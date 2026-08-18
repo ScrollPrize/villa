@@ -22,6 +22,7 @@ from tqdm import tqdm
 
 import prefetch
 from dt_targets import snap_dt_target, strip_dt_target_in_sample_frame
+from spiral_progress import progress_or_null
 from loss_maps import diagnostics_enabled, record_loss_samples
 import geom_utils
 from sample_spiral import (
@@ -2160,7 +2161,8 @@ def _build_anchor_kdtree(anchor_zyx):
     return cKDTree(np.ascontiguousarray(anchor_np, dtype=np.float32))
 
 
-def _track_points_far_from_anchors_mask(track_zyx, anchor_tree, threshold):
+def _track_points_far_from_anchors_mask(track_zyx, anchor_tree, threshold,
+                                        progress=None):
     if isinstance(track_zyx, torch.Tensor):
         track_np = track_zyx.detach().cpu().numpy()
     else:
@@ -2176,9 +2178,15 @@ def _track_points_far_from_anchors_mask(track_zyx, anchor_tree, threshold):
     chunk_size = max(
         1, int(os.environ.get('FIT_SPIRAL_TRACK_EXCLUSION_CHUNK', '4000000')))
     keep = np.empty(track_np.shape[0], dtype=bool)
-    progress = tqdm(
+    # The only step of track preparation that is both long and countable, so
+    # it is the only one a service client hears about. One report per chunk,
+    # never per track; the reporter rate-limits from there.
+    reporter = progress_or_null(progress)
+    reporter.begin('loading', 'Excluding track points near patches',
+                   step=0, total_steps=track_np.shape[0], unit='points')
+    bar = tqdm(
         total=track_np.shape[0], desc='excluding track points',
-        unit='point', unit_scale=True,
+        unit='point', unit_scale=True, disable=progress is not None,
     )
     try:
         for begin in range(0, track_np.shape[0], chunk_size):
@@ -2187,16 +2195,17 @@ def _track_points_far_from_anchors_mask(track_zyx, anchor_tree, threshold):
                 track_np[begin:end], k=1,
                 distance_upper_bound=float(threshold), workers=-1)
             keep[begin:end] = np.isinf(dist)
-            progress.update(end - begin)
+            bar.update(end - begin)
+            reporter.update(end)
     finally:
-        progress.close()
+        bar.close()
     return keep
 
 
 def prepare_main_phase_tracks(
         tracks, anchor_scroll_zyxs, exclusion_radius, device, anchor_tree=None,
         sampling_config=None, track_families=None, track_source_ids=None,
-        crossing_cache=None, track_graph=None):
+        crossing_cache=None, track_graph=None, progress=None):
     if not tracks:
         return None
     if sampling_config is not None and 'length_bin_weights' in sampling_config:
@@ -2513,7 +2522,8 @@ def prepare_main_phase_tracks(
         np.cumsum(input_lengths, out=input_offsets[1:])
         flat_zyx_np = np.concatenate(
             [t.astype(np.float32) for t in working_tracks], axis=0)
-    keep_np = _track_points_far_from_anchors_mask(flat_zyx_np, anchor_tree, exclusion_radius)
+    keep_np = _track_points_far_from_anchors_mask(
+        flat_zyx_np, anchor_tree, exclusion_radius, progress=progress)
     num_tracks_orig = len(working_tracks)
     # Points are already grouped by track.  Segment reduction replaces the old
     # int64 track-id-per-point array (7.3 GiB for the 2um store).

@@ -55,6 +55,8 @@ option(VC_ENABLE_TYSAN    "TypeSanitizer (clang-only, LLVM 18+)"         OFF)
 option(VC_ENABLE_NSAN     "NumericalStabilitySanitizer (clang-only, LLVM 19+)" OFF)
 option(VC_ENABLE_COVERAGE "Code coverage instrumentation"                OFF)
 option(VC_TESTING         "Build and run unit tests"                     OFF)
+option(VC_RUN_RENDER_BENCHMARKS
+       "Register deterministic Linux-amd64 Callgrind rendering benchmarks" OFF)
 option(VC_DEAD_CODE_REPORT "Enable dead-code reporting (curated -Wunused* + linker --print-gc-sections; use a Debug build to avoid LTO)" OFF)
 option(VC_PROFILE_COMPILE  "Emit per-TU compile-time profiles (-ftime-trace on clang, -ftime-report on gcc)" OFF)
 # flatboi drags in PaStiX (Fortran + autotools + Scotch), which has no
@@ -257,23 +259,29 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
         set(_link "")
         # ld64.lld (the LLVM Mach-O linker the macOS preset selects via
         # -fuse-ld=lld) mishandles C++ exception unwind info for our large
-        # ThinLTO shared libraries: a `throw` inside e.g. libvc_core that should
-        # be caught in an executable instead unwinds past every handler into
-        # std::terminate (SIGABRT) once it crosses the dylib boundary. The
-        # failure is in how lld lays out the dylib's unwind tables — relinking
-        # the *same* objects with Apple's ld makes cross-dylib exceptions
+        # ThinLTO binaries: a `throw` that should be caught by an enclosing
+        # handler instead unwinds past every handler into std::terminate
+        # (SIGABRT). The failure is in how lld lays out the unwind tables —
+        # relinking the *same* objects with Apple's ld makes exceptions
         # propagate correctly, and no ld64.lld flag (-keep_dwarf_unwind,
-        # -no_compact_unwind, -dead_strip) reliably fixes it for a library this
-        # size. So on macOS we link shared libraries with Apple's system ld
-        # (always available via the SDK) while keeping lld for executables.
+        # -no_compact_unwind, -dead_strip) reliably fixes it at this size.
+        #
+        # This was first observed for cross-dylib throws (a `throw` inside
+        # libvc_core caught in an executable), so the workaround originally
+        # covered SHARED_LIBRARY targets only. With Homebrew clang/lld 22.1.8
+        # the same corruption appears *within* the VC3D executable: opening a
+        # volume-less project made resolveLasagnaForVolume's std::runtime_error
+        # bypass the `catch (...)` in CWindow::updateAtlasFiberDocks and abort
+        # the app. Relinking only the executables with Apple's ld — same
+        # objects, same dylibs — turns that back into the intended handled
+        # error, so executables need the workaround too.
+        #
         # -fuse-ld= with an empty value selects the driver default (Apple ld).
         # A later -fuse-ld= (empty) on the link line overrides the preset's
-        # earlier -fuse-ld=lld for shared-library targets only; clang honors the
-        # last one. Applied per-target via a genex so it's idempotent across
-        # reconfigures and leaves executables on lld.
+        # earlier -fuse-ld=lld; clang honors the last one. Applied via
+        # add_link_options so it is idempotent across reconfigures.
         if(CMAKE_EXE_LINKER_FLAGS MATCHES "lld" OR CMAKE_SHARED_LINKER_FLAGS MATCHES "lld")
-            add_link_options(
-                "$<$<STREQUAL:$<TARGET_PROPERTY:TYPE>,SHARED_LIBRARY>:-fuse-ld=>")
+            add_link_options(-fuse-ld=)
         endif()
     else()
         set(_link -fuse-ld=lld -Wl,--gc-sections -Wl,--as-needed)
@@ -916,20 +924,24 @@ if(VC_TESTING)
         COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
                 --parallel 4 -L "^vc-core$"
         DEPENDS vc_test_core
+        VERBATIM
         USES_TERMINAL)
     add_custom_target(check-core-offline
         COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
                 --parallel 4 -L "^vc-core$" -LE "^network$"
         DEPENDS vc_test_core
+        VERBATIM
         USES_TERMINAL)
     add_custom_target(check-specialized
         COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
                 --parallel 4 -L "^vc-specialized$"
         DEPENDS vc_test_specialized
+        VERBATIM
         USES_TERMINAL)
     add_custom_target(check
         COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
         DEPENDS ${_vc_test_targets}
+        VERBATIM
         USES_TERMINAL)
 
     if(VC_ENABLE_COVERAGE)

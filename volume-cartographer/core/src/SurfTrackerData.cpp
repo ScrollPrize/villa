@@ -124,18 +124,16 @@ std::set<QuadSurface *>& SurfTrackerData::surfs(const cv::Vec2i& loc)
 
 const std::set<QuadSurface *>& SurfTrackerData::surfsC(const cv::Vec2i& loc) const
 {
-    if (!_surfs.contains(loc))
-        return _emptysurfs;
-    else
-        return _surfs.find(loc)->second;
+    auto it = _surfs.find(loc);
+    return it == _surfs.end() ? _emptysurfs : it->second;
 }
 
 cv::Vec3d SurfTrackerData::lookup_int(QuadSurface *sm, const cv::Vec2i& p)
 {
-    auto id = std::make_pair(sm, p);
-    if (!_data.contains(id))
+    auto it = _data.find(std::make_pair(sm, p));
+    if (it == _data.end())
         throw std::runtime_error("error, lookup failed!");
-    cv::Vec2d l = loc(sm, p);
+    cv::Vec2d l = it->second;
     const auto points = sm->rawPoints();
     if (!loc_valid(points, l))
         return {-1, -1, -1};
@@ -145,10 +143,10 @@ cv::Vec3d SurfTrackerData::lookup_int(QuadSurface *sm, const cv::Vec2i& p)
 
 bool SurfTrackerData::valid_int(QuadSurface *sm, const cv::Vec2i& p)
 {
-    auto id = std::make_pair(sm, p);
-    if (!_data.contains(id))
+    auto it = _data.find(std::make_pair(sm, p));
+    if (it == _data.end())
         return false;
-    cv::Vec2d l = loc(sm, p);
+    cv::Vec2d l = it->second;
     const auto points = sm->rawPoints();
     return loc_valid(points, l);
 }

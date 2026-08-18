@@ -1,3 +1,22 @@
+# 2026-08-07
+
+- Simplified manager S3 staging to marker-only resumable rclone transfer and
+  restored lean existing-schema Atlas Lasagna entries without duplicated
+  portable provenance.
+
+# 2026-08-06
+
+- Added path-aware per-user Bash completion installation for `las_manager`,
+  with isolated providers that coexist across multiple virtual environments.
+- Added longest-prefix contextual help and shared argument-aware Bash/Zsh
+  completion, including exact cache-local OME scale proposals.
+- Made manager catalog indexing tolerate volumes whose optional shape is null.
+- Replaced repeated `volume ls` labels with a grouped table and added exact
+  chunk-backed prefetched-scale reporting.
+- Refined the volume tree so each scroll shares its first volume row and
+  branches additional volumes below, removed the duplicate ID column, and
+  aligned depth/height/width components to widths 6/5/5.
+
 # 2026-08-03
 
 - Added experimental float16 shared raw-product accumulator rings while
@@ -231,6 +250,16 @@
   restart-rate runner for precomputed 3D fiber inference `.lasagna.json`
   products and `vc3d_fiber` JSON files.
 
+# 2026-08-06: Lasagna inference manager foundations
+
+- Added the installed `las_manager` command with XDG configuration, atomic
+  initialization, unique command prefixes, and read-only shell completion.
+- Added conditional one-hour open-data catalog caching and deterministic volume
+  discovery that preserves full Atlas identity/origin/license metadata.
+- Added safe cached Fiber checkpoint discovery with stable backend/run/snapshot
+  selectors, checkpoint hashes, test metrics, model/output/precision metadata,
+  and optional Atlas model identity.
+
 # 2026-07-28
 
 - Defaulted Fiber whole-volume output to filtered 0.25x inference, changed
@@ -288,3 +317,94 @@
   dispatch and restored float16 product rings as the default.
 - Added `--accumulator-workers`, backend/throughput diagnostics, native
   numerical coverage, and process-vs-synchronous output coverage.
+
+# 2026-08-06: Lasagna manager durable Fiber runs
+
+- Added scale-specific open-data prefetch through the existing downloader,
+  backend-neutral immutable run records, detached tmux execution, authoritative
+  exit/state logging, durable/live listings, and contextual tmux attachment.
+
+# 2026-08-06: checkpoint-driven Fiber inference provenance
+
+- Made embedded checkpoint configuration authoritative for Fiber inference,
+  retaining an explicit positional config only for legacy snapshots.
+- Added direct portable `inference.json` output with exact scale/settings,
+  checkpoint and catalog identity, failure state, and bounded structural OME
+  inventory; Lasagna manifests now preserve its relative reference and unknown
+  forward-compatible fields.
+- Connected manager run/catalog context to the direct inference writer without
+  leaking host paths, command logs, or tmux identity into `artifacts/`.
+
+# 2026-08-06: shared inference OME-Zarr compression
+
+- Defaulted newly created Fiber and Lasagna inference pyramids to exact
+  Zarr-v2 Blosc/Zstd level-3 byte-shuffle compression through their shared
+  output-group creator.
+- Added the shared `--ome-compressor` compatibility override and preserved
+  existing per-level codecs on resume with an explicit mismatch warning.
+
+## 2026-08-06 — Lasagna manager Phase 5 integration
+
+- Made Bash and Zsh completion registry-derived and added cached dynamic
+  snapshot, volume, inference, and live-run selectors without completion-time
+  refresh or mutation.
+- Made completed portable provenance part of the manager success contract and
+  added bounded moved-bundle validation shared across artifact kinds.
+- Validated a Fiber provenance mapping against the checked-out Atlas Pydantic
+  `DataEntry` model and exercised a synthetic Lasagna artifact fixture.
+
+## 2026-08-06 — Atlas staging and prediction ingestion
+
+- Added shared Fiber/Lasagna portable-bundle validation and atomic, idempotent
+  run-UUID staging uploads with commit markers and content manifests.
+- Added Atlas provenance parsing, explicit model registration, and browser
+  bundle registration while mapping both Fiber and Lasagna output to the
+  existing Lasagna artifact and CC BY-NC publication rule.
+
+## 2026-08-06 — Lasagna manager backend
+
+- Added structure-based Lasagna checkpoint indexing, namespaced selectors, and
+  shared manager/tmux launch dispatch through `predict3d`.
+- Made direct Lasagna inference author the shared portable provenance envelope,
+  including its manifest decoding fields and structural Zarr inventory.
+- Reused the existing catalog, prefetch, run lifecycle, completion, staging,
+  and Atlas Lasagna ingestion paths without a second orchestration workflow.
+# 2026-08-06: self-contained detached manager inference
+
+- Packaged sibling Fiber/Vesuvius and canonical Lasagna modules so inference
+  needs no ambient `PYTHONPATH`.
+- Moved automatic open-data prefetch into the tmux runner with an explicit
+  lifecycle, making launch return immediately while retaining strict
+  prefetch-before-GPU ordering.
+- Replaced provenance-heavy paths with concise, collision-safe human labels
+  while retaining canonical Atlas identity in metadata.
+# 2026-08-06: manager defaults and stable tmux attachment
+
+- Added initialized global inference params for 512-voxel tiles, 32-voxel
+  borders, 96-voxel overlap, and all visible GPUs, with per-run overrides.
+- Made managed tmux identity use atomically captured, run-UUID-tagged stable
+  window IDs and distinguish orphan inference processes from attachable runs.
+- Made attached inference panes show the same live byte stream retained in the
+  durable run log.
+# 2026-08-06: manager no-prefetch download delegation
+
+- Made `inference run --no-prefetch` retain backend on-demand downloads while
+  the default prefetch-first workflow continues to disable concurrent fetching.
+
+# 2026-08-07: provenance-driven Atlas model registration
+
+- Added shared direct/managed Fiber and Lasagna inference commit provenance.
+- Replaced manual upload model selection with fresh checkpoint-hash resolution
+  and automatic minimal Atlas model registration.
+- Standardized Fiber Atlas models as `fiber3d/unet` Lasagna models with numeric
+  references, relative snapshot path, and snapshot SHA-256.
+
+## 2026-08-11 — Shared live selected-scale inference cache
+
+- Added opt-in Fiber/Lasagna full-volume live S3 materialization with a bounded
+  lazy tile window, authoritative active-plane inventory, atomic transfer, and
+  conservative whole-Z-plane eviction behind the canonical commit frontier.
+- Added selected-level reader/mutator locking, manager launch/provenance support,
+  and 10 TiB / 10,000-tile defaults without changing the normal prefetch path.
+- Made live progress cadence independent of TTY detection and report unique
+  remote-missing chunks per listed Z plane.

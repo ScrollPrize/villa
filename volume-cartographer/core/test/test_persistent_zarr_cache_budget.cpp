@@ -79,6 +79,74 @@ TEST_CASE("budget discovers only remote-volume and Lasagna Zarr data")
     fs::remove_all(root);
 }
 
+TEST_CASE("budget discovers native Zarr payloads but excludes metadata")
+{
+    const auto root = tempRoot("native_zarr");
+    const auto mirror = root / "volume-hash";
+    writeBytes(mirror / ".zgroup", 17);
+    writeBytes(mirror / ".zattrs", 19);
+    fs::create_directories(mirror / "scale0");
+    {
+        std::ofstream metadata(mirror / "scale0" / ".zarray");
+        metadata << R"({"zarr_format":2,"shape":[8,8,8],"chunks":[2,2,2],"dtype":"|u1","compressor":null,"fill_value":0,"order":"C","filters":null})";
+    }
+    writeBytes(mirror / "scale0" / ".zattrs", 29);
+    writeBytes(mirror / "scale0" / "0.0.0", 31);
+    writeBytes(mirror / "scale0" / "0.0.1.empty", 0);
+    writeBytes(mirror / "unrelated.txt", 37);
+    writeBytes(mirror / "scale0" / "unrelated.txt", 43);
+
+    auto budget = Budget::configure(root, {}, spaceWith(
+        std::make_shared<std::atomic<std::uint64_t>>(900)));
+    budget->waitForIdle();
+    CHECK(budget->stats().managedBytes == 31);
+    fs::remove_all(root);
+}
+
+TEST_CASE("budget discovers native Zarr v3 shard payloads")
+{
+    const auto root = tempRoot("native_zarr_v3");
+    const auto mirror = root / "volume-hash";
+    writeBytes(mirror / "zarr.json", 17);
+    fs::create_directories(mirror / "scale0");
+    {
+        std::ofstream metadata(mirror / "scale0" / "zarr.json");
+        metadata << R"({"zarr_format":3,"node_type":"array","shape":[8,8,8]})";
+    }
+    writeBytes(mirror / "scale0" / "c" / "0" / "0" / "0", 41);
+    writeBytes(mirror / "scale0" / "c" / "bad" / "0" / "0", 47);
+
+    auto budget = Budget::configure(root, {}, spaceWith(
+        std::make_shared<std::atomic<std::uint64_t>>(900)));
+    budget->waitForIdle();
+    CHECK(budget->stats().managedBytes == 41);
+    fs::remove_all(root);
+}
+
+TEST_CASE("protected metadata writes enforce free space without becoming evictable")
+{
+    const auto root = tempRoot("protected_metadata");
+    const auto metadata = root / "volume-hash" / "zarr.json";
+    auto free = std::make_shared<std::atomic<std::uint64_t>>(55);
+    auto budget = Budget::configure(root, {1, 50}, spaceWith(free));
+    budget->waitForIdle();
+
+    CHECK_FALSE(static_cast<bool>(
+        budget->reserveProtectedWrite(metadata, 10)));
+    free->store(60);
+    auto reservation = budget->reserveProtectedWrite(metadata, 10);
+    REQUIRE(static_cast<bool>(reservation));
+    writeBytes(metadata, 10);
+    reservation.commit();
+
+    CHECK(fs::is_regular_file(metadata));
+    CHECK(budget->stats().managedBytes == 0);
+    budget->updateLimits({0, 0});
+    budget->waitForIdle();
+    CHECK(fs::is_regular_file(metadata));
+    fs::remove_all(root);
+}
+
 TEST_CASE("volume chunk exclusions are relative to the managed root")
 {
     const auto base = tempRoot("relative");

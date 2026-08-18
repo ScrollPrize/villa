@@ -39,6 +39,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.inference_adapter import (
     FiberTrace3DPredictAdapter,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.infer import (
+    _checkpoint_config_for_inference,
     _input_scaledown_from_base,
     _resolve_inference_precision,
     _resolve_inference_device,
@@ -417,6 +418,7 @@ def test_fiber_inference_cli_forwards_shared_multi_gpu_pipeline(monkeypatch: pyt
         "--inference-precision", "bf16",
         "--product-accumulator-dtype", "float32",
         "--download-workers", "77",
+        "--ome-compressor", "none",
     ])
     assert result == 0
     assert captured["device"] is None
@@ -434,6 +436,70 @@ def test_fiber_inference_cli_forwards_shared_multi_gpu_pipeline(monkeypatch: pyt
     assert captured["inference_precision"] == "bf16"
     assert captured["product_accumulator_dtype"] == "float32"
     assert captured["download_workers"] == 77
+    assert captured["ome_compressor"] == "none"
+
+
+def test_fiber_inference_cli_forwards_live_cache_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        fiber_infer_module, "run_fiber_trace_3d_inference",
+        lambda **kwargs: captured.update(kwargs),
+    )
+    assert fiber_infer_module.main([
+        "--input", "volume.zarr/0", "--output", "fiber.lasagna.json",
+        "--checkpoint", "model.pt", "--live-fetch",
+        "--live-cache-gib", "12.5", "--live-fetch-ahead-tiles", "4321",
+        "--download-workers", "123",
+    ]) == 0
+    assert captured["live_fetch"] is True
+    assert captured["live_cache_gib"] == 12.5
+    assert captured["live_fetch_ahead_tiles"] == 4321
+    assert captured["download_workers"] == 123
+
+
+@pytest.mark.parametrize("extra", [
+    ["--live-fetch", "--no-download"],
+    ["--live-fetch", "--crop", "0", "0", "0", "1", "1", "1"],
+    ["--live-cache-gib", "1"],
+])
+def test_fiber_inference_cli_rejects_invalid_live_cache_combinations(extra) -> None:
+    with pytest.raises(SystemExit):
+        fiber_infer_module.main([
+            "--input", "volume.zarr/0", "--output", "fiber.lasagna.json",
+            "--checkpoint", "model.pt", *extra,
+        ])
+
+
+def test_fiber_inference_cli_omits_config_for_current_checkpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        fiber_infer_module,
+        "run_fiber_trace_3d_inference",
+        lambda **kwargs: captured.update(kwargs),
+    )
+    assert fiber_infer_module.main([
+        "--input", "input.zarr", "--output", "fiber.lasagna.json",
+        "--checkpoint", "model.pt",
+    ]) == 0
+    assert captured["config_path"] is None
+
+
+def test_checkpoint_config_is_authoritative_with_legacy_fallback(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "model.pt"
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text(json.dumps({"patch_shape_zyx": [32, 32, 32]}), encoding="utf-8")
+    torch.save({"config": {"patch_shape_zyx": [64, 64, 64]}}, checkpoint)
+
+    config, source = _checkpoint_config_for_inference(checkpoint, legacy)
+    assert config["patch_shape_zyx"] == [64, 64, 64]
+    assert source == "checkpoint"
+
+    torch.save({"model": {}}, checkpoint)
+    config, source = _checkpoint_config_for_inference(checkpoint, legacy)
+    assert config["patch_shape_zyx"] == [32, 32, 32]
+    assert source == "legacy-file"
+    with pytest.raises(ValueError, match="legacy config"):
+        _checkpoint_config_for_inference(checkpoint, None)
 
 
 class _NativeTraceTestPredictionAdapter:
@@ -3084,6 +3150,8 @@ def test_3d_fiber_infer_writes_lasagna_presence_normal_products(tmp_path: Path) 
         levels=2,
         ome_chunk=4,
         pyramid_workers=1,
+        flush_workers=0,
+        accumulator_workers=0,
     )
 
     for channel_name in FIBER_TRACE_3D_PERSISTED_CHANNELS:
@@ -3104,7 +3172,15 @@ def test_3d_fiber_infer_writes_lasagna_presence_normal_products(tmp_path: Path) 
         assert group["channels"] == [channel_name]
         assert group["scaledown"] == 0
         assert group["zarr"] == f"fiber_out_{channel_name}.ome.zarr/0"
-    assert not (tmp_path / "fiber_trace_3d_inference.json").exists()
+    provenance = json.loads((tmp_path / "inference.json").read_text(encoding="utf-8"))
+    assert provenance["status"] == "completed"
+    assert provenance["artifact_kind"] == "fiber3d-prediction"
+    assert provenance["source_scale"]["requested_group"] == 0
+    assert provenance["inference"]["effective_base_factor"] == 1
+    assert len(provenance["inference"]["code_commit"]) == 40
+    assert set(provenance["inference"]["code_commit"]) <= set("0123456789abcdef")
+    assert len(provenance["artifacts"]) == 4
+    assert manifest["provenance"] == "inference.json"
     for raw_channel in FIBER_TRACE_3D_INTERNAL_CHANNELS:
         assert not (tmp_path / "fiber" / "option_000" / raw_channel).exists()
 
@@ -3115,6 +3191,7 @@ def test_3d_fiber_inference_scale_defaults_and_validates_all_axes() -> None:
     parameters = inspect.signature(run_fiber_trace_3d_inference).parameters
     assert parameters["inference_scaledown_power"].default == 2
     assert parameters["ome_chunk"].default == 64
+    assert parameters["ome_compressor"].default == "blosc-zstd"
     assert _input_scaledown_from_base((17, 33, 65), (5, 9, 17)) == 4
     with pytest.raises(ValueError, match="isotropic power-of-two"):
         _input_scaledown_from_base((17, 33, 65), (5, 17, 17))

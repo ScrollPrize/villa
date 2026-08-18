@@ -109,6 +109,87 @@ def _checkpoint_normalization_scheme(checkpoint_data):
     return image_normalization
 
 
+_NNUNET_NORMALIZATION_MAP = {
+    'CTNormalization': 'ct',
+    'ZScoreNormalization': 'instance_zscore',
+    'NoNormalization': 'none',
+    'RescaleTo01Normalization': 'instance_minmax',
+}
+
+
+def _nnunet_normalization_from_model_info(model_info):
+    """Return the normalization declared by an nnU-Net model's plans.
+
+    ``load_model_for_inference`` already returns the nnU-Net configuration and
+    plans managers.  Keep their native metadata authoritative rather than
+    silently falling back to the CLI's per-patch z-score default.
+
+    VCDataset currently accepts one normalization contract for the entire
+    input, so reject multi-channel plans instead of applying one channel's
+    fingerprint to another.
+    """
+    configuration_manager = model_info.get('configuration_manager')
+    plans_manager = model_info.get('plans_manager')
+    if configuration_manager is None or plans_manager is None:
+        return None, None
+
+    schemes = getattr(configuration_manager, 'normalization_schemes', None)
+    if schemes is None:
+        return None, None
+    if isinstance(schemes, str):
+        schemes = [schemes]
+    else:
+        schemes = list(schemes)
+    if len(schemes) != 1:
+        raise ValueError(
+            'vesuvius.predict cannot reproduce nnU-Net normalization for '
+            f'{len(schemes)} input channels; expected exactly one scheme')
+
+    native_scheme = schemes[0]
+    if not isinstance(native_scheme, str):
+        native_scheme = getattr(native_scheme, '__name__', str(native_scheme))
+    native_scheme = native_scheme.rsplit('.', 1)[-1]
+    try:
+        scheme = _NNUNET_NORMALIZATION_MAP[native_scheme]
+    except KeyError as exc:
+        raise ValueError(
+            'Unsupported nnU-Net normalization scheme in plans.json: '
+            f'{native_scheme!r}') from exc
+
+    use_mask = getattr(configuration_manager, 'use_mask_for_norm', None)
+    if isinstance(use_mask, (list, tuple)):
+        use_mask = use_mask[0] if use_mask else None
+    if scheme == 'instance_zscore' and bool(use_mask):
+        raise ValueError(
+            'nnU-Net plans require masked Z-score normalization, which '
+            'vesuvius.predict cannot reproduce without the preprocessing mask')
+
+    intensity_properties = None
+    if scheme == 'ct':
+        per_channel = getattr(
+            plans_manager, 'foreground_intensity_properties_per_channel', None)
+        if not isinstance(per_channel, dict):
+            raise ValueError(
+                'nnU-Net CTNormalization requires '
+                'foreground_intensity_properties_per_channel in plans.json')
+        intensity_properties = per_channel.get('0', per_channel.get(0))
+        required = {
+            'mean', 'std', 'percentile_00_5', 'percentile_99_5',
+        }
+        if not isinstance(intensity_properties, dict):
+            raise ValueError(
+                'nnU-Net CTNormalization requires intensity properties for '
+                'input channel 0')
+        missing = sorted(required.difference(intensity_properties))
+        if missing:
+            raise ValueError(
+                'nnU-Net CTNormalization channel-0 intensity properties are '
+                f'missing: {", ".join(missing)}')
+        intensity_properties = dict(intensity_properties)
+
+    return scheme, intensity_properties
+
+
 def _select_evenly_spaced_middle_indices(candidate_indices, limit):
     """Select a deterministic, small representative subset of patch indices."""
     candidates = list(candidate_indices)
@@ -447,6 +528,26 @@ class Inferer():
                     verbose=self.verbose
                 )
         
+        # Prefer normalization metadata returned directly by train.py/external
+        # loaders. For nnU-Net, derive it from the plans managers that the
+        # loader already returns.
+        model_scheme = model_info.get('normalization_scheme')
+        model_intensity_properties = model_info.get('intensity_properties')
+        if model_scheme is None:
+            model_scheme, nnunet_intensity_properties = \
+                _nnunet_normalization_from_model_info(model_info)
+            if model_intensity_properties is None:
+                model_intensity_properties = nnunet_intensity_properties
+        if model_scheme is not None:
+            self.model_normalization_scheme = model_scheme
+            if model_scheme != self.normalization_scheme:
+                print(
+                    'Using model-declared normalization '
+                    f'{model_scheme!r} instead of CLI/default '
+                    f'{self.normalization_scheme!r}.')
+        if model_intensity_properties is not None:
+            self.model_intensity_properties = model_intensity_properties
+
         # model loader returns a dict, network is the actual model
         model = model_info['network']
         model.eval()
@@ -727,6 +828,7 @@ class Inferer():
             normalization_scheme=normalization_scheme,
             global_mean=global_mean,
             global_std=global_std,
+            intensity_props=self.model_intensity_properties,
             input_format=self.input_format,
             verbose=self.verbose,
             mode='infer',
@@ -1163,7 +1265,7 @@ def build_parser():
                       help='Optional: Override patch size, comma-separated (e.g., "192,192,192"). If not provided, uses the model\'s default patch size.')
     parser.add_argument('--save_softmax', action='store_true', help='Save softmax outputs')
     parser.add_argument('--normalization', type=str, default='instance_zscore',
-                      help='Normalization scheme (instance_zscore, global_zscore, instance_minmax, none)')
+                      help='Normalization scheme (instance_zscore, global_zscore, instance_minmax, percentile_minmax, ct, none)')
     parser.add_argument('--device', type=str, default='cuda', help='Device to use (cuda, cpu)')
     parser.add_argument('--num_workers', type=int, default=4,
                       help='Number of DataLoader workers. Use 0 in low /dev/shm environments (e.g. Docker).')

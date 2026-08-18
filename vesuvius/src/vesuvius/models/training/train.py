@@ -303,6 +303,22 @@ class BaseTrainer:
                 print("Compile policy set to 'off'; using eager mode.")
             return model
 
+        # torch.compile's inductor backend needs triton on CUDA, but compilation
+        # is lazy: without this check the failure escapes the try/except below
+        # and surfaces as TritonMissing at the first forward pass (e.g. on
+        # Windows, where CUDA wheels do not bundle triton).
+        try:
+            from torch.utils._triton import has_triton
+        except ImportError:
+            has_triton = None
+        if has_triton is not None and not has_triton():
+            if not self.is_distributed or self.rank == 0:
+                print(
+                    "torch.compile requires a working triton installation, "
+                    "which is unavailable in this environment; using eager mode."
+                )
+            return model
+
         compile_start = perf_counter()
         if not self.is_distributed or self.rank == 0:
             print(f"Compiling model with policy '{compile_policy}'")

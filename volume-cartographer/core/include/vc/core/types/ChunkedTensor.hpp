@@ -68,14 +68,14 @@ inline std::unique_ptr<vc::render::ChunkCache> openChunkedArrayCache(
         levels.push_back({opened.shapes[i], opened.chunkShapes[i], opened.transforms[i]});
     }
 
-    vc::render::ChunkCache::Options options;
-    options.decodedByteCapacity = capacityBytes;
+    vc::render::ChunkCacheService::Options serviceOptions;
+    serviceOptions.decodedByteCapacity = capacityBytes;
     return std::make_unique<vc::render::ChunkCache>(
         std::move(levels),
         std::move(opened.fetchers),
         opened.fillValue,
         opened.dtype,
-        options);
+        vc::render::ChunkCache::Options{}, std::move(serviceOptions));
 }
 
 static std::string tmp_name_proc_thread()

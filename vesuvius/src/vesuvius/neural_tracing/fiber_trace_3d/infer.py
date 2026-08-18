@@ -1,14 +1,31 @@
 from __future__ import annotations
 
 import argparse
+from functools import wraps
+import hashlib
 import json
 import math
 from pathlib import Path
+import platform
+import subprocess
 import time
 from typing import Any
 
 import torch
 import zarr
+
+try:
+    from lasagna.live_omezarr_cache import (
+        DEFAULT_LIVE_CACHE_GIB,
+        DEFAULT_LIVE_FETCH_AHEAD_TILES,
+        LiveOmeZarrCache,
+    )
+except ImportError:  # pragma: no cover - supports PYTHONPATH=lasagna style runs.
+    from live_omezarr_cache import (
+        DEFAULT_LIVE_CACHE_GIB,
+        DEFAULT_LIVE_FETCH_AHEAD_TILES,
+        LiveOmeZarrCache,
+    )
 
 try:
     from lasagna.tiled_predict3d import (
@@ -17,6 +34,8 @@ try:
         DEFAULT_INPUT_COPY_THREADS,
         DEFAULT_INPUT_IO_THREADS,
         DEFAULT_INPUT_READER,
+        DEFAULT_OME_COMPRESSOR,
+        OME_COMPRESSOR_CHOICES,
         DEFAULT_PREFETCH_TILES_PER_GPU,
         _auto_download,
         build_product_omezarr_pyramids,
@@ -36,6 +55,8 @@ except ImportError:  # pragma: no cover - supports PYTHONPATH=lasagna style runs
         DEFAULT_INPUT_COPY_THREADS,
         DEFAULT_INPUT_IO_THREADS,
         DEFAULT_INPUT_READER,
+        DEFAULT_OME_COMPRESSOR,
+        OME_COMPRESSOR_CHOICES,
         DEFAULT_PREFETCH_TILES_PER_GPU,
         _auto_download,
         build_product_omezarr_pyramids,
@@ -69,6 +90,77 @@ def _load_config(path: str | Path) -> dict[str, Any]:
     return config
 
 
+def _checkpoint_config_for_inference(
+    checkpoint: str | Path | None,
+    legacy_config_path: str | Path | None,
+) -> tuple[dict[str, Any], str]:
+    payload: Any = None
+    if checkpoint is not None:
+        payload = torch.load(str(checkpoint), map_location="cpu", mmap=True, weights_only=True)
+    embedded = payload.get("config") if isinstance(payload, dict) else None
+    if isinstance(embedded, dict):
+        config = dict(embedded)
+        config.setdefault("_config_dir", str(Path(checkpoint).resolve().parent))
+        return config, "checkpoint"
+    if legacy_config_path is None:
+        raise ValueError(
+            "checkpoint does not contain an embedded config; pass a legacy config JSON "
+            "as the positional argument"
+        )
+    return _load_config(legacy_config_path), "legacy-file"
+
+
+def _sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _checkpoint_provenance(path: str | Path | None, config: dict[str, Any]) -> dict[str, Any]:
+    if path is None:
+        return {
+            "name": None, "sha256": None, "step": None,
+            "metric_name": None, "metric_value": None,
+        }
+    payload = torch.load(str(path), map_location="cpu", mmap=True, weights_only=True)
+    top = payload if isinstance(payload, dict) else {}
+    model = config.get("model_3d", config.get("model", {}))
+    def scalar(value: Any) -> Any:
+        item = getattr(value, "item", None)
+        return item() if callable(item) else value
+    return {
+        "name": Path(path).name,
+        "sha256": _sha256(path),
+        "step": scalar(top.get("step")),
+        "metric_name": top.get("metric_name"),
+        "metric_value": scalar(top.get("metric")),
+        "architecture": model.get("architecture") if isinstance(model, dict) else None,
+        "output_schema": {
+            key: model[key] for key in (
+                "output_channels", "direction_branch_count", "conditioned_decoder_enabled",
+            ) if isinstance(model, dict) and key in model
+        },
+    }
+
+
+def _repository_state() -> dict[str, Any]:
+    root = Path(__file__).resolve().parents[5]
+    try:
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=root, check=True, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        ).stdout.strip()
+        dirty = bool(subprocess.run(
+            ["git", "status", "--porcelain"], cwd=root, check=True, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        ).stdout)
+        return {"revision": revision, "dirty": dirty}
+    except (OSError, subprocess.SubprocessError):
+        return {"revision": None, "dirty": None}
+
+
 def _tile_size_from_config(config: dict[str, Any], explicit_tile_size: int | None) -> int:
     if explicit_tile_size is not None:
         tile_size = int(explicit_tile_size)
@@ -100,6 +192,35 @@ def _storage_ds_end(value: int, scaledown: int) -> int:
     value_i = max(0, int(value))
     scaledown_i = max(1, int(scaledown))
     return (value_i + scaledown_i - 1) // scaledown_i
+
+
+def _manage_live_cache(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        enabled = bool(kwargs.get("live_fetch", False))
+        if not enabled:
+            kwargs["_live_cache"] = None
+            return function(*args, **kwargs)
+        if kwargs.get("no_download", False):
+            raise ValueError("--live-fetch conflicts with --no-download")
+        if kwargs.get("crop_xyzwhd") is not None:
+            raise ValueError("--live-fetch supports only full, non-cropped inference")
+        cache_gib = float(kwargs.get("live_cache_gib", DEFAULT_LIVE_CACHE_GIB))
+        lookahead = int(kwargs.get("live_fetch_ahead_tiles", DEFAULT_LIVE_FETCH_AHEAD_TILES))
+        workers = int(kwargs.get("download_workers", 64))
+        if not math.isfinite(cache_gib) or cache_gib <= 0:
+            raise ValueError("live_cache_gib must be finite and > 0")
+        if lookahead <= 0:
+            raise ValueError("live_fetch_ahead_tiles must be > 0")
+        with LiveOmeZarrCache(
+            kwargs["input_path"],
+            max_bytes=int(cache_gib * (1 << 30)),
+            lookahead_tiles=lookahead,
+            workers=workers,
+        ) as live_cache:
+            kwargs["_live_cache"] = live_cache
+            return function(*args, **kwargs)
+    return wrapped
 
 
 def _input_scaledown_from_base(
@@ -284,9 +405,10 @@ def _select_and_expand_crop(
     )
 
 
+@_manage_live_cache
 def run_fiber_trace_3d_inference(
     *,
-    config_path: str | Path,
+    config_path: str | Path | None = None,
     input_path: str,
     output_path: str | Path,
     checkpoint: str | Path | None,
@@ -302,6 +424,7 @@ def run_fiber_trace_3d_inference(
     no_download: bool = False,
     levels: int = 5,
     ome_chunk: int = 64,
+    ome_compressor: str = DEFAULT_OME_COMPRESSOR,
     pyramid_workers: int = 0,
     recurrent_steps: int | None = None,
     prefetch_workers: int = 0,
@@ -314,9 +437,14 @@ def run_fiber_trace_3d_inference(
     input_io_threads: int = DEFAULT_INPUT_IO_THREADS,
     input_copy_threads: int = DEFAULT_INPUT_COPY_THREADS,
     download_workers: int = 64,
+    live_fetch: bool = False,
+    live_cache_gib: float = DEFAULT_LIVE_CACHE_GIB,
+    live_fetch_ahead_tiles: int = DEFAULT_LIVE_FETCH_AHEAD_TILES,
     profile_pipeline: bool = False,
     inference_precision: str = "auto",
     product_accumulator_dtype: str = "float16",
+    provenance_context_path: str | Path | None = None,
+    _live_cache: LiveOmeZarrCache | None = None,
 ) -> None:
     if int(download_workers) <= 0:
         raise ValueError("download_workers must be a positive integer")
@@ -328,17 +456,18 @@ def run_fiber_trace_3d_inference(
         raise ValueError("input_cache_gib must be finite and >= 0")
     if int(prefetch_tiles_per_gpu) <= 0 or int(input_io_threads) <= 0 or int(input_copy_threads) <= 0:
         raise ValueError("prefetch_tiles_per_gpu and TensorStore thread counts must be > 0")
-    config = _load_config(config_path)
+    config, config_source = _checkpoint_config_for_inference(checkpoint, config_path)
     tile_size_i = _tile_size_from_config(config, tile_size)
     output_manifest = Path(output_path)
     if not output_manifest.name.endswith(".lasagna.json"):
         raise ValueError(f"output must be .lasagna.json, got: {output_path}")
     output_dir = output_manifest.parent
+    provenance_path = output_dir / "inference.json"
     json_stem = output_manifest.name.removesuffix(".lasagna.json")
     if not json_stem:
         raise ValueError("output .lasagna.json path must have a non-empty stem")
 
-    if not no_download:
+    if not no_download and not live_fetch:
         _auto_download(input_path, crop_xyzwhd, download_workers=int(download_workers))
 
     a_in = zarr.open(str(input_path), mode="r")
@@ -417,13 +546,102 @@ def run_fiber_trace_3d_inference(
         base_shape_zyx=base_shape_zyx,
         n_levels=n_levels,
         ome_chunk=int(ome_chunk),
+        ome_compressor=ome_compressor,
     )
     write_lasagna_product_manifest(
         output_path=output_manifest,
         products=predict_adapter.output_products,
         base_shape_zyx=base_shape_zyx,
         crop_xyzwhd_base=crop_xyzwhd,
+		provenance_json="inference.json",
     )
+
+    try:
+        from inference_provenance import (
+            atomic_write as write_provenance,
+            base_document,
+            code_commit,
+            finalize_document,
+            json_digest,
+            load_context,
+        )
+    except ImportError:  # pragma: no cover - monorepo package import mode.
+        from lasagna.inference_provenance import (
+            atomic_write as write_provenance,
+            base_document,
+            code_commit,
+            finalize_document,
+            json_digest,
+            load_context,
+        )
+    provenance_context = load_context(provenance_context_path)
+    provenance = base_document(
+        artifact_kind="fiber3d-prediction",
+        context=provenance_context,
+    )
+    context_source = provenance_context.get("source", {})
+    requested_group = (
+        context_source.get("requested_group")
+        if isinstance(context_source, dict) else None
+    )
+    if requested_group is None:
+        input_group_name = Path(str(input_path).rstrip("/")).name
+        requested_group = (
+            int(input_group_name)
+            if input_group_name.isdigit()
+            else _level_from_scaledown(input_sd)
+        )
+    context_model = provenance_context.get("model", {})
+    atlas_model_id = context_model.get("atlas_model_id") if isinstance(context_model, dict) else None
+    checkpoint_provenance = _checkpoint_provenance(checkpoint, config)
+    checkpoint_provenance.update(
+        config_source=config_source,
+        config_sha256=json_digest(config),
+    )
+    provenance.update({
+        "source_scale": {
+            "requested_group": int(requested_group),
+            "observed_input_shape_zyx": list(input_shape),
+            "base_shape_zyx": list(base_shape_zyx),
+            "source_to_base_factor": int(input_sd),
+        },
+        "inference": {
+            "code_commit": code_commit(Path(__file__)),
+            "scaledown_power": power,
+            "scaledown_factor_from_input": output_sd_input,
+            "effective_base_factor": effective_output_sd,
+            "produced_levels": list(range(output_level, n_levels)),
+            "crop_xyzwhd_base": list(crop_xyzwhd) if crop_xyzwhd is not None else None,
+            "tile_size": tile_size_i,
+            "border": int(border),
+            "overlap": int(overlap),
+            "ome_chunk": int(ome_chunk),
+            "ome_compressor_requested": str(ome_compressor),
+            "precision": precision_mode,
+            "product_accumulator_dtype": str(product_accumulator_dtype),
+            "recurrent_steps": predict_adapter.recurrent_steps,
+            "live_fetch": {
+                "enabled": bool(live_fetch),
+                "cache_target_gib": float(live_cache_gib),
+                "lookahead_tiles": int(live_fetch_ahead_tiles),
+                "download_workers": int(download_workers),
+            },
+        },
+        "checkpoint": checkpoint_provenance,
+        "atlas_model_identity": {
+            "model_id": atlas_model_id,
+            "source": "trusted-checkpoint-metadata" if atlas_model_id else "unresolved",
+        },
+        "repository": _repository_state(),
+        "runtime": {
+            "python": platform.python_version(),
+            "torch": torch.__version__,
+            "zarr": getattr(zarr, "__version__", None),
+            "cuda": torch.version.cuda,
+        },
+        "manifest": output_manifest.name,
+    })
+    write_provenance(provenance_path, provenance)
 
     print(
         f"[fiber_trace_3d:infer] input={input_path} shape={input_shape} "
@@ -442,77 +660,98 @@ def run_fiber_trace_3d_inference(
 
     t0 = time.time()
     model = None
-    if len(resolved_devices) == 1:
-        print(
-            f"[fiber_trace_3d:infer] loading checkpoint={checkpoint} device={torch_device}",
-            flush=True,
+    try:
+        if len(resolved_devices) == 1:
+            print(
+                f"[fiber_trace_3d:infer] loading checkpoint={checkpoint} device={torch_device}",
+                flush=True,
+            )
+            model = predict_adapter.load_model(device=torch_device)
+            print("[fiber_trace_3d:infer] model loaded; starting tiled inference", flush=True)
+        else:
+            print("[fiber_trace_3d:infer] starting persistent multi-GPU workers", flush=True)
+        progress = {
+            "t0": time.time(),
+            "finalized_base_z": int(oz0 * effective_output_sd),
+            "finalized_base_z_total": int(oz1 * effective_output_sd),
+        }
+        run_tiled_inference_3d(
+            model,
+            a_in,
+            crop_slices=crop_slices,
+            device=torch_device,
+            model_adapter=predict_adapter,
+            output_adapter=output_adapter,
+            products=predict_adapter.output_products,
+			output_regions_zyx={p.name: output_region for p in predict_adapter.output_products},
+			full_output_shapes_zyx={p.name: full_output_shape for p in predict_adapter.output_products},
+            input_zarr_path=str(input_path),
+			output_scaledown_base={p.name: effective_output_sd for p in predict_adapter.output_products},
+            tile_size=tile_size_i,
+            overlap=int(overlap),
+            border=int(border),
+            tmp_dir=str(output_dir),
+            progress=progress,
+            temp_prefix=f"{json_stem}_",
+            devices=resolved_devices,
+            prefetch_workers=int(prefetch_workers),
+            slots_per_gpu=int(slots_per_gpu),
+            flush_workers=int(flush_workers),
+            input_reader=str(input_reader),
+            prefetch_tiles_per_gpu=int(prefetch_tiles_per_gpu),
+            input_cache_bytes=int(float(input_cache_gib) * (1 << 30)),
+            input_io_threads=int(input_io_threads),
+            input_copy_threads=int(input_copy_threads),
+            profile_pipeline=bool(profile_pipeline),
+            product_accumulator_dtype=str(product_accumulator_dtype),
+            accumulator_workers=int(accumulator_workers),
+            live_cache=_live_cache,
         )
-        model = predict_adapter.load_model(device=torch_device)
-        print("[fiber_trace_3d:infer] model loaded; starting tiled inference", flush=True)
-    else:
-        print("[fiber_trace_3d:infer] starting persistent multi-GPU workers", flush=True)
-    progress = {
-        "t0": time.time(),
-        "finalized_base_z": int(oz0 * effective_output_sd),
-        "finalized_base_z_total": int(oz1 * effective_output_sd),
-    }
-    run_tiled_inference_3d(
-        model,
-        a_in,
-        crop_slices=crop_slices,
-        device=torch_device,
-        model_adapter=predict_adapter,
-        output_adapter=output_adapter,
-        products=predict_adapter.output_products,
-		output_regions_zyx={p.name: output_region for p in predict_adapter.output_products},
-		full_output_shapes_zyx={p.name: full_output_shape for p in predict_adapter.output_products},
-        input_zarr_path=str(input_path),
-		output_scaledown_base={p.name: effective_output_sd for p in predict_adapter.output_products},
-        tile_size=tile_size_i,
-        overlap=int(overlap),
-        border=int(border),
-        tmp_dir=str(output_dir),
-        progress=progress,
-        temp_prefix=f"{json_stem}_",
-        devices=resolved_devices,
-        prefetch_workers=int(prefetch_workers),
-        slots_per_gpu=int(slots_per_gpu),
-        flush_workers=int(flush_workers),
-        input_reader=str(input_reader),
-        prefetch_tiles_per_gpu=int(prefetch_tiles_per_gpu),
-        input_cache_bytes=int(float(input_cache_gib) * (1 << 30)),
-        input_io_threads=int(input_io_threads),
-        input_copy_threads=int(input_copy_threads),
-        profile_pipeline=bool(profile_pipeline),
-        product_accumulator_dtype=str(product_accumulator_dtype),
-        accumulator_workers=int(accumulator_workers),
-    )
-    del model
-    if torch_device.type == "cuda":
-        torch.cuda.empty_cache()
+        if _live_cache is not None:
+            _live_cache.close()
+            provenance["inference"]["live_fetch"]["final_stats"] = _live_cache.snapshot()
+            write_provenance(provenance_path, provenance)
+        del model
+        if torch_device.type == "cuda":
+            torch.cuda.empty_cache()
 
-    build_product_omezarr_pyramids(
-        products=predict_adapter.output_products,
-        n_levels=n_levels,
-        ome_chunk=int(ome_chunk),
-        crop_zyx=output_region,
-        workers=int(pyramid_workers),
-    )
-    removed_finish = _cleanup_predict3d_temp_files(
-        output_dir,
-        f"{json_stem}_",
-        remove_current_process=True,
-    )
-    if removed_finish > 0:
+        build_product_omezarr_pyramids(
+            products=predict_adapter.output_products,
+            n_levels=n_levels,
+            ome_chunk=int(ome_chunk),
+            crop_zyx=output_region,
+            workers=int(pyramid_workers),
+        )
+        removed_finish = _cleanup_predict3d_temp_files(
+            output_dir,
+            f"{json_stem}_",
+            remove_current_process=True,
+        )
+        if removed_finish > 0:
+            print(
+                f"[fiber_trace_3d:infer] removed {removed_finish} temp path(s) on finish",
+                flush=True,
+            )
+        finalize_document(
+            provenance, path=provenance_path, status="completed",
+            manifest_path=output_manifest,
+        )
         print(
-            f"[fiber_trace_3d:infer] removed {removed_finish} temp path(s) on finish",
+            f"[fiber_trace_3d:infer] done output={output_manifest} "
+            f"elapsed={time.time() - t0:.1f}s",
             flush=True,
         )
-    print(
-        f"[fiber_trace_3d:infer] done output={output_manifest} "
-        f"elapsed={time.time() - t0:.1f}s",
-        flush=True,
-    )
+    except BaseException as error:
+        if _live_cache is not None:
+            _live_cache.close()
+            provenance["inference"]["live_fetch"]["final_stats"] = _live_cache.snapshot()
+        finalize_document(
+            provenance, path=provenance_path,
+            status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
+            manifest_path=output_manifest,
+            error=type(error).__name__,
+        )
+        raise
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -520,7 +759,10 @@ def main(argv: list[str] | None = None) -> int:
         description="Run shared tiled 3D inference for fiber trace models.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("config", help="Fiber trace 3D training/inference config JSON.")
+    parser.add_argument(
+        "config", nargs="?", default=None,
+        help="Legacy Fiber config JSON; omitted when the checkpoint embeds config.",
+    )
     parser.add_argument("--input", required=True, help="Input zarr array (3D ZYX).")
     parser.add_argument("--output", required=True, help="Output .lasagna.json manifest path.")
     parser.add_argument("--checkpoint", required=True, help="Fiber trace 3D model checkpoint (.pt).")
@@ -604,6 +846,18 @@ def main(argv: list[str] | None = None) -> int:
         help="Parallel S3 chunk download threads used by automatic download.",
     )
     parser.add_argument(
+        "--live-fetch", action="store_true",
+        help="Fetch the selected input scale lazily and evict only safe old Z-chunk planes.",
+    )
+    parser.add_argument(
+        "--live-cache-gib", type=float, default=None,
+        help=f"Selected-scale disk-cache target in GiB (default: {DEFAULT_LIVE_CACHE_GIB}).",
+    )
+    parser.add_argument(
+        "--live-fetch-ahead-tiles", type=int, default=None,
+        help=f"Lazy materialization lookahead in canonical tiles (default: {DEFAULT_LIVE_FETCH_AHEAD_TILES}).",
+    )
+    parser.add_argument(
         "--base-ref",
         default=None,
         help="Reference zarr for base shape. With --base-scale N, base = ref_shape * 2^N.",
@@ -623,6 +877,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--ome-chunk", type=int, default=64, help="Output OME-Zarr chunk size.")
     parser.add_argument(
+        "--ome-compressor", choices=OME_COMPRESSOR_CHOICES, default=DEFAULT_OME_COMPRESSOR,
+        help="Compressor for newly created output arrays; existing arrays retain their codec.",
+    )
+    parser.add_argument(
         "--pyramid-workers",
         type=int,
         default=0,
@@ -633,6 +891,10 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=None,
         help="Conditioned recurrent inference steps; each step is stored as one option.",
+    )
+    parser.add_argument(
+        "--provenance-context", default=None,
+        help="Manager-provided portable source/model context JSON.",
     )
     args = parser.parse_args(argv)
     if int(args.download_workers) <= 0:
@@ -649,6 +911,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--input-io-threads must be > 0")
     if int(args.input_copy_threads) <= 0:
         parser.error("--input-copy-threads must be > 0")
+    if not args.live_fetch and (args.live_cache_gib is not None or args.live_fetch_ahead_tiles is not None):
+        parser.error("--live-cache-gib/--live-fetch-ahead-tiles require --live-fetch")
+    if args.live_fetch and args.no_download:
+        parser.error("--live-fetch conflicts with --no-download")
+    if args.live_fetch and args.crop_xyzwhd is not None:
+        parser.error("--live-fetch supports only full, non-cropped inference")
 
     run_fiber_trace_3d_inference(
         config_path=args.config,
@@ -667,6 +935,7 @@ def main(argv: list[str] | None = None) -> int:
         no_download=bool(args.no_download),
         levels=int(args.levels),
         ome_chunk=int(args.ome_chunk),
+        ome_compressor=str(args.ome_compressor),
         pyramid_workers=int(args.pyramid_workers),
         recurrent_steps=args.recurrent_steps,
         prefetch_workers=int(args.prefetch_workers),
@@ -682,6 +951,15 @@ def main(argv: list[str] | None = None) -> int:
         inference_precision=str(args.inference_precision),
         product_accumulator_dtype=str(args.product_accumulator_dtype),
         download_workers=int(args.download_workers),
+        live_fetch=bool(args.live_fetch),
+        live_cache_gib=(
+            DEFAULT_LIVE_CACHE_GIB if args.live_cache_gib is None else float(args.live_cache_gib)
+        ),
+        live_fetch_ahead_tiles=(
+            DEFAULT_LIVE_FETCH_AHEAD_TILES
+            if args.live_fetch_ahead_tiles is None else int(args.live_fetch_ahead_tiles)
+        ),
+        provenance_context_path=args.provenance_context,
     )
     return 0
 
