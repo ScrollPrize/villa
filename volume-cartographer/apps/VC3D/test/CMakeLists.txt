@@ -167,6 +167,7 @@ target_include_directories(test_annotation_frame PRIVATE
     ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 target_link_libraries(test_annotation_frame PRIVATE
+    vc_core
     Qt6::Core
     Qt6::Test)
 

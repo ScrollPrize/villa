@@ -552,6 +552,9 @@ private:
     // re-applies sheet normals after the umbilicus changed. Failures are logged
     // per pane and do not stop the others.
     void rematerializeOpenGeneratedViews();
+    // Everything the orientation of a freshly built set of views would come from.
+    [[nodiscard]] vc3d::annotation::OrientationKey currentOrientationKey() const;
+    void onActiveVolumeChanged();
     // Pushes _umbilicusNotice to every open pane's dialog.
     void publishUmbilicusNotice();
     void finishOptimization(const std::string& surfaceName);
@@ -820,6 +823,14 @@ private:
     // volume switch handed the orientation vote geometry from the previous frame.
     vc3d::annotation::AnnotationFrame _scrollUmbilicusFrame;
     bool _scrollUmbilicusLoadAttempted = false;
+    // How the cached umbilicus was read, and by what factor. Part of the
+    // orientation key: the factor is where a voxel size, if it mattered at all,
+    // actually reached the geometry.
+    vc3d::annotation::UmbilicusOrientationMode _scrollUmbilicusMode =
+        vc3d::annotation::UmbilicusOrientationMode::VolumeCentre;
+    double _scrollUmbilicusFactor = 0.0;
+    std::string _scrollUmbilicusTransformPath;
+    std::uintmax_t _scrollUmbilicusTransformSize = 0;
     // Why the package's umbilicus could not be used, for the strip notice.
     // Empty when one was applied, and when none exists to complain about.
     // Orienting off the volume centre instead is exactly the silent degradation

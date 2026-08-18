@@ -58,6 +58,7 @@
 #include <QLineEdit>
 #include <QMetaObject>
 #include <QMessageBox>
+#include <QScopedValueRollback>
 #include <QMdiArea>
 #include <QMdiSubWindow>
 #include <QPoint>
@@ -127,6 +128,10 @@ struct LineAnnotationController::LineAnnotationSession {
     std::shared_ptr<vc::lasagna::LasagnaDataset> traceNormalDataset;
     std::shared_ptr<vc::lasagna::LasagnaNormalSampler> traceNormalSampler;
     TaskState taskState = TaskState::Idle;
+    // What the currently materialized generated views took their orientation
+    // from. Compared when the active volume or the umbilicus changes, so the
+    // question is asked of the real inputs rather than a proxy.
+    vc3d::annotation::OrientationKey orientationKey;
     cv::Vec3d seedPoint{0.0, 0.0, 0.0};
     std::string sourceAnnotationSurfaceName;
     vc::lasagna::LineOptimizationReport optimizationReport;
@@ -1893,6 +1898,17 @@ LineAnnotationController::LineAnnotationController(CState* state,
         // normals to surfaces already built, so the attach would report success
         // while every open strip kept its old orientation — told it worked, and
         // nothing visibly changes.
+        // Queued: CState emits volumeChanged from inside ViewerManager::switchVolume(),
+        // before it restores focus and navigation, and materialization reads pane
+        // camera state. Running after the switch unwinds also coalesces rapid
+        // switching.
+        connect(_state,
+                &CState::volumeChanged,
+                this,
+                [this](const std::shared_ptr<Volume>&, const std::string&) {
+                    onActiveVolumeChanged();
+                },
+                Qt::QueuedConnection);
         connect(_state, &CState::umbilicusChanged, this, [this]() {
             invalidateScrollUmbilicus();
             publishUmbilicusNotice();
@@ -9532,7 +9548,75 @@ void LineAnnotationController::invalidateScrollUmbilicus()
     _scrollUmbilicusLoadAttempted = false;
     _scrollUmbilicusFrame = {};
     _scrollUmbilicus.reset();
+    _scrollUmbilicusMode = vc3d::annotation::UmbilicusOrientationMode::VolumeCentre;
+    _scrollUmbilicusFactor = 0.0;
+    _scrollUmbilicusTransformPath.clear();
+    _scrollUmbilicusTransformSize = 0;
     _umbilicusNotice.clear();
+}
+
+vc3d::annotation::OrientationKey
+LineAnnotationController::currentOrientationKey() const
+{
+    vc3d::annotation::OrientationKey key;
+    const auto frame = annotationFrame();
+    for (int axis = 0; axis < 3; ++axis) {
+        key.gridXyz[axis] = std::llround(frame.extentXyz[axis]);
+    }
+    try {
+        if (const auto volume = _state ? _state->currentVolume() : nullptr) {
+            key.rawVolumeShapeXyz = {volume->sliceWidth(),
+                                     volume->sliceHeight(),
+                                     volume->numSlices()};
+        }
+    } catch (...) {
+    }
+    key.mode = _scrollUmbilicusMode;
+    key.umbilicusFactor = _scrollUmbilicusFactor;
+    key.transformPath = _scrollUmbilicusTransformPath;
+    key.transformSize = _scrollUmbilicusTransformSize;
+    return key;
+}
+
+void LineAnnotationController::onActiveVolumeChanged()
+{
+    // Order matters, and the cheap checks come first: this fires on every volume
+    // selection, including the initial load and every downsample-level switch, and
+    // nothing here may touch the filesystem in the common case.
+    //
+    // Not keyed on _scrollUmbilicusLoadAttempted: invalidateScrollUmbilicus()
+    // resets that flag without closing any pane, so generated views can outlive it
+    // and an early return here would leave them stale for good.
+    const bool anythingMaterialized =
+        std::any_of(_panes.begin(), _panes.end(), [](const PaneRecord& pane) {
+            return pane.session && !pane.session->generatedSurfaceNames.empty();
+        });
+    if (!anythingMaterialized) {
+        return;
+    }
+
+    // The key, not the annotation frame: two volumes of one scan can record
+    // different micrometre figures while indexing the same voxels, and whether
+    // that matters depends entirely on whether the umbilicus scale was derived
+    // from those figures — which the factor already answers.
+    const auto key = currentOrientationKey();
+    const bool everythingCurrent =
+        std::all_of(_panes.begin(), _panes.end(), [&key](const PaneRecord& pane) {
+            return !pane.session || pane.session->generatedSurfaceNames.empty() ||
+                   vc3d::annotation::sameOrientationKey(
+                       pane.session->orientationKey, key);
+        });
+    if (everythingCurrent) {
+        return;
+    }
+
+    // Deliberately no ++_umbilicusGeneration: that counter means "the attachment
+    // changed", which holders such as the Fiber Map read to decide staleness, and
+    // a volume switch is not an attachment change — the Fiber Map covers it
+    // through its own frame comparison.
+    invalidateScrollUmbilicus();
+    publishUmbilicusNotice();
+    rematerializeOpenGeneratedViews();
 }
 
 void LineAnnotationController::rematerializeOpenGeneratedViews()
@@ -9547,6 +9631,20 @@ void LineAnnotationController::rematerializeOpenGeneratedViews()
         if (!pane.session || pane.session->suppressGeneratedViews) {
             continue;
         }
+        // Nothing was ever materialized for this pane, so there is no stale
+        // orientation on screen to correct — and the builder rejects an empty
+        // model, which during initial tracing turned a successful attach into a
+        // modal complaint about views the user never asked for.
+        if (pane.session->generatedSurfaceNames.empty() ||
+            pane.session->optimizedLine.points.empty()) {
+            continue;
+        }
+        // A reaction to someone else's action must not interrupt with a dialog
+        // about a pane they were not looking at; the warning below is the report.
+        // Scoped rather than saved and restored by hand: materializeGeneratedViews
+        // can throw past its own catch, which would leave this session silent for
+        // good.
+        QScopedValueRollback<bool> quiet(pane.session->suppressErrorDialogs, true);
         try {
             if (!materializeGeneratedViews(*pane.session)) {
                 Logger()->warn(
@@ -9717,6 +9815,9 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
                                     resolved.path.filename().string()));
                     } else if (action ==
                                vc::core::util::UmbilicusLoadAction::Apply) {
+                        _scrollUmbilicusMode =
+                            vc3d::annotation::UmbilicusOrientationMode::Applied;
+                        _scrollUmbilicusFactor = scale->factor;
                         for (auto& point : controlPoints) {
                             point *= static_cast<float>(scale->factor);
                         }
@@ -9772,6 +9873,12 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
                                     volpkgRoot / "transforms" / "transform.json";
                             }
                             if (fs::exists(transformPath)) {
+                                std::error_code sizeEc;
+                                const auto size =
+                                    fs::file_size(transformPath, sizeEc);
+                                _scrollUmbilicusTransformPath =
+                                    transformPath.string();
+                                _scrollUmbilicusTransformSize = sizeEc ? 0 : size;
                                 try {
                                     const cv::Matx44d toSession =
                                         vc::core::util::invertAffineTransformMatrix(
@@ -9795,6 +9902,9 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
                             framed = std::move(controlPoints);
                         }
                         if (framed) {
+                            _scrollUmbilicusMode =
+                                vc3d::annotation::UmbilicusOrientationMode::Legacy;
+                            _scrollUmbilicusFactor = 1.0;
                             _scrollUmbilicus = vc::core::util::Umbilicus::FromPoints(
                                 std::move(*framed), volumeShape);
                             Logger()->info(
@@ -9922,6 +10032,11 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
                   session.suppressErrorDialogs);
         return false;
     }
+
+    // Recorded after the build succeeded and before the old surfaces go, since
+    // orientedLineNormalsForSession() above is what resolved the umbilicus and
+    // therefore what settled the mode, the factor and the transform.
+    session.orientationKey = currentOrientationKey();
 
     for (const auto& name : session.generatedSurfaceNames) {
         _state->setSurface(name, nullptr);

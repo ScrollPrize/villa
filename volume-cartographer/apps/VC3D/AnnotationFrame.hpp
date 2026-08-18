@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <optional>
+#include <string>
 
 namespace vc3d::annotation {
 
@@ -105,6 +107,77 @@ inline bool sameAnnotationFrame(const AnnotationFrame& a,
             return false;
     }
     return true;
+}
+
+// Whether two frames are the same *grid*, i.e. whether geometry expressed in
+// voxels indexes the same voxels in both. Voxel counts only.
+//
+// Neither this nor sameAnnotationFrame proves the two are voxelwise aligned:
+// AnnotationFrame carries no origin, axis order or pose, so equal counts are also
+// consistent with a crop or a registration. Both are proxies. This is the
+// narrower question, asked where the answer decides whether to destroy work: a
+// differing physical voxel size relabels a grid, it does not replace it, and
+// geometry computed in voxels is still about the same voxels.
+inline bool sameAnnotationGrid(const AnnotationFrame& a, const AnnotationFrame& b)
+{
+    for (int axis = 0; axis < 3; ++axis) {
+        if (std::llround(a.extentXyz[axis]) != std::llround(b.extentXyz[axis]))
+            return false;
+    }
+    return true;
+}
+
+// How a set of generated views got its scroll-centre reference.
+enum class UmbilicusOrientationMode {
+    // No usable umbilicus: the volume's raw XY centre.
+    VolumeCentre,
+    // A resolved umbilicus carried into the annotation frame by a derived scale.
+    Applied,
+    // A resolved umbilicus read the pre-metadata way, optionally through a
+    // registration transform's inverse.
+    Legacy,
+};
+
+// Everything a materialized set of generated views took its orientation from.
+// Recorded when the views are built and compared when something changes, so the
+// question "do these views still reflect the current state" is asked of the
+// actual inputs rather than of a proxy for them.
+//
+// Deliberately not an AnnotationFrame compared with sameAnnotationFrame(): that
+// comparison is voxel-size sensitive, so it would differ for two volumes of one
+// scan whose recorded micrometre figures disagree and force a rebuild before
+// umbilicusFactor could show that nothing had moved. Whatever the voxel size
+// contributed, it contributed through the factor.
+//
+// The scale *source* is deliberately absent: identical resolved geometry must not
+// rebuild because its provenance changed.
+struct OrientationKey {
+    // The annotation grid, as integer voxel counts.
+    std::array<long long, 3> gridXyz{0, 0, 0};
+    // The session volume's own shape. The volume-centre fallback and the legacy
+    // reading both use it directly, so two volumes sharing an annotation grid can
+    // still need different orientation.
+    std::array<int, 3> rawVolumeShapeXyz{0, 0, 0};
+    UmbilicusOrientationMode mode = UmbilicusOrientationMode::VolumeCentre;
+    // The scale actually applied to the umbilicus points.
+    double umbilicusFactor = 0.0;
+    // Legacy reading only: the registration transform it went through, if any.
+    std::string transformPath;
+    std::uintmax_t transformSize = 0;
+};
+
+inline bool sameOrientationKey(const OrientationKey& a, const OrientationKey& b)
+{
+    if (a.gridXyz != b.gridXyz || a.rawVolumeShapeXyz != b.rawVolumeShapeXyz)
+        return false;
+    if (a.mode != b.mode)
+        return false;
+    if (a.transformPath != b.transformPath || a.transformSize != b.transformSize)
+        return false;
+    // Relative, so floating-point representation noise cannot cause rebuild churn.
+    const double scale = std::max({std::abs(a.umbilicusFactor),
+                                   std::abs(b.umbilicusFactor), 1.0});
+    return std::abs(a.umbilicusFactor - b.umbilicusFactor) <= 1e-9 * scale;
 }
 
 } // namespace vc3d::annotation

@@ -5,8 +5,15 @@
 
 #include "AnnotationFrame.hpp"
 
+#include "vc/core/util/ScrollUmbilicus.hpp"
+
 using vc3d::annotation::AnnotationFrame;
 using vc3d::annotation::deriveAnnotationFrame;
+using vc3d::annotation::OrientationKey;
+using vc3d::annotation::sameAnnotationFrame;
+using vc3d::annotation::sameAnnotationGrid;
+using vc3d::annotation::sameOrientationKey;
+using vc3d::annotation::UmbilicusOrientationMode;
 
 namespace
 {
@@ -20,6 +27,23 @@ namespace
         return {kSourceDims[0] / divisor,
                 kSourceDims[1] / divisor,
                 kSourceDims[2] / divisor};
+    }
+    // PHerc0139_ds2.volpkg: two volumes of one scan, byte-identical voxel counts,
+    // recorded voxel sizes 2.5% apart. Measured from their meta.json, not
+    // constructed, because the whole question this pair settles is what real
+    // metadata does.
+    const std::array<double, 3> kPHerc0139Dims{6628.0, 6628.0, 19239.0};
+    constexpr double kPHerc0139RawUm = 9.596;
+    constexpr double kPHerc0139SurfUm = 9.362;
+
+    OrientationKey appliedKey(double factor)
+    {
+        OrientationKey key;
+        key.gridXyz = {6628, 6628, 19239};
+        key.rawVolumeShapeXyz = {6628, 6628, 19239};
+        key.mode = UmbilicusOrientationMode::Applied;
+        key.umbilicusFactor = factor;
+        return key;
     }
 } // namespace
 
@@ -175,6 +199,104 @@ private slots:
         QVERIFY(badStamp.voxelSizeUm.has_value());
         QCOMPARE(*badStamp.voxelSizeUm, kSourceUm);
         QCOMPARE(badStamp.factor, 4.0);
+    }
+    // The measurement that decides how destructive a voxel-size-only change may
+    // be. Both volumes index the same voxels; only the micrometre label differs.
+    void sameGridDifferentVoxelSize()
+    {
+        const auto raw =
+            deriveAnnotationFrame(kPHerc0139RawUm, 0, std::nullopt, kPHerc0139Dims);
+        const auto surf =
+            deriveAnnotationFrame(kPHerc0139SurfUm, 0, std::nullopt, kPHerc0139Dims);
+
+        QCOMPARE(*raw.voxelSizeUm, kPHerc0139RawUm);
+        QCOMPARE(*surf.voxelSizeUm, kPHerc0139SurfUm);
+        QCOMPARE(raw.extentXyz, surf.extentXyz);
+
+        // Different frames, same grid: geometry in voxels still means the same
+        // thing, so this must not be read as "the map is meaningless here".
+        QVERIFY(!sameAnnotationFrame(raw, surf));
+        QVERIFY(sameAnnotationGrid(raw, surf));
+    }
+
+    void differentCountsAreADifferentGrid()
+    {
+        const auto here = deriveAnnotationFrame(kSourceUm, 0, std::nullopt, kSourceDims);
+        const auto elsewhere =
+            deriveAnnotationFrame(kSourceUm, 0, std::nullopt, {20000.0, 20000.0, 40000.0});
+        QVERIFY(!sameAnnotationGrid(here, elsewhere));
+        QVERIFY(!sameAnnotationFrame(here, elsewhere));
+
+        // And an unknown voxel size never silently matches a known one, on either
+        // predicate's terms: the grid still compares equal, the frame does not.
+        const auto unknown = deriveAnnotationFrame(0.0, 0, std::nullopt, kSourceDims);
+        QVERIFY(!sameAnnotationFrame(here, unknown));
+        QVERIFY(sameAnnotationGrid(here, unknown));
+    }
+
+    // Which scale path the umbilicus took is what decides whether the 2.5% voxel
+    // size difference above reaches the geometry at all.
+    void scalePathsAcrossTheSameGrid()
+    {
+        vc::core::util::UmbilicusFileInfo stamped;
+        stamped.controlPoints = {{100.0f, 100.0f, 200.0f},
+                                 {120.0f, 120.0f, 19000.0f}};
+        stamped.volumeWidth = 6628;
+        stamped.volumeHeight = 6628;
+        stamped.volumeSlices = 19239;
+        stamped.voxelsizeUm = kPHerc0139RawUm;
+
+        const auto viaDimsRaw = vc::core::util::deriveUmbilicusScale(
+            stamped, kPHerc0139Dims, kPHerc0139RawUm);
+        const auto viaDimsSurf = vc::core::util::deriveUmbilicusScale(
+            stamped, kPHerc0139Dims, kPHerc0139SurfUm);
+        QVERIFY(viaDimsRaw.has_value());
+        QVERIFY(viaDimsSurf.has_value());
+        // Dimensions win over voxel size, and the dimensions are identical, so
+        // the factor is too: switching between these volumes moves nothing.
+        QCOMPARE(viaDimsRaw->factor, 1.0);
+        QCOMPARE(viaDimsSurf->factor, 1.0);
+
+        vc::core::util::UmbilicusFileInfo voxelOnly;
+        voxelOnly.controlPoints = stamped.controlPoints;
+        voxelOnly.voxelsizeUm = kPHerc0139RawUm;
+        const auto viaVoxelRaw = vc::core::util::deriveUmbilicusScale(
+            voxelOnly, kPHerc0139Dims, kPHerc0139RawUm);
+        const auto viaVoxelSurf = vc::core::util::deriveUmbilicusScale(
+            voxelOnly, kPHerc0139Dims, kPHerc0139SurfUm);
+        QVERIFY(viaVoxelRaw.has_value());
+        QVERIFY(viaVoxelSurf.has_value());
+        QCOMPARE(viaVoxelRaw->factor, 1.0);
+        // 9.596 / 9.362: here the label does reach the geometry.
+        QVERIFY(std::abs(viaVoxelSurf->factor - 1.024995) < 1e-5);
+    }
+
+    // The orientation key is what the views were built from, so a factor that did
+    // not move must not cost a rebuild, and one that did must.
+    void orientationKeyFollowsTheFactor()
+    {
+        QVERIFY(sameOrientationKey(appliedKey(1.0), appliedKey(1.0)));
+        QVERIFY(!sameOrientationKey(appliedKey(1.0), appliedKey(1.024995)));
+
+        // Representation noise is not a change.
+        QVERIFY(sameOrientationKey(appliedKey(4.0), appliedKey(4.0 + 1e-13)));
+
+        // The volume's own shape is in the key because the volume-centre fallback
+        // and the legacy reading use it directly.
+        auto otherShape = appliedKey(1.0);
+        otherShape.rawVolumeShapeXyz = {3314, 3314, 9620};
+        QVERIFY(!sameOrientationKey(appliedKey(1.0), otherShape));
+
+        // As is how the umbilicus was read at all.
+        auto legacy = appliedKey(1.0);
+        legacy.mode = UmbilicusOrientationMode::Legacy;
+        QVERIFY(!sameOrientationKey(appliedKey(1.0), legacy));
+
+        // And the registration transform a legacy reading went through.
+        auto viaTransform = legacy;
+        viaTransform.transformPath = "/vol/transform.json";
+        viaTransform.transformSize = 512;
+        QVERIFY(!sameOrientationKey(legacy, viaTransform));
     }
 };
 
