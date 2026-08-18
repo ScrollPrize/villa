@@ -200,6 +200,34 @@ TEST_CASE("native Callgrind parser preserves chronological deltas and totals")
     CHECK(parsed.totals.at(1).at("D1mr") == 3);
 }
 
+TEST_CASE("native Callgrind parser ignores zero residual-only idle threads")
+{
+    TemporaryDirectory temporary;
+    const auto prefix = temporary.path / "callgrind.out";
+    writeText(temporary.path / "callgrind.out.1-01", callgrindProfile(1, {10, 2, 1}));
+    writeText(temporary.path / "callgrind.out.1-02", callgrindProfile(2, {0, 0, 0}));
+    writeText(temporary.path / "callgrind.out-01", callgrindProfile(1, {0, 0, 0}));
+    writeText(temporary.path / "callgrind.out-02", callgrindProfile(2, {0, 0, 0}));
+    writeText(temporary.path / "callgrind.out-03", callgrindProfile(3, {0, 0, 0}));
+
+    const auto parsed = replay::parsePeriodicCallgrind(prefix);
+    REQUIRE(parsed.totals.size() == 1);
+    CHECK(parsed.totals.contains(1));
+    CHECK_FALSE(parsed.totals.contains(2));
+    CHECK_FALSE(parsed.totals.contains(3));
+}
+
+TEST_CASE("native Callgrind parser rejects nonzero residual-only threads")
+{
+    TemporaryDirectory temporary;
+    const auto prefix = temporary.path / "callgrind.out";
+    writeText(temporary.path / "callgrind.out.1-01", callgrindProfile(1, {10, 2, 1}));
+    writeText(temporary.path / "callgrind.out-01", callgrindProfile(1, {0, 0, 0}));
+    writeText(temporary.path / "callgrind.out-02", callgrindProfile(2, {1, 0, 0}));
+
+    CHECK_THROWS_WITH_AS(replay::parsePeriodicCallgrind(prefix), doctest::Contains("Callgrind residual-only thread contains measured work"), std::runtime_error);
+}
+
 TEST_CASE("native DRD parser trims to the passive measured clock pair")
 {
     TemporaryDirectory temporary;

@@ -13,6 +13,12 @@ Ninja to generate a fresh eight-case Valgrind graph:
 - complete DRD dependency graphs for the four parallel cases;
 - a relative modeled-runtime score and exact rendering checksum per case.
 
+The fixture renders through the production `ChunkCache`. A deterministic fake
+`IChunkFetcher` preloads all resident and missing states before measurement;
+the benchmark fails if a timed render reaches the fetcher. Storage, decode, and
+download work are therefore excluded while production cache lookup, locking,
+and request-context handling remain measured.
+
 Every score must stay at or below the reference plus the one-sided slowdown
 tolerance stored in `core/test/data/render_valgrind_ci_reference.json`. Faster
 scores pass. This is a regression score, not estimated native wall time.

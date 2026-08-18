@@ -109,6 +109,11 @@ EventProfile addProfiles(const EventProfile& left, const EventProfile& right)
     return result;
 }
 
+bool profileIsZero(const EventProfile& profile)
+{
+    return std::all_of(profile.begin(), profile.end(), [](const auto& event) { return event.second == 0; });
+}
+
 std::int64_t profileValue(const EventProfile& profile, const std::string& name)
 {
     const auto found = profile.find(name);
@@ -316,11 +321,20 @@ CallgrindTrace parsePeriodicCallgrind(const std::filesystem::path& prefix)
         auto parsed_residual = parseProfile(residual_file->second);
         total = addProfiles(total, parsed_residual.events);
         slices.push_back(std::move(parsed_residual.events));
+        if (profileIsZero(total)) {
+            continue;
+        }
         result.slices.emplace(thread, std::move(slices));
         result.totals.emplace(thread, std::move(total));
     }
-    if (residuals.size() != files.size()) {
-        throw std::runtime_error("Callgrind residual and periodic thread sets differ");
+    for (const auto& [thread, path] : residuals) {
+        if (files.contains(thread)) {
+            continue;
+        }
+        const auto residual = parseProfile(path);
+        if (residual.thread != thread || !profileIsZero(residual.events)) {
+            throw std::runtime_error("Callgrind residual-only thread contains measured work");
+        }
     }
     return result;
 }

@@ -21,22 +21,24 @@
 
 - The benchmark must exercise the production `ChunkedPlaneSampler`
   fine-to-coarse coordinate rendering path.
-- It must use a deterministic synthetic chunked volume with four pyramid
-  levels and pseudo-random decoded `uint8` chunk contents.
+- It must use the production `ChunkCache` with a deterministic synthetic
+  `IChunkFetcher`, four pyramid levels, and pseudo-random decoded `uint8`
+  chunk contents.
 - Synthetic chunk materialization must occur before the measured region. The
   measured workload must represent rendering against controlled resident,
-  missing, and fallback states, without storage, network, compression, or
-  asynchronous cache scheduling costs.
+  missing, and fallback states, including production cache lookup and locking
+  costs but excluding storage, network, compression, decode, and asynchronous
+  cache scheduling costs. No fetcher call may occur after preload.
 - The coordinate fixture must include substantial contiguous runs of spatially
   correlated coordinates, matching the usual surface-rendering access pattern.
 - The fixture must use trilinear sampling with every coordinate and all eight
   required voxels in bounds at every pyramid level. For a coordinate assigned
   to level `L`, at least one required chunk must be missing at each finer level
   and all required chunks must be resident data at level `L`.
-- Both `tryGetChunk()` and `getChunkIfCached()` must return pre-materialized
-  states without allocation or mutation. The benchmark must use
-  `queueMisses=true` and `queuedFallbackLevels=0` so level 0 follows the normal
-  request path and fallback levels use resident-only reads.
+- Both `tryGetChunk()` and `getChunkIfCached()` must resolve through the real
+  cache from pre-materialized states. The benchmark must use `queueMisses=true`
+  and `queuedFallbackLevels=0` so level 0 follows the normal request path and
+  fallback levels use resident-only reads.
 - The benchmark must provide these scenarios:
   - `full_res`: every coordinate is available at level 0.
   - `fallback_3`: every coordinate falls back through levels 0, 1, and 2 and
