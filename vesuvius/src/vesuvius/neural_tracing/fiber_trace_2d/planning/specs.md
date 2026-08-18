@@ -3136,6 +3136,18 @@
   coordinate-discovery and stable-filter visits. Production reports direct
   owned visits and the visits avoided relative to its former two complete
   support-range scans; existing logical observation populations are unchanged.
+- Version 17 splits direction-conditioned peak data into 16-byte float32 hot
+  response records, parallel 32-bit evidence indices, and 16-byte retained
+  evidence records. Invalid-gradient retained observations remain evidence
+  because their aligned weight contributes to gradient coverage. Prepared
+  response/evidence counters report populations; response-observation visits
+  count every hot scan, while evidence-observation visits count indexed records
+  actually loaded after radial rejection. Record sizes and maximum temporary
+  peak-observation storage are reported explicitly.
+- Peak response implementations may regroup equivalent accumulation work;
+  exact floating-point identity and fixed accumulation order are not required.
+  Deterministic repeatability, anchor axis/position distributions, populations,
+  replay metrics, failures, and visual quality remain the acceptance gates.
 - Transient direction-conditioned peak observations and transverse response
   math use float32. Persistent anchor state, accepted positions, diagnostics,
   and serialized output remain double precision. Peak ties and downstream DP

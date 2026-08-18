@@ -622,3 +622,88 @@ to 234.29 seconds, and command wall from 10.65 to 10.43 seconds. Median peak
 RSS was 2.02 GiB. Peak request/miss/acceptance counters, all extraction and DP
 populations, 2 greedy / 1 fiberlet failures, and complete replay SHA-256 were
 identical to checkpoint 14.
+
+## Checkpoint 16: Split Peak Response And Evidence Streams
+
+1. Use committed checkpoint 15 (`f88aea31e`) and its three-run medians as the
+   baseline: 10.43 seconds command wall, 234.29 seconds total CPU, 6.221
+   seconds anchor wall, 160.30 seconds anchor CPU, and 42.84 worker-seconds in
+   direction-conditioned peak search.
+2. Replace the wide all-observation peak record with a compact fixed-width hot
+   record containing transverse coordinates, axial Gaussian, and signal. Keep
+   one hot record for every spatially relevant observation in canonical order,
+   with retained-evidence indices in a parallel fixed-width array so the
+   dominant coordinate/kernel stream remains a 16-byte stride.
+3. Store direction-alignment and projected-gradient fields only for retained,
+   direction-usable evidence whose stored float alignment is positive. Invalid
+   gradients remain evidence because their aligned weight contributes to the
+   gradient-coverage denominator. Preserve that evidence's relative observation
+   order. A response scans the hot records once, computes the
+   Gaussian once, accumulates denominator and numerator, and consults the
+   compact evidence stream only when the hot record carries a valid index.
+4. Small floating-point and accumulation-order changes are acceptable. Do not
+   add compatibility arithmetic solely to reproduce legacy bits. Preserve the
+   response equation, candidate domain, hill-climb/tie traversal, acceptance
+   checks, and deterministic execution.
+5. Advance the extraction profile schema and report prepared hot/evidence
+   populations plus hot/evidence response visits. Prepared-count ratios expose
+   the evidence population fraction. Hot visits count every response-record
+   scan; evidence visits count only indexed records actually reached inside the
+   radial cutoff, so their ratio also includes spatial rejection. Report actual
+   record sizes/capacities and peak RSS.
+6. Add focused profile invariants and peak behavior coverage, including a
+   mixed/interleaved fixture with denominator-only and retained evidence, plus
+   retained evidence with invalid gradients. Assert stream and visit
+   relationships without exposing the transient record types as public API.
+7. Build and run focused GCC and Clang anchor/path/replay tests. Run three
+   canonical 32-thread, 5,000-base-voxel replays and compare total/anchor wall
+   and CPU, peak-search worker time, hot/evidence populations and visits, peak
+   request counters, peak RSS, extraction/DP populations, replay failures, and
+   artifacts against checkpoint 15. If artifacts differ, additionally compare
+   deterministic repeats, anchor axis/position distributions, downstream replay
+   metrics, and generated visualizations.
+8. Retain the checkpoint only if peak or enclosing anchor cost improves and
+   deterministic repeatability plus anchor/replay quality remain acceptable.
+   Exact artifact identity with checkpoint 15 is explicitly not required.
+
+### Checkpoint 16 Spec Update
+
+- Document the hot response and sparse evidence representations and their
+  retained profile counters.
+- State explicitly that response regrouping may change floating-point
+  accumulation order and is accepted through deterministic quality gates.
+
+### Checkpoint 16 Documentation Update
+
+- Update `volume-cartographer/docs/fiberlets.md` with the split peak data flow,
+  profile fields, evidence fraction, and measured outcome if retained.
+- Record validation and benchmarks in `task_log.md`; update `changelog.md` only
+  for an accepted checkpoint and complete `status.md`.
+
+### Checkpoint 16 Result
+
+Accepted. The retained layout uses a 16-byte response record, parallel 4-byte
+evidence indices, and 16-byte evidence records. Only 9,607,554 of 199,261,642
+prepared records (4.82%) carried evidence, and only 96,698,222 of 2,974,011,902
+hot response visits (3.25%) loaded evidence after radial rejection. Across
+three final canonical runs, median command wall fell from 10.43 to 10.25
+seconds, total CPU from 234.29 to 229.90 seconds, anchor wall from 6.221 to
+6.070 seconds, anchor CPU from 160.30 to 155.82 seconds, and peak-search worker
+time from 42.84 to 39.94 seconds. Peak RSS was 2.03 GiB. Populations, DP work,
+2 greedy / 1 fiberlet failures, and replay SHA-256 remained identical.
+
+## Future Option: Radial Demand And Neighbor Reuse
+
+1. Add measurement-only counters for total hot records passing the radial
+   cutoff and unique prepared records used by at least one evaluated candidate
+   per component. Report overlap between adjacent candidate responses.
+2. If many prepared records are never used, group the hot stream into spatially
+   coherent contiguous blocks with conservative transverse AABBs and reject
+   whole blocks before individual distance/Gaussian work.
+3. If most records are used but neighboring responses overlap heavily, batch
+   only the already-demanded neighboring responses so each hot record load can
+   update several accumulators. Do not eagerly evaluate the full peak grid.
+4. Compare against the rejected checkpoint-3 results: its 2D CSR removed 59%
+   of candidate visits but lost overall because indexing and locality overhead
+   exceeded the arithmetic savings. Any new structure must retain sequential
+   access and demonstrate lower peak and total CPU, not merely fewer visits.

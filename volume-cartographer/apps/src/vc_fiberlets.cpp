@@ -591,7 +591,7 @@ void printTubeExtractionProfile(
         return encoded.str();
     };
     output << std::setprecision(17)
-           << "fiberlet_extraction_profile version=16"
+           << "fiberlet_extraction_profile version=17"
            << " anchor_elapsed_seconds=" << extraction.anchors.elapsedSeconds
            << " anchor_cpu_seconds=" << anchor.elapsedCpuSeconds
            << " anchor_profiled_seconds=" << anchorProfiledSeconds
@@ -692,6 +692,18 @@ void printTubeExtractionProfile(
            << " anchor_fit_peak_components=" << fit.peakComponents
            << " anchor_fit_peak_preparation_observation_visits="
            << fit.peakPreparationObservationVisits
+           << " anchor_fit_peak_prepared_response_observations="
+           << fit.peakPreparedResponseObservations
+           << " anchor_fit_peak_prepared_evidence_observations="
+           << fit.peakPreparedEvidenceObservations
+           << " anchor_fit_peak_response_observation_record_bytes="
+           << fit.peakResponseObservationRecordBytes
+           << " anchor_fit_peak_evidence_index_record_bytes="
+           << fit.peakEvidenceIndexRecordBytes
+           << " anchor_fit_peak_evidence_observation_record_bytes="
+           << fit.peakEvidenceObservationRecordBytes
+           << " anchor_fit_peak_maximum_observation_storage_bytes="
+           << fit.peakMaximumObservationStorageBytes
            << " anchor_fit_peak_grid_response_requests="
            << fit.peakGridResponseRequests
            << " anchor_fit_peak_computed_grid_responses="
@@ -700,6 +712,8 @@ void printTubeExtractionProfile(
            << fit.peakAcceptanceResponses
            << " anchor_fit_peak_response_observation_visits="
            << fit.peakResponseObservationVisits
+           << " anchor_fit_peak_response_evidence_observation_visits="
+           << fit.peakResponseEvidenceObservationVisits
            << " anchor_fit_final_evaluation_observation_visits="
            << fit.finalEvaluationObservationVisits
            << " anchor_fit_setup_work_seconds=" << fit.setupWorkSeconds

@@ -689,3 +689,60 @@
 - Checkpoint 15 is retained.
 - Checkpoint 14 did not record RSS separately. The nearest recorded baseline is
   checkpoint 12's 2.08 GiB median; checkpoint 15 did not regress against it.
+## Checkpoint 16: split peak response/evidence streams
+
+- User approved the experiment and explicitly reiterated that exact numeric
+  identity and fixed accumulation order are not requirements.
+- Baseline is committed checkpoint 15 (`f88aea31e`): median command wall
+  10.43 s, total CPU 234.29 s, anchor wall 6.221 s, anchor CPU 160.30 s, and
+  peak-search worker time 42.84 s across three canonical runs.
+- Planned representation keeps one compact hot record per spatially relevant
+  observation and moves alignment/gradient fields into a sparse stream indexed
+  only by retained usable evidence. This avoids a second Gaussian evaluation
+  while reducing the dominant scan's record width.
+- Independent review required preserving invalid-gradient observations in the
+  evidence stream, defining actual in-cutoff evidence visits separately from
+  prepared evidence population, avoiding ABI-dependent legacy record-size
+  claims, and applying axis/position distribution plus replay/visual quality
+  gates if artifacts change. The implementation plan now includes each item.
+- The first implementation used a 20-byte hot record containing its evidence
+  index. Initial replay profiling found only 4.82% prepared evidence and 3.25%
+  actual evidence visits. The experiment therefore moved indices to a parallel
+  four-byte array, leaving a 16-byte hot kernel stream; the index array is only
+  consulted after radial rejection.
+- Three final 16-byte-stream canonical runs measured:
+
+  | metric | minimum | median | maximum | checkpoint 15 median |
+  |---|---:|---:|---:|---:|
+  | command wall | 10.15 s | 10.25 s | 10.47 s | 10.43 s |
+  | total CPU | 227.84 s | 229.90 s | 231.37 s | 234.29 s |
+  | anchor wall | 5.922 s | 6.070 s | 6.222 s | 6.221 s |
+  | anchor CPU | 153.83 s | 155.82 s | 157.00 s | 160.30 s |
+  | peak-search worker time | 39.905 s | 39.940 s | 40.017 s | 42.836 s |
+  | peak RSS | 2.03 GiB | 2.03 GiB | 2.05 GiB | 2.02 GiB |
+
+- Every run prepared 199,261,642 hot records and 9,607,554 evidence records
+  (4.82%). The 2,974,011,902 hot response visits loaded 96,698,222 evidence
+  records after radial rejection (3.25%). Maximum per-component transient
+  storage was 923,104 bytes on this target.
+- All runs retained 2,603 anchors, 51,782 searched / 26,494 accepted fiberlets,
+  170,813 sampled voxels, 62,970,689 DP relaxations, and 2 greedy / 1 fiberlet
+  failures. All replay artifacts retained SHA-256
+  `41fa73c76bc3a20528d064e2baed78552a20bed41542f9ed4e2ddcfb5e739215`.
+- Checkpoint 16 is retained. Exact numeric identity was not used as a gate; it
+  happened to be preserved.
+- Focused GCC and Clang QuickBuild suites passed `test_fiber_anchors`,
+  `test_fiberlet_paths`, and `test_fiber_replay`. The Clang tree reused the
+  existing local libigl and PaStiX sources; no dependency download or install
+  was performed. `git diff --check` passed.
+- The review-proposed all-denominator/zero-evidence production fixture was not
+  added: peak search is entered only for a retained component, so at least one
+  retained evidence observation necessarily exists. The existing two-component
+  profile fixture instead verifies mixed denominator-only/evidence records and
+  confirms evidence with all gradients invalid remains indexed. No public test
+  seam was introduced solely to construct an unreachable state.
+- Logged a future peak-search option: first measure per-response radial survival,
+  per-component unique use, and neighboring-candidate overlap. Use those results
+  to choose conservative contiguous-block rejection or demanded-neighbor
+  batching. The prior 2D CSR's 59% visit reduction but runtime regression is the
+  explicit warning against optimizing visit counts without preserving locality.

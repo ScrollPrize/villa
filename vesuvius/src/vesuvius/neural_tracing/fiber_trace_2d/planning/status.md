@@ -66,6 +66,15 @@
 - [x] Run three canonical checkpoint 14 replays and compare quality/performance.
 - [x] Retain checkpoint 14 based on the measured result.
 - [x] Update specifications, documentation, changelog, task log, and status.
+- [x] Obtain approval for checkpoint 16 split peak streams.
+- [x] Plan checkpoint 16 and its profile/test/documentation updates.
+- [x] Independently review checkpoint 16 against task and specifications.
+- [x] Implement compact hot peak records and sparse retained evidence.
+- [x] Add stream population/visit profiling and focused coverage.
+- [x] Run focused GCC and Clang validation.
+- [x] Run three canonical checkpoint 16 replays and compare performance/quality.
+- [x] Retain checkpoint 16 based on the measured result.
+- [x] Update specifications, documentation, changelog, task log, and status.
 - [x] Obtain approval for checkpoint 15 contiguous peak-grid caching.
 - [x] Plan checkpoint 15 and its test/documentation updates.
 - [x] Independently review checkpoint 15 against task and specifications.

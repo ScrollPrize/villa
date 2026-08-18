@@ -620,3 +620,7 @@
   geometry with checked contiguous row-major caches. The canonical replay's
   median peak-search worker time improved from roughly 43.9 to 42.84 seconds
   with byte-identical artifacts and deterministic work counters.
+- Split peak responses into a 16-byte hot stream and sparse retained-evidence
+  storage. Canonical median peak-search worker time improved from 42.84 to
+  39.94 seconds and command wall from 10.43 to 10.25 seconds with unchanged
+  replay artifacts and quality populations.

@@ -563,6 +563,10 @@ TEST_CASE("fiber anchor fit profile separates repeated fitting work")
 {
     const auto observations = cellObservations(
         4, {1.0, 0.0, 0.0}, directionAtDegrees(45.0));
+    CHECK(std::none_of(observations.begin(), observations.end(),
+        [](const auto& observation) {
+            return observation.presenceGradientValid;
+        }));
     vc::fiber_tracer::FiberAnchorFitProfile profile;
     const auto result = vc::fiber_tracer::fitFiberCellAnchors(
         {0, 0, 0}, {0, 0, 0}, {4, 4, 4}, observations, config(),
@@ -590,11 +594,22 @@ TEST_CASE("fiber anchor fit profile separates repeated fitting work")
     CHECK(profile.localCentroidObservationVisits > 0);
     CHECK(profile.refinedEvaluationObservationVisits > 0);
     CHECK(profile.peakComponents == 2);
+    CHECK(profile.peakPreparedResponseObservations > 0);
+    CHECK(profile.peakPreparedEvidenceObservations > 0);
+    CHECK(profile.peakPreparedEvidenceObservations <
+          profile.peakPreparedResponseObservations);
+    CHECK(profile.peakResponseObservationRecordBytes >= 4 * sizeof(float));
+    CHECK(profile.peakEvidenceIndexRecordBytes == sizeof(uint32_t));
+    CHECK(profile.peakEvidenceObservationRecordBytes >= 4 * sizeof(float));
+    CHECK(profile.peakMaximumObservationStorageBytes > 0);
     CHECK(profile.peakGridResponseRequests >=
           profile.peakComputedGridResponses);
     CHECK(profile.peakComputedGridResponses > 0);
     CHECK(profile.peakAcceptanceResponses > 0);
     CHECK(profile.peakResponseObservationVisits > 0);
+    CHECK(profile.peakResponseEvidenceObservationVisits > 0);
+    CHECK(profile.peakResponseEvidenceObservationVisits <=
+          profile.peakResponseObservationVisits);
     CHECK(profile.finalEvaluationObservationVisits == observations.size());
     CHECK(profile.setupWorkSeconds >= 0.0);
     CHECK(profile.seedGenerationWorkSeconds >= 0.0);

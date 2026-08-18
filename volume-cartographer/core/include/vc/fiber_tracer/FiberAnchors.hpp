@@ -243,10 +243,17 @@ struct FiberAnchorFitProfile {
     size_t refinedEvaluationObservationVisits = 0;
     size_t peakComponents = 0;
     size_t peakPreparationObservationVisits = 0;
+    size_t peakPreparedResponseObservations = 0;
+    size_t peakPreparedEvidenceObservations = 0;
+    size_t peakResponseObservationRecordBytes = 0;
+    size_t peakEvidenceIndexRecordBytes = 0;
+    size_t peakEvidenceObservationRecordBytes = 0;
+    size_t peakMaximumObservationStorageBytes = 0;
     size_t peakGridResponseRequests = 0;
     size_t peakComputedGridResponses = 0;
     size_t peakAcceptanceResponses = 0;
     size_t peakResponseObservationVisits = 0;
+    size_t peakResponseEvidenceObservationVisits = 0;
     size_t finalEvaluationObservationVisits = 0;
     double setupWorkSeconds = 0.0;
     double seedGenerationWorkSeconds = 0.0;

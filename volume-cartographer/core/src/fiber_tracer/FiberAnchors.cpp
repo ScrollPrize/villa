@@ -1227,19 +1227,25 @@ template <typename ObservationRange>
         (2.0 * config.peakAxialSigmaPredictionVoxels *
          config.peakAxialSigmaPredictionVoxels);
 
-    struct PeakObservation {
+    constexpr uint32_t kNoPeakEvidence = std::numeric_limits<uint32_t>::max();
+    struct PeakResponseObservation {
         float first = 0.0F;
         float second = 0.0F;
         float axialGaussian = 0.0F;
         float signal = 0.0F;
+    };
+    struct PeakEvidenceObservation {
         float directionAlignmentSquared = 0.0F;
         float gradientFirst = 0.0F;
         float gradientSecond = 0.0F;
         float gradientNorm = 0.0F;
-        bool presenceGradientValid = false;
     };
-    std::vector<PeakObservation> peakObservations;
-    peakObservations.reserve(observations.size());
+    std::vector<PeakResponseObservation> responseObservations;
+    std::vector<uint32_t> evidenceIndices;
+    std::vector<PeakEvidenceObservation> evidenceObservations;
+    responseObservations.reserve(observations.size());
+    evidenceIndices.reserve(observations.size());
+    evidenceObservations.reserve(observations.size() / 2);
     if (profile != nullptr) {
         ++profile->peakComponents;
         profile->peakPreparationObservationVisits += observations.size();
@@ -1273,31 +1279,61 @@ template <typename ObservationRange>
             selectedAlignment = dot * dot;
             signal = observationPresence(observation) * selectedAlignment;
         }
-        PeakObservation peakObservation;
-        peakObservation.first = static_cast<float>(first);
-        peakObservation.second = static_cast<float>(second);
-        peakObservation.axialGaussian = static_cast<float>(std::exp(
+        PeakResponseObservation responseObservation;
+        responseObservation.first = static_cast<float>(first);
+        responseObservation.second = static_cast<float>(second);
+        responseObservation.axialGaussian = static_cast<float>(std::exp(
             -axial * axial * invTwoAxialSigma2));
-        peakObservation.signal = static_cast<float>(signal);
-        peakObservation.directionAlignmentSquared =
-            static_cast<float>(selectedAlignment);
-        if (observationGradientValid(observations, observationIndex) &&
-            finiteVector(observation.presenceGradientPredictionXYZ)) {
-            const cv::Vec3d gradient = observationGradient(observation);
-            peakObservation.gradientFirst =
-                static_cast<float>(gradient.dot(basis[0]));
-            peakObservation.gradientSecond =
-                static_cast<float>(gradient.dot(basis[1]));
-            const double gradientNorm2 =
-                peakObservation.gradientFirst * peakObservation.gradientFirst +
-                peakObservation.gradientSecond * peakObservation.gradientSecond;
-            if (gradientNorm2 > kMatrixEpsilon) {
-                peakObservation.gradientNorm =
-                    static_cast<float>(std::sqrt(gradientNorm2));
-                peakObservation.presenceGradientValid = true;
+        responseObservation.signal = static_cast<float>(signal);
+        uint32_t evidenceIndex = kNoPeakEvidence;
+        const float alignment = static_cast<float>(selectedAlignment);
+        if (alignment > 0.0F) {
+            if (evidenceObservations.size() >= kNoPeakEvidence) {
+                throw std::overflow_error(
+                    "peak evidence observation index exceeds uint32 range");
             }
+            evidenceIndex = static_cast<uint32_t>(evidenceObservations.size());
+            PeakEvidenceObservation evidenceObservation;
+            evidenceObservation.directionAlignmentSquared = alignment;
+            if (observationGradientValid(observations, observationIndex) &&
+                finiteVector(observation.presenceGradientPredictionXYZ)) {
+                const cv::Vec3d gradient = observationGradient(observation);
+                evidenceObservation.gradientFirst =
+                    static_cast<float>(gradient.dot(basis[0]));
+                evidenceObservation.gradientSecond =
+                    static_cast<float>(gradient.dot(basis[1]));
+                const double gradientNorm2 =
+                    evidenceObservation.gradientFirst *
+                        evidenceObservation.gradientFirst +
+                    evidenceObservation.gradientSecond *
+                        evidenceObservation.gradientSecond;
+                if (gradientNorm2 > kMatrixEpsilon) {
+                    evidenceObservation.gradientNorm =
+                        static_cast<float>(std::sqrt(gradientNorm2));
+                }
+            }
+            evidenceObservations.push_back(evidenceObservation);
         }
-        peakObservations.push_back(peakObservation);
+        responseObservations.push_back(responseObservation);
+        evidenceIndices.push_back(evidenceIndex);
+    }
+    if (profile != nullptr) {
+        profile->peakPreparedResponseObservations += responseObservations.size();
+        profile->peakPreparedEvidenceObservations += evidenceObservations.size();
+        profile->peakResponseObservationRecordBytes = std::max(
+            profile->peakResponseObservationRecordBytes,
+            sizeof(PeakResponseObservation));
+        profile->peakEvidenceIndexRecordBytes = std::max(
+            profile->peakEvidenceIndexRecordBytes, sizeof(uint32_t));
+        profile->peakEvidenceObservationRecordBytes = std::max(
+            profile->peakEvidenceObservationRecordBytes,
+            sizeof(PeakEvidenceObservation));
+        profile->peakMaximumObservationStorageBytes = std::max(
+            profile->peakMaximumObservationStorageBytes,
+            responseObservations.capacity() * sizeof(PeakResponseObservation) +
+                evidenceIndices.capacity() * sizeof(uint32_t) +
+                evidenceObservations.capacity() *
+                    sizeof(PeakEvidenceObservation));
     }
 
     const auto responseAt = [&](float candidateFirst, float candidateSecond, bool acceptance) {
@@ -1306,15 +1342,19 @@ template <typename ObservationRange>
                 ++profile->peakAcceptanceResponses;
             else
                 ++profile->peakComputedGridResponses;
-            profile->peakResponseObservationVisits += peakObservations.size();
+            profile->peakResponseObservationVisits += responseObservations.size();
         }
+        size_t responseEvidenceVisits = 0;
         CompensatedSum numerator;
         CompensatedSum denominator;
         CompensatedSum eligibleGradientWeight;
         CompensatedSum validGradientWeight;
         CompensatedSum inward;
         CompensatedSum outward;
-        for (const auto& observation : peakObservations) {
+        for (size_t observationIndex = 0;
+             observationIndex < responseObservations.size();
+             ++observationIndex) {
+            const auto& observation = responseObservations[observationIndex];
             const float radialFirst = candidateFirst - observation.first;
             const float radialSecond = candidateSecond - observation.second;
             const float distanceSquared =
@@ -1325,12 +1365,16 @@ template <typename ObservationRange>
                 std::exp(-distanceSquared * invTwoTransverseSigma2);
             denominator.add(gaussian);
             numerator.add(gaussian * observation.signal);
-            if (!(observation.directionAlignmentSquared > 0.0))
+            const uint32_t evidenceIndex = evidenceIndices[observationIndex];
+            if (evidenceIndex == kNoPeakEvidence)
                 continue;
+            const auto& evidence =
+                evidenceObservations[evidenceIndex];
+            ++responseEvidenceVisits;
             const float eligibleWeight =
-                gaussian * observation.directionAlignmentSquared;
+                gaussian * evidence.directionAlignmentSquared;
             eligibleGradientWeight.add(eligibleWeight);
-            if (!observation.presenceGradientValid) {
+            if (!(evidence.gradientNorm > 0.0F)) {
                 continue;
             }
             if (!(distanceSquared > kMatrixEpsilon)) {
@@ -1338,11 +1382,11 @@ template <typename ObservationRange>
             }
             validGradientWeight.add(eligibleWeight);
             const float cosine = std::clamp(
-                (observation.gradientFirst * radialFirst +
-                 observation.gradientSecond * radialSecond) /
-                    (observation.gradientNorm * std::sqrt(distanceSquared)),
+                (evidence.gradientFirst * radialFirst +
+                 evidence.gradientSecond * radialSecond) /
+                    (evidence.gradientNorm * std::sqrt(distanceSquared)),
                 -1.0F, 1.0F);
-            const float vote = eligibleWeight * observation.gradientNorm *
+            const float vote = eligibleWeight * evidence.gradientNorm *
                 static_cast<float>(config.peakSigmaPredictionVoxels) *
                 cosine * cosine;
             if (cosine > 0.0)
@@ -1350,7 +1394,13 @@ template <typename ObservationRange>
             else if (cosine < 0.0)
                 outward.add(vote);
         }
-        const double presenceResponse = denominator.sum > 0.0 ? numerator.sum / denominator.sum : 0.0;
+        if (profile != nullptr) {
+            profile->peakResponseEvidenceObservationVisits +=
+                responseEvidenceVisits;
+        }
+        const double presenceResponse = denominator.sum > 0.0
+            ? numerator.sum / denominator.sum
+            : 0.0;
         if (!(config.peakGradientWeight > 0.0) || !(eligibleGradientWeight.sum > 0.0) || !(validGradientWeight.sum > 0.0)) {
             return presenceResponse;
         }
@@ -1684,11 +1734,29 @@ void accumulateFitProfile(
     total.peakComponents += value.peakComponents;
     total.peakPreparationObservationVisits +=
         value.peakPreparationObservationVisits;
+    total.peakPreparedResponseObservations +=
+        value.peakPreparedResponseObservations;
+    total.peakPreparedEvidenceObservations +=
+        value.peakPreparedEvidenceObservations;
+    total.peakResponseObservationRecordBytes = std::max(
+        total.peakResponseObservationRecordBytes,
+        value.peakResponseObservationRecordBytes);
+    total.peakEvidenceIndexRecordBytes = std::max(
+        total.peakEvidenceIndexRecordBytes,
+        value.peakEvidenceIndexRecordBytes);
+    total.peakEvidenceObservationRecordBytes = std::max(
+        total.peakEvidenceObservationRecordBytes,
+        value.peakEvidenceObservationRecordBytes);
+    total.peakMaximumObservationStorageBytes = std::max(
+        total.peakMaximumObservationStorageBytes,
+        value.peakMaximumObservationStorageBytes);
     total.peakGridResponseRequests += value.peakGridResponseRequests;
     total.peakComputedGridResponses += value.peakComputedGridResponses;
     total.peakAcceptanceResponses += value.peakAcceptanceResponses;
     total.peakResponseObservationVisits +=
         value.peakResponseObservationVisits;
+    total.peakResponseEvidenceObservationVisits +=
+        value.peakResponseEvidenceObservationVisits;
     total.finalEvaluationObservationVisits +=
         value.finalEvaluationObservationVisits;
     total.setupWorkSeconds += value.setupWorkSeconds;

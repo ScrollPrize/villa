@@ -65,3 +65,17 @@ peak domain, hill-climb traversal, response evaluation order, tie-breaking,
 subpixel acceptance, and response arithmetic remain unchanged. Precompute the
 grid's feasible points once and use direct shifted indices for response-cache
 hits and misses.
+
+The next measured continuation splits direction-conditioned peak observations
+into a compact hot response stream and a sparse retained-evidence stream. The
+dominant response scan must no longer load gradient/alignment fields for every
+spatially relevant observation. Exact floating-point identity and accumulation
+order are not required; deterministic repeatability, acceptable anchor/replay
+quality, and measured speed are the retention gates.
+
+A later peak-search option should measure radial-cutoff survival and unique
+observation use across evaluated neighboring candidates. Based on that result,
+test either spatially coherent contiguous-block rejection for observations that
+no visited candidate needs, or reuse observation loads across neighboring
+candidate responses. Do not restore the previously rejected pointer-heavy CSR
+or counting-sort implementations unchanged.

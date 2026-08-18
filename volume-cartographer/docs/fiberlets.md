@@ -681,6 +681,19 @@ replay, median peak-search worker time fell from roughly 43.9 to 42.84 seconds,
 anchor CPU from 162.51 to 160.30 seconds, and command wall from 10.65 to 10.43
 seconds while complete artifacts and deterministic counters remained exact.
 
+Peak responses store transverse coordinates, axial weight, and signal in a
+16-byte sequential record. A parallel 32-bit index addresses a 16-byte sparse
+record containing alignment and projected-gradient data only for retained
+usable evidence. Invalid-gradient evidence remains indexed because it still
+contributes eligible aligned weight to gradient coverage. Version 17 profile
+fields report prepared hot/evidence populations, their record sizes, maximum
+temporary storage, all hot response visits, and evidence records actually read
+inside the radial cutoff. On the canonical replay, 4.82% of prepared records
+and 3.25% of response visits needed evidence; median peak-search worker time
+fell from 42.84 to 39.94 seconds and command wall from 10.43 to 10.25 seconds.
+The response equation remains unchanged, but exact accumulation order is not a
+compatibility requirement; deterministic geometry and replay quality are.
+
 Production extraction also constructs each sampled tile voxel once as a compact
 float32 observation with a pre-normalized direction. Each overlapping cell
 stores only canonical-order 32-bit indices into that tile plus its cell-local
