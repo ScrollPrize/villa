@@ -37,3 +37,10 @@ interpolate an interior node only when search first requests it. Cache the
 result by candidate-local node index and preserve the existing compact
 quantization, strict gates, scoring arithmetic, transition order, and endpoint
 handling.
+
+The next measured continuation is exact anchor support-stencil reuse. For
+complete interior cells with a full sampling halo, construct the canonical
+owned-or-radius support offsets once and translate them into each tile instead
+of rescanning the full sample cube. Preserve canonical observation order,
+gradient-halo eligibility, profile population semantics, and the existing
+clipped construction for partial or volume-boundary cells.

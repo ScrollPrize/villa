@@ -550,7 +550,7 @@ sampling, search, and total wall times. Use identical manifests, fiber, options,
 build type, and interval for before/after performance comparisons.
 
 Benchmark and replay extraction also emit a versioned
-`fiberlet_extraction_profile version=14` row. Both commands use the same field
+`fiberlet_extraction_profile version=15` row. Both commands use the same field
 names and units. Replay writes the row to stderr after full tube extraction;
 benchmark writes it to stdout after the existing summary. The row separates:
 
@@ -600,6 +600,17 @@ seconds, and peak RSS from 2.46 to 2.11 GiB. Search itself increased from 1.00
 to 1.29 seconds because lazy interpolation is included there; the former
 all-node interpolation phase fell from 1.52 seconds to about 0.015 seconds.
 Selected geometry, replay failures, and replay artifacts were unchanged.
+
+Version 15 adds `anchor_support_stencil_cells` and
+`anchor_clipped_support_cells`. Complete volume-interior cells with their full
+sampling halo reuse one immutable ordered `(z, y, xBegin, xEnd)` support
+stencil. The spans are translated through each tile's actual row and plane
+strides, preserving canonical Z/Y/X observation order. Partial cells and cells
+without a full volume halo retain the clipped scalar construction. On the
+canonical replay all 13,027 work cells used the stencil; median observation-
+construction worker time fell from 18.99 to 11.84 seconds, anchor CPU from
+177.28 to 167.49 seconds, and total wall from 10.76 to 10.37 seconds. All
+workload populations and replay artifacts remained identical.
 
 Version 2 subdivides `anchor_fitting_work_seconds` into exclusive summed-worker
 phases for weighted-observation setup, seed generation, seed-pair refinement,
@@ -651,6 +662,12 @@ stores only canonical-order 32-bit indices into that tile plus its cell-local
 gradient-validity byte. The public expanded-observation fitting API uses the
 same templated fitter. Tile observation storage and maximum cell-reference
 scratch are included in the existing concurrent sample-memory budget.
+Complete cells whose configured sample halo fits inside the volume expand the
+shared ordered support-span stencil directly into those indices. Crop and tile
+boundaries do not affect eligibility. A volume boundary or partial final cell
+uses the original clipped sample-cube scan. When gradients are enabled, the
+extra halo voxel makes every retained stencil site gradient-eligible; sampled
+tile-gradient validity remains authoritative.
 
 Version 7 reports tile-halo sampling explicitly. Six-cell tiles are paired
 deterministically by maximum overlapping sample volume while preserving at

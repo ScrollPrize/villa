@@ -2667,7 +2667,14 @@
   observation copies across overlapping support regions. The public expanded
   observation API and production indexed path share one templated fitter. Tile
   halos may overlap, but the decoded chunk cache avoids repeated source-chunk
-  reads. Deterministic tile splitting and the worker
+  reads. Complete cells with a full volume halo expand one immutable ordered
+  `(z, y, xBegin, xEnd)` owned-or-radius support stencil through their tile's
+  actual strides. This preserves canonical ZYX order and logical observation/
+  gradient populations. Crop and tile boundaries do not affect eligibility;
+  partial cells or cells clipped by a volume boundary retain the scalar sample-
+  cube construction. When gradients are enabled, the extra halo voxel makes
+  every retained stencil site gradient-eligible, while sampled tile-gradient
+  validity remains authoritative. Deterministic tile splitting and the worker
   count keep coordinate vectors, decoded samples, and cell scratch under the
   aggregate sample-memory budget; lower-level sampling uses one thread.
   Results and worker failures are stored by canonical cell index, retain
@@ -3045,7 +3052,7 @@
   Benchmark comparisons must retain identical inputs, parameters, build type,
   and interval.
 - Benchmark and full replay extraction emit the same versioned
-  `fiberlet_extraction_profile version=14` key/value schema. The profile exposes
+  `fiberlet_extraction_profile version=15` key/value schema. The profile exposes
   deterministic workload counters and finer anchor/fiberlet phase timings.
   Enclosing phase fields are wall time, `_work_seconds` fields are summed
   worker/candidate time, and CPU fields are process CPU time. Corner insertion
@@ -3109,6 +3116,11 @@
   Sparse interpolation timing samples use a fixed hash of canonical candidate
   index and packed node key; exact resolution/materialization counts remain
   complete and deterministic.
+- Version 15 adds `anchor_support_stencil_cells` and
+  `anchor_clipped_support_cells`. Their sum equals `anchor_work_cells`.
+  `anchor_candidate_observations` retains the represented sample-cube count,
+  while retained-observation and gradient counters retain their logical
+  populations when the support stencil avoids rejected-site tests.
 - Transient direction-conditioned peak observations and transverse response
   math use float32. Persistent anchor state, accepted positions, diagnostics,
   and serialized output remain double precision. Peak ties and downstream DP

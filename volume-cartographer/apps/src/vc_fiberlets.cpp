@@ -591,7 +591,7 @@ void printTubeExtractionProfile(
         return encoded.str();
     };
     output << std::setprecision(17)
-           << "fiberlet_extraction_profile version=14"
+           << "fiberlet_extraction_profile version=15"
            << " anchor_elapsed_seconds=" << extraction.anchors.elapsedSeconds
            << " anchor_cpu_seconds=" << anchor.elapsedCpuSeconds
            << " anchor_profiled_seconds=" << anchorProfiledSeconds
@@ -612,6 +612,8 @@ void printTubeExtractionProfile(
            << anchor.reusedPredictionVoxels
            << " anchor_candidate_observations=" << anchor.candidateObservations
            << " anchor_retained_observations=" << anchor.retainedObservations
+           << " anchor_support_stencil_cells=" << anchor.supportStencilCells
+           << " anchor_clipped_support_cells=" << anchor.clippedSupportCells
            << " anchor_gradient_attempts=" << anchor.gradientAttempts
            << " anchor_valid_gradients=" << anchor.validGradients
            << " anchor_gradient_computations=" << anchor.gradientComputations

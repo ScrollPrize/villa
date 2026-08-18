@@ -516,3 +516,42 @@
   materialization, request/miss/hit accounting, serial/parallel counter parity,
   and the existing invalid/ambiguous interpolation behavior. `git diff
   --check` passed.
+
+## Checkpoint 12: Canonical Anchor Support Stencil
+
+- Reused the canonical command and warmed local inputs recorded in the
+  baseline section with the regular GCC `QuickBuild` tree, 32 threads, and
+  three measured repetitions. The Clang validation tree also uses `QuickBuild`.
+- Complete cells with a full volume halo now expand one immutable ordered
+  `(z, y, xBegin, xEnd)` owned-or-radius stencil through each tile's actual
+  strides. Partial cells and cells clipped by a volume boundary retain the
+  prior scalar scan. Crop and tile boundaries do not affect eligibility.
+- The independent plan review required 3D rather than flattened canonical
+  offsets, exact full-halo predicates, a scalar ordered-index oracle, odd/even
+  cell and gradient cases, multiple cells with differing tile/cell origins,
+  explicit fallback coverage, logical counter invariants, and profile version
+  15. The implementation incorporates those corrections.
+- The canonical workload used the stencil for all 13,027 work cells and kept
+  exact checkpoint-11 populations: 2,603 anchors, 51,782 searched / 26,494
+  accepted fiberlets, 170,813 sampled voxels, and 2 greedy / 1 fiberlet replay
+  failures.
+
+  | metric | minimum | median | maximum | checkpoint 11 median |
+  |---|---:|---:|---:|---:|
+  | total wall | 10.37 s | 10.37 s | 10.40 s | 10.76 s |
+  | total CPU | 238.72 s | 238.78 s | 238.88 s | 248.84 s |
+  | anchor wall | 6.397 s | 6.416 s | 6.463 s | 6.817 s |
+  | anchor CPU | 167.10 s | 167.49 s | 167.96 s | 177.28 s |
+  | observation construction worker time | 11.73 s | 11.84 s | 11.98 s | 18.99 s |
+  | fiberlet wall | 3.272 s | 3.294 s | 3.298 s | 3.299 s |
+  | peak RSS | 2.08 GiB | 2.08 GiB | 2.10 GiB | 2.11 GiB |
+
+- Median observation construction improved 37.6%, anchor CPU 5.5%, total CPU
+  4.0%, and total wall 3.6%. All three `fiber_replay.json` files retained exact
+  SHA-256
+  `41fa73c76bc3a20528d064e2baed78552a20bed41542f9ed4e2ddcfb5e739215`.
+- GCC and Clang builds and focused `test_fiber_anchors`,
+  `test_fiberlet_paths`, and `test_fiber_replay` CTest runs passed. Tests cover
+  scalar-order/stride equivalence, odd/even cells, gradient/no-gradient halos,
+  serial/parallel full-stencil extraction, exact full-halo eligibility, and a
+  partial-cell fallback.

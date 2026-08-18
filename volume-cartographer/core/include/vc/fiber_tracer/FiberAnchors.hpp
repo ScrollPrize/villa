@@ -270,6 +270,8 @@ struct FiberAnchorExtractionProfile {
     size_t reusedPredictionVoxels = 0;
     size_t candidateObservations = 0;
     size_t retainedObservations = 0;
+    size_t supportStencilCells = 0;
+    size_t clippedSupportCells = 0;
     size_t gradientAttempts = 0;
     size_t validGradients = 0;
     size_t gradientComputations = 0;

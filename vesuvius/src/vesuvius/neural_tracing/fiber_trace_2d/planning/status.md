@@ -57,6 +57,14 @@
 - [x] Run focused GCC and Clang validation.
 - [x] Run three canonical checkpoint 10 replays and compare quality/performance.
 - [x] Update specifications, user documentation, changelog, and task log.
+- [x] Plan checkpoint 12 canonical anchor support-stencil reuse.
+- [x] Independently review checkpoint 12 against task and specifications.
+- [x] Implement the full-halo stencil and clipped boundary fallback.
+- [x] Add fast-path/fallback profile counters and focused extraction coverage.
+- [x] Run focused GCC and Clang validation.
+- [x] Run three canonical checkpoint 12 replays and compare performance/quality.
+- [x] Retain or remove checkpoint 12 based on the measured result.
+- [x] Update specifications, user documentation, changelog, and task log.
 - [x] Plan checkpoint 11 lazy node scoring materialization.
 - [x] Independently review checkpoint 11 against task and specifications.
 - [x] Implement candidate-local lazy node scoring caches.

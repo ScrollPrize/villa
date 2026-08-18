@@ -2,6 +2,7 @@
 #include "vc/core/util/AtomicFile.hpp"
 #include "vc/fiber_tracer/FiberAxisTensor.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
+#include "vc/fiber_tracer/detail/FiberAnchorSupportStencil.hpp"
 
 #include <algorithm>
 #include <array>
@@ -2612,6 +2613,10 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
     const size_t sampleHalo =
         static_cast<size_t>(std::ceil(maximumSupportRadius)) +
         (config.peakGradientWeight > 0.0 ? 1 : 0);
+    const auto supportStencil = detail::buildFiberAnchorSupportStencil(
+        cellSize, sampleHalo, maximumSupportRadius);
+    const size_t supportStencilSize =
+        detail::fiberAnchorSupportStencilSize(supportStencil);
     const std::set<std::array<size_t, 3>> explicitCellSet(
         explicitCells.begin(), explicitCells.end());
     const auto selectedCell = [&report, &explicitCellSet, usesExplicitCells](const std::array<size_t, 3>& cell) {
@@ -3054,6 +3059,8 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             size_t reusedPredictionVoxels = 0;
             size_t candidateObservations = 0;
             size_t retainedObservations = 0;
+            size_t supportStencilCells = 0;
+            size_t clippedSupportCells = 0;
             size_t gradientAttempts = 0;
             size_t validGradients = 0;
             size_t gradientComputations = 0;
@@ -3113,50 +3120,79 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                 cellSampleShape, "fiber anchor observation");
             cellObservationIndices.clear();
             cellGradientValidity.clear();
-            cellObservationIndices.reserve(maximumObservations);
-            cellGradientValidity.reserve(maximumObservations);
-            for (size_t z = cellSampleBegin[0]; z < cellSampleEnd[0]; ++z) {
-                for (size_t y = cellSampleBegin[1]; y < cellSampleEnd[1]; ++y) {
-                    for (size_t x = cellSampleBegin[2]; x < cellSampleEnd[2]; ++x) {
-                        ++workerProfile.candidateObservations;
-                        const size_t index = tileIndex(z, y, x);
-                        const cv::Vec3d position{
-                            static_cast<double>(x),
-                            static_cast<double>(y),
-                            static_cast<double>(z),
-                        };
-                        const cv::Vec3d delta = position - pivot;
-                        const bool owned =
-                            position[0] >= static_cast<double>(begin[2]) &&
-                            position[0] < static_cast<double>(end[2]) &&
-                            position[1] >= static_cast<double>(begin[1]) &&
-                            position[1] < static_cast<double>(end[1]) &&
-                            position[2] >= static_cast<double>(begin[0]) &&
-                            position[2] < static_cast<double>(end[0]);
-                        if (owned ||
-                            delta.dot(delta) <=
-                                maximumSupportRadius * maximumSupportRadius +
-                                    1.0e-12) {
-                            cellObservationIndices.push_back(
-                                static_cast<uint32_t>(index));
-                            bool gradientValid = false;
-                            if (config.peakGradientWeight > 0.0) {
-                                ++workerProfile.gradientAttempts;
-                                const bool insideGradientHalo =
-                                    z != cellSampleBegin[0] &&
-                                    z + 1 < cellSampleEnd[0] &&
-                                    y != cellSampleBegin[1] &&
-                                    y + 1 < cellSampleEnd[1] &&
-                                    x != cellSampleBegin[2] &&
-                                    x + 1 < cellSampleEnd[2];
-                                gradientValid = insideGradientHalo &&
-                                    observations[index]
-                                        .presenceGradientValid;
-                                if (gradientValid)
-                                    ++workerProfile.validGradients;
+            bool fullHalo = true;
+            for (size_t axis = 0; axis < 3; ++axis) {
+                fullHalo = fullHalo && end[axis] - begin[axis] == cellSize &&
+                    begin[axis] >= sampleHalo &&
+                    grid.shapeZYX[axis] - end[axis] >= sampleHalo;
+            }
+            if (fullHalo) {
+                ++workerProfile.supportStencilCells;
+                workerProfile.candidateObservations += maximumObservations;
+                cellObservationIndices.reserve(supportStencilSize);
+                cellGradientValidity.reserve(supportStencilSize);
+                detail::visitFiberAnchorSupportStencilTileIndices(
+                    supportStencil, cellSampleBegin, tile.sampleBegin,
+                    sampleShape, [&](uint32_t compactIndex) {
+                        cellObservationIndices.push_back(compactIndex);
+                        bool gradientValid = false;
+                        if (config.peakGradientWeight > 0.0) {
+                            ++workerProfile.gradientAttempts;
+                            gradientValid = observations[compactIndex]
+                                .presenceGradientValid;
+                            if (gradientValid)
+                                ++workerProfile.validGradients;
+                        }
+                        cellGradientValidity.push_back(
+                            static_cast<uint8_t>(gradientValid));
+                    });
+            } else {
+                ++workerProfile.clippedSupportCells;
+                cellObservationIndices.reserve(maximumObservations);
+                cellGradientValidity.reserve(maximumObservations);
+                for (size_t z = cellSampleBegin[0]; z < cellSampleEnd[0]; ++z) {
+                    for (size_t y = cellSampleBegin[1]; y < cellSampleEnd[1]; ++y) {
+                        for (size_t x = cellSampleBegin[2]; x < cellSampleEnd[2]; ++x) {
+                            ++workerProfile.candidateObservations;
+                            const size_t index = tileIndex(z, y, x);
+                            const cv::Vec3d position{
+                                static_cast<double>(x),
+                                static_cast<double>(y),
+                                static_cast<double>(z),
+                            };
+                            const cv::Vec3d delta = position - pivot;
+                            const bool owned =
+                                position[0] >= static_cast<double>(begin[2]) &&
+                                position[0] < static_cast<double>(end[2]) &&
+                                position[1] >= static_cast<double>(begin[1]) &&
+                                position[1] < static_cast<double>(end[1]) &&
+                                position[2] >= static_cast<double>(begin[0]) &&
+                                position[2] < static_cast<double>(end[0]);
+                            if (owned ||
+                                delta.dot(delta) <=
+                                    maximumSupportRadius * maximumSupportRadius +
+                                        1.0e-12) {
+                                cellObservationIndices.push_back(
+                                    static_cast<uint32_t>(index));
+                                bool gradientValid = false;
+                                if (config.peakGradientWeight > 0.0) {
+                                    ++workerProfile.gradientAttempts;
+                                    const bool insideGradientHalo =
+                                        z != cellSampleBegin[0] &&
+                                        z + 1 < cellSampleEnd[0] &&
+                                        y != cellSampleBegin[1] &&
+                                        y + 1 < cellSampleEnd[1] &&
+                                        x != cellSampleBegin[2] &&
+                                        x + 1 < cellSampleEnd[2];
+                                    gradientValid = insideGradientHalo &&
+                                        observations[index]
+                                            .presenceGradientValid;
+                                    if (gradientValid)
+                                        ++workerProfile.validGradients;
+                                }
+                                cellGradientValidity.push_back(
+                                    static_cast<uint8_t>(gradientValid));
                             }
-                            cellGradientValidity.push_back(
-                                static_cast<uint8_t>(gradientValid));
                         }
                     }
                 }
@@ -3455,6 +3491,10 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                 workerProfile.candidateObservations;
             report.profile.retainedObservations +=
                 workerProfile.retainedObservations;
+            report.profile.supportStencilCells +=
+                workerProfile.supportStencilCells;
+            report.profile.clippedSupportCells +=
+                workerProfile.clippedSupportCells;
             report.profile.gradientAttempts += workerProfile.gradientAttempts;
             report.profile.validGradients += workerProfile.validGradients;
             report.profile.gradientComputations +=

@@ -2,6 +2,7 @@
 #include <doctest/doctest.h>
 
 #include "vc/fiber_tracer/FiberAnchors.hpp"
+#include "vc/fiber_tracer/detail/FiberAnchorSupportStencil.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "utils/zarr.hpp"
 
@@ -115,6 +116,76 @@ TEST_CASE("fiber anchor peak kernel defaults integrate across neighboring cells"
               1.5 * value.cellSizePredictionVoxels /
                   value.peakAxialSigmaPredictionVoxels,
               2.0)) == doctest::Approx(std::exp(-0.5)));
+}
+
+TEST_CASE("fiber anchor support stencil preserves scalar order and tile strides")
+{
+    for (const size_t cellSize : {size_t{3}, size_t{4}}) {
+        for (const bool gradients : {false, true}) {
+            CAPTURE(cellSize);
+            CAPTURE(gradients);
+            const double radius = 3.25;
+            const size_t halo = static_cast<size_t>(std::ceil(radius)) +
+                (gradients ? 1 : 0);
+            const size_t extent = cellSize + 2 * halo;
+            const std::array<size_t, 3> cellSampleBegin{17, 19, 23};
+            const std::array<size_t, 3> tileSampleBegin{11, 13, 17};
+            const std::array<size_t, 3> tileShape{32, 34, 36};
+            const double pivot = 0.5 * static_cast<double>(cellSize - 1);
+            std::vector<uint32_t> expected;
+            for (size_t z = 0; z < extent; ++z) {
+                for (size_t y = 0; y < extent; ++y) {
+                    for (size_t x = 0; x < extent; ++x) {
+                        const std::array<double, 3> relative{
+                            static_cast<double>(z) - halo,
+                            static_cast<double>(y) - halo,
+                            static_cast<double>(x) - halo,
+                        };
+                        const bool owned = std::all_of(
+                            relative.begin(), relative.end(),
+                            [cellSize](double value) {
+                                return value >= 0.0 && value < cellSize;
+                            });
+                        const double dz = relative[0] - pivot;
+                        const double dy = relative[1] - pivot;
+                        const double dx = relative[2] - pivot;
+                        if (!owned && dz * dz + dy * dy + dx * dx >
+                                radius * radius + 1.0e-12) {
+                            continue;
+                        }
+                        if (gradients) {
+                            CHECK(z > 0);
+                            CHECK(y > 0);
+                            CHECK(x > 0);
+                            CHECK(z + 1 < extent);
+                            CHECK(y + 1 < extent);
+                            CHECK(x + 1 < extent);
+                        }
+                        const size_t tileZ =
+                            cellSampleBegin[0] + z - tileSampleBegin[0];
+                        const size_t tileY =
+                            cellSampleBegin[1] + y - tileSampleBegin[1];
+                        const size_t tileX =
+                            cellSampleBegin[2] + x - tileSampleBegin[2];
+                        expected.push_back(static_cast<uint32_t>(
+                            (tileZ * tileShape[1] + tileY) * tileShape[2] +
+                            tileX));
+                    }
+                }
+            }
+
+            const auto stencil =
+                vc::fiber_tracer::detail::buildFiberAnchorSupportStencil(
+                    cellSize, halo, radius);
+            CHECK(vc::fiber_tracer::detail::fiberAnchorSupportStencilSize(
+                      stencil) == expected.size());
+            std::vector<uint32_t> actual;
+            vc::fiber_tracer::detail::visitFiberAnchorSupportStencilTileIndices(
+                stencil, cellSampleBegin, tileSampleBegin, tileShape,
+                [&](uint32_t index) { actual.push_back(index); });
+            CHECK(actual == expected);
+        }
+    }
 }
 
 TEST_CASE("normalized float observations preserve anchor geometry")
@@ -1808,6 +1879,9 @@ TEST_CASE("explicit anchor cells remain sparse and filter refinement before NMS"
     CHECK(report.profile.candidateObservations >=
           report.profile.retainedObservations);
     CHECK(report.profile.retainedObservations > 0);
+    CHECK(report.profile.supportStencilCells +
+              report.profile.clippedSupportCells ==
+          report.profile.workCells);
     CHECK(report.profile.gradientAttempts ==
           report.profile.retainedObservations);
     CHECK(report.profile.validGradients <= report.profile.gradientAttempts);
@@ -1869,6 +1943,82 @@ TEST_CASE("explicit anchor cells remain sparse and filter refinement before NMS"
         vc::fiber_tracer::fiberAnchorCellReportObj(report);
     CHECK(occurrenceCount(cellObj, "\np ") == 2);
     CHECK(occurrenceCount(cellObj, "\nl ") == 1);
+}
+
+TEST_CASE("interior anchor cells reuse the canonical support stencil")
+{
+    const vc::fiber_tracer::FiberPredictionGridInfo grid{{64, 64, 64}, 1.0};
+    auto serialConfig = config();
+    serialConfig.parallelThreads = 1;
+    auto parallelConfig = serialConfig;
+    parallelConfig.parallelThreads = 7;
+    const std::vector<std::array<size_t, 3>> cells{
+        {6, 6, 6},
+        {6, 6, 7},
+    };
+    const auto sampler = [](const auto& indices, int, auto& samples) {
+        samples.assign(
+            indices.size(),
+            vc::fiber_tracer::FiberStoredPredictionSample{
+                {1.0, 0.0, 0.0}, 1.0, true});
+    };
+    const auto serial =
+        vc::fiber_tracer::extractRefinedFiberAnchorsForCells(
+            grid, serialConfig, sampler, cells);
+    const auto parallel =
+        vc::fiber_tracer::extractRefinedFiberAnchorsForCells(
+            grid, parallelConfig, sampler, cells);
+
+    for (const auto* report : {&serial, &parallel}) {
+        CHECK(report->profile.workCells == cells.size());
+        CHECK(report->profile.supportStencilCells == cells.size());
+        CHECK(report->profile.clippedSupportCells == 0);
+        CHECK(report->profile.candidateObservations >=
+              report->profile.retainedObservations);
+        CHECK(report->profile.gradientAttempts ==
+              report->profile.retainedObservations);
+    }
+    CHECK(serial.profile.candidateObservations ==
+          parallel.profile.candidateObservations);
+    CHECK(serial.profile.retainedObservations ==
+          parallel.profile.retainedObservations);
+    CHECK(serial.profile.validGradients == parallel.profile.validGradients);
+    CHECK(serial.nonEmptyCells.size() == parallel.nonEmptyCells.size());
+    for (size_t index = 0; index < serial.nonEmptyCells.size(); ++index) {
+        CHECK(serial.nonEmptyCells[index].cellZYX ==
+              parallel.nonEmptyCells[index].cellZYX);
+        CHECK(serial.nonEmptyCells[index].retainedAnchorCount ==
+              parallel.nonEmptyCells[index].retainedAnchorCount);
+    }
+}
+
+TEST_CASE("anchor support stencil falls back only for clipped cells")
+{
+    vc::fiber_tracer::FiberPredictionGridInfo grid{{7, 7, 7}, 1.0};
+    auto value = config();
+    value.cellSizePredictionVoxels = 2;
+    value.localWindowRadiusPredictionVoxels = 0.1;
+    value.gaussianSigmaPredictionVoxels = 0.1;
+    value.peakSigmaPredictionVoxels = 0.1;
+    value.axialSupportHalfWidthPredictionVoxels = 0.2;
+    value.peakAxialSigmaPredictionVoxels = 0.2;
+    value.gaussianCutoffSigmas = 1.0;
+    value.peakGridStepPredictionVoxels = 0.1;
+    const auto report =
+        vc::fiber_tracer::extractRefinedFiberAnchorsForCells(
+            grid,
+            value,
+            [](const auto& indices, int, auto& samples) {
+                samples.assign(
+                    indices.size(),
+                    vc::fiber_tracer::FiberStoredPredictionSample{
+                        {1.0, 0.0, 0.0}, 1.0, true});
+            },
+            {{1, 1, 1}, {3, 1, 1}});
+
+    CHECK(report.profile.workCells == 2);
+    CHECK(report.profile.supportStencilCells == 1);
+    CHECK(report.profile.clippedSupportCells == 1);
 }
 
 TEST_CASE("adjacent anchor tile groups reuse overlapping prediction halos")

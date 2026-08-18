@@ -12,6 +12,11 @@
   wall by 9.7%, and peak RSS by 14.2% with byte-identical replay artifacts.
 - Added extraction-profile version 14 with endpoint, lazy request/miss/hit, and
   shared/local scoring-memory diagnostics.
+- Reused an exact ordered support-span stencil for complete anchor cells,
+  reducing canonical anchor CPU by 5.5% and total wall by 3.6% with
+  byte-identical replay artifacts.
+- Added extraction-profile version 15 with support-stencil and clipped-cell
+  counts.
 
 # 2026-08-17: robust sampled-direction anchor refinement
 

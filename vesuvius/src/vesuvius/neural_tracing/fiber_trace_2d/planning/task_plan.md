@@ -353,3 +353,63 @@ artifacts exactly matched checkpoint 10.
 3. Run `git diff --check`.
 4. Run the exact canonical replay command recorded in `task_log.md` and compare
    against the immediately preceding accepted checkpoint.
+
+## Checkpoint 12: Canonical Anchor Support Stencil
+
+1. Build one canonical support stencil for a complete cell with a full halo.
+   Store ordered `(z, y, xBegin, xEnd)` spans relative to the cell sample begin,
+   generated under the exact existing owned-or-radius predicate. Do not flatten
+   canonical offsets because tile row and plane strides vary.
+2. When gradients are enabled, the extra halo voxel guarantees every retained
+   full-stencil site is gradient-eligible. Final validity is therefore exactly
+   the tile observation's sampled-gradient validity. Keep the explicit halo
+   eligibility test in the clipped fallback.
+3. Use the stencil only when every axis satisfies `end - begin == cellSize`,
+   `begin >= sampleHalo`, and `gridShape - end >= sampleHalo`. Crop and tile
+   boundaries do not affect eligibility. Translate each 3D span through the
+   current tile shape into compact observation indices. Keep the existing
+   clipped scalar scan for every other cell.
+4. Preserve profile semantics: `candidateObservations` remains the number of
+   sample-cube sites represented, while `retainedObservations`, gradient
+   attempts, and valid gradients retain their existing logical populations.
+   Add explicit fast-path/fallback cell counters, require their sum to equal
+   `workCells`, and advance the emitted profile schema from 14 to 15.
+5. Keep the stencil immutable and extraction-local. Do not create a dense
+   per-cell cache or increase concurrent sample ownership.
+6. Compare the ordered span expansion against a scalar oracle for odd and even
+   cell sizes, with and without gradient weighting. Cover multiple full-halo
+   cells sharing a tile where tile and cell sample origins differ, exact low/
+   high halo eligibility, a crop-edge interior cell, and a partial final cell.
+   Assert fast/fallback counters, deterministic serial/parallel populations,
+   and unchanged extracted anchors on existing fixtures.
+7. Build and run focused GCC and Clang anchor/path/replay tests. Run three
+   canonical 32-thread, 5,000-base-voxel replays and compare total/anchor wall
+   and CPU, observation-construction work, populations, replay failures, and
+   artifact hashes against checkpoint 11.
+8. Retain the checkpoint only if it improves total or anchor cost without an
+   unacceptable population or replay-quality regression.
+
+### Checkpoint 12 Spec Update
+
+- Document that production anchor extraction reuses a canonical support
+  stencil only for complete full-halo cells and retains clipped scalar
+  construction elsewhere.
+- Define canonical Z/Y/X ordering, exact owned-or-radius membership, and
+  gradient-validity equivalence as required behavior.
+- Add fast-path/fallback profile counters to the extraction profile schema.
+- Define the emitted schema as profile version 15.
+
+### Checkpoint 12 Documentation Update
+
+- Update `volume-cartographer/docs/fiberlets.md` with the support-stencil fast
+  path, its boundary fallback, and the new profile fields.
+- Record the accepted or rejected benchmark result in `task_log.md`, summarize
+  an accepted checkpoint in `changelog.md`, and complete `status.md`.
+
+### Checkpoint 12 Result
+
+Accepted. All 13,027 canonical work cells used the stencil. Three runs reduced
+median observation-construction worker time from 18.99 to 11.84 seconds,
+anchor CPU from 177.28 to 167.49 seconds, and total wall from 10.76 to 10.37
+seconds. Populations, DP work, replay failures, and complete replay artifacts
+remained identical to checkpoint 11.
