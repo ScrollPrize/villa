@@ -93,13 +93,18 @@ struct CurvedDomain {
 struct SearchNode {
     cv::Vec3f point{0.0f, 0.0f, 0.0f};
     uint32_t key = 0;
+};
+
+static_assert(sizeof(SearchNode) == 16);
+
+struct CompactNodeScoring {
     std::array<uint8_t, 2> predictionAxis{128, 128};
     std::array<uint8_t, 2> normalAxis{128, 128};
     uint8_t presence = 0;
     uint8_t flags = 0;
 };
 
-static_assert(sizeof(SearchNode) == 24);
+static_assert(sizeof(CompactNodeScoring) == 6);
 
 struct SearchCorridor {
     std::vector<cv::Vec3f> reference;
@@ -227,8 +232,22 @@ struct SolveProfile {
     size_t nodeIndexSlots = 0;
     size_t preparedNodes = 0;
     size_t preparedNodeBytes = 0;
+    size_t lazyCacheIndexBytes = 0;
     size_t directIndexBytes = 0;
     size_t stateBytes = 0;
+    size_t lazyNodeRequests = 0;
+    size_t lazyNodeCacheHits = 0;
+    size_t scoringPageDirectoryProbes = 0;
+    size_t interpolationProfiledPoints = 0;
+    size_t interpolationProfiledCorners = 0;
+    size_t interpolationProfiledPredictionIdentical = 0;
+    size_t interpolationProfiledNormalIdentical = 0;
+    size_t interpolationProfiledPredictionPrincipalSolves = 0;
+    size_t interpolationProfiledNormalPrincipalSolves = 0;
+    size_t interpolationPredictionClosedFormResolutions = 0;
+    size_t interpolationNormalClosedFormResolutions = 0;
+    size_t interpolationPredictionIterativeFallbacks = 0;
+    size_t interpolationNormalIterativeFallbacks = 0;
     size_t reachedNodes = 0;
     size_t generatedEdges = 0;
     size_t validEdges = 0;
@@ -239,17 +258,24 @@ struct SolveProfile {
     double nodeIndexSeconds = 0.0;
     double nodePreparationSeconds = 0.0;
     double dpSeconds = 0.0;
+    double interpolationProfiledLookupSeconds = 0.0;
+    double interpolationProfiledPredictionCornerSeconds = 0.0;
+    double interpolationProfiledNormalCornerSeconds = 0.0;
+    double interpolationProfiledPredictionResolveSeconds = 0.0;
+    double interpolationProfiledNormalResolveSeconds = 0.0;
 };
 
 struct DpNodeScoring {
     cv::Vec3d predictionAxis{0.0, 0.0, 0.0};
     FiberLocalMetricSample metricPrediction;
     cv::Vec3f metricNormal{0.0f, 0.0f, 0.0f};
+    std::array<uint8_t, 2> normalAxis{128, 128};
     uint8_t flags = 0;
 };
 
 struct DpEdge {
     uint32_t next = std::numeric_limits<uint32_t>::max();
+    uint32_t scoring = std::numeric_limits<uint32_t>::max();
     cv::Vec3f metricDirection{0.0f, 0.0f, 0.0f};
     float metricLength = 0.0f;
 };
@@ -1199,61 +1225,37 @@ constexpr uint8_t kNodePredictionValid = 1U << 0U;
 constexpr uint8_t kNodePresenceValid = 1U << 1U;
 constexpr uint8_t kNodeNormalValid = 1U << 2U;
 
-void storeNodeScoring(SearchNode& node, const ScoringVoxel& scoring)
+CompactNodeScoring compactNodeScoring(const ScoringVoxel& scoring)
 {
-    node.flags = 0;
+    CompactNodeScoring compact;
     if (scoring.prediction.presenceValid &&
         std::isfinite(scoring.prediction.presence)) {
         const double presence = std::clamp(scoring.prediction.presence, 0.0, 1.0);
-        node.presence = static_cast<uint8_t>(std::lround(presence * 255.0));
-        node.flags |= kNodePresenceValid;
+        compact.presence = static_cast<uint8_t>(std::lround(presence * 255.0));
+        compact.flags |= kNodePresenceValid;
     }
     if (scoring.prediction.valid) {
         const auto encoded =
             vc::lasagna::encodeCompactNormalToRaw(scoring.prediction.direction);
         if (encoded.has_value()) {
-            node.predictionAxis = *encoded;
-            node.flags |= kNodePredictionValid;
+            compact.predictionAxis = *encoded;
+            compact.flags |= kNodePredictionValid;
         }
     }
     if (scoring.normalValid) {
         const auto encoded =
             vc::lasagna::encodeCompactNormalToRaw(scoring.normal);
         if (encoded.has_value()) {
-            node.normalAxis = *encoded;
-            node.flags |= kNodeNormalValid;
+            compact.normalAxis = *encoded;
+            compact.flags |= kNodeNormalValid;
         }
     }
-}
-
-FiberStoredPredictionSample nodePrediction(const SearchNode& node)
-{
-    FiberStoredPredictionSample prediction;
-    prediction.presence = static_cast<double>(node.presence) / 255.0;
-    prediction.presenceValid = (node.flags & kNodePresenceValid) != 0;
-    prediction.valid = (node.flags & kNodePredictionValid) != 0;
-    if (prediction.valid) {
-        prediction.direction = vc::lasagna::decodeCompactNormalFromRaw(
-            node.predictionAxis[0], node.predictionAxis[1]);
-    }
-    return prediction;
-}
-
-vc::lasagna::NormalSample nodeNormal(const SearchNode& node)
-{
-    const bool valid = (node.flags & kNodeNormalValid) != 0;
-    return {
-        valid ? vc::lasagna::decodeCompactNormalFromRaw(
-                    node.normalAxis[0], node.normalAxis[1])
-              : cv::Vec3d{0.0, 0.0, 0.0},
-        valid,
-        {},
-    };
+    return compact;
 }
 
 cv::Vec3f floatVector(const cv::Vec3d& value);
 
-DpNodeScoring prepareDpNodeScoring(const SearchNode& node)
+DpNodeScoring prepareDpNodeScoring(const CompactNodeScoring& node)
 {
     DpNodeScoring scoring;
     const double presence = static_cast<double>(node.presence) / 255.0;
@@ -1267,6 +1269,7 @@ DpNodeScoring prepareDpNodeScoring(const SearchNode& node)
     }
     scoring.metricPrediction.presence = static_cast<float>(presence);
     if ((node.flags & kNodeNormalValid) != 0) {
+        scoring.normalAxis = node.normalAxis;
         const cv::Vec3d normalAxis = vc::lasagna::decodeCompactNormalFromRaw(
             node.normalAxis[0], node.normalAxis[1]);
         scoring.metricNormal =
@@ -1282,6 +1285,18 @@ FiberStoredPredictionSample nodePrediction(const DpNodeScoring& node)
         static_cast<double>(node.metricPrediction.presence),
         (node.flags & kNodePredictionValid) != 0,
         (node.flags & kNodePresenceValid) != 0,
+    };
+}
+
+vc::lasagna::NormalSample nodeNormal(const DpNodeScoring& node)
+{
+    const bool valid = (node.flags & kNodeNormalValid) != 0;
+    return {
+        valid ? vc::lasagna::decodeCompactNormalFromRaw(
+                    node.normalAxis[0], node.normalAxis[1])
+              : cv::Vec3d{0.0, 0.0, 0.0},
+        valid,
+        {},
     };
 }
 
@@ -1452,10 +1467,132 @@ DpIncoming incomingForState(
     };
 }
 
+class LazyNodeScoringCache {
+public:
+    LazyNodeScoringCache(
+        const std::vector<SearchNode>& nodes,
+        const FiberPredictionGridInfo& grid,
+        const PagedScoringIndex& scoringIndex,
+        const std::vector<PreparedScoringVoxel>& scoring,
+        size_t candidateIndex,
+        SolveProfile& profile)
+        : nodes_(nodes),
+          grid_(grid),
+          scoringIndex_(scoringIndex),
+          scoring_(scoring),
+          candidateIndex_(candidateIndex),
+          profile_(profile),
+          nodeToCache_(nodes.size(), missing)
+    {
+        profile_.lazyCacheIndexBytes = checkedProduct(
+            nodeToCache_.capacity(), sizeof(uint32_t),
+            "fiberlet lazy scoring-cache index byte count");
+    }
+
+    ~LazyNodeScoringCache() noexcept
+    {
+        profile_.preparedNodes = cache_.size();
+        profile_.preparedNodeBytes =
+            cache_.capacity() * sizeof(DpNodeScoring);
+        profile_.interpolationProfiledPoints = sampled_.points;
+        profile_.interpolationProfiledCorners = sampled_.corners;
+        profile_.interpolationProfiledPredictionIdentical =
+            sampled_.predictionIdentical;
+        profile_.interpolationProfiledNormalIdentical =
+            sampled_.normalIdentical;
+        profile_.interpolationProfiledPredictionPrincipalSolves =
+            sampled_.predictionPrincipalSolves;
+        profile_.interpolationProfiledNormalPrincipalSolves =
+            sampled_.normalPrincipalSolves;
+        profile_.interpolationProfiledLookupSeconds = sampled_.lookupSeconds;
+        profile_.interpolationProfiledPredictionCornerSeconds =
+            sampled_.predictionCornerSeconds;
+        profile_.interpolationProfiledNormalCornerSeconds =
+            sampled_.normalCornerSeconds;
+        profile_.interpolationProfiledPredictionResolveSeconds =
+            sampled_.predictionResolveSeconds;
+        profile_.interpolationProfiledNormalResolveSeconds =
+            sampled_.normalResolveSeconds;
+        profile_.interpolationPredictionClosedFormResolutions =
+            resolutions_.predictionClosedFormResolutions;
+        profile_.interpolationNormalClosedFormResolutions =
+            resolutions_.normalClosedFormResolutions;
+        profile_.interpolationPredictionIterativeFallbacks =
+            resolutions_.predictionIterativeFallbacks;
+        profile_.interpolationNormalIterativeFallbacks =
+            resolutions_.normalIterativeFallbacks;
+    }
+
+    uint32_t materialize(size_t node)
+    {
+        ++profile_.lazyNodeRequests;
+        uint32_t& cached = nodeToCache_.at(node);
+        if (cached != missing) {
+            ++profile_.lazyNodeCacheHits;
+            return cached;
+        }
+        if (cache_.size() >= static_cast<size_t>(missing))
+            throw std::overflow_error("fiberlet lazy scoring cache exceeds 32 bits");
+        InterpolationProfileSample* sampled =
+            selectedForProfile(nodes_[node].key) ? &sampled_ : nullptr;
+        auto lookup = scoringIndex_.lookup(
+            scoring_, profile_.scoringPageDirectoryProbes);
+        const ScoringVoxel interpolated = interpolateScoringPoint(
+            nodePoint(nodes_[node]), grid_, lookup, sampled, &resolutions_);
+        cached = static_cast<uint32_t>(cache_.size());
+        cache_.push_back(prepareDpNodeScoring(compactNodeScoring(interpolated)));
+        return cached;
+    }
+
+    const DpNodeScoring& at(uint32_t cached) const
+    {
+        if (cached >= cache_.size())
+            throw std::logic_error("fiberlet lazy scoring cache index is invalid");
+        return cache_[cached];
+    }
+
+    uint32_t existing(size_t node) const
+    {
+        const uint32_t cached = nodeToCache_.at(node);
+        if (cached == missing)
+            throw std::logic_error("fiberlet reached node has no cached scoring");
+        return cached;
+    }
+
+private:
+    bool selectedForProfile(uint32_t nodeKey) const noexcept
+    {
+        uint64_t value =
+            (static_cast<uint64_t>(candidateIndex_) << 32U) | nodeKey;
+        value += 0x9e3779b97f4a7c15ULL;
+        value = (value ^ (value >> 30U)) * 0xbf58476d1ce4e5b9ULL;
+        value = (value ^ (value >> 27U)) * 0x94d049bb133111ebULL;
+        value ^= value >> 31U;
+        return (value & 4095U) == 0;
+    }
+
+    static constexpr uint32_t missing =
+        std::numeric_limits<uint32_t>::max();
+    const std::vector<SearchNode>& nodes_;
+    const FiberPredictionGridInfo& grid_;
+    const PagedScoringIndex& scoringIndex_;
+    const std::vector<PreparedScoringVoxel>& scoring_;
+    size_t candidateIndex_ = 0;
+    SolveProfile& profile_;
+    std::vector<uint32_t> nodeToCache_;
+    std::vector<DpNodeScoring> cache_;
+    InterpolationProfileSample sampled_;
+    InterpolationResolutionStats resolutions_;
+};
+
 FiberletCandidateResult solveCandidate(
     FiberletCandidateResult candidate,
     const FiberletPathConfig& config,
     const PreparedCandidate& prepared,
+    const FiberPredictionGridInfo& grid,
+    const PagedScoringIndex& scoringIndex,
+    const std::vector<PreparedScoringVoxel>& scoring,
+    size_t candidateIndex,
     SolveProfile& profile)
 {
     candidate.searched = true;
@@ -1527,14 +1664,8 @@ FiberletCandidateResult solveCandidate(
         Clock::now() - nodeIndexStart).count();
 
     const auto nodePreparationStart = Clock::now();
-    std::vector<DpNodeScoring> dpNodes;
-    dpNodes.reserve(nodes.size());
-    for (const auto& node : nodes)
-        dpNodes.push_back(prepareDpNodeScoring(node));
-    profile.preparedNodes = dpNodes.size();
-    profile.preparedNodeBytes = checkedProduct(
-        dpNodes.capacity(), sizeof(DpNodeScoring),
-        "fiberlet prepared DP-node byte count");
+    LazyNodeScoringCache dpNodes(
+        nodes, grid, scoringIndex, scoring, candidateIndex, profile);
     profile.nodePreparationSeconds = std::chrono::duration<double>(
         Clock::now() - nodePreparationStart).count();
 
@@ -1585,13 +1716,17 @@ FiberletCandidateResult solveCandidate(
         if (!(stepLength > kEpsilon))
             continue;
         const cv::Vec3d direction = delta / stepLength;
-        if (directedAngle(candidate.startAxisXYZ, direction) > maximumAngle + kEpsilon ||
-            !withinPredictionDeviation(
-                direction, nodePrediction(nodes[node]), maximumPredictionDeviation)) {
+        if (directedAngle(candidate.startAxisXYZ, direction) > maximumAngle + kEpsilon) {
             continue;
         }
-        const FiberStoredPredictionSample prediction = nodePrediction(dpNodes[node]);
-        const vc::lasagna::NormalSample normal = nodeNormal(nodes[node]);
+        const uint32_t scoringIndex = dpNodes.materialize(node);
+        const auto& scoring = dpNodes.at(scoringIndex);
+        if (!withinPredictionDeviation(
+                direction, nodePrediction(scoring), maximumPredictionDeviation)) {
+            continue;
+        }
+        const FiberStoredPredictionSample prediction = nodePrediction(scoring);
+        const vc::lasagna::NormalSample normal = nodeNormal(scoring);
         auto& state = currentStates[
             (node - currentRange.begin) * stateCount + sourceState];
         state.reached = true;
@@ -1630,6 +1765,7 @@ FiberletCandidateResult solveCandidate(
             if (reachedStateCount == 0)
                 continue;
             ++profile.reachedNodes;
+            const uint32_t currentScoringIndex = dpNodes.existing(node);
 
             std::array<DpEdge, transitionStateCount> outgoing;
             size_t generatedEdges = 0;
@@ -1660,13 +1796,16 @@ FiberletCandidateResult solveCandidate(
                     if (!(stepLength > kEpsilon))
                         continue;
                     const cv::Vec3d direction = delta / stepLength;
+                    const uint32_t nextScoringIndex =
+                        dpNodes.materialize(found);
                     if (!withinPredictionDeviation(
-                            direction, nodePrediction(dpNodes[found]),
+                            direction, nodePrediction(dpNodes.at(nextScoringIndex)),
                             maximumPredictionDeviation)) {
                         continue;
                     }
                     outgoing[transitionState] = {
                         found,
+                        nextScoringIndex,
                         prepareFiberLocalUnitDirection(floatVector(direction)),
                         static_cast<float>(stepLength),
                     };
@@ -1676,6 +1815,7 @@ FiberletCandidateResult solveCandidate(
             profile.generatedEdges += generatedEdges;
             profile.validEdges += validEdges;
             profile.reusedEdges += validEdges * (reachedStateCount - 1);
+            const auto& currentScoring = dpNodes.at(currentScoringIndex);
             for (size_t previousState = 0; previousState < stateCount; ++previousState) {
                 const auto& currentState =
                     currentStates[currentOffset + previousState];
@@ -1694,16 +1834,17 @@ FiberletCandidateResult solveCandidate(
                         if (edge.next == missingNode)
                             continue;
                         const size_t next = edge.next;
+                        const auto& nextScoring = dpNodes.at(edge.scoring);
                         DpAccumulatedCost nextCost = currentState.cost;
                         nextCost += pathStepMetricCostPrepared(
-                            &dpNodes[node].metricPrediction,
-                            dpNodes[next].metricPrediction,
+                            &currentScoring.metricPrediction,
+                            nextScoring.metricPrediction,
                             incoming.metricDirection,
                             incoming.metricLength,
                             edge.metricDirection,
                             edge.metricLength,
-                            dpNodes[next].metricNormal,
-                            (dpNodes[next].flags & kNodeNormalValid) != 0,
+                            nextScoring.metricNormal,
+                            (nextScoring.flags & kNodeNormalValid) != 0,
                             metricConfig);
                         auto& destination = nextStates[
                             (next - nextRange.begin) * stateCount +
@@ -1734,8 +1875,18 @@ FiberletCandidateResult solveCandidate(
     }
     for (size_t node = currentRange.begin; node < currentRange.end; ++node) {
         const cv::Vec3d point = nodePoint(nodes[node]);
-        const FiberStoredPredictionSample prediction = nodePrediction(dpNodes[node]);
-        const vc::lasagna::NormalSample normal = nodeNormal(nodes[node]);
+        bool reached = false;
+        for (size_t stateIndex = 0; stateIndex < stateCount; ++stateIndex) {
+            reached = reached || currentStates[
+                (node - currentRange.begin) * stateCount + stateIndex].reached;
+        }
+        if (!reached)
+            continue;
+        const uint32_t scoringIndex = dpNodes.existing(node);
+        const FiberStoredPredictionSample prediction =
+            nodePrediction(dpNodes.at(scoringIndex));
+        const vc::lasagna::NormalSample normal =
+            nodeNormal(dpNodes.at(scoringIndex));
         for (size_t stateIndex = 0; stateIndex < stateCount; ++stateIndex) {
             const auto& state = currentStates[
                 (node - currentRange.begin) * stateCount + stateIndex];
@@ -2774,10 +2925,16 @@ FiberletPathReport traceFiberletPaths(
         const size_t preparedNodeBytes = checkedProduct(
             item.nodes.size(), sizeof(DpNodeScoring),
             "fiberlet prepared DP-node byte estimate");
+        const size_t lazyCacheIndexBytes = checkedProduct(
+            item.nodes.size(), sizeof(uint32_t),
+            "fiberlet lazy scoring-cache index byte estimate");
         maximumSearchTransientBytes = std::max(
             maximumSearchTransientBytes,
             checkedSum(
-                checkedSum(stateBytes, nodeIndexBytes,
+                checkedSum(
+                    checkedSum(stateBytes, nodeIndexBytes,
+                        "fiberlet search transient byte estimate"),
+                    lazyCacheIndexBytes,
                     "fiberlet search transient byte estimate"),
                 preparedNodeBytes,
                 "fiberlet search transient byte estimate"));
@@ -2963,6 +3120,12 @@ FiberletPathReport traceFiberletPaths(
     report.scoringIndexCpuSeconds =
         processCpuSeconds() - scoringIndexCpuStart;
     const size_t scoringIndexPayloadBytes = scoringIndex.payloadBytes();
+    const size_t retainedPreparedScoringBytes = checkedProduct(
+        preparedScoringVoxels.capacity(), sizeof(PreparedScoringVoxel),
+        "fiberlet retained prepared-scoring byte estimate");
+    report.dpSharedScoringBytes = checkedSum(
+        retainedPreparedScoringBytes, scoringIndexPayloadBytes,
+        "fiberlet shared search-scoring byte estimate");
     report.estimatedPeakOwnedBytes = std::
         max(report.estimatedPeakOwnedBytes,
             checkedSum(
@@ -2972,13 +3135,9 @@ FiberletPathReport traceFiberletPaths(
                 scoringIndexPayloadBytes,
                 "fiberlet peak owned byte estimate"));
     errors.assign(prepared.size(), {});
-    for (const auto& item : prepared) {
-        report.interpolatedScoringPoints = checkedSum(
-            report.interpolatedScoringPoints,
-            checkedSum(item.nodes.size(), 2,
-                "fiberlet interpolated scoring point count"),
-            "fiberlet interpolated scoring point count");
-    }
+    report.endpointScoringInterpolations = checkedProduct(
+        prepared.size(), 2, "fiberlet endpoint interpolation count");
+    report.interpolatedScoringPoints = report.endpointScoringInterpolations;
     std::atomic<size_t> nextMaterialization{0};
     std::atomic<size_t> completedMaterialization{0};
     std::vector<size_t> pageDirectoryProbes(workerCount);
@@ -3010,11 +3169,6 @@ FiberletPathReport traceFiberletPaths(
                     candidate.startPositionPredictionXYZ);
                 item.targetScoring = interpolate(
                     candidate.targetPositionPredictionXYZ);
-                for (size_t node = 0; node < item.nodes.size(); ++node) {
-                    const ScoringVoxel scoring = interpolate(
-                        nodePoint(item.nodes[node]));
-                    storeNodeScoring(item.nodes[node], scoring);
-                }
             } catch (...) {
                 errors[searchIndex] = std::current_exception();
             }
@@ -3081,11 +3235,15 @@ FiberletPathReport traceFiberletPaths(
         if (error)
             std::rethrow_exception(error);
     }
-    scoringIndex.clear();
     orderedVoxels.clear();
     orderedVoxels.shrink_to_fit();
-    preparedScoringVoxels.clear();
-    preparedScoringVoxels.shrink_to_fit();
+    report.estimatedPeakOwnedBytes = std::max(
+        report.estimatedPeakOwnedBytes,
+        checkedSum(
+            checkedSum(preparedBytes, report.dpSharedScoringBytes,
+                "fiberlet peak lazy-search byte estimate"),
+            report.peakSearchTransientBytes,
+            "fiberlet peak lazy-search byte estimate"));
 
     const auto searchStart = Clock::now();
     const double searchCpuStart = processCpuSeconds();
@@ -3103,7 +3261,9 @@ FiberletPathReport traceFiberletPaths(
             try {
                 report.candidates[candidateIndex] = solveCandidate(
                     report.candidates[candidateIndex], report.config,
-                    prepared[searchIndex], solveProfiles[searchIndex]);
+                    prepared[searchIndex], grid, scoringIndex,
+                    preparedScoringVoxels, searchIndex,
+                    solveProfiles[searchIndex]);
             } catch (...) {
                 errors[searchIndex] = std::current_exception();
             }
@@ -3138,8 +3298,23 @@ FiberletPathReport traceFiberletPaths(
         report.dpPreparedNodes = checkedSum(
             report.dpPreparedNodes, profile.preparedNodes,
             "fiberlet prepared DP-node count");
+        report.lazyNodeScoringMaterializations = checkedSum(
+            report.lazyNodeScoringMaterializations, profile.preparedNodes,
+            "fiberlet lazy node materialization count");
+        report.interpolatedScoringPoints = checkedSum(
+            report.interpolatedScoringPoints, profile.preparedNodes,
+            "fiberlet interpolated scoring point count");
+        report.lazyNodeScoringRequests = checkedSum(
+            report.lazyNodeScoringRequests, profile.lazyNodeRequests,
+            "fiberlet lazy node scoring request count");
+        report.lazyNodeScoringCacheHits = checkedSum(
+            report.lazyNodeScoringCacheHits, profile.lazyNodeCacheHits,
+            "fiberlet lazy node scoring cache-hit count");
         report.dpMaximumPreparedNodeBytes = std::max(
             report.dpMaximumPreparedNodeBytes, profile.preparedNodeBytes);
+        report.dpMaximumLazyCacheIndexBytes = std::max(
+            report.dpMaximumLazyCacheIndexBytes,
+            profile.lazyCacheIndexBytes);
         report.dpMaximumDirectIndexBytes = std::max(
             report.dpMaximumDirectIndexBytes, profile.directIndexBytes);
         report.dpMaximumStateBytes = std::max(
@@ -3165,11 +3340,48 @@ FiberletPathReport traceFiberletPaths(
         report.dpRelaxations = checkedSum(
             report.dpRelaxations, profile.relaxations,
             "fiberlet DP relaxation count");
+        report.scoringPageDirectoryProbes = checkedSum(
+            report.scoringPageDirectoryProbes,
+            profile.scoringPageDirectoryProbes,
+            "fiberlet scoring page probe count");
+        report.interpolationProfiledPoints +=
+            profile.interpolationProfiledPoints;
+        report.interpolationProfiledCorners +=
+            profile.interpolationProfiledCorners;
+        report.interpolationProfiledPredictionIdentical +=
+            profile.interpolationProfiledPredictionIdentical;
+        report.interpolationProfiledNormalIdentical +=
+            profile.interpolationProfiledNormalIdentical;
+        report.interpolationProfiledPredictionPrincipalSolves +=
+            profile.interpolationProfiledPredictionPrincipalSolves;
+        report.interpolationProfiledNormalPrincipalSolves +=
+            profile.interpolationProfiledNormalPrincipalSolves;
+        report.interpolationPredictionClosedFormResolutions +=
+            profile.interpolationPredictionClosedFormResolutions;
+        report.interpolationNormalClosedFormResolutions +=
+            profile.interpolationNormalClosedFormResolutions;
+        report.interpolationPredictionIterativeFallbacks +=
+            profile.interpolationPredictionIterativeFallbacks;
+        report.interpolationNormalIterativeFallbacks +=
+            profile.interpolationNormalIterativeFallbacks;
+        report.interpolationProfiledLookupSeconds +=
+            profile.interpolationProfiledLookupSeconds;
+        report.interpolationProfiledPredictionCornerSeconds +=
+            profile.interpolationProfiledPredictionCornerSeconds;
+        report.interpolationProfiledNormalCornerSeconds +=
+            profile.interpolationProfiledNormalCornerSeconds;
+        report.interpolationProfiledPredictionResolveSeconds +=
+            profile.interpolationProfiledPredictionResolveSeconds;
+        report.interpolationProfiledNormalResolveSeconds +=
+            profile.interpolationProfiledNormalResolveSeconds;
         report.searchNodeIndexWorkSeconds += profile.nodeIndexSeconds;
         report.searchNodePreparationWorkSeconds +=
             profile.nodePreparationSeconds;
         report.searchDpWorkSeconds += profile.dpSeconds;
     }
+    scoringIndex.clear();
+    preparedScoringVoxels.clear();
+    preparedScoringVoxels.shrink_to_fit();
     if (progressError)
         std::rethrow_exception(progressError);
     for (const size_t candidateIndex : searchCandidateIndices) {

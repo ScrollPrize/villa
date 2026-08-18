@@ -7,6 +7,11 @@
   total CPU by 8.8% while preserving selected geometry and replay failures.
 - Added extraction-profile version 13 with solve-local memory, node/edge reuse,
   and node-preparation diagnostics.
+- Deferred interior scoring interpolation until first search access and cached
+  it per candidate. This reduced canonical fiberlet CPU by another 35.9%, total
+  wall by 9.7%, and peak RSS by 14.2% with byte-identical replay artifacts.
+- Added extraction-profile version 14 with endpoint, lazy request/miss/hit, and
+  shared/local scoring-memory diagnostics.
 
 # 2026-08-17: robust sampled-direction anchor refinement
 

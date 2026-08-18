@@ -30,3 +30,10 @@ reusing each reached node's outgoing-edge descriptors across incoming states,
 fully pre-generating all retained-node transitions, and compacting DP state by
 deriving incoming edges and predecessor nodes from the node/transition key.
 Retain the fastest acceptable composition and record rejected variants.
+
+The next measured continuation is lazy node scoring materialization. Keep the
+global deduplicated source-voxel sampling and immutable scoring index, but
+interpolate an interior node only when search first requests it. Cache the
+result by candidate-local node index and preserve the existing compact
+quantization, strict gates, scoring arithmetic, transition order, and endpoint
+handling.

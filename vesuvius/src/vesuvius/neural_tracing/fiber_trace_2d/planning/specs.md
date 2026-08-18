@@ -2761,9 +2761,10 @@
   selection-boundary corners.
 - `--batch`, initially 65536, limits consecutive global unique coordinates per
   sampler call. All prediction ranges complete before any normal range. After
-  all reads, endpoint/node corners and weights are re-derived directly from
-  their canonical stored positions and sampling temporaries are released before
-  parallel DP. Prediction
+  all reads, prepared scoring voxels and their immutable paged index are
+  retained through parallel DP. Exact endpoints are interpolated eagerly;
+  interior-node corners and weights are re-derived from canonical stored
+  positions only on a candidate-local lazy-cache miss. Prediction
   and normal samplers each receive every global coordinate exactly once; only
   their call count changes with `--batch`.
 - Every parallel stage writes canonical slots. Workers continue after
@@ -2823,16 +2824,19 @@
   Materialized interior prediction and normal axes are re-encoded in the
   Lasagna +Z compact `nx/ny` byte convention; presence is a clamped rounded
   byte and validity uses independent bits. This intentional second
-  quantization is part of the experimental DP objective. The 24-byte node
-  stores only key, float position, compact axes, presence, and flags; no normal
+  quantization is part of the experimental DP objective. The persistent
+  16-byte geometry node stores only key and float position; compact scoring is
+  converted immediately into the candidate-local prepared cache and no normal
   reason or interpolation stencil is retained. The
   global sparse union includes all required native corners even when a corner
   lies outside the floating-node tube predicate. Evaluated nodes retain integer
-  candidate and local keys rather than floating-point hash identity. Before
-  solving one candidate, each retained node's compact axes are decoded and
-  normalized once into a solve-local scoring array. This expanded array is
-  released after that candidate and is not added to persistent prepared
-  geometry.
+  candidate and local keys rather than floating-point hash identity. Each
+  candidate owns a direct node-to-cache map and append-only prepared scoring
+  cache. First access interpolates, compact-quantizes, decodes, and normalizes
+  that node; later accesses reuse its cache index. Mutable page lookup state is
+  candidate-local, while the underlying prepared scoring voxels and page index
+  are shared read-only. Both local structures are released after that candidate
+  and are not added to persistent prepared geometry.
 - Every nonzero DP edge must have an unoriented angle strictly below 25 degrees
   to the interpolated dense fiber-prediction axis. Equivalently, for normalized step
   `d` and fiber axis `f`, `abs(d dot f) > cos(25 degrees)` without a boundary
@@ -3041,7 +3045,7 @@
   Benchmark comparisons must retain identical inputs, parameters, build type,
   and interval.
 - Benchmark and full replay extraction emit the same versioned
-  `fiberlet_extraction_profile version=13` key/value schema. The profile exposes
+  `fiberlet_extraction_profile version=14` key/value schema. The profile exposes
   deterministic workload counters and finer anchor/fiberlet phase timings.
   Enclosing phase fields are wall time, `_work_seconds` fields are summed
   worker/candidate time, and CPU fields are process CPU time. Corner insertion
@@ -3098,6 +3102,13 @@
   sink. State-memory accounting is the global predecessor bytes plus the two
   largest adjacent rolling cost layers; adjacent-layer populations are counted
   during parallel node generation rather than by a separate serial pass.
+- Version 14 changes `interpolatedScoringPoints` to actual endpoint plus unique
+  lazy-node interpolations. It separately reports endpoint interpolations, lazy
+  requests, unique materializations, cache hits, maximum node-to-cache index
+  bytes, and shared prepared-scoring/page-index bytes retained during search.
+  Sparse interpolation timing samples use a fixed hash of canonical candidate
+  index and packed node key; exact resolution/materialization counts remain
+  complete and deterministic.
 - Transient direction-conditioned peak observations and transverse response
   math use float32. Persistent anchor state, accepted positions, diagnostics,
   and serialized output remain double precision. Peak ties and downstream DP

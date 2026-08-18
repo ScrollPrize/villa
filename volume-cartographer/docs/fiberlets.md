@@ -231,9 +231,10 @@ changing the geometric predicate.
 `--batch` is a coordinate-call limit, 65536 by default. It partitions only
 consecutive ranges of the global unique union. The path stage completes all
 prediction calls, then all normal calls, materializes every prepared endpoint
-and node score by deriving corners and weights from its position again,
-releases sampling storage, and finally runs every DP
-candidate in parallel from its retained geometry. Increasing `--batch` changes
+score, and retains immutable prepared scoring voxels plus their page index while
+running every DP candidate in parallel. Interior node scores are interpolated
+at first search access and cached by candidate-local node index. Increasing
+`--batch` changes
 sampler call count only; it cannot decrease the unique request population or
 change path/graph artifacts. Each volume call and each parallel stage may use
 `--threads`; candidate results remain in their canonical slots.
@@ -269,14 +270,14 @@ state byte per node/state. Float32 cumulative costs roll through only the
 current and next interior layers because alignment and curvature need no older
 cost state. Source and sink transitions remain separate.
 
-Each interior node occupies 24 bytes: one checked row-major `uint32` key,
-three `float32` prediction coordinates, compact two-byte fiber and normal axes,
-one byte of presence, and validity flags. Fiber/normal axes use the same +Z
-hemisphere `nx/ny` encoding as Lasagna and presence uses the native byte scale.
-No per-node reason string or interpolation-address object is retained. This
-re-quantization is intentional for the experimental fiberlet objective; exact
-anchor endpoints remain double precision. DP expands compact prediction and
-normal axes into normalized solve-local scoring records once per node. Each
+Each interior geometry node occupies 16 bytes: one checked row-major `uint32`
+key and three `float32` prediction coordinates. On a lazy-cache miss, fiber and
+normal axes pass through the same +Z compact `nx/ny` encoding as Lasagna and
+presence uses the native byte scale. No per-node reason string or
+interpolation-address object is retained. This re-quantization is intentional
+for the experimental fiberlet objective; exact anchor endpoints remain double
+precision. DP stores normalized solve-local scoring records only for requested
+nodes. Each
 reached node resolves its at most nine outgoing neighbors and edge geometry
 once, reusing them across incoming states; no candidate-wide edge table is
 materialized.
@@ -549,7 +550,7 @@ sampling, search, and total wall times. Use identical manifests, fiber, options,
 build type, and interval for before/after performance comparisons.
 
 Benchmark and replay extraction also emit a versioned
-`fiberlet_extraction_profile version=13` row. Both commands use the same field
+`fiberlet_extraction_profile version=14` row. Both commands use the same field
 names and units. Replay writes the row to stderr after full tube extraction;
 benchmark writes it to stdout after the existing summary. The row separates:
 
@@ -586,6 +587,19 @@ versus 12.42 and about 1.85 seconds before solve-local reuse. Median total CPU
 fell from 310.98 to 283.73 seconds and search CPU from about 58 to 31.39
 seconds. Selected geometry and replay failures were unchanged; float32
 cumulative costs permit small serialized-cost differences.
+
+Version 14 reports eager endpoint interpolations, lazy node requests, unique
+node materializations, cache hits, maximum lazy node-map bytes, and immutable
+shared scoring bytes retained through search. `interpolatedScoringPoints` is
+now endpoint interpolations plus unique lazy node materializations. On the same
+canonical replay, only 14.48M of 50.72M retained nodes were materialized.
+Three runs measured 10.76 seconds median total wall time and 3.30 seconds
+fiberlet wall time, versus 11.91 and 4.52 seconds for version 13. Median total
+CPU fell from 283.73 to 248.84 seconds, fiberlet CPU from 108.20 to 69.38
+seconds, and peak RSS from 2.46 to 2.11 GiB. Search itself increased from 1.00
+to 1.29 seconds because lazy interpolation is included there; the former
+all-node interpolation phase fell from 1.52 seconds to about 0.015 seconds.
+Selected geometry, replay failures, and replay artifacts were unchanged.
 
 Version 2 subdivides `anchor_fitting_work_seconds` into exclusive summed-worker
 phases for weighted-observation setup, seed generation, seed-pair refinement,

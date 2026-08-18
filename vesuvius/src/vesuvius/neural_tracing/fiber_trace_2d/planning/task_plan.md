@@ -251,6 +251,84 @@ costs changed ten relaxation decisions and serialized costs only.
 - Add the accepted result to `planning/changelog.md`; keep failed variants only
   in `planning/task_log.md`.
 
+## Checkpoint 11: Lazy Node Scoring Materialization
+
+1. Use commit `93bde87a2` and its three-run checkpoint-10 medians as the
+   baseline: 11.91 seconds total wall, 283.73 seconds total CPU, 4.52/108.20
+   seconds fiberlet wall/CPU, and 1.00/31.39 seconds search wall/CPU.
+2. Preserve global native-corner collection, deterministic unique merging,
+   batched prediction/normal reads, prepared scoring voxels, and the paged
+   scoring index. These establish the complete immutable source data required
+   by any node that search may request.
+3. Eagerly interpolate only exact candidate endpoints. Retain the immutable
+   prepared scoring array and page index through search instead of releasing
+   them before dynamic programming.
+4. Give each candidate solve a local direct node-to-cache index and a compact
+   append-only `DpNodeScoring` cache. On first access, interpolate the node at
+   its authoritative stored float position, pass through the existing compact
+   encode/decode boundary, and prepare the normalized metric representation.
+   Reuse that cached value for every later gate, normal, and scoring access.
+   Store cache indices in edges and local variables rather than references so
+   append growth cannot invalidate active data; do not reserve the full retained
+   node population.
+5. Preserve canonical node/state/transition order, source/sink special cases,
+   strict double prediction-deviation checks, float local scoring, rolling
+   cumulative costs, and predecessor reconstruction. Shared source data is
+   immutable and every lazy cache is owned by one solve worker, so no locks or
+   cross-candidate writes are introduced.
+6. Every candidate owns its mutable page-lookup cache and probe counter. Only
+   the underlying paged index and prepared scoring array are shared immutable
+   data.
+7. Extract one shared compact-scoring conversion helper used at the eager and
+   lazy boundaries; do not duplicate compact axis encoding, presence rounding,
+   validity, or decode preparation.
+8. Count endpoint interpolations, lazy node requests, unique lazy
+   materializations/cache misses, and cache hits. Keep
+   `interpolatedScoringPoints` as endpoint plus unique lazy interpolations.
+   Include shared scoring/index bytes retained through search, the candidate
+   node-to-cache map, actual lazy cache capacity, direct node index, rolling
+   states, and backpointers in memory diagnostics; retain a conservative
+   all-node cache bound for admission accounting.
+9. Avoid a timer call on every hot cache access. Retain deterministic sparse
+   interpolation subprofiling using a fixed hash of canonical candidate index
+   plus packed node key, while exact resolution and materialization counters
+   remain complete and candidate-local diagnostics aggregate in canonical
+   order.
+10. Add regression coverage for endpoint-only interpolation, actual
+   interpolation being lower than retained nodes on a pruned fixture, cache
+   reuse, serial/parallel determinism, unchanged source-coordinate requests,
+   invalid/ambiguous rejection, path geometry/costs, and failures. Run focused
+   GCC and Clang tests.
+11. Run three identically warmed canonical 5,000-base-voxel replays. Record
+   command, inputs, baseline commit, build type, threads, cache state, and
+   min/median/max. Compare total, fiberlet,
+   endpoint materialization, search wall/CPU, peak RSS, actual interpolated
+   nodes, cache hits, DP counters, populations, failures, and artifact hashes.
+   Retain the variant only if combined endpoint materialization plus search and
+   total runtime improve without unacceptable quality change.
+
+### Checkpoint 11 Spec Update
+
+- Document eager endpoint versus lazy interior-node materialization, immutable
+  shared source data, candidate-local cache ownership, actual interpolation
+  counter semantics, and the retained compact quantization boundary.
+
+### Checkpoint 11 Documentation Update
+
+- Update `volume-cartographer/docs/fiberlets.md` and profile-schema notes with
+  the accepted data flow and measured outcome. Record failed variants only in
+  `task_log.md`; add an accepted result to `changelog.md`.
+
+### Checkpoint 11 Measured Outcome
+
+Accepted. Three runs materialized 14,478,750 of 50,718,661 retained nodes and
+served 44,815,799 repeated requests from candidate-local caches. Median total
+wall/CPU fell from 11.91/283.73 to 10.76/248.84 seconds; fiberlet wall/CPU fell
+from 4.52/108.20 to 3.30/69.38 seconds. Search itself rose from 1.00/31.39 to
+1.29/40.66 seconds because lazy interpolation moved into search, while eager
+interpolation fell from 1.52 seconds wall to about 0.015 seconds. All final
+artifacts exactly matched checkpoint 10.
+
 ## Spec Update
 
 - Document compact tile observation ownership and float precision boundaries.

@@ -419,6 +419,11 @@ TEST_CASE("fiberlet DP preserves a short pair as one exact transition")
     CHECK(path.pointsPredictionXYZ.front() == start);
     CHECK(path.pointsPredictionXYZ.back() == target);
     CHECK(cv::norm(path.pointsPredictionXYZ.back() - path.pointsPredictionXYZ.front()) == doctest::Approx(1.5));
+    CHECK(report.endpointScoringInterpolations == 2);
+    CHECK(report.lazyNodeScoringRequests == 0);
+    CHECK(report.lazyNodeScoringMaterializations == 0);
+    CHECK(report.lazyNodeScoringCacheHits == 0);
+    CHECK(report.interpolatedScoringPoints == 2);
 }
 
 TEST_CASE("fiberlet DP enforces a strict sampled fiber-direction bound")
@@ -897,6 +902,7 @@ TEST_CASE("fiberlet sparse replay domain rejects a disconnected corridor")
     CHECK(report.diagnostics.successfulPaths == 0);
     REQUIRE(report.candidates.size() == 1);
     CHECK(report.candidates[0].reason == "no_path");
+    CHECK(report.lazyNodeScoringMaterializations < report.retainedSearchNodes);
 }
 
 TEST_CASE("fiberlet candidate workers preserve deterministic results")
@@ -921,7 +927,19 @@ TEST_CASE("fiberlet candidate workers preserve deterministic results")
         CHECK(report.latticeNodePositions >= report.corridorAcceptedNodes);
         CHECK(report.corridorAcceptedNodes >= report.retainedSearchNodes);
         CHECK(report.interpolationCornerInsertions >= report.sampledVoxels);
-        CHECK(report.interpolatedScoringPoints == report.evaluatedDpNodes);
+        CHECK(report.endpointScoringInterpolations ==
+              2 * report.preparedCandidates);
+        CHECK(report.interpolatedScoringPoints ==
+              report.endpointScoringInterpolations +
+                  report.lazyNodeScoringMaterializations);
+        CHECK(report.lazyNodeScoringMaterializations <=
+              report.retainedSearchNodes);
+        CHECK(report.lazyNodeScoringRequests ==
+              report.lazyNodeScoringMaterializations +
+                  report.lazyNodeScoringCacheHits);
+        CHECK(report.lazyNodeScoringCacheHits > 0);
+        CHECK(report.dpPreparedNodes ==
+              report.lazyNodeScoringMaterializations);
         CHECK(report.retainedSearchNodes + 2 * report.preparedCandidates ==
               report.evaluatedDpNodes);
         CHECK(report.scoringPageCount <= report.sampledVoxels);
@@ -977,6 +995,14 @@ TEST_CASE("fiberlet candidate workers preserve deterministic results")
           parallel.interpolationCornerInsertions);
     CHECK(serial.interpolatedScoringPoints ==
           parallel.interpolatedScoringPoints);
+    CHECK(serial.endpointScoringInterpolations ==
+          parallel.endpointScoringInterpolations);
+    CHECK(serial.lazyNodeScoringRequests ==
+          parallel.lazyNodeScoringRequests);
+    CHECK(serial.lazyNodeScoringMaterializations ==
+          parallel.lazyNodeScoringMaterializations);
+    CHECK(serial.lazyNodeScoringCacheHits ==
+          parallel.lazyNodeScoringCacheHits);
     CHECK(serial.scoringPageCount == parallel.scoringPageCount);
     CHECK(serial.scoringPageSlots == parallel.scoringPageSlots);
     CHECK(serial.scoringPageDirectoryProbes ==

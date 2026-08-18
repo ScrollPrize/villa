@@ -472,3 +472,47 @@
   `test_fiberlet_paths`, and `test_fiber_replay`; both focused CTest runs passed
   all three tests. `test_fiberlet_paths` now directly checks equality between
   validating and prepared local-scoring components. `git diff --check` passed.
+
+## Checkpoint 11: Lazy Node Scoring Materialization
+
+- Kept global native-corner collection, prediction/normal sampling, prepared
+  scoring voxels, and the immutable paged scoring index. Exact endpoints remain
+  eager; each candidate lazily interpolates interior nodes into its own direct
+  cache. A shared compact conversion helper preserves the prior encode/decode,
+  presence rounding, validity, strict gate, and scoring boundaries.
+- The independent plan review required cache indices instead of unstable
+  references, candidate-local mutable lookup state, explicit shared/local
+  memory accounting, stable candidate/key-hash profiling, and separate
+  endpoint/request/miss/hit counters. All corrections were incorporated.
+- A first run exposed three changed relaxations because source/final transitions
+  consumed a prepared float normal. Retaining the compact normal bytes for
+  those transitions restored exact checkpoint-10 arithmetic and artifact hash.
+- Reached current and final nodes use a checked existing-cache lookup, avoiding
+  8,670,563 redundant miss-capable requests without changing scoring.
+
+  | metric | minimum | median | maximum | checkpoint 10 median |
+  |---|---:|---:|---:|---:|
+  | total wall | 10.65 s | 10.76 s | 10.85 s | 11.91 s |
+  | total CPU | 244.49 s | 248.84 s | 251.92 s | 283.73 s |
+  | fiberlet wall | 3.25 s | 3.30 s | 3.34 s | 4.52 s |
+  | fiberlet CPU | 68.14 s | 69.38 s | 70.28 s | 108.20 s |
+  | endpoint materialization wall | 0.0147 s | 0.0152 s | 0.0165 s | 1.52 s all-node |
+  | search wall | 1.268 s | 1.293 s | 1.311 s | 0.996 s |
+  | search CPU | 39.99 s | 40.66 s | 41.10 s | 31.39 s |
+  | peak RSS | 2.11 GiB | 2.11 GiB | 2.12 GiB | 2.46 GiB |
+
+- Every run retained 50,718,661 geometry nodes, interpolated 103,564 endpoints
+  and 14,478,750 unique lazy nodes, issued 59,294,549 lazy requests, and served
+  44,815,799 cache hits. The shared prepared-scoring/page-index payload was
+  16,930,232 bytes; largest candidate-local node map/cache/state payloads were
+  7,832 / 131,072 / 114,630 bytes.
+- DP populations and all counters matched checkpoint 10, including 62,970,689
+  relaxations. All runs retained 2 greedy / 1 fiberlet replay failures and
+  produced SHA-256
+  `41fa73c76bc3a20528d064e2baed78552a20bed41542f9ed4e2ddcfb5e739215`.
+- GCC and Clang builds and focused `test_fiber_anchors`,
+  `test_fiberlet_paths`, and `test_fiber_replay` CTest runs passed. The path
+  suite has 44 cases and now covers endpoint-only zero-lazy work, pruned
+  materialization, request/miss/hit accounting, serial/parallel counter parity,
+  and the existing invalid/ambiguous interpolation behavior. `git diff
+  --check` passed.

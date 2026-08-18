@@ -176,6 +176,10 @@ struct FiberletPathReport {
     size_t retainedSearchNodes = 0;
     size_t interpolationCornerInsertions = 0;
     size_t interpolatedScoringPoints = 0;
+    size_t endpointScoringInterpolations = 0;
+    size_t lazyNodeScoringRequests = 0;
+    size_t lazyNodeScoringMaterializations = 0;
+    size_t lazyNodeScoringCacheHits = 0;
     size_t scoringPageCount = 0;
     size_t scoringPageSlots = 0;
     size_t scoringPageDirectoryProbes = 0;
@@ -193,8 +197,10 @@ struct FiberletPathReport {
     size_t dpNodeIndexSlots = 0;
     size_t dpPreparedNodes = 0;
     size_t dpMaximumPreparedNodeBytes = 0;
+    size_t dpMaximumLazyCacheIndexBytes = 0;
     size_t dpMaximumDirectIndexBytes = 0;
     size_t dpMaximumStateBytes = 0;
+    size_t dpSharedScoringBytes = 0;
     size_t dpReachedNodes = 0;
     size_t dpGeneratedEdges = 0;
     size_t dpValidEdges = 0;

@@ -591,7 +591,7 @@ void printTubeExtractionProfile(
         return encoded.str();
     };
     output << std::setprecision(17)
-           << "fiberlet_extraction_profile version=13"
+           << "fiberlet_extraction_profile version=14"
            << " anchor_elapsed_seconds=" << extraction.anchors.elapsedSeconds
            << " anchor_cpu_seconds=" << anchor.elapsedCpuSeconds
            << " anchor_profiled_seconds=" << anchorProfiledSeconds
@@ -745,6 +745,14 @@ void printTubeExtractionProfile(
            << " fiberlet_unique_sampled_voxels=" << paths.sampledVoxels
            << " fiberlet_interpolated_scoring_points="
            << paths.interpolatedScoringPoints
+           << " fiberlet_endpoint_scoring_interpolations="
+           << paths.endpointScoringInterpolations
+           << " fiberlet_lazy_node_scoring_requests="
+           << paths.lazyNodeScoringRequests
+           << " fiberlet_lazy_node_scoring_materializations="
+           << paths.lazyNodeScoringMaterializations
+           << " fiberlet_lazy_node_scoring_cache_hits="
+           << paths.lazyNodeScoringCacheHits
            << " fiberlet_scoring_page_count=" << paths.scoringPageCount
            << " fiberlet_scoring_page_slots=" << paths.scoringPageSlots
            << " fiberlet_scoring_page_directory_probes="
@@ -774,9 +782,13 @@ void printTubeExtractionProfile(
            << " fiberlet_dp_prepared_nodes=" << paths.dpPreparedNodes
            << " fiberlet_dp_max_prepared_node_bytes="
            << paths.dpMaximumPreparedNodeBytes
+           << " fiberlet_dp_max_lazy_cache_index_bytes="
+           << paths.dpMaximumLazyCacheIndexBytes
            << " fiberlet_dp_max_direct_index_bytes="
            << paths.dpMaximumDirectIndexBytes
            << " fiberlet_dp_max_state_bytes=" << paths.dpMaximumStateBytes
+           << " fiberlet_dp_shared_scoring_bytes="
+           << paths.dpSharedScoringBytes
            << " fiberlet_dp_reached_nodes=" << paths.dpReachedNodes
            << " fiberlet_dp_generated_edges=" << paths.dpGeneratedEdges
            << " fiberlet_dp_valid_edges=" << paths.dpValidEdges

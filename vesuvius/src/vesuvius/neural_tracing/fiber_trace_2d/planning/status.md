@@ -57,3 +57,12 @@
 - [x] Run focused GCC and Clang validation.
 - [x] Run three canonical checkpoint 10 replays and compare quality/performance.
 - [x] Update specifications, user documentation, changelog, and task log.
+- [x] Plan checkpoint 11 lazy node scoring materialization.
+- [x] Independently review checkpoint 11 against task and specifications.
+- [x] Implement candidate-local lazy node scoring caches.
+- [x] Add actual materialization/cache-hit profiling and memory accounting.
+- [x] Add lazy materialization and determinism regression coverage.
+- [x] Run focused GCC and Clang validation.
+- [x] Run three canonical checkpoint 11 replays and compare quality/performance.
+- [x] Retain or remove checkpoint 11 based on the measured result.
+- [x] Update specifications, user documentation, changelog, and task log.
