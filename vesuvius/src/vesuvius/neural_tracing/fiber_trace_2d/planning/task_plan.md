@@ -413,3 +413,141 @@ median observation-construction worker time from 18.99 to 11.84 seconds,
 anchor CPU from 177.28 to 167.49 seconds, and total wall from 10.76 to 10.37
 seconds. Populations, DP work, replay failures, and complete replay artifacts
 remained identical to checkpoint 11.
+
+## Checkpoint 13: Inline Robust Membership
+
+1. Use commit `c100de833` and the accepted checkpoint-12 three-run medians as
+   the baseline: 10.37 seconds total wall, 238.78 seconds total CPU, 6.42
+   seconds anchor wall, and 167.49 seconds anchor CPU.
+2. Replace the materialized retained/not-retained byte array with one internal
+   robust-membership representation containing canonical component assignments,
+   canonical residual histogram bins, and the two selected cutoff bins.
+3. Define membership exactly as the existing predicate: an observation is
+   retained iff its assignment is below the active component count and its
+   residual bin is no greater than that component's cutoff. Keep unassigned
+   observations distinguishable through the assignment byte.
+4. Remove the second full observation pass in `robustDirectionProposal()` that
+   currently overwrites residual bins with booleans. Carry the membership
+   representation through local centroid calculation, spatial objectives,
+   peak preparation, and final evaluation; do not rematerialize booleans at a
+   later phase boundary.
+5. Define the predicate in one shared internal/detail membership helper used by
+   production and focused tests. Move the final membership object into
+   `RefinedFitState` and pass it by const reference through peak and final
+   evaluation. Do not replace the removed pass with O(N) membership-vector
+   copies. A proposal discarded after component compaction must not transfer
+   assignments or cutoffs into the restarted fit.
+6. Preserve observation traversal, component traversal, compensated-sum update
+   order, robust cutoff selection, tensor construction, line-search decisions,
+   component removal, and final support arithmetic. The optimization changes
+   only how an already-selected membership predicate is represented.
+7. Advance the extraction profile schema to version 16. Keep
+   `localTensorObservationVisits` as physical proposal-scan visits and add an
+   explicit avoided-membership-materialization visit count. Require their sum
+   to equal the version-15 logical tensor-visit count, including the
+   `computeAxes=false` final refresh.
+8. Add focused tests that compare the shared inline helper against a
+   materialized oracle for one/two active components, assigned/unassigned
+   observations, arbitrary unassigned residuals, cutoff equality, bin/cutoff
+   255, fully retained, and trimmed cases. Force component removal and verify
+   the restarted fit does not retain stale membership. Retain final peak use,
+   serial/parallel anchor, and replay determinism coverage.
+9. Build and run focused GCC and Clang anchor/path/replay tests. Run three
+   canonical 32-thread, 5,000-base-voxel replays and compare total/anchor wall
+   and CPU, tensor-proposal work, physical and avoided visits, populations, DP
+   work, replay failures, and artifact hashes against checkpoint 12.
+10. Retain the checkpoint only if it improves total or anchor cost without an
+   unacceptable population or replay-quality regression.
+
+### Checkpoint 13 Spec Update
+
+- Document residual-bin/cutoff membership representation and the exact inline
+  retained predicate.
+- Define `localTensorObservationVisits` as physical proposal scans and document
+  the avoided materialization counter.
+- Define the emitted extraction-profile schema as version 16.
+
+### Checkpoint 13 Documentation Update
+
+- Update `volume-cartographer/docs/fiberlets.md` with the inline membership data
+  flow, profile fields, and measured result.
+- Record the benchmark and validation outcome in `task_log.md`, summarize an
+  accepted checkpoint in `changelog.md`, and complete `status.md`.
+
+### Checkpoint 13 Result
+
+Rejected and removed. The representation eliminated exactly 809,364,400
+materialization visits per run and retained exact artifacts, populations, DP
+work, and failures. It replaced one retained-byte load in every later hot scan
+with assignment, residual-bin, and cutoff evaluation, however. Across three
+runs median command wall rose from 10.37 to 11.01 seconds, anchor wall from
+6.416 to 6.653 seconds, and anchor CPU from 167.49 to 169.09 seconds. The
+checkpoint-12 materialized retained-byte representation remains the baseline.
+
+## Checkpoint 14: Direct Owned-Cell Initialization Range
+
+1. Use checkpoint 12 as the baseline: 10.37 seconds median command wall,
+   6.416 seconds anchor wall, and 167.49 seconds anchor CPU. Recover and compare
+   `anchor_fit_setup_work_seconds` from the checkpoint-12 profile because the
+   two scans being removed are charged to fit setup; the 11.84-second support
+   observation-construction measurement is not their phase baseline.
+2. Separate the support observation range used by robust refinement from the
+   owned observation range used by initial seed fitting. Keep one shared
+   fitting implementation and pass both ranges explicitly.
+3. For the production dense-tile path, expose the exact clipped cell cube as a
+   zero-allocation row range. Map canonical local Z/Y/X positions
+   directly through the tile shape and origin to compact observations; do not
+   create an owned-index vector. Validate in O(1) that cell bounds are
+   monotonic and contained by the tile sample box, the tile shape product
+   equals the observation count, and the owned product equals the clipped cell
+   volume before unchecked traversal.
+4. Preserve the public vector API by deriving and validating its owned range
+   through the existing coordinate-based rules. Preserve its stable input-order
+   filter and historical count-only coverage check exactly: do not sort,
+   deduplicate, require lattice coordinates, or strengthen duplicate/missing
+   validation. Invalid, non-finite, and incomplete public input must retain its
+   current behavior.
+5. Preserve canonical Z/Y/X owned-observation order, initial denominator and
+   seed arithmetic, support-range refinement, gradient-validity semantics,
+   profile populations, and all acceptance decisions.
+6. Advance the extraction profile schema. Add separate counters for public
+   discovery visits, physical owned-initialization visits, and production
+   support visits avoided relative to the previous two complete support-range
+   scans.
+   Keep existing logical counters such as `weightedObservations` stable.
+7. Add focused tests for direct-range/index equivalence, partial cells,
+   non-zero tile origins, boundary cells, structural range validation, public
+   shuffled/off-lattice/duplicate-plus-missing input, invalid flags, NaN
+   presence, unusable directions, denominator behavior, and serial/parallel
+   extraction parity.
+8. Build and run focused GCC and Clang anchor/path/replay tests. Run three
+   canonical 32-thread, 5,000-base-voxel replays and compare total/anchor wall
+   and CPU, initialization/setup work, populations, DP work, failures, and
+   artifact hashes against checkpoint 12.
+9. Retain the checkpoint only if total or anchor cost improves without an
+   unacceptable population or replay-quality regression.
+
+### Checkpoint 14 `planning/specs.md` Update
+
+- Document the separate owned initialization and support refinement ranges.
+- Define canonical direct owned-cell traversal and public validation behavior.
+- Document any retained profile fields and schema-version change.
+
+### Checkpoint 14 Documentation Update
+
+- Update `volume-cartographer/docs/fiberlets.md` with the direct owned-range
+  production path and its measured result.
+- Record the accepted or rejected benchmark result in `task_log.md`; update
+  `changelog.md` only for an accepted checkpoint and complete `status.md`.
+
+### Checkpoint 14 Result
+
+Accepted. Production initialization directly visited 833,728 owned voxels and
+avoided 858,114,544 visits from the former two support-range scans. Across
+three fresh paired runs, median fitter-internal setup time fell from 10.996 to
+0.074 seconds, anchor CPU from 169.45 to 162.51 seconds, anchor wall from 6.553 to
+6.304 seconds, total CPU from 243.52 to 237.40 seconds, and command wall from
+10.76 to 10.65 seconds. Populations, 62,970,689 DP relaxations, 2 greedy / 1
+fiberlet failures, and replay SHA-256 remained identical.
+The final profile attribution also includes constant-time direct-layout
+construction in setup; its validation run reported 0.092 setup worker-seconds.

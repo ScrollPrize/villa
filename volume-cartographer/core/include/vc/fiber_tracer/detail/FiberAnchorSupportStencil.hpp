@@ -20,6 +20,82 @@ struct FiberAnchorSupportSpan {
     bool operator==(const FiberAnchorSupportSpan&) const = default;
 };
 
+struct FiberAnchorOwnedCellTileLayout {
+    std::array<size_t, 3> ownedShapeZYX{};
+    size_t baseIndex = 0;
+    size_t rowStride = 0;
+    size_t planeStride = 0;
+    size_t ownedSize = 0;
+};
+
+[[nodiscard]] inline size_t checkedFiberAnchorLayoutProduct(
+    const std::array<size_t, 3>& shape)
+{
+    size_t result = 1;
+    for (const size_t extent : shape) {
+        if (extent == 0 || result > std::numeric_limits<size_t>::max() / extent)
+            throw std::invalid_argument("fiber anchor tile layout has an invalid shape");
+        result *= extent;
+    }
+    return result;
+}
+
+[[nodiscard]] inline FiberAnchorOwnedCellTileLayout
+buildFiberAnchorOwnedCellTileLayout(
+    size_t observationCount,
+    const std::array<size_t, 3>& tileBeginZYX,
+    const std::array<size_t, 3>& tileShapeZYX,
+    const std::array<size_t, 3>& cellBeginZYX,
+    const std::array<size_t, 3>& cellEndZYX)
+{
+    if (checkedFiberAnchorLayoutProduct(tileShapeZYX) != observationCount)
+        throw std::invalid_argument("fiber anchor tile shape does not match its observations");
+
+    std::array<size_t, 3> ownedShape{};
+    for (size_t axis = 0; axis < 3; ++axis) {
+        if (cellBeginZYX[axis] >= cellEndZYX[axis])
+            throw std::invalid_argument("fiber anchor owned cell bounds are empty or reversed");
+        if (tileShapeZYX[axis] >
+            std::numeric_limits<size_t>::max() - tileBeginZYX[axis]) {
+            throw std::invalid_argument("fiber anchor tile bounds overflow");
+        }
+        const size_t tileEnd = tileBeginZYX[axis] + tileShapeZYX[axis];
+        if (cellBeginZYX[axis] < tileBeginZYX[axis] ||
+            cellEndZYX[axis] > tileEnd) {
+            throw std::invalid_argument("fiber anchor owned cell is outside its tile");
+        }
+        ownedShape[axis] = cellEndZYX[axis] - cellBeginZYX[axis];
+    }
+
+    FiberAnchorOwnedCellTileLayout result;
+    result.ownedShapeZYX = ownedShape;
+    result.rowStride = tileShapeZYX[2];
+    result.planeStride = tileShapeZYX[1] * tileShapeZYX[2];
+    result.baseIndex =
+        (cellBeginZYX[0] - tileBeginZYX[0]) * result.planeStride +
+        (cellBeginZYX[1] - tileBeginZYX[1]) * result.rowStride +
+        cellBeginZYX[2] - tileBeginZYX[2];
+    result.ownedSize = checkedFiberAnchorLayoutProduct(ownedShape);
+    return result;
+}
+
+template <typename Visitor>
+inline void visitFiberAnchorOwnedCellTileIndices(
+    const FiberAnchorOwnedCellTileLayout& layout,
+    Visitor&& visitor)
+{
+    size_t canonicalIndex = 0;
+    for (size_t z = 0; z < layout.ownedShapeZYX[0]; ++z) {
+        for (size_t y = 0; y < layout.ownedShapeZYX[1]; ++y) {
+            size_t index = layout.baseIndex + z * layout.planeStride +
+                y * layout.rowStride;
+            const size_t end = index + layout.ownedShapeZYX[2];
+            for (; index < end; ++index, ++canonicalIndex)
+                visitor(index, canonicalIndex);
+        }
+    }
+}
+
 [[nodiscard]] inline std::vector<FiberAnchorSupportSpan>
 buildFiberAnchorSupportStencil(
     size_t cellSize,

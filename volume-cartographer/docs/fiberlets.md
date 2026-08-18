@@ -550,7 +550,7 @@ sampling, search, and total wall times. Use identical manifests, fiber, options,
 build type, and interval for before/after performance comparisons.
 
 Benchmark and replay extraction also emit a versioned
-`fiberlet_extraction_profile version=15` row. Both commands use the same field
+`fiberlet_extraction_profile version=16` row. Both commands use the same field
 names and units. Replay writes the row to stderr after full tube extraction;
 benchmark writes it to stdout after the existing summary. The row separates:
 
@@ -612,6 +612,21 @@ construction worker time fell from 18.99 to 11.84 seconds, anchor CPU from
 177.28 to 167.49 seconds, and total wall from 10.76 to 10.37 seconds. All
 workload populations and replay artifacts remained identical.
 
+Version 16 separates the larger support range used by robust refinement from
+the exact owned-cell range used by initialization. Production traverses the
+owned cube directly from validated dense-tile row and plane strides; it does
+not rescan support coordinates or allocate owned indices. The public expanded-
+observation API retains its stable input-order filter and historical count-only
+coverage validation. `anchor_fit_owned_discovery_observation_visits`,
+`anchor_fit_owned_initialization_observation_visits`, and
+`anchor_fit_avoided_owned_support_observation_visits` distinguish those paths.
+On the canonical replay, direct initialization visited 833,728 owned voxels and
+avoided 858,114,544 support-range visits. Fit-setup worker time fell from a
+10.996-second baseline median to 0.092 seconds in the final attribution-inclusive
+validation; anchor CPU fell from 169.45 to 162.51 seconds and anchor wall
+from 6.553 to 6.304 seconds, and total wall from 10.76 to 10.65 seconds. Replay
+populations, failures, and artifacts remained identical.
+
 Version 2 subdivides `anchor_fitting_work_seconds` into exclusive summed-worker
 phases for weighted-observation setup, seed generation, seed-pair refinement,
 initialized-component finalization, local direction/position refinement,
@@ -668,6 +683,10 @@ boundaries do not affect eligibility. A volume boundary or partial final cell
 uses the original clipped sample-cube scan. When gradients are enabled, the
 extra halo voxel makes every retained stencil site gradient-eligible; sampled
 tile-gradient validity remains authoritative.
+Initialization does not rediscover owned observations from this support range.
+It traverses the clipped cell's dense tile rows directly in canonical Z/Y/X
+order after constant-time tile-shape, bounds-containment, and owned-cardinality
+validation. Refinement continues to use the support indices and gradient bytes.
 
 Version 7 reports tile-halo sampling explicitly. Six-cell tiles are paired
 deterministically by maximum overlapping sample volume while preserving at

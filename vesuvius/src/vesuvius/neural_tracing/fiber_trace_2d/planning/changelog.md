@@ -17,6 +17,11 @@
   byte-identical replay artifacts.
 - Added extraction-profile version 15 with support-stencil and clipped-cell
   counts.
+- Traversed the exact owned-cell cube directly during anchor initialization,
+  reducing canonical fit-setup worker time from 11.00 to about 0.09 seconds and
+  anchor CPU by 4.1% with byte-identical replay artifacts.
+- Added extraction-profile version 16 with public discovery, direct owned, and
+  avoided support-visit counts.
 
 # 2026-08-17: robust sampled-direction anchor refinement
 

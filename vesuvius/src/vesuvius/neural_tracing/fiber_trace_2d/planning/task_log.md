@@ -555,3 +555,88 @@
   scalar-order/stride equivalence, odd/even cells, gradient/no-gradient halos,
   serial/parallel full-stencil extraction, exact full-halo eligibility, and a
   partial-cell fallback.
+
+## Checkpoint 13: Inline Robust Membership (Rejected)
+
+- Replaced the materialized retained/not-retained byte vector experimentally
+  with component assignments, residual bins, two cutoff bins, and one shared
+  inline predicate. Final membership was move-owned by refinement state and
+  consumed by const reference through centroid, objective, peak, and final
+  support loops.
+- Independent review added explicit move ownership, a shared internal test seam,
+  component-compaction lifetime requirements, cutoff/bin boundary coverage,
+  and the version-15 logical-visit accounting invariant.
+- Clang exposed an all-components-removed path where final evaluation entered
+  with empty membership. An equivalent zero-component early return fixed it;
+  focused GCC and Clang anchor/path/replay suites then passed all three tests.
+- The canonical command, inputs, `QuickBuild` tree, warmed cache, 32 threads,
+  and 5,000-base-voxel interval were unchanged from checkpoint 12. Three runs
+  produced:
+
+  | metric | minimum | median | maximum | checkpoint 12 median |
+  |---|---:|---:|---:|---:|
+  | command wall | 10.92 s | 11.01 s | 11.58 s | 10.37 s |
+  | anchor wall | 6.652 s | 6.653 s | 6.797 s | 6.416 s |
+  | anchor CPU | 167.38 s | 169.09 s | 169.19 s | 167.49 s |
+  | tensor-proposal worker time | 35.04 s | 35.65 s | 35.66 s | about 35.25 s |
+  | fiberlet wall | 3.523 s | 3.568 s | 3.947 s | 3.294 s |
+  | peak RSS | 2.00 GiB | 2.03 GiB | 2.04 GiB | 2.08 GiB |
+
+- Every run performed 809,364,400 physical proposal visits and avoided the
+  same number of materialization visits, reconstructing the prior
+  1,618,728,800 logical visits exactly. Populations and DP work remained exact:
+  2,603 anchors, 51,782 searched / 26,494 accepted fiberlets, 170,813 sampled
+  voxels, and 62,970,689 DP relaxations. Failures remained 2 greedy / 1
+  fiberlet.
+- All three `fiber_replay.json` files retained SHA-256
+  `41fa73c76bc3a20528d064e2baed78552a20bed41542f9ed4e2ddcfb5e739215`.
+- The removed pass was cheaper than repeatedly evaluating residual-bin/cutoff
+  membership in later billion-visit loops. The implementation, profile version
+  16 experiment, helper, and tests were removed; checkpoint 12 remains the
+  production baseline and no specification or user-documentation change was
+  retained.
+
+## Checkpoint 14: Direct Owned-Cell Initialization Range
+
+- Approved for implementation. The production extractor already knows dense
+  tile strides and exact clipped cell bounds; this checkpoint will expose that
+  owned cube directly to initialization instead of rediscovering it by scanning
+  the larger support range. Robust refinement remains on the unchanged support
+  range, and the public vector API retains coordinate validation.
+- Independent review clarified that the public API must retain stable input
+  order and its historical count-only coverage check, including off-lattice and
+  duplicate-plus-missing inputs. It also requires O(1) direct-range structural
+  validation, explicit public/direct/avoided-support visit counters, invalid-direction
+  denominator coverage, and comparison against fit setup rather than support
+  observation-construction time.
+- Implemented a validated dense-tile owned-cell layout and row visitor. Public
+  fitting still performs the original stable coordinate filter and count-only
+  coverage check; production initialization directly traverses the owned cube,
+  while all robust refinement remains on the unchanged support range.
+- Focused GCC and Clang anchor/path/replay suites passed. Added layout
+  containment/cardinality tests, canonical row-order coverage, public shuffled/
+  off-lattice/duplicate-plus-missing compatibility, invalid/NaN/unusable
+  direction initialization parity, direct visit accounting, partial cells, and
+  serial/parallel extraction coverage.
+
+  | metric | baseline min | baseline median | baseline max | direct min | direct median | direct max |
+  |---|---:|---:|---:|---:|---:|---:|
+  | command wall | 10.70 s | 10.76 s | 11.15 s | 10.37 s | 10.65 s | 10.68 s |
+  | total CPU | 237.95 s | 243.52 s | 247.12 s | 233.53 s | 237.40 s | 239.89 s |
+  | anchor wall | 6.547 s | 6.553 s | 6.733 s | 6.061 s | 6.304 s | 6.339 s |
+  | anchor CPU | 165.37 s | 169.45 s | 172.57 s | 160.03 s | 162.51 s | 164.47 s |
+  | fitter setup before layout attribution | 10.336 s | 10.996 s | 11.082 s | 0.073 s | 0.074 s | 0.076 s |
+  | fiberlet wall | 3.424 s | 3.470 s | 3.652 s | 3.564 s | 3.594 s | 3.599 s |
+
+- Every direct run reported 833,728 physical owned-initialization visits and
+  858,114,544 avoided support visits. All runs retained 2,603 anchors, 51,782
+  searched / 26,494 accepted fiberlets, 170,813 sampled voxels, 62,970,689 DP
+  relaxations, and 2 greedy / 1 fiberlet failures. All baseline and direct
+  artifacts had SHA-256
+  `41fa73c76bc3a20528d064e2baed78552a20bed41542f9ed4e2ddcfb5e739215`.
+- The small fiberlet-wall increase was outside the changed anchor path and was
+  outweighed by lower anchor and total cost. Checkpoint 14 is retained.
+- Final review moved constant-time direct-layout validation into the fit-setup
+  accounting. A post-change validation run reported 0.092 setup worker-seconds
+  and retained the same artifact hash; its unrelated fiberlet stages ran under
+  visible external load and were not added to the paired benchmark table.

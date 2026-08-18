@@ -44,3 +44,17 @@ owned-or-radius support offsets once and translate them into each tile instead
 of rescanning the full sample cube. Preserve canonical observation order,
 gradient-halo eligibility, profile population semantics, and the existing
 clipped construction for partial or volume-boundary cells.
+
+The next measured continuation removes robust-membership materialization.
+Keep each observation's component assignment and residual histogram bin plus
+the two component cutoff bins, and evaluate retained membership inline in the
+existing centroid, objective, peak, and final-support scans. Preserve the exact
+membership predicate, observation traversal and accumulation order, fitting
+arithmetic, and all acceptance decisions.
+
+The next measured continuation removes redundant owned-cell discovery during
+anchor initialization. Production extraction already has a dense tile and the
+exact cell bounds, so expose the owned Z/Y/X cube as a direct zero-allocation
+range for seed initialization while retaining the existing support range for
+refinement. Preserve canonical owned-observation order and the public vector
+API's validation behavior.

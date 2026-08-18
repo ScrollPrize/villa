@@ -57,6 +57,24 @@
 - [x] Run focused GCC and Clang validation.
 - [x] Run three canonical checkpoint 10 replays and compare quality/performance.
 - [x] Update specifications, user documentation, changelog, and task log.
+- [x] Obtain approval for checkpoint 14 direct owned-cell initialization.
+- [x] Plan checkpoint 14 and its profile/test updates.
+- [x] Independently review checkpoint 14 against task and specifications.
+- [x] Implement the direct production owned-cell range.
+- [x] Add direct-range parity and profile coverage.
+- [x] Run focused GCC and Clang validation.
+- [x] Run three canonical checkpoint 14 replays and compare quality/performance.
+- [x] Retain checkpoint 14 based on the measured result.
+- [x] Update specifications, documentation, changelog, task log, and status.
+- [x] Obtain approval for checkpoint 13 inline robust membership.
+- [x] Plan checkpoint 13 and its profile/test updates.
+- [x] Independently review checkpoint 13 against task and specifications.
+- [x] Implement residual-bin/cutoff membership without boolean materialization.
+- [x] Add inline-membership oracle and profile coverage.
+- [x] Run focused GCC and Clang validation.
+- [x] Run three canonical checkpoint 13 replays and compare quality/performance.
+- [x] Remove checkpoint 13 after the measured regression.
+- [x] Record the rejected result; production specs/docs/changelog remain unchanged.
 - [x] Plan checkpoint 12 canonical anchor support-stencil reuse.
 - [x] Independently review checkpoint 12 against task and specifications.
 - [x] Implement the full-halo stencil and clipped boundary fallback.

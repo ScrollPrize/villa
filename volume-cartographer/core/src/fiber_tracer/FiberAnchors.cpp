@@ -335,6 +335,52 @@ private:
     const std::vector<uint8_t>& gradientValidity_;
 };
 
+class DenseOwnedCompactObservationRange {
+public:
+    DenseOwnedCompactObservationRange(
+        const std::vector<CompactFiberAnchorObservation>& observations,
+        const std::array<size_t, 3>& tileBeginZYX,
+        const std::array<size_t, 3>& tileShapeZYX,
+        const std::array<size_t, 3>& cellBeginZYX,
+        const std::array<size_t, 3>& cellEndZYX)
+        : observations_{observations},
+          layout_{detail::buildFiberAnchorOwnedCellTileLayout(
+              observations.size(), tileBeginZYX, tileShapeZYX,
+              cellBeginZYX, cellEndZYX)}
+    {
+    }
+
+    [[nodiscard]] size_t size() const { return layout_.ownedSize; }
+
+    template <typename Visitor>
+    void visit(Visitor&& visitor) const
+    {
+        detail::visitFiberAnchorOwnedCellTileIndices(
+            layout_, [&](size_t observationIndex, size_t canonicalIndex) {
+                visitor(observations_[observationIndex], canonicalIndex);
+            });
+    }
+
+private:
+    const std::vector<CompactFiberAnchorObservation>& observations_;
+    detail::FiberAnchorOwnedCellTileLayout layout_;
+};
+
+template <typename ObservationRange, typename Visitor>
+void visitObservations(const ObservationRange& observations, Visitor&& visitor)
+{
+    for (size_t index = 0; index < observations.size(); ++index)
+        visitor(observations[index], index);
+}
+
+template <typename Visitor>
+void visitObservations(
+    const DenseOwnedCompactObservationRange& observations,
+    Visitor&& visitor)
+{
+    observations.visit(std::forward<Visitor>(visitor));
+}
+
 template <typename Observation>
 [[nodiscard]] bool observationGradientValid(
     const std::vector<Observation>& observations,
@@ -1578,6 +1624,12 @@ void accumulateFitProfile(
     total.invocations += value.invocations;
     total.nonemptyCells += value.nonemptyCells;
     total.weightedObservations += value.weightedObservations;
+    total.ownedDiscoveryObservationVisits +=
+        value.ownedDiscoveryObservationVisits;
+    total.ownedInitializationObservationVisits +=
+        value.ownedInitializationObservationVisits;
+    total.avoidedOwnedSupportObservationVisits +=
+        value.avoidedOwnedSupportObservationVisits;
     total.seeds += value.seeds;
     total.seedGenerationObservationVisits +=
         value.seedGenerationObservationVisits;
@@ -2107,12 +2159,14 @@ void suppressFiberAnchorDuplicates(
     applyLocalMaximumNms(cells, config);
 }
 
-template <typename ObservationRange>
+template <typename ObservationRange, typename OwnedObservationRange>
 FiberCellAnchorResult fitFiberCellAnchorsImpl(
     const std::array<size_t, 3>& cellZYX,
     const std::array<size_t, 3>& cellBeginZYX,
     const std::array<size_t, 3>& cellEndZYX,
     const ObservationRange& input,
+    const OwnedObservationRange& ownedInput,
+    bool validateOwnedCoverage,
     const FiberAnchorConfig& config,
     FiberAnchorFitProfile* profile)
 {
@@ -2135,14 +2189,25 @@ FiberCellAnchorResult fitFiberCellAnchorsImpl(
             position[2] >= static_cast<double>(cellBeginZYX[0]) &&
             position[2] < static_cast<double>(cellEndZYX[0]);
     };
-    size_t ownedCount = 0;
-    for (size_t index = 0; index < input.size(); ++index) {
-        const cv::Vec3d position = observationPosition(input[index]);
-        ownedCount += static_cast<size_t>(
-            finiteVector(position) && isOwned(position));
+    if (validateOwnedCoverage) {
+        size_t ownedCount = 0;
+        for (size_t index = 0; index < input.size(); ++index) {
+            const cv::Vec3d position = observationPosition(input[index]);
+            ownedCount += static_cast<size_t>(
+                finiteVector(position) && isOwned(position));
+        }
+        if (profile != nullptr)
+            profile->ownedDiscoveryObservationVisits += input.size();
+        if (ownedCount != expected)
+            throw std::invalid_argument("fiber anchor observations do not cover the owned cell voxels exactly once");
+    } else {
+        if (ownedInput.size() != expected)
+            throw std::logic_error("fiber anchor direct owned range has the wrong size");
+        if (profile != nullptr) {
+            profile->avoidedOwnedSupportObservationVisits +=
+                2 * input.size() - ownedInput.size();
+        }
     }
-    if (ownedCount != expected)
-        throw std::invalid_argument("fiber anchor observations do not cover the owned cell voxels exactly once");
 
     FiberCellAnchorResult result;
     result.cellZYX = cellZYX;
@@ -2169,20 +2234,17 @@ FiberCellAnchorResult fitFiberCellAnchorsImpl(
          config.gaussianSigmaPredictionVoxels);
     CompensatedSum denominator;
     std::vector<WeightedObservation> observations;
-    observations.reserve(input.size());
-    for (size_t index = 0; index < input.size(); ++index) {
-        const auto& candidate = input[index];
+    observations.reserve(ownedInput.size());
+    visitObservations(ownedInput, [&](const auto& candidate, size_t index) {
         const cv::Vec3d position = observationPosition(candidate);
-        if (!finiteVector(position) || !isOwned(position)) {
-            continue;
-        }
+        if (validateOwnedCoverage && (!finiteVector(position) || !isOwned(position)))
+            return;
         const cv::Vec3d delta = position - center;
         const double gaussian = std::exp(-delta.dot(delta) * invTwoSigma2);
         denominator.add(gaussian);
         cv::Vec3d direction;
-        if (!usableDirectionObservation(candidate, config, direction)) {
-            continue;
-        }
+        if (!usableDirectionObservation(candidate, config, direction))
+            return;
         observations.push_back({
             position,
             direction,
@@ -2190,8 +2252,9 @@ FiberCellAnchorResult fitFiberCellAnchorsImpl(
             gaussian * observationPresence(candidate),
             index,
         });
-    }
+    });
     if (profile != nullptr) {
+        profile->ownedInitializationObservationVisits += ownedInput.size();
         profile->setupWorkSeconds += std::chrono::duration<double>(
             FitClock::now() - phaseStart).count();
         profile->weightedObservations += observations.size();
@@ -2465,7 +2528,8 @@ FiberCellAnchorResult fitFiberCellAnchors(
     FiberAnchorFitProfile* profile)
 {
     return fitFiberCellAnchorsImpl(
-        cellZYX, cellBeginZYX, cellEndZYX, input, config, profile);
+        cellZYX, cellBeginZYX, cellEndZYX, input, input,
+        /*validateOwnedCoverage=*/true, config, profile);
 }
 
 static FiberAnchorExtractionReport extractFiberAnchorsImpl(
@@ -3206,8 +3270,15 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             const IndexedObservationRange observationRange{
                 observations, cellObservationIndices,
                 cellGradientValidity};
+            const auto ownedRangeStart = std::chrono::steady_clock::now();
+            const DenseOwnedCompactObservationRange ownedObservationRange{
+                observations, tile.sampleBegin, sampleShape, begin, end};
+            workerProfile.fit.setupWorkSeconds +=
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - ownedRangeStart).count();
             auto result = fitFiberCellAnchorsImpl(
-                cellZYX, begin, end, observationRange, config,
+                cellZYX, begin, end, observationRange, ownedObservationRange,
+                /*validateOwnedCoverage=*/false, config,
                 &workerProfile.fit);
             workerProfile.fittingSeconds += std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - fittingStart).count();

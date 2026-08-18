@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
@@ -188,6 +189,76 @@ TEST_CASE("fiber anchor support stencil preserves scalar order and tile strides"
     }
 }
 
+TEST_CASE("fiber anchor owned-cell tile layout preserves canonical rows")
+{
+    const std::array<size_t, 3> tileBegin{10, 20, 30};
+    const std::array<size_t, 3> tileShape{5, 6, 7};
+    const std::array<size_t, 3> cellBegin{11, 22, 33};
+    const std::array<size_t, 3> cellEnd{14, 25, 37};
+    const auto layout =
+        vc::fiber_tracer::detail::buildFiberAnchorOwnedCellTileLayout(
+            5 * 6 * 7, tileBegin, tileShape, cellBegin, cellEnd);
+
+    CHECK(layout.ownedShapeZYX == std::array<size_t, 3>{3, 3, 4});
+    CHECK(layout.ownedSize == 36);
+    std::vector<size_t> actual;
+    std::vector<size_t> canonical;
+    vc::fiber_tracer::detail::visitFiberAnchorOwnedCellTileIndices(
+        layout, [&](size_t index, size_t canonicalIndex) {
+            actual.push_back(index);
+            canonical.push_back(canonicalIndex);
+        });
+    std::vector<size_t> expected;
+    for (size_t z = cellBegin[0]; z < cellEnd[0]; ++z) {
+        for (size_t y = cellBegin[1]; y < cellEnd[1]; ++y) {
+            for (size_t x = cellBegin[2]; x < cellEnd[2]; ++x) {
+                expected.push_back(
+                    ((z - tileBegin[0]) * tileShape[1] +
+                     y - tileBegin[1]) * tileShape[2] + x - tileBegin[2]);
+            }
+        }
+    }
+    CHECK(actual == expected);
+    CHECK(std::all_of(actual.begin(), actual.end(), [](size_t index) {
+        return index < 5 * 6 * 7;
+    }));
+    CHECK(canonical.size() == layout.ownedSize);
+    CHECK(std::is_sorted(canonical.begin(), canonical.end()));
+    CHECK(canonical.front() == 0);
+    CHECK(canonical.back() + 1 == layout.ownedSize);
+
+    CHECK_THROWS_AS(
+        vc::fiber_tracer::detail::buildFiberAnchorOwnedCellTileLayout(
+            5 * 6 * 7 - 1, tileBegin, tileShape, cellBegin, cellEnd),
+        std::invalid_argument);
+    CHECK_THROWS_AS(
+        vc::fiber_tracer::detail::buildFiberAnchorOwnedCellTileLayout(
+            5 * 6 * 7, tileBegin, tileShape, cellEnd, cellBegin),
+        std::invalid_argument);
+    CHECK_THROWS_AS(
+        vc::fiber_tracer::detail::buildFiberAnchorOwnedCellTileLayout(
+            5 * 6 * 7, tileBegin, tileShape,
+            std::array<size_t, 3>{9, 22, 33}, cellEnd),
+        std::invalid_argument);
+    CHECK_THROWS_AS(
+        vc::fiber_tracer::detail::buildFiberAnchorOwnedCellTileLayout(
+            1, {0, 0, 0},
+            {std::numeric_limits<size_t>::max(), 2, 1},
+            {0, 0, 0}, {1, 1, 1}),
+        std::invalid_argument);
+    CHECK_THROWS_AS(
+        vc::fiber_tracer::detail::buildFiberAnchorOwnedCellTileLayout(
+            1, {std::numeric_limits<size_t>::max(), 0, 0}, {1, 1, 1},
+            {std::numeric_limits<size_t>::max(), 0, 0},
+            {std::numeric_limits<size_t>::max(), 1, 1}),
+        std::invalid_argument);
+    CHECK_THROWS_AS(
+        vc::fiber_tracer::detail::buildFiberAnchorOwnedCellTileLayout(
+            5 * 6 * 7, tileBegin, tileShape, cellBegin,
+            std::array<size_t, 3>{16, 25, 37}),
+        std::invalid_argument);
+}
+
 TEST_CASE("normalized float observations preserve anchor geometry")
 {
     auto value = config();
@@ -298,6 +369,9 @@ TEST_CASE("fiber anchor extraction rejects an empty cell")
     CHECK(profile.invocations == 1);
     CHECK(profile.nonemptyCells == 0);
     CHECK(profile.weightedObservations == 0);
+    CHECK(profile.ownedDiscoveryObservationVisits == observations.size());
+    CHECK(profile.ownedInitializationObservationVisits == observations.size());
+    CHECK(profile.avoidedOwnedSupportObservationVisits == 0);
     CHECK(profile.setupWorkSeconds >= 0.0);
     CHECK(profile.seedGenerationWorkSeconds == 0.0);
 }
@@ -319,6 +393,111 @@ TEST_CASE("fiber anchor extraction emits one unoriented straight component")
     CHECK(result.components[0].anchor.directionalCoherence == doctest::Approx(1.0));
 }
 
+TEST_CASE("public anchor fitting preserves stable count-only owned filtering")
+{
+    auto shuffled = cellObservations(2, {1.0, 0.0, 0.0});
+    std::reverse(shuffled.begin(), shuffled.end());
+    CHECK_NOTHROW(vc::fiber_tracer::fitFiberCellAnchors(
+        {0, 0, 0}, {0, 0, 0}, {2, 2, 2}, shuffled, config()));
+
+    auto offLattice = shuffled;
+    offLattice.front().positionPredictionXYZ = {0.25, 0.5, 0.75};
+    CHECK_NOTHROW(vc::fiber_tracer::fitFiberCellAnchors(
+        {0, 0, 0}, {0, 0, 0}, {2, 2, 2}, offLattice, config()));
+
+    auto duplicateAndMissing = shuffled;
+    duplicateAndMissing.front().positionPredictionXYZ =
+        duplicateAndMissing.back().positionPredictionXYZ;
+    CHECK_NOTHROW(vc::fiber_tracer::fitFiberCellAnchors(
+        {0, 0, 0}, {0, 0, 0}, {2, 2, 2}, duplicateAndMissing, config()));
+
+    auto orderConfig = config();
+    orderConfig.maximumSeedCount = 2;
+    std::vector<FiberAnchorObservation> orderSensitive;
+    for (const cv::Vec3d direction : {
+             cv::Vec3d{1.0, 0.0, 0.0}, cv::Vec3d{1.0, 0.0, 0.0},
+             cv::Vec3d{1.0, 0.0, 0.0}, cv::Vec3d{1.0, 0.0, 0.0},
+             cv::Vec3d{0.0, 1.0, 0.0}, cv::Vec3d{0.0, 1.0, 0.0},
+             cv::Vec3d{0.0, 1.0, 0.0}, cv::Vec3d{0.0, 1.0, 0.0}}) {
+        orderSensitive.push_back({{0.0, 0.0, 0.0}, direction, 1.0, true});
+    }
+    const auto forward = vc::fiber_tracer::fitFiberCellAnchors(
+        {0, 0, 0}, {0, 0, 0}, {2, 2, 2}, orderSensitive, orderConfig);
+    std::reverse(orderSensitive.begin(), orderSensitive.end());
+    const auto reverse = vc::fiber_tracer::fitFiberCellAnchors(
+        {0, 0, 0}, {0, 0, 0}, {2, 2, 2}, orderSensitive, orderConfig);
+    REQUIRE(forward.initializedDiagnostics[0].anchor.has_value());
+    REQUIRE(reverse.initializedDiagnostics[0].anchor.has_value());
+    CHECK(axialDot(
+              forward.initializedDiagnostics[0].anchor->axisXYZ,
+              {1.0, 0.0, 0.0}) >
+          1.0 - 1.0e-12);
+    CHECK(axialDot(
+              reverse.initializedDiagnostics[0].anchor->axisXYZ,
+              {0.0, 1.0, 0.0}) >
+          1.0 - 1.0e-12);
+}
+
+TEST_CASE("direct owned anchor initialization matches public invalid semantics")
+{
+    auto value = config();
+    value.peakGradientWeight = 0.0;
+    const vc::fiber_tracer::FiberPredictionGridInfo grid{{4, 4, 4}, 1.0};
+    auto manual = cellObservations(4, {1.0, 0.0, 0.0});
+    manual[0].valid = false;
+    manual[1].presence = std::numeric_limits<double>::quiet_NaN();
+    manual[2].direction = {0.0, 0.0, 0.0};
+    const auto expected = vc::fiber_tracer::fitFiberCellAnchors(
+        {0, 0, 0}, {0, 0, 0}, {4, 4, 4}, manual, value);
+
+    const auto report =
+        vc::fiber_tracer::extractRefinedFiberAnchorsForCells(
+            grid, value,
+            [](const auto& indices, int, auto& samples) {
+                samples.clear();
+                samples.reserve(indices.size());
+                for (const auto& index : indices) {
+                    const size_t flat =
+                        (index[0] * 4 + index[1]) * 4 + index[2];
+                    vc::fiber_tracer::FiberStoredPredictionSample sample{
+                        {1.0, 0.0, 0.0}, 1.0, true};
+                    if (flat == 0)
+                        sample.valid = false;
+                    if (flat == 1)
+                        sample.presence =
+                            std::numeric_limits<double>::quiet_NaN();
+                    if (flat == 2)
+                        sample.direction = {0.0, 0.0, 0.0};
+                    samples.push_back(sample);
+                }
+            },
+            {{0, 0, 0}});
+
+    CHECK(expected.retainedAnchorCount == 1);
+    CHECK(report.profile.fit.weightedObservations == 61);
+    const auto& initialized = report.diagnosticStages[static_cast<size_t>(
+        vc::fiber_tracer::FiberAnchorDiagnosticStage::Initialized)];
+    REQUIRE(initialized.size() == expected.initializedDiagnostics.size());
+    for (size_t component = 0; component < initialized.size(); ++component) {
+        const auto& actual = initialized[component];
+        const auto& reference = expected.initializedDiagnostics[component];
+        CHECK(actual.metrics.assignedObservationCount ==
+              reference.metrics.assignedObservationCount);
+        CHECK(actual.metrics.objectiveContribution ==
+              reference.metrics.objectiveContribution);
+        CHECK(actual.anchor.has_value() == reference.anchor.has_value());
+        if (actual.anchor && reference.anchor) {
+            CHECK(actual.anchor->axisXYZ == reference.anchor->axisXYZ);
+            CHECK(actual.anchor->positionPredictionXYZ ==
+                  reference.anchor->positionPredictionXYZ);
+        }
+    }
+    CHECK(report.profile.fit.ownedDiscoveryObservationVisits == 0);
+    CHECK(report.profile.fit.ownedInitializationObservationVisits == 64);
+    CHECK(report.profile.fit.avoidedOwnedSupportObservationVisits ==
+          2 * report.profile.retainedObservations - 64);
+}
+
 TEST_CASE("fiber anchor fit profile separates repeated fitting work")
 {
     const auto observations = cellObservations(
@@ -332,6 +511,9 @@ TEST_CASE("fiber anchor fit profile separates repeated fitting work")
     CHECK(profile.invocations == 1);
     CHECK(profile.nonemptyCells == 1);
     CHECK(profile.weightedObservations == observations.size());
+    CHECK(profile.ownedDiscoveryObservationVisits == observations.size());
+    CHECK(profile.ownedInitializationObservationVisits == observations.size());
+    CHECK(profile.avoidedOwnedSupportObservationVisits == 0);
     CHECK(profile.seeds > 0);
     CHECK(profile.seedPairs > 0);
     CHECK(profile.seedPairIterations >= profile.seedPairs);
@@ -1977,6 +2159,12 @@ TEST_CASE("interior anchor cells reuse the canonical support stencil")
               report->profile.retainedObservations);
         CHECK(report->profile.gradientAttempts ==
               report->profile.retainedObservations);
+        CHECK(report->profile.fit.ownedDiscoveryObservationVisits == 0);
+        CHECK(report->profile.fit.ownedInitializationObservationVisits ==
+              cells.size() * 4 * 4 * 4);
+        CHECK(report->profile.fit.avoidedOwnedSupportObservationVisits ==
+              2 * report->profile.retainedObservations -
+                  report->profile.fit.ownedInitializationObservationVisits);
     }
     CHECK(serial.profile.candidateObservations ==
           parallel.profile.candidateObservations);
@@ -2019,6 +2207,41 @@ TEST_CASE("anchor support stencil falls back only for clipped cells")
     CHECK(report.profile.workCells == 2);
     CHECK(report.profile.supportStencilCells == 1);
     CHECK(report.profile.clippedSupportCells == 1);
+    CHECK(report.profile.fit.ownedDiscoveryObservationVisits == 0);
+    CHECK(report.profile.fit.ownedInitializationObservationVisits == 12);
+    CHECK(report.profile.fit.avoidedOwnedSupportObservationVisits ==
+          2 * report.profile.retainedObservations - 12);
+    const auto expectedPartial = vc::fiber_tracer::fitFiberCellAnchors(
+        {3, 1, 1}, {6, 2, 2}, {7, 4, 4},
+        boxObservations(
+            {6, 2, 2}, {7, 4, 4}, [](int x, int y, int z) {
+                return FiberAnchorObservation{
+                    {static_cast<double>(x), static_cast<double>(y),
+                     static_cast<double>(z)},
+                    {1.0, 0.0, 0.0}, 1.0, true};
+            }),
+        value);
+    const auto& initialized = report.diagnosticStages[static_cast<size_t>(
+        vc::fiber_tracer::FiberAnchorDiagnosticStage::Initialized)];
+    for (size_t candidate = 0; candidate < 2; ++candidate) {
+        const auto actual = std::find_if(
+            initialized.begin(), initialized.end(), [candidate](const auto& record) {
+                return record.cellZYX == std::array<size_t, 3>{3, 1, 1} &&
+                    record.candidateId == candidate;
+            });
+        REQUIRE(actual != initialized.end());
+        const auto& expected = expectedPartial.initializedDiagnostics[candidate];
+        CHECK(actual->metrics.assignedObservationCount ==
+              expected.metrics.assignedObservationCount);
+        CHECK(actual->metrics.objectiveContribution ==
+              expected.metrics.objectiveContribution);
+        CHECK(actual->anchor.has_value() == expected.anchor.has_value());
+        if (actual->anchor && expected.anchor) {
+            CHECK(actual->anchor->axisXYZ == expected.anchor->axisXYZ);
+            CHECK(actual->anchor->positionPredictionXYZ ==
+                  expected.anchor->positionPredictionXYZ);
+        }
+    }
 }
 
 TEST_CASE("adjacent anchor tile groups reuse overlapping prediction halos")

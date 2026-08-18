@@ -214,6 +214,9 @@ struct FiberAnchorFitProfile {
     size_t invocations = 0;
     size_t nonemptyCells = 0;
     size_t weightedObservations = 0;
+    size_t ownedDiscoveryObservationVisits = 0;
+    size_t ownedInitializationObservationVisits = 0;
+    size_t avoidedOwnedSupportObservationVisits = 0;
     size_t seeds = 0;
     size_t seedGenerationObservationVisits = 0;
     size_t seedPairs = 0;

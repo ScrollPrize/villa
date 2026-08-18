@@ -2681,6 +2681,15 @@
   predicates and diagnostic aggregation run serially, and progress callbacks
   are serialized. The lowest-index cell failure is reported after all workers
   join.
+  Initial seed fitting uses a separate exact owned-cell view over the same
+  dense tile. Its constant-time layout validation requires monotonic cell
+  bounds, containment by the tile sample box, matching tile observation
+  cardinality, and matching clipped owned cardinality. It then visits dense
+  rows in canonical Z/Y/X order without an owned-index allocation. Robust
+  refinement continues to use the larger support-index range. The public
+  expanded-observation API retains stable input-order filtering and its
+  historical count-only owned-coverage check; it does not sort, deduplicate,
+  or require lattice coordinates.
   Machine output and OBJ store spatial positions only in base-volume XYZ
   coordinates. Prediction shape/scale, cell indices, cell size, direction
   falloff, transverse/axial peak sigmas, peak grid step, cutoff, local window,
@@ -3052,7 +3061,7 @@
   Benchmark comparisons must retain identical inputs, parameters, build type,
   and interval.
 - Benchmark and full replay extraction emit the same versioned
-  `fiberlet_extraction_profile version=15` key/value schema. The profile exposes
+  `fiberlet_extraction_profile version=16` key/value schema. The profile exposes
   deterministic workload counters and finer anchor/fiberlet phase timings.
   Enclosing phase fields are wall time, `_work_seconds` fields are summed
   worker/candidate time, and CPU fields are process CPU time. Corner insertion
@@ -3121,6 +3130,12 @@
   `anchor_candidate_observations` retains the represented sample-cube count,
   while retained-observation and gradient counters retain their logical
   populations when the support stencil avoids rejected-site tests.
+- Version 16 adds `anchor_fit_owned_discovery_observation_visits`,
+  `anchor_fit_owned_initialization_observation_visits`, and
+  `anchor_fit_avoided_owned_support_observation_visits`. Public fitting reports
+  coordinate-discovery and stable-filter visits. Production reports direct
+  owned visits and the visits avoided relative to its former two complete
+  support-range scans; existing logical observation populations are unchanged.
 - Transient direction-conditioned peak observations and transverse response
   math use float32. Persistent anchor state, accepted positions, diagnostics,
   and serialized output remain double precision. Peak ties and downstream DP
