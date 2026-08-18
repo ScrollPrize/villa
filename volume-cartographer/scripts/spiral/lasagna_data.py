@@ -1,11 +1,130 @@
 import json
 import os
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - unavailable on Windows
+    fcntl = None
+
 import numpy as np
 import torch
 import zarr
 
-from pack_resident_pools import sidecar_path
+from pack_resident_pools import pack_arrays, sidecar_path
+
+
+def _ensure_sidecar(array_dirs, sidecar, *, label, stage_name, progress=None):
+    """Build one missing resident-pool sidecar, safely across fit processes."""
+    meta_path = os.path.join(sidecar, 'meta.json')
+    if os.path.exists(meta_path):
+        return sidecar
+
+    if progress is not None:
+        progress.begin(
+            'building', stage_name, step=0, total_steps=0, unit='chunks',
+            detail=sidecar)
+    print(f'{label}: sparse resident pool not found; building {sidecar}',
+          flush=True)
+
+    # Multiple fits can start against the same dataset at once. The metadata
+    # is written last by pack_arrays(), so a waiter can distinguish a complete
+    # pool from a partial one after it acquires the lock.
+    lock_path = sidecar + '.lock'
+    with open(lock_path, 'a+b') as lock_file:
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        else:  # pragma: no cover - Windows fallback
+            import msvcrt
+            lock_file.seek(0, os.SEEK_END)
+            if lock_file.tell() == 0:
+                lock_file.write(b'\0')
+                lock_file.flush()
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+        try:
+            if os.path.exists(meta_path):
+                if progress is not None:
+                    progress.finish(detail='built by another process')
+                return sidecar
+
+            pack_arrays(
+                array_dirs,
+                sidecar,
+                label=label,
+                progress_callback=(
+                    (lambda current, total, detail: progress.update(
+                        current, total_steps=total, detail=detail))
+                    if progress is not None else None
+                ),
+            )
+        finally:
+            if fcntl is None:  # pragma: no cover - Windows fallback
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+
+    if progress is not None:
+        progress.finish(detail=f'sparse store ready at {sidecar}')
+    return sidecar
+
+
+def ensure_fit_sparse_stores(
+    *,
+    use_normals,
+    use_spacing,
+    use_sdt,
+    normal_nx_zarr_path,
+    normal_ny_zarr_path,
+    grad_mag_zarr_path,
+    normal_zarr_group,
+    sdt_zarr_path,
+    sdt_zarr_group,
+    progress=None,
+):
+    """Build the resident pools required by one fit when they are absent."""
+    normal_group = str(normal_zarr_group)
+    if use_normals:
+        if not normal_nx_zarr_path or not normal_ny_zarr_path:
+            raise RuntimeError(
+                'normal sampling is enabled, but one of the nx/ny zarr paths '
+                'is not set')
+        sidecar = sidecar_path(
+            normal_nx_zarr_path, normal_group, pair=True)
+        _ensure_sidecar(
+            [os.path.join(normal_nx_zarr_path, normal_group),
+             os.path.join(normal_ny_zarr_path, normal_group)],
+            sidecar,
+            label='lasagna normals',
+            stage_name='Building Lasagna normal sparse store',
+            progress=progress,
+        )
+
+    if use_spacing:
+        if not grad_mag_zarr_path:
+            raise RuntimeError(
+                'dense spacing loss is enabled, but grad_mag zarr path is not set')
+        sidecar = sidecar_path(grad_mag_zarr_path, normal_group)
+        _ensure_sidecar(
+            [os.path.join(grad_mag_zarr_path, normal_group)],
+            sidecar,
+            label='lasagna grad_mag',
+            stage_name='Building Lasagna gradient sparse store',
+            progress=progress,
+        )
+
+    if use_sdt:
+        if not sdt_zarr_path or not os.path.exists(sdt_zarr_path):
+            raise RuntimeError(
+                "dense_spacing_mode='phase' requires the surf-SDT store: "
+                f'{sdt_zarr_path!r}')
+        group = str(sdt_zarr_group)
+        sidecar = sidecar_path(sdt_zarr_path, group)
+        _ensure_sidecar(
+            [os.path.join(sdt_zarr_path, group)],
+            sidecar,
+            label='surf_sdt',
+            stage_name='Building surface-distance sparse store',
+            progress=progress,
+        )
 
 
 def _require_sidecar(zarr_path, group, *, pair=False, label):

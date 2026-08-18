@@ -318,30 +318,67 @@ LazySurfaceGeometry readLazySurfaceGeometry(const std::filesystem::path& path,
         return scale;
     };
 
+    // The caller's metadata may be a partial override (second constructor), so
+    // fall back to the on-disk meta.json for missing fields lazily if needed.
+    std::optional<utils::Json> diskMetadataStorage;
+    auto diskMetadata = [&]() -> const utils::Json& {
+        if (!diskMetadataStorage) {
+            diskMetadataStorage = vc::json::load_json_file(path / "meta.json");
+        }
+        return *diskMetadataStorage;
+    };
+
     std::optional<cv::Vec2f> scale = readScale(metadata);
     if (!scale) {
-        const auto diskMetadata =
-            vc::json::load_json_file(path / "meta.json");
-        scale = readScale(diskMetadata);
+        scale = readScale(diskMetadata());
     }
     if (!scale) {
         throw std::runtime_error("Missing or invalid surface scale in: " +
                                  (path / "meta.json").string());
     }
 
-    const auto xPath = path / "x.tif";
-    TIFF* tif = TIFFOpen(xPath.string().c_str(), "r");
-    if (!tif) {
-        throw std::runtime_error("Failed to open TIFF: " + xPath.string());
-    }
+    auto readDimensions =
+        [](const utils::Json& json) -> std::optional<std::pair<uint32_t, uint32_t>> {
+        if (!json.contains("tiff_dimensions") ||
+            !json["tiff_dimensions"].is_array() ||
+            json["tiff_dimensions"].size() < 2) {
+            return std::nullopt;
+        }
+        const auto w = json["tiff_dimensions"][0].get_int();
+        const auto h = json["tiff_dimensions"][1].get_int();
+        if (w <= 0 || h <= 0) {
+            return std::nullopt;
+        }
+        return std::make_pair(static_cast<uint32_t>(w), static_cast<uint32_t>(h));
+    };
+
     uint32_t width = 0;
     uint32_t height = 0;
-    const bool haveGeometry =
-        TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &width) &&
-        TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &height);
-    TIFFClose(tif);
-    if (!haveGeometry || width == 0 || height == 0) {
-        throw std::runtime_error("TIFF missing width/height: " + xPath.string());
+    const auto xPath = path / "x.tif";
+    if (std::filesystem::exists(xPath)) {
+        TIFF* tif = TIFFOpen(xPath.string().c_str(), "r");
+        if (!tif) {
+            throw std::runtime_error("Failed to open TIFF: " + xPath.string());
+        }
+        const bool haveGeometry =
+            TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &width) &&
+            TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &height);
+        TIFFClose(tif);
+        if (!haveGeometry || width == 0 || height == 0) {
+            throw std::runtime_error("TIFF missing width/height: " + xPath.string());
+        }
+    } else {
+        // Metadata-only surfaces (open-data lazy placeholders) carry the grid
+        // size in meta.json; the TIFFs only exist after materialization.
+        std::optional<std::pair<uint32_t, uint32_t>> dims = readDimensions(metadata);
+        if (!dims) {
+            dims = readDimensions(diskMetadata());
+        }
+        if (!dims) {
+            throw std::runtime_error("Failed to open TIFF: " + xPath.string() + " and no dimensions metadata available");
+        }
+        width = dims->first;
+        height = dims->second;
     }
 
     LazySurfaceGeometry result;
@@ -492,6 +529,20 @@ void warpBilinearReplicateVec3f(const cv::Mat_<cv::Vec3f>& src,
     const float foy = float(oy);
     const float fsx = float(sx);
     const float fsy = float(sy);
+    // The mapping is separable: the source x sample (x0,x1,wx) depends only on
+    // dx, not dy. Precompute the x axis once per call instead of recomputing it
+    // for every one of the dh rows. Bit-identical to the per-pixel form (same
+    // float ops, same order). Filled single-threaded before the parallel row
+    // loop, which then only reads these (shared) arrays.
+    std::vector<int> x0v(dw), x1v(dw);
+    std::vector<float> wxv(dw);
+    for (int dx = 0; dx < dw; ++dx) {
+        float fx = fox + float(dx) * fsx;
+        fx = fx < 0.0f ? 0.0f : (fx > sxmax ? sxmax : fx);
+        int x0 = int(fx);
+        int x1 = x0 + 1; if (x1 > sc - 1) x1 = sc - 1;
+        x0v[dx] = x0; x1v[dx] = x1; wxv[dx] = fx - float(x0);
+    }
     #pragma omp parallel for schedule(dynamic, 8)
     for (int dy = 0; dy < dh; ++dy) {
         float fy = foy + float(dy) * fsy;
@@ -499,19 +550,16 @@ void warpBilinearReplicateVec3f(const cv::Mat_<cv::Vec3f>& src,
         int y0 = int(fy);                  // floor since fy >= 0
         int y1 = y0 + 1; if (y1 > sr - 1) y1 = sr - 1;
         const float wy = fy - float(y0);
+        const float iwy = 1.0f - wy;
         const cv::Vec3f* row0 = src[y0];
         const cv::Vec3f* row1 = src[y1];
         cv::Vec3f* orow = dst[dy];
         for (int dx = 0; dx < dw; ++dx) {
-            float fx = fox + float(dx) * fsx;
-            fx = fx < 0.0f ? 0.0f : (fx > sxmax ? sxmax : fx);
-            int x0 = int(fx);
-            int x1 = x0 + 1; if (x1 > sc - 1) x1 = sc - 1;
-            const float wx = fx - float(x0);
+            const int x0 = x0v[dx], x1 = x1v[dx];
+            const float wx = wxv[dx];
             const cv::Vec3f& p00 = row0[x0]; const cv::Vec3f& p01 = row0[x1];
             const cv::Vec3f& p10 = row1[x0]; const cv::Vec3f& p11 = row1[x1];
             const float iwx = 1.0f - wx;
-            const float iwy = 1.0f - wy;
             orow[dx] = (p00 * iwx + p01 * wx) * iwy
                      + (p10 * iwx + p11 * wx) * wy;
         }
@@ -528,6 +576,11 @@ void warpNearestConstU8(const cv::Mat_<uint8_t>& src,
     const int dw = dst.cols, dh = dst.rows;
     const float fox = float(ox), foy = float(oy);
     const float fsx = float(sx), fsy = float(sy);
+    // Separable: precompute the nearest source x index per column once, instead
+    // of an std::lround per pixel (dw lrounds vs dw*dh). Bit-identical.
+    std::vector<int> sxv(dw);
+    for (int dx = 0; dx < dw; ++dx)
+        sxv[dx] = int(std::lround(fox + float(dx) * fsx));
     #pragma omp parallel for schedule(dynamic, 8)
     for (int dy = 0; dy < dh; ++dy) {
         const int sy_i = int(std::lround(foy + float(dy) * fsy));
@@ -538,7 +591,7 @@ void warpNearestConstU8(const cv::Mat_<uint8_t>& src,
         }
         const uint8_t* srow = src[sy_i];
         for (int dx = 0; dx < dw; ++dx) {
-            const int sx_i = int(std::lround(fox + float(dx) * fsx));
+            const int sx_i = sxv[dx];
             orow[dx] = (sx_i < 0 || sx_i >= sc) ? border : srow[sx_i];
         }
     }
@@ -597,6 +650,11 @@ void warpNearestConstVec3f(const cv::Mat_<cv::Vec3f>& src,
     const int dw = dst.cols, dh = dst.rows;
     const float fox = float(ox), foy = float(oy);
     const float fsx = float(sx), fsy = float(sy);
+    // Separable: precompute the nearest source x index per column once (dw
+    // lrounds vs dw*dh per-pixel). Bit-identical.
+    std::vector<int> sxv(dw);
+    for (int dx = 0; dx < dw; ++dx)
+        sxv[dx] = int(std::lround(fox + float(dx) * fsx));
     #pragma omp parallel for schedule(dynamic, 8)
     for (int dy = 0; dy < dh; ++dy) {
         const int sy_i = int(std::lround(foy + float(dy) * fsy));
@@ -607,7 +665,7 @@ void warpNearestConstVec3f(const cv::Mat_<cv::Vec3f>& src,
         }
         const cv::Vec3f* srow = src[sy_i];
         for (int dx = 0; dx < dw; ++dx) {
-            const int sx_i = int(std::lround(fox + float(dx) * fsx));
+            const int sx_i = sxv[dx];
             orow[dx] = (sx_i < 0 || sx_i >= sc) ? border : srow[sx_i];
         }
     }
@@ -631,6 +689,17 @@ void warpBilinearConstVec3f(const cv::Mat_<cv::Vec3f>& src,
     const float foy = float(oy);
     const float fsx = float(sx);
     const float fsy = float(sy);
+    // Separable: precompute the x axis once per call (x0=-1 marks an
+    // out-of-range column -> border). Bit-identical to the per-pixel form.
+    std::vector<int> x0v(dw), x1v(dw);
+    std::vector<float> wxv(dw);
+    for (int dx = 0; dx < dw; ++dx) {
+        float fx = fox + float(dx) * fsx;
+        if (fx < 0.0f || fx > sxmax) { x0v[dx] = -1; continue; }
+        int x0 = int(fx);
+        int x1 = x0 + 1; if (x1 > sc - 1) x1 = sc - 1;
+        x0v[dx] = x0; x1v[dx] = x1; wxv[dx] = fx - float(x0);
+    }
     #pragma omp parallel for schedule(dynamic, 8)
     for (int dy = 0; dy < dh; ++dy) {
         float fy = foy + float(dy) * fsy;
@@ -642,21 +711,17 @@ void warpBilinearConstVec3f(const cv::Mat_<cv::Vec3f>& src,
         int y0 = int(fy);
         int y1 = y0 + 1; if (y1 > sr - 1) y1 = sr - 1;
         const float wy = fy - float(y0);
+        const float iwy = 1.0f - wy;
         const cv::Vec3f* row0 = src[y0];
         const cv::Vec3f* row1 = src[y1];
         for (int dx = 0; dx < dw; ++dx) {
-            float fx = fox + float(dx) * fsx;
-            if (fx < 0.0f || fx > sxmax) {
-                orow[dx] = border;
-                continue;
-            }
-            int x0 = int(fx);
-            int x1 = x0 + 1; if (x1 > sc - 1) x1 = sc - 1;
-            const float wx = fx - float(x0);
+            const int x0 = x0v[dx];
+            if (x0 < 0) { orow[dx] = border; continue; }
+            const int x1 = x1v[dx];
+            const float wx = wxv[dx];
             const cv::Vec3f& p00 = row0[x0]; const cv::Vec3f& p01 = row0[x1];
             const cv::Vec3f& p10 = row1[x0]; const cv::Vec3f& p11 = row1[x1];
             const float iwx = 1.0f - wx;
-            const float iwy = 1.0f - wy;
             orow[dx] = (p00 * iwx + p01 * wx) * iwy
                      + (p10 * iwx + p11 * wx) * wy;
         }
@@ -2548,6 +2613,44 @@ Rect3D expand_rect(const Rect3D &a, const cv::Vec3f &p)
     return res;
 }
 
+utils::Json bbox_to_json(const Rect3D& bbox)
+{
+    auto lo = utils::Json::array();
+    lo.push_back(bbox.low[0]);
+    lo.push_back(bbox.low[1]);
+    lo.push_back(bbox.low[2]);
+    auto hi = utils::Json::array();
+    hi.push_back(bbox.high[0]);
+    hi.push_back(bbox.high[1]);
+    hi.push_back(bbox.high[2]);
+    auto arr = utils::Json::array();
+    arr.push_back(std::move(lo));
+    arr.push_back(std::move(hi));
+
+    return arr;
+}
+
+bool bbox_of_valid_points(const cv::Mat_<cv::Vec3f>& points, Rect3D& out)
+{
+    bool any = false;
+    Rect3D res;
+    for (int j = 0; j < points.rows; j++)
+        for (int i = 0; i < points.cols; i++) {
+            const cv::Vec3f& p = points(j, i);
+            if (p[0] == -1)
+                continue;
+            if (!any) {
+                res = {p, p};
+                any = true;
+            } else
+                res = expand_rect(res, p);
+        }
+
+    if (any)
+        out = res;
+
+    return any;
+}
 
 bool intersect(const Rect3D &a, const Rect3D &b)
 {

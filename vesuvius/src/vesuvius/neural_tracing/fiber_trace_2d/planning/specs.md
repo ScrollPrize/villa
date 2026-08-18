@@ -19,11 +19,35 @@
 - Resume state is durable output chunks only. Done markers are not allowed.
   Scratch mmap/temporary files are not resume state and may be deleted on
   startup/resume or finish.
-- Neural accumulation uses a fixed-depth circular float32 mmap per raw product
-  and one geometric weight mmap per distinct source-relative inference scale.
+- Neural accumulation uses a fixed-depth circular mmap per raw product,
+  float32 by default and optionally float16 for memory-constrained experiments, and one
+  float32 geometric weight mmap per distinct source-relative inference scale.
+  Flush reads widen bounded product chunks to float32 before normalization and
+  finalization. FP16 assumes finite, model-bounded raw products; unbounded
+  custom adapters must select float32 to avoid overflow.
   Ring depth is derived from the actual canonical Z tile positions, nonzero
   tile support, flush opportunities, and output chunk alignment. Mmap shape and
   logical file size must be independent of full output Z.
+- Ring planning keeps the chunk-aligned `flushed` frontier separate from the
+  physical ring origin and follows runtime write-before-post-row-flush order.
+  The initial prefix from logical plane zero remains live when a computed
+  frontier merely equals `output_begin`; only a strictly advancing runtime
+  flush releases it.
+- Flush overlaps inference through the same circular mmap, enlarged only for
+  the exact maximum span produced by one frozen finalized interval plus the
+  following active canonical Z row. There is one runner-wide flush future,
+  including across inference scales. No live overlap, finalized band, or full
+  mmap region is copied to another mmap or a band-sized RAM buffer.
+- Submitted/frozen, completed/written, and released/origin frontiers are
+  distinct. At the next advancing frontier the coordinator waits for the
+  previous combined flush, clears its exact dirty rectangles, releases its
+  generations, and only then submits the next combined interval. User-visible
+  finalized Z advances only after successful output writes.
+- The flush worker receives immutable chunk descriptors and reads frozen mmap
+  regions one output chunk at a time. Temporary denominator, stacked raw, and
+  finalized channel arrays remain bounded by one output chunk. A failed flush
+  never clears or reuses its frozen slots, and all exit paths wait for the
+  non-cancellable reader thread before mmap cleanup.
 - Completed output is normalized, finalized, written, and cleared one globally
   anchored output chunk at a time. Denominator and wrap scratch are bounded by
   one output chunk; no full-XY or full-band normalization/finalization
@@ -107,6 +131,91 @@
   determinism remain required, and performance changes must report the
   representative whole-fiber restart metric so numeric changes cannot silently
   degrade trace quality.
+- Multi-GPU tiled inference exists only in the shared runner and is therefore
+  identical for Lasagna predict3d and Fiber 3D inference. It uses one
+  persistent spawn-context model worker per selected CUDA device, without DDP
+  or GPU collectives.
+- The canonical tile stream materializes only independent Z/Y/X axis lattices
+  (O(Z+Y+X)), never their Cartesian product. Filtering, CPU/Zarr prefetch, GPU
+  execution, result completion, and ordered commit use fixed bounded windows.
+- Input reads happen outside GPU workers. The default local Zarr-v2 backend is
+  one asynchronously polled TensorStore driver/context created only after all
+  spawned GPU/flush workers start. `python-zarr` is an explicit fallback.
+  Resume/skipped work is rejected before read submission. The lazy prefetch
+  window is `prefetch_tiles_per_gpu * selected_device_count` (CPU/single-device
+  counts as one) and is independent of GPU shared-memory slots.
+- Every outstanding TensorStore read may own a full padded input tile. Input
+  memory is bounded by that window times tile bytes, plus the separately bounded
+  TensorStore cache, existing input/result shared memory, and request/cache
+  overhead. A ready tile enters shared memory only when input/result slots and a
+  GPU queue are available. Existing clipped bounds, source dtype, uint16
+  conversion timing, fully-outside uint8 behavior, and NumPy reflect-padding
+  semantics are preserved exactly.
+- Input slots cannot be reused until H2D completion, and results cannot be
+  published until D2H completion. The coordinator alone unlinks shared memory;
+  workers only attach and close it.
+- CUDA input transfer preserves compact uint8/uint16 source dtype. UInt16 is
+  converted through int32 floor division by 257; normalization and adapter
+  preprocessing are CUDA FP32. CPU fallback preserves historical NumPy
+  conversion. Fiber model autocast follows checkpoint training-policy metadata
+  by default, with explicit precision override and all-device validation;
+  shared product arithmetic, filtering, D2H, and accumulation remain FP32.
+- Opt-in multi-device pipeline profiling uses bounded streaming aggregates,
+  preserves the disabled worker/message path, distinguishes summed concurrent
+  service from wall span, and directly reports reader throughput and effective
+  outstanding-request concurrency, queue delays, CPU conversion,
+  CUDA/transfer/model/output, and commit stages.
+- GPU results may finish out of order, but accumulation remains in canonical
+  tile order. A Z row flushes only after all preceding canonical events,
+  including skips, commit. The coordinator solely owns circular accumulators,
+  resume state, progress, and output writes.
+- Output adapters must permit completeness checks for future, disjoint chunks
+  while the flush worker writes a frozen chunk. Model adapters must permit
+  inference to overlap their stateless raw-product finalization callback.
+- Sparse/resume-complete work is rejected before prefetch. Workers calculate
+  only the union of raw products required by incomplete output chunks; the
+  coordinator retains chunk masks and adds shared geometric weight once.
+- Worker exceptions, hard exits, CUDA failures, interrupts, and coordinator
+  errors cancel prefetch, stop workers, and close shared resources rather than
+  waiting indefinitely.
+- `--devices all` selects all visible CUDA devices and a comma-separated list
+  selects a subset. Existing singular `--device` and CPU behavior remain
+  supported; conflicting or invalid selections fail before model construction.
+- Automatic OME-Zarr download uses `--download-workers` independently of
+  inference prefetch, GPU slots, and pyramid workers. It defaults to 64 and
+  must be positive even when automatic download is disabled.
+- Fiber and Lasagna expose the same opt-in `--live-fetch` selected-level disk
+  cache through the shared runner. It is valid only for full, non-cropped
+  inference on a local numeric OME-Zarr-v2 level backed by S3 `_download`
+  metadata, and conflicts with `--no-download`. The disk target defaults to
+  10240 GiB (10 TiB), the materialization window defaults to 10,000 canonical
+  tile descriptors, and `--download-workers` controls raw chunk transfers.
+  This descriptor window is independent of the smaller TensorStore full-tile
+  read window and must not materialize a global Cartesian job list.
+- Live source support is authoritative per active remote Z-chunk inventory;
+  transient local absence and advisory `.noremote` data cannot suppress valid
+  inference. Completed output work is rejected before remote materialization.
+  Downloads use unique temporary files and atomic replacement, and terminal
+  list/GET/write failure is fatal rather than reclassified as masked fill.
+- Live cache accounting and deletion apply only to valid chunks in the exact
+  selected scale. On each completely committed canonical model Z row, the
+  runner advances a safe input frontier. If actual completed resident bytes
+  exceed the target, it removes oldest whole cached Z-chunk planes whose ends
+  are at or before that frontier, repeating until under target or no safe plane
+  remains. It never evicts by Y/X, LRU, or ahead of inference; insufficient
+  obsolete data permits a reported temporary overshoot.
+- Cooperating ordinary inference readers hold a shared selected-level advisory
+  lock, while live mutation and bulk download hold the exclusive lock. Lock
+  files live below `.dl_cache`; non-cooperating external readers are outside
+  this protection. Live mode initially supports only the primary input source;
+  separately remote Lasagna `pred_dt` is rejected while local `pred_dt` remains
+  supported.
+- `.dl_cache/<level>.noremote.json` is advisory only. Missing, unreadable,
+  malformed, or schema-invalid cache data warns and behaves as an empty set;
+  it must never abort inference or suppress remote validation. Saves snapshot
+  Stats under lock, include empty sets, and use same-directory unique temporary
+  files plus atomic replace. Save failures warn, retain the previous valid
+  target when possible, clean temporary files, and do not fail the download.
 - Fiber whole-volume inference's `--inference-scaledown-power` defaults to 2
   (factor 4 relative to selected input). It is converted to the runner's
   literal factor and does not read or reinterpret tracer config `scaledown`.
@@ -119,6 +228,17 @@
   blur-plus-2x-decimation path for weighted predictions and weights. Fiber has
   no private resampling, blending, or border implementation.
 - Lasagna predict3d and Fiber inference default to 64x64x64 OME-Zarr chunks.
+- `las_manager` Bash and Zsh completion is generated from the same command
+  registry used for prefix dispatch. Dynamic snapshot and catalog candidates
+  use cached indexes only; inference candidates read durable records; live-run
+  candidates may query tmux but never reconcile or mutate records.
+- A manager-launched inference is complete only when the child exits zero and
+  its portable `artifacts/inference.json` reports `completed` with an artifact
+  inventory. A zero exit without that contract is recorded as failed with a
+  diagnostic completion error.
+- Portable artifact inventory paths must be relative, remain inside the bundle,
+  and resolve after the complete `artifacts/` directory is moved. This bounded
+  validation does not recursively enumerate Zarr chunks.
 - Pyramid multiprocessing may use the automatic available-CPU process count,
   but every pyramid worker must run native BLAS/OpenMP libraries with one
   thread. The same constraint applies to serial pyramid execution, and parent
@@ -127,6 +247,11 @@
   and untouched chunks produce neither output chunks nor mmap zero-writes.
   Only dirty product and shared-weight regions are flushed and cleared before
   circular-slot reuse.
+- Sparse source support is evaluated on the global output lattice: each global
+  output-chunk footprint is clipped to the product's full output shape and only
+  then mapped into selected-input coordinates. Crop-local padded ring
+  dimensions must never clip this global footprint. Products sharing an
+  inference-scale accumulator must share the same full output shape.
 - Output products are independently resumable. For Lasagna, missing `pred_dt`
   chunks schedule only derived distance-transform generation; they must not
   schedule neural model inference when `cos` and `grad_mag/nx/ny` chunks are
@@ -191,6 +316,23 @@
   `fiber_trace_3d_inference.json`, no raw seven-channel persisted bundle, no
   directory-style `--output`, no duplicate fiber output adapter, and no public
   exports for removed V0 symbols.
+- Shared multi-device Fiber/Lasagna inference accumulates output chunks in
+  persistent spawned CPU processes. A stable integer mapping gives each
+  `(scale, chunk_z, chunk_y, chunk_x)` exactly one FIFO owner, so overlapping
+  tile updates need no locks and retain canonical per-chunk order. GPU result
+  slots remain live until every referenced accumulation task acknowledges.
+- Accumulation queues are bounded and a new Z row cannot reserve circular-ring
+  generations until the preceding row is committed. Flush frontiers therefore
+  observe only acknowledged tasks and retain the rolling-memory bound.
+- Product rings default to float16 while the shared weight ring remains
+  float32. Each product update widens the stored half to float32, adds the
+  float32 tile contribution, and rounds to nearest-even back to binary16.
+  This reduced-precision accumulation is explicitly not bitwise equivalent to
+  float32; `--product-accumulator-dtype float32` restores float32 accumulation.
+- The optional native accumulator extension must retain a portable scalar
+  implementation. On supported x86 GCC/Clang builds it may runtime-dispatch to
+  an isolated AVX-512F+F16C kernel; the package must not require AVX-512
+  globally and unsupported CPUs/platforms must continue through the fallback.
 
 ## 3D CP-Centered Fiber Model Variant
 
@@ -454,8 +596,21 @@
   Checkpoints are saved by rank 0 from the unwrapped model so snapshot keys do
   not receive a DDP `module.` prefix.
 - DDP side effects are rank-0-only: TensorBoard, stdout progress, checkpoints,
-  dense test evaluation, Trace2CP metrics, and train/test visualization. Scalar
-  training losses are averaged across ranks before rank-0 logging.
+  Trace2CP metrics, and train/test visualization. Dense test model evaluation
+  is deterministically distributed across all ranks; scalar training losses
+  are averaged across ranks before rank-0 logging.
+- Dense DDP tests partition global batch IDs as `rank, rank + WORLD_SIZE, ...`.
+  The configured test start is a literal sample offset, including when it is
+  not batch-aligned; every global batch is evaluated exactly once and only the
+  final global batch is sliced. Per-batch float metric rows are gathered to
+  rank 0, restored to global batch order, and combined with the historical
+  unweighted Python per-batch mean so metric and best-snapshot semantics remain
+  unchanged. Ranks with no assigned batch still enter the gather.
+- Each rank retains a separate persistent test DataLoader worker pool using the
+  same worker count, prefetch factor, worker device, and multiprocessing context
+  as training. Rank 0 reuses its already evaluated global batch zero for the
+  test sample sheet instead of synchronously loading it again. The train and
+  test pools coexist and are both released before distributed teardown.
 - Normal 3D training also supports `--resume <snapshot.pt>`. The CLI path
   overrides config resume keys, restores model and optimizer state, writes a
   fresh timestamped run directory, and records the effective resume path in
@@ -581,6 +736,21 @@
   as CP-centered volume blocks. For Trace2CP evaluation, dense 3D inference is
   run over tiled axis-aligned blocks covering the requested 2D strip
   coordinates plus configured context, then sampled/projected back to 2D.
+- Hang diagnostics are disabled by default. Setting the JSON boolean
+  `training.test_hang_diagnostics_enabled: true` or passing
+  `--test-hang-diagnostics` during normal training enables append-only per-rank
+  diagnostic logs, `SIGUSR2` manual dumps, detailed test phase markers, and a
+  rank-0 pre-NCCL-timeout watchdog. The watchdog defaults to 480 seconds through
+  `training.test_watchdog_seconds`, which must be positive and below the
+  600-second process-group timeout when diagnostics are enabled. Disabled mode
+  creates no files or handlers, arms no timer, polls no resources, and performs
+  no diagnostic CUDA synchronization. The CLI flag is invalid in auxiliary
+  prefetch, benchmark, and Trace2CP visualization modes.
+- Rank 0 prints `test_timing step=... total_seconds=...` for the complete test
+  routine through distributed dense evaluation, visualization, and Trace2CP,
+  excluding the subsequent TensorBoard flush, and logs the same duration as
+  `timing/test_total_seconds`. Rank-0-only post-dense phases must remain below
+  the process-group timeout while other ranks wait at the result broadcast.
 - When a 3D config defines `test_datasets` and `test_trace2cp_enabled` is
   false, test evaluation runs ordinary 3D sparse direction/presence loss on the
   held-out CP-centered 3D samples. It must not require Trace2CP geometry or
@@ -2338,3 +2508,216 @@
 - Tests use fake/local arrays and monkeypatched readers where possible and must not require network access.
 - `docs/code_structure.md` documents the current implemented module structure, data flow, config shape, runner outputs, and local workflow caveats; `planning/specs.md` remains the normative behavior source.
 - Future changes that affect public config, data flow, sampling, caching, augmentation, runner outputs, tests, or local workflow must update both the relevant specs and code docs.
+# Lasagna inference manager foundations
+
+- The installed `las_manager` CLI owns one backend-neutral configuration,
+  catalog, snapshot, run, provenance, and publication model for Fiber 3D and
+  Lasagna inference. Command and entity tokens use exact match first, then only
+  unambiguous prefixes; ordinals printed by listings are not stable selectors.
+- Global configuration lives at
+  `${XDG_CONFIG_HOME:-~/.config}/las_manager/config.toml`, with
+  `LAS_MANAGER_CONFIG` as an automation override. It contains the catalog URL,
+  public bucket, snapshot directory list, cache/output/venv/Atlas directories,
+  staging S3 origin, and catalog maximum age. It never contains AWS
+  credentials. Relative paths resolve from the config file.
+- Global `params` is a string-token array passed to both inference backends.
+  Initialized configs default to `--tile-size 512 --border 32 --overlap 96
+  --devices all`. Per-run arguments after `--` follow configured tokens and
+  override them; explicit singular/plural device selection removes the
+  configured mutually exclusive device selector. Existing configs without the
+  key receive the default without migration failure.
+- The open-data catalog is cached as validated JSON plus a sidecar containing
+  its source URL, SHA-256, ETag/Last-Modified, fetch/validation times, and last
+  refresh error. `fetch` always revalidates; dependent commands refresh when
+  the cache is missing or at least one hour old. Refresh failure may use a
+  previously valid cache with a warning; invalid new data must not replace it.
+- A volume record preserves the complete catalog identity needed for portable
+  provenance and Atlas ingestion: sample/volume IDs and long ID, shape, voxel
+  size/format/license, the original volume DataEntry, all OME origins/access
+  roots, selected public S3 origin, and catalog hash/fetch metadata. Stable
+  selectors are `sample_id/long_id`, globally unique `long_id`, and globally
+  unique volume ID.
+- Human `volume ls` renders a deterministic, aligned table with one header,
+  groups records by sample/scroll, prints the scroll and first volume together,
+  and puts branches for additional volumes beneath it in the `SCROLL` column.
+  A single-volume scroll has no branch. The redundant `ID`
+  column is omitted because the long volume name begins with that ID. Three-D
+  shapes retain depth/height/width order and use space-padded widths 6/5/5.
+  Its `PREFETCHED` column contains numerically
+  sorted local OME groups only when `.zarray` and at least one non-metadata
+  chunk exist; advertised or metadata-only groups remain absent. UTF-capable
+  output uses `├─`/`└─`, otherwise `|-`/`\-`. Empty results are header-only.
+  `volume ls --json` retains the backend-neutral record schema for machines and
+  is unaffected by human rendering.
+- Snapshot roots may be a run collection, one run, or `snapshots/`. Listing
+  deduplicates canonical paths, reads checkpoints with CPU mapping, mmap and
+  `weights_only=True`, and caches metadata by path/size/mtime. The stable
+  selector is backend/run/checkpoint. Records include hash, step/test metric,
+  patch/architecture/output options, precision, task/process/code revision,
+  and optional Atlas model identity; absent legacy metadata remains explicit.
+- Shell completion is generated by the same command registry and may use only
+  valid local catalog/checkpoint caches. It must not refresh the network, open
+  an uncached checkpoint, download data, or mutate state.
+- `completion install [bash]` atomically installs a canonical loader in the
+  standard XDG user Bash-completion directory plus one digest-isolated provider
+  per canonical console-script executable. At completion time the loader uses
+  the external `las_manager` selected by `PATH`, obtains its canonical provider
+  identity through a config-free command, and dispatches only to that provider.
+  Providers from multiple venvs coexist; missing venvs are inert. Installation
+  support is Bash-only, while `completion bash|zsh` remains available for
+  generated setup.
+- A final literal `help` before any `--` prints argparse help for the longest
+  exact or uniquely abbreviated command prefix. Unrecognized suffixes fall
+  back to the understood parent; an unrecognized first token remains an error.
+  A `help` token after `--` is forwarded to the inference backend unchanged.
+- Bash and Zsh completion delegate full word context to one shared resolver,
+  understand unique command abbreviations, and complete valid flags, static
+  option values, cached selectors, samples, formats, and locally evidenced OME
+  scale indices. Scale discovery reads only local `.zattrs` multiscale dataset
+  paths and numeric groups with `.zarray`; it does not invent unknown remote
+  levels or perform network access.
+- Nullable optional catalog collections are normalized before iteration.
+  Specifically, `properties.shape = null` is indexed and displayed as unknown
+  rather than preventing other volumes from being listed or completed.
+- `volume prefetch <volume> <scale>` calls the existing OME-Zarr downloader for
+  exactly that numbered group and stores the OME root at
+  `<cache_dir>/volumes/<sample_id>/<long_id>`. It preserves downloader metadata
+  and accepts an explicit worker count; no manager-specific transfer path is
+  permitted.
+- A Lasagna install built from the monorepo includes the sibling Vesuvius
+  namespace, Fiber inference packages, their config data, and canonical
+  `lasagna.*` modules. The configured venv must run Fiber inference without an
+  ambient `PYTHONPATH`; both editable installs and monorepo-built wheels obey
+  this contract.
+- `inference run <snapshot> <volume> <scale>` atomically reserves a run,
+  launches a detached manager-prefixed tmux session, prints its path, and
+  returns immediately. By default the tmux runner invokes the shared downloader
+  before inference and passes backend `--no-download`; `--no-prefetch` skips the
+  manager phase and omits backend `--no-download`, retaining normal on-demand
+  crop-aware fetching during the inference lifecycle. On an empty cache the
+  manager initializes only local `_download` source metadata, with no remote
+  scan or chunk transfer. `--download-workers` applies to both modes; explicit
+  backend arguments after `--`, including `--no-download`, retain precedence.
+  The serialized, versioned request
+  preserves source, destination, group, workers, anonymous access, and remote
+  inventory behavior. Additional inference
+  argv is preserved without shell interpolation. The positional scale selects
+  the input OME group and does not alter the backend's output-scaledown default.
+- Every launch has an immutable UUID and atomically reserved output directory
+  containing private `metadata.json`, `command.json`, `run.log`, and a portable
+  `artifacts/` subtree. The backend-neutral record pins the complete source and
+  checkpoint identity and tracks prefetch, inference, staging-upload,
+  Atlas-ingest, and Atlas-publication state independently. New directory labels
+  use `<sample>-<acquisition>-las-sd<group>-<uuid8>`; this is a concise human
+  label, not Atlas canonical identity. Full volume, model, backend, source
+  group, command, time, revision, and UUID identity remains structured metadata.
+- A manager wrapper owns the `created -> running -> completed|failed|interrupted`
+  transition, combined prefetch/inference logging, real child exit status, and
+  signal forwarding. Prefetch tracks pending/running/completed/failed/skipped,
+  timestamps and error; failure/interruption prevents inference from starting.
+  Inference stdout/stderr is teed byte-for-byte to both `run.log` and the tmux
+  pane so attaching shows live carriage-return progress without weakening the
+  durable log or exit-code contract.
+  Stale active records are reconciled against both tmux and PID/start-time
+  identity without deleting artifacts. `inference ls` is the durable view;
+  `run ls` contains only live tmux sessions.
+- `tmux attach` attaches normally outside tmux. Inside tmux it links the run
+  window immediately after the current window and selects it, never nesting a
+  client or renaming the source window. Creation atomically captures tmux's
+  stable `window_id`, tags the window with the immutable run UUID, and validates
+  both before live/attach decisions. Numeric indices are never durable
+  identity. Window names use `inf-<sample>-<uuid4>` and are only short display
+  labels. A surviving orphan inference process is durable-running but not
+  attachable when its wrapper window is gone.
+- Subsequent ordered phases add direct portable provenance,
+  shared Zstd output, Atlas Lasagna-bundle publication, and the Lasagna backend without
+  introducing a second manager workflow or discarding the identities above.
+- Current Fiber checkpoints are self-configuring for inference: their embedded
+  config is authoritative and the CLI positional config is optional. A
+  positional config remains supported only as the explicit fallback for a
+  legacy checkpoint without embedded config; conflicting explicit config does
+  not override a current checkpoint.
+- Fiber inference directly and atomically maintains bundle-relative
+  `inference.json` with schema version, status, source/catalog identity,
+  requested and observed input scale, effective output scale/levels/crop,
+  numerical settings, checkpoint/config identity, repository/runtime identity,
+  and a bounded structural artifact inventory. It records failed/interrupted
+  status after artifact initialization and never recursively inventories Zarr
+  chunks.
+- The shared Fiber/Lasagna inference metadata writer records the checked-out
+  Villa revision as `inference.code_commit`; this applies to direct and managed
+  invocation. Repository dirtiness remains explicit. Packaged deployments may
+  supply the build commit when no Git checkout is present; otherwise the value
+  is null. Git provenance is not copied into Atlas model metadata.
+- The manager passes portable catalog/model/run context through an explicit
+  private context file. Fiber inference, not the manager, authors inference
+  facts. Private absolute paths, command, hostname/user, logs, and tmux identity
+  remain outside `artifacts/`.
+- Lasagna manifests preserve a relative `provenance` reference and unknown
+  forward-compatible top-level fields across load/save.
+- Newly created Fiber and Lasagna inference OME-Zarr arrays use the shared
+  exact Zarr-v2 compressor `{id: blosc, cname: zstd, clevel: 3, shuffle: 1,
+  blocksize: 0}` at every generated level. Both direct CLIs expose the same
+  `--ome-compressor` compatibility override. Resume never rewrites an existing
+  array's codec; requested/actual mismatches are reported, while provenance
+  inventories the codec actually persisted per level.
+
+## Atlas staging and ingestion
+
+- `las_manager open-data validate/upload` accepts completed portable Fiber and
+  Lasagna bundles through one backend-neutral implementation. Both require a
+  CC BY-NC 4.0 source license. Model identity is resolved automatically from a
+  carried ID or a freshly rehashed checkpoint in configured snapshot roots;
+  there is no normal upload-time model-ID argument.
+- Staging uses the immutable run UUID and a fixed local file inventory.
+  `_INCOMPLETE` is the manager-side transaction guard: it is written before
+  rclone starts and removed only after rclone succeeds; failed staging never
+  invokes Atlas ingestion. Retry invokes rclone again and relies on its
+  configured comparison behavior. Completed run UUID/bundle contents are
+  immutable because `rclone copy --size-only` neither detects changed same-size
+  objects nor deletes stale destination objects. No manager upload manifest or
+  per-Zarr-chunk transaction hash is stored remotely.
+- Atlas maps both Fiber and Lasagna output to the existing `lasagna` copy-first
+  artifact. Canonical identity is volume, canonical model ID, and source input
+  level. The data entry contains only its private origin and existing
+  `model_id`/`level` parameters; portable provenance remains in `inference.json`
+  and is not copied into Atlas `creation_info`. The origin path is relative to
+  its access-root URL and Atlas joins them to resolve the full data-sync source.
+- Missing models are registered automatically using an Atlas UTC datetime ID.
+  Fiber uses the minimal Lasagna model record with architecture `fiber3d/unet`,
+  task `lasagna`, process `model_training`, snapshot-root-relative checkpoint
+  path, and snapshot SHA-256. Data entries keep numeric model references.
+  Byte-identical checkpoint aliases are normalized; incompatible hashes,
+  metadata, tasks, or canonical-ID collisions are rejected before staging.
+- Public publication remains an operator-controlled Atlas data-sync action.
+
+## Lasagna manager backend
+
+- Snapshot discovery classifies current Fiber checkpoints by their embedded
+  Fiber model config and Lasagna checkpoints by their Lasagna architecture
+  metadata/state-dict wrapper. It never infers a backend from a filename.
+  Selectors are namespaced as `fiber3d/run/checkpoint` and
+  `lasagna/run/checkpoint`; `--backend` is needed only for an ambiguous legacy
+  shorthand.
+- Lasagna launches use `preprocess_cos_omezarr predict3d` but otherwise share
+  the manager's volume prefetch, immutable run record, tmux runner, completion,
+  lifecycle, portable artifact bundle, staging, and Atlas ingestion paths.
+- Direct and managed Lasagna inference write the shared `inference.json`
+  envelope with `artifact_kind = "lasagna"`. Its product metadata preserves
+  the `.lasagna.json` source-to-base mapping, gradient encoding scale/factor,
+  crops, groups, channels, Zarr paths, and output scaledowns. The manifest
+  points to `inference.json` by a bundle-relative path.
+
+# Process-parallel 3D flush
+
+- Fiber and Lasagna inference use the same shared rolling-mmap flush engine.
+- Positive `flush_workers` use persistent spawn processes with bounded
+  descriptor-only queues. Workers read frozen mmap regions directly and own
+  distinct scale/chunk writes; ndarray payloads never cross IPC.
+- Exactly one frozen batch may overlap the following inference band. Ring reuse
+  and `final_z` advancement require successful completion of the entire batch.
+- Each worker limits native CPU libraries to one thread and allocates at most
+  one chunk's denominator/raw/finalized arrays.
+- `flush_workers=0` is the synchronous baseline and uses immediate ring release;
+  both inference CLIs default to the available CPU count capped at 64 process
+  workers.

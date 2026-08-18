@@ -10,6 +10,7 @@
 #include "utils/Json.hpp"
 #include "vc/core/types/ChunkedTensor.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/tracer/Tracer.hpp"
 
@@ -333,7 +334,8 @@ int main(int argc, char *argv[])
     auto volume = remote_volume
         ? Volume::NewFromUrl(volume_arg, {}, {}, remote_metadata)
         : Volume::New(vol_path);
-    volume->setCacheBudget(size_t(params.value("cache_size", 1e9)));
+    vc::render::processChunkCacheService()->configureDecodedByteCapacity(
+        size_t(params.value("cache_size", 1e9)));
     auto* chunk_cache = volume->chunkedCache();
     const std::array<int, 3> volume_shape_zyx{
         volume->numSlices(),
@@ -570,8 +572,22 @@ int main(int argc, char *argv[])
         }
     }
 
-    if (thread_limit)
+    if (thread_limit) {
         omp_set_num_threads(thread_limit);
+    }
+    else if (omp_get_max_threads() > 8) {
+        // Tracing throughput peaks at a small thread count and degrades well
+        // past it: measured on an i7-10700F (8C/16T) and a Ryzen 9 8940HX
+        // (16C/32T), wall time per cm2 traced is lowest at 4 threads on both,
+        // and running unbounded costs 2.2x and 3.5x respectively. The penalty
+        // grows with core count, so the default is worst exactly on the large
+        // machines used for batch tracing. VC3D already passes thread_limit=1
+        // when it launches this tool (SegmentationCommandHandler.cpp).
+        std::cout << "NOTE: running with " << omp_get_max_threads()
+                  << " OpenMP threads; tracing does not scale past a few threads. "
+                  << "Set \"thread_limit\" in the params JSON (VC3D uses 1) or "
+                  << "OMP_NUM_THREADS to cap it." << std::endl;
+    }
 
     std::unique_ptr<QuadSurface> resume_surf;
     if (mode == "resume") {

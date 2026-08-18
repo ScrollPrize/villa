@@ -4,11 +4,12 @@
 		"flatten_solver": "forward",
 		"flatten_initial_inversion": false,
 		"flatten_output_step": 20.0,
-		"flatten_output_margin": 0.0
+		"flatten_output_margin": 0.0,
+		"flatten_edge_step_global_scale": 100.0
 	},
 	"base": {
 		"flatten_sdir": 1.0,
-		"flatten_map_step": 0.1,
+		"flatten_edge_step": 1.0,
 		"flatten_avg_offset": 1.0,
 		"flatten_orient": 2.0
 	},
@@ -33,7 +34,8 @@
 				"status_interval": 100,
 				"auto_steps_window": 2000,
 				"auto_steps_max": 100000,
-				"auto_steps_rel_threshold": 1e-5
+				"auto_steps_rel_threshold": 1e-5,
+				"flatten_renorm_interval": 500
 			}
 		},
 		{

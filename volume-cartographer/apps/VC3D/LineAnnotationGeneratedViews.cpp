@@ -26,15 +26,52 @@ bool finiteScenePoint(const QPointF& point)
 QPointF generatedStripControlPointToScene(
     CChunkedVolumeViewer* viewer,
     QuadSurface* surface,
-    const GeneratedOverlay::ControlPointMarker& control)
+    const GeneratedOverlay::ControlPointMarker& control,
+    const vc::lasagna::LineStripPositionMap& controlPositionMap)
 {
+    // The strip is uniformly parameterized by centerline arclength. The
+    // explicit map converts the model point-index coordinate before the O(1)
+    // centerline lookup. volumeToScene runs QuadSurface::pointTo — an O(strip length)
+    // gradient descent from the strip center — which made every overlay
+    // rebuild cost O(controlPoints x lineLength) and dominated zoom/pan
+    // lag on many-control-point fibers; keep it only for points that are
+    // genuinely off the centerline: manual/no-reoptimization edits retain
+    // the clicked off-line volume position until the next optimization,
+    // and their markers (and hit tests) must show the true position, not
+    // the centerline. Preconditions are re-checked here because the O(1)
+    // helper reports failure as a default (finite) QPointF, which must
+    // not shadow the fallback.
+    if (viewer && surface && std::isfinite(control.linePosition)) {
+        const auto* points = surface->rawPointsPtr();
+        const cv::Vec2f scale = surface->scale();
+        const double gridColumn = controlPositionMap.valid()
+            ? controlPositionMap.originalPositionToStripGridColumn(control.linePosition)
+            : control.linePosition;
+        const int column = static_cast<int>(std::lround(gridColumn));
+        if (points && !points->empty() && scale[0] != 0.0f && scale[1] != 0.0f &&
+            column >= 0 && column < points->cols) {
+            const cv::Vec3f centerlinePoint = (*points)(points->rows / 2, column);
+            constexpr float kOnCenterlineToleranceVx = 1.0e-3f;
+            const bool onCenterline = !finiteGeneratedPoint(control.point) ||
+                (finiteGeneratedPoint(centerlinePoint) &&
+                 cv::norm(control.point - centerlinePoint) <= kOnCenterlineToleranceVx);
+            if (onCenterline) {
+                const QPointF positionScene = generatedStripLinePositionToScene(
+                    viewer, surface, control.linePosition, &controlPositionMap);
+                if (finiteScenePoint(positionScene)) {
+                    return positionScene;
+                }
+            }
+        }
+    }
     if (viewer && finiteGeneratedPoint(control.point)) {
         const QPointF pointScene = viewer->volumeToScene(control.point);
         if (finiteScenePoint(pointScene)) {
             return pointScene;
         }
     }
-    return generatedStripLinePositionToScene(viewer, surface, control.linePosition);
+    return generatedStripLinePositionToScene(viewer, surface, control.linePosition,
+                                             &controlPositionMap);
 }
 
 QColor generatedCurrentLineMarkerColor(GeneratedCurrentLineMarkerState state,
@@ -55,7 +92,8 @@ QColor generatedCurrentLineMarkerColor(GeneratedCurrentLineMarkerState state,
 
 QPointF generatedStripLinePositionToScene(CChunkedVolumeViewer* viewer,
                                           QuadSurface* surface,
-                                          double linePosition)
+                                          double linePosition,
+                                          const vc::lasagna::LineStripPositionMap* positionMap)
 {
     if (!viewer || !surface) {
         return {};
@@ -64,19 +102,21 @@ QPointF generatedStripLinePositionToScene(CChunkedVolumeViewer* viewer,
     if (!points || points->empty()) {
         return {};
     }
-    const cv::Vec2f scale = surface->scale();
-    if (scale[0] == 0.0f || scale[1] == 0.0f) {
+    const double gridColumn = positionMap && positionMap->valid()
+        ? positionMap->originalPositionToStripGridColumn(linePosition)
+        : linePosition;
+    if (!std::isfinite(gridColumn)) {
         return {};
     }
-    const float surfaceX = (static_cast<float>(linePosition) -
-                            static_cast<float>(points->cols) / 2.0f) / scale[0];
-    const float centerRow = static_cast<float>(points->rows / 2);
-    const float surfaceY = (centerRow - static_cast<float>(points->rows) / 2.0f) / scale[1];
-    return viewer->surfaceCoordsToScene(surfaceX, surfaceY);
+    const cv::Vec2d surfacePoint = surface->gridToSurface(
+        {gridColumn, static_cast<double>(points->rows / 2)});
+    return viewer->surfaceCoordsToScene(static_cast<float>(surfacePoint[0]),
+                                        static_cast<float>(surfacePoint[1]));
 }
 
 double generatedLinePositionFromStripScene(CChunkedVolumeViewer* viewer,
-                                           const QPointF& scenePoint)
+                                           const QPointF& scenePoint,
+                                           const vc::lasagna::LineStripPositionMap* positionMap)
 {
     if (!viewer) {
         return std::numeric_limits<double>::quiet_NaN();
@@ -87,13 +127,16 @@ double generatedLinePositionFromStripScene(CChunkedVolumeViewer* viewer,
         return std::numeric_limits<double>::quiet_NaN();
     }
     const cv::Vec2f surfacePoint = viewer->sceneToSurfaceCoords(scenePoint);
-    const cv::Vec2f scale = quad->scale();
-    if (scale[0] == 0.0f || !std::isfinite(surfacePoint[0])) {
+    if (!std::isfinite(surfacePoint[0]) || !std::isfinite(surfacePoint[1])) {
         return std::numeric_limits<double>::quiet_NaN();
     }
-    const double position = static_cast<double>(surfacePoint[0] * scale[0]) +
-                            static_cast<double>(points->cols) / 2.0;
-    return std::clamp(position, 0.0, static_cast<double>(points->cols - 1));
+    const cv::Vec2d gridPoint = quad->surfaceToGrid(
+        {static_cast<double>(surfacePoint[0]), static_cast<double>(surfacePoint[1])});
+    const double gridColumn = std::clamp(gridPoint[0], 0.0,
+                                         static_cast<double>(points->cols - 1));
+    return positionMap && positionMap->valid()
+        ? positionMap->stripGridColumnToOriginalPosition(gridColumn)
+        : gridColumn;
 }
 
 std::optional<float> generatedCrossSliceControlPointDistanceThreshold(CChunkedVolumeViewer* viewer)
@@ -243,21 +286,40 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
     pendingBranchControlPointStyle.brushColor = QColor(80, 150, 255, 175);
     pendingBranchControlPointStyle.z = 162.5;
 
+    ViewerOverlayControllerBase::OverlayStyle sameHvBranchControlPointStyle = branchControlPointStyle;
+    sameHvBranchControlPointStyle.penColor = QColor(255, 140, 0, 245);
+    sameHvBranchControlPointStyle.brushColor = QColor(255, 140, 0, 175);
+
+    ViewerOverlayControllerBase::OverlayStyle sameHvPendingBranchControlPointStyle =
+        pendingBranchControlPointStyle;
+    sameHvPendingBranchControlPointStyle.penColor = QColor(255, 190, 120, 245);
+    sameHvPendingBranchControlPointStyle.brushColor = QColor(255, 190, 120, 175);
+
     ViewerOverlayControllerBase::OverlayStyle linkCandidateControlPointStyle = branchControlPointStyle;
     linkCandidateControlPointStyle.penColor = QColor(60, 235, 120, 245);
     linkCandidateControlPointStyle.brushColor = QColor(60, 235, 120, 175);
     linkCandidateControlPointStyle.z = 163.0;
 
+    ViewerOverlayControllerBase::OverlayStyle splitCandidateControlPointStyle = branchControlPointStyle;
+    splitCandidateControlPointStyle.penColor = QColor(235, 60, 60, 245);
+    splitCandidateControlPointStyle.brushColor = QColor(235, 60, 60, 175);
+    splitCandidateControlPointStyle.z = 163.5;
+
     auto controlStyleForMarker = [&](const GeneratedOverlay::ControlPointMarker& control)
         -> const ViewerOverlayControllerBase::OverlayStyle& {
+        if (control.isSplitCandidate) {
+            return splitCandidateControlPointStyle;
+        }
         if (control.isLinkCandidate) {
             return linkCandidateControlPointStyle;
         }
         if (control.hasPendingLinks) {
-            return pendingBranchControlPointStyle;
+            return control.hasSameHvPendingLinks ? sameHvPendingBranchControlPointStyle
+                                                 : pendingBranchControlPointStyle;
         }
         if (control.hasBranches) {
-            return branchControlPointStyle;
+            return control.hasSameHvBranches ? sameHvBranchControlPointStyle
+                                             : branchControlPointStyle;
         }
         return control.isSeed ? seedStyle : controlPointStyle;
     };
@@ -360,6 +422,9 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
         auto* quad = dynamic_cast<QuadSurface*>(viewer->currentSurface());
         const auto* points = quad ? quad->rawPointsPtr() : nullptr;
         if (points && !points->empty()) {
+            const double maximumLinePosition = overlay.stripPositionMap.valid()
+                ? static_cast<double>(overlay.stripPositionMap.originalArclengths.size() - 1)
+                : static_cast<double>(points->cols - 1);
             const cv::Vec2f scale = quad->scale();
             if (scale[0] != 0.0f && scale[1] != 0.0f && !overlay.linePoints.empty()) {
                 const float centerRow = static_cast<float>(points->rows / 2);
@@ -374,18 +439,20 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
             }
             if (overlay.controlPoints.empty() &&
                 overlay.seedLineIndex >= 0 &&
-                overlay.seedLineIndex < points->cols) {
-                seedScene = generatedStripLinePositionToScene(viewer, quad, overlay.seedLineIndex);
+                static_cast<double>(overlay.seedLineIndex) <= maximumLinePosition) {
+                seedScene = generatedStripLinePositionToScene(
+                    viewer, quad, overlay.seedLineIndex, &overlay.stripPositionMap);
                 hasSeedScene = finiteScenePoint(seedScene);
             }
             for (const double position : overlay.markerLinePositions) {
                 if (!std::isfinite(position) ||
                     position < 0.0 ||
-                    position > static_cast<double>(points->cols - 1) ||
+                    position > maximumLinePosition ||
                     std::abs(position - overlay.currentLinePosition) < 1.0e-6) {
                     continue;
                 }
-                const QPointF markerScene = generatedStripLinePositionToScene(viewer, quad, position);
+                const QPointF markerScene = generatedStripLinePositionToScene(
+                    viewer, quad, position, &overlay.stripPositionMap);
                 if (finiteScenePoint(markerScene)) {
                     primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{
                         markerScene,
@@ -397,11 +464,12 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
             for (const auto& control : overlay.controlPoints) {
                 if (!std::isfinite(control.linePosition) ||
                     control.linePosition < 0.0 ||
-                    control.linePosition > static_cast<double>(points->cols - 1)) {
+                    control.linePosition > maximumLinePosition) {
                     continue;
                 }
                 const QPointF controlScene =
-                    generatedStripControlPointToScene(viewer, quad, control);
+                    generatedStripControlPointToScene(viewer, quad, control,
+                                                      overlay.stripPositionMap);
                 if (finiteScenePoint(controlScene)) {
                     primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{
                         controlScene,
@@ -416,7 +484,8 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
                 }
                 const QPointF controlScene = finiteGeneratedPoint(predSnap.controlPoint)
                     ? viewer->volumeToScene(predSnap.controlPoint)
-                    : generatedStripLinePositionToScene(viewer, quad, predSnap.linePosition);
+                    : generatedStripLinePositionToScene(
+                          viewer, quad, predSnap.linePosition, &overlay.stripPositionMap);
                 const QPointF snapScene = viewer->volumeToScene(predSnap.snapPoint);
                 if (finiteScenePoint(controlScene) && finiteScenePoint(snapScene)) {
                     primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
@@ -432,7 +501,8 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
             }
             if (std::isfinite(overlay.currentLinePosition)) {
                 const QPointF markerScene =
-                    generatedStripLinePositionToScene(viewer, quad, overlay.currentLinePosition);
+                    generatedStripLinePositionToScene(
+                        viewer, quad, overlay.currentLinePosition, &overlay.stripPositionMap);
                 if (finiteScenePoint(markerScene)) {
                     if (overlay.currentLineMarkerAsCross) {
                         constexpr qreal kCrossRadius = 5.5;
@@ -578,17 +648,34 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
 
     if (!overlay.useSurfaceCenterLine && sceneLine.size() >= 2) {
         const auto controlRange = generatedControlLinePositionRange(overlay.controlPoints);
+        // Consecutive non-tail segments accumulate into one polyline
+        // primitive per run (same pattern as the branch lines above): a
+        // primitive per segment meant one QGraphicsPathItem per segment,
+        // and rebuilding thousands of scene items per overlay refresh
+        // dominated zoom/pan lag on long fibers.
+        std::vector<QPointF> run;
+        const auto flushRun = [&]() {
+            if (run.size() >= 2) {
+                primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
+                    std::move(run),
+                    false,
+                    lineStyle});
+            }
+            run = {};
+        };
         for (size_t i = 1; i < sceneLine.size(); ++i) {
             const auto& previous = sceneLine[i - 1];
             const auto& current = sceneLine[i];
             if (generatedLineSegmentIsTail(previous.second, current.second, controlRange)) {
+                flushRun();
                 continue;
             }
-            primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
-                {previous.first, current.first},
-                false,
-                lineStyle});
+            if (run.empty()) {
+                run.push_back(previous.first);
+            }
+            run.push_back(current.first);
         }
+        flushRun();
     }
 
     if (finiteGeneratedPoint(overlay.pointMarker)) {
@@ -660,7 +747,8 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
         QPointF controlScene;
         if (options.stripViewer) {
             auto* quad = dynamic_cast<QuadSurface*>(options.viewer->currentSurface());
-            controlScene = generatedStripControlPointToScene(options.viewer, quad, control);
+            controlScene = generatedStripControlPointToScene(
+                options.viewer, quad, control, options.stripPositionMap);
         } else {
             controlScene = options.viewer->volumeToScene(control.point);
         }
@@ -814,6 +902,15 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
             selectedControlIndex != std::numeric_limits<size_t>::max() &&
             !selectedControl.hasBranches);
     }
+    // Linked CPs are legal split points (their links are remapped onto the
+    // halves), so unlike the link candidate there is no hasBranches gate.
+    QAction* designateSplitCandidateAction = nullptr;
+    if (options.designateSplitCandidate) {
+        designateSplitCandidateAction =
+            menu.addAction(QWidget::tr("Designate as split candidate"));
+        designateSplitCandidateAction->setEnabled(
+            selectedControlIndex != std::numeric_limits<size_t>::max());
+    }
     std::vector<std::pair<QAction*, GeneratedOverlay::ControlPointMarker::BranchLink>> openBranchActions;
     if (!selectedControl.branchLinks.empty()) {
         QMenu* branchMenu = menu.addMenu(QWidget::tr("Go to linked annotation"));
@@ -911,6 +1008,31 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
             selectedControlIndex != std::numeric_limits<size_t>::max() &&
             !selectedControl.hasBranches);
     }
+    // No hasBranches gate: the merge consumes the very pending link the two
+    // endpoint CPs typically already carry.
+    QAction* mergeWithCandidateAction = nullptr;
+    if (options.mergeWithCandidate && !options.mergeWithCandidateLabel.isEmpty()) {
+        mergeWithCandidateAction = menu.addAction(options.mergeWithCandidateLabel);
+        mergeWithCandidateAction->setEnabled(
+            options.mergeWithCandidateEnabled &&
+            selectedControlIndex != std::numeric_limits<size_t>::max());
+    }
+    QAction* splitFromCandidateAction = nullptr;
+    if (options.splitFromCandidate && !options.splitFromCandidateLabel.isEmpty()) {
+        splitFromCandidateAction = menu.addAction(options.splitFromCandidateLabel);
+        splitFromCandidateAction->setEnabled(
+            options.splitFromCandidateEnabled &&
+            selectedControlIndex != std::numeric_limits<size_t>::max());
+    }
+    QAction* splitFromCandidateAndLinkAction = nullptr;
+    if (options.splitFromCandidateAndLink &&
+        !options.splitFromCandidateAndLinkLabel.isEmpty()) {
+        splitFromCandidateAndLinkAction =
+            menu.addAction(options.splitFromCandidateAndLinkLabel);
+        splitFromCandidateAndLinkAction->setEnabled(
+            options.splitFromCandidateEnabled &&
+            selectedControlIndex != std::numeric_limits<size_t>::max());
+    }
     QAction* openNearbyAnnotationAction = nullptr;
     if (options.openNearbyAnnotation && nearbyIntersection) {
         openNearbyAnnotationAction = menu.addAction(
@@ -985,6 +1107,30 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
         selected == linkWithCandidateAction &&
         linkWithCandidateAction->isEnabled()) {
         options.linkWithCandidate(selectedControlIndex, selectedControl.point);
+        return GeneratedControlPointContextResult::Handled;
+    }
+    if (mergeWithCandidateAction &&
+        selected == mergeWithCandidateAction &&
+        mergeWithCandidateAction->isEnabled()) {
+        options.mergeWithCandidate(selectedControlIndex, selectedControl.point);
+        return GeneratedControlPointContextResult::Handled;
+    }
+    if (designateSplitCandidateAction &&
+        selected == designateSplitCandidateAction &&
+        designateSplitCandidateAction->isEnabled()) {
+        options.designateSplitCandidate(selectedControlIndex, selectedControl.point);
+        return GeneratedControlPointContextResult::Handled;
+    }
+    if (splitFromCandidateAction &&
+        selected == splitFromCandidateAction &&
+        splitFromCandidateAction->isEnabled()) {
+        options.splitFromCandidate(selectedControlIndex, selectedControl.point);
+        return GeneratedControlPointContextResult::Handled;
+    }
+    if (splitFromCandidateAndLinkAction &&
+        selected == splitFromCandidateAndLinkAction &&
+        splitFromCandidateAndLinkAction->isEnabled()) {
+        options.splitFromCandidateAndLink(selectedControlIndex, selectedControl.point);
         return GeneratedControlPointContextResult::Handled;
     }
     if (openNearbyAnnotationAction && selected == openNearbyAnnotationAction) {

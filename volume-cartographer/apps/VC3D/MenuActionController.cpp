@@ -200,6 +200,10 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     connect(_mergePatchAct, &QAction::triggered,
             this, &MenuActionController::mergePatchFromMenuRequested);
 
+    _growTrackPatchesAct = new QAction(QObject::tr("Grow Track Patches..."), this);
+    connect(_growTrackPatchesAct, &QAction::triggered,
+            this, &MenuActionController::growTrackPatchesFromMenuRequested);
+
     _materializeOpenDataFolderAct = new QAction(
         QObject::tr("Create/Fetch All Segments for Current Folder"), this);
     connect(_materializeOpenDataFolderAct, &QAction::triggered, this,
@@ -249,6 +253,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _actionsMenu->addSeparator();
     _actionsMenu->addAction(_mergeTifxyzAct);
     _actionsMenu->addAction(_mergePatchAct);
+    _actionsMenu->addAction(_growTrackPatchesAct);
     _actionsMenu->addSeparator();
     _transformsMenu = new QMenu(QObject::tr("&Transforms"), _actionsMenu);
     _transformsMenu->addAction(_rotateSurfaceAct);
@@ -1255,13 +1260,11 @@ void MenuActionController::showSettingsDialog()
         settings.value(vc3d::settings::viewer::AXIS_OVERLAY_OPACITY,
                        vc3d::settings::viewer::AXIS_OVERLAY_OPACITY_DEFAULT).toInt());
 
-    // The spiral cache budgets live on the manager, not the window, and only the
-    // spiral workspace opts in -- so walk every live manager and let the ones
-    // that opted in re-read them. Byte capacities are adjustable in place, so
-    // this takes effect without reopening the workspace.
+    // Cache budgets are independent per workspace. Re-read them for every live
+    // manager so changes take effect without reopening either workspace.
     for (auto* manager : ViewerManager::allManagers()) {
-        if (manager && manager->surfaceCacheEnabled())
-            manager->applySpiralCacheSettings();
+        if (manager)
+            manager->applyViewerCacheSettings();
     }
 
     dialog->deleteLater();
@@ -1899,7 +1902,7 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote)
             const auto result =
                 targetPackage->attachPreparedLasagnaDataset(persistedLocation, {}, fiberInference, task.volumes, cacheRoot.toStdString());
             if (result == VolumePkg::AttachLasagnaResult::VolumeIdConflict) {
-                QMessageBox::warning(_window, QObject::tr("Attach Lasagna failed"), QObject::tr("A derived Lasagna volume conflicts with an existing volume id."));
+                QMessageBox::warning(_window, QObject::tr("Attach Lasagna failed"), QObject::tr("A Lasagna volume conflicts with an existing volume id."));
                 return;
             }
             _window->refreshCurrentVolumePackageUi(QString(), true);

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -38,11 +39,14 @@ from vesuvius.neural_tracing.fiber_trace_3d.inference_adapter import (
     FiberTrace3DPredictAdapter,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.infer import (
+    _checkpoint_config_for_inference,
     _input_scaledown_from_base,
+    _resolve_inference_precision,
     _resolve_inference_device,
     _select_and_expand_crop,
     run_fiber_trace_3d_inference,
 )
+from vesuvius.neural_tracing.fiber_trace_3d import infer as fiber_infer_module
 from vesuvius.neural_tracing.fiber_trace_3d.prediction import (
     decode_grouped_direction_presence,
     direction_branch_count_from_channels,
@@ -129,12 +133,153 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     trace_native_3d_whole_fiber,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.train import (
+    _TrainingHangDiagnostics,
+    _diagnostic_cuda_synchronize,
     _autocast_context,
     _conditioned_perpendicular_queries,
     _safe_probability_bce,
     compute_conditioned_losses,
     compute_losses,
 )
+
+
+def _run_hang_diagnostics_subprocess(tmp_path: Path, body: str) -> subprocess.CompletedProcess[str]:
+    source_root = Path(__file__).resolve().parents[2] / "src"
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(source_root), env.get("PYTHONPATH", "")]
+    ).rstrip(os.pathsep)
+    script = (
+        "import os, signal, time\n"
+        "from pathlib import Path\n"
+        "import torch\n"
+        "from vesuvius.neural_tracing.fiber_trace_3d.train import _TrainingHangDiagnostics\n"
+        f"run_dir = Path({str(tmp_path)!r})\n"
+        + body
+    )
+    return subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+
+def test_training_hang_diagnostics_disabled_has_no_side_effects(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    calls = []
+
+    def record(name):
+        return lambda *args, **kwargs: calls.append((name, args, kwargs))
+
+    monkeypatch.setattr("vesuvius.neural_tracing.fiber_trace_3d.train.faulthandler.register", record("register"))
+    monkeypatch.setattr("vesuvius.neural_tracing.fiber_trace_3d.train.faulthandler.unregister", record("unregister"))
+    monkeypatch.setattr("vesuvius.neural_tracing.fiber_trace_3d.train.faulthandler.dump_traceback_later", record("dump"))
+    monkeypatch.setattr("vesuvius.neural_tracing.fiber_trace_3d.train.faulthandler.cancel_dump_traceback_later", record("cancel"))
+    monkeypatch.setattr("vesuvius.neural_tracing.fiber_trace_3d.train.torch.cuda.synchronize", record("sync"))
+
+    diagnostics = _TrainingHangDiagnostics(
+        tmp_path,
+        rank=0,
+        device=torch.device("cuda", 0),
+        automatic_watchdog=True,
+        enabled=False,
+    )
+    diagnostics.marker("ignored")
+    diagnostics.arm_test_watchdog(10)
+    _diagnostic_cuda_synchronize(
+        diagnostics,
+        phase="ignored-sync",
+        step=10,
+        device=torch.device("cuda", 0),
+    )
+    diagnostics.close()
+
+    assert calls == []
+    assert not (tmp_path / "hang_diagnostics_rank_0.log").exists()
+
+
+@pytest.mark.parametrize(
+    ("training", "cli_enabled", "expected"),
+    [
+        ({}, False, (False, False, False)),
+        ({"test_hang_diagnostics_enabled": True}, False, (True, False, True)),
+        ({"test_hang_diagnostics_enabled": False}, True, (False, True, True)),
+    ],
+)
+def test_training_hang_diagnostics_enable_resolution(training, cli_enabled, expected) -> None:
+    assert _resolve_test_hang_diagnostics_enabled(
+        training,
+        cli_enabled=cli_enabled,
+    ) == expected
+
+
+def test_training_hang_diagnostics_config_requires_json_boolean() -> None:
+    with pytest.raises(ValueError, match="must be a JSON boolean"):
+        _resolve_test_hang_diagnostics_enabled(
+            {"test_hang_diagnostics_enabled": "false"},
+            cli_enabled=False,
+        )
+
+
+def test_training_watchdog_timeout_is_validated_only_when_enabled() -> None:
+    assert _resolve_test_watchdog_seconds(
+        {"test_watchdog_seconds": "invalid"},
+        diagnostics_enabled=False,
+    ) == 480.0
+    with pytest.raises(ValueError):
+        _resolve_test_watchdog_seconds(
+            {"test_watchdog_seconds": 600},
+            diagnostics_enabled=True,
+        )
+    assert _resolve_test_watchdog_seconds(
+        {"test_watchdog_seconds": 123},
+        diagnostics_enabled=True,
+    ) == 123.0
+
+
+def test_training_hang_watchdog_dumps_and_can_be_rearmed(tmp_path: Path) -> None:
+    result = _run_hang_diagnostics_subprocess(
+        tmp_path,
+        "d = _TrainingHangDiagnostics(run_dir, rank=0, device=torch.device('cpu'), "
+        "watchdog_seconds=0.1, automatic_watchdog=True)\n"
+        "d.arm_test_watchdog(12)\n"
+        "time.sleep(0.25)\n"
+        "d.arm_test_watchdog(13)\n"
+        "d.cancel_test_watchdog(step=13)\n"
+        "d.close()\n",
+    )
+    assert result.returncode == 0, result.stderr
+    text = (tmp_path / "hang_diagnostics_rank_0.log").read_text(encoding="utf-8")
+    assert "Timeout" in text
+    assert "test-watchdog-arm" in text
+    assert "step=13" in text
+    assert "test-watchdog-cancel" in text
+
+
+def test_training_hang_watchdog_cancel_and_manual_dump(tmp_path: Path) -> None:
+    result = _run_hang_diagnostics_subprocess(
+        tmp_path,
+        "d = _TrainingHangDiagnostics(run_dir, rank=0, device=torch.device('cpu'), "
+        "watchdog_seconds=0.1, automatic_watchdog=True)\n"
+        "d.marker('unit-phase', step=7)\n"
+        "d.arm_test_watchdog(7)\n"
+        "d.cancel_test_watchdog(step=7)\n"
+        "time.sleep(0.2)\n"
+        "sig = getattr(signal, 'SIGUSR2', None)\n"
+        "if sig is not None: os.kill(os.getpid(), sig); time.sleep(0.05)\n"
+        "d.close()\n",
+    )
+    assert result.returncode == 0, result.stderr
+    text = (tmp_path / "hang_diagnostics_rank_0.log").read_text(encoding="utf-8")
+    assert "phase=unit-phase" in text
+    assert "Timeout" not in text
+    if hasattr(signal, "SIGUSR2"):
+        assert "Current thread" in text
 from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _FiberTrace3DBatchDataset,
     _DistributedConfig,
@@ -155,15 +300,22 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _mixed_precision_config_from_training,
     _oblique_line_presence_for_display,
     _distributed_config_from_env,
+    _distributed_gather_dense_test_rows,
     _distributed_should_use_sync_batchnorm,
+    _distributed_test_batch_indices,
     _distributed_training_batch_index,
     _distributed_training_sample_index,
+    _mean_dense_test_rows,
+    _report_test_timing,
+    _resolve_test_hang_diagnostics_enabled,
+    _resolve_test_watchdog_seconds,
     _resolve_dense_test_selection,
     _resolve_prefetch_sample_count,
     _require_single_process_cli_mode,
     _save_snapshot,
     _select_branch_by_chunked_min_fraction,
     _training_sample_index_limit,
+    _test_batch_take,
     _validate_snapshot_intervals,
     _write_3d_sample_sheet,
 )
@@ -219,6 +371,135 @@ def test_inference_device_defaults_to_available_cuda(monkeypatch: pytest.MonkeyP
     assert _resolve_inference_device(None) == torch.device("cpu")
     assert _resolve_inference_device("auto") == torch.device("cpu")
     assert _resolve_inference_device("cpu") == torch.device("cpu")
+
+
+def test_inference_precision_auto_uses_checkpoint_policy(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "snapshot.pt"
+    torch.save({"config": {"training": {"mixed_precision": "bf16"}}}, checkpoint)
+    assert _resolve_inference_precision(
+        "auto", checkpoint=checkpoint, devices=(torch.device("cpu"),)
+    ) == ("bf16", "checkpoint")
+
+
+def test_inference_precision_auto_legacy_and_unsupported_fall_back(tmp_path: Path) -> None:
+    ambiguous = tmp_path / "ambiguous.pt"
+    torch.save({"config": {"training": {"mixed_precision": "auto"}}}, ambiguous)
+    assert _resolve_inference_precision(
+        "auto", checkpoint=ambiguous, devices=(torch.device("cpu"),)
+    ) == ("off", "checkpoint-ambiguous")
+    fp16 = tmp_path / "fp16.pt"
+    torch.save({"config": {"training": {"mixed_precision": "fp16"}}}, fp16)
+    assert _resolve_inference_precision(
+        "auto", checkpoint=fp16, devices=(torch.device("cpu"),)
+    ) == ("off", "checkpoint-unsupported")
+    with pytest.raises(ValueError, match="requires a CUDA device"):
+        _resolve_inference_precision(
+            "fp16", checkpoint=None, devices=(torch.device("cpu"),)
+        )
+
+
+def test_fiber_inference_cli_forwards_shared_multi_gpu_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(fiber_infer_module, "run_fiber_trace_3d_inference", fake_run)
+    result = fiber_infer_module.main([
+        "config.json", "--input", "input.zarr", "--output", "fiber.lasagna.json",
+        "--checkpoint", "model.pt", "--devices", "all",
+        "--prefetch-workers", "5", "--slots-per-gpu", "3",
+		"--flush-workers", "6",
+        "--accumulator-workers", "9",
+        "--input-reader", "python-zarr", "--prefetch-tiles-per-gpu", "7",
+        "--input-cache-gib", "2.5", "--input-io-threads", "11",
+        "--input-copy-threads", "3",
+        "--profile-pipeline",
+        "--inference-precision", "bf16",
+        "--product-accumulator-dtype", "float32",
+        "--download-workers", "77",
+        "--ome-compressor", "none",
+    ])
+    assert result == 0
+    assert captured["device"] is None
+    assert captured["devices"] == "all"
+    assert captured["prefetch_workers"] == 5
+    assert captured["slots_per_gpu"] == 3
+    assert captured["flush_workers"] == 6
+    assert captured["accumulator_workers"] == 9
+    assert captured["input_reader"] == "python-zarr"
+    assert captured["prefetch_tiles_per_gpu"] == 7
+    assert captured["input_cache_gib"] == 2.5
+    assert captured["input_io_threads"] == 11
+    assert captured["input_copy_threads"] == 3
+    assert captured["profile_pipeline"] is True
+    assert captured["inference_precision"] == "bf16"
+    assert captured["product_accumulator_dtype"] == "float32"
+    assert captured["download_workers"] == 77
+    assert captured["ome_compressor"] == "none"
+
+
+def test_fiber_inference_cli_forwards_live_cache_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        fiber_infer_module, "run_fiber_trace_3d_inference",
+        lambda **kwargs: captured.update(kwargs),
+    )
+    assert fiber_infer_module.main([
+        "--input", "volume.zarr/0", "--output", "fiber.lasagna.json",
+        "--checkpoint", "model.pt", "--live-fetch",
+        "--live-cache-gib", "12.5", "--live-fetch-ahead-tiles", "4321",
+        "--download-workers", "123",
+    ]) == 0
+    assert captured["live_fetch"] is True
+    assert captured["live_cache_gib"] == 12.5
+    assert captured["live_fetch_ahead_tiles"] == 4321
+    assert captured["download_workers"] == 123
+
+
+@pytest.mark.parametrize("extra", [
+    ["--live-fetch", "--no-download"],
+    ["--live-fetch", "--crop", "0", "0", "0", "1", "1", "1"],
+    ["--live-cache-gib", "1"],
+])
+def test_fiber_inference_cli_rejects_invalid_live_cache_combinations(extra) -> None:
+    with pytest.raises(SystemExit):
+        fiber_infer_module.main([
+            "--input", "volume.zarr/0", "--output", "fiber.lasagna.json",
+            "--checkpoint", "model.pt", *extra,
+        ])
+
+
+def test_fiber_inference_cli_omits_config_for_current_checkpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        fiber_infer_module,
+        "run_fiber_trace_3d_inference",
+        lambda **kwargs: captured.update(kwargs),
+    )
+    assert fiber_infer_module.main([
+        "--input", "input.zarr", "--output", "fiber.lasagna.json",
+        "--checkpoint", "model.pt",
+    ]) == 0
+    assert captured["config_path"] is None
+
+
+def test_checkpoint_config_is_authoritative_with_legacy_fallback(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "model.pt"
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text(json.dumps({"patch_shape_zyx": [32, 32, 32]}), encoding="utf-8")
+    torch.save({"config": {"patch_shape_zyx": [64, 64, 64]}}, checkpoint)
+
+    config, source = _checkpoint_config_for_inference(checkpoint, legacy)
+    assert config["patch_shape_zyx"] == [64, 64, 64]
+    assert source == "checkpoint"
+
+    torch.save({"model": {}}, checkpoint)
+    config, source = _checkpoint_config_for_inference(checkpoint, legacy)
+    assert config["patch_shape_zyx"] == [32, 32, 32]
+    assert source == "legacy-file"
+    with pytest.raises(ValueError, match="legacy config"):
+        _checkpoint_config_for_inference(checkpoint, None)
 
 
 class _NativeTraceTestPredictionAdapter:
@@ -929,6 +1210,103 @@ def test_3d_batch_dataset_strides_batch_indices_for_distributed_ranks() -> None:
 
     assert torch.equal(first.stream_indices, torch.tensor([2, 3], dtype=torch.long))
     assert torch.equal(second.stream_indices, torch.tensor([8, 9], dtype=torch.long))
+
+
+def test_3d_batch_dataset_applies_non_aligned_sample_offset_before_stride() -> None:
+    config = _loader(augment_enabled=False).config
+    dataset = _FiberTrace3DBatchDataset(
+        config,
+        start_batch_index=1,
+        batch_index_stride=3,
+        sample_index_offset=5,
+        batch_count=2,
+        sample_mode="random",
+        worker_device="cpu",
+    )
+
+    assert torch.equal(dataset[0].stream_indices, torch.tensor([7, 8], dtype=torch.long))
+    assert torch.equal(dataset[1].stream_indices, torch.tensor([13, 14], dtype=torch.long))
+
+
+@pytest.mark.parametrize(
+    ("sample_count", "batch_size", "world_size"),
+    [(3, 8, 8), (123, 8, 8), (16, 8, 3), (0, 8, 4)],
+)
+def test_3d_distributed_test_batches_are_disjoint_and_complete(
+    sample_count: int,
+    batch_size: int,
+    world_size: int,
+) -> None:
+    assignments = []
+    for rank in range(world_size):
+        config = _DistributedConfig(
+            enabled=world_size > 1,
+            rank=rank,
+            local_rank=rank,
+            world_size=world_size,
+            is_main=rank == 0,
+            backend="gloo",
+            device=torch.device("cpu"),
+        )
+        assignments.extend(
+            _distributed_test_batch_indices(
+                sample_count=sample_count,
+                batch_size=batch_size,
+                config=config,
+            )
+        )
+    expected_count = math.ceil(sample_count / batch_size)
+    assert sorted(assignments) == list(range(expected_count))
+    assert len(assignments) == len(set(assignments))
+    if expected_count:
+        assert sum(
+            _test_batch_take(
+                sample_count=sample_count,
+                batch_size=batch_size,
+                global_batch_index=index,
+            )
+            for index in range(expected_count)
+        ) == sample_count
+
+
+def test_3d_gathered_test_rows_restore_serial_global_batch_mean(monkeypatch) -> None:
+    rows_by_rank = [
+        [(0, {"total": 1.0, "direction": 10.0}), (2, {"total": 3.0, "direction": 30.0})],
+        [(1, {"total": 2.0, "direction": 20.0})],
+    ]
+    config = _DistributedConfig(
+        enabled=True,
+        rank=0,
+        local_rank=0,
+        world_size=2,
+        is_main=True,
+        backend="gloo",
+        device=torch.device("cpu"),
+    )
+
+    def fake_gather_object(local_rows, gathered, *, dst):
+        assert local_rows == rows_by_rank[0]
+        assert dst == 0
+        gathered[:] = rows_by_rank
+
+    monkeypatch.setattr("vesuvius.neural_tracing.fiber_trace_3d.train.dist.gather_object", fake_gather_object)
+    gathered = _distributed_gather_dense_test_rows(rows_by_rank[0], config)
+    assert [index for index, _row in sorted(gathered)] == [0, 1, 2]
+    assert _mean_dense_test_rows(gathered) == {"total": 2.0, "direction": 20.0}
+
+
+def test_3d_test_timing_prints_and_logs_tensorboard_scalar(capsys) -> None:
+    class Writer:
+        def __init__(self):
+            self.scalars = []
+
+        def add_scalar(self, tag, value, step):
+            self.scalars.append((tag, value, step))
+
+    writer = Writer()
+    _report_test_timing(step=1200, total_seconds=12.3456, writer=writer)
+    assert capsys.readouterr().out == "test_timing step=1200 total_seconds=12.346\n"
+    assert writer.scalars == [("timing/test_total_seconds", 12.3456, 1200)]
 
 
 def test_3d_distributed_config_defaults_to_single_process() -> None:
@@ -2772,6 +3150,8 @@ def test_3d_fiber_infer_writes_lasagna_presence_normal_products(tmp_path: Path) 
         levels=2,
         ome_chunk=4,
         pyramid_workers=1,
+        flush_workers=0,
+        accumulator_workers=0,
     )
 
     for channel_name in FIBER_TRACE_3D_PERSISTED_CHANNELS:
@@ -2792,7 +3172,15 @@ def test_3d_fiber_infer_writes_lasagna_presence_normal_products(tmp_path: Path) 
         assert group["channels"] == [channel_name]
         assert group["scaledown"] == 0
         assert group["zarr"] == f"fiber_out_{channel_name}.ome.zarr/0"
-    assert not (tmp_path / "fiber_trace_3d_inference.json").exists()
+    provenance = json.loads((tmp_path / "inference.json").read_text(encoding="utf-8"))
+    assert provenance["status"] == "completed"
+    assert provenance["artifact_kind"] == "fiber3d-prediction"
+    assert provenance["source_scale"]["requested_group"] == 0
+    assert provenance["inference"]["effective_base_factor"] == 1
+    assert len(provenance["inference"]["code_commit"]) == 40
+    assert set(provenance["inference"]["code_commit"]) <= set("0123456789abcdef")
+    assert len(provenance["artifacts"]) == 4
+    assert manifest["provenance"] == "inference.json"
     for raw_channel in FIBER_TRACE_3D_INTERNAL_CHANNELS:
         assert not (tmp_path / "fiber" / "option_000" / raw_channel).exists()
 
@@ -2803,6 +3191,7 @@ def test_3d_fiber_inference_scale_defaults_and_validates_all_axes() -> None:
     parameters = inspect.signature(run_fiber_trace_3d_inference).parameters
     assert parameters["inference_scaledown_power"].default == 2
     assert parameters["ome_chunk"].default == 64
+    assert parameters["ome_compressor"].default == "blosc-zstd"
     assert _input_scaledown_from_base((17, 33, 65), (5, 9, 17)) == 4
     with pytest.raises(ValueError, match="isotropic power-of-two"):
         _input_scaledown_from_base((17, 33, 65), (5, 17, 17))

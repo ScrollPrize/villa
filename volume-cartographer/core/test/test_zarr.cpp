@@ -130,6 +130,38 @@ TEST_CASE("writeZarrAttrs writes a parseable .zattrs at the volume path")
     fs::remove_all(d);
 }
 
+TEST_CASE("writeZarrAttrs derives per-axis scale from slice step and pixel density")
+{
+    auto d = tmpDir("attrs_axes");
+    writeZarrAttrs(/*outDir=*/d, /*volPath=*/d,
+                   /*groupIdx=*/1, /*baseZ=*/8,
+                   /*sliceStep=*/3.0, /*accumStep=*/0.0,
+                   /*accumTypeStr=*/"max", /*accumSamples=*/0,
+                   /*canvasSize=*/cv::Size(32, 32),
+                   /*CZ=*/8, /*CH=*/16, /*CW=*/16,
+                   /*baseVoxelSize=*/8.0, /*voxelUnit=*/"um",
+                   /*pixelsPerVoxel=*/2.0);
+    auto j = utils::Json::parse_file(d / ".zattrs");
+    auto scaleAt = [&](size_t level) {
+        return j["multiscales"][size_t(0)]["datasets"][level]
+                ["coordinateTransformations"][size_t(0)]["scale"]
+                .get_double_array();
+    };
+    // Z = 8 um * slice step 3; Y/X = 8 um / 2 pixels-per-voxel.
+    auto s0 = scaleAt(0);
+    REQUIRE(s0.size() == 3);
+    CHECK(s0[0] == doctest::Approx(24.0));
+    CHECK(s0[1] == doctest::Approx(4.0));
+    CHECK(s0[2] == doctest::Approx(4.0));
+    // Pyramid level 2 quadruples Y/X only; Z spacing is per-slice, unchanged.
+    auto s2 = scaleAt(2);
+    REQUIRE(s2.size() == 3);
+    CHECK(s2[0] == doctest::Approx(24.0));
+    CHECK(s2[1] == doctest::Approx(16.0));
+    CHECK(s2[2] == doctest::Approx(16.0));
+    fs::remove_all(d);
+}
+
 TEST_CASE("writeZarrRegionU8ByChunk writes data into multiple chunks")
 {
     auto d = tmpDir("region_chunks");

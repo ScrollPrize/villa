@@ -25,20 +25,29 @@ from __future__ import annotations
 
 import argparse
 import collections
+from contextlib import ExitStack
 import json
 import math
 import os
+from pathlib import Path
 import queue
 import random
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import uuid
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 import boto3
 import botocore.config
 import botocore.exceptions
 from botocore import UNSIGNED
+
+try:
+    from lasagna.live_omezarr_cache import SelectedLevelLock
+except ImportError:  # pragma: no cover - direct scripts/ execution.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from live_omezarr_cache import SelectedLevelLock
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +70,7 @@ def _get_s3_client(anon: bool, region: str | None = None):
             return client
     cfg = botocore.config.Config(
         max_pool_connections=4,
-        retries={"max_attempts": 0},
+        retries={"mode": "standard", "total_max_attempts": 5},
         connect_timeout=10,
         read_timeout=30,
     )
@@ -88,6 +97,8 @@ def _parse_s3_uri(uri: str) -> tuple[str, str]:
 
 _RATE_WINDOW = 10.0  # seconds for rolling speed average
 _REMOTE_INVENTORY_Z_PREFIX_LIMIT = 256
+_PROGRESS_HISTORY_INTERVAL = 60.0
+_DOWNLOAD_FUTURES_PER_WORKER = 2
 
 
 class Stats:
@@ -107,6 +118,7 @@ class Stats:
         self.inventory_failed = 0
         self.inventory_prefix = ""
         self.scan_done = False
+        self.scan_error: str | None = None
         self._lock = threading.Lock()
         self._t0 = time.monotonic()
         self._byte_samples: collections.deque[tuple[float, int]] = collections.deque()
@@ -155,6 +167,7 @@ class Stats:
                 "inventory_failed": self.inventory_failed,
                 "inventory_prefix": self.inventory_prefix,
                 "scan_done": self.scan_done,
+                "scan_error": self.scan_error,
                 "elapsed": now - self._t0,
                 "dl_elapsed": dl_elapsed,
                 "rate": rolling_rate,
@@ -185,6 +198,12 @@ class Stats:
         with self._lock:
             self.inventory_prefix = prefix
 
+    def finish_scan(self, error: BaseException | None = None) -> None:
+        with self._lock:
+            if error is not None:
+                self.scan_error = f"{type(error).__name__}: {error}"
+            self.scan_done = True
+
     def add_noremote(self, level: int, chunk_key: str) -> None:
         with self._lock:
             self.noremote_keys.setdefault(level, set()).add(chunk_key)
@@ -197,6 +216,10 @@ class Stats:
         with self._lock:
             self.noremote_keys.setdefault(level, set()).discard(chunk_key)
 
+    def snapshot_noremote(self) -> dict[int, set[str]]:
+        with self._lock:
+            return {int(level): set(keys) for level, keys in self.noremote_keys.items()}
+
 
 def _noremote_path(local_root: str, level: int) -> str:
     return os.path.join(local_root, ".dl_cache", f"{level}.noremote.json")
@@ -207,8 +230,18 @@ def _load_noremote(local_root: str, levels: list[int]) -> dict[int, set[str]]:
     for lvl in levels:
         p = _noremote_path(local_root, lvl)
         if os.path.isfile(p):
-            with open(p) as f:
-                result[lvl] = set(json.load(f))
+            try:
+                with open(p, encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if not isinstance(loaded, list) or any(not isinstance(key, str) for key in loaded):
+                    raise ValueError("expected a JSON list containing only string chunk keys")
+                result[lvl] = set(loaded)
+            except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                print(
+                    f"WARNING: ignoring invalid noremote cache for level {lvl} at {p}: {exc}",
+                    file=sys.stderr,
+                )
+                result[lvl] = set()
         else:
             result[lvl] = set()
     return result
@@ -216,27 +249,49 @@ def _load_noremote(local_root: str, levels: list[int]) -> dict[int, set[str]]:
 
 def _save_noremote(local_root: str, noremote: dict[int, set[str]]) -> None:
     for lvl, keys in noremote.items():
-        if not keys:
-            continue
         p = _noremote_path(local_root, lvl)
         os.makedirs(os.path.dirname(p), exist_ok=True)
-        with open(p, "w") as f:
-            json.dump(sorted(keys), f)
-            f.write("\n")
+        tmp = f"{p}.tmp.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
+        try:
+            with open(tmp, "x", encoding="utf-8") as f:
+                json.dump(sorted(keys), f)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, p)
+        except (OSError, TypeError, ValueError) as exc:
+            print(
+                f"WARNING: could not save advisory noremote cache for level {lvl} at {p}: {exc}",
+                file=sys.stderr,
+            )
+        finally:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                print(
+                    f"WARNING: could not remove temporary noremote cache {tmp}: {exc}",
+                    file=sys.stderr,
+                )
 
 
 # ---------------------------------------------------------------------------
 # S3 helpers using boto3 directly
 # ---------------------------------------------------------------------------
 
-def _s3_read_bytes(bucket: str, key: str, anon: bool) -> bytes:
-    client = _get_s3_client(anon)
+def _s3_read_bytes(
+    bucket: str, key: str, anon: bool, *, region: str | None = None,
+) -> bytes:
+    client = _get_s3_client(anon, region)
     resp = client.get_object(Bucket=bucket, Key=key)
     return resp["Body"].read()
 
 
-def _s3_read_json(bucket: str, key: str, anon: bool) -> dict:
-    return json.loads(_s3_read_bytes(bucket, key, anon))
+def _s3_read_json(
+    bucket: str, key: str, anon: bool, *, region: str | None = None,
+) -> dict:
+    return json.loads(_s3_read_bytes(bucket, key, anon, region=region))
 
 
 def _s3_exists(bucket: str, key: str, anon: bool) -> bool:
@@ -263,9 +318,11 @@ def _s3_list_prefix(bucket: str, prefix: str, anon: bool) -> list[str]:
     return result
 
 
-def _s3_iter_objects(bucket: str, prefix: str, anon: bool):
+def _s3_iter_objects(
+    bucket: str, prefix: str, anon: bool, *, region: str | None = None,
+):
     """Yield all object keys under prefix as S3 listing pages arrive."""
-    client = _get_s3_client(anon)
+    client = _get_s3_client(anon, region)
     paginator = client.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
@@ -312,6 +369,13 @@ def _parse_coord3(s: str) -> tuple[int, int, int]:
     if len(vals) != 3:
         raise argparse.ArgumentTypeError(f"expected 3 comma-separated ints, got {len(vals)}")
     return tuple(vals)  # type: ignore[return-value]
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 def _fmt_bytes(n: int) -> str:
@@ -647,7 +711,7 @@ def _scanner(
                 download_queue,
                 stats,
             )
-        stats.scan_done = True
+        stats.finish_scan()
         return
 
     inventory_groups: list[tuple[int, str, list[_ChunkItem]]] = []
@@ -719,20 +783,11 @@ def _scanner(
                     stats.discard_noremote(lvl, ckey)
                     stats.inc(scanned=1, remote=1)
                     _queue_item(download_queue, nonlocal_by_key[ckey])
-            except botocore.exceptions.ClientError as e:
-                print(
-                    f"\n  WARN: could not list {list_prefix} ({e}); using GET/404 discovery",
-                    file=sys.stderr,
-                )
+            except Exception as error:
                 stats.inc(inventory_failed=1)
-                for ckey, item in nonlocal_by_key.items():
-                    if ckey in found:
-                        continue
-                    if stats.is_noremote(lvl, ckey):
-                        stats.inc(scanned=1, missing_remote=1)
-                    else:
-                        stats.inc(scanned=1, remote=1)
-                        _queue_item(download_queue, item)
+                raise RuntimeError(
+                    f"remote inventory failed for s3://{bucket}/{list_prefix}: {error}"
+                ) from error
             else:
                 if stop_event.is_set():
                     continue
@@ -741,16 +796,53 @@ def _scanner(
                         continue
                     stats.add_noremote(lvl, ckey)
                     stats.inc(scanned=1, missing_remote=1)
-            finally:
                 stats.inc(inventory_done=1)
+            finally:
                 stats.set_inventory_prefix("")
 
-    stats.scan_done = True
+    stats.finish_scan()
+
+
+def _guarded_scanner(*args, **kwargs) -> None:
+    """Run the scanner and make every exit observable by the coordinator."""
+    stats = kwargs.get("stats")
+    if stats is None:
+        # `_scanner` receives Stats immediately before the stop event.
+        stats = args[-2]
+    try:
+        _scanner(*args, **kwargs)
+    except Exception as error:
+        stats.finish_scan(error)
 
 
 # ---------------------------------------------------------------------------
 # Downloader — one call per chunk, runs inside ThreadPoolExecutor
 # ---------------------------------------------------------------------------
+
+def _download_chunk_atomic(
+    bucket: str,
+    s3_key: str,
+    local_path: str,
+    anon: bool,
+    *,
+    region: str | None = None,
+) -> int:
+    """Download one raw chunk with a unique temporary file or raise."""
+    client = _get_s3_client(anon, region)
+    resp = client.get_object(Bucket=bucket, Key=s3_key)
+    data = resp["Body"].read()
+    os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
+    tmp_path = f"{local_path}.tmp.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
+    try:
+        with open(tmp_path, "wb") as f:
+            f.write(data)
+        os.replace(tmp_path, local_path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+    return len(data)
 
 def _download_one(
     bucket: str,
@@ -764,15 +856,8 @@ def _download_one(
 ) -> bool:
     for attempt in range(max_retries):
         try:
-            client = _get_s3_client(anon)
-            resp = client.get_object(Bucket=bucket, Key=s3_key)
-            data = resp["Body"].read()
-            os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
-            tmp_path = local_path + ".tmp"
-            with open(tmp_path, "wb") as f:
-                f.write(data)
-            os.replace(tmp_path, local_path)
-            stats.inc(downloaded=1, bytes_downloaded=len(data))
+            size = _download_chunk_atomic(bucket, s3_key, local_path, anon)
+            stats.inc(downloaded=1, bytes_downloaded=size)
             return True
         except botocore.exceptions.ClientError as e:
             code = e.response.get("Error", {}).get("Code", "")
@@ -789,10 +874,6 @@ def _download_one(
             if attempt == max_retries - 1:
                 print(f"\n  WARN: failed {s3_key}: {e}", file=sys.stderr)
                 stats.inc(failed=1)
-                try:
-                    os.unlink(local_path + ".tmp")
-                except OSError:
-                    pass
                 return False
             time.sleep(0.5 * (attempt + 1))
     return False
@@ -802,63 +883,198 @@ def _download_one(
 # Progress display
 # ---------------------------------------------------------------------------
 
+_PROGRESS_SIGNATURE_FIELDS = (
+    "total", "scanned", "local", "remote", "downloaded", "download_missing",
+    "missing_remote", "failed", "bytes", "inventory_total", "inventory_done",
+    "inventory_objects", "inventory_failed", "scan_done", "scan_error",
+)
+
+
+def _format_progress_line(s: dict) -> str:
+    total = s["total"]
+    if total <= 0:
+        return "[starting scan...]"
+
+    scanned = s["scanned"]
+    scan_pct = 100.0 * scanned / total
+    inventory_total = s["inventory_total"]
+    if s.get("scan_error"):
+        tag = "scan failed"
+    elif s["scan_done"]:
+        tag = "scan done"
+    elif inventory_total > 0:
+        tag = f"list {s['inventory_done']:,}/{inventory_total:,} scan {scan_pct:4.1f}%"
+    else:
+        tag = f"scan {scan_pct:4.1f}%"
+
+    need, estimated = _remaining_download_estimate(s)
+    chunk_rate = s["chunk_rate"]
+    avg_chunk_rate = s["avg_chunk_rate"]
+    eta_avg = (need / avg_chunk_rate) if avg_chunk_rate > 0 and need > 0 else None
+    eta_cur = (need / chunk_rate) if chunk_rate > 0 and need > 0 else None
+    dl_elapsed = s["dl_elapsed"]
+    avg_rate = s["bytes"] / max(dl_elapsed, 0.01) if dl_elapsed > 0 else 0.0
+    tilde = "~" if estimated else ""
+    download_missing = s["download_missing"]
+    inventory_failed = s["inventory_failed"]
+
+    return (
+        f"[{tag}] local: {s['local']:,} | to_dl: {tilde}{need:,} | "
+        f"done: {s['downloaded']:,} | missing: {s['missing_remote']:,}"
+        + (f" (+{download_missing:,} 404)" if download_missing else "")
+        + (
+            f" | listed: {s['inventory_objects']:,} obj"
+            + (f", {inventory_failed:,} fail" if inventory_failed else "")
+            if inventory_total > 0 else ""
+        )
+        + f" | rate: {chunk_rate:.1f} ch/s, {_fmt_bytes(int(s['rate']))}/s "
+        f"(avg {avg_chunk_rate:.1f} ch/s, {_fmt_bytes(int(avg_rate))}/s) | "
+        f"fail: {s['failed']} | ETA avg/cur: {tilde}{_fmt_duration(eta_avg)}/"
+        f"{tilde}{_fmt_duration(eta_cur)}"
+    )
+
+
+class _ProgressReporter:
+    """Select live updates and sparse newline-delimited history records."""
+
+    def __init__(self, history_interval: float = _PROGRESS_HISTORY_INTERVAL) -> None:
+        self.history_interval = history_interval
+        self.last_signature: tuple[object, ...] | None = None
+        self.last_line = ""
+        self.last_history_at: float | None = None
+        self.progress_since_history = False
+
+    def update(self, snapshot: dict, now: float) -> tuple[str, bool] | None:
+        signature = tuple(snapshot.get(field) for field in _PROGRESS_SIGNATURE_FIELDS)
+        changed = signature != self.last_signature
+        if self.last_history_at is None:
+            self.last_history_at = now
+        if changed:
+            self.last_signature = signature
+            self.last_line = _format_progress_line(snapshot)
+            if any(int(snapshot.get(field, 0) or 0) > 0 for field in (
+                "total", "scanned", "downloaded", "missing_remote", "inventory_objects",
+            )) or snapshot.get("scan_done") or snapshot.get("scan_error"):
+                self.progress_since_history = True
+
+        history_due = (
+            self.progress_since_history
+            and now - self.last_history_at >= self.history_interval
+        )
+        if history_due:
+            self.last_history_at = now
+            self.progress_since_history = False
+            return self.last_line, True
+        if changed:
+            return self.last_line, False
+        return None
+
+
+def _fit_live_progress(line: str, stream) -> str:
+    try:
+        if not stream.isatty():
+            return line
+        columns = os.get_terminal_size(stream.fileno()).columns
+    except (AttributeError, OSError, ValueError):
+        return line
+    limit = max(20, columns - 1)
+    if len(line) <= limit:
+        return line
+    tail = min(48, max(12, limit // 3))
+    return f"{line[:limit - tail - 3]}...{line[-tail:]}"
+
+
 def _progress_loop(stats: Stats, stop_event: threading.Event) -> None:
+    reporter = _ProgressReporter()
+    last_live_width = 0
     while not stop_event.is_set():
-        s = stats.snapshot()
-        total = s["total"]
-        scanned = s["scanned"]
-        local = s["local"]
-        remote = s["remote"]
-        downloaded = s["downloaded"]
-        download_missing = s["download_missing"]
-        missing_remote = s["missing_remote"]
-        failed = s["failed"]
-        byt = s["bytes"]
-        scan_done = s["scan_done"]
-        rate = s["rate"]
-        chunk_rate = s["chunk_rate"]
-        avg_chunk_rate = s["avg_chunk_rate"]
-        inventory_total = s["inventory_total"]
-        inventory_done = s["inventory_done"]
-        inventory_objects = s["inventory_objects"]
-        inventory_failed = s["inventory_failed"]
-
-        dl_elapsed = s["dl_elapsed"]
-        avg_rate = byt / max(dl_elapsed, 0.01) if dl_elapsed > 0 else 0.0
-
-        if total > 0:
-            scan_pct = 100.0 * scanned / total if total > 0 else 0.0
-            if scan_done:
-                tag = "scan done"
-            elif inventory_total > 0:
-                tag = f"list {inventory_done:,}/{inventory_total:,} scan {scan_pct:4.1f}%"
+        emission = reporter.update(stats.snapshot(), time.monotonic())
+        if emission is not None:
+            line, newline = emission
+            if newline:
+                sys.stderr.write(f"\r{line}\n")
+                last_live_width = 0
             else:
-                tag = f"scan {scan_pct:4.1f}%"
-            need, estimated = _remaining_download_estimate(s)
-            eta_avg = (need / avg_chunk_rate) if avg_chunk_rate > 0 and need > 0 else None
-            eta_cur = (need / chunk_rate) if chunk_rate > 0 and need > 0 else None
-
-            tilde = "~" if estimated else ""
-            line = (
-                f"\r[{tag}] local: {local:,} | to_dl: {tilde}{need:,} | "
-                f"done: {downloaded:,} | missing: {missing_remote:,}"
-                + (f" (+{download_missing:,} 404)" if download_missing else "")
-                + (
-                    f" | listed: {inventory_objects:,} obj"
-                    + (f", {inventory_failed:,} fail" if inventory_failed else "")
-                    if inventory_total > 0 else ""
-                )
-                + f" | rate: {chunk_rate:.1f} ch/s, {_fmt_bytes(int(rate))}/s "
-                f"(avg {avg_chunk_rate:.1f} ch/s, {_fmt_bytes(int(avg_rate))}/s) | "
-                f"fail: {failed} | ETA avg/cur: {tilde}{_fmt_duration(eta_avg)}/"
-                f"{tilde}{_fmt_duration(eta_cur)}  "
-            )
-        else:
-            line = "\r[starting scan...]  "
-
-        sys.stderr.write(line)
-        sys.stderr.flush()
+                live_line = _fit_live_progress(line, sys.stderr)
+                padding = " " * max(0, last_live_width - len(live_line))
+                sys.stderr.write(f"\r{live_line}{padding}")
+                last_live_width = len(live_line)
+            sys.stderr.flush()
         stop_event.wait(0.5)
+
+
+class _ScannerFailure(RuntimeError):
+    pass
+
+
+def _drain_download_queue(
+    download_queue: queue.Queue,
+    stats: Stats,
+    *,
+    bucket: str,
+    anon: bool,
+    workers: int,
+    local_root: str,
+    levels: list[int],
+) -> None:
+    """Download a bounded window of scanner results and surface scan failures."""
+    max_pending = max(1, workers * _DOWNLOAD_FUTURES_PER_WORKER)
+    pending: set = set()
+
+    def raise_if_scanner_failed() -> None:
+        error = stats.snapshot().get("scan_error")
+        if error:
+            for future in pending:
+                future.cancel()
+            raise _ScannerFailure(str(error))
+
+    def reap(*, block: bool) -> None:
+        nonlocal pending
+        if not pending:
+            return
+        done, pending = wait(
+            pending,
+            timeout=None if block else 0,
+            return_when=FIRST_COMPLETED,
+        )
+        for future in done:
+            future.result()
+
+    with ExitStack() as locks:
+        for level in sorted(set(int(value) for value in levels)):
+            locks.enter_context(SelectedLevelLock(
+                Path(local_root), level, exclusive=True,
+            ))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            while True:
+                raise_if_scanner_failed()
+                if len(pending) >= max_pending:
+                    reap(block=True)
+                    continue
+                try:
+                    item = download_queue.get(timeout=0.2)
+                except queue.Empty:
+                    reap(block=False)
+                    raise_if_scanner_failed()
+                    if stats.snapshot()["scan_done"] and download_queue.empty():
+                        break
+                    continue
+                if item is None:
+                    break
+                lvl, s3key, lpath, ckey = item
+                pending.add(pool.submit(
+                    _download_one,
+                    bucket,
+                    s3key,
+                    lpath,
+                    anon,
+                    stats,
+                    level=lvl,
+                    chunk_key=ckey,
+                ))
+
+            while pending:
+                reap(block=True)
 
 
 # ---------------------------------------------------------------------------
@@ -882,7 +1098,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Rectangular half-size in all dims (used with --center)")
     p.add_argument("--zrange", default=None,
                    help="Z slice range at scale 0: z0,z1 (downloads all X/Y for that Z range)")
-    p.add_argument("--workers", type=int, default=64,
+    p.add_argument("--workers", type=_positive_int, default=64,
                    help="Parallel download threads (default: 64)")
     p.add_argument("--order", choices=("z", "morton", "random"), default="z",
                    help="Chunk queue order: z is z-major z/y/x, morton is a Z-order curve (default: z)")
@@ -1022,7 +1238,7 @@ def main(argv: list[str] | None = None) -> int:
     stop_evt = threading.Event()
 
     scanner_thread = threading.Thread(
-        target=_scanner,
+        target=_guarded_scanner,
         args=(bucket, prefix, local_root, levels_meta, bbox_zyx,
               multiscales, local_chunk_keys, anon, not args.no_remote_inventory, args.order,
               dl_queue, st, stop_evt),
@@ -1035,43 +1251,50 @@ def main(argv: list[str] | None = None) -> int:
     scanner_thread.start()
     progress_thread.start()
 
-    n_workers = args.workers
-
-    def _drain_queue() -> None:
-        futures: list = []
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            while True:
-                try:
-                    item = dl_queue.get(timeout=0.2)
-                except queue.Empty:
-                    if st.scan_done and dl_queue.empty():
-                        break
-                    continue
-                if item is None:
-                    break
-                lvl, s3key, lpath, ckey = item
-                fut = pool.submit(_download_one, bucket, s3key, lpath, anon, st,
-                                  level=lvl, chunk_key=ckey)
-                futures.append(fut)
-            for f in as_completed(futures):
-                f.result()
-
+    scanner_failure: _ScannerFailure | None = None
+    interrupted = False
     try:
-        _drain_queue()
+        _drain_download_queue(
+            dl_queue,
+            st,
+            bucket=bucket,
+            anon=anon,
+            workers=args.workers,
+            local_root=local_root,
+            levels=levels,
+        )
+    except _ScannerFailure as error:
+        scanner_failure = error
     except KeyboardInterrupt:
-        print("\nInterrupted — stopping...", file=sys.stderr)
+        interrupted = True
         stop_evt.set()
 
     stop_evt.set()
     scanner_thread.join(timeout=5)
+    progress_thread.join(timeout=2)
 
-    _save_noremote(local_root, st.noremote_keys)
+    _save_noremote(local_root, st.snapshot_noremote())
 
     # Store S3 source URI in local .zattrs so predict3d can re-download
-    _store_download_meta(local_root, remote_root, anon, args.region)
+    initialize_download_source(local_root, remote_root, anon, args.region)
 
     snap = st.snapshot()
     sys.stderr.write("\n")
+    if scanner_failure is not None:
+        print(f"ERROR: S3 inventory scan stopped: {scanner_failure}", file=sys.stderr)
+        print(
+            f"Incomplete but resumable: {snap['downloaded']:,} chunks "
+            f"({_fmt_bytes(snap['bytes'])}) downloaded; rerun the same command.",
+            file=sys.stderr,
+        )
+        return 1
+    if interrupted:
+        print(
+            f"Interrupted; partial download is resumable "
+            f"({snap['downloaded']:,} chunks, {_fmt_bytes(snap['bytes'])}).",
+            file=sys.stderr,
+        )
+        return 130
     print(
         f"Complete: {snap['total']:,} chunks "
         f"({snap['local']:,} cached + {snap['downloaded']:,} downloaded"
@@ -1084,9 +1307,10 @@ def main(argv: list[str] | None = None) -> int:
     return 1 if snap["failed"] else 0
 
 
-def _store_download_meta(local_root: str, source_uri: str, anon: bool,
-                         region: str | None = None) -> None:
+def initialize_download_source(local_root: str, source_uri: str, anon: bool,
+                               region: str | None = None) -> None:
     """Write _download metadata into local .zattrs for later re-download."""
+    os.makedirs(local_root, exist_ok=True)
     zattrs_path = os.path.join(local_root, ".zattrs")
     if os.path.isfile(zattrs_path):
         with open(zattrs_path) as f:
@@ -1116,6 +1340,9 @@ def download(
 
     Returns 0 on success, 1 on failure.
     """
+    workers = int(workers)
+    if workers <= 0:
+        raise ValueError("workers must be a positive integer")
     argv = [source, dest]
     if scales is not None:
         argv += ["--scales", ",".join(str(s) for s in scales)]

@@ -784,6 +784,20 @@ wheels = [
 ]
 
 [[package]]
+name = "libigl"
+version = "2.6.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "scipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/b9/2d/595f3ba33701b2354723821e38745674ae9b21ec79d18d7757dbe2e893c3/libigl-2.6.2.tar.gz", hash = "sha256:5da0c5d889a66e3e90eefe6b7f0e7239ade6ac94353585f1b5b086bb1372599e", size = 41219283, upload-time = "2026-03-05T17:28:03.963Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/98/99/99422c55a722afea4cd25c8d6c2fd5f432be564a12cfa18a2aae7160abff/libigl-2.6.2-cp312-abi3-macosx_11_0_arm64.whl", hash = "sha256:9b477b584277def1fbf99c05a9ca59c96ad09f6e6572ac58b88ac73c7f3f7ac9", size = 11257225, upload-time = "2026-03-05T17:27:50.124Z" },
+    { url = "https://files.pythonhosted.org/packages/e1/9f/3c6994d112759d25b00007384651157dabf955c61a62050de4fadea794f2/libigl-2.6.2-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e92dac380ec1f81d87a6f5423b2de228e106f90edb9c14033984210c23b32854", size = 12820764, upload-time = "2026-03-05T17:27:52.08Z" },
+]
+
+[[package]]
 name = "markupsafe"
 version = "3.0.3"
 source = { registry = "https://pypi.org/simple" }
@@ -1720,6 +1734,7 @@ dependencies = [
     { name = "imageio" },
     { name = "kimimaro", extra = ["all"] },
     { name = "kornia" },
+    { name = "libigl" },
     { name = "matplotlib" },
     { name = "networkx" },
     { name = "numpy" },
@@ -1731,6 +1746,7 @@ dependencies = [
     { name = "s3fs" },
     { name = "scipy" },
     { name = "tensorstore" },
+    { name = "threadpoolctl" },
     { name = "tifffile" },
     { name = "torchdiffeq" },
     { name = "tqdm" },
@@ -1748,6 +1764,7 @@ requires-dist = [
     { name = "imageio", specifier = ">=2.37.3" },
     { name = "kimimaro", extras = ["all"], specifier = ">=5.8.1" },
     { name = "kornia", specifier = ">=0.8.3" },
+    { name = "libigl", specifier = ">=2.6.1" },
     { name = "matplotlib", specifier = ">=3.11.0" },
     { name = "networkx", specifier = ">=3.6.1" },
     { name = "numpy", specifier = ">=2.5.0" },
@@ -1759,6 +1776,7 @@ requires-dist = [
     { name = "s3fs", specifier = ">=2026.6.0" },
     { name = "scipy", specifier = ">=1.18.0" },
     { name = "tensorstore", specifier = ">=0.1.80" },
+    { name = "threadpoolctl", specifier = ">=3.6.0" },
     { name = "tifffile", specifier = ">=2026.6.1" },
     { name = "torchdiffeq", specifier = ">=0.2.5" },
     { name = "tqdm", specifier = ">=4.68.3" },
@@ -1798,6 +1816,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/01/99/2ea3b37864adb2e9f6e724c6959ab2b7f56aa4dad01964d4b32adf211e68/tensorstore-0.1.84-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:98e10cae5b3fc0828967b8ddf36242b3b26ac8bc79880bc3e36346063259212a", size = 14990904, upload-time = "2026-05-16T06:17:51.464Z" },
     { url = "https://files.pythonhosted.org/packages/ff/26/fe72887d7b91e832bef3033d244c4c548993d1b6fb19177dff3895659c12/tensorstore-0.1.84-cp314-cp314t-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:98edbc57d453ba8ebcf0d19bc28e4de6de95922bee2eca0805955b0833b8ce26", size = 19365698, upload-time = "2026-05-16T06:17:53.748Z" },
     { url = "https://files.pythonhosted.org/packages/37/74/35a1d41343f86f6e2ef135e81f6b8107b9f16c777a3e8be9e3fbce541d18/tensorstore-0.1.84-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:0bd20de85c1b83dd3ca94db24e7bd449bdb055590a1b162b05691f6b81fff00f", size = 20986107, upload-time = "2026-05-16T06:17:56.571Z" },
+]
+
+[[package]]
+name = "threadpoolctl"
+version = "3.6.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/b7/4d/08c89e34946fce2aec4fbb45c9016efd5f4d7f24af8e5d93296e935631d8/threadpoolctl-3.6.0.tar.gz", hash = "sha256:8ab8b4aa3491d812b623328249fab5302a68d2d71745c8a4c719a2fcaba9f44e", size = 21274, upload-time = "2025-03-13T13:49:23.031Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/32/d5/f9a850d79b0851d1d4ef6456097579a9005b31fea68726a4ae5f2d82ddd9/threadpoolctl-3.6.0-py3-none-any.whl", hash = "sha256:43a0b8fd5a2928500110039e43a5eed8480b918967083ea48dc3ab9f13c4a7fb", size = 18638, upload-time = "2025-03-13T13:49:21.846Z" },
 ]
 
 [[package]]
