@@ -22,10 +22,11 @@ __all__ = [
 # --------------------------------------------------------------------------- #
 
 def _prepare_image(image: np.ndarray, target_dtype: np.dtype | type = DEFAULT_TARGET_DTYPE) -> np.ndarray:
+    # copy: the normalisers rescale in place, so this must not alias the caller's array
     arr = np.asarray(image)
     if target_dtype is not None:
-        arr = arr.astype(target_dtype, copy=False)
-    return arr
+        return arr.astype(target_dtype, copy=True)
+    return arr.copy()
 
 
 def _prepare_mask(mask: np.ndarray, image_shape: Tuple[int, ...]) -> np.ndarray:

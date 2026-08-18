@@ -10,6 +10,7 @@
 #include "utils/Json.hpp"
 #include "vc/core/types/ChunkedTensor.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/tracer/Tracer.hpp"
 
@@ -343,7 +344,8 @@ int main(int argc, char *argv[])
         std::cerr << std::endl;
         return EXIT_FAILURE;
     }
-    volume->setCacheBudget(size_t(params.value("cache_size", 1e9)));
+    vc::render::processChunkCacheService()->configureDecodedByteCapacity(
+        size_t(params.value("cache_size", 1e9)));
     auto* chunk_cache = volume->chunkedCache();
     const std::array<int, 3> volume_shape_zyx{
         volume->numSlices(),

@@ -36,16 +36,83 @@ lasagna-download-list --help
 lasagna-preprocess --help
 lasagna-preprocess integrate --help
 lasagna-preprocess predict3d --help
+las_manager --help
 ```
 
 The bootstrap installs Lasagna with `-e`, so changes in this checkout are
-immediately visible in the environment without reinstalling.
+immediately visible in the environment without reinstalling. The distribution
+also exposes the sibling Vesuvius Fiber packages and canonical `lasagna.*`
+modules; direct and managed inference do not require `PYTHONPATH`.
 
-This installation currently expects the `villa` monorepo layout: Lasagna uses
-the sibling `vesuvius/src` model implementation and installs its declared model
-dependencies. It deliberately does not build Volume Cartographer, which is not
-needed for preprocessing. Copying only the `lasagna/` directory is therefore
-not yet a supported standalone installation.
+### Inference manager
+
+`las_manager` provides configuration, discovery, prefetch, and durable tmux
+execution for managed Fiber and Lasagna inference. Initialize its XDG configuration, fill
+in `cache_dir`, `output_dir`, `venv`, and one or more `snapshot_dirs`, then:
+
+```bash
+las_manager config init
+${EDITOR:-vi} "${XDG_CONFIG_HOME:-$HOME/.config}/las_manager/config.toml"
+las_manager fetch
+las_manager volume ls --sample PHerc0332
+las_manager snapshot ls
+las_manager volume prefetch <volume> 1 --workers 512
+las_manager inference run <snapshot> <volume> 1 -- --devices all
+las_manager inference ls
+```
+
+Fresh configs include shared inference defaults equivalent to
+`--tile-size 512 --border 32 --overlap 96 --devices all` in the `params` token
+array. Edit that array globally or append arguments after `--` for a single-run
+override.
+
+`inference run` returns as soon as its run directory and detached tmux session
+are created. The tmux workflow performs automatic prefetch first and inference
+second; use `las_manager run ls`, `las_manager tmux attach <run>`, or follow the
+printed run directory's `run.log`. Passing `--no-prefetch` writes only the
+source descriptor and lets the inference backend download missing chunks on
+demand for its crop; this download belongs to the inference lifecycle.
+
+Current Fiber checkpoints carry their authoritative inference config, so no
+separate config argument is needed. Direct inference uses the same rule:
+
+```bash
+python -m vesuvius.neural_tracing.fiber_trace_3d.infer \
+  --input /path/to/volume.ome.zarr/1 \
+  --output /path/to/artifacts/fiber.lasagna.json \
+  --checkpoint /path/to/snapshots/best.pt
+```
+
+Pass a config JSON as the optional positional argument only for a legacy
+checkpoint without embedded config. Every run writes portable
+`inference.json` next to the output manifest, including the exact Villa Git
+commit in `inference.code_commit`.
+
+Direct Lasagna checkpoints are listed under `lasagna/...` selectors and use
+the same command shape:
+
+```bash
+las_manager inference run lasagna/<run>/<checkpoint.pt> <volume> 1 -- --devices all
+```
+
+The manager dispatches these to `preprocess_cos_omezarr predict3d`; both direct
+and managed Lasagna inference write portable provenance and remain compatible
+with the existing Atlas `lasagna` artifact type.
+
+Commands and subcommands accept unique prefixes, so `las_manager sn l` is the
+same as `las_manager snapshot ls`. Install path-aware Bash completion once with
+`las_manager completion install`; it follows whichever registered venv's
+`las_manager` is currently selected by `PATH`. Configuration, cache semantics,
+and selector details are documented in [`docs/manager.md`](docs/manager.md).
+Cached volumes, snapshots, runs, option values, and locally known OME scale
+indices are completed contextually. A final `help` token shows help for the
+longest recognized command prefix, for example `las_manager vol pre help`.
+
+This installation currently expects the `villa` monorepo layout: Lasagna
+packages the sibling `vesuvius/src` implementation and installs its declared
+model dependencies. It deliberately does not build Volume Cartographer, which
+is not needed for preprocessing. Copying only the `lasagna/` directory is
+therefore not yet a supported standalone installation.
 
 ### Batch-download the PHerc scale-0 volumes
 
@@ -204,6 +271,12 @@ runner:
 lasagna-preprocess predict3d ... --devices all
 ```
 
+New Fiber and Lasagna `predict3d` OME-Zarr arrays use the same Zarr-v2
+Blosc/Zstd compressor (`clevel=3`, byte shuffle) at every pyramid level.
+Existing arrays keep their compressor when inference resumes; a mismatch is
+reported. Use `--ome-compressor none` only when uncompressed compatibility
+output is required.
+
 Use a subset with `--devices cuda:0,cuda:2`. Input tiles default to asynchronous
 TensorStore bounding-box reads outside GPU workers. The tile Cartesian product
 is generated lazily and read-ahead is bounded independently from reusable GPU
@@ -258,6 +331,25 @@ Automatic S3 chunk fetching defaults to 64 transfer threads. Set it separately
 from inference prefetch with, for example, `--download-workers 256`. Interrupted
 or malformed `.dl_cache/*.noremote.json` files are advisory: they are ignored
 with a warning and rewritten atomically rather than aborting inference.
+
+For full-volume inference when one selected input scale is too large to keep,
+enable the shared rolling disk cache:
+
+```bash
+lasagna-preprocess predict3d ... --input /cache/volume.zarr/0 --live-fetch
+python -m vesuvius.neural_tracing.fiber_trace_3d.infer ... \
+  --input /cache/volume.zarr/0 --live-fetch
+```
+
+The local OME root must contain `_download` S3 metadata. The defaults are a
+10 TiB selected-scale target (`--live-cache-gib 10240`) and 10,000 lazy tile
+descriptors (`--live-fetch-ahead-tiles 10000`); this disk window is separate
+from TensorStore's much smaller `--prefetch-tiles-per-gpu` array window. Only
+whole input Z-chunk planes safely behind a fully committed model row are
+removed. Cache pressure may temporarily exceed the target when no obsolete
+plane is safe. Live mode is intentionally full-volume only, conflicts with
+`--no-download`, and currently rejects a separately remote Lasagna `--pred-dt`.
+Interrupted runs retain atomically completed chunks and can be rerun directly.
 
 ### Multi-axis processing
 

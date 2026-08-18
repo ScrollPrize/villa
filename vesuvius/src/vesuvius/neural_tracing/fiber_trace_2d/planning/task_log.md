@@ -1,81 +1,92 @@
-# Task log: process-parallel native accumulation
+# Task log: rolling live OME-Zarr input cache for shared 3D inference
 
-## Baseline
+## Planning findings
 
-- Current accumulation is synchronous in the coordinator. Real-run
-  `commit_sum` was 14.1 s for 294 processed tiles within 68.6 s inference.
-- Controlled four-channel 32x256x256 ring, eight-addition, five-iteration
-  benchmark: NumPy float32 0.0443 s mean with 32 MiB backing; NumPy float16
-  0.2931 s with 16 MiB backing (6.6x slower).
-- Target CPU is dual-socket Intel Xeon Platinum 8480+ (224 logical CPUs) with
-  AVX-512F, F16C, and AVX-512-FP16. The implementation must remain portable to
-  Ubuntu/macOS and amd64/arm64 through runtime dispatch and scalar fallback.
+- Bulk auto-download currently completes before inference. TensorStore's
+  existing bounded read-ahead only reads already-local chunks and is not a
+  remote materialization cache.
+- The shared runner currently uses transient local chunk existence both to
+  skip model tiles and to classify supported output chunks. Live caching must
+  make these checks authoritative against remote inventory or an initially
+  empty/evicted cache can incorrectly suppress valid inference.
+- Canonical traversal is Z-major with lazily materialized axis lattices. The
+  live window can therefore remain bounded at 10,000 events and a safe eviction
+  frontier can advance only after a complete canonical model Z row commits.
+- At the current 512/96/32 defaults, PHercParis4 scale 0 has 6,241 tiles per
+  model Z row. A 10,000-tile window spans at most three model Z positions and
+  approximately 7--12 128-voxel input Zarr planes. The configured 10 TiB cache
+  target is much larger than the immediate forward working set.
+- A conservative target requires no ahead/LRU deletion: when over target,
+  delete oldest whole planes strictly behind the safe boundary; if none are
+  available, report and temporarily remain over target.
+- `preprocess_cos_omezarr.py` still contains a duplicated automatic-download
+  wrapper even though Fiber imports the shared runner helper. This task will
+  remove that divergence rather than add another backend-specific cache path.
+- Independent review required remote inventory to remain active-plane bounded,
+  clarified sparse-plane eviction, preserved `.noremote` as advisory only,
+  separated the 10,000 descriptor/materialization window from the much smaller
+  TensorStore tile-array window, and strengthened local accounting, metadata
+  validation, shared/exclusive locking, and fatal transport-error behavior.
+- Current uncommitted downloader retry/progress/scanner-failure changes are the
+  baseline for this task and must be preserved rather than rewritten away.
 
-## Plan review
+## Deviations
 
-Independent review required precise half-to-float add semantics, ISA-matched
-runtime dispatch, stable per-worker FIFO ownership, nonblocking submission with
-ack pumping, provisional activity failure safety, coordinator-owned ring
-generations, all-scale slot reference counts, flush-frontier invariants,
-strided/unaligned/tail validation, inspectable/forceable native backends,
-explicit cache/queue cleanup, backpressure diagnostics, adversarial ordering and
-failure tests, and separate kernel/pipeline benchmarks. The plan incorporates
-these requirements.
+- Live fetching initially manages only the primary selected input scale.
+  Lasagna `pred_dt` is an independent post-inference external source; live mode
+  rejects a separately remote `pred_dt` rather than silently materializing a
+  second unbounded cache. Already-local `pred_dt` behavior remains unchanged.
+- S3 list responses are consumed as keys, not object-size projections. Progress
+  therefore reports exact completed resident/downloaded bytes, current transfer
+  rate, and in-flight chunk count, but does not invent a projected-byte total.
+  Actual completed bytes remain the sole eviction trigger as required.
 
 ## Implementation
 
-- Added `accumulator_add.cpp` as a second pybind11 extension. It accepts
-  arbitrary positive Y/Z strides with contiguous X rows, releases the GIL,
-  supports float16 and float32 destinations, and has forceable `scalar`,
-  `avx512`, and `auto` dispatch modes. AVX-512 is isolated behind GCC/Clang
-  target attributes and runtime AVX-512F+F16C detection; no global ISA flag is
-  used.
-- Added persistent spawn-context accumulator processes to the authoritative
-  shared runner. Queue items contain only shared-slot/mmap descriptors and
-  slices. Stable integer spatial ownership plus one bounded FIFO per worker
-  serializes every output chunk without locks.
-- The coordinator owns ring generation and activity metadata, retains result
-  slots until all task acknowledgements, pumps acknowledgements under queue
-  backpressure, and gates reservation at Z-row transitions. Activity is
-  committed only after successful worker completion, before canonical progress
-  and flush handling.
-- Added `--accumulator-workers` to both Fiber and Lasagna frontends, defaulting
-  to `min(CPU count, 32)`; zero uses the synchronous path. Added startup/backend
-  and task/work/queue/wall/rate diagnostics.
-- Product rings now default to float16; weights remain float32. Float32 remains
-  selectable explicitly.
+- Added `lasagna/live_omezarr_cache.py` with selected-level metadata validation,
+  authoritative lazy per-Z remote inventory, atomic retrying raw-chunk transfer,
+  aggregate local accounting, shared/exclusive advisory locking, and
+  conservative whole-plane eviction.
+- Kept canonical event generation lazy while separating the 10,000-item live
+  materialization window from the existing bounded TensorStore/full-tile read
+  window. Durable completed outputs are skipped before fetch. Serial and
+  multi-device paths call the same shared scheduler.
+- Changed live source-support checks to use authoritative remote inventory,
+  never transient local cache contents or `.noremote` state.
+- Removed the duplicate Lasagna downloader implementation and routed Fiber and
+  Lasagna through the shared automatic-download helper. Bulk download takes the
+  same exclusive selected-level lock used by live mutation; ordinary tiled
+  readers take a shared lock.
+- Added Fiber, Lasagna, and manager CLI flags, manager completion, source-link
+  initialization without bulk prefetch, portable provenance, and final manager
+  cache statistics. Normal non-live prefetch and no-prefetch behavior remains
+  unchanged.
+- Made progress refresh once per second through both terminals and manager
+  pipes, with newline history checkpoints at most once per minute while work
+  advances. Remote-missing accounting now counts each absent chunk once when
+  its Z-plane inventory is first listed instead of counting overlapping tile
+  requests repeatedly.
+- Updated shared inference specs, code-structure documentation, Lasagna README,
+  manager documentation, and changelog.
 
-## Validation and measurements
+## Validation
 
-- Manual baseline-ISA build (Python 3.14, GCC, pybind11 headers from the local
-  build cache) succeeded; runtime backend on the Xeon 8480+ is `avx512`.
-- Exhaustive 65,536-value binary16 input validation for one float32 addition
-  matches NumPy bit-for-bit for all finite outputs in both forced scalar and
-  automatic AVX-512 modes; NaN masks also match. This found and corrected an
-  initial scalar subnormal exponent error.
-- Strided Y/Z, unaligned X, and 37-element tail views match NumPy for float16
-  and float32.
-- Focused shared-runner regression passed: synchronous versus two CPU device
-  workers plus two accumulator processes produced exactly equal output chunks
-  with float16 product rings; scratch mmaps were cleaned.
-- Kernel benchmark command used a `(16,512,512)` float16 destination and
-  float32 source, eight repeated adds, seven iterations. NumPy median was
-  142.507 ms (mean 142.316, min 141.391, max 143.150); AVX-512 median was
-  7.653 ms (mean 7.654, min 7.644, max 7.663), an 18.6x median kernel speedup.
-  Forced portable scalar median was 331.671 ms. This is a kernel benchmark, not
-  an end-to-end volume throughput claim.
-
-## Deviations and limitations
-
-- The serial baseline continues through the existing `_accumulate_group`
-  coordinator routine instead of being mechanically expressed as process task
-  descriptors; it does use the same native add primitive. This keeps the
-  zero-worker diagnostic path small while exact serial/process output coverage
-  validates the two planners.
-- The environment lacks `pytest`, so pytest suites were not run. Focused
-  `unittest` cases and Python compile checks passed. A full unittest-module run
-  was stopped after it made no progress in an unrelated early test; the focused
-  affected tests were rerun individually.
-- No representative full-volume eight-GPU run was launched by the agent. The
-  new accumulator diagnostics are intended for the user's next real inference
-  comparison; no end-to-end speedup is claimed here.
+- `python -m py_compile` passed for the new cache, shared runner, downloader,
+  both inference entry points, and manager modules.
+- `pytest lasagna/tests/test_live_omezarr_cache.py
+  lasagna/tests/test_live_tiled_predict3d.py
+  lasagna/tests/test_download_omezarr.py lasagna/tests/test_manager.py -q`:
+  **77 passed**.
+- Two focused legacy shared-runner tests covering normal Python-Zarr/TensorStore
+  serial equivalence and lazy canonical events: **2 passed**.
+- Fiber CLI/signature tests including live options and invalid combinations:
+  **7 passed, 199 deselected**.
+- Fiber, Lasagna, and manager `--help` smoke checks expose all three live flags.
+- `git diff --check` passed.
+- Focused progress/missing-accounting regression validation: **11 passed**.
+- No real S3/full-volume performance run was made, so no throughput or peak-cache
+  claim is reported. The focused synthetic tests verify window ordering,
+  pre-fetch resume rejection, selected-scale isolation, exact accounting, and
+  safe-plane deletion. A broader local suite attempt encountered an existing
+  Zarr 3/Python 3.14 synchronous `open_group` stall in an unrelated atomic-output
+  test; the focused normal-runner tests complete successfully.

@@ -2,6 +2,7 @@
 
 
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/render/ChunkCache.hpp"
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/core.hpp>
@@ -410,7 +411,8 @@ int main(int argc, char *argv[])
         std::cerr << std::endl;
         return EXIT_FAILURE;
     }
-    volume.setCacheBudget(cfg.cache_bytes);
+    vc::render::processChunkCacheService()->configureDecodedByteCapacity(
+        cfg.cache_bytes);
     auto* chunk_cache = volume.chunkedCache();
 
     const auto shape = chunk_cache->shape(level);

@@ -3,6 +3,7 @@
 
 
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/render/ChunkCache.hpp"
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/core.hpp>
@@ -89,7 +90,8 @@ int main(int argc, char *argv[])
     cv::Size tgt_size = {3840, 2160};
 
     Volume volume(vol_path);
-    volume.setCacheBudget(size_t(10e9));
+    vc::render::processChunkCacheService()->configureDecodedByteCapacity(
+        size_t(10e9));
     constexpr int renderLevel = 1;
     if (!volume.hasScaleLevel(renderLevel)) {
         // Sparse pyramids keep absent levels as {0,0,0} placeholders; reading

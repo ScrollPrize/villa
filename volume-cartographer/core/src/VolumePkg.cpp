@@ -188,6 +188,11 @@ std::string tagValueWithPrefix(const std::vector<std::string>& tags, std::string
     return {};
 }
 
+// Note that this deliberately disagrees with sameAttachmentLocation() for
+// remote locators: two selector-free locators are deduped there when they
+// resolve to the same source URL, and kept distinct here unless the strings
+// match. Pre-existing, and left alone, but it means attach/match and
+// persisted-entry dedupe can reach different answers for the same pair.
 bool samePersistedVolumeIdentity(const std::string& a, const std::string& b)
 {
     if (a == b)
@@ -216,6 +221,20 @@ fs::path absoluteLocalPath(
     return path.lexically_normal();
 }
 
+// Do two already-absolute, lexically normalized paths name the same thing?
+// A lexical comparison cannot see through a symlink, and the two sides do not
+// always arrive in the same spelling: load() keeps path_ verbatim and the open
+// dialog does not resolve links. fs::equivalent needs both paths to exist and
+// reports through the error_code, so the lexical answer stays authoritative for
+// locations that have not been created yet.
+bool samePathOnDisk(const fs::path& a, const fs::path& b)
+{
+    if (a == b)
+        return true;
+    std::error_code ec;
+    return fs::equivalent(a, b, ec);
+}
+
 bool sameAttachmentLocation(
     const std::string& a,
     const std::string& b,
@@ -226,8 +245,9 @@ bool sameAttachmentLocation(
     if (aRemote != bRemote)
         return false;
     if (!aRemote) {
-        return absoluteLocalPath(a, projectDirectory) ==
-               absoluteLocalPath(b, projectDirectory);
+        return samePathOnDisk(
+            absoluteLocalPath(a, projectDirectory),
+            absoluteLocalPath(b, projectDirectory));
     }
     try {
         const auto aSpec = vc::parseRemoteVolumeSpec(a);
@@ -258,7 +278,7 @@ bool entryBacksAttachmentLocation(
     try {
         return fs::is_directory(entryPath) &&
                !isSingleZarrVolumeDir(entryPath) &&
-               attachmentPath.parent_path() == entryPath &&
+               samePathOnDisk(attachmentPath.parent_path(), entryPath) &&
                isSingleZarrVolumeDir(attachmentPath);
     } catch (const fs::filesystem_error&) {
         return false;
@@ -280,8 +300,9 @@ bool loadedVolumeMatchesLocation(
     auto loadedPath = volume->path();
     if (loadedPath.is_relative())
         loadedPath = fs::absolute(loadedPath);
-    return loadedPath.lexically_normal() ==
-           absoluteLocalPath(location, projectDirectory);
+    return samePathOnDisk(
+        loadedPath.lexically_normal(),
+        absoluteLocalPath(location, projectDirectory));
 }
 
 std::vector<fs::path> immediateSubdirs(const fs::path& dir)

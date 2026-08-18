@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -185,12 +186,19 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     check = (
         "import json, torch; "
+        "import vesuvius.neural_tracing.fiber_trace_3d.infer as fiber_infer; "
         "print(json.dumps({'torch': torch.__version__, "
-        "'torch_cuda': torch.version.cuda, 'cuda_available': torch.cuda.is_available()})); "
+        "'torch_cuda': torch.version.cuda, 'cuda_available': torch.cuda.is_available(), "
+        "'fiber_infer': fiber_infer.__file__})); "
         f"raise SystemExit(0 if {backend == 'cpu' or args.skip_cuda_check!r} "
         "or torch.cuda.is_available() else 1)"
     )
-    result = subprocess.run([str(venv_python), "-c", check], check=False)
+    check_environment = dict(os.environ)
+    check_environment.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [str(venv_python), "-c", check], check=False, cwd=venv,
+        env=check_environment,
+    )
     if result.returncode != 0:
         raise SystemExit(
             "PyTorch installed, but CUDA is unavailable. Check nvidia-smi/driver access "

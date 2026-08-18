@@ -220,6 +220,50 @@ test("does not retry non-idempotent Drive copies after an ambiguous network fail
   assert.equal(mock.calls.length, 1);
 });
 
+test("creates one private managed Spreadsheet in the explicit Shared Drive folder", async () => {
+  const { client, mock } = clientFor([jsonResponse({ id: "monthly-sheet" })]);
+
+  await client.createFile({
+    name: "August 2026 Progress Prize Responses",
+    mimeType: "application/vnd.google-apps.spreadsheet",
+    parentId: "private-active-folder",
+    appProperties: {
+      managedBy: "scrollprize-progress-prizes",
+      role: "responses",
+      cycle: "2026-08",
+    },
+  });
+
+  assert.equal(mock.calls[0].url.pathname, "/drive/v3/files");
+  assert.equal(mock.calls[0].url.searchParams.get("supportsAllDrives"), "true");
+  assert.equal(mock.calls[0].url.searchParams.get("ignoreDefaultVisibility"), "true");
+  assert.deepEqual(JSON.parse(mock.calls[0].options.body), {
+    name: "August 2026 Progress Prize Responses",
+    mimeType: "application/vnd.google-apps.spreadsheet",
+    parents: ["private-active-folder"],
+    appProperties: {
+      managedBy: "scrollprize-progress-prizes",
+      role: "responses",
+      cycle: "2026-08",
+    },
+  });
+});
+
+test("does not retry an ambiguous Spreadsheet creation", async () => {
+  const { client, mock } = clientFor([
+    new TypeError("connection closed after the server may have created the sheet"),
+    jsonResponse({ id: "duplicate" }),
+  ]);
+
+  await assert.rejects(client.createFile({
+    name: "August 2026 Progress Prize Responses",
+    mimeType: "application/vnd.google-apps.spreadsheet",
+    parentId: "private-active-folder",
+    appProperties: { cycle: "2026-08" },
+  }), /network error after 1 attempts/);
+  assert.equal(mock.calls.length, 1);
+});
+
 test("gets, updates the title of, and changes publishing for a form", async () => {
   const { client, mock } = clientFor([
     jsonResponse({ formId: "form", revisionId: "rev-1" }),
@@ -278,6 +322,81 @@ test("validates Form write controls and impossible publish states before fetchin
     /cannot accept responses/,
   );
   assert.equal(mock.calls.length, 0);
+});
+
+test("paginates Form responses without requesting response mutation authority", async () => {
+  const { client, mock } = clientFor([
+    jsonResponse({ responses: [{ responseId: "one" }], nextPageToken: "next" }),
+    jsonResponse({ responses: [{ responseId: "two" }] }),
+  ]);
+
+  assert.deepEqual(await client.listFormResponses({ formId: "private-form" }), [
+    { responseId: "one" },
+    { responseId: "two" },
+  ]);
+  assert.equal(mock.calls[0].url.pathname, "/v1/forms/private-form/responses");
+  assert.equal(mock.calls[0].url.searchParams.get("pageSize"), "1000");
+  assert.equal(mock.calls[1].url.searchParams.get("pageToken"), "next");
+});
+
+test("reads a bounded Sheet range and appends only raw inserted rows", async () => {
+  const { client, mock } = clientFor([
+    jsonResponse({
+      spreadsheetId: "private-sheet",
+      sheets: [{ properties: { sheetId: 0, title: "Form responses", index: 0 } }],
+    }),
+    jsonResponse({ range: "Form responses!A:A", values: [["Response ID"], ["one"]] }),
+    jsonResponse({ updates: { updatedRows: 1 } }),
+  ]);
+
+  assert.deepEqual(await client.getSpreadsheet({ spreadsheetId: "private-sheet" }), {
+    spreadsheetId: "private-sheet",
+    sheets: [{ properties: { sheetId: 0, title: "Form responses", index: 0 } }],
+  });
+  assert.deepEqual(await client.getSheetValues({
+    spreadsheetId: "private-sheet",
+    range: "Form responses!A:A",
+  }), {
+    range: "Form responses!A:A",
+    values: [["Response ID"], ["one"]],
+  });
+  await client.appendSheetValues({
+    spreadsheetId: "private-sheet",
+    range: "Form responses!A:Z",
+    rows: [["two", "2026-08-06T12:00:00Z"]],
+  });
+
+  assert.equal(
+    mock.calls[1].url.pathname,
+    "/v4/spreadsheets/private-sheet/values/Form%20responses!A%3AA",
+  );
+  assert.equal(mock.calls[0].url.pathname, "/v4/spreadsheets/private-sheet");
+  assert.equal(mock.calls[0].url.searchParams.get("includeGridData"), "false");
+  assert.equal(mock.calls[1].url.searchParams.get("majorDimension"), "ROWS");
+  assert.equal(
+    mock.calls[2].url.pathname,
+    "/v4/spreadsheets/private-sheet/values/Form%20responses!A%3AZ:append",
+  );
+  assert.equal(mock.calls[2].url.searchParams.get("valueInputOption"), "RAW");
+  assert.equal(mock.calls[2].url.searchParams.get("insertDataOption"), "INSERT_ROWS");
+  assert.deepEqual(JSON.parse(mock.calls[2].options.body), {
+    majorDimension: "ROWS",
+    values: [["two", "2026-08-06T12:00:00Z"]],
+  });
+});
+
+test("does not retry an ambiguous append that may already have written rows", async () => {
+  const { client, mock } = clientFor([
+    new TypeError("connection closed after the server may have appended rows"),
+    jsonResponse({ updates: { updatedRows: 1 } }),
+  ]);
+
+  await assert.rejects(client.appendSheetValues({
+    spreadsheetId: "private-sheet",
+    range: "Form responses!A:Z",
+    rows: [["one"]],
+  }), /network error after 1 attempts/);
+  assert.equal(mock.calls.length, 1);
 });
 
 test("paginates, creates, and deletes Drive permissions", async () => {
@@ -343,15 +462,19 @@ test("redacts tokens, internal IDs, ACL identities, and editor links but keeps r
   const redacted = redactForLog(
     {
       formId: "private-form-id",
+      spreadsheetId: "private-spreadsheet-id",
+      linkedSheetId: "private-legacy-sheet-id",
       permission: { emailAddress: "editor@example.org" },
       responderUri,
-      note: "Bearer token-value and secret-value at https://docs.google.com/forms/d/editor-id/viewform",
+      note: "Bearer token-value and secret-value at https://docs.google.com/spreadsheets/d/private-id/edit",
     },
     { secrets: ["secret-value"] },
   );
 
   assert.deepEqual(redacted, {
     formId: "[REDACTED]",
+    spreadsheetId: "[REDACTED]",
+    linkedSheetId: "[REDACTED]",
     permission: { emailAddress: "[REDACTED]" },
     responderUri,
     note: "Bearer [REDACTED] and [REDACTED] at [REDACTED]",
@@ -362,9 +485,13 @@ test("exports read-only validation and ACL-bounded headless write scopes", () =>
   assert.deepEqual(GOOGLE_API_READ_SCOPES, [
     "https://www.googleapis.com/auth/drive.readonly",
     "https://www.googleapis.com/auth/forms.body.readonly",
+    "https://www.googleapis.com/auth/forms.responses.readonly",
+    "https://www.googleapis.com/auth/spreadsheets.readonly",
   ]);
   assert.deepEqual(GOOGLE_API_SCOPES, [
     "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/forms.body",
+    "https://www.googleapis.com/auth/forms.responses.readonly",
+    "https://www.googleapis.com/auth/spreadsheets",
   ]);
 });
