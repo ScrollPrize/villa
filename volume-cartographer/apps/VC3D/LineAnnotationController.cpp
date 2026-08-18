@@ -9543,10 +9543,47 @@ void LineAnnotationController::updateGeneratedViewMetricsForFiber(uint64_t fiber
     }
 }
 
+QString LineAnnotationController::umbilicusCacheToken() const
+{
+    if (!_state || !_state->vpkg()) {
+        return {};
+    }
+    const VolumePkg& pkg = *_state->vpkg();
+    // Deliberately cheap: compared whenever a cached, already-scaled umbilicus is
+    // about to be reused, so it must not run the resolver's search or parse any
+    // JSON. The project's field covers attaching, detaching and repointing -- none
+    // of which emits a signal -- and stat()ing the file it names covers that file
+    // being fixed, replaced or removed, which is what the attach dialog promises is
+    // a workable order of operations.
+    //
+    // Size and mtime, so this is a metadata token rather than a guarantee: a
+    // same-size rewrite inside one timestamp tick is invisible to it. It covers only
+    // the declared file, not files a directory search would discover; widening it to
+    // those wants the resolver to enumerate its own candidates, which is follow-up
+    // work rather than a second guess made here.
+    QString token = QString::fromStdString(pkg.umbilicus());
+    const fs::path declared = pkg.umbilicusPath();
+    if (declared.empty()) {
+        return token;
+    }
+    std::error_code ec;
+    const auto size = fs::file_size(declared, ec);
+    if (ec) {
+        return token + QStringLiteral("|-");
+    }
+    token += QStringLiteral("|%1").arg(size);
+    const auto written = fs::last_write_time(declared, ec);
+    if (!ec) {
+        token += QStringLiteral(":%1").arg(
+            static_cast<qlonglong>(written.time_since_epoch().count()));
+    }
+    return token;
+}
+
 void LineAnnotationController::invalidateScrollUmbilicus()
 {
     _scrollUmbilicusLoadAttempted = false;
-    _scrollUmbilicusFingerprint.clear();
+    _scrollUmbilicusToken.clear();
     _scrollUmbilicusFrame = {};
     _scrollUmbilicus.reset();
     _scrollUmbilicusMode = vc3d::annotation::UmbilicusOrientationMode::VolumeCentre;
@@ -9554,6 +9591,7 @@ void LineAnnotationController::invalidateScrollUmbilicus()
     _scrollUmbilicusScaleSource.reset();
     _scrollUmbilicusTransformPath.clear();
     _scrollUmbilicusTransformSize = 0;
+    _scrollUmbilicusTransformWriteTime = 0;
     _umbilicusNotice.clear();
 }
 
@@ -9573,6 +9611,7 @@ LineAnnotationController::currentOrientationKey() const
     key.mode = _scrollUmbilicusMode;
     key.scaleSource = _scrollUmbilicusScaleSource;
     key.transformPath = _scrollUmbilicusTransformPath;
+    key.transformWriteTime = _scrollUmbilicusTransformWriteTime;
     key.transformSize = _scrollUmbilicusTransformSize;
     return key;
 }
@@ -9623,39 +9662,52 @@ void LineAnnotationController::rematerializeOpenGeneratedViews()
     // Surfaces already built carry the normals they were built with, so an
     // invalidated umbilicus only reaches the screen by rebuilding them.
     //
-    // One pane failing must not strand the rest: each is an independent fiber,
-    // and the alternative — the first failure leaving later panes on geometry
-    // from the old umbilicus — is the inconsistency this exists to remove.
+    // Snapshotted first, and by shared_ptr: materializeGeneratedViews() calls
+    // _state->setSurface(), whose surfaceChanged signal reaches this controller's
+    // own slot, and a pane closing there would invalidate an iterator over _panes
+    // and destroy the session that the rollback below holds a reference into.
+    struct Target {
+        std::shared_ptr<LineAnnotationSession> session;
+        std::string surfaceName;
+    };
+    std::vector<Target> targets;
+    targets.reserve(_panes.size());
     for (const auto& pane : _panes) {
         if (!pane.session || pane.session->suppressGeneratedViews) {
             continue;
         }
         // Nothing was ever materialized for this pane, so there is no stale
-        // orientation on screen to correct — and the builder rejects an empty
+        // orientation on screen to correct -- and the builder rejects an empty
         // model, which during initial tracing turned a successful attach into a
         // modal complaint about views the user never asked for.
         if (pane.session->generatedSurfaceNames.empty() ||
             pane.session->optimizedLine.points.empty()) {
             continue;
         }
-        // A reaction to someone else's action must not interrupt with a dialog
-        // about a pane they were not looking at; the warning below is the report.
-        // Scoped rather than saved and restored by hand: materializeGeneratedViews
-        // can throw past its own catch, which would leave this session silent for
-        // good.
-        QScopedValueRollback<bool> quiet(pane.session->suppressErrorDialogs, true);
+        targets.push_back({pane.session, pane.surfaceName});
+    }
+
+    // One pane failing must not strand the rest: each is an independent fiber, and
+    // the alternative -- the first failure leaving later panes on geometry from the
+    // old umbilicus -- is the inconsistency this exists to remove.
+    for (const auto& target : targets) {
+        // A reaction to someone else's action must not interrupt with a dialog about
+        // a pane they were not looking at; the warning below is the report. Scoped
+        // rather than saved and restored by hand: materializeGeneratedViews can
+        // throw past its own catch, which would leave this session silent for good.
+        QScopedValueRollback<bool> quiet(target.session->suppressErrorDialogs, true);
         try {
-            if (!materializeGeneratedViews(*pane.session)) {
+            if (!materializeGeneratedViews(*target.session)) {
                 Logger()->warn(
                     "Line annotation: could not rebuild generated views for {} "
                     "after the umbilicus changed; its orientation is unchanged",
-                    pane.surfaceName);
+                    target.surfaceName);
             }
         } catch (const std::exception& e) {
             Logger()->warn(
                 "Line annotation: rebuilding generated views for {} after the "
                 "umbilicus changed threw: {}",
-                pane.surfaceName,
+                target.surfaceName,
                 e.what());
         }
     }
@@ -9734,14 +9786,14 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
     // this the refusal stayed cached until an unrelated invalidation -- which
     // contradicts the attach dialog telling the user that attaching and then fixing
     // the file is a reasonable order of operations. A stat, no parse.
-    const QString currentUmbilicusFingerprint = umbilicusFingerprint();
+    const QString currentUmbilicusToken = umbilicusCacheToken();
     if (!_scrollUmbilicusLoadAttempted || volpkgRoot != _scrollUmbilicusRoot ||
-        currentUmbilicusFingerprint != _scrollUmbilicusFingerprint ||
+        currentUmbilicusToken != _scrollUmbilicusToken ||
         !vc3d::annotation::sameAnnotationFrame(currentAnnotationFrame,
                                               _scrollUmbilicusFrame)) {
         _scrollUmbilicusLoadAttempted = true;
         _scrollUmbilicusRoot = volpkgRoot;
-        _scrollUmbilicusFingerprint = currentUmbilicusFingerprint;
+        _scrollUmbilicusToken = currentUmbilicusToken;
         _scrollUmbilicusFrame = currentAnnotationFrame;
         _scrollUmbilicus.reset();
         // Cleared before the attempt: whatever is set below describes this
@@ -9756,6 +9808,7 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
         _scrollUmbilicusScaleSource.reset();
         _scrollUmbilicusTransformPath.clear();
         _scrollUmbilicusTransformSize = 0;
+        _scrollUmbilicusTransformWriteTime = 0;
         _umbilicusNotice.clear();
         try {
             if (_state && _state->vpkg() && volume) {
@@ -9870,17 +9923,51 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
                         for (auto& point : controlPoints) {
                             point *= static_cast<float>(scale->factor);
                         }
+                        // Rounded doubles into ints: an implausible extent must not
+                        // wrap round to a negative or truncated shape and be handed
+                        // to FromPoints as though it were a grid.
+                        const auto asSliceCount = [](double extent) -> int {
+                            if (!std::isfinite(extent) || extent < 1.0 ||
+                                extent > static_cast<double>(
+                                             std::numeric_limits<int>::max())) {
+                                return 0;
+                            }
+                            return static_cast<int>(std::llround(extent));
+                        };
                         const cv::Vec3i annotationShape{
-                            static_cast<int>(std::llround(annotationGrid[2])),
-                            static_cast<int>(std::llround(annotationGrid[1])),
-                            static_cast<int>(std::llround(annotationGrid[0]))};
-                        _scrollUmbilicus = vc::core::util::Umbilicus::FromPoints(
-                            std::move(controlPoints), annotationShape);
-                        Logger()->info(
-                            "Line annotation: umbilicus {} at scale x{:g} ({})",
-                            resolved.path.string(),
-                            scale->factor,
-                            scale->description);
+                            asSliceCount(annotationGrid[2]),
+                            asSliceCount(annotationGrid[1]),
+                            asSliceCount(annotationGrid[0])};
+                        if (annotationShape[0] <= 0 || annotationShape[1] <= 0 ||
+                            annotationShape[2] <= 0) {
+                            Logger()->warn(
+                                "Line annotation: umbilicus {} resolved but the "
+                                "annotation frame extent {:g}x{:g}x{:g} is not a "
+                                "usable grid; orienting without it",
+                                resolved.path.string(),
+                                annotationGrid[0],
+                                annotationGrid[1],
+                                annotationGrid[2]);
+                            _umbilicusNotice =
+                                tr("umbilicus %1 unusable: the annotation frame "
+                                   "extent is not a usable grid")
+                                    .arg(QString::fromStdString(
+                                        resolved.path.filename().string()));
+                            _scrollUmbilicusMode = vc3d::annotation::
+                                UmbilicusOrientationMode::VolumeCentre;
+                            _scrollUmbilicusFactor = 0.0;
+                            _scrollUmbilicusScaleSource.reset();
+                            // Left unset, so orientation falls back to the volume
+                            // centre with the notice above saying why.
+                        } else {
+                            _scrollUmbilicus = vc::core::util::Umbilicus::FromPoints(
+                                std::move(controlPoints), annotationShape);
+                            Logger()->info(
+                                "Line annotation: umbilicus {} at scale x{:g} ({})",
+                                resolved.path.string(),
+                                scale->factor,
+                                scale->description);
+                        }
                     } else {
                         // Nothing usable stated and nothing inferable, or no
                         // annotation frame to reach: keep the legacy reading.
@@ -9922,12 +10009,21 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
                                     volpkgRoot / "transforms" / "transform.json";
                             }
                             if (fs::exists(transformPath)) {
-                                std::error_code sizeEc;
+                                // Size alone is not identity: rewriting the matrix
+                                // values leaves the byte length unchanged, so the
+                                // write time carries the rest.
+                                std::error_code statEc;
                                 const auto size =
-                                    fs::file_size(transformPath, sizeEc);
+                                    fs::file_size(transformPath, statEc);
                                 _scrollUmbilicusTransformPath =
                                     transformPath.string();
-                                _scrollUmbilicusTransformSize = sizeEc ? 0 : size;
+                                _scrollUmbilicusTransformSize = statEc ? 0 : size;
+                                const auto written =
+                                    fs::last_write_time(transformPath, statEc);
+                                _scrollUmbilicusTransformWriteTime =
+                                    statEc ? 0
+                                           : static_cast<long long>(
+                                                 written.time_since_epoch().count());
                                 try {
                                     const cv::Matx44d toSession =
                                         vc::core::util::invertAffineTransformMatrix(
@@ -10082,11 +10178,6 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
         return false;
     }
 
-    // Recorded after the build succeeded and before the old surfaces go, since
-    // orientedLineNormalsForSession() above is what resolved the umbilicus and
-    // therefore what settled the mode, the factor and the transform.
-    session.orientationKey = currentOrientationKey();
-
     for (const auto& name : session.generatedSurfaceNames) {
         _state->setSurface(name, nullptr);
     }
@@ -10202,6 +10293,11 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
 
     auto* pane = paneForSurface(session.surfaceName);
     if (!pane || !pane->dialog) {
+        // Recorded only on success, and only once every surface is in place: a key
+        // written earlier would claim the new orientation while a later throw or
+        // failure had left the old, partial or cleared views on screen, and the
+        // next comparison would then suppress the rebuild that would fix it.
+        session.orientationKey = currentOrientationKey();
         return true;
     }
 
@@ -10229,6 +10325,9 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
         !isAlignmentPendingForFiber(session.fiberId)) {
         requestFiberAlignmentMetrics(session.fiberId);
     }
+    // See the note at the other success return: only a completed build may claim an
+    // orientation.
+    session.orientationKey = currentOrientationKey();
     return true;
 }
 

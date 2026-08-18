@@ -327,7 +327,14 @@ private slots:
         auto viaTransform = legacy;
         viaTransform.transformPath = "/vol/transform.json";
         viaTransform.transformSize = 512;
+        viaTransform.transformWriteTime = 1000;
         QVERIFY(!sameOrientationKey(legacy, viaTransform));
+
+        // Rewriting the matrix leaves the byte length alone, so size is not
+        // identity on its own.
+        auto rewritten = viaTransform;
+        rewritten.transformWriteTime = 2000;
+        QVERIFY(!sameOrientationKey(viaTransform, rewritten));
     }
 
     // An unknown voxel size means an unknown factor, so the volume's raw counts are

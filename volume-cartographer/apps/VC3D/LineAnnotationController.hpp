@@ -553,6 +553,10 @@ private:
     // per pane and do not stop the others.
     void rematerializeOpenGeneratedViews();
     // Everything the orientation of a freshly built set of views would come from.
+    // Cheap metadata token over the attached umbilicus file: the project's field
+    // plus a stat() of what it names, and no JSON parse. Part of the cached
+    // umbilicus's key, so fixing a refused file reaches the views.
+    [[nodiscard]] QString umbilicusCacheToken() const;
     [[nodiscard]] vc3d::annotation::OrientationKey currentOrientationKey() const;
     void onActiveVolumeChanged();
     // Pushes _umbilicusNotice to every open pane's dialog.
@@ -816,6 +820,9 @@ private:
     // fallback is used instead).
     std::optional<vc::core::util::Umbilicus> _scrollUmbilicus;
     std::filesystem::path _scrollUmbilicusRoot;
+    // The attached umbilicus file as of the cached load, so it changing underneath
+    // VC3D -- being fixed, replaced or removed -- is noticed.
+    QString _scrollUmbilicusToken;
     // The resolver's dependencies as of the cached load, so the file changing
     // underneath VC3D -- being fixed, replaced or removed -- is noticed.
     QString _scrollUmbilicusFingerprint;
@@ -835,6 +842,7 @@ private:
     std::optional<vc::core::util::UmbilicusScaleSource> _scrollUmbilicusScaleSource;
     std::string _scrollUmbilicusTransformPath;
     std::uintmax_t _scrollUmbilicusTransformSize = 0;
+    long long _scrollUmbilicusTransformWriteTime = 0;
     // Why the package's umbilicus could not be used, for the strip notice.
     // Empty when one was applied, and when none exists to complain about.
     // Orienting off the volume centre instead is exactly the silent degradation

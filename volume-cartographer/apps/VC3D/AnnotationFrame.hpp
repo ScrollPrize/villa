@@ -180,6 +180,7 @@ struct OrientationKey {
     // Legacy reading only: the registration transform it went through, if any.
     std::string transformPath;
     std::uintmax_t transformSize = 0;
+    long long transformWriteTime = 0;
 };
 
 inline bool sameOrientationKey(const OrientationKey& a, const OrientationKey& b)
@@ -188,7 +189,8 @@ inline bool sameOrientationKey(const OrientationKey& a, const OrientationKey& b)
         return false;
     if (a.mode != b.mode)
         return false;
-    if (a.transformPath != b.transformPath || a.transformSize != b.transformSize)
+    if (a.transformPath != b.transformPath || a.transformSize != b.transformSize ||
+        a.transformWriteTime != b.transformWriteTime)
         return false;
     // Different voxel counts: the geometry is about another grid.
     if (!sameAnnotationGrid(a.frame, b.frame))
