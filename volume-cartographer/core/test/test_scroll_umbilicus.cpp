@@ -8,6 +8,8 @@
 
 #include "vc/core/types/VolumePkg.hpp"
 
+#include <array>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -19,6 +21,7 @@ using vc::core::util::deriveUmbilicusScale;
 using vc::core::util::resolveScrollUmbilicus;
 using vc::core::util::UmbilicusFileInfo;
 using vc::core::util::UmbilicusScaleSource;
+using vc::core::util::uniformRescaleFactor;
 
 namespace {
 
@@ -496,7 +499,14 @@ TEST_CASE("resolver: parent and grandparent holding different files still refuse
     fs::remove_all(d);
 }
 
-TEST_CASE("deriveUmbilicusScale: stamped dimensions give an exact integer ratio")
+namespace {
+
+// The real PHercParis4 configuration: umbilicus.json stamps the 9.6 um ds2 grid
+// while annotation runs on the project's 2.4 um store, whose level-0 shape is
+// 32693 x 32693 x 75784. Only z is an exact multiple of the stamp -- 32693/4 is
+// 8173.25, which the downsample rounded up to 8174 -- so the axes disagree by
+// 0.0092% and a tolerance is genuinely required here.
+UmbilicusFileInfo stampedPHercParis4()
 {
     UmbilicusFileInfo info;
     info.controlPoints = {{1.0f, 2.0f, 3.0f}};
@@ -504,12 +514,110 @@ TEST_CASE("deriveUmbilicusScale: stamped dimensions give an exact integer ratio"
     info.volumeHeight = 8174;
     info.volumeSlices = 18946;
     info.voxelsizeUm = 9.6;
+    return info;
+}
 
-    // The annotation frame is four times finer than the stamped grid.
-    const auto scale = deriveUmbilicusScale(info, {32696.0, 32696.0, 75784.0}, 2.4);
+const std::array<double, 3> kPHercParis4AnnotationGrid{32693.0, 32693.0, 75784.0};
+
+} // namespace
+
+TEST_CASE("deriveUmbilicusScale: the real PHercParis4 stamp resolves to exactly 4")
+{
+    const auto scale =
+        deriveUmbilicusScale(stampedPHercParis4(), kPHercParis4AnnotationGrid, 2.4);
     REQUIRE(scale.has_value());
-    CHECK(scale->factor == doctest::Approx(4.0));
     CHECK(scale->source == UmbilicusScaleSource::StampedDimensions);
+    // Exactly 4, and specifically not the mean of (3.9996331, 3.9996331, 4.0)
+    // = 3.9997553 that averaging the axis ratios produced.
+    CHECK(scale->factor == doctest::Approx(4.0).epsilon(1e-12));
+    CHECK(std::abs(scale->factor - 3.9997553) > 1e-6);
+}
+
+TEST_CASE("deriveUmbilicusScale: an identical grid gives exactly 1")
+{
+    const auto scale = deriveUmbilicusScale(
+        stampedPHercParis4(), {8174.0, 8174.0, 18946.0}, 9.6);
+    REQUIRE(scale.has_value());
+    CHECK(scale->factor == doctest::Approx(1.0).epsilon(1e-12));
+    CHECK(scale->source == UmbilicusScaleSource::StampedDimensions);
+}
+
+TEST_CASE("uniformRescaleFactor: axes rounded in opposite directions still agree")
+{
+    // Both x/y and z three voxels off an exact x4, in opposite directions. One
+    // factor of 4 satisfies |t - s*4| <= 3 on every axis, so this is a rescale.
+    const auto factor = uniformRescaleFactor({8174.0, 8174.0, 18946.0},
+                                             {32699.0, 32699.0, 75781.0});
+    REQUIRE(factor.has_value());
+    CHECK(*factor == doctest::Approx(4.0).epsilon(1e-12));
+}
+
+TEST_CASE("uniformRescaleFactor: a two percent spread is not a rescale")
+{
+    // Ratios (4, 4, 3.96): the spread the previous `hi <= lo * 1.02` accepted
+    // and then averaged away.
+    CHECK_FALSE(uniformRescaleFactor({8174.0, 8174.0, 18946.0},
+                                     {32696.0, 32696.0, 75026.0})
+                    .has_value());
+    // And through the public entry point, so the weaker readings below the
+    // stamped-dimensions arm are not reached as a consolation prize either.
+    CHECK_FALSE(deriveUmbilicusScale(stampedPHercParis4(),
+                                     {32696.0, 32696.0, 75026.0}, 2.4)
+                    .has_value());
+}
+
+TEST_CASE("uniformRescaleFactor: small grids get no free tolerance")
+{
+    // Ratios (0.51, 0.51, 0.5). Every axis is within one target voxel of a
+    // single factor, so a fixed one-voxel slack would accept this; the bound
+    // scales with the factor instead, and 2% of a 100-voxel axis is not
+    // downsample rounding.
+    CHECK_FALSE(uniformRescaleFactor({100.0, 100.0, 1000.0}, {51.0, 51.0, 500.0})
+                    .has_value());
+}
+
+TEST_CASE("uniformRescaleFactor: a cropped axis is refused")
+{
+    CHECK_FALSE(uniformRescaleFactor({8174.0, 8174.0, 18946.0},
+                                     {32696.0, 32696.0, 40000.0})
+                    .has_value());
+}
+
+TEST_CASE("uniformRescaleFactor: the rounding bound is tight on both sides")
+{
+    // f - 1 target voxels is the most a floor/ceil downsample can hide. At the
+    // bound it is accepted; well past it, refused.
+    const std::array<double, 3> stamped{8174.0, 8174.0, 18946.0};
+    CHECK(uniformRescaleFactor(stamped, {32696.0, 32696.0, 75787.0}).has_value());
+    CHECK_FALSE(uniformRescaleFactor(stamped, {32696.0, 32696.0, 75800.0}).has_value());
+}
+
+TEST_CASE("uniformRescaleFactor: a coarser target works with a real residual")
+{
+    // The stamp is the finer grid, so the rounding sits on the target side and
+    // the bound is 1 - f. The residual is non-zero, so this cannot pass by
+    // having zero error on some reference axis.
+    const auto factor = uniformRescaleFactor({32693.0, 32693.0, 75784.0},
+                                             {8174.0, 8174.0, 18946.0});
+    REQUIRE(factor.has_value());
+    CHECK(*factor == doctest::Approx(0.25).epsilon(1e-4));
+    CHECK(*factor < 1.0);
+}
+
+TEST_CASE("uniformRescaleFactor: fractional and unusable extents")
+{
+    // AnnotationFrame::extentXyz is integer voxel counts times a floating ratio,
+    // so a caller can hand in non-integral counts.
+    const auto factor = uniformRescaleFactor({8174.0, 8174.0, 18946.0},
+                                             {24522.0, 24522.0, 56838.0});
+    REQUIRE(factor.has_value());
+    CHECK(*factor == doctest::Approx(3.0).epsilon(1e-12));
+    CHECK_FALSE(uniformRescaleFactor({8174.0, 8174.0, 18946.0},
+                                     {0.0, 24522.0, 56838.0})
+                    .has_value());
+    CHECK_FALSE(uniformRescaleFactor({8174.0, 0.0, 18946.0},
+                                     {24522.0, 24522.0, 56838.0})
+                    .has_value());
 }
 
 TEST_CASE("deriveUmbilicusScale: dimensions that are not a uniform rescale say nothing")
@@ -521,7 +629,7 @@ TEST_CASE("deriveUmbilicusScale: dimensions that are not a uniform rescale say n
     info.volumeSlices = 18946;
     info.voxelsizeUm = 9.6;     // must not be used as a consolation prize
 
-    CHECK_FALSE(deriveUmbilicusScale(info, {32696.0, 32696.0, 75784.0}, 2.4).has_value());
+    CHECK_FALSE(deriveUmbilicusScale(info, kPHercParis4AnnotationGrid, 2.4).has_value());
 }
 
 TEST_CASE("deriveUmbilicusScale: voxel sizes are used when dimensions are absent")

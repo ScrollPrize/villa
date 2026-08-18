@@ -65,14 +65,41 @@ namespace vc::core::util {
         std::string description;
     };
 
+    // The single factor that carries `stampedXyz` voxel counts onto `targetXyz`
+    // voxel counts, or nothing when no one factor explains all three axes.
+    //
+    // Both triplets count the voxels of one physical volume sampled at two
+    // resolutions, and downsampling rounds, so an axis is consistent with a
+    // factor f when
+    //
+    //     |target - stamped * f| <= |f - 1|
+    //
+    // For f > 1 the stamped grid is the coarser one and its count is a floor or
+    // a ceiling of target/f, which hides up to f-1 target voxels; for f < 1 the
+    // rounding happens on the target side and the bound is 1-f. At f == 1 the
+    // tolerance is zero, which is right: identical grids must match exactly.
+    //
+    // That inequality is a closed interval in f per axis, so the answer is the
+    // intersection of three intervals: empty means the stamp does not describe a
+    // rescale of the target at all. Where the intersection holds exactly one
+    // integer that integer is returned, since it is the value consistent with
+    // every axis and every rescale seen so far is integral; otherwise the
+    // midpoint. No tuned tolerance is involved — an earlier version accepted any
+    // spread under 2% and returned the mean of the three ratios, which is a
+    // number that matches none of them.
+    [[nodiscard]] std::optional<double> uniformRescaleFactor(
+        const std::array<double, 3>& stampedXyz,
+        const std::array<double, 3>& targetXyz);
+
     // The factor that carries an umbilicus file's coordinates into the frame
     // whose extent is targetGridXyz (x, y, z voxel counts) — the frame the
     // caller's own coordinates live in, which is not necessarily any single
     // volume's own grid.
     //
     // Tried in descending order of trust: the stamped grid dimensions against
-    // the target grid (exact integers, no micrometres involved, and rejected
-    // outright if the three axis ratios disagree); the stamped voxel size
+    // the target grid through uniformRescaleFactor() (integer counts, no
+    // micrometres involved, and rejected outright when no one factor explains
+    // all three axes); the stamped voxel size
     // against targetVoxelSizeUm; and finally which power-of-two downsample of
     // the target grid the points fit inside and nearly fill, which is a reading
     // of the file rather than a statement by it. Empty when none of the three

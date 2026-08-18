@@ -30,6 +30,25 @@ bool isTifxyzSegmentDir(const fs::path& dir)
 }
 
 
+// The factor to report for a feasible interval of rescale factors. Every rescale
+// seen so far is integral, and an integer inside the interval is by construction
+// consistent with all three axes, so prefer it; that is what turns a stamp whose
+// axes round differently -- 8174/8174/18946 against 32693/32693/75784 -- into
+// exactly 4 rather than a near miss. Otherwise the midpoint, which commits to no
+// single axis.
+double factorFromInterval(double lo, double hi)
+{
+    const double firstInteger = std::ceil(lo);
+    if (firstInteger <= hi && firstInteger + 1.0 > hi) {
+        return firstInteger;
+    }
+    if (std::isinf(hi)) {
+        return lo;
+    }
+    return lo + (hi - lo) * 0.5;
+}
+
+
 fs::path canonicalize(const fs::path& path)
 {
     std::error_code ec;
@@ -189,6 +208,49 @@ ScrollUmbilicusResolution resolveScrollUmbilicus(const VolumePkg& pkg)
     return resolution;
 }
 
+std::optional<double> uniformRescaleFactor(
+    const std::array<double, 3>& stampedXyz,
+    const std::array<double, 3>& targetXyz)
+{
+    for (int axis = 0; axis < 3; ++axis) {
+        if (!std::isfinite(stampedXyz[axis]) || stampedXyz[axis] <= 0.0 ||
+            !std::isfinite(targetXyz[axis]) || targetXyz[axis] <= 0.0) {
+            return std::nullopt;
+        }
+    }
+
+    // Per axis, |t - s*f| <= |f - 1| is a closed interval in f. Solving the two
+    // sides gives (t+1)/(s+1) and (t-1)/(s-1); which is the lower bound depends
+    // on whether f is above or below 1, and s == 1 leaves one side unbounded.
+    // Intersect the axes on each side of 1 separately and take whichever region
+    // survives.
+    constexpr double kInf = std::numeric_limits<double>::infinity();
+    double aboveLo = 1.0;
+    double aboveHi = kInf;
+    double belowLo = 0.0;
+    double belowHi = 1.0;
+    for (int axis = 0; axis < 3; ++axis) {
+        const double s = stampedXyz[axis];
+        const double t = targetXyz[axis];
+        const double sum = (t + 1.0) / (s + 1.0);
+        const double diff = s > 1.0 ? (t - 1.0) / (s - 1.0) : kInf;
+        // f >= 1: lower bound is (t+1)/(s+1), upper bound (t-1)/(s-1).
+        aboveLo = std::max(aboveLo, sum);
+        aboveHi = std::min(aboveHi, diff);
+        // f <= 1: the roles swap.
+        belowLo = std::max(belowLo, s > 1.0 ? diff : 0.0);
+        belowHi = std::min(belowHi, sum);
+    }
+
+    if (aboveLo <= aboveHi) {
+        return factorFromInterval(aboveLo, aboveHi);
+    }
+    if (belowLo <= belowHi) {
+        return factorFromInterval(belowLo, belowHi);
+    }
+    return std::nullopt;
+}
+
 std::optional<UmbilicusScale> deriveUmbilicusScale(
     const UmbilicusFileInfo& info,
     const std::array<double, 3>& targetGridXyz,
@@ -201,23 +263,22 @@ std::optional<UmbilicusScale> deriveUmbilicusScale(
                                  info.volumeSlices && *info.volumeWidth > 0 &&
                                  *info.volumeHeight > 0 && *info.volumeSlices > 0;
     if (haveStampedDims && haveTarget) {
-        const std::array<double, 3> ratios{
-            targetGridXyz[0] / *info.volumeWidth,
-            targetGridXyz[1] / *info.volumeHeight,
-            targetGridXyz[2] / *info.volumeSlices};
-        const double lo = std::min({ratios[0], ratios[1], ratios[2]});
-        const double hi = std::max({ratios[0], ratios[1], ratios[2]});
-        if (lo > 0.0 && hi <= lo * 1.02) {
+        const std::array<double, 3> stamped{
+            static_cast<double>(*info.volumeWidth),
+            static_cast<double>(*info.volumeHeight),
+            static_cast<double>(*info.volumeSlices)};
+        if (const auto factor = uniformRescaleFactor(stamped, targetGridXyz)) {
             UmbilicusScale scale;
-            scale.factor = (ratios[0] + ratios[1] + ratios[2]) / 3.0;
+            scale.factor = *factor;
             scale.source = UmbilicusScaleSource::StampedDimensions;
             scale.description = "stamped " + std::to_string(*info.volumeWidth) + "x" +
                                 std::to_string(*info.volumeHeight) + "x" +
                                 std::to_string(*info.volumeSlices) + " grid";
             return scale;
         }
-        // Axis ratios that disagree mean this is not a rescale of the target
-        // grid at all, so neither of the weaker readings below applies either.
+        // No single factor explains all three axes, so this is not a rescale of
+        // the target grid at all and neither of the weaker readings below
+        // applies either.
         return std::nullopt;
     }
 
