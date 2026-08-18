@@ -31,11 +31,12 @@ from render_valgrind_common import (
 from thread_sync_trace import parse_drd_trace, write_event_stream
 
 SCHEMA_VERSION = 1
+NATIVE_EVALUATION_SCHEMA_VERSION = 2
 BENCHMARK_METADATA_SCHEMA = 1
 DEFAULT_REPETITIONS = 1
 DEFAULT_QUANTUM = 10000
 DEFAULT_DRD_ATTEMPTS = 3
-DEFAULT_TOLERANCE = 0.10
+DEFAULT_TOLERANCE = 0.05
 DATA_READ_FEATURE_NAMES = (
     "non_data_instructions",
     "data_reads",
@@ -510,19 +511,39 @@ def evaluate(args: argparse.Namespace) -> None:
 
 def freeze_reference(args: argparse.Namespace) -> None:
     tolerance = validate_tolerance(args.tolerance)
-    model_hash = sha256_file(args.model.resolve())
+    model_path = args.model.resolve()
+    model_hash = sha256_file(model_path)
+    model_id = json.loads(model_path.read_text()).get("model_id")
+    if not model_id:
+        raise RuntimeError("render model has no model_id")
     cases: dict[str, object] = {}
     for path in args.results:
-        result = load_manifest(path.resolve(), "evaluation")
-        if result["model_sha256"] != model_hash:
-            raise RuntimeError(f"evaluation {path} used a different model")
+        result_path = path.resolve()
+        result = json.loads(result_path.read_text())
+        if result.get("kind") != "evaluation":
+            raise RuntimeError(
+                f"expected evaluation artifact, got {result.get('kind')!r}"
+            )
+        schema = result.get("schema_version")
+        if schema == SCHEMA_VERSION:
+            if result.get("model_sha256") != model_hash:
+                raise RuntimeError(f"evaluation {path} used a different model")
+        elif schema == NATIVE_EVALUATION_SCHEMA_VERSION:
+            if result.get("model_id") != model_id:
+                raise RuntimeError(f"evaluation {path} used a different model")
+        else:
+            raise RuntimeError(f"unsupported evaluation schema in {path}")
         if result["case"] in cases:
             raise RuntimeError(f"duplicate evaluation case {result['case']}")
-        cases[result["case"]] = {
+        case = {
             "checksum": result["checksum"],
-            "identity": result["identity"],
-            "modeled_runtime_score_ns": result["modeled_runtime_score_ns"],
+            "modeled_runtime_score_ns": validate_score(
+                result["modeled_runtime_score_ns"], "evaluation"
+            ),
         }
+        if "identity" in result:
+            case["identity"] = result["identity"]
+        cases[result["case"]] = case
     expected = {
         f"{fixture}/{scenario}"
         for fixture in ("serial", "parallel")

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "vc/lasagna/LineViewBuilder.hpp"
+
 #include <opencv2/core/types.hpp>
 
 #include <QPoint>
@@ -133,6 +135,9 @@ struct GeneratedOverlay {
     bool emphasizedPointMarker = false;
     bool useSurfaceCenterLine = false;
     bool currentLineMarkerAsCross = false;
+    // Present for strip overlays. Line positions above remain in original
+    // LineModel point-index coordinates and are mapped only while projecting.
+    vc::lasagna::LineStripPositionMap stripPositionMap;
 };
 
 struct GeneratedSpanAlignmentMetric {
@@ -177,6 +182,7 @@ struct GeneratedViews {
     std::shared_ptr<PlaneSurface> sideCutSurface;
     std::vector<cv::Vec3f> linePoints;
     std::vector<cv::Vec3f> lineUpVectors;
+    vc::lasagna::LineStripPositionMap stripPositionMap;
     // Per-line-point sampled sheet normals, sign-oriented away from the
     // scroll center (NaN where the sample is invalid). Empty when
     // unavailable.
@@ -739,149 +745,275 @@ inline std::optional<double> closestGeneratedControlPointLinePosition(
     return closest;
 }
 
-inline bool generatedControlPointPlacementWithinAnyDistance(
-    double linePosition,
-    const std::vector<double>& controlLinePositions,
-    double maxDistance,
-    double existingControlTolerance = 0.5)
+inline constexpr double kGeneratedParallaxGhostMinimumOpacity = 0.3;
+inline constexpr double kGeneratedParallaxGhostMaximumOpacity = 0.85;
+// Fraction of the visibility distance over which a ghost fades out at the far
+// edge, so it eases in and out instead of popping at the cutoff.
+inline constexpr double kGeneratedParallaxGhostEdgeFadeFraction = 0.25;
+
+// Parallax slide-in cue for the nearest control point on one side of the current
+// cut. All positions, deltas and the slide range are line-position units (one unit
+// is one index step in GeneratedViews::linePoints, roughly 30 base voxels of arc
+// length); nothing here is expressed in voxels or scene pixels. The viewer-side
+// geometry (scene offset, viewport width) stays in the dialog.
+struct GeneratedParallaxGhost {
+    size_t controlIndex = 0;
+    double linePosition = 0.0;
+    // Signed, clamped to [-1, 1]; positive means the control point is ahead.
+    double offsetFraction = 0.0;
+    // Ramps from kGeneratedParallaxGhostMinimumOpacity at or beyond the slide
+    // range up to kGeneratedParallaxGhostMaximumOpacity as the delta closes.
+    double opacity = 0.0;
+};
+
+// direction is +1 for the nearest control point strictly ahead of
+// currentLinePosition and -1 for the nearest one strictly behind it. A ghost
+// only exists while the control point is within maxDistanceLinePositions of the
+// current position; its opacity fades to zero over the outer
+// kGeneratedParallaxGhostEdgeFadeFraction of that distance. Returns nullopt
+// when no such control point exists or when any input is unusable.
+inline std::optional<GeneratedParallaxGhost> generatedParallaxGhost(
+    const std::vector<GeneratedOverlay::ControlPointMarker>& controls,
+    const GeneratedControlPointLinePositionIndex& index,
+    double currentLinePosition,
+    int direction,
+    double slideRangeLinePositions,
+    double maxDistanceLinePositions)
 {
-    if (!std::isfinite(maxDistance) || maxDistance <= 0.0) {
-        return true;
+    if (controls.empty() || index.sortedControlIndices.empty()) {
+        return std::nullopt;
     }
-    if (!std::isfinite(linePosition)) {
-        return false;
+    if (!std::isfinite(currentLinePosition)) {
+        return std::nullopt;
+    }
+    if (!std::isfinite(slideRangeLinePositions) || slideRangeLinePositions <= 0.0) {
+        return std::nullopt;
+    }
+    if (!std::isfinite(maxDistanceLinePositions) || maxDistanceLinePositions <= 0.0) {
+        return std::nullopt;
+    }
+    if (direction != 1 && direction != -1) {
+        return std::nullopt;
     }
 
-    bool hasFiniteControl = false;
-    double nearestDistance = std::numeric_limits<double>::infinity();
-    for (const double controlPosition : controlLinePositions) {
-        if (!std::isfinite(controlPosition)) {
+    const auto& indices = index.sortedControlIndices;
+    // Out-of-range entries sort last and are rejected by the scan below; the
+    // sentinel keeps both binary-search comparators consistently ordered.
+    const auto positionForIndex = [&controls](size_t controlIndex) {
+        return controlIndex < controls.size()
+                   ? controls[controlIndex].linePosition
+                   : std::numeric_limits<double>::infinity();
+    };
+    const auto usable = [&controls, &positionForIndex](size_t controlIndex) {
+        return controlIndex < controls.size() && std::isfinite(positionForIndex(controlIndex));
+    };
+
+    std::optional<size_t> selected;
+    if (direction > 0) {
+        auto it = std::upper_bound(
+            indices.begin(),
+            indices.end(),
+            currentLinePosition,
+            [&positionForIndex](double value, size_t controlIndex) {
+                return value < positionForIndex(controlIndex);
+            });
+        for (; it != indices.end(); ++it) {
+            if (usable(*it) && positionForIndex(*it) > currentLinePosition) {
+                selected = *it;
+                break;
+            }
+        }
+    } else {
+        auto it = std::lower_bound(
+            indices.begin(),
+            indices.end(),
+            currentLinePosition,
+            [&positionForIndex](size_t controlIndex, double value) {
+                return positionForIndex(controlIndex) < value;
+            });
+        while (it != indices.begin()) {
+            --it;
+            if (usable(*it) && positionForIndex(*it) < currentLinePosition) {
+                selected = *it;
+                break;
+            }
+        }
+    }
+    if (!selected) {
+        return std::nullopt;
+    }
+
+    GeneratedParallaxGhost ghost;
+    ghost.controlIndex = *selected;
+    ghost.linePosition = positionForIndex(*selected);
+    const double delta = ghost.linePosition - currentLinePosition;
+    if (std::abs(delta) > maxDistanceLinePositions) {
+        return std::nullopt;
+    }
+    ghost.offsetFraction = std::clamp(delta / slideRangeLinePositions, -1.0, 1.0);
+    const double proximity = 1.0 - std::abs(ghost.offsetFraction);
+    ghost.opacity = kGeneratedParallaxGhostMinimumOpacity +
+                    proximity * (kGeneratedParallaxGhostMaximumOpacity -
+                                 kGeneratedParallaxGhostMinimumOpacity);
+    const double edgeFadeSpan =
+        maxDistanceLinePositions * kGeneratedParallaxGhostEdgeFadeFraction;
+    ghost.opacity *= std::clamp(
+        (maxDistanceLinePositions - std::abs(delta)) / edgeFadeSpan, 0.0, 1.0);
+    return ghost;
+}
+
+// ---------------------------------------------------------------------------
+// Arrow-key panning between control points.
+//
+// One signed-velocity integrator drives the whole gesture: a tap ramps up and
+// brakes into the first control point ahead, a hold cruises straight through
+// the intermediate ones, a live speed change simply moves the cruise target,
+// and pressing the opposite arrow decelerates through zero into the reverse
+// ramp. Everything below is pure arithmetic so it can be exercised without Qt.
+// ---------------------------------------------------------------------------
+
+// Seconds spent ramping from rest to the cruise speed (acceleration = cruise / this).
+inline constexpr double kGeneratedArrowPanRampSeconds = 0.25;
+// Cruise-speed bounds and default, in line positions per second (1 unit ~ 30 voxels).
+inline constexpr double kGeneratedArrowPanMinimumSpeed = 1.0;
+inline constexpr double kGeneratedArrowPanMaximumSpeed = 500.0;
+inline constexpr double kGeneratedArrowPanDefaultSpeed = 12.0;
+// Multiplicative step applied by the Up/Down arrows.
+inline constexpr double kGeneratedArrowPanSpeedStep = 1.25;
+// Distance below which a stop target counts as reached.
+inline constexpr double kGeneratedArrowPanLandingEpsilon = 1.0e-9;
+
+struct GeneratedArrowPanState {
+    double position = 0.0;
+    // Signed, in line positions per second.
+    double velocity = 0.0;
+    // True once the step consumed the stop target exactly.
+    bool landed = false;
+};
+
+// One integrator step. `direction` is the travel direction (not the key state):
+// it stays set while a released tap coasts into its target. `stopTarget`, when
+// present, is braked into using the v^2 / (2a) trigger and landed on exactly.
+inline GeneratedArrowPanState generatedArrowPanStep(double position,
+                                                    double velocity,
+                                                    int direction,
+                                                    double cruiseSpeed,
+                                                    double acceleration,
+                                                    double dtSeconds,
+                                                    const std::optional<double>& stopTarget)
+{
+    GeneratedArrowPanState next;
+    next.position = position;
+    next.velocity = std::isfinite(velocity) ? velocity : 0.0;
+    if (!std::isfinite(position)) {
+        next.velocity = 0.0;
+        return next;
+    }
+    if (!std::isfinite(dtSeconds) || dtSeconds <= 0.0) {
+        return next;
+    }
+    if (!std::isfinite(cruiseSpeed) || cruiseSpeed <= 0.0 ||
+        !std::isfinite(acceleration) || acceleration <= 0.0) {
+        next.velocity = 0.0;
+        return next;
+    }
+
+    const int travel = (direction > 0) ? 1 : ((direction < 0) ? -1 : 0);
+    const bool haveTarget = stopTarget.has_value() && std::isfinite(*stopTarget);
+    if (haveTarget && travel != 0) {
+        // Target already reached (or behind us): land instead of running off.
+        const double signedRemaining = (*stopTarget - position) * static_cast<double>(travel);
+        if (signedRemaining <= kGeneratedArrowPanLandingEpsilon) {
+            next.position = *stopTarget;
+            next.velocity = 0.0;
+            next.landed = true;
+            return next;
+        }
+    }
+
+    double desiredVelocity = static_cast<double>(travel) * cruiseSpeed;
+    double rate = acceleration;
+    bool braking = false;
+    if (haveTarget) {
+        const double remaining = *stopTarget - position;
+        // A reversal keeps the old velocity while the direction already points
+        // the other way; brake only when the target is ahead of the motion.
+        const double heading = (next.velocity != 0.0) ? next.velocity : desiredVelocity;
+        if (heading != 0.0 && remaining != 0.0 && ((remaining > 0.0) == (heading > 0.0))) {
+            const double brakingDistance =
+                (next.velocity * next.velocity) / (2.0 * acceleration);
+            if (std::abs(remaining) <= brakingDistance) {
+                desiredVelocity = 0.0;
+                braking = true;
+                // Never undershoot: brake at least as hard as the exact profile.
+                rate = std::max(acceleration,
+                                (next.velocity * next.velocity) / (2.0 * std::abs(remaining)));
+            }
+        }
+    }
+
+    const double maxDelta = rate * dtSeconds;
+    next.velocity += std::clamp(desiredVelocity - next.velocity, -maxDelta, maxDelta);
+    next.position = position + next.velocity * dtSeconds;
+
+    if (haveTarget) {
+        const double moved = next.position - position;
+        const double remaining = *stopTarget - position;
+        if (moved != 0.0 && ((remaining > 0.0) == (moved > 0.0)) &&
+            std::abs(moved) >= std::abs(remaining)) {
+            next.position = *stopTarget;
+            next.velocity = 0.0;
+            next.landed = true;
+        } else if (braking && next.velocity == 0.0) {
+            // Braking decayed to a standstill less than half a tick short of the
+            // target; snap so the gesture always terminates on the control point.
+            next.position = *stopTarget;
+            next.landed = true;
+        }
+    }
+    return next;
+}
+
+// Next control point strictly in `direction` from `currentPosition`, but never
+// short of `minimumTarget` (the first control point the gesture promised when
+// the key went down, or the far end while the key is still held). Falls back to
+// `minimumTarget` when nothing further exists; a non-finite `minimumTarget`
+// means "no floor and no fallback", which yields nullopt with no candidate.
+inline std::optional<double> generatedArrowPanStopTarget(
+    const std::vector<double>& sortedControlLinePositions,
+    double currentPosition,
+    int direction,
+    double minimumTarget)
+{
+    if (!std::isfinite(currentPosition) || direction == 0) {
+        return std::nullopt;
+    }
+    const bool haveMinimum = std::isfinite(minimumTarget);
+    std::optional<double> best;
+    for (const double position : sortedControlLinePositions) {
+        if (!std::isfinite(position)) {
             continue;
         }
-        hasFiniteControl = true;
-        const double distance = std::abs(controlPosition - linePosition);
-        if (distance <= existingControlTolerance) {
-            return true;
+        if (direction > 0) {
+            if (position <= currentPosition || (haveMinimum && position < minimumTarget)) {
+                continue;
+            }
+            if (!best || position < *best) {
+                best = position;
+            }
+        } else {
+            if (position >= currentPosition || (haveMinimum && position > minimumTarget)) {
+                continue;
+            }
+            if (!best || position > *best) {
+                best = position;
+            }
         }
-        nearestDistance = std::min(nearestDistance, distance);
     }
-    if (!hasFiniteControl) {
-        return controlLinePositions.empty();
+    if (!best && haveMinimum) {
+        best = minimumTarget;
     }
-    return nearestDistance <= maxDistance + 1.0e-6;
-}
-
-inline bool generatedControlPointPlacementWithinPreviousDistance(
-    double linePosition,
-    const std::vector<double>& controlLinePositions,
-    double maxDistance,
-    double existingControlTolerance = 0.5)
-{
-    return generatedControlPointPlacementWithinAnyDistance(linePosition,
-                                                          controlLinePositions,
-                                                          maxDistance,
-                                                          existingControlTolerance);
-}
-
-inline bool generatedControlPointPlacementWithinPreviousDistance(
-    double linePosition,
-    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
-    double maxDistance,
-    double existingControlTolerance = 0.5)
-{
-    std::vector<double> positions;
-    positions.reserve(controlPoints.size());
-    for (const auto& control : controlPoints) {
-        positions.push_back(control.linePosition);
-    }
-    return generatedControlPointPlacementWithinPreviousDistance(linePosition,
-                                                               positions,
-                                                               maxDistance,
-                                                               existingControlTolerance);
-}
-
-inline bool generatedControlPointPlacementWithinAnyDistance(
-    double linePosition,
-    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
-    double maxDistance,
-    double existingControlTolerance = 0.5)
-{
-    std::vector<double> positions;
-    positions.reserve(controlPoints.size());
-    for (const auto& control : controlPoints) {
-        positions.push_back(control.linePosition);
-    }
-    return generatedControlPointPlacementWithinAnyDistance(linePosition,
-                                                          positions,
-                                                          maxDistance,
-                                                          existingControlTolerance);
-}
-
-inline bool generatedLinePositionWithinAnyControlDistance(
-    double linePosition,
-    const std::vector<double>& controlLinePositions,
-    double maxDistance)
-{
-    if (!std::isfinite(maxDistance) || maxDistance <= 0.0) {
-        return true;
-    }
-    if (!std::isfinite(linePosition)) {
-        return false;
-    }
-
-    constexpr double kExactControlTolerance = 1.0e-6;
-    bool hasFiniteControl = false;
-    double nearestDistance = std::numeric_limits<double>::infinity();
-    for (const double controlPosition : controlLinePositions) {
-        if (!std::isfinite(controlPosition)) {
-            continue;
-        }
-        hasFiniteControl = true;
-        const double distance = std::abs(controlPosition - linePosition);
-        if (distance <= kExactControlTolerance) {
-            return true;
-        }
-        nearestDistance = std::min(nearestDistance, distance);
-    }
-    if (!hasFiniteControl) {
-        return controlLinePositions.empty();
-    }
-    return nearestDistance <= maxDistance + 1.0e-6;
-}
-
-inline bool generatedLinePositionWithinPreviousControlDistance(
-    double linePosition,
-    const std::vector<double>& controlLinePositions,
-    double maxDistance)
-{
-    return generatedLinePositionWithinAnyControlDistance(linePosition,
-                                                        controlLinePositions,
-                                                        maxDistance);
-}
-
-inline bool generatedLinePositionWithinAnyControlDistance(
-    double linePosition,
-    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
-    double maxDistance)
-{
-    std::vector<double> positions;
-    positions.reserve(controlPoints.size());
-    for (const auto& control : controlPoints) {
-        positions.push_back(control.linePosition);
-    }
-    return generatedLinePositionWithinAnyControlDistance(linePosition,
-                                                        positions,
-                                                        maxDistance);
-}
-
-inline bool generatedLinePositionWithinPreviousControlDistance(
-    double linePosition,
-    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
-    double maxDistance)
-{
-    return generatedLinePositionWithinAnyControlDistance(linePosition,
-                                                        controlPoints,
-                                                        maxDistance);
+    return best;
 }
 
 inline std::optional<size_t> nearestGeneratedControlPointIndex(
@@ -934,6 +1066,7 @@ inline GeneratedOverlay makeGeneratedStripOverlay(
     overlay.controlPoints = views.controlPoints;
     overlay.predSnapPoints = views.predSnapPoints;
     overlay.markerLinePositions = markerLinePositions;
+    overlay.stripPositionMap = views.stripPositionMap;
     return overlay;
 }
 
@@ -947,6 +1080,7 @@ inline GeneratedOverlay makeGeneratedStaticStripOverlay(const GeneratedViews& vi
     overlay.useSurfaceCenterLine = true;
     overlay.controlPoints = views.controlPoints;
     overlay.predSnapPoints = views.predSnapPoints;
+    overlay.stripPositionMap = views.stripPositionMap;
     return overlay;
 }
 
@@ -959,6 +1093,7 @@ inline GeneratedOverlay makeGeneratedDynamicStripOverlay(
     overlay.useSurfaceCenterLine = true;
     overlay.currentLinePosition = currentLinePosition;
     overlay.markerLinePositions = markerLinePositions;
+    overlay.stripPositionMap = views.stripPositionMap;
     return overlay;
 }
 
@@ -1043,6 +1178,7 @@ struct GeneratedControlPointContextMenuOptions {
     size_t linePointCount = 0;
     double linePosition = std::numeric_limits<double>::quiet_NaN();
     bool stripViewer = false;
+    vc::lasagna::LineStripPositionMap stripPositionMap;
     bool linkWithCandidateEnabled = false;
     QString linkWithCandidateLabel;
     bool mergeWithCandidateEnabled = false;
@@ -1071,9 +1207,11 @@ struct GeneratedControlPointContextMenuOptions {
 
 QPointF generatedStripLinePositionToScene(CChunkedVolumeViewer* viewer,
                                           QuadSurface* surface,
-                                          double linePosition);
+                                          double linePosition,
+                                          const vc::lasagna::LineStripPositionMap* positionMap = nullptr);
 double generatedLinePositionFromStripScene(CChunkedVolumeViewer* viewer,
-                                           const QPointF& scenePoint);
+                                           const QPointF& scenePoint,
+                                           const vc::lasagna::LineStripPositionMap* positionMap = nullptr);
 std::optional<float> generatedCrossSliceControlPointDistanceThreshold(CChunkedVolumeViewer* viewer);
 GeneratedOverlay makeGeneratedCrossSliceOverlayForPlane(const GeneratedViews& views,
                                                         double linePosition,

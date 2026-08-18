@@ -52,6 +52,13 @@ struct ReplayResult {
 
 using EventProfile = std::map<std::string, std::int64_t>;
 
+struct AttributionWindow {
+    std::vector<std::size_t> candidates;
+    double units{0.0};
+};
+
+using ThreadAttributionWindows = std::map<std::int64_t, std::vector<AttributionWindow>>;
+
 struct EventCostModel {
     std::vector<std::string> feature_names;
     std::vector<double> coefficients_ns;
@@ -70,7 +77,12 @@ public:
     [[nodiscard]] std::size_t size() const noexcept { return _events.size(); }
     [[nodiscard]] const std::vector<Event>& events() const noexcept { return _events; }
 
+    [[nodiscard]] ThreadAttributionWindows attributionWindows(double residual_fraction) const;
+
     [[nodiscard]] std::vector<double> assignCosts(const std::map<std::int64_t, double>& thread_costs, double residual_fraction, const std::string& split_policy) const;
+
+    [[nodiscard]] std::vector<double> assignWindowCosts(
+        const std::map<std::int64_t, std::vector<double>>& window_costs, double residual_fraction, const std::string& split_policy) const;
 
     [[nodiscard]] ReplayResult replayAdjusted(const std::vector<double>& durations, const ReplayOptions& options) const;
 

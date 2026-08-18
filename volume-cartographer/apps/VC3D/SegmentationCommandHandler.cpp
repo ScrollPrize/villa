@@ -4629,6 +4629,92 @@ void SegmentationCommandHandler::onMergePatch(const QStringList& segmentIds)
     emit statusMessage(tr("Patching tifxyz..."), 0);
 }
 
+void SegmentationCommandHandler::onGrowTrackPatches()
+{
+    if (!_cmdRunner) {
+        QMessageBox::warning(_parentWidget, tr("Grow Track Patches"),
+                             tr("Command runner is not initialized."));
+        return;
+    }
+    if (_cmdRunner->isRunning()) {
+        QMessageBox::warning(_parentWidget, tr("Grow Track Patches"),
+                             tr("A command-line tool is already running."));
+        return;
+    }
+
+    GrowTrackPatchesDialog dlg(_parentWidget);
+    if (dlg.exec() != QDialog::Accepted) {
+        emit statusMessage(tr("Grow Track Patches cancelled"), 3000);
+        return;
+    }
+
+    const QString python = dlg.resolvedPython();
+    const QString script = dlg.scriptPath();
+    const QStringList scriptArgs = dlg.buildArgs();
+
+    // Validate python executable once more (dialog already did)
+    QFileInfo pyInfo(python);
+    if (!pyInfo.exists() || (!pyInfo.isExecutable() && !pyInfo.isFile())) {
+        QMessageBox::warning(_parentWidget, tr("Grow Track Patches"),
+                             tr("Python executable not found or not executable: %1").arg(python));
+        return;
+    }
+    if (!QFileInfo(script).isFile()) {
+        QMessageBox::warning(_parentWidget, tr("Grow Track Patches"),
+                             tr("Script not found: %1").arg(script));
+        return;
+    }
+
+    // Build full args: script path as first arg followed by dialog args
+    QStringList args;
+    args << script << scriptArgs;
+
+    if (dlg.ompThreads() > 0) {
+        _cmdRunner->setNextOmpThreads(dlg.ompThreads());
+    }
+
+    // Connect one-shot completion handler to surface status messages.
+    // Use CustomCommand tool identifier.
+    QPointer<SegmentationCommandHandler> guard(this);
+    auto connection = std::make_shared<QMetaObject::Connection>();
+    *connection = connect(_cmdRunner, &CommandLineToolRunner::toolFinished,
+                          this,
+                          [this, guard, connection]
+                          (CommandLineToolRunner::Tool tool,
+                           bool success,
+                           const QString& message,
+                           const QString& /*outputPath*/,
+                           bool) {
+        if (!guard) {
+            disconnect(*connection);
+            return;
+        }
+        if (tool != CommandLineToolRunner::Tool::CustomCommand) {
+            return;
+        }
+        disconnect(*connection);
+        if (success) {
+            emit statusMessage(tr("Grow Track Patches finished"), 5000);
+            if (_surfacePanel) {
+                _surfacePanel->reloadSurfacesFromDisk();
+            }
+        } else {
+            QMessageBox::critical(_parentWidget, tr("Grow Track Patches"),
+                                  tr("grow_track_graph.py failed.\n%1").arg(message));
+            emit statusMessage(tr("Grow Track Patches failed"), 5000);
+        }
+    });
+
+    _cmdRunner->showConsoleOutput();
+    const bool started = _cmdRunner->executeCustomCommand(python, args, tr("Grow Track Patches"));
+    if (!started) {
+        QObject::disconnect(*connection);
+        emit statusMessage(tr("Failed to start grow_track_graph.py"), 5000);
+        return;
+    }
+    emit statusMessage(tr("Running grow_track_graph.py..."), 0);
+}
+
 void SegmentationCommandHandler::onAddIgnoreLabel()
 {
     if (!_state || !_state->vpkg()) {

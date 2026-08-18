@@ -353,7 +353,7 @@ int main(int argc, char** argv)
     auto surface = std::make_shared<QuadSurface>(points, cv::Vec2f{1.0f, 1.0f});
     surface->path = std::filesystem::path(segDir.toStdString());
 
-    CState state(0);
+    CState state;
     state.setSurface("segmentation", surface, true);
     panel._lastLasagnaMode = SegmentationLasagnaPanel::LasagnaMode::NewModel;
     panel.setState(&state);

@@ -4,6 +4,7 @@ import atexit
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from functools import wraps
 import json
 import multiprocessing as mp
 from multiprocessing import shared_memory
@@ -39,6 +40,11 @@ except ImportError:
 		build_scalar_omezarr_pyramid,
 		set_pyramid_metadata,
 	)
+
+try:
+	from live_omezarr_cache import LiveOmeZarrCache, selected_level_lock_for_input
+except ImportError:
+	from lasagna.live_omezarr_cache import LiveOmeZarrCache, selected_level_lock_for_input
 
 
 ChunkOriginZYX = tuple[int, int, int]
@@ -1045,6 +1051,23 @@ def _predict3d_progress_line(progress: dict) -> str:
 	fill = int(round(done / total * bar_w))
 	fill = max(0, min(bar_w, fill))
 	bar = "#" * fill + "-" * (bar_w - fill)
+	live_cache = progress.get("live_cache")
+	cache_status = ""
+	if isinstance(live_cache, Mapping):
+		resident = int(live_cache.get("resident_bytes", 0)) / float(1 << 40)
+		target = int(live_cache.get("target_bytes", 0)) / float(1 << 40)
+		safe_plane = int(live_cache.get("safe_plane_exclusive", 0))
+		downloaded = int(live_cache.get("downloaded_chunks", 0))
+		missing = int(live_cache.get("missing_chunks", live_cache.get("missing_requests", 0)))
+		inflight = int(live_cache.get("inflight_downloads", 0))
+		evicted = int(live_cache.get("evicted_planes", 0))
+		rate = float(live_cache.get("download_rate_bytes_s", 0.0)) / float(1 << 20)
+		over = "+" if live_cache.get("over_target") else ""
+		cache_status = (
+			f" cache={resident:.2f}/{target:.2f}TiB{over} dl={downloaded} "
+			f"miss={missing} inflight={inflight} rate={rate:.1f}MiB/s "
+			f"safe_zchunk={safe_plane} evicted={evicted}"
+		)
 	return (
 		f"[predict3d] [{bar}] {done}/{total} tiles "
 		f"({100.0 * done / total:.1f}%) "
@@ -1052,7 +1075,46 @@ def _predict3d_progress_line(progress: dict) -> str:
 		f"{avg}"
 		f"{_predict3d_overall_eta(progress)}"
 		f"{_predict3d_finalized_status(progress)}"
+		f"{cache_status}"
 	)
+
+
+class _Predict3dProgressEmitter:
+	"""Render identical live progress through a terminal or manager pipe."""
+
+	def __init__(
+		self, *, refresh_seconds: float = 1.0, history_seconds: float = 60.0,
+		clock: Any | None = None,
+	) -> None:
+		self._refresh_seconds = float(refresh_seconds)
+		self._history_seconds = float(history_seconds)
+		self._clock = clock or time.monotonic
+		now = float(self._clock())
+		self._last_refresh = now
+		self._last_history = now
+		self._last_done = 0
+		self._line_open = False
+
+	def emit(self, status: str, *, done: int, total: int) -> None:
+		now = float(self._clock())
+		changed = int(done) != self._last_done
+		self._last_done = int(done)
+		if not changed:
+			return
+		if int(done) >= int(total) or now - self._last_history >= self._history_seconds:
+			print(("\r" if self._line_open else "") + status, flush=True)
+			self._line_open = False
+			self._last_refresh = now
+			self._last_history = now
+		elif now - self._last_refresh >= self._refresh_seconds:
+			print(f"\r{status}  ", end="", flush=True)
+			self._line_open = True
+			self._last_refresh = now
+
+	def finish_line(self) -> None:
+		if self._line_open:
+			print(flush=True)
+			self._line_open = False
 
 
 def _iter_chunk_origins_for_region(
@@ -2286,6 +2348,24 @@ def _iter_canonical_tile_events(
 				yield int(tz), int(ty), int(tx), iy == len(y_positions) - 1 and ix == len(x_positions) - 1, next_tz
 
 
+def _lock_selected_level_reader(function):
+	@wraps(function)
+	def wrapped(*args, **kwargs):
+		if kwargs.get("live_cache") is not None:
+			return function(*args, **kwargs)
+		input_path = kwargs.get("input_zarr_path")
+		lock = (
+			selected_level_lock_for_input(input_path, exclusive=False)
+			if input_path is not None else None
+		)
+		if lock is None:
+			return function(*args, **kwargs)
+		with lock:
+			return function(*args, **kwargs)
+	return wrapped
+
+
+@_lock_selected_level_reader
 def run_tiled_inference_3d(
 	model,
 	zarr_arr,
@@ -2318,6 +2398,7 @@ def run_tiled_inference_3d(
 	profile_pipeline: bool = False,
 	product_accumulator_dtype: str | np.dtype = "float16",
 	accumulator_workers: int = 0,
+	live_cache: LiveOmeZarrCache | None = None,
 ) -> None:
 	"""Authoritative one-pass, multi-scale tiled inference engine."""
 	products = tuple(products)
@@ -2361,6 +2442,15 @@ def run_tiled_inference_3d(
 		)
 	if input_reader == "tensorstore" and input_zarr_path is None:
 		raise ValueError("TensorStore input requires input_zarr_path")
+	if live_cache is not None:
+		if input_zarr_path is None:
+			raise ValueError("live cache requires input_zarr_path")
+		if Path(str(input_zarr_path).rstrip("/")).resolve() != live_cache.source.level_path.resolve():
+			raise ValueError("live cache selected level does not match input_zarr_path")
+		if (z0, z1, y0, y1, x0, x1) != (
+			0, volume_shape[0], 0, volume_shape[1], 0, volume_shape[2],
+		):
+			raise ValueError("live cache supports only full, non-cropped inference")
 	scales = {
 		p.name: max(1, int(p.inference_scaledown or 1))
 		for p in products
@@ -2511,7 +2601,10 @@ def run_tiled_inference_3d(
 				max(0, int(origin[1]) * sd), min(volume_shape[1], int(ends[1]) * sd),
 				max(0, int(origin[2]) * sd), min(volume_shape[2], int(ends[2]) * sd),
 			)
-			cache[origin] = all(bounds[i] < bounds[i + 1] for i in (0, 2, 4)) and _input_has_chunks(input_dir, *bounds)
+			cache[origin] = all(bounds[i] < bounds[i + 1] for i in (0, 2, 4)) and (
+				live_cache.region_has_remote_chunks(bounds)
+				if live_cache is not None else _input_has_chunks(input_dir, *bounds)
+			)
 		return bool(cache[origin])
 
 	def _needed_chunks(sd: int, g: dict[str, Any], reg: RegionZYX) -> dict[ChunkOriginZYX, tuple[OutputProductSpec, ...]]:
@@ -2530,13 +2623,44 @@ def run_tiled_inference_3d(
 				g["unsupported_origins"].add(origin)
 		return needed
 
-	def _tile_work(tz: int, ty: int, tx: int) -> tuple[str, ...]:
-		bounds = (
+	def _tile_input_bounds(tz: int, ty: int, tx: int) -> RegionZYX:
+		return (
 			max(0, tz + z0 - pad), min(volume_shape[0], tz + z0 - pad + tile_size),
 			max(0, ty + y0 - pad), min(volume_shape[1], ty + y0 - pad + tile_size),
 			max(0, tx + x0 - pad), min(volume_shape[2], tx + x0 - pad + tile_size),
 		)
-		if not _input_has_chunks(input_dir, *bounds):
+
+	def _tile_may_need_output(tz: int, ty: int, tx: int) -> bool:
+		"""Check durable output resume state without consulting input cache state."""
+		for sd, g in groups.items():
+			Zo, Yo, Xo = g["shape"]
+			ts = tile_size // sd
+			clips = [
+				_downscaled_tile_clip(value, sd, ts, size)
+				for value, size in zip((tz, ty, tx), (Zo, Yo, Xo))
+			]
+			oz0, oy0, ox0, oz1, oy1, ox1 = g["region"]
+			b = g["b"]
+			reg = (
+				max(oz0, oz0 + clips[0][0] - b), min(oz1, oz0 + clips[0][1] - b),
+				max(oy0, oy0 + clips[1][0] - b), min(oy1, oy0 + clips[1][1] - b),
+				max(ox0, ox0 + clips[2][0] - b), min(ox1, ox0 + clips[2][1] - b),
+			)
+			for origin in _iter_chunk_origins_for_region(*reg, g["oc"], g["full_shape"]):
+				if any(
+					not output_adapter.product_chunk_complete(product, chunk_origin_zyx=origin)
+					for product in g["products"]
+				):
+					return True
+		return False
+
+	def _tile_work(tz: int, ty: int, tx: int) -> tuple[str, ...]:
+		bounds = _tile_input_bounds(tz, ty, tx)
+		has_source = (
+			live_cache.region_has_remote_chunks(bounds)
+			if live_cache is not None else _input_has_chunks(input_dir, *bounds)
+		)
+		if not has_source:
 			return ()
 		needed_names: set[str] = set()
 		for sd, g in groups.items():
@@ -2961,7 +3085,10 @@ def run_tiled_inference_3d(
 	t0 = time.time()
 	if progress is not None:
 		progress.update(tiles_total=total, tiles_done=0, tiles_processed=0, tiles_skipped=0, tile_time_sum=0.0, tiles_remaining_est=total)
+		if live_cache is not None:
+			progress["live_cache"] = live_cache.snapshot()
 	print(_predict3d_progress_line(progress) if progress is not None else f"[predict3d] 0/{total} tiles", flush=True)
+	progress_emitter = _Predict3dProgressEmitter()
 	try:
 		def _record_commit(*, was_processed: bool, elapsed: float, row_end: bool, next_tz: int) -> None:
 			nonlocal done, processed, skipped, tile_time
@@ -2976,13 +3103,20 @@ def run_tiled_inference_3d(
 				skipped += 1
 			if progress is not None:
 				progress.update(tiles_done=done, tiles_processed=processed, tiles_skipped=skipped, tile_time_sum=tile_time, tiles_remaining_est=total-done)
+				if live_cache is not None:
+					progress["live_cache"] = live_cache.snapshot()
 			status = _predict3d_progress_line(progress) if progress is not None else f"[predict3d] {done}/{total} tiles"
-			if was_processed and sys.stdout.isatty():
-				print(f"\r{status}  ", end="", flush=True)
-			elif done == total or (row_end and done % max(1, len(y_positions) * len(x_positions)) == 0):
-				print(status, flush=True)
+			progress_emitter.emit(status, done=done, total=total)
 			if row_end:
+				progress_emitter.finish_line()
 				_advance_flushes(next_tz)
+				if live_cache is not None:
+					safe_input_z = min(
+						volume_shape[0], max(0, int(next_tz) + int(z0) - int(pad)),
+					)
+					live_cache.advance_safe_boundary(safe_input_z)
+					if progress is not None:
+						progress["live_cache"] = live_cache.snapshot()
 
 		if not parallel:
 			_start_flush_workers()
@@ -3007,6 +3141,82 @@ def run_tiled_inference_3d(
 
 			def _next_serial_event() -> dict[str, Any] | None:
 				nonlocal serial_source_done, serial_ready_highwater
+				if live_cache is not None:
+					while not serial_source_done and len(serial_pending) < live_cache.lookahead_tiles:
+						try:
+							tz, ty, tx, row_end, next_tz = next(serial_source)
+						except StopIteration:
+							serial_source_done = True
+							break
+						event = dict(
+							coord=(tz, ty, tx), row_end=row_end, next_tz=next_tz,
+						)
+						if not _tile_may_need_output(tz, ty, tx):
+							event.update(status="done_skip", needed=())
+						else:
+							event.update(
+								status="fetching",
+								cache_task=live_cache.request_region(_tile_input_bounds(tz, ty, tx)),
+							)
+						serial_pending.append(event)
+
+					def finish_materialization(event: dict[str, Any], *, block: bool) -> bool:
+						if event["status"] != "fetching":
+							return True
+						task = event["cache_task"]
+						if not block and not task.done():
+							return False
+						task.result()
+						tz, ty, tx = event["coord"]
+						event["needed"] = _tile_work(tz, ty, tx)
+						event["status"] = "awaiting_read" if event["needed"] else "done_skip"
+						return True
+
+					for pending_event in serial_pending:
+						finish_materialization(pending_event, block=False)
+					active_reads = sum(
+						1 for pending_event in serial_pending if pending_event.get("status") == "reading"
+					)
+					for pending_event in serial_pending:
+						if active_reads >= int(prefetch_tiles_per_gpu):
+							break
+						if pending_event.get("status") != "awaiting_read":
+							continue
+						if serial_reader is None:
+							pending_event["status"] = "ready"
+							continue
+						tz, ty, tx = pending_event["coord"]
+						pending_event["read_task"] = serial_reader.submit(
+							volume_shape=volume_shape, crop_offset=(z0, y0, x0), coord=(tz, ty, tx),
+							tile_size=tile_size, border=pad,
+						)
+						pending_event["status"] = "reading"
+						active_reads += 1
+					if not serial_pending:
+						return None
+					head = serial_pending[0]
+					if head["status"] == "fetching":
+						finish_materialization(head, block=True)
+					if head["status"] == "awaiting_read":
+						if serial_reader is None:
+							head["status"] = "ready"
+						else:
+							tz, ty, tx = head["coord"]
+							head["read_task"] = serial_reader.submit(
+								volume_shape=volume_shape, crop_offset=(z0, y0, x0), coord=(tz, ty, tx),
+								tile_size=tile_size, border=pad,
+							)
+							head["status"] = "reading"
+					serial_ready_highwater = max(
+						serial_ready_highwater,
+						sum(
+							1 for pending_event in serial_pending
+							if pending_event.get("status") == "reading"
+							and serial_reader is not None
+							and serial_reader.done(pending_event["read_task"])
+						),
+					)
+					return serial_pending.popleft()
 				if serial_reader is None:
 					try:
 						tz, ty, tx, row_end, next_tz = next(serial_source)
@@ -3050,7 +3260,12 @@ def run_tiled_inference_3d(
 						continue
 					tile_t0 = time.time()
 					if serial_reader is None:
-						tile_np = event["tile"]
+						if live_cache is not None:
+							tile_np = _read_tile_zarr(
+								zarr_arr, volume_shape, (z0, y0, x0), tz, ty, tx, tile_size, pad,
+							)
+						else:
+							tile_np = event["tile"]
 					else:
 						tile_np, read_elapsed = serial_reader.result(event["read_task"])
 						serial_read_sum += float(read_elapsed)
@@ -3086,6 +3301,10 @@ def run_tiled_inference_3d(
 					serial_reader.cancel(
 						event["read_task"] for event in serial_pending if event.get("read_task") is not None
 					)
+				for pending_event in serial_pending:
+					cache_task = pending_event.get("cache_task")
+					if cache_task is not None:
+						cache_task.cancel()
 			if serial_reader is not None:
 				print(
 					f"[predict3d] input stats backend=tensorstore reads={processed} "
@@ -3095,6 +3314,9 @@ def run_tiled_inference_3d(
 		else:
 			_slot_count = len(resolved_devices) * int(slots_per_gpu)
 			_prefetch_window = len(resolved_devices) * int(prefetch_tiles_per_gpu)
+			_materialization_window = (
+				live_cache.lookahead_tiles if live_cache is not None else _prefetch_window
+			)
 			_input_layouts, input_bytes = _packed_layouts((("input", (tile_size, tile_size, tile_size), np.dtype(zarr_arr.dtype)),))
 			_result_entries = []
 			for product in products:
@@ -3117,7 +3339,8 @@ def run_tiled_inference_3d(
 			result_specs = tuple(_SharedSlotSpec(shm.name, result_bytes, _result_layouts) for shm in result_shms)
 			print(
 				f"[predict3d] multi-device devices={','.join(str(v) for v in resolved_devices)} slots={_slot_count} "
-				f"prefetch_window={_prefetch_window} input_shared={_slot_count * input_bytes / 1024**3:.2f}GiB "
+				f"prefetch_window={_prefetch_window} materialization_window={_materialization_window} "
+				f"input_shared={_slot_count * input_bytes / 1024**3:.2f}GiB "
 				f"result_shared={_slot_count * result_bytes / 1024**3:.2f}GiB",
 				flush=True,
 			)
@@ -3388,38 +3611,64 @@ def run_tiled_inference_3d(
 							raise RuntimeError(
 								f"accumulator worker {index} exited unexpectedly with code {process.exitcode}"
 							)
-					while not source_done and len(events) < _prefetch_window:
+					while not source_done and len(events) < _materialization_window:
 						try:
 							tz, ty, tx, row_end, next_tz = next(event_iter)
 						except StopIteration:
 							source_done = True
 							break
-						needed_names = _tile_work(tz, ty, tx)
-						event = dict(coord=(tz, ty, tx), row_end=row_end, next_tz=next_tz, needed=needed_names)
-						if not needed_names:
-							event["status"] = "done_skip"
-						else:
-							event["status"] = "reading"
-							if tensorstore_reader is not None:
-								task = tensorstore_reader.submit(
-									volume_shape=volume_shape, crop_offset=(z0, y0, x0),
-									coord=(tz, ty, tx), tile_size=tile_size, border=pad,
-									profile=bool(profile_pipeline),
-								)
-								event["read_task"] = task
-								futures[id(task)] = next_sequence
+						event = dict(coord=(tz, ty, tx), row_end=row_end, next_tz=next_tz)
+						if live_cache is not None:
+							if not _tile_may_need_output(tz, ty, tx):
+								event.update(status="done_skip", needed=())
 							else:
-								event["read_submitted_at"] = time.perf_counter()
-								future = executor.submit(_read_coord, (tz, ty, tx))
-								if profile_pipeline:
-									future.add_done_callback(
-										lambda _future, current=event: current.__setitem__("read_completed_at", time.perf_counter())
-									)
-								event["read_task"] = future
-								futures[future] = next_sequence
-							read_submitted += 1
+								event.update(
+									status="fetching",
+									cache_task=live_cache.request_region(_tile_input_bounds(tz, ty, tx)),
+								)
+						else:
+							needed_names = _tile_work(tz, ty, tx)
+							event["needed"] = needed_names
+							event["status"] = "awaiting_read" if needed_names else "done_skip"
 						events[next_sequence] = event
 						next_sequence += 1
+						made_progress = True
+					for event in events.values():
+						if event.get("status") != "fetching":
+							continue
+						cache_task = event["cache_task"]
+						if not cache_task.done():
+							continue
+						cache_task.result()
+						tz, ty, tx = event["coord"]
+						event["needed"] = _tile_work(tz, ty, tx)
+						event["status"] = "awaiting_read" if event["needed"] else "done_skip"
+						made_progress = True
+					for seq, event in events.items():
+						if len(futures) >= _prefetch_window:
+							break
+						if event.get("status") != "awaiting_read":
+							continue
+						tz, ty, tx = event["coord"]
+						event["status"] = "reading"
+						if tensorstore_reader is not None:
+							task = tensorstore_reader.submit(
+								volume_shape=volume_shape, crop_offset=(z0, y0, x0),
+								coord=(tz, ty, tx), tile_size=tile_size, border=pad,
+								profile=bool(profile_pipeline),
+							)
+							event["read_task"] = task
+							futures[id(task)] = seq
+						else:
+							event["read_submitted_at"] = time.perf_counter()
+							future = executor.submit(_read_coord, (tz, ty, tx))
+							if profile_pipeline:
+								future.add_done_callback(
+									lambda _future, current=event: current.__setitem__("read_completed_at", time.perf_counter())
+								)
+							event["read_task"] = future
+							futures[future] = seq
+						read_submitted += 1
 						made_progress = True
 					read_live_highwater = max(read_live_highwater, len(futures))
 					for future_key, seq in list(futures.items()):
@@ -3551,7 +3800,10 @@ def run_tiled_inference_3d(
 						not work_queue.full() for work_queue in work_queues
 					)
 					has_ready_input = any(event["status"] == "ready" for event in events.values())
-					has_pending_input = any(event["status"] == "reading" for event in events.values())
+					has_pending_input = any(
+						event["status"] in ("fetching", "awaiting_read", "reading")
+						for event in events.values()
+					)
 					if can_accept_input and not has_ready_input and has_pending_input:
 						if starve_started is None:
 							starve_started = time.perf_counter()
@@ -3626,6 +3878,10 @@ def run_tiled_inference_3d(
 						flush=True,
 					)
 			finally:
+				for event in events.values():
+					cache_task = event.get("cache_task")
+					if cache_task is not None:
+						cache_task.cancel()
 				if tensorstore_reader is not None:
 					tensorstore_reader.cancel(
 						event["read_task"] for event in events.values()
@@ -3669,8 +3925,7 @@ def run_tiled_inference_3d(
 					shm.unlink()
 		_complete_pending_flush()
 		_shutdown_flush_workers(terminate=False)
-		if progress is not None:
-			print(_predict3d_progress_line(progress), flush=True)
+		progress_emitter.finish_line()
 		flush_wall = 0.0 if flush_started_at is None else time.perf_counter() - flush_started_at
 		flush_rate = 0.0 if flush_wall <= 0.0 else flush_chunks_total / flush_wall
 		print(

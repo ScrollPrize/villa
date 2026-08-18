@@ -178,6 +178,21 @@ struct LineAnnotationController::LineAnnotationSession {
     std::optional<vc::lasagna::LineModel> optimizedLineBeforeModeChange;
     std::optional<std::vector<LineAnnotationController::FiberBranchRef>>
         branchesBeforeModeChange;
+    struct ControlPointCollapseRollback {
+        std::vector<vc3d::line_annotation::LineControlPoint> controlPoints;
+        vc::lasagna::LineModel optimizedLine;
+        vc::lasagna::LineOptimizationReport optimizationReport;
+        std::vector<LineAnnotationController::FiberBranchRef> branches;
+        fs::path selectedManifestPath;
+        cv::Vec3d seedPoint{0.0, 0.0, 0.0};
+        double focusedLinePosition = 0.0;
+        std::optional<cv::Vec3d> focusedControlPoint;
+        bool lineWasOptimized = false;
+        bool fiberMetricsMatchStoredFiber = false;
+        SessionOptimizationState optimizationState =
+            SessionOptimizationState::Unoptimized;
+    };
+    std::optional<ControlPointCollapseRollback> controlPointCollapseRollback;
     std::optional<fs::path> atlasDir;
     fs::path atlasFiberPath;
     vc::atlas::AtlasPredSnapSet predSnapSet;
@@ -232,6 +247,7 @@ struct LineAnnotationController::IntersectionInspectionSession {
         bool strip = false;
         bool follow = false;
         double linePosition = 0.0;
+        vc::lasagna::LineStripPositionMap stripPositionMap;
     };
 
     QPointer<QMdiArea> targetArea;
@@ -253,6 +269,9 @@ struct LineAnnotationController::IntersectionInspectionSession {
 };
 
 namespace {
+
+constexpr double kMinimumControlPointSpacingBaseVoxels =
+    vc::lasagna::kLineViewSamplingDistanceBaseVoxels;
 
 std::optional<vc3d::opendata::CoordinateIdentity> coordinateIdentityForState(
     const CState* state)
@@ -877,6 +896,36 @@ bool branchLinkedEndpointMatches(
            lhs.branchControlPointIndex == rhs.branchControlPointIndex;
 }
 
+bool deduplicateBranchLinks(
+    std::vector<LineAnnotationController::FiberBranchRef>& branches,
+    uint64_t targetFiberId = 0,
+    const std::string& targetFileName = {})
+{
+    const bool targetScoped = targetFiberId != 0 || !targetFileName.empty();
+    std::vector<LineAnnotationController::FiberBranchRef> deduplicated;
+    deduplicated.reserve(branches.size());
+    for (auto& branch : branches) {
+        if (targetScoped &&
+            !branchReferencesFiber(branch, targetFiberId, targetFileName)) {
+            deduplicated.push_back(std::move(branch));
+            continue;
+        }
+        const auto duplicate = std::find_if(
+            deduplicated.begin(), deduplicated.end(), [&branch](const auto& candidate) {
+                return candidate.controlPointIndex == branch.controlPointIndex &&
+                       branchLinkedEndpointMatches(candidate, branch);
+            });
+        if (duplicate == deduplicated.end()) {
+            deduplicated.push_back(std::move(branch));
+        } else {
+            duplicate->pending = duplicate->pending || branch.pending;
+        }
+    }
+    const bool changed = deduplicated.size() != branches.size();
+    branches = std::move(deduplicated);
+    return changed;
+}
+
 template <typename ControlPoint>
 std::optional<size_t> controlPointIndexAtLinePosition(
     const std::vector<ControlPoint>& controls,
@@ -1199,7 +1248,8 @@ cv::Vec3f interpolatedUpAtLinePosition(const std::vector<cv::Vec3f>& upVectors,
 }
 
 std::optional<cv::Vec2f> stripLinePositionToSurfacePoint(QuadSurface* surface,
-                                                         double linePosition)
+                                                         double linePosition,
+                                                         const vc::lasagna::LineStripPositionMap* positionMap)
 {
     if (!surface || !std::isfinite(linePosition)) {
         return std::nullopt;
@@ -1208,29 +1258,31 @@ std::optional<cv::Vec2f> stripLinePositionToSurfacePoint(QuadSurface* surface,
     if (!points || points->empty()) {
         return std::nullopt;
     }
-    const cv::Vec2f scale = surface->scale();
-    if (scale[0] == 0.0f || scale[1] == 0.0f) {
+    const double gridColumn = positionMap && positionMap->valid()
+        ? positionMap->originalPositionToStripGridColumn(linePosition)
+        : linePosition;
+    if (!std::isfinite(gridColumn)) {
         return std::nullopt;
     }
-    const float surfaceX = (static_cast<float>(linePosition) -
-                            static_cast<float>(points->cols) / 2.0f) / scale[0];
-    const float centerRow = static_cast<float>(points->rows / 2);
-    const float surfaceY = (centerRow - static_cast<float>(points->rows) / 2.0f) / scale[1];
-    return cv::Vec2f{surfaceX, surfaceY};
+    const cv::Vec2d surfacePoint = surface->gridToSurface(
+        {gridColumn, static_cast<double>(points->rows / 2)});
+    return cv::Vec2f{static_cast<float>(surfacePoint[0]),
+                     static_cast<float>(surfacePoint[1])};
 }
 
 void frameStripLineSpan(CChunkedVolumeViewer* viewer,
                         QuadSurface* surface,
                         double firstLinePosition,
-                        double secondLinePosition)
+                        double secondLinePosition,
+                        const vc::lasagna::LineStripPositionMap* positionMap)
 {
     if (!viewer || !surface ||
         !std::isfinite(firstLinePosition) ||
         !std::isfinite(secondLinePosition)) {
         return;
     }
-    const auto first = stripLinePositionToSurfacePoint(surface, firstLinePosition);
-    const auto second = stripLinePositionToSurfacePoint(surface, secondLinePosition);
+    const auto first = stripLinePositionToSurfacePoint(surface, firstLinePosition, positionMap);
+    const auto second = stripLinePositionToSurfacePoint(surface, secondLinePosition, positionMap);
     if (!first || !second) {
         return;
     }
@@ -1397,6 +1449,28 @@ void remapBranchControlPointIndices(
                                       return branch.controlPointIndex < 0;
                                   }),
                    branches.end());
+}
+
+void remapCollapsedBranchControlPointIndices(
+    const std::vector<size_t>& oldToNewIndices,
+    std::vector<LineAnnotationController::FiberBranchRef>& branches)
+{
+    for (auto& branch : branches) {
+        if (branch.controlPointIndex < 0 ||
+            static_cast<size_t>(branch.controlPointIndex) >= oldToNewIndices.size()) {
+            branch.controlPointIndex = -1;
+            continue;
+        }
+        branch.controlPointIndex = static_cast<int>(
+            oldToNewIndices[static_cast<size_t>(branch.controlPointIndex)]);
+    }
+    branches.erase(
+        std::remove_if(branches.begin(), branches.end(), [](const auto& branch) {
+            return branch.controlPointIndex < 0;
+        }),
+        branches.end());
+
+    deduplicateBranchLinks(branches);
 }
 
 std::vector<vc3d::line_annotation::GeneratedOverlay::PredSnapMarker>
@@ -4267,6 +4341,11 @@ bool LineAnnotationController::rebuildIntersectionInspection(QString* errorMessa
                 lineModelFromPoints(side.fiber->linePoints,
                                     side.editSession->normalSampler.get());
             vc::lasagna::LineViewConfig sideConfig;
+            sideConfig.controlPointLinePositions.reserve(
+                side.editSession->controlPoints.size());
+            for (const auto& control : side.editSession->controlPoints) {
+                sideConfig.controlPointLinePositions.push_back(control.linePosition);
+            }
             // Same orientation pin as the annotation views, so the inspection
             // strip's vertical does not flip between fibers or rebuilds.
             sideConfig.orientedPointNormals =
@@ -4725,7 +4804,8 @@ bool LineAnnotationController::rebuildIntersectionInspection(QString* errorMessa
                 frameStripLineSpan(chunkedViewer,
                                    quad,
                                    side.triplet.previousLinePosition,
-                                   side.triplet.nextLinePosition);
+                                   side.triplet.nextLinePosition,
+                                   &side.lineViews.stripPositionMap);
             }
             if (_intersectionInspection) {
                 _intersectionInspection->generatedSurfaceContexts[side.stripSurfaceName] =
@@ -4735,10 +4815,13 @@ bool LineAnnotationController::rebuildIntersectionInspection(QString* errorMessa
                         true,
                         false,
                         side.focusLinePosition,
+                        side.lineViews.stripPositionMap,
                     };
             }
             const std::vector<cv::Vec3d> linePoints = side.fiber->linePoints;
             const std::vector<cv::Vec3f> lineUpVectors = side.lineViews.lineUpVectors;
+            const vc::lasagna::LineStripPositionMap stripPositionMap =
+                side.lineViews.stripPositionMap;
             const auto session = side.editSession;
             const double focus = side.focusLinePosition;
             const std::vector<double> markerLinePositions{
@@ -4752,6 +4835,7 @@ bool LineAnnotationController::rebuildIntersectionInspection(QString* errorMessa
                  key = side.stripSurfaceName,
                  linePoints,
                  lineUpVectors,
+                 stripPositionMap,
                  session,
                  focus,
                  markerLinePositions]() {
@@ -4761,6 +4845,7 @@ bool LineAnnotationController::rebuildIntersectionInspection(QString* errorMessa
                     vc3d::line_annotation::GeneratedViews views;
                     views.linePoints = generatedLinePoints(linePoints);
                     views.lineUpVectors = lineUpVectors;
+                    views.stripPositionMap = stripPositionMap;
                     views.controlPoints = controlMarkersForSession(*session);
                     views.branchLinePoints = generatedBranchLinePointsForSession(*session);
                     views.branchLinks = generatedBranchLinkMarkers(session->branches);
@@ -4782,6 +4867,7 @@ bool LineAnnotationController::rebuildIntersectionInspection(QString* errorMessa
                     this,
                     [this,
                      chunkedViewer,
+                     stripPositionMap,
                      sourceSideFlag = side.sourceSide](cv::Vec3f,
                                                        Qt::MouseButtons,
                                                        Qt::KeyboardModifiers,
@@ -4798,7 +4884,8 @@ bool LineAnnotationController::rebuildIntersectionInspection(QString* errorMessa
                         const double linePosition =
                             vc3d::line_annotation::generatedLinePositionFromStripScene(
                                 chunkedViewer,
-                                scenePoint);
+                                scenePoint,
+                                &stripPositionMap);
                         if (std::isfinite(linePosition)) {
                             (void)updateIntersectionFollowSlice(
                                 sourceSideFlag,
@@ -4811,6 +4898,7 @@ bool LineAnnotationController::rebuildIntersectionInspection(QString* errorMessa
                     this,
                     [this,
                      surfaceName = side.stripSurfaceName,
+                     stripPositionMap,
                      sourceSideFlag = side.sourceSide](
                         cv::Vec3f volumePoint,
                         cv::Vec3f,
@@ -4823,7 +4911,8 @@ bool LineAnnotationController::rebuildIntersectionInspection(QString* errorMessa
                         const double linePosition =
                             vc3d::line_annotation::generatedLinePositionFromStripScene(
                                 qobject_cast<CChunkedVolumeViewer*>(sender()),
-                                scenePoint);
+                                scenePoint,
+                                &stripPositionMap);
                         if (!std::isfinite(linePosition)) {
                             return;
                         }
@@ -5376,7 +5465,8 @@ bool LineAnnotationController::showGeneratedControlPointContextMenu(CChunkedVolu
         if (context.strip) {
             linePosition = vc3d::line_annotation::generatedLinePositionFromStripScene(
                 viewer,
-                scenePoint);
+                scenePoint,
+                &context.stripPositionMap);
         } else if (context.follow) {
             const auto& follow = context.sourceSide
                 ? _intersectionInspection->sourceFollow
@@ -5397,6 +5487,7 @@ bool LineAnnotationController::showGeneratedControlPointContextMenu(CChunkedVolu
             : pane->session->optimizedLine.points.size();
         options.linePosition = linePosition;
         options.stripViewer = context.strip;
+        options.stripPositionMap = context.stripPositionMap;
         const auto candidateState = linkCandidateMenuState(*pane->session);
         options.linkWithCandidateEnabled = candidateState.enabled;
         options.linkWithCandidateLabel = candidateState.label;
@@ -6309,81 +6400,91 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
         return;
     }
 
-    if (session.fiberId != 0 && session.fiberMetricsMatchStoredFiber) {
-        session.fiberMetricsMatchStoredFiber = false;
-        invalidateFiberAlignmentMetrics(session.fiberId, true);
-    }
-
     const double maxPosition = static_cast<double>(session.optimizedLine.points.size() - 1);
     linePosition = std::clamp(linePosition, 0.0, maxPosition);
-    if (pane->dialog && pane->dialog->maxControlPointDistanceVx() > 0) {
-        std::vector<double> controlLinePositions;
-        controlLinePositions.reserve(session.controlPoints.size());
-        for (const auto& control : session.controlPoints) {
-            controlLinePositions.push_back(control.linePosition);
-        }
-        if (!vc3d::line_annotation::generatedControlPointPlacementWithinAnyDistance(
+    std::vector<cv::Vec3d> currentLinePoints;
+    currentLinePoints.reserve(session.optimizedLine.points.size());
+    for (const auto& point : session.optimizedLine.points) {
+        currentLinePoints.push_back(point.position);
+    }
+    const auto cumulativeArclengths =
+        vc3d::fiber_slice::cumulativePolylineArclengths(currentLinePoints);
+    std::vector<double> controlLinePositions;
+    controlLinePositions.reserve(session.controlPoints.size());
+    for (const auto& control : session.controlPoints) {
+        controlLinePositions.push_back(control.linePosition);
+    }
+    if (pane->dialog &&
+        pane->dialog->maxControlPointExtrapolationDistanceVx() > 0) {
+        if (!vc3d::fiber_slice::linePositionWithinControlExtrapolationDistance(
+                cumulativeArclengths,
                 linePosition,
                 controlLinePositions,
-                static_cast<double>(pane->dialog->maxControlPointDistanceVx()))) {
+                static_cast<double>(
+                    pane->dialog->maxControlPointExtrapolationDistanceVx()))) {
             return;
         }
     }
     const cv::Vec3d clicked(volumePoint[0], volumePoint[1], volumePoint[2]);
 
-    auto nearest = session.controlPoints.end();
-    double nearestDistance = std::numeric_limits<double>::infinity();
-    for (auto it = session.controlPoints.begin(); it != session.controlPoints.end(); ++it) {
-        if (!std::isfinite(it->linePosition)) {
-            continue;
-        }
-        const double distance = std::abs(it->linePosition - linePosition);
-        if (distance < nearestDistance) {
-            nearestDistance = distance;
-            nearest = it;
-        }
+    const std::vector<size_t> nearbyControlIndices =
+        vc3d::fiber_slice::linePositionIndicesWithinArclengthRadius(
+            cumulativeArclengths,
+            linePosition,
+            controlLinePositions,
+            kMinimumControlPointSpacingBaseVoxels);
+    if (!confirmLinkedControlPointEdits(session,
+                                        nearbyControlIndices,
+                                        tr("Replacing the nearby control points"))) {
+        return;
     }
 
-    size_t changedControlIndex = 0;
-    bool editedExistingControl = false;
-    if (nearest != session.controlPoints.end() && nearestDistance <= 0.5) {
-        editedExistingControl = true;
-        changedControlIndex = static_cast<size_t>(std::distance(session.controlPoints.begin(), nearest));
-        if (!confirmLinkedControlPointEdit(session,
-                                           static_cast<int>(changedControlIndex),
-                                           tr("Moving it"))) {
-            return;
-        }
-        vc3d::line_annotation::invalidateSegmentsAdjacentToControl(
-            session.controlPoints, changedControlIndex);
-        nearest->volumePoint = clicked;
-        nearest->optimizedIndex = -1;
-        linePosition = nearest->linePosition;
-        if (nearest->isSeed) {
-            session.seedPoint = clicked;
-        }
-    } else {
-        session.controlPoints.push_back({linePosition, clicked, false, -1});
-        changedControlIndex = session.controlPoints.size() - 1;
-        vc3d::line_annotation::invalidateSegmentSplitByInsertedControl(
-            session.controlPoints, changedControlIndex);
-    }
-
-    session.focusedLinePosition = linePosition;
-    session.focusedControlPoint = clicked;
-    setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
+    const std::vector<vc3d::line_annotation::LineControlPoint> previousControls =
+        session.controlPoints;
+    const std::vector<FiberBranchRef> previousBranches = session.branches;
+    const cv::Vec3d previousSeedPoint = session.seedPoint;
+    const double previousFocusedLinePosition = session.focusedLinePosition;
+    const std::optional<cv::Vec3d> previousFocusedControlPoint =
+        session.focusedControlPoint;
+    const SessionOptimizationState previousOptimizationState =
+        session.optimizationState;
     const bool autoReoptimize =
         !pane->dialog ||
         pane->dialog->reoptimizationMode() ==
             LineAnnotationDialog::ReoptimizationMode::AutoReoptimize;
     if (!autoReoptimize) {
-        const std::string noReoptEventName = editedExistingControl
-            ? "control_edit_no_reopt"
-            : "control_add_no_reopt";
+        auto collapse = vc3d::line_annotation::collapseControlPointsAtClick(
+            session.controlPoints,
+            nearbyControlIndices,
+            linePosition,
+            clicked);
+        const bool editedExistingControl = collapse.replacedExisting();
+        const size_t collapsedControlCount = collapse.collapsedOldIndices.size();
+        const size_t changedControlIndex = collapse.replacementIndex;
+        session.controlPoints = std::move(collapse.controlPoints);
+        remapCollapsedBranchControlPointIndices(collapse.oldToNewIndices,
+                                                session.branches);
+        if (session.controlPoints[changedControlIndex].isSeed) {
+            session.seedPoint = clicked;
+        }
+        session.focusedLinePosition = linePosition;
+        session.focusedControlPoint = clicked;
+        if (session.fiberId != 0 && session.fiberMetricsMatchStoredFiber) {
+            session.fiberMetricsMatchStoredFiber = false;
+            invalidateFiberAlignmentMetrics(session.fiberId, true);
+        }
+        setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
+        const std::string noReoptEventName = collapsedControlCount > 1
+            ? "control_collapse_no_reopt"
+            : (editedExistingControl ? "control_edit_no_reopt"
+                                     : "control_add_no_reopt");
         writeLineDebugJson(noReoptEventName,
                            session.controlPoints,
                            linePointsToJson(session.optimizedLine));
-        syncLinkedBranchMetadataAfterFiberModification(session);
+        const BranchMetadataSyncResult branchSync =
+            syncLinkedBranchMetadataAfterFiberModification(
+                session, nullptr, &previousBranches);
+        scheduleBranchMetadataSaves(branchSync.affectedFiberIds, session.fiberId);
         if (pane->dialog) {
             pane->dialog->setGeneratedBranchOverlayData(
                 controlMarkersForSession(session),
@@ -6397,20 +6498,9 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
         return;
     }
 
-    std::vector<cv::Vec3d> currentLinePoints;
-    currentLinePoints.reserve(session.optimizedLine.points.size());
-    for (const auto& point : session.optimizedLine.points) {
-        currentLinePoints.push_back(point.position);
-    }
-
-    const std::vector<vc3d::line_annotation::LineControlPoint> branchRemapControls = session.controlPoints;
-    const std::vector<FiberBranchRef> branchRemapBranches = session.branches;
-
-    vc::lasagna::LineControlPointUpdateResult update;
-    const std::string updateEventName = editedExistingControl
-        ? "control_edit_span_update"
-        : "control_add_span_update";
     const auto updateStart = Clock::now();
+    vc3d::line_annotation::PreparedControlPointEdit prepared;
+    vc::lasagna::LineModel preparedLine;
     try {
         vc::lasagna::LineOptimizationConfig updateConfig;
         const int initialCenterlineLengthVx = pane->dialog
@@ -6419,34 +6509,75 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
         const auto discretization = initialLineDiscretization(initialCenterlineLengthVx);
         updateConfig.segmentsPerSide = discretization.segmentsPerSide;
         updateConfig.segmentLength = discretization.segmentLength;
-        update = vc::lasagna::updateExistingLineControlPoint(std::move(currentLinePoints),
-                                                             vc3d::line_annotation::optimizerControlPoints(
-                                                                 session.controlPoints),
-                                                             changedControlIndex,
-                                                             *session.normalSampler,
-                                                             updateConfig);
+        prepared = vc3d::line_annotation::prepareAutomaticControlPointEdit(
+            currentLinePoints,
+            session.controlPoints,
+            nearbyControlIndices,
+            linePosition,
+            clicked,
+            *session.normalSampler,
+            updateConfig);
+        preparedLine = prepared.lineReconstructed
+            ? lineModelFromPoints(prepared.linePoints, session.normalSampler.get())
+            : session.optimizedLine;
     } catch (const std::exception& ex) {
         showError(tr("Could not update line control point: %1")
                       .arg(QString::fromStdString(ex.what())),
                   session.suppressErrorDialogs);
         return;
     }
-    session.optimizedLine = lineModelFromPoints(update.linePoints, session.normalSampler.get());
-    session.controlPoints = vc3d::line_annotation::mergeOptimizerControlPoints(
-        std::move(update.controlPoints), branchRemapControls);
-    syncLinkedBranchMetadataAfterFiberModification(
-        session,
-        &branchRemapControls,
-        &branchRemapBranches);
-    if (update.changedControlIndex >= 0 &&
-        update.changedControlIndex < static_cast<int>(session.controlPoints.size())) {
-        const auto& changed = session.controlPoints[static_cast<size_t>(update.changedControlIndex)];
-        session.focusedLinePosition = changed.linePosition;
-        session.focusedControlPoint = changed.volumePoint;
-        if (changed.isSeed) {
-            session.seedPoint = changed.volumePoint;
-        }
+
+    const bool editedExistingControl = !prepared.collapsedOldIndices.empty();
+    const size_t collapsedControlCount = prepared.collapsedOldIndices.size();
+    const std::vector<vc3d::line_annotation::LineControlPoint> branchRemapControls =
+        prepared.controlPointsBeforeLineUpdate;
+    if (collapsedControlCount > 1) {
+        session.controlPointCollapseRollback =
+            LineAnnotationSession::ControlPointCollapseRollback{
+                previousControls,
+                session.optimizedLine,
+                session.optimizationReport,
+                previousBranches,
+                session.selectedManifestPath,
+                previousSeedPoint,
+                previousFocusedLinePosition,
+                previousFocusedControlPoint,
+                session.lineWasOptimized,
+                session.fiberMetricsMatchStoredFiber,
+                previousOptimizationState};
     }
+
+    session.controlPoints = std::move(prepared.controlPoints);
+    remapCollapsedBranchControlPointIndices(prepared.oldToNewIndices,
+                                            session.branches);
+    const std::vector<FiberBranchRef> branchRemapBranches = session.branches;
+    session.optimizedLine = std::move(preparedLine);
+    const auto& changed = session.controlPoints[prepared.replacementIndex];
+    session.focusedLinePosition = changed.linePosition;
+    session.focusedControlPoint = changed.volumePoint;
+    if (changed.isSeed) {
+        session.seedPoint = changed.volumePoint;
+    }
+    if (collapsedControlCount <= 1 && session.fiberId != 0 &&
+        session.fiberMetricsMatchStoredFiber) {
+        session.fiberMetricsMatchStoredFiber = false;
+        invalidateFiberAlignmentMetrics(session.fiberId, true);
+    }
+    setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
+
+    if (collapsedControlCount <= 1) {
+        const BranchMetadataSyncResult branchSync =
+            syncLinkedBranchMetadataAfterFiberModification(
+                session,
+                &branchRemapControls,
+                &branchRemapBranches);
+        scheduleBranchMetadataSaves(branchSync.affectedFiberIds, session.fiberId);
+    }
+
+    const std::string updateEventName = collapsedControlCount > 1
+        ? "control_collapse_span_update"
+        : (editedExistingControl ? "control_edit_span_update"
+                                 : "control_add_span_update");
     const double updateMs = elapsedMs(updateStart, Clock::now());
     Logger()->info("Line annotation Lasagna stage timing: event={} overall_ms={:.3f} points={}",
                    updateEventName,
@@ -6455,18 +6586,25 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     writeLineDebugJson(updateEventName,
                        session.controlPoints,
                        linePointsToJson(session.optimizedLine));
-    std::vector<size_t> dirtySegments;
-    if (update.changedControlIndex > 0) {
-        dirtySegments.push_back(
-            static_cast<size_t>(update.changedControlIndex - 1));
+    startFiberModeOptimization(
+        session, false, std::move(prepared.dirtySegmentIndices));
+    if (collapsedControlCount > 1 &&
+        session.taskState != LineAnnotationSession::TaskState::Running) {
+        auto rollback = std::move(*session.controlPointCollapseRollback);
+        session.controlPointCollapseRollback.reset();
+        session.controlPoints = std::move(rollback.controlPoints);
+        session.optimizedLine = std::move(rollback.optimizedLine);
+        session.optimizationReport = std::move(rollback.optimizationReport);
+        session.branches = std::move(rollback.branches);
+        session.selectedManifestPath = std::move(rollback.selectedManifestPath);
+        session.seedPoint = rollback.seedPoint;
+        session.focusedLinePosition = rollback.focusedLinePosition;
+        session.focusedControlPoint = std::move(rollback.focusedControlPoint);
+        session.lineWasOptimized = rollback.lineWasOptimized;
+        session.fiberMetricsMatchStoredFiber =
+            rollback.fiberMetricsMatchStoredFiber;
+        setSessionOptimizationState(session, rollback.optimizationState);
     }
-    if (update.changedControlIndex >= 0 &&
-        update.changedControlIndex + 1 <
-            static_cast<int>(session.controlPoints.size())) {
-        dirtySegments.push_back(
-            static_cast<size_t>(update.changedControlIndex));
-    }
-    startFiberModeOptimization(session, false, std::move(dirtySegments));
 }
 
 void LineAnnotationController::handleGeneratedControlPointBranch(const std::string& surfaceName,
@@ -8687,11 +8825,18 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
             return false;
         }
     }
+    if (session.controlPointCollapseRollback && session.fiberId != 0 &&
+        session.fiberMetricsMatchStoredFiber) {
+        session.fiberMetricsMatchStoredFiber = false;
+        invalidateFiberAlignmentMetrics(session.fiberId, true);
+    }
     // Past the last failure exit: complete the deferred reciprocal cleanup
     // and endpoint refresh on linked fibers (the session-local remap already
     // ran before the views were rebuilt).
-    syncLinkedBranchMetadataAfterFiberModification(
-        session, nullptr, &branchRemapBranches);
+    const BranchMetadataSyncResult branchSync =
+        syncLinkedBranchMetadataAfterFiberModification(
+            session, nullptr, &branchRemapBranches);
+    scheduleBranchMetadataSaves(branchSync.affectedFiberIds, session.fiberId);
     refreshBranchLineViews(session.fiberId);
 
     if (session.restoreFiberOptimizationModeOnFailure) {
@@ -9056,7 +9201,8 @@ void LineAnnotationController::startFiberModeOptimization(
          !session.traceNormalSampler || !session.fiberPredictionField)) {
         return;
     }
-    if (session.fiberId != 0 && session.fiberMetricsMatchStoredFiber) {
+    if (!session.controlPointCollapseRollback && session.fiberId != 0 &&
+        session.fiberMetricsMatchStoredFiber) {
         session.fiberMetricsMatchStoredFiber = false;
         invalidateFiberAlignmentMetrics(session.fiberId, true);
     }
@@ -9156,6 +9302,22 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
     }
     if (!ok) {
         setSessionOptimizationState(session, session.optimizationStateBeforeTask);
+        if (session.controlPointCollapseRollback) {
+            auto rollback = std::move(*session.controlPointCollapseRollback);
+            session.controlPointCollapseRollback.reset();
+            session.controlPoints = std::move(rollback.controlPoints);
+            session.optimizedLine = std::move(rollback.optimizedLine);
+            session.optimizationReport = std::move(rollback.optimizationReport);
+            session.branches = std::move(rollback.branches);
+            session.selectedManifestPath = std::move(rollback.selectedManifestPath);
+            session.seedPoint = rollback.seedPoint;
+            session.focusedLinePosition = rollback.focusedLinePosition;
+            session.focusedControlPoint = std::move(rollback.focusedControlPoint);
+            session.lineWasOptimized = rollback.lineWasOptimized;
+            session.fiberMetricsMatchStoredFiber =
+                rollback.fiberMetricsMatchStoredFiber;
+            setSessionOptimizationState(session, rollback.optimizationState);
+        }
         if (session.controlPointsBeforeModeChange) {
             session.controlPoints = std::move(*session.controlPointsBeforeModeChange);
             session.controlPointsBeforeModeChange.reset();
@@ -9188,6 +9350,7 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
             materializeGeneratedViews(session);
         }
     } else {
+        session.controlPointCollapseRollback.reset();
         session.controlPointsBeforeModeChange.reset();
         session.optimizedLineBeforeModeChange.reset();
         session.branchesBeforeModeChange.reset();
@@ -9551,6 +9714,10 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     vc::lasagna::LineViewSurfaces views;
     try {
         vc::lasagna::LineViewConfig viewConfig;
+        viewConfig.controlPointLinePositions.reserve(session.controlPoints.size());
+        for (const auto& control : session.controlPoints) {
+            viewConfig.controlPointLinePositions.push_back(control.linePosition);
+        }
         viewConfig.orientedPointNormals = orientedNormals;
         views = vc::lasagna::buildLineViewSurfaces(session.optimizedLine, viewConfig);
     } catch (const std::exception& ex) {
@@ -9602,6 +9769,7 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     generatedViews.lineSideSlice = views.lineSideSlice;
     generatedViews.linePoints = std::move(linePoints);
     generatedViews.lineUpVectors = views.lineUpVectors;
+    generatedViews.stripPositionMap = views.stripPositionMap;
     generatedViews.lineNormals = std::move(orientedNormals);
     generatedViews.branchLinePoints = generatedBranchLinePointsForSession(session);
     generatedViews.branchLinks = generatedBranchLinkMarkers(session.branches);
@@ -11479,6 +11647,21 @@ LineAnnotationController::syncLinkedBranchMetadataAfterFiberModification(
     for (const uint64_t fiberId : syncBranchEndpointPositions(session)) {
         addUniqueFiberId(result.affectedFiberIds, fiberId);
     }
+    for (const auto& pane : _panes) {
+        if (pane.session && pane.session.get() != &session &&
+            deduplicateBranchLinks(pane.session->branches,
+                                   session.fiberId,
+                                   session.fiberFileName)) {
+            addUniqueFiberId(result.affectedFiberIds, pane.session->fiberId);
+        }
+    }
+    for (auto& fiber : _fibers) {
+        if (deduplicateBranchLinks(fiber.branches,
+                                   session.fiberId,
+                                   session.fiberFileName)) {
+            addUniqueFiberId(result.affectedFiberIds, fiber.id);
+        }
+    }
     std::sort(result.affectedFiberIds.begin(), result.affectedFiberIds.end());
     return result;
 }
@@ -11694,6 +11877,42 @@ bool LineAnnotationController::confirmLinkedControlPointEdit(
         tr("This control point is linked to another fiber. %1 will update linked "
            "branch metadata on both fibers. Continue?")
             .arg(action),
+        QMessageBox::Yes | QMessageBox::No,
+        QMessageBox::No);
+    return response == QMessageBox::Yes;
+}
+
+bool LineAnnotationController::confirmLinkedControlPointEdits(
+    const LineAnnotationSession& session,
+    const std::vector<size_t>& controlPointIndices,
+    const QString& action) const
+{
+    const size_t linkedCount = static_cast<size_t>(std::count_if(
+        controlPointIndices.begin(),
+        controlPointIndices.end(),
+        [this, &session](size_t index) {
+            return index <= static_cast<size_t>(std::numeric_limits<int>::max()) &&
+                   controlPointHasBranch(session, static_cast<int>(index));
+        }));
+    if (linkedCount == 0) {
+        return true;
+    }
+    if (session.suppressErrorDialogs || _errorDialogsSuppressed) {
+        showError(
+            tr("%1 was rejected: %2 affected control point(s) are linked to "
+               "other fibers and confirmation prompts are disabled in headless mode.")
+                .arg(action)
+                .arg(linkedCount),
+            true);
+        return false;
+    }
+    const auto response = QMessageBox::question(
+        _parentWidget.data(),
+        tr("Linked control points"),
+        tr("%1 will affect %2 control point(s) linked to other fibers and "
+           "update branch metadata on both sides. Continue?")
+            .arg(action)
+            .arg(linkedCount),
         QMessageBox::Yes | QMessageBox::No,
         QMessageBox::No);
     return response == QMessageBox::Yes;
