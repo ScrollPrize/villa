@@ -46,3 +46,14 @@
 - [x] Benchmark checkpoint 9 over three canonical runs.
 - [x] Complete GCC and Clang anchor/path/replay validation for checkpoint 9.
 - [x] Review checkpoint 9 and retain the closed-form resolver.
+- [x] Plan checkpoint 10 prepared-node, edge-reuse, full-edge-table, and compact-state variants.
+- [x] Independently review checkpoint 10 against the task and specifications.
+- [x] Measure cached expanded node data and retain the improving variant.
+- [x] Measure reached-node outgoing-edge reuse and retain the improving variant.
+- [x] Measure and reject candidate-wide pre-generated edges.
+- [x] Measure compact derivable DP state and retain the improving variant.
+- [x] Test and retain the prepared normalized scoring path.
+- [x] Select and compose the fastest acceptable variants.
+- [x] Run focused GCC and Clang validation.
+- [x] Run three canonical checkpoint 10 replays and compare quality/performance.
+- [x] Update specifications, user documentation, changelog, and task log.

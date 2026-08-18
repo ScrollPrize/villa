@@ -294,3 +294,181 @@
   failures, and complete replay artifacts were unchanged. Checkpoint 8 and all
   checkpoint-9 runs have SHA-256
   `83bfadf690ac5d3badcd6a07822d95c2fa2d44fcb06e28dd8d821e308d4c7197`.
+
+## Checkpoint 10: Prepared DP Nodes And Edges
+
+- Checkpoint 9 is the baseline: median total wall 12.42 seconds, total CPU
+  310.98 seconds, fiberlet DP about 1.85 seconds wall / 58 CPU-seconds,
+  50,718,661 retained nodes, 282,121,125 transition lookups, 31,364,056
+  reached-state visits, and 62,970,698 relaxations.
+- Planned independent variants are solve-local expanded node data, outgoing
+  edge reuse per reached node, a full candidate edge table, and compact DP
+  states with key-derived predecessors/incoming geometry. A prepared normalized
+  scoring path is conditional on the resulting profile.
+- Numeric identity is not required, but each retained variant must preserve
+  acceptable geometry, replay outcomes, and bounded memory.
+- Independent review confirmed the predecessor invariant with corrections:
+  states 0--8 derive `(layer-1,u-du,v-dv)` and retain the predecessor's state;
+  state 9 is source-only; source/sink handling stays outside interior edge
+  tables; the direct index survives through reconstruction; the initial
+  variants preserve the double strict prediction-deviation gate.
+- Checkpoint-10 measurements use the checkpoint-9 one-pass workload, not the
+  obsolete two-pass command still recorded for the original checkpoint.
+- Each variant reports exact solve-local allocation estimates and reached/edge
+  reuse counters in addition to phase timings and RSS.
+
+### Variant 10A: Solve-Local Prepared Nodes
+
+- Cached decoded prediction axes, normal axes, presence, and validity once for
+  every retained node. Transition order, DP state, feasibility, and scoring
+  arithmetic remained unchanged.
+- One canonical run measured 12.41 seconds total wall and 303.89 seconds total
+  CPU. Search measured 1.624 seconds wall / 50.63 CPU-seconds, comprising 0.682
+  node-index, 2.810 node-preparation, and 47.63 DP worker-seconds. Checkpoint 9
+  search was about 58 CPU-seconds and total CPU median was 310.98 seconds.
+- The largest candidate used 125,312 prepared-node bytes, 13,872 direct-index
+  bytes, and 1,879,680 state bytes. Peak RSS was 2,624,136 KiB.
+- Populations, transition/state/relaxation counts, 2 greedy / 1 fiberlet replay
+  failures, and `fiber_replay.json` SHA-256
+  `83bfadf690ac5d3badcd6a07822d95c2fa2d44fcb06e28dd8d821e308d4c7197`
+  matched checkpoint 9 exactly. Retain this variant.
+
+### Variant 10B: Reached-Node Outgoing-Edge Reuse
+
+- Constructed each reached node's at most nine neighbor lookups, physical edge
+  geometry, and strict prediction-deviation result once, then reused the
+  descriptors while retaining the canonical incoming-state/outgoing-edge loop
+  order for strict ties.
+- One canonical run measured 12.32 seconds total wall and 295.40 seconds total
+  CPU. Search fell from variant 10A's 1.624 seconds wall / 50.63 CPU-seconds to
+  1.435 seconds / 43.39 CPU-seconds; DP work fell from 47.63 to 40.91 seconds.
+- Only 8,670,563 of 50,718,661 retained nodes were reached. They generated
+  77,960,094 physical neighbor descriptors, of which 30,566,294 were valid;
+  91,494,705 repeated valid-edge constructions were avoided across additional
+  incoming states. Logical transition/state/relaxation counts were unchanged.
+- Peak RSS was 2,616,320 KiB. Populations, failures, and replay SHA-256 remained
+  identical to checkpoint 9. Retain this variant.
+
+### Variant 10C: Candidate-Wide Edge Table
+
+- Pre-generated every interior node's edge table after node/index preparation.
+  This generated 453,751,032 physical descriptors and 114,243,122 valid edges,
+  versus 77,960,094 / 30,566,294 for reached-node generation.
+- Table-backed DP improved from 40.91 to 36.20 CPU-seconds, but edge preparation
+  cost 27.95 CPU-seconds. Combined search regressed from variant 10B's 43.39 to
+  66.60 CPU-seconds and from 1.435 to 2.152 seconds wall. Total wall was 13.05
+  seconds and total CPU 320.49 seconds.
+- The largest edge table occupied 720,544 bytes. Peak RSS was 2,607,264 KiB;
+  output and failures remained identical.
+- Reject and remove this variant. Reachability is sparse enough that eagerly
+  processing every retained node overwhelms the modest table-backed DP gain.
+
+### Variant 10D: Compact Key-Derived State
+
+- Reduced `DpState` from 96 to 48 bytes by retaining cumulative cost,
+  reachability, and the predecessor's state index. States 0--8 derive their
+  predecessor node and incoming geometry from `(layer-1,u-du,v-dv)`; state 9
+  terminates reconstruction at the source. Missing/invalid derived predecessors
+  fail loudly.
+- One canonical run measured 12.11 seconds total wall and 289.55 seconds total
+  CPU. Search improved from variant 10B's 1.435 seconds / 43.39 CPU-seconds to
+  1.192 seconds / 37.23 CPU-seconds; DP work was 35.00 seconds.
+- Largest-candidate state storage halved from 1,879,680 to 939,840 bytes. Peak
+  RSS remained dominated by earlier phases at 2,625,512 KiB, while process
+  minor faults fell from 1,205,966 to 437,594.
+- Populations, all logical DP counters, failures, and the replay hash remained
+  identical. Retain this variant.
+
+### Variant 10E: Prepared Normalized Metric Inputs
+
+- Extracted one shared prepared-input entry point from `FiberLocalScoring`.
+  Existing callers retain the validating/normalizing wrapper; fiberlet DP
+  prepares node axes and each physical incoming/outgoing step once, then uses
+  the same alignment and smoothness equations without repeated normalization
+  or metric-config construction.
+- One canonical run measured 11.90 seconds total wall and 284.89 seconds total
+  CPU. Search improved from variant 10D's 1.192 seconds / 37.23 CPU-seconds to
+  1.073 seconds / 33.21 CPU-seconds. Node preparation increased from 2.72 to
+  5.45 CPU-seconds; DP fell from 35.00 to 28.44 CPU-seconds.
+- Largest prepared-node storage increased from 125,312 to 187,968 bytes. Peak
+  RSS fell to 2,577,104 KiB.
+- Fiberlet geometry/OBJ, populations, and replay failures were unchanged. One
+  relaxation changed out of 62,970,698 and serialized smoothness costs changed
+  by small float-scale amounts, so the JSON hash changed as permitted. Retain
+  this variant.
+
+### Variant 10F: Slim Prepared Nodes
+
+- Removed redundant double normal and presence fields. Interior scoring uses
+  prepared float data; the strict prediction gate retains its cached double
+  axis, while source/sink normals use the authoritative compact node.
+- One canonical run measured 11.77 seconds total wall and 282.82 seconds total
+  CPU. Search was 1.045 seconds / 32.81 CPU-seconds, with node preparation down
+  from 5.45 to 4.85 CPU-seconds and DP at 28.19 seconds.
+- Largest prepared-node storage returned from 187,968 to 125,312 bytes.
+  Geometry, counters, and failures matched variant 10E. Retain this variant.
+
+### Variant 10G: Rolling Layer-Local DP Costs
+
+- Retained one byte of predecessor-state identity for every global node/state,
+  but kept cumulative double costs only for the current and next DAG layers.
+  Canonical node/state/edge relaxation order and reconstruction are unchanged.
+- One canonical run measured 11.81 seconds total wall and 281.25 seconds total
+  CPU. Search improved from variant 10F's 1.045 seconds / 32.81 CPU-seconds to
+  1.000 seconds / 31.64 CPU-seconds; DP work fell from 28.19 to 26.71 seconds.
+- Largest-candidate rolling state/backpointer storage was 214,680 bytes versus
+  939,840 bytes for the all-node compact state.
+- The prior all-node loop also generated dead outgoing lookups from the final
+  interior layer before separately finalizing it to the sink. The rolling loop
+  stops at that layer, reducing reached-node/state visits and logical lookups
+  while preserving all 62,970,699 relaxations and producing byte-identical
+  output to variant 10F. Retain this variant.
+
+### Variant 10H: Float Cumulative Costs
+
+- Stored the five cumulative DP cost components as float32, matching the
+  precision of every local metric contribution, while retaining public/output
+  costs as doubles at the boundary.
+- One canonical run measured search at 0.983 seconds / 31.03 CPU-seconds versus
+  variant 10G's 1.000 seconds / 31.64 CPU-seconds. DP work fell from 26.71 to
+  26.11 CPU-seconds and largest rolling state storage from 214,680 to 114,630
+  bytes. Total run time was noisy at 12.04 seconds wall / 283.89 CPU-seconds.
+- Ten relaxation decisions changed out of 62,970,699. Selected fiberlet
+  geometry/OBJ, populations, and 2 greedy / 1 fiberlet failures were unchanged;
+  serialized costs changed at expected float accumulation scale. Retain this
+  variant under the task's explicit float/numeric-relaxation permission.
+
+### Final Checkpoint 10 Composition
+
+- Removed an instrumentation-only serial scan over all 50,718,661 retained
+  nodes. Maximum adjacent-layer population is now accumulated while each
+  candidate's nodes are already generated in layer order. Profile residual
+  wall time returned from about 0.18 seconds to 0.006--0.008 seconds.
+- Three canonical final runs:
+
+  | metric | minimum | median | maximum | checkpoint 9 median |
+  |---|---:|---:|---:|---:|
+  | total wall | 11.81 s | 11.91 s | 12.08 s | 12.42 s |
+  | total CPU | 283.63 s | 283.73 s | 289.31 s | 310.98 s |
+  | fiberlet wall | 4.51 s | 4.52 s | 4.56 s | 4.60 s |
+  | fiberlet CPU | 107.31 s | 108.20 s | 109.40 s | 119.03 s |
+  | search wall | 0.989 s | 0.996 s | 1.005 s | about 1.85 s |
+  | search CPU | 31.02 s | 31.39 s | 31.78 s | about 58 s |
+  | peak RSS | 2.46 GiB | 2.48 GiB | 2.49 GiB | 2.50 GiB |
+
+- Every run prepared 50,718,661 nodes. Search reached 6,400,256 nodes,
+  generated 57,574,182 outgoing descriptors, retained 30,566,294 valid
+  descriptors, and avoided 91,494,705 repeated constructions. It performed
+  189,586,809 logical lookups, 21,071,661 reached-state visits, and 62,970,689
+  relaxations.
+- Largest-candidate solve-local storage was 125,312 prepared-node bytes,
+  13,872 direct-index bytes, and 114,630 rolling-state/backpointer bytes.
+- All three final JSON artifacts have SHA-256
+  `41fa73c76bc3a20528d064e2baed78552a20bed41542f9ed4e2ddcfb5e739215`.
+  Selected geometry, OBJ content, populations, and 2 greedy / 1 fiberlet
+  failures match variant 10G/checkpoint 9; expected float cumulative-cost
+  serialization differences remain.
+- GCC and Clang builds passed for `test_fiber_anchors`,
+  `test_fiberlet_paths`, and `test_fiber_replay`; both focused CTest runs passed
+  all three tests. `test_fiberlet_paths` now directly checks equality between
+  validating and prepared local-scoring components. `git diff --check` passed.

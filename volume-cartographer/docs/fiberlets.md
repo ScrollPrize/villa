@@ -262,8 +262,12 @@ The exact start and target anchors are source and sink. Interior transitions
 advance exactly one curved plane and change either transverse index by at most
 one. Their directions and lengths are computed from the resulting floating XYZ
 positions, so they are not restricted to world axes or 26 quantized directions.
-The layered graph is acyclic. DP state retains the incoming transition because
-alignment and curvature depend on the previous physical step.
+The layered graph is acyclic. States 0 through 8 encode the incoming transverse
+step and state 9 is source-only. The predecessor packed key and incoming
+geometry are derived from that state; reconstruction retains one predecessor-
+state byte per node/state. Float32 cumulative costs roll through only the
+current and next interior layers because alignment and curvature need no older
+cost state. Source and sink transitions remain separate.
 
 Each interior node occupies 24 bytes: one checked row-major `uint32` key,
 three `float32` prediction coordinates, compact two-byte fiber and normal axes,
@@ -271,7 +275,11 @@ one byte of presence, and validity flags. Fiber/normal axes use the same +Z
 hemisphere `nx/ny` encoding as Lasagna and presence uses the native byte scale.
 No per-node reason string or interpolation-address object is retained. This
 re-quantization is intentional for the experimental fiberlet objective; exact
-anchor endpoints remain double precision.
+anchor endpoints remain double precision. DP expands compact prediction and
+normal axes into normalized solve-local scoring records once per node. Each
+reached node resolves its at most nine outgoing neighbors and edge geometry
+once, reusing them across incoming states; no candidate-wide edge table is
+materialized.
 
 Presence is trilinearly interpolated. Fiber directions are unoriented: the
 native voxel axes are validated and normalized once into compact float32
@@ -541,7 +549,7 @@ sampling, search, and total wall times. Use identical manifests, fiber, options,
 build type, and interval for before/after performance comparisons.
 
 Benchmark and replay extraction also emit a versioned
-`fiberlet_extraction_profile version=12` row. Both commands use the same field
+`fiberlet_extraction_profile version=13` row. Both commands use the same field
 names and units. Replay writes the row to stderr after full tube extraction;
 benchmark writes it to stdout after the existing summary. The row separates:
 
@@ -565,6 +573,19 @@ point.
 Version 12 adds complete prediction/normal closed-form resolution and iterative
 fallback counts. Ambiguous tensors do not count as fallbacks because no unique
 direction exists to recover.
+
+Version 13 adds prepared-node counts, reached/generated/valid/reused edge
+counts, solve-local prepared-node/direct-index/state byte maxima, and separate
+node-preparation worker time. Lookup/visit counters omit dead outgoing work
+from the final interior layer, which transitions directly to the sink. Rolling
+state memory is the global predecessor bytes plus the largest adjacent pair of
+cost layers; those layer populations are collected during node generation.
+On the canonical 5,000-base-voxel replay at 32 threads, three runs measured
+11.91 seconds median total wall time and 0.996 seconds median search wall time,
+versus 12.42 and about 1.85 seconds before solve-local reuse. Median total CPU
+fell from 310.98 to 283.73 seconds and search CPU from about 58 to 31.39
+seconds. Selected geometry and replay failures were unchanged; float32
+cumulative costs permit small serialized-cost differences.
 
 Version 2 subdivides `anchor_fitting_work_seconds` into exclusive summed-worker
 phases for weighted-observation setup, seed generation, seed-pair refinement,

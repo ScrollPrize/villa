@@ -191,6 +191,14 @@ struct FiberletPathReport {
     size_t interpolationNormalIterativeFallbacks = 0;
     size_t dpNodeIndexEntries = 0;
     size_t dpNodeIndexSlots = 0;
+    size_t dpPreparedNodes = 0;
+    size_t dpMaximumPreparedNodeBytes = 0;
+    size_t dpMaximumDirectIndexBytes = 0;
+    size_t dpMaximumStateBytes = 0;
+    size_t dpReachedNodes = 0;
+    size_t dpGeneratedEdges = 0;
+    size_t dpValidEdges = 0;
+    size_t dpReusedEdges = 0;
     size_t dpTransitionLookups = 0;
     size_t dpReachedStateVisits = 0;
     size_t dpRelaxations = 0;
@@ -223,6 +231,7 @@ struct FiberletPathReport {
     double searchSeconds = 0.0;
     double searchCpuSeconds = 0.0;
     double searchNodeIndexWorkSeconds = 0.0;
+    double searchNodePreparationWorkSeconds = 0.0;
     double searchDpWorkSeconds = 0.0;
     double elapsedSeconds = 0.0;
     double elapsedCpuSeconds = 0.0;

@@ -205,6 +205,7 @@ struct PreparedCandidate {
     CurvedDomain domain;
     std::vector<SearchNode> nodes;
     LocalNodeKeyLayout keyLayout;
+    size_t maximumActiveLayerNodes = 0;
     ScoringVoxel startScoring;
     ScoringVoxel targetScoring;
 };
@@ -224,24 +225,104 @@ struct PreparationProfile {
 struct SolveProfile {
     size_t nodeIndexEntries = 0;
     size_t nodeIndexSlots = 0;
+    size_t preparedNodes = 0;
+    size_t preparedNodeBytes = 0;
+    size_t directIndexBytes = 0;
+    size_t stateBytes = 0;
+    size_t reachedNodes = 0;
+    size_t generatedEdges = 0;
+    size_t validEdges = 0;
+    size_t reusedEdges = 0;
     size_t transitionLookups = 0;
     size_t reachedStateVisits = 0;
     size_t relaxations = 0;
     double nodeIndexSeconds = 0.0;
+    double nodePreparationSeconds = 0.0;
     double dpSeconds = 0.0;
 };
 
-struct BackPointer {
-    int64_t node = -1;
-    int state = -1;
+struct DpNodeScoring {
+    cv::Vec3d predictionAxis{0.0, 0.0, 0.0};
+    FiberLocalMetricSample metricPrediction;
+    cv::Vec3f metricNormal{0.0f, 0.0f, 0.0f};
+    uint8_t flags = 0;
 };
 
-struct DpState {
+struct DpEdge {
+    uint32_t next = std::numeric_limits<uint32_t>::max();
+    cv::Vec3f metricDirection{0.0f, 0.0f, 0.0f};
+    float metricLength = 0.0f;
+};
+
+struct DpAccumulatedCost {
+    float invalidPrediction = 0.0f;
+    float alignment = 0.0f;
+    float isotropicSmoothness = 0.0f;
+    float tangentSmoothness = 0.0f;
+    float normalSmoothness = 0.0f;
+
+    float total() const noexcept
+    {
+        return invalidPrediction + alignment + isotropicSmoothness +
+            tangentSmoothness + normalSmoothness;
+    }
+
+    DpAccumulatedCost& operator+=(const FiberletPathCost& other) noexcept
+    {
+        invalidPrediction += static_cast<float>(other.invalidPrediction);
+        alignment += static_cast<float>(other.alignment);
+        isotropicSmoothness += static_cast<float>(other.isotropicSmoothness);
+        tangentSmoothness += static_cast<float>(other.tangentSmoothness);
+        normalSmoothness += static_cast<float>(other.normalSmoothness);
+        return *this;
+    }
+
+    DpAccumulatedCost& operator+=(const FiberLocalMetricCost& other) noexcept
+    {
+        invalidPrediction += other.invalidPrediction;
+        alignment += other.alignment;
+        isotropicSmoothness += other.isotropicSmoothness;
+        tangentSmoothness += other.tangentSmoothness;
+        normalSmoothness += other.normalSmoothness;
+        return *this;
+    }
+};
+
+DpAccumulatedCost dpAccumulatedCost(const FiberletPathCost& cost)
+{
+    DpAccumulatedCost output;
+    output += cost;
+    return output;
+}
+
+FiberletPathCost fiberletPathCost(const DpAccumulatedCost& cost)
+{
+    FiberletPathCost output;
+    output.invalidPrediction = cost.invalidPrediction;
+    output.alignment = cost.alignment;
+    output.isotropicSmoothness = cost.isotropicSmoothness;
+    output.tangentSmoothness = cost.tangentSmoothness;
+    output.normalSmoothness = cost.normalSmoothness;
+    return output;
+}
+
+struct DpLayerState {
+    DpAccumulatedCost cost;
     bool reached = false;
-    FiberletPathCost cost;
-    BackPointer previous;
-    cv::Vec3d incomingDirection{0.0, 0.0, 0.0};
-    double incomingLength = 0.0;
+};
+
+struct NodeRange {
+    size_t begin = 0;
+    size_t end = 0;
+
+    size_t size() const noexcept { return end - begin; }
+};
+
+struct DpIncoming {
+    cv::Vec3d direction{0.0, 0.0, 0.0};
+    double length = 0.0;
+    cv::Vec3f metricDirection{0.0f, 0.0f, 0.0f};
+    float metricLength = 0.0f;
 };
 
 double vectorLength(const cv::Vec3d& value)
@@ -640,12 +721,16 @@ std::vector<SearchNode> enumerateLocalNodes(
     const FiberPredictionGridInfo& grid,
     const FiberletPointPredicate& pointPredicate,
     const LocalNodeKeyLayout& layout,
+    size_t& maximumActiveLayerNodes,
     PreparationProfile& profile)
 {
     std::vector<SearchNode> nodes;
+    maximumActiveLayerNodes = 0;
     if (domain.layers.size() <= 2)
         return nodes;
+    size_t previousLayerNodes = 0;
     for (size_t layer = 1; layer + 1 < domain.layers.size(); ++layer) {
+        const size_t layerBegin = nodes.size();
         for (int u = -layout.transverseLimit; u <= layout.transverseLimit; ++u) {
             for (int v = -layout.transverseLimit; v <= layout.transverseLimit; ++v) {
                 ++profile.latticeNodePositions;
@@ -684,6 +769,11 @@ std::vector<SearchNode> enumerateLocalNodes(
                 }
             }
         }
+        const size_t currentLayerNodes = nodes.size() - layerBegin;
+        maximumActiveLayerNodes = std::max(
+            maximumActiveLayerNodes,
+            previousLayerNodes + currentLayerNodes);
+        previousLayerNodes = currentLayerNodes;
     }
     return nodes;
 }
@@ -1060,6 +1150,7 @@ PreparedCandidate prepareCandidate(
         grid,
         pointPredicate,
         prepared.keyLayout,
+        prepared.maximumActiveLayerNodes,
         profile);
     profile.retainedNodes = prepared.nodes.size();
     profile.nodeEnumerationSeconds = std::chrono::duration<double>(
@@ -1160,6 +1251,40 @@ vc::lasagna::NormalSample nodeNormal(const SearchNode& node)
     };
 }
 
+cv::Vec3f floatVector(const cv::Vec3d& value);
+
+DpNodeScoring prepareDpNodeScoring(const SearchNode& node)
+{
+    DpNodeScoring scoring;
+    const double presence = static_cast<double>(node.presence) / 255.0;
+    scoring.flags = node.flags;
+    if ((node.flags & kNodePredictionValid) != 0) {
+        scoring.predictionAxis = vc::lasagna::decodeCompactNormalFromRaw(
+            node.predictionAxis[0], node.predictionAxis[1]);
+        scoring.metricPrediction.direction =
+            prepareFiberLocalUnitDirection(floatVector(scoring.predictionAxis));
+        scoring.metricPrediction.valid = true;
+    }
+    scoring.metricPrediction.presence = static_cast<float>(presence);
+    if ((node.flags & kNodeNormalValid) != 0) {
+        const cv::Vec3d normalAxis = vc::lasagna::decodeCompactNormalFromRaw(
+            node.normalAxis[0], node.normalAxis[1]);
+        scoring.metricNormal =
+            prepareFiberLocalUnitDirection(floatVector(normalAxis));
+    }
+    return scoring;
+}
+
+FiberStoredPredictionSample nodePrediction(const DpNodeScoring& node)
+{
+    return {
+        node.predictionAxis,
+        static_cast<double>(node.metricPrediction.presence),
+        (node.flags & kNodePredictionValid) != 0,
+        (node.flags & kNodePresenceValid) != 0,
+    };
+}
+
 bool usablePrediction(const FiberStoredPredictionSample& prediction)
 {
     const double normSquared = prediction.direction.dot(prediction.direction);
@@ -1197,6 +1322,30 @@ FiberLocalMetricSample localSample(const FiberStoredPredictionSample& sample)
     };
 }
 
+FiberLocalMetricConfig localMetricConfig(const FiberletPathConfig& config)
+{
+    return {
+        static_cast<float>(config.invalidPredictionCostPerVoxel),
+        FiberLocalSmoothnessConfig{
+            static_cast<float>(config.smoothnessWeight),
+            static_cast<float>(config.smoothnessNormalWeight),
+            static_cast<float>(config.smoothnessTangentWeight),
+            static_cast<float>(config.smoothnessFreeAngleDegrees * kPi / 180.0),
+        },
+    };
+}
+
+FiberletPathCost fiberletPathCost(const FiberLocalMetricCost& local)
+{
+    FiberletPathCost cost;
+    cost.invalidPrediction = local.invalidPrediction;
+    cost.alignment = local.alignment;
+    cost.isotropicSmoothness = local.isotropicSmoothness;
+    cost.tangentSmoothness = local.tangentSmoothness;
+    cost.normalSmoothness = local.normalSmoothness;
+    return cost;
+}
+
 FiberletPathCost pathStepCost(
     const FiberStoredPredictionSample* currentPrediction,
     const FiberStoredPredictionSample& candidatePrediction,
@@ -1217,25 +1366,90 @@ FiberletPathCost pathStepCost(
         static_cast<float>(candidateLength),
         floatVector(normal.normal),
         normal.valid,
-        FiberLocalMetricConfig{
-            static_cast<float>(config.invalidPredictionCostPerVoxel),
-            FiberLocalSmoothnessConfig{
-                static_cast<float>(config.smoothnessWeight),
-                static_cast<float>(config.smoothnessNormalWeight),
-                static_cast<float>(config.smoothnessTangentWeight),
-                static_cast<float>(config.smoothnessFreeAngleDegrees * kPi / 180.0)}});
-    FiberletPathCost cost;
-    cost.invalidPrediction = local.invalidPrediction;
-    cost.alignment = local.alignment;
-    cost.isotropicSmoothness = local.isotropicSmoothness;
-    cost.tangentSmoothness = local.tangentSmoothness;
-    cost.normalSmoothness = local.normalSmoothness;
-    return cost;
+        localMetricConfig(config));
+    return fiberletPathCost(local);
+}
+
+FiberLocalMetricCost pathStepMetricCostPrepared(
+    const FiberLocalMetricSample* currentPrediction,
+    const FiberLocalMetricSample& candidatePrediction,
+    const cv::Vec3f& previousDirection,
+    float previousLength,
+    const cv::Vec3f& candidateDirection,
+    float candidateLength,
+    const cv::Vec3f& normal,
+    bool normalValid,
+    const FiberLocalMetricConfig& config)
+{
+    return fiberLocalMetricCostPrepared(
+        currentPrediction, candidatePrediction,
+        previousDirection, previousLength,
+        candidateDirection, candidateLength,
+        normal, normalValid, config);
 }
 
 bool betterCost(double candidate, double current)
 {
     return candidate < current;
+}
+
+uint32_t predecessorNode(
+    size_t node,
+    size_t incomingState,
+    const std::vector<SearchNode>& nodes,
+    const std::vector<uint32_t>& nodeIndex,
+    const LocalNodeKeyLayout& layout,
+    uint32_t missingNode)
+{
+    if (incomingState >= 9)
+        throw std::logic_error("fiberlet source state has no predecessor node");
+    const LocalNodeKey current = unpackLocalNodeKey(nodes[node].key, layout);
+    if (current.layer == 0)
+        throw std::logic_error("fiberlet interior state is in layer zero");
+    const int deltaU = static_cast<int>(incomingState / 3) - 1;
+    const int deltaV = static_cast<int>(incomingState % 3) - 1;
+    const LocalNodeKey previous{
+        current.layer - 1,
+        current.transverseU - deltaU,
+        current.transverseV - deltaV,
+    };
+    if (previous.transverseU < -layout.transverseLimit ||
+        previous.transverseU > layout.transverseLimit ||
+        previous.transverseV < -layout.transverseLimit ||
+        previous.transverseV > layout.transverseLimit) {
+        throw std::logic_error("fiberlet reached state derives an out-of-range predecessor");
+    }
+    const uint32_t found = nodeIndex[packLocalNodeKey(previous, layout)];
+    if (found == missingNode)
+        throw std::logic_error("fiberlet reached state derives a missing predecessor");
+    return found;
+}
+
+DpIncoming incomingForState(
+    size_t node,
+    size_t state,
+    const FiberletCandidateResult& candidate,
+    const std::vector<SearchNode>& nodes,
+    const std::vector<uint32_t>& nodeIndex,
+    const LocalNodeKeyLayout& layout,
+    uint32_t missingNode)
+{
+    const cv::Vec3d point = nodePoint(nodes[node]);
+    const cv::Vec3d previousPoint = state == 9
+        ? candidate.startPositionPredictionXYZ
+        : nodePoint(nodes[predecessorNode(
+              node, state, nodes, nodeIndex, layout, missingNode)]);
+    const cv::Vec3d delta = point - previousPoint;
+    const double length = vectorLength(delta);
+    if (!(length > kEpsilon))
+        throw std::logic_error("fiberlet reached state has a zero-length incoming edge");
+    const cv::Vec3d direction = delta / length;
+    return {
+        direction,
+        length,
+        prepareFiberLocalUnitDirection(floatVector(direction)),
+        static_cast<float>(length),
+    };
 }
 
 FiberletCandidateResult solveCandidate(
@@ -1253,6 +1467,7 @@ FiberletCandidateResult solveCandidate(
     }
     const double maximumAngle = config.maximumEndpointAngleDegrees * kPi / 180.0;
     const double maximumPredictionDeviation = config.maximumPredictionDeviationDegrees * kPi / 180.0;
+    const FiberLocalMetricConfig metricConfig = localMetricConfig(config);
     const auto& domain = prepared.domain;
     const auto& nodes = prepared.nodes;
     const auto& startScoring = prepared.startScoring;
@@ -1305,19 +1520,65 @@ FiberletCandidateResult solveCandidate(
     }
     profile.nodeIndexEntries = nodes.size();
     profile.nodeIndexSlots = nodeIndex.size();
+    profile.directIndexBytes = checkedProduct(
+        nodeIndex.capacity(), sizeof(uint32_t),
+        "fiberlet DP direct-index byte count");
     profile.nodeIndexSeconds = std::chrono::duration<double>(
         Clock::now() - nodeIndexStart).count();
+
+    const auto nodePreparationStart = Clock::now();
+    std::vector<DpNodeScoring> dpNodes;
+    dpNodes.reserve(nodes.size());
+    for (const auto& node : nodes)
+        dpNodes.push_back(prepareDpNodeScoring(node));
+    profile.preparedNodes = dpNodes.size();
+    profile.preparedNodeBytes = checkedProduct(
+        dpNodes.capacity(), sizeof(DpNodeScoring),
+        "fiberlet prepared DP-node byte count");
+    profile.nodePreparationSeconds = std::chrono::duration<double>(
+        Clock::now() - nodePreparationStart).count();
 
     const auto dpStart = Clock::now();
     constexpr size_t transitionStateCount = 9;
     constexpr size_t sourceState = transitionStateCount;
     constexpr size_t stateCount = transitionStateCount + 1;
-    std::vector<DpState> states(checkedProduct(nodes.size(), stateCount, "fiberlet DP state count"));
-    for (size_t node = 0; node < nodes.size(); ++node) {
-        const LocalNodeKey key =
-            unpackLocalNodeKey(nodes[node].key, prepared.keyLayout);
-        if (key.layer != 1)
-            continue;
+    constexpr uint8_t missingState = std::numeric_limits<uint8_t>::max();
+    std::vector<NodeRange> layerRanges(domain.layers.size());
+    size_t rangeCursor = 0;
+    for (size_t layer = 0; layer < layerRanges.size(); ++layer) {
+        layerRanges[layer].begin = rangeCursor;
+        while (rangeCursor < nodes.size()) {
+            const LocalNodeKey key = unpackLocalNodeKey(
+                nodes[rangeCursor].key, prepared.keyLayout);
+            if (key.layer < layer)
+                throw std::logic_error("fiberlet DP nodes are not layer ordered");
+            if (key.layer != layer)
+                break;
+            ++rangeCursor;
+        }
+        layerRanges[layer].end = rangeCursor;
+    }
+    if (rangeCursor != nodes.size())
+        throw std::logic_error("fiberlet DP node layer exceeds its domain");
+
+    std::vector<uint8_t> previousStates(
+        checkedProduct(nodes.size(), stateCount,
+            "fiberlet DP backpointer-state count"),
+        missingState);
+    const size_t backpointerBytes = checkedProduct(
+        previousStates.capacity(), sizeof(uint8_t),
+        "fiberlet DP backpointer-state byte count");
+    const size_t finalInteriorLayer = domain.layers.size() - 2;
+    NodeRange currentRange = layerRanges[1];
+    std::vector<DpLayerState> currentStates(
+        checkedProduct(currentRange.size(), stateCount,
+            "fiberlet DP layer-state count"));
+    profile.stateBytes = checkedSum(
+        backpointerBytes,
+        checkedProduct(currentStates.capacity(), sizeof(DpLayerState),
+            "fiberlet DP layer-state byte count"),
+        "fiberlet DP state byte count");
+    for (size_t node = currentRange.begin; node < currentRange.end; ++node) {
         const cv::Vec3d point = nodePoint(nodes[node]);
         const cv::Vec3d delta = point - candidate.startPositionPredictionXYZ;
         const double stepLength = vectorLength(delta);
@@ -1329,31 +1590,54 @@ FiberletCandidateResult solveCandidate(
                 direction, nodePrediction(nodes[node]), maximumPredictionDeviation)) {
             continue;
         }
-        const FiberStoredPredictionSample prediction = nodePrediction(nodes[node]);
+        const FiberStoredPredictionSample prediction = nodePrediction(dpNodes[node]);
         const vc::lasagna::NormalSample normal = nodeNormal(nodes[node]);
-        auto& state = states[node * stateCount + sourceState];
+        auto& state = currentStates[
+            (node - currentRange.begin) * stateCount + sourceState];
         state.reached = true;
-        state.cost = pathStepCost(
+        state.cost = dpAccumulatedCost(pathStepCost(
             nullptr, prediction, candidate.startAxisXYZ, stepLength,
-            direction, stepLength, normal, config);
-        state.previous = {-1, -1};
-        state.incomingDirection = direction;
-        state.incomingLength = stepLength;
+            direction, stepLength, normal, config));
     }
 
-    for (size_t node = 0; node < nodes.size(); ++node) {
-        const LocalNodeKey currentKey =
-            unpackLocalNodeKey(nodes[node].key, prepared.keyLayout);
-        const cv::Vec3d currentPoint = nodePoint(nodes[node]);
-        const FiberStoredPredictionSample currentPrediction =
-            nodePrediction(nodes[node]);
-        for (size_t previousState = 0; previousState < stateCount; ++previousState) {
-            const auto& currentState = states[node * stateCount + previousState];
-            if (!currentState.reached)
+    for (size_t layer = 1; layer < finalInteriorLayer; ++layer) {
+        const NodeRange nextRange = layerRanges[layer + 1];
+        std::vector<DpLayerState> nextStates(
+            checkedProduct(nextRange.size(), stateCount,
+                "fiberlet DP layer-state count"));
+        const size_t activeLayerBytes = checkedSum(
+            checkedProduct(currentStates.capacity(), sizeof(DpLayerState),
+                "fiberlet DP layer-state byte count"),
+            checkedProduct(nextStates.capacity(), sizeof(DpLayerState),
+                "fiberlet DP layer-state byte count"),
+            "fiberlet DP rolling-state byte count");
+        profile.stateBytes = std::max(
+            profile.stateBytes,
+            checkedSum(backpointerBytes, activeLayerBytes,
+                "fiberlet DP state byte count"));
+
+        for (size_t node = currentRange.begin; node < currentRange.end; ++node) {
+            const LocalNodeKey currentKey =
+                unpackLocalNodeKey(nodes[node].key, prepared.keyLayout);
+            const cv::Vec3d currentPoint = nodePoint(nodes[node]);
+            const size_t currentOffset =
+                (node - currentRange.begin) * stateCount;
+            size_t reachedStateCount = 0;
+            for (size_t state = 0; state < stateCount; ++state) {
+                reachedStateCount +=
+                    currentStates[currentOffset + state].reached ? 1U : 0U;
+            }
+            if (reachedStateCount == 0)
                 continue;
-            ++profile.reachedStateVisits;
+            ++profile.reachedNodes;
+
+            std::array<DpEdge, transitionStateCount> outgoing;
+            size_t generatedEdges = 0;
+            size_t validEdges = 0;
             for (int deltaU = -1; deltaU <= 1; ++deltaU) {
                 for (int deltaV = -1; deltaV <= 1; ++deltaV) {
+                    const size_t transitionState =
+                        static_cast<size_t>((deltaU + 1) * 3 + (deltaV + 1));
                     const LocalNodeKey nextKey{
                         currentKey.layer + 1,
                         currentKey.transverseU + deltaU,
@@ -1364,67 +1648,102 @@ FiberletCandidateResult solveCandidate(
                         nextKey.transverseV > prepared.keyLayout.transverseLimit) {
                         continue;
                     }
-                    ++profile.transitionLookups;
+                    ++generatedEdges;
                     const uint32_t found = nodeIndex[
                         packLocalNodeKey(nextKey, prepared.keyLayout)];
                     if (found == missingNode)
                         continue;
-                    const size_t next = found;
-                    const cv::Vec3d delta = nodePoint(nodes[next]) - currentPoint;
+                    if (found < nextRange.begin || found >= nextRange.end)
+                        throw std::logic_error("fiberlet DP edge leaves the next layer");
+                    const cv::Vec3d delta = nodePoint(nodes[found]) - currentPoint;
                     const double stepLength = vectorLength(delta);
                     if (!(stepLength > kEpsilon))
                         continue;
                     const cv::Vec3d direction = delta / stepLength;
-                    const FiberStoredPredictionSample nextPrediction =
-                        nodePrediction(nodes[next]);
                     if (!withinPredictionDeviation(
-                            direction, nextPrediction, maximumPredictionDeviation)) {
+                            direction, nodePrediction(dpNodes[found]),
+                            maximumPredictionDeviation)) {
                         continue;
                     }
-                    const vc::lasagna::NormalSample nextNormal =
-                        nodeNormal(nodes[next]);
-                    FiberletPathCost nextCost = currentState.cost;
-                    nextCost += pathStepCost(
-                        &currentPrediction,
-                        nextPrediction,
-                        currentState.incomingDirection,
-                        currentState.incomingLength,
-                        direction,
-                        stepLength,
-                        nextNormal,
-                        config);
-                    const size_t transitionState = static_cast<size_t>((deltaU + 1) * 3 + (deltaV + 1));
-                    auto& destination = states[next * stateCount + transitionState];
-                    if (!destination.reached || betterCost(nextCost.total(), destination.cost.total())) {
-                        ++profile.relaxations;
-                        destination.reached = true;
-                        destination.cost = nextCost;
-                        destination.previous = {static_cast<int64_t>(node), static_cast<int>(previousState)};
-                        destination.incomingDirection = direction;
-                        destination.incomingLength = stepLength;
+                    outgoing[transitionState] = {
+                        found,
+                        prepareFiberLocalUnitDirection(floatVector(direction)),
+                        static_cast<float>(stepLength),
+                    };
+                    ++validEdges;
+                }
+            }
+            profile.generatedEdges += generatedEdges;
+            profile.validEdges += validEdges;
+            profile.reusedEdges += validEdges * (reachedStateCount - 1);
+            for (size_t previousState = 0; previousState < stateCount; ++previousState) {
+                const auto& currentState =
+                    currentStates[currentOffset + previousState];
+                if (!currentState.reached)
+                    continue;
+                ++profile.reachedStateVisits;
+                profile.transitionLookups += generatedEdges;
+                const DpIncoming incoming = incomingForState(
+                    node, previousState, candidate, nodes, nodeIndex,
+                    prepared.keyLayout, missingNode);
+                for (int deltaU = -1; deltaU <= 1; ++deltaU) {
+                    for (int deltaV = -1; deltaV <= 1; ++deltaV) {
+                        const size_t transitionState =
+                            static_cast<size_t>((deltaU + 1) * 3 + (deltaV + 1));
+                        const auto& edge = outgoing[transitionState];
+                        if (edge.next == missingNode)
+                            continue;
+                        const size_t next = edge.next;
+                        DpAccumulatedCost nextCost = currentState.cost;
+                        nextCost += pathStepMetricCostPrepared(
+                            &dpNodes[node].metricPrediction,
+                            dpNodes[next].metricPrediction,
+                            incoming.metricDirection,
+                            incoming.metricLength,
+                            edge.metricDirection,
+                            edge.metricLength,
+                            dpNodes[next].metricNormal,
+                            (dpNodes[next].flags & kNodeNormalValid) != 0,
+                            metricConfig);
+                        auto& destination = nextStates[
+                            (next - nextRange.begin) * stateCount +
+                            transitionState];
+                        if (!destination.reached || betterCost(
+                                nextCost.total(), destination.cost.total())) {
+                            ++profile.relaxations;
+                            destination.reached = true;
+                            destination.cost = nextCost;
+                            previousStates[next * stateCount + transitionState] =
+                                static_cast<uint8_t>(previousState);
+                        }
                     }
                 }
             }
         }
+        currentRange = nextRange;
+        currentStates = std::move(nextStates);
     }
 
     bool foundPath = false;
     size_t bestNode = 0;
     size_t bestState = 0;
     FiberletPathCost bestCost;
-    const size_t finalInteriorLayer = domain.layers.size() - 2;
-    for (size_t node = 0; node < nodes.size(); ++node) {
-        const LocalNodeKey key =
-            unpackLocalNodeKey(nodes[node].key, prepared.keyLayout);
-        if (key.layer != finalInteriorLayer)
-            continue;
+    if (currentRange.begin != layerRanges[finalInteriorLayer].begin ||
+        currentRange.end != layerRanges[finalInteriorLayer].end) {
+        throw std::logic_error("fiberlet DP did not finish on its final layer");
+    }
+    for (size_t node = currentRange.begin; node < currentRange.end; ++node) {
         const cv::Vec3d point = nodePoint(nodes[node]);
-        const FiberStoredPredictionSample prediction = nodePrediction(nodes[node]);
+        const FiberStoredPredictionSample prediction = nodePrediction(dpNodes[node]);
         const vc::lasagna::NormalSample normal = nodeNormal(nodes[node]);
         for (size_t stateIndex = 0; stateIndex < stateCount; ++stateIndex) {
-            const auto& state = states[node * stateCount + stateIndex];
+            const auto& state = currentStates[
+                (node - currentRange.begin) * stateCount + stateIndex];
             if (!state.reached)
                 continue;
+            const DpIncoming incoming = incomingForState(
+                node, stateIndex, candidate, nodes, nodeIndex,
+                prepared.keyLayout, missingNode);
             const cv::Vec3d delta = candidate.targetPositionPredictionXYZ - point;
             const double finalLength = vectorLength(delta);
             if (!(finalLength > kEpsilon))
@@ -1433,12 +1752,12 @@ FiberletCandidateResult solveCandidate(
             if (directedAngle(finalDirection, candidate.targetAxisXYZ) > maximumAngle + kEpsilon) {
                 continue;
             }
-            FiberletPathCost finalized = state.cost;
+            FiberletPathCost finalized = fiberletPathCost(state.cost);
             finalized += pathStepCost(
                 &prediction,
                 targetProxy,
-                state.incomingDirection,
-                state.incomingLength,
+                incoming.direction,
+                incoming.length,
                 finalDirection,
                 finalLength,
                 normal,
@@ -1463,11 +1782,15 @@ FiberletCandidateResult solveCandidate(
     size_t state = bestState;
     while (true) {
         reversed.push_back(nodePoint(nodes[node]));
-        const auto previous = states[node * stateCount + state].previous;
-        if (previous.node < 0)
+        if (state == sourceState)
             break;
-        node = static_cast<size_t>(previous.node);
-        state = static_cast<size_t>(previous.state);
+        const uint8_t previousState =
+            previousStates[node * stateCount + state];
+        if (previousState >= stateCount)
+            throw std::logic_error("fiberlet DP state has an invalid predecessor state");
+        node = predecessorNode(
+            node, state, nodes, nodeIndex, prepared.keyLayout, missingNode);
+        state = previousState;
     }
     std::reverse(reversed.begin(), reversed.end());
     candidate.pointsPredictionXYZ.push_back(candidate.startPositionPredictionXYZ);
@@ -2434,16 +2757,29 @@ FiberletPathReport traceFiberletPaths(
     size_t maximumSearchTransientBytes = 0;
     constexpr size_t stateCount = 10;
     for (const auto& item : prepared) {
-        const size_t stateBytes = checkedProduct(
+        const size_t backpointerBytes = checkedProduct(
             checkedProduct(item.nodes.size(), stateCount,
-                "fiberlet DP state byte estimate"),
-            sizeof(DpState), "fiberlet DP state byte estimate");
+                "fiberlet DP backpointer byte estimate"),
+            sizeof(uint8_t), "fiberlet DP backpointer byte estimate");
+        const size_t activeStateBytes = checkedProduct(
+            checkedProduct(item.maximumActiveLayerNodes, stateCount,
+                "fiberlet DP rolling-state byte estimate"),
+            sizeof(DpLayerState), "fiberlet DP rolling-state byte estimate");
+        const size_t stateBytes = checkedSum(
+            backpointerBytes, activeStateBytes,
+            "fiberlet DP state byte estimate");
         const size_t nodeIndexBytes = checkedProduct(
             item.keyLayout.keyCount, sizeof(uint32_t),
             "fiberlet DP index byte estimate");
+        const size_t preparedNodeBytes = checkedProduct(
+            item.nodes.size(), sizeof(DpNodeScoring),
+            "fiberlet prepared DP-node byte estimate");
         maximumSearchTransientBytes = std::max(
             maximumSearchTransientBytes,
-            checkedSum(stateBytes, nodeIndexBytes,
+            checkedSum(
+                checkedSum(stateBytes, nodeIndexBytes,
+                    "fiberlet search transient byte estimate"),
+                preparedNodeBytes,
                 "fiberlet search transient byte estimate"));
     }
     report.peakSearchTransientBytes = checkedProduct(
@@ -2799,6 +3135,27 @@ FiberletPathReport traceFiberletPaths(
         report.dpNodeIndexSlots = checkedSum(
             report.dpNodeIndexSlots, profile.nodeIndexSlots,
             "fiberlet DP node-index slot count");
+        report.dpPreparedNodes = checkedSum(
+            report.dpPreparedNodes, profile.preparedNodes,
+            "fiberlet prepared DP-node count");
+        report.dpMaximumPreparedNodeBytes = std::max(
+            report.dpMaximumPreparedNodeBytes, profile.preparedNodeBytes);
+        report.dpMaximumDirectIndexBytes = std::max(
+            report.dpMaximumDirectIndexBytes, profile.directIndexBytes);
+        report.dpMaximumStateBytes = std::max(
+            report.dpMaximumStateBytes, profile.stateBytes);
+        report.dpReachedNodes = checkedSum(
+            report.dpReachedNodes, profile.reachedNodes,
+            "fiberlet reached DP-node count");
+        report.dpGeneratedEdges = checkedSum(
+            report.dpGeneratedEdges, profile.generatedEdges,
+            "fiberlet generated DP-edge count");
+        report.dpValidEdges = checkedSum(
+            report.dpValidEdges, profile.validEdges,
+            "fiberlet valid DP-edge count");
+        report.dpReusedEdges = checkedSum(
+            report.dpReusedEdges, profile.reusedEdges,
+            "fiberlet reused DP-edge count");
         report.dpTransitionLookups = checkedSum(
             report.dpTransitionLookups, profile.transitionLookups,
             "fiberlet DP transition lookup count");
@@ -2809,6 +3166,8 @@ FiberletPathReport traceFiberletPaths(
             report.dpRelaxations, profile.relaxations,
             "fiberlet DP relaxation count");
         report.searchNodeIndexWorkSeconds += profile.nodeIndexSeconds;
+        report.searchNodePreparationWorkSeconds +=
+            profile.nodePreparationSeconds;
         report.searchDpWorkSeconds += profile.dpSeconds;
     }
     if (progressError)

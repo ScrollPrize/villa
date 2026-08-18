@@ -2803,9 +2803,14 @@
   at most one. Their actual mapped XYZ vectors and Euclidean lengths drive all
   feasibility and scoring. The final interval may be shorter than 2 prediction
   voxels; exact multiples and curves shorter than 2 do not create duplicate
-  planes. State retains incoming predecessor identity, with up to nine
-  prior-layer transitions plus the source state, because the objective is
-  second-order. Strict cost ties retain the first canonical predecessor.
+  planes. States 0 through 8 encode the incoming `(du,dv)` transition; state 9
+  is source-only. The predecessor node is derived from the checked packed key
+  as `(layer-1,u-du,v-dv)`, while reconstruction stores only the predecessor's
+  state index. Cumulative costs are float32 and exist only for the current and
+  next interior layers; one predecessor-state byte per global node/state
+  remains until reconstruction. The exact source and sink stay outside this
+  rolling interior representation. Strict cost ties retain the first canonical
+  predecessor.
 - Arbitrary-position presence is the trilinear weighted sum of all positive-weight
   native corners. Unoriented prediction axes are normalized and combined as
   `T=sum(w*d*d^T)` without presence weighting; the deterministic shared
@@ -2823,7 +2828,11 @@
   reason or interpolation stencil is retained. The
   global sparse union includes all required native corners even when a corner
   lies outside the floating-node tube predicate. Evaluated nodes retain integer
-  candidate and local keys rather than floating-point hash identity.
+  candidate and local keys rather than floating-point hash identity. Before
+  solving one candidate, each retained node's compact axes are decoded and
+  normalized once into a solve-local scoring array. This expanded array is
+  released after that candidate and is not added to persistent prepared
+  geometry.
 - Every nonzero DP edge must have an unoriented angle strictly below 25 degrees
   to the interpolated dense fiber-prediction axis. Equivalently, for normalized step
   `d` and fiber axis `f`, `abs(d dot f) > cos(25 degrees)` without a boundary
@@ -2832,7 +2841,10 @@
   and remain constrained by the fitted endpoint-axis rule. A missing, invalid,
   nonfinite, or degenerate required interior prediction rejects that edge before
   scoring. The independent Lasagna surface normal does not participate in this
-  hard gate.
+  hard gate. A reached node resolves at most nine outgoing neighbor lookups,
+  mapped directions/lengths, and hard-gate results once and reuses those edge
+  descriptors across every reached incoming state. Unreached nodes do not
+  pre-generate edges.
 - Valid-data scoring shares the regular native tracer's exact ordered float
   multiplicative alignment loss. For incoming step `a`, outgoing step `b`,
   current prediction `c` sign-aligned to `a`, candidate prediction `d` sign-
@@ -2841,6 +2853,9 @@
   that order. Alignment cost is `(1-score)*actual_edge_length`; edge-length weighting
   keeps differently directed local transitions comparable. The former lattice
   direction floor and independent presence/direction weights do not exist.
+  Fiberlet DP calls the shared prepared-input scoring path with cached unit
+  vectors; the regular validating scoring API normalizes and delegates to the
+  same arithmetic.
 - The source transition uses the fitted start axis as both `a` and `c`, its
   actual mapped direction as `b`, and the dense destination prediction as `d`.
   The sink transition uses the current dense prediction and incoming step, its
@@ -3026,7 +3041,7 @@
   Benchmark comparisons must retain identical inputs, parameters, build type,
   and interval.
 - Benchmark and full replay extraction emit the same versioned
-  `fiberlet_extraction_profile version=6` key/value schema. The profile exposes
+  `fiberlet_extraction_profile version=13` key/value schema. The profile exposes
   deterministic workload counters and finer anchor/fiberlet phase timings.
   Enclosing phase fields are wall time, `_work_seconds` fields are summed
   worker/candidate time, and CPU fields are process CPU time. Corner insertion
@@ -3076,6 +3091,13 @@
   spatial objectives, and transverse peak evaluation may regroup otherwise
   equivalent floating-point operations; small numeric differences from
   version 4 are accepted for this anchor fitter.
+- Version 13 adds solve-local prepared-node/index/state byte maxima, prepared
+  node count, reached-node and generated/valid/reused-edge counts, and separate
+  node-preparation worker time. DP visit/lookup counters exclude outgoing work
+  from the final interior layer because that layer transitions directly to the
+  sink. State-memory accounting is the global predecessor bytes plus the two
+  largest adjacent rolling cost layers; adjacent-layer populations are counted
+  during parallel node generation rather than by a separate serial pass.
 - Transient direction-conditioned peak observations and transverse response
   math use float32. Persistent anchor state, accepted positions, diagnostics,
   and serialized output remain double precision. Peak ties and downstream DP

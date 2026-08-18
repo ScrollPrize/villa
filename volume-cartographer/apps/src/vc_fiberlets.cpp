@@ -591,7 +591,7 @@ void printTubeExtractionProfile(
         return encoded.str();
     };
     output << std::setprecision(17)
-           << "fiberlet_extraction_profile version=12"
+           << "fiberlet_extraction_profile version=13"
            << " anchor_elapsed_seconds=" << extraction.anchors.elapsedSeconds
            << " anchor_cpu_seconds=" << anchor.elapsedCpuSeconds
            << " anchor_profiled_seconds=" << anchorProfiledSeconds
@@ -771,6 +771,16 @@ void printTubeExtractionProfile(
            << paths.interpolationNormalIterativeFallbacks
            << " fiberlet_dp_node_index_entries=" << paths.dpNodeIndexEntries
            << " fiberlet_dp_node_index_slots=" << paths.dpNodeIndexSlots
+           << " fiberlet_dp_prepared_nodes=" << paths.dpPreparedNodes
+           << " fiberlet_dp_max_prepared_node_bytes="
+           << paths.dpMaximumPreparedNodeBytes
+           << " fiberlet_dp_max_direct_index_bytes="
+           << paths.dpMaximumDirectIndexBytes
+           << " fiberlet_dp_max_state_bytes=" << paths.dpMaximumStateBytes
+           << " fiberlet_dp_reached_nodes=" << paths.dpReachedNodes
+           << " fiberlet_dp_generated_edges=" << paths.dpGeneratedEdges
+           << " fiberlet_dp_valid_edges=" << paths.dpValidEdges
+           << " fiberlet_dp_reused_edges=" << paths.dpReusedEdges
            << " fiberlet_dp_transition_lookups=" << paths.dpTransitionLookups
            << " fiberlet_dp_reached_state_visits=" << paths.dpReachedStateVisits
            << " fiberlet_dp_relaxations=" << paths.dpRelaxations
@@ -826,6 +836,8 @@ void printTubeExtractionProfile(
            << " fiberlet_search_cpu_seconds=" << paths.searchCpuSeconds
            << " fiberlet_node_index_work_seconds="
            << paths.searchNodeIndexWorkSeconds
+           << " fiberlet_node_preparation_work_seconds="
+           << paths.searchNodePreparationWorkSeconds
            << " fiberlet_dp_work_seconds=" << paths.searchDpWorkSeconds << '\n';
     output.precision(previousPrecision);
 }

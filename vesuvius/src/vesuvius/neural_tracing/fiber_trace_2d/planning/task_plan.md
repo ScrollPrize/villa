@@ -170,6 +170,87 @@ total wall from 12.51 to 12.42 seconds, and total CPU from 315.81 to 310.98
 seconds. Every run was byte-identical to checkpoint 8. The closed-form
 resolver was accepted.
 
+## Checkpoint 10: Prepared DP Nodes And Edges
+
+Measure the following variants independently against checkpoint 9. Do not
+conflate preparation and search: report both, plus total wall/CPU and peak RSS.
+
+1. Cache each retained node's point, decoded normalized prediction, decoded
+   normalized normal, presence, and validity once before dynamic programming.
+   Preserve the compact materialized `SearchNode` representation used by the
+   earlier parallel stage; the expanded representation is solve-local. Keep
+   the current double-precision strict 25-degree feasibility gate during the
+   first comparisons.
+2. For each reached current node, resolve its at most nine outgoing neighbors,
+   edge directions/lengths, destination prediction-deviation check, and
+   destination scoring data once. Reuse those descriptors across all reached
+   incoming states at that node.
+3. Compare the reached-node cache with a candidate-wide pre-generated compact
+   edge table. The full table may perform work for unreachable nodes, so retain
+   it only if reduced DP work outweighs preparation and memory costs. This
+   table covers interior node-to-node edges only; source initialization and
+   sink finalization retain their distinct endpoint semantics.
+4. Compact `DpState`. The incoming transition state uniquely determines the
+   predecessor lattice key `(layer-1,u-du,v-dv)`, incoming direction, and
+   incoming length for states 0 through 8. State 9 is source-only. Store only
+   cumulative cost, reachability, and the predecessor's state index needed for
+   reconstruction; derive the predecessor node from the direct node index,
+   which remains alive through reconstruction.
+5. If scoring remains dominant, add a prepared normalized local-metric path
+   which consumes cached unit vectors directly. Keep the public shared scoring
+   implementation authoritative and extract shared arithmetic instead of
+   copying it.
+6. Keep each variant only when it improves the combined preparation plus DP
+   time without unacceptable replay-quality or memory regression. Record all
+   rejected variants in `task_log.md`.
+
+### Checkpoint 10 Selected Composition
+
+The retained composition caches solve-local normalized node data, reuses each
+reached node's outgoing descriptors across incoming states, derives compact
+predecessors from packed keys, rolls float32 cumulative costs over two layers,
+and stores global one-byte predecessor states for reconstruction. The eager
+candidate-wide edge table was rejected because its unreachable-node work made
+combined search slower.
+
+Three final canonical runs measured median total wall/CPU at 11.91/283.73
+seconds, fiberlet wall/CPU at 4.52/108.20 seconds, and search wall/CPU at
+1.00/31.39 seconds. Against checkpoint 9, median total wall improved 4.1%,
+total CPU 8.8%, search wall 46.2%, and search CPU 45.9%. Geometry, populations,
+and 2 greedy / 1 fiberlet replay failures remained unchanged; float cumulative
+costs changed ten relaxation decisions and serialized costs only.
+
+### Checkpoint 10 Validation
+
+1. Add focused path tests for predecessor reconstruction, missing neighbors,
+   source states, and paths crossing every transverse transition.
+2. Run focused GCC and Clang `test_fiberlet_paths` and `test_fiber_replay`, plus
+   `test_fiber_anchors` as the extraction integration guard.
+3. Run three canonical 5,000-base-voxel replays for each serious contender.
+   Use the checkpoint-9 one-pass command without the obsolete explicit
+   `--maximum-iterations 2`. Compare total, preparation, node/edge preparation,
+   DP wall/CPU, peak RSS, populations, DP counters, failures, and artifact
+   hashes. When hashes differ, compare per-candidate success/reason, selected
+   path geometry, cost components, graph population, and replay failures.
+4. Retain only the fastest acceptable composition in production code.
+5. Report exact expanded-node, edge-table, direct-index, and state bytes per
+   candidate and the peak concurrent search-byte estimate. Count unique reached
+   nodes and generated, valid, and reused edge descriptors.
+
+### Checkpoint 10 Spec Update
+
+- Document the retained node/edge representation and state-key invariant in
+  `planning/specs.md` after selection.
+- Increment the extraction-profile schema only for counters/timings retained
+  in the final implementation.
+
+### Checkpoint 10 Documentation Update
+
+- Update `volume-cartographer/docs/fiberlets.md` with the selected DP data flow,
+  memory accounting, profile fields, and benchmark result.
+- Add the accepted result to `planning/changelog.md`; keep failed variants only
+  in `planning/task_log.md`.
+
 ## Spec Update
 
 - Document compact tile observation ownership and float precision boundaries.

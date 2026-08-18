@@ -1,3 +1,13 @@
+# 2026-08-18: solve-local fiberlet DP reuse
+
+- Cached normalized scoring inputs once per retained node and reused each
+  reached node's outgoing descriptors across its incoming DP states.
+- Replaced all-node cumulative state with rolling two-layer float32 costs and
+  packed-key-derived predecessors, cutting canonical search CPU by 45.9% and
+  total CPU by 8.8% while preserving selected geometry and replay failures.
+- Added extraction-profile version 13 with solve-local memory, node/edge reuse,
+  and node-preparation diagnostics.
+
 # 2026-08-17: robust sampled-direction anchor refinement
 
 - Replaced joint angular line search with deterministic competitive robust

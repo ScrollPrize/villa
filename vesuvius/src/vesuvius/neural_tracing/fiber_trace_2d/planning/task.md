@@ -23,3 +23,10 @@ The ordered options are:
 Small floating-point differences are acceptable. Persistent geometry and file
 formats must remain valid, and each checkpoint must retain acceptable replay
 quality before it can become the next baseline.
+
+The current continuation targets the remaining fiberlet dynamic-programming
+cost. Measure separately: caching decoded static data for every retained node,
+reusing each reached node's outgoing-edge descriptors across incoming states,
+fully pre-generating all retained-node transitions, and compacting DP state by
+deriving incoming edges and predecessor nodes from the node/transition key.
+Retain the fastest acceptable composition and record rejected variants.
