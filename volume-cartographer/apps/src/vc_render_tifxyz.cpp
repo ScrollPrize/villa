@@ -1348,9 +1348,15 @@ int main(int argc, char *argv[])
     if (useRemoteCache) {
         try {
             vc::HttpAuth remoteAuth = vc::HttpAuth::from_env();
+            // With --remote-url the -v path is where chunks are staged, which
+            // is what --prefetch-remote already calls "the existing staged
+            // cache". Nothing was writing it: Volume::createChunkCacheConfigured
+            // sets persistentCachePath for VC3D, and this path opens the remote
+            // pyramid directly instead, so every run re-downloaded the whole
+            // ROI -- 15,608 chunks and about 30 GB for one winding here.
             ownedChunkCache = vc::render::createChunkCache(
                 vc::render::openHttpZarrPyramid(remoteUrl, remoteAuth),
-                cache_bytes);
+                cache_bytes, 16, std::filesystem::path(vol_path));
             chunk_cache = ownedChunkCache.get();
             if (cacheLevel < 0 || cacheLevel >= chunk_cache->numLevels()) {
                 logPrintf(stderr, "Error: group index %d not available in remote zarr\n", group_idx);
