@@ -134,6 +134,30 @@ struct ControlPointCollapseResult {
     double clickedLinePosition,
     const cv::Vec3d& clickedPoint);
 
+struct PreparedControlPointEdit {
+    std::vector<cv::Vec3d> linePoints;
+    std::vector<LineControlPoint> controlPointsBeforeLineUpdate;
+    std::vector<LineControlPoint> controlPoints;
+    std::vector<size_t> oldToNewIndices;
+    std::vector<size_t> collapsedOldIndices;
+    std::vector<size_t> dirtySegmentIndices;
+    size_t replacementIndex = std::numeric_limits<size_t>::max();
+    bool lineReconstructed = false;
+};
+
+[[nodiscard]] PreparedControlPointEdit prepareAutomaticControlPointEdit(
+    const std::vector<cv::Vec3d>& linePoints,
+    const std::vector<LineControlPoint>& controls,
+    std::vector<size_t> collapsedIndices,
+    double clickedLinePosition,
+    const cv::Vec3d& clickedPoint,
+    const vc::lasagna::NormalSampler& sampler,
+    const vc::lasagna::LineOptimizationConfig& config);
+
+[[nodiscard]] cv::Vec3d lineTangentAtPosition(
+    const std::vector<cv::Vec3d>& linePoints,
+    double linePosition);
+
 struct StoredControlPoint : cv::Vec3d {
     std::optional<FiberTraceSegmentMetadata> segmentToNext;
 
