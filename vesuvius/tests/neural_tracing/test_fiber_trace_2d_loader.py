@@ -1,0 +1,8533 @@
+from __future__ import annotations
+
+from dataclasses import replace
+import json
+import math
+import threading
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+import zarr
+
+from tests.zarr_utils import create_v2_group_array
+
+import vesuvius.neural_tracing.fiber_trace_2d.augmentation as augment_module
+import vesuvius.neural_tracing.fiber_trace_2d.loader as loader_module
+import vesuvius.neural_tracing.fiber_trace_2d.runner as runner_module
+from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
+    FiberStripAugmentConfig,
+    FiberStripAugmentParams,
+    apply_value_augmentation,
+    apply_value_augmentation_batch,
+    limit_augmentation_rows,
+    random_combined_augmentation,
+    sample_xy_maps_bilinear,
+    smooth_offset_field,
+    source_coordinate_grid_for_output,
+    strip_augment_transform,
+    transformed_centerline_coords,
+    transformed_source_point_coords,
+)
+from vesuvius.neural_tracing.fiber_trace_2d.direction import (
+    DirectionSupervision,
+    build_direction_supervision,
+    cp_neighborhood_yx,
+    decode_lasagna_direction_xy,
+    direction_angle_error_degrees,
+    encode_lasagna_direction_xy,
+)
+from vesuvius.neural_tracing.fiber_trace_2d.embedding import (
+    contrastive_embedding_loss,
+    contrastive_negative_reachable_mask,
+    presence_loss,
+)
+from vesuvius.neural_tracing.fiber_trace_2d.fiber_json import (
+    load_fiber_file,
+    load_vc3d_fiber,
+    load_nml_fibers,
+)
+from vesuvius.neural_tracing.fiber_trace_2d.loader import (
+    FiberStrip2DLoader,
+    FiberStripSegmentSample,
+    ZarrChunkRequest,
+    load_config,
+    strip_z_offsets_from_count_step,
+)
+from vesuvius.neural_tracing.fiber_trace_2d.model import (
+    FiberStripDirectionModelConfig,
+    FiberStripDirectionNet,
+    direction_output,
+    embedding_output,
+    presence_output,
+)
+from vesuvius.neural_tracing.fiber_trace_2d.sampling import CoordinateSampleResult
+from vesuvius.neural_tracing.fiber_trace_2d.train import (
+    _benchmark_stage_totals,
+    _draw_predicted_cp_direction,
+    _print_profile_header,
+    _select_visualization_patch_indices,
+    _should_print_training_step,
+    _load_training_batch,
+    _TrainingBatchPipeline,
+    _resolve_test_selection,
+    _embedding_channel_count,
+    _top_view_scalar_channel_count,
+    _test_loader_config_from_raw,
+    _training_config_from_raw,
+    _validate_training_batch_config,
+    FiberStripTrainingConfig,
+    build_top_distance_transform_supervision,
+    prefetch_training,
+    run_benchmark,
+    run_training,
+)
+from vesuvius.neural_tracing.fiber_trace_2d.runner import (
+    _DirVisImageAugment,
+    _Trace2CpImageScoringConfig,
+    _Trace2CpBidirectionalResult,
+    _Trace2CpCombinedWeights,
+    _Trace2CpDirectionResult,
+    _Trace2CpPredictedFields,
+    _Trace2CpResult,
+    _Trace2CpSideTopZSourceArrays,
+    _Trace2CpSideTopZExperiment,
+    _Trace2CpSideTopZLineResult,
+    _Trace2CpSideTopZTopSliceDebug,
+    _Trace2CpTimingRow,
+    _Trace2CpZTraceDebug,
+    _TtaDirectionField,
+    _aggregate_trace2cp_timings,
+    _bilinear_direction_sample,
+    _bilinear_direction_sample_ambiguous,
+    _bilinear_embedding_sample,
+    _build_dir_vis_center_patch,
+    _trace2cp_candidate_angles_degrees,
+    _trace2cp_dp_direction_angle_penalty_np,
+    _trace2cp_dp_direction_angle_penalty_torch,
+    _trace2cp_candidate_fan_directions,
+    _trace2cp_target_trace_max_steps,
+    _trace_combined_direction_line_to_target,
+    _direction_model_receptive_field_diameter,
+    _dir_vis_image_space_augmentations,
+    _dir_vis_half_image_paste_side,
+    _direction_field_overlay_rgb,
+    _draw_trace2cp_top_strip_panel,
+    _draw_trace2cp_side_top_z_compact_overlay,
+    _draw_trace2cp_side_top_z_top_slice_direction_overlay,
+    _trace2cp_side_top_z_axes_at_point,
+    _draw_trace2cp_similarity_debug_column,
+    _draw_trace2cp_fiber_overlay,
+    _draw_trace2cp_overlay,
+    _draw_trace2cp_tta_slice,
+    _side_presence_z_pillar_image,
+    _export_augment_contact_sheet,
+    _export_trace2cp_fiber_vis,
+    _config_for_trace2cp_fiber_json,
+    _identity_source_xy_grid,
+    _labeled_panel_grid_rgb,
+    _labeled_panel_strip_rgb,
+    _resample_polyline_by_arclength,
+    _paste_unaugmented_center_patch,
+    _print_timing_table,
+    _reference_point_to_tta,
+    _require_trace2cp_embedding_field,
+    _score_trace2cp,
+    _source_grid_direction_to_reference,
+    _Trace2CpPairEvaluation,
+    _Trace2CpSimilarityDebug,
+    _trace2cp_fiber_pair_cp_indices,
+    _trace2cp_similarity_debug,
+    _trace2cp_refinement_from_traces,
+    _trace2cp_center_penalty,
+    _closest_trace2cp_approach_z,
+    _trace2cp_metric_from_traces,
+    _trace2cp_metric_bidirectional,
+    _trace2cp_tta_params,
+    _trace2cp_refinement_from_traces_z,
+    _trace2cp_refinement_input_xyz,
+    _trace2cp_nonempty_xyz_trace_or_none,
+    _smooth_trace2cp_refinement_trace,
+    _trace2cp_z_corrected_image_u8,
+    _trace2cp_z_corrected_presence_u8,
+    _trace2cp_z_layer_tiff_stack,
+    _trace2cp_image_descriptor,
+    _trace2cp_image_descriptor_loss,
+    _trace2cp_select_horizontal_median_direction,
+    _trace2cp_weighted_median_top_direction,
+    _trace2cp_top_monotone_direction_path,
+    _trace2cp_top_monotone_direction_path_z,
+    _trace2cp_top_direction_traces,
+    _load_top_direction_model_from_checkpoint,
+    _trace_combined_image_line_to_target,
+    _trace_combined_image_line_to_target_z,
+    _trace_score_trace2cp_joint_dp_bidirectional,
+    _raise_trace2cp_max_steps,
+    _trace_direction_line,
+    _trace_direction_line_to_target,
+    _trace_combined_direction_line_to_target_z,
+    _trace_score_trace2cp_bidirectional,
+    _trace_score_trace2cp_combined_bidirectional,
+    _trace_score_trace2cp_combined_dp_bidirectional,
+    _trace_score_trace2cp_combined_z_bidirectional,
+    _trace_score_trace2cp_combined_z_dp_bidirectional,
+    _trace_median_tta_direction_line_to_target,
+    _trace_median_tta_direction_line,
+    _trace_side_top_z_line_to_target,
+    _to_u8_display_image,
+    _write_scalar_surface_obj,
+    _write_trace2cp_side_top_z_top_slice_debug,
+)
+from vesuvius.neural_tracing.fiber_trace_2d.sampling import NumpyZarrCoordinateSampler
+from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import (
+    build_side_strip_patch_grid,
+    build_side_strip_patch_grid_from_line_window,
+    build_side_strip_patch_grid_from_line_window_torch,
+    build_side_strip_patch_grid_tensor_from_line_window,
+    build_top_strip_patch_grid_tensor_from_line_window,
+    control_point_line_index,
+    side_strip_segment_line_window,
+    side_strip_line_window,
+    source_point_xy_for_line_index,
+)
+
+
+def _write_fiber(
+    path: Path,
+    points: list[list[float]] | None = None,
+    control_points: list[list[float]] | None = None,
+) -> Path:
+    points = points or [[0.0, 20.0, 20.0], [10.0, 20.0, 20.0], [20.0, 20.0, 20.0]]
+    control_points = control_points or points
+    obj = {
+        "type": "vc3d_fiber",
+        "version": 1,
+        "line_points": points,
+        "control_points": control_points,
+        "generation": 1,
+    }
+    path.write_text(json.dumps(obj), encoding="utf-8")
+    return path
+
+
+def _write_nml(path: Path, *, things: list[dict[str, object]]) -> Path:
+    chunks = ["<?xml version=\"1.0\" encoding=\"UTF-8\"?>", "<things>"]
+    for thing_index, thing in enumerate(things):
+        thing_id = str(thing.get("id", thing_index))
+        thing_name = str(thing.get("name", ""))
+        chunks.append(f"<thing id=\"{thing_id}\" name=\"{thing_name}\">")
+        chunks.append("<nodes>")
+        for node in thing["nodes"]:  # type: ignore[index]
+            node_id, x, y, z = node
+            chunks.append(
+                f"<node id=\"{node_id}\" x=\"{float(x):.6f}\" y=\"{float(y):.6f}\" z=\"{float(z):.6f}\" />"
+            )
+        chunks.append("</nodes>")
+        chunks.append("<edges>")
+        for source, target in thing["edges"]:  # type: ignore[index]
+            chunks.append(f"<edge source=\"{source}\" target=\"{target}\" />")
+        chunks.append("</edges>")
+        chunks.append("</thing>")
+    chunks.append("</things>")
+    path.write_text("\n".join(chunks), encoding="utf-8")
+    return path
+
+
+def _write_zarr(path: Path) -> Path:
+    arr = create_v2_group_array(
+        path,
+        "0",
+        shape=(48, 48, 48),
+        chunks=(16, 16, 16),
+        dtype="float32",
+    )
+    z, y, x = np.indices(arr.shape, dtype=np.float32)
+    arr[:] = z * 10000.0 + y * 100.0 + x
+    return path
+
+
+def _write_lasagna_manifest(tmp_path: Path) -> Path:
+    normals_path = tmp_path / "normals.zarr"
+    arr = create_v2_group_array(
+        normals_path,
+        "0",
+        shape=(3, 48, 48, 48),
+        chunks=(1, 16, 16, 16),
+        dtype="uint8",
+    )
+    arr[0, :, :, :] = 1
+    arr[1, :, :, :] = 128
+    arr[2, :, :, :] = 255
+    manifest = {
+        "version": 2,
+        "source_to_base": 1.0,
+        "base_shape_zyx": [48, 48, 48],
+        "grad_mag_encode_scale": 1000.0,
+        "grad_mag_factor": 1.0,
+        "umbilicus_json": "umbilicus.json",
+        "groups": {
+            "normals": {
+                "zarr": "normals.zarr",
+                "scaledown": 0,
+                "channels": ["grad_mag", "nx", "ny"],
+            }
+        },
+    }
+    (tmp_path / "umbilicus.json").write_text("{}", encoding="utf-8")
+    path = tmp_path / "test.lasagna.json"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    return path
+
+
+def _write_config(tmp_path: Path, *, batch_size: int = 2) -> Path:
+    fiber = _write_fiber(tmp_path / "fiber.json")
+    volume = _write_zarr(tmp_path / "vol.zarr")
+    manifest = _write_lasagna_manifest(tmp_path)
+    config = {
+        "batch_size": batch_size,
+        "patch_shape_hw": [3, 3],
+        "strip_z_offset_count": 3,
+        "strip_z_offset_step": 1.0,
+        "augment_device": "cpu",
+        "seed": 123,
+        "datasets": [
+            {
+                "fiber_paths": [str(fiber)],
+                "base_volume_path": str(volume),
+                "base_volume_scale": 0,
+                "lasagna_manifest_path": str(manifest),
+            }
+        ],
+    }
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config), encoding="utf-8")
+    return path
+
+
+def _test_sampler_factory(**kwargs):
+    return NumpyZarrCoordinateSampler(
+        kwargs["array"],
+        level_spacing_base=kwargs["level_spacing_base"],
+    )
+
+
+def _make_loader(config) -> FiberStrip2DLoader:
+    return FiberStrip2DLoader(config, sampler_factory=_test_sampler_factory)
+
+
+def test_augment_vis_timing_table_reports_warm_path_average(capsys: pytest.CaptureFixture[str]) -> None:
+    rows = [
+        ("unaugmented", {"total": 100.0, "loader_total": 90.0, "volume_sample": 80.0}),
+        ("shift_x_min", {"total": 10.0, "loader_total": 8.0, "volume_sample": 6.0}),
+        ("shift_x_max", {"total": 14.0, "loader_total": 10.0, "volume_sample": 8.0}),
+    ]
+    totals = {"total": 124.0, "loader_total": 108.0, "volume_sample": 94.0}
+
+    _print_timing_table(rows, totals)
+
+    output = capsys.readouterr().out
+    assert "total/no-first" in output
+    assert "avg/no-first" in output
+    assert "         24.0" in output
+    assert "         12.0" in output
+
+
+def test_line_trace_bilinear_direction_sample_normalizes() -> None:
+    field = np.zeros((3, 3, 2), dtype=np.float32)
+    field[:, :, 0] = 2.0
+
+    sampled = _bilinear_direction_sample(field, np.asarray([1.25, 1.5], dtype=np.float32))
+
+    assert sampled is not None
+    assert np.allclose(sampled, [1.0, 0.0])
+
+
+def test_line_trace_bilinear_direction_sample_ambiguous_aligns_neighbor_samples_before_interpolation() -> None:
+    field = np.zeros((2, 2, 2), dtype=np.float32)
+    field[0, 0, 0] = 1.0
+    field[0, 1, 0] = -1.0
+    field[1, 0, 0] = 1.0
+    field[1, 1, 0] = -1.0
+
+    plain = _bilinear_direction_sample(field, np.asarray([0.5, 0.5], dtype=np.float32))
+    aligned = _bilinear_direction_sample_ambiguous(
+        field,
+        np.asarray([0.5, 0.5], dtype=np.float32),
+        np.asarray([1.0, 0.0], dtype=np.float32),
+    )
+
+    assert plain is None
+    assert aligned is not None
+    np.testing.assert_allclose(aligned, [1.0, 0.0])
+
+
+def test_line_trace_horizontal_stops_at_margin() -> None:
+    field = np.zeros((9, 9, 2), dtype=np.float32)
+    field[:, :, 0] = 1.0
+
+    line = _trace_direction_line(
+        field,
+        np.asarray([4.0, 4.0], dtype=np.float32),
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        step_px=1.0,
+        rf_margin_px=2.0,
+    )
+
+    assert np.allclose(line[:, 1], 4.0)
+    assert np.isclose(line[0, 0], 2.0)
+    assert np.isclose(line[-1, 0], 6.0)
+
+
+def test_line_trace_keeps_ambiguous_direction_continuous() -> None:
+    field = np.zeros((9, 9, 2), dtype=np.float32)
+    field[:, :, 0] = 1.0
+    field[:, :4, 0] = -1.0
+
+    line = _trace_direction_line(
+        field,
+        np.asarray([4.0, 4.0], dtype=np.float32),
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+
+    assert np.all(np.diff(line[:, 0]) > 0.0)
+    assert np.isclose(line[0, 0], 1.0)
+    assert np.isclose(line[-1, 0], 7.0)
+
+
+def test_trace2cp_scoring_interpolates_target_column() -> None:
+    trace = np.asarray([[1.0, 4.0], [3.0, 6.0]], dtype=np.float32)
+    result = _score_trace2cp(
+        trace,
+        np.asarray([2.0, 5.0], dtype=np.float32),
+        shape_hw=(11, 11),
+        rf_margin_px=1.0,
+        termination_reason="target_column",
+    )
+
+    assert result.reached_target_column
+    assert result.score == pytest.approx(0.0)
+    assert result.raw_y_error_px == pytest.approx(0.0)
+    assert result.trace_y_at_target_x == pytest.approx(5.0)
+
+
+def test_trace2cp_timing_aggregation_preserves_stage_order() -> None:
+    rows = (
+        _Trace2CpTimingRow(stage="infer", elapsed_ms=10.0),
+        _Trace2CpTimingRow(stage="trace", elapsed_ms=3.0),
+        _Trace2CpTimingRow(stage="infer", elapsed_ms=6.0),
+    )
+
+    assert _aggregate_trace2cp_timings(rows) == [
+        ("infer", 2, pytest.approx(16.0), pytest.approx(8.0), pytest.approx(10.0)),
+        ("trace", 1, pytest.approx(3.0), pytest.approx(3.0), pytest.approx(3.0)),
+    ]
+
+
+def test_trace2cp_scoring_failure_is_edge_score() -> None:
+    trace = np.asarray([[1.0, 4.0], [1.5, 4.0]], dtype=np.float32)
+    result = _score_trace2cp(
+        trace,
+        np.asarray([8.0, 5.0], dtype=np.float32),
+        shape_hw=(11, 11),
+        rf_margin_px=1.0,
+        termination_reason="invalid_direction",
+    )
+
+    assert not result.reached_target_column
+    assert result.score == pytest.approx(1.0)
+    assert result.raw_y_error_px == pytest.approx(4.0)
+
+
+def test_trace2cp_one_way_trace_stops_at_target_column() -> None:
+    field = np.zeros((9, 9, 2), dtype=np.float32)
+    field[:, :, 0] = 1.0
+
+    line, reason = _trace_direction_line_to_target(
+        field,
+        np.asarray([2.0, 4.0], dtype=np.float32),
+        np.asarray([6.0, 4.0], dtype=np.float32),
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+
+    assert reason == "target_column"
+    assert np.allclose(line[:, 1], 4.0)
+    assert np.isclose(line[0, 0], 2.0)
+    assert np.isclose(line[-1, 0], 6.0)
+
+
+def test_trace2cp_bidirectional_trace_scores_target_columns_and_refines_closest_approach() -> None:
+    field = np.zeros((11, 11, 2), dtype=np.float32)
+    field[:, :, 0] = 1.0
+
+    result = _trace_score_trace2cp_bidirectional(
+        field,
+        np.asarray([2.0, 4.0], dtype=np.float32),
+        np.asarray([8.0, 5.0], dtype=np.float32),
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+
+    assert result.forward.result.reached_target_column
+    assert result.reverse.result.reached_target_column
+    assert np.all(np.diff(result.forward.trace_xy[:, 0]) > 0.0)
+    assert np.all(np.diff(result.reverse.trace_xy[:, 0]) < 0.0)
+    assert result.forward.result.raw_y_error_px == pytest.approx(1.0)
+    assert result.reverse.result.raw_y_error_px == pytest.approx(1.0)
+    assert result.forward.result.score == pytest.approx(1.0 / 4.0)
+    assert result.reverse.result.score == pytest.approx(1.0 / 3.0)
+    assert result.endpoint_score == pytest.approx(0.5 * (1.0 / 4.0 + 1.0 / 3.0))
+    assert result.score == pytest.approx(1.0 / 8.0)
+    assert result.raw_y_error_px == pytest.approx(1.0)
+    assert result.considered_y_error_px == pytest.approx(1.0)
+    assert result.refinement.center_penalty == pytest.approx(1.0)
+    assert result.refinement.closest_x == pytest.approx(5.0)
+    assert result.refinement.closest_midpoint_xy.tolist() == pytest.approx([5.0, 4.5])
+    assert result.metric.error == pytest.approx(1.0 / 6.0)
+    assert result.metric.raw_y_error_px == pytest.approx(1.0)
+    assert result.metric.horizontal_span_px == pytest.approx(6.0)
+    assert result.metric.reached_target_columns
+    assert result.metric.reason == "target_columns"
+    assert result.metric.forward_y_at_target_x == pytest.approx(4.0)
+    assert result.metric.reverse_y_at_target_x == pytest.approx(5.0)
+
+    metric_only = _trace2cp_metric_bidirectional(
+        field,
+        np.asarray([2.0, 4.0], dtype=np.float32),
+        np.asarray([8.0, 5.0], dtype=np.float32),
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+    assert metric_only.error == pytest.approx(result.metric.error)
+
+
+def test_trace2cp_metric_uses_target_columns_not_closest_intersection() -> None:
+    forward = np.asarray([[0.0, 8.0], [5.0, 8.0], [10.0, 20.0]], dtype=np.float32)
+    reverse = np.asarray([[10.0, 12.0], [5.0, 8.0], [0.0, 12.0]], dtype=np.float32)
+
+    metric = _trace2cp_metric_from_traces(
+        forward,
+        reverse,
+        np.asarray([0.0, 8.0], dtype=np.float32),
+        np.asarray([10.0, 12.0], dtype=np.float32),
+        shape_hw=(21, 21),
+        rf_margin_px=1.0,
+    )
+
+    assert metric.reached_overlap
+    assert metric.reached_target_columns
+    assert metric.reason == "target_columns"
+    assert metric.forward_y_at_target_x == pytest.approx(20.0)
+    assert metric.reverse_y_at_target_x == pytest.approx(12.0)
+    assert metric.raw_y_error_px == pytest.approx(6.0)
+    assert metric.error == pytest.approx(6.0 / 10.0)
+
+
+def test_trace2cp_metric_missing_target_columns_uses_centerline_edge_error() -> None:
+    forward = np.asarray([[0.0, 10.0], [2.0, 10.0]], dtype=np.float32)
+    reverse = np.asarray([[10.0, 10.0], [8.0, 10.0]], dtype=np.float32)
+
+    metric = _trace2cp_metric_from_traces(
+        forward,
+        reverse,
+        np.asarray([0.0, 10.0], dtype=np.float32),
+        np.asarray([10.0, 10.0], dtype=np.float32),
+        shape_hw=(21, 21),
+        rf_margin_px=1.0,
+    )
+
+    assert not metric.reached_overlap
+    assert not metric.reached_target_columns
+    assert metric.reason == "missing_target_columns"
+    assert metric.raw_y_error_px == pytest.approx(9.0)
+    assert metric.error == pytest.approx(9.0 / 10.0)
+
+
+def test_trace2cp_center_penalty_is_one_at_center_and_two_at_cps() -> None:
+    assert _trace2cp_center_penalty(5.0, 2.0, 8.0) == pytest.approx(1.0)
+    assert _trace2cp_center_penalty(2.0, 2.0, 8.0) == pytest.approx(2.0)
+    assert _trace2cp_center_penalty(8.0, 2.0, 8.0) == pytest.approx(2.0)
+
+
+def test_trace2cp_center_penalty_can_choose_larger_centered_gap() -> None:
+    forward = np.asarray([[0.0, 8.0], [5.0, 8.0], [10.0, 8.0]], dtype=np.float32)
+    reverse = np.asarray([[10.0, 12.0], [5.0, 15.0], [0.0, 12.0]], dtype=np.float32)
+    direction = np.zeros((21, 21, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+
+    result = _trace2cp_refinement_from_traces(
+        forward,
+        reverse,
+        np.asarray([0.0, 8.0], dtype=np.float32),
+        np.asarray([10.0, 12.0], dtype=np.float32),
+        direction_xy=direction,
+        valid_mask=np.ones((21, 21), dtype=bool),
+        shape_hw=(21, 21),
+        step_px=2.0,
+        rf_margin_px=1.0,
+    )
+
+    assert result.closest_x == pytest.approx(5.0)
+    assert result.raw_y_error_px == pytest.approx(7.0)
+    assert result.considered_y_error_px == pytest.approx(7.0)
+    assert result.center_penalty == pytest.approx(1.0)
+    assert result.score == pytest.approx(7.0 / 18.0)
+
+
+def test_trace2cp_refinement_warps_partial_traces_to_midpoint() -> None:
+    forward = np.asarray([[2.0, 4.0], [4.0, 4.0], [6.0, 4.0]], dtype=np.float32)
+    reverse = np.asarray([[8.0, 8.0], [6.0, 8.0], [4.0, 8.0]], dtype=np.float32)
+    direction = np.zeros((13, 13, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+
+    result = _trace2cp_refinement_from_traces(
+        forward,
+        reverse,
+        np.asarray([2.0, 4.0], dtype=np.float32),
+        np.asarray([8.0, 8.0], dtype=np.float32),
+        direction_xy=direction,
+        valid_mask=np.ones((13, 13), dtype=bool),
+        shape_hw=(13, 13),
+        step_px=2.0,
+        rf_margin_px=1.0,
+    )
+
+    assert result.reached_overlap
+    assert result.score == pytest.approx(4.0 / 10.0)
+    assert result.considered_y_error_px == pytest.approx(4.0)
+    assert result.center_penalty == pytest.approx(1.0)
+    assert result.closest_x == pytest.approx(5.0)
+    assert result.closest_midpoint_xy.tolist() == pytest.approx([5.0, 6.0])
+    assert result.partial_forward_xy[-1].tolist() == pytest.approx([5.0, 4.0])
+    assert result.partial_reverse_xy[-1].tolist() == pytest.approx([5.0, 8.0])
+    assert result.fused_dense_xy[0].tolist() == pytest.approx([2.0, 4.0])
+    assert result.fused_dense_xy[-1].tolist() == pytest.approx([8.0, 8.0])
+    assert bool(np.any(np.all(np.isclose(result.fused_dense_xy, np.asarray([5.0, 6.0])), axis=1)))
+
+
+def test_trace2cp_refinement_trace_smoothing_is_gaussian_and_preserves_cp_anchors() -> None:
+    trace = np.asarray(
+        [
+            [0.0, 10.0, 0.0],
+            [1.0, 16.0, 3.0],
+            [2.0, 8.0, -3.0],
+            [3.0, 10.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    smoothed = _smooth_trace2cp_refinement_trace(trace, window=3)
+
+    np.testing.assert_allclose(smoothed[0], trace[0])
+    np.testing.assert_allclose(smoothed[-1], trace[-1])
+    np.testing.assert_allclose(smoothed[:, 0], trace[:, 0])
+    sigma = 0.8
+    kernel = np.exp(-0.5 * np.square(np.asarray([-1.0, 0.0, 1.0], dtype=np.float32) / sigma))
+    kernel = kernel / np.sum(kernel)
+    expected_y1 = float(np.dot(np.asarray([10.0, 16.0, 8.0], dtype=np.float32), kernel))
+    expected_z1 = float(np.dot(np.asarray([0.0, 3.0, -3.0], dtype=np.float32), kernel))
+    assert float(smoothed[1, 1]) == pytest.approx(expected_y1)
+    assert float(smoothed[1, 2]) == pytest.approx(expected_z1)
+    assert abs(float(smoothed[1, 1]) - float(trace[1, 1])) > 0.1
+    assert abs(float(smoothed[1, 2])) < abs(float(trace[1, 2]))
+
+
+def test_trace2cp_refinement_input_adds_zero_z_for_2d_fused_trace() -> None:
+    start = np.asarray([2.0, 10.0], dtype=np.float32)
+    target = np.asarray([12.0, 10.0], dtype=np.float32)
+    direction = np.zeros((24, 20, 2), dtype=np.float32)
+    direction[..., 0] = 1.0
+    result = _trace2cp_refinement_from_traces(
+        np.stack([start, target]).astype(np.float32),
+        np.stack([target, start]).astype(np.float32),
+        start,
+        target,
+        direction_xy=direction,
+        valid_mask=np.ones(direction.shape[:2], dtype=bool),
+        shape_hw=direction.shape[:2],
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+
+    trace_xyz = _trace2cp_refinement_input_xyz(result)
+
+    assert trace_xyz.shape[1] == 3
+    np.testing.assert_allclose(trace_xyz[:, 2], 0.0)
+
+
+def test_trace2cp_empty_xyz_trace_is_not_valid_for_z_top_debug() -> None:
+    assert _trace2cp_nonempty_xyz_trace_or_none(np.zeros((0, 3), dtype=np.float32)) is None
+    assert _trace2cp_nonempty_xyz_trace_or_none(np.zeros((2, 2), dtype=np.float32)) is None
+
+    trace = np.asarray([[0.0, 1.0, 0.0], [2.0, 3.0, 1.0]], dtype=np.float32)
+    valid = _trace2cp_nonempty_xyz_trace_or_none(trace)
+
+    assert valid is not None
+    np.testing.assert_allclose(valid, trace)
+
+
+def test_resample_polyline_by_arclength_keeps_endpoints() -> None:
+    line = np.asarray([[0.0, 0.0], [3.0, 4.0]], dtype=np.float32)
+
+    resampled = _resample_polyline_by_arclength(line, step_px=2.0)
+
+    assert resampled[0].tolist() == pytest.approx([0.0, 0.0])
+    assert resampled[-1].tolist() == pytest.approx([3.0, 4.0])
+    assert resampled.shape[0] == 4
+
+
+def test_trace2cp_overlay_can_add_reference_column() -> None:
+    field = np.zeros((11, 11, 2), dtype=np.float32)
+    field[:, :, 0] = 1.0
+    result = _trace_score_trace2cp_bidirectional(
+        field,
+        np.asarray([2.0, 4.0], dtype=np.float32),
+        np.asarray([8.0, 5.0], dtype=np.float32),
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+    image = np.zeros((11, 11), dtype=np.uint8)
+    line = np.asarray([[2.0, 4.0], [8.0, 5.0]], dtype=np.float32)
+
+    single = _draw_trace2cp_overlay(
+        image,
+        line_xy=line,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 5.0], dtype=np.float32),
+        bidirectional_result=result,
+        result_label="med_tta",
+    )
+    dual = _draw_trace2cp_overlay(
+        image,
+        line_xy=line,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 5.0], dtype=np.float32),
+        bidirectional_result=result,
+        result_label="med_tta",
+        reference_result=result,
+        reference_label="reference",
+    )
+
+    assert dual.shape[0] >= single.shape[0]
+    assert dual.shape[1] == 2 * single.shape[1]
+
+
+def test_trace2cp_similarity_debug_maps_use_cosine_scale() -> None:
+    embedding = np.zeros((2, 5, 7), dtype=np.float32)
+    embedding[0, :, :3] = 1.0
+    embedding[1, :, 3:] = 1.0
+    valid = np.ones((5, 7), dtype=bool)
+
+    debug = _trace2cp_similarity_debug(
+        embedding,
+        valid,
+        start_xy=np.asarray([1.0, 2.0], dtype=np.float32),
+        target_xy=np.asarray([5.0, 2.0], dtype=np.float32),
+        forward_trace_xy=np.asarray([[1.0, 2.0], [4.0, 2.0], [5.0, 2.0]], dtype=np.float32),
+        reverse_trace_xy=np.asarray([[5.0, 2.0], [1.0, 2.0], [2.0, 2.0]], dtype=np.float32),
+        step_px=2.0,
+        fiber_embeddings=np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32),
+    )
+
+    assert debug is not None
+    assert debug.global_bank_size == 2
+    assert debug.start_cp_similarity[2, 1] == pytest.approx(1.0)
+    assert debug.start_cp_similarity[2, 5] == pytest.approx(0.0)
+    assert debug.target_cp_similarity[2, 1] == pytest.approx(0.0)
+    assert debug.target_cp_similarity[2, 5] == pytest.approx(1.0)
+    assert debug.global_similarity is not None
+    assert debug.global_similarity[2, 1] == pytest.approx(0.5)
+    assert debug.global_similarity[2, 5] == pytest.approx(0.5)
+    assert debug.forward_last_similarity is not None
+    assert np.isnan(debug.forward_last_similarity[2, 1])
+    assert debug.forward_last_similarity[2, 3] == pytest.approx(0.0)
+    assert debug.forward_last_similarity[2, 5] == pytest.approx(1.0)
+    assert debug.reverse_last_similarity is not None
+    assert debug.reverse_last_similarity[2, 0] == pytest.approx(0.0)
+    assert debug.reverse_last_similarity[2, 2] == pytest.approx(1.0)
+    assert debug.reverse_last_similarity[2, 3] == pytest.approx(0.0)
+    assert np.isnan(debug.reverse_last_similarity[2, 5])
+
+
+def test_trace2cp_overlay_can_add_similarity_debug_column() -> None:
+    field = np.zeros((11, 11, 2), dtype=np.float32)
+    field[:, :, 0] = 1.0
+    result = _trace_score_trace2cp_bidirectional(
+        field,
+        np.asarray([2.0, 4.0], dtype=np.float32),
+        np.asarray([8.0, 5.0], dtype=np.float32),
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+    image = np.zeros((11, 11), dtype=np.uint8)
+    valid = np.ones((11, 11), dtype=bool)
+    line = np.asarray([[2.0, 4.0], [8.0, 5.0]], dtype=np.float32)
+    similarity = np.linspace(-1.0, 1.0, 121, dtype=np.float32).reshape(11, 11)
+    debug = _Trace2CpSimilarityDebug(
+        start_cp_similarity=similarity,
+        target_cp_similarity=similarity,
+        global_similarity=similarity,
+        forward_last_similarity=similarity,
+        reverse_last_similarity=similarity,
+        global_bank_size=3,
+    )
+
+    base = _draw_trace2cp_overlay(
+        image,
+        line_xy=line,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 5.0], dtype=np.float32),
+        bidirectional_result=result,
+    )
+    with_debug = _draw_trace2cp_overlay(
+        image,
+        line_xy=line,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 5.0], dtype=np.float32),
+        bidirectional_result=result,
+        similarity_debug=debug,
+        valid_mask=valid,
+    )
+    debug_column = _draw_trace2cp_similarity_debug_column(
+        debug,
+        valid_mask=valid,
+        line_xy=line,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 5.0], dtype=np.float32),
+        bidirectional_result=result,
+    )
+
+    assert with_debug.shape[1] == base.shape[1] + debug_column.shape[1]
+    assert with_debug.shape[0] >= debug_column.shape[0]
+    assert bool(np.any(with_debug[:, -debug_column.shape[1] :, :] != 0))
+
+
+def test_trace2cp_overlay_can_add_presence_column() -> None:
+    field = np.zeros((11, 11, 2), dtype=np.float32)
+    field[:, :, 0] = 1.0
+    result = _trace_score_trace2cp_bidirectional(
+        field,
+        np.asarray([2.0, 4.0], dtype=np.float32),
+        np.asarray([8.0, 5.0], dtype=np.float32),
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+    image = np.zeros((11, 11), dtype=np.uint8)
+    valid = np.ones((11, 11), dtype=bool)
+    line = np.asarray([[2.0, 4.0], [8.0, 5.0]], dtype=np.float32)
+    presence = np.linspace(0.0, 1.0, 121, dtype=np.float32).reshape(11, 11)
+
+    base = _draw_trace2cp_overlay(
+        image,
+        line_xy=line,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 5.0], dtype=np.float32),
+        bidirectional_result=result,
+    )
+    with_presence = _draw_trace2cp_overlay(
+        image,
+        line_xy=line,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 5.0], dtype=np.float32),
+        bidirectional_result=result,
+        presence_debug=presence,
+        valid_mask=valid,
+    )
+
+    assert with_presence.shape[1] > base.shape[1]
+    assert with_presence.shape[0] >= base.shape[0]
+    assert bool(np.any(with_presence[:, -image.shape[1] :, :] != 0))
+
+
+def test_trace2cp_overlay_can_add_top_strip_column() -> None:
+    field = np.zeros((11, 11, 2), dtype=np.float32)
+    field[:, :, 0] = 1.0
+    result = _trace_score_trace2cp_bidirectional(
+        field,
+        np.asarray([2.0, 4.0], dtype=np.float32),
+        np.asarray([8.0, 5.0], dtype=np.float32),
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+    image = np.zeros((11, 11), dtype=np.uint8)
+    line = np.asarray([[2.0, 4.0], [8.0, 5.0]], dtype=np.float32)
+    top = np.full((11, 11), 96.0, dtype=np.float32)
+    traced_top = np.full((11, 11), 144.0, dtype=np.float32)
+    z_top = np.full((11, 11), 192.0, dtype=np.float32)
+    top_presence = np.full((11, 11), 220, dtype=np.uint8)
+    valid = np.ones((11, 11), dtype=bool)
+
+    base = _draw_trace2cp_overlay(
+        image,
+        line_xy=line,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 5.0], dtype=np.float32),
+        bidirectional_result=result,
+    )
+    with_top = _draw_trace2cp_overlay(
+        image,
+        line_xy=line,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 5.0], dtype=np.float32),
+        bidirectional_result=result,
+        top_strip_image=top,
+        top_strip_valid_mask=valid,
+    )
+    with_traced_top = _draw_trace2cp_overlay(
+        image,
+        line_xy=line,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 5.0], dtype=np.float32),
+        bidirectional_result=result,
+        top_strip_image=top,
+        top_strip_valid_mask=valid,
+        traced_top_strip_image=traced_top,
+        traced_top_strip_valid_mask=valid,
+    )
+    with_z_top = _draw_trace2cp_overlay(
+        image,
+        line_xy=line,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 5.0], dtype=np.float32),
+        bidirectional_result=result,
+        top_strip_image=top,
+        top_strip_valid_mask=valid,
+        traced_top_strip_image=traced_top,
+        traced_top_strip_valid_mask=valid,
+        z_top_strip_image=z_top,
+        z_top_strip_valid_mask=valid,
+    )
+    with_top_presence = _draw_trace2cp_overlay(
+        image,
+        line_xy=line,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 5.0], dtype=np.float32),
+        bidirectional_result=result,
+        top_strip_image=top,
+        top_strip_valid_mask=valid,
+        traced_top_strip_image=traced_top,
+        traced_top_strip_valid_mask=valid,
+        z_top_strip_image=z_top,
+        z_top_strip_valid_mask=valid,
+        top_strip_presence_image=top_presence,
+        top_strip_presence_valid_mask=valid,
+        traced_top_strip_presence_image=top_presence,
+        traced_top_strip_presence_valid_mask=valid,
+        z_top_strip_presence_image=top_presence,
+        z_top_strip_presence_valid_mask=valid,
+    )
+
+    assert with_top.shape[1] == base.shape[1] + image.shape[1]
+    assert with_top.shape[0] >= base.shape[0]
+    assert with_traced_top.shape[1] == with_top.shape[1]
+    assert with_traced_top.shape[0] >= with_top.shape[0]
+    assert with_z_top.shape[1] == with_traced_top.shape[1]
+    assert with_z_top.shape[0] >= with_traced_top.shape[0]
+    assert with_top_presence.shape[1] == with_z_top.shape[1]
+    assert with_top_presence.shape[0] > with_z_top.shape[0]
+    assert bool(np.any(with_z_top[:, -image.shape[1] :, :] != 0))
+    assert bool(np.any(with_top_presence[:, -image.shape[1] :, :] != 0))
+    assert float(np.mean(with_z_top[:, -image.shape[1] :, :])) > float(
+        np.mean(with_top[:, -image.shape[1] :, :])
+    )
+
+
+def test_side_presence_z_pillar_image_samples_inferred_layers() -> None:
+    valid = np.ones((7, 7), dtype=bool)
+    trace = np.asarray([[0.0, 3.0], [6.0, 3.0]], dtype=np.float32)
+    layers: dict[int, SimpleNamespace] = {}
+    for layer in (-1, 0, 1):
+        presence = np.full((7, 7), 0.5 + 0.25 * float(layer), dtype=np.float32)
+        fields = SimpleNamespace(presence_hw=presence)
+        layers[layer] = SimpleNamespace(fields=fields, valid_mask=valid)
+    cache = SimpleNamespace(max_layer=1, get=lambda layer: layers[int(layer)])
+
+    projected, projected_valid = _side_presence_z_pillar_image(cache, trace, width=7)
+
+    assert projected is not None
+    assert projected_valid is not None
+    assert projected.shape == (3, 7)
+    assert bool(projected_valid.all())
+    assert int(projected[0, 3]) < int(projected[1, 3]) < int(projected[2, 3])
+
+
+def test_side_presence_z_pillar_image_shifts_columns_by_trace_z() -> None:
+    valid = np.ones((7, 7), dtype=bool)
+    trace = np.asarray([[0.0, 3.0, 1.0], [6.0, 3.0, 1.0]], dtype=np.float32)
+    layers: dict[int, SimpleNamespace] = {}
+    for layer in (-2, -1, 0, 1, 2):
+        presence = np.full((7, 7), 0.5 + 0.125 * float(layer), dtype=np.float32)
+        fields = SimpleNamespace(presence_hw=presence)
+        layers[layer] = SimpleNamespace(fields=fields, valid_mask=valid)
+    cache = SimpleNamespace(max_layer=2, z_step_voxels=1.0, get=lambda layer: layers[int(layer)])
+
+    shifted, shifted_valid = _side_presence_z_pillar_image(cache, trace, width=7)
+
+    assert shifted is not None
+    assert shifted_valid is not None
+    assert shifted.shape == (5, 7)
+    # The center row is relative z=0, so with trace z=+1 it samples absolute layer +1.
+    assert int(shifted[2, 3]) == int(np.uint8(np.clip((0.5 + 0.125) * 255.0, 0.0, 255.0)))
+    assert not bool(shifted_valid[-1, 3])
+
+
+def test_write_scalar_surface_obj_skips_invalid_vertices_and_faces(tmp_path: Path) -> None:
+    yy, xx = np.meshgrid(np.arange(3, dtype=np.float32), np.arange(3, dtype=np.float32), indexing="ij")
+    coords = np.stack([xx, yy, np.zeros_like(xx)], axis=2)
+    scalar = np.arange(9, dtype=np.float32).reshape(3, 3)
+    valid = np.ones((3, 3), dtype=bool)
+    valid[2, 2] = False
+    path = tmp_path / "surface.obj"
+
+    vertices, faces = _write_scalar_surface_obj(
+        path,
+        coords,
+        scalar,
+        valid,
+        scalar_min=0.0,
+        scalar_max=8.0,
+        object_name="test_surface",
+    )
+
+    text = path.read_text(encoding="utf-8").splitlines()
+    assert vertices == 8
+    assert faces == 3
+    assert sum(1 for line in text if line.startswith("v ")) == 8
+    assert sum(1 for line in text if line.startswith("f ")) == 3
+    assert "v 0.000000 0.000000 0.000000 0.000000 0.000000 0.000000" in text
+    assert "v 1.000000 1.000000 0.000000 0.500000 0.500000 0.500000" in text
+
+
+def test_trace2cp_target_column_wins_over_next_rf_margin() -> None:
+    field = np.zeros((9, 9, 2), dtype=np.float32)
+    field[:, :, 0] = 1.0
+
+    line, reason = _trace_direction_line_to_target(
+        field,
+        np.asarray([4.0, 4.0], dtype=np.float32),
+        np.asarray([6.0, 4.0], dtype=np.float32),
+        step_px=2.0,
+        rf_margin_px=3.0,
+    )
+
+    assert reason == "target_column"
+    assert np.isclose(line[-1, 0], 6.0)
+
+
+def test_trace2cp_reverse_target_column_wins_over_next_rf_margin() -> None:
+    field = np.zeros((9, 9, 2), dtype=np.float32)
+    field[:, :, 0] = 1.0
+
+    line, reason = _trace_direction_line_to_target(
+        field,
+        np.asarray([4.0, 4.0], dtype=np.float32),
+        np.asarray([2.0, 4.0], dtype=np.float32),
+        step_px=2.0,
+        rf_margin_px=3.0,
+    )
+
+    assert reason == "target_column"
+    assert np.isclose(line[-1, 0], 2.0)
+
+
+def test_trace2cp_target_trace_budget_has_curved_trace_slack() -> None:
+    shape_hw = (256, 2048)
+    step_px = 4.0
+    old_diagonal_budget = int(np.ceil(np.hypot(*shape_hw) / step_px)) + 2
+
+    budget = _trace2cp_target_trace_max_steps(
+        shape_hw,
+        np.asarray([32.0, 128.0], dtype=np.float32),
+        np.asarray([1980.0, 128.0], dtype=np.float32),
+        step_px,
+    )
+
+    assert budget > old_diagonal_budget * 4
+
+
+def test_trace2cp_candidate_angles_are_symmetric_and_configurable() -> None:
+    angles = _trace2cp_candidate_angles_degrees(25.0, 1.0)
+
+    assert angles.shape == (51,)
+    assert angles[0] == pytest.approx(-25.0)
+    assert angles[-1] == pytest.approx(25.0)
+    assert 0.0 in angles.tolist()
+
+    every_second = _trace2cp_candidate_angles_degrees(25.0, 2.0)
+    assert every_second[0] == pytest.approx(-24.0)
+    assert every_second[-1] == pytest.approx(24.0)
+    assert np.allclose(np.diff(every_second), 2.0)
+    assert 0.0 in every_second.tolist()
+
+
+def test_trace2cp_candidate_fan_rotates_around_oriented_direction() -> None:
+    angles, vectors = _trace2cp_candidate_fan_directions(
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        max_degrees=1.0,
+        step_degrees=1.0,
+    )
+
+    assert angles.tolist() == pytest.approx([-1.0, 0.0, 1.0])
+    assert vectors[1].tolist() == pytest.approx([1.0, 0.0], abs=1.0e-6)
+    assert vectors[0, 1] < 0.0
+    assert vectors[2, 1] > 0.0
+
+
+def test_bilinear_embedding_sample_normalizes_vectors() -> None:
+    embedding = np.zeros((2, 5, 5), dtype=np.float32)
+    embedding[0] = 3.0
+    embedding[1] = 4.0
+
+    sampled = _bilinear_embedding_sample(
+        embedding,
+        np.asarray([2.25, 2.5], dtype=np.float32),
+        valid_mask=np.ones((5, 5), dtype=bool),
+    )
+
+    assert sampled is not None
+    assert sampled.tolist() == pytest.approx([0.6, 0.8])
+
+
+def test_trace2cp_combined_direction_only_selects_center_candidate() -> None:
+    direction = np.zeros((9, 9, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    embedding = np.zeros((2, 9, 9), dtype=np.float32)
+    embedding[0] = 1.0
+
+    line, reason, stats = _trace_combined_direction_line_to_target(
+        direction_xy=direction,
+        tta_fields=None,
+        embedding_chw=embedding,
+        valid_mask=np.ones((9, 9), dtype=bool),
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([6.0, 4.0], dtype=np.float32),
+        start_embedding=np.asarray([1.0, 0.0], dtype=np.float32),
+        target_embedding=np.asarray([1.0, 0.0], dtype=np.float32),
+        fiber_embeddings=np.zeros((0, 2), dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=1.0, last=0.0, enclosing=0.0, fiber=0.0),
+        candidate_max_degrees=25.0,
+        candidate_step_degrees=1.0,
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+
+    assert reason == "target_column"
+    assert np.allclose(line[:, 1], 4.0)
+    assert stats.steps == 4
+    assert stats.mean("direction") == pytest.approx(0.0, abs=1.0e-6)
+
+
+def test_trace2cp_combined_direction_only_does_not_require_embeddings() -> None:
+    direction = np.zeros((9, 9, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+
+    line, reason, stats = _trace_combined_direction_line_to_target(
+        direction_xy=direction,
+        tta_fields=None,
+        embedding_chw=None,
+        valid_mask=np.ones((9, 9), dtype=bool),
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([6.0, 4.0], dtype=np.float32),
+        start_embedding=None,
+        target_embedding=None,
+        fiber_embeddings=None,
+        weights=_Trace2CpCombinedWeights(direction=1.0, last=0.0, enclosing=0.0, fiber=0.0),
+        candidate_max_degrees=25.0,
+        candidate_step_degrees=1.0,
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+
+    assert reason == "target_column"
+    assert np.allclose(line[:, 1], 4.0)
+    assert stats.mean("direction") == pytest.approx(0.0, abs=1.0e-6)
+
+
+def test_trace2cp_combined_embedding_weight_can_choose_off_axis_candidate() -> None:
+    direction = np.zeros((11, 11, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    embedding = np.zeros((2, 11, 11), dtype=np.float32)
+    embedding[0, :5, :] = 1.0
+    embedding[1, 5:, :] = 1.0
+
+    line, _reason, stats = _trace_combined_direction_line_to_target(
+        direction_xy=direction,
+        tta_fields=None,
+        embedding_chw=embedding,
+        valid_mask=np.ones((11, 11), dtype=bool),
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([9.0, 4.0], dtype=np.float32),
+        start_embedding=np.asarray([1.0, 0.0], dtype=np.float32),
+        target_embedding=np.asarray([1.0, 0.0], dtype=np.float32),
+        fiber_embeddings=np.asarray([[0.0, 1.0]], dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=0.0, last=0.0, enclosing=0.0, fiber=1.0),
+        candidate_max_degrees=45.0,
+        candidate_step_degrees=45.0,
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+
+    assert line.shape[0] > 1
+    assert line[1, 1] > 4.0
+    assert stats.mean("fiber") < 1.0
+
+
+def test_trace2cp_combined_presence_weight_can_choose_off_axis_candidate() -> None:
+    direction = np.zeros((11, 11, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    presence = np.zeros((11, 11), dtype=np.float32)
+    presence[5:, :] = 1.0
+
+    line, _reason, stats = _trace_combined_direction_line_to_target(
+        direction_xy=direction,
+        tta_fields=None,
+        embedding_chw=None,
+        presence_hw=presence,
+        valid_mask=np.ones((11, 11), dtype=bool),
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([9.0, 4.0], dtype=np.float32),
+        start_embedding=None,
+        target_embedding=None,
+        fiber_embeddings=None,
+        weights=_Trace2CpCombinedWeights(
+            direction=0.0,
+            last=0.0,
+            enclosing=0.0,
+            fiber=0.0,
+            presence=1.0,
+        ),
+        candidate_max_degrees=45.0,
+        candidate_step_degrees=45.0,
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+
+    assert line.shape[0] > 1
+    assert line[1, 1] > 4.0
+    assert stats.mean("presence") < 1.0
+
+
+def test_trace2cp_joint_dp_presence_can_choose_off_axis_path() -> None:
+    direction = np.zeros((17, 17, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    valid = np.ones((17, 17), dtype=bool)
+    presence = np.zeros((17, 17), dtype=np.float32)
+    presence[9, :] = 1.0
+
+    result, summary, path_xyz = _trace_score_trace2cp_joint_dp_bidirectional(
+        direction_fields=[direction],
+        valid_masks=[valid],
+        presence_fields=[presence],
+        start_xy=np.asarray([2.0, 8.0], dtype=np.float32),
+        target_xy=np.asarray([14.0, 8.0], dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=0.0, presence=1.0),
+        step_px=4.0,
+        rf_margin_px=1.0,
+        horizontal_step_px=4,
+    )
+
+    assert result.forward.result.reason == "joint_dp"
+    assert result.reverse.result.reason == "joint_dp"
+    assert result.forward.trace_xy[0].tolist() == pytest.approx([2.0, 8.0])
+    assert result.forward.trace_xy[-1].tolist() == pytest.approx([14.0, 8.0])
+    assert float(np.max(result.forward.trace_xy[:, 1])) > 8.0
+    assert summary.mean("presence") < 1.0
+    assert np.allclose(path_xyz[:, 2], 0.0)
+
+
+def test_trace2cp_joint_dp_can_choose_non_center_z_layer() -> None:
+    direction = np.zeros((17, 17, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    valid = np.ones((17, 17), dtype=bool)
+    center_presence = np.zeros((17, 17), dtype=np.float32)
+    matching_presence = np.ones((17, 17), dtype=np.float32)
+
+    result, summary, path_xyz = _trace_score_trace2cp_joint_dp_bidirectional(
+        direction_fields=[direction, direction, direction],
+        valid_masks=[valid, valid, valid],
+        presence_fields=[center_presence, center_presence, matching_presence],
+        start_xy=np.asarray([2.0, 8.0], dtype=np.float32),
+        target_xy=np.asarray([14.0, 8.0], dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=0.0, presence=1.0),
+        step_px=4.0,
+        rf_margin_px=1.0,
+        z_step_voxels=1.0,
+        max_abs_dz=1,
+        horizontal_step_px=4,
+    )
+
+    assert result.forward.trace_xy[0].tolist() == pytest.approx([2.0, 8.0])
+    assert result.forward.trace_xy[-1].tolist() == pytest.approx([14.0, 8.0])
+    assert float(np.max(path_xyz[:, 2])) > 0.0
+    assert summary.mean("presence") < 1.0
+    assert result.refinement.fused_resampled_z is not None
+
+
+def test_trace2cp_combined_candidate_point_direction_can_choose_off_axis() -> None:
+    direction = np.zeros((7, 9, 2), dtype=np.float32)
+    direction[:, :, 0] = np.float32(1.0 / math.sqrt(2.0))
+    direction[:, :, 1] = np.float32(1.0 / math.sqrt(2.0))
+    direction[3, 2] = np.asarray([1.0, 0.0], dtype=np.float32)
+    direction[3, 3] = np.asarray([0.0, 1.0], dtype=np.float32)
+    embedding = np.zeros((2, 7, 9), dtype=np.float32)
+    embedding[0] = 1.0
+
+    line, reason, stats = _trace_combined_direction_line_to_target(
+        direction_xy=direction,
+        tta_fields=None,
+        embedding_chw=embedding,
+        valid_mask=np.ones((7, 9), dtype=bool),
+        start_xy=np.asarray([2.0, 3.0], dtype=np.float32),
+        target_xy=np.asarray([6.0, 3.0], dtype=np.float32),
+        start_embedding=np.asarray([1.0, 0.0], dtype=np.float32),
+        target_embedding=np.asarray([1.0, 0.0], dtype=np.float32),
+        fiber_embeddings=np.zeros((0, 2), dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=1.0, last=0.0, enclosing=0.0, fiber=0.0),
+        candidate_max_degrees=45.0,
+        candidate_step_degrees=45.0,
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+
+    assert reason in {"target_column", "max_steps", "top", "bottom", "left", "right"}
+    assert stats.steps > 0
+    assert line[1, 1] > 3.0
+
+
+def test_trace2cp_combined_requires_embedding_channels() -> None:
+    with pytest.raises(ValueError, match="embedding channels"):
+        _require_trace2cp_embedding_field(None)
+
+
+def test_trace2cp_combined_empty_fiber_bank_fails_when_weighted() -> None:
+    direction = np.zeros((7, 7, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    embedding = np.zeros((2, 7, 7), dtype=np.float32)
+    embedding[0] = 1.0
+
+    with pytest.raises(ValueError, match="fiber CP embedding bank is empty"):
+        _trace_combined_direction_line_to_target(
+            direction_xy=direction,
+            tta_fields=None,
+            embedding_chw=embedding,
+            valid_mask=np.ones((7, 7), dtype=bool),
+            start_xy=np.asarray([2.0, 3.0], dtype=np.float32),
+            target_xy=np.asarray([5.0, 3.0], dtype=np.float32),
+            start_embedding=np.asarray([1.0, 0.0], dtype=np.float32),
+            target_embedding=np.asarray([1.0, 0.0], dtype=np.float32),
+            fiber_embeddings=np.zeros((0, 0), dtype=np.float32),
+            weights=_Trace2CpCombinedWeights(direction=1.0, last=0.0, enclosing=0.0, fiber=1.0),
+            candidate_max_degrees=25.0,
+            candidate_step_degrees=1.0,
+            step_px=1.0,
+            rf_margin_px=1.0,
+        )
+
+
+def test_trace2cp_image_descriptor_matches_identical_patch_better_than_shifted_patch() -> None:
+    y, x = np.mgrid[0:17, 0:17].astype(np.float32)
+    image = x * 7.0 + y * 11.0
+    valid = np.ones_like(image, dtype=bool)
+    config = _Trace2CpImageScoringConfig(patch_along=7, patch_across=5, blur_radius=1)
+
+    center = _trace2cp_image_descriptor(
+        image,
+        valid,
+        np.asarray([8.0, 8.0], dtype=np.float32),
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        config,
+    )
+    same = _trace2cp_image_descriptor(
+        image,
+        valid,
+        np.asarray([8.0, 8.0], dtype=np.float32),
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        config,
+    )
+    shifted = _trace2cp_image_descriptor(
+        image,
+        valid,
+        np.asarray([10.0, 8.0], dtype=np.float32),
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        config,
+    )
+
+    assert center is not None
+    assert same is not None
+    assert shifted is not None
+    assert _trace2cp_image_descriptor_loss(center, same) == pytest.approx(0.0, abs=1.0e-8)
+    assert _trace2cp_image_descriptor_loss(center, shifted) > 0.0
+
+
+def test_trace2cp_image_descriptor_direction_sign_is_horizontal_flip_equivalent() -> None:
+    y, x = np.mgrid[0:17, 0:17].astype(np.float32)
+    image = x * 13.0 + y * 3.0
+    valid = np.ones_like(image, dtype=bool)
+    config = _Trace2CpImageScoringConfig(patch_along=7, patch_across=5, blur_radius=0)
+
+    forward = _trace2cp_image_descriptor(
+        image,
+        valid,
+        np.asarray([8.0, 8.0], dtype=np.float32),
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        config,
+    )
+    reverse = _trace2cp_image_descriptor(
+        image,
+        valid,
+        np.asarray([8.0, 8.0], dtype=np.float32),
+        np.asarray([-1.0, 0.0], dtype=np.float32),
+        config,
+    )
+
+    assert forward is not None
+    assert reverse is not None
+    assert _trace2cp_image_descriptor_loss(forward, reverse) == pytest.approx(0.0, abs=1.0e-8)
+
+
+def test_trace2cp_image_combined_can_choose_off_axis_candidate_without_embeddings() -> None:
+    direction = np.zeros((17, 17, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    image = np.zeros((17, 17), dtype=np.float32)
+    # Make the straight-ahead first candidate locally unlike the CP descriptors.
+    image[8, 6] = 255.0
+    valid = np.ones((17, 17), dtype=bool)
+
+    line, reason, stats = _trace_combined_image_line_to_target(
+        direction_xy=direction,
+        tta_fields=None,
+        image_hw=image,
+        valid_mask=valid,
+        start_xy=np.asarray([2.0, 8.0], dtype=np.float32),
+        target_xy=np.asarray([14.0, 8.0], dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=0.0, image=1.0),
+        image_config=_Trace2CpImageScoringConfig(patch_along=3, patch_across=3, blur_radius=0),
+        candidate_max_degrees=45.0,
+        candidate_step_degrees=45.0,
+        step_px=4.0,
+        rf_margin_px=1.0,
+    )
+
+    assert reason in {"target_column", "max_steps", "top", "bottom", "left", "right", "invalid_candidate"}
+    assert stats.steps > 0
+    assert stats.mean("image") >= 0.0
+    assert abs(float(line[1, 1]) - 8.0) > 1.0
+
+
+def test_trace2cp_image_z_search_can_choose_image_layer_without_embeddings() -> None:
+    direction = np.zeros((9, 13, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    valid = np.ones((9, 13), dtype=bool)
+    center_image = np.zeros((9, 13), dtype=np.float32)
+    bad_image = center_image.copy()
+    bad_image[4, 5] = 255.0
+    matching_image = center_image.copy()
+
+    class FakePlaneCache:
+        z_step_voxels = 1.0
+        max_layer = 1
+
+        def __init__(self) -> None:
+            self.layers = {
+                -1: SimpleNamespace(
+                    image=bad_image,
+                    valid_mask=valid,
+                    fields=_Trace2CpPredictedFields(direction_xy=direction, embedding_chw=None),
+                ),
+                0: SimpleNamespace(
+                    image=bad_image,
+                    valid_mask=valid,
+                    fields=_Trace2CpPredictedFields(direction_xy=direction, embedding_chw=None),
+                ),
+                1: SimpleNamespace(
+                    image=matching_image,
+                    valid_mask=valid,
+                    fields=_Trace2CpPredictedFields(direction_xy=direction, embedding_chw=None),
+                ),
+            }
+
+        def get(self, layer: int):
+            return self.layers[int(layer)]
+
+        def ensure_neighbors(self, layer: int) -> None:
+            assert abs(int(layer)) <= self.max_layer
+
+    line, reason, stats = _trace_combined_image_line_to_target_z(
+        plane_cache=FakePlaneCache(),
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([10.0, 4.0], dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=0.0, image=1.0),
+        image_config=_Trace2CpImageScoringConfig(patch_along=3, patch_across=3, blur_radius=0),
+        candidate_max_degrees=0.0,
+        candidate_step_degrees=1.0,
+        step_px=3.0,
+        rf_margin_px=1.0,
+    )
+
+    assert reason == "target_column"
+    assert stats.steps > 0
+    assert line[1, 2] == pytest.approx(1.0)
+
+
+def test_trace2cp_z_search_can_choose_embedding_layer() -> None:
+    direction = np.zeros((7, 9, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    layer_direction = direction.copy()
+    layer_direction[:, :, 0] = np.float32(1.0 / math.sqrt(2.0))
+    layer_direction[:, :, 1] = np.float32(1.0 / math.sqrt(2.0))
+    valid = np.ones((7, 9), dtype=bool)
+
+    center_embedding = np.zeros((2, 7, 9), dtype=np.float32)
+    center_embedding[1] = 1.0
+    matching_embedding = np.zeros((2, 7, 9), dtype=np.float32)
+    matching_embedding[0] = 1.0
+
+    class FakePlaneCache:
+        z_step_voxels = 1.0
+        max_layer = 1
+
+        def __init__(self) -> None:
+            self.layers = {
+                -1: SimpleNamespace(
+                    fields=_Trace2CpPredictedFields(direction_xy=direction, embedding_chw=center_embedding),
+                    valid_mask=valid,
+                ),
+                0: SimpleNamespace(
+                    fields=_Trace2CpPredictedFields(direction_xy=direction, embedding_chw=center_embedding),
+                    valid_mask=valid,
+                ),
+                1: SimpleNamespace(
+                    fields=_Trace2CpPredictedFields(direction_xy=layer_direction, embedding_chw=matching_embedding),
+                    valid_mask=valid,
+                ),
+            }
+            self.requested_layers: list[int] = []
+
+        def get(self, layer: int):
+            self.requested_layers.append(int(layer))
+            return self.layers[int(layer)]
+
+        def ensure_neighbors(self, layer: int) -> None:
+            assert abs(int(layer)) <= self.max_layer
+
+    cache = FakePlaneCache()
+    line, reason, stats = _trace_combined_direction_line_to_target_z(
+        plane_cache=cache,
+        start_xy=np.asarray([2.0, 3.0], dtype=np.float32),
+        target_xy=np.asarray([4.0, 3.0], dtype=np.float32),
+        start_embedding=np.asarray([1.0, 0.0], dtype=np.float32),
+        target_embedding=np.asarray([1.0, 0.0], dtype=np.float32),
+        fiber_embeddings=np.zeros((0, 2), dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=0.0, last=1.0, enclosing=1.0, fiber=0.0),
+        candidate_max_degrees=0.0,
+        candidate_step_degrees=1.0,
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+
+    assert reason == "target_column"
+    assert stats.steps > 0
+    assert line[1, 2] == pytest.approx(1.0)
+    assert line.shape[0] >= 3
+    assert line[2, 1] > line[1, 1]
+    assert 1 in cache.requested_layers
+
+
+def test_trace2cp_z_search_candidate_point_direction_can_choose_off_axis() -> None:
+    direction = np.zeros((7, 9, 2), dtype=np.float32)
+    direction[:, :, 0] = np.float32(1.0 / math.sqrt(2.0))
+    direction[:, :, 1] = np.float32(1.0 / math.sqrt(2.0))
+    direction[3, 2] = np.asarray([1.0, 0.0], dtype=np.float32)
+    direction[3, 3] = np.asarray([0.0, 1.0], dtype=np.float32)
+    embedding = np.zeros((2, 7, 9), dtype=np.float32)
+    embedding[0] = 1.0
+    valid = np.ones((7, 9), dtype=bool)
+
+    class FakePlaneCache:
+        z_step_voxels = 1.0
+        max_layer = 0
+
+        def get(self, layer: int):
+            assert int(layer) == 0
+            return SimpleNamespace(
+                fields=_Trace2CpPredictedFields(direction_xy=direction, embedding_chw=embedding),
+                valid_mask=valid,
+            )
+
+        def ensure_neighbors(self, layer: int) -> None:
+            assert int(layer) == 0
+
+    line, reason, stats = _trace_combined_direction_line_to_target_z(
+        plane_cache=FakePlaneCache(),
+        start_xy=np.asarray([2.0, 3.0], dtype=np.float32),
+        target_xy=np.asarray([6.0, 3.0], dtype=np.float32),
+        start_embedding=np.asarray([1.0, 0.0], dtype=np.float32),
+        target_embedding=np.asarray([1.0, 0.0], dtype=np.float32),
+        fiber_embeddings=np.zeros((0, 2), dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=1.0, last=0.0, enclosing=0.0, fiber=0.0),
+        candidate_max_degrees=45.0,
+        candidate_step_degrees=45.0,
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+
+    assert reason in {"target_column", "max_steps", "top", "bottom", "left", "right"}
+    assert stats.steps > 0
+    assert line[1, 1] > 3.0
+
+
+def test_trace2cp_z_plane_cache_reuses_segment_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    def make_sample(offset: float) -> FiberStripSegmentSample:
+        return FiberStripSegmentSample(
+            record_index=0,
+            fiber_path="fiber.json",
+            start_control_point_index=0,
+            target_control_point_index=1,
+            start_control_point_xyz=np.zeros(3, dtype=np.float32),
+            target_control_point_xyz=np.ones(3, dtype=np.float32),
+            strip_z_offset=float(offset),
+            coords_zyx=np.zeros((3, 3, 3), dtype=np.float32),
+            valid_mask=np.ones((3, 3), dtype=bool),
+            frame=SimpleNamespace(),
+            line_xy=np.zeros((3, 2), dtype=np.float32),
+            start_control_point_xy=np.asarray([0.0, 1.0], dtype=np.float32),
+            target_control_point_xy=np.asarray([2.0, 1.0], dtype=np.float32),
+            line_point_indices=np.arange(3, dtype=np.int64),
+            line_normals_xyz=np.zeros((3, 3), dtype=np.float32),
+            start_row_axis_xyz=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+            target_row_axis_xyz=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+        )
+
+    class FakeLoader:
+        def __init__(self) -> None:
+            self.sampled_offsets: list[float] = []
+
+        def sample_trace2cp_segment_side_z_source(self, source, *, side_z_offset_voxels: float = 0.0):
+            self.sampled_offsets.append(float(side_z_offset_voxels))
+            return make_sample(0.0), np.ones((3, 3), dtype=np.float32), np.ones((3, 3), dtype=bool)
+
+        def build_trace2cp_segment_patch(self, *args, **kwargs):
+            raise AssertionError("z-plane cache must not rebuild trace2cp segment patches")
+
+    def fake_predict(model, image, valid_mask, *, device):
+        direction = np.zeros((3, 3, 2), dtype=np.float32)
+        direction[:, :, 0] = 1.0
+        embedding = np.zeros((2, 3, 3), dtype=np.float32)
+        embedding[0] = 1.0
+        return _Trace2CpPredictedFields(direction_xy=direction, embedding_chw=embedding)
+
+    monkeypatch.setattr(runner_module, "_predict_trace2cp_fields", fake_predict)
+    loader = FakeLoader()
+    center_layer = runner_module._Trace2CpZLayerPrediction(
+        layer=0,
+        z_voxels=0.0,
+        sample=make_sample(0.0),
+        image=np.ones((3, 3), dtype=np.float32),
+        valid_mask=np.ones((3, 3), dtype=bool),
+        fields=fake_predict(None, None, None, device=torch.device("cpu")),
+    )
+    source = object()
+    cache = runner_module._Trace2CpZPlaneCache(
+        loader=loader,
+        model=torch.nn.Identity(),
+        sample_index=123,
+        target_cp_index=1,
+        target_offset=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+        row_axis_alignment_line_index=None,
+        row_axis_alignment_xyz=None,
+        device=torch.device("cpu"),
+        segment_source=source,
+        center_layer=center_layer,
+        z_step_voxels=1.0,
+        max_layer=2,
+    )
+
+    assert cache.get(1).z_voxels == pytest.approx(1.0)
+    assert cache.get(-2).z_voxels == pytest.approx(-2.0)
+    assert loader.sampled_offsets == [1.0, -2.0]
+
+
+def test_trace2cp_z_plane_cache_interpolates_subvoxel_layers(monkeypatch: pytest.MonkeyPatch) -> None:
+    valid = np.ones((3, 3), dtype=bool)
+
+    def make_sample(offset: float) -> FiberStripSegmentSample:
+        return FiberStripSegmentSample(
+            record_index=0,
+            fiber_path="fiber.json",
+            start_control_point_index=0,
+            target_control_point_index=1,
+            start_control_point_xyz=np.zeros(3, dtype=np.float32),
+            target_control_point_xyz=np.ones(3, dtype=np.float32),
+            strip_z_offset=0.0,
+            coords_zyx=np.zeros((3, 3, 3), dtype=np.float32),
+            valid_mask=valid,
+            frame=SimpleNamespace(),
+            line_xy=np.zeros((3, 2), dtype=np.float32),
+            start_control_point_xy=np.asarray([0.0, 1.0], dtype=np.float32),
+            target_control_point_xy=np.asarray([2.0, 1.0], dtype=np.float32),
+            line_point_indices=np.arange(3, dtype=np.int64),
+            line_normals_xyz=np.zeros((3, 3), dtype=np.float32),
+            start_row_axis_xyz=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+            target_row_axis_xyz=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+        )
+
+    class FakeLoader:
+        def __init__(self) -> None:
+            self.sampled_offsets: list[float] = []
+
+        def sample_trace2cp_segment_side_z_source(self, source, *, side_z_offset_voxels: float = 0.0):
+            self.sampled_offsets.append(float(side_z_offset_voxels))
+            image = np.full((3, 3), float(side_z_offset_voxels), dtype=np.float32)
+            return make_sample(float(side_z_offset_voxels)), image, valid
+
+    def fields_for_offset(offset: float) -> _Trace2CpPredictedFields:
+        direction = np.zeros((3, 3, 2), dtype=np.float32)
+        if float(offset) <= 0.0:
+            direction[:, :, 0] = 1.0
+        else:
+            direction[:, :, 1] = 1.0
+        embedding = np.zeros((2, 3, 3), dtype=np.float32)
+        embedding[0] = 1.0
+        presence = np.full((3, 3), float(offset), dtype=np.float32)
+        return _Trace2CpPredictedFields(
+            direction_xy=direction,
+            embedding_chw=embedding,
+            presence_hw=presence,
+        )
+
+    def fake_predict(model, image, valid_mask, *, device):
+        return fields_for_offset(float(np.asarray(image, dtype=np.float32)[0, 0]))
+
+    monkeypatch.setattr(runner_module, "_predict_trace2cp_fields", fake_predict)
+    loader = FakeLoader()
+    center_layer = runner_module._Trace2CpZLayerPrediction(
+        layer=0,
+        z_voxels=0.0,
+        sample=make_sample(0.0),
+        image=np.zeros((3, 3), dtype=np.float32),
+        valid_mask=valid,
+        fields=fields_for_offset(0.0),
+    )
+    cache = runner_module._Trace2CpZPlaneCache(
+        loader=loader,
+        model=torch.nn.Identity(),
+        sample_index=123,
+        target_cp_index=1,
+        target_offset=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+        row_axis_alignment_line_index=None,
+        row_axis_alignment_xyz=None,
+        device=torch.device("cpu"),
+        segment_source=object(),
+        center_layer=center_layer,
+        z_step_voxels=0.5,
+        max_layer=4,
+    )
+
+    half = cache.get(1)
+    expected = np.asarray([math.sqrt(0.5), math.sqrt(0.5)], dtype=np.float32)
+    np.testing.assert_allclose(half.fields.direction_xy[1, 1], expected, atol=1.0e-6)
+    assert half.fields.presence_hw is not None
+    assert float(half.fields.presence_hw[1, 1]) == pytest.approx(0.5)
+    assert half.z_voxels == pytest.approx(0.5)
+    assert loader.sampled_offsets == [1.0]
+
+    one = cache.get(2)
+    np.testing.assert_allclose(one.fields.direction_xy[1, 1], [0.0, 1.0], atol=1.0e-6)
+    assert loader.sampled_offsets == [1.0]
+    inferred = dict(cache.inferred_layer_predictions())
+    assert sorted(inferred) == [0, 1]
+
+
+def test_trace2cp_presence_blur_follows_direction_xy_and_z() -> None:
+    presence = np.zeros((3, 7, 9), dtype=np.float32)
+    valid = np.ones_like(presence, dtype=bool)
+    presence[1, 3, 4] = 1.0
+    horizontal = np.zeros((*presence.shape, 2), dtype=np.float32)
+    horizontal[..., 0] = 1.0
+
+    blurred_horizontal = runner_module._trace2cp_blur_presence_stack_directional(
+        presence,
+        valid,
+        direction_stack=horizontal,
+        radius_z=1,
+        radius_along=2,
+        radius_across=0,
+        device=torch.device("cpu"),
+    )
+
+    assert blurred_horizontal.shape == presence.shape
+    assert float(blurred_horizontal[1, 3, 4]) < 1.0
+    assert float(blurred_horizontal[1, 3, 4]) > 0.0
+    assert float(blurred_horizontal[0, 3, 4]) > 0.0
+    assert float(blurred_horizontal[1, 3, 3]) > 0.0
+    assert float(blurred_horizontal[1, 2, 4]) == pytest.approx(0.0)
+
+    vertical = np.zeros((*presence.shape, 2), dtype=np.float32)
+    vertical[..., 1] = 1.0
+    blurred_vertical = runner_module._trace2cp_blur_presence_stack_directional(
+        presence,
+        valid,
+        direction_stack=vertical,
+        radius_z=0,
+        radius_along=2,
+        radius_across=0,
+        device=torch.device("cpu"),
+    )
+
+    assert float(blurred_vertical[1, 2, 4]) > 0.0
+    assert float(blurred_vertical[1, 3, 3]) == pytest.approx(0.0)
+
+    flipped = horizontal.copy()
+    flipped[..., 0] = -1.0
+    blurred_flipped = runner_module._trace2cp_blur_presence_stack_directional(
+        presence,
+        valid,
+        direction_stack=flipped,
+        radius_z=1,
+        radius_along=2,
+        radius_across=0,
+        device=torch.device("cpu"),
+    )
+    np.testing.assert_allclose(blurred_flipped, blurred_horizontal, atol=1.0e-6)
+
+
+def test_trace2cp_z_plane_cache_presence_blur_disabled_by_default() -> None:
+    presence = np.zeros((5, 11), dtype=np.float32)
+    presence[2, 5] = 1.0
+    direction = np.zeros((5, 11, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    center_layer = runner_module._Trace2CpZLayerPrediction(
+        layer=0,
+        z_voxels=0.0,
+        sample=SimpleNamespace(strip_z_offset=0.0),
+        image=np.zeros(presence.shape, dtype=np.float32),
+        valid_mask=np.ones(presence.shape, dtype=bool),
+        fields=_Trace2CpPredictedFields(
+            direction_xy=direction,
+            embedding_chw=None,
+            presence_hw=presence,
+        ),
+    )
+    cache = runner_module._Trace2CpZPlaneCache(
+        loader=object(),
+        model=torch.nn.Identity(),
+        sample_index=123,
+        target_cp_index=1,
+        target_offset=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+        row_axis_alignment_line_index=None,
+        row_axis_alignment_xyz=None,
+        device=torch.device("cpu"),
+        segment_source=object(),
+        center_layer=center_layer,
+        z_step_voxels=1.0,
+        max_layer=1,
+    )
+
+    raw = cache.blurred_presence_for_layer(0)
+
+    assert raw is not None
+    np.testing.assert_array_equal(raw, presence)
+    assert cache._blurred_presence_layers == {}
+
+
+def test_trace2cp_z_plane_cache_blurs_presence_layers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(runner_module, "_TRACE2CP_SIDE_PRESENCE_BLUR_RADIUS_Z", 1)
+    monkeypatch.setattr(runner_module, "_TRACE2CP_SIDE_PRESENCE_BLUR_RADIUS_ALONG", 2)
+    monkeypatch.setattr(runner_module, "_TRACE2CP_SIDE_PRESENCE_BLUR_RADIUS_ACROSS", 0)
+    valid = np.ones((5, 11), dtype=bool)
+
+    def make_sample(offset: float) -> FiberStripSegmentSample:
+        return FiberStripSegmentSample(
+            record_index=0,
+            fiber_path="fiber.json",
+            start_control_point_index=0,
+            target_control_point_index=1,
+            start_control_point_xyz=np.zeros(3, dtype=np.float32),
+            target_control_point_xyz=np.ones(3, dtype=np.float32),
+            strip_z_offset=0.0,
+            coords_zyx=np.zeros((5, 11, 3), dtype=np.float32),
+            valid_mask=valid,
+            frame=SimpleNamespace(),
+            line_xy=np.zeros((3, 2), dtype=np.float32),
+            start_control_point_xy=np.asarray([0.0, 2.0], dtype=np.float32),
+            target_control_point_xy=np.asarray([10.0, 2.0], dtype=np.float32),
+            line_point_indices=np.arange(3, dtype=np.int64),
+            line_normals_xyz=np.zeros((3, 3), dtype=np.float32),
+            start_row_axis_xyz=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+            target_row_axis_xyz=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+        )
+
+    class FakeLoader:
+        def __init__(self) -> None:
+            self.sampled_offsets: list[float] = []
+
+        def sample_trace2cp_segment_side_z_source(self, source, *, side_z_offset_voxels: float = 0.0):
+            self.sampled_offsets.append(float(side_z_offset_voxels))
+            image = np.full(valid.shape, float(side_z_offset_voxels), dtype=np.float32)
+            return make_sample(float(side_z_offset_voxels)), image, valid
+
+    def fields_for_offset(offset: float) -> _Trace2CpPredictedFields:
+        direction = np.zeros((5, 11, 2), dtype=np.float32)
+        direction[:, :, 0] = 1.0
+        presence = np.zeros((5, 11), dtype=np.float32)
+        if float(offset) == 0.0:
+            presence[2, 5] = 1.0
+        return _Trace2CpPredictedFields(
+            direction_xy=direction,
+            embedding_chw=None,
+            presence_hw=presence,
+        )
+
+    def fake_predict(model, image, valid_mask, *, device):
+        return fields_for_offset(float(np.asarray(image, dtype=np.float32)[0, 0]))
+
+    monkeypatch.setattr(runner_module, "_predict_trace2cp_fields", fake_predict)
+    loader = FakeLoader()
+    center_layer = runner_module._Trace2CpZLayerPrediction(
+        layer=0,
+        z_voxels=0.0,
+        sample=make_sample(0.0),
+        image=np.zeros(valid.shape, dtype=np.float32),
+        valid_mask=valid,
+        fields=fields_for_offset(0.0),
+    )
+    cache = runner_module._Trace2CpZPlaneCache(
+        loader=loader,
+        model=torch.nn.Identity(),
+        sample_index=123,
+        target_cp_index=1,
+        target_offset=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+        row_axis_alignment_line_index=None,
+        row_axis_alignment_xyz=None,
+        device=torch.device("cpu"),
+        segment_source=object(),
+        center_layer=center_layer,
+        z_step_voxels=1.0,
+        max_layer=1,
+        presence_blur_enabled=True,
+    )
+
+    blurred = cache.blurred_presence_for_layer(0)
+
+    assert blurred is not None
+    assert float(blurred[2, 5]) < 1.0
+    assert float(blurred[2, 5]) > 0.0
+    assert float(blurred[2, 4]) > 0.0
+    assert float(blurred[1, 5]) == pytest.approx(0.0)
+    assert loader.sampled_offsets == [-1.0, 1.0]
+
+
+def test_trace2cp_pair_builds_presence_z_pillar_panels(monkeypatch: pytest.MonkeyPatch) -> None:
+    shape = (9, 21)
+    valid = np.ones(shape, dtype=bool)
+    sample = FiberStripSegmentSample(
+        record_index=0,
+        fiber_path="fiber.json",
+        start_control_point_index=0,
+        target_control_point_index=1,
+        start_control_point_xyz=np.zeros(3, dtype=np.float32),
+        target_control_point_xyz=np.ones(3, dtype=np.float32),
+        strip_z_offset=0.0,
+        coords_zyx=np.zeros((shape[0], shape[1], 3), dtype=np.float32),
+        valid_mask=valid,
+        frame=SimpleNamespace(),
+        line_xy=np.asarray([[2.0, 4.0], [10.0, 4.0], [18.0, 4.0]], dtype=np.float32),
+        start_control_point_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_control_point_xy=np.asarray([18.0, 4.0], dtype=np.float32),
+        line_point_indices=np.arange(3, dtype=np.int64),
+        line_normals_xyz=np.zeros((3, 3), dtype=np.float32),
+        start_row_axis_xyz=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+        target_row_axis_xyz=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+    )
+
+    class FakeLoader:
+        def sample_trace2cp_segment_source(self, _source):
+            return sample, np.zeros(shape, dtype=np.float32), valid
+
+        def sample_trace2cp_segment_side_z_source(self, _source, *, side_z_offset_voxels: float = 0.0):
+            image = np.full(shape, float(side_z_offset_voxels), dtype=np.float32)
+            return sample, image, valid
+
+        def sample_trace2cp_top_strip_source(self, _source):
+            return np.zeros((5, shape[1]), dtype=np.float32), np.ones((5, shape[1]), dtype=bool)
+
+        def sample_trace2cp_traced_top_strip_source(self, _source, _trace_xyz, *, top_offsets_by_column=None):
+            return np.zeros((5, shape[1]), dtype=np.float32), np.ones((5, shape[1]), dtype=bool)
+
+    def fake_predict(_model, _image, _valid_mask, *, device):
+        direction = np.zeros((shape[0], shape[1], 2), dtype=np.float32)
+        direction[:, :, 0] = 1.0
+        embedding = np.zeros((2, shape[0], shape[1]), dtype=np.float32)
+        presence = np.full(shape, 0.5, dtype=np.float32)
+        return _Trace2CpPredictedFields(
+            direction_xy=direction,
+            embedding_chw=embedding,
+            presence_hw=presence,
+        )
+
+    def fake_combined_z(**_kwargs):
+        result = _trace2cp_test_bidirectional_result()
+        summary = runner_module._Trace2CpCombinedSummary(
+            forward=_trace2cp_test_stats(),
+            reverse=_trace2cp_test_stats(),
+            candidate_angles_degrees=np.asarray([0.0], dtype=np.float32),
+            fiber_bank_size=0,
+            fiber_bank_skipped=0,
+        )
+        forward_xyz = np.concatenate(
+            [result.forward.trace_xy, np.zeros((int(result.forward.trace_xy.shape[0]), 1), dtype=np.float32)],
+            axis=1,
+        )
+        reverse_xyz = np.concatenate(
+            [result.reverse.trace_xy, np.zeros((int(result.reverse.trace_xy.shape[0]), 1), dtype=np.float32)],
+            axis=1,
+        )
+        return result, summary, forward_xyz, reverse_xyz
+
+    def fake_fused_xyz(_refinement):
+        return np.asarray(
+            [[2.0, 4.0, 0.0], [10.0, 4.0, 0.0], [18.0, 4.0, 0.0]],
+            dtype=np.float32,
+        )
+
+    monkeypatch.setattr(runner_module, "_predict_trace2cp_fields", fake_predict)
+    monkeypatch.setattr(runner_module, "_trace_score_trace2cp_combined_z_bidirectional", fake_combined_z)
+    monkeypatch.setattr(runner_module, "_trace2cp_refinement_fused_xyz", fake_fused_xyz)
+
+    evaluation = runner_module._evaluate_trace2cp_pair(
+        FakeLoader(),
+        torch.nn.Identity(),
+        0,
+        device=torch.device("cpu"),
+        step_px=4.0,
+        rf_margin_px=0.0,
+        target_offset=1,
+        target_cp_index=None,
+        med_tta=False,
+        line_trace_tta_count=0,
+        vis_tta=False,
+        combined=True,
+        combined_weights=_Trace2CpCombinedWeights(direction=1.0, presence=1.0),
+        combined_fiber_bank=None,
+        combined_mode="direction",
+        image_scoring=None,
+        candidate_max_degrees=0.0,
+        candidate_step_degrees=1.0,
+        z_search=runner_module._Trace2CpZSearchConfig(enabled=True, step_voxels=1.0, max_layer=1),
+        trace2cp_dp=False,
+        sample_mode="flat",
+        segment_source=SimpleNamespace(),
+        build_similarity_debug=False,
+        build_top_strip_debug=True,
+    )
+
+    assert evaluation.top_strip_presence_image is not None
+    assert evaluation.traced_top_strip_presence_image is not None
+    assert evaluation.z_top_strip_presence_image is not None
+    assert evaluation.top_strip_presence_image.shape == (3, shape[1])
+    assert bool(np.asarray(evaluation.top_strip_presence_valid_mask, dtype=bool).any())
+    assert bool(np.asarray(evaluation.traced_top_strip_presence_valid_mask, dtype=bool).any())
+    assert bool(np.asarray(evaluation.z_top_strip_presence_valid_mask, dtype=bool).any())
+
+
+def test_trace2cp_z_closest_approach_includes_z_distance() -> None:
+    forward = np.asarray([[0.0, 10.0, 2.0], [10.0, 10.0, 2.0]], dtype=np.float32)
+    reverse = np.asarray([[0.0, 10.0, -2.0], [10.0, 10.0, -2.0]], dtype=np.float32)
+
+    result = _closest_trace2cp_approach_z(
+        forward,
+        reverse,
+        np.asarray([0.0, 10.0], dtype=np.float32),
+        np.asarray([10.0, 10.0], dtype=np.float32),
+        shape_hw=(31, 11),
+        rf_margin_px=0.0,
+    )
+
+    score, gap, considered_gap, penalty, closest_x, forward_y, reverse_y, forward_z, reverse_z, midpoint, midpoint_z, reason, reached = result
+    assert reached
+    assert reason == "closest_approach_z"
+    assert gap == pytest.approx(4.0)
+    assert considered_gap == pytest.approx(4.0)
+    assert penalty == pytest.approx(1.0)
+    assert score == pytest.approx(4.0 / 30.0)
+    assert closest_x == pytest.approx(5.0)
+    assert forward_y == pytest.approx(10.0)
+    assert reverse_y == pytest.approx(10.0)
+    assert forward_z == pytest.approx(2.0)
+    assert reverse_z == pytest.approx(-2.0)
+    assert midpoint.tolist() == pytest.approx([5.0, 10.0])
+    assert midpoint_z == pytest.approx(0.0)
+
+
+def test_trace2cp_z_refinement_keeps_cp_z_zero_and_fuses_fractional_z() -> None:
+    forward = np.asarray([[0.0, 10.0, 0.0], [5.0, 10.0, 2.0]], dtype=np.float32)
+    reverse = np.asarray([[10.0, 10.0, 0.0], [5.0, 10.0, -2.0]], dtype=np.float32)
+
+    result = _trace2cp_refinement_from_traces_z(
+        forward,
+        reverse,
+        np.asarray([0.0, 10.0], dtype=np.float32),
+        np.asarray([10.0, 10.0], dtype=np.float32),
+        shape_hw=(31, 11),
+        step_px=1.0,
+        rf_margin_px=0.0,
+    )
+
+    assert result.reached_overlap
+    assert result.raw_y_error_px == pytest.approx(4.0)
+    assert result.closest_forward_z_voxels == pytest.approx(2.0)
+    assert result.closest_reverse_z_voxels == pytest.approx(-2.0)
+    assert result.closest_midpoint_z_voxels == pytest.approx(0.0)
+    assert result.fused_resampled_z is not None
+    assert result.fused_resampled_z[0] == pytest.approx(0.0)
+    assert result.fused_resampled_z[-1] == pytest.approx(0.0)
+    assert np.max(np.abs(result.fused_resampled_z)) < 2.0
+
+
+def test_trace2cp_z_corrected_image_copies_nearest_inferred_layer_columns() -> None:
+    def layer(value: int):
+        return SimpleNamespace(
+            image=np.full((2, 3), value, dtype=np.float32),
+            valid_mask=np.ones((2, 3), dtype=bool),
+        )
+
+    plane_cache = SimpleNamespace(
+        z_step_voxels=2.0,
+        layers={-1: layer(10), 0: layer(20), 1: layer(30)},
+    )
+    trace = np.asarray([[0.0, 0.0, -2.0], [1.0, 0.0, 0.0], [2.0, 0.0, 2.0]], dtype=np.float32)
+
+    image, missing, layer_columns = _trace2cp_z_corrected_image_u8(
+        plane_cache=plane_cache,
+        trace_xyz=trace,
+        fallback_shape_hw=(2, 3),
+    )
+
+    assert missing == 0
+    assert layer_columns.tolist() == [-1, 0, 1]
+    assert image[:, 0].tolist() == [10, 10]
+    assert image[:, 1].tolist() == [20, 20]
+    assert image[:, 2].tolist() == [30, 30]
+
+
+def test_trace2cp_z_corrected_image_fetches_missing_cache_layers_lazily() -> None:
+    class LazyCache:
+        z_step_voxels = 1.0
+
+        def __init__(self) -> None:
+            self.layers = {0: self._layer(20)}
+            self.requested: list[int] = []
+
+        @staticmethod
+        def _layer(value: int):
+            return SimpleNamespace(
+                image=np.full((2, 3), value, dtype=np.float32),
+                valid_mask=np.ones((2, 3), dtype=bool),
+            )
+
+        def get(self, layer: int):
+            self.requested.append(int(layer))
+            if int(layer) not in self.layers:
+                self.layers[int(layer)] = self._layer(20 + 10 * int(layer))
+            return self.layers[int(layer)]
+
+    cache = LazyCache()
+    trace = np.asarray([[0.0, 0.0, -1.0], [1.0, 0.0, 0.0], [2.0, 0.0, 1.0]], dtype=np.float32)
+
+    image, missing, layer_columns = _trace2cp_z_corrected_image_u8(
+        plane_cache=cache,
+        trace_xyz=trace,
+        fallback_shape_hw=(2, 3),
+    )
+
+    assert missing == 0
+    assert layer_columns.tolist() == [-1, 0, 1]
+    assert image[:, 0].tolist() == [10, 10]
+    assert image[:, 1].tolist() == [20, 20]
+    assert image[:, 2].tolist() == [30, 30]
+    assert -1 in cache.requested
+    assert 1 in cache.requested
+
+
+def test_trace2cp_z_corrected_presence_copies_nearest_inferred_layer_columns() -> None:
+    def layer(value: float):
+        return SimpleNamespace(
+            valid_mask=np.ones((2, 3), dtype=bool),
+            fields=SimpleNamespace(
+                presence_hw=np.full((2, 3), value, dtype=np.float32),
+            ),
+        )
+
+    plane_cache = SimpleNamespace(
+        z_step_voxels=2.0,
+        layers={-1: layer(0.1), 0: layer(0.5), 1: layer(0.9)},
+    )
+    trace = np.asarray([[0.0, 0.0, -2.0], [1.0, 0.0, 0.0], [2.0, 0.0, 2.0]], dtype=np.float32)
+
+    presence, missing, layer_columns = _trace2cp_z_corrected_presence_u8(
+        plane_cache=plane_cache,
+        trace_xyz=trace,
+        fallback_shape_hw=(2, 3),
+    )
+
+    assert presence is not None
+    assert missing == 0
+    assert layer_columns.tolist() == [-1, 0, 1]
+    assert presence[:, 0].tolist() == [25, 25]
+    assert presence[:, 1].tolist() == [127, 127]
+    assert presence[:, 2].tolist() == [229, 229]
+
+
+def test_trace2cp_z_corrected_presence_fetches_missing_cache_layers_lazily() -> None:
+    class LazyCache:
+        z_step_voxels = 1.0
+
+        def __init__(self) -> None:
+            self.layers = {0: self._layer(0.5)}
+            self.requested: list[int] = []
+
+        @staticmethod
+        def _layer(value: float):
+            return SimpleNamespace(
+                valid_mask=np.ones((2, 3), dtype=bool),
+                fields=SimpleNamespace(
+                    presence_hw=np.full((2, 3), value, dtype=np.float32),
+                ),
+            )
+
+        def get(self, layer: int):
+            self.requested.append(int(layer))
+            if int(layer) not in self.layers:
+                self.layers[int(layer)] = self._layer(0.5 + 0.25 * int(layer))
+            return self.layers[int(layer)]
+
+    cache = LazyCache()
+    trace = np.asarray([[0.0, 0.0, -1.0], [1.0, 0.0, 0.0], [2.0, 0.0, 1.0]], dtype=np.float32)
+
+    presence, missing, layer_columns = _trace2cp_z_corrected_presence_u8(
+        plane_cache=cache,
+        trace_xyz=trace,
+        fallback_shape_hw=(2, 3),
+    )
+
+    assert presence is not None
+    assert missing == 0
+    assert layer_columns.tolist() == [-1, 0, 1]
+    assert presence[:, 0].tolist() == [63, 63]
+    assert presence[:, 1].tolist() == [127, 127]
+    assert presence[:, 2].tolist() == [191, 191]
+    assert -1 in cache.requested
+    assert 1 in cache.requested
+
+
+def test_trace2cp_z_corrected_image_marks_untraced_columns_black() -> None:
+    plane_cache = SimpleNamespace(
+        z_step_voxels=2.0,
+        layers={
+            0: SimpleNamespace(
+                image=np.full((2, 4), 200, dtype=np.float32),
+                valid_mask=np.ones((2, 4), dtype=bool),
+            )
+        },
+    )
+    trace = np.asarray([[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=np.float32)
+
+    image, missing, layer_columns = _trace2cp_z_corrected_image_u8(
+        plane_cache=plane_cache,
+        trace_xyz=trace,
+        fallback_shape_hw=(2, 4),
+    )
+
+    assert missing == 2
+    assert layer_columns.tolist() == [-10000, 0, 0, -10000]
+    assert image[:, 0].tolist() == [0, 0]
+    assert image[:, 1].tolist() == [200, 200]
+    assert image[:, 2].tolist() == [200, 200]
+    assert image[:, 3].tolist() == [0, 0]
+
+
+def test_trace2cp_z_layer_tiff_stack_orders_slices_then_presence() -> None:
+    def layer(layer_index: int, image_value: int, presence_value: float):
+        return SimpleNamespace(
+            layer=layer_index,
+            z_voxels=float(layer_index) * 2.0,
+            image=np.full((2, 2), image_value, dtype=np.float32),
+            valid_mask=np.ones((2, 2), dtype=bool),
+            fields=SimpleNamespace(
+                presence_hw=np.full((2, 2), presence_value, dtype=np.float32),
+            ),
+        )
+
+    plane_cache = SimpleNamespace(
+        z_step_voxels=2.0,
+        layers={
+            1: layer(1, 30, 0.75),
+            -1: layer(-1, 10, 0.25),
+            0: layer(0, 20, 0.50),
+        },
+    )
+
+    stack, labels = _trace2cp_z_layer_tiff_stack(plane_cache)
+
+    assert stack.shape == (6, 2, 2)
+    assert labels == (
+        "slice layer=-1 z_voxels=-2.000000",
+        "slice layer=0 z_voxels=0.000000",
+        "slice layer=1 z_voxels=2.000000",
+        "presence layer=-1 z_voxels=-2.000000",
+        "presence layer=0 z_voxels=0.000000",
+        "presence layer=1 z_voxels=2.000000",
+    )
+    assert stack[:, 0, 0].tolist() == [10, 20, 30, 63, 127, 191]
+
+
+def test_trace2cp_tta_params_drop_y_shift_and_scale() -> None:
+    params = FiberStripAugmentParams(
+        shift_x=3.0,
+        shift_y=4.0,
+        rotation_degrees=17.0,
+        shear_x=0.25,
+        shear_y=-0.5,
+        scale=1.8,
+        smooth_offset=2.5,
+        smooth_offset_stride=8.0,
+        smooth_offset_seed=123,
+        flip_x=True,
+        flip_y=True,
+        brightness=0.5,
+        contrast=2.0,
+        gamma=0.25,
+        noise_std=0.75,
+        blur_sigma=1.5,
+    )
+
+    filtered = _trace2cp_tta_params(params)
+
+    assert filtered.shift_x == pytest.approx(3.0)
+    assert filtered.shift_y == pytest.approx(0.0)
+    assert filtered.scale == pytest.approx(1.0)
+    assert filtered.rotation_degrees == pytest.approx(17.0)
+    assert filtered.shear_x == pytest.approx(0.25)
+    assert filtered.shear_y == pytest.approx(-0.5)
+    assert filtered.smooth_offset == pytest.approx(2.5)
+    assert filtered.flip_x is True
+    assert filtered.flip_y is True
+    assert filtered.brightness == pytest.approx(0.0)
+    assert filtered.contrast == pytest.approx(1.0)
+    assert filtered.gamma == pytest.approx(1.0)
+    assert filtered.noise_std == pytest.approx(0.0)
+    assert filtered.blur_sigma == pytest.approx(0.0)
+
+
+def test_trace2cp_median_tta_trace_stops_at_target_column() -> None:
+    field = np.zeros((9, 9, 2), dtype=np.float32)
+    field[:, :, 0] = 1.0
+    fields = [
+        _TtaDirectionField(
+            name="reference",
+            direction_xy=field,
+            valid_mask=np.ones((9, 9), dtype=bool),
+            source_xy_grid=_identity_source_xy_grid((9, 9)),
+            reference_to_tta_xy_grid=_identity_source_xy_grid((9, 9)),
+        )
+    ]
+
+    line, reason = _trace_median_tta_direction_line_to_target(
+        fields,
+        np.asarray([2.0, 4.0], dtype=np.float32),
+        np.asarray([6.0, 4.0], dtype=np.float32),
+        shape_hw=(9, 9),
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+
+    assert reason == "target_column"
+    assert np.allclose(line[:, 1], 4.0)
+    assert np.isclose(line[-1, 0], 6.0)
+
+
+def test_trace2cp_segment_window_maps_start_and_target_cp(tmp_path: Path) -> None:
+    fiber = load_vc3d_fiber(
+        _write_fiber(
+            tmp_path / "fiber_trace_2d_trace2cp_window.json",
+            points=[[0.0, 20.0, 20.0], [10.0, 20.0, 20.0], [20.0, 20.0, 20.0]],
+            control_points=[[0.0, 20.0, 20.0], [10.0, 20.0, 20.0], [20.0, 20.0, 20.0]],
+        )
+    )
+    window = side_strip_segment_line_window(
+        fiber,
+        start_control_point_index=0,
+        target_control_point_index=1,
+        margin_px=2.0,
+        pixel_spacing_base=1.0,
+    )
+    start_line_index = control_point_line_index(fiber, 0)
+    target_line_index = control_point_line_index(fiber, 1)
+    start_xy = source_point_xy_for_line_index(
+        window,
+        original_line_index=start_line_index,
+        patch_shape_hw=(9, 16),
+        anchor_column_px=2.0,
+        pixel_spacing_base=1.0,
+    )
+    target_xy = source_point_xy_for_line_index(
+        window,
+        original_line_index=target_line_index,
+        patch_shape_hw=(9, 16),
+        anchor_column_px=2.0,
+        pixel_spacing_base=1.0,
+    )
+
+    assert start_xy.tolist() == pytest.approx([2.0, 4.0])
+    assert target_xy.tolist() == pytest.approx([12.0, 4.0])
+
+
+def test_trace2cp_loader_rejects_same_cp(tmp_path: Path) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+
+    with pytest.raises(ValueError, match="must differ"):
+        loader.build_trace2cp_segment_patch(
+            0,
+            target_control_point_index=0,
+            rf_margin_px=0.0,
+            sample_mode="flat",
+        )
+
+
+def test_trace2cp_segment_patch_uses_eight_times_configured_height(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["patch_shape_hw"] = [5, 7]
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+
+    sample, image, valid = loader.build_trace2cp_segment_patch(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+    )
+
+    assert image.shape[0] == 40
+    assert valid.shape[0] == 40
+    assert sample.coords_zyx.shape[0] == 40
+
+
+def test_trace2cp_segment_patch_accepts_explicit_selected_scale_z_offset(tmp_path: Path) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+
+    center, _, _ = loader.build_trace2cp_segment_patch(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+    )
+    shifted, _, _ = loader.build_trace2cp_segment_patch(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        strip_z_offset=2.0,
+        sample_mode="flat",
+    )
+
+    assert center.strip_z_offset == pytest.approx(0.0)
+    assert shifted.strip_z_offset == pytest.approx(2.0)
+    assert shifted.coords_zyx.shape == center.coords_zyx.shape
+    assert not np.allclose(shifted.coords_zyx, center.coords_zyx)
+
+
+def test_trace2cp_segment_source_offsets_each_pixel_axis(tmp_path: Path) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    source = loader.build_trace2cp_segment_source(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+        device=torch.device("cpu"),
+    )
+
+    center, _, _ = loader.sample_trace2cp_segment_source(source)
+    shifted, _, _ = loader.sample_trace2cp_segment_source(source, strip_z_offset=1.0)
+
+    axis_zyx = source.grid.offset_axis_zyx.detach().cpu().numpy().astype(np.float32)
+    expected = axis_zyx * np.float32(source.record.volume_spacing_base)
+    grid_valid = source.grid.valid_mask.detach().cpu().numpy().astype(bool)
+    delta = shifted.coords_zyx - center.coords_zyx
+
+    assert shifted.strip_z_offset == pytest.approx(1.0)
+    assert np.count_nonzero(grid_valid) > 0
+    assert np.allclose(delta[grid_valid], expected[grid_valid], atol=1.0e-5)
+
+
+def test_trace2cp_segment_side_z_offsets_use_out_of_plane_axis(tmp_path: Path) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    source = loader.build_trace2cp_segment_source(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+        device=torch.device("cpu"),
+    )
+    assert source.grid.side_axis_zyx is not None
+
+    center_coords, center_valid = loader.trace2cp_segment_side_z_coords_xyz(
+        source,
+        side_z_offset_voxels=0.0,
+    )
+    shifted_coords, shifted_valid = loader.trace2cp_segment_side_z_coords_xyz(
+        source,
+        side_z_offset_voxels=1.0,
+    )
+    row_axis_xyz = source.grid.offset_axis_xyz.detach().cpu().numpy().astype(np.float32)
+    side_axis_xyz = source.grid.side_axis_xyz.detach().cpu().numpy().astype(np.float32)
+    expected = side_axis_xyz * np.float32(source.record.volume_spacing_base)
+    delta = shifted_coords - center_coords
+    grid_valid = (
+        center_valid
+        & shifted_valid
+        & source.grid.valid_mask.detach().cpu().numpy().astype(bool)
+    )
+
+    assert np.count_nonzero(grid_valid) > 0
+    assert np.allclose(delta[grid_valid], expected[grid_valid], atol=1.0e-5)
+    row_side_dot = np.sum(row_axis_xyz[grid_valid] * side_axis_xyz[grid_valid], axis=1)
+    assert np.max(np.abs(row_side_dot)) < 1.0e-4
+
+
+def test_trace2cp_render_sampling_rejects_chunk_errors() -> None:
+    class ErrorSampler:
+        blocking = True
+
+        def sample_coords(
+            self,
+            coords_zyx_base: np.ndarray,
+            valid_mask: np.ndarray,
+        ) -> CoordinateSampleResult:
+            return CoordinateSampleResult(
+                image=np.zeros(valid_mask.shape, dtype=np.float32),
+                valid_mask=np.asarray(valid_mask, dtype=bool),
+                stats={"error_chunks": 1},
+            )
+
+    source = SimpleNamespace(record=SimpleNamespace(sampler=ErrorSampler()))
+    coords = np.zeros((3, 4, 3), dtype=np.float32)
+    valid = np.ones((3, 4), dtype=bool)
+
+    with pytest.raises(ValueError, match="incomplete requested-level data"):
+        FiberStrip2DLoader._sample_trace2cp_coords_blocking(
+            object(),
+            source,
+            coords,
+            valid,
+            context="test",
+        )
+
+
+def test_trace2cp_render_sampling_rejects_nonblocking_sampler() -> None:
+    class NonBlockingSampler:
+        blocking = False
+
+        def sample_coords(
+            self,
+            coords_zyx_base: np.ndarray,
+            valid_mask: np.ndarray,
+        ) -> CoordinateSampleResult:
+            del coords_zyx_base, valid_mask
+            raise AssertionError("non-blocking sampler should be rejected before sampling")
+
+    source = SimpleNamespace(record=SimpleNamespace(sampler=NonBlockingSampler()))
+    coords = np.zeros((3, 4, 3), dtype=np.float32)
+    valid = np.ones((3, 4), dtype=bool)
+
+    with pytest.raises(ValueError, match="blocking coordinate sampling"):
+        FiberStrip2DLoader._sample_trace2cp_coords_blocking(
+            object(),
+            source,
+            coords,
+            valid,
+            context="test",
+        )
+
+
+def test_trace2cp_refined_segment_source_samples_from_fused_trace(tmp_path: Path) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    source = loader.build_trace2cp_segment_source(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+        device=torch.device("cpu"),
+    )
+    start = np.asarray(source.start_control_point_xy, dtype=np.float32)
+    target = np.asarray(source.target_control_point_xy, dtype=np.float32)
+    midpoint = 0.5 * (start + target)
+    midpoint[1] += np.float32(1.0)
+    trace_xyz = np.asarray(
+        [
+            [start[0], start[1], 0.0],
+            [midpoint[0], midpoint[1], 0.0],
+            [target[0], target[1], 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    refined_source = loader.build_trace2cp_refined_segment_source(
+        source,
+        trace_xyz,
+        device=torch.device("cpu"),
+    )
+    refined_sample, refined_image, refined_valid = loader.sample_trace2cp_segment_source(refined_source)
+
+    assert refined_sample.start_control_point_index == source.start_control_point_index
+    assert refined_sample.target_control_point_index == source.target_control_point_index
+    assert refined_source.source_shape_hw[0] == source.source_shape_hw[0]
+    assert refined_source.source_shape_hw[1] >= source.source_shape_hw[1]
+    assert refined_sample.start_control_point_xy[0] < refined_sample.target_control_point_xy[0]
+    assert refined_image.shape == refined_valid.shape
+    assert np.count_nonzero(refined_valid) > 0
+
+
+def test_trace2cp_volume_trace_segment_source_ignores_original_source_grid(
+    tmp_path: Path,
+) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    source = loader.build_trace2cp_segment_source(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+        device=torch.device("cpu"),
+    )
+    broken_grid_source = replace(source, grid=SimpleNamespace())
+    trace_xyz = np.asarray(source.line_window.line_points_xyz, dtype=np.float32).copy()
+    trace_xyz[:, 1] += np.float32(5.0)
+
+    regenerated_source = loader.build_trace2cp_volume_trace_segment_source(
+        broken_grid_source,
+        trace_xyz,
+        device=torch.device("cpu"),
+    )
+    regenerated_sample, regenerated_image, regenerated_valid = (
+        loader.sample_trace2cp_segment_source(regenerated_source)
+    )
+
+    assert regenerated_sample.start_control_point_index == source.start_control_point_index
+    assert regenerated_sample.target_control_point_index == source.target_control_point_index
+    assert regenerated_image.shape == regenerated_valid.shape
+    assert np.count_nonzero(regenerated_valid) > 0
+    assert np.allclose(
+        np.asarray(regenerated_source.line_window.line_points_xyz, dtype=np.float32)[1:-1, 1],
+        trace_xyz[:, 1],
+    )
+
+
+def test_trace2cp_refined_segment_source_clips_off_strip_trace_points(tmp_path: Path) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    source = loader.build_trace2cp_segment_source(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+        device=torch.device("cpu"),
+    )
+    start = np.asarray(source.start_control_point_xy, dtype=np.float32)
+    target = np.asarray(source.target_control_point_xy, dtype=np.float32)
+    midpoint = 0.5 * (start + target)
+    off_strip = midpoint.copy()
+    off_strip[1] = np.float32(source.source_shape_hw[0] + 8)
+
+    refined_source = loader.build_trace2cp_refined_segment_source(
+        source,
+        np.asarray(
+            [
+                [start[0], start[1], 0.0],
+                [off_strip[0], off_strip[1], 0.0],
+                [target[0], target[1], 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        device=torch.device("cpu"),
+    )
+
+    refined_sample, refined_image, refined_valid = loader.sample_trace2cp_segment_source(
+        refined_source
+    )
+    assert refined_sample.start_control_point_index == source.start_control_point_index
+    assert refined_sample.target_control_point_index == source.target_control_point_index
+    assert refined_image.shape == refined_valid.shape
+    assert np.count_nonzero(refined_valid) > 0
+
+
+def test_trace2cp_refined_segment_source_clips_off_strip_endpoint_points(
+    tmp_path: Path,
+) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    source = loader.build_trace2cp_segment_source(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+        device=torch.device("cpu"),
+    )
+    start = np.asarray(source.start_control_point_xy, dtype=np.float32)
+    target = np.asarray(source.target_control_point_xy, dtype=np.float32)
+    first_valid = 0.33 * start + 0.67 * target
+    second_valid = 0.67 * start + 0.33 * target
+    off_strip_y = np.float32(source.source_shape_hw[0] + 8)
+
+    refined_source = loader.build_trace2cp_refined_segment_source(
+        source,
+        np.asarray(
+            [
+                [start[0], off_strip_y, 0.0],
+                [first_valid[0], first_valid[1], 0.0],
+                [second_valid[0], second_valid[1], 0.0],
+                [target[0], off_strip_y, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        device=torch.device("cpu"),
+    )
+
+    refined_sample, refined_image, refined_valid = loader.sample_trace2cp_segment_source(
+        refined_source
+    )
+    assert refined_sample.start_control_point_index == source.start_control_point_index
+    assert refined_sample.target_control_point_index == source.target_control_point_index
+    assert refined_image.shape == refined_valid.shape
+    assert np.count_nonzero(refined_valid) > 0
+
+
+def test_trace2cp_refined_segment_source_rejects_all_off_strip_trace_points(
+    tmp_path: Path,
+) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    source = loader.build_trace2cp_segment_source(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+        device=torch.device("cpu"),
+    )
+    start = np.asarray(source.start_control_point_xy, dtype=np.float32)
+    target = np.asarray(source.target_control_point_xy, dtype=np.float32)
+    off_strip_y = np.float32(source.source_shape_hw[0] + 8)
+
+    with pytest.raises(ValueError, match="fewer than two source-strip-valid points"):
+        loader.build_trace2cp_refined_segment_source(
+            source,
+            np.asarray(
+                [
+                    [start[0], off_strip_y, 0.0],
+                    [target[0], off_strip_y, 0.0],
+                ],
+                dtype=np.float32,
+            ),
+            device=torch.device("cpu"),
+        )
+
+
+def test_trace2cp_refined_segment_source_preserves_bidirectional_trace_starts(tmp_path: Path) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    source = loader.build_trace2cp_segment_source(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+        device=torch.device("cpu"),
+    )
+    start = np.asarray(source.start_control_point_xy, dtype=np.float32)
+    target = np.asarray(source.target_control_point_xy, dtype=np.float32)
+    midpoint = 0.5 * (start + target)
+    midpoint[1] += np.float32(1.0)
+    refined_source = loader.build_trace2cp_refined_segment_source(
+        source,
+        np.asarray(
+            [
+                [start[0], start[1], 0.0],
+                [midpoint[0], midpoint[1], 0.0],
+                [target[0], target[1], 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        device=torch.device("cpu"),
+    )
+    sample, image, valid = loader.sample_trace2cp_segment_source(refined_source)
+    direction = np.zeros((*image.shape, 2), dtype=np.float32)
+    direction[..., 0] = 1.0
+
+    result = _trace_score_trace2cp_bidirectional(
+        direction,
+        np.asarray(sample.start_control_point_xy, dtype=np.float32),
+        np.asarray(sample.target_control_point_xy, dtype=np.float32),
+        valid_mask=valid,
+        step_px=1.0,
+        rf_margin_px=0.0,
+    )
+
+    np.testing.assert_allclose(result.forward.trace_xy[0], sample.start_control_point_xy)
+    np.testing.assert_allclose(result.reverse.trace_xy[0], sample.target_control_point_xy)
+    assert float(result.forward.trace_xy[-1, 0]) > float(result.forward.trace_xy[0, 0])
+    assert float(result.reverse.trace_xy[-1, 0]) < float(result.reverse.trace_xy[0, 0])
+
+
+def test_trace2cp_traced_top_strip_samples_from_fused_trace(tmp_path: Path) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    source = loader.build_trace2cp_segment_source(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+        device=torch.device("cpu"),
+    )
+    trace_xyz = np.column_stack(
+        [
+            np.asarray(source.line_xy[:, 0], dtype=np.float32),
+            np.asarray(source.line_xy[:, 1], dtype=np.float32),
+            np.zeros((int(source.line_xy.shape[0]),), dtype=np.float32),
+        ]
+    )
+    z_trace_xyz = trace_xyz.copy()
+    z_trace_xyz[:, 2] = np.float32(1.0)
+
+    image, valid = loader.sample_trace2cp_traced_top_strip_source(source, trace_xyz)
+    z_image, z_valid = loader.sample_trace2cp_traced_top_strip_source(source, z_trace_xyz)
+
+    assert image.shape == source.source_shape_hw
+    assert valid.shape == source.source_shape_hw
+    assert z_image.shape == source.source_shape_hw
+    assert z_valid.shape == source.source_shape_hw
+    assert bool(valid.any())
+    assert bool(z_valid.any())
+    overlap = valid & z_valid
+    assert bool(overlap.any())
+    assert not np.allclose(image[overlap], z_image[overlap])
+
+    coords, coord_valid = loader.trace2cp_traced_top_strip_coords_xyz(source, trace_xyz)
+    shifted, shifted_valid = loader.trace2cp_traced_top_strip_coords_xyz(
+        source,
+        trace_xyz,
+        top_offsets_by_column=np.ones((int(source.source_shape_hw[1]),), dtype=np.float32),
+    )
+    center_row = int(source.source_shape_hw[0]) // 2
+    assert center_row + 1 < int(source.source_shape_hw[0])
+    shifted_overlap = shifted_valid[center_row] & coord_valid[center_row + 1]
+    assert bool(shifted_overlap.any())
+    np.testing.assert_allclose(
+        shifted[center_row, shifted_overlap],
+        coords[center_row + 1, shifted_overlap],
+        atol=1.0e-4,
+    )
+    with pytest.raises(ValueError, match="top_offsets_by_column length"):
+        loader.trace2cp_traced_top_strip_coords_xyz(
+            source,
+            trace_xyz,
+            top_offsets_by_column=np.zeros((2,), dtype=np.float32),
+        )
+
+
+def test_trace2cp_segment_patch_can_align_ambiguous_normal_sign(tmp_path: Path) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+
+    reference, _, _ = loader.build_trace2cp_segment_patch(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+        device=torch.device("cpu"),
+    )
+    line_index = int(reference.line_point_indices[0])
+    alignment_normal = -np.asarray(reference.line_normals_xyz[0], dtype=np.float32)
+
+    aligned, _, _ = loader.build_trace2cp_segment_patch(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        row_axis_alignment_line_index=line_index,
+        row_axis_alignment_xyz=alignment_normal,
+        sample_mode="flat",
+        device=torch.device("cpu"),
+    )
+
+    assert np.allclose(aligned.line_normals_xyz, -reference.line_normals_xyz)
+    assert np.allclose(aligned.start_row_axis_xyz, -reference.start_row_axis_xyz, atol=1.0e-5)
+    assert np.allclose(aligned.target_row_axis_xyz, -reference.target_row_axis_xyz, atol=1.0e-5)
+    assert np.allclose(aligned.coords_zyx, reference.coords_zyx[::-1], atol=1.0e-4)
+
+
+def test_loader_maps_fiber_json_to_flat_control_point_indices(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    loader = _make_loader(load_config(config_path))
+    fiber_path = json.loads(config_path.read_text(encoding="utf-8"))["datasets"][0]["fiber_paths"][0]
+
+    assert loader.flat_sample_indices_for_fiber_json(fiber_path) == (0, 1, 2)
+
+    with pytest.raises(ValueError, match="not present"):
+        loader.flat_sample_indices_for_fiber_json(tmp_path / "missing.json")
+
+
+def test_load_nml_fiber_orders_unordered_nodes_by_edges(tmp_path: Path) -> None:
+    nml = _write_nml(
+        tmp_path / "fiber.nml",
+        things=[
+            {
+                "id": "7",
+                "name": "ordered-by-edges",
+                "nodes": [
+                    ("3", 30.0, 0.0, 0.0),
+                    ("1", 10.0, 0.0, 0.0),
+                    ("2", 20.0, 0.0, 0.0),
+                ],
+                "edges": [("1", "2"), ("2", "3")],
+            }
+        ],
+    )
+
+    fibers = load_nml_fibers(nml)
+
+    assert len(fibers) == 1
+    np.testing.assert_allclose(
+        fibers[0].line_points_xyz,
+        np.asarray([[10.0, 0.0, 0.0], [20.0, 0.0, 0.0], [30.0, 0.0, 0.0]], dtype=np.float32),
+    )
+    np.testing.assert_allclose(fibers[0].control_points_xyz, fibers[0].line_points_xyz)
+    assert fibers[0].metadata["source_format"] == "nml"
+    assert fibers[0].metadata["nml_thing_id"] == "7"
+
+
+def test_load_nml_fiber_splits_simple_path_components(tmp_path: Path) -> None:
+    nml = _write_nml(
+        tmp_path / "multi.nml",
+        things=[
+            {
+                "id": "1",
+                "nodes": [
+                    ("1", 10.0, 10.0, 10.0),
+                    ("2", 11.0, 10.0, 10.0),
+                    ("10", 20.0, 10.0, 10.0),
+                    ("11", 21.0, 10.0, 10.0),
+                ],
+                "edges": [("1", "2"), ("10", "11")],
+            }
+        ],
+    )
+
+    fibers = load_nml_fibers(nml)
+
+    assert len(fibers) == 2
+    assert [fiber.metadata["nml_component_index"] for fiber in fibers] == [0, 1]
+    assert [fiber.control_points_xyz.shape[0] for fiber in fibers] == [2, 2]
+
+
+def test_load_nml_fiber_rejects_only_branching_components(tmp_path: Path) -> None:
+    nml = _write_nml(
+        tmp_path / "branch.nml",
+        things=[
+            {
+                "id": "valid",
+                "nodes": [("1", 1.0, 1.0, 1.0), ("2", 2.0, 1.0, 1.0)],
+                "edges": [("1", "2")],
+            },
+            {
+                "id": "branch",
+                "nodes": [
+                    ("10", 10.0, 1.0, 1.0),
+                    ("11", 11.0, 1.0, 1.0),
+                    ("12", 12.0, 1.0, 1.0),
+                    ("13", 13.0, 1.0, 1.0),
+                ],
+                "edges": [("10", "11"), ("11", "12"), ("11", "13")],
+            },
+        ],
+    )
+
+    with pytest.warns(RuntimeWarning, match="branch"):
+        fibers = load_nml_fibers(nml)
+
+    assert len(fibers) == 1
+    assert fibers[0].metadata["nml_thing_id"] == "valid"
+
+
+def test_load_fiber_file_applies_inline_xyz_transform_and_inverse(tmp_path: Path) -> None:
+    nml = _write_nml(
+        tmp_path / "transform.nml",
+        things=[
+            {
+                "id": "1",
+                "nodes": [("1", 1.0, 2.0, 3.0), ("2", 4.0, 5.0, 6.0)],
+                "edges": [("1", "2")],
+            }
+        ],
+    )
+    matrix = np.asarray(
+        [
+            [1.0, 0.0, 0.0, 10.0],
+            [0.0, 1.0, 0.0, 20.0],
+            [0.0, 0.0, 1.0, 30.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+    transformed = load_fiber_file(nml, transform_xyz=matrix)[0]
+    inverted = load_fiber_file(nml, transform_xyz=np.linalg.inv(matrix))[0]
+
+    np.testing.assert_allclose(
+        transformed.control_points_xyz,
+        np.asarray([[11.0, 22.0, 33.0], [14.0, 25.0, 36.0]], dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        inverted.control_points_xyz,
+        np.asarray([[-9.0, -18.0, -27.0], [-6.0, -15.0, -24.0]], dtype=np.float32),
+    )
+
+
+def test_loader_loads_nml_components_and_applies_dataset_transform(tmp_path: Path) -> None:
+    nml = _write_nml(
+        tmp_path / "fibers.nml",
+        things=[
+            {
+                "id": "1",
+                "nodes": [
+                    ("1", 1.0, 1.0, 1.0),
+                    ("2", 2.0, 1.0, 1.0),
+                    ("10", 3.0, 1.0, 1.0),
+                    ("11", 4.0, 1.0, 1.0),
+                ],
+                "edges": [("1", "2"), ("10", "11")],
+            }
+        ],
+    )
+    volume = _write_zarr(tmp_path / "vol.zarr")
+    manifest = _write_lasagna_manifest(tmp_path)
+    config = {
+        "batch_size": 1,
+        "patch_shape_hw": [3, 3],
+        "strip_z_offset_count": 1,
+        "strip_z_offset_step": 1.0,
+        "loader_workers": 1,
+        "seed": 123,
+        "datasets": [
+            {
+                "fiber_paths": [str(nml)],
+                "base_volume_path": str(volume),
+                "base_volume_scale": 0,
+                "lasagna_manifest_path": str(manifest),
+                "fiber_transform": [
+                    [1.0, 0.0, 0.0, 10.0],
+                    [0.0, 1.0, 0.0, 20.0],
+                    [0.0, 0.0, 1.0, 30.0],
+                ],
+            }
+        ],
+    }
+    config_path = tmp_path / "nml_config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    loader = _make_loader(load_config(config_path))
+
+    assert len(loader.records) == 2
+    assert loader.sample_count == 4
+    assert loader.flat_sample_indices_for_fiber_json(nml) == (0, 1, 2, 3)
+    np.testing.assert_allclose(loader.records[0].fiber.control_points_xyz[0], [11.0, 21.0, 31.0])
+    assert loader.records[0].fiber.metadata["fiber_transform_applied"] is True
+    assert loader.records[0].fiber_identity != loader.records[1].fiber_identity
+
+
+def test_loader_accepts_transform_json_and_invert(tmp_path: Path) -> None:
+    nml = _write_nml(
+        tmp_path / "invert.nml",
+        things=[
+            {
+                "id": "1",
+                "nodes": [("1", 11.0, 22.0, 33.0), ("2", 12.0, 22.0, 33.0)],
+                "edges": [("1", "2")],
+            }
+        ],
+    )
+    transform_path = tmp_path / "transform.json"
+    transform_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0.0",
+                "fixed_volume": "fixed.zarr",
+                "transformation_matrix": [
+                    [1.0, 0.0, 0.0, 10.0],
+                    [0.0, 1.0, 0.0, 20.0],
+                    [0.0, 0.0, 1.0, 30.0],
+                ],
+                "fixed_landmarks": [],
+                "moving_landmarks": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    volume = _write_zarr(tmp_path / "vol.zarr")
+    manifest = _write_lasagna_manifest(tmp_path)
+    config = {
+        "batch_size": 1,
+        "patch_shape_hw": [3, 3],
+        "strip_z_offset_count": 1,
+        "strip_z_offset_step": 1.0,
+        "seed": 123,
+        "datasets": [
+            {
+                "fiber_paths": [str(nml)],
+                "base_volume_path": str(volume),
+                "base_volume_scale": 0,
+                "lasagna_manifest_path": str(manifest),
+                "fiber_transform_json": str(transform_path),
+                "fiber_transform_invert": True,
+            }
+        ],
+    }
+    config_path = tmp_path / "transform_json_config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    loader = _make_loader(load_config(config_path))
+
+    assert loader.sample_count == 2
+    np.testing.assert_allclose(loader.records[0].fiber.control_points_xyz[0], [1.0, 2.0, 3.0])
+
+
+def test_trace2cp_fiber_json_config_narrows_loader_to_explicit_fiber(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    (tmp_path / "test").mkdir()
+    requested_fiber = _write_fiber(tmp_path / "test" / "explicit_trace2cp_fiber.json")
+
+    narrowed = _config_for_trace2cp_fiber_json(load_config(config_path), requested_fiber)
+    loader = _make_loader(narrowed)
+
+    assert tuple(narrowed.datasets[0]["fiber_paths"]) == (str(requested_fiber.resolve()),)
+    assert "fiber_glob" not in narrowed.datasets[0]
+    assert loader.flat_sample_indices_for_fiber_json(requested_fiber) == (0, 1, 2)
+    assert Path(loader.records[0].fiber.path).resolve() == requested_fiber.resolve()
+
+
+def test_trace2cp_fiber_pair_cp_indices_respect_offsets() -> None:
+    assert _trace2cp_fiber_pair_cp_indices(4, 1) == ((0, 1), (1, 2), (2, 3))
+    assert _trace2cp_fiber_pair_cp_indices(4, 2) == ((0, 2), (1, 3))
+    assert _trace2cp_fiber_pair_cp_indices(4, -1) == ((1, 0), (2, 1), (3, 2))
+    assert _trace2cp_fiber_pair_cp_indices(2, 3) == ()
+    with pytest.raises(ValueError, match="non-zero"):
+        _trace2cp_fiber_pair_cp_indices(4, 0)
+
+
+def _fake_trace2cp_pair_evaluation(
+    start_cp: int,
+    target_cp: int,
+    *,
+    start_xy: np.ndarray | None = None,
+    target_xy: np.ndarray | None = None,
+    image: np.ndarray | None = None,
+) -> _Trace2CpPairEvaluation:
+    if image is None:
+        image = np.full((20, 16), 64.0, dtype=np.float32)
+    else:
+        image = np.asarray(image, dtype=np.float32)
+    valid = np.ones_like(image, dtype=bool)
+    direction = np.zeros((*image.shape, 2), dtype=np.float32)
+    direction[..., 0] = 1.0
+    start_xy = np.asarray([2.0, 10.0], dtype=np.float32) if start_xy is None else np.asarray(start_xy, dtype=np.float32)
+    target_xy = np.asarray([12.0, 10.0], dtype=np.float32) if target_xy is None else np.asarray(target_xy, dtype=np.float32)
+    result = _trace_score_trace2cp_bidirectional(
+        direction,
+        start_xy,
+        target_xy,
+        valid_mask=valid,
+        step_px=1.0,
+        rf_margin_px=1.0,
+    )
+    sample = FiberStripSegmentSample(
+        record_index=0,
+        fiber_path="fiber.json",
+        start_control_point_index=start_cp,
+        target_control_point_index=target_cp,
+        start_control_point_xyz=np.zeros(3, dtype=np.float32),
+        target_control_point_xyz=np.ones(3, dtype=np.float32),
+        strip_z_offset=0.0,
+        coords_zyx=np.zeros((*image.shape, 3), dtype=np.float32),
+        valid_mask=valid,
+        frame=None,
+        line_xy=np.stack([start_xy, target_xy]).astype(np.float32, copy=False),
+        start_control_point_xy=start_xy,
+        target_control_point_xy=target_xy,
+        line_point_indices=np.asarray([start_cp, target_cp], dtype=np.int64),
+        line_normals_xyz=np.tile(np.asarray([[0.0, 0.0, 1.0]], dtype=np.float32), (2, 1)),
+        start_row_axis_xyz=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+        target_row_axis_xyz=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+    )
+    return _Trace2CpPairEvaluation(
+        sample_index=start_cp,
+        sample=sample,
+        image=image,
+        valid_mask=valid,
+        base_result=result,
+        selected_result=result,
+        selected_mode="base",
+        combined_summary=None,
+        tta_count=0,
+        med_fields_count=0,
+        tta_rows=(),
+        tta_debug_entries=(),
+    )
+
+
+def test_trace2cp_max_steps_is_loud_error() -> None:
+    evaluation = _fake_trace2cp_pair_evaluation(0, 1)
+    bad_forward = _Trace2CpDirectionResult(
+        trace_xy=evaluation.selected_result.forward.trace_xy,
+        result=_Trace2CpResult(
+            score=1.0,
+            raw_y_error_px=9.0,
+            trace_y_at_target_x=float("nan"),
+            target_x=float(evaluation.sample.target_control_point_xy[0]),
+            reached_target_column=False,
+            reason="max_steps",
+        ),
+    )
+    bad_result = runner_module._Trace2CpBidirectionalResult(
+        forward=bad_forward,
+        reverse=evaluation.selected_result.reverse,
+        refinement=evaluation.selected_result.refinement,
+        metric=evaluation.selected_result.metric,
+    )
+
+    with pytest.raises(ValueError, match="exhausted max_steps"):
+        _raise_trace2cp_max_steps(
+            bad_result,
+            mode="combined_image",
+            sample=evaluation.sample,
+            image_shape_hw=evaluation.image.shape,
+            step_px=4.0,
+            rf_margin_px=8.0,
+        )
+
+
+def test_trace2cp_fiber_overlay_composes_pair_results_into_long_strip() -> None:
+    first = _fake_trace2cp_pair_evaluation(0, 1)
+    second = _fake_trace2cp_pair_evaluation(1, 2)
+
+    drawn = _draw_trace2cp_fiber_overlay(
+        [first, second],
+        control_point_x=np.asarray([0.0, 10.0, 20.0], dtype=np.float32),
+        label="fiber",
+    )
+
+    assert drawn.ndim == 3
+    assert drawn.shape[2] == 3
+    assert drawn.shape[0] > first.image.shape[0]
+    assert drawn.shape[1] > first.image.shape[1]
+    assert bool(np.any(drawn[..., 1] != drawn[..., 0]))
+
+
+def test_trace2cp_fiber_overlay_can_add_presence_row() -> None:
+    first = _fake_trace2cp_pair_evaluation(0, 1)
+    presence = np.linspace(0.0, 1.0, first.image.size, dtype=np.float32).reshape(first.image.shape)
+    first_with_presence = replace(first, presence_debug=presence)
+
+    base = _draw_trace2cp_fiber_overlay(
+        [first],
+        control_point_x=np.asarray([0.0, 10.0], dtype=np.float32),
+        label="fiber",
+    )
+    drawn = _draw_trace2cp_fiber_overlay(
+        [first_with_presence],
+        control_point_x=np.asarray([0.0, 10.0], dtype=np.float32),
+        label="fiber",
+    )
+
+    assert drawn.shape[0] > base.shape[0]
+    assert drawn.shape[1] == base.shape[1]
+    assert bool(np.any(drawn[-first.image.shape[0] :, :, :] != 0))
+
+
+def test_trace2cp_fiber_overlay_adds_top_strip_rows() -> None:
+    first = _fake_trace2cp_pair_evaluation(0, 1)
+    top_image = np.full_like(first.image, 96.0, dtype=np.float32)
+    traced_top_image = np.full_like(first.image, 144.0, dtype=np.float32)
+    z_top_image = np.full_like(first.image, 192.0, dtype=np.float32)
+    top_presence = np.full_like(first.image, 220, dtype=np.uint8)
+    top_valid = np.ones_like(first.image, dtype=bool)
+    with_top = replace(
+        first,
+        top_strip_image=top_image,
+        top_strip_valid_mask=top_valid,
+    )
+    with_traced_top = replace(
+        with_top,
+        traced_top_strip_image=traced_top_image,
+        traced_top_strip_valid_mask=top_valid,
+    )
+    with_z_top = replace(
+        with_traced_top,
+        z_top_strip_image=z_top_image,
+        z_top_strip_valid_mask=top_valid,
+    )
+    with_top_presence = replace(
+        with_z_top,
+        top_strip_presence_image=top_presence,
+        top_strip_presence_valid_mask=top_valid,
+        traced_top_strip_presence_image=top_presence,
+        traced_top_strip_presence_valid_mask=top_valid,
+        z_top_strip_presence_image=top_presence,
+        z_top_strip_presence_valid_mask=top_valid,
+    )
+
+    base = _draw_trace2cp_fiber_overlay(
+        [first],
+        control_point_x=np.asarray([0.0, 10.0], dtype=np.float32),
+        label="fiber",
+    )
+    drawn_top = _draw_trace2cp_fiber_overlay(
+        [with_top],
+        control_point_x=np.asarray([0.0, 10.0], dtype=np.float32),
+        label="fiber",
+    )
+    drawn_traced_top = _draw_trace2cp_fiber_overlay(
+        [with_traced_top],
+        control_point_x=np.asarray([0.0, 10.0], dtype=np.float32),
+        label="fiber",
+    )
+    drawn_z_top = _draw_trace2cp_fiber_overlay(
+        [with_z_top],
+        control_point_x=np.asarray([0.0, 10.0], dtype=np.float32),
+        label="fiber",
+    )
+    drawn_top_presence = _draw_trace2cp_fiber_overlay(
+        [with_top_presence],
+        control_point_x=np.asarray([0.0, 10.0], dtype=np.float32),
+        label="fiber",
+    )
+
+    assert drawn_top.shape[0] > base.shape[0]
+    assert drawn_top.shape[1] == base.shape[1]
+    assert drawn_traced_top.shape[0] > drawn_top.shape[0]
+    assert drawn_traced_top.shape[1] == base.shape[1]
+    assert drawn_z_top.shape[0] > drawn_traced_top.shape[0]
+    assert drawn_z_top.shape[1] == base.shape[1]
+    assert drawn_top_presence.shape[0] > drawn_z_top.shape[0]
+    assert drawn_top_presence.shape[1] == base.shape[1]
+    assert bool(np.any(drawn_z_top[-first.image.shape[0] :, :, :] != 0))
+    assert bool(np.any(drawn_top_presence[-first.image.shape[0] :, :, :] != 0))
+
+
+def test_trace2cp_fiber_overlay_flips_reversed_pair_image_data() -> None:
+    image = np.zeros((20, 16), dtype=np.float32)
+    image[:, 12] = 240.0
+    image[:, 2] = 40.0
+    reversed_pair = _fake_trace2cp_pair_evaluation(
+        0,
+        1,
+        start_xy=np.asarray([12.0, 10.0], dtype=np.float32),
+        target_xy=np.asarray([2.0, 10.0], dtype=np.float32),
+        image=image,
+    )
+
+    drawn = _draw_trace2cp_fiber_overlay(
+        [reversed_pair],
+        control_point_x=np.asarray([0.0, 10.0], dtype=np.float32),
+        label="fiber",
+    )
+
+    column_mean = drawn.mean(axis=(0, 2))
+    bright_column = int(np.argmax(column_mean))
+    # Local x=12 is the pair start and should land left of local x=2, the target.
+    assert bright_column < drawn.shape[1] // 2
+    assert drawn.shape[0] >= image.shape[0] * 4
+
+
+def test_trace2cp_fiber_export_skips_invalid_pair_and_keeps_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class _FakeLoader:
+        config = SimpleNamespace(augment=SimpleNamespace(device="cpu"))
+
+        def flat_sample_indices_for_fiber_json(self, fiber_json):
+            return (10, 11, 12)
+
+    def fake_evaluate(*args, **kwargs):
+        target = int(kwargs["target_cp_index"])
+        if target == 1:
+            raise ValueError("Lasagna grad_mag sample is zero\nat fiber line point")
+        return _fake_trace2cp_pair_evaluation(1, 2)
+
+    written: list[Path] = []
+
+    monkeypatch.setattr(runner_module, "_load_direction_model", lambda *args, **kwargs: (object(), {"step": 7}))
+    monkeypatch.setattr(
+        runner_module,
+        "_model_config_from_checkpoint",
+        lambda *args, **kwargs: SimpleNamespace(depth=1),
+    )
+    monkeypatch.setattr(runner_module, "_evaluate_trace2cp_pair", fake_evaluate)
+    monkeypatch.setattr(
+        runner_module,
+        "_trace2cp_control_point_x_positions",
+        lambda *args, **kwargs: np.asarray([0.0, 10.0, 20.0], dtype=np.float32),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_trace2cp_control_point_line_indices",
+        lambda *args, **kwargs: np.asarray([0, 1, 2], dtype=np.int64),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_draw_trace2cp_fiber_overlay",
+        lambda *args, **kwargs: np.zeros((8, 12, 3), dtype=np.uint8),
+    )
+    monkeypatch.setattr(runner_module, "_write_jpg", lambda path, image: written.append(Path(path)))
+
+    _export_trace2cp_fiber_vis(
+        _FakeLoader(),
+        "fiber.json",
+        tmp_path,
+        checkpoint_path=tmp_path / "checkpoint.pt",
+        step_px=1.0,
+        rf_margin_px=None,
+        target_offset=1,
+    )
+
+    summary = (tmp_path / "trace2cp_fiber_summary.txt").read_text(encoding="utf-8")
+    output = capsys.readouterr().out
+    assert written == [tmp_path / "trace2cp_fiber_vis.jpg"]
+    assert "valid_pair_count=1" in summary
+    assert "skipped_pair_count=1" in summary
+    assert "0 1 Lasagna grad_mag sample is zero at fiber line point" in summary
+    assert "trace2cp fiber_pair_skip" in output
+
+
+def test_trace2cp_tta_patch_samples_volume_from_augmented_coords(tmp_path: Path) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    sample, _, _ = loader.build_trace2cp_segment_patch(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+        device=torch.device("cpu"),
+    )
+
+    patch = loader.build_trace2cp_tta_patch_from_sample(
+        sample,
+        FiberStripAugmentParams(rotation_degrees=35.0),
+        rf_margin_px=0.0,
+        device=torch.device("cpu"),
+    )
+
+    coords = np.asarray(patch.sample.coords_zyx, dtype=np.float32)
+    valid = np.asarray(patch.valid_mask, dtype=bool)
+    expected = coords[..., 0] * 10000.0 + coords[..., 1] * 100.0 + coords[..., 2]
+    assert patch.image.shape == patch.valid_mask.shape
+    assert patch.source_xy_grid.shape[:2] == patch.image.shape
+    assert patch.reference_to_tta_xy_grid.shape[:2] == sample.coords_zyx.shape[:2]
+    assert bool(valid.any())
+    assert np.allclose(patch.image[valid], expected[valid], atol=1.0e-2)
+
+
+def test_trace2cp_tta_rotation_expands_canvas_and_contains_base_corners(tmp_path: Path) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+    sample, _, _ = loader.build_trace2cp_segment_patch(
+        0,
+        target_control_point_index=1,
+        rf_margin_px=0.0,
+        sample_mode="flat",
+        device=torch.device("cpu"),
+    )
+
+    patch = loader.build_trace2cp_tta_patch_from_sample(
+        sample,
+        FiberStripAugmentParams(rotation_degrees=45.0),
+        rf_margin_px=0.0,
+        device=torch.device("cpu"),
+    )
+
+    base_h, base_w = sample.coords_zyx.shape[:2]
+    out_h, out_w = patch.image.shape
+    corners = np.asarray(patch.base_corners_xy, dtype=np.float32)
+    assert out_h > base_h or out_w > base_w
+    assert corners.shape == (4, 2)
+    assert bool(np.isfinite(corners).all())
+    assert float(corners[:, 0].min()) >= 0.0
+    assert float(corners[:, 1].min()) >= 0.0
+    assert float(corners[:, 0].max()) <= float(out_w - 1)
+    assert float(corners[:, 1].max()) <= float(out_h - 1)
+
+
+def test_trace2cp_tta_debug_slice_draws_transformed_corner_outline() -> None:
+    image = np.zeros((9, 11), dtype=np.float32)
+    valid = np.ones_like(image, dtype=bool)
+    corners = np.asarray([[1.0, 1.0], [9.0, 1.0], [9.0, 7.0], [1.0, 7.0]], dtype=np.float32)
+
+    drawn = _draw_trace2cp_tta_slice(
+        image,
+        valid,
+        base_corners_xy=corners,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 4.0], dtype=np.float32),
+        label="debug",
+    )
+
+    body = drawn[-image.shape[0] :, :, :]
+    assert drawn.shape[0] > image.shape[0]
+    assert body.shape[:2] == image.shape
+    assert bool(np.any(body[..., 0] != body[..., 1]))
+
+
+def test_no_training_or_tta_image_space_geometric_augmentation_helpers_exist() -> None:
+    root = Path(runner_module.__file__).resolve().parent
+    forbidden_tokens = (
+        "_warp_patch_by",
+        "_line_trace_tta_entries",
+        "_trace_tta_matrix",
+        "_transform_points_xy",
+        "_transform_direction_xy",
+        "affine_grid",
+        "rot90",
+        "cv2.warp",
+        ".rotate(",
+        ".resize(",
+    )
+    grid_sample_allowed = {"augmentation.py", "loader.py"}
+    offenders: list[str] = []
+    for path in sorted(root.rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        if path.name == "runner.py":
+            for allowed_name, end_marker in (
+                ("_trace2cp_directional_blur_xy_lhw", "\ndef _trace2cp_blur_presence_stack_directional"),
+                ("_direction_field_overlay_rgb", "\n@dataclass"),
+                ("_dir_vis_image_space_augmentations", "\ndef _render_dir_vis_panel"),
+            ):
+                start = text.find(f"def {allowed_name}")
+                end = text.find(end_marker, start)
+                if start >= 0 and end > start:
+                    text = text[:start] + text[end:]
+        for token in forbidden_tokens:
+            if token in text:
+                offenders.append(f"{path.name}:{token}")
+        if "grid_sample" in text and path.name not in grid_sample_allowed:
+            offenders.append(f"{path.name}:grid_sample")
+    assert offenders == []
+
+
+def test_identity_tta_source_grid_maps_points_and_directions() -> None:
+    source_xy = _identity_source_xy_grid((11, 13))
+    point = np.asarray([4.0, 6.0], dtype=np.float32)
+
+    tta_point = _reference_point_to_tta(source_xy, point)
+    assert tta_point is not None
+    assert np.allclose(tta_point, point)
+
+    reference_direction = _source_grid_direction_to_reference(
+        source_xy,
+        tta_point,
+        np.asarray([1.0, 0.0], dtype=np.float32),
+    )
+    assert reference_direction is not None
+    assert np.allclose(reference_direction, [1.0, 0.0])
+
+
+def test_line_trace_random_tta_source_grid_maps_points_and_directions() -> None:
+    source_xy = np.zeros((9, 9, 2), dtype=np.float32)
+    yy, xx = np.indices((9, 9), dtype=np.float32)
+    source_xy[..., 0] = xx - 1.0
+    source_xy[..., 1] = yy
+    reference_to_tta_xy = np.zeros((9, 9, 2), dtype=np.float32)
+    reference_to_tta_xy[..., 0] = xx + 1.0
+    reference_to_tta_xy[..., 1] = yy
+
+    tta_point = _reference_point_to_tta(reference_to_tta_xy, np.asarray([4.0, 4.0], dtype=np.float32))
+    assert tta_point is not None
+    assert np.allclose(tta_point, [5.0, 4.0])
+
+    reference_direction = _source_grid_direction_to_reference(
+        source_xy,
+        tta_point,
+        np.asarray([1.0, 0.0], dtype=np.float32),
+    )
+    assert reference_direction is not None
+    assert np.allclose(reference_direction, [1.0, 0.0])
+
+
+def test_median_tta_trace_uses_reference_space_directions() -> None:
+    ref = np.zeros((9, 9, 2), dtype=np.float32)
+    ref[:, :, 0] = 1.0
+    up = np.zeros_like(ref)
+    up[:, :, 1] = 1.0
+    shifted_opposite = np.zeros_like(ref)
+    shifted_opposite[:, :, 0] = -1.0
+    valid = np.ones((9, 9), dtype=bool)
+    identity_grid = _identity_source_xy_grid((9, 9))
+    shifted_grid = _identity_source_xy_grid((9, 9))
+    shifted_grid[..., 0] -= 1.0
+    shifted_reference_to_tta = _identity_source_xy_grid((9, 9))
+    shifted_reference_to_tta[..., 0] += 1.0
+    fields = [
+        _TtaDirectionField("ref", ref, valid, identity_grid, identity_grid),
+        _TtaDirectionField("up", up, valid, identity_grid, identity_grid),
+        _TtaDirectionField("shifted_opposite", shifted_opposite, valid, shifted_grid, shifted_reference_to_tta),
+    ]
+
+    line = _trace_median_tta_direction_line(
+        fields,
+        np.asarray([4.0, 4.0], dtype=np.float32),
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        shape_hw=(9, 9),
+        step_px=1.0,
+        rf_margin_px=2.0,
+    )
+
+    assert np.allclose(line[:, 1], 4.0)
+    assert np.isclose(line[0, 0], 2.0)
+    assert np.isclose(line[-1, 0], 6.0)
+
+
+def test_tta_reference_mapping_does_not_use_dense_nearest_scan() -> None:
+    source = Path(runner_module.__file__).read_text(encoding="utf-8")
+
+    assert "_nearest_tta_point_for_reference" not in source
+    helper = source.split("def _reference_point_to_tta", 1)[1].split(
+        "\ndef _source_grid_direction_to_reference",
+        1,
+    )[0]
+    assert "argmin" not in helper
+    assert "delta * delta" not in helper
+
+
+def test_dir_vis_overlay_scales_and_strides() -> None:
+    image = np.full((5, 7), 64, dtype=np.uint8)
+    valid = np.zeros((5, 7), dtype=bool)
+    valid[0::2, 0::2] = True
+    valid[2, 2] = False
+    direction = np.zeros((5, 7, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+
+    overlay, drawn = _direction_field_overlay_rgb(image, valid, direction, scale=4, stride=2)
+
+    assert overlay.shape == (20, 28, 3)
+    assert drawn == 11
+    scaled = np.repeat(np.repeat(np.repeat(image[..., None], 3, axis=2), 4, axis=0), 4, axis=1)
+    assert not np.array_equal(overlay, scaled)
+
+
+def test_trace2cp_top_strip_panel_accepts_rgb_direction_overlay() -> None:
+    image = np.zeros((5, 9, 3), dtype=np.uint8)
+    image[:, :, 1] = 64
+    valid = np.ones((5, 9), dtype=bool)
+    line_xy = np.asarray([[0.0, 1.0], [4.0, 2.0], [8.0, 3.0]], dtype=np.float32)
+
+    panel = _draw_trace2cp_top_strip_panel(
+        image,
+        valid,
+        line_xy=line_xy,
+        start_xy=np.asarray([1.0, 2.0], dtype=np.float32),
+        target_xy=np.asarray([7.0, 2.0], dtype=np.float32),
+        label="rgb top",
+    )
+
+    assert panel.ndim == 3
+    assert panel.shape[1] == 9
+    assert panel.shape[2] == 3
+    assert panel.shape[0] > image.shape[0]
+
+
+def test_trace2cp_top_model_direction_selection_medians_horizontal_candidates() -> None:
+    angle30 = np.deg2rad(30.0)
+    angle60 = np.deg2rad(60.0)
+    positive30 = np.zeros((2, 3, 2), dtype=np.float32)
+    positive30[:, :, 0] = np.cos(angle30)
+    positive30[:, :, 1] = np.sin(angle30)
+    negative30 = -positive30
+    horizontal = np.zeros((2, 3, 2), dtype=np.float32)
+    horizontal[:, :, 0] = 1.0
+    too_steep = np.zeros((2, 3, 2), dtype=np.float32)
+    too_steep[:, :, 0] = np.cos(angle60)
+    too_steep[:, :, 1] = np.sin(angle60)
+    valid = np.ones((2, 3), dtype=bool)
+    valid_positive = valid.copy()
+    valid_positive[0, 0] = False
+    valid_negative = valid.copy()
+    valid_negative[0, 0] = False
+    expected = np.asarray([np.cos(angle30), np.sin(angle30)], dtype=np.float32)
+
+    selected, selected_valid, layer = _trace2cp_select_horizontal_median_direction(
+        [too_steep, horizontal, negative30, positive30],
+        [valid, valid, valid_negative, valid_positive],
+    )
+
+    assert bool(selected_valid.all())
+    np.testing.assert_allclose(selected[1, 1], expected, atol=1.0e-6)
+    assert int(layer[1, 1]) in (2, 3)
+    np.testing.assert_allclose(selected[0, 0], horizontal[0, 0], atol=1.0e-6)
+    assert int(layer[0, 0]) == 1
+
+
+def test_trace2cp_top_model_direction_overlay_returns_dp_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_predict(_model, image, valid_mask, *, device):
+        _ = device
+        shape = tuple(int(v) for v in np.asarray(image).shape)
+        direction = np.zeros((*shape, 2), dtype=np.float32)
+        direction[..., 0] = 1.0
+        return _Trace2CpPredictedFields(
+            direction_xy=direction,
+            embedding_chw=None,
+            presence_hw=np.ones(shape, dtype=np.float32),
+        )
+
+    monkeypatch.setattr(runner_module, "_predict_trace2cp_fields", fake_predict)
+    images = [np.full((9, 13), float(index), dtype=np.float32) for index in range(3)]
+    valids = [np.ones((9, 13), dtype=bool) for _ in images]
+
+    overlay, drawn, best_layer, debug, path_debug = runner_module._trace2cp_top_model_direction_overlay(
+        object(),
+        images[1],
+        valids[1],
+        images,
+        valids,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([10.0, 4.0], dtype=np.float32),
+        step_px=1.0,
+        device=torch.device("cpu"),
+    )
+
+    assert overlay.shape == (9, 13, 3)
+    assert drawn > 0
+    assert best_layer.shape == (9, 13)
+    assert "dp_points=" in debug
+    assert path_debug is not None
+    assert path_debug.path_xy.ndim == 2
+    assert path_debug.path_xy.shape[1] == 2
+    assert path_debug.layer_offsets.shape[0] == path_debug.path_xy.shape[0]
+    assert bool(np.isfinite(path_debug.path_xy).all())
+    assert bool(np.isfinite(path_debug.layer_offsets).all())
+
+
+def test_trace2cp_top_model_optimized_trace_uses_row_and_layer_offsets() -> None:
+    reference = np.asarray(
+        [
+            [0.0, 5.0, 1.0],
+            [10.0, 5.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    path = np.asarray(
+        [
+            [0.0, 4.0],
+            [10.0, 7.0],
+        ],
+        dtype=np.float32,
+    )
+    layers = np.asarray([2.0, -1.0], dtype=np.float32)
+
+    optimized = runner_module._trace2cp_top_model_optimized_trace_xyz(
+        reference,
+        path,
+        layers,
+        center_y=4.0,
+    )
+
+    np.testing.assert_allclose(optimized[:, 0], path[:, 0])
+    np.testing.assert_allclose(optimized[:, 1], reference[:, 1])
+    np.testing.assert_allclose(optimized[:, 2], [3.0, 3.0])
+
+
+def test_trace2cp_weighted_median_top_direction_aligns_ambiguous_signs() -> None:
+    angle = np.deg2rad(20.0)
+    expected = np.asarray([np.cos(angle), np.sin(angle)], dtype=np.float32)
+    direction = np.zeros((9, 9, 2), dtype=np.float32)
+    direction[:, :, :] = expected
+    direction[::2, :, :] *= -1.0
+    valid = np.ones((9, 9), dtype=bool)
+
+    selected = _trace2cp_weighted_median_top_direction(
+        direction,
+        valid,
+        center_xy=np.asarray([4.0, 4.0], dtype=np.float32),
+        reference_xy=np.asarray([1.0, 0.0], dtype=np.float32),
+        radius_px=4.0,
+    )
+
+    assert selected is not None
+    np.testing.assert_allclose(selected, expected, atol=1.0e-6)
+
+
+def test_trace2cp_side_top_z_axes_offset_along_side_z_not_row_axis() -> None:
+    height, width = 5, 5
+    yy, xx = np.meshgrid(
+        np.arange(height, dtype=np.float32),
+        np.arange(width, dtype=np.float32),
+        indexing="ij",
+    )
+    coords = np.stack([xx, yy, np.zeros_like(xx)], axis=2).astype(np.float32)
+    arrays = _Trace2CpSideTopZSourceArrays(
+        coords_xyz=coords,
+        valid_mask=np.ones((height, width), dtype=bool),
+        row_axis_xyz=np.broadcast_to(
+            np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+            (height, width, 3),
+        ).copy(),
+        side_z_axis_xyz=np.broadcast_to(
+            np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+            (height, width, 3),
+        ).copy(),
+        volume_spacing_base=2.0,
+    )
+
+    axes = _trace2cp_side_top_z_axes_at_point(
+        arrays,
+        np.asarray([2.0, 2.0], dtype=np.float32),
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        z_offset_voxels=3.0,
+    )
+
+    assert axes is not None
+    center_xyz, tangent_xyz, side_z_axis_xyz, row_axis_xyz = axes
+    np.testing.assert_allclose(center_xyz, [2.0, 2.0, -6.0], atol=1.0e-6)
+    np.testing.assert_allclose(tangent_xyz, [1.0, 0.0, 0.0], atol=1.0e-6)
+    np.testing.assert_allclose(side_z_axis_xyz, [0.0, 0.0, -1.0], atol=1.0e-6)
+    np.testing.assert_allclose(row_axis_xyz, [0.0, 1.0, 0.0], atol=1.0e-6)
+
+
+def test_trace2cp_side_top_z_experiment_scores_candidate_side_direction(monkeypatch: pytest.MonkeyPatch) -> None:
+    direction = np.zeros((16, 16, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    direction[4:7, 8:11] = np.asarray([0.0, 1.0], dtype=np.float32)
+    diagonal = np.asarray([math.sqrt(0.5), math.sqrt(0.5)], dtype=np.float32)
+    direction[7:10, 7:10] = diagonal
+    valid = np.ones((16, 16), dtype=bool)
+
+    class FakePlaneCache:
+        z_step_voxels = 1.0
+        max_layer = 32
+
+        def __init__(self) -> None:
+            self.layers: list[int] = []
+
+        def get(self, layer: int):
+            self.layers.append(int(layer))
+            return SimpleNamespace(
+                valid_mask=valid,
+                fields=SimpleNamespace(direction_xy=direction, presence_hw=None),
+            )
+
+    top_patch_points: list[np.ndarray] = []
+
+    def fake_sample_top_patch(*args, **_kwargs):
+        top_patch_points.append(np.asarray(args[2], dtype=np.float32))
+        return np.zeros((9, 9), dtype=np.float32), np.ones((9, 9), dtype=bool)
+
+    def fake_predict_top_fields(*_args, **_kwargs):
+        top_direction = np.zeros((9, 9, 2), dtype=np.float32)
+        top_direction[:, :, 0] = 1.0
+        return _Trace2CpPredictedFields(
+            direction_xy=top_direction,
+            embedding_chw=None,
+            presence_hw=None,
+        )
+
+    monkeypatch.setattr(runner_module, "_sample_trace2cp_local_top_patch", fake_sample_top_patch)
+    monkeypatch.setattr(runner_module, "_predict_trace2cp_fields", fake_predict_top_fields)
+
+    traced = _trace_side_top_z_line_to_target(
+        plane_cache=FakePlaneCache(),
+        segment_source=object(),
+        source_arrays=SimpleNamespace(),
+        top_model=object(),
+        start_xy=np.asarray([5.0, 5.0], dtype=np.float32),
+        target_xy=np.asarray([14.0, 5.0], dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=1.0, presence=0.0),
+        candidate_max_degrees=45.0,
+        candidate_step_degrees=45.0,
+        device=torch.device("cpu"),
+        step_px=4.0,
+        rf_margin_px=0.0,
+        top_radius_px=4.0,
+        top_patch_shape_hw=(9, 9),
+        max_steps=1,
+    )
+
+    assert traced.reason == "max_steps"
+    assert traced.trace_xyz.shape[0] == 2
+    assert traced.trace_xyz[1, 1] > 7.0
+    np.testing.assert_allclose(top_patch_points[0], traced.trace_xyz[1, :2], atol=1.0e-6)
+
+
+def test_trace2cp_side_top_z_experiment_progress_prints_bar(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    direction = np.zeros((8, 8, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    valid = np.ones((8, 8), dtype=bool)
+
+    class FakePlaneCache:
+        z_step_voxels = 1.0
+        max_layer = 2
+
+        def get(self, _layer: int):
+            return SimpleNamespace(
+                valid_mask=valid,
+                fields=SimpleNamespace(direction_xy=direction, presence_hw=None),
+            )
+
+    def fake_sample_top_patch(*_args, **_kwargs):
+        return np.zeros((5, 5), dtype=np.float32), np.ones((5, 5), dtype=bool)
+
+    def fake_predict_top_fields(*_args, **_kwargs):
+        top_direction = np.zeros((5, 5, 2), dtype=np.float32)
+        top_direction[:, :, 0] = 1.0
+        return _Trace2CpPredictedFields(
+            direction_xy=top_direction,
+            embedding_chw=None,
+            presence_hw=None,
+        )
+
+    monkeypatch.setattr(runner_module, "_sample_trace2cp_local_top_patch", fake_sample_top_patch)
+    monkeypatch.setattr(runner_module, "_predict_trace2cp_fields", fake_predict_top_fields)
+
+    traced = _trace_side_top_z_line_to_target(
+        plane_cache=FakePlaneCache(),
+        segment_source=object(),
+        source_arrays=SimpleNamespace(),
+        top_model=object(),
+        start_xy=np.asarray([1.0, 3.0], dtype=np.float32),
+        target_xy=np.asarray([6.0, 3.0], dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=1.0, presence=0.0),
+        candidate_max_degrees=0.0,
+        candidate_step_degrees=1.0,
+        device=torch.device("cpu"),
+        step_px=1.0,
+        rf_margin_px=0.0,
+        top_radius_px=2.0,
+        top_patch_shape_hw=(5, 5),
+        max_steps=2,
+        progress_label="unit",
+        progress_interval_s=0.0,
+    )
+
+    output = capsys.readouterr().out
+    assert traced.reason == "max_steps"
+    assert "trace2cp side_top_z progress" in output
+    assert "label='unit'" in output
+    assert "[" in output and "]" in output
+    assert "steps=2/5" in output
+    assert "eta=" in output
+    assert "reason=max_steps" in output
+
+
+def test_trace2cp_side_top_z_experiment_aligns_ambiguous_side_samples(monkeypatch: pytest.MonkeyPatch) -> None:
+    direction = np.zeros((7, 8, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    direction[:, 1::2, :] *= -1.0
+    valid = np.ones((7, 8), dtype=bool)
+
+    class FakePlaneCache:
+        z_step_voxels = 1.0
+        max_layer = 32
+
+        def get(self, _layer: int):
+            return SimpleNamespace(
+                valid_mask=valid,
+                fields=SimpleNamespace(direction_xy=direction, presence_hw=None),
+            )
+
+    def fake_sample_top_patch(*_args, **_kwargs):
+        return np.zeros((9, 9), dtype=np.float32), np.ones((9, 9), dtype=bool)
+
+    def fake_predict_top_fields(*_args, **_kwargs):
+        top_direction = np.zeros((9, 9, 2), dtype=np.float32)
+        top_direction[:, :, 0] = 1.0
+        return _Trace2CpPredictedFields(
+            direction_xy=top_direction,
+            embedding_chw=None,
+            presence_hw=None,
+        )
+
+    monkeypatch.setattr(runner_module, "_sample_trace2cp_local_top_patch", fake_sample_top_patch)
+    monkeypatch.setattr(runner_module, "_predict_trace2cp_fields", fake_predict_top_fields)
+
+    traced = _trace_side_top_z_line_to_target(
+        plane_cache=FakePlaneCache(),
+        segment_source=object(),
+        source_arrays=SimpleNamespace(),
+        top_model=object(),
+        start_xy=np.asarray([1.5, 3.0], dtype=np.float32),
+        target_xy=np.asarray([6.5, 3.0], dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=1.0, presence=0.0),
+        candidate_max_degrees=0.0,
+        candidate_step_degrees=1.0,
+        device=torch.device("cpu"),
+        step_px=1.0,
+        rf_margin_px=0.0,
+        top_radius_px=4.0,
+        top_patch_shape_hw=(9, 9),
+        max_steps=1,
+    )
+
+    assert traced.reason == "max_steps"
+    np.testing.assert_allclose(traced.trace_xyz[1, :2], np.asarray([2.5, 3.0], dtype=np.float32), atol=1.0e-6)
+
+
+def test_trace2cp_side_top_z_experiment_scores_candidate_presence(monkeypatch: pytest.MonkeyPatch) -> None:
+    direction = np.zeros((16, 16, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    presence = np.zeros((16, 16), dtype=np.float32)
+    presence[4:7, 4:7] = 1.0
+    presence[7:10, 7:10] = 1.0
+    valid = np.ones((16, 16), dtype=bool)
+
+    class FakePlaneCache:
+        z_step_voxels = 1.0
+        max_layer = 32
+
+        def get(self, _layer: int):
+            return SimpleNamespace(
+                valid_mask=valid,
+                fields=SimpleNamespace(direction_xy=direction, presence_hw=presence),
+            )
+
+    def fake_sample_top_patch(*_args, **_kwargs):
+        return np.zeros((9, 9), dtype=np.float32), np.ones((9, 9), dtype=bool)
+
+    def fake_predict_top_fields(*_args, **_kwargs):
+        top_direction = np.zeros((9, 9, 2), dtype=np.float32)
+        top_direction[:, :, 0] = 1.0
+        return _Trace2CpPredictedFields(
+            direction_xy=top_direction,
+            embedding_chw=None,
+            presence_hw=None,
+        )
+
+    monkeypatch.setattr(runner_module, "_sample_trace2cp_local_top_patch", fake_sample_top_patch)
+    monkeypatch.setattr(runner_module, "_predict_trace2cp_fields", fake_predict_top_fields)
+
+    traced = _trace_side_top_z_line_to_target(
+        plane_cache=FakePlaneCache(),
+        segment_source=object(),
+        source_arrays=SimpleNamespace(),
+        top_model=object(),
+        start_xy=np.asarray([5.0, 5.0], dtype=np.float32),
+        target_xy=np.asarray([14.0, 5.0], dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=0.0, presence=1.0),
+        candidate_max_degrees=45.0,
+        candidate_step_degrees=45.0,
+        device=torch.device("cpu"),
+        step_px=4.0,
+        rf_margin_px=0.0,
+        top_radius_px=4.0,
+        top_patch_shape_hw=(9, 9),
+        max_steps=1,
+    )
+
+    assert traced.reason == "max_steps"
+    assert traced.trace_xyz.shape[0] == 2
+    assert traced.trace_xyz[1, 1] > 7.0
+
+
+def test_trace2cp_side_top_z_experiment_uses_current_z_side_layer(monkeypatch: pytest.MonkeyPatch) -> None:
+    layer0_direction = np.zeros((10, 10, 2), dtype=np.float32)
+    layer0_direction[:, :, 0] = 1.0
+    layer1_direction = np.zeros((10, 10, 2), dtype=np.float32)
+    layer1_direction[:, :, 1] = 1.0
+    valid = np.ones((10, 10), dtype=bool)
+
+    class FakePlaneCache:
+        z_step_voxels = 1.0
+        max_layer = 3
+
+        def __init__(self) -> None:
+            self.layers: list[int] = []
+
+        def get(self, layer: int):
+            self.layers.append(int(layer))
+            direction_field = layer1_direction if int(layer) == 1 else layer0_direction
+            return SimpleNamespace(
+                valid_mask=valid,
+                fields=SimpleNamespace(direction_xy=direction_field, presence_hw=None),
+            )
+
+    def fake_sample_top_patch(*_args, **_kwargs):
+        return np.zeros((9, 9), dtype=np.float32), np.ones((9, 9), dtype=bool)
+
+    def fake_predict_top_fields(*_args, **_kwargs):
+        top_direction = np.zeros((9, 9, 2), dtype=np.float32)
+        top_direction[:, :, :] = np.asarray([math.sqrt(0.5), math.sqrt(0.5)], dtype=np.float32)
+        return _Trace2CpPredictedFields(
+            direction_xy=top_direction,
+            embedding_chw=None,
+            presence_hw=None,
+        )
+
+    monkeypatch.setattr(runner_module, "_sample_trace2cp_local_top_patch", fake_sample_top_patch)
+    monkeypatch.setattr(runner_module, "_predict_trace2cp_fields", fake_predict_top_fields)
+    cache = FakePlaneCache()
+
+    traced = _trace_side_top_z_line_to_target(
+        plane_cache=cache,
+        segment_source=object(),
+        source_arrays=SimpleNamespace(),
+        top_model=object(),
+        start_xy=np.asarray([1.0, 1.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 1.0], dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=1.0, presence=0.0),
+        candidate_max_degrees=0.0,
+        candidate_step_degrees=1.0,
+        device=torch.device("cpu"),
+        step_px=1.0,
+        rf_margin_px=0.0,
+        top_radius_px=4.0,
+        top_patch_shape_hw=(9, 9),
+        max_steps=2,
+    )
+
+    assert traced.reason == "max_steps"
+    assert 1 in cache.layers
+    np.testing.assert_allclose(traced.trace_xyz[1], np.asarray([2.0, 1.0, 1.0], dtype=np.float32), atol=1.0e-6)
+    assert traced.trace_xyz[2, 1] > traced.trace_xyz[1, 1]
+
+
+def test_trace2cp_side_top_z_compact_overlay_has_only_relevant_panels(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(runner_module, "_draw_label_band", lambda image, _label: np.asarray(image, dtype=np.uint8))
+    height, width = 5, 7
+    forward = np.asarray([[1.0, 2.0, 0.0], [5.0, 2.0, 1.0]], dtype=np.float32)
+    reverse = np.asarray([[5.0, 3.0, 0.0], [1.0, 3.0, -1.0]], dtype=np.float32)
+    layer_columns = np.zeros((width,), dtype=np.int32)
+    z_debug = _Trace2CpZTraceDebug(
+        forward_trace_xyz=forward,
+        reverse_trace_xyz=reverse,
+        fused_trace_xyz=forward,
+        forward_z_image=np.full((height, width), 32, dtype=np.uint8),
+        reverse_z_image=np.full((height, width), 64, dtype=np.uint8),
+        fused_z_image=np.full((height, width), 96, dtype=np.uint8),
+        forward_missing_columns=0,
+        reverse_missing_columns=0,
+        fused_missing_columns=0,
+        forward_layer_columns=layer_columns,
+        reverse_layer_columns=layer_columns,
+        fused_layer_columns=layer_columns,
+        layers=(0,),
+        z_step_voxels=1.0,
+        max_layer=1,
+        forward_z_presence=np.full((height, width), 128, dtype=np.uint8),
+        reverse_z_presence=np.full((height, width), 160, dtype=np.uint8),
+    )
+    experiment = _Trace2CpSideTopZExperiment(
+        result=SimpleNamespace(),
+        z_debug=z_debug,
+        forward_line=_Trace2CpSideTopZLineResult(forward, "target_column", 1, 0),
+        reverse_line=_Trace2CpSideTopZLineResult(reverse, "target_column", 1, 0),
+        forward_top_strip_image=np.full((height, width), 80, dtype=np.float32),
+        forward_top_strip_valid_mask=np.ones((height, width), dtype=bool),
+        reverse_top_strip_image=np.full((height, width), 100, dtype=np.float32),
+        reverse_top_strip_valid_mask=np.ones((height, width), dtype=bool),
+        traced_top_strip_image=None,
+        traced_top_strip_valid_mask=None,
+        z_top_strip_image=None,
+        z_top_strip_valid_mask=None,
+        timing_rows=(),
+    )
+
+    overlay = _draw_trace2cp_side_top_z_compact_overlay(
+        line_xy=np.asarray([[0.0, 2.0], [6.0, 2.0]], dtype=np.float32),
+        start_xy=np.asarray([1.0, 2.0], dtype=np.float32),
+        target_xy=np.asarray([5.0, 2.0], dtype=np.float32),
+        experiment=experiment,
+        input_top_strip_image=np.full((height, width), 48, dtype=np.float32),
+        input_top_strip_valid_mask=np.ones((height, width), dtype=bool),
+        fallback_shape_hw=(height, width),
+    )
+
+    assert overlay.shape == (7 * height, width, 3)
+
+
+def test_trace2cp_side_top_z_experiment_export_is_exclusive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    image = np.zeros((9, 21), dtype=np.float32)
+    valid = np.ones_like(image, dtype=bool)
+    line_xy = np.asarray([[2.0, 4.0], [18.0, 4.0]], dtype=np.float32)
+    sample = FiberStripSegmentSample(
+        record_index=0,
+        fiber_path="fiber.json",
+        start_control_point_index=1,
+        target_control_point_index=2,
+        start_control_point_xyz=np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
+        target_control_point_xyz=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+        strip_z_offset=0.0,
+        coords_zyx=np.zeros((9, 21, 3), dtype=np.float32),
+        valid_mask=valid,
+        frame=None,
+        line_xy=line_xy,
+        start_control_point_xy=line_xy[0],
+        target_control_point_xy=line_xy[1],
+        line_point_indices=np.asarray([0, 1], dtype=np.int32),
+        line_normals_xyz=np.asarray([[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]], dtype=np.float32),
+        start_row_axis_xyz=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+        target_row_axis_xyz=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+    )
+
+    class FakeLoader:
+        config = SimpleNamespace(augment=SimpleNamespace(device="cpu"))
+
+        def build_trace2cp_segment_source(self, *args, **kwargs):
+            return SimpleNamespace(name="segment")
+
+        def sample_trace2cp_segment_source(self, _source):
+            return sample, image, valid
+
+        def sample_trace2cp_top_strip_source(self, _source):
+            return image, valid
+
+    def fake_fields(*_args, **_kwargs):
+        direction = np.zeros((9, 21, 2), dtype=np.float32)
+        direction[:, :, 0] = 1.0
+        return _Trace2CpPredictedFields(
+            direction_xy=direction,
+            embedding_chw=np.zeros((2, 9, 21), dtype=np.float32),
+            presence_hw=np.ones((9, 21), dtype=np.float32),
+        )
+
+    def forbidden_chain(*_args, **_kwargs):
+        raise AssertionError("exclusive side/top experiment must not run normal Trace2CP chain")
+
+    def fake_experiment(**_kwargs):
+        result = _trace2cp_test_bidirectional_result()
+        trace_xyz = np.asarray([[2.0, 4.0, 0.0], [18.0, 4.0, 0.0]], dtype=np.float32)
+        layer_columns = np.zeros(21, dtype=np.int32)
+        z_debug = _Trace2CpZTraceDebug(
+            forward_trace_xyz=trace_xyz,
+            reverse_trace_xyz=trace_xyz[::-1].copy(),
+            fused_trace_xyz=trace_xyz,
+            forward_z_image=np.zeros((9, 21), dtype=np.uint8),
+            reverse_z_image=np.zeros((9, 21), dtype=np.uint8),
+            fused_z_image=np.zeros((9, 21), dtype=np.uint8),
+            forward_missing_columns=0,
+            reverse_missing_columns=0,
+            fused_missing_columns=0,
+            forward_layer_columns=layer_columns,
+            reverse_layer_columns=layer_columns,
+            fused_layer_columns=layer_columns,
+            layers=(0,),
+            z_step_voxels=1.0,
+            max_layer=0,
+            forward_z_presence=np.zeros((9, 21), dtype=np.uint8),
+            reverse_z_presence=np.zeros((9, 21), dtype=np.uint8),
+            fused_z_presence=np.zeros((9, 21), dtype=np.uint8),
+        )
+        line_result = _Trace2CpSideTopZLineResult(
+            trace_xyz=trace_xyz,
+            reason="target_column",
+            top_patch_count=0,
+            top_invalid_count=0,
+        )
+        return _Trace2CpSideTopZExperiment(
+            result=result,
+            z_debug=z_debug,
+            forward_line=line_result,
+            reverse_line=line_result,
+            forward_top_strip_image=image,
+            forward_top_strip_valid_mask=valid,
+            reverse_top_strip_image=image,
+            reverse_top_strip_valid_mask=valid,
+            traced_top_strip_image=image,
+            traced_top_strip_valid_mask=valid,
+            z_top_strip_image=image,
+            z_top_strip_valid_mask=valid,
+            timing_rows=(),
+        )
+
+    written: list[Path] = []
+    monkeypatch.setattr(
+        runner_module,
+        "_load_direction_model",
+        lambda *args, **kwargs: (object(), {"step": 3, "config": {"training": {"model_depth": 2}}}),
+    )
+    monkeypatch.setattr(runner_module, "_load_top_direction_model_from_checkpoint", lambda *args, **kwargs: object())
+    monkeypatch.setattr(runner_module, "_predict_trace2cp_fields", fake_fields)
+    monkeypatch.setattr(runner_module, "_evaluate_trace2cp_refinement_chain", forbidden_chain)
+    monkeypatch.setattr(runner_module, "_trace_score_trace2cp_side_top_z_experiment_bidirectional", fake_experiment)
+    monkeypatch.setattr(
+        runner_module,
+        "_draw_trace2cp_side_top_z_compact_overlay",
+        lambda **_kwargs: np.zeros((9, 21, 3), dtype=np.uint8),
+    )
+    monkeypatch.setattr(runner_module, "_write_trace2cp_side_top_z_top_slice_debug", lambda *_args, **_kwargs: (0, 0))
+    monkeypatch.setattr(runner_module, "_write_jpg", lambda path, _image: written.append(Path(path)))
+
+    runner_module._export_trace2cp_vis(
+        FakeLoader(),
+        0,
+        tmp_path,
+        checkpoint_path=tmp_path / "checkpoint.pt",
+        step_px=4.0,
+        rf_margin_px=0.0,
+        target_offset=1,
+        target_cp_index=None,
+        combined=True,
+        combined_weights=_Trace2CpCombinedWeights(direction=1.0, presence=1.0),
+        combined_mode="direction",
+        z_search=runner_module._Trace2CpZSearchConfig(enabled=True, step_voxels=1.0, max_layer=4),
+        side_top_z_experiment=True,
+    )
+
+    assert [path.name for path in written] == ["trace2cp_side_top_z_experiment.jpg"]
+    assert (tmp_path / "trace2cp_side_top_z_summary.txt").exists()
+    assert not (tmp_path / "trace2cp_summary.txt").exists()
+
+
+def test_trace2cp_side_top_z_top_slice_debug_writes_raw_and_overlay_dirs(tmp_path: Path) -> None:
+    height, width = 5, 7
+    image = np.full((height, width), 42.0, dtype=np.float32)
+    valid = np.ones((height, width), dtype=bool)
+    forward_slice = _Trace2CpSideTopZTopSliceDebug(
+        image=image,
+        valid_mask=valid,
+        direction_xy=np.asarray([1.0, 0.0], dtype=np.float32),
+        point_xy=np.asarray([1.0, 2.0], dtype=np.float32),
+        z_offset_voxels=0.0,
+    )
+    reverse_slice = _Trace2CpSideTopZTopSliceDebug(
+        image=image + 1.0,
+        valid_mask=valid,
+        direction_xy=np.asarray([-1.0, 0.0], dtype=np.float32),
+        point_xy=np.asarray([5.0, 2.0], dtype=np.float32),
+        z_offset_voxels=1.0,
+    )
+    layer_columns = np.zeros((width,), dtype=np.int32)
+    z_debug = _Trace2CpZTraceDebug(
+        forward_trace_xyz=np.asarray([[1.0, 2.0, 0.0]], dtype=np.float32),
+        reverse_trace_xyz=np.asarray([[5.0, 2.0, 0.0]], dtype=np.float32),
+        fused_trace_xyz=np.asarray([[1.0, 2.0, 0.0]], dtype=np.float32),
+        forward_z_image=np.zeros((height, width), dtype=np.uint8),
+        reverse_z_image=np.zeros((height, width), dtype=np.uint8),
+        fused_z_image=np.zeros((height, width), dtype=np.uint8),
+        forward_missing_columns=0,
+        reverse_missing_columns=0,
+        fused_missing_columns=0,
+        forward_layer_columns=layer_columns,
+        reverse_layer_columns=layer_columns,
+        fused_layer_columns=layer_columns,
+        layers=(0,),
+        z_step_voxels=1.0,
+        max_layer=1,
+    )
+    experiment = _Trace2CpSideTopZExperiment(
+        result=SimpleNamespace(),
+        z_debug=z_debug,
+        forward_line=_Trace2CpSideTopZLineResult(
+            np.asarray([[1.0, 2.0, 0.0]], dtype=np.float32),
+            "target_column",
+            1,
+            0,
+            top_slices=(forward_slice,),
+        ),
+        reverse_line=_Trace2CpSideTopZLineResult(
+            np.asarray([[5.0, 2.0, 0.0]], dtype=np.float32),
+            "target_column",
+            1,
+            0,
+            top_slices=(reverse_slice,),
+        ),
+        forward_top_strip_image=None,
+        forward_top_strip_valid_mask=None,
+        reverse_top_strip_image=None,
+        reverse_top_strip_valid_mask=None,
+        traced_top_strip_image=None,
+        traced_top_strip_valid_mask=None,
+        z_top_strip_image=None,
+        z_top_strip_valid_mask=None,
+        timing_rows=(),
+    )
+    stale_dir = tmp_path / "trace2cp_side_top_z_top_slices"
+    stale_dir.mkdir()
+    (stale_dir / "stale.jpg").write_bytes(b"stale")
+
+    written, expected = _write_trace2cp_side_top_z_top_slice_debug(tmp_path, experiment)
+
+    assert written == expected == 2
+    slices = sorted(path.name for path in (tmp_path / "trace2cp_side_top_z_top_slices").glob("*.jpg"))
+    overlays = sorted(path.name for path in (tmp_path / "trace2cp_side_top_z_top_overlays").glob("*.jpg"))
+    assert slices == ["bw_0000.jpg", "fw_0000.jpg"]
+    assert overlays == ["bw_0000.jpg", "fw_0000.jpg"]
+
+
+def test_trace2cp_side_top_z_top_slice_direction_overlay_draws_direction() -> None:
+    height, width = 17, 19
+    debug = _Trace2CpSideTopZTopSliceDebug(
+        image=np.full((height, width), 32.0, dtype=np.float32),
+        valid_mask=np.ones((height, width), dtype=bool),
+        direction_xy=np.asarray([1.0, 0.0], dtype=np.float32),
+        point_xy=np.asarray([8.0, 8.0], dtype=np.float32),
+        z_offset_voxels=0.0,
+    )
+
+    overlay = _draw_trace2cp_side_top_z_top_slice_direction_overlay(debug)
+
+    assert overlay.shape == (height, width, 3)
+    yellow = (
+        (overlay[..., 0].astype(np.int16) > 220)
+        & (overlay[..., 1].astype(np.int16) > 190)
+        & (overlay[..., 2].astype(np.int16) < 100)
+    )
+    assert int(np.count_nonzero(yellow)) > 0
+
+
+def test_trace2cp_top_monotone_direction_path_connects_center_cps() -> None:
+    direction = np.zeros((5, 19, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    valid = np.ones((5, 19), dtype=bool)
+
+    path = _trace2cp_top_monotone_direction_path(
+        direction,
+        valid,
+        start_xy=np.asarray([1.0, 2.0], dtype=np.float32),
+        target_xy=np.asarray([17.0, 2.0], dtype=np.float32),
+    )
+
+    assert path.shape == (3, 2)
+    assert path[0].tolist() == pytest.approx([1.0, 2.0])
+    assert path[1].tolist() == pytest.approx([9.0, 2.0])
+    assert path[-1].tolist() == pytest.approx([17.0, 2.0])
+    np.testing.assert_allclose(path[:, 1], 2.0)
+
+
+def test_trace2cp_top_monotone_direction_path_prefers_gradual_eight_pixel_steps() -> None:
+    direction = np.zeros((7, 17, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    valid = np.ones((7, 17), dtype=bool)
+
+    path = _trace2cp_top_monotone_direction_path(
+        direction,
+        valid,
+        start_xy=np.asarray([0.0, 1.0], dtype=np.float32),
+        target_xy=np.asarray([16.0, 3.0], dtype=np.float32),
+        max_abs_dy=8,
+    )
+
+    np.testing.assert_allclose(path, [[0.0, 1.0], [8.0, 2.0], [16.0, 3.0]])
+
+
+def test_trace2cp_top_monotone_direction_path_respects_invalid_mask() -> None:
+    direction = np.zeros((5, 19, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    valid = np.ones((5, 19), dtype=bool)
+    valid[2, 9] = False
+
+    path = _trace2cp_top_monotone_direction_path(
+        direction,
+        valid,
+        start_xy=np.asarray([1.0, 2.0], dtype=np.float32),
+        target_xy=np.asarray([17.0, 2.0], dtype=np.float32),
+    )
+
+    assert path[0].tolist() == pytest.approx([1.0, 2.0])
+    assert path[-1].tolist() == pytest.approx([17.0, 2.0])
+    assert path[1, 0] == pytest.approx(9.0)
+    assert path[1, 1] != pytest.approx(2.0)
+
+
+def test_trace2cp_top_monotone_direction_path_crosses_invalid_barrier_with_penalty() -> None:
+    direction = np.zeros((5, 19, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    valid = np.ones((5, 19), dtype=bool)
+    valid[:, 9] = False
+
+    path = _trace2cp_top_monotone_direction_path(
+        direction,
+        valid,
+        start_xy=np.asarray([1.0, 2.0], dtype=np.float32),
+        target_xy=np.asarray([17.0, 2.0], dtype=np.float32),
+    )
+
+    assert path[0].tolist() == pytest.approx([1.0, 2.0])
+    assert path[-1].tolist() == pytest.approx([17.0, 2.0])
+    assert path.shape[0] == 3
+
+
+def test_trace2cp_top_monotone_direction_path_z_stays_center_when_layers_match() -> None:
+    direction = np.zeros((5, 19, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    valid = np.ones((5, 19), dtype=bool)
+
+    path, layers = _trace2cp_top_monotone_direction_path_z(
+        [direction, direction, direction],
+        [valid, valid, valid],
+        start_xy=np.asarray([1.0, 2.0], dtype=np.float32),
+        target_xy=np.asarray([17.0, 2.0], dtype=np.float32),
+    )
+
+    assert path.shape == (3, 2)
+    np.testing.assert_array_equal(layers, np.asarray([1, 1, 1], dtype=np.int32))
+
+
+def test_trace2cp_top_monotone_direction_path_z_torch_matches_numpy() -> None:
+    base = np.zeros((7, 21, 2), dtype=np.float32)
+    base[:, :, 0] = 1.0
+    angled = base.copy()
+    angled[:, 9:15, 0] = np.float32(4.0 / math.sqrt(17.0))
+    angled[:, 9:15, 1] = np.float32(1.0 / math.sqrt(17.0))
+    valid = np.ones((7, 21), dtype=bool)
+    presence = np.zeros((7, 21), dtype=np.float32)
+    presence[4, :] = 1.0
+    kwargs = dict(
+        direction_fields=[angled, base, angled],
+        valid_masks=[valid, valid, valid],
+        presence_fields=[presence, presence, presence],
+        start_xy=np.asarray([1.0, 3.0], dtype=np.float32),
+        target_xy=np.asarray([17.0, 3.0], dtype=np.float32),
+        direction_weight=1.0,
+        presence_weight=0.2,
+        max_abs_dy=3,
+        max_abs_dz=1,
+        horizontal_step_px=4,
+        max_direction_angle_degrees=45.0,
+    )
+
+    numpy_path, numpy_layers = _trace2cp_top_monotone_direction_path_z(**kwargs)
+    torch_path, torch_layers = _trace2cp_top_monotone_direction_path_z(
+        **kwargs,
+        torch_device=torch.device("cpu"),
+        torch_move_chunk_size=2,
+    )
+
+    np.testing.assert_array_equal(torch_path, numpy_path)
+    np.testing.assert_array_equal(torch_layers, numpy_layers)
+
+
+def test_trace2cp_dp_direction_angle_penalty_uses_angle_space_scale() -> None:
+    angles = np.asarray([0.0, 10.0, 20.0, 25.0, 45.0], dtype=np.float32)
+    alignment = np.cos(np.deg2rad(angles)).astype(np.float32)
+
+    penalty = _trace2cp_dp_direction_angle_penalty_np(
+        alignment,
+        excess_knee_degrees=25.0,
+    )
+    torch_penalty = _trace2cp_dp_direction_angle_penalty_torch(
+        torch.as_tensor(alignment),
+        excess_knee_degrees=25.0,
+    ).cpu().numpy()
+
+    np.testing.assert_allclose(
+        penalty,
+        torch_penalty,
+        rtol=1.0e-5,
+        atol=1.0e-5,
+    )
+    np.testing.assert_allclose(
+        penalty[:4],
+        np.asarray([0.0, 1.0, 4.0, 6.25], dtype=np.float32),
+        rtol=1.0e-4,
+        atol=1.0e-4,
+    )
+    assert float(penalty[4]) == pytest.approx(36.45, rel=1.0e-3)
+    assert float(penalty[4] / penalty[2]) == pytest.approx(9.1125, rel=1.0e-3)
+
+
+def test_trace2cp_joint_dp_candidate_angle_does_not_cap_global_slope() -> None:
+    direction = np.zeros((41, 17, 2), dtype=np.float32)
+    steep = np.asarray([4.0, -5.0], dtype=np.float32)
+    steep /= np.linalg.norm(steep)
+    direction[:, :, :] = steep
+    valid = np.ones((41, 17), dtype=bool)
+
+    result, _summary, path_xyz = _trace_score_trace2cp_joint_dp_bidirectional(
+        direction_fields=[direction],
+        valid_masks=[valid],
+        presence_fields=None,
+        start_xy=np.asarray([0.0, 30.0], dtype=np.float32),
+        target_xy=np.asarray([16.0, 10.0], dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=1.0, last=0.0, enclosing=0.0, fiber=0.0, image=0.0),
+        step_px=4.0,
+        rf_margin_px=0.0,
+        horizontal_step_px=4,
+        max_direction_angle_degrees=25.0,
+        candidate_angles_degrees=_trace2cp_candidate_angles_degrees(25.0, 1.0),
+    )
+
+    assert result.metric.reached_target_columns
+    np.testing.assert_allclose(path_xyz[0, :2], np.asarray([0.0, 30.0], dtype=np.float32))
+    np.testing.assert_allclose(path_xyz[-1, :2], np.asarray([16.0, 10.0], dtype=np.float32))
+    assert float(np.max(np.abs(np.diff(path_xyz[:, 1])))) > 4.0
+
+
+def test_trace2cp_top_monotone_direction_path_z_progress_prints_eta(capsys) -> None:
+    direction = np.zeros((5, 19, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    valid = np.ones((5, 19), dtype=bool)
+
+    _trace2cp_top_monotone_direction_path_z(
+        [direction],
+        [valid],
+        start_xy=np.asarray([1.0, 2.0], dtype=np.float32),
+        target_xy=np.asarray([17.0, 2.0], dtype=np.float32),
+        progress_label="unit",
+        progress_interval_s=0.0,
+    )
+
+    captured = capsys.readouterr().out
+    assert "trace2cp dp start" in captured
+    assert "trace2cp dp progress" in captured
+    assert "eta_s=" in captured
+    assert "trace2cp dp done" in captured
+
+
+def _trace2cp_test_stats(reason: str = "target_column") -> runner_module._Trace2CpCombinedTraceStats:
+    return runner_module._Trace2CpCombinedTraceStats(
+        steps=1,
+        invalid_candidates=0,
+        direction_loss_sum=0.0,
+        last_loss_sum=0.0,
+        enclosing_loss_sum=0.0,
+        fiber_loss_sum=0.0,
+        total_loss_sum=0.0,
+        reason=reason,
+    )
+
+
+def _trace2cp_test_bidirectional_result() -> _Trace2CpBidirectionalResult:
+    direction = np.zeros((9, 21, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    valid = np.ones((9, 21), dtype=bool)
+    return _trace_score_trace2cp_bidirectional(
+        direction,
+        np.asarray([2.0, 4.0], dtype=np.float32),
+        np.asarray([18.0, 4.0], dtype=np.float32),
+        valid_mask=valid,
+        step_px=4.0,
+        rf_margin_px=0.0,
+    )
+
+
+def test_trace2cp_combined_defaults_to_stepwise_not_dp(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[float, float]] = []
+
+    def fake_stepwise(**kwargs):
+        start = np.asarray(kwargs["start_xy"], dtype=np.float32)
+        target = np.asarray(kwargs["target_xy"], dtype=np.float32)
+        calls.append((float(start[0]), float(target[0])))
+        return np.stack([start, target], axis=0).astype(np.float32), "target_column", _trace2cp_test_stats()
+
+    def forbidden_dp(**_kwargs):
+        raise AssertionError("DP backend should require explicit --trace2cp-dp routing")
+
+    monkeypatch.setattr(runner_module, "_trace_combined_direction_line_to_target", fake_stepwise)
+    monkeypatch.setattr(runner_module, "_trace_score_trace2cp_joint_dp_bidirectional", forbidden_dp)
+    direction = np.zeros((9, 21, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    valid = np.ones((9, 21), dtype=bool)
+
+    result, summary = _trace_score_trace2cp_combined_bidirectional(
+        direction_xy=direction,
+        tta_fields=None,
+        embedding_chw=None,
+        presence_hw=None,
+        valid_mask=valid,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([18.0, 4.0], dtype=np.float32),
+        fiber_embeddings=None,
+        weights=_Trace2CpCombinedWeights(direction=1.0, last=0.0, enclosing=0.0, fiber=0.0, image=0.0),
+        candidate_max_degrees=25.0,
+        candidate_step_degrees=1.0,
+        step_px=4.0,
+        rf_margin_px=0.0,
+    )
+
+    assert calls == [(2.0, 18.0), (18.0, 2.0)]
+    assert summary.steps == 2
+    assert result.metric.reached_target_columns
+
+
+def test_trace2cp_explicit_dp_uses_dp_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    def forbidden_stepwise(**_kwargs):
+        raise AssertionError("stepwise backend should not run for explicit DP routing")
+
+    def fake_dp(**_kwargs):
+        calls.append("dp")
+        summary = runner_module._Trace2CpCombinedSummary(
+            forward=_trace2cp_test_stats(),
+            reverse=_trace2cp_test_stats(),
+            candidate_angles_degrees=np.asarray([0.0], dtype=np.float32),
+            fiber_bank_size=0,
+            fiber_bank_skipped=0,
+        )
+        path = np.asarray([[2.0, 4.0, 0.0], [18.0, 4.0, 0.0]], dtype=np.float32)
+        return _trace2cp_test_bidirectional_result(), summary, path
+
+    monkeypatch.setattr(runner_module, "_trace_combined_direction_line_to_target", forbidden_stepwise)
+    monkeypatch.setattr(runner_module, "_trace_score_trace2cp_joint_dp_bidirectional", fake_dp)
+    direction = np.zeros((9, 21, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    valid = np.ones((9, 21), dtype=bool)
+
+    result, summary = _trace_score_trace2cp_combined_dp_bidirectional(
+        direction_xy=direction,
+        tta_fields=None,
+        embedding_chw=None,
+        presence_hw=None,
+        valid_mask=valid,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([18.0, 4.0], dtype=np.float32),
+        fiber_embeddings=None,
+        weights=_Trace2CpCombinedWeights(direction=1.0, last=0.0, enclosing=0.0, fiber=0.0, image=0.0),
+        candidate_max_degrees=25.0,
+        candidate_step_degrees=1.0,
+        step_px=4.0,
+        rf_margin_px=0.0,
+        torch_device=torch.device("cpu"),
+    )
+
+    assert calls == ["dp"]
+    assert summary.steps == 2
+    assert result.metric.reached_target_columns
+
+
+def test_trace2cp_joint_dp_uses_z_smoothness_without_z_step_penalty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, float] = {}
+
+    def fake_path_z(*_args, **kwargs):
+        captured["z_transition_penalty"] = float(kwargs["z_transition_penalty"])
+        captured["dz_smooth_penalty"] = float(kwargs["dz_smooth_penalty"])
+        return (
+            np.asarray([[2.0, 4.0], [18.0, 4.0]], dtype=np.float32),
+            np.asarray([0, 0], dtype=np.int32),
+        )
+
+    monkeypatch.setattr(runner_module, "_trace2cp_top_monotone_direction_path_z", fake_path_z)
+    direction = np.zeros((9, 21, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    valid = np.ones((9, 21), dtype=bool)
+
+    _trace_score_trace2cp_joint_dp_bidirectional(
+        direction_fields=[direction],
+        valid_masks=[valid],
+        presence_fields=None,
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([18.0, 4.0], dtype=np.float32),
+        weights=_Trace2CpCombinedWeights(direction=1.0),
+        step_px=4.0,
+        rf_margin_px=0.0,
+        max_abs_dz=1,
+        horizontal_step_px=4,
+        max_direction_angle_degrees=25.0,
+    )
+
+    assert captured["z_transition_penalty"] == pytest.approx(0.0)
+    assert captured["dz_smooth_penalty"] == pytest.approx(0.5)
+
+
+def test_trace2cp_z_search_defaults_to_stepwise_not_dp(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[float, float]] = []
+
+    class FakePlaneCache:
+        max_layer = 4
+        z_step_voxels = 0.5
+
+        def __init__(self) -> None:
+            direction = np.zeros((9, 21, 2), dtype=np.float32)
+            direction[:, :, 0] = 1.0
+            self.center = SimpleNamespace(
+                fields=_Trace2CpPredictedFields(
+                    direction_xy=direction,
+                    embedding_chw=np.zeros((2, 9, 21), dtype=np.float32),
+                    presence_hw=np.ones((9, 21), dtype=np.float32),
+                ),
+                valid_mask=np.ones((9, 21), dtype=bool),
+            )
+
+        def get(self, _layer: int):
+            return self.center
+
+    def fake_stepwise_z(**kwargs):
+        start = np.asarray(kwargs["start_xy"], dtype=np.float32)
+        target = np.asarray(kwargs["target_xy"], dtype=np.float32)
+        calls.append((float(start[0]), float(target[0])))
+        return (
+            np.asarray([[start[0], start[1], 0.0], [target[0], target[1], 0.0]], dtype=np.float32),
+            "target_column",
+            _trace2cp_test_stats(),
+        )
+
+    def forbidden_dp(**_kwargs):
+        raise AssertionError("z-search should use stepwise candidate search unless DP is explicit")
+
+    monkeypatch.setattr(runner_module, "_trace_combined_direction_line_to_target_z", fake_stepwise_z)
+    monkeypatch.setattr(runner_module, "_trace_score_trace2cp_joint_dp_bidirectional", forbidden_dp)
+
+    result, summary, forward_xyz, reverse_xyz = _trace_score_trace2cp_combined_z_bidirectional(
+        plane_cache=FakePlaneCache(),
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([18.0, 4.0], dtype=np.float32),
+        fiber_embeddings=None,
+        weights=_Trace2CpCombinedWeights(direction=1.0, last=0.0, enclosing=0.0, fiber=0.0, image=0.0),
+        candidate_max_degrees=25.0,
+        candidate_step_degrees=1.0,
+        step_px=4.0,
+        rf_margin_px=0.0,
+    )
+
+    assert calls == [(2.0, 18.0), (18.0, 2.0)]
+    assert summary.steps == 2
+    assert result.metric.reached_target_columns
+    np.testing.assert_allclose(forward_xyz[:, 2], 0.0)
+    np.testing.assert_allclose(reverse_xyz[:, 2], 0.0)
+
+
+def test_trace2cp_z_search_explicit_dp_uses_dp_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    class FakePlaneCache:
+        max_layer = 0
+        z_step_voxels = 0.5
+        device = torch.device("cpu")
+
+        def __init__(self) -> None:
+            direction = np.zeros((9, 21, 2), dtype=np.float32)
+            direction[:, :, 0] = 1.0
+            self.center = SimpleNamespace(
+                fields=_Trace2CpPredictedFields(
+                    direction_xy=direction,
+                    embedding_chw=np.zeros((2, 9, 21), dtype=np.float32),
+                    presence_hw=np.ones((9, 21), dtype=np.float32),
+                ),
+                valid_mask=np.ones((9, 21), dtype=bool),
+            )
+
+        def get(self, _layer: int):
+            return self.center
+
+    def forbidden_stepwise_z(**_kwargs):
+        raise AssertionError("stepwise z backend should not run for explicit DP routing")
+
+    def fake_dp(**_kwargs):
+        calls.append("dp")
+        summary = runner_module._Trace2CpCombinedSummary(
+            forward=_trace2cp_test_stats(),
+            reverse=_trace2cp_test_stats(),
+            candidate_angles_degrees=np.asarray([0.0], dtype=np.float32),
+            fiber_bank_size=0,
+            fiber_bank_skipped=0,
+        )
+        path = np.asarray([[2.0, 4.0, 0.0], [18.0, 4.0, 0.0]], dtype=np.float32)
+        return _trace2cp_test_bidirectional_result(), summary, path
+
+    monkeypatch.setattr(runner_module, "_trace_combined_direction_line_to_target_z", forbidden_stepwise_z)
+    monkeypatch.setattr(runner_module, "_trace_score_trace2cp_joint_dp_bidirectional", fake_dp)
+
+    result, summary, forward_xyz, reverse_xyz = _trace_score_trace2cp_combined_z_dp_bidirectional(
+        plane_cache=FakePlaneCache(),
+        start_xy=np.asarray([2.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([18.0, 4.0], dtype=np.float32),
+        fiber_embeddings=None,
+        weights=_Trace2CpCombinedWeights(direction=1.0, last=0.0, enclosing=0.0, fiber=0.0, image=0.0),
+        candidate_max_degrees=25.0,
+        candidate_step_degrees=1.0,
+        step_px=4.0,
+        rf_margin_px=0.0,
+    )
+
+    assert calls == ["dp"]
+    assert summary.steps == 2
+    assert result.metric.reached_target_columns
+    np.testing.assert_allclose(forward_xyz[:, 2], 0.0)
+    np.testing.assert_allclose(reverse_xyz[:, 2], 0.0)
+
+
+def test_trace2cp_top_monotone_direction_path_z_uses_better_direction_layer() -> None:
+    vertical = np.zeros((5, 19, 2), dtype=np.float32)
+    vertical[:, :, 1] = 1.0
+    horizontal = np.zeros((5, 19, 2), dtype=np.float32)
+    horizontal[:, :, 0] = 1.0
+    valid = np.ones((5, 19), dtype=bool)
+
+    path, layers = _trace2cp_top_monotone_direction_path_z(
+        [vertical, vertical, horizontal],
+        [valid, valid, valid],
+        start_xy=np.asarray([1.0, 2.0], dtype=np.float32),
+        target_xy=np.asarray([17.0, 2.0], dtype=np.float32),
+        z_transition_penalty=0.1,
+    )
+
+    assert path.shape == (3, 2)
+    np.testing.assert_array_equal(layers, np.asarray([1, 2, 1], dtype=np.int32))
+
+
+def test_trace2cp_top_monotone_direction_path_smooths_abrupt_y_steps() -> None:
+    direction = np.zeros((9, 25, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    for segment_index, dy in enumerate((2, -2, 2)):
+        x_start = segment_index * 8 + 1
+        x_stop = min((segment_index + 1) * 8 + 1, direction.shape[1])
+        vector = np.asarray([8.0, float(dy)], dtype=np.float32)
+        vector /= np.linalg.norm(vector)
+        direction[:, x_start:x_stop, :] = vector
+    valid = np.ones((9, 25), dtype=bool)
+
+    unsmoothed, _unsmoothed_layers = _trace2cp_top_monotone_direction_path_z(
+        [direction],
+        [valid],
+        start_xy=np.asarray([0.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([24.0, 4.0], dtype=np.float32),
+        dy_smooth_penalty=0.0,
+        dz_smooth_penalty=0.0,
+    )
+    smoothed, _smoothed_layers = _trace2cp_top_monotone_direction_path_z(
+        [direction],
+        [valid],
+        start_xy=np.asarray([0.0, 4.0], dtype=np.float32),
+        target_xy=np.asarray([24.0, 4.0], dtype=np.float32),
+        dy_smooth_penalty=1.0,
+        dz_smooth_penalty=0.0,
+    )
+
+    unsmoothed_steps = np.diff(unsmoothed[:, 1])
+    smoothed_steps = np.diff(smoothed[:, 1])
+    unsmoothed_roughness = np.sum(np.diff(unsmoothed_steps) ** 2)
+    smoothed_roughness = np.sum(np.diff(smoothed_steps) ** 2)
+    assert smoothed_roughness < unsmoothed_roughness
+
+
+def test_trace2cp_top_direction_traces_reach_opposite_cp_columns() -> None:
+    direction = np.zeros((5, 11, 2), dtype=np.float32)
+    direction[:, :, 0] = 1.0
+    valid = np.ones((5, 11), dtype=bool)
+
+    forward, reverse, forward_reason, reverse_reason = _trace2cp_top_direction_traces(
+        direction,
+        valid,
+        start_xy=np.asarray([2.0, 0.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 4.0], dtype=np.float32),
+        step_px=2.0,
+    )
+
+    assert forward[0].tolist() == pytest.approx([2.0, 2.0])
+    assert forward[-1].tolist() == pytest.approx([8.0, 2.0])
+    assert reverse[0].tolist() == pytest.approx([8.0, 2.0])
+    assert reverse[-1].tolist() == pytest.approx([2.0, 2.0])
+    assert forward_reason == "target_column"
+    assert reverse_reason == "target_column"
+
+
+def test_trace2cp_top_direction_traces_handle_ambiguous_sign_seams() -> None:
+    direction = np.zeros((5, 11, 2), dtype=np.float32)
+    direction[:, :6, 0] = 1.0
+    direction[:, 6:, 0] = -1.0
+    valid = np.ones((5, 11), dtype=bool)
+
+    forward, reverse, forward_reason, reverse_reason = _trace2cp_top_direction_traces(
+        direction,
+        valid,
+        start_xy=np.asarray([2.0, 0.0], dtype=np.float32),
+        target_xy=np.asarray([8.0, 4.0], dtype=np.float32),
+        step_px=1.0,
+    )
+
+    assert forward[-1].tolist() == pytest.approx([8.0, 2.0])
+    assert reverse[-1].tolist() == pytest.approx([2.0, 2.0])
+    assert np.all(np.diff(forward[:, 0]) >= 0.0)
+    assert np.all(np.diff(reverse[:, 0]) <= 0.0)
+    assert forward_reason == "target_column"
+    assert reverse_reason == "target_column"
+
+
+def test_trace2cp_top_model_loader_requires_and_loads_top_state(tmp_path: Path) -> None:
+    model = FiberStripDirectionNet(
+        FiberStripDirectionModelConfig(hidden_channels=4, depth=2, presence_channels=1)
+    )
+    checkpoint = {
+        "config": {"training": {"model_hidden_channels": 4, "model_depth": 2}},
+        "top_model_state_dict": model.state_dict(),
+    }
+
+    loaded = _load_top_direction_model_from_checkpoint(
+        checkpoint,
+        tmp_path / "checkpoint.pt",
+        device=torch.device("cpu"),
+    )
+
+    assert isinstance(loaded, FiberStripDirectionNet)
+    assert loaded.presence_channels == 1
+    with pytest.raises(ValueError, match="top_model_state_dict"):
+        _load_top_direction_model_from_checkpoint(
+            {"config": checkpoint["config"]},
+            tmp_path / "missing.pt",
+            device=torch.device("cpu"),
+        )
+
+
+def test_dir_vis_image_space_augmentations_are_pixel_perfect_and_contiguous() -> None:
+    image = np.arange(6, dtype=np.float32).reshape(2, 3)
+    valid = np.asarray([[True, False, True], [False, True, False]], dtype=bool)
+
+    augmentations = _dir_vis_image_space_augmentations(image, valid)
+
+    assert [augment.name for augment in augmentations] == [
+        "identity",
+        "flip_x",
+        "flip_y",
+        "rot90",
+        "rot180",
+        "rot270",
+    ]
+    by_name = {augment.name: augment for augment in augmentations}
+    assert np.array_equal(by_name["identity"].image, image)
+    assert np.array_equal(by_name["flip_x"].image, np.flip(image, axis=1))
+    assert np.array_equal(by_name["flip_y"].image, np.flip(image, axis=0))
+    assert np.array_equal(by_name["rot90"].image, np.rot90(image, k=1, axes=(0, 1)))
+    assert np.array_equal(by_name["rot180"].image, np.rot90(image, k=2, axes=(0, 1)))
+    assert np.array_equal(by_name["rot270"].image, np.rot90(image, k=3, axes=(0, 1)))
+    assert np.array_equal(by_name["rot90"].valid_mask, np.rot90(valid, k=1, axes=(0, 1)))
+    assert all(augment.image.flags.c_contiguous for augment in augmentations)
+    assert all(augment.valid_mask.flags.c_contiguous for augment in augmentations)
+
+
+def test_labeled_panel_strip_preserves_natural_panel_sizes() -> None:
+    wide = np.full((2, 5, 3), (10, 20, 30), dtype=np.uint8)
+    tall = np.full((5, 2, 3), (40, 50, 60), dtype=np.uint8)
+
+    strip = _labeled_panel_strip_rgb([wide, tall], ["wide", "tall"])
+
+    assert strip.shape[1] == wide.shape[1] + tall.shape[1]
+    label_h = strip.shape[0] - max(wide.shape[0], tall.shape[0])
+    assert label_h > 0
+    assert np.array_equal(strip[label_h : label_h + wide.shape[0], : wide.shape[1]], wide)
+    assert np.array_equal(strip[label_h : label_h + tall.shape[0], wide.shape[1] :], tall)
+
+
+def test_labeled_panel_grid_uses_one_label_band_and_no_cell_padding() -> None:
+    panels = [
+        [np.full((2, 3, 3), 10, dtype=np.uint8), np.full((2, 3, 3), 20, dtype=np.uint8)],
+        [np.full((2, 3, 3), 30, dtype=np.uint8), np.full((2, 3, 3), 40, dtype=np.uint8)],
+    ]
+
+    grid = _labeled_panel_grid_rgb(panels, ["a", "b"])
+
+    assert grid.shape[1] == 6
+    label_h = grid.shape[0] - 4
+    assert label_h > 0
+    assert np.array_equal(grid[label_h : label_h + 2, 0:3], panels[0][0])
+    assert np.array_equal(grid[label_h : label_h + 2, 3:6], panels[0][1])
+    assert np.array_equal(grid[label_h + 2 : label_h + 4, 0:3], panels[1][0])
+    assert np.array_equal(grid[label_h + 2 : label_h + 4, 3:6], panels[1][1])
+
+
+def test_dir_vis_display_image_does_not_apply_valid_mask() -> None:
+    image = np.asarray([[10.0, 20.0], [np.nan, 300.0]], dtype=np.float32)
+
+    display = _to_u8_display_image(image)
+
+    assert np.array_equal(display, np.asarray([[10, 20], [0, 255]], dtype=np.uint8))
+
+
+def test_dir_vis_pastes_unaugmented_center_patch() -> None:
+    base = np.arange(25, dtype=np.float32).reshape(5, 5)
+    target = _DirVisImageAugment(
+        name="flip_x",
+        image=np.full((5, 5), -1.0, dtype=np.float32),
+        valid_mask=np.zeros((5, 5), dtype=bool),
+    )
+    base_valid = np.ones((5, 5), dtype=bool)
+
+    pasted = _paste_unaugmented_center_patch(base, base_valid, target, paste_side=3)
+
+    expected = np.full((5, 5), -1.0, dtype=np.float32)
+    expected[1:4, 1:4] = base[1:4, 1:4]
+    assert pasted.name == "paste_flip_x"
+    assert np.array_equal(pasted.image, expected)
+    assert np.count_nonzero(pasted.valid_mask) == 9
+
+
+def test_dir_vis_debug_paste_side_uses_half_image_side() -> None:
+    assert _dir_vis_half_image_paste_side((356, 356)) == 178
+    assert _dir_vis_half_image_paste_side((5, 7)) == 3
+    with pytest.raises(ValueError, match="non-empty"):
+        _dir_vis_half_image_paste_side((0, 8))
+
+
+def test_direction_model_receptive_field_diameter_matches_conv_stack() -> None:
+    radius, diameter = _direction_model_receptive_field_diameter(FiberStripDirectionModelConfig(depth=10))
+
+    assert radius == 21
+    assert diameter == 43
+
+
+def test_dir_vis_center_patch_center_crops_to_square_without_scaling() -> None:
+    class FakeLoader:
+        def build_center_strip_patch(
+            self, sample_index: int, *, device: torch.device
+        ) -> tuple[object, np.ndarray, np.ndarray]:
+            assert sample_index == 7
+            assert device.type == "cpu"
+            return (
+                SimpleNamespace(control_point_index=5),
+                np.arange(24, dtype=np.float32).reshape(4, 6),
+                np.ones((4, 6), dtype=bool),
+            )
+
+    sample, image, valid = _build_dir_vis_center_patch(FakeLoader(), 7, device=torch.device("cpu"))
+
+    assert sample.control_point_index == 5
+    assert image.shape == (4, 4)
+    assert valid.shape == (4, 4)
+    assert np.array_equal(image, np.arange(24, dtype=np.float32).reshape(4, 6)[:, 1:5])
+
+
+def test_direction_model_defaults_to_10_block_64_channel_resnet() -> None:
+    config = FiberStripDirectionModelConfig()
+    model = FiberStripDirectionNet(config)
+
+    assert config.hidden_channels == 64
+    assert config.depth == 10
+    assert len(model.blocks) == 10
+    assert model.input[0].out_channels == 64
+    assert isinstance(model.input[1], torch.nn.BatchNorm2d)
+    assert model.input[1].num_features == 64
+    assert isinstance(model.blocks[0].norm1, torch.nn.BatchNorm2d)
+    assert model.blocks[0].norm1.num_features == 64
+
+
+def test_direction_model_forward_shape_and_range() -> None:
+    model = FiberStripDirectionNet(FiberStripDirectionModelConfig(hidden_channels=4, depth=2))
+    image = torch.zeros((3, 1, 8, 9), dtype=torch.float32)
+
+    output = model(image)
+
+    assert isinstance(model.input[1], torch.nn.BatchNorm2d)
+    assert model.input[1].num_features == 4
+    assert output.shape == (3, 2, 8, 9)
+    assert bool(torch.all(output >= 0.0))
+    assert bool(torch.all(output <= 1.0))
+
+
+def test_direction_model_can_append_embedding_channels() -> None:
+    model = FiberStripDirectionNet(
+        FiberStripDirectionModelConfig(hidden_channels=4, depth=2, embedding_channels=5)
+    )
+    image = torch.zeros((3, 1, 8, 9), dtype=torch.float32)
+
+    output = model(image)
+
+    assert output.shape == (3, 7, 8, 9)
+    assert bool(torch.all(output[:, :2] >= 0.0))
+    assert bool(torch.all(output[:, :2] <= 1.0))
+    assert bool(torch.isfinite(output[:, 2:]).all())
+
+
+def test_direction_model_can_append_presence_before_embedding_channels() -> None:
+    model = FiberStripDirectionNet(
+        FiberStripDirectionModelConfig(
+            hidden_channels=4,
+            depth=2,
+            presence_channels=1,
+            embedding_channels=5,
+        )
+    )
+    image = torch.zeros((3, 1, 8, 9), dtype=torch.float32)
+
+    output = model(image)
+
+    assert output.shape == (3, 8, 8, 9)
+    assert direction_output(output).shape == (3, 2, 8, 9)
+    assert presence_output(output, presence_channels=1).shape == (3, 1, 8, 9)
+    assert embedding_output(output, presence_channels=1).shape == (3, 5, 8, 9)
+    assert bool(torch.all(direction_output(output) >= 0.0))
+    assert bool(torch.all(direction_output(output) <= 1.0))
+    assert bool(torch.all(presence_output(output, presence_channels=1) >= 0.0))
+    assert bool(torch.all(presence_output(output, presence_channels=1) <= 1.0))
+    assert bool(torch.isfinite(embedding_output(output, presence_channels=1)).all())
+
+
+def test_fiber_parser_reuse(tmp_path: Path) -> None:
+    path = _write_fiber(tmp_path / "fiber.json")
+    fiber = load_vc3d_fiber(path)
+    assert fiber.control_points_xyz.shape == (3, 3)
+    assert np.allclose(fiber.control_points_zyx[0], [20.0, 20.0, 0.0])
+
+
+def test_side_strip_grid_matches_vc3d_simple_line_boundaries(tmp_path: Path) -> None:
+    fiber = load_vc3d_fiber(_write_fiber(tmp_path / "fiber.json"))
+    grid = build_side_strip_patch_grid(
+        fiber,
+        control_point_index=1,
+        patch_shape_hw=(3, 3),
+        strip_z_offset=0.0,
+        sampled_normal=np.asarray([0.0, 0.0, 1.0], dtype=np.float64),
+    )
+
+    assert np.allclose(grid.coords_xyz[0, 1], [10.0, 20.0, 19.0])
+    assert np.allclose(grid.coords_xyz[1, 1], [10.0, 20.0, 20.0])
+    assert np.allclose(grid.coords_xyz[2, 1], [10.0, 20.0, 21.0])
+    assert np.all(grid.valid_mask)
+
+
+def test_top_strip_grid_uses_vc3d_line_surface_side_axis(tmp_path: Path) -> None:
+    fiber = load_vc3d_fiber(_write_fiber(tmp_path / "fiber.json"))
+    window = side_strip_line_window(
+        fiber,
+        control_point_index=1,
+        patch_shape_hw=(3, 3),
+        interpolation_point_margin=0,
+    )
+    normals = np.repeat(
+        np.asarray([[0.0, 0.0, 1.0]], dtype=np.float32),
+        window.line_points_xyz.shape[0],
+        axis=0,
+    )
+
+    grid = build_top_strip_patch_grid_tensor_from_line_window(
+        window,
+        patch_shape_hw=(3, 3),
+        sampled_normals=normals,
+        device=torch.device("cpu"),
+    ).to_numpy()
+    z_grid = build_top_strip_patch_grid_tensor_from_line_window(
+        window,
+        patch_shape_hw=(3, 3),
+        sampled_normals=normals,
+        normal_offsets_by_column=np.asarray([0.0, 1.0, 2.0], dtype=np.float32),
+        device=torch.device("cpu"),
+    ).to_numpy()
+
+    assert np.allclose(grid.coords_xyz[0, 1], [10.0, 19.0, 20.0])
+    assert np.allclose(grid.coords_xyz[1, 1], [10.0, 20.0, 20.0])
+    assert np.allclose(grid.coords_xyz[2, 1], [10.0, 21.0, 20.0])
+    assert np.allclose(z_grid.coords_xyz[:, :, 2], [[20.0, 21.0, 22.0]] * 3)
+    assert np.all(grid.valid_mask)
+
+
+def test_strip_pixel_spacing_is_in_base_voxels(tmp_path: Path) -> None:
+    fiber = load_vc3d_fiber(_write_fiber(tmp_path / "fiber.json"))
+    normal = np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
+    strip = build_side_strip_patch_grid(
+        fiber,
+        control_point_index=1,
+        patch_shape_hw=(3, 3),
+        strip_z_offset=0.0,
+        sampled_normal=normal,
+        pixel_spacing_base=2.0,
+    )
+
+    assert np.allclose(strip.coords_xyz[1, :, 0], [8.0, 10.0, 12.0])
+    assert np.allclose(strip.coords_xyz[:, 1, 2], [18.0, 20.0, 22.0])
+
+
+def test_torch_side_strip_grid_matches_numpy_path(tmp_path: Path) -> None:
+    fiber = load_vc3d_fiber(
+        _write_fiber(
+            tmp_path / "fiber.json",
+            points=[
+                [0.0, 20.0, 20.0],
+                [8.0, 22.0, 20.0],
+                [16.0, 20.0, 20.0],
+                [24.0, 18.0, 20.0],
+            ],
+            control_points=[
+                [8.0, 22.0, 20.0],
+                [16.0, 20.0, 20.0],
+            ],
+        )
+    )
+    window = side_strip_line_window(
+        fiber,
+        control_point_index=1,
+        patch_shape_hw=(5, 7),
+        pixel_spacing_base=2.0,
+        interpolation_point_margin=0,
+    )
+    normals = np.repeat(np.asarray([[0.0, 0.0, 1.0]], dtype=np.float32), window.line_points_xyz.shape[0], axis=0)
+
+    numpy_grid = build_side_strip_patch_grid_from_line_window(
+        window,
+        patch_shape_hw=(5, 7),
+        strip_z_offset=0.25,
+        sampled_normals=normals,
+        pixel_spacing_base=2.0,
+    )
+    torch_grid = build_side_strip_patch_grid_from_line_window_torch(
+        window,
+        patch_shape_hw=(5, 7),
+        strip_z_offset=0.25,
+        sampled_normals=normals,
+        pixel_spacing_base=2.0,
+        device=torch.device("cpu"),
+    )
+    tensor_grid = build_side_strip_patch_grid_tensor_from_line_window(
+        window,
+        patch_shape_hw=(5, 7),
+        strip_z_offset=0.25,
+        sampled_normals=normals,
+        pixel_spacing_base=2.0,
+        device=torch.device("cpu"),
+    )
+
+    assert np.array_equal(torch_grid.valid_mask, numpy_grid.valid_mask)
+    assert np.allclose(torch_grid.coords_xyz, numpy_grid.coords_xyz, atol=1.0e-5)
+    assert np.allclose(torch_grid.coords_zyx, numpy_grid.coords_zyx, atol=1.0e-5)
+    assert isinstance(tensor_grid.coords_zyx, torch.Tensor)
+    assert tensor_grid.coords_zyx.device.type == "cpu"
+    assert tensor_grid.coords_zyx.dtype == torch.float32
+    assert np.allclose(tensor_grid.to_numpy().coords_zyx, numpy_grid.coords_zyx, atol=1.0e-5)
+
+
+def test_side_strip_uses_fiber_line_points_not_sparse_control_chord(tmp_path: Path) -> None:
+    fiber = load_vc3d_fiber(
+        _write_fiber(
+            tmp_path / "fiber.json",
+            points=[
+                [0.0, 20.0, 20.0],
+                [10.0, 30.0, 20.0],
+                [20.0, 20.0, 20.0],
+            ],
+            control_points=[
+                [0.0, 20.0, 20.0],
+                [10.0, 30.0, 20.0],
+                [20.0, 20.0, 20.0],
+            ],
+        )
+    )
+    grid = build_side_strip_patch_grid(
+        fiber,
+        control_point_index=1,
+        patch_shape_hw=(1, 3),
+        strip_z_offset=0.0,
+        sampled_normal=np.asarray([0.0, 0.0, 1.0], dtype=np.float64),
+        pixel_spacing_base=2.0,
+    )
+
+    assert grid.coords_xyz[0, 1, 1] > 29.0
+    assert grid.coords_xyz[0, 0, 0] < grid.coords_xyz[0, 2, 0]
+
+
+def test_side_strip_rejects_control_point_not_in_line_points(tmp_path: Path) -> None:
+    fiber = load_vc3d_fiber(
+        _write_fiber(
+            tmp_path / "fiber.json",
+            points=[
+                [0.0, 20.0, 20.0],
+                [10.0, 30.0, 20.0],
+                [20.0, 20.0, 20.0],
+            ],
+            control_points=[
+                [10.0, 20.0, 20.0],
+            ],
+        )
+    )
+
+    with pytest.raises(ValueError, match="not an exact member of line_points"):
+        build_side_strip_patch_grid(
+            fiber,
+            control_point_index=0,
+            patch_shape_hw=(1, 3),
+            strip_z_offset=0.0,
+            sampled_normal=np.asarray([0.0, 0.0, 1.0], dtype=np.float64),
+            pixel_spacing_base=2.0,
+        )
+
+
+def test_strip_z_offsets_generated_from_count_and_step() -> None:
+    assert strip_z_offsets_from_count_step(16, 1.0) == tuple(float(v) for v in range(-7, 9))
+    assert strip_z_offsets_from_count_step(3, 2.0) == (-2.0, 0.0, 2.0)
+
+
+def test_config_rejects_literal_strip_z_offsets(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["strip_z_offsets"] = [-1, 0, 1]
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="strip_z_offsets was removed"):
+        load_config(config_path)
+
+
+def test_config_prefetch_workers_is_not_capped_at_16(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["prefetch_workers"] = 64
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    parsed = load_config(config_path)
+
+    assert parsed.prefetch_workers == 64
+
+
+def test_config_prefetch_sampler_workers_is_separate_from_download_workers(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["prefetch_workers"] = 64
+    config["prefetch_sampler_workers"] = 3
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    parsed = load_config(config_path)
+
+    assert parsed.prefetch_workers == 64
+    assert parsed.prefetch_sampler_workers == 3
+
+
+def test_config_loader_workers_defaults_to_logical_cpu_count(tmp_path: Path) -> None:
+    parsed = load_config(_write_config(tmp_path, batch_size=1))
+
+    assert parsed.loader_workers == max(1, loader_module.os.cpu_count() or 1)
+
+
+def test_config_loader_workers_zero_means_logical_cpu_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(loader_module.os, "cpu_count", lambda: 32)
+    config_path = _write_config(tmp_path, batch_size=1)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["loader_workers"] = 0
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    parsed = load_config(config_path)
+
+    assert parsed.loader_workers == 32
+
+
+def test_config_loader_workers_accepts_single_worker_debug_mode(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["loader_workers"] = 1
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    parsed = load_config(config_path)
+
+    assert parsed.loader_workers == 1
+
+
+def test_config_rejects_negative_loader_workers(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["loader_workers"] = -1
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="loader_workers must be positive"):
+        load_config(config_path)
+
+
+def test_config_parses_vc3d_cache_budget_and_io_threads(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["volume_cache_memory_mib"] = 500
+    config["volume_io_threads"] = 3
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    parsed = load_config(config_path)
+
+    assert parsed.volume_cache_memory_mib == 500.0
+    assert parsed.volume_cache_memory_bytes == 500 * 1024 * 1024
+    assert parsed.volume_io_threads == 3
+
+
+def test_loader_clone_reuses_metadata_but_refreshes_sampler(tmp_path: Path) -> None:
+    created_samplers: list[_RecordingCoordinateSampler] = []
+
+    def factory(**kwargs):
+        sampler = _RecordingCoordinateSampler(
+            kwargs["array"],
+            level_spacing_base=kwargs["level_spacing_base"],
+        )
+        created_samplers.append(sampler)
+        return sampler
+
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["volume_cache_memory_mib"] = 500
+    raw["volume_io_threads"] = 2
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = FiberStrip2DLoader(load_config(config_path), sampler_factory=factory)
+
+    clone = loader.clone()
+
+    assert len(created_samplers) == 2
+    assert clone.records[0].fiber is loader.records[0].fiber
+    assert clone.records[0].volume is loader.records[0].volume
+    assert clone.records[0].grad_mag is loader.records[0].grad_mag
+    assert clone.records[0].sampler is not loader.records[0].sampler
+    assert clone._sample_identity_keys is loader._sample_identity_keys
+    assert clone._random_pass_cache is loader._random_pass_cache
+    assert clone._geometry_store is loader._geometry_store
+
+
+def test_numpy_sampler_batch_loading_matches_repeated_patch_loading(tmp_path: Path) -> None:
+    array = zarr.open(str(_write_zarr(tmp_path / "vol.zarr") / "0"), mode="r")
+    sampler = NumpyZarrCoordinateSampler(array, level_spacing_base=1.0)
+    coords = np.zeros((2, 3, 3, 3), dtype=np.float32)
+    valid = np.ones((2, 3, 3), dtype=bool)
+    coords[0, ..., 0] = 20.0
+    coords[0, ..., 1] = np.arange(3, dtype=np.float32).reshape(3, 1) + 20.0
+    coords[0, ..., 2] = np.arange(3, dtype=np.float32).reshape(1, 3) + 20.0
+    coords[1] = coords[0] + np.asarray([1.0, 2.0, 3.0], dtype=np.float32)
+
+    batch = sampler.sample_coord_batch(coords, valid)
+    repeated = [sampler.sample_coords(coords[index], valid[index]) for index in range(2)]
+
+    assert batch.image.shape == (2, 3, 3)
+    assert batch.valid_mask.shape == (2, 3, 3)
+    np.testing.assert_allclose(batch.image, np.stack([item.image for item in repeated], axis=0))
+    np.testing.assert_array_equal(batch.valid_mask, np.stack([item.valid_mask for item in repeated], axis=0))
+    assert batch.stats["batch_patches"] == 2
+    assert batch.stats["batch_mode_flattened"] == 1
+
+
+def test_config_rejects_strip_coord_cache_dir(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["strip_coord_cache_dir"] = "coord-cache"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="strip_coord_cache_dir was removed"):
+        load_config(config_path)
+
+
+def test_config_and_loader_batch_shape(tmp_path: Path) -> None:
+    config = load_config(_write_config(tmp_path, batch_size=2))
+    loader = _make_loader(config)
+    batch = loader.load_batch(0)
+
+    assert batch.images.shape == (2, 3, 1, 3, 3)
+    assert batch.coords_zyx.shape == (2, 3, 3, 3, 3)
+    assert batch.valid_mask.shape == (2, 3, 3, 3)
+    assert not hasattr(batch, "planar_images")
+    assert batch.strip_z_offsets.tolist() == [-1.0, 0.0, 1.0]
+    assert batch.control_point_indices.shape == (2,)
+
+
+def test_fiber_group_batch_concatenates_same_fiber_control_point_groups(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=4)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["strip_z_offset_count"] = 1
+    raw["loader_workers"] = 1
+    fiber_a = _write_fiber(
+        tmp_path / "fiber_a.json",
+        points=[[0.0, 20.0, 20.0], [10.0, 20.0, 20.0]],
+    )
+    fiber_b = _write_fiber(
+        tmp_path / "fiber_b.json",
+        points=[[0.0, 22.0, 22.0], [10.0, 22.0, 22.0]],
+    )
+    raw["datasets"][0]["fiber_paths"] = [str(fiber_a), str(fiber_b)]
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+
+    batch = loader.load_fiber_group_batch(
+        0,
+        batch_size=4,
+        control_points_per_group=2,
+        include_coords=False,
+    )
+
+    assert batch.images.shape == (4, 1, 1, 3, 3)
+    assert len(set(batch.fiber_paths)) == 2
+    assert sorted(batch.fiber_paths.count(path) for path in set(batch.fiber_paths)) == [2, 2]
+
+
+def test_fiber_group_batch_syncs_value_augmentation_but_not_geometry(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=4)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["strip_z_offset_count"] = 1
+    raw["augment_enabled"] = True
+    raw["augment_device"] = "cpu"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+
+    batch = loader.load_fiber_group_batch(
+        0,
+        batch_size=4,
+        control_points_per_group=2,
+        apply_image_augmentation=False,
+        include_coords=False,
+    )
+
+    params = tuple(param for param in batch.augmentation_params if param is not None)
+    assert len(params) == 4
+    values = [(p.brightness, p.contrast, p.gamma, p.noise_std, p.blur_sigma, p.noise_seed) for p in params]
+    geometry = {(p.shift_x, p.shift_y, p.rotation_degrees, p.shear_x, p.shear_y, p.scale) for p in params}
+    assert values[0] == values[1]
+    assert values[2] == values[3]
+    assert len(geometry) > 1
+
+
+def test_loader_batch_profile_collects_stage_timings(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["augment_enabled"] = True
+    raw["augment_device"] = "cpu"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+    profile: dict[str, float] = {}
+
+    batch = loader.load_batch(0, profile=profile)
+
+    assert batch.images.shape == (1, 3, 1, 3, 3)
+    for key in (
+        "descriptor",
+        "compact_geometry",
+        "strip_coords",
+        "coord_augmentation",
+        "line_coords",
+        "volume_sample",
+        "value_augmentation",
+        "load_batch_wall",
+        "load_batch_worker",
+    ):
+        assert key in profile
+        assert profile[key] >= 0.0
+
+
+def test_training_profile_splits_compact_geometry_and_line(capsys: pytest.CaptureFixture[str]) -> None:
+    stages = _benchmark_stage_totals(
+        {
+            "descriptor": 1.0,
+            "compact_geometry": 2.0,
+            "strip_coords": 5.0,
+            "line_coords": 6.0,
+            "coord_augmentation": 7.0,
+            "volume_sample": 8.0,
+            "load_batch_wall": 10.0,
+            "load_batch_worker": 25.0,
+        },
+        {},
+    )
+
+    _print_profile_header()
+    output = capsys.readouterr().out
+
+    assert stages["descriptor"] == 1.0
+    assert stages["compact_geometry"] == 2.0
+    assert stages["source_geom"] == 5.0
+    assert stages["line"] == 6.0
+    assert stages["coord_gen"] == 14.0
+    assert stages["loader_wall"] == 10.0
+    assert stages["loader_worker"] == 25.0
+    assert stages["loader_thread_factor"] == 2.5
+    assert "geom" in output
+    assert "source" in output
+    assert "line" in output
+    assert "tf" in output
+
+
+def test_loader_skips_whole_fiber_with_out_of_volume_control_point(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    bad_fiber = _write_fiber(
+        tmp_path / "bad_fiber.json",
+        points=[[0.0, 20.0, 20.0], [10.0, 20.0, 20.0], [20.0, 20.0, 60.0]],
+        control_points=[[0.0, 20.0, 20.0], [20.0, 20.0, 60.0]],
+    )
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["datasets"][0]["fiber_paths"].append(str(bad_fiber))
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    loader = _make_loader(load_config(config_path))
+
+    assert loader.sample_count == 3
+    assert len(loader.records) == 1
+    assert Path(loader.records[0].fiber.path).name == "fiber.json"
+
+
+def test_loader_tolerates_invalid_remote_line_endpoints_outside_cp_window(tmp_path: Path) -> None:
+    points = [[0.0, 20.0, -10.0]]
+    points.extend([[float(x), 20.0, 20.0] for x in range(5, 50, 5)])
+    fiber = _write_fiber(
+        tmp_path / "fiber.json",
+        points=points,
+        control_points=[[30.0, 20.0, 20.0]],
+    )
+    volume = _write_zarr(tmp_path / "vol.zarr")
+    manifest = _write_lasagna_manifest(tmp_path)
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "batch_size": 1,
+                "patch_shape_hw": [3, 3],
+                "strip_z_offset_count": 1,
+                "strip_z_offset_step": 1.0,
+                "augment_shift_x": 0.0,
+                "augment_shift_y": 0.0,
+                "augment_rotation_degrees": 0.0,
+                "augment_shear_x": 0.0,
+                "augment_shear_y": 0.0,
+                "augment_scale_min": 1.0,
+                "augment_scale_max": 1.0,
+                "augment_smooth_offset": 0.0,
+                "seed": 123,
+                "datasets": [
+                    {
+                        "fiber_paths": [str(fiber)],
+                        "base_volume_path": str(volume),
+                        "base_volume_scale": 0,
+                        "lasagna_manifest_path": str(manifest),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    loader = _make_loader(load_config(config_path))
+
+    batch = loader.load_batch(0)
+
+    assert batch.images.shape == (1, 1, 1, 3, 3)
+    assert batch.control_point_indices.tolist() == [0]
+
+
+def test_loader_samples_only_cp_local_lasagna_normals(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    points = [[float(x), 20.0, 20.0] for x in range(0, 45, 5)]
+    fiber = _write_fiber(
+        tmp_path / "fiber.json",
+        points=points,
+        control_points=[[20.0, 20.0, 20.0]],
+    )
+    volume = _write_zarr(tmp_path / "vol.zarr")
+    manifest = _write_lasagna_manifest(tmp_path)
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "batch_size": 1,
+                "patch_shape_hw": [3, 3],
+                "strip_z_offset_count": 1,
+                "strip_z_offset_step": 1.0,
+                "augment_shift_x": 0.0,
+                "augment_shift_y": 0.0,
+                "augment_rotation_degrees": 0.0,
+                "augment_shear_x": 0.0,
+                "augment_shear_y": 0.0,
+                "augment_scale_min": 1.0,
+                "augment_scale_max": 1.0,
+                "augment_smooth_offset": 0.0,
+                "seed": 123,
+                "datasets": [
+                    {
+                        "fiber_paths": [str(fiber)],
+                        "base_volume_path": str(volume),
+                        "base_volume_scale": 0,
+                        "lasagna_manifest_path": str(manifest),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    sampled_indices: list[int | None] = []
+    original = FiberStrip2DLoader._lasagna_normals_at_zyx_batch
+
+    def fake_normal_batch(self, record, points_zyx_base, *, line_indices):
+        sampled_indices.extend(int(v) for v in line_indices)
+        return original(
+            self,
+            record,
+            points_zyx_base,
+            line_indices=line_indices,
+        )
+
+    monkeypatch.setattr(FiberStrip2DLoader, "_lasagna_normals_at_zyx_batch", fake_normal_batch)
+    loader = _make_loader(load_config(config_path))
+    startup_indices = list(sampled_indices)
+
+    loader.build_center_strip_patch(0)
+
+    geometry = loader._geometry_store.by_record_index[0]
+    assert geometry is not None
+    expected_indices = np.flatnonzero(geometry.normal_valid).tolist()
+    assert startup_indices == expected_indices
+    assert sampled_indices == expected_indices
+    assert expected_indices != list(range(len(points)))
+
+
+def test_vectorized_lasagna_normals_match_scalar_path(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["loader_workers"] = 1
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+    record = loader.records[0]
+    points_xyz = np.asarray(record.fiber.line_points_xyz, dtype=np.float64)
+    line_indices = np.arange(points_xyz.shape[0], dtype=np.int64)
+
+    batch_normals, batch_valid, batch_invalid = loader._lasagna_normals_at_zyx_batch(
+        record,
+        points_xyz[:, [2, 1, 0]],
+        line_indices=line_indices,
+    )
+
+    assert not batch_invalid
+    assert batch_valid.tolist() == [True] * int(points_xyz.shape[0])
+    scalar = np.stack(
+        [
+            loader._lasagna_normal_at_zyx(
+                record,
+                point_xyz[[2, 1, 0]],
+                line_point_index=int(index),
+            )
+            for index, point_xyz in enumerate(points_xyz)
+        ],
+        axis=0,
+    )
+    np.testing.assert_allclose(batch_normals, scalar, atol=1.0e-6)
+
+
+def test_parallel_startup_geometry_matches_serial(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=2)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    fiber_b = _write_fiber(
+        tmp_path / "fiber_b.json",
+        points=[[0.0, 22.0, 22.0], [10.0, 22.0, 22.0], [20.0, 22.0, 22.0]],
+    )
+    raw["datasets"][0]["fiber_paths"].append(str(fiber_b))
+
+    raw["loader_workers"] = 1
+    serial_path = tmp_path / "serial.json"
+    serial_path.write_text(json.dumps(raw), encoding="utf-8")
+    serial = _make_loader(load_config(serial_path))
+
+    raw["loader_workers"] = 2
+    parallel_path = tmp_path / "parallel.json"
+    parallel_path.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(loader_module, "ProcessPoolExecutor", loader_module.ThreadPoolExecutor)
+        parallel = _make_loader(load_config(parallel_path))
+
+    assert len(serial._geometry_store.by_record_index) == len(parallel._geometry_store.by_record_index)
+    for serial_geometry, parallel_geometry in zip(
+        serial._geometry_store.by_record_index,
+        parallel._geometry_store.by_record_index,
+    ):
+        assert serial_geometry is not None
+        assert parallel_geometry is not None
+        np.testing.assert_array_equal(serial_geometry.control_line_indices, parallel_geometry.control_line_indices)
+        np.testing.assert_array_equal(serial_geometry.cp_valid, parallel_geometry.cp_valid)
+        np.testing.assert_array_equal(serial_geometry.cp_interval_indices, parallel_geometry.cp_interval_indices)
+        np.testing.assert_array_equal(serial_geometry.normal_valid, parallel_geometry.normal_valid)
+        np.testing.assert_allclose(serial_geometry.normals_xyz, parallel_geometry.normals_xyz, equal_nan=True)
+        assert serial_geometry.invalid_line_reasons == parallel_geometry.invalid_line_reasons
+        assert serial_geometry.invalid_cp_reasons == parallel_geometry.invalid_cp_reasons
+
+
+def test_augmentation_config_defaults_and_overrides(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["augment_enabled"] = True
+    raw["augment_seed"] = 999
+    raw["augment_shift_x"] = 2.5
+    raw["augment_brightness"] = 0.25
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    config = load_config(config_path)
+
+    assert config.augment.enabled is True
+    assert config.augment.seed == 999
+    assert config.augment.device == "cpu"
+    assert config.augment.shift_x == 2.5
+    assert config.augment.shift_y == 0.75
+    assert config.augment.brightness == 0.25
+    assert config.augment.rotation_degrees == 180.0
+    assert config.augment.shear_x == 1.0
+    assert config.augment.shear_y == 1.0
+    assert config.augment.scale_min == math.sqrt(0.5)
+    assert config.augment.scale_max == math.sqrt(2.0)
+    assert config.augment.smooth_offset == 8.0
+    assert config.augment.smooth_offset_stride == 16.0
+    assert config.augment.contrast_min == 0.5
+    assert config.augment.contrast_max == 2.0
+    assert config.augment.gamma_min == 0.5
+    assert config.augment.gamma_max == 2.0
+    assert config.augment.noise_std == 0.125
+    assert config.augment.blur_sigma == 2.0
+
+
+def test_combined_augmentation_is_deterministic() -> None:
+    config = FiberStripAugmentConfig(enabled=True, seed=42, device="cpu")
+
+    first = random_combined_augmentation(config, sample_index=7, variant_index=3)
+    second = random_combined_augmentation(config, sample_index=7, variant_index=3)
+    other = random_combined_augmentation(config, sample_index=7, variant_index=4)
+
+    assert first == second
+    assert first != other
+
+
+def test_coordinate_scale_and_smooth_offset_are_deterministic() -> None:
+    device = torch.device("cpu")
+    base = source_coordinate_grid_for_output(
+        5,
+        5,
+        9,
+        9,
+        FiberStripAugmentParams(),
+        device=device,
+    )
+    scaled = source_coordinate_grid_for_output(
+        5,
+        5,
+        9,
+        9,
+        FiberStripAugmentParams(scale=2.0),
+        device=device,
+    )
+    smooth_a = smooth_offset_field(5, 5, amplitude=3.0, stride=2.0, seed=17, device=device)
+    smooth_b = smooth_offset_field(5, 5, amplitude=3.0, stride=2.0, seed=17, device=device)
+
+    assert torch.allclose(smooth_a, smooth_b)
+    assert float(torch.abs(smooth_a).max().item()) <= 4.5
+    assert torch.allclose(base[2, 2], scaled[2, 2])
+    assert abs(float(scaled[2, 3, 0] - scaled[2, 2, 0])) < abs(float(base[2, 3, 0] - base[2, 2, 0]))
+
+
+def test_shift_is_applied_after_scale_in_output_space() -> None:
+    device = torch.device("cpu")
+    params = FiberStripAugmentParams(shift_x=1.0, shift_y=-2.0, scale=2.0)
+
+    point = transformed_source_point_coords(
+        (9, 9),
+        (9, 9),
+        params,
+        (5.0, 4.0),
+        device=device,
+    )
+    grid = source_coordinate_grid_for_output(9, 9, 9, 9, params, device=device)
+
+    assert np.allclose(point, np.asarray([7.0, 2.0], dtype=np.float32))
+    assert torch.allclose(grid[int(round(point[1])), int(round(point[0]))], torch.tensor([5.0, 4.0]))
+
+
+def test_strip_augment_transform_affine_round_trip() -> None:
+    device = torch.device("cpu")
+    params = FiberStripAugmentParams(
+        shift_x=3.0,
+        shift_y=-2.0,
+        rotation_degrees=17.0,
+        shear_x=0.15,
+        shear_y=-0.08,
+        scale=1.2,
+        flip_x=True,
+    )
+    transform = strip_augment_transform((19, 23), (31, 37), params, device=device)
+    source_points = torch.tensor(
+        [[18.0, 15.0], [12.5, 9.25], [24.0, 17.5]],
+        dtype=torch.float32,
+        device=device,
+    )
+
+    output_points = transform.source_to_output_points(source_points)
+    round_tripped = transform.output_to_source_points(output_points)
+
+    assert torch.allclose(round_tripped, source_points, atol=1.0e-4)
+
+
+def test_strip_augment_transform_smooth_round_trip_is_subpixel_with_cached_maps() -> None:
+    device = torch.device("cpu")
+    params = FiberStripAugmentParams(
+        shift_x=2.0,
+        shift_y=-1.0,
+        rotation_degrees=8.0,
+        shear_x=0.05,
+        shear_y=-0.03,
+        scale=1.1,
+        smooth_offset=2.5,
+        smooth_offset_stride=4.0,
+        smooth_offset_seed=19,
+    )
+    transform = strip_augment_transform((21, 21), (31, 31), params, device=device)
+    source_points = torch.tensor(
+        [[15.0, 15.0], [12.0, 13.0], [18.0, 17.0]],
+        dtype=torch.float32,
+        device=device,
+    )
+
+    output_points = transform.source_to_output_points(source_points)
+    round_tripped = transform.output_to_source_points(output_points)
+
+    assert torch.allclose(round_tripped, source_points, atol=0.1)
+
+
+def test_strip_augment_transform_caches_smooth_controls(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = 0
+    original = augment_module._smooth_offset_controls
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(augment_module, "_smooth_offset_controls", counted)
+    transform = strip_augment_transform(
+        (21, 21),
+        (31, 31),
+        FiberStripAugmentParams(smooth_offset=2.0, smooth_offset_stride=4.0, smooth_offset_seed=5),
+        device=torch.device("cpu"),
+    )
+    source_points = torch.tensor([[15.0, 15.0], [12.0, 13.0]], dtype=torch.float32)
+
+    transform.source_to_output_points(source_points)
+    transform.source_to_output_points(source_points)
+    transform.output_to_source_points(torch.tensor([[10.0, 10.0]], dtype=torch.float32))
+
+    assert calls == 1
+
+
+def test_strip_augment_transform_point_mapping_uses_cached_maps(monkeypatch: pytest.MonkeyPatch) -> None:
+    params = FiberStripAugmentParams(smooth_offset=2.0, smooth_offset_stride=4.0, smooth_offset_seed=5)
+    transform = strip_augment_transform((21, 21), (31, 31), params, device=torch.device("cpu"))
+
+    def forbidden(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("point mapping must use cached map tensors")
+
+    monkeypatch.setattr(augment_module, "_cubic_interp_1d", forbidden)
+
+    source_points = torch.tensor([[15.0, 15.0], [12.0, 13.0]], dtype=torch.float32)
+    output_points = torch.tensor([[10.0, 10.0], [11.0, 12.0]], dtype=torch.float32)
+
+    assert torch.isfinite(transform.source_to_output_points(source_points)).all()
+    assert torch.isfinite(transform.output_to_source_points(output_points)).all()
+
+
+def test_line_augmentation_returns_coordinates_not_mask() -> None:
+    line = transformed_centerline_coords(
+        (5, 5),
+        (9, 9),
+        FiberStripAugmentParams(shift_x=2.0),
+        device=torch.device("cpu"),
+    )
+
+    assert line.ndim == 2
+    assert line.shape[1] == 2
+    assert line.dtype == np.float32
+
+
+def test_smooth_line_and_cp_mapping_do_not_use_nearest_grid_search() -> None:
+    assert not hasattr(augment_module, "_nearest_output_pixels_for_source_points")
+
+    params = FiberStripAugmentParams(smooth_offset=2.0, smooth_offset_stride=3.0, smooth_offset_seed=7)
+
+    line = transformed_centerline_coords(
+        (9, 9),
+        (13, 13),
+        params,
+        device=torch.device("cpu"),
+    )
+    point = transformed_source_point_coords(
+        (9, 9),
+        (13, 13),
+        params,
+        (6.0, 6.0),
+        device=torch.device("cpu"),
+    )
+
+    assert line.shape[1] == 2
+    assert np.isfinite(line).all()
+    assert np.isfinite(point).all()
+
+
+def test_line_augmentation_shift_is_vectorized_direct_mapping() -> None:
+    line = transformed_centerline_coords(
+        (5, 5),
+        (5, 5),
+        FiberStripAugmentParams(shift_x=1.0),
+        device=torch.device("cpu"),
+    )
+
+    assert np.allclose(line[:, 0], np.asarray([1.0, 2.0, 3.0, 4.0], dtype=np.float32))
+    assert np.allclose(line[:, 1], np.full((4,), 2.0, dtype=np.float32))
+
+
+def test_batched_xy_map_bilinear_matches_single_transform_lookup() -> None:
+    device = torch.device("cpu")
+    params = [
+        FiberStripAugmentParams(shift_x=1.0, shift_y=-0.5, scale=1.1),
+        FiberStripAugmentParams(rotation_degrees=8.0, smooth_offset=1.5, smooth_offset_seed=4),
+    ]
+    transforms = [strip_augment_transform((9, 9), (13, 13), param, device=device) for param in params]
+    maps = torch.stack([transform.forward_map_xy for transform in transforms], dim=0)
+    points = torch.tensor(
+        [
+            [[6.0, 6.0], [3.5, 7.25], [10.0, 9.0]],
+            [[6.0, 6.0], [3.5, 7.25], [10.0, 9.0]],
+        ],
+        dtype=torch.float32,
+    )
+
+    batched, valid = sample_xy_maps_bilinear(maps, points)
+
+    assert bool(valid.all().item())
+    for index, transform in enumerate(transforms):
+        assert torch.allclose(batched[index], transform.source_to_output_points(points[index]), atol=1.0e-6)
+
+
+def test_batched_xy_map_bilinear_marks_oob_points() -> None:
+    maps = torch.zeros((1, 5, 5, 2), dtype=torch.float32)
+    points = torch.tensor([[[-1.0, 2.0], [2.0, 2.0], [5.0, 1.0]]], dtype=torch.float32)
+
+    sampled, valid = sample_xy_maps_bilinear(maps, points)
+
+    assert valid.tolist() == [[False, True, False]]
+    assert not torch.isfinite(sampled[0, 0]).all()
+    assert torch.isfinite(sampled[0, 1]).all()
+    assert not torch.isfinite(sampled[0, 2]).all()
+
+
+def test_batched_coordinate_augmentation_matches_single_patch_path() -> None:
+    device = torch.device("cpu")
+    yy, xx = torch.meshgrid(torch.arange(7, dtype=torch.float32), torch.arange(7, dtype=torch.float32), indexing="ij")
+    base = torch.stack([yy, xx, yy + xx], dim=-1)
+    coords = torch.stack([base, base + 10.0], dim=0)
+    valid = torch.ones((2, 7, 7), dtype=torch.bool)
+    params = [
+        FiberStripAugmentParams(shift_x=1.0, shift_y=-0.5, scale=1.1),
+        FiberStripAugmentParams(rotation_degrees=5.0, shear_x=0.1),
+    ]
+    transforms = [strip_augment_transform((5, 5), (7, 7), param, device=device) for param in params]
+    maps = torch.stack([transform.backward_map_xy for transform in transforms], dim=0)
+
+    batch_coords, batch_valid = loader_module._resample_coord_tensor_batch_like_augmentation(coords, valid, maps)
+    singles = [
+        loader_module._resample_coord_tensors_like_augmentation(
+            coords[index],
+            valid[index],
+            params[index],
+            output_shape_hw=(5, 5),
+            device=device,
+            transform=transforms[index],
+        )
+        for index in range(2)
+    ]
+
+    assert torch.allclose(batch_coords, torch.stack([item[0] for item in singles], dim=0), atol=1.0e-6)
+    assert torch.equal(batch_valid, torch.stack([item[1] for item in singles], dim=0))
+
+
+def test_value_augmentation_noise_and_blur_are_torch_based() -> None:
+    image = np.zeros((9, 9), dtype=np.float32)
+    image[4, 4] = 255.0
+    valid = np.ones((9, 9), dtype=bool)
+
+    blurred, blurred_valid = apply_value_augmentation(
+        image,
+        valid,
+        FiberStripAugmentParams(blur_sigma=1.0),
+        device=torch.device("cpu"),
+    )
+    noisy, _ = apply_value_augmentation(
+        image,
+        valid,
+        FiberStripAugmentParams(noise_std=0.25, noise_seed=1),
+        device=torch.device("cpu"),
+    )
+
+    assert blurred.device.type == "cpu"
+    assert bool(blurred_valid.all().item())
+    assert 0.0 < float(blurred[4, 4].item()) < 255.0
+    assert float(blurred[4, 3].item()) > 0.0
+    assert not torch.allclose(noisy, torch.as_tensor(image))
+
+
+def test_batched_value_augmentation_matches_single_patch_path() -> None:
+    images = np.stack(
+        [
+            np.linspace(0.0, 1.0, 16, dtype=np.float32).reshape(4, 4),
+            np.linspace(1.0, 2.0, 16, dtype=np.float32).reshape(4, 4),
+        ],
+        axis=0,
+    )
+    valid = np.ones((2, 4, 4), dtype=bool)
+    params = [
+        FiberStripAugmentParams(brightness=0.1, contrast=1.2, gamma=1.0, noise_std=0.0, blur_sigma=0.0),
+        FiberStripAugmentParams(brightness=-0.1, contrast=0.8, gamma=2.0, noise_std=0.0, blur_sigma=0.0),
+    ]
+
+    batched, batched_valid = apply_value_augmentation_batch(images, valid, params, device=torch.device("cpu"))
+    singles = [
+        apply_value_augmentation(images[index], valid[index], params[index], device=torch.device("cpu"))[0]
+        for index in range(2)
+    ]
+
+    assert bool(batched_valid.all().item())
+    assert torch.allclose(batched, torch.stack(singles, dim=0), atol=1.0e-6)
+
+
+def test_gamma_augmentation_is_range_based() -> None:
+    image = np.linspace(10.0, 110.0, 9, dtype=np.float32).reshape(3, 3)
+    valid = np.ones((3, 3), dtype=bool)
+
+    gamma, gamma_valid = apply_value_augmentation(
+        image,
+        valid,
+        FiberStripAugmentParams(gamma=2.0),
+        device=torch.device("cpu"),
+    )
+
+    assert bool(gamma_valid.all().item())
+    assert torch.isclose(gamma[0, 0], torch.tensor(10.0))
+    assert torch.isclose(gamma[-1, -1], torch.tensor(110.0))
+    assert not torch.allclose(gamma, torch.as_tensor(image))
+
+
+def test_augmented_loader_preserves_shape_and_changes_values(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["augment_enabled"] = True
+    raw["augment_brightness"] = 1.0
+    raw["augment_contrast"] = 0.0
+    raw["augment_noise_std"] = 0.0
+    raw["augment_blur_sigma"] = 0.0
+    raw["augment_shift_x"] = 0.0
+    raw["augment_shift_y"] = 0.0
+    raw["augment_rotation_degrees"] = 0.0
+    raw["augment_shear_x"] = 0.0
+    raw["augment_shear_y"] = 0.0
+    raw["augment_scale_min"] = 1.0
+    raw["augment_scale_max"] = 1.0
+    raw["augment_smooth_offset"] = 0.0
+    raw["augment_gamma_min"] = 1.0
+    raw["augment_gamma_max"] = 1.0
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    base_dir = tmp_path / "base"
+    base_dir.mkdir()
+    base_config = load_config(_write_config(base_dir, batch_size=1))
+    aug_config = load_config(config_path)
+    base = _make_loader(base_config).load_batch(0)
+    augmented = _make_loader(aug_config).load_batch(0)
+
+    assert augmented.images.shape == base.images.shape
+    assert augmented.valid_mask.shape == base.valid_mask.shape
+    assert not np.allclose(augmented.images, base.images)
+
+
+def test_augment_center_patch_loads_one_zarr_sample(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = load_config(_write_config(tmp_path, batch_size=1))
+    loader = _make_loader(config)
+    calls = 0
+    original = loader.records[0].sampler.sample_coords
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(loader.records[0].sampler, "sample_coords", counted)
+
+    sample, image, valid = loader.build_center_strip_patch(0)
+
+    assert calls == 1
+    assert image.shape == (3, 3)
+    assert valid.shape == (3, 3)
+    assert sample.strip_z_offset == 0.0
+
+
+def _as_test_numpy(value: torch.Tensor) -> np.ndarray:
+    return value.detach().cpu().numpy()
+
+
+def test_compact_geometry_rebuilds_source_without_disk_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    config = load_config(config_path)
+    first_loader = _make_loader(config)
+    first_source = first_loader.build_strip_source(0, device=torch.device("cpu"))
+
+    second_loader = _make_loader(config)
+
+    def forbidden(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("source construction should use compact geometry, not line-window normal sampling")
+
+    monkeypatch.setattr(second_loader, "_lasagna_normals_for_line_window", forbidden)
+    second_source = second_loader.build_strip_source(0, device=torch.device("cpu"))
+
+    assert np.allclose(
+        _as_test_numpy(first_source.grid.coords_zyx),
+        _as_test_numpy(second_source.grid.coords_zyx),
+    )
+    assert np.array_equal(
+        _as_test_numpy(first_source.grid.valid_mask),
+        _as_test_numpy(second_source.grid.valid_mask),
+    )
+    assert np.allclose(
+        _as_test_numpy(second_source.source_control_point_xy),
+        np.asarray([1.0, 1.0], dtype=np.float32),
+    )
+    assert not list(tmp_path.glob("coord-cache/**/*.npz"))
+
+
+def test_compact_geometry_source_shapes_are_generated_directly(tmp_path: Path) -> None:
+    large_dir = tmp_path / "large"
+    small_dir = tmp_path / "small"
+    large_dir.mkdir()
+    small_dir.mkdir()
+    large_path = _write_config(large_dir, batch_size=1)
+    raw = json.loads(large_path.read_text(encoding="utf-8"))
+    raw["patch_shape_hw"] = [7, 7]
+    large_path.write_text(json.dumps(raw), encoding="utf-8")
+    large_loader = _make_loader(load_config(large_path))
+    large_source = large_loader.build_strip_source(0, device=torch.device("cpu"))
+
+    small_path = _write_config(small_dir, batch_size=1)
+    small_loader = _make_loader(load_config(small_path))
+    small_source = small_loader.build_strip_source(0, device=torch.device("cpu"))
+
+    assert large_source.grid.coords_zyx.shape[:2] == (7, 7)
+    assert small_source.grid.coords_zyx.shape[:2] == (3, 3)
+    assert np.allclose(
+        _as_test_numpy(small_source.source_control_point_xy),
+        np.asarray([1.0, 1.0], dtype=np.float32),
+    )
+
+
+def test_trace2cp_segment_trims_invalid_compact_geometry_margin() -> None:
+    loader = object.__new__(FiberStrip2DLoader)
+    interval = loader_module._FiberLineGeometryInterval(
+        start_index=10,
+        end_index=21,
+        start_arc=0.0,
+        frame_arrays=None,
+    )
+    geometry = loader_module._FiberLineGeometry(
+        record_index=0,
+        cumulative=np.arange(30, dtype=np.float64),
+        control_line_indices=np.asarray([12, 18], dtype=np.int64),
+        normals_xyz=np.zeros((30, 3), dtype=np.float32),
+        normal_valid=np.asarray([10 <= idx < 21 for idx in range(30)], dtype=bool),
+        invalid_line_reasons={},
+        intervals=(interval,),
+        cp_interval_indices=np.asarray([0, 0], dtype=np.int64),
+        cp_valid=np.asarray([True, True], dtype=bool),
+        invalid_cp_reasons=("", ""),
+    )
+    loader._geometry_store = loader_module._FiberLineGeometryStore(
+        by_record_index=[geometry],
+        by_fiber_identity={"fiber": geometry},
+        lock=threading.Lock(),
+        memory_bytes=0,
+        valid_control_points=2,
+        skipped_control_points=0,
+    )
+    record = SimpleNamespace(fiber_identity="fiber")
+    line_window = loader_module.FiberStripLineWindow(
+        line_points_xyz=np.arange(8, 23, dtype=np.float64)[:, None].repeat(3, axis=1),
+        original_line_indices=np.arange(8, 23, dtype=np.int64),
+        local_control_point_index=4,
+    )
+
+    trimmed = loader._trim_line_window_to_valid_compact_interval(
+        record,
+        line_window,
+        start_line_index=12,
+        target_line_index=18,
+    )
+
+    np.testing.assert_array_equal(trimmed.original_line_indices, np.arange(10, 21))
+    assert trimmed.local_control_point_index == 2
+
+
+def test_required_line_ranges_include_control_point_to_control_point_span(tmp_path: Path) -> None:
+    fiber_path = _write_fiber(
+        tmp_path / "fiber.json",
+        points=[[float(index), 0.0, 0.0] for index in range(100)],
+        control_points=[[10.0, 0.0, 0.0], [80.0, 0.0, 0.0]],
+    )
+    fiber = load_vc3d_fiber(fiber_path)
+    record = SimpleNamespace(fiber=fiber)
+    loader = object.__new__(FiberStrip2DLoader)
+
+    def line_window_bounds(_record, *, control_point_index: int, source_shape_hw: tuple[int, int]):
+        del _record, source_shape_hw
+        return (10, 12) if int(control_point_index) == 0 else (78, 80)
+
+    loader._line_window_bounds_for_control_point = line_window_bounds
+
+    required = loader._required_line_ranges_for_record(
+        record,
+        source_shape_hw=(3, 3),
+    )
+
+    assert (10, 81) in required.merged_ranges
+
+
+def test_trace2cp_segment_rejects_invalid_compact_geometry_between_cps() -> None:
+    loader = object.__new__(FiberStrip2DLoader)
+    interval = loader_module._FiberLineGeometryInterval(
+        start_index=10,
+        end_index=16,
+        start_arc=0.0,
+        frame_arrays=None,
+    )
+    geometry = loader_module._FiberLineGeometry(
+        record_index=0,
+        cumulative=np.arange(30, dtype=np.float64),
+        control_line_indices=np.asarray([12, 18], dtype=np.int64),
+        normals_xyz=np.zeros((30, 3), dtype=np.float32),
+        normal_valid=np.asarray([10 <= idx < 16 for idx in range(30)], dtype=bool),
+        invalid_line_reasons={16: "Lasagna grad_mag sample is zero at fiber line point value=0"},
+        intervals=(interval,),
+        cp_interval_indices=np.asarray([0, -1], dtype=np.int64),
+        cp_valid=np.asarray([True, False], dtype=bool),
+        invalid_cp_reasons=("", "invalid"),
+    )
+    loader._geometry_store = loader_module._FiberLineGeometryStore(
+        by_record_index=[geometry],
+        by_fiber_identity={"fiber": geometry},
+        lock=threading.Lock(),
+        memory_bytes=0,
+        valid_control_points=1,
+        skipped_control_points=1,
+    )
+    record = SimpleNamespace(fiber_identity="fiber")
+    line_window = loader_module.FiberStripLineWindow(
+        line_points_xyz=np.arange(10, 20, dtype=np.float64)[:, None].repeat(3, axis=1),
+        original_line_indices=np.arange(10, 20, dtype=np.int64),
+        local_control_point_index=2,
+    )
+
+    with pytest.raises(ValueError, match="first_invalid=16.*Lasagna grad_mag sample is zero"):
+        loader._trim_line_window_to_valid_compact_interval(
+            record,
+            line_window,
+            start_line_index=12,
+            target_line_index=18,
+        )
+
+
+def test_top_source_uses_compact_geometry_without_resampling_normals(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=1)))
+
+    def forbidden(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("top source construction should use compact geometry")
+
+    monkeypatch.setattr(loader, "_lasagna_normals_for_line_window", forbidden)
+
+    source = loader.build_top_strip_source(0, device=torch.device("cpu"))
+
+    assert source.grid.coords_zyx.shape[:2] == (3, 3)
+    assert source.grid.valid_mask.shape == (3, 3)
+    assert np.allclose(
+        _as_test_numpy(source.source_control_point_xy),
+        np.asarray([1.0, 1.0], dtype=np.float32),
+    )
+
+
+def test_augmented_center_patch_loads_one_zarr_sample(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["augment_enabled"] = True
+    raw["augment_device"] = "cpu"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+    params = random_combined_augmentation(loader.config.augment, sample_index=0, variant_index=0)
+    calls = 0
+    original = loader.records[0].sampler.sample_coords
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(loader.records[0].sampler, "sample_coords", counted)
+
+    sample, image, valid, line = loader.build_augmented_center_strip_patch(
+        0,
+        params,
+        device=torch.device("cpu"),
+    )
+
+    assert calls == 1
+    assert image.shape == (3, 3)
+    assert valid.shape == (3, 3)
+    assert line.ndim == 2
+    assert line.shape[1] == 2
+    assert sample.strip_z_offset == 0.0
+
+
+def test_augmented_patch_reuses_one_transform_for_coords_and_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["augment_enabled"] = True
+    raw["augment_device"] = "cpu"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+    params = random_combined_augmentation(loader.config.augment, sample_index=0, variant_index=0)
+    original_factory = loader_module.strip_augment_transform
+    calls = 0
+
+    def counted_factory(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_factory(*args, **kwargs)
+
+    monkeypatch.setattr(loader_module, "strip_augment_transform", counted_factory)
+
+    loader.build_augmented_center_strip_patch(
+        0,
+        params,
+        device=torch.device("cpu"),
+    )
+
+    assert calls == 1
+
+
+def test_loader_maps_augmented_line_and_cp_in_one_batched_call(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["augment_enabled"] = True
+    raw["augment_device"] = "cpu"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+    source = loader.build_strip_source(0, device=torch.device("cpu"), use_augmentation_envelope=True)
+    params = random_combined_augmentation(loader.config.augment, sample_index=0, variant_index=0)
+    original_factory = loader_module.strip_augment_transform
+    call_shapes: list[tuple[int, ...]] = []
+
+    class CountingTransform:
+        def __init__(self, wrapped):
+            self._wrapped = wrapped
+
+        def source_to_output_points(self, points):
+            call_shapes.append(tuple(points.shape))
+            return self._wrapped.source_to_output_points(points)
+
+        def __getattr__(self, name):
+            return getattr(self._wrapped, name)
+
+    def counted_factory(*args, **kwargs):
+        return CountingTransform(original_factory(*args, **kwargs))
+
+    monkeypatch.setattr(loader_module, "strip_augment_transform", counted_factory)
+
+    line_xy, cp_xy = loader._line_and_cp_xy_for_params(
+        source,
+        params,
+        device=torch.device("cpu"),
+    )
+
+    assert call_shapes == [(int(source.source_line_xy.shape[0]) + 1, 2)]
+    assert line_xy.ndim == 2
+    assert line_xy.shape[1] == 2
+    assert cp_xy.shape == (2,)
+
+
+def test_build_sample_uses_batched_line_lookup_for_augmented_offsets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["augment_enabled"] = True
+    raw["augment_device"] = "cpu"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+    original = loader_module.sample_xy_maps_bilinear
+    call_shapes: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+
+    def counted(*args, **kwargs):
+        call_shapes.append((tuple(args[0].shape), tuple(args[1].shape)))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(loader_module, "sample_xy_maps_bilinear", counted)
+
+    samples, images, coords, valids = loader.build_sample(0, sample_mode="flat")
+
+    assert call_shapes
+    assert any(shape[0][0] == len(loader.strip_z_offsets) for shape in call_shapes)
+    assert len(samples) == len(loader.strip_z_offsets)
+    assert images.shape[0] == len(loader.strip_z_offsets)
+    assert coords.shape[0] == len(loader.strip_z_offsets)
+    assert valids.shape[0] == len(loader.strip_z_offsets)
+
+
+def test_deferred_batch_image_augmentation_matches_inline_batch(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["augment_enabled"] = True
+    raw["augment_device"] = "cpu"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    loader = _make_loader(load_config(config_path))
+    inline = loader.load_batch(0, batch_size=1, sample_mode="flat", apply_image_augmentation=True)
+    deferred_base = loader.load_batch(0, batch_size=1, sample_mode="flat", apply_image_augmentation=False)
+    deferred = loader.apply_batch_image_augmentation(deferred_base)
+
+    assert len(deferred_base.augmentation_params) == deferred_base.images.shape[0] * deferred_base.images.shape[1]
+    np.testing.assert_allclose(deferred.images, inline.images)
+    np.testing.assert_array_equal(deferred.valid_mask, inline.valid_mask)
+
+
+def test_batched_value_blur_matches_single_patch_path() -> None:
+    images = np.arange(2 * 7 * 7, dtype=np.float32).reshape(2, 7, 7)
+    valid = np.ones((2, 7, 7), dtype=bool)
+    params = (
+        FiberStripAugmentParams(blur_sigma=0.5),
+        FiberStripAugmentParams(blur_sigma=1.25),
+    )
+
+    batch_images, batch_valid = apply_value_augmentation_batch(
+        images,
+        valid,
+        params,
+        device=torch.device("cpu"),
+    )
+    single_images = []
+    for index, param in enumerate(params):
+        image, single_valid = apply_value_augmentation(
+            images[index],
+            valid[index],
+            param,
+            device=torch.device("cpu"),
+        )
+        single_images.append(image)
+        assert torch.equal(single_valid, batch_valid[index])
+
+    torch.testing.assert_close(batch_images, torch.stack(single_images), rtol=1.0e-5, atol=1.0e-5)
+
+
+def test_training_rejects_batch_size_control_point_mismatch(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=2)
+    loader_config = load_config(config_path)
+    training = FiberStripTrainingConfig(train_control_points_per_step=3)
+
+    with pytest.raises(ValueError, match="control_points_per_step.*batch_size"):
+        _validate_training_batch_config(training, loader_config)
+
+
+def test_standard_example_training_disables_contrastive_embedding_by_default() -> None:
+    config_path = (
+        Path(__file__).resolve().parents[2]
+        / "src"
+        / "vesuvius"
+        / "neural_tracing"
+        / "fiber_trace_2d"
+        / "configs"
+        / "loader_example.json"
+    )
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    training = _training_config_from_raw(raw)
+
+    assert training.presence_enabled is True
+    assert training.top_view_enabled is True
+    assert training.contrastive_enabled is False
+    assert _embedding_channel_count(training) == 0
+
+
+def test_top_view_scalar_channel_count_is_configured_only_when_enabled() -> None:
+    assert _top_view_scalar_channel_count(FiberStripTrainingConfig(top_view_enabled=False)) == 0
+    assert _top_view_scalar_channel_count(FiberStripTrainingConfig(top_view_enabled=True)) == 1
+
+
+def test_top_distance_transform_supervision_samples_full_normal_line() -> None:
+    sample = SimpleNamespace(
+        line_xy=np.asarray([[1.0, 3.0], [3.0, 3.0], [5.0, 3.0]], dtype=np.float32),
+        control_point_xy=np.asarray([3.0, 3.0], dtype=np.float32),
+    )
+    valid = np.ones((1, 7, 7), dtype=bool)
+
+    supervision = build_top_distance_transform_supervision(
+        [sample],
+        valid,
+        radius_px=2.0,
+        device=torch.device("cpu"),
+    )
+
+    rows = {
+        (int(y), int(x)): float(target)
+        for y, x, target in zip(
+            supervision.y.cpu().numpy().tolist(),
+            supervision.x.cpu().numpy().tolist(),
+            supervision.target.cpu().numpy().tolist(),
+            strict=True,
+        )
+    }
+    assert rows[(3, 3)] == pytest.approx(1.0)
+    assert rows[(2, 3)] == pytest.approx(0.5)
+    assert rows[(1, 3)] == pytest.approx(0.0)
+    assert rows[(0, 3)] == pytest.approx(0.0)
+    assert rows[(6, 3)] == pytest.approx(0.0)
+
+
+def test_disabled_contrastive_ignores_stale_embedding_channels() -> None:
+    training = FiberStripTrainingConfig(
+        presence_enabled=True,
+        contrastive_enabled=False,
+        contrastive_embedding_channels=16,
+    )
+    model = FiberStripDirectionNet(
+        FiberStripDirectionModelConfig(
+            in_channels=1,
+            hidden_channels=4,
+            depth=1,
+            presence_channels=1,
+            embedding_channels=_embedding_channel_count(training),
+        )
+    )
+
+    output = model(torch.zeros((1, 1, 3, 3), dtype=torch.float32))
+
+    assert output.shape == (1, 3, 3, 3)
+    assert embedding_output(output, presence_channels=1).shape[1] == 0
+
+
+def test_enabled_contrastive_uses_configured_embedding_channels() -> None:
+    training = FiberStripTrainingConfig(
+        presence_enabled=True,
+        contrastive_enabled=True,
+        contrastive_embedding_channels=16,
+    )
+    model = FiberStripDirectionNet(
+        FiberStripDirectionModelConfig(
+            in_channels=1,
+            hidden_channels=4,
+            depth=1,
+            presence_channels=1,
+            embedding_channels=_embedding_channel_count(training),
+        )
+    )
+
+    output = model(torch.zeros((1, 1, 3, 3), dtype=torch.float32))
+
+    assert output.shape == (1, 19, 3, 3)
+    assert embedding_output(output, presence_channels=1).shape[1] == 16
+
+
+def test_top_view_enabled_model_has_direction_plus_dt_channels() -> None:
+    training = FiberStripTrainingConfig(top_view_enabled=True)
+    model = FiberStripDirectionNet(
+        FiberStripDirectionModelConfig(
+            in_channels=1,
+            hidden_channels=4,
+            depth=1,
+            presence_channels=_top_view_scalar_channel_count(training),
+            embedding_channels=0,
+        )
+    )
+
+    output = model(torch.zeros((1, 1, 5, 5), dtype=torch.float32))
+
+    assert direction_output(output).shape == (1, 2, 5, 5)
+    assert presence_output(output, presence_channels=1).shape == (1, 1, 5, 5)
+
+
+def test_training_batch_pipeline_preserves_step_sample_order() -> None:
+    class FakeLoader:
+        def __init__(self) -> None:
+            self.starts: list[int] = []
+
+        def load_batch(self, start_sample_index: int, **kwargs):
+            self.starts.append(int(start_sample_index))
+            return SimpleNamespace(start=int(start_sample_index))
+
+    training = FiberStripTrainingConfig(
+        train_control_points_per_step=2,
+        max_sample_index=0,
+        pipeline_depth=3,
+    )
+    loader = FakeLoader()
+    with _TrainingBatchPipeline(
+        loader,  # type: ignore[arg-type]
+        training,
+        sample_mode="random",
+        start_step=1,
+        max_step=3,
+        profile_enabled=False,
+        apply_image_augmentation=False,
+    ) as pipeline:
+        first, _ = pipeline.next()
+        second, _ = pipeline.next()
+        third, _ = pipeline.next()
+
+    assert [first.raw_start_sample_index, second.raw_start_sample_index, third.raw_start_sample_index] == [0, 2, 4]
+    assert [first.batch.start, second.batch.start, third.batch.start] == [0, 2, 4]
+    assert sorted(loader.starts) == [0, 2, 4]
+
+
+def test_identity_equivalent_augment_vis_entries_match(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["augment_enabled"] = True
+    raw["augment_device"] = "cpu"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+    lower_entries, _ = limit_augmentation_rows(loader.config.augment, sample_index=0)
+    params_by_name = dict(lower_entries)
+
+    outputs = {}
+    for name in ("unaugmented", "noise_min", "blur_min"):
+        _, image, valid, line = loader.build_augmented_center_strip_patch(
+            0,
+            params_by_name[name],
+            device=torch.device("cpu"),
+        )
+        outputs[name] = (image, valid, line)
+
+    base_image, base_valid, base_line = outputs["unaugmented"]
+    for name in ("noise_min", "blur_min"):
+        image, valid, line = outputs[name]
+        assert np.allclose(image, base_image), name
+        assert np.array_equal(valid, base_valid), name
+        assert np.allclose(line, base_line), name
+
+
+def test_augment_contact_sheet_export_writes_jpg(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["augment_enabled"] = True
+    raw["augment_device"] = "cpu"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+    out = tmp_path / "aug_out"
+
+    _export_augment_contact_sheet(loader, 0, out)
+
+    output = capsys.readouterr().out
+    assert "augment-vis timings" not in output
+    assert "output timings" not in output
+    assert (out / "augment_contact_sheet.jpg").is_file()
+    assert (out / "augment_summary.txt").is_file()
+    from PIL import Image
+
+    with Image.open(out / "augment_contact_sheet.jpg") as image:
+        assert image.size[0] == 3 * 15
+        assert image.size[1] > 3 * 3
+        arr = np.asarray(image)
+        assert arr[:2, :8].max() > 0
+        cyan_dominant = (arr[:, :, 1] > arr[:, :, 0] + 40) & (arr[:, :, 2] > arr[:, :, 0] + 40)
+        assert np.count_nonzero(cyan_dominant) > 0
+    summary = (out / "augment_summary.txt").read_text(encoding="utf-8")
+    assert "layout=row 1: lower limits; row 2: upper limits; row 3: random combined" in summary
+    assert "cp_xy=" in summary
+    assert "rotate_min" in summary
+    assert "rotate_max" in summary
+    assert "blur_max" in summary
+    assert "scale_max" in summary
+    assert "smooth_max" in summary
+    assert "gamma_max" in summary
+    assert "combined_00" in summary
+
+
+def test_augment_contact_sheet_profile_prints_cold_and_warm_tables(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["augment_enabled"] = True
+    raw["augment_device"] = "cpu"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+    out = tmp_path / "aug_profile_out"
+
+    _export_augment_contact_sheet(loader, 0, out, profile=True)
+
+    output = capsys.readouterr().out
+    assert "fiber_trace_2d augment-vis timings pass=1 cold-ish in ms" in output
+    assert "fiber_trace_2d augment-vis timings pass=2 warm in ms" in output
+    assert "total/no-first" in output
+    assert "avg/no-first" in output
+    assert (out / "augment_contact_sheet.jpg").is_file()
+
+
+def test_deterministic_sample_index_independent_of_batch_size(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    config_a = load_config(config_path)
+    config_b = load_config(config_path)
+    loader_a = _make_loader(config_a)
+    loader_b = _make_loader(config_b)
+
+    a = [loader_a.descriptor_for_sample_index(i)[2] for i in range(8)]
+    b = [loader_b.descriptor_for_sample_index(i)[2] for i in range(8)]
+    assert a == b
+
+
+def test_random_sample_mode_covers_all_control_points_before_repeating(tmp_path: Path) -> None:
+    config = load_config(_write_config(tmp_path, batch_size=1))
+    loader = _make_loader(config)
+
+    first_pass = [loader._random_flat_index(i) for i in range(loader.sample_count)]
+    second_pass = [
+        loader._random_flat_index(i)
+        for i in range(loader.sample_count, loader.sample_count * 2)
+    ]
+    again = [loader._random_flat_index(i) for i in range(loader.sample_count)]
+
+    assert sorted(first_pass) == list(range(loader.sample_count))
+    assert sorted(second_pass) == list(range(loader.sample_count))
+    assert first_pass == again
+
+
+def test_flat_sample_mode_iterates_control_points_sequentially_for_debug(tmp_path: Path) -> None:
+    config = load_config(_write_config(tmp_path, batch_size=1))
+    loader = _make_loader(config)
+
+    indices = [loader.descriptor_for_sample_index(i, sample_mode="flat")[2] for i in range(5)]
+
+    assert indices == [0, 1, 2, 0, 1]
+
+
+def test_prefetch_uses_dependency_chunks_and_cache_markers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = load_config(_write_config(tmp_path, batch_size=1))
+    loader = _make_loader(config)
+
+    class Store:
+        def __init__(self, root: Path) -> None:
+            self.root = root
+            self.calls: list[str] = []
+
+    store = Store(tmp_path / "cache")
+    store.root.mkdir(parents=True)
+    (store.root / "hit.bin").write_bytes(b"cached")
+    (store.root / "known_missing.empty").write_bytes(b"")
+
+    def downloader(request: ZarrChunkRequest) -> bytes | None:
+        store.calls.append(request.key)
+        if request.key == "new_missing":
+            return None
+        return b"\x01\x02"
+
+    def request(key: str) -> ZarrChunkRequest:
+        return ZarrChunkRequest(
+            store=store,
+            store_identity="test",
+            key=key,
+            cache_path=store.root / f"{key}.bin",
+            empty_path=store.root / f"{key}.empty",
+            remote_url=f"https://example.invalid/{key}",
+            cache_payload_format="source_bytes",
+            downloader=downloader,
+        )
+
+    def fake_chunk_requests(coords, valid):
+        del coords, valid
+        return [
+            request("hit"),
+            request("known_missing"),
+            request("download"),
+            request("new_missing"),
+            request("download"),
+        ]
+
+    def forbidden_prefetch(coords, valid):
+        del coords, valid
+        raise AssertionError("loader prefetch must not call sampler.prefetch_coords")
+
+    monkeypatch.setattr(loader.records[0].sampler, "chunk_requests_for_coords", fake_chunk_requests)
+    monkeypatch.setattr(loader.records[0].sampler, "prefetch_coords", forbidden_prefetch)
+
+    summary = loader.prefetch(0, 1, workers=8)
+
+    assert sorted(store.calls) == ["download", "new_missing"]
+    assert summary["patches"] == 3
+    assert summary["generated"] == 4
+    assert summary["cache_hits"] == 1
+    assert summary["known_missing"] == 1
+    assert summary["newly_missing"] == 1
+    assert summary["missing"] == 2
+    assert summary["downloaded"] == 1
+    assert summary["queued_for_download"] == 2
+    assert summary["download_done"] == 2
+    assert summary["bytes"] == 2
+    assert summary["errors"] == 0
+    assert summary["workers"] == 8
+    assert summary["producer_workers"] == 1
+    assert (store.root / "new_missing.empty").is_file()
+    assert (store.root / "new_missing.empty").read_bytes() == b""
+    assert (store.root / "download.bin").read_bytes() == b"\x01\x02"
+    output = capsys.readouterr().out
+    assert "samples[" in output
+    assert "downloads[" in output
+    assert "idx=1" in output
+    assert "samplers=1" in output
+
+
+def test_prefetch_idx_requires_cache_complete_prefix(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["prefetch_sampler_workers"] = 1
+    raw["volume_cache_retry_seconds"] = 0.001
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+
+    class Store:
+        def __init__(self, root: Path) -> None:
+            self.root = root
+
+    store = Store(tmp_path / "cache")
+    store.root.mkdir(parents=True)
+    (store.root / "hit.bin").write_bytes(b"cached")
+    call_count = 0
+
+    def failing_downloader(request: ZarrChunkRequest) -> bytes:
+        del request
+        raise RuntimeError("network failed")
+
+    def request(key: str) -> ZarrChunkRequest:
+        return ZarrChunkRequest(
+            store=store,
+            store_identity="idx-test",
+            key=key,
+            cache_path=store.root / f"{key}.bin",
+            empty_path=store.root / f"{key}.empty",
+            remote_url=f"https://example.invalid/{key}",
+            cache_payload_format="source_bytes",
+            downloader=failing_downloader,
+        )
+
+    def fake_chunk_requests(coords, valid):
+        nonlocal call_count
+        del coords, valid
+        call_count += 1
+        return [request("error" if call_count <= len(loader.strip_z_offsets) else "hit")]
+
+    monkeypatch.setattr(loader.records[0].sampler, "chunk_requests_for_coords", fake_chunk_requests)
+
+    summary = loader.prefetch(0, 2, workers=1)
+
+    assert summary["errors"] == 1
+    assert summary["cache_hits"] == 1
+    assert summary["max_exclusive_sample_index"] == 0
+    output = capsys.readouterr().out
+    assert "idx=0" in output
+    assert "idx=1" not in output
+
+
+def test_prefetch_idx_waits_for_all_requests_in_stream_sample(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["prefetch_sampler_workers"] = 1
+    raw["strip_z_offset_count"] = 1
+    raw["volume_cache_retry_seconds"] = 0.001
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+
+    class Store:
+        def __init__(self, root: Path) -> None:
+            self.root = root
+
+    store = Store(tmp_path / "cache")
+    store.root.mkdir(parents=True)
+    (store.root / "hit_0.bin").write_bytes(b"cached")
+    (store.root / "hit_1.bin").write_bytes(b"cached")
+    call_count = 0
+
+    def failing_downloader(request: ZarrChunkRequest) -> bytes:
+        del request
+        raise RuntimeError("network failed")
+
+    def request(key: str) -> ZarrChunkRequest:
+        return ZarrChunkRequest(
+            store=store,
+            store_identity="idx-close-test",
+            key=key,
+            cache_path=store.root / f"{key}.bin",
+            empty_path=store.root / f"{key}.empty",
+            remote_url=f"https://example.invalid/{key}",
+            cache_payload_format="source_bytes",
+            downloader=failing_downloader,
+        )
+
+    def fake_chunk_requests(coords, valid):
+        nonlocal call_count
+        del coords, valid
+        call_count += 1
+        if call_count == 1:
+            return [request("hit_0"), request("error")]
+        return [request("hit_1")]
+
+    monkeypatch.setattr(loader.records[0].sampler, "chunk_requests_for_coords", fake_chunk_requests)
+
+    summary = loader.prefetch(0, 2, workers=1)
+
+    assert summary["errors"] == 1
+    assert summary["cache_hits"] == 2
+    assert summary["max_exclusive_sample_index"] == 0
+
+
+def test_prefetch_sampler_workers_limits_dependency_producers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["prefetch_workers"] = 8
+    raw["prefetch_sampler_workers"] = 2
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+    monkeypatch.setattr(loader.records[0].sampler, "chunk_requests_for_coords", lambda coords, valid: [])
+
+    summary = loader.prefetch(0, 3)
+
+    assert summary["workers"] == 8
+    assert summary["producer_workers"] == 2
+
+
+def test_prefetch_limits_and_restores_torch_cpu_threads(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["prefetch_sampler_workers"] = 4
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+    thread_state = {"value": 32}
+    calls: list[int] = []
+
+    def get_num_threads() -> int:
+        return int(thread_state["value"])
+
+    def set_num_threads(value: int) -> None:
+        thread_state["value"] = int(value)
+        calls.append(int(value))
+
+    monkeypatch.setattr(loader_module.torch, "get_num_threads", get_num_threads)
+    monkeypatch.setattr(loader_module.torch, "set_num_threads", set_num_threads)
+    monkeypatch.setattr(loader.records[0].sampler, "chunk_requests_for_coords", lambda coords, valid: [])
+
+    summary = loader.prefetch(0, 1, workers=1)
+
+    assert calls == [1, 32]
+    assert thread_state["value"] == 32
+    assert summary["producer_workers"] == 1
+
+
+def test_prefetch_prioritizes_pending_downloads_by_earliest_sample(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["prefetch_sampler_workers"] = 2
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+
+    class Store:
+        def __init__(self, root: Path) -> None:
+            self.root = root
+            self.calls: list[str] = []
+
+    store = Store(tmp_path / "cache")
+    store.root.mkdir(parents=True)
+    sample_one_requests_seen = threading.Event()
+
+    def downloader(request: ZarrChunkRequest) -> bytes:
+        store.calls.append(request.key)
+        return request.key.encode("utf-8")
+
+    def request(key: str) -> ZarrChunkRequest:
+        return ZarrChunkRequest(
+            store=store,
+            store_identity="priority",
+            key=key,
+            cache_path=store.root / f"{key}.bin",
+            empty_path=store.root / f"{key}.empty",
+            remote_url=f"https://example.invalid/{key}",
+            cache_payload_format="source_bytes",
+            downloader=downloader,
+        )
+
+    class Sampler:
+        def chunk_requests_for_coords(self, coords, valid):
+            del valid
+            sample_index = int(coords[0, 0, 0])
+            if sample_index == 0:
+                return [request("sample_0")]
+            sample_one_requests_seen.set()
+            return [request("sample_1_active"), request("sample_1_pending")]
+
+    sampler = Sampler()
+
+    def build_strip_source(sample_index: int, **kwargs):
+        del kwargs
+        if int(sample_index) == 0:
+            sample_one_requests_seen.wait(timeout=2.0)
+        return SimpleNamespace(sample_index=int(sample_index), record=SimpleNamespace(sampler=sampler))
+
+    def prefetch_envelope_coords_from_source(source, offset_index):
+        del offset_index
+        coords = np.asarray([[[float(source.sample_index), 0.0, 0.0]]], dtype=np.float32)
+        valid = np.ones((1, 1), dtype=bool)
+        return coords, valid
+
+    monkeypatch.setattr(loader, "build_strip_source", build_strip_source)
+    monkeypatch.setattr(loader, "_prefetch_envelope_coords_from_source", prefetch_envelope_coords_from_source)
+
+    summary = loader.prefetch(0, 2, workers=1)
+
+    assert store.calls == ["sample_0", "sample_1_active", "sample_1_pending"]
+    assert summary["downloaded"] == 3
+    assert summary["max_exclusive_sample_index"] == 2
+
+
+def test_prefetch_skips_invalid_sample_construction(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    loader = _make_loader(load_config(_write_config(tmp_path, batch_size=2)))
+    original_build_strip_source = loader.build_strip_source
+
+    def build_strip_source(sample_index: int, **kwargs):
+        if int(sample_index) == 0:
+            raise ValueError("Lasagna grad_mag sample is zero at fiber line point")
+        return original_build_strip_source(sample_index, **kwargs)
+
+    monkeypatch.setattr(loader, "build_strip_source", build_strip_source)
+    monkeypatch.setattr(loader.records[0].sampler, "chunk_requests_for_coords", lambda coords, valid: [])
+
+    summary = loader.prefetch(0, 2, workers=2)
+
+    assert summary["samples"] == 2
+    assert summary["skipped_samples"] == 1
+    assert summary["patches"] == 3
+    assert "grad_mag sample is zero" in summary["first_sample_skip"]
+    output = capsys.readouterr().out
+    assert "skipped=1" in output
+    assert "first_skip" not in output
+
+
+def test_load_batch_skips_invalid_training_samples(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config_path = _write_config(tmp_path, batch_size=2)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["loader_workers"] = 1
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+    original_prepare_sample = loader._prepare_sample
+    attempted: list[int] = []
+
+    def prepare_sample(sample_index: int, **kwargs):
+        attempted.append(int(sample_index))
+        if int(sample_index) == 0:
+            raise ValueError("Lasagna grad_mag sample is zero at fiber line point")
+        return original_prepare_sample(sample_index, **kwargs)
+
+    monkeypatch.setattr(loader, "_prepare_sample", prepare_sample)
+
+    batch = loader.load_batch(0, batch_size=2)
+
+    assert attempted[:3] == [0, 1, 2]
+    assert batch.images.shape[0] == 2
+    assert batch.coords_zyx.shape[0] == 2
+    assert loader._load_batch_skipped_samples == 1
+
+
+def test_load_batch_wraps_through_sample_index_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["loader_workers"] = 1
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+    attempted: list[int] = []
+
+    original_prepare_sample = loader._prepare_sample
+
+    def prepare_sample(
+        sample_index: int,
+        *,
+        sample_mode: str = "random",
+        profile=None,
+        **kwargs,
+    ):
+        attempted.append(int(sample_index))
+        return original_prepare_sample(sample_index, sample_mode=sample_mode, profile=profile, **kwargs)
+
+    monkeypatch.setattr(loader, "_prepare_sample", prepare_sample)
+
+    batch = loader.load_batch(1, batch_size=4, sample_index_limit=2)
+
+    assert attempted == [1, 0, 1, 0]
+    assert batch.images.shape == (4, len(loader.strip_z_offsets), 1, 3, 3)
+
+
+def test_bounded_sample_reuse_advances_augmentation_seed(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["augment_enabled"] = True
+    raw["augment_device"] = "cpu"
+    raw["strip_z_offset_count"] = 1
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+
+    first = loader.load_batch(
+        0,
+        batch_size=1,
+        sample_index_limit=1,
+        apply_image_augmentation=False,
+        include_coords=False,
+    )
+    second = loader.load_batch(
+        1,
+        batch_size=1,
+        sample_index_limit=1,
+        apply_image_augmentation=False,
+        include_coords=False,
+    )
+
+    assert first.control_point_indices.tolist() == second.control_point_indices.tolist()
+    assert first.augmentation_params[0] is not None
+    assert second.augmentation_params[0] is not None
+    assert first.augmentation_params[0] != second.augmentation_params[0]
+
+
+def test_parallel_load_batch_preserves_output_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config_path = _write_config(tmp_path, batch_size=3)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["loader_workers"] = 4
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+    original_prepare_sample = loader._prepare_sample
+
+    def prepare_sample(
+        sample_index: int,
+        *,
+        sample_mode: str = "random",
+        profile=None,
+        **kwargs,
+    ):
+        if int(sample_index) == 0:
+            loader_module.time.sleep(0.02)
+        return original_prepare_sample(sample_index, sample_mode=sample_mode, profile=profile, **kwargs)
+
+    monkeypatch.setattr(loader, "_prepare_sample", prepare_sample)
+
+    batch = loader.load_batch(0, batch_size=3)
+
+    assert batch.control_point_indices.tolist() == [0, 1, 2]
+
+
+def test_parallel_load_batch_reuses_executor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config_path = _write_config(tmp_path, batch_size=2)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["loader_workers"] = 2
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+
+    def build_sample(
+        sample_index: int,
+        *,
+        sample_mode: str = "random",
+        profile=None,
+        apply_image_augmentation: bool = True,
+    ):
+        del sample_mode
+        del profile
+        del apply_image_augmentation
+        sample = SimpleNamespace(
+            record_index=0,
+            control_point_index=int(sample_index),
+            fiber_path=f"fiber_{sample_index}.json",
+        )
+        image = np.full((len(loader.strip_z_offsets), 3, 3), float(sample_index), dtype=np.float32)
+        coords = np.zeros((len(loader.strip_z_offsets), 3, 3, 3), dtype=np.float32)
+        valid = np.ones((len(loader.strip_z_offsets), 3, 3), dtype=bool)
+        return [sample], image, coords, valid
+
+    monkeypatch.setattr(loader, "build_sample", build_sample)
+
+    loader.load_batch(0, batch_size=2)
+    first_executor = loader._loader_executor
+    loader.load_batch(2, batch_size=2)
+
+    assert first_executor is not None
+    assert loader._loader_executor is first_executor
+    loader.close()
+    assert loader._loader_executor is None
+
+
+def test_random_pass_order_is_cached_before_parallel_worker_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=2)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["loader_workers"] = 2
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+    original_ensure = loader._ensure_random_pass_order
+    calls: list[int] = []
+
+    def ensure_random_pass_order(pass_index: int):
+        calls.append(int(pass_index))
+        return original_ensure(pass_index)
+
+    monkeypatch.setattr(loader, "_ensure_random_pass_order", ensure_random_pass_order)
+
+    def build_sample(
+        sample_index: int,
+        *,
+        sample_mode: str = "random",
+        profile=None,
+        apply_image_augmentation: bool = True,
+    ):
+        del profile
+        del apply_image_augmentation
+        record, record_index, control_index = loader.descriptor_for_sample_index(
+            sample_index, sample_mode=sample_mode
+        )
+        del record
+        sample = SimpleNamespace(
+            record_index=record_index,
+            control_point_index=control_index,
+            fiber_path=f"fiber_{control_index}.json",
+        )
+        image = np.full((len(loader.strip_z_offsets), 3, 3), float(control_index), dtype=np.float32)
+        coords = np.zeros((len(loader.strip_z_offsets), 3, 3, 3), dtype=np.float32)
+        valid = np.ones((len(loader.strip_z_offsets), 3, 3), dtype=bool)
+        return [sample], image, coords, valid
+
+    monkeypatch.setattr(loader, "build_sample", build_sample)
+
+    loader.load_batch(0, batch_size=2)
+
+    assert calls
+    assert 0 in loader._random_pass_cache
+    assert loader._random_pass_cache[0].shape[0] == loader.sample_count
+
+
+class _RecordingCoordinateSampler(NumpyZarrCoordinateSampler):
+    def __init__(self, array, *, level_spacing_base: float) -> None:
+        super().__init__(array, level_spacing_base=level_spacing_base)
+        self.sample_coords_calls: list[tuple[np.ndarray, np.ndarray]] = []
+        self.sample_coord_batch_calls: list[tuple[np.ndarray, np.ndarray]] = []
+        self.chunk_request_calls: list[tuple[np.ndarray, np.ndarray]] = []
+        self.prefetch_calls: list[tuple[np.ndarray, np.ndarray]] = []
+
+    def sample_coords(self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray):
+        self.sample_coords_calls.append((np.array(coords_zyx_base, copy=True), np.array(valid_mask, copy=True)))
+        return super().sample_coords(coords_zyx_base, valid_mask)
+
+    def sample_coord_batch(self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray):
+        self.sample_coord_batch_calls.append(
+            (np.array(coords_zyx_base, copy=True), np.array(valid_mask, copy=True))
+        )
+        return super().sample_coord_batch(coords_zyx_base, valid_mask)
+
+    def chunk_requests_for_coords(self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray):
+        self.chunk_request_calls.append((np.array(coords_zyx_base, copy=True), np.array(valid_mask, copy=True)))
+        coords = np.asarray(coords_zyx_base, dtype=np.float64)
+        valid = np.asarray(valid_mask, dtype=bool) & np.isfinite(coords).all(axis=-1)
+        if not bool(valid.any()):
+            return []
+        chunk_idx = np.floor(coords[valid] / 16.0).astype(np.int64)
+        unique = np.unique(chunk_idx, axis=0)
+        return [
+            ZarrChunkRequest(store={}, store_identity="recording", key=f"{z}.{y}.{x}")
+            for z, y, x in unique.tolist()
+        ]
+
+    def prefetch_coords(self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray):
+        self.prefetch_calls.append((np.array(coords_zyx_base, copy=True), np.array(valid_mask, copy=True)))
+        return super().prefetch_coords(coords_zyx_base, valid_mask)
+
+
+def _request_keys(requests: list[ZarrChunkRequest]) -> set[tuple[str, str]]:
+    return {(request.store_identity, request.key) for request in requests}
+
+
+def test_prefetch_envelope_covers_augmented_loading_dependencies(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    fiber = _write_fiber(
+        tmp_path / "long_fiber.json",
+        points=[[float(x), 24.0, 24.0] for x in range(8, 41, 4)],
+        control_points=[[24.0, 24.0, 24.0]],
+    )
+    raw["datasets"][0]["fiber_paths"] = [str(fiber)]
+    raw["patch_shape_hw"] = [5, 5]
+    raw["strip_z_offset_count"] = 2
+    raw["augment_enabled"] = True
+    raw["augment_device"] = "cpu"
+    raw["augment_shift_x"] = 1.0
+    raw["augment_shift_y"] = 1.0
+    raw["augment_rotation_degrees"] = 12.0
+    raw["augment_shear_x"] = 0.2
+    raw["augment_shear_y"] = 0.15
+    raw["augment_scale_min"] = 0.95
+    raw["augment_scale_max"] = 1.05
+    raw["augment_smooth_offset"] = 0.0
+    raw["augment_brightness"] = 0.0
+    raw["augment_contrast_min"] = 1.0
+    raw["augment_contrast_max"] = 1.0
+    raw["augment_gamma_min"] = 1.0
+    raw["augment_gamma_max"] = 1.0
+    raw["augment_noise_std"] = 0.0
+    raw["augment_blur_sigma"] = 0.0
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    samplers: list[_RecordingCoordinateSampler] = []
+
+    def factory(**kwargs):
+        sampler = _RecordingCoordinateSampler(
+            kwargs["array"],
+            level_spacing_base=kwargs["level_spacing_base"],
+        )
+        samplers.append(sampler)
+        return sampler
+
+    loader = FiberStrip2DLoader(load_config(config_path), sampler_factory=factory)
+    sample_index = 4
+
+    prefetch_requests = loader.chunk_requests_for_sample_index(sample_index)
+    loader.build_sample(sample_index)
+
+    sampler = samplers[0]
+    assert len(sampler.chunk_request_calls) == 2
+    assert len(sampler.sample_coord_batch_calls) == 1
+    assert len(sampler.sample_coords_calls) == 1
+    prefetch_keys = _request_keys(prefetch_requests)
+    assert prefetch_keys
+    for load_coords, load_valid in sampler.sample_coord_batch_calls:
+        assert load_coords.shape[:3] == (2, 5, 5)
+        assert load_valid.shape == (2, 5, 5)
+        load_keys = _request_keys(sampler.chunk_requests_for_coords(load_coords, load_valid))
+        assert load_keys <= prefetch_keys
+
+
+def test_prefetch_requests_can_include_top_view_dependencies(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["strip_z_offset_count"] = 2
+    raw["augment_device"] = "cpu"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    samplers: list[_RecordingCoordinateSampler] = []
+
+    def factory(**kwargs):
+        sampler = _RecordingCoordinateSampler(
+            kwargs["array"],
+            level_spacing_base=kwargs["level_spacing_base"],
+        )
+        samplers.append(sampler)
+        return sampler
+
+    loader = FiberStrip2DLoader(load_config(config_path), sampler_factory=factory)
+
+    side_requests = loader.chunk_requests_for_sample_index(0)
+    side_call_count = len(samplers[0].chunk_request_calls)
+    top_requests = loader.chunk_requests_for_sample_index(0, include_top_view=True)
+
+    assert side_requests
+    assert top_requests
+    assert side_call_count == 2
+    assert len(samplers[0].chunk_request_calls) == 5
+    top_coords, top_valid = samplers[0].chunk_request_calls[-1]
+    assert top_coords.ndim == 3
+    assert top_coords.shape[-1] == 3
+    assert top_coords.shape[:2] == top_valid.shape
+    assert top_coords.shape[0] >= 3
+    assert top_coords.shape[1] >= 3
+
+
+def test_load_top_batch_for_batch_returns_one_patch_per_control_point(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=2)
+    loader = _make_loader(load_config(config_path))
+    side_batch = loader.load_batch(0, batch_size=2, sample_mode="flat")
+
+    top_batch = loader.load_top_batch_for_batch(side_batch)
+
+    assert top_batch.images.shape == (2, 1, 1, 3, 3)
+    assert top_batch.valid_mask.shape == (2, 1, 3, 3)
+    assert len(top_batch.samples) == 2
+    assert top_batch.control_point_indices.tolist() == side_batch.control_point_indices.tolist()
+    assert tuple(float(v) for v in top_batch.strip_z_offsets.tolist()) == (0.0,)
+    for sample in top_batch.samples:
+        assert np.asarray(sample.line_xy).shape[1] == 2
+        np.testing.assert_allclose(sample.control_point_xy, np.asarray([1.0, 1.0], dtype=np.float32))
+
+
+def test_load_top_batch_for_batch_uses_grouped_coordinate_batch_sampling(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=2)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["strip_z_offset_count"] = 1
+    raw["augment_device"] = "cpu"
+    raw["loader_workers"] = 1
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    samplers: list[_RecordingCoordinateSampler] = []
+
+    def factory(**kwargs):
+        sampler = _RecordingCoordinateSampler(
+            kwargs["array"],
+            level_spacing_base=kwargs["level_spacing_base"],
+        )
+        samplers.append(sampler)
+        return sampler
+
+    loader = FiberStrip2DLoader(load_config(config_path), sampler_factory=factory)
+    side_batch = loader.load_batch(0, batch_size=2, sample_mode="flat")
+    sampler = samplers[0]
+    side_call_count = len(sampler.sample_coord_batch_calls)
+    side_low_level_call_count = len(sampler.sample_coords_calls)
+
+    top_batch = loader.load_top_batch_for_batch(side_batch)
+
+    assert top_batch.images.shape == (2, 1, 1, 3, 3)
+    assert len(sampler.sample_coord_batch_calls) == side_call_count + 1
+    assert len(sampler.sample_coords_calls) == side_low_level_call_count + 1
+    top_coords, top_valid = sampler.sample_coord_batch_calls[-1]
+    assert top_coords.shape == (2, 3, 3, 3)
+    assert top_valid.shape == (2, 3, 3)
+
+
+def test_training_load_does_not_call_numpy_strip_builder(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import vesuvius.neural_tracing.fiber_trace_2d.loader as loader_module
+    import vesuvius.neural_tracing.fiber_trace_2d.strip_geometry as strip_geometry_module
+
+    config = load_config(_write_config(tmp_path, batch_size=1))
+    loader = _make_loader(config)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("training loader must use shared torch source path")
+
+    assert not hasattr(loader_module, "build_side_strip_patch_grid_from_line_window")
+    monkeypatch.setattr(strip_geometry_module, "build_side_strip_patch_grid_from_line_window", forbidden)
+
+    batch = loader.load_batch(0)
+
+    assert batch.images.shape == (1, 3, 1, 3, 3)
+
+
+def test_training_prefetch_maps_steps_to_sample_count(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    run_path = tmp_path / "runs"
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["training"] = {
+        "run_path": str(run_path),
+        "run_name": "prefetch",
+        "max_steps": 7,
+        "control_points_per_step": 3,
+        "tensorboard_enabled": False,
+    }
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    calls: list[tuple[int, int, str, int]] = []
+
+    def fake_prefetch(
+        self,
+        start_sample_index,
+        sample_count,
+        *,
+        workers=None,
+        sample_mode="random",
+        sample_index_limit=None,
+        include_top_view=False,
+    ):
+        del self, workers, include_top_view
+        calls.append((int(start_sample_index), int(sample_count), str(sample_mode), int(sample_index_limit or 0)))
+        return {
+            "generated": 11,
+            "missing": 5,
+            "downloaded": 5,
+            "bytes": 123,
+            "errors": 0,
+            "workers": 1,
+        }
+
+    monkeypatch.setattr(FiberStrip2DLoader, "prefetch", fake_prefetch)
+
+    summary = prefetch_training(config_path, prefetch_steps=3, sampler_factory=_test_sampler_factory)
+
+    assert calls == [(0, 9, "random", 0)]
+    assert summary["generated"] == 11
+    assert not run_path.exists()
+
+    calls.clear()
+    prefetch_training(
+        config_path,
+        prefetch_steps=None,
+        prefetch_start_step=2,
+        sampler_factory=_test_sampler_factory,
+    )
+
+    assert calls == [(3, 21, "random", 0)]
+    assert not run_path.exists()
+
+    calls.clear()
+    prefetch_training(
+        config_path,
+        prefetch_steps=0,
+        prefetch_start_step=2,
+        sampler_factory=_test_sampler_factory,
+    )
+
+    assert calls == [(0, 3, "random", 0)]
+
+
+def test_training_prefetch_respects_max_sample_index_limit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["training"] = {
+        "max_steps": 7,
+        "max_sample_index": 2,
+        "control_points_per_step": 3,
+        "tensorboard_enabled": False,
+    }
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    calls: list[tuple[int, int, str, int]] = []
+
+    def fake_prefetch(
+        self,
+        start_sample_index,
+        sample_count,
+        *,
+        workers=None,
+        sample_mode="random",
+        sample_index_limit=None,
+        include_top_view=False,
+    ):
+        del self, workers, include_top_view
+        calls.append((int(start_sample_index), int(sample_count), str(sample_mode), int(sample_index_limit or 0)))
+        return {"generated": 0, "missing": 0, "downloaded": 0, "bytes": 0, "errors": 0, "workers": 1}
+
+    monkeypatch.setattr(FiberStrip2DLoader, "prefetch", fake_prefetch)
+
+    prefetch_training(config_path, prefetch_steps=0, sampler_factory=_test_sampler_factory)
+
+    assert calls == [(0, 2, "random", 2)]
+
+
+def test_training_prefetch_forwards_top_view_dependency_flag(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["training"] = {
+        "max_steps": 1,
+        "control_points_per_step": 1,
+        "top_view_enabled": True,
+        "tensorboard_enabled": False,
+    }
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    calls: list[bool] = []
+
+    def fake_prefetch(
+        self,
+        start_sample_index,
+        sample_count,
+        *,
+        workers=None,
+        sample_mode="random",
+        sample_index_limit=None,
+        include_top_view=False,
+    ):
+        del self, start_sample_index, sample_count, workers, sample_mode, sample_index_limit
+        calls.append(bool(include_top_view))
+        return {"generated": 0, "missing": 0, "downloaded": 0, "bytes": 0, "errors": 0, "workers": 1}
+
+    monkeypatch.setattr(FiberStrip2DLoader, "prefetch", fake_prefetch)
+
+    prefetch_training(config_path, prefetch_steps=1, sampler_factory=_test_sampler_factory)
+
+    assert calls == [True]
+
+
+def test_training_prefetch_max_steps_zero_prefetches_dataset_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["training"] = {
+        "max_steps": 0,
+        "control_points_per_step": 2,
+        "tensorboard_enabled": False,
+    }
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    calls: list[tuple[int, int, str]] = []
+
+    def fake_prefetch(
+        self,
+        start_sample_index,
+        sample_count,
+        *,
+        workers=None,
+        sample_mode="random",
+        sample_index_limit=None,
+        include_top_view=False,
+    ):
+        del workers, include_top_view
+        calls.append((int(start_sample_index), int(sample_count), str(sample_mode)))
+        return {
+            "generated": 3,
+            "missing": 0,
+            "downloaded": 0,
+            "bytes": 0,
+            "errors": 0,
+            "workers": 1,
+            "samples": int(sample_count),
+            "loader_sample_count": int(self.sample_count),
+        }
+
+    monkeypatch.setattr(FiberStrip2DLoader, "prefetch", fake_prefetch)
+
+    summary = prefetch_training(config_path, prefetch_steps=0, sampler_factory=_test_sampler_factory)
+
+    assert calls == [(0, 3, "random")]
+    assert summary["samples"] == 3
+    assert summary["loader_sample_count"] == 3
+
+
+def test_training_prefetch_max_steps_zero_prefetches_test_datasets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    test_fiber = _write_fiber(tmp_path / "heldout_fiber.json", points=[[8.0, 24.0, 24.0], [18.0, 24.0, 24.0]])
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["test_datasets"] = [
+        {
+            **raw["datasets"][0],
+            "fiber_paths": [str(test_fiber)],
+        }
+    ]
+    raw["training"] = {
+        "max_steps": 0,
+        "control_points_per_step": 2,
+        "tensorboard_enabled": False,
+    }
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    calls: list[tuple[int, int, str, int]] = []
+
+    def fake_prefetch(
+        self,
+        start_sample_index,
+        sample_count,
+        *,
+        workers=None,
+        sample_mode="random",
+        sample_index_limit=None,
+        include_top_view=False,
+    ):
+        del workers, include_top_view
+        calls.append((int(start_sample_index), int(sample_count), str(sample_mode), int(self.sample_count)))
+        return {
+            "generated": int(sample_count),
+            "missing": 0,
+            "downloaded": 0,
+            "bytes": 0,
+            "errors": 0,
+            "workers": 1,
+            "samples": int(sample_count),
+        }
+
+    monkeypatch.setattr(FiberStrip2DLoader, "prefetch", fake_prefetch)
+
+    summary = prefetch_training(config_path, prefetch_steps=0, sampler_factory=_test_sampler_factory)
+
+    assert calls == [(0, 3, "random", 3), (0, 2, "random", 2)]
+    assert summary["samples"] == 5
+
+
+def test_training_prefetch_rejects_negative_steps(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+
+    with pytest.raises(ValueError, match="--prefetch-steps must be >= 0"):
+        prefetch_training(config_path, prefetch_steps=-1, sampler_factory=_test_sampler_factory)
+
+
+def test_training_config_parses_test_settings() -> None:
+    config = _training_config_from_raw(
+        {
+            "training": {
+                "test_interval": 17,
+                "test_control_points": 3,
+                "test_start_sample_index": 11,
+            }
+        }
+    )
+
+    assert config.test_interval == 17
+    assert config.test_control_points == 3
+    assert config.test_start_sample_index == 11
+
+
+def test_training_config_allows_zero_test_control_points_for_full_test_set() -> None:
+    config = _training_config_from_raw({"training": {"test_control_points": 0}})
+
+    assert config.test_control_points == 0
+
+
+def test_training_config_rejects_negative_test_control_points() -> None:
+    with pytest.raises(ValueError, match="training.test_control_points must be >= 0"):
+        _training_config_from_raw({"training": {"test_control_points": -1}})
+
+
+def test_zero_test_control_points_resolves_to_full_flat_test_set() -> None:
+    training = FiberStripTrainingConfig(test_control_points=0, test_start_sample_index=19)
+    loader = SimpleNamespace(sample_count=7)
+
+    selection = _resolve_test_selection(training, loader)  # type: ignore[arg-type]
+
+    assert selection.start_sample_index == 0
+    assert selection.sample_count == 7
+    assert selection.sample_mode == "flat"
+
+
+def test_training_config_allows_zero_max_steps() -> None:
+    config = _training_config_from_raw({"training": {"max_steps": 0}})
+
+    assert config.max_steps == 0
+
+
+def test_training_config_parses_max_sample_index() -> None:
+    config = _training_config_from_raw({"training": {"max_sample_index": 123}})
+
+    assert config.max_sample_index == 123
+
+
+def test_training_config_rejects_negative_max_sample_index() -> None:
+    with pytest.raises(ValueError, match="training.max_sample_index must be >= 0"):
+        _training_config_from_raw({"training": {"max_sample_index": -1}})
+
+
+def test_test_datasets_replace_training_datasets_for_loader_config(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    train_fiber = raw["datasets"][0]["fiber_paths"][0]
+    test_fiber = _write_fiber(tmp_path / "test_fiber.json", points=[[5.0, 22.0, 22.0], [15.0, 22.0, 22.0]])
+    raw["test_datasets"] = [
+        {
+            **raw["datasets"][0],
+            "fiber_paths": [str(test_fiber)],
+        }
+    ]
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    loader_config = load_config(config_path)
+    test_config = _test_loader_config_from_raw(raw, loader_config)
+
+    assert test_config is not None
+    assert loader_config.datasets[0]["fiber_paths"] == [train_fiber]
+    assert test_config.datasets[0]["fiber_paths"] == [str(test_fiber)]
+
+
+def test_lasagna_direction_encoding_is_forward_backward_ambiguous() -> None:
+    directions = torch.tensor(
+        [
+            [1.0, 0.0],
+            [-1.0, 0.0],
+            [0.0, 1.0],
+            [math.sqrt(0.5), math.sqrt(0.5)],
+        ],
+        dtype=torch.float32,
+    )
+
+    encoded = encode_lasagna_direction_xy(directions)
+
+    assert torch.allclose(encoded[0], encoded[1])
+    assert torch.allclose(encoded[0], torch.tensor([1.0, 0.5 + 0.5 / math.sqrt(2.0)]))
+    assert torch.allclose(encoded[2], torch.tensor([0.0, 0.5 - 0.5 / math.sqrt(2.0)]), atol=1.0e-6)
+    assert torch.allclose(encoded[3], torch.tensor([0.5, 0.5 - 0.5 / math.sqrt(2.0)]), atol=1.0e-6)
+
+
+def test_lasagna_direction_decode_is_analytic_unsigned_inverse() -> None:
+    directions = torch.tensor(
+        [
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [math.sqrt(0.5), math.sqrt(0.5)],
+            [0.25, -0.75],
+            [-0.3, 0.9],
+        ],
+        dtype=torch.float32,
+    )
+    directions = directions / torch.linalg.vector_norm(directions, dim=1, keepdim=True)
+
+    decoded = decode_lasagna_direction_xy(encode_lasagna_direction_xy(directions))
+    folded_dot = torch.abs(torch.sum(decoded * directions, dim=1))
+
+    assert decoded.shape == directions.shape
+    assert torch.allclose(torch.linalg.vector_norm(decoded, dim=1), torch.ones((directions.shape[0],)), atol=1.0e-6)
+    assert torch.allclose(folded_dot, torch.ones_like(folded_dot), atol=1.0e-5)
+
+
+def test_lasagna_direction_decode_has_no_binned_candidate_lookup() -> None:
+    source = Path(augment_module.__file__).resolve().with_name("direction.py").read_text(encoding="utf-8")
+    decoder_source = source.split("def decode_lasagna_direction_xy", 1)[1].split("\ndef cp_neighborhood_yx", 1)[0]
+
+    assert "def decode_lasagna_direction_xy(encoded: torch.Tensor) -> torch.Tensor" in source
+    assert "torch.atan2" in decoder_source
+    assert "linspace" not in decoder_source
+    assert "argmin" not in decoder_source
+    assert "bins" not in decoder_source
+
+
+def test_cp_local_supervision_uses_eight_samples_and_augmented_line() -> None:
+    valid = np.ones((1, 5, 5), dtype=bool)
+    sample = SimpleNamespace(
+        line_xy=np.asarray(
+            [
+                [0.0, 1.0],
+                [1.0, 1.5],
+                [2.0, 2.0],
+                [3.0, 2.5],
+                [4.0, 3.0],
+            ],
+            dtype=np.float32,
+        )
+    )
+
+    supervision = build_direction_supervision([sample], valid, device=torch.device("cpu"))
+
+    assert supervision.target.shape == (8, 2)
+    assert sorted(zip(supervision.y.tolist(), supervision.x.tolist())) == sorted(
+        tuple(item) for item in cp_neighborhood_yx(np.asarray([2.0, 2.0], dtype=np.float32), (5, 5)).tolist()
+    )
+    expected = encode_lasagna_direction_xy(torch.tensor([1.0, 0.5]))
+    assert torch.allclose(supervision.target[0], expected, atol=1.0e-6)
+
+
+def test_direction_angle_error_reports_degrees() -> None:
+    valid = np.ones((1, 5, 5), dtype=bool)
+    sample = SimpleNamespace(
+        line_xy=np.asarray(
+            [
+                [0.0, 2.0],
+                [1.0, 2.0],
+                [2.0, 2.0],
+                [3.0, 2.0],
+                [4.0, 2.0],
+            ],
+            dtype=np.float32,
+        ),
+        control_point_xy=np.asarray([2.0, 2.0], dtype=np.float32),
+    )
+    supervision = build_direction_supervision([sample], valid, device=torch.device("cpu"))
+    perfect = torch.zeros((1, 2, 5, 5), dtype=torch.float32)
+    perpendicular = torch.zeros((1, 2, 5, 5), dtype=torch.float32)
+    perfect_value = encode_lasagna_direction_xy(torch.tensor([1.0, 0.0], dtype=torch.float32))
+    perpendicular_value = encode_lasagna_direction_xy(torch.tensor([0.0, 1.0], dtype=torch.float32))
+    perfect[:, :, :, :] = perfect_value.view(1, 2, 1, 1)
+    perpendicular[:, :, :, :] = perpendicular_value.view(1, 2, 1, 1)
+
+    perfect_error = direction_angle_error_degrees(perfect, supervision)
+    perpendicular_error = direction_angle_error_degrees(perpendicular, supervision)
+
+    assert float(perfect_error.max()) < 0.5
+    assert float(perpendicular_error.min()) > 89.0
+
+
+def test_contrastive_embedding_loss_balances_positive_and_negative_terms() -> None:
+    output = torch.zeros((2, 4, 3, 3), dtype=torch.float32)
+    output[:, 2, :, :] = 1.0
+    supervision = DirectionSupervision(
+        patch_indices=torch.tensor([0, 1], dtype=torch.long),
+        y=torch.tensor([1, 1], dtype=torch.long),
+        x=torch.tensor([1, 1], dtype=torch.long),
+        target=torch.zeros((2, 2), dtype=torch.float32),
+        cp_xy=torch.zeros((2, 2), dtype=torch.float32),
+        tangent_xy=torch.tensor([[1.0, 0.0], [1.0, 0.0]], dtype=torch.float32),
+    )
+    samples = (
+        SimpleNamespace(fiber_path="fiber-a", record_index=0),
+        SimpleNamespace(fiber_path="fiber-a", record_index=0),
+    )
+    valid = np.ones((2, 3, 3), dtype=bool)
+
+    loss, metrics = contrastive_embedding_loss(
+        output,
+        supervision,
+        samples,  # type: ignore[arg-type]
+        valid,
+        weight=2.0,
+        negative_margin=0.0,
+    )
+
+    assert float(loss.detach().item()) == pytest.approx(2.62)
+    assert metrics.positive_loss == pytest.approx(0.0)
+    assert metrics.negative_loss == pytest.approx(1.0)
+    assert metrics.similarity_mean_value == pytest.approx(1.0)
+    assert metrics.similarity_mean_loss == pytest.approx(0.81)
+    assert metrics.similarity_mean_target == pytest.approx(0.1)
+    assert metrics.loss == pytest.approx(2.62)
+    assert metrics.positive_samples == 2
+    assert metrics.negative_samples == 2
+    assert metrics.similarity_mean_samples == 2
+
+
+def test_presence_loss_balances_cp_and_reachable_non_cp_pixels() -> None:
+    output = torch.zeros((1, 3, 5, 5), dtype=torch.float32)
+    reachable = contrastive_negative_reachable_mask((5, 5), shift_x=0.0, shift_y=0.0)
+    output[:, 2, :, :] = 0.99
+    output[:, 2, reachable] = 0.25
+    output[:, 2, 2, 2] = 0.8
+    supervision = DirectionSupervision(
+        patch_indices=torch.tensor([0], dtype=torch.long),
+        y=torch.tensor([2], dtype=torch.long),
+        x=torch.tensor([2], dtype=torch.long),
+        target=torch.zeros((1, 2), dtype=torch.float32),
+        cp_xy=torch.tensor([[2.0, 2.0]], dtype=torch.float32),
+        tangent_xy=torch.tensor([[1.0, 0.0]], dtype=torch.float32),
+    )
+    samples = (
+        SimpleNamespace(
+            fiber_path="fiber-a",
+            record_index=0,
+            control_point_index=7,
+            control_point_xy=np.asarray([2.0, 2.0], dtype=np.float32),
+            line_xy=np.asarray([[1.0, 2.0], [2.0, 2.0], [3.0, 2.0]], dtype=np.float32),
+        ),
+    )
+    valid = np.ones((1, 5, 5), dtype=bool)
+
+    loss, metrics = presence_loss(
+        output,
+        supervision,
+        samples,  # type: ignore[arg-type]
+        valid,
+        weight=2.0,
+        negative_candidate_mask=reachable,
+        presence_channels=1,
+    )
+
+    expected_positive = -math.log(0.8)
+    expected_negative = -math.log(0.75)
+    assert float(loss.detach().item()) == pytest.approx(expected_positive + expected_negative)
+    assert metrics.loss == pytest.approx(expected_positive + expected_negative)
+    assert metrics.positive_loss == pytest.approx(expected_positive)
+    assert metrics.negative_loss == pytest.approx(expected_negative)
+    assert metrics.positive_samples == 1
+    assert metrics.negative_samples == 8
+
+
+def test_contrastive_embedding_loss_selects_best_other_cp_offset_only() -> None:
+    output = torch.zeros((4, 4, 3, 3), dtype=torch.float32)
+    output[0, 2:4, 1, 1] = torch.tensor([1.0, 0.0])
+    output[1, 2:4, 1, 1] = torch.tensor([1.0, 0.0])
+    output[2, 2:4, 1, 1] = torch.tensor([0.0, 1.0])
+    output[3, 2:4, 1, 1] = torch.tensor([0.6, 0.8])
+    supervision = DirectionSupervision(
+        patch_indices=torch.tensor([0, 1, 2, 3], dtype=torch.long),
+        y=torch.tensor([1, 1, 1, 1], dtype=torch.long),
+        x=torch.tensor([1, 1, 1, 1], dtype=torch.long),
+        target=torch.zeros((4, 2), dtype=torch.float32),
+        cp_xy=torch.zeros((4, 2), dtype=torch.float32),
+        tangent_xy=torch.tensor(
+            [[1.0, 0.0], [1.0, 0.0], [1.0, 0.0], [1.0, 0.0]],
+            dtype=torch.float32,
+        ),
+    )
+    samples = (
+        SimpleNamespace(fiber_path="fiber-a", record_index=0, control_point_index=0),
+        SimpleNamespace(fiber_path="fiber-a", record_index=0, control_point_index=0),
+        SimpleNamespace(fiber_path="fiber-a", record_index=0, control_point_index=1),
+        SimpleNamespace(fiber_path="fiber-a", record_index=0, control_point_index=2),
+    )
+    valid = np.ones((4, 3, 3), dtype=bool)
+
+    _, metrics = contrastive_embedding_loss(
+        output,
+        supervision,
+        samples,  # type: ignore[arg-type]
+        valid,
+        weight=1.0,
+        negative_margin=0.0,
+    )
+
+    assert metrics.positive_loss == pytest.approx(0.3)
+    assert metrics.positive_samples == 4
+
+
+def test_contrastive_embedding_loss_ignores_cross_fiber_cp_negatives() -> None:
+    output = torch.zeros((4, 4, 3, 3), dtype=torch.float32)
+    output[:, 3, :, :] = 1.0
+    output[:, 2, 1, 1] = 1.0
+    output[:, 3, 1, 1] = 0.0
+    supervision = DirectionSupervision(
+        patch_indices=torch.tensor([0, 1, 2, 3], dtype=torch.long),
+        y=torch.tensor([1, 1, 1, 1], dtype=torch.long),
+        x=torch.tensor([1, 1, 1, 1], dtype=torch.long),
+        target=torch.zeros((4, 2), dtype=torch.float32),
+        cp_xy=torch.zeros((4, 2), dtype=torch.float32),
+        tangent_xy=torch.tensor(
+            [[1.0, 0.0], [1.0, 0.0], [1.0, 0.0], [1.0, 0.0]],
+            dtype=torch.float32,
+        ),
+    )
+    samples = (
+        SimpleNamespace(fiber_path="fiber-a", record_index=0),
+        SimpleNamespace(fiber_path="fiber-a", record_index=0),
+        SimpleNamespace(fiber_path="fiber-b", record_index=1),
+        SimpleNamespace(fiber_path="fiber-b", record_index=1),
+    )
+    valid = np.ones((4, 3, 3), dtype=bool)
+
+    loss, metrics = contrastive_embedding_loss(
+        output,
+        supervision,
+        samples,  # type: ignore[arg-type]
+        valid,
+        weight=1.0,
+        negative_margin=0.0,
+    )
+
+    assert metrics.positive_loss == pytest.approx(0.0)
+    assert metrics.pixel_negative_loss == pytest.approx(0.0)
+    assert metrics.negative_loss == pytest.approx(0.0)
+    assert metrics.similarity_mean_value == pytest.approx(5.0 / 9.0)
+    assert metrics.similarity_mean_loss == pytest.approx((5.0 / 9.0 - 0.1) ** 2)
+    assert float(loss.detach().item()) == pytest.approx((5.0 / 9.0 - 0.1) ** 2)
+    assert metrics.pixel_negative_samples == 4
+    assert metrics.negative_samples == 4
+
+
+def test_contrastive_embedding_loss_ignores_unreachable_edge_negatives() -> None:
+    output = torch.zeros((2, 4, 5, 5), dtype=torch.float32)
+    output[:, 2, :, :] = 1.0
+    reachable = contrastive_negative_reachable_mask((5, 5), shift_x=0.0, shift_y=0.0)
+    output[:, 2, reachable] = 0.0
+    output[:, 3, reachable] = 1.0
+    output[:, 2, 2, 2] = 1.0
+    output[:, 3, 2, 2] = 0.0
+    supervision = DirectionSupervision(
+        patch_indices=torch.tensor([0, 1], dtype=torch.long),
+        y=torch.tensor([2, 2], dtype=torch.long),
+        x=torch.tensor([2, 2], dtype=torch.long),
+        target=torch.zeros((2, 2), dtype=torch.float32),
+        cp_xy=torch.zeros((2, 2), dtype=torch.float32),
+        tangent_xy=torch.tensor([[1.0, 0.0], [1.0, 0.0]], dtype=torch.float32),
+    )
+    samples = (
+        SimpleNamespace(fiber_path="fiber-a", record_index=0),
+        SimpleNamespace(fiber_path="fiber-a", record_index=0),
+    )
+    valid = np.ones((2, 5, 5), dtype=bool)
+
+    _, unmasked_metrics = contrastive_embedding_loss(
+        output,
+        supervision,
+        samples,  # type: ignore[arg-type]
+        valid,
+        weight=1.0,
+        negative_margin=0.0,
+    )
+    loss, masked_metrics = contrastive_embedding_loss(
+        output,
+        supervision,
+        samples,  # type: ignore[arg-type]
+        valid,
+        weight=1.0,
+        negative_margin=0.0,
+        negative_candidate_mask=reachable,
+    )
+
+    assert unmasked_metrics.negative_loss > 0.0
+    assert unmasked_metrics.similarity_mean_value == pytest.approx(21.0 / 25.0)
+    assert float(loss.detach().item()) == pytest.approx((5.0 / 9.0 - 0.1) ** 2)
+    assert masked_metrics.negative_loss == pytest.approx(0.0)
+    assert masked_metrics.similarity_mean_value == pytest.approx(5.0 / 9.0)
+    assert masked_metrics.similarity_mean_loss == pytest.approx((5.0 / 9.0 - 0.1) ** 2)
+    assert masked_metrics.negative_samples == 2
+
+
+def test_training_batch_assembly_default_patch_count_is_64(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["patch_shape_hw"] = [5, 5]
+    raw["strip_z_offset_count"] = 16
+    raw["training"] = {"control_points_per_step": 4}
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+
+    batch = loader.load_batch(0, batch_size=4)
+
+    assert batch.images.shape == (4, 16, 1, 5, 5)
+    assert len(batch.samples) == 64
+
+
+def test_training_prints_first_100_samples_then_interval() -> None:
+    assert _should_print_training_step(
+        1,
+        scalar_log_interval=50,
+        start_sample_index=0,
+        sample_count=4,
+    )
+    assert _should_print_training_step(
+        25,
+        scalar_log_interval=50,
+        start_sample_index=96,
+        sample_count=4,
+    )
+    assert not _should_print_training_step(
+        26,
+        scalar_log_interval=50,
+        start_sample_index=100,
+        sample_count=4,
+    )
+    assert _should_print_training_step(
+        50,
+        scalar_log_interval=50,
+        start_sample_index=196,
+        sample_count=4,
+    )
+
+
+def test_training_visualization_draws_only_predicted_cp_direction() -> None:
+    rgb = np.zeros((17, 17, 3), dtype=np.uint8)
+    out = _draw_predicted_cp_direction(
+        rgb,
+        cp_xy=np.asarray([8.0, 8.0], dtype=np.float32),
+        prediction_xy=np.asarray([1.0, 0.0], dtype=np.float32),
+    )
+
+    green = (out[:, :, 1] > out[:, :, 0] + 40) & (out[:, :, 1] > out[:, :, 2] + 40)
+    yellow = (out[:, :, 0] > 180) & (out[:, :, 1] > 180) & (out[:, :, 2] < 80)
+    cyan = (out[:, :, 1] > 180) & (out[:, :, 2] > 180) & (out[:, :, 0] < 80)
+
+    assert np.count_nonzero(green) > 0
+    assert np.count_nonzero(yellow) == 0
+    assert np.count_nonzero(cyan) == 0
+
+
+def test_training_visualization_selects_different_control_points_first() -> None:
+    batch = SimpleNamespace(
+        images=np.zeros((4, 16, 1, 5, 5), dtype=np.float32),
+        strip_z_offsets=np.asarray(
+            [-7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8],
+            dtype=np.float32,
+        ),
+    )
+
+    indices = _select_visualization_patch_indices(batch, max_patches=8)
+
+    assert indices[:4] == [7, 23, 39, 55]
+    assert [index // 16 for index in indices[:4]] == [0, 1, 2, 3]
+
+
+def test_training_batch_keeps_full_centerline_for_visualization(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["patch_shape_hw"] = [5, 7]
+    raw["strip_z_offset_count"] = 1
+    raw["augment_enabled"] = False
+    raw["loader_workers"] = 1
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    loader = _make_loader(load_config(config_path))
+    training = FiberStripTrainingConfig(train_control_points_per_step=1)
+
+    loaded = _load_training_batch(
+        loader,
+        training,
+        step=1,
+        sample_mode="flat",
+        profile_enabled=False,
+        apply_image_augmentation=False,
+    )
+
+    sample = loaded.batch.samples[0]
+    assert sample.line_xy.shape == (7, 2)
+    np.testing.assert_allclose(sample.line_xy[:, 0], np.arange(7, dtype=np.float32))
+    np.testing.assert_allclose(sample.line_xy[:, 1], np.full((7,), 2.0, dtype=np.float32))
+
+
+def test_one_step_training_smoke_writes_checkpoint(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["patch_shape_hw"] = [5, 5]
+    raw["training"] = {
+        "run_path": str(tmp_path / "runs"),
+        "run_name": "smoke",
+        "max_steps": 1,
+        "control_points_per_step": 1,
+        "tensorboard_enabled": False,
+        "model_hidden_channels": 4,
+        "model_depth": 2,
+    }
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    run_dir = run_training(config_path, sampler_factory=_test_sampler_factory)
+
+    assert (run_dir / "snapshots" / "current.pt").is_file()
+    assert (run_dir / "snapshots" / "best.pt").is_file()
+
+
+def test_training_resume_continues_existing_checkpoint(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["patch_shape_hw"] = [5, 5]
+    raw["training"] = {
+        "run_path": str(tmp_path / "runs"),
+        "run_name": "resume",
+        "max_steps": 1,
+        "control_points_per_step": 1,
+        "tensorboard_enabled": False,
+        "model_hidden_channels": 4,
+        "model_depth": 2,
+    }
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    run_dir = run_training(config_path, sampler_factory=_test_sampler_factory)
+    current_path = run_dir / "snapshots" / "current.pt"
+    first_current = torch.load(current_path, map_location="cpu", weights_only=False)
+    assert first_current["step"] == 1
+
+    raw["training"]["max_steps"] = 2
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    resumed_run_dir = run_training(
+        config_path,
+        sampler_factory=_test_sampler_factory,
+        resume_checkpoint=current_path,
+    )
+
+    resumed_current_path = resumed_run_dir / "snapshots" / "current.pt"
+    resumed_current = torch.load(resumed_current_path, map_location="cpu", weights_only=False)
+    assert resumed_run_dir != run_dir
+    assert resumed_current["step"] == 2
+    assert current_path.is_file()
+
+
+def test_training_benchmark_reports_patch_throughput_without_run_dir(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["patch_shape_hw"] = [5, 5]
+    raw["training"] = {
+        "run_path": str(tmp_path / "runs"),
+        "run_name": "benchmark",
+        "max_steps": 1,
+        "control_points_per_step": 1,
+        "tensorboard_enabled": False,
+        "model_hidden_channels": 4,
+        "model_depth": 2,
+    }
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    summary = run_benchmark(config_path, sampler_factory=_test_sampler_factory, batches=2, profile=True)
+
+    assert summary.batches == 2
+    assert summary.patches == 6
+    assert summary.patches_per_second > 0.0
+    assert "coord_gen" in summary.stage_ms_per_patch
+    assert "loader_wall" in summary.stage_ms_per_patch
+    assert "loader_worker" in summary.stage_ms_per_patch
+    assert not (tmp_path / "runs").exists()
+
+
+def test_training_load_only_benchmark_skips_image_aug_and_model_work(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["patch_shape_hw"] = [5, 5]
+    raw["augment_enabled"] = True
+    raw["augment_device"] = "cpu"
+    raw["training"] = {
+        "run_path": str(tmp_path / "runs"),
+        "run_name": "load_only",
+        "max_steps": 1,
+        "control_points_per_step": 1,
+        "tensorboard_enabled": False,
+        "model_hidden_channels": 4,
+        "model_depth": 2,
+    }
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    summary = run_benchmark(
+        config_path,
+        sampler_factory=_test_sampler_factory,
+        batches=2,
+        profile=True,
+        load_only=True,
+    )
+
+    assert summary.batches == 2
+    assert summary.patches == 6
+    assert summary.stage_ms_per_patch["loading"] >= 0.0
+    assert summary.stage_ms_per_patch["image_aug"] == 0.0
+    assert summary.stage_ms_per_patch["fw"] == 0.0
+    assert summary.stage_ms_per_patch["bw_step"] == 0.0
+    assert not (tmp_path / "runs").exists()
+
+
+def test_training_with_test_dataset_uses_test_interval_for_snapshots(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    test_fiber = _write_fiber(tmp_path / "heldout_fiber.json", points=[[8.0, 24.0, 24.0], [18.0, 24.0, 24.0]])
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["patch_shape_hw"] = [5, 5]
+    raw["test_datasets"] = [
+        {
+            **raw["datasets"][0],
+            "fiber_paths": [str(test_fiber)],
+        }
+    ]
+    raw["training"] = {
+        "run_path": str(tmp_path / "runs"),
+        "run_name": "test_interval",
+        "max_steps": 2,
+        "control_points_per_step": 1,
+        "test_interval": 2,
+        "test_control_points": 1,
+        "test_start_sample_index": 0,
+        "tensorboard_enabled": False,
+        "model_hidden_channels": 4,
+        "model_depth": 2,
+    }
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    run_dir = run_training(config_path, sampler_factory=_test_sampler_factory)
+
+    current = torch.load(run_dir / "snapshots" / "current.pt", map_location="cpu", weights_only=False)
+    best = torch.load(run_dir / "snapshots" / "best.pt", map_location="cpu", weights_only=False)
+    assert current["step"] == 2
+    assert current["metric_name"] == "test/trace2cp_error"
+    assert best["metric_name"] == "test/trace2cp_error"
+
+
+def test_zero_test_control_points_runs_trace2cp_over_full_test_set(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = _write_config(tmp_path, batch_size=1)
+    test_fiber = _write_fiber(
+        tmp_path / "heldout_full_fiber.json",
+        points=[[8.0, 24.0, 24.0], [18.0, 24.0, 24.0], [28.0, 24.0, 24.0]],
+    )
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw["patch_shape_hw"] = [5, 5]
+    raw["test_datasets"] = [
+        {
+            **raw["datasets"][0],
+            "fiber_paths": [str(test_fiber)],
+        }
+    ]
+    raw["training"] = {
+        "run_path": str(tmp_path / "runs"),
+        "run_name": "test_full",
+        "max_steps": 1,
+        "control_points_per_step": 1,
+        "test_interval": 1,
+        "test_control_points": 0,
+        "test_start_sample_index": 99,
+        "tensorboard_enabled": False,
+        "model_hidden_channels": 4,
+        "model_depth": 2,
+    }
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    run_dir = run_training(config_path, sampler_factory=_test_sampler_factory)
+    stdout = capsys.readouterr().out
+
+    current = torch.load(run_dir / "snapshots" / "current.pt", map_location="cpu", weights_only=False)
+    assert current["metric_name"] == "test/trace2cp_error"
+    assert "test_trace2cp_segments=2" in stdout
+    assert "test_trace2cp_skipped=1" in stdout

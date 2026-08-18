@@ -47,11 +47,11 @@ def main():
 
     dataset = Path(args.dataset)
     checkpoint = load_checkpoint_cpu(args.checkpoint)
-    cfg = dict(fs.default_config)
+    cfg = fs.Config().as_dict()
     cfg.update({k: v for k, v in checkpoint.get('cfg', {}).items() if k in cfg})
     cfg.update({
         'dense_spacing_mode': 'phase',
-        'dense_spacing_num_pairs': int(args.pairs),
+        'sample_count_dense_spacing_pairs': int(args.pairs),
         # measure attachment at unit weight; keep repo-default 12/8/2 for the rest
         'loss_weight_dense_spacing': 12.0,
         'loss_weight_dense_spacing_count': 8.0,
@@ -99,9 +99,7 @@ def main():
         # their production weights: 'dense_spacing' is the legacy spacing
         # objective the bundle replaced, 'dense_normals' the ever-present
         # stabilizer — the magnitude yardsticks for the bundle terms.
-        import losses as losses_module
         from losses import iter_lasagna_losses
-        losses_module.configure_losses(cfg, args.z_begin, args.z_end)
         lasagna_weights = {
             'dense_spacing': float(cfg['loss_weight_dense_spacing']),
             'dense_normals': float(cfg['loss_weight_dense_normals']),
@@ -114,8 +112,9 @@ def main():
                 model.zero_grad(set_to_none=True)
                 for name, loss in iter_lasagna_losses(
                         transform, dr, normals, outer,
-                        cfg['dense_normals_num_points'],
-                        compute_spacing=True):
+                        cfg['sample_count_dense_normal_points'],
+                        compute_spacing=True,
+                        cfg=cfg, z_begin=args.z_begin, z_end=args.z_end):
                     if name != target_name:
                         continue
                     weighted = loss * lasagna_weights[name]

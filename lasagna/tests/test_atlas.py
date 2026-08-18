@@ -18,6 +18,30 @@ if ROOT not in sys.path:
 import atlas
 
 
+def _v3_segment() -> dict[str, object]:
+	return {
+		"optimizer": "native_fiber_trace3d", "metadata_version": 3,
+		"tracer_version": 2, "interp_goal": "global", "interp_mode": "lasagna",
+		"metric": 1.0, "msg": "lasagna", "normal_manifest": "normals.json",
+		"fiber_manifest": "", "trace_to_base_scale": 4.0,
+		"meeting_error_base_voxels": None, "meeting_error_ratio": None,
+		"meeting_source": "", "failure_code": "", "failure_detail": "",
+		"lasagna_failure_code": "", "lasagna_failure_detail": "",
+		"config": {
+			"step_voxels": 4.0, "cone_angle_degrees": 25.0,
+			"cone_angle_step_degrees": 5.0, "cone_grid_size": 25,
+			"beam_width": 8, "beam_prune_distance_voxels": 1.0,
+			"beam_lookahead_steps": 2, "smoothness_weight": 2.0,
+			"smoothness_normal_weight": 0.1, "smoothness_tangent_weight": 10.0,
+			"smoothness_free_angle_degrees": 0.0, "cumulative_smoothness_steps": 4,
+			"cumulative_smoothness_tangent_weight": 2.0,
+			"initial_free_angle_degrees": 0.0, "max_step_factor": 3.0,
+			"meeting_accept_max_error_ratio": 0.1,
+			"endpoint_accept_threshold_base_voxels": 20.0,
+		},
+	}
+
+
 def _sample_model_xyz(xyz: torch.Tensor, h: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 	return atlas._bilinear_sample_grid(xyz[0], h, w)
 
@@ -98,6 +122,28 @@ def _atlas21_config_from_fixture(
 
 
 class AtlasParserTest(unittest.TestCase):
+	def test_v3_fiber_control_points_are_strictly_validated(self) -> None:
+		import tempfile
+		with tempfile.TemporaryDirectory() as td:
+			path = Path(td) / "fiber.json"
+			doc = {
+				"type": "vc3d_fiber", "version": 3,
+				"optimization_mode": "native_fiber_trace3d",
+				"line_points": [[1, 2, 3], [4, 5, 6]],
+				"control_points": [
+					{"position": [1, 2, 3], "segment_to_next": _v3_segment()},
+					{"position": [4, 5, 6]},
+				],
+			}
+			path.write_text(json.dumps(doc), encoding="utf-8")
+			self.assertEqual(atlas.load_vc3d_fiber_control_points(path),
+				[(1.0, 2.0, 3.0), (4.0, 5.0, 6.0)])
+
+			del doc["control_points"][0]["segment_to_next"]
+			path.write_text(json.dumps(doc), encoding="utf-8")
+			with self.assertRaisesRegex(ValueError, "missing segment_to_next"):
+				atlas.load_vc3d_fiber_control_points(path)
+
 	def test_atlas_init_crops_from_anchor_extents_with_margin(self) -> None:
 		with self.subTest("synthetic atlas"):
 			import tempfile

@@ -98,6 +98,8 @@ private slots:
     void attachVolume();
     void attachSegments();
     void attachNormalGrid();
+    void attachLasagnaManifest();
+    void attachRemoteLasagnaManifest();
     void detachEntry();
     void setOutputSegments();
     void convertLegacyVolpkg();
@@ -127,6 +129,7 @@ signals:
     // wires this to SegmentationCommandHandler::onMergePatch with an
     // empty seed list so the dialog opens with empty combo boxes.
     void mergePatchFromMenuRequested();
+    void growTrackPatchesFromMenuRequested();
     void openDataCatalogVisibilityChanged(bool visible);
 
 private:
@@ -138,6 +141,8 @@ private:
     void saveRecentRemoteUrls(const QStringList& urls);
     void updateRecentRemoteList(const QString& url);
     void attachRemoteZarrUrl(const QString& url);
+    void beginLasagnaManifestAttachment(bool remote);
+    struct LasagnaAttachTaskResult;
     bool openOpenDataSample(const vc3d::opendata::OpenDataSample& sample,
                             bool interactive = true,
                             const vc3d::opendata::OpenDataResourceSelection* selection = nullptr,
@@ -187,6 +192,8 @@ private:
     QAction* _attachVolumeAct{nullptr};
     QAction* _attachSegmentsAct{nullptr};
     QAction* _attachNormalGridAct{nullptr};
+    QAction* _attachLasagnaManifestAct{nullptr};
+    QAction* _attachRemoteLasagnaManifestAct{nullptr};
     QAction* _detachEntryAct{nullptr};
     QAction* _setOutputSegmentsAct{nullptr};
     QAction* _convertLegacyAct{nullptr};
@@ -208,6 +215,7 @@ private:
     QAction* _rotateSurfaceAct{nullptr};
     QAction* _mergeTifxyzAct{nullptr};
     QAction* _mergePatchAct{nullptr};
+    QAction* _growTrackPatchesAct{nullptr};
     QAction* _materializeOpenDataFolderAct{nullptr};
     QAction* _recalculateFiberScoresAct{nullptr};
 
@@ -218,4 +226,5 @@ private:
     std::shared_ptr<std::atomic<bool>> _openDataPrefillCancelFlag;
     // True from launch until the finished slot runs; prevents overlapping opens.
     bool _openDataSampleOpenInFlight{false};
+    bool _lasagnaAttachmentInFlight{false};
 };

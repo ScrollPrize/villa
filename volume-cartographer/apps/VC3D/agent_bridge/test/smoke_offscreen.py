@@ -19,7 +19,7 @@ Prints a single JSON result object on the last stdout line; exits nonzero if any
 check fails. Every socket wait carries a timeout so an offscreen hang cannot
 block forever.
 
-    python3 smoke_offscreen.py [--vc3d /path/to/VC3D]
+    python3 smoke_offscreen.py [--vc3d /path/to/VC3D] [--rpc-timeout SECONDS]
 """
 from __future__ import annotations
 
@@ -44,6 +44,7 @@ DEFAULT_VC3D_BIN = REPO_ROOT / "build" / "ci-release-gcc" / "bin" / "VC3D"
 DESCRIPTION_SNAPSHOT = Path(__file__).resolve().parents[1] / "rpc_description.json"
 
 OFFSCREEN_ENV = {"QT_QPA_PLATFORM": "offscreen"}
+RPC_TIMEOUT = 10.0
 
 
 def log(msg: str) -> None:
@@ -84,6 +85,42 @@ def launch(
         binary,
         args,
         env_overrides=env,
+    )
+
+
+def require_running(proc: VC3DProcess, results: Results, context: str) -> None:
+    if proc.is_running():
+        return
+
+    exit_code = proc.exit_code()
+    results.record(
+        "process_alive",
+        False,
+        f"VC3D exited during {context} with code {exit_code}",
+    )
+    captured = proc.tail_log(8000)
+    crash_start = next(
+        (i for i, line in enumerate(captured) if "VC3D CRASH REPORT" in line),
+        None,
+    )
+    if crash_start is not None:
+        start = max(0, crash_start - 20)
+        end = next(
+            (
+                i for i in range(crash_start + 1, len(captured))
+                if captured[i] == "--- BYTES AT PC ---"
+            ),
+            min(len(captured), crash_start + 250),
+        )
+        diagnostic_lines = captured[start:end]
+    else:
+        diagnostic_lines = captured[-120:]
+
+    log(f"VC3D diagnostics after unexpected exit during {context}:")
+    for line in diagnostic_lines:
+        log(f"[VC3D] {line}")
+    raise RuntimeError(
+        f"VC3D exited during {context} with code {exit_code}"
     )
 
 
@@ -151,7 +188,7 @@ def wait_for_job(
         status, _ = client.call(
             "job.status",
             {"jobId": job_id},
-            timeout=min(10.0, timeout),
+            timeout=min(RPC_TIMEOUT, timeout),
         )
         if status.get("state") != "running":
             return status
@@ -163,7 +200,7 @@ def expect_param_error(client: BridgeClient, method: str, params: object,
                        expect_param: str) -> tuple[bool, str]:
     """Calls `method`; expects BridgeError(-32602) with data.param == expect_param."""
     try:
-        result, _ = client.call(method, params, timeout=10.0)
+        result, _ = client.call(method, params, timeout=RPC_TIMEOUT)
         return False, f"expected -32602, got result keys={list(result)[:6]}"
     except BridgeError as e:
         if e.code != -32602:
@@ -182,7 +219,7 @@ def expect_prevalidation_accepts(
     params: object,
 ) -> tuple[bool, str]:
     try:
-        client.call(method, params, timeout=10.0)
+        client.call(method, params, timeout=RPC_TIMEOUT)
         return True, "request passed descriptor validation"
     except BridgeError as error:
         return (
@@ -214,7 +251,7 @@ def check_rpc_describe(
         description, _ = client.call(
             "rpc.describe",
             {"prefix": "viewer."},
-            timeout=10.0,
+            timeout=RPC_TIMEOUT,
         )
         methods = description.get("methods", {})
         coverage = description.get("coverage", {})
@@ -253,7 +290,7 @@ def check_rpc_describe(
         )
 
     try:
-        description, _ = client.call("rpc.describe", {}, timeout=10.0)
+        description, _ = client.call("rpc.describe", {}, timeout=RPC_TIMEOUT)
         snapshot = {"methods": description.get("methods", {})}
         coverage = description.get("coverage", {})
         complete = (
@@ -349,7 +386,7 @@ def check_viewer_normalization(client: BridgeClient, results: Results) -> None:
                 "samplingStride": -7,
                 "zScrollSensitivity": 107,
             },
-            timeout=10.0,
+            timeout=RPC_TIMEOUT,
         )
         for path, expected in {
             "intersectionOpacity": 1,
@@ -373,7 +410,7 @@ def check_viewer_normalization(client: BridgeClient, results: Results) -> None:
                 "maxDisplayedResolution": 12,
                 "composite": {"layersFront": -7, "layersBehind": 100},
             },
-            timeout=10.0,
+            timeout=RPC_TIMEOUT,
         )
         for path, expected in {
             "opacity": 1,
@@ -387,7 +424,7 @@ def check_viewer_normalization(client: BridgeClient, results: Results) -> None:
         overlay, _ = client.call(
             "viewer.set_overlay",
             {"window": {"low": 10, "high": 5}},
-            timeout=10.0,
+            timeout=RPC_TIMEOUT,
         )
         expect(overlay, "windowLow", 10)
         expect(overlay, "windowHigh", 11)
@@ -395,11 +432,11 @@ def check_viewer_normalization(client: BridgeClient, results: Results) -> None:
         overlay, _ = client.call(
             "viewer.set_overlay",
             {"colormap": ""},
-            timeout=10.0,
+            timeout=RPC_TIMEOUT,
         )
         expect(overlay, "colormap", "")
         overlay, _ = client.call(
-            "viewer.get_overlay", {}, timeout=10.0)
+            "viewer.get_overlay", {}, timeout=RPC_TIMEOUT)
         expect(overlay, "colormap", "")
     except Exception as error:  # noqa: BLE001
         failures.append(f"{type(error).__name__}: {error}")
@@ -421,7 +458,7 @@ def check_canvas_normalization(client: BridgeClient, results: Results) -> None:
                 "to": {"x": 1, "y": 1, "z": 1},
                 "steps": 300,
             },
-            timeout=10.0,
+            timeout=RPC_TIMEOUT,
         )
         results.record(
             "canvas_drag_step_clamp",
@@ -446,7 +483,7 @@ def check_project_create(
     created = requested.with_suffix(".volpkg.json")
 
     try:
-        before, _ = client.call("state.get", {}, timeout=10.0)
+        before, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
         result, _ = client.call(
             "project.create",
             {
@@ -454,9 +491,9 @@ def check_project_create(
                 "volume": str(volume),
                 "tags": ["source:smoke"],
             },
-            timeout=10.0,
+            timeout=RPC_TIMEOUT,
         )
-        after, _ = client.call("state.get", {}, timeout=10.0)
+        after, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
         document = json.loads(created.read_text())
         volume_entry = document.get("volumes", [{}])[0]
         valid = (
@@ -494,7 +531,7 @@ def check_project_create(
         client.call(
             "project.create",
             {"path": str(created), "volume": str(volume)},
-            timeout=10.0,
+            timeout=RPC_TIMEOUT,
         )
         results.record(
             "project_create_overwrite_guard",
@@ -524,7 +561,7 @@ def check_project_create(
             client.call(
                 "project.create",
                 {"path": str(output), "volume": candidate},
-                timeout=10.0,
+                timeout=RPC_TIMEOUT,
             )
             results.record(name, False, "expected an error, got a result")
         except BridgeError as error:
@@ -577,7 +614,7 @@ def check_project_create(
         opened, _ = client.call(
             "volume.open",
             {"path": str(created)},
-            timeout=10.0,
+            timeout=RPC_TIMEOUT,
         )
         results.record(
             "project_create_then_open",
@@ -606,7 +643,7 @@ def check_volume_attach(
         retry, _ = client.call(
             "volume.attach",
             {"location": str(root / "volumes" / "vol1")},
-            timeout=10.0,
+            timeout=RPC_TIMEOUT,
         )
         terminal = wait_for_job(client, retry["jobId"])
         document = json.loads(volpkg.read_text())
@@ -627,35 +664,35 @@ def check_volume_attach(
         )
 
     try:
-        before, _ = client.call("volume.list", {}, timeout=10.0)
+        before, _ = client.call("volume.list", {}, timeout=RPC_TIMEOUT)
         started, _ = client.call(
             "volume.attach",
             {
                 "location": str(overlay),
                 "tags": ["role:overlay", "source:smoke"],
             },
-            timeout=10.0,
+            timeout=RPC_TIMEOUT,
         )
         terminal = wait_for_job(client, started["jobId"])
-        volumes, _ = client.call("volume.list", {}, timeout=10.0)
+        volumes, _ = client.call("volume.list", {}, timeout=RPC_TIMEOUT)
         available, _ = client.call(
-            "viewer.list_overlay_volumes", {}, timeout=10.0)
+            "viewer.list_overlay_volumes", {}, timeout=RPC_TIMEOUT)
         overlay_result, _ = client.call(
             "viewer.set_overlay",
             {"volumeId": "vol2", "opacity": 0.4},
-            timeout=10.0,
+            timeout=RPC_TIMEOUT,
         )
         overlay_read, _ = client.call(
-            "viewer.get_overlay", {}, timeout=10.0)
+            "viewer.get_overlay", {}, timeout=RPC_TIMEOUT)
         selected, _ = client.call(
-            "viewer.list_overlay_volumes", {}, timeout=10.0)
+            "viewer.list_overlay_volumes", {}, timeout=RPC_TIMEOUT)
         render_result, _ = client.call(
             "viewer.set_render_settings",
             {"overlayOpacity": 0.35},
-            timeout=10.0,
+            timeout=RPC_TIMEOUT,
         )
         overlay_after_render, _ = client.call(
-            "viewer.get_overlay", {}, timeout=10.0)
+            "viewer.get_overlay", {}, timeout=RPC_TIMEOUT)
         results.record(
             "viewer_overlay_controller_sync",
             overlay_read.get("volumeId") == "vol2"
@@ -720,15 +757,15 @@ def check_volume_attach(
                 "opacity": 0.35,
                 "window": {"low": 17, "high": 201},
             },
-            timeout=10.0,
+            timeout=RPC_TIMEOUT,
         )
         client.call(
             "volume.open",
             {"path": str(volpkg)},
-            timeout=10.0,
+            timeout=RPC_TIMEOUT,
         )
         restored_overlay, _ = client.call(
-            "viewer.get_overlay", {}, timeout=10.0)
+            "viewer.get_overlay", {}, timeout=RPC_TIMEOUT)
         results.record(
             "viewer_overlay_reopen",
             restored_overlay == expected_overlay,
@@ -745,7 +782,7 @@ def check_volume_attach(
         retry, _ = client.call(
             "volume.attach",
             {"location": str(overlay), "tags": ["replacement:ignored"]},
-            timeout=10.0,
+            timeout=RPC_TIMEOUT,
         )
         terminal = wait_for_job(client, retry["jobId"])
         document = json.loads(volpkg.read_text())
@@ -777,10 +814,10 @@ def check_volume_attach(
         started, _ = client.call(
             "volume.attach",
             {"location": str(conflict)},
-            timeout=10.0,
+            timeout=RPC_TIMEOUT,
         )
         terminal = wait_for_job(client, started["jobId"])
-        volumes, _ = client.call("volume.list", {}, timeout=10.0)
+        volumes, _ = client.call("volume.list", {}, timeout=RPC_TIMEOUT)
         document = json.loads(volpkg.read_text())
         persisted = [
             entry
@@ -806,7 +843,7 @@ def check_volume_attach(
         client.call(
             "volume.attach",
             {"location": str(root / "volumes")},
-            timeout=10.0,
+            timeout=RPC_TIMEOUT,
         )
         results.record(
             "volume_attach_rejects_collection",
@@ -856,7 +893,7 @@ def check_segments_attach(
         initial_result, _ = client.call(
             "segments.attach",
             {"location": str(initial) + os.sep},
-            timeout=10.0,
+            timeout=RPC_TIMEOUT,
         )
         result, _ = client.call(
             "segments.attach",
@@ -864,9 +901,9 @@ def check_segments_attach(
                 "location": str(source),
                 "tags": ["source:smoke", "status:working"],
             },
-            timeout=10.0,
+            timeout=RPC_TIMEOUT,
         )
-        listed, _ = client.call("segments.list", {}, timeout=10.0)
+        listed, _ = client.call("segments.list", {}, timeout=RPC_TIMEOUT)
         document = json.loads(volpkg.read_text())
         initial_locations = {
             entry.get("location") if isinstance(entry, dict) else entry
@@ -912,7 +949,7 @@ def check_segments_attach(
         retry, _ = client.call(
             "segments.attach",
             {"location": str(source) + os.sep},
-            timeout=10.0,
+            timeout=RPC_TIMEOUT,
         )
         document = json.loads(volpkg.read_text())
         matching = [
@@ -942,13 +979,13 @@ def check_segments_attach(
         client.call(
             "volume.open",
             {"path": str(volpkg)},
-            timeout=10.0,
+            timeout=RPC_TIMEOUT,
         )
-        reopened, _ = client.call("segments.list", {}, timeout=10.0)
+        reopened, _ = client.call("segments.list", {}, timeout=RPC_TIMEOUT)
         retry, _ = client.call(
             "segments.attach",
             {"location": str(source)},
-            timeout=10.0,
+            timeout=RPC_TIMEOUT,
         )
         document = json.loads(volpkg.read_text())
         matching = [
@@ -983,12 +1020,12 @@ def check_segments_attach(
         client.call(
             "segments.activate",
             {"segmentId": segment_id},
-            timeout=10.0,
+            timeout=RPC_TIMEOUT,
         )
         client.call(
             "segmentation.enable_editing",
             {"enabled": True},
-            timeout=10.0,
+            timeout=RPC_TIMEOUT,
         )
         editing_enabled = True
         blocked = root / "blocked-segments"
@@ -998,7 +1035,7 @@ def check_segments_attach(
             client.call(
                 "segments.attach",
                 {"location": str(blocked), "select": False},
-                timeout=10.0,
+                timeout=RPC_TIMEOUT,
             )
             results.record(
                 "segments_attach_editing_guard",
@@ -1024,7 +1061,7 @@ def check_segments_attach(
                 client.call(
                     "segmentation.enable_editing",
                     {"enabled": False},
-                    timeout=10.0,
+                    timeout=RPC_TIMEOUT,
                 )
             except Exception as error:  # noqa: BLE001
                 results.record(
@@ -1041,7 +1078,7 @@ def check_segments_attach(
         client.call(
             "segments.attach",
             {"location": str(conflicting)},
-            timeout=10.0,
+            timeout=RPC_TIMEOUT,
         )
         results.record(
             "segments_attach_source_name_conflict",
@@ -1076,7 +1113,7 @@ def check_segments_attach(
         client.call(
             "segments.attach",
             {"location": str(root / "missing-segments")},
-            timeout=10.0,
+            timeout=RPC_TIMEOUT,
         )
         results.record(
             "segments_attach_invalid_layout",
@@ -1101,7 +1138,7 @@ def check_c4(client: BridgeClient, results: Results, volpkg: str,
              broken_fiber_volpkg: str) -> None:
     # Liveness / dispatch sanity.
     try:
-        state, _ = client.call("state.get", {}, timeout=10.0)
+        state, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
         results.record("liveness_state_get", isinstance(state, dict),
                        f"keys={list(state)[:4] if isinstance(state, dict) else state}")
     except Exception as e:  # noqa: BLE001
@@ -1136,11 +1173,11 @@ def check_c4(client: BridgeClient, results: Results, volpkg: str,
 
     try:
         overlay_before_error, _ = client.call(
-            "viewer.get_overlay", {}, timeout=10.0)
+            "viewer.get_overlay", {}, timeout=RPC_TIMEOUT)
         client.call(
             "viewer.set_overlay",
             {"volumeId": "__missing__"},
-            timeout=10.0,
+            timeout=RPC_TIMEOUT,
         )
         results.record(
             "viewer_overlay_unknown_volume",
@@ -1149,7 +1186,7 @@ def check_c4(client: BridgeClient, results: Results, volpkg: str,
         )
     except BridgeError as error:
         overlay_after_error, _ = client.call(
-            "viewer.get_overlay", {}, timeout=10.0)
+            "viewer.get_overlay", {}, timeout=RPC_TIMEOUT)
         results.record(
             "viewer_overlay_unknown_volume",
             error.code == -32007
@@ -1181,7 +1218,7 @@ def check_c4(client: BridgeClient, results: Results, volpkg: str,
     results.record("c4_int_fractional_rejected", ok, detail)
 
     try:
-        state2, _ = client.call("state.get", {}, timeout=10.0)
+        state2, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
         results.record("c4_no_corruption_state_get", isinstance(state2, dict),
                        "bridge still answers after malformed requests")
     except Exception as e:  # noqa: BLE001
@@ -1189,11 +1226,11 @@ def check_c4(client: BridgeClient, results: Results, volpkg: str,
 
     before = None
     try:
-        before, _ = client.call("state.get", {}, timeout=10.0)
+        before, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
         client.call(
             "volume.open",
             {"path": "/vc3d-smoke/does-not-exist.volpkg.json"},
-            timeout=10.0,
+            timeout=RPC_TIMEOUT,
         )
         results.record("volume_open_failure_is_headless", False,
                        "expected a bridge error, got a result")
@@ -1205,7 +1242,7 @@ def check_c4(client: BridgeClient, results: Results, volpkg: str,
                        f"unexpected {type(e).__name__}: {e}")
 
     try:
-        after, _ = client.call("state.get", {}, timeout=10.0)
+        after, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
         preserved = before is not None and after.get("vpkg") == before.get("vpkg")
         results.record("volume_open_failure_preserves_project", preserved,
                        f"vpkg unchanged={preserved}")
@@ -1217,12 +1254,12 @@ def check_c4(client: BridgeClient, results: Results, volpkg: str,
         client.call(
             "volume.open",
             {"path": volpkg, "volumeId": "missing-volume"},
-            timeout=10.0,
+            timeout=RPC_TIMEOUT,
         )
         results.record("volume_open_unknown_id_preserves_project", False,
                        "expected a bridge error, got a result")
     except BridgeError as e:
-        after, _ = client.call("state.get", {}, timeout=10.0)
+        after, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
         preserved = before is not None and after.get("vpkg") == before.get("vpkg")
         results.record("volume_open_unknown_id_preserves_project",
                        e.code == -32007 and preserved,
@@ -1233,7 +1270,7 @@ def check_c4(client: BridgeClient, results: Results, volpkg: str,
 
     try:
         opened, _ = client.call(
-            "volume.open", {"path": broken_fiber_volpkg}, timeout=10.0)
+            "volume.open", {"path": broken_fiber_volpkg}, timeout=RPC_TIMEOUT)
         results.record(
             "volume_open_broken_fibers_is_headless",
             opened.get("opened") is True,
@@ -1244,7 +1281,7 @@ def check_c4(client: BridgeClient, results: Results, volpkg: str,
                        f"unexpected {type(e).__name__}: {e}")
 
     try:
-        saved, _ = client.call("fiber.save", {}, timeout=10.0)
+        saved, _ = client.call("fiber.save", {}, timeout=RPC_TIMEOUT)
         results.record("fiber_save_completion_response", saved.get("saved") is True,
                        f"saved={saved.get('saved')}")
     except Exception as e:  # noqa: BLE001
@@ -1257,7 +1294,7 @@ def check_c2_oversized(sock_path: str, results: Results) -> None:
     while a separate fresh connection keeps working."""
     over = 2 * 1024 * 1024  # > kMaxLineBytes (1 MiB), no newline
     raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    raw.settimeout(10.0)
+    raw.settimeout(RPC_TIMEOUT)
     closed_by_server = False
     detail = ""
     try:
@@ -1269,7 +1306,7 @@ def check_c2_oversized(sock_path: str, results: Results) -> None:
             while sent < over:
                 sent += raw.send(chunk)
             # Fully sent without error: the server must close the read side (EOF).
-            deadline = time.monotonic() + 10.0
+            deadline = time.monotonic() + RPC_TIMEOUT
             while time.monotonic() < deadline:
                 try:
                     data = raw.recv(65536)
@@ -1293,9 +1330,9 @@ def check_c2_oversized(sock_path: str, results: Results) -> None:
 
     # A separate fresh connection must be unaffected.
     try:
-        fresh = BridgeClient(sock_path, connect_timeout=10.0)
+        fresh = BridgeClient(sock_path, connect_timeout=RPC_TIMEOUT)
         try:
-            state, _ = fresh.call("state.get", {}, timeout=10.0)
+            state, _ = fresh.call("state.get", {}, timeout=RPC_TIMEOUT)
             results.record("c2_other_client_unaffected", isinstance(state, dict),
                            "fresh connection still answers state.get")
         finally:
@@ -1311,7 +1348,7 @@ def check_c2_suffix_bypass(sock_path: str, results: Results) -> None:
     present, so the residual has to be bounded after the framed lines are
     consumed. Send '{}\\n' + >1 MiB with no further newline."""
     raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    raw.settimeout(10.0)
+    raw.settimeout(RPC_TIMEOUT)
     closed_by_server = False
     detail = ""
     try:
@@ -1324,7 +1361,7 @@ def check_c2_suffix_bypass(sock_path: str, results: Results) -> None:
         try:
             while sent < over:
                 sent += raw.send(chunk)
-            deadline = time.monotonic() + 10.0
+            deadline = time.monotonic() + RPC_TIMEOUT
             while time.monotonic() < deadline:
                 try:
                     data = raw.recv(65536)
@@ -1346,9 +1383,9 @@ def check_c2_suffix_bypass(sock_path: str, results: Results) -> None:
 
     # Bridge still serves other clients after bounding the suffix.
     try:
-        fresh = BridgeClient(sock_path, connect_timeout=10.0)
+        fresh = BridgeClient(sock_path, connect_timeout=RPC_TIMEOUT)
         try:
-            state, _ = fresh.call("state.get", {}, timeout=10.0)
+            state, _ = fresh.call("state.get", {}, timeout=RPC_TIMEOUT)
             results.record("c9_other_client_unaffected", isinstance(state, dict),
                            "fresh connection still answers after suffix drop")
         finally:
@@ -1415,7 +1452,7 @@ def check_c3_live_probe(binary: str, name: str, sock_path: str,
     # The already-connected client survives regardless (existing fd), so this is
     # only a weak liveness signal, not proof the endpoint wasn't reclaimed.
     try:
-        state, _ = first_client.call("state.get", {}, timeout=10.0)
+        state, _ = first_client.call("state.get", {}, timeout=RPC_TIMEOUT)
         results.record("c3_first_conn_still_answers", isinstance(state, dict),
                        "pre-existing connection still answers state.get")
     except Exception as e:  # noqa: BLE001
@@ -1424,15 +1461,26 @@ def check_c3_live_probe(binary: str, name: str, sock_path: str,
 
 
 def main() -> int:
+    global RPC_TIMEOUT
+
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--vc3d", default=str(DEFAULT_VC3D_BIN),
                     help="path to the VC3D binary")
+    ap.add_argument(
+        "--rpc-timeout",
+        type=float,
+        default=RPC_TIMEOUT,
+        help="per-call bridge timeout in seconds (default: 10)",
+    )
     ap.add_argument(
         "--update-description-snapshot",
         action="store_true",
         help="rewrite the checked-in rpc.describe snapshot from the live binary",
     )
     args = ap.parse_args()
+    if args.rpc_timeout <= 0:
+        ap.error("--rpc-timeout must be positive")
+    RPC_TIMEOUT = args.rpc_timeout
 
     binary = args.vc3d
     if not os.path.exists(binary):
@@ -1466,7 +1514,7 @@ def main() -> int:
         try:
             sock_path = proc.wait_for_handshake(timeout=60.0)
             log(f"handshake: name={name} path={sock_path}")
-            client = BridgeClient(sock_path, connect_timeout=10.0)
+            client = BridgeClient(sock_path, connect_timeout=RPC_TIMEOUT)
 
             check_rpc_describe(
                 client,
@@ -1474,6 +1522,7 @@ def main() -> int:
                 update_snapshot=args.update_description_snapshot,
             )
             check_viewer_normalization(client, results)
+            require_running(proc, results, "viewer normalization")
             check_canvas_normalization(client, results)
 
             check_volume_attach(client, results, tmp_path, volpkg)

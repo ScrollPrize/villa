@@ -1643,7 +1643,7 @@ def _phase_and_count_losses(
     if outer - inner < 1:
         return
     started = time.perf_counter()
-    num_pairs = int(cfg['dense_spacing_num_pairs'])
+    num_pairs = int(cfg['sample_count_dense_spacing_pairs'])
     if num_pairs <= 0:
         # A zero shared-ray budget disables phase/count sampling. Be defensive
         # here because session configuration is remote and may come from an
@@ -1651,9 +1651,9 @@ def _phase_and_count_losses(
         # supplemental budget remains usable without a shared batch.
         if density_active:
             total_density_pairs = max(
-                0, int(cfg['dense_spacing_density_extra_pairs']))
+                0, int(cfg['sample_count_dense_spacing_density_extra_pairs']))
             chunk_cap = max(
-                1, int(cfg['dense_spacing_density_chunk_pairs']))
+                1, int(cfg['sample_count_dense_spacing_density_chunk_pairs']))
             remaining = total_density_pairs
             while remaining > 0:
                 n_chunk = min(chunk_cap, remaining)
@@ -1714,7 +1714,7 @@ def _phase_and_count_losses(
         seg_valids = [pair['seg_valid']]
         theta_all, z_all, r_mid_all = [theta], [z], [
             (k + m_f / 2 + theta / (2 * np.pi)) * dr_per_winding.detach()]
-        extra_pairs = int(cfg['dense_spacing_count_extra_pairs'])
+        extra_pairs = int(cfg['sample_count_dense_spacing_count_extra_pairs'])
         if extra_pairs > 0:
             # Optional count-only supplement restoring spatial coverage when
             # the shared batch alone is too sparse.
@@ -1805,7 +1805,7 @@ def _phase_and_count_losses(
             if not phase_active:
                 # the shared-batch health metrics otherwise ride with phase
                 density_metrics.update(central_metrics)
-            extra_pairs = int(cfg['dense_spacing_density_extra_pairs'])
+            extra_pairs = int(cfg['sample_count_dense_spacing_density_extra_pairs'])
             total_density_pairs = num_pairs + max(0, extra_pairs)
             share = num_pairs / total_density_pairs
             density_metrics['_shared_graph'] = True
@@ -1815,7 +1815,7 @@ def _phase_and_count_losses(
             # detection, no pair-HMM) is cheap enough to run at several times
             # the shared-batch sampling; chunked so only one chunk's graph is
             # resident per backward.
-            chunk_cap = int(cfg['dense_spacing_density_chunk_pairs'])
+            chunk_cap = int(cfg['sample_count_dense_spacing_density_chunk_pairs'])
             remaining = max(0, extra_pairs)
             while remaining > 0:
                 n_chunk = min(chunk_cap, remaining)
@@ -1925,7 +1925,7 @@ def get_min_spacing_loss(
     zero = torch.zeros([], device=device)
     if outer_winding_idx is None:
         return zero, {}
-    num_samples = int(cfg['min_spacing_independent_samples'])
+    num_samples = int(cfg['sample_count_minimum_spacing_independent_samples'])
     inner, outer = fitted_winding_domain(outer_winding_idx)
     if outer <= inner or num_samples <= 0:
         return zero, {}
@@ -1936,7 +1936,7 @@ def get_min_spacing_loss(
     z = torch.empty(num_samples, device=device).uniform_(
         float(z_begin), float(z_end - 1), generator=generator)
     ell_gap = spiral_and_transform.get_native_log_gaps(winding, theta, z)
-    ell_min = float(np.log(float(cfg['min_spacing_d_min_wv'])))
+    ell_min = float(np.log(float(cfg['dense_min_spacing_d_min_wv'])))
     deficiency = F.relu(ell_min - ell_gap)
     loss = deficiency.square().mean()
     if not metrics_enabled():
@@ -1972,7 +1972,7 @@ def get_dense_attachment_loss(
     if sdt_volume['kind'] != 'sdt':
         raise ValueError('attachment requires a signed-distance store, not a raw-surf volume')
 
-    num_points = int(cfg['dense_attachment_num_points'])
+    num_points = int(cfg['sample_count_dense_attachment_points'])
     attachment_scale = float(cfg['dense_attachment_scale'])
     inner_winding, outer_winding = fitted_winding_domain(outer_winding_idx)
     if outer_winding < inner_winding:

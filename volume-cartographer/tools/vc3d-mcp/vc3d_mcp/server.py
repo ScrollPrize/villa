@@ -34,7 +34,7 @@ from . import tools  # noqa: F401  - imports every module, registering its @mcp.
 # Handshake wait budget for the auto-launch path: VC3D can take a while to
 # construct CWindow before AgentBridgeServer::listen() prints the handshake.
 LAUNCH_HANDSHAKE_TIMEOUT_S = 30.0
-BRIDGE_PROTOCOL_VERSION = 1
+BRIDGE_PROTOCOL_VERSION = 2
 
 # Kept alive for the process lifetime so a bridge we launched isn't reaped as a
 # child zombie, and can be terminated on our own exit.

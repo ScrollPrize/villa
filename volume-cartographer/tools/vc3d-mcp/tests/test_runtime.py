@@ -212,7 +212,7 @@ class AutoLaunchTest(unittest.TestCase):
             path_lookup.assert_not_called()
 
     def test_protocol_check_rejects_stale_bridge(self) -> None:
-        with self.assertRaisesRegex(BridgeConnectionError, "expected 1, got None"):
+        with self.assertRaisesRegex(BridgeConnectionError, "expected 2, got None"):
             server_module._validate_protocol({"pong": True})
 
 

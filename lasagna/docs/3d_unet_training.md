@@ -650,6 +650,14 @@ accumulators → chunked normal estimation from 3×2 direction channels → uint
 encoding → zarr output. Input tiles are read lazily from zarr (no full-crop
 load). Uses CUDA by default when available.
 
+The generic tiled mechanics live in `lasagna/tiled_predict3d.py`: canonical
+global tile positions, crop-independent output chunk selection, rolling
+z-band scratch, output-chunk resume, temp cleanup, progress, and atomic chunk
+writes. `preprocess_cos_omezarr.py predict3d` is the Lasagna adapter/wrapper
+for cos, `grad_mag/nx/ny`, optional `pred_dt`, `.lasagna.json` metadata, and
+Lasagna pyramid generation. The wrapper CLI and output semantics stay
+compatible with earlier `predict3d` runs.
+
 #### Basic usage
 
 ```bash
@@ -684,6 +692,10 @@ python lasagna/preprocess_cos_omezarr.py predict3d \
 | `--crop-xyzwhd` | Process only a sub-region: `x y z w h d` in fullres input coordinates. |
 | `--pred-dt` | Path to a surface prediction zarr. Adds a `pred_dt` distance-to-surface channel to the output. |
 | `--device` | Compute device (default: `cuda` if available, otherwise `cpu`). |
+| `--devices` | Multi-GPU selection: `all` visible GPUs or a comma-separated subset such as `cuda:0,cuda:2`. Cannot be combined with `--device`. |
+| `--prefetch-workers` | CPU/Zarr tile readers. `0` selects a bounded automatic count. |
+| `--slots-per-gpu` | Fixed shared-memory input/result pipeline slots per GPU (default 2). |
+| `--download-workers` | Parallel automatic S3 chunk transfers (default 64); independent of inference and pyramid workers. |
 | `--chunk-z` | Zarr chunk size along Z in the output (default 32). |
 | `--chunk-yx` | Zarr chunk size along Y and X in the output (default 32). |
 
@@ -705,10 +717,49 @@ per logical accumulator channel. Completed z bands are normalized, written as
 full OME-Zarr chunks, and discarded before the next bands are processed. Input
 tiles are read lazily from the zarr — the full crop is never loaded into RAM.
 
+Multi-GPU inference keeps only the independent axis lattices and generates
+their Cartesian tile stream on demand. Asynchronous TensorStore bounding-box
+reads use a separate bounded read-ahead window while persistent per-GPU model
+workers use fixed shared-memory input/result slots. Completed input arrays are
+copied into shared memory only when a GPU queue and both slot types are
+available, then released. Worker results can finish out of order, but they are
+accumulated in the same canonical order as serial inference; only the
+coordinator writes Zarr or advances the rolling Z ring. The conservative input
+memory bound is the read-ahead window times one padded tile, plus TensorStore's
+cache and the shared-memory slots. `--input-reader python-zarr` retains the old
+threaded reader for comparison.
+
+`--profile-pipeline` enables fixed-memory multi-device diagnostics. Historical
+`gpuN_sum` spans CPU dtype conversion through output D2H; the detailed report
+separates those stages and directly reports reader service-time sum, read-active
+wall span, throughput, effective outstanding-request concurrency,
+completion-to-collection lag, and GPU input
+idle time. Per-worker sums are concurrent service totals, not wall time.
+CUDA workers transfer compact integer input and report compact-H2D separately
+from FP32 CUDA conversion; CPU execution preserves the historical conversion.
+
+Output flushing also overlaps inference. One enlarged but still fixed-depth
+mmap ring retains at most one finalized interval while the following Z row is
+accumulated into disjoint slots. Persistent spawn-process workers reopen that
+frozen interval read-only and normalize/finalize/write distinct output chunks
+in parallel, without copying a band through IPC. Their task/result queues are
+bounded and each worker allocates at most one chunk's temporary arrays. At the
+next flush frontier the coordinator waits if needed, clears/releases the whole
+completed interval, and submits the next. `--flush-workers` defaults to the
+available CPU count capped at 64; zero restores synchronous flushing and the
+smaller immediate-release ring for A/B measurements. Final status reports
+workers, chunks, aggregate worker time, and coordinator wait.
+
+Raw product rings default to float16, halving ring backing. Persistent
+accumulator processes use the native runtime-dispatched AVX-512 kernel on
+supported x86 hosts and a portable fallback elsewhere. Use
+`--product-accumulator-dtype float32` when float32 accumulation is required.
+The shared weight denominator and per-chunk flush arithmetic remain float32.
+
 | Component            | RAM usage (2000³ crop, sd=4) |
 |----------------------|-----------------------------|
 | Input                | ~0 (lazy zarr reads)         |
-| Rolling accumulator  | active z-band only           |
+| Rolling accumulator  | active band + one frozen flush interval (mmap) |
 | Post-processing      | ~0.5 GiB (Z-chunked)         |
 | **Total**            | bounded by active band       |
 
@@ -729,6 +780,11 @@ All chunk writes go through unique temporary paths and are installed with
 atomic rename. On startup/resume and on normal finish, stale predict3d temp
 paths in the output directory are removed; pid-bearing temp paths owned by
 other live predict3d processes are left alone.
+
+The shared runner treats each logical product independently. For Lasagna,
+`cos` is a single-channel fine product, `grad_mag/nx/ny` is one coherent
+coarse model product, and `pred_dt` is a derived product. Fiber inference uses
+the same mechanics but different adapters and output semantics.
 
 The process sets `oom_score_adj=1000` so the OOM killer targets it before the
 parent session.

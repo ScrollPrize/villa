@@ -23,8 +23,10 @@
 #include <opencv2/core/mat.hpp>
 
 #include "LineAnnotationFiberClassification.hpp"
+#include "LineAnnotationFiberSegments.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 #include "vc/atlas/FiberIntersections.hpp"
+#include "vc/core/util/Umbilicus.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 
@@ -55,7 +57,7 @@ public:
         bool ok = false;
         std::filesystem::path manifestPath;
         cv::Vec3d seedPoint{0.0, 0.0, 0.0};
-        std::vector<vc::lasagna::LineControlPoint> controlPoints;
+        std::vector<vc3d::line_annotation::LineControlPoint> controlPoints;
         cv::Vec3d sourceSliceNormal{0.0, 0.0, 1.0};
         InitialDirectionMode initialDirectionMode = InitialDirectionMode::Sideways;
         vc::lasagna::LineOptimizationResult result;
@@ -81,6 +83,13 @@ public:
             int linePointCount = 0;
             double lengthVx = 0.0;
             AlignmentMetrics alignment;
+            // Actual producer of the stored span geometry: 'C' (cspline),
+            // 'L' (lasagna), or 'T' (prediction trace).
+            char interpMarker = 'L';
+            // Predictions provenance: the fiber-inference manifest the
+            // trace ran with (segment_to_next.fiber_manifest); empty for
+            // non-trace spans.
+            std::string fiberManifest;
         };
 
         uint64_t id = 0;
@@ -103,6 +112,9 @@ public:
         int linkedFiberCount = 0;
         // Number of branch links on this fiber still awaiting review approval.
         int pendingLinkCount = 0;
+        // Interpolation provenance of the stored geometry (see deriveTraceState).
+        vc3d::line_annotation::FiberTraceState traceState =
+            vc3d::line_annotation::FiberTraceState::Legacy;
     };
 
     struct FiberSnapshotWithPath {
@@ -150,7 +162,7 @@ public:
     using VolumeSelectorFactory = std::function<QWidget*(QWidget*)>;
     using OptimizationTaskFactory =
         std::function<OptimizationTaskResult(std::filesystem::path,
-                                             std::vector<vc::lasagna::LineControlPoint>,
+                                             std::vector<vc3d::line_annotation::LineControlPoint>,
                                              std::vector<cv::Vec3d>,
                                              cv::Vec3d,
                                              InitialDirectionMode,
@@ -166,7 +178,6 @@ public:
     ~LineAnnotationController() override;
 
     bool canLaunchFromViewer(const CChunkedVolumeViewer* viewer) const;
-    void launchFromViewer(CChunkedVolumeViewer* viewer, const QPointF& scenePoint);
     void launchFromViewerAtPoint(CChunkedVolumeViewer* viewer,
                                  const QPointF& scenePoint,
                                  bool replaceOwningAnnotation = true);
@@ -241,6 +252,18 @@ public:
 
     void setDatasetPickerForTesting(DatasetPicker picker);
     void setOptimizationTaskFactoryForTesting(OptimizationTaskFactory factory);
+    // Replaces the modal QMessageBox that guards fiber optimization-mode
+    // switches; the callback receives the requested mode and returns
+    // whether to proceed.
+    void setModeChangeConfirmationForTesting(
+        std::function<bool(vc3d::line_annotation::FiberOptimizationMode)> confirmer);
+    // Replaces the modal QMessageBox shown when the two fibers of a merge
+    // carry different optimization modes; the callback receives (clicked,
+    // candidate) modes and returns the mode to keep, or nullopt to cancel.
+    void setMergeModePickerForTesting(
+        std::function<std::optional<vc3d::line_annotation::FiberOptimizationMode>(
+            vc3d::line_annotation::FiberOptimizationMode,
+            vc3d::line_annotation::FiberOptimizationMode)> picker);
     void setVolumeSelectorFactory(VolumeSelectorFactory factory);
     void setSurfacePanel(SurfacePanelController* panel);
     void setCurrentAtlasDirectory(std::optional<std::filesystem::path> atlasDir);
@@ -304,7 +327,7 @@ private:
         uint64_t sequence = 0;
         std::string fileName;
         uint64_t generation = 1;
-        std::vector<cv::Vec3d> controlPoints;
+        std::vector<vc3d::line_annotation::StoredControlPoint> controlPoints;
         std::vector<cv::Vec3d> linePoints;
         // Stored snapshots only. Live-session branch metadata must be converted
         // through storedFiberFromSession()/saveSessionAsFiber() so the central
@@ -313,6 +336,8 @@ private:
         vc3d::line_annotation::FiberHvClassification hvClassification;
         std::string manualHvTag;
         std::vector<std::string> tags;
+        vc3d::line_annotation::FiberOptimizationMode optimizationMode =
+            vc3d::line_annotation::FiberOptimizationMode::Lasagna;
         bool needsSave = false;
     };
 
@@ -425,12 +450,37 @@ private:
     void handleGeneratedPredSnapPoint(const std::string& surfaceName,
                                       cv::Vec3f volumePoint);
     void handleGeneratedSideStripIntersectionQuery(const std::string& surfaceName);
+    void handleGeneratedSegmentInterpolationGoal(const std::string& surfaceName,
+                                                 size_t firstControlPointIndex,
+                                                 size_t secondControlPointIndex,
+                                                 const std::string& goal);
     void handleGeneratedControlPointLinkCandidate(const std::string& surfaceName,
                                                   size_t controlPointIndex,
                                                   cv::Vec3f volumePoint);
     void handleGeneratedControlPointLinkWithCandidate(const std::string& surfaceName,
                                                       size_t controlPointIndex,
                                                       cv::Vec3f volumePoint);
+    // Concatenates the link candidate's fiber onto the session's fiber
+    // end-to-end (both control points must be endpoints) into one brand-new
+    // fiber: tags unioned, third-party links remapped, the pair link between
+    // the merge endpoints consumed, both originals deleted, the merged line
+    // re-optimized and reopened at the join.
+    void handleGeneratedControlPointMergeWithCandidate(const std::string& surfaceName,
+                                                       size_t controlPointIndex,
+                                                       cv::Vec3f volumePoint);
+    void handleGeneratedControlPointSplitCandidate(const std::string& surfaceName,
+                                                   size_t controlPointIndex,
+                                                   cv::Vec3f volumePoint);
+    // Splits the session's fiber between the split candidate and the clicked
+    // adjacent control point into two brand-new fibers (fresh identities,
+    // tags/mode/span metadata inherited, branch links remapped onto the
+    // halves), deletes the original, and reopens the candidate's half.
+    // linkHalves additionally records a reciprocal branch link between the
+    // two boundary control points ("Split from candidate and link").
+    void handleGeneratedControlPointSplitFromCandidate(const std::string& surfaceName,
+                                                       size_t controlPointIndex,
+                                                       cv::Vec3f volumePoint,
+                                                       bool linkHalves);
     void handleGeneratedOpenNearbyAnnotation(uint64_t fiberId, cv::Vec3f volumePoint);
     void handleGeneratedControlPointUnlink(const std::string& surfaceName,
                                            size_t controlPointIndex,
@@ -445,11 +495,22 @@ private:
         controlMarkersForSession(const LineAnnotationSession& session) const;
     [[nodiscard]] vc3d::line_annotation::GeneratedLinkCandidateMenuState
         linkCandidateMenuState(const LineAnnotationSession& session) const;
+    [[nodiscard]] vc3d::line_annotation::GeneratedLinkCandidateMenuState
+        splitCandidateMenuState(const LineAnnotationSession& session) const;
+    [[nodiscard]] vc3d::line_annotation::GeneratedLinkCandidateMenuState
+        splitAndLinkCandidateMenuState(const LineAnnotationSession& session) const;
+    [[nodiscard]] vc3d::line_annotation::GeneratedLinkCandidateMenuState
+        mergeCandidateMenuState(const LineAnnotationSession& session) const;
     [[nodiscard]] std::vector<vc3d::line_annotation::GeneratedOverlay::FiberIntersectionMarker>
         markLinkCandidateFiberIntersections(
             std::vector<vc3d::line_annotation::GeneratedOverlay::FiberIntersectionMarker> markers,
             const std::vector<FiberBranchRef>& branches) const;
     bool ensureDatasetForSession(LineAnnotationSession& session);
+    bool ensureFiberInferenceDatasetForSession(LineAnnotationSession& session);
+    void refreshLineAnnotationDatasetMenus() const;
+    void refreshLineAnnotationDatasetMenu(LineAnnotationDialog* dialog) const;
+    void handleLasagnaDatasetSelectionChanged(const std::string& location);
+    void handleFiberInferenceDatasetSelectionChanged(const std::string& location);
     bool needsFinalOptimization(const LineAnnotationSession& session) const;
     bool finalizeSessionOptimizationSynchronously(LineAnnotationSession& session,
                                                   bool fireSuccessCallback);
@@ -461,13 +522,28 @@ private:
                                      bool updateGeneratedViews,
                                      SessionOptimizationState resultOptimizationState,
                                      const std::string& eventOverride = {},
-                                     bool fireSuccessCallback = true);
+                                     bool fireSuccessCallback = true,
+                                     bool allowFiberSave = true);
     void requestFinalizedClose(const std::string& surfaceName);
     void startOptimization(LineAnnotationSession& session,
                            bool fullOptimization = false,
                            int activeStart = -1,
                            int activeEnd = -1);
+    void startFiberModeOptimization(LineAnnotationSession& session,
+                                    bool retraceAll,
+                                    std::optional<std::vector<size_t>> dirtySegments = std::nullopt,
+                                    bool globalGoalsOnly = false);
+    [[nodiscard]] vc3d::line_annotation::FiberModeOptimizationRequest
+        makeFiberModeOptimizationRequest(const LineAnnotationSession& session,
+                                         bool retraceAll,
+                                         std::optional<std::vector<size_t>> dirtySegments = std::nullopt,
+                                         bool globalGoalsOnly = false) const;
     void finishOptimization(const std::string& surfaceName);
+    // Per-line-point sampled sheet normals, sign-oriented away from the
+    // scroll center (umbilicus when available, volume XY center otherwise);
+    // NaN entries mark invalid samples.
+    [[nodiscard]] std::vector<cv::Vec3f> orientedLineNormalsForSession(
+        const LineAnnotationSession& session);
     bool materializeGeneratedViews(LineAnnotationSession& session);
     bool materializeGeneratedViews(LineAnnotationSession& session,
                                    const std::string& surfacePrefix);
@@ -478,10 +554,15 @@ private:
     [[nodiscard]] std::vector<std::filesystem::path> saveGeneratedQuadMeshes(LineAnnotationSession& session);
     [[nodiscard]] PaneRecord* paneForSurface(const std::string& surfaceName);
     [[nodiscard]] const PaneRecord* paneForSurface(const std::string& surfaceName) const;
+    // "H"/"V" from the manual tag, falling back to the automatic classification;
+    // empty when unknown or the fiber isn't loaded.
+    [[nodiscard]] QString fiberHvDirectionTag(uint64_t fiberId) const;
+    // Pushes the H/V tag and the clickable tag buttons to the pane's dialog.
+    void pushFiberUiState(const PaneRecord& pane) const;
     [[nodiscard]] std::optional<std::string> pickDataset(QWidget* parent,
                                                           const std::filesystem::path& startDir) const;
     [[nodiscard]] OptimizationTaskResult runOptimizationTask(std::filesystem::path manifestPath,
-                                                             std::vector<vc::lasagna::LineControlPoint> controlPoints,
+                                                             std::vector<vc3d::line_annotation::LineControlPoint> controlPoints,
                                                              std::vector<cv::Vec3d> initialLinePoints,
                                                              cv::Vec3d sourceSliceNormal,
                                                              InitialDirectionMode directionMode,
@@ -496,6 +577,20 @@ private:
     // needs_reoptimization tag; on load VC3D offers to re-fit their lines.
     // Declining keeps the tag so the next load asks again.
     void promptReoptimizationForMergedFibers();
+    // Modal guard before a fiber optimization-mode switch re-optimizes the
+    // line; returns false when the user cancels. Suppressed (agent-driven)
+    // sessions proceed without prompting.
+    [[nodiscard]] bool confirmFiberOptimizationModeChange(
+        const LineAnnotationSession& session,
+        vc3d::line_annotation::FiberOptimizationMode requestedMode);
+    // Modal picker when the two fibers of a merge carry different
+    // optimization modes; nullopt cancels the merge. Suppressed
+    // (agent-driven) sessions take the clicked fiber's mode.
+    [[nodiscard]] std::optional<vc3d::line_annotation::FiberOptimizationMode>
+        pickMergeOptimizationMode(
+            const LineAnnotationSession& session,
+            vc3d::line_annotation::FiberOptimizationMode clickedMode,
+            vc3d::line_annotation::FiberOptimizationMode candidateMode);
     // fileNames, not runtime ids: ids are densely reassigned on reloads,
     // which can happen while the prompt's modal spins.
     void reoptimizeMergedFibers(const std::vector<std::string>& fiberFileNames);
@@ -544,7 +639,7 @@ private:
     // changed, then schedule saves for returned linked fibers as needed.
     BranchMetadataSyncResult syncLinkedBranchMetadataAfterFiberModification(
         LineAnnotationSession& session,
-        const std::vector<vc::lasagna::LineControlPoint>* previousControlPoints = nullptr,
+        const std::vector<vc3d::line_annotation::LineControlPoint>* previousControlPoints = nullptr,
         const std::vector<FiberBranchRef>* previousBranches = nullptr);
     void scheduleBranchMetadataSaves(const std::vector<uint64_t>& fiberIds,
                                      uint64_t excludedFiberId = 0);
@@ -557,6 +652,10 @@ private:
     [[nodiscard]] bool confirmLinkedControlPointEdit(const LineAnnotationSession& session,
                                                      int controlPointIndex,
                                                      const QString& action) const;
+    [[nodiscard]] bool confirmLinkedControlPointEdits(
+        const LineAnnotationSession& session,
+        const std::vector<size_t>& controlPointIndices,
+        const QString& action) const;
     [[nodiscard]] bool controlPointHasBranch(const LineAnnotationSession& session,
                                              int controlPointIndex) const;
     std::vector<uint64_t> syncBranchEndpointPositions(LineAnnotationSession& session);
@@ -644,6 +743,17 @@ private:
     // saveOpenFibersHeadless (no waiting).
     void saveOpenFibersCore();
     void cleanupIntersectionInspectionSurfaces();
+    // Tears down the intersection-inspection workspace when one of its
+    // editing sessions holds a fiber that was just retired (split/merge);
+    // otherwise the pane would stay open and editable with all saves
+    // suppressed.
+    void closeIntersectionInspectionForRetiredFibers(
+        const std::vector<uint64_t>& fiberIds);
+    // Closes every dialog pane whose session holds one of the fibers. The
+    // single-dialog invariant means at most the invoking pane matches
+    // today; sweeping by fiber id keeps split/merge retirement correct by
+    // construction rather than by that invariant.
+    void closeDialogPanesForFibers(const std::vector<uint64_t>& fiberIds);
     // Returns false on failure; with a non-null `errorMessage` the failure is
     // reported there (dialog-free), otherwise via showError (interactive).
     bool rebuildIntersectionInspection(QString* errorMessage = nullptr);
@@ -681,10 +791,21 @@ private:
     bool _fiberMetricsPending = false;
     std::unique_ptr<IntersectionInspectionSession> _intersectionInspection;
     std::unique_ptr<FiberSliceOverlayController> _fiberSliceOverlay;
+    // Scroll-center reference for orienting generated-view normals; loaded
+    // lazily from the volpkg's umbilicus file and re-attempted when the
+    // volpkg root changes. nullopt after a failed attempt (volume-center
+    // fallback is used instead).
+    std::optional<vc::core::util::Umbilicus> _scrollUmbilicus;
+    std::filesystem::path _scrollUmbilicusRoot;
+    bool _scrollUmbilicusLoadAttempted = false;
     std::deque<FiberSaveJob> _pendingFiberSaveJobs;
     QPointer<QFutureWatcher<FiberSaveTaskResult>> _fiberSaveWatcher;
     uint64_t _nextFiberSaveSequence = 0;
     bool _fiberSaveRunning = false;
+    // Total failed save jobs; callers compare before/after a
+    // waitForFiberSaves() flush to gate destructive follow-ups (fiber
+    // retirement) on the flushed saves having actually succeeded.
+    uint64_t _fiberSaveFailureCount = 0;
     mutable std::shared_ptr<FiberSaveBatchTracker> _activeFiberSaveBatch;
     uint64_t _nextSideStripIntersectionToken = 0;
     uint64_t _latestSideStripIntersectionToken = 0;
@@ -701,15 +822,23 @@ private:
     std::optional<std::filesystem::path> _currentAtlasDir;
     DatasetPicker _datasetPicker;
     OptimizationTaskFactory _optimizationTaskFactory;
+    std::function<bool(vc3d::line_annotation::FiberOptimizationMode)>
+        _modeChangeConfirmation;
+    std::function<std::optional<vc3d::line_annotation::FiberOptimizationMode>(
+        vc3d::line_annotation::FiberOptimizationMode,
+        vc3d::line_annotation::FiberOptimizationMode)>
+        _mergeModePicker;
     bool _errorDialogsSuppressed = false;
     // Deduplicates the deferred re-optimization prompt across reentrant
     // fiber (re)loads.
     bool _reoptimizationPromptPending = false;
     mutable QString _lastSuppressedError;
 
-    // Transient (in-memory only) staging state for linking two existing control
-    // points across fibers. Position is the primary key; the stored index is a
-    // hint re-resolved at link time because indices are remapped on save.
+    // Transient (in-memory only) staging state for a designated control
+    // point: linking two CPs across fibers (_linkCandidate) or splitting a
+    // fiber between adjacent CPs (_splitCandidate). Position is the primary
+    // key; the stored index is a hint re-resolved at use time because
+    // indices are remapped on save.
     struct LinkCandidate {
         uint64_t fiberId = 0;
         std::string fiberFileName;
@@ -717,4 +846,5 @@ private:
         int storedControlPointIndexHint = -1;
     };
     std::optional<LinkCandidate> _linkCandidate;
+    std::optional<LinkCandidate> _splitCandidate;
 };
