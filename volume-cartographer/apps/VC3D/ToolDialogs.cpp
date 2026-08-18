@@ -3042,13 +3042,13 @@ GrowTrackPatchesDialog::GrowTrackPatchesDialog(QWidget* parent)
     spMaxSize_ = new QDoubleSpinBox(advBox);
     spMaxSize_->setRange(0.000001, 100000.0);
     spMaxSize_->setDecimals(6);
-    spMaxSize_->setValue(1.327104);
+    spMaxSize_->setValue(10.0);
 
     spMaxThickFrac_ = new QDoubleSpinBox(advBox);
     spMaxThickFrac_->setRange(0.0, 1.0);
     spMaxThickFrac_->setDecimals(4);
     spMaxThickFrac_->setSingleStep(0.01);
-    spMaxThickFrac_->setValue(0.05);
+    spMaxThickFrac_->setValue(0.0);
 
     chkRejectFold_ = new QCheckBox(tr("Reject any fold fixes"), advBox);
 
@@ -3075,7 +3075,7 @@ GrowTrackPatchesDialog::GrowTrackPatchesDialog(QWidget* parent)
     spBorderErode_ = new QDoubleSpinBox(advBox);
     spBorderErode_->setRange(0.0, 100000.0);
     spBorderErode_->setDecimals(1);
-    spBorderErode_->setValue(40.0);
+    spBorderErode_->setValue(1.0);
 
     spWorkers_ = new QSpinBox(advBox);
     spWorkers_->setRange(1, 256);
