@@ -250,14 +250,34 @@ double distanceToSegment(const QPointF& point, const QPointF& a, const QPointF& 
 
 QRectF fiberBounds(const vc3d::fiber_map::PlacedFiber& fiber)
 {
-    QRectF bounds;
+    // Accumulated by hand rather than through united(): a zero-size QRectF is null,
+    // so seeding with one and testing isNull() never accumulated anything, and the
+    // result was a degenerate rect at the last point -- which then failed its own
+    // callers' isNull() check, so label chips were never placed and selecting a
+    // fiber in the tree never centred the view.
+    bool havePoint = false;
+    double left = 0.0;
+    double top = 0.0;
+    double right = 0.0;
+    double bottom = 0.0;
     for (const vc3d::fiber_map::Run& run : fiber.runs) {
         for (const QPointF& point : run.points) {
-            bounds = bounds.isNull() ? QRectF(point, QSizeF(0.0, 0.0))
-                                     : bounds.united(QRectF(point, QSizeF(0.0, 0.0)));
+            if (!havePoint) {
+                left = right = point.x();
+                top = bottom = point.y();
+                havePoint = true;
+                continue;
+            }
+            left = std::min(left, point.x());
+            right = std::max(right, point.x());
+            top = std::min(top, point.y());
+            bottom = std::max(bottom, point.y());
         }
     }
-    return bounds;
+    if (!havePoint) {
+        return {};
+    }
+    return QRectF(QPointF(left, top), QPointF(right, bottom));
 }
 
 // Text pinned to a scene position but drawn at a fixed pixel size, offset by
@@ -579,14 +599,13 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
                 // picture, not a late one. Evaluated here and applied on the next
                 // turn of the event loop, because the destructive half cannot run
                 // from inside the tree's own signal.
-                // Relabelling rebuilds the tree too, so it is deferred on the
-                // same grounds; the click after it lands on refreshed labels.
                 const auto verdict = evaluateDependencies();
-                if (verdict.action != StaleVerdict::Action::Fresh ||
-                    verdict.relabelOnly) {
+                if (verdict.action != StaleVerdict::Action::Fresh) {
+                    // Re-evaluated inside the callback rather than carried into it:
+                    // anything could change between the two, and applying a stale
+                    // verdict could announce a new package's layout current.
                     QMetaObject::invokeMethod(
-                        this,
-                        [this, verdict]() { applyStaleVerdict(verdict); },
+                        this, [this]() { refreshStaleState(); },
                         Qt::QueuedConnection);
                     return;
                 }
@@ -664,7 +683,6 @@ void FiberMapWorkspace::clearLayout(const QString& reason)
     _layout = {};
     _layoutGeneration = 0;
     _layoutFrame = {};
-    _layoutScaleSource.reset();
     _layoutUmbilicusFingerprint.clear();
     _layoutPackageGeneration = 0;
     _layoutUmbilicusGeneration = 0;
@@ -709,7 +727,6 @@ FiberMapWorkspace::layoutDependencies() const
     deps.umbilicusGeneration = _layoutUmbilicusGeneration;
     deps.umbilicusFingerprint = _layoutUmbilicusFingerprint;
     deps.frame = _layoutFrame;
-    deps.scaleSource = _layoutScaleSource;
     return deps;
 }
 
@@ -740,12 +757,6 @@ bool FiberMapWorkspace::applyStaleVerdict(const StaleVerdict& verdict)
     case StaleVerdict::Action::Fresh:
         break;
     }
-    if (verdict.relabelOnly) {
-        // The geometry is right and the map stays usable; only the physical
-        // figures beside it moved.
-        _layoutFrame = currentFrame();
-        refreshUnitLabels();
-    }
     return false;
 }
 
@@ -754,17 +765,6 @@ bool FiberMapWorkspace::refreshStaleState()
     return applyStaleVerdict(evaluateDependencies());
 }
 
-void FiberMapWorkspace::refreshUnitLabels()
-{
-    _voxelSizeUm = _layoutFrame.voxelSizeUm;
-    // The network headers and the status line are the only places a physical
-    // figure appears, and both are redrawn from the layout as it stands.
-    rebuildScene(_emptyMessage);
-    rebuildTree();
-    if (_statusLabel) {
-        _statusLabel->setText(withCachedUmbilicusStatus(tr("layout current")));
-    }
-}
 
 void FiberMapWorkspace::showEvent(QShowEvent* event)
 {
@@ -786,6 +786,10 @@ void FiberMapWorkspace::rebuildLayout()
     if (!_controller) {
         return;
     }
+    // Read before and after: fiberMapSnapshot() parses the umbilicus, so a rewrite
+    // during that parse would otherwise tag the old geometry with the new token and
+    // every later check would call it fresh.
+    const QString fingerprintBefore = _controller->umbilicusFingerprint();
     LineAnnotationController::FiberMapSnapshot snapshot = _controller->fiberMapSnapshot();
     _layoutGeneration = snapshot.generation;
     // Everything the snapshot was derived from, so a later check compares against
@@ -793,16 +797,21 @@ void FiberMapWorkspace::rebuildLayout()
     // frame comes from the snapshot rather than a second derivation for that
     // reason; only the umbilicus token has to be read separately.
     _layoutFrame = snapshot.frame;
-    // Which reading produced the scale, so a later voxel-size change can be told
-    // apart from one that actually moved the geometry.
-    _layoutScaleSource = snapshot.umbilicusScaleSource;
     _layoutUmbilicusFingerprint = _controller->umbilicusFingerprint();
+    const bool umbilicusMovedDuringBuild =
+        _layoutUmbilicusFingerprint != fingerprintBefore;
     _layoutPackageGeneration = _controller->packageGeneration();
     _layoutUmbilicusGeneration = _controller->umbilicusGeneration();
     // Set before the build so an empty result still counts as built: it was
     // derived from these dependencies and goes out of date with them.
     _layoutBuilt = true;
     _stale = false;
+    if (umbilicusMovedDuringBuild) {
+        // The file changed while it was being read, so this layout is already about
+        // a superseded umbilicus. Built, then immediately stale, so the user is told
+        // to rebuild rather than shown geometry that looks current.
+        markStale(tr("Umbilicus changed while building — press Rebuild layout"));
+    }
 
     // The snapshot's geometry is handed straight to the layout; every fiber of
     // the package is in it, so a second copy is worth avoiding.
@@ -1384,7 +1393,10 @@ void FiberMapWorkspace::handleControlPointMenu(const QPointF& scenePos, const QP
         return;
     }
     const std::string fileName = entry->fiber.fileName;
-    QMenu menu(this);
+    // Parentless: exec() runs a nested event loop, and a parented stack menu would
+    // be deleted by its parent if the workspace went away inside it and then
+    // destroyed again by stack unwinding.
+    QMenu menu;
     QAction* action = menu.addAction(tr("Go to control point %1 in %2")
                                         .arg(bestIndex)
                                         .arg(_controller->fiberDisplayName(fiberId)));
@@ -1421,7 +1433,7 @@ void FiberMapWorkspace::handleControlPointMenu(const QPointF& scenePos, const QP
                     _controller->fiberDataGeneration() != menuGeneration ||
                     _controller->packageGeneration() != menuPackage ||
                     _controller->umbilicusGeneration() != menuUmbilicusGeneration ||
-                    !vc3d::annotation::sameAnnotationGrid(currentFrame(), menuFrame) ||
+                    !vc3d::annotation::sameAnnotationFrame(currentFrame(), menuFrame) ||
                     _controller->umbilicusFingerprint() != menuUmbilicus;
                 if (changed) {
                     markStale(tr("Map changed — press Rebuild layout"));

@@ -6446,6 +6446,7 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
     // through an affine transform is called out as outside what a scalar can
     // express. Neither blocks the unroll; there is no transform-aware consumer
     // to hand off to yet.
+    bool stampContradicted = false;
     if (resolved.info.volume && !resolved.info.volume->empty()) {
         const std::shared_ptr<Volume> stampedVolume =
             attachedVolumeByStoreName(*_state->vpkg(), *resolved.info.volume);
@@ -6459,6 +6460,9 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
                 impliedVoxelUm = stampedVolume->voxelSize();
             } catch (...) {
             }
+            // Not merely "unverified": if the stamp and the volume it names disagree
+            // about the grid, the two statements contradict each other and there is
+            // no defensible scale to draw with.
             bool dimensionMismatch = false;
             if (impliedVoxelUm > 0.0 && resolved.info.volumeWidth &&
                 resolved.info.volumeHeight && resolved.info.volumeSlices) {
@@ -6485,6 +6489,7 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
                         vc::core::util::uniformRescaleFactor(stampedGrid, storeGrid);
                     if (!storeFactor) {
                         dimensionMismatch = true;
+                        stampContradicted = true;
                         label += tr(" (stamp mismatch: dimensions are not a "
                                     "uniform rescale of %1)")
                                      .arg(QString::fromStdString(
@@ -6544,6 +6549,20 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
                 resolved.path.string(),
                 *resolved.info.volume);
         }
+    }
+
+    if (stampContradicted) {
+        // Refused rather than drawn with a warning beside it. A contradicted stamp is
+        // not weaker evidence than an unverified one, it is evidence against, and an
+        // actionable map unrolled from it is the confidently wrong picture this whole
+        // change exists to prevent.
+        snapshot.umbilicusMessage =
+            tr("umbilicus %1 refused: its stamped grid contradicts volume %2")
+                .arg(QString::fromStdString(resolved.path.filename().string()),
+                     QString::fromStdString(*resolved.info.volume));
+        snapshot.umbilicusLabel.clear();
+        snapshot.umbilicusScaleSource.reset();
+        return snapshot;
     }
 
     for (auto& point : points) {
@@ -11537,8 +11556,11 @@ void LineAnnotationController::reoptimizeMergedFibers(
 
 void LineAnnotationController::emitFiberSummaries()
 {
-    // Every in-memory fiber mutation lands here (or in the save/load paths that
-    // bump the counter themselves), so this is where derived data becomes stale.
+    // Most in-memory fiber mutations land here, and this is where derived data
+    // becomes stale for them. The exceptions bump the counter themselves --
+    // scheduleBranchMetadataSaves() upserts the peers of a structural edit and some
+    // of its callers return without emitting summaries -- so a holder comparing
+    // fiberDataGeneration() sees every change, not only the ones reaching here.
     ++_fiberDataGeneration;
     emit fibersChanged(fiberSummaries());
 }
@@ -12654,6 +12676,13 @@ void LineAnnotationController::scheduleBranchMetadataSaves(
         }
     }
     if (!snapshots.empty()) {
+        // This function inserts into and overwrites _fibers to keep the peers of a
+        // structural edit in step, and some callers return straight afterwards
+        // without going through emitFiberSummaries(). Holders comparing
+        // fiberDataGeneration() -- the Fiber Map's click, list and menu gates --
+        // would then accept geometry and links that had already changed. The counter
+        // belongs with the mutation, not with whichever caller emits summaries later.
+        ++_fiberDataGeneration;
         scheduleFiberSaveSnapshots(std::move(snapshots));
     }
 }

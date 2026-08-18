@@ -324,9 +324,24 @@ Result buildLayout(const std::vector<InputFiber>& fibers,
         return index;
     };
     for (std::size_t i = 0; i < fiberCount; ++i) {
+        const int controlCount = static_cast<int>(ordered[i]->controlPoints.size());
         for (const InputLink& link : ordered[i]->links) {
             const auto target = indexById.find(link.branchFiberId);
             if (target == indexById.end()) {
+                continue;
+            }
+            // Validated here, not only where the link is placed. A link naming a
+            // control point that does not exist cannot position anything, but
+            // joining on it anyway pulled an otherwise unconnected fiber into the
+            // component: it then counted towards minFibers, skewed the network's
+            // median radius, and was drawn at its default zero turn offset as though
+            // it were linked to something.
+            const int otherCount =
+                static_cast<int>(ordered[target->second]->controlPoints.size());
+            if (link.controlPointIndex < 0 ||
+                link.controlPointIndex >= controlCount ||
+                link.branchControlPointIndex < 0 ||
+                link.branchControlPointIndex >= otherCount) {
                 continue;
             }
             const std::size_t a = findRoot(i);

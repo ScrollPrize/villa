@@ -14,7 +14,6 @@ using vc3d::annotation::AnnotationFrame;
 using vc3d::fiber_map::FiberMapDependencies;
 using vc3d::fiber_map::StaleVerdict;
 using vc3d::fiber_map::staleVerdictFor;
-using vc::core::util::UmbilicusScaleSource;
 
 namespace
 {
@@ -46,7 +45,6 @@ namespace
         deps.umbilicusGeneration = 2;
         deps.umbilicusFingerprint = QStringLiteral("umb|1024:99");
         deps.frame = frameAt(9.596);
-        deps.scaleSource = UmbilicusScaleSource::StampedDimensions;
         return deps;
     }
 
@@ -70,7 +68,6 @@ private slots:
         const auto deps = baseline();
         const auto result = verdict(deps, deps);
         QCOMPARE(result.action, StaleVerdict::Action::Fresh);
-        QVERIFY(!result.relabelOnly);
     }
 
     // Before a first build there is nothing to compare against. Comparing anyway
@@ -121,58 +118,17 @@ private slots:
         QCOMPARE(result.action, StaleVerdict::Action::ClearLayout);
     }
 
-    // The measurement this arm exists for. Same voxels, 2.5% different micrometre
-    // label, and a scale that came from stamped dimensions: the geometry never saw
-    // the micrometre figure, so refusing every interaction would be a false
-    // positive. Only the printed figures are redrawn.
-    void voxelSizeOnlyChangeRelabelsWhenTheScaleCameFromDimensions()
+    // Same voxels, 2.5% different micrometre label. Not meaningless -- the counts
+    // are identical -- but not current either: the layout's smoothing sigma, resample
+    // step, label pads, panel tick and minimum gap are all physical quantities
+    // converted through that figure, so a rebuild would place things differently. An
+    // earlier version of this treated the case as a relabel and reported the layout
+    // current, which was wrong.
+    void voxelSizeOnlyChangeMarksStaleRatherThanClearing()
     {
-        auto built = baseline();
-        built.scaleSource = UmbilicusScaleSource::StampedDimensions;
         auto current = baseline();
         current.frame = frameAt(9.362);
-
-        const auto result = verdict(built, current);
-        QCOMPARE(result.action, StaleVerdict::Action::Fresh);
-        QVERIFY(result.relabelOnly);
-    }
-
-    void voxelSizeOnlyChangeRelabelsWhenTheScaleWasInferred()
-    {
-        auto built = baseline();
-        built.scaleSource = UmbilicusScaleSource::InferredFromGrid;
-        auto current = baseline();
-        current.frame = frameAt(9.362);
-
-        const auto result = verdict(built, current);
-        QCOMPARE(result.action, StaleVerdict::Action::Fresh);
-        QVERIFY(result.relabelOnly);
-    }
-
-    void voxelSizeOnlyChangeWithNoUmbilicusRelabels()
-    {
-        auto built = baseline();
-        built.scaleSource.reset();
-        auto current = baseline();
-        current.frame = frameAt(9.362);
-
-        const auto result = verdict(built, current);
-        QCOMPARE(result.action, StaleVerdict::Action::Fresh);
-        QVERIFY(result.relabelOnly);
-    }
-
-    // The one case where the micrometre figure did reach the geometry: the scale
-    // was 9.596/9.362 rather than an integer count ratio.
-    void voxelSizeOnlyChangeStalesWhenTheScaleCameFromIt()
-    {
-        auto built = baseline();
-        built.scaleSource = UmbilicusScaleSource::StampedVoxelSize;
-        auto current = baseline();
-        current.frame = frameAt(9.362);
-
-        const auto result = verdict(built, current);
-        QCOMPARE(result.action, StaleVerdict::Action::MarkStale);
-        QVERIFY(!result.relabelOnly);
+        QCOMPARE(verdict(baseline(), current).action, StaleVerdict::Action::MarkStale);
     }
 
     void changedFibersMarkStale()

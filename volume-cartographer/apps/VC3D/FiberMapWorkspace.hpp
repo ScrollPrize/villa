@@ -121,9 +121,6 @@ private:
     bool applyStaleVerdict(const StaleVerdict& verdict);
     // The two together, for callers that can absorb a scene rebuild inline.
     bool refreshStaleState();
-    // Redraws the physical-unit text without touching geometry, for the case where
-    // only the voxel size moved.
-    void refreshUnitLabels();
     // The frame a rebuild would place geometry in right now.
     [[nodiscard]] vc3d::annotation::AnnotationFrame currentFrame() const;
     // Appends the package's umbilicus state to a status line, resolving it at
@@ -183,11 +180,6 @@ private:
     // since; a fresh workspace is stale until its first rebuild.
     uint64_t _layoutGeneration = 0;
     vc3d::annotation::AnnotationFrame _layoutFrame;
-    // Where the layout's umbilicus scale came from. It decides whether a changed
-    // physical voxel size reached the geometry at all: through stamped dimensions
-    // or through grid inference it did not, so the map stays usable and only its
-    // labels are redrawn.
-    std::optional<vc::core::util::UmbilicusScaleSource> _layoutScaleSource;
     QString _layoutUmbilicusFingerprint;
     // Controller counters as of the build. Compared rather than observed, so that
     // this workspace existing costs annotation work nothing.

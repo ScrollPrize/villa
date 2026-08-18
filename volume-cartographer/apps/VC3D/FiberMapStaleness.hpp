@@ -26,9 +26,6 @@ struct FiberMapDependencies {
     // covering a file changing underneath VC3D, which no counter reports.
     QString umbilicusFingerprint;
     vc3d::annotation::AnnotationFrame frame;
-    // Which reading produced the layout's umbilicus scale. Unset when no umbilicus
-    // was applied. Only meaningful on the *recorded* side.
-    std::optional<vc::core::util::UmbilicusScaleSource> scaleSource;
 };
 
 // What a comparison concluded, separately from acting on it.
@@ -41,8 +38,6 @@ struct StaleVerdict {
     Action action = Action::Fresh;
     // Names what actually changed, for the status line.
     QString reason;
-    // The geometry did not move, only the physical figures printed beside it.
-    bool relabelOnly = false;
 };
 
 // The whole decision, as a function of the two dependency sets.
@@ -55,11 +50,12 @@ struct StaleVerdict {
 //  - Changed fibers, a changed umbilicus, or a voxel size the scale was actually
 //    derived from leave it out of date. The banner says so and the map refuses to
 //    act, but the geometry survives for the rebuild.
-//  - A voxel size the scale was *not* derived from changed nothing but the
-//    labels. Refusing every interaction over that is a false positive: the two
-//    volumes of PHerc0139_ds2 index byte-identical voxel counts and record voxel
-//    sizes 2.5% apart, and through stamped dimensions or grid inference the
-//    micrometre figure never reached the geometry at all.
+//    A voxel size the umbilicus scale was not derived from belongs here too: the
+//    layout's smoothing sigma, resample step, label pads, panel tick and minimum
+//    gap are all physical quantities converted through it, so a rebuild would place
+//    things differently even where the umbilicus itself would not move. An earlier
+//    version treated that case as a relabel and reported the layout current, which
+//    was wrong.
 inline StaleVerdict staleVerdictFor(const FiberMapDependencies& built,
                                     const FiberMapDependencies& current,
                                     bool layoutBuilt,
@@ -88,14 +84,15 @@ inline StaleVerdict staleVerdictFor(const FiberMapDependencies& built,
         return verdict;
     }
 
+    // Same voxels, different physical scale. Two stores of one scan can disagree
+    // here -- PHerc0139_ds2's raw and surf pair are byte-identical in voxel counts
+    // and 2.5% apart in recorded voxel size. Not meaningless, so this does not
+    // clear; out of date, because every physical tuning parameter the layout used
+    // was converted through that figure.
     if (!vc3d::annotation::sameAnnotationFrame(current.frame, built.frame)) {
-        if (built.scaleSource ==
-            vc::core::util::UmbilicusScaleSource::StampedVoxelSize) {
-            verdict.action = StaleVerdict::Action::MarkStale;
-            verdict.reason = QObject::tr("voxel size changed — press Rebuild layout");
-            return verdict;
-        }
-        verdict.relabelOnly = true;
+        verdict.action = StaleVerdict::Action::MarkStale;
+        verdict.reason = QObject::tr("voxel size changed — press Rebuild layout");
+        return verdict;
     }
 
     if (alreadyStale) {
