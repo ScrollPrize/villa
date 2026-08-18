@@ -165,6 +165,85 @@ TEST_CASE("readCompositeFast: composite over a few slices")
     CHECK(int(out(0, 0)) == 100);
 }
 
+// Runs readCompositeFast over the 4x4 constant block with one composite
+// method, and returns the result. Every layer samples inside the chunk, so
+// each pixel sees numLayers copies of the chunk's constant.
+static cv::Mat_<uint8_t> compositeConst(uint8_t value, const CompositeParams& params,
+                                        int zStart = 0, int zEnd = 3)
+{
+    ConstChunkArray a(value);
+    auto base = coordsGrid(4, 4);
+    cv::Mat_<cv::Vec3f> normals(4, 4, cv::Vec3f(0.f, 0.f, 1.f));
+    cv::Mat_<uint8_t> out(4, 4, uint8_t{0});
+    readCompositeFast(out, &a, /*level=*/0, base, normals,
+                      /*zStep=*/1.0f, zStart, zEnd, params);
+    return out;
+}
+
+TEST_CASE("readCompositeFast: alpha compositing over non-zero data is non-zero")
+{
+    // Regression: "alpha" used to take the layer-storage path without a
+    // matching reduction branch, so it fell through to a mean over a count
+    // that was never incremented and every pixel came out 0.
+    CompositeParams params;
+    params.method = "alpha";
+    auto out = compositeConst(100, params);
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c)
+            CHECK(int(out(r, c)) > 0);
+    // Front-to-back blending of four layers at 100/255 saturates below the
+    // layer value itself, so it must not read back as a plain mean either.
+    CHECK(int(out(0, 0)) < 100);
+}
+
+TEST_CASE("readCompositeFast: beerLambert is not silently a mean")
+{
+    // Regression: "beerLambert" was missing from the layer-storage set, so it
+    // stayed on the running-mean path and the output was a mean mislabeled as
+    // Beer-Lambert.
+    CompositeParams params;
+    params.method = "beerLambert";
+    auto out = compositeConst(100, params);
+    CHECK(int(out(0, 0)) > 0);
+
+    CompositeParams meanParams;
+    meanParams.method = "mean";
+    CHECK(int(out(0, 0)) != int(compositeConst(100, meanParams)(0, 0)));
+
+    // Emission scales the accumulated color, so raising it must move the
+    // result -- proof the bl* params reach the compositor.
+    CompositeParams brighter = params;
+    brighter.blEmission = params.blEmission * 3.0f;
+    CHECK(int(compositeConst(100, brighter)(0, 0)) > int(out(0, 0)));
+}
+
+TEST_CASE("readCompositeFast: isoCutoff drops layers below the threshold")
+{
+    // Layers under the cutoff are dropped from the stack, matching the
+    // interactive compositors; with every layer below it the pixel keeps the
+    // value the caller passed in (both call sites pre-zero the buffer).
+    CompositeParams params;
+    params.method = "mean";
+    params.isoCutoff = 200;
+    auto out = compositeConst(100, params);
+    CHECK(int(out(0, 0)) == 0);
+
+    // A cutoff under the data leaves the mean untouched.
+    params.isoCutoff = 50;
+    CHECK(int(compositeConst(100, params)(0, 0)) == 100);
+}
+
+TEST_CASE("readCompositeFast: max and median still reduce as before")
+{
+    CompositeParams params;
+    params.method = "max";
+    CHECK(int(compositeConst(100, params)(0, 0)) == 100);
+    params.method = "median";
+    CHECK(int(compositeConst(100, params)(0, 0)) == 100);
+    params.method = "min";
+    CHECK(int(compositeConst(100, params)(0, 0)) == 100);
+}
+
 TEST_CASE("samplePlane: produces non-zero values where coords are inside the chunk")
 {
     ConstChunkArray a(77);
