@@ -545,6 +545,13 @@ private:
     // volume's grid carried to the resolution the fibers were annotated at.
     // Default-constructed (no voxel size, zero extent) when no volume is loaded.
     [[nodiscard]] vc3d::annotation::AnnotationFrame annotationFrame() const;
+    // Drops the cached scroll umbilicus and everything describing it, so the next
+    // use resolves again.
+    void invalidateScrollUmbilicus();
+    // Rebuilds the generated views of every open pane, which is what actually
+    // re-applies sheet normals after the umbilicus changed. Failures are logged
+    // per pane and do not stop the others.
+    void rematerializeOpenGeneratedViews();
     // Pushes _umbilicusNotice to every open pane's dialog.
     void publishUmbilicusNotice();
     void finishOptimization(const std::string& surfaceName);
@@ -806,6 +813,12 @@ private:
     // fallback is used instead).
     std::optional<vc::core::util::Umbilicus> _scrollUmbilicus;
     std::filesystem::path _scrollUmbilicusRoot;
+    // The annotation frame _scrollUmbilicus was scaled into. Part of the cache
+    // key because the cached value is not the file's contents: its points are
+    // already multiplied by a frame-dependent factor and its per-slice centres
+    // sized to that frame's extent. Keyed on the project directory alone, a
+    // volume switch handed the orientation vote geometry from the previous frame.
+    vc3d::annotation::AnnotationFrame _scrollUmbilicusFrame;
     bool _scrollUmbilicusLoadAttempted = false;
     // Why the package's umbilicus could not be used, for the strip notice.
     // Empty when one was applied, and when none exists to complain about.

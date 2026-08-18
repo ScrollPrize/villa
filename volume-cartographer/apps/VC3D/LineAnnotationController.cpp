@@ -1887,15 +1887,16 @@ LineAnnotationController::LineAnnotationController(CState* state,
                 &CState::vpkgChanged,
                 this,
                 &LineAnnotationController::onVolumePackageChanged);
-        // The resolved umbilicus is cached until the volpkg root changes, so
-        // without this an attach or detach would not reach normal orientation
-        // until the project was reopened. Only the cache is dropped; the next
-        // materialization of a generated view resolves again.
+        // Without this an attach or detach would not reach normal orientation
+        // until the project was reopened, since the resolved umbilicus is cached.
+        // Dropping the cache alone is not enough either: nothing re-applies
+        // normals to surfaces already built, so the attach would report success
+        // while every open strip kept its old orientation — told it worked, and
+        // nothing visibly changes.
         connect(_state, &CState::umbilicusChanged, this, [this]() {
-            _scrollUmbilicusLoadAttempted = false;
-            _scrollUmbilicus.reset();
-            _umbilicusNotice.clear();
+            invalidateScrollUmbilicus();
             publishUmbilicusNotice();
+            rematerializeOpenGeneratedViews();
         });
         if (_state->vpkg()) {
             loadFibersForCurrentPackage();
@@ -6331,6 +6332,10 @@ void LineAnnotationController::onSurfaceChanged(std::string name,
 
 void LineAnnotationController::onVolumePackageChanged(std::shared_ptr<VolumePkg> /*pkg*/)
 {
+    // Dropped outright rather than left to the frame comparison: two projects can
+    // sit in one directory with identical grids, so both halves of the cache key
+    // can match while the umbilicus file behind them differs.
+    invalidateScrollUmbilicus();
     loadFibersForCurrentPackage();
 }
 
@@ -9522,6 +9527,43 @@ void LineAnnotationController::updateGeneratedViewMetricsForFiber(uint64_t fiber
     }
 }
 
+void LineAnnotationController::invalidateScrollUmbilicus()
+{
+    _scrollUmbilicusLoadAttempted = false;
+    _scrollUmbilicusFrame = {};
+    _scrollUmbilicus.reset();
+    _umbilicusNotice.clear();
+}
+
+void LineAnnotationController::rematerializeOpenGeneratedViews()
+{
+    // Surfaces already built carry the normals they were built with, so an
+    // invalidated umbilicus only reaches the screen by rebuilding them.
+    //
+    // One pane failing must not strand the rest: each is an independent fiber,
+    // and the alternative — the first failure leaving later panes on geometry
+    // from the old umbilicus — is the inconsistency this exists to remove.
+    for (const auto& pane : _panes) {
+        if (!pane.session || pane.session->suppressGeneratedViews) {
+            continue;
+        }
+        try {
+            if (!materializeGeneratedViews(*pane.session)) {
+                Logger()->warn(
+                    "Line annotation: could not rebuild generated views for {} "
+                    "after the umbilicus changed; its orientation is unchanged",
+                    pane.surfaceName);
+            }
+        } catch (const std::exception& e) {
+            Logger()->warn(
+                "Line annotation: rebuilding generated views for {} after the "
+                "umbilicus changed threw: {}",
+                pane.surfaceName,
+                e.what());
+        }
+    }
+}
+
 void LineAnnotationController::publishUmbilicusNotice()
 {
     // Every open pane, because the umbilicus is a property of the package rather
@@ -9584,9 +9626,18 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
             ? fs::path(vpkg->getVolpkgDirectory())
             : vpkg->path().parent_path();
     }
-    if (!_scrollUmbilicusLoadAttempted || volpkgRoot != _scrollUmbilicusRoot) {
+    // The frame is part of the key, not just the directory: switching the active
+    // volume changes both the factor the points were scaled by and the extent the
+    // per-slice centres were sized to. Compared here rather than driven by a
+    // signal so that switching between downsample levels of one scan — which
+    // derives an identical frame — costs nothing.
+    const auto currentAnnotationFrame = annotationFrame();
+    if (!_scrollUmbilicusLoadAttempted || volpkgRoot != _scrollUmbilicusRoot ||
+        !vc3d::annotation::sameAnnotationFrame(currentAnnotationFrame,
+                                              _scrollUmbilicusFrame)) {
         _scrollUmbilicusLoadAttempted = true;
         _scrollUmbilicusRoot = volpkgRoot;
+        _scrollUmbilicusFrame = currentAnnotationFrame;
         _scrollUmbilicus.reset();
         // Cleared before the attempt: whatever is set below describes this
         // attempt, and success has to be able to retract an earlier complaint.
@@ -9610,7 +9661,10 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
                     // umbilicus has to be too, and the dense per-slice centres
                     // have to be built at that frame's extent rather than the
                     // volume's own.
-                    const auto frame = annotationFrame();
+                    // The frame from the cache key above, not a fresh derivation:
+                    // the two must agree or the cache would record a frame the
+                    // geometry was not built in.
+                    const auto& frame = currentAnnotationFrame;
                     const std::array<double, 3>& annotationGrid =
                         frame.extentXyz;
                     const auto scale = vc::core::util::deriveUmbilicusScale(

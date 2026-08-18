@@ -119,6 +119,41 @@ private slots:
         }
     }
 
+    // Used as a cache key: geometry scaled into one frame is only reusable in a
+    // frame that compares equal, so this decides when a cached umbilicus is kept.
+    void frameComparisonDecidesReuse()
+    {
+        using vc3d::annotation::sameAnnotationFrame;
+
+        const auto atLevel0 =
+            deriveAnnotationFrame(kSourceUm, 0, std::nullopt, kSourceDims);
+        const auto atLevel2 =
+            deriveAnnotationFrame(kSourceUm * 4.0, 2, std::nullopt, dimsAtLevel(2));
+        QVERIFY(sameAnnotationFrame(atLevel0, atLevel2));
+
+        // A different scan: same voxel size, different extent.
+        const auto otherScan = deriveAnnotationFrame(
+            kSourceUm, 0, std::nullopt, {20000.0, 20000.0, 40000.0});
+        QVERIFY(!sameAnnotationFrame(atLevel0, otherScan));
+
+        // Same extent, different resolution.
+        const auto otherResolution =
+            deriveAnnotationFrame(7.0, 0, std::nullopt, kSourceDims);
+        QVERIFY(!sameAnnotationFrame(atLevel0, otherResolution));
+
+        // A voxel size that round-trips imprecisely is still the same grid.
+        const auto rounded = deriveAnnotationFrame(
+            kSourceUm + 1e-12, 0, std::nullopt, kSourceDims);
+        QVERIFY(sameAnnotationFrame(atLevel0, rounded));
+
+        // Unknown is not equal to known, so a frame that stops being derivable
+        // invalidates rather than silently matching.
+        const auto unknown =
+            deriveAnnotationFrame(0.0, 0, std::nullopt, kSourceDims);
+        QVERIFY(!sameAnnotationFrame(atLevel0, unknown));
+        QVERIFY(sameAnnotationFrame(unknown, unknown));
+    }
+
     // Unusable inputs report "unknown" rather than a plausible-looking guess.
     void unusableInputsStayUnknown()
     {

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <optional>
@@ -79,6 +80,31 @@ inline AnnotationFrame deriveAnnotationFrame(
                            volumeDimsXyz[2] * frame.factor};
     }
     return frame;
+}
+
+// True when two frames describe the same grid, i.e. when geometry built in one is
+// still valid in the other. Two stores of one scan at different pyramid levels
+// compare equal, which is what lets switching between them leave derived geometry
+// alone; a store of a different scan does not.
+//
+// Voxel sizes compare with a relative tolerance, so metadata that round-trips 2.4
+// slightly differently is not mistaken for a new scan; extents compare as the
+// integer voxel counts they are.
+inline bool sameAnnotationFrame(const AnnotationFrame& a,
+                                const AnnotationFrame& b)
+{
+    if (a.voxelSizeUm.has_value() != b.voxelSizeUm.has_value())
+        return false;
+    if (a.voxelSizeUm) {
+        const double scale = std::max(*a.voxelSizeUm, *b.voxelSizeUm);
+        if (std::abs(*a.voxelSizeUm - *b.voxelSizeUm) > 1e-6 * scale)
+            return false;
+    }
+    for (int axis = 0; axis < 3; ++axis) {
+        if (std::llround(a.extentXyz[axis]) != std::llround(b.extentXyz[axis]))
+            return false;
+    }
+    return true;
 }
 
 } // namespace vc3d::annotation
