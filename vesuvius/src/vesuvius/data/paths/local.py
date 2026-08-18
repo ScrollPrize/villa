@@ -59,8 +59,14 @@ def categorize_zarr_files(tree, base_dir):
     zarr_files: Dict[str, Dict[str, Dict[str, Dict[str, Dict[str, str]]]]] = {}
 
     # Regex patterns for matching volume and segment paths
-    volume_pattern = re.compile(r'volumes[/\\](?P<intensity>\d+)(?=keV|um)(?P<unit>[a-zA-Z]+)_(?P<resolution>\d+\.\d{2})(?P<suffix>[a-zA-Z]*)\.zarr')
-    segment_pattern = re.compile(r'segments[/\\](?P<intensity>\d+)(?=keV|um)(?P<unit>[a-zA-Z]+)_(?P<resolution>\d+\.\d{2})(?P<suffix>[a-zA-Z]*)[/\\](?P<segment_id>[^/\\]+)\.zarr')
+    # Resolution accepts any number of decimal places (or none). Hardcoding
+    # exactly two (\d+\.\d{2}) silently skipped most published resolutions:
+    # of the resolutions actually present in the open-data bucket, only
+    # 3.24um and 7.91um have two decimals -- 1.129um, 2.399um, 9.9um,
+    # 45.532um and 2.4um were all dropped, with no warning, so a local
+    # catalog built from them was silently incomplete.
+    volume_pattern = re.compile(r'volumes[/\\](?P<intensity>\d+)(?=keV|um)(?P<unit>[a-zA-Z]+)_(?P<resolution>\d+(?:\.\d+)?)(?P<suffix>[a-zA-Z]*)\.zarr')
+    segment_pattern = re.compile(r'segments[/\\](?P<intensity>\d+)(?=keV|um)(?P<unit>[a-zA-Z]+)_(?P<resolution>\d+(?:\.\d+)?)(?P<suffix>[a-zA-Z]*)[/\\](?P<segment_id>[^/\\]+)\.zarr')
     scroll_pattern = re.compile(r'(?P<scrollnumber>\d+)[/\\](?=volumes|segments)(volumes|segments)')
 
     for key in tree.keys():
