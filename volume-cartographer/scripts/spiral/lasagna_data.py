@@ -1,6 +1,10 @@
-import fcntl
 import json
 import os
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - unavailable on Windows
+    fcntl = None
 
 import numpy as np
 import torch
@@ -26,23 +30,37 @@ def _ensure_sidecar(array_dirs, sidecar, *, label, stage_name, progress=None):
     # is written last by pack_arrays(), so a waiter can distinguish a complete
     # pool from a partial one after it acquires the lock.
     lock_path = sidecar + '.lock'
-    with open(lock_path, 'a+') as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        if os.path.exists(meta_path):
-            if progress is not None:
-                progress.finish(detail='built by another process')
-            return sidecar
+    with open(lock_path, 'a+b') as lock_file:
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        else:  # pragma: no cover - Windows fallback
+            import msvcrt
+            lock_file.seek(0, os.SEEK_END)
+            if lock_file.tell() == 0:
+                lock_file.write(b'\0')
+                lock_file.flush()
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+        try:
+            if os.path.exists(meta_path):
+                if progress is not None:
+                    progress.finish(detail='built by another process')
+                return sidecar
 
-        pack_arrays(
-            array_dirs,
-            sidecar,
-            label=label,
-            progress_callback=(
-                (lambda current, total, detail: progress.update(
-                    current, total_steps=total, detail=detail))
-                if progress is not None else None
-            ),
-        )
+            pack_arrays(
+                array_dirs,
+                sidecar,
+                label=label,
+                progress_callback=(
+                    (lambda current, total, detail: progress.update(
+                        current, total_steps=total, detail=detail))
+                    if progress is not None else None
+                ),
+            )
+        finally:
+            if fcntl is None:  # pragma: no cover - Windows fallback
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
 
     if progress is not None:
         progress.finish(detail=f'sparse store ready at {sidecar}')

@@ -346,10 +346,11 @@ def pack_arrays(
                 for f, bricks in zip(channel_files, channel_bricks):
                     f.write(bricks.tobytes())
                 done += 1
-                if progress_callback is not None:
-                    progress_callback(
-                        done, len(keys), f'{len(coords) - 1:,} bricks kept')
                 if done % 2000 == 0 or done == len(keys):
+                    if progress_callback is not None:
+                        progress_callback(
+                            done, len(keys),
+                            f'{len(coords) - 1:,} bricks kept')
                     elapsed = time.perf_counter() - started
                     print(f'{label}: {done:,}/{len(keys):,} chunks, '
                           f'{len(coords) - 1:,} bricks kept '
