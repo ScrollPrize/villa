@@ -640,3 +640,52 @@
   accounting. A post-change validation run reported 0.092 setup worker-seconds
   and retained the same artifact hash; its unrelated fiberlet stages ran under
   visible external load and were not added to the paired benchmark table.
+
+## Checkpoint 15: Contiguous Peak-Grid Cache
+
+- Approved for implementation. Replace the bounded peak hill-climb's ordered
+  map and repeated grid geometry with direct row-major slots while preserving
+  the response kernel, traversal and tie-breaking exactly.
+- Independent review required exact artifacts/counters, preservation of the
+  no-feasible-slot `(0,0)` fallback, separate double physical coordinates and
+  float response coordinates, a shared tested internal cache seam, non-finite
+  cache coverage, checked unsigned layout arithmetic, and peak-RSS comparison.
+  The implementation plan incorporates these requirements.
+- Implemented a checked internal row-major grid layout and response cache. Peak
+  search precomputes physical points and feasibility once, while response
+  coordinates retain their separate float index/step calculation. Computed
+  state is independent of the response value, so NaN and infinities are cached.
+- Added direct layout coverage at extents 0, 8, and 128; exact boundary and
+  out-of-range behavior; non-finite response/cache-hit coverage; and an
+  extent-zero production fit with one feasible slot and exact response counts.
+- Final review restricted the internal helper to the same maximum extent 128
+  enforced by fitter configuration, closing signed-offset overflow outside the
+  production domain. Extent 129 is covered as an error.
+- The planned no-feasible-slot and explicit tie tests were not added. A
+  nonempty fitted cell's finite owned lattice positions enclose its center, so
+  at least the center slot is feasible; the historical dormant center fallback
+  remains structurally unchanged. Candidate comparison and tie logic were not
+  edited and retain the existing behavioral tests. This is an explicit test
+  simplification rather than new behavior.
+- Focused GCC and Clang `test_fiber_anchors`, `test_fiberlet_paths`, and
+  `test_fiber_replay` suites passed. The final extent-zero addition was rerun
+  under both compilers.
+
+  | metric | minimum | median | maximum | checkpoint 14 median |
+  |---|---:|---:|---:|---:|
+  | command wall | 10.37 s | 10.43 s | 10.47 s | 10.65 s |
+  | total CPU | 231.46 s | 234.29 s | 235.60 s | 237.40 s |
+  | anchor wall | 6.189 s | 6.221 s | 6.251 s | 6.304 s |
+  | anchor CPU | 158.02 s | 160.30 s | 161.33 s | 162.51 s |
+  | peak-search worker time | 42.757 s | 42.836 s | 43.664 s | about 43.9 s |
+  | peak RSS | 2.01 GiB | 2.02 GiB | 2.03 GiB | 2.08 GiB at checkpoint 12 |
+
+- Every run retained 929,769 peak response requests, 335,498 computed grid
+  responses, 28,675 uncached acceptance responses, 2,603 anchors, 51,782
+  searched / 26,494 accepted fiberlets, 170,813 sampled voxels, 62,970,689 DP
+  relaxations, and 2 greedy / 1 fiberlet failures. Every `fiber_replay.json`
+  retained SHA-256
+  `41fa73c76bc3a20528d064e2baed78552a20bed41542f9ed4e2ddcfb5e739215`.
+- Checkpoint 15 is retained.
+- Checkpoint 14 did not record RSS separately. The nearest recorded baseline is
+  checkpoint 12's 2.08 GiB median; checkpoint 15 did not regress against it.

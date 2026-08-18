@@ -58,3 +58,10 @@ exact cell bounds, so expose the owned Z/Y/X cube as a direct zero-allocation
 range for seed initialization while retaining the existing support range for
 refinement. Preserve canonical owned-observation order and the public vector
 API's validation behavior.
+
+The next measured continuation replaces the direction-conditioned peak
+search's ordered-map response cache with bounded contiguous grid storage. The
+peak domain, hill-climb traversal, response evaluation order, tie-breaking,
+subpixel acceptance, and response arithmetic remain unchanged. Precompute the
+grid's feasible points once and use direct shifted indices for response-cache
+hits and misses.

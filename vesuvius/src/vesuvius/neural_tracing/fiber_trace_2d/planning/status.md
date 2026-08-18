@@ -66,6 +66,15 @@
 - [x] Run three canonical checkpoint 14 replays and compare quality/performance.
 - [x] Retain checkpoint 14 based on the measured result.
 - [x] Update specifications, documentation, changelog, task log, and status.
+- [x] Obtain approval for checkpoint 15 contiguous peak-grid caching.
+- [x] Plan checkpoint 15 and its test/documentation updates.
+- [x] Independently review checkpoint 15 against task and specifications.
+- [x] Implement bounded peak-grid geometry and response storage.
+- [x] Add focused cache-index and behavioral parity coverage.
+- [x] Run focused GCC and Clang validation.
+- [x] Run three canonical checkpoint 15 replays and compare performance/quality.
+- [x] Retain checkpoint 15 based on the measured result.
+- [x] Update specifications, documentation, changelog, task log, and status.
 - [x] Obtain approval for checkpoint 13 inline robust membership.
 - [x] Plan checkpoint 13 and its profile/test updates.
 - [x] Independently review checkpoint 13 against task and specifications.

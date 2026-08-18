@@ -2,6 +2,7 @@
 #include "vc/core/util/AtomicFile.hpp"
 #include "vc/fiber_tracer/FiberAxisTensor.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
+#include "vc/fiber_tracer/detail/FiberAnchorPeakGrid.hpp"
 #include "vc/fiber_tracer/detail/FiberAnchorSupportStencil.hpp"
 
 #include <algorithm>
@@ -1365,9 +1366,27 @@ template <typename ObservationRange>
 
     using GridIndex = std::pair<int, int>;
     const int extent = static_cast<int>(std::floor(config.localWindowRadiusPredictionVoxels / config.peakGridStepPredictionVoxels));
-    const auto pointAt = [&](const GridIndex& index) {
-        return pivot + basis[0] * (static_cast<double>(index.first) * config.peakGridStepPredictionVoxels) +
-               basis[1] * (static_cast<double>(index.second) * config.peakGridStepPredictionVoxels);
+    const detail::FiberAnchorPeakGridLayout peakGrid{extent};
+    std::vector<cv::Vec3d> gridPoints(peakGrid.size());
+    std::vector<uint8_t> feasibleGrid(peakGrid.size(), 0);
+    for (int first = -extent; first <= extent; ++first) {
+        for (int second = -extent; second <= extent; ++second) {
+            const size_t slot = peakGrid.indexUnchecked(first, second);
+            const cv::Vec3d point =
+                pivot + basis[0] *
+                    (static_cast<double>(first) *
+                     config.peakGridStepPredictionVoxels) +
+                basis[1] *
+                    (static_cast<double>(second) *
+                     config.peakGridStepPredictionVoxels);
+            gridPoints[slot] = point;
+            feasibleGrid[slot] = static_cast<uint8_t>(insidePeakDomain(
+                point, pivot, owner,
+                config.localWindowRadiusPredictionVoxels));
+        }
+    }
+    const auto pointAt = [&](const GridIndex& index) -> const cv::Vec3d& {
+        return gridPoints[peakGrid.indexUnchecked(index.first, index.second)];
     };
     const auto responseAtIndex = [&](const GridIndex& index, bool acceptance) {
         return responseAt(
@@ -1378,22 +1397,17 @@ template <typename ObservationRange>
             acceptance);
     };
     const auto feasible = [&](const GridIndex& index) {
-        return std::abs(index.first) <= extent &&
-            std::abs(index.second) <= extent &&
-            insidePeakDomain(
-                pointAt(index), pivot, owner,
-                config.localWindowRadiusPredictionVoxels);
+        return peakGrid.contains(index.first, index.second) &&
+            feasibleGrid[peakGrid.indexUnchecked(index.first, index.second)];
     };
 
-    std::map<GridIndex, double> responseCache;
+    detail::FiberAnchorPeakResponseCache responseCache{peakGrid};
     const auto response = [&](const GridIndex& index) {
         if (profile != nullptr)
             ++profile->peakGridResponseRequests;
-        const auto found = responseCache.find(index);
-        if (found != responseCache.end())
-            return found->second;
-        return responseCache.emplace(index, responseAtIndex(index, false))
-            .first->second;
+        return responseCache.getOrCompute(
+            index.first, index.second,
+            [&] { return responseAtIndex(index, false); });
     };
 
     GridIndex current{0, 0};

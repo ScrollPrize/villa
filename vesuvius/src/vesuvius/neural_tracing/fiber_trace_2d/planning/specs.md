@@ -3141,6 +3141,14 @@
   and serialized output remain double precision. Peak ties and downstream DP
   counts need not be numerically identical, but retained populations and replay
   quality must be checked on the canonical workload.
+- The bounded direction-conditioned peak grid uses a checked row-major layout.
+  Physical grid points and feasibility are constructed once in canonical
+  first/second-index order; computed response values use direct cache slots
+  with a separate computed-state byte. Hill-climb traversal, lexicographic
+  tie-breaking, response arithmetic, separate float response coordinates, the
+  no-feasible-slot center fallback, and uncached subpixel acceptance semantics
+  remain unchanged. Existing profile request, computed-grid, and acceptance
+  response counters retain their definitions.
 - The hot replay-tube filter snapshots authoritative clipped source segments in
   prediction coordinates as float32 and uses a packed Boost.Geometry R-tree of
   radius-expanded segment AABBs. A point is inside when any candidate's

@@ -613,3 +613,10 @@
 - Added version-3 local-refinement subphase profiling, identifying repeated
   refined-state evaluation as roughly 89-90% of remaining local-refinement
   worker time on the canonical replay.
+
+# 2026-08-18: contiguous anchor peak-grid caching
+
+- Replaced direction-conditioned peak-search ordered maps and repeated grid
+  geometry with checked contiguous row-major caches. The canonical replay's
+  median peak-search worker time improved from roughly 43.9 to 42.84 seconds
+  with byte-identical artifacts and deterministic work counters.

@@ -2,6 +2,7 @@
 #include <doctest/doctest.h>
 
 #include "vc/fiber_tracer/FiberAnchors.hpp"
+#include "vc/fiber_tracer/detail/FiberAnchorPeakGrid.hpp"
 #include "vc/fiber_tracer/detail/FiberAnchorSupportStencil.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "utils/zarr.hpp"
@@ -25,6 +26,66 @@ namespace
 
 using vc::fiber_tracer::FiberAnchorConfig;
 using vc::fiber_tracer::FiberAnchorObservation;
+
+TEST_CASE("fiber anchor peak grid layout maps every bounded coordinate directly")
+{
+    using vc::fiber_tracer::detail::FiberAnchorPeakGridLayout;
+    for (const int extent : {0, 8, 128}) {
+        const FiberAnchorPeakGridLayout layout{extent};
+        const size_t expectedSide = 2 * static_cast<size_t>(extent) + 1;
+        CHECK(layout.extent() == extent);
+        CHECK(layout.side() == expectedSide);
+        CHECK(layout.size() == expectedSide * expectedSide);
+        std::vector<uint8_t> visited(layout.size(), 0);
+        for (int first = -extent; first <= extent; ++first) {
+            for (int second = -extent; second <= extent; ++second) {
+                REQUIRE(layout.contains(first, second));
+                const size_t slot = layout.index(first, second);
+                REQUIRE(slot < visited.size());
+                CHECK(visited[slot] == 0);
+                visited[slot] = 1;
+            }
+        }
+        CHECK(std::all_of(visited.begin(), visited.end(),
+            [](uint8_t value) { return value == 1; }));
+        CHECK(layout.index(-extent, -extent) == 0);
+        CHECK(layout.index(extent, extent) + 1 == layout.size());
+        CHECK_FALSE(layout.contains(-extent - 1, 0));
+        CHECK_FALSE(layout.contains(extent + 1, 0));
+        CHECK_THROWS_AS(layout.index(-extent - 1, 0), std::out_of_range);
+        CHECK_THROWS_AS(layout.index(extent + 1, 0), std::out_of_range);
+    }
+    CHECK_THROWS_AS(FiberAnchorPeakGridLayout{-1}, std::invalid_argument);
+    CHECK_THROWS_AS(FiberAnchorPeakGridLayout{129}, std::invalid_argument);
+}
+
+TEST_CASE("fiber anchor peak response cache stores every computed bit pattern")
+{
+    using vc::fiber_tracer::detail::FiberAnchorPeakGridLayout;
+    using vc::fiber_tracer::detail::FiberAnchorPeakResponseCache;
+    FiberAnchorPeakResponseCache cache{FiberAnchorPeakGridLayout{1}};
+    size_t computeCalls = 0;
+    const auto cached = [&](int first, int second, double value) {
+        return cache.getOrCompute(first, second, [&] {
+            ++computeCalls;
+            return value;
+        });
+    };
+    CHECK(cached(-1, -1, 4.0) == 4.0);
+    CHECK(cached(-1, -1, 9.0) == 4.0);
+    CHECK(std::isnan(cached(0, 0,
+        std::numeric_limits<double>::quiet_NaN())));
+    CHECK(std::isnan(cached(0, 0, 3.0)));
+    CHECK(cached(1, 0, std::numeric_limits<double>::infinity()) ==
+          std::numeric_limits<double>::infinity());
+    CHECK(cached(1, 0, 1.0) == std::numeric_limits<double>::infinity());
+    CHECK(cached(1, 1, -std::numeric_limits<double>::infinity()) ==
+          -std::numeric_limits<double>::infinity());
+    CHECK(cached(1, 1, 1.0) == -std::numeric_limits<double>::infinity());
+    CHECK(computeCalls == 4);
+    CHECK_THROWS_AS(cached(2, 0, 0.0), std::out_of_range);
+    CHECK(computeCalls == 4);
+}
 
 std::vector<FiberAnchorObservation> cellObservations(int size, const cv::Vec3d& first, const cv::Vec3d& second = {0.0, 0.0, 0.0}, double secondPresence = 1.0)
 {
@@ -953,6 +1014,24 @@ TEST_CASE("fiber anchor peak search stays on the local in-cell mode")
     CHECK(anchor.positionPredictionXYZ[1] == doctest::Approx(7.0).epsilon(1.0e-8));
     CHECK(anchor.positionPredictionXYZ[1] < 7.5);
     CHECK(std::abs((anchor.positionPredictionXYZ - pivot).dot(anchor.axisXYZ)) < 1.0e-10);
+}
+
+TEST_CASE("fiber anchor peak search supports a single clipped grid slot")
+{
+    auto options = config();
+    options.localWindowRadiusPredictionVoxels = 0.25;
+    options.peakGridStepPredictionVoxels = 0.5;
+    options.minimumAlignedSupport = 0.001;
+    const auto observations = cellObservations(4, {1.0, 0.0, 0.0});
+    vc::fiber_tracer::FiberAnchorFitProfile profile;
+    const auto result = vc::fiber_tracer::fitFiberCellAnchors(
+        {0, 0, 0}, {0, 0, 0}, {4, 4, 4}, observations, options, &profile);
+    REQUIRE(result.retainedAnchorCount == 1);
+    CHECK(profile.peakComponents == 1);
+    CHECK(profile.peakComputedGridResponses == 1);
+    CHECK(profile.peakAcceptanceResponses == 1);
+    CHECK(result.components[0].anchor.positionPredictionXYZ ==
+          cv::Vec3d{1.5, 1.5, 1.5});
 }
 
 TEST_CASE("fiber anchor peak search leaves a symmetric parallel-ridge midpoint")

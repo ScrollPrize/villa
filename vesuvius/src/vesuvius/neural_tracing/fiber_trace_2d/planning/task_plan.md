@@ -551,3 +551,74 @@ three fresh paired runs, median fitter-internal setup time fell from 10.996 to
 fiberlet failures, and replay SHA-256 remained identical.
 The final profile attribution also includes constant-time direct-layout
 construction in setup; its validation run reported 0.092 setup worker-seconds.
+
+## Checkpoint 15: Contiguous Peak-Grid Cache
+
+1. Use committed checkpoint 14 (`bc16557f5`) and its fresh paired medians as
+   the baseline: 10.65 seconds command wall, 237.40 seconds total CPU, 6.304
+   seconds anchor wall, 162.51 seconds anchor CPU, and roughly 43.9 worker
+   seconds in direction-conditioned peak search.
+2. Replace the per-component `std::map<pair<int,int>, double>` with one bounded
+   row-major grid covering `[-extent,+extent]^2`. Extract its checked layout
+   and response-cache storage into one reusable internal `detail` helper used
+   by production and focused tests. Store computed state separately from
+   response values so every response, including NaN or infinity if produced by
+   unchanged arithmetic, retains the old cache-hit semantics.
+3. Precompute each grid slot's physical point and feasibility once. Use a
+   checked shifted-index helper for all hill-climb, neighbor, separable-fit,
+   and joint-fit accesses. Do not change candidate enumeration, neighbor order,
+   response computation order, response-cache request/miss counters,
+   tie-breaking, tolerance calculation, or subpixel acceptance evaluations.
+   Preserve the historical `(0,0)` fallback when clipping produces no feasible
+   grid slot. Keep physical point construction in double precision and response
+   coordinate construction as independent float index/step multiplication;
+   never derive one from the other.
+4. Keep arbitrary accepted subpixel candidates uncached exactly as before.
+   Preserve the existing configuration limit on extent. Validate signed bounds
+   before offsetting coordinates, then calculate side and area with checked
+   unsigned arithmetic so 32-bit and 64-bit builds reject overflow consistently.
+5. Add focused internal tests for shifted index uniqueness/bounds and cached
+   response behavior over minimum, default, and maximum supported extents.
+   Cover extent zero, exact `+/-extent`, rejected `+/-(extent+1)`, cached NaN
+   and infinities, and exact compute-call counts for cache hits. Retain existing
+   peak mode, symmetry, subpixel, robust-membership, and serial/parallel
+   extraction tests as behavioral coverage. The production extent-zero case
+   must verify the single feasible center slot. No direct no-feasible-slot case
+   is required because every nonempty fitted cell owns finite lattice positions
+   enclosing its center; preserve the dormant center fallback structurally.
+   The untouched plateau/lexicographic selection code remains under existing
+   peak behavior coverage.
+6. Build and run focused GCC and Clang anchor/path/replay tests. Run three
+   canonical 32-thread, 5,000-base-voxel replays and compare total/anchor wall
+   and CPU, peak-search worker time, peak request/miss/acceptance counters,
+   populations, DP work, failures, artifact hashes, and peak RSS against the
+   nearest recorded baseline. Peak-cache construction remains included in
+   peak-search time.
+7. Retain the checkpoint only if it improves peak or enclosing anchor cost and
+   preserves peak outputs, deterministic counters, populations, failures, and
+   complete replay artifacts exactly.
+
+### Checkpoint 15 Spec Update
+
+- Document that bounded direction-conditioned peak responses use direct
+  row-major cache slots while preserving the canonical search and response
+  semantics.
+- No profile-schema change is planned because existing request, computed, and
+  acceptance counters retain their definitions.
+
+### Checkpoint 15 Documentation Update
+
+- Update `volume-cartographer/docs/fiberlets.md` with the bounded peak-grid
+  cache and measured result if retained.
+- Record the benchmark and validation outcome in `task_log.md`; summarize an
+  accepted checkpoint in `changelog.md`, and complete `status.md`.
+
+### Checkpoint 15 Result
+
+Accepted. Three canonical runs reduced median direction-conditioned peak-search
+worker time from roughly 43.9 to 42.84 seconds, anchor CPU from 162.51 to
+160.30 seconds, anchor wall from 6.304 to 6.221 seconds, total CPU from 237.40
+to 234.29 seconds, and command wall from 10.65 to 10.43 seconds. Median peak
+RSS was 2.02 GiB. Peak request/miss/acceptance counters, all extraction and DP
+populations, 2 greedy / 1 fiberlet failures, and complete replay SHA-256 were
+identical to checkpoint 14.

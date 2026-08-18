@@ -671,6 +671,16 @@ serialized output remain double precision. This halves the repeatedly scanned
 peak-search working set; small differences in peak ties and downstream path
 node counts are expected.
 
+The bounded peak hill climb stores grid geometry, feasibility, and computed
+responses in contiguous row-major slots. Response values have independent
+computed-state bytes, so every result, including a non-finite result, is
+computed once and cached. The canonical
+candidate order, response kernel, tie-breaking, float response coordinates,
+and uncached subpixel checks are unchanged. On the canonical 5,000-base-voxel
+replay, median peak-search worker time fell from roughly 43.9 to 42.84 seconds,
+anchor CPU from 162.51 to 160.30 seconds, and command wall from 10.65 to 10.43
+seconds while complete artifacts and deterministic counters remained exact.
+
 Production extraction also constructs each sampled tile voxel once as a compact
 float32 observation with a pre-normalized direction. Each overlapping cell
 stores only canonical-order 32-bit indices into that tile plus its cell-local
