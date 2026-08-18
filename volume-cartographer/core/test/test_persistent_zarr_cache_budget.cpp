@@ -98,6 +98,28 @@ TEST_CASE("budget startup scan discovers Delta3D Zarr chunks")
     fs::remove_all(root);
 }
 
+TEST_CASE("budget-coordinated cache replacement removes stale subtree accounting")
+{
+    const auto root = tempRoot("replace_subtree");
+    const auto oldVolume = root / "old-volume";
+    const auto oldChunk = oldVolume / "level_0" / "0" / "0" / "0.bin";
+    writeBytes(oldChunk, 100);
+    auto budget = Budget::configure(root, {100, 0}, spaceWith(
+        std::make_shared<std::atomic<std::uint64_t>>(900)));
+    budget->waitForIdle();
+    REQUIRE(budget->stats().managedBytes == 100);
+
+    std::error_code ec;
+    CHECK(budget->removeCacheSubtree(oldVolume, ec));
+    CHECK_FALSE(ec);
+    CHECK_FALSE(fs::exists(oldVolume));
+    CHECK(budget->stats().managedBytes == 0);
+
+    CHECK(publish(*budget, volumeChunk(root, 1), 100));
+    CHECK(budget->stats().managedBytes == 100);
+    fs::remove_all(root);
+}
+
 TEST_CASE("budget discovers native Zarr payloads but excludes metadata")
 {
     const auto root = tempRoot("native_zarr");

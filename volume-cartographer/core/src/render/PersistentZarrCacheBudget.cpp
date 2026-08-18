@@ -657,6 +657,49 @@ PersistentZarrCacheBudget::reserveWriteImpl(
                             managed);
 }
 
+bool PersistentZarrCacheBudget::removeCacheSubtree(
+    const fs::path& subtree, std::error_code& ec)
+{
+    const auto normalized = normalizedPath(subtree);
+    if (normalized == impl_->root || !isWithin(normalized, impl_->root)) {
+        ec = std::make_error_code(std::errc::invalid_argument);
+        return false;
+    }
+
+    const auto overlaps = [&](const std::string& path) {
+        return isWithin(fs::path(path), normalized);
+    };
+    std::unique_lock lock(impl_->mutex);
+    impl_->cv.wait(lock, [&] {
+        if (impl_->scanInFlight || impl_->trimInFlight)
+            return false;
+        for (const auto& [path, count] : impl_->readPins) {
+            (void)count;
+            if (overlaps(path))
+                return false;
+        }
+        return std::none_of(
+            impl_->writePins.begin(), impl_->writePins.end(), overlaps);
+    });
+
+    fs::remove_all(normalized, ec);
+    if (ec)
+        return false;
+
+    for (auto it = impl_->entries.begin(); it != impl_->entries.end();) {
+        if (!overlaps(it->first)) {
+            ++it;
+            continue;
+        }
+        impl_->managedBytes -=
+            std::min(impl_->managedBytes, it->second.size);
+        it = impl_->entries.erase(it);
+    }
+    lock.unlock();
+    pollSpace();
+    return true;
+}
+
 void PersistentZarrCacheBudget::releaseRead(const fs::path& path, bool touch)
 {
     if (touch) {

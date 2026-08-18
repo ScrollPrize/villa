@@ -175,11 +175,14 @@ std::shared_ptr<ChunkCache> makeDelta3dCache(
 
 std::shared_ptr<ChunkCache> makeMirrorCache(
     std::shared_ptr<MirrorFetcher> f,
-    const fs::path& persist)
+    const fs::path& persist,
+    std::optional<fs::path> budgetRoot = {})
 {
     std::vector<ChunkCache::LevelInfo> levels = {{{8, 8, 8}, {4, 4, 4}, {}}};
     ChunkCache::Options opts;
     opts.persistentCachePath = persist;
+    if (budgetRoot)
+        opts.persistentCacheBudgetRoot = *budgetRoot;
     opts.zarrMirrorMetadata.push_back(
         {".zgroup", {std::byte{'{'}, std::byte{'}'}}});
     ChunkCacheService::Options serviceOptions;
@@ -856,6 +859,12 @@ TEST_CASE("persistent cache format transitions are leased and volume-local")
     const auto persist = parent / "volume-a";
     const auto sibling = parent / "volume-b" / "keep.bin";
     writeSizedFile(sibling, 7);
+    auto budget = vc::render::PersistentZarrCacheBudget::configure(
+        parent, {}, [](const fs::path&, std::error_code& ec) {
+            ec.clear();
+            return fs::space_info{1ULL << 40, 1ULL << 40, 1ULL << 40};
+        });
+    budget->waitForIdle();
     const auto bookkeeping = parent / ".vc_cache_bookkeeping" /
                              persist.filename() / ".vc_prefill_level_0.json";
 
@@ -864,18 +873,20 @@ TEST_CASE("persistent cache format transitions are leased and volume-local")
     fetched.bytes = variedBytes(64);
     auto mirrorFetcher = std::make_shared<MirrorFetcher>();
     mirrorFetcher->setCanned({0, 0, 0, 0}, fetched);
-    auto mirror = makeMirrorCache(mirrorFetcher, persist);
+    auto mirror = makeMirrorCache(mirrorFetcher, persist, parent);
     REQUIRE(mirror->persistentCacheLayout() ==
             vc::render::PersistentCacheLayout::ZarrMirror);
     REQUIRE(waitForResolved(*mirror, 0, 0, 0, 0).status == ChunkStatus::Data);
+    mirror->waitForPersistentWrites();
     REQUIRE(fs::is_regular_file(persist / "scale0" / "0.0.0"));
+    REQUIRE(budget->stats().managedBytes > 0);
     writeSizedFile(bookkeeping, 3);
 
     // An incompatible process cannot replace a cache while this mirror holds
     // its shared lease; rendering remains available with persistence disabled.
     auto blockedFetcher = std::make_shared<CountingFetcher>();
     blockedFetcher->setCanned({0, 0, 0, 0}, fetched);
-    auto blocked = makeDelta3dCache(blockedFetcher, persist);
+    auto blocked = makeDelta3dCache(blockedFetcher, persist, parent);
     CHECK_FALSE(blocked->stats().persistentCacheEnabled);
     CHECK_FALSE(blocked->stats().persistentCacheWarning.empty());
     REQUIRE(waitForResolved(*blocked, 0, 0, 0, 0).status == ChunkStatus::Data);
@@ -886,9 +897,10 @@ TEST_CASE("persistent cache format transitions are leased and volume-local")
 
     auto deltaFetcher = std::make_shared<CountingFetcher>();
     deltaFetcher->setCanned({0, 0, 0, 0}, fetched);
-    auto delta = makeDelta3dCache(deltaFetcher, persist);
+    auto delta = makeDelta3dCache(deltaFetcher, persist, parent);
     REQUIRE(delta->persistentCacheLayout() ==
             vc::render::PersistentCacheLayout::Delta3d);
+    CHECK(budget->stats().managedBytes == 0);
     CHECK_FALSE(fs::exists(persist / "scale0" / "0.0.0"));
     CHECK_FALSE(fs::exists(bookkeeping));
     CHECK(fs::is_regular_file(sibling));
@@ -899,14 +911,14 @@ TEST_CASE("persistent cache format transitions are leased and volume-local")
 
     // Same-format processes can share the derived Zarr cache concurrently.
     auto sameModeFetcher = std::make_shared<CountingFetcher>();
-    auto sameMode = makeDelta3dCache(sameModeFetcher, persist);
+    auto sameMode = makeDelta3dCache(sameModeFetcher, persist, parent);
     CHECK(sameMode->stats().persistentCacheEnabled);
     REQUIRE(waitForResolved(*sameMode, 0, 0, 0, 0).status == ChunkStatus::Data);
     CHECK(sameModeFetcher->fetchCalls.load() == 0);
 
     auto blockedMirrorFetcher = std::make_shared<MirrorFetcher>();
     blockedMirrorFetcher->setCanned({0, 0, 0, 0}, fetched);
-    auto blockedMirror = makeMirrorCache(blockedMirrorFetcher, persist);
+    auto blockedMirror = makeMirrorCache(blockedMirrorFetcher, persist, parent);
     CHECK_FALSE(blockedMirror->stats().persistentCacheEnabled);
     blockedMirror.reset();
     sameMode.reset();
@@ -914,7 +926,7 @@ TEST_CASE("persistent cache format transitions are leased and volume-local")
 
     auto restoredFetcher = std::make_shared<MirrorFetcher>();
     restoredFetcher->setCanned({0, 0, 0, 0}, fetched);
-    auto restored = makeMirrorCache(restoredFetcher, persist);
+    auto restored = makeMirrorCache(restoredFetcher, persist, parent);
     REQUIRE(restored->persistentCacheLayout() ==
             vc::render::PersistentCacheLayout::ZarrMirror);
     CHECK_FALSE(fs::exists(persist / ".vc_delta3d_cache"));

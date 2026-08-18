@@ -360,7 +360,13 @@ PersistentCachePreparation preparePersistentCache(
     // have completed while the lock was being converted.
     if (!compatible()) {
         std::error_code ec;
-        std::filesystem::remove_all(root, ec);
+        auto budget = budgetRoot
+            ? PersistentZarrCacheBudget::findForPath(root)
+            : std::shared_ptr<PersistentZarrCacheBudget>{};
+        if (budget)
+            budget->removeCacheSubtree(root, ec);
+        else
+            std::filesystem::remove_all(root, ec);
         if (!ec) {
             const auto bookkeeping = root.parent_path() /
                 ".vc_cache_bookkeeping" / root.filename();
@@ -415,6 +421,17 @@ void releasePersistentWriteBytes(std::size_t bytes)
     g_persistentWriteBacklogBytes.fetch_sub(bytes, std::memory_order_acq_rel);
 }
 
+void replacePersistentWriteBytes(std::size_t reservedBytes,
+                                 std::size_t replacementBytes)
+{
+    if (replacementBytes > reservedBytes) {
+        g_persistentWriteBacklogBytes.fetch_add(
+            replacementBytes - reservedBytes, std::memory_order_acq_rel);
+    } else if (reservedBytes > replacementBytes) {
+        releasePersistentWriteBytes(reservedBytes - replacementBytes);
+    }
+}
+
 std::string uniqueTmpSuffix()
 {
     // Several caches (viewers, core blocking readers, prefill — possibly in
@@ -437,6 +454,23 @@ utils::ThreadPool& persistentCacheWriterPool()
     return *pool;
 #else
     static utils::ThreadPool pool(1);
+    return pool;
+#endif
+}
+
+utils::ThreadPool& persistentCacheCompressionPool()
+{
+    // Compression is intentionally isolated from rendering's decode workers.
+    // Two workers provide steady write-back throughput while bounding the
+    // transient raw-plus-encoded working set to two chunks.
+    // Initialize the writer first so static teardown destroys the compression
+    // pool before the pool its running tasks publish into.
+    (void)persistentCacheWriterPool();
+#if defined(_WIN32)
+    static auto* pool = new utils::ThreadPool(2);
+    return *pool;
+#else
+    static utils::ThreadPool pool(2);
     return pool;
 #endif
 }
@@ -4133,71 +4167,32 @@ bool ChunkCache::queueDelta3dWrite(
         operation->writeQueued.store(true, std::memory_order_release);
     }
     state->persistentWritesInFlight_.fetch_add(1, std::memory_order_acq_rel);
-
-    auto scheduler = state->decodeScheduler_.lock();
-    if (!scheduler) {
-        state->persistentWritesInFlight_.fetch_sub(1, std::memory_order_acq_rel);
-        releasePersistentWriteBytes(rawBytes);
-        if (operation)
-            operation->writeQueued.store(false, std::memory_order_release);
-        return false;
-    }
-
-    const auto taskId = state->nextTaskId_->fetch_add(
-        1, std::memory_order_relaxed);
-    ChunkWorkPriority priority;
-    priority.maintenance = true;
     try {
-        scheduler->submit(
-            taskId, priority, 0, 0,
+        persistentCacheCompressionPool().enqueue(
             [state, key, rawBytes, bytes = std::move(bytes), operation] {
                 std::shared_ptr<const std::vector<std::byte>> encoded;
                 std::string error;
-                std::size_t encodedReservation = 0;
-                bool verificationReservation = false;
                 try {
                     auto payload = vc::cacheCompress(
                         std::span<const std::byte>(bytes->data(), bytes->size()),
                         state->levels_.at(static_cast<std::size_t>(key.level)).chunkShape,
                         dtypeSize(state->dtype_), vc::kCacheQuantLossless);
-                    if (!reservePersistentWriteBytes(payload.size())) {
-                        error = "Delta3D encoded write backlog is full";
-                    } else {
-                        encodedReservation = payload.size();
-                        verificationReservation =
-                            reservePersistentWriteBytes(rawBytes);
-                        if (!verificationReservation) {
-                            error = "Delta3D verification backlog is full";
-                        } else {
-                            auto verified = vc::cacheDecompress(
-                                std::span<const std::byte>(
-                                    payload.data(), payload.size()),
-                                bytes->size());
-                            releasePersistentWriteBytes(rawBytes);
-                            verificationReservation = false;
-                            if (!verified || *verified != *bytes) {
-                                error = "Delta3D lossless verification failed";
-                            } else {
-                                encoded =
-                                    std::make_shared<const std::vector<std::byte>>(
-                                        std::move(payload));
-                            }
-                        }
-                    }
+                    encoded =
+                        std::make_shared<const std::vector<std::byte>>(
+                            std::move(payload));
                 } catch (const std::exception& exception) {
                     error = exception.what();
                 } catch (...) {
                     error = "unknown Delta3D compression error";
                 }
-                if (verificationReservation)
-                    releasePersistentWriteBytes(rawBytes);
-                if (!encoded && encodedReservation != 0) {
-                    releasePersistentWriteBytes(encodedReservation);
-                    encodedReservation = 0;
-                }
 
                 if (encoded) {
                     const std::size_t encodedBytes = encoded->size();
+                    // The accepted job already owns a raw-byte backlog slot.
+                    // Convert that reservation to the encoded payload instead
+                    // of attempting a second admission that can fail after the
+                    // expensive compression work has completed.
+                    replacePersistentWriteBytes(rawBytes, encodedBytes);
                     try {
                         persistentCacheWriterPool().enqueue(
                             [state, key, encodedBytes, encoded = std::move(encoded),
@@ -4231,12 +4226,13 @@ bool ChunkCache::queueDelta3dWrite(
                                                   "Delta3D persistent write failed"});
                                 }
                             });
-                        releasePersistentWriteBytes(rawBytes);
                         return;
                     } catch (...) {
                         releasePersistentWriteBytes(encodedBytes);
                         error = "could not queue Delta3D persistent write";
                     }
+                } else {
+                    releasePersistentWriteBytes(rawBytes);
                 }
 
                 {
@@ -4248,7 +4244,6 @@ bool ChunkCache::queueDelta3dWrite(
                     state->persistentWritesInFlight_.fetch_sub(
                         1, std::memory_order_acq_rel);
                 }
-                releasePersistentWriteBytes(rawBytes);
                 state->cv_.notify_all();
                 if (operation) {
                     completePersistenceOperation(

@@ -112,6 +112,13 @@ public:
         const std::filesystem::path& target,
         std::uint64_t newSize);
 
+    // Removes an exact cache subtree and forgets every managed entry beneath
+    // it as one budget-coordinated operation. This waits for the startup scan,
+    // trimming, and overlapping reads/writes so format transitions cannot
+    // leave stale accounting behind.
+    bool removeCacheSubtree(const std::filesystem::path& subtree,
+                            std::error_code& ec);
+
     // Primarily useful for deterministic tests and orderly shutdown checks.
     void waitForIdle();
     static void resetRegistryForTesting();
