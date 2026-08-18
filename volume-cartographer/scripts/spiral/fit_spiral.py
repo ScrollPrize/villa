@@ -39,7 +39,8 @@ from ddp_helpers import (
 from config import (CHECKPOINT_MODEL_SHAPE_KEYS, Config, FitConfig,
                     durable_config)
 from fit_session import fit_input
-from lasagna_data import prepare_lasagna_volume, prepare_surf_sdt_volume
+from lasagna_data import (ensure_fit_sparse_stores, prepare_lasagna_volume,
+                          prepare_surf_sdt_volume)
 from checkpoint_io import load_checkpoint_cpu
 from influence import make_influence_state, subsample_rows
 from native_spiral import load_native_spiral_sampling
@@ -1852,6 +1853,43 @@ class FitContext:
         self._build_store_state()
         self._build_model_state()
 
+    def _ensure_sparse_volume_stores(self, *, use_normals, progress):
+        """Have rank zero build missing derived stores before any rank loads."""
+        # The resident pools are derived inputs. A normal single-process fit
+        # builds any missing ones itself; in DDP, rank zero builds once and
+        # publishes any failure before the other ranks try to open the pools.
+        build_error = None
+        if not self.dist.is_distributed or self.dist.is_main_process:
+            try:
+                ensure_fit_sparse_stores(
+                    use_normals=use_normals,
+                    use_spacing=self.grad_mag_spacing_enabled,
+                    use_sdt=self.phase_mode,
+                    normal_nx_zarr_path=self.normal_nx_zarr_path,
+                    normal_ny_zarr_path=self.normal_ny_zarr_path,
+                    grad_mag_zarr_path=self.grad_mag_zarr_path,
+                    normal_zarr_group=self.normal_zarr_group,
+                    sdt_zarr_path=self.surf_sdt_zarr_path,
+                    sdt_zarr_group=self.surf_sdt_zarr_group,
+                    progress=progress,
+                )
+            except Exception as exc:
+                build_error = exc
+        if self.dist.is_distributed:
+            error_message = [
+                None if build_error is None else
+                f'{type(build_error).__name__}: {build_error}'
+            ]
+            torch.distributed.broadcast_object_list(error_message, src=0)
+            if error_message[0] is not None:
+                if build_error is not None:
+                    raise build_error
+                raise RuntimeError(
+                    'rank 0 could not build the sparse volume stores: '
+                    f'{error_message[0]}')
+        elif build_error is not None:
+            raise build_error
+
     def _build_store_state(self):
         """Materialise the Lasagna and surf-SDT brick pools.
 
@@ -1865,9 +1903,14 @@ class FitContext:
         # lasagna and SDT stores
         # ==========================================================================
 
+        use_normals = (
+            self.config['loss_weight_dense_normals'] > 0 or self.phase_mode)
+        self._ensure_sparse_volume_stores(
+            use_normals=use_normals, progress=progress)
+
         self.lasagna_volume = prepare_lasagna_volume(
             self.scroll_zarr,
-            use_normals=(self.config['loss_weight_dense_normals'] > 0 or self.phase_mode),
+            use_normals=use_normals,
             use_spacing=self.grad_mag_spacing_enabled,
             normal_nx_zarr_path=self.normal_nx_zarr_path,
             normal_ny_zarr_path=self.normal_ny_zarr_path,

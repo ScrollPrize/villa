@@ -232,6 +232,7 @@ def pack_arrays(
     ct_masker: CtMasker | None = None,
     io_threads: int = 16,
     force: bool = False,
+    progress_callback=None,
 ) -> str:
     """Pack one or more same-geometry uint8 zarr arrays (one per channel).
 
@@ -280,6 +281,8 @@ def pack_arrays(
     print(f'{label}: packing {len(keys):,} chunks of {chunks} into bricks of '
           f'{brick} x{len(array_dirs)} channel(s), <= {upper_gib:.1f} GiB, '
           f'ct_mask={"on" if ct_masker else "off"} -> {out_dir}')
+    if progress_callback is not None:
+        progress_callback(0, len(keys), 'discovering occupied bricks')
 
     readers = [
         _make_chunk_reader(m['compressor'], chunk_voxels) for m in metas
@@ -343,6 +346,9 @@ def pack_arrays(
                 for f, bricks in zip(channel_files, channel_bricks):
                     f.write(bricks.tobytes())
                 done += 1
+                if progress_callback is not None:
+                    progress_callback(
+                        done, len(keys), f'{len(coords) - 1:,} bricks kept')
                 if done % 2000 == 0 or done == len(keys):
                     elapsed = time.perf_counter() - started
                     print(f'{label}: {done:,}/{len(keys):,} chunks, '

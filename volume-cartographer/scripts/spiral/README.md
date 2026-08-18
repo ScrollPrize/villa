@@ -112,7 +112,10 @@ scroll) so those bricks drop out of the pool and sample as no-data. The
 fitter loads the sidecars restricted to the configured z-ROI in one
 sequential read per channel (for the full s1 ROI: ~33 GiB SDT + ~10 GiB
 normals); after that every gather is pure device indexing with no I/O and no
-eviction. A missing sidecar is a startup error naming the pack command.
+eviction. When a required sidecar is missing, the fitter builds it before GPU
+loading and reports chunk progress. In DDP runs only rank 0 builds it. Manual
+prepacking with `--ct` remains useful because the CT mask can substantially
+reduce the resident pool size.
 Set `FIT_SPIRAL_RESIDENT_BOUNDS_CHECK=1` to enable per-gather bounds
 assertions when debugging new sampling code.
 
