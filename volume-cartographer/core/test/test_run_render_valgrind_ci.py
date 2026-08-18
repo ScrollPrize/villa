@@ -328,6 +328,42 @@ class RenderValgrindCiTest(unittest.TestCase):
             reference["tolerance"] = 0.05
             self.assertEqual(updated, reference)
 
+    def test_freeze_reference_accepts_native_evaluations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = root / "model.json"
+            model.write_text(json.dumps({"model_id": "native-model"}))
+            results = []
+            for fixture in ("serial", "parallel"):
+                for scenario in DRIVER.SCENARIOS:
+                    result = root / f"{fixture}-{scenario}.json"
+                    result.write_text(
+                        json.dumps(
+                            {
+                                "schema_version": 2,
+                                "kind": "evaluation",
+                                "case": f"{fixture}/{scenario}",
+                                "model_id": "native-model",
+                                "checksum": 123,
+                                "modeled_runtime_score_ns": 100.0,
+                            }
+                        )
+                    )
+                    results.append(result)
+
+            output = root / "reference.json"
+            DRIVER.freeze_reference(
+                SimpleNamespace(
+                    tolerance=0.05,
+                    model=model,
+                    output=output,
+                    results=results,
+                )
+            )
+            reference = json.loads(output.read_text())
+            self.assertEqual(reference["tolerance"], 0.05)
+            self.assertEqual(len(reference["cases"]), 8)
+            self.assertNotIn("identity", reference["cases"]["serial/full_res"])
 
 if __name__ == "__main__":
     unittest.main()

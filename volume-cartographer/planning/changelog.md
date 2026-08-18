@@ -102,7 +102,7 @@
 
 ## 2026-08-18
 
-- Replaced cross-run Valgrind worker-ID attribution with native passive paired-trace reconstruction and conservative replay.
+- Re-enabled the 5% synthetic-rendering gate with native paired attribution and production-cache lookup coverage.
 
 ## 2026-08-12
 
