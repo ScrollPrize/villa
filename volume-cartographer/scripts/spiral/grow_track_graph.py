@@ -400,7 +400,7 @@ def previously_used_seed_rows(
                 and is_complete_tifxyz(metadata_path.parent)
             ):
                 used.add(int(seed))
-        except OSError, TypeError, ValueError, json.JSONDecodeError:
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
             continue
     return used
 
