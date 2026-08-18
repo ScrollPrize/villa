@@ -21,6 +21,7 @@
 
 class JsonProfileEditor;
 class VolumeSelector;
+class QGroupBox;
 
 class RenderParamsDialog : public QDialog {
     Q_OBJECT
@@ -707,6 +708,7 @@ private:
     QDoubleSpinBox* spRandomTopPercent_{nullptr};
     QSpinBox* spMinValidVertices_{nullptr};
 
+    QGroupBox* advBox_{nullptr};
     QDoubleSpinBox* spGrowthMinSpan_{nullptr};
     QSpinBox* spMinConnect_{nullptr};
     QDoubleSpinBox* spMinSize_{nullptr};

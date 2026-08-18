@@ -3004,9 +3004,13 @@ GrowTrackPatchesDialog::GrowTrackPatchesDialog(QWidget* parent)
     bg->addButton(rbSeeds_);
     bg->addButton(rbRandom_);
 
-    auto updateSeedEnabled = [this]() {
+    auto updateSeedEnabled = [this, seedsForm]() {
         const bool isSeeds = rbSeeds_->isChecked();
         edtSeeds_->setEnabled(isSeeds);
+        edtSeeds_->setVisible(isSeeds);
+        if (QWidget* label = seedsForm->labelForField(edtSeeds_)) {
+            label->setVisible(isSeeds);
+        }
         spRandomCount_->setEnabled(!isSeeds);
         spRandomSeed_->setEnabled(!isSeeds);
         spRandomTopPercent_->setEnabled(!isSeeds);
@@ -3019,7 +3023,8 @@ GrowTrackPatchesDialog::GrowTrackPatchesDialog(QWidget* parent)
     main->addWidget(seedBox);
 
     // ---- Growth / filtering ----
-    auto* advBox = new QGroupBox(tr("Advanced (tuning)"), this);
+    advBox_ = new QGroupBox(tr("Use advanced options"), this);
+    auto* advBox = advBox_;
     advBox->setCheckable(true);
     advBox->setChecked(false);
     auto* advForm = new QFormLayout(advBox);
@@ -3102,6 +3107,16 @@ GrowTrackPatchesDialog::GrowTrackPatchesDialog(QWidget* parent)
     advForm->addRow(tr("OMP threads:"), edtOmpThreads_);
     advForm->addRow(QString(), chkOverwrite_);
 
+    auto setAdvancedControlsVisible = [advForm](bool visible) {
+        for (int i = 0; i < advForm->count(); ++i) {
+            if (QWidget* widget = advForm->itemAt(i)->widget()) {
+                widget->setVisible(visible);
+            }
+        }
+    };
+    connect(advBox_, &QGroupBox::toggled, this, setAdvancedControlsVisible);
+    setAdvancedControlsVisible(advBox_->isChecked());
+
     main->addWidget(advBox);
 
     // ---- Buttons ----
@@ -3175,24 +3190,27 @@ QStringList GrowTrackPatchesDialog::buildArgs() const
         args << "--min-valid-vertices" << QString::number(spMinValidVertices_->value());
     }
 
-    args << "--growth-min-span" << QString::number(spGrowthMinSpan_->value(), 'g', 10);
-    args << "--min-connect" << QString::number(spMinConnect_->value());
-    args << "--min-size" << QString::number(spMinSize_->value(), 'g', 10);
-    args << "--max-size" << QString::number(spMaxSize_->value(), 'g', 10);
-    args << "--max-thick-cell-frac" << QString::number(spMaxThickFrac_->value(), 'g', 10);
-    if (chkRejectFold_->isChecked()) args << "--reject-any-fold-fixes";
-    args << "--gate-tol" << QString::number(spGateTol_->value(), 'g', 10);
-    args << "--resample-spacing" << QString::number(spResampleSpacing_->value(), 'g', 10);
-    args << "--min-track-arclength" << QString::number(spMinTrackArclength_->value(), 'g', 10);
-    args << "--output-spacing" << QString::number(spOutputSpacing_->value(), 'g', 10);
-    args << "--border-erode-vx" << QString::number(spBorderErode_->value(), 'g', 10);
-    args << "--workers" << QString::number(spWorkers_->value());
-    if (chkOverwrite_->isChecked()) args << "--overwrite";
+    if (advBox_->isChecked()) {
+        args << "--growth-min-span" << QString::number(spGrowthMinSpan_->value(), 'g', 10);
+        args << "--min-connect" << QString::number(spMinConnect_->value());
+        args << "--min-size" << QString::number(spMinSize_->value(), 'g', 10);
+        args << "--max-size" << QString::number(spMaxSize_->value(), 'g', 10);
+        args << "--max-thick-cell-frac" << QString::number(spMaxThickFrac_->value(), 'g', 10);
+        if (chkRejectFold_->isChecked()) args << "--reject-any-fold-fixes";
+        args << "--gate-tol" << QString::number(spGateTol_->value(), 'g', 10);
+        args << "--resample-spacing" << QString::number(spResampleSpacing_->value(), 'g', 10);
+        args << "--min-track-arclength" << QString::number(spMinTrackArclength_->value(), 'g', 10);
+        args << "--output-spacing" << QString::number(spOutputSpacing_->value(), 'g', 10);
+        args << "--border-erode-vx" << QString::number(spBorderErode_->value(), 'g', 10);
+        args << "--workers" << QString::number(spWorkers_->value());
+        if (chkOverwrite_->isChecked()) args << "--overwrite";
+    }
     return args;
 }
 
 int GrowTrackPatchesDialog::ompThreads() const
 {
+    if (!advBox_->isChecked()) return -1;
     const QString t = edtOmpThreads_->text().trimmed();
     if (t.isEmpty()) return -1;
     bool ok = false;
@@ -3307,17 +3325,19 @@ void GrowTrackPatchesDialog::accept()
         }
     }
 
-    if (spMinSize_->value() > spMaxSize_->value()) {
-        QMessageBox::warning(this, tr("Grow Track Patches"), tr("Min size must not exceed Max size."));
-        return;
-    }
-    if (spResampleSpacing_->value() <= 0.0) {
-        QMessageBox::warning(this, tr("Grow Track Patches"), tr("Resample spacing must be > 0."));
-        return;
-    }
-    if (spGrowthMinSpan_->value() < 0.0) {
-        QMessageBox::warning(this, tr("Grow Track Patches"), tr("Growth min span must be >= 0."));
-        return;
+    if (advBox_->isChecked()) {
+        if (spMinSize_->value() > spMaxSize_->value()) {
+            QMessageBox::warning(this, tr("Grow Track Patches"), tr("Min size must not exceed Max size."));
+            return;
+        }
+        if (spResampleSpacing_->value() <= 0.0) {
+            QMessageBox::warning(this, tr("Grow Track Patches"), tr("Resample spacing must be > 0."));
+            return;
+        }
+        if (spGrowthMinSpan_->value() < 0.0) {
+            QMessageBox::warning(this, tr("Grow Track Patches"), tr("Growth min span must be >= 0."));
+            return;
+        }
     }
 
     saveVenv();
