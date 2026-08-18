@@ -4,7 +4,8 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  scripts/build_macos.sh [--install-deps] [--ccache|--sccache] [--build-dir DIR] [--jobs N]
+  scripts/build_macos.sh [--install-deps] [--ccache|--sccache] [--build-dir DIR]
+                         [--jobs N] [--tests] [--check]
 
 Build VC3D natively on macOS with Homebrew LLVM/Clang.
 
@@ -14,6 +15,9 @@ Options:
   --sccache        Enable sccache (installed when combined with --install-deps).
   --build-dir DIR  Override the default build directory: build-macos
   --jobs N         Parallel build jobs. Defaults to the host CPU count.
+  --tests          Configure with VC_TESTING=ON so the unit tests are built.
+  --check          Implies --tests, then runs the check-core and check-specialized
+                   targets.
 USAGE
 }
 
@@ -31,6 +35,8 @@ install_deps=0
 use_ccache=0
 use_sccache=0
 build_dir="build-macos"
+build_tests=0
+run_check=0
 jobs="$(sysctl -n hw.ncpu 2>/dev/null || echo 8)"
 
 while [[ $# -gt 0 ]]; do
@@ -50,6 +56,15 @@ while [[ $# -gt 0 ]]; do
     --build-dir)
       build_dir="${2:?missing value for --build-dir}"
       shift 2
+      ;;
+    --tests)
+      build_tests=1
+      shift
+      ;;
+    --check)
+      build_tests=1
+      run_check=1
+      shift
       ;;
     --jobs)
       jobs="${2:?missing value for --jobs}"
@@ -201,6 +216,10 @@ done
 # Accelerate.framework — see openblas note in required_formulae above.
 extra_cmake_args+=("-DBLA_VENDOR=OpenBLAS")
 
+if (( build_tests )); then
+  extra_cmake_args+=("-DVC_TESTING=ON")
+fi
+
 # PaStiX enables Fortran at configure time even with PASTIX_WITH_FORTRAN=OFF.
 # Use LLVM's flang (from the Homebrew flang keg) so the toolchain stays
 # clang/flang + lld end-to-end; gfortran would inherit our -fuse-ld=lld
@@ -220,6 +239,10 @@ cmake --preset macos-homebrew-llvm \
   "${extra_cmake_args[@]}"
 
 cmake --build "$build_dir" -j "$jobs"
+
+if (( run_check )); then
+  cmake --build "$build_dir" -j "$jobs" --target check-core check-specialized
+fi
 
 if (( use_ccache )); then
   ccache --show-stats
