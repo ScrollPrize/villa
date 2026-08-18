@@ -100,6 +100,10 @@
   classification, source download/read, and CPU decode queues so cached decode
   work no longer delays discovery and admission of remote misses.
 
+## 2026-08-18
+
+- Replaced cross-run Valgrind worker-ID attribution with native passive paired-trace reconstruction and conservative replay.
+
 ## 2026-08-12
 
 - Added per-scale unresolved-fetch counts to VC3D's existing cache status bar

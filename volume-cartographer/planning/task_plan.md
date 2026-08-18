@@ -1,130 +1,105 @@
-# VC3D control-point collapse rollback plan
+# VC3D render attribution and lookup repair plan
 
-## Current failure
+## Phase 1: deterministic paired attribution
 
-`handleGeneratedControlPoint()` first reduces every matched control to one
-replacement with a known fractional line position. For zero or one matched
-control it then calls `updateExistingLineControlPoint()`, which rebuilds the two
-adjacent spans and makes the replacement an exact sample of the updated line.
-For more than one matched control, however, it bypasses that update and starts
-fiber optimization against the unchanged old line. The fiber optimizer then
-projects controls independently by nearest 3-D distance, so a replacement can
-bind to another winding of a self-approaching line.
+1. Keep the benchmark binary unchanged. Run Callgrind and DRD with the same
+   `--fair-sched=yes` and `--scheduling-quantum` values and the same benchmark
+   arguments. Enable periodic Callgrind dumps at the fixed basic-block interval
+   without adding application markers.
+2. Parse the benchmark's existing paired `steady_clock`/`clock_gettime` calls
+   from the DRD syscall trace and trim the dependency graph to the measured
+   render only. Require one unambiguous boundary pair; drop outside dependencies
+   as already-satisfied and renumber the retained graph.
+3. Parse periodic Callgrind dumps as chronological per-thread event-cost slices.
+   Preserve every event counter and require their sum to equal the complete
+   measured Callgrind profile.
+4. Keep main thread 1 as the stable control role. Canonically order worker
+   Callgrind traces by deterministic non-cache work signature and DRD worker
+   traces by measured work-quanta/dependency signature. Match ranks only when
+   order is unambiguous; tied DRD signatures require equivalent Callgrind traces
+   within a predeclared tolerance or the pair fails. Enumerate every admissible
+   mapping inside an equivalent tie and use the maximum replay makespan, while
+   reporting the permutation range.
+5. Resample each matched chronological Callgrind cost trace over that DRD
+   worker's measured eligible windows while preserving order and exact total
+   cost. Keep original DRD thread IDs, program order, blocking, and dependency
+   edges. Implement direct per-window attribution in the native replay engine.
+6. Keep the regular collection and evaluation path native: the C++ tool parses
+   raw periodic Callgrind profiles and the raw DRD trace, validates and matches
+   them, performs attribution/replay, and writes the evaluation artifact.
+   CMake/Ninja invokes Valgrind and the native tool directly. Python remains
+   available only for offline calibration and is not part of the CI estimate.
+7. Collect repeated paired runs for every parallel scenario. Require stable
+   canonical signatures, exact cost conservation, and stable modeled makespan.
+   A pair that cannot prove reconstruction is rejected rather than averaged.
+8. Retain generic per-thread attribution for other replay users and keep serial
+   evaluation unchanged. Keep role pooling only as a diagnostic comparison,
+   not the renderer gate's final attribution.
+9. Freeze a new reference only after deterministic pairing and repeatability are
+   accepted, then re-enable the workflow gate in a separate reviewable change.
 
-The ordinary local-update exception path separately restores controls,
-branches, seed, and focus after already marking the session unoptimized, but
-does not restore the captured previous optimization state.
+## Phase 2: lookup performance
 
-## Implementation
-
-1. Keep `collapseControlPointsAtClick()` as the single pure operation for
-   insertion, one-control replacement, and multi-control collapse. Continue to
-   use its old-to-new branch mapping when the prepared edit is committed.
-2. Extract a reusable automatic-click preparation helper beside the existing
-   line-annotation fiber helpers. It accepts the old line/controls, matched
-   indices, clicked line position/point, sampler, and local-update config; it
-   performs collapse on copies and, when at least two controls survive, invokes
-   `updateExistingLineControlPoint()` for the replacement. It returns the
-   updated line, rich controls with segment metadata merged back, replacement
-   index, requested adjacent dirty spans, and old-to-new branch mapping.
-   `handleGeneratedControlPoint()` and focused tests must both call this helper;
-   do not duplicate its composition in the controller or tests.
-3. Remove the automatic multi-control branch that calls
-   `startFiberModeOptimization()` against `session.optimizedLine` without first
-   updating that line.
-4. Route every automatic click edit with at least two surviving controls through
-   the existing `updateExistingLineControlPoint()` call using the collapsed
-   replacement index. After compaction there is one changed control regardless
-   of how many old controls were removed, so the existing updater can rebuild
-   the complete left-neighbor -> replacement and replacement -> right-neighbor
-   spans from the replacement's authoritative line position.
-5. Handle an all-control collapse explicitly. With one surviving replacement
-   there are no adjacent spans to rebuild, so retain the old line only as a
-   tangent reference and run the established one-control reinitialization from
-   the clicked point. Change that one-control tangent lookup to use the
-   replacement's authoritative clamped `linePosition`, never nearest 3-D
-   position, so a nearby winding cannot choose the initial direction.
-6. Prepare the entire automatic edit before mutating the session. If preparation
-   throws, report the error while controls, line, branches, seed/focus,
-   optimization state, and alignment-metric state are still untouched. Only
-   after preparation succeeds, commit its controls/line, remap session-local
-   branch indices, update seed/focus, mark metrics stale, and mark the session
-   unoptimized.
-7. Derive requested dirty spans from the updater's post-sort replacement index;
-   these are exactly the replacement's surviving adjacent spans. The fiber
-   optimizer may expand a requested dirty span across a connected C-spline run
-   by existing policy.
-8. Preserve the original pre-edit line and session fields in the existing
-   multi-collapse rollback object until asynchronous fiber optimization and
-   generated-view materialization succeed. Both failure-to-start and
-   asynchronous failure restore the original pre-edit controls, line, branches,
-   seed, focus, and optimization state and clear the rollback object.
-9. Keep branch updates transactional for multi-collapse. Apply only the
-   old-to-new mapping to session-local branch indices before optimization; do
-   not mutate reciprocal fibers or schedule saves. On successful optimization,
-   use the existing deferred synchronization in `applyOptimizationTaskResult()`.
-   Preserve the current insertion/single-replacement synchronization behavior.
-10. Keep no-reoptimization mode unchanged: it records the collapsed controls on
-   the current line without running local reconstruction or fiber optimization.
-   Do not change persisted control representation or legacy load-time matching.
+1. Build the pre-render-order commit, the render-order commit, and the repaired
+   head with the same GCC Release configuration. Run serial and parallel native
+   trials repeatedly and collect Callgrind counters/checksums for all scenarios.
+2. Separate synthetic-fixture overhead from production behavior. The synthetic
+   array currently inherits the contextual `tryGetChunk()` forwarding overload,
+   while production `ChunkCache` overrides it directly; benchmark both the
+   production-equivalent direct overload and the generic compatibility path.
+3. Profile before choosing among these compatible optimizations:
+   - a per-tile/per-level successful-chunk cursor containing chunk bounds,
+     resolved payload, strides, and full key, checked before coordinate division
+     and key construction;
+   - a source-bound prepared lookup handle containing render-job request,
+     source ID/state, and level invariants;
+   - a fixed-capacity linear/small-vector local chunk cache in place of hashing
+     for the current maximum of eight pinned chunks.
+4. Implement one optimization at a time. Keep the old path as the correctness
+   oracle and compare exact image checksums plus requested/missing/error counts.
+5. Accept only changes with repeatable native and modeled improvement. Report
+   command, build type, input scenario, repetitions, and mean plus distribution
+   statistics.
 
 ## Testing and validation
 
-1. Test the extracted production preparation helper with a multi-control
-   fixture. Verify its updated line contains the clicked replacement as an exact
-   support between surviving neighbors, its controls remain ordered, and its
-   requested dirty spans are the replacement's adjacent spans.
-2. Add a self-approaching/two-winding fixture where the clicked replacement is
-   spatially nearer to an unrelated winding than to the old sample at its line
-   position. Invoke the production preparation helper and verify local
-   reconstruction anchors it in the intended ordered span and produces strictly
-   ordered control indices before full optimization.
-3. Retain and run the pure collapse tests for metadata ownership, seed transfer,
-   old-to-new branch indices, and dirty spans, ensuring unification does not
-   alter collapse semantics.
-4. Exercise endpoint/all-control collapse behavior. Verify preparation retains
-   the clicked replacement and that the one-control optimizer selects its
-   tangent from authoritative line position on a self-approaching line.
-5. Add a preparation-failure test using a throwing sampler/update fixture and
-   verify caller-owned inputs are unchanged. Review the controller ordering to
-   ensure no session field, optimization state, metric state, reciprocal branch,
-   or save is mutated before that helper returns successfully.
-6. Add focused branch-remap coverage for two linked controls collapsing into
-   one: local indices may be remapped during commit, while reciprocal mutation
-   is represented only by the later successful-commit synchronization input.
-   Verify failure rollback retains the pre-edit branch snapshot. If the private
-   Qt session still prevents an isolated asynchronous failure test, record that
-   narrow limitation explicitly.
-7. Build with all 32 cores and run:
-   `cmake --build volume-cartographer/build --parallel 32 --target test_lasagna_line_optimizer test_line_annotation_generated_views VC3D`.
-   Run both focused test binaries and `git diff --check`.
+- Native replay unit tests for direct window-cost conservation, chronological
+  placement, invalid window vectors, and unchanged generic per-thread
+  attribution.
+- Native parser tests for periodic Callgrind dumps and passive measured-window
+  trimming, plus native matching tests for equivalent ties, ambiguous ties,
+  chronological attribution, and exact event-counter conservation.
+- Repeated complete render matrices before freezing any reference.
+- Exact synthetic-render checksums and existing `ChunkedPlaneSampler` and
+  `ChunkCache` tests for speed changes.
+- Build relevant C++ targets with all 32 cores and run `git diff --check`.
 
 ## Specification updates
 
-- Create `specs/line_annotation.md` as the durable home for line-annotation
-  editing requirements currently represented only in `planning/spec.md`.
-- Amend both the durable specification and the existing line-annotation ribbon
-  invariant in `planning/spec.md`: every automatically reoptimized
-  generated-view click, including a multi-control collapse, must first
-  reconstruct the replacement's adjacent spans from its authoritative line
-  position; it must not project the replacement onto the unchanged line solely
-  by nearest 3-D distance.
-- Require transactional failure behavior: failed synchronous preparation leaves
-  geometry and optimization state unchanged, while failed asynchronous
-  multi-collapse restores the original pre-edit snapshot.
-- Do not change the persisted-control format or claim that legacy independent
-  nearest-3-D reconstruction is solved.
+Update `specs/benchmarks.md` so the renderer-gate contract requires passive
+deterministic paired reconstruction, measured-window trimming, canonical
+logical-worker matching, chronological per-window cost placement, exact cost
+conservation, and rejection of ambiguous pairs. Raw worker IDs never cross
+independent-run boundaries. Update `planning/spec.md` only if the accepted
+lookup optimization adds a renderer requirement not already covered there,
+including the measured no-numeric-change requirement.
 
 ## Documentation updates
 
-- Update `docs/line_annotation_fibers.md` to state that automatic control-point
-  edits locally reconstruct the neighboring spans before full fiber
-  optimization, including when several nearby controls collapse to one.
-- Document that failed automatic preparation retains the prior line and
-  optimization status.
+Update `docs/thread_sync_replay.md` and
+`docs/benchmarks/render_valgrind_ci.md` with paired-trace attribution,
+repeatability/rebaseline procedure, matching diagnostics, and the reason raw
+worker IDs cannot cross independent Valgrind runs. Document any new prepared
+lookup API beside the renderer implementation.
 
 ## Changelog update
 
-- Add one dated line to `planning/changelog.md` noting that multi-control
-  collapse now anchors its replacement through local span reconstruction and
-  synchronous preparation failure leaves the prior edit state unchanged.
+Add one dated line when attribution is corrected and the stable gate is
+re-enabled. Add a separate measured lookup-performance line only if the second
+phase produces an accepted code change.
+
+## Independent review
+
+Pending review of this plan against the current replay implementation, passive
+measurement constraint, benchmark specification, complete-cost invariant, and
+strict ambiguity rejection.

@@ -42,7 +42,7 @@ cmake --build volume-cartographer/build/ci-render-benchmark \
   --target bench_render_synthetic bench_thread_sync_replay --parallel "$jobs"
 ctest --test-dir volume-cartographer/build/ci-render-benchmark \
   --output-on-failure \
-  -R '^(test_render_synthetic_fixture|test_render_valgrind_ci_no_site)$'
+  -R '^(test_render_synthetic_fixture|test_thread_sync_replay_native)$'
 cmake --build volume-cartographer/build/ci-render-benchmark \
   --target render_valgrind_ci --parallel "$jobs"
 ```
@@ -51,42 +51,46 @@ Set `jobs` to a smaller positive number to limit local CPU or memory use. This
 only controls how many independent Ninja commands run at once. It does not
 change the fixed four-worker renderer fixture or five-core replay model.
 
-`test_render_valgrind_ci_no_site` runs the coordinator with `python3 -S`, parses
-a DRD fixture, and evaluates a profile through the real native replay engine.
-This prevents the dependency container from silently relying on host-installed
-Python packages. Python coordinates collection and artifact validation; all
-event-cost and replay computation is native C++.
+The regular estimate contains no Python process. Ninja invokes Valgrind
+directly, then `bench_thread_sync_replay evaluate-render` parses the raw
+Callgrind profiles and DRD log, validates the pair, attributes costs, replays
+the graph, and writes the result in C++.
 
 Artifacts are under
 `build/ci-render-benchmark/render-valgrind-ci/<fixture>/<scenario>/`:
 
-- `callgrind/artifact.json` and raw per-thread profiles;
-- `drd/artifact.json`, `drd.log`, and `events.jsonl` for parallel cases;
+- `callgrind/callgrind.out.*`, benchmark metadata, and a collection stamp;
+- `drd/drd.log`, benchmark metadata, and a collection stamp for parallel cases;
 - `evaluation.json` for the ungated score;
 - `checked.json` after a passing comparison;
-- `checked.failed.json` after a failed comparison.
 
-Start failure diagnosis with `checked.failed.json`. Historical compiler, model,
-checksum, cache, fixture, repetition, and profiler changes do not fail the
-reference gate. The output records
-`reference_valgrind_version`, `observed_valgrind_version`, and whether they
-changed. Current-run artifact corruption or Callgrind/DRD inconsistency still
-fails because it prevents a valid score. An incomplete DRD failure means the
-trace must be recollected. A score above the allowed slowdown is a performance
-regression requiring investigation or an intentional reference update.
+Start failure diagnosis with the raw profiles, DRD log, and `evaluation.json`.
+Historical compiler, model, checksum, cache, fixture, repetition, and profiler
+changes do not fail the reference gate. Current-run parse errors or
+Callgrind/DRD metadata inconsistency still fail because they prevent a valid
+score. A score above the allowed slowdown is a performance regression requiring
+investigation or an intentional reference update.
+
+Parallel collection uses the same fair scheduler and 10,000-basic-block
+quantum in both Valgrind runs. Periodic Callgrind deltas are matched to the DRD
+measured window by canonical worker work rank. Equal DRD worker signatures are
+accepted only when their total costs differ by at most 5% and their normalized
+32-bin chronological shapes differ by at most 2%. Every admissible mapping is
+replayed and the maximum makespan is the score.
 
 ## CI Activation
 
-The workflow runs on qualifying pull requests and pushes to `main`. The
+The workflow job is temporarily disabled while its corrected references are
+reviewed. Once its `if: ${{ false }}` guard is removed, it runs on qualifying
+pull requests and pushes to `main`. The
 rendering job is selected when changes touch VC3D/core build inputs such as
 `volume-cartographer/core/**`, `volume-cartographer/scripts/**`, CMake files,
 VC3D sources, shared utilities/libraries, or `.github/workflows/vc3d-ci.yml`.
 Documentation-only changes under `volume-cartographer/docs/**` run the workflow
 path filter but do not select this expensive rendering job.
 
-Merging the implementation into `main` therefore makes the job available for
-all subsequent qualifying changes; the pull request containing the workflow
-change should also execute it. To make passing it mandatory before merge, add
+Merging alone does not activate the currently disabled job. To make a restored
+job mandatory before merge, add
 the `Synthetic rendering regression (GCC Release / Valgrind replay)` check to
 the repository branch ruleset or branch protection. Merging alone runs the
 check but does not make it a required status check.
@@ -245,8 +249,9 @@ solely to change policy width.
 For any maintenance change, run:
 
 ```bash
-PYTHONPATH=volume-cartographer/scripts python3 -m unittest \
-  volume-cartographer/core/test/test_run_render_valgrind_ci.py
+cmake --build volume-cartographer/build/ci-render-benchmark \
+  --target test_thread_sync_replay_native --parallel "$(nproc)"
+volume-cartographer/build/ci-render-benchmark/bin/test_thread_sync_replay_native
 cmake --build volume-cartographer/build/ci-render-benchmark \
   --target render_valgrind_ci --parallel "$(nproc)"
 git diff --check

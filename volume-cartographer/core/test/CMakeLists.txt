@@ -380,14 +380,16 @@ target_compile_definitions(bench_thread_pool_dispatch PRIVATE
 vc_register_test_target(bench_thread_pool_dispatch)
 
 add_library(vc_thread_sync_replay STATIC
-    thread_sync_replay/Replay.cpp)
+    thread_sync_replay/Replay.cpp
+    thread_sync_replay/RenderValgrind.cpp)
 target_include_directories(vc_thread_sync_replay PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(vc_thread_sync_replay PUBLIC
     nlohmann_json::nlohmann_json)
 
 add_executable(bench_thread_sync_replay
-    thread_sync_replay/main.cpp)
+    thread_sync_replay/main.cpp
+    thread_sync_replay/RenderValgrindCli.cpp)
 target_link_libraries(bench_thread_sync_replay PRIVATE
     vc_thread_sync_replay nlohmann_json::nlohmann_json)
 target_compile_definitions(bench_thread_sync_replay PRIVATE
@@ -564,33 +566,33 @@ if(VC_RUN_RENDER_BENCHMARKS)
        CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
         set(_render_valgrind_ci_root
             "${CMAKE_BINARY_DIR}/render-valgrind-ci")
-        set(_render_valgrind_ci_runner
-            "${PROJECT_SOURCE_DIR}/scripts/run_render_valgrind_ci.py")
-        set(_render_valgrind_ci_common
-            "${PROJECT_SOURCE_DIR}/scripts/render_valgrind_common.py")
         set(_render_valgrind_ci_model
             "${PROJECT_SOURCE_DIR}/core/test/data/render_valgrind_ci_model.json")
         set(_render_valgrind_ci_reference
             "${PROJECT_SOURCE_DIR}/core/test/data/render_valgrind_ci_reference.json")
-        set(_render_valgrind_ci_script_deps
-            "${_render_valgrind_ci_runner}"
-            "${_render_valgrind_ci_common}"
-            "${PROJECT_SOURCE_DIR}/scripts/native_thread_sync_replay.py"
-            "${PROJECT_SOURCE_DIR}/scripts/thread_sync_trace.py")
         set(_render_valgrind_ci_measure_outputs)
         set(_render_valgrind_ci_gate_outputs)
 
         foreach(_fixture serial parallel)
+            if(_fixture STREQUAL "serial")
+                set(_render_workers 1)
+            else()
+                set(_render_workers 4)
+            endif()
             foreach(_scenario full_res fallback_3 mixed_correlated mixed_shuffled)
                 set(_case_dir
                     "${_render_valgrind_ci_root}/${_fixture}/${_scenario}")
                 set(_callgrind_dir "${_case_dir}/callgrind")
-                set(_callgrind_artifact
-                    "${_callgrind_dir}/artifact.json")
+                set(_callgrind_stamp
+                    "${_callgrind_dir}/collected.stamp")
+                set(_callgrind_prefix
+                    "${_callgrind_dir}/callgrind.out")
+                set(_callgrind_metadata
+                    "${_callgrind_dir}/metadata.json")
                 set(_callgrind_byproducts
                     "${_callgrind_dir}/callgrind.out"
                     "${_callgrind_dir}/callgrind.out-01"
-                    "${_callgrind_dir}/metadata.callgrind.json")
+                    "${_callgrind_metadata}")
                 if(_fixture STREQUAL "parallel")
                     list(APPEND _callgrind_byproducts
                         "${_callgrind_dir}/callgrind.out-02"
@@ -599,82 +601,121 @@ if(VC_RUN_RENDER_BENCHMARKS)
                         "${_callgrind_dir}/callgrind.out-05")
                 endif()
                 add_custom_command(
-                    OUTPUT "${_callgrind_artifact}"
+                    OUTPUT "${_callgrind_stamp}"
                     BYPRODUCTS ${_callgrind_byproducts}
+                    COMMAND ${CMAKE_COMMAND} -E remove_directory
+                        "${_callgrind_dir}"
                     COMMAND ${CMAKE_COMMAND} -E make_directory
                         "${_callgrind_dir}"
-                    COMMAND ${Python3_EXECUTABLE} "${_render_valgrind_ci_runner}"
-                        callgrind
-                        --benchmark $<TARGET_FILE:bench_render_synthetic>
+                    COMMAND ${CMAKE_COMMAND} -E env
+                        "VC_RENDER_SAMPLER_THREADS=${_render_workers}"
+                        ${VC_VALGRIND_EXECUTABLE}
+                        --tool=callgrind
+                        --instr-atstart=no
+                        --fair-sched=yes
+                        --scheduling-quantum=10000
+                        --separate-threads=yes
+                        --dump-every-bb=10000
+                        --combine-dumps=no
+                        --collect-systime=no
+                        --cache-sim=yes
+                        --branch-sim=yes
+                        --I1=32768,8,64
+                        --D1=32768,8,64
+                        --LL=8388608,16,64
+                        "--callgrind-out-file=${_callgrind_prefix}"
+                        $<TARGET_FILE:bench_render_synthetic>
                         --fixture ${_fixture}
                         --scenario ${_scenario}
+                        --native-trials 1
+                        --metadata "${_callgrind_metadata}"
                         --repetitions 1
-                        --output-dir "${_callgrind_dir}"
-                        --artifact "${_callgrind_artifact}"
+                        --callgrind
+                    COMMAND ${CMAKE_COMMAND} -E touch "${_callgrind_stamp}"
                     DEPENDS
                         bench_render_synthetic
-                        ${_render_valgrind_ci_script_deps}
                     VERBATIM)
 
-                set(_drd_artifact)
+                set(_drd_stamp)
                 if(_fixture STREQUAL "parallel")
                     set(_drd_dir "${_case_dir}/drd")
-                    set(_drd_artifact "${_drd_dir}/artifact.json")
+                    set(_drd_stamp "${_drd_dir}/collected.stamp")
+                    set(_drd_trace "${_drd_dir}/drd.log")
+                    set(_drd_metadata "${_drd_dir}/metadata.json")
                     add_custom_command(
-                        OUTPUT "${_drd_artifact}"
+                        OUTPUT "${_drd_stamp}"
                         BYPRODUCTS
-                            "${_drd_dir}/drd.log"
-                            "${_drd_dir}/events.jsonl"
-                            "${_drd_dir}/metadata.drd.json"
+                            "${_drd_trace}"
+                            "${_drd_metadata}"
+                        COMMAND ${CMAKE_COMMAND} -E remove_directory
+                            "${_drd_dir}"
                         COMMAND ${CMAKE_COMMAND} -E make_directory
                             "${_drd_dir}"
-                        COMMAND ${Python3_EXECUTABLE} "${_render_valgrind_ci_runner}"
-                            drd
-                            --benchmark $<TARGET_FILE:bench_render_synthetic>
+                        COMMAND ${CMAKE_COMMAND} -E env
+                            "VC_RENDER_SAMPLER_THREADS=4"
+                            ${VC_VALGRIND_EXECUTABLE}
+                            --tool=drd
+                            --trace-segment=yes
+                            --trace-csw=yes
+                            --fair-sched=yes
+                            --time-stamp=yes
+                            --scheduling-quantum=10000
+                            --trace-sched=yes
+                            --trace-syscalls=yes
+                            "--log-file=${_drd_trace}"
+                            $<TARGET_FILE:bench_render_synthetic>
+                            --fixture parallel
                             --scenario ${_scenario}
+                            --native-trials 1
+                            --metadata "${_drd_metadata}"
                             --repetitions 1
-                            --output-dir "${_drd_dir}"
-                            --artifact "${_drd_artifact}"
+                        COMMAND ${CMAKE_COMMAND} -E touch "${_drd_stamp}"
                         DEPENDS
                             bench_render_synthetic
-                            ${_render_valgrind_ci_script_deps}
                         VERBATIM)
                 endif()
 
                 set(_evaluation "${_case_dir}/evaluation.json")
                 set(_evaluation_command
-                    ${Python3_EXECUTABLE} "${_render_valgrind_ci_runner}"
-                    evaluate
-                    --callgrind "${_callgrind_artifact}"
+                    $<TARGET_FILE:bench_thread_sync_replay>
+                    evaluate-render
+                    --fixture ${_fixture}
+                    --scenario ${_scenario}
+                    --callgrind-prefix "${_callgrind_prefix}"
+                    --callgrind-metadata "${_callgrind_metadata}"
                     --model "${_render_valgrind_ci_model}"
-                    --replay-engine $<TARGET_FILE:bench_thread_sync_replay>
                     --output "${_evaluation}")
                 if(_fixture STREQUAL "parallel")
-                    list(APPEND _evaluation_command --drd "${_drd_artifact}")
+                    list(APPEND _evaluation_command
+                        --drd-trace "${_drd_trace}"
+                        --drd-metadata "${_drd_metadata}")
                 endif()
                 add_custom_command(
                     OUTPUT "${_evaluation}"
                     COMMAND ${_evaluation_command}
                     DEPENDS
-                        "${_callgrind_artifact}"
-                        ${_drd_artifact}
+                        "${_callgrind_stamp}"
+                        ${_drd_stamp}
                         bench_thread_sync_replay
                         "${_render_valgrind_ci_model}"
-                        ${_render_valgrind_ci_script_deps}
                     VERBATIM)
                 list(APPEND _render_valgrind_ci_measure_outputs "${_evaluation}")
 
                 set(_gate "${_case_dir}/checked.json")
                 set(_gate_command
-                    ${Python3_EXECUTABLE} "${_render_valgrind_ci_runner}"
-                    evaluate
-                    --callgrind "${_callgrind_artifact}"
+                    $<TARGET_FILE:bench_thread_sync_replay>
+                    evaluate-render
+                    --fixture ${_fixture}
+                    --scenario ${_scenario}
+                    --callgrind-prefix "${_callgrind_prefix}"
+                    --callgrind-metadata "${_callgrind_metadata}"
                     --model "${_render_valgrind_ci_model}"
                     --reference "${_render_valgrind_ci_reference}"
-                    --replay-engine $<TARGET_FILE:bench_thread_sync_replay>
                     --output "${_gate}")
                 if(_fixture STREQUAL "parallel")
-                    list(APPEND _gate_command --drd "${_drd_artifact}")
+                    list(APPEND _gate_command
+                        --drd-trace "${_drd_trace}"
+                        --drd-metadata "${_drd_metadata}")
                 endif()
                 add_custom_command(
                     OUTPUT "${_gate}"
@@ -682,12 +723,11 @@ if(VC_RUN_RENDER_BENCHMARKS)
                     COMMAND ${_gate_command}
                     DEPENDS
                         "${_evaluation}"
-                        "${_callgrind_artifact}"
-                        ${_drd_artifact}
+                        "${_callgrind_stamp}"
+                        ${_drd_stamp}
                         bench_thread_sync_replay
                         "${_render_valgrind_ci_model}"
                         "${_render_valgrind_ci_reference}"
-                        ${_render_valgrind_ci_script_deps}
                     VERBATIM)
                 list(APPEND _render_valgrind_ci_gate_outputs "${_gate}")
             endforeach()

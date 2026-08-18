@@ -118,20 +118,29 @@
   process per host CPU even when each guest configures four renderer workers.
 - The CI regression graph must generate fresh separate-thread Callgrind
   profiles for all eight cases and fresh complete DRD dependency graphs for the
-  four parallel cases. A collector publishes its completion manifest atomically
-  only after all raw files and metadata validate; evaluators depend on those
-  manifests and may not rerun collection.
+  four parallel cases. Ninja publishes a collection stamp only after Valgrind
+  exits successfully; native evaluators depend on those stamps and may not
+  rerun collection.
 - The CI relative modeled-runtime score uses the frozen synthetic-only
-  data-read event model. Feature extraction, event-cost evaluation, deterministic
-  numeric-thread summation, cost attribution, and replay must run in the native
-  C++ replay engine. The Python CI coordinator must use only the standard
-  library at runtime; a `python3 -S` test must exercise dependency parsing and
-  native scoring. Serial score is summed per-thread modeled work per render
+  data-read event model. Raw profile and DRD parsing, feature extraction,
+  event-cost evaluation, logical-worker matching, cost attribution, replay,
+  and result output must run in the native C++ replay engine. Python must not
+  be used in the regular evaluation path. Serial score is summed per-thread modeled work per render
   call. Parallel score is native FIFO replay makespan per render call with four
   workers plus one caller core, equal attribution,
   `residual_fraction=0.5`, zero wake latency, the frozen cross-thread release
   latency, and unit replay/dependency-excess scales. Process startup and native
   wall timing are excluded.
+- Callgrind and DRD must use the same fair-scheduler and scheduling-quantum
+  settings without application markers or measured-program changes. The DRD
+  graph must be trimmed to the unique passive clock-call pair around the render.
+  Periodic Callgrind deltas must be placed chronologically over matched DRD work
+  windows while preserving each thread's exact aggregate modeled cost.
+- Raw Valgrind worker IDs must never be treated as identities across independent
+  runs. Main thread 1 remains fixed; workers are matched by canonical work rank.
+  Equal DRD signatures require predeclared cost and chronological-shape
+  equivalence. All admissible equivalent mappings must be replayed and the
+  maximum makespan reported; non-equivalent ambiguity is an error.
 - The relative modeled-runtime score is not a validated absolute runtime claim.
   Each case may be at most the configured tolerance slower than its versioned
   reference, initially 10%. Faster scores are accepted without a lower bound.
@@ -147,9 +156,9 @@
   reference pass/fail. The reference schema and case key remain required to
   locate and interpret the score baseline.
 - Current-run artifact integrity remains mandatory. Paired Callgrind and DRD
-  artifacts must describe the same case and metadata and use the same Valgrind
-  version. Parallel traces must have no unresolved happens-before edge or
-  unmatched blocking wait.
+  metadata must describe the same case, dimensions, repetitions, worker count,
+  and checksum. Parallel traces must have one unambiguous measured window and
+  no unresolved in-window happens-before edge.
 - The machine-readable summary must record the metric schema/model version,
   Callgrind events by name, compiler, architecture target, Valgrind version,
   cache geometry, dimensions, tile size, worker count, repetitions, checksum,
@@ -204,14 +213,12 @@ the previous governor, frequency bounds, energy preference, and boost setting.
   fixed-basic-block work slices, pair blocking futex waits with guest wakes or
   observed thread completion, and fail timing validation when dependencies are
   unresolved.
-- Passive event scoring and playback must use the native persistent replay
-  engine. Python remains responsible for Valgrind collection, dependency
-  extraction, model fitting, orchestration, and reports, but production callers
-  must ask the native engine to evaluate profile costs, load each event graph
-  once, cache named cost attributions, and submit ordered replay batches through
-  the versioned protocol. Missing native replay is an error; there is no silent
-  Python fallback. The Python replay and NumPy event model are retained only as
-  calibration/parity tools and must not be used for production benchmark
+- Passive event scoring and playback must use the native replay engine. The
+  rendering gate must also perform raw Valgrind parsing, dependency extraction,
+  orchestration, and reporting natively. The persistent JSON protocol remains
+  available to offline calibration tools. Missing native replay is an error;
+  there is no Python fallback. Python replay and NumPy event models are retained
+  only as calibration/parity tools and must not produce production benchmark
   results.
 - Valgrind elapsed timestamps must not be used as native duration or as work
   weights. State names must distinguish traced blocking from native scheduler

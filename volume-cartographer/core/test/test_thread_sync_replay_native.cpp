@@ -1,9 +1,13 @@
 #include "thread_sync_replay/Replay.hpp"
+#include "thread_sync_replay/RenderValgrind.hpp"
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
 #include <cmath>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -15,6 +19,39 @@ namespace replay = vc::thread_sync_replay;
 namespace
 {
 
+class TemporaryDirectory
+{
+public:
+    TemporaryDirectory()
+    {
+        path = std::filesystem::temp_directory_path() /
+               ("vc-thread-sync-replay-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        std::filesystem::create_directories(path);
+    }
+
+    ~TemporaryDirectory() { std::filesystem::remove_all(path); }
+
+    std::filesystem::path path;
+};
+
+void writeText(const std::filesystem::path& path, const std::string& value)
+{
+    std::ofstream stream(path);
+    REQUIRE(stream.good());
+    stream << value;
+}
+
+std::string callgrindProfile(std::int64_t thread, const std::vector<std::int64_t>& totals)
+{
+    std::string result = "thread: " + std::to_string(thread) + "\n";
+    result += "events: Ir Dr Dw I1mr D1mr D1mw ILmr DLmr DLmw Bc Bcm Bi Bim\n";
+    result += "totals:";
+    for (const auto value : totals) {
+        result += " " + std::to_string(value);
+    }
+    return result + "\n";
+}
+
 replay::EventProfile representativeProfile()
 {
     return {
@@ -25,7 +62,9 @@ replay::EventProfile representativeProfile()
         {"D1mw", 1},
         {"DLmr", 1},
         {"DLmw", 0},
+        {"Bc", 20},
         {"Bcm", 2},
+        {"Bi", 4},
         {"Bim", 1},
     };
 }
@@ -109,6 +148,105 @@ TEST_CASE("native replay attributes a sole zero-weight trailing window")
     const auto durations = graph.assignCosts({{1, 120.0}}, 0.0, "equal");
     CHECK(durations[0] == 0.0);
     CHECK(durations[1] == 120.0);
+}
+
+TEST_CASE("native replay attributes explicit chronological window costs")
+{
+    replay::Graph graph({
+        {.thread = 1, .kind = "work"},
+        {.thread = 1, .kind = "work_quantum"},
+        {.thread = 1, .kind = "work"},
+        {.thread = 1, .kind = "thread_finish"},
+    });
+    const auto windows = graph.attributionWindows(0.5);
+    REQUIRE(windows.at(1).size() == 2);
+    CHECK(windows.at(1)[0].units == 1.0);
+    CHECK(windows.at(1)[1].units == 0.5);
+
+    const auto durations = graph.assignWindowCosts({{1, {10.0, 30.0}}}, 0.5, "front");
+    CHECK(durations[0] == 10.0);
+    CHECK(durations[1] == 0.0);
+    CHECK(durations[2] == 30.0);
+    CHECK(durations[3] == 0.0);
+}
+
+TEST_CASE("native replay rejects malformed explicit window costs")
+{
+    replay::Graph graph({
+        {.thread = 1, .kind = "work"},
+        {.thread = 1, .kind = "work_quantum"},
+        {.thread = 2, .kind = "work"},
+    });
+    CHECK_THROWS_AS(graph.assignWindowCosts({{1, {1.0}}}, 0.5, "front"), std::runtime_error);
+    CHECK_THROWS_AS(graph.assignWindowCosts({{1, {1.0}}, {2, {2.0, 3.0}}}, 0.5, "front"), std::runtime_error);
+    CHECK_THROWS_AS(graph.assignWindowCosts({{1, {-1.0}}, {2, {2.0}}}, 0.5, "front"), std::runtime_error);
+}
+
+TEST_CASE("native Callgrind parser preserves chronological deltas and totals")
+{
+    TemporaryDirectory temporary;
+    const auto prefix = temporary.path / "callgrind.out";
+    writeText(temporary.path / "callgrind.out.1-01", callgrindProfile(1, {10, 2, 1, 0, 1, 0, 0, 0, 0, 2, 1, 0, 0}));
+    writeText(temporary.path / "callgrind.out.2-01", callgrindProfile(1, {20, 4, 2, 0, 2, 0, 0, 1, 0, 4, 2, 0, 0}));
+    writeText(temporary.path / "callgrind.out-01", callgrindProfile(1, {3, 1, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0}));
+
+    const auto parsed = replay::parsePeriodicCallgrind(prefix);
+    CHECK(parsed.periodic_dump_count == 2);
+    REQUIRE(parsed.slices.at(1).size() == 3);
+    CHECK(parsed.slices.at(1)[0].at("Ir") == 10);
+    CHECK(parsed.slices.at(1)[1].at("Ir") == 20);
+    CHECK(parsed.slices.at(1)[2].at("Ir") == 3);
+    CHECK(parsed.totals.at(1).at("Ir") == 33);
+    CHECK(parsed.totals.at(1).at("D1mr") == 3);
+}
+
+TEST_CASE("native DRD parser trims to the passive measured clock pair")
+{
+    TemporaryDirectory temporary;
+    const auto trace = temporary.path / "drd.log";
+    writeText(
+        trace,
+        "-- New segment for thread 1 with vc [ 1: 1 ]\n"
+        "SYSCALL[2,1](228) sys_clock_gettime( 1, 0xaaa )[sync] --> Success(0x0)\n"
+        "-- New segment for thread 1 with vc [ 1: 2 ]\n"
+        "-- New segment for thread 2 with vc [ 1: 2, 2: 1 ]\n"
+        "-- SCHED[2]: releasing lock (VG_(scheduler):timeslice) -> VgTs_Yielding\n"
+        "SYSCALL[2,1](228) sys_clock_gettime( 1, 0xaaa )[sync] --> Success(0x0)\n"
+        "-- New segment for thread 1 with vc [ 1: 3, 2: 1 ]\n");
+
+    const auto parsed = replay::parseMeasuredDrd(trace);
+    CHECK(parsed.parsed_segment_count == 3);
+    CHECK(parsed.retained_segment_count == 2);
+    CHECK(parsed.events.size() == 3);
+    CHECK(parsed.happens_before_edges == 1);
+    CHECK(parsed.full_quanta.at(2) == 1);
+    CHECK(parsed.events[1].dependencies.back().kind == "drd_happens_before");
+}
+
+TEST_CASE("native paired replay enumerates equivalent worker identities")
+{
+    replay::CallgrindTrace callgrind;
+    for (std::int64_t thread = 1; thread <= 3; ++thread) {
+        callgrind.slices[thread] = {representativeProfile()};
+        callgrind.totals[thread] = representativeProfile();
+    }
+    replay::DrdTrace drd{
+        .events =
+            {
+                {.thread = 1, .kind = "work_quantum"},
+                {.thread = 2, .kind = "work_quantum"},
+                {.thread = 3, .kind = "work_quantum"},
+            },
+        .full_quanta = {{1, 1}, {2, 1}, {3, 1}},
+    };
+    const auto result = replay::replayPaired(callgrind, drd, dataReadModel(), {.replay = {.cores = 3}});
+    CHECK(result.mapping_count == 2);
+    CHECK(result.conservative.modeled_work > 0.0);
+    CHECK(result.minimum_makespan == result.conservative.modeled_makespan);
+
+    callgrind.totals[3]["Ir"] *= 2;
+    callgrind.slices[3][0] = callgrind.totals[3];
+    CHECK_THROWS_AS(replay::replayPaired(callgrind, drd, dataReadModel(), {.replay = {.cores = 3}}), std::runtime_error);
 }
 
 TEST_CASE("native replay applies cross-thread and wake latency cumulatively")
