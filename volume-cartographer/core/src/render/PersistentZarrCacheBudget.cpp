@@ -764,6 +764,79 @@ bool PersistentZarrCacheBudget::removeCacheSubtree(
     return true;
 }
 
+bool PersistentZarrCacheBudget::moveCacheSubtree(
+    const fs::path& source,
+    const fs::path& destination,
+    std::error_code& ec)
+{
+    const auto normalizedSource = normalizedPath(source);
+    const auto normalizedDestination = normalizedPath(destination);
+    ec.clear();
+    if (normalizedSource == normalizedDestination)
+        return true;
+    if (normalizedSource == impl_->root ||
+        normalizedDestination == impl_->root ||
+        !isWithin(normalizedSource, impl_->root) ||
+        !isWithin(normalizedDestination, impl_->root) ||
+        isWithin(normalizedSource, normalizedDestination) ||
+        isWithin(normalizedDestination, normalizedSource)) {
+        ec = std::make_error_code(std::errc::invalid_argument);
+        return false;
+    }
+
+    const auto overlapsEither = [&](const std::string& path) {
+        const auto candidate = fs::path(path);
+        return isWithin(candidate, normalizedSource) ||
+               isWithin(candidate, normalizedDestination);
+    };
+    std::unique_lock lock(impl_->mutex);
+    impl_->cv.wait(lock, [&] {
+        if (impl_->scanInFlight || impl_->trimInFlight)
+            return false;
+        for (const auto& [path, count] : impl_->readPins) {
+            (void)count;
+            if (overlapsEither(path))
+                return false;
+        }
+        return std::none_of(
+            impl_->writePins.begin(), impl_->writePins.end(), overlapsEither);
+    });
+
+    if (!fs::exists(normalizedSource, ec))
+        return !ec;
+    if (fs::exists(normalizedDestination, ec)) {
+        ec = std::make_error_code(std::errc::file_exists);
+        return false;
+    }
+    if (ec)
+        return false;
+    fs::create_directories(normalizedDestination.parent_path(), ec);
+    if (ec)
+        return false;
+    fs::rename(normalizedSource, normalizedDestination, ec);
+    if (ec)
+        return false;
+
+    std::vector<std::pair<std::string, Impl::Entry>> movedEntries;
+    for (auto it = impl_->entries.begin(); it != impl_->entries.end();) {
+        const auto path = fs::path(it->first);
+        if (!isWithin(path, normalizedSource)) {
+            ++it;
+            continue;
+        }
+        movedEntries.emplace_back(
+            (normalizedDestination /
+             path.lexically_relative(normalizedSource)).string(),
+            it->second);
+        it = impl_->entries.erase(it);
+    }
+    for (auto& [path, entry] : movedEntries)
+        impl_->entries.insert_or_assign(std::move(path), std::move(entry));
+    lock.unlock();
+    pollSpace();
+    return true;
+}
+
 void PersistentZarrCacheBudget::releaseRead(const fs::path& path, bool touch)
 {
     if (touch) {

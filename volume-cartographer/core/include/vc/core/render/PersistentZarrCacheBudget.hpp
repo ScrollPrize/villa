@@ -120,6 +120,12 @@ public:
     bool removeCacheSubtree(const std::filesystem::path& subtree,
                             std::error_code& ec);
 
+    // Atomically moves an exact cache subtree within this budget root and
+    // rewrites its in-memory accounting paths. The destination must not exist.
+    bool moveCacheSubtree(const std::filesystem::path& source,
+                          const std::filesystem::path& destination,
+                          std::error_code& ec);
+
     // Primarily useful for deterministic tests and orderly shutdown checks.
     void waitForIdle();
     static void resetRegistryForTesting();

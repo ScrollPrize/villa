@@ -98,6 +98,49 @@ TEST_CASE("budget startup scan discovers Delta3D Zarr chunks")
     fs::remove_all(root);
 }
 
+TEST_CASE("budget discovers open-data volume chunks grouped by sample")
+{
+    const auto root = tempRoot("open_data_volume");
+    writeBytes(root / "open_data" / "volumes" / "PHerc0139" /
+                   "volume-hash" / "level_0" / "0" / "0" / "0.bin",
+               29);
+
+    auto budget = Budget::configure(root, {}, spaceWith(
+        std::make_shared<std::atomic<std::uint64_t>>(900)));
+    budget->waitForIdle();
+    CHECK(budget->stats().managedBytes == 29);
+    fs::remove_all(root);
+}
+
+TEST_CASE("budget-coordinated cache migration preserves accounting")
+{
+    const auto root = tempRoot("move_subtree");
+    const auto legacyVolume = root / "volume-hash";
+    const auto legacyChunk =
+        legacyVolume / "level_0" / "0" / "0" / "0.bin";
+    const auto groupedVolume =
+        root / "open_data" / "volumes" / "PHerc0139" / "volume-hash";
+    writeBytes(legacyChunk, 37);
+
+    auto budget = Budget::configure(root, {}, spaceWith(
+        std::make_shared<std::atomic<std::uint64_t>>(900)));
+    budget->waitForIdle();
+    REQUIRE(budget->stats().managedBytes == 37);
+
+    std::error_code ec;
+    CHECK(budget->moveCacheSubtree(legacyVolume, groupedVolume, ec));
+    CHECK_FALSE(ec);
+    CHECK_FALSE(fs::exists(legacyVolume));
+    CHECK(fs::is_regular_file(
+        groupedVolume / "level_0" / "0" / "0" / "0.bin"));
+    CHECK(budget->stats().managedBytes == 37);
+
+    auto pin = budget->pinRead(
+        groupedVolume / "level_0" / "0" / "0" / "0.bin");
+    pin.complete(false);
+    fs::remove_all(root);
+}
+
 TEST_CASE("budget-coordinated cache replacement removes stale subtree accounting")
 {
     const auto root = tempRoot("replace_subtree");
