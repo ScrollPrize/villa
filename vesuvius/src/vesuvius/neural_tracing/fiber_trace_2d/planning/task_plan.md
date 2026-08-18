@@ -707,3 +707,264 @@ time from 42.84 to 39.94 seconds. Peak RSS was 2.03 GiB. Populations, DP work,
    of candidate visits but lost overall because indexing and locality overhead
    exceeded the arithmetic savings. Any new structure must retain sequential
    access and demonstrate lower peak and total CPU, not merely fewer visits.
+
+## Checkpoint 17: Reuse Objective Gaussian Values
+
+1. Use committed checkpoint 16 (`7bb2830fd`) and its three-run medians as the
+   baseline: 10.25 seconds command wall, 229.90 seconds total CPU, 6.070
+   seconds anchor wall, 155.82 seconds anchor CPU, and 39.94 worker-seconds in
+   direction-conditioned peak search.
+2. In `retainedSpatialObjective()`, compute all active-component Gaussians once
+   per observation while accumulating the denominator, then reuse the assigned
+   component value for the retained numerator.
+3. Apply the same local reuse in `retainedSpatialObjectivePair()` for both
+   candidate states and in `evaluateFinalRefinedState()` for the final support
+   numerator. Do not introduce persistent storage or an additional observation
+   traversal.
+4. Preserve observation/component traversal, denominator and numerator
+   accumulation order, membership predicates, response equations, line-search
+   decisions, and final support decisions. Exact floating-point identity is
+   not required, but deterministic extraction and replay quality are.
+5. Use the existing local-state and final-evaluation phase timings as the
+   direct work measurement. Do not add a per-observation counter that consumes
+   part of the expected saving or advance the profile schema solely for this
+   local implementation detail. The nearest checkpoint-16 profile measured
+   roughly 23.44 local-state and 13.76 final-evaluation worker-seconds.
+6. Run focused GCC and Clang `test_fiber_anchors`, `test_fiberlet_paths`, and
+   `test_fiber_replay`. Run one canonical replay for an initial decision; if
+   promising, run three canonical 32-thread, 5,000-base-voxel replays and
+   compare total/anchor wall and CPU, local-state/final-evaluation worker time,
+   populations, DP work, failures, artifact hashes, and peak RSS. If hashes
+   change, also compare deterministic repeats, anchor axis/position
+   distributions, downstream replay metrics, and generated visualizations.
+7. Retain the checkpoint only if the enclosing anchor or objective-evaluation
+   cost improves without unacceptable extraction or replay-quality changes.
+
+### Checkpoint 17 Spec Update
+
+- If retained, document that retained objective and final-state kernels reuse
+  their already-computed per-component Gaussian values; equations and decision
+  semantics remain unchanged.
+- Advance the profile schema only if a new deterministic work counter is kept.
+
+### Checkpoint 17 Documentation Update
+
+- Update `volume-cartographer/docs/fiberlets.md` with the reuse path and measured
+  result if retained.
+- Record implementation, validation, benchmarks, and any rejected variants in
+  `task_log.md`; add a concise accepted-checkpoint entry to `changelog.md` and
+  complete `status.md`.
+
+### Checkpoint 17 Result
+
+Rejected. Three canonical runs preserved all extraction/DP populations, 2
+greedy / 1 fiberlet failures, and byte-identical replay artifacts, but median
+local-state evaluation rose from roughly 23.44 to 24.34 worker-seconds and
+final evaluation rose from 13.76 to 14.12 worker-seconds. Median command wall
+was effectively flat at 10.23 versus 10.25 seconds. The explicit stack arrays
+were removed. The likely explanation is compiler common-subexpression
+elimination of the pure repeated call in the committed code, while explicit
+arrays increased register or spill pressure. No production specification,
+user documentation, changelog, or profile-schema change is retained.
+
+## Checkpoint 18: Radial Demand And Neighbor Reuse
+
+1. Use committed checkpoint 16 (`7bb2830fd`) as the production baseline. Its
+   three-run medians are 10.25 seconds command wall, 229.90 seconds total CPU,
+   6.070 seconds anchor wall, 155.82 seconds anchor CPU, and 39.94
+   peak-search worker-seconds.
+2. Add temporary deterministic measurement for each peak component: prepared
+   response records, total records passing the exact radial cutoff, and unique
+   prepared records passing at least once. Track computed grid responses and
+   uncached subpixel acceptance responses separately because only grid responses
+   participate in demand cohorts.
+3. Simulate candidate-by-block rejection for contiguous block sizes 16, 32,
+   and 64. Report blocks tested/rejected, record slots surviving block
+   rejection, metadata bytes, and component-weighted distributions. Simulate
+   the exact conservative rule intended for production: outward-rounded float
+   bounds expanded by the cutoff and reject only on axis separation. Do not use
+   the simulation to skip production work yet.
+4. Measure actual simultaneously batchable grid demand. Before each hill-climb
+   neighborhood, separable-interpolation neighborhood, and final 3x3
+   neighborhood, collect the feasible unique slots that are still missing from
+   the response cache. Report cohort-size histograms and theoretical record
+   loads before/after batching by cohort type. Requests reached in different
+   iterations are not counted as batchable together.
+5. Keep measurement overhead out of the retained implementation. Accumulate
+   per-response counts locally and use one compact per-component touch array;
+   remove temporary touch/block/cohort tracking after selecting a strategy.
+6. Select exactly one implementation from the measurement:
+   - If unique radial use is low, partition the existing sequential response
+     stream into small contiguous blocks with conservative transverse AABBs.
+     Skip a block only when its exact minimum squared distance from the
+     candidate exceeds the radial cutoff, then retain the existing per-record
+     check inside surviving blocks.
+   - If unique radial use is high and repeated use is substantial, batch only
+     the currently demanded uncached neighboring grid responses. Traverse the
+     sequential response stream once and update candidate-local compensated
+     accumulators in deterministic candidate order. Do not precompute the full
+     peak grid.
+7. Preserve the existing prepared-record layout, response arithmetic,
+   per-candidate observation accumulation order, feasibility, hill-climb and
+   tie behavior, acceptance checks, and deterministic execution. Small numeric
+   changes are acceptable but are not required by either strategy.
+8. For block rejection, add scalar-oracle tests including cutoff-boundary and
+   randomized fixtures. For batching, add mixed cached/missing and duplicate
+   request tests. In either case, verify request/computed/acceptance counters,
+   tie/hill-climb behavior, and deterministic repeats; retain existing
+   single-slot, ridge, bounded-subpixel, and profile tests. Run focused GCC and
+   Clang anchor/path/replay suites.
+9. Run one instrumented canonical replay to select the strategy. Run one
+   initial optimized replay, then three final canonical 32-thread,
+   5,000-base-voxel replays if promising. Compare peak-search worker time,
+   total/anchor wall and CPU, peak response counts, populations, DP work,
+   failures, artifact hashes, and peak RSS. If hashes change, additionally
+   compare deterministic repeats, anchor axis/position distributions,
+   downstream metrics, and visualizations.
+10. Retain the checkpoint only if peak-search or enclosing anchor cost improves
+   with acceptable deterministic replay quality. Remove rejected variants and
+   record their measurements.
+
+### Checkpoint 18 Spec Update
+
+- If retained, document the selected exact block broad phase or demanded
+  neighboring-response batching and its preserved demand/response semantics.
+- Retain no measurement-only profile fields; advance the schema only if a
+  generally useful production counter survives the experiment.
+
+### Checkpoint 18 Documentation Update
+
+- Update `volume-cartographer/docs/fiberlets.md` with the selected data flow and
+  measured result if retained.
+- Record measurement, variant selection, validation, and benchmark results in
+  `task_log.md`; add an accepted result to `changelog.md` and complete
+  `status.md`.
+
+### Checkpoint 18 Result
+
+Rejected. Measurement showed high simultaneous theoretical reuse, but direct
+batching did not convert it into runtime savings. Full-cohort, width-four, and
+width-two variants raised peak-search worker time from the 39.94-second
+baseline to 46.41, 47.66, and 49.16 seconds respectively. The 16/32/64-record
+block simulation could eliminate only 23.6%, 16.5%, and 8.5% of record visits,
+so block metadata/check overhead was not implemented after batching failed.
+All measured variants retained exact populations, failures, and replay
+artifact bytes. Temporary measurement fields, response-cache APIs, tests, and
+batching code were removed. No production spec, user-doc, changelog, or profile
+schema change remains.
+
+## Checkpoint 19: plain float tensor accumulation
+
+1. Use committed checkpoint 16 (`7bb2830fd`) as the production baseline:
+   median 10.25 seconds command wall, 229.90 seconds total CPU, 6.070 seconds
+   anchor wall, 155.82 seconds anchor CPU, and approximately 35.5 worker-seconds
+   in local tensor proposal work.
+2. Change only the optional six-entry symmetric tensor histograms inside
+   `robustDirectionProposal()` from compensated double sums to ordinary float32
+   sums. Keep residual histograms, total masses, component assignment, robust
+   cutoff selection, retained membership, traversal order, and all other
+   accumulators unchanged.
+3. Merge the at-most-256 retained residual bins into six ordinary double sums,
+   then construct the existing double 3x3 matrix at the principal-axis solver
+   boundary. Do not change the eigensolver or its uniqueness rules.
+4. Exercise the production path through public anchor fitting rather than
+   duplicating private tensor construction in tests. Cover representative one-
+   and two-component fits plus low-mass, imbalanced, near-isotropic, and nearly
+   equal leading-eigenvalue cases. Require finite normalized axes where the
+   component remains unique and deterministic component removal otherwise.
+5. Run focused GCC and Clang `test_fiber_anchors`, `test_fiberlet_paths`, and
+   `test_fiber_replay` suites. Run the canonical 32-thread, 5,000-base-voxel
+   replay three times if the first optimized run is promising.
+6. Compare local tensor-proposal worker time, total/anchor wall and CPU,
+   populations, DP work, failures, artifact hashes, anchor position/axis
+   distributions if artifacts differ, and peak RSS. Quality comparison must
+   report matched-anchor count and axis-angle and position-delta p50/p95/max,
+   plus deterministic repeat agreement. Retain only if the target phase or
+   enclosing anchor extraction improves with similar deterministic replay
+   quality.
+
+### Checkpoint 19 Spec Update
+
+- If retained, document that robust direction tensors use ordinary float32
+  accumulation and that exact floating-point identity is not part of the
+  extraction contract. The profile schema remains unchanged.
+- If rejected, leave production specifications unchanged and record only the
+  measured experiment.
+
+### Checkpoint 19 Documentation Update
+
+- If retained, update `volume-cartographer/docs/fiberlets.md` and
+  `planning/changelog.md` with the accumulator boundary and measured result.
+- Record implementation, validation, quality comparison, and benchmarks in
+  `task_log.md`, then complete `status.md` whether accepted or rejected.
+
+### Checkpoint 19 Result
+
+Inconclusive. The float-bin and ordinary-double experiments were run while the
+computer had competing work, so none of their timing measurements are valid.
+Both partial variants were removed. Their quality observations may inform test
+coverage, but no performance or retention conclusion is drawn.
+
+## Checkpoint 20: scalar-specialized robust proposal
+
+1. Keep `robustDirectionProposal()` shared and scalar-generic. Select `float`
+   for production `CompactFiberAnchorObservation` ranges and `double` for the
+   public `FiberAnchorObservation` path.
+2. In the float specialization, keep observation positions/directions,
+   component axes/positions, pivot, Gaussian constants/results, alignments,
+   scores, masses, residual histograms, and tensor histograms in float32 for
+   the complete per-observation loop. Preserve compact directions' existing
+   already-normalized contract; retain public double normalization behavior.
+   Build proposal-local scalar component/config/pivot state once before the hot
+   loop and use typed literals and scalar OpenCV vectors throughout.
+3. Convert the two 256-bin residual histograms and total masses once after the
+   hot loop, then call the existing double robust-cutoff implementation. Derive
+   each double total mass by summing the converted bins rather than maintaining
+   a separate float total. Make residual binning scalar-generic so compact
+   residuals are not widened before bin selection. Merge retained float tensor
+   bins into six ordinary doubles and retain the existing double eigensolver
+   and uniqueness policy.
+4. Do not convert centroid, spatial-objective, peak-search, final-evaluation,
+   persistent anchor state, or public output arithmetic in this checkpoint.
+   This isolates the measured local tensor-proposal phase.
+5. Exercise the private compact specialization through the existing public
+   `extractFiberAnchors*` sampler fixtures, not by rounding inputs and calling
+   the double-only `fitFiberCellAnchors()`. Cover compact and double one-/two-
+   component paths plus presence-floor equality, equal component scores,
+   residual-bin boundaries, trim-mass limits, low mass, imbalanced weights,
+   near-isotropic tensors, and nearly equal leading eigenvalues. Verify
+   deterministic repeats, finite normalized retained axes, stable component
+   removal, and bounded compact-vs-double axis/position differences rather than
+   bit identity.
+6. Build `vc_fiberlets` and run focused GCC and Clang anchor/path/replay tests.
+   Do not run the canonical replay benchmark until the user explicitly reports
+   the computer is free.
+7. Once approved, run alternating compensated-baseline and all-float builds on
+   the canonical workload, with three valid runs of each. Compare tensor work,
+   total/anchor wall and CPU, populations, DP work, failures, deterministic
+   hashes, matched-anchor axis/position distributions where available, emitted
+   route deltas, and peak RSS.
+8. Before retention, require GCC and Clang validation and note that macOS/arm64
+   CI compilation remains the portability gate.
+
+### Checkpoint 20 Spec Update
+
+- If retained after valid measurements, document the compact-production float
+  robust-proposal boundary and double summary/eigensolver boundary. Do not
+  change the profile schema.
+- If rejected, remove the implementation and retain only the experiment log.
+
+### Checkpoint 20 Documentation Update
+
+- Record implementation and test results now, then append controlled benchmark
+  results when authorized. Update `volume-cartographer/docs/fiberlets.md` and
+  `planning/changelog.md` only after retention.
+
+### Checkpoint 20 Result
+
+Accepted. Three alternating runs reduced median tensor-proposal worker time
+from 25.63 to 23.74 seconds, anchor CPU from 143.16 to 140.75 seconds, anchor
+wall from 5.504 to 5.461 seconds, and command wall from 9.65 to 9.58 seconds.
+The optimized runs were deterministic and retained 2,603 anchors, 2,560 graph
+nodes, 26,494 edges, and 2 greedy / 1 fiberlet failures. The 352 emitted route
+points differed from baseline by at most 1.3764e-6 base voxels.

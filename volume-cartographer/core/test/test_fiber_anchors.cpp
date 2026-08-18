@@ -366,6 +366,109 @@ TEST_CASE("normalized float observations preserve anchor geometry")
     }
 }
 
+TEST_CASE("compact float robust proposal matches a stable double fit")
+{
+    auto value = config();
+    value.peakGradientWeight = 0.0;
+    value.minimumAlignedSupport = 0.001;
+    const cv::Vec3d first = directionAtDegrees(20.0);
+    const cv::Vec3d second = directionAtDegrees(70.0);
+    const vc::fiber_tracer::FiberPredictionGridInfo grid{{4, 4, 4}, 1.0};
+    const auto report = vc::fiber_tracer::extractFiberAnchors(
+        grid, value,
+        [&](const auto& indices, int, auto& samples) {
+            samples.clear();
+            for (const auto& index : indices) {
+                samples.push_back({
+                    index[2] < 2 ? first : second,
+                    index[2] < 2 ? 1.0 : 0.25,
+                    true,
+                });
+            }
+        });
+    const auto reference = vc::fiber_tracer::fitFiberCellAnchors(
+        {0, 0, 0}, {0, 0, 0}, {4, 4, 4},
+        cellObservations(4, first, second, 0.25), value);
+
+    REQUIRE(report.nonEmptyCells.size() == 1);
+    const auto& compact = report.nonEmptyCells.front();
+    CHECK(compact.retainedAnchorCount == reference.retainedAnchorCount);
+    for (const auto& expected : reference.components) {
+        if (!expected.retained)
+            continue;
+        double bestAxisMatch = 0.0;
+        double bestPositionDelta = std::numeric_limits<double>::infinity();
+        for (const auto& actual : compact.components) {
+            if (!actual.retained)
+                continue;
+            bestAxisMatch = std::max(bestAxisMatch,
+                axialDot(actual.anchor.axisXYZ, expected.anchor.axisXYZ));
+            bestPositionDelta = std::min(bestPositionDelta,
+                cv::norm(actual.anchor.positionPredictionXYZ -
+                    expected.anchor.positionPredictionXYZ));
+        }
+        CHECK(bestAxisMatch > 1.0 - 1.0e-5);
+        CHECK_MESSAGE(bestPositionDelta < 0.05,
+            std::string("position_delta=") +
+                std::to_string(bestPositionDelta));
+    }
+}
+
+TEST_CASE("compact float robust proposal is deterministic near degeneracy")
+{
+    auto value = config();
+    value.maximumSeedCount = 1;
+    value.peakGradientWeight = 0.0;
+    value.minimumAlignedSupport = 0.001;
+    const vc::fiber_tracer::FiberPredictionGridInfo grid{{4, 4, 4}, 1.0};
+    const auto sampler = [&](const auto& indices, int, auto& samples) {
+        samples.clear();
+        for (const auto& index : indices) {
+            const size_t selector = (index[0] + index[1] + index[2]) % 3;
+            const cv::Vec3d direction = selector == 0
+                ? cv::Vec3d{1.0, 0.0, 0.0}
+                : selector == 1
+                    ? cv::Vec3d{0.0, 1.0, 0.0}
+                    : cv::Vec3d{0.0, 0.0, 1.0};
+            samples.push_back({
+                direction, value.observationPresenceFloor, true});
+        }
+    };
+    const auto first = vc::fiber_tracer::extractFiberAnchors(
+        grid, value, sampler);
+    const auto second = vc::fiber_tracer::extractFiberAnchors(
+        grid, value, sampler);
+
+    CHECK(first.diagnostics.zeroAnchorCells ==
+          second.diagnostics.zeroAnchorCells);
+    CHECK(first.diagnostics.oneAnchorCells ==
+          second.diagnostics.oneAnchorCells);
+    CHECK(first.diagnostics.twoAnchorCells ==
+          second.diagnostics.twoAnchorCells);
+    REQUIRE(first.nonEmptyCells.size() == second.nonEmptyCells.size());
+    for (size_t cell = 0; cell < first.nonEmptyCells.size(); ++cell) {
+        const auto& left = first.nonEmptyCells[cell];
+        const auto& right = second.nonEmptyCells[cell];
+        CHECK(left.retainedAnchorCount == right.retainedAnchorCount);
+        for (size_t component = 0; component < left.components.size();
+             ++component) {
+            CHECK(left.components[component].retained ==
+                  right.components[component].retained);
+            if (!left.components[component].retained)
+                continue;
+            const cv::Vec3d leftAxis = left.components[component].anchor.axisXYZ;
+            const cv::Vec3d rightAxis = right.components[component].anchor.axisXYZ;
+            CHECK(std::isfinite(leftAxis[0]));
+            CHECK(std::isfinite(leftAxis[1]));
+            CHECK(std::isfinite(leftAxis[2]));
+            CHECK(cv::norm(leftAxis) == doctest::Approx(1.0));
+            CHECK(leftAxis == rightAxis);
+            CHECK(left.components[component].anchor.positionPredictionXYZ ==
+                  right.components[component].anchor.positionPredictionXYZ);
+        }
+    }
+}
+
 std::filesystem::path temporaryDirectory(const std::string& tag)
 {
     std::mt19937_64 generator(std::random_device{}());

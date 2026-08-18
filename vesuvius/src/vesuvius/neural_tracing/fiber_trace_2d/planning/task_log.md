@@ -746,3 +746,208 @@
   to choose conservative contiguous-block rejection or demanded-neighbor
   batching. The prior 2D CSR's 59% visit reduction but runtime regression is the
   explicit warning against optimizing visit counts without preserving locality.
+
+## Checkpoint 17: reuse objective Gaussian values
+
+- User approved eliminating duplicate `transverseGaussian()` calls in retained
+  spatial objectives and final refined-state evaluation. Exact numeric identity
+  is explicitly not required.
+- Baseline is committed checkpoint 16 (`7bb2830fd`): median command wall
+  10.25 s, total CPU 229.90 s, anchor wall 6.070 s, anchor CPU 155.82 s, and
+  peak-search worker time 39.94 s across three canonical runs.
+- Planned change retains the active-component Gaussian values already computed
+  for each denominator and reuses the assigned value for its numerator. No
+  persistent cache, extra traversal, or changed fitting equation is planned.
+- Independent review confirmed `transverseGaussian()` is pure and local reuse
+  preserves the equations and accumulation order. The plan was corrected to
+  compute only active components, require axis/position and visual review if
+  hashes change, and use existing phase timers instead of adding a hot-loop
+  profile counter. The nearest profile measured roughly 23.44 local-state and
+  13.76 final-evaluation worker-seconds.
+- The implementation used fixed two-slot stack arrays but evaluated entries
+  only for `activeComponents`. Existing GCC anchor/path/replay tests passed.
+- Three canonical runs measured:
+
+  | metric | minimum | median | maximum | checkpoint 16 median |
+  |---|---:|---:|---:|---:|
+  | command wall | 10.18 s | 10.23 s | 10.28 s | 10.25 s |
+  | total CPU | 225.62 s | 229.14 s | 229.63 s | 229.90 s |
+  | anchor wall | 6.033 s | 6.063 s | 6.069 s | 6.070 s |
+  | anchor CPU | 152.41 s | 155.53 s | 155.67 s | 155.82 s |
+  | local-state evaluation worker time | 24.242 s | 24.335 s | 24.636 s | about 23.44 s |
+  | final-evaluation worker time | 14.035 s | 14.123 s | 14.303 s | about 13.76 s |
+  | peak-search worker time | 39.258 s | 39.431 s | 40.044 s | 39.94 s |
+  | peak RSS | 2.02 GiB | 2.03 GiB | 2.03 GiB | 2.03 GiB |
+
+- Every run retained 2,603 anchors, 51,782 searched / 26,494 accepted
+  fiberlets, 170,813 sampled voxels, 62,970,689 DP relaxations, and 2 greedy /
+  1 fiberlet failures. Every replay artifact retained SHA-256
+  `41fa73c76bc3a20528d064e2baed78552a20bed41542f9ed4e2ddcfb5e739215`.
+- Checkpoint 17 is rejected because both directly targeted worker phases
+  regressed despite effectively flat enclosing wall/CPU time. The likely cause
+  is that the compiler already eliminates the pure repeated expression where
+  profitable, while explicit arrays add register or spill pressure. The source
+  change was removed.
+- Clang validation, production specification/documentation updates, and a
+  changelog entry were intentionally skipped after rejection because no
+  production code or schema change remains.
+
+## Checkpoint 18: radial demand and neighbor reuse
+
+- User approved the measurement-led peak-search optimization. Baseline remains
+  committed checkpoint 16 (`7bb2830fd`) at median 10.25 s command wall,
+  229.90 s total CPU, 6.070 s anchor wall, 155.82 s anchor CPU, and 39.94
+  peak-search worker-seconds.
+- The first phase will temporarily count exact radial-cutoff passes and unique
+  touched records per component. Low unique use selects conservative contiguous
+  block rejection; high repeated neighboring use selects demanded-response
+  batching. The temporary touch instrumentation will not remain in production.
+- Independent review found those aggregate measurements insufficient by
+  themselves. The measurement now also simulates conservative contiguous block
+  rejection at 16/32/64 records, records actual simultaneously missing cohorts
+  for hill-climb/separable/final neighborhoods, and separates cached-grid from
+  uncached acceptance responses. Any retained block rule must use outward
+  bounds and conservative axis separation; any batching path must explicitly
+  collect missing slots, evaluate one cohort, and publish all values before
+  preserving the existing comparison order and counters.
+- The instrumented canonical replay preserved the exact baseline artifact and
+  measured 2,974,011,902 full response-record visits. Grid responses had
+  768,213,262 radial passes over 79,309,912 per-component unique records, a
+  9.69x repeated-use factor; acceptance responses had 65,642,789 passes over
+  55,962,374 unique records.
+- Conservative contiguous blocks were not selective enough: 16/32/64-record
+  blocks left 2.272B / 2.485B / 2.720B record visits, reductions of 23.6%,
+  16.5%, and 8.5% from the full scan. Their maximum metadata was only
+  12,384 / 6,192 / 3,096 bytes, but the arithmetic reduction is modest.
+- Actual hill-climb missing-response cohorts had theoretical unbatched loads of
+  2,739,837,736 records versus 536,179,860 loads when batched, an 80.4%
+  reduction in hot-record loads. Separable and final neighborhoods had no
+  missing responses on this workload because the hill-climb neighborhoods had
+  already populated those cache slots. Demanded-neighbor batching is therefore
+  selected; temporary block/touch/cohort profile fields will be removed.
+- Full-cohort batching preserved the exact replay artifact but raised
+  peak-search worker time to 46.406 s, anchor CPU to 161.71 s, and command wall
+  to 10.54 s. Bounded width four reached 47.663 s peak work and 10.55 s wall;
+  width two reached 49.156 s and 10.80 s. Baseline peak work is 39.94 s.
+- The compact response stream evidently remains cache-resident between scalar
+  scans. Interleaving independent candidates adds accumulator working state and
+  register/spill pressure without removing the dominant exponential and
+  compensated-sum arithmetic. Narrower batches increase repeated stream scans
+  while retaining that accumulator overhead.
+- All variants retained 2,603 anchors, 51,782 searched / 26,494 accepted
+  fiberlets, 170,813 sampled voxels, 62,970,689 DP relaxations, 2 greedy / 1
+  fiberlet failures, and replay SHA-256
+  `41fa73c76bc3a20528d064e2baed78552a20bed41542f9ed4e2ddcfb5e739215`.
+- Checkpoint 18 is rejected. All temporary measurement fields, cache APIs,
+  focused tests, accumulator refactoring, and cohort code were removed. The
+  16-record block path was not implemented because its best possible simulated
+  visit reduction was only 23.6%, with additional metadata and branch cost.
+  Three-run final benchmarking and Clang validation were skipped after the
+  clear single-run regressions; no production documentation or changelog entry
+  is retained.
+
+## Checkpoint 19: plain float tensor accumulation
+
+- User approved replacing compensated tensor accumulation and explicitly
+  confirmed that numerical differences are acceptable when final extraction
+  quality remains similar.
+- The experiment is intentionally limited to the six-entry tensor histograms
+  in `robustDirectionProposal()`. Earlier float peak scoring did not affect this
+  fitter path. Residual/cutoff arithmetic, centroids, objectives, and final
+  evaluation remain unchanged so the measured result identifies this cost.
+- Baseline remains committed checkpoint 16 (`7bb2830fd`): median command wall
+  10.25 seconds, total CPU 229.90 seconds, anchor wall 6.070 seconds, anchor CPU
+  155.82 seconds, and approximately 35.5 local tensor-proposal worker-seconds.
+- Independent review approved the narrow scope and corrected the final merge to
+  ordinary double: float32 is used only for the repeated per-observation bin
+  updates. It also added public-path low-mass/imbalanced/near-degenerate tests
+  and concrete matched-anchor axis-angle and position-delta quality metrics.
+- The float32 variant passed the existing public anchor/path/replay suites and
+  retained 2,603 anchors, 51,782 searched / 26,494 accepted fiberlets, 170,813
+  sampled voxels, 62,970,683 DP relaxations, and 2 greedy / 1 fiberlet failures.
+  Three runs were deterministic with replay SHA-256
+  `c2f251cf47e0b12008060f1ef6c84f0feabf7a86d5caff6b06896e0380d17c40`.
+  Relative to compensated output, greedy routes were identical; fiberlet route
+  point displacement was p50 0, p95 4.17e-7, maximum 1.37e-6 base voxels.
+- Float32 medians were 11.02 seconds command wall, 235.35 seconds total CPU,
+  6.449 seconds anchor wall, 158.19 seconds anchor CPU, and 38.26 tensor worker-
+  seconds. Machine load varied: an intervening paired compensated run measured
+  11.03, 236.88, 6.383, 160.27, and 38.71 seconds, so only a small CPU-side
+  signal was present and the casts remained suspect.
+- As a measured deviation from the initial float-only plan, ordinary double
+  accumulation was tested to isolate compensation from conversion cost. Its
+  three-run min/median/max results were command wall 10.21/10.35/10.41 seconds,
+  total CPU 228.13/228.36/230.82 seconds, anchor wall 5.994/6.060/6.139 seconds,
+  anchor CPU 153.62/154.60/156.02 seconds, and tensor proposal
+  35.47/35.68/36.27 worker-seconds. All three artifacts exactly matched the
+  compensated SHA-256
+  `41fa73c76bc3a20528d064e2baed78552a20bed41542f9ed4e2ddcfb5e739215`.
+- A final immediately paired compensated run was faster than the ordinary-
+  double median at 10.12 seconds wall, 227.29 seconds total CPU, 5.924 seconds
+  anchor wall, 153.51 seconds anchor CPU, and 35.16 tensor worker-seconds.
+  Historical three-run baseline medians were likewise 10.25 seconds wall and
+  approximately 35.5 tensor worker-seconds. Neither uncompensated variant has a
+  repeatable benefit, so all production changes were removed.
+- The planned extra near-degenerate public fixtures and Clang rerun were
+  skipped after rejection. Existing robust trimming, angular-tail,
+  one-/two-component, serial/parallel, path, and replay tests cover the restored
+  production path. Production specs, user docs, changelog, and profile schema
+  remain unchanged.
+- User reported that the machine had competing work during every checkpoint-19
+  run. All checkpoint-19 timing comparisons are therefore invalid, including
+  the apparent float/double regressions and gains. The partial implementations
+  remain removed, but checkpoint 19 is inconclusive rather than rejected.
+
+## Checkpoint 20: scalar-specialized robust proposal
+
+- User approved reimplementing the experiment without the avoidable
+  float-to-double-to-float conversions. Production compact observations will
+  stay float throughout the robust proposal hot loop; only fixed-size summaries
+  cross to the existing double cutoff and eigensolver. The public observation
+  API remains double through the same generic implementation.
+- Canonical performance measurements are explicitly deferred until the user
+  reports that the computer is free. Build and focused correctness validation
+  may proceed meanwhile.
+- Independent review confirmed the scope but required proposal-local scalar
+  state, scalar residual binning, histogram-derived cutoff mass, actual compact
+  extraction fixtures, explicit float-sensitive boundaries, and concrete
+  aggregate quality metrics. The implementation plan incorporates these
+  corrections.
+- Implemented scalar-generic proposal helpers. Production compact observations
+  now use float positions, directions, component/pivot copies, Gaussian and
+  assignment arithmetic, residual histograms, and plain tensor bins throughout
+  the per-observation proposal loop. Only the two fixed 256-bin histograms and
+  six retained tensor entries are converted to double for the existing cutoff
+  and eigensolver.
+- The public double fitter instantiates the same shared proposal but retains its
+  existing normalized directions, observation-order total-mass sum,
+  compensated per-bin tensors, compensated final bin merge, double cutoff, and
+  double eigensolver. Centroid, spatial objective, peak, final evaluation,
+  persistent state, and output code are unchanged in both paths.
+- Added extraction-level coverage that actually traverses the private compact
+  storage. A stable two-direction fixture matches the double fitter within
+  axis cosine `1e-5` and 0.05 prediction voxels; the observed position delta was
+  0.019951 prediction voxels. A three-direction near-degenerate fixture at the
+  exact presence floor verifies deterministic retention/removal and finite
+  normalized retained axes.
+- The GCC `QuickBuild` rebuilt `vc_fiberlets` and all three focused tests;
+  `test_fiber_anchors`, `test_fiberlet_paths`, and `test_fiber_replay` passed in
+  0.63 seconds. The production `FiberAnchors.cpp` compile command also passed
+  under Clang; a separate linked Clang test tree is not currently configured
+  and remains required before retention. `git diff --check` passes.
+- After the user confirmed the machine was free, three optimized and three
+  compensated-double runs were alternated on the canonical 5,000-base-voxel
+  replay with 32 threads. Optimized medians were 9.58 seconds command wall,
+  5.461 seconds anchor wall, 140.75 seconds anchor CPU, and 23.736 tensor-
+  proposal worker-seconds. Baseline medians were 9.65, 5.504, 143.16, and
+  25.632 seconds respectively. The float proposal therefore reduced its own
+  worker time by 7.4%, anchor wall by 0.8%, anchor CPU by 1.7%, and command wall
+  by 0.7%. Median peak RSS changed from 2,117,268 to 2,123,056 KiB (+0.3%).
+- All three optimized artifacts had SHA-256
+  `9ad06d494b886dc4e256e1adadc3cb12e70fee051c3292895a4593a475efa472`;
+  all three baseline artifacts reproduced the historical SHA-256
+  `41fa73c76bc3a20528d064e2baed78552a20bed41542f9ed4e2ddcfb5e739215`.
+  Both variants retained 2,603 anchors, 2,560 graph nodes, 26,494 graph edges,
+  and 2 greedy / 1 fiberlet failures. Their 352 emitted fiberlet route points
+  differed by at most 1.3764e-6 base voxels (mean 5.63e-8). The optimized
+  candidate remains uncommitted pending the retention decision.

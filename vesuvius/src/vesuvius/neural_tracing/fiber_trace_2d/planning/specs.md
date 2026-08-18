@@ -2690,6 +2690,14 @@
   expanded-observation API retains stable input-order filtering and its
   historical count-only owned-coverage check; it does not sort, deduplicate,
   or require lattice coordinates.
+  Production compact observations also keep robust-proposal positions,
+  directions, component state, Gaussian/alignment values, masses, residual
+  histograms, and retained direction tensors in float32 throughout the repeated
+  per-observation loop. The fixed residual histograms and six retained tensor
+  entries widen once afterward; robust cutoff selection, principal-axis
+  resolution, persistent component state, diagnostics, and serialized output
+  remain double precision. The public expanded-observation fitter retains its
+  double-precision proposal path.
   Machine output and OBJ store spatial positions only in base-volume XYZ
   coordinates. Prediction shape/scale, cell indices, cell size, direction
   falloff, transverse/axial peak sigmas, peak grid step, cutoff, local window,
@@ -3061,7 +3069,7 @@
   Benchmark comparisons must retain identical inputs, parameters, build type,
   and interval.
 - Benchmark and full replay extraction emit the same versioned
-  `fiberlet_extraction_profile version=16` key/value schema. The profile exposes
+  `fiberlet_extraction_profile version=17` key/value schema. The profile exposes
   deterministic workload counters and finer anchor/fiberlet phase timings.
   Enclosing phase fields are wall time, `_work_seconds` fields are summed
   worker/candidate time, and CPU fields are process CPU time. Corner insertion

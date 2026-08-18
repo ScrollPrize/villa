@@ -79,3 +79,52 @@ test either spatially coherent contiguous-block rejection for observations that
 no visited candidate needs, or reuse observation loads across neighboring
 candidate responses. Do not restore the previously rejected pointer-heavy CSR
 or counting-sort implementations unchanged.
+
+The measured checkpoint-17 continuation tested eliminating duplicate
+transverse-Gaussian evaluation in retained spatial objectives and final
+refined-state evaluation.
+Each observation's per-component Gaussian is already required for the
+denominator; retain the active-component local values and reuse the assigned component's
+value in the numerator. Keep observation/component traversal, equations,
+candidate decisions, and public behavior unchanged. Exact numeric identity is
+not a retention requirement; deterministic replay quality and measured speed
+remain the gates. The explicit local-value storage regressed both targeted
+worker phases and was removed; the committed implementation remains active.
+
+The next measured continuation targets the remaining direction-conditioned
+peak-response scans. First measure exact radial-cutoff survival, per-component
+unique record use, and repeated use across computed responses. If many records
+are never needed, test conservative contiguous-block AABB rejection while
+retaining sequential record storage. If most records are needed repeatedly by
+neighboring candidates, instead batch only already-demanded neighboring
+responses so one record load updates several response accumulators. Do not
+restore pointer-heavy per-candidate indices or eagerly evaluate unused grid
+responses.
+
+Checkpoint 18 measured both strategies and tested full, four-candidate, and
+two-candidate demanded cohorts. All batching widths regressed peak-search time
+because the compact record stream was already cache-resident while multiple
+compensated accumulator sets increased register and spill cost. The experiment
+was removed; the committed scalar response cache remains active.
+
+The next measured continuation targets compensated tensor accumulation in
+`robustDirectionProposal()`. Replace the six compensated-double tensor
+histogram entries with ordinary float32 accumulation, retaining the existing
+assignment, robust cutoff, component selection, and eigensolver. Exact numeric
+identity is not required; deterministic repeatability and similar anchor and
+replay quality are the acceptance gates. Keep this checkpoint separate from
+centroid and objective accumulator changes so its effect is measurable.
+
+Checkpoint 19 tested both ordinary float32 tensor bins and ordinary double
+tensor bins, but the machine was not idle and the timing results are invalid.
+Both partial variants were removed without a retention decision.
+
+The next implementation keeps the production compact-observation robust
+proposal in float32 end to end: position and direction access, component and
+pivot copies, Gaussian and assignment arithmetic, residual/mass histograms,
+and tensor bins. Convert only the fixed-size histogram summaries to double for
+the existing robust-cutoff policy and the final six tensor entries for the
+existing eigensolver. The public double-observation path remains double through
+the same scalar-generic implementation. Build and validate now, but do not run
+the canonical performance benchmark until the user confirms the computer is
+free.

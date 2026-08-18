@@ -550,7 +550,7 @@ sampling, search, and total wall times. Use identical manifests, fiber, options,
 build type, and interval for before/after performance comparisons.
 
 Benchmark and replay extraction also emit a versioned
-`fiberlet_extraction_profile version=16` row. Both commands use the same field
+`fiberlet_extraction_profile version=17` row. Both commands use the same field
 names and units. Replay writes the row to stderr after full tube extraction;
 benchmark writes it to stdout after the existing summary. The row separates:
 
@@ -643,6 +643,17 @@ denominator for the initial state and every backtracking candidate.
 minus those three kernels, so it includes bounds/setup, interpolation,
 acceptance, convergence, and profiling overhead. The four fields reconcile to
 `anchor_fit_local_refinement_work_seconds`.
+
+Production compact observations keep the robust direction-proposal scan in
+float32, including component assignment, Gaussian/alignment arithmetic,
+residual histograms, and retained direction-tensor bins. Only the fixed-size
+histogram summaries and six retained tensor entries widen to the existing
+double cutoff and eigensolver. The public expanded-observation fitter remains
+double precision. On the canonical 5,000-base-voxel replay, median tensor-
+proposal worker time fell from 25.63 to 23.74 seconds, anchor CPU from 143.16
+to 140.75 seconds, and command wall from 9.65 to 9.58 seconds. Anchor/graph
+populations and failures were unchanged; emitted route points differed by at
+most 1.38e-6 base voxels.
 
 Version 4 reports robust components with no detected outliers, trimmed
 components, candidate/actual trimmed and retained mass, components removed for

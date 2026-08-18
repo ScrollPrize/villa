@@ -23,6 +23,7 @@
 #include <stdexcept>
 #include <thread>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 
 namespace vc::fiber_tracer {
@@ -168,13 +169,15 @@ struct RefinedFitState {
 
 constexpr size_t kRobustHistogramBins = 256;
 
-[[nodiscard]] size_t robustHistogramBin(double residual)
+template <typename Scalar>
+[[nodiscard]] size_t robustHistogramBin(Scalar residual)
 {
-    const double bounded = std::clamp(residual, 0.0, 1.0);
+    static_assert(std::is_floating_point_v<Scalar>);
+    const Scalar bounded = std::clamp(residual, Scalar{0}, Scalar{1});
     return std::min(
         kRobustHistogramBins - 1,
         static_cast<size_t>(std::floor(
-            bounded * static_cast<double>(kRobustHistogramBins))));
+            bounded * static_cast<Scalar>(kRobustHistogramBins))));
 }
 
 [[nodiscard]] double robustHistogramCenter(size_t bin)
@@ -286,6 +289,89 @@ struct CompactFiberAnchorObservation {
     bool valid = false;
     bool presenceGradientValid = false;
 };
+
+template <typename Observation>
+using FiberAnchorProposalScalar = std::conditional_t<
+    std::is_same_v<std::remove_cvref_t<Observation>,
+        CompactFiberAnchorObservation>,
+    float,
+    double>;
+
+template <typename Scalar>
+using FiberAnchorProposalVector = cv::Vec<Scalar, 3>;
+
+template <typename Scalar>
+struct FiberAnchorProposalComponent {
+    FiberAnchorProposalVector<Scalar> axis{Scalar{1}, Scalar{0}, Scalar{0}};
+    FiberAnchorProposalVector<Scalar> position{
+        Scalar{0}, Scalar{0}, Scalar{0}};
+};
+
+template <typename Scalar, typename Observation>
+[[nodiscard]] FiberAnchorProposalVector<Scalar> proposalObservationPosition(
+    const Observation& observation)
+{
+    return {
+        static_cast<Scalar>(observation.positionPredictionXYZ[0]),
+        static_cast<Scalar>(observation.positionPredictionXYZ[1]),
+        static_cast<Scalar>(observation.positionPredictionXYZ[2]),
+    };
+}
+
+template <typename Scalar, typename Observation>
+[[nodiscard]] bool usableProposalDirection(
+    const Observation& observation,
+    Scalar presenceFloor,
+    FiberAnchorProposalVector<Scalar>& direction)
+{
+    const Scalar presence = static_cast<Scalar>(observation.presence);
+    if (!observation.valid || !finiteVector(observation.direction) ||
+        !std::isfinite(presence) || presence < presenceFloor ||
+        presence < Scalar{0} || presence > Scalar{1}) {
+        return false;
+    }
+    direction = {
+        static_cast<Scalar>(observation.direction[0]),
+        static_cast<Scalar>(observation.direction[1]),
+        static_cast<Scalar>(observation.direction[2]),
+    };
+    if constexpr (!std::is_same_v<std::remove_cvref_t<Observation>,
+                      CompactFiberAnchorObservation>) {
+        const Scalar norm2 = direction.dot(direction);
+        if (!(norm2 > static_cast<Scalar>(kMatrixEpsilon * kMatrixEpsilon)) ||
+            !std::isfinite(norm2)) {
+            direction = {Scalar{0}, Scalar{0}, Scalar{0}};
+        } else {
+            direction /= std::sqrt(norm2);
+        }
+    }
+    return direction.dot(direction) > static_cast<Scalar>(kMatrixEpsilon);
+}
+
+template <typename Scalar, typename Observation>
+[[nodiscard]] Scalar proposalTransverseGaussian(
+    const Observation& observation,
+    const FiberAnchorProposalComponent<Scalar>& component,
+    const FiberAnchorProposalVector<Scalar>& pivot,
+    Scalar axialSupportHalfWidth,
+    Scalar gaussianCutoff,
+    Scalar gaussianSigma)
+{
+    const auto position = proposalObservationPosition<Scalar>(observation);
+    if (!finiteVector(position))
+        return Scalar{0};
+    const Scalar axial = (position - pivot).dot(component.axis);
+    if (std::abs(axial) > axialSupportHalfWidth)
+        return Scalar{0};
+    const auto offset = position - component.position;
+    const auto transverse =
+        offset - component.axis * offset.dot(component.axis);
+    const Scalar distanceSquared = transverse.dot(transverse);
+    if (distanceSquared > gaussianCutoff * gaussianCutoff)
+        return Scalar{0};
+    return std::exp(-distanceSquared /
+        (Scalar{2} * gaussianSigma * gaussianSigma));
+}
 
 template <typename Observation>
 [[nodiscard]] cv::Vec3d observationPosition(const Observation& observation)
@@ -607,37 +693,74 @@ template <typename ObservationRange>
     FiberAnchorFitProfile* profile,
     bool computeAxes)
 {
+    using Observation =
+        std::remove_cvref_t<decltype(observations[size_t{0}])>;
+    using Scalar = FiberAnchorProposalScalar<Observation>;
+    constexpr bool compactFloatProposal = std::is_same_v<
+        Observation, CompactFiberAnchorObservation>;
+    using TensorEntry = std::conditional_t<
+        compactFloatProposal, float, CompensatedSum>;
+    using ScalarTensor = std::array<TensorEntry, 6>;
+    using TensorHistogram = std::array<ScalarTensor, kRobustHistogramBins>;
+
     RobustDirectionProposal proposal;
     proposal.assignments.assign(observations.size(), kUnassignedComponent);
     proposal.retainedInliers.assign(observations.size(), 0);
-    std::array<std::array<double, kRobustHistogramBins>, 2> residualHistograms{};
-    using SymmetricTensor = std::array<CompensatedSum, 6>;
-    using TensorHistogram = std::array<SymmetricTensor, kRobustHistogramBins>;
+    std::array<std::array<Scalar, kRobustHistogramBins>, 2>
+        scalarResidualHistograms{};
     std::optional<std::array<TensorHistogram, 2>> tensorHistograms;
     if (computeAxes)
         tensorHistograms.emplace();
     std::array<double, 2> totalMass{0.0, 0.0};
 
+    std::array<FiberAnchorProposalComponent<Scalar>, 2> scalarComponents{};
+    for (size_t component = 0; component < activeComponents; ++component) {
+        for (int coordinate = 0; coordinate < 3; ++coordinate) {
+            scalarComponents[component].axis[coordinate] =
+                static_cast<Scalar>(components[component].axis[coordinate]);
+            scalarComponents[component].position[coordinate] =
+                static_cast<Scalar>(components[component].position[coordinate]);
+        }
+    }
+    const FiberAnchorProposalVector<Scalar> scalarPivot{
+        static_cast<Scalar>(pivot[0]),
+        static_cast<Scalar>(pivot[1]),
+        static_cast<Scalar>(pivot[2]),
+    };
+    const Scalar presenceFloor =
+        static_cast<Scalar>(config.observationPresenceFloor);
+    const Scalar axialSupportHalfWidth =
+        static_cast<Scalar>(config.axialSupportHalfWidthPredictionVoxels);
+    const Scalar gaussianSigma =
+        static_cast<Scalar>(config.gaussianSigmaPredictionVoxels);
+    const Scalar gaussianCutoff = static_cast<Scalar>(
+        config.gaussianCutoffSigmas *
+        config.gaussianSigmaPredictionVoxels);
+
     for (size_t index = 0; index < observations.size(); ++index) {
         const auto& observation = observations[index];
-        cv::Vec3d direction;
-        if (!usableDirectionObservation(observation, config, direction))
+        FiberAnchorProposalVector<Scalar> direction;
+        if (!usableProposalDirection(
+                observation, presenceFloor, direction)) {
             continue;
-        std::array<double, 2> gaussian{0.0, 0.0};
-        std::array<double, 2> alignment{0.0, 0.0};
-        std::array<double, 2> score{0.0, 0.0};
+        }
+        const Scalar presence = static_cast<Scalar>(observation.presence);
+        std::array<Scalar, 2> gaussian{Scalar{0}, Scalar{0}};
+        std::array<Scalar, 2> alignment{Scalar{0}, Scalar{0}};
+        std::array<Scalar, 2> score{Scalar{0}, Scalar{0}};
         for (size_t component = 0; component < activeComponents; ++component) {
-            gaussian[component] = transverseGaussian(
-                observation, components[component], pivot, config);
-            const double dot = direction.dot(components[component].axis);
+            gaussian[component] = proposalTransverseGaussian(
+                observation, scalarComponents[component], scalarPivot,
+                axialSupportHalfWidth, gaussianCutoff, gaussianSigma);
+            const Scalar dot =
+                direction.dot(scalarComponents[component].axis);
             alignment[component] = dot * dot;
-            score[component] = gaussian[component] *
-                observationPresence(observation) *
-                alignment[component];
+            score[component] =
+                gaussian[component] * presence * alignment[component];
         }
         uint8_t assigned = kUnassignedComponent;
         for (size_t component = 0; component < activeComponents; ++component) {
-            if (score[component] > 0.0 &&
+            if (score[component] > Scalar{0} &&
                 (assigned == kUnassignedComponent ||
                  score[component] > score[assigned])) {
                 assigned = static_cast<uint8_t>(component);
@@ -646,25 +769,47 @@ template <typename ObservationRange>
         proposal.assignments[index] = assigned;
         if (assigned == kUnassignedComponent)
             continue;
-        const double mass = gaussian[assigned] *
-            observationPresence(observation);
-        const double residual = std::clamp(1.0 - alignment[assigned], 0.0, 1.0);
+        const Scalar mass = gaussian[assigned] * presence;
+        const Scalar residual = std::clamp(
+            Scalar{1} - alignment[assigned], Scalar{0}, Scalar{1});
         const size_t residualBin = robustHistogramBin(residual);
         proposal.retainedInliers[index] = static_cast<uint8_t>(residualBin);
-        residualHistograms[assigned][residualBin] += mass;
-        totalMass[assigned] += mass;
+        scalarResidualHistograms[assigned][residualBin] += mass;
+        if constexpr (!compactFloatProposal)
+            totalMass[assigned] += static_cast<double>(mass);
         if (tensorHistograms.has_value()) {
             auto& tensor = (*tensorHistograms)[assigned][residualBin];
-            tensor[0].add(mass * direction[0] * direction[0]);
-            tensor[1].add(mass * direction[0] * direction[1]);
-            tensor[2].add(mass * direction[0] * direction[2]);
-            tensor[3].add(mass * direction[1] * direction[1]);
-            tensor[4].add(mass * direction[1] * direction[2]);
-            tensor[5].add(mass * direction[2] * direction[2]);
+            const std::array<Scalar, 6> values{
+                mass * direction[0] * direction[0],
+                mass * direction[0] * direction[1],
+                mass * direction[0] * direction[2],
+                mass * direction[1] * direction[1],
+                mass * direction[1] * direction[2],
+                mass * direction[2] * direction[2],
+            };
+            for (size_t entry = 0; entry < tensor.size(); ++entry) {
+                if constexpr (compactFloatProposal)
+                    tensor[entry] += values[entry];
+                else
+                    tensor[entry].add(values[entry]);
+            }
         }
     }
     if (profile != nullptr)
         profile->localTensorObservationVisits += observations.size();
+
+    std::array<std::array<double, kRobustHistogramBins>, 2>
+        residualHistograms{};
+    for (size_t component = 0; component < activeComponents; ++component) {
+        for (size_t residualBin = 0;
+             residualBin < kRobustHistogramBins; ++residualBin) {
+            const double mass = static_cast<double>(
+                scalarResidualHistograms[component][residualBin]);
+            residualHistograms[component][residualBin] = mass;
+            if constexpr (compactFloatProposal)
+                totalMass[component] += mass;
+        }
+    }
 
     std::array<size_t, 2> cutoffBins{
         kRobustHistogramBins - 1, kRobustHistogramBins - 1};
@@ -720,18 +865,29 @@ template <typename ObservationRange>
     if (!computeAxes)
         return proposal;
     for (size_t component = 0; component < activeComponents; ++component) {
-        SymmetricTensor sums;
+        std::array<double, 6> sums{};
+        std::array<CompensatedSum, 6> compensatedSums{};
         for (size_t residualBin = 0;
              residualBin <= cutoffBins[component]; ++residualBin) {
             for (size_t entry = 0; entry < sums.size(); ++entry) {
-                sums[entry].add(
-                    (*tensorHistograms)[component][residualBin][entry].sum);
+                if constexpr (compactFloatProposal) {
+                    sums[entry] += static_cast<double>(
+                        (*tensorHistograms)[component][residualBin][entry]);
+                } else {
+                    compensatedSums[entry].add(
+                        (*tensorHistograms)[component]
+                            [residualBin][entry].sum);
+                }
             }
         }
+        if constexpr (!compactFloatProposal) {
+            for (size_t entry = 0; entry < sums.size(); ++entry)
+                sums[entry] = compensatedSums[entry].sum;
+        }
         const cv::Matx33d tensor{
-            sums[0].sum, sums[1].sum, sums[2].sum,
-            sums[1].sum, sums[3].sum, sums[4].sum,
-            sums[2].sum, sums[4].sum, sums[5].sum,
+            sums[0], sums[1], sums[2],
+            sums[1], sums[3], sums[4],
+            sums[2], sums[4], sums[5],
         };
         const FiberPrincipalAxis principal = principalFiberAxis(tensor);
         proposal.unique[component] = principal.unique;

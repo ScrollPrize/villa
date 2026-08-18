@@ -624,3 +624,8 @@
   storage. Canonical median peak-search worker time improved from 42.84 to
   39.94 seconds and command wall from 10.43 to 10.25 seconds with unchanged
   replay artifacts and quality populations.
+- Kept production compact robust direction proposals in float32 through their
+  per-observation loop, widening only fixed-size summaries for the existing
+  double cutoff and eigensolver. Canonical median proposal work improved from
+  25.63 to 23.74 worker-seconds with unchanged populations/failures and a
+  maximum emitted-route displacement of 1.38e-6 base voxels.

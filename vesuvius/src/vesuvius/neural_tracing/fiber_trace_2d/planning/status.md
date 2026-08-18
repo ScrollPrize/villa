@@ -57,6 +57,47 @@
 - [x] Run focused GCC and Clang validation.
 - [x] Run three canonical checkpoint 10 replays and compare quality/performance.
 - [x] Update specifications, user documentation, changelog, and task log.
+- [x] Obtain approval for checkpoint 19 plain float tensor accumulation.
+- [x] Plan checkpoint 19 and its quality/performance gates.
+- [x] Independently review checkpoint 19 against task and specifications.
+- [x] Implement plain float robust tensor histograms.
+- [x] Evaluate an ordinary-double variant after float conversion overhead.
+- [x] Use existing public-path numerical-quality and deterministic replay coverage.
+- [x] Run focused GCC validation.
+- [x] Run preliminary checkpoint 19 replays under subsequently identified load.
+- [x] Remove the partial checkpoint 19 variants without a retention decision.
+- [x] Record checkpoint 19 as inconclusive; production specs/docs remain unchanged.
+- [x] Mark checkpoint 19 timing results invalid due to competing machine load.
+- [x] Plan checkpoint 20 scalar-specialized robust proposal.
+- [x] Independently review checkpoint 20 against task and specifications.
+- [x] Implement the shared float-production/double-public robust proposal.
+- [x] Add focused scalar-path and near-degenerate quality coverage.
+- [x] Build and run focused GCC validation.
+- [x] Compile the touched production translation unit with Clang.
+- [ ] Run focused linked Clang tests before retention.
+- [x] Wait for user confirmation that the benchmark computer is free.
+- [x] Run alternating controlled baseline/checkpoint-20 canonical measurements.
+- [x] Retain checkpoint 20 based on valid performance and quality.
+- [x] Update checkpoint 20 specifications, user documentation, changelog, and logs.
+- [x] Obtain approval for checkpoint 18 radial-demand optimization.
+- [x] Plan checkpoint 18 and its measurement/validation gates.
+- [x] Independently review checkpoint 18 against task and specifications.
+- [x] Measure radial survival, block rejectability, and demand cohorts.
+- [x] Test full, four-candidate, and two-candidate demanded batching.
+- [x] Add temporary cache/profile coverage and remove it with rejected code.
+- [x] Run focused GCC validation; skip Clang after clear rejection.
+- [x] Run instrumented and per-variant canonical replay measurements.
+- [x] Remove checkpoint 18 after all batching widths regress.
+- [x] Record rejection; production specs/docs/changelog remain unchanged.
+- [x] Obtain approval for checkpoint 17 objective Gaussian reuse.
+- [x] Plan checkpoint 17 and its test/documentation updates.
+- [x] Independently review checkpoint 17 against task and specifications.
+- [x] Implement local per-observation Gaussian reuse.
+- [x] Use existing phase timing and behavior coverage; add no hot-loop counter.
+- [x] Run focused GCC validation; skip Clang after the measured rejection.
+- [x] Run three canonical checkpoint 17 replay measurements.
+- [x] Remove checkpoint 17 after the measured phase regression.
+- [x] Record the rejection; production specs/docs/changelog remain unchanged.
 - [x] Obtain approval for checkpoint 14 direct owned-cell initialization.
 - [x] Plan checkpoint 14 and its profile/test updates.
 - [x] Independently review checkpoint 14 against task and specifications.
