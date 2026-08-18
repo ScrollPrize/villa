@@ -287,10 +287,10 @@ void ViewerCompositePanel::setupControls()
             });
         });
     }
-    // The alpha/opacity params and stack direction feed the plane-view
-    // composites too (scalar alpha and volumetric TF), so they go to every
-    // viewer. The layer counts stay per-scope (layersFront/Behind vs
-    // planeLayersFront/Behind).
+    // The alpha/opacity params feed the plane-view composites too (scalar
+    // alpha and volumetric TF), so they go to every viewer. The layer counts
+    // and stack direction stay per-scope (layersFront/Behind/reverseDirection
+    // vs their plane* counterparts).
     if (_uiRefs.alphaMin) {
         connect(_uiRefs.alphaMin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
             applyToAllViewers([value](VolumeViewerBase* viewer) {
@@ -329,7 +329,7 @@ void ViewerCompositePanel::setupControls()
     }
     if (_uiRefs.reverseDirection) {
         connect(_uiRefs.reverseDirection, &QCheckBox::toggled, this, [this](bool checked) {
-            applyToAllViewers([checked](VolumeViewerBase* viewer) {
+            applyToSegmentationViewer([checked](VolumeViewerBase* viewer) {
                 auto s = viewer->compositeRenderSettings();
                 s.reverseDirection = checked;
                 viewer->setCompositeRenderSettings(s);
@@ -392,6 +392,15 @@ void ViewerCompositePanel::setupControls()
             });
         });
     }
+    if (_uiRefs.planeReverseDirection) {
+        connect(_uiRefs.planeReverseDirection, &QCheckBox::toggled, this, [this](bool checked) {
+            applyToPlaneViewers([checked](VolumeViewerBase* viewer) {
+                auto s = viewer->compositeRenderSettings();
+                s.planeReverseDirection = checked;
+                viewer->setCompositeRenderSettings(s);
+            });
+        });
+    }
 
     updateCompositeParamsVisibility();
 }
@@ -447,6 +456,9 @@ void ViewerCompositePanel::applyInitialSettingsToViewer(VolumeViewerBase* viewer
         }
         if (_uiRefs.planeLayersBehind) {
             s.planeLayersBehind = std::max(0, _uiRefs.planeLayersBehind->value());
+        }
+        if (_uiRefs.planeReverseDirection) {
+            s.planeReverseDirection = _uiRefs.planeReverseDirection->isChecked();
         }
         if (_volumetricGamma) {
             s.params.tfGamma = float(_volumetricGamma->value());
@@ -542,6 +554,10 @@ void ViewerCompositePanel::syncUiFromManager()
         if (_uiRefs.planeLayersBehind) {
             const QSignalBlocker blocker(_uiRefs.planeLayersBehind);
             _uiRefs.planeLayersBehind->setValue(settings.planeLayersBehind);
+        }
+        if (_uiRefs.planeReverseDirection) {
+            const QSignalBlocker blocker(_uiRefs.planeReverseDirection);
+            _uiRefs.planeReverseDirection->setChecked(settings.planeReverseDirection);
         }
     }
     updateCompositeParamsVisibility();

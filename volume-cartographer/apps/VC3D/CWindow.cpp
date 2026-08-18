@@ -7992,6 +7992,7 @@ void CWindow::CreateWidgets(void)
         .planeCompositeYZ = ui.chkPlaneCompositeYZ,
         .planeLayersFront = ui.spinPlaneLayersFront,
         .planeLayersBehind = ui.spinPlaneLayersBehind,
+        .planeReverseDirection = ui.chkPlaneReverseDirection,
     };
     _viewerCompositePanel = new ViewerCompositePanel(compositeUi, _viewerManager.get(), ui.dockWidgetComposite);
     _viewerCompositePanel->setViewerManagers(

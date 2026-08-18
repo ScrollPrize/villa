@@ -45,6 +45,7 @@ public:
         QCheckBox* planeCompositeYZ{nullptr};
         QSpinBox* planeLayersFront{nullptr};
         QSpinBox* planeLayersBehind{nullptr};
+        QCheckBox* planeReverseDirection{nullptr};
     };
 
     explicit ViewerCompositePanel(const UiRefs& uiRefs,

@@ -56,6 +56,7 @@ struct CompositeRenderSettings {
     bool planeEnabled = false;
     int planeLayersFront = 4;
     int planeLayersBehind = 4;
+    bool planeReverseDirection = false;
 
     CompositeParams params;  // method, alpha, BL, isoCutoff
 

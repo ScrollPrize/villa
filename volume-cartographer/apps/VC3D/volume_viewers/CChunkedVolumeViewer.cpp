@@ -2497,7 +2497,9 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                                     : ctx.compositeSettings.layersFront;
     const int baseBehind = planeView ? ctx.compositeSettings.planeLayersBehind
                                      : ctx.compositeSettings.layersBehind;
-    const float direction = ctx.compositeSettings.reverseDirection ? -1.0f : 1.0f;
+    const bool baseReverse = planeView ? ctx.compositeSettings.planeReverseDirection
+                                       : ctx.compositeSettings.reverseDirection;
+    const float direction = baseReverse ? -1.0f : 1.0f;
     auto [baseCoords, baseViewports] = expandedSamples(
         baseComposite, baseFront, baseBehind, direction);
     auto baseDemand = vc::render::ChunkedPlaneSampler::collectViewportDependencies(
@@ -2585,7 +2587,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         const int behind = std::max(0, ctx.compositeSettings.planeLayersBehind);
         const int numLayers = front + behind + 1;
         const int zStart = -behind;
-        const float zStep = ctx.compositeSettings.reverseDirection ? -1.0f : 1.0f;
+        const float zStep = ctx.compositeSettings.planeReverseDirection ? -1.0f : 1.0f;
         auto compositeOptions = vc::render::ChunkedPlaneSampler::Options(
             vc::Sampling::Nearest, options.tileSize);
         compositeOptions.queuedFallbackLevels = options.queuedFallbackLevels;
