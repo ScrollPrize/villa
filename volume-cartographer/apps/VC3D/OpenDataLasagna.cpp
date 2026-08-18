@@ -214,6 +214,7 @@ std::vector<std::string> entryTags(const OpenDataLasagnaInfo& info)
 {
     std::vector<std::string> tags{
         "open-data",
+        std::string(vc::project::kAnonymousRemoteAuthTag),
         std::string(kOpenDataLasagnaEntryTag),
         std::string(kOpenDataSampleIdTagPrefix) + info.sampleId,
         "vc-open-data-volume-id:" + info.volumeId,
@@ -454,13 +455,21 @@ std::filesystem::path prepareOpenDataLasagna(
                 const auto manifest = finalDir /
                     marker.value("manifest_file", std::string{});
                 if (std::filesystem::is_regular_file(manifest)) {
-                    validatePrepared(info, manifest);
+                    bool markerChanged = false;
+                    if (!marker.value("anonymous", false)) {
+                        marker["anonymous"] = true;
+                        markerChanged = true;
+                    }
                     if (marker.value("source_coordinate_level", -1) !=
                         info.sourceCoordinateLevel) {
                         marker["source_coordinate_level"] =
                             info.sourceCoordinateLevel;
+                        markerChanged = true;
+                    }
+                    if (markerChanged) {
                         detail::writeStringAtomic(markerPath, marker.dump(2));
                     }
+                    validatePrepared(info, manifest);
                     return manifest;
                 }
             }
@@ -477,10 +486,12 @@ std::filesystem::path prepareOpenDataLasagna(
         cacheOptions.cacheRoot = cacheRoot;
         cacheOptions.destination =
             (finalDir / relativeName).lexically_relative(cacheRoot);
+        cacheOptions.discoverAwsCredentials = false;
         const auto cached = vc::core::util::cacheRemoteFile(
             manifestUrl, cacheOptions);
         nlohmann::json marker{
             {"version", 1},
+            {"anonymous", true},
             {"artifact_url", info.artifactUrl},
             {"sample_id", info.sampleId},
             {"volume_id", info.volumeId},
@@ -494,9 +505,15 @@ std::filesystem::path prepareOpenDataLasagna(
             marker["source_to_base"] = *info.sourceToBase;
         if (info.baseShapeZYX)
             marker["base_shape_zyx"] = *info.baseShapeZYX;
-        validatePrepared(info, cached.path);
         detail::writeStringAtomic(
             finalDir / vc::lasagna::kLasagnaRemoteMarker, marker.dump(2));
+        try {
+            validatePrepared(info, cached.path);
+        } catch (...) {
+            std::error_code ec;
+            std::filesystem::remove(markerPath, ec);
+            throw;
+        }
         return cached.path;
     } catch (const std::exception& e) {
         if (errorOut) *errorOut = e.what();

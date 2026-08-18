@@ -21,6 +21,8 @@ class QuadSurface;
 namespace vc::project {
 
 inline constexpr std::string_view kFiberLasagnaTag = "vc-lasagna-fiber";
+inline constexpr std::string_view kAnonymousRemoteAuthTag =
+    "vc-remote-auth:anonymous";
 
 struct Entry {
     std::string location;
@@ -28,6 +30,7 @@ struct Entry {
 };
 
 [[nodiscard]] bool hasEntryTag(const Entry& entry, std::string_view tag);
+[[nodiscard]] bool usesAnonymousRemoteAuth(const Entry& entry);
 [[nodiscard]] bool isFiberLasagnaEntry(const Entry& entry);
 
 enum class Category { Volumes, Segments, NormalGrids };

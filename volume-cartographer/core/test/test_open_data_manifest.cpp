@@ -458,6 +458,8 @@ TEST_CASE("Open-data Lasagna alone requests its declared rebased source view")
           "http://127.0.0.1:9/source.zarr");
     CHECK(pkg->volumeEntries()[1].location ==
           "http://127.0.0.1:9/source.zarr#vc-base-scale=2");
+    CHECK(vc::project::usesAnonymousRemoteAuth(pkg->volumeEntries()[0]));
+    CHECK(vc::project::usesAnonymousRemoteAuth(pkg->volumeEntries()[1]));
     CHECK(std::find(pkg->volumeEntries()[1].tags.begin(),
                     pkg->volumeEntries()[1].tags.end(),
                     "vc-open-data-coordinate-space:sample/high-resolution@L2") !=
@@ -972,6 +974,9 @@ TEST_CASE("OpenDataSampleProject attaches all supported zarr artifacts for a cat
     CHECK(pkg->volumeEntries()[0].location == "http://127.0.0.1:9/base.zarr");
     CHECK(pkg->volumeEntries()[1].location == "http://127.0.0.1:9/surface.zarr");
     CHECK(pkg->volumeEntries()[2].location == "http://127.0.0.1:9/ink.zarr");
+    for (const auto& entry : pkg->volumeEntries()) {
+        CHECK(vc::project::usesAnonymousRemoteAuth(entry));
+    }
 
     CHECK(std::find(pkg->volumeEntries()[1].tags.begin(),
                     pkg->volumeEntries()[1].tags.end(),

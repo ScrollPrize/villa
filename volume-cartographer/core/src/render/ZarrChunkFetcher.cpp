@@ -91,6 +91,7 @@ class ClassifyingHttpStore final : public utils::Store {
 public:
     explicit ClassifyingHttpStore(std::string baseUrl, vc::HttpAuth auth = {})
         : baseUrl_(stripTrailingSlash(std::move(baseUrl)))
+        , authenticated_(!auth.empty())
         , client_(makeClient(std::move(auth)))
     {
     }
@@ -102,7 +103,8 @@ public:
             return true;
         if (response.not_found())
             return false;
-        if (response.status_code == 403 && isOptionalMetadataProbe(key))
+        if (response.status_code == 403 && isOptionalMetadataProbe(key) &&
+            !authenticated_)
             return false;
         throw HttpStatusError(response.status_code, key, response.error_message);
     }
@@ -124,7 +126,8 @@ public:
         }
         if (response.not_found())
             return std::nullopt;
-        if (response.status_code == 403 && isOptionalMetadataProbe(key))
+        if (response.status_code == 403 && isOptionalMetadataProbe(key) &&
+            !authenticated_)
             return std::nullopt;
         throw HttpStatusError(response.status_code, key, response.error_message);
     }
@@ -194,6 +197,7 @@ private:
     }
 
     std::string baseUrl_;
+    bool authenticated_ = false;
     utils::HttpClient client_;
     mutable std::mutex metadataMutex_;
     mutable std::unordered_map<std::string, std::vector<std::byte>> metadata_;
