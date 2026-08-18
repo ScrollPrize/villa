@@ -2226,6 +2226,63 @@ def _build_anchor_kdtree(anchor_zyx):
     return cKDTree(np.ascontiguousarray(anchor_np, dtype=np.float32))
 
 
+def _compact_rows_in_place(rows, keep, block=1 << 22):
+    """Drop the unkept rows of `rows`, reusing its own storage.
+
+    ``rows[keep]`` allocates a second array as large as the survivors, so for a
+    moment both exist: on the 2 um store at three thousand slices that is
+    2.16 GB standing beside 2.16 GB, inside a peak of 14.5 GiB that a 16 GB
+    machine cannot clear. Compacting in place removes the duplicate; the caller
+    keeps a view of the surviving prefix and the tail is released with the
+    original.
+
+    Safe because the write position never overtakes the read position. Entering
+    a block at ``lo``, ``write`` counts survivors before ``lo`` and so is at
+    most ``lo``; the block contributes ``n <= hi - lo`` rows; therefore
+    ``write + n <= hi``. Nothing is overwritten before it has been read. This
+    holds only for order-preserving compaction into a prefix, which is what a
+    boolean mask does and is why the assertion below is worth keeping.
+
+    Returns the view. The caller must not keep using the full array.
+    """
+    if rows.shape[0] != keep.shape[0]:
+        raise ValueError(
+            f'mask length {keep.shape[0]} does not match {rows.shape[0]} rows')
+    # Refuse anything this must not write through. The packed store's
+    # coordinates are a read-only int32 memmap and reach the caller as a fresh
+    # float32 array only because the conversion copies; were the store ever
+    # written as float32 that conversion would become a no-op and this would be
+    # asked to rewrite the file on disk. A view into someone else's buffer is
+    # the same hazard without the file. Fall back to the copy instead.
+    if not rows.flags.writeable or rows.base is not None:
+        return rows[keep]
+    total = int(np.count_nonzero(keep))
+    if total == rows.shape[0]:
+        return rows
+    # Compacting in place keeps the whole original allocation alive behind the
+    # returned view, so it trades a lower peak for a larger resident tail. That
+    # is the right trade only while most rows survive; below half, the copy is
+    # smaller than the tail it would strand.
+    if total * 2 < rows.shape[0]:
+        return rows[keep]
+    write = 0
+    for lo in range(0, rows.shape[0], block):
+        hi = min(lo + block, rows.shape[0])
+        sub = keep[lo:hi]
+        n = int(np.count_nonzero(sub))
+        if n == 0:
+            continue
+        if write + n > hi:                       # cannot happen; see above
+            raise AssertionError(
+                f'in-place compaction would overwrite unread rows: '
+                f'write {write} + {n} > {hi}')
+        rows[write:write + n] = rows[lo:hi][sub]
+        write += n
+    if write != total:
+        raise AssertionError(f'compacted {write} rows, expected {total}')
+    return rows[:total]
+
+
 def _track_points_far_from_anchors_mask(track_zyx, anchor_tree, threshold,
                                         progress=None):
     if isinstance(track_zyx, torch.Tensor):
@@ -2606,7 +2663,11 @@ def prepare_main_phase_tracks(
     keep_np &= surviving_points
     del surviving_points
     lengths_new = new_lengths[surviving].astype(np.int64)
-    compact_zyx_np = flat_zyx_np[keep_np]
+    # In place: the fancy-indexed copy stood beside the original until the del
+    # below, and on the 2 um store at three thousand slices each is 2.16 GB
+    # inside a 14.5 GiB peak. Compaction preserves order and writes a prefix,
+    # so the survivors can be moved down within the array they came from.
+    compact_zyx_np = _compact_rows_in_place(flat_zyx_np, keep_np)
     crossing_csr_override = None
     if track_graph is not None:
         if int(keep_np.sum()) >= np.iinfo(np.int32).max:
