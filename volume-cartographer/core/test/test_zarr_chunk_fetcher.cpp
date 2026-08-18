@@ -508,7 +508,7 @@ TEST_CASE("Delta3D cache is a regular unsharded Zarr with the source layout")
     fs::remove_all(cacheDir);
 }
 
-TEST_CASE("Delta3D persistent Zarr rejects sharded source arrays")
+TEST_CASE("Delta3D persistence is disabled for sharded source arrays")
 {
     auto source = tmpDir("delta3d_sharded_source");
     auto cacheDir = tmpDir("delta3d_sharded_cache");
@@ -522,10 +522,16 @@ TEST_CASE("Delta3D persistent Zarr rejects sharded source arrays")
     vc::render::ChunkCacheService::Options serviceOptions;
     serviceOptions.persistentCacheEncoding =
         vc::render::PersistentCacheEncoding::Delta3dLossless;
-    CHECK_THROWS_WITH_AS(
-        createChunkCache(array, options, serviceOptions),
-        doctest::Contains("requires unsharded Zarr sources"),
-        std::runtime_error);
+    auto cache = createChunkCache(array, options, serviceOptions);
+    REQUIRE(cache);
+    const auto stats = cache->stats();
+    CHECK_FALSE(stats.persistentCacheEnabled);
+    CHECK(stats.persistentCacheWarning.find("sharded") != std::string::npos);
+    const auto chunk = cache->getChunkBlocking(0, 0, 0, 0);
+    REQUIRE(chunk.status == vc::render::ChunkStatus::Data);
+    REQUIRE(chunk.bytes);
+    CHECK(chunk.bytes->front() == std::byte{1});
+    CHECK_FALSE(fs::exists(cacheDir / ".vc_delta3d_cache"));
     fs::remove_all(source);
     fs::remove_all(cacheDir);
 }

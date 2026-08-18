@@ -5,6 +5,7 @@
 #include "vc/core/util/Logging.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <fstream>
 #include <limits>
@@ -12,6 +13,7 @@
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <optional>
+#include <random>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -23,6 +25,8 @@
 namespace vc::render {
 namespace fs = std::filesystem;
 namespace {
+
+constexpr std::string_view kRetiredCacheDirectory = ".vc_cache_retired";
 
 fs::path normalizedPath(const fs::path& path)
 {
@@ -44,6 +48,17 @@ bool isWithin(const fs::path& path, const fs::path& root)
             return false;
     }
     return true;
+}
+
+fs::path retiredCachePath(const fs::path& subtree)
+{
+    static const auto processTag =
+        static_cast<std::uint64_t>(std::random_device{}());
+    static std::atomic<std::uint64_t> counter{0};
+    return subtree.parent_path() / kRetiredCacheDirectory /
+           (subtree.filename().string() + "." + std::to_string(processTag) +
+            "." + std::to_string(
+                      counter.fetch_add(1, std::memory_order_relaxed)));
 }
 
 bool isUnsignedNumber(const std::string& value)
@@ -266,6 +281,7 @@ struct PersistentZarrCacheBudget::Impl {
     bool lowSpace = false;
     bool scanInFlight = true;
     bool trimInFlight = false;
+    std::size_t retirementsInFlight = 0;
 };
 
 PersistentZarrCacheBudget::PersistentZarrCacheBudget(
@@ -357,12 +373,17 @@ void PersistentZarrCacheBudget::startScan()
         std::vector<fs::path> files;
         std::vector<fs::path> artifacts;
         std::vector<NativeZarrArrayLayout> zarrArrays;
+        std::vector<fs::path> retiredRoots;
         std::error_code ec;
         fs::recursive_directory_iterator it(
             self->impl_->root, fs::directory_options::skip_permission_denied, ec);
         const fs::recursive_directory_iterator end;
         while (!ec && it != end) {
-            if (it->is_regular_file(ec)) {
+            if (it->is_directory(ec) && !ec &&
+                it->path().filename() == kRetiredCacheDirectory) {
+                retiredRoots.push_back(normalizedPath(it->path()));
+                it.disable_recursion_pending();
+            } else if (it->is_regular_file(ec)) {
                 const auto path = normalizedPath(it->path());
                 files.push_back(path);
                 if (path.filename() == "lasagna-remote.json")
@@ -404,7 +425,36 @@ void PersistentZarrCacheBudget::startScan()
             self->impl_->managedBytes = total;
             self->impl_->scanInFlight = false;
         }
+        for (auto& retired : retiredRoots)
+            self->removeRetiredSubtreeAsync(std::move(retired));
         self->startTrim();
+        self->impl_->cv.notify_all();
+        self->pollSpace();
+    }).detach();
+}
+
+void PersistentZarrCacheBudget::removeRetiredSubtreeAsync(fs::path retired)
+{
+    {
+        std::lock_guard lock(impl_->mutex);
+        ++impl_->retirementsInFlight;
+    }
+    auto self = shared_from_this();
+    std::thread([self, retired = std::move(retired)] {
+        std::error_code ec;
+        fs::remove_all(retired, ec);
+        if (ec) {
+            Logger()->warn("Could not delete retired persistent cache {}: {}",
+                           retired.string(), ec.message());
+        }
+        if (retired.filename() != kRetiredCacheDirectory) {
+            std::error_code parentEc;
+            fs::remove(retired.parent_path(), parentEc);
+        }
+        {
+            std::lock_guard lock(self->impl_->mutex);
+            --self->impl_->retirementsInFlight;
+        }
         self->impl_->cv.notify_all();
         self->pollSpace();
     }).detach();
@@ -682,9 +732,20 @@ bool PersistentZarrCacheBudget::removeCacheSubtree(
             impl_->writePins.begin(), impl_->writePins.end(), overlaps);
     });
 
-    fs::remove_all(normalized, ec);
-    if (ec)
+    std::optional<fs::path> retired;
+    if (fs::exists(normalized, ec)) {
+        const auto retiredRoot = normalized.parent_path() /
+                                 kRetiredCacheDirectory;
+        fs::create_directories(retiredRoot, ec);
+        if (ec)
+            return false;
+        retired = retiredCachePath(normalized);
+        fs::rename(normalized, *retired, ec);
+        if (ec)
+            return false;
+    } else if (ec) {
         return false;
+    }
 
     for (auto it = impl_->entries.begin(); it != impl_->entries.end();) {
         if (!overlaps(it->first)) {
@@ -696,7 +757,10 @@ bool PersistentZarrCacheBudget::removeCacheSubtree(
         it = impl_->entries.erase(it);
     }
     lock.unlock();
-    pollSpace();
+    if (retired)
+        removeRetiredSubtreeAsync(std::move(*retired));
+    else
+        pollSpace();
     return true;
 }
 
@@ -779,7 +843,7 @@ void PersistentZarrCacheBudget::waitForIdle()
     std::unique_lock lock(impl_->mutex);
     impl_->cv.wait(lock, [&] {
         return !impl_->scanInFlight && !impl_->trimInFlight &&
-               impl_->writePins.empty();
+               impl_->writePins.empty() && impl_->retirementsInFlight == 0;
     });
 }
 

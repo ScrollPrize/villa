@@ -114,6 +114,8 @@ TEST_CASE("budget-coordinated cache replacement removes stale subtree accounting
     CHECK_FALSE(ec);
     CHECK_FALSE(fs::exists(oldVolume));
     CHECK(budget->stats().managedBytes == 0);
+    budget->waitForIdle();
+    CHECK_FALSE(fs::exists(root / ".vc_cache_retired"));
 
     CHECK(publish(*budget, volumeChunk(root, 1), 100));
     CHECK(budget->stats().managedBytes == 100);

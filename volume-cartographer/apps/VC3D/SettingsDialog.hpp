@@ -2,27 +2,14 @@
 
 #include "ui_VCSettings.h"
 #include <QStringList>
-#include <array>
-#include <cstddef>
 #include <filesystem>
 #include <memory>
 #include <vector>
 
 class QComboBox;
 class QCheckBox;
-class QPushButton;
 class QSpinBox;
 class VolumePkg;
-class Volume;
-
-
-// Chunk geometry of the currently shown volume, used to map legacy cache
-// entries back to logical chunks for redownload.
-// levelChunkShapes is indexed by pyramid level ({0,0,0} = unknown).
-struct CacheChunkLayout {
-    std::vector<std::array<int, 3>> levelChunkShapes;
-    std::size_t elemSize = 1;
-};
 
 class SettingsDialog : public QDialog, private Ui_VCSettingsDlg
 {
@@ -30,9 +17,6 @@ class SettingsDialog : public QDialog, private Ui_VCSettingsDlg
 
     public:
         SettingsDialog(std::shared_ptr<VolumePkg> volumePackage = {},
-                       std::shared_ptr<Volume> currentVolume = {},
-                       std::filesystem::path currentVolumeCacheDir = {},
-                       CacheChunkLayout currentVolumeChunkLayout = {},
                        QWidget* parent = nullptr);
 
         static std::vector<int> expandSettingToIntRange(const QString& setting);
@@ -44,15 +28,10 @@ class SettingsDialog : public QDialog, private Ui_VCSettingsDlg
     private:
         void setupOutputSegmentsControl();
         void setupCacheActionControls();
-        void redownloadExistingCache();
 
         std::shared_ptr<VolumePkg> _volumePackage;
-        std::shared_ptr<Volume> _currentVolume;
-        std::filesystem::path _currentVolumeCacheDir;
         std::filesystem::path _activeRemoteCacheRoot;
-        CacheChunkLayout _currentVolumeChunkLayout;
         QComboBox* _outputSegmentsCombo{nullptr};
-        QPushButton* _redownloadCacheButton{nullptr};
         QCheckBox* _remoteCacheDelta3dCheckBox{nullptr};
         bool _outputSegmentsChanged{false};
 };

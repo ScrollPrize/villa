@@ -112,10 +112,11 @@ public:
         const std::filesystem::path& target,
         std::uint64_t newSize);
 
-    // Removes an exact cache subtree and forgets every managed entry beneath
-    // it as one budget-coordinated operation. This waits for the startup scan,
-    // trimming, and overlapping reads/writes so format transitions cannot
-    // leave stale accounting behind.
+    // Atomically retires an exact cache subtree and forgets every managed entry
+    // beneath it as one budget-coordinated operation. Recursive deletion then
+    // runs in the background. This waits for the startup scan, trimming, and
+    // overlapping reads/writes so format transitions cannot leave stale
+    // accounting behind.
     bool removeCacheSubtree(const std::filesystem::path& subtree,
                             std::error_code& ec);
 
@@ -130,6 +131,7 @@ private:
                               SpaceProvider spaceProvider);
     void startScan();
     void startTrim();
+    void removeRetiredSubtreeAsync(std::filesystem::path retired);
     void releaseRead(const std::filesystem::path& path, bool touch);
     void finishWrite(const std::filesystem::path& target,
                      const std::vector<std::filesystem::path>& replacements,

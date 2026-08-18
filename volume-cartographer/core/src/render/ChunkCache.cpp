@@ -37,7 +37,7 @@ namespace vc::render {
 
 namespace {
 
-constexpr std::size_t kPersistentWriteBacklogBytes = 512ULL * 1024ULL * 1024ULL;
+constexpr std::size_t kPersistentWriteBacklogBytes = 1024ULL * 1024ULL * 1024ULL;
 constexpr std::size_t kPersistentProbeWorkers = 32;
 constexpr std::size_t kDecodeWorkers = 8;
 constexpr int kTerminalLevelPriorityBonus = 100;
@@ -845,18 +845,24 @@ std::shared_ptr<ChunkCache> ChunkCacheService::acquireSource(
     options.compressPersistentCache = false;
     options.cacheQuantBinWidth = 1;
     ChunkCache::validateSourceDefinition(levels, fetchers);
+    PersistentCachePreparation cachePreparation;
     if (options.persistentCachePath &&
         impl_->persistentCacheEncoding ==
             PersistentCacheEncoding::Delta3dLossless) {
+        bool sharded = false;
         for (std::size_t level = 0; level < fetchers.size(); ++level) {
             const auto& fetcher = fetchers[level];
             if (!fetcher)
                 continue;
             const ChunkKey key{static_cast<int>(level), 0, 0, 0};
             const auto object = fetcher->storageObject(key);
-            if (!object || object->sharded()) {
+            if (!object) {
                 throw std::runtime_error(
-                    "Delta3D persistent Zarr cache requires unsharded Zarr sources");
+                    "Delta3D persistent Zarr cache requires physical Zarr object support");
+            }
+            if (object->sharded()) {
+                sharded = true;
+                break;
             }
             const auto sourceKey = fetcher->sourceChunkKey(key);
             if (!sourceKey || !isSafeZarrStoreKey(*sourceKey)) {
@@ -864,10 +870,19 @@ std::shared_ptr<ChunkCache> ChunkCacheService::acquireSource(
                     "Delta3D persistent Zarr cache requires safe native Zarr chunk keys");
             }
         }
-        options.zarrMirrorMetadata =
-            delta3dZarrMetadata(options.zarrMirrorMetadata);
+        if (sharded) {
+            cachePreparation.warning =
+                "Delta3D disk caching is disabled for sharded Zarr sources";
+            Logger()->warn(
+                "ChunkCache disabled persistent caching for {}: {}",
+                sourceIdentity, cachePreparation.warning);
+            options.persistentCachePath.reset();
+            options.persistentCacheBudgetRoot.reset();
+        } else {
+            options.zarrMirrorMetadata =
+                delta3dZarrMetadata(options.zarrMirrorMetadata);
+        }
     }
-    PersistentCachePreparation cachePreparation;
     if (options.persistentCachePath &&
         (impl_->persistentCacheEncoding ==
              PersistentCacheEncoding::Delta3dLossless ||
