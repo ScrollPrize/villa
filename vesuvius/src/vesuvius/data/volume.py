@@ -1295,13 +1295,17 @@ class Cube:
                 array, _ = nrrd.read(url)
             else:
                 if self.cache:
-                    # Extract the relevant path after "instance-labels"
-                    path_after_finished_cubes = url.split('instance-labels/')[1]
-                    # Extract the directory structure and the filename
-                    dir_structure, filename = os.path.split(path_after_finished_cubes)
+                    # The cube's own coordinates give the cache layout, so the URL does
+                    # not have to be parsed. It used to be split on 'instance-labels/',
+                    # which appears twice in the published URLs
+                    # (volumetric-instance-labels/instance-labels/), so the piece taken
+                    # was the empty string between the two occurrences.
+                    filename = os.path.basename(url)
 
                     # Create the full directory path in the temp_dir
-                    full_temp_dir_path = os.path.join(self.cache_dir, dir_structure)
+                    full_temp_dir_path = os.path.join(
+                        self.cache_dir, f'{self.z:05d}_{self.y:05d}_{self.x:05d}'
+                    )
 
                     # Make sure the directory structure exists
                     os.makedirs(full_temp_dir_path, exist_ok=True)
