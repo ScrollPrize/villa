@@ -2889,3 +2889,437 @@ void MergePatchDialog::accept()
     updateSessionFromUI();
     QDialog::accept();
 }
+
+// ================= GrowTrackPatchesDialog =================
+#include <QRadioButton>
+#include <QButtonGroup>
+#include <QSettings>
+#include <QCoreApplication>
+#include <QDir>
+#include <QFileInfo>
+
+GrowTrackPatchesDialog::GrowTrackPatchesDialog(QWidget* parent)
+    : QDialog(parent)
+{
+    setWindowTitle(tr("Grow Track Patches"));
+    auto* main = new QVBoxLayout(this);
+
+    // ---- Inputs ----
+    auto* ioBox = new QGroupBox(tr("Inputs"), this);
+    auto* ioForm = new QFormLayout(ioBox);
+    ioBox->setLayout(ioForm);
+
+    QWidget* wTracks = pathPicker(this, edtTracks_, tr("Select packed .vctracks directory"), true);
+    QWidget* wCross = pathPicker(this, edtCrossings_, tr("Select crossings .npz file"), false);
+    // For output directory we allow typing a non-existing path; the picker
+    // browses an existing parent, but the text field is freely editable.
+    QWidget* wOut = pathPicker(this, edtOutput_, tr("Select output directory"), true);
+    // venv picker: python binary inside venv
+    QWidget* wVenv = pathPicker(this, edtVenv_, tr("Select venv Python"), false);
+    // Enhance venv button to also allow directory selection (venv root)
+    // by reusing the same line edit: if user picks a directory we accept it.
+    // Override the button behaviour for venv: try file first, fall back to dir.
+    {
+        // wVenv is a QWidget with QHBoxLayout containing QLineEdit and QPushButton
+        auto* lay = qobject_cast<QHBoxLayout*>(wVenv->layout());
+        if (lay && lay->count() >= 2) {
+            auto* btn = qobject_cast<QPushButton*>(lay->itemAt(1)->widget());
+            if (btn) {
+                // disconnect the pathPicker's handler and install venv-aware one
+                QObject::disconnect(btn, nullptr, nullptr, nullptr);
+                connect(btn, &QPushButton::clicked, this, [this]() {
+                    const QString start = edtVenv_->text().isEmpty() ? QDir::homePath() : edtVenv_->text();
+                    // First try to pick a python file
+                    QString file = QFileDialog::getOpenFileName(this, tr("Select venv Python"), start, tr("Python (python*);;All files (*)"));
+                    if (!file.isEmpty()) {
+                        edtVenv_->setText(file);
+                        return;
+                    }
+                    // Fallback: pick venv directory
+                    QString dir = QFileDialog::getExistingDirectory(this, tr("Select venv directory"), start);
+                    if (!dir.isEmpty()) {
+                        edtVenv_->setText(dir);
+                    }
+                });
+            }
+        }
+    }
+
+    edtTracks_->setPlaceholderText(tr("/path/to/tracks.vctracks  (directory with metadata.json)"));
+    edtCrossings_->setPlaceholderText(tr("/path/to/crossings.npz  (uncompressed)"));
+    edtOutput_->setPlaceholderText(tr("/path/to/output  (parent directory for .tifxyz patches)"));
+    edtVenv_->setPlaceholderText(tr("/path/to/venv/bin/python  or  /path/to/venv"));
+
+    ioForm->addRow(tr("Tracks (.vctracks dir):"), wTracks);
+    ioForm->addRow(tr("Crossings (.npz):"), wCross);
+    ioForm->addRow(tr("Output dir:"), wOut);
+    ioForm->addRow(tr("Venv Python:"), wVenv);
+    main->addWidget(ioBox);
+
+    applySavedVenv();
+
+    // ---- Seed selection ----
+    auto* seedBox = new QGroupBox(tr("Seed selection (exactly one)"), this);
+    auto* seedLay = new QVBoxLayout(seedBox);
+    seedBox->setLayout(seedLay);
+
+    auto* radioRow = new QHBoxLayout();
+    rbSeeds_ = new QRadioButton(tr("Explicit seeds"), seedBox);
+    rbRandom_ = new QRadioButton(tr("Random count"), seedBox);
+    rbSeeds_->setChecked(true);
+    radioRow->addWidget(rbSeeds_);
+    radioRow->addWidget(rbRandom_);
+    radioRow->addStretch();
+    seedLay->addLayout(radioRow);
+
+    auto* seedsForm = new QFormLayout();
+    edtSeeds_ = new QLineEdit(seedBox);
+    edtSeeds_->setPlaceholderText(tr("e.g. 0 5 10  or  1,2,3  (track row indices)"));
+    seedsForm->addRow(tr("Seeds:"), edtSeeds_);
+    seedLay->addLayout(seedsForm);
+
+    auto* randForm = new QFormLayout();
+    spRandomCount_ = new QSpinBox(seedBox);
+    spRandomCount_->setRange(1, 1000000);
+    spRandomCount_->setValue(10);
+    spRandomSeed_ = new QSpinBox(seedBox);
+    spRandomSeed_->setRange(0, INT_MAX);
+    spRandomSeed_->setValue(0);
+    spRandomTopPercent_ = new QDoubleSpinBox(seedBox);
+    spRandomTopPercent_->setRange(0.0001, 100.0);
+    spRandomTopPercent_->setDecimals(2);
+    spRandomTopPercent_->setValue(30.0);
+    spMinValidVertices_ = new QSpinBox(seedBox);
+    spMinValidVertices_->setRange(0, 100000000);
+    spMinValidVertices_->setValue(20000);
+    spMinValidVertices_->setSingleStep(1000);
+
+    randForm->addRow(tr("Random count:"), spRandomCount_);
+    randForm->addRow(tr("Random seed:"), spRandomSeed_);
+    randForm->addRow(tr("Random top %:"), spRandomTopPercent_);
+    randForm->addRow(tr("Min valid vertices (random mode):"), spMinValidVertices_);
+    seedLay->addLayout(randForm);
+
+    auto* bg = new QButtonGroup(seedBox);
+    bg->addButton(rbSeeds_);
+    bg->addButton(rbRandom_);
+
+    auto updateSeedEnabled = [this]() {
+        const bool isSeeds = rbSeeds_->isChecked();
+        edtSeeds_->setEnabled(isSeeds);
+        spRandomCount_->setEnabled(!isSeeds);
+        spRandomSeed_->setEnabled(!isSeeds);
+        spRandomTopPercent_->setEnabled(!isSeeds);
+        spMinValidVertices_->setEnabled(!isSeeds);
+    };
+    connect(rbSeeds_, &QRadioButton::toggled, this, updateSeedEnabled);
+    connect(rbRandom_, &QRadioButton::toggled, this, updateSeedEnabled);
+    updateSeedEnabled();
+
+    main->addWidget(seedBox);
+
+    // ---- Growth / filtering ----
+    auto* advBox = new QGroupBox(tr("Advanced (tuning)"), this);
+    advBox->setCheckable(true);
+    advBox->setChecked(false);
+    auto* advForm = new QFormLayout(advBox);
+    advBox->setLayout(advForm);
+
+    spGrowthMinSpan_ = new QDoubleSpinBox(advBox);
+    spGrowthMinSpan_->setRange(0.0, 100000.0);
+    spGrowthMinSpan_->setDecimals(1);
+    spGrowthMinSpan_->setValue(80.0);
+
+    spMinConnect_ = new QSpinBox(advBox);
+    spMinConnect_->setRange(0, 1000);
+    spMinConnect_->setValue(3);
+
+    spMinSize_ = new QDoubleSpinBox(advBox);
+    spMinSize_->setRange(0.0, 100000.0);
+    spMinSize_->setDecimals(6);
+    spMinSize_->setValue(0.0);
+
+    spMaxSize_ = new QDoubleSpinBox(advBox);
+    spMaxSize_->setRange(0.000001, 100000.0);
+    spMaxSize_->setDecimals(6);
+    spMaxSize_->setValue(1.327104);
+
+    spMaxThickFrac_ = new QDoubleSpinBox(advBox);
+    spMaxThickFrac_->setRange(0.0, 1.0);
+    spMaxThickFrac_->setDecimals(4);
+    spMaxThickFrac_->setSingleStep(0.01);
+    spMaxThickFrac_->setValue(0.05);
+
+    chkRejectFold_ = new QCheckBox(tr("Reject any fold fixes"), advBox);
+
+    spGateTol_ = new QDoubleSpinBox(advBox);
+    spGateTol_->setRange(0.0, 1000.0);
+    spGateTol_->setDecimals(2);
+    spGateTol_->setValue(9.0);
+
+    spResampleSpacing_ = new QDoubleSpinBox(advBox);
+    spResampleSpacing_->setRange(0.0001, 1000.0);
+    spResampleSpacing_->setDecimals(2);
+    spResampleSpacing_->setValue(5.0);
+
+    spMinTrackArclength_ = new QDoubleSpinBox(advBox);
+    spMinTrackArclength_->setRange(0.0, 100000.0);
+    spMinTrackArclength_->setDecimals(1);
+    spMinTrackArclength_->setValue(40.0);
+
+    spOutputSpacing_ = new QDoubleSpinBox(advBox);
+    spOutputSpacing_->setRange(0.0, 1000.0);
+    spOutputSpacing_->setDecimals(1);
+    spOutputSpacing_->setValue(20.0);
+
+    spBorderErode_ = new QDoubleSpinBox(advBox);
+    spBorderErode_->setRange(0.0, 100000.0);
+    spBorderErode_->setDecimals(1);
+    spBorderErode_->setValue(40.0);
+
+    spWorkers_ = new QSpinBox(advBox);
+    spWorkers_->setRange(1, 256);
+    spWorkers_->setValue(1);
+
+    chkOverwrite_ = new QCheckBox(tr("Overwrite existing outputs"), advBox);
+
+    edtOmpThreads_ = new QLineEdit(advBox);
+    edtOmpThreads_->setPlaceholderText(tr("optional, e.g. 8"));
+    edtOmpThreads_->setValidator(new QRegularExpressionValidator(QRegularExpression(R"(^\s*\d*\s*$)"), this));
+
+    advForm->addRow(tr("Growth min span (vx):"), spGrowthMinSpan_);
+    advForm->addRow(tr("Min connect:"), spMinConnect_);
+    advForm->addRow(tr("Min size (cm²):"), spMinSize_);
+    advForm->addRow(tr("Max size (cm²):"), spMaxSize_);
+    advForm->addRow(tr("Max thick cell frac:"), spMaxThickFrac_);
+    advForm->addRow(QString(), chkRejectFold_);
+    advForm->addRow(tr("Gate tol:"), spGateTol_);
+    advForm->addRow(tr("Resample spacing (vx):"), spResampleSpacing_);
+    advForm->addRow(tr("Min track arclength (vx):"), spMinTrackArclength_);
+    advForm->addRow(tr("Output spacing (vx):"), spOutputSpacing_);
+    advForm->addRow(tr("Border erode (vx):"), spBorderErode_);
+    advForm->addRow(tr("Workers:"), spWorkers_);
+    advForm->addRow(tr("OMP threads:"), edtOmpThreads_);
+    advForm->addRow(QString(), chkOverwrite_);
+
+    main->addWidget(advBox);
+
+    // ---- Buttons ----
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+    connect(buttons, &QDialogButtonBox::accepted, this, &GrowTrackPatchesDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
+    main->addWidget(buttons);
+
+    ensureDialogWidthForEdits(this, {edtTracks_, edtCrossings_, edtOutput_, edtVenv_, edtSeeds_});
+}
+
+QString GrowTrackPatchesDialog::tracksPath() const { return edtTracks_->text().trimmed(); }
+QString GrowTrackPatchesDialog::crossingsPath() const { return edtCrossings_->text().trimmed(); }
+QString GrowTrackPatchesDialog::outputPath() const { return edtOutput_->text().trimmed(); }
+QString GrowTrackPatchesDialog::venvPath() const { return edtVenv_->text().trimmed(); }
+
+QString GrowTrackPatchesDialog::resolvedPython() const
+{
+    const QString v = venvPath();
+    if (v.isEmpty()) return {};
+    QFileInfo fi(v);
+    if (fi.isDir()) {
+        const QString cand1 = QDir(v).filePath("bin/python");
+        if (QFileInfo(cand1).isExecutable() || QFileInfo(cand1).isFile()) return cand1;
+        const QString cand2 = QDir(v).filePath("bin/python3");
+        if (QFileInfo(cand2).isExecutable() || QFileInfo(cand2).isFile()) return cand2;
+        // Windows venv
+        const QString cand3 = QDir(v).filePath("Scripts/python.exe");
+        if (QFileInfo(cand3).exists()) return cand3;
+        return cand1;
+    }
+    return v;
+}
+
+QString GrowTrackPatchesDialog::scriptPath() const
+{
+    const QString hardcoded = QStringLiteral("/home/sean/villa/volume-cartographer/scripts/spiral/grow_track_graph.py");
+    if (QFileInfo(hardcoded).isFile()) return hardcoded;
+
+    const QString appDir = QCoreApplication::applicationDirPath();
+    const QStringList candidates = {
+        QDir(appDir).filePath("../scripts/spiral/grow_track_graph.py"),
+        QDir(appDir).filePath("../../scripts/spiral/grow_track_graph.py"),
+        QDir(appDir).filePath("scripts/spiral/grow_track_graph.py"),
+        QDir(QDir::currentPath()).filePath("scripts/spiral/grow_track_graph.py"),
+        QDir(QDir::currentPath()).filePath("volume-cartographer/scripts/spiral/grow_track_graph.py"),
+    };
+    for (const auto& c : candidates) {
+        if (QFileInfo(c).isFile()) return QDir::cleanPath(c);
+    }
+    return hardcoded;
+}
+
+QStringList GrowTrackPatchesDialog::buildArgs() const
+{
+    QStringList args;
+    args << tracksPath() << crossingsPath() << outputPath();
+
+    if (rbSeeds_->isChecked()) {
+        const QString txt = edtSeeds_->text().trimmed();
+        // Split on whitespace, comma, semicolon
+        QStringList parts = txt.split(QRegularExpression(R"([\s,;]+)"), Qt::SkipEmptyParts);
+        if (!parts.isEmpty()) {
+            args << "--seeds";
+            for (const auto& p : parts) args << p;
+        }
+    } else {
+        args << "--random-count" << QString::number(spRandomCount_->value());
+        args << "--random-seed" << QString::number(spRandomSeed_->value());
+        args << "--random-top-percent" << QString::number(spRandomTopPercent_->value(), 'g', 10);
+        args << "--min-valid-vertices" << QString::number(spMinValidVertices_->value());
+    }
+
+    args << "--growth-min-span" << QString::number(spGrowthMinSpan_->value(), 'g', 10);
+    args << "--min-connect" << QString::number(spMinConnect_->value());
+    args << "--min-size" << QString::number(spMinSize_->value(), 'g', 10);
+    args << "--max-size" << QString::number(spMaxSize_->value(), 'g', 10);
+    args << "--max-thick-cell-frac" << QString::number(spMaxThickFrac_->value(), 'g', 10);
+    if (chkRejectFold_->isChecked()) args << "--reject-any-fold-fixes";
+    args << "--gate-tol" << QString::number(spGateTol_->value(), 'g', 10);
+    args << "--resample-spacing" << QString::number(spResampleSpacing_->value(), 'g', 10);
+    args << "--min-track-arclength" << QString::number(spMinTrackArclength_->value(), 'g', 10);
+    args << "--output-spacing" << QString::number(spOutputSpacing_->value(), 'g', 10);
+    args << "--border-erode-vx" << QString::number(spBorderErode_->value(), 'g', 10);
+    args << "--workers" << QString::number(spWorkers_->value());
+    if (chkOverwrite_->isChecked()) args << "--overwrite";
+    return args;
+}
+
+int GrowTrackPatchesDialog::ompThreads() const
+{
+    const QString t = edtOmpThreads_->text().trimmed();
+    if (t.isEmpty()) return -1;
+    bool ok = false;
+    const int v = t.toInt(&ok);
+    return (ok && v > 0) ? v : -1;
+}
+
+void GrowTrackPatchesDialog::applySavedVenv()
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const QString saved = settings.value(vc3d::settings::tools::GROW_TRACK_VENV,
+                                         vc3d::settings::tools::GROW_TRACK_VENV_DEFAULT).toString();
+    if (!saved.isEmpty()) {
+        edtVenv_->setText(saved);
+    }
+}
+
+void GrowTrackPatchesDialog::saveVenv() const
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.setValue(vc3d::settings::tools::GROW_TRACK_VENV, venvPath());
+}
+
+void GrowTrackPatchesDialog::accept()
+{
+    const QString tracks = tracksPath();
+    const QString crossings = crossingsPath();
+    const QString out = outputPath();
+    const QString venv = venvPath();
+
+    if (tracks.isEmpty()) {
+        QMessageBox::warning(this, tr("Grow Track Patches"), tr("Select a tracks .vctracks directory."));
+        return;
+    }
+    if (crossings.isEmpty()) {
+        QMessageBox::warning(this, tr("Grow Track Patches"), tr("Select a crossings .npz file."));
+        return;
+    }
+    if (out.isEmpty()) {
+        QMessageBox::warning(this, tr("Grow Track Patches"), tr("Select an output directory."));
+        return;
+    }
+    if (venv.isEmpty()) {
+        QMessageBox::warning(this, tr("Grow Track Patches"), tr("Select a venv Python executable (or venv directory). It will be saved in settings."));
+        return;
+    }
+
+    QFileInfo tInfo(tracks);
+    if (!tInfo.exists()) {
+        QMessageBox::warning(this, tr("Grow Track Patches"), tr("Tracks path does not exist: %1").arg(tracks));
+        return;
+    }
+    if (!tInfo.isDir()) {
+        // .vctracks is expected to be a directory; warn but allow file case
+        // (PackedTracks also handles single .npz via directory glob)
+        // So only reject if it's not a dir and not a file that exists? Keep strict.
+    }
+    // Check for metadata.json to give early feedback
+    if (tInfo.isDir() && !QFileInfo(QDir(tracks).filePath("metadata.json")).exists()) {
+        auto btn = QMessageBox::warning(this, tr("Grow Track Patches"),
+            tr("Tracks directory does not contain metadata.json — it may not be a packed .vctracks directory. Continue anyway?"),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (btn != QMessageBox::Yes) return;
+    }
+
+    QFileInfo cInfo(crossings);
+    if (!cInfo.exists() || !cInfo.isFile()) {
+        QMessageBox::warning(this, tr("Grow Track Patches"), tr("Crossings .npz file does not exist: %1").arg(crossings));
+        return;
+    }
+
+    const QString py = resolvedPython();
+    QFileInfo pyInfo(py);
+    if (!pyInfo.exists()) {
+        QMessageBox::warning(this, tr("Grow Track Patches"), tr("Venv Python not found: %1\n\nPick the python binary inside your venv (e.g. /path/to/venv/bin/python) or the venv directory itself.").arg(py));
+        return;
+    }
+    if (!pyInfo.isExecutable() && !pyInfo.isFile()) {
+        QMessageBox::warning(this, tr("Grow Track Patches"), tr("Venv Python is not executable: %1").arg(py));
+        return;
+    }
+
+    const QString script = scriptPath();
+    if (!QFileInfo(script).isFile()) {
+        QMessageBox::warning(this, tr("Grow Track Patches"), tr("grow_track_graph.py not found at %1\n\nExpected at /home/sean/villa/volume-cartographer/scripts/spiral/grow_track_graph.py or relative to the application.").arg(script));
+        return;
+    }
+
+    if (rbSeeds_->isChecked()) {
+        const QString txt = edtSeeds_->text().trimmed();
+        if (txt.isEmpty()) {
+            QMessageBox::warning(this, tr("Grow Track Patches"), tr("Enter at least one seed track index for --seeds, or switch to Random count mode."));
+            return;
+        }
+        QStringList parts = txt.split(QRegularExpression(R"([\s,;]+)"), Qt::SkipEmptyParts);
+        for (const auto& p : parts) {
+            bool ok = false;
+            p.toInt(&ok);
+            if (!ok) {
+                QMessageBox::warning(this, tr("Grow Track Patches"), tr("Invalid seed value '%1' — expected integers separated by spaces or commas.").arg(p));
+                return;
+            }
+        }
+    } else {
+        if (spRandomCount_->value() <= 0) {
+            QMessageBox::warning(this, tr("Grow Track Patches"), tr("Random count must be > 0."));
+            return;
+        }
+        if (spRandomTopPercent_->value() <= 0.0 || spRandomTopPercent_->value() > 100.0) {
+            QMessageBox::warning(this, tr("Grow Track Patches"), tr("Random top % must be in (0, 100]."));
+            return;
+        }
+    }
+
+    if (spMinSize_->value() > spMaxSize_->value()) {
+        QMessageBox::warning(this, tr("Grow Track Patches"), tr("Min size must not exceed Max size."));
+        return;
+    }
+    if (spResampleSpacing_->value() <= 0.0) {
+        QMessageBox::warning(this, tr("Grow Track Patches"), tr("Resample spacing must be > 0."));
+        return;
+    }
+    if (spGrowthMinSpan_->value() < 0.0) {
+        QMessageBox::warning(this, tr("Grow Track Patches"), tr("Growth min span must be >= 0."));
+        return;
+    }
+
+    saveVenv();
+    QDialog::accept();
+}

@@ -388,6 +388,8 @@ namespace aws {
 namespace tools {
     constexpr auto FLATBOI_PATH = "tools/flatboi_path";
     constexpr auto FLATBOI = "tools/flatboi";  // Legacy key
+    constexpr auto GROW_TRACK_VENV = "tools/grow_track_venv";
+    constexpr auto GROW_TRACK_VENV_DEFAULT = "";
 }
 
 // -----------------------------------------------------------------------------
