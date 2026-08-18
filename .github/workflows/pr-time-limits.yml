@@ -32,7 +32,13 @@ jobs:
             created_ts=$(date -u -d "$created_at" +%s)
             updated_ts=$(date -u -d "$updated_at" +%s)
 
-            if [ "$updated_ts" -le "$inactive_cutoff" ] || [ "$created_ts" -le "$age_cutoff" ]; then
-              gh pr close "$number" --repo "${{ github.repository }}"
+            if [ "$updated_ts" -le "$inactive_cutoff" ]; then
+              gh pr close "$number" \
+                --repo "${{ github.repository }}" \
+                --comment "Closing automatically under the repository PR time limits because this PR has had no activity for 14 days."
+            elif [ "$created_ts" -le "$age_cutoff" ]; then
+              gh pr close "$number" \
+                --repo "${{ github.repository }}" \
+                --comment "Closing automatically under the repository PR time limits because this PR has been open for 28 days without being merged."
             fi
           done
