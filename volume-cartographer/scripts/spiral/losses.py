@@ -1464,6 +1464,45 @@ def _sample_component_walk(members, edges, strip_lengths, branch_probability):
             return segments
 
 
+def _dense_walk_crossing_adjustments(
+    slice_to_spiral_transform, dr_per_winding, flat_zyxs,
+    walk_flat_indices, sampled_walk_positions,
+):
+    # Theta=0 crossing adjustments for each row's sampled points, counted along
+    # the row's FULL dense walk rather than the sparse picks. The picks can sit
+    # more than pi apart in theta on a long strip (a fiber spanning several
+    # windings), where the consecutive-diff crossing detector miscounts and
+    # assigns wrong winding offsets even to a perfectly-fit strip; the dense
+    # walk's consecutive points are decimation-spaced, so |dtheta| < pi holds
+    # there. Adjustments carry no gradient (get_theta_crossing_step_adjustments
+    # detaches), so the walk is transformed in one batched no-grad call, padded
+    # to the longest walk by repeating the last point (identical consecutive
+    # points give exactly zero theta-diffs, as in
+    # _batched_pcl_chain_seam_adjustments). Each row is re-anchored at its
+    # first pick, matching the frame the legacy sparse unwrap used, so
+    # downstream frame-sensitive consumers (snap_strip_dt_target's anchor
+    # transfer, radius_from_unwrapped_shifted) see identical values on strips
+    # where the sparse unwrap was already correct.
+    num_rows = len(walk_flat_indices)
+    max_walk_len = max(len(walk) for walk in walk_flat_indices)
+    padded = np.empty([num_rows, max_walk_len], dtype=np.int64)
+    for k, walk in enumerate(walk_flat_indices):
+        padded[k, :len(walk)] = walk
+        padded[k, len(walk):] = walk[-1]
+    device = dr_per_winding.device
+    with torch.no_grad():
+        walk_zyxs = flat_zyxs[torch.from_numpy(padded).to(device=device)]
+        walk_spiral = slice_to_spiral_transform(
+            walk_zyxs.reshape(-1, 3)).reshape(*walk_zyxs.shape)
+        walk_theta, _, _ = get_theta_and_radii(walk_spiral[..., 1:], dr_per_winding)
+        _, walk_adjustments = unwrap_shifted_radii(
+            walk_theta, torch.zeros_like(walk_theta), dr_per_winding,
+        )
+        picks = torch.from_numpy(sampled_walk_positions).to(device=device)
+        adjustments = torch.gather(walk_adjustments, 1, picks)
+        return adjustments - adjustments[:, :1]
+
+
 def get_unattached_pcl_strip_losses(
     slice_to_spiral_transform,
     dr_per_winding,
@@ -1481,9 +1520,12 @@ def get_unattached_pcl_strip_losses(
     cfg,
 ):
     # Unattached pcls are treated as ordered strips, indexed by int(point_id), and
-    # assumed to be locally dense enough that adjacent samples have |dtheta| < pi
-    # (so _unwrap_track_shifted_radii can stitch theta=0 crossings, exactly like a patch
-    # row/column). Two losses are computed, analogous to the patch radius
+    # assumed to be locally dense enough that adjacent STRIP points have
+    # |dtheta| < pi. The per-row samples themselves may be far sparser than that
+    # (a fiber spanning several windings sampled at num_points_per_pcl points),
+    # so theta=0 crossings are stitched along the full dense walk in a no-grad
+    # pass (_dense_walk_crossing_adjustments) and only the resulting adjustments
+    # are applied to the sampled points. Two losses are computed, analogous to the patch radius
     # and DT losses: (1) shifted-radius should be constant along the strip after
     # subtracting per-point winding-annotation offsets; (2) each point should snap to
     # its target winding, with the target taken from the snapped strip median (or,
@@ -1525,6 +1567,8 @@ def get_unattached_pcl_strip_losses(
     sampled_strip_indices = np.empty([num_rows, num_points_per_pcl], dtype=np.int64)
     sampled_local_indices = np.empty([num_rows, num_points_per_pcl], dtype=np.int64)
     sampled_flat_indices = np.empty([num_rows, num_points_per_pcl], dtype=np.int64)
+    sampled_walk_positions = np.empty([num_rows, num_points_per_pcl], dtype=np.int64)
+    walk_flat_indices = []
     for k, comp_idx in enumerate(chosen_comps):
         members = component_strip_lists[comp_idx]
         edges = component_edges[comp_idx]
@@ -1550,16 +1594,23 @@ def get_unattached_pcl_strip_losses(
         sampled_strip_indices[k] = walk_strips[picks]
         sampled_local_indices[k] = walk_locals[picks]
         sampled_flat_indices[k] = starts_cpu[sampled_strip_indices[k]] + sampled_local_indices[k]
+        sampled_walk_positions[k] = picks
+        walk_flat_indices.append(starts_cpu[walk_strips] + walk_locals)
 
     sampled_flat_indices_t = torch.from_numpy(sampled_flat_indices).to(device=device)
     zyxs_t = flat['zyxs'][sampled_flat_indices_t]
     winding_t = flat['windings'][sampled_flat_indices_t]
 
+    # Crossing adjustments come from the dense walk, not from unwrapping the
+    # sparse picks (see _dense_walk_crossing_adjustments).
+    crossing_adjustments = _dense_walk_crossing_adjustments(
+        slice_to_spiral_transform, dr_per_winding, flat['zyxs'],
+        walk_flat_indices, sampled_walk_positions,
+    )
+
     spiral_zyxs = slice_to_spiral_transform(zyxs_t.reshape(-1, 3)).reshape(*zyxs_t.shape)
     theta, _, shifted_radii = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
-    shifted_radii, crossing_adjustments = unwrap_shifted_radii(
-        theta, shifted_radii, dr_per_winding,
-    )
+    shifted_radii = shifted_radii + crossing_adjustments
 
     # Normalise so a pcl with mixed annotations still reads as a single 'strip'.
     normalised_radii = shifted_radii - winding_t * dr_per_winding
