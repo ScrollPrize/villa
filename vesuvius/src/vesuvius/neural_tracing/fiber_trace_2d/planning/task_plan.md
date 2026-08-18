@@ -133,6 +133,25 @@ reduced median interpolation materialization wall time from 2.40 to 2.30
 seconds and total wall from 13.26 to 13.22 seconds. Exact artifact parity was
 retained, and the paged lookup was accepted.
 
+## Checkpoint 8: Prepared Scoring Tensors
+
+1. Sample the remaining interpolation path to separate sparse lookup,
+   prediction/normal corner work, and principal-axis resolution.
+2. Validate and normalize each unique sampled prediction and normal once.
+   Store compact float32 axes and six independent symmetric outer-product
+   components per field.
+3. Preserve interpolation corner and weight order, double-precision weighted
+   accumulation, principal-axis resolution, and final node quantization.
+
+The bounded profile attributed about 16% of sampled time to lookup, 44% to
+repeated corner direction/tensor work, and 40% to principal-axis resolution.
+All 12,423 sampled points required both principal-axis solves. Three optimized
+runs reduced median interpolation materialization from 2.30 to 1.71 seconds
+and total wall from 13.22 to 12.51 seconds. Fiberlet geometry, populations,
+and replay failures were unchanged; loss values changed around `1e-6` and a
+handful of DP work counters changed because of the intentional float32
+preparation boundary. The prepared scoring representation was accepted.
+
 ## Spec Update
 
 - Document compact tile observation ownership and float precision boundaries.

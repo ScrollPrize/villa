@@ -849,6 +849,15 @@ TEST_CASE("fiberlet candidate workers preserve deterministic results")
               report.interpolatedScoringPoints);
         CHECK(report.scoringPageDirectoryProbes <=
               report.interpolationCornerInsertions);
+        CHECK(report.interpolationProfiledPoints > 0);
+        CHECK(report.interpolationProfiledPoints <=
+              report.interpolatedScoringPoints);
+        CHECK(report.interpolationProfiledCorners >=
+              report.interpolationProfiledPoints);
+        CHECK(report.interpolationProfiledPredictionPrincipalSolves <=
+              report.interpolationProfiledPoints);
+        CHECK(report.interpolationProfiledNormalPrincipalSolves <=
+              report.interpolationProfiledPoints);
         CHECK(report.dpNodeIndexEntries <= report.retainedSearchNodes);
         CHECK(report.dpNodeIndexSlots >= report.dpNodeIndexEntries);
         CHECK(report.dpRelaxations <= report.dpTransitionLookups);
@@ -856,7 +865,13 @@ TEST_CASE("fiberlet candidate workers preserve deterministic results")
         CHECK(report.preparationNodeEnumerationWorkSeconds >= 0.0);
         CHECK(report.preparationCornerCollectionWorkSeconds >= 0.0);
         CHECK(report.scoringIndexSeconds >= 0.0);
+        CHECK(report.scoringPreparationSeconds >= 0.0);
         CHECK(report.interpolationMaterializationSeconds >= 0.0);
+        CHECK(report.interpolationProfiledLookupSeconds >= 0.0);
+        CHECK(report.interpolationProfiledPredictionCornerSeconds >= 0.0);
+        CHECK(report.interpolationProfiledNormalCornerSeconds >= 0.0);
+        CHECK(report.interpolationProfiledPredictionResolveSeconds >= 0.0);
+        CHECK(report.interpolationProfiledNormalResolveSeconds >= 0.0);
         CHECK(report.searchNodeIndexWorkSeconds >= 0.0);
         CHECK(report.searchDpWorkSeconds >= 0.0);
     };

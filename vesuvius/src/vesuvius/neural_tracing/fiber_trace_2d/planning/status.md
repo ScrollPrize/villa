@@ -36,3 +36,8 @@
 - [x] Run GCC and Clang focused path/replay validation.
 - [x] Benchmark checkpoint 7 over three canonical runs.
 - [x] Review checkpoint 7 and retain the paged scoring lookup.
+- [x] Profile interpolation corner and principal-axis costs.
+- [x] Implement compact prepared scoring axes and symmetric tensors.
+- [x] Run focused path/replay validation for checkpoint 8.
+- [x] Benchmark checkpoint 8 over three canonical runs.
+- [x] Review checkpoint 8 and retain float32 scoring preparation.

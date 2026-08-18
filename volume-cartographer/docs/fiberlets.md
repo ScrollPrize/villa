@@ -274,12 +274,15 @@ re-quantization is intentional for the experimental fiberlet objective; exact
 anchor endpoints remain double precision.
 
 Presence is trilinearly interpolated. Fiber directions are unoriented: the
-positive-weight native corner axes are normalized and accumulated as weighted
-outer products, then the shared deterministic symmetric eigensolver resolves a
-unique principal axis. This preserves antipodal axes without sign cancellation;
-an invalid required corner or ambiguous tensor invalidates the destination.
-Normals use the same interpolation, but invalid normal data keeps the existing
-isotropic curvature fallback rather than rejecting the path.
+native voxel axes are validated and normalized once into compact float32
+symmetric outer products. Positive-weight corners accumulate those tensors,
+then the shared deterministic symmetric eigensolver resolves a unique principal
+axis. This preserves antipodal axes without sign cancellation; an invalid
+required corner or ambiguous tensor invalidates the destination. Normals use
+the same interpolation, but invalid normal data keeps the existing isotropic
+curvature fallback rather than rejecting the path. Float32 preparation is an
+intentional transient precision boundary; interpolation weights, tensor sums,
+and eigensolver calculations remain double precision.
 
 Every interior mapped move must have an unoriented angle strictly below 25
 degrees to the dense fiber-prediction axis interpolated at its destination.
@@ -535,7 +538,7 @@ sampling, search, and total wall times. Use identical manifests, fiber, options,
 build type, and interval for before/after performance comparisons.
 
 Benchmark and replay extraction also emit a versioned
-`fiberlet_extraction_profile version=9` row. Both commands use the same field
+`fiberlet_extraction_profile version=11` row. Both commands use the same field
 names and units. Replay writes the row to stderr after full tube extraction;
 benchmark writes it to stdout after the existing summary. The row separates:
 
@@ -544,12 +547,17 @@ benchmark writes it to stdout after the existing summary. The row separates:
   and finalization;
 - fiberlet candidate generation, geometry preparation, node enumeration,
   interpolation-corner collection and merge, prediction/normal sampling,
-  scoring-index construction, interpolation materialization, node-index
-  construction, and dynamic programming;
+  scoring preparation and index construction, interpolation materialization,
+  node-index construction, and dynamic programming;
 - deterministic workload counts including selected/context/work cells, tiles,
   sampler calls and submitted coordinates, observations and gradients, lattice
   nodes and corridor tests, corner insertion attempts and globally unique
   sampled voxels, and DP lookups/visits/relaxations.
+
+Version 11 also reports a bounded one-in-4096-per-worker interpolation sample.
+It separates page lookup, prediction/normal corner accumulation, and
+prediction/normal principal-axis resolution without timing every scoring
+point.
 
 Version 2 subdivides `anchor_fitting_work_seconds` into exclusive summed-worker
 phases for weighted-observation setup, seed generation, seed-pair refinement,

@@ -240,3 +240,33 @@
 - All populations, DP counters, and failures match checkpoint 6. All three new
   runs and the checkpoint-6 reference produced identical `fiber_replay.json`
   SHA-256 `eab2edfb769986649c900ebf5b5ab72fb2d615c07ba06e88cd3a1868cecaa98b`.
+
+## Checkpoint 8: Prepared Scoring Tensors
+
+- A bounded one-in-4096-per-worker profile sampled 12,423 of 50,822,225
+  interpolations and 99,344 corners. Its measured phase shares were 15.7%
+  sparse lookup, 23.1% prediction corner work, 21.1% normal corner work,
+  21.2% prediction principal-axis resolution, and 18.9% normal principal-axis
+  resolution. Neither prediction nor normal used the identical-axis shortcut.
+- Each of 170,813 unique scoring voxels now validates and normalizes its
+  prediction and normal once. The prepared representation stores float32 axes,
+  presence, validity, and six symmetric outer-product components. Interpolation
+  still accumulates weighted components in double precision and uses the same
+  principal-axis solver.
+
+  | metric | minimum | median | maximum | checkpoint 7 median |
+  |---|---:|---:|---:|---:|
+  | total wall | 12.48 s | 12.51 s | 12.69 s | 13.22 s |
+  | total CPU | 315.48 s | 315.81 s | 317.49 s | 335.86 s |
+  | interpolation materialization wall | 1.69 s | 1.70 s | 1.72 s | 2.30 s |
+  | interpolation materialization CPU | 53.82 s | 53.89 s | 54.45 s | 72.96 s |
+  | peak RSS | 2.50 GiB | 2.51 GiB | 2.53 GiB | 2.50 GiB |
+
+- Median total wall improved 5.4%, total CPU 6.0%, materialization wall 26.1%,
+  and materialization CPU 26.1%. Scoring preparation itself costs under 0.01
+  seconds wall.
+- All three optimized runs produced the same replay and the same fiberlet OBJ
+  hash as checkpoint 7. Anchor/fiberlet populations and replay failures were
+  unchanged. The output JSON differs only in loss values around `1e-6`; DP
+  transition lookups changed by 9, reached-state visits by 1, and relaxations
+  by 7 out of hundreds of millions.

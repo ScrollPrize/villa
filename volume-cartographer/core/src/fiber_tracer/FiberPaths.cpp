@@ -115,6 +115,92 @@ struct ScoringVoxel {
     bool normalValid = false;
 };
 
+struct SymmetricAxisTensor {
+    // xx, xy, xz, yy, yz, zz
+    std::array<float, 6> values{};
+};
+
+struct PreparedScoringVoxel {
+    cv::Vec3f predictionAxis{0.0f, 0.0f, 0.0f};
+    cv::Vec3f normalAxis{0.0f, 0.0f, 0.0f};
+    SymmetricAxisTensor predictionTensor;
+    SymmetricAxisTensor normalTensor;
+    float presence = 0.0f;
+    uint8_t flags = 0;
+};
+
+static_assert(sizeof(PreparedScoringVoxel) == 80);
+
+constexpr uint8_t kPreparedPredictionValid = 1U << 0;
+constexpr uint8_t kPreparedNormalValid = 1U << 1;
+
+bool finiteVector(const cv::Vec3d& value);
+
+SymmetricAxisTensor compactAxisTensor(const cv::Vec3d& axis)
+{
+    return {{
+        static_cast<float>(axis[0] * axis[0]),
+        static_cast<float>(axis[0] * axis[1]),
+        static_cast<float>(axis[0] * axis[2]),
+        static_cast<float>(axis[1] * axis[1]),
+        static_cast<float>(axis[1] * axis[2]),
+        static_cast<float>(axis[2] * axis[2]),
+    }};
+}
+
+void prepareAxis(
+    const cv::Vec3d& input,
+    bool valid,
+    cv::Vec3f& axis,
+    SymmetricAxisTensor& tensor,
+    uint8_t flag,
+    uint8_t& flags)
+{
+    const double norm2 = input.dot(input);
+    if (!valid || !finiteVector(input) || !(norm2 > kEpsilon) ||
+        !std::isfinite(norm2)) {
+        return;
+    }
+    const cv::Vec3d normalized = input / std::sqrt(norm2);
+    axis = cv::Vec3f(normalized);
+    tensor = compactAxisTensor(normalized);
+    flags |= flag;
+}
+
+PreparedScoringVoxel prepareScoringVoxel(const ScoringVoxel& input)
+{
+    PreparedScoringVoxel output;
+    const bool predictionValid = input.prediction.valid &&
+        std::isfinite(input.prediction.presence);
+    prepareAxis(
+        input.prediction.direction, predictionValid,
+        output.predictionAxis, output.predictionTensor,
+        kPreparedPredictionValid, output.flags);
+    prepareAxis(
+        input.normal, input.normalValid,
+        output.normalAxis, output.normalTensor,
+        kPreparedNormalValid, output.flags);
+    output.presence = static_cast<float>(input.prediction.presence);
+    return output;
+}
+
+void accumulateTensor(
+    cv::Matx33d& output,
+    const SymmetricAxisTensor& input,
+    double weight)
+{
+    const auto& value = input.values;
+    output(0, 0) += weight * static_cast<double>(value[0]);
+    output(0, 1) += weight * static_cast<double>(value[1]);
+    output(1, 0) += weight * static_cast<double>(value[1]);
+    output(0, 2) += weight * static_cast<double>(value[2]);
+    output(2, 0) += weight * static_cast<double>(value[2]);
+    output(1, 1) += weight * static_cast<double>(value[3]);
+    output(1, 2) += weight * static_cast<double>(value[4]);
+    output(2, 1) += weight * static_cast<double>(value[4]);
+    output(2, 2) += weight * static_cast<double>(value[5]);
+}
+
 struct PreparedCandidate {
     CurvedDomain domain;
     std::vector<SearchNode> nodes;
@@ -638,9 +724,29 @@ void forEachInterpolationCorner(
     }
 }
 
+struct InterpolationProfileSample {
+    size_t points = 0;
+    size_t corners = 0;
+    size_t predictionIdentical = 0;
+    size_t normalIdentical = 0;
+    size_t predictionPrincipalSolves = 0;
+    size_t normalPrincipalSolves = 0;
+    double lookupSeconds = 0.0;
+    double predictionCornerSeconds = 0.0;
+    double normalCornerSeconds = 0.0;
+    double predictionResolveSeconds = 0.0;
+    double normalResolveSeconds = 0.0;
+};
+
 template <typename Lookup>
-ScoringVoxel interpolateScoringPoint(const cv::Vec3d& point, const FiberPredictionGridInfo& grid, Lookup&& lookup)
+ScoringVoxel interpolateScoringPoint(
+    const cv::Vec3d& point,
+    const FiberPredictionGridInfo& grid,
+    Lookup&& lookup,
+    InterpolationProfileSample* profile = nullptr)
 {
+    if (profile != nullptr)
+        ++profile->points;
     ScoringVoxel output;
     cv::Matx33d predictionTensor = cv::Matx33d::zeros();
     cv::Matx33d normalTensor = cv::Matx33d::zeros();
@@ -652,35 +758,56 @@ ScoringVoxel interpolateScoringPoint(const cv::Vec3d& point, const FiberPredicti
     std::optional<cv::Vec3d> firstNormalAxis;
     double presence = 0.0;
     forEachInterpolationCorner(point, grid, [&](const Voxel& corner, double weight) {
+        const auto lookupStart = profile == nullptr ? Clock::time_point{} : Clock::now();
         const auto& sample = lookup(corner);
-        const double directionNorm2 = sample.prediction.direction.dot(sample.prediction.direction);
-        if (!sample.prediction.valid || !finiteVector(sample.prediction.direction) || !std::isfinite(sample.prediction.presence) ||
-            !(directionNorm2 > kEpsilon) || !std::isfinite(directionNorm2)) {
+        if (profile != nullptr) {
+            ++profile->corners;
+            profile->lookupSeconds += std::chrono::duration<double>(
+                Clock::now() - lookupStart).count();
+        }
+        const auto predictionStart = profile == nullptr ? Clock::time_point{} : Clock::now();
+        if ((sample.flags & kPreparedPredictionValid) == 0) {
             predictionValid = false;
         } else {
-            const cv::Vec3d axis = sample.prediction.direction / std::sqrt(directionNorm2);
+            const cv::Vec3d axis(sample.predictionAxis);
             if (!firstPredictionAxis.has_value())
                 firstPredictionAxis = axis;
             else if (std::abs(firstPredictionAxis->dot(axis)) < 1.0 - 1.0e-12)
                 predictionAxesIdentical = false;
-            predictionTensor += fiberAxisTensor(axis, weight);
-            presence += weight * sample.prediction.presence;
+            accumulateTensor(predictionTensor, sample.predictionTensor, weight);
+            presence += weight * static_cast<double>(sample.presence);
+        }
+        if (profile != nullptr) {
+            profile->predictionCornerSeconds += std::chrono::duration<double>(
+                Clock::now() - predictionStart).count();
         }
 
-        const double normalNorm2 = sample.normal.dot(sample.normal);
-        if (!sample.normalValid || !finiteVector(sample.normal) || !(normalNorm2 > kEpsilon) || !std::isfinite(normalNorm2)) {
+        const auto normalStart = profile == nullptr ? Clock::time_point{} : Clock::now();
+        if ((sample.flags & kPreparedNormalValid) == 0) {
             normalValid = false;
         } else {
-            const cv::Vec3d axis = sample.normal / std::sqrt(normalNorm2);
+            const cv::Vec3d axis(sample.normalAxis);
             if (!firstNormalAxis.has_value())
                 firstNormalAxis = axis;
             else if (std::abs(firstNormalAxis->dot(axis)) < 1.0 - 1.0e-12)
                 normalAxesIdentical = false;
-            normalTensor += fiberAxisTensor(axis, weight);
+            accumulateTensor(normalTensor, sample.normalTensor, weight);
+        }
+        if (profile != nullptr) {
+            profile->normalCornerSeconds += std::chrono::duration<double>(
+                Clock::now() - normalStart).count();
         }
     });
     if (predictionValid && std::isfinite(presence)) {
+        const auto resolveStart = profile == nullptr ? Clock::time_point{} : Clock::now();
         const auto principal = principalFiberAxis(predictionTensor);
+        if (profile != nullptr) {
+            ++profile->predictionPrincipalSolves;
+            if (predictionAxesIdentical && firstPredictionAxis.has_value())
+                ++profile->predictionIdentical;
+            profile->predictionResolveSeconds += std::chrono::duration<double>(
+                Clock::now() - resolveStart).count();
+        }
         if (predictionAxesIdentical && firstPredictionAxis.has_value()) {
             output.prediction.direction = canonicalFiberAxis(*firstPredictionAxis);
             output.prediction.presence = presence;
@@ -694,7 +821,15 @@ ScoringVoxel interpolateScoringPoint(const cv::Vec3d& point, const FiberPredicti
         }
     }
     if (normalValid) {
+        const auto resolveStart = profile == nullptr ? Clock::time_point{} : Clock::now();
         const auto principal = principalFiberAxis(normalTensor);
+        if (profile != nullptr) {
+            ++profile->normalPrincipalSolves;
+            if (normalAxesIdentical && firstNormalAxis.has_value())
+                ++profile->normalIdentical;
+            profile->normalResolveSeconds += std::chrono::duration<double>(
+                Clock::now() - resolveStart).count();
+        }
         if (normalAxesIdentical && firstNormalAxis.has_value()) {
             output.normal = canonicalFiberAxis(*firstNormalAxis);
             output.normalValid = true;
@@ -749,13 +884,13 @@ public:
     public:
         Lookup(
             const PagedScoringIndex& index,
-            const std::vector<ScoringVoxel>& scoring,
+            const std::vector<PreparedScoringVoxel>& scoring,
             size_t& directoryProbes)
             : index_(index), scoring_(scoring), directoryProbes_(directoryProbes)
         {
         }
 
-        const ScoringVoxel& operator()(const Voxel& voxel)
+        const PreparedScoringVoxel& operator()(const Voxel& voxel)
         {
             const Voxel key = pageKey(voxel);
             const Page* page = nullptr;
@@ -789,7 +924,7 @@ public:
 
     private:
         const PagedScoringIndex& index_;
-        const std::vector<ScoringVoxel>& scoring_;
+        const std::vector<PreparedScoringVoxel>& scoring_;
         size_t& directoryProbes_;
         std::array<Voxel, 8> cacheKeys_{};
         std::array<const Page*, 8> cachePages_{};
@@ -797,7 +932,7 @@ public:
     };
 
     Lookup lookup(
-        const std::vector<ScoringVoxel>& scoring,
+        const std::vector<PreparedScoringVoxel>& scoring,
         size_t& directoryProbes) const
     {
         return Lookup(*this, scoring, directoryProbes);
@@ -2431,6 +2566,35 @@ FiberletPathReport traceFiberletPaths(
     const auto materializationStart = Clock::now();
     const double materializationCpuStart = processCpuSeconds();
     reportProgress("materialization", 0, prepared.size(), materializationStart, true);
+    const auto scoringPreparationStart = Clock::now();
+    const double scoringPreparationCpuStart = processCpuSeconds();
+    std::vector<PreparedScoringVoxel> preparedScoringVoxels;
+    preparedScoringVoxels.reserve(scoringVoxels.size());
+    for (const auto& scoring : scoringVoxels)
+        preparedScoringVoxels.push_back(prepareScoringVoxel(scoring));
+    report.scoringPreparationSeconds = std::chrono::duration<double>(
+        Clock::now() - scoringPreparationStart).count();
+    report.scoringPreparationCpuSeconds =
+        processCpuSeconds() - scoringPreparationCpuStart;
+    const size_t preparedScoringArrayBytes = checkedSum(
+        checkedProduct(
+            orderedVoxels.capacity(), sizeof(Voxel),
+            "fiberlet prepared scoring byte estimate"),
+        checkedProduct(
+            preparedScoringVoxels.capacity(), sizeof(PreparedScoringVoxel),
+            "fiberlet prepared scoring byte estimate"),
+        "fiberlet prepared scoring byte estimate");
+    report.estimatedPeakOwnedBytes = std::max(
+        report.estimatedPeakOwnedBytes,
+        checkedSum(
+            checkedSum(preparedBytes, sampledArrayBytes,
+                "fiberlet scoring preparation byte estimate"),
+            checkedProduct(
+                preparedScoringVoxels.capacity(), sizeof(PreparedScoringVoxel),
+                "fiberlet scoring preparation byte estimate"),
+            "fiberlet scoring preparation byte estimate"));
+    scoringVoxels.clear();
+    scoringVoxels.shrink_to_fit();
     const auto scoringIndexStart = Clock::now();
     const double scoringIndexCpuStart = processCpuSeconds();
     PagedScoringIndex scoringIndex(orderedVoxels);
@@ -2444,7 +2608,9 @@ FiberletPathReport traceFiberletPaths(
     report.estimatedPeakOwnedBytes = std::
         max(report.estimatedPeakOwnedBytes,
             checkedSum(
-                checkedSum(preparedBytes, sampledArrayBytes, "fiberlet peak owned byte estimate"),
+                checkedSum(
+                    preparedBytes, preparedScoringArrayBytes,
+                    "fiberlet peak owned byte estimate"),
                 scoringIndexPayloadBytes,
                 "fiberlet peak owned byte estimate"));
     errors.assign(prepared.size(), {});
@@ -2458,8 +2624,10 @@ FiberletPathReport traceFiberletPaths(
     std::atomic<size_t> nextMaterialization{0};
     std::atomic<size_t> completedMaterialization{0};
     std::vector<size_t> pageDirectoryProbes(workerCount);
+    std::vector<InterpolationProfileSample> interpolationProfiles(workerCount);
     const auto materializationWorker = [&](size_t workerIndex) {
         size_t localPageDirectoryProbes = 0;
+        size_t localInterpolationCount = 0;
         while (true) {
             const size_t searchIndex = nextMaterialization.fetch_add(1, std::memory_order_relaxed);
             if (searchIndex >= prepared.size())
@@ -2468,8 +2636,11 @@ FiberletPathReport traceFiberletPaths(
                 auto& item = prepared[searchIndex];
                 const auto interpolate = [&](const cv::Vec3d& point) {
                     auto lookup = scoringIndex.lookup(
-                        scoringVoxels, localPageDirectoryProbes);
-                    return interpolateScoringPoint(point, grid, lookup);
+                        preparedScoringVoxels, localPageDirectoryProbes);
+                    InterpolationProfileSample* profile = nullptr;
+                    if ((localInterpolationCount++ & 4095U) == 0)
+                        profile = &interpolationProfiles[workerIndex];
+                    return interpolateScoringPoint(point, grid, lookup, profile);
                 };
                 const auto& candidate =
                     report.candidates[searchCandidateIndices[searchIndex]];
@@ -2513,6 +2684,25 @@ FiberletPathReport traceFiberletPaths(
             report.scoringPageDirectoryProbes, probes,
             "fiberlet scoring page probe count");
     }
+    for (const auto& profile : interpolationProfiles) {
+        report.interpolationProfiledPoints += profile.points;
+        report.interpolationProfiledCorners += profile.corners;
+        report.interpolationProfiledPredictionIdentical += profile.predictionIdentical;
+        report.interpolationProfiledNormalIdentical += profile.normalIdentical;
+        report.interpolationProfiledPredictionPrincipalSolves +=
+            profile.predictionPrincipalSolves;
+        report.interpolationProfiledNormalPrincipalSolves +=
+            profile.normalPrincipalSolves;
+        report.interpolationProfiledLookupSeconds += profile.lookupSeconds;
+        report.interpolationProfiledPredictionCornerSeconds +=
+            profile.predictionCornerSeconds;
+        report.interpolationProfiledNormalCornerSeconds +=
+            profile.normalCornerSeconds;
+        report.interpolationProfiledPredictionResolveSeconds +=
+            profile.predictionResolveSeconds;
+        report.interpolationProfiledNormalResolveSeconds +=
+            profile.normalResolveSeconds;
+    }
     report.samplingMaterializationSeconds = std::chrono::duration<double>(Clock::now() - materializationStart).count();
     report.samplingMaterializationCpuSeconds = processCpuSeconds() - materializationCpuStart;
     for (const auto& error : errors) {
@@ -2522,8 +2712,8 @@ FiberletPathReport traceFiberletPaths(
     scoringIndex.clear();
     orderedVoxels.clear();
     orderedVoxels.shrink_to_fit();
-    scoringVoxels.clear();
-    scoringVoxels.shrink_to_fit();
+    preparedScoringVoxels.clear();
+    preparedScoringVoxels.shrink_to_fit();
 
     const auto searchStart = Clock::now();
     const double searchCpuStart = processCpuSeconds();

@@ -23,6 +23,9 @@
 - Replaced repeated scoring-voxel hash lookups with sparse `16^3` pages and
   dense page-local indices, reducing interpolation materialization by 4.2%
   while preserving exact replay artifacts.
+- Prepared compact float32 prediction/normal axes and symmetric tensors once
+  per sampled voxel, reducing interpolation materialization by 26.1% while
+  preserving fiberlet geometry and replay outcomes.
 
 # 2026-08-17: fiberlet extraction profiling
 
