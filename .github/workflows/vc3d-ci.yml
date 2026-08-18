@@ -194,9 +194,7 @@ jobs:
   render-benchmark:
     name: Synthetic rendering regression (GCC Release / Valgrind replay)
     needs: changes
-    # Temporarily disabled while the renderer regression and parallel replay
-    # stability are repaired. The aggregate CI job accepts this job as skipped.
-    if: ${{ false }}
+    if: needs.changes.outputs.test_core == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     container:
@@ -231,9 +229,10 @@ jobs:
           echo "Using $jobs Ninja jobs"
           cmake --build build/ci-render-benchmark \
             --target bench_render_synthetic bench_thread_sync_replay \
+              test_thread_sync_replay_native \
             --parallel "$jobs"
           ctest --test-dir build/ci-render-benchmark --output-on-failure \
-            -R '^(test_render_synthetic_fixture|test_render_valgrind_ci_no_site)$'
+            -R '^(test_render_synthetic_fixture|test_thread_sync_replay_native)$'
       - name: Run full fresh Valgrind matrix
         working-directory: volume-cartographer
         run: |
