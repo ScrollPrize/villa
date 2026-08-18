@@ -599,6 +599,22 @@ TEST_CASE("ChunkCacheService interns source identity into a numeric hot key")
           ChunkKey{0, 0, 0, 0, other->sourceId()});
 }
 
+TEST_CASE("Delta3D cache mode permits sources without persistent caching")
+{
+    auto options = serviceOptions();
+    options.persistentCacheEncoding =
+        vc::render::PersistentCacheEncoding::Delta3dLossless;
+    auto service = std::make_shared<ChunkCacheService>(std::move(options));
+    auto fetcher = std::make_shared<CountingFetcher>();
+
+    auto cache = makeServiceCache(
+        service, "local-with-delta3d-process-mode", fetcher);
+
+    REQUIRE(cache);
+    CHECK(cache->persistentCacheLayout() ==
+          vc::render::PersistentCacheLayout::Legacy);
+}
+
 TEST_CASE("ChunkCacheService carries adaptive download state into its shared scheduler")
 {
     const ChunkCacheService::AdaptiveDownloadState initial{

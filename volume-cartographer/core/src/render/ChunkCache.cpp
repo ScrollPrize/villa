@@ -811,8 +811,9 @@ std::shared_ptr<ChunkCache> ChunkCacheService::acquireSource(
     options.compressPersistentCache = false;
     options.cacheQuantBinWidth = 1;
     ChunkCache::validateSourceDefinition(levels, fetchers);
-    if (impl_->persistentCacheEncoding ==
-        PersistentCacheEncoding::Delta3dLossless) {
+    if (options.persistentCachePath &&
+        impl_->persistentCacheEncoding ==
+            PersistentCacheEncoding::Delta3dLossless) {
         for (std::size_t level = 0; level < fetchers.size(); ++level) {
             const auto& fetcher = fetchers[level];
             if (!fetcher)
