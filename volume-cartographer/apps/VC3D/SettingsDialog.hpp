@@ -9,6 +9,7 @@
 #include <vector>
 
 class QComboBox;
+class QCheckBox;
 class QPushButton;
 class QSpinBox;
 class VolumePkg;
@@ -52,5 +53,6 @@ class SettingsDialog : public QDialog, private Ui_VCSettingsDlg
         CacheChunkLayout _currentVolumeChunkLayout;
         QComboBox* _outputSegmentsCombo{nullptr};
         QPushButton* _redownloadCacheButton{nullptr};
+        QCheckBox* _remoteCacheDelta3dCheckBox{nullptr};
         bool _outputSegmentsChanged{false};
 };

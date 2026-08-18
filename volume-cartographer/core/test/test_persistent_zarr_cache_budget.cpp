@@ -79,6 +79,25 @@ TEST_CASE("budget discovers only remote-volume and Lasagna Zarr data")
     fs::remove_all(root);
 }
 
+TEST_CASE("budget startup scan discovers Delta3D Zarr chunks")
+{
+    const auto root = tempRoot("delta3d_discover");
+    const auto volume = root / "volume-hash";
+    fs::create_directories(volume / "0");
+    {
+        std::ofstream metadata(volume / "0" / ".zarray");
+        metadata << R"({"zarr_format":2,"shape":[8,8,8],"chunks":[2,2,2],"dtype":"|u1","compressor":{"id":"vc-delta3d","quant":1},"fill_value":0,"order":"C","filters":null})";
+    }
+    writeBytes(volume / "0" / "0.0.0", 23);
+    writeBytes(root / "volume-hash" / ".vc_delta3d_cache", 5);
+
+    auto budget = Budget::configure(root, {}, spaceWith(
+        std::make_shared<std::atomic<std::uint64_t>>(900)));
+    budget->waitForIdle();
+    CHECK(budget->stats().managedBytes == 23);
+    fs::remove_all(root);
+}
+
 TEST_CASE("budget discovers native Zarr payloads but excludes metadata")
 {
     const auto root = tempRoot("native_zarr");

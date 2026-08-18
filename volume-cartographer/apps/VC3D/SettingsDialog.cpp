@@ -147,6 +147,9 @@ SettingsDialog::SettingsDialog(std::shared_ptr<VolumePkg> volumePackage,
             });
 
     setupCacheActionControls();
+    _remoteCacheDelta3dCheckBox->setChecked(settings.value(
+        perf::REMOTE_CACHE_DELTA3D,
+        perf::REMOTE_CACHE_DELTA3D_DEFAULT).toBool());
 
     _redownloadCacheButton->setEnabled(!_currentVolumeCacheDir.empty() &&
                                        _currentVolume &&
@@ -175,10 +178,19 @@ SettingsDialog::SettingsDialog(std::shared_ptr<VolumePkg> volumePackage,
 
 void SettingsDialog::setupCacheActionControls()
 {
+    _remoteCacheDelta3dCheckBox = new QCheckBox(
+        tr("Compress remote volume disk cache with VC-Delta3D (lossless)."),
+        groupBox_5);
+    _remoteCacheDelta3dCheckBox->setObjectName(
+        QStringLiteral("chkRemoteCacheDelta3d"));
+    _remoteCacheDelta3dCheckBox->setToolTip(tr(
+        "Requires restart. On the next use of each remote volume, VC3D replaces "
+        "incompatible disposable cache contents with the selected lossless format."));
+
     _redownloadCacheButton = new QPushButton(tr("Redownload cache..."), groupBox_5);
     _redownloadCacheButton->setObjectName(QStringLiteral("btnRedownloadCache"));
     _redownloadCacheButton->setToolTip(
-        tr("Fetch fresh exact source payloads for chunks already represented in the disk cache. This does not decode or recompress them."));
+        tr("Fetch fresh remote chunks already represented in the disk cache and replace them using the active cache format. This does not populate the RAM cache."));
 
     auto* row = new QWidget(groupBox_5);
     row->setObjectName(QStringLiteral("cacheActionControls"));
@@ -187,8 +199,10 @@ void SettingsDialog::setupCacheActionControls()
     layout->setSpacing(6);
     layout->addWidget(_redownloadCacheButton);
 
-    if (gridLayout_5)
+    if (gridLayout_5) {
+        gridLayout_5->addWidget(_remoteCacheDelta3dCheckBox, 2, 0, 1, 2);
         gridLayout_5->addWidget(row, 2, 2, 1, 1);
+    }
 }
 
 void SettingsDialog::setupOutputSegmentsControl()
@@ -300,6 +314,9 @@ void SettingsDialog::accept()
     settings.setValue(viewer_cache::OVERLAY_SURFACE_CACHE_GB,
                       spinViewerOverlaySurfaceCacheGB->value());
     settings.setValue(viewer::REMOTE_CACHE_DIR, edtRemoteCachePath->text());
+    settings.setValue(
+        perf::REMOTE_CACHE_DELTA3D,
+        _remoteCacheDelta3dCheckBox->isChecked());
     const bool automaticDownloads = chkAutoDownloadParallelism->isChecked();
     const int downloadParallelism = spinIOThreads->value();
     settings.setValue(
@@ -476,7 +493,9 @@ void SettingsDialog::redownloadExistingCache()
 
     std::vector<CacheFileEntry> entries;
     if (source->persistentCacheLayout() ==
-        vc::render::PersistentCacheLayout::ZarrMirror) {
+            vc::render::PersistentCacheLayout::ZarrMirror ||
+        source->persistentCacheLayout() ==
+            vc::render::PersistentCacheLayout::Delta3d) {
         for (const auto& key : source->persistedStorageObjectRepresentatives())
             entries.push_back({key, {}});
     } else {
@@ -542,7 +561,7 @@ void SettingsDialog::redownloadExistingCache()
     progress.setValue(static_cast<int>(entries.size()));
 
     QString summary =
-        tr("Refreshed exact source payloads for %1 of %2 chunks.")
+        tr("Refreshed disk entries for %1 of %2 chunks.")
             .arg(refreshed.load())
             .arg(entries.size());
     if (missing.load() > 0)

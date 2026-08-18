@@ -65,7 +65,7 @@ def _read_zarray_meta(array_dir: Path) -> dict:
 def _register_codec(compressor: dict | None) -> None:
     if compressor is not None and compressor.get('id') == 'vcz1':
         try:
-            import vc.compression.vcz1_numcodecs  # noqa: F401 registers vcz1
+            import vc_delta3d  # noqa: F401 registers vcz1
         except ImportError as exc:
             raise RuntimeError(
                 'the CT store uses the vcz1 codec; install the '

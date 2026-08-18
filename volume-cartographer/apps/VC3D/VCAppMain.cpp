@@ -491,6 +491,8 @@ auto main(int argc, char* argv[]) -> int
         vc3d::settings::perf::REMOTE_DOWNLOAD_AUTOMATIC_DEFAULT;
     std::size_t fixedDownloadParallelism =
         vc3d::settings::perf::REMOTE_DOWNLOAD_PARALLELISM_DEFAULT;
+    bool remoteCacheDelta3d =
+        vc3d::settings::perf::REMOTE_CACHE_DELTA3D_DEFAULT;
     {
         using namespace vc3d::settings;
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
@@ -503,6 +505,9 @@ auto main(int argc, char* argv[]) -> int
                 perf::REMOTE_DOWNLOAD_PARALLELISM,
                 perf::REMOTE_DOWNLOAD_PARALLELISM_DEFAULT).toInt(),
             1, perf::REMOTE_DOWNLOAD_WORKER_CAPACITY));
+        remoteCacheDelta3d = settings.value(
+            perf::REMOTE_CACHE_DELTA3D,
+            perf::REMOTE_CACHE_DELTA3D_DEFAULT).toBool();
 
         // Per-segment rotating-backup count -> core (used by saveOverwrite/growth).
         QuadSurface::setBackupCount(
@@ -555,6 +560,9 @@ auto main(int argc, char* argv[]) -> int
             vc3d::settings::perf::REMOTE_DOWNLOAD_WORKER_CAPACITY;
         cacheOptions.fetchConcurrency.adaptive = true;
         cacheOptions.initialAdaptiveDownloadState = loadAdaptiveDownloadState();
+        cacheOptions.persistentCacheEncoding = remoteCacheDelta3d
+            ? vc::render::PersistentCacheEncoding::Delta3dLossless
+            : vc::render::PersistentCacheEncoding::SourceMirror;
         chunkCacheService = vc::render::configureProcessChunkCacheService(
             std::move(cacheOptions));
         if (!automaticDownloadParallelism) {
