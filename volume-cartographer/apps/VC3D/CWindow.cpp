@@ -2623,8 +2623,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                 }
                 updateAtlasSearchDocks();
             });
-    _fiberMapWorkspace =
-        new FiberMapWorkspace(_lineAnnotationController.get(), _state, this);
+    _fiberMapWorkspace = new FiberMapWorkspace(_lineAnnotationController.get(), this);
     _fiberMapWorkspace->setProperty("workspaceId", QStringLiteral("fiber-map"));
     const int fiberMapIndex = _workspaceTabs->addTab(_fiberMapWorkspace, tr("Fiber Map"));
     if (auto* tabBar = _workspaceTabs->tabBar()) {

@@ -1,6 +1,5 @@
 #include "FiberMapWorkspace.hpp"
 
-#include "CState.hpp"
 #include "LineAnnotationController.hpp"
 
 #include "vc/core/util/Logging.hpp"
@@ -484,7 +483,6 @@ void FiberMapView::mouseReleaseEvent(QMouseEvent* event)
 }
 
 FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
-                                     CState* state,
                                      QWidget* parent)
     : QMainWindow(parent)
     , _controller(controller)
@@ -591,42 +589,17 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
     // one of those moments: leaving another scroll's fibers on screen until the
     // next click is showing the wrong picture, not a late one. The slot drops
     // the layout and nothing more, so no annotation path pays for it.
+    // Nothing is connected to the controller or to CState on purpose. A workspace
+    // that may never be opened must cost annotation work nothing, and a slot here
+    // would have to either do the work or defer it anyway — the earlier attempt
+    // reached the umbilicus resolver from a package-change handler, searching
+    // directories and parsing JSON for a tab nobody had looked at.
     //
-    // Both connections bind to `this` as context, so Qt drops them if either
-    // party is destroyed; no extra lifetime guard is needed for the captured
-    // state pointer, which the slots do not dereference.
-    if (state) {
-        connect(state, &CState::vpkgChanged, this,
-                [this](const std::shared_ptr<VolumePkg>&) {
-                    clearLayout(tr("project changed — press Rebuild layout"));
-                });
-        // A volume switch only matters when it changes the frame the unroll
-        // happens in: two downsample levels of one scan derive the same frame, so
-        // moving between them leaves the map alone.
-        connect(state, &CState::volumeChanged, this,
-                [this](const std::shared_ptr<Volume>&, const std::string&) {
-                    if (!_layoutBuilt) {
-                        return;
-                    }
-                    if (!vc3d::annotation::sameAnnotationFrame(currentFrame(),
-                                                               _layoutFrame)) {
-                        clearLayout(
-                            tr("coordinate frame changed — press Rebuild layout"));
-                    }
-                });
-        // Attach and detach change where every fiber lands. Stale rather than
-        // cleared: the fibers and the frame are unchanged, only their placement.
-        connect(state, &CState::umbilicusChanged, this, [this]() {
-            _umbilicusStatusValid = false;
-            if (_layoutBuilt) {
-                markStale(tr("Umbilicus changed — press Rebuild layout"));
-            } else if (_statusLabel) {
-                // Nothing built yet, but the status line is showing a resolved
-                // umbilicus that has just been replaced.
-                _statusLabel->setText(withCachedUmbilicusStatus(_emptyMessage));
-            }
-        });
-    }
+    // Instead the controller keeps counters that are cheap to bump, and this
+    // compares them at the moments it matters: on show, on rebuild, and before
+    // acting on a click. The cost of that is deferred detection — a tab already
+    // visible when the volume or umbilicus changes keeps its picture until the
+    // user does something — which is the accepted trade.
 
     rebuildScene(tr("press Rebuild layout"));
 }
@@ -681,6 +654,8 @@ void FiberMapWorkspace::clearLayout(const QString& reason)
     _layoutGeneration = 0;
     _layoutFrame = {};
     _layoutUmbilicusFingerprint.clear();
+    _layoutPackageGeneration = 0;
+    _layoutUmbilicusGeneration = 0;
     _layoutBuilt = false;
     _voxelSizeUm.reset();
     _scrollZMaxVx = 0.0;
@@ -703,10 +678,17 @@ bool FiberMapWorkspace::refreshStaleState()
     if (!_controller || !_layoutBuilt) {
         return _stale;
     }
-    // The frame comes first: geometry unrolled in one coordinate frame is not
-    // out of date in another, it is meaningless there, so this clears rather
-    // than marks. Two stores of one scan at different downsample levels compare
-    // equal, which is why switching between them costs nothing.
+    // A new project takes the fibers with it, so the layout is not out of date,
+    // it is about something else entirely. Checked before the frame because two
+    // projects can share a coordinate frame.
+    if (_controller->packageGeneration() != _layoutPackageGeneration) {
+        clearLayout(tr("project changed — press Rebuild layout"));
+        return true;
+    }
+    // The frame next: geometry unrolled in one coordinate frame is not out of
+    // date in another, it is meaningless there, so this clears rather than marks.
+    // Two stores of one scan at different downsample levels compare equal, which
+    // is why switching between them costs nothing.
     if (!vc3d::annotation::sameAnnotationFrame(currentFrame(), _layoutFrame)) {
         clearLayout(tr("coordinate frame changed — press Rebuild layout"));
         return true;
@@ -719,9 +701,10 @@ bool FiberMapWorkspace::refreshStaleState()
         return true;
     }
     // Attaching or repointing the umbilicus changes where every fiber lands. The
-    // signal covers the visible tab; this covers the file being rewritten in
-    // place, which nothing announces.
-    if (_controller->umbilicusFingerprint() != _layoutUmbilicusFingerprint) {
+    // counter covers what VC3D itself did; the fingerprint covers the file being
+    // added, replaced or rewritten underneath it, which nothing announces.
+    if (_controller->umbilicusGeneration() != _layoutUmbilicusGeneration ||
+        _controller->umbilicusFingerprint() != _layoutUmbilicusFingerprint) {
         markStale(tr("Umbilicus changed — press Rebuild layout"));
         return true;
     }
@@ -756,6 +739,8 @@ void FiberMapWorkspace::rebuildLayout()
     // reason; only the umbilicus token has to be read separately.
     _layoutFrame = snapshot.frame;
     _layoutUmbilicusFingerprint = _controller->umbilicusFingerprint();
+    _layoutPackageGeneration = _controller->packageGeneration();
+    _layoutUmbilicusGeneration = _controller->umbilicusGeneration();
     // Set before the build so an empty result still counts as built: it was
     // derived from these dependencies and goes out of date with them.
     _layoutBuilt = true;

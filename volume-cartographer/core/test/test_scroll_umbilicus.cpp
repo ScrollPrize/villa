@@ -777,3 +777,72 @@ TEST_CASE("decideUmbilicusLoadAction: refusal needs a claim and a target")
     CHECK(decideUmbilicusLoadAction(std::nullopt, noClaim, false) ==
           UmbilicusLoadAction::UseLegacy);
 }
+
+TEST_CASE("umbilicusCandidatePaths: agrees with the search, and dedups like it")
+{
+    using vc::core::util::umbilicusCandidatePaths;
+
+    auto d = tmpDir("candidate_paths");
+    const auto volpkg = d / "scroll.volpkg";
+    writeSegment(volpkg / "paths" / "seg1");
+    writeUmbilicus(volpkg / "umbilicus.json", 2.4);
+
+    auto pkg = projectIn(d);
+    REQUIRE(pkg->addSegmentsEntry((volpkg / "paths" / "seg1").string()));
+
+    const auto candidates = umbilicusCandidatePaths(*pkg);
+
+    // The file the resolver settles on must be among them, or a caller watching
+    // these for change would miss the one that decides the answer.
+    const auto resolved = resolveScrollUmbilicus(*pkg);
+    REQUIRE(!resolved.path.empty());
+    CHECK(std::any_of(candidates.begin(), candidates.end(),
+                      [&](const fs::path& candidate) {
+                          std::error_code ec;
+                          return fs::exists(candidate, ec) && !ec &&
+                                 fs::equivalent(candidate, resolved.path, ec) && !ec;
+                      }));
+
+    // Both recognised names are offered per root, since either could appear later
+    // and change what resolves.
+    CHECK(std::any_of(candidates.begin(), candidates.end(),
+                      [](const fs::path& candidate) {
+                          return candidate.filename() == "estimated_umbilicus.json";
+                      }));
+
+    // Deduplicated by canonical path: no two entries name the same file.
+    for (std::size_t i = 0; i < candidates.size(); ++i) {
+        for (std::size_t j = i + 1; j < candidates.size(); ++j) {
+            CHECK(fs::weakly_canonical(candidates[i]) !=
+                  fs::weakly_canonical(candidates[j]));
+        }
+    }
+
+    // Small enough to stat on every check, which is the whole reason this is
+    // separate from the resolver.
+    CHECK(candidates.size() <= 8);
+    fs::remove_all(d);
+}
+
+TEST_CASE("umbilicusCandidatePaths: a path is offered before the file exists")
+{
+    using vc::core::util::umbilicusCandidatePaths;
+
+    auto d = tmpDir("candidate_absent");
+    const auto volpkg = d / "scroll.volpkg";
+    writeSegment(volpkg / "paths" / "seg1");
+    // No umbilicus written at all.
+
+    auto pkg = projectIn(d);
+    REQUIRE(pkg->addSegmentsEntry((volpkg / "paths" / "seg1").string()));
+
+    const auto candidates = umbilicusCandidatePaths(*pkg);
+    CHECK_FALSE(candidates.empty());
+    // Absent candidates are still reported: noticing a file appear is exactly
+    // what a caller comparing these needs.
+    for (const auto& candidate : candidates) {
+        std::error_code ec;
+        CHECK_FALSE(fs::exists(candidate, ec));
+    }
+    fs::remove_all(d);
+}

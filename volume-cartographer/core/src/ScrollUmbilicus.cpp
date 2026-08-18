@@ -70,9 +70,65 @@ std::string describeMetadataErrors(const fs::path& path,
     return message;
 }
 
+// The two names a search recognises, in priority order.
+constexpr const char* kUmbilicusFileNames[] = {"umbilicus.json",
+                                               "estimated_umbilicus.json"};
+
 } // namespace
 
 namespace vc::core::util {
+
+// Directories a search looks in, in priority order and deduplicated.
+std::vector<fs::path> umbilicusSearchRoots(const VolumePkg& pkg)
+{
+    std::vector<fs::path> roots;
+    const auto addRoot = [&roots](const fs::path& root) {
+        if (root.empty()) {
+            return;
+        }
+        if (std::find(roots.begin(), roots.end(), root) != roots.end()) {
+            return;
+        }
+        roots.push_back(root);
+    };
+
+    addRoot(pkg.path().empty() ? fs::path(pkg.getVolpkgDirectory())
+                               : pkg.path().parent_path());
+    for (const auto& segment : pkg.availableSegmentPaths()) {
+        // The entry may be the segments directory itself, whose parent is the
+        // volpkg, or a single segment inside it, whose grandparent is. Only the
+        // latter earns the extra level: taking the grandparent of a segments
+        // directory would search whatever holds the volpkg, where an unrelated
+        // umbilicus could win or force a false ambiguity.
+        addRoot(segment.parent_path());
+        if (isTifxyzSegmentDir(segment)) {
+            addRoot(segment.parent_path().parent_path());
+        }
+    }
+    return roots;
+}
+
+std::vector<fs::path> umbilicusCandidatePaths(const VolumePkg& pkg)
+{
+    std::vector<fs::path> candidates;
+    std::vector<fs::path> canonical;
+    for (const auto& root : umbilicusSearchRoots(pkg)) {
+        for (const char* name : kUmbilicusFileNames) {
+            const fs::path candidate = root / name;
+            // Canonical dedup, matching the search: two roots reaching one file
+            // through a symlink must count once, or a caller comparing these
+            // would see a change that did not happen.
+            const auto resolvedPath = canonicalize(candidate);
+            if (std::find(canonical.begin(), canonical.end(), resolvedPath) !=
+                canonical.end()) {
+                continue;
+            }
+            canonical.push_back(resolvedPath);
+            candidates.push_back(candidate);
+        }
+    }
+    return candidates;
+}
 
 ScrollUmbilicusResolution resolveScrollUmbilicus(const VolumePkg& pkg)
 {
@@ -114,35 +170,12 @@ ScrollUmbilicusResolution resolveScrollUmbilicus(const VolumePkg& pkg)
         return resolution;
     }
 
-    std::vector<fs::path> roots;
-    const auto addRoot = [&roots](const fs::path& root) {
-        if (root.empty()) {
-            return;
-        }
-        if (std::find(roots.begin(), roots.end(), root) != roots.end()) {
-            return;
-        }
-        roots.push_back(root);
-    };
-
-    addRoot(pkg.path().empty() ? fs::path(pkg.getVolpkgDirectory())
-                               : pkg.path().parent_path());
-    for (const auto& segment : pkg.availableSegmentPaths()) {
-        // The entry may be the segments directory itself, whose parent is the
-        // volpkg, or a single segment inside it, whose grandparent is. Only the
-        // latter earns the extra level: taking the grandparent of a segments
-        // directory would search whatever holds the volpkg, where an unrelated
-        // umbilicus could win or force a false ambiguity.
-        addRoot(segment.parent_path());
-        if (isTifxyzSegmentDir(segment)) {
-            addRoot(segment.parent_path().parent_path());
-        }
-    }
+    const auto roots = umbilicusSearchRoots(pkg);
 
     std::vector<fs::path> hits;
     std::vector<fs::path> canonicalHits;
     for (const auto& root : roots) {
-        for (const char* name : {"umbilicus.json", "estimated_umbilicus.json"}) {
+        for (const char* name : kUmbilicusFileNames) {
             const fs::path candidate = root / name;
             std::error_code ec;
             if (!fs::exists(candidate, ec) || ec) {

@@ -312,6 +312,14 @@ public:
     // it to decide whether what they built is still current; runtime fiber ids
     // are only meaningful within one generation.
     [[nodiscard]] uint64_t fiberDataGeneration() const { return _fiberDataGeneration; }
+    // Bumped when the project is replaced, and when the attached umbilicus
+    // changes. Counters rather than signals so that a derived view which may never
+    // be opened costs nothing to keep informed: bumping is an integer store, and
+    // the holder decides when to look. Kept apart because they mean different
+    // things to a holder — a new project invalidates its data outright, while a
+    // new umbilicus only moves where that data lands.
+    [[nodiscard]] uint64_t packageGeneration() const { return _packageGeneration; }
+    [[nodiscard]] uint64_t umbilicusGeneration() const { return _umbilicusGeneration; }
     // Runtime id of the loaded fiber with this file name, or 0 when the package
     // no longer holds it. The stable way to act on a fiber recorded earlier.
     [[nodiscard]] uint64_t fiberIdForFileName(const std::string& fileName) const;
@@ -944,6 +952,10 @@ private:
     // See fiberDataGeneration(). Starts at 1 so a holder's default 0 always
     // reads as stale.
     uint64_t _fiberDataGeneration = 1;
+    // See packageGeneration() / umbilicusGeneration(); both start at 1 for the
+    // same reason.
+    uint64_t _packageGeneration = 1;
+    uint64_t _umbilicusGeneration = 1;
     std::deque<FiberSaveJob> _pendingFiberSaveJobs;
     QPointer<QFutureWatcher<FiberSaveTaskResult>> _fiberSaveWatcher;
     uint64_t _nextFiberSaveSequence = 0;

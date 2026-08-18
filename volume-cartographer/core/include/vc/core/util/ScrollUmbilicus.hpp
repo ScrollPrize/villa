@@ -109,6 +109,18 @@ namespace vc::core::util {
         const std::array<double, 3>& targetGridXyz,
         std::optional<double> targetVoxelSizeUm);
 
+    // Every path a directory search would consider, in priority order and
+    // deduplicated by canonical path so a file reachable through two roots
+    // appears once.
+    //
+    // Exposed so that a caller wanting to know whether the answer *could* have
+    // changed can stat these instead of running the search: the cost of
+    // resolveScrollUmbilicus() is the JSON parse and the ambiguity handling, not
+    // the existence checks. Shared rather than reconstructed, so the two cannot
+    // drift apart about where an umbilicus may live.
+    [[nodiscard]] std::vector<std::filesystem::path> umbilicusCandidatePaths(
+        const VolumePkg& pkg);
+
     // Whether the file itself declares the grid its coordinates index, and by
     // which key. Dimensions outrank voxel size: exact integer counts, no
     // rounding, and they express rescales no µm figure can.

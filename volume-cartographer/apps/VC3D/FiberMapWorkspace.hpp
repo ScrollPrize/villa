@@ -16,7 +16,6 @@
 #include "AnnotationFrame.hpp"
 #include "FiberNetworkLayout.hpp"
 
-class CState;
 class LineAnnotationController;
 class QDockWidget;
 class QEvent;
@@ -69,10 +68,7 @@ class FiberMapWorkspace : public QMainWindow
     Q_OBJECT
 
 public:
-    // `state` is observed only for the package switch that invalidates a layout
-    // outright; it may be null in tests.
     explicit FiberMapWorkspace(LineAnnotationController* controller,
-                               CState* state,
                                QWidget* parent = nullptr);
 
 signals:
@@ -170,6 +166,10 @@ private:
     uint64_t _layoutGeneration = 0;
     vc3d::annotation::AnnotationFrame _layoutFrame;
     QString _layoutUmbilicusFingerprint;
+    // Controller counters as of the build. Compared rather than observed, so that
+    // this workspace existing costs annotation work nothing.
+    uint64_t _layoutPackageGeneration = 0;
+    uint64_t _layoutUmbilicusGeneration = 0;
     // Whether a layout has ever been built. Distinct from "the layout has no
     // networks": an empty result is still a result, built from dependencies that
     // can go out of date, and conflating the two left a map that had found no

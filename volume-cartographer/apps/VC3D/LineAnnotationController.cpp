@@ -1938,6 +1938,7 @@ LineAnnotationController::LineAnnotationController(CState* state,
                 },
                 Qt::QueuedConnection);
         connect(_state, &CState::umbilicusChanged, this, [this]() {
+            ++_umbilicusGeneration;
             invalidateScrollUmbilicus();
             publishUmbilicusNotice();
             rematerializeOpenGeneratedViews();
@@ -6169,10 +6170,28 @@ QString LineAnnotationController::umbilicusFingerprint() const
                 static_cast<qlonglong>(written.time_since_epoch().count()));
         }
     }
-    // A file found by discovery rather than named by the project is not covered:
-    // noticing one appear would need the directory search this exists to avoid.
-    // Rebuild re-resolves regardless, so the cost of missing it is a stale
-    // banner that does not appear, not wrong geometry.
+    // Discovery covers the far more common case of no project field at all, where
+    // the answer comes from whichever candidate file exists. Stat-ing the
+    // candidates catches one being added, replaced or removed; the paths come from
+    // the resolver so the two cannot disagree about where to look, and no JSON is
+    // parsed, which is what made the full search too expensive to do here.
+    for (const auto& candidate : vc::core::util::umbilicusCandidatePaths(pkg)) {
+        std::error_code candidateEc;
+        const auto size = std::filesystem::file_size(candidate, candidateEc);
+        if (candidateEc) {
+            // Absent is itself a state worth recording: a file appearing later has
+            // to read as a change.
+            fingerprint += QStringLiteral("|-");
+            continue;
+        }
+        fingerprint += QStringLiteral("|%1").arg(size);
+        const auto written =
+            std::filesystem::last_write_time(candidate, candidateEc);
+        if (!candidateEc) {
+            fingerprint += QStringLiteral(":%1").arg(
+                static_cast<qlonglong>(written.time_since_epoch().count()));
+        }
+    }
     return fingerprint;
 }
 
@@ -6187,9 +6206,10 @@ LineAnnotationController::umbilicusStatus() const
         vc::core::util::resolveScrollUmbilicus(pkg);
     if (!resolved.path.empty()) {
         QString text = QString::fromStdString(resolved.path.filename().string());
-        if (!resolved.info.voxelsizeUm) {
-            // An unstamped file leaves the frame to be guessed, so the status
-            // line says so before the guess shows up in a rebuilt layout.
+        if (!vc::core::util::umbilicusFrameClaim(resolved.info).any()) {
+            // Only a file stating nothing at all. Dimensions alone are a complete
+            // statement — the preferred one — so calling that unstamped labelled
+            // the better-stamped file as the worse.
             text += tr(" (unstamped)");
         }
         return {true, std::move(text)};
@@ -6337,166 +6357,50 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
     const bool haveFiberGrid = fiberGridXyz[0] > 0.0 && fiberGridXyz[1] > 0.0 &&
                                fiberGridXyz[2] > 0.0;
 
-    double scale = 1.0;
-    bool haveScale = false;
-    bool inferred = false;
-    // Which of the three sources decided the scale; only the voxel-size path
-    // licenses the label to describe the frame in µm.
-    bool scaleFromStampedVoxelSize = false;
+    // Framing is the shared implementation's job. deriveUmbilicusScale() knows the
+    // stamped-dimension test, the voxel-size fallback and the grid inference, and
+    // decideUmbilicusLoadAction() knows which of those may be acted on. A second
+    // copy lived here, which is how the two consumers of one file format came to
+    // disagree, and would have kept every later fix from reaching this one.
+    const auto derived = vc::core::util::deriveUmbilicusScale(
+        resolved.info, fiberGridXyz, snapshot.voxelSizeUm);
+    const auto claim = vc::core::util::umbilicusFrameClaim(resolved.info);
+    const auto action = vc::core::util::decideUmbilicusLoadAction(
+        derived, claim, haveFiberGrid);
 
-    const bool haveStampedDims = resolved.info.volumeWidth &&
-                                 resolved.info.volumeHeight &&
-                                 resolved.info.volumeSlices &&
-                                 *resolved.info.volumeWidth > 0 &&
-                                 *resolved.info.volumeHeight > 0 &&
-                                 *resolved.info.volumeSlices > 0;
-    if (haveStampedDims && haveFiberGrid) {
-        const std::array<double, 3> ratios{
-            fiberGridXyz[0] / *resolved.info.volumeWidth,
-            fiberGridXyz[1] / *resolved.info.volumeHeight,
-            fiberGridXyz[2] / *resolved.info.volumeSlices};
-        const double lo = std::min({ratios[0], ratios[1], ratios[2]});
-        const double hi = std::max({ratios[0], ratios[1], ratios[2]});
-        if (lo > 0.0 && hi <= lo * 1.02) {
-            scale = (ratios[0] + ratios[1] + ratios[2]) / 3.0;
-            haveScale = true;
-            Logger()->info(
-                "Fiber map: umbilicus {} at scale x{:g} (stamped {}x{}x{} grid "
-                "into {:g}x{:g}x{:g})",
-                resolved.path.string(),
-                scale,
-                *resolved.info.volumeWidth,
-                *resolved.info.volumeHeight,
-                *resolved.info.volumeSlices,
-                fiberGridXyz[0],
-                fiberGridXyz[1],
-                fiberGridXyz[2]);
-        } else {
-            Logger()->warn(
-                "Fiber map: umbilicus {} stamps a {}x{}x{} grid whose axis "
-                "ratios against {:g}x{:g}x{:g} disagree ({:g}..{:g}); not a "
-                "uniform rescale of this volume",
-                resolved.path.string(),
-                *resolved.info.volumeWidth,
-                *resolved.info.volumeHeight,
-                *resolved.info.volumeSlices,
-                fiberGridXyz[0],
-                fiberGridXyz[1],
-                fiberGridXyz[2],
-                lo,
-                hi);
-            snapshot.umbilicusMessage =
-                tr("%1 was annotated on a grid that is not a uniform rescale of "
-                   "this volume.")
-                    .arg(QString::fromStdString(resolved.path.filename().string()));
-            return snapshot;
-        }
-    }
-
-    // Comparing voxel sizes needs the annotation's own; without it the stamp
-    // says nothing usable and the inferred-grid path below has to decide.
-    if (!haveScale && resolved.info.voxelsizeUm && snapshot.voxelSizeUm &&
-        *snapshot.voxelSizeUm > 0.0) {
-        const double ratio = *resolved.info.voxelsizeUm / *snapshot.voxelSizeUm;
-        if (std::isfinite(ratio) && ratio > 0.0) {
-            scale = ratio;
-            haveScale = true;
-            scaleFromStampedVoxelSize = true;
-            Logger()->info(
-                "Fiber map: umbilicus {} at scale x{:g} (stamped {:g} um into "
-                "{:g} um)",
-                resolved.path.string(),
-                scale,
-                *resolved.info.voxelsizeUm,
-                *snapshot.voxelSizeUm);
-        }
-    } else if (!haveScale && resolved.info.voxelsizeUm && !snapshot.voxelSizeUm) {
-        Logger()->info(
-            "Fiber map: umbilicus {} stamps {:g} um but the annotation voxel "
-            "size is unknown; falling through to the grid comparison",
-            resolved.path.string(),
-            *resolved.info.voxelsizeUm);
-    }
-
-    if (!haveScale && haveFiberGrid) {
-        // Nothing stamped: find which downsample of the fibers' grid the points
-        // were drawn on. An umbilicus is annotated along the whole scroll, so
-        // the right grid is the one it nearly fills and still fits inside.
-        // Candidates are a factor of two apart, so a grid covered at least this
-        // much leaves the next coarser one under half covered — the match is
-        // unique without needing a tie-break.
-        constexpr double kMinZCoverage = 0.6;
-        constexpr int kMaxDownsampleSteps = 5;
-        double umbLo[3] = {std::numeric_limits<double>::infinity(),
-                           std::numeric_limits<double>::infinity(),
-                           std::numeric_limits<double>::infinity()};
-        double umbHi[3] = {-std::numeric_limits<double>::infinity(),
-                           -std::numeric_limits<double>::infinity(),
-                           -std::numeric_limits<double>::infinity()};
-        for (const auto& point : points) {
-            for (int axis = 0; axis < 3; ++axis) {
-                umbLo[axis] = std::min(umbLo[axis], static_cast<double>(point[axis]));
-                umbHi[axis] = std::max(umbHi[axis], static_cast<double>(point[axis]));
-            }
-        }
-
-        std::vector<double> matches;
-        double bestCoverage = 0.0;
-        for (int step = 0; step <= kMaxDownsampleSteps; ++step) {
-            const double candidate = std::pow(2.0, step);
-            bool fits = umbLo[0] >= 0.0 && umbLo[1] >= 0.0 && umbLo[2] >= 0.0;
-            for (int axis = 0; axis < 3 && fits; ++axis) {
-                fits = umbHi[axis] <= fiberGridXyz[axis] / candidate;
-            }
-            if (!fits) {
-                continue;
-            }
-            const double gridZ = fiberGridXyz[2] / candidate;
-            const double coverage = gridZ > 0.0 ? (umbHi[2] - umbLo[2]) / gridZ : 0.0;
-            bestCoverage = std::max(bestCoverage, coverage);
-            if (coverage >= kMinZCoverage) {
-                matches.push_back(candidate);
-            }
-        }
-
-        if (matches.size() == 1) {
-            scale = matches.front();
-            haveScale = true;
-            inferred = true;
-            Logger()->info(
-                "Fiber map: umbilicus {} is unstamped; inferred scale x{:g} from "
-                "the volume grid (z coverage {:.0f}%)",
-                resolved.path.string(),
-                scale,
-                bestCoverage * 100.0);
-        } else {
-            Logger()->warn(
-                "Fiber map: umbilicus {} is unstamped and its grid could not be "
-                "identified ({} candidate grids, best z coverage {:.0f}%)",
-                resolved.path.string(),
-                matches.size(),
-                bestCoverage * 100.0);
-            snapshot.umbilicusMessage =
-                tr("%1 carries no frame metadata and the grid it was annotated "
-                   "on could not be identified. Stamp it with volume_width, "
-                   "volume_height and volume_slices.")
-                    .arg(QString::fromStdString(resolved.path.filename().string()));
-            return snapshot;
-        }
-    }
-
-    if (!haveScale) {
+    if (action != vc::core::util::UmbilicusLoadAction::Apply) {
+        // One message for every way of failing, including the stated frame that
+        // does not fit, which this consumer used to accept by falling through to a
+        // weaker reading. The previous copy told a conflicting stamp apart from an
+        // ambiguous or under-covered inference and quoted the coverage it had
+        // measured; deriveUmbilicusScale() reports only that it could not answer,
+        // so that detail is gone until it carries a reason.
         Logger()->warn(
-            "Fiber map: umbilicus {} cannot be placed — no stamped frame and no "
-            "volume grid to compare against",
-            resolved.path.string());
+            "Fiber map: could not determine the frame of umbilicus {} against the "
+            "{:g}x{:g}x{:g} annotation grid",
+            resolved.path.string(),
+            fiberGridXyz[0],
+            fiberGridXyz[1],
+            fiberGridXyz[2]);
         snapshot.umbilicusMessage =
-            tr("%1 cannot be placed: it carries no frame metadata and no volume "
-               "is loaded to compare it against.")
+            tr("Could not determine the umbilicus frame for %1. Stamp it with "
+               "volume_width, volume_height and volume_slices.")
                 .arg(QString::fromStdString(resolved.path.filename().string()));
         return snapshot;
     }
-    const bool guessed = inferred;
+
+    const double scale = derived->factor;
+    // Which source decided it: only the µm comparison licenses the label to
+    // describe the frame in micrometres, and only an inference has to admit it is
+    // one.
+    const bool guessed =
+        derived->source == vc::core::util::UmbilicusScaleSource::InferredFromGrid;
+    const bool scaleFromStampedVoxelSize =
+        derived->source == vc::core::util::UmbilicusScaleSource::StampedVoxelSize;
+    Logger()->info("Fiber map: umbilicus {} at scale x{:g} ({})",
+                   resolved.path.string(),
+                   scale,
+                   derived->description);
 
     // A bare factor says how much the coordinates moved but not what frame they
     // came from. Within one volpkg the volumes are levels of a single
@@ -6893,6 +6797,7 @@ void LineAnnotationController::onVolumePackageChanged(std::shared_ptr<VolumePkg>
     // Dropped outright rather than left to the frame comparison: two projects can
     // sit in one directory with identical grids, so both halves of the cache key
     // can match while the umbilicus file behind them differs.
+    ++_packageGeneration;
     invalidateScrollUmbilicus();
     loadFibersForCurrentPackage();
 }
