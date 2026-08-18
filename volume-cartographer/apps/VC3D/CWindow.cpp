@@ -2798,6 +2798,10 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             this, [this]() {
                 _segmentationCommandHandler->onMergePatch(QStringList{});
             });
+    connect(_menuController.get(), &MenuActionController::growTrackPatchesFromMenuRequested,
+            this, [this]() {
+                _segmentationCommandHandler->onGrowTrackPatches();
+            });
     connect(_menuController.get(), &MenuActionController::openDataCatalogVisibilityChanged,
             this, [this](bool) {
                 updateVolumePackageEmptyState();

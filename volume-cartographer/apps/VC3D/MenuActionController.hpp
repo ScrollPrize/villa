@@ -129,6 +129,7 @@ signals:
     // wires this to SegmentationCommandHandler::onMergePatch with an
     // empty seed list so the dialog opens with empty combo boxes.
     void mergePatchFromMenuRequested();
+    void growTrackPatchesFromMenuRequested();
     void openDataCatalogVisibilityChanged(bool visible);
 
 private:
@@ -214,6 +215,7 @@ private:
     QAction* _rotateSurfaceAct{nullptr};
     QAction* _mergeTifxyzAct{nullptr};
     QAction* _mergePatchAct{nullptr};
+    QAction* _growTrackPatchesAct{nullptr};
     QAction* _materializeOpenDataFolderAct{nullptr};
     QAction* _recalculateFiberScoresAct{nullptr};
 
