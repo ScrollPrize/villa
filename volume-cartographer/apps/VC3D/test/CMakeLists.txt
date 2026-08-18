@@ -194,3 +194,23 @@ target_link_libraries(test_annotation_frame PRIVATE
 add_test(NAME annotation_frame COMMAND test_annotation_frame)
 vc_register_test_target(test_annotation_frame)
 vc_register_ctest(annotation_frame test_annotation_frame)
+
+add_executable(test_fiber_map_staleness
+    test_fiber_map_staleness.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapStaleness.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/AnnotationFrame.hpp)
+
+set_target_properties(test_fiber_map_staleness PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_fiber_map_staleness PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_fiber_map_staleness PRIVATE
+    vc_core
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME fiber_map_staleness COMMAND test_fiber_map_staleness)
+vc_register_test_target(test_fiber_map_staleness)
+vc_register_ctest(fiber_map_staleness test_fiber_map_staleness)

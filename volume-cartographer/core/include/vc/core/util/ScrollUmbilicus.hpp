@@ -109,15 +109,35 @@ namespace vc::core::util {
         const std::array<double, 3>& targetGridXyz,
         std::optional<double> targetVoxelSizeUm);
 
-    // Every path a directory search would consider, in priority order and
-    // deduplicated by canonical path so a file reachable through two roots
-    // appears once.
+    // One file the resolution depends on, and how.
+    struct UmbilicusCandidate {
+        std::filesystem::path path;
+        bool exists = false;
+        // Whether this file's *contents* can change the answer. A file the
+        // resolver would actually open is decisive; one it only counts towards an
+        // ambiguity matters by existing, and editing it changes nothing.
+        bool decidesResolution = false;
+    };
+
+    // Everything whose existence or contents can change what
+    // resolveScrollUmbilicus() answers, in priority order.
     //
-    // Exposed so that a caller wanting to know whether the answer *could* have
-    // changed can stat these instead of running the search: the cost of
-    // resolveScrollUmbilicus() is the JSON parse and the ambiguity handling, not
-    // the existence checks. Shared rather than reconstructed, so the two cannot
-    // drift apart about where an umbilicus may live.
+    // This is the resolver's own scan, exposed rather than reconstructed, because
+    // reconstructing it is what let a caller drift: the project field short
+    // circuits the search entirely, so fingerprinting discovery candidates
+    // alongside it invalidated derived views over files the resolver never looks
+    // at. Both operations consume this, so they cannot disagree.
+    //
+    // Discovery stops at the first existing name in each root, matching the
+    // search, so a shadowed lower-priority file is absent from the list; the
+    // absent higher-priority names are present, because one appearing does change
+    // the answer. Deduplicated by canonical path so a file reachable through two
+    // roots appears once.
+    [[nodiscard]] std::vector<UmbilicusCandidate> scanUmbilicusCandidates(
+        const VolumePkg& pkg);
+
+    // The paths of scanUmbilicusCandidates(), for callers that only need to stat
+    // them.
     [[nodiscard]] std::vector<std::filesystem::path> umbilicusCandidatePaths(
         const VolumePkg& pkg);
 

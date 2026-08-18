@@ -13,7 +13,10 @@
 #include <optional>
 #include <vector>
 
+#include "vc/core/util/ScrollUmbilicus.hpp"
+
 #include "AnnotationFrame.hpp"
+#include "FiberMapStaleness.hpp"
 #include "FiberNetworkLayout.hpp"
 
 class LineAnnotationController;
@@ -97,15 +100,30 @@ private:
     // rather than always blaming the fibers.
     void markStale(const QString& reason);
     // Drops the layout entirely, for the changes that leave it not merely out of
-    // date but meaningless: geometry unrolled in one coordinate frame says
-    // nothing about another, and a different package has different fibers.
+    // date but meaningless: geometry unrolled over one set of voxels says nothing
+    // about another set, and a different package has different fibers. A differing
+    // physical voxel size over the same voxel counts is *not* one of those — see
+    // evaluateDependencies().
     void clearLayout(const QString& reason);
-    // Compares what the current layout was built from against what a rebuild
-    // would use now: a changed coordinate frame clears the map, while changed
-    // fibers or a changed umbilicus only mark it stale. Returns whether the map
-    // can still be acted on. Cheap enough to guard interaction — an integer
-    // compare, a few volume metadata reads, and one stat().
+    // The decision itself lives in FiberMapStaleness.hpp as a function of two
+    // dependency sets, so every arm of it is testable without a widget. Splitting
+    // evaluation from application matters for one caller in particular: the fiber
+    // tree's currentItemChanged handler cannot afford a synchronous clearLayout(),
+    // which clears the tree and so deletes the QTreeWidgetItem the signal is still
+    // being delivered with.
+    using StaleVerdict = vc3d::fiber_map::StaleVerdict;
+    [[nodiscard]] vc3d::fiber_map::FiberMapDependencies currentDependencies() const;
+    [[nodiscard]] vc3d::fiber_map::FiberMapDependencies layoutDependencies() const;
+    // Cheap enough to guard interaction — integer compares, a few volume metadata
+    // reads, and stats of the umbilicus candidates. Mutates nothing.
+    [[nodiscard]] StaleVerdict evaluateDependencies() const;
+    // Acts on a verdict. Returns whether the map can still be acted on.
+    bool applyStaleVerdict(const StaleVerdict& verdict);
+    // The two together, for callers that can absorb a scene rebuild inline.
     bool refreshStaleState();
+    // Redraws the physical-unit text without touching geometry, for the case where
+    // only the voxel size moved.
+    void refreshUnitLabels();
     // The frame a rebuild would place geometry in right now.
     [[nodiscard]] vc3d::annotation::AnnotationFrame currentFrame() const;
     // Appends the package's umbilicus state to a status line, resolving it at
@@ -165,6 +183,11 @@ private:
     // since; a fresh workspace is stale until its first rebuild.
     uint64_t _layoutGeneration = 0;
     vc3d::annotation::AnnotationFrame _layoutFrame;
+    // Where the layout's umbilicus scale came from. It decides whether a changed
+    // physical voxel size reached the geometry at all: through stamped dimensions
+    // or through grid inference it did not, so the map stays usable and only its
+    // labels are redrawn.
+    std::optional<vc::core::util::UmbilicusScaleSource> _layoutScaleSource;
     QString _layoutUmbilicusFingerprint;
     // Controller counters as of the build. Compared rather than observed, so that
     // this workspace existing costs annotation work nothing.

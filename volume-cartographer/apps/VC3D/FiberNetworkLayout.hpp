@@ -10,7 +10,7 @@
 #include <vector>
 
 // Extrinsic unroll of manually linked H/V fiber networks about the scroll
-// umbilicus, ported from scripts/fiber_network_unroll.py.
+// umbilicus, ported from the fiber_network_unroll.py review script.
 //
 //     x = unwrapped angle about the umbilicus * the network's median radius
 //     y = z

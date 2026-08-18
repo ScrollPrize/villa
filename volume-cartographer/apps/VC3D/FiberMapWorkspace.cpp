@@ -47,7 +47,7 @@ namespace
 {
 
 // Everything about the map that depends on the application theme. The dark row
-// is the script's own dark theme (scripts/fiber_network_unroll.py THEME["dark"]);
+// is the review script's own dark theme (fiber_network_unroll.py THEME["dark"]);
 // the light row takes the script's light surface/ink/winding and pairs them with
 // H/V hues of the same families darkened enough to read on white.
 struct FiberMapPalette {
@@ -566,8 +566,28 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
                 if (_syncingSelection || !current) {
                     return;
                 }
+                // Read off the item before anything can invalidate it: the
+                // verdict below may call for clearLayout(), which clears the tree
+                // and so deletes `current` while this emission is still being
+                // delivered.
                 const uint64_t fiberId = current->data(0, Qt::UserRole).toULongLong();
                 if (fiberId == 0) {
+                    return;
+                }
+                // The same gate the scene click and the control-point menu use;
+                // acting on a map whose dependencies moved is showing a wrong
+                // picture, not a late one. Evaluated here and applied on the next
+                // turn of the event loop, because the destructive half cannot run
+                // from inside the tree's own signal.
+                // Relabelling rebuilds the tree too, so it is deferred on the
+                // same grounds; the click after it lands on refreshed labels.
+                const auto verdict = evaluateDependencies();
+                if (verdict.action != StaleVerdict::Action::Fresh ||
+                    verdict.relabelOnly) {
+                    QMetaObject::invokeMethod(
+                        this,
+                        [this, verdict]() { applyStaleVerdict(verdict); },
+                        Qt::QueuedConnection);
                     return;
                 }
                 setHighlightedFiber(fiberId);
@@ -580,26 +600,17 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
                 }
             });
 
-    // No connections to the controller's change signals on purpose: annotation
-    // work must not pay for a workspace that may never be opened. Staleness is
-    // discovered by comparing what the layout was built from at the moments it
-    // matters — see refreshStaleState().
-    //
-    // A package switch is the exception, and only because it cannot wait for
-    // one of those moments: leaving another scroll's fibers on screen until the
-    // next click is showing the wrong picture, not a late one. The slot drops
-    // the layout and nothing more, so no annotation path pays for it.
     // Nothing is connected to the controller or to CState on purpose. A workspace
     // that may never be opened must cost annotation work nothing, and a slot here
-    // would have to either do the work or defer it anyway — the earlier attempt
+    // would have to either do the work or defer it anyway — an earlier attempt
     // reached the umbilicus resolver from a package-change handler, searching
     // directories and parsing JSON for a tab nobody had looked at.
     //
     // Instead the controller keeps counters that are cheap to bump, and this
     // compares them at the moments it matters: on show, on rebuild, and before
-    // acting on a click. The cost of that is deferred detection — a tab already
-    // visible when the volume or umbilicus changes keeps its picture until the
-    // user does something — which is the accepted trade.
+    // acting on a click or a fiber-list selection. The cost of that is deferred
+    // detection — a tab already visible when the volume or umbilicus changes keeps
+    // its picture until the user does something — which is the accepted trade.
 
     rebuildScene(tr("press Rebuild layout"));
 }
@@ -653,6 +664,7 @@ void FiberMapWorkspace::clearLayout(const QString& reason)
     _layout = {};
     _layoutGeneration = 0;
     _layoutFrame = {};
+    _layoutScaleSource.reset();
     _layoutUmbilicusFingerprint.clear();
     _layoutPackageGeneration = 0;
     _layoutUmbilicusGeneration = 0;
@@ -673,42 +685,85 @@ void FiberMapWorkspace::clearLayout(const QString& reason)
     }
 }
 
-bool FiberMapWorkspace::refreshStaleState()
+vc3d::fiber_map::FiberMapDependencies
+FiberMapWorkspace::currentDependencies() const
 {
-    if (!_controller || !_layoutBuilt) {
-        return _stale;
+    vc3d::fiber_map::FiberMapDependencies deps;
+    if (!_controller) {
+        return deps;
     }
-    // A new project takes the fibers with it, so the layout is not out of date,
-    // it is about something else entirely. Checked before the frame because two
-    // projects can share a coordinate frame.
-    if (_controller->packageGeneration() != _layoutPackageGeneration) {
-        clearLayout(tr("project changed — press Rebuild layout"));
-        return true;
+    deps.fiberGeneration = _controller->fiberDataGeneration();
+    deps.packageGeneration = _controller->packageGeneration();
+    deps.umbilicusGeneration = _controller->umbilicusGeneration();
+    deps.umbilicusFingerprint = _controller->umbilicusFingerprint();
+    deps.frame = _controller->annotationFrame();
+    return deps;
+}
+
+vc3d::fiber_map::FiberMapDependencies
+FiberMapWorkspace::layoutDependencies() const
+{
+    vc3d::fiber_map::FiberMapDependencies deps;
+    deps.fiberGeneration = _layoutGeneration;
+    deps.packageGeneration = _layoutPackageGeneration;
+    deps.umbilicusGeneration = _layoutUmbilicusGeneration;
+    deps.umbilicusFingerprint = _layoutUmbilicusFingerprint;
+    deps.frame = _layoutFrame;
+    deps.scaleSource = _layoutScaleSource;
+    return deps;
+}
+
+vc3d::fiber_map::StaleVerdict FiberMapWorkspace::evaluateDependencies() const
+{
+    if (!_controller) {
+        return {};
     }
-    // The frame next: geometry unrolled in one coordinate frame is not out of
-    // date in another, it is meaningless there, so this clears rather than marks.
-    // Two stores of one scan at different downsample levels compare equal, which
-    // is why switching between them costs nothing.
-    if (!vc3d::annotation::sameAnnotationFrame(currentFrame(), _layoutFrame)) {
-        clearLayout(tr("coordinate frame changed — press Rebuild layout"));
+    return vc3d::fiber_map::staleVerdictFor(
+        layoutDependencies(),
+        currentDependencies(),
+        _layoutBuilt,
+        _stale,
+        _statusLabel ? _statusLabel->text() : QString());
+}
+
+bool FiberMapWorkspace::applyStaleVerdict(const StaleVerdict& verdict)
+{
+    switch (verdict.action) {
+    case StaleVerdict::Action::ClearLayout:
+        clearLayout(verdict.reason);
         return true;
+    case StaleVerdict::Action::MarkStale:
+        if (!_stale) {
+            markStale(verdict.reason);
+        }
+        return true;
+    case StaleVerdict::Action::Fresh:
+        break;
     }
-    if (_stale) {
-        return true;
-    }
-    if (_controller->fiberDataGeneration() != _layoutGeneration) {
-        markStale(tr("Fibers changed — press Rebuild layout"));
-        return true;
-    }
-    // Attaching or repointing the umbilicus changes where every fiber lands. The
-    // counter covers what VC3D itself did; the fingerprint covers the file being
-    // added, replaced or rewritten underneath it, which nothing announces.
-    if (_controller->umbilicusGeneration() != _layoutUmbilicusGeneration ||
-        _controller->umbilicusFingerprint() != _layoutUmbilicusFingerprint) {
-        markStale(tr("Umbilicus changed — press Rebuild layout"));
-        return true;
+    if (verdict.relabelOnly) {
+        // The geometry is right and the map stays usable; only the physical
+        // figures beside it moved.
+        _layoutFrame = currentFrame();
+        refreshUnitLabels();
     }
     return false;
+}
+
+bool FiberMapWorkspace::refreshStaleState()
+{
+    return applyStaleVerdict(evaluateDependencies());
+}
+
+void FiberMapWorkspace::refreshUnitLabels()
+{
+    _voxelSizeUm = _layoutFrame.voxelSizeUm;
+    // The network headers and the status line are the only places a physical
+    // figure appears, and both are redrawn from the layout as it stands.
+    rebuildScene(_emptyMessage);
+    rebuildTree();
+    if (_statusLabel) {
+        _statusLabel->setText(withCachedUmbilicusStatus(tr("layout current")));
+    }
 }
 
 void FiberMapWorkspace::showEvent(QShowEvent* event)
@@ -738,6 +793,9 @@ void FiberMapWorkspace::rebuildLayout()
     // frame comes from the snapshot rather than a second derivation for that
     // reason; only the umbilicus token has to be read separately.
     _layoutFrame = snapshot.frame;
+    // Which reading produced the scale, so a later voxel-size change can be told
+    // apart from one that actually moved the geometry.
+    _layoutScaleSource = snapshot.umbilicusScaleSource;
     _layoutUmbilicusFingerprint = _controller->umbilicusFingerprint();
     _layoutPackageGeneration = _controller->packageGeneration();
     _layoutUmbilicusGeneration = _controller->umbilicusGeneration();
@@ -1338,8 +1396,11 @@ void FiberMapWorkspace::handleControlPointMenu(const QPointF& scenePos, const QP
     const uint64_t menuGeneration = _controller->fiberDataGeneration();
     const vc3d::annotation::AnnotationFrame menuFrame = currentFrame();
     const QString menuUmbilicus = _controller->umbilicusFingerprint();
+    const uint64_t menuPackage = _controller->packageGeneration();
+    const uint64_t menuUmbilicusGeneration = _controller->umbilicusGeneration();
     connect(action, &QAction::triggered, this,
-            [this, fileName, bestIndex, menuGeneration, menuFrame, menuUmbilicus]() {
+            [this, fileName, bestIndex, menuGeneration, menuFrame, menuUmbilicus,
+             menuPackage, menuUmbilicusGeneration]() {
                 if (!_controller) {
                     return;
                 }
@@ -1352,9 +1413,15 @@ void FiberMapWorkspace::handleControlPointMenu(const QPointF& scenePos, const QP
                 // event loop, and tearing the scene down there would destroy items
                 // while the press that opened the menu is still unwinding. The
                 // clear happens at the next natural moment instead.
+                // The package and umbilicus counters are here too: two packages
+                // can share a frame, a fingerprint and a generation value, so
+                // without them this could resolve an old file name inside a new
+                // package and navigate using an index chosen from the old one.
                 const bool changed =
                     _controller->fiberDataGeneration() != menuGeneration ||
-                    !vc3d::annotation::sameAnnotationFrame(currentFrame(), menuFrame) ||
+                    _controller->packageGeneration() != menuPackage ||
+                    _controller->umbilicusGeneration() != menuUmbilicusGeneration ||
+                    !vc3d::annotation::sameAnnotationGrid(currentFrame(), menuFrame) ||
                     _controller->umbilicusFingerprint() != menuUmbilicus;
                 if (changed) {
                     markStale(tr("Map changed — press Rebuild layout"));

@@ -8,6 +8,7 @@
 
 #include "vc/core/types/VolumePkg.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <filesystem>
@@ -778,57 +779,137 @@ TEST_CASE("decideUmbilicusLoadAction: refusal needs a claim and a target")
           UmbilicusLoadAction::UseLegacy);
 }
 
-TEST_CASE("umbilicusCandidatePaths: agrees with the search, and dedups like it")
-{
-    using vc::core::util::umbilicusCandidatePaths;
+namespace {
 
-    auto d = tmpDir("candidate_paths");
+using vc::core::util::scanUmbilicusCandidates;
+using vc::core::util::umbilicusCandidatePaths;
+
+bool offers(const std::vector<fs::path>& candidates, const std::string& name)
+{
+    return std::any_of(candidates.begin(), candidates.end(),
+                       [&name](const fs::path& candidate) {
+                           return candidate.filename() == name;
+                       });
+}
+
+std::size_t countIn(const std::vector<fs::path>& candidates, const fs::path& root,
+                    const std::string& name)
+{
+    return static_cast<std::size_t>(
+        std::count_if(candidates.begin(), candidates.end(),
+                      [&](const fs::path& candidate) {
+                          return candidate == root / name;
+                      }));
+}
+
+} // namespace
+
+TEST_CASE("scanUmbilicusCandidates: what could change the answer, and nothing else")
+{
+    auto d = tmpDir("candidate_scope");
     const auto volpkg = d / "scroll.volpkg";
     writeSegment(volpkg / "paths" / "seg1");
     writeUmbilicus(volpkg / "umbilicus.json", 2.4);
+    writeUmbilicus(volpkg / "estimated_umbilicus.json", 2.4);
+
+    auto pkg = projectIn(d);
+    REQUIRE(pkg->addSegmentsEntry((volpkg / "paths" / "seg1").string()));
+
+    SUBCASE("discovery: the deciding file is offered and agrees with the resolver")
+    {
+        const auto candidates = umbilicusCandidatePaths(*pkg);
+        const auto resolved = resolveScrollUmbilicus(*pkg);
+        REQUIRE(!resolved.path.empty());
+        CHECK(std::any_of(candidates.begin(), candidates.end(),
+                          [&](const fs::path& candidate) {
+                              std::error_code ec;
+                              return fs::exists(candidate, ec) && !ec &&
+                                     fs::equivalent(candidate, resolved.path, ec) && !ec;
+                          }));
+
+        // A shadowed lower-priority file cannot change the answer, so watching it
+        // would invalidate derived views over a file the resolver never opens.
+        CHECK(countIn(candidates, volpkg, "umbilicus.json") == 1);
+        CHECK(countIn(candidates, volpkg, "estimated_umbilicus.json") == 0);
+
+        // And the record says which one the contents matter for.
+        const auto scanned = scanUmbilicusCandidates(*pkg);
+        for (const auto& candidate : scanned) {
+            if (candidate.path == volpkg / "umbilicus.json") {
+                CHECK(candidate.exists);
+                CHECK(candidate.decidesResolution);
+            }
+            // An absent path is a dependency by its absence only.
+            if (!candidate.exists) {
+                CHECK_FALSE(candidate.decidesResolution);
+            }
+        }
+
+        // Deduplicated by canonical path: no two entries name the same file.
+        for (std::size_t i = 0; i < candidates.size(); ++i) {
+            for (std::size_t j = i + 1; j < candidates.size(); ++j) {
+                CHECK(fs::weakly_canonical(candidates[i]) !=
+                      fs::weakly_canonical(candidates[j]));
+            }
+        }
+        // Small enough to stat on every interaction, which is the whole reason
+        // this is separate from the resolver.
+        CHECK(candidates.size() <= 8);
+    }
+
+    SUBCASE("an explicit project field is the only dependency")
+    {
+        pkg->setUmbilicus((volpkg / "umbilicus.json").string());
+        const auto candidates = umbilicusCandidatePaths(*pkg);
+        REQUIRE(candidates.size() == 1);
+        CHECK(candidates.front() == volpkg / "umbilicus.json");
+        // The discoverable file beside it is ignored by the resolver, so touching
+        // it must not read as a change.
+        CHECK_FALSE(offers(candidates, "estimated_umbilicus.json"));
+    }
+
+    SUBCASE("an unusable configured location depends on no file")
+    {
+        pkg->setUmbilicus("s3://bucket/umbilicus.json");
+        CHECK(umbilicusCandidatePaths(*pkg).empty());
+    }
+
+    SUBCASE("a configured local path is offered before it exists")
+    {
+        pkg->setUmbilicus((volpkg / "not_there_yet.json").string());
+        const auto scanned = scanUmbilicusCandidates(*pkg);
+        REQUIRE(scanned.size() == 1);
+        CHECK(scanned.front().path == volpkg / "not_there_yet.json");
+        CHECK_FALSE(scanned.front().exists);
+        // Its appearing is what has to be noticed.
+        CHECK(scanned.front().decidesResolution);
+    }
+
+    fs::remove_all(d);
+}
+
+TEST_CASE("scanUmbilicusCandidates: an absent higher-priority name is still watched")
+{
+    auto d = tmpDir("candidate_absent");
+    const auto volpkg = d / "scroll.volpkg";
+    writeSegment(volpkg / "paths" / "seg1");
+    // Only the fallback name exists, so umbilicus.json appearing later would
+    // change what resolves and must be in the list.
+    writeUmbilicus(volpkg / "estimated_umbilicus.json", 2.4);
 
     auto pkg = projectIn(d);
     REQUIRE(pkg->addSegmentsEntry((volpkg / "paths" / "seg1").string()));
 
     const auto candidates = umbilicusCandidatePaths(*pkg);
-
-    // The file the resolver settles on must be among them, or a caller watching
-    // these for change would miss the one that decides the answer.
-    const auto resolved = resolveScrollUmbilicus(*pkg);
-    REQUIRE(!resolved.path.empty());
-    CHECK(std::any_of(candidates.begin(), candidates.end(),
-                      [&](const fs::path& candidate) {
-                          std::error_code ec;
-                          return fs::exists(candidate, ec) && !ec &&
-                                 fs::equivalent(candidate, resolved.path, ec) && !ec;
-                      }));
-
-    // Both recognised names are offered per root, since either could appear later
-    // and change what resolves.
-    CHECK(std::any_of(candidates.begin(), candidates.end(),
-                      [](const fs::path& candidate) {
-                          return candidate.filename() == "estimated_umbilicus.json";
-                      }));
-
-    // Deduplicated by canonical path: no two entries name the same file.
-    for (std::size_t i = 0; i < candidates.size(); ++i) {
-        for (std::size_t j = i + 1; j < candidates.size(); ++j) {
-            CHECK(fs::weakly_canonical(candidates[i]) !=
-                  fs::weakly_canonical(candidates[j]));
-        }
-    }
-
-    // Small enough to stat on every check, which is the whole reason this is
-    // separate from the resolver.
-    CHECK(candidates.size() <= 8);
+    CHECK(countIn(candidates, volpkg, "umbilicus.json") == 1);
+    CHECK(countIn(candidates, volpkg, "estimated_umbilicus.json") == 1);
+    CHECK(resolveScrollUmbilicus(*pkg).path == volpkg / "estimated_umbilicus.json");
     fs::remove_all(d);
 }
 
 TEST_CASE("umbilicusCandidatePaths: a path is offered before the file exists")
 {
-    using vc::core::util::umbilicusCandidatePaths;
-
-    auto d = tmpDir("candidate_absent");
+    auto d = tmpDir("candidate_none");
     const auto volpkg = d / "scroll.volpkg";
     writeSegment(volpkg / "paths" / "seg1");
     // No umbilicus written at all.
@@ -838,8 +919,10 @@ TEST_CASE("umbilicusCandidatePaths: a path is offered before the file exists")
 
     const auto candidates = umbilicusCandidatePaths(*pkg);
     CHECK_FALSE(candidates.empty());
-    // Absent candidates are still reported: noticing a file appear is exactly
-    // what a caller comparing these needs.
+    // Nothing exists, so every name in every root is watched: noticing a file
+    // appear is exactly what a caller comparing these needs.
+    CHECK(offers(candidates, "umbilicus.json"));
+    CHECK(offers(candidates, "estimated_umbilicus.json"));
     for (const auto& candidate : candidates) {
         std::error_code ec;
         CHECK_FALSE(fs::exists(candidate, ec));

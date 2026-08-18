@@ -6151,34 +6151,22 @@ QString LineAnnotationController::umbilicusFingerprint() const
         return {};
     }
     const VolumePkg& pkg = *_state->vpkg();
-    // Deliberately cheap: this is compared whenever a derived view is about to
-    // be trusted, so it must not run the resolver's directory search or parse
-    // any JSON. The project's field covers attaching, detaching and repointing —
-    // none of which emits a signal — and stat()ing the file it names covers the
-    // file being rewritten in place.
+    // Deliberately cheap: this is compared whenever a derived view is about to be
+    // trusted, so it must not run the resolver's JSON parse. The project's field
+    // covers attaching, detaching and repointing -- none of which emits a signal --
+    // and stat()ing what the resolver depends on covers a file being added,
+    // replaced or rewritten underneath it.
+    //
+    // What that set is comes from the resolver rather than from a second guess
+    // here. An earlier version listed every discovery candidate unconditionally,
+    // which meant that with the project's field set -- the resolver's short circuit
+    // -- editing an unrelated umbilicus.json beside the volpkg invalidated the map
+    // and blocked interaction over a file nothing would ever open.
     QString fingerprint = QString::fromStdString(pkg.umbilicus());
-    std::error_code ec;
-    const std::filesystem::path path = pkg.umbilicusPath();
-    if (!path.empty()) {
-        const auto size = std::filesystem::file_size(path, ec);
-        if (!ec) {
-            fingerprint += QStringLiteral("|%1").arg(size);
-        }
-        const auto written = std::filesystem::last_write_time(path, ec);
-        if (!ec) {
-            fingerprint += QStringLiteral("|%1").arg(
-                static_cast<qlonglong>(written.time_since_epoch().count()));
-        }
-    }
-    // Discovery covers the far more common case of no project field at all, where
-    // the answer comes from whichever candidate file exists. Stat-ing the
-    // candidates catches one being added, replaced or removed; the paths come from
-    // the resolver so the two cannot disagree about where to look, and no JSON is
-    // parsed, which is what made the full search too expensive to do here.
-    for (const auto& candidate : vc::core::util::umbilicusCandidatePaths(pkg)) {
-        std::error_code candidateEc;
-        const auto size = std::filesystem::file_size(candidate, candidateEc);
-        if (candidateEc) {
+    for (const auto& candidate : vc::core::util::scanUmbilicusCandidates(pkg)) {
+        std::error_code ec;
+        const auto size = std::filesystem::file_size(candidate.path, ec);
+        if (ec) {
             // Absent is itself a state worth recording: a file appearing later has
             // to read as a change.
             fingerprint += QStringLiteral("|-");
@@ -6186,8 +6174,8 @@ QString LineAnnotationController::umbilicusFingerprint() const
         }
         fingerprint += QStringLiteral("|%1").arg(size);
         const auto written =
-            std::filesystem::last_write_time(candidate, candidateEc);
-        if (!candidateEc) {
+            std::filesystem::last_write_time(candidate.path, ec);
+        if (!ec) {
             fingerprint += QStringLiteral(":%1").arg(
                 static_cast<qlonglong>(written.time_since_epoch().count()));
         }
@@ -6346,7 +6334,7 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
 
     // The umbilicus may be annotated on a downsampled grid while the fibers
     // live in the volume's level-0 source frame (PHercParis4's is x4; see
-    // scripts/fiber_network_unroll.md), so its coordinates have to be brought
+    // the fiber_network_unroll review tooling), so its coordinates have to be brought
     // into that frame first. In order of trust: the stamped grid dimensions
     // against the fibers' own grid (exact integers), the stamped voxel size
     // against the annotation voxel size, then which downsample of the fibers'
@@ -6390,6 +6378,7 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
     }
 
     const double scale = derived->factor;
+    snapshot.umbilicusScaleSource = derived->source;
     // Which source decided it: only the µm comparison licenses the label to
     // describe the frame in micrometres, and only an inference has to admit it is
     // one.
@@ -6473,23 +6462,28 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
             bool dimensionMismatch = false;
             if (impliedVoxelUm > 0.0 && resolved.info.volumeWidth &&
                 resolved.info.volumeHeight && resolved.info.volumeSlices) {
-                double ratioX = 0.0;
-                double ratioY = 0.0;
-                double ratioZ = 0.0;
+                // The same question deriveUmbilicusScale() asks, so it is asked by
+                // the same function. This block used to carry its own copy of a 2%
+                // spread test and its own average of the three ratios, which meant
+                // the Fiber Map could call a stamp uniform that the shared
+                // implementation refuses, and derive an implied voxel size from a
+                // factor matching no axis.
+                std::array<double, 3> storeGrid{0.0, 0.0, 0.0};
                 try {
-                    ratioX = static_cast<double>(stampedVolume->sliceWidth()) /
-                             *resolved.info.volumeWidth;
-                    ratioY = static_cast<double>(stampedVolume->sliceHeight()) /
-                             *resolved.info.volumeHeight;
-                    ratioZ = static_cast<double>(stampedVolume->numSlices()) /
-                             *resolved.info.volumeSlices;
+                    storeGrid = {static_cast<double>(stampedVolume->sliceWidth()),
+                                 static_cast<double>(stampedVolume->sliceHeight()),
+                                 static_cast<double>(stampedVolume->numSlices())};
                 } catch (...) {
-                    ratioX = ratioY = ratioZ = 0.0;
+                    storeGrid = {0.0, 0.0, 0.0};
                 }
-                if (ratioX > 0.0 && ratioY > 0.0 && ratioZ > 0.0) {
-                    const double lo = std::min({ratioX, ratioY, ratioZ});
-                    const double hi = std::max({ratioX, ratioY, ratioZ});
-                    if (hi > lo * 1.02) {
+                const std::array<double, 3> stampedGrid{
+                    static_cast<double>(*resolved.info.volumeWidth),
+                    static_cast<double>(*resolved.info.volumeHeight),
+                    static_cast<double>(*resolved.info.volumeSlices)};
+                if (storeGrid[0] > 0.0 && storeGrid[1] > 0.0 && storeGrid[2] > 0.0) {
+                    const auto storeFactor =
+                        vc::core::util::uniformRescaleFactor(stampedGrid, storeGrid);
+                    if (!storeFactor) {
                         dimensionMismatch = true;
                         label += tr(" (stamp mismatch: dimensions are not a "
                                     "uniform rescale of %1)")
@@ -6507,7 +6501,7 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
                             stampedVolume->sliceHeight(),
                             stampedVolume->numSlices());
                     } else {
-                        impliedVoxelUm *= (ratioX + ratioY + ratioZ) / 3.0;
+                        impliedVoxelUm *= *storeFactor;
                     }
                 }
             }

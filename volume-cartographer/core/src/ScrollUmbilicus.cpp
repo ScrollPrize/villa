@@ -108,26 +108,72 @@ std::vector<fs::path> umbilicusSearchRoots(const VolumePkg& pkg)
     return roots;
 }
 
-std::vector<fs::path> umbilicusCandidatePaths(const VolumePkg& pkg)
+std::vector<UmbilicusCandidate> scanUmbilicusCandidates(const VolumePkg& pkg)
 {
-    std::vector<fs::path> candidates;
+    std::vector<UmbilicusCandidate> candidates;
+
+    // The project's field short circuits the search entirely, so it is the whole
+    // dependency: no discovered file can change what the resolver answers while it
+    // is set. Included even when it does not exist, because its appearing does.
+    if (const auto configured = pkg.umbilicus(); !configured.empty()) {
+        const auto declared = pkg.umbilicusPath();
+        if (declared.empty()) {
+            // Remote or otherwise unsupported: the resolver errors without
+            // touching the filesystem, so nothing on disk is a dependency.
+            return candidates;
+        }
+        std::error_code ec;
+        UmbilicusCandidate candidate;
+        candidate.path = declared;
+        candidate.exists = fs::exists(declared, ec) && !ec;
+        candidate.decidesResolution = true;
+        candidates.push_back(std::move(candidate));
+        return candidates;
+    }
+
     std::vector<fs::path> canonical;
     for (const auto& root : umbilicusSearchRoots(pkg)) {
         for (const char* name : kUmbilicusFileNames) {
-            const fs::path candidate = root / name;
+            const fs::path path = root / name;
             // Canonical dedup, matching the search: two roots reaching one file
-            // through a symlink must count once, or a caller comparing these
-            // would see a change that did not happen.
-            const auto resolvedPath = canonicalize(candidate);
-            if (std::find(canonical.begin(), canonical.end(), resolvedPath) !=
-                canonical.end()) {
-                continue;
+            // through a symlink must count once, or a caller comparing these would
+            // see a change that did not happen. Deliberately `continue` and not
+            // `break`: skipping a duplicate must not end this root's own priority
+            // walk, or a root whose umbilicus.json is an alias of an earlier hit
+            // would go on to offer its distinct estimated_umbilicus.json.
+            const auto resolvedPath = canonicalize(path);
+            const bool duplicate =
+                std::find(canonical.begin(), canonical.end(), resolvedPath) !=
+                canonical.end();
+            std::error_code ec;
+            const bool exists = fs::exists(path, ec) && !ec;
+            if (!duplicate) {
+                canonical.push_back(resolvedPath);
+                UmbilicusCandidate candidate;
+                candidate.path = path;
+                candidate.exists = exists;
+                // Every hit is one the resolver would open — a second one makes the
+                // resolution ambiguous rather than being ignored.
+                candidate.decidesResolution = exists;
+                candidates.push_back(std::move(candidate));
             }
-            canonical.push_back(resolvedPath);
-            candidates.push_back(candidate);
+            if (exists) {
+                // The search stops at the first existing name in this root, so no
+                // lower-priority name here can affect the answer.
+                break;
+            }
         }
     }
     return candidates;
+}
+
+std::vector<fs::path> umbilicusCandidatePaths(const VolumePkg& pkg)
+{
+    std::vector<fs::path> paths;
+    for (auto& candidate : scanUmbilicusCandidates(pkg)) {
+        paths.push_back(std::move(candidate.path));
+    }
+    return paths;
 }
 
 ScrollUmbilicusResolution resolveScrollUmbilicus(const VolumePkg& pkg)
@@ -172,22 +218,12 @@ ScrollUmbilicusResolution resolveScrollUmbilicus(const VolumePkg& pkg)
 
     const auto roots = umbilicusSearchRoots(pkg);
 
+    // One scan, shared with the dependency listing: the priority walk, the
+    // per-root stop and the canonical dedup live there and nowhere else.
     std::vector<fs::path> hits;
-    std::vector<fs::path> canonicalHits;
-    for (const auto& root : roots) {
-        for (const char* name : kUmbilicusFileNames) {
-            const fs::path candidate = root / name;
-            std::error_code ec;
-            if (!fs::exists(candidate, ec) || ec) {
-                continue;
-            }
-            const auto canonical = canonicalize(candidate);
-            if (std::find(canonicalHits.begin(), canonicalHits.end(), canonical) ==
-                canonicalHits.end()) {
-                canonicalHits.push_back(canonical);
-                hits.push_back(candidate);
-            }
-            break;
+    for (auto& candidate : scanUmbilicusCandidates(pkg)) {
+        if (candidate.decidesResolution) {
+            hits.push_back(std::move(candidate.path));
         }
     }
 

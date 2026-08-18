@@ -179,6 +179,11 @@ public:
         // bare guessed factor. Carries the stamp-mismatch and registered-volume
         // notes when either check fires. Empty when no umbilicus was applied.
         QString umbilicusLabel;
+        // Which of deriveUmbilicusScale()'s readings produced the scale, unset
+        // when no umbilicus was applied. A holder needs it to know whether a
+        // changed physical voxel size reached the geometry: through stamped
+        // dimensions or grid inference it did not, and only labels are affected.
+        std::optional<vc::core::util::UmbilicusScaleSource> umbilicusScaleSource;
     };
 
     // One-line umbilicus availability summary for workspace status bars:
@@ -305,6 +310,10 @@ public:
     // changes. Attaching, detaching or repointing it emits no signal, so holders
     // of derived geometry have to compare this instead. Cheap by construction:
     // the project's field plus a stat(), never the resolver's directory search.
+    // Cheap token over everything resolveScrollUmbilicus() depends on: the
+    // project's field plus a stat() of each path the resolver's own scan reports,
+    // and no JSON parse. Size and mtime, so it is a metadata token rather than a
+    // guarantee -- a same-size rewrite inside one timestamp tick is invisible to it.
     [[nodiscard]] QString umbilicusFingerprint() const;
     [[nodiscard]] std::vector<FiberLinkOverlayInfo> fiberLinkOverlayInfos() const;
     // Bumped whenever the loaded fiber set changes (load, save, delete, and the
