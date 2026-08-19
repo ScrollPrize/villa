@@ -1124,3 +1124,86 @@ All six replay artifacts were byte-identical, all work/population counters and
 accepted backtracking depths matched, and every run retained 2 greedy / 1
 fiberlet failures. Median RSS changed by +0.2%. The module and precision
 boundary are retained without a profile-schema change.
+
+## Checkpoint 23: float final anchor evaluation
+
+### Scope and implementation
+
+1. Extend the isolated `FiberAnchorObjectives` module with the complete final
+   refined-state reduction: per-component all-site Gaussian denominator,
+   retained aligned numerator, retained presence mass, assigned count, and
+   combined objective.
+2. Keep compact production observations in float32 throughout position,
+   direction, presence, Gaussian, dot-product, and accumulation arithmetic.
+   Widen only the fixed-size final summary when it crosses into persistent
+   `RefinedEvaluation`/anchor output state. Do not preserve double merely for
+   historical numeric identity.
+3. Run the expanded public final-evaluation entry point through the same
+   float32 equation as production. Its double-valued input fields are narrowed
+   at observation access and its fixed-size result is widened at return. This
+   deliberately tests a broader float boundary; compensated double is not
+   retained merely for legacy identity.
+4. Preserve all-site denominator semantics, logical assignment/membership
+   indexing, component counts, and existing acceptance/serialization code.
+   Validate compact source indices and all input cardinalities before scanning.
+5. Remove the old templated final-evaluation scan from `FiberAnchors.cpp` once
+   both callers dispatch to the shared module. Keep no runtime compatibility
+   branch.
+
+### Quality and performance gates
+
+1. Add direct module tests for zero/one/two components, repeated and
+   nonconsecutive compact indices, unusable denominator-only evidence, assigned
+   counts/presence masses, deterministic repeats, and compact-versus-expanded
+   agreement at realistic coordinates.
+2. Add threshold-sensitive extraction coverage and compare retained/rejected
+   support decisions. Exact floating-point or artifact identity is not a gate;
+   stable populations, comparable axes/positions/support values, unchanged
+   replay-failure behavior, and deterministic output are required.
+3. Run focused GCC and linked Clang suites for `test_fiber_anchors`,
+   `test_fiberlet_paths`, and `test_fiber_replay`, plus `git diff --check`.
+4. Preserve the checkpoint-22 shared library, verify loader choice, and run
+   three alternating canonical replay pairs. Report min/median/max command
+   wall, total CPU, anchor wall/CPU, final-evaluation worker time, peak RSS,
+   populations, DP work, replay failures, and support-value differences.
+5. Retain only if the final kernel and enclosing runtime improve without a
+   material quality regression; otherwise remove and record the experiment.
+
+### Measured layout correction
+
+- The initial implementation placed final evaluation beside the checkpoint-22
+  objective kernels. Although final-evaluation work improved, it perturbed the
+  existing objective code enough to regress enclosing runtime. Split final
+  evaluation into its own translation unit and extract common observation,
+  Gaussian, and direction primitives into one private shared header before the
+  retention measurement. This is a code-generation isolation correction, not
+  a second optimization or duplicated implementation.
+
+### Spec update
+
+- If retained, state in `planning/specs.md` that compact production final
+  support reduction uses float32 and widens only fixed-size output summaries;
+  deterministic quality and acceptance behavior, not numerical identity, are
+  the contract.
+
+### Documentation update
+
+- If retained, update `volume-cartographer/docs/fiberlets.md` with the isolated
+  final-evaluation ownership and production precision boundary.
+
+### Changelog update
+
+- If retained, add a checkpoint-23 entry with measured performance and quality.
+  If rejected, record it only in the active task plan and log.
+
+### Result
+
+Accepted after strict translation-unit isolation. The initial co-located layout
+was rejected because it regressed the existing objective kernel despite making
+final evaluation faster. Restoring `FiberAnchorObjectives.cpp` byte-for-byte
+and placing final evaluation in its own translation unit returned objective and
+tensor work to baseline noise. Three fresh alternating pairs measured median
+final-evaluation work at 13.11/13.79 worker-seconds, anchor CPU at
+130.55/132.40 seconds, total CPU at 202.89/204.33 seconds, and command wall at
+9.22/9.26 seconds for candidate/baseline. All six artifacts were byte-identical
+with unchanged populations, DP relaxations, and replay failures.

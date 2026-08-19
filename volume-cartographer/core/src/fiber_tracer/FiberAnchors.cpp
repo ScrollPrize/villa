@@ -5,6 +5,7 @@
 #include "vc/fiber_tracer/detail/FiberAnchorPeakGrid.hpp"
 #include "vc/fiber_tracer/detail/FiberAnchorSupportStencil.hpp"
 #include "FiberAnchorObjectives.hpp"
+#include "FiberAnchorFinalEvaluation.hpp"
 
 #include <algorithm>
 #include <array>
@@ -142,6 +143,8 @@ struct RefinedEvaluation {
     std::array<double, 2> denominators{0.0, 0.0};
     std::array<double, 2> numerators{0.0, 0.0};
     std::array<double, 2> presenceMasses{0.0, 0.0};
+    std::array<double, 2> alignedSupports{0.0, 0.0};
+    std::array<double, 2> directionalCoherences{0.0, 0.0};
     std::array<size_t, 2> assignedCounts{0, 0};
     double objective = 0.0;
 };
@@ -973,9 +976,33 @@ objectiveComponents(const std::array<RefinedComponentState, 2>& components)
         objectiveConfig(config));
 }
 
-template <typename ObservationRange>
+[[nodiscard]] RefinedEvaluation finalEvaluationResult(
+    const detail::FiberAnchorFinalEvaluation& reduced,
+    const std::vector<uint8_t>& assignments,
+    const std::vector<uint8_t>& retainedInliers)
+{
+    RefinedEvaluation evaluation;
+    evaluation.assignments = assignments;
+    evaluation.retainedInliers = retainedInliers;
+    for (size_t component = 0; component < 2; ++component) {
+        evaluation.denominators[component] =
+            static_cast<double>(reduced.denominators[component]);
+        evaluation.numerators[component] =
+            static_cast<double>(reduced.numerators[component]);
+        evaluation.presenceMasses[component] =
+            static_cast<double>(reduced.presenceMasses[component]);
+        evaluation.alignedSupports[component] =
+            static_cast<double>(reduced.alignedSupports[component]);
+        evaluation.directionalCoherences[component] =
+            static_cast<double>(reduced.directionalCoherences[component]);
+        evaluation.assignedCounts[component] = reduced.assignedCounts[component];
+    }
+    evaluation.objective = static_cast<double>(reduced.objective);
+    return evaluation;
+}
+
 [[nodiscard]] RefinedEvaluation evaluateFinalRefinedState(
-    const ObservationRange& observations,
+    const std::vector<FiberAnchorObservation>& observations,
     const std::array<RefinedComponentState, 2>& components,
     size_t activeComponents,
     const std::vector<uint8_t>& assignments,
@@ -983,46 +1010,28 @@ template <typename ObservationRange>
     const cv::Vec3d& pivot,
     const FiberAnchorConfig& config)
 {
-    RefinedEvaluation evaluation;
-    evaluation.assignments = assignments;
-    evaluation.retainedInliers = retainedInliers;
-    std::array<CompensatedSum, 2> denominators;
-    std::array<CompensatedSum, 2> numerators;
-    std::array<CompensatedSum, 2> presenceMasses;
-    for (size_t index = 0; index < observations.size(); ++index) {
-        const auto& observation = observations[index];
-        for (size_t component = 0; component < activeComponents; ++component) {
-            denominators[component].add(transverseGaussian(
-                observation, components[component], pivot, config));
-        }
-        const uint8_t assigned = assignments[index];
-        if (!retainedInliers[index] || assigned >= activeComponents)
-            continue;
-        cv::Vec3d direction;
-        if (!usableDirectionObservation(observation, config, direction))
-            continue;
-        const double gaussian = transverseGaussian(
-            observation, components[assigned], pivot, config);
-        const double dot = direction.dot(components[assigned].axis);
-        numerators[assigned].add(
-            gaussian * observationPresence(observation) * dot * dot);
-        presenceMasses[assigned].add(
-            gaussian * observationPresence(observation));
-        ++evaluation.assignedCounts[assigned];
-    }
-    CompensatedSum numeratorTotal;
-    CompensatedSum denominatorTotal;
-    for (size_t component = 0; component < activeComponents; ++component) {
-        evaluation.denominators[component] = denominators[component].sum;
-        evaluation.numerators[component] = numerators[component].sum;
-        evaluation.presenceMasses[component] = presenceMasses[component].sum;
-        numeratorTotal.add(numerators[component].sum);
-        denominatorTotal.add(denominators[component].sum);
-    }
-    evaluation.objective = denominatorTotal.sum > 0.0
-        ? numeratorTotal.sum / denominatorTotal.sum
-        : 0.0;
-    return evaluation;
+    return finalEvaluationResult(
+        detail::finalAnchorEvaluationExpanded(
+            observations, objectiveComponents(components), activeComponents,
+            assignments, retainedInliers, pivot, objectiveConfig(config)),
+        assignments, retainedInliers);
+}
+
+[[nodiscard]] RefinedEvaluation evaluateFinalRefinedState(
+    const IndexedObservationRange<CompactFiberAnchorObservation>& observations,
+    const std::array<RefinedComponentState, 2>& components,
+    size_t activeComponents,
+    const std::vector<uint8_t>& assignments,
+    const std::vector<uint8_t>& retainedInliers,
+    const cv::Vec3d& pivot,
+    const FiberAnchorConfig& config)
+{
+    return finalEvaluationResult(
+        detail::finalAnchorEvaluationCompact(
+            observations.observationStorage(), observations.observationIndices(),
+            objectiveComponents(components), activeComponents, assignments,
+            retainedInliers, pivot, objectiveConfig(config)),
+        assignments, retainedInliers);
 }
 
 template <typename ObservationRange>
@@ -2700,21 +2709,17 @@ FiberCellAnchorResult fitFiberCellAnchorsImpl(
         component.diagnosticId = refined.componentIds[componentIndex];
         component.diagnosticParentIds = {
             refined.componentIds[componentIndex]};
-        const double denominatorValue = refined.evaluation.denominators[componentIndex];
         const double numeratorValue = refined.evaluation.numerators[componentIndex];
-        const double presenceMass = refined.evaluation.presenceMasses[componentIndex];
         component.assignedObservationCount =
             refined.evaluation.assignedCounts[componentIndex];
         component.anchor.axisXYZ =
             canonicalFiberAxis(refined.components[componentIndex].axis);
         component.anchor.positionPredictionXYZ =
             refined.components[componentIndex].position;
-        component.anchor.alignedSupport = denominatorValue > 0.0
-            ? numeratorValue / denominatorValue
-            : 0.0;
-        component.anchor.directionalCoherence = presenceMass > 0.0
-            ? numeratorValue / presenceMass
-            : 0.0;
+        component.anchor.alignedSupport =
+            refined.evaluation.alignedSupports[componentIndex];
+        component.anchor.directionalCoherence =
+            refined.evaluation.directionalCoherences[componentIndex];
         component.anchor.refinementScore = component.anchor.alignedSupport;
         component.anchor.refinementIterations = refined.acceptedIterations;
         if (component.assignedObservationCount == 0 || !(numeratorValue > 0.0)) {

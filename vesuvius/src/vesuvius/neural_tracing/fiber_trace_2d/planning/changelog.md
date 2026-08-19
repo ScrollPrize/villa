@@ -1,3 +1,10 @@
+# 2026-08-19: float final anchor support reduction
+
+- Isolated final refined-anchor evaluation in its own translation unit and kept
+  both compact and expanded observation paths in checked float32 arithmetic.
+- Reduced canonical final-evaluation worker time by 4.9%, anchor CPU by 1.4%,
+  and total wall by 0.4% with byte-identical replay artifacts.
+
 # 2026-08-18: solve-local fiberlet DP reuse
 
 - Cached normalized scoring inputs once per retained node and reused each

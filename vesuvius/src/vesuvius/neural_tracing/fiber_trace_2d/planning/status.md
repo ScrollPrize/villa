@@ -57,6 +57,17 @@
 - [x] Run focused GCC and Clang validation.
 - [x] Run three canonical checkpoint 10 replays and compare quality/performance.
 - [x] Update specifications, user documentation, changelog, and task log.
+- [x] Obtain approval for checkpoint 23 float final evaluation.
+- [x] Plan checkpoint 23 and its precision, quality, and performance gates.
+- [x] Independently review checkpoint 23 against task and specifications.
+- [x] Preserve and loader-verify the checkpoint-22 shared-library baseline.
+- [x] Implement isolated compact-float final evaluation without production
+  float/double round trips.
+- [x] Add direct final-reduction and threshold-sensitive quality coverage.
+- [x] Run focused GCC and linked Clang validation.
+- [x] Run three alternating canonical benchmark pairs and compare quality.
+- [x] Retain or remove checkpoint 23 based on measured results.
+- [x] Update checkpoint 23 records and retained documentation.
 - [x] Obtain approval for checkpoint 19 plain float tensor accumulation.
 - [x] Plan checkpoint 19 and its quality/performance gates.
 - [x] Independently review checkpoint 19 against task and specifications.

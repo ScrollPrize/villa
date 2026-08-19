@@ -139,3 +139,9 @@ Checkpoint 22 retests that demonstrated compact-float objective kernel in a
 separate translation unit so its code generation cannot perturb the robust
 tensor-proposal implementation. Keep the expanded public fitter on its existing
 double path and retain the experiment only if enclosing runtime improves.
+
+Checkpoint 23 moves final refined-anchor support evaluation to float32 for both
+compact production and expanded public observations. Do not preserve double
+arithmetic merely for historical identity; safely narrow public values, compute
+support/coherence/objective in float, and retain the change only if canonical
+quality and enclosing performance remain acceptable.

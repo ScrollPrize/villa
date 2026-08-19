@@ -3171,6 +3171,16 @@
   and serialized output remain double precision. Peak ties and downstream DP
   counts need not be numerically identical, but retained populations and replay
   quality must be checked on the canonical workload.
+- Final refined-anchor support evaluation uses one float32 reduction for both
+  compact production observations and expanded public observations. Compact
+  fields are consumed directly; expanded positions, directions, and presence
+  are range-checked before narrowing, and expanded directions are normalized
+  safely in float32. All finite-position sites contribute to the Gaussian
+  denominator independently of direction/presence usability or robust
+  membership. Aligned support, directional coherence, and combined objective
+  are computed before the fixed-size result widens into persistent double
+  anchor state. Exact numeric identity is not required; deterministic support
+  classification and canonical replay quality are the contract.
 - The bounded direction-conditioned peak grid uses a checked row-major layout.
   Physical grid points and feasibility are constructed once in canonical
   first/second-index order; computed response values use direct cache slots

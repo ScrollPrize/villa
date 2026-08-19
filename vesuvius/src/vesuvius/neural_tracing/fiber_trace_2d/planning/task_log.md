@@ -1066,3 +1066,61 @@
   zero, and produced 2 greedy / 1 fiberlet failures. All six artifacts retained
   SHA-256 `9ad06d494b886dc4e256e1adadc3cb12e70fee051c3292895a4593a475efa472`.
   Checkpoint 22 is retained; no profile-schema change was needed.
+
+## Checkpoint 23: float final anchor evaluation
+
+- User rejected treating compensated double arithmetic as intrinsically
+  required for final support evaluation. The production compact path will stay
+  float32 through observation access, Gaussian/direction math, and accumulators,
+  widening only the fixed-size summary at the persistent output boundary.
+- Numerical identity is explicitly not an acceptance requirement. The gates are
+  deterministic repeatability, stable support/acceptance decisions, comparable
+  anchor geometry and downstream replay quality, and measured enclosing speed.
+- The expanded/public final-evaluation dispatch will exercise the same float32
+  equation as production rather than retaining a compensated-double special
+  case. Its source doubles narrow on access and only the fixed summary widens.
+- The first three-pair layout improved median final-evaluation work from 13.68
+  to 12.35 worker-seconds (-9.7%), but co-locating it with checkpoint 22's
+  objective kernels regressed local objective work from 14.03 to 20.09 seconds
+  (+43.2%). Median anchor CPU rose from 131.87 to 136.90 seconds and command
+  wall from 9.14 to 9.40 seconds. All six artifacts remained byte-identical
+  with unchanged populations, DP work, and failures.
+- This layout is rejected. The shared low-level equation will be extracted to a
+  private header and final evaluation moved to a separate translation unit so
+  it cannot perturb objective code generation. The isolated layout will be
+  rebuilt and measured as the actual checkpoint candidate.
+- Independent review approved strict isolation and required fresh measurements,
+  checked public narrowing, scale-safe expanded normalization, float-derived
+  support/coherence/objective ratios, denominator/count edge coverage, and GCC
+  plus linked Clang validation. The implementation and tests include each item.
+- The attempted shared-helper extraction still left local objective work at
+  20.89 worker-seconds. The final correction restored
+  `FiberAnchorObjectives.cpp` byte-for-byte to checkpoint 22 and extracted the
+  pre-existing final-reduction behavior into its own private implementation.
+  A screening run restored objective/tensor work to 13.69/22.54 seconds.
+- Three fresh pairs alternated candidate-1, baseline-1, candidate-2,
+  baseline-2, candidate-3, baseline-3. Both used the same QuickBuild executable,
+  warm local Paris4 inputs, 32 threads, a 5,000-base-voxel replay, and explicitly
+  loader-verified libraries (candidate SHA-256
+  `239b1ebdbae79f8e0df2a5dcdc6a05286d21de61f0f74d66257c31023e91bf90`; baseline
+  SHA-256 `87a47e9c5f73c15a8f39dc09a049a2f85fbbce6db165e4d20d0e92620550d8e4`).
+- Controlled min/median/max results were:
+
+  | metric | float final | checkpoint 22 | median change |
+  |---|---:|---:|---:|
+  | command wall | 9.02 / 9.22 / 9.32 s | 9.11 / 9.26 / 9.43 s | -0.4% |
+  | total CPU | 199.84 / 202.89 / 203.88 s | 202.81 / 204.33 / 206.03 s | -0.7% |
+  | anchor wall | 4.888 / 5.043 / 5.134 s | 5.016 / 5.103 / 5.212 s | -1.2% |
+  | anchor CPU | 128.26 / 130.55 / 131.52 s | 131.27 / 132.40 / 133.30 s | -1.4% |
+  | final evaluation | 12.73 / 13.11 / 13.12 s | 13.56 / 13.79 / 13.84 s | -4.9% |
+  | local objective | 13.71 / 14.10 / 14.14 s | 13.94 / 14.05 / 14.20 s | +0.4% |
+  | tensor proposal | 22.45 / 23.08 / 23.09 s | 22.79 / 23.09 / 23.41 s | -0.0% |
+  | peak RSS | 2,121,456 / 2,121,656 / 2,158,252 KiB | 2,107,536 / 2,116,432 / 2,131,040 KiB | +0.2% |
+
+- Every run retained 2,603 anchors, 2,560 graph nodes, 26,494 edges,
+  62,970,388 DP relaxations, and 2 greedy / 1 fiberlet failures. All artifacts
+  retained SHA-256
+  `9ad06d494b886dc4e256e1adadc3cb12e70fee051c3292895a4593a475efa472`.
+  Direct tests cover compact/public support and coherence agreement, threshold
+  equality and adjacent decisions, checked nonrepresentable inputs, and exact
+  assigned-count/denominator semantics. Checkpoint 23 is retained.

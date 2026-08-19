@@ -7,6 +7,7 @@
 #include "vc/lasagna/Dataset.hpp"
 #include "utils/zarr.hpp"
 #include "../src/fiber_tracer/FiberAnchorObjectives.hpp"
+#include "../src/fiber_tracer/FiberAnchorFinalEvaluation.hpp"
 
 #include <algorithm>
 #include <array>
@@ -157,6 +158,161 @@ TEST_CASE("fiber anchor objective denominator includes unusable evidence sites")
     CHECK(detail::retainedSpatialObjectiveCompact(
         observations, cutoffIndices, components, 1, cutoffAssignments,
         cutoffRetained, pivot, options) == 1.0);
+}
+
+TEST_CASE("fiber anchor final evaluation preserves indexed support semantics")
+{
+    namespace detail = vc::fiber_tracer::detail;
+    const detail::FiberAnchorObjectiveConfig options{1.0, 3.0, 6.0, 0.05};
+    const cv::Vec3d pivot{20000.0, 20000.0, 20000.0};
+    const std::array<detail::FiberAnchorObjectiveComponent, 2> components{{
+        {{1.0, 0.0, 0.0}, pivot},
+        {{0.0, 1.0, 0.0}, pivot},
+    }};
+    std::vector<detail::CompactFiberAnchorObservation> storage(5);
+    const auto setObservation = [&](size_t index, const cv::Vec3f& position,
+                                    const cv::Vec3f& direction, float presence,
+                                    bool valid) {
+        storage[index].positionPredictionXYZ = position;
+        storage[index].direction = direction;
+        storage[index].presence = presence;
+        storage[index].valid = valid;
+    };
+    setObservation(1, {20000.0F, 20001.0F, 20000.0F},
+        {1.0F, 0.0F, 0.0F}, 0.75F, true);
+    setObservation(3, {20000.0F, 20000.0F, 20000.0F},
+        {1.0F, 0.0F, 0.0F}, 1.0F, true);
+    setObservation(4, {20001.0F, 20000.0F, 20000.0F},
+        {0.0F, 1.0F, 0.0F}, 0.6F, true);
+    const std::vector<uint32_t> indices{3, 1, 3, 4};
+    const std::vector<uint8_t> assignments{0, 0, 0, 1};
+    const std::vector<uint8_t> retained{1, 1, 0, 1};
+
+    std::vector<FiberAnchorObservation> expanded;
+    for (const uint32_t index : indices) {
+        const auto& source = storage[index];
+        expanded.push_back({
+            cv::Vec3d{source.positionPredictionXYZ},
+            cv::Vec3d{source.direction},
+            static_cast<double>(source.presence),
+            source.valid,
+        });
+    }
+    const auto compact = detail::finalAnchorEvaluationCompact(
+        storage, indices, components, 2, assignments, retained, pivot, options);
+    const auto repeated = detail::finalAnchorEvaluationCompact(
+        storage, indices, components, 2, assignments, retained, pivot, options);
+    const auto publicResult = detail::finalAnchorEvaluationExpanded(
+        expanded, components, 2, assignments, retained, pivot, options);
+    CHECK(compact.denominators == repeated.denominators);
+    CHECK(compact.numerators == repeated.numerators);
+    CHECK(compact.presenceMasses == repeated.presenceMasses);
+    CHECK((compact.assignedCounts == std::array<size_t, 2>{2, 1}));
+    CHECK(compact.assignedCounts == repeated.assignedCounts);
+    CHECK(compact.objective == repeated.objective);
+    for (size_t component = 0; component < 2; ++component) {
+        CHECK(compact.denominators[component] ==
+              doctest::Approx(publicResult.denominators[component]).epsilon(1.0e-6));
+        CHECK(compact.numerators[component] ==
+              doctest::Approx(publicResult.numerators[component]).epsilon(1.0e-6));
+        CHECK(compact.presenceMasses[component] ==
+              doctest::Approx(publicResult.presenceMasses[component]).epsilon(1.0e-6));
+    }
+    CHECK(compact.objective ==
+          doctest::Approx(publicResult.objective).epsilon(1.0e-6));
+
+    const auto inactive = detail::finalAnchorEvaluationCompact(
+        storage, indices, components, 0, assignments, retained, pivot, options);
+    CHECK(inactive.objective == 0.0F);
+    CHECK((inactive.assignedCounts == std::array<size_t, 2>{0, 0}));
+    CHECK_THROWS_AS(detail::finalAnchorEvaluationCompact(
+        storage, indices, components, 2, std::span<const uint8_t>{}, retained,
+        pivot, options), std::invalid_argument);
+    const std::vector<uint32_t> invalidIndices{
+        static_cast<uint32_t>(storage.size())};
+    const std::vector<uint8_t> one{1};
+    CHECK_THROWS_AS(detail::finalAnchorEvaluationCompact(
+        storage, invalidIndices, components, 1, one, one, pivot, options),
+        std::out_of_range);
+}
+
+TEST_CASE("fiber anchor final evaluation includes unusable denominator sites")
+{
+    namespace detail = vc::fiber_tracer::detail;
+    const detail::FiberAnchorObjectiveConfig options{1.0, 3.0, 6.0, 0.05};
+    const cv::Vec3d pivot{0.0, 0.0, 0.0};
+    const std::array<detail::FiberAnchorObjectiveComponent, 2> components{{
+        {{1.0, 0.0, 0.0}, pivot},
+        {{0.0, 1.0, 0.0}, pivot},
+    }};
+    std::vector<detail::CompactFiberAnchorObservation> observations(5);
+    for (auto& observation : observations) {
+        observation.positionPredictionXYZ = {0.0F, 0.0F, 0.0F};
+        observation.direction = {1.0F, 0.0F, 0.0F};
+        observation.presence = 1.0F;
+        observation.valid = true;
+    }
+    observations[1].valid = false;
+    observations[2].presence = 0.0F;
+    observations[3].presence = std::numeric_limits<float>::quiet_NaN();
+    observations[4].positionPredictionXYZ[0] =
+        std::numeric_limits<float>::quiet_NaN();
+    const std::vector<uint32_t> indices{0, 1, 2, 3, 4};
+    const std::vector<uint8_t> assignments(indices.size(), 0);
+    const std::vector<uint8_t> retained(indices.size(), 1);
+    const auto result = detail::finalAnchorEvaluationCompact(
+        observations, indices, components, 1, assignments, retained, pivot,
+        options);
+    CHECK(result.denominators[0] == 4.0F);
+    CHECK(result.numerators[0] == 1.0F);
+    CHECK(result.presenceMasses[0] == 1.0F);
+    // Assigned counts describe usable retained direction observations even
+    // when their spatial Gaussian is zero because the position is unusable.
+    CHECK(result.assignedCounts[0] == 2);
+    CHECK(result.objective == 0.25F);
+}
+
+TEST_CASE("fiber anchor expanded final evaluation narrows safely")
+{
+    namespace detail = vc::fiber_tracer::detail;
+    const detail::FiberAnchorObjectiveConfig options{1.0, 3.0, 6.0, 0.05};
+    const cv::Vec3d pivot{0.0, 0.0, 0.0};
+    const std::array<detail::FiberAnchorObjectiveComponent, 2> components{{
+        {{1.0, 0.0, 0.0}, pivot},
+        {{0.0, 1.0, 0.0}, pivot},
+    }};
+    const double huge = std::numeric_limits<double>::max();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    std::vector<FiberAnchorObservation> observations{
+        {{0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 1.0, true},
+        {{0.0, 0.0, 0.0}, {10.0, 0.0, 0.0}, 1.0, true},
+        {{0.0, 0.0, 0.0}, {1.0e-20, 0.0, 0.0}, 1.0, true},
+        {{0.0, 0.0, 0.0}, {huge, 0.0, 0.0}, 1.0, true},
+        {{0.0, 0.0, 0.0}, {inf, 0.0, 0.0}, 1.0, true},
+        {{0.0, 0.0, 0.0}, {nan, 0.0, 0.0}, 1.0, true},
+        {{huge, 0.0, 0.0}, {1.0, 0.0, 0.0}, 1.0, true},
+        {{0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, huge, true},
+        {{0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, nan, true},
+    };
+    const std::vector<uint8_t> assignments(observations.size(), 0);
+    const std::vector<uint8_t> retained(observations.size(), 1);
+    const auto result = detail::finalAnchorEvaluationExpanded(
+        observations, components, 1, assignments, retained, pivot, options);
+    CHECK(result.denominators[0] == 8.0F);
+    CHECK(result.numerators[0] == 2.0F);
+    CHECK(result.presenceMasses[0] == 2.0F);
+    CHECK(result.assignedCounts[0] == 3);
+    CHECK(result.alignedSupports[0] == 0.25F);
+    CHECK(result.directionalCoherences[0] == 1.0F);
+    CHECK(result.objective == 0.25F);
+
+    const std::vector<uint8_t> discarded(observations.size(), 0);
+    const auto denominatorOnly = detail::finalAnchorEvaluationExpanded(
+        observations, components, 1, assignments, discarded, pivot, options);
+    CHECK(denominatorOnly.denominators == result.denominators);
+    CHECK(denominatorOnly.numerators[0] == 0.0F);
+    CHECK(denominatorOnly.assignedCounts[0] == 0);
 }
 
 TEST_CASE("fiber anchor peak grid layout maps every bounded coordinate directly")
@@ -543,6 +699,20 @@ TEST_CASE("compact float robust proposal matches a stable double fit")
         CHECK_MESSAGE(bestPositionDelta < 0.05,
             std::string("position_delta=") +
                 std::to_string(bestPositionDelta));
+        double bestSupportDelta = std::numeric_limits<double>::infinity();
+        double bestCoherenceDelta = std::numeric_limits<double>::infinity();
+        for (const auto& actual : compact.components) {
+            if (!actual.retained)
+                continue;
+            bestSupportDelta = std::min(bestSupportDelta,
+                std::abs(actual.anchor.alignedSupport -
+                    expected.anchor.alignedSupport));
+            bestCoherenceDelta = std::min(bestCoherenceDelta,
+                std::abs(actual.anchor.directionalCoherence -
+                    expected.anchor.directionalCoherence));
+        }
+        CHECK(bestSupportDelta < 1.0e-5);
+        CHECK(bestCoherenceDelta < 1.0e-5);
     }
 }
 
@@ -1213,6 +1383,35 @@ TEST_CASE("fiber anchor support threshold is inclusive")
     options.minimumAlignedSupport = baseline.components[0].anchor.alignedSupport;
     const auto boundary = vc::fiber_tracer::fitFiberCellAnchors({0, 0, 0}, {0, 0, 0}, {4, 4, 4}, observations, options);
     CHECK(boundary.retainedAnchorCount == 1);
+}
+
+TEST_CASE("fiber anchor support threshold distinguishes adjacent values")
+{
+    auto observations = cellObservations(
+        4, {1.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, 0.05);
+    auto options = config();
+    options.minimumAlignedSupport = 0.001;
+    const auto baseline = vc::fiber_tracer::fitFiberCellAnchors(
+        {0, 0, 0}, {0, 0, 0}, {4, 4, 4}, observations, options);
+    REQUIRE(baseline.retainedAnchorCount == 2);
+    const double weaker = std::min(
+        baseline.components[0].anchor.alignedSupport,
+        baseline.components[1].anchor.alignedSupport);
+
+    options.minimumAlignedSupport = weaker;
+    CHECK(vc::fiber_tracer::fitFiberCellAnchors(
+        {0, 0, 0}, {0, 0, 0}, {4, 4, 4}, observations, options)
+              .retainedAnchorCount == 2);
+    options.minimumAlignedSupport =
+        std::nextafter(weaker, std::numeric_limits<double>::infinity());
+    CHECK(vc::fiber_tracer::fitFiberCellAnchors(
+        {0, 0, 0}, {0, 0, 0}, {4, 4, 4}, observations, options)
+              .retainedAnchorCount == 1);
+    options.minimumAlignedSupport =
+        std::nextafter(weaker, -std::numeric_limits<double>::infinity());
+    CHECK(vc::fiber_tracer::fitFiberCellAnchors(
+        {0, 0, 0}, {0, 0, 0}, {4, 4, 4}, observations, options)
+              .retainedAnchorCount == 2);
 }
 
 TEST_CASE("fiber anchor refinement centers an off-center halo-supported fiber without axial motion")

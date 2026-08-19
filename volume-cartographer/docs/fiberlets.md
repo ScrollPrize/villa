@@ -664,10 +664,24 @@ index. Gaussian, alignment, ordinary numerator/denominator sums, and final
 ratio are float32. Every finite-position site contributes to all active
 denominators before evidence eligibility is checked. The public expanded path
 uses the same objective equation with normalized directions and compensated
-double sums; persistent state and final support remain double. On the canonical
+double sums; persistent component and accepted-position state remain double. On the canonical
 replay, isolation reduced median local-state objective work from 22.59 to 13.86
 worker-seconds, anchor CPU from 140.80 to 130.74 seconds, and command wall from
 9.56 to 9.17 seconds, with byte-identical replay artifacts.
+
+Final support evaluation is independently isolated from both the anchor fitter
+and fixed-direction objective kernels. Compact production observations remain
+float32 throughout Gaussian, direction, presence, and accumulation arithmetic.
+The expanded public fitter uses the same float32 reduction after checked
+narrowing and scale-safe direction normalization. Per-component aligned
+support/coherence and the combined objective are computed in float, then the
+fixed-size result widens into the existing double output fields. Invalid or
+unrepresentable public evidence cannot enter a numerator; a finite-position
+site still contributes to every active denominator regardless of membership or
+direction usability. On the canonical replay, median final-evaluation work fell
+from 13.79 to 13.11 worker-seconds, anchor CPU from 132.40 to 130.55 seconds,
+and command wall from 9.26 to 9.22 seconds, with byte-identical artifacts and
+unchanged replay work/failures.
 
 Version 4 reports robust components with no detected outliers, trimmed
 components, candidate/actual trimmed and retained mass, components removed for
