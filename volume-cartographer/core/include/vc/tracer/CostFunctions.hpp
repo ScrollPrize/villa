@@ -101,6 +101,8 @@ private:
     CachedChunked3dInterpolator<uint8_t, passTroughComputor> _interp_frac;
 };
 
+struct DistLossAnalytic;
+
 struct DistLoss {
     DistLoss(float dist, float w) : _d(dist), _w(w) {};
     template <typename T>
@@ -141,11 +143,81 @@ struct DistLoss {
     double _d;
     double _w;
 
-    static ceres::CostFunction* Create(float d, float w = 1.0)
-    {
-        return new ceres::AutoDiffCostFunction<DistLoss, 1, 3, 3>(new DistLoss(d, w));
-    }
+    static ceres::CostFunction* Create(float d, float w = 1.0);
 };
+
+struct DistLossAnalytic : public ceres::SizedCostFunction<1, 3, 3> {
+    DistLossAnalytic(double dist, double w) : _d(dist), _w(w) {}
+
+    bool Evaluate(double const* const* parameters, double* residuals, double** jacobians) const override
+    {
+        const double* a = parameters[0];
+        const double* b = parameters[1];
+
+        auto zero_jacobians = [&]() {
+            if (!jacobians) return;
+            if (jacobians[0]) jacobians[0][0] = jacobians[0][1] = jacobians[0][2] = 0.0;
+            if (jacobians[1]) jacobians[1][0] = jacobians[1][1] = jacobians[1][2] = 0.0;
+        };
+
+        if (a[0] == -1 && a[1] == -1 && a[2] == -1) {
+            residuals[0] = 0.0;
+            std::cout << "invalid DistLoss CORNER" << std::endl;
+            zero_jacobians();
+            return true;
+        }
+        if (b[0] == -1 && b[1] == -1 && b[2] == -1) {
+            residuals[0] = 0.0;
+            std::cout << "invalid DistLoss CORNER" << std::endl;
+            zero_jacobians();
+            return true;
+        }
+
+        double d[3] = { a[0] - b[0], a[1] - b[1], a[2] - b[2] };
+        double dist_sq = d[0]*d[0] + d[1]*d[1] + d[2]*d[2];
+        const double d_sq = _d * _d;
+
+        if (dist_sq <= 0.0) {
+            residuals[0] = _w * (dist_sq - 1.0);
+            zero_jacobians();
+            return true;
+        }
+
+        const double dist = std::sqrt(dist_sq);
+        double g;
+        if (dist_sq < d_sq) {
+            residuals[0] = _w * (_d / dist - 1.0);
+            g = -_w * _d / dist_sq;
+        } else {
+            residuals[0] = _w * (dist / _d - 1.0);
+            g = _w / _d;
+        }
+
+        if (jacobians) {
+            const double inv_dist = 1.0 / dist;
+            if (jacobians[0]) {
+                for (int i = 0; i < 3; ++i) jacobians[0][i] = g * d[i] * inv_dist;
+            }
+            if (jacobians[1]) {
+                for (int i = 0; i < 3; ++i) jacobians[1][i] = -g * d[i] * inv_dist;
+            }
+        }
+        return true;
+    }
+
+    double _d;
+    double _w;
+};
+
+inline ceres::CostFunction* CreateDistLossAnalytic(float d, float w = 1.0)
+{
+    return new DistLossAnalytic(d, w);
+}
+
+inline ceres::CostFunction* DistLoss::Create(float d, float w)
+{
+    return new DistLossAnalytic(d, w);
+}
 
 struct DistLoss2D {
     DistLoss2D(float dist, float w) : _d(dist), _w(w) {};
