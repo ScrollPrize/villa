@@ -7,6 +7,8 @@
 #include <system_error>
 
 static const std::filesystem::path METADATA_FILE = "meta.json";
+static constexpr const char* OPEN_DATA_LAZY_PLACEHOLDER_KEY =
+    "vc_open_data_lazy_placeholder";
 
 Segmentation::Segmentation(std::filesystem::path path)
     : path_(std::move(path))
@@ -106,6 +108,15 @@ bool Segmentation::canLoadSurface() const
         return false;
     }
 
+    // Catalog placeholders intentionally contain only metadata until the user
+    // selects one. QuadSurface can construct their lightweight tree-row model
+    // from scale/tiff_dimensions without touching the absent TIFF payload.
+    if (metadata_.contains(OPEN_DATA_LAZY_PLACEHOLDER_KEY) &&
+        metadata_[OPEN_DATA_LAZY_PLACEHOLDER_KEY].is_boolean() &&
+        metadata_[OPEN_DATA_LAZY_PLACEHOLDER_KEY].get_bool()) {
+        return true;
+    }
+
     // loadSurface() only reads meta.json; the x/y/z.tif payload is read lazily
     // by QuadSurface::ensureLoaded() on first geometry access. That access
     // typically happens deep inside a Qt slot (focus marker, intersections,
@@ -118,11 +129,7 @@ bool Segmentation::canLoadSurface() const
     for (const auto* band : {"x.tif", "y.tif", "z.tif"}) {
         std::error_code ec;
         if (!std::filesystem::exists(path_ / band, ec) || ec) {
-            // Open Data placeholders carry catalog-origin.json instead of a
-            // payload; they must register so the fetch/materialize path can
-            // run, and app code guards geometry access for them.
-            std::error_code originEc;
-            return std::filesystem::exists(path_ / "catalog-origin.json", originEc) && !originEc;
+            return false;
         }
     }
     return true;
