@@ -571,7 +571,7 @@ sampling, search, and total wall times. Use identical manifests, fiber, options,
 build type, and interval for before/after performance comparisons.
 
 Benchmark and replay extraction also emit a versioned
-`fiberlet_extraction_profile version=17` row. Both commands use the same field
+`fiberlet_extraction_profile version=19` row. Both commands use the same field
 names and units. Replay writes the row to stderr after full tube extraction;
 benchmark writes it to stdout after the existing summary. The row separates:
 
@@ -771,13 +771,20 @@ order after constant-time tile-shape, bounds-containment, and owned-cardinality
 validation. Refinement continues to use the support indices and gradient bytes.
 
 Version 7 reports tile-halo sampling explicitly. Six-cell tiles are paired
-deterministically by maximum overlapping sample volume while preserving at
-least one independent job per pair. The first tile is sampled normally; the
-second copies bit-identical raw prediction samples from the overlap and submits
-only missing coordinates. Gradient construction, compact observations, and
-cell iteration remain tile-local and unchanged. Group memory includes both the
-active tile working set and retained raw samples and remains bounded by
-`maximumConcurrentSampleBytes`.
+deterministically by maximum overlapping sample volume when the staged pair
+fits `maximumConcurrentSampleBytes`, while preserving at least one independent
+job per pair. The first tile is sampled normally; the second copies
+bit-identical raw prediction samples from the overlap and submits only missing
+coordinates. Gradient construction and compact observations remain tile-local.
+
+Prepared cells use a cooperative queue shared by the bounded group workers.
+The owner retains each tile's immutable compact observations until all of its
+cells finish, and only then releases the tile or advances to the paired tile.
+This work-balances fitting tails without retaining additional sampled groups,
+changing overlap reuse, or changing within-cell observation order. Version 19
+profile fields report p50, p95, and maximum complete-group, tile-preparation,
+and cell-processing durations; complete-group duration includes both
+preparation and cell work.
 
 `anchor_sampling_groups` counts independent jobs,
 `anchor_reused_prediction_voxels` counts copied overlap,

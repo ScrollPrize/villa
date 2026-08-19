@@ -1391,6 +1391,28 @@ unchanged populations and DP work, and 2 greedy / 1 fiberlet failures.
 4. Compare anchor wall/CPU, worker utilization and tail, sample reuse, peak
    memory, deterministic output, and replay quality.
 
+Result: retained. Measurement-only schema-19 timing found complete group jobs
+at 1.013 seconds median, 3.172 seconds p95, and 4.027 seconds maximum, while
+individual cells were 8.11 milliseconds median, 11.85 milliseconds p95, and
+28.78 milliseconds maximum. The implementation keeps group owners and tile
+storage bounded as before, but publishes each prepared tile's cells to a
+cooperative queue that every extraction worker can drain. Owners wait for all
+dependent cells before releasing observations or advancing overlap reuse. An
+existing admission gap was also closed: two tiles are paired only if their
+staged peak fits `maximumConcurrentSampleBytes`.
+
+Three warm canonical runs measured command wall at 6.97 / 6.97 / 6.99 seconds,
+total CPU at 193.91 / 194.12 / 194.37 seconds, anchor wall at
+4.251 / 4.262 / 4.264 seconds, anchor CPU at 126.97 / 126.98 / 127.42 seconds,
+and peak RSS at 1,684,328 / 1,687,504 / 1,709,368 KiB. Against checkpoint 26
+medians, command wall improved 10.3%, anchor wall 15.9%, total CPU 1.1%, and
+anchor CPU 2.2%; fiberlet wall remained effectively flat. Median maximum group
+job duration fell to 1.647 seconds. All runs retained exact replay SHA-256
+`f2b8e679c23470d1221f7930a21b0c37fa0906845de0bc2cbf3e8ab7329f78ee`,
+exact fiberlet-route SHA-256
+`1ec7df7b8d2417ddc762652be3bf0057eef8b93a329a24d36f02a8837465014b`,
+unchanged populations and DP work, and 2 greedy / 1 fiberlet failures.
+
 ### Checkpoint 28: peak Gaussian acceleration
 
 1. Isolate the radial Gaussian cost inside the scalar sequential response

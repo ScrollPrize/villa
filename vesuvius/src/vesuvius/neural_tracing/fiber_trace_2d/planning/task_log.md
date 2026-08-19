@@ -1270,3 +1270,47 @@
   order, and artifact SHA-256
   `f2b8e679c23470d1221f7930a21b0c37fa0906845de0bc2cbf3e8ab7329f78ee`.
   Checkpoint 26 is retained.
+
+## Checkpoint 27: cooperative ready-cell anchor scheduling
+
+- Added schema-19 p50/p95/maximum timings for complete group jobs, tile
+  preparation, and individual cell processing. The unchanged scheduler's
+  measurement run showed a 4.027-second maximum group job against a
+  28.78-millisecond maximum cell, confirming group-level load imbalance.
+- Kept sampling groups as deterministic reuse and memory-ownership units.
+  Prepared tile cells enter a shared cooperative queue; owners retain immutable
+  tile observations and help drain work until every dependent cell completes.
+  No additional sampled group or tile is retained.
+- Rejected over-budget tile pairing, closing the reviewed case where each tile
+  fit independently but the paired staging peak exceeded
+  `maximumConcurrentSampleBytes`.
+- Three warm canonical runs under
+  `volume-cartographer/build/benchmarks/checkpoint27` measured command wall at
+  6.97 / 6.97 / 6.99 seconds, total CPU at 193.91 / 194.12 / 194.37 seconds,
+  anchor wall at 4.251 / 4.262 / 4.264 seconds, anchor CPU at
+  126.97 / 126.98 / 127.42 seconds, and peak RSS at
+  1,684,328 / 1,687,504 / 1,709,368 KiB. Host process checks before and after
+  each run found no competing load above the two-core exclusion threshold.
+- Against checkpoint 26 medians, total wall improved 10.3%, anchor wall 15.9%,
+  total CPU 1.1%, and anchor CPU 2.2%. Median maximum group-job duration fell
+  from the measured 4.027 seconds to 1.647 seconds.
+- Every retained run produced exact replay SHA-256
+  `f2b8e679c23470d1221f7930a21b0c37fa0906845de0bc2cbf3e8ab7329f78ee`
+  and exact fiberlet-route SHA-256
+  `1ec7df7b8d2417ddc762652be3bf0057eef8b93a329a24d36f02a8837465014b`,
+  with 2,603 anchors, 2,562 graph nodes, 26,445 edges, 62,873,000 DP
+  relaxations, and 2 greedy / 1 fiberlet failures.
+- Independent plan review identified ownership, deadlock, and memory-accounting
+  risks in retaining several fully prepared sampling groups. The retained
+  implementation deliberately deviates from that detail: it publishes cells
+  only for the current tile and makes the owner wait while participating in the
+  same work-conserving queue. This keeps the previous tile/group memory
+  lifetime and needs no second worker pool or bounded producer queue.
+- The review requested additional active-worker occupancy and queue-depth
+  instrumentation. That was not retained: complete group-job, tile-preparation,
+  and cell-processing tails were sufficient to identify the imbalance, and the
+  measured wall-time reduction plus exact artifacts validate the scheduler.
+  No queue-depth or occupancy field is silently claimed by schema 19.
+- Validation passed GCC `test_fiber_anchors` (78), `test_fiberlet_paths` (49),
+  and `test_fiber_replay` (6), plus repository-local Clang
+  `test_fiber_anchors` (78). `git diff --check` passed.

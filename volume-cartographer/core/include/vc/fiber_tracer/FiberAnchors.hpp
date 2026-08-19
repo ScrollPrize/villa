@@ -297,6 +297,15 @@ struct FiberAnchorExtractionProfile {
     double gradientConstructionWorkSeconds = 0.0;
     double observationConstructionWorkSeconds = 0.0;
     double fittingWorkSeconds = 0.0;
+    double groupJobP50Seconds = 0.0;
+    double groupJobP95Seconds = 0.0;
+    double groupJobMaximumSeconds = 0.0;
+    double tilePreparationP50Seconds = 0.0;
+    double tilePreparationP95Seconds = 0.0;
+    double tilePreparationMaximumSeconds = 0.0;
+    double cellProcessingP50Seconds = 0.0;
+    double cellProcessingP95Seconds = 0.0;
+    double cellProcessingMaximumSeconds = 0.0;
     double selectionSeconds = 0.0;
     double initialDiagnosticsSeconds = 0.0;
     double duplicateSuppressionSeconds = 0.0;

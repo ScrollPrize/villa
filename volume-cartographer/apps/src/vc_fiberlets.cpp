@@ -591,7 +591,7 @@ void printTubeExtractionProfile(
         return encoded.str();
     };
     output << std::setprecision(17)
-           << "fiberlet_extraction_profile version=18"
+           << "fiberlet_extraction_profile version=19"
            << " anchor_elapsed_seconds=" << extraction.anchors.elapsedSeconds
            << " anchor_cpu_seconds=" << anchor.elapsedCpuSeconds
            << " anchor_profiled_seconds=" << anchorProfiledSeconds
@@ -635,6 +635,24 @@ void printTubeExtractionProfile(
            << " anchor_observation_construction_work_seconds="
            << anchor.observationConstructionWorkSeconds
            << " anchor_fitting_work_seconds=" << anchor.fittingWorkSeconds
+           << " anchor_group_job_p50_seconds="
+           << anchor.groupJobP50Seconds
+           << " anchor_group_job_p95_seconds="
+           << anchor.groupJobP95Seconds
+           << " anchor_group_job_max_seconds="
+           << anchor.groupJobMaximumSeconds
+           << " anchor_tile_preparation_p50_seconds="
+           << anchor.tilePreparationP50Seconds
+           << " anchor_tile_preparation_p95_seconds="
+           << anchor.tilePreparationP95Seconds
+           << " anchor_tile_preparation_max_seconds="
+           << anchor.tilePreparationMaximumSeconds
+           << " anchor_cell_processing_p50_seconds="
+           << anchor.cellProcessingP50Seconds
+           << " anchor_cell_processing_p95_seconds="
+           << anchor.cellProcessingP95Seconds
+           << " anchor_cell_processing_max_seconds="
+           << anchor.cellProcessingMaximumSeconds
            << " anchor_fit_invocations=" << fit.invocations
            << " anchor_fit_nonempty_cells=" << fit.nonemptyCells
            << " anchor_fit_weighted_observations=" << fit.weightedObservations

@@ -2654,6 +2654,21 @@ TEST_CASE("explicit anchor cells remain sparse and filter refinement before NMS"
     CHECK(report.profile.gradientConstructionWorkSeconds >= 0.0);
     CHECK(report.profile.observationConstructionWorkSeconds >= 0.0);
     CHECK(report.profile.fittingWorkSeconds >= 0.0);
+    CHECK(report.profile.groupJobMaximumSeconds >=
+          report.profile.groupJobP95Seconds);
+    CHECK(report.profile.groupJobP95Seconds >=
+          report.profile.groupJobP50Seconds);
+    CHECK(report.profile.groupJobMaximumSeconds > 0.0);
+    CHECK(report.profile.tilePreparationMaximumSeconds >=
+          report.profile.tilePreparationP95Seconds);
+    CHECK(report.profile.tilePreparationP95Seconds >=
+          report.profile.tilePreparationP50Seconds);
+    CHECK(report.profile.tilePreparationMaximumSeconds > 0.0);
+    CHECK(report.profile.cellProcessingMaximumSeconds >=
+          report.profile.cellProcessingP95Seconds);
+    CHECK(report.profile.cellProcessingP95Seconds >=
+          report.profile.cellProcessingP50Seconds);
+    CHECK(report.profile.cellProcessingMaximumSeconds > 0.0);
     CHECK(report.profile.fit.invocations == report.profile.workCells);
     CHECK(report.profile.fit.nonemptyCells > 0);
     CHECK(report.profile.fit.nonemptyCells <= report.profile.fit.invocations);

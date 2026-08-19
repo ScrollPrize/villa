@@ -2687,7 +2687,14 @@
   every retained stencil site gradient-eligible, while sampled tile-gradient
   validity remains authoritative. Deterministic tile splitting and the worker
   count keep coordinate vectors, decoded samples, and cell scratch under the
-  aggregate sample-memory budget; lower-level sampling uses one thread.
+  aggregate sample-memory budget; lower-level sampling uses one thread. Tiles
+  are paired for overlap reuse only when the staged pair fits that budget. Once
+  a tile's sampling, gradient, and compact-observation construction finish, its
+  cells enter one cooperative worker queue. Any extraction worker may fit a
+  ready cell, but the tile owner retains the immutable observations and waits
+  for every dependent cell before releasing them or advancing overlap reuse.
+  Sampling groups therefore remain the deterministic memory-ownership unit
+  while cell fitting is work-balanced independently.
   Results and worker failures are stored by canonical cell index, retain
   predicates and diagnostic aggregation run serially, and progress callbacks
   are serialized. The lowest-index cell failure is reported after all workers
@@ -3080,7 +3087,7 @@
   Benchmark comparisons must retain identical inputs, parameters, build type,
   and interval.
 - Benchmark and full replay extraction emit the same versioned
-  `fiberlet_extraction_profile version=17` key/value schema. The profile exposes
+  `fiberlet_extraction_profile version=19` key/value schema. The profile exposes
   deterministic workload counters and finer anchor/fiberlet phase timings.
   Enclosing phase fields are wall time, `_work_seconds` fields are summed
   worker/candidate time, and CPU fields are process CPU time. Corner insertion
@@ -3090,6 +3097,11 @@
   cost remains in its enclosing phase. Diagnostics must not change sampling,
   fitting, candidate generation, DP math, ordering, serialized artifacts, or
   determinism.
+- Version 19 adds p50, p95, and maximum durations for complete group jobs, tile
+  preparation, and individual ready-cell processing. Group-job duration spans
+  sampling, preparation, and all dependent cell work; it is not a sampler-only
+  metric. These scheduling diagnostics are timing-only and do not enter
+  artifacts.
 - Version 2 divides anchor fitting into exclusive summed-worker setup, seed
   generation, seed-pair refinement, initialized-component finalization, local
   direction/position refinement including backtracking, direction-conditioned

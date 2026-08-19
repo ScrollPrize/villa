@@ -69,7 +69,7 @@
 - [x] Update checkpoint planning and measurement records.
 - [x] Checkpoint 25: parallelize deterministic corner-set finalization.
 - [x] Checkpoint 26: retain sparse paged corner bitmaps after validation.
-- [ ] Checkpoint 27: measure and improve ready-cell anchor load balance.
+- [x] Checkpoint 27: measure and improve ready-cell anchor load balance.
 - [ ] Checkpoint 28: test bounded peak Gaussian acceleration.
 - [ ] Checkpoint 29: test one-pass post-update membership reuse as a quality change.
 - [ ] Checkpoint 30: profile and optimize remaining DP throughput.

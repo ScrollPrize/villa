@@ -13,8 +13,10 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <ctime>
+#include <deque>
 #include <exception>
 #include <limits>
 #include <map>
@@ -3352,9 +3354,6 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             group.estimatedBytes = tiles[first].estimatedBytes;
             grouped[first] = 1;
             if (bestSecond != tiles.size()) {
-                group.tileIndices[1] = bestSecond;
-                group.tileCount = 2;
-                grouped[bestSecond] = 1;
                 const size_t firstRawBytes =
                     checkedMultiply(
                         tileSampleCount(tiles[first]),
@@ -3365,13 +3364,19 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                         tileSampleCount(tiles[bestSecond]),
                         sizeof(FloatStoredPredictionSample),
                         "fiber anchor retained tile");
-                group.estimatedBytes = std::max(
+                const size_t pairedBytes = std::max(
                     checkedAdd(
                         tiles[first].estimatedBytes, secondRawBytes,
                         "fiber anchor tile sampling group"),
                     checkedAdd(
                         tiles[bestSecond].estimatedBytes, firstRawBytes,
                         "fiber anchor tile sampling group"));
+                if (pairedBytes <= config.maximumConcurrentSampleBytes) {
+                    group.tileIndices[1] = bestSecond;
+                    group.tileCount = 2;
+                    group.estimatedBytes = pairedBytes;
+                    grouped[bestSecond] = 1;
+                }
             }
             samplingGroups.push_back(group);
         }
@@ -3414,6 +3419,9 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             double gradientConstructionSeconds = 0.0F;
             double observationConstructionSeconds = 0.0F;
             double fittingSeconds = 0.0F;
+            std::vector<double> groupJobDurations;
+            std::vector<double> tilePreparationDurations;
+            std::vector<double> cellProcessingDurations;
             FiberAnchorFitProfile fit;
         };
         std::vector<WorkerProfile> workerProfiles(workerCount);
@@ -3568,21 +3576,104 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
 
         std::atomic<size_t> nextJob{0};
         std::atomic<size_t> completedJobs{0};
+        std::atomic<size_t> completedGroupJobs{0};
         std::mutex progressMutex;
         auto lastProgressTime = phaseStart;
         std::exception_ptr progressError;
+        struct ReadyTile {
+            const Tile* tile = nullptr;
+            const std::vector<CompactFiberAnchorObservation>* observations =
+                nullptr;
+            std::array<size_t, 3> sampleShape{};
+            std::atomic<size_t> remainingCells{0};
+        };
+        struct ReadyCellTask {
+            ReadyTile* readyTile = nullptr;
+            size_t cellIndex = 0;
+        };
+        std::mutex readyCellMutex;
+        std::condition_variable readyCellCondition;
+        std::deque<ReadyCellTask> readyCells;
+        const auto reportCellCompleted = [&]() {
+            const size_t completed = completedJobs.fetch_add(1) + 1;
+            if (!progressCallback)
+                return;
+            const auto now = std::chrono::steady_clock::now();
+            std::lock_guard lock(progressMutex);
+            if (!progressError &&
+                now - lastProgressTime >= std::chrono::seconds(1) &&
+                completed < requestedCells.size()) {
+                try {
+                    progressCallback({
+                        phase,
+                        completed,
+                        requestedCells.size(),
+                        std::chrono::duration<double>(now - phaseStart).count(),
+                    });
+                    lastProgressTime = now;
+                } catch (...) {
+                    progressError = std::current_exception();
+                }
+            }
+        };
         const auto worker = [&](size_t workerIndex) {
             auto& workerProfile = workerProfiles[workerIndex];
+            std::vector<uint32_t> cellObservationIndices;
+            std::vector<uint8_t> cellGradientValidity;
+            const auto processReadyCell = [&](const ReadyCellTask& task) {
+                const auto cellStart = std::chrono::steady_clock::now();
+                try {
+                    const auto& ready = *task.readyTile;
+                    jobResults[task.cellIndex] = processCell(
+                        requestedCells[task.cellIndex], *ready.tile,
+                        *ready.observations, ready.sampleShape,
+                        cellObservationIndices, cellGradientValidity,
+                        workerProfile);
+                } catch (...) {
+                    jobErrors[task.cellIndex] = std::current_exception();
+                }
+                workerProfile.cellProcessingDurations.push_back(
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - cellStart).count());
+                reportCellCompleted();
+                task.readyTile->remainingCells.fetch_sub(1);
+                readyCellCondition.notify_all();
+            };
+            const auto helpUntil = [&](const ReadyTile* ownTile) {
+                while (true) {
+                    ReadyCellTask task;
+                    {
+                        std::unique_lock lock(readyCellMutex);
+                        readyCellCondition.wait(lock, [&]() {
+                            return !readyCells.empty() ||
+                                (ownTile != nullptr
+                                    ? ownTile->remainingCells.load() == 0
+                                    : completedGroupJobs.load() ==
+                                        samplingGroups.size());
+                        });
+                        if (readyCells.empty())
+                            return;
+                        task = readyCells.front();
+                        readyCells.pop_front();
+                    }
+                    processReadyCell(task);
+                }
+            };
             while (true) {
                 const size_t job = nextJob.fetch_add(1);
-                if (job >= samplingGroups.size())
+                if (job >= samplingGroups.size()) {
+                    helpUntil(nullptr);
                     break;
+                }
                 try {
+                    const auto groupStart = std::chrono::steady_clock::now();
                     const auto& group = samplingGroups[job];
                     const Tile* previousTile = nullptr;
                     std::vector<FloatStoredPredictionSample> previousSamples;
                     for (size_t groupIndex = 0;
                          groupIndex < group.tileCount; ++groupIndex) {
+                    const auto tilePreparationStart =
+                        std::chrono::steady_clock::now();
                     const Tile& tile = tiles[group.tileIndices[groupIndex]];
                     const std::array<size_t, 3> sampleShape{
                         tile.sampleEnd[0] - tile.sampleBegin[0],
@@ -3769,38 +3860,29 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                             std::chrono::steady_clock::now() - compactStart)
                             .count();
                     std::vector<CachedPresenceGradient>().swap(gradients);
-                    std::vector<uint32_t> cellObservationIndices;
-                    std::vector<uint8_t> cellGradientValidity;
-                    for (const size_t cellIndex : tile.cells) {
-                        jobResults[cellIndex] = processCell(
-                            requestedCells[cellIndex], tile, observations,
-                            sampleShape, cellObservationIndices,
-                            cellGradientValidity, workerProfile);
-                        const size_t completed = completedJobs.fetch_add(1) + 1;
-                        if (progressCallback) {
-                            const auto now = std::chrono::steady_clock::now();
-                            std::lock_guard lock(progressMutex);
-                            if (!progressError &&
-                                now - lastProgressTime >= std::chrono::seconds(1) &&
-                                completed < requestedCells.size()) {
-                                try {
-                                    progressCallback({
-                                        phase,
-                                        completed,
-                                        requestedCells.size(),
-                                        std::chrono::duration<double>(
-                                            now - phaseStart).count(),
-                                    });
-                                    lastProgressTime = now;
-                                } catch (...) {
-                                    progressError = std::current_exception();
-                                }
-                            }
-                        }
+                    workerProfile.tilePreparationDurations.push_back(
+                        std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() -
+                            tilePreparationStart).count());
+                    ReadyTile readyTile;
+                    readyTile.tile = &tile;
+                    readyTile.observations = &observations;
+                    readyTile.sampleShape = sampleShape;
+                    readyTile.remainingCells.store(tile.cells.size());
+                    {
+                        std::lock_guard lock(readyCellMutex);
+                        for (const size_t cellIndex : tile.cells)
+                            readyCells.push_back({&readyTile, cellIndex});
                     }
+                    readyCellCondition.notify_all();
+                    helpUntil(&readyTile);
                     previousTile = &tile;
                     previousSamples = std::move(samples);
                     }
+                    workerProfile.groupJobDurations.push_back(
+                        std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - groupStart)
+                            .count());
                 } catch (...) {
                     for (size_t groupIndex = 0;
                          groupIndex < samplingGroups[job].tileCount;
@@ -3811,6 +3893,8 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                             jobErrors[cellIndex] = std::current_exception();
                     }
                 }
+                completedGroupJobs.fetch_add(1);
+                readyCellCondition.notify_all();
             }
         };
         const auto cellProcessingStart = std::chrono::steady_clock::now();
@@ -3825,6 +3909,9 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             std::chrono::steady_clock::now() - cellProcessingStart).count();
         report.profile.cellProcessingCpuSeconds +=
             processCpuSeconds() - cellProcessingCpuStart;
+        std::vector<double> groupJobDurations;
+        std::vector<double> tilePreparationDurations;
+        std::vector<double> cellProcessingDurations;
         for (const auto& workerProfile : workerProfiles) {
             report.profile.predictionSamplerCalls +=
                 workerProfile.predictionSamplerCalls;
@@ -3856,8 +3943,52 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             report.profile.observationConstructionWorkSeconds +=
                 workerProfile.observationConstructionSeconds;
             report.profile.fittingWorkSeconds += workerProfile.fittingSeconds;
+            groupJobDurations.insert(
+                groupJobDurations.end(),
+                workerProfile.groupJobDurations.begin(),
+                workerProfile.groupJobDurations.end());
+            tilePreparationDurations.insert(
+                tilePreparationDurations.end(),
+                workerProfile.tilePreparationDurations.begin(),
+                workerProfile.tilePreparationDurations.end());
+            cellProcessingDurations.insert(
+                cellProcessingDurations.end(),
+                workerProfile.cellProcessingDurations.begin(),
+                workerProfile.cellProcessingDurations.end());
             accumulateFitProfile(report.profile.fit, workerProfile.fit);
         }
+        const auto assignDurationQuantiles = [](
+            std::vector<double>& durations,
+            double& p50,
+            double& p95,
+            double& maximum) {
+            if (durations.empty())
+                return;
+            std::sort(durations.begin(), durations.end());
+            const auto percentile = [&](double quantile) {
+                const size_t index = static_cast<size_t>(std::ceil(
+                    quantile * static_cast<double>(durations.size()))) - 1;
+                return durations[std::min(index, durations.size() - 1)];
+            };
+            p50 = percentile(0.50);
+            p95 = percentile(0.95);
+            maximum = durations.back();
+        };
+        assignDurationQuantiles(
+            groupJobDurations,
+            report.profile.groupJobP50Seconds,
+            report.profile.groupJobP95Seconds,
+            report.profile.groupJobMaximumSeconds);
+        assignDurationQuantiles(
+            tilePreparationDurations,
+            report.profile.tilePreparationP50Seconds,
+            report.profile.tilePreparationP95Seconds,
+            report.profile.tilePreparationMaximumSeconds);
+        assignDurationQuantiles(
+            cellProcessingDurations,
+            report.profile.cellProcessingP50Seconds,
+            report.profile.cellProcessingP95Seconds,
+            report.profile.cellProcessingMaximumSeconds);
 
         for (const auto& error : jobErrors) {
             if (error)
