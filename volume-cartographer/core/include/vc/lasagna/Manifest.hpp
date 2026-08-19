@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -83,6 +84,7 @@ struct LasagnaDatasetManifest {
 
     [[nodiscard]] bool hasNormalSource() const noexcept;
     [[nodiscard]] const LasagnaChannelGroup* groupForChannel(std::string_view channel) const noexcept;
+    [[nodiscard]] std::vector<std::string> fiberPredictionPrefixes() const;
 
     static LasagnaDatasetManifest parseFile(const std::filesystem::path& manifestPath);
     static LasagnaDatasetManifest parseText(

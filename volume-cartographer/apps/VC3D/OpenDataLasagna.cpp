@@ -162,35 +162,6 @@ void validateGroupDescriptor(const vc::lasagna::LasagnaDatasetManifest& manifest
     }
 }
 
-bool endsWith(std::string_view value, std::string_view suffix)
-{
-    return value.size() >= suffix.size() &&
-           value.substr(value.size() - suffix.size()) == suffix;
-}
-
-bool hasFiberInferenceChannels(
-    const vc::lasagna::LasagnaDatasetManifest& manifest)
-{
-    if (manifest.groupForChannel("presence") &&
-        manifest.groupForChannel("nx") &&
-        manifest.groupForChannel("ny")) {
-        return true;
-    }
-
-    constexpr std::string_view suffix = "_presence";
-    for (const auto& group : manifest.groups) {
-        for (const auto& channel : group.channels) {
-            if (!endsWith(channel, suffix)) continue;
-            const auto prefix = channel.substr(0, channel.size() - suffix.size());
-            if (manifest.groupForChannel(prefix + "_nx") &&
-                manifest.groupForChannel(prefix + "_ny")) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
 bool compatibleBaseShape(
     const std::array<std::size_t, 3>& catalogShape,
     const std::array<std::size_t, 3>& manifestShape)
@@ -425,7 +396,7 @@ OpenDataLasagnaDatasetKind validateOpenDataLasagnaManifest(
             "Lasagna base_shape_zyx does not match its parent volume");
     }
 
-    if (hasFiberInferenceChannels(manifest)) {
+    if (!manifest.fiberPredictionPrefixes().empty()) {
         return OpenDataLasagnaDatasetKind::FiberInference;
     }
     if (manifest.hasNormalSource()) {
