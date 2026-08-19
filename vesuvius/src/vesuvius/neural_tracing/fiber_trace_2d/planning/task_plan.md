@@ -968,3 +968,159 @@ wall from 5.504 to 5.461 seconds, and command wall from 9.65 to 9.58 seconds.
 The optimized runs were deterministic and retained 2,603 anchors, 2,560 graph
 nodes, 26,494 edges, and 2 greedy / 1 fiberlet failures. The 352 emitted route
 points differed from baseline by at most 1.3764e-6 base voxels.
+
+## Checkpoint 21: compact-float spatial objectives
+
+1. Use committed checkpoint 20 (`397c1cbf3`) as the baseline. Its controlled
+   medians are 9.58 seconds command wall, 5.461 seconds anchor wall, 140.75
+   seconds anchor CPU, and approximately 22.3 worker-seconds in local state
+   evaluation.
+2. Keep the shared `retainedSpatialObjective()` and paired variant generic.
+   Select float32 only for production `CompactFiberAnchorObservation` ranges;
+   preserve the public expanded-observation path's double arithmetic,
+   direction normalization, compensated sums, and behavior.
+3. For the compact specialization, convert active component axes/positions,
+   pivot, Gaussian constants, and presence floor once per objective call. Keep
+   observation positions/directions, Gaussian values, alignment, numerator,
+   and denominator in ordinary, uncompensated float32 through the complete
+   scan. Compact directions retain their existing pre-normalized contract.
+   Widen only the final one or two objective ratios to double for unchanged
+   tolerance and acceptance logic. The paired function remains one fused scan
+   with independent baseline/candidate accumulators; do not add Gaussian reuse
+   or any checkpoint-17 behavior.
+4. Preserve observation/component traversal, membership bytes, candidate and
+   backtracking order, bounds/clamping, accepted persistent component state,
+   profile counters, and profile schema. Do not change centroid proposal,
+   robust direction proposal, final evaluation, peak search, or serialization.
+   Preserve denominator semantics exactly: every finite-position observation
+   contributes one Gaussian per active component before any validity, presence,
+   direction, assignment, or trimming check gates numerator evidence.
+5. Add extraction-level coverage through the private compact path. Compare a
+   stable position-refinement fixture with the public double fitter using
+   bounded anchor position/axis tolerances, and cover deterministic repeats near
+   an objective tie or backtracking decision boundary. Cover denominator-only
+   observations with invalid directions, NaN/below-floor presence, unassigned
+   or trimmed numerator evidence, zero denominator, axial/transverse cutoff
+   equality and adjacent-float cases, and a translated fixture at realistic
+   large prediction coordinates. Existing public-path tests must remain exact.
+6. Build `vc_fiberlets` plus focused anchor/path/replay tests with GCC and
+   compile the touched production path with Clang. Run `git diff --check`.
+7. Benchmark three alternating compact-float and checkpoint-20 baseline runs
+   on the canonical 32-thread, 5,000-base-voxel replay. Compare local state-
+   evaluation work, total/anchor wall and CPU, peak RSS, populations, DP work,
+   failures, deterministic hashes, and emitted route displacement. Record
+   build type/flags, host, cache state, warmup policy, exact run order, inputs,
+   and commits. If artifacts differ materially, additionally compare matched-
+   anchor count, axis/position p50/p95/max, accepted backtracking-depth
+   distributions, and visualizations.
+8. Retain only if local-state or enclosing anchor cost improves without an
+   unacceptable deterministic quality change. Remove the experiment otherwise.
+
+### Checkpoint 21 Spec Update
+
+- If retained, extend the compact-production float precision boundary to the
+  fixed-direction spatial objective scans while documenting that persistent
+  state and acceptance remain double. Do not change the profile schema.
+- If rejected, leave production specifications unchanged and retain only the
+  measured experiment log.
+
+### Checkpoint 21 Documentation Update
+
+- Record implementation, tests, and controlled results in `task_log.md`.
+  Update `volume-cartographer/docs/fiberlets.md` and `planning/changelog.md`
+  only if the checkpoint is retained, and close all items in `status.md`.
+
+### Checkpoint 21 Result
+
+Rejected and removed. Across three alternating pairs, median local state-
+evaluation worker time improved from 22.48 to 20.03 seconds (10.9%), but median
+tensor-proposal work regressed from 23.47 to 31.32 seconds. Anchor CPU rose
+from 140.07 to 145.48 seconds, command wall from 9.44 to 9.59 seconds, and total
+CPU from 211.40 to 216.80 seconds. All six artifacts were byte-identical and
+quality populations were unchanged, identifying a code-generation/locality
+regression rather than a numerical-quality failure. Production code and tests
+were restored to committed checkpoint 20.
+
+## Checkpoint 22: isolated compact-float spatial objectives
+
+1. Use committed checkpoint 20 (`397c1cbf3`) as the baseline. Preserve its
+   shared library before rebuilding so optimized and baseline runs can be
+   alternated without a runtime branch in either hot path.
+2. Add a source-private fiber-anchor objective module to `vc_fiber_tracer`.
+   Move the complete retained spatial-objective equation behind that module's
+   internal interface rather than copying a second private implementation into
+   `FiberAnchors.cpp`. Move the exact compact record and compensated-sum helper
+   once into a source-private shared header; pass a module-specific component
+   and scalar-config value instead of exposing fitter state. Add no installed or
+   public API.
+3. Provide two explicitly selected module paths. Expanded public observations
+   retain double arithmetic, direction normalization, compensated accumulation,
+   and denominator rules. Indexed compact production observations use the
+   checkpoint-21 float32 arithmetic, ordinary float accumulators,
+   pre-normalized directions, and a fused paired scan.
+4. Borrow observation and index storage through spans. The indexed compact
+   kernel iterates logical indices, reads the observation from
+   `storage[indices[logical]]`, and reads assignment/membership from
+   `[logical]`. Validate logical cardinalities and every underlying index. Do
+   not materialize, reorder, or copy per-cell observations. Convert only the
+   two component states, pivot, and required scalar configuration once per call.
+5. Preserve all-site denominator semantics: each finite-position observation
+   contributes to every active denominator before validity, presence,
+   direction, assignment, or robust-membership checks gate numerator evidence.
+   Preserve candidate/backtracking order, persistent state, counters,
+   acceptance, peak search, final evaluation, and output.
+6. Add focused coverage through a test-only include of the source-private
+   module. Cover expanded and indexed compact inputs, empty input, invalid
+   cardinality/index rejection, nonconsecutive and repeated underlying indices,
+   denominator-only invalid/NaN/below-floor observations, zero/one/two active
+   components, cutoff boundaries, fused paired versus two single evaluations,
+   realistic large coordinates, and deterministic repeats. Require exact
+   public-double single/paired and fitter behavior; use checkpoint-21 geometric
+   tolerances only for compact-float versus double comparisons.
+7. Build `vc_fiberlets` and run linked GCC and Clang `test_fiber_anchors`,
+   `test_fiberlet_paths`, and `test_fiber_replay`. Add the new source through
+   CMake, use standard C++23 `std::span`, and run `git diff --check`;
+   macOS/arm64 CI remains the portability gate. If the local Clang tree cannot
+   be linked without installation, record that deviation before falling back to
+   a production-flag Clang translation-unit compile.
+8. Before source edits, rebuild checkpoint 20 from its clean production source,
+   save and hash its shared library, and prove the explicit loader path selects
+   it. Alternate three isolated and three checkpoint-20 runs through explicit
+   isolated library paths on the canonical 32-thread, 5,000-base-voxel replay.
+   Record run order, binary/library hashes, compiler/flags, host/load, cache and
+   warmup state, exact command and inputs. Compare local-state and tensor-
+   proposal worker times, total/anchor wall and CPU, peak RSS, populations, DP
+   work, failures, artifact hashes, and emitted route displacement. If artifacts
+   differ materially, also compare matched-anchor position/axis and accepted
+   backtracking-depth distributions, downstream metrics, and visualizations.
+9. Retain only if the compact objective saving survives while tensor-proposal
+   work returns to baseline noise and enclosing anchor or total cost improves.
+   Otherwise remove the module and retain only the experiment record.
+
+### Checkpoint 22 Spec Update
+
+- If retained, document the compact float objective precision boundary and the
+  separate objective module while keeping persistent state and final
+  evaluation double. Do not change the profile schema.
+- If rejected, leave production specifications unchanged and record only the
+  measured experiment.
+
+### Checkpoint 22 Documentation Update
+
+- Record design, independent review, validation, benchmark method, and result
+  in `task_log.md`. Update `volume-cartographer/docs/fiberlets.md` and
+  `planning/changelog.md` only if retained, then close checkpoint items in
+  `status.md`.
+
+### Checkpoint 22 Result
+
+Accepted. Three alternating isolated/baseline pairs measured median command
+wall at 9.17/9.56 seconds, total CPU at 201.84/212.93 seconds, anchor wall at
+5.050/5.425 seconds, and anchor CPU at 130.74/140.80 seconds. The isolated
+objective reduced median local-state work from 22.59 to 13.86 worker-seconds;
+tensor-proposal work also remained isolated and improved from 23.72 to 22.78
+worker-seconds instead of repeating checkpoint 21's 31.32-second regression.
+All six replay artifacts were byte-identical, all work/population counters and
+accepted backtracking depths matched, and every run retained 2 greedy / 1
+fiberlet failures. Median RSS changed by +0.2%. The module and precision
+boundary are retained without a profile-schema change.

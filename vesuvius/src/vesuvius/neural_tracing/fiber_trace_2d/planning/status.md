@@ -79,6 +79,25 @@
 - [x] Run alternating controlled baseline/checkpoint-20 canonical measurements.
 - [x] Retain checkpoint 20 based on valid performance and quality.
 - [x] Update checkpoint 20 specifications, user documentation, changelog, and logs.
+- [x] Obtain approval for checkpoint 21 compact-float spatial objectives.
+- [x] Plan checkpoint 21 and its quality/performance gates.
+- [x] Independently review checkpoint 21 against task and specifications.
+- [x] Implement the compact-float single and paired spatial objectives.
+- [x] Add compact-path decision-boundary and deterministic quality coverage.
+- [x] Build and run focused GCC validation and compile with Clang.
+- [x] Run alternating controlled baseline/checkpoint-21 canonical measurements.
+- [x] Remove checkpoint 21 after the measured total-runtime regression.
+- [x] Record the rejected result; production specifications/docs/changelog remain unchanged.
+- [x] Obtain approval for checkpoint 22 objective code-generation isolation.
+- [x] Plan checkpoint 22 and its performance/quality gates.
+- [x] Independently review checkpoint 22 against task and specifications.
+- [x] Preserve the checkpoint-20 shared-library baseline without a runtime switch.
+- [x] Implement the isolated expanded-double and compact-float objective module.
+- [x] Add focused objective-module regression coverage.
+- [x] Build and run focused GCC and Clang validation.
+- [x] Run three alternating benchmark pairs and compare quality.
+- [x] Retain checkpoint 22 from measured results.
+- [x] Update checkpoint records, specifications, user docs, and changelog.
 - [x] Obtain approval for checkpoint 18 radial-demand optimization.
 - [x] Plan checkpoint 18 and its measurement/validation gates.
 - [x] Independently review checkpoint 18 against task and specifications.

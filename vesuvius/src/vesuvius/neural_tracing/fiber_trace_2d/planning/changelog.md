@@ -629,3 +629,8 @@
   double cutoff and eigensolver. Canonical median proposal work improved from
   25.63 to 23.74 worker-seconds with unchanged populations/failures and a
   maximum emitted-route displacement of 1.38e-6 base voxels.
+- Isolated retained spatial objectives in a private translation unit and kept
+  production compact objective arithmetic float32 while preserving the public
+  compensated-double path. Canonical median objective work improved from 22.59
+  to 13.86 worker-seconds and command wall from 9.56 to 9.17 seconds with
+  byte-identical replay artifacts.

@@ -6,6 +6,7 @@
 #include "vc/fiber_tracer/detail/FiberAnchorSupportStencil.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "utils/zarr.hpp"
+#include "../src/fiber_tracer/FiberAnchorObjectives.hpp"
 
 #include <algorithm>
 #include <array>
@@ -26,6 +27,137 @@ namespace
 
 using vc::fiber_tracer::FiberAnchorConfig;
 using vc::fiber_tracer::FiberAnchorObservation;
+
+TEST_CASE("fiber anchor objective module preserves logical indexed semantics")
+{
+    namespace detail = vc::fiber_tracer::detail;
+    detail::FiberAnchorObjectiveConfig options;
+    options.gaussianSigmaPredictionVoxels = 1.0;
+    options.gaussianCutoffSigmas = 3.0;
+    options.axialSupportHalfWidthPredictionVoxels = 6.0;
+    options.observationPresenceFloor = 0.05;
+    const cv::Vec3d pivot{20000.0, 20000.0, 20000.0};
+    std::array<detail::FiberAnchorObjectiveComponent, 2> first{{
+        {{1.0, 0.0, 0.0}, pivot},
+        {{0.0, 1.0, 0.0}, pivot},
+    }};
+    auto second = first;
+    second[0].position += cv::Vec3d{0.0, 0.25, 0.0};
+    second[1].position += cv::Vec3d{0.0, 0.0, 0.5};
+
+    std::vector<detail::CompactFiberAnchorObservation> storage(5);
+    const auto setObservation = [&](size_t index, const cv::Vec3f& position,
+                                    const cv::Vec3f& direction, float presence,
+                                    bool valid) {
+        storage[index].positionPredictionXYZ = position;
+        storage[index].direction = direction;
+        storage[index].presence = presence;
+        storage[index].valid = valid;
+    };
+    setObservation(1, {20000.0F, 20001.0F, 20000.0F}, {1.0F, 0.0F, 0.0F},
+        0.75F, true);
+    setObservation(3, {20000.0F, 20000.0F, 20000.0F}, {1.0F, 0.0F, 0.0F},
+        1.0F, true);
+    setObservation(4, {20001.0F, 20000.0F, 20000.0F}, {0.0F, 1.0F, 0.0F},
+        0.6F, true);
+    const std::vector<uint32_t> indices{3, 1, 3, 4};
+    const std::vector<uint8_t> assignments{0, 0, 0, 1};
+    const std::vector<uint8_t> retained{1, 1, 0, 1};
+
+    std::vector<FiberAnchorObservation> expanded;
+    for (const uint32_t index : indices) {
+        const auto& source = storage[index];
+        expanded.push_back({
+            cv::Vec3d{source.positionPredictionXYZ},
+            cv::Vec3d{source.direction},
+            static_cast<double>(source.presence),
+            source.valid,
+        });
+    }
+    const double expandedFirst = detail::retainedSpatialObjectiveExpanded(
+        expanded, first, 2, assignments, retained, pivot, options);
+    const double expandedSecond = detail::retainedSpatialObjectiveExpanded(
+        expanded, second, 2, assignments, retained, pivot, options);
+    const auto expandedPair = detail::retainedSpatialObjectivePairExpanded(
+        expanded, first, second, 2, assignments, retained, pivot, options);
+    CHECK(expandedPair[0] == expandedFirst);
+    CHECK(expandedPair[1] == expandedSecond);
+
+    const double compactFirst = detail::retainedSpatialObjectiveCompact(
+        storage, indices, first, 2, assignments, retained, pivot, options);
+    const double compactSecond = detail::retainedSpatialObjectiveCompact(
+        storage, indices, second, 2, assignments, retained, pivot, options);
+    const auto compactPair = detail::retainedSpatialObjectivePairCompact(
+        storage, indices, first, second, 2, assignments, retained, pivot,
+        options);
+    CHECK(compactPair[0] == compactFirst);
+    CHECK(compactPair[1] == compactSecond);
+    CHECK(compactFirst == doctest::Approx(expandedFirst).epsilon(1.0e-5));
+    CHECK(compactSecond == doctest::Approx(expandedSecond).epsilon(1.0e-5));
+    CHECK(detail::retainedSpatialObjectiveCompact(
+        storage, indices, first, 0, assignments, retained, pivot, options) == 0.0);
+
+    CHECK_THROWS_AS(detail::retainedSpatialObjectiveCompact(
+        storage, indices, first, 2, std::span<const uint8_t>{}, retained,
+        pivot, options), std::invalid_argument);
+    const std::vector<uint32_t> invalidIndices{5};
+    const std::vector<uint8_t> one{1};
+    CHECK_THROWS_AS(detail::retainedSpatialObjectiveCompact(
+        storage, invalidIndices, first, 1, one, one, pivot, options),
+        std::out_of_range);
+    const std::vector<detail::CompactFiberAnchorObservation> emptyStorage;
+    const std::vector<uint32_t> emptyIndices;
+    const std::vector<uint8_t> emptyFlags;
+    CHECK(detail::retainedSpatialObjectiveCompact(
+        emptyStorage, emptyIndices, first, 1, emptyFlags, emptyFlags, pivot,
+        options) == 0.0);
+}
+
+TEST_CASE("fiber anchor objective denominator includes unusable evidence sites")
+{
+    namespace detail = vc::fiber_tracer::detail;
+    detail::FiberAnchorObjectiveConfig options{1.0, 3.0, 6.0, 0.05};
+    const cv::Vec3d pivot{0.0, 0.0, 0.0};
+    const std::array<detail::FiberAnchorObjectiveComponent, 2> components{{
+        {{1.0, 0.0, 0.0}, pivot},
+        {{0.0, 1.0, 0.0}, pivot},
+    }};
+    std::vector<detail::CompactFiberAnchorObservation> observations(5);
+    for (auto& observation : observations) {
+        observation.positionPredictionXYZ = {0.0F, 0.0F, 0.0F};
+        observation.direction = {1.0F, 0.0F, 0.0F};
+        observation.presence = 1.0F;
+        observation.valid = true;
+    }
+    observations[1].valid = false;
+    observations[2].presence = 0.0F;
+    observations[3].presence = std::numeric_limits<float>::quiet_NaN();
+    observations[4].positionPredictionXYZ[0] =
+        std::numeric_limits<float>::quiet_NaN();
+    const std::vector<uint32_t> indices{0, 1, 2, 3, 4};
+    const std::vector<uint8_t> assignments(indices.size(), 0);
+    const std::vector<uint8_t> retained(indices.size(), 1);
+    CHECK(detail::retainedSpatialObjectiveCompact(
+        observations, indices, components, 1, assignments, retained, pivot,
+        options) == doctest::Approx(0.25));
+
+    observations.resize(2);
+    observations[1] = observations[0];
+    observations[1].positionPredictionXYZ = {0.0F, 3.0F, 0.0F};
+    observations[1].valid = false;
+    const std::vector<uint32_t> cutoffIndices{0, 1};
+    const std::vector<uint8_t> cutoffAssignments(2, 0);
+    const std::vector<uint8_t> cutoffRetained(2, 1);
+    const double atCutoff = detail::retainedSpatialObjectiveCompact(
+        observations, cutoffIndices, components, 1, cutoffAssignments,
+        cutoffRetained, pivot, options);
+    CHECK(atCutoff < 1.0);
+    observations[1].positionPredictionXYZ[1] =
+        std::nextafter(3.0F, std::numeric_limits<float>::infinity());
+    CHECK(detail::retainedSpatialObjectiveCompact(
+        observations, cutoffIndices, components, 1, cutoffAssignments,
+        cutoffRetained, pivot, options) == 1.0);
+}
 
 TEST_CASE("fiber anchor peak grid layout maps every bounded coordinate directly")
 {

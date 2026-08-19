@@ -655,6 +655,20 @@ to 140.75 seconds, and command wall from 9.65 to 9.58 seconds. Anchor/graph
 populations and failures were unchanged; emitted route points differed by at
 most 1.38e-6 base voxels.
 
+Fixed-direction position objectives live in a separate private translation
+unit so their production float specialization cannot perturb robust-proposal
+code generation. The production path borrows tile observations and canonical
+per-cell indices without materialization: assignment and membership arrays use
+logical per-cell positions, while observation reads use the corresponding tile
+index. Gaussian, alignment, ordinary numerator/denominator sums, and final
+ratio are float32. Every finite-position site contributes to all active
+denominators before evidence eligibility is checked. The public expanded path
+uses the same objective equation with normalized directions and compensated
+double sums; persistent state and final support remain double. On the canonical
+replay, isolation reduced median local-state objective work from 22.59 to 13.86
+worker-seconds, anchor CPU from 140.80 to 130.74 seconds, and command wall from
+9.56 to 9.17 seconds, with byte-identical replay artifacts.
+
 Version 4 reports robust components with no detected outliers, trimmed
 components, candidate/actual trimmed and retained mass, components removed for
 non-unique retained tensors, iteration-limit hits, and position candidates tested

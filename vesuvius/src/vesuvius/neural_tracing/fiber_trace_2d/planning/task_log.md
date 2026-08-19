@@ -950,4 +950,119 @@
   Both variants retained 2,603 anchors, 2,560 graph nodes, 26,494 graph edges,
   and 2 greedy / 1 fiberlet failures. Their 352 emitted fiberlet route points
   differed by at most 1.3764e-6 base voxels (mean 5.63e-8). The optimized
-  candidate remains uncommitted pending the retention decision.
+  candidate was retained and committed as `397c1cbf3`.
+
+## Checkpoint 21: compact-float spatial objectives
+
+- User approved extending the successful compact float boundary to the
+  fixed-direction spatial objective scans. The checkpoint intentionally leaves
+  final evaluation and all persistent/acceptance state in double so its target
+  is the approximately 22.3 local-state-evaluation worker-seconds measured in
+  checkpoint 20.
+- Baseline is committed checkpoint 20 (`397c1cbf3`): median command wall 9.58
+  seconds, anchor wall 5.461 seconds, anchor CPU 140.75 seconds, and unchanged
+  2,603 anchors / 2,560 graph nodes / 26,494 edges / 2 greedy and 1 fiberlet
+  failures.
+- Independent review approved the narrow scope but required explicit all-site
+  denominator semantics, ordinary-float accumulator selection, one fused paired
+  scan without checkpoint-17 Gaussian reuse, large-coordinate/cutoff fixtures,
+  stronger branch-quality comparisons, and complete benchmark metadata. The
+  implementation and validation plan incorporates these corrections. A linked
+  Clang test tree is not currently configured; the touched translation unit
+  will be compiled with Clang and macOS/arm64 CI remains the portability gate.
+- Implemented scalar-specialized single and paired spatial objectives. The
+  public expanded path retains its former double code and compensated sums.
+  The compact path uses ordinary float numerators/denominators and existing
+  compact scalar Gaussian/direction helpers, with every finite-position site
+  entering each denominator before numerator eligibility is tested. The paired
+  path remains one fused scan and final evaluation is unchanged.
+- Added an extraction-level fixture near prediction coordinate 20,000 with
+  invalid-direction, NaN-presence, and below-floor denominator-only samples.
+  It checks deterministic compact extraction/backtracking and bounded geometry
+  against the unchanged expanded double fitter. All 72 anchor cases and the
+  focused anchor/path/replay CTest suites passed; the touched production unit
+  compiled with Clang 22.1.8 and `git diff --check` passed.
+- Three optimized and three checkpoint-20 baseline runs were alternated on the
+  canonical replay. Optimized medians were 9.59 seconds command wall, 216.80
+  seconds total CPU, 5.525 seconds anchor wall, 145.48 seconds anchor CPU,
+  20.03 local-state-evaluation worker-seconds, and 31.32 tensor-proposal
+  worker-seconds. Baseline medians were 9.44, 211.40, 5.385, 140.07, 22.48,
+  and 23.47 seconds respectively.
+- The intended objective kernel improved by 10.9%, but tensor proposal
+  regressed by 33.4%, anchor CPU by 3.9%, total CPU by 2.6%, and command wall
+  by 1.6%. All six replay artifacts exactly matched checkpoint 20 SHA-256
+  `9ad06d494b886dc4e256e1adadc3cb12e70fee051c3292895a4593a475efa472`;
+  populations and 2 greedy / 1 fiberlet failures were unchanged. The repeatable
+  cross-phase regression is attributed to code generation/instruction locality,
+  not numerical quality.
+- Removed the production specialization, its temporary benchmark switch, and
+  checkpoint-only fixture. Production source/tests are identical to committed
+  checkpoint 20. Specifications, user documentation, changelog, and profile
+  schema remain unchanged.
+
+## Checkpoint 22: isolated compact-float spatial objectives
+
+- User approved retesting checkpoint 21's faster compact objective kernel with
+  code-generation isolation. Checkpoint 21 reduced local-state evaluation by
+  10.9%, but placing the specialization in `FiberAnchors.cpp` increased
+  unrelated tensor-proposal work by 33.4% and regressed total runtime.
+- The planned private module owns the complete objective equation and provides
+  expanded-double and indexed-compact-float entry points. Production storage is
+  borrowed through spans, and the main fitter performs only small fixed-state
+  conversion and dispatch. This avoids implementation copying and a hot-path
+  benchmark branch.
+- The current checkpoint-20 `libvc_fiber_tracer.so` will be preserved before
+  rebuilding. Alternating runs will select that library or the rebuilt library
+  through the dynamic loader, keeping both measured implementations branch-free.
+- Independent review approved translation-unit isolation after requiring the
+  exact logical-index/underlying-tile-index mapping, shared source-private type
+  extraction, strict all-site denominator order, exact public-double behavior,
+  direct private-module edge coverage, a rebuilt and loader-verified baseline,
+  complete benchmark metadata, and linked Clang validation. The plan now
+  includes each correction.
+- Rebuilt checkpoint 20 before source edits and preserved
+  `libvc_fiber_tracer.so` SHA-256
+  `9dfecc2166c185634cf4a8ed693af9a5c1a5883e07a23608448b26817d40db26`.
+  The isolated library SHA-256 was
+  `87a47e9c5f73c15a8f39dc09a049a2f85fbbce6db165e4d20d0e92620550d8e4`.
+  `ldd` verified the baseline loader path used the preserved library and the
+  default path used the rebuilt workspace library.
+- Implemented `FiberAnchorObjectives.cpp` plus a source-private shared header.
+  The module owns the common objective equation and instantiates expanded
+  compensated-double and indexed compact-float paths. Compact logical indices
+  select assignment/membership entries independently from the underlying tile
+  indices. Invalid cardinalities and underlying indices fail before evaluation.
+- Added direct private-module coverage for nonconsecutive/repeated tile indices,
+  exact expanded single/paired parity, compact single/paired parity, compact-
+  versus-expanded tolerance, empty and zero-component inputs, invalid mappings,
+  denominator-only invalid/NaN/below-floor evidence, realistic coordinates near
+  20,000, and exact/adjacent cutoff positions.
+- GCC and Clang 22.1.8 QuickBuild linked suites passed `test_fiber_anchors`,
+  `test_fiberlet_paths`, and `test_fiber_replay`. The Clang tree reused local
+  libigl and PaStiX sources; no install or download was performed. Its initial
+  `/tmp` run failed only because the machine's temp quota prevented test output;
+  rerunning with workspace `TMPDIR` passed all three suites. `git diff --check`
+  passed.
+- Ran alternating order isolated-1, baseline-1, isolated-2, baseline-2,
+  isolated-3, baseline-3 with the canonical 32-thread, 5,000-base-voxel replay
+  on the Paris4 `fiber_s1_002` prediction manifest, fiber
+  `dj_20260805T025256484_000003.json`, and `las_008` normal manifest. Both
+  variants used the same QuickBuild executable, warm local inputs, no explicit
+  warmup, and an explicitly verified dynamic-library path.
+- Controlled min/median/max results were:
+
+  | metric | isolated | checkpoint 20 | median change |
+  |---|---:|---:|---:|
+  | command wall | 9.08 / 9.17 / 9.26 s | 9.54 / 9.56 / 9.58 s | -4.1% |
+  | total CPU | 201.42 / 201.84 / 203.46 s | 211.74 / 212.93 / 213.27 s | -5.2% |
+  | anchor wall | 4.998 / 5.050 / 5.179 s | 5.421 / 5.425 / 5.458 s | -6.9% |
+  | anchor CPU | 130.40 / 130.74 / 131.34 s | 140.28 / 140.80 / 141.24 s | -7.1% |
+  | local-state objective work | 13.77 / 13.86 / 13.91 s | 22.53 / 22.59 / 22.61 s | -38.6% |
+  | tensor-proposal work | 22.66 / 22.78 / 22.89 s | 23.71 / 23.72 / 23.81 s | -4.0% |
+  | peak RSS | 2,084,764 / 2,115,560 / 2,116,312 KiB | 2,109,644 / 2,112,200 / 2,122,024 KiB | +0.2% |
+
+- Every run retained 2,603 anchors, 2,560 graph nodes, 26,494 graph edges,
+  62,970,388 DP relaxations, accepted all 12,275 position candidates at depth
+  zero, and produced 2 greedy / 1 fiberlet failures. All six artifacts retained
+  SHA-256 `9ad06d494b886dc4e256e1adadc3cb12e70fee051c3292895a4593a475efa472`.
+  Checkpoint 22 is retained; no profile-schema change was needed.

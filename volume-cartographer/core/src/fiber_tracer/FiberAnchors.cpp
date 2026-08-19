@@ -4,6 +4,7 @@
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
 #include "vc/fiber_tracer/detail/FiberAnchorPeakGrid.hpp"
 #include "vc/fiber_tracer/detail/FiberAnchorSupportStencil.hpp"
+#include "FiberAnchorObjectives.hpp"
 
 #include <algorithm>
 #include <array>
@@ -110,18 +111,8 @@ double interpolatedQuantile(const std::vector<double>& sorted, double quantile)
     return sorted[lower] * (1.0 - fraction) + sorted[upper] * fraction;
 }
 
-struct CompensatedSum {
-    void add(double value)
-    {
-        const double adjusted = value - correction;
-        const double next = sum + adjusted;
-        correction = (next - sum) - adjusted;
-        sum = next;
-    }
-
-    double sum = 0.0;
-    double correction = 0.0;
-};
+using detail::CompensatedSum;
+using detail::CompactFiberAnchorObservation;
 
 struct WeightedObservation {
     cv::Vec3d position{0.0, 0.0, 0.0};
@@ -281,15 +272,6 @@ constexpr size_t kNoDiagnosticId = std::numeric_limits<size_t>::max();
            std::isfinite(value[2]);
 }
 
-struct CompactFiberAnchorObservation {
-    cv::Vec3f positionPredictionXYZ{0.0F, 0.0F, 0.0F};
-    cv::Vec3f direction{0.0F, 0.0F, 0.0F};
-    cv::Vec3f presenceGradientPredictionXYZ{0.0F, 0.0F, 0.0F};
-    float presence = 0.0F;
-    bool valid = false;
-    bool presenceGradientValid = false;
-};
-
 template <typename Observation>
 using FiberAnchorProposalScalar = std::conditional_t<
     std::is_same_v<std::remove_cvref_t<Observation>,
@@ -414,6 +396,16 @@ public:
     [[nodiscard]] bool presenceGradientValid(size_t index) const
     {
         return gradientValidity_[index] != 0;
+    }
+
+    [[nodiscard]] std::span<const Observation> observationStorage() const
+    {
+        return observations_;
+    }
+
+    [[nodiscard]] std::span<const uint32_t> observationIndices() const
+    {
+        return indices_;
     }
 
 private:
@@ -897,9 +889,30 @@ template <typename ObservationRange>
     return proposal;
 }
 
-template <typename ObservationRange>
+[[nodiscard]] detail::FiberAnchorObjectiveConfig objectiveConfig(
+    const FiberAnchorConfig& config)
+{
+    return {
+        config.gaussianSigmaPredictionVoxels,
+        config.gaussianCutoffSigmas,
+        config.axialSupportHalfWidthPredictionVoxels,
+        config.observationPresenceFloor,
+    };
+}
+
+[[nodiscard]] std::array<detail::FiberAnchorObjectiveComponent, 2>
+objectiveComponents(const std::array<RefinedComponentState, 2>& components)
+{
+    std::array<detail::FiberAnchorObjectiveComponent, 2> result;
+    for (size_t component = 0; component < result.size(); ++component) {
+        result[component].axis = components[component].axis;
+        result[component].position = components[component].position;
+    }
+    return result;
+}
+
 [[nodiscard]] double retainedSpatialObjective(
-    const ObservationRange& observations,
+    const std::vector<FiberAnchorObservation>& observations,
     const std::array<RefinedComponentState, 2>& components,
     size_t activeComponents,
     const std::vector<uint8_t>& assignments,
@@ -907,31 +920,13 @@ template <typename ObservationRange>
     const cv::Vec3d& pivot,
     const FiberAnchorConfig& config)
 {
-    CompensatedSum numerator;
-    CompensatedSum denominator;
-    for (size_t index = 0; index < observations.size(); ++index) {
-        for (size_t component = 0; component < activeComponents; ++component) {
-            denominator.add(transverseGaussian(
-                observations[index], components[component], pivot, config));
-        }
-        const uint8_t component = assignments[index];
-        cv::Vec3d direction;
-        if (!retainedInliers[index] || component >= activeComponents)
-            continue;
-        if (!usableDirectionObservation(observations[index], config, direction))
-            continue;
-        const double gaussian = transverseGaussian(
-            observations[index], components[component], pivot, config);
-        const double dot = direction.dot(components[component].axis);
-        numerator.add(gaussian * observationPresence(observations[index]) *
-            dot * dot);
-    }
-    return denominator.sum > 0.0 ? numerator.sum / denominator.sum : 0.0;
+    return detail::retainedSpatialObjectiveExpanded(
+        observations, objectiveComponents(components), activeComponents,
+        assignments, retainedInliers, pivot, objectiveConfig(config));
 }
 
-template <typename ObservationRange>
 [[nodiscard]] std::array<double, 2> retainedSpatialObjectivePair(
-    const ObservationRange& observations,
+    const std::vector<FiberAnchorObservation>& observations,
     const std::array<RefinedComponentState, 2>& first,
     const std::array<RefinedComponentState, 2>& second,
     size_t activeComponents,
@@ -940,43 +935,42 @@ template <typename ObservationRange>
     const cv::Vec3d& pivot,
     const FiberAnchorConfig& config)
 {
-    std::array<CompensatedSum, 2> numerators;
-    std::array<CompensatedSum, 2> denominators;
-    for (size_t index = 0; index < observations.size(); ++index) {
-        const auto& observation = observations[index];
-        for (size_t component = 0; component < activeComponents; ++component) {
-            denominators[0].add(transverseGaussian(
-                observation, first[component], pivot, config));
-            denominators[1].add(transverseGaussian(
-                observation, second[component], pivot, config));
-        }
-        const uint8_t component = assignments[index];
-        if (!retainedInliers[index] || component >= activeComponents)
-            continue;
-        cv::Vec3d direction;
-        if (!usableDirectionObservation(observation, config, direction))
-            continue;
-        const double firstGaussian = transverseGaussian(
-            observation, first[component], pivot, config);
-        const double secondGaussian = transverseGaussian(
-            observation, second[component], pivot, config);
-        const double firstDot = direction.dot(first[component].axis);
-        const double secondDot = direction.dot(second[component].axis);
-        numerators[0].add(
-            firstGaussian * observationPresence(observation) *
-            firstDot * firstDot);
-        numerators[1].add(
-            secondGaussian * observationPresence(observation) *
-            secondDot * secondDot);
-    }
-    return {
-        denominators[0].sum > 0.0
-            ? numerators[0].sum / denominators[0].sum
-            : 0.0,
-        denominators[1].sum > 0.0
-            ? numerators[1].sum / denominators[1].sum
-            : 0.0,
-    };
+    return detail::retainedSpatialObjectivePairExpanded(
+        observations, objectiveComponents(first), objectiveComponents(second),
+        activeComponents, assignments, retainedInliers, pivot,
+        objectiveConfig(config));
+}
+
+[[nodiscard]] double retainedSpatialObjective(
+    const IndexedObservationRange<CompactFiberAnchorObservation>& observations,
+    const std::array<RefinedComponentState, 2>& components,
+    size_t activeComponents,
+    const std::vector<uint8_t>& assignments,
+    const std::vector<uint8_t>& retainedInliers,
+    const cv::Vec3d& pivot,
+    const FiberAnchorConfig& config)
+{
+    return detail::retainedSpatialObjectiveCompact(
+        observations.observationStorage(), observations.observationIndices(),
+        objectiveComponents(components), activeComponents, assignments,
+        retainedInliers, pivot, objectiveConfig(config));
+}
+
+[[nodiscard]] std::array<double, 2> retainedSpatialObjectivePair(
+    const IndexedObservationRange<CompactFiberAnchorObservation>& observations,
+    const std::array<RefinedComponentState, 2>& first,
+    const std::array<RefinedComponentState, 2>& second,
+    size_t activeComponents,
+    const std::vector<uint8_t>& assignments,
+    const std::vector<uint8_t>& retainedInliers,
+    const cv::Vec3d& pivot,
+    const FiberAnchorConfig& config)
+{
+    return detail::retainedSpatialObjectivePairCompact(
+        observations.observationStorage(), observations.observationIndices(),
+        objectiveComponents(first), objectiveComponents(second),
+        activeComponents, assignments, retainedInliers, pivot,
+        objectiveConfig(config));
 }
 
 template <typename ObservationRange>

@@ -2546,6 +2546,16 @@
   cannot create normalization holes that attract or repel the fit. Coherence
   divides by retained assigned `sum g_ik p_i`. Empty, degenerate, and
   below-threshold components are discarded independently.
+- Fixed-direction spatial objectives are implemented in a separate private
+  objective module. Production indexed compact observations remain float32
+  through Gaussian, alignment, numerator, denominator, and final ratio
+  arithmetic; their directions are already normalized by compact-observation
+  construction. Logical assignment/membership indices address the per-cell
+  index stream, while observations address the indexed tile storage. The
+  expanded public fitter retains normalized double directions and compensated
+  double accumulation. Persistent component state, acceptance tolerances,
+  final aligned-support evaluation, diagnostics, and serialization remain
+  double precision.
 - Robust assignment, trimming, direct direction update, and position update run
   for at most `maximum_iterations`, default 2. This is a bounded alternating
   refinement budget, not convergence to exact equality of hard assignment or

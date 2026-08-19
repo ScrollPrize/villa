@@ -128,3 +128,14 @@ existing eigensolver. The public double-observation path remains double through
 the same scalar-generic implementation. Build and validate now, but do not run
 the canonical performance benchmark until the user confirms the computer is
 free.
+
+Checkpoint 21 tested float32 fixed-direction spatial objectives used by anchor
+position backtracking. Although the target kernel improved by 10.9%, the added
+specialization consistently perturbed code generation enough to regress the
+separate robust tensor proposal and total runtime. The experiment was removed;
+checkpoint 20 remains the production baseline.
+
+Checkpoint 22 retests that demonstrated compact-float objective kernel in a
+separate translation unit so its code generation cannot perturb the robust
+tensor-proposal implementation. Keep the expanded public fitter on its existing
+double path and retain the experiment only if enclosing runtime improves.
