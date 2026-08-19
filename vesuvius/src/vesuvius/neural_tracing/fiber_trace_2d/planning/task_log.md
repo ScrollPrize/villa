@@ -1697,3 +1697,77 @@
 - Retained the checkpoint because the targeted search and DP gains repeated in
   all three pairs, enclosing fiberlet time improved, command time did not
   regress, and replay output remained exact.
+
+## Checkpoint 36: prepared outgoing-edge smoothness
+
+- Started from committed checkpoint 35 (`08b4ea9cb`). The canonical profile
+  records 28,279,855 valid outgoing edges and 83,916,118 reused edge
+  evaluations, so candidate-side normal projection, tangent normalization, and
+  inverse-sine are currently repeated about four times per valid edge.
+- The isolated experiment will move those candidate-only intermediates into a
+  shared private prepared descriptor stored on each stack-local `DpEdge`.
+  Existing public and non-DP callers will prepare on demand through the same
+  scorer. Exact costs, transitions, populations, failures, and replay bytes are
+  required; alternating measurements against `08b4ea9cb` decide retention.
+- Independent review required the descriptor to own its normal, preservation
+  of the invalid-prediction early return, a direct private-path comparison with
+  an independent full-metric oracle, non-finite/degenerate branch coverage,
+  descriptor-size and reuse accounting, and explicit benchmark reproducibility
+  details. The plan now includes each requirement. It also removes the proposed
+  redundant candidate normal component; only its computed angle is retained.
+- Implemented the source-private prepared descriptor and one shared
+  candidate-prepared smoothness/metric path. The unchanged public prepared
+  scorer preserves invalid-prediction early return and otherwise prepares on
+  demand. Each valid `DpEdge` now prepares once after prediction-deviation
+  admission and reuses the descriptor for every reached incoming state.
+- Added a direct private-path test against an independent test-local copy of
+  the complete legacy metric equation. Coverage includes valid normal-aware
+  scoring, invalid/zero/NaN/Inf normals, each and both tangent degeneracies,
+  zero/NaN/Inf directions, invalid prediction, and nonpositive lengths. GCC
+  passed 51 path and 6 replay cases; repository-local Clang passed all 51 path
+  cases. All five exported local-scoring symbols retain their existing ABI.
+- The prepared descriptor is 32 bytes and `DpEdge` grows from 24 to 56 bytes,
+  increasing the fixed nine-edge worker stack by 288 bytes. Disassembly maps
+  the candidate `asin` to outgoing-edge construction at `FiberPaths.cpp:2014`;
+  the reused transition loop retains only the previous-side `asin`. The
+  baseline had both inverse-sine calls together in transition scoring.
+- Canonical command, substituting only the baseline/candidate executable and a
+  distinct output directory:
+
+  ```text
+  /usr/bin/time -v <vc_fiberlets> fiberlet-replay \
+    /home/hendrik/business/aiconsulting/vesuviuschallenge/data/s1/PHercParis4.volpkg/volumes/fiber_s1_002.lasagna.json \
+    /home/hendrik/business/aiconsulting/vesuviuschallenge/data/fibers/david/Paris4_fibers/dj_20260805T025256484_000003.json \
+    <output> \
+    --normal-manifest /home/hendrik/business/aiconsulting/vesuviuschallenge/data/lasagna3d_inf/las008_s1_full/las_008.lasagna.json \
+    --threads 32 --length 5000 --maximum-iterations 2
+  ```
+
+  Both builds used matching QuickBuild configuration with `VC_TESTING=ON`.
+  Baseline was commit `08b4ea9cb`; order was `B/C, C/B, B/C`, with host-load
+  checks before every run. Logs and artifacts are under
+  `volume-cartographer/build/benchmarks/checkpoint36/`.
+
+  | metric | baseline min/median/max | candidate min/median/max | median change |
+  |---|---:|---:|---:|
+  | command wall | `7.50/7.53/7.56 s` | `7.52/7.52/7.53 s` | `-0.1%` |
+  | total CPU | `199.42/200.06/200.20 s` | `199.16/200.31/201.12 s` | `+0.1%` |
+  | anchor wall | `5.0809/5.0846/5.1172 s` | `5.0880/5.1034/5.1043 s` | `+0.4%` |
+  | anchor CPU | `141.753/142.159/142.395 s` | `142.139/142.969/143.247 s` | `+0.6%` |
+  | fiberlet wall | `1.8906/1.8996/1.9083 s` | `1.8745/1.8814/1.9008 s` | `-1.0%` |
+  | fiberlet CPU | `55.605/55.725/55.828 s` | `54.945/55.268/55.813 s` | `-0.8%` |
+  | search wall | `0.9632/0.9701/0.9710 s` | `0.9471/0.9505/0.9554 s` | `-2.0%` |
+  | search CPU | `30.133/30.251/30.397 s` | `29.713/29.821/29.978 s` | `-1.4%` |
+  | DP worker | `30.418/30.640/30.696 s` | `29.935/29.988/30.192 s` | `-2.1%` |
+  | peak RSS | `1,614,972/1,616,896/1,619,728 KiB` | `1,609,032/1,609,532/1,619,236 KiB` | `-0.5%` |
+
+- All six runs retained 2,519 anchors, 48,852 searched / 24,475 accepted
+  candidates, 28,279,855 valid outgoing edges, 83,916,118 reused edge
+  evaluations, 58,058,924 relaxations, and 2 greedy / 1 fiberlet failures.
+  Every artifact was byte-identical with SHA-256
+  `904c39d08e39c6b7b65ac95fd47d28d50e254a33609201c92aef71c6cc131308`.
+- Retained the checkpoint because search and DP gains repeated in all three
+  pairs, enclosing fiberlet time improved, RSS did not regress, and replay
+  output remained exact. Future performance checkpoints will use one invariant
+  benchmark launcher command and change baseline/candidate/output selection
+  only through local launcher configuration.

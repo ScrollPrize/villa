@@ -7,6 +7,8 @@
 #include "vc/fiber_tracer/FiberPaths.hpp"
 #include "vc/lasagna/ChannelSampler.hpp"
 
+#include "../src/fiber_tracer/FiberLocalScoringInternal.hpp"
+
 #include <opencv2/imgcodecs.hpp>
 
 #include <algorithm>
@@ -327,6 +329,60 @@ vc::fiber_tracer::FiberLocalSmoothnessCost legacyFiberLocalSmoothnessCost(
     return cost;
 }
 
+vc::fiber_tracer::FiberLocalMetricCost legacyFiberLocalMetricCostPrepared(
+    const vc::fiber_tracer::FiberLocalMetricSample* currentPrediction,
+    const vc::fiber_tracer::FiberLocalMetricSample& candidatePrediction,
+    const cv::Vec3f& previousStepDirection,
+    float previousStepLength,
+    const cv::Vec3f& candidateStepDirection,
+    float candidateStepLength,
+    const cv::Vec3f& normal,
+    bool normalValid,
+    const vc::fiber_tracer::FiberLocalMetricConfig& config)
+{
+    vc::fiber_tracer::FiberLocalMetricCost cost;
+    if (!candidatePrediction.valid) {
+        cost.invalidPrediction = config.invalidPredictionCostPerVoxel *
+                                 std::max(0.0f, candidateStepLength);
+        return cost;
+    }
+    const auto clampPositiveUnit = [](float value) {
+        if (!std::isfinite(value))
+            return 0.0f;
+        return std::clamp(value, 0.0f, 1.0f);
+    };
+    cv::Vec3f currentAxis = previousStepDirection;
+    if (currentPrediction != nullptr && currentPrediction->valid) {
+        currentAxis = currentPrediction->direction;
+        if (currentAxis.dot(previousStepDirection) < 0.0f)
+            currentAxis *= -1.0f;
+    }
+    cv::Vec3f candidateAxis = candidatePrediction.direction;
+    if (candidateAxis.dot(candidateStepDirection) < 0.0f)
+        candidateAxis *= -1.0f;
+    float score = clampPositiveUnit(candidatePrediction.presence);
+    score *= clampPositiveUnit(
+        previousStepDirection.dot(candidateStepDirection));
+    score *= clampPositiveUnit(previousStepDirection.dot(currentAxis));
+    score *= clampPositiveUnit(previousStepDirection.dot(candidateAxis));
+    score *= clampPositiveUnit(currentAxis.dot(candidateStepDirection));
+    score *= clampPositiveUnit(currentAxis.dot(candidateAxis));
+    score *= clampPositiveUnit(candidateStepDirection.dot(candidateAxis));
+    cost.alignment = (1.0f - score) *
+                     std::max(0.0f, candidateStepLength);
+    const auto smoothness = legacyFiberLocalSmoothnessCost(
+        previousStepDirection, candidateStepDirection,
+        normal, normalValid, config.smoothness);
+    const float effectiveLength = std::max(
+        1.0f,
+        (std::max(0.0f, previousStepLength) +
+         std::max(0.0f, candidateStepLength)) * 0.5f);
+    cost.isotropicSmoothness = smoothness.isotropic / effectiveLength;
+    cost.tangentSmoothness = smoothness.tangent / effectiveLength;
+    cost.normalSmoothness = smoothness.normal / effectiveLength;
+    return cost;
+}
+
 }  // namespace
 
 TEST_CASE("fiber local smoothness preserves native split equations")
@@ -464,6 +520,94 @@ TEST_CASE("prepared fiber local scoring matches validating scoring")
                {}, 0.0f, normal, true);
     checkExact(&current, nonFinitePresence, previousStep, 1.5f,
                candidateStep, 2.25f, normal, true);
+}
+
+TEST_CASE("candidate-prepared fiber local scoring preserves legacy metric branches")
+{
+    using namespace vc::fiber_tracer;
+    const FiberLocalMetricConfig config{
+        4.0f,
+        FiberLocalSmoothnessConfig{2.0f, 0.1f, 10.0f, 0.05f},
+    };
+    const FiberLocalMetricSample current{{0.8f, 0.6f, 0.0f}, 0.75f, true};
+    const FiberLocalMetricSample candidate{{0.6f, -0.8f, 0.0f}, 0.6f, true};
+    const FiberLocalMetricSample invalidCandidate{{}, 0.6f, false};
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float infinity = std::numeric_limits<float>::infinity();
+    struct TestCase {
+        const FiberLocalMetricSample* currentPrediction;
+        FiberLocalMetricSample candidatePrediction;
+        cv::Vec3f previous;
+        float previousLength;
+        cv::Vec3f candidate;
+        float candidateLength;
+        cv::Vec3f normal;
+        bool normalValid;
+    };
+    const std::array cases{
+        TestCase{&current, candidate, {1.0f, 0.0f, 0.0f}, 1.5f,
+                 {0.0f, 1.0f, 0.0f}, 2.25f,
+                 {0.0f, 0.0f, 1.0f}, true},
+        TestCase{&current, candidate, {1.0f, 0.0f, 0.0f}, 1.5f,
+                 {0.0f, 1.0f, 0.0f}, 2.25f, {}, false},
+        TestCase{&current, candidate, {1.0f, 0.0f, 0.0f}, 1.5f,
+                 {0.0f, 1.0f, 0.0f}, 2.25f, {}, true},
+        TestCase{&current, candidate, {1.0f, 0.0f, 0.0f}, 1.5f,
+                 {0.0f, 1.0f, 0.0f}, 2.25f,
+                 {infinity, 0.0f, 0.0f}, true},
+        TestCase{&current, candidate, {1.0f, 0.0f, 0.0f}, 1.5f,
+                 {0.0f, 1.0f, 0.0f}, 2.25f,
+                 {nan, 0.0f, 0.0f}, true},
+        TestCase{&current, candidate, {0.0f, 0.0f, 1.0f}, 1.5f,
+                 {1.0f, 0.0f, 0.0f}, 2.25f,
+                 {0.0f, 0.0f, 1.0f}, true},
+        TestCase{&current, candidate, {1.0f, 0.0f, 0.0f}, 1.5f,
+                 {0.0f, 0.0f, 1.0f}, 2.25f,
+                 {0.0f, 0.0f, 1.0f}, true},
+        TestCase{&current, candidate, {0.0f, 0.0f, 1.0f}, 1.5f,
+                 {0.0f, 0.0f, -1.0f}, 2.25f,
+                 {0.0f, 0.0f, 1.0f}, true},
+        TestCase{nullptr, candidate, {}, 0.0f,
+                 {1.0f, 0.0f, 0.0f}, 2.25f,
+                 {0.0f, 0.0f, 1.0f}, true},
+        TestCase{nullptr, candidate, {1.0f, 0.0f, 0.0f}, 1.5f,
+                 {}, 0.0f, {0.0f, 0.0f, 1.0f}, true},
+        TestCase{nullptr, candidate, {nan, 0.0f, 0.0f}, 1.5f,
+                 {1.0f, 0.0f, 0.0f}, 2.25f,
+                 {0.0f, 0.0f, 1.0f}, true},
+        TestCase{nullptr, candidate, {1.0f, 0.0f, 0.0f}, 1.5f,
+                 {infinity, 0.0f, 0.0f}, 2.25f,
+                 {0.0f, 0.0f, 1.0f}, true},
+        TestCase{&current, invalidCandidate, {nan, 0.0f, 0.0f}, -1.5f,
+                 {infinity, 0.0f, 0.0f}, -2.25f,
+                 {infinity, nan, 0.0f}, true},
+        TestCase{&current, candidate, {1.0f, 0.0f, 0.0f}, -1.5f,
+                 {0.0f, 1.0f, 0.0f}, -2.25f,
+                 {0.0f, 0.0f, 1.0f}, true},
+    };
+
+    for (const auto& test : cases) {
+        const auto expected = legacyFiberLocalMetricCostPrepared(
+            test.currentPrediction, test.candidatePrediction,
+            test.previous, test.previousLength,
+            test.candidate, test.candidateLength,
+            test.normal, test.normalValid, config);
+        const auto candidateSmoothness = test.candidatePrediction.valid
+            ? detail::prepareFiberLocalCandidateSmoothnessInline(
+                  test.candidate, test.normal, test.normalValid)
+            : detail::FiberLocalPreparedCandidateSmoothness{};
+        const auto actual =
+            detail::fiberLocalMetricCostCandidatePreparedInline(
+                test.currentPrediction, test.candidatePrediction,
+                test.previous, test.previousLength,
+                test.candidate, test.candidateLength,
+                candidateSmoothness, config);
+        CHECK(actual.invalidPrediction == expected.invalidPrediction);
+        CHECK(actual.alignment == expected.alignment);
+        CHECK(actual.isotropicSmoothness == expected.isotropicSmoothness);
+        CHECK(actual.tangentSmoothness == expected.tangentSmoothness);
+        CHECK(actual.normalSmoothness == expected.normalSmoothness);
+    }
 }
 
 TEST_CASE("fiber local alignment loss preserves native multiplicative scoring")

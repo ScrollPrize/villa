@@ -1942,3 +1942,80 @@ unchanged populations and DP work, and 2 greedy / 1 fiberlet failures.
   `904c39d08e39c6b7b65ac95fd47d28d50e254a33609201c92aef71c6cc131308`,
   with exact populations, DP counters, routes, and 2 greedy / 1 fiberlet
   failures.
+
+### Checkpoint 36: prepared outgoing-edge smoothness
+
+1. Extract candidate-side normal-aware smoothness preparation into the shared
+   source-private local-scoring implementation. The descriptor will own the
+   normal from which it was prepared and retain only the normalized candidate
+   tangent, candidate normal angle, and compact branch state needed by the
+   existing equations. This makes mismatched descriptor/normal use impossible
+   and avoids retaining the redundant candidate normal component.
+2. Add a shared metric-cost entry point that accepts an already prepared
+   candidate smoothness descriptor. Keep the existing prepared-direction entry
+   point as an on-demand wrapper over the same implementation so exported
+   public callers, source/sink transitions, and DP transitions cannot diverge.
+   Do not copy scoring equations into `FiberPaths.cpp`. Preserve the invalid
+   candidate-prediction early return before on-demand preparation so invalid or
+   non-finite geometry does not evaluate projection or inverse sine.
+3. Prepare and store the descriptor in each valid stack-local `DpEdge`, using
+   that edge's direction and destination normal. Reuse it for all reached
+   incoming states. Preserve outgoing-edge generation order, transition order,
+   accumulation order, tie policy, precision, and returned arithmetic exactly.
+4. Include the source-private header directly from the focused path test and
+   compare the candidate-prepared metric route against an independent
+   test-local implementation of the complete legacy metric equation. Cover
+   valid normal-aware scoring, invalid and zero normals, NaN/Inf normals with a
+   valid flag, previous-only and candidate-only projected-tangent degeneracy,
+   both-sided degeneracy, zero/non-finite step directions, invalid candidate
+   prediction, and nonpositive edge lengths. Run focused GCC path/replay tests
+   and repository-local Clang path tests. Inspect optimized DP code to verify
+   that candidate projection, normalization, and inverse-sine are outside the
+   incoming-state reuse loop.
+5. Record baseline/candidate `sizeof(DpEdge)`, prepared-descriptor count, valid
+   edge count, and reuse count, and inspect generated code for stack growth or
+   spills. Use operation counts and disassembly rather than per-transition
+   timers that would distort this short hot loop; aggregate DP/search timing
+   remains the runtime gate.
+6. Build an uninstrumented QuickBuild `VC_TESTING=ON` baseline at commit
+   `08b4ea9cb` with CMake options matching the candidate. Use the canonical
+   Paris4 5,000-length replay, 32 threads, two maximum iterations, warm cache,
+   and distinct output directories. Check host CPU load, screen once, then run
+   three counterbalanced warm pairs in order `B/C, C/B, B/C`. Record the exact
+   command and dataset paths plus min/median/max command wall/CPU, anchor
+   wall/CPU, fiberlet wall/CPU, search wall/CPU, DP worker time, RSS,
+   populations, DP counters, routes, failures, and hashes. Retain only a
+   repeatable enclosing gain with byte-identical replay output; otherwise
+   remove the experiment.
+
+#### Checkpoint 36 spec update
+
+- None. The optimization reuses identical candidate-side intermediates within
+  one reached node; scoring equations, precision, inputs, outputs, and
+  decisions remain unchanged.
+
+#### Checkpoint 36 documentation update
+
+- If retained, update `volume-cartographer/docs/fiberlets.md` to document
+  outgoing-edge candidate smoothness preparation and add a concise changelog
+  entry. Record the complete experiment and measurements in
+  `planning/task_log.md`. If rejected, retain only the experiment record in the
+  active planning files.
+
+#### Checkpoint 36 result
+
+- Retained. The private descriptor owns its destination normal and stores one
+  normalized candidate tangent, one candidate normal angle, and compact branch
+  state. `DpEdge` grows from 24 to 56 bytes, adding 288 stack bytes for its
+  fixed nine-edge array. Optimized code places the candidate `asin` in outgoing
+  construction and leaves only the previous-side `asin` in transition reuse.
+- Three counterbalanced uninstrumented QuickBuild pairs reduced median search
+  wall from `0.9701` to `0.9505` seconds (2.0%), search CPU from `30.2511` to
+  `29.8211` seconds (1.4%), DP worker time from `30.6398` to `29.9875` seconds
+  (2.1%), and fiberlet wall from `1.8996` to `1.8814` seconds (1.0%). Median
+  command wall was effectively flat at `7.53/7.52` seconds because anchor work
+  dominates the enclosing run.
+- All six artifacts had SHA-256
+  `904c39d08e39c6b7b65ac95fd47d28d50e254a33609201c92aef71c6cc131308`,
+  with exact populations, DP counters, routes, and 2 greedy / 1 fiberlet
+  failures.

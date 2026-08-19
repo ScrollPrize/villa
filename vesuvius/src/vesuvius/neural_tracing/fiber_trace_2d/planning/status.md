@@ -63,6 +63,12 @@
 - [x] Checkpoint 35: run GCC/Clang validation and inspect optimized code.
 - [x] Checkpoint 35: benchmark alternating baseline/candidate pairs.
 - [x] Checkpoint 35: retain or remove based on measured enclosing performance.
+- [x] Checkpoint 36: inspect outgoing-edge reuse and write the detailed plan.
+- [x] Checkpoint 36: independently review the plan.
+- [x] Checkpoint 36: implement shared candidate-side smoothness preparation.
+- [x] Checkpoint 36: run GCC/Clang validation and inspect optimized code.
+- [x] Checkpoint 36: benchmark alternating baseline/candidate pairs.
+- [x] Checkpoint 36: retain or remove based on measured enclosing performance.
 - [x] Obtain approval for checkpoint 30 terminal membership reuse.
 - [x] Refine checkpoint 30 semantics and quality/performance gates.
 - [x] Independently review checkpoint 30 against the task and specifications.

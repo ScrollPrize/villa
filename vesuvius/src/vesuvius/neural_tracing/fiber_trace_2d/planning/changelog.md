@@ -4,6 +4,10 @@
   both compact and expanded observation paths in checked float32 arithmetic.
 - Reduced canonical final-evaluation worker time by 4.9%, anchor CPU by 1.4%,
   and total wall by 0.4% with byte-identical replay artifacts.
+- Prepared candidate-side normal-aware smoothness once per outgoing fiberlet DP
+  edge and reused it across incoming states. Canonical search wall and DP worker
+  time improved about 2.0% and 2.1%, respectively, with byte-identical replay
+  artifacts.
 
 # 2026-08-18: solve-local fiberlet DP reuse
 

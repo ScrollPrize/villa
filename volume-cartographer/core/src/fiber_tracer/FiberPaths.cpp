@@ -277,6 +277,7 @@ struct DpEdge {
     uint32_t scoring = std::numeric_limits<uint32_t>::max();
     cv::Vec3f metricDirection{0.0f, 0.0f, 0.0f};
     float metricLength = 0.0f;
+    detail::FiberLocalPreparedCandidateSmoothness candidateSmoothness;
 };
 
 struct DpAccumulatedCost {
@@ -1598,15 +1599,14 @@ FiberLocalMetricCost pathStepMetricCostPrepared(
     float previousLength,
     const cv::Vec3f& candidateDirection,
     float candidateLength,
-    const cv::Vec3f& normal,
-    bool normalValid,
+    const detail::FiberLocalPreparedCandidateSmoothness& candidateSmoothness,
     const FiberLocalMetricConfig& config)
 {
-    return detail::fiberLocalMetricCostPreparedInline(
+    return detail::fiberLocalMetricCostCandidatePreparedInline(
         currentPrediction, candidatePrediction,
         previousDirection, previousLength,
         candidateDirection, candidateLength,
-        normal, normalValid, config);
+        candidateSmoothness, config);
 }
 
 bool betterCost(float candidate, float current)
@@ -2008,11 +2008,18 @@ FiberletCandidateResult solveCandidate(
                             maximumPredictionDeviation)) {
                         continue;
                     }
+                    const auto& nextScoring = dpNodes.at(nextScoringIndex);
+                    const cv::Vec3f metricDirection =
+                        prepareFiberLocalUnitDirection(direction);
                     outgoing[transitionState] = {
                         found,
                         nextScoringIndex,
-                        prepareFiberLocalUnitDirection(direction),
+                        metricDirection,
                         stepLength,
+                        detail::prepareFiberLocalCandidateSmoothnessInline(
+                            metricDirection,
+                            nextScoring.metricNormal,
+                            (nextScoring.flags & kNodeNormalValid) != 0),
                     };
                     ++validEdges;
                 }
@@ -2048,8 +2055,7 @@ FiberletCandidateResult solveCandidate(
                             incoming.metricLength,
                             edge.metricDirection,
                             edge.metricLength,
-                            nextScoring.metricNormal,
-                            (nextScoring.flags & kNodeNormalValid) != 0,
+                            edge.candidateSmoothness,
                             metricConfig);
                         auto& destination = nextStates[
                             (next - nextRange.begin) * stateCount +

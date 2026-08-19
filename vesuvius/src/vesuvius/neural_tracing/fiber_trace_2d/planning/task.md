@@ -244,10 +244,11 @@ paired run. The polynomial met the error and replay-quality gates but clearly
 regressed peak, anchor, and command time. Both variants were removed; the
 committed `expf` implementation remains the production baseline.
 
-The current measured continuation will test lazy isotropic-smoothness
-evaluation in the shared local scorer, whose inlined prepared path is hot in
-fiberlet DP. Normal-aware transitions with valid projected tangents must not
-compute the otherwise unused isotropic angle. Isotropic fallback and degenerate
-projected-tangent behavior must remain exact. Retain the checkpoint only if
-alternating canonical measurements show a repeatable enclosing gain with
-byte-identical replay output.
+Checkpoint 35 retained lazy isotropic-smoothness evaluation in the shared local
+scorer. The current measured continuation will prepare the candidate side of
+normal-aware smoothness once per outgoing DP edge, then reuse it across every
+reached incoming state. The shared local scorer must remain the sole owner of
+the equations; public callers prepare on demand, while the DP stores only a
+stack-local prepared descriptor. Retain the checkpoint only if exact branch
+coverage and byte-identical replay output hold and alternating canonical
+measurements show a repeatable enclosing gain.

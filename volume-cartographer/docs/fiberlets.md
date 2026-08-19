@@ -339,7 +339,11 @@ The shared smoothness implementation evaluates isotropic curvature only when
 an invalid normal or a degenerate projected tangent actually requires that
 fallback. Normal-aware transitions with valid projected tangents therefore
 avoid an otherwise unused inverse-cosine evaluation without changing any
-returned cost.
+returned cost. Each reached node also prepares the outgoing edge's destination
+normal, projected candidate tangent, and candidate normal angle once, then
+reuses those exact intermediates across every incoming DP state. Public and
+non-DP callers prepare the same private descriptor on demand through the shared
+scorer; there is no separate scoring equation.
 
 Source and sink transitions use the fitted endpoint axes as proxy endpoint
 predictions; sink presence is one. Curvature uses the native tracer's shared
