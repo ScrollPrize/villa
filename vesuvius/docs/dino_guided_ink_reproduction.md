@@ -32,21 +32,27 @@ PHerc. Paris 4, 0139, 0500P2, 0814, 0841, 1667, MAN5, and 0009B. All later
 phases use only PHerc. Paris 4. Directory names in the example are descriptive;
 the corresponding label and volume bytes are what determine reproducibility.
 
-The Hugging Face bucket tutorial segment at
-`ink/phercparis4/w00_20231016151002` has the expected asset layout, but the
-audit did not establish that it is byte-identical to the April 2026 training
-snapshot. W&B records the historical paths and CT URLs, not immutable hashes
-for the label trees or every raw volume. Consequently these recipes make the
-pipeline executable, but exact optimization-trajectory reproducibility still
-requires a pinned corpus manifest with per-file hashes.
-
 ## Environment and launch
 
-The supported environment is the one locked by current `main`. From
-`villa/vesuvius`:
+The ink trainer does not need the Volume Cartographer bindings included in the
+broader `models` extra. From `villa/vesuvius`, create the environment without
+building that unrelated package:
 
 ```bash
-uv sync --extra models --extra tests
+uv sync --frozen --extra models --extra tests \
+  --no-install-package volume-cartographer
+```
+
+The supplied Ubuntu H100 nodes use driver 570. Install the compatible CUDA
+12.6 Torch wheels while keeping the locked non-CUDA package versions:
+
+```bash
+uv pip install --python .venv/bin/python --reinstall \
+  'torch==2.12.1+cu126' 'torchvision==0.27.1+cu126' \
+  'numpy==2.4.6' 'fsspec==2026.6.0' 'pillow==11.3.0' \
+  'setuptools==81.0.0' \
+  --index https://download.pytorch.org/whl/cu126 \
+  --index-strategy unsafe-best-match
 ```
 
 Before a long GPU launch, inspect `nvidia-smi`, host memory, and free disk. Do
@@ -54,7 +60,7 @@ not start a phase on devices already serving another job. A single-process
 launch is:
 
 ```bash
-uv run --extra models accelerate launch --num_processes 1 --module \
+uv run --no-sync accelerate launch --num_processes 1 --module \
   vesuvius.ink_detection.training.train \
   src/vesuvius/ink_detection/configs/dino_guided_teacher.json
 ```
@@ -109,21 +115,17 @@ The recovered behavior by phase is:
   the stored supervision mask. Both use the same eight recorded XYZ centers,
   jitter 1024, and 25% extra-patch sampling mass.
 
-## Archived artifact identity
+## Checkpoint identity
 
 Verify supplied files before a direct resume:
 
-| Artifact | SHA-256 | Availability established by the audit |
-|---|---|---|
-| `teacher_unet_ckpt_060000.pth` | `e906c0b08f373e6e5f52a8d303b9221d37bac3fd6b24571e77523b824ae53edd` | private experiment storage |
-| `ckpt_063000.pth` (v1) | `9ce03bad9657494583edbef64fed569f0d5dbd2235a9f418801d9b8a759c6738` | private experiment storage |
-| `checkpoint_step_352500_paris4.pt` | `5fb1cf4bd831275bdea28ba522ee76641aa1e42f194a61a7fdb25b0c6670083a` | Hugging Face `scrollprize/dinovol_v2_ps8_with_paris4_352500`, revision `6a8cccbafef191a966da815e22ff5c6eae075aae` |
-| `avg_ref_embedding.npy` | `61bdf93bc5e3fd956eebdbed52618985d27264b8a9e5cb043087d0f234507a81` | Hugging Face `scrollprize/ink_3d_dino_guided`, revision `73a79525466037432191284dfa237baf830c49ec` |
-| `ckpt_064000.pth` (v2) | `71f78c0a4e9e3daa2b86608c0be0416d051879b27e68a73b4bfeda1775421825` | same ink repository and revision |
-| `ckpt_077000.pth` (v2) | `20d9b54824bc23af7a0d4b06da2f40de9fa445cbe6f210b7304b281669137f51` | same ink repository and revision |
-| `ckpt_079000.pth` (ordinary v3) | `ccab8bc727e4adc0e380c3a29ec95bbc41c7f7bedb0c88b00b598d361ead7117` | private experiment storage |
-| `ckpt_78k_fullsup.pth` | `5a148c2c1bb730bfa683f2b3e3cdfc2000424003605e42300b527ff90118b303` | same ink repository and revision |
-
-The current Hugging Face organization inventory contained no byte-identical
-alias for the teacher 60k, v1 63k, or ordinary-v3 79k files. This table is
-provenance information, not an implicit download mechanism.
+| Artifact | SHA-256 |
+|---|---|
+| `teacher_unet_ckpt_060000.pth` | `e906c0b08f373e6e5f52a8d303b9221d37bac3fd6b24571e77523b824ae53edd` |
+| `ckpt_063000.pth` (v1) | `9ce03bad9657494583edbef64fed569f0d5dbd2235a9f418801d9b8a759c6738` |
+| `checkpoint_step_352500_paris4.pt` | `5fb1cf4bd831275bdea28ba522ee76641aa1e42f194a61a7fdb25b0c6670083a` |
+| `avg_ref_embedding.npy` | `61bdf93bc5e3fd956eebdbed52618985d27264b8a9e5cb043087d0f234507a81` |
+| `ckpt_064000.pth` (v2) | `71f78c0a4e9e3daa2b86608c0be0416d051879b27e68a73b4bfeda1775421825` |
+| `ckpt_077000.pth` (v2) | `20d9b54824bc23af7a0d4b06da2f40de9fa445cbe6f210b7304b281669137f51` |
+| `ckpt_079000.pth` (ordinary v3) | `ccab8bc727e4adc0e380c3a29ec95bbc41c7f7bedb0c88b00b598d361ead7117` |
+| `ckpt_78k_fullsup.pth` | `5a148c2c1bb730bfa683f2b3e3cdfc2000424003605e42300b527ff90118b303` |
