@@ -6,6 +6,7 @@ import torch
 import losses
 from losses import PatchWalk, SampledWalk
 from theta_crossing_map import ThetaCrossingMap
+from winding_supervision import get_winding_model_patch_relative_loss
 
 
 DR = 12.0
@@ -162,4 +163,37 @@ def test_relative_winding_loss_keeps_both_annotation_frames(monkeypatch):
         _IdentityTransform(), torch.tensor(DR),
         {'p1': object(), 'p2': object()}, atlas, [pcl], strata,
         crossing_map=crossing_map, cfg=cfg, z_begin=-1, z_end=1)
+    assert loss.item() < 1e-5
+
+
+def test_winding_model_patch_loss_uses_the_same_seam_transport(monkeypatch):
+    points = [
+        _spiral_point(6.0, 4),
+        _spiral_point(6.1, 4),
+        _spiral_point(0.1, 5),
+        _spiral_point(0.2, 5),
+        _spiral_point(5.0, 6),
+        _spiral_point(5.1, 6),
+        _spiral_point(5.2, 6),
+        _spiral_point(5.3, 6),
+    ]
+    crossing_map = _crossing_map(
+        points, [[0, 4], [1, 2], [2, 3], [5, 6], [6, 7]])
+    _sampled_shapes(monkeypatch, {'p1': [1, 2, 3], 'p2': [5, 6, 7]})
+    atlas = _Atlas([
+        torch.tensor([points[2], points[3]], dtype=torch.float32),
+        torch.tensor([points[6], points[7]], dtype=torch.float32),
+    ])
+
+    class AssignmentStore:
+        def sample_pair_requests(self, _cfg):
+            return [(
+                ('p1', 0, 0), ('p2', 0, 0),
+                'p1', 'p2', 2.0, np.array([0, 4]), 0, 4,
+            )]
+
+    loss = get_winding_model_patch_relative_loss(
+        _IdentityTransform(), torch.tensor(DR), AssignmentStore(),
+        {'p1': object(), 'p2': object()}, atlas,
+        crossing_map=crossing_map, cfg=_cfg(), z_begin=-1, z_end=1)
     assert loss.item() < 1e-5

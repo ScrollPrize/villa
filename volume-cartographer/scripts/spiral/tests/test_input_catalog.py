@@ -59,6 +59,9 @@ def test_lasagna_store_predicates_reproduce_the_mode_contract():
                      "loss_weight_dense_normals": 0.0}
     assert fit_input("winding_inference").required(winding_model) is True
     assert fit_input("winding_inference").enabled(winding_model) is True
+    assert fit_input("winding_patch_assignments").required(winding_model) is False
+    assert fit_input("winding_patch_assignments").enabled(winding_model) is True
+    assert fit_input("winding_patch_assignments").enabled({}) is False
     assert fit_input("normal_x").required(winding_model) is False
     assert fit_input("surf_sdt").required(winding_model) is False
 

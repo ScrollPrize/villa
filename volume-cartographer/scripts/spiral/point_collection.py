@@ -121,6 +121,72 @@ def _build_surface_patch_index(
     return index, surface_ids
 
 
+def build_surface_patch_index(
+    patches: Dict[str, Patch],
+    tolerance: float,
+):
+    """Build the native surface index used by compact preprocessing tools."""
+    return _build_surface_patch_index(patches, tolerance)
+
+
+def locate_points_on_patches(
+    patches: Dict[str, Patch],
+    point_zyxs: np.ndarray,
+    tolerance: float,
+    *,
+    built_index=None,
+    general_hit_policy: str = 'nearest',
+):
+    """Attach a compact ZYX array without materialising point dictionaries.
+
+    Returns arrays parallel to ``point_zyxs`` plus the surface-id table used by
+    ``patch_index``.  Unattached rows carry patch index -1, IJ [-1, -1], and
+    infinite distance.  The native surface index is required: this entry point
+    exists for artifacts containing millions of crossings, where the Python
+    per-patch fallback is not a practical alternative.
+    """
+    point_zyxs = np.ascontiguousarray(point_zyxs, dtype=np.float32)
+    if point_zyxs.ndim != 2 or point_zyxs.shape[1] != 3:
+        raise ValueError(
+            f'point_zyxs must have shape [N, 3], got {point_zyxs.shape}')
+    if built_index is None:
+        built_index = _build_surface_patch_index(patches, tolerance)
+    if built_index is None:
+        raise RuntimeError(
+            'compact point-to-patch attachment requires vc.surface_index')
+    index, surface_ids = built_index
+    if not hasattr(index, 'locate_all_xyz_batch'):
+        raise RuntimeError(
+            'compact point-to-patch attachment requires '
+            'SurfacePatchIndex.locate_all_xyz_batch')
+
+    patch_index = np.full(len(point_zyxs), -1, dtype=np.int32)
+    distance = np.full(len(point_zyxs), np.inf, dtype=np.float32)
+    ij = np.full((len(point_zyxs), 2), -1.0, dtype=np.float32)
+    if not len(point_zyxs):
+        return patch_index, ij, distance, surface_ids
+
+    offsets, surf_idx, distances, ijs = index.locate_all_xyz_batch(
+        np.ascontiguousarray(point_zyxs[:, ::-1], dtype=np.float32), tolerance)
+    patch_areas = None
+    if general_hit_policy == 'largest_area':
+        patch_areas = np.asarray(
+            [float(patches[patch_id].area) for patch_id in surface_ids],
+            dtype=np.float64,
+        )
+    elif general_hit_policy != 'nearest':
+        raise ValueError(
+            f'unknown general_hit_policy {general_hit_policy!r}')
+    best = _best_hit_per_point(
+        offsets, surf_idx, distances, ijs, patch_areas=patch_areas)
+    if best is not None:
+        points, surfaces, best_distances, best_ijs = best
+        patch_index[points] = surfaces.astype(np.int32, copy=False)
+        distance[points] = best_distances.astype(np.float32, copy=False)
+        ij[points] = best_ijs.astype(np.float32, copy=False)
+    return patch_index, ij, distance, surface_ids
+
+
 def _record_point_patch_link(
     links: Dict[str, List[PointPatchLink]],
     collection: Dict[str, Any],

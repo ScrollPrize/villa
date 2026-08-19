@@ -300,7 +300,7 @@ class Patch:
                 f.write(f"f {bl + 1} {tr + 1} {br + 1}\n")
 
 
-def load_tifxyz(path):
+def load_tifxyz(path, *, geometry_only=False):
 
     with open(f'{path}/meta.json', 'r') as meta_json:
         metadata = json.load(meta_json)
@@ -321,14 +321,14 @@ def load_tifxyz(path):
 
     zyxs = torch.from_numpy(zyxs_np).to(torch.float32)
 
-    if os.path.exists(f'{path}/overlapping.json'):
+    if not geometry_only and os.path.exists(f'{path}/overlapping.json'):
         with open(f'{path}/overlapping.json', 'r') as overlapping_json:
             overlapping_ids = json.load(overlapping_json)['overlapping']
     else:
         overlapping_ids = None
 
     winding_path = f'{path}/winding.tif'
-    if os.path.exists(winding_path):
+    if not geometry_only and os.path.exists(winding_path):
         winding_np = np.array(Image.open(winding_path))
         assert winding_np.shape[:2] == zyxs.shape[:2] and winding_np.ndim == 2 and winding_np.dtype == np.float32
         wt = torch.from_numpy(winding_np)

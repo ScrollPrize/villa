@@ -1190,13 +1190,8 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
     # the selected points crosses theta=0, adjust the expected delta by that
     # branch-cut jump.
 
-    num_points_per_strip = cfg['sample_count_points_per_patch'] // 2
-    num_strips_per_pcl = 4
-    num_strips_per_pair = 2 * num_strips_per_pcl  # 8
-
     # Each entry holds two groups of four L walks, patch ids, the annotated
     # winding difference, and ordered PCL-chain node ids from p1 to p2.
-    strip_pairs = []
     pair_requests = []
 
     # sampling_strata indexes into point_collections and already excludes single-point
@@ -1254,6 +1249,45 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
                 p1['_theta_node_id'], p2['_theta_node_id'],
             ))
 
+    return get_patch_relative_pair_loss(
+        slice_to_spiral_transform,
+        dr_per_winding,
+        patches_dict,
+        patch_atlas,
+        pair_requests,
+        crossing_map=crossing_map,
+        cfg=cfg,
+        z_begin=z_begin,
+        z_end=z_end,
+        loss_name='rel_winding',
+    )
+
+
+def get_patch_relative_pair_loss(
+    slice_to_spiral_transform,
+    dr_per_winding,
+    patches_dict,
+    patch_atlas,
+    pair_requests,
+    *,
+    crossing_map,
+    cfg,
+    z_begin,
+    z_end,
+    loss_name='rel_winding',
+):
+    """Evaluate already-selected relative assignments on sampled patch walks.
+
+    Both manual PCLs and compact winding-model assignments produce the same
+    request tuple: two patch anchors, two patch ids, target winding delta,
+    ordered source-chain node ids, and the two exact reference node ids.
+    Keeping this evaluator source-agnostic makes their patch propagation and
+    theta-seam handling identical.
+    """
+    num_points_per_strip = cfg['sample_count_points_per_patch'] // 2
+    num_strips_per_pcl = 4
+    num_strips_per_pair = 2 * num_strips_per_pcl
+    strip_pairs = []
     sampled_l_shapes = _sample_l_shapes_batch(
         patches_dict,
         patch_atlas,
@@ -1348,7 +1382,7 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
         diagnostic_spiral = flat_spiral.reshape(
             len(strip_pairs), num_strips_per_pair, num_points_per_strip, 3)
         record_loss_samples(
-            'rel_winding', diagnostic_spiral,
+            loss_name, diagnostic_spiral,
             pair_residuals[:, None, None], z_mask,
         )
     return _masked_all_pairs_l1(p1_r, p2_r, m1, m2, expected_diff)

@@ -94,7 +94,8 @@ from config import Config
 # "allow_rebuild", and its 409 carries the preflight's "reasons" with either
 # the "stage" a rebuild would need or "refused" when none would help.
 # Version 29 adds the compact winding-inference input and dense-spacing mode.
-API_VERSION = 29
+# Version 30 adds the optional preprocessed winding-to-patch assignment input.
+API_VERSION = 30
 
 
 class SessionState(str, Enum):
@@ -265,6 +266,9 @@ FIT_INPUT_CATALOG: tuple[FitInputSpec, ...] = (
                  conventional_relative="winding_inference",
                  enabled=_winding_model_enabled,
                  required=_winding_model_enabled),
+    FitInputSpec("winding_patch_assignments", "directory",
+                 conventional_relative="winding_patch_assignments",
+                 enabled=_winding_model_enabled),
 )
 
 _FIT_INPUTS_BY_KEY = {spec.key: spec for spec in FIT_INPUT_CATALOG}
@@ -321,6 +325,7 @@ class SpiralInputPaths:
     gradient_magnitude: str = ""
     surf_sdt: str = ""
     winding_inference: str = ""
+    winding_patch_assignments: str = ""
     scroll_zarr: str = ""
     checkpoint: str = ""
     output_directory: str = ""
@@ -649,6 +654,7 @@ def conventional_input_paths(
         gradient_magnitude=resolve("gradient_magnitude"),
         surf_sdt=resolve("surf_sdt"),
         winding_inference=resolve("winding_inference"),
+        winding_patch_assignments=resolve("winding_patch_assignments"),
         checkpoint=_normalise_path(checkpoint) if checkpoint else "",
         output_directory=_normalise_path(output_directory) if output_directory else "",
         cache_directory=_normalise_path(cache_directory) if cache_directory else "",

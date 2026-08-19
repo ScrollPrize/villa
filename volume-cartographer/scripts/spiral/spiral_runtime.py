@@ -26,7 +26,8 @@ from fit_session import (AUTOSAVE_CHECKPOINT_NAME, ScrollSpec, SessionState,
                          SpiralInputPaths, SpiralPreviewConfig,
                          SpiralRunConfig, run_mutable_config,
                          write_autosave_metadata)
-from config import Config, FitConfig, durable_config
+from config import (CHECKPOINT_DEFAULTABLE_KEYS, Config, FitConfig,
+                    durable_config)
 from spiral_progress import NullProgressReporter, ProgressReporter
 
 
@@ -791,30 +792,31 @@ class InteractiveFitSession:
                 durable = dict(checkpoint_config['cfg'])
                 # Checkpoints store the durable subset of the schema
                 # (see config.durable_config), so key sets compare
-                # against that subset. z_begin/z_end joined the schema
-                # after many checkpoints were written: a stored cfg
-                # lacking exactly those keys is accepted with defaults
-                # from the session request; every other key-set
-                # mismatch stays a strict error.
+                # against that subset. A small audited set of later optional
+                # fields may be absent and is restored from current defaults;
+                # every other key-set mismatch stays a strict error.
                 durable_schema = set(durable_config(config))
                 missing = durable_schema - set(durable)
-                if set(durable) - durable_schema or missing - {"z_begin", "z_end"}:
+                if (set(durable) - durable_schema
+                        or missing - CHECKPOINT_DEFAULTABLE_KEYS):
                     raise ValueError(
                         "Checkpoint configuration does not match the current schema")
                 if missing:
-                    assumed = {
-                        "z_begin": int(self.run_config.z_begin),
-                        "z_end": int(self.run_config.z_end),
-                    }
+                    assumed = {key: config[key] for key in missing}
+                    assumed.update({
+                        key: value for key, value in {
+                            "z_begin": int(self.run_config.z_begin),
+                            "z_end": int(self.run_config.z_end),
+                        }.items() if key in missing
+                    })
                     durable.update(
                         {key: assumed[key] for key in missing})
                     warning = (
                         f"Checkpoint {self.paths.checkpoint} predates "
-                        "z_begin/z_end in the stored configuration; "
-                        "assuming "
+                        "fields in the stored configuration; assuming "
                         + ", ".join(f"{key}={assumed[key]}"
                                     for key in sorted(missing))
-                        + " from the session request")
+                        + " from current defaults/session request")
                     print(warning)
                     with self._condition:
                         self._warnings.append(warning)

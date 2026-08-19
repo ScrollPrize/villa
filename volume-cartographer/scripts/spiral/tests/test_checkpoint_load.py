@@ -182,6 +182,13 @@ class CheckpointPreflightTests(unittest.TestCase):
         carve_out.pop("z_begin", None)
         carve_out.pop("z_end", None)
         self.assertTrue(_inspect(_checkpoint(cfg=carve_out)).accepted)
+        optional_feature = durable_config(CONFIG)
+        optional_feature.pop(
+            "sample_count_winding_model_patch_relative_rays")
+        optional_feature.pop(
+            "sample_count_winding_model_patch_pairs_per_ray")
+        optional_feature.pop("loss_weight_winding_model_patch_relative")
+        self.assertTrue(_inspect(_checkpoint(cfg=optional_feature)).accepted)
         shaped = durable_config(CONFIG)
         shaped["model_flow_bounds_radius"] = (
             int(shaped["model_flow_bounds_radius"]) + 1)

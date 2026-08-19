@@ -215,6 +215,20 @@ class WindingInferenceStore:
             "target": self.origin.new_empty((0,)),
         }
 
+    def materialize_flat(self, flat_indices):
+        """Materialize arbitrary global crossing rows as ZYX coordinates."""
+        flat = torch.as_tensor(
+            flat_indices, dtype=torch.int64, device=self.device)
+        if not flat.numel():
+            return self.origin.new_empty((*flat.shape, 3))
+        if flat.min().item() < 0 or flat.max().item() >= len(self.crossing_t):
+            raise IndexError("winding-inference crossing index is out of range")
+        ray = torch.searchsorted(self.offset[1:], flat, right=True)
+        return (
+            self.origin[ray]
+            + self.crossing_t[flat, None] * self.step[ray]
+        )
+
     def _materialize(self, ray, first, second):
         first_flat = self.offset[ray] + first
         second_flat = self.offset[ray] + second
@@ -323,3 +337,33 @@ def get_winding_inference_losses(
             record_loss_samples(
                 name, component_spiral.mean(dim=1), residual.detach().abs(), valid)
     return losses, metrics
+
+
+def get_winding_model_patch_relative_loss(
+    slice_to_spiral_transform,
+    dr_per_winding,
+    store,
+    patches_dict,
+    patch_atlas,
+    *,
+    crossing_map,
+    cfg,
+    z_begin,
+    z_end,
+):
+    """Propagate model-relative assignments across their attached patches."""
+    from losses import get_patch_relative_pair_loss
+
+    pair_requests = store.sample_pair_requests(cfg)
+    return get_patch_relative_pair_loss(
+        slice_to_spiral_transform,
+        dr_per_winding,
+        patches_dict,
+        patch_atlas,
+        pair_requests,
+        crossing_map=crossing_map,
+        cfg=cfg,
+        z_begin=z_begin,
+        z_end=z_end,
+        loss_name="winding_model_patch_relative",
+    )

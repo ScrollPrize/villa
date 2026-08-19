@@ -29,6 +29,25 @@ The compact store is created by the Vesuvius winding-model
 `export_spiral_supervision.py` tool; see its `NATIVE_PHASE_CACHE.md` for the
 exact export command and format.
 
+To propagate inferred relative assignments across verified patches using the
+same sampled patch-strip loss as a relative-winding PCL, build the optional
+attachment artifact once:
+
+```sh
+python scripts/spiral/build_winding_patch_assignments.py \
+    --dataset /path/to/dataset
+```
+
+This writes the conventional `<dataset>/winding_patch_assignments` input.
+Patch TIFFs are loaded with an automatically sized process pool (up to eight
+workers); use `--patch-workers N` to tune this for the host's storage and RAM.
+Enable it with a positive `loss_weight_winding_model_patch_relative`; the
+default is zero. Patch removals, ROI filtering, erosion, and later geometry
+edits do not invalidate the whole artifact: the fit revalidates stored patch
+coordinates and skips only stale assignments, reporting counts at startup.
+Regenerate the artifact only when assignments for new or changed patches are
+desired.
+
 For a headless fit, pass the dataset root with `--dataset` and select inference
 mode (plus any independently disabled losses) through
 `FIT_SPIRAL_CONFIG_OVERRIDES`. The dataset's `spiral-scroll.json` and the

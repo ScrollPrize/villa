@@ -36,8 +36,8 @@ from ddp_helpers import (
     maybe_init_distributed,
     process_context,
 )
-from config import (CHECKPOINT_MODEL_SHAPE_KEYS, Config, FitConfig,
-                    durable_config)
+from config import (CHECKPOINT_DEFAULTABLE_KEYS, CHECKPOINT_MODEL_SHAPE_KEYS,
+                    Config, FitConfig, durable_config)
 from fit_session import fit_input
 from lasagna_data import (ensure_fit_sparse_stores, prepare_lasagna_volume,
                           prepare_surf_sdt_volume)
@@ -124,8 +124,10 @@ from transforms import SpiralAndTransform
 from theta_crossing_map import ThetaCrossingMap
 from winding_supervision import (
     get_winding_inference_losses,
+    get_winding_model_patch_relative_loss,
     load_winding_inference_store,
 )
+from winding_patch_assignments import load_winding_patch_assignments
 from spiral_progress import ProgressReporter, progress_or_null
 
 
@@ -916,6 +918,8 @@ class FitContext:
         self.grad_mag_zarr_path = paths.gradient_magnitude or None
         self.surf_sdt_zarr_path = paths.surf_sdt or None
         self.winding_inference_path = paths.winding_inference or None
+        self.winding_patch_assignments_path = (
+            paths.winding_patch_assignments or None)
         self.fibers_path = paths.fibers or None
         self.verified_patches_path = paths.verified_patches or None
         self.unverified_patches_path = paths.unverified_patches or None
@@ -1834,6 +1838,13 @@ class FitContext:
     def _winding_model_mode_active(self):
         return self.winding_model_mode and self.winding_inference is not None
 
+    def _winding_model_patch_mode_active(self):
+        return (
+            self._winding_model_mode_active()
+            and self.winding_patch_assignments is not None
+            and self.winding_patch_assignments.num_eligible_rays > 0
+        )
+
     def _warn_if_sdt_loss_inactive(self):
         # Run-mutable weights are read afresh every step, but the SDT-backed
         # components only exist in phase mode; make other sessions' nonzero
@@ -1851,6 +1862,17 @@ class FitContext:
                 print(f'WARNING: {weight_key} > 0 but dense_spacing_mode='
                       f'{self.dense_spacing_mode!r}; this component runs only as '
                       "part of the 'phase' bundle and is INACTIVE.")
+
+    def _warn_if_winding_patch_loss_inactive(self):
+        if (self.config['loss_weight_winding_model_patch_relative'] <= 0
+                or self._winding_model_patch_mode_active()
+                or self._winding_patch_inactive_warned):
+            return
+        self._winding_patch_inactive_warned = True
+        print(
+            'WARNING: loss_weight_winding_model_patch_relative > 0 but no '
+            'eligible winding patch assignments are loaded; the component '
+            'is INACTIVE.')
 
     def _subsample_shell_radius_pool(self, patch):
         # The shell-patch radius loss draws sample_count_shell_samples random
@@ -2037,6 +2059,7 @@ class FitContext:
                 self._scalar_stores.append(self.sdt_volume['store'])
 
         self.winding_inference = None
+        self.winding_patch_assignments = None
         if self.winding_model_mode:
             if (not self.winding_inference_path
                     or not os.path.isdir(self.winding_inference_path)):
@@ -2061,8 +2084,27 @@ class FitContext:
                 f"z-range [{self.z_begin}, {self.z_end})), "
                 f"{self.winding_inference.fingerprint['num_crossings']:,} "
                 'crossings')
+            if (self.winding_patch_assignments_path
+                    and os.path.isdir(self.winding_patch_assignments_path)):
+                try:
+                    self.winding_patch_assignments = (
+                        load_winding_patch_assignments(
+                            self.winding_patch_assignments_path,
+                            self.winding_inference,
+                            self.verified_patches,
+                            verify=os.environ.get(
+                                'FIT_SPIRAL_VERIFY_WINDING_PATCH_ASSIGNMENTS',
+                                '1') != '0',
+                        )
+                    )
+                except Exception as exc:
+                    print(
+                        'WARNING: ignoring winding patch assignments at '
+                        f'{self.winding_patch_assignments_path!r}: {exc}')
+                    self.winding_patch_assignments = None
 
         self._sdt_inactive_warned = set()
+        self._winding_patch_inactive_warned = False
 
     def _build_theta_crossing_map(self):
         """Rebuild the shared patch/PCL source topology.
@@ -2076,6 +2118,9 @@ class FitContext:
         self.patch_atlas.register_theta_topology(crossing_map)
         if self.unverified_patch_atlas is not None:
             self.unverified_patch_atlas.register_theta_topology(crossing_map)
+        if self.winding_patch_assignments is not None:
+            self.winding_patch_assignments.register_theta_topology(
+                crossing_map, self.winding_inference)
 
         flat = get_or_build_unattached_pcl_flat(
             self.unattached_pcl_strips, self.device)
@@ -2628,7 +2673,7 @@ class FitContext:
                     f'\n      checkpoint: {checkpoint_fingerprint}'
                     f'\n      current:    {current_fingerprint}')
 
-        if modern and self.winding_model_mode:
+        if modern and getattr(self, 'winding_model_mode', False):
             checkpoint_fingerprint = checkpoint.get(
                 'winding_inference_fingerprint')
             current_fingerprint = (
@@ -2649,12 +2694,13 @@ class FitContext:
         checkpoint_cfg = checkpoint.get('cfg')
         if isinstance(checkpoint_cfg, Mapping):
             # Checkpoints store the durable subset of the schema, so the key
-            # set compares against that subset. z_begin/z_end joined the schema
-            # after many checkpoints were written and are owned by the session
-            # request either way, so exactly those two may be absent.
+            # set compares against that subset. A small audited set of later
+            # optional fields may be absent and supplied by current defaults.
             durable_schema = set(durable_config(dict(self.config)))
             unknown = set(checkpoint_cfg) - durable_schema
-            missing = durable_schema - set(checkpoint_cfg) - {'z_begin', 'z_end'}
+            missing = (
+                durable_schema - set(checkpoint_cfg)
+                - CHECKPOINT_DEFAULTABLE_KEYS)
             if unknown or missing:
                 reasons.append(
                     'checkpoint configuration does not match the current '
@@ -2941,6 +2987,7 @@ class FitContext:
                     'patch_radius', 'patch_dt',
                     'unverified_patch_radius', 'unverified_patch_dt',
                     'sym_dirichlet', 'rel_winding', 'abs_winding',
+                    'winding_model_patch_relative',
                     'dense_normals', 'dense_spacing', 'dense_attachment',
                     'unattached_pcl_radius', 'unattached_pcl_dt',
                     'track_radius', 'track_dt', 'shell_patch_radius',
@@ -2956,6 +3003,9 @@ class FitContext:
                     float(self.config['loss_weight_dense_spacing']), 1.0)
                 diagnostic_weights['dense_spacing_winding_model_density'] = max(
                     float(self.config['loss_weight_dense_spacing_density']), 1.0)
+            if self._winding_model_patch_mode_active():
+                diagnostic_weights['winding_model_patch_relative'] = float(
+                    self.config['loss_weight_winding_model_patch_relative'])
             transform = self.spiral_and_transform.get_slice_to_spiral_transform()
             dr = self.spiral_and_transform.get_dr_per_winding()
             self.theta_crossing_map.force_refresh(transform)
@@ -3033,6 +3083,20 @@ class FitContext:
                         transform, dr, self.winding_inference, self.config,
                         self.z_begin, self.z_end,
                         generator=preview_generator)
+                if (self._winding_model_patch_mode_active()
+                        and self.config[
+                            'loss_weight_winding_model_patch_relative'] > 0):
+                    get_winding_model_patch_relative_loss(
+                        transform,
+                        dr,
+                        self.winding_patch_assignments,
+                        self.verified_patches,
+                        self.patch_atlas,
+                        crossing_map=self.theta_crossing_map,
+                        cfg=self.config,
+                        z_begin=self.z_begin,
+                        z_end=self.z_end,
+                    )
                 if self.unattached_pcl_strips:
                     get_unattached_pcl_strip_losses(
                         transform, dr, self.unattached_pcl_strips,
@@ -3765,6 +3829,7 @@ class FitContext:
                 })
 
         self._warn_if_sdt_loss_inactive()
+        self._warn_if_winding_patch_loss_inactive()
         self._warn_if_dense_losses_structurally_disabled()
         if self._winding_model_mode_active():
             inference_losses, inference_metrics = get_winding_inference_losses(
@@ -3785,6 +3850,25 @@ class FitContext:
             })
             log_metrics.update(inference_metrics)
             del inference_losses, inference_metrics
+        if (self._winding_model_patch_mode_active()
+                and self.config[
+                    'loss_weight_winding_model_patch_relative'] > 0):
+            backward_family({
+                'winding_model_patch_relative': (
+                    get_winding_model_patch_relative_loss(
+                        self.slice_to_spiral_transform,
+                        self.dr_per_winding,
+                        self.winding_patch_assignments,
+                        self.verified_patches,
+                        self.patch_atlas,
+                        crossing_map=self.theta_crossing_map,
+                        cfg=self.config,
+                        z_begin=self.z_begin,
+                        z_end=self.z_end,
+                    )
+                    * self.config[
+                        'loss_weight_winding_model_patch_relative'])
+            })
         phase_components_active = self._phase_mode_active()
         min_spacing_active = self.config['loss_weight_min_spacing'] > 0
         if phase_components_active or min_spacing_active:
@@ -4136,6 +4220,7 @@ class FitContext:
         while self._scalar_stores:
             self._scalar_stores.pop().close()
         self.winding_inference = None
+        self.winding_patch_assignments = None
 
 
 def main(config, *, scroll, paths, progress=None, resume_path=None,
@@ -4215,6 +4300,7 @@ if __name__ == '__main__':
             'sample_count_dense_spacing_density_extra_pairs',
             'sample_count_winding_model_relative_pairs',
             'sample_count_winding_model_density_pairs',
+            'sample_count_winding_model_patch_relative_rays',
             'sample_count_dense_attachment_points',
             'sample_count_regularisation_points',
             'sample_count_shell_samples',

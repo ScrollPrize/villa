@@ -65,6 +65,7 @@ _SCALE_WITH_Z_FIELDS = {
     "sample_count_dense_spacing_density_extra_pairs",
     "sample_count_winding_model_relative_pairs",
     "sample_count_winding_model_density_pairs",
+    "sample_count_winding_model_patch_relative_rays",
     "sample_count_minimum_spacing_independent_samples",
     "sample_count_dense_attachment_points",
     "sample_count_shell_samples",
@@ -105,6 +106,18 @@ CHECKPOINT_MODEL_SHAPE_KEYS = (
     "model_flow_field_type", "model_gap_expander_logit_resolution",
     "model_gap_expander_num_windings", "model_linear_z_resolution",
 )
+
+# Older checkpoints may omit configuration fields introduced by optional,
+# disabled-by-default features. Their current defaults are safe substitutions:
+# the zero loss weight keeps the feature inactive, and its sampling counts are
+# inert until a user explicitly raises that weight.
+CHECKPOINT_DEFAULTABLE_KEYS = frozenset({
+    "z_begin",
+    "z_end",
+    "sample_count_winding_model_patch_relative_rays",
+    "sample_count_winding_model_patch_pairs_per_ray",
+    "loss_weight_winding_model_patch_relative",
+})
 
 
 # Configuration keys whose every consumer is built by
@@ -280,6 +293,8 @@ class Config:
         self.sample_count_dense_spacing_density_chunk_pairs = 24000
         self.sample_count_winding_model_relative_pairs = 12000
         self.sample_count_winding_model_density_pairs = 12000
+        self.sample_count_winding_model_patch_relative_rays = 48
+        self.sample_count_winding_model_patch_pairs_per_ray = 4
         self.sample_count_minimum_spacing_independent_samples = 2000
         self.sample_count_dense_attachment_points = 20000
         self.sample_count_patch_dt_target_points = 256
@@ -397,6 +412,11 @@ class Config:
         self.loss_weight_unverified_patch_radius = 2.0
         self.loss_weight_unverified_patch_dt = 1.0
         self.loss_weight_rel_winding = 5.0
+        # Optional machine-inferred relative assignments propagated across
+        # verified patches through the same strip evaluator as manual PCLs.
+        # Opt-in so merely adding the preprocessing artifact cannot change an
+        # existing fit.
+        self.loss_weight_winding_model_patch_relative = 0.0
         self.loss_weight_abs_winding = 5.0
         self.loss_weight_unattached_pcl_radius = 2.0
         self.loss_weight_unattached_pcl_dt = 4.0
