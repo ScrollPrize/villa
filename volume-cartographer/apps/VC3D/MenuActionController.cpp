@@ -25,6 +25,7 @@
 #include "vc/core/Version.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/LoadJson.hpp"
+#include "vc/core/util/ScrollUmbilicus.hpp"
 #include "vc/core/util/Umbilicus.hpp"
 #include "vc/core/util/VolpkgConvert.hpp"
 #include "vc/core/types/Segmentation.hpp"
@@ -1832,10 +1833,7 @@ void MenuActionController::attachUmbilicus()
         _window->showStatusBarMessage(
             QObject::tr("Attached umbilicus %1").arg(QFileInfo(file).fileName()), 5000);
     }
-    const bool statesDimensions = info.volumeWidth && info.volumeHeight &&
-                                  info.volumeSlices;
-    const bool statesFrame = info.voxelsizeUm.has_value() || statesDimensions;
-    if (!statesFrame) {
+    if (!vc::core::util::umbilicusFrameClaim(info).any()) {
         // Dimensions alone are a complete statement — the preferred one, in fact,
         // being exact integer counts — so warning about a missing voxelsize_um
         // there would call the better-stamped file unstamped.

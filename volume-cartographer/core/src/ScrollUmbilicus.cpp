@@ -259,4 +259,253 @@ ScrollUmbilicusResolution resolveScrollUmbilicus(const VolumePkg& pkg)
     return resolution;
 }
 
+std::optional<double> uniformRescaleFactor(
+    const std::array<double, 3>& stampedXyz,
+    const std::array<double, 3>& targetXyz)
+{
+    for (int axis = 0; axis < 3; ++axis) {
+        if (!std::isfinite(stampedXyz[axis]) || stampedXyz[axis] < 1.0 ||
+            !std::isfinite(targetXyz[axis]) || targetXyz[axis] < 1.0) {
+            return std::nullopt;
+        }
+    }
+
+    // Downsampling by an integer factor n maps a count c to floor(c/n) or
+    // ceil(c/n) and nothing else, so a candidate factor can be tested exactly:
+    // no tolerance, no averaging, no constant to tune. Both directions are
+    // tried, since the stamped grid may be the coarser one (target = stamped * n)
+    // or the finer one (stamped = target * m).
+    const auto explains = [&](double factor) {
+        for (int axis = 0; axis < 3; ++axis) {
+            const double coarse =
+                factor >= 1.0 ? targetXyz[axis] : stampedXyz[axis];
+            const double fine =
+                factor >= 1.0 ? stampedXyz[axis] : targetXyz[axis];
+            const double step = factor >= 1.0 ? factor : 1.0 / factor;
+            const double exact = coarse / step;
+            if (fine != std::floor(exact) && fine != std::ceil(exact)) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    // Six pyramid levels either way covers every store this format describes.
+    constexpr int kMaxStep = 64;
+    std::vector<double> candidates;
+    for (int n = 1; n <= kMaxStep; ++n) {
+        if (explains(static_cast<double>(n))) {
+            candidates.push_back(static_cast<double>(n));
+        }
+    }
+    for (int m = 2; m <= kMaxStep; ++m) {
+        if (explains(1.0 / static_cast<double>(m))) {
+            candidates.push_back(1.0 / static_cast<double>(m));
+        }
+    }
+
+    // Exactly one factor explains all three axes, or the counts do not identify
+    // one and this reading has no answer to give. Several can only happen on
+    // grids of a handful of voxels, where the rounding windows overlap; refusing
+    // there is right, since picking one would be a guess.
+    if (candidates.size() != 1) {
+        return std::nullopt;
+    }
+    return candidates.front();
+}
+
+std::optional<UmbilicusScale> deriveUmbilicusScale(
+    const UmbilicusFileInfo& info,
+    const std::array<double, 3>& targetGridXyz,
+    std::optional<double> targetVoxelSizeUm)
+{
+    const bool haveTarget = targetGridXyz[0] > 0.0 && targetGridXyz[1] > 0.0 &&
+                            targetGridXyz[2] > 0.0;
+
+    const bool haveStampedDims = info.volumeWidth && info.volumeHeight &&
+                                 info.volumeSlices && *info.volumeWidth > 0 &&
+                                 *info.volumeHeight > 0 && *info.volumeSlices > 0;
+    if (haveStampedDims && haveTarget) {
+        const std::array<double, 3> stamped{
+            static_cast<double>(*info.volumeWidth),
+            static_cast<double>(*info.volumeHeight),
+            static_cast<double>(*info.volumeSlices)};
+        if (const auto factor = uniformRescaleFactor(stamped, targetGridXyz)) {
+            UmbilicusScale scale;
+            scale.factor = *factor;
+            scale.source = UmbilicusScaleSource::StampedDimensions;
+            scale.description = "stamped " + std::to_string(*info.volumeWidth) + "x" +
+                                std::to_string(*info.volumeHeight) + "x" +
+                                std::to_string(*info.volumeSlices) + " grid";
+            return scale;
+        }
+        // No single factor explains all three axes, so this is not a rescale of
+        // the target grid at all and neither of the weaker readings below
+        // applies either.
+        return std::nullopt;
+    }
+
+    if (info.voxelsizeUm && targetVoxelSizeUm && *targetVoxelSizeUm > 0.0) {
+        const double ratio = *info.voxelsizeUm / *targetVoxelSizeUm;
+        if (std::isfinite(ratio) && ratio > 0.0) {
+            UmbilicusScale scale;
+            scale.factor = ratio;
+            scale.source = UmbilicusScaleSource::StampedVoxelSize;
+            scale.description = "stamped " + std::to_string(*info.voxelsizeUm) +
+                                " um voxels";
+            return scale;
+        }
+    }
+
+    if (!haveTarget || info.controlPoints.empty()) {
+        return std::nullopt;
+    }
+
+    // Nothing stated: read the grid off the points. An umbilicus runs the length
+    // of the scroll, so the right grid is the one it nearly fills and still fits
+    // inside. Candidates are a factor of two apart, so a grid this well covered
+    // leaves the next coarser one under half covered and the match is unique.
+    constexpr double kMinZCoverage = 0.6;
+    constexpr int kMaxDownsampleSteps = 5;
+    std::array<double, 3> lo{std::numeric_limits<double>::infinity(),
+                             std::numeric_limits<double>::infinity(),
+                             std::numeric_limits<double>::infinity()};
+    std::array<double, 3> hi{-std::numeric_limits<double>::infinity(),
+                             -std::numeric_limits<double>::infinity(),
+                             -std::numeric_limits<double>::infinity()};
+    for (const auto& point : info.controlPoints) {
+        for (int axis = 0; axis < 3; ++axis) {
+            lo[axis] = std::min(lo[axis], static_cast<double>(point[axis]));
+            hi[axis] = std::max(hi[axis], static_cast<double>(point[axis]));
+        }
+    }
+
+    std::optional<UmbilicusScale> match;
+    for (int step = 0; step <= kMaxDownsampleSteps; ++step) {
+        const double candidate = std::pow(2.0, step);
+        bool fits = lo[0] >= 0.0 && lo[1] >= 0.0 && lo[2] >= 0.0;
+        for (int axis = 0; axis < 3 && fits; ++axis) {
+            fits = hi[axis] <= targetGridXyz[axis] / candidate;
+        }
+        if (!fits) {
+            continue;
+        }
+        const double gridZ = targetGridXyz[2] / candidate;
+        const double coverage = gridZ > 0.0 ? (hi[2] - lo[2]) / gridZ : 0.0;
+        if (coverage < kMinZCoverage) {
+            continue;
+        }
+        if (match) {
+            return std::nullopt;  // more than one grid fits: say nothing
+        }
+        UmbilicusScale scale;
+        scale.factor = candidate;
+        scale.source = UmbilicusScaleSource::InferredFromGrid;
+        scale.description = "inferred from the volume grid";
+        match = scale;
+    }
+    return match;
+}
+
+UmbilicusFrameClaim umbilicusFrameClaim(const UmbilicusFileInfo& info)
+{
+    UmbilicusFrameClaim claim;
+    // A partial triplet is not a claim: two of three counts cannot describe a
+    // grid, and treating it as one would refuse files over a typo.
+    claim.dimensions = info.volumeWidth && info.volumeHeight &&
+                       info.volumeSlices && *info.volumeWidth > 0 &&
+                       *info.volumeHeight > 0 && *info.volumeSlices > 0;
+    claim.voxelSize = info.voxelsizeUm && *info.voxelsizeUm > 0.0;
+    return claim;
+}
+
+std::optional<std::string> umbilicusStampContradiction(
+    const UmbilicusFileInfo& info,
+    const std::array<double, 3>& namedVolumeGridXyz,
+    std::optional<double> namedVolumeVoxelSizeUm)
+{
+    const auto claim = umbilicusFrameClaim(info);
+    const bool haveGrid = namedVolumeGridXyz[0] > 0.0 &&
+                          namedVolumeGridXyz[1] > 0.0 &&
+                          namedVolumeGridXyz[2] > 0.0;
+
+    // The named volume's voxel size, carried onto the stamped grid: ratio 1
+    // means the file was annotated on the store's own grid.
+    double impliedVoxelUm = 0.0;
+    if (namedVolumeVoxelSizeUm && std::isfinite(*namedVolumeVoxelSizeUm) &&
+        *namedVolumeVoxelSizeUm > 0.0) {
+        impliedVoxelUm = *namedVolumeVoxelSizeUm;
+    }
+
+    if (claim.dimensions && haveGrid) {
+        const std::array<double, 3> stamped{
+            static_cast<double>(*info.volumeWidth),
+            static_cast<double>(*info.volumeHeight),
+            static_cast<double>(*info.volumeSlices)};
+        // The same question deriveUmbilicusScale() asks of the target grid, so
+        // it is asked by the same function rather than by a private copy that
+        // could drift.
+        const auto storeFactor =
+            uniformRescaleFactor(stamped, namedVolumeGridXyz);
+        if (!storeFactor) {
+            return "the stamped " + std::to_string(*info.volumeWidth) + "x" +
+                   std::to_string(*info.volumeHeight) + "x" +
+                   std::to_string(*info.volumeSlices) +
+                   " grid is not a uniform rescale of the named volume's " +
+                   std::to_string(static_cast<long long>(namedVolumeGridXyz[0])) +
+                   "x" +
+                   std::to_string(static_cast<long long>(namedVolumeGridXyz[1])) +
+                   "x" +
+                   std::to_string(static_cast<long long>(namedVolumeGridXyz[2]));
+        }
+        impliedVoxelUm *= *storeFactor;
+    }
+
+    // 1% covers metadata that round-trips a micrometre figure imprecisely; a
+    // real disagreement is far larger (the smallest rescale is x2).
+    if (claim.voxelSize && impliedVoxelUm > 0.0 &&
+        std::isfinite(impliedVoxelUm) &&
+        std::abs(impliedVoxelUm - *info.voxelsizeUm) >
+            0.01 * *info.voxelsizeUm) {
+        return "the stamped " + std::to_string(*info.voxelsizeUm) +
+               " um voxel size disagrees with the " +
+               std::to_string(impliedVoxelUm) +
+               " um the named volume implies";
+    }
+    return std::nullopt;
+}
+
+UmbilicusLoadAction decideUmbilicusLoadAction(
+    const std::optional<UmbilicusScale>& scale,
+    const UmbilicusFrameClaim& claim,
+    bool haveTargetGrid,
+    bool stampContradicted)
+{
+    // A contradicted stamp refuses before anything else is weighed: whatever
+    // scale was derived came from a statement the named volume disproves, and
+    // proceeding on it — or on the legacy reading, as though the file had said
+    // nothing — would both act on a file known to be wrong about itself.
+    if (stampContradicted) {
+        return UmbilicusLoadAction::Refuse;
+    }
+    if (!haveTargetGrid) {
+        // No target grid means the stated frame cannot be checked -- which is not
+        // the same as the file stating nothing, and must not be treated as such.
+        // The legacy reading applies a registration inverse or takes the points
+        // raw; doing that to a file that declares a frame we could not evaluate is
+        // proceeding on a guess exactly where the check failed. So a stated frame
+        // is refused, and only a file that states nothing keeps its previous
+        // reading. The two diagnostics differ; neither uses the file.
+        return claim.any() ? UmbilicusLoadAction::Refuse
+                           : UmbilicusLoadAction::UseLegacy;
+    }
+    if (scale) {
+        return UmbilicusLoadAction::Apply;
+    }
+    if (claim.any()) {
+        return UmbilicusLoadAction::Refuse;
+    }
+    return UmbilicusLoadAction::UseLegacy;
+}
+
 } // namespace vc::core::util
