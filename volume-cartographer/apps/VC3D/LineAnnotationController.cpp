@@ -1927,7 +1927,18 @@ LineAnnotationController::LineAnnotationController(CState* state,
         connect(_state,
                 &CState::volumeChanged,
                 this,
-                [this](const std::shared_ptr<Volume>&, const std::string&) {
+                [this](const std::shared_ptr<Volume>&,
+                       const std::string& volumeId) {
+                    // CState re-emits for a reselection of the current volume
+                    // (package UI refreshes do this); only an actual switch
+                    // changes what views were built from. Guarded here rather
+                    // than in CState, whose other consumers may rely on the
+                    // re-emission. Cleared on package change, since two
+                    // projects can name a volume identically.
+                    if (volumeId == _lastVolumeChangedId) {
+                        return;
+                    }
+                    _lastVolumeChangedId = volumeId;
                     onActiveVolumeChanged();
                 });
         // Without this an attach or detach would not reach normal orientation
@@ -6380,6 +6391,60 @@ void LineAnnotationController::onSurfaceChanged(std::string name,
 
 void LineAnnotationController::onVolumePackageChanged(std::shared_ptr<VolumePkg> /*pkg*/)
 {
+    // Sessions belong to the package they were traced in. Left in place, the
+    // new project's first volume selection bumps the orientation epoch and the
+    // refresh pass rebuilds their generated views against the new project --
+    // resurrecting surfaces from the old one -- and a pane closed later would
+    // auto-save the old session's fiber into the new package's paths. Torn
+    // down here, and deliberately *without* the save that a normal pane close
+    // performs: by the time this handler runs the current package is already
+    // the new one, so that save is exactly the wrong-target write this exists
+    // to prevent. A session's work was persisted into its own package by the
+    // save-on-mutation paths while it was being edited.
+    if (_intersectionInspection) {
+        cleanupIntersectionInspectionSurfaces();
+        _intersectionInspection.reset();
+    }
+    std::vector<PaneRecord> panes;
+    // Swapped out first: setSurface() below re-enters this controller through
+    // surfaceChanged, and no iterator over _panes may be live when it does.
+    panes.swap(_panes);
+    for (auto& pane : panes) {
+        if (pane.session && pane.session->watcher) {
+            auto* watcher = pane.session->watcher.data();
+            disconnect(watcher, nullptr, this, nullptr);
+            connect(watcher,
+                    &QFutureWatcher<OptimizationTaskResult>::finished,
+                    watcher,
+                    &QObject::deleteLater);
+            pane.session->watcher = nullptr;
+        }
+    }
+    // A side-strip intersection computed for the old package must not deliver
+    // into the new one.
+    const uint64_t cancelToken = ++_nextSideStripIntersectionToken;
+    _latestSideStripIntersectionToken = cancelToken;
+    if (_latestSideStripIntersectionTokenAtomic) {
+        _latestSideStripIntersectionTokenAtomic->store(cancelToken,
+                                                       std::memory_order_relaxed);
+    }
+    _pendingSideStripIntersectionRequest.reset();
+    _lastSideStripIntersectionKey = 0;
+    _lastSideStripIntersectionSurfaceName.clear();
+    _lastSideStripIntersectionMarkers.clear();
+    if (_state) {
+        for (const auto& pane : panes) {
+            _state->setSurface(pane.surfaceName, nullptr);
+            if (pane.session) {
+                for (const auto& name : pane.session->generatedSurfaceNames) {
+                    _state->setSurface(name, nullptr);
+                }
+            }
+        }
+    }
+    // The volume-reselection guard must not carry an id across packages: two
+    // projects can name a volume identically.
+    _lastVolumeChangedId.clear();
     // Dropped outright rather than left to the frame comparison: two projects can
     // sit in one directory with identical grids, so both halves of the cache key
     // can match while the umbilicus file behind them differs.

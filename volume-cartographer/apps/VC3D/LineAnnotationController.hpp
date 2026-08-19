@@ -864,6 +864,10 @@ private:
     // decide staleness of derived geometry; a volume switch is deliberately not
     // an attachment change.
     uint64_t _umbilicusGeneration = 0;
+    // The volumeId of the last volumeChanged this controller acted on, so a
+    // reselection of the current volume is not treated as a switch. Cleared on
+    // package change.
+    std::string _lastVolumeChangedId;
     // Why the package's umbilicus could not be used, for the strip notice.
     // Empty when one was applied, and when none exists to complain about.
     // Orienting off the volume centre instead is exactly the silent degradation
