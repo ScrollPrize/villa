@@ -74,7 +74,19 @@ def _uses_surface_mask_channel(mode):
     return str(mode).strip().lower() in {"normal_pooled_3d", _FULL_3D_SINGLE_WRAP_MODE}
 
 
-def _disable_z_projection_for_normal_pooled_3d(config):
+def _uses_flat_depth_targets(config, mode):
+    """flat training keeps the label's z extent instead of collapsing it.
+
+    The flat volume is already resampled along the surface normal, so a label
+    that varies with z is a depth-resolved target as it stands. Collapsing it
+    drops that supervision, which is the default; setting flat_depth_targets
+    keeps it and makes the model predict a volume."""
+    if str(mode).strip().lower() != 'flat':
+        return False
+    return bool(config.get('flat_depth_targets', False))
+
+
+def _disable_z_projection_for_volume_targets(config):
     config.setdefault('model_config', {})['z_projection_mode'] = 'none'
     for target_info in (config.get('targets') or {}).values():
         if isinstance(target_info, dict):
@@ -104,7 +116,7 @@ def _full_3d_dilation_distances_for_level(config):
     return label_dilation / factor, supervision_dilation / factor
 
 
-def _build_full_3d_preview_batch(
+def _build_volume_preview_batch(
     batch: dict,
     preds: torch.Tensor,
     targets: torch.Tensor,
@@ -112,7 +124,7 @@ def _build_full_3d_preview_batch(
 ) -> tuple[dict, torch.Tensor, torch.Tensor, torch.Tensor]:
     if preds.ndim != 5 or targets.ndim != 5 or ignore_mask.ndim != 5:
         raise ValueError(
-            "full_3d previews expect preds, targets, and ignore_mask with shape [B, 1, Z, Y, X]"
+            "volume previews expect preds, targets, and ignore_mask with shape [B, 1, Z, Y, X]"
         )
 
     z_index = int(batch['supervision_mask'].shape[-3] // 2)
@@ -284,6 +296,7 @@ def train(config_path):
     mode = str(config.get('mode', 'flat')).strip().lower()
     native_3d_mode = _is_native_3d_training_mode(mode)
     normal_pooled_mode = mode == 'normal_pooled_3d'
+    flat_depth_targets = _uses_flat_depth_targets(config, mode)
     surface_mask_channel = _uses_surface_mask_channel(mode)
     pooling_config = config.get('normal_pooling') or {}
     deep_supervision_enabled = bool(config.get('enable_deep_supervision', False))
@@ -293,8 +306,10 @@ def train(config_path):
     if normal_pooled_mode and model_type.startswith('resnet3d'):
         raise ValueError("normal_pooled_3d is currently only supported with the vesuvius_unet model path")
     if native_3d_mode:
-        _disable_z_projection_for_normal_pooled_3d(config)
+        _disable_z_projection_for_volume_targets(config)
         config['in_channels'] = 1 + int(surface_mask_channel)
+    elif flat_depth_targets:
+        _disable_z_projection_for_volume_targets(config)
 
     config.setdefault('volume_auth_json', None)
     requested_stitch_factor = int(config.get('stitch_factor', 1))
@@ -737,6 +752,19 @@ def train(config_path):
             ignore_mask = (batch['supervision_mask'] <= 0).to(dtype=targets.dtype)
             return preds, targets, ignore_mask
 
+        if flat_depth_targets:
+            crop_shape = tuple(int(v) for v in batch['inklabels'].shape[-3:])
+            if tuple(int(v) for v in preds.shape[-3:]) != crop_shape:
+                preds = F.interpolate(
+                    preds,
+                    size=crop_shape,
+                    mode='trilinear',
+                    align_corners=True,
+                )
+            targets = (batch['inklabels'] > 0).to(dtype=batch['inklabels'].dtype)
+            ignore_mask = (batch['supervision_mask'] <= 0).to(dtype=targets.dtype)
+            return preds, targets, ignore_mask
+
         targets = (torch.amax(batch['inklabels'], dim=2) > 0).to(dtype=batch['inklabels'].dtype)
         supervision_mask = torch.amax(batch['supervision_mask'], dim=2)
         ignore_mask = (supervision_mask <= 0).to(dtype=targets.dtype)
@@ -930,8 +958,8 @@ def train(config_path):
             train_preview_targets = targets.detach()
             train_preview_ignore_mask = ignore_mask.detach()
             train_preview_volume_logits = (preds[0] if isinstance(preds, (list, tuple)) else preds).detach() if normal_pooled_mode else None
-            if mode in _FULL_3D_TRAINING_MODES:
-                (train_preview_batch,train_preview_preds,train_preview_targets,train_preview_ignore_mask) = _build_full_3d_preview_batch(
+            if mode in _FULL_3D_TRAINING_MODES or flat_depth_targets:
+                (train_preview_batch,train_preview_preds,train_preview_targets,train_preview_ignore_mask) = _build_volume_preview_batch(
                     batch,
                     train_preview_preds,
                     train_preview_targets,
@@ -1069,13 +1097,13 @@ def train(config_path):
                         val_preview_targets = val_targets.detach()
                         val_preview_ignore = val_ignore_mask.detach()
                         val_preview_volume_logits = preview_volume_preds.detach() if normal_pooled_mode else None
-                        if mode in _FULL_3D_TRAINING_MODES:
+                        if mode in _FULL_3D_TRAINING_MODES or flat_depth_targets:
                             (
                                 val_preview_batch,
                                 val_preview_preds,
                                 val_preview_targets,
                                 val_preview_ignore,
-                            ) = _build_full_3d_preview_batch(
+                            ) = _build_volume_preview_batch(
                                 val_batch,
                                 val_preview_preds,
                                 val_preview_targets,

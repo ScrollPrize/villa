@@ -66,11 +66,18 @@ class TargetHeadWrapper(nn.Module):
         *,
         target_name: str,
         input_pad_depth_to: int | None = None,
+        z_window: tuple[int, int] | None = None,
     ):
         super().__init__()
         self.model = model
         self.target_name = str(target_name)
         self.input_pad_depth_to = input_pad_depth_to
+        if z_window is not None:
+            start, stop = (int(v) for v in z_window)
+            if start < 0 or stop <= start:
+                raise ValueError(f"z window must be 0 <= start < stop, got {z_window!r}")
+            z_window = (start, stop)
+        self.z_window = z_window
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from koine_machines.models.input_padding import center_pad_input_depth
@@ -91,6 +98,32 @@ class TargetHeadWrapper(nn.Module):
             if len(logits) == 0:
                 raise ValueError(f"Target {self.target_name!r} returned an empty logits list")
             logits = logits[0]
+        if logits.ndim == 5:
+            # A model trained on depth-resolved targets predicts a volume. The
+            # surface map this writes is that volume under a max over z, which
+            # is what a z-projecting model would have produced, so the two stay
+            # comparable on the same held-out split.
+            if self.z_window is None:
+                LOGGER.warning(
+                    "Reducing a volume prediction over its full depth. Slices the "
+                    "training loss did not cover carry no signal and a max over "
+                    "them can bury the ink; pass --z-window with the supervised "
+                    "range instead."
+                )
+            else:
+                # Only the slices the training loss actually covered. Outside
+                # the supervised column the network was free to predict
+                # anything, and it does: measured on a depth-target run, ink
+                # and background both saturate above 0.6 there, so reducing
+                # over the full volume reports that noise instead of the ink.
+                start, stop = self.z_window
+                depth = logits.shape[2]
+                if start >= depth:
+                    raise ValueError(
+                        f"z window {self.z_window} starts past the prediction depth {depth}"
+                    )
+                logits = logits[:, :, start:min(stop, depth)]
+            logits = logits.amax(dim=2)
         return logits
 
 
@@ -477,6 +510,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=(
             "Comma-separated CUDA device ids to use for inference, for example 0 or 0,1,2,3. "
             "When multiple GPUs are provided, each inference batch is split across those devices."
+        ),
+    )
+    parser.add_argument(
+        "--z-window",
+        default=None,
+        metavar="START:STOP",
+        help=(
+            "Reduce only these z slices of a volume prediction, as a half-open range, "
+            "for example 16:48. Use the column the training labels supervised: slices "
+            "outside it carry no signal, and a max over them buries the ink. "
+            "Default: the whole volume."
         ),
     )
     parser.add_argument("--compile-mode", default="reduce-overhead")
@@ -1328,7 +1372,29 @@ def resolve_amp_dtype(
     return checkpoint_amp_dtype(checkpoint_payload, checkpoint_path)
 
 
-def build_repo_training_model_bundle(payload: dict[str, Any], checkpoint_path: Path | str) -> ConfiguredModel:
+def parse_z_window(value: str | None) -> tuple[int, int] | None:
+    """Parse a ``START:STOP`` z range; None (or empty) means the whole volume."""
+    if value is None or not str(value).strip():
+        return None
+    text = str(value).strip()
+    parts = text.split(":")
+    if len(parts) != 2:
+        raise ValueError(f"z window must look like START:STOP, got {text!r}")
+    try:
+        start, stop = (int(part) for part in parts)
+    except ValueError as exc:
+        raise ValueError(f"z window bounds must be integers, got {text!r}") from exc
+    if start < 0 or stop <= start:
+        raise ValueError(f"z window must be 0 <= start < stop, got {text!r}")
+    return start, stop
+
+
+def build_repo_training_model_bundle(
+    payload: dict[str, Any],
+    checkpoint_path: Path | str,
+    *,
+    z_window: tuple[int, int] | None = None,
+) -> ConfiguredModel:
     from koine_machines.models.make_model import make_model
     from koine_machines.models.input_padding import configured_input_pad_depth
 
@@ -1353,6 +1419,7 @@ def build_repo_training_model_bundle(payload: dict[str, Any], checkpoint_path: P
         base_model,
         target_name=infer_target_name_from_config(config),
         input_pad_depth_to=configured_input_pad_depth(config),
+        z_window=z_window,
     )
     model.eval()
     return ConfiguredModel(
@@ -1383,7 +1450,11 @@ def configure_model(args: argparse.Namespace) -> ConfiguredModel:
                 "Ignoring --metadata-json for config-backed checkpoint %s; the model will be rebuilt from checkpoint['config'].",
                 args.checkpoint,
             )
-        configured_model = build_repo_training_model_bundle(checkpoint_payload, args.checkpoint)
+        configured_model = build_repo_training_model_bundle(
+            checkpoint_payload,
+            args.checkpoint,
+            z_window=parse_z_window(getattr(args, "z_window", None)),
+        )
         configured_model.amp_dtype = resolved_amp_dtype
         return configured_model
     raise ValueError(
