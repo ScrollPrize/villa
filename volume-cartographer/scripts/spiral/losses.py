@@ -159,39 +159,14 @@ def get_shell_outer_loss(shell_map, slice_to_spiral_transform, dr_per_winding, o
 
 
 
-def _sample_patch_points_python(patches, patch_indices, cap, rng):
-    """Uniformly sample distinct valid quads, padding rows with a valid point."""
-    if cap <= 0:
-        raise ValueError('patch point cap must be positive')
-    patch_indices = np.asarray(patch_indices, dtype=np.int64)
-    ijs = np.empty((len(patch_indices), cap, 2), dtype=np.float32)
-    counts = np.empty(len(patch_indices), dtype=np.int64)
-    for row, patch_idx in enumerate(patch_indices):
-        patch = patches[int(patch_idx)]
-        cells = getattr(patch, '_sampling_valid_quad_indices_np', None)
-        if cells is None:
-            cells = np.argwhere(patch._sampling_valid_quad_mask_np).astype(
-                np.int64, copy=False)
-        count = min(len(cells), cap)
-        if count <= 0:
-            raise RuntimeError('patch sampling mask contains no valid quads')
-        # choice(..., replace=False) randomises order even when every cell is used.
-        selected = rng.choice(len(cells), count, replace=False)
-        row_ijs = cells[selected].astype(np.float32) + rng.random(
-            (count, 2)).astype(np.float32)
-        ijs[row, :count] = row_ijs
-        if count < cap:
-            # Geometry transforms never see an invalid coordinate. The accompanying
-            # validity mask excludes this duplicate from every reduction.
-            ijs[row, count:] = row_ijs[0]
-        counts[row] = count
-    return ijs, counts
-
-
-def _sample_patch_points(patches, patch_indices, cap, rng, patch_atlas):
+def _sample_patch_points(patch_indices, cap, rng, patch_atlas):
+    """Sample patch quads through the required native sampling binding."""
     native_atlas = getattr(patch_atlas, 'sampling_atlas', None)
-    if native_atlas is None:
-        return _sample_patch_points_python(patches, patch_indices, cap, rng)
+    if native_atlas is None or not hasattr(native_atlas, 'sample_patch_points'):
+        raise RuntimeError(
+            'Patch sampling requires '
+            'vc.spiral_sampling.PatchSamplingAtlas.sample_patch_points; '
+            'rebuild and install the vc_spiral_sampling native extension')
     seed = int(rng.randint(0, np.iinfo(np.int64).max))
     sampled = native_atlas.sample_patch_points(
         np.ascontiguousarray(patch_indices, dtype=np.int64), cap, seed)
@@ -391,7 +366,7 @@ def _sample_patch_batch(key, patches, sampling_probabilities, num_to_sample,
         patch_indices = rng.choice(len(patches), num_to_sample,
                                    p=sampling_probabilities, replace=True)
         ijs_np, counts_np = _sample_patch_points(
-            patches, patch_indices, point_cap, rng, patch_atlas)
+            patch_indices, point_cap, rng, patch_atlas)
         row_indices = np.broadcast_to(
             np.asarray(patch_indices, dtype=np.int64)[:, None],
             (num_to_sample, point_cap),
@@ -781,16 +756,11 @@ def _valid_patch_annotation(patches_dict, patch_atlas, pid, i, j):
     return patch_idx, int(node_id)
 
 
-def _sample_requested_patch_rows(patches_dict, patch_indices, point_cap,
-                                 patch_atlas):
+def _sample_requested_patch_rows(patch_indices, point_cap, patch_atlas):
     """Sample already-validated annotation patch rows without replacement."""
-    patches = [None] * len(patch_atlas.id_to_idx)
-    for patch_id, patch_idx in patch_atlas.id_to_idx.items():
-        patches[patch_idx] = patches_dict[patch_id]
     patch_indices = np.asarray(patch_indices, dtype=np.int64)
     ijs_np, counts_np = _sample_patch_points(
-        patches, patch_indices, point_cap, prefetch.LegacyNumpyRandom,
-        patch_atlas)
+        patch_indices, point_cap, prefetch.LegacyNumpyRandom, patch_atlas)
     row_patch_indices = np.broadcast_to(
         patch_indices[:, None], (len(patch_indices), point_cap))
     node_ids_np = patch_atlas.theta_node_ids(row_patch_indices, ijs_np)
@@ -863,7 +833,7 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding,
     flat_patch_indices = np.asarray(
         [idx for row in rows for idx in row['patch_indices']], dtype=np.int64)
     _, flat_zyxs, flat_node_ids, flat_mask = _sample_requested_patch_rows(
-        patches_dict, flat_patch_indices, point_cap, patch_atlas)
+        flat_patch_indices, point_cap, patch_atlas)
     flat_spiral = slice_to_spiral_transform(
         flat_zyxs.reshape(-1, 3)).reshape(*flat_zyxs.shape)
     theta, _, shifted = get_theta_and_radii(
@@ -946,7 +916,7 @@ def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding,
 
     point_cap = cfg['sample_count_points_per_patch']
     _, zyxs, node_ids, mask = _sample_requested_patch_rows(
-        patches_dict, [row[0] for row in rows], point_cap, patch_atlas)
+        [row[0] for row in rows], point_cap, patch_atlas)
     spiral = slice_to_spiral_transform(
         zyxs.reshape(-1, 3)).reshape(*zyxs.shape)
     theta, _, shifted = get_theta_and_radii(

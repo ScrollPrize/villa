@@ -304,6 +304,25 @@ class ShellPolarMap:
         return target_radius, radius, confidence, valid
 
 
+def _make_native_patch_sampling_atlas(masks):
+    """Construct the required native sampler, rejecting missing/stale builds."""
+    native = load_native_spiral_sampling()
+    atlas_type = (
+        getattr(native, 'PatchSamplingAtlas', None)
+        if native is not None else None)
+    if atlas_type is None:
+        raise RuntimeError(
+            'Patch sampling requires vc.spiral_sampling.PatchSamplingAtlas; '
+            'rebuild and install the vc_spiral_sampling native extension')
+    atlas = atlas_type(masks)
+    if not hasattr(atlas, 'sample_patch_points'):
+        raise RuntimeError(
+            'The installed vc.spiral_sampling binding is out of date: '
+            'PatchSamplingAtlas.sample_patch_points is missing; rebuild and '
+            'install the vc_spiral_sampling native extension')
+    return atlas
+
+
 class PatchAtlas:
     """All patches' (H, W, 3) zyxs grids packed into one flat tensor, batched
     per lookup instead of per-patch dispatch. Geometry is initially prepared on
@@ -336,14 +355,12 @@ class PatchAtlas:
         self._quad_node_ids = []
         self._theta_node_start = None
         self._theta_node_ranges = []
-        native = load_native_spiral_sampling()
+        masks = [
+            np.ascontiguousarray(p._sampling_valid_quad_mask_np, dtype=bool)
+            for p in patches_by_id.values()
+        ]
         self.sampling_atlas = (
-            native.PatchSamplingAtlas([
-                np.ascontiguousarray(p._sampling_valid_quad_mask_np, dtype=bool)
-                for p in patches_by_id.values()
-            ])
-            if native is not None and patches_by_id else None
-        )
+            _make_native_patch_sampling_atlas(masks) if masks else None)
 
     def memory_mb(self):
         return self.zyxs_flat.numel() * 4 / 1e6
@@ -360,14 +377,13 @@ class PatchAtlas:
 
     def rebuild_sampling_atlas(self):
         """Rebuild CPU/native lookup metadata after sampling masks change."""
-        native = load_native_spiral_sampling()
+        masks = [
+            np.ascontiguousarray(
+                patch._sampling_valid_quad_mask_np, dtype=bool)
+            for patch in self._patches
+        ]
         self.sampling_atlas = (
-            native.PatchSamplingAtlas([
-                np.ascontiguousarray(
-                    patch._sampling_valid_quad_mask_np, dtype=bool)
-                for patch in self._patches
-            ])
-            if native is not None and self._patches else None)
+            _make_native_patch_sampling_atlas(masks) if masks else None)
 
     def lookup(self, patch_idx_per_sample, ijs):
         # Caller must ensure floor(ij) lies on a valid quad. CPU lookup remains
@@ -565,9 +581,7 @@ class PatchAtlas:
         if self.sampling_atlas is not None:
             self.sampling_atlas.append(masks)
         else:
-            native = load_native_spiral_sampling()
-            if native is not None:
-                self.sampling_atlas = native.PatchSamplingAtlas(masks)
+            self.sampling_atlas = _make_native_patch_sampling_atlas(masks)
 
 
 class _UnattachedPclStripList(list):

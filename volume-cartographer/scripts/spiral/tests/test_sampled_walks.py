@@ -1,16 +1,23 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 import losses
+from native_spiral import load_native_spiral_sampling
+
+
+native = load_native_spiral_sampling()
 
 
 class _Atlas:
-    sampling_atlas = None
     device = torch.device('cpu')
 
     def __init__(self, masks):
+        if native is None:
+            raise RuntimeError('vc.spiral_sampling is required by this test')
+        self.sampling_atlas = native.PatchSamplingAtlas(masks)
         self.node_maps = []
         start = 0
         for mask in masks:
@@ -41,32 +48,11 @@ def _patch(mask):
     )
 
 
-def test_python_sampler_is_seeded_uniform_without_replacement():
-    mask = np.ones((7, 9), dtype=bool)
-    mask[2:5, 3:7] = False
-    patches = [_patch(mask)]
-    first = losses._sample_patch_points_python(
-        patches, [0, 0], 25, np.random.RandomState(42))
-    second = losses._sample_patch_points_python(
-        patches, [0, 0], 25, np.random.RandomState(42))
-    np.testing.assert_array_equal(first[0], second[0])
-    np.testing.assert_array_equal(first[1], [25, 25])
-    cells = np.floor(first[0]).astype(np.int64)
-    assert mask[cells[..., 0], cells[..., 1]].all()
-    assert all(len(np.unique(row, axis=0)) == 25 for row in cells)
-
-
-def test_python_sampler_uses_every_small_cell_and_masks_padding():
-    mask = np.zeros((4, 6), dtype=bool)
-    mask[[0, 1, 3], [4, 2, 5]] = True
-    ijs, counts = losses._sample_patch_points_python(
-        [_patch(mask)], [0], 8, np.random.RandomState(7))
-    assert counts.tolist() == [3]
-    cells = np.floor(ijs[0]).astype(np.int64)
-    assert len(np.unique(cells[:3], axis=0)) == 3
-    assert mask[cells[:, 0], cells[:, 1]].all()
-    np.testing.assert_array_equal(
-        ijs[0, 3:], np.repeat(ijs[0, :1], 5, axis=0))
+def test_patch_sampler_requires_current_native_binding():
+    with pytest.raises(RuntimeError, match='sample_patch_points'):
+        losses._sample_patch_points(
+            np.array([0]), 8, np.random.RandomState(7),
+            SimpleNamespace(sampling_atlas=None))
 
 
 def test_patch_batch_returns_node_ids_and_explicit_padding_mask():

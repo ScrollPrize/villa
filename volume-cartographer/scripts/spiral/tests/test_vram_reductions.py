@@ -450,8 +450,6 @@ class DevicePatchAtlasTests(unittest.TestCase):
         import losses as losses_module
         patches = {f'p{n}': self._fake_patch(8, 8, 10 + n) for n in range(3)}
         atlas = self.PatchAtlas(patches, device='cuda').materialize()
-        if atlas.sampling_atlas is None:
-            self.skipTest('native spiral sampling module unavailable')
         cfg = {}
         from theta_crossing_map import ThetaCrossingMap
         crossing_map = ThetaCrossingMap('cuda')
@@ -478,8 +476,6 @@ class DevicePatchAtlasTests(unittest.TestCase):
         import prefetch as prefetch_module
         patches = {f'p{n}': self._fake_patch(8, 8, 20 + n) for n in range(3)}
         atlas = self.PatchAtlas(patches, device='cuda').materialize()
-        if atlas.sampling_atlas is None:
-            self.skipTest('native spiral sampling module unavailable')
         cfg = {}
         from theta_crossing_map import ThetaCrossingMap
         crossing_map = ThetaCrossingMap('cuda')
