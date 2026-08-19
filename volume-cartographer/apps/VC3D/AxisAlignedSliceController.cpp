@@ -400,11 +400,18 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
                                     float yawDeg = 0.0f,
                                     double tilt = 0.0) {
         auto planeShared = std::dynamic_pointer_cast<PlaneSurface>(_state->surface(planeName));
-        if (!planeShared) {
+        // Preserve the plane's scroll displacement along its normal (set by
+        // shift-scrolling its viewer) so re-orienting (e.g. rotating via the
+        // xy-view handles) doesn't snap the plane back to the focus point.
+        // Lateral drift relative to the focus is still discarded.
+        float scrollOffset = 0.0f;
+        if (planeShared) {
+            const cv::Vec3f oldNormal = normalizeOrZero(planeShared->normal({}, {}));
+            scrollOffset = (planeShared->origin() - origin).dot(oldNormal);
+        } else {
             planeShared = std::make_shared<PlaneSurface>();
         }
 
-        planeShared->setOrigin(origin);
         planeShared->setInPlaneRotation(0.0f);
 
         cv::Vec3f rotatedNormal = baseNormal;
@@ -423,6 +430,7 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
         }
 
         planeShared->setNormal(rotatedNormal);
+        planeShared->setOrigin(origin + rotatedNormal * scrollOffset);
 
         // Up/right alignment first, then the volumetric-camera azimuth folded
         // on top (in-plane rotations commute, so one setInPlaneRotation call).
