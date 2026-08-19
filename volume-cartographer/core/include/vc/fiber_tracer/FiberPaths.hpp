@@ -6,6 +6,7 @@
 #include <array>
 #include <compare>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <optional>
@@ -318,6 +319,11 @@ struct FiberletCorridorContainmentDebug {
     const std::vector<cv::Vec3f>& reference,
     float radius,
     std::optional<size_t> adjacentSegment = std::nullopt);
+
+[[nodiscard]] std::vector<std::array<int64_t, 3>>
+debugFinalizeFiberletCornerSets(
+    const std::vector<std::vector<std::array<int64_t, 3>>>& cornerSets,
+    size_t parallelThreads);
 
 }  // namespace testing
 #endif

@@ -1298,3 +1298,114 @@ with unchanged populations, DP relaxations, and replay failures.
 - Checkpoint 24 is retained after three deterministic canonical runs improved
   median wall time by 2.8%, total CPU by 1.7%, and peak RSS by 5.4% while
   preserving comparable replay quality.
+
+## Post-checkpoint-24 optimization queue
+
+Use commit `d2229bf6f` as the new measured baseline. Implement one checkpoint
+at a time and stop for review after its focused tests and three canonical
+replays. The ordered queue is:
+
+### Checkpoint 25: parallel corner-set finalization
+
+1. Keep candidate preparation and worker-local corner ownership unchanged.
+2. Convert each worker's corner set to a vector and sort it concurrently using
+   the existing bounded worker count. Keep each vector's `storedVoxelLess`
+   order and retain the current deterministic pairwise sorted-unique merge.
+3. Account concurrent vector capacity in peak-memory estimates and propagate
+   worker exceptions before merging.
+4. Add focused coverage comparing serial reference finalization with the
+   parallel result for empty, overlapping, duplicate-heavy, and uneven worker
+   sets.
+5. Compare corner-merge wall/CPU, total wall/CPU, RSS, exact sampled-voxel
+   order, graph populations, DP work, artifact hash, and replay failures.
+
+Result: retained. The production path allocates exact destination capacities on
+the calling thread, then concurrently fills and sorts worker vectors before the
+existing merge tree. GCC and Clang focused suites pass all 49 cases. Three warm
+canonical runs produced:
+
+| metric | checkpoint 25 min / median / max | checkpoint 24 min / median / max | median change |
+|---|---:|---:|---:|
+| command wall | 8.08 / 8.23 / 8.35 s | 8.86 / 8.96 / 8.98 s | -8.1% |
+| total CPU | 201.66 / 202.91 / 205.02 s | 197.05 / 199.47 / 200.68 s | +1.7% |
+| anchor wall | 5.011 / 5.124 / 5.236 s | 4.963 / 4.984 / 5.032 s | +2.8% |
+| anchor CPU | 130.65 / 131.49 / 133.02 s | 128.80 / 129.92 / 130.80 s | +1.2% |
+| fiberlet wall | 2.488 / 2.519 / 2.534 s | 3.236 / 3.298 / 3.313 s | -23.6% |
+| fiberlet CPU | 68.26 / 69.31 / 69.89 s | 66.01 / 67.33 / 67.68 s | +2.9% |
+| corner finalization wall | 0.265 / 0.268 / 0.268 s | about 1.05 s | about -74.5% |
+| corner finalization CPU | 2.462 / 2.463 / 2.497 s | about 1.36 s | about +81% |
+| peak RSS | 2,060,168 / 2,060,332 / 2,077,188 KiB | 1,994,740 / 2,007,020 / 2,018,200 KiB | +2.7% |
+
+All runs retained 170,778 sampled voxels in the exact prior order and produced
+artifact SHA-256
+`f2b8e679c23470d1221f7930a21b0c37fa0906845de0bc2cbf3e8ab7329f78ee`.
+Anchor/graph/DP populations and the 2 greedy / 1 fiberlet failures were
+unchanged. The cold first run was excluded after recording 1,670 major faults
+and 773,656 filesystem-input blocks.
+
+### Checkpoint 26: sparse paged corner bitmap
+
+Proceed only if checkpoint 25 leaves corner collection or merging material.
+
+1. Measure worker-set sizes, duplicate ratios, occupied spatial pages, and page
+   reuse before choosing a page edge.
+2. Replace per-worker `unordered_set` insertion with a bounded sparse page
+   directory and dense bits inside occupied pages. Cache the last page during
+   each candidate's locally coherent insertion stream.
+3. Merge corresponding pages with bitwise OR and enumerate set bits in exact
+   stored-voxel order. Do not sample conservative extra corners.
+4. Compare all 405.7 million insertion attempts, 170,778 canonical unique
+   voxels, corner collection/merge time, memory, and complete replay quality.
+
+### Checkpoint 27: ready-cell anchor scheduling
+
+1. Add measurement-only per-sampling-group and per-cell fitting durations to
+   distinguish tile sampling latency from fitting-tail imbalance.
+2. If fitting tails explain the roughly 26/32 effective-core utilization,
+   retain sampled group storage under the existing memory budget and enqueue
+   its cells independently once sampling and gradient construction complete.
+3. Keep each cell's observation order and fitting arithmetic unchanged. A
+   group is released only after all of its cells finish.
+4. Compare anchor wall/CPU, worker utilization and tail, sample reuse, peak
+   memory, deterministic output, and replay quality.
+
+### Checkpoint 28: peak Gaussian acceleration
+
+1. Isolate the radial Gaussian cost inside the scalar sequential response
+   scan; do not restore rejected response batching, CSR, or counting-sort
+   layouts unchanged.
+2. Evaluate a float lookup or bounded polynomial over the exact finite cutoff
+   interval. Record maximum/mean relative and absolute error against `expf` and
+   preserve exact zero outside the cutoff.
+3. Keep evidence traversal, response-cache behavior, hill-climb ordering, and
+   tie policy unchanged around the approximation.
+4. Compare peak worker time, selected peak displacement, anchor distributions,
+   populations, graph/DP changes, replay failures, and visual quality. Exact
+   artifact identity is not required.
+
+### Checkpoint 29: one-pass membership reuse experiment
+
+1. Reuse the robust assignments and retained membership from the accepted
+   default one-pass update instead of recomputing membership at its new
+   positions.
+2. Profile the removed scans explicitly. Keep the existing recomputation
+   available only as an experiment reference, not as a permanent compatibility
+   branch.
+3. Treat this as a fitting-quality change. Compare matched anchors, position
+   and angle tails, retained/unmatched populations, failure visualizations,
+   graph/DP work, and replay failures before retention.
+4. Do not repeat the rejected inline-membership experiment; this checkpoint
+   changes when membership is recomputed rather than adding its predicate to
+   every downstream hot scan.
+
+### Checkpoint 30: remaining DP throughput
+
+1. Profile transition-cost arithmetic and candidate completion tails under the
+   checkpoint-24 float representation.
+2. Test largest-candidate-first scheduling independently from any arithmetic
+   change. Preserve candidate result indexing and deterministic path decisions.
+3. If arithmetic remains material, test a portable vectorized transition
+   kernel with a scalar fallback for Ubuntu/macOS and amd64/arm64.
+4. Compare search wall/CPU, tail utilization, DP counters, selected paths,
+   artifact determinism, and replay quality. Its current 1.23-second wall-time
+   ceiling makes it lower priority than checkpoints 25-29.

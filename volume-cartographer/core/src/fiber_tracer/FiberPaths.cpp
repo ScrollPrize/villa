@@ -1218,6 +1218,125 @@ std::vector<Voxel> mergeSortedUnique(const std::vector<Voxel>& left, const std::
     return merged;
 }
 
+struct FinalizedCorners {
+    std::vector<Voxel> voxels;
+    size_t peakTransientBytes = 0;
+};
+
+size_t cornerVectorBytes(const std::vector<std::vector<Voxel>>& vectors)
+{
+    size_t bytes = 0;
+    for (const auto& corners : vectors) {
+        bytes = checkedSum(
+            bytes,
+            checkedProduct(
+                corners.capacity(), sizeof(Voxel),
+                "fiberlet sorted corner byte estimate"),
+            "fiberlet sorted corner byte estimate");
+    }
+    return bytes;
+}
+
+FinalizedCorners finalizeCornerSets(
+    std::vector<std::unordered_set<Voxel, VoxelHash>>& cornerSets,
+    size_t parallelThreads,
+    size_t cornerSetBytes)
+{
+    FinalizedCorners result;
+    if (cornerSets.empty())
+        return result;
+    if (parallelThreads == 0)
+        throw std::invalid_argument("fiberlet corner finalization requires at least one worker");
+
+    std::vector<std::vector<Voxel>> cornerVectors(cornerSets.size());
+    for (size_t index = 0; index < cornerSets.size(); ++index)
+        cornerVectors[index].reserve(cornerSets[index].size());
+    std::atomic<size_t> nextSet{0};
+    std::vector<std::exception_ptr> sortErrors(cornerSets.size());
+    const auto sortWorker = [&]() {
+        while (true) {
+            const size_t index = nextSet.fetch_add(1, std::memory_order_relaxed);
+            if (index >= cornerSets.size())
+                return;
+            try {
+                cornerVectors[index].assign(
+                    cornerSets[index].begin(), cornerSets[index].end());
+                std::sort(
+                    cornerVectors[index].begin(), cornerVectors[index].end(),
+                    storedVoxelLess);
+            } catch (...) {
+                sortErrors[index] = std::current_exception();
+            }
+        }
+    };
+    const size_t sortWorkers = std::min(parallelThreads, cornerSets.size());
+    if (sortWorkers == 1) {
+        sortWorker();
+    } else {
+        std::vector<std::thread> workers;
+        workers.reserve(sortWorkers);
+        for (size_t index = 0; index < sortWorkers; ++index)
+            workers.emplace_back(sortWorker);
+        for (auto& thread : workers)
+            thread.join();
+    }
+    for (const auto& error : sortErrors) {
+        if (error)
+            std::rethrow_exception(error);
+    }
+
+    result.peakTransientBytes = checkedSum(
+        cornerSetBytes, cornerVectorBytes(cornerVectors),
+        "fiberlet corner finalization byte estimate");
+    cornerSets.clear();
+    cornerSets.shrink_to_fit();
+
+    while (cornerVectors.size() > 1) {
+        const size_t pairCount = cornerVectors.size() / 2;
+        std::vector<std::vector<Voxel>> next((cornerVectors.size() + 1) / 2);
+        std::atomic<size_t> nextPair{0};
+        std::vector<std::exception_ptr> mergeErrors(pairCount);
+        const auto mergeWorker = [&]() {
+            while (true) {
+                const size_t pair = nextPair.fetch_add(1, std::memory_order_relaxed);
+                if (pair >= pairCount)
+                    return;
+                try {
+                    next[pair] = mergeSortedUnique(
+                        cornerVectors[pair * 2], cornerVectors[pair * 2 + 1]);
+                } catch (...) {
+                    mergeErrors[pair] = std::current_exception();
+                }
+            }
+        };
+        const size_t mergeWorkers = std::min(parallelThreads, pairCount);
+        if (mergeWorkers == 1) {
+            mergeWorker();
+        } else {
+            std::vector<std::thread> workers;
+            workers.reserve(mergeWorkers);
+            for (size_t index = 0; index < mergeWorkers; ++index)
+                workers.emplace_back(mergeWorker);
+            for (auto& thread : workers)
+                thread.join();
+        }
+        for (const auto& error : mergeErrors) {
+            if (error)
+                std::rethrow_exception(error);
+        }
+        if (cornerVectors.size() % 2 != 0)
+            next.back() = std::move(cornerVectors.back());
+        result.peakTransientBytes = std::max(
+            result.peakTransientBytes,
+            checkedSum(
+                cornerVectorBytes(cornerVectors), cornerVectorBytes(next),
+                "fiberlet corner finalization byte estimate"));
+        cornerVectors = std::move(next);
+    }
+    result.voxels = std::move(cornerVectors.front());
+    return result;
+}
+
 size_t preparedPayloadBytes(const std::vector<PreparedCandidate>& prepared)
 {
     size_t bytes = checkedProduct(prepared.capacity(), sizeof(PreparedCandidate), "fiberlet prepared byte estimate");
@@ -2979,65 +3098,15 @@ FiberletPathReport traceFiberletPaths(
     const auto cornerMergeStart = Clock::now();
     const double cornerMergeCpuStart = processCpuSeconds();
     reportProgress("corner_merge", 0, workerCorners.size(), cornerMergeStart, true);
-    std::vector<std::vector<Voxel>> cornerVectors(workerCorners.size());
-    for (size_t index = 0; index < workerCorners.size(); ++index) {
-        cornerVectors[index].assign(workerCorners[index].begin(), workerCorners[index].end());
-        std::sort(cornerVectors[index].begin(), cornerVectors[index].end(), storedVoxelLess);
-    }
-    size_t sortedCornerBytes = 0;
-    for (const auto& corners : cornerVectors) {
-        sortedCornerBytes = checkedSum(
-            sortedCornerBytes,
-            checkedProduct(corners.capacity(), sizeof(Voxel), "fiberlet sorted corner byte estimate"),
-            "fiberlet sorted corner byte estimate");
-    }
+    auto finalizedCorners = finalizeCornerSets(
+        workerCorners, static_cast<size_t>(report.config.parallelThreads),
+        workerCornerBytes);
     report.estimatedPeakOwnedBytes = std::
         max(report.estimatedPeakOwnedBytes,
             checkedSum(
-                checkedSum(preparedBytes, workerCornerBytes, "fiberlet peak owned byte estimate"),
-                sortedCornerBytes,
+                preparedBytes, finalizedCorners.peakTransientBytes,
                 "fiberlet peak owned byte estimate"));
-    workerCorners.clear();
-    workerCorners.shrink_to_fit();
-    while (cornerVectors.size() > 1) {
-        const size_t pairCount = cornerVectors.size() / 2;
-        std::vector<std::vector<Voxel>> next((cornerVectors.size() + 1) / 2);
-        std::atomic<size_t> nextPair{0};
-        std::vector<std::exception_ptr> mergeErrors(pairCount);
-        const auto mergeWorker = [&]() {
-            while (true) {
-                const size_t pair = nextPair.fetch_add(1, std::memory_order_relaxed);
-                if (pair >= pairCount)
-                    return;
-                try {
-                    next[pair] = mergeSortedUnique(cornerVectors[pair * 2], cornerVectors[pair * 2 + 1]);
-                } catch (...) {
-                    mergeErrors[pair] = std::current_exception();
-                }
-            }
-        };
-        const size_t mergeWorkers = std::min(pairCount, static_cast<size_t>(report.config.parallelThreads));
-        if (mergeWorkers == 1) {
-            mergeWorker();
-        } else {
-            std::vector<std::thread> workers;
-            workers.reserve(mergeWorkers);
-            for (size_t index = 0; index < mergeWorkers; ++index)
-                workers.emplace_back(mergeWorker);
-            for (auto& thread : workers)
-                thread.join();
-        }
-        for (const auto& error : mergeErrors) {
-            if (error)
-                std::rethrow_exception(error);
-        }
-        if (cornerVectors.size() % 2 != 0)
-            next.back() = std::move(cornerVectors.back());
-        cornerVectors = std::move(next);
-    }
-    std::vector<Voxel> orderedVoxels;
-    if (!cornerVectors.empty())
-        orderedVoxels = std::move(cornerVectors.front());
+    std::vector<Voxel> orderedVoxels = std::move(finalizedCorners.voxels);
     reportProgress("corner_merge", workerCount, workerCount, cornerMergeStart, true);
     report.cornerMergeSeconds = std::chrono::duration<double>(Clock::now() - cornerMergeStart).count();
     report.cornerMergeCpuSeconds = processCpuSeconds() - cornerMergeCpuStart;
@@ -3869,6 +3938,28 @@ FiberletCorridorContainmentDebug debugFiberletCorridorContains(
         point, reference, radius * radius, adjacentSegment,
         result.segmentTests);
     return result;
+}
+
+std::vector<std::array<int64_t, 3>> debugFinalizeFiberletCornerSets(
+    const std::vector<std::vector<std::array<int64_t, 3>>>& cornerSets,
+    size_t parallelThreads)
+{
+    std::vector<std::unordered_set<Voxel, VoxelHash>> uniqueSets(
+        cornerSets.size());
+    size_t cornerSetBytes = 0;
+    for (size_t index = 0; index < cornerSets.size(); ++index) {
+        uniqueSets[index].insert(
+            cornerSets[index].begin(), cornerSets[index].end());
+        cornerSetBytes = checkedSum(
+            cornerSetBytes,
+            checkedProduct(
+                uniqueSets[index].size(), sizeof(Voxel),
+                "fiberlet test corner byte estimate"),
+            "fiberlet test corner byte estimate");
+    }
+    return finalizeCornerSets(
+               uniqueSets, parallelThreads, cornerSetBytes)
+        .voxels;
 }
 
 }  // namespace testing

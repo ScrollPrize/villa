@@ -1197,3 +1197,28 @@
   Together with the recorded localized route comparison, this satisfies the
   deterministic performance and comparable-quality gates. Checkpoint 24 is
   retained.
+- Recorded the post-checkpoint-24 queue as checkpoints 25-30: parallel corner
+  finalization, sparse paged corner deduplication, ready-cell anchor scheduling,
+  bounded peak Gaussian acceleration, one-pass membership reuse, and remaining
+  DP scheduling/vectorization. The plan explicitly excludes unchanged retries
+  of previously rejected response batching, inline membership, and eager-edge
+  variants.
+- Checkpoint 25 moved worker-local corner-set conversion and sorting onto the
+  configured bounded workers while preserving the existing deterministic merge
+  tree. Exact vector capacities are reserved on the calling thread before the
+  parallel phase, and peak-memory accounting now includes simultaneously live
+  merge inputs and outputs. Focused empty, overlap, duplicate-heavy, and uneven
+  set tests compare the production finalizer with a serial reference. GCC and
+  Clang each pass all 49 `test_fiberlet_paths` cases.
+- One cold repository-local replay was excluded because it incurred 1,670 major
+  faults and 773,656 filesystem-input blocks. Three subsequent warm runs had
+  command wall 8.08 / 8.23 / 8.35 seconds, total CPU 201.66 / 202.91 / 205.02
+  seconds, corner-finalization wall 0.265 / 0.268 / 0.268 seconds, and peak RSS
+  2,060,168 / 2,060,332 / 2,077,188 KiB. Checkpoint 24 medians were 8.96 wall,
+  199.47 CPU, about 1.05 corner-finalization wall, and 2,007,020 KiB RSS.
+- Every checkpoint-25 warm run retained 170,778 sampled voxels, 2,603 anchors,
+  2,562 graph nodes, 26,445 edges, 62,873,000 DP relaxations, 2 greedy / 1
+  fiberlet failures, and exact artifact SHA-256
+  `f2b8e679c23470d1221f7930a21b0c37fa0906845de0bc2cbf3e8ab7329f78ee`.
+  Checkpoint 25 is retained for its 8.1% median wall-time gain; its 1.7% CPU and
+  2.7% RSS increases are recorded tradeoffs.

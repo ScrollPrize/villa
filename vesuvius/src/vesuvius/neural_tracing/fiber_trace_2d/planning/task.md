@@ -158,3 +158,53 @@ determinism and comparable extraction/replay quality are the retention gates.
 Three canonical runs retained deterministic artifacts and replay failures while
 improving median wall time by 2.8%, total CPU by 1.7%, and peak RSS by 5.4%
 against checkpoint 23. The end-to-end float representation is retained.
+
+## Remaining options after checkpoint 24
+
+Continue from commit `d2229bf6f` and test these options one at a time:
+
+1. Parallelize conversion and sorting of the 32 worker-local interpolation-
+   corner sets before their existing deterministic merge. The checkpoint-24
+   corner-merge stage costs about 1.05 seconds wall but only 1.36 CPU-seconds,
+   exposing a mostly serial wall-time bottleneck. Preserve the final sorted
+   unique voxel sequence exactly.
+2. If corner sorting remains material, replace worker-local corner hash sets
+   with sparse paged bitmaps. The canonical replay performs about 405.7 million
+   insertion attempts for only 170,778 unique voxels. Preserve exact corner
+   coverage and deterministic ordered output; measure page-directory overhead
+   before retaining this larger change.
+3. Improve anchor fitting load balance after sampled tile data becomes ready.
+   Checkpoint 24 uses roughly 26 effective cores across the anchor phase on a
+   32-thread run. Measure per-group and per-cell tails first, then test a queue
+   that allows ready cells to be fitted independently without duplicating tile
+   samples or exceeding the bounded sample-memory budget.
+4. Accelerate direction-conditioned peak-response Gaussian evaluation. Peak
+   search still costs about 33.75 worker-seconds over roughly 2.97 billion hot
+   observation visits. Evaluate a bounded float lookup or polynomial only with
+   explicit approximation-error, anchor-distribution, and replay-quality
+   gates. This option intentionally permits small numeric changes.
+5. Test eliminating the post-update robust-membership refresh in the default
+   one-pass fitter by reusing the accepted step's membership. This removes
+   repeated full observation scans but changes fitting semantics and therefore
+   requires stronger anchor geometry and visualization review. Do not present
+   it as behavior-preserving.
+6. Further optimize fiberlet DP through transition SIMD/vectorization or
+   largest-candidate-first scheduling. DP costs about 38.7 worker-seconds but
+   only 1.23 seconds wall because it already parallelizes well, so prioritize
+   it after the serial corner and anchor-tail work.
+
+Do not repeat the rejected peak-response batching/CSR/counting-sort variants,
+inline robust-membership materialization removal, or eager candidate-wide edge
+generation unchanged. Any revisit must address the measured locality,
+register-pressure, or repeated-predicate reason for the prior regression.
+
+Checkpoint 25 parallelized conversion and sorting of the worker-local corner
+sets while retaining the deterministic pairwise sorted-unique merge. Destination
+capacity is allocated on the calling thread before workers populate and sort the
+vectors, limiting allocator-arena growth. Three warm canonical runs reduced
+median corner-finalization wall time from about 1.05 to 0.268 seconds and total
+wall time from 8.96 to 8.23 seconds. Median total CPU increased from 199.47 to
+202.91 seconds and peak RSS increased from 2,007,020 to 2,060,332 KiB. Exact
+sample order, artifact hash, graph populations, DP work, and replay failures
+were unchanged. The wall-time gain is retained with the CPU/RSS tradeoff
+recorded.

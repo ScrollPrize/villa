@@ -57,6 +57,12 @@
 - [x] Run focused GCC and Clang validation.
 - [x] Run three canonical checkpoint 10 replays and compare quality/performance.
 - [x] Update specifications, user documentation, changelog, and task log.
+- [x] Checkpoint 25: parallelize deterministic corner-set finalization.
+- [ ] Checkpoint 26: test sparse paged corner bitmaps if still justified.
+- [ ] Checkpoint 27: measure and improve ready-cell anchor load balance.
+- [ ] Checkpoint 28: test bounded peak Gaussian acceleration.
+- [ ] Checkpoint 29: test one-pass post-update membership reuse as a quality change.
+- [ ] Checkpoint 30: profile and optimize remaining DP throughput.
 - [x] Obtain approval for checkpoint 23 float final evaluation.
 - [x] Plan checkpoint 23 and its precision, quality, and performance gates.
 - [x] Independently review checkpoint 23 against task and specifications.
