@@ -66,6 +66,18 @@ class LegacyNumpyRandom:
     choice = staticmethod(np.random.choice)
 
 
+def _iter_tensors(value):
+    """Yield tensors nested in the batch container types used by prefetch jobs."""
+    if isinstance(value, torch.Tensor):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _iter_tensors(item)
+    elif isinstance(value, (tuple, list)):
+        for item in value:
+            yield from _iter_tensors(item)
+
+
 class StepPrefetcher:
 
     def __init__(self):
@@ -133,8 +145,12 @@ class StepPrefetcher:
             result, evt = self.run_job(job)
         self._pending[key] = self._ensure_executor().submit(self.run_job, job)
         torch.cuda.current_stream().wait_event(evt)
-        for t in result if isinstance(result, tuple) else (result,):
-            if isinstance(t, torch.Tensor) and t.is_cuda:
+        # CUDA tensors may be nested in per-loss metadata dictionaries (for
+        # example dense_walk_info['walk_zyxs']). Record every one on the
+        # consumer stream so the caching allocator cannot recycle its
+        # side-stream allocation while consumer kernels are still using it.
+        for t in _iter_tensors(result):
+            if t.is_cuda:
                 t.record_stream(torch.cuda.current_stream())
         return result
 
