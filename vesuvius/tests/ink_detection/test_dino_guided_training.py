@@ -112,6 +112,31 @@ def test_dynamic_labels_reject_non_native_or_wrong_size_inputs():
         _parse(mapping)
 
 
+def test_unlabeled_dynamic_labels_require_full_supervision():
+    mapping = _training_mapping()
+    mapping["patch_discovery_mode"] = "unlabeled"
+    mapping["unlabeled_datasets"] = mapping["datasets"]
+    mapping["dynamic_label"] = {
+        "enabled": True,
+        "kind": "self_distill",
+        "primary_ckpt": "v2-77k.pth",
+        "ensemble_ckpt": "v2-64k.pth",
+        "primary_threshold": 0.17647,
+        "ensemble_threshold": 0.15686,
+        "mean_hi": 105,
+        "std_lo": 30,
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="patch_discovery_mode='unlabeled'.*force_full_supervision=true",
+    ):
+        _parse(mapping)
+
+    mapping["force_full_supervision"] = True
+    assert _parse(mapping).force_full_supervision is True
+
+
 def test_force_full_supervision_zeroes_native_ignore_mask():
     predictions = torch.zeros(1, 1, 2, 2, 2)
     batch = {
