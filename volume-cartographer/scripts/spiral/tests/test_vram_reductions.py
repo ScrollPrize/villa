@@ -309,7 +309,7 @@ class HostResidentPatchAtlasTests(unittest.TestCase):
         cfg = {'patch_strip_sampling': 'straight'}
         np.random.seed(0)
         probabilities = np.full(3, 1 / 3, dtype=np.float64)
-        ijs_gpu, idx_gpu, zyxs_gpu = losses_module._sample_patch_batch(
+        ijs_gpu, idx_gpu, zyxs_gpu, _ = losses_module._sample_patch_batch(
             'test_patches', list(patches.values()), probabilities,
             num_to_sample=4, num_points_per_direction=6, cfg=cfg,
             patch_atlas=atlas)
@@ -336,7 +336,7 @@ class HostResidentPatchAtlasTests(unittest.TestCase):
             # First call runs inline and schedules the next batch; the second
             # pops the prefetched triple assembled on the worker thread.
             for _ in range(2):
-                ijs_gpu, idx_gpu, zyxs_gpu = losses_module._sample_patch_batch(
+                ijs_gpu, idx_gpu, zyxs_gpu, _ = losses_module._sample_patch_batch(
                     'test_prefetch_patches', list(patches.values()), probabilities,
                     num_to_sample=4, num_points_per_direction=6, cfg=cfg,
                     patch_atlas=atlas)
