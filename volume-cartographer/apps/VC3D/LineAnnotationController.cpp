@@ -128,6 +128,11 @@ struct LineAnnotationController::LineAnnotationSession {
     std::shared_ptr<vc::lasagna::LasagnaDataset> traceNormalDataset;
     std::shared_ptr<vc::lasagna::LasagnaNormalSampler> traceNormalSampler;
     TaskState taskState = TaskState::Idle;
+    // The controller's orientation epoch when the current generated views were
+    // materialized. Behind the controller's value, the views were built before
+    // the umbilicus or active volume last changed and are rebuilt by the next
+    // refreshStaleGeneratedViews() pass.
+    int orientationEpoch = -1;
     cv::Vec3d seedPoint{0.0, 0.0, 0.0};
     std::string sourceAnnotationSurfaceName;
     vc::lasagna::LineOptimizationReport optimizationReport;
@@ -267,6 +272,11 @@ struct LineAnnotationController::IntersectionInspectionSession {
     QPointer<QShortcut> followShortcut;
     std::optional<bool> activeFollowSourceSide;
     std::map<std::string, GeneratedSurfaceContext> generatedSurfaceContexts;
+    // The controller's orientation epoch when these strips were built. The
+    // inspection's sessions suppress ordinary generated views, so the pane walk
+    // in refreshStaleGeneratedViews() never reaches them; this is how the
+    // inspection itself is noticed as stale instead.
+    int orientationEpoch = -1;
 };
 
 namespace {
@@ -1911,12 +1921,27 @@ LineAnnotationController::LineAnnotationController(CState* state,
                 &CState::vpkgChanged,
                 this,
                 &LineAnnotationController::onVolumePackageChanged);
+        // Both handlers only bump counters and queue one coalesced refresh; the
+        // actual reload happens at the cache choke point when a stale view is
+        // rebuilt, so neither handler touches the filesystem itself.
+        connect(_state,
+                &CState::volumeChanged,
+                this,
+                [this](const std::shared_ptr<Volume>&, const std::string&) {
+                    onActiveVolumeChanged();
+                });
         // Without this an attach or detach would not reach normal orientation
-        // until the project was reopened, since the resolved umbilicus is cached
-        // keyed only on what a materialization can observe changing.
+        // until the project was reopened, since the resolved umbilicus is cached.
+        // Dropping the cache alone is not enough either: nothing re-applies
+        // normals to surfaces already built, so the attach would report success
+        // while every open strip kept its old orientation — told it worked, and
+        // nothing visibly changes.
         connect(_state, &CState::umbilicusChanged, this, [this]() {
+            ++_umbilicusGeneration;
+            ++_orientationEpoch;
             invalidateScrollUmbilicus();
             publishUmbilicusNotice();
+            scheduleStaleViewRefresh();
         });
         if (_state->vpkg()) {
             loadFibersForCurrentPackage();
@@ -5132,6 +5157,9 @@ bool LineAnnotationController::rebuildIntersectionInspection(QString* errorMessa
                 }
             }
         }
+        // Only a completed build may claim the current orientation; a throw above
+        // leaves the previous epoch in place so the next refresh retries.
+        _intersectionInspection->orientationEpoch = _orientationEpoch;
         return true;
     } catch (const std::exception& ex) {
         if (errorMessage) {
@@ -9554,29 +9582,55 @@ QString LineAnnotationController::umbilicusCacheToken() const
     }
     const VolumePkg& pkg = *_state->vpkg();
     // Deliberately cheap: compared whenever a cached, already-scaled umbilicus is
-    // about to be reused, so it must not run the resolver's search or parse any
-    // JSON. The project's field covers attaching, detaching and repointing, and
-    // stat()ing the file it names covers that file being fixed, replaced or
-    // removed, which is what the attach dialog promises is a workable order of
-    // operations.
+    // about to be reused, so it stats and never parses. The candidates come from
+    // the resolver's own scan rather than a reconstruction of it, so the project
+    // field being set, cleared or repointed, the file it names being fixed,
+    // replaced or removed, and a discovery candidate appearing, changing or
+    // vanishing all change the token — the attach dialog promises that fixing a
+    // refused file is a workable order of operations, and a search-discovered
+    // file deserves the same.
     //
     // Size and mtime, so this is a metadata token rather than a guarantee: a
     // same-size rewrite inside one timestamp tick is invisible to it.
     QString token = QString::fromStdString(pkg.umbilicus());
-    const fs::path declared = pkg.umbilicusPath();
-    if (declared.empty()) {
-        return token;
+    const auto stat = [&token](const fs::path& path) {
+        token += QStringLiteral("|%1").arg(QString::fromStdString(path.string()));
+        std::error_code ec;
+        const auto size = fs::file_size(path, ec);
+        if (ec) {
+            token += QStringLiteral("=-");
+            return;
+        }
+        token += QStringLiteral("=%1").arg(size);
+        const auto written = fs::last_write_time(path, ec);
+        if (!ec) {
+            token += QStringLiteral(":%1").arg(
+                static_cast<qlonglong>(written.time_since_epoch().count()));
+        }
+    };
+    try {
+        for (const auto& candidate :
+             vc::core::util::umbilicusCandidatePaths(pkg)) {
+            stat(candidate);
+        }
+    } catch (...) {
     }
-    std::error_code ec;
-    const auto size = fs::file_size(declared, ec);
-    if (ec) {
-        return token + QStringLiteral("|-");
-    }
-    token += QStringLiteral("|%1").arg(size);
-    const auto written = fs::last_write_time(declared, ec);
-    if (!ec) {
-        token += QStringLiteral(":%1").arg(
-            static_cast<qlonglong>(written.time_since_epoch().count()));
+    // The registration transform the legacy reading would consult is an
+    // orientation input of its own: editing it in place changes where a
+    // legacy-read umbilicus lands while every candidate file stays untouched.
+    try {
+        if (const auto volume = _state->currentVolume();
+            volume && volume->baseScaleLevel() == 0) {
+            fs::path transform = volume->path() / "transform.json";
+            if (!fs::exists(transform)) {
+                const fs::path root = pkg.path().empty()
+                    ? fs::path(pkg.getVolpkgDirectory())
+                    : pkg.path().parent_path();
+                transform = root / "transforms" / "transform.json";
+            }
+            stat(transform);
+        }
+    } catch (...) {
     }
     return token;
 }
@@ -9586,8 +9640,121 @@ void LineAnnotationController::invalidateScrollUmbilicus()
     _scrollUmbilicusLoadAttempted = false;
     _scrollUmbilicusToken.clear();
     _scrollUmbilicusFrame = {};
+    _scrollUmbilicusVolumeId.clear();
     _scrollUmbilicus.reset();
     _umbilicusNotice.clear();
+}
+
+void LineAnnotationController::onActiveVolumeChanged()
+{
+    // Deliberately conservative: any volume switch marks built views stale,
+    // including a downsample-level switch of one scan, where the rebuild will
+    // reproduce the same orientation. The alternative — proving the previous
+    // views equivalent without re-resolving — needs a record of every input the
+    // orientation came from (raw shape, umbilicus reading, scale source, the
+    // registration transform's identity), and each review of that record found
+    // another input it was missing. A wasted rebuild after a user-initiated
+    // switch is bounded and visible; a stale strip is neither.
+    //
+    // Deliberately no ++_umbilicusGeneration: that counter means "the attachment
+    // changed", which holders such as the Fiber Map read to decide staleness,
+    // and a volume switch is not an attachment change — the Fiber Map covers it
+    // through its own frame comparison.
+    ++_orientationEpoch;
+    scheduleStaleViewRefresh();
+}
+
+void LineAnnotationController::scheduleStaleViewRefresh()
+{
+    if (_staleViewRefreshQueued) {
+        return;
+    }
+    _staleViewRefreshQueued = true;
+    // Next event-loop turn: CState emits volumeChanged from inside
+    // ViewerManager::switchVolume(), before it restores focus and navigation,
+    // and materialization reads pane camera state. Deferring also collapses
+    // rapid switching into one rebuild.
+    QMetaObject::invokeMethod(
+        this,
+        [this]() {
+            _staleViewRefreshQueued = false;
+            refreshStaleGeneratedViews();
+        },
+        Qt::QueuedConnection);
+}
+
+void LineAnnotationController::refreshStaleGeneratedViews()
+{
+    // Surfaces already built carry the normals they were built with, so an
+    // invalidated umbilicus only reaches the screen by rebuilding them.
+    //
+    // Snapshotted first, and by shared_ptr: materializeGeneratedViews() calls
+    // _state->setSurface(), whose surfaceChanged signal reaches this controller's
+    // own slot, and a pane closing there would invalidate an iterator over _panes
+    // and destroy the session that the rollback below holds a reference into.
+    struct Target {
+        std::shared_ptr<LineAnnotationSession> session;
+        std::string surfaceName;
+    };
+    std::vector<Target> targets;
+    targets.reserve(_panes.size());
+    for (const auto& pane : _panes) {
+        // The selection rule lives in UmbilicusOrientationFreshness.hpp so it
+        // is asserted rather than read; the skips it encodes are the ones this
+        // path has been burned by (an empty model turning a successful attach
+        // into a modal complaint, intersection sides double-rebuilt).
+        const vc3d::annotation::GeneratedViewsPaneState state{
+            pane.session != nullptr,
+            pane.session && pane.session->suppressGeneratedViews,
+            pane.session && !pane.session->generatedSurfaceNames.empty(),
+            pane.session && !pane.session->optimizedLine.points.empty(),
+            pane.session ? pane.session->orientationEpoch : -1};
+        if (!vc3d::annotation::paneNeedsOrientationRefresh(state,
+                                                           _orientationEpoch)) {
+            continue;
+        }
+        targets.push_back({pane.session, pane.surfaceName});
+    }
+
+    // One pane failing must not strand the rest: each is an independent fiber, and
+    // the alternative -- the first failure leaving later panes on geometry from the
+    // old umbilicus -- is the inconsistency this exists to remove.
+    for (const auto& target : targets) {
+        // A reaction to someone else's action must not interrupt with a dialog about
+        // a pane they were not looking at; the warning below is the report. Scoped
+        // rather than saved and restored by hand: materializeGeneratedViews can
+        // throw past its own catch, which would leave this session silent for good.
+        QScopedValueRollback<bool> quiet(target.session->suppressErrorDialogs, true);
+        try {
+            if (!materializeGeneratedViews(*target.session)) {
+                Logger()->warn(
+                    "Line annotation: could not rebuild generated views for {} "
+                    "after the umbilicus changed; its orientation is unchanged",
+                    target.surfaceName);
+            }
+        } catch (const std::exception& e) {
+            Logger()->warn(
+                "Line annotation: rebuilding generated views for {} after the "
+                "umbilicus changed threw: {}",
+                target.surfaceName,
+                e.what());
+        }
+    }
+
+    // The intersection inspection's strips consume the same oriented normals
+    // but through sessions that suppress ordinary generated views, so the pane
+    // walk above never reaches them; the inspection records its own epoch and
+    // is rebuilt whole.
+    if (_intersectionInspection &&
+        _intersectionInspection->orientationEpoch != _orientationEpoch) {
+        QString error;
+        if (!rebuildIntersectionInspection(&error)) {
+            Logger()->warn(
+                "Line annotation: could not rebuild the intersection inspection "
+                "after the umbilicus or volume changed: {}",
+                error.toStdString());
+        }
+    }
 }
 
 void LineAnnotationController::publishUmbilicusNotice()
@@ -9671,21 +9838,38 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
     // volume changes both the factor the points were scaled by and the extent the
     // per-slice centres were sized to.
     const auto currentAnnotationFrame = annotationFrame();
-    // The file itself is part of the key too, not just where it was looked
-    // for. Attaching a malformed umbilicus and then fixing it emits nothing
-    // beyond the attach itself, so without this the refusal stayed cached until
-    // an unrelated invalidation -- which contradicts the attach dialog telling
-    // the user that attaching and then fixing the file is a reasonable order of
-    // operations. A stat, no parse.
+    // As is the volume itself, deliberately and conservatively: the
+    // volume-centre fallback reads its raw shape and the legacy reading its
+    // registration transform, so two volumes deriving one annotation frame can
+    // still need different geometry. Re-resolving on a same-frame switch is a
+    // few stats and one parse; proving it unnecessary is the equivalence record
+    // every review round found another hole in.
+    const std::string currentVolumeId =
+        _state ? _state->currentVolumeId() : std::string{};
+    // The files themselves are part of the key too, not just where they were
+    // looked for. Attaching a malformed umbilicus and then fixing it emits
+    // nothing, so without this the refusal stayed cached until an unrelated
+    // invalidation -- which contradicts the attach dialog telling the user that
+    // attaching and then fixing the file is a reasonable order of operations.
+    // Stats, no parse.
     const QString currentUmbilicusToken = umbilicusCacheToken();
-    if (!_scrollUmbilicusLoadAttempted || volpkgRoot != _scrollUmbilicusRoot ||
-        currentUmbilicusToken != _scrollUmbilicusToken ||
-        !vc3d::annotation::sameAnnotationFrame(currentAnnotationFrame,
-                                              _scrollUmbilicusFrame)) {
+    const vc3d::annotation::UmbilicusCacheInputs cachedInputs{
+        _scrollUmbilicusRoot.string(),
+        _scrollUmbilicusVolumeId,
+        _scrollUmbilicusToken.toStdString(),
+        _scrollUmbilicusFrame};
+    const vc3d::annotation::UmbilicusCacheInputs currentInputs{
+        volpkgRoot.string(),
+        currentVolumeId,
+        currentUmbilicusToken.toStdString(),
+        currentAnnotationFrame};
+    if (vc3d::annotation::umbilicusReloadNeeded(
+            _scrollUmbilicusLoadAttempted, cachedInputs, currentInputs)) {
         _scrollUmbilicusLoadAttempted = true;
         _scrollUmbilicusRoot = volpkgRoot;
         _scrollUmbilicusToken = currentUmbilicusToken;
         _scrollUmbilicusFrame = currentAnnotationFrame;
+        _scrollUmbilicusVolumeId = currentVolumeId;
         // Cleared before the attempt: whatever is set below describes this
         // attempt, and success has to be able to retract an earlier complaint.
         _scrollUmbilicus.reset();
@@ -10193,6 +10377,11 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
 
     auto* pane = paneForSurface(session.surfaceName);
     if (!pane || !pane->dialog) {
+        // Recorded only on success, and only once every surface is in place: an
+        // epoch written earlier would claim the new orientation while a later
+        // throw or failure had left the old, partial or cleared views on screen,
+        // and the next refresh would then skip the rebuild that would fix it.
+        session.orientationEpoch = _orientationEpoch;
         return true;
     }
 
@@ -10220,6 +10409,9 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
         !isAlignmentPendingForFiber(session.fiberId)) {
         requestFiberAlignmentMetrics(session.fiberId);
     }
+    // See the note at the other success return: only a completed build may claim an
+    // orientation.
+    session.orientationEpoch = _orientationEpoch;
     return true;
 }
 
