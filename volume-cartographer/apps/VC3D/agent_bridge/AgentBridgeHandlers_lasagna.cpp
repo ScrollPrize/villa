@@ -83,25 +83,26 @@ QJsonObject AgentBridgeServer::handleLasagnaAttachManifest(
     QString error;
     const bool started = _window->_menuController->startLasagnaManifestAttachment(
         location, fiberInference, select,
-        [this, token, select](
-            const MenuActionController::LasagnaManifestAttachOutcome& outcome) {
-            if (!outcome.success) {
+        [this, token, location, fiberInference, select](
+            const QString& error, bool attached,
+            const QStringList& attachedVolumeIds) {
+            if (!error.isEmpty()) {
                 completeDeferredError(
                     token, -32005, "Lasagna manifest attachment failed",
-                    {{QStringLiteral("detail"), outcome.error}});
+                    {{QStringLiteral("detail"), error}});
                 return;
             }
             QJsonArray volumeIds;
-            for (const QString& id : outcome.volumeIds)
+            for (const QString& id : attachedVolumeIds)
                 volumeIds.append(id);
             completeDeferredResult(
                 token,
-                {{QStringLiteral("attached"), outcome.attached},
-                 {QStringLiteral("alreadyAttached"), outcome.alreadyAttached},
-                 {QStringLiteral("manifestLocation"), outcome.manifestLocation},
+                {{QStringLiteral("attached"), attached},
+                 {QStringLiteral("alreadyAttached"), !attached},
+                 {QStringLiteral("manifestLocation"), location},
                  {QStringLiteral("role"),
-                  outcome.fiberInference ? QStringLiteral("fiber_inference")
-                                         : QStringLiteral("regular")},
+                  fiberInference ? QStringLiteral("fiber_inference")
+                                 : QStringLiteral("regular")},
                  {QStringLiteral("selected"), select},
                  {QStringLiteral("volumeIds"), volumeIds}});
         },

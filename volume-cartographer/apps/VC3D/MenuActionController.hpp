@@ -93,16 +93,6 @@ public:
     // True while any sample open is in flight.
     bool openDataSampleOpenInFlight() const;
 
-    struct LasagnaManifestAttachOutcome {
-        bool success{false};
-        bool attached{false};
-        bool alreadyAttached{false};
-        bool fiberInference{false};
-        QString error;
-        QString manifestLocation;
-        QStringList volumeIds;
-    };
-
     // Non-interactive counterpart of File -> Attach (Remote) Lasagna
     // Manifest. It reuses the same validation, authentication, background
     // preparation, and transactional project update as the GUI action.
@@ -110,7 +100,9 @@ public:
         const QString& location,
         bool fiberInference,
         bool select,
-        std::function<void(const LasagnaManifestAttachOutcome&)> onFinished,
+        std::function<void(const QString& error,
+                           bool attached,
+                           const QStringList& volumeIds)> onFinished,
         QString* errorMessage = nullptr);
 
 private slots:
@@ -168,7 +160,9 @@ private:
         bool fiberInference,
         bool select,
         bool interactive,
-        std::function<void(const LasagnaManifestAttachOutcome&)> onFinished,
+        std::function<void(const QString& error,
+                           bool attached,
+                           const QStringList& volumeIds)> onFinished,
         QString* errorMessage);
     struct LasagnaAttachTaskResult;
     bool openOpenDataSample(const vc3d::opendata::OpenDataSample& sample,

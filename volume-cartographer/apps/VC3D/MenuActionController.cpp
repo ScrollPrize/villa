@@ -1824,14 +1824,7 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote)
 
     QString error;
     const bool started = startLasagnaManifestAttachmentImpl(
-        location, fiberInference, true, true,
-        [this](const LasagnaManifestAttachOutcome& outcome) {
-            if (!outcome.success) {
-                QMessageBox::warning(
-                    _window, QObject::tr("Attach Lasagna failed"), outcome.error);
-            }
-        },
-        &error);
+        location, fiberInference, true, true, {}, &error);
     if (!started && !error.isEmpty()) {
         QMessageBox::warning(
             _window, QObject::tr("Attach failed"), error);
@@ -1842,7 +1835,7 @@ bool MenuActionController::startLasagnaManifestAttachment(
     const QString& location,
     bool fiberInference,
     bool select,
-    std::function<void(const LasagnaManifestAttachOutcome&)> onFinished,
+    std::function<void(const QString&, bool, const QStringList&)> onFinished,
     QString* errorMessage)
 {
     return startLasagnaManifestAttachmentImpl(
@@ -1855,7 +1848,7 @@ bool MenuActionController::startLasagnaManifestAttachmentImpl(
     bool fiberInference,
     bool select,
     bool interactive,
-    std::function<void(const LasagnaManifestAttachOutcome&)> onFinished,
+    std::function<void(const QString&, bool, const QStringList&)> onFinished,
     QString* errorMessage)
 {
     if (errorMessage)
@@ -1938,13 +1931,16 @@ bool MenuActionController::startLasagnaManifestAttachmentImpl(
     auto* watcher = new QFutureWatcher<LasagnaAttachTaskResult>(this);
     connect(watcher, &QFutureWatcher<LasagnaAttachTaskResult>::finished, this,
             [this, watcher, targetPackage, persistedLocation, fiberInference,
-             select, cacheRoot, onFinished = std::move(onFinished)]() mutable {
-        LasagnaManifestAttachOutcome outcome;
-        outcome.fiberInference = fiberInference;
-        outcome.manifestLocation = QString::fromStdString(persistedLocation);
-        auto complete = [&]() {
+             select, interactive, cacheRoot,
+             onFinished = std::move(onFinished)]() mutable {
+        auto complete = [&](const QString& error = {}, bool attached = false,
+                            const QStringList& volumeIds = {}) {
+            if (interactive && !error.isEmpty()) {
+                QMessageBox::warning(
+                    _window, QObject::tr("Attach Lasagna failed"), error);
+            }
             if (onFinished)
-                onFinished(outcome);
+                onFinished(error, attached, volumeIds);
         };
         auto task = watcher->result();
         watcher->deleteLater();
@@ -1954,14 +1950,12 @@ bool MenuActionController::startLasagnaManifestAttachmentImpl(
         if (_attachRemoteLasagnaManifestAct)
             _attachRemoteLasagnaManifestAct->setEnabled(true);
         if (!task.error.isEmpty()) {
-            outcome.error = task.error;
-            complete();
+            complete(task.error);
             return;
         }
         if (!_window || !_window->_state || _window->_state->vpkg() != targetPackage) {
-            outcome.error =
-                QObject::tr("The open project changed while the manifest was loading.");
-            complete();
+            complete(QObject::tr(
+                "The open project changed while the manifest was loading."));
             return;
         }
         try {
@@ -1970,26 +1964,22 @@ bool MenuActionController::startLasagnaManifestAttachmentImpl(
                     persistedLocation, {}, fiberInference, task.volumes,
                     cacheRoot.toStdString(), select);
             if (result == VolumePkg::AttachLasagnaResult::VolumeIdConflict) {
-                outcome.error = QObject::tr(
-                    "A Lasagna volume conflicts with an existing volume id.");
-                complete();
+                complete(QObject::tr(
+                    "A Lasagna volume conflicts with an existing volume id."));
                 return;
             }
             _window->refreshCurrentVolumePackageUi(QString(), true);
-            outcome.success = true;
-            outcome.attached =
-                result == VolumePkg::AttachLasagnaResult::Attached;
-            outcome.alreadyAttached =
-                result == VolumePkg::AttachLasagnaResult::AlreadyAttached;
+            QStringList volumeIds;
             for (const auto& prepared : task.volumes) {
                 if (prepared.volume)
-                    outcome.volumeIds.append(
+                    volumeIds.append(
                         QString::fromStdString(prepared.volume->id()));
             }
+            complete({}, result == VolumePkg::AttachLasagnaResult::Attached,
+                     volumeIds);
         } catch (const std::exception& error) {
-            outcome.error = QString::fromUtf8(error.what());
+            complete(QString::fromUtf8(error.what()));
         }
-        complete();
     });
 
     _lasagnaAttachmentInFlight = true;
