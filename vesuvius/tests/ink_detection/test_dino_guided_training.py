@@ -19,6 +19,7 @@ from vesuvius.ink_detection.data.coord_patch_dataset import CoordPatchDataset
 from vesuvius.ink_detection.training.train import (
     apply_dynamic_label_substitution,
     prepare_loss_inputs,
+    prepare_validation_loss_inputs,
     should_save_checkpoint,
 )
 
@@ -157,6 +158,23 @@ def test_force_full_supervision_zeroes_native_ignore_mask():
 
     assert torch.all(ordinary_ignore == 1)
     assert torch.all(full_ignore == 0)
+
+
+def test_validation_always_preserves_the_stored_supervision_mask():
+    predictions = torch.zeros(1, 1, 2, 2, 2)
+    batch = {
+        "image": torch.zeros_like(predictions),
+        "inklabels": torch.zeros_like(predictions),
+        "supervision_mask": torch.zeros_like(predictions),
+    }
+
+    _, _, validation_ignore = prepare_validation_loss_inputs(
+        predictions,
+        batch,
+        mode="full_3d",
+    )
+
+    assert torch.all(validation_ignore == 1)
 
 
 def test_dynamic_label_substitution_uses_clean_image_and_removes_helper_keys():

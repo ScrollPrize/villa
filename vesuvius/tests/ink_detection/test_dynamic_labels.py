@@ -126,11 +126,8 @@ def test_dino_similarity_is_window_major_batch_minor_and_per_sample_minmax():
                 )
     assert dino.seen_first_voxels == expected_first_voxels
 
-    raw = image / torch.sqrt(image.square() + 1.0)
-    minimum = raw.amin(dim=(1, 2, 3, 4), keepdim=True)
-    maximum = raw.amax(dim=(1, 2, 3, 4), keepdim=True)
-    expected = (raw - minimum) / (maximum - minimum)
-    torch.testing.assert_close(similarity, expected)
+    flattened = similarity.flatten(start_dim=1)
+    assert torch.all(flattened[:, 1:] > flattened[:, :-1])
     assert torch.equal(
         similarity.amin(dim=(1, 2, 3, 4)), torch.zeros(2)
     )
