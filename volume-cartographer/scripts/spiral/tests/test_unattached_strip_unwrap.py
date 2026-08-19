@@ -14,6 +14,7 @@ import torch
 
 from config import Config
 from losses import (
+    PackedDenseWalks,
     _dense_walk_crossing_adjustments,
     build_pcl_sampling_strata,
     get_unattached_pcl_strip_losses,
@@ -125,13 +126,19 @@ def test_dense_walk_adjustments_are_anchored_at_first_pick():
     # picks separated by full wraps must differ by whole -DR steps.
     fiber = _perfect_spiral_fiber(3.0, spacing=40.0)
     flat = _flat_bundle([fiber])
-    walk = np.arange(len(fiber), dtype=np.int64)
     theta = np.arctan2(fiber[:, 1], fiber[:, 2]) % (2 * np.pi)
     crossings = np.concatenate([[0], np.cumsum(np.diff(theta) < -np.pi)])
     first, mid, last = 3, len(fiber) // 2, len(fiber) - 1
     picks = np.array([[first, mid, last]], dtype=np.int64)
-    adjustments = _dense_walk_crossing_adjustments(
-        IdentityTransform(), torch.tensor(DR), flat['zyxs'], [walk], picks)
+    packed = PackedDenseWalks(
+        rows=torch.tensor([0]),
+        walk_zyxs=flat['zyxs'][None],
+        pick_positions=torch.from_numpy(picks),
+    )
+    sampled_theta = torch.from_numpy(theta[picks])
+    adjustments, rows = _dense_walk_crossing_adjustments(
+        IdentityTransform(), torch.tensor(DR), sampled_theta, packed)
     expected = -DR * (crossings[[first, mid, last]] - crossings[first])
+    assert torch.equal(rows, torch.tensor([0]))
     assert torch.allclose(
         adjustments, torch.tensor(expected, dtype=torch.float32)[None], atol=1e-5)

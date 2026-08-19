@@ -21,6 +21,7 @@ stream wait on the job's recorded event before using the returned tensors.
 """
 import os
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import fields, is_dataclass
 
 import numpy as np
 import torch
@@ -70,6 +71,9 @@ def _iter_tensors(value):
     """Yield tensors nested in the batch container types used by prefetch jobs."""
     if isinstance(value, torch.Tensor):
         yield value
+    elif is_dataclass(value) and not isinstance(value, type):
+        for field in fields(value):
+            yield from _iter_tensors(getattr(value, field.name))
     elif isinstance(value, dict):
         for item in value.values():
             yield from _iter_tensors(item)
@@ -145,8 +149,8 @@ class StepPrefetcher:
             result, evt = self.run_job(job)
         self._pending[key] = self._ensure_executor().submit(self.run_job, job)
         torch.cuda.current_stream().wait_event(evt)
-        # CUDA tensors may be nested in per-loss metadata dictionaries (for
-        # example dense_walk_info['walk_zyxs']). Record every one on the
+        # CUDA tensors may be nested in per-loss metadata containers (for
+        # example PackedDenseWalks). Record every one on the
         # consumer stream so the caching allocator cannot recycle its
         # side-stream allocation while consumer kernels are still using it.
         for t in _iter_tensors(result):

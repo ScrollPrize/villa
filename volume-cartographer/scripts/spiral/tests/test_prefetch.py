@@ -1,6 +1,14 @@
+from dataclasses import dataclass
+
 import torch
 
 from prefetch import _iter_tensors
+
+
+@dataclass
+class WalkPayload:
+    positions: torch.Tensor
+    walk_zyxs: torch.Tensor
 
 
 def test_iter_tensors_finds_walk_payload_nested_in_batch_metadata():
@@ -9,10 +17,7 @@ def test_iter_tensors_finds_walk_payload_nested_in_batch_metadata():
     positions = torch.tensor([0])
     result = (
         direct,
-        {'dense_walk_info': {
-            'positions': positions,
-            'walk_zyxs': walk_zyxs,
-        }},
+        {'packed_dense_walks': WalkPayload(positions, walk_zyxs)},
         [None],
     )
 

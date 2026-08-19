@@ -1,5 +1,6 @@
 import itertools
 import os
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -330,26 +331,45 @@ def _masked_all_pairs_l1(p1, p2, mask1, mask2, expected_diff):
 _PATCH_DENSE_UNWRAP_WALK_FACTOR = 2
 
 
-def _maybe_dense_walk_entry(dense_entries, slot, n, path_ij, positions, num_points):
+@dataclass(slots=True)
+class DenseWalk:
+    """One source-space dense walk and the sparse picks drawn from it."""
+
+    row: int
+    path: np.ndarray
+    pick_positions: np.ndarray
+
+
+@dataclass(slots=True)
+class PackedDenseWalks:
+    """Dense walks resolved to world-space points and padded for one batch."""
+
+    rows: torch.Tensor
+    walk_zyxs: torch.Tensor
+    pick_positions: torch.Tensor
+
+
+def _maybe_dense_walk_entry(dense_walks, row, path_ij, positions, num_points):
     if path_ij.shape[0] > _PATCH_DENSE_UNWRAP_WALK_FACTOR * num_points:
         # Quad centres: floor(ij) lands on the path's own valid quads.
         walk_ijs = path_ij.astype(np.float32) + 0.5
-        dense_entries.append((slot, n, walk_ijs, positions))
+        dense_walks.append(DenseWalk(row, walk_ijs, positions))
 
 
-def _reconstruct_straight_dense_entries(ijs_np, num_points, skip):
+def _reconstruct_straight_dense_walks(ijs_np, num_points, skip):
     # Straight-mode strips (python or native sampler) confine their picks to one
     # contiguous valid run of a single grid line, so the dense walk can be
     # rebuilt from the picks alone: the fixed coordinate is shared by every
     # pick, and every integer cell between the extreme picks' floor cells lies
-    # in the same run. `skip` holds (slot, n) pairs already covered (serpentine
-    # 2D samples, whose walk is threaded explicitly).
-    dense_entries = []
+    # in the same run. `skip` holds flattened track rows already covered by
+    # explicitly threaded paths such as serpentine 2D samples.
+    dense_walks = []
     _, N, P, _ = ijs_np.shape
     for slot in range(2):
         fixed_axis, var_axis = slot, 1 - slot
         for n in range(N):
-            if (slot, n) in skip:
+            row = slot * N + n
+            if row in skip:
                 continue
             var = ijs_np[slot, n, :, var_axis]
             var_floor = np.floor(var).astype(np.int64)
@@ -360,19 +380,19 @@ def _reconstruct_straight_dense_entries(ijs_np, num_points, skip):
             walk_ijs = np.empty([walk_len, 2], dtype=np.float32)
             walk_ijs[:, var_axis] = lo + np.arange(walk_len, dtype=np.float32) + 0.5
             walk_ijs[:, fixed_axis] = ijs_np[slot, n, :, fixed_axis].mean()
-            dense_entries.append((slot, n, walk_ijs, var_floor - lo))
-    return dense_entries
+            dense_walks.append(DenseWalk(row, walk_ijs, var_floor - lo))
+    return dense_walks
 
 
 def _build_patch_ijs(patches, patch_indices, num_points_per_direction, rng, cfg):
     # CPU part of the patch-strip sampler: for each patch, one row strip and
     # one column strip of fractional ijs. Pure numpy + `rng` so it can run on
     # the prefetch worker for the next step while the GPU works on this one.
-    # Also returns dense-walk entries (slot, n, walk_ijs, pick_positions) for
+    # Also returns DenseWalk entries for
     # path-sampled strips (serpentine, dijkstra) long enough to need the
     # dense-walk unwrap; straight strips are reconstructed by the caller.
     N = len(patch_indices)
-    dense_entries = []
+    dense_walks = []
 
     use_dijkstra_strips = cfg['patch_strip_sampling'] == 'dijkstra'
     if use_dijkstra_strips:
@@ -407,8 +427,8 @@ def _build_patch_ijs(patches, patch_indices, num_points_per_direction, rng, cfg)
                 path_2d, P, rng, return_positions=True)
             vertical_ijs_by_patch[n], positions_v = _sample_points_along_path(
                 path_2d, P, rng, return_positions=True)
-            _maybe_dense_walk_entry(dense_entries, 0, n, path_2d, positions_h, P)
-            _maybe_dense_walk_entry(dense_entries, 1, n, path_2d, positions_v, P)
+            _maybe_dense_walk_entry(dense_walks, n, path_2d, positions_h, P)
+            _maybe_dense_walk_entry(dense_walks, N + n, path_2d, positions_v, P)
             continue
 
         if use_dijkstra_strips:
@@ -423,8 +443,8 @@ def _build_patch_ijs(patches, patch_indices, num_points_per_direction, rng, cfg)
                 path_a, P, rng, return_positions=True)
             vertical_ijs_by_patch[n], positions_b = _sample_points_along_path(
                 path_b, P, rng, return_positions=True)
-            _maybe_dense_walk_entry(dense_entries, 0, n, path_a, positions_a, P)
-            _maybe_dense_walk_entry(dense_entries, 1, n, path_b, positions_b, P)
+            _maybe_dense_walk_entry(dense_walks, n, path_a, positions_a, P)
+            _maybe_dense_walk_entry(dense_walks, N + n, path_b, positions_b, P)
             continue
 
         # Horizontal: pick a row uniformly from rows-with-valid-quads, then pick a run
@@ -462,53 +482,60 @@ def _build_patch_ijs(patches, patch_indices, num_points_per_direction, rng, cfg)
         vertical_ijs_by_patch[n, :, 1] = col_idx + fixed_jitters_v[n]
         vertical_ijs_by_patch[n, :, 0] = lo_v + coords_v + var_jitters_v[n]
 
-    return np.stack([horizontal_ijs_by_patch, vertical_ijs_by_patch], axis=0), dense_entries  # (2, N, P, 2)
+    return np.stack([horizontal_ijs_by_patch, vertical_ijs_by_patch], axis=0), dense_walks  # (2, N, P, 2)
 
 
-def _pack_patch_dense_walks(dense_entries, patch_indices, patch_atlas):
-    # Batch the flagged strips' dense walks: pad to the longest walk by
-    # repeating the last cell (identical consecutive points give exactly zero
-    # theta-diffs), gather their zyxs from the atlas once, and keep each pick's
-    # integer position along its walk. Consumed by
-    # _dense_patch_strip_adjustments at loss time (the transform is applied
-    # there, not here, so prefetched batches stay valid).
-    if not dense_entries:
+def _pack_dense_walks(dense_walks, resolve_paths):
+    # Pad source-space paths by repeating their last entry, then resolve the
+    # padded batch to world-space zyxs in one source-specific gather. Repeating
+    # the endpoint is unwrap-neutral because identical points have zero theta
+    # difference.
+    if not dense_walks:
         return None
-    num_walks = len(dense_entries)
-    num_points = dense_entries[0][3].shape[0]
-    max_walk_len = max(entry[2].shape[0] for entry in dense_entries)
-    walks_np = np.empty([num_walks, max_walk_len, 2], dtype=np.float32)
+    num_walks = len(dense_walks)
+    num_points = dense_walks[0].pick_positions.shape[0]
+    max_walk_len = max(walk.path.shape[0] for walk in dense_walks)
+    path_shape = (num_walks, max_walk_len, *dense_walks[0].path.shape[1:])
+    paths_np = np.empty(path_shape, dtype=dense_walks[0].path.dtype)
     positions_np = np.empty([num_walks, num_points], dtype=np.int64)
-    idx_np = np.empty([num_walks, max_walk_len], dtype=np.int64)
-    slots_np = np.empty([num_walks], dtype=np.int64)
     rows_np = np.empty([num_walks], dtype=np.int64)
-    for k, (slot, n, walk_ijs, positions) in enumerate(dense_entries):
-        walk_len = walk_ijs.shape[0]
-        walks_np[k, :walk_len] = walk_ijs
-        walks_np[k, walk_len:] = walk_ijs[-1]
-        positions_np[k] = positions
-        idx_np[k] = patch_indices[n]
-        slots_np[k] = slot
-        rows_np[k] = n
-    walk_zyxs = patch_atlas.lookup(
-        torch.from_numpy(idx_np), torch.from_numpy(walks_np))
-    return {
-        'slots': torch.from_numpy(slots_np),
-        'rows': torch.from_numpy(rows_np),
-        'positions': torch.from_numpy(positions_np),
-        'walk_zyxs': walk_zyxs,
-    }
+    for k, walk in enumerate(dense_walks):
+        walk_len = walk.path.shape[0]
+        paths_np[k, :walk_len] = walk.path
+        paths_np[k, walk_len:] = walk.path[-1]
+        positions_np[k] = walk.pick_positions
+        rows_np[k] = walk.row
+    return PackedDenseWalks(
+        rows=torch.from_numpy(rows_np),
+        walk_zyxs=resolve_paths(paths_np, rows_np),
+        pick_positions=torch.from_numpy(positions_np),
+    )
+
+
+def _pack_patch_dense_walks(dense_walks, patch_indices, patch_atlas):
+    # Resolve patch-local ij paths through the atlas. A flattened track row is
+    # slot * N + patch-row, so row % N selects its patch index.
+    num_patch_rows = len(patch_indices)
+
+    def resolve_paths(paths_np, rows_np):
+        walk_patch_indices = np.asarray(patch_indices)[rows_np % num_patch_rows]
+        idx_np = np.broadcast_to(
+            walk_patch_indices[:, None], paths_np.shape[:2]).copy()
+        return patch_atlas.lookup(
+            torch.from_numpy(idx_np), torch.from_numpy(paths_np))
+
+    return _pack_dense_walks(dense_walks, resolve_paths)
 
 
 def _sample_patch_batch(key, patches, sampling_probabilities, num_to_sample,
                         num_points_per_direction, cfg, patch_atlas=None):
     # Returns (combined_ijs_gpu (2,N,P,2), patch_indices_gpu (N,),
-    # slice_zyxs_gpu (2,N,P,3), dense_walk_info). The atlas is host-resident
+    # slice_zyxs_gpu (2,N,P,3), packed_dense_walks). The atlas is host-resident
     # and the ijs are born on the CPU, so the bilinear gather runs here at
     # batch-build time and only the interpolated points are uploaded. With
     # prefetch enabled the batch - sampling, gather, and uploads - was
     # assembled for this step during the previous one, and next step's batch
-    # is scheduled now. dense_walk_info (or None) carries the dense walks of
+    # is scheduled now. packed_dense_walks (or None) carries the dense walks of
     # strips long enough that the sparse-pick theta unwrap could miscount
     # theta=0 crossings (see _PATCH_DENSE_UNWRAP_WALK_FACTOR).
     if num_to_sample <= 0:
@@ -528,7 +555,7 @@ def _sample_patch_batch(key, patches, sampling_probabilities, num_to_sample,
             # The native sampler only knows strips; rows for small 2D-sampled
             # patches (see cfg['patch_2d_sampling_max_area']) are overwritten
             # with serpentine whole-patch samples.
-            dense_entries = []
+            dense_walks = []
             small_ns = [
                 n for n, patch_idx in enumerate(patch_indices)
                 if getattr(patches[patch_idx], '_sampling_2d_path', None) is not None
@@ -544,22 +571,22 @@ def _sample_patch_batch(key, patches, sampling_probabilities, num_to_sample,
                         path_2d, num_points_per_direction, rng,
                         return_positions=True)
                     _maybe_dense_walk_entry(
-                        dense_entries, 0, n, path_2d, positions_h,
+                        dense_walks, n, path_2d, positions_h,
                         num_points_per_direction)
                     _maybe_dense_walk_entry(
-                        dense_entries, 1, n, path_2d, positions_v,
+                        dense_walks, num_to_sample + n, path_2d, positions_v,
                         num_points_per_direction)
         else:
-            ijs_np, dense_entries = _build_patch_ijs(
+            ijs_np, dense_walks = _build_patch_ijs(
                 patches, patch_indices, num_points_per_direction, rng, cfg)
         if cfg['patch_strip_sampling'] != 'dijkstra':
             # Straight strips (python or native sampler alike) are rebuilt
             # from the picks; path-sampled strips are already threaded above.
-            dense_entries.extend(_reconstruct_straight_dense_entries(
+            dense_walks.extend(_reconstruct_straight_dense_walks(
                 ijs_np, num_points_per_direction,
-                {(slot, n) for slot, n, _, _ in dense_entries}))
-        dense_walk_info = _pack_patch_dense_walks(
-            dense_entries, patch_indices, patch_atlas)
+                {walk.row for walk in dense_walks}))
+        packed_dense_walks = _pack_patch_dense_walks(
+            dense_walks, patch_indices, patch_atlas)
         ijs_cpu = torch.from_numpy(ijs_np)
         idx_cpu = torch.from_numpy(
             np.ascontiguousarray(patch_indices, dtype=np.int64))
@@ -568,7 +595,7 @@ def _sample_patch_batch(key, patches, sampling_probabilities, num_to_sample,
             idx_cpu[None, :, None].expand(2, N, P), ijs_cpu)
         ijs_gpu = ijs_cpu.cuda(non_blocking=True)
         idx_gpu = idx_cpu.cuda(non_blocking=True)
-        return ijs_gpu, idx_gpu, slice_zyxs_gpu, dense_walk_info
+        return ijs_gpu, idx_gpu, slice_zyxs_gpu, packed_dense_walks
 
     if prefetch.prefetch_enabled() and torch.cuda.is_available():
         pf = prefetch.get_prefetcher()
@@ -578,21 +605,18 @@ def _sample_patch_batch(key, patches, sampling_probabilities, num_to_sample,
     return build(prefetch.LegacyNumpyRandom)
 
 
-def _dense_patch_strip_adjustments(slice_to_spiral_transform, dr_per_winding, all_theta, dense_walk_info):
-    # Theta=0 crossing adjustments for the flagged strips' picks, counted along
-    # each strip's FULL dense walk (consecutive cells one quad apart, so the
-    # |dtheta| < pi assumption of the raw-diff detector genuinely holds) rather
-    # than the sparse picks -- the patch-strip analogue of
-    # _dense_walk_crossing_adjustments, with one extra step: a pick sits inside
-    # its floor cell's quad (sub-cell jitter), so its adjustment is the floor
-    # cell's cumulative adjustment plus the single-step correction between the
-    # cell's theta and the pick's own theta. Adjustments carry no gradient, so
-    # the walk is transformed in one batched no-grad call. Each strip is
-    # re-anchored at its first pick, matching the sparse unwrap's frame, so on
-    # strips where the sparse unwrap was already correct the values are
-    # numerically identical.
+def _dense_walk_crossing_adjustments(
+    slice_to_spiral_transform, dr_per_winding, sampled_theta,
+    packed_dense_walks,
+):
+    # Count theta=0 crossings for selected sampled rows along their full dense
+    # world-space walks. Each gathered walk point is connected to the actual
+    # sampled point by one final step. That step is zero for PCLs (the pick is a
+    # walk point) and accounts for patch sub-cell jitter (the walk uses quad
+    # centres). Each row is re-anchored at its first pick to preserve the sparse
+    # unwrap's frame. All adjustments are detached constants.
     with torch.no_grad():
-        walk_zyxs = dense_walk_info['walk_zyxs']
+        walk_zyxs = packed_dense_walks.walk_zyxs
         walk_spiral = slice_to_spiral_transform(
             walk_zyxs.reshape(-1, 3)).reshape(*walk_zyxs.shape)
         walk_theta, _, _ = get_theta_and_radii(walk_spiral[..., 1:], dr_per_winding)
@@ -600,12 +624,12 @@ def _dense_patch_strip_adjustments(slice_to_spiral_transform, dr_per_winding, al
             walk_theta, torch.zeros_like(walk_theta), dr_per_winding,
         )
         device = walk_theta.device
-        positions = dense_walk_info['positions'].to(device=device)
-        slots = dense_walk_info['slots'].to(device=all_theta.device)
-        rows = dense_walk_info['rows'].to(device=all_theta.device)
+        positions = packed_dense_walks.pick_positions.to(device=device)
+        rows = packed_dense_walks.rows.to(device=sampled_theta.device)
         floor_adjustments = torch.gather(walk_adjustments, 1, positions)
         floor_theta = torch.gather(walk_theta, 1, positions)
-        pick_theta = all_theta[slots, rows].detach().to(device=device)
+        theta_rows = sampled_theta.reshape(-1, sampled_theta.shape[-1])
+        pick_theta = theta_rows[rows].detach().to(device=device)
         theta_step = pick_theta - floor_theta
         local_step = (
             (theta_step > np.pi).to(walk_adjustments.dtype)
@@ -613,7 +637,30 @@ def _dense_patch_strip_adjustments(slice_to_spiral_transform, dr_per_winding, al
         ) * dr_per_winding.detach()
         adjustments = floor_adjustments + local_step
         adjustments = adjustments - adjustments[:, :1]
-        return adjustments.to(device=all_theta.device), slots, rows
+        return adjustments.to(device=sampled_theta.device), rows
+
+
+def _unwrap_sampled_tracks(
+    slice_to_spiral_transform, dr_per_winding, theta, shifted_radii,
+    packed_dense_walks=None,
+):
+    # Use the inexpensive sparse unwrap for every row, then replace selected
+    # rows with exact adjustments gathered along their dense walks.
+    sparse_shifted_radii, crossing_adjustments = unwrap_shifted_radii(
+        theta, shifted_radii, dr_per_winding,
+    )
+    if packed_dense_walks is None:
+        return sparse_shifted_radii, crossing_adjustments
+
+    dense_adjustments, rows = _dense_walk_crossing_adjustments(
+        slice_to_spiral_transform, dr_per_winding, theta,
+        packed_dense_walks,
+    )
+    corrected_adjustments = crossing_adjustments.clone()
+    adjustment_rows = corrected_adjustments.reshape(
+        -1, crossing_adjustments.shape[-1])
+    adjustment_rows[rows] = dense_adjustments
+    return shifted_radii + corrected_adjustments, corrected_adjustments
 
 
 def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, patch_atlas, batch, extra_zyxs=None):
@@ -622,12 +669,12 @@ def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, pat
     # walk, so unwrapping can stitch theta=0 crossings between samples. Strips
     # whose walk is far longer than the pick count get their crossing
     # adjustments recomputed along the dense walk (see
-    # _dense_patch_strip_adjustments); the sparse-pick unwrap miscounts
+    # _unwrap_sampled_tracks); the sparse-pick unwrap miscounts
     # crossings there.
 
     # The bilinear atlas gather already ran on the CPU at batch-build time
     # (see _sample_patch_batch); the batch carries the interpolated points.
-    combined_ijs_gpu, patch_indices_gpu, all_slice_zyxs, dense_walk_info = batch
+    combined_ijs_gpu, patch_indices_gpu, all_slice_zyxs, packed_dense_walks = batch
 
     # When the caller has extra points (umbilicus, shell, ...), pack them into the same
     # forward ODE call to amortise the per-call overhead.
@@ -642,21 +689,10 @@ def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, pat
         extra_spiral = None
 
     all_theta, _, all_shifted_radii = get_theta_and_radii(all_spiral_zyxs[..., 1:], dr_per_winding)
-    all_shifted_radii, all_crossing_adjustments = unwrap_shifted_radii(
-        all_theta, all_shifted_radii, dr_per_winding,
+    all_shifted_radii, all_crossing_adjustments = _unwrap_sampled_tracks(
+        slice_to_spiral_transform, dr_per_winding, all_theta,
+        all_shifted_radii, packed_dense_walks,
     )
-
-    if dense_walk_info is not None:
-        dense_adjustments, slots, rows = _dense_patch_strip_adjustments(
-            slice_to_spiral_transform, dr_per_winding, all_theta, dense_walk_info,
-        )
-        # Adjustments are detached constants, so the correction is a plain
-        # constant offset on the flagged strips' rows.
-        adjustment_delta = torch.zeros_like(all_crossing_adjustments)
-        adjustment_delta[slots, rows] = (
-            dense_adjustments - all_crossing_adjustments[slots, rows])
-        all_shifted_radii = all_shifted_radii + adjustment_delta
-        all_crossing_adjustments = all_crossing_adjustments + adjustment_delta
 
     return (
         combined_ijs_gpu,
@@ -1636,45 +1672,6 @@ def _sample_component_walk(members, edges, strip_lengths, branch_probability):
             return segments
 
 
-def _dense_walk_crossing_adjustments(
-    slice_to_spiral_transform, dr_per_winding, flat_zyxs,
-    walk_flat_indices, sampled_walk_positions,
-):
-    # Theta=0 crossing adjustments for each row's sampled points, counted along
-    # the row's FULL dense walk rather than the sparse picks. The picks can sit
-    # more than pi apart in theta on a long strip (a fiber spanning several
-    # windings), where the consecutive-diff crossing detector miscounts and
-    # assigns wrong winding offsets even to a perfectly-fit strip; the dense
-    # walk's consecutive points are decimation-spaced, so |dtheta| < pi holds
-    # there. Adjustments carry no gradient (get_theta_crossing_step_adjustments
-    # detaches), so the walk is transformed in one batched no-grad call, padded
-    # to the longest walk by repeating the last point (identical consecutive
-    # points give exactly zero theta-diffs, as in
-    # _batched_pcl_chain_seam_adjustments). Each row is re-anchored at its
-    # first pick, matching the frame the legacy sparse unwrap used, so
-    # downstream frame-sensitive consumers (snap_strip_dt_target's anchor
-    # transfer, radius_from_unwrapped_shifted) see identical values on strips
-    # where the sparse unwrap was already correct.
-    num_rows = len(walk_flat_indices)
-    max_walk_len = max(len(walk) for walk in walk_flat_indices)
-    padded = np.empty([num_rows, max_walk_len], dtype=np.int64)
-    for k, walk in enumerate(walk_flat_indices):
-        padded[k, :len(walk)] = walk
-        padded[k, len(walk):] = walk[-1]
-    device = dr_per_winding.device
-    with torch.no_grad():
-        walk_zyxs = flat_zyxs[torch.from_numpy(padded).to(device=device)]
-        walk_spiral = slice_to_spiral_transform(
-            walk_zyxs.reshape(-1, 3)).reshape(*walk_zyxs.shape)
-        walk_theta, _, _ = get_theta_and_radii(walk_spiral[..., 1:], dr_per_winding)
-        _, walk_adjustments = unwrap_shifted_radii(
-            walk_theta, torch.zeros_like(walk_theta), dr_per_winding,
-        )
-        picks = torch.from_numpy(sampled_walk_positions).to(device=device)
-        adjustments = torch.gather(walk_adjustments, 1, picks)
-        return adjustments - adjustments[:, :1]
-
-
 def get_unattached_pcl_strip_losses(
     slice_to_spiral_transform,
     dr_per_winding,
@@ -1696,7 +1693,7 @@ def get_unattached_pcl_strip_losses(
     # |dtheta| < pi. The per-row samples themselves may be far sparser than that
     # (a fiber spanning several windings sampled at num_points_per_pcl points),
     # so theta=0 crossings are stitched along the full dense walk in a no-grad
-    # pass (_dense_walk_crossing_adjustments) and only the resulting adjustments
+    # pass (_unwrap_sampled_tracks) and only the resulting adjustments
     # are applied to the sampled points. Two losses are computed, analogous to the patch radius
     # and DT losses: (1) shifted-radius should be constant along the strip after
     # subtracting per-point winding-annotation offsets; (2) each point should snap to
@@ -1739,8 +1736,7 @@ def get_unattached_pcl_strip_losses(
     sampled_strip_indices = np.empty([num_rows, num_points_per_pcl], dtype=np.int64)
     sampled_local_indices = np.empty([num_rows, num_points_per_pcl], dtype=np.int64)
     sampled_flat_indices = np.empty([num_rows, num_points_per_pcl], dtype=np.int64)
-    sampled_walk_positions = np.empty([num_rows, num_points_per_pcl], dtype=np.int64)
-    walk_flat_indices = []
+    dense_walks = []
     for k, comp_idx in enumerate(chosen_comps):
         members = component_strip_lists[comp_idx]
         edges = component_edges[comp_idx]
@@ -1766,23 +1762,28 @@ def get_unattached_pcl_strip_losses(
         sampled_strip_indices[k] = walk_strips[picks]
         sampled_local_indices[k] = walk_locals[picks]
         sampled_flat_indices[k] = starts_cpu[sampled_strip_indices[k]] + sampled_local_indices[k]
-        sampled_walk_positions[k] = picks
-        walk_flat_indices.append(starts_cpu[walk_strips] + walk_locals)
+        dense_walks.append(DenseWalk(
+            row=k,
+            path=starts_cpu[walk_strips] + walk_locals,
+            pick_positions=picks,
+        ))
 
     sampled_flat_indices_t = torch.from_numpy(sampled_flat_indices).to(device=device)
     zyxs_t = flat['zyxs'][sampled_flat_indices_t]
     winding_t = flat['windings'][sampled_flat_indices_t]
 
-    # Crossing adjustments come from the dense walk, not from unwrapping the
-    # sparse picks (see _dense_walk_crossing_adjustments).
-    crossing_adjustments = _dense_walk_crossing_adjustments(
-        slice_to_spiral_transform, dr_per_winding, flat['zyxs'],
-        walk_flat_indices, sampled_walk_positions,
-    )
+    def resolve_paths(paths_np, _rows_np):
+        indices = torch.from_numpy(paths_np).to(device=flat['zyxs'].device)
+        return flat['zyxs'][indices]
+
+    packed_dense_walks = _pack_dense_walks(dense_walks, resolve_paths)
 
     spiral_zyxs = slice_to_spiral_transform(zyxs_t.reshape(-1, 3)).reshape(*zyxs_t.shape)
     theta, _, shifted_radii = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
-    shifted_radii = shifted_radii + crossing_adjustments
+    shifted_radii, crossing_adjustments = _unwrap_sampled_tracks(
+        slice_to_spiral_transform, dr_per_winding, theta, shifted_radii,
+        packed_dense_walks,
+    )
 
     # Normalise so a pcl with mixed annotations still reads as a single 'strip'.
     normalised_radii = shifted_radii - winding_t * dr_per_winding

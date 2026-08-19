@@ -20,7 +20,9 @@ import torch
 from config import Config
 import losses
 from losses import (
-    _reconstruct_straight_dense_entries,
+    PackedDenseWalks,
+    _dense_walk_crossing_adjustments,
+    _reconstruct_straight_dense_walks,
     get_unverified_patch_losses,
 )
 
@@ -172,7 +174,7 @@ def test_dense_walk_matches_sparse_unwrap_on_short_strips(mode, monkeypatch):
     np.testing.assert_array_equal(legacy_dt, dense_dt)
 
 
-def test_reconstruct_straight_dense_entries():
+def test_reconstruct_straight_dense_walks():
     # Slot 0 fixes axis 0 (a row strip): the walk must cover exactly the
     # picks' floor-cell range at quad centres, with positions the picks'
     # offsets into it; a strip below the length threshold yields no entry.
@@ -182,11 +184,38 @@ def test_reconstruct_straight_dense_entries():
     ijs[0, 0, :, 1] = [2.5, 30.1, 55.9, 90.2]
     ijs[1, 0, :, 1] = 3.7
     ijs[1, 0, :, 0] = [1.2, 2.5, 3.1, 4.9]  # span 4 cells <= 2 * P: skipped
-    entries = _reconstruct_straight_dense_entries(ijs, P, skip=set())
-    assert len(entries) == 1
-    slot, n, walk_ijs, positions = entries[0]
-    assert (slot, n) == (0, 0)
-    assert walk_ijs.shape == (89, 2)
-    np.testing.assert_allclose(walk_ijs[:, 0], 7.3, rtol=1e-6)
-    np.testing.assert_allclose(walk_ijs[:, 1], np.arange(2, 91) + 0.5)
-    np.testing.assert_array_equal(positions, [0, 28, 53, 88])
+    walks = _reconstruct_straight_dense_walks(ijs, P, skip=set())
+    assert len(walks) == 1
+    walk = walks[0]
+    assert walk.row == 0
+    assert walk.path.shape == (89, 2)
+    np.testing.assert_allclose(walk.path[:, 0], 7.3, rtol=1e-6)
+    np.testing.assert_allclose(walk.path[:, 1], np.arange(2, 91) + 0.5)
+    np.testing.assert_array_equal(walk.pick_positions, [0, 28, 53, 88])
+
+
+def test_dense_walk_connects_quad_centres_to_jittered_picks():
+    # The shared dense-walk helper must include the final theta step from each
+    # path cell's centre to the actual fractional patch pick. Flattened row 1
+    # is selected here; row 0 is deliberately unrelated.
+    walk_theta = torch.tensor([0.1, 0.2])
+    walk_zyxs = torch.stack([
+        torch.zeros_like(walk_theta),
+        torch.sin(walk_theta),
+        torch.cos(walk_theta),
+    ], dim=-1)[None]
+    sampled_theta = torch.tensor([
+        [1.0, 1.1],
+        [2 * np.pi - 0.1, 0.2],
+    ])
+    packed = PackedDenseWalks(
+        rows=torch.tensor([1]),
+        walk_zyxs=walk_zyxs,
+        pick_positions=torch.tensor([[0, 1]]),
+    )
+
+    adjustments, rows = _dense_walk_crossing_adjustments(
+        IdentityTransform(), torch.tensor(DR), sampled_theta, packed)
+
+    assert torch.equal(rows, torch.tensor([1]))
+    assert torch.allclose(adjustments, torch.tensor([[0.0, -DR]]))
