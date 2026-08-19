@@ -39,8 +39,9 @@ def test_no_input_path_is_advertised_as_takeable_by_a_resident_session():
 
 def test_model_configuration_is_a_new_fit_change():
     assert not any(spec.checkpoint_domain for spec in FIT_INPUT_CATALOG)
-    fields = Config.catalog()["schema"]["fields"]
-    assert fields["z_begin"]["runtime_impact"] == "new_fit"
+    schema = Config.catalog()["schema"]
+    fields = schema["fields"]
+    assert schema["run_fields"]["z_begin"]["runtime_impact"] == "new_fit"
     assert fields["model_num_flow_stages"]["runtime_impact"] == "new_fit"
 
 

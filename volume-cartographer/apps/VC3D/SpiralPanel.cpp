@@ -1707,7 +1707,9 @@ QJsonObject SpiralPanel::sessionAdvancedConfig() const
     }
     for (auto it = config.begin(); it != config.end();) {
         if (it.key().startsWith(QStringLiteral("influence_"))
-            || it.key() == QStringLiteral("loss_weight_anchor"))
+            || it.key() == QStringLiteral("loss_weight_anchor")
+            || it.key() == QStringLiteral("z_begin")
+            || it.key() == QStringLiteral("z_end"))
             it = config.erase(it);
         else
             ++it;

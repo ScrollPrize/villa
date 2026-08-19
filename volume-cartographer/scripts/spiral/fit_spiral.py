@@ -2936,7 +2936,6 @@ class FitContext:
                     get_winding_inference_losses(
                         transform, dr, self.winding_inference, self.config,
                         self.z_begin, self.z_end,
-                        shell_map=self.shell_map,
                         generator=preview_generator)
                 if self.unattached_pcl_strips:
                     get_unattached_pcl_strip_losses(
@@ -3678,7 +3677,6 @@ class FitContext:
                 self.config,
                 self.z_begin,
                 self.z_end,
-                shell_map=self.shell_map,
             )
             backward_family({
                 'dense_spacing_winding_model_relative': (

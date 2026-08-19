@@ -821,9 +821,10 @@ class InteractiveFitSession:
                     with self._condition:
                         self._warnings.append(warning)
                 durable = Config(durable).as_dict()
-                # The optimisation z window is owned by the session
-                # request; the checkpoint's stored range only documents
-                # what it trained with.
+                # Keep the durable configuration aligned with the canonical
+                # run window. The service restores a newly loaded checkpoint's
+                # range into this run block; later dock edits remain free to
+                # choose a narrower or otherwise compatible window.
                 durable["z_begin"] = int(self.run_config.z_begin)
                 durable["z_end"] = int(self.run_config.z_end)
                 config.update(durable)
@@ -835,8 +836,9 @@ class InteractiveFitSession:
                 # not retain a complete model + optimiser checkpoint for the
                 # lifetime of the resident fitter thread.
                 del checkpoint_config
-        # The session request's z window is authoritative for this fit,
-        # both for the applied configuration and the Default profile.
+        # The canonical run window (the request normally, or the restored
+        # checkpoint window above) owns the applied configuration and Default
+        # profile.
         config["z_begin"] = int(self.run_config.z_begin)
         config["z_end"] = int(self.run_config.z_end)
         unknown = sorted(set(self.run_config.config) - set(config))
@@ -875,6 +877,8 @@ class InteractiveFitSession:
                 self.run_config.z_end, count_keys,
                 world_size=world_size)
         config.update(explicit_sampling_counts)
+        for key in ('z_begin', 'z_end'):
+            default_advanced_config.pop(key, None)
         self.requested_config = dict(config)
         with self._condition:
             self._applied_config = copy.deepcopy(config)

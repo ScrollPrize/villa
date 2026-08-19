@@ -57,6 +57,29 @@ private slots:
             expected);
     }
 
+    void EffectiveAdvancedConfigurationExcludesDockOwnedZRange()
+    {
+        const QJsonObject request{
+            {"run", QJsonObject{
+                {"z_begin", 120},
+                {"z_end", 840},
+                {"config", QJsonObject{
+                    {"z_begin", 1},
+                    {"z_end", 2},
+                    {"loss_weight_patch_radius", 3.0},
+                }},
+            }},
+        };
+        const QJsonObject effective = vc3d::effectiveSpiralSessionConfig(
+            request,
+            QJsonObject{{"z_begin", 4000}, {"z_end", 17000}},
+            QJsonObject{});
+
+        QVERIFY(!effective.contains("z_begin"));
+        QVERIFY(!effective.contains("z_end"));
+        QCOMPARE(effective["loss_weight_patch_radius"].toDouble(), 3.0);
+    }
+
     void runMutableConfigAndShellPathDoNotRequireFullReload()
     {
         const QJsonObject defaults{

@@ -44,6 +44,11 @@ inline QJsonObject effectiveSpiralSessionConfig(
         effective.insert(it.key(), it.value());
     for (auto it = activeRunConfig.begin(); it != activeRunConfig.end(); ++it)
         effective.insert(it.key(), it.value());
+    // The z window is represented by run.z_begin/run.z_end and edited in the
+    // panel dock. Older profiles and resolved checkpoint configurations may
+    // still contain durable copies, but they are not advanced JSON settings.
+    effective.remove(QStringLiteral("z_begin"));
+    effective.remove(QStringLiteral("z_end"));
     return effective;
 }
 

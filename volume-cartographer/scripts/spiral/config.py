@@ -247,6 +247,10 @@ def _field_spec(key, default):
         spec["scale_with_z"] = True
     if key in _Z_RANGE_DESCRIPTIONS:
         spec["description"] = _Z_RANGE_DESCRIPTIONS[key]
+        # These values remain part of the resolved/checkpoint configuration,
+        # but interactive clients edit them through the run-level z controls,
+        # not as independent advanced-JSON settings.
+        spec["ui_owner"] = "run"
     elif key in _INPUT_TOGGLE_DESCRIPTIONS:
         spec["description"] = _INPUT_TOGGLE_DESCRIPTIONS[key]
     return spec
@@ -552,13 +556,25 @@ class Config:
 
     @classmethod
     def catalog(cls):
-        defaults = cls().as_dict()
+        resolved_defaults = cls().as_dict()
+        run_owned = {"z_begin", "z_end"}
+        defaults = {
+            key: value for key, value in resolved_defaults.items()
+            if key not in run_owned
+        }
         fields = {
             key: _field_spec(key, value)
             for key, value in defaults.items()
         }
+        run_fields = {
+            key: _field_spec(key, resolved_defaults[key])
+            for key in sorted(run_owned)
+        }
         presets = {
-            path.stem: cls(path).as_dict()
+            path.stem: {
+                key: value for key, value in cls(path).as_dict().items()
+                if key not in run_owned
+            }
             for path in (Path(__file__).parent / "configs").glob("*.json")
         }
         return {
@@ -574,6 +590,10 @@ class Config:
                 # answers still come from the service (see rebuild_stage).
                 "model_stage_keys": sorted(MODEL_STAGE_KEYS),
                 "fields": fields,
+                # API run-block fields shown in the left-side dock. They are
+                # catalogued for clients but deliberately absent from the
+                # advanced configuration defaults, fields, and presets.
+                "run_fields": run_fields,
             },
             "presets": presets,
         }

@@ -139,7 +139,8 @@ SESSION_BUSY_STATES = frozenset({
 def run_mutable_config(config: Mapping[str, Any]) -> dict[str, Any]:
     fields = Config.catalog()["schema"]["fields"]
     return {key: value for key, value in config.items()
-            if fields[key]["runtime_impact"] == "run_boundary"}
+            if key in fields
+            and fields[key]["runtime_impact"] == "run_boundary"}
 
 
 class PclRole(str, Enum):

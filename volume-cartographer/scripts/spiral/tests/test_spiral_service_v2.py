@@ -51,7 +51,7 @@ from fit_session import (API_VERSION, AUTOSAVE_CHECKPOINT_NAME,
                          SpiralPreviewConfig, SpiralRunConfig,
                          resolve_dataset_root, select_startup_autosave,
                          validate_autosave, write_autosave_metadata)
-from config import Config, durable_config
+from config import BACKFILLABLE_CONFIG_DEFAULTS, Config, durable_config
 
 
 class FakeSession:
@@ -261,7 +261,8 @@ class ProgressStatusTests(unittest.TestCase):
 
 def _planned_run(state, request):
     request = dict(request)
-    configuration = Config(request.pop("run_config", {})).as_dict()
+    configuration = dict(Config.catalog()["defaults"])
+    configuration.update(request.pop("run_config", {}))
     return state.run({
         "configuration": configuration,
         "iterations": request.pop("iterations"),
@@ -1085,6 +1086,22 @@ class DatasetOwnershipTests(unittest.TestCase):
         })
         self.assertEqual(paths.winding_inference, str(winding))
         self.assertEqual(run.config, {})
+        self.assertEqual((run.z_begin, run.z_end), (0, 10))
+
+        # Loading the checkpoint seeds the canonical run range (and therefore
+        # the VC3D dock), even though ordinary request preparation leaves later
+        # explicit dock edits alone.
+        with mock.patch("spiral_runtime.create_session",
+                        return_value=FakeSession()):
+            response = self.state.initialize({
+                "paths": {"checkpoint": str(checkpoint)},
+                "run": {"z_begin": 0, "z_end": 10, "config": {}},
+            })
+            _await_build(self.state)
+        attached_run = response["session_request"]["run"]
+        self.assertEqual(
+            (attached_run["z_begin"], attached_run["z_end"]),
+            (checkpoint_config["z_begin"], checkpoint_config["z_end"]))
 
     def test_status_advertises_canonical_active_session_request(self):
         config = {
@@ -1139,6 +1156,17 @@ class DatasetOwnershipTests(unittest.TestCase):
                 self.assertEqual([detail["field"] for detail
                                   in caught.exception.details],
                                  [f"run.{key}"])
+
+    def test_initialization_refuses_z_range_in_advanced_config(self):
+        with self.assertRaises(ApiError) as caught:
+            self.state.initialize({
+                "run": {"z_begin": 100, "z_end": 900,
+                        "config": {"z_begin": 200, "z_end": 800}},
+            })
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(
+            [detail["field"] for detail in caught.exception.details],
+            ["run.config.z_begin", "run.config.z_end"])
 
     def test_a_failed_build_reports_error_and_a_rebuild_recovers(self):
         request = {
@@ -1375,6 +1403,27 @@ class DatasetOwnershipTests(unittest.TestCase):
             "domain.ckpt", {**live, "z_end": live["z_end"] + 1000}))
         self.assertEqual(error.payload["stage"], "all")
 
+        # Input toggles have an unambiguous historical default. Their absence
+        # in a legacy checkpoint must not turn an otherwise rebuildable model
+        # mismatch into a permanent refusal.
+        pre_toggles = {
+            key: value for key, value in live.items()
+            if key not in BACKFILLABLE_CONFIG_DEFAULTS
+        }
+        pre_toggles["model_num_flow_stages"] = 3
+        error = self._refuse_load(session, self._write_checkpoint(
+            "pre-input-toggles.ckpt", pre_toggles))
+        self.assertEqual(error.payload["stage"], "model")
+        self.assertNotIn("refused", error.payload)
+
+        # The stage calculation uses the same historical True defaults as the
+        # rebuild. A live disabled input therefore promotes the rebuild to the
+        # full host-input stage.
+        session.applied_config["input_use_tracks"] = False
+        error = self._refuse_load(session, self._write_checkpoint(
+            "pre-input-toggles-disabled-live.ckpt", pre_toggles))
+        self.assertEqual(error.payload["stage"], "all")
+
     def test_a_refusal_no_rebuild_can_fix_offers_nothing(self):
         session = _attach_fake_session(self.state, self.output, self.root)
         live = Config().as_dict()
@@ -1423,7 +1472,8 @@ class DatasetOwnershipTests(unittest.TestCase):
         # checkpoint's own cfg, so resending the profile would re-impose the
         # very keys the preflight just refused.
         self.assertEqual(rebuilds[0]["run"]["config"], {})
-        self.assertEqual(rebuilds[0]["run"]["z_end"], 10)
+        self.assertEqual(rebuilds[0]["run"]["z_begin"], live["z_begin"])
+        self.assertEqual(rebuilds[0]["run"]["z_end"], live["z_end"])
 
     def test_allow_rebuild_must_be_a_boolean(self):
         _attach_fake_session(self.state, self.output, self.root)

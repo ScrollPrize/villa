@@ -68,7 +68,8 @@ from fit_session import (API_VERSION, FIT_INPUT_CATALOG, SESSION_BUSY_STATES,
                          load_scroll_spec,
                          parse_session_request, resolve_dataset_root,
                          validate_session_request)
-from config import (CHECKPOINT_MODEL_SHAPE_KEYS, Config, durable_config,
+from config import (BACKFILLABLE_CONFIG_DEFAULTS,
+                    CHECKPOINT_MODEL_SHAPE_KEYS, Config, durable_config,
                     rebuild_stage)
 from service_http import (ApiError, TRANSFER_CHUNK_BYTES,
                           is_safe_relative_name)
@@ -774,7 +775,7 @@ class ServiceState:
             (request.get("run") or {}).get("config") or {})
         config = requested_config
         if checkpoint:
-            checkpoint_config, _ = self._checkpoint_durable_cfg(
+            checkpoint_config, _, _ = self._checkpoint_durable_cfg(
                 paths["checkpoint"])
             if checkpoint_config is not None:
                 config = {**checkpoint_config, **requested_config}
@@ -825,7 +826,7 @@ class ServiceState:
             return resolved_request, config
         return resolved_request
 
-    def _prepare_session_request(self, request):
+    def _prepare_session_request(self, request, *, restore_checkpoint_z=False):
         """Validate one session request into the arguments a build needs."""
         # The scroll specification in the dataset root owns these. A request
         # that names one is refused rather than quietly overruled by the file.
@@ -852,6 +853,22 @@ class ServiceState:
             # caller's error, not a service fault.
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            f"Malformed session request: {exc}") from exc
+        if restore_checkpoint_z and paths.checkpoint:
+            _, _, checkpoint_z_range = self._checkpoint_durable_cfg(
+                paths.checkpoint)
+            if checkpoint_z_range is not None:
+                run = dataclasses.replace(
+                    run, z_begin=checkpoint_z_range[0],
+                    z_end=checkpoint_z_range[1])
+        misplaced_z = sorted(
+            key for key in ("z_begin", "z_end") if key in run.config)
+        if misplaced_z:
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "The z range belongs to the run block, not advanced config",
+                [{"field": f"run.config.{key}",
+                  "message": f"Set run.{key} instead"}
+                 for key in misplaced_z])
         validation_run = (
             dataclasses.replace(run, config=input_config)
             if input_config is not None else run)
@@ -882,7 +899,8 @@ class ServiceState:
                 raise ApiError(
                     HTTPStatus.CONFLICT,
                     "The fit session has already been initialized")
-        paths, run, preview, scroll = self._prepare_session_request(request)
+        paths, run, preview, scroll = self._prepare_session_request(
+            request, restore_checkpoint_z=True)
         if paths.checkpoint and run.config:
             self._reject_overrides_the_checkpoint_contradicts(
                 paths.checkpoint, run.config)
@@ -1331,10 +1349,20 @@ class ServiceState:
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            "iterations must be at least 1")
         current = session.status().get("applied_config")
+        request_run = self.session_request.get("run") or {}
         if current is None:
             current = Config(
-                (self.session_request.get("run") or {}).get("config") or {}
+                request_run.get("config") or {}
             ).as_dict()
+            for key in ("z_begin", "z_end"):
+                if key in request_run:
+                    current[key] = request_run[key]
+        # A Run carries a complete advanced configuration but never owns the
+        # z window. Preserve the resident run values that Config() supplied as
+        # ordinary defaults while validating the advanced fields above.
+        for key in ("z_begin", "z_end"):
+            configuration[key] = current.get(
+                key, request_run.get(key, configuration[key]))
         changes = {key: value for key, value in configuration.items()
                    if current.get(key) != value}
         fields = self.config_catalog["schema"]["fields"]
@@ -1605,7 +1633,7 @@ class ServiceState:
                 "config_revision": result.get("config_revision")}
 
     def _checkpoint_durable_cfg(self, path):
-        """The durable configuration and dataset a checkpoint records.
+        """The durable configuration, dataset and z window a checkpoint records.
 
         CPU-only and read afresh: the same bytes an escalated rebuild would
         apply, so nothing here can go stale between the refusal and the
@@ -1617,14 +1645,30 @@ class ServiceState:
         try:
             payload = load_checkpoint_cpu(path)
         except Exception:
-            return None, ""
+            return None, "", None
         try:
             if not isinstance(payload, dict):
-                return None, ""
+                return None, "", None
             cfg = payload.get("cfg")
             manifest = payload.get("input_manifest") or {}
+            # z_begin/z_end are run-block settings in the service API.  A
+            # checkpoint load is the one other source allowed to choose them:
+            # prefer the optimisation window in its durable cfg, falling back
+            # to the top-level model domain for checkpoints from before the
+            # fields joined the configuration schema.
+            z_source = cfg if isinstance(cfg, Mapping) \
+                and "z_begin" in cfg and "z_end" in cfg else payload
+            z_range = None
+            if "z_begin" in z_source and "z_end" in z_source:
+                try:
+                    candidate = (int(z_source["z_begin"]),
+                                 int(z_source["z_end"]))
+                    if candidate[0] < candidate[1]:
+                        z_range = candidate
+                except (TypeError, ValueError):
+                    pass
             return (dict(cfg) if isinstance(cfg, Mapping) else None,
-                    str(manifest.get("dataset_root") or ""))
+                    str(manifest.get("dataset_root") or ""), z_range)
         finally:
             # A refusal must not leave a whole model + optimiser archive
             # mapped for the lifetime of the service.
@@ -1644,7 +1688,8 @@ class ServiceState:
         z_begin/z_end on this same path rather than through a special case.
         """
         reasons = [line for line in str(cause).splitlines() if line.strip()]
-        checkpoint_cfg, checkpoint_dataset = self._checkpoint_durable_cfg(path)
+        checkpoint_cfg, checkpoint_dataset, _ = \
+            self._checkpoint_durable_cfg(path)
         with self.lock:
             status = self.session.status() if self.session else {}
             dataset_root = str(
@@ -1654,7 +1699,9 @@ class ServiceState:
         # whose configuration is not this schema's at all.
         if checkpoint_cfg is None or (
                 set(checkpoint_cfg) - set(live)
-                or set(live) - set(checkpoint_cfg) - {"z_begin", "z_end"}):
+                or set(live) - set(checkpoint_cfg) - (
+                    {"z_begin", "z_end"}
+                    | set(BACKFILLABLE_CONFIG_DEFAULTS))):
             return ApiError(
                 HTTPStatus.CONFLICT, f"Checkpoint refused: {cause}",
                 payload={"reasons": reasons, "refused": True})
@@ -1663,7 +1710,11 @@ class ServiceState:
             return ApiError(
                 HTTPStatus.CONFLICT, f"Checkpoint refused: {cause}",
                 payload={"reasons": reasons, "refused": True})
-        changed = {key for key, value in checkpoint_cfg.items()
+        resolved_checkpoint_cfg = {
+            **BACKFILLABLE_CONFIG_DEFAULTS,
+            **checkpoint_cfg,
+        }
+        changed = {key for key, value in resolved_checkpoint_cfg.items()
                    if live.get(key) != value}
         return ApiError(
             HTTPStatus.CONFLICT, f"Checkpoint refused: {cause}",
@@ -1683,7 +1734,7 @@ class ServiceState:
         loss weights, sample counts, schedules — is a legitimate change to
         make while resuming, and the fit is built to take them.
         """
-        checkpoint_cfg, _ = self._checkpoint_durable_cfg(path)
+        checkpoint_cfg, _, _ = self._checkpoint_durable_cfg(path)
         if not checkpoint_cfg:
             return
         conflicts = sorted(
@@ -1719,6 +1770,9 @@ class ServiceState:
         paths = dict(current.get("paths") or {})
         paths["checkpoint"] = path
         run = dict(current.get("run") or {})
+        _, _, checkpoint_z_range = self._checkpoint_durable_cfg(path)
+        if checkpoint_z_range is not None:
+            run["z_begin"], run["z_end"] = checkpoint_z_range
         run["config"] = {}
         return self.rebuild({**current, "paths": paths, "run": run})
 

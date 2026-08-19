@@ -4,6 +4,7 @@ import json
 import pytest
 
 from config import Config, FitConfig, MODEL_STAGE_KEYS, rebuild_stage
+from fit_session import run_mutable_config
 
 
 def test_fit_config_wraps_a_resolved_mapping_with_dict_style_access():
@@ -23,6 +24,9 @@ def test_fit_config_wraps_a_resolved_mapping_with_dict_style_access():
 def test_catalog_is_complete_and_presets_are_resolved():
     catalog = Config.catalog()
     assert set(catalog["defaults"]) == set(catalog["schema"]["fields"])
+    assert set(catalog["schema"]["run_fields"]) == {"z_begin", "z_end"}
+    assert set(Config().as_dict()) == (
+        set(catalog["defaults"]) | set(catalog["schema"]["run_fields"]))
     for preset in catalog["presets"].values():
         assert set(preset) == set(catalog["defaults"])
 
@@ -52,6 +56,17 @@ def test_input_participation_toggles_are_rebuild_scoped_booleans():
         assert catalog["schema"]["fields"][key]["type"] == "boolean"
         assert catalog["schema"]["fields"][key]["runtime_impact"] == "new_fit"
         assert catalog["schema"]["fields"][key]["description"]
+
+
+def test_z_range_is_advertised_as_owned_by_the_run_controls():
+    catalog = Config.catalog()
+    assert "z_begin" not in catalog["defaults"]
+    assert "z_end" not in catalog["defaults"]
+    fields = catalog["schema"]["run_fields"]
+    assert fields["z_begin"]["ui_owner"] == "run"
+    assert fields["z_end"]["ui_owner"] == "run"
+    assert "z_begin" not in run_mutable_config(Config().as_dict())
+    assert "z_end" not in run_mutable_config(Config().as_dict())
 
 
 def test_interactive_runtime_impacts_match_resident_capabilities():
