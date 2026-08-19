@@ -1524,6 +1524,15 @@ class TrainingConfig:
             raise ValueError(
                 "force_full_supervision requires dynamic_label.kind='self_distill'"
             )
+        if (
+            dynamic_label is not None
+            and ink.data.discovery_mode == "unlabeled"
+            and not force_full_supervision
+        ):
+            raise ValueError(
+                "dynamic_label with patch_discovery_mode='unlabeled' requires "
+                "force_full_supervision=true"
+            )
         save_iterations_value = canonical.get("save_iterations") or ()
         if not isinstance(save_iterations_value, (list, tuple)):
             raise TypeError("save_iterations must be an array")
