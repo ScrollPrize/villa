@@ -118,7 +118,11 @@ bool Segmentation::canLoadSurface() const
     for (const auto* band : {"x.tif", "y.tif", "z.tif"}) {
         std::error_code ec;
         if (!std::filesystem::exists(path_ / band, ec) || ec) {
-            return false;
+            // Open Data placeholders carry catalog-origin.json instead of a
+            // payload; they must register so the fetch/materialize path can
+            // run, and app code guards geometry access for them.
+            std::error_code originEc;
+            return std::filesystem::exists(path_ / "catalog-origin.json", originEc) && !originEc;
         }
     }
     return true;
