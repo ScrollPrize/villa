@@ -258,6 +258,75 @@ size_t occurrenceCount(const std::string& text, const std::string& needle)
     return count;
 }
 
+vc::fiber_tracer::FiberLocalSmoothnessCost legacyFiberLocalSmoothnessCost(
+    const cv::Vec3f& previousStepDirection,
+    const cv::Vec3f& candidateStepDirection,
+    const cv::Vec3f& normal,
+    bool normalValid,
+    const vc::fiber_tracer::FiberLocalSmoothnessConfig& config)
+{
+    using vc::fiber_tracer::FiberLocalSmoothnessCost;
+    using vc::fiber_tracer::FiberLocalSmoothnessMode;
+    constexpr float epsilon = 1.0e-6f;
+    constexpr float epsilon2 = epsilon * epsilon;
+    const auto clampUnit = [](float value) {
+        if (!std::isfinite(value))
+            return 0.0f;
+        return std::clamp(value, -1.0f, 1.0f);
+    };
+    const auto normalizeOrZero = [](const cv::Vec3f& value) {
+        const float length = std::sqrt(value.dot(value));
+        if (!(length > epsilon) || !std::isfinite(length))
+            return cv::Vec3f{};
+        return value / length;
+    };
+    const auto angleBetweenUnit = [&](const cv::Vec3f& left,
+                                      const cv::Vec3f& right) {
+        return std::acos(clampUnit(left.dot(right)));
+    };
+    const auto excessAngleSquared = [](float angle, float freeAngle) {
+        const float excess = std::max(0.0f, angle - freeAngle);
+        return excess * excess;
+    };
+
+    FiberLocalSmoothnessCost cost;
+    if (previousStepDirection.dot(previousStepDirection) <= epsilon2 ||
+        candidateStepDirection.dot(candidateStepDirection) <= epsilon2) {
+        return cost;
+    }
+
+    const float isotropicAngle = angleBetweenUnit(
+        previousStepDirection, candidateStepDirection);
+    const float isotropic = config.isotropicWeight * excessAngleSquared(
+        isotropicAngle, config.freeAngleRadians);
+    if (!normalValid || normal.dot(normal) <= epsilon2) {
+        cost.isotropic = isotropic;
+        cost.mode = FiberLocalSmoothnessMode::IsotropicFallback;
+        return cost;
+    }
+
+    const float previousNormal = clampUnit(previousStepDirection.dot(normal));
+    const float candidateNormal = clampUnit(candidateStepDirection.dot(normal));
+    const cv::Vec3f previousTangent = normalizeOrZero(
+        previousStepDirection - normal * previousNormal);
+    const cv::Vec3f candidateTangent = normalizeOrZero(
+        candidateStepDirection - normal * candidateNormal);
+    const bool tangentValid =
+        previousTangent.dot(previousTangent) > epsilon2 &&
+        candidateTangent.dot(candidateTangent) > epsilon2;
+    const float tangentAngle = tangentValid
+        ? angleBetweenUnit(previousTangent, candidateTangent)
+        : isotropicAngle;
+    const float normalAngle = std::abs(
+        std::asin(candidateNormal) - std::asin(previousNormal));
+    cost.tangent = config.tangentWeight * excessAngleSquared(
+        tangentAngle, config.freeAngleRadians);
+    cost.normal = config.normalWeight * excessAngleSquared(
+        normalAngle, config.freeAngleRadians);
+    cost.mode = FiberLocalSmoothnessMode::NormalAware;
+    return cost;
+}
+
 }  // namespace
 
 TEST_CASE("fiber local smoothness preserves native split equations")
@@ -284,6 +353,46 @@ TEST_CASE("fiber local smoothness preserves native split equations")
     auto free = config;
     free.freeAngleRadians = pi * 0.5f;
     CHECK(vc::fiber_tracer::fiberLocalSmoothnessCost({1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {}, false, free).total() == doctest::Approx(0.0f));
+}
+
+TEST_CASE("lazy fiber local isotropic evaluation preserves legacy branches")
+{
+    using vc::fiber_tracer::FiberLocalSmoothnessConfig;
+    using vc::fiber_tracer::fiberLocalSmoothnessCost;
+    const FiberLocalSmoothnessConfig config{2.0f, 0.1f, 10.0f, 0.05f};
+    struct TestCase {
+        cv::Vec3f previous;
+        cv::Vec3f candidate;
+        cv::Vec3f normal;
+        bool normalValid;
+    };
+    const std::array cases{
+        TestCase{{1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f},
+                 {0.0f, 0.0f, 1.0f}, true},
+        TestCase{{1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f},
+                 {0.0f, 0.0f, 1.0f}, false},
+        TestCase{{1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f},
+                 {}, true},
+        TestCase{{0.0f, 0.0f, 1.0f}, {1.0f, 0.0f, 0.0f},
+                 {0.0f, 0.0f, 1.0f}, true},
+        TestCase{{1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f},
+                 {0.0f, 0.0f, 1.0f}, true},
+        TestCase{{0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -1.0f},
+                 {0.0f, 0.0f, 1.0f}, true},
+    };
+
+    for (const auto& test : cases) {
+        const auto expected = legacyFiberLocalSmoothnessCost(
+            test.previous, test.candidate, test.normal,
+            test.normalValid, config);
+        const auto actual = fiberLocalSmoothnessCost(
+            test.previous, test.candidate, test.normal,
+            test.normalValid, config);
+        CHECK(actual.isotropic == expected.isotropic);
+        CHECK(actual.tangent == expected.tangent);
+        CHECK(actual.normal == expected.normal);
+        CHECK(actual.mode == expected.mode);
+    }
 }
 
 TEST_CASE("prepared fiber local scoring matches validating scoring")

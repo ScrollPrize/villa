@@ -243,3 +243,11 @@ The lookup had no end-to-end gain and slightly increased peak-search work in a
 paired run. The polynomial met the error and replay-quality gates but clearly
 regressed peak, anchor, and command time. Both variants were removed; the
 committed `expf` implementation remains the production baseline.
+
+The current measured continuation will test lazy isotropic-smoothness
+evaluation in the shared local scorer, whose inlined prepared path is hot in
+fiberlet DP. Normal-aware transitions with valid projected tangents must not
+compute the otherwise unused isotropic angle. Isotropic fallback and degenerate
+projected-tangent behavior must remain exact. Retain the checkpoint only if
+alternating canonical measurements show a repeatable enclosing gain with
+byte-identical replay output.

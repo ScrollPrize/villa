@@ -655,3 +655,6 @@
   scoring and the prepared fiberlet DP loop. Canonical median DP search wall
   improved 9.8% and fiberlet wall 5.7% with exact replay artifacts and work
   counters.
+- Deferred isotropic-angle evaluation in shared local scoring until an invalid
+  normal or degenerate projected tangent requires it. Canonical median DP
+  search wall improved another 6.2% with byte-identical replay artifacts.

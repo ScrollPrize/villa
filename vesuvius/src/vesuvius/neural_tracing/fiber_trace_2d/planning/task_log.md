@@ -1631,3 +1631,69 @@
   2 greedy / 1 fiberlet failures. Every `fiber_replay.json` was byte-identical
   with SHA-256
   `904c39d08e39c6b7b65ac95fd47d28d50e254a33609201c92aef71c6cc131308`.
+
+## Checkpoint 35: lazy isotropic smoothness evaluation
+
+- Started from committed checkpoint 34 (`0d104426e`). The shared smoothness
+  primitive currently evaluates one isotropic `acos` and its weighted penalty
+  before normal validation, even though the common normal-aware path discards
+  both whenever its two projected tangents are valid.
+- The isolated experiment will defer that calculation to invalid-normal or
+  degenerate-projected-tangent fallback paths. Returned arithmetic and output
+  must remain exact, and alternating uninstrumented measurements against a
+  matching checkpoint-34 build will decide retention.
+- Independent review found that the existing generic/prepared parity test is
+  not an independent oracle because both paths share this helper. The corrected
+  plan adds a test-local legacy equation, all one-sided/two-sided tangent and
+  invalid-normal branches, baseline/candidate code-generation inspection, and
+  load checks before counterbalanced `B/C, C/B, B/C` benchmark runs. It also
+  clarifies that this is shared local scoring even though fiberlet DP is the
+  measured hotspot.
+- Implemented the shared-helper rewrite and an independent test-local copy of
+  the old equation. Exact branch parity covers valid projected tangents,
+  `normalValid=false`, a valid zero normal, previous-only tangent degeneracy,
+  candidate-only degeneracy, and two-sided degeneracy. GCC passed 50 path and
+  6 replay cases; repository-local Clang passed all 50 path cases.
+- GCC baseline inspection found two angle call sites in the solve body: the
+  eager isotropic angle and the projected-tangent angle. The candidate has
+  branch-specific invalid-normal, valid-tangent, and degenerate-tangent call
+  sites, so the common valid-normal/valid-tangent path executes one `acos`
+  instead of two. Candidate Clang also keeps fallback calls behind branches.
+- Canonical command, with either baseline or candidate binary and a distinct
+  output directory:
+
+  ```text
+  /usr/bin/time -v <vc_fiberlets> fiberlet-replay \
+    /home/hendrik/business/aiconsulting/vesuviuschallenge/data/s1/PHercParis4.volpkg/volumes/fiber_s1_002.lasagna.json \
+    /home/hendrik/business/aiconsulting/vesuviuschallenge/data/fibers/david/Paris4_fibers/dj_20260805T025256484_000003.json \
+    <output> \
+    --normal-manifest /home/hendrik/business/aiconsulting/vesuviuschallenge/data/lasagna3d_inf/las008_s1_full/las_008.lasagna.json \
+    --threads 32 --length 5000 --maximum-iterations 2
+  ```
+
+  Both builds used matching repository `QuickBuild` configuration with
+  `VC_TESTING=ON`. Baseline was commit `0d104426e`; run order was
+  `B/C, C/B, B/C`, with host-load checks before every run. Logs and artifacts
+  are under `volume-cartographer/build/benchmarks/checkpoint35/`.
+
+  | metric | baseline min/median/max | candidate min/median/max | median change |
+  |---|---:|---:|---:|
+  | command wall | `7.59/7.61/7.66 s` | `7.53/7.55/7.65 s` | `-0.8%` |
+  | total CPU | `201.70/204.17/204.48 s` | `201.80/202.23/203.50 s` | `-1.0%` |
+  | anchor wall | `5.1082/5.1200/5.1327 s` | `5.0888/5.1154/5.1825 s` | `-0.1%` |
+  | fiberlet wall | `1.9432/1.9605/1.9944 s` | `1.9017/1.9091/1.9291 s` | `-2.6%` |
+  | fiberlet CPU | `57.485/57.974/58.520 s` | `56.221/56.431/56.739 s` | `-2.7%` |
+  | search wall | `1.0242/1.0368/1.0399 s` | `0.9696/0.9723/0.9870 s` | `-6.2%` |
+  | search CPU | `32.219/32.571/32.601 s` | `30.547/30.556/30.850 s` | `-6.2%` |
+  | DP worker | `32.362/32.772/32.864 s` | `30.618/30.713/31.173 s` | `-6.3%` |
+  | peak RSS | `1,604,484/1,608,012/1,613,112 KiB` | `1,605,436/1,605,860/1,612,480 KiB` | `-0.1%` |
+
+- All six measured runs retained 2,519 anchors, 48,852 searched / 24,475
+  accepted candidates, 170,521 sampled voxels, 47,790,462 evaluated DP nodes,
+  58,058,924 relaxations, and 2 greedy / 1 fiberlet failures. Every measured
+  `fiber_replay.json` and the screening artifact were byte-identical with
+  SHA-256
+  `904c39d08e39c6b7b65ac95fd47d28d50e254a33609201c92aef71c6cc131308`.
+- Retained the checkpoint because the targeted search and DP gains repeated in
+  all three pairs, enclosing fiberlet time improved, command time did not
+  regress, and replay output remained exact.

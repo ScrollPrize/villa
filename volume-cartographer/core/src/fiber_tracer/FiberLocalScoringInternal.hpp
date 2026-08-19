@@ -81,12 +81,12 @@ static inline FiberLocalSmoothnessCost fiberLocalSmoothnessCostInline(
         return cost;
     }
 
-    const float isotropicAngle = fiberLocalAngleBetweenUnit(
-        previousStepDirection, candidateStepDirection);
-    const float isotropic = config.isotropicWeight * fiberLocalExcessAngleSquared(
-        isotropicAngle, config.freeAngleRadians);
     if (!normalValid || normal.dot(normal) <= epsilon2) {
-        cost.isotropic = isotropic;
+        const float isotropicAngle = fiberLocalAngleBetweenUnit(
+            previousStepDirection, candidateStepDirection);
+        cost.isotropic = config.isotropicWeight *
+                         fiberLocalExcessAngleSquared(
+                             isotropicAngle, config.freeAngleRadians);
         cost.mode = FiberLocalSmoothnessMode::IsotropicFallback;
         return cost;
     }
@@ -104,7 +104,8 @@ static inline FiberLocalSmoothnessCost fiberLocalSmoothnessCostInline(
         candidateTangent.dot(candidateTangent) > epsilon2;
     const float tangentAngle = tangentValid
         ? fiberLocalAngleBetweenUnit(previousTangent, candidateTangent)
-        : isotropicAngle;
+        : fiberLocalAngleBetweenUnit(
+              previousStepDirection, candidateStepDirection);
     const float normalAngle = std::abs(
         std::asin(candidateNormal) - std::asin(previousNormal));
     cost.tangent = config.tangentWeight * fiberLocalExcessAngleSquared(

@@ -335,6 +335,11 @@ The exported validating/prepared scoring functions and the prepared DP hot loop
 share one source-private inline implementation of alignment, smoothness, and
 metric composition. This preserves the public API and exact equations while
 avoiding interposable shared-library calls for every interior DP transition.
+The shared smoothness implementation evaluates isotropic curvature only when
+an invalid normal or a degenerate projected tangent actually requires that
+fallback. Normal-aware transitions with valid projected tangents therefore
+avoid an otherwise unused inverse-cosine evaluation without changing any
+returned cost.
 
 Source and sink transitions use the fitted endpoint axes as proxy endpoint
 predictions; sink presence is one. Curvature uses the native tracer's shared

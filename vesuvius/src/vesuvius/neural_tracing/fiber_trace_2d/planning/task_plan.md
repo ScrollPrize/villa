@@ -1883,3 +1883,62 @@ unchanged populations and DP work, and 2 greedy / 1 fiberlet failures.
   with exact populations, DP counters, routes, and 2 greedy / 1 fiberlet
   failures. Peak RSS medians were `1,611,932` KiB baseline and `1,601,256` KiB
   candidate.
+
+### Checkpoint 35: lazy isotropic smoothness evaluation
+
+1. In the shared source-private smoothness primitive, move isotropic angle and
+   penalty evaluation into the invalid-normal fallback. In the normal-aware
+   branch, evaluate the isotropic angle only when either projected tangent is
+   degenerate and the existing tangent-angle fallback requires it.
+2. Preserve the exact equations and arithmetic order for every returned cost.
+   Do not add a DP-specific implementation, approximation, runtime option, or
+   platform-specific intrinsic. Both exported wrappers and the inlined DP path
+   must continue to use the same private implementation.
+3. Add an independent test-local implementation of the pre-checkpoint
+   equations; do not use generic/prepared comparisons that share the private
+   helper as the parity oracle. Compare every returned field exactly for valid
+   projected tangents, `normalValid=false`, a valid flag with zero normal, each
+   one-sided projected-tangent degeneracy, and two-sided degeneracy.
+4. Run focused GCC path/replay tests and repository-local Clang path tests.
+   Inspect baseline and candidate GCC DP call-site control flow, and candidate
+   Clang control flow where practical, to establish whether the compiler had
+   already sunk the eager `acos` and confirm both fallback paths retain it.
+5. Build an uninstrumented baseline at commit `0d104426e` with the same CMake
+   options as the candidate. Check host CPU load before every run, screen once,
+   then use counterbalanced warm order `B/C, C/B, B/C`. Record the exact
+   command, dataset, build flags, output directories, and min/median/max.
+   Compare command, fiberlet, search, DP-worker and CPU times, RSS, populations,
+   DP counters, routes, failures, and artifact hashes. Retain only a repeatable
+   enclosing gain with byte-identical output; otherwise remove the source and
+   test changes.
+
+#### Checkpoint 35 spec update
+
+- None. This checkpoint changes only when an existing intermediate is
+  evaluated; equations, precision, inputs, outputs, and decisions are
+  unchanged.
+
+#### Checkpoint 35 documentation update
+
+- If retained, document the shared local-scorer lazy fallback evaluation and
+  its fiberlet-DP measurement in
+  `volume-cartographer/docs/fiberlets.md`, add a concise changelog entry, and
+  record full measurements in `planning/task_log.md`. If rejected, keep only
+  the experiment result in the active task records.
+
+#### Checkpoint 35 result
+
+- Retained. GCC baseline code generation kept the isotropic `acos` before
+  normal validation, while the candidate partitions it into the two fallback
+  paths; a valid-normal/valid-tangent transition now evaluates one angle rather
+  than two. Candidate Clang code generation also keeps the fallback calls
+  behind their branches.
+- Three counterbalanced uninstrumented QuickBuild pairs reduced median search
+  wall from `1.0368` to `0.9723` seconds (6.2%), search CPU from `32.5708` to
+  `30.5559` seconds (6.2%), DP worker time from `32.7720` to `30.7132` seconds
+  (6.3%), and fiberlet wall from `1.9605` to `1.9091` seconds (2.6%). Median
+  command wall improved from `7.61` to `7.55` seconds (0.8%).
+- All six measured artifacts and the screening artifact had SHA-256
+  `904c39d08e39c6b7b65ac95fd47d28d50e254a33609201c92aef71c6cc131308`,
+  with exact populations, DP counters, routes, and 2 greedy / 1 fiberlet
+  failures.
