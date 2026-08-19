@@ -9,6 +9,7 @@
 
 class VolumePkg;
 namespace vc::project { struct Entry; }
+namespace vc::lasagna { struct LasagnaDatasetManifest; }
 
 namespace vc3d::opendata {
 
@@ -42,6 +43,18 @@ struct ResolvedOpenDataLasagna {
     std::string artifactUrl;
     bool manifestBacked = false;
 };
+
+enum class OpenDataLasagnaDatasetKind {
+    Normal,
+    FiberInference,
+};
+
+// Validates the catalog metadata against the authoritative inner manifest and
+// classifies the dataset by its channel schema. Catalog creation_info is
+// optional; when present, its values must agree with the inner manifest.
+[[nodiscard]] OpenDataLasagnaDatasetKind validateOpenDataLasagnaManifest(
+    const OpenDataLasagnaInfo& info,
+    const vc::lasagna::LasagnaDatasetManifest& manifest);
 
 // Returns the public manifest URL for a catalogue-backed entry and the stored
 // project location for an ordinary entry.
