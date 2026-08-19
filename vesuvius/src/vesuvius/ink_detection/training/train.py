@@ -186,6 +186,12 @@ def prepare_loss_inputs(
     return predictions, targets, ignore_mask
 
 
+def prepare_validation_loss_inputs(predictions, batch, *, mode: str):
+    """Prepare stored validation labels without relaxing their supervision mask."""
+
+    return prepare_loss_inputs(predictions, batch, mode=mode)
+
+
 def apply_dynamic_label_substitution(batch, generator, *, kind: str) -> None:
     """Replace training labels while keeping stored validation labels untouched."""
 
@@ -993,11 +999,10 @@ def _run_training(request: TrainingRequest) -> int:
                         val_loss_predictions,
                         val_targets,
                         val_ignore,
-                    ) = prepare_loss_inputs(
+                    ) = prepare_validation_loss_inputs(
                         val_predictions,
                         val_batch,
                         mode=config.ink.data.mode,
-                        force_full_supervision=config.force_full_supervision,
                     )
                     primary_val_predictions = (
                         val_loss_predictions[0]
@@ -1069,11 +1074,12 @@ def _run_training(request: TrainingRequest) -> int:
                                     config.stitched_gradient_checkpointing
                                 ),
                             )
-                        ema_loss_predictions, _, _ = prepare_loss_inputs(
-                            ema_predictions,
-                            val_batch,
-                            mode=config.ink.data.mode,
-                            force_full_supervision=config.force_full_supervision,
+                        ema_loss_predictions, _, _ = (
+                            prepare_validation_loss_inputs(
+                                ema_predictions,
+                                val_batch,
+                                mode=config.ink.data.mode,
+                            )
                         )
                         ema_targets_with_ignore = (
                             concatenate_deep_supervision_ignore(
