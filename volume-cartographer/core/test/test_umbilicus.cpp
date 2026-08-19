@@ -313,6 +313,7 @@ TEST_CASE("LoadFileInfo: stamped file reports every metadata field")
     const auto info = Umbilicus::LoadFileInfo(path);
     REQUIRE(info.controlPoints.size() == 2);
     CHECK(info.controlPoints[0] == cv::Vec3f(10.0f, 20.0f, 5.0f));
+    CHECK(info.metadataErrors.empty());
     REQUIRE(info.voxelsizeUm.has_value());
     CHECK(*info.voxelsizeUm == doctest::Approx(9.6));
     REQUIRE(info.volume.has_value());
@@ -342,6 +343,7 @@ TEST_CASE("LoadFileInfo: metadata without frame keys leaves every field unset")
     CHECK_FALSE(info.volumeHeight.has_value());
     CHECK_FALSE(info.volumeSlices.has_value());
     // A field nobody declared is legal, not an error.
+    CHECK(info.metadataErrors.empty());
 
     fs::remove(path);
 }
@@ -359,6 +361,7 @@ TEST_CASE("LoadFileInfo: bare-array json parses points with no metadata")
     CHECK_FALSE(info.volumeWidth.has_value());
     CHECK_FALSE(info.volumeHeight.has_value());
     CHECK_FALSE(info.volumeSlices.has_value());
+    CHECK(info.metadataErrors.empty());
 
     fs::remove(path);
 }
@@ -375,7 +378,287 @@ TEST_CASE("LoadFileInfo: text file parses points with no metadata")
     CHECK_FALSE(info.volumeWidth.has_value());
     CHECK_FALSE(info.volumeHeight.has_value());
     CHECK_FALSE(info.volumeSlices.has_value());
+    CHECK(info.metadataErrors.empty());
 
     fs::remove(path);
 }
 
+TEST_CASE("LoadFileInfo: an incomplete dimension triplet is malformed, not absent")
+{
+    const std::string points =
+        R"("control_points": [{"x": 1, "y": 2, "z": 3, "score": 100}]})";
+
+    SUBCASE("two of three declares nothing and says so")
+    {
+        const auto path = tmpFile("info_partial_dims", ".json");
+        writeFile(path,
+                  R"({"metadata": {"volume_width": 8174, "volume_slices": 18946},)"
+                      + points);
+
+        const auto info = Umbilicus::LoadFileInfo(path);
+        // Points still parse: a caller wanting only the polyline must not lose its
+        // umbilicus over a frame field it never reads.
+        CHECK(info.controlPoints.size() == 1);
+        REQUIRE(info.metadataErrors.size() == 1);
+        CHECK(info.metadataErrors[0] ==
+              "volume dimensions: an incomplete triplet declares nothing; "
+              "missing volume_height");
+        fs::remove(path);
+    }
+
+    SUBCASE("one of three names both absent keys")
+    {
+        const auto path = tmpFile("info_one_dim", ".json");
+        writeFile(path, R"({"metadata": {"volume_height": 8174},)" + points);
+
+        const auto info = Umbilicus::LoadFileInfo(path);
+        REQUIRE(info.metadataErrors.size() == 1);
+        CHECK(info.metadataErrors[0] ==
+              "volume dimensions: an incomplete triplet declares nothing; "
+              "missing volume_width, volume_slices");
+        fs::remove(path);
+    }
+
+    SUBCASE("a complete triplet is silent")
+    {
+        const auto path = tmpFile("info_full_dims", ".json");
+        writeFile(path,
+                  R"({"metadata": {"volume_width": 8174, "volume_height": 8174,)"
+                  R"( "volume_slices": 18946},)" + points);
+
+        CHECK(Umbilicus::LoadFileInfo(path).metadataErrors.empty());
+        fs::remove(path);
+    }
+
+    SUBCASE("declaring none of them stays legal and silent")
+    {
+        const auto path = tmpFile("info_no_dims", ".json");
+        writeFile(path, R"({"metadata": {"voxelsize_um": 9.6},)" + points);
+
+        CHECK(Umbilicus::LoadFileInfo(path).metadataErrors.empty());
+        fs::remove(path);
+    }
+
+    SUBCASE("a rejected dimension is blamed once, not twice")
+    {
+        const auto path = tmpFile("info_bad_and_partial", ".json");
+        writeFile(path,
+                  R"({"metadata": {"volume_width": -5, "volume_height": 8174},)"
+                      + points);
+
+        const auto info = Umbilicus::LoadFileInfo(path);
+        REQUIRE(info.metadataErrors.size() == 1);
+        CHECK(info.metadataErrors[0] ==
+              "volume_width: expected a positive integer, got -5");
+        fs::remove(path);
+    }
+}
+
+TEST_CASE("LoadFileInfo: a malformed field only costs that field")
+{
+    const std::string points =
+        R"("control_points": [{"x": 1, "y": 2, "z": 3, "score": 100}]})";
+
+    SUBCASE("malformed voxelsize_um")
+    {
+        const auto path = tmpFile("info_bad_voxelsize", ".json");
+        writeFile(path,
+                  R"({"metadata": {"voxelsize_um": "nine point six",)"
+                  R"( "volume": "scroll.zarr", "volume_width": 8174,)"
+                  R"( "volume_height": 8174, "volume_slices": 18946},)" + points);
+
+        const auto info = Umbilicus::LoadFileInfo(path);
+        CHECK_FALSE(info.voxelsizeUm.has_value());
+        CHECK(info.volume.value_or("") == "scroll.zarr");
+        CHECK(info.volumeWidth.value_or(-1) == 8174);
+        REQUIRE(info.metadataErrors.size() == 1);
+        CHECK(info.metadataErrors[0] ==
+              R"(voxelsize_um: expected a positive number, got "nine point six")");
+        fs::remove(path);
+    }
+
+    SUBCASE("non-positive voxelsize_um")
+    {
+        const auto path = tmpFile("info_zero_voxelsize", ".json");
+        writeFile(path,
+                  R"({"metadata": {"voxelsize_um": 0, "volume_width": 8174,)"
+                  R"( "volume_height": 8174, "volume_slices": 18946},)" + points);
+
+        const auto info = Umbilicus::LoadFileInfo(path);
+        CHECK_FALSE(info.voxelsizeUm.has_value());
+        CHECK(info.volumeSlices.value_or(-1) == 18946);
+        REQUIRE(info.metadataErrors.size() == 1);
+        CHECK(info.metadataErrors[0] ==
+              "voxelsize_um: expected a positive number, got 0");
+        fs::remove(path);
+    }
+
+    SUBCASE("malformed volume")
+    {
+        const auto path = tmpFile("info_bad_volume", ".json");
+        writeFile(path,
+                  R"({"metadata": {"voxelsize_um": 2.4, "volume": 7,)"
+                  R"( "volume_width": 8174, "volume_height": 8174,)"
+                  R"( "volume_slices": 18946},)" + points);
+
+        const auto info = Umbilicus::LoadFileInfo(path);
+        CHECK(info.voxelsizeUm.value_or(0.0) == doctest::Approx(2.4));
+        CHECK_FALSE(info.volume.has_value());
+        CHECK(info.volumeHeight.value_or(-1) == 8174);
+        REQUIRE(info.metadataErrors.size() == 1);
+        CHECK(info.metadataErrors[0] ==
+              "volume: expected a non-empty string, got 7");
+        fs::remove(path);
+    }
+
+    SUBCASE("empty volume")
+    {
+        const auto path = tmpFile("info_empty_volume", ".json");
+        writeFile(path,
+                  R"({"metadata": {"volume": "", "volume_width": 8174,)"
+                  R"( "volume_height": 8174, "volume_slices": 18946},)" + points);
+
+        const auto info = Umbilicus::LoadFileInfo(path);
+        CHECK_FALSE(info.volume.has_value());
+        CHECK(info.volumeWidth.value_or(-1) == 8174);
+        REQUIRE(info.metadataErrors.size() == 1);
+        CHECK(info.metadataErrors[0] ==
+              R"(volume: expected a non-empty string, got "")");
+        fs::remove(path);
+    }
+
+    SUBCASE("negative volume_width")
+    {
+        const auto path = tmpFile("info_bad_width", ".json");
+        writeFile(path,
+                  R"({"metadata": {"voxelsize_um": 2.4,)"
+                  R"( "volume": "scroll.zarr", "volume_width": -5,)"
+                  R"( "volume_height": 8174, "volume_slices": 18946},)" + points);
+
+        const auto info = Umbilicus::LoadFileInfo(path);
+        CHECK(info.voxelsizeUm.value_or(0.0) == doctest::Approx(2.4));
+        CHECK(info.volume.value_or("") == "scroll.zarr");
+        CHECK_FALSE(info.volumeWidth.has_value());
+        CHECK(info.volumeHeight.value_or(-1) == 8174);
+        CHECK(info.volumeSlices.value_or(-1) == 18946);
+        REQUIRE(info.metadataErrors.size() == 1);
+        CHECK(info.metadataErrors[0] ==
+              "volume_width: expected a positive integer, got -5");
+        fs::remove(path);
+    }
+
+    SUBCASE("non-integer volume_height")
+    {
+        const auto path = tmpFile("info_bad_height", ".json");
+        writeFile(path,
+                  R"({"metadata": {"voxelsize_um": 2.4,)"
+                  R"( "volume": "scroll.zarr", "volume_width": 8174,)"
+                  R"( "volume_height": 8174.5, "volume_slices": 18946},)" + points);
+
+        const auto info = Umbilicus::LoadFileInfo(path);
+        CHECK(info.volumeWidth.value_or(-1) == 8174);
+        CHECK_FALSE(info.volumeHeight.has_value());
+        CHECK(info.volumeSlices.value_or(-1) == 18946);
+        REQUIRE(info.metadataErrors.size() == 1);
+        CHECK(info.metadataErrors[0].rfind(
+                  "volume_height: expected a positive integer, got ", 0) == 0);
+        fs::remove(path);
+    }
+
+    SUBCASE("zero volume_slices")
+    {
+        const auto path = tmpFile("info_bad_slices", ".json");
+        writeFile(path,
+                  R"({"metadata": {"voxelsize_um": 2.4,)"
+                  R"( "volume": "scroll.zarr", "volume_width": 8174,)"
+                  R"( "volume_height": 8174, "volume_slices": 0},)" + points);
+
+        const auto info = Umbilicus::LoadFileInfo(path);
+        CHECK(info.volumeWidth.value_or(-1) == 8174);
+        CHECK(info.volumeHeight.value_or(-1) == 8174);
+        CHECK_FALSE(info.volumeSlices.has_value());
+        REQUIRE(info.metadataErrors.size() == 1);
+        CHECK(info.metadataErrors[0] ==
+              "volume_slices: expected a positive integer, got 0");
+        fs::remove(path);
+    }
+
+    SUBCASE("metadata is not an object")
+    {
+        const auto path = tmpFile("info_bad_metadata", ".json");
+        writeFile(path, R"({"metadata": "nope", )" + points);
+
+        const auto info = Umbilicus::LoadFileInfo(path);
+        CHECK_FALSE(info.voxelsizeUm.has_value());
+        CHECK_FALSE(info.volume.has_value());
+        CHECK_FALSE(info.volumeWidth.has_value());
+        CHECK_FALSE(info.volumeHeight.has_value());
+        CHECK_FALSE(info.volumeSlices.has_value());
+        // The block is blamed as a whole: read as legacy it would let a
+        // consumer guess the frame, which is what these errors prevent.
+        REQUIRE(info.metadataErrors.size() == 1);
+        CHECK(info.metadataErrors[0] == "metadata: expected an object, got \"nope\"");
+        fs::remove(path);
+    }
+
+    SUBCASE("metadata of any non-object type is malformed")
+    {
+        for (const char* value : {"3", "[1,2]", "true"}) {
+            const auto path = tmpFile("info_metadata_type", ".json");
+            writeFile(path, std::string(R"({"metadata": )") + value + ", " + points);
+
+            const auto info = Umbilicus::LoadFileInfo(path);
+            REQUIRE(info.metadataErrors.size() == 1);
+            CHECK(info.metadataErrors[0].rfind("metadata: expected an object", 0) == 0);
+            CHECK(info.controlPoints.size() == 1);
+            fs::remove(path);
+        }
+    }
+
+    SUBCASE("metadata null means the same as leaving it out")
+    {
+        const auto path = tmpFile("info_metadata_null", ".json");
+        writeFile(path, R"({"metadata": null, )" + points);
+
+        const auto info = Umbilicus::LoadFileInfo(path);
+        CHECK(info.metadataErrors.empty());
+        CHECK_FALSE(info.voxelsizeUm.has_value());
+        CHECK(info.controlPoints.size() == 1);
+        fs::remove(path);
+    }
+}
+
+TEST_CASE("LoadFileInfo: every malformed field is reported, points still load")
+{
+    const auto path = tmpFile("info_all_bad", ".json");
+    writeFile(path,
+              R"({"metadata": {"voxelsize_um": 0, "volume": "",)"
+              R"( "volume_width": -5, "volume_height": "8174",)"
+              R"( "volume_slices": false},)"
+              R"("control_points": [{"x": 1, "y": 2, "z": 3, "score": 100},)"
+              R"({"x": 4, "y": 5, "z": 6, "score": 100}]})");
+
+    const auto info = Umbilicus::LoadFileInfo(path);
+    // Point-only consumers must not lose their umbilicus over frame fields.
+    REQUIRE(info.controlPoints.size() == 2);
+    CHECK(info.controlPoints[0] == cv::Vec3f(1.0f, 2.0f, 3.0f));
+    CHECK_FALSE(info.voxelsizeUm.has_value());
+    CHECK_FALSE(info.volume.has_value());
+    CHECK_FALSE(info.volumeWidth.has_value());
+    CHECK_FALSE(info.volumeHeight.has_value());
+    CHECK_FALSE(info.volumeSlices.has_value());
+
+    REQUIRE(info.metadataErrors.size() == 5);
+    CHECK(info.metadataErrors[0] ==
+          "voxelsize_um: expected a positive number, got 0");
+    CHECK(info.metadataErrors[1] ==
+          R"(volume: expected a non-empty string, got "")");
+    CHECK(info.metadataErrors[2] ==
+          "volume_width: expected a positive integer, got -5");
+    CHECK(info.metadataErrors[3] ==
+          R"(volume_height: expected a positive integer, got "8174")");
+    CHECK(info.metadataErrors[4] ==
+          "volume_slices: expected a positive integer, got false");
+
+    fs::remove(path);
+}
