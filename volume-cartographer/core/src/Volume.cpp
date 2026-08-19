@@ -1737,8 +1737,18 @@ std::string Volume::chunkCacheSourceIdentity() const
     if (isRemote_) {
         const auto normalized = vc::core::util::remoteFileCacheSource(
             vc::core::util::normalizeRemoteFileLocation(remoteUrl_));
-        return "remote|" + normalized +
-               "|base=" + std::to_string(baseScaleLevel_);
+        std::string identity = "remote|" + normalized +
+            "|base=" + std::to_string(baseScaleLevel_);
+        auto persistentPath = remotePersistentCachePath();
+        if (!persistentPath.empty()) {
+            std::error_code ec;
+            const auto absolute = std::filesystem::absolute(persistentPath, ec);
+            if (!ec)
+                persistentPath = absolute;
+            identity += "|cache=" +
+                persistentPath.lexically_normal().generic_string();
+        }
+        return identity;
     }
     if (preparedSourceFactory_) {
         return "prepared|" + id() + "|instance=" +

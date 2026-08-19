@@ -678,7 +678,7 @@ struct ChunkCacheService::Impl {
         }
         fetchScheduler = std::make_shared<ChunkRequestScheduler>(
             workerCapacity, 7, schedulerSelectionGate,
-            adaptiveOptions, initialState);
+            adaptiveOptions, initialState, 1);
         if (!activeFetchAdaptive) {
             fetchScheduler->configureConcurrency(activeFetchWorkers);
         }
@@ -2278,8 +2278,25 @@ ChunkCache::PersistentRequestResult ChunkCache::persistChunkBlocking(
                                 state->storageObjectTransfers_.find(objectKey);
                             transfer != state->storageObjectTransfers_.end()) {
                             transfer->second.refreshRequested = true;
+                            reprioritizeStorageObjectTransferLocked(
+                                *state, transfer->second);
                         }
                     }
+                } else if (auto transfer = state->sourceTransfers_.find(key);
+                           transfer != state->sourceTransfers_.end()) {
+                    ChunkWorkPriority priority;
+                    if (transfer->second.decodeRequested) {
+                        if (const auto entry = state->entries_.find(key);
+                            entry != state->entries_.end()) {
+                            priority = workPriorityLocked(
+                                *state, key, entry->second);
+                        }
+                    } else {
+                        priority.maintenance = true;
+                    }
+                    if (auto scheduler = state->fetchScheduler_.lock())
+                        scheduler->reprioritize(
+                            transfer->second.taskId, priority);
                 }
             }
         } else {
@@ -2431,22 +2448,26 @@ void ChunkCache::completePersistenceOperation(
     const std::shared_ptr<PersistenceOperation>& operation,
     PersistentRequestResult result)
 {
+    std::vector<FetchContext> foregroundWaiters;
     {
         std::lock_guard lock(state->mutex_);
+        {
+            std::lock_guard operationLock(operation->mutex);
+            if (operation->completed)
+                return;
+            operation->result = std::move(result);
+            operation->completed = true;
+        }
         const auto current = state->persistenceOperations_.find(key);
         if (current != state->persistenceOperations_.end() &&
             current->second == operation) {
             state->persistenceOperations_.erase(current);
         }
-    }
-    {
-        std::lock_guard lock(operation->mutex);
-        if (operation->completed)
-            return;
-        operation->result = std::move(result);
-        operation->completed = true;
+        foregroundWaiters = std::move(operation->foregroundWaiters);
     }
     operation->cv.notify_all();
+    for (auto& context : foregroundWaiters)
+        probePersistentAndDispatch(state, key, std::move(context));
 }
 
 ChunkResult ChunkCache::resultFromEntryLocked(
@@ -2618,6 +2639,7 @@ ChunkWorkPriority ChunkCache::storageObjectPriorityLocked(
         }
     }
     best.maintenance = !have;
+    best.reserveForegroundSlot = best.maintenance && !transfer.refreshRequested;
     return best;
 }
 
@@ -2761,6 +2783,8 @@ bool ChunkCache::cancelUndemandedEntryLocked(State& state,
         entry.fetchTaskId = 0;
         ChunkWorkPriority priority;
         priority.maintenance = true;
+        if (const auto operation = transfer->second.persistence.lock())
+            priority.reserveForegroundSlot = !operation->refresh;
         if (auto scheduler = state.fetchScheduler_.lock())
             scheduler->reprioritize(sourceTaskId, priority);
     } else {
@@ -2872,6 +2896,7 @@ void ChunkCache::probePersistentAndDispatch(const std::shared_ptr<State>& state,
                                             ChunkKey key,
                                             FetchContext context)
 {
+    bool waitingForPersistence = false;
     {
         std::lock_guard lock(state->mutex_);
         if (context.generation != state->generation_ ||
@@ -2884,7 +2909,16 @@ void ChunkCache::probePersistentAndDispatch(const std::shared_ptr<State>& state,
             return;
         }
         it->second.probeTaskId = 0;
+        if (state->persistentLayout_ == PersistentCacheLayout::Delta3d) {
+            if (auto operation = state->persistenceOperations_.find(key);
+                operation != state->persistenceOperations_.end()) {
+                operation->second->foregroundWaiters.push_back(context);
+                waitingForPersistence = true;
+            }
+        }
     }
+    if (waitingForPersistence)
+        return;
 
     PersistentProbeResult probe;
     try {
@@ -2914,6 +2948,7 @@ void ChunkCache::queueRemoteFetch(const std::shared_ptr<State>& state,
 {
     bool pruned = false;
     bool remoteStart = false;
+    bool waitingForPersistence = false;
     state->schedulerSelectionGate_->publish([&] {
         std::lock_guard lock(state->mutex_);
         auto it = state->entries_.find(key);
@@ -2928,6 +2963,14 @@ void ChunkCache::queueRemoteFetch(const std::shared_ptr<State>& state,
             pruned = true;
             return;
         }
+        if (state->persistentLayout_ == PersistentCacheLayout::Delta3d) {
+            if (auto operation = state->persistenceOperations_.find(key);
+                operation != state->persistenceOperations_.end()) {
+                operation->second->foregroundWaiters.push_back(context);
+                waitingForPersistence = true;
+                return;
+            }
+        }
         if (state->persistentLayout_ == PersistentCacheLayout::ZarrMirror) {
             remoteStart = joinStorageObjectTransferLocked(
                 state, key, context, true, {});
@@ -2937,7 +2980,7 @@ void ChunkCache::queueRemoteFetch(const std::shared_ptr<State>& state,
     });
     if (remoteStart)
         notifyRemoteFetchListeners(state, key, true);
-    if (pruned)
+    if (pruned || waitingForPersistence)
         state->cv_.notify_all();
 }
 
@@ -2975,6 +3018,8 @@ void ChunkCache::joinSourceTransferLocked(
                 priority = workPriorityLocked(*state, key, entry->second);
         } else {
             priority.maintenance = true;
+            if (const auto operation = transfer.persistence.lock())
+                priority.reserveForegroundSlot = !operation->refresh;
         }
         scheduler->reprioritize(transfer.taskId, priority);
         return;
@@ -3001,6 +3046,7 @@ void ChunkCache::joinSourceTransferLocked(
         }
     } else {
         priority.maintenance = true;
+        priority.reserveForegroundSlot = persistence && !persistence->refresh;
     }
     if (persistence)
         persistence->sourceTaskId = transfer.taskId;

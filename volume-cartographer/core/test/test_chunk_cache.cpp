@@ -2225,6 +2225,89 @@ TEST_CASE("ChunkRequestScheduler runs maintenance after interactive and backgrou
     CHECK(order == std::vector<int>{1, 4, 3, 2});
 }
 
+TEST_CASE("ChunkRequestScheduler reserves fetch admission from maintenance work")
+{
+    ChunkRequestScheduler scheduler(2, 7, {}, {}, {}, 1);
+    ChunkWorkPriority maintenance;
+    maintenance.maintenance = true;
+    maintenance.reserveForegroundSlot = true;
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool releaseMaintenance = false;
+    std::atomic<int> maintenanceStarted{0};
+    std::latch firstMaintenanceStarted{1};
+    auto maintenanceTask = [&] {
+        ++maintenanceStarted;
+        firstMaintenanceStarted.count_down();
+        std::unique_lock lock(mutex);
+        cv.wait(lock, [&] { return releaseMaintenance; });
+    };
+
+    scheduler.submit(1, maintenance, 1, 0, maintenanceTask);
+    scheduler.submit(2, maintenance, 1, 0, maintenanceTask);
+    firstMaintenanceStarted.wait();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    CHECK(maintenanceStarted.load() == 1);
+
+    std::promise<void> interactiveStarted;
+    auto interactiveFuture = interactiveStarted.get_future();
+    ChunkWorkPriority interactive;
+    interactive.interactive = true;
+    scheduler.submit(3, interactive, 1, 0, [&] {
+        interactiveStarted.set_value();
+    });
+    CHECK(interactiveFuture.wait_for(std::chrono::seconds(1)) ==
+          std::future_status::ready);
+
+    std::promise<void> refreshStarted;
+    auto refreshFuture = refreshStarted.get_future();
+    ChunkWorkPriority refresh;
+    refresh.maintenance = true;
+    scheduler.submit(4, refresh, 1, 0, [&] {
+        refreshStarted.set_value();
+    });
+    CHECK(refreshFuture.wait_for(std::chrono::seconds(1)) ==
+          std::future_status::ready);
+
+    {
+        std::lock_guard lock(mutex);
+        releaseMaintenance = true;
+    }
+    cv.notify_all();
+    scheduler.waitIdle();
+    CHECK(maintenanceStarted.load() == 2);
+}
+
+TEST_CASE("ChunkRequestScheduler reservation preserves ordinary admission")
+{
+    ChunkRequestScheduler scheduler(2, 7, {}, {}, {}, 1);
+    std::atomic<int> started{0};
+    std::promise<void> bothStarted;
+    auto bothStartedFuture = bothStarted.get_future();
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool release = false;
+    auto task = [&] {
+        if (++started == 2)
+            bothStarted.set_value();
+        std::unique_lock lock(mutex);
+        cv.wait(lock, [&] { return release; });
+    };
+
+    scheduler.submit(1, {}, 1, 0, task);
+    scheduler.submit(2, {}, 1, 0, task);
+    CHECK(bothStartedFuture.wait_for(std::chrono::seconds(1)) ==
+          std::future_status::ready);
+
+    {
+        std::lock_guard lock(mutex);
+        release = true;
+    }
+    cv.notify_all();
+    scheduler.waitIdle();
+}
+
 TEST_CASE("ChunkRequestScheduler orders level then active view then distance")
 {
     ChunkRequestScheduler scheduler(1);

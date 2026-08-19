@@ -355,6 +355,15 @@ private:
         std::list<ChunkKey>::iterator lruIt;
     };
 
+    struct FetchContext {
+        std::uint64_t generation = 0;
+        std::uint64_t fetcherGeneration = 0;
+        std::uint64_t fetchSerial = 0;
+        std::uint64_t schedulerEpoch = 0;
+        std::shared_ptr<IChunkFetcher> fetcher;
+        std::shared_ptr<ChunkRequestScheduler> fetchScheduler;
+    };
+
     struct PersistenceOperation {
         mutable std::mutex mutex;
         std::condition_variable cv;
@@ -364,6 +373,10 @@ private:
         std::atomic_bool writeQueued{false};
         std::uint64_t probeTaskId = 0;
         std::uint64_t sourceTaskId = 0;
+        // Foreground misses arriving while a maintenance Delta3D operation is
+        // decoding or publishing wait here, then re-probe the completed cache
+        // entry instead of issuing a duplicate source request.
+        std::vector<FetchContext> foregroundWaiters;
     };
 
     struct SourceTransfer {
@@ -519,15 +532,6 @@ private:
         std::shared_ptr<void> persistentLease_;
         std::string persistentCacheWarning_;
 
-    };
-
-    struct FetchContext {
-        std::uint64_t generation = 0;
-        std::uint64_t fetcherGeneration = 0;
-        std::uint64_t fetchSerial = 0;
-        std::uint64_t schedulerEpoch = 0;
-        std::shared_ptr<IChunkFetcher> fetcher;
-        std::shared_ptr<ChunkRequestScheduler> fetchScheduler;
     };
 
     static ChunkResult resultFromEntryLocked(

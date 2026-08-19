@@ -162,6 +162,46 @@ private:
     bool fetchReleased_ = false;
 };
 
+class BlockingMaintenanceDecodeFetcher final : public CountingFetcher {
+public:
+    ChunkFetchResult decodeFetched(
+        const ChunkKey&, ChunkFetchResult fetched) const override
+    {
+        ++decodeCalls;
+        {
+            std::lock_guard lock(mutex_);
+            decodeEntered_ = true;
+        }
+        cv_.notify_all();
+        std::unique_lock lock(mutex_);
+        cv_.wait(lock, [&] { return decodeReleased_; });
+        return fetched;
+    }
+
+    void waitForDecode()
+    {
+        std::unique_lock lock(mutex_);
+        cv_.wait(lock, [&] { return decodeEntered_; });
+    }
+
+    void releaseDecode()
+    {
+        {
+            std::lock_guard lock(mutex_);
+            decodeReleased_ = true;
+        }
+        cv_.notify_all();
+    }
+
+    mutable std::atomic<int> decodeCalls{0};
+
+private:
+    mutable std::mutex mutex_;
+    mutable std::condition_variable cv_;
+    mutable bool decodeEntered_ = false;
+    mutable bool decodeReleased_ = false;
+};
+
 fs::path tmpDir(const std::string& tag)
 {
     std::mt19937_64 rng(std::random_device{}());
@@ -879,6 +919,45 @@ TEST_CASE("Delta3D foreground and persistence requests share one source decode")
     CHECK(fetcher->fetchCalls.load() == 1);
     CHECK(fetcher->decodeCalls.load() == 1);
     CHECK(fs::is_regular_file(persist / "0" / "0.0.0"));
+
+    cache.reset();
+    fs::remove_all(persist);
+}
+
+TEST_CASE("Delta3D foreground waits for maintenance publication without refetching")
+{
+    auto persist = tmpDir("delta3d_publication_join");
+    auto fetcher = std::make_shared<BlockingMaintenanceDecodeFetcher>();
+    ChunkFetchResult fetched;
+    fetched.status = ChunkFetchStatus::Found;
+    fetched.bytes = variedBytes(64);
+    fetcher->setCanned({0, 0, 0, 0}, fetched);
+    auto cache = makeDelta3dCache(fetcher, persist);
+
+    auto persisted = std::async(std::launch::async, [&] {
+        return cache->persistChunkBlocking(0, 0, 0, 0);
+    });
+    fetcher->waitForDecode();
+    REQUIRE(fetcher->fetchCalls.load() == 1);
+
+    auto rendered = std::async(std::launch::async, [&] {
+        return cache->getChunkBlocking(0, 0, 0, 0);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK(fetcher->fetchCalls.load() == 1);
+    CHECK(rendered.wait_for(std::chrono::milliseconds(0)) ==
+          std::future_status::timeout);
+
+    fetcher->releaseDecode();
+    REQUIRE(persisted.wait_for(std::chrono::seconds(2)) ==
+            std::future_status::ready);
+    REQUIRE(rendered.wait_for(std::chrono::seconds(2)) ==
+            std::future_status::ready);
+    CHECK(persisted.get().status ==
+          ChunkCache::PersistentRequestStatus::Data);
+    CHECK(rendered.get().status == ChunkStatus::Data);
+    CHECK(fetcher->fetchCalls.load() == 1);
+    CHECK(fetcher->decodeCalls.load() == 1);
 
     cache.reset();
     fs::remove_all(persist);
