@@ -239,10 +239,88 @@ TEST_CASE("OpenDataManifest parses Lasagna as a distinct typed artifact")
     CHECK(artifacts.front().sourceToBase == doctest::Approx(1.0));
     CHECK(artifacts.front().baseShapeZYX == volume.shapeZYX);
 
+    const auto inner = vc::lasagna::LasagnaDatasetManifest::parseText(R"({
+      "version":2,
+      "source_to_base":1.0,
+      "base_shape_zyx":[100,200,300],
+      "groups":{
+        "grad_mag":{"zarr":"grad_mag.zarr","channels":["grad_mag"]},
+        "nx":{"zarr":"nx.zarr","channels":["nx"]},
+        "ny":{"zarr":"ny.zarr","channels":["ny"]}
+      }
+    })");
+    CHECK(validateOpenDataLasagnaManifest(artifacts.front(), inner) ==
+          OpenDataLasagnaDatasetKind::Normal);
+
     auto missingLevelVolume = volume;
     missingLevelVolume.artifacts.front().levelParameterPresent = false;
     missingLevelVolume.artifacts.front().sourceCoordinateLevel.reset();
     CHECK(lasagnaArtifacts(sample.id, missingLevelVolume).empty());
+}
+
+TEST_CASE("Open-data fiber Lasagna accepts authoritative inner metadata")
+{
+    const auto manifest = parseOpenDataManifest(R"({
+      "metadata":{"samples":{"PHercParis4":{"volumes":{"20260411134726":{
+        "properties":{"shape":[75784,32693,32693]},
+        "data":[{
+          "type":"lasagna",
+          "parameters":{"model_id":"20260801084232","level":1},
+          "creation_info":null,
+          "origins":[{"path":"PHercParis4/representations/predictions/fibers/run/",
+            "access_roots":[{"type":"s3","url":"s3://vesuvius-challenge-open-data/",
+              "usage":"public-read"}]}]
+        }]
+      }}}}}
+    })");
+    const auto& volume = manifest.samples.front().volumes.front();
+    const auto infos = lasagnaArtifacts("PHercParis4", volume);
+    REQUIRE(infos.size() == 1);
+    CHECK_FALSE(infos.front().lasagnaVersionPresent);
+    CHECK_FALSE(infos.front().sourceToBasePresent);
+
+    const auto inner = vc::lasagna::LasagnaDatasetManifest::parseText(R"({
+      "version":2,
+      "source_to_base":1.0,
+      "base_shape_zyx":[75784,32694,32694],
+      "groups":{
+        "presence":{"zarr":"presence.zarr/3","scaledown":3,"channels":["presence"]},
+        "nx":{"zarr":"nx.zarr/3","scaledown":3,"channels":["nx"]},
+        "ny":{"zarr":"ny.zarr/3","scaledown":3,"channels":["ny"]}
+      }
+    })");
+    CHECK(validateOpenDataLasagnaManifest(infos.front(), inner) ==
+          OpenDataLasagnaDatasetKind::FiberInference);
+}
+
+TEST_CASE("Open-data Lasagna still rejects incompatible inner metadata")
+{
+    OpenDataLasagnaInfo info;
+    info.levelWasExplicit = true;
+    info.sourceCoordinateLevel = 1;
+    info.baseShapeZYX = std::array<std::size_t, 3>{100, 200, 300};
+
+    const auto wrongShape = vc::lasagna::LasagnaDatasetManifest::parseText(R"({
+      "version":2,
+      "source_to_base":1.0,
+      "base_shape_zyx":[100,202,300],
+      "groups":{
+        "presence":{"zarr":"presence.zarr","channels":["presence"]},
+        "nx":{"zarr":"nx.zarr","channels":["nx"]},
+        "ny":{"zarr":"ny.zarr","channels":["ny"]}
+      }
+    })");
+    CHECK_THROWS_WITH_AS(
+        validateOpenDataLasagnaManifest(info, wrongShape),
+        doctest::Contains("base_shape_zyx"),
+        std::runtime_error);
+
+    info.baseShapeZYX = std::array<std::size_t, 3>{100, 202, 300};
+    info.lasagnaVersionPresent = true;
+    CHECK_THROWS_WITH_AS(
+        validateOpenDataLasagnaManifest(info, wrongShape),
+        doctest::Contains("lasagna_version"),
+        std::runtime_error);
 }
 
 TEST_CASE("Open-data Lasagna attachment handles level artifacts independently")
