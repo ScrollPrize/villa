@@ -1762,6 +1762,15 @@ class ExplicitInitializationTests(HttpServiceFixture):
             body={"command_id": "initialize-2"})
         self.assertEqual(duplicate, 409, payload)
 
+    def test_initialize_route_rejects_non_mapping_advanced_config(self):
+        status, payload, _ = self.request(
+            "POST", "/session/initialize",
+            body={"command_id": "initialize-malformed",
+                  "run": {"z_begin": 0, "z_end": 10, "config": 1}})
+        self.assertEqual(status, 400, payload)
+        self.assertIn("Malformed session request",
+                      json.loads(payload)["error"])
+
     def test_rebuild_before_initialization_is_rejected(self):
         status, payload, _ = self.request(
             "POST", "/session/rebuild",

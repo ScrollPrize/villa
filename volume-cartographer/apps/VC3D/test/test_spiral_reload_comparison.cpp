@@ -40,6 +40,28 @@ private slots:
             true, QStringLiteral("Uninitialized"), false));
     }
 
+    void CheckpointLoadAdoptsOnlyTheCanonicalCheckpointPath()
+    {
+        const QJsonObject loaded{
+            {"paths", QJsonObject{{"checkpoint", "/checkpoints/old.ckpt"}}},
+            {"run", QJsonObject{{"z_begin", 4000}, {"z_end", 17000}}},
+        };
+        QJsonObject edited = loaded;
+        edited["run"] = QJsonObject{{"z_begin", 5000}, {"z_end", 17000}};
+        edited["paths"] = QJsonObject{
+            {"checkpoint", "/checkpoints/new.ckpt"}};
+
+        const QJsonObject adopted =
+            vc3d::spiralSessionRequestWithCheckpoint(
+                loaded, QStringLiteral("/checkpoints/new.ckpt"));
+
+        QCOMPARE(adopted["paths"].toObject()["checkpoint"].toString(),
+                 QStringLiteral("/checkpoints/new.ckpt"));
+        QCOMPARE(adopted["run"].toObject()["z_begin"].toInt(), 4000);
+        QVERIFY(vc3d::normalizedSpiralReloadRequest(edited, {}, {})
+                != vc3d::normalizedSpiralReloadRequest(adopted, {}, {}));
+    }
+
     void RunConfigurationContainsOnlyRunBoundaryFields()
     {
         const QJsonObject editorConfig{

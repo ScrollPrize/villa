@@ -1224,10 +1224,14 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                 _advancedProfiles->setSessionDefault(_attachedAdvancedConfig);
                 _advancedProfiles->showSessionDefault();
                 _applyingResolution = false;
-                // The successful load is now the canonical resident session,
-                // including its checkpoint path and resolved configuration.
-                _loadedSessionRequest = sessionRequest();
-                _reloadRequired = false;
+                // An in-place load changes only the resident checkpoint state;
+                // it does not apply rebuild-scoped edits currently in the
+                // form. Adopt the canonical checkpoint path without adopting
+                // those pending edits as the session baseline.
+                _loadedSessionRequest =
+                    vc3d::spiralSessionRequestWithCheckpoint(
+                        _loadedSessionRequest, hostPath);
+                refreshReloadRequired();
                 _warnings->setText(
                     tr("Loaded %1 into the resident fit at iteration %2")
                         .arg(hostPath)

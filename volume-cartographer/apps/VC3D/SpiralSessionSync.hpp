@@ -13,13 +13,20 @@ inline bool spiralCheckpointLoadAvailable(
             || sessionState == QStringLiteral("Idle"));
 }
 
-inline QJsonObject spiralCheckpointInitializationRequest(
+inline QJsonObject spiralSessionRequestWithCheckpoint(
     QJsonObject request, const QString& checkpoint)
 {
     QJsonObject paths =
         request.value(QStringLiteral("paths")).toObject();
     paths[QStringLiteral("checkpoint")] = checkpoint;
     request[QStringLiteral("paths")] = paths;
+    return request;
+}
+
+inline QJsonObject spiralCheckpointInitializationRequest(
+    QJsonObject request, const QString& checkpoint)
+{
+    request = spiralSessionRequestWithCheckpoint(request, checkpoint);
 
     // The checkpoint is the durable configuration source. In particular, a
     // profile that happened to be selected before Load must not be layered

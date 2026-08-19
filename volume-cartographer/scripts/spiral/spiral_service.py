@@ -828,25 +828,26 @@ class ServiceState:
 
     def _prepare_session_request(self, request, *, restore_checkpoint_z=False):
         """Validate one session request into the arguments a build needs."""
-        # The scroll specification in the dataset root owns these. A request
-        # that names one is refused rather than quietly overruled by the file.
-        scroll_owned = sorted(
-            key for key in SCROLL_SPEC_OWNED_RUN_KEYS
-            if key in (request.get("run") or {}))
-        if scroll_owned:
-            raise ApiError(
-                HTTPStatus.BAD_REQUEST,
-                f"{SCROLL_SPEC_FILENAME} in the dataset root owns these "
-                "values; the request must not carry them",
-                [{"field": f"run.{key}",
-                  "message": (f"Owned by {SCROLL_SPEC_FILENAME} as "
-                              f"{SCROLL_SPEC_OWNED_RUN_KEYS[key]!r}")}
-                 for key in scroll_owned])
         input_config = None
-        if self.dataset_resolution is not None:
-            request, input_config = self._dataset_session_request(
-                request, include_input_config=True)
         try:
+            # The scroll specification in the dataset root owns these. A
+            # request that names one is refused rather than quietly overruled
+            # by the file.
+            scroll_owned = sorted(
+                key for key in SCROLL_SPEC_OWNED_RUN_KEYS
+                if key in (request.get("run") or {}))
+            if scroll_owned:
+                raise ApiError(
+                    HTTPStatus.BAD_REQUEST,
+                    f"{SCROLL_SPEC_FILENAME} in the dataset root owns these "
+                    "values; the request must not carry them",
+                    [{"field": f"run.{key}",
+                      "message": (f"Owned by {SCROLL_SPEC_FILENAME} as "
+                                  f"{SCROLL_SPEC_OWNED_RUN_KEYS[key]!r}")}
+                     for key in scroll_owned])
+            if self.dataset_resolution is not None:
+                request, input_config = self._dataset_session_request(
+                    request, include_input_config=True)
             paths, run, preview = parse_session_request(request)
         except (KeyError, TypeError, ValueError) as exc:
             # An unparseable request field (an unknown PCL role, say) is the
