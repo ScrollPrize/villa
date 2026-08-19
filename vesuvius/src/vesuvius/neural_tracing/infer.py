@@ -394,7 +394,12 @@ class Inference:
 
         def run_with_tta(model_inputs):
             if self.do_tta:
-                return infer_with_tta(forward, model_inputs, self.tta_type, batched=self.tta_batched)
+                return infer_with_tta(
+                    forward,
+                    model_inputs,
+                    self.tta_type,
+                    use_batched=self.tta_batched,
+                )
             return forward(model_inputs)
 
         with torch.no_grad(), torch.autocast('cuda'):
