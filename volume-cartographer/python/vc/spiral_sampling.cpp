@@ -199,13 +199,38 @@ public:
     {
         if (node_offsets_.empty())
             node_offsets_.push_back(0);
-        for (nb::handle item : masks) {
-            const BoolMatrix mask = nb::cast<BoolMatrix>(item);
-            PatchData patch = build_patch(mask);
-            const uint64_t count = index_size(patch.valid_cells);
-            patches_.push_back(std::move(patch));
-            node_offsets_.push_back(node_offsets_.back() + count);
+        // Casting touches Python objects, so the views are collected under
+        // the GIL; the per-patch builds are pure C++ over the borrowed
+        // buffers and run in parallel with it released.
+        std::vector<BoolMatrix> views;
+        views.reserve(nb::len(masks));
+        for (nb::handle item : masks)
+            views.push_back(nb::cast<BoolMatrix>(item));
+        const size_t base = patches_.size();
+        patches_.resize(base + views.size());
+        bool empty_mask = false;
+        {
+            nb::gil_scoped_release release;
+#pragma omp parallel for schedule(dynamic) reduction(|| : empty_mask)
+            for (int64_t index = 0;
+                 index < static_cast<int64_t>(views.size()); ++index) {
+                PatchData patch;
+                if (!build_patch(views[static_cast<size_t>(index)], patch)) {
+                    empty_mask = true;
+                    continue;
+                }
+                patches_[base + static_cast<size_t>(index)] = std::move(patch);
+            }
         }
+        if (empty_mask) {
+            patches_.resize(base);
+            throw std::runtime_error(
+                "patch sampling mask contains no valid quads");
+        }
+        for (size_t index = base; index < patches_.size(); ++index)
+            node_offsets_.push_back(
+                node_offsets_.back()
+                + index_size(patches_[index].valid_cells));
     }
 
     size_t size() const { return patches_.size(); }
@@ -587,9 +612,11 @@ private:
         return row * patch.rectangle_width + column;
     }
 
-    static PatchData build_patch(BoolMatrix mask)
+    // Pure C++ (no GIL interaction): runs inside the parallel append loop.
+    // Returns false for a mask with no valid quads instead of throwing so the
+    // caller can fail after the parallel region.
+    static bool build_patch(const BoolMatrix& mask, PatchData& patch)
     {
-        PatchData patch;
         patch.height = mask.shape(0);
         patch.width = mask.shape(1);
         std::vector<uint64_t> cells;
@@ -597,36 +624,52 @@ private:
         uint64_t column_hi = 0;
         patch.row_lo = patch.height;
         patch.column_lo = patch.width;
-        {
-            nb::gil_scoped_release release;
-            for (uint64_t row = 0; row < patch.height; ++row) {
-                for (uint64_t column = 0; column < patch.width; ++column) {
-                    if (!mask(row, column))
-                        continue;
-                    cells.push_back(row * patch.width + column);
-                    patch.row_lo = std::min(patch.row_lo, row);
-                    patch.column_lo = std::min(patch.column_lo, column);
-                    row_hi = std::max(row_hi, row + 1);
-                    column_hi = std::max(column_hi, column + 1);
-                }
+        for (uint64_t row = 0; row < patch.height; ++row) {
+            for (uint64_t column = 0; column < patch.width; ++column) {
+                if (!mask(row, column))
+                    continue;
+                cells.push_back(row * patch.width + column);
+                patch.row_lo = std::min(patch.row_lo, row);
+                patch.column_lo = std::min(patch.column_lo, column);
+                row_hi = std::max(row_hi, row + 1);
+                column_hi = std::max(column_hi, column + 1);
             }
-            if (cells.empty())
-                throw std::runtime_error(
-                    "patch sampling mask contains no valid quads");
-            patch.rectangle_width = column_hi - patch.column_lo;
-            patch.rectangular = cells.size()
-                == (row_hi - patch.row_lo) * patch.rectangle_width;
-            const uint64_t maximum = cells.back();
-            patch.valid_cells = compact_indices(std::move(cells), maximum);
-            if (!patch.rectangular)
-                build_ragged_tree(patch);
         }
-        return patch;
+        if (cells.empty())
+            return false;
+        patch.rectangle_width = column_hi - patch.column_lo;
+        patch.rectangular = cells.size()
+            == (row_hi - patch.row_lo) * patch.rectangle_width;
+        const uint64_t maximum = cells.back();
+        patch.valid_cells = compact_indices(std::move(cells), maximum);
+        if (!patch.rectangular)
+            build_ragged_tree(patch);
+        return true;
     }
 
     static void build_ragged_tree(PatchData& patch)
     {
         const size_t count = index_size(patch.valid_cells);
+        // Transient dense linear -> ordinal map: the DFS resolves eight
+        // neighbours per cell, so O(1) lookups beat per-neighbour binary
+        // searches. Freed on return; falls back to searches for the
+        // (unrealistic) case of a grid too large for uint32 ordinals.
+        constexpr uint32_t no_ordinal = std::numeric_limits<uint32_t>::max();
+        const uint64_t area = patch.height * patch.width;
+        std::vector<uint32_t> dense_ordinals;
+        if (area < no_ordinal && count < no_ordinal) {
+            dense_ordinals.assign(static_cast<size_t>(area), no_ordinal);
+            for (size_t ordinal = 0; ordinal < count; ++ordinal)
+                dense_ordinals[index_at(patch.valid_cells, ordinal)] =
+                    static_cast<uint32_t>(ordinal);
+        }
+        auto resolve = [&patch, &dense_ordinals](uint64_t linear) -> uint64_t {
+            if (dense_ordinals.empty())
+                return valid_ordinal(patch, linear);
+            const uint32_t ordinal = dense_ordinals[
+                static_cast<size_t>(linear)];
+            return ordinal == no_ordinal ? missing_index : ordinal;
+        };
         struct Frame {
             uint64_t ordinal;
             uint64_t preorder_position;
@@ -634,7 +677,8 @@ private:
             uint8_t neighbor_count = 0;
             uint8_t next = 0;
         };
-        auto make_frame = [&patch](uint64_t ordinal, uint64_t preorder_position) {
+        auto make_frame = [&patch, &resolve](
+                              uint64_t ordinal, uint64_t preorder_position) {
             Frame frame;
             frame.ordinal = ordinal;
             frame.preorder_position = preorder_position;
@@ -657,7 +701,7 @@ private:
                     continue;
                 const uint64_t next_linear = static_cast<uint64_t>(next_row)
                     * patch.width + static_cast<uint64_t>(next_column);
-                const uint64_t next_ordinal = valid_ordinal(patch, next_linear);
+                const uint64_t next_ordinal = resolve(next_linear);
                 if (next_ordinal != missing_index)
                     frame.neighbors[frame.neighbor_count++] = next_ordinal;
             }
