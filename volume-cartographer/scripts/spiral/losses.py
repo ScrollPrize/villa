@@ -735,16 +735,30 @@ def get_unverified_patch_losses(slice_to_spiral_transform, dr_per_winding, num_p
 
 
 def _pcl_chain_seam_adjustments(crossing_map, dr_per_winding, chain_node_ids):
-    values = []
-    for node_ids in chain_node_ids:
-        edge_ids, directions = crossing_map.resolve_walks(node_ids)
-        edge_ids = edge_ids.to(crossing_map.device)
-        directions = directions.to(crossing_map.device)
+    # All chains are resolved in one edge lookup and reduced with one
+    # integer segmented sum; integer addition makes the result independent
+    # of summation order, so this matches the per-chain reduction exactly.
+    device = crossing_map.device
+    chains = [np.asarray(node_ids, dtype=np.int64).reshape(-1)
+              for node_ids in chain_node_ids]
+    edge_counts = np.fromiter(
+        (max(len(chain) - 1, 0) for chain in chains),
+        dtype=np.int64, count=len(chains))
+    sums = torch.zeros(len(chains), dtype=torch.int32, device=device)
+    if edge_counts.sum():
+        pairs = np.concatenate([
+            np.stack([chain[:-1], chain[1:]], axis=-1)
+            for chain in chains if len(chain) > 1])
+        edge_ids, directions = crossing_map.resolve_edges(pairs)
+        edge_ids = edge_ids.to(device)
+        directions = directions.to(device)
         winding_steps = (
             crossing_map.crossings[edge_ids]
-            * directions.to(crossing_map.crossings.dtype))
-        values.append(winding_steps.to(torch.int32).sum())
-    return torch.stack(values).to(dr_per_winding.dtype) * dr_per_winding.detach()
+            * directions.to(crossing_map.crossings.dtype)).to(torch.int32)
+        row_ids = torch.from_numpy(np.repeat(
+            np.arange(len(chains), dtype=np.int64), edge_counts)).to(device)
+        sums.index_add_(0, row_ids, winding_steps)
+    return sums.to(dr_per_winding.dtype) * dr_per_winding.detach()
 
 
 def _valid_patch_annotation(patches_dict, patch_atlas, pid, i, j):
