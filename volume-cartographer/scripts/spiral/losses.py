@@ -545,7 +545,16 @@ def _pack_walks(walks, crossing_map):
         if walk.connect_fractional_picks:
             correction_node_ids_np[k] = walk_nodes[positions]
 
-    node_ids = torch.as_tensor(node_ids_np, dtype=torch.int64, device=device)
+    edge_ids_np = np.zeros(edge_valid_np.shape, dtype=np.int64)
+    directions_np = np.ones(edge_valid_np.shape, dtype=np.int8)
+    if max_walk_len > 1:
+        pairs_np = np.stack(
+            [node_ids_np[:, :-1], node_ids_np[:, 1:]], axis=-1)
+        resolved, resolved_dir = crossing_map.resolve_edges(
+            pairs_np[edge_valid_np])
+        edge_ids_np[edge_valid_np] = resolved.numpy()
+        directions_np[edge_valid_np] = resolved_dir.numpy()
+
     pick_positions = torch.as_tensor(
         pick_positions_np, dtype=torch.int64, device=device)
     edge_valid = torch.as_tensor(
@@ -557,13 +566,10 @@ def _pack_walks(walks, crossing_map):
     reference_node_ids = torch.as_tensor(
         reference_node_ids_np, dtype=torch.int64, device=device)
 
-    edge_ids = torch.zeros_like(edge_valid, dtype=torch.int64)
-    directions = torch.ones_like(edge_valid, dtype=torch.int8)
-    if max_walk_len > 1:
-        pairs = torch.stack([node_ids[:, :-1], node_ids[:, 1:]], dim=-1)
-        resolved, resolved_dir = crossing_map.resolve_edges(pairs[edge_valid])
-        edge_ids[edge_valid] = resolved
-        directions[edge_valid] = resolved_dir
+    edge_ids = torch.as_tensor(
+        edge_ids_np, dtype=torch.int64, device=device)
+    directions = torch.as_tensor(
+        directions_np, dtype=torch.int8, device=device)
     return PackedWalks(
         edge_ids=edge_ids,
         directions=directions,
@@ -1166,6 +1172,8 @@ def _pcl_chain_seam_adjustments(crossing_map, dr_per_winding, chain_node_ids):
     values = []
     for node_ids in chain_node_ids:
         edge_ids, directions = crossing_map.resolve_walks(node_ids)
+        edge_ids = edge_ids.to(crossing_map.device)
+        directions = directions.to(crossing_map.device)
         winding_steps = (
             crossing_map.crossings[edge_ids]
             * directions.to(crossing_map.crossings.dtype))

@@ -35,6 +35,11 @@ class ThetaCrossingMap:
 
     def __init__(self, device='cuda', update_interval=100, chunk_size=65_536):
         self.device = torch.device(device)
+        # Source topology can contain several edges per valid patch quad.  It
+        # is immutable, is touched only during refresh/edge resolution, and
+        # can dwarf the tensors used by an optimisation step.  Keep it on the
+        # host; only the compact int8 crossing values are resident on CUDA.
+        self.topology_device = torch.device('cpu')
         self.update_interval = self._validate_interval(update_interval)
         self.chunk_size = int(chunk_size)
         if self.chunk_size <= 0:
@@ -42,8 +47,10 @@ class ThetaCrossingMap:
         self._sources: list[_NodeSource] = []
         self._edge_chunks: list[torch.Tensor] = []
         self.num_nodes = 0
-        self.edge_nodes = torch.empty((0, 2), dtype=torch.int64, device=self.device)
-        self._edge_keys = torch.empty(0, dtype=torch.int64, device=self.device)
+        self.edge_nodes = torch.empty(
+            (0, 2), dtype=torch.int64, device=self.topology_device)
+        self._edge_keys = torch.empty(
+            0, dtype=torch.int64, device=self.topology_device)
         self.node_theta = torch.empty(0, dtype=torch.float32, device=self.device)
         self.crossings = torch.empty(0, dtype=torch.int8, device=self.device)
         self.last_refresh_iteration: int | None = None
@@ -72,7 +79,8 @@ class ThetaCrossingMap:
 
     def register_edges(self, node_pairs):
         """Register undirected node pairs; duplicates and reverse duplicates are removed."""
-        pairs = torch.as_tensor(node_pairs, dtype=torch.int64, device=self.device)
+        pairs = torch.as_tensor(
+            node_pairs, dtype=torch.int64, device=self.topology_device)
         if pairs.numel() == 0:
             return
         pairs = pairs.reshape(-1, 2)
@@ -103,8 +111,10 @@ class ThetaCrossingMap:
             self._edge_keys = keys[keep]
             self.edge_nodes = pairs[order][keep]
         else:
-            self.edge_nodes = torch.empty((0, 2), dtype=torch.int64, device=self.device)
-            self._edge_keys = torch.empty(0, dtype=torch.int64, device=self.device)
+            self.edge_nodes = torch.empty(
+                (0, 2), dtype=torch.int64, device=self.topology_device)
+            self._edge_keys = torch.empty(
+                0, dtype=torch.int64, device=self.topology_device)
         self._edge_chunks.clear()
         self.crossings = torch.empty(
             self.edge_nodes.shape[0], dtype=torch.int8, device=self.device)
@@ -119,7 +129,12 @@ class ThetaCrossingMap:
         multiple wraps.
         """
         self._finalize_topology()
-        pairs = torch.as_tensor(node_pairs, dtype=torch.int64, device=self.device)
+        return_device = (
+            node_pairs.device
+            if isinstance(node_pairs, torch.Tensor)
+            else self.topology_device)
+        pairs = torch.as_tensor(
+            node_pairs, dtype=torch.int64, device=self.topology_device)
         original_shape = pairs.shape[:-1]
         pairs = pairs.reshape(-1, 2)
         canonical = pairs.sort(dim=1).values
@@ -136,7 +151,10 @@ class ThetaCrossingMap:
                 f'{tuple(bad)}; rebuild the crossing topology')
         directions = torch.where(
             pairs[:, 0] == canonical[:, 0], 1, -1).to(torch.int8)
-        return positions.reshape(original_shape), directions.reshape(original_shape)
+        return (
+            positions.reshape(original_shape).to(return_device),
+            directions.reshape(original_shape).to(return_device),
+        )
 
     def resolve_walks(self, node_ids):
         node_ids = torch.as_tensor(node_ids, dtype=torch.int64, device=self.device)
@@ -191,11 +209,21 @@ class ThetaCrossingMap:
                         torch.atan2(spiral[:, 1], spiral[:, 2]) % _TWO_PI
                     ).to(torch.float32)
             if self.edge_nodes.numel():
-                edge_theta = theta[self.edge_nodes]
-                delta = edge_theta[:, 1] - edge_theta[:, 0]
-                self.crossings = (
-                    (delta > np.pi).to(torch.int8)
-                    - (delta < -np.pi).to(torch.int8))
+                # A whole-patch edge table can be multiple GiB as int64 pairs.
+                # Stream it through CUDA in bounded chunks instead of
+                # materialising the table (and its gather result) there.
+                # _finalize_topology already sized this compact cache; fill it
+                # in place so refresh does not briefly hold two copies.
+                crossings = self.crossings
+                for lo in range(0, self.edge_nodes.shape[0], self.chunk_size):
+                    hi = min(self.edge_nodes.shape[0], lo + self.chunk_size)
+                    edge_nodes = self.edge_nodes[lo:hi].to(self.device)
+                    edge_theta = theta[edge_nodes]
+                    delta = edge_theta[:, 1] - edge_theta[:, 0]
+                    crossings[lo:hi] = (
+                        (delta > np.pi).to(torch.int8)
+                        - (delta < -np.pi).to(torch.int8))
+                self.crossings = crossings
             else:
                 self.crossings = torch.empty(0, dtype=torch.int8, device=self.device)
         self.node_theta = theta

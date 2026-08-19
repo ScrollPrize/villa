@@ -393,12 +393,16 @@ class PatchAtlas:
         quad_ijs = (
             np.concatenate(quad_ij_chunks)
             if quad_ij_chunks else np.empty((0, 2), dtype=np.int64))
-        patch_t = torch.as_tensor(quad_patch, dtype=torch.int64, device=self.device)
-        ijs_t = torch.as_tensor(quad_ijs, dtype=torch.float32, device=self.device)
+        # These tables are source topology, not per-step training data.  For a
+        # large atlas they can consume more than a GiB, so retain them on the
+        # host and upload only the refresh chunk selected by get_centres.
+        patch_t = torch.as_tensor(quad_patch, dtype=torch.int64)
+        ijs_t = torch.as_tensor(quad_ijs, dtype=torch.float32)
 
         def get_centres(local_indices):
-            idx = patch_t[local_indices]
-            return self.lookup(idx, ijs_t[local_indices] + 0.5)
+            local_indices_cpu = local_indices.to(device='cpu')
+            idx = patch_t[local_indices_cpu]
+            return self.lookup(idx, ijs_t[local_indices_cpu] + 0.5)
 
         start = crossing_map.register_nodes(num_quads, get_centres)
         self._theta_node_start = start
