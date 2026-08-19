@@ -1769,6 +1769,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         }
         updatePauseIndicator();
         updateOptimizationStatusIndicator();
+        updateUmbilicusNotice();
         rebuildGeneratedOverlays();
         if (_showAsMeshAction) {
             _showAsMeshAction->setEnabled(true);
@@ -2172,6 +2173,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
 
     updatePauseIndicator();
     updateOptimizationStatusIndicator();
+    updateUmbilicusNotice();
     rebuildGeneratedOverlays();
     if (_showAsMeshAction) {
         _showAsMeshAction->setEnabled(true);
@@ -3119,6 +3121,45 @@ void LineAnnotationDialog::updatePauseIndicator()
         std::max(0, (bottomStrip->width() - _pauseIndicator->width()) / 2), 10);
     _pauseIndicator->setVisible(!_currentCutFollowsStripMouse);
     _pauseIndicator->raise();
+}
+
+void LineAnnotationDialog::setUmbilicusNotice(const QString& notice)
+{
+    if (_umbilicusNotice == notice) {
+        return;
+    }
+    _umbilicusNotice = notice;
+    updateUmbilicusNotice();
+}
+
+void LineAnnotationDialog::updateUmbilicusNotice()
+{
+    CChunkedVolumeViewer* bottomStrip =
+        _stripViewers.empty() ? nullptr : _stripViewers.back().data();
+    if (!bottomStrip || _umbilicusNotice.isEmpty()) {
+        if (_umbilicusNoticeLabel) {
+            _umbilicusNoticeLabel->hide();
+        }
+        return;
+    }
+    if (!_umbilicusNoticeLabel ||
+        _umbilicusNoticeLabel->parentWidget() != bottomStrip) {
+        delete _umbilicusNoticeLabel;
+        auto* label = new QLabel(bottomStrip);
+        label->setObjectName(QStringLiteral("lineAnnotationUmbilicusNotice"));
+        label->setAttribute(Qt::WA_TransparentForMouseEvents);
+        label->setStyleSheet(QStringLiteral(
+            "QLabel { color: rgb(255, 90, 90); background-color: rgba(20, 20, 20, 160); "
+            "border-radius: 4px; padding: 2px 6px; font-size: 10px; }"));
+        _umbilicusNoticeLabel = label;
+    }
+    _umbilicusNoticeLabel->setText(_umbilicusNotice);
+    _umbilicusNoticeLabel->adjustSize();
+    // Top-left: the pause badge owns the top centre and the optimization badge
+    // the bottom right.
+    _umbilicusNoticeLabel->move(10, 10);
+    _umbilicusNoticeLabel->show();
+    _umbilicusNoticeLabel->raise();
 }
 
 void LineAnnotationDialog::updateOptimizationStatusIndicator()

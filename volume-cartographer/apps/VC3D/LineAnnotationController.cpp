@@ -58,6 +58,7 @@
 #include <QLineEdit>
 #include <QMetaObject>
 #include <QMessageBox>
+#include <QScopedValueRollback>
 #include <QMdiArea>
 #include <QMdiSubWindow>
 #include <QPoint>
@@ -280,6 +281,29 @@ std::optional<vc3d::opendata::CoordinateIdentity> coordinateIdentityForState(
         return std::nullopt;
     return vc3d::opendata::coordinateIdentityForVolume(
         *state->vpkg(), state->currentVolumeId());
+}
+
+// The attached volume an umbilicus stamp names by store directory name, so the
+// stamp can be checked against it. Remote volumes are skipped: the check needs
+// local shape metadata.
+std::shared_ptr<Volume> attachedVolumeByStoreName(const VolumePkg& pkg,
+                                                  const std::string& storeName)
+{
+    const std::string wanted =
+        std::filesystem::path(storeName).filename().string();
+    if (wanted.empty())
+        return nullptr;
+    try {
+        for (const std::string& id : pkg.volumeIDs()) {
+            const std::shared_ptr<Volume> volume = pkg.volume(id);
+            if (!volume || volume->isRemote())
+                continue;
+            if (volume->path().filename().string() == wanted)
+                return volume;
+        }
+    } catch (...) {
+    }
+    return nullptr;
 }
 
 void copyCoordinateIdentityToJson(
@@ -1887,6 +1911,13 @@ LineAnnotationController::LineAnnotationController(CState* state,
                 &CState::vpkgChanged,
                 this,
                 &LineAnnotationController::onVolumePackageChanged);
+        // Without this an attach or detach would not reach normal orientation
+        // until the project was reopened, since the resolved umbilicus is cached
+        // keyed only on what a materialization can observe changing.
+        connect(_state, &CState::umbilicusChanged, this, [this]() {
+            invalidateScrollUmbilicus();
+            publishUmbilicusNotice();
+        });
         if (_state->vpkg()) {
             loadFibersForCurrentPackage();
         }
@@ -2188,6 +2219,9 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
 
     _panes.push_back(PaneRecord{_nextPaneId - 1, sourceKind, surfaceName, dialog, session});
     pushFiberUiState(_panes.back());
+    // A pane opened after the umbilicus was resolved has to be told too; the
+    // notice describes the package, not this pane's fiber.
+    dialog->setUmbilicusNotice(_umbilicusNotice);
     connect(dialog, &LineAnnotationDialog::paneClosed, this, [this](const std::string& name) {
         cleanupSurfaceName(name);
     });
@@ -6318,6 +6352,10 @@ void LineAnnotationController::onSurfaceChanged(std::string name,
 
 void LineAnnotationController::onVolumePackageChanged(std::shared_ptr<VolumePkg> /*pkg*/)
 {
+    // Dropped outright rather than left to the frame comparison: two projects can
+    // sit in one directory with identical grids, so both halves of the cache key
+    // can match while the umbilicus file behind them differs.
+    invalidateScrollUmbilicus();
     loadFibersForCurrentPackage();
 }
 
@@ -9509,6 +9547,102 @@ void LineAnnotationController::updateGeneratedViewMetricsForFiber(uint64_t fiber
     }
 }
 
+QString LineAnnotationController::umbilicusCacheToken() const
+{
+    if (!_state || !_state->vpkg()) {
+        return {};
+    }
+    const VolumePkg& pkg = *_state->vpkg();
+    // Deliberately cheap: compared whenever a cached, already-scaled umbilicus is
+    // about to be reused, so it must not run the resolver's search or parse any
+    // JSON. The project's field covers attaching, detaching and repointing, and
+    // stat()ing the file it names covers that file being fixed, replaced or
+    // removed, which is what the attach dialog promises is a workable order of
+    // operations.
+    //
+    // Size and mtime, so this is a metadata token rather than a guarantee: a
+    // same-size rewrite inside one timestamp tick is invisible to it.
+    QString token = QString::fromStdString(pkg.umbilicus());
+    const fs::path declared = pkg.umbilicusPath();
+    if (declared.empty()) {
+        return token;
+    }
+    std::error_code ec;
+    const auto size = fs::file_size(declared, ec);
+    if (ec) {
+        return token + QStringLiteral("|-");
+    }
+    token += QStringLiteral("|%1").arg(size);
+    const auto written = fs::last_write_time(declared, ec);
+    if (!ec) {
+        token += QStringLiteral(":%1").arg(
+            static_cast<qlonglong>(written.time_since_epoch().count()));
+    }
+    return token;
+}
+
+void LineAnnotationController::invalidateScrollUmbilicus()
+{
+    _scrollUmbilicusLoadAttempted = false;
+    _scrollUmbilicusToken.clear();
+    _scrollUmbilicusFrame = {};
+    _scrollUmbilicus.reset();
+    _umbilicusNotice.clear();
+}
+
+void LineAnnotationController::publishUmbilicusNotice()
+{
+    // Every open pane, because the umbilicus is a property of the package rather
+    // than of any one fiber. Idempotent: the dialog ignores an unchanged notice.
+    for (const auto& pane : _panes) {
+        if (pane.dialog) {
+            pane.dialog->setUmbilicusNotice(_umbilicusNotice);
+        }
+    }
+}
+
+vc3d::annotation::AnnotationFrame LineAnnotationController::annotationFrame() const
+{
+    if (!_state) {
+        return {};
+    }
+    try {
+        const auto volume = _state->currentVolume();
+        if (!volume) {
+            return {};
+        }
+        // The exact coordinate factor comes straight from the tags, not through
+        // coordinateIdentityForVolume(): that helper withholds the whole
+        // identity when the physical resolution is missing, and the factor is
+        // an exact integer statement that must not be lost over absent physical
+        // metadata. The stamped resolution, where present, is passed as the
+        // physical figure it is; deriveAnnotationFrame() never derives counts
+        // from it.
+        std::optional<double> exactFactor;
+        std::optional<double> stampedResolution;
+        if (_state->vpkg() && !_state->currentVolumeId().empty()) {
+            if (const auto identity = vc3d::opendata::coordinateIdentityFromTags(
+                    _state->vpkg()->volumeTags(_state->currentVolumeId()))) {
+                exactFactor =
+                    static_cast<double>(identity->sourceCoordinateScaleFactor);
+                if (identity->sourceOriginalResolution > 0.0) {
+                    stampedResolution = identity->sourceOriginalResolution;
+                }
+            }
+        }
+        return vc3d::annotation::deriveAnnotationFrame(
+            volume->voxelSize(),
+            volume->baseScaleLevel(),
+            exactFactor,
+            stampedResolution,
+            {static_cast<double>(volume->sliceWidth()),
+             static_cast<double>(volume->sliceHeight()),
+             static_cast<double>(volume->numSlices())});
+    } catch (...) {
+        return {};
+    }
+}
+
 std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
     const LineAnnotationSession& session)
 {
@@ -9523,6 +9657,9 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
         volume.reset();
     }
 
+    // One way to find umbilicus data: the shared resolver honours the project's
+    // attachment, refuses several candidates rather than picking one, and
+    // refuses a file whose frame metadata is malformed.
     fs::path volpkgRoot;
     if (_state && _state->vpkg()) {
         auto vpkg = _state->vpkg();
@@ -9530,90 +9667,303 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
             ? fs::path(vpkg->getVolpkgDirectory())
             : vpkg->path().parent_path();
     }
-    if (!_scrollUmbilicusLoadAttempted || volpkgRoot != _scrollUmbilicusRoot) {
+    // The frame is part of the key, not just the directory: switching the active
+    // volume changes both the factor the points were scaled by and the extent the
+    // per-slice centres were sized to.
+    const auto currentAnnotationFrame = annotationFrame();
+    // The file itself is part of the key too, not just where it was looked
+    // for. Attaching a malformed umbilicus and then fixing it emits nothing
+    // beyond the attach itself, so without this the refusal stayed cached until
+    // an unrelated invalidation -- which contradicts the attach dialog telling
+    // the user that attaching and then fixing the file is a reasonable order of
+    // operations. A stat, no parse.
+    const QString currentUmbilicusToken = umbilicusCacheToken();
+    if (!_scrollUmbilicusLoadAttempted || volpkgRoot != _scrollUmbilicusRoot ||
+        currentUmbilicusToken != _scrollUmbilicusToken ||
+        !vc3d::annotation::sameAnnotationFrame(currentAnnotationFrame,
+                                              _scrollUmbilicusFrame)) {
         _scrollUmbilicusLoadAttempted = true;
         _scrollUmbilicusRoot = volpkgRoot;
+        _scrollUmbilicusToken = currentUmbilicusToken;
+        _scrollUmbilicusFrame = currentAnnotationFrame;
+        // Cleared before the attempt: whatever is set below describes this
+        // attempt, and success has to be able to retract an earlier complaint.
         _scrollUmbilicus.reset();
+        _umbilicusNotice.clear();
         try {
-            if (!volpkgRoot.empty() && volume) {
-                const cv::Vec3i volumeShape{volume->numSlices(),
-                                            volume->sliceHeight(),
-                                            volume->sliceWidth()};
-                std::vector<cv::Vec3f> controlPoints;
-                for (const char* name : {"umbilicus.json", "estimated_umbilicus.json"}) {
-                    const fs::path candidate = volpkgRoot / name;
-                    if (fs::exists(candidate)) {
-                        controlPoints =
-                            vc::core::util::Umbilicus::LoadControlPoints(candidate);
-                        break;
+            if (_state && _state->vpkg() && volume) {
+                const auto resolved =
+                    vc::core::util::resolveScrollUmbilicus(*_state->vpkg());
+                if (resolved.path.empty()) {
+                    if (!resolved.error.empty()) {
+                        Logger()->warn("Line annotation: no usable umbilicus: {}",
+                                       resolved.error);
+                        _umbilicusNotice =
+                            tr("no usable umbilicus: %1")
+                                .arg(QString::fromStdString(resolved.error));
                     }
-                }
+                } else {
+                    std::vector<cv::Vec3f> controlPoints = resolved.info.controlPoints;
 
-                // Plausibility floor: once framed, an umbilicus should cover
-                // a sensible fraction of the session volume's z range.
-                const auto zCoverage = [&](const std::vector<cv::Vec3f>& points) {
-                    float lo = std::numeric_limits<float>::infinity();
-                    float hi = -std::numeric_limits<float>::infinity();
-                    for (const auto& point : points) {
-                        lo = std::min(lo, point[2]);
-                        hi = std::max(hi, point[2]);
-                    }
-                    const float slices = static_cast<float>(volume->numSlices());
-                    const float overlap =
-                        std::min(hi, slices) - std::max(lo, 0.0f);
-                    return overlap > 0.0f ? overlap / slices : 0.0f;
-                };
-                constexpr float kMinPlausibleZCoverage = 0.25f;
+                    // The line's own points are in the annotation frame, so the
+                    // umbilicus has to be too, and the dense per-slice centres
+                    // have to be built at that frame's extent rather than the
+                    // volume's own.
+                    // The frame from the cache key above, not a fresh derivation:
+                    // the two must agree or the cache would record a frame the
+                    // geometry was not built in.
+                    const auto& frame = currentAnnotationFrame;
+                    const std::array<double, 3>& annotationGrid =
+                        frame.extentXyz;
+                    const auto scale = vc::core::util::deriveUmbilicusScale(
+                        resolved.info, annotationGrid, frame.voxelSizeUm);
 
-                if (!controlPoints.empty()) {
-                    // Stored umbilici live in the registration's fixed-volume
-                    // frame when the session volume carries a transform.json
-                    // (defined in native /0 coordinates, mapping session
-                    // coordinates to that fixed frame -- the same discovery
-                    // convention as SurfaceAffineTransformController, with
-                    // the volpkg-level transforms/ file as a fallback
-                    // location). Apply its inverse to place the umbilicus in
-                    // the session frame; on any transform problem or an
-                    // implausible result, fall back to the raw points rather
-                    // than discarding the umbilicus.
-                    std::optional<std::vector<cv::Vec3f>> framed;
-                    if (volume->baseScaleLevel() == 0) {
-                        fs::path transformPath = volume->path() / "transform.json";
-                        if (!fs::exists(transformPath)) {
-                            transformPath =
-                                volpkgRoot / "transforms" / "transform.json";
-                        }
-                        if (fs::exists(transformPath)) {
+                    // Three outcomes, not two: a file whose stated frame does
+                    // not fit the target is refused rather than quietly read as
+                    // though it had stated nothing, which was a fail-open that
+                    // could orient views from the wrong frame.
+                    //
+                    // An inferred scale is applied here as it already was in the
+                    // Fiber Map. An umbilicus spans very nearly the full height
+                    // of a scroll, which is the property the inference tests, so
+                    // it is trustworthy on the cases it accepts. It also declines
+                    // the case it could not express: a file in a registration's
+                    // fixed-volume frame is offset rather than rescaled, so its
+                    // points do not fit inside any candidate grid and inference
+                    // yields nothing, dropping through to the legacy reading that
+                    // does handle a pose.
+                    const auto claim =
+                        vc::core::util::umbilicusFrameClaim(resolved.info);
+                    const bool haveTargetGrid = annotationGrid[2] > 0.0;
+
+                    // A stamp naming a volume this project has can be checked
+                    // against it, and a contradicted stamp is refused outright:
+                    // whatever scale was derived came from a statement the named
+                    // volume disproves. One this project does not have merely
+                    // goes unverified, which is not a contradiction.
+                    std::optional<std::string> stampContradiction;
+                    if (resolved.info.volume && !resolved.info.volume->empty()) {
+                        if (const auto named = attachedVolumeByStoreName(
+                                *_state->vpkg(), *resolved.info.volume)) {
+                            std::array<double, 3> namedGrid{0.0, 0.0, 0.0};
+                            std::optional<double> namedVoxelUm;
                             try {
-                                const cv::Matx44d toSession =
-                                    vc::core::util::invertAffineTransformMatrix(
-                                        vc::core::util::loadAffineTransformMatrix(
-                                            transformPath));
-                                std::vector<cv::Vec3f> transformed = controlPoints;
-                                for (auto& point : transformed) {
-                                    point = vc::core::util::applyAffineTransform(
-                                        point, toSession);
-                                }
-                                if (zCoverage(transformed) >= kMinPlausibleZCoverage) {
-                                    framed = std::move(transformed);
+                                namedGrid = {
+                                    static_cast<double>(named->sliceWidth()),
+                                    static_cast<double>(named->sliceHeight()),
+                                    static_cast<double>(named->numSlices())};
+                                const double voxel = named->voxelSize();
+                                if (std::isfinite(voxel) && voxel > 0.0) {
+                                    namedVoxelUm = voxel;
                                 }
                             } catch (...) {
                             }
+                            stampContradiction =
+                                vc::core::util::umbilicusStampContradiction(
+                                    resolved.info, namedGrid, namedVoxelUm);
                         }
                     }
-                    if (!framed &&
-                        zCoverage(controlPoints) >= kMinPlausibleZCoverage) {
-                        framed = std::move(controlPoints);
+
+                    auto action = vc::core::util::decideUmbilicusLoadAction(
+                        scale, claim, haveTargetGrid,
+                        stampContradiction.has_value());
+
+                    if (stampContradiction) {
+                        Logger()->warn(
+                            "Line annotation: refusing umbilicus {}: {}",
+                            resolved.path.string(),
+                            *stampContradiction);
+                        _umbilicusNotice =
+                            tr("umbilicus %1 refused: its stamp contradicts the "
+                               "volume it names")
+                                .arg(QString::fromStdString(
+                                    resolved.path.filename().string()));
                     }
-                    if (framed) {
-                        _scrollUmbilicus = vc::core::util::Umbilicus::FromPoints(
-                            std::move(*framed), volumeShape);
+
+                    // An *inferred* scale must not outrank a registration
+                    // transform. Inference is a reading of the points -- do they fit
+                    // inside a candidate grid and nearly fill it -- and a
+                    // translated fixed-frame umbilicus can satisfy that while still
+                    // needing the transform: the offset moves it without pushing it
+                    // out of bounds or shortening its z span. Applying an inferred
+                    // scale there would skip the transform entirely and orient
+                    // normals about untranslated centres, which is a regression on
+                    // the reading this PR replaced. A file that *states* its frame
+                    // still wins, because a statement outranks a reading.
+                    if (action == vc::core::util::UmbilicusLoadAction::Apply &&
+                        scale &&
+                        scale->source ==
+                            vc::core::util::UmbilicusScaleSource::InferredFromGrid &&
+                        volume->baseScaleLevel() == 0) {
+                        fs::path candidate = volume->path() / "transform.json";
+                        if (!fs::exists(candidate)) {
+                            candidate = volpkgRoot / "transforms" / "transform.json";
+                        }
+                        if (fs::exists(candidate)) {
+                            Logger()->info(
+                                "Line annotation: umbilicus {} has no stated frame "
+                                "and {} exists, so the registration reading is used "
+                                "rather than an inferred x{:g}",
+                                resolved.path.string(),
+                                candidate.string(),
+                                scale->factor);
+                            action = vc::core::util::UmbilicusLoadAction::UseLegacy;
+                        }
+                    }
+
+                    if (action == vc::core::util::UmbilicusLoadAction::Refuse &&
+                        stampContradiction) {
+                        // Logged and noticed above; nothing usable was read.
+                    } else if (action ==
+                               vc::core::util::UmbilicusLoadAction::Refuse) {
+                        const auto stampedGrid =
+                            claim.dimensions
+                                ? std::to_string(*resolved.info.volumeWidth) + "x" +
+                                      std::to_string(*resolved.info.volumeHeight) + "x" +
+                                      std::to_string(*resolved.info.volumeSlices)
+                                : std::string("(no dimensions)");
+                        Logger()->warn(
+                            "Line annotation: refusing umbilicus {}: it states a "
+                            "{} grid{}, which is not a uniform rescale of the "
+                            "{:g}x{:g}x{:g} annotation frame; orienting without it",
+                            resolved.path.string(),
+                            stampedGrid,
+                            claim.voxelSize
+                                ? " at " + std::to_string(*resolved.info.voxelsizeUm) +
+                                      " um voxels"
+                                : "",
+                            annotationGrid[0],
+                            annotationGrid[1],
+                            annotationGrid[2]);
+                        _umbilicusNotice =
+                            tr("umbilicus %1 refused: its stated frame does not "
+                               "match this volume")
+                                .arg(QString::fromStdString(
+                                    resolved.path.filename().string()));
+                    } else if (action ==
+                               vc::core::util::UmbilicusLoadAction::Apply) {
+                        for (auto& point : controlPoints) {
+                            point *= static_cast<float>(scale->factor);
+                        }
+                        // Rounded doubles into ints: an implausible extent must not
+                        // wrap round to a negative or truncated shape and be handed
+                        // to FromPoints as though it were a grid.
+                        const auto asSliceCount = [](double extent) -> int {
+                            if (!std::isfinite(extent) || extent < 1.0 ||
+                                extent > static_cast<double>(
+                                             std::numeric_limits<int>::max())) {
+                                return 0;
+                            }
+                            return static_cast<int>(std::llround(extent));
+                        };
+                        const cv::Vec3i annotationShape{
+                            asSliceCount(annotationGrid[2]),
+                            asSliceCount(annotationGrid[1]),
+                            asSliceCount(annotationGrid[0])};
+                        if (annotationShape[0] <= 0 || annotationShape[1] <= 0 ||
+                            annotationShape[2] <= 0) {
+                            Logger()->warn(
+                                "Line annotation: umbilicus {} resolved but the "
+                                "annotation frame extent {:g}x{:g}x{:g} is not a "
+                                "usable grid; orienting without it",
+                                resolved.path.string(),
+                                annotationGrid[0],
+                                annotationGrid[1],
+                                annotationGrid[2]);
+                            _umbilicusNotice =
+                                tr("umbilicus %1 unusable: the annotation frame "
+                                   "extent is not a usable grid")
+                                    .arg(QString::fromStdString(
+                                        resolved.path.filename().string()));
+                            // Left unset, so orientation falls back to the volume
+                            // centre with the notice above saying why.
+                        } else {
+                            _scrollUmbilicus = vc::core::util::Umbilicus::FromPoints(
+                                std::move(controlPoints), annotationShape);
+                            Logger()->info(
+                                "Line annotation: umbilicus {} at scale x{:g} ({})",
+                                resolved.path.string(),
+                                scale->factor,
+                                scale->description);
+                        }
+                    } else {
+                        // Nothing usable stated and nothing inferable, or no
+                        // annotation frame to reach: keep the legacy reading.
+                        // Stored umbilici of this vintage may live in the
+                        // registration's fixed-volume frame when the session volume
+                        // carries a transform.json (native /0 coordinates mapping
+                        // session coordinates to that fixed frame, discovered the
+                        // same way SurfaceAffineTransformController does it, with
+                        // the volpkg-level transforms/ file as a fallback). Apply
+                        // its inverse; on any transform problem or an implausible
+                        // result fall back to the raw points rather than discarding
+                        // the umbilicus. Such a file still carries the frame
+                        // mismatch it always did — stamping it is the fix.
+                        const cv::Vec3i volumeShape{volume->numSlices(),
+                                                    volume->sliceHeight(),
+                                                    volume->sliceWidth()};
+                        const auto zCoverage =
+                            [&](const std::vector<cv::Vec3f>& points) {
+                                float lo = std::numeric_limits<float>::infinity();
+                                float hi = -std::numeric_limits<float>::infinity();
+                                for (const auto& point : points) {
+                                    lo = std::min(lo, point[2]);
+                                    hi = std::max(hi, point[2]);
+                                }
+                                const float slices =
+                                    static_cast<float>(volume->numSlices());
+                                const float overlap =
+                                    std::min(hi, slices) - std::max(lo, 0.0f);
+                                return overlap > 0.0f ? overlap / slices : 0.0f;
+                            };
+                        constexpr float kMinPlausibleZCoverage = 0.25f;
+
+                        std::optional<std::vector<cv::Vec3f>> framed;
+                        if (volume->baseScaleLevel() == 0) {
+                            fs::path transformPath =
+                                volume->path() / "transform.json";
+                            if (!fs::exists(transformPath)) {
+                                transformPath =
+                                    volpkgRoot / "transforms" / "transform.json";
+                            }
+                            if (fs::exists(transformPath)) {
+                                try {
+                                    const cv::Matx44d toSession =
+                                        vc::core::util::invertAffineTransformMatrix(
+                                            vc::core::util::loadAffineTransformMatrix(
+                                                transformPath));
+                                    std::vector<cv::Vec3f> transformed = controlPoints;
+                                    for (auto& point : transformed) {
+                                        point = vc::core::util::applyAffineTransform(
+                                            point, toSession);
+                                    }
+                                    if (zCoverage(transformed) >=
+                                        kMinPlausibleZCoverage) {
+                                        framed = std::move(transformed);
+                                    }
+                                } catch (...) {
+                                }
+                            }
+                        }
+                        if (!framed &&
+                            zCoverage(controlPoints) >= kMinPlausibleZCoverage) {
+                            framed = std::move(controlPoints);
+                        }
+                        if (framed) {
+                            _scrollUmbilicus = vc::core::util::Umbilicus::FromPoints(
+                                std::move(*framed), volumeShape);
+                            Logger()->info(
+                                "Line annotation: umbilicus {} carries no frame "
+                                "metadata; read as before",
+                                resolved.path.string());
+                        }
                     }
                 }
             }
         } catch (...) {
             _scrollUmbilicus.reset();
         }
+        publishUmbilicusNotice();
     }
 
     cv::Vec2f volumeCenterXY{kNan, kNan};

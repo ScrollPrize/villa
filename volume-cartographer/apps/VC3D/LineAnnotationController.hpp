@@ -6,6 +6,7 @@
 #include <QString>
 #include <QFutureWatcher>
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <deque>
@@ -22,11 +23,13 @@
 #include <nlohmann/json.hpp>
 #include <opencv2/core/mat.hpp>
 
+#include "AnnotationFrame.hpp"
 #include "LineAnnotationFiberClassification.hpp"
 #include "LineAnnotationFiberSegments.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 #include "vc/atlas/FiberIntersections.hpp"
 #include "vc/core/util/Umbilicus.hpp"
+#include "vc/core/util/ScrollUmbilicus.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 
@@ -538,6 +541,19 @@ private:
                                          bool retraceAll,
                                          std::optional<std::vector<size_t>> dirtySegments = std::nullopt,
                                          bool globalGoalsOnly = false) const;
+    // The frame line points and control points are expressed in: the current
+    // volume's grid carried to the resolution the fibers were annotated at.
+    // Default-constructed (no voxel size, zero extent) when no volume is loaded.
+    [[nodiscard]] vc3d::annotation::AnnotationFrame annotationFrame() const;
+    // Drops the cached scroll umbilicus and everything describing it, so the next
+    // use resolves again.
+    void invalidateScrollUmbilicus();
+    // Cheap metadata token over the attached umbilicus file: the project's field
+    // plus a stat() of what it names, and no JSON parse. Part of the cached
+    // umbilicus's key, so fixing a refused file reaches the views.
+    [[nodiscard]] QString umbilicusCacheToken() const;
+    // Pushes _umbilicusNotice to every open pane's dialog.
+    void publishUmbilicusNotice();
     void finishOptimization(const std::string& surfaceName);
     // Per-line-point sampled sheet normals, sign-oriented away from the
     // scroll center (umbilicus when available, volume XY center otherwise);
@@ -797,7 +813,21 @@ private:
     // fallback is used instead).
     std::optional<vc::core::util::Umbilicus> _scrollUmbilicus;
     std::filesystem::path _scrollUmbilicusRoot;
+    // The attached umbilicus file as of the cached load, so it changing
+    // underneath VC3D — being fixed, replaced or removed — is noticed.
+    QString _scrollUmbilicusToken;
+    // The annotation frame _scrollUmbilicus was scaled into. Part of the cache
+    // key because the cached value is not the file's contents: its points are
+    // already multiplied by a frame-dependent factor and its per-slice centres
+    // sized to that frame's extent. Keyed on the project directory alone, a
+    // volume switch handed the orientation vote geometry from the previous frame.
+    vc3d::annotation::AnnotationFrame _scrollUmbilicusFrame;
     bool _scrollUmbilicusLoadAttempted = false;
+    // Why the package's umbilicus could not be used, for the strip notice.
+    // Empty when one was applied, and when none exists to complain about.
+    // Orienting off the volume centre instead is exactly the silent degradation
+    // that hid a frame mismatch for a whole scroll, so it is said out loud.
+    QString _umbilicusNotice;
     std::deque<FiberSaveJob> _pendingFiberSaveJobs;
     QPointer<QFutureWatcher<FiberSaveTaskResult>> _fiberSaveWatcher;
     uint64_t _nextFiberSaveSequence = 0;
