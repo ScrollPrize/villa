@@ -59,7 +59,7 @@ class ThetaCrossingMap:
     delta greater than pi and -1 for a delta less than -pi.
     """
 
-    def __init__(self, device='cuda', update_interval=100, chunk_size=65_536):
+    def __init__(self, device='cuda', update_interval=100, chunk_size=1_048_576):
         self.device = torch.device(device)
         # Source topology can contain several edges per valid patch quad.  It
         # is immutable, is touched only during refresh/edge resolution, and
@@ -67,6 +67,10 @@ class ThetaCrossingMap:
         # host; only the compact int8 crossing values are resident on CUDA.
         self.topology_device = torch.device('cpu')
         self.update_interval = self._validate_interval(update_interval)
+        # One chunk bounds the host/device transient (~16 MB of int64 pairs)
+        # while amortising per-chunk provider-callback and kernel-launch
+        # overhead, and is large enough for the native neighbour provider to
+        # fan out across threads.
         self.chunk_size = int(chunk_size)
         if self.chunk_size <= 0:
             raise ValueError('ThetaCrossingMap chunk_size must be positive')

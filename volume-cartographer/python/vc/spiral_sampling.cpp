@@ -322,36 +322,59 @@ public:
             throw std::runtime_error("invalid neighbor chunk request");
         const uint64_t next = std::min(end, cursor + slot_count);
         std::vector<int64_t> pairs;
-        pairs.reserve(static_cast<size_t>(next - cursor) * 2);
         {
             nb::gil_scoped_release release;
-            size_t patch_index = cursor < end ? locate_node(cursor / 4) : 0;
-            constexpr int offsets[4][2] = {{0, 1}, {1, -1}, {1, 0}, {1, 1}};
-            for (uint64_t slot = cursor; slot < next; ++slot) {
-                const uint64_t node = slot / 4;
-                while (node >= node_offsets_[patch_index + 1])
-                    ++patch_index;
-                const PatchData& patch = patches_[patch_index];
-                const uint64_t patch_start = node_offsets_[patch_index];
-                const uint64_t local = node - patch_start;
-                const uint64_t linear = index_at(patch.valid_cells, local);
-                const int64_t row = static_cast<int64_t>(linear / patch.width);
-                const int64_t column = static_cast<int64_t>(linear % patch.width);
-                const int direction = static_cast<int>(slot % 4);
-                const int64_t next_row = row + offsets[direction][0];
-                const int64_t next_column = column + offsets[direction][1];
-                if (next_row < 0 || next_column < 0
-                    || static_cast<uint64_t>(next_row) >= patch.height
-                    || static_cast<uint64_t>(next_column) >= patch.width)
-                    continue;
-                const uint64_t next_linear = static_cast<uint64_t>(next_row)
-                    * patch.width + static_cast<uint64_t>(next_column);
-                const uint64_t next_local = valid_ordinal(patch, next_linear);
-                if (next_local == missing_index)
-                    continue;
-                pairs.push_back(static_cast<int64_t>(node));
-                pairs.push_back(static_cast<int64_t>(patch_start + next_local));
+            // Contiguous slot sub-ranges are filled independently and
+            // concatenated in range order, so the emitted pair sequence is
+            // identical to a single serial pass for any thread count.
+            const uint64_t total = next - cursor;
+            const uint64_t per_range = 262'144;
+            const size_t num_ranges = total
+                ? static_cast<size_t>((total + per_range - 1) / per_range) : 0;
+            std::vector<std::vector<int64_t>> partial(num_ranges);
+#pragma omp parallel for schedule(dynamic)
+            for (int64_t range_index = 0;
+                 range_index < static_cast<int64_t>(num_ranges); ++range_index) {
+                const uint64_t lo = cursor
+                    + static_cast<uint64_t>(range_index) * per_range;
+                const uint64_t hi = std::min(next, lo + per_range);
+                std::vector<int64_t>& out = partial[
+                    static_cast<size_t>(range_index)];
+                out.reserve(static_cast<size_t>(hi - lo) * 2);
+                size_t patch_index = locate_node(lo / 4);
+                constexpr int offsets[4][2] = {{0, 1}, {1, -1}, {1, 0}, {1, 1}};
+                for (uint64_t slot = lo; slot < hi; ++slot) {
+                    const uint64_t node = slot / 4;
+                    while (node >= node_offsets_[patch_index + 1])
+                        ++patch_index;
+                    const PatchData& patch = patches_[patch_index];
+                    const uint64_t patch_start = node_offsets_[patch_index];
+                    const uint64_t local = node - patch_start;
+                    const uint64_t linear = index_at(patch.valid_cells, local);
+                    const int64_t row = static_cast<int64_t>(linear / patch.width);
+                    const int64_t column = static_cast<int64_t>(linear % patch.width);
+                    const int direction = static_cast<int>(slot % 4);
+                    const int64_t next_row = row + offsets[direction][0];
+                    const int64_t next_column = column + offsets[direction][1];
+                    if (next_row < 0 || next_column < 0
+                        || static_cast<uint64_t>(next_row) >= patch.height
+                        || static_cast<uint64_t>(next_column) >= patch.width)
+                        continue;
+                    const uint64_t next_linear = static_cast<uint64_t>(next_row)
+                        * patch.width + static_cast<uint64_t>(next_column);
+                    const uint64_t next_local = valid_ordinal(patch, next_linear);
+                    if (next_local == missing_index)
+                        continue;
+                    out.push_back(static_cast<int64_t>(node));
+                    out.push_back(static_cast<int64_t>(patch_start + next_local));
+                }
             }
+            size_t total_values = 0;
+            for (const std::vector<int64_t>& out : partial)
+                total_values += out.size();
+            pairs.reserve(total_values);
+            for (const std::vector<int64_t>& out : partial)
+                pairs.insert(pairs.end(), out.begin(), out.end());
         }
         nb::dict result;
         result["next_cursor"] = next;
