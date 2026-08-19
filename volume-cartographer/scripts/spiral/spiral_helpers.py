@@ -392,6 +392,9 @@ class Chain:
         revisit points; consumers wanting each adjacency once must dedupe)."""
 
     def zyxs_between(self, p1, p2):
+        return self._zyxs(self.points_between(p1, p2))
+
+    def points_between(self, p1, p2):
         raise NotImplementedError
 
     def iter_chain(self):
@@ -427,14 +430,12 @@ class SequenceChain(Chain):
             self._index_of = {id(p): k for k, p in enumerate(self._ordered)}
         return self._ordered, self._index_of
 
-    def zyxs_between(self, p1, p2):
+    def points_between(self, p1, p2):
         ordered, index_of = self._sorted()
         i1, i2 = index_of[id(p1)], index_of[id(p2)]
         if i1 <= i2:
-            chain = ordered[i1:i2 + 1]
-        else:
-            chain = list(reversed(ordered[i2:i1 + 1]))
-        return self._zyxs(chain)
+            return ordered[i1:i2 + 1]
+        return list(reversed(ordered[i2:i1 + 1]))
 
     def iter_chain(self):
         return self._sorted()[0]
@@ -484,7 +485,7 @@ class ComponentChain(Chain):
             return points[pos_from:pos_to + 1]
         return list(reversed(points[pos_to:pos_from + 1]))
 
-    def zyxs_between(self, p1, p2):
+    def points_between(self, p1, p2):
         # Within-member index ranges concatenated across the spanning-tree path
         # from p1's member to p2's, hopping fibers at each junction.
         m1, i1 = self.pos_of[id(p1)]
@@ -505,7 +506,7 @@ class ComponentChain(Chain):
             chain.extend(self._member_segment(m_from, pos, leave))
             pos = arrive
         chain.extend(self._member_segment(member_path[-1], pos, i2))
-        return self._zyxs(chain)
+        return chain
 
     def iter_chain(self):
         # Euler tour of the member tree: walk each member end-to-end and back,

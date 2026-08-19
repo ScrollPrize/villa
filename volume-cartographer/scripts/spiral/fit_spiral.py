@@ -121,6 +121,7 @@ from satisfaction_metrics import (
 )
 from visualization import overlay_patches_on_slices
 from transforms import SpiralAndTransform
+from theta_crossing_map import ThetaCrossingMap
 from winding_supervision import (
     get_winding_inference_losses,
     load_winding_inference_store,
@@ -293,12 +294,9 @@ class ShellPolarMap:
 
 class PatchAtlas:
     """All patches' (H, W, 3) zyxs grids packed into one flat tensor, batched
-    per lookup instead of per-patch dispatch. The packed grids stay resident in
-    host memory: the (i, j) samples are drawn on the CPU anyway, so the
-    bilinear gather runs there (mostly-contiguous strip reads, a few MB per
-    step) and only the interpolated points are uploaded to `device`. This
-    keeps the atlas - which scales with the input patch count, not with any
-    per-step budget - out of VRAM entirely."""
+    per lookup instead of per-patch dispatch. Geometry is initially prepared on
+    the host and moved as one allocation by :meth:`materialize` during device
+    setup. Sampling masks remain in the native/CPU sampling atlas."""
 
     def __init__(self, patches_by_id, device='cuda'):
         self.device = torch.device(device)
@@ -322,6 +320,9 @@ class PatchAtlas:
         self.widths = torch.tensor(widths, dtype=torch.int64)  # (N,)
         self.heights = torch.tensor(heights, dtype=torch.int64)  # (N,)
         self.id_to_idx = {pid: i for i, pid in enumerate(patches_by_id.keys())}
+        self._patches = list(patches_by_id.values())
+        self._quad_node_ids = []
+        self._theta_node_start = None
         native = load_native_spiral_sampling()
         self.sampling_atlas = (
             native.PatchSamplingAtlas([
@@ -334,16 +335,33 @@ class PatchAtlas:
     def memory_mb(self):
         return self.zyxs_flat.numel() * 4 / 1e6
 
+    def materialize(self, device=None):
+        """Move geometry and lookup metadata to the configured device."""
+        if device is not None:
+            self.device = torch.device(device)
+        self.zyxs_flat = self.zyxs_flat.to(self.device)
+        self.offsets = self.offsets.to(self.device)
+        self.widths = self.widths.to(self.device)
+        self.heights = self.heights.to(self.device)
+        return self
+
+    def rebuild_sampling_atlas(self):
+        """Rebuild CPU/native lookup metadata after sampling masks change."""
+        native = load_native_spiral_sampling()
+        self.sampling_atlas = (
+            native.PatchSamplingAtlas([
+                np.ascontiguousarray(
+                    patch._sampling_valid_quad_mask_np, dtype=bool)
+                for patch in self._patches
+            ])
+            if native is not None and self._patches else None)
+
     def lookup(self, patch_idx_per_sample, ijs):
-        # patch_idx_per_sample: (...,) int64 on CPU
-        # ijs: (..., 2) float on CPU
-        # Gathers and interpolates on the host-resident atlas and returns
-        # (..., 3) on self.device. Caller must ensure floor(ij) lies on a
-        # valid quad. Runs inside the batch prefetcher when that is enabled,
-        # so both the gather and the upload happen a step ahead.
-        assert not patch_idx_per_sample.is_cuda and not ijs.is_cuda, (
-            'the atlas is host-resident: pass CPU indices/ijs; only the '
-            'interpolated points are uploaded')
+        # Caller must ensure floor(ij) lies on a valid quad. CPU lookup remains
+        # supported before materialisation and for CPU-only tests.
+        patch_idx_per_sample = patch_idx_per_sample.to(
+            device=self.zyxs_flat.device, dtype=torch.int64, non_blocking=True)
+        ijs = ijs.to(device=self.zyxs_flat.device, non_blocking=True)
         zyxs = bilinear_atlas_lookup(
             self.zyxs_flat,
             self.offsets,
@@ -352,14 +370,78 @@ class PatchAtlas:
             ijs,
             heights=self.heights,
         )
-        return zyxs.to(device=self.device, non_blocking=True)
+        return zyxs
+
+    def register_theta_topology(self, crossing_map):
+        """Register valid quad centres and every sampler-reachable edge."""
+        quad_patch_chunks = []
+        quad_ij_chunks = []
+        local_maps = []
+        num_quads = 0
+        for patch_idx, patch in enumerate(self._patches):
+            mask = np.asarray(patch._sampling_valid_quad_mask_np, dtype=bool)
+            coords = np.argwhere(mask).astype(np.int64, copy=False)
+            local = np.full(mask.shape, -1, dtype=np.int64)
+            local[mask] = np.arange(len(coords), dtype=np.int64) + num_quads
+            local_maps.append(local)
+            quad_patch_chunks.append(np.full(len(coords), patch_idx, dtype=np.int64))
+            quad_ij_chunks.append(coords)
+            num_quads += len(coords)
+        quad_patch = (
+            np.concatenate(quad_patch_chunks)
+            if quad_patch_chunks else np.empty(0, dtype=np.int64))
+        quad_ijs = (
+            np.concatenate(quad_ij_chunks)
+            if quad_ij_chunks else np.empty((0, 2), dtype=np.int64))
+        patch_t = torch.as_tensor(quad_patch, dtype=torch.int64, device=self.device)
+        ijs_t = torch.as_tensor(quad_ijs, dtype=torch.float32, device=self.device)
+
+        def get_centres(local_indices):
+            idx = patch_t[local_indices]
+            return self.lookup(idx, ijs_t[local_indices] + 0.5)
+
+        start = crossing_map.register_nodes(num_quads, get_centres)
+        self._theta_node_start = start
+        self._quad_node_ids = [m + np.where(m >= 0, start, 0) for m in local_maps]
+
+        neighbours = ((0, 1), (1, -1), (1, 0), (1, 1))
+        for patch, node_map in zip(self._patches, self._quad_node_ids):
+            patch_edges = []
+            mask = node_map >= start
+            h, w = mask.shape
+            for di, dj in neighbours:
+                a = node_map[:h - di, max(0, -dj):w - max(0, dj)]
+                b = node_map[di:, max(0, dj):w - max(0, -dj)]
+                valid = (a >= start) & (b >= start)
+                if valid.any():
+                    patch_edges.append(np.stack([a[valid], b[valid]], axis=1))
+            serpentine = getattr(patch, '_sampling_2d_path', None)
+            if serpentine is not None and len(serpentine) > 1:
+                ids = node_map[serpentine[:, 0], serpentine[:, 1]]
+                patch_edges.append(np.stack([ids[:-1], ids[1:]], axis=1))
+            if patch_edges:
+                crossing_map.register_edges(np.concatenate(patch_edges, axis=0))
+        return start
+
+    def theta_node_ids(self, patch_indices, ijs):
+        """Resolve fractional samples/path cells to registered quad-centre ids."""
+        patch_indices = np.asarray(patch_indices, dtype=np.int64)
+        cells = np.floor(np.asarray(ijs)).astype(np.int64)
+        out = np.empty(cells.shape[:-1], dtype=np.int64)
+        for patch_idx in np.unique(patch_indices):
+            which = patch_indices == patch_idx
+            selected = cells[which]
+            node_map = self._quad_node_ids[int(patch_idx)]
+            out[which] = node_map[selected[:, 0], selected[:, 1]]
+        if (out < 0).any():
+            raise RuntimeError('patch sampler selected a cell outside crossing topology')
+        return out
 
     def append_patches(self, patches_by_id):
         """Append new patches without rebuilding the resident atlas.
 
-        A host-side concatenation of just the new grids, so a resident
-        interactive session can incorporate a handful of added patches in
-        seconds.
+        Only the new grids are transferred to the atlas device, so a resident
+        interactive session can incorporate a handful of patches quickly.
         """
         if not patches_by_id:
             return
@@ -376,16 +458,19 @@ class PatchAtlas:
             offsets.append(offsets[-1] + H * W)
             widths.append(W)
             heights.append(H)
-        new_flat = torch.cat(flat_pieces, dim=0)
+        new_flat = torch.cat(flat_pieces, dim=0).to(self.zyxs_flat.device)
         self.zyxs_flat = torch.cat([self.zyxs_flat, new_flat], dim=0)
         self.offsets = torch.cat([
             self.offsets,
-            torch.tensor(offsets[1:], dtype=torch.int64),
+            torch.tensor(offsets[1:], dtype=torch.int64, device=self.offsets.device),
         ])
         self.widths = torch.cat([
-            self.widths, torch.tensor(widths, dtype=torch.int64)])
+            self.widths, torch.tensor(widths, dtype=torch.int64, device=self.widths.device)])
         self.heights = torch.cat([
-            self.heights, torch.tensor(heights, dtype=torch.int64)])
+            self.heights, torch.tensor(heights, dtype=torch.int64, device=self.heights.device)])
+        self._patches.extend(patches_by_id.values())
+        self._theta_node_start = None
+        self._quad_node_ids = []
         next_idx = len(self.id_to_idx)
         for pid in patches_by_id:
             self.id_to_idx[pid] = next_idx
@@ -1055,11 +1140,10 @@ class FitContext:
 
         Seeds the host RNG streams, then loads patches, point collections,
         fibers, tracks, and the outer shell; links and classifies PCLs;
-        builds the sampling caches, the host-resident patch atlases, the
+        builds the sampling caches, host-prepared patch atlases, the
         trusted-geometry index, the interactive influence anchor stash and
         the whole-object DT target samples. Requires no device state: the
-        patch atlases are host-resident (their `device` only selects where
-        each lookup's interpolated points are delivered), and the CUDA
+        patch atlases are moved as part of device-state setup, and the CUDA
         stores, model, and optimiser are built later by
         build_device_state().
 
@@ -1585,7 +1669,7 @@ class FitContext:
             'loading', 'Building verified-patch GPU atlas',
             detail=f'{len(verified_patches):,} patches')
         patch_atlas = PatchAtlas(verified_patches, device='cuda')
-        print(f'patch atlas (host-resident): {patch_atlas.memory_mb():.1f} MB')
+        print(f'patch atlas: {patch_atlas.memory_mb():.1f} MB')
 
         # ==========================================================================================
         # trusted geometry (verified patches and pcls) kdtree / unverified patches + tracks masking
@@ -1980,6 +2064,66 @@ class FitContext:
 
         self._sdt_inactive_warned = set()
 
+    def _build_theta_crossing_map(self):
+        """Rebuild the shared patch/PCL source topology.
+
+        This is derived device state. It is reconstructed after model rebuilds
+        and interactive input changes, and is never checkpointed.
+        """
+        crossing_map = ThetaCrossingMap(
+            self.device,
+            self.config['theta_crossing_map_update_interval'])
+        self.patch_atlas.register_theta_topology(crossing_map)
+        if self.unverified_patch_atlas is not None:
+            self.unverified_patch_atlas.register_theta_topology(crossing_map)
+
+        flat = get_or_build_unattached_pcl_flat(
+            self.unattached_pcl_strips, self.device)
+        if flat is not None:
+            start = crossing_map.register_nodes(
+                flat['total'], lambda local, points=flat['zyxs']: points[local])
+            starts = flat['starts_cpu'].numpy()
+            for strip_idx, strip in enumerate(self.unattached_pcl_strips):
+                node_ids = start + np.arange(
+                    starts[strip_idx], starts[strip_idx + 1], dtype=np.int64)
+                strip['_theta_node_ids'] = node_ids
+                if len(node_ids) > 1:
+                    crossing_map.register_edges(
+                        np.stack([node_ids[:-1], node_ids[1:]], axis=1))
+            for edges in self.unattached_component_edges:
+                junctions = []
+                for strip_a, pos_a, strip_b, pos_b in edges:
+                    junctions.append((
+                        self.unattached_pcl_strips[strip_a]['_theta_node_ids'][pos_a],
+                        self.unattached_pcl_strips[strip_b]['_theta_node_ids'][pos_b]))
+                if junctions:
+                    crossing_map.register_edges(junctions)
+
+        points = []
+        seen = set()
+        for pcl in self.cross_patch_pcls:
+            for point in pcl['points'].values():
+                if id(point) not in seen:
+                    seen.add(id(point))
+                    points.append(point)
+        if points:
+            point_zyxs = torch.as_tensor(
+                np.stack([p['zyx'] for p in points]).astype(np.float32),
+                device=self.device)
+            start = crossing_map.register_nodes(
+                len(points), lambda local, values=point_zyxs: values[local])
+            for local, point in enumerate(points):
+                point['_theta_node_id'] = start + local
+            for pcl in self.cross_patch_pcls:
+                chain = list(pcl['chain'].iter_chain())
+                if len(chain) > 1:
+                    ids = np.fromiter(
+                        (p['_theta_node_id'] for p in chain), dtype=np.int64)
+                    crossing_map.register_edges(
+                        np.stack([ids[:-1], ids[1:]], axis=1))
+
+        self.theta_crossing_map = crossing_map
+
     def _build_model_state(self):
         """Construct the model, the optimiser, and everything after them.
 
@@ -1995,6 +2139,9 @@ class FitContext:
 
         self.num_slices_for_visualisation = self.config.get('output_num_slices_for_visualization', 20)
         self.device = torch.device('cuda')
+        self.patch_atlas.materialize(self.device)
+        if self.unverified_patch_atlas is not None:
+            self.unverified_patch_atlas.materialize(self.device)
 
         # The full z series is a model input. PNG-only slice grids and raster inputs
         # are prepared lazily at final export, and never in a resident VC3D session.
@@ -2248,6 +2395,7 @@ class FitContext:
 
         self.slice_to_spiral_transform = self.spiral_and_transform.get_slice_to_spiral_transform()
         self.dr_per_winding = self.spiral_and_transform.get_dr_per_winding()
+        self._build_theta_crossing_map()
 
         # Caches are recomputed lazily once the corresponding DT loss is active.
         # Updates are deterministic given the transform, so DDP ranks stay consistent.
@@ -2810,6 +2958,7 @@ class FitContext:
                     float(self.config['loss_weight_dense_spacing_density']), 1.0)
             transform = self.spiral_and_transform.get_slice_to_spiral_transform()
             dr = self.spiral_and_transform.get_dr_per_winding()
+            self.theta_crossing_map.force_refresh(transform)
             progress.begin(
                 'exporting_preview', 'Computing preview diagnostics')
             recorder = LossMapRecorder(
@@ -2830,6 +2979,7 @@ class FitContext:
                     compute_dt=self.config['loss_weight_patch_dt'] > 0,
                     shell_valid_zyxs=self.shell_valid_zyxs_gpu,
                     shell_outer_winding_idx=self.shell_outer_winding_idx,
+                    crossing_map=self.theta_crossing_map,
                     cfg=self.config,
                 )
                 if self.unverified_patch_atlas is not None:
@@ -2840,6 +2990,7 @@ class FitContext:
                         self.unverified_patches_list, self.unverified_patch_atlas,
                         self.unverified_patch_sampling_probabilities,
                         compute_dt=self.config['loss_weight_unverified_patch_dt'] > 0,
+                        crossing_map=self.theta_crossing_map,
                         cfg=self.config,
                     )
                 if self.config['loss_weight_sym_dirichlet'] > 0:
@@ -2851,11 +3002,13 @@ class FitContext:
                     get_patch_rel_winding_loss(
                         transform, dr, self.verified_patches, self.patch_atlas,
                         self.cross_patch_pcls, self.pcl_sampling_strata['cross_patch'],
+                        crossing_map=self.theta_crossing_map,
                         cfg=self.config, z_begin=self.z_begin, z_end=self.z_end)
                 if self.config['loss_weight_abs_winding'] > 0 and self.cross_patch_pcls:
                     get_patch_abs_winding_loss(
                         transform, dr, self.verified_patches, self.patch_atlas,
                         self.cross_patch_pcls,
+                        crossing_map=self.theta_crossing_map,
                         cfg=self.config, z_begin=self.z_begin, z_end=self.z_end)
                 if self.lasagna_volume is not None:
                     for _loss_name, _loss_value in iter_lasagna_losses(
@@ -2890,6 +3043,7 @@ class FitContext:
                         self.config['sample_count_unattached_pcls_per_step'],
                         self.config['sample_count_unattached_pcl_points_per_step'],
                         compute_dt=self.config['loss_weight_unattached_pcl_dt'] > 0,
+                        crossing_map=self.theta_crossing_map,
                         cfg=self.config,
                     )
                 if self.prepared_main_tracks is not None:
@@ -3183,6 +3337,7 @@ class FitContext:
                 # Whole-object DT target caches index the (now longer) object
                 # pools; force recomputation on next use.
                 self.dt_target_cache_manager.reset()
+                self._build_theta_crossing_map()
 
             if run_cfg['influence_enabled'] and (new_patches or new_collections):
                 self.influence_state = make_influence_state(run_cfg, torch.device('cuda'))
@@ -3282,10 +3437,12 @@ class FitContext:
             if 'patch_loss_z_margin' in changed:
                 self.patch_sampling_probabilities = \
                     self._prepare_patch_sampling_cache(self.verified_patches_list)
+                self.patch_atlas.rebuild_sampling_atlas()
                 if self.unverified_patches_list:
                     self.unverified_patch_sampling_probabilities = \
                         self._prepare_patch_sampling_cache(
                             self.unverified_patches_list)
+                    self.unverified_patch_atlas.rebuild_sampling_atlas()
             elif 'patch_sampling_area_exponent' in changed:
                 self.patch_sampling_probabilities = self._patch_sampling_probabilities(
                     self.verified_patches_list)
@@ -3373,6 +3530,17 @@ class FitContext:
         self.unverified_patch_sampling_probabilities = \
             rebuilt_unverified_probabilities
         self.unverified_patch_atlas = rebuilt_unverified_atlas
+        if self.unverified_patch_atlas is not None:
+            self.unverified_patch_atlas.materialize(self.device)
+        if changed & {
+                'patch_loss_z_margin',
+                'patch_unverified_patch_exclusion_radius',
+        }:
+            self._build_theta_crossing_map()
+        elif 'theta_crossing_map_update_interval' in changed:
+            # refresh_if_due observes the changed interval on the next step and
+            # resets its cadence without rebuilding immutable topology.
+            self.theta_crossing_map.invalidate()
 
     def step(self, iteration):
         self.step_timer.start('fwd')
@@ -3392,6 +3560,10 @@ class FitContext:
         self.slice_to_spiral_transform = self.spiral_and_transform.get_slice_to_spiral_transform(
             shared=shared_transform_leaves)
         self.dr_per_winding = shared_transform_leaves[0]
+        self.theta_crossing_map.refresh_if_due(
+            iteration,
+            self.slice_to_spiral_transform,
+            self.config['theta_crossing_map_update_interval'])
 
         losses = {}
         log_metrics = {
@@ -3489,6 +3661,7 @@ class FitContext:
             shell_outer_winding_idx=self.shell_outer_winding_idx,
             dt_max_winding=patch_dt_max_winding,
             dt_target_cache=patch_dt_target_cache,
+            crossing_map=self.theta_crossing_map,
             cfg=self.config,
         )
         patch_family = {
@@ -3516,6 +3689,7 @@ class FitContext:
                 compute_dt=compute_unverified_patch_dt,
                 dt_max_winding=unverified_patch_dt_max_winding,
                 dt_target_cache=unverified_patch_dt_target_cache,
+                crossing_map=self.theta_crossing_map,
                 cfg=self.config,
             )
             backward_family({
@@ -3544,6 +3718,7 @@ class FitContext:
                     self.patch_atlas,
                     self.cross_patch_pcls,
                     self.pcl_sampling_strata['cross_patch'],
+                    crossing_map=self.theta_crossing_map,
                     cfg=self.config, z_begin=self.z_begin, z_end=self.z_end,
                 ) * self.config['loss_weight_rel_winding'],
             })
@@ -3556,6 +3731,7 @@ class FitContext:
                     self.verified_patches,
                     self.patch_atlas,
                     self.cross_patch_pcls,
+                    crossing_map=self.theta_crossing_map,
                     cfg=self.config, z_begin=self.z_begin, z_end=self.z_end,
                 ) * self.config['loss_weight_abs_winding'],
             })
@@ -3687,6 +3863,7 @@ class FitContext:
                 compute_dt=compute_patch_dt,
                 dt_max_winding=patch_dt_max_winding,
                 dt_target_cache=unattached_pcl_dt_target_cache,
+                crossing_map=self.theta_crossing_map,
                 cfg=self.config,
             )
             backward_family({

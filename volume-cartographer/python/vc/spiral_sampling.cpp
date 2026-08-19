@@ -61,6 +61,18 @@ nb::ndarray<nb::numpy, T, nb::ndim<4>> own_4d(
         held->data(), {a, b, c, d}, owner);
 }
 
+template <typename T>
+nb::ndarray<nb::numpy, T, nb::ndim<3>> own_3d(
+    std::vector<T>&& values, size_t a, size_t b, size_t c)
+{
+    auto* held = new std::vector<T>(std::move(values));
+    nb::capsule owner(held, [](void* pointer) noexcept {
+        delete static_cast<std::vector<T>*>(pointer);
+    });
+    return nb::ndarray<nb::numpy, T, nb::ndim<3>>(
+        held->data(), {a, b, c}, owner);
+}
+
 uint64_t splitmix64(uint64_t value)
 {
     value += 0x9e3779b97f4a7c15ULL;
@@ -261,6 +273,55 @@ public:
                       static_cast<size_t>(points_per_direction), 2);
     }
 
+    nb::dict sample_patch_walks(
+        Int64Vector patch_indices, int points_per_direction, uint64_t seed) const
+    {
+        auto ijs = sample_patch_strips(
+            patch_indices, points_per_direction, seed);
+        const size_t count = patch_indices.shape(0);
+        std::vector<int64_t> path_ijs;
+        std::vector<int64_t> path_offsets(2 * count + 1, 0);
+        std::vector<int64_t> pick_positions(
+            2 * count * static_cast<size_t>(points_per_direction));
+        for (size_t direction = 0; direction < 2; ++direction) {
+            for (size_t sample = 0; sample < count; ++sample) {
+                int lo = std::numeric_limits<int>::max();
+                int hi = std::numeric_limits<int>::min();
+                const int varying_axis = direction == 0 ? 1 : 0;
+                const int fixed_axis = 1 - varying_axis;
+                for (int point = 0; point < points_per_direction; ++point) {
+                    const int varying = static_cast<int>(std::floor(
+                        ijs(direction, sample, static_cast<size_t>(point), varying_axis)));
+                    lo = std::min(lo, varying);
+                    hi = std::max(hi, varying);
+                }
+                const int fixed = static_cast<int>(std::floor(
+                    ijs(direction, sample, 0, fixed_axis)));
+                const size_t row = direction * count + sample;
+                path_offsets[row + 1] = path_offsets[row] + hi - lo + 1;
+                for (int varying = lo; varying <= hi; ++varying) {
+                    path_ijs.push_back(direction == 0 ? fixed : varying);
+                    path_ijs.push_back(direction == 0 ? varying : fixed);
+                }
+                for (int point = 0; point < points_per_direction; ++point) {
+                    const int varying = static_cast<int>(std::floor(
+                        ijs(direction, sample, static_cast<size_t>(point), varying_axis)));
+                    pick_positions[(row * points_per_direction)
+                        + static_cast<size_t>(point)] = varying - lo;
+                }
+            }
+        }
+        nb::dict result;
+        result["ijs"] = std::move(ijs);
+        result["path_ijs"] = own_2d(
+            std::move(path_ijs), static_cast<size_t>(path_offsets.back()), 2);
+        result["path_offsets"] = own_1d(std::move(path_offsets));
+        result["pick_positions"] = own_3d(
+            std::move(pick_positions), 2, count,
+            static_cast<size_t>(points_per_direction));
+        return result;
+    }
+
     nb::dict sample_l_shapes(
         Int64Vector patch_indices, Int64Matrix anchors,
         int points_per_shape, uint64_t seed) const
@@ -276,6 +337,8 @@ public:
                 throw std::runtime_error("patch index is out of range");
         }
         std::vector<float> output(count * 4 * points_per_shape * 2);
+        std::vector<int64_t> pick_positions(count * 4 * points_per_shape);
+        std::vector<int64_t> waypoints(count * 4 * 3 * 2);
         std::vector<uint8_t> valid(count, 0);
         {
             nb::gil_scoped_release release;
@@ -316,6 +379,16 @@ public:
                     const int second_far = second_direction > 0 ? second_hi - 1 : second_lo;
                     const int second_max = std::abs(second_far - second_start);
                     const int total_steps = turn_step + second_max;
+                    const int end_row = second_horizontal ? turn_row : second_far;
+                    const int end_column = second_horizontal ? second_far : turn_column;
+                    const size_t waypoint_base =
+                        (static_cast<size_t>(anchor_index) * 4 + shape) * 6;
+                    waypoints[waypoint_base] = row;
+                    waypoints[waypoint_base + 1] = column;
+                    waypoints[waypoint_base + 2] = turn_row;
+                    waypoints[waypoint_base + 3] = turn_column;
+                    waypoints[waypoint_base + 4] = end_row;
+                    waypoints[waypoint_base + 5] = end_column;
                     const auto steps = sample_sorted_positions(
                         rng, total_steps + 1, points_per_shape);
                     const float first_fixed_jitter = uniform_float(rng);
@@ -345,6 +418,10 @@ public:
                             + static_cast<size_t>(point)) * 2);
                         output[base] = out_row;
                         output[base + 1] = out_column;
+                        const size_t pick_base =
+                            (static_cast<size_t>(anchor_index) * 4 + shape)
+                            * points_per_shape + static_cast<size_t>(point);
+                        pick_positions[pick_base] = step;
                     }
                 }
             }
@@ -352,6 +429,11 @@ public:
         nb::dict result;
         result["ijs"] = own_4d(std::move(output), count, 4,
                                static_cast<size_t>(points_per_shape), 2);
+        result["pick_positions"] = own_3d(
+            std::move(pick_positions), count, 4,
+            static_cast<size_t>(points_per_shape));
+        result["waypoints"] = own_4d(
+            std::move(waypoints), count, 4, 3, 2);
         result["valid"] = own_1d(std::move(valid));
         return result;
     }
@@ -493,6 +575,8 @@ NB_MODULE(spiral_sampling, module)
         .def(nb::init<const nb::list&>(), nb::arg("masks"))
         .def("append", &PatchSamplingAtlas::append, nb::arg("masks"))
         .def("sample_patch_strips", &PatchSamplingAtlas::sample_patch_strips,
+             nb::arg("patch_indices"), nb::arg("points_per_direction"), nb::arg("seed"))
+        .def("sample_patch_walks", &PatchSamplingAtlas::sample_patch_walks,
              nb::arg("patch_indices"), nb::arg("points_per_direction"), nb::arg("seed"))
         .def("sample_l_shapes", &PatchSamplingAtlas::sample_l_shapes,
              nb::arg("patch_indices"), nb::arg("anchors"),

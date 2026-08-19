@@ -4,8 +4,8 @@ that span multiple windings (long fibers).
 The loss samples only num_points_per_pcl points per row; on a fiber wrapping
 several turns, consecutive samples can sit more than pi apart in theta, where
 a consecutive-diff crossing detector miscounts seam crossings and assigns
-wrong winding offsets even to a perfectly-fit strip. The fix counts crossings
-along the full dense walk (_dense_walk_crossing_adjustments); these tests pin
+wrong winding offsets even to a perfectly-fit strip. The crossing map caches
+the full source topology; these tests pin
 that a geometrically perfect spiral fiber yields ~zero radius and DT loss
 regardless of how many windings it spans."""
 
@@ -14,11 +14,10 @@ import torch
 
 from config import Config
 from losses import (
-    PackedDenseWalks,
-    _dense_walk_crossing_adjustments,
     build_pcl_sampling_strata,
     get_unattached_pcl_strip_losses,
 )
+from theta_crossing_map import ThetaCrossingMap
 
 DR = 12.0
 
@@ -74,6 +73,15 @@ def _run_losses(zyxs_list, cfg, num_steps=25, compute_dt=True, seed=0):
     torch.manual_seed(seed)
     strips = _strips(zyxs_list)
     flat = _flat_bundle(zyxs_list)
+    crossing_map = ThetaCrossingMap('cpu')
+    node_start = crossing_map.register_nodes(
+        flat['total'], lambda indices: flat['zyxs'][indices])
+    starts = flat['starts_cpu'].numpy()
+    for strip_idx, strip in enumerate(strips):
+        ids = node_start + np.arange(starts[strip_idx], starts[strip_idx + 1])
+        strip['_theta_node_ids'] = ids
+        crossing_map.register_edges(np.stack([ids[:-1], ids[1:]], axis=1))
+    crossing_map.force_refresh(IdentityTransform())
     strata = build_pcl_sampling_strata(
         ['fibers'] * len(zyxs_list), cfg,
         member_weights=[1] * len(zyxs_list))
@@ -86,7 +94,7 @@ def _run_losses(zyxs_list, cfg, num_steps=25, compute_dt=True, seed=0):
             IdentityTransform(), dr, strips, components, edges, strata,
             lambda _strips, _device: flat,
             len(zyxs_list), cfg['sample_count_unattached_pcl_points_per_step'],
-            compute_dt=compute_dt, cfg=cfg,
+            compute_dt=compute_dt, crossing_map=crossing_map, cfg=cfg,
         )
         radius_losses.append(float(radius_loss))
         dt_losses.append(float(dt_loss))
@@ -119,26 +127,3 @@ def test_subwrap_strip_across_seam_still_has_zero_loss():
     radius_losses, dt_losses = _run_losses([fiber], cfg)
     assert radius_losses.max() < 1e-3
     assert dt_losses.max() < 1e-3
-
-
-def test_dense_walk_adjustments_are_anchored_at_first_pick():
-    # The adjustment at each row's first pick must be zero (legacy frame), and
-    # picks separated by full wraps must differ by whole -DR steps.
-    fiber = _perfect_spiral_fiber(3.0, spacing=40.0)
-    flat = _flat_bundle([fiber])
-    theta = np.arctan2(fiber[:, 1], fiber[:, 2]) % (2 * np.pi)
-    crossings = np.concatenate([[0], np.cumsum(np.diff(theta) < -np.pi)])
-    first, mid, last = 3, len(fiber) // 2, len(fiber) - 1
-    picks = np.array([[first, mid, last]], dtype=np.int64)
-    packed = PackedDenseWalks(
-        rows=torch.tensor([0]),
-        walk_zyxs=flat['zyxs'][None],
-        pick_positions=torch.from_numpy(picks),
-    )
-    sampled_theta = torch.from_numpy(theta[picks])
-    adjustments, rows = _dense_walk_crossing_adjustments(
-        IdentityTransform(), torch.tensor(DR), sampled_theta, packed)
-    expected = -DR * (crossings[[first, mid, last]] - crossings[first])
-    assert torch.equal(rows, torch.tensor([0]))
-    assert torch.allclose(
-        adjustments, torch.tensor(expected, dtype=torch.float32)[None], atol=1e-5)

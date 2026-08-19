@@ -240,7 +240,7 @@ class SharedTransformLeafTests(unittest.TestCase):
         self._check_streamed_leaf_backwards_match_combined('cylindrical')
 
 
-class HostResidentPatchAtlasTests(unittest.TestCase):
+class DevicePatchAtlasTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         # fit_spiral is import-heavy (wandb, zarr, ...); load it once for the
@@ -254,6 +254,7 @@ class HostResidentPatchAtlasTests(unittest.TestCase):
         return types.SimpleNamespace(
             zyxs=torch.rand(height, width, 3, generator=generator) * 100.,
             _sampling_valid_quad_mask_np=np.ones((height - 1, width - 1), dtype=bool),
+            _sampling_2d_path=None,
         )
 
     @staticmethod
@@ -264,7 +265,7 @@ class HostResidentPatchAtlasTests(unittest.TestCase):
         bottom = grid[i0 + 1, j0] * (1 - dj) + grid[i0 + 1, j0 + 1] * dj
         return top * (1 - di) + bottom * di
 
-    def test_atlas_stays_on_host_and_lookup_matches_manual_bilinear(self):
+    def test_cpu_fallback_lookup_matches_manual_bilinear(self):
         patches = {'a': self._fake_patch(5, 7, 0), 'b': self._fake_patch(9, 4, 1)}
         atlas = self.PatchAtlas(patches, device='cpu')
         self.assertEqual(atlas.zyxs_flat.device.type, 'cpu')
@@ -279,7 +280,7 @@ class HostResidentPatchAtlasTests(unittest.TestCase):
         ])
         torch.testing.assert_close(out, expected)
 
-    def test_append_patches_stays_on_host(self):
+    def test_cpu_fallback_append(self):
         atlas = self.PatchAtlas({'a': self._fake_patch(5, 5, 3)}, device='cpu')
         extra = self._fake_patch(4, 8, 4)
         atlas.append_patches({'b': extra})
@@ -289,35 +290,43 @@ class HostResidentPatchAtlasTests(unittest.TestCase):
         torch.testing.assert_close(out[0], self._manual_bilinear(extra.zyxs, 1.5, 2.5))
 
     @unittest.skipUnless(torch.cuda.is_available(), 'needs CUDA')
-    def test_lookup_uploads_only_interpolated_points(self):
-        atlas = self.PatchAtlas({'a': self._fake_patch(6, 6, 2)}, device='cuda')
-        self.assertEqual(atlas.zyxs_flat.device.type, 'cpu')
-        idx = torch.zeros(3, dtype=torch.int64)
-        ijs = torch.tensor([[0.5, 0.5], [2.25, 3.75], [4.0, 4.0]])
+    def test_materialized_lookup_and_append_stay_on_cuda(self):
+        atlas = self.PatchAtlas(
+            {'a': self._fake_patch(6, 6, 2)}, device='cuda').materialize()
+        self.assertEqual(atlas.zyxs_flat.device.type, 'cuda')
+        self.assertTrue(atlas.offsets.is_cuda)
+        idx = torch.zeros(3, dtype=torch.int64, device='cuda')
+        ijs = torch.tensor(
+            [[0.5, 0.5], [2.25, 3.75], [4.0, 4.0]], device='cuda')
         out = atlas.lookup(idx, ijs)
         self.assertTrue(out.is_cuda)
-        with self.assertRaises(AssertionError):
-            atlas.lookup(idx.cuda(), ijs.cuda())
+        atlas.append_patches({'b': self._fake_patch(4, 5, 8)})
+        self.assertTrue(atlas.zyxs_flat.is_cuda)
+        self.assertTrue(atlas.widths.is_cuda)
 
     @unittest.skipUnless(torch.cuda.is_available(), 'needs CUDA')
     def test_sample_patch_batch_carries_pregathered_points(self):
         import losses as losses_module
         patches = {f'p{n}': self._fake_patch(8, 8, 10 + n) for n in range(3)}
-        atlas = self.PatchAtlas(patches, device='cuda')
+        atlas = self.PatchAtlas(patches, device='cuda').materialize()
         if atlas.sampling_atlas is None:
             self.skipTest('native spiral sampling module unavailable')
         cfg = {'patch_strip_sampling': 'straight'}
+        from theta_crossing_map import ThetaCrossingMap
+        crossing_map = ThetaCrossingMap('cuda')
+        atlas.register_theta_topology(crossing_map)
+        crossing_map.force_refresh(lambda value: value)
         np.random.seed(0)
         probabilities = np.full(3, 1 / 3, dtype=np.float64)
         ijs_gpu, idx_gpu, zyxs_gpu, _ = losses_module._sample_patch_batch(
             'test_patches', list(patches.values()), probabilities,
             num_to_sample=4, num_points_per_direction=6, cfg=cfg,
-            patch_atlas=atlas)
+            patch_atlas=atlas, crossing_map=crossing_map)
         self.assertEqual(tuple(zyxs_gpu.shape), (2, 4, 6, 3))
         self.assertTrue(zyxs_gpu.is_cuda)
         idx_cpu = idx_gpu.cpu()
         expected = atlas.lookup(
-            idx_cpu[None, :, None].expand(2, 4, 6), ijs_gpu.cpu())
+            idx_gpu[None, :, None].expand(2, 4, 6), ijs_gpu)
         torch.testing.assert_close(zyxs_gpu, expected)
 
     @unittest.skipUnless(torch.cuda.is_available(), 'needs CUDA')
@@ -326,10 +335,14 @@ class HostResidentPatchAtlasTests(unittest.TestCase):
         import losses as losses_module
         import prefetch as prefetch_module
         patches = {f'p{n}': self._fake_patch(8, 8, 20 + n) for n in range(3)}
-        atlas = self.PatchAtlas(patches, device='cuda')
+        atlas = self.PatchAtlas(patches, device='cuda').materialize()
         if atlas.sampling_atlas is None:
             self.skipTest('native spiral sampling module unavailable')
         cfg = {'patch_strip_sampling': 'straight'}
+        from theta_crossing_map import ThetaCrossingMap
+        crossing_map = ThetaCrossingMap('cuda')
+        atlas.register_theta_topology(crossing_map)
+        crossing_map.force_refresh(lambda value: value)
         os.environ['FIT_SPIRAL_PREFETCH'] = '1'
         try:
             probabilities = np.full(3, 1 / 3, dtype=np.float64)
@@ -339,15 +352,15 @@ class HostResidentPatchAtlasTests(unittest.TestCase):
                 ijs_gpu, idx_gpu, zyxs_gpu, _ = losses_module._sample_patch_batch(
                     'test_prefetch_patches', list(patches.values()), probabilities,
                     num_to_sample=4, num_points_per_direction=6, cfg=cfg,
-                    patch_atlas=atlas)
+                    patch_atlas=atlas, crossing_map=crossing_map)
                 self.assertEqual(tuple(zyxs_gpu.shape), (2, 4, 6, 3))
                 expected = atlas.lookup(
-                    idx_gpu.cpu()[None, :, None].expand(2, 4, 6), ijs_gpu.cpu())
+                    idx_gpu[None, :, None].expand(2, 4, 6), ijs_gpu)
                 torch.testing.assert_close(zyxs_gpu, expected)
         finally:
             os.environ.pop('FIT_SPIRAL_PREFETCH', None)
             prefetch_module.get_prefetcher().drop(
-                ('test_prefetch_patches', 4, 6))
+                ('test_prefetch_patches', id(crossing_map), 4, 6))
 
 
 class NonFiniteGradCheckTests(unittest.TestCase):

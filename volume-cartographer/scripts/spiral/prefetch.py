@@ -1,8 +1,7 @@
 """One-step-ahead prefetch of per-step CPU batch assembly.
 
-The training loop's per-step CPU work (numpy patch-strip sampling, the
-bilinear gather on the host-resident patch atlas, the track point gather, and
-their host->device uploads) otherwise runs serially while the GPU is idle:
+The training loop's per-step CPU work (numpy patch-strip/topology sampling and
+the track point gather) otherwise runs serially while the GPU is idle:
 the track gather even forces a device sync. Prefetching runs
 the *next* step's sampling on a worker thread while the GPU chews on the
 current step.
@@ -150,7 +149,7 @@ class StepPrefetcher:
         self._pending[key] = self._ensure_executor().submit(self.run_job, job)
         torch.cuda.current_stream().wait_event(evt)
         # CUDA tensors may be nested in per-loss metadata containers (for
-        # example PackedDenseWalks). Record every one on the
+        # example PackedWalks). Record every one on the
         # consumer stream so the caching allocator cannot recycle its
         # side-stream allocation while consumer kernels are still using it.
         for t in _iter_tensors(result):

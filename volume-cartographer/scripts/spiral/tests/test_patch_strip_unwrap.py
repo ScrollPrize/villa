@@ -6,12 +6,9 @@ dijkstra geodesic, or a serpentine 2D walk) and stitch theta=0 crossings from
 consecutive-pick raw diffs. On a band whose strips span tens of windings the
 picks sit more than pi apart in theta and the detector misassigns winding
 offsets even on a perfectly-fit patch (the patch analogue of the long-fiber
-bug). The fix recomputes crossing adjustments along the strip's dense walk for
-strips whose walk exceeds _PATCH_DENSE_UNWRAP_WALK_FACTOR * P cells; these
-tests pin that a geometrically perfect multi-wrap band reads ~zero radius and
-DT loss in both strip-sampling modes, that the dense path reproduces the
-sparse unwrap exactly where the latter was already correct, and that the
-straight-strip walk reconstruction is faithful."""
+bug). These tests pin that the cached source-topology crossings make a
+geometrically perfect multi-wrap band read ~zero radius and DT loss in both
+strip-sampling modes."""
 
 import numpy as np
 import pytest
@@ -19,20 +16,11 @@ import torch
 
 from config import Config
 import losses
-from losses import (
-    PackedDenseWalks,
-    _dense_walk_crossing_adjustments,
-    _reconstruct_straight_dense_walks,
-    get_unverified_patch_losses,
-)
+from losses import get_unverified_patch_losses
+from theta_crossing_map import ThetaCrossingMap
 
 DR = 12.0
 CELL = 20.0
-
-requires_cuda = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason='_sample_patch_batch uploads the batch with .cuda()')
-
 
 class IdentityTransform:
     def __call__(self, zyxs):
@@ -70,6 +58,7 @@ class FakeAtlas:
     def __init__(self, grids, device):
         self.grids = grids
         self.device = torch.device(device)
+        self.node_maps = []
 
     def lookup(self, patch_idx_per_sample, ijs):
         idx = patch_idx_per_sample.reshape(-1)
@@ -86,6 +75,35 @@ class FakeAtlas:
                       + di * (1 - dj) * g[i0 + 1, j0]
                       + di * dj * g[i0 + 1, j0 + 1])
         return out.reshape(*ijs.shape[:-1], 3).to(device=self.device)
+
+    def register_topology(self, crossing_map):
+        for patch_idx, grid in enumerate(self.grids):
+            h, w = grid.shape[0] - 1, grid.shape[1] - 1
+            centres = (
+                grid[:-1, :-1] + grid[1:, :-1]
+                + grid[:-1, 1:] + grid[1:, 1:]) / 4
+            centres = centres.reshape(-1, 3).to(self.device)
+            start = crossing_map.register_nodes(
+                h * w,
+                lambda indices, values=centres: values[indices])
+            node_map = start + np.arange(h * w, dtype=np.int64).reshape(h, w)
+            self.node_maps.append(node_map)
+            edges = []
+            for di, dj in ((0, 1), (1, -1), (1, 0), (1, 1)):
+                a = node_map[:h - di, max(0, -dj):w - max(0, dj)]
+                b = node_map[di:, max(0, dj):w - max(0, -dj)]
+                edges.append(np.stack([a.reshape(-1), b.reshape(-1)], axis=1))
+            crossing_map.register_edges(np.concatenate(edges))
+
+    def theta_node_ids(self, patch_indices, ijs):
+        patch_indices = np.asarray(patch_indices)
+        cells = np.floor(ijs).astype(np.int64)
+        out = np.empty(cells.shape[:-1], dtype=np.int64)
+        for patch_idx in np.unique(patch_indices):
+            which = patch_indices == patch_idx
+            picked = cells[which]
+            out[which] = self.node_maps[patch_idx][picked[:, 0], picked[:, 1]]
+        return out
 
 
 class FakePatch:
@@ -109,7 +127,7 @@ class FakePatch:
             self._strip_path_pool = [path]
 
 
-def _run_losses(grid, cfg, monkeypatch, num_steps=6, seed=0, device='cuda'):
+def _run_losses(grid, cfg, monkeypatch, num_steps=6, seed=0, device='cpu'):
     monkeypatch.setattr(
         losses.strip_path_pools, 'ensure_patch_path_pools', lambda patches: None)
     monkeypatch.setattr(
@@ -118,18 +136,21 @@ def _run_losses(grid, cfg, monkeypatch, num_steps=6, seed=0, device='cuda'):
     torch.manual_seed(seed)
     patch = FakePatch(grid, cfg['patch_strip_sampling'])
     atlas = FakeAtlas([grid], device)
+    crossing_map = ThetaCrossingMap(device)
+    atlas.register_topology(crossing_map)
+    crossing_map.force_refresh(IdentityTransform())
     dr = torch.tensor(DR, device=device)
     radius_losses, dt_losses = [], []
     for _ in range(num_steps):
         radius_loss, dt_loss = get_unverified_patch_losses(
             IdentityTransform(), dr, 1, 1, [patch], atlas,
-            np.array([1.0]), compute_dt=True, cfg=cfg)
+            np.array([1.0]), compute_dt=True,
+            crossing_map=crossing_map, cfg=cfg)
         radius_losses.append(float(radius_loss))
         dt_losses.append(float(dt_loss))
     return np.array(radius_losses), np.array(dt_losses)
 
 
-@requires_cuda
 @pytest.mark.parametrize('mode', ['straight', 'dijkstra'])
 def test_multiwrap_perfect_band_has_zero_loss(mode, monkeypatch):
     # A perfect 40-wrap band strip sampled at 400 picks: consecutive picks can
@@ -143,79 +164,11 @@ def test_multiwrap_perfect_band_has_zero_loss(mode, monkeypatch):
     assert dt_losses.max() < 1e-3
 
 
-@requires_cuda
-def test_legacy_sparse_unwrap_fails_on_multiwrap_band(monkeypatch):
-    # Sanity check that the scenario above actually regresses something:
-    # disabling the dense walk (factor so large it never fires) restores the
-    # legacy sparse unwrap, which must misread the same perfect band.
-    cfg = Config().as_dict()
-    cfg['patch_strip_sampling'] = 'straight'
-    monkeypatch.setattr(losses, '_PATCH_DENSE_UNWRAP_WALK_FACTOR', 10 ** 9)
-    grid = _band_grid(40.0)
-    radius_losses, _ = _run_losses(grid, cfg, monkeypatch)
-    assert radius_losses.max() > 1e-3
-
-
-@requires_cuda
 @pytest.mark.parametrize('mode', ['straight', 'dijkstra'])
-def test_dense_walk_matches_sparse_unwrap_on_short_strips(mode, monkeypatch):
-    # On a sub-wrap band crossing the theta=0 seam the sparse unwrap is
-    # already correct; forcing the dense walk onto every strip (factor 0) must
-    # reproduce its losses exactly (same RNG, so the picks are identical).
+def test_crossing_map_handles_short_strips(mode, monkeypatch):
     cfg = Config().as_dict()
     cfg['patch_strip_sampling'] = mode
     grid = _band_grid(0.8, theta0=1.75 * np.pi)
-    monkeypatch.setattr(losses, '_PATCH_DENSE_UNWRAP_WALK_FACTOR', 10 ** 9)
-    legacy_radius, legacy_dt = _run_losses(grid, cfg, monkeypatch, seed=3)
-    monkeypatch.setattr(losses, '_PATCH_DENSE_UNWRAP_WALK_FACTOR', 0)
-    dense_radius, dense_dt = _run_losses(grid, cfg, monkeypatch, seed=3)
-    assert legacy_radius.max() < 1e-3
-    np.testing.assert_array_equal(legacy_radius, dense_radius)
-    np.testing.assert_array_equal(legacy_dt, dense_dt)
-
-
-def test_reconstruct_straight_dense_walks():
-    # Slot 0 fixes axis 0 (a row strip): the walk must cover exactly the
-    # picks' floor-cell range at quad centres, with positions the picks'
-    # offsets into it; a strip below the length threshold yields no entry.
-    P = 4
-    ijs = np.zeros([2, 1, P, 2], dtype=np.float32)
-    ijs[0, 0, :, 0] = 7.3
-    ijs[0, 0, :, 1] = [2.5, 30.1, 55.9, 90.2]
-    ijs[1, 0, :, 1] = 3.7
-    ijs[1, 0, :, 0] = [1.2, 2.5, 3.1, 4.9]  # span 4 cells <= 2 * P: skipped
-    walks = _reconstruct_straight_dense_walks(ijs, P, skip=set())
-    assert len(walks) == 1
-    walk = walks[0]
-    assert walk.row == 0
-    assert walk.path.shape == (89, 2)
-    np.testing.assert_allclose(walk.path[:, 0], 7.3, rtol=1e-6)
-    np.testing.assert_allclose(walk.path[:, 1], np.arange(2, 91) + 0.5)
-    np.testing.assert_array_equal(walk.pick_positions, [0, 28, 53, 88])
-
-
-def test_dense_walk_connects_quad_centres_to_jittered_picks():
-    # The shared dense-walk helper must include the final theta step from each
-    # path cell's centre to the actual fractional patch pick. Flattened row 1
-    # is selected here; row 0 is deliberately unrelated.
-    walk_theta = torch.tensor([0.1, 0.2])
-    walk_zyxs = torch.stack([
-        torch.zeros_like(walk_theta),
-        torch.sin(walk_theta),
-        torch.cos(walk_theta),
-    ], dim=-1)[None]
-    sampled_theta = torch.tensor([
-        [1.0, 1.1],
-        [2 * np.pi - 0.1, 0.2],
-    ])
-    packed = PackedDenseWalks(
-        rows=torch.tensor([1]),
-        walk_zyxs=walk_zyxs,
-        pick_positions=torch.tensor([[0, 1]]),
-    )
-
-    adjustments, rows = _dense_walk_crossing_adjustments(
-        IdentityTransform(), torch.tensor(DR), sampled_theta, packed)
-
-    assert torch.equal(rows, torch.tensor([1]))
-    assert torch.allclose(adjustments, torch.tensor([[0.0, -DR]]))
+    radius, dt = _run_losses(grid, cfg, monkeypatch, seed=3)
+    assert radius.max() < 1e-3
+    assert dt.max() < 1e-3

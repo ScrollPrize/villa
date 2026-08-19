@@ -195,7 +195,11 @@ def _field_spec(key, default):
     }
     if kind in ("integer", "number"):
         spec.update(
-            minimum=1 if key == "output_num_slices_for_visualization" else 0,
+            minimum=(
+                1 if key in {
+                    "output_num_slices_for_visualization",
+                    "theta_crossing_map_update_interval",
+                } else 0),
             maximum=(1_000_000 if key == "output_num_slices_for_visualization"
                      else 1_000_000_000),
             step=1 if kind == "integer" else .01,
@@ -244,6 +248,9 @@ class Config:
         self.model_gap_expander_lr_scale = 0.3
         self.model_linear_z_resolution = 48
         self.model_initial_dr_per_winding = 16.0
+        # Patch/PCL theta=0 topology is transformed only on this cadence.  The
+        # cached signed crossings are otherwise gathered by sampled walks.
+        self.theta_crossing_map_update_interval = 100
         self.patch_radius_loss_margin = 0.025
         self.patch_radius_loss_inv = False
         self.patch_loss_z_margin = 0

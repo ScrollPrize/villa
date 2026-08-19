@@ -15,7 +15,6 @@ from sample_spiral import (
     canonical_winding_samples,
     get_theta_and_radii,
     radius_from_unwrapped_shifted,
-    unwrap_shifted_radii,
 )
 from spiral_helpers import _huber_abs
 
@@ -172,27 +171,20 @@ def run_containing_index(mask_1d: np.ndarray, idx: int) -> tuple[int, int] | Non
 
 
 
-def _unwrap_track_shifted_radii(theta, shifted_radii, dr_per_winding):
-    # Compatibility wrapper for callers/tests that only need the unwrapped values.
-    return unwrap_shifted_radii(theta, shifted_radii, dr_per_winding)[0]
-
-
 # ============================================================================================
 # 'dijkstra' strip sampling (cfg['patch_strip_sampling'] == 'dijkstra'): instead of straight
 # rows/columns (and cardinal L-shapes), strips are geodesic shortest paths on the 8-connected
 # valid-quad graph, from a start cell to a 'distant' reachable endpoint, skirting holes and
-# ragged edges. Consecutive path cells are grid-adjacent, so a path is a contiguous walk and
-# unwrap_shifted_radii can stitch theta=0 crossings along it exactly as for straight
+# ragged edges. Consecutive path cells are grid-adjacent, so their crossing-map
+# edges stitch theta=0 crossings exactly as for straight
 # strips. The paths come from per-patch / per-anchor pools built and continuously refreshed by
 # background worker processes (see strip_path_pools.py; strip_paths.py has the actual path
 # computation); here we only subsample positions along a pooled path + subpixel jitter.
 # ============================================================================================
 
 def _sample_points_along_path(path_ij, num_points, rng=None, return_positions=False):
-    # Subsample `num_points` positions along a path (sorted in traversal order, so the unwrap
-    # sees a contiguous walk) with per-point subpixel jitter in both axes; path cells are valid
-    # quads, so jittered points stay on valid quads. With return_positions, also return each
-    # sample's integer index along the path (its floor cell), for the dense-walk theta unwrap.
+    # Subsample positions in traversal order with per-point subpixel jitter.
+    # With return_positions, also return each sample's node-path position.
     rng = np.random if rng is None else rng
     path_len = path_ij.shape[0]
     positions = np.sort(rng.choice(path_len, num_points, replace=num_points > path_len))
@@ -205,9 +197,7 @@ def _sample_points_along_path(path_ij, num_points, rng=None, return_positions=Fa
 
 def build_serpentine_quad_path(valid_quad_mask):
     # Order every valid quad along a boustrophedon walk (row by row, alternating
-    # direction) so consecutive entries are spatially close and the sequential
-    # theta=0 unwrap (unwrap_shifted_radii) applies to samples drawn along the
-    # path exactly as it does to strips. Only used for small patches (area below
+    # direction) and explicitly register every consecutive edge. Only used for small patches (area below
     # cfg['patch_2d_sampling_max_area']): holes and row turns make jumps whose
     # theta change must stay below pi, which a small physical extent guarantees.
     rows = []
@@ -228,16 +218,21 @@ def _sample_dijkstra_strips_at_ij(patch, i_q, j_q, num_points):
     pools = strip_path_pools.get_anchor_path_pools(patch, i_q, j_q)
     if pools is None:
         return None
-    return [
-        _sample_points_along_path(pool[np.random.randint(len(pool))], num_points)
-        for pool in pools
-    ]
+    result = []
+    for pool in pools:
+        path = pool[np.random.randint(len(pool))]
+        ijs, positions = _sample_points_along_path(
+            path, num_points, return_positions=True)
+        result.append(PatchWalk(
+            ijs=ijs, path=path.astype(np.int64), pick_positions=positions,
+            waypoints=path[[0, len(path) // 2, -1]].astype(np.int64)))
+    return result
 
 def _sample_strip_ijs(line_valid, seed, fixed_coord, axis, num_points):
     # Sample num_points fractional ijs along the contiguous True run of `line_valid`
     # containing `seed`, fixed at `fixed_coord` along `axis` (axis=0 -> fixed i, varying j;
     # axis=1 -> fixed j, varying i), with sub-pixel jitter. Caller guarantees line_valid[seed].
-    # The contiguous range lets _unwrap_track_shifted_radii reliably handle theta=0 crossings.
+    # The contiguous range is represented as registered crossing-map edges.
     lo, hi = run_containing_index(line_valid, seed)
     run_len = hi - lo
     coords = np.sort(np.random.choice(run_len, num_points, replace=num_points > run_len))
@@ -318,22 +313,9 @@ def _masked_all_pairs_l1(p1, p2, mask1, mask2, expected_diff):
 
 
 
-# A strip's P sorted picks can only open a >pi theta gap (breaking the raw-diff
-# crossing detector; see _dense_walk_crossing_adjustments) when the walk they
-# are drawn from is much longer than the pick count: the largest pick gap runs
-# ~walk_len * ln(P) / P cells. At this factor the largest gap on a non-flagged
-# strip is ~2*ln(P) cells (~12 cells / ~250-350 vx for P = 400), which stays
-# far below pi at any radius where patches exist. Strips whose walk exceeds
-# factor * P cells get their crossing adjustments recomputed along the dense
-# walk instead (exact at any span); on this dataset that fires only for the
-# few whole-band patches (e.g. 0000_top_band, whose strips span 40+ windings),
-# so the extra no-grad transform cost is negligible.
-_PATCH_DENSE_UNWRAP_WALK_FACTOR = 2
-
-
 @dataclass(slots=True)
-class DenseWalk:
-    """One source-space dense walk and the sparse picks drawn from it."""
+class SampledWalk:
+    """One topology-node walk and the sparse picks drawn from it."""
 
     row: int
     path: np.ndarray
@@ -341,29 +323,41 @@ class DenseWalk:
 
 
 @dataclass(slots=True)
-class PackedDenseWalks:
-    """Dense walks resolved to world-space points and padded for one batch."""
+class PatchWalk:
+    """Fractional patch picks plus their dense quad-node path."""
 
-    rows: torch.Tensor
-    walk_zyxs: torch.Tensor
+    ijs: np.ndarray
+    path: np.ndarray
+    pick_positions: np.ndarray
+    waypoints: np.ndarray
+
+
+@dataclass(slots=True)
+class PackedWalks:
+    """Walks resolved to cached canonical edges, with no XYZ payload."""
+
+    edge_ids: torch.Tensor
+    directions: torch.Tensor
+    edge_valid: torch.Tensor
     pick_positions: torch.Tensor
+    pick_node_ids: torch.Tensor
+    local_correction_mask: torch.Tensor
 
 
-def _maybe_dense_walk_entry(dense_walks, row, path_ij, positions, num_points):
-    if path_ij.shape[0] > _PATCH_DENSE_UNWRAP_WALK_FACTOR * num_points:
-        # Quad centres: floor(ij) lands on the path's own valid quads.
-        walk_ijs = path_ij.astype(np.float32) + 0.5
-        dense_walks.append(DenseWalk(row, walk_ijs, positions))
+def _add_walk(walks, row, path_ij, positions):
+    # Quad centres: floor(ij) lands on the path's own valid quads.
+    walk_ijs = path_ij.astype(np.float32) + 0.5
+    walks.append(SampledWalk(row, walk_ijs, positions))
 
 
-def _reconstruct_straight_dense_walks(ijs_np, num_points, skip):
+def _reconstruct_straight_walks(ijs_np, skip):
     # Straight-mode strips (python or native sampler) confine their picks to one
-    # contiguous valid run of a single grid line, so the dense walk can be
+    # contiguous valid run of a single grid line, so the node walk can be
     # rebuilt from the picks alone: the fixed coordinate is shared by every
     # pick, and every integer cell between the extreme picks' floor cells lies
     # in the same run. `skip` holds flattened track rows already covered by
     # explicitly threaded paths such as serpentine 2D samples.
-    dense_walks = []
+    walks = []
     _, N, P, _ = ijs_np.shape
     for slot in range(2):
         fixed_axis, var_axis = slot, 1 - slot
@@ -375,24 +369,21 @@ def _reconstruct_straight_dense_walks(ijs_np, num_points, skip):
             var_floor = np.floor(var).astype(np.int64)
             lo = var_floor.min()
             walk_len = int(var_floor.max() - lo + 1)
-            if walk_len <= _PATCH_DENSE_UNWRAP_WALK_FACTOR * num_points:
-                continue
             walk_ijs = np.empty([walk_len, 2], dtype=np.float32)
             walk_ijs[:, var_axis] = lo + np.arange(walk_len, dtype=np.float32) + 0.5
             walk_ijs[:, fixed_axis] = ijs_np[slot, n, :, fixed_axis].mean()
-            dense_walks.append(DenseWalk(row, walk_ijs, var_floor - lo))
-    return dense_walks
+            walks.append(SampledWalk(row, walk_ijs, var_floor - lo))
+    return walks
 
 
 def _build_patch_ijs(patches, patch_indices, num_points_per_direction, rng, cfg):
     # CPU part of the patch-strip sampler: for each patch, one row strip and
     # one column strip of fractional ijs. Pure numpy + `rng` so it can run on
     # the prefetch worker for the next step while the GPU works on this one.
-    # Also returns DenseWalk entries for
-    # path-sampled strips (serpentine, dijkstra) long enough to need the
-    # dense-walk unwrap; straight strips are reconstructed by the caller.
+    # Also returns the complete topology path and pick positions for every
+    # path-sampled strip; straight paths are reconstructed by the caller.
     N = len(patch_indices)
-    dense_walks = []
+    walks = []
 
     use_dijkstra_strips = cfg['patch_strip_sampling'] == 'dijkstra'
     if use_dijkstra_strips:
@@ -422,13 +413,13 @@ def _build_patch_ijs(patches, patch_indices, num_points_per_direction, rng, cfg)
             # Small patch (area below cfg['patch_2d_sampling_max_area']): both
             # strip slots become independent sparse 2D samples over the whole
             # patch, drawn along the precomputed serpentine quad walk so the
-            # downstream sequential unwrap sees spatially contiguous samples.
+            # downstream crossing gather sees a contiguous source path.
             horizontal_ijs_by_patch[n], positions_h = _sample_points_along_path(
                 path_2d, P, rng, return_positions=True)
             vertical_ijs_by_patch[n], positions_v = _sample_points_along_path(
                 path_2d, P, rng, return_positions=True)
-            _maybe_dense_walk_entry(dense_walks, n, path_2d, positions_h, P)
-            _maybe_dense_walk_entry(dense_walks, N + n, path_2d, positions_v, P)
+            _add_walk(walks, n, path_2d, positions_h)
+            _add_walk(walks, N + n, path_2d, positions_v)
             continue
 
         if use_dijkstra_strips:
@@ -443,8 +434,8 @@ def _build_patch_ijs(patches, patch_indices, num_points_per_direction, rng, cfg)
                 path_a, P, rng, return_positions=True)
             vertical_ijs_by_patch[n], positions_b = _sample_points_along_path(
                 path_b, P, rng, return_positions=True)
-            _maybe_dense_walk_entry(dense_walks, n, path_a, positions_a, P)
-            _maybe_dense_walk_entry(dense_walks, N + n, path_b, positions_b, P)
+            _add_walk(walks, n, path_a, positions_a)
+            _add_walk(walks, N + n, path_b, positions_b)
             continue
 
         # Horizontal: pick a row uniformly from rows-with-valid-quads, then pick a run
@@ -482,62 +473,85 @@ def _build_patch_ijs(patches, patch_indices, num_points_per_direction, rng, cfg)
         vertical_ijs_by_patch[n, :, 1] = col_idx + fixed_jitters_v[n]
         vertical_ijs_by_patch[n, :, 0] = lo_v + coords_v + var_jitters_v[n]
 
-    return np.stack([horizontal_ijs_by_patch, vertical_ijs_by_patch], axis=0), dense_walks  # (2, N, P, 2)
+    return np.stack([horizontal_ijs_by_patch, vertical_ijs_by_patch], axis=0), walks  # (2, N, P, 2)
 
 
-def _pack_dense_walks(dense_walks, resolve_paths):
-    # Pad source-space paths by repeating their last entry, then resolve the
-    # padded batch to world-space zyxs in one source-specific gather. Repeating
-    # the endpoint is unwrap-neutral because identical points have zero theta
-    # difference.
-    if not dense_walks:
+def _pack_walks(walks, resolve_node_paths, crossing_map, *, local_correction):
+    """Resolve ragged node walks to padded edge IDs and sparse pick metadata."""
+    if not walks:
         return None
-    num_walks = len(dense_walks)
-    num_points = dense_walks[0].pick_positions.shape[0]
-    max_walk_len = max(walk.path.shape[0] for walk in dense_walks)
-    path_shape = (num_walks, max_walk_len, *dense_walks[0].path.shape[1:])
-    paths_np = np.empty(path_shape, dtype=dense_walks[0].path.dtype)
+    walks = sorted(walks, key=lambda walk: walk.row)
+    if [walk.row for walk in walks] != list(range(len(walks))):
+        raise RuntimeError('packed sampled walks must contain every row exactly once')
+    num_walks = len(walks)
+    num_points = walks[0].pick_positions.shape[0]
+    max_walk_len = max(walk.path.shape[0] for walk in walks)
+    path_shape = (num_walks, max_walk_len, *walks[0].path.shape[1:])
+    paths_np = np.empty(path_shape, dtype=walks[0].path.dtype)
     positions_np = np.empty([num_walks, num_points], dtype=np.int64)
-    rows_np = np.empty([num_walks], dtype=np.int64)
-    for k, walk in enumerate(dense_walks):
+    valid_np = np.zeros([num_walks, max(0, max_walk_len - 1)], dtype=bool)
+    for k, walk in enumerate(walks):
         walk_len = walk.path.shape[0]
         paths_np[k, :walk_len] = walk.path
         paths_np[k, walk_len:] = walk.path[-1]
         positions_np[k] = walk.pick_positions
-        rows_np[k] = walk.row
-    return PackedDenseWalks(
-        rows=torch.from_numpy(rows_np),
-        walk_zyxs=resolve_paths(paths_np, rows_np),
+        valid_np[k, :max(0, walk_len - 1)] = True
+    node_ids = resolve_node_paths(paths_np)
+    pick_nodes = np.take_along_axis(node_ids, positions_np, axis=1)
+    edge_ids = np.zeros(valid_np.shape, dtype=np.int64)
+    directions = np.ones(valid_np.shape, dtype=np.int8)
+    if valid_np.any():
+        pairs = np.stack([node_ids[:, :-1][valid_np], node_ids[:, 1:][valid_np]], axis=-1)
+        resolved, resolved_dir = crossing_map.resolve_edges(pairs)
+        edge_ids[valid_np] = resolved.cpu().numpy()
+        directions[valid_np] = resolved_dir.cpu().numpy()
+    return PackedWalks(
+        edge_ids=torch.from_numpy(edge_ids),
+        directions=torch.from_numpy(directions),
+        edge_valid=torch.from_numpy(valid_np),
         pick_positions=torch.from_numpy(positions_np),
+        pick_node_ids=torch.from_numpy(pick_nodes),
+        local_correction_mask=torch.full(
+            (num_walks, num_points), bool(local_correction), dtype=torch.bool),
     )
 
 
-def _pack_patch_dense_walks(dense_walks, patch_indices, patch_atlas):
-    # Resolve patch-local ij paths through the atlas. A flattened track row is
-    # slot * N + patch-row, so row % N selects its patch index.
+def _pack_patch_walks(walks, patch_indices, patch_atlas, crossing_map):
     num_patch_rows = len(patch_indices)
 
-    def resolve_paths(paths_np, rows_np):
-        walk_patch_indices = np.asarray(patch_indices)[rows_np % num_patch_rows]
-        idx_np = np.broadcast_to(
-            walk_patch_indices[:, None], paths_np.shape[:2]).copy()
-        return patch_atlas.lookup(
-            torch.from_numpy(idx_np), torch.from_numpy(paths_np))
+    def resolve_paths(paths_np):
+        walk_patch_indices = np.asarray(patch_indices)[
+            np.arange(paths_np.shape[0]) % num_patch_rows]
+        idx_np = np.broadcast_to(walk_patch_indices[:, None], paths_np.shape[:2])
+        return patch_atlas.theta_node_ids(idx_np, paths_np)
 
-    return _pack_dense_walks(dense_walks, resolve_paths)
+    return _pack_walks(
+        walks, resolve_paths, crossing_map, local_correction=True)
+
+
+def _pack_l_shape_walks(flat_walks, patch_indices, patch_atlas, crossing_map):
+    walks = [
+        SampledWalk(k, walk.path.astype(np.float32) + 0.5,
+                    walk.pick_positions)
+        for k, walk in enumerate(flat_walks)
+    ]
+
+    def resolve_paths(paths_np):
+        idx = np.broadcast_to(
+            np.asarray(patch_indices, dtype=np.int64)[:, None],
+            paths_np.shape[:2])
+        return patch_atlas.theta_node_ids(idx, paths_np)
+
+    return _pack_walks(
+        walks, resolve_paths, crossing_map, local_correction=True)
 
 
 def _sample_patch_batch(key, patches, sampling_probabilities, num_to_sample,
-                        num_points_per_direction, cfg, patch_atlas=None):
-    # Returns (combined_ijs_gpu (2,N,P,2), patch_indices_gpu (N,),
-    # slice_zyxs_gpu (2,N,P,3), packed_dense_walks). The atlas is host-resident
-    # and the ijs are born on the CPU, so the bilinear gather runs here at
-    # batch-build time and only the interpolated points are uploaded. With
-    # prefetch enabled the batch - sampling, gather, and uploads - was
-    # assembled for this step during the previous one, and next step's batch
-    # is scheduled now. packed_dense_walks (or None) carries the dense walks of
-    # strips long enough that the sparse-pick theta unwrap could miscount
-    # theta=0 crossings (see _PATCH_DENSE_UNWRAP_WALK_FACTOR).
+                        num_points_per_direction, cfg, patch_atlas=None,
+                        crossing_map=None):
+    # Returns sampled ijs, patch indices, sparse interpolated XYZ picks, and
+    # packed edge/pick metadata. The full node paths never carry XYZ and never
+    # enter the transform on an ordinary loss step.
     if num_to_sample <= 0:
         raise ValueError('Expected at least one patch index')
 
@@ -547,15 +561,27 @@ def _sample_patch_batch(key, patches, sampling_probabilities, num_to_sample,
         native_atlas = getattr(patch_atlas, 'sampling_atlas', None)
         if native_atlas is not None and cfg['patch_strip_sampling'] != 'dijkstra':
             seed = int(rng.randint(0, np.iinfo(np.int64).max))
-            ijs_np = np.asarray(native_atlas.sample_patch_strips(
+            native_walks = native_atlas.sample_patch_walks(
                 np.ascontiguousarray(patch_indices, dtype=np.int64),
                 num_points_per_direction,
                 seed,
-            ))
+            )
+            ijs_np = np.asarray(native_walks['ijs'])
+            path_ijs = np.asarray(native_walks['path_ijs'])
+            path_offsets = np.asarray(native_walks['path_offsets'])
+            native_positions = np.asarray(native_walks['pick_positions'])
             # The native sampler only knows strips; rows for small 2D-sampled
             # patches (see cfg['patch_2d_sampling_max_area']) are overwritten
             # with serpentine whole-patch samples.
-            dense_walks = []
+            walks = [
+                SampledWalk(
+                    row=row,
+                    path=path_ijs[path_offsets[row]:path_offsets[row + 1]],
+                    pick_positions=native_positions.reshape(
+                        2 * num_to_sample, num_points_per_direction)[row],
+                )
+                for row in range(2 * num_to_sample)
+            ]
             small_ns = [
                 n for n, patch_idx in enumerate(patch_indices)
                 if getattr(patches[patch_idx], '_sampling_2d_path', None) is not None
@@ -563,6 +589,8 @@ def _sample_patch_batch(key, patches, sampling_probabilities, num_to_sample,
             if small_ns:
                 ijs_np = np.array(ijs_np)  # the native buffer may be read-only
                 for n in small_ns:
+                    walks[n] = None
+                    walks[num_to_sample + n] = None
                     path_2d = patches[patch_indices[n]]._sampling_2d_path
                     ijs_np[0, n], positions_h = _sample_points_along_path(
                         path_2d, num_points_per_direction, rng,
@@ -570,111 +598,67 @@ def _sample_patch_batch(key, patches, sampling_probabilities, num_to_sample,
                     ijs_np[1, n], positions_v = _sample_points_along_path(
                         path_2d, num_points_per_direction, rng,
                         return_positions=True)
-                    _maybe_dense_walk_entry(
-                        dense_walks, n, path_2d, positions_h,
-                        num_points_per_direction)
-                    _maybe_dense_walk_entry(
-                        dense_walks, num_to_sample + n, path_2d, positions_v,
-                        num_points_per_direction)
+                    _add_walk(walks, n, path_2d, positions_h)
+                    _add_walk(walks, num_to_sample + n, path_2d, positions_v)
+                walks = [walk for walk in walks if walk is not None]
         else:
-            ijs_np, dense_walks = _build_patch_ijs(
+            ijs_np, walks = _build_patch_ijs(
                 patches, patch_indices, num_points_per_direction, rng, cfg)
         if cfg['patch_strip_sampling'] != 'dijkstra':
             # Straight strips (python or native sampler alike) are rebuilt
             # from the picks; path-sampled strips are already threaded above.
-            dense_walks.extend(_reconstruct_straight_dense_walks(
-                ijs_np, num_points_per_direction,
-                {walk.row for walk in dense_walks}))
-        packed_dense_walks = _pack_patch_dense_walks(
-            dense_walks, patch_indices, patch_atlas)
+            walks.extend(_reconstruct_straight_walks(
+                ijs_np,
+                {walk.row for walk in walks}))
+        packed_walks = _pack_patch_walks(
+            walks, patch_indices, patch_atlas, crossing_map)
         ijs_cpu = torch.from_numpy(ijs_np)
         idx_cpu = torch.from_numpy(
             np.ascontiguousarray(patch_indices, dtype=np.int64))
         _, N, P, _ = ijs_cpu.shape
         slice_zyxs_gpu = patch_atlas.lookup(
             idx_cpu[None, :, None].expand(2, N, P), ijs_cpu)
-        ijs_gpu = ijs_cpu.cuda(non_blocking=True)
-        idx_gpu = idx_cpu.cuda(non_blocking=True)
-        return ijs_gpu, idx_gpu, slice_zyxs_gpu, packed_dense_walks
+        target_device = patch_atlas.device
+        ijs_gpu = ijs_cpu.to(device=target_device, non_blocking=True)
+        idx_gpu = idx_cpu.to(device=target_device, non_blocking=True)
+        return ijs_gpu, idx_gpu, slice_zyxs_gpu, packed_walks
 
     if prefetch.prefetch_enabled() and torch.cuda.is_available():
         pf = prefetch.get_prefetcher()
         rng = pf.np_rng(key)
-        return pf.pop_or_run((key, num_to_sample, num_points_per_direction),
+        return pf.pop_or_run((key, id(crossing_map), num_to_sample,
+                              num_points_per_direction),
                              lambda: build(rng))
     return build(prefetch.LegacyNumpyRandom)
 
 
-def _dense_walk_crossing_adjustments(
-    slice_to_spiral_transform, dr_per_winding, sampled_theta,
-    packed_dense_walks,
-):
-    # Count theta=0 crossings for selected sampled rows along their full dense
-    # world-space walks. Each gathered walk point is connected to the actual
-    # sampled point by one final step. That step is zero for PCLs (the pick is a
-    # walk point) and accounts for patch sub-cell jitter (the walk uses quad
-    # centres). Each row is re-anchored at its first pick to preserve the sparse
-    # unwrap's frame. All adjustments are detached constants.
-    with torch.no_grad():
-        walk_zyxs = packed_dense_walks.walk_zyxs
-        walk_spiral = slice_to_spiral_transform(
-            walk_zyxs.reshape(-1, 3)).reshape(*walk_zyxs.shape)
-        walk_theta, _, _ = get_theta_and_radii(walk_spiral[..., 1:], dr_per_winding)
-        _, walk_adjustments = unwrap_shifted_radii(
-            walk_theta, torch.zeros_like(walk_theta), dr_per_winding,
-        )
-        device = walk_theta.device
-        positions = packed_dense_walks.pick_positions.to(device=device)
-        rows = packed_dense_walks.rows.to(device=sampled_theta.device)
-        floor_adjustments = torch.gather(walk_adjustments, 1, positions)
-        floor_theta = torch.gather(walk_theta, 1, positions)
-        theta_rows = sampled_theta.reshape(-1, sampled_theta.shape[-1])
-        pick_theta = theta_rows[rows].detach().to(device=device)
-        theta_step = pick_theta - floor_theta
-        local_step = (
-            (theta_step > np.pi).to(walk_adjustments.dtype)
-            - (theta_step < -np.pi).to(walk_adjustments.dtype)
-        ) * dr_per_winding.detach()
-        adjustments = floor_adjustments + local_step
-        adjustments = adjustments - adjustments[:, :1]
-        return adjustments.to(device=sampled_theta.device), rows
-
-
 def _unwrap_sampled_tracks(
-    slice_to_spiral_transform, dr_per_winding, theta, shifted_radii,
-    packed_dense_walks=None,
+    crossing_map, dr_per_winding, theta, shifted_radii, packed_walks,
 ):
-    # Use the inexpensive sparse unwrap for every row, then replace selected
-    # rows with exact adjustments gathered along their dense walks.
-    sparse_shifted_radii, crossing_adjustments = unwrap_shifted_radii(
-        theta, shifted_radii, dr_per_winding,
+    crossing_adjustments = crossing_map.adjustments(
+        packed_walks.edge_ids,
+        packed_walks.directions,
+        packed_walks.pick_positions,
+        packed_walks.pick_node_ids,
+        theta.reshape(-1, theta.shape[-1]),
+        packed_walks.local_correction_mask,
+        dr_per_winding,
+        packed_walks.edge_valid,
     )
-    if packed_dense_walks is None:
-        return sparse_shifted_radii, crossing_adjustments
-
-    dense_adjustments, rows = _dense_walk_crossing_adjustments(
-        slice_to_spiral_transform, dr_per_winding, theta,
-        packed_dense_walks,
-    )
-    corrected_adjustments = crossing_adjustments.clone()
-    adjustment_rows = corrected_adjustments.reshape(
-        -1, crossing_adjustments.shape[-1])
-    adjustment_rows[rows] = dense_adjustments
-    return shifted_radii + corrected_adjustments, corrected_adjustments
+    crossing_adjustments = crossing_adjustments.reshape(theta.shape)
+    return shifted_radii + crossing_adjustments, crossing_adjustments
 
 
-def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, patch_atlas, batch, extra_zyxs=None):
+def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches,
+                         patch_atlas, batch, crossing_map, extra_zyxs=None):
     # For each patch, take one row and one column in straight mode, or two
     # geodesic paths in dijkstra mode. Either representation is a contiguous
-    # walk, so unwrapping can stitch theta=0 crossings between samples. Strips
-    # whose walk is far longer than the pick count get their crossing
-    # adjustments recomputed along the dense walk (see
-    # _unwrap_sampled_tracks); the sparse-pick unwrap miscounts
-    # crossings there.
+    # walk. Cached edge crossings are gathered along the complete node path,
+    # irrespective of how sparse the fractional picks are.
 
     # The bilinear atlas gather already ran on the CPU at batch-build time
     # (see _sample_patch_batch); the batch carries the interpolated points.
-    combined_ijs_gpu, patch_indices_gpu, all_slice_zyxs, packed_dense_walks = batch
+    combined_ijs_gpu, patch_indices_gpu, all_slice_zyxs, packed_walks = batch
 
     # When the caller has extra points (umbilicus, shell, ...), pack them into the same
     # forward ODE call to amortise the per-call overhead.
@@ -690,8 +674,8 @@ def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, pat
 
     all_theta, _, all_shifted_radii = get_theta_and_radii(all_spiral_zyxs[..., 1:], dr_per_winding)
     all_shifted_radii, all_crossing_adjustments = _unwrap_sampled_tracks(
-        slice_to_spiral_transform, dr_per_winding, all_theta,
-        all_shifted_radii, packed_dense_walks,
+        crossing_map, dr_per_winding, all_theta,
+        all_shifted_radii, packed_walks,
     )
 
     return (
@@ -830,7 +814,7 @@ def _patch_radius_and_dt_losses(
 
 
 
-def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, num_patches_for_radius, num_patches_for_dt, patches, patch_atlas, patch_sampling_probabilities, umbilicus_zyx, compute_dt=True, shell_valid_zyxs=None, shell_outer_winding_idx=None, dt_max_winding=None, dt_target_cache=None, *, cfg):
+def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, num_patches_for_radius, num_patches_for_dt, patches, patch_atlas, patch_sampling_probabilities, umbilicus_zyx, compute_dt=True, shell_valid_zyxs=None, shell_outer_winding_idx=None, dt_max_winding=None, dt_target_cache=None, *, crossing_map, cfg):
 
     n_umb = umbilicus_zyx.shape[0]
     if shell_valid_zyxs is not None:
@@ -853,7 +837,7 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
         batch = _sample_patch_batch(
             'verified_patches', patches, patch_sampling_probabilities,
             num_patches_to_sample, cfg['sample_count_points_per_patch'] // 2,
-            cfg, patch_atlas)
+            cfg, patch_atlas, crossing_map)
 
         (
             sample_ijs,
@@ -869,6 +853,7 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
             patches,
             patch_atlas,
             batch,
+            crossing_map,
             extra_zyxs,
         )
 
@@ -918,7 +903,7 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
 
 
 
-def get_unverified_patch_losses(slice_to_spiral_transform, dr_per_winding, num_patches_for_radius, num_patches_for_dt, patches, patch_atlas, patch_sampling_probabilities, compute_dt=True, dt_max_winding=None, dt_target_cache=None, *, cfg):
+def get_unverified_patch_losses(slice_to_spiral_transform, dr_per_winding, num_patches_for_radius, num_patches_for_dt, patches, patch_atlas, patch_sampling_probabilities, compute_dt=True, dt_max_winding=None, dt_target_cache=None, *, crossing_map, cfg):
     # Radius + DT losses for the untrusted 'unverified' patch set. Same machinery as the
     # verified patches (shared _sample_patch_tracks + _patch_radius_and_dt_losses) but with the
     # independent unverified_* hyperparameters and no umbilicus/shell extras. These patches are
@@ -928,7 +913,7 @@ def get_unverified_patch_losses(slice_to_spiral_transform, dr_per_winding, num_p
     batch = _sample_patch_batch(
         'unverified_patches', patches, patch_sampling_probabilities,
         num_patches_to_sample, cfg['sample_count_unverified_points_per_patch'] // 2,
-        cfg, patch_atlas)
+        cfg, patch_atlas, crossing_map)
 
     (
         sample_ijs,
@@ -944,6 +929,7 @@ def get_unverified_patch_losses(slice_to_spiral_transform, dr_per_winding, num_p
         patches,
         patch_atlas,
         batch,
+        crossing_map,
     )
 
     return _patch_radius_and_dt_losses(
@@ -966,7 +952,7 @@ def _sample_single_l_shape(valid_quad, i_q, j_q, leg1_axis, leg1_dir, leg2_dir, 
     # turn point along the perpendicular axis in direction `leg2_dir` (+1 or -1) to the end
     # of its valid run. Returns a float32 [num_points, 2] sampled in traversal order, with
     # subpixel jitter; the fixed-axis jitter is shared within each leg (matching the
-    # _sample_strip_ijs convention), so the unwrap can stitch theta=0 crossings along the
+    # _sample_strip_ijs convention), preserving the registered node traversal along the
     # full L (the only ~sqrt(2)-quad jump is across the corner, still well within the
     # |dtheta| < pi requirement). Caller guarantees valid_quad[i_q, j_q].
 
@@ -1028,7 +1014,25 @@ def _sample_single_l_shape(valid_quad, i_q, j_q, leg1_axis, leg1_dir, leg2_dir, 
         ijs[~on_leg1, 0] = leg2_var
         ijs[~on_leg1, 1] = leg2_fixed
 
-    return ijs
+    path = np.empty([num_positions, 2], dtype=np.int64)
+    dense_steps = np.arange(num_positions, dtype=np.int64)
+    dense_leg1 = dense_steps <= turn_step
+    if leg1_axis == 0:
+        path[dense_leg1, 0] = i_q
+        path[dense_leg1, 1] = var_start1 + leg1_dir * dense_steps[dense_leg1]
+        path[~dense_leg1, 0] = i_turn + leg2_dir * (dense_steps[~dense_leg1] - turn_step)
+        path[~dense_leg1, 1] = j_turn
+    else:
+        path[dense_leg1, 0] = var_start1 + leg1_dir * dense_steps[dense_leg1]
+        path[dense_leg1, 1] = j_q
+        path[~dense_leg1, 0] = i_turn
+        path[~dense_leg1, 1] = j_turn + leg2_dir * (dense_steps[~dense_leg1] - turn_step)
+    return PatchWalk(
+        ijs=ijs,
+        path=path,
+        pick_positions=steps.astype(np.int64),
+        waypoints=path[[0, turn_step, total_steps]],
+    )
 
 
 
@@ -1040,8 +1044,8 @@ def _sample_l_shapes_at_ij(patch, i, j, num_points, cfg):
     # perpendicular direction is chosen uniformly at random. Returns a list of 4 float32
     # [num_points, 2] arrays sampled in traversal order, or None if (i, j) doesn't lie on
     # a valid quad (or, in dijkstra mode, while this anchor's path pools are still being
-    # built in the background). Each L is a single contiguous walk in patch space, so the unwrap can
-    # handle theta=0 seam crossings along the bent strip just as it does along a straight
+    # built in the background). Each L is a single contiguous walk in patch space, so cached
+    # crossings handle theta=0 seams along the bent strip just as along a straight
     # row/column.
     valid_quad = patch._sampling_valid_quad_mask_np
     H_q, W_q = valid_quad.shape
@@ -1089,34 +1093,43 @@ def _sample_l_shapes_batch(patches_dict, patch_atlas, requests, num_points, cfg)
         int(np.random.randint(0, np.iinfo(np.int64).max)),
     )
     ijs = np.asarray(result['ijs'])
+    pick_positions = np.asarray(result['pick_positions'])
+    waypoints = np.asarray(result['waypoints'])
     valid = np.asarray(result['valid'], dtype=bool)
-    return [ijs[k] if valid[k] else None for k in range(len(requests))]
+    sampled = []
+    for k in range(len(requests)):
+        if not valid[k]:
+            sampled.append(None)
+            continue
+        shapes = []
+        for s in range(4):
+            anchor, turn, end = waypoints[k, s]
+            leg1_delta = np.sign(turn - anchor)
+            leg2_delta = np.sign(end - turn)
+            leg1_len = int(np.abs(turn - anchor).sum())
+            leg2_len = int(np.abs(end - turn).sum())
+            leg1 = anchor + np.arange(leg1_len + 1)[:, None] * leg1_delta
+            leg2 = turn + np.arange(1, leg2_len + 1)[:, None] * leg2_delta
+            path = np.concatenate([leg1, leg2], axis=0).astype(np.int64)
+            shapes.append(PatchWalk(
+                ijs=ijs[k, s], path=path,
+                pick_positions=pick_positions[k, s],
+                waypoints=waypoints[k, s]))
+        sampled.append(shapes)
+    return sampled
 
-def _batched_pcl_chain_seam_adjustments(slice_to_spiral_transform, dr_per_winding, chain_zyxs_list):
-    # Cumulative theta=0 seam adjustment (last unwrap entry) for each pcl chain.
-    # The adjustments are built purely from detached thetas and detached
-    # dr_per_winding -- there is no gradient path from them into the loss -- so
-    # all chains can be transformed in one batched no-grad call instead of one
-    # full transform (flow-ODE integration) per pair. Chains are padded to the
-    # longest length by repeating their last point: identical consecutive
-    # points give exactly zero theta-diffs, so the unwrapped adjustment at the
-    # padded end equals the adjustment at the true chain end.
-    num_chains = len(chain_zyxs_list)
-    max_chain_len = max(len(chain) for chain in chain_zyxs_list)
-    chains_np = np.empty([num_chains, max_chain_len, 3], dtype=np.float32)
-    for k, chain_zyxs in enumerate(chain_zyxs_list):
-        n = len(chain_zyxs)
-        chains_np[k, :n] = chain_zyxs
-        chains_np[k, n:] = chain_zyxs[-1]
-    with torch.no_grad():
-        chains_t = torch.from_numpy(chains_np).to(device=dr_per_winding.device, non_blocking=True)
-        chain_spiral = slice_to_spiral_transform(chains_t.reshape(-1, 3)).reshape(num_chains, max_chain_len, 3)
-        chain_theta, _, _ = get_theta_and_radii(chain_spiral[..., 1:], dr_per_winding)
-        chain_adjustments = _unwrap_track_shifted_radii(chain_theta, torch.zeros_like(chain_theta), dr_per_winding)
-        return chain_adjustments[:, -1]
+def _pcl_chain_seam_adjustments(crossing_map, dr_per_winding, chain_node_ids):
+    values = []
+    for node_ids in chain_node_ids:
+        edge_ids, directions = crossing_map.resolve_walks(node_ids)
+        winding_steps = (
+            crossing_map.crossings[edge_ids]
+            * directions.to(crossing_map.crossings.dtype))
+        values.append(winding_steps.to(torch.int32).sum())
+    return torch.stack(values).to(dr_per_winding.dtype) * dr_per_winding.detach()
 
 
-def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, patch_atlas, point_collections, sampling_strata, *, cfg, z_begin, z_end):
+def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, patch_atlas, point_collections, sampling_strata, *, crossing_map, cfg, z_begin, z_end):
     # For pairs of annotated PCL points on different patches, constrain the spiral
     # shifted-radius gap to match the annotated winding-number difference. Each
     # cross-patch pcl exposes its attached points grouped by patch
@@ -1125,10 +1138,9 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
     # L-shaped strips: from (i, j), walk along one of the cardinal patch directions
     # (right, left, down, up) to a uniformly-random turn point inside the contiguous
     # valid run, then 90-degree-turn into a uniformly-random perpendicular direction
-    # and walk to the end of that valid run. Each L is sampled in traversal order
-    # along its bent path, so _unwrap_track_shifted_radii can stitch theta=0 seam
-    # crossings along the whole strip (the corner only introduces a ~sqrt(2)-quad ij
-    # jump). We then pool all 4 L-strips per annotated point into one set of sample
+    # and walk to the end of that valid run. Each L is sampled in traversal order,
+    # and cached crossings are gathered along its complete node path. We then pool
+    # all 4 L-strips per annotated point into one set of sample
     # points and take a single all-pairs diff between p1's and p2's pooled sets,
     # regressing it onto winding_diff * dr_per_winding. If the PCL chain between
     # the selected points crosses theta=0, adjust the expected delta by that
@@ -1138,8 +1150,8 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
     num_strips_per_pcl = 4
     num_strips_per_pair = 2 * num_strips_per_pcl  # 8
 
-    # Each entry: (ls1, ls2, pid1, pid2, winding_diff, pcl_chain_zyxs), where
-    # ls* is a list of 4 L-shape ij strips and pcl_chain_zyxs is ordered p1 -> p2.
+    # Each entry holds two groups of four L walks, patch ids, the annotated
+    # winding difference, and ordered PCL-chain node ids from p1 to p2.
     strip_pairs = []
     pair_requests = []
 
@@ -1189,10 +1201,12 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
             i1, j1 = int(p1['on_patch']['ij'][0]), int(p1['on_patch']['ij'][1])
             i2, j2 = int(p2['on_patch']['ij'][0]), int(p2['on_patch']['ij'][1])
 
-            pcl_chain_zyxs = chain.zyxs_between(p1, p2)
+            pcl_chain_node_ids = np.fromiter(
+                (point['_theta_node_id'] for point in chain.points_between(p1, p2)),
+                dtype=np.int64)
             pair_requests.append((
                 (pid1, i1, j1), (pid2, i2, j2),
-                pid1, pid2, winding_diff, pcl_chain_zyxs,
+                pid1, pid2, winding_diff, pcl_chain_node_ids,
             ))
 
     sampled_l_shapes = _sample_l_shapes_batch(
@@ -1216,16 +1230,18 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
     total_strips = len(strip_pairs) * num_strips_per_pair
     flat_ijs = np.empty([total_strips, num_points_per_strip, 2], dtype=np.float32)
     flat_pids = []
+    flat_walks = []
     for k, (ls1, ls2, pid1, pid2, _, _) in enumerate(strip_pairs):
         base = k * num_strips_per_pair
         for s, strip in enumerate(ls1):
-            flat_ijs[base + s] = strip
+            flat_ijs[base + s] = strip.ijs
+            flat_walks.append(strip)
         for s, strip in enumerate(ls2):
-            flat_ijs[base + num_strips_per_pcl + s] = strip
+            flat_ijs[base + num_strips_per_pcl + s] = strip.ijs
+            flat_walks.append(strip)
         flat_pids.extend([pid1] * num_strips_per_pcl + [pid2] * num_strips_per_pcl)
 
-    # Batched bilinear gather on the host-resident atlas; only the
-    # interpolated points are uploaded.
+    # Batched bilinear gather on the device-resident atlas.
     patch_idx_per_strip_np = np.fromiter(
         (patch_atlas.id_to_idx[pid] for pid in flat_pids),
         dtype=np.int64,
@@ -1236,16 +1252,16 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
     flat_zyxs = patch_atlas.lookup(patch_idx_per_sample, torch.from_numpy(flat_ijs))
 
     # Mask out strip samples whose z falls outside [z_begin - margin, z_end + margin).
-    # Computed before unwrapping but applied after, since _unwrap_track_shifted_radii
-    # needs the full sequential strip to stitch theta=0 crossings.
+    # Computed before applying cached crossing adjustments but masked afterward.
     z_margin = cfg['patch_loss_z_margin']
     z_mask = (flat_zyxs[..., 0] >= z_begin - z_margin) & (flat_zyxs[..., 0] < z_end + z_margin)
 
     flat_spiral = slice_to_spiral_transform(flat_zyxs.reshape(-1, 3)).reshape(*flat_zyxs.shape)
     theta, _, shifted_radii = get_theta_and_radii(flat_spiral[..., 1:], dr_per_winding)
-    shifted_radii, _ = unwrap_shifted_radii(
-        theta, shifted_radii, dr_per_winding,
-    )
+    packed_walks = _pack_l_shape_walks(
+        flat_walks, patch_idx_per_strip_np, patch_atlas, crossing_map)
+    shifted_radii, _ = _unwrap_sampled_tracks(
+        crossing_map, dr_per_winding, theta, shifted_radii, packed_walks)
 
     # [num_pairs, 8, num_points_per_strip] -> pool each side's 4 strips into a single set.
     shifted_radii = shifted_radii.reshape(len(strip_pairs), num_strips_per_pair, num_points_per_strip)
@@ -1261,8 +1277,8 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
         device='cuda',
         dtype=torch.float32,
     )
-    pcl_seam_adjustments = _batched_pcl_chain_seam_adjustments(
-        slice_to_spiral_transform,
+    pcl_seam_adjustments = _pcl_chain_seam_adjustments(
+        crossing_map,
         dr_per_winding,
         [strip_pair[5] for strip_pair in strip_pairs],
     )
@@ -1290,7 +1306,7 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
 
 
 
-def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, patch_atlas, point_collections, *, cfg, z_begin, z_end):
+def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding, patches_dict, patch_atlas, point_collections, *, crossing_map, cfg, z_begin, z_end):
     # For PCL points carrying an absolute winding annotation (only pcls flagged
     # metadata.winding_is_absolute), pin the spiral shifted-radius at each annotated
     # point to its absolute target, winding_annotation * dr_per_winding (the spiral has
@@ -1298,8 +1314,8 @@ def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
     # dr_per_winding). This mirrors get_patch_rel_winding_loss, but anchors each point's
     # absolute winding instead of regressing a pair's winding difference: we sample some
     # absolute-winding pcls, some attached points within each, build 4 L-shaped strips
-    # per point (sampled in traversal order so _unwrap_track_shifted_radii can stitch
-    # theta=0 seam crossings), then drive every in-roi strip sample's shifted radius to
+    # per point (sampled in traversal order so cached crossings can be gathered),
+    # then drive every in-roi strip sample's shifted radius to
     # the point's target. Each L starts at the annotated point, so its unwrapped
     # shifted-radius keeps the true absolute scale at the anchor.
 
@@ -1348,14 +1364,15 @@ def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
     total_strips = len(strips) * num_strips_per_point
     flat_ijs = np.empty([total_strips, num_points_per_strip, 2], dtype=np.float32)
     flat_pids = []
+    flat_walks = []
     for k, (ls, pid, _) in enumerate(strips):
         base = k * num_strips_per_point
         for s, strip in enumerate(ls):
-            flat_ijs[base + s] = strip
+            flat_ijs[base + s] = strip.ijs
+            flat_walks.append(strip)
         flat_pids.extend([pid] * num_strips_per_point)
 
-    # Batched bilinear gather on the host-resident atlas; only the
-    # interpolated points are uploaded.
+    # Batched bilinear gather on the device-resident atlas.
     patch_idx_per_strip_np = np.fromiter(
         (patch_atlas.id_to_idx[pid] for pid in flat_pids),
         dtype=np.int64,
@@ -1366,16 +1383,16 @@ def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
     flat_zyxs = patch_atlas.lookup(patch_idx_per_sample, torch.from_numpy(flat_ijs))
 
     # Mask out strip samples whose z falls outside [z_begin - margin, z_end + margin).
-    # Computed before unwrapping but applied after, since _unwrap_track_shifted_radii
-    # needs the full sequential strip to stitch theta=0 crossings.
+    # Computed before applying cached crossing adjustments but masked afterward.
     z_margin = cfg['patch_loss_z_margin']
     z_mask = (flat_zyxs[..., 0] >= z_begin - z_margin) & (flat_zyxs[..., 0] < z_end + z_margin)
 
     flat_spiral = slice_to_spiral_transform(flat_zyxs.reshape(-1, 3)).reshape(*flat_zyxs.shape)
     theta, _, shifted_radii = get_theta_and_radii(flat_spiral[..., 1:], dr_per_winding)
-    shifted_radii, crossing_adjustments = unwrap_shifted_radii(
-        theta, shifted_radii, dr_per_winding,
-    )
+    packed_walks = _pack_l_shape_walks(
+        flat_walks, patch_idx_per_strip_np, patch_atlas, crossing_map)
+    shifted_radii, crossing_adjustments = _unwrap_sampled_tracks(
+        crossing_map, dr_per_winding, theta, shifted_radii, packed_walks)
 
     # [num_points, 4, num_points_per_strip] -> pool each point's 4 strips into one set.
     num_samples_per_point = num_strips_per_point * num_points_per_strip
@@ -1642,7 +1659,7 @@ def _sample_component_walk(members, edges, strip_lengths, branch_probability):
     Returns ordered segments [(strip, pos_from, pos_to)] (inclusive, pos_from >
     pos_to when walking backwards); consecutive segments meet at a junction,
     whose two nearly-coincident endpoints appear as consecutive walk points, so
-    the sequential theta=0 unwrap treats the hop like any other step."""
+    the crossing map treats the hop like any other registered edge."""
     junctions = {s: [] for s in members}
     for strip_a, pos_a, strip_b, pos_b in edges:
         junctions[strip_a].append((pos_a, strip_b, pos_b))
@@ -1686,15 +1703,15 @@ def get_unattached_pcl_strip_losses(
     dt_max_winding=None,
     dt_target_cache=None,
     *,
+    crossing_map,
     cfg,
 ):
     # Unattached pcls are treated as ordered strips, indexed by int(point_id), and
     # assumed to be locally dense enough that adjacent STRIP points have
     # |dtheta| < pi. The per-row samples themselves may be far sparser than that
     # (a fiber spanning several windings sampled at num_points_per_pcl points),
-    # so theta=0 crossings are stitched along the full dense walk in a no-grad
-    # pass (_unwrap_sampled_tracks) and only the resulting adjustments
-    # are applied to the sampled points. Two losses are computed, analogous to the patch radius
+    # so theta=0 crossings are gathered along the complete cached node walk and
+    # applied to the sampled points. Two losses are computed, analogous to the patch radius
     # and DT losses: (1) shifted-radius should be constant along the strip after
     # subtracting per-point winding-annotation offsets; (2) each point should snap to
     # its target winding, with the target taken from the snapped strip median (or,
@@ -1709,8 +1726,7 @@ def get_unattached_pcl_strip_losses(
     # sampled along a chain *walk* through its strips (_sample_component_walk):
     # along a strip, hopping to the linked strip at a junction with
     # cfg['loss_fiber_link_branch_probability'], so a junction hop is an ordinary
-    # |dtheta| < pi step and the sequential unwrap stitches theta=0 crossings
-    # through it like any other. The constant-shifted-radius target (1) along the
+    # registered step and cached crossings continue through it. The constant-shifted-radius target (1) along the
     # walk then pulls points on either side of every traversed junction onto one
     # shared winding; over steps, random walks cover all of a component's
     # junctions. Rows mix strips, so the DT snap (2) passes per-point strip
@@ -1736,7 +1752,7 @@ def get_unattached_pcl_strip_losses(
     sampled_strip_indices = np.empty([num_rows, num_points_per_pcl], dtype=np.int64)
     sampled_local_indices = np.empty([num_rows, num_points_per_pcl], dtype=np.int64)
     sampled_flat_indices = np.empty([num_rows, num_points_per_pcl], dtype=np.int64)
-    dense_walks = []
+    walks = []
     for k, comp_idx in enumerate(chosen_comps):
         members = component_strip_lists[comp_idx]
         edges = component_edges[comp_idx]
@@ -1762,9 +1778,15 @@ def get_unattached_pcl_strip_losses(
         sampled_strip_indices[k] = walk_strips[picks]
         sampled_local_indices[k] = walk_locals[picks]
         sampled_flat_indices[k] = starts_cpu[sampled_strip_indices[k]] + sampled_local_indices[k]
-        dense_walks.append(DenseWalk(
+        node_path = np.concatenate([
+            pcl_strips[strip_idx]['_theta_node_ids'][np.arange(
+                pos_from, pos_to + (1 if pos_from <= pos_to else -1),
+                1 if pos_from <= pos_to else -1)]
+            for strip_idx, pos_from, pos_to in segments
+        ])
+        walks.append(SampledWalk(
             row=k,
-            path=starts_cpu[walk_strips] + walk_locals,
+            path=node_path,
             pick_positions=picks,
         ))
 
@@ -1772,17 +1794,14 @@ def get_unattached_pcl_strip_losses(
     zyxs_t = flat['zyxs'][sampled_flat_indices_t]
     winding_t = flat['windings'][sampled_flat_indices_t]
 
-    def resolve_paths(paths_np, _rows_np):
-        indices = torch.from_numpy(paths_np).to(device=flat['zyxs'].device)
-        return flat['zyxs'][indices]
-
-    packed_dense_walks = _pack_dense_walks(dense_walks, resolve_paths)
+    packed_walks = _pack_walks(
+        walks, lambda paths: paths, crossing_map,
+        local_correction=False)
 
     spiral_zyxs = slice_to_spiral_transform(zyxs_t.reshape(-1, 3)).reshape(*zyxs_t.shape)
     theta, _, shifted_radii = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
     shifted_radii, crossing_adjustments = _unwrap_sampled_tracks(
-        slice_to_spiral_transform, dr_per_winding, theta, shifted_radii,
-        packed_dense_walks,
+        crossing_map, dr_per_winding, theta, shifted_radii, packed_walks,
     )
 
     # Normalise so a pcl with mixed annotations still reads as a single 'strip'.
