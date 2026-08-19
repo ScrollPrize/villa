@@ -2,7 +2,7 @@ name: Continuous Integration (CI)
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize]
   # Trusted main builds populate sccache entries that all subsequent PRs can
   # read. Caches written by pull_request runs are scoped to that PR's merge ref.
   push:
