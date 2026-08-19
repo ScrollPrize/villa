@@ -245,8 +245,10 @@ class DevicePatchAtlasTests(unittest.TestCase):
     def setUpClass(cls):
         # fit_spiral is import-heavy (wandb, zarr, ...); load it once for the
         # class rather than at test-module import.
-        from fit_spiral import PatchAtlas
+        from fit_spiral import PatchAtlas, largest_patch_quad_component
         cls.PatchAtlas = PatchAtlas
+        cls.largest_patch_quad_component = staticmethod(
+            largest_patch_quad_component)
 
     @staticmethod
     def _fake_patch(height, width, seed):
@@ -288,6 +290,48 @@ class DevicePatchAtlasTests(unittest.TestCase):
         self.assertEqual(atlas.id_to_idx['b'], 1)
         out = atlas.lookup(torch.tensor([1]), torch.tensor([[1.5, 2.5]]))
         torch.testing.assert_close(out[0], self._manual_bilinear(extra.zyxs, 1.5, 2.5))
+
+    def test_largest_patch_component_uses_eight_connectivity(self):
+        mask = np.zeros((8, 10), dtype=bool)
+        mask[0:3, 0:3] = True
+        mask[3, 3] = True  # diagonal connection keeps this in the large component
+        mask[4:7, 4:7] = True
+        mask[1:3, 8:10] = True  # detached four-cell island is discarded
+        expected = mask.copy()
+        expected[1:3, 8:10] = False
+        actual = self.largest_patch_quad_component(mask)
+        np.testing.assert_array_equal(actual, expected)
+        self.assertFalse(np.shares_memory(actual, mask))
+
+    def test_patch_atlas_registers_potential_for_every_valid_quad(self):
+        from theta_crossing_map import ThetaCrossingMap
+
+        patch = self._fake_patch(6, 8, 13)
+        # A connected ragged mask exercises the DFS tree rather than relying on
+        # a rectangular row walk. Geometry uses a smooth theta ramp so every
+        # non-tree edge agrees with the cached lift.
+        mask = np.ones((5, 7), dtype=bool)
+        mask[0, 5:] = False
+        mask[1, 6] = False
+        patch._sampling_valid_quad_mask_np = mask
+        theta = torch.linspace(5.5, 7.2, patch.zyxs.shape[1])
+        radius = torch.full_like(theta, 30.0)
+        patch.zyxs[..., 0] = torch.arange(
+            patch.zyxs.shape[0], dtype=torch.float32)[:, None]
+        patch.zyxs[..., 1] = torch.sin(theta)[None, :] * radius
+        patch.zyxs[..., 2] = torch.cos(theta)[None, :] * radius
+
+        atlas = self.PatchAtlas({'p': patch}, device='cpu')
+        crossing_map = ThetaCrossingMap('cpu', chunk_size=4)
+        atlas.register_theta_topology(crossing_map)
+        crossing_map.force_refresh(lambda value: value)
+
+        node_ids = atlas.theta_node_ids(
+            np.zeros(int(mask.sum()), dtype=np.int64), np.argwhere(mask))
+        potentials = crossing_map.winding_potentials(node_ids)
+        self.assertEqual(potentials.numel(), int(mask.sum()))
+        self.assertTrue(bool((potentials != crossing_map._unset_potential).all()))
+        self.assertEqual(crossing_map.potential_consistency()['inconsistent_edges'], 0)
 
     @unittest.skipUnless(torch.cuda.is_available(), 'needs CUDA')
     def test_materialized_lookup_and_append_stay_on_cuda(self):

@@ -146,6 +146,109 @@ def test_reference_node_connects_exact_annotation_to_patch_walk_origin():
     assert torch.equal(adjustment, torch.tensor([[-12.0, -12.0]]))
 
 
+def test_unwrap_tree_caches_branching_multiwrap_node_potentials():
+    # DFS preorder: 0 -> 1 -> 2 -> 3, then node 4 branches from node 1.
+    # The main arm crosses theta=0 once; the branch does not.
+    unwrapped_theta = [5.8, 6.1, 6.4, 6.7, 5.5]
+    points = _points_for_theta([value % (2 * math.pi) for value in unwrapped_theta])
+    crossing_map = ThetaCrossingMap('cpu', chunk_size=2)
+    crossing_map.register_nodes(len(points), lambda indices: points[indices])
+    crossing_map.register_edges([
+        [0, 1], [1, 2], [2, 3], [1, 4],
+        # Non-tree edge with the same continuous lift checks cycle consistency.
+        [0, 4],
+    ])
+    crossing_map.register_unwrap_tree(
+        [0, 1, 2, 3, 4], [-1, 0, 1, 2, 1])
+    crossing_map.force_refresh(_identity)
+
+    assert crossing_map.node_winding_potential.tolist() == [0, 0, -1, -1, 0]
+    assert crossing_map.potential_consistency() == {
+        'checked_edges': 5,
+        'inconsistent_edges': 0,
+        'max_abs_residual': 0,
+    }
+
+    # Arbitrary sample order no longer needs to be a contiguous theta walk.
+    sample_ids = torch.tensor([[3, 1, 4, 2]])
+    sample_theta = crossing_map.node_theta[sample_ids]
+    adjustments = crossing_map.adjustments_from_potentials(
+        sample_ids, sample_theta, torch.tensor(12.0))
+    assert torch.equal(adjustments, torch.tensor([[0.0, 12.0, 12.0, 0.0]]))
+
+
+def test_unordered_potentials_span_forty_wraps_without_sparse_aliasing():
+    unwrapped_theta = torch.arange(0.2, 40 * 2 * math.pi + 0.2, 0.2)
+    wrapped_theta = unwrapped_theta.remainder(2 * math.pi)
+    points = _points_for_theta(wrapped_theta.tolist())
+    num_nodes = len(points)
+    crossing_map = ThetaCrossingMap('cpu', chunk_size=37)
+    crossing_map.register_nodes(num_nodes, lambda indices: points[indices])
+    crossing_map.register_unwrap_tree(
+        torch.arange(num_nodes),
+        torch.cat([torch.tensor([-1]), torch.arange(num_nodes - 1)]),
+    )
+    crossing_map.force_refresh(_identity)
+
+    expected = -torch.floor(unwrapped_theta / (2 * math.pi)).to(torch.int32)
+    torch.testing.assert_close(crossing_map.node_winding_potential, expected)
+    # Deliberately stride farther than half a turn between arbitrary picks.
+    picked = torch.arange(num_nodes - 1, -1, -31)[:800][None, :]
+    actual = crossing_map.winding_potentials(
+        picked, crossing_map.node_theta[picked])
+    torch.testing.assert_close(actual, expected[picked])
+
+
+def test_potential_adjustments_handle_fractional_and_annotation_frames():
+    # Reference node 0 is an exact PCL point. Patch nodes 1..3 form a tree
+    # rooted at the attached quad (node 1) and cross theta=0 at node 2.
+    points = _points_for_theta([6.0, 6.1, 0.1, 0.3])
+    crossing_map = ThetaCrossingMap('cpu')
+    crossing_map.register_nodes(len(points), lambda indices: points[indices])
+    crossing_map.register_unwrap_tree([1, 2, 3], [-1, 0, 1])
+    crossing_map.force_refresh(_identity)
+
+    sample_ids = torch.tensor([[2, 3]])
+    # The first fractional point is just before theta=0 although its cell
+    # centre is just after it; the local correction cancels the tree crossing.
+    sampled_theta = torch.tensor([[2 * math.pi - 0.05, 0.3]])
+    adjustments = crossing_map.adjustments_from_potentials(
+        sample_ids,
+        sampled_theta,
+        torch.tensor(10.0),
+        reference_node_ids=torch.tensor([0]),
+        reference_patch_node_ids=torch.tensor([1]),
+    )
+    assert torch.equal(adjustments, torch.tensor([[0.0, -10.0]]))
+
+
+def test_unwrap_tree_rejects_non_preorder_and_unregistered_potential_lookup():
+    points = _points_for_theta([0.0, 0.1, 0.2])
+    crossing_map = ThetaCrossingMap('cpu')
+    crossing_map.register_nodes(3, lambda indices: points[indices])
+    with pytest.raises(ValueError, match='precede'):
+        crossing_map.register_unwrap_tree([0, 1, 2], [-1, 2, 0])
+    crossing_map_4 = ThetaCrossingMap('cpu')
+    points_4 = _points_for_theta([0.0, 0.1, 0.2, 0.3])
+    crossing_map_4.register_nodes(4, lambda indices: points_4[indices])
+    with pytest.raises(ValueError, match='depth-first preorder'):
+        crossing_map_4.register_unwrap_tree([0, 1, 2, 3], [-1, 0, 0, 1])
+    crossing_map.register_unwrap_tree([0, 1], [-1, 0])
+    crossing_map.force_refresh(_identity)
+    with pytest.raises(RuntimeError, match='no registered unwrap potential'):
+        crossing_map.winding_potentials(torch.tensor([2]))
+
+
+def test_single_node_unwrap_tree_needs_no_registered_edge():
+    points = _points_for_theta([0.4])
+    crossing_map = ThetaCrossingMap('cpu')
+    crossing_map.register_nodes(1, lambda indices: points[indices])
+    crossing_map.register_unwrap_tree([0], [-1])
+    crossing_map.force_refresh(_identity)
+    assert crossing_map.edge_nodes.numel() == 0
+    assert crossing_map.winding_potentials([0]).tolist() == [0]
+
+
 def test_refresh_interval_chunking_force_refresh_and_interval_change():
     points = _points_for_theta([0.1, 0.2, 0.3, 0.4, 0.5])
     calls = []

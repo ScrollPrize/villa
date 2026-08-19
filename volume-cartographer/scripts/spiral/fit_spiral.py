@@ -21,6 +21,8 @@ import datetime
 import time
 import numpy as np
 import scipy.ndimage
+import scipy.sparse
+import scipy.sparse.csgraph
 import torch.nn.functional as F
 from scipy.spatial import cKDTree
 from tqdm import tqdm
@@ -130,6 +132,18 @@ from spiral_progress import ProgressReporter, progress_or_null
 
 
 configure_torch_threads_from_env()
+
+
+def largest_patch_quad_component(mask):
+    """Return only the largest 8-connected True component of a quad mask."""
+    mask = np.asarray(mask, dtype=bool)
+    component_labels, num_components = scipy.ndimage.label(
+        mask, structure=np.ones((3, 3), dtype=bool))
+    if num_components <= 1:
+        return mask.copy()
+    component_sizes = np.bincount(component_labels.reshape(-1))
+    component_sizes[0] = 0
+    return component_labels == int(component_sizes.argmax())
 
 
 # Fields of a surf-SDT fingerprint that describe where the store lives and how
@@ -373,7 +387,7 @@ class PatchAtlas:
         return zyxs
 
     def register_theta_topology(self, crossing_map):
-        """Register valid quad centres and every sampler-reachable edge."""
+        """Register valid quad centres, local edges, and patch unwrap trees."""
         quad_patch_chunks = []
         quad_ij_chunks = []
         local_maps = []
@@ -410,7 +424,7 @@ class PatchAtlas:
 
         neighbours = ((0, 1), (1, -1), (1, 0), (1, 1))
         for patch, node_map in zip(self._patches, self._quad_node_ids):
-            patch_edges = []
+            local_patch_edges = []
             mask = node_map >= start
             h, w = mask.shape
             for di, dj in neighbours:
@@ -418,13 +432,62 @@ class PatchAtlas:
                 b = node_map[di:, max(0, dj):w - max(0, -dj)]
                 valid = (a >= start) & (b >= start)
                 if valid.any():
-                    patch_edges.append(np.stack([a[valid], b[valid]], axis=1))
+                    local_patch_edges.append(
+                        np.stack([a[valid], b[valid]], axis=1))
+            patch_edges = list(local_patch_edges)
             serpentine = getattr(patch, '_sampling_2d_path', None)
             if serpentine is not None and len(serpentine) > 1:
                 ids = node_map[serpentine[:, 0], serpentine[:, 1]]
                 patch_edges.append(np.stack([ids[:-1], ids[1:]], axis=1))
             if patch_edges:
                 crossing_map.register_edges(np.concatenate(patch_edges, axis=0))
+
+            # The sampling mask is reduced to its largest 8-connected
+            # component during host preparation, so the local-neighbour graph
+            # must form one tree.  scipy's deterministic DFS gives a preorder;
+            # converting predecessor node IDs to earlier preorder positions is
+            # the compact topology the theta map needs for cached potentials.
+            patch_nodes = node_map[mask]
+            if patch_nodes.size == 1:
+                crossing_map.register_unwrap_tree(
+                    patch_nodes, np.array([-1], dtype=np.int64))
+                continue
+            coords = np.argwhere(mask)
+            row_lo, col_lo = coords.min(axis=0)
+            row_hi, col_hi = coords.max(axis=0) + 1
+            if patch_nodes.size == (row_hi - row_lo) * (col_hi - col_lo):
+                # Most auto-grown patches are solid rectangles. A
+                # boustrophedon path is already a local-edge spanning tree and
+                # avoids tens of thousands of tiny scipy graph traversals.
+                rectangular_nodes = node_map[row_lo:row_hi, col_lo:col_hi]
+                preorder = np.concatenate([
+                    rectangular_nodes[row]
+                    if row % 2 == 0 else rectangular_nodes[row, ::-1]
+                    for row in range(rectangular_nodes.shape[0])
+                ])
+                parents = np.arange(-1, preorder.size - 1, dtype=np.int64)
+                crossing_map.register_unwrap_tree(preorder, parents)
+                continue
+            if not local_patch_edges:
+                raise RuntimeError('multi-quad patch has no local theta edges')
+            local_edges = np.concatenate(local_patch_edges, axis=0)
+            node_base = int(patch_nodes.min())
+            compact_edges = local_edges - node_base
+            graph = scipy.sparse.csr_matrix(
+                (np.ones(compact_edges.shape[0], dtype=np.int8),
+                 (compact_edges[:, 0], compact_edges[:, 1])),
+                shape=(patch_nodes.size, patch_nodes.size),
+            )
+            order, predecessors = scipy.sparse.csgraph.depth_first_order(
+                graph, 0, directed=False, return_predecessors=True)
+            if order.size != patch_nodes.size:
+                raise RuntimeError(
+                    'patch theta topology is disconnected after largest-component filtering')
+            preorder_position = np.empty(order.size, dtype=np.int64)
+            preorder_position[order] = np.arange(order.size, dtype=np.int64)
+            parents = np.full(order.size, -1, dtype=np.int64)
+            parents[1:] = preorder_position[predecessors[order[1:]]]
+            crossing_map.register_unwrap_tree(node_base + order, parents)
         return start
 
     def theta_node_ids(self, patch_indices, ijs):
@@ -1004,7 +1067,19 @@ class FitContext:
                 # Fallback if no quad falls in the ROI; should be rare since patches
                 # entirely outside the z-ROI are dropped earlier.
                 in_roi_quad_mask_np = valid_quad_mask_np
+            # Every patch loss and its cached theta lift use one connected
+            # surface. Ignore detached islands rather than inventing an
+            # integer winding offset between components. Eight-connectivity
+            # matches both patch edge topology and the former Dijkstra graph.
+            in_roi_quad_mask_np = largest_patch_quad_component(
+                in_roi_quad_mask_np)
             patch._sampling_valid_quad_mask_np = in_roi_quad_mask_np
+            patch_scale = np.asarray(
+                patch.scale.detach().cpu()
+                if hasattr(patch.scale, 'detach') else patch.scale,
+                dtype=np.float64)
+            patch._sampling_area = float(
+                in_roi_quad_mask_np.sum() * (1.0 / patch_scale).prod())
             # Patches below the 2D-sampling area threshold get a serpentine
             # walk over their in-ROI valid quads; the loss samplers draw sparse
             # whole-patch 2D samples along it instead of 1D strips (see
@@ -1012,7 +1087,7 @@ class FitContext:
             max_area_2d = self.config['patch_2d_sampling_max_area']
             patch._sampling_2d_path = (
                 build_serpentine_quad_path(in_roi_quad_mask_np)
-                if max_area_2d is not None and float(patch.area) < max_area_2d
+                if max_area_2d is not None and patch._sampling_area < max_area_2d
                 else None
             )
             if not native_sampling_available:
@@ -1053,7 +1128,10 @@ class FitContext:
         return self._patch_sampling_probabilities(patches)
 
     def _patch_sampling_probabilities(self, patches):
-        areas = np.asarray([float(patch.area) for patch in patches], dtype=np.float32)
+        areas = np.asarray([
+            float(getattr(patch, '_sampling_area', patch.area))
+            for patch in patches
+        ], dtype=np.float32)
         weights = areas ** self.config['patch_sampling_area_exponent']
         return weights / weights.sum()
 

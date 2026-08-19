@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from typing import Callable
 
 import numpy as np
+import scipy.sparse
+import scipy.sparse.linalg
 import torch
 
 
@@ -23,6 +25,15 @@ class _NodeSource:
     start: int
     count: int
     get_zyxs: Callable[[torch.Tensor], torch.Tensor]
+
+
+@dataclass(slots=True)
+class _UnwrapTree:
+    """One preorder-indexed tree used to lift wrapped node theta."""
+
+    node_ids: torch.Tensor
+    parent_pairs: torch.Tensor
+    subtree_ends: torch.Tensor
 
 
 class ThetaCrossingMap:
@@ -46,6 +57,7 @@ class ThetaCrossingMap:
             raise ValueError('ThetaCrossingMap chunk_size must be positive')
         self._sources: list[_NodeSource] = []
         self._edge_chunks: list[torch.Tensor] = []
+        self._unwrap_trees: list[_UnwrapTree] = []
         self.num_nodes = 0
         self.edge_nodes = torch.empty(
             (0, 2), dtype=torch.int64, device=self.topology_device)
@@ -53,6 +65,21 @@ class ThetaCrossingMap:
             0, dtype=torch.int64, device=self.topology_device)
         self.node_theta = torch.empty(0, dtype=torch.float32, device=self.device)
         self.crossings = torch.empty(0, dtype=torch.int8, device=self.device)
+        # Patch quad centres opt into an unwrap tree.  The resulting integer
+        # potential is root-relative and is refreshed from the same cached
+        # edge crossings as sampled walks.  INT32_MIN marks non-tree nodes
+        # (for example PCL topology, which continues to use explicit walks).
+        self._unset_potential = torch.iinfo(torch.int32).min
+        self.node_winding_potential = torch.empty(
+            0, dtype=torch.int32, device=self.device)
+        self._potential_node_ids = torch.empty(
+            0, dtype=torch.int64, device=self.topology_device)
+        self._potential_edge_ids = torch.empty(
+            0, dtype=torch.int64, device=self.topology_device)
+        self._potential_directions = torch.empty(
+            0, dtype=torch.int8, device=self.topology_device)
+        self._potential_exit_positions = torch.empty(
+            0, dtype=torch.int64, device=self.topology_device)
         self.last_refresh_iteration: int | None = None
         self._fresh_without_iteration = False
         self._topology_dirty = False
@@ -94,6 +121,100 @@ class ThetaCrossingMap:
             self.last_refresh_iteration = None
             self._fresh_without_iteration = False
 
+    def register_unwrap_tree(self, node_ids, parent_positions):
+        """Register one connected node tree in depth-first preorder.
+
+        ``node_ids`` contains every tree node exactly once. ``parent_positions``
+        indexes that array, with -1 for the root and every other parent strictly
+        preceding its child.  The preorder property makes every subtree a
+        contiguous range.  At refresh time edge crossing steps are added on
+        subtree entry and removed just after subtree exit; one cumulative sum
+        then yields a root-relative integer winding potential at every node.
+        """
+        nodes = torch.as_tensor(
+            node_ids, dtype=torch.int64, device=self.topology_device).reshape(-1)
+        parents = torch.as_tensor(
+            parent_positions, dtype=torch.int64,
+            device=self.topology_device).reshape(-1)
+        if nodes.numel() == 0 or parents.shape != nodes.shape:
+            raise ValueError('unwrap tree nodes and parents must be equal nonempty vectors')
+        if nodes.min().item() < 0 or nodes.max().item() >= self.num_nodes:
+            raise ValueError('unwrap tree contains an unregistered node')
+        if torch.unique(nodes).numel() != nodes.numel():
+            raise ValueError('unwrap tree contains duplicate nodes')
+        if parents[0].item() != -1:
+            raise ValueError('unwrap tree root parent must be -1')
+        if parents.numel() > 1:
+            positions = torch.arange(
+                1, parents.numel(), dtype=torch.int64,
+                device=self.topology_device)
+            if not bool(((parents[1:] >= 0) & (parents[1:] < positions)).all()):
+                raise ValueError('unwrap tree parents must precede their children')
+
+        # In DFS preorder every subtree is contiguous. Compute its end once at
+        # topology build time; refreshes then need only a streamed scatter and
+        # one cumsum.
+        count = nodes.numel()
+        if count == 1:
+            subtree_ends = torch.zeros(
+                1, dtype=torch.int64, device=self.topology_device)
+        elif np.array_equal(parents.numpy()[1:], np.arange(count - 1)):
+            # A Hamiltonian grid walk is a single chain: every subtree ends at
+            # the final node. This is the common fast path for rectangular
+            # auto-grown patches.
+            subtree_ends = torch.full(
+                (count,), count - 1, dtype=torch.int64,
+                device=self.topology_device)
+        elif count < 10_000:
+            # Avoid constructing a sparse triangular system for small ragged
+            # patches; a short host loop has much lower fixed overhead.
+            parents_np = parents.numpy()
+            subtree_sizes = np.ones(count, dtype=np.int64)
+            for child in range(count - 1, 0, -1):
+                parent = parents_np[child]
+                subtree_sizes[parent] += subtree_sizes[child]
+            subtree_ends = torch.from_numpy(
+                np.arange(count, dtype=np.int64) + subtree_sizes - 1)
+        else:
+            # subtree_size[parent] = 1 + sum(subtree_size[child]).  Because
+            # parents precede children this is an upper-triangular solve.  The
+            # scipy implementation performs the reverse accumulation in C;
+            # unlike a Python node loop it stays cheap for million-quad bands.
+            positions_np = np.arange(count, dtype=np.int64)
+            parents_np = parents.numpy()
+            rows = np.concatenate([positions_np, parents_np[1:]])
+            cols = np.concatenate([positions_np, positions_np[1:]])
+            data = np.concatenate([
+                np.ones(count, dtype=np.float64),
+                -np.ones(count - 1, dtype=np.float64),
+            ])
+            system = scipy.sparse.csr_matrix(
+                (data, (rows, cols)), shape=(count, count))
+            subtree_sizes = scipy.sparse.linalg.spsolve_triangular(
+                system, np.ones(count, dtype=np.float64), lower=False)
+            subtree_sizes = np.rint(subtree_sizes).astype(np.int64)
+            subtree_ends = torch.from_numpy(
+                positions_np + subtree_sizes - 1)
+        if count > 1:
+            child_positions = torch.arange(
+                1, count, dtype=torch.int64, device=self.topology_device)
+            if not bool((subtree_ends[parents[1:]] >= child_positions).all()):
+                raise ValueError('unwrap tree nodes must be in depth-first preorder')
+        parent_pairs = (
+            torch.stack([nodes[parents[1:]], nodes[1:]], dim=1)
+            if nodes.numel() > 1
+            else torch.empty((0, 2), dtype=torch.int64,
+                             device=self.topology_device)
+        )
+        self._unwrap_trees.append(_UnwrapTree(
+            nodes, parent_pairs, subtree_ends))
+        self.register_edges(parent_pairs)
+        # A single-node tree has no edge through which register_edges can mark
+        # the derived potential topology dirty.
+        self._topology_dirty = True
+        self.last_refresh_iteration = None
+        self._fresh_without_iteration = False
+
     def invalidate(self):
         """Invalidate transformed values without discarding source topology."""
         self.last_refresh_iteration = None
@@ -119,6 +240,52 @@ class ThetaCrossingMap:
         self.crossings = torch.empty(
             self.edge_nodes.shape[0], dtype=torch.int8, device=self.device)
         self._topology_dirty = False
+
+        potential_nodes = []
+        potential_edge_ids = []
+        potential_directions = []
+        potential_exits = []
+        offset = 0
+        for tree in self._unwrap_trees:
+            count = tree.node_ids.numel()
+            edge_ids = torch.zeros(
+                count, dtype=torch.int64, device=self.topology_device)
+            directions = torch.zeros(
+                count, dtype=torch.int8, device=self.topology_device)
+            if count > 1:
+                resolved, resolved_directions = self.resolve_edges(
+                    tree.parent_pairs)
+                edge_ids[1:] = resolved
+                directions[1:] = resolved_directions
+            # Each non-root step is removed immediately after its child's
+            # complete subtree. Roots carry a zero step, so their exit is inert.
+            exits = tree.subtree_ends + offset + 1
+            exits[0] = offset
+            potential_nodes.append(tree.node_ids)
+            potential_edge_ids.append(edge_ids)
+            potential_directions.append(directions)
+            potential_exits.append(exits)
+            offset += count
+        if potential_nodes:
+            all_nodes = torch.cat(potential_nodes)
+            if torch.unique(all_nodes).numel() != all_nodes.numel():
+                raise ValueError('unwrap trees overlap at one or more nodes')
+            self._potential_node_ids = all_nodes
+            self._potential_edge_ids = torch.cat(potential_edge_ids)
+            self._potential_directions = torch.cat(potential_directions)
+            self._potential_exit_positions = torch.cat(potential_exits)
+        else:
+            self._potential_node_ids = torch.empty(
+                0, dtype=torch.int64, device=self.topology_device)
+            self._potential_edge_ids = torch.empty(
+                0, dtype=torch.int64, device=self.topology_device)
+            self._potential_directions = torch.empty(
+                0, dtype=torch.int8, device=self.topology_device)
+            self._potential_exit_positions = torch.empty(
+                0, dtype=torch.int64, device=self.topology_device)
+        self.node_winding_potential = torch.full(
+            (self.num_nodes,), self._unset_potential,
+            dtype=torch.int32, device=self.device)
 
     def resolve_edges(self, node_pairs):
         """Resolve directed node pairs to ``(edge_ids, directions)``.
@@ -226,7 +393,131 @@ class ThetaCrossingMap:
                 self.crossings = crossings
             else:
                 self.crossings = torch.empty(0, dtype=torch.int8, device=self.device)
+
+            num_potential_nodes = self._potential_node_ids.numel()
+            node_potential = torch.full(
+                (self.num_nodes,), self._unset_potential,
+                dtype=torch.int32, device=self.device)
+            if num_potential_nodes:
+                events = torch.zeros(
+                    num_potential_nodes + 1,
+                    dtype=torch.int32, device=self.device)
+                for lo in range(0, num_potential_nodes, self.chunk_size):
+                    hi = min(num_potential_nodes, lo + self.chunk_size)
+                    edge_ids = self._potential_edge_ids[lo:hi].to(self.device)
+                    directions = self._potential_directions[lo:hi].to(self.device)
+                    steps = (
+                        self.crossings[edge_ids].to(torch.int32)
+                        * directions.to(torch.int32)
+                        if self.crossings.numel()
+                        else torch.zeros_like(directions, dtype=torch.int32))
+                    entries = torch.arange(
+                        lo, hi, dtype=torch.int64, device=self.device)
+                    exits = self._potential_exit_positions[lo:hi].to(self.device)
+                    events.index_add_(0, entries, steps)
+                    events.index_add_(0, exits, -steps)
+                ordered_potential = events.cumsum(
+                    dim=0, dtype=torch.int32)[:-1]
+                for lo in range(0, num_potential_nodes, self.chunk_size):
+                    hi = min(num_potential_nodes, lo + self.chunk_size)
+                    node_ids = self._potential_node_ids[lo:hi].to(self.device)
+                    node_potential[node_ids] = ordered_potential[lo:hi]
+            self.node_winding_potential = node_potential
         self.node_theta = theta
+
+    def winding_potentials(self, node_ids, sampled_theta=None):
+        """Return root-relative integer winding potentials for arbitrary nodes.
+
+        When ``sampled_theta`` is supplied, the cached quad-centre potential is
+        transported through the final local centre-to-fractional-sample step.
+        """
+        ids = torch.as_tensor(node_ids, dtype=torch.int64, device=self.device)
+        if self.node_winding_potential.numel() != self.num_nodes:
+            raise RuntimeError('ThetaCrossingMap must be refreshed before use')
+        values = self.node_winding_potential[ids]
+        if bool((values == self._unset_potential).any()):
+            bad = ids[(values == self._unset_potential).nonzero(as_tuple=True)[0][0]]
+            raise RuntimeError(
+                f'theta node {int(bad)} has no registered unwrap potential')
+        if sampled_theta is not None:
+            theta = torch.as_tensor(
+                sampled_theta, device=self.device).detach()
+            if theta.shape != ids.shape:
+                raise ValueError('sampled theta and potential node IDs must have equal shape')
+            local_delta = theta - self.node_theta[ids]
+            values = values + (
+                (local_delta > np.pi).to(torch.int32)
+                - (local_delta < -np.pi).to(torch.int32))
+        return values
+
+    def adjustments_from_potentials(
+        self, node_ids, sampled_theta, dr_per_winding, *,
+        reference_node_ids=None, reference_patch_node_ids=None,
+    ):
+        """Adjust unordered patch samples using cached per-node potentials.
+
+        Ordinary rows are reanchored at their first sample.  Annotation-led
+        rows instead use the exact PCL reference node and its attached patch
+        quad, preserving the absolute/relative winding frame without an
+        explicit sampled strip from the annotation.
+        """
+        values = self.winding_potentials(node_ids, sampled_theta)
+        has_reference = reference_node_ids is not None
+        if has_reference != (reference_patch_node_ids is not None):
+            raise ValueError(
+                'reference node and reference patch node must be supplied together')
+        if has_reference:
+            references = torch.as_tensor(
+                reference_node_ids, dtype=torch.int64, device=self.device)
+            patch_references = torch.as_tensor(
+                reference_patch_node_ids, dtype=torch.int64, device=self.device)
+            expected_shape = values.shape[:-1]
+            if references.shape != expected_shape or patch_references.shape != expected_shape:
+                raise ValueError('reference IDs must match the sample row shape')
+            patch_potential = self.winding_potentials(patch_references)
+            reference_delta = (
+                self.node_theta[patch_references] - self.node_theta[references])
+            reference_step = (
+                (reference_delta > np.pi).to(torch.int32)
+                - (reference_delta < -np.pi).to(torch.int32))
+            values = (
+                values - patch_potential[..., None]
+                + reference_step[..., None])
+        else:
+            values = values - values[..., :1]
+        return values.to(dr_per_winding.dtype) * dr_per_winding.detach()
+
+    def potential_consistency(self):
+        """Check cached potentials against every edge joining potential nodes.
+
+        Tree edges are correct by construction; non-tree neighbor edges make
+        this a useful cycle/path-independence diagnostic for large patches.
+        Returns integer counts and the largest absolute winding residual.
+        """
+        if self.node_winding_potential.numel() != self.num_nodes:
+            raise RuntimeError('ThetaCrossingMap must be refreshed before use')
+        checked = 0
+        inconsistent = 0
+        max_abs_residual = 0
+        for lo in range(0, self.edge_nodes.shape[0], self.chunk_size):
+            hi = min(self.edge_nodes.shape[0], lo + self.chunk_size)
+            nodes = self.edge_nodes[lo:hi].to(self.device)
+            potentials = self.node_winding_potential[nodes]
+            valid = (potentials != self._unset_potential).all(dim=1)
+            if not bool(valid.any()):
+                continue
+            residual = (
+                potentials[valid, 1] - potentials[valid, 0]
+                - self.crossings[lo:hi][valid].to(torch.int32))
+            checked += int(valid.sum())
+            inconsistent += int((residual != 0).sum())
+            max_abs_residual = max(
+                max_abs_residual, int(residual.abs().max()))
+        return {
+            'checked_edges': checked,
+            'inconsistent_edges': inconsistent,
+            'max_abs_residual': max_abs_residual,
+        }
 
     def adjustments(self, packed_walks, sampled_theta, dr_per_winding):
         """Gather cumulative crossing adjustments for packed sampled walks.
