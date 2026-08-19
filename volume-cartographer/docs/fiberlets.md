@@ -346,10 +346,15 @@ descriptor owns its sign-oriented candidate prediction axis and individual
 candidate-only alignment factors. Each reached incoming state similarly
 prepares its sign-oriented current prediction axis and previous/current factor
 once. Only the four genuinely pair-dependent alignment dots remain in the
-transition loop; factor multiplication order is unchanged. Public and non-DP
-metric callers prepare the same private descriptors on demand through the
-shared scorer, while the standalone alignment API keeps its raw caller-oriented
-semantics. There is no separate scoring equation.
+transition loop. Interior DP stores valid outgoing alignment inputs in a
+compact fixed-capacity structure-of-arrays batch and evaluates those four dots
+across the batch. Invalid outgoing slots are omitted, and valid lanes retain
+ascending transition-slot order. Factor multiplication order is unchanged;
+smoothness, accumulated component costs, strict-less comparisons, destination
+updates, and backpointers remain scalar in their original order. Public and
+non-DP metric callers prepare the same private descriptors on demand through
+the shared scorer, while the standalone alignment API keeps its raw caller-
+oriented semantics. There is no separate scoring equation.
 
 Source and sink transitions use the fitted endpoint axes as proxy endpoint
 predictions; sink presence is one. Curvature uses the native tracer's shared

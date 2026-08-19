@@ -1,5 +1,15 @@
 # Status: staged fiberlet anchor acceleration
 
+- [x] Obtain approval for checkpoint 38 portable transition batching.
+- [x] Inspect the remaining DP scoring loop and write the detailed plan.
+- [x] Independently review checkpoint 38 against task and specifications.
+- [x] Implement the compact nine-slot alignment batch and shared primitives.
+- [x] Add scalar-oracle, adversarial, and DP reuse coverage.
+- [x] Run focused GCC and Clang validation and inspect optimized code.
+- [x] Check CPU availability and run invariant canonical measurements.
+- [x] Retain checkpoint 38 based on measured results.
+- [x] Update specifications, user documentation, changelog, and task log.
+
 - [x] Obtain approval for checkpoint 37 two-sided alignment preparation.
 - [x] Plan checkpoint 37 and its exactness/performance gates.
 - [x] Independently review checkpoint 37 against task and specifications.

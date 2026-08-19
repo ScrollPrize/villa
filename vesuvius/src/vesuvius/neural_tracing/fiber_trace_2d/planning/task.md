@@ -262,3 +262,20 @@ factor multiplication order remain in the transition loop. The shared local
 scorer remains the sole owner of the equations, public callers continue to
 prepare on demand, and retention requires exact replay output plus a repeatable
 fiberlet-DP gain.
+
+Checkpoint 38 will test portable batching of the remaining pair-dependent
+alignment arithmetic across each reached state's fixed nine outgoing slots.
+Store only the alignment inputs needed by that batch in compact structure-of-
+arrays form while retaining the authoritative candidate descriptor for scalar
+smoothness. Compute alignment results in transition-slot order, then perform
+smoothness, cost accumulation, comparisons, and relaxation in the existing
+scalar order. Keep source/sink paths and public scoring APIs unchanged. Require
+an independent scalar oracle, GCC/Clang portability, evidence that optimized
+production code vectorizes or otherwise improves the batch, unchanged replay
+behavior, and a repeatable enclosing search/DP gain before retention.
+
+Checkpoint 38 retained the compact-valid-lane layout. Matching optimized
+counterbalanced runs reduced median search and DP worker time by about 5.9%
+and median fiberlet wall by 5.7%, while all replay artifacts remained byte-
+identical. The fixed-nine neutral-lane alternative was not pursued after the
+compact layout both vectorized and avoided invalid-lane work.

@@ -665,3 +665,7 @@
 - Deferred isotropic-angle evaluation in shared local scoring until an invalid
   normal or degenerate projected tangent requires it. Canonical median DP
   search wall improved another 6.2% with byte-identical replay artifacts.
+- Batched the four pair-dependent interior-DP alignment dots across compact
+  valid outgoing lanes while retaining scalar transition relaxation order.
+  Matching optimized runs improved median DP search wall by 5.9% and fiberlet
+  wall by 5.7% with byte-identical replay artifacts.

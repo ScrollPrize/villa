@@ -1859,3 +1859,82 @@
   regress, and replay output remained exact. The command-wall increase tracks
   the untouched anchor phase and is recorded rather than attributed to this
   local DP change.
+
+## Checkpoint 38: portable batched transition alignment
+
+- Started from committed checkpoint 37 (`836303cea`). The remaining interior
+  loop evaluates four pair-dependent alignment dots for about 112.2 million
+  scored state/edge pairs. Smoothness contains branch-dependent inverse
+  trigonometry and remains scalar; relaxation order also remains scalar.
+- The experiment will expose only the independent fixed-nine alignment work as
+  compact SoA arrays. A shared private primitive owns the arithmetic, and the
+  existing scalar scorer remains the correctness oracle. Standard C++ plus
+  GCC/Clang optimized-code inspection decides whether the batch is genuinely
+  vectorized or merely adds packing overhead.
+- Independent review identified QuickBuild `-O1`, invalid-lane reads, dot/FMA
+  ordering, duplicated cost assembly, packing traffic, and scalar-vs-batch DP
+  comparison as explicit risks. The revised plan compares finite fixed lanes
+  with compact valid lanes, never reads invalid source descriptors, retains
+  shared cost assembly, validates all 512 masks bitwise under matching
+  optimized flags, records layout/code-generation evidence, and uses identical
+  optimized baseline/candidate builds behind the invariant launcher.
+- Implemented a compact-valid-lane SoA batch in the shared source-private local
+  scorer. Outgoing construction appends valid edges in ascending transition-
+  slot order. Each reached incoming state computes the four pair-dependent
+  alignment dots for that compact batch; the existing scalar loop then performs
+  shared smoothness/cost assembly, accumulated-state addition, strict-less
+  comparisons, and backpointer writes in the same order. Source, sink, and
+  direct paths remain unchanged.
+- The chosen batch is 312 bytes and its output array is 36 bytes. `DpEdge`
+  remains 76 bytes. GCC stack-usage reports show `solveCandidate()` growing
+  from 2,064 to 2,480 bytes (`+416` bounded dynamic bytes). The canonical run
+  has 28,354,560 valid outgoing edges over 5,963,689 reached nodes, or 4.75
+  compact lanes per batch, and reuses them for 84,166,532 incoming-state/edge
+  evaluations.
+- GCC 16 `-O3` reports the batch loop vectorized with 32-byte vectors and an
+  eight-lane unroll plus a 16-byte epilogue. Clang `-O3` reports vectorization
+  width eight and interleave count one. Both implementations remain portable
+  scalar C++ with no intrinsics, explicit alignment, or fast-math.
+- Added an all-512-mask scalar/batch bitwise oracle with poisoned invalid source
+  slots and edge cases, plus a multi-incoming-state relaxation fixture that
+  compares complete cost components, totals, relaxation counts, and predecessor
+  choices. GCC and Clang QuickBuild each pass 54 path cases and 6 replay cases.
+  The matching GCC `-O3` replay suite passes. Its full path suite retains 295
+  failures in the older independent legacy metric bitwise oracle at line 393;
+  those optimizer-dependent failures existed before this batch, while the new
+  batch checks emit no failures. No sanitizer-configured local build existed,
+  so sanitizer execution was not added during this checkpoint.
+- Matching GCC 16 `-O3`, no-LTO, `VC_TESTING=ON` baseline and candidate builds
+  used the invariant command
+  `volume-cartographer/build/benchmarks/fiberlet_replay/run`. The launcher used
+  `fiber_s1_002.lasagna.json`,
+  `dj_20260805T025256484_000003.json`, the regular Lasagna normal manifest, 32
+  threads, length 5,000, and two maximum iterations. Baseline was checkpoint-37
+  commit `836303cea`; three warm pairs ran `B/C, C/B, B/C`. Logs and artifacts
+  are under `volume-cartographer/build/benchmarks/checkpoint38/runs/`.
+
+  | metric | baseline min/median/max | candidate min/median/max | median change |
+  |---|---:|---:|---:|
+  | command wall | `5.47/5.54/5.58 s` | `5.41/5.50/5.64 s` | `-0.7%` |
+  | total CPU | `139.76/141.22/141.75 s` | `139.09/140.01/141.86 s` | `-0.9%` |
+  | anchor wall | `3.4458/3.4476/3.4915 s` | `3.4354/3.5253/3.5722 s` | `+2.3%` |
+  | anchor CPU | `90.887/91.652/91.825 s` | `90.795/91.529/92.175 s` | `-0.1%` |
+  | fiberlet wall | `1.6307/1.6779/1.6995 s` | `1.5789/1.5820/1.6594 s` | `-5.7%` |
+  | fiberlet CPU | `46.913/47.675/48.012 s` | `46.403/46.593/47.783 s` | `-2.3%` |
+  | search wall | `0.7796/0.7899/0.8545 s` | `0.7429/0.7433/0.7737 s` | `-5.9%` |
+  | search CPU | `23.256/23.868/24.042 s` | `23.183/23.292/23.583 s` | `-2.4%` |
+  | DP worker | `24.678/24.986/27.088 s` | `23.525/23.528/24.512 s` | `-5.8%` |
+  | peak RSS | `1,347,112/1,347,144/1,359,368 KiB` | `1,347,348/1,349,252/1,356,008 KiB` | `+0.2%` |
+
+- Every measured run retained 2,521 anchors, 48,944 searched / 24,526 accepted
+  candidates, 28,354,560 valid edges, 84,166,532 reused edge evaluations,
+  58,211,093 relaxations, and 2 greedy / 1 fiberlet failures. Every artifact
+  was byte-identical with SHA-256
+  `79e9163de700ed1f93e3ae2c15073cf1fb196d5678f296d8126b5c6dbcc291aa`.
+- Retained the compact layout because the targeted search/DP and enclosing
+  fiberlet gains repeated while replay output remained exact. The planned
+  initialized fixed-nine neutral-lane alternative was intentionally not
+  implemented after compact lanes both vectorized and avoided 4.25 invalid
+  lanes per average batch; it would add masked invalid-lane work without
+  addressing a measured deficiency. This is the checkpoint's only functional
+  experiment-plan simplification.

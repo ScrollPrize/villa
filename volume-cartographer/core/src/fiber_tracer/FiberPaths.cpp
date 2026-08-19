@@ -1591,17 +1591,6 @@ FiberletPathCost pathStepCost(
     return fiberletPathCost(local);
 }
 
-FiberLocalMetricCost pathStepMetricCostPrepared(
-    const detail::FiberLocalPreparedIncomingAlignment& incoming,
-    float previousLength,
-    float candidateLength,
-    const detail::FiberLocalPreparedCandidateMetric& candidate,
-    const FiberLocalMetricConfig& config)
-{
-    return detail::fiberLocalMetricCostFullyPreparedInline(
-        incoming, previousLength, candidateLength, candidate, config);
-}
-
 bool betterCost(float candidate, float current)
 {
     return candidate < current;
@@ -1966,6 +1955,8 @@ FiberletCandidateResult solveCandidate(
             const uint32_t currentScoringIndex = dpNodes.existing(node);
 
             std::array<DpEdge, transitionStateCount> outgoing;
+            detail::FiberLocalPreparedCandidateAlignmentBatch<
+                transitionStateCount> outgoingAlignment;
             size_t generatedEdges = 0;
             size_t validEdges = 0;
             for (int deltaU = -1; deltaU <= 1; ++deltaU) {
@@ -2004,16 +1995,22 @@ FiberletCandidateResult solveCandidate(
                     const auto& nextScoring = dpNodes.at(nextScoringIndex);
                     const cv::Vec3f metricDirection =
                         prepareFiberLocalUnitDirection(direction);
-                    outgoing[transitionState] = {
-                        found,
-                        nextScoringIndex,
-                        stepLength,
+                    const auto candidateMetric =
                         detail::prepareFiberLocalCandidateMetricInline(
                             nextScoring.metricPrediction,
                             metricDirection,
                             nextScoring.metricNormal,
-                            (nextScoring.flags & kNodeNormalValid) != 0),
+                            (nextScoring.flags & kNodeNormalValid) != 0);
+                    outgoing[transitionState] = {
+                        found,
+                        nextScoringIndex,
+                        stepLength,
+                        candidateMetric,
                     };
+                    detail::appendFiberLocalCandidateAlignmentInline(
+                        outgoingAlignment,
+                        static_cast<std::uint8_t>(transitionState),
+                        candidateMetric);
                     ++validEdges;
                 }
             }
@@ -2035,32 +2032,33 @@ FiberletCandidateResult solveCandidate(
                     detail::prepareFiberLocalIncomingAlignmentInline(
                         &currentScoring.metricPrediction,
                         incoming.metricDirection);
-                for (int deltaU = -1; deltaU <= 1; ++deltaU) {
-                    for (int deltaV = -1; deltaV <= 1; ++deltaV) {
-                        const size_t transitionState =
-                            static_cast<size_t>((deltaU + 1) * 3 + (deltaV + 1));
-                        const auto& edge = outgoing[transitionState];
-                        if (edge.next == missingNode)
-                            continue;
-                        const size_t next = edge.next;
-                        DpAccumulatedCost nextCost = currentState.cost;
-                        nextCost += pathStepMetricCostPrepared(
+                std::array<float, transitionStateCount> alignmentLosses;
+                detail::fiberLocalAlignmentLossPreparedBatchInline(
+                    incomingMetric, outgoingAlignment, alignmentLosses);
+                for (size_t lane = 0; lane < outgoingAlignment.count; ++lane) {
+                    const size_t transitionState =
+                        outgoingAlignment.slotOfLane[lane];
+                    const auto& edge = outgoing[transitionState];
+                    const size_t next = edge.next;
+                    DpAccumulatedCost nextCost = currentState.cost;
+                    nextCost +=
+                        detail::fiberLocalMetricCostFromPreparedAlignmentInline(
+                            alignmentLosses[lane],
                             incomingMetric,
                             incoming.metricLength,
                             edge.metricLength,
                             edge.candidateMetric,
                             metricConfig);
-                        auto& destination = nextStates[
-                            (next - nextRange.begin) * stateCount +
-                            transitionState];
-                        if (!destination.reached || betterCost(
-                                nextCost.total(), destination.cost.total())) {
-                            ++profile.relaxations;
-                            destination.reached = true;
-                            destination.cost = nextCost;
-                            previousStates[next * stateCount + transitionState] =
-                                static_cast<uint8_t>(previousState);
-                        }
+                    auto& destination = nextStates[
+                        (next - nextRange.begin) * stateCount +
+                        transitionState];
+                    if (!destination.reached || betterCost(
+                            nextCost.total(), destination.cost.total())) {
+                        ++profile.relaxations;
+                        destination.reached = true;
+                        destination.cost = nextCost;
+                        previousStates[next * stateCount + transitionState] =
+                            static_cast<uint8_t>(previousState);
                     }
                 }
             }

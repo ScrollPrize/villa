@@ -702,6 +702,198 @@ TEST_CASE("fully prepared fiber local scoring matches randomized legacy metrics 
     }
 }
 
+TEST_CASE("batched prepared alignment matches every scalar validity mask bitwise")
+{
+    using namespace vc::fiber_tracer;
+    constexpr size_t capacity = 9;
+    std::mt19937 generator(0x38ba7cU);
+    const auto sampleValue = [&]() {
+        return static_cast<float>(static_cast<int32_t>(generator() % 4001U) -
+                                  2000) /
+               1000.0f;
+    };
+    const auto sampleUnit = [&]() {
+        cv::Vec3f value{sampleValue(), sampleValue(), sampleValue()};
+        if (value.dot(value) < 0.01f)
+            value[0] += 1.0f;
+        return prepareFiberLocalUnitDirection(value);
+    };
+
+    for (uint32_t mask = 0; mask < (1U << capacity); ++mask) {
+        const cv::Vec3f previous = sampleUnit();
+        FiberLocalMetricSample current{sampleUnit(), sampleValue(), true};
+        const auto incoming =
+            detail::prepareFiberLocalIncomingAlignmentInline(
+                &current, previous);
+        std::array<detail::FiberLocalPreparedCandidateMetric, capacity>
+            candidates;
+        detail::FiberLocalPreparedCandidateAlignmentBatch<capacity> batch;
+        for (size_t slot = 0; slot < capacity; ++slot) {
+            if ((mask & (1U << slot)) == 0) {
+                const float poison = std::numeric_limits<float>::quiet_NaN();
+                candidates[slot].direction = {poison, poison, poison};
+                candidates[slot].predictionDirection =
+                    {poison, poison, poison};
+                candidates[slot].presence = poison;
+                candidates[slot].directionPredictionAlignment = poison;
+                continue;
+            }
+            const cv::Vec3f candidateDirection = sampleUnit();
+            const FiberLocalMetricSample candidate{
+                sampleUnit(), sampleValue(), true};
+            candidates[slot] = detail::prepareFiberLocalCandidateMetricInline(
+                candidate, candidateDirection, {}, false);
+            detail::appendFiberLocalCandidateAlignmentInline(
+                batch, static_cast<uint8_t>(slot), candidates[slot]);
+        }
+
+        std::array<float, capacity> losses;
+        losses.fill(std::numeric_limits<float>::quiet_NaN());
+        detail::fiberLocalAlignmentLossPreparedBatchInline(
+            incoming, batch, losses);
+        CHECK(batch.count == static_cast<size_t>(std::popcount(mask)));
+        for (size_t lane = 0; lane < batch.count; ++lane) {
+            const size_t slot = batch.slotOfLane[lane];
+            const float expected =
+                detail::fiberLocalAlignmentLossPreparedInline(
+                    incoming, candidates[slot]);
+            const uint32_t actualBits =
+                std::bit_cast<uint32_t>(losses[lane]);
+            const uint32_t expectedBits = std::bit_cast<uint32_t>(expected);
+            CHECK(actualBits == expectedBits);
+            if (lane > 0)
+                CHECK(batch.slotOfLane[lane - 1] < slot);
+        }
+    }
+
+    detail::FiberLocalPreparedCandidateAlignmentBatch<capacity> batch;
+    const FiberLocalMetricSample candidate{
+        {1.0f, -0.0f, 0.0f},
+        std::numeric_limits<float>::infinity(),
+        true};
+    const auto prepared = detail::prepareFiberLocalCandidateMetricInline(
+        candidate, {-0.0f, 1.0f, 0.0f}, {}, false);
+    detail::appendFiberLocalCandidateAlignmentInline(batch, 8, prepared);
+    const FiberLocalMetricSample current{
+        {1.0f, 0.0f, -0.0f}, 1.0f, true};
+    const auto incoming = detail::prepareFiberLocalIncomingAlignmentInline(
+        &current, {1.0f, -0.0f, 0.0f});
+    std::array<float, capacity> losses;
+    detail::fiberLocalAlignmentLossPreparedBatchInline(
+        incoming, batch, losses);
+    CHECK(std::bit_cast<uint32_t>(losses[0]) ==
+          std::bit_cast<uint32_t>(
+              detail::fiberLocalAlignmentLossPreparedInline(
+                  incoming, prepared)));
+}
+
+TEST_CASE("batched prepared alignment preserves scalar relaxation choices")
+{
+    using namespace vc::fiber_tracer;
+    constexpr size_t capacity = 9;
+    constexpr size_t incomingCount = 5;
+    constexpr std::array<uint32_t, 3> masks{
+        0b101010101U,
+        0b111111110U,
+        0b011010011U,
+    };
+    const FiberLocalMetricConfig config{
+        4.0f,
+        FiberLocalSmoothnessConfig{2.0f, 0.1f, 10.0f, 0.05f},
+    };
+    std::mt19937 generator(0x38d9aU);
+    const auto sampleValue = [&]() {
+        return static_cast<float>(static_cast<int32_t>(generator() % 4001U) -
+                                  2000) /
+               1000.0f;
+    };
+    const auto sampleUnit = [&]() {
+        cv::Vec3f value{sampleValue(), sampleValue(), sampleValue()};
+        if (value.dot(value) < 0.01f)
+            value[0] += 1.0f;
+        return prepareFiberLocalUnitDirection(value);
+    };
+
+    for (const uint32_t mask : masks) {
+        std::array<detail::FiberLocalPreparedCandidateMetric, capacity>
+            candidates;
+        std::array<float, capacity> candidateLengths;
+        detail::FiberLocalPreparedCandidateAlignmentBatch<capacity> batch;
+        for (size_t slot = 0; slot < capacity; ++slot) {
+            if ((mask & (1U << slot)) == 0)
+                continue;
+            const FiberLocalMetricSample prediction{
+                sampleUnit(), sampleValue(), true};
+            candidates[slot] = detail::prepareFiberLocalCandidateMetricInline(
+                prediction, sampleUnit(), sampleUnit(), slot % 3 != 0);
+            candidateLengths[slot] = sampleValue() * 3.0f;
+            detail::appendFiberLocalCandidateAlignmentInline(
+                batch, static_cast<uint8_t>(slot), candidates[slot]);
+        }
+
+        std::array<float, capacity> scalarBest;
+        std::array<float, capacity> batchedBest;
+        std::array<uint8_t, capacity> scalarPrevious;
+        std::array<uint8_t, capacity> batchedPrevious;
+        scalarBest.fill(std::numeric_limits<float>::infinity());
+        batchedBest.fill(std::numeric_limits<float>::infinity());
+        scalarPrevious.fill(std::numeric_limits<uint8_t>::max());
+        batchedPrevious.fill(std::numeric_limits<uint8_t>::max());
+        size_t scalarRelaxations = 0;
+        size_t batchedRelaxations = 0;
+
+        for (size_t previousState = 0; previousState < incomingCount;
+             ++previousState) {
+            const FiberLocalMetricSample current{
+                sampleUnit(), sampleValue(), previousState != 3};
+            const auto incoming =
+                detail::prepareFiberLocalIncomingAlignmentInline(
+                    &current, sampleUnit());
+            const float previousLength = sampleValue() * 3.0f;
+            const float accumulated = sampleValue() * 5.0f;
+            std::array<float, capacity> losses;
+            detail::fiberLocalAlignmentLossPreparedBatchInline(
+                incoming, batch, losses);
+
+            for (size_t lane = 0; lane < batch.count; ++lane) {
+                const size_t slot = batch.slotOfLane[lane];
+                const auto scalar =
+                    detail::fiberLocalMetricCostFullyPreparedInline(
+                        incoming, previousLength, candidateLengths[slot],
+                        candidates[slot], config);
+                const auto batched =
+                    detail::fiberLocalMetricCostFromPreparedAlignmentInline(
+                        losses[lane], incoming, previousLength,
+                        candidateLengths[slot], candidates[slot], config);
+                checkMetricCostBits(batched, scalar);
+                const float scalarTotal = accumulated + scalar.total();
+                const float batchedTotal = accumulated + batched.total();
+                CHECK(std::bit_cast<uint32_t>(batchedTotal) ==
+                      std::bit_cast<uint32_t>(scalarTotal));
+                if (scalarTotal < scalarBest[slot]) {
+                    ++scalarRelaxations;
+                    scalarBest[slot] = scalarTotal;
+                    scalarPrevious[slot] =
+                        static_cast<uint8_t>(previousState);
+                }
+                if (batchedTotal < batchedBest[slot]) {
+                    ++batchedRelaxations;
+                    batchedBest[slot] = batchedTotal;
+                    batchedPrevious[slot] =
+                        static_cast<uint8_t>(previousState);
+                }
+            }
+        }
+
+        CHECK(batchedRelaxations == scalarRelaxations);
+        CHECK(batchedPrevious == scalarPrevious);
+        for (size_t slot = 0; slot < capacity; ++slot) {
+            CHECK(std::bit_cast<uint32_t>(batchedBest[slot]) ==
+                  std::bit_cast<uint32_t>(scalarBest[slot]));
+        }
+    }
+}
+
 TEST_CASE("fiber local alignment loss preserves native multiplicative scoring")
 {
     using vc::fiber_tracer::fiberLocalAlignmentLoss;

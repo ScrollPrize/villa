@@ -2112,3 +2112,101 @@ unchanged populations and DP work, and 2 greedy / 1 fiberlet failures.
 - Every measured artifact retained exact populations, DP counters, routes,
   2 greedy / 1 fiberlet failures, and SHA-256
   `904c39d08e39c6b7b65ac95fd47d28d50e254a33609201c92aef71c6cc131308`.
+
+### Checkpoint 38: portable batched transition alignment
+
+1. Keep the existing nine-slot outgoing-edge construction and transition-slot
+   numbering. Compare two fixed-capacity SoA layouts: nine initialized finite
+   lanes plus a validity mask, and compact valid lanes plus an ascending
+   `slotOfLane` map and `validCount`. Both contain candidate direction,
+   oriented prediction direction, presence, and the stored
+   candidate/prediction factor. Fill the batch once per reached node from the
+   same candidate metric descriptor used by scalar smoothness. Never read an
+   invalid source edge; tests may poison invalid source descriptors while all
+   batch storage itself remains initialized.
+2. Add one shared source-private batch primitive that evaluates only the four
+   pair-dependent dot products and the existing seven-factor multiplication in
+   slot order. Reuse the existing clamp primitive and reproduce each
+   `cv::Vec3f::dot` component reduction plus the scalar factor multiplication
+   order without reassociation or FMA-sensitive rewriting. Refactor the
+   complete scalar prepared scorer to consume the same alignment primitive and
+   a shared cost-assembly primitive accepting precomputed alignment loss. The
+   assembly primitive remains the sole owner of edge-length weighting,
+   smoothness evaluation, and effective-length normalization; do not copy
+   metric equations into `FiberPaths.cpp`.
+3. For each reached incoming state, evaluate the alignment batch once into a
+   fixed stack array. Keep the subsequent transition loop scalar and in the
+   existing order: skip invalid slots, evaluate candidate-prepared smoothness,
+   compute effective length and component costs, add to the accumulated state,
+   compare totals, and update the same destination/backpointer. Source seeding,
+   sink evaluation, direct paths, candidate/node order, and tie policy remain
+   unchanged.
+4. Add a direct scalar-vs-batch oracle over deterministic randomized and
+   adversarial values. Cover all 512 validity masks and every valid count/slot,
+   NaN/Inf inputs, signed zero, sign-oriented axes, and poisonous invalid
+   source slots. Compare valid-lane results bitwise under the optimized build
+   flags. Add a test-only scalar/batch DP selection and compare complete costs,
+   routes, counters, relaxations, and reconstruction for multiple reached
+   incoming states and nodes with different valid-edge sets. Preserve all
+   public scoring symbols and APIs. Run focused sanitizer coverage where the
+   existing build setup permits it.
+5. Build focused GCC and repository-local Clang path/replay tests. Inspect the
+   exact measured `FiberPaths.cpp` object and compiler vectorization diagnostics
+   for the batch loop; the implementation remains standard portable C++ with
+   no architecture-specific intrinsics, alignment assumptions, or fast-math.
+   Record batch and `DpEdge` sizes, stack-frame growth, valid-lane occupancy,
+   packing/kernel work, and whether each compiler vectorizes. The batch is
+   constructed once per reached node with no heap work or per-incoming copy.
+   Reject a layout if scalarization or packing overhead erases the gain. Normal
+   CI remains the macOS/arm64 portability gate; local speed claims apply to the
+   measured x86 host only.
+6. Reuse the exact command
+   `volume-cartographer/build/benchmarks/fiberlet_replay/run`. Change only its
+   ignored selection data to point at matching checkpoint-37 baseline and
+   checkpoint-38 candidate builds and fresh outputs. Use identical optimized
+   `Release` or `RelWithDebInfo` flags that enable the inspected vectorizer for
+   both builds; do not compare an optimized candidate against the existing
+   QuickBuild baseline. Check CPU load before and after each run, screen once,
+   then run counterbalanced warm pairs when the host is available. Report
+   min/median/max command, CPU, fiberlet, search, DP, and RSS values plus
+   populations, failures, counters, and artifact hashes. Retain only a
+   repeatable search/DP and enclosing fiberlet gain without replay quality
+   regression.
+
+#### Checkpoint 38 spec update
+
+- None unless retained. If retained, clarify only that interior DP may batch
+  independent outgoing-slot alignment arithmetic while preserving scalar
+  transition and relaxation order.
+
+#### Checkpoint 38 documentation update
+
+- If retained, document the compact outgoing alignment batch in
+  `volume-cartographer/docs/fiberlets.md`, add a concise changelog entry, and
+  record complete measurements in `planning/task_log.md`. If rejected, remove
+  source/test/user-documentation changes and keep only the experiment result in
+  the active planning records.
+
+#### Checkpoint 38 result
+
+- Retained the compact-valid-lane SoA layout. The batch occupies 312 stack
+  bytes, its nine alignment outputs occupy 36 bytes, and `DpEdge` remains 76
+  bytes. The measured `solveCandidate()` stack frame grows from 2,064 to 2,480
+  bounded dynamic bytes. The
+  canonical run averaged 4.75 valid lanes per reached node, so compacting
+  avoids evaluating nearly half of each fixed nine-lane batch.
+- GCC 16 at `-O3` vectorized the alignment loop with 32-byte vectors and an
+  eight-lane unroll plus a 16-byte epilogue. Clang at `-O3` also vectorized it
+  at width eight with interleave count one. Focused GCC and Clang QuickBuild
+  path/replay suites passed. The new all-512-mask arithmetic oracle and
+  relaxation-selection fixture also pass in those builds. The full GCC `-O3`
+  path executable retains 295 failures in the older independent legacy metric
+  bitwise oracle at line 393; those optimizer-dependent failures predate this
+  batch and do not occur in the normal test configuration.
+- Three counterbalanced matching GCC `-O3` pairs reduced median search wall
+  from `0.7899` to `0.7433` seconds (5.9%), DP worker time from `24.9858` to
+  `23.5284` seconds (5.8%), fiberlet wall from `1.6779` to `1.5820` seconds
+  (5.7%), and fiberlet CPU from `47.675` to `46.593` seconds (2.3%). Median
+  command wall changed from `5.54` to `5.50` seconds and total CPU from
+  `141.22` to `140.01` seconds. Every replay artifact was byte-identical with
+  SHA-256 `79e9163de700ed1f93e3ae2c15073cf1fb196d5678f296d8126b5c6dbcc291aa`.
