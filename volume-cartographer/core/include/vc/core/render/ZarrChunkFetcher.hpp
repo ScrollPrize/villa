@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace utils {
@@ -62,6 +63,15 @@ OpenedChunkedZarr openHttpZarrPyramid(
 OpenedRemoteChunkedZarr openRemoteZarrPyramid(
     const std::string& url,
     RemoteZarrOpenOptions options = {});
+
+// S3 deliberately returns AccessDenied rather than NotFound for a missing key
+// when the caller lacks ListBucket. Optional discovery probes must therefore
+// accept a generic 403 while preserving explicit credential failures so the
+// anonymous retry policy can still run. Exposed for deterministic tests.
+bool isOptionalRemoteMetadataMiss(
+    long status,
+    std::string_view key,
+    std::string_view responseBody = {});
 
 // Enforce the supported contiguous dyadic VC pyramid contract and make
 // physical level baseScaleLevel logical level zero. Exposed for deterministic

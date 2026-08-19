@@ -9,8 +9,8 @@ Ninja to generate a fresh eight-case Valgrind graph:
 
 - serial and four-worker parallel fixtures;
 - `full_res`, `fallback_3`, `mixed_correlated`, and `mixed_shuffled`;
-- separate-thread Callgrind profiles for all eight cases;
-- complete DRD dependency graphs for the four parallel cases;
+- periodic separate-thread Callgrind profiles for all eight cases;
+- scheduler and futex traces from each parallel case's same Callgrind run;
 - a relative modeled-runtime score and exact rendering checksum per case.
 
 The fixture renders through the production `ChunkCache`. A deterministic fake
@@ -59,39 +59,31 @@ change the fixed four-worker renderer fixture or five-core replay model.
 
 The regular estimate contains no Python process. Ninja invokes Valgrind
 directly, then `bench_thread_sync_replay evaluate-render` parses the raw
-Callgrind profiles and DRD log, validates the pair, attributes costs, replays
-the graph, and writes the result in C++.
+Callgrind profiles and scheduler log, attributes costs to their originating
+threads, replays the synchronization graph, and writes the result in C++.
 
 Artifacts are under
 `build/ci-render-benchmark/render-valgrind-ci/<fixture>/<scenario>/`:
 
 - `callgrind/callgrind.out.*`, benchmark metadata, and a collection stamp;
 - `callgrind/scheduler.log` for parallel cases;
-- `drd/drd.log`, benchmark metadata, and a collection stamp for parallel cases;
 - `evaluation.json` for the ungated score;
 - `checked.json` after a passing comparison;
 
-Start failure diagnosis with the raw profiles, DRD log, and `evaluation.json`.
+Start failure diagnosis with the raw profiles, scheduler log, and
+`evaluation.json`.
 Historical compiler, model, checksum, cache, fixture, repetition, and profiler
 changes do not fail the reference gate. Current-run parse errors or
-Callgrind/DRD metadata inconsistency still fail because they prevent a valid
-score. A score above the allowed slowdown is a performance regression requiring
+incomplete futex dependencies still fail because they prevent a valid score. A
+score above the allowed slowdown is a performance regression requiring
 investigation or an intentional reference update.
 
-Parallel collection uses the same fair scheduler and 10,000-basic-block
-quantum in both Valgrind runs. Callgrind also records the scheduler stream from
-its own execution. Main thread 1 remains fixed; the four worker identities are
-matched by exhaustively scoring all 24 permutations against normalized worker
-activity share and cumulative activity in 16 measured-window bins. Assignments
-within the scheduler-quantum resolution of the best score are all replayed, and
-the maximum makespan is the case score. The case fails as insufficient
-attribution evidence if those compatible assignments span more than 2% in
-makespan.
-
-An attribution retry, if enabled, must recollect only the affected case and
-only after an `assignment evidence insufficient` failure. It must not retry a
-completed evaluation whose modeled-runtime score exceeds the reference; that
-is a performance regression, not a collection-quality failure.
+Parallel collection uses Callgrind's fair scheduler and a fixed
+10,000-basic-block quantum. Periodic event-counter deltas, scheduler quanta,
+and futex wait/wake operations all come from that one execution. Successful
+waits are linked to wakes on the same futex address, and each thread's profile
+is applied directly to that thread's replay windows. There is no cross-run
+worker assignment or second profiler trace.
 
 ## CI Activation
 
@@ -115,7 +107,7 @@ naturally bounded by available graph work.
 
 Model calibration, case references, and tolerance are independent controls:
 
-- **Recalibrate** only when changing how Callgrind/DRD events map to the score.
+- **Recalibrate** only when changing how Callgrind events map to the score.
 - **Refresh references** when an understood code or toolchain change shifts the
   expected score while the model remains valid.
 - **Change tolerance** when intentionally changing regression sensitivity.
@@ -203,8 +195,8 @@ baseline. Never use renderer observations to fit these coefficients.
 
 Use this when the model remains unchanged but an understood implementation,
 compiler, or Valgrind change alters expected scores. Use a new build directory
-to guarantee fresh Callgrind and DRD collection, and match the intended CI
-toolchain exactly:
+to guarantee fresh Callgrind collection, and match the intended CI toolchain
+exactly:
 
 ```bash
 build=volume-cartographer/build/render-reference-$(date +%Y%m%d-%H%M%S)
@@ -229,8 +221,8 @@ The freeze command requires exactly all eight native evaluation artifacts and
 records score, checksum, model hash, and tolerance. Legacy evaluation artifacts
 also retain their environment/workload identity as diagnostic metadata. Only
 score and tolerance affect historical pass/fail.
-Review every old/new score ratio. Run a second fresh collection before accepting
-references when parallel DRD replay variation is close to the chosen tolerance.
+Review every old/new score ratio. Run a second fresh collection before
+accepting references when a parallel score is close to the chosen tolerance.
 
 ## Tightening Or Loosening Tolerance
 

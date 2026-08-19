@@ -2,7 +2,7 @@ name: Continuous Integration (CI)
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize]
   # Trusted main builds populate sccache entries that all subsequent PRs can
   # read. Caches written by pull_request runs are scoped to that PR's merge ref.
   push:
@@ -24,7 +24,7 @@ jobs:
   changes:
     name: Detect changes
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 15
     outputs:
       vc: ${{ steps.filter.outputs.vc }}
       test_core: ${{ steps.filter.outputs.test_core }}
@@ -34,7 +34,19 @@ jobs:
       flatboi: ${{ steps.filter.outputs.flatboi }}
       mcp: ${{ steps.filter.outputs.mcp }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Villa
+        id: checkout
+        uses: actions/checkout@v4
+        timeout-minutes: 2
+        continue-on-error: true
+        with:
+          sparse-checkout: volume-cartographer
+      - name: Retry checkout Villa
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        timeout-minutes: 2
+        with:
+          sparse-checkout: volume-cartographer
       - id: filter
         uses: dorny/paths-filter@v3
         with:
@@ -112,7 +124,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.vc != 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - run: echo "No volume-cartographer changes — skipping build."
 
@@ -121,7 +133,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.test_core == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     container:
       image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
       credentials:
@@ -132,7 +144,19 @@ jobs:
       SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
       SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-0c371b1d-clang-quickbuild-o0
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Villa
+        id: checkout
+        uses: actions/checkout@v4
+        timeout-minutes: 2
+        continue-on-error: true
+        with:
+          sparse-checkout: volume-cartographer
+      - name: Retry checkout Villa
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        timeout-minutes: 2
+        with:
+          sparse-checkout: volume-cartographer
       - name: Set up shared compiler cache
         uses: mozilla-actions/sccache-action@v0.0.10
         with:
@@ -159,7 +183,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.test_specialized == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     container:
       image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
       credentials:
@@ -170,7 +194,19 @@ jobs:
       SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
       SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-0c371b1d-clang-quickbuild-o0
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Villa
+        id: checkout
+        uses: actions/checkout@v4
+        timeout-minutes: 2
+        continue-on-error: true
+        with:
+          sparse-checkout: volume-cartographer
+      - name: Retry checkout Villa
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        timeout-minutes: 2
+        with:
+          sparse-checkout: volume-cartographer
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0
@@ -196,14 +232,26 @@ jobs:
     needs: changes
     if: needs.changes.outputs.test_core == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     container:
       image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Villa
+        id: checkout
+        uses: actions/checkout@v4
+        timeout-minutes: 2
+        continue-on-error: true
+        with:
+          sparse-checkout: volume-cartographer
+      - name: Retry checkout Villa
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        timeout-minutes: 2
+        with:
+          sparse-checkout: volume-cartographer
       # Keep this until the next published dependency image includes the
       # valgrind entry in scripts/install_build_deps.sh.
       - name: Install Valgrind profiler
@@ -253,7 +301,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.vc3d == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     container:
       image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
       credentials:
@@ -264,7 +312,19 @@ jobs:
       SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
       SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-0c371b1d-clang-quickbuild-o0
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Villa
+        id: checkout
+        uses: actions/checkout@v4
+        timeout-minutes: 2
+        continue-on-error: true
+        with:
+          sparse-checkout: volume-cartographer
+      - name: Retry checkout Villa
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        timeout-minutes: 2
+        with:
+          sparse-checkout: volume-cartographer
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0
@@ -290,7 +350,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.cli == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     container:
       image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
       credentials:
@@ -301,7 +361,19 @@ jobs:
       SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
       SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-0c371b1d-clang-quickbuild-o0
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Villa
+        id: checkout
+        uses: actions/checkout@v4
+        timeout-minutes: 2
+        continue-on-error: true
+        with:
+          sparse-checkout: volume-cartographer
+      - name: Retry checkout Villa
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        timeout-minutes: 2
+        with:
+          sparse-checkout: volume-cartographer
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0
@@ -325,7 +397,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.flatboi == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     container:
       image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
       credentials:
@@ -336,7 +408,19 @@ jobs:
       SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
       SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-0c371b1d-clang-quickbuild-o0
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Villa
+        id: checkout
+        uses: actions/checkout@v4
+        timeout-minutes: 2
+        continue-on-error: true
+        with:
+          sparse-checkout: volume-cartographer
+      - name: Retry checkout Villa
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        timeout-minutes: 2
+        with:
+          sparse-checkout: volume-cartographer
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0
@@ -360,9 +444,21 @@ jobs:
     needs: changes
     if: needs.changes.outputs.mcp == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Villa
+        id: checkout
+        uses: actions/checkout@v4
+        timeout-minutes: 2
+        continue-on-error: true
+        with:
+          sparse-checkout: volume-cartographer
+      - name: Retry checkout Villa
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        timeout-minutes: 2
+        with:
+          sparse-checkout: volume-cartographer
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -396,9 +492,33 @@ jobs:
       matrix:
         os: [macos-15]
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Villa
+        id: checkout
+        uses: actions/checkout@v4
+        timeout-minutes: 2
+        continue-on-error: true
+        with:
+          sparse-checkout: volume-cartographer
+      - name: Retry checkout Villa
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        timeout-minutes: 2
+        with:
+          sparse-checkout: volume-cartographer
 
-      - uses: actions/checkout@v4
+      - name: Checkout VC3D dependencies
+        id: checkout_deps
+        uses: actions/checkout@v4
+        timeout-minutes: 2
+        continue-on-error: true
+        with:
+          repository: ScrollPrize/vc3d-deps
+          ref: b21145c78af694a0fc574249a3f7ae6f037f8bea
+          path: vc3d-deps
+      - name: Retry checkout VC3D dependencies
+        if: steps.checkout_deps.outcome == 'failure'
+        uses: actions/checkout@v4
+        timeout-minutes: 2
         with:
           repository: ScrollPrize/vc3d-deps
           ref: b21145c78af694a0fc574249a3f7ae6f037f8bea
@@ -438,7 +558,7 @@ jobs:
     needs: [changes, skip, test-core, test-specialized, render-benchmark, vc3d-compile-smoke, cli-compile, flatboi-compile, mcp-test, macos-build]
     if: always()
     runs-on: ubuntu-24.04
-    timeout-minutes: 2
+    timeout-minutes: 15
     steps:
       - name: Aggregate required-check result
         env:

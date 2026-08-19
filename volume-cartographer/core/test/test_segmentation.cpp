@@ -151,6 +151,14 @@ TEST_CASE("Segmentation: canLoadSurface requires the tifxyz payload")
     CHECK_FALSE(seg.canLoadSurface());
     CHECK(seg.loadSurface() == nullptr);
 
+    SUBCASE("catalog provenance alone is not a lazy placeholder")
+    {
+        std::ofstream(t.dir / "catalog-origin.json") << "{}";
+        Segmentation catalogSegment(t.dir);
+        CHECK_FALSE(catalogSegment.canLoadSurface());
+        CHECK(catalogSegment.loadSurface() == nullptr);
+    }
+
     SUBCASE("a partial payload is still not loadable")
     {
         std::ofstream(t.dir / "x.tif") << "stub";
@@ -165,6 +173,26 @@ TEST_CASE("Segmentation: canLoadSurface requires the tifxyz payload")
         Segmentation complete(t.dir);
         CHECK(complete.canLoadSurface());
     }
+}
+
+TEST_CASE("Segmentation: canLoadSurface allows open-data lazy placeholders")
+{
+    TmpSeg t;
+    writeMeta(t.dir, R"({
+        "type":"seg",
+        "uuid":"placeholder",
+        "name":"lazy",
+        "format":"tifxyz",
+        "scale":[1.0,1.0],
+        "tiff_dimensions":[16,8],
+        "vc_open_data_lazy_placeholder":true
+    })");
+
+    Segmentation seg(t.dir);
+    CHECK(seg.canLoadSurface());
+    CHECK(seg.loadSurface() != nullptr);
+    CHECK(seg.getSurface() != nullptr);
+    CHECK_FALSE(fs::exists(t.dir / "x.tif"));
 }
 
 TEST_CASE("Segmentation: loadSurface returns nullptr when not tifxyz")

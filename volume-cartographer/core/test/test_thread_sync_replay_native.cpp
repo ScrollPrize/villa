@@ -87,39 +87,12 @@ replay::EventCostModel dataReadModel()
     };
 }
 
-replay::SchedulerTrace schedulerTrace(std::vector<std::int64_t> quantum_threads)
-{
-    replay::SchedulerTrace result{.quantum_threads = std::move(quantum_threads)};
-    for (const auto thread : result.quantum_threads) {
-        ++result.full_quanta[thread];
-    }
-    return result;
-}
-
 replay::EventProfile scaledProfile(std::int64_t scale)
 {
     auto result = representativeProfile();
     for (auto& [name, value] : result) {
         (void)name;
         value *= scale;
-    }
-    return result;
-}
-
-std::vector<std::int64_t> roundRobinSchedule(std::vector<std::pair<std::int64_t, std::size_t>> remaining)
-{
-    std::vector<std::int64_t> result;
-    bool emitted = true;
-    while (emitted) {
-        emitted = false;
-        for (auto& [thread, count] : remaining) {
-            if (count == 0) {
-                continue;
-            }
-            result.push_back(thread);
-            --count;
-            emitted = true;
-        }
     }
     return result;
 }
@@ -266,30 +239,38 @@ TEST_CASE("native Callgrind parser rejects nonzero residual-only threads")
     CHECK_THROWS_WITH_AS(replay::parsePeriodicCallgrind(prefix), doctest::Contains("Callgrind residual-only thread contains measured work"), std::runtime_error);
 }
 
-TEST_CASE("native DRD parser trims to the passive measured clock pair")
+TEST_CASE("native Callgrind synchronization parser pairs measured futex wakeups")
 {
     TemporaryDirectory temporary;
-    const auto trace = temporary.path / "drd.log";
+    const auto trace = temporary.path / "scheduler.log";
     writeText(
         trace,
-        "-- New segment for thread 1 with vc [ 1: 1 ]\n"
+        "SYSCALL[2,2](202) sys_futex ( 0xbbb, 393, 0, 0x0, 0x0 ) --> [async] ...\n"
         "SYSCALL[2,1](228) sys_clock_gettime( 1, 0xaaa )[sync] --> Success(0x0)\n"
-        "-- New segment for thread 1 with vc [ 1: 2 ]\n"
-        "-- New segment for thread 2 with vc [ 1: 2, 2: 1 ]\n"
+        "SYSCALL[2,1](202) sys_futex ( 0xbbb, 129, 1, 0x0, 0x0 ) --> [async] ...\n"
+        "SYSCALL[2,1](202) ... [async] --> Success(0x1)\n"
+        "SYSCALL[2,2](202) ... [async] --> Success(0x0)\n"
         "-- SCHED[2]: releasing lock (VG_(scheduler):timeslice) -> VgTs_Yielding\n"
+        "SYSCALL[2,2](202) sys_futex ( 0xccc, 393, 0, 0x0, 0x0 ) --> [async] ...\n"
         "SYSCALL[2,1](228) sys_clock_gettime( 1, 0xaaa )[sync] --> Success(0x0)\n"
-        "-- New segment for thread 1 with vc [ 1: 3, 2: 1 ]\n");
+        "-- SCHED[9]: releasing lock (VG_(scheduler):timeslice) -> VgTs_Yielding\n");
 
-    const auto parsed = replay::parseMeasuredDrd(trace);
-    CHECK(parsed.parsed_segment_count == 3);
-    CHECK(parsed.retained_segment_count == 2);
-    CHECK(parsed.events.size() == 3);
-    CHECK(parsed.happens_before_edges == 1);
+    const auto parsed = replay::parseMeasuredCallgrindSync(trace);
+    REQUIRE(parsed.events.size() == 4);
+    CHECK(parsed.parsed_futex_calls == 2);
+    CHECK(parsed.blocking_futex_waits == 1);
+    CHECK(parsed.futex_happens_before_edges == 1);
+    CHECK(parsed.dropped_pre_window_edges == 0);
     CHECK(parsed.scheduler.full_quanta.at(2) == 1);
-    CHECK(parsed.events[1].dependencies.back().kind == "drd_happens_before");
+    CHECK(parsed.events[0].kind == "futex_wake");
+    CHECK(parsed.events[1].kind == "futex_resume");
+    CHECK(parsed.events[1].dependencies.back().kind == "futex_wake");
+    CHECK(parsed.events[2].kind == "work_quantum");
+    CHECK(parsed.events[3].kind == "futex_wait");
+    CHECK(parsed.events[3].blocked);
 }
 
-TEST_CASE("native scheduler parser preserves measured quantum order")
+TEST_CASE("native Callgrind synchronization parser preserves measured quantum order")
 {
     TemporaryDirectory temporary;
     const auto trace = temporary.path / "scheduler.log";
@@ -303,91 +284,85 @@ TEST_CASE("native scheduler parser preserves measured quantum order")
         "SYSCALL[2,1](228) sys_clock_gettime( 1, 0xaaa )[sync] --> Success(0x0)\n"
         "-- SCHED[9]: releasing lock (VG_(scheduler):timeslice) -> VgTs_Yielding\n");
 
-    const auto parsed = replay::parseMeasuredScheduler(trace);
-    CHECK(parsed.quantum_threads == std::vector<std::int64_t>{2, 3, 2});
-    CHECK(parsed.full_quanta.at(2) == 2);
-    CHECK(parsed.full_quanta.at(3) == 1);
-    CHECK(parsed.begin_line == 2);
-    CHECK(parsed.end_line == 6);
+    const auto parsed = replay::parseMeasuredCallgrindSync(trace);
+    CHECK(parsed.scheduler.quantum_threads == std::vector<std::int64_t>{2, 3, 2});
+    CHECK(parsed.scheduler.full_quanta.at(2) == 2);
+    CHECK(parsed.scheduler.full_quanta.at(3) == 1);
+    CHECK(parsed.scheduler.begin_line == 2);
+    CHECK(parsed.scheduler.end_line == 6);
 }
 
-TEST_CASE("native paired replay uses same-run scheduler evidence")
+TEST_CASE("native Callgrind synchronization parser ignores nonblocking futex waits")
+{
+    TemporaryDirectory temporary;
+    const auto trace = temporary.path / "scheduler.log";
+    writeText(
+        trace,
+        "SYSCALL[2,1](228) sys_clock_gettime( 1, 0xaaa )[sync] --> Success(0x0)\n"
+        "SYSCALL[2,2](202) sys_futex ( 0xbbb, 393, 0, 0x0, 0x0 ) --> [async] ...\n"
+        "SYSCALL[2,2](202) ... [async] --> Failure(0xb)\n"
+        "-- SCHED[2]: releasing lock (VG_(scheduler):timeslice) -> VgTs_Yielding\n"
+        "SYSCALL[2,1](228) sys_clock_gettime( 1, 0xaaa )[sync] --> Success(0x0)\n");
+
+    const auto parsed = replay::parseMeasuredCallgrindSync(trace);
+    REQUIRE(parsed.events.size() == 2);
+    CHECK(parsed.events[0].kind == "futex_wait");
+    CHECK_FALSE(parsed.events[0].blocked);
+    CHECK(parsed.blocking_futex_waits == 0);
+    CHECK(parsed.futex_happens_before_edges == 0);
+}
+
+TEST_CASE("native Callgrind synchronization parser rejects an unmatched measured wakeup")
+{
+    TemporaryDirectory temporary;
+    const auto trace = temporary.path / "scheduler.log";
+    writeText(
+        trace,
+        "SYSCALL[2,1](228) sys_clock_gettime( 1, 0xaaa )[sync] --> Success(0x0)\n"
+        "SYSCALL[2,2](202) sys_futex ( 0xbbb, 393, 0, 0x0, 0x0 ) --> [async] ...\n"
+        "SYSCALL[2,2](202) ... [async] --> Success(0x0)\n"
+        "-- SCHED[2]: releasing lock (VG_(scheduler):timeslice) -> VgTs_Yielding\n"
+        "SYSCALL[2,1](228) sys_clock_gettime( 1, 0xaaa )[sync] --> Success(0x0)\n");
+
+    CHECK_THROWS_WITH_AS(replay::parseMeasuredCallgrindSync(trace), doctest::Contains("no matching wake"), std::runtime_error);
+}
+
+TEST_CASE("native Callgrind replay attributes costs directly to same-run threads")
 {
     replay::CallgrindTrace callgrind;
     for (std::int64_t thread = 1; thread <= 3; ++thread) {
         callgrind.slices[thread] = {scaledProfile(thread)};
         callgrind.totals[thread] = scaledProfile(thread);
     }
-    const auto callgrind_scheduler = schedulerTrace({2, 3, 2, 2, 2, 2, 2, 2});
-    replay::DrdTrace drd{
+    replay::CallgrindSyncTrace sync{
         .events =
             {
                 {.thread = 1, .kind = "work_quantum"},
-                {.thread = 3, .kind = "work_quantum"},
-                {.thread = 2, .kind = "work_quantum"},
-            },
-        .scheduler = schedulerTrace({3, 2, 3, 3, 3, 3, 3, 3}),
-    };
-    const auto result =
-        replay::replayPaired(callgrind, callgrind_scheduler, drd, dataReadModel(), {.scheduler_bins = 4, .scheduler_quantum_slack = 0.0, .replay = {.cores = 3}});
-    CHECK(result.evaluated_mapping_count == 2);
-    CHECK(result.mapping_count == 1);
-    CHECK(result.selected_source_by_trace_thread.at(2) == 3);
-    CHECK(result.selected_source_by_trace_thread.at(3) == 2);
-    CHECK(result.conservative.modeled_work > 0.0);
-    CHECK(result.minimum_makespan == result.conservative.modeled_makespan);
-}
-
-TEST_CASE("native paired replay rejects material assignment ambiguity")
-{
-    replay::CallgrindTrace callgrind;
-    callgrind.slices[1] = {scaledProfile(10)};
-    callgrind.totals[1] = scaledProfile(10);
-    callgrind.slices[2] = {scaledProfile(1)};
-    callgrind.totals[2] = scaledProfile(1);
-    callgrind.slices[3] = {scaledProfile(10)};
-    callgrind.totals[3] = scaledProfile(10);
-    const auto callgrind_scheduler = schedulerTrace({2, 3, 2, 3});
-    replay::DrdTrace drd{
-        .events =
-            {
                 {.thread = 2, .kind = "work_quantum"},
                 {.thread = 3, .kind = "work_quantum"},
-                {.thread = 1, .kind = "work_quantum", .dependencies = {{0, "drd_happens_before"}}},
             },
-        .scheduler = schedulerTrace({2, 3, 2, 3}),
     };
-    CHECK_THROWS_WITH_AS(replay::replayPaired(callgrind, callgrind_scheduler, drd, dataReadModel(), {.scheduler_bins = 1, .scheduler_quantum_slack = 0.0, .maximum_makespan_spread = 0.02, .replay = {.cores = 3}}), doctest::Contains("assignment evidence insufficient"), std::runtime_error);
+    const auto result = replay::replayCallgrind(callgrind, sync, dataReadModel(), {.replay = {.cores = 3}});
+    const double expected = replay::modeledProfileCostNs(scaledProfile(1), dataReadModel()) +
+                            replay::modeledProfileCostNs(scaledProfile(2), dataReadModel()) +
+                            replay::modeledProfileCostNs(scaledProfile(3), dataReadModel());
+    CHECK(result.modeled_work == doctest::Approx(expected));
 }
 
-TEST_CASE("native paired replay resolves a shifted DRD tie from Callgrind scheduling")
+TEST_CASE("native Callgrind replay retains short threads without a full quantum")
 {
     replay::CallgrindTrace callgrind;
     callgrind.slices[1] = {scaledProfile(1)};
     callgrind.totals[1] = scaledProfile(1);
-    for (const auto [thread, scale] : std::vector<std::pair<std::int64_t, std::int64_t>>{{2, 4}, {3, 5}, {4, 8}, {5, 10}}) {
-        callgrind.slices[thread] = {scaledProfile(scale)};
-        callgrind.totals[thread] = scaledProfile(scale);
-    }
-    const auto callgrind_scheduler = schedulerTrace(roundRobinSchedule({{2, 42}, {3, 43}, {4, 46}, {5, 50}}));
-    replay::DrdTrace drd{
-        .events =
-            {
-                {.thread = 1, .kind = "work_quantum"},
-                {.thread = 6, .kind = "work_quantum"},
-                {.thread = 7, .kind = "work_quantum"},
-                {.thread = 8, .kind = "work_quantum"},
-                {.thread = 9, .kind = "work_quantum"},
-            },
-        .scheduler = schedulerTrace(roundRobinSchedule({{6, 38}, {7, 38}, {8, 41}, {9, 45}})),
+    callgrind.slices[2] = {scaledProfile(2)};
+    callgrind.totals[2] = scaledProfile(2);
+    replay::CallgrindSyncTrace sync{
+        .events = {{.thread = 1, .kind = "work_quantum"}},
     };
-    const auto result =
-        replay::replayPaired(callgrind, callgrind_scheduler, drd, dataReadModel(), {.scheduler_bins = 16, .scheduler_quantum_slack = 1.0, .maximum_makespan_spread = 0.02, .replay = {.cores = 5}});
-    CHECK(result.evaluated_mapping_count == 24);
-    CHECK(result.mapping_count == 2);
-    CHECK(result.selected_source_by_trace_thread.at(8) == 4);
-    CHECK(result.selected_source_by_trace_thread.at(9) == 5);
-    CHECK(result.makespan_relative_spread == 0.0);
+    const auto result = replay::replayCallgrind(callgrind, sync, dataReadModel(), {.replay = {.cores = 2}});
+    CHECK(
+        result.modeled_work ==
+        doctest::Approx(replay::modeledProfileCostNs(scaledProfile(1), dataReadModel()) + replay::modeledProfileCostNs(scaledProfile(2), dataReadModel())));
 }
 
 TEST_CASE("native replay applies cross-thread and wake latency cumulatively")
