@@ -208,20 +208,6 @@ instances. Discovery checks the newest records first and skips endpoints that
 do not respond or use an incompatible protocol version. It leaves valid
 registry records in place because a busy VC3D can time out temporarily.
 
-### The wrong VC3D *build* answered
-
-Auto-launch resolves `--launch`, then `VC3D_BINARY`, then `VC3D` on `PATH`,
-then a fixed list of standard build directories (the CMake presets, plus
-`build-macos`). **A build in any other directory is invisible to that scan**,
-so a repo with both a stale preset build and a fresh custom one can silently
-launch the stale one. Discovery records contain process/server/socket timing
-metadata, but not the executable path or revision.
-
-Call `vc3d_ping` and read `executablePath` and `gitSha`. They are the only
-authoritative answer to "which revision am I driving", and any before/after
-comparison that does not record them is not a comparison. Pass `--launch` or
-`VC3D_BINARY` explicitly when the build you mean is not on the preset list.
-
 ### Large screenshots fail
 
 Inline screenshots cross the local bridge as base64. For large captures, pass
