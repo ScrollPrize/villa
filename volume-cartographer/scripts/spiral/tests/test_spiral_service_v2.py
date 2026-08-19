@@ -1463,11 +1463,15 @@ class DatasetOwnershipTests(unittest.TestCase):
 
         rebuilds = []
         self.state.rebuild = lambda request: rebuilds.append(request) or {}
-        self.state.load_checkpoint({"host_checkpoint": str(checkpoint),
-                                    "allow_rebuild": True})
+        response = self.state.load_checkpoint({
+            "host_checkpoint": str(checkpoint), "allow_rebuild": True})
 
         self.assertEqual(len(rebuilds), 1)
+        self.assertEqual(response["checkpoint_path"], str(checkpoint))
         self.assertEqual(rebuilds[0]["paths"]["checkpoint"], str(checkpoint))
+        self.assertNotIn("dataset_root", rebuilds[0]["paths"])
+        self.assertNotIn("verified_patches", rebuilds[0]["paths"])
+        self.assertNotIn("output_directory", rebuilds[0]["paths"])
         # No advanced overrides: the runtime layers run.config on top of the
         # checkpoint's own cfg, so resending the profile would re-impose the
         # very keys the preflight just refused.
@@ -1514,6 +1518,46 @@ class DatasetOwnershipTests(unittest.TestCase):
             self.state.load_checkpoint({"host_checkpoint": str(checkpoint)})
         self.assertEqual(caught.exception.status, 409)
         self.assertEqual(session.loaded, [])
+
+    def test_error_session_can_rebuild_from_a_different_checkpoint(self):
+        _attach_fake_session(self.state, self.output, self.root)
+        # A failed build has a canonical request and identity to recover, but
+        # no usable resident object on which an in-place load could operate.
+        self.state.session = None
+        self.state._session_state = SessionState.Error
+        self.state._session_error = "bad checkpoint"
+        checkpoint = self.output / "uploaded-checkpoints" / "recovery.ckpt"
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        import torch
+        torch.save({
+            "schema_version": 2,
+            "cfg": durable_config({**Config().as_dict(), **_NO_DENSE_LOSSES}),
+            "input_manifest": {"dataset_root": str(self.root)},
+        }, checkpoint)
+
+        with self.assertRaises(ApiError) as caught:
+            self.state.load_checkpoint(
+                {"uploaded_checkpoint": str(checkpoint)})
+        self.assertEqual(caught.exception.status, 409)
+
+        # Exercise the real rebuild request parser.  The stored session
+        # request contains all canonical service-owned paths, but retrying a
+        # checkpoint must feed only client-selectable paths back through the
+        # dataset-mode boundary.
+        with mock.patch.object(self.state, "_begin_build") as begin_build:
+            response = self.state.load_checkpoint({
+                "uploaded_checkpoint": str(checkpoint),
+                "allow_rebuild": True,
+            })
+
+        begin_build.assert_called_once()
+        rebuilt_paths, rebuilt_run = begin_build.call_args.args[:2]
+        self.assertEqual(rebuilt_paths.checkpoint, str(checkpoint))
+        self.assertEqual(rebuilt_paths.dataset_root, str(self.root))
+        self.assertEqual(rebuilt_paths.output_directory, str(self.output))
+        self.assertEqual(rebuilt_run.config, {})
+        self.assertTrue(response["rebuilding"])
+        self.assertEqual(response["checkpoint_path"], str(checkpoint))
 
 
 def _write_autosave(directory, *, iterations, namespace, dataset_root,

@@ -638,7 +638,8 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         tr("Load this checkpoint. If no fit exists, initialize the fit directly "
            "from the checkpoint. Otherwise replace the resident model's weights, "
            "optimiser and RNG state; if it does not match, the service says what "
-           "a rebuild would have to replace and asks before doing it."));
+           "a rebuild would have to replace and asks before doing it. If the fit "
+           "is in error, Load rebuilds it directly from the selected checkpoint."));
     _save = new QPushButton(tr("Save on Service"), checkpointContents);
     _save->setEnabled(false);
     _downloadCheckpoint = new QPushButton(tr("Download…"), checkpointContents);
@@ -1172,12 +1173,20 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             _service->initializeSession(request);
             return;
         }
-        _warnings->setText(tr("Loading checkpoint into the resident fit…"));
+        const bool recoverFailedSession =
+            _sessionState == QStringLiteral("Error");
+        _warnings->setText(
+            recoverFailedSession
+                ? tr("Rebuilding the failed fit from the checkpoint…")
+                : tr("Loading checkpoint into the resident fit…"));
         // One POST. A local file is uploaded on the way (the upload reuses an
         // identical checkpoint already on the host), and a refusal comes back
-        // through checkpointLoadRefused with what a rebuild would take.
+        // through checkpointLoadRefused with what a rebuild would take. An
+        // errored resident fit cannot accept state in place, so selecting a
+        // checkpoint there is explicitly a recovery rebuild.
         _service->loadCheckpoint(local ? QString() : selected,
-                                 local ? selected : QString());
+                                 local ? selected : QString(),
+                                 recoverFailedSession);
     });
     connect(_service, &SpiralServiceManager::checkpointLoadRefused, this,
             [this](const QString& hostPath, const QString& localPath,
@@ -1233,9 +1242,11 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                         _loadedSessionRequest, hostPath);
                 refreshReloadRequired();
                 _warnings->setText(
-                    tr("Loaded %1 into the resident fit at iteration %2")
-                        .arg(hostPath)
-                        .arg(iteration));
+                    iteration >= 0
+                        ? tr("Loaded %1 into the resident fit at iteration %2")
+                              .arg(hostPath)
+                              .arg(iteration)
+                        : tr("Rebuilding the fit from %1…").arg(hostPath));
             });
     connect(_commitInputs, &QPushButton::clicked, this, [this]() {
         if (QMessageBox::question(this, tr("Commit inputs"),

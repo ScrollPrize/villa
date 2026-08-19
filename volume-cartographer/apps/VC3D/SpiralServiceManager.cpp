@@ -1,6 +1,7 @@
 #include "SpiralServiceManager.hpp"
 
 #include "SpiralArtifactCache.hpp"
+#include "SpiralSessionSync.hpp"
 #include "SpiralSshTunnel.hpp"
 #include "VCSettings.hpp"
 
@@ -763,12 +764,9 @@ void SpiralServiceManager::runIterations(int iterations,
                                          const QJsonObject& influenceConfig,
                                          const QJsonObject& runConfig)
 {
-    QJsonObject configuration = _configurationDefaults;
-    for (auto it = _appliedConfiguration.begin();
-         it != _appliedConfiguration.end(); ++it)
-        configuration[it.key()] = it.value();
-    for (auto it = runConfig.begin(); it != runConfig.end(); ++it)
-        configuration[it.key()] = it.value();
+    const QJsonObject configuration =
+        vc3d::completeSpiralRunConfiguration(
+            _configurationDefaults, _appliedConfiguration, runConfig);
     // Base inputs are owned and canonicalized by the service.  A Run changes
     // neither their paths nor their contents, so restating the panel's
     // necessarily partial path view here can only create a false mismatch

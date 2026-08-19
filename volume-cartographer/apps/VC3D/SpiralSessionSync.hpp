@@ -10,7 +10,8 @@ inline bool spiralCheckpointLoadAvailable(
 {
     return connected && checkpointSelected
         && (sessionState == QStringLiteral("Uninitialized")
-            || sessionState == QStringLiteral("Idle"));
+            || sessionState == QStringLiteral("Idle")
+            || sessionState == QStringLiteral("Error"));
 }
 
 inline QJsonObject spiralSessionRequestWithCheckpoint(
@@ -67,6 +68,25 @@ inline QJsonObject spiralRunBoundaryConfig(
     for (auto it = config.begin(); it != config.end(); ++it)
         if (runConfigKeys.contains(it.key()))
             result.insert(it.key(), it.value());
+    return result;
+}
+
+inline QJsonObject completeSpiralRunConfiguration(
+    const QJsonObject& defaults,
+    const QJsonObject& appliedConfig,
+    const QJsonObject& runConfig)
+{
+    QJsonObject result = defaults;
+    auto applyKnown = [&result](const QJsonObject& values) {
+        for (auto it = values.begin(); it != values.end(); ++it)
+            if (result.contains(it.key()))
+                result.insert(it.key(), it.value());
+    };
+    // The catalog defaults define the exact /session/run schema. Resident
+    // status also carries run-block values such as z_begin/z_end; those must
+    // not leak back into the advanced configuration payload.
+    applyKnown(appliedConfig);
+    applyKnown(runConfig);
     return result;
 }
 

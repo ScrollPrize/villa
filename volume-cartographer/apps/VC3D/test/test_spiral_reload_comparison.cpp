@@ -34,8 +34,12 @@ private slots:
             true, QStringLiteral("Uninitialized"), true));
         QVERIFY(vc3d::spiralCheckpointLoadAvailable(
             true, QStringLiteral("Idle"), true));
+        QVERIFY(vc3d::spiralCheckpointLoadAvailable(
+            true, QStringLiteral("Error"), true));
         QVERIFY(!vc3d::spiralCheckpointLoadAvailable(
             true, QStringLiteral("Loading"), true));
+        QVERIFY(!vc3d::spiralCheckpointLoadAvailable(
+            true, QStringLiteral("Running"), true));
         QVERIFY(!vc3d::spiralCheckpointLoadAvailable(
             true, QStringLiteral("Uninitialized"), false));
     }
@@ -77,6 +81,34 @@ private slots:
         QCOMPARE(
             vc3d::spiralRunBoundaryConfig(editorConfig, runBoundaryKeys),
             expected);
+    }
+
+    void CompleteRunConfigurationExcludesCheckpointRunBlockFields()
+    {
+        const QJsonObject defaults{
+            {"loss_weight_patch_radius", 8.0},
+            {"optimizer_learning_rate", 3e-5},
+        };
+        const QJsonObject checkpointApplied{
+            {"loss_weight_patch_radius", 6.0},
+            {"optimizer_learning_rate", 3e-5},
+            {"z_begin", 4000},
+            {"z_end", 17000},
+        };
+        const QJsonObject runConfig{
+            {"loss_weight_patch_radius", 2.0},
+            {"z_begin", 5000},
+        };
+
+        const QJsonObject configuration =
+            vc3d::completeSpiralRunConfiguration(
+                defaults, checkpointApplied, runConfig);
+
+        QCOMPARE(configuration.keys(), defaults.keys());
+        QCOMPARE(configuration["loss_weight_patch_radius"].toDouble(), 2.0);
+        QCOMPARE(configuration["optimizer_learning_rate"].toDouble(), 3e-5);
+        QVERIFY(!configuration.contains("z_begin"));
+        QVERIFY(!configuration.contains("z_end"));
     }
 
     void EffectiveAdvancedConfigurationExcludesDockOwnedZRange()

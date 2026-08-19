@@ -1585,6 +1585,8 @@ class ServiceState:
         With ``allow_rebuild`` the service performs that rebuild itself, from
         the live session request with this checkpoint set and the advanced
         overrides dropped — see ``_rebuild_onto_checkpoint``.
+        This is also the explicit recovery path for an errored session, where
+        applying any checkpoint in place is no longer safe or even possible.
 
         The preflight therefore runs twice on the escalation path: once to
         refuse, once inside the rebuild. That is a real cost, it is only paid
@@ -1596,9 +1598,15 @@ class ServiceState:
         if not isinstance(allow_rebuild, bool):
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            "allow_rebuild must be true or false")
-        session = self._require_session()
         path = self._resolve_load_source(request)
-        state = session.status().get("state")
+        with self.lock:
+            session = self.session
+            lifecycle_state = self._session_state
+        state = (session.status().get("state")
+                 if session is not None else lifecycle_state)
+        if allow_rebuild and state == SessionState.Error:
+            return self._rebuild_onto_checkpoint(path)
+        session = self._require_session()
         if state != SessionState.Idle:
             raise ApiError(
                 HTTPStatus.CONFLICT,
@@ -1769,13 +1777,27 @@ class ServiceState:
             raise ApiError(HTTPStatus.CONFLICT,
                            "There is no session request to rebuild from")
         paths = dict(current.get("paths") or {})
+        if self.dataset_resolution is not None:
+            # ``session_request`` is the canonical manifest the service built,
+            # so it contains every resolved base-input path.  ``rebuild``
+            # deliberately accepts the narrower client request shape in
+            # dataset mode and rejects those same service-owned paths.  Turn
+            # the canonical manifest back into that shape before re-entering
+            # request validation; the dataset resolver will restore the base
+            # inputs.  This matters especially after a failed checkpoint
+            # build, when this is the recovery path for trying another one.
+            paths = {
+                key: value for key, value in paths.items()
+                if key in _DATASET_CLIENT_SELECTABLE and value
+            }
         paths["checkpoint"] = path
         run = dict(current.get("run") or {})
         _, _, checkpoint_z_range = self._checkpoint_durable_cfg(path)
         if checkpoint_z_range is not None:
             run["z_begin"], run["z_end"] = checkpoint_z_range
         run["config"] = {}
-        return self.rebuild({**current, "paths": paths, "run": run})
+        response = self.rebuild({**current, "paths": paths, "run": run})
+        return {**response, "checkpoint_path": path}
 
     def download_checkpoint(self):
         """Create a checkpoint and publish it as a downloadable artifact."""
@@ -1814,8 +1836,8 @@ class ServiceState:
                     raise ApiError(
                         HTTPStatus.CONFLICT,
                         f"The fit session failed to build: "
-                        f"{self._session_error}. Rebuild with defaults to "
-                        f"recover.")
+                        f"{self._session_error}. Rebuild with defaults or "
+                        f"from a checkpoint to recover.")
                 raise ApiError(HTTPStatus.CONFLICT,
                                "The fit session is still loading")
             return self.session
