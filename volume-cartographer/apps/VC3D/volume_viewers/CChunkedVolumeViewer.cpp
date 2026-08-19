@@ -1233,6 +1233,24 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
                                             const std::shared_ptr<Surface>& surf,
                                             bool isEditUpdate)
 {
+    // Surface geometry is read lazily: the first access below reaches
+    // QuadSurface::ensureLoaded(), which opens x/y/z.tif and throws when the
+    // payload is missing or unreadable — a partial download, a segment deleted
+    // by another process, an unmounted share. This slot is invoked straight
+    // from a signal emission, and an exception must not be allowed to reach
+    // Qt's dispatch frames: it cannot be caught above them (Qt installs no
+    // handler, and on macOS unwinding through them terminates outright), so it
+    // would take down the session over one bad segment. Contain it here, while
+    // the throw still has only our own frames to unwind through.
+    try {
+        onSurfaceChangedImpl(name, surf, isEditUpdate);
+    } catch (const std::exception& e) {
+        Logger()->error("Surface '{}' could not be displayed: {}", name, e.what());
+    }
+}
+
+void CChunkedVolumeViewer::onSurfaceChangedImpl(const std::string& name, const std::shared_ptr<Surface>& surf, bool isEditUpdate)
+{
     if (_closing) {
         return;
     }
@@ -4560,7 +4578,7 @@ void CChunkedVolumeViewer::setLinkedCursorVolumePoint(const std::optional<cv::Ve
         }
     };
 
-    const bool accepted =
+    const bool accepted = !_linkedCursorMirroringSuppressed &&
         (_segmentationCursorMirroring || _linkedCursorAlwaysEnabled) && point.has_value();
     // Track the point for the status-bar position readout even when it doesn't
     // project onto this viewer's surface and the crosshair stays hidden. Only

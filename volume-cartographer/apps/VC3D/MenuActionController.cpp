@@ -200,6 +200,10 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     connect(_mergePatchAct, &QAction::triggered,
             this, &MenuActionController::mergePatchFromMenuRequested);
 
+    _growTrackPatchesAct = new QAction(QObject::tr("Grow Track Patches..."), this);
+    connect(_growTrackPatchesAct, &QAction::triggered,
+            this, &MenuActionController::growTrackPatchesFromMenuRequested);
+
     _materializeOpenDataFolderAct = new QAction(
         QObject::tr("Create/Fetch All Segments for Current Folder"), this);
     connect(_materializeOpenDataFolderAct, &QAction::triggered, this,
@@ -249,6 +253,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _actionsMenu->addSeparator();
     _actionsMenu->addAction(_mergeTifxyzAct);
     _actionsMenu->addAction(_mergePatchAct);
+    _actionsMenu->addAction(_growTrackPatchesAct);
     _actionsMenu->addSeparator();
     _transformsMenu = new QMenu(QObject::tr("&Transforms"), _actionsMenu);
     _transformsMenu->addAction(_rotateSurfaceAct);

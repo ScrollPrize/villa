@@ -47,6 +47,28 @@ TEST_CASE("Volume::NewFromUrl: opens the PHerc 0172 zarr")
     CHECK_FALSE(v->id().empty());
 }
 
+TEST_CASE("Volume::NewFromUrl: invalid credentials fall back to anonymous public S3")
+{
+    vc::HttpAuth invalid;
+    invalid.access_key = "INVALIDACCESSKEY";
+    invalid.secret_key = "INVALIDSECRET";
+    invalid.session_token = "INVALIDSESSIONTOKEN";
+    invalid.region = "us-east-1";
+
+    try {
+        const auto volume = Volume::NewFromUrl(kVolumeUrl, {}, invalid);
+        REQUIRE(volume != nullptr);
+        CHECK(volume->isRemote());
+        CHECK(volume->remoteAuth().empty());
+    } catch (const std::exception& e) {
+        if (requireNetwork()) {
+            FAIL("invalid-credential anonymous fallback failed: " << e.what());
+        }
+        MESSAGE("Skipping invalid-credential fallback (network unavailable?): "
+                << e.what());
+    }
+}
+
 TEST_CASE("Volume: shape and pyramid metadata match the upstream .zarray files")
 {
     auto v = openOrSkip();

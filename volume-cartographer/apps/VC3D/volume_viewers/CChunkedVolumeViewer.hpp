@@ -242,6 +242,13 @@ public:
     // views" toggle (used by the line annotation window's pane group, whose
     // mirroring is dialog-local).
     void setLinkedCursorAlwaysEnabled(bool enabled) { _linkedCursorAlwaysEnabled = enabled; }
+    // Reject linked-cursor points outright, overriding both of the above. The
+    // line annotation window needs this to keep mirrored crosses out of its
+    // panes while the global toggle is on.
+    void setLinkedCursorMirroringSuppressed(bool suppressed)
+    {
+        _linkedCursorMirroringSuppressed = suppressed;
+    }
 
     CVolumeViewerView* graphicsView() const override { return _view; }
     QObject* asQObject() override { return this; }
@@ -260,6 +267,8 @@ protected:
 
 public slots:
     void OnVolumeChanged(std::shared_ptr<Volume> vol);
+    // Thin guard around onSurfaceChangedImpl; see the definition for why the
+    // lazy surface load has to be contained before it reaches Qt.
     void onSurfaceChanged(const std::string& name, const std::shared_ptr<Surface>& surf, bool isEditUpdate = false);
     void onSurfaceWillBeDeleted(const std::string& name, const std::shared_ptr<Surface>& surf);
     void onVolumeClosing();
@@ -429,6 +438,7 @@ private:
     void clearLineAnnotationPlacementMarker();
     bool handleMeasurementClick(const QPointF& scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
     void refreshMeasurementOverlay();
+    void onSurfaceChangedImpl(const std::string& name, const std::shared_ptr<Surface>& surf, bool isEditUpdate);
     void updateFocusMarker(POI* poi = nullptr);
     void refreshSameWrapAnnotationOverlay();
     std::optional<std::pair<uint64_t, uint64_t>> pointAtScenePosition(const QPointF& scenePos);
@@ -687,6 +697,7 @@ private:
     QGraphicsItem* _focusMarker = nullptr;
     bool _segmentationCursorMirroring = false;
     bool _linkedCursorAlwaysEnabled = false;
+    bool _linkedCursorMirroringSuppressed = false;
 
     struct MeasurementPoint {
         cv::Vec2f surface{0.0f, 0.0f};

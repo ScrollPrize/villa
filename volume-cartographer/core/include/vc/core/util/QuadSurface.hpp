@@ -519,6 +519,10 @@ private:
     static std::recursive_mutex& dirWriteMutex(const std::filesystem::path& dir);
 };
 
+// Serialize a bbox as [[minX,minY,minZ],[maxX,maxY,maxZ]], the layout
+// QuadSurface::save() writes for its own bbox key.
+utils::Json bbox_to_json(const Rect3D& bbox);
+
 std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::filesystem::path &path, int flags = 0);
 std::unique_ptr<QuadSurface> load_quad_from_tifxyz_region(
     const std::filesystem::path &path, const cv::Rect &region, int flags = 0);

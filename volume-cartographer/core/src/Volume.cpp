@@ -1325,10 +1325,12 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     const std::string& url,
     const std::filesystem::path& cacheRoot,
     const vc::HttpAuth& authIn,
-    const utils::Json& metadata)
+    const utils::Json& metadata,
+    bool discoverAwsCredentials)
 {
     vc::render::RemoteZarrOpenOptions openOptions;
     openOptions.auth = authIn;
+    openOptions.discoverAwsCredentials = discoverAwsCredentials;
     auto remoteOpen = vc::render::openRemoteZarrPyramid(url, std::move(openOptions));
     auto opened = std::move(remoteOpen.opened);
     auto auth = std::move(remoteOpen.auth);
