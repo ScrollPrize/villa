@@ -543,6 +543,8 @@ Ownership changed as follows:
   lengths, full-precision `native_trace2cp_fiber_restarts_per_kvx`, optional
   full-precision `native_trace2cp_fiber_restarts_per_meter`, and the old
   segment fraction only as `restart_fraction_per_segment`.
+- Durable end-to-end native Python Trace2CP measurements and their metric/unit
+  conventions are recorded in `docs/native_trace2cp_benchmarks.md`.
 - The shared C++ CP-pair tracer fuses forward and reverse traces in trace-grid
   3D ZYX coordinates without sorting by straight-axis progress. It repeatedly
   moves a local tangent plane along each resampled path and intersects the

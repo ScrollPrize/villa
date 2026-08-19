@@ -1,18 +1,20 @@
-# Plan: merge fiber-lets2
+# Plan: Native Trace2CP benchmark record
 
-1. Confirm conflicts are limited to stale task-local planning files.
-2. Clear the conflicting task records without altering merged implementation,
-   specification, changelog, or user documentation changes.
-3. Verify that the index contains no unresolved entries.
+1. Copy the user-supplied historical benchmark document exactly.
+2. Add the supplied 2026-08-19 aggregate results to the existing main table
+   with the code revision used for both runs.
+3. Add only the new snapshot and settings rows required to define that result.
+4. Validate Markdown formatting, arithmetic, and repository diff cleanliness.
 
 ## Spec update
 
-None. The branch specifications merged without conflicts.
+None. This records measurements without changing runtime behavior.
 
 ## Documentation update
 
-None. User and developer documentation merged without conflicts.
+Restore the exact supplied `docs/native_trace2cp_benchmarks.md` and extend its
+existing tables with the supplied run.
 
 ## Changelog update
 
-None beyond the entries already merged from both branches.
+None. A benchmark-record update does not change behavior.
