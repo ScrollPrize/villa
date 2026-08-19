@@ -20,7 +20,7 @@ struct FiberAnchorFinalEvaluation {
     size_t activeComponents,
     std::span<const uint8_t> assignments,
     std::span<const uint8_t> retainedInliers,
-    const cv::Vec3d& pivot,
+    const cv::Vec3f& pivot,
     const FiberAnchorObjectiveConfig& config);
 
 [[nodiscard]] FiberAnchorFinalEvaluation finalAnchorEvaluationCompact(
@@ -30,7 +30,7 @@ struct FiberAnchorFinalEvaluation {
     size_t activeComponents,
     std::span<const uint8_t> assignments,
     std::span<const uint8_t> retainedInliers,
-    const cv::Vec3d& pivot,
+    const cv::Vec3f& pivot,
     const FiberAnchorObjectiveConfig& config);
 
 }  // namespace vc::fiber_tracer::detail

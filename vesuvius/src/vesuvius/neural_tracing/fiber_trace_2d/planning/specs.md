@@ -2552,10 +2552,11 @@
   arithmetic; their directions are already normalized by compact-observation
   construction. Logical assignment/membership indices address the per-cell
   index stream, while observations address the indexed tile storage. The
-  expanded public fitter retains normalized double directions and compensated
-  double accumulation. Persistent component state, acceptance tolerances,
-  final aligned-support evaluation, diagnostics, and serialization remain
-  double precision.
+  direct public fitter uses the same float32 observation, component, and
+  accumulator representation. Persistent component state, acceptance
+  tolerances, final aligned-support evaluation, diagnostics, and serialized
+  numeric values are float32; direct and indexed fitting differ only in storage
+  and indexing.
 - Robust assignment, trimming, direct direction update, and position update run
   for at most `maximum_iterations`, default 2. This is a bounded alternating
   refinement budget, not convergence to exact equality of hard assignment or
@@ -2703,11 +2704,10 @@
   Production compact observations also keep robust-proposal positions,
   directions, component state, Gaussian/alignment values, masses, residual
   histograms, and retained direction tensors in float32 throughout the repeated
-  per-observation loop. The fixed residual histograms and six retained tensor
-  entries widen once afterward; robust cutoff selection, principal-axis
-  resolution, persistent component state, diagnostics, and serialized output
-  remain double precision. The public expanded-observation fitter retains its
-  double-precision proposal path.
+  per-observation loop. Fixed residual histograms, retained tensors, robust
+  cutoff selection, the shared float principal-axis solver, persistent
+  component state, diagnostics, and serialized output remain float32. The
+  public direct-observation fitter uses this same precision path.
   Machine output and OBJ store spatial positions only in base-volume XYZ
   coordinates. Prediction shape/scale, cell indices, cell size, direction
   falloff, transverse/axial peak sigmas, peak grid step, cutoff, local window,
@@ -2830,7 +2830,8 @@
   volume bounds, corridor membership, and any replay tube predicate. An
   interior mapped point is narrowed once to three `float32` coordinates before
   any of those admission tests; that stored position is authoritative for
-  sampling, DP geometry, and output. Exact endpoint anchors remain doubles.
+  sampling, DP geometry, and output. Exact endpoint anchors use the same
+  float32 representation as interior nodes.
   `(layer,u,v)` is checked row-major packed into one `uint32_t` using the
   per-candidate transverse width; non-finite or overflowing lattices fail.
 - The exact start `(s=0,u=v=0)` and target `(s=L,u=v=0)` are source and sink.
@@ -3166,20 +3167,32 @@
   exact floating-point identity and fixed accumulation order are not required.
   Deterministic repeatability, anchor axis/position distributions, populations,
   replay metrics, failures, and visual quality remain the acceptance gates.
-- Transient direction-conditioned peak observations and transverse response
-  math use float32. Persistent anchor state, accepted positions, diagnostics,
-  and serialized output remain double precision. Peak ties and downstream DP
-  counts need not be numerically identical, but retained populations and replay
-  quality must be checked on the canonical workload.
+- Direction-conditioned peak observations, transverse response math,
+  persistent anchor state, accepted positions, diagnostics, and serialized
+  output use float32. Peak ties and downstream DP counts need not be
+  numerically identical, but retained populations and replay quality must be
+  checked on the canonical workload.
+- Stored-prediction samplers may retain their shared double-valued interface,
+  but anchor extraction must normalize and range-check each returned sample
+  once into a float32 tile. Reused tile halos, gradients, compact observations,
+  and fitting must never retain the shared double sample. Float convergence,
+  matrix, geometry, and response-comparison tolerances must be representable
+  and effective at the magnitude where they are applied.
+- Float32 anchor/fiberlet grids must have nonzero extents no larger than
+  `2^24` on every axis, preserving exact integer voxel identity. Base-space
+  serialization and OBJ output must fail instead of emitting coordinates that
+  overflow float32.
+- The existing double principal-axis API retains its historical names. The
+  float32 API uses explicit `*F` names so brace-initialized double callers do
+  not become ambiguous.
 - Final refined-anchor support evaluation uses one float32 reduction for both
-  compact production observations and expanded public observations. Compact
-  fields are consumed directly; expanded positions, directions, and presence
-  are range-checked before narrowing, and expanded directions are normalized
-  safely in float32. All finite-position sites contribute to the Gaussian
+  compact production observations and direct public observations. All fields
+  are consumed directly and public directions are normalized safely in
+  float32. All finite-position sites contribute to the Gaussian
   denominator independently of direction/presence usability or robust
   membership. Aligned support, directional coherence, and combined objective
-  are computed before the fixed-size result widens into persistent double
-  anchor state. Exact numeric identity is not required; deterministic support
+  remain float32 in persistent anchor state. Exact numeric identity is not
+  required; deterministic support
   classification and canonical replay quality are the contract.
 - The bounded direction-conditioned peak grid uses a checked row-major layout.
   Physical grid points and feasibility are constructed once in canonical

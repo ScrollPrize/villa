@@ -12,7 +12,7 @@ template <typename Range>
     size_t activeComponents,
     std::span<const uint8_t> assignments,
     std::span<const uint8_t> retainedInliers,
-    const cv::Vec3d& inputPivot,
+    const cv::Vec3f& inputPivot,
     const FiberAnchorObjectiveConfig& inputConfig)
 {
     static_assert(std::is_same_v<typename Range::Scalar, float>);
@@ -20,13 +20,11 @@ template <typename Range>
         observations, activeComponents, assignments, retainedInliers);
     std::array<ObjectiveComponent<float>, 2> components;
     for (size_t component = 0; component < components.size(); ++component) {
-        components[component].axis =
-            checkedFloatVector(inputComponents[component].axis);
-        components[component].position =
-            checkedFloatVector(inputComponents[component].position);
+        components[component].axis = inputComponents[component].axis;
+        components[component].position = inputComponents[component].position;
     }
-    const auto pivot = checkedFloatVector(inputPivot);
-    const auto config = checkedFloatConfig(inputConfig);
+    const auto pivot = inputPivot;
+    const auto config = floatConfig(inputConfig);
     FiberAnchorFinalEvaluation result;
     for (size_t logicalIndex = 0; logicalIndex < observations.size();
          ++logicalIndex) {
@@ -43,13 +41,7 @@ template <typename Range>
             continue;
         const float gaussian = transverseGaussian<Range>(
             observation, components[assigned], pivot, config);
-        float presence;
-        if constexpr (std::is_same_v<Range, ExpandedFinalObservationRange>) {
-            if (!checkedFloat(observation.presence, presence))
-                continue;
-        } else {
-            presence = static_cast<float>(observation.presence);
-        }
+        const float presence = observation.presence;
         const float dot = direction.dot(components[assigned].axis);
         result.numerators[assigned] += gaussian * presence * dot * dot;
         result.presenceMasses[assigned] += gaussian * presence;
@@ -82,7 +74,7 @@ FiberAnchorFinalEvaluation finalAnchorEvaluationExpanded(
     size_t activeComponents,
     std::span<const uint8_t> assignments,
     std::span<const uint8_t> retainedInliers,
-    const cv::Vec3d& pivot,
+    const cv::Vec3f& pivot,
     const FiberAnchorObjectiveConfig& config)
 {
     return evaluateFinal(
@@ -97,7 +89,7 @@ FiberAnchorFinalEvaluation finalAnchorEvaluationCompact(
     size_t activeComponents,
     std::span<const uint8_t> assignments,
     std::span<const uint8_t> retainedInliers,
-    const cv::Vec3d& pivot,
+    const cv::Vec3f& pivot,
     const FiberAnchorObjectiveConfig& config)
 {
     return evaluateFinal(

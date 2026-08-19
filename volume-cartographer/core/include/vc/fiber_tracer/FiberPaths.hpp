@@ -32,43 +32,50 @@ struct FiberletAnchorId {
 
 struct FiberletPathConfig {
     int cellRadius = 4;
-    double neighborhoodMarginCells = 0.5;
-    double longitudinalStepPredictionVoxels = 2.0;
-    double transverseStepPredictionVoxels = 0.5;
-    double maximumEndpointAngleDegrees = 45.0;
-    double maximumPredictionDeviationDegrees = 25.0;
-    double corridorRadiusPredictionVoxels = 0.0;
-    double invalidPredictionCostPerVoxel = 4.0;
-    double smoothnessWeight = 2.0;
-    double smoothnessNormalWeight = 0.1;
-    double smoothnessTangentWeight = 10.0;
-    double smoothnessFreeAngleDegrees = 0.0;
+    float neighborhoodMarginCells = 0.5F;
+    float longitudinalStepPredictionVoxels = 2.0F;
+    float transverseStepPredictionVoxels = 0.5F;
+    float maximumEndpointAngleDegrees = 45.0F;
+    float maximumPredictionDeviationDegrees = 25.0F;
+    float corridorRadiusPredictionVoxels = 0.0F;
+    float invalidPredictionCostPerVoxel = 4.0F;
+    float smoothnessWeight = 2.0F;
+    float smoothnessNormalWeight = 0.1F;
+    float smoothnessTangentWeight = 10.0F;
+    float smoothnessFreeAngleDegrees = 0.0F;
     int samplingBatchCoordinates = 65536;
     int parallelThreads = 1;
 };
 
 struct FiberletPathCost {
-    double invalidPrediction = 0.0;
-    double alignment = 0.0;
-    double isotropicSmoothness = 0.0;
-    double tangentSmoothness = 0.0;
-    double normalSmoothness = 0.0;
+    float invalidPrediction = 0.0F;
+    float alignment = 0.0F;
+    float isotropicSmoothness = 0.0F;
+    float tangentSmoothness = 0.0F;
+    float normalSmoothness = 0.0F;
 
-    [[nodiscard]] double total() const noexcept;
+    [[nodiscard]] float total() const noexcept;
     FiberletPathCost& operator+=(const FiberletPathCost& other) noexcept;
+};
+
+struct FiberletPredictionSample {
+    cv::Vec3f direction{0.0F, 0.0F, 0.0F};
+    float presence = 0.0F;
+    bool valid = false;
+    bool presenceValid = false;
 };
 
 struct FiberletCandidateResult {
     FiberletAnchorId start;
     FiberletAnchorId target;
-    cv::Vec3d startPositionPredictionXYZ{0.0, 0.0, 0.0};
-    cv::Vec3d targetPositionPredictionXYZ{0.0, 0.0, 0.0};
-    cv::Vec3d startAxisXYZ{1.0, 0.0, 0.0};
-    cv::Vec3d targetAxisXYZ{1.0, 0.0, 0.0};
-    FiberStoredPredictionSample startPrediction;
-    FiberStoredPredictionSample targetPrediction;
-    cv::Vec3d startNormalXYZ{0.0, 0.0, 0.0};
-    cv::Vec3d targetNormalXYZ{0.0, 0.0, 0.0};
+    cv::Vec3f startPositionPredictionXYZ{0.0F, 0.0F, 0.0F};
+    cv::Vec3f targetPositionPredictionXYZ{0.0F, 0.0F, 0.0F};
+    cv::Vec3f startAxisXYZ{1.0F, 0.0F, 0.0F};
+    cv::Vec3f targetAxisXYZ{1.0F, 0.0F, 0.0F};
+    FiberletPredictionSample startPrediction;
+    FiberletPredictionSample targetPrediction;
+    cv::Vec3f startNormalXYZ{0.0F, 0.0F, 0.0F};
+    cv::Vec3f targetNormalXYZ{0.0F, 0.0F, 0.0F};
     bool startNormalValid = false;
     bool targetNormalValid = false;
     bool searched = false;
@@ -76,14 +83,14 @@ struct FiberletCandidateResult {
     bool success = false;
     std::string reason;
     FiberletPathCost cost;
-    std::vector<cv::Vec3d> pointsPredictionXYZ;
+    std::vector<cv::Vec3f> pointsPredictionXYZ;
 };
 
 struct FiberletScoreStatistics {
     size_t count = 0;
-    std::optional<double> minimum;
-    std::optional<double> mean;
-    std::optional<double> maximum;
+    std::optional<float> minimum;
+    std::optional<float> mean;
+    std::optional<float> maximum;
 };
 
 struct FiberletPathStatistics {
@@ -102,21 +109,21 @@ struct FiberletPathStatistics {
 
 struct FiberletPathVisualMetric {
     size_t candidateIndex = 0;
-    double pathLengthPredictionVoxels = 0.0;
-    double totalLoss = 0.0;
-    double lossPerPredictionVoxel = 0.0;
-    double relativeQuality = 0.0;
+    float pathLengthPredictionVoxels = 0.0F;
+    float totalLoss = 0.0F;
+    float lossPerPredictionVoxel = 0.0F;
+    float relativeQuality = 0.0F;
 };
 
 struct FiberletPathVisualReport {
     std::vector<FiberletPathVisualMetric> paths;
-    std::optional<double> minimumLossPerPredictionVoxel;
-    std::optional<double> maximumLossPerPredictionVoxel;
+    std::optional<float> minimumLossPerPredictionVoxel;
+    std::optional<float> maximumLossPerPredictionVoxel;
 };
 
 struct FiberPresenceSlicePixel {
     std::array<size_t, 3> indexZYX{0, 0, 0};
-    double presence = 0.0;
+    float presence = 0.0F;
 };
 
 struct FiberPresenceSlice {
@@ -261,13 +268,13 @@ struct FiberletPathProgress {
 };
 
 using FiberletPathProgressCallback = std::function<void(const FiberletPathProgress& progress)>;
-using FiberletPointPredicate = std::function<bool(const cv::Vec3d& pointPredictionXYZ)>;
+using FiberletPointPredicate = std::function<bool(const cv::Vec3f& pointPredictionXYZ)>;
 
 void validateFiberletPathConfig(const FiberletPathConfig& config);
 
 [[nodiscard]] LoadedFiberAnchorArtifact loadFiberAnchorArtifact(const std::filesystem::path& path);
 
-[[nodiscard]] std::vector<std::array<int, 3>> fiberletCellNeighborhoodOffsets(int radius, double margin);
+[[nodiscard]] std::vector<std::array<int, 3>> fiberletCellNeighborhoodOffsets(int radius, float margin);
 
 [[nodiscard]] FiberletPathReport traceFiberletPaths(
     const LoadedFiberAnchorArtifact& anchors,

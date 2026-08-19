@@ -16,9 +16,9 @@ namespace vc::fiber_tracer
 
 struct FiberletGraphNode {
     FiberletAnchorId anchor;
-    cv::Vec3d positionBaseXYZ{0.0, 0.0, 0.0};
-    FiberStoredPredictionSample prediction;
-    cv::Vec3d normalXYZ{0.0, 0.0, 0.0};
+    cv::Vec3f positionBaseXYZ{0.0F, 0.0F, 0.0F};
+    FiberletPredictionSample prediction;
+    cv::Vec3f normalXYZ{0.0F, 0.0F, 0.0F};
     bool normalValid = false;
     std::vector<size_t> outgoingArcs;
 };
@@ -27,24 +27,24 @@ struct FiberletGraphEdge {
     size_t candidateIndex = 0;
     size_t startNode = 0;
     size_t targetNode = 0;
-    std::vector<cv::Vec3d> pointsBaseXYZ;
-    double pathLengthPredictionVoxels = 0.0;
+    std::vector<cv::Vec3f> pointsBaseXYZ;
+    float pathLengthPredictionVoxels = 0.0F;
     FiberletPathCost cost;
 };
 
 struct FiberletGraphTransition {
     size_t incomingArc = 0;
     size_t outgoingArc = 0;
-    double angleDegrees = 0.0;
-    double incomingLengthPredictionVoxels = 0.0;
-    double outgoingLengthPredictionVoxels = 0.0;
+    float angleDegrees = 0.0F;
+    float incomingLengthPredictionVoxels = 0.0F;
+    float outgoingLengthPredictionVoxels = 0.0F;
     FiberletPathCost cost;
 };
 
 struct FiberletGraph {
-    double predictionToBaseScale = 1.0;
+    float predictionToBaseScale = 1.0F;
     int anchorCellSizePredictionVoxels = 0;
-    double maximumJoinAngleDegrees = 45.0;
+    float maximumJoinAngleDegrees = 45.0F;
     std::vector<FiberletGraphNode> nodes;
     std::vector<FiberletGraphEdge> edges;
     std::vector<FiberletGraphTransition> transitions;
@@ -70,6 +70,30 @@ struct FiberletGraphReplayMatch {
     double errorBaseVoxels = 0.0;
 };
 
+struct FiberletGraphReplayCost {
+    double invalidPrediction = 0.0;
+    double alignment = 0.0;
+    double isotropicSmoothness = 0.0;
+    double tangentSmoothness = 0.0;
+    double normalSmoothness = 0.0;
+
+    [[nodiscard]] double total() const noexcept
+    {
+        return invalidPrediction + alignment + isotropicSmoothness +
+            tangentSmoothness + normalSmoothness;
+    }
+
+    FiberletGraphReplayCost& operator+=(const FiberletPathCost& other) noexcept
+    {
+        invalidPrediction += static_cast<double>(other.invalidPrediction);
+        alignment += static_cast<double>(other.alignment);
+        isotropicSmoothness += static_cast<double>(other.isotropicSmoothness);
+        tangentSmoothness += static_cast<double>(other.tangentSmoothness);
+        normalSmoothness += static_cast<double>(other.normalSmoothness);
+        return *this;
+    }
+};
+
 struct FiberletGraphReplaySegment {
     double startReferenceArcBase = 0.0;
     double endReferenceArcBase = 0.0;
@@ -82,8 +106,8 @@ struct FiberletGraphReplaySegment {
     bool terminalPartialEdge = false;
     std::vector<FiberletGraphReplayMatch> matches;
     double totalLoss = 0.0;
-    FiberletPathCost edgeCost;
-    FiberletPathCost transitionCost;
+    FiberletGraphReplayCost edgeCost;
+    FiberletGraphReplayCost transitionCost;
     double pathLengthPredictionVoxels = 0.0;
 };
 
@@ -95,7 +119,7 @@ struct FiberletGraphReplayResult {
     std::vector<FiberReplayFailure> failures;
 };
 
-[[nodiscard]] FiberletGraph buildFiberletGraph(const FiberletPathReport& paths, double maximumJoinAngleDegrees = 45.0);
+[[nodiscard]] FiberletGraph buildFiberletGraph(const FiberletPathReport& paths, float maximumJoinAngleDegrees = 45.0F);
 
 [[nodiscard]] FiberletGraphReplayResult traceFiberletGraphReplay(
     const FiberletGraph& graph,

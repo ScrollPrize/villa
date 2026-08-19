@@ -1207,3 +1207,94 @@ final-evaluation work at 13.11/13.79 worker-seconds, anchor CPU at
 130.55/132.40 seconds, total CPU at 202.89/204.33 seconds, and command wall at
 9.22/9.26 seconds for candidate/baseline. All six artifacts were byte-identical
 with unchanged populations, DP relaxations, and replay failures.
+
+## Checkpoint 24: end-to-end float anchor and fiberlet state
+
+### Scope and implementation
+
+1. Change anchor observations, fitting configuration, peak offsets, robust
+   residual/cutoff state, objective components, refinement state, retained
+   anchors, support scores, and numeric diagnostics to float32. Remove the
+   expanded-double fitter specialization and its checked narrowing layer; both
+   direct and indexed inputs use the same float representation.
+2. Change fiberlet path configuration, costs, candidate endpoint geometry,
+   sampled endpoint state, path points, visual metrics, and graph geometry to
+   float32. This includes curved-domain/layer geometry, Hermite construction,
+   transported frames, interpolation fractions, scoring voxels, prepared node
+   scoring, transition geometry, and DP incoming state. Keep integer
+   lattice/cell/index state unchanged.
+3. Convert existing external `Vec3d` reference polylines and normal-sampler
+   results once at their boundary. Keep replay/reference-distance arithmetic
+   and elapsed-time/process-accounting fields double because those are outside
+   anchor/fiberlet extraction and are not repeated observation or node state.
+   Change the extraction point predicate to `Vec3f` so node enumeration does
+   not widen every point. Convert the shared stored-prediction sample itself to
+   float if all users permit it; otherwise introduce one float extraction
+   sample adapter and never retain the shared double sample in anchor/fiberlet
+   state.
+4. Serialize float fields directly as JSON numbers and use float-appropriate
+   OBJ precision. Existing version-1 and current version-2 artifacts remain
+   readable by accepting finite, float-representable JSON numeric values into
+   float fields and rejecting out-of-range values. No schema bump, runtime
+   compatibility branch, or duplicate double representation is retained.
+5. Audit containers and helper return types so no float result is widened to
+   double and stored, then narrowed again in a hot loop. Constants and standard
+   math overloads used by extraction must be float unless an external boundary
+   explicitly requires double.
+6. Generalize the shared principal-axis tensor implementation to support float
+   without copying its algorithm. Anchor and fiberlet extraction use the float
+   instantiation; unrelated existing double callers retain the same shared
+   implementation.
+7. Split float path/graph costs from replay's double cumulative accumulators.
+   Graph geometry and edge/transition costs remain float; replay sums and
+   reference-distance results remain double without changing the extraction
+   records.
+8. Use this precision inventory throughout the audit: extraction configuration,
+   geometry, samples, objectives, costs, diagnostics, statistics, and graph
+   data are float; timing/process accounting, external reference/replay
+   geometry, and cold external scale metadata are double; lattice, indices,
+   counts, and flags remain integer.
+
+### Quality and validation gates
+
+1. Add exact compile-time size assertions only for compact trivially-copyable
+   hot records and field-type assertions for aggregate records containing
+   standard-library objects. Add float serialization/load coverage for legacy
+   version-1 and current version-2 artifacts, round trips, and out-of-range
+   rejection.
+2. Update anchor, fiberlet-path, graph, and replay tests to compare with
+   float-appropriate tolerances. Preserve deterministic ordering, integer work
+   topology, validity semantics, and threshold strictness.
+3. Build and run focused GCC and Clang tests for anchors, paths, graph, and
+   replay. Do not run the canonical replay benchmark while the user reports the
+   CPUs busy.
+4. Once approved, run three canonical 5,000-base-voxel replays and compare
+   min/median/max wall and CPU time, memory, anchor/fiberlet/graph populations,
+   geometry deltas, DP work, and replay failures against commit `07176ccd6`.
+5. Retain only if outputs are deterministic and quality remains comparable.
+   Exact artifact hashes and double-rounding identity are not acceptance gates.
+6. Audit convergence, degeneracy, eigenvalue uniqueness, owner-boundary,
+   support, merge, NMS, and angle tolerances for float semantics. Preserve
+   strict comparison direction and add exact/adjacent-float boundary tests;
+   do not blindly retain double-scale epsilon constants where they are inert in
+   float arithmetic.
+
+### Spec update
+
+- Replace the mixed persistent-double precision rules with one float32 anchor
+  and fiberlet extraction contract. Document external double inputs as boundary
+  conversions only. Explicitly replace the expanded-public-double,
+  persistent-anchor-double, exact-endpoint-double, and final-result-widening
+  clauses. Timing/process accounting, external replay/reference geometry, and
+  cold scale metadata are the only intentional doubles at subsystem boundaries.
+
+### Documentation update
+
+- Update `volume-cartographer/docs/fiberlets.md` to describe the end-to-end
+  float representation and version-1 reader behavior.
+
+### Changelog update
+
+- Checkpoint 24 is retained after three deterministic canonical runs improved
+  median wall time by 2.8%, total CPU by 1.7%, and peak RSS by 5.4% while
+  preserving comparable replay quality.

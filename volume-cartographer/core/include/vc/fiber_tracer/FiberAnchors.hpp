@@ -18,54 +18,54 @@ namespace vc::fiber_tracer
 {
 
 struct FiberAnchorObservation {
-    cv::Vec3d positionPredictionXYZ{0.0, 0.0, 0.0};
-    cv::Vec3d direction{0.0, 0.0, 0.0};
-    double presence = 0.0;
+    cv::Vec3f positionPredictionXYZ{0.0F, 0.0F, 0.0F};
+    cv::Vec3f direction{0.0F, 0.0F, 0.0F};
+    float presence = 0.0F;
     bool valid = false;
-    cv::Vec3d presenceGradientPredictionXYZ{0.0, 0.0, 0.0};
+    cv::Vec3f presenceGradientPredictionXYZ{0.0F, 0.0F, 0.0F};
     bool presenceGradientValid = false;
 };
 
 struct FiberAnchorConfig {
     int cellSizePredictionVoxels = 4;
-    double gaussianSigmaPredictionVoxels = 2.0;
-    double peakSigmaPredictionVoxels = 1.5;
-    double peakAxialSigmaPredictionVoxels = 6.0;
-    double peakGridStepPredictionVoxels = 0.5;
-    double peakGradientWeight = 1.0;
-    double peakGradientReliabilityScale = 0.05;
-    double gaussianCutoffSigmas = 3.0;
-    double localWindowRadiusPredictionVoxels = 4.0;
-    double axialSupportHalfWidthPredictionVoxels = 6.0;
-    double positionConvergenceTolerancePredictionVoxels = 1.0e-4;
-    double nmsMaximumAngleDegrees = 10.0;
-    double nmsTransverseRadiusPredictionVoxels = 2.0;
-    double nmsLongitudinalRadiusPredictionVoxels = 1.0;
-    double observationPresenceFloor = 0.05;
-    double minimumAlignedSupport = 0.05;
-    double robustMaximumTrimMassFraction = 0.20;
-    double robustMadMultiplier = 3.0;
-    double robustMinimumAngleDegrees = 5.0;
-    double mergeMaximumAngleDegrees = 10.0;
-    double mergeMaximumAbsoluteObjectiveLoss = 0.01;
-    double mergeMaximumRelativeObjectiveLoss = 0.05;
+    float gaussianSigmaPredictionVoxels = 2.0F;
+    float peakSigmaPredictionVoxels = 1.5F;
+    float peakAxialSigmaPredictionVoxels = 6.0F;
+    float peakGridStepPredictionVoxels = 0.5F;
+    float peakGradientWeight = 1.0F;
+    float peakGradientReliabilityScale = 0.05F;
+    float gaussianCutoffSigmas = 3.0F;
+    float localWindowRadiusPredictionVoxels = 4.0F;
+    float axialSupportHalfWidthPredictionVoxels = 6.0F;
+    float positionConvergenceTolerancePredictionVoxels = 1.0e-4F;
+    float nmsMaximumAngleDegrees = 10.0F;
+    float nmsTransverseRadiusPredictionVoxels = 2.0F;
+    float nmsLongitudinalRadiusPredictionVoxels = 1.0F;
+    float observationPresenceFloor = 0.05F;
+    float minimumAlignedSupport = 0.05F;
+    float robustMaximumTrimMassFraction = 0.20F;
+    float robustMadMultiplier = 3.0F;
+    float robustMinimumAngleDegrees = 5.0F;
+    float mergeMaximumAngleDegrees = 10.0F;
+    float mergeMaximumAbsoluteObjectiveLoss = 0.01F;
+    float mergeMaximumRelativeObjectiveLoss = 0.05F;
     size_t maximumSeedCount = 8;
     int maximumIterations = 1;
-    double convergenceTolerance = 1.0e-12;
+    float convergenceTolerance = 1.0e-6F;
     size_t maximumConcurrentSampleBytes =
         2ULL * 1024ULL * 1024ULL * 1024ULL;
     int parallelThreads = 1;
 };
 
 struct FiberAnchorQuadraticPeakOffset {
-    double firstGridSteps = 0.0;
-    double secondGridSteps = 0.0;
+    float firstGridSteps = 0.0F;
+    float secondGridSteps = 0.0F;
 };
 
 // Samples are indexed [first + 1][second + 1] for offsets in {-1, 0, 1}.
 [[nodiscard]] std::optional<FiberAnchorQuadraticPeakOffset>
 fitFiberAnchorQuadraticPeak(
-    const std::array<std::array<double, 3>, 3>& response);
+    const std::array<std::array<float, 3>, 3>& response);
 
 struct FiberAnchorCrop {
     std::array<size_t, 3> originXYZ{0, 0, 0};
@@ -74,20 +74,20 @@ struct FiberAnchorCrop {
 
 struct FiberAnchor {
     std::array<size_t, 3> cellZYX{0, 0, 0};
-    cv::Vec3d positionPredictionXYZ{0.0, 0.0, 0.0};
-    cv::Vec3d axisXYZ{1.0, 0.0, 0.0};
-    double alignedSupport = 0.0;
-    double directionalCoherence = 0.0;
-    double refinementScore = 0.0;
+    cv::Vec3f positionPredictionXYZ{0.0F, 0.0F, 0.0F};
+    cv::Vec3f axisXYZ{1.0F, 0.0F, 0.0F};
+    float alignedSupport = 0.0F;
+    float directionalCoherence = 0.0F;
+    float refinementScore = 0.0F;
     size_t refinementIterations = 0;
 };
 
 struct FiberAnchorDiagnosticMetrics {
     std::optional<size_t> assignedObservationCount;
-    std::optional<double> objectiveContribution;
-    std::optional<double> alignedSupport;
-    std::optional<double> directionalCoherence;
-    std::optional<double> refinementScore;
+    std::optional<float> objectiveContribution;
+    std::optional<float> alignedSupport;
+    std::optional<float> directionalCoherence;
+    std::optional<float> refinementScore;
     std::optional<size_t> refinementIterations;
 };
 
@@ -95,16 +95,16 @@ struct FiberAnchorDiagnosticSuppressor {
     std::array<size_t, 3> cellZYX{0, 0, 0};
     size_t candidateId = 0;
     bool externalContext = false;
-    double alignedSupport = 0.0;
-    double directionalCoherence = 0.0;
+    float alignedSupport = 0.0F;
+    float directionalCoherence = 0.0F;
 };
 
 struct FiberAnchorDiagnosticTransition {
     std::string outcome;
     std::optional<std::string> reason;
     std::optional<size_t> successorId;
-    std::optional<double> testedValue;
-    std::optional<double> threshold;
+    std::optional<float> testedValue;
+    std::optional<float> threshold;
     std::optional<FiberAnchorDiagnosticSuppressor> suppressor;
 };
 
@@ -114,9 +114,9 @@ struct FiberAnchorDiagnosticRecord {
     std::vector<size_t> parentIds;
     std::optional<FiberAnchor> anchor;
     // Transient benchmark provenance. Deliberately omitted from artifacts.
-    std::optional<cv::Vec3d> discretePeakPositionPredictionXYZ;
-    std::optional<cv::Vec3d> separablePeakPositionPredictionXYZ;
-    std::optional<cv::Vec3d> jointPeakPositionPredictionXYZ;
+    std::optional<cv::Vec3f> discretePeakPositionPredictionXYZ;
+    std::optional<cv::Vec3f> separablePeakPositionPredictionXYZ;
+    std::optional<cv::Vec3f> jointPeakPositionPredictionXYZ;
     FiberAnchorDiagnosticMetrics metrics;
     FiberAnchorDiagnosticTransition transition;
 };
@@ -138,9 +138,9 @@ inline constexpr size_t kFiberAnchorDiagnosticStageCount =
 
 struct FiberAnchorComponent {
     FiberAnchor anchor;
-    std::optional<cv::Vec3d> discretePeakPositionPredictionXYZ;
-    std::optional<cv::Vec3d> separablePeakPositionPredictionXYZ;
-    std::optional<cv::Vec3d> jointPeakPositionPredictionXYZ;
+    std::optional<cv::Vec3f> discretePeakPositionPredictionXYZ;
+    std::optional<cv::Vec3f> separablePeakPositionPredictionXYZ;
+    std::optional<cv::Vec3f> jointPeakPositionPredictionXYZ;
     bool retained = false;
     std::string rejectionReason;
     size_t assignedObservationCount = 0;
@@ -148,18 +148,18 @@ struct FiberAnchorComponent {
     std::vector<size_t> diagnosticParentIds;
     bool retainedAfterSupport = false;
     bool retainedAfterSelection = false;
-    std::optional<double> selectionTestedValue;
-    std::optional<double> selectionThreshold;
+    std::optional<float> selectionTestedValue;
+    std::optional<float> selectionThreshold;
     std::optional<FiberAnchorDiagnosticSuppressor> nmsSuppressor;
     bool removedDuringRobustRefinement = false;
 };
 
 struct FiberAnchorMergeEvaluation {
-    double angleDegrees = 0.0;
-    double jointObjective = 0.0;
-    double splitObjective = 0.0;
-    double objectiveLoss = 0.0;
-    double allowedObjectiveLoss = 0.0;
+    float angleDegrees = 0.0F;
+    float jointObjective = 0.0F;
+    float splitObjective = 0.0F;
+    float objectiveLoss = 0.0F;
+    float allowedObjectiveLoss = 0.0F;
     bool merged = false;
 };
 
@@ -167,7 +167,7 @@ struct FiberCellAnchorResult {
     std::array<size_t, 3> cellZYX{0, 0, 0};
     std::array<FiberAnchorComponent, 2> components;
     std::optional<FiberAnchorMergeEvaluation> mergeEvaluation;
-    double objective = 0.0;
+    float objective = 0.0F;
     size_t retainedAnchorCount = 0;
     std::array<FiberAnchorDiagnosticRecord, 2> initializedDiagnostics;
 };
@@ -186,28 +186,28 @@ struct FiberAnchorExtractionDiagnostics {
 };
 
 struct FiberAnchorResidualSample {
-    double residual = 0.0;
-    double mass = 0.0;
+    float residual = 0.0F;
+    float mass = 0.0F;
 };
 
 struct FiberAnchorRobustCutoff {
-    double cutoffResidual = 1.0;
-    double totalMass = 0.0;
-    double candidateTrimmedMass = 0.0;
-    double trimmedMass = 0.0;
-    double retainedMass = 0.0;
+    float cutoffResidual = 1.0F;
+    float totalMass = 0.0F;
+    float candidateTrimmedMass = 0.0F;
+    float trimmedMass = 0.0F;
+    float retainedMass = 0.0F;
     bool detectedOutliers = false;
 };
 
 [[nodiscard]] FiberAnchorRobustCutoff selectFiberAnchorRobustCutoff(
     const std::vector<FiberAnchorResidualSample>& samples,
-    double maximumTrimMassFraction,
-    double madMultiplier,
-    double minimumAngleDegrees);
+    float maximumTrimMassFraction,
+    float madMultiplier,
+    float minimumAngleDegrees);
 
-[[nodiscard]] std::vector<double> fiberAnchorSpatialBacktrackingFractions(
-    double maximumDisplacementPredictionVoxels,
-    double targetStepPredictionVoxels,
+[[nodiscard]] std::vector<float> fiberAnchorSpatialBacktrackingFractions(
+    float maximumDisplacementPredictionVoxels,
+    float targetStepPredictionVoxels,
     int maximumHalvings = 8);
 
 struct FiberAnchorFitProfile {
@@ -235,9 +235,9 @@ struct FiberAnchorFitProfile {
     size_t spatialCandidatesTested = 0;
     std::array<size_t, 9> spatialCandidatesTestedByDepth{};
     std::array<size_t, 9> spatialCandidatesAcceptedByDepth{};
-    double robustCandidateTrimmedMass = 0.0;
-    double robustTrimmedMass = 0.0;
-    double robustRetainedMass = 0.0;
+    float robustCandidateTrimmedMass = 0.0F;
+    float robustTrimmedMass = 0.0F;
+    float robustRetainedMass = 0.0F;
     size_t localTensorObservationVisits = 0;
     size_t localCentroidObservationVisits = 0;
     size_t refinedEvaluationObservationVisits = 0;
@@ -322,19 +322,19 @@ struct FiberAnchorExtractionReport {
 
 struct FiberAnchorDistanceStatistics {
     size_t count = 0;
-    std::optional<double> minimum;
-    std::optional<double> mean;
-    std::optional<double> median;
-    std::optional<double> percentile95;
-    std::optional<double> maximum;
+    std::optional<float> minimum;
+    std::optional<float> mean;
+    std::optional<float> median;
+    std::optional<float> percentile95;
+    std::optional<float> maximum;
 };
 
 struct FiberAnchorBenchmarkThreshold {
-    double thresholdBaseVoxels = 0.0;
+    float thresholdBaseVoxels = 0.0F;
     size_t anchorHits = 0;
-    std::optional<double> anchorHitRate;
+    std::optional<float> anchorHitRate;
     size_t cellHits = 0;
-    double cellHitRate = 0.0;
+    float cellHitRate = 0.0F;
 };
 
 struct FiberAnchorBenchmarkStageReport {
@@ -354,7 +354,7 @@ struct FiberAnchorBenchmarkReport {
 struct FiberAnchorArtifactInfo {
     std::string sourceLocator;
     std::string manifestContentHash;
-    double glyphLengthBaseVoxels = 16.0;
+    float glyphLengthBaseVoxels = 16.0F;
     std::optional<double> baseVoxelSizeUm;
 };
 
@@ -370,8 +370,8 @@ using FiberStoredPredictionBatchSampler =
 
 struct FiberAnchorRetainEvaluation {
     bool retained = true;
-    std::optional<double> testedValue;
-    std::optional<double> threshold;
+    std::optional<float> testedValue;
+    std::optional<float> threshold;
 };
 
 using FiberAnchorRetainPredicate =
@@ -423,7 +423,7 @@ fiberAnchorCellsNearPolyline(
 [[nodiscard]] FiberAnchorBenchmarkReport benchmarkRefinedFiberAnchors(
     const FiberAnchorExtractionReport& anchors,
     const std::vector<cv::Vec3d>& referenceLineBase,
-    const std::vector<double>& thresholdsBaseVoxels);
+    const std::vector<float>& thresholdsBaseVoxels);
 
 void suppressFiberAnchorDuplicates(
     std::vector<FiberCellAnchorResult>& cells,

@@ -27,6 +27,27 @@ has a globally fixed origin and owns the half-open ZYX range
 cell it intersects and samples that cell in full. It does not move or truncate
 interior cells. Prediction-grid coordinates remain private solver values.
 
+Anchor and fiberlet extraction use float32 end to end: observations,
+configuration used by solver math, component and peak state, retained anchors,
+fiberlet domain/frame/interpolation geometry, path costs, DP state, candidate
+points, graph geometry, diagnostics, and serialized numeric values. Integer
+lattice/index/count state remains integer. External reference fibers, replay
+distance calculations, cold volume-scale metadata, and elapsed/process timing
+remain double precision and convert only at subsystem boundaries. Version-1
+and version-2 JSON artifacts carry untyped JSON numbers and load into this
+float representation without a schema change. The shared prediction and normal
+sampler interfaces remain double-valued for other consumers; extraction
+normalizes, range-checks, and narrows their results once at the sampling
+boundary and retains only float tiles afterward.
+Prediction-grid extents must not exceed `2^24` voxels on any axis so every
+integer voxel coordinate remains exact in float32. Artifact and OBJ writers
+also reject base-coordinate scaling that would overflow float32.
+On the canonical 32-thread, 5,000-base-voxel Paris4 replay, the complete
+float32 representation reduced median command wall time from 9.22 to 8.96
+seconds, total CPU from 202.89 to 199.47 seconds, and peak RSS from 2,121,656
+to 2,007,020 KiB. Replay failures were unchanged and repeated float32 runs
+produced identical artifacts.
+
 ## Fit
 
 The existing deterministic two-mode non-orthogonal PCA fit supplies initial
@@ -275,12 +296,11 @@ key and three `float32` prediction coordinates. On a lazy-cache miss, fiber and
 normal axes pass through the same +Z compact `nx/ny` encoding as Lasagna and
 presence uses the native byte scale. No per-node reason string or
 interpolation-address object is retained. This re-quantization is intentional
-for the experimental fiberlet objective; exact anchor endpoints remain double
-precision. DP stores normalized solve-local scoring records only for requested
-nodes. Each
-reached node resolves its at most nine outgoing neighbors and edge geometry
-once, reusing them across incoming states; no candidate-wide edge table is
-materialized.
+for the experimental fiberlet objective; exact anchor endpoints use the same
+float32 geometry representation. DP stores normalized solve-local scoring
+records only for requested nodes. Each reached node resolves its at most nine
+outgoing neighbors and edge geometry once, reusing them across incoming states;
+no candidate-wide edge table is materialized.
 
 Presence is trilinearly interpolated. Fiber directions are unoriented: the
 native voxel axes are validated and normalized once into compact float32
@@ -292,9 +312,10 @@ existing iterative Jacobi resolver is used as a numerical fallback. This
 preserves antipodal axes without sign cancellation; an invalid required corner
 or ambiguous tensor invalidates the destination. Normals use the same
 interpolation, but invalid normal data keeps the existing isotropic curvature
-fallback rather than rejecting the path. Float32 preparation is an intentional
-transient precision boundary; interpolation weights, tensor sums, and
-principal-axis calculations remain double precision.
+fallback rather than rejecting the path. Interpolation weights, tensor sums,
+and principal-axis calculations stay float32 throughout fiberlet extraction;
+only the external normal-sampler call uses its existing double-coordinate API
+before immediately narrowing the returned sample.
 
 Every interior mapped move must have an unoriented angle strictly below 25
 degrees to the dense fiber-prediction axis interpolated at its destination.
@@ -646,10 +667,9 @@ acceptance, convergence, and profiling overhead. The four fields reconcile to
 
 Production compact observations keep the robust direction-proposal scan in
 float32, including component assignment, Gaussian/alignment arithmetic,
-residual histograms, and retained direction-tensor bins. Only the fixed-size
-histogram summaries and six retained tensor entries widen to the existing
-double cutoff and eigensolver. The public expanded-observation fitter remains
-double precision. On the canonical 5,000-base-voxel replay, median tensor-
+residual histograms, retained direction-tensor bins, robust cutoffs, and the
+shared float principal-axis solver. The direct public-observation fitter uses
+the same representation. On the canonical 5,000-base-voxel replay, median tensor-
 proposal worker time fell from 25.63 to 23.74 seconds, anchor CPU from 143.16
 to 140.75 seconds, and command wall from 9.65 to 9.58 seconds. Anchor/graph
 populations and failures were unchanged; emitted route points differed by at
@@ -662,9 +682,9 @@ per-cell indices without materialization: assignment and membership arrays use
 logical per-cell positions, while observation reads use the corresponding tile
 index. Gaussian, alignment, ordinary numerator/denominator sums, and final
 ratio are float32. Every finite-position site contributes to all active
-denominators before evidence eligibility is checked. The public expanded path
-uses the same objective equation with normalized directions and compensated
-double sums; persistent component and accepted-position state remain double. On the canonical
+denominators before evidence eligibility is checked. The direct public path
+uses the same float objective equation and persistent component/accepted-position
+state. On the canonical
 replay, isolation reduced median local-state objective work from 22.59 to 13.86
 worker-seconds, anchor CPU from 140.80 to 130.74 seconds, and command wall from
 9.56 to 9.17 seconds, with byte-identical replay artifacts.
@@ -672,13 +692,12 @@ worker-seconds, anchor CPU from 140.80 to 130.74 seconds, and command wall from
 Final support evaluation is independently isolated from both the anchor fitter
 and fixed-direction objective kernels. Compact production observations remain
 float32 throughout Gaussian, direction, presence, and accumulation arithmetic.
-The expanded public fitter uses the same float32 reduction after checked
-narrowing and scale-safe direction normalization. Per-component aligned
-support/coherence and the combined objective are computed in float, then the
-fixed-size result widens into the existing double output fields. Invalid or
-unrepresentable public evidence cannot enter a numerator; a finite-position
-site still contributes to every active denominator regardless of membership or
-direction usability. On the canonical replay, median final-evaluation work fell
+The direct public fitter uses the same float32 reduction with scale-safe
+direction normalization. Per-component aligned support/coherence, the combined
+objective, and persistent output fields remain float. Invalid public evidence
+cannot enter a numerator; a finite-position site still contributes to every
+active denominator regardless of membership or direction usability. On the
+canonical replay, median final-evaluation work fell
 from 13.79 to 13.11 worker-seconds, anchor CPU from 132.40 to 130.55 seconds,
 and command wall from 9.26 to 9.22 seconds, with byte-identical artifacts and
 unchanged replay work/failures.
@@ -704,11 +723,12 @@ responses use an equivalent two-dimensional transverse representation. These
 grouped reductions can introduce small floating-point differences; exact
 numeric identity with version 4 is not a requirement.
 
-Peak-search observations and their transverse response calculations use
-float32. Accepted anchor positions, component state, aggregate diagnostics, and
-serialized output remain double precision. This halves the repeatedly scanned
-peak-search working set; small differences in peak ties and downstream path
-node counts are expected.
+Peak-search observations, transverse response calculations, accepted anchor
+positions, component state, aggregate numeric diagnostics, and serialized
+output use float32. This removes widening at the peak-search boundary and
+halves the repeatedly scanned working set relative to the earlier double
+representation; small differences in peak ties and downstream path node counts
+are expected.
 
 The bounded peak hill climb stores grid geometry, feasibility, and computed
 responses in contiguous row-major slots. Response values have independent

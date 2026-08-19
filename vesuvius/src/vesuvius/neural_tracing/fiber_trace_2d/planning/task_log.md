@@ -1124,3 +1124,76 @@
   Direct tests cover compact/public support and coherence agreement, threshold
   equality and adjacent decisions, checked nonrepresentable inputs, and exact
   assigned-count/denominator semantics. Checkpoint 23 is retained.
+
+## Checkpoint 24: end-to-end float anchor and fiberlet state
+
+- Committed checkpoint 23 as `07176ccd6` before beginning this experiment.
+- Converted anchor observations, solver configuration, robust/refinement and
+  peak state, retained anchors, diagnostics, artifact fields, fiberlet geometry,
+  sampled scoring state, path/graph costs, DP state, candidates, and graph data
+  to float32. Integer lattice, index, count, and flag state remains unchanged.
+- Kept only timing/process accounting, cold external scale parsing, and
+  reference/replay calculations double. Shared prediction and normal samplers
+  remain external double-valued APIs, but their results are checked and narrowed
+  once; anchor tile reuse and all extraction state retain only float32 values.
+- Generalized the shared tensor implementation while preserving the existing
+  named double API. Explicit `canonicalFiberAxisF`, `fiberAxisTensorF`,
+  `principalFiberAxisF`, and `principalFiberAxisClosedFormF` entry points avoid
+  making existing brace-initialized double calls ambiguous.
+- Replaced ineffective inherited double-scale tolerances with deliberate float
+  convergence, matrix, geometry, and response-comparison tolerances. Graph
+  construction now rejects prediction-scale underflow and base-coordinate
+  overflow. Version-1 and version-2 JSON remain readable with checked float
+  representability and no schema change.
+- GCC and Clang QuickBuild production/focused targets compile. On both builds,
+  `test_fiber_anchors`, `test_fiberlet_paths`, and `test_fiber_replay` pass.
+  Focused tests cover float field types, extreme values, float principal-axis
+  uniqueness/ambiguity, graph underflow/overflow, artifact round trips, legacy
+  version loading, and out-of-range rejection. `git diff --check` passes.
+- The canonical 32-thread, 5,000-base-voxel replay is intentionally deferred
+  because the user reports the CPUs busy. No performance, population, geometry,
+  DP-work, replay-quality, or retention conclusion has been recorded yet.
+- At user request, one canonical replay was subsequently run for quality only;
+  its timing is invalid because the CPUs remained busy. Against checkpoint 23's
+  retained replay SHA-256
+  `9ad06d494b886dc4e256e1adadc3cb12e70fee051c3292895a4593a475efa472`,
+  the float run retained 2,603 anchors and the same 2 greedy / 1 fiberlet
+  failures. Greedy replay output was exactly identical. Graph nodes changed
+  2,560 to 2,562, accepted edges 26,494 to 26,445, and DP relaxations
+  62,970,388 to 62,873,000. The first fiberlet segment retained the same 238
+  route points and failed only 0.00645 base voxels later in reference arc; its
+  pointwise displacement had median 0.0044, p95 5.43, and maximum 14.54 base
+  voxels before reconverging to an evaluator point about 0.0066 base voxels
+  from baseline. The final segment had median 0.0039, p95 0.0169, and maximum
+  0.0316 base-voxel displacement and reached the identical reference end.
+  This is comparable replay behavior, not numeric or topology identity. Three
+  controlled runs are still required before any performance/retention decision.
+- Post-replay review restored concrete public principal-axis result structs,
+  rejected prediction-grid extents above `2^24`, and added checked float32
+  scaling for serialized and OBJ base coordinates. GCC and Clang builds pass
+  `test_fiber_anchors`, `test_fiberlet_paths`, and `test_fiber_replay` with
+  focused overflow and oversized-grid coverage. These are cold validation and
+  output-path guards and do not alter the canonical valid-grid replay result.
+- After the user confirmed CPU availability, three measured checkpoint-24
+  replays used the same QuickBuild executable, warm local Paris4 inputs,
+  32 threads, and a 5,000-base-voxel reference interval. Results against the
+  controlled checkpoint-23 measurements were:
+
+  | metric | checkpoint 24 min / median / max | checkpoint 23 min / median / max | median change |
+  |---|---:|---:|---:|
+  | command wall | 8.86 / 8.96 / 8.98 s | 9.02 / 9.22 / 9.32 s | -2.8% |
+  | total CPU | 197.05 / 199.47 / 200.68 s | 199.84 / 202.89 / 203.88 s | -1.7% |
+  | anchor wall | 4.963 / 4.984 / 5.032 s | 4.888 / 5.043 / 5.134 s | -1.2% |
+  | anchor CPU | 128.80 / 129.92 / 130.80 s | 128.26 / 130.55 / 131.52 s | -0.5% |
+  | fiberlet wall | 3.236 / 3.298 / 3.313 s | not recorded | n/a |
+  | fiberlet CPU | 66.01 / 67.33 / 67.68 s | not recorded | n/a |
+  | final evaluation work | 11.99 / 12.25 / 12.34 s | 12.73 / 13.11 / 13.12 s | -6.5% |
+  | peak RSS | 1,994,740 / 2,007,020 / 2,018,200 KiB | 2,107,536 / 2,121,656 / 2,158,252 KiB | -5.4% |
+
+- Every checkpoint-24 run retained 2,603 anchors, 2,562 graph nodes, 26,445
+  edges, 62,873,000 DP relaxations, and 2 greedy / 1 fiberlet failures. All
+  three artifacts and the earlier quality-only run had SHA-256
+  `f2b8e679c23470d1221f7930a21b0c37fa0906845de0bc2cbf3e8ab7329f78ee`.
+  Together with the recorded localized route comparison, this satisfies the
+  deterministic performance and comparable-quality gates. Checkpoint 24 is
+  retained.

@@ -4,41 +4,18 @@
 
 #include <algorithm>
 #include <cmath>
-#include <limits>
 #include <stdexcept>
 #include <type_traits>
 
 namespace vc::fiber_tracer::detail::final_evaluation_kernel {
 
-constexpr double kMatrixEpsilon = 1.0e-15;
+constexpr float kMatrixEpsilon = 1.0e-15F;
 
 template <typename Scalar>
 [[nodiscard]] bool finiteVector(const cv::Vec<Scalar, 3>& value)
 {
     return std::isfinite(value[0]) && std::isfinite(value[1]) &&
            std::isfinite(value[2]);
-}
-
-[[nodiscard]] inline bool checkedFloat(double value, float& result)
-{
-    if (!std::isfinite(value) ||
-        std::abs(value) > static_cast<double>(std::numeric_limits<float>::max())) {
-        return false;
-    }
-    result = static_cast<float>(value);
-    return true;
-}
-
-[[nodiscard]] inline cv::Vec3f checkedFloatVector(const cv::Vec3d& value)
-{
-    cv::Vec3f result;
-    for (int coordinate = 0; coordinate < 3; ++coordinate) {
-        if (!checkedFloat(value[coordinate], result[coordinate])) {
-            throw std::invalid_argument(
-                "fiber anchor final state is not float representable");
-        }
-    }
-    return result;
 }
 
 template <typename Scalar>
@@ -55,22 +32,15 @@ struct ObjectiveConfig {
     Scalar presenceFloor;
 };
 
-[[nodiscard]] inline ObjectiveConfig<float> checkedFloatConfig(
+[[nodiscard]] inline ObjectiveConfig<float> floatConfig(
     const FiberAnchorObjectiveConfig& config)
 {
-    ObjectiveConfig<float> result;
-    const double cutoff = config.gaussianCutoffSigmas *
-        config.gaussianSigmaPredictionVoxels;
-    if (!checkedFloat(config.gaussianSigmaPredictionVoxels,
-            result.gaussianSigma) ||
-        !checkedFloat(cutoff, result.gaussianCutoff) ||
-        !checkedFloat(config.axialSupportHalfWidthPredictionVoxels,
-            result.axialSupportHalfWidth) ||
-        !checkedFloat(config.observationPresenceFloor, result.presenceFloor)) {
-        throw std::invalid_argument(
-            "fiber anchor final configuration is not float representable");
-    }
-    return result;
+    return {
+        config.gaussianSigmaPredictionVoxels,
+        config.gaussianCutoffSigmas * config.gaussianSigmaPredictionVoxels,
+        config.axialSupportHalfWidthPredictionVoxels,
+        config.observationPresenceFloor,
+    };
 }
 
 struct ExpandedFinalObservationRange {
@@ -131,24 +101,7 @@ template <typename Range>
 [[nodiscard]] cv::Vec<typename Range::Scalar, 3> observationPosition(
     const typename Range::Observation& observation)
 {
-    using Scalar = typename Range::Scalar;
-    if constexpr (std::is_same_v<Range, ExpandedFinalObservationRange>) {
-        cv::Vec3f position;
-        for (int coordinate = 0; coordinate < 3; ++coordinate) {
-            if (!checkedFloat(
-                    observation.positionPredictionXYZ[coordinate],
-                    position[coordinate])) {
-                return {
-                    std::numeric_limits<float>::quiet_NaN(), 0.0F, 0.0F};
-            }
-        }
-        return position;
-    }
-    return {
-        static_cast<Scalar>(observation.positionPredictionXYZ[0]),
-        static_cast<Scalar>(observation.positionPredictionXYZ[1]),
-        static_cast<Scalar>(observation.positionPredictionXYZ[2]),
-    };
+    return observation.positionPredictionXYZ;
 }
 
 template <typename Range>
@@ -158,32 +111,13 @@ template <typename Range>
     cv::Vec<typename Range::Scalar, 3>& direction)
 {
     using Scalar = typename Range::Scalar;
-    Scalar presence;
-    if constexpr (std::is_same_v<Range, ExpandedFinalObservationRange>) {
-        if (!checkedFloat(observation.presence, presence))
-            return false;
-    } else {
-        presence = static_cast<Scalar>(observation.presence);
-    }
+    const Scalar presence = observation.presence;
     if (!observation.valid || !finiteVector(observation.direction) ||
         !std::isfinite(presence) || presence < presenceFloor ||
         presence < Scalar{0} || presence > Scalar{1}) {
         return false;
     }
-    if constexpr (std::is_same_v<Range, ExpandedFinalObservationRange>) {
-        for (int coordinate = 0; coordinate < 3; ++coordinate) {
-            if (!checkedFloat(
-                    observation.direction[coordinate], direction[coordinate])) {
-                return false;
-            }
-        }
-    } else {
-        direction = {
-            static_cast<Scalar>(observation.direction[0]),
-            static_cast<Scalar>(observation.direction[1]),
-            static_cast<Scalar>(observation.direction[2]),
-        };
-    }
+    direction = observation.direction;
     Scalar norm2 = direction.dot(direction);
     if constexpr (Range::normalizeDirections) {
         const Scalar scale = std::max({

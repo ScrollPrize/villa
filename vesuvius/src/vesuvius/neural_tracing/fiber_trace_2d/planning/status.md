@@ -181,3 +181,16 @@
 - [x] Run three canonical checkpoint 11 replays and compare quality/performance.
 - [x] Retain or remove checkpoint 11 based on the measured result.
 - [x] Update specifications, user documentation, changelog, and task log.
+- [x] Commit checkpoint 23 final-evaluation specialization.
+- [x] Plan checkpoint 24 end-to-end float anchor/fiberlet state.
+- [x] Independently review checkpoint 24 against task and specifications.
+- [x] Convert anchor observations, fitting state, retained state, and artifacts.
+- [x] Convert fiberlet candidates, costs, paths, graph state, and artifacts.
+- [x] Remove redundant double/float conversion paths and audit boundaries.
+- [x] Add/update float representation and compatibility coverage.
+- [x] Run focused GCC and Clang validation.
+- [x] Run one canonical checkpoint-24 replay for quality only while timing is invalid.
+- [x] Wait for CPU availability before canonical replay benchmarking.
+- [x] Run three canonical checkpoint-24 replay comparisons.
+- [x] Retain checkpoint 24 based on quality and performance.
+- [x] Update specifications, user documentation, changelog, and task log.

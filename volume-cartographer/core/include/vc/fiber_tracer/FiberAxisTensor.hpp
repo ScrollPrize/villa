@@ -14,17 +14,31 @@ struct FiberPrincipalAxis {
     bool unique = false;
 };
 
+struct FiberPrincipalAxisF {
+    cv::Vec3f axis{0.0F, 0.0F, 0.0F};
+    float largestEigenvalue = 0.0F;
+    float secondEigenvalue = 0.0F;
+    bool valid = false;
+    bool unique = false;
+};
+
 [[nodiscard]] cv::Vec3d canonicalFiberAxis(cv::Vec3d axis);
+[[nodiscard]] cv::Vec3f canonicalFiberAxisF(cv::Vec3f axis);
 
 [[nodiscard]] cv::Matx33d fiberAxisTensor(const cv::Vec3d& unitAxis, double weight = 1.0);
+[[nodiscard]] cv::Matx33f fiberAxisTensorF(const cv::Vec3f& unitAxis, float weight = 1.0F);
 
 [[nodiscard]] FiberPrincipalAxis principalFiberAxis(const cv::Matx33d& tensor);
+[[nodiscard]] FiberPrincipalAxisF principalFiberAxisF(const cv::Matx33f& tensor);
 
 // Resolves a symmetric 3x3 tensor in closed form. Ambiguous top eigenvalues
 // remain non-unique; the iterative solver is used only when a clear-gap
 // eigenvector cannot be reconstructed to a bounded residual.
 [[nodiscard]] FiberPrincipalAxis principalFiberAxisClosedForm(
     const cv::Matx33d& tensor,
+    bool* usedIterativeFallback = nullptr);
+[[nodiscard]] FiberPrincipalAxisF principalFiberAxisClosedFormF(
+    const cv::Matx33f& tensor,
     bool* usedIterativeFallback = nullptr);
 
 }  // namespace vc::fiber_tracer

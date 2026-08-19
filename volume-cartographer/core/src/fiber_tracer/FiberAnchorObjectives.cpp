@@ -8,7 +8,7 @@
 namespace vc::fiber_tracer::detail {
 namespace {
 
-constexpr double kMatrixEpsilon = 1.0e-15;
+constexpr float kMatrixEpsilon = 1.0e-15F;
 
 template <typename Scalar>
 [[nodiscard]] bool finiteVector(const cv::Vec<Scalar, 3>& value)
@@ -18,7 +18,7 @@ template <typename Scalar>
 }
 
 template <typename Scalar>
-[[nodiscard]] cv::Vec<Scalar, 3> converted(const cv::Vec3d& value)
+[[nodiscard]] cv::Vec<Scalar, 3> converted(const cv::Vec3f& value)
 {
     return {
         static_cast<Scalar>(value[0]),
@@ -71,16 +71,6 @@ template <typename Scalar>
 class ObjectiveSum;
 
 template <>
-class ObjectiveSum<double> {
-public:
-    void add(double value) { value_.add(value); }
-    [[nodiscard]] double value() const { return value_.sum; }
-
-private:
-    CompensatedSum value_;
-};
-
-template <>
 class ObjectiveSum<float> {
 public:
     void add(float value) { value_ += value; }
@@ -92,7 +82,7 @@ private:
 
 struct ExpandedObservationRange {
     using Observation = FiberAnchorObservation;
-    using Scalar = double;
+    using Scalar = float;
     static constexpr bool normalizeDirections = true;
 
     [[nodiscard]] size_t size() const { return observations.size(); }
@@ -207,14 +197,14 @@ template <typename Range>
 }
 
 template <size_t StateCount, typename Range>
-[[nodiscard]] std::array<double, StateCount> evaluateObjectives(
+[[nodiscard]] std::array<float, StateCount> evaluateObjectives(
     const Range& observations,
     const std::array<std::array<FiberAnchorObjectiveComponent, 2>, StateCount>&
         inputStates,
     size_t activeComponents,
     std::span<const uint8_t> assignments,
     std::span<const uint8_t> retainedInliers,
-    const cv::Vec3d& inputPivot,
+    const cv::Vec3f& inputPivot,
     const FiberAnchorObjectiveConfig& inputConfig)
 {
     using Scalar = typename Range::Scalar;
@@ -250,25 +240,24 @@ template <size_t StateCount, typename Range>
             numerators[state].add(gaussian * presence * dot * dot);
         }
     }
-    std::array<double, StateCount> result{};
+    std::array<float, StateCount> result{};
     for (size_t state = 0; state < StateCount; ++state) {
         const Scalar denominator = denominators[state].value();
         if (denominator > Scalar{0}) {
-            result[state] = static_cast<double>(
-                numerators[state].value() / denominator);
+            result[state] = numerators[state].value() / denominator;
         }
     }
     return result;
 }
 
 template <typename Range>
-[[nodiscard]] double evaluateSingle(
+[[nodiscard]] float evaluateSingle(
     const Range& observations,
     const std::array<FiberAnchorObjectiveComponent, 2>& components,
     size_t activeComponents,
     std::span<const uint8_t> assignments,
     std::span<const uint8_t> retainedInliers,
-    const cv::Vec3d& pivot,
+    const cv::Vec3f& pivot,
     const FiberAnchorObjectiveConfig& config)
 {
     const std::array<std::array<FiberAnchorObjectiveComponent, 2>, 1> states{
@@ -279,14 +268,14 @@ template <typename Range>
 }
 
 template <typename Range>
-[[nodiscard]] std::array<double, 2> evaluatePair(
+[[nodiscard]] std::array<float, 2> evaluatePair(
     const Range& observations,
     const std::array<FiberAnchorObjectiveComponent, 2>& first,
     const std::array<FiberAnchorObjectiveComponent, 2>& second,
     size_t activeComponents,
     std::span<const uint8_t> assignments,
     std::span<const uint8_t> retainedInliers,
-    const cv::Vec3d& pivot,
+    const cv::Vec3f& pivot,
     const FiberAnchorObjectiveConfig& config)
 {
     return evaluateObjectives<2>(
@@ -296,13 +285,13 @@ template <typename Range>
 
 }  // namespace
 
-double retainedSpatialObjectiveExpanded(
+float retainedSpatialObjectiveExpanded(
     std::span<const FiberAnchorObservation> observations,
     const std::array<FiberAnchorObjectiveComponent, 2>& components,
     size_t activeComponents,
     std::span<const uint8_t> assignments,
     std::span<const uint8_t> retainedInliers,
-    const cv::Vec3d& pivot,
+    const cv::Vec3f& pivot,
     const FiberAnchorObjectiveConfig& config)
 {
     return evaluateSingle(
@@ -310,14 +299,14 @@ double retainedSpatialObjectiveExpanded(
         assignments, retainedInliers, pivot, config);
 }
 
-std::array<double, 2> retainedSpatialObjectivePairExpanded(
+std::array<float, 2> retainedSpatialObjectivePairExpanded(
     std::span<const FiberAnchorObservation> observations,
     const std::array<FiberAnchorObjectiveComponent, 2>& first,
     const std::array<FiberAnchorObjectiveComponent, 2>& second,
     size_t activeComponents,
     std::span<const uint8_t> assignments,
     std::span<const uint8_t> retainedInliers,
-    const cv::Vec3d& pivot,
+    const cv::Vec3f& pivot,
     const FiberAnchorObjectiveConfig& config)
 {
     return evaluatePair(
@@ -325,14 +314,14 @@ std::array<double, 2> retainedSpatialObjectivePairExpanded(
         activeComponents, assignments, retainedInliers, pivot, config);
 }
 
-double retainedSpatialObjectiveCompact(
+float retainedSpatialObjectiveCompact(
     std::span<const CompactFiberAnchorObservation> observationStorage,
     std::span<const uint32_t> observationIndices,
     const std::array<FiberAnchorObjectiveComponent, 2>& components,
     size_t activeComponents,
     std::span<const uint8_t> assignments,
     std::span<const uint8_t> retainedInliers,
-    const cv::Vec3d& pivot,
+    const cv::Vec3f& pivot,
     const FiberAnchorObjectiveConfig& config)
 {
     return evaluateSingle(
@@ -341,7 +330,7 @@ double retainedSpatialObjectiveCompact(
         config);
 }
 
-std::array<double, 2> retainedSpatialObjectivePairCompact(
+std::array<float, 2> retainedSpatialObjectivePairCompact(
     std::span<const CompactFiberAnchorObservation> observationStorage,
     std::span<const uint32_t> observationIndices,
     const std::array<FiberAnchorObjectiveComponent, 2>& first,
@@ -349,7 +338,7 @@ std::array<double, 2> retainedSpatialObjectivePairCompact(
     size_t activeComponents,
     std::span<const uint8_t> assignments,
     std::span<const uint8_t> retainedInliers,
-    const cv::Vec3d& pivot,
+    const cv::Vec3f& pivot,
     const FiberAnchorObjectiveConfig& config)
 {
     return evaluatePair(

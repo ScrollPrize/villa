@@ -145,3 +145,16 @@ compact production and expanded public observations. Do not preserve double
 arithmetic merely for historical identity; safely narrow public values, compute
 support/coherence/objective in float, and retain the change only if canonical
 quality and enclosing performance remain acceptable.
+
+Checkpoint 24 removes the remaining historical double-precision representation
+from anchor and fiberlet extraction. Use float32 for observations, configuration
+used by extraction math, component/refinement state, retained anchors,
+diagnostics, fiberlet candidate geometry, path costs, path points, and graph
+geometry. Reference polyline, normal-sampler, and replay APIs may retain their
+existing double representation outside this subsystem, but must narrow once at
+the extraction boundary instead of propagating doubles through it. Timing and
+process-accounting values remain double. Exact numeric identity is not required;
+determinism and comparable extraction/replay quality are the retention gates.
+Three canonical runs retained deterministic artifacts and replay failures while
+improving median wall time by 2.8%, total CPU by 1.7%, and peak RSS by 5.4%
+against checkpoint 23. The end-to-end float representation is retained.

@@ -74,7 +74,7 @@ public:
     }
 
     template <typename Compute>
-    double getOrCompute(int first, int second, Compute&& compute)
+    float getOrCompute(int first, int second, Compute&& compute)
     {
         const size_t slot = layout_.index(first, second);
         if (!computed_[slot]) {
@@ -86,7 +86,7 @@ public:
 
 private:
     FiberAnchorPeakGridLayout layout_;
-    std::vector<double> values_;
+    std::vector<float> values_;
     std::vector<unsigned char> computed_;
 };
 
