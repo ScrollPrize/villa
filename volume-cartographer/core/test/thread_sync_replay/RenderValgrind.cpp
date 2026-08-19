@@ -3,12 +3,10 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
-#include <functional>
 #include <limits>
 #include <numeric>
 #include <optional>
 #include <regex>
-#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -255,97 +253,28 @@ std::vector<double> distributeSlices(const std::vector<EventProfile>& slices, co
     return result;
 }
 
-struct SchedulerDescriptor {
-    double share{0.0};
-    std::vector<double> cumulative_activity;
-};
-
-struct SchedulerDescriptors {
-    std::map<std::int64_t, SchedulerDescriptor> threads;
-    std::size_t total_quanta{0};
-};
-
-SchedulerDescriptors describeScheduler(const SchedulerTrace& scheduler, const std::vector<std::int64_t>& threads, std::size_t bins)
-{
-    if (threads.empty() || bins == 0) {
-        throw std::runtime_error("scheduler attribution requires workers and activity bins");
-    }
-    const std::set<std::int64_t> expected(threads.begin(), threads.end());
-    SchedulerDescriptors result;
-    for (const auto thread : threads) {
-        const auto found = scheduler.full_quanta.find(thread);
-        if (found == scheduler.full_quanta.end() || found->second == 0) {
-            throw std::runtime_error("scheduler trace has no measured work for worker " + std::to_string(thread));
-        }
-        result.threads.emplace(thread, SchedulerDescriptor{.cumulative_activity = std::vector<double>(bins, 0.0)});
-    }
-    for (const auto& [thread, quanta] : scheduler.full_quanta) {
-        if (thread != kMainThread && quanta != 0 && !expected.contains(thread)) {
-            throw std::runtime_error("scheduler trace contains an unmatched active worker " + std::to_string(thread));
-        }
-    }
-
-    std::vector<std::int64_t> sequence;
-    for (const auto thread : scheduler.quantum_threads) {
-        if (expected.contains(thread)) {
-            sequence.push_back(thread);
-        }
-    }
-    result.total_quanta = sequence.size();
-    if (result.total_quanta == 0) {
-        throw std::runtime_error("scheduler trace contains no worker quanta");
-    }
-
-    std::map<std::int64_t, std::size_t> cumulative;
-    std::size_t cursor = 0;
-    for (std::size_t bin = 0; bin < bins; ++bin) {
-        const std::size_t boundary = (bin + 1) * result.total_quanta / bins;
-        while (cursor < boundary) {
-            ++cumulative[sequence[cursor++]];
-        }
-        for (const auto thread : threads) {
-            result.threads.at(thread).cumulative_activity[bin] = static_cast<double>(cumulative[thread]) / static_cast<double>(result.total_quanta);
-        }
-    }
-    for (const auto thread : threads) {
-        const auto counted = cumulative[thread];
-        if (counted != scheduler.full_quanta.at(thread)) {
-            throw std::runtime_error("scheduler trace quantum sequence and totals disagree");
-        }
-        result.threads.at(thread).share = static_cast<double>(counted) / static_cast<double>(result.total_quanta);
-    }
-    return result;
-}
-
-double schedulerDistance(const SchedulerDescriptor& source, const SchedulerDescriptor& target)
-{
-    if (source.cumulative_activity.size() != target.cumulative_activity.size() || source.cumulative_activity.empty()) {
-        throw std::runtime_error("scheduler activity descriptors have incompatible shapes");
-    }
-    double cumulative_distance = 0.0;
-    for (std::size_t index = 0; index < source.cumulative_activity.size(); ++index) {
-        cumulative_distance += std::abs(source.cumulative_activity[index] - target.cumulative_activity[index]);
-    }
-    return std::abs(source.share - target.share) + cumulative_distance / source.cumulative_activity.size();
-}
-
-std::map<std::int64_t, std::vector<double>> mappedWindowCosts(
-    const std::map<std::int64_t, std::int64_t>& source_by_trace, const CallgrindTrace& callgrind, const ThreadAttributionWindows& windows, const EventCostModel& model)
+std::map<std::int64_t, std::vector<double>> directWindowCosts(const CallgrindTrace& callgrind, const ThreadAttributionWindows& windows, const EventCostModel& model)
 {
     std::map<std::int64_t, std::vector<double>> result;
-    for (const auto& [trace_thread, source_thread] : source_by_trace) {
-        const auto found_windows = windows.find(trace_thread);
-        const auto found_slices = callgrind.slices.find(source_thread);
-        const auto found_total = callgrind.totals.find(source_thread);
-        if (found_windows == windows.end() || found_slices == callgrind.slices.end() || found_total == callgrind.totals.end()) {
-            throw std::runtime_error("paired attribution references an unknown thread");
+    for (const auto& [thread, thread_windows] : windows) {
+        const auto found_slices = callgrind.slices.find(thread);
+        const auto found_total = callgrind.totals.find(thread);
+        if (found_slices == callgrind.slices.end() || found_total == callgrind.totals.end()) {
+            result.emplace(thread, std::vector<double>(thread_windows.size(), 0.0));
+            continue;
         }
         std::vector<double> weights;
-        weights.reserve(found_windows->second.size());
-        for (const auto& window : found_windows->second) {
+        weights.reserve(thread_windows.size());
+        for (const auto& window : thread_windows) {
             weights.push_back(window.units);
         }
-        result.emplace(trace_thread, distributeSlices(found_slices->second, found_total->second, model, weights));
+        result.emplace(thread, distributeSlices(found_slices->second, found_total->second, model, weights));
+    }
+    for (const auto& [thread, total] : callgrind.totals) {
+        (void)total;
+        if (!windows.contains(thread)) {
+            throw std::runtime_error("Callgrind thread " + std::to_string(thread) + " has measured cost but no scheduler event");
+        }
     }
     return result;
 }
@@ -426,59 +355,168 @@ CallgrindTrace parsePeriodicCallgrind(const std::filesystem::path& prefix)
     return result;
 }
 
-SchedulerTrace parseMeasuredScheduler(const std::filesystem::path& path)
-{
-    return schedulerFromMeasuredLog(readMeasuredLog(path));
-}
-
-DrdTrace parseMeasuredDrd(const std::filesystem::path& path)
+CallgrindSyncTrace parseMeasuredCallgrindSync(const std::filesystem::path& path)
 {
     const auto measured = readMeasuredLog(path);
     const auto& lines = measured.lines;
     const auto begin = measured.begin;
     const auto end = measured.end;
 
-    const std::regex segment_re(R"(New segment for thread ([0-9]+) with vc \[ (.*) \])");
-    const std::regex value_re(R"((\d+):\s*(\d+))");
-    const std::regex quantum_re(R"(SCHED\[(\d+)\]:\s+releasing lock \(VG_\(scheduler\):timeslice\))");
-    struct SegmentRecord {
-        std::size_t line;
-        std::int64_t thread;
-        std::map<std::int64_t, std::int64_t> clock;
-        std::optional<std::size_t> event;
+    struct FutexCall {
+        std::int64_t thread{0};
+        std::string address;
+        std::uint64_t operation{0};
+        std::size_t start_line{0};
+        std::size_t completion_line{0};
+        bool complete{false};
+        bool success{false};
+        std::uint64_t result{0};
     };
-    std::vector<SegmentRecord> segments;
-    std::map<std::pair<std::int64_t, std::int64_t>, std::size_t> segment_by_clock;
-    for (std::size_t index = 0; index < end; ++index) {
+    const std::regex start_re(R"(SYSCALL\[\d+,(\d+)\]\(202\) sys_futex \(\s*(0x[0-9a-fA-F]+),\s*([0-9]+),\s*([0-9]+).+\)\s*--> )");
+    const std::regex completion_re(R"(SYSCALL\[\d+,(\d+)\]\(202\) \.\.\. \[async\] --> (Success|Failure)\((0x[0-9a-fA-F]+)\))");
+    const std::regex result_re(R"(--> (Success|Failure)\((0x[0-9a-fA-F]+)\))");
+    const std::regex quantum_re(R"(SCHED\[(\d+)\]:\s+releasing lock \(VG_\(scheduler\):timeslice\))");
+    std::vector<FutexCall> calls;
+    std::map<std::int64_t, std::size_t> pending;
+    for (std::size_t index = 0; index < lines.size(); ++index) {
         std::smatch match;
-        if (!std::regex_search(lines[index], match, segment_re)) {
+        if (std::regex_search(lines[index], match, start_re)) {
+            FutexCall call{
+                .thread = std::stoll(match[1].str()),
+                .address = match[2].str(),
+                .operation = std::stoull(match[3].str()),
+                .start_line = index,
+                .completion_line = index,
+            };
+            std::smatch immediate;
+            if (std::regex_search(lines[index], immediate, result_re)) {
+                call.complete = true;
+                call.success = immediate[1].str() == "Success";
+                call.result = std::stoull(immediate[2].str(), nullptr, 0);
+            }
+            const auto call_index = calls.size();
+            calls.push_back(std::move(call));
+            if (!calls.back().complete && !pending.emplace(calls.back().thread, call_index).second) {
+                throw std::runtime_error("Callgrind scheduler trace has overlapping futex syscalls for one thread");
+            }
             continue;
         }
-        SegmentRecord record{.line = index, .thread = std::stoll(match[1].str())};
-        const auto clock_text = match[2].str();
-        for (auto iterator = std::sregex_iterator(clock_text.begin(), clock_text.end(), value_re); iterator != std::sregex_iterator(); ++iterator) {
-            record.clock.emplace(std::stoll((*iterator)[1].str()), std::stoll((*iterator)[2].str()));
+        if (!std::regex_search(lines[index], match, completion_re)) {
+            continue;
         }
-        const auto own = record.clock.find(record.thread);
-        if (own == record.clock.end()) {
-            throw std::runtime_error("DRD segment has no own vector-clock value");
+        const auto thread = std::stoll(match[1].str());
+        const auto found = pending.find(thread);
+        if (found == pending.end()) {
+            continue;
         }
-        const auto record_index = segments.size();
-        if (!segment_by_clock.emplace(std::make_pair(record.thread, own->second), record_index).second) {
-            throw std::runtime_error("duplicate DRD vector-clock segment");
-        }
-        segments.push_back(std::move(record));
+        auto& call = calls[found->second];
+        call.complete = true;
+        call.completion_line = index;
+        call.success = match[2].str() == "Success";
+        call.result = std::stoull(match[3].str(), nullptr, 0);
+        pending.erase(found);
     }
 
-    DrdTrace result;
+    const auto command = [](const FutexCall& call) { return call.operation & 0x7fU; };
+    const auto is_wait = [&](const FutexCall& call) { return command(call) == 0U || command(call) == 9U; };
+    const auto is_wake = [&](const FutexCall& call) { return command(call) == 1U || command(call) == 10U; };
+    const auto wait_blocks = [](const FutexCall& call) {
+        constexpr std::uint64_t eagain = 11;
+        return !call.complete || call.success || call.result != eagain;
+    };
+    const auto in_window = [&](std::size_t line) { return line > begin && line < end; };
+
+    std::vector<std::uint64_t> wake_capacity(calls.size(), 0);
+    for (std::size_t index = 0; index < calls.size(); ++index) {
+        const auto& call = calls[index];
+        if (in_window(call.start_line) && !is_wait(call) && !is_wake(call)) {
+            throw std::runtime_error("Callgrind measured window contains unsupported futex operation " + std::to_string(command(call)));
+        }
+        if (is_wake(call) && call.complete && call.success) {
+            wake_capacity[index] = call.result;
+        }
+    }
+
+    std::vector<std::size_t> successful_waits;
+    for (std::size_t index = 0; index < calls.size(); ++index) {
+        if (is_wait(calls[index]) && calls[index].complete && calls[index].success) {
+            successful_waits.push_back(index);
+        }
+    }
+    std::sort(successful_waits.begin(), successful_waits.end(), [&](std::size_t left, std::size_t right) {
+        return calls[left].completion_line < calls[right].completion_line;
+    });
+
+    std::map<std::size_t, std::size_t> wake_by_wait;
+    std::size_t dropped_pre_window_edges = 0;
+    for (const auto wait_index : successful_waits) {
+        const auto& wait = calls[wait_index];
+        std::optional<std::size_t> selected;
+        for (std::size_t wake_index = 0; wake_index < calls.size(); ++wake_index) {
+            const auto& wake = calls[wake_index];
+            if (!is_wake(wake) || wake.address != wait.address || wake_capacity[wake_index] == 0 || wake.start_line < wait.start_line ||
+                wake.start_line > wait.completion_line) {
+                continue;
+            }
+            selected = wake_index;
+            break;
+        }
+        if (!selected) {
+            if (in_window(wait.completion_line) && wait.start_line <= begin) {
+                ++dropped_pre_window_edges;
+                continue;
+            }
+            if (in_window(wait.completion_line)) {
+                throw std::runtime_error("Callgrind measured futex wait has no matching wake");
+            }
+            continue;
+        }
+        --wake_capacity[*selected];
+        if (in_window(wait.completion_line)) {
+            wake_by_wait.emplace(wait_index, *selected);
+        }
+    }
+
+    enum class ActionKind {
+        FutexStart,
+        FutexResume,
+        WorkQuantum,
+    };
+    struct Action {
+        std::size_t line{0};
+        ActionKind kind{ActionKind::FutexStart};
+        std::int64_t thread{0};
+        std::size_t call{0};
+    };
+    std::vector<Action> actions;
+    for (std::size_t index = 0; index < calls.size(); ++index) {
+        const auto& call = calls[index];
+        if (in_window(call.start_line) && (is_wait(call) || is_wake(call))) {
+            actions.push_back({call.start_line, ActionKind::FutexStart, call.thread, index});
+        }
+        if (is_wait(call) && call.complete && wait_blocks(call) && in_window(call.completion_line)) {
+            actions.push_back({call.completion_line, ActionKind::FutexResume, call.thread, index});
+        }
+    }
+    for (std::size_t index = begin + 1; index < end; ++index) {
+        std::smatch match;
+        if (std::regex_search(lines[index], match, quantum_re)) {
+            actions.push_back({index, ActionKind::WorkQuantum, std::stoll(match[1].str()), 0});
+        }
+    }
+    std::stable_sort(actions.begin(), actions.end(), [](const Action& left, const Action& right) {
+        return std::tie(left.line, left.kind) < std::tie(right.line, right.kind);
+    });
+
+    CallgrindSyncTrace result;
     result.scheduler = schedulerFromMeasuredLog(measured);
-    result.parsed_segment_count = segments.size();
+    result.dropped_pre_window_edges = dropped_pre_window_edges;
     result.begin_line = begin + 1;
     result.end_line = end + 1;
     std::map<std::int64_t, std::size_t> previous;
-    std::map<std::int64_t, std::map<std::int64_t, std::int64_t>> previous_clock;
-    auto append = [&](std::int64_t thread, std::string kind) -> std::size_t {
-        Event event{.thread = thread, .kind = std::move(kind)};
+    std::map<std::size_t, std::size_t> wake_event;
+    const auto append = [&](std::int64_t thread, std::string kind, bool blocked = false) {
+        Event event{.thread = thread, .kind = std::move(kind), .blocked = blocked};
         const auto found = previous.find(thread);
         if (found != previous.end()) {
             event.dependencies.push_back({found->second, "program_order"});
@@ -488,151 +526,75 @@ DrdTrace parseMeasuredDrd(const std::filesystem::path& path)
         previous[thread] = sequence;
         return sequence;
     };
-
-    std::size_t segment_cursor = 0;
-    for (std::size_t index = begin + 1; index < end; ++index) {
-        while (segment_cursor < segments.size() && segments[segment_cursor].line < index) {
-            ++segment_cursor;
+    for (const auto& action : actions) {
+        if (action.kind == ActionKind::WorkQuantum) {
+            append(action.thread, "work_quantum");
+            continue;
         }
-        if (segment_cursor < segments.size() && segments[segment_cursor].line == index) {
-            auto& segment = segments[segment_cursor];
-            const auto sequence = append(segment.thread, "hb_segment");
-            ++result.retained_segment_count;
-            segment.event = sequence;
-            for (const auto& [owner, value] : segment.clock) {
-                if (owner == segment.thread || value <= previous_clock[segment.thread][owner]) {
-                    continue;
+        const auto& call = calls[action.call];
+        if (action.kind == ActionKind::FutexStart) {
+            ++result.parsed_futex_calls;
+            if (is_wait(call)) {
+                const bool blocked = wait_blocks(call);
+                append(call.thread, "futex_wait", blocked);
+                if (blocked) {
+                    ++result.blocking_futex_waits;
                 }
-                const auto predecessor = segment_by_clock.find({owner, value});
-                if (predecessor == segment_by_clock.end() || segments[predecessor->second].line >= index) {
-                    throw std::runtime_error("DRD trace has an unresolved measured-window dependency");
-                }
-                const auto predecessor_event = segments[predecessor->second].event;
-                if (predecessor_event) {
-                    result.events[sequence].dependencies.push_back({*predecessor_event, "drd_happens_before"});
-                    ++result.happens_before_edges;
-                } else {
-                    ++result.dropped_pre_window_edges;
-                }
+            } else {
+                wake_event.emplace(action.call, append(call.thread, "futex_wake"));
             }
-            previous_clock[segment.thread] = segment.clock;
-            ++segment_cursor;
+            continue;
         }
-        std::smatch quantum;
-        if (std::regex_search(lines[index], quantum, quantum_re)) {
-            const auto thread = std::stoll(quantum[1].str());
-            append(thread, "work_quantum");
+
+        const auto sequence = append(call.thread, "futex_resume");
+        const auto matching_wake = wake_by_wait.find(action.call);
+        if (matching_wake == wake_by_wait.end()) {
+            continue;
         }
+        const auto source = wake_event.find(matching_wake->second);
+        if (source == wake_event.end()) {
+            ++result.dropped_pre_window_edges;
+            continue;
+        }
+        result.events[sequence].dependencies.push_back({source->second, "futex_wake"});
+        ++result.futex_happens_before_edges;
     }
     if (result.events.empty()) {
-        throw std::runtime_error("DRD measured window contains no replay events");
+        throw std::runtime_error("Callgrind measured window contains no replay events");
     }
     return result;
 }
 
-PairedReplayResult replayPaired(
-    const CallgrindTrace& callgrind, const SchedulerTrace& callgrind_scheduler, const DrdTrace& drd, const EventCostModel& model, const PairedReplayOptions& options)
+ReplayResult replayCallgrind(const CallgrindTrace& callgrind, const CallgrindSyncTrace& sync, const EventCostModel& model, const CallgrindReplayOptions& options)
 {
-    if (options.scheduler_bins == 0 || !std::isfinite(options.scheduler_quantum_slack) || options.scheduler_quantum_slack < 0.0) {
-        throw std::runtime_error("scheduler assignment settings are invalid");
-    }
-    if (!std::isfinite(options.maximum_makespan_spread) || options.maximum_makespan_spread < 0.0 || options.maximum_makespan_spread >= 1.0) {
-        throw std::runtime_error("maximum makespan spread must be in [0, 1)");
-    }
-    if (options.maximum_mappings == 0) {
-        throw std::runtime_error("maximum mapping count must be positive");
-    }
-    Graph graph(drd.events);
-    const auto windows = graph.attributionWindows(options.residual_fraction);
-    if (callgrind.totals.size() != windows.size() || !callgrind.totals.contains(kMainThread) || !windows.contains(kMainThread)) {
-        throw std::runtime_error("Callgrind and DRD thread counts do not match");
+    std::vector<Event> events = sync.events;
+    std::map<std::int64_t, std::size_t> previous;
+    for (std::size_t sequence = 0; sequence < events.size(); ++sequence) {
+        previous[events[sequence].thread] = sequence;
     }
 
-    std::vector<std::int64_t> source_threads;
+    Graph initial(events);
+    const auto initial_windows = initial.attributionWindows(options.residual_fraction);
     for (const auto& [thread, total] : callgrind.totals) {
         (void)total;
-        if (thread == kMainThread) {
+        const auto found = initial_windows.find(thread);
+        if (found != initial_windows.end() && !found->second.empty()) {
             continue;
         }
-        source_threads.push_back(thread);
-    }
-    std::vector<std::int64_t> trace_threads;
-    for (const auto& [thread, thread_windows] : windows) {
-        (void)thread_windows;
-        if (thread == kMainThread) {
-            continue;
+        Event residual{.thread = thread, .kind = "work_residual"};
+        const auto predecessor = previous.find(thread);
+        if (predecessor != previous.end()) {
+            residual.dependencies.push_back({predecessor->second, "program_order"});
         }
-        trace_threads.push_back(thread);
-    }
-    if (source_threads.size() != trace_threads.size()) {
-        throw std::runtime_error("Callgrind and DRD worker counts do not match");
+        previous[thread] = events.size();
+        events.push_back(std::move(residual));
     }
 
-    const auto source_descriptors = describeScheduler(callgrind_scheduler, source_threads, options.scheduler_bins);
-    const auto trace_descriptors = describeScheduler(drd.scheduler, trace_threads, options.scheduler_bins);
-    const double quantum_tolerance =
-        2.0 * options.scheduler_quantum_slack *
-        (1.0 / static_cast<double>(source_descriptors.total_quanta) + 1.0 / static_cast<double>(trace_descriptors.total_quanta));
-
-    struct Candidate {
-        std::map<std::int64_t, std::int64_t> source_by_trace;
-        double assignment_score{0.0};
-    };
-    std::vector<Candidate> candidates;
-    std::vector<std::int64_t> permutation = source_threads;
-    std::sort(permutation.begin(), permutation.end());
-    do {
-        if (candidates.size() >= options.maximum_mappings) {
-            throw std::runtime_error("worker assignment count exceeds limit");
-        }
-        Candidate candidate{.source_by_trace = {{kMainThread, kMainThread}}};
-        for (std::size_t index = 0; index < trace_threads.size(); ++index) {
-            const auto trace_thread = trace_threads[index];
-            const auto source_thread = permutation[index];
-            candidate.source_by_trace.emplace(trace_thread, source_thread);
-            candidate.assignment_score += schedulerDistance(source_descriptors.threads.at(source_thread), trace_descriptors.threads.at(trace_thread));
-        }
-        candidates.push_back(std::move(candidate));
-    } while (std::next_permutation(permutation.begin(), permutation.end()));
-    if (candidates.empty()) {
-        throw std::runtime_error("no worker assignments were generated");
-    }
-
-    PairedReplayResult result;
-    result.evaluated_mapping_count = candidates.size();
-    result.best_assignment_score = std::min_element(candidates.begin(), candidates.end(), [](const Candidate& left, const Candidate& right) {
-                                       return left.assignment_score < right.assignment_score;
-                                   })->assignment_score;
-    result.assignment_score_tolerance = quantum_tolerance;
-    result.minimum_makespan = std::numeric_limits<double>::infinity();
-    double maximum_makespan = -1.0;
-    const double maximum_assignment_score = result.best_assignment_score + quantum_tolerance;
-    for (const auto& candidate : candidates) {
-        if (candidate.assignment_score > maximum_assignment_score + std::numeric_limits<double>::epsilon() * 16.0) {
-            continue;
-        }
-        ++result.mapping_count;
-        result.maximum_assignment_score = std::max(result.maximum_assignment_score, candidate.assignment_score);
-        const auto costs = mappedWindowCosts(candidate.source_by_trace, callgrind, windows, model);
-        const auto durations = graph.assignWindowCosts(costs, options.residual_fraction, options.split_policy);
-        const auto replay = graph.replayAdjusted(durations, options.replay);
-        result.minimum_makespan = std::min(result.minimum_makespan, replay.modeled_makespan);
-        if (replay.modeled_makespan > maximum_makespan) {
-            maximum_makespan = replay.modeled_makespan;
-            result.conservative = replay;
-            result.selected_source_by_trace_thread = candidate.source_by_trace;
-        }
-    }
-    if (result.mapping_count == 0) {
-        throw std::runtime_error("no scheduler-compatible worker assignment");
-    }
-    result.makespan_relative_spread = (maximum_makespan - result.minimum_makespan) / maximum_makespan;
-    if (result.makespan_relative_spread > options.maximum_makespan_spread) {
-        throw std::runtime_error(
-            "assignment evidence insufficient: scheduler-compatible worker assignments exceed the makespan ambiguity limit: spread=" +
-            std::to_string(result.makespan_relative_spread) + ", limit=" + std::to_string(options.maximum_makespan_spread));
-    }
-    return result;
+    Graph graph(std::move(events));
+    const auto windows = graph.attributionWindows(options.residual_fraction);
+    const auto costs = directWindowCosts(callgrind, windows, model);
+    const auto durations = graph.assignWindowCosts(costs, options.residual_fraction, options.split_policy);
+    return graph.replayAdjusted(durations, options.replay);
 }
 
 }  // namespace vc::thread_sync_replay
