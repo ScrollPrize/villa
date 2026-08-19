@@ -270,7 +270,7 @@ class DevicePatchAtlasTests(unittest.TestCase):
     def test_cpu_fallback_lookup_matches_manual_bilinear(self):
         patches = {'a': self._fake_patch(5, 7, 0), 'b': self._fake_patch(9, 4, 1)}
         atlas = self.PatchAtlas(patches, device='cpu')
-        self.assertEqual(atlas.zyxs_flat.device.type, 'cpu')
+        self.assertIsNone(atlas.zyxs_flat)
         self.assertEqual(atlas.offsets.device.type, 'cpu')
 
         idx = torch.tensor([0, 1, 1, 0])
@@ -281,12 +281,16 @@ class DevicePatchAtlasTests(unittest.TestCase):
             for key, ij in zip(['a', 'b', 'b', 'a'], ijs)
         ])
         torch.testing.assert_close(out, expected)
+        self.assertIsNone(atlas.zyxs_flat)
+        atlas.materialize()
+        self.assertEqual(atlas.zyxs_flat.device.type, 'cpu')
+        torch.testing.assert_close(atlas.lookup(idx, ijs), expected)
 
     def test_cpu_fallback_append(self):
         atlas = self.PatchAtlas({'a': self._fake_patch(5, 5, 3)}, device='cpu')
         extra = self._fake_patch(4, 8, 4)
         atlas.append_patches({'b': extra})
-        self.assertEqual(atlas.zyxs_flat.device.type, 'cpu')
+        self.assertIsNone(atlas.zyxs_flat)
         self.assertEqual(atlas.id_to_idx['b'], 1)
         out = atlas.lookup(torch.tensor([1]), torch.tensor([[1.5, 2.5]]))
         torch.testing.assert_close(out[0], self._manual_bilinear(extra.zyxs, 1.5, 2.5))

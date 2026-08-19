@@ -58,6 +58,70 @@ class PatchSamplingBindingTests(unittest.TestCase):
         self.assertLess(result[..., 0].max(), 9)
         self.assertLess(result[..., 1].max(), 11)
 
+    def test_sampled_node_ordinals_match_row_major_valid_cells(self):
+        second = np.zeros((4, 6), dtype=bool)
+        second[1:3, 2:5] = True
+        atlas = spiral_sampling.PatchSamplingAtlas([self.mask, second])
+        sampled = atlas.sample_patch_points(
+            np.array([1], dtype=np.int64), 9, 71)
+        ijs = np.asarray(sampled['ijs'])[0]
+        ordinals = np.asarray(sampled['node_ordinals'])[0]
+        expected_local = np.searchsorted(
+            np.flatnonzero(second),
+            np.ravel_multi_index(
+                tuple(np.floor(ijs).astype(np.int64).T), second.shape))
+        np.testing.assert_array_equal(
+            ordinals, int(self.mask.sum()) + expected_local)
+        # Padding retains both the first geometry and its already-resolved ID.
+        np.testing.assert_array_equal(ordinals[6:], np.repeat(ordinals[:1], 3))
+
+    def test_compact_topology_has_bounded_persistent_bytes(self):
+        rectangle = np.ones((101, 103), dtype=bool)
+        ragged = rectangle.copy()
+        ragged[20:70, 30:60] = False
+        atlas = spiral_sampling.PatchSamplingAtlas([rectangle, ragged])
+        stats = dict(atlas.memory_stats())
+        # Rectangles need one uint32 linear cell index. Ragged patches add
+        # three uint32 tree arrays. Per-patch offsets are the only extra data.
+        self.assertLessEqual(
+            int(stats['persistent_bytes']),
+            16 * int(stats['num_valid_cells']) + 8 * (len(atlas) + 1))
+
+    def test_ragged_tree_and_streamed_neighbors_match_legacy_graph(self):
+        import scipy.sparse
+
+        mask = np.ones((8, 10), dtype=bool)
+        mask[0, 7:] = False
+        mask[2:5, 4] = False
+        mask[6:, :2] = False
+        node_map = np.full(mask.shape, -1, dtype=np.int64)
+        node_map[mask] = np.arange(mask.sum())
+        edges = []
+        for di, dj in ((0, 1), (1, -1), (1, 0), (1, 1)):
+            a = node_map[:mask.shape[0] - di,
+                         max(0, -dj):mask.shape[1] - max(0, dj)]
+            b = node_map[di:,
+                         max(0, dj):mask.shape[1] - max(0, -dj)]
+            valid = (a >= 0) & (b >= 0)
+            if valid.any():
+                edges.append(np.stack([a[valid], b[valid]], axis=1))
+        expected_edges = np.concatenate(edges)
+        graph = scipy.sparse.csr_matrix(
+            (np.ones(len(expected_edges), dtype=np.int8),
+             (expected_edges[:, 0], expected_edges[:, 1])),
+            shape=(int(mask.sum()),) * 2)
+        expected_order = scipy.sparse.csgraph.depth_first_order(
+            graph, 0, directed=False, return_predecessors=False)
+
+        atlas = spiral_sampling.PatchSamplingAtlas([mask])
+        tree = atlas.tree_chunk(0, int(mask.sum()))
+        np.testing.assert_array_equal(tree['node_ordinals'], expected_order)
+        streamed = atlas.neighbor_chunk(0, int(mask.sum()) * 4)
+        actual_edges = np.asarray(streamed['node_pairs'])
+        np.testing.assert_array_equal(
+            actual_edges[np.lexsort((actual_edges[:, 1], actual_edges[:, 0]))],
+            expected_edges[np.lexsort((expected_edges[:, 1], expected_edges[:, 0]))])
+
 
 @unittest.skipUnless(spiral_sampling is not None, "vc.spiral_sampling is not built")
 class DtTargetBindingTests(unittest.TestCase):

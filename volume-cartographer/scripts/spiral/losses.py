@@ -173,6 +173,8 @@ def _sample_patch_points(patch_indices, cap, rng, patch_atlas):
     return (
         np.asarray(sampled['ijs'], dtype=np.float32),
         np.asarray(sampled['counts'], dtype=np.int64),
+        np.asarray(sampled['node_ordinals'], dtype=np.int64)
+        if 'node_ordinals' in sampled else None,
     )
 
 
@@ -365,13 +367,18 @@ def _sample_patch_batch(key, patches, sampling_probabilities, num_to_sample,
     def build(rng):
         patch_indices = rng.choice(len(patches), num_to_sample,
                                    p=sampling_probabilities, replace=True)
-        ijs_np, counts_np = _sample_patch_points(
+        ijs_np, counts_np, node_ordinals_np = _sample_patch_points(
             patch_indices, point_cap, rng, patch_atlas)
         row_indices = np.broadcast_to(
             np.asarray(patch_indices, dtype=np.int64)[:, None],
             (num_to_sample, point_cap),
         )
-        node_ids_np = patch_atlas.theta_node_ids(row_indices, ijs_np)
+        node_ids_np = (
+            patch_atlas.theta_node_ids_from_ordinals(node_ordinals_np)
+            if (node_ordinals_np is not None
+                and hasattr(patch_atlas, 'theta_node_ids_from_ordinals'))
+            else patch_atlas.theta_node_ids(row_indices, ijs_np)
+        )
         ijs_cpu = torch.from_numpy(ijs_np)
         idx_cpu = torch.from_numpy(
             np.ascontiguousarray(patch_indices, dtype=np.int64))
@@ -759,11 +766,16 @@ def _valid_patch_annotation(patches_dict, patch_atlas, pid, i, j):
 def _sample_requested_patch_rows(patch_indices, point_cap, patch_atlas):
     """Sample already-validated annotation patch rows without replacement."""
     patch_indices = np.asarray(patch_indices, dtype=np.int64)
-    ijs_np, counts_np = _sample_patch_points(
+    ijs_np, counts_np, node_ordinals_np = _sample_patch_points(
         patch_indices, point_cap, prefetch.LegacyNumpyRandom, patch_atlas)
     row_patch_indices = np.broadcast_to(
         patch_indices[:, None], (len(patch_indices), point_cap))
-    node_ids_np = patch_atlas.theta_node_ids(row_patch_indices, ijs_np)
+    node_ids_np = (
+        patch_atlas.theta_node_ids_from_ordinals(node_ordinals_np)
+        if (node_ordinals_np is not None
+            and hasattr(patch_atlas, 'theta_node_ids_from_ordinals'))
+        else patch_atlas.theta_node_ids(row_patch_indices, ijs_np)
+    )
     ijs = torch.from_numpy(ijs_np).to(patch_atlas.device)
     patch_indices_t = torch.from_numpy(patch_indices).to(patch_atlas.device)
     zyxs = patch_atlas.lookup(

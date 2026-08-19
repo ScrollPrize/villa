@@ -36,6 +36,21 @@ class _UnwrapTree:
     subtree_ends: torch.Tensor
 
 
+@dataclass(slots=True)
+class _PotentialSource:
+    """Compact tree and neighbour topology owned by an external atlas.
+
+    The callbacks return source-local node ordinals.  Keeping the compact
+    representation in the native sampling atlas avoids materialising an
+    int64 node map, tree and eight-neighbour edge graph for every patch quad.
+    """
+
+    start: int
+    count: int
+    get_tree_chunk: Callable[[int, int], tuple[np.ndarray, np.ndarray, np.ndarray]]
+    get_neighbor_chunk: Callable[[int, int], tuple[int, np.ndarray]]
+
+
 class ThetaCrossingMap:
     """One deduplicated, periodically refreshed crossing cache.
 
@@ -58,6 +73,7 @@ class ThetaCrossingMap:
         self._sources: list[_NodeSource] = []
         self._edge_chunks: list[torch.Tensor] = []
         self._unwrap_trees: list[_UnwrapTree] = []
+        self._potential_sources: list[_PotentialSource] = []
         self.num_nodes = 0
         self.edge_nodes = torch.empty(
             (0, 2), dtype=torch.int64, device=self.topology_device)
@@ -120,6 +136,28 @@ class ThetaCrossingMap:
             self._topology_dirty = True
             self.last_refresh_iteration = None
             self._fresh_without_iteration = False
+
+    def register_potential_source(
+        self, start, count, get_tree_chunk, get_neighbor_chunk,
+    ):
+        """Register compact patch topology without adding explicit edges.
+
+        ``get_tree_chunk(lo, hi)`` returns preorder node ordinals, parent node
+        ordinals and subtree exit positions for ``[lo, hi)``.  The neighbour
+        callback consumes a four-neighbour-slot cursor and returns the next
+        cursor plus the valid source-local node pairs encountered.  Both APIs
+        are deliberately chunked so refresh and consistency checks have a
+        fixed-size host transient.
+        """
+        start = int(start)
+        count = int(count)
+        if count < 0 or start < 0 or start + count > self.num_nodes:
+            raise ValueError('compact potential source is outside registered nodes')
+        self._potential_sources.append(_PotentialSource(
+            start, count, get_tree_chunk, get_neighbor_chunk))
+        self._topology_dirty = True
+        self.last_refresh_iteration = None
+        self._fresh_without_iteration = False
 
     def register_unwrap_tree(self, node_ids, parent_positions):
         """Register one connected node tree in depth-first preorder.
@@ -416,12 +454,55 @@ class ThetaCrossingMap:
                     exits = self._potential_exit_positions[lo:hi].to(self.device)
                     events.index_add_(0, entries, steps)
                     events.index_add_(0, exits, -steps)
-                ordered_potential = events.cumsum(
-                    dim=0, dtype=torch.int32)[:-1]
+                torch.cumsum(events, dim=0, dtype=torch.int32, out=events)
+                ordered_potential = events[:-1]
                 for lo in range(0, num_potential_nodes, self.chunk_size):
                     hi = min(num_potential_nodes, lo + self.chunk_size)
                     node_ids = self._potential_node_ids[lo:hi].to(self.device)
                     node_potential[node_ids] = ordered_potential[lo:hi]
+
+            # Patch atlases keep their trees in compact native storage.  The
+            # callback expands only one bounded chunk of IDs at a time; branch
+            # steps are computed straight from theta, so patch edges never
+            # enter the explicit PCL/fiber edge table above.
+            for source in self._potential_sources:
+                if source.count == 0:
+                    continue
+                events = torch.zeros(
+                    source.count + 1, dtype=torch.int32, device=self.device)
+                for lo in range(0, source.count, self.chunk_size):
+                    hi = min(source.count, lo + self.chunk_size)
+                    nodes_np, parents_np, exits_np = source.get_tree_chunk(lo, hi)
+                    nodes = torch.as_tensor(
+                        nodes_np, dtype=torch.int64, device=self.device)
+                    parents = torch.as_tensor(
+                        parents_np, dtype=torch.int64, device=self.device)
+                    exits = torch.as_tensor(
+                        exits_np, dtype=torch.int64, device=self.device)
+                    expected = hi - lo
+                    if (nodes.numel() != expected
+                            or parents.numel() != expected
+                            or exits.numel() != expected):
+                        raise RuntimeError(
+                            'compact theta tree provider returned the wrong chunk size')
+                    delta = (
+                        theta[source.start + nodes]
+                        - theta[source.start + parents])
+                    steps = (
+                        (delta > np.pi).to(torch.int32)
+                        - (delta < -np.pi).to(torch.int32))
+                    entries = torch.arange(
+                        lo, hi, dtype=torch.int64, device=self.device)
+                    events.index_add_(0, entries, steps)
+                    events.index_add_(0, exits, -steps)
+                torch.cumsum(events, dim=0, dtype=torch.int32, out=events)
+                ordered_potential = events[:-1]
+                for lo in range(0, source.count, self.chunk_size):
+                    hi = min(source.count, lo + self.chunk_size)
+                    nodes_np, _, _ = source.get_tree_chunk(lo, hi)
+                    nodes = torch.as_tensor(
+                        nodes_np, dtype=torch.int64, device=self.device)
+                    node_potential[source.start + nodes] = ordered_potential[lo:hi]
             self.node_winding_potential = node_potential
         self.node_theta = theta
 
@@ -501,14 +582,40 @@ class ThetaCrossingMap:
             (), dtype=torch.int64, device=self.device)
         max_abs_residual_total = torch.zeros(
             (), dtype=torch.int32, device=self.device)
-        for lo in range(0, self.edge_nodes.shape[0], self.chunk_size):
-            hi = min(self.edge_nodes.shape[0], lo + self.chunk_size)
-            nodes = self.edge_nodes[lo:hi].to(self.device)
+
+        def edge_chunks():
+            for lo in range(0, self.edge_nodes.shape[0], self.chunk_size):
+                hi = min(self.edge_nodes.shape[0], lo + self.chunk_size)
+                yield (self.edge_nodes[lo:hi].to(self.device),
+                       self.crossings[lo:hi].to(torch.int32))
+            for source in self._potential_sources:
+                cursor = 0
+                end = source.count * 4
+                while cursor < end:
+                    next_cursor, pairs_np = source.get_neighbor_chunk(
+                        cursor, self.chunk_size)
+                    next_cursor = int(next_cursor)
+                    if next_cursor <= cursor or next_cursor > end:
+                        raise RuntimeError(
+                            'compact theta neighbour provider made invalid progress')
+                    cursor = next_cursor
+                    pairs = torch.as_tensor(
+                        pairs_np, dtype=torch.int64, device=self.device).reshape(-1, 2)
+                    if not pairs.numel():
+                        continue
+                    nodes = pairs + source.start
+                    delta = self.node_theta[nodes[:, 1]] - self.node_theta[nodes[:, 0]]
+                    crossings = (
+                        (delta > np.pi).to(torch.int32)
+                        - (delta < -np.pi).to(torch.int32))
+                    yield nodes, crossings
+
+        for nodes, crossings in edge_chunks():
             potentials = self.node_winding_potential[nodes]
             valid = (potentials != self._unset_potential).all(dim=1)
             residual = (
                 potentials[:, 1] - potentials[:, 0]
-                - self.crossings[lo:hi].to(torch.int32))
+                - crossings)
             bad = valid & (residual != 0)
             checked_total += valid.sum()
             inconsistent_total += bad.sum()
@@ -530,14 +637,12 @@ class ThetaCrossingMap:
             # Attribution is intentionally a second pass.  The common clean
             # case above performs only three final device synchronisations,
             # rather than one for every streamed edge chunk.
-            for lo in range(0, self.edge_nodes.shape[0], self.chunk_size):
-                hi = min(self.edge_nodes.shape[0], lo + self.chunk_size)
-                nodes = self.edge_nodes[lo:hi].to(self.device)
+            for nodes, crossings in edge_chunks():
                 potentials = self.node_winding_potential[nodes]
                 valid = (potentials != self._unset_potential).all(dim=1)
                 residual = (
                     potentials[:, 1] - potentials[:, 0]
-                    - self.crossings[lo:hi].to(torch.int32))
+                    - crossings)
                 bad = valid & (residual != 0)
                 if bool(bad.any()):
                     inconsistent_node_chunks.append(nodes[bad].cpu())
