@@ -211,7 +211,9 @@ def build_serpentine_quad_path(valid_quad_mask):
     return np.ascontiguousarray(np.concatenate(rows, axis=0))
 
 
-def _sample_dijkstra_strips_at_ij(patch, i_q, j_q, num_points):
+def _sample_dijkstra_strips_at_ij(
+    patch, patch_idx, patch_atlas, i_q, j_q, num_points,
+):
     # 'dijkstra'-mode replacement for _sample_l_shapes_at_ij: 4 geodesic strips from the
     # annotated cell, one per cardinal cone; None while the anchor's pools are still being
     # built in the background. Caller guarantees valid_quad[i_q, j_q].
@@ -224,8 +226,10 @@ def _sample_dijkstra_strips_at_ij(patch, i_q, j_q, num_points):
         ijs, positions = _sample_points_along_path(
             path, num_points, return_positions=True)
         result.append(PatchWalk(
-            ijs=ijs, path=path.astype(np.int64), pick_positions=positions,
-            waypoints=path[[0, len(path) // 2, -1]].astype(np.int64)))
+            ijs=ijs,
+            walk=_patch_sampled_walk(
+                patch_atlas, patch_idx, path, positions),
+        ))
     return result
 
 def _sample_strip_ijs(line_valid, seed, fixed_coord, axis, num_points):
@@ -317,19 +321,17 @@ def _masked_all_pairs_l1(p1, p2, mask1, mask2, expected_diff):
 class SampledWalk:
     """One topology-node walk and the sparse picks drawn from it."""
 
-    row: int
-    path: np.ndarray
+    node_ids: np.ndarray
     pick_positions: np.ndarray
+    connect_fractional_picks: bool
 
 
 @dataclass(slots=True)
 class PatchWalk:
-    """Fractional patch picks plus their dense quad-node path."""
+    """Fractional patch picks accompanying a normalized topology walk."""
 
     ijs: np.ndarray
-    path: np.ndarray
-    pick_positions: np.ndarray
-    waypoints: np.ndarray
+    walk: SampledWalk
 
 
 @dataclass(slots=True)
@@ -340,50 +342,58 @@ class PackedWalks:
     directions: torch.Tensor
     edge_valid: torch.Tensor
     pick_positions: torch.Tensor
-    pick_node_ids: torch.Tensor
-    local_correction_mask: torch.Tensor
+    correction_node_ids: torch.Tensor
 
 
-def _add_walk(walks, row, path_ij, positions):
-    # Quad centres: floor(ij) lands on the path's own valid quads.
-    walk_ijs = path_ij.astype(np.float32) + 0.5
-    walks.append(SampledWalk(row, walk_ijs, positions))
+def _patch_sampled_walk(patch_atlas, patch_idx, path_ij, positions):
+    """Resolve one patch-local dense path to the common global-node form."""
+    path_ij = np.asarray(path_ij)
+    patch_indices = np.full(path_ij.shape[0], patch_idx, dtype=np.int64)
+    node_ids = patch_atlas.theta_node_ids(patch_indices, path_ij)
+    return SampledWalk(
+        node_ids=np.ascontiguousarray(node_ids, dtype=np.int64),
+        pick_positions=np.ascontiguousarray(positions, dtype=np.int64),
+        connect_fractional_picks=True,
+    )
 
 
-def _reconstruct_straight_walks(ijs_np, skip):
+def _reconstruct_straight_walks(ijs_np, patch_indices, patch_atlas, walks):
     # Straight-mode strips (python or native sampler) confine their picks to one
     # contiguous valid run of a single grid line, so the node walk can be
     # rebuilt from the picks alone: the fixed coordinate is shared by every
     # pick, and every integer cell between the extreme picks' floor cells lies
-    # in the same run. `skip` holds flattened track rows already covered by
-    # explicitly threaded paths such as serpentine 2D samples.
-    walks = []
+    # in the same run. Rows already populated by an explicitly threaded path
+    # (such as a serpentine 2D sample) are left untouched.
     _, N, P, _ = ijs_np.shape
     for slot in range(2):
         fixed_axis, var_axis = slot, 1 - slot
         for n in range(N):
             row = slot * N + n
-            if row in skip:
+            if walks[row] is not None:
                 continue
             var = ijs_np[slot, n, :, var_axis]
             var_floor = np.floor(var).astype(np.int64)
             lo = var_floor.min()
             walk_len = int(var_floor.max() - lo + 1)
-            walk_ijs = np.empty([walk_len, 2], dtype=np.float32)
-            walk_ijs[:, var_axis] = lo + np.arange(walk_len, dtype=np.float32) + 0.5
-            walk_ijs[:, fixed_axis] = ijs_np[slot, n, :, fixed_axis].mean()
-            walks.append(SampledWalk(row, walk_ijs, var_floor - lo))
+            path_ij = np.empty([walk_len, 2], dtype=np.int64)
+            path_ij[:, var_axis] = lo + np.arange(walk_len, dtype=np.int64)
+            path_ij[:, fixed_axis] = int(np.floor(
+                ijs_np[slot, n, 0, fixed_axis]))
+            walks[row] = _patch_sampled_walk(
+                patch_atlas, patch_indices[n], path_ij, var_floor - lo)
     return walks
 
 
-def _build_patch_ijs(patches, patch_indices, num_points_per_direction, rng, cfg):
+def _build_patch_ijs(
+    patches, patch_indices, num_points_per_direction, rng, cfg, patch_atlas,
+):
     # CPU part of the patch-strip sampler: for each patch, one row strip and
     # one column strip of fractional ijs. Pure numpy + `rng` so it can run on
     # the prefetch worker for the next step while the GPU works on this one.
     # Also returns the complete topology path and pick positions for every
     # path-sampled strip; straight paths are reconstructed by the caller.
     N = len(patch_indices)
-    walks = []
+    walks = [None] * (2 * N)
 
     use_dijkstra_strips = cfg['patch_strip_sampling'] == 'dijkstra'
     if use_dijkstra_strips:
@@ -418,8 +428,10 @@ def _build_patch_ijs(patches, patch_indices, num_points_per_direction, rng, cfg)
                 path_2d, P, rng, return_positions=True)
             vertical_ijs_by_patch[n], positions_v = _sample_points_along_path(
                 path_2d, P, rng, return_positions=True)
-            _add_walk(walks, n, path_2d, positions_h)
-            _add_walk(walks, N + n, path_2d, positions_v)
+            walks[n] = _patch_sampled_walk(
+                patch_atlas, patch_idx, path_2d, positions_h)
+            walks[N + n] = _patch_sampled_walk(
+                patch_atlas, patch_idx, path_2d, positions_v)
             continue
 
         if use_dijkstra_strips:
@@ -434,8 +446,10 @@ def _build_patch_ijs(patches, patch_indices, num_points_per_direction, rng, cfg)
                 path_a, P, rng, return_positions=True)
             vertical_ijs_by_patch[n], positions_b = _sample_points_along_path(
                 path_b, P, rng, return_positions=True)
-            _add_walk(walks, n, path_a, positions_a)
-            _add_walk(walks, N + n, path_b, positions_b)
+            walks[n] = _patch_sampled_walk(
+                patch_atlas, patch_idx, path_a, positions_a)
+            walks[N + n] = _patch_sampled_walk(
+                patch_atlas, patch_idx, path_b, positions_b)
             continue
 
         # Horizontal: pick a row uniformly from rows-with-valid-quads, then pick a run
@@ -476,74 +490,67 @@ def _build_patch_ijs(patches, patch_indices, num_points_per_direction, rng, cfg)
     return np.stack([horizontal_ijs_by_patch, vertical_ijs_by_patch], axis=0), walks  # (2, N, P, 2)
 
 
-def _pack_walks(walks, resolve_node_paths, crossing_map, *, local_correction):
-    """Resolve ragged node walks to padded edge IDs and sparse pick metadata."""
+def _pack_walks(walks, crossing_map):
+    """Pack ordered normalized walks on the theta-map device."""
     if not walks:
         return None
-    walks = sorted(walks, key=lambda walk: walk.row)
-    if [walk.row for walk in walks] != list(range(len(walks))):
-        raise RuntimeError('packed sampled walks must contain every row exactly once')
     num_walks = len(walks)
-    num_points = walks[0].pick_positions.shape[0]
-    max_walk_len = max(walk.path.shape[0] for walk in walks)
-    path_shape = (num_walks, max_walk_len, *walks[0].path.shape[1:])
-    paths_np = np.empty(path_shape, dtype=walks[0].path.dtype)
-    positions_np = np.empty([num_walks, num_points], dtype=np.int64)
-    valid_np = np.zeros([num_walks, max(0, max_walk_len - 1)], dtype=bool)
+    device = crossing_map.device
+    num_points = np.asarray(walks[0].pick_positions).size
+    max_walk_len = 0
+    normalized = []
     for k, walk in enumerate(walks):
-        walk_len = walk.path.shape[0]
-        paths_np[k, :walk_len] = walk.path
-        paths_np[k, walk_len:] = walk.path[-1]
-        positions_np[k] = walk.pick_positions
-        valid_np[k, :max(0, walk_len - 1)] = True
-    node_ids = resolve_node_paths(paths_np)
-    pick_nodes = np.take_along_axis(node_ids, positions_np, axis=1)
-    edge_ids = np.zeros(valid_np.shape, dtype=np.int64)
-    directions = np.ones(valid_np.shape, dtype=np.int8)
-    if valid_np.any():
-        pairs = np.stack([node_ids[:, :-1][valid_np], node_ids[:, 1:][valid_np]], axis=-1)
-        resolved, resolved_dir = crossing_map.resolve_edges(pairs)
-        edge_ids[valid_np] = resolved.cpu().numpy()
-        directions[valid_np] = resolved_dir.cpu().numpy()
+        node_ids = np.asarray(walk.node_ids, dtype=np.int64)
+        positions = np.asarray(walk.pick_positions, dtype=np.int64)
+        if node_ids.ndim != 1 or node_ids.size == 0:
+            raise ValueError(f'sampled walk {k} must contain a nonempty 1-D node path')
+        if positions.ndim != 1 or positions.size != num_points:
+            raise ValueError('sampled walks must have equal-length 1-D pick positions')
+        if positions.size and (
+            (positions < 0).any() or (positions >= node_ids.size).any()
+        ):
+            raise ValueError(f'sampled walk {k} contains an out-of-range pick position')
+        if (node_ids < 0).any() or (node_ids >= crossing_map.num_nodes).any():
+            raise ValueError(f'sampled walk {k} contains an unregistered node id')
+        normalized.append((node_ids, positions))
+        max_walk_len = max(max_walk_len, node_ids.size)
+
+    node_ids_np = np.empty((num_walks, max_walk_len), dtype=np.int64)
+    pick_positions_np = np.empty((num_walks, num_points), dtype=np.int64)
+    edge_valid_np = np.zeros((num_walks, max_walk_len - 1), dtype=bool)
+    correction_node_ids_np = np.full(
+        (num_walks, num_points), -1, dtype=np.int64)
+    for k, (walk, (walk_nodes, positions)) in enumerate(zip(walks, normalized)):
+        walk_len = walk_nodes.size
+        node_ids_np[k, :walk_len] = walk_nodes
+        node_ids_np[k, walk_len:] = walk_nodes[-1]
+        pick_positions_np[k] = positions
+        edge_valid_np[k, :walk_len - 1] = True
+        if walk.connect_fractional_picks:
+            correction_node_ids_np[k] = walk_nodes[positions]
+
+    node_ids = torch.as_tensor(node_ids_np, dtype=torch.int64, device=device)
+    pick_positions = torch.as_tensor(
+        pick_positions_np, dtype=torch.int64, device=device)
+    edge_valid = torch.as_tensor(
+        edge_valid_np, dtype=torch.bool, device=device)
+    correction_node_ids = torch.as_tensor(
+        correction_node_ids_np, dtype=torch.int64, device=device)
+
+    edge_ids = torch.zeros_like(edge_valid, dtype=torch.int64)
+    directions = torch.ones_like(edge_valid, dtype=torch.int8)
+    if max_walk_len > 1:
+        pairs = torch.stack([node_ids[:, :-1], node_ids[:, 1:]], dim=-1)
+        resolved, resolved_dir = crossing_map.resolve_edges(pairs[edge_valid])
+        edge_ids[edge_valid] = resolved
+        directions[edge_valid] = resolved_dir
     return PackedWalks(
-        edge_ids=torch.from_numpy(edge_ids),
-        directions=torch.from_numpy(directions),
-        edge_valid=torch.from_numpy(valid_np),
-        pick_positions=torch.from_numpy(positions_np),
-        pick_node_ids=torch.from_numpy(pick_nodes),
-        local_correction_mask=torch.full(
-            (num_walks, num_points), bool(local_correction), dtype=torch.bool),
+        edge_ids=edge_ids,
+        directions=directions,
+        edge_valid=edge_valid,
+        pick_positions=pick_positions,
+        correction_node_ids=correction_node_ids,
     )
-
-
-def _pack_patch_walks(walks, patch_indices, patch_atlas, crossing_map):
-    num_patch_rows = len(patch_indices)
-
-    def resolve_paths(paths_np):
-        walk_patch_indices = np.asarray(patch_indices)[
-            np.arange(paths_np.shape[0]) % num_patch_rows]
-        idx_np = np.broadcast_to(walk_patch_indices[:, None], paths_np.shape[:2])
-        return patch_atlas.theta_node_ids(idx_np, paths_np)
-
-    return _pack_walks(
-        walks, resolve_paths, crossing_map, local_correction=True)
-
-
-def _pack_l_shape_walks(flat_walks, patch_indices, patch_atlas, crossing_map):
-    walks = [
-        SampledWalk(k, walk.path.astype(np.float32) + 0.5,
-                    walk.pick_positions)
-        for k, walk in enumerate(flat_walks)
-    ]
-
-    def resolve_paths(paths_np):
-        idx = np.broadcast_to(
-            np.asarray(patch_indices, dtype=np.int64)[:, None],
-            paths_np.shape[:2])
-        return patch_atlas.theta_node_ids(idx, paths_np)
-
-    return _pack_walks(
-        walks, resolve_paths, crossing_map, local_correction=True)
 
 
 def _sample_patch_batch(key, patches, sampling_probabilities, num_to_sample,
@@ -574,10 +581,11 @@ def _sample_patch_batch(key, patches, sampling_probabilities, num_to_sample,
             # patches (see cfg['patch_2d_sampling_max_area']) are overwritten
             # with serpentine whole-patch samples.
             walks = [
-                SampledWalk(
-                    row=row,
-                    path=path_ijs[path_offsets[row]:path_offsets[row + 1]],
-                    pick_positions=native_positions.reshape(
+                _patch_sampled_walk(
+                    patch_atlas,
+                    patch_indices[row % num_to_sample],
+                    path_ijs[path_offsets[row]:path_offsets[row + 1]],
+                    native_positions.reshape(
                         2 * num_to_sample, num_points_per_direction)[row],
                 )
                 for row in range(2 * num_to_sample)
@@ -598,20 +606,22 @@ def _sample_patch_batch(key, patches, sampling_probabilities, num_to_sample,
                     ijs_np[1, n], positions_v = _sample_points_along_path(
                         path_2d, num_points_per_direction, rng,
                         return_positions=True)
-                    _add_walk(walks, n, path_2d, positions_h)
-                    _add_walk(walks, num_to_sample + n, path_2d, positions_v)
-                walks = [walk for walk in walks if walk is not None]
+                    walks[n] = _patch_sampled_walk(
+                        patch_atlas, patch_indices[n], path_2d, positions_h)
+                    walks[num_to_sample + n] = _patch_sampled_walk(
+                        patch_atlas, patch_indices[n], path_2d, positions_v)
         else:
             ijs_np, walks = _build_patch_ijs(
-                patches, patch_indices, num_points_per_direction, rng, cfg)
+                patches, patch_indices, num_points_per_direction, rng, cfg,
+                patch_atlas)
         if cfg['patch_strip_sampling'] != 'dijkstra':
             # Straight strips (python or native sampler alike) are rebuilt
             # from the picks; path-sampled strips are already threaded above.
-            walks.extend(_reconstruct_straight_walks(
-                ijs_np,
-                {walk.row for walk in walks}))
-        packed_walks = _pack_patch_walks(
-            walks, patch_indices, patch_atlas, crossing_map)
+            walks = _reconstruct_straight_walks(
+                ijs_np, patch_indices, patch_atlas, walks)
+        if any(walk is None for walk in walks):
+            raise RuntimeError('patch sampler did not produce every walk row')
+        packed_walks = _pack_walks(walks, crossing_map)
         ijs_cpu = torch.from_numpy(ijs_np)
         idx_cpu = torch.from_numpy(
             np.ascontiguousarray(patch_indices, dtype=np.int64))
@@ -636,14 +646,9 @@ def _unwrap_sampled_tracks(
     crossing_map, dr_per_winding, theta, shifted_radii, packed_walks,
 ):
     crossing_adjustments = crossing_map.adjustments(
-        packed_walks.edge_ids,
-        packed_walks.directions,
-        packed_walks.pick_positions,
-        packed_walks.pick_node_ids,
+        packed_walks,
         theta.reshape(-1, theta.shape[-1]),
-        packed_walks.local_correction_mask,
         dr_per_winding,
-        packed_walks.edge_valid,
     )
     crossing_adjustments = crossing_adjustments.reshape(theta.shape)
     return shifted_radii + crossing_adjustments, crossing_adjustments
@@ -945,7 +950,10 @@ def get_unverified_patch_losses(slice_to_spiral_transform, dr_per_winding, num_p
 
 
 
-def _sample_single_l_shape(valid_quad, i_q, j_q, leg1_axis, leg1_dir, leg2_dir, num_points):
+def _sample_single_l_shape(
+    valid_quad, patch_idx, patch_atlas, i_q, j_q,
+    leg1_axis, leg1_dir, leg2_dir, num_points,
+):
     # Sample a single L-shape on `valid_quad` starting at (i_q, j_q). Leg 1 walks along
     # `leg1_axis` (0 -> varying j, 1 -> varying i) in direction `leg1_dir` (+1 or -1) to a
     # uniformly random turn point inside the contiguous valid run. Leg 2 walks from the
@@ -1029,14 +1037,15 @@ def _sample_single_l_shape(valid_quad, i_q, j_q, leg1_axis, leg1_dir, leg2_dir, 
         path[~dense_leg1, 1] = j_turn + leg2_dir * (dense_steps[~dense_leg1] - turn_step)
     return PatchWalk(
         ijs=ijs,
-        path=path,
-        pick_positions=steps.astype(np.int64),
-        waypoints=path[[0, turn_step, total_steps]],
+        walk=_patch_sampled_walk(
+            patch_atlas, patch_idx, path, steps.astype(np.int64)),
     )
 
 
 
-def _sample_l_shapes_at_ij(patch, i, j, num_points, cfg):
+def _sample_l_shapes_at_ij(
+    patch, patch_idx, patch_atlas, i, j, num_points, cfg,
+):
     # Sample 4 strips anchored on the annotated point (i, j) of `patch`, one per cardinal
     # primary direction. In 'dijkstra' mode these are geodesic strips to distant endpoints
     # (one per cardinal cone; see _sample_dijkstra_strips_at_ij); otherwise L-shapes, one per
@@ -1055,12 +1064,14 @@ def _sample_l_shapes_at_ij(patch, i, j, num_points, cfg):
         return None
 
     if cfg['patch_strip_sampling'] == 'dijkstra':
-        return _sample_dijkstra_strips_at_ij(patch, i_q, j_q, num_points)
+        return _sample_dijkstra_strips_at_ij(
+            patch, patch_idx, patch_atlas, i_q, j_q, num_points)
 
     primary_specs = [(0, +1), (0, -1), (1, +1), (1, -1)]  # (leg1_axis, leg1_dir)
     return [
         _sample_single_l_shape(
-            valid_quad, i_q, j_q, leg1_axis, leg1_dir,
+            valid_quad, patch_idx, patch_atlas, i_q, j_q,
+            leg1_axis, leg1_dir,
             leg2_dir=int(np.random.choice([-1, +1])),
             num_points=num_points,
         )
@@ -1077,7 +1088,9 @@ def _sample_l_shapes_batch(patches_dict, patch_atlas, requests, num_points, cfg)
         native_atlas = None
     if native_atlas is None:
         return [
-            _sample_l_shapes_at_ij(patches_dict[pid], i, j, num_points, cfg)
+            _sample_l_shapes_at_ij(
+                patches_dict[pid], patch_atlas.id_to_idx[pid], patch_atlas,
+                i, j, num_points, cfg)
             for pid, i, j in requests
         ]
     patch_indices = np.fromiter(
@@ -1112,9 +1125,11 @@ def _sample_l_shapes_batch(patches_dict, patch_atlas, requests, num_points, cfg)
             leg2 = turn + np.arange(1, leg2_len + 1)[:, None] * leg2_delta
             path = np.concatenate([leg1, leg2], axis=0).astype(np.int64)
             shapes.append(PatchWalk(
-                ijs=ijs[k, s], path=path,
-                pick_positions=pick_positions[k, s],
-                waypoints=waypoints[k, s]))
+                ijs=ijs[k, s],
+                walk=_patch_sampled_walk(
+                    patch_atlas, patch_indices[k], path,
+                    pick_positions[k, s]),
+            ))
         sampled.append(shapes)
     return sampled
 
@@ -1258,8 +1273,8 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
 
     flat_spiral = slice_to_spiral_transform(flat_zyxs.reshape(-1, 3)).reshape(*flat_zyxs.shape)
     theta, _, shifted_radii = get_theta_and_radii(flat_spiral[..., 1:], dr_per_winding)
-    packed_walks = _pack_l_shape_walks(
-        flat_walks, patch_idx_per_strip_np, patch_atlas, crossing_map)
+    packed_walks = _pack_walks(
+        [patch_walk.walk for patch_walk in flat_walks], crossing_map)
     shifted_radii, _ = _unwrap_sampled_tracks(
         crossing_map, dr_per_winding, theta, shifted_radii, packed_walks)
 
@@ -1389,8 +1404,8 @@ def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
 
     flat_spiral = slice_to_spiral_transform(flat_zyxs.reshape(-1, 3)).reshape(*flat_zyxs.shape)
     theta, _, shifted_radii = get_theta_and_radii(flat_spiral[..., 1:], dr_per_winding)
-    packed_walks = _pack_l_shape_walks(
-        flat_walks, patch_idx_per_strip_np, patch_atlas, crossing_map)
+    packed_walks = _pack_walks(
+        [patch_walk.walk for patch_walk in flat_walks], crossing_map)
     shifted_radii, crossing_adjustments = _unwrap_sampled_tracks(
         crossing_map, dr_per_winding, theta, shifted_radii, packed_walks)
 
@@ -1785,18 +1800,16 @@ def get_unattached_pcl_strip_losses(
             for strip_idx, pos_from, pos_to in segments
         ])
         walks.append(SampledWalk(
-            row=k,
-            path=node_path,
+            node_ids=node_path,
             pick_positions=picks,
+            connect_fractional_picks=False,
         ))
 
     sampled_flat_indices_t = torch.from_numpy(sampled_flat_indices).to(device=device)
     zyxs_t = flat['zyxs'][sampled_flat_indices_t]
     winding_t = flat['windings'][sampled_flat_indices_t]
 
-    packed_walks = _pack_walks(
-        walks, lambda paths: paths, crossing_map,
-        local_correction=False)
+    packed_walks = _pack_walks(walks, crossing_map)
 
     spiral_zyxs = slice_to_spiral_transform(zyxs_t.reshape(-1, 3)).reshape(*zyxs_t.shape)
     theta, _, shifted_radii = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)

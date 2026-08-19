@@ -200,41 +200,33 @@ class ThetaCrossingMap:
                 self.crossings = torch.empty(0, dtype=torch.int8, device=self.device)
         self.node_theta = theta
 
-    def adjustments(self, edge_ids, directions, pick_positions, pick_node_ids,
-                    sampled_theta, local_correction_mask, dr_per_winding,
-                    edge_valid=None):
+    def adjustments(self, packed_walks, sampled_theta, dr_per_winding):
         """Gather cumulative crossing adjustments for packed sampled walks.
 
-        Inputs are row-major. ``edge_ids``/``directions`` describe each dense
-        node step, and ``pick_positions`` indexes nodes in that walk.  Padded
-        edges may be zeroed with ``edge_valid``.  Patch picks set the local
-        correction mask so the cached quad-centre theta is connected to the
-        current fractional pick before rows are reanchored; exact PCL nodes do
-        not.
+        Inputs are row-major. Packed edge IDs/directions describe each dense
+        node step, and pick positions index nodes in that walk. A nonnegative
+        correction-node ID connects a cached patch quad centre to its current
+        fractional pick before rows are reanchored; exact PCL nodes use -1.
         """
         if self.last_refresh_iteration is None and self.node_theta.numel() != self.num_nodes:
             raise RuntimeError('ThetaCrossingMap must be refreshed before use')
-        edge_ids = torch.as_tensor(edge_ids, dtype=torch.int64, device=self.device)
-        directions = torch.as_tensor(directions, dtype=torch.int8, device=self.device)
+        edge_ids = packed_walks.edge_ids
+        directions = packed_walks.directions
         steps = self.crossings[edge_ids].to(torch.int32) * directions.to(torch.int32)
-        if edge_valid is not None:
-            steps = steps * torch.as_tensor(edge_valid, dtype=torch.int32, device=self.device)
+        steps = steps * packed_walks.edge_valid.to(torch.int32)
         cumulative = torch.cat([
             torch.zeros((*steps.shape[:-1], 1), dtype=torch.int32, device=self.device),
             steps.cumsum(dim=-1),
         ], dim=-1)
-        pick_positions = torch.as_tensor(
-            pick_positions, dtype=torch.int64, device=self.device)
-        picked = torch.gather(cumulative, -1, pick_positions)
-        pick_node_ids = torch.as_tensor(
-            pick_node_ids, dtype=torch.int64, device=self.device)
+        picked = torch.gather(cumulative, -1, packed_walks.pick_positions)
+        correction_node_ids = packed_walks.correction_node_ids
         sampled_theta = sampled_theta.detach().to(device=self.device)
-        centre_theta = self.node_theta[pick_node_ids]
+        correction_mask = correction_node_ids >= 0
+        centre_theta = self.node_theta[correction_node_ids.clamp_min(0)]
         local_delta = sampled_theta - centre_theta
         local = ((local_delta > np.pi).to(torch.int32)
                  - (local_delta < -np.pi).to(torch.int32))
-        mask = torch.as_tensor(
-            local_correction_mask, dtype=torch.bool, device=self.device)
-        picked = picked + torch.where(mask, local, torch.zeros_like(local))
+        picked = picked + torch.where(
+            correction_mask, local, torch.zeros_like(local))
         picked = picked - picked[..., :1]
         return picked.to(dr_per_winding.dtype) * dr_per_winding.detach()
