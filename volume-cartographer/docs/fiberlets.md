@@ -27,6 +27,27 @@ has a globally fixed origin and owns the half-open ZYX range
 cell it intersects and samples that cell in full. It does not move or truncate
 interior cells. Prediction-grid coordinates remain private solver values.
 
+Anchor and fiberlet extraction use float32 end to end: observations,
+configuration used by solver math, component and peak state, retained anchors,
+fiberlet domain/frame/interpolation geometry, path costs, DP state, candidate
+points, graph geometry, diagnostics, and serialized numeric values. Integer
+lattice/index/count state remains integer. External reference fibers, replay
+distance calculations, cold volume-scale metadata, and elapsed/process timing
+remain double precision and convert only at subsystem boundaries. Version-1
+and version-2 JSON artifacts carry untyped JSON numbers and load into this
+float representation without a schema change. The shared prediction and normal
+sampler interfaces remain double-valued for other consumers; extraction
+normalizes, range-checks, and narrows their results once at the sampling
+boundary and retains only float tiles afterward.
+Prediction-grid extents must not exceed `2^24` voxels on any axis so every
+integer voxel coordinate remains exact in float32. Artifact and OBJ writers
+also reject base-coordinate scaling that would overflow float32.
+On the canonical 32-thread, 5,000-base-voxel Paris4 replay, the complete
+float32 representation reduced median command wall time from 9.22 to 8.96
+seconds, total CPU from 202.89 to 199.47 seconds, and peak RSS from 2,121,656
+to 2,007,020 KiB. Replay failures were unchanged and repeated float32 runs
+produced identical artifacts.
+
 ## Fit
 
 The existing deterministic two-mode non-orthogonal PCA fit supplies initial
@@ -231,9 +252,10 @@ changing the geometric predicate.
 `--batch` is a coordinate-call limit, 65536 by default. It partitions only
 consecutive ranges of the global unique union. The path stage completes all
 prediction calls, then all normal calls, materializes every prepared endpoint
-and node score by deriving corners and weights from its position again,
-releases sampling storage, and finally runs every DP
-candidate in parallel from its retained geometry. Increasing `--batch` changes
+score, and retains immutable prepared scoring voxels plus their page index while
+running every DP candidate in parallel. Interior node scores are interpolated
+at first search access and cached by candidate-local node index. Increasing
+`--batch` changes
 sampler call count only; it cannot decrease the unique request population or
 change path/graph artifacts. Each volume call and each parallel stage may use
 `--threads`; candidate results remain in their canonical slots.
@@ -262,24 +284,38 @@ The exact start and target anchors are source and sink. Interior transitions
 advance exactly one curved plane and change either transverse index by at most
 one. Their directions and lengths are computed from the resulting floating XYZ
 positions, so they are not restricted to world axes or 26 quantized directions.
-The layered graph is acyclic. DP state retains the incoming transition because
-alignment and curvature depend on the previous physical step.
+The layered graph is acyclic. States 0 through 8 encode the incoming transverse
+step and state 9 is source-only. The predecessor packed key and incoming
+geometry are derived from that state; reconstruction retains one predecessor-
+state byte per node/state. Float32 cumulative costs roll through only the
+current and next interior layers because alignment and curvature need no older
+cost state. Source and sink transitions remain separate.
 
-Each interior node occupies 24 bytes: one checked row-major `uint32` key,
-three `float32` prediction coordinates, compact two-byte fiber and normal axes,
-one byte of presence, and validity flags. Fiber/normal axes use the same +Z
-hemisphere `nx/ny` encoding as Lasagna and presence uses the native byte scale.
-No per-node reason string or interpolation-address object is retained. This
-re-quantization is intentional for the experimental fiberlet objective; exact
-anchor endpoints remain double precision.
+Each interior geometry node occupies 16 bytes: one checked row-major `uint32`
+key and three `float32` prediction coordinates. On a lazy-cache miss, fiber and
+normal axes pass through the same +Z compact `nx/ny` encoding as Lasagna and
+presence uses the native byte scale. No per-node reason string or
+interpolation-address object is retained. This re-quantization is intentional
+for the experimental fiberlet objective; exact anchor endpoints use the same
+float32 geometry representation. DP stores normalized solve-local scoring
+records only for requested nodes. Each reached node resolves its at most nine
+outgoing neighbors and edge geometry once, reusing them across incoming states;
+no candidate-wide edge table is materialized.
 
 Presence is trilinearly interpolated. Fiber directions are unoriented: the
-positive-weight native corner axes are normalized and accumulated as weighted
-outer products, then the shared deterministic symmetric eigensolver resolves a
-unique principal axis. This preserves antipodal axes without sign cancellation;
-an invalid required corner or ambiguous tensor invalidates the destination.
-Normals use the same interpolation, but invalid normal data keeps the existing
-isotropic curvature fallback rather than rejecting the path.
+native voxel axes are validated and normalized once into compact float32
+symmetric outer products. Positive-weight corners accumulate those tensors,
+then an analytic symmetric 3x3 resolver finds the unique principal axis. A
+missing top-eigenvalue gap remains ambiguous and invalid. When the gap is clear
+but closed-form eigenvector reconstruction fails its residual bound, the
+existing iterative Jacobi resolver is used as a numerical fallback. This
+preserves antipodal axes without sign cancellation; an invalid required corner
+or ambiguous tensor invalidates the destination. Normals use the same
+interpolation, but invalid normal data keeps the existing isotropic curvature
+fallback rather than rejecting the path. Interpolation weights, tensor sums,
+and principal-axis calculations stay float32 throughout fiberlet extraction;
+only the external normal-sampler call uses its existing double-coordinate API
+before immediately narrowing the returned sample.
 
 Every interior mapped move must have an unoriented angle strictly below 25
 degrees to the dense fiber-prediction axis interpolated at its destination.
@@ -653,7 +689,7 @@ sampling, search, and total wall times. Use identical manifests, fiber, options,
 build type, and interval for before/after performance comparisons.
 
 Benchmark and replay extraction also emit a versioned
-`fiberlet_extraction_profile version=8` row. Both commands use the same field
+`fiberlet_extraction_profile version=17` row. Both commands use the same field
 names and units. Replay writes the row to stderr after full tube extraction;
 benchmark writes it to stdout after the existing summary. The row separates:
 
@@ -662,12 +698,73 @@ benchmark writes it to stdout after the existing summary. The row separates:
   and finalization;
 - fiberlet candidate generation, geometry preparation, node enumeration,
   interpolation-corner collection and merge, prediction/normal sampling,
-  scoring-index construction, interpolation materialization, node-index
-  construction, and dynamic programming;
+  scoring preparation and index construction, interpolation materialization,
+  node-index construction, and dynamic programming;
 - deterministic workload counts including selected/context/work cells, tiles,
   sampler calls and submitted coordinates, observations and gradients, lattice
   nodes and corridor tests, corner insertion attempts and globally unique
   sampled voxels, and DP lookups/visits/relaxations.
+
+Version 11 also reports a bounded one-in-4096-per-worker interpolation sample.
+It separates page lookup, prediction/normal corner accumulation, and
+prediction/normal principal-axis resolution without timing every scoring
+point.
+
+Version 12 adds complete prediction/normal closed-form resolution and iterative
+fallback counts. Ambiguous tensors do not count as fallbacks because no unique
+direction exists to recover.
+
+Version 13 adds prepared-node counts, reached/generated/valid/reused edge
+counts, solve-local prepared-node/direct-index/state byte maxima, and separate
+node-preparation worker time. Lookup/visit counters omit dead outgoing work
+from the final interior layer, which transitions directly to the sink. Rolling
+state memory is the global predecessor bytes plus the largest adjacent pair of
+cost layers; those layer populations are collected during node generation.
+On the canonical 5,000-base-voxel replay at 32 threads, three runs measured
+11.91 seconds median total wall time and 0.996 seconds median search wall time,
+versus 12.42 and about 1.85 seconds before solve-local reuse. Median total CPU
+fell from 310.98 to 283.73 seconds and search CPU from about 58 to 31.39
+seconds. Selected geometry and replay failures were unchanged; float32
+cumulative costs permit small serialized-cost differences.
+
+Version 14 reports eager endpoint interpolations, lazy node requests, unique
+node materializations, cache hits, maximum lazy node-map bytes, and immutable
+shared scoring bytes retained through search. `interpolatedScoringPoints` is
+now endpoint interpolations plus unique lazy node materializations. On the same
+canonical replay, only 14.48M of 50.72M retained nodes were materialized.
+Three runs measured 10.76 seconds median total wall time and 3.30 seconds
+fiberlet wall time, versus 11.91 and 4.52 seconds for version 13. Median total
+CPU fell from 283.73 to 248.84 seconds, fiberlet CPU from 108.20 to 69.38
+seconds, and peak RSS from 2.46 to 2.11 GiB. Search itself increased from 1.00
+to 1.29 seconds because lazy interpolation is included there; the former
+all-node interpolation phase fell from 1.52 seconds to about 0.015 seconds.
+Selected geometry, replay failures, and replay artifacts were unchanged.
+
+Version 15 adds `anchor_support_stencil_cells` and
+`anchor_clipped_support_cells`. Complete volume-interior cells with their full
+sampling halo reuse one immutable ordered `(z, y, xBegin, xEnd)` support
+stencil. The spans are translated through each tile's actual row and plane
+strides, preserving canonical Z/Y/X observation order. Partial cells and cells
+without a full volume halo retain the clipped scalar construction. On the
+canonical replay all 13,027 work cells used the stencil; median observation-
+construction worker time fell from 18.99 to 11.84 seconds, anchor CPU from
+177.28 to 167.49 seconds, and total wall from 10.76 to 10.37 seconds. All
+workload populations and replay artifacts remained identical.
+
+Version 16 separates the larger support range used by robust refinement from
+the exact owned-cell range used by initialization. Production traverses the
+owned cube directly from validated dense-tile row and plane strides; it does
+not rescan support coordinates or allocate owned indices. The public expanded-
+observation API retains its stable input-order filter and historical count-only
+coverage validation. `anchor_fit_owned_discovery_observation_visits`,
+`anchor_fit_owned_initialization_observation_visits`, and
+`anchor_fit_avoided_owned_support_observation_visits` distinguish those paths.
+On the canonical replay, direct initialization visited 833,728 owned voxels and
+avoided 858,114,544 support-range visits. Fit-setup worker time fell from a
+10.996-second baseline median to 0.092 seconds in the final attribution-inclusive
+validation; anchor CPU fell from 169.45 to 162.51 seconds and anchor wall
+from 6.553 to 6.304 seconds, and total wall from 10.76 to 10.65 seconds. Replay
+populations, failures, and artifacts remained identical.
 
 Version 2 subdivides `anchor_fitting_work_seconds` into exclusive summed-worker
 phases for weighted-observation setup, seed generation, seed-pair refinement,
@@ -685,6 +782,43 @@ denominator for the initial state and every backtracking candidate.
 minus those three kernels, so it includes bounds/setup, interpolation,
 acceptance, convergence, and profiling overhead. The four fields reconcile to
 `anchor_fit_local_refinement_work_seconds`.
+
+Production compact observations keep the robust direction-proposal scan in
+float32, including component assignment, Gaussian/alignment arithmetic,
+residual histograms, retained direction-tensor bins, robust cutoffs, and the
+shared float principal-axis solver. The direct public-observation fitter uses
+the same representation. On the canonical 5,000-base-voxel replay, median tensor-
+proposal worker time fell from 25.63 to 23.74 seconds, anchor CPU from 143.16
+to 140.75 seconds, and command wall from 9.65 to 9.58 seconds. Anchor/graph
+populations and failures were unchanged; emitted route points differed by at
+most 1.38e-6 base voxels.
+
+Fixed-direction position objectives live in a separate private translation
+unit so their production float specialization cannot perturb robust-proposal
+code generation. The production path borrows tile observations and canonical
+per-cell indices without materialization: assignment and membership arrays use
+logical per-cell positions, while observation reads use the corresponding tile
+index. Gaussian, alignment, ordinary numerator/denominator sums, and final
+ratio are float32. Every finite-position site contributes to all active
+denominators before evidence eligibility is checked. The direct public path
+uses the same float objective equation and persistent component/accepted-position
+state. On the canonical
+replay, isolation reduced median local-state objective work from 22.59 to 13.86
+worker-seconds, anchor CPU from 140.80 to 130.74 seconds, and command wall from
+9.56 to 9.17 seconds, with byte-identical replay artifacts.
+
+Final support evaluation is independently isolated from both the anchor fitter
+and fixed-direction objective kernels. Compact production observations remain
+float32 throughout Gaussian, direction, presence, and accumulation arithmetic.
+The direct public fitter uses the same float32 reduction with scale-safe
+direction normalization. Per-component aligned support/coherence, the combined
+objective, and persistent output fields remain float. Invalid public evidence
+cannot enter a numerator; a finite-position site still contributes to every
+active denominator regardless of membership or direction usability. On the
+canonical replay, median final-evaluation work fell
+from 13.79 to 13.11 worker-seconds, anchor CPU from 132.40 to 130.55 seconds,
+and command wall from 9.26 to 9.22 seconds, with byte-identical artifacts and
+unchanged replay work/failures.
 
 Version 4 reports robust components with no detected outliers, trimmed
 components, candidate/actual trimmed and retained mass, components removed for
@@ -707,11 +841,35 @@ responses use an equivalent two-dimensional transverse representation. These
 grouped reductions can introduce small floating-point differences; exact
 numeric identity with version 4 is not a requirement.
 
-Peak-search observations and their transverse response calculations use
-float32. Accepted anchor positions, component state, aggregate diagnostics, and
-serialized output remain double precision. This halves the repeatedly scanned
-peak-search working set; small differences in peak ties and downstream path
-node counts are expected.
+Peak-search observations, transverse response calculations, accepted anchor
+positions, component state, aggregate numeric diagnostics, and serialized
+output use float32. This removes widening at the peak-search boundary and
+halves the repeatedly scanned working set relative to the earlier double
+representation; small differences in peak ties and downstream path node counts
+are expected.
+
+The bounded peak hill climb stores grid geometry, feasibility, and computed
+responses in contiguous row-major slots. Response values have independent
+computed-state bytes, so every result, including a non-finite result, is
+computed once and cached. The canonical
+candidate order, response kernel, tie-breaking, float response coordinates,
+and uncached subpixel checks are unchanged. On the canonical 5,000-base-voxel
+replay, median peak-search worker time fell from roughly 43.9 to 42.84 seconds,
+anchor CPU from 162.51 to 160.30 seconds, and command wall from 10.65 to 10.43
+seconds while complete artifacts and deterministic counters remained exact.
+
+Peak responses store transverse coordinates, axial weight, and signal in a
+16-byte sequential record. A parallel 32-bit index addresses a 16-byte sparse
+record containing alignment and projected-gradient data only for retained
+usable evidence. Invalid-gradient evidence remains indexed because it still
+contributes eligible aligned weight to gradient coverage. Version 17 profile
+fields report prepared hot/evidence populations, their record sizes, maximum
+temporary storage, all hot response visits, and evidence records actually read
+inside the radial cutoff. On the canonical replay, 4.82% of prepared records
+and 3.25% of response visits needed evidence; median peak-search worker time
+fell from 42.84 to 39.94 seconds and command wall from 10.43 to 10.25 seconds.
+The response equation remains unchanged, but exact accumulation order is not a
+compatibility requirement; deterministic geometry and replay quality are.
 
 Production extraction also constructs each sampled tile voxel once as a compact
 float32 observation with a pre-normalized direction. Each overlapping cell
@@ -719,6 +877,16 @@ stores only canonical-order 32-bit indices into that tile plus its cell-local
 gradient-validity byte. The public expanded-observation fitting API uses the
 same templated fitter. Tile observation storage and maximum cell-reference
 scratch are included in the existing concurrent sample-memory budget.
+Complete cells whose configured sample halo fits inside the volume expand the
+shared ordered support-span stencil directly into those indices. Crop and tile
+boundaries do not affect eligibility. A volume boundary or partial final cell
+uses the original clipped sample-cube scan. When gradients are enabled, the
+extra halo voxel makes every retained stencil site gradient-eligible; sampled
+tile-gradient validity remains authoritative.
+Initialization does not rediscover owned observations from this support range.
+It traverses the clipped cell's dense tile rows directly in canonical Z/Y/X
+order after constant-time tile-shape, bounds-containment, and owned-cardinality
+validation. Refinement continues to use the support indices and gradient bytes.
 
 Version 7 reports tile-halo sampling explicitly. Six-cell tiles are paired
 deterministically by maximum overlapping sample volume while preserving at
@@ -743,6 +911,15 @@ DP state, and path-cost evaluation are unchanged. Peak search memory accounting
 uses the direct table's actual payload. `fiberlet_dp_node_index_entries` counts
 stored nodes and `fiberlet_dp_node_index_slots` counts allocated direct-table
 slots, exposing occupancy and sparse-lattice overhead.
+
+Version 9 stores sampled scoring-voxel indices in sparse `16^3` pages. Each
+interpolation stencil caches up to its eight touched pages, then resolves each
+corner by a dense page-local offset. This changes only lookup: corner order,
+weights, tensor accumulation, principal-axis resolution, and compact node
+quantization are unchanged. `fiberlet_scoring_page_count` reports occupied
+pages, `fiberlet_scoring_page_slots` reports their dense index capacity, and
+`fiberlet_scoring_page_directory_probes` reports actual sparse-directory
+lookups after per-stencil reuse.
 
 Anchor-fit counters distinguish fitter invocations from nonempty cells and
 report seeds, seed pairs, seed-pair iterations, local-refinement attempts and

@@ -602,7 +602,7 @@ void printTubeExtractionProfile(
         return encoded.str();
     };
     output << std::setprecision(17)
-           << "fiberlet_extraction_profile version=8"
+           << "fiberlet_extraction_profile version=17"
            << " anchor_elapsed_seconds=" << extraction.anchors.elapsedSeconds
            << " anchor_cpu_seconds=" << anchor.elapsedCpuSeconds
            << " anchor_profiled_seconds=" << anchorProfiledSeconds
@@ -623,6 +623,8 @@ void printTubeExtractionProfile(
            << anchor.reusedPredictionVoxels
            << " anchor_candidate_observations=" << anchor.candidateObservations
            << " anchor_retained_observations=" << anchor.retainedObservations
+           << " anchor_support_stencil_cells=" << anchor.supportStencilCells
+           << " anchor_clipped_support_cells=" << anchor.clippedSupportCells
            << " anchor_gradient_attempts=" << anchor.gradientAttempts
            << " anchor_valid_gradients=" << anchor.validGradients
            << " anchor_gradient_computations=" << anchor.gradientComputations
@@ -647,6 +649,12 @@ void printTubeExtractionProfile(
            << " anchor_fit_invocations=" << fit.invocations
            << " anchor_fit_nonempty_cells=" << fit.nonemptyCells
            << " anchor_fit_weighted_observations=" << fit.weightedObservations
+           << " anchor_fit_owned_discovery_observation_visits="
+           << fit.ownedDiscoveryObservationVisits
+           << " anchor_fit_owned_initialization_observation_visits="
+           << fit.ownedInitializationObservationVisits
+           << " anchor_fit_avoided_owned_support_observation_visits="
+           << fit.avoidedOwnedSupportObservationVisits
            << " anchor_fit_seeds=" << fit.seeds
            << " anchor_fit_seed_generation_observation_visits="
            << fit.seedGenerationObservationVisits
@@ -695,6 +703,18 @@ void printTubeExtractionProfile(
            << " anchor_fit_peak_components=" << fit.peakComponents
            << " anchor_fit_peak_preparation_observation_visits="
            << fit.peakPreparationObservationVisits
+           << " anchor_fit_peak_prepared_response_observations="
+           << fit.peakPreparedResponseObservations
+           << " anchor_fit_peak_prepared_evidence_observations="
+           << fit.peakPreparedEvidenceObservations
+           << " anchor_fit_peak_response_observation_record_bytes="
+           << fit.peakResponseObservationRecordBytes
+           << " anchor_fit_peak_evidence_index_record_bytes="
+           << fit.peakEvidenceIndexRecordBytes
+           << " anchor_fit_peak_evidence_observation_record_bytes="
+           << fit.peakEvidenceObservationRecordBytes
+           << " anchor_fit_peak_maximum_observation_storage_bytes="
+           << fit.peakMaximumObservationStorageBytes
            << " anchor_fit_peak_grid_response_requests="
            << fit.peakGridResponseRequests
            << " anchor_fit_peak_computed_grid_responses="
@@ -703,6 +723,8 @@ void printTubeExtractionProfile(
            << fit.peakAcceptanceResponses
            << " anchor_fit_peak_response_observation_visits="
            << fit.peakResponseObservationVisits
+           << " anchor_fit_peak_response_evidence_observation_visits="
+           << fit.peakResponseEvidenceObservationVisits
            << " anchor_fit_final_evaluation_observation_visits="
            << fit.finalEvaluationObservationVisits
            << " anchor_fit_setup_work_seconds=" << fit.setupWorkSeconds
@@ -756,8 +778,54 @@ void printTubeExtractionProfile(
            << " fiberlet_unique_sampled_voxels=" << paths.sampledVoxels
            << " fiberlet_interpolated_scoring_points="
            << paths.interpolatedScoringPoints
+           << " fiberlet_endpoint_scoring_interpolations="
+           << paths.endpointScoringInterpolations
+           << " fiberlet_lazy_node_scoring_requests="
+           << paths.lazyNodeScoringRequests
+           << " fiberlet_lazy_node_scoring_materializations="
+           << paths.lazyNodeScoringMaterializations
+           << " fiberlet_lazy_node_scoring_cache_hits="
+           << paths.lazyNodeScoringCacheHits
+           << " fiberlet_scoring_page_count=" << paths.scoringPageCount
+           << " fiberlet_scoring_page_slots=" << paths.scoringPageSlots
+           << " fiberlet_scoring_page_directory_probes="
+           << paths.scoringPageDirectoryProbes
+           << " fiberlet_interpolation_profiled_points="
+           << paths.interpolationProfiledPoints
+           << " fiberlet_interpolation_profiled_corners="
+           << paths.interpolationProfiledCorners
+           << " fiberlet_interpolation_profiled_prediction_identical="
+           << paths.interpolationProfiledPredictionIdentical
+           << " fiberlet_interpolation_profiled_normal_identical="
+           << paths.interpolationProfiledNormalIdentical
+           << " fiberlet_interpolation_profiled_prediction_principal_solves="
+           << paths.interpolationProfiledPredictionPrincipalSolves
+           << " fiberlet_interpolation_profiled_normal_principal_solves="
+           << paths.interpolationProfiledNormalPrincipalSolves
+           << " fiberlet_interpolation_prediction_closed_form_resolutions="
+           << paths.interpolationPredictionClosedFormResolutions
+           << " fiberlet_interpolation_normal_closed_form_resolutions="
+           << paths.interpolationNormalClosedFormResolutions
+           << " fiberlet_interpolation_prediction_iterative_fallbacks="
+           << paths.interpolationPredictionIterativeFallbacks
+           << " fiberlet_interpolation_normal_iterative_fallbacks="
+           << paths.interpolationNormalIterativeFallbacks
            << " fiberlet_dp_node_index_entries=" << paths.dpNodeIndexEntries
            << " fiberlet_dp_node_index_slots=" << paths.dpNodeIndexSlots
+           << " fiberlet_dp_prepared_nodes=" << paths.dpPreparedNodes
+           << " fiberlet_dp_max_prepared_node_bytes="
+           << paths.dpMaximumPreparedNodeBytes
+           << " fiberlet_dp_max_lazy_cache_index_bytes="
+           << paths.dpMaximumLazyCacheIndexBytes
+           << " fiberlet_dp_max_direct_index_bytes="
+           << paths.dpMaximumDirectIndexBytes
+           << " fiberlet_dp_max_state_bytes=" << paths.dpMaximumStateBytes
+           << " fiberlet_dp_shared_scoring_bytes="
+           << paths.dpSharedScoringBytes
+           << " fiberlet_dp_reached_nodes=" << paths.dpReachedNodes
+           << " fiberlet_dp_generated_edges=" << paths.dpGeneratedEdges
+           << " fiberlet_dp_valid_edges=" << paths.dpValidEdges
+           << " fiberlet_dp_reused_edges=" << paths.dpReusedEdges
            << " fiberlet_dp_transition_lookups=" << paths.dpTransitionLookups
            << " fiberlet_dp_reached_state_visits=" << paths.dpReachedStateVisits
            << " fiberlet_dp_relaxations=" << paths.dpRelaxations
@@ -791,14 +859,30 @@ void printTubeExtractionProfile(
            << " fiberlet_scoring_index_seconds=" << paths.scoringIndexSeconds
            << " fiberlet_scoring_index_cpu_seconds="
            << paths.scoringIndexCpuSeconds
+           << " fiberlet_scoring_preparation_seconds="
+           << paths.scoringPreparationSeconds
+           << " fiberlet_scoring_preparation_cpu_seconds="
+           << paths.scoringPreparationCpuSeconds
            << " fiberlet_interpolation_materialization_seconds="
            << paths.interpolationMaterializationSeconds
            << " fiberlet_interpolation_materialization_cpu_seconds="
            << paths.interpolationMaterializationCpuSeconds
+           << " fiberlet_interpolation_profiled_lookup_seconds="
+           << paths.interpolationProfiledLookupSeconds
+           << " fiberlet_interpolation_profiled_prediction_corner_seconds="
+           << paths.interpolationProfiledPredictionCornerSeconds
+           << " fiberlet_interpolation_profiled_normal_corner_seconds="
+           << paths.interpolationProfiledNormalCornerSeconds
+           << " fiberlet_interpolation_profiled_prediction_resolve_seconds="
+           << paths.interpolationProfiledPredictionResolveSeconds
+           << " fiberlet_interpolation_profiled_normal_resolve_seconds="
+           << paths.interpolationProfiledNormalResolveSeconds
            << " fiberlet_search_seconds=" << paths.searchSeconds
            << " fiberlet_search_cpu_seconds=" << paths.searchCpuSeconds
            << " fiberlet_node_index_work_seconds="
            << paths.searchNodeIndexWorkSeconds
+           << " fiberlet_node_preparation_work_seconds="
+           << paths.searchNodePreparationWorkSeconds
            << " fiberlet_dp_work_seconds=" << paths.searchDpWorkSeconds << '\n';
     output.precision(previousPrecision);
 }

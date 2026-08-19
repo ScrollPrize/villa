@@ -2,6 +2,11 @@
 #include "vc/core/util/AtomicFile.hpp"
 #include "vc/fiber_tracer/FiberAxisTensor.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
+#include "vc/fiber_tracer/detail/FiberAnchorPeakGrid.hpp"
+#include "vc/fiber_tracer/detail/FiberAnchorSupportStencil.hpp"
+#include "FiberAnchorObjectives.hpp"
+#include "FiberAnchorFinalEvaluation.hpp"
+#include "FiberFloatGeometry.hpp"
 
 #include <algorithm>
 #include <array>
@@ -21,19 +26,22 @@
 #include <stdexcept>
 #include <thread>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 
 namespace vc::fiber_tracer {
 namespace {
 
-constexpr double kMatrixEpsilon = 1.0e-15;
-constexpr double kGeometryEpsilon = 1.0e-12;
+constexpr float kMatrixEpsilon = 1.0e-12F;
+constexpr float kGeometryEpsilon = 1.0e-6F;
+constexpr float kFloatComparisonEpsilon =
+    8.0F * std::numeric_limits<float>::epsilon();
 
 double processCpuSeconds()
 {
     const std::clock_t ticks = std::clock();
     return ticks == static_cast<std::clock_t>(-1)
-        ? 0.0
+        ? 0.0F
         : static_cast<double>(ticks) / static_cast<double>(CLOCKS_PER_SEC);
 }
 
@@ -44,13 +52,13 @@ double segmentAabbDistanceSquared(
     const cv::Vec3d& high)
 {
     const cv::Vec3d delta = end - start;
-    std::vector<double> breaks{0.0, 1.0};
+    std::vector<double> breaks{0.0F, 1.0F};
     for (int axis = 0; axis < 3; ++axis) {
         if (std::abs(delta[axis]) <= kGeometryEpsilon)
             continue;
         for (const double bound : {low[axis], high[axis]}) {
             const double t = (bound - start[axis]) / delta[axis];
-            if (t > 0.0 && t < 1.0)
+            if (t > 0.0F && t < 1.0F)
                 breaks.push_back(t);
         }
     }
@@ -59,13 +67,13 @@ double segmentAabbDistanceSquared(
     double best = std::numeric_limits<double>::infinity();
     const auto evaluate = [&](double t) {
         const cv::Vec3d point = start + delta * t;
-        double squared = 0.0;
+        double squared = 0.0F;
         for (int axis = 0; axis < 3; ++axis) {
             const double outside = point[axis] < low[axis]
                 ? low[axis] - point[axis]
                 : point[axis] > high[axis]
                     ? point[axis] - high[axis]
-                    : 0.0;
+                    : 0.0F;
             squared += outside * outside;
         }
         best = std::min(best, squared);
@@ -75,12 +83,12 @@ double segmentAabbDistanceSquared(
         const double finish = breaks[interval + 1];
         evaluate(begin);
         evaluate(finish);
-        const double middle = 0.5 * (begin + finish);
-        double quadratic = 0.0;
-        double linear = 0.0;
+        const double middle = 0.5F * (begin + finish);
+        double quadratic = 0.0F;
+        double linear = 0.0F;
         for (int axis = 0; axis < 3; ++axis) {
             const double point = start[axis] + delta[axis] * middle;
-            double offset = 0.0;
+            double offset = 0.0F;
             if (point < low[axis])
                 offset = start[axis] - low[axis];
             else if (point > high[axis])
@@ -96,60 +104,63 @@ double segmentAabbDistanceSquared(
     return best;
 }
 
-double interpolatedQuantile(const std::vector<double>& sorted, double quantile)
+float interpolatedQuantile(const std::vector<float>& sorted, float quantile)
 {
     if (sorted.empty())
         throw std::invalid_argument("anchor benchmark quantile population is empty");
-    const double rank = quantile * static_cast<double>(sorted.size() - 1);
+    const float rank = quantile * static_cast<float>(sorted.size() - 1);
     const size_t lower = static_cast<size_t>(std::floor(rank));
     const size_t upper = static_cast<size_t>(std::ceil(rank));
-    const double fraction = rank - static_cast<double>(lower);
-    return sorted[lower] * (1.0 - fraction) + sorted[upper] * fraction;
+    const float fraction = rank - static_cast<float>(lower);
+    return sorted[lower] * (1.0F - fraction) + sorted[upper] * fraction;
 }
 
-struct CompensatedSum {
-    void add(double value)
-    {
-        const double adjusted = value - correction;
-        const double next = sum + adjusted;
-        correction = (next - sum) - adjusted;
-        sum = next;
-    }
+using detail::CompactFiberAnchorObservation;
 
-    double sum = 0.0;
-    double correction = 0.0;
+struct FloatSum {
+    void add(float value) { sum += value; }
+    float sum = 0.0F;
+};
+
+struct FloatStoredPredictionSample {
+    cv::Vec3f direction{0.0F, 0.0F, 0.0F};
+    float presence = 0.0F;
+    bool valid = false;
+    bool presenceValid = false;
 };
 
 struct WeightedObservation {
-    cv::Vec3d position{0.0, 0.0, 0.0};
-    cv::Vec3d direction{0.0, 0.0, 0.0};
-    double gaussian = 0.0;
-    double weight = 0.0;
+    cv::Vec3f position{0.0F, 0.0F, 0.0F};
+    cv::Vec3f direction{0.0F, 0.0F, 0.0F};
+    float gaussian = 0.0F;
+    float weight = 0.0F;
     size_t canonicalIndex = 0;
 };
 
 struct FitState {
-    std::array<cv::Vec3d, 2> axes{};
+    std::array<cv::Vec3f, 2> axes{};
     std::vector<uint8_t> assignments;
-    double objectiveNumerator = -1.0;
+    float objectiveNumerator = -1.0F;
     size_t iteration = 0;
 };
 
 constexpr uint8_t kUnassignedComponent = 2;
 
 struct RefinedComponentState {
-    cv::Vec3d axis{1.0, 0.0, 0.0};
-    cv::Vec3d position{0.0, 0.0, 0.0};
+    cv::Vec3f axis{1.0F, 0.0F, 0.0F};
+    cv::Vec3f position{0.0F, 0.0F, 0.0F};
 };
 
 struct RefinedEvaluation {
     std::vector<uint8_t> assignments;
     std::vector<uint8_t> retainedInliers;
-    std::array<double, 2> denominators{0.0, 0.0};
-    std::array<double, 2> numerators{0.0, 0.0};
-    std::array<double, 2> presenceMasses{0.0, 0.0};
+    std::array<float, 2> denominators{0.0F, 0.0F};
+    std::array<float, 2> numerators{0.0F, 0.0F};
+    std::array<float, 2> presenceMasses{0.0F, 0.0F};
+    std::array<float, 2> alignedSupports{0.0F, 0.0F};
+    std::array<float, 2> directionalCoherences{0.0F, 0.0F};
     std::array<size_t, 2> assignedCounts{0, 0};
-    double objective = 0.0;
+    float objective = 0.0F;
 };
 
 struct RefinedFitState {
@@ -166,30 +177,32 @@ struct RefinedFitState {
 
 constexpr size_t kRobustHistogramBins = 256;
 
-[[nodiscard]] size_t robustHistogramBin(double residual)
+template <typename Scalar>
+[[nodiscard]] size_t robustHistogramBin(Scalar residual)
 {
-    const double bounded = std::clamp(residual, 0.0, 1.0);
+    static_assert(std::is_floating_point_v<Scalar>);
+    const Scalar bounded = std::clamp(residual, Scalar{0}, Scalar{1});
     return std::min(
         kRobustHistogramBins - 1,
         static_cast<size_t>(std::floor(
-            bounded * static_cast<double>(kRobustHistogramBins))));
+            bounded * static_cast<Scalar>(kRobustHistogramBins))));
 }
 
-[[nodiscard]] double robustHistogramCenter(size_t bin)
+[[nodiscard]] float robustHistogramCenter(size_t bin)
 {
-    return (static_cast<double>(bin) + 0.5) /
-        static_cast<double>(kRobustHistogramBins);
+    return (static_cast<float>(bin) + 0.5F) /
+        static_cast<float>(kRobustHistogramBins);
 }
 
 [[nodiscard]] size_t weightedHistogramQuantileBin(
-    const std::array<double, kRobustHistogramBins>& histogram,
-    double totalMass,
-    double quantile)
+    const std::array<float, kRobustHistogramBins>& histogram,
+    float totalMass,
+    float quantile)
 {
-    if (!(totalMass > 0.0))
+    if (!(totalMass > 0.0F))
         return kRobustHistogramBins - 1;
-    const double target = std::clamp(quantile, 0.0, 1.0) * totalMass;
-    double cumulative = 0.0;
+    const float target = std::clamp(quantile, 0.0F, 1.0F) * totalMass;
+    float cumulative = 0.0F;
     for (size_t bin = 0; bin < histogram.size(); ++bin) {
         cumulative += histogram[bin];
         if (cumulative >= target)
@@ -198,13 +211,13 @@ constexpr size_t kRobustHistogramBins = 256;
     return kRobustHistogramBins - 1;
 }
 
-[[nodiscard]] double histogramMassAbove(
-    const std::array<double, kRobustHistogramBins>& histogram,
+[[nodiscard]] float histogramMassAbove(
+    const std::array<float, kRobustHistogramBins>& histogram,
     size_t cutoffBin)
 {
     return std::accumulate(
         histogram.begin() + static_cast<std::ptrdiff_t>(cutoffBin + 1),
-        histogram.end(), 0.0);
+        histogram.end(), 0.0F);
 }
 
 struct RobustHistogramCutoff {
@@ -213,44 +226,44 @@ struct RobustHistogramCutoff {
 };
 
 [[nodiscard]] RobustHistogramCutoff selectRobustHistogramCutoff(
-    const std::array<double, kRobustHistogramBins>& residualHistogram,
-    const std::array<double, kRobustHistogramBins>& deviationHistogram,
-    double totalMass,
-    double median,
-    double maximumTrimMassFraction,
-    double madMultiplier,
-    double minimumAngleDegrees)
+    const std::array<float, kRobustHistogramBins>& residualHistogram,
+    const std::array<float, kRobustHistogramBins>& deviationHistogram,
+    float totalMass,
+    float median,
+    float maximumTrimMassFraction,
+    float madMultiplier,
+    float minimumAngleDegrees)
 {
     RobustHistogramCutoff result;
     result.summary.totalMass = totalMass;
     result.summary.retainedMass = totalMass;
-    if (!(totalMass > 0.0) || !(maximumTrimMassFraction > 0.0))
+    if (!(totalMass > 0.0F) || !(maximumTrimMassFraction > 0.0F))
         return result;
 
-    const double mad = robustHistogramCenter(weightedHistogramQuantileBin(
-        deviationHistogram, totalMass, 0.5));
-    const double floorRadians = minimumAngleDegrees * std::acos(-1.0) / 180.0;
-    const double floorResidual = std::sin(floorRadians) * std::sin(floorRadians);
+    const float mad = robustHistogramCenter(weightedHistogramQuantileBin(
+        deviationHistogram, totalMass, 0.5F));
+    const float floorRadians = minimumAngleDegrees * std::acos(-1.0F) / 180.0F;
+    const float floorResidual = std::sin(floorRadians) * std::sin(floorRadians);
     result.cutoffBin = robustHistogramBin(std::clamp(
-        std::max(median + madMultiplier * mad, floorResidual), 0.0, 1.0));
+        std::max(median + madMultiplier * mad, floorResidual), 0.0F, 1.0F));
     result.summary.candidateTrimmedMass = histogramMassAbove(
         residualHistogram, result.cutoffBin);
     result.summary.detectedOutliers =
-        result.summary.candidateTrimmedMass > 0.0;
+        result.summary.candidateTrimmedMass > 0.0F;
     if (!result.summary.detectedOutliers)
         return result;
 
-    const double maximumTrimmed = maximumTrimMassFraction * totalMass;
+    const float maximumTrimmed = maximumTrimMassFraction * totalMass;
     if (result.summary.candidateTrimmedMass > maximumTrimmed) {
         result.cutoffBin = std::max(
             result.cutoffBin,
             weightedHistogramQuantileBin(
                 residualHistogram, totalMass,
-                1.0 - maximumTrimMassFraction));
+                1.0F - maximumTrimMassFraction));
     }
     result.summary.cutoffResidual =
-        static_cast<double>(result.cutoffBin + 1) /
-        static_cast<double>(kRobustHistogramBins);
+        static_cast<float>(result.cutoffBin + 1) /
+        static_cast<float>(kRobustHistogramBins);
     result.summary.trimmedMass = histogramMassAbove(
         residualHistogram, result.cutoffBin);
     result.summary.retainedMass = totalMass - result.summary.trimmedMass;
@@ -258,17 +271,11 @@ struct RobustHistogramCutoff {
 }
 
 struct PeakOwnerBounds {
-    cv::Vec3d lower{0.0, 0.0, 0.0};
-    cv::Vec3d upper{0.0, 0.0, 0.0};
+    cv::Vec3f lower{0.0F, 0.0F, 0.0F};
+    cv::Vec3f upper{0.0F, 0.0F, 0.0F};
 };
 
 constexpr size_t kNoDiagnosticId = std::numeric_limits<size_t>::max();
-
-[[nodiscard]] bool finiteVector(const cv::Vec3d& value)
-{
-    return std::isfinite(value[0]) && std::isfinite(value[1]) &&
-           std::isfinite(value[2]);
-}
 
 [[nodiscard]] bool finiteVector(const cv::Vec3f& value)
 {
@@ -276,31 +283,139 @@ constexpr size_t kNoDiagnosticId = std::numeric_limits<size_t>::max();
            std::isfinite(value[2]);
 }
 
-struct CompactFiberAnchorObservation {
-    cv::Vec3f positionPredictionXYZ{0.0F, 0.0F, 0.0F};
-    cv::Vec3f direction{0.0F, 0.0F, 0.0F};
-    cv::Vec3f presenceGradientPredictionXYZ{0.0F, 0.0F, 0.0F};
-    float presence = 0.0F;
-    bool valid = false;
-    bool presenceGradientValid = false;
+[[nodiscard]] FloatStoredPredictionSample narrowStoredPredictionSample(
+    const FiberStoredPredictionSample& input)
+{
+    FloatStoredPredictionSample output;
+    output.valid = input.valid;
+    output.presenceValid = input.presenceValid;
+    if (std::isfinite(input.presence) &&
+        input.presence >=
+            static_cast<double>(std::numeric_limits<float>::lowest()) &&
+        input.presence <=
+            static_cast<double>(std::numeric_limits<float>::max())) {
+        output.presence = static_cast<float>(input.presence);
+    } else {
+        output.presence = std::numeric_limits<float>::quiet_NaN();
+    }
+
+    const double scale = std::max({
+        std::abs(input.direction[0]), std::abs(input.direction[1]),
+        std::abs(input.direction[2])});
+    if (!(scale > 0.0) || !std::isfinite(scale))
+        return output;
+    cv::Vec3d direction = input.direction / scale;
+    const double norm2 = direction.dot(direction);
+    if (!(norm2 > 0.0) || !std::isfinite(norm2))
+        return output;
+    direction /= std::sqrt(norm2);
+    output.direction = {
+        static_cast<float>(direction[0]),
+        static_cast<float>(direction[1]),
+        static_cast<float>(direction[2]),
+    };
+    return output;
+}
+
+template <typename Observation>
+using FiberAnchorProposalScalar = std::conditional_t<
+    std::is_same_v<std::remove_cvref_t<Observation>,
+        CompactFiberAnchorObservation>,
+    float,
+    float>;
+
+template <typename Scalar>
+using FiberAnchorProposalVector = cv::Vec<Scalar, 3>;
+
+template <typename Scalar>
+struct FiberAnchorProposalComponent {
+    FiberAnchorProposalVector<Scalar> axis{Scalar{1}, Scalar{0}, Scalar{0}};
+    FiberAnchorProposalVector<Scalar> position{
+        Scalar{0}, Scalar{0}, Scalar{0}};
 };
 
-template <typename Observation>
-[[nodiscard]] cv::Vec3d observationPosition(const Observation& observation)
+template <typename Scalar, typename Observation>
+[[nodiscard]] FiberAnchorProposalVector<Scalar> proposalObservationPosition(
+    const Observation& observation)
 {
-    return cv::Vec3d{observation.positionPredictionXYZ};
+    return {
+        static_cast<Scalar>(observation.positionPredictionXYZ[0]),
+        static_cast<Scalar>(observation.positionPredictionXYZ[1]),
+        static_cast<Scalar>(observation.positionPredictionXYZ[2]),
+    };
+}
+
+template <typename Scalar, typename Observation>
+[[nodiscard]] bool usableProposalDirection(
+    const Observation& observation,
+    Scalar presenceFloor,
+    FiberAnchorProposalVector<Scalar>& direction)
+{
+    const Scalar presence = static_cast<Scalar>(observation.presence);
+    if (!observation.valid || !finiteVector(observation.direction) ||
+        !std::isfinite(presence) || presence < presenceFloor ||
+        presence < Scalar{0} || presence > Scalar{1}) {
+        return false;
+    }
+    direction = {
+        static_cast<Scalar>(observation.direction[0]),
+        static_cast<Scalar>(observation.direction[1]),
+        static_cast<Scalar>(observation.direction[2]),
+    };
+    if constexpr (!std::is_same_v<std::remove_cvref_t<Observation>,
+                      CompactFiberAnchorObservation>) {
+        const Scalar norm2 = direction.dot(direction);
+        if (!(norm2 > static_cast<Scalar>(kMatrixEpsilon * kMatrixEpsilon)) ||
+            !std::isfinite(norm2)) {
+            direction = {Scalar{0}, Scalar{0}, Scalar{0}};
+        } else {
+            direction /= std::sqrt(norm2);
+        }
+    }
+    return direction.dot(direction) > static_cast<Scalar>(kMatrixEpsilon);
+}
+
+template <typename Scalar, typename Observation>
+[[nodiscard]] Scalar proposalTransverseGaussian(
+    const Observation& observation,
+    const FiberAnchorProposalComponent<Scalar>& component,
+    const FiberAnchorProposalVector<Scalar>& pivot,
+    Scalar axialSupportHalfWidth,
+    Scalar gaussianCutoff,
+    Scalar gaussianSigma)
+{
+    const auto position = proposalObservationPosition<Scalar>(observation);
+    if (!finiteVector(position))
+        return Scalar{0};
+    const Scalar axial = (position - pivot).dot(component.axis);
+    if (std::abs(axial) > axialSupportHalfWidth)
+        return Scalar{0};
+    const auto offset = position - component.position;
+    const auto transverse =
+        offset - component.axis * offset.dot(component.axis);
+    const Scalar distanceSquared = transverse.dot(transverse);
+    if (distanceSquared > gaussianCutoff * gaussianCutoff)
+        return Scalar{0};
+    return std::exp(-distanceSquared /
+        (Scalar{2} * gaussianSigma * gaussianSigma));
 }
 
 template <typename Observation>
-[[nodiscard]] double observationPresence(const Observation& observation)
+[[nodiscard]] cv::Vec3f observationPosition(const Observation& observation)
 {
-    return static_cast<double>(observation.presence);
+    return cv::Vec3f{observation.positionPredictionXYZ};
 }
 
 template <typename Observation>
-[[nodiscard]] cv::Vec3d observationGradient(const Observation& observation)
+[[nodiscard]] float observationPresence(const Observation& observation)
 {
-    return cv::Vec3d{observation.presenceGradientPredictionXYZ};
+    return static_cast<float>(observation.presence);
+}
+
+template <typename Observation>
+[[nodiscard]] cv::Vec3f observationGradient(const Observation& observation)
+{
+    return cv::Vec3f{observation.presenceGradientPredictionXYZ};
 }
 
 template <typename Observation>
@@ -328,11 +443,67 @@ public:
         return gradientValidity_[index] != 0;
     }
 
+    [[nodiscard]] std::span<const Observation> observationStorage() const
+    {
+        return observations_;
+    }
+
+    [[nodiscard]] std::span<const uint32_t> observationIndices() const
+    {
+        return indices_;
+    }
+
 private:
     const std::vector<Observation>& observations_;
     const std::vector<uint32_t>& indices_;
     const std::vector<uint8_t>& gradientValidity_;
 };
+
+class DenseOwnedCompactObservationRange {
+public:
+    DenseOwnedCompactObservationRange(
+        const std::vector<CompactFiberAnchorObservation>& observations,
+        const std::array<size_t, 3>& tileBeginZYX,
+        const std::array<size_t, 3>& tileShapeZYX,
+        const std::array<size_t, 3>& cellBeginZYX,
+        const std::array<size_t, 3>& cellEndZYX)
+        : observations_{observations},
+          layout_{detail::buildFiberAnchorOwnedCellTileLayout(
+              observations.size(), tileBeginZYX, tileShapeZYX,
+              cellBeginZYX, cellEndZYX)}
+    {
+    }
+
+    [[nodiscard]] size_t size() const { return layout_.ownedSize; }
+
+    template <typename Visitor>
+    void visit(Visitor&& visitor) const
+    {
+        detail::visitFiberAnchorOwnedCellTileIndices(
+            layout_, [&](size_t observationIndex, size_t canonicalIndex) {
+                visitor(observations_[observationIndex], canonicalIndex);
+            });
+    }
+
+private:
+    const std::vector<CompactFiberAnchorObservation>& observations_;
+    detail::FiberAnchorOwnedCellTileLayout layout_;
+};
+
+template <typename ObservationRange, typename Visitor>
+void visitObservations(const ObservationRange& observations, Visitor&& visitor)
+{
+    for (size_t index = 0; index < observations.size(); ++index)
+        visitor(observations[index], index);
+}
+
+template <typename Visitor>
+void visitObservations(
+    const DenseOwnedCompactObservationRange& observations,
+    Visitor&& visitor)
+{
+    observations.visit(std::forward<Visitor>(visitor));
+}
 
 template <typename Observation>
 [[nodiscard]] bool observationGradientValid(
@@ -350,16 +521,16 @@ template <typename Observation>
     return observations.presenceGradientValid(index);
 }
 
-[[nodiscard]] cv::Vec3d normalized(const cv::Vec3d& value)
+[[nodiscard]] cv::Vec3f normalized(const cv::Vec3f& value)
 {
-    const double norm2 = value.dot(value);
+    const float norm2 = value.dot(value);
     if (!(norm2 > kMatrixEpsilon * kMatrixEpsilon) || !std::isfinite(norm2))
-        return {0.0, 0.0, 0.0};
+        return {0.0F, 0.0F, 0.0F};
     return value / std::sqrt(norm2);
 }
 
-[[nodiscard]] std::array<cv::Vec3d, 2> transverseBasis(
-    const cv::Vec3d& axis)
+[[nodiscard]] std::array<cv::Vec3f, 2> transverseBasis(
+    const cv::Vec3f& axis)
 {
     size_t referenceIndex = 0;
     for (size_t index = 1; index < 3; ++index) {
@@ -368,21 +539,21 @@ template <typename Observation>
             referenceIndex = index;
         }
     }
-    cv::Vec3d reference{0.0, 0.0, 0.0};
-    reference[static_cast<int>(referenceIndex)] = 1.0;
-    const cv::Vec3d first = normalized(
+    cv::Vec3f reference{0.0F, 0.0F, 0.0F};
+    reference[static_cast<int>(referenceIndex)] = 1.0F;
+    const cv::Vec3f first = normalized(
         reference - axis * reference.dot(axis));
     return {first, normalized(axis.cross(first))};
 }
 
 [[nodiscard]] bool insidePeakDomain(
-    const cv::Vec3d& point,
-    const cv::Vec3d& pivot,
+    const cv::Vec3f& point,
+    const cv::Vec3f& pivot,
     const PeakOwnerBounds& owner,
-    double radius)
+    float radius)
 {
-    const cv::Vec3d offset = point - pivot;
-    if (offset.dot(offset) > radius * radius + 1.0e-12)
+    const cv::Vec3f offset = point - pivot;
+    if (offset.dot(offset) > radius * radius + kGeometryEpsilon)
         return false;
     for (int coordinate = 0; coordinate < 3; ++coordinate) {
         if (point[coordinate] < owner.lower[coordinate] ||
@@ -393,12 +564,12 @@ template <typename Observation>
     return true;
 }
 
-[[nodiscard]] cv::Matx33d weightedTensor(
+[[nodiscard]] cv::Matx33f weightedTensor(
     const std::vector<WeightedObservation>& observations,
     const std::vector<uint8_t>* assignments,
     uint8_t component)
 {
-    std::array<CompensatedSum, 9> sums;
+    std::array<FloatSum, 9> sums;
     for (size_t index = 0; index < observations.size(); ++index) {
         if (assignments != nullptr && (*assignments)[index] != component)
             continue;
@@ -411,7 +582,7 @@ template <typename Observation>
             }
         }
     }
-    cv::Matx33d tensor;
+    cv::Matx33f tensor;
     for (int row = 0; row < 3; ++row) {
         for (int column = 0; column < 3; ++column)
             tensor(row, column) = sums[static_cast<size_t>(row * 3 + column)].sum;
@@ -421,91 +592,91 @@ template <typename Observation>
 
 [[nodiscard]] std::vector<uint8_t> assignObservations(
     const std::vector<WeightedObservation>& observations,
-    const std::array<cv::Vec3d, 2>& axes)
+    const std::array<cv::Vec3f, 2>& axes)
 {
     std::vector<uint8_t> assignments(observations.size(), 0);
     for (size_t index = 0; index < observations.size(); ++index) {
-        const double dot0 = observations[index].direction.dot(axes[0]);
-        const double dot1 = observations[index].direction.dot(axes[1]);
+        const float dot0 = observations[index].direction.dot(axes[0]);
+        const float dot1 = observations[index].direction.dot(axes[1]);
         assignments[index] = dot0 * dot0 >= dot1 * dot1 ? 0 : 1;
     }
     return assignments;
 }
 
-[[nodiscard]] double objectiveNumerator(
+[[nodiscard]] float objectiveNumerator(
     const std::vector<WeightedObservation>& observations,
-    const std::array<cv::Vec3d, 2>& axes)
+    const std::array<cv::Vec3f, 2>& axes)
 {
-    CompensatedSum result;
+    FloatSum result;
     for (const auto& observation : observations) {
-        const double dot0 = observation.direction.dot(axes[0]);
-        const double dot1 = observation.direction.dot(axes[1]);
+        const float dot0 = observation.direction.dot(axes[0]);
+        const float dot1 = observation.direction.dot(axes[1]);
         result.add(observation.weight * std::max(dot0 * dot0, dot1 * dot1));
     }
     return result.sum;
 }
 
-[[nodiscard]] double projectiveUpdate(const cv::Vec3d& before, const cv::Vec3d& after)
+[[nodiscard]] float projectiveUpdate(const cv::Vec3f& before, const cv::Vec3f& after)
 {
-    return 1.0 - std::clamp(std::abs(before.dot(after)), 0.0, 1.0);
+    return 1.0F - std::clamp(std::abs(before.dot(after)), 0.0F, 1.0F);
 }
 
-[[nodiscard]] cv::Vec3d projectToConstraintPlane(
-    const cv::Vec3d& point,
-    const cv::Vec3d& pivot,
-    const cv::Vec3d& axis)
+[[nodiscard]] cv::Vec3f projectToConstraintPlane(
+    const cv::Vec3f& point,
+    const cv::Vec3f& pivot,
+    const cv::Vec3f& axis)
 {
     return point - axis * ((point - pivot).dot(axis));
 }
 
-[[nodiscard]] cv::Vec3d clampToWindow(
-    const cv::Vec3d& point,
-    const cv::Vec3d& pivot,
-    const cv::Vec3d& axis,
-    double radius,
-    const cv::Vec3d& lower,
-    const cv::Vec3d& upper)
+[[nodiscard]] cv::Vec3f clampToWindow(
+    const cv::Vec3f& point,
+    const cv::Vec3f& pivot,
+    const cv::Vec3f& axis,
+    float radius,
+    const cv::Vec3f& lower,
+    const cv::Vec3f& upper)
 {
-    cv::Vec3d offset = projectToConstraintPlane(point, pivot, axis) - pivot;
-    const double length = std::sqrt(std::max(0.0, offset.dot(offset)));
+    cv::Vec3f offset = projectToConstraintPlane(point, pivot, axis) - pivot;
+    const float length = std::sqrt(std::max(0.0F, offset.dot(offset)));
     if (length > radius)
         offset *= radius / length;
-    double scale = 1.0;
+    float scale = 1.0F;
     for (int coordinate = 0; coordinate < 3; ++coordinate) {
-        if (offset[coordinate] > 0.0) {
+        if (offset[coordinate] > 0.0F) {
             scale = std::min(
                 scale, (upper[coordinate] - pivot[coordinate]) /
                     offset[coordinate]);
-        } else if (offset[coordinate] < 0.0) {
+        } else if (offset[coordinate] < 0.0F) {
             scale = std::min(
                 scale, (lower[coordinate] - pivot[coordinate]) /
                     offset[coordinate]);
         }
     }
-    return pivot + offset * std::clamp(scale, 0.0, 1.0);
+    return pivot + offset * std::clamp(scale, 0.0F, 1.0F);
 }
 
 template <typename Observation>
-[[nodiscard]] double transverseGaussian(
+[[nodiscard]] float transverseGaussian(
     const Observation& observation,
     const RefinedComponentState& component,
-    const cv::Vec3d& pivot,
+    const cv::Vec3f& pivot,
     const FiberAnchorConfig& config)
 {
-    const cv::Vec3d position = observationPosition(observation);
+    const cv::Vec3f position = observationPosition(observation);
     if (!finiteVector(position))
-        return 0.0;
-    const double axial = (position - pivot).dot(component.axis);
+        return 0.0F;
+    const float axial = (position - pivot).dot(component.axis);
     if (std::abs(axial) > config.axialSupportHalfWidthPredictionVoxels)
-        return 0.0;
-    const cv::Vec3d offset = position - component.position;
-    const cv::Vec3d transverse = offset - component.axis * offset.dot(component.axis);
-    const double distanceSquared = transverse.dot(transverse);
-    const double cutoff = config.gaussianCutoffSigmas * config.gaussianSigmaPredictionVoxels;
+        return 0.0F;
+    const cv::Vec3f offset = position - component.position;
+    const cv::Vec3f transverse = offset - component.axis * offset.dot(component.axis);
+    const float distanceSquared = transverse.dot(transverse);
+    const float cutoff = config.gaussianCutoffSigmas * config.gaussianSigmaPredictionVoxels;
     if (distanceSquared > cutoff * cutoff)
-        return 0.0;
+        return 0.0F;
     return std::exp(-distanceSquared /
-        (2.0 * config.gaussianSigmaPredictionVoxels *
+        (2.0F * config.gaussianSigmaPredictionVoxels *
          config.gaussianSigmaPredictionVoxels));
 }
 
@@ -513,39 +684,39 @@ template <typename Observation>
 [[nodiscard]] bool usableDirectionObservation(
     const Observation& observation,
     const FiberAnchorConfig& config,
-    cv::Vec3d& direction)
+    cv::Vec3f& direction)
 {
-    const double presence = observationPresence(observation);
+    const float presence = observationPresence(observation);
     if (!observation.valid || !finiteVector(observation.direction) ||
         !std::isfinite(presence) ||
         presence < config.observationPresenceFloor ||
-        presence < 0.0 || presence > 1.0) {
+        presence < 0.0F || presence > 1.0F) {
         return false;
     }
-    direction = normalized(cv::Vec3d{observation.direction});
+    direction = normalized(cv::Vec3f{observation.direction});
     return direction.dot(direction) > kMatrixEpsilon;
 }
 
 [[nodiscard]] bool usableDirectionObservation(
     const CompactFiberAnchorObservation& observation,
     const FiberAnchorConfig& config,
-    cv::Vec3d& direction)
+    cv::Vec3f& direction)
 {
-    const double presence = observationPresence(observation);
+    const float presence = observationPresence(observation);
     if (!observation.valid || !finiteVector(observation.direction) ||
         !std::isfinite(presence) ||
         presence < config.observationPresenceFloor ||
-        presence < 0.0 || presence > 1.0) {
+        presence < 0.0F || presence > 1.0F) {
         return false;
     }
-    direction = cv::Vec3d{observation.direction};
+    direction = cv::Vec3f{observation.direction};
     return direction.dot(direction) > kMatrixEpsilon;
 }
 
 struct RobustDirectionProposal {
     std::vector<uint8_t> assignments;
     std::vector<uint8_t> retainedInliers;
-    std::array<cv::Vec3d, 2> axes{};
+    std::array<cv::Vec3f, 2> axes{};
     std::array<bool, 2> unique{false, false};
 };
 
@@ -554,42 +725,79 @@ template <typename ObservationRange>
     const ObservationRange& observations,
     const std::array<RefinedComponentState, 2>& components,
     size_t activeComponents,
-    const cv::Vec3d& pivot,
+    const cv::Vec3f& pivot,
     const FiberAnchorConfig& config,
     FiberAnchorFitProfile* profile,
     bool computeAxes)
 {
+    using Observation =
+        std::remove_cvref_t<decltype(observations[size_t{0}])>;
+    using Scalar = FiberAnchorProposalScalar<Observation>;
+    constexpr bool compactFloatProposal = std::is_same_v<
+        Observation, CompactFiberAnchorObservation>;
+    using TensorEntry = std::conditional_t<
+        compactFloatProposal, float, FloatSum>;
+    using ScalarTensor = std::array<TensorEntry, 6>;
+    using TensorHistogram = std::array<ScalarTensor, kRobustHistogramBins>;
+
     RobustDirectionProposal proposal;
     proposal.assignments.assign(observations.size(), kUnassignedComponent);
     proposal.retainedInliers.assign(observations.size(), 0);
-    std::array<std::array<double, kRobustHistogramBins>, 2> residualHistograms{};
-    using SymmetricTensor = std::array<CompensatedSum, 6>;
-    using TensorHistogram = std::array<SymmetricTensor, kRobustHistogramBins>;
+    std::array<std::array<Scalar, kRobustHistogramBins>, 2>
+        scalarResidualHistograms{};
     std::optional<std::array<TensorHistogram, 2>> tensorHistograms;
     if (computeAxes)
         tensorHistograms.emplace();
-    std::array<double, 2> totalMass{0.0, 0.0};
+    std::array<float, 2> totalMass{0.0F, 0.0F};
+
+    std::array<FiberAnchorProposalComponent<Scalar>, 2> scalarComponents{};
+    for (size_t component = 0; component < activeComponents; ++component) {
+        for (int coordinate = 0; coordinate < 3; ++coordinate) {
+            scalarComponents[component].axis[coordinate] =
+                static_cast<Scalar>(components[component].axis[coordinate]);
+            scalarComponents[component].position[coordinate] =
+                static_cast<Scalar>(components[component].position[coordinate]);
+        }
+    }
+    const FiberAnchorProposalVector<Scalar> scalarPivot{
+        static_cast<Scalar>(pivot[0]),
+        static_cast<Scalar>(pivot[1]),
+        static_cast<Scalar>(pivot[2]),
+    };
+    const Scalar presenceFloor =
+        static_cast<Scalar>(config.observationPresenceFloor);
+    const Scalar axialSupportHalfWidth =
+        static_cast<Scalar>(config.axialSupportHalfWidthPredictionVoxels);
+    const Scalar gaussianSigma =
+        static_cast<Scalar>(config.gaussianSigmaPredictionVoxels);
+    const Scalar gaussianCutoff = static_cast<Scalar>(
+        config.gaussianCutoffSigmas *
+        config.gaussianSigmaPredictionVoxels);
 
     for (size_t index = 0; index < observations.size(); ++index) {
         const auto& observation = observations[index];
-        cv::Vec3d direction;
-        if (!usableDirectionObservation(observation, config, direction))
+        FiberAnchorProposalVector<Scalar> direction;
+        if (!usableProposalDirection(
+                observation, presenceFloor, direction)) {
             continue;
-        std::array<double, 2> gaussian{0.0, 0.0};
-        std::array<double, 2> alignment{0.0, 0.0};
-        std::array<double, 2> score{0.0, 0.0};
+        }
+        const Scalar presence = static_cast<Scalar>(observation.presence);
+        std::array<Scalar, 2> gaussian{Scalar{0}, Scalar{0}};
+        std::array<Scalar, 2> alignment{Scalar{0}, Scalar{0}};
+        std::array<Scalar, 2> score{Scalar{0}, Scalar{0}};
         for (size_t component = 0; component < activeComponents; ++component) {
-            gaussian[component] = transverseGaussian(
-                observation, components[component], pivot, config);
-            const double dot = direction.dot(components[component].axis);
+            gaussian[component] = proposalTransverseGaussian(
+                observation, scalarComponents[component], scalarPivot,
+                axialSupportHalfWidth, gaussianCutoff, gaussianSigma);
+            const Scalar dot =
+                direction.dot(scalarComponents[component].axis);
             alignment[component] = dot * dot;
-            score[component] = gaussian[component] *
-                observationPresence(observation) *
-                alignment[component];
+            score[component] =
+                gaussian[component] * presence * alignment[component];
         }
         uint8_t assigned = kUnassignedComponent;
         for (size_t component = 0; component < activeComponents; ++component) {
-            if (score[component] > 0.0 &&
+            if (score[component] > Scalar{0} &&
                 (assigned == kUnassignedComponent ||
                  score[component] > score[assigned])) {
                 assigned = static_cast<uint8_t>(component);
@@ -598,39 +806,61 @@ template <typename ObservationRange>
         proposal.assignments[index] = assigned;
         if (assigned == kUnassignedComponent)
             continue;
-        const double mass = gaussian[assigned] *
-            observationPresence(observation);
-        const double residual = std::clamp(1.0 - alignment[assigned], 0.0, 1.0);
+        const Scalar mass = gaussian[assigned] * presence;
+        const Scalar residual = std::clamp(
+            Scalar{1} - alignment[assigned], Scalar{0}, Scalar{1});
         const size_t residualBin = robustHistogramBin(residual);
         proposal.retainedInliers[index] = static_cast<uint8_t>(residualBin);
-        residualHistograms[assigned][residualBin] += mass;
-        totalMass[assigned] += mass;
+        scalarResidualHistograms[assigned][residualBin] += mass;
+        if constexpr (!compactFloatProposal)
+            totalMass[assigned] += static_cast<float>(mass);
         if (tensorHistograms.has_value()) {
             auto& tensor = (*tensorHistograms)[assigned][residualBin];
-            tensor[0].add(mass * direction[0] * direction[0]);
-            tensor[1].add(mass * direction[0] * direction[1]);
-            tensor[2].add(mass * direction[0] * direction[2]);
-            tensor[3].add(mass * direction[1] * direction[1]);
-            tensor[4].add(mass * direction[1] * direction[2]);
-            tensor[5].add(mass * direction[2] * direction[2]);
+            const std::array<Scalar, 6> values{
+                mass * direction[0] * direction[0],
+                mass * direction[0] * direction[1],
+                mass * direction[0] * direction[2],
+                mass * direction[1] * direction[1],
+                mass * direction[1] * direction[2],
+                mass * direction[2] * direction[2],
+            };
+            for (size_t entry = 0; entry < tensor.size(); ++entry) {
+                if constexpr (compactFloatProposal)
+                    tensor[entry] += values[entry];
+                else
+                    tensor[entry].add(values[entry]);
+            }
         }
     }
     if (profile != nullptr)
         profile->localTensorObservationVisits += observations.size();
 
+    std::array<std::array<float, kRobustHistogramBins>, 2>
+        residualHistograms{};
+    for (size_t component = 0; component < activeComponents; ++component) {
+        for (size_t residualBin = 0;
+             residualBin < kRobustHistogramBins; ++residualBin) {
+            const float mass = static_cast<float>(
+                scalarResidualHistograms[component][residualBin]);
+            residualHistograms[component][residualBin] = mass;
+            if constexpr (compactFloatProposal)
+                totalMass[component] += mass;
+        }
+    }
+
     std::array<size_t, 2> cutoffBins{
         kRobustHistogramBins - 1, kRobustHistogramBins - 1};
     for (size_t component = 0; component < activeComponents; ++component) {
-        if (!(totalMass[component] > 0.0) ||
-            !(config.robustMaximumTrimMassFraction > 0.0)) {
+        if (!(totalMass[component] > 0.0F) ||
+            !(config.robustMaximumTrimMassFraction > 0.0F)) {
             if (profile != nullptr)
                 profile->robustRetainedMass += totalMass[component];
             continue;
         }
         const size_t medianBin = weightedHistogramQuantileBin(
-            residualHistograms[component], totalMass[component], 0.5);
-        const double median = robustHistogramCenter(medianBin);
-        std::array<double, kRobustHistogramBins> deviationHistogram{};
+            residualHistograms[component], totalMass[component], 0.5F);
+        const float median = robustHistogramCenter(medianBin);
+        std::array<float, kRobustHistogramBins> deviationHistogram{};
         for (size_t residualBin = 0; residualBin < kRobustHistogramBins;
              ++residualBin) {
             deviationHistogram[robustHistogramBin(std::abs(
@@ -656,7 +886,7 @@ template <typename ObservationRange>
                 cutoff.summary.candidateTrimmedMass;
             profile->robustTrimmedMass += cutoff.summary.trimmedMass;
             profile->robustRetainedMass += cutoff.summary.retainedMass;
-            if (cutoff.summary.trimmedMass > 0.0)
+            if (cutoff.summary.trimmedMass > 0.0F)
                 ++profile->robustTrimmedComponents;
         }
     }
@@ -672,20 +902,31 @@ template <typename ObservationRange>
     if (!computeAxes)
         return proposal;
     for (size_t component = 0; component < activeComponents; ++component) {
-        SymmetricTensor sums;
+        std::array<float, 6> sums{};
+        std::array<FloatSum, 6> compensatedSums{};
         for (size_t residualBin = 0;
              residualBin <= cutoffBins[component]; ++residualBin) {
             for (size_t entry = 0; entry < sums.size(); ++entry) {
-                sums[entry].add(
-                    (*tensorHistograms)[component][residualBin][entry].sum);
+                if constexpr (compactFloatProposal) {
+                    sums[entry] += static_cast<float>(
+                        (*tensorHistograms)[component][residualBin][entry]);
+                } else {
+                    compensatedSums[entry].add(
+                        (*tensorHistograms)[component]
+                            [residualBin][entry].sum);
+                }
             }
         }
-        const cv::Matx33d tensor{
-            sums[0].sum, sums[1].sum, sums[2].sum,
-            sums[1].sum, sums[3].sum, sums[4].sum,
-            sums[2].sum, sums[4].sum, sums[5].sum,
+        if constexpr (!compactFloatProposal) {
+            for (size_t entry = 0; entry < sums.size(); ++entry)
+                sums[entry] = compensatedSums[entry].sum;
+        }
+        const cv::Matx33f tensor{
+            sums[0], sums[1], sums[2],
+            sums[1], sums[3], sums[4],
+            sums[2], sums[4], sums[5],
         };
-        const FiberPrincipalAxis principal = principalFiberAxis(tensor);
+        const FiberPrincipalAxisF principal = principalFiberAxisF(tensor);
         proposal.unique[component] = principal.unique;
         if (principal.unique)
             proposal.axes[component] = principal.axis;
@@ -693,145 +934,153 @@ template <typename ObservationRange>
     return proposal;
 }
 
-template <typename ObservationRange>
-[[nodiscard]] double retainedSpatialObjective(
-    const ObservationRange& observations,
+[[nodiscard]] detail::FiberAnchorObjectiveConfig objectiveConfig(
+    const FiberAnchorConfig& config)
+{
+    return {
+        config.gaussianSigmaPredictionVoxels,
+        config.gaussianCutoffSigmas,
+        config.axialSupportHalfWidthPredictionVoxels,
+        config.observationPresenceFloor,
+    };
+}
+
+[[nodiscard]] std::array<detail::FiberAnchorObjectiveComponent, 2>
+objectiveComponents(const std::array<RefinedComponentState, 2>& components)
+{
+    std::array<detail::FiberAnchorObjectiveComponent, 2> result;
+    for (size_t component = 0; component < result.size(); ++component) {
+        result[component].axis = components[component].axis;
+        result[component].position = components[component].position;
+    }
+    return result;
+}
+
+[[nodiscard]] float retainedSpatialObjective(
+    const std::vector<FiberAnchorObservation>& observations,
     const std::array<RefinedComponentState, 2>& components,
     size_t activeComponents,
     const std::vector<uint8_t>& assignments,
     const std::vector<uint8_t>& retainedInliers,
-    const cv::Vec3d& pivot,
+    const cv::Vec3f& pivot,
     const FiberAnchorConfig& config)
 {
-    CompensatedSum numerator;
-    CompensatedSum denominator;
-    for (size_t index = 0; index < observations.size(); ++index) {
-        for (size_t component = 0; component < activeComponents; ++component) {
-            denominator.add(transverseGaussian(
-                observations[index], components[component], pivot, config));
-        }
-        const uint8_t component = assignments[index];
-        cv::Vec3d direction;
-        if (!retainedInliers[index] || component >= activeComponents)
-            continue;
-        if (!usableDirectionObservation(observations[index], config, direction))
-            continue;
-        const double gaussian = transverseGaussian(
-            observations[index], components[component], pivot, config);
-        const double dot = direction.dot(components[component].axis);
-        numerator.add(gaussian * observationPresence(observations[index]) *
-            dot * dot);
-    }
-    return denominator.sum > 0.0 ? numerator.sum / denominator.sum : 0.0;
+    return detail::retainedSpatialObjectiveExpanded(
+        observations, objectiveComponents(components), activeComponents,
+        assignments, retainedInliers, pivot, objectiveConfig(config));
 }
 
-template <typename ObservationRange>
-[[nodiscard]] std::array<double, 2> retainedSpatialObjectivePair(
-    const ObservationRange& observations,
+[[nodiscard]] std::array<float, 2> retainedSpatialObjectivePair(
+    const std::vector<FiberAnchorObservation>& observations,
     const std::array<RefinedComponentState, 2>& first,
     const std::array<RefinedComponentState, 2>& second,
     size_t activeComponents,
     const std::vector<uint8_t>& assignments,
     const std::vector<uint8_t>& retainedInliers,
-    const cv::Vec3d& pivot,
+    const cv::Vec3f& pivot,
     const FiberAnchorConfig& config)
 {
-    std::array<CompensatedSum, 2> numerators;
-    std::array<CompensatedSum, 2> denominators;
-    for (size_t index = 0; index < observations.size(); ++index) {
-        const auto& observation = observations[index];
-        for (size_t component = 0; component < activeComponents; ++component) {
-            denominators[0].add(transverseGaussian(
-                observation, first[component], pivot, config));
-            denominators[1].add(transverseGaussian(
-                observation, second[component], pivot, config));
-        }
-        const uint8_t component = assignments[index];
-        if (!retainedInliers[index] || component >= activeComponents)
-            continue;
-        cv::Vec3d direction;
-        if (!usableDirectionObservation(observation, config, direction))
-            continue;
-        const double firstGaussian = transverseGaussian(
-            observation, first[component], pivot, config);
-        const double secondGaussian = transverseGaussian(
-            observation, second[component], pivot, config);
-        const double firstDot = direction.dot(first[component].axis);
-        const double secondDot = direction.dot(second[component].axis);
-        numerators[0].add(
-            firstGaussian * observationPresence(observation) *
-            firstDot * firstDot);
-        numerators[1].add(
-            secondGaussian * observationPresence(observation) *
-            secondDot * secondDot);
-    }
-    return {
-        denominators[0].sum > 0.0
-            ? numerators[0].sum / denominators[0].sum
-            : 0.0,
-        denominators[1].sum > 0.0
-            ? numerators[1].sum / denominators[1].sum
-            : 0.0,
-    };
+    return detail::retainedSpatialObjectivePairExpanded(
+        observations, objectiveComponents(first), objectiveComponents(second),
+        activeComponents, assignments, retainedInliers, pivot,
+        objectiveConfig(config));
 }
 
-template <typename ObservationRange>
-[[nodiscard]] RefinedEvaluation evaluateFinalRefinedState(
-    const ObservationRange& observations,
+[[nodiscard]] float retainedSpatialObjective(
+    const IndexedObservationRange<CompactFiberAnchorObservation>& observations,
     const std::array<RefinedComponentState, 2>& components,
     size_t activeComponents,
     const std::vector<uint8_t>& assignments,
     const std::vector<uint8_t>& retainedInliers,
-    const cv::Vec3d& pivot,
+    const cv::Vec3f& pivot,
     const FiberAnchorConfig& config)
+{
+    return detail::retainedSpatialObjectiveCompact(
+        observations.observationStorage(), observations.observationIndices(),
+        objectiveComponents(components), activeComponents, assignments,
+        retainedInliers, pivot, objectiveConfig(config));
+}
+
+[[nodiscard]] std::array<float, 2> retainedSpatialObjectivePair(
+    const IndexedObservationRange<CompactFiberAnchorObservation>& observations,
+    const std::array<RefinedComponentState, 2>& first,
+    const std::array<RefinedComponentState, 2>& second,
+    size_t activeComponents,
+    const std::vector<uint8_t>& assignments,
+    const std::vector<uint8_t>& retainedInliers,
+    const cv::Vec3f& pivot,
+    const FiberAnchorConfig& config)
+{
+    return detail::retainedSpatialObjectivePairCompact(
+        observations.observationStorage(), observations.observationIndices(),
+        objectiveComponents(first), objectiveComponents(second),
+        activeComponents, assignments, retainedInliers, pivot,
+        objectiveConfig(config));
+}
+
+[[nodiscard]] RefinedEvaluation finalEvaluationResult(
+    const detail::FiberAnchorFinalEvaluation& reduced,
+    const std::vector<uint8_t>& assignments,
+    const std::vector<uint8_t>& retainedInliers)
 {
     RefinedEvaluation evaluation;
     evaluation.assignments = assignments;
     evaluation.retainedInliers = retainedInliers;
-    std::array<CompensatedSum, 2> denominators;
-    std::array<CompensatedSum, 2> numerators;
-    std::array<CompensatedSum, 2> presenceMasses;
-    for (size_t index = 0; index < observations.size(); ++index) {
-        const auto& observation = observations[index];
-        for (size_t component = 0; component < activeComponents; ++component) {
-            denominators[component].add(transverseGaussian(
-                observation, components[component], pivot, config));
-        }
-        const uint8_t assigned = assignments[index];
-        if (!retainedInliers[index] || assigned >= activeComponents)
-            continue;
-        cv::Vec3d direction;
-        if (!usableDirectionObservation(observation, config, direction))
-            continue;
-        const double gaussian = transverseGaussian(
-            observation, components[assigned], pivot, config);
-        const double dot = direction.dot(components[assigned].axis);
-        numerators[assigned].add(
-            gaussian * observationPresence(observation) * dot * dot);
-        presenceMasses[assigned].add(
-            gaussian * observationPresence(observation));
-        ++evaluation.assignedCounts[assigned];
+    for (size_t component = 0; component < 2; ++component) {
+        evaluation.denominators[component] =
+            static_cast<float>(reduced.denominators[component]);
+        evaluation.numerators[component] =
+            static_cast<float>(reduced.numerators[component]);
+        evaluation.presenceMasses[component] =
+            static_cast<float>(reduced.presenceMasses[component]);
+        evaluation.alignedSupports[component] =
+            static_cast<float>(reduced.alignedSupports[component]);
+        evaluation.directionalCoherences[component] =
+            static_cast<float>(reduced.directionalCoherences[component]);
+        evaluation.assignedCounts[component] = reduced.assignedCounts[component];
     }
-    CompensatedSum numeratorTotal;
-    CompensatedSum denominatorTotal;
-    for (size_t component = 0; component < activeComponents; ++component) {
-        evaluation.denominators[component] = denominators[component].sum;
-        evaluation.numerators[component] = numerators[component].sum;
-        evaluation.presenceMasses[component] = presenceMasses[component].sum;
-        numeratorTotal.add(numerators[component].sum);
-        denominatorTotal.add(denominators[component].sum);
-    }
-    evaluation.objective = denominatorTotal.sum > 0.0
-        ? numeratorTotal.sum / denominatorTotal.sum
-        : 0.0;
+    evaluation.objective = static_cast<float>(reduced.objective);
     return evaluation;
+}
+
+[[nodiscard]] RefinedEvaluation evaluateFinalRefinedState(
+    const std::vector<FiberAnchorObservation>& observations,
+    const std::array<RefinedComponentState, 2>& components,
+    size_t activeComponents,
+    const std::vector<uint8_t>& assignments,
+    const std::vector<uint8_t>& retainedInliers,
+    const cv::Vec3f& pivot,
+    const FiberAnchorConfig& config)
+{
+    return finalEvaluationResult(
+        detail::finalAnchorEvaluationExpanded(
+            observations, objectiveComponents(components), activeComponents,
+            assignments, retainedInliers, pivot, objectiveConfig(config)),
+        assignments, retainedInliers);
+}
+
+[[nodiscard]] RefinedEvaluation evaluateFinalRefinedState(
+    const IndexedObservationRange<CompactFiberAnchorObservation>& observations,
+    const std::array<RefinedComponentState, 2>& components,
+    size_t activeComponents,
+    const std::vector<uint8_t>& assignments,
+    const std::vector<uint8_t>& retainedInliers,
+    const cv::Vec3f& pivot,
+    const FiberAnchorConfig& config)
+{
+    return finalEvaluationResult(
+        detail::finalAnchorEvaluationCompact(
+            observations.observationStorage(), observations.observationIndices(),
+            objectiveComponents(components), activeComponents, assignments,
+            retainedInliers, pivot, objectiveConfig(config)),
+        assignments, retainedInliers);
 }
 
 template <typename ObservationRange>
 [[nodiscard]] RefinedFitState refineLocalComponents(
     const ObservationRange& observations,
-    const cv::Vec3d& pivot,
-    const std::array<cv::Vec3d, 2>& seedAxes,
+    const cv::Vec3f& pivot,
+    const std::array<cv::Vec3f, 2>& seedAxes,
     const std::array<size_t, 2>& seedComponentIds,
     size_t activeComponents,
     const FiberAnchorConfig& config,
@@ -841,22 +1090,22 @@ template <typename ObservationRange>
     RefinedFitState state;
     state.activeComponents = activeComponents;
     for (size_t component = 0; component < activeComponents; ++component) {
-        state.components[component].axis = canonicalFiberAxis(seedAxes[component]);
+        state.components[component].axis = canonicalFiberAxisF(seedAxes[component]);
         state.components[component].position = pivot;
         state.componentIds[component] = seedComponentIds[component];
     }
-    cv::Vec3d lower{
-        std::numeric_limits<double>::infinity(),
-        std::numeric_limits<double>::infinity(),
-        std::numeric_limits<double>::infinity(),
+    cv::Vec3f lower{
+        std::numeric_limits<float>::infinity(),
+        std::numeric_limits<float>::infinity(),
+        std::numeric_limits<float>::infinity(),
     };
-    cv::Vec3d upper{
-        -std::numeric_limits<double>::infinity(),
-        -std::numeric_limits<double>::infinity(),
-        -std::numeric_limits<double>::infinity(),
+    cv::Vec3f upper{
+        -std::numeric_limits<float>::infinity(),
+        -std::numeric_limits<float>::infinity(),
+        -std::numeric_limits<float>::infinity(),
     };
     for (size_t index = 0; index < observations.size(); ++index) {
-        const cv::Vec3d position = observationPosition(observations[index]);
+        const cv::Vec3f position = observationPosition(observations[index]);
         if (!finiteVector(position))
             continue;
         for (int coordinate = 0; coordinate < 3; ++coordinate) {
@@ -924,12 +1173,12 @@ template <typename ObservationRange>
             ? RefinementClock::now()
             : RefinementClock::time_point{};
         for (size_t component = 0; component < state.activeComponents; ++component) {
-            const cv::Vec3d projectedCurrent = projectToConstraintPlane(
+            const cv::Vec3f projectedCurrent = projectToConstraintPlane(
                 state.components[component].position,
                 pivot,
                 proposed[component].axis);
-            std::array<CompensatedSum, 3> centroid;
-            CompensatedSum centroidMass;
+            std::array<FloatSum, 3> centroid;
+            FloatSum centroidMass;
             RefinedComponentState centered{
                 proposed[component].axis,
                 projectedCurrent,
@@ -940,25 +1189,25 @@ template <typename ObservationRange>
                     continue;
                 }
                 const auto& observation = observations[index];
-                const double gaussian = transverseGaussian(
+                const float gaussian = transverseGaussian(
                     observation, centered, pivot, config);
-                cv::Vec3d direction;
+                cv::Vec3f direction;
                 if (!usableDirectionObservation(
                         observation, config, direction)) {
                     continue;
                 }
-                const double dot = direction.dot(centered.axis);
-                const double weight = gaussian *
+                const float dot = direction.dot(centered.axis);
+                const float weight = gaussian *
                     observationPresence(observation) * dot * dot;
                 centroidMass.add(weight);
-                const cv::Vec3d position = observationPosition(observation);
+                const cv::Vec3f position = observationPosition(observation);
                 for (int axis = 0; axis < 3; ++axis) {
                     centroid[axis].add(
                         weight * position[axis]);
                 }
             }
-            if (centroidMass.sum > 0.0) {
-                const cv::Vec3d mean{
+            if (centroidMass.sum > 0.0F) {
+                const cv::Vec3f mean{
                     centroid[0].sum / centroidMass.sum,
                     centroid[1].sum / centroidMass.sum,
                     centroid[2].sum / centroidMass.sum,
@@ -981,8 +1230,8 @@ template <typename ObservationRange>
         }
 
         std::array<RefinedComponentState, 2> baseline = state.components;
-        double acceptedDirectionUpdate = 0.0;
-        double maximumTargetDisplacement = 0.0;
+        float acceptedDirectionUpdate = 0.0F;
+        float maximumTargetDisplacement = 0.0F;
         for (size_t component = 0; component < state.activeComponents; ++component) {
             baseline[component].axis = proposed[component].axis;
             baseline[component].position = clampToWindow(
@@ -996,11 +1245,11 @@ template <typename ObservationRange>
                 projectiveUpdate(
                     state.components[component].axis,
                     baseline[component].axis));
-            const cv::Vec3d displacement =
+            const cv::Vec3f displacement =
                 proposed[component].position - baseline[component].position;
             maximumTargetDisplacement = std::max(
                 maximumTargetDisplacement,
-                std::sqrt(std::max(0.0, displacement.dot(displacement))));
+                std::sqrt(std::max(0.0F, displacement.dot(displacement))));
         }
         const auto evaluationStart = profile != nullptr
             ? RefinementClock::now()
@@ -1008,11 +1257,11 @@ template <typename ObservationRange>
         if (profile != nullptr)
             profile->refinedEvaluationObservationVisits += observations.size();
         auto acceptedComponents = baseline;
-        double acceptedPositionUpdate = 0.0;
+        float acceptedPositionUpdate = 0.0F;
         const auto fractions = fiberAnchorSpatialBacktrackingFractions(
             maximumTargetDisplacement,
             config.peakGridStepPredictionVoxels);
-        double baselineObjective = 0.0;
+        float baselineObjective = 0.0F;
         for (size_t depth = 0; depth < fractions.size(); ++depth) {
             if (profile != nullptr) {
                 ++profile->backtrackingEvaluations;
@@ -1030,7 +1279,7 @@ template <typename ObservationRange>
                     pivot, candidate[component].axis,
                     config.localWindowRadiusPredictionVoxels, lower, upper);
             }
-            double objective = 0.0;
+            float objective = 0.0F;
             if (depth == 0) {
                 const auto objectives = retainedSpatialObjectivePair(
                     observations, baseline, candidate, state.activeComponents,
@@ -1042,20 +1291,20 @@ template <typename ObservationRange>
                     observations, candidate, state.activeComponents,
                     robust.assignments, robust.retainedInliers, pivot, config);
             }
-            const double tolerance = config.convergenceTolerance *
-                std::max(1.0, std::abs(baselineObjective));
+            const float tolerance = config.convergenceTolerance *
+                std::max(1.0F, std::abs(baselineObjective));
             if (objective <= baselineObjective + tolerance)
                 continue;
             acceptedComponents = candidate;
             if (profile != nullptr)
                 ++profile->spatialCandidatesAcceptedByDepth[depth];
             for (size_t component = 0; component < state.activeComponents; ++component) {
-                const cv::Vec3d delta =
+                const cv::Vec3f delta =
                     acceptedComponents[component].position -
                     baseline[component].position;
                 acceptedPositionUpdate = std::max(
                     acceptedPositionUpdate,
-                    std::sqrt(std::max(0.0, delta.dot(delta))));
+                    std::sqrt(std::max(0.0F, delta.dot(delta))));
             }
             break;
         }
@@ -1068,7 +1317,7 @@ template <typename ObservationRange>
         state.evaluation.assignments = robust.assignments;
         state.evaluation.retainedInliers = robust.retainedInliers;
         ++state.acceptedIterations;
-        const double positionTolerance = std::max(
+        const float positionTolerance = std::max(
             config.positionConvergenceTolerancePredictionVoxels,
             config.peakGridStepPredictionVoxels);
         if (acceptedDirectionUpdate <= config.convergenceTolerance &&
@@ -1104,18 +1353,18 @@ template <typename ObservationRange>
     const std::array<size_t, 3>& cellBeginZYX,
     const std::array<size_t, 3>& cellEndZYX)
 {
-    cv::Vec3d observedLower{
-        std::numeric_limits<double>::infinity(),
-        std::numeric_limits<double>::infinity(),
-        std::numeric_limits<double>::infinity(),
+    cv::Vec3f observedLower{
+        std::numeric_limits<float>::infinity(),
+        std::numeric_limits<float>::infinity(),
+        std::numeric_limits<float>::infinity(),
     };
-    cv::Vec3d observedUpper{
-        -std::numeric_limits<double>::infinity(),
-        -std::numeric_limits<double>::infinity(),
-        -std::numeric_limits<double>::infinity(),
+    cv::Vec3f observedUpper{
+        -std::numeric_limits<float>::infinity(),
+        -std::numeric_limits<float>::infinity(),
+        -std::numeric_limits<float>::infinity(),
     };
     for (size_t index = 0; index < observations.size(); ++index) {
-        const cv::Vec3d position = observationPosition(observations[index]);
+        const cv::Vec3f position = observationPosition(observations[index]);
         if (!finiteVector(position))
             continue;
         for (int coordinate = 0; coordinate < 3; ++coordinate) {
@@ -1131,31 +1380,31 @@ template <typename ObservationRange>
     PeakOwnerBounds owner;
     for (int coordinate = 0; coordinate < 3; ++coordinate) {
         const size_t zyx = static_cast<size_t>(2 - coordinate);
-        const double begin = static_cast<double>(cellBeginZYX[zyx]);
-        const double end = static_cast<double>(cellEndZYX[zyx]);
-        owner.lower[coordinate] = std::max(observedLower[coordinate], begin - 0.5);
-        const double voronoiUpper = end - 0.5;
-        if (observedUpper[coordinate] <= end - 1.0) {
+        const float begin = static_cast<float>(cellBeginZYX[zyx]);
+        const float end = static_cast<float>(cellEndZYX[zyx]);
+        owner.lower[coordinate] = std::max(observedLower[coordinate], begin - 0.5F);
+        const float voronoiUpper = end - 0.5F;
+        if (observedUpper[coordinate] <= end - 1.0F) {
             owner.upper[coordinate] = observedUpper[coordinate];
         } else {
             owner.upper[coordinate] = std::nextafter(
                 std::min(observedUpper[coordinate], voronoiUpper),
-                -std::numeric_limits<double>::infinity());
+                -std::numeric_limits<float>::infinity());
         }
     }
     return owner;
 }
 
 struct DirectionConditionedPeak {
-    cv::Vec3d discrete{0.0, 0.0, 0.0};
-    cv::Vec3d separable1d{0.0, 0.0, 0.0};
-    cv::Vec3d joint2d{0.0, 0.0, 0.0};
+    cv::Vec3f discrete{0.0F, 0.0F, 0.0F};
+    cv::Vec3f separable1d{0.0F, 0.0F, 0.0F};
+    cv::Vec3f joint2d{0.0F, 0.0F, 0.0F};
 };
 
 template <typename ObservationRange>
 [[nodiscard]] DirectionConditionedPeak findDirectionConditionedLocalPeak(
     const ObservationRange& observations,
-    const cv::Vec3d& pivot,
+    const cv::Vec3f& pivot,
     const PeakOwnerBounds& owner,
     const std::array<RefinedComponentState, 2>& components,
     size_t selectedComponent,
@@ -1164,34 +1413,40 @@ template <typename ObservationRange>
     const FiberAnchorConfig& config,
     FiberAnchorFitProfile* profile)
 {
-    const cv::Vec3d axis = components[selectedComponent].axis;
+    const cv::Vec3f axis = components[selectedComponent].axis;
     const auto basis = transverseBasis(axis);
     const float cutoff = static_cast<float>(
         config.gaussianCutoffSigmas * config.peakSigmaPredictionVoxels);
-    const double axialCutoff =
+    const float axialCutoff =
         config.gaussianCutoffSigmas *
         config.peakAxialSigmaPredictionVoxels;
-    const double unionRadius = config.localWindowRadiusPredictionVoxels + cutoff;
-    const float invTwoTransverseSigma2 = static_cast<float>(1.0 /
-        (2.0 * config.peakSigmaPredictionVoxels *
+    const float unionRadius = config.localWindowRadiusPredictionVoxels + cutoff;
+    const float invTwoTransverseSigma2 = static_cast<float>(1.0F /
+        (2.0F * config.peakSigmaPredictionVoxels *
          config.peakSigmaPredictionVoxels));
-    const double invTwoAxialSigma2 = 1.0 /
-        (2.0 * config.peakAxialSigmaPredictionVoxels *
+    const float invTwoAxialSigma2 = 1.0F /
+        (2.0F * config.peakAxialSigmaPredictionVoxels *
          config.peakAxialSigmaPredictionVoxels);
 
-    struct PeakObservation {
+    constexpr uint32_t kNoPeakEvidence = std::numeric_limits<uint32_t>::max();
+    struct PeakResponseObservation {
         float first = 0.0F;
         float second = 0.0F;
         float axialGaussian = 0.0F;
         float signal = 0.0F;
+    };
+    struct PeakEvidenceObservation {
         float directionAlignmentSquared = 0.0F;
         float gradientFirst = 0.0F;
         float gradientSecond = 0.0F;
         float gradientNorm = 0.0F;
-        bool presenceGradientValid = false;
     };
-    std::vector<PeakObservation> peakObservations;
-    peakObservations.reserve(observations.size());
+    std::vector<PeakResponseObservation> responseObservations;
+    std::vector<uint32_t> evidenceIndices;
+    std::vector<PeakEvidenceObservation> evidenceObservations;
+    responseObservations.reserve(observations.size());
+    evidenceIndices.reserve(observations.size());
+    evidenceObservations.reserve(observations.size() / 2);
     if (profile != nullptr) {
         ++profile->peakComponents;
         profile->peakPreparationObservationVisits += observations.size();
@@ -1199,57 +1454,87 @@ template <typename ObservationRange>
     for (size_t observationIndex = 0;
          observationIndex < observations.size(); ++observationIndex) {
         const auto& observation = observations[observationIndex];
-        const cv::Vec3d position = observationPosition(observation);
+        const cv::Vec3f position = observationPosition(observation);
         if (!finiteVector(position))
             continue;
-        const cv::Vec3d pivotOffset = position - pivot;
-        const double axial = pivotOffset.dot(axis);
+        const cv::Vec3f pivotOffset = position - pivot;
+        const float axial = pivotOffset.dot(axis);
         if (std::abs(axial) > axialCutoff)
             continue;
-        const cv::Vec3d transverse = pivotOffset - axis * axial;
+        const cv::Vec3f transverse = pivotOffset - axis * axial;
         if (transverse.dot(transverse) > unionRadius * unionRadius)
             continue;
-        const double first = transverse.dot(basis[0]);
-        const double second = transverse.dot(basis[1]);
+        const float first = transverse.dot(basis[0]);
+        const float second = transverse.dot(basis[1]);
 
-        cv::Vec3d direction;
+        cv::Vec3f direction;
         const bool usablePositive = usableDirectionObservation(
             observation, config, direction);
         const bool retainedForComponent =
             retainedInliers[observationIndex] &&
             assignments[observationIndex] == selectedComponent;
-        double selectedAlignment = 0.0;
-        double signal = 0.0;
+        float selectedAlignment = 0.0F;
+        float signal = 0.0F;
         if (retainedForComponent && usablePositive) {
-            const double dot = direction.dot(axis);
+            const float dot = direction.dot(axis);
             selectedAlignment = dot * dot;
             signal = observationPresence(observation) * selectedAlignment;
         }
-        PeakObservation peakObservation;
-        peakObservation.first = static_cast<float>(first);
-        peakObservation.second = static_cast<float>(second);
-        peakObservation.axialGaussian = static_cast<float>(std::exp(
+        PeakResponseObservation responseObservation;
+        responseObservation.first = static_cast<float>(first);
+        responseObservation.second = static_cast<float>(second);
+        responseObservation.axialGaussian = static_cast<float>(std::exp(
             -axial * axial * invTwoAxialSigma2));
-        peakObservation.signal = static_cast<float>(signal);
-        peakObservation.directionAlignmentSquared =
-            static_cast<float>(selectedAlignment);
-        if (observationGradientValid(observations, observationIndex) &&
-            finiteVector(observation.presenceGradientPredictionXYZ)) {
-            const cv::Vec3d gradient = observationGradient(observation);
-            peakObservation.gradientFirst =
-                static_cast<float>(gradient.dot(basis[0]));
-            peakObservation.gradientSecond =
-                static_cast<float>(gradient.dot(basis[1]));
-            const double gradientNorm2 =
-                peakObservation.gradientFirst * peakObservation.gradientFirst +
-                peakObservation.gradientSecond * peakObservation.gradientSecond;
-            if (gradientNorm2 > kMatrixEpsilon) {
-                peakObservation.gradientNorm =
-                    static_cast<float>(std::sqrt(gradientNorm2));
-                peakObservation.presenceGradientValid = true;
+        responseObservation.signal = static_cast<float>(signal);
+        uint32_t evidenceIndex = kNoPeakEvidence;
+        const float alignment = static_cast<float>(selectedAlignment);
+        if (alignment > 0.0F) {
+            if (evidenceObservations.size() >= kNoPeakEvidence) {
+                throw std::overflow_error(
+                    "peak evidence observation index exceeds uint32 range");
             }
+            evidenceIndex = static_cast<uint32_t>(evidenceObservations.size());
+            PeakEvidenceObservation evidenceObservation;
+            evidenceObservation.directionAlignmentSquared = alignment;
+            if (observationGradientValid(observations, observationIndex) &&
+                finiteVector(observation.presenceGradientPredictionXYZ)) {
+                const cv::Vec3f gradient = observationGradient(observation);
+                evidenceObservation.gradientFirst =
+                    static_cast<float>(gradient.dot(basis[0]));
+                evidenceObservation.gradientSecond =
+                    static_cast<float>(gradient.dot(basis[1]));
+                const float gradientNorm2 =
+                    evidenceObservation.gradientFirst *
+                        evidenceObservation.gradientFirst +
+                    evidenceObservation.gradientSecond *
+                        evidenceObservation.gradientSecond;
+                if (gradientNorm2 > kMatrixEpsilon) {
+                    evidenceObservation.gradientNorm =
+                        static_cast<float>(std::sqrt(gradientNorm2));
+                }
+            }
+            evidenceObservations.push_back(evidenceObservation);
         }
-        peakObservations.push_back(peakObservation);
+        responseObservations.push_back(responseObservation);
+        evidenceIndices.push_back(evidenceIndex);
+    }
+    if (profile != nullptr) {
+        profile->peakPreparedResponseObservations += responseObservations.size();
+        profile->peakPreparedEvidenceObservations += evidenceObservations.size();
+        profile->peakResponseObservationRecordBytes = std::max(
+            profile->peakResponseObservationRecordBytes,
+            sizeof(PeakResponseObservation));
+        profile->peakEvidenceIndexRecordBytes = std::max(
+            profile->peakEvidenceIndexRecordBytes, sizeof(uint32_t));
+        profile->peakEvidenceObservationRecordBytes = std::max(
+            profile->peakEvidenceObservationRecordBytes,
+            sizeof(PeakEvidenceObservation));
+        profile->peakMaximumObservationStorageBytes = std::max(
+            profile->peakMaximumObservationStorageBytes,
+            responseObservations.capacity() * sizeof(PeakResponseObservation) +
+                evidenceIndices.capacity() * sizeof(uint32_t) +
+                evidenceObservations.capacity() *
+                    sizeof(PeakEvidenceObservation));
     }
 
     const auto responseAt = [&](float candidateFirst, float candidateSecond, bool acceptance) {
@@ -1258,15 +1543,19 @@ template <typename ObservationRange>
                 ++profile->peakAcceptanceResponses;
             else
                 ++profile->peakComputedGridResponses;
-            profile->peakResponseObservationVisits += peakObservations.size();
+            profile->peakResponseObservationVisits += responseObservations.size();
         }
-        CompensatedSum numerator;
-        CompensatedSum denominator;
-        CompensatedSum eligibleGradientWeight;
-        CompensatedSum validGradientWeight;
-        CompensatedSum inward;
-        CompensatedSum outward;
-        for (const auto& observation : peakObservations) {
+        size_t responseEvidenceVisits = 0;
+        FloatSum numerator;
+        FloatSum denominator;
+        FloatSum eligibleGradientWeight;
+        FloatSum validGradientWeight;
+        FloatSum inward;
+        FloatSum outward;
+        for (size_t observationIndex = 0;
+             observationIndex < responseObservations.size();
+             ++observationIndex) {
+            const auto& observation = responseObservations[observationIndex];
             const float radialFirst = candidateFirst - observation.first;
             const float radialSecond = candidateSecond - observation.second;
             const float distanceSquared =
@@ -1277,12 +1566,16 @@ template <typename ObservationRange>
                 std::exp(-distanceSquared * invTwoTransverseSigma2);
             denominator.add(gaussian);
             numerator.add(gaussian * observation.signal);
-            if (!(observation.directionAlignmentSquared > 0.0))
+            const uint32_t evidenceIndex = evidenceIndices[observationIndex];
+            if (evidenceIndex == kNoPeakEvidence)
                 continue;
+            const auto& evidence =
+                evidenceObservations[evidenceIndex];
+            ++responseEvidenceVisits;
             const float eligibleWeight =
-                gaussian * observation.directionAlignmentSquared;
+                gaussian * evidence.directionAlignmentSquared;
             eligibleGradientWeight.add(eligibleWeight);
-            if (!observation.presenceGradientValid) {
+            if (!(evidence.gradientNorm > 0.0F)) {
                 continue;
             }
             if (!(distanceSquared > kMatrixEpsilon)) {
@@ -1290,37 +1583,61 @@ template <typename ObservationRange>
             }
             validGradientWeight.add(eligibleWeight);
             const float cosine = std::clamp(
-                (observation.gradientFirst * radialFirst +
-                 observation.gradientSecond * radialSecond) /
-                    (observation.gradientNorm * std::sqrt(distanceSquared)),
+                (evidence.gradientFirst * radialFirst +
+                 evidence.gradientSecond * radialSecond) /
+                    (evidence.gradientNorm * std::sqrt(distanceSquared)),
                 -1.0F, 1.0F);
-            const float vote = eligibleWeight * observation.gradientNorm *
+            const float vote = eligibleWeight * evidence.gradientNorm *
                 static_cast<float>(config.peakSigmaPredictionVoxels) *
                 cosine * cosine;
-            if (cosine > 0.0)
+            if (cosine > 0.0F)
                 inward.add(vote);
-            else if (cosine < 0.0)
+            else if (cosine < 0.0F)
                 outward.add(vote);
         }
-        const double presenceResponse = denominator.sum > 0.0 ? numerator.sum / denominator.sum : 0.0;
-        if (!(config.peakGradientWeight > 0.0) || !(eligibleGradientWeight.sum > 0.0) || !(validGradientWeight.sum > 0.0)) {
+        if (profile != nullptr) {
+            profile->peakResponseEvidenceObservationVisits +=
+                responseEvidenceVisits;
+        }
+        const float presenceResponse = denominator.sum > 0.0F
+            ? numerator.sum / denominator.sum
+            : 0.0F;
+        if (!(config.peakGradientWeight > 0.0F) || !(eligibleGradientWeight.sum > 0.0F) || !(validGradientWeight.sum > 0.0F)) {
             return presenceResponse;
         }
-        const double voteMass = inward.sum + outward.sum;
-        if (!(voteMass > 0.0))
+        const float voteMass = inward.sum + outward.sum;
+        if (!(voteMass > 0.0F))
             return presenceResponse;
-        const double coverage = std::clamp(validGradientWeight.sum / eligibleGradientWeight.sum, 0.0, 1.0);
-        const double radialGradient = voteMass / validGradientWeight.sum;
-        const double reliability = coverage * radialGradient / (radialGradient + config.peakGradientReliabilityScale);
-        const double signedVote = (inward.sum - outward.sum) / voteMass;
+        const float coverage = std::clamp(validGradientWeight.sum / eligibleGradientWeight.sum, 0.0F, 1.0F);
+        const float radialGradient = voteMass / validGradientWeight.sum;
+        const float reliability = coverage * radialGradient / (radialGradient + config.peakGradientReliabilityScale);
+        const float signedVote = (inward.sum - outward.sum) / voteMass;
         return presenceResponse + config.peakGradientWeight * reliability * signedVote;
     };
 
     using GridIndex = std::pair<int, int>;
     const int extent = static_cast<int>(std::floor(config.localWindowRadiusPredictionVoxels / config.peakGridStepPredictionVoxels));
-    const auto pointAt = [&](const GridIndex& index) {
-        return pivot + basis[0] * (static_cast<double>(index.first) * config.peakGridStepPredictionVoxels) +
-               basis[1] * (static_cast<double>(index.second) * config.peakGridStepPredictionVoxels);
+    const detail::FiberAnchorPeakGridLayout peakGrid{extent};
+    std::vector<cv::Vec3f> gridPoints(peakGrid.size());
+    std::vector<uint8_t> feasibleGrid(peakGrid.size(), 0);
+    for (int first = -extent; first <= extent; ++first) {
+        for (int second = -extent; second <= extent; ++second) {
+            const size_t slot = peakGrid.indexUnchecked(first, second);
+            const cv::Vec3f point =
+                pivot + basis[0] *
+                    (static_cast<float>(first) *
+                     config.peakGridStepPredictionVoxels) +
+                basis[1] *
+                    (static_cast<float>(second) *
+                     config.peakGridStepPredictionVoxels);
+            gridPoints[slot] = point;
+            feasibleGrid[slot] = static_cast<uint8_t>(insidePeakDomain(
+                point, pivot, owner,
+                config.localWindowRadiusPredictionVoxels));
+        }
+    }
+    const auto pointAt = [&](const GridIndex& index) -> const cv::Vec3f& {
+        return gridPoints[peakGrid.indexUnchecked(index.first, index.second)];
     };
     const auto responseAtIndex = [&](const GridIndex& index, bool acceptance) {
         return responseAt(
@@ -1331,34 +1648,29 @@ template <typename ObservationRange>
             acceptance);
     };
     const auto feasible = [&](const GridIndex& index) {
-        return std::abs(index.first) <= extent &&
-            std::abs(index.second) <= extent &&
-            insidePeakDomain(
-                pointAt(index), pivot, owner,
-                config.localWindowRadiusPredictionVoxels);
+        return peakGrid.contains(index.first, index.second) &&
+            feasibleGrid[peakGrid.indexUnchecked(index.first, index.second)];
     };
 
-    std::map<GridIndex, double> responseCache;
+    detail::FiberAnchorPeakResponseCache responseCache{peakGrid};
     const auto response = [&](const GridIndex& index) {
         if (profile != nullptr)
             ++profile->peakGridResponseRequests;
-        const auto found = responseCache.find(index);
-        if (found != responseCache.end())
-            return found->second;
-        return responseCache.emplace(index, responseAtIndex(index, false))
-            .first->second;
+        return responseCache.getOrCompute(
+            index.first, index.second,
+            [&] { return responseAtIndex(index, false); });
     };
 
     GridIndex current{0, 0};
-    double nearestDistance = std::numeric_limits<double>::infinity();
+    float nearestDistance = std::numeric_limits<float>::infinity();
     for (int first = -extent; first <= extent; ++first) {
         for (int second = -extent; second <= extent; ++second) {
             const GridIndex candidate{first, second};
             if (!feasible(candidate))
                 continue;
-            const cv::Vec3d delta =
+            const cv::Vec3f delta =
                 pointAt(candidate) - components[selectedComponent].position;
-            const double distance = delta.dot(delta);
+            const float distance = delta.dot(delta);
             if (distance < nearestDistance) {
                 nearestDistance = distance;
                 current = candidate;
@@ -1372,7 +1684,7 @@ template <typename ObservationRange>
     }};
     while (true) {
         GridIndex best = current;
-        double bestResponse = response(current);
+        float bestResponse = response(current);
         for (const auto& offset : neighbors) {
             const GridIndex candidate{
                 current.first + offset.first,
@@ -1380,26 +1692,26 @@ template <typename ObservationRange>
             };
             if (!feasible(candidate))
                 continue;
-            const double candidateResponse = response(candidate);
+            const float candidateResponse = response(candidate);
             if (candidateResponse > bestResponse ||
                 (candidateResponse == bestResponse && candidate < best)) {
                 best = candidate;
                 bestResponse = candidateResponse;
             }
         }
-        const double tolerance = 1.0e-12 *
-            std::max(1.0, std::abs(response(current)));
+        const float tolerance = kFloatComparisonEpsilon *
+            std::max(1.0F, std::abs(response(current)));
         if (bestResponse <= response(current) + tolerance)
             break;
         current = best;
     }
 
-    const cv::Vec3d discrete = pointAt(current);
-    const double centerResponse = response(current);
-    const double tolerance =
-        1.0e-12 * std::max(1.0, std::abs(centerResponse));
-    const auto acceptedPosition = [&](const cv::Vec3d& candidate) {
-        const cv::Vec3d offset = candidate - pivot;
+    const cv::Vec3f discrete = pointAt(current);
+    const float centerResponse = response(current);
+    const float tolerance =
+        kFloatComparisonEpsilon * std::max(1.0F, std::abs(centerResponse));
+    const auto acceptedPosition = [&](const cv::Vec3f& candidate) {
+        const cv::Vec3f offset = candidate - pivot;
         return insidePeakDomain(
                    candidate, pivot, owner,
                    config.localWindowRadiusPredictionVoxels) &&
@@ -1409,7 +1721,7 @@ template <typename ObservationRange>
                 tolerance >= centerResponse;
     };
 
-    std::array<double, 2> separableOffsetGridSteps{0.0, 0.0};
+    std::array<float, 2> separableOffsetGridSteps{0.0F, 0.0F};
     for (int dimension = 0; dimension < 2; ++dimension) {
         GridIndex lower = current;
         GridIndex upper = current;
@@ -1417,31 +1729,31 @@ template <typename ObservationRange>
         (dimension == 0 ? upper.first : upper.second) += 1;
         if (!feasible(lower) || !feasible(upper))
             continue;
-        const double lowerResponse = response(lower);
-        const double upperResponse = response(upper);
-        const double curvature =
-            lowerResponse - 2.0 * centerResponse + upperResponse;
-        if (!(curvature < 0.0) || !std::isfinite(curvature))
+        const float lowerResponse = response(lower);
+        const float upperResponse = response(upper);
+        const float curvature =
+            lowerResponse - 2.0F * centerResponse + upperResponse;
+        if (!(curvature < 0.0F) || !std::isfinite(curvature))
             continue;
-        const double offset =
-            0.5 * (lowerResponse - upperResponse) / curvature;
+        const float offset =
+            0.5F * (lowerResponse - upperResponse) / curvature;
         if (std::isfinite(offset)) {
             separableOffsetGridSteps[static_cast<size_t>(dimension)] =
-                std::clamp(offset, -0.5, 0.5);
+                std::clamp(offset, -0.5F, 0.5F);
         }
     }
-    const cv::Vec3d separableCandidate =
+    const cv::Vec3f separableCandidate =
         discrete + basis[0] *
                 (separableOffsetGridSteps[0] *
                  config.peakGridStepPredictionVoxels) +
         basis[1] *
                 (separableOffsetGridSteps[1] *
                  config.peakGridStepPredictionVoxels);
-    const cv::Vec3d separable = acceptedPosition(separableCandidate)
+    const cv::Vec3f separable = acceptedPosition(separableCandidate)
         ? separableCandidate
         : discrete;
 
-    std::array<std::array<double, 3>, 3> neighborhood{};
+    std::array<std::array<float, 3>, 3> neighborhood{};
     bool completeNeighborhood = true;
     for (int first = -1; first <= 1; ++first) {
         for (int second = -1; second <= 1; ++second) {
@@ -1453,7 +1765,7 @@ template <typename ObservationRange>
                 completeNeighborhood = false;
                 continue;
             }
-            const double value = response(sample);
+            const float value = response(sample);
             if (!std::isfinite(value)) {
                 completeNeighborhood = false;
                 continue;
@@ -1462,11 +1774,11 @@ template <typename ObservationRange>
                         [static_cast<size_t>(second + 1)] = value;
         }
     }
-    cv::Vec3d joint = discrete;
+    cv::Vec3f joint = discrete;
     if (completeNeighborhood) {
         const auto offset = fitFiberAnchorQuadraticPeak(neighborhood);
         if (offset.has_value()) {
-            const cv::Vec3d candidate =
+            const cv::Vec3f candidate =
                 discrete + basis[0] *
                         (offset->firstGridSteps *
                          config.peakGridStepPredictionVoxels) +
@@ -1487,14 +1799,14 @@ template <typename ObservationRange>
 
 [[nodiscard]] FitState refineSeedPair(
     const std::vector<WeightedObservation>& observations,
-    std::array<cv::Vec3d, 2> axes,
+    std::array<cv::Vec3f, 2> axes,
     const FiberAnchorConfig& config,
     FiberAnchorFitProfile* profile)
 {
     if (profile != nullptr)
         ++profile->seedPairs;
     FitState best;
-    best.objectiveNumerator = -1.0;
+    best.objectiveNumerator = -1.0F;
     std::vector<uint8_t> previousAssignments;
     std::vector<uint8_t> twoBackAssignments;
     for (int iteration = 0; iteration < config.maximumIterations; ++iteration) {
@@ -1505,9 +1817,9 @@ template <typename ObservationRange>
             profile->seedObjectiveObservationVisits += observations.size();
         }
         auto assignments = assignObservations(observations, axes);
-        std::array<cv::Vec3d, 2> updated = axes;
+        std::array<cv::Vec3f, 2> updated = axes;
         for (uint8_t component = 0; component < 2; ++component) {
-            const auto principal = principalFiberAxis(
+            const auto principal = principalFiberAxisF(
                 weightedTensor(observations, &assignments, component));
             if (principal.unique)
                 updated[component] = principal.axis;
@@ -1518,10 +1830,10 @@ template <typename ObservationRange>
             objectiveNumerator(observations, updated),
             static_cast<size_t>(iteration),
         };
-        if (best.objectiveNumerator < 0.0 || betterState(state, best))
+        if (best.objectiveNumerator < 0.0F || betterState(state, best))
             best = state;
 
-        const double update = std::max(
+        const float update = std::max(
             projectiveUpdate(axes[0], updated[0]),
             projectiveUpdate(axes[1], updated[1]));
         const bool unchanged = !previousAssignments.empty() &&
@@ -1577,6 +1889,12 @@ void accumulateFitProfile(
     total.invocations += value.invocations;
     total.nonemptyCells += value.nonemptyCells;
     total.weightedObservations += value.weightedObservations;
+    total.ownedDiscoveryObservationVisits +=
+        value.ownedDiscoveryObservationVisits;
+    total.ownedInitializationObservationVisits +=
+        value.ownedInitializationObservationVisits;
+    total.avoidedOwnedSupportObservationVisits +=
+        value.avoidedOwnedSupportObservationVisits;
     total.seeds += value.seeds;
     total.seedGenerationObservationVisits +=
         value.seedGenerationObservationVisits;
@@ -1617,11 +1935,29 @@ void accumulateFitProfile(
     total.peakComponents += value.peakComponents;
     total.peakPreparationObservationVisits +=
         value.peakPreparationObservationVisits;
+    total.peakPreparedResponseObservations +=
+        value.peakPreparedResponseObservations;
+    total.peakPreparedEvidenceObservations +=
+        value.peakPreparedEvidenceObservations;
+    total.peakResponseObservationRecordBytes = std::max(
+        total.peakResponseObservationRecordBytes,
+        value.peakResponseObservationRecordBytes);
+    total.peakEvidenceIndexRecordBytes = std::max(
+        total.peakEvidenceIndexRecordBytes,
+        value.peakEvidenceIndexRecordBytes);
+    total.peakEvidenceObservationRecordBytes = std::max(
+        total.peakEvidenceObservationRecordBytes,
+        value.peakEvidenceObservationRecordBytes);
+    total.peakMaximumObservationStorageBytes = std::max(
+        total.peakMaximumObservationStorageBytes,
+        value.peakMaximumObservationStorageBytes);
     total.peakGridResponseRequests += value.peakGridResponseRequests;
     total.peakComputedGridResponses += value.peakComputedGridResponses;
     total.peakAcceptanceResponses += value.peakAcceptanceResponses;
     total.peakResponseObservationVisits +=
         value.peakResponseObservationVisits;
+    total.peakResponseEvidenceObservationVisits +=
+        value.peakResponseEvidenceObservationVisits;
     total.finalEvaluationObservationVisits +=
         value.finalEvaluationObservationVisits;
     total.setupWorkSeconds += value.setupWorkSeconds;
@@ -1665,25 +2001,25 @@ struct NmsCandidate {
     const FiberAnchor& right,
     const FiberAnchorConfig& config)
 {
-    double dot = std::clamp(left.axisXYZ.dot(right.axisXYZ), -1.0, 1.0);
-    const double axialDot = std::abs(dot);
-    const double minimumDot = std::cos(
-        config.nmsMaximumAngleDegrees * std::acos(-1.0) / 180.0);
+    float dot = std::clamp(left.axisXYZ.dot(right.axisXYZ), -1.0F, 1.0F);
+    const float axialDot = std::abs(dot);
+    const float minimumDot = std::cos(
+        config.nmsMaximumAngleDegrees * std::acos(-1.0F) / 180.0F);
     if (axialDot < minimumDot)
         return false;
-    cv::Vec3d alignedRight = right.axisXYZ;
-    if (dot < 0.0)
-        alignedRight *= -1.0;
-    cv::Vec3d averageAxis = normalized(left.axisXYZ + alignedRight);
+    cv::Vec3f alignedRight = right.axisXYZ;
+    if (dot < 0.0F)
+        alignedRight *= -1.0F;
+    cv::Vec3f averageAxis = normalized(left.axisXYZ + alignedRight);
     if (averageAxis.dot(averageAxis) <= kMatrixEpsilon)
         averageAxis = left.axisXYZ;
-    const cv::Vec3d delta = right.positionPredictionXYZ -
+    const cv::Vec3f delta = right.positionPredictionXYZ -
         left.positionPredictionXYZ;
-    const double longitudinal = std::abs(delta.dot(averageAxis));
-    const cv::Vec3d transverseVector =
+    const float longitudinal = std::abs(delta.dot(averageAxis));
+    const cv::Vec3f transverseVector =
         delta - averageAxis * delta.dot(averageAxis);
-    const double transverse = std::sqrt(std::max(
-        0.0, transverseVector.dot(transverseVector)));
+    const float transverse = std::sqrt(std::max(
+        0.0F, transverseVector.dot(transverseVector)));
     return longitudinal <= config.nmsLongitudinalRadiusPredictionVoxels &&
         transverse <= config.nmsTransverseRadiusPredictionVoxels;
 }
@@ -1701,14 +2037,14 @@ void applyLocalMaximumNms(
     }
     if (candidates.empty())
         return;
-    const double binSize = std::max(
-        1.0e-12,
+    const float binSize = std::max(
+        kGeometryEpsilon,
         std::hypot(
             config.nmsTransverseRadiusPredictionVoxels,
             config.nmsLongitudinalRadiusPredictionVoxels));
     using Bin = std::array<int64_t, 3>;
     std::map<Bin, std::vector<size_t>> bins;
-    const auto binFor = [binSize](const cv::Vec3d& position) {
+    const auto binFor = [binSize](const cv::Vec3f& position) {
         return Bin{
             static_cast<int64_t>(std::floor(position[0] / binSize)),
             static_cast<int64_t>(std::floor(position[1] / binSize)),
@@ -1776,65 +2112,65 @@ void applyLocalMaximumNms(
 
 FiberAnchorRobustCutoff selectFiberAnchorRobustCutoff(
     const std::vector<FiberAnchorResidualSample>& samples,
-    double maximumTrimMassFraction,
-    double madMultiplier,
-    double minimumAngleDegrees)
+    float maximumTrimMassFraction,
+    float madMultiplier,
+    float minimumAngleDegrees)
 {
-    if (!(maximumTrimMassFraction >= 0.0) ||
-        maximumTrimMassFraction > 0.20 ||
+    if (!(maximumTrimMassFraction >= 0.0F) ||
+        maximumTrimMassFraction > 0.20F ||
         !std::isfinite(maximumTrimMassFraction) ||
-        !(madMultiplier >= 0.0) || !std::isfinite(madMultiplier) ||
-        !(minimumAngleDegrees >= 0.0) || minimumAngleDegrees > 90.0 ||
+        !(madMultiplier >= 0.0F) || !std::isfinite(madMultiplier) ||
+        !(minimumAngleDegrees >= 0.0F) || minimumAngleDegrees > 90.0F ||
         !std::isfinite(minimumAngleDegrees)) {
         throw std::invalid_argument("invalid fiber anchor robust cutoff parameters");
     }
     FiberAnchorRobustCutoff result;
-    std::array<double, kRobustHistogramBins> histogram{};
+    std::array<float, kRobustHistogramBins> histogram{};
     for (const auto& sample : samples) {
         if (!std::isfinite(sample.residual) || !std::isfinite(sample.mass) ||
-            !(sample.mass > 0.0)) {
+            !(sample.mass > 0.0F)) {
             continue;
         }
         histogram[robustHistogramBin(sample.residual)] += sample.mass;
         result.totalMass += sample.mass;
     }
     result.retainedMass = result.totalMass;
-    if (!(result.totalMass > 0.0) || !(maximumTrimMassFraction > 0.0))
+    if (!(result.totalMass > 0.0F) || !(maximumTrimMassFraction > 0.0F))
         return result;
 
     const size_t medianBin = weightedHistogramQuantileBin(
-        histogram, result.totalMass, 0.5);
-    const double median = robustHistogramCenter(medianBin);
-    std::array<double, kRobustHistogramBins> deviationHistogram{};
+        histogram, result.totalMass, 0.5F);
+    const float median = robustHistogramCenter(medianBin);
+    std::array<float, kRobustHistogramBins> deviationHistogram{};
     for (const auto& sample : samples) {
         if (!std::isfinite(sample.residual) || !std::isfinite(sample.mass) ||
-            !(sample.mass > 0.0)) {
+            !(sample.mass > 0.0F)) {
             continue;
         }
         deviationHistogram[robustHistogramBin(std::abs(
-            std::clamp(sample.residual, 0.0, 1.0) - median))] += sample.mass;
+            std::clamp(sample.residual, 0.0F, 1.0F) - median))] += sample.mass;
     }
     return selectRobustHistogramCutoff(
         histogram, deviationHistogram, result.totalMass, median,
         maximumTrimMassFraction, madMultiplier, minimumAngleDegrees).summary;
 }
 
-std::vector<double> fiberAnchorSpatialBacktrackingFractions(
-    double maximumDisplacementPredictionVoxels,
-    double targetStepPredictionVoxels,
+std::vector<float> fiberAnchorSpatialBacktrackingFractions(
+    float maximumDisplacementPredictionVoxels,
+    float targetStepPredictionVoxels,
     int maximumHalvings)
 {
-    if (!(maximumDisplacementPredictionVoxels >= 0.0) ||
+    if (!(maximumDisplacementPredictionVoxels >= 0.0F) ||
         !std::isfinite(maximumDisplacementPredictionVoxels) ||
-        !(targetStepPredictionVoxels > 0.0) ||
+        !(targetStepPredictionVoxels > 0.0F) ||
         !std::isfinite(targetStepPredictionVoxels) ||
         maximumHalvings < 0 || maximumHalvings > 8) {
         throw std::invalid_argument("invalid fiber anchor spatial backtracking parameters");
     }
-    std::vector<double> fractions;
+    std::vector<float> fractions;
     fractions.reserve(static_cast<size_t>(maximumHalvings + 1));
     for (int depth = 0; depth <= maximumHalvings; ++depth) {
-        const double fraction = std::ldexp(1.0, -depth);
+        const float fraction = std::ldexp(1.0F, -depth);
         fractions.push_back(fraction);
         if (maximumDisplacementPredictionVoxels * fraction <=
             targetStepPredictionVoxels) {
@@ -1845,42 +2181,42 @@ std::vector<double> fiberAnchorSpatialBacktrackingFractions(
 }
 
 std::optional<FiberAnchorQuadraticPeakOffset> fitFiberAnchorQuadraticPeak(
-    const std::array<std::array<double, 3>, 3>& response)
+    const std::array<std::array<float, 3>, 3>& response)
 {
-    CompensatedSum sum;
-    CompensatedSum firstMoment;
-    CompensatedSum secondMoment;
-    CompensatedSum firstSquaredMoment;
-    CompensatedSum mixedMoment;
-    CompensatedSum secondSquaredMoment;
-    double responseScale = 1.0;
+    FloatSum sum;
+    FloatSum firstMoment;
+    FloatSum secondMoment;
+    FloatSum firstSquaredMoment;
+    FloatSum mixedMoment;
+    FloatSum secondSquaredMoment;
+    float responseScale = 1.0F;
     for (int first = -1; first <= 1; ++first) {
         for (int second = -1; second <= 1; ++second) {
-            const double value = response[static_cast<size_t>(first + 1)]
+            const float value = response[static_cast<size_t>(first + 1)]
                                          [static_cast<size_t>(second + 1)];
             if (!std::isfinite(value))
                 return std::nullopt;
             responseScale = std::max(responseScale, std::abs(value));
             sum.add(value);
-            firstMoment.add(static_cast<double>(first) * value);
-            secondMoment.add(static_cast<double>(second) * value);
+            firstMoment.add(static_cast<float>(first) * value);
+            secondMoment.add(static_cast<float>(second) * value);
             firstSquaredMoment.add(
-                static_cast<double>(first * first) * value);
-            mixedMoment.add(static_cast<double>(first * second) * value);
+                static_cast<float>(first * first) * value);
+            mixedMoment.add(static_cast<float>(first * second) * value);
             secondSquaredMoment.add(
-                static_cast<double>(second * second) * value);
+                static_cast<float>(second * second) * value);
         }
     }
 
     // Least-squares model a + bx + cy + dx^2 + exy + fy^2 on {-1,0,1}^2.
-    const double gradientFirst = firstMoment.sum / 6.0;
-    const double gradientSecond = secondMoment.sum / 6.0;
-    const double hessianFirstFirst =
-        firstSquaredMoment.sum - 2.0 * sum.sum / 3.0;
-    const double hessianFirstSecond = mixedMoment.sum / 4.0;
-    const double hessianSecondSecond =
-        secondSquaredMoment.sum - 2.0 * sum.sum / 3.0;
-    const std::array<double, 5> coefficients{
+    const float gradientFirst = firstMoment.sum / 6.0F;
+    const float gradientSecond = secondMoment.sum / 6.0F;
+    const float hessianFirstFirst =
+        firstSquaredMoment.sum - 2.0F * sum.sum / 3.0F;
+    const float hessianFirstSecond = mixedMoment.sum / 4.0F;
+    const float hessianSecondSecond =
+        secondSquaredMoment.sum - 2.0F * sum.sum / 3.0F;
+    const std::array<float, 5> coefficients{
         gradientFirst,
         gradientSecond,
         hessianFirstFirst,
@@ -1888,19 +2224,19 @@ std::optional<FiberAnchorQuadraticPeakOffset> fitFiberAnchorQuadraticPeak(
         hessianSecondSecond,
     };
     if (std::any_of(coefficients.begin(), coefficients.end(),
-                    [](double value) { return !std::isfinite(value); })) {
+                    [](float value) { return !std::isfinite(value); })) {
         return std::nullopt;
     }
 
-    constexpr double kRelativeCurvatureTolerance = 1.0e-12;
-    const double curvatureTolerance =
+    constexpr float kRelativeCurvatureTolerance = 1.0e-6F;
+    const float curvatureTolerance =
         kRelativeCurvatureTolerance * responseScale;
-    const double trace = hessianFirstFirst + hessianSecondSecond;
-    const double discriminant = std::hypot(
+    const float trace = hessianFirstFirst + hessianSecondSecond;
+    const float discriminant = std::hypot(
         hessianFirstFirst - hessianSecondSecond,
-        2.0 * hessianFirstSecond);
-    const double largestEigenvalue = 0.5 * (trace + discriminant);
-    const double determinant =
+        2.0F * hessianFirstSecond);
+    const float largestEigenvalue = 0.5F * (trace + discriminant);
+    const float determinant =
         hessianFirstFirst * hessianSecondSecond -
         hessianFirstSecond * hessianFirstSecond;
     if (!(largestEigenvalue < -curvatureTolerance) ||
@@ -1909,14 +2245,14 @@ std::optional<FiberAnchorQuadraticPeakOffset> fitFiberAnchorQuadraticPeak(
         return std::nullopt;
     }
 
-    const double first =
+    const float first =
         (hessianFirstSecond * gradientSecond -
          hessianSecondSecond * gradientFirst) / determinant;
-    const double second =
+    const float second =
         (hessianFirstSecond * gradientFirst -
          hessianFirstFirst * gradientSecond) / determinant;
     if (!std::isfinite(first) || !std::isfinite(second) ||
-        std::abs(first) > 0.5 || std::abs(second) > 0.5) {
+        std::abs(first) > 0.5F || std::abs(second) > 0.5F) {
         return std::nullopt;
     }
     return FiberAnchorQuadraticPeakOffset{first, second};
@@ -1945,105 +2281,105 @@ void validateFiberAnchorConfig(const FiberAnchorConfig& config)
 {
     if (config.cellSizePredictionVoxels < 2 || config.cellSizePredictionVoxels > 8)
         throw std::invalid_argument("fiber anchor cell size must be in [2, 8]");
-    if (!(config.gaussianSigmaPredictionVoxels > 0.0) ||
+    if (!(config.gaussianSigmaPredictionVoxels > 0.0F) ||
         !std::isfinite(config.gaussianSigmaPredictionVoxels)) {
         throw std::invalid_argument("fiber anchor Gaussian sigma must be positive and finite");
     }
-    if (!(config.peakSigmaPredictionVoxels > 0.0) ||
+    if (!(config.peakSigmaPredictionVoxels > 0.0F) ||
         !std::isfinite(config.peakSigmaPredictionVoxels)) {
         throw std::invalid_argument("fiber anchor peak sigma must be positive and finite");
     }
-    if (!(config.peakGradientWeight >= 0.0) ||
+    if (!(config.peakGradientWeight >= 0.0F) ||
         !std::isfinite(config.peakGradientWeight)) {
         throw std::invalid_argument(
             "fiber anchor peak gradient weight must be nonnegative and finite");
     }
-    if (!(config.peakGradientReliabilityScale > 0.0) ||
+    if (!(config.peakGradientReliabilityScale > 0.0F) ||
         !std::isfinite(config.peakGradientReliabilityScale)) {
         throw std::invalid_argument(
             "fiber anchor peak gradient reliability scale must be positive and finite");
     }
-    if (!(config.peakAxialSigmaPredictionVoxels > 0.0) ||
+    if (!(config.peakAxialSigmaPredictionVoxels > 0.0F) ||
         !std::isfinite(config.peakAxialSigmaPredictionVoxels)) {
         throw std::invalid_argument(
             "fiber anchor peak axial sigma must be positive and finite");
     }
-    if (!(config.peakGridStepPredictionVoxels > 0.0) ||
+    if (!(config.peakGridStepPredictionVoxels > 0.0F) ||
         !std::isfinite(config.peakGridStepPredictionVoxels)) {
         throw std::invalid_argument("fiber anchor peak grid step must be positive and finite");
     }
-    if (!(config.gaussianCutoffSigmas > 0.0) ||
+    if (!(config.gaussianCutoffSigmas > 0.0F) ||
         !std::isfinite(config.gaussianCutoffSigmas)) {
         throw std::invalid_argument("fiber anchor Gaussian cutoff must be positive and finite");
     }
-    if (!(config.localWindowRadiusPredictionVoxels > 0.0) ||
+    if (!(config.localWindowRadiusPredictionVoxels > 0.0F) ||
         !std::isfinite(config.localWindowRadiusPredictionVoxels)) {
         throw std::invalid_argument("fiber anchor local window must be positive and finite");
     }
     if (config.localWindowRadiusPredictionVoxels /
             config.peakGridStepPredictionVoxels >
-        128.0) {
+        128.0F) {
         throw std::invalid_argument(
             "fiber anchor peak grid radius must not exceed 128 steps");
     }
-    if (!(config.axialSupportHalfWidthPredictionVoxels > 0.0) ||
+    if (!(config.axialSupportHalfWidthPredictionVoxels > 0.0F) ||
         !std::isfinite(config.axialSupportHalfWidthPredictionVoxels)) {
         throw std::invalid_argument("fiber anchor axial support must be positive and finite");
     }
-    if (!(config.positionConvergenceTolerancePredictionVoxels >= 0.0) ||
+    if (!(config.positionConvergenceTolerancePredictionVoxels >= 0.0F) ||
         !std::isfinite(config.positionConvergenceTolerancePredictionVoxels)) {
         throw std::invalid_argument("fiber anchor position tolerance must be finite and non-negative");
     }
-    if (!(config.nmsMaximumAngleDegrees >= 0.0) ||
-        !(config.nmsMaximumAngleDegrees <= 90.0) ||
+    if (!(config.nmsMaximumAngleDegrees >= 0.0F) ||
+        !(config.nmsMaximumAngleDegrees <= 90.0F) ||
         !std::isfinite(config.nmsMaximumAngleDegrees)) {
         throw std::invalid_argument("fiber anchor NMS angle must be in [0, 90]");
     }
-    if (!(config.nmsTransverseRadiusPredictionVoxels >= 0.0) ||
+    if (!(config.nmsTransverseRadiusPredictionVoxels >= 0.0F) ||
         !std::isfinite(config.nmsTransverseRadiusPredictionVoxels)) {
         throw std::invalid_argument("fiber anchor NMS transverse radius must be finite and non-negative");
     }
-    if (!(config.nmsLongitudinalRadiusPredictionVoxels >= 0.0) ||
+    if (!(config.nmsLongitudinalRadiusPredictionVoxels >= 0.0F) ||
         !std::isfinite(config.nmsLongitudinalRadiusPredictionVoxels)) {
         throw std::invalid_argument("fiber anchor NMS longitudinal radius must be finite and non-negative");
     }
-    if (!(config.observationPresenceFloor >= 0.0) ||
-        !(config.observationPresenceFloor <= 1.0) ||
+    if (!(config.observationPresenceFloor >= 0.0F) ||
+        !(config.observationPresenceFloor <= 1.0F) ||
         !std::isfinite(config.observationPresenceFloor)) {
         throw std::invalid_argument("fiber anchor observation presence floor must be in [0, 1]");
     }
-    if (!(config.minimumAlignedSupport >= 0.0) ||
-        !(config.minimumAlignedSupport <= 1.0) ||
+    if (!(config.minimumAlignedSupport >= 0.0F) ||
+        !(config.minimumAlignedSupport <= 1.0F) ||
         !std::isfinite(config.minimumAlignedSupport)) {
         throw std::invalid_argument("fiber anchor minimum aligned support must be in [0, 1]");
     }
-    if (!(config.robustMaximumTrimMassFraction >= 0.0) ||
-        config.robustMaximumTrimMassFraction > 0.20 ||
+    if (!(config.robustMaximumTrimMassFraction >= 0.0F) ||
+        config.robustMaximumTrimMassFraction > 0.20F ||
         !std::isfinite(config.robustMaximumTrimMassFraction)) {
         throw std::invalid_argument(
-            "fiber anchor robust maximum trim mass must be in [0, 0.20]");
+            "fiber anchor robust maximum trim mass must be in [0, 0.20F]");
     }
-    if (!(config.robustMadMultiplier >= 0.0) ||
+    if (!(config.robustMadMultiplier >= 0.0F) ||
         !std::isfinite(config.robustMadMultiplier)) {
         throw std::invalid_argument(
             "fiber anchor robust MAD multiplier must be nonnegative and finite");
     }
-    if (!(config.robustMinimumAngleDegrees >= 0.0) ||
-        config.robustMinimumAngleDegrees > 90.0 ||
+    if (!(config.robustMinimumAngleDegrees >= 0.0F) ||
+        config.robustMinimumAngleDegrees > 90.0F ||
         !std::isfinite(config.robustMinimumAngleDegrees)) {
         throw std::invalid_argument(
             "fiber anchor robust minimum angle must be in [0, 90]");
     }
-    if (!(config.mergeMaximumAngleDegrees >= 0.0) ||
-        !(config.mergeMaximumAngleDegrees <= 90.0) ||
+    if (!(config.mergeMaximumAngleDegrees >= 0.0F) ||
+        !(config.mergeMaximumAngleDegrees <= 90.0F) ||
         !std::isfinite(config.mergeMaximumAngleDegrees)) {
         throw std::invalid_argument("fiber anchor merge maximum angle must be in [0, 90]");
     }
-    if (!(config.mergeMaximumAbsoluteObjectiveLoss >= 0.0) ||
-        !(config.mergeMaximumAbsoluteObjectiveLoss <= 1.0) ||
+    if (!(config.mergeMaximumAbsoluteObjectiveLoss >= 0.0F) ||
+        !(config.mergeMaximumAbsoluteObjectiveLoss <= 1.0F) ||
         !std::isfinite(config.mergeMaximumAbsoluteObjectiveLoss) ||
-        !(config.mergeMaximumRelativeObjectiveLoss >= 0.0) ||
-        !(config.mergeMaximumRelativeObjectiveLoss <= 1.0) ||
+        !(config.mergeMaximumRelativeObjectiveLoss >= 0.0F) ||
+        !(config.mergeMaximumRelativeObjectiveLoss <= 1.0F) ||
         !std::isfinite(config.mergeMaximumRelativeObjectiveLoss)) {
         throw std::invalid_argument("fiber anchor merge objective losses must be in [0, 1]");
     }
@@ -2051,7 +2387,7 @@ void validateFiberAnchorConfig(const FiberAnchorConfig& config)
         throw std::invalid_argument("fiber anchor maximum seed count must be in [1, 64]");
     if (config.maximumIterations < 1)
         throw std::invalid_argument("fiber anchor maximum iterations must be positive");
-    if (!(config.convergenceTolerance >= 0.0) ||
+    if (!(config.convergenceTolerance >= 0.0F) ||
         !std::isfinite(config.convergenceTolerance)) {
         throw std::invalid_argument("fiber anchor convergence tolerance must be finite and non-negative");
     }
@@ -2067,7 +2403,7 @@ FiberAnchorCrop fiberAnchorCropFromBaseVoxels(
     const FiberAnchorCrop& baseCrop,
     double predictionToBaseScale)
 {
-    if (!(predictionToBaseScale > 0.0) || !std::isfinite(predictionToBaseScale))
+    if (!(predictionToBaseScale > 0.0F) || !std::isfinite(predictionToBaseScale))
         throw std::invalid_argument("fiber anchor base crop requires a positive prediction-to-base scale");
 
     FiberAnchorCrop predictionCrop;
@@ -2106,12 +2442,14 @@ void suppressFiberAnchorDuplicates(
     applyLocalMaximumNms(cells, config);
 }
 
-template <typename ObservationRange>
+template <typename ObservationRange, typename OwnedObservationRange>
 FiberCellAnchorResult fitFiberCellAnchorsImpl(
     const std::array<size_t, 3>& cellZYX,
     const std::array<size_t, 3>& cellBeginZYX,
     const std::array<size_t, 3>& cellEndZYX,
     const ObservationRange& input,
+    const OwnedObservationRange& ownedInput,
+    bool validateOwnedCoverage,
     const FiberAnchorConfig& config,
     FiberAnchorFitProfile* profile)
 {
@@ -2126,22 +2464,33 @@ FiberCellAnchorResult fitFiberCellAnchorsImpl(
         (cellEndZYX[0] - cellBeginZYX[0]) *
         (cellEndZYX[1] - cellBeginZYX[1]) *
         (cellEndZYX[2] - cellBeginZYX[2]);
-    const auto isOwned = [&cellBeginZYX, &cellEndZYX](const cv::Vec3d& position) {
-        return position[0] >= static_cast<double>(cellBeginZYX[2]) &&
-            position[0] < static_cast<double>(cellEndZYX[2]) &&
-            position[1] >= static_cast<double>(cellBeginZYX[1]) &&
-            position[1] < static_cast<double>(cellEndZYX[1]) &&
-            position[2] >= static_cast<double>(cellBeginZYX[0]) &&
-            position[2] < static_cast<double>(cellEndZYX[0]);
+    const auto isOwned = [&cellBeginZYX, &cellEndZYX](const cv::Vec3f& position) {
+        return position[0] >= static_cast<float>(cellBeginZYX[2]) &&
+            position[0] < static_cast<float>(cellEndZYX[2]) &&
+            position[1] >= static_cast<float>(cellBeginZYX[1]) &&
+            position[1] < static_cast<float>(cellEndZYX[1]) &&
+            position[2] >= static_cast<float>(cellBeginZYX[0]) &&
+            position[2] < static_cast<float>(cellEndZYX[0]);
     };
-    size_t ownedCount = 0;
-    for (size_t index = 0; index < input.size(); ++index) {
-        const cv::Vec3d position = observationPosition(input[index]);
-        ownedCount += static_cast<size_t>(
-            finiteVector(position) && isOwned(position));
+    if (validateOwnedCoverage) {
+        size_t ownedCount = 0;
+        for (size_t index = 0; index < input.size(); ++index) {
+            const cv::Vec3f position = observationPosition(input[index]);
+            ownedCount += static_cast<size_t>(
+                finiteVector(position) && isOwned(position));
+        }
+        if (profile != nullptr)
+            profile->ownedDiscoveryObservationVisits += input.size();
+        if (ownedCount != expected)
+            throw std::invalid_argument("fiber anchor observations do not cover the owned cell voxels exactly once");
+    } else {
+        if (ownedInput.size() != expected)
+            throw std::logic_error("fiber anchor direct owned range has the wrong size");
+        if (profile != nullptr) {
+            profile->avoidedOwnedSupportObservationVisits +=
+                2 * input.size() - ownedInput.size();
+        }
     }
-    if (ownedCount != expected)
-        throw std::invalid_argument("fiber anchor observations do not cover the owned cell voxels exactly once");
 
     FiberCellAnchorResult result;
     result.cellZYX = cellZYX;
@@ -2155,33 +2504,30 @@ FiberCellAnchorResult fitFiberCellAnchorsImpl(
         diagnostic.transition.outcome = "rejected";
         diagnostic.transition.reason = "empty";
     }
-    const cv::Vec3d center{
-        (static_cast<double>(cellBeginZYX[2]) +
-            static_cast<double>(cellEndZYX[2]) - 1.0) * 0.5,
-        (static_cast<double>(cellBeginZYX[1]) +
-            static_cast<double>(cellEndZYX[1]) - 1.0) * 0.5,
-        (static_cast<double>(cellBeginZYX[0]) +
-            static_cast<double>(cellEndZYX[0]) - 1.0) * 0.5,
+    const cv::Vec3f center{
+        (static_cast<float>(cellBeginZYX[2]) +
+            static_cast<float>(cellEndZYX[2]) - 1.0F) * 0.5F,
+        (static_cast<float>(cellBeginZYX[1]) +
+            static_cast<float>(cellEndZYX[1]) - 1.0F) * 0.5F,
+        (static_cast<float>(cellBeginZYX[0]) +
+            static_cast<float>(cellEndZYX[0]) - 1.0F) * 0.5F,
     };
-    const double invTwoSigma2 = 1.0 /
-        (2.0 * config.gaussianSigmaPredictionVoxels *
+    const float invTwoSigma2 = 1.0F /
+        (2.0F * config.gaussianSigmaPredictionVoxels *
          config.gaussianSigmaPredictionVoxels);
-    CompensatedSum denominator;
+    FloatSum denominator;
     std::vector<WeightedObservation> observations;
-    observations.reserve(input.size());
-    for (size_t index = 0; index < input.size(); ++index) {
-        const auto& candidate = input[index];
-        const cv::Vec3d position = observationPosition(candidate);
-        if (!finiteVector(position) || !isOwned(position)) {
-            continue;
-        }
-        const cv::Vec3d delta = position - center;
-        const double gaussian = std::exp(-delta.dot(delta) * invTwoSigma2);
+    observations.reserve(ownedInput.size());
+    visitObservations(ownedInput, [&](const auto& candidate, size_t index) {
+        const cv::Vec3f position = observationPosition(candidate);
+        if (validateOwnedCoverage && (!finiteVector(position) || !isOwned(position)))
+            return;
+        const cv::Vec3f delta = position - center;
+        const float gaussian = std::exp(-delta.dot(delta) * invTwoSigma2);
         denominator.add(gaussian);
-        cv::Vec3d direction;
-        if (!usableDirectionObservation(candidate, config, direction)) {
-            continue;
-        }
+        cv::Vec3f direction;
+        if (!usableDirectionObservation(candidate, config, direction))
+            return;
         observations.push_back({
             position,
             direction,
@@ -2189,8 +2535,9 @@ FiberCellAnchorResult fitFiberCellAnchorsImpl(
             gaussian * observationPresence(candidate),
             index,
         });
-    }
+    });
     if (profile != nullptr) {
+        profile->ownedInitializationObservationVisits += ownedInput.size();
         profile->setupWorkSeconds += std::chrono::duration<double>(
             FitClock::now() - phaseStart).count();
         profile->weightedObservations += observations.size();
@@ -2206,8 +2553,8 @@ FiberCellAnchorResult fitFiberCellAnchorsImpl(
         profile->seedGenerationObservationVisits += observations.size();
     }
 
-    const FiberPrincipalAxis global = principalFiberAxis(weightedTensor(observations, nullptr, 0));
-    std::vector<cv::Vec3d> seeds;
+    const FiberPrincipalAxisF global = principalFiberAxisF(weightedTensor(observations, nullptr, 0));
+    std::vector<cv::Vec3f> seeds;
     seeds.reserve(config.maximumSeedCount);
     if (global.unique) {
         seeds.push_back(global.axis);
@@ -2219,33 +2566,33 @@ FiberCellAnchorResult fitFiberCellAnchorsImpl(
             if (observations[index].weight > observations[best].weight)
                 best = index;
         }
-        seeds.push_back(canonicalFiberAxis(observations[best].direction));
+        seeds.push_back(canonicalFiberAxisF(observations[best].direction));
     }
     std::vector<bool> selected(observations.size(), false);
     while (seeds.size() < config.maximumSeedCount) {
         if (profile != nullptr)
             profile->seedGenerationObservationVisits += observations.size();
         size_t best = observations.size();
-        double bestScore = 0.0;
+        float bestScore = 0.0F;
         for (size_t index = 0; index < observations.size(); ++index) {
             if (selected[index])
                 continue;
-            double minimumDissimilarity = 1.0;
+            float minimumDissimilarity = 1.0F;
             for (const auto& seed : seeds) {
-                const double dot = observations[index].direction.dot(seed);
+                const float dot = observations[index].direction.dot(seed);
                 minimumDissimilarity = std::min(
-                    minimumDissimilarity, std::max(0.0, 1.0 - dot * dot));
+                    minimumDissimilarity, std::max(0.0F, 1.0F - dot * dot));
             }
-            const double score = observations[index].weight * minimumDissimilarity;
+            const float score = observations[index].weight * minimumDissimilarity;
             if (score > bestScore) {
                 bestScore = score;
                 best = index;
             }
         }
-        if (best == observations.size() || !(bestScore > 0.0))
+        if (best == observations.size() || !(bestScore > 0.0F))
             break;
         selected[best] = true;
-        seeds.push_back(canonicalFiberAxis(observations[best].direction));
+        seeds.push_back(canonicalFiberAxisF(observations[best].direction));
     }
     if (profile != nullptr) {
         profile->seeds += seeds.size();
@@ -2255,7 +2602,7 @@ FiberCellAnchorResult fitFiberCellAnchorsImpl(
     }
 
     FitState bestFit;
-    bestFit.objectiveNumerator = -1.0;
+    bestFit.objectiveNumerator = -1.0F;
     if (seeds.size() == 1) {
         bestFit = refineSeedPair(
             observations, {seeds[0], seeds[0]}, config, profile);
@@ -2265,7 +2612,7 @@ FiberCellAnchorResult fitFiberCellAnchorsImpl(
                 const FitState fit = refineSeedPair(
                     observations, {seeds[first], seeds[second]}, config,
                     profile);
-                if (bestFit.objectiveNumerator < 0.0 || betterState(fit, bestFit))
+                if (bestFit.objectiveNumerator < 0.0F || betterState(fit, bestFit))
                     bestFit = fit;
             }
         }
@@ -2277,13 +2624,13 @@ FiberCellAnchorResult fitFiberCellAnchorsImpl(
         profile->initializationObservationVisits +=
             2 * observations.size();
     }
-    const double seededObjective = denominator.sum > 0.0
+    const float seededObjective = denominator.sum > 0.0F
         ? bestFit.objectiveNumerator / denominator.sum
-        : 0.0;
+        : 0.0F;
 
-    const std::array<FiberPrincipalAxis, 2> fittedComponents{
-        principalFiberAxis(weightedTensor(observations, &bestFit.assignments, 0)),
-        principalFiberAxis(weightedTensor(observations, &bestFit.assignments, 1)),
+    const std::array<FiberPrincipalAxisF, 2> fittedComponents{
+        principalFiberAxisF(weightedTensor(observations, &bestFit.assignments, 0)),
+        principalFiberAxisF(weightedTensor(observations, &bestFit.assignments, 1)),
     };
     std::array<size_t, 2> fittedAssignedCounts{0, 0};
     if (profile != nullptr)
@@ -2304,9 +2651,9 @@ FiberCellAnchorResult fitFiberCellAnchorsImpl(
             anchor.positionPredictionXYZ = center;
             anchor.axisXYZ = fitted.axis;
             diagnostic.anchor = anchor;
-            diagnostic.metrics.objectiveContribution = denominator.sum > 0.0
+            diagnostic.metrics.objectiveContribution = denominator.sum > 0.0F
                 ? fitted.largestEigenvalue / denominator.sum
-                : 0.0;
+                : 0.0F;
             diagnostic.transition.outcome = "continue";
             diagnostic.transition.reason.reset();
         } else {
@@ -2321,7 +2668,7 @@ FiberCellAnchorResult fitFiberCellAnchorsImpl(
     }
     result.objective = seededObjective;
 
-    std::array<cv::Vec3d, 2> seedAxes{};
+    std::array<cv::Vec3f, 2> seedAxes{};
     std::array<size_t, 2> diagnosticIds{kNoDiagnosticId, kNoDiagnosticId};
     size_t activeComponents = 0;
     for (uint8_t componentIndex = 0; componentIndex < 2; ++componentIndex) {
@@ -2404,24 +2751,20 @@ FiberCellAnchorResult fitFiberCellAnchorsImpl(
         component.diagnosticId = refined.componentIds[componentIndex];
         component.diagnosticParentIds = {
             refined.componentIds[componentIndex]};
-        const double denominatorValue = refined.evaluation.denominators[componentIndex];
-        const double numeratorValue = refined.evaluation.numerators[componentIndex];
-        const double presenceMass = refined.evaluation.presenceMasses[componentIndex];
+        const float numeratorValue = refined.evaluation.numerators[componentIndex];
         component.assignedObservationCount =
             refined.evaluation.assignedCounts[componentIndex];
         component.anchor.axisXYZ =
-            canonicalFiberAxis(refined.components[componentIndex].axis);
+            canonicalFiberAxisF(refined.components[componentIndex].axis);
         component.anchor.positionPredictionXYZ =
             refined.components[componentIndex].position;
-        component.anchor.alignedSupport = denominatorValue > 0.0
-            ? numeratorValue / denominatorValue
-            : 0.0;
-        component.anchor.directionalCoherence = presenceMass > 0.0
-            ? numeratorValue / presenceMass
-            : 0.0;
+        component.anchor.alignedSupport =
+            refined.evaluation.alignedSupports[componentIndex];
+        component.anchor.directionalCoherence =
+            refined.evaluation.directionalCoherences[componentIndex];
         component.anchor.refinementScore = component.anchor.alignedSupport;
         component.anchor.refinementIterations = refined.acceptedIterations;
-        if (component.assignedObservationCount == 0 || !(numeratorValue > 0.0)) {
+        if (component.assignedObservationCount == 0 || !(numeratorValue > 0.0F)) {
             component.rejectionReason = "empty";
         } else if (component.anchor.alignedSupport < config.minimumAlignedSupport) {
             component.rejectionReason = "below_support";
@@ -2464,7 +2807,8 @@ FiberCellAnchorResult fitFiberCellAnchors(
     FiberAnchorFitProfile* profile)
 {
     return fitFiberCellAnchorsImpl(
-        cellZYX, cellBeginZYX, cellEndZYX, input, config, profile);
+        cellZYX, cellBeginZYX, cellEndZYX, input, input,
+        /*validateOwnedCoverage=*/true, config, profile);
 }
 
 static FiberAnchorExtractionReport extractFiberAnchorsImpl(
@@ -2480,10 +2824,9 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
     validateFiberAnchorConfig(config);
     if (!sampler)
         throw std::invalid_argument("fiber anchor extraction requires a prediction sampler");
-    if (!(grid.predictionToBaseScale > 0.0) ||
+    if (!(grid.predictionToBaseScale > 0.0F) ||
         !std::isfinite(grid.predictionToBaseScale) ||
-        std::any_of(grid.shapeZYX.begin(), grid.shapeZYX.end(),
-                    [](size_t value) { return value == 0; })) {
+        !detail::floatGridShapeExactlyRepresentable(grid.shapeZYX)) {
         throw std::invalid_argument("fiber anchor extraction requires a valid prediction grid");
     }
 
@@ -2594,24 +2937,28 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
         }
         return left + right;
     };
-    const double broadTransverseSupport =
+    const float broadTransverseSupport =
         config.localWindowRadiusPredictionVoxels +
         config.gaussianCutoffSigmas * config.gaussianSigmaPredictionVoxels;
-    const double broadSupportRadius = std::hypot(
+    const float broadSupportRadius = std::hypot(
         broadTransverseSupport,
         config.axialSupportHalfWidthPredictionVoxels);
-    const double peakTransverseSupport =
+    const float peakTransverseSupport =
         config.localWindowRadiusPredictionVoxels +
         config.gaussianCutoffSigmas * config.peakSigmaPredictionVoxels;
-    const double peakSupportRadius = std::hypot(
+    const float peakSupportRadius = std::hypot(
         peakTransverseSupport,
         config.gaussianCutoffSigmas *
             config.peakAxialSigmaPredictionVoxels);
-    const double maximumSupportRadius =
+    const float maximumSupportRadius =
         std::max(broadSupportRadius, peakSupportRadius);
     const size_t sampleHalo =
         static_cast<size_t>(std::ceil(maximumSupportRadius)) +
-        (config.peakGradientWeight > 0.0 ? 1 : 0);
+        (config.peakGradientWeight > 0.0F ? 1 : 0);
+    const auto supportStencil = detail::buildFiberAnchorSupportStencil(
+        cellSize, sampleHalo, maximumSupportRadius);
+    const size_t supportStencilSize =
+        detail::fiberAnchorSupportStencilSize(supportStencil);
     const std::set<std::array<size_t, 3>> explicitCellSet(
         explicitCells.begin(), explicitCells.end());
     const auto selectedCell = [&report, &explicitCellSet, usesExplicitCells](const std::array<size_t, 3>& cell) {
@@ -2644,27 +2991,27 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
     }
     std::set<CellIndex> workCellSet(selectedCells.begin(), selectedCells.end());
     if (!refinedOnly) {
-        const double nmsDistance = std::hypot(
+        const float nmsDistance = std::hypot(
             config.nmsTransverseRadiusPredictionVoxels,
             config.nmsLongitudinalRadiusPredictionVoxels);
-        const double pivotReach =
-            2.0 * config.localWindowRadiusPredictionVoxels + nmsDistance;
+        const float pivotReach =
+            2.0F * config.localWindowRadiusPredictionVoxels + nmsDistance;
         const size_t cellRadius = static_cast<size_t>(std::ceil(
-            pivotReach / static_cast<double>(cellSize))) + 1;
+            pivotReach / static_cast<float>(cellSize))) + 1;
         const auto cellPivot = [&](const CellIndex& cell) {
-            cv::Vec3d pivot;
+            cv::Vec3f pivot;
             for (size_t axis = 0; axis < 3; ++axis) {
                 const size_t begin = cell[axis] * cellSize;
                 const size_t end = std::min(
                     begin + cellSize, grid.shapeZYX[axis]);
                 pivot[static_cast<int>(2 - axis)] =
-                    (static_cast<double>(begin) +
-                     static_cast<double>(end) - 1.0) * 0.5;
+                    (static_cast<float>(begin) +
+                     static_cast<float>(end) - 1.0F) * 0.5F;
             }
             return pivot;
         };
         for (const auto& selected : selectedCells) {
-            const cv::Vec3d selectedPivot = cellPivot(selected);
+            const cv::Vec3f selectedPivot = cellPivot(selected);
             CellIndex begin{};
             CellIndex end{};
             for (size_t axis = 0; axis < 3; ++axis) {
@@ -2680,10 +3027,10 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                 for (size_t cy = begin[1]; cy < end[1]; ++cy) {
                     for (size_t cx = begin[2]; cx < end[2]; ++cx) {
                         const CellIndex candidate{cz, cy, cx};
-                        const cv::Vec3d delta =
+                        const cv::Vec3f delta =
                             cellPivot(candidate) - selectedPivot;
                         if (delta.dot(delta) <=
-                            pivotReach * pivotReach + 1.0e-12) {
+                            pivotReach * pivotReach + kGeometryEpsilon) {
                             workCellSet.insert(candidate);
                         }
                     }
@@ -2704,7 +3051,7 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                                   const char* phase) {
         const auto phaseStart = std::chrono::steady_clock::now();
         if (progressCallback)
-            progressCallback({phase, 0, requestedCells.size(), 0.0});
+            progressCallback({phase, 0, requestedCells.size(), 0.0F});
         if (requestedCells.empty())
             return std::vector<FiberCellAnchorResult>{};
         const auto tilePlanningStart = std::chrono::steady_clock::now();
@@ -2780,9 +3127,10 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                 checkedProduct(tileShape, "fiber anchor tile sample");
             const size_t denseBytes =
                 sizeof(CellIndex) + sizeof(size_t) +
+                sizeof(FloatStoredPredictionSample) +
                 sizeof(FiberStoredPredictionSample) +
                 sizeof(CompactFiberAnchorObservation) +
-                (config.peakGradientWeight > 0.0
+                (config.peakGradientWeight > 0.0F
                     ? sizeof(CachedPresenceGradient)
                     : 0);
             tile.estimatedBytes = tileSamples >
@@ -3010,12 +3358,12 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                 const size_t firstRawBytes =
                     checkedMultiply(
                         tileSampleCount(tiles[first]),
-                        sizeof(FiberStoredPredictionSample),
+                        sizeof(FloatStoredPredictionSample),
                         "fiber anchor retained tile");
                 const size_t secondRawBytes =
                     checkedMultiply(
                         tileSampleCount(tiles[bestSecond]),
-                        sizeof(FiberStoredPredictionSample),
+                        sizeof(FloatStoredPredictionSample),
                         "fiber anchor retained tile");
                 group.estimatedBytes = std::max(
                     checkedAdd(
@@ -3054,16 +3402,18 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             size_t reusedPredictionVoxels = 0;
             size_t candidateObservations = 0;
             size_t retainedObservations = 0;
+            size_t supportStencilCells = 0;
+            size_t clippedSupportCells = 0;
             size_t gradientAttempts = 0;
             size_t validGradients = 0;
             size_t gradientComputations = 0;
             size_t validGradientComputations = 0;
             size_t fitIterations = 0;
-            double coordinateConstructionSeconds = 0.0;
-            double predictionSamplingSeconds = 0.0;
-            double gradientConstructionSeconds = 0.0;
-            double observationConstructionSeconds = 0.0;
-            double fittingSeconds = 0.0;
+            double coordinateConstructionSeconds = 0.0F;
+            double predictionSamplingSeconds = 0.0F;
+            double gradientConstructionSeconds = 0.0F;
+            double observationConstructionSeconds = 0.0F;
+            double fittingSeconds = 0.0F;
             FiberAnchorFitProfile fit;
         };
         std::vector<WorkerProfile> workerProfiles(workerCount);
@@ -3086,16 +3436,16 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                 std::min(begin[1] + cellSize, grid.shapeZYX[1]),
                 std::min(begin[2] + cellSize, grid.shapeZYX[2]),
             };
-            const cv::Vec3d pivot{
-                (static_cast<double>(begin[2]) + static_cast<double>(end[2]) -
-                 1.0) *
-                    0.5,
-                (static_cast<double>(begin[1]) + static_cast<double>(end[1]) -
-                 1.0) *
-                    0.5,
-                (static_cast<double>(begin[0]) + static_cast<double>(end[0]) -
-                 1.0) *
-                    0.5,
+            const cv::Vec3f pivot{
+                (static_cast<float>(begin[2]) + static_cast<float>(end[2]) -
+                 1.0F) *
+                    0.5F,
+                (static_cast<float>(begin[1]) + static_cast<float>(end[1]) -
+                 1.0F) *
+                    0.5F,
+                (static_cast<float>(begin[0]) + static_cast<float>(end[0]) -
+                 1.0F) *
+                    0.5F,
             };
             const auto [cellSampleBegin, cellSampleEnd] = sampleBounds(cellZYX);
             const size_t plane = sampleShape[1] * sampleShape[2];
@@ -3113,50 +3463,79 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                 cellSampleShape, "fiber anchor observation");
             cellObservationIndices.clear();
             cellGradientValidity.clear();
-            cellObservationIndices.reserve(maximumObservations);
-            cellGradientValidity.reserve(maximumObservations);
-            for (size_t z = cellSampleBegin[0]; z < cellSampleEnd[0]; ++z) {
-                for (size_t y = cellSampleBegin[1]; y < cellSampleEnd[1]; ++y) {
-                    for (size_t x = cellSampleBegin[2]; x < cellSampleEnd[2]; ++x) {
-                        ++workerProfile.candidateObservations;
-                        const size_t index = tileIndex(z, y, x);
-                        const cv::Vec3d position{
-                            static_cast<double>(x),
-                            static_cast<double>(y),
-                            static_cast<double>(z),
-                        };
-                        const cv::Vec3d delta = position - pivot;
-                        const bool owned =
-                            position[0] >= static_cast<double>(begin[2]) &&
-                            position[0] < static_cast<double>(end[2]) &&
-                            position[1] >= static_cast<double>(begin[1]) &&
-                            position[1] < static_cast<double>(end[1]) &&
-                            position[2] >= static_cast<double>(begin[0]) &&
-                            position[2] < static_cast<double>(end[0]);
-                        if (owned ||
-                            delta.dot(delta) <=
-                                maximumSupportRadius * maximumSupportRadius +
-                                    1.0e-12) {
-                            cellObservationIndices.push_back(
-                                static_cast<uint32_t>(index));
-                            bool gradientValid = false;
-                            if (config.peakGradientWeight > 0.0) {
-                                ++workerProfile.gradientAttempts;
-                                const bool insideGradientHalo =
-                                    z != cellSampleBegin[0] &&
-                                    z + 1 < cellSampleEnd[0] &&
-                                    y != cellSampleBegin[1] &&
-                                    y + 1 < cellSampleEnd[1] &&
-                                    x != cellSampleBegin[2] &&
-                                    x + 1 < cellSampleEnd[2];
-                                gradientValid = insideGradientHalo &&
-                                    observations[index]
-                                        .presenceGradientValid;
-                                if (gradientValid)
-                                    ++workerProfile.validGradients;
+            bool fullHalo = true;
+            for (size_t axis = 0; axis < 3; ++axis) {
+                fullHalo = fullHalo && end[axis] - begin[axis] == cellSize &&
+                    begin[axis] >= sampleHalo &&
+                    grid.shapeZYX[axis] - end[axis] >= sampleHalo;
+            }
+            if (fullHalo) {
+                ++workerProfile.supportStencilCells;
+                workerProfile.candidateObservations += maximumObservations;
+                cellObservationIndices.reserve(supportStencilSize);
+                cellGradientValidity.reserve(supportStencilSize);
+                detail::visitFiberAnchorSupportStencilTileIndices(
+                    supportStencil, cellSampleBegin, tile.sampleBegin,
+                    sampleShape, [&](uint32_t compactIndex) {
+                        cellObservationIndices.push_back(compactIndex);
+                        bool gradientValid = false;
+                        if (config.peakGradientWeight > 0.0F) {
+                            ++workerProfile.gradientAttempts;
+                            gradientValid = observations[compactIndex]
+                                .presenceGradientValid;
+                            if (gradientValid)
+                                ++workerProfile.validGradients;
+                        }
+                        cellGradientValidity.push_back(
+                            static_cast<uint8_t>(gradientValid));
+                    });
+            } else {
+                ++workerProfile.clippedSupportCells;
+                cellObservationIndices.reserve(maximumObservations);
+                cellGradientValidity.reserve(maximumObservations);
+                for (size_t z = cellSampleBegin[0]; z < cellSampleEnd[0]; ++z) {
+                    for (size_t y = cellSampleBegin[1]; y < cellSampleEnd[1]; ++y) {
+                        for (size_t x = cellSampleBegin[2]; x < cellSampleEnd[2]; ++x) {
+                            ++workerProfile.candidateObservations;
+                            const size_t index = tileIndex(z, y, x);
+                            const cv::Vec3f position{
+                                static_cast<float>(x),
+                                static_cast<float>(y),
+                                static_cast<float>(z),
+                            };
+                            const cv::Vec3f delta = position - pivot;
+                            const bool owned =
+                                position[0] >= static_cast<float>(begin[2]) &&
+                                position[0] < static_cast<float>(end[2]) &&
+                                position[1] >= static_cast<float>(begin[1]) &&
+                                position[1] < static_cast<float>(end[1]) &&
+                                position[2] >= static_cast<float>(begin[0]) &&
+                                position[2] < static_cast<float>(end[0]);
+                            if (owned ||
+                                delta.dot(delta) <=
+                                    maximumSupportRadius * maximumSupportRadius +
+                                        kGeometryEpsilon) {
+                                cellObservationIndices.push_back(
+                                    static_cast<uint32_t>(index));
+                                bool gradientValid = false;
+                                if (config.peakGradientWeight > 0.0F) {
+                                    ++workerProfile.gradientAttempts;
+                                    const bool insideGradientHalo =
+                                        z != cellSampleBegin[0] &&
+                                        z + 1 < cellSampleEnd[0] &&
+                                        y != cellSampleBegin[1] &&
+                                        y + 1 < cellSampleEnd[1] &&
+                                        x != cellSampleBegin[2] &&
+                                        x + 1 < cellSampleEnd[2];
+                                    gradientValid = insideGradientHalo &&
+                                        observations[index]
+                                            .presenceGradientValid;
+                                    if (gradientValid)
+                                        ++workerProfile.validGradients;
+                                }
+                                cellGradientValidity.push_back(
+                                    static_cast<uint8_t>(gradientValid));
                             }
-                            cellGradientValidity.push_back(
-                                static_cast<uint8_t>(gradientValid));
                         }
                     }
                 }
@@ -3170,8 +3549,15 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             const IndexedObservationRange observationRange{
                 observations, cellObservationIndices,
                 cellGradientValidity};
+            const auto ownedRangeStart = std::chrono::steady_clock::now();
+            const DenseOwnedCompactObservationRange ownedObservationRange{
+                observations, tile.sampleBegin, sampleShape, begin, end};
+            workerProfile.fit.setupWorkSeconds +=
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - ownedRangeStart).count();
             auto result = fitFiberCellAnchorsImpl(
-                cellZYX, begin, end, observationRange, config,
+                cellZYX, begin, end, observationRange, ownedObservationRange,
+                /*validateOwnedCoverage=*/false, config,
                 &workerProfile.fit);
             workerProfile.fittingSeconds += std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - fittingStart).count();
@@ -3194,7 +3580,7 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                 try {
                     const auto& group = samplingGroups[job];
                     const Tile* previousTile = nullptr;
-                    std::vector<FiberStoredPredictionSample> previousSamples;
+                    std::vector<FloatStoredPredictionSample> previousSamples;
                     for (size_t groupIndex = 0;
                          groupIndex < group.tileCount; ++groupIndex) {
                     const Tile& tile = tiles[group.tileIndices[groupIndex]];
@@ -3216,7 +3602,7 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                     indices.reserve(sampleCount);
                     std::vector<size_t> sampledOffsets;
                     sampledOffsets.reserve(sampleCount);
-                    std::vector<FiberStoredPredictionSample> samples(sampleCount);
+                    std::vector<FloatStoredPredictionSample> samples(sampleCount);
                     const size_t plane = sampleShape[1] * sampleShape[2];
                     for (size_t z = tile.sampleBegin[0]; z < tile.sampleEnd[0]; ++z) {
                         for (size_t y = tile.sampleBegin[1]; y < tile.sampleEnd[1]; ++y) {
@@ -3271,8 +3657,10 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                             throw std::runtime_error(
                                 "fiber stored prediction sampler returned the wrong sample count");
                         }
-                        for (size_t index = 0; index < sampled.size(); ++index)
-                            samples[sampledOffsets[index]] = sampled[index];
+                        for (size_t index = 0; index < sampled.size(); ++index) {
+                            samples[sampledOffsets[index]] =
+                                narrowStoredPredictionSample(sampled[index]);
+                        }
                     }
                     workerProfile.submittedPredictionVoxels += indices.size();
                     workerProfile.reusedPredictionVoxels +=
@@ -3282,11 +3670,11 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                     sampledOffsets.clear();
                     sampledOffsets.shrink_to_fit();
                     std::vector<CachedPresenceGradient> gradients;
-                    if (config.peakGradientWeight > 0.0) {
+                    if (config.peakGradientWeight > 0.0F) {
                         const auto gradientStart = std::chrono::steady_clock::now();
                         gradients.resize(sampleCount);
-                        constexpr std::array<double, 3> smooth{0.25, 0.5, 0.25};
-                        constexpr std::array<double, 3> derivative{-0.5, 0.0, 0.5};
+                        constexpr std::array<float, 3> smooth{0.25F, 0.5F, 0.25F};
+                        constexpr std::array<float, 3> derivative{-0.5F, 0.0F, 0.5F};
                         const size_t plane = sampleShape[1] * sampleShape[2];
                         const auto localIndex = [&](size_t z, size_t y, size_t x) {
                             return (z - tile.sampleBegin[0]) * plane +
@@ -3319,7 +3707,7 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                                                     valid = false;
                                                     break;
                                                 }
-                                                const double presence = sample.presence;
+                                                const float presence = sample.presence;
                                                 cached.value[0] +=
                                                     presence * derivative[dx + 1] *
                                                     smooth[dy + 1] * smooth[dz + 1];
@@ -3363,17 +3751,10 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                                     static_cast<float>(y),
                                     static_cast<float>(z),
                                 };
-                                const cv::Vec3d direction = normalized(
-                                    sample.direction);
-                                observation.direction = {
-                                    static_cast<float>(direction[0]),
-                                    static_cast<float>(direction[1]),
-                                    static_cast<float>(direction[2]),
-                                };
-                                observation.presence =
-                                    static_cast<float>(sample.presence);
+                                observation.direction = sample.direction;
+                                observation.presence = sample.presence;
                                 observation.valid = sample.valid;
-                                if (config.peakGradientWeight > 0.0 &&
+                                if (config.peakGradientWeight > 0.0F &&
                                     gradients[index].valid) {
                                     observation
                                         .presenceGradientPredictionXYZ =
@@ -3455,6 +3836,10 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                 workerProfile.candidateObservations;
             report.profile.retainedObservations +=
                 workerProfile.retainedObservations;
+            report.profile.supportStencilCells +=
+                workerProfile.supportStencilCells;
+            report.profile.clippedSupportCells +=
+                workerProfile.clippedSupportCells;
             report.profile.gradientAttempts += workerProfile.gradientAttempts;
             report.profile.validGradients += workerProfile.validGradients;
             report.profile.gradientComputations +=
@@ -3769,8 +4154,8 @@ std::vector<std::array<size_t, 3>> fiberAnchorCellsNearPolyline(
     const FiberPredictionGridInfo& grid,
     int anchorCellSizePredictionVoxels)
 {
-    if (!(radiusBaseVoxels >= 0.0) || !std::isfinite(radiusBaseVoxels) ||
-        !(grid.predictionToBaseScale > 0.0) ||
+    if (!(radiusBaseVoxels >= 0.0F) || !std::isfinite(radiusBaseVoxels) ||
+        !(grid.predictionToBaseScale > 0.0F) ||
         !std::isfinite(grid.predictionToBaseScale) ||
         anchorCellSizePredictionVoxels < 1) {
         throw std::invalid_argument("fiber anchor polyline cell selection is invalid");
@@ -3821,14 +4206,14 @@ std::vector<std::array<size_t, 3>> fiberAnchorCellsNearPolyline(
                         std::min(grid.shapeZYX[2], begin[2] + cellSize),
                     };
                     const cv::Vec3d cellLow{
-                        (static_cast<double>(begin[2]) - 0.5) * scale,
-                        (static_cast<double>(begin[1]) - 0.5) * scale,
-                        (static_cast<double>(begin[0]) - 0.5) * scale,
+                        (static_cast<double>(begin[2]) - 0.5F) * scale,
+                        (static_cast<double>(begin[1]) - 0.5F) * scale,
+                        (static_cast<double>(begin[0]) - 0.5F) * scale,
                     };
                     const cv::Vec3d cellHigh{
-                        (static_cast<double>(end[2]) - 0.5) * scale,
-                        (static_cast<double>(end[1]) - 0.5) * scale,
-                        (static_cast<double>(end[0]) - 0.5) * scale,
+                        (static_cast<double>(end[2]) - 0.5F) * scale,
+                        (static_cast<double>(end[1]) - 0.5F) * scale,
+                        (static_cast<double>(end[0]) - 0.5F) * scale,
                     };
                     if (segmentAabbDistanceSquared(
                             start, endPoint, cellLow, cellHigh) <=
@@ -3847,9 +4232,9 @@ std::vector<std::array<size_t, 3>> fiberAnchorCellsNearPolyline(
 FiberAnchorBenchmarkReport benchmarkRefinedFiberAnchors(
     const FiberAnchorExtractionReport& anchors,
     const std::vector<cv::Vec3d>& referenceLineBase,
-    const std::vector<double>& thresholdsBaseVoxels)
+    const std::vector<float>& thresholdsBaseVoxels)
 {
-    if (!(anchors.grid.predictionToBaseScale > 0.0) ||
+    if (!(anchors.grid.predictionToBaseScale > 0.0F) ||
         !std::isfinite(anchors.grid.predictionToBaseScale) ||
         anchors.selectedCellsZYX.empty()) {
         throw std::invalid_argument("anchor benchmark extraction report is invalid");
@@ -3857,7 +4242,7 @@ FiberAnchorBenchmarkReport benchmarkRefinedFiberAnchors(
     if (thresholdsBaseVoxels.empty() ||
         std::any_of(
             thresholdsBaseVoxels.begin(), thresholdsBaseVoxels.end(),
-            [](double value) { return !(value >= 0.0) || !std::isfinite(value); })) {
+            [](float value) { return !(value >= 0.0F) || !std::isfinite(value); })) {
         throw std::invalid_argument("anchor benchmark thresholds are invalid");
     }
     if (!std::is_sorted(
@@ -3872,11 +4257,11 @@ FiberAnchorBenchmarkReport benchmarkRefinedFiberAnchors(
         FiberAnchorDiagnosticStage::Refined)];
     enum class BenchmarkPeakStage { Discrete, Separable1d, Joint2d };
     const auto measureStage = [&](BenchmarkPeakStage stage) {
-        std::map<std::array<size_t, 3>, std::vector<double>> distancesByCell;
+        std::map<std::array<size_t, 3>, std::vector<float>> distancesByCell;
         for (const auto& cell : anchors.selectedCellsZYX)
-            distancesByCell.emplace(cell, std::vector<double>{});
+            distancesByCell.emplace(cell, std::vector<float>{});
 
-        std::vector<double> distances;
+        std::vector<float> distances;
         for (const auto& record : refined) {
             if (!record.anchor.has_value())
                 continue;
@@ -3891,7 +4276,7 @@ FiberAnchorBenchmarkReport benchmarkRefinedFiberAnchors(
                 throw std::invalid_argument(
                     "refined anchor lacks matched peak benchmark provenance");
             }
-            cv::Vec3d pointPrediction;
+            cv::Vec3f pointPrediction;
             switch (stage) {
             case BenchmarkPeakStage::Discrete:
                 pointPrediction = *record.discretePeakPositionPredictionXYZ;
@@ -3903,11 +4288,12 @@ FiberAnchorBenchmarkReport benchmarkRefinedFiberAnchors(
                 pointPrediction = *record.jointPeakPositionPredictionXYZ;
                 break;
             }
-            const double distance = distanceToPolylineArc(
+            const float distance = static_cast<float>(distanceToPolylineArc(
                 reference,
-                pointPrediction * anchors.grid.predictionToBaseScale,
-                0.0,
-                reference.length());
+                cv::Vec3d{pointPrediction[0], pointPrediction[1], pointPrediction[2]} *
+                    anchors.grid.predictionToBaseScale,
+                0.0F,
+                reference.length()));
             cell->second.push_back(distance);
             distances.push_back(distance);
         }
@@ -3924,14 +4310,14 @@ FiberAnchorBenchmarkReport benchmarkRefinedFiberAnchors(
             result.anchorDistancesBaseVoxels.minimum = distances.front();
             result.anchorDistancesBaseVoxels.maximum = distances.back();
             result.anchorDistancesBaseVoxels.mean =
-                std::accumulate(distances.begin(), distances.end(), 0.0) /
-                static_cast<double>(distances.size());
+                std::accumulate(distances.begin(), distances.end(), 0.0F) /
+                static_cast<float>(distances.size());
             result.anchorDistancesBaseVoxels.median =
-                interpolatedQuantile(distances, 0.5);
+                interpolatedQuantile(distances, 0.5F);
             result.anchorDistancesBaseVoxels.percentile95 =
-                interpolatedQuantile(distances, 0.95);
+                interpolatedQuantile(distances, 0.95F);
         }
-        for (const double threshold : thresholdsBaseVoxels) {
+        for (const float threshold : thresholdsBaseVoxels) {
             FiberAnchorBenchmarkThreshold measured;
             measured.thresholdBaseVoxels = threshold;
             measured.anchorHits = static_cast<size_t>(std::upper_bound(
@@ -3939,8 +4325,8 @@ FiberAnchorBenchmarkReport benchmarkRefinedFiberAnchors(
                 threshold + kGeometryEpsilon) - distances.begin());
             if (!distances.empty()) {
                 measured.anchorHitRate =
-                    static_cast<double>(measured.anchorHits) /
-                    static_cast<double>(distances.size());
+                    static_cast<float>(measured.anchorHits) /
+                    static_cast<float>(distances.size());
             }
             for (const auto& [cell, cellDistances] : distancesByCell) {
                 (void)cell;
@@ -3951,8 +4337,8 @@ FiberAnchorBenchmarkReport benchmarkRefinedFiberAnchors(
                     ++measured.cellHits;
                 }
             }
-            measured.cellHitRate = static_cast<double>(measured.cellHits) /
-                static_cast<double>(result.referenceCells);
+            measured.cellHitRate = static_cast<float>(measured.cellHits) /
+                static_cast<float>(result.referenceCells);
             result.thresholds.push_back(measured);
         }
         return result;
@@ -3988,14 +4374,14 @@ nlohmann::json fiberAnchorReportJson(
         }},
         {"selection", {
             {"prediction_interval_origin_base_xyz", {
-                report.selectedCrop.originXYZ[0] * report.grid.predictionToBaseScale,
-                report.selectedCrop.originXYZ[1] * report.grid.predictionToBaseScale,
-                report.selectedCrop.originXYZ[2] * report.grid.predictionToBaseScale,
+                detail::checkedScaleFloatIndex(report.selectedCrop.originXYZ[0], report.grid.predictionToBaseScale, "fiber anchor crop origin"),
+                detail::checkedScaleFloatIndex(report.selectedCrop.originXYZ[1], report.grid.predictionToBaseScale, "fiber anchor crop origin"),
+                detail::checkedScaleFloatIndex(report.selectedCrop.originXYZ[2], report.grid.predictionToBaseScale, "fiber anchor crop origin"),
             }},
             {"prediction_interval_size_base_xyz", {
-                report.selectedCrop.sizeXYZ[0] * report.grid.predictionToBaseScale,
-                report.selectedCrop.sizeXYZ[1] * report.grid.predictionToBaseScale,
-                report.selectedCrop.sizeXYZ[2] * report.grid.predictionToBaseScale,
+                detail::checkedScaleFloatIndex(report.selectedCrop.sizeXYZ[0], report.grid.predictionToBaseScale, "fiber anchor crop size"),
+                detail::checkedScaleFloatIndex(report.selectedCrop.sizeXYZ[1], report.grid.predictionToBaseScale, "fiber anchor crop size"),
+                detail::checkedScaleFloatIndex(report.selectedCrop.sizeXYZ[2], report.grid.predictionToBaseScale, "fiber anchor crop size"),
             }},
             {"cell_begin_zyx", report.selectedCellBeginZYX},
             {"cell_end_zyx", report.selectedCellEndZYX},
@@ -4071,8 +4457,10 @@ nlohmann::json fiberAnchorReportJson(
             };
             if (component.retained) {
                 const auto& anchor = component.anchor;
-                const cv::Vec3d positionBase =
-                    anchor.positionPredictionXYZ * report.grid.predictionToBaseScale;
+                const cv::Vec3f positionBase = detail::checkedScaleFloatPosition(
+                    anchor.positionPredictionXYZ,
+                    report.grid.predictionToBaseScale,
+                    "fiber anchor base position");
                 componentJson["position_base_xyz"] = {
                     positionBase[0], positionBase[1], positionBase[2]};
                 componentJson["axis_xyz"] = {
@@ -4120,7 +4508,7 @@ nlohmann::json nullableSize(const std::optional<size_t>& value)
     return value.has_value() ? nlohmann::json(*value) : nlohmann::json(nullptr);
 }
 
-nlohmann::json nullableDouble(const std::optional<double>& value)
+nlohmann::json nullableDouble(const std::optional<float>& value)
 {
     return value.has_value() ? nlohmann::json(*value) : nlohmann::json(nullptr);
 }
@@ -4161,12 +4549,12 @@ std::string fiberAnchorReportObjForComponent(
     const FiberAnchorArtifactInfo& artifact,
     std::optional<size_t> selectedComponent)
 {
-    if (!(artifact.glyphLengthBaseVoxels > 0.0) ||
+    if (!(artifact.glyphLengthBaseVoxels > 0.0F) ||
         !std::isfinite(artifact.glyphLengthBaseVoxels)) {
         throw std::invalid_argument("fiber anchor OBJ glyph length must be positive and finite");
     }
     std::ostringstream output;
-    output << std::setprecision(std::numeric_limits<double>::max_digits10);
+    output << std::setprecision(std::numeric_limits<float>::max_digits10);
     output << "# vc_fiberlet_anchors version 1\n";
     size_t vertex = 1;
     for (const auto& cell : report.nonEmptyCells) {
@@ -4180,12 +4568,16 @@ std::string fiberAnchorReportObjForComponent(
             if (!component.retained)
                 continue;
             const auto& anchor = component.anchor;
-            const cv::Vec3d center = anchor.positionPredictionXYZ *
-                report.grid.predictionToBaseScale;
-            const cv::Vec3d half = anchor.axisXYZ *
-                (artifact.glyphLengthBaseVoxels * 0.5);
-            const cv::Vec3d first = center - half;
-            const cv::Vec3d second = center + half;
+            const cv::Vec3f center = detail::checkedScaleFloatPosition(
+                anchor.positionPredictionXYZ,
+                report.grid.predictionToBaseScale,
+                "fiber anchor OBJ base position");
+            const cv::Vec3f half = anchor.axisXYZ *
+                (artifact.glyphLengthBaseVoxels * 0.5F);
+            const cv::Vec3f first = detail::checkedFloatPosition(
+                center - half, "fiber anchor OBJ endpoint");
+            const cv::Vec3f second = detail::checkedFloatPosition(
+                center + half, "fiber anchor OBJ endpoint");
             output << "g cell_" << cell.cellZYX[0] << '_' << cell.cellZYX[1]
                    << '_' << cell.cellZYX[2] << "_anchor_" << componentIndex << '\n';
             output << "v " << first[0] << ' ' << first[1] << ' ' << first[2] << '\n';
@@ -4206,7 +4598,7 @@ nlohmann::json fiberAnchorDiagnosticStageJson(
 {
     if (artifact.sourceLocator.empty() || artifact.manifestContentHash.empty())
         throw std::invalid_argument("fiber anchor diagnostics require source identity and manifest hash");
-    if (!(artifact.glyphLengthBaseVoxels > 0.0) ||
+    if (!(artifact.glyphLengthBaseVoxels > 0.0F) ||
         !std::isfinite(artifact.glyphLengthBaseVoxels)) {
         throw std::invalid_argument("fiber anchor diagnostic glyph length must be positive and finite");
     }
@@ -4248,8 +4640,10 @@ nlohmann::json fiberAnchorDiagnosticStageJson(
         nlohmann::json geometry = nullptr;
         if (record.anchor.has_value()) {
             const FiberAnchor& anchor = *record.anchor;
-            const cv::Vec3d positionBase =
-                anchor.positionPredictionXYZ * report.grid.predictionToBaseScale;
+            const cv::Vec3f positionBase = detail::checkedScaleFloatPosition(
+                anchor.positionPredictionXYZ,
+                report.grid.predictionToBaseScale,
+                "fiber anchor diagnostic base position");
             geometry = {
                 {"position_base_xyz", {positionBase[0], positionBase[1], positionBase[2]}},
                 {"axis_xyz", {anchor.axisXYZ[0], anchor.axisXYZ[1], anchor.axisXYZ[2]}},
@@ -4316,7 +4710,7 @@ std::string fiberAnchorReportObj(
 
 std::string fiberAnchorCellReportObj(const FiberAnchorExtractionReport& report)
 {
-    if (!(report.grid.predictionToBaseScale > 0.0) ||
+    if (!(report.grid.predictionToBaseScale > 0.0F) ||
         !std::isfinite(report.grid.predictionToBaseScale) ||
         report.config.cellSizePredictionVoxels < 1) {
         throw std::invalid_argument("fiber anchor cell OBJ metadata is invalid");
@@ -4330,7 +4724,7 @@ std::string fiberAnchorCellReportObj(const FiberAnchorExtractionReport& report)
     const size_t cellSize = static_cast<size_t>(
         report.config.cellSizePredictionVoxels);
     std::ostringstream output;
-    output << std::setprecision(std::numeric_limits<double>::max_digits10);
+    output << std::setprecision(std::numeric_limits<float>::max_digits10);
     output << "# vc_fiberlet_anchor_cells version 1\n";
     size_t vertex = 1;
     for (const auto& cellZYX : selectedCells) {
@@ -4343,13 +4737,14 @@ std::string fiberAnchorCellReportObj(const FiberAnchorExtractionReport& report)
             if (begin[axis] >= end[axis])
                 throw std::invalid_argument("fiber anchor cell lies outside its grid");
         }
-        const cv::Vec3d centerPredictionXYZ{
-            0.5 * static_cast<double>(begin[2] + end[2] - 1),
-            0.5 * static_cast<double>(begin[1] + end[1] - 1),
-            0.5 * static_cast<double>(begin[0] + end[0] - 1),
+        const cv::Vec3f centerPredictionXYZ{
+            0.5F * static_cast<float>(begin[2] + end[2] - 1),
+            0.5F * static_cast<float>(begin[1] + end[1] - 1),
+            0.5F * static_cast<float>(begin[0] + end[0] - 1),
         };
-        const cv::Vec3d centerBase = centerPredictionXYZ *
-            report.grid.predictionToBaseScale;
+        const cv::Vec3f centerBase = detail::checkedScaleFloatPosition(
+            centerPredictionXYZ, report.grid.predictionToBaseScale,
+            "fiber anchor cell base position");
         const size_t centerVertex = vertex++;
         output << "g cell_" << cellZYX[0] << '_' << cellZYX[1] << '_'
                << cellZYX[2] << '\n';
@@ -4362,8 +4757,10 @@ std::string fiberAnchorCellReportObj(const FiberAnchorExtractionReport& report)
         for (const auto& component : retained->second->components) {
             if (!component.retained)
                 continue;
-            const cv::Vec3d anchorBase = component.anchor.positionPredictionXYZ *
-                report.grid.predictionToBaseScale;
+            const cv::Vec3f anchorBase = detail::checkedScaleFloatPosition(
+                component.anchor.positionPredictionXYZ,
+                report.grid.predictionToBaseScale,
+                "fiber anchor cell base position");
             const size_t anchorVertex = vertex++;
             output << "v " << anchorBase[0] << ' ' << anchorBase[1] << ' '
                    << anchorBase[2] << '\n';

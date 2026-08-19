@@ -1,9 +1,12 @@
-# Status: Native Trace2CP benchmark record
+# Status: re-merge fiber-lets2
 
-- [x] Locate the historical benchmark record
-- [x] Confirm the documented benchmark file is missing
-- [x] Capture the supplied command and output scopes
-- [x] Review the documentation plan independently
-- [x] Restore and update the benchmark document
-- [x] Add the supplied step-32 aggregate benchmark
-- [x] Validate metrics, Markdown, and diff cleanliness
+- [x] Commit benchmark results separately
+- [x] Start merge and inventory conflicts
+- [x] Resolve the FiberGraph behavior conflict
+- [x] Clear stale task-local planning conflicts
+- [x] Review the merge plan independently
+- [x] Verify and stage all resolutions
+- [x] Build affected targets with `-j32`
+- [x] Run focused anchor, path, and replay tests
+- [x] Run repeated merged canonical replay validation
+- [x] Commit the merge

@@ -2546,6 +2546,17 @@
   cannot create normalization holes that attract or repel the fit. Coherence
   divides by retained assigned `sum g_ik p_i`. Empty, degenerate, and
   below-threshold components are discarded independently.
+- Fixed-direction spatial objectives are implemented in a separate private
+  objective module. Production indexed compact observations remain float32
+  through Gaussian, alignment, numerator, denominator, and final ratio
+  arithmetic; their directions are already normalized by compact-observation
+  construction. Logical assignment/membership indices address the per-cell
+  index stream, while observations address the indexed tile storage. The
+  direct public fitter uses the same float32 observation, component, and
+  accumulator representation. Persistent component state, acceptance
+  tolerances, final aligned-support evaluation, diagnostics, and serialized
+  numeric values are float32; direct and indexed fitting differ only in storage
+  and indexing.
 - Robust assignment, trimming, direct direction update, and position update run
   for at most `maximum_iterations`, default 2. This is a bounded alternating
   refinement budget, not convergence to exact equality of hard assignment or
@@ -2667,13 +2678,36 @@
   observation copies across overlapping support regions. The public expanded
   observation API and production indexed path share one templated fitter. Tile
   halos may overlap, but the decoded chunk cache avoids repeated source-chunk
-  reads. Deterministic tile splitting and the worker
+  reads. Complete cells with a full volume halo expand one immutable ordered
+  `(z, y, xBegin, xEnd)` owned-or-radius support stencil through their tile's
+  actual strides. This preserves canonical ZYX order and logical observation/
+  gradient populations. Crop and tile boundaries do not affect eligibility;
+  partial cells or cells clipped by a volume boundary retain the scalar sample-
+  cube construction. When gradients are enabled, the extra halo voxel makes
+  every retained stencil site gradient-eligible, while sampled tile-gradient
+  validity remains authoritative. Deterministic tile splitting and the worker
   count keep coordinate vectors, decoded samples, and cell scratch under the
   aggregate sample-memory budget; lower-level sampling uses one thread.
   Results and worker failures are stored by canonical cell index, retain
   predicates and diagnostic aggregation run serially, and progress callbacks
   are serialized. The lowest-index cell failure is reported after all workers
   join.
+  Initial seed fitting uses a separate exact owned-cell view over the same
+  dense tile. Its constant-time layout validation requires monotonic cell
+  bounds, containment by the tile sample box, matching tile observation
+  cardinality, and matching clipped owned cardinality. It then visits dense
+  rows in canonical Z/Y/X order without an owned-index allocation. Robust
+  refinement continues to use the larger support-index range. The public
+  expanded-observation API retains stable input-order filtering and its
+  historical count-only owned-coverage check; it does not sort, deduplicate,
+  or require lattice coordinates.
+  Production compact observations also keep robust-proposal positions,
+  directions, component state, Gaussian/alignment values, masses, residual
+  histograms, and retained direction tensors in float32 throughout the repeated
+  per-observation loop. Fixed residual histograms, retained tensors, robust
+  cutoff selection, the shared float principal-axis solver, persistent
+  component state, diagnostics, and serialized output remain float32. The
+  public direct-observation fitter uses this same precision path.
   Machine output and OBJ store spatial positions only in base-volume XYZ
   coordinates. Prediction shape/scale, cell indices, cell size, direction
   falloff, transverse/axial peak sigmas, peak grid step, cutoff, local window,
@@ -2761,9 +2795,10 @@
   selection-boundary corners.
 - `--batch`, initially 65536, limits consecutive global unique coordinates per
   sampler call. All prediction ranges complete before any normal range. After
-  all reads, endpoint/node corners and weights are re-derived directly from
-  their canonical stored positions and sampling temporaries are released before
-  parallel DP. Prediction
+  all reads, prepared scoring voxels and their immutable paged index are
+  retained through parallel DP. Exact endpoints are interpolated eagerly;
+  interior-node corners and weights are re-derived from canonical stored
+  positions only on a candidate-local lazy-cache miss. Prediction
   and normal samplers each receive every global coordinate exactly once; only
   their call count changes with `--batch`.
 - Every parallel stage writes canonical slots. Workers continue after
@@ -2795,7 +2830,8 @@
   volume bounds, corridor membership, and any replay tube predicate. An
   interior mapped point is narrowed once to three `float32` coordinates before
   any of those admission tests; that stored position is authoritative for
-  sampling, DP geometry, and output. Exact endpoint anchors remain doubles.
+  sampling, DP geometry, and output. Exact endpoint anchors use the same
+  float32 representation as interior nodes.
   `(layer,u,v)` is checked row-major packed into one `uint32_t` using the
   per-candidate transverse width; non-finite or overflowing lattices fail.
 - The exact start `(s=0,u=v=0)` and target `(s=L,u=v=0)` are source and sink.
@@ -2803,9 +2839,14 @@
   at most one. Their actual mapped XYZ vectors and Euclidean lengths drive all
   feasibility and scoring. The final interval may be shorter than 2 prediction
   voxels; exact multiples and curves shorter than 2 do not create duplicate
-  planes. State retains incoming predecessor identity, with up to nine
-  prior-layer transitions plus the source state, because the objective is
-  second-order. Strict cost ties retain the first canonical predecessor.
+  planes. States 0 through 8 encode the incoming `(du,dv)` transition; state 9
+  is source-only. The predecessor node is derived from the checked packed key
+  as `(layer-1,u-du,v-dv)`, while reconstruction stores only the predecessor's
+  state index. Cumulative costs are float32 and exist only for the current and
+  next interior layers; one predecessor-state byte per global node/state
+  remains until reconstruction. The exact source and sink stay outside this
+  rolling interior representation. Strict cost ties retain the first canonical
+  predecessor.
 - Arbitrary-position presence is the trilinear weighted sum of all positive-weight
   native corners. Unoriented prediction axes are normalized and combined as
   `T=sum(w*d*d^T)` without presence weighting; the deterministic shared
@@ -2818,12 +2859,19 @@
   Materialized interior prediction and normal axes are re-encoded in the
   Lasagna +Z compact `nx/ny` byte convention; presence is a clamped rounded
   byte and validity uses independent bits. This intentional second
-  quantization is part of the experimental DP objective. The 24-byte node
-  stores only key, float position, compact axes, presence, and flags; no normal
+  quantization is part of the experimental DP objective. The persistent
+  16-byte geometry node stores only key and float position; compact scoring is
+  converted immediately into the candidate-local prepared cache and no normal
   reason or interpolation stencil is retained. The
   global sparse union includes all required native corners even when a corner
   lies outside the floating-node tube predicate. Evaluated nodes retain integer
-  candidate and local keys rather than floating-point hash identity.
+  candidate and local keys rather than floating-point hash identity. Each
+  candidate owns a direct node-to-cache map and append-only prepared scoring
+  cache. First access interpolates, compact-quantizes, decodes, and normalizes
+  that node; later accesses reuse its cache index. Mutable page lookup state is
+  candidate-local, while the underlying prepared scoring voxels and page index
+  are shared read-only. Both local structures are released after that candidate
+  and are not added to persistent prepared geometry.
 - Every nonzero DP edge must have an unoriented angle strictly below 25 degrees
   to the interpolated dense fiber-prediction axis. Equivalently, for normalized step
   `d` and fiber axis `f`, `abs(d dot f) > cos(25 degrees)` without a boundary
@@ -2832,7 +2880,10 @@
   and remain constrained by the fitted endpoint-axis rule. A missing, invalid,
   nonfinite, or degenerate required interior prediction rejects that edge before
   scoring. The independent Lasagna surface normal does not participate in this
-  hard gate.
+  hard gate. A reached node resolves at most nine outgoing neighbor lookups,
+  mapped directions/lengths, and hard-gate results once and reuses those edge
+  descriptors across every reached incoming state. Unreached nodes do not
+  pre-generate edges.
 - Valid-data scoring shares the regular native tracer's exact ordered float
   multiplicative alignment loss. For incoming step `a`, outgoing step `b`,
   current prediction `c` sign-aligned to `a`, candidate prediction `d` sign-
@@ -2841,6 +2892,9 @@
   that order. Alignment cost is `(1-score)*actual_edge_length`; edge-length weighting
   keeps differently directed local transitions comparable. The former lattice
   direction floor and independent presence/direction weights do not exist.
+  Fiberlet DP calls the shared prepared-input scoring path with cached unit
+  vectors; the regular validating scoring API normalizes and delegates to the
+  same arithmetic.
 - The source transition uses the fitted start axis as both `a` and `c`, its
   actual mapped direction as `b`, and the dense destination prediction as `d`.
   The sink transition uses the current dense prediction and incoming step, its
@@ -3143,7 +3197,7 @@
   Benchmark comparisons must retain identical inputs, parameters, build type,
   and interval.
 - Benchmark and full replay extraction emit the same versioned
-  `fiberlet_extraction_profile version=6` key/value schema. The profile exposes
+  `fiberlet_extraction_profile version=17` key/value schema. The profile exposes
   deterministic workload counters and finer anchor/fiberlet phase timings.
   Enclosing phase fields are wall time, `_work_seconds` fields are summed
   worker/candidate time, and CPU fields are process CPU time. Corner insertion
@@ -3193,11 +3247,78 @@
   spatial objectives, and transverse peak evaluation may regroup otherwise
   equivalent floating-point operations; small numeric differences from
   version 4 are accepted for this anchor fitter.
-- Transient direction-conditioned peak observations and transverse response
-  math use float32. Persistent anchor state, accepted positions, diagnostics,
-  and serialized output remain double precision. Peak ties and downstream DP
-  counts need not be numerically identical, but retained populations and replay
-  quality must be checked on the canonical workload.
+- Version 13 adds solve-local prepared-node/index/state byte maxima, prepared
+  node count, reached-node and generated/valid/reused-edge counts, and separate
+  node-preparation worker time. DP visit/lookup counters exclude outgoing work
+  from the final interior layer because that layer transitions directly to the
+  sink. State-memory accounting is the global predecessor bytes plus the two
+  largest adjacent rolling cost layers; adjacent-layer populations are counted
+  during parallel node generation rather than by a separate serial pass.
+- Version 14 changes `interpolatedScoringPoints` to actual endpoint plus unique
+  lazy-node interpolations. It separately reports endpoint interpolations, lazy
+  requests, unique materializations, cache hits, maximum node-to-cache index
+  bytes, and shared prepared-scoring/page-index bytes retained during search.
+  Sparse interpolation timing samples use a fixed hash of canonical candidate
+  index and packed node key; exact resolution/materialization counts remain
+  complete and deterministic.
+- Version 15 adds `anchor_support_stencil_cells` and
+  `anchor_clipped_support_cells`. Their sum equals `anchor_work_cells`.
+  `anchor_candidate_observations` retains the represented sample-cube count,
+  while retained-observation and gradient counters retain their logical
+  populations when the support stencil avoids rejected-site tests.
+- Version 16 adds `anchor_fit_owned_discovery_observation_visits`,
+  `anchor_fit_owned_initialization_observation_visits`, and
+  `anchor_fit_avoided_owned_support_observation_visits`. Public fitting reports
+  coordinate-discovery and stable-filter visits. Production reports direct
+  owned visits and the visits avoided relative to its former two complete
+  support-range scans; existing logical observation populations are unchanged.
+- Version 17 splits direction-conditioned peak data into 16-byte float32 hot
+  response records, parallel 32-bit evidence indices, and 16-byte retained
+  evidence records. Invalid-gradient retained observations remain evidence
+  because their aligned weight contributes to gradient coverage. Prepared
+  response/evidence counters report populations; response-observation visits
+  count every hot scan, while evidence-observation visits count indexed records
+  actually loaded after radial rejection. Record sizes and maximum temporary
+  peak-observation storage are reported explicitly.
+- Peak response implementations may regroup equivalent accumulation work;
+  exact floating-point identity and fixed accumulation order are not required.
+  Deterministic repeatability, anchor axis/position distributions, populations,
+  replay metrics, failures, and visual quality remain the acceptance gates.
+- Direction-conditioned peak observations, transverse response math,
+  persistent anchor state, accepted positions, diagnostics, and serialized
+  output use float32. Peak ties and downstream DP counts need not be
+  numerically identical, but retained populations and replay quality must be
+  checked on the canonical workload.
+- Stored-prediction samplers may retain their shared double-valued interface,
+  but anchor extraction must normalize and range-check each returned sample
+  once into a float32 tile. Reused tile halos, gradients, compact observations,
+  and fitting must never retain the shared double sample. Float convergence,
+  matrix, geometry, and response-comparison tolerances must be representable
+  and effective at the magnitude where they are applied.
+- Float32 anchor/fiberlet grids must have nonzero extents no larger than
+  `2^24` on every axis, preserving exact integer voxel identity. Base-space
+  serialization and OBJ output must fail instead of emitting coordinates that
+  overflow float32.
+- The existing double principal-axis API retains its historical names. The
+  float32 API uses explicit `*F` names so brace-initialized double callers do
+  not become ambiguous.
+- Final refined-anchor support evaluation uses one float32 reduction for both
+  compact production observations and direct public observations. All fields
+  are consumed directly and public directions are normalized safely in
+  float32. All finite-position sites contribute to the Gaussian
+  denominator independently of direction/presence usability or robust
+  membership. Aligned support, directional coherence, and combined objective
+  remain float32 in persistent anchor state. Exact numeric identity is not
+  required; deterministic support
+  classification and canonical replay quality are the contract.
+- The bounded direction-conditioned peak grid uses a checked row-major layout.
+  Physical grid points and feasibility are constructed once in canonical
+  first/second-index order; computed response values use direct cache slots
+  with a separate computed-state byte. Hill-climb traversal, lexicographic
+  tie-breaking, response arithmetic, separate float response coordinates, the
+  no-feasible-slot center fallback, and uncached subpixel acceptance semantics
+  remain unchanged. Existing profile request, computed-grid, and acceptance
+  response counters retain their definitions.
 - The hot replay-tube filter snapshots authoritative clipped source segments in
   prediction coordinates as float32 and uses a packed Boost.Geometry R-tree of
   radius-expanded segment AABBs. A point is inside when any candidate's

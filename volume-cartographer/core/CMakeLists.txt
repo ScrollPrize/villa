@@ -194,6 +194,8 @@ target_link_libraries(vc_atlas PUBLIC vc_core vc_lasagna PRIVATE Ceres::ceres)
 
 add_library(vc_fiber_tracer
     src/fiber_tracer/FiberAnchors.cpp
+    src/fiber_tracer/FiberAnchorObjectives.cpp
+    src/fiber_tracer/FiberAnchorFinalEvaluation.cpp
     src/fiber_tracer/FiberAxisTensor.cpp
     src/fiber_tracer/FiberGraph.cpp
     src/fiber_tracer/FiberLocalScoring.cpp

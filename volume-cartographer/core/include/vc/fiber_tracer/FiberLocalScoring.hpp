@@ -72,4 +72,22 @@ struct FiberLocalMetricCost {
     bool normalValid,
     const FiberLocalMetricConfig& config);
 
+// Prepares a finite unit direction using the same validation as the regular
+// metric path. Invalid or degenerate input becomes zero.
+[[nodiscard]] cv::Vec3f prepareFiberLocalUnitDirection(
+    const cv::Vec3f& direction);
+
+// Equivalent metric equations for inputs already prepared as unit directions.
+// Valid prediction samples must contain a prepared unit direction.
+[[nodiscard]] FiberLocalMetricCost fiberLocalMetricCostPrepared(
+    const FiberLocalMetricSample* currentPrediction,
+    const FiberLocalMetricSample& candidatePrediction,
+    const cv::Vec3f& previousStepUnitDirection,
+    float previousStepLength,
+    const cv::Vec3f& candidateStepUnitDirection,
+    float candidateStepLength,
+    const cv::Vec3f& normal,
+    bool normalValid,
+    const FiberLocalMetricConfig& config);
+
 }  // namespace vc::fiber_tracer

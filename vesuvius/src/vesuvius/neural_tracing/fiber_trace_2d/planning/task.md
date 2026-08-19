@@ -1,5 +1,6 @@
-# Task: Native Trace2CP benchmark record
+# Task: re-merge fiber-lets2
 
-Restore the user-supplied exact historical native Python Trace2CP benchmark
-document and add the supplied four-fiber scale-0-model/scale-2-field runs using
-the existing tables and naming scheme.
+Commit the updated native Trace2CP benchmark records, then merge the latest
+`fiber-lets2` changes into `fiber-lets`. Clear stale task-local planning
+content and preserve the current anisotropic replay behavior while accepting
+the new fiberlet extraction performance work.

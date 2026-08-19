@@ -1,3 +1,35 @@
+# 2026-08-19: float final anchor support reduction
+
+- Isolated final refined-anchor evaluation in its own translation unit and kept
+  both compact and expanded observation paths in checked float32 arithmetic.
+- Reduced canonical final-evaluation worker time by 4.9%, anchor CPU by 1.4%,
+  and total wall by 0.4% with byte-identical replay artifacts.
+
+# 2026-08-18: solve-local fiberlet DP reuse
+
+- Cached normalized scoring inputs once per retained node and reused each
+  reached node's outgoing descriptors across its incoming DP states.
+- Replaced all-node cumulative state with rolling two-layer float32 costs and
+  packed-key-derived predecessors, cutting canonical search CPU by 45.9% and
+  total CPU by 8.8% while preserving selected geometry and replay failures.
+- Added extraction-profile version 13 with solve-local memory, node/edge reuse,
+  and node-preparation diagnostics.
+- Deferred interior scoring interpolation until first search access and cached
+  it per candidate. This reduced canonical fiberlet CPU by another 35.9%, total
+  wall by 9.7%, and peak RSS by 14.2% with byte-identical replay artifacts.
+- Added extraction-profile version 14 with endpoint, lazy request/miss/hit, and
+  shared/local scoring-memory diagnostics.
+- Reused an exact ordered support-span stencil for complete anchor cells,
+  reducing canonical anchor CPU by 5.5% and total wall by 3.6% with
+  byte-identical replay artifacts.
+- Added extraction-profile version 15 with support-stencil and clipped-cell
+  counts.
+- Traversed the exact owned-cell cube directly during anchor initialization,
+  reducing canonical fit-setup worker time from 11.00 to about 0.09 seconds and
+  anchor CPU by 4.1% with byte-identical replay artifacts.
+- Added extraction-profile version 16 with public discovery, direct owned, and
+  avoided support-visit counts.
+
 # 2026-08-17: robust sampled-direction anchor refinement
 
 - Replaced joint angular line search with deterministic competitive robust
@@ -20,6 +52,15 @@
 - Replaced per-fiberlet packed-node-key hash maps with bounded direct indexes,
   reducing canonical replay wall time by 2.1% with unchanged path work and
   replay quality.
+- Replaced repeated scoring-voxel hash lookups with sparse `16^3` pages and
+  dense page-local indices, reducing interpolation materialization by 4.2%
+  while preserving exact replay artifacts.
+- Prepared compact float32 prediction/normal axes and symmetric tensors once
+  per sampled voxel, reducing interpolation materialization by 26.1% while
+  preserving fiberlet geometry and replay outcomes.
+- Replaced fiberlet interpolation's iterative principal-axis solve with a
+  guarded closed form, reducing resolver materialization by another 8.8% with
+  zero fallbacks and byte-identical replay artifacts.
 
 # 2026-08-17: fiberlet extraction profiling
 
@@ -617,3 +658,24 @@
 - Added version-3 local-refinement subphase profiling, identifying repeated
   refined-state evaluation as roughly 89-90% of remaining local-refinement
   worker time on the canonical replay.
+
+# 2026-08-18: contiguous anchor peak-grid caching
+
+- Replaced direction-conditioned peak-search ordered maps and repeated grid
+  geometry with checked contiguous row-major caches. The canonical replay's
+  median peak-search worker time improved from roughly 43.9 to 42.84 seconds
+  with byte-identical artifacts and deterministic work counters.
+- Split peak responses into a 16-byte hot stream and sparse retained-evidence
+  storage. Canonical median peak-search worker time improved from 42.84 to
+  39.94 seconds and command wall from 10.43 to 10.25 seconds with unchanged
+  replay artifacts and quality populations.
+- Kept production compact robust direction proposals in float32 through their
+  per-observation loop, widening only fixed-size summaries for the existing
+  double cutoff and eigensolver. Canonical median proposal work improved from
+  25.63 to 23.74 worker-seconds with unchanged populations/failures and a
+  maximum emitted-route displacement of 1.38e-6 base voxels.
+- Isolated retained spatial objectives in a private translation unit and kept
+  production compact objective arithmetic float32 while preserving the public
+  compensated-double path. Canonical median objective work improved from 22.59
+  to 13.86 worker-seconds and command wall from 9.56 to 9.17 seconds with
+  byte-identical replay artifacts.
