@@ -333,6 +333,103 @@ class DevicePatchAtlasTests(unittest.TestCase):
         self.assertTrue(bool((potentials != crossing_map._unset_potential).all()))
         self.assertEqual(crossing_map.potential_consistency()['inconsistent_edges'], 0)
 
+    def test_patch_atlas_attributes_global_theta_nodes_to_patch_ids(self):
+        from theta_crossing_map import ThetaCrossingMap
+
+        patches = {
+            'first': self._fake_patch(3, 3, 41),
+            'second': self._fake_patch(4, 3, 42),
+        }
+        atlas = self.PatchAtlas(patches, device='cpu')
+        crossing_map = ThetaCrossingMap('cpu')
+        atlas.register_theta_topology(crossing_map)
+
+        # The atlases own 4 and 6 consecutive quad-centre nodes respectively.
+        self.assertEqual(atlas.patch_ids_for_theta_nodes([1]), ['first'])
+        self.assertEqual(atlas.patch_ids_for_theta_nodes(torch.tensor([8, 2])),
+                         ['first', 'second'])
+        self.assertEqual(atlas.patch_ids_for_theta_nodes([10, 999]), [])
+
+    def test_fit_context_gate_excludes_patch_and_writes_source_path(self):
+        from fit_spiral import FitContext, _UnattachedPclStripList
+
+        # Construct a 2x2 quad-centre field whose theta values make the
+        # diagonal/local-edge graph non-liftable.  Vertex values are recovered
+        # recursively so bilinear lookup at each centre is exact.
+        centre_theta = torch.tensor([[0.1, 2.0], [4.0, 6.0]])
+        centre_yx = torch.stack([
+            torch.sin(centre_theta) * 30.0,
+            torch.cos(centre_theta) * 30.0,
+        ], dim=-1)
+        zyxs = torch.zeros((3, 3, 3), dtype=torch.float32)
+        zyxs[..., 0] = 10.0
+        for i in range(2):
+            for j in range(2):
+                zyxs[i + 1, j + 1, 1:] = (
+                    4.0 * centre_yx[i, j]
+                    - zyxs[i, j, 1:]
+                    - zyxs[i + 1, j, 1:]
+                    - zyxs[i, j + 1, 1:])
+        patch = types.SimpleNamespace(
+            zyxs=zyxs,
+            _sampling_valid_quad_mask_np=np.ones((2, 2), dtype=bool),
+            _sampling_2d_path=None,
+            _sampling_area=4.0,
+            area=4.0,
+            _source_path='/inputs/non-liftable-patch.tifxyz',
+        )
+        unverified_patch = types.SimpleNamespace(**vars(patch))
+        unverified_patch._source_path = \
+            '/unverified/non-liftable-unverified-patch.tifxyz'
+
+        with tempfile.TemporaryDirectory() as out_path:
+            context = FitContext.__new__(FitContext)
+            context.device = torch.device('cpu')
+            context.config = {
+                'theta_crossing_map_update_interval': 100,
+                'patch_sampling_area_exponent': 1.0,
+            }
+            context.slice_to_spiral_transform = lambda value: value
+            context.dist = types.SimpleNamespace(is_main_process=True)
+            context.out_path = out_path
+            context.non_liftable_patch_paths = set()
+            context.verified_patches_path = '/inputs'
+            context.unverified_patches_path = '/unverified'
+            context.verified_patches = {'bad': patch}
+            context.verified_patches_list = [patch]
+            context.patch_sampling_probabilities = np.ones(1)
+            context.num_verified_patches = 1
+            context.patch_atlas = self.PatchAtlas(
+                context.verified_patches, device='cpu').materialize()
+            context.unverified_patches = {'unverified-bad': unverified_patch}
+            context.unverified_patches_list = [unverified_patch]
+            context.unverified_patch_sampling_probabilities = np.ones(1)
+            context.unverified_patch_atlas = self.PatchAtlas(
+                context.unverified_patches, device='cpu').materialize()
+            context.cross_patch_pcls = []
+            context.unattached_pcl_strips = _UnattachedPclStripList()
+            context.unattached_component_edges = []
+            context.interactive_driver = None
+
+            warnings = context._build_theta_crossing_map()
+
+            self.assertEqual(len(warnings), 2)
+            self.assertEqual(context.verified_patches, {})
+            self.assertEqual(context.verified_patches_list, [])
+            self.assertEqual(context.unverified_patches, {})
+            self.assertEqual(context.unverified_patches_list, [])
+            self.assertIsNone(context.unverified_patch_atlas)
+            self.assertEqual(context.num_verified_patches, 0)
+            self.assertEqual(
+                context.theta_crossing_map.potential_consistency()[
+                    'inconsistent_edges'],
+                0)
+            report = Path(out_path, 'non_liftable_patches.txt').read_text()
+            self.assertEqual(
+                report,
+                '/inputs/non-liftable-patch.tifxyz\n'
+                '/unverified/non-liftable-unverified-patch.tifxyz\n')
+
     @unittest.skipUnless(torch.cuda.is_available(), 'needs CUDA')
     def test_materialized_lookup_and_append_stay_on_cuda(self):
         atlas = self.PatchAtlas(

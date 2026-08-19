@@ -337,6 +337,7 @@ class PatchAtlas:
         self._patches = list(patches_by_id.values())
         self._quad_node_ids = []
         self._theta_node_start = None
+        self._theta_node_ranges = []
         native = load_native_spiral_sampling()
         self.sampling_atlas = (
             native.PatchSamplingAtlas([
@@ -421,6 +422,12 @@ class PatchAtlas:
         start = crossing_map.register_nodes(num_quads, get_centres)
         self._theta_node_start = start
         self._quad_node_ids = [m + np.where(m >= 0, start, 0) for m in local_maps]
+        range_start = start
+        self._theta_node_ranges = []
+        for local in local_maps:
+            range_end = range_start + int((local >= 0).sum())
+            self._theta_node_ranges.append((range_start, range_end))
+            range_start = range_end
 
         neighbours = ((0, 1), (1, -1), (1, 0), (1, 1))
         for patch, node_map in zip(self._patches, self._quad_node_ids):
@@ -490,6 +497,20 @@ class PatchAtlas:
             crossing_map.register_unwrap_tree(node_base + order, parents)
         return start
 
+    def patch_ids_for_theta_nodes(self, node_ids):
+        """Return patches owning any of the supplied global theta node IDs."""
+        nodes = torch.as_tensor(node_ids, dtype=torch.int64).cpu().numpy()
+        if nodes.size == 0:
+            return []
+        nodes = np.unique(nodes)
+        patch_ids = list(self.id_to_idx)
+        found = []
+        for patch_id, (lo, hi) in zip(patch_ids, self._theta_node_ranges):
+            position = int(np.searchsorted(nodes, lo))
+            if position < nodes.size and nodes[position] < hi:
+                found.append(patch_id)
+        return found
+
     def theta_node_ids(self, patch_indices, ijs):
         """Resolve fractional samples/path cells to registered quad-centre ids."""
         patch_indices = np.asarray(patch_indices, dtype=np.int64)
@@ -538,6 +559,7 @@ class PatchAtlas:
         self._patches.extend(patches_by_id.values())
         self._theta_node_start = None
         self._quad_node_ids = []
+        self._theta_node_ranges = []
         next_idx = len(self.id_to_idx)
         for pid in patches_by_id:
             self.id_to_idx[pid] = next_idx
@@ -955,6 +977,7 @@ class FitContext:
         self.out_base_dir = out_base_dir if out_base_dir is not None else './out'
         self.run_tag = run_tag or None
         self.run_name = run_name
+        self.non_liftable_patch_paths = set()
         # Who this process is in the job, as an explicit value. Callers that
         # joined a process group pass the context maybe_init_distributed()
         # returned; the default is the process context installed there (a
@@ -1037,7 +1060,9 @@ class FitContext:
         for entry_number, entry in enumerate(entries, start=1):
             segment_path = os.path.join(path, entry)
             try:
-                patches[entry] = load_tifxyz(segment_path)
+                patch = load_tifxyz(segment_path)
+                patch._source_path = os.path.abspath(segment_path)
+                patches[entry] = patch
             except Exception as e:
                 print(f'Failed to load segment {entry}: {e}')
             progress.update(
@@ -2146,12 +2171,8 @@ class FitContext:
 
         self._sdt_inactive_warned = set()
 
-    def _build_theta_crossing_map(self):
-        """Rebuild the shared patch/PCL source topology.
-
-        This is derived device state. It is reconstructed after model rebuilds
-        and interactive input changes, and is never checkpointed.
-        """
+    def _make_theta_crossing_map(self):
+        """Construct the shared patch/PCL source topology."""
         crossing_map = ThetaCrossingMap(
             self.device,
             self.config['theta_crossing_map_update_interval'])
@@ -2204,7 +2225,151 @@ class FitContext:
                     crossing_map.register_edges(
                         np.stack([ids[:-1], ids[1:]], axis=1))
 
-        self.theta_crossing_map = crossing_map
+        return crossing_map
+
+    def _patch_input_path(self, patch_id, patch, root):
+        source_path = getattr(patch, '_source_path', None)
+        if source_path is None:
+            source_path = os.path.join(root, patch_id) if root else str(patch_id)
+        return os.path.abspath(source_path)
+
+    def _write_non_liftable_patch_report(self):
+        """Atomically publish the cumulative rejected-patch path list."""
+        if not self.dist.is_main_process or not hasattr(self, 'out_path'):
+            return
+        report_path = os.path.join(self.out_path, 'non_liftable_patches.txt')
+        temporary_path = f'{report_path}.tmp-{os.getpid()}'
+        with open(temporary_path, 'w', encoding='utf-8') as report:
+            for path in sorted(self.non_liftable_patch_paths):
+                report.write(f'{path}\n')
+        os.replace(temporary_path, report_path)
+
+    def _trusted_geometry_from_active_inputs(self):
+        """Rebuild retained trusted geometry after rejecting verified patches."""
+        pieces = []
+        for patch in self.verified_patches_list:
+            points = patch.zyxs.reshape(-1, 3).to(dtype=torch.float32).cpu()
+            valid = patch.valid_vertex_mask.reshape(-1).cpu()
+            in_roi = (points[:, 0] >= self.z_begin) & (points[:, 0] < self.z_end)
+            if bool((valid & in_roi).any()):
+                pieces.append(points[valid & in_roi])
+        for strip in self.unattached_pcl_strips:
+            points = torch.from_numpy(strip['zyxs']).to(dtype=torch.float32)
+            in_roi = (points[:, 0] >= self.z_begin) & (points[:, 0] < self.z_end)
+            if bool(in_roi.any()):
+                pieces.append(points[in_roi])
+        return torch.cat(pieces, dim=0) if pieces else torch.empty((0, 3))
+
+    def _exclude_non_liftable_patches(self, verified_ids, unverified_ids, report):
+        """Remove inconsistent patches from every active patch sampling pool."""
+        warnings = []
+        rejected_verified = set(verified_ids)
+
+        for patch_id in verified_ids:
+            patch = self.verified_patches[patch_id]
+            path = self._patch_input_path(
+                patch_id, patch, self.verified_patches_path)
+            self.non_liftable_patch_paths.add(path)
+            warning = (
+                f'non-liftable patch {path!r} has theta cycle inconsistencies; '
+                'excluding it from this fit')
+            print(f'WARNING: {warning}')
+            warnings.append(warning)
+            del self.verified_patches[patch_id]
+
+        for patch_id in unverified_ids:
+            patch = self.unverified_patches[patch_id]
+            path = self._patch_input_path(
+                patch_id, patch, self.unverified_patches_path)
+            self.non_liftable_patch_paths.add(path)
+            warning = (
+                f'non-liftable patch {path!r} has theta cycle inconsistencies; '
+                'excluding it from this fit')
+            print(f'WARNING: {warning}')
+            warnings.append(warning)
+            del self.unverified_patches[patch_id]
+
+        # Preserve list identities where possible because resident-session
+        # loss closures may already hold them.
+        self.verified_patches_list[:] = self.verified_patches.values()
+        self.patch_sampling_probabilities = (
+            self._patch_sampling_probabilities(self.verified_patches_list)
+            if self.verified_patches_list else np.empty(0, dtype=np.float32))
+        self.num_verified_patches = len(self.verified_patches_list)
+        self.patch_atlas = PatchAtlas(
+            self.verified_patches, device=self.device).materialize(self.device)
+
+        self.unverified_patches_list[:] = self.unverified_patches.values()
+        if self.unverified_patches_list:
+            self.unverified_patch_sampling_probabilities = \
+                self._patch_sampling_probabilities(self.unverified_patches_list)
+            self.unverified_patch_atlas = PatchAtlas(
+                self.unverified_patches, device=self.device).materialize(self.device)
+        else:
+            self.unverified_patch_sampling_probabilities = None
+            self.unverified_patch_atlas = None
+
+        if rejected_verified and self.cross_patch_pcls:
+            for pcl in self.cross_patch_pcls:
+                points_by_patch = pcl.get('points_by_patch', {})
+                for patch_id in rejected_verified:
+                    points_by_patch.pop(patch_id, None)
+            self._rebuild_pcl_sampling_strata()
+
+        if rejected_verified:
+            # Future interactive masking and influence anchors must not retain
+            # geometry from a patch that the consistency gate rejected.
+            if self.interactive_driver is not None:
+                trusted = self._trusted_geometry_from_active_inputs()
+                trusted_np = np.ascontiguousarray(
+                    trusted.numpy(), dtype=np.float32)
+                self.trusted_geometry_tree = (
+                    cKDTree(trusted_np) if trusted_np.shape[0] else None)
+                generator = torch.Generator().manual_seed(
+                    int(self.config['optimizer_random_seed']))
+                self.influence_anchor_geometry = subsample_rows(
+                    trusted,
+                    int(self.config['sample_count_influence_anchor_geometry_points']),
+                    generator,
+                ).clone()
+
+        if hasattr(self, 'dt_target_cache_manager'):
+            self.dt_target_cache_manager.reset()
+        self._write_non_liftable_patch_report()
+        print(
+            'WARNING: theta consistency gate rejected '
+            f'{len(verified_ids) + len(unverified_ids)} patch(es) from '
+            f'{report["inconsistent_edges"]} inconsistent edge(s)')
+        return warnings
+
+    def _enforce_theta_liftability(self):
+        """Reject patches whose cached tree potential is path-dependent."""
+        warnings = []
+        while True:
+            report, bad_nodes = \
+                self.theta_crossing_map.potential_inconsistencies()
+            if report['inconsistent_edges'] == 0:
+                self._write_non_liftable_patch_report()
+                return warnings
+            verified_ids = self.patch_atlas.patch_ids_for_theta_nodes(bad_nodes)
+            unverified_ids = (
+                self.unverified_patch_atlas.patch_ids_for_theta_nodes(bad_nodes)
+                if self.unverified_patch_atlas is not None else [])
+            if not verified_ids and not unverified_ids:
+                raise RuntimeError(
+                    'theta consistency gate found inconsistent potential edges '
+                    'that could not be attributed to a patch')
+            warnings.extend(self._exclude_non_liftable_patches(
+                verified_ids, unverified_ids, report))
+            self.theta_crossing_map = self._make_theta_crossing_map()
+            self.theta_crossing_map.force_refresh(
+                self.slice_to_spiral_transform)
+
+    def _build_theta_crossing_map(self):
+        """Rebuild, refresh, and validate shared patch/PCL theta topology."""
+        self.theta_crossing_map = self._make_theta_crossing_map()
+        self.theta_crossing_map.force_refresh(self.slice_to_spiral_transform)
+        return self._enforce_theta_liftability()
 
     def _build_model_state(self):
         """Construct the model, the optimiser, and everything after them.
@@ -3234,6 +3399,7 @@ class FitContext:
             run_cfg.update(dict(influence_config or {}))
             new_patches = {}
             new_collections = {}
+            theta_warnings = []
             # (input_id, pcl) per uploaded fiber, for the unresolved-link
             # warning below.
             new_fibers = []
@@ -3247,6 +3413,7 @@ class FitContext:
                     if input_id in self.verified_patches or input_id in new_patches:
                         raise RuntimeError(f'Patch {input_id!r} is already part of this session')
                     patch = load_tifxyz(path)
+                    patch._source_path = os.path.abspath(path)
                     cells_to_erode = patch.erosion_cells(self.config['patch_erode_patches'])
                     if cells_to_erode > 0 and not erode_patch_valid_region(patch, cells_to_erode):
                         raise RuntimeError(f'Patch {input_id!r} has no valid quads after erosion')
@@ -3419,7 +3586,13 @@ class FitContext:
                 # Whole-object DT target caches index the (now longer) object
                 # pools; force recomputation on next use.
                 self.dt_target_cache_manager.reset()
-                self._build_theta_crossing_map()
+                theta_warnings = self._build_theta_crossing_map()
+                # The gate may have rejected one of this incorporation's
+                # patches; downstream influence setup must see only survivors.
+                new_patches = {
+                    patch_id: patch for patch_id, patch in new_patches.items()
+                    if patch_id in self.verified_patches
+                }
 
             if run_cfg['influence_enabled'] and (new_patches or new_collections):
                 self.influence_state = make_influence_state(run_cfg, torch.device('cuda'))
@@ -3452,7 +3625,7 @@ class FitContext:
                   f'{len(new_collections)} point collections into the resident session; '
                   f'DT losses disabled until iteration {self.interactive_dt_resume_iteration}')
 
-            warnings = []
+            warnings = list(theta_warnings)
             link_warning = unresolved_fiber_link_warning(
                 new_fibers,
                 use_links=self.config['pcl_use_fiber_links'],
@@ -3642,10 +3815,12 @@ class FitContext:
         self.slice_to_spiral_transform = self.spiral_and_transform.get_slice_to_spiral_transform(
             shared=shared_transform_leaves)
         self.dr_per_winding = shared_transform_leaves[0]
-        self.theta_crossing_map.refresh_if_due(
+        theta_map_refreshed = self.theta_crossing_map.refresh_if_due(
             iteration,
             self.slice_to_spiral_transform,
             self.config['theta_crossing_map_update_interval'])
+        if theta_map_refreshed:
+            self._enforce_theta_liftability()
 
         losses = {}
         log_metrics = {

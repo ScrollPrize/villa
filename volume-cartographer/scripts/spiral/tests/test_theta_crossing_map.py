@@ -177,6 +177,29 @@ def test_unwrap_tree_caches_branching_multiwrap_node_potentials():
     assert torch.equal(adjustments, torch.tensor([[0.0, 12.0, 12.0, 0.0]]))
 
 
+def test_potential_inconsistencies_returns_only_bad_edge_nodes_on_host():
+    # The tree walks 0.1 -> 2.5 -> 4.9 without crossing wrapped theta zero,
+    # while the direct 0 -> 2 edge does cross the branch cut.  No global lift
+    # can satisfy that cycle.
+    points = _points_for_theta([0.1, 2.5, 4.9])
+    crossing_map = ThetaCrossingMap('cpu', chunk_size=2)
+    crossing_map.register_nodes(3, lambda indices: points[indices])
+    crossing_map.register_unwrap_tree([0, 1, 2], [-1, 0, 1])
+    crossing_map.register_edges([[0, 2]])
+    crossing_map.force_refresh(_identity)
+
+    report, bad_nodes = crossing_map.potential_inconsistencies()
+
+    assert report == {
+        'checked_edges': 3,
+        'inconsistent_edges': 1,
+        'max_abs_residual': 1,
+    }
+    assert bad_nodes.device.type == 'cpu'
+    assert bad_nodes.tolist() == [0, 2]
+    assert crossing_map.potential_consistency() == report
+
+
 def test_unordered_potentials_span_forty_wraps_without_sparse_aliasing():
     unwrapped_theta = torch.arange(0.2, 40 * 2 * math.pi + 0.2, 0.2)
     wrapped_theta = unwrapped_theta.remainder(2 * math.pi)

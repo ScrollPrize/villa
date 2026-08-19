@@ -487,37 +487,71 @@ class ThetaCrossingMap:
             values = values - values[..., :1]
         return values.to(dr_per_winding.dtype) * dr_per_winding.detach()
 
-    def potential_consistency(self):
-        """Check cached potentials against every edge joining potential nodes.
+    def potential_inconsistencies(self):
+        """Check potentials and return the nodes on inconsistent patch edges.
 
         Tree edges are correct by construction; non-tree neighbor edges make
-        this a useful cycle/path-independence diagnostic for large patches.
-        Returns integer counts and the largest absolute winding residual.
+        this a cycle/path-independence diagnostic for large patches.  The node
+        IDs are returned on the host so callers can attribute a failure to its
+        owning patch without allocating a dense node-to-patch table.
         """
         if self.node_winding_potential.numel() != self.num_nodes:
             raise RuntimeError('ThetaCrossingMap must be refreshed before use')
-        checked = 0
-        inconsistent = 0
-        max_abs_residual = 0
+        checked_total = torch.zeros(
+            (), dtype=torch.int64, device=self.device)
+        inconsistent_total = torch.zeros(
+            (), dtype=torch.int64, device=self.device)
+        max_abs_residual_total = torch.zeros(
+            (), dtype=torch.int32, device=self.device)
         for lo in range(0, self.edge_nodes.shape[0], self.chunk_size):
             hi = min(self.edge_nodes.shape[0], lo + self.chunk_size)
             nodes = self.edge_nodes[lo:hi].to(self.device)
             potentials = self.node_winding_potential[nodes]
             valid = (potentials != self._unset_potential).all(dim=1)
-            if not bool(valid.any()):
-                continue
             residual = (
-                potentials[valid, 1] - potentials[valid, 0]
-                - self.crossings[lo:hi][valid].to(torch.int32))
-            checked += int(valid.sum())
-            inconsistent += int((residual != 0).sum())
-            max_abs_residual = max(
-                max_abs_residual, int(residual.abs().max()))
-        return {
+                potentials[:, 1] - potentials[:, 0]
+                - self.crossings[lo:hi].to(torch.int32))
+            bad = valid & (residual != 0)
+            checked_total += valid.sum()
+            inconsistent_total += bad.sum()
+            if residual.numel():
+                chunk_max = torch.where(
+                    valid, residual.abs(), 0).max()
+                max_abs_residual_total = torch.maximum(
+                    max_abs_residual_total, chunk_max)
+        checked = int(checked_total)
+        inconsistent = int(inconsistent_total)
+        max_abs_residual = int(max_abs_residual_total)
+        report = {
             'checked_edges': checked,
             'inconsistent_edges': inconsistent,
             'max_abs_residual': max_abs_residual,
         }
+        inconsistent_node_chunks = []
+        if inconsistent:
+            # Attribution is intentionally a second pass.  The common clean
+            # case above performs only three final device synchronisations,
+            # rather than one for every streamed edge chunk.
+            for lo in range(0, self.edge_nodes.shape[0], self.chunk_size):
+                hi = min(self.edge_nodes.shape[0], lo + self.chunk_size)
+                nodes = self.edge_nodes[lo:hi].to(self.device)
+                potentials = self.node_winding_potential[nodes]
+                valid = (potentials != self._unset_potential).all(dim=1)
+                residual = (
+                    potentials[:, 1] - potentials[:, 0]
+                    - self.crossings[lo:hi].to(torch.int32))
+                bad = valid & (residual != 0)
+                if bool(bad.any()):
+                    inconsistent_node_chunks.append(nodes[bad].cpu())
+        inconsistent_nodes = torch.empty(0, dtype=torch.int64)
+        if inconsistent_node_chunks:
+            inconsistent_nodes = torch.unique(
+                torch.cat(inconsistent_node_chunks))
+        return report, inconsistent_nodes
+
+    def potential_consistency(self):
+        """Return aggregate cycle/path-independence diagnostics."""
+        return self.potential_inconsistencies()[0]
 
     def adjustments(self, packed_walks, sampled_theta, dr_per_winding):
         """Gather cumulative crossing adjustments for packed sampled walks.
