@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from torch import nn
@@ -201,6 +202,25 @@ def test_dino_checkpoint_schema_is_validated_before_model_construction(tmp_path)
             device="cpu",
             dtype=torch.float32,
         )
+
+
+def test_reference_embedding_stays_float32_when_models_use_bfloat16(tmp_path):
+    source = np.array([1.0001, 0.33337], dtype=np.float32)
+    path = tmp_path / "reference.npy"
+    np.save(path, source)
+
+    embedding = labels.load_reference_embedding(
+        path,
+        embedding_dim=2,
+        device="cpu",
+        dtype=torch.bfloat16,
+    )
+
+    expected = torch.from_numpy(source)
+    expected = expected / expected.norm().clamp_min(1e-12)
+    assert embedding.dtype == torch.float32
+    torch.testing.assert_close(embedding, expected, rtol=0.0, atol=0.0)
+    assert not torch.equal(embedding, embedding.bfloat16().float())
 
 
 def _self_distill_generator(

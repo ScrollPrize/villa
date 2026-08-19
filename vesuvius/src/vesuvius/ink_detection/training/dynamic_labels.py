@@ -153,7 +153,7 @@ def load_reference_embedding(
         )
     embedding = torch.from_numpy(array).to(device=device, dtype=torch.float32)
     embedding = embedding / embedding.norm().clamp_min(1e-12)
-    return embedding.to(dtype=dtype)
+    return embedding.to(dtype=torch.float32)
 
 
 def gaussian_window_3d(size: int, sigma: float) -> torch.Tensor:
