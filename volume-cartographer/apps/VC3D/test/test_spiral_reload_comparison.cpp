@@ -1,4 +1,5 @@
 #include "SpiralReloadComparison.hpp"
+#include "SpiralSessionSync.hpp"
 
 #include <QJsonObject>
 #include <QtTest/QtTest>
@@ -8,6 +9,54 @@ class SpiralReloadComparisonTest final : public QObject
     Q_OBJECT
 
 private slots:
+    void CheckpointLoadInitializesWithoutProfileOverrides()
+    {
+        const QJsonObject request{
+            {"paths", QJsonObject{{"verified_patches", "/patches"}}},
+            {"run", QJsonObject{
+                {"z_begin", 4000},
+                {"config", QJsonObject{{"model_num_flow_stages", 9}}},
+            }},
+        };
+
+        const QJsonObject initialized =
+            vc3d::spiralCheckpointInitializationRequest(
+                request, QStringLiteral("/checkpoints/resume.ckpt"));
+
+        QCOMPARE(initialized["paths"].toObject()["checkpoint"].toString(),
+                 QStringLiteral("/checkpoints/resume.ckpt"));
+        QCOMPARE(initialized["paths"].toObject()["verified_patches"].toString(),
+                 QStringLiteral("/patches"));
+        QCOMPARE(initialized["run"].toObject()["z_begin"].toInt(), 4000);
+        QVERIFY(initialized["run"].toObject()["config"].toObject().isEmpty());
+
+        QVERIFY(vc3d::spiralCheckpointLoadAvailable(
+            true, QStringLiteral("Uninitialized"), true));
+        QVERIFY(vc3d::spiralCheckpointLoadAvailable(
+            true, QStringLiteral("Idle"), true));
+        QVERIFY(!vc3d::spiralCheckpointLoadAvailable(
+            true, QStringLiteral("Loading"), true));
+        QVERIFY(!vc3d::spiralCheckpointLoadAvailable(
+            true, QStringLiteral("Uninitialized"), false));
+    }
+
+    void RunConfigurationContainsOnlyRunBoundaryFields()
+    {
+        const QJsonObject editorConfig{
+            {"dense_spacing_mode", "winding_model"},
+            {"z_begin", 4000},
+            {"loss_weight_patch_radius", 3.0},
+        };
+        const QSet<QString> runBoundaryKeys{
+            QStringLiteral("loss_weight_patch_radius")};
+        const QJsonObject expected{
+            {"loss_weight_patch_radius", 3.0}};
+
+        QCOMPARE(
+            vc3d::spiralRunBoundaryConfig(editorConfig, runBoundaryKeys),
+            expected);
+    }
+
     void runMutableConfigAndShellPathDoNotRequireFullReload()
     {
         const QJsonObject defaults{

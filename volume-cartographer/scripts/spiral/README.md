@@ -218,9 +218,10 @@ validation and never ignores certificate errors.
 
 ### Datasets, output, and cache
 
-`--dataset` must point at a dataset root containing at least `umbilicus.json`,
-`verified_patches/`, and `spiral-scroll.json`; the service refuses to start
-when required entries are missing and prints what was missing. The dataset
+`--dataset` must point at a dataset root containing at least `umbilicus.json`
+and `spiral-scroll.json`; the service refuses to start when either is missing.
+Verified patches are required when their default-on input toggle is active,
+but a patch-free fit can initialize with that source disabled. The dataset
 holds inputs only.
 
 `--output` is required and must resolve outside the dataset root. Every piece
@@ -262,6 +263,26 @@ coordinate scale). None of them are panel settings: the panel reports them
 read-only, and the service rejects a session request that carries
 `scroll_name`, `voxel_size_um`, `lasagna_group` or `lasagna_scale`.
 
+Optional supervision sources have rebuild-scoped boolean switches in Advanced
+config. Set an `input_use_*` key to `false` to skip validation, loading,
+sampling, and losses for that source without changing its tuned weights or
+sample counts. Available switches cover verified/unverified patches, tracks,
+fibers, each PCL role (`absolute`, `relative`, `same_winding`, and
+`drawn_control_points`), normals, surface SDT, gradient magnitude, winding
+inference, and the outer shell. For example:
+
+```json
+{
+  "input_use_tracks": false,
+  "input_use_fibers": false,
+  "input_use_pcl_drawn_control_points": false
+}
+```
+
+Changing one requires a whole-fit rebuild. Disabling a prerequisite also
+disables its dependent supervision: phase spacing needs normals and surface
+SDT, while winding inference needs the outer shell.
+
 While a session is active you can right-click a patch in the Surface panel or
 a fiber in the Fibers panel and pick *Add to current spiral fit*. Added inputs
 are uploaded into a session-scoped ephemeral folder, used from the next run
@@ -289,8 +310,14 @@ by SHA-256, so choosing content the service already retains reuses it without
 transferring the file again, and the service validates new archives and keeps
 the newest few unique uploads.
 
-*Load* replaces the resident model's weights, optimiser and RNG state in
-place. When the checkpoint does not match the live model the service refuses
+Before the first fit is initialized, *Load* initializes it directly from the
+selected checkpoint; it does not first construct a throwaway model. The
+configuration profile becomes **Checkpoint** and displays the resolved
+configuration carried by that checkpoint. *Initialize Fit* is the separate
+from-scratch action.
+
+With an existing fit, *Load* replaces the resident model's weights, optimiser
+and RNG state in place. When the checkpoint does not match the live model the service refuses
 it and says what a rebuild would have to replace: rebuilding the **model only**
 keeps the loaded dataset inputs and everything already added to the fit, while
 a **whole-fit** rebuild re-reads the dataset and discards added inputs that
@@ -299,6 +326,10 @@ rebuild can accept — one written against another dataset, or against a
 configuration schema this service does not have — is reported and nothing is
 offered. A checkpoint-backed session takes its durable configuration from the
 checkpoint, so the local advanced-config profile does not override it.
+
+The Iterations value on *Run* is a count added to the checkpoint's durable
+iteration. The progress bar is local to that run and therefore starts at zero;
+the session status line reports the global current and target iterations.
 
 The section also holds *Save on Service* and *Download…*, and reports the
 checkpoint the resident fit was actually built from. That report is read-only:

@@ -1272,7 +1272,7 @@ def sample_spiral_surface_frame(dr_per_winding, outer_winding_idx, num_points, z
 
 
 
-def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volume, outer_winding_idx, num_points, epsilon=None, compute_spacing=True, *, cfg, z_begin, z_end):
+def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volume, outer_winding_idx, num_points, epsilon=None, compute_spacing=True, compute_normals=True, *, cfg, z_begin, z_end):
     # Sample points uniformly over the spiral cylinder (a disk of radius
     # dr_per_winding * outer_winding_idx in spiral yx, over the z-ROI). Two losses are computed:
     #   (normals) the spiral radial covector at each sample is pulled back to scroll space via
@@ -1295,7 +1295,8 @@ def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volum
     if lasagna_volume is None or outer_winding_idx is None:
         if compute_spacing:
             yield 'dense_spacing', zero
-        yield 'dense_normals', zero
+        if compute_normals:
+            yield 'dense_normals', zero
         return
 
     backend = lasagna_volume.get('backend', 'dense_test')
@@ -1356,27 +1357,35 @@ def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volum
         integration_zyx = None
 
     if backend == 'sparse_cuda':
-        normal_indices = torch.stack([zi, yi, xi], dim=-1)
+        normal_indices = (
+            torch.stack([zi, yi, xi], dim=-1)
+            if compute_normals
+            else torch.zeros([0, 3], dtype=torch.int64, device=device)
+        )
         if compute_spacing:
             grad_indices = torch.stack([izi, iyi, ixi], dim=-1)
         else:
             grad_indices = torch.zeros([0, 3], dtype=torch.int64, device=device)
         normal_u8, grad_mag_u8 = lasagna_volume['store'].gather_pair(
             normal_indices, grad_indices, device)
-        nx_u8, ny_u8 = normal_u8.unbind(dim=-1)
+        if compute_normals:
+            nx_u8, ny_u8 = normal_u8.unbind(dim=-1)
         if compute_spacing:
             grad_mag_u8 = grad_mag_u8.reshape(izi.shape)
     elif backend in ('dense', 'dense_test'):
-        nx_u8 = volume[0, zi, yi, xi]
-        ny_u8 = volume[1, zi, yi, xi]
+        if compute_normals:
+            nx_u8 = volume[0, zi, yi, xi]
+            ny_u8 = volume[1, zi, yi, xi]
         grad_mag_u8 = volume[2, izi, iyi, ixi] if compute_spacing else None
     else:
         raise ValueError(f'unsupported lasagna backend {backend!r}')
-    normal_weight = (((nx_u8 != 0) | (ny_u8 != 0)) & in_bounds).float()
-    nx = _decode_uint8_normal_component(nx_u8.float())
-    ny = _decode_uint8_normal_component(ny_u8.float())
-    nz = torch.sqrt((1. - nx * nx - ny * ny).clamp(min=0.))
-    target_normal = F.normalize(torch.stack([nz, ny, nx], dim=-1), dim=-1)  # zyx
+    if compute_normals:
+        normal_weight = (((nx_u8 != 0) | (ny_u8 != 0)) & in_bounds).float()
+        nx = _decode_uint8_normal_component(nx_u8.float())
+        ny = _decode_uint8_normal_component(ny_u8.float())
+        nz = torch.sqrt((1. - nx * nx - ny * ny).clamp(min=0.))
+        target_normal = F.normalize(
+            torch.stack([nz, ny, nx], dim=-1), dim=-1)  # zyx
 
     if compute_spacing:
         # grad_mag encodes a winding density (windings per base-volume voxel); the decode factor below
@@ -1409,6 +1418,8 @@ def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volum
     # so the two large transform graphs never need to coexist.
     del scroll_samples, scroll_inner, scroll_outer, scroll_center
     del scroll_displacement, scroll_segment_length, integration_zyx
+    if not compute_normals:
+        return
     scroll_normal = get_radial_normal_in_scroll_space(
         slice_to_spiral_transform,
         scroll_center_detached,

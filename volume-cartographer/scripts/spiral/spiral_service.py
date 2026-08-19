@@ -11,13 +11,10 @@ generated state) are required; ``--cache`` defaults to the documented user
 cache (``$XDG_CACHE_HOME/vc3d/spiral``). Both --output and --cache must
 resolve outside the dataset root — the dataset holds inputs only.
 
-The session is eager and always loaded: once the dataset and its scroll
-specification validate, the service builds its runtime asynchronously and
-reports ``Loading`` (then ``Idle``, or ``Error`` with the cause) without any
-client request. There is no state in which no session exists, and no verb
-that deletes one; ``POST /session/rebuild`` replaces the resident session and
-is the only path that may change the model domain or structural
-configuration.
+The service starts ``Uninitialized``. Dataset and checkpoint discovery remain
+available without importing the fitting runtime; ``POST /session/initialize``
+creates the first resident session, and ``POST /session/rebuild`` replaces an
+existing one.
 
 Generated display data (previews, downloadable
 checkpoints) is published as immutable, opaque artifacts and transferred
@@ -64,11 +61,12 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from fit_session import (API_VERSION, FIT_INPUT_CATALOG, SESSION_BUSY_STATES,
                          SCROLL_SPEC_FILENAME, SCROLL_SPEC_OWNED_RUN_KEYS,
-                         AutosaveError, ScrollSpecError, SessionState,
+                         ScrollSpecError, SessionState,
                          SpiralInputPaths, default_user_cache_dir,
+                         input_source_enabled, pcl_input_enabled,
+                         phase_bundle_enabled, winding_inference_enabled,
                          load_scroll_spec,
                          parse_session_request, resolve_dataset_root,
-                         select_startup_autosave, validate_autosave,
                          validate_session_request)
 from config import (CHECKPOINT_MODEL_SHAPE_KEYS, Config, durable_config,
                     rebuild_stage)
@@ -92,7 +90,7 @@ from lasagna_publish import (_load_flatten_correspondence,  # noqa: F401
                              _validate_tifxyz_output_step)
 
 
-SERVICE_VERSION = "9.0.0"
+SERVICE_VERSION = "10.0.0"
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_DEDUPLICATED_COMMANDS = 256
 PREVIEW_ARTIFACTS_KEPT = 3
@@ -149,8 +147,6 @@ def _cause(exc):
             f"{detail.get('field')}: {detail.get('message')}"
             for detail in (exc.details or []))
         return f"{exc.message}{f' ({details})' if details else ''}"
-    if isinstance(exc, AutosaveError):
-        return f"Startup autosave cannot be loaded: {exc}"
     return f"{type(exc).__name__}: {exc}"
 
 
@@ -494,14 +490,11 @@ class _TeeStream:
 class ServiceState:
     """HTTP-facing state of the service process.
 
-    The session is eager and always loaded: the service starts building its
-    runtime as soon as it is up, and there is no state in which no session
-    exists. While the runtime is being constructed (or after a construction
-    failure) there is no session *object* to ask, so the service reports the
-    lifecycle state it is driving itself — ``Loading``, or ``Error`` with the
-    cause. Once the object exists the runtime owns the state again: every
-    decision reads ``session.status()["state"]`` and the service never keeps
-    or advances a copy of it.
+    The service starts uninitialized. Dataset discovery and the HTTP control
+    surface are available immediately, but constructing the fit runtime is an
+    explicit client action. While a runtime is being constructed (or after a
+    construction failure) there is no session *object* to ask, so the service
+    reports the lifecycle state it is driving itself.
 
     What the service does own is service-scoped bookkeeping — session and
     command generations, artifacts, and uploads.
@@ -520,14 +513,11 @@ class ServiceState:
         self.commands = OrderedDict()
         self.inflight_commands = set()
         self.command_condition = threading.Condition(self.lock)
-        # Lifecycle the service drives while there is no session object to
-        # ask: Loading until the runtime is built, Error (with the cause) if
-        # building it failed. Never Idle/Running — those belong to the
-        # runtime, which is authoritative the moment it exists.
-        self._session_state = SessionState.Loading
-        self._session_phase = "Starting the fit session"
+        # Lifecycle the service drives while there is no session object.
+        # Idle/Running belong to the runtime once one has been initialized.
+        self._session_state = SessionState.Uninitialized
+        self._session_phase = "Waiting for fit initialization"
         self._session_error = None
-        self._autosave_selection = None
         self._building = False
         self.startup_run = dict(startup_run or {})
         self.dataset_root = str(dataset_root) if dataset_root else None
@@ -628,7 +618,6 @@ class ServiceState:
                 "preview_generation": 0,
                 "progress": None,
             })
-            response["autosave_selection"] = self._autosave_selection
             response.setdefault("progress", None)
             # The status snapshot carries raw progress facts only. ETA is a
             # presentation value clients derive from step/total/elapsed.
@@ -685,8 +674,9 @@ class ServiceState:
             "process_id": os.getpid(),
             "dataset_root": self.dataset_root,
             "session_state": state,
-            "cuda_ready": None if state == SessionState.Loading
-            else state != SessionState.Error,
+            "cuda_ready": (None if state == SessionState.Loading else
+                           state not in {SessionState.Uninitialized,
+                                         SessionState.Error}),
         })
         return response
 
@@ -736,8 +726,17 @@ class ServiceState:
     # Session lifecycle
     # ------------------------------------------------------------------
 
-    def _dataset_session_request(self, request):
-        """Build the load request for a --dataset service from its own resolution."""
+    def _dataset_session_request(self, request, *, include_input_config=False):
+        """Build a dataset-owned request and select its active inputs.
+
+        A checkpoint-backed request intentionally carries no UI profile
+        overrides: the checkpoint owns its durable configuration. Input
+        selection must therefore consult that checkpoint configuration before
+        clearing mode-specific paths. Otherwise a winding-model checkpoint is
+        first treated like the default phase mode, ``winding_inference`` is
+        erased, and only then does the fitter discover that the checkpoint
+        requires it.
+        """
         resolution = self.dataset_resolution.to_dict()
         requested_paths = request.get("paths") or {}
         offending = sorted(
@@ -758,7 +757,6 @@ class ServiceState:
                     "output_directory", "cache_directory"):
             paths[key] = resolution["resolved"].get(key, "")
         paths["pcls"] = resolution["pcl_inputs"]
-
         checkpoint = str(requested_paths.get("checkpoint") or "").strip()
         if checkpoint:
             allowed = set(resolution.get("detected_checkpoints", []))
@@ -772,7 +770,46 @@ class ServiceState:
                                [{"field": "checkpoint", "message": "Not a service-advertised checkpoint"}])
             paths["checkpoint"] = resolved_checkpoint
 
+        requested_config = dict(
+            (request.get("run") or {}).get("config") or {})
+        config = requested_config
+        if checkpoint:
+            checkpoint_config, _ = self._checkpoint_durable_cfg(
+                paths["checkpoint"])
+            if checkpoint_config is not None:
+                config = {**checkpoint_config, **requested_config}
+
+        # The service owns conventional paths, while the session config owns
+        # which optional sources participate. Clear disabled paths before
+        # validating any client-selectable override so the manifest, validator,
+        # and fitter all describe the same source set.
+        selected_paths = {
+            "verified_patches": "verified_patches",
+            "unverified_patches": "unverified_patches",
+            "fibers": "fibers",
+            "outer_shell": "outer_shell",
+            "tracks_dbm": "tracks_dbm",
+            "normal_x": "normals",
+            "normal_y": "normals",
+            "gradient_magnitude": "gradient_magnitude",
+            "surf_sdt": "surf_sdt",
+            "winding_inference": "winding_inference",
+        }
+        for path_key, source in selected_paths.items():
+            if not input_source_enabled(config, source):
+                paths[path_key] = ""
+        if not phase_bundle_enabled(config):
+            paths["surf_sdt"] = ""
+        if not winding_inference_enabled(config):
+            paths["winding_inference"] = ""
+        paths["pcls"] = [
+            spec for spec in paths["pcls"]
+            if pcl_input_enabled(config, spec.get("role"), spec.get("path", ""))
+        ]
+
         tracks = str(requested_paths.get("tracks_dbm") or "").strip()
+        if not input_source_enabled(config, "tracks_dbm"):
+            tracks = ""
         if tracks:
             candidates = set(resolution.get("ambiguities", {}).get("tracks_dbm", []))
             if resolution["resolved"].get("tracks_dbm"):
@@ -783,7 +820,10 @@ class ServiceState:
                                [{"field": "tracks_dbm", "message": "Not a service-advertised candidate"}])
             paths["tracks_dbm"] = str(Path(tracks).resolve(strict=False))
 
-        return {**request, "paths": paths}
+        resolved_request = {**request, "paths": paths}
+        if include_input_config:
+            return resolved_request, config
+        return resolved_request
 
     def _prepare_session_request(self, request):
         """Validate one session request into the arguments a build needs."""
@@ -801,8 +841,10 @@ class ServiceState:
                   "message": (f"Owned by {SCROLL_SPEC_FILENAME} as "
                               f"{SCROLL_SPEC_OWNED_RUN_KEYS[key]!r}")}
                  for key in scroll_owned])
+        input_config = None
         if self.dataset_resolution is not None:
-            request = self._dataset_session_request(request)
+            request, input_config = self._dataset_session_request(
+                request, include_input_config=True)
         try:
             paths, run, preview = parse_session_request(request)
         except (KeyError, TypeError, ValueError) as exc:
@@ -810,7 +852,10 @@ class ServiceState:
             # caller's error, not a service fault.
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            f"Malformed session request: {exc}") from exc
-        errors = validate_session_request(paths, run)
+        validation_run = (
+            dataclasses.replace(run, config=input_config)
+            if input_config is not None else run)
+        errors = validate_session_request(paths, validation_run)
         # The scroll specification is resolved from the dataset root; it
         # carries the physical scroll facts (including the outward sense,
         # which is not part of the session request).
@@ -823,49 +868,26 @@ class ServiceState:
             raise ApiError(HTTPStatus.BAD_REQUEST, "Session validation failed", errors)
         return paths, run, preview, scroll
 
-    def startup_session_request(self, *, resume=True):
-        """The request this service builds its own session from.
+    def startup_session_request(self):
+        """The launch defaults used by explicit recovery rebuilds."""
+        return {"run": dict(self.startup_run)}
 
-        With ``resume``, the durable autosave for this service's output
-        namespace is selected from metadata (see
-        ``fit_session.select_startup_autosave``) and resumed. A selected
-        autosave that fails container or identity validation raises
-        ``AutosaveError``: the service says so rather than silently starting
-        from scratch or from an older state.
-        """
-        request = {"run": dict(self.startup_run)}
-        output_root = self._output_root()
-        if not resume or output_root is None or self.dataset_root is None:
-            with self.lock:
-                self._autosave_selection = None
-            return request
-        selection = select_startup_autosave(
-            output_root, session_namespace=output_root,
-            dataset_root=self.dataset_root)
+    def initialize(self, request):
+        """Create the first resident fit session on explicit client request."""
+        request = dict(request or {})
+        request.pop("command_id", None)
         with self.lock:
-            self._autosave_selection = selection.manifest()
-        if selection.selected is not None:
-            validate_autosave(selection.selected)
-            request["paths"] = {"checkpoint": selection.selected.checkpoint}
-        return request
-
-    def start_initial_session(self):
-        """Build the startup session asynchronously.
-
-        Returns as soon as the work is handed to a thread: the HTTP surface
-        is already listening, and /health, /dataset, /configuration, /events
-        and status must keep answering while CUDA and the model come up.
-        """
-        def bootstrap():
-            try:
-                request = self.startup_session_request()
-                prepared = self._prepare_session_request(request)
-            except BaseException as exc:
-                self._fail_session(None, _cause(exc))
-                return
-            self._begin_build(*prepared)
-        threading.Thread(target=bootstrap, name="spiral-session-bootstrap",
-                         daemon=True).start()
+            if self._building or self.session_id is not None \
+                    or self._session_state != SessionState.Uninitialized:
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    "The fit session has already been initialized")
+        paths, run, preview, scroll = self._prepare_session_request(request)
+        if paths.checkpoint and run.config:
+            self._reject_overrides_the_checkpoint_contradicts(
+                paths.checkpoint, run.config)
+        self._begin_build(paths, run, preview, scroll)
+        return {**self.status(), "accepted": True, "initializing": True}
 
     def rebuild(self, request):
         """Rebuild the resident session, from the model stage or from nothing.
@@ -883,6 +905,11 @@ class ServiceState:
         """
         request = dict(request or {})
         request.pop("command_id", None)
+        with self.lock:
+            if self.session_id is None:
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    "There is no fit session to rebuild; initialize it first")
         defaults = request.pop("defaults", False)
         if not isinstance(defaults, bool):
             raise ApiError(HTTPStatus.BAD_REQUEST,
@@ -892,7 +919,7 @@ class ServiceState:
                 raise ApiError(
                     HTTPStatus.BAD_REQUEST,
                     "A defaults rebuild takes no other request fields")
-            request = self.startup_session_request(resume=False)
+            request = self.startup_session_request()
         paths, run, preview, scroll = self._prepare_session_request(request)
         if paths.checkpoint and run.config:
             self._reject_overrides_the_checkpoint_contradicts(
@@ -1718,13 +1745,16 @@ class ServiceState:
     def _require_session(self):
         """The resident session, or why there is nothing to operate on.
 
-        The service is always trying to hold a session, so the only reasons
-        the object is absent are that it is still being built or that
-        building it failed. Both are reported as the lifecycle state the
-        client is already polling, with the cause when there is one.
+        The object is absent before initialization, while it is being built,
+        or after building failed. Report the lifecycle state the client is
+        already polling.
         """
         with self.lock:
             if self.session is None:
+                if self._session_state == SessionState.Uninitialized:
+                    raise ApiError(
+                        HTTPStatus.CONFLICT,
+                        "The fit session has not been initialized")
                 if self._session_state == SessionState.Error:
                     raise ApiError(
                         HTTPStatus.CONFLICT,
@@ -2187,8 +2217,8 @@ ROUTES = (
     Route("PUT", re.compile(rf"/session/inputs/({_UPLOAD_ID})/files/(.+)"),
           "upload_file", _route_upload_file, Idempotency.CONTENT),
 
-    # There is deliberately no DELETE /session: the service always holds a
-    # session, and replacing one is POST /session/rebuild.
+    # There is deliberately no DELETE /session. The first session is created
+    # explicitly and replacing one is POST /session/rebuild.
     #
     # A removal names its target in the path, so it needs no body: the
     # operation is already idempotent (a second DELETE finds nothing to
@@ -2205,6 +2235,9 @@ ROUTES = (
           Idempotency.UPLOAD_ID, reads_body=True),
     Route("POST", "/session/inputs", "upload_begin",
           lambda ctx: ctx.state.begin_upload(ctx.body), Idempotency.NONE,
+          reads_body=True),
+    Route("POST", "/session/initialize", "session_initialize",
+          lambda ctx: ctx.state.initialize(ctx.body), Idempotency.COMMAND_ID,
           reads_body=True),
     Route("POST", "/session/rebuild", "session_rebuild",
           lambda ctx: ctx.state.rebuild(ctx.body), Idempotency.COMMAND_ID,
@@ -2506,19 +2539,16 @@ def main(argv=None):
         "--session-name", type=parse_session_name, default=None, metavar="NAME",
         help="Stable output namespace: generated state moves to "
              "<output>/NAME, held under an exclusive lease")
-    # The session is eager, so the z-domain it is built with has to be
-    # expressible at launch. Both are startup defaults only: changing them
-    # afterwards is a rebuild, which is the one verb allowed to replace the
-    # model domain.
+    # These launch defaults are used only by explicit recovery rebuilds.
     parser.add_argument("--z-begin", type=int, default=Config().z_begin,
-                        help="First z slice of the startup session "
+                        help="Default first z slice for initialization/recovery "
                              f"(default: {Config().z_begin})")
     parser.add_argument("--z-end", type=int, default=Config().z_end,
-                        help="Last z slice (exclusive) of the startup session "
+                        help="Default last z slice for initialization/recovery "
                              f"(default: {Config().z_end})")
     parser.add_argument("--config", default=None, metavar="JSON",
-                        help="Advanced configuration overrides for the startup "
-                             "session, as a JSON object. These are the "
+                        help="Advanced configuration defaults for initialization "
+                             "and recovery, as a JSON object. These are the "
                              "'defaults' a rebuild-with-defaults returns to.")
     parser.add_argument(
         "--gpus", type=parse_gpu_ids, default=(0,), metavar="DEVICE[,DEVICE...]",
@@ -2665,11 +2695,6 @@ def main(argv=None):
         print(f"Spiral session name: {args.session_name}", flush=True)
     print(f"Spiral z-range: [{args.z_begin}, {args.z_end})", flush=True)
     print(f"SPIRAL_SERVICE_READY port={server.server_port}", flush=True)
-    # The session is eager: startup dataset and spec validation has passed,
-    # so the runtime is built now, asynchronously, and the service reports
-    # Loading while CUDA and the model come up. No client request creates a
-    # session.
-    state.start_initial_session()
     server.timeout = 0.5
     try:
         while not shutdown.is_set():

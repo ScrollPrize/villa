@@ -94,11 +94,14 @@ from config import Config
 # "allow_rebuild", and its 409 carries the preflight's "reasons" with either
 # the "stage" a rebuild would need or "refused" when none would help.
 # Version 29 adds the compact winding-inference input and dense-spacing mode.
-API_VERSION = 29
+# Version 30 makes session creation explicit.  A service starts in
+# Uninitialized and does not import the fitting runtime, initialize CUDA, read
+# fit inputs, or select an autosave until POST /session/initialize.
+API_VERSION = 30
 
 
 class SessionState(str, Enum):
-    """Lifecycle state of one resident fit session.
+    """Lifecycle state reported by the session service.
 
     The wire form is the member name; the member is a ``str`` so a status
     snapshot serializes and compares exactly like the string it replaces.
@@ -108,10 +111,11 @@ class SessionState(str, Enum):
     ``completed_iterations``. Operation phase and progress are reported
     separately (``phase``/``progress``) and are not part of this enum.
 
-    ``Empty`` is deliberately absent: it describes a service with no
-    session at all, not a state a session can be in.
+    ``Uninitialized`` belongs to the service rather than a resident runtime:
+    it is the intentional state before the user asks to create the first fit.
     """
 
+    Uninitialized = "Uninitialized"
     Loading = "Loading"
     Idle = "Idle"
     Running = "Running"
@@ -145,6 +149,62 @@ class PclRole(str, Enum):
     DRAWN_CONTROL_POINTS = "drawn_control_points"
 
 
+_INPUT_TOGGLE_KEYS = {
+    "verified_patches": "input_use_verified_patches",
+    "unverified_patches": "input_use_unverified_patches",
+    "tracks_dbm": "input_use_tracks",
+    "fibers": "input_use_fibers",
+    "normals": "input_use_normals",
+    "surf_sdt": "input_use_surf_sdt",
+    "gradient_magnitude": "input_use_gradient_magnitude",
+    "winding_inference": "input_use_winding_inference",
+    "outer_shell": "input_use_outer_shell",
+}
+
+_PCL_ROLE_TOGGLE_KEYS = {
+    PclRole.ABSOLUTE: "input_use_pcl_absolute",
+    PclRole.RELATIVE: "input_use_pcl_relative",
+    PclRole.SAME_WINDING: "input_use_pcl_same_winding",
+    PclRole.DRAWN_CONTROL_POINTS: "input_use_pcl_drawn_control_points",
+}
+
+
+def input_source_enabled(config: Mapping[str, Any], source: str) -> bool:
+    """Whether a rebuild may include one optional supervision source."""
+    enabled = bool(config.get(_INPUT_TOGGLE_KEYS[source], True))
+    if source in {"verified_patches", "unverified_patches"}:
+        enabled = enabled and not bool(config.get("input_disable_patches", False))
+    return enabled
+
+
+def effective_pcl_role(role: PclRole | str | None, path: str = "") -> PclRole:
+    """Resolve the historical role-less PCL convention."""
+    if role is not None:
+        return role if isinstance(role, PclRole) else PclRole(role)
+    if os.path.basename(path) == "abs_winding.json":
+        return PclRole.ABSOLUTE
+    return PclRole.RELATIVE
+
+
+def pcl_input_enabled(config: Mapping[str, Any], role: PclRole | str | None,
+                      path: str = "") -> bool:
+    """Whether a PCL document participates, including source dependencies."""
+    effective_role = effective_pcl_role(role, path)
+    enabled = bool(config.get(_PCL_ROLE_TOGGLE_KEYS[effective_role], True))
+    # Absolute winding annotations only have meaning after attaching to
+    # verified patches. Other roles can still provide unattached strips.
+    if effective_role is PclRole.ABSOLUTE:
+        enabled = enabled and input_source_enabled(config, "verified_patches")
+    return enabled
+
+
+def any_pcl_input_enabled(config: Mapping[str, Any]) -> bool:
+    return any(
+        pcl_input_enabled(config, role)
+        for role in PclRole
+    )
+
+
 # ---------------------------------------------------------------------------
 # Declarative fit-input catalog
 # ---------------------------------------------------------------------------
@@ -166,12 +226,28 @@ def _never(config: Mapping[str, Any]) -> bool:
     return False
 
 
-def _patches_enabled(config: Mapping[str, Any]) -> bool:
-    return not bool(config.get("input_disable_patches", False))
+def _verified_patches_enabled(config: Mapping[str, Any]) -> bool:
+    return input_source_enabled(config, "verified_patches")
+
+
+def _unverified_patches_enabled(config: Mapping[str, Any]) -> bool:
+    return input_source_enabled(config, "unverified_patches")
+
+
+def _fibers_enabled(config: Mapping[str, Any]) -> bool:
+    return input_source_enabled(config, "fibers")
+
+
+def _tracks_enabled(config: Mapping[str, Any]) -> bool:
+    return input_source_enabled(config, "tracks_dbm")
+
+
+def _pcls_enabled(config: Mapping[str, Any]) -> bool:
+    return any_pcl_input_enabled(config)
 
 
 def _shell_losses_enabled(config: Mapping[str, Any]) -> bool:
-    return (
+    return input_source_enabled(config, "outer_shell") and (
         float(config.get("loss_weight_shell_outer", 1.0)) > 0
         or float(config.get("loss_weight_shell_patch_radius", 0)) > 0
     )
@@ -186,24 +262,51 @@ def _dense_spacing_mode(config: Mapping[str, Any]) -> str | None:
 
 
 def _phase_bundle_enabled(config: Mapping[str, Any]) -> bool:
-    return _dense_spacing_mode(config) == "phase"
+    return (
+        _dense_spacing_mode(config) == "phase"
+        and input_source_enabled(config, "normals")
+        and input_source_enabled(config, "surf_sdt")
+    )
 
 
 def _normals_required(config: Mapping[str, Any]) -> bool:
     # The phase bundle requires both normal channels (band incidence
     # handling) even when individual sub-weights are zero, so run-mutable
     # weights can be raised at run boundaries.
-    return (float(config.get("loss_weight_dense_normals", 100.0)) > 0
-            or _phase_bundle_enabled(config))
+    return input_source_enabled(config, "normals") and (
+        float(config.get("loss_weight_dense_normals", 100.0)) > 0
+        or _phase_bundle_enabled(config)
+    )
 
 
 def _grad_mag_required(config: Mapping[str, Any]) -> bool:
-    return (_dense_spacing_mode(config) == "grad_mag"
+    return (input_source_enabled(config, "gradient_magnitude")
+            and _dense_spacing_mode(config) == "grad_mag"
             and float(config.get("loss_weight_dense_spacing", 12.0)) > 0)
 
 
 def _winding_model_enabled(config: Mapping[str, Any]) -> bool:
-    return _dense_spacing_mode(config) == "winding_model"
+    return (
+        _dense_spacing_mode(config) == "winding_model"
+        and input_source_enabled(config, "winding_inference")
+        and input_source_enabled(config, "outer_shell")
+    )
+
+
+def _outer_shell_required(config: Mapping[str, Any]) -> bool:
+    return _shell_losses_enabled(config) or _winding_model_enabled(config)
+
+
+def phase_bundle_enabled(config: Mapping[str, Any]) -> bool:
+    return _phase_bundle_enabled(config)
+
+
+def winding_inference_enabled(config: Mapping[str, Any]) -> bool:
+    return _winding_model_enabled(config)
+
+
+def shell_losses_enabled(config: Mapping[str, Any]) -> bool:
+    return _shell_losses_enabled(config)
 
 
 @dataclass(frozen=True)
@@ -239,27 +342,37 @@ FIT_INPUT_CATALOG: tuple[FitInputSpec, ...] = (
                  resolve_required=True, required=_always),
     FitInputSpec("verified_patches", "directory",
                  conventional_relative="verified_patches",
-                 resolve_required=True, required=_patches_enabled),
+                 enabled=_verified_patches_enabled,
+                 required=_verified_patches_enabled),
     FitInputSpec("unverified_patches", "directory",
-                 enabled=_patches_enabled),
-    FitInputSpec("fibers", "directory", conventional_relative="fibers"),
+                 enabled=_unverified_patches_enabled),
+    FitInputSpec("fibers", "directory", conventional_relative="fibers",
+                 enabled=_fibers_enabled),
     FitInputSpec("outer_shell", "directory",
                  conventional_relative="outer_shell",
-                 required=_shell_losses_enabled),
+                 enabled=lambda config: input_source_enabled(config, "outer_shell"),
+                 required=_outer_shell_required),
     FitInputSpec("tracks_dbm", "dbm",
-                 conventional_relative="tracks/2um_ds2_ps256_surf_v2.dbm"),
-    FitInputSpec("pcls", "pcl-set", json_content=True),
+                 conventional_relative="tracks/2um_ds2_ps256_surf_v2.dbm",
+                 enabled=_tracks_enabled),
+    FitInputSpec("pcls", "pcl-set", json_content=True,
+                 enabled=_pcls_enabled),
     FitInputSpec("normal_x", "zarr-group",
                  conventional_relative="lasagna_inputs/las_008_nx.ome.zarr",
+                 enabled=lambda config: input_source_enabled(config, "normals"),
                  required=_normals_required),
     FitInputSpec("normal_y", "zarr-group",
                  conventional_relative="lasagna_inputs/las_008_ny.ome.zarr",
+                 enabled=lambda config: input_source_enabled(config, "normals"),
                  required=_normals_required),
     FitInputSpec("gradient_magnitude", "zarr-group",
                  conventional_relative="lasagna_inputs/las_008_grad_mag.ome.zarr",
+                 enabled=lambda config: input_source_enabled(
+                     config, "gradient_magnitude"),
                  required=_grad_mag_required),
     FitInputSpec("surf_sdt", "zarr-group",
                  conventional_relative="lasagna_inputs/las_008_surf_sdt.ome.zarr",
+                 enabled=_phase_bundle_enabled,
                  required=_phase_bundle_enabled),
     FitInputSpec("winding_inference", "directory",
                  conventional_relative="winding_inference",
@@ -695,15 +808,15 @@ def validate_checkpoint_container(path: str | Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Autosave metadata and startup selection
+# Autosave metadata and selection
 # ---------------------------------------------------------------------------
 #
 # A pause writes ``checkpoint_autosave.ckpt`` into that run's output directory
 # and, beside it, a metadata sidecar naming what the file *is*. An
-# always-loaded service picks its startup autosave from those sidecars alone:
-# a bare ``.ckpt`` with no metadata is never selected, and the winner is the
-# one with the most completed iterations, never the last filename in sort
-# order.
+# selector can identify it from those sidecars alone: a bare ``.ckpt`` with no
+# metadata is never selected, and the winner is the one with the most
+# completed iterations, never the last filename in sort order. The interactive
+# service advertises autosaves as checkpoints but does not select one itself.
 
 AUTOSAVE_CHECKPOINT_NAME = "checkpoint_autosave.ckpt"
 AUTOSAVE_METADATA_NAME = "checkpoint_autosave.json"
@@ -861,7 +974,7 @@ def select_startup_autosave(
     session_namespace: str | Path,
     dataset_root: str | Path,
 ) -> AutosaveSelection:
-    """Choose the autosave an always-loaded service should resume from.
+    """Choose the newest matching autosave from validated metadata.
 
     Selection is by metadata: the sidecar must parse, must carry this
     service's session namespace, and must have been written against this
@@ -1065,6 +1178,8 @@ def validate_session_request(
                 errors.append({"field": spec.key, "message": "DBM logical base or backing file was not found"})
         elif spec.kind == "pcl-set":
             for index, pcl in enumerate(paths.pcls):
+                if not pcl_input_enabled(run.config, pcl.role, pcl.path):
+                    continue
                 expanded = _expand_pcl(pcl)
                 if pcl.required and not expanded:
                     errors.append({"field": f"pcls[{index}]", "message": "Required PCL pattern matched no files"})
@@ -1093,7 +1208,7 @@ def validate_session_request(
         if spec.kind == "zarr-group":
             check_catalog_input(spec)
 
-    if spacing_mode == "winding_model" and paths.winding_inference:
+    if _winding_model_enabled(run.config) and paths.winding_inference:
         manifest = Path(paths.winding_inference) / "manifest.json"
         if not manifest.is_file():
             errors.append({"field": "winding_inference",

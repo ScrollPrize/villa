@@ -622,6 +622,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _checkpointChoice->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
     _checkpointChoice->setToolTip(
         tr("Checkpoints the service can load, plus any local file browsed for here"));
+    _checkpointChoice->addItem(tr("None"), QString());
     auto* browseCheckpoint = new QToolButton(checkpointContents);
     browseCheckpoint->setText(QStringLiteral("…"));
     browseCheckpoint->setToolTip(tr("Choose a .ckpt file on this computer; it is "
@@ -634,9 +635,10 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _loadCheckpoint = new QPushButton(tr("Load"), checkpointContents);
     _loadCheckpoint->setEnabled(false);
     _loadCheckpoint->setToolTip(
-        tr("Replace the resident model's weights, optimiser and RNG state from "
-           "this checkpoint. If it does not match the live model, the service "
-           "says what a rebuild would have to replace and asks before doing it."));
+        tr("Load this checkpoint. If no fit exists, initialize the fit directly "
+           "from the checkpoint. Otherwise replace the resident model's weights, "
+           "optimiser and RNG state; if it does not match, the service says what "
+           "a rebuild would have to replace and asks before doing it."));
     _save = new QPushButton(tr("Save on Service"), checkpointContents);
     _save->setEnabled(false);
     _downloadCheckpoint = new QPushButton(tr("Download…"), checkpointContents);
@@ -669,6 +671,13 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         _checkpointChoice->setItemData(0, true, kLocalCheckpointRole);
         _checkpointChoice->setCurrentIndex(0);
     });
+    connect(_checkpointChoice, qOverload<int>(&QComboBox::currentIndexChanged),
+            this, [this](int) {
+                _loadCheckpoint->setEnabled(
+                    vc3d::spiralCheckpointLoadAvailable(
+                        _connected, _sessionState,
+                        !_checkpointChoice->currentData().toString().isEmpty()));
+            });
 
     auto* runGroup = makeSection(tr("Run and status"),
                                  QStringLiteral("spiralRunStatusGroup"),
@@ -677,9 +686,9 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     auto* runLayout = new QVBoxLayout(runContents);
     runGroup->contentLayout()->addWidget(runContents);
     auto* controls = new QHBoxLayout;
-    // The service holds a session from startup, so this never creates one:
-    // it applies the panel's inputs and configuration by rebuilding.
-    _load = new QPushButton(tr("Rebuild Fit"), runContents);
+    // Connecting discovers the dataset but does not create a fit. This button
+    // initializes the first one and becomes Rebuild Fit afterward.
+    _load = new QPushButton(tr("Initialize Fit"), runContents);
     _load->setEnabled(false);
     _iterations = new QSpinBox(runContents); _iterations->setRange(1, 1000000); _iterations->setValue(100);
     _run = new QPushButton(tr("Run"), runContents);
@@ -891,6 +900,8 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                     _reloadRequired = false;
                     _advancedSessionGeneration = -1;
                     _runConfigKeys.clear();
+                    setSessionCheckpoint({});
+                    _advancedProfiles->setSessionDefaultLabel({});
                 }
                 _state->setText(tr("Service: %1").arg(text));
             });
@@ -1035,6 +1046,19 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             return;
         }
         guardSessionExit([this]() {
+            if (_sessionState == QStringLiteral("Uninitialized")) {
+                QJsonObject request = sessionRequest();
+                QJsonObject paths =
+                    request.value(QStringLiteral("paths")).toObject();
+                // Initialize Fit always starts a new model. Checkpoint startup
+                // belongs to the Checkpoint section's Load action.
+                paths[QStringLiteral("checkpoint")] = QString();
+                request[QStringLiteral("paths")] = paths;
+                persist();
+                _warnings->setText(tr("Initializing the fit…"));
+                _service->initializeSession(request);
+                return;
+            }
             // Nothing to apply: this would discard the trained model and build
             // the same session again. Still allowed — starting a fit over is a
             // legitimate thing to want — but not by accident. A failed session
@@ -1095,8 +1119,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         }
         persist();
         _service->runIterations(_iterations->value(), influenceConfig(),
-                                runAdvancedConfig(),
-                                sessionRequest().value(QStringLiteral("paths")).toObject());
+                                runAdvancedConfig());
     });
     connect(_stop, &QPushButton::clicked, _service, &SpiralServiceManager::stopAfterIteration);
     connect(_save, &QPushButton::clicked, this, [this]() {
@@ -1137,6 +1160,18 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         const bool local =
             _checkpointChoice->currentData(kLocalCheckpointRole).toBool();
         _loadCheckpoint->setEnabled(false);
+        if (_sessionState == QStringLiteral("Uninitialized")) {
+            // A checkpoint is the source of truth for durable model
+            // configuration. Do not build a throwaway fit or layer the
+            // currently selected profile over the checkpoint while loading.
+            const QJsonObject request =
+                vc3d::spiralCheckpointInitializationRequest(
+                    sessionRequest(), selected);
+            persist();
+            _warnings->setText(tr("Initializing the fit from the checkpoint…"));
+            _service->initializeSession(request);
+            return;
+        }
         _warnings->setText(tr("Loading checkpoint into the resident fit…"));
         // One POST. A local file is uploaded on the way (the upload reuses an
         // identical checkpoint already on the host), and a refusal comes back
@@ -1148,8 +1183,10 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             [this](const QString& hostPath, const QString& localPath,
                    const QStringList& reasons, const QString& stage,
                    const QString& message) {
-                _loadCheckpoint->setEnabled(_connected && _sessionRunnable
-                                            && _checkpointChoice->count() > 0);
+                _loadCheckpoint->setEnabled(
+                    vc3d::spiralCheckpointLoadAvailable(
+                        _connected, _sessionState,
+                        !_checkpointChoice->currentData().toString().isEmpty()));
                 const QString detail =
                     reasons.isEmpty() ? message : reasons.join(QStringLiteral("\n"));
                 _warnings->setText(detail);
@@ -1181,6 +1218,16 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             });
     connect(_service, &SpiralServiceManager::checkpointLoaded, this,
             [this](const QString& hostPath, qint64 iteration) {
+                _applyingResolution = true;
+                setSessionCheckpoint(hostPath);
+                _advancedProfiles->setSessionDefaultLabel(tr("Checkpoint"));
+                _advancedProfiles->setSessionDefault(_attachedAdvancedConfig);
+                _advancedProfiles->showSessionDefault();
+                _applyingResolution = false;
+                // The successful load is now the canonical resident session,
+                // including its checkpoint path and resolved configuration.
+                _loadedSessionRequest = sessionRequest();
+                _reloadRequired = false;
                 _warnings->setText(
                     tr("Loaded %1 into the resident fit at iteration %2")
                         .arg(hostPath)
@@ -1681,7 +1728,12 @@ QJsonObject SpiralPanel::runAdvancedConfig() const
         else
             ++it;
     }
-    return config;
+    // A Run may alter only fields advertised as run-boundary settings.  The
+    // editor also contains structural fields (dense_spacing_mode, z range,
+    // model shape, input preparation, ...); sending stale profile values for
+    // those after a successful rebuild makes the service correctly reject
+    // the Run as requiring yet another rebuild.
+    return vc3d::spiralRunBoundaryConfig(config, _runConfigKeys);
 }
 
 void SpiralPanel::applyTrackSamplingConfig(QJsonObject& config) const
@@ -1798,7 +1850,9 @@ void SpiralPanel::synchronizeSession(const QJsonObject& request,
     _applyingResolution = true;
     for (auto it = _paths.begin(); it != _paths.end(); ++it)
         it.value()->setText(paths.value(it.key()).toString());
-    setSessionCheckpoint(paths.value(QStringLiteral("checkpoint")).toString());
+    const QString checkpoint =
+        paths.value(QStringLiteral("checkpoint")).toString();
+    setSessionCheckpoint(checkpoint);
 
     _pclList->clear();
     for (const QJsonValue& value : paths.value(QStringLiteral("pcls")).toArray()) {
@@ -1821,8 +1875,11 @@ void SpiralPanel::synchronizeSession(const QJsonObject& request,
 
     _defaultAdvancedConfig = defaultConfig;
     _attachedAdvancedConfig = effectiveConfig;
+    _advancedProfiles->setSessionDefaultLabel(
+        checkpoint.isEmpty() ? QString() : tr("Checkpoint"));
     _advancedProfiles->setSessionDefault(effectiveConfig);
-    _advancedProfiles->showSessionDefault();
+    if (!checkpoint.isEmpty())
+        _advancedProfiles->showSessionDefault();
     _savePngVisualizations->setChecked(
         effectiveConfig.value(QStringLiteral("output_save_png_visualizations"))
             .toBool(false));
@@ -1849,11 +1906,13 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
 {
     const qint64 sessionGeneration =
         status.value(QStringLiteral("session_generation")).toInteger(-1);
-    // The service is always loaded, so the button is always a rebuild; it
-    // names the recovery case explicitly when the session failed to build.
     _sessionState = status.value(QStringLiteral("state")).toString();
-    _load->setText(_sessionState == QStringLiteral("Error")
-                       ? tr("Rebuild Fit (recover)") : tr("Rebuild Fit"));
+    if (_sessionState == QStringLiteral("Uninitialized"))
+        _load->setText(tr("Initialize Fit"));
+    else if (_sessionState == QStringLiteral("Error"))
+        _load->setText(tr("Rebuild Fit (recover)"));
+    else
+        _load->setText(tr("Rebuild Fit"));
     const QJsonObject runConfig = status.value(QStringLiteral("run_config")).toObject();
     const QJsonObject runConfigLimits =
         status.value(QStringLiteral("run_config_limits")).toObject();
@@ -1873,7 +1932,6 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
         _attachedAdvancedConfig = effectiveConfig;
         _applyingResolution = true;
         _advancedProfiles->setSessionDefault(effectiveConfig);
-        _advancedProfiles->showSessionDefault();
         _savePngVisualizations->setChecked(
             effectiveConfig
                 .value(QStringLiteral("output_save_png_visualizations"))
@@ -1893,9 +1951,9 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     }
 
     const QString state = status.value("state").toString();
-    // There is no state in which the service has no session, so nothing
-    // here has to un-adopt one. A rebuild advances session_generation and
-    // the adopted configuration is re-synchronized from that.
+    // Before explicit initialization there is no resident session to adopt.
+    // Initialization/rebuild advances session_generation and synchronization
+    // adopts the canonical request.
     const QJsonObject progress =
         status.value(QStringLiteral("progress")).toObject();
     const bool idle = state == QStringLiteral("Idle");
@@ -2005,12 +2063,11 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     _warnings->setText(diagnostics.join(QStringLiteral("\n\n")));
     const bool runnable = idle;
     _sessionRunnable = runnable;
-    // A rebuild tears the session down, so it needs the same idle session
-    // every other mutation does — the service answers 409 otherwise. Error is
-    // the exception and the reason the button exists there: a session that
-    // failed to build has nothing running to protect.
+    // Initialize is available without a session. Rebuild otherwise needs an
+    // idle or failed session.
     _load->setEnabled(_connected
-                      && (runnable || state == QStringLiteral("Error")));
+                      && (runnable || state == QStringLiteral("Error")
+                          || state == QStringLiteral("Uninitialized")));
     _run->setEnabled(_connected && runnable && !_reloadRequired);
     _stop->setEnabled(state == "Running");
     _save->setEnabled(_connected && runnable);
@@ -2020,8 +2077,10 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     // idle session a run does.
     // Nothing to load until the service has advertised a checkpoint or a
     // local one has been browsed for.
-    _loadCheckpoint->setEnabled(_connected && runnable
-                                && _checkpointChoice->count() > 0);
+    _loadCheckpoint->setEnabled(
+        vc3d::spiralCheckpointLoadAvailable(
+            _connected, state,
+            !_checkpointChoice->currentData().toString().isEmpty()));
 
     // Ephemeral inputs added to the running fit.
     const QJsonArray ephemeral = status.value(QStringLiteral("ephemeral_inputs")).toArray();
@@ -2098,6 +2157,7 @@ void SpiralPanel::refreshCheckpointChoices()
 
     const QSignalBlocker blocker(_checkpointChoice);
     _checkpointChoice->clear();
+    _checkpointChoice->addItem(tr("None"), QString());
     for (const auto& entry : local) {
         _checkpointChoice->addItem(entry.first, entry.second);
         _checkpointChoice->setItemData(_checkpointChoice->count() - 1, true,
@@ -2106,7 +2166,7 @@ void SpiralPanel::refreshCheckpointChoices()
     for (const QString& hostPath : _service->serviceCheckpoints())
         _checkpointChoice->addItem(hostPath, hostPath);
     const int restored = _checkpointChoice->findData(selected);
-    if (restored >= 0) _checkpointChoice->setCurrentIndex(restored);
+    _checkpointChoice->setCurrentIndex(restored >= 0 ? restored : 0);
 }
 
 QString SpiralPanel::pendingRebuildStage() const
@@ -2236,6 +2296,11 @@ void SpiralPanel::restore()
         settings.value(valuePrefix + "influence_anchor_weight", 20.0).toDouble());
     _iterations->setValue(settings.value(valuePrefix + "iterations", 100).toInt());
     _advancedProfiles->clearSessionDefault();
+    {
+        const QSignalBlocker blocker(_checkpointChoice);
+        _checkpointChoice->clear();
+        _checkpointChoice->addItem(tr("None"), QString());
+    }
     // Restoring is a profile switch: the previous service's scroll is not this
     // profile's, and nothing is known until the new connection advertises one.
     applyScrollSpec({});

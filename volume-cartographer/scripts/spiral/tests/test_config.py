@@ -35,12 +35,23 @@ def test_every_key_has_generated_metadata():
         assert field["label"] == key.split("_", 1)[1].replace("_", " ").title()
 
 
-def test_input_participation_is_not_part_of_advanced_configuration():
+def test_input_participation_toggles_are_rebuild_scoped_booleans():
     catalog = Config.catalog()
-    assert not any(
-        key.startswith("input_use_")
-        for key in catalog["defaults"]
-    )
+    expected = {
+        "input_use_verified_patches", "input_use_unverified_patches",
+        "input_use_tracks", "input_use_fibers", "input_use_pcl_absolute",
+        "input_use_pcl_relative", "input_use_pcl_same_winding",
+        "input_use_pcl_drawn_control_points", "input_use_normals",
+        "input_use_surf_sdt", "input_use_gradient_magnitude",
+        "input_use_winding_inference", "input_use_outer_shell",
+    }
+    assert {key for key in catalog["defaults"]
+            if key.startswith("input_use_")} == expected
+    for key in expected:
+        assert catalog["defaults"][key] is True
+        assert catalog["schema"]["fields"][key]["type"] == "boolean"
+        assert catalog["schema"]["fields"][key]["runtime_impact"] == "new_fit"
+        assert catalog["schema"]["fields"][key]["description"]
 
 
 def test_interactive_runtime_impacts_match_resident_capabilities():
@@ -50,7 +61,8 @@ def test_interactive_runtime_impacts_match_resident_capabilities():
         if key.startswith("patch_"):
             expected = (
                 "new_fit"
-                if key == "patch_erode_patches" else "run_boundary")
+                if key in {"patch_erode_patches", "patch_2d_sampling_max_area",
+                           "patch_uuid_filter_regex"} else "run_boundary")
             assert field["runtime_impact"] == expected
         if key.startswith("dense_"):
             expected = (
