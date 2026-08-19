@@ -452,22 +452,23 @@ class DevicePatchAtlasTests(unittest.TestCase):
         atlas = self.PatchAtlas(patches, device='cuda').materialize()
         if atlas.sampling_atlas is None:
             self.skipTest('native spiral sampling module unavailable')
-        cfg = {'patch_strip_sampling': 'straight'}
+        cfg = {}
         from theta_crossing_map import ThetaCrossingMap
         crossing_map = ThetaCrossingMap('cuda')
         atlas.register_theta_topology(crossing_map)
         crossing_map.force_refresh(lambda value: value)
         np.random.seed(0)
         probabilities = np.full(3, 1 / 3, dtype=np.float64)
-        ijs_gpu, idx_gpu, zyxs_gpu, _ = losses_module._sample_patch_batch(
+        ijs_gpu, idx_gpu, zyxs_gpu, _, sample_mask = losses_module._sample_patch_batch(
             'test_patches', list(patches.values()), probabilities,
-            num_to_sample=4, num_points_per_direction=6, cfg=cfg,
+            num_to_sample=4, point_cap=6, cfg=cfg,
             patch_atlas=atlas, crossing_map=crossing_map)
-        self.assertEqual(tuple(zyxs_gpu.shape), (2, 4, 6, 3))
+        self.assertEqual(tuple(zyxs_gpu.shape), (4, 6, 3))
+        self.assertTrue(bool(sample_mask.all()))
         self.assertTrue(zyxs_gpu.is_cuda)
         idx_cpu = idx_gpu.cpu()
         expected = atlas.lookup(
-            idx_gpu[None, :, None].expand(2, 4, 6), ijs_gpu)
+            idx_gpu[:, None].expand(4, 6), ijs_gpu)
         torch.testing.assert_close(zyxs_gpu, expected)
 
     @unittest.skipUnless(torch.cuda.is_available(), 'needs CUDA')
@@ -479,7 +480,7 @@ class DevicePatchAtlasTests(unittest.TestCase):
         atlas = self.PatchAtlas(patches, device='cuda').materialize()
         if atlas.sampling_atlas is None:
             self.skipTest('native spiral sampling module unavailable')
-        cfg = {'patch_strip_sampling': 'straight'}
+        cfg = {}
         from theta_crossing_map import ThetaCrossingMap
         crossing_map = ThetaCrossingMap('cuda')
         atlas.register_theta_topology(crossing_map)
@@ -490,13 +491,14 @@ class DevicePatchAtlasTests(unittest.TestCase):
             # First call runs inline and schedules the next batch; the second
             # pops the prefetched triple assembled on the worker thread.
             for _ in range(2):
-                ijs_gpu, idx_gpu, zyxs_gpu, _ = losses_module._sample_patch_batch(
+                ijs_gpu, idx_gpu, zyxs_gpu, _, sample_mask = losses_module._sample_patch_batch(
                     'test_prefetch_patches', list(patches.values()), probabilities,
-                    num_to_sample=4, num_points_per_direction=6, cfg=cfg,
+                    num_to_sample=4, point_cap=6, cfg=cfg,
                     patch_atlas=atlas, crossing_map=crossing_map)
-                self.assertEqual(tuple(zyxs_gpu.shape), (2, 4, 6, 3))
+                self.assertEqual(tuple(zyxs_gpu.shape), (4, 6, 3))
+                self.assertTrue(bool(sample_mask.all()))
                 expected = atlas.lookup(
-                    idx_gpu[None, :, None].expand(2, 4, 6), ijs_gpu)
+                    idx_gpu[:, None].expand(4, 6), ijs_gpu)
                 torch.testing.assert_close(zyxs_gpu, expected)
         finally:
             os.environ.pop('FIT_SPIRAL_PREFETCH', None)

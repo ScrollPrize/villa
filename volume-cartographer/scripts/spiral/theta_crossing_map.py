@@ -456,10 +456,10 @@ class ThetaCrossingMap:
     ):
         """Adjust unordered patch samples using cached per-node potentials.
 
-        Ordinary rows are reanchored at their first sample.  Annotation-led
+        Ordinary rows retain the patch tree's root-relative frame. Annotation-led
         rows instead use the exact PCL reference node and its attached patch
         quad, preserving the absolute/relative winding frame without an
-        explicit sampled strip from the annotation.
+        explicit sampled walk from the annotation.
         """
         values = self.winding_potentials(node_ids, sampled_theta)
         has_reference = reference_node_ids is not None
@@ -483,8 +483,6 @@ class ThetaCrossingMap:
             values = (
                 values - patch_potential[..., None]
                 + reference_step[..., None])
-        else:
-            values = values - values[..., :1]
         return values.to(dr_per_winding.dtype) * dr_per_winding.detach()
 
     def potential_inconsistencies(self):

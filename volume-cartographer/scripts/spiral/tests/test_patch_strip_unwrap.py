@@ -1,14 +1,4 @@
-"""Regression tests for the patch-strip loss's theta=0 unwrap on strips that
-span multiple windings (whole-band patches such as 0000_top_band).
-
-The patch losses sample P sorted picks along a strip (a grid-line run, a
-dijkstra geodesic, or a serpentine 2D walk) and stitch theta=0 crossings from
-consecutive-pick raw diffs. On a band whose strips span tens of windings the
-picks sit more than pi apart in theta and the detector misassigns winding
-offsets even on a perfectly-fit patch (the patch analogue of the long-fiber
-bug). These tests pin that the cached source-topology crossings make a
-geometrically perfect multi-wrap band read ~zero radius and DT loss in both
-strip-sampling modes."""
+"""Uniform 2D patch sampling remains exact on multi-wrap surfaces."""
 
 import numpy as np
 import pytest
@@ -94,6 +84,12 @@ class FakeAtlas:
                 b = node_map[di:, max(0, dj):w - max(0, -dj)]
                 edges.append(np.stack([a.reshape(-1), b.reshape(-1)], axis=1))
             crossing_map.register_edges(np.concatenate(edges))
+            preorder = np.concatenate([
+                node_map[row] if row % 2 == 0 else node_map[row, ::-1]
+                for row in range(h)
+            ])
+            crossing_map.register_unwrap_tree(
+                preorder, np.arange(-1, preorder.size - 1, dtype=np.int64))
 
     def theta_node_ids(self, patch_indices, ijs):
         patch_indices = np.asarray(patch_indices)
@@ -107,34 +103,18 @@ class FakeAtlas:
 
 
 class FakePatch:
-    def __init__(self, grid, mode):
+    def __init__(self, grid):
         H, W = grid.shape[:2]
-        self._sampling_2d_path = None
-        if mode == 'straight':
-            self._sampling_valid_quad_rows = np.arange(H - 1, dtype=np.int64)
-            self._sampling_valid_quad_cols = np.arange(W - 1, dtype=np.int64)
-            self._h_runs_los = [np.array([0])] * (H - 1)
-            self._h_runs_his = [np.array([W - 1])] * (H - 1)
-            self._h_runs_cum = [np.array([W - 1])] * (H - 1)
-            self._v_runs_los = [np.array([0])] * (W - 1)
-            self._v_runs_his = [np.array([H - 1])] * (W - 1)
-            self._v_runs_cum = [np.array([H - 1])] * (W - 1)
-        else:  # dijkstra: one geodesic along the band per pool slot
-            path = np.stack([
-                np.full(W - 1, 1, dtype=np.int64),
-                np.arange(W - 1, dtype=np.int64),
-            ], axis=1)
-            self._strip_path_pool = [path]
+        self._sampling_valid_quad_mask_np = np.ones(
+            (H - 1, W - 1), dtype=bool)
+        self._sampling_valid_quad_indices_np = np.argwhere(
+            self._sampling_valid_quad_mask_np).astype(np.int64)
 
 
-def _run_losses(grid, cfg, monkeypatch, num_steps=6, seed=0, device='cpu'):
-    monkeypatch.setattr(
-        losses.strip_path_pools, 'ensure_patch_path_pools', lambda patches: None)
-    monkeypatch.setattr(
-        losses.strip_path_pools, 'submit_patch_pool_refresh', lambda patch: None)
+def _run_losses(grid, cfg, num_steps=6, seed=0, device='cpu'):
     np.random.seed(seed)
     torch.manual_seed(seed)
-    patch = FakePatch(grid, cfg['patch_strip_sampling'])
+    patch = FakePatch(grid)
     atlas = FakeAtlas([grid], device)
     crossing_map = ThetaCrossingMap(device)
     atlas.register_topology(crossing_map)
@@ -151,24 +131,20 @@ def _run_losses(grid, cfg, monkeypatch, num_steps=6, seed=0, device='cpu'):
     return np.array(radius_losses), np.array(dt_losses)
 
 
-@pytest.mark.parametrize('mode', ['straight', 'dijkstra'])
-def test_multiwrap_perfect_band_has_zero_loss(mode, monkeypatch):
+def test_multiwrap_perfect_band_has_zero_loss():
     # A perfect 40-wrap band strip sampled at 400 picks: consecutive picks can
     # sit more than pi apart in theta, so the sparse unwrap this regresses
     # against misassigned most picks' winding offsets on every step.
     cfg = Config().as_dict()
-    cfg['patch_strip_sampling'] = mode
     grid = _band_grid(40.0)
-    radius_losses, dt_losses = _run_losses(grid, cfg, monkeypatch)
+    radius_losses, dt_losses = _run_losses(grid, cfg)
     assert radius_losses.max() < 1e-3
     assert dt_losses.max() < 1e-3
 
 
-@pytest.mark.parametrize('mode', ['straight', 'dijkstra'])
-def test_crossing_map_handles_short_strips(mode, monkeypatch):
+def test_uniform_sampling_handles_short_ragged_patches():
     cfg = Config().as_dict()
-    cfg['patch_strip_sampling'] = mode
     grid = _band_grid(0.8, theta0=1.75 * np.pi)
-    radius, dt = _run_losses(grid, cfg, monkeypatch, seed=3)
+    radius, dt = _run_losses(grid, cfg, seed=3)
     assert radius.max() < 1e-3
     assert dt.max() < 1e-3

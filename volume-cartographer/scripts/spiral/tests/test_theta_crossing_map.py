@@ -174,7 +174,7 @@ def test_unwrap_tree_caches_branching_multiwrap_node_potentials():
     sample_theta = crossing_map.node_theta[sample_ids]
     adjustments = crossing_map.adjustments_from_potentials(
         sample_ids, sample_theta, torch.tensor(12.0))
-    assert torch.equal(adjustments, torch.tensor([[0.0, 12.0, 12.0, 0.0]]))
+    assert torch.equal(adjustments, torch.tensor([[-12.0, 0.0, 0.0, -12.0]]))
 
 
 def test_potential_inconsistencies_returns_only_bad_edge_nodes_on_host():

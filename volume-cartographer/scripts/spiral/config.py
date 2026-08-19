@@ -9,7 +9,6 @@ from pathlib import Path
 _ENUMS = {
     "model_flow_integration_solver": ["rk4"],
     "model_flow_field_type": ["cartesian", "cylindrical"],
-    "patch_strip_sampling": ["straight", "dijkstra"],
     "track_crossing_mode": ["count", "track_walk"],
     "track_radius_target": ["mean", "median"],
     "dense_spacing_mode": ["phase", "grad_mag", "winding_model"],
@@ -26,13 +25,11 @@ _NULL_TYPES = {
     "loss_start_track_dt": "integer",
     "loss_start_unverified_patch_dt": "number",
     "patch_uuid_filter_regex": "string",
-    "patch_2d_sampling_max_area": "number",
 }
 
 _PREPARED_INPUT_FIELDS = {
     "patch_erode_patches",
     "patch_uuid_filter_regex",
-    "patch_2d_sampling_max_area",
     "track_crossing_precompute_max",
     "track_crossing_mode",
     "track_exclusion_radius",
@@ -248,8 +245,9 @@ class Config:
         self.model_gap_expander_lr_scale = 0.3
         self.model_linear_z_resolution = 48
         self.model_initial_dr_per_winding = 16.0
-        # Patch/PCL theta=0 topology is transformed only on this cadence.  The
-        # cached signed crossings are otherwise gathered by sampled walks.
+        # Patch/PCL theta=0 topology is transformed only on this cadence. Patch
+        # samples use cached node potentials; generic PCL/track walks gather
+        # cached signed crossings.
         self.theta_crossing_map_update_interval = 100
         self.patch_radius_loss_margin = 0.025
         self.patch_radius_loss_inv = False
@@ -289,15 +287,6 @@ class Config:
         self.sample_count_influence_anchor_lattice_points = 100000
         self.sample_count_influence_anchor_geometry_points = 100000
         self.sample_count_influence_anchor_samples_per_step = 4096
-        self.patch_strip_sampling = "straight"
-        # Patches whose area (vx^2, see tifxyz Patch.area) is below this use a
-        # sparse whole-patch 2D sample for the patch losses instead of 1D
-        # strips; the sample is ordered along a serpentine walk over the valid
-        # quads so the sequential theta=0 unwrap still applies (safe because
-        # small patches span well under half a winding between consecutive
-        # samples). None disables 2D sampling; larger patches always keep the
-        # patch_strip_sampling behaviour.
-        self.patch_2d_sampling_max_area = None
         # Exponent applied to patch areas when building patch sampling
         # probabilities: 0 = uniform, 1 = proportional to area.
         self.patch_sampling_area_exponent = 0.5

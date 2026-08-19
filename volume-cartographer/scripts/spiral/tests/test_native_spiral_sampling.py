@@ -17,50 +17,43 @@ class NativePatchSamplingTests(unittest.TestCase):
         self.mask[8:14, 10:22] = False
         self.atlas = native.PatchSamplingAtlas([self.mask])
 
-    def test_straight_strip_samples_are_deterministic_and_valid(self):
+    def test_patch_points_are_deterministic_distinct_and_valid(self):
         indices = np.zeros(24, dtype=np.int64)
-        first = np.asarray(self.atlas.sample_patch_strips(indices, 40, 1234))
-        second = np.asarray(self.atlas.sample_patch_strips(indices, 40, 1234))
-        np.testing.assert_array_equal(first, second)
-        self.assertEqual(first.shape, (2, 24, 40, 2))
-        floors = np.floor(first).astype(np.int64)
-        self.assertTrue(self.mask[floors[..., 0], floors[..., 1]].all())
-        # Horizontal strips share i, vertical strips share j.
-        self.assertTrue(np.allclose(first[0, :, :, 0], first[0, :, :1, 0]))
-        self.assertTrue(np.allclose(first[1, :, :, 1], first[1, :, :1, 1]))
-
-    def test_walk_api_preserves_sampling_and_returns_dense_node_metadata(self):
-        indices = np.zeros(8, dtype=np.int64)
-        strips = np.asarray(self.atlas.sample_patch_strips(indices, 20, 4321))
-        walks = self.atlas.sample_patch_walks(indices, 20, 4321)
-        np.testing.assert_array_equal(np.asarray(walks['ijs']), strips)
-        offsets = np.asarray(walks['path_offsets'])
-        paths = np.asarray(walks['path_ijs'])
-        positions = np.asarray(walks['pick_positions']).reshape(16, 20)
-        floors = np.floor(strips).astype(np.int64).reshape(16, 20, 2)
-        for row in range(16):
-            path = paths[offsets[row]:offsets[row + 1]]
-            np.testing.assert_array_equal(path[positions[row]], floors[row])
-
-    def test_l_shapes_report_invalid_anchors_and_stay_on_mask(self):
-        anchors = np.array([[4, 4], [10, 12], [20, 25]], dtype=np.int64)
-        result = self.atlas.sample_l_shapes(
-            np.zeros(len(anchors), dtype=np.int64), anchors, 32, 99)
-        valid = np.asarray(result["valid"], dtype=bool)
-        np.testing.assert_array_equal(valid, [True, False, True])
-        ijs = np.asarray(result["ijs"])[valid]
+        first = self.atlas.sample_patch_points(indices, 40, 1234)
+        second = self.atlas.sample_patch_points(indices, 40, 1234)
+        np.testing.assert_array_equal(first['ijs'], second['ijs'])
+        np.testing.assert_array_equal(first['counts'], second['counts'])
+        ijs = np.asarray(first['ijs'])
+        counts = np.asarray(first['counts'])
+        self.assertEqual(ijs.shape, (24, 40, 2))
+        np.testing.assert_array_equal(counts, 40)
         floors = np.floor(ijs).astype(np.int64)
         self.assertTrue(self.mask[floors[..., 0], floors[..., 1]].all())
-        positions = np.asarray(result['pick_positions'])[valid]
-        waypoints = np.asarray(result['waypoints'])[valid]
-        self.assertEqual(positions.shape, (2, 4, 32))
-        self.assertEqual(waypoints.shape, (2, 4, 3, 2))
+        for row in floors:
+            self.assertEqual(len(np.unique(row, axis=0)), 40)
+
+    def test_small_patch_uses_every_cell_and_pads_with_valid_geometry(self):
+        mask = np.zeros((4, 5), dtype=bool)
+        mask[[0, 1, 3], [1, 4, 2]] = True
+        atlas = native.PatchSamplingAtlas([mask])
+        result = atlas.sample_patch_points(np.array([0]), 8, 77)
+        ijs = np.asarray(result['ijs'])[0]
+        self.assertEqual(int(np.asarray(result['counts'])[0]), 3)
+        cells = np.floor(ijs).astype(np.int64)
+        self.assertEqual(len(np.unique(cells[:3], axis=0)), 3)
+        self.assertTrue(mask[cells[:, 0], cells[:, 1]].all())
+        np.testing.assert_array_equal(ijs[3:], np.repeat(ijs[:1], 5, axis=0))
+
+    def test_native_strip_apis_are_absent(self):
+        self.assertFalse(hasattr(self.atlas, 'sample_patch_strips'))
+        self.assertFalse(hasattr(self.atlas, 'sample_patch_walks'))
+        self.assertFalse(hasattr(self.atlas, 'sample_l_shapes'))
 
     def test_append_preserves_patch_index_order(self):
         second_mask = np.ones((9, 11), dtype=bool)
         self.atlas.append([second_mask])
-        result = np.asarray(self.atlas.sample_patch_strips(
-            np.array([1], dtype=np.int64), 16, 7))
+        result = np.asarray(self.atlas.sample_patch_points(
+            np.array([1], dtype=np.int64), 16, 7)['ijs'])
         self.assertLess(result[..., 0].max(), 9)
         self.assertLess(result[..., 1].max(), 11)
 

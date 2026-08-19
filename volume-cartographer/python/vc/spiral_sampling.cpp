@@ -5,6 +5,7 @@
 #include <numeric>
 #include <random>
 #include <stdexcept>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -22,7 +23,6 @@ namespace {
 
 using BoolMatrix = nb::ndarray<nb::numpy, const bool, nb::ndim<2>, nb::c_contig>;
 using Int64Vector = nb::ndarray<nb::numpy, const int64_t, nb::ndim<1>, nb::c_contig>;
-using Int64Matrix = nb::ndarray<nb::numpy, const int64_t, nb::shape<-1, 2>, nb::c_contig>;
 using FloatVector = nb::ndarray<nb::numpy, const float, nb::ndim<1>, nb::c_contig>;
 using Int32Pairs = nb::ndarray<nb::numpy, const int32_t, nb::shape<-1, 2>, nb::c_contig>;
 
@@ -50,18 +50,6 @@ nb::ndarray<nb::numpy, T, nb::ndim<2>> own_2d(
 }
 
 template <typename T>
-nb::ndarray<nb::numpy, T, nb::ndim<4>> own_4d(
-    std::vector<T>&& values, size_t a, size_t b, size_t c, size_t d)
-{
-    auto* held = new std::vector<T>(std::move(values));
-    nb::capsule owner(held, [](void* pointer) noexcept {
-        delete static_cast<std::vector<T>*>(pointer);
-    });
-    return nb::ndarray<nb::numpy, T, nb::ndim<4>>(
-        held->data(), {a, b, c, d}, owner);
-}
-
-template <typename T>
 nb::ndarray<nb::numpy, T, nb::ndim<3>> own_3d(
     std::vector<T>&& values, size_t a, size_t b, size_t c)
 {
@@ -81,67 +69,9 @@ uint64_t splitmix64(uint64_t value)
     return value ^ (value >> 31);
 }
 
-struct Run {
-    int lo = 0;
-    int hi = 0;
-    int cumulative = 0;
-};
-
 struct PatchData {
-    int height = 0;
-    int width = 0;
-    std::vector<uint8_t> valid;
-    std::vector<int> valid_rows;
-    std::vector<int> valid_columns;
-    std::vector<std::vector<Run>> horizontal_runs;
-    std::vector<std::vector<Run>> vertical_runs;
-
-    bool at(int row, int column) const
-    {
-        return row >= 0 && row < height && column >= 0 && column < width
-            && valid[static_cast<size_t>(row) * width + column] != 0;
-    }
+    std::vector<std::pair<int, int>> valid_cells;
 };
-
-std::vector<Run> line_runs(const PatchData& patch, bool horizontal, int fixed)
-{
-    const int length = horizontal ? patch.width : patch.height;
-    std::vector<Run> runs;
-    int cumulative = 0;
-    for (int position = 0; position < length;) {
-        const bool is_valid = horizontal
-            ? patch.at(fixed, position) : patch.at(position, fixed);
-        if (!is_valid) {
-            ++position;
-            continue;
-        }
-        const int lo = position;
-        do {
-            ++position;
-        } while (position < length && (horizontal
-            ? patch.at(fixed, position) : patch.at(position, fixed)));
-        cumulative += position - lo;
-        runs.push_back({lo, position, cumulative});
-    }
-    return runs;
-}
-
-std::pair<int, int> containing_run(
-    const PatchData& patch, bool horizontal, int fixed, int position)
-{
-    if (!(horizontal ? patch.at(fixed, position) : patch.at(position, fixed)))
-        throw std::runtime_error("sample anchor does not lie on a valid quad");
-    int lo = position;
-    int hi = position + 1;
-    while (lo > 0 && (horizontal
-        ? patch.at(fixed, lo - 1) : patch.at(lo - 1, fixed)))
-        --lo;
-    const int length = horizontal ? patch.width : patch.height;
-    while (hi < length && (horizontal
-        ? patch.at(fixed, hi) : patch.at(hi, fixed)))
-        ++hi;
-    return {lo, hi};
-}
 
 template <typename Rng>
 int uniform_int(Rng& rng, int upper_exclusive)
@@ -157,26 +87,6 @@ float uniform_float(Rng& rng)
     return std::generate_canonical<float, 24>(rng);
 }
 
-template <typename Rng>
-std::vector<int> sample_sorted_positions(Rng& rng, int length, int count)
-{
-    std::vector<int> result(static_cast<size_t>(count));
-    if (count <= length) {
-        std::vector<int> pool(static_cast<size_t>(length));
-        std::iota(pool.begin(), pool.end(), 0);
-        for (int i = 0; i < count; ++i) {
-            const int selected = i + uniform_int(rng, length - i);
-            std::swap(pool[static_cast<size_t>(i)], pool[static_cast<size_t>(selected)]);
-            result[static_cast<size_t>(i)] = pool[static_cast<size_t>(i)];
-        }
-    } else {
-        for (int& value : result)
-            value = uniform_int(rng, length);
-    }
-    std::sort(result.begin(), result.end());
-    return result;
-}
-
 class PatchSamplingAtlas {
 public:
     PatchSamplingAtlas() = default;
@@ -189,31 +99,17 @@ public:
             PatchData patch;
             {
                 nb::gil_scoped_release release;
-                patch.height = static_cast<int>(mask.shape(0));
-                patch.width = static_cast<int>(mask.shape(1));
-                patch.valid.resize(static_cast<size_t>(patch.height) * patch.width);
-                for (int row = 0; row < patch.height; ++row) {
-                    for (int column = 0; column < patch.width; ++column) {
-                        patch.valid[static_cast<size_t>(row) * patch.width + column]
-                            = mask(row, column) ? 1 : 0;
-                    }
-                }
-                for (int row = 0; row < patch.height; ++row) {
-                    auto runs = line_runs(patch, true, row);
-                    if (!runs.empty()) {
-                        patch.valid_rows.push_back(row);
-                        patch.horizontal_runs.push_back(std::move(runs));
-                    }
-                }
-                for (int column = 0; column < patch.width; ++column) {
-                    auto runs = line_runs(patch, false, column);
-                    if (!runs.empty()) {
-                        patch.valid_columns.push_back(column);
-                        patch.vertical_runs.push_back(std::move(runs));
+                const int height = static_cast<int>(mask.shape(0));
+                const int width = static_cast<int>(mask.shape(1));
+                for (int row = 0; row < height; ++row) {
+                    for (int column = 0; column < width; ++column) {
+                        const bool is_valid = mask(row, column);
+                        if (is_valid)
+                            patch.valid_cells.emplace_back(row, column);
                     }
                 }
             }
-            if (patch.valid_rows.empty() || patch.valid_columns.empty())
+            if (patch.valid_cells.empty())
                 throw std::runtime_error("patch sampling mask contains no valid quads");
             patches_.push_back(std::move(patch));
         }
@@ -221,18 +117,19 @@ public:
 
     size_t size() const { return patches_.size(); }
 
-    auto sample_patch_strips(
-        Int64Vector patch_indices, int points_per_direction, uint64_t seed) const
+    nb::dict sample_patch_points(
+        Int64Vector patch_indices, int point_cap, uint64_t seed) const
     {
-        if (points_per_direction <= 0)
-            throw std::runtime_error("points_per_direction must be positive");
+        if (point_cap <= 0)
+            throw std::runtime_error("point_cap must be positive");
         const size_t count = patch_indices.shape(0);
         for (size_t sample = 0; sample < count; ++sample) {
             const int64_t patch_index = patch_indices(sample);
             if (patch_index < 0 || static_cast<size_t>(patch_index) >= patches_.size())
                 throw std::runtime_error("patch index is out of range");
         }
-        std::vector<float> output(2 * count * points_per_direction * 2);
+        std::vector<float> output(count * static_cast<size_t>(point_cap) * 2);
+        std::vector<int64_t> counts(count);
         {
             nb::gil_scoped_release release;
 #pragma omp parallel for schedule(static)
@@ -240,201 +137,60 @@ public:
                 const int64_t patch_index = patch_indices(static_cast<size_t>(sample));
                 const PatchData& patch = patches_[static_cast<size_t>(patch_index)];
                 std::mt19937_64 rng(splitmix64(seed + static_cast<uint64_t>(sample)));
-                for (int direction = 0; direction < 2; ++direction) {
-                    const bool horizontal = direction == 0;
-                    const auto& valid_lines = horizontal
-                        ? patch.valid_rows : patch.valid_columns;
-                    const auto& runs_by_line = horizontal
-                        ? patch.horizontal_runs : patch.vertical_runs;
-                    const int line_slot = uniform_int(rng, static_cast<int>(valid_lines.size()));
-                    const auto& runs = runs_by_line[static_cast<size_t>(line_slot)];
-                    const int selected_position = uniform_int(rng, runs.back().cumulative);
-                    const auto found = std::lower_bound(
-                        runs.begin(), runs.end(), selected_position + 1,
-                        [](const Run& run, int value) { return run.cumulative < value; });
-                    const int run_length = found->hi - found->lo;
-                    const auto positions = sample_sorted_positions(
-                        rng, run_length, points_per_direction);
-                    const float fixed = static_cast<float>(valid_lines[static_cast<size_t>(line_slot)])
-                        + uniform_float(rng);
-                    for (int point = 0; point < points_per_direction; ++point) {
-                        const float varying = static_cast<float>(found->lo + positions[static_cast<size_t>(point)])
-                            + uniform_float(rng);
-                        const size_t base = (((static_cast<size_t>(direction) * count
-                            + static_cast<size_t>(sample)) * points_per_direction
-                            + static_cast<size_t>(point)) * 2);
-                        output[base] = horizontal ? fixed : varying;
-                        output[base + 1] = horizontal ? varying : fixed;
-                    }
-                }
-            }
-        }
-        return own_4d(std::move(output), 2, count,
-                      static_cast<size_t>(points_per_direction), 2);
-    }
-
-    nb::dict sample_patch_walks(
-        Int64Vector patch_indices, int points_per_direction, uint64_t seed) const
-    {
-        auto ijs = sample_patch_strips(
-            patch_indices, points_per_direction, seed);
-        const size_t count = patch_indices.shape(0);
-        std::vector<int64_t> path_ijs;
-        std::vector<int64_t> path_offsets(2 * count + 1, 0);
-        std::vector<int64_t> pick_positions(
-            2 * count * static_cast<size_t>(points_per_direction));
-        for (size_t direction = 0; direction < 2; ++direction) {
-            for (size_t sample = 0; sample < count; ++sample) {
-                int lo = std::numeric_limits<int>::max();
-                int hi = std::numeric_limits<int>::min();
-                const int varying_axis = direction == 0 ? 1 : 0;
-                const int fixed_axis = 1 - varying_axis;
-                for (int point = 0; point < points_per_direction; ++point) {
-                    const int varying = static_cast<int>(std::floor(
-                        ijs(direction, sample, static_cast<size_t>(point), varying_axis)));
-                    lo = std::min(lo, varying);
-                    hi = std::max(hi, varying);
-                }
-                const int fixed = static_cast<int>(std::floor(
-                    ijs(direction, sample, 0, fixed_axis)));
-                const size_t row = direction * count + sample;
-                path_offsets[row + 1] = path_offsets[row] + hi - lo + 1;
-                for (int varying = lo; varying <= hi; ++varying) {
-                    path_ijs.push_back(direction == 0 ? fixed : varying);
-                    path_ijs.push_back(direction == 0 ? varying : fixed);
-                }
-                for (int point = 0; point < points_per_direction; ++point) {
-                    const int varying = static_cast<int>(std::floor(
-                        ijs(direction, sample, static_cast<size_t>(point), varying_axis)));
-                    pick_positions[(row * points_per_direction)
-                        + static_cast<size_t>(point)] = varying - lo;
-                }
-            }
-        }
-        nb::dict result;
-        result["ijs"] = std::move(ijs);
-        result["path_ijs"] = own_2d(
-            std::move(path_ijs), static_cast<size_t>(path_offsets.back()), 2);
-        result["path_offsets"] = own_1d(std::move(path_offsets));
-        result["pick_positions"] = own_3d(
-            std::move(pick_positions), 2, count,
-            static_cast<size_t>(points_per_direction));
-        return result;
-    }
-
-    nb::dict sample_l_shapes(
-        Int64Vector patch_indices, Int64Matrix anchors,
-        int points_per_shape, uint64_t seed) const
-    {
-        if (anchors.shape(0) != patch_indices.shape(0))
-            throw std::runtime_error("anchors and patch_indices must have equal length");
-        if (points_per_shape <= 0)
-            throw std::runtime_error("points_per_shape must be positive");
-        const size_t count = patch_indices.shape(0);
-        for (size_t sample = 0; sample < count; ++sample) {
-            const int64_t patch_index = patch_indices(sample);
-            if (patch_index < 0 || static_cast<size_t>(patch_index) >= patches_.size())
-                throw std::runtime_error("patch index is out of range");
-        }
-        std::vector<float> output(count * 4 * points_per_shape * 2);
-        std::vector<int64_t> pick_positions(count * 4 * points_per_shape);
-        std::vector<int64_t> waypoints(count * 4 * 3 * 2);
-        std::vector<uint8_t> valid(count, 0);
-        {
-            nb::gil_scoped_release release;
-#pragma omp parallel for schedule(static)
-            for (int64_t anchor_index = 0;
-                 anchor_index < static_cast<int64_t>(count); ++anchor_index) {
-                const int64_t patch_index = patch_indices(static_cast<size_t>(anchor_index));
-                const PatchData& patch = patches_[static_cast<size_t>(patch_index)];
-                const int row = std::clamp<int64_t>(
-                    anchors(static_cast<size_t>(anchor_index), 0), 0, patch.height - 1);
-                const int column = std::clamp<int64_t>(
-                    anchors(static_cast<size_t>(anchor_index), 1), 0, patch.width - 1);
-                if (!patch.at(row, column))
-                    continue;
-                valid[static_cast<size_t>(anchor_index)] = 1;
-                std::mt19937_64 rng(splitmix64(seed + static_cast<uint64_t>(anchor_index)));
-                for (int shape = 0; shape < 4; ++shape) {
-                    const bool first_horizontal = shape < 2;
-                    const int first_direction = (shape == 0 || shape == 2) ? 1 : -1;
-                    const int second_direction = uniform_int(rng, 2) ? 1 : -1;
-                    const auto [first_lo, first_hi] = containing_run(
-                        patch, first_horizontal,
-                        first_horizontal ? row : column,
-                        first_horizontal ? column : row);
-                    const int first_start = first_horizontal ? column : row;
-                    const int first_far = first_direction > 0 ? first_hi - 1 : first_lo;
-                    const int first_max = std::abs(first_far - first_start);
-                    const int turn_step = uniform_int(rng, first_max + 1);
-                    const int turn = first_start + first_direction * turn_step;
-                    const int turn_row = first_horizontal ? row : turn;
-                    const int turn_column = first_horizontal ? turn : column;
-                    const bool second_horizontal = !first_horizontal;
-                    const auto [second_lo, second_hi] = containing_run(
-                        patch, second_horizontal,
-                        second_horizontal ? turn_row : turn_column,
-                        second_horizontal ? turn_column : turn_row);
-                    const int second_start = second_horizontal ? turn_column : turn_row;
-                    const int second_far = second_direction > 0 ? second_hi - 1 : second_lo;
-                    const int second_max = std::abs(second_far - second_start);
-                    const int total_steps = turn_step + second_max;
-                    const int end_row = second_horizontal ? turn_row : second_far;
-                    const int end_column = second_horizontal ? second_far : turn_column;
-                    const size_t waypoint_base =
-                        (static_cast<size_t>(anchor_index) * 4 + shape) * 6;
-                    waypoints[waypoint_base] = row;
-                    waypoints[waypoint_base + 1] = column;
-                    waypoints[waypoint_base + 2] = turn_row;
-                    waypoints[waypoint_base + 3] = turn_column;
-                    waypoints[waypoint_base + 4] = end_row;
-                    waypoints[waypoint_base + 5] = end_column;
-                    const auto steps = sample_sorted_positions(
-                        rng, total_steps + 1, points_per_shape);
-                    const float first_fixed_jitter = uniform_float(rng);
-                    const float second_fixed_jitter = uniform_float(rng);
-                    for (int point = 0; point < points_per_shape; ++point) {
-                        const int step = steps[static_cast<size_t>(point)];
-                        float out_row;
-                        float out_column;
-                        if (step <= turn_step) {
-                            const float varying = static_cast<float>(first_start + first_direction * step)
-                                + uniform_float(rng);
-                            const float fixed = static_cast<float>(first_horizontal ? row : column)
-                                + first_fixed_jitter;
-                            out_row = first_horizontal ? fixed : varying;
-                            out_column = first_horizontal ? varying : fixed;
-                        } else {
-                            const int second_step = step - turn_step;
-                            const float varying = static_cast<float>(second_start + second_direction * second_step)
-                                + uniform_float(rng);
-                            const float fixed = static_cast<float>(second_horizontal ? turn_row : turn_column)
-                                + second_fixed_jitter;
-                            out_row = second_horizontal ? fixed : varying;
-                            out_column = second_horizontal ? varying : fixed;
+                const int sample_count = std::min<int>(
+                    point_cap, static_cast<int>(patch.valid_cells.size()));
+                counts[static_cast<size_t>(sample)] = sample_count;
+                std::vector<int> selected_cells;
+                selected_cells.reserve(static_cast<size_t>(sample_count));
+                const int valid_count = static_cast<int>(patch.valid_cells.size());
+                if (sample_count == valid_count) {
+                    selected_cells.resize(static_cast<size_t>(valid_count));
+                    std::iota(selected_cells.begin(), selected_cells.end(), 0);
+                } else {
+                    // Floyd's algorithm draws a uniform subset in O(cap) memory,
+                    // avoiding a full-patch permutation for large atlases.
+                    std::unordered_set<int> selected_set;
+                    selected_set.reserve(static_cast<size_t>(sample_count) * 2);
+                    for (int candidate = valid_count - sample_count;
+                         candidate < valid_count; ++candidate) {
+                        const int draw = uniform_int(rng, candidate + 1);
+                        if (selected_set.insert(draw).second)
+                            selected_cells.push_back(draw);
+                        else {
+                            selected_set.insert(candidate);
+                            selected_cells.push_back(candidate);
                         }
-                        const size_t base = (((static_cast<size_t>(anchor_index) * 4
-                            + static_cast<size_t>(shape)) * points_per_shape
-                            + static_cast<size_t>(point)) * 2);
-                        output[base] = out_row;
-                        output[base + 1] = out_column;
-                        const size_t pick_base =
-                            (static_cast<size_t>(anchor_index) * 4 + shape)
-                            * points_per_shape + static_cast<size_t>(point);
-                        pick_positions[pick_base] = step;
                     }
+                }
+                // The loss is order-independent, but randomising order prevents
+                // padding and diagnostics from inheriting grid-order bias.
+                for (int end = sample_count; end > 1; --end) {
+                    const int swap_with = uniform_int(rng, end);
+                    std::swap(selected_cells[static_cast<size_t>(end - 1)],
+                              selected_cells[static_cast<size_t>(swap_with)]);
+                }
+                for (int point = 0; point < sample_count; ++point) {
+                    const auto [row, column] = patch.valid_cells[
+                        static_cast<size_t>(selected_cells[
+                            static_cast<size_t>(point)])];
+                    const size_t base = (static_cast<size_t>(sample) * point_cap
+                        + static_cast<size_t>(point)) * 2;
+                    output[base] = static_cast<float>(row) + uniform_float(rng);
+                    output[base + 1] = static_cast<float>(column) + uniform_float(rng);
+                }
+                for (int point = sample_count; point < point_cap; ++point) {
+                    const size_t base = (static_cast<size_t>(sample) * point_cap
+                        + static_cast<size_t>(point)) * 2;
+                    const size_t first = static_cast<size_t>(sample) * point_cap * 2;
+                    output[base] = output[first];
+                    output[base + 1] = output[first + 1];
                 }
             }
         }
         nb::dict result;
-        result["ijs"] = own_4d(std::move(output), count, 4,
-                               static_cast<size_t>(points_per_shape), 2);
-        result["pick_positions"] = own_3d(
-            std::move(pick_positions), count, 4,
-            static_cast<size_t>(points_per_shape));
-        result["waypoints"] = own_4d(
-            std::move(waypoints), count, 4, 3, 2);
-        result["valid"] = own_1d(std::move(valid));
+        result["ijs"] = own_3d(
+            std::move(output), count, static_cast<size_t>(point_cap), 2);
+        result["counts"] = own_1d(std::move(counts));
         return result;
     }
 
@@ -574,13 +330,8 @@ NB_MODULE(spiral_sampling, module)
         .def(nb::init<>())
         .def(nb::init<const nb::list&>(), nb::arg("masks"))
         .def("append", &PatchSamplingAtlas::append, nb::arg("masks"))
-        .def("sample_patch_strips", &PatchSamplingAtlas::sample_patch_strips,
-             nb::arg("patch_indices"), nb::arg("points_per_direction"), nb::arg("seed"))
-        .def("sample_patch_walks", &PatchSamplingAtlas::sample_patch_walks,
-             nb::arg("patch_indices"), nb::arg("points_per_direction"), nb::arg("seed"))
-        .def("sample_l_shapes", &PatchSamplingAtlas::sample_l_shapes,
-             nb::arg("patch_indices"), nb::arg("anchors"),
-             nb::arg("points_per_shape"), nb::arg("seed"))
+        .def("sample_patch_points", &PatchSamplingAtlas::sample_patch_points,
+             nb::arg("patch_indices"), nb::arg("point_cap"), nb::arg("seed"))
         .def("__len__", &PatchSamplingAtlas::size);
     module.def("prepare_dt_samples", &prepare_dt_samples,
                nb::arg("mask"), nb::arg("row_edges"), nb::arg("column_edges"));

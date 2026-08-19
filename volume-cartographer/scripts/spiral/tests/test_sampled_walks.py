@@ -1,142 +1,89 @@
 from types import SimpleNamespace
 
 import numpy as np
-import pytest
 import torch
 
 import losses
-from losses import PatchWalk, SampledWalk
-from theta_crossing_map import ThetaCrossingMap
-
-
-class _NativeStraightSampler:
-    def sample_patch_walks(self, patch_indices, num_points, seed):
-        assert len(patch_indices) == 1
-        horizontal = np.array([[1, 0], [1, 1], [1, 2]], dtype=np.int64)
-        vertical = np.array([[0, 2], [1, 2], [2, 2]], dtype=np.int64)
-        paths = np.concatenate([horizontal, vertical])
-        picks = np.resize(np.array([0, 1, 2], dtype=np.int64), (2, 1, num_points))
-        ijs = np.empty((2, 1, num_points, 2), dtype=np.float32)
-        ijs[0, 0] = horizontal[picks[0, 0]] + 0.25
-        ijs[1, 0] = vertical[picks[1, 0]] + 0.25
-        return {
-            'ijs': ijs,
-            'path_ijs': paths,
-            'path_offsets': np.array([0, 3, 6], dtype=np.int64),
-            'pick_positions': picks,
-        }
-
-
-class _NativeLShapeSampler:
-    def sample_l_shapes(self, patch_indices, anchors, num_points, seed):
-        waypoints = np.array([[[
-            [1, 1], [1, 2], [2, 2],
-        ]] * 4], dtype=np.int64)
-        picks = np.resize(
-            np.array([0, 1, 2], dtype=np.int64), (1, 4, num_points))
-        path = np.array([[1, 1], [1, 2], [2, 2]], dtype=np.float32)
-        ijs = np.empty((1, 4, num_points, 2), dtype=np.float32)
-        for shape in range(4):
-            ijs[0, shape] = path[picks[0, shape]] + 0.25
-        return {
-            'ijs': ijs,
-            'pick_positions': picks,
-            'waypoints': waypoints,
-            'valid': np.array([True]),
-        }
 
 
 class _Atlas:
-    id_to_idx = {'p': 0}
+    sampling_atlas = None
     device = torch.device('cpu')
 
-    def __init__(self, native=None):
-        self.sampling_atlas = native
-        self.node_map = np.arange(16, dtype=np.int64).reshape(4, 4)
+    def __init__(self, masks):
+        self.node_maps = []
+        start = 0
+        for mask in masks:
+            node_map = np.full(mask.shape, -1, dtype=np.int64)
+            node_map[mask] = start + np.arange(mask.sum())
+            self.node_maps.append(node_map)
+            start += int(mask.sum())
 
     def theta_node_ids(self, patch_indices, ijs):
+        patch_indices = np.asarray(patch_indices)
         cells = np.floor(np.asarray(ijs)).astype(np.int64)
-        return self.node_map[cells[..., 0], cells[..., 1]]
+        out = np.empty(cells.shape[:-1], dtype=np.int64)
+        for patch_idx in np.unique(patch_indices):
+            selected = patch_indices == patch_idx
+            ij = cells[selected]
+            out[selected] = self.node_maps[int(patch_idx)][ij[:, 0], ij[:, 1]]
+        return out
 
     def lookup(self, patch_indices, ijs):
-        return torch.zeros((*ijs.shape[:-1], 3), dtype=torch.float32)
+        return torch.cat([
+            torch.zeros((*ijs.shape[:-1], 1)), ijs.to(torch.float32)], dim=-1)
 
 
-def _crossing_map():
-    crossing_map = ThetaCrossingMap('cpu')
-    points = torch.zeros((16, 3), dtype=torch.float32)
-    crossing_map.register_nodes(16, lambda indices: points[indices])
-    node_map = np.arange(16, dtype=np.int64).reshape(4, 4)
-    edges = []
-    for di, dj in ((0, 1), (1, -1), (1, 0), (1, 1)):
-        a = node_map[:4 - di, max(0, -dj):4 - max(0, dj)]
-        b = node_map[di:, max(0, dj):4 - max(0, -dj)]
-        edges.append(np.stack([a.reshape(-1), b.reshape(-1)], axis=1))
-    crossing_map.register_edges(np.concatenate(edges))
-    return crossing_map
-
-
-def _straight_patch():
+def _patch(mask):
     return SimpleNamespace(
-        _sampling_2d_path=None,
-        _sampling_valid_quad_rows=np.arange(4, dtype=np.int64),
-        _sampling_valid_quad_cols=np.arange(4, dtype=np.int64),
-        _h_runs_los=[np.array([0])] * 4,
-        _h_runs_his=[np.array([4])] * 4,
-        _h_runs_cum=[np.array([4])] * 4,
-        _v_runs_los=[np.array([0])] * 4,
-        _v_runs_his=[np.array([4])] * 4,
-        _v_runs_cum=[np.array([4])] * 4,
+        _sampling_valid_quad_mask_np=mask,
+        _sampling_valid_quad_indices_np=np.argwhere(mask).astype(np.int64),
     )
 
 
-@pytest.mark.parametrize('mode', ['straight', 'dijkstra', 'serpentine', 'native'])
-def test_patch_sampler_normalizes_every_row_to_global_node_ids(
-    mode, monkeypatch,
-):
-    atlas = _Atlas(_NativeStraightSampler() if mode == 'native' else None)
-    patch = _straight_patch()
-    cfg_mode = 'straight'
-    if mode == 'dijkstra':
-        cfg_mode = 'dijkstra'
-        path = np.array([[1, 0], [1, 1], [1, 2], [1, 3]], dtype=np.int64)
-        patch._strip_path_pool = [path]
-        monkeypatch.setattr(
-            losses.strip_path_pools, 'ensure_patch_path_pools', lambda patches: None)
-        monkeypatch.setattr(
-            losses.strip_path_pools, 'submit_patch_pool_refresh', lambda patch: None)
-    elif mode == 'serpentine':
-        patch._sampling_2d_path = np.array([
-            [0, 0], [0, 1], [1, 1], [1, 0],
-        ], dtype=np.int64)
+def test_python_sampler_is_seeded_uniform_without_replacement():
+    mask = np.ones((7, 9), dtype=bool)
+    mask[2:5, 3:7] = False
+    patches = [_patch(mask)]
+    first = losses._sample_patch_points_python(
+        patches, [0, 0], 25, np.random.RandomState(42))
+    second = losses._sample_patch_points_python(
+        patches, [0, 0], 25, np.random.RandomState(42))
+    np.testing.assert_array_equal(first[0], second[0])
+    np.testing.assert_array_equal(first[1], [25, 25])
+    cells = np.floor(first[0]).astype(np.int64)
+    assert mask[cells[..., 0], cells[..., 1]].all()
+    assert all(len(np.unique(row, axis=0)) == 25 for row in cells)
 
-    ijs, _, _, packed = losses._sample_patch_batch(
-        f'normalize_{mode}', [patch], np.array([1.0]), 1, 3,
-        {'patch_strip_sampling': cfg_mode},
-        patch_atlas=atlas, crossing_map=_crossing_map())
-    expected_nodes = atlas.theta_node_ids(
-        np.zeros((2, 3), dtype=np.int64), ijs.numpy().reshape(2, 3, 2))
+
+def test_python_sampler_uses_every_small_cell_and_masks_padding():
+    mask = np.zeros((4, 6), dtype=bool)
+    mask[[0, 1, 3], [4, 2, 5]] = True
+    ijs, counts = losses._sample_patch_points_python(
+        [_patch(mask)], [0], 8, np.random.RandomState(7))
+    assert counts.tolist() == [3]
+    cells = np.floor(ijs[0]).astype(np.int64)
+    assert len(np.unique(cells[:3], axis=0)) == 3
+    assert mask[cells[:, 0], cells[:, 1]].all()
     np.testing.assert_array_equal(
-        packed.correction_node_ids.numpy(), expected_nodes)
-    assert packed.correction_node_ids.shape == (2, 3)
+        ijs[0, 3:], np.repeat(ijs[0, :1], 5, axis=0))
 
 
-@pytest.mark.parametrize('native', [False, True])
-def test_l_shape_sampler_keeps_ijs_but_normalizes_topology(native):
-    atlas = _Atlas(_NativeLShapeSampler() if native else None)
-    patch = SimpleNamespace(_sampling_valid_quad_mask_np=np.ones((4, 4), dtype=bool))
-    np.random.seed(4)
-    shapes = losses._sample_l_shapes_batch(
-        {'p': patch}, atlas, [('p', 1, 1)], 3,
-        {'patch_strip_sampling': 'straight'})[0]
-
-    assert len(shapes) == 4
-    assert all(isinstance(shape, PatchWalk) for shape in shapes)
-    assert all(isinstance(shape.walk, SampledWalk) for shape in shapes)
-    assert all(shape.walk.connect_fractional_picks for shape in shapes)
-    for shape in shapes:
-        picked_nodes = shape.walk.node_ids[shape.walk.pick_positions]
-        expected = atlas.theta_node_ids(np.zeros(3, dtype=np.int64), shape.ijs)
-        np.testing.assert_array_equal(picked_nodes, expected)
-        assert not hasattr(shape, 'path')
-        assert not hasattr(shape, 'waypoints')
+def test_patch_batch_returns_node_ids_and_explicit_padding_mask():
+    masks = [np.ones((2, 2), dtype=bool), np.ones((5, 5), dtype=bool)]
+    patches = [_patch(mask) for mask in masks]
+    atlas = _Atlas(masks)
+    np.random.seed(3)
+    batch = losses._sample_patch_batch(
+        'uniform_2d', patches, np.array([1.0, 0.0]), 2, 7, {},
+        patch_atlas=atlas, crossing_map=object())
+    ijs, patch_indices, zyxs, node_ids, sample_mask = batch
+    assert ijs.shape == (2, 7, 2)
+    assert zyxs.shape == (2, 7, 3)
+    assert node_ids.shape == (2, 7)
+    assert sample_mask.shape == (2, 7)
+    assert sample_mask.sum(dim=-1).tolist() == [4, 4]
+    assert patch_indices.tolist() == [0, 0]
+    expected = atlas.theta_node_ids(
+        np.zeros((2, 7), dtype=np.int64), ijs.numpy())
+    np.testing.assert_array_equal(node_ids.numpy(), expected)

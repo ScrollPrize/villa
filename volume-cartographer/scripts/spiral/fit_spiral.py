@@ -77,10 +77,8 @@ from sample_spiral import (
     get_theta,
     get_winding_xy,
 )
-import strip_path_pools
 from losses import (
     build_pcl_sampling_strata,
-    build_serpentine_quad_path,
     iter_lasagna_losses,
     get_patch_abs_winding_loss,
     get_patch_and_umbilicus_losses,
@@ -441,13 +439,9 @@ class PatchAtlas:
                 if valid.any():
                     local_patch_edges.append(
                         np.stack([a[valid], b[valid]], axis=1))
-            patch_edges = list(local_patch_edges)
-            serpentine = getattr(patch, '_sampling_2d_path', None)
-            if serpentine is not None and len(serpentine) > 1:
-                ids = node_map[serpentine[:, 0], serpentine[:, 1]]
-                patch_edges.append(np.stack([ids[:-1], ids[1:]], axis=1))
-            if patch_edges:
-                crossing_map.register_edges(np.concatenate(patch_edges, axis=0))
+            if local_patch_edges:
+                crossing_map.register_edges(
+                    np.concatenate(local_patch_edges, axis=0))
 
             # The sampling mask is reduced to its largest 8-connected
             # component during host preparation, so the local-neighbour graph
@@ -1023,11 +1017,6 @@ class FitContext:
 
         self._lasagna_store = None
         self._scalar_stores = []
-        # configure_losses() used to warm the geodesic strip-path worker
-        # pool as an import-time side effect of installing the config.
-        if config['patch_strip_sampling'] == 'dijkstra':
-            strip_path_pools.warm_workers()
-
     # The optimisation z window lives in the fit configuration (its catalog
     # metadata records the full effect list); these properties are the one
     # reading point for the many z-window consumers below.
@@ -1074,7 +1063,6 @@ class FitContext:
         progress.begin(
             'loading', 'Preparing patch sampling',
             step=0, total_steps=len(patches), unit='patches')
-        native_sampling_available = load_native_spiral_sampling() is not None
         for patch_idx, patch in enumerate(patches):
             # Use the quad-valid mask so bilinear interpolation at (row_idx+di, j+dj)
             # is well-defined for di, dj in [0, 1).
@@ -1099,55 +1087,14 @@ class FitContext:
             in_roi_quad_mask_np = largest_patch_quad_component(
                 in_roi_quad_mask_np)
             patch._sampling_valid_quad_mask_np = in_roi_quad_mask_np
+            patch._sampling_valid_quad_indices_np = np.ascontiguousarray(
+                np.argwhere(in_roi_quad_mask_np), dtype=np.int64)
             patch_scale = np.asarray(
                 patch.scale.detach().cpu()
                 if hasattr(patch.scale, 'detach') else patch.scale,
                 dtype=np.float64)
             patch._sampling_area = float(
                 in_roi_quad_mask_np.sum() * (1.0 / patch_scale).prod())
-            # Patches below the 2D-sampling area threshold get a serpentine
-            # walk over their in-ROI valid quads; the loss samplers draw sparse
-            # whole-patch 2D samples along it instead of 1D strips (see
-            # _build_patch_ijs / _sample_patch_batch in losses.py).
-            max_area_2d = self.config['patch_2d_sampling_max_area']
-            patch._sampling_2d_path = (
-                build_serpentine_quad_path(in_roi_quad_mask_np)
-                if max_area_2d is not None and patch._sampling_area < max_area_2d
-                else None
-            )
-            if not native_sampling_available:
-                patch._sampling_valid_quad_rows = np.flatnonzero(in_roi_quad_mask_np.any(axis=1))
-                patch._sampling_valid_quad_cols = np.flatnonzero(in_roi_quad_mask_np.any(axis=0))
-
-                # Python fallback: precompute, per row and per column, the
-                # contiguous valid-quad runs. The native atlas owns an equivalent
-                # packed representation and avoids these many small Python arrays.
-                def _runs_per_line(mask_np, fixed_axis, valid_lines):
-                    # Returns parallel lists indexed by valid line.
-
-                    def _build_line_runs(line_valid):
-                        padded = np.concatenate([[False], line_valid, [False]]).astype(np.int8)
-                        diff = np.diff(padded)
-                        los = np.where(diff == 1)[0].astype(np.int64)
-                        his = np.where(diff == -1)[0].astype(np.int64)
-                        return los, his
-
-                    los_list, his_list, cum_list = [], [], []
-                    for r in valid_lines:
-                        line = mask_np[r] if fixed_axis == 0 else mask_np[:, r]
-                        los, his = _build_line_runs(line)
-                        los_list.append(los)
-                        his_list.append(his)
-                        cum_list.append(np.cumsum(his - los))
-                    return los_list, his_list, cum_list
-
-                patch._h_runs_los, patch._h_runs_his, patch._h_runs_cum = _runs_per_line(
-                    in_roi_quad_mask_np, 0, patch._sampling_valid_quad_rows
-                )
-                patch._v_runs_los, patch._v_runs_his, patch._v_runs_cum = _runs_per_line(
-                    in_roi_quad_mask_np, 1, patch._sampling_valid_quad_cols
-                )
-
             progress.update(patch_idx + 1)
 
         return self._patch_sampling_probabilities(patches)
