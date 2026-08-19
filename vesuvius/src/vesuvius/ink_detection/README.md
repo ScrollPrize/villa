@@ -45,6 +45,11 @@ cache-directory overshoot.
 ```text
 configs/aligned21_hybrid_3d2d.json
 configs/aligned21_fixed_scroll_prior.json
+configs/dino_guided_teacher.json
+configs/dino_guided_v1.json
+configs/dino_guided_v2.json
+configs/dino_guided_v3.json
+configs/dino_guided_v3_fullsup.json
 ```
 
 The hybrid recipe uses a 17-of-21 Z window, robust-MAD normalization, a local
@@ -60,6 +65,13 @@ DINOv2-backed ink training is supported through the shared model builder. Use
 `dinov2_ps16_crop256`, or a compatible local DINOv2/Dinovol checkpoint. The
 optional `model_config.pretrained_decoder_type`, `freeze_encoder`, and
 `encoder_lr_mult` fields control its decoder and fine-tuning policy.
+
+The five `dino_guided_*` configs reconstruct the frozen-teacher,
+DINO-intersection, intensity-gated, and self-distillation phases of the 2026
+3D ink experiment. They contain local path placeholders and never fetch data
+or checkpoints. See
+[`docs/dino_guided_ink_reproduction.md`](../../../docs/dino_guided_ink_reproduction.md)
+for the input contract, checkpoint lineage, and run commands.
 
 ## Commands
 
