@@ -641,45 +641,6 @@ if(VC_RUN_RENDER_BENCHMARKS)
                         bench_render_synthetic
                     VERBATIM)
 
-                set(_drd_stamp)
-                if(_fixture STREQUAL "parallel")
-                    set(_drd_dir "${_case_dir}/drd")
-                    set(_drd_stamp "${_drd_dir}/collected.stamp")
-                    set(_drd_trace "${_drd_dir}/drd.log")
-                    set(_drd_metadata "${_drd_dir}/metadata.json")
-                    add_custom_command(
-                        OUTPUT "${_drd_stamp}"
-                        BYPRODUCTS
-                            "${_drd_trace}"
-                            "${_drd_metadata}"
-                        COMMAND ${CMAKE_COMMAND} -E remove_directory
-                            "${_drd_dir}"
-                        COMMAND ${CMAKE_COMMAND} -E make_directory
-                            "${_drd_dir}"
-                        COMMAND ${CMAKE_COMMAND} -E env
-                            "VC_RENDER_SAMPLER_THREADS=4"
-                            ${VC_VALGRIND_EXECUTABLE}
-                            --tool=drd
-                            --trace-segment=yes
-                            --trace-csw=yes
-                            --fair-sched=yes
-                            --time-stamp=yes
-                            --scheduling-quantum=10000
-                            --trace-sched=yes
-                            --trace-syscalls=yes
-                            "--log-file=${_drd_trace}"
-                            $<TARGET_FILE:bench_render_synthetic>
-                            --fixture parallel
-                            --scenario ${_scenario}
-                            --native-trials 1
-                            --metadata "${_drd_metadata}"
-                            --repetitions 1
-                        COMMAND ${CMAKE_COMMAND} -E touch "${_drd_stamp}"
-                        DEPENDS
-                            bench_render_synthetic
-                        VERBATIM)
-                endif()
-
                 set(_evaluation "${_case_dir}/evaluation.json")
                 set(_evaluation_command
                     $<TARGET_FILE:bench_thread_sync_replay>
@@ -692,16 +653,13 @@ if(VC_RUN_RENDER_BENCHMARKS)
                     --output "${_evaluation}")
                 if(_fixture STREQUAL "parallel")
                     list(APPEND _evaluation_command
-                        --callgrind-scheduler "${_callgrind_scheduler}"
-                        --drd-trace "${_drd_trace}"
-                        --drd-metadata "${_drd_metadata}")
+                        --callgrind-scheduler "${_callgrind_scheduler}")
                 endif()
                 add_custom_command(
                     OUTPUT "${_evaluation}"
                     COMMAND ${_evaluation_command}
                     DEPENDS
                         "${_callgrind_stamp}"
-                        ${_drd_stamp}
                         bench_thread_sync_replay
                         "${_render_valgrind_ci_model}"
                     VERBATIM)
@@ -720,9 +678,7 @@ if(VC_RUN_RENDER_BENCHMARKS)
                     --output "${_gate}")
                 if(_fixture STREQUAL "parallel")
                     list(APPEND _gate_command
-                        --callgrind-scheduler "${_callgrind_scheduler}"
-                        --drd-trace "${_drd_trace}"
-                        --drd-metadata "${_drd_metadata}")
+                        --callgrind-scheduler "${_callgrind_scheduler}")
                 endif()
                 add_custom_command(
                     OUTPUT "${_gate}"
@@ -731,7 +687,6 @@ if(VC_RUN_RENDER_BENCHMARKS)
                     DEPENDS
                         "${_evaluation}"
                         "${_callgrind_stamp}"
-                        ${_drd_stamp}
                         bench_thread_sync_replay
                         "${_render_valgrind_ci_model}"
                         "${_render_valgrind_ci_reference}"
