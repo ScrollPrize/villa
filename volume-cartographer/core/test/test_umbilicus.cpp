@@ -296,3 +296,86 @@ TEST_CASE("control_points json format loads via the shared loader")
 
     fs::remove(path);
 }
+
+// ------- LoadFileInfo (frame metadata) -------
+
+TEST_CASE("LoadFileInfo: stamped file reports every metadata field")
+{
+    const auto path = tmpFile("info_stamped", ".json");
+    writeFile(path,
+              R"({"metadata": {"total_points": 2, "voxelsize_um": 9.6,)"
+              R"( "volume": "scroll.zarr", "volume_width": 8174,)"
+              R"( "volume_height": 8174, "volume_slices": 18946},)"
+              R"("control_points": [)"
+              R"({"x": 10, "y": 20, "z": 5, "score": 100},)"
+              R"({"x": 12, "y": 22, "z": 15, "score": 100}]})");
+
+    const auto info = Umbilicus::LoadFileInfo(path);
+    REQUIRE(info.controlPoints.size() == 2);
+    CHECK(info.controlPoints[0] == cv::Vec3f(10.0f, 20.0f, 5.0f));
+    REQUIRE(info.voxelsizeUm.has_value());
+    CHECK(*info.voxelsizeUm == doctest::Approx(9.6));
+    REQUIRE(info.volume.has_value());
+    CHECK(*info.volume == "scroll.zarr");
+    REQUIRE(info.volumeWidth.has_value());
+    CHECK(*info.volumeWidth == 8174);
+    REQUIRE(info.volumeHeight.has_value());
+    CHECK(*info.volumeHeight == 8174);
+    REQUIRE(info.volumeSlices.has_value());
+    CHECK(*info.volumeSlices == 18946);
+
+    fs::remove(path);
+}
+
+TEST_CASE("LoadFileInfo: metadata without frame keys leaves every field unset")
+{
+    const auto path = tmpFile("info_unstamped", ".json");
+    writeFile(path,
+              R"({"metadata": {"total_points": 1, "timestamp": "2026-04-20T13:16:29Z"},)"
+              R"("control_points": [{"x": 1, "y": 2, "z": 3, "score": 100}]})");
+
+    const auto info = Umbilicus::LoadFileInfo(path);
+    REQUIRE(info.controlPoints.size() == 1);
+    CHECK_FALSE(info.voxelsizeUm.has_value());
+    CHECK_FALSE(info.volume.has_value());
+    CHECK_FALSE(info.volumeWidth.has_value());
+    CHECK_FALSE(info.volumeHeight.has_value());
+    CHECK_FALSE(info.volumeSlices.has_value());
+    // A field nobody declared is legal, not an error.
+
+    fs::remove(path);
+}
+
+TEST_CASE("LoadFileInfo: bare-array json parses points with no metadata")
+{
+    const auto path = tmpFile("info_bare", ".json");
+    writeFile(path, "[[0,5,10],[10,6,11]]");
+
+    const auto info = Umbilicus::LoadFileInfo(path);
+    REQUIRE(info.controlPoints.size() == 2);
+    CHECK(info.controlPoints[0] == cv::Vec3f(10.0f, 5.0f, 0.0f));
+    CHECK_FALSE(info.voxelsizeUm.has_value());
+    CHECK_FALSE(info.volume.has_value());
+    CHECK_FALSE(info.volumeWidth.has_value());
+    CHECK_FALSE(info.volumeHeight.has_value());
+    CHECK_FALSE(info.volumeSlices.has_value());
+
+    fs::remove(path);
+}
+
+TEST_CASE("LoadFileInfo: text file parses points with no metadata")
+{
+    const auto path = tmpFile("info_text", ".txt");
+    writeFile(path, "0, 5, 10\n10, 6, 11\n");
+
+    const auto info = Umbilicus::LoadFileInfo(path);
+    REQUIRE(info.controlPoints.size() == 2);
+    CHECK_FALSE(info.voxelsizeUm.has_value());
+    CHECK_FALSE(info.volume.has_value());
+    CHECK_FALSE(info.volumeWidth.has_value());
+    CHECK_FALSE(info.volumeHeight.has_value());
+    CHECK_FALSE(info.volumeSlices.has_value());
+
+    fs::remove(path);
+}
+
