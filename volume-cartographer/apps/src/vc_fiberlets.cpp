@@ -591,7 +591,7 @@ void printTubeExtractionProfile(
         return encoded.str();
     };
     output << std::setprecision(17)
-           << "fiberlet_extraction_profile version=19"
+           << "fiberlet_extraction_profile version=20"
            << " anchor_elapsed_seconds=" << extraction.anchors.elapsedSeconds
            << " anchor_cpu_seconds=" << anchor.elapsedCpuSeconds
            << " anchor_profiled_seconds=" << anchorProfiledSeconds
@@ -601,15 +601,23 @@ void printTubeExtractionProfile(
            << " anchor_context_cells=" << anchor.contextCells
            << " anchor_work_cells=" << anchor.workCells
            << " anchor_tiles=" << anchor.tiles
-           << " anchor_sampling_groups=" << anchor.samplingGroups
+           << " anchor_sampling_partitions=" << anchor.samplingPartitions
            << " anchor_workers=" << anchor.workers
            << " anchor_sampler_calls=" << anchor.predictionSamplerCalls
+           << " anchor_shared_sampling_batches="
+           << anchor.sharedSamplingBatches
+           << " anchor_max_sampling_batch_voxels="
+           << anchor.maximumSamplingBatchVoxels
            << " anchor_submitted_prediction_voxels="
            << anchor.submittedPredictionVoxels
            << " anchor_unique_tile_prediction_voxels="
            << anchor.uniqueTilePredictionVoxels
            << " anchor_reused_prediction_voxels="
            << anchor.reusedPredictionVoxels
+           << " anchor_max_shared_sample_bytes="
+           << anchor.maximumSharedSampleBytes
+           << " anchor_max_accounted_live_bytes="
+           << anchor.maximumAccountedLiveBytes
            << " anchor_candidate_observations=" << anchor.candidateObservations
            << " anchor_retained_observations=" << anchor.retainedObservations
            << " anchor_support_stencil_cells=" << anchor.supportStencilCells
@@ -626,21 +634,27 @@ void printTubeExtractionProfile(
            << " anchor_cell_processing_seconds=" << anchor.cellProcessingSeconds
            << " anchor_cell_processing_cpu_seconds="
            << anchor.cellProcessingCpuSeconds
+           << " anchor_shared_sampling_seconds="
+           << anchor.sharedSamplingSeconds
+           << " anchor_shared_sampling_cpu_seconds="
+           << anchor.sharedSamplingCpuSeconds
            << " anchor_coordinate_construction_work_seconds="
            << anchor.coordinateConstructionWorkSeconds
            << " anchor_prediction_sampling_work_seconds="
            << anchor.predictionSamplingWorkSeconds
+           << " anchor_tile_sample_copy_work_seconds="
+           << anchor.tileSampleCopyWorkSeconds
            << " anchor_gradient_construction_work_seconds="
            << anchor.gradientConstructionWorkSeconds
            << " anchor_observation_construction_work_seconds="
            << anchor.observationConstructionWorkSeconds
            << " anchor_fitting_work_seconds=" << anchor.fittingWorkSeconds
-           << " anchor_group_job_p50_seconds="
-           << anchor.groupJobP50Seconds
-           << " anchor_group_job_p95_seconds="
-           << anchor.groupJobP95Seconds
-           << " anchor_group_job_max_seconds="
-           << anchor.groupJobMaximumSeconds
+           << " anchor_partition_p50_seconds="
+           << anchor.partitionP50Seconds
+           << " anchor_partition_p95_seconds="
+           << anchor.partitionP95Seconds
+           << " anchor_partition_max_seconds="
+           << anchor.partitionMaximumSeconds
            << " anchor_tile_preparation_p50_seconds="
            << anchor.tilePreparationP50Seconds
            << " anchor_tile_preparation_p95_seconds="

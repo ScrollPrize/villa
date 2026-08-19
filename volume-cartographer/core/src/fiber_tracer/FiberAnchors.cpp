@@ -16,7 +16,6 @@
 #include <condition_variable>
 #include <cstdint>
 #include <ctime>
-#include <deque>
 #include <exception>
 #include <limits>
 #include <map>
@@ -3128,9 +3127,7 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             const size_t tileSamples =
                 checkedProduct(tileShape, "fiber anchor tile sample");
             const size_t denseBytes =
-                sizeof(CellIndex) + sizeof(size_t) +
                 sizeof(FloatStoredPredictionSample) +
-                sizeof(FiberStoredPredictionSample) +
                 sizeof(CompactFiberAnchorObservation) +
                 (config.peakGradientWeight > 0.0F
                     ? sizeof(CachedPresenceGradient)
@@ -3313,88 +3310,114 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                 tile.sampleEnd[2] - tile.sampleBegin[2],
             }, "fiber anchor tile sample");
         };
-        const auto overlapVoxels = [&](const Tile& left, const Tile& right) {
-            std::array<size_t, 3> extent{};
-            for (size_t axis = 0; axis < 3; ++axis) {
-                const size_t begin = std::max(
-                    left.sampleBegin[axis], right.sampleBegin[axis]);
-                const size_t end = std::min(
-                    left.sampleEnd[axis], right.sampleEnd[axis]);
-                if (begin >= end)
-                    return size_t{0};
-                extent[axis] = end - begin;
-            }
-            return checkedProduct(extent, "fiber anchor tile overlap");
+        struct SharedSampleInterval {
+            size_t z = 0;
+            size_t y = 0;
+            size_t xBegin = 0;
+            size_t xEnd = 0;
+            size_t sampleOffset = 0;
         };
-        struct TileSamplingGroup {
-            std::array<size_t, 2> tileIndices{};
-            size_t tileCount = 0;
-            size_t estimatedBytes = 0;
+        struct SharedSampleRow {
+            size_t z = 0;
+            size_t y = 0;
+            size_t intervalBegin = 0;
+            size_t intervalEnd = 0;
         };
-        std::vector<TileSamplingGroup> samplingGroups;
-        std::vector<uint8_t> grouped(tiles.size(), 0);
-        for (size_t first = 0; first < tiles.size(); ++first) {
-            if (grouped[first])
-                continue;
-            size_t bestSecond = tiles.size();
-            size_t bestOverlap = 0;
-            for (size_t second = first + 1; second < tiles.size(); ++second) {
-                if (grouped[second])
-                    continue;
-                const size_t overlap =
-                    overlapVoxels(tiles[first], tiles[second]);
-                if (overlap > bestOverlap) {
-                    bestOverlap = overlap;
-                    bestSecond = second;
-                }
-            }
-            TileSamplingGroup group;
-            group.tileIndices[0] = first;
-            group.tileCount = 1;
-            group.estimatedBytes = tiles[first].estimatedBytes;
-            grouped[first] = 1;
-            if (bestSecond != tiles.size()) {
-                const size_t firstRawBytes =
-                    checkedMultiply(
-                        tileSampleCount(tiles[first]),
-                        sizeof(FloatStoredPredictionSample),
-                        "fiber anchor retained tile");
-                const size_t secondRawBytes =
-                    checkedMultiply(
-                        tileSampleCount(tiles[bestSecond]),
-                        sizeof(FloatStoredPredictionSample),
-                        "fiber anchor retained tile");
-                const size_t pairedBytes = std::max(
+        struct TilePartition {
+            size_t tileBegin = 0;
+            size_t tileEnd = 0;
+            size_t sharedUpperBytes = 0;
+            size_t maximumTileBytes = 0;
+        };
+        constexpr size_t samplingScratchBytesPerVoxel =
+            sizeof(CellIndex) + sizeof(FiberStoredPredictionSample);
+        constexpr size_t kMinimumSamplingBatchVoxels = 4096;
+        const size_t sharedTargetBytes =
+            config.maximumConcurrentSampleBytes / 2;
+        std::vector<TilePartition> partitions;
+        size_t tileOccurrences = 0;
+        size_t partitionBegin = 0;
+        size_t partitionSharedUpperBytes = 0;
+        size_t partitionMaximumTileBytes = 0;
+        size_t partitionSampleUpperCount = 0;
+        for (size_t tileIndex = 0; tileIndex < tiles.size(); ++tileIndex) {
+            const auto& tile = tiles[tileIndex];
+            const size_t tileSamples = tileSampleCount(tile);
+            tileOccurrences = checkedAdd(
+                tileOccurrences, tileSamples,
+                "fiber anchor tile sample occurrences");
+            const size_t tileSampleBytes = checkedMultiply(
+                tileSamples, sizeof(FloatStoredPredictionSample),
+                "fiber anchor shared tile sample upper bound");
+            const size_t tileRows = checkedMultiply(
+                tile.sampleEnd[0] - tile.sampleBegin[0],
+                tile.sampleEnd[1] - tile.sampleBegin[1],
+                "fiber anchor shared tile rows");
+            const size_t tileMetadataBytes = checkedMultiply(
+                tileRows,
+                sizeof(SharedSampleInterval) + sizeof(SharedSampleRow),
+                "fiber anchor shared row metadata upper bound");
+            const size_t tileSharedUpperBytes = checkedAdd(
+                tileSampleBytes, tileMetadataBytes,
+                "fiber anchor shared tile upper bound");
+            const size_t candidateSharedUpperBytes = checkedAdd(
+                partitionSharedUpperBytes, tileSharedUpperBytes,
+                "fiber anchor partition shared upper bound");
+            const size_t candidateMaximumTileBytes = std::max(
+                partitionMaximumTileBytes, tile.estimatedBytes);
+            const size_t candidateSampleUpperCount = checkedAdd(
+                partitionSampleUpperCount, tileSamples,
+                "fiber anchor partition sample upper count");
+            const size_t minimumSamplingScratchBytes = checkedMultiply(
+                std::min(
+                    candidateSampleUpperCount,
+                    kMinimumSamplingBatchVoxels),
+                samplingScratchBytesPerVoxel,
+                "fiber anchor minimum sampling scratch");
+            const size_t minimumLiveBytes = checkedAdd(
+                checkedAdd(
+                    candidateSharedUpperBytes, candidateMaximumTileBytes,
+                    "fiber anchor partition minimum live bytes"),
+                minimumSamplingScratchBytes,
+                "fiber anchor partition minimum live bytes");
+            const bool exceedsTarget = tileIndex != partitionBegin &&
+                candidateSharedUpperBytes > sharedTargetBytes;
+            const bool exceedsBudget = minimumLiveBytes >
+                config.maximumConcurrentSampleBytes;
+            if (exceedsTarget || exceedsBudget) {
+                partitions.push_back({
+                    partitionBegin, tileIndex, partitionSharedUpperBytes,
+                    partitionMaximumTileBytes});
+                partitionBegin = tileIndex;
+                partitionSharedUpperBytes = tileSharedUpperBytes;
+                partitionMaximumTileBytes = tile.estimatedBytes;
+                partitionSampleUpperCount = tileSamples;
+                const size_t singleSamplingScratchBytes = checkedMultiply(
+                    std::min(tileSamples, kMinimumSamplingBatchVoxels),
+                    samplingScratchBytesPerVoxel,
+                    "fiber anchor minimum sampling scratch");
+                const size_t singleMinimumLiveBytes = checkedAdd(
                     checkedAdd(
-                        tiles[first].estimatedBytes, secondRawBytes,
-                        "fiber anchor tile sampling group"),
-                    checkedAdd(
-                        tiles[bestSecond].estimatedBytes, firstRawBytes,
-                        "fiber anchor tile sampling group"));
-                if (pairedBytes <= config.maximumConcurrentSampleBytes) {
-                    group.tileIndices[1] = bestSecond;
-                    group.tileCount = 2;
-                    group.estimatedBytes = pairedBytes;
-                    grouped[bestSecond] = 1;
+                        partitionSharedUpperBytes, partitionMaximumTileBytes,
+                        "fiber anchor partition minimum live bytes"),
+                    singleSamplingScratchBytes,
+                    "fiber anchor partition minimum live bytes");
+                if (singleMinimumLiveBytes >
+                    config.maximumConcurrentSampleBytes) {
+                    throw std::runtime_error(
+                        "fiber anchor cell sample exceeds the concurrent byte limit");
                 }
+            } else {
+                partitionSharedUpperBytes = candidateSharedUpperBytes;
+                partitionMaximumTileBytes = candidateMaximumTileBytes;
+                partitionSampleUpperCount = candidateSampleUpperCount;
             }
-            samplingGroups.push_back(group);
         }
-        size_t maximumGroupBytes = 0;
-        for (const auto& group : samplingGroups) {
-            maximumGroupBytes = std::max(
-                maximumGroupBytes, group.estimatedBytes);
-        }
-        const size_t memoryWorkers = std::max<size_t>(
-            1, config.maximumConcurrentSampleBytes / maximumGroupBytes);
-        const size_t workerCount = std::min({
-            samplingGroups.size(),
-            static_cast<size_t>(config.parallelThreads),
-            memoryWorkers,
-        });
+        partitions.push_back({
+            partitionBegin, tiles.size(), partitionSharedUpperBytes,
+            partitionMaximumTileBytes});
         report.profile.tiles += tiles.size();
-        report.profile.samplingGroups += samplingGroups.size();
-        report.profile.workers = std::max(report.profile.workers, workerCount);
+        report.profile.samplingPartitions += partitions.size();
         report.profile.tilePlanningSeconds += std::chrono::duration<double>(
             std::chrono::steady_clock::now() - tilePlanningStart).count();
 
@@ -3402,9 +3425,6 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             requestedCells.size());
         std::vector<std::exception_ptr> jobErrors(requestedCells.size());
         struct WorkerProfile {
-            size_t predictionSamplerCalls = 0;
-            size_t submittedPredictionVoxels = 0;
-            size_t reusedPredictionVoxels = 0;
             size_t candidateObservations = 0;
             size_t retainedObservations = 0;
             size_t supportStencilCells = 0;
@@ -3416,15 +3436,16 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             size_t fitIterations = 0;
             double coordinateConstructionSeconds = 0.0F;
             double predictionSamplingSeconds = 0.0F;
+            double tileSampleCopySeconds = 0.0F;
             double gradientConstructionSeconds = 0.0F;
             double observationConstructionSeconds = 0.0F;
             double fittingSeconds = 0.0F;
-            std::vector<double> groupJobDurations;
             std::vector<double> tilePreparationDurations;
             std::vector<double> cellProcessingDurations;
             FiberAnchorFitProfile fit;
         };
-        std::vector<WorkerProfile> workerProfiles(workerCount);
+        std::vector<WorkerProfile> workerProfiles(
+            static_cast<size_t>(config.parallelThreads));
         const auto processCell = [&]
             (const CellIndex& cellZYX,
              const Tile& tile,
@@ -3574,26 +3595,10 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             return result;
         };
 
-        std::atomic<size_t> nextJob{0};
         std::atomic<size_t> completedJobs{0};
-        std::atomic<size_t> completedGroupJobs{0};
         std::mutex progressMutex;
         auto lastProgressTime = phaseStart;
         std::exception_ptr progressError;
-        struct ReadyTile {
-            const Tile* tile = nullptr;
-            const std::vector<CompactFiberAnchorObservation>* observations =
-                nullptr;
-            std::array<size_t, 3> sampleShape{};
-            std::atomic<size_t> remainingCells{0};
-        };
-        struct ReadyCellTask {
-            ReadyTile* readyTile = nullptr;
-            size_t cellIndex = 0;
-        };
-        std::mutex readyCellMutex;
-        std::condition_variable readyCellCondition;
-        std::deque<ReadyCellTask> readyCells;
         const auto reportCellCompleted = [&]() {
             const size_t completed = completedJobs.fetch_add(1) + 1;
             if (!progressCallback)
@@ -3616,65 +3621,417 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                 }
             }
         };
-        const auto worker = [&](size_t workerIndex) {
-            auto& workerProfile = workerProfiles[workerIndex];
-            std::vector<uint32_t> cellObservationIndices;
-            std::vector<uint8_t> cellGradientValidity;
-            const auto processReadyCell = [&](const ReadyCellTask& task) {
-                const auto cellStart = std::chrono::steady_clock::now();
-                try {
-                    const auto& ready = *task.readyTile;
-                    jobResults[task.cellIndex] = processCell(
-                        requestedCells[task.cellIndex], *ready.tile,
-                        *ready.observations, ready.sampleShape,
-                        cellObservationIndices, cellGradientValidity,
-                        workerProfile);
-                } catch (...) {
-                    jobErrors[task.cellIndex] = std::current_exception();
+        std::vector<double> partitionDurations;
+        const auto cellProcessingStart = std::chrono::steady_clock::now();
+        const double cellProcessingCpuStart = processCpuSeconds();
+        for (const auto& partition : partitions) {
+            const auto partitionStart = std::chrono::steady_clock::now();
+            std::vector<SharedSampleInterval> intervals;
+            for (size_t tileIndex = partition.tileBegin;
+                 tileIndex < partition.tileEnd; ++tileIndex) {
+                const auto& tile = tiles[tileIndex];
+                const size_t rows = checkedMultiply(
+                    tile.sampleEnd[0] - tile.sampleBegin[0],
+                    tile.sampleEnd[1] - tile.sampleBegin[1],
+                    "fiber anchor shared interval count");
+                if (intervals.size() >
+                    std::numeric_limits<size_t>::max() - rows) {
+                    throw std::overflow_error(
+                        "fiber anchor shared interval count overflows");
                 }
-                workerProfile.cellProcessingDurations.push_back(
-                    std::chrono::duration<double>(
-                        std::chrono::steady_clock::now() - cellStart).count());
-                reportCellCompleted();
-                task.readyTile->remainingCells.fetch_sub(1);
-                readyCellCondition.notify_all();
-            };
-            const auto helpUntil = [&](const ReadyTile* ownTile) {
-                while (true) {
-                    ReadyCellTask task;
-                    {
-                        std::unique_lock lock(readyCellMutex);
-                        readyCellCondition.wait(lock, [&]() {
-                            return !readyCells.empty() ||
-                                (ownTile != nullptr
-                                    ? ownTile->remainingCells.load() == 0
-                                    : completedGroupJobs.load() ==
-                                        samplingGroups.size());
-                        });
-                        if (readyCells.empty())
-                            return;
-                        task = readyCells.front();
-                        readyCells.pop_front();
+                intervals.reserve(intervals.size() + rows);
+                for (size_t z = tile.sampleBegin[0];
+                     z < tile.sampleEnd[0]; ++z) {
+                    for (size_t y = tile.sampleBegin[1];
+                         y < tile.sampleEnd[1]; ++y) {
+                        intervals.push_back({
+                            z, y, tile.sampleBegin[2], tile.sampleEnd[2], 0});
                     }
-                    processReadyCell(task);
+                }
+            }
+            std::sort(intervals.begin(), intervals.end(),
+                [](const auto& left, const auto& right) {
+                    return std::tie(left.z, left.y, left.xBegin, left.xEnd) <
+                        std::tie(right.z, right.y, right.xBegin, right.xEnd);
+                });
+            size_t mergedCount = 0;
+            for (const auto& interval : intervals) {
+                if (mergedCount != 0) {
+                    auto& previous = intervals[mergedCount - 1];
+                    if (previous.z == interval.z && previous.y == interval.y &&
+                        interval.xBegin <= previous.xEnd) {
+                        previous.xEnd = std::max(previous.xEnd, interval.xEnd);
+                        continue;
+                    }
+                }
+                intervals[mergedCount++] = interval;
+            }
+            intervals.resize(mergedCount);
+            std::vector<SharedSampleRow> rows;
+            rows.reserve(intervals.size());
+            size_t unionSamples = 0;
+            for (size_t intervalIndex = 0;
+                 intervalIndex < intervals.size(); ++intervalIndex) {
+                auto& interval = intervals[intervalIndex];
+                interval.sampleOffset = unionSamples;
+                unionSamples = checkedAdd(
+                    unionSamples, interval.xEnd - interval.xBegin,
+                    "fiber anchor partition sample union");
+                if (rows.empty() || rows.back().z != interval.z ||
+                    rows.back().y != interval.y) {
+                    rows.push_back({
+                        interval.z, interval.y, intervalIndex,
+                        intervalIndex + 1});
+                } else {
+                    rows.back().intervalEnd = intervalIndex + 1;
+                }
+            }
+            const size_t intervalBytes = checkedMultiply(
+                intervals.capacity(), sizeof(SharedSampleInterval),
+                "fiber anchor shared intervals");
+            const size_t rowBytes = checkedMultiply(
+                rows.capacity(), sizeof(SharedSampleRow),
+                "fiber anchor shared rows");
+            const size_t sharedSampleBytes = checkedMultiply(
+                unionSamples, sizeof(FloatStoredPredictionSample),
+                "fiber anchor shared samples");
+            const size_t sharedBaseBytes = checkedAdd(
+                checkedAdd(intervalBytes, rowBytes,
+                    "fiber anchor shared metadata"),
+                sharedSampleBytes, "fiber anchor shared storage");
+            const size_t minimumFitLiveBytes = checkedAdd(
+                sharedBaseBytes, partition.maximumTileBytes,
+                "fiber anchor partition fitting bytes");
+            const size_t minimumSamplingLiveBytes = checkedAdd(
+                sharedBaseBytes,
+                checkedMultiply(
+                    std::min(unionSamples, kMinimumSamplingBatchVoxels),
+                    samplingScratchBytesPerVoxel,
+                    "fiber anchor minimum sampling scratch"),
+                "fiber anchor partition sampling bytes");
+            if (minimumFitLiveBytes > config.maximumConcurrentSampleBytes ||
+                minimumSamplingLiveBytes > config.maximumConcurrentSampleBytes) {
+                throw std::runtime_error(
+                    "fiber anchor cell sample exceeds the concurrent byte limit");
+            }
+            report.profile.maximumSharedSampleBytes = std::max(
+                report.profile.maximumSharedSampleBytes, sharedBaseBytes);
+
+            std::vector<FloatStoredPredictionSample> sharedSamples(unionSamples);
+            const size_t minimumSamplingBatchVoxels = std::min(
+                unionSamples, kMinimumSamplingBatchVoxels);
+            const size_t maximumSamplingBatchCount =
+                (unionSamples + minimumSamplingBatchVoxels - 1) /
+                minimumSamplingBatchVoxels;
+            size_t samplingWorkerCount = std::min(
+                static_cast<size_t>(config.parallelThreads), unionSamples);
+            const size_t maximumSamplingControlBytes = checkedAdd(
+                checkedMultiply(
+                    maximumSamplingBatchCount, sizeof(std::exception_ptr),
+                    "fiber anchor sampling errors"),
+                checkedMultiply(
+                    samplingWorkerCount,
+                    2 * sizeof(double) + sizeof(std::thread),
+                    "fiber anchor sampling worker control"),
+                "fiber anchor sampling control");
+            if (maximumSamplingControlBytes >
+                config.maximumConcurrentSampleBytes - sharedBaseBytes) {
+                throw std::runtime_error(
+                    "fiber anchor cell sample exceeds the concurrent byte limit");
+            }
+            const size_t samplingAvailableBytes =
+                config.maximumConcurrentSampleBytes - sharedBaseBytes -
+                maximumSamplingControlBytes;
+            const size_t minimumSamplingScratchBytes = checkedMultiply(
+                minimumSamplingBatchVoxels,
+                samplingScratchBytesPerVoxel,
+                "fiber anchor minimum sampling scratch");
+            if (samplingAvailableBytes < minimumSamplingScratchBytes) {
+                throw std::runtime_error(
+                    "fiber anchor cell sample exceeds the concurrent byte limit");
+            }
+            while (samplingWorkerCount > 1 &&
+                   samplingAvailableBytes / samplingWorkerCount <
+                       minimumSamplingScratchBytes) {
+                --samplingWorkerCount;
+            }
+            const size_t maximumBatchFromBudget =
+                samplingAvailableBytes /
+                (samplingWorkerCount * samplingScratchBytesPerVoxel);
+            constexpr size_t kMaximumSamplingBatchVoxels = 65536;
+            const size_t samplingBatchVoxels = std::max(
+                minimumSamplingBatchVoxels, std::min({
+                    kMaximumSamplingBatchVoxels,
+                    maximumBatchFromBudget,
+                    (unionSamples + samplingWorkerCount - 1) /
+                        samplingWorkerCount,
+                }));
+            const size_t samplingBatchCount =
+                (unionSamples + samplingBatchVoxels - 1) /
+                samplingBatchVoxels;
+            samplingWorkerCount = std::min(
+                samplingWorkerCount, samplingBatchCount);
+            const size_t samplingScratchBytes = checkedMultiply(
+                checkedMultiply(
+                    samplingWorkerCount, samplingBatchVoxels,
+                    "fiber anchor concurrent sampling voxels"),
+                samplingScratchBytesPerVoxel,
+                "fiber anchor concurrent sampling scratch");
+            report.profile.maximumAccountedLiveBytes = std::max(
+                report.profile.maximumAccountedLiveBytes,
+                checkedAdd(
+                    checkedAdd(
+                        sharedBaseBytes, maximumSamplingControlBytes,
+                        "fiber anchor sampling live bytes"),
+                    samplingScratchBytes,
+                    "fiber anchor sampling live bytes"));
+            report.profile.workers = std::max(
+                report.profile.workers, samplingWorkerCount);
+            report.profile.sharedSamplingBatches += samplingBatchCount;
+            report.profile.maximumSamplingBatchVoxels = std::max(
+                report.profile.maximumSamplingBatchVoxels,
+                samplingBatchVoxels);
+            std::vector<std::exception_ptr> samplingErrors(samplingBatchCount);
+            std::vector<double> samplingCoordinateSeconds(samplingWorkerCount);
+            std::vector<double> samplingWorkSeconds(samplingWorkerCount);
+            std::atomic<size_t> nextSamplingBatch{0};
+            const auto sharedSamplingStart = std::chrono::steady_clock::now();
+            const double sharedSamplingCpuStart = processCpuSeconds();
+            const auto sampleWorker = [&](size_t workerIndex) {
+                while (true) {
+                    const size_t batchIndex = nextSamplingBatch.fetch_add(1);
+                    if (batchIndex >= samplingBatchCount)
+                        return;
+                    try {
+                        const size_t sampleBegin =
+                            batchIndex * samplingBatchVoxels;
+                        const size_t sampleEnd = std::min(
+                            unionSamples, sampleBegin + samplingBatchVoxels);
+                        const auto coordinateStart =
+                            std::chrono::steady_clock::now();
+                        std::vector<CellIndex> indices;
+                        indices.reserve(sampleEnd - sampleBegin);
+                        auto intervalIt = std::lower_bound(
+                            intervals.begin(), intervals.end(), sampleBegin,
+                            [](const SharedSampleInterval& interval,
+                               size_t offset) {
+                                return interval.sampleOffset +
+                                    (interval.xEnd - interval.xBegin) <= offset;
+                            });
+                        size_t offset = sampleBegin;
+                        while (offset < sampleEnd) {
+                            if (intervalIt == intervals.end()) {
+                                throw std::logic_error(
+                                    "fiber anchor shared sample offset is missing");
+                            }
+                            const size_t local = offset -
+                                intervalIt->sampleOffset;
+                            const size_t available =
+                                intervalIt->xEnd - intervalIt->xBegin - local;
+                            const size_t count = std::min(
+                                available, sampleEnd - offset);
+                            for (size_t index = 0; index < count; ++index) {
+                                indices.push_back({
+                                    intervalIt->z, intervalIt->y,
+                                    intervalIt->xBegin + local + index});
+                            }
+                            offset += count;
+                            ++intervalIt;
+                        }
+                        samplingCoordinateSeconds[workerIndex] +=
+                            std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() -
+                                coordinateStart).count();
+                        std::vector<FiberStoredPredictionSample> sampled;
+                        const auto samplingStart =
+                            std::chrono::steady_clock::now();
+                        sampler(indices, 1, sampled);
+                        samplingWorkSeconds[workerIndex] +=
+                            std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() -
+                                samplingStart).count();
+                        if (sampled.size() != indices.size()) {
+                            throw std::runtime_error(
+                                "fiber stored prediction sampler returned the wrong sample count");
+                        }
+                        for (size_t index = 0; index < sampled.size(); ++index) {
+                            sharedSamples[sampleBegin + index] =
+                                narrowStoredPredictionSample(sampled[index]);
+                        }
+                    } catch (...) {
+                        samplingErrors[batchIndex] = std::current_exception();
+                    }
                 }
             };
-            while (true) {
-                const size_t job = nextJob.fetch_add(1);
-                if (job >= samplingGroups.size()) {
-                    helpUntil(nullptr);
+            std::vector<std::thread> samplingWorkers;
+            samplingWorkers.reserve(samplingWorkerCount);
+            for (size_t workerIndex = 0;
+                 workerIndex < samplingWorkerCount; ++workerIndex) {
+                samplingWorkers.emplace_back(sampleWorker, workerIndex);
+            }
+            for (auto& thread : samplingWorkers)
+                thread.join();
+            report.profile.sharedSamplingSeconds +=
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() -
+                    sharedSamplingStart).count();
+            report.profile.sharedSamplingCpuSeconds +=
+                processCpuSeconds() - sharedSamplingCpuStart;
+            report.profile.coordinateConstructionWorkSeconds +=
+                std::accumulate(
+                    samplingCoordinateSeconds.begin(),
+                    samplingCoordinateSeconds.end(), 0.0);
+            report.profile.predictionSamplingWorkSeconds +=
+                std::accumulate(
+                    samplingWorkSeconds.begin(), samplingWorkSeconds.end(), 0.0);
+            report.profile.predictionSamplerCalls += samplingBatchCount;
+            report.profile.submittedPredictionVoxels += unionSamples;
+            std::exception_ptr samplingError;
+            for (const auto& error : samplingErrors) {
+                if (error) {
+                    samplingError = error;
                     break;
                 }
-                try {
-                    const auto groupStart = std::chrono::steady_clock::now();
-                    const auto& group = samplingGroups[job];
-                    const Tile* previousTile = nullptr;
-                    std::vector<FloatStoredPredictionSample> previousSamples;
-                    for (size_t groupIndex = 0;
-                         groupIndex < group.tileCount; ++groupIndex) {
+            }
+            if (samplingError) {
+                for (size_t tileIndex = partition.tileBegin;
+                     tileIndex < partition.tileEnd; ++tileIndex) {
+                    for (const size_t cellIndex : tiles[tileIndex].cells) {
+                        jobErrors[cellIndex] = samplingError;
+                        reportCellCompleted();
+                    }
+                }
+                partitionDurations.push_back(std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - partitionStart).count());
+                continue;
+            }
+
+            const size_t partitionTileCount =
+                partition.tileEnd - partition.tileBegin;
+            struct ReadyTile {
+                const Tile* tile = nullptr;
+                const std::vector<CompactFiberAnchorObservation>* observations =
+                    nullptr;
+                std::array<size_t, 3> sampleShape{};
+                std::atomic<size_t> remainingCells{0};
+            };
+            struct ReadyCellTask {
+                ReadyTile* readyTile = nullptr;
+                size_t cellIndex = 0;
+            };
+            size_t partitionCellCount = 0;
+            for (size_t tileIndex = partition.tileBegin;
+                 tileIndex < partition.tileEnd; ++tileIndex) {
+                partitionCellCount = checkedAdd(
+                    partitionCellCount, tiles[tileIndex].cells.size(),
+                    "fiber anchor ready-cell queue");
+            }
+            const size_t readyQueueBytes = checkedMultiply(
+                partitionCellCount, sizeof(ReadyCellTask),
+                "fiber anchor ready-cell queue");
+            const size_t fittingProfileBytes = checkedAdd(
+                checkedMultiply(
+                    partitionCellCount, sizeof(double),
+                    "fiber anchor cell timing storage"),
+                checkedMultiply(
+                    partitionTileCount, sizeof(double),
+                    "fiber anchor tile timing storage"),
+                "fiber anchor fitting profile storage");
+            const size_t fittingBaseBytes = checkedAdd(
+                checkedAdd(
+                    sharedBaseBytes, readyQueueBytes,
+                    "fiber anchor fitting base bytes"),
+                fittingProfileBytes,
+                "fiber anchor fitting base bytes");
+            if (fittingBaseBytes > config.maximumConcurrentSampleBytes ||
+                partition.maximumTileBytes >
+                    config.maximumConcurrentSampleBytes - fittingBaseBytes) {
+                throw std::runtime_error(
+                    "fiber anchor cell sample exceeds the concurrent byte limit");
+            }
+            const size_t fitAvailableBytes =
+                config.maximumConcurrentSampleBytes - fittingBaseBytes;
+            const size_t fitWorkerCount = std::min({
+                partitionTileCount,
+                static_cast<size_t>(config.parallelThreads),
+                std::max<size_t>(
+                    1, fitAvailableBytes / partition.maximumTileBytes),
+            });
+            report.profile.workers = std::max(
+                report.profile.workers, fitWorkerCount);
+            report.profile.maximumAccountedLiveBytes = std::max(
+                report.profile.maximumAccountedLiveBytes,
+                checkedAdd(
+                    fittingBaseBytes,
+                    checkedMultiply(
+                        fitWorkerCount, partition.maximumTileBytes,
+                        "fiber anchor fitting live bytes"),
+                    "fiber anchor fitting live bytes"));
+
+            std::mutex readyCellMutex;
+            std::condition_variable readyCellCondition;
+            std::vector<ReadyCellTask> readyCells;
+            readyCells.reserve(partitionCellCount);
+            size_t nextReadyCell = 0;
+            std::atomic<size_t> nextTile{partition.tileBegin};
+            std::atomic<size_t> completedTiles{0};
+            const auto fitWorker = [&](size_t workerIndex) {
+                auto& workerProfile = workerProfiles[workerIndex];
+                std::vector<uint32_t> cellObservationIndices;
+                std::vector<uint8_t> cellGradientValidity;
+                const auto processReadyCell = [&](const ReadyCellTask& task) {
+                    const auto cellStart = std::chrono::steady_clock::now();
+                    try {
+                        const auto& ready = *task.readyTile;
+                        jobResults[task.cellIndex] = processCell(
+                            requestedCells[task.cellIndex], *ready.tile,
+                            *ready.observations, ready.sampleShape,
+                            cellObservationIndices, cellGradientValidity,
+                            workerProfile);
+                    } catch (...) {
+                        jobErrors[task.cellIndex] = std::current_exception();
+                    }
+                    const double duration = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - cellStart).count();
+                    task.readyTile->remainingCells.fetch_sub(1);
+                    readyCellCondition.notify_all();
+                    try {
+                        workerProfile.cellProcessingDurations.push_back(duration);
+                    } catch (...) {
+                        if (!jobErrors[task.cellIndex])
+                            jobErrors[task.cellIndex] = std::current_exception();
+                    }
+                    reportCellCompleted();
+                };
+                const auto helpUntil = [&](const ReadyTile* ownTile) {
+                    while (true) {
+                        ReadyCellTask task;
+                        {
+                            std::unique_lock lock(readyCellMutex);
+                            readyCellCondition.wait(lock, [&]() {
+                                return nextReadyCell < readyCells.size() ||
+                                    (ownTile != nullptr
+                                        ? ownTile->remainingCells.load() == 0
+                                        : completedTiles.load() ==
+                                            partitionTileCount);
+                            });
+                            if (nextReadyCell == readyCells.size())
+                                return;
+                            task = readyCells[nextReadyCell++];
+                        }
+                        processReadyCell(task);
+                    }
+                };
+                while (true) {
+                    const size_t tileIndex = nextTile.fetch_add(1);
+                    if (tileIndex >= partition.tileEnd) {
+                        helpUntil(nullptr);
+                        break;
+                    }
+                    const Tile& tile = tiles[tileIndex];
+                    try {
                     const auto tilePreparationStart =
                         std::chrono::steady_clock::now();
-                    const Tile& tile = tiles[group.tileIndices[groupIndex]];
                     const std::array<size_t, 3> sampleShape{
                         tile.sampleEnd[0] - tile.sampleBegin[0],
                         tile.sampleEnd[1] - tile.sampleBegin[1],
@@ -3688,78 +4045,57 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                         throw std::runtime_error(
                             "fiber anchor tile exceeds compact index range");
                     }
-                    const auto coordinateStart = std::chrono::steady_clock::now();
-                    std::vector<CellIndex> indices;
-                    indices.reserve(sampleCount);
-                    std::vector<size_t> sampledOffsets;
-                    sampledOffsets.reserve(sampleCount);
+                    const auto copyStart = std::chrono::steady_clock::now();
                     std::vector<FloatStoredPredictionSample> samples(sampleCount);
                     const size_t plane = sampleShape[1] * sampleShape[2];
                     for (size_t z = tile.sampleBegin[0]; z < tile.sampleEnd[0]; ++z) {
                         for (size_t y = tile.sampleBegin[1]; y < tile.sampleEnd[1]; ++y) {
-                            for (size_t x = tile.sampleBegin[2]; x < tile.sampleEnd[2]; ++x) {
-                                const size_t offset =
-                                    (z - tile.sampleBegin[0]) * plane +
-                                    (y - tile.sampleBegin[1]) * sampleShape[2] +
-                                    (x - tile.sampleBegin[2]);
-                                const bool reusable = previousTile != nullptr &&
-                                    z >= previousTile->sampleBegin[0] &&
-                                    z < previousTile->sampleEnd[0] &&
-                                    y >= previousTile->sampleBegin[1] &&
-                                    y < previousTile->sampleEnd[1] &&
-                                    x >= previousTile->sampleBegin[2] &&
-                                    x < previousTile->sampleEnd[2];
-                                if (reusable) {
-                                    const size_t previousWidth =
-                                        previousTile->sampleEnd[2] -
-                                        previousTile->sampleBegin[2];
-                                    const size_t previousPlane =
-                                        (previousTile->sampleEnd[1] -
-                                         previousTile->sampleBegin[1]) *
-                                        previousWidth;
-                                    const size_t previousOffset =
-                                        (z - previousTile->sampleBegin[0]) *
-                                            previousPlane +
-                                        (y - previousTile->sampleBegin[1]) *
-                                            previousWidth +
-                                        (x - previousTile->sampleBegin[2]);
-                                    samples[offset] = previousSamples[previousOffset];
-                                } else {
-                                    indices.push_back({z, y, x});
-                                    sampledOffsets.push_back(offset);
-                                }
+                            const auto rowIt = std::lower_bound(
+                                rows.begin(), rows.end(), std::pair{z, y},
+                                [](const SharedSampleRow& row,
+                                   const std::pair<size_t, size_t>& key) {
+                                    return std::pair{row.z, row.y} < key;
+                                });
+                            if (rowIt == rows.end() || rowIt->z != z ||
+                                rowIt->y != y) {
+                                throw std::logic_error(
+                                    "fiber anchor shared sample row is missing");
                             }
+                            const auto intervalIt = std::find_if(
+                                intervals.begin() +
+                                    static_cast<std::ptrdiff_t>(
+                                        rowIt->intervalBegin),
+                                intervals.begin() +
+                                    static_cast<std::ptrdiff_t>(
+                                        rowIt->intervalEnd),
+                                [&](const SharedSampleInterval& interval) {
+                                    return interval.xBegin <= tile.sampleBegin[2] &&
+                                        interval.xEnd >= tile.sampleEnd[2];
+                                });
+                            if (intervalIt == intervals.begin() +
+                                    static_cast<std::ptrdiff_t>(
+                                        rowIt->intervalEnd)) {
+                                throw std::logic_error(
+                                    "fiber anchor shared sample interval is missing");
+                            }
+                            const size_t sourceOffset =
+                                intervalIt->sampleOffset +
+                                tile.sampleBegin[2] - intervalIt->xBegin;
+                            const size_t destinationOffset =
+                                (z - tile.sampleBegin[0]) * plane +
+                                (y - tile.sampleBegin[1]) * sampleShape[2];
+                            std::copy_n(
+                                sharedSamples.begin() +
+                                    static_cast<std::ptrdiff_t>(sourceOffset),
+                                sampleShape[2],
+                                samples.begin() +
+                                    static_cast<std::ptrdiff_t>(
+                                        destinationOffset));
                         }
                     }
-                    workerProfile.coordinateConstructionSeconds +=
+                    workerProfile.tileSampleCopySeconds +=
                         std::chrono::duration<double>(
-                            std::chrono::steady_clock::now() - coordinateStart).count();
-                    if (!indices.empty()) {
-                        std::vector<FiberStoredPredictionSample> sampled;
-                        const auto samplingStart =
-                            std::chrono::steady_clock::now();
-                        sampler(indices, 1, sampled);
-                        workerProfile.predictionSamplingSeconds +=
-                            std::chrono::duration<double>(
-                                std::chrono::steady_clock::now() -
-                                samplingStart).count();
-                        ++workerProfile.predictionSamplerCalls;
-                        if (sampled.size() != indices.size()) {
-                            throw std::runtime_error(
-                                "fiber stored prediction sampler returned the wrong sample count");
-                        }
-                        for (size_t index = 0; index < sampled.size(); ++index) {
-                            samples[sampledOffsets[index]] =
-                                narrowStoredPredictionSample(sampled[index]);
-                        }
-                    }
-                    workerProfile.submittedPredictionVoxels += indices.size();
-                    workerProfile.reusedPredictionVoxels +=
-                        sampleCount - indices.size();
-                    indices.clear();
-                    indices.shrink_to_fit();
-                    sampledOffsets.clear();
-                    sampledOffsets.shrink_to_fit();
+                            std::chrono::steady_clock::now() - copyStart).count();
                     std::vector<CachedPresenceGradient> gradients;
                     if (config.peakGradientWeight > 0.0F) {
                         const auto gradientStart = std::chrono::steady_clock::now();
@@ -3876,49 +4212,37 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                     }
                     readyCellCondition.notify_all();
                     helpUntil(&readyTile);
-                    previousTile = &tile;
-                    previousSamples = std::move(samples);
+                    } catch (...) {
+                        const auto error = std::current_exception();
+                        for (const size_t cellIndex : tile.cells) {
+                            jobErrors[cellIndex] = error;
+                            reportCellCompleted();
+                        }
                     }
-                    workerProfile.groupJobDurations.push_back(
-                        std::chrono::duration<double>(
-                            std::chrono::steady_clock::now() - groupStart)
-                            .count());
-                } catch (...) {
-                    for (size_t groupIndex = 0;
-                         groupIndex < samplingGroups[job].tileCount;
-                         ++groupIndex) {
-                        const auto& tile = tiles[
-                            samplingGroups[job].tileIndices[groupIndex]];
-                        for (const size_t cellIndex : tile.cells)
-                            jobErrors[cellIndex] = std::current_exception();
-                    }
+                    completedTiles.fetch_add(1);
+                    readyCellCondition.notify_all();
                 }
-                completedGroupJobs.fetch_add(1);
-                readyCellCondition.notify_all();
+            };
+            std::vector<std::thread> fitWorkers;
+            fitWorkers.reserve(fitWorkerCount);
+            for (size_t workerIndex = 0;
+                 workerIndex < fitWorkerCount; ++workerIndex) {
+                fitWorkers.emplace_back(fitWorker, workerIndex);
             }
-        };
-        const auto cellProcessingStart = std::chrono::steady_clock::now();
-        const double cellProcessingCpuStart = processCpuSeconds();
-        std::vector<std::thread> workers;
-        workers.reserve(workerCount);
-        for (size_t workerIndex = 0; workerIndex < workerCount; ++workerIndex)
-            workers.emplace_back(worker, workerIndex);
-        for (auto& thread : workers)
-            thread.join();
+            for (auto& thread : fitWorkers)
+                thread.join();
+            partitionDurations.push_back(std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - partitionStart).count());
+        }
         report.profile.cellProcessingSeconds += std::chrono::duration<double>(
             std::chrono::steady_clock::now() - cellProcessingStart).count();
         report.profile.cellProcessingCpuSeconds +=
             processCpuSeconds() - cellProcessingCpuStart;
-        std::vector<double> groupJobDurations;
+        report.profile.reusedPredictionVoxels +=
+            tileOccurrences - report.profile.submittedPredictionVoxels;
         std::vector<double> tilePreparationDurations;
         std::vector<double> cellProcessingDurations;
         for (const auto& workerProfile : workerProfiles) {
-            report.profile.predictionSamplerCalls +=
-                workerProfile.predictionSamplerCalls;
-            report.profile.submittedPredictionVoxels +=
-                workerProfile.submittedPredictionVoxels;
-            report.profile.reusedPredictionVoxels +=
-                workerProfile.reusedPredictionVoxels;
             report.profile.candidateObservations +=
                 workerProfile.candidateObservations;
             report.profile.retainedObservations +=
@@ -3938,15 +4262,13 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                 workerProfile.coordinateConstructionSeconds;
             report.profile.predictionSamplingWorkSeconds +=
                 workerProfile.predictionSamplingSeconds;
+            report.profile.tileSampleCopyWorkSeconds +=
+                workerProfile.tileSampleCopySeconds;
             report.profile.gradientConstructionWorkSeconds +=
                 workerProfile.gradientConstructionSeconds;
             report.profile.observationConstructionWorkSeconds +=
                 workerProfile.observationConstructionSeconds;
             report.profile.fittingWorkSeconds += workerProfile.fittingSeconds;
-            groupJobDurations.insert(
-                groupJobDurations.end(),
-                workerProfile.groupJobDurations.begin(),
-                workerProfile.groupJobDurations.end());
             tilePreparationDurations.insert(
                 tilePreparationDurations.end(),
                 workerProfile.tilePreparationDurations.begin(),
@@ -3975,10 +4297,10 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             maximum = durations.back();
         };
         assignDurationQuantiles(
-            groupJobDurations,
-            report.profile.groupJobP50Seconds,
-            report.profile.groupJobP95Seconds,
-            report.profile.groupJobMaximumSeconds);
+            partitionDurations,
+            report.profile.partitionP50Seconds,
+            report.profile.partitionP95Seconds,
+            report.profile.partitionMaximumSeconds);
         assignDurationQuantiles(
             tilePreparationDurations,
             report.profile.tilePreparationP50Seconds,

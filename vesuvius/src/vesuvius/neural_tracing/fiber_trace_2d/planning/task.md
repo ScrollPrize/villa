@@ -198,6 +198,16 @@ inline robust-membership materialization removal, or eager candidate-wide edge
 generation unchanged. Any revisit must address the measured locality,
 register-pressure, or repeated-predicate reason for the prior regression.
 
+The current continuation replaces pair-local anchor-tile overlap reuse with
+bounded extraction-wide raw prediction reuse. Partition tiles when the full
+union would exceed the existing sample-memory budget; within each partition,
+build the exact union of tile sample boxes, sample each prediction voxel once
+in bounded parallel batches, and copy contiguous shared row ranges into each
+tile before its unchanged gradient, observation, and fitting work. This must
+preserve support for extractions larger than the memory budget. Retain the
+change only if reduced sampler work improves end-to-end wall time without
+unacceptable memory or replay-quality regression.
+
 Checkpoint 25 parallelized conversion and sorting of the worker-local corner
 sets while retaining the deterministic pairwise sorted-unique merge. Destination
 capacity is allocated on the calling thread before workers populate and sort the

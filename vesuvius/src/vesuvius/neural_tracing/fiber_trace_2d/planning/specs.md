@@ -3087,7 +3087,7 @@
   Benchmark comparisons must retain identical inputs, parameters, build type,
   and interval.
 - Benchmark and full replay extraction emit the same versioned
-  `fiberlet_extraction_profile version=19` key/value schema. The profile exposes
+  `fiberlet_extraction_profile version=20` key/value schema. The profile exposes
   deterministic workload counters and finer anchor/fiberlet phase timings.
   Enclosing phase fields are wall time, `_work_seconds` fields are summed
   worker/candidate time, and CPU fields are process CPU time. Corner insertion
@@ -3097,11 +3097,26 @@
   cost remains in its enclosing phase. Diagnostics must not change sampling,
   fitting, candidate generation, DP math, ordering, serialized artifacts, or
   determinism.
-- Version 19 adds p50, p95, and maximum durations for complete group jobs, tile
-  preparation, and individual ready-cell processing. Group-job duration spans
-  sampling, preparation, and all dependent cell work; it is not a sampler-only
-  metric. These scheduling diagnostics are timing-only and do not enter
-  artifacts.
+- Version 20 replaces pair-local tile sampling groups with bounded exact-union
+  partitions. Tiles remain in canonical order. Each partition merges exact X
+  intervals for structured `(z,y)` rows, samples every union coordinate once
+  in deterministic bounded batches, joins sampling, and then copies contiguous
+  shared ranges into tile-local raw buffers. Large extractions stream through
+  multiple partitions rather than requiring the whole union to remain resident.
+  Sampling and fitting worker counts are admitted independently against
+  `maximumConcurrentSampleBytes`; shared samples, row metadata, sampler scratch,
+  batch/error control, ready-cell queue storage, timing storage, tile buffers,
+  gradients, compact observations, and per-cell scratch are included in the
+  reported maximum live-byte ceiling. Every sampler call receives one lower-
+  level thread. A failed batch is selected by batch order and assigned to its
+  partition cells so final failure propagation remains canonical by cell.
+  Tile owners retain immutable compact observations until all published cells
+  finish. Version 20 reports partition count and duration quantiles, shared
+  batch count/maximum size, shared-sampling wall/CPU, shared/accounted bytes,
+  and tile-copy worker time. Submitted voxels count partition unions; reused
+  voxels count tile occurrences not submitted. The exact whole-extraction tile
+  union remains a diagnostic and may be lower than submissions when bounded
+  partition boundaries repeat overlap.
 - Version 2 divides anchor fitting into exclusive summed-worker setup, seed
   generation, seed-pair refinement, initialized-component finalization, local
   direction/position refinement including backtracking, direction-conditioned

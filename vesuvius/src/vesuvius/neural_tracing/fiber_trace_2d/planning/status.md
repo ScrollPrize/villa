@@ -70,9 +70,15 @@
 - [x] Checkpoint 25: parallelize deterministic corner-set finalization.
 - [x] Checkpoint 26: retain sparse paged corner bitmaps after validation.
 - [x] Checkpoint 27: measure and improve ready-cell anchor load balance.
-- [ ] Checkpoint 28: test bounded peak Gaussian acceleration.
-- [ ] Checkpoint 29: test one-pass post-update membership reuse as a quality change.
-- [ ] Checkpoint 30: profile and optimize remaining DP throughput.
+- [x] Checkpoint 28: plan extraction-wide raw prediction reuse.
+- [x] Checkpoint 28: independently review the plan against task and specs.
+- [x] Checkpoint 28: implement extraction-wide raw prediction reuse.
+- [x] Checkpoint 28: add focused union, budget, failure, and parity coverage.
+- [x] Checkpoint 28: run GCC and Clang focused validation.
+- [x] Checkpoint 28: benchmark three warm canonical replays and retain exact-union reuse.
+- [ ] Checkpoint 29: test bounded peak Gaussian acceleration.
+- [ ] Checkpoint 30: test one-pass post-update membership reuse as a quality change.
+- [ ] Checkpoint 31: profile and optimize remaining DP throughput.
 - [x] Obtain approval for checkpoint 23 float final evaluation.
 - [x] Plan checkpoint 23 and its precision, quality, and performance gates.
 - [x] Independently review checkpoint 23 against task and specifications.

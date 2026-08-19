@@ -1413,7 +1413,94 @@ exact fiberlet-route SHA-256
 `1ec7df7b8d2417ddc762652be3bf0057eef8b93a329a24d36f02a8837465014b`,
 unchanged populations and DP work, and 2 greedy / 1 fiberlet failures.
 
-### Checkpoint 28: peak Gaussian acceleration
+### Checkpoint 28: extraction-wide raw prediction reuse
+
+1. Replace pair-local tile overlap reuse with bounded exact-union partitions.
+   Partition canonical-order tiles conservatively from their dense sample-byte
+   upper bound so arbitrarily large extractions retain the current streaming
+   behavior. Within each partition, represent the exact union as sorted
+   `(z,y)` rows containing merged X intervals and one contiguous float32 raw-
+   sample array; do not use a per-voxel hash or sample conservative padding.
+   The canonical workload should form one partition; overlap crossing a
+   partition boundary may be sampled once per partition.
+2. Sample every partition-union coordinate exactly once in deterministic
+   bounded batches. Use a separately admitted sampling-worker count, and pass
+   lower-level sampler thread count `1` on every call. Allocate the final
+   shared vector before workers write disjoint ranges. Record exceptions by
+   canonical batch index, join all workers, and propagate the earliest batch
+   failure deterministically before any tile reads shared samples.
+3. Account row/interval metadata and shared samples plus the maximum concurrent
+   coordinate and expanded-sampler scratch during sampling. Separately account
+   metadata/shared samples plus `fitWorkerCount * maximumTileWorkingBytes`
+   during fitting, including gradients, compact observations, queues, and
+   per-worker cell scratch. Reject only when one legal tile partition cannot
+   fit, matching the existing minimum supported workload.
+4. Materialize each tile's dense raw sample vector by copying contiguous X
+   ranges from the immutable shared rows. Preserve canonical Z/Y/X tile order,
+   tile-local gradient construction, compact-observation construction, the
+   ready-cell scheduler, fitting arithmetic, and canonical error reporting.
+5. Keep shared sampling and cell fitting as separate bounded phases within
+   each partition for the
+   first implementation. Measure the removed sampler work against any lost
+   sampling/fitting overlap; do not retain the change merely because submitted
+   voxel count falls.
+6. Make each tile the fitting-job and ownership unit. A tile owner prepares one
+   immutable observation vector, publishes its cells, helps the shared ready-
+   cell queue until its own cells complete, then releases the vector and marks
+   the tile complete. Idle workers stop only after every tile job in the
+   partition is complete. Cell failures remain stored and rethrown by lowest
+   canonical cell index after all partitions finish.
+7. Bump the extraction profile schema. Replace sampling-group fields with
+   partition count/durations and add maximum accounted live bytes, shared-
+   union bytes, batch count/size, shared sampling wall/CPU, and tile-copy work.
+   `submittedPredictionVoxels` counts union voxels across partitions;
+   `reusedPredictionVoxels` is tile occurrences minus submissions; the exact
+   whole-extraction union remains a diagnostic and can be lower than submitted
+   count only when partition boundaries repeat overlap.
+8. Add focused coverage for overlapping and disjoint tiles, merged and split
+   row intervals, one- and multi-partition budgets, deterministic single/multi-
+   worker sampling, reversed multi-batch failures, wrong sampler result sizes,
+   gradient enabled/disabled, clipped and explicit-cell runs, invalid samples,
+   progress callback failures, checked arithmetic, and exact output parity.
+   Use structured keys and checked `size_t` arithmetic; make no assumptions
+   about record padding or signed shifts.
+9. Run focused GCC and Clang anchor/path/replay tests, then three warm canonical
+   replays with host-load checks. Compare total and anchor wall/CPU, prediction
+   sampling and tile-copy work, RSS, populations, DP work, failures, and replay
+   hashes against checkpoint 27. Record exact command, dataset, build type,
+   min/median/max, maximum accounted live bytes, and union-planning time. Add a
+   synthetic budget-pressure validation. Remove the implementation if combined
+   wall time or memory is not acceptable.
+10. Update `status.md` incrementally and record implementation decisions,
+    deviations, failed variants, and measurements in `task_log.md`.
+
+#### Checkpoint 28 spec update
+
+- Replace pair-local sampling-group reuse with the retained bounded exact-union
+  partition contract, including deterministic coordinate order, memory
+  admission, ownership/termination, and profile counter meanings.
+
+#### Checkpoint 28 documentation update
+
+- Update `volume-cartographer/docs/fiberlets.md` with the shared-row layout,
+  phase boundary, memory accounting, and measured benchmark result.
+- Record accepted behavior in `planning/changelog.md`; keep rejected variants
+  and measurements only in `planning/task_log.md`.
+
+#### Checkpoint 28 result
+
+- Retained schema-20 bounded exact-union sampling after three warm canonical
+  QuickBuild runs. Median command wall improved from 6.97 to 6.82 seconds,
+  anchor wall from 4.262 to 4.069 seconds, and anchor CPU from 126.98 to 111.61
+  seconds. Prediction submissions fell from 26,741,712 to the exact 6,162,456-
+  voxel union; median peak RSS changed from 1,687,504 to 1,675,944 KiB.
+- All runs retained exact replay SHA-256
+  `f2b8e679c23470d1221f7930a21b0c37fa0906845de0bc2cbf3e8ab7329f78ee`,
+  unchanged populations and DP work, and 2 greedy / 1 fiberlet failures.
+- Focused validation passed 83 GCC and 83 Clang anchor cases, 49 GCC path
+  cases, and 6 GCC replay cases.
+
+### Checkpoint 29: peak Gaussian acceleration
 
 1. Isolate the radial Gaussian cost inside the scalar sequential response
    scan; do not restore rejected response batching, CSR, or counting-sort
@@ -1427,7 +1514,7 @@ unchanged populations and DP work, and 2 greedy / 1 fiberlet failures.
    populations, graph/DP changes, replay failures, and visual quality. Exact
    artifact identity is not required.
 
-### Checkpoint 29: one-pass membership reuse experiment
+### Checkpoint 30: one-pass membership reuse experiment
 
 1. Reuse the robust assignments and retained membership from the accepted
    default one-pass update instead of recomputing membership at its new
@@ -1442,7 +1529,7 @@ unchanged populations and DP work, and 2 greedy / 1 fiberlet failures.
    changes when membership is recomputed rather than adding its predicate to
    every downstream hot scan.
 
-### Checkpoint 30: remaining DP throughput
+### Checkpoint 31: remaining DP throughput
 
 1. Profile transition-cost arithmetic and candidate completion tails under the
    checkpoint-24 float representation.

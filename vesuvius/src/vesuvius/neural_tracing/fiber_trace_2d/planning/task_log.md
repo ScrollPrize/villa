@@ -1314,3 +1314,78 @@
 - Validation passed GCC `test_fiber_anchors` (78), `test_fiberlet_paths` (49),
   and `test_fiber_replay` (6), plus repository-local Clang
   `test_fiber_anchors` (78). `git diff --check` passed.
+
+## Checkpoint 28: extraction-wide raw prediction reuse
+
+- Checkpoint-27 profiling leaves 26,741,712 sampler submissions for
+  39,701,808 tile occurrences, although the exact tile-box union contains only
+  6,162,456 prediction voxels. Pair-local overlap reuse therefore removes less
+  than half of the avoidable repeated sampling.
+- The planned representation is a sorted sparse set of `(z,y)` rows with
+  merged X intervals and one contiguous float32 sample array. It stores only
+  exact union voxels and supports contiguous tile copies without a hot
+  per-voxel hash lookup.
+- The first experiment deliberately separates shared sampling from tile
+  preparation/fitting. This may lose useful pipeline overlap, so reduced
+  submitted samples alone is not a retention result; end-to-end wall, CPU, and
+  RSS remain the decision gates.
+- Independent review rejected a whole-extraction residency requirement because
+  the existing implementation streams workloads larger than the memory cap.
+  The implementation will instead use one bounded partitioning algorithm,
+  with separate sampling- and fitting-phase admission, deterministic batch
+  failures, and tile-owned cooperative fitting. The review also required a
+  profile-version bump, explicit ownership/termination, structured checked
+  keys, and broader budget/boundary/failure coverage; all are incorporated in
+  the revised plan.
+- Implemented schema-20 bounded exact-union partitions. Each partition merges
+  tile X ranges by structured `(z,y)` row, samples the contiguous union in
+  deterministic bounded batches, joins the sampling phase, and then lets
+  tile owners copy complete rows before publishing cells to the cooperative
+  fitting queue. Sampling and fitting worker counts are admitted separately.
+- Focused tests now cover exact three-tile deduplication, low-budget multi-
+  partition streaming with identical serialized results, wrong sampler result
+  sizes, and earliest-batch error selection under reversed completion. GCC
+  passes 82 anchor, 49 path, and 6 replay cases; the repository-local Clang
+  build passes all 82 anchor cases.
+- One warm screening replay produced the exact checkpoint-27 artifact SHA-256
+  `f2b8e679c23470d1221f7930a21b0c37fa0906845de0bc2cbf3e8ab7329f78ee`.
+  It submitted exactly 6,162,456 union voxels instead of 26,741,712, measured
+  4.063 anchor wall / 111.16 anchor CPU seconds and 6.82 command wall seconds,
+  with 1,673,116 KiB peak RSS. This is screening evidence only; three retained
+  runs remain required.
+- Hardened the cooperative queue after review: its complete task capacity is
+  reserved before workers start, completion is published before fallible timing
+  storage, and a timing-allocation error cannot overwrite an earlier cell error.
+  Sampling failures are attached to every affected partition cell, while the
+  final canonical cell scan preserves failure precedence across partitions.
+- Three warm canonical QuickBuild runs used
+  `/usr/bin/time -v volume-cartographer/build/bin/vc_fiberlets fiberlet-replay
+  /home/hendrik/business/aiconsulting/vesuviuschallenge/data/s1/PHercParis4.volpkg/volumes/fiber_s1_002.lasagna.json
+  /home/hendrik/business/aiconsulting/vesuviuschallenge/data/fibers/david/Paris4_fibers/dj_20260805T025256484_000003.json
+  volume-cartographer/build/benchmarks/checkpoint28/runN --normal-manifest
+  /home/hendrik/business/aiconsulting/vesuviuschallenge/data/lasagna3d_inf/las008_s1_full/las_008.lasagna.json
+  --threads 32 --length 5000`.
+  Host checks before and after each run found no unrelated process above the
+  two-core exclusion threshold.
+- Checkpoint-28 min / median / max results were command wall
+  6.80 / 6.82 / 6.84 seconds, total CPU 178.10 / 178.82 / 179.57 seconds,
+  anchor wall 4.067 / 4.069 / 4.084 seconds, anchor CPU
+  111.20 / 111.61 / 112.04 seconds, and peak RSS
+  1,664,980 / 1,675,944 / 1,683,836 KiB. Shared sampling wall was
+  0.225 / 0.228 / 0.232 seconds, shared-sampling CPU
+  6.11 / 6.25 / 6.41 seconds, prediction-sampling worker time
+  6.05 / 6.23 / 6.31 seconds, and tile-copy worker time
+  2.45 / 2.47 / 2.53 seconds.
+- Against checkpoint-27 medians, command wall improved 2.2%, total CPU 7.9%,
+  anchor wall 4.5%, and anchor CPU 12.1%; median peak RSS improved 0.7%.
+  Every run used one partition, submitted the exact 6,162,456-voxel union
+  instead of 26,741,712 voxels (-77.0%), reused 33,539,352 tile occurrences,
+  and reported 150,686,048 maximum shared bytes and 902,563,752 maximum
+  accounted live bytes.
+- Every retained run produced exact replay SHA-256
+  `f2b8e679c23470d1221f7930a21b0c37fa0906845de0bc2cbf3e8ab7329f78ee`,
+  2,603 anchors, 2,562 graph nodes, 26,445 edges, 62,873,000 DP relaxations,
+  and 2 greedy / 1 fiberlet failures. Checkpoint 28 is retained.
+- Final validation passed GCC `test_fiber_anchors` (83),
+  `test_fiberlet_paths` (49), and `test_fiber_replay` (6), plus repository-local
+  Clang `test_fiber_anchors` (83). `git diff --check` passed.
