@@ -2687,7 +2687,14 @@
   every retained stencil site gradient-eligible, while sampled tile-gradient
   validity remains authoritative. Deterministic tile splitting and the worker
   count keep coordinate vectors, decoded samples, and cell scratch under the
-  aggregate sample-memory budget; lower-level sampling uses one thread.
+  aggregate sample-memory budget; lower-level sampling uses one thread. Tiles
+  are paired for overlap reuse only when the staged pair fits that budget. Once
+  a tile's sampling, gradient, and compact-observation construction finish, its
+  cells enter one cooperative worker queue. Any extraction worker may fit a
+  ready cell, but the tile owner retains the immutable observations and waits
+  for every dependent cell before releasing them or advancing overlap reuse.
+  Sampling groups therefore remain the deterministic memory-ownership unit
+  while cell fitting is work-balanced independently.
   Results and worker failures are stored by canonical cell index, retain
   predicates and diagnostic aggregation run serially, and progress callbacks
   are serialized. The lowest-index cell failure is reported after all workers
@@ -3197,7 +3204,7 @@
   Benchmark comparisons must retain identical inputs, parameters, build type,
   and interval.
 - Benchmark and full replay extraction emit the same versioned
-  `fiberlet_extraction_profile version=17` key/value schema. The profile exposes
+  `fiberlet_extraction_profile version=20` key/value schema. The profile exposes
   deterministic workload counters and finer anchor/fiberlet phase timings.
   Enclosing phase fields are wall time, `_work_seconds` fields are summed
   worker/candidate time, and CPU fields are process CPU time. Corner insertion
@@ -3207,6 +3214,26 @@
   cost remains in its enclosing phase. Diagnostics must not change sampling,
   fitting, candidate generation, DP math, ordering, serialized artifacts, or
   determinism.
+- Version 20 replaces pair-local tile sampling groups with bounded exact-union
+  partitions. Tiles remain in canonical order. Each partition merges exact X
+  intervals for structured `(z,y)` rows, samples every union coordinate once
+  in deterministic bounded batches, joins sampling, and then copies contiguous
+  shared ranges into tile-local raw buffers. Large extractions stream through
+  multiple partitions rather than requiring the whole union to remain resident.
+  Sampling and fitting worker counts are admitted independently against
+  `maximumConcurrentSampleBytes`; shared samples, row metadata, sampler scratch,
+  batch/error control, ready-cell queue storage, timing storage, tile buffers,
+  gradients, compact observations, and per-cell scratch are included in the
+  reported maximum live-byte ceiling. Every sampler call receives one lower-
+  level thread. A failed batch is selected by batch order and assigned to its
+  partition cells so final failure propagation remains canonical by cell.
+  Tile owners retain immutable compact observations until all published cells
+  finish. Version 20 reports partition count and duration quantiles, shared
+  batch count/maximum size, shared-sampling wall/CPU, shared/accounted bytes,
+  and tile-copy worker time. Submitted voxels count partition unions; reused
+  voxels count tile occurrences not submitted. The exact whole-extraction tile
+  union remains a diagnostic and may be lower than submissions when bounded
+  partition boundaries repeat overlap.
 - Version 2 divides anchor fitting into exclusive summed-worker setup, seed
   generation, seed-pair refinement, initialized-component finalization, local
   direction/position refinement including backtracking, direction-conditioned

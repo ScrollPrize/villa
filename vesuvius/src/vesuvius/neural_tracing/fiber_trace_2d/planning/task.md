@@ -1,6 +1,6 @@
-# Task: re-merge fiber-lets2
+# Task: merge current fiber-lets2 speed improvements
 
-Commit the updated native Trace2CP benchmark records, then merge the latest
-`fiber-lets2` changes into `fiber-lets`. Clear stale task-local planning
-content and preserve the current anisotropic replay behavior while accepting
-the new fiberlet extraction performance work.
+Merge the current `fiber-lets2` branch into `fiber-lets` after committing the
+proposed fiberlet storage format. Retain the speed implementation and its
+durable specification, documentation, changelog, and tests. Clear conflicting
+task-local planning content and validate the merged C++ targets.

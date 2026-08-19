@@ -679,3 +679,13 @@
   compensated-double path. Canonical median objective work improved from 22.59
   to 13.86 worker-seconds and command wall from 9.56 to 9.17 seconds with
   byte-identical replay artifacts.
+
+# 2026-08-19: cooperative ready-cell anchor scheduling
+
+- Work-balanced prepared anchor cells across the bounded sampling-group worker
+  pool while retaining tile-local observation ownership and overlap reuse.
+  Canonical median anchor wall time improved from 5.067 to 4.262 seconds and
+  total wall time from 7.77 to 6.97 seconds with exact replay artifacts.
+- Replaced pair-local raw prediction reuse with bounded exact-union sampling
+  partitions. The canonical replay submitted 77% fewer prediction voxels;
+  median anchor CPU improved 12.1% and command wall 2.2% with exact artifacts.

@@ -1049,6 +1049,62 @@ TEST_CASE("fiberlet global sampling coordinates are invariant under batching and
     }
 }
 
+TEST_CASE("sparse bitmap corner finalization matches a serial reference")
+{
+    using Voxel = std::array<int64_t, 3>;
+    const auto check = [](const std::vector<std::vector<Voxel>>& sets) {
+        std::vector<Voxel> expected;
+        for (const auto& set : sets)
+            expected.insert(expected.end(), set.begin(), set.end());
+        const auto storedLess = [](const Voxel& left, const Voxel& right) {
+            return std::array{
+                       static_cast<size_t>(left[2]),
+                       static_cast<size_t>(left[1]),
+                       static_cast<size_t>(left[0])} <
+                std::array{
+                       static_cast<size_t>(right[2]),
+                       static_cast<size_t>(right[1]),
+                       static_cast<size_t>(right[0])};
+        };
+        std::sort(expected.begin(), expected.end(), storedLess);
+        expected.erase(std::unique(expected.begin(), expected.end()), expected.end());
+
+        CHECK(vc::fiber_tracer::testing::debugFinalizeFiberletCornerSets(sets) ==
+              expected);
+    };
+
+    SUBCASE("empty")
+    {
+        check({});
+        check({{}, {}, {}});
+    }
+    SUBCASE("overlapping")
+    {
+        check({
+            {{3, 2, 1}, {0, 0, 0}, {4, 2, 1}},
+            {{4, 2, 1}, {3, 2, 1}, {9, 0, 0}},
+            {{3, 2, 1}, {1, 5, 2}},
+        });
+    }
+    SUBCASE("duplicate heavy")
+    {
+        check({
+            std::vector<Voxel>(200, {7, 8, 9}),
+            std::vector<Voxel>(300, {7, 8, 9}),
+            {{7, 8, 8}, {7, 8, 9}, {7, 8, 10}},
+        });
+    }
+    SUBCASE("uneven")
+    {
+        std::vector<std::vector<Voxel>> sets(17);
+        for (int64_t index = 0; index < 1000; ++index)
+            sets[3].push_back({index % 13, index % 17, index % 19});
+        sets[0] = {{100, 1, 0}};
+        sets[16] = {{-1, 2, 3}, {100, 1, 0}};
+        check(sets);
+    }
+}
+
 TEST_CASE("fiberlet sparse replay domain rejects a disconnected corridor")
 {
     const auto anchors = twoAnchorArtifact();

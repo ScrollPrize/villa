@@ -689,7 +689,7 @@ sampling, search, and total wall times. Use identical manifests, fiber, options,
 build type, and interval for before/after performance comparisons.
 
 Benchmark and replay extraction also emit a versioned
-`fiberlet_extraction_profile version=17` row. Both commands use the same field
+`fiberlet_extraction_profile version=20` row. Both commands use the same field
 names and units. Replay writes the row to stderr after full tube extraction;
 benchmark writes it to stdout after the existing summary. The row separates:
 
@@ -888,21 +888,39 @@ It traverses the clipped cell's dense tile rows directly in canonical Z/Y/X
 order after constant-time tile-shape, bounds-containment, and owned-cardinality
 validation. Refinement continues to use the support indices and gradient bytes.
 
-Version 7 reports tile-halo sampling explicitly. Six-cell tiles are paired
-deterministically by maximum overlapping sample volume while preserving at
-least one independent job per pair. The first tile is sampled normally; the
-second copies bit-identical raw prediction samples from the overlap and submits
-only missing coordinates. Gradient construction, compact observations, and
-cell iteration remain tile-local and unchanged. Group memory includes both the
-active tile working set and retained raw samples and remains bounded by
-`maximumConcurrentSampleBytes`.
+Version 20 shares raw prediction samples across bounded exact-union partitions.
+Canonical-order tiles are partitioned conservatively so workloads larger than
+the sample-memory budget still stream. Within each partition, exact tile X
+ranges are merged per structured `(z,y)` row and stored in one contiguous
+float32 sample array. Deterministic bounded batches submit every partition-
+union coordinate once, using one lower-level sampler thread per batch. Sampling
+joins before any tile reads the shared array. Each tile then copies contiguous
+row ranges, constructs its gradients and compact observations locally, and
+publishes cells to the cooperative fitting queue. Its owner helps the same
+queue and retains the immutable observations until every dependent cell is
+complete.
 
-`anchor_sampling_groups` counts independent jobs,
-`anchor_reused_prediction_voxels` counts copied overlap,
-`anchor_submitted_prediction_voxels` counts actual sampler coordinates, and
-`anchor_unique_tile_prediction_voxels` is the exact global union of all dense
-tile boxes. The union is measured with a coordinate-compressed box sweep and
-does not alter extraction work.
+Sampling workers are bounded by shared storage plus concurrent coordinate and
+expanded-result scratch. Fitting workers are bounded separately by shared
+storage, the pre-reserved ready-cell queue, timing storage, and complete
+per-worker tile/gradient/observation/cell scratch. These allocations contribute
+to `anchor_max_accounted_live_bytes`; partitions are split rather than requiring
+the full extraction union to fit. `anchor_sampling_partitions` and partition
+duration quantiles expose the phase boundary. The profile also reports shared
+batch count/maximum size, shared-sampling wall/CPU, maximum shared bytes, and
+tile-copy worker time. `anchor_submitted_prediction_voxels` counts partition-
+union samples, `anchor_reused_prediction_voxels` is tile occurrences minus
+submissions, and `anchor_unique_tile_prediction_voxels` remains the exact whole-
+extraction union. Submitted and unique counts are equal for a one-partition
+workload; bounded partitions may resample overlap at their boundaries.
+
+On the canonical 5,000-base-voxel Paris4 replay, one partition reduced raw
+prediction submissions from 26,741,712 to the exact 6,162,456-voxel union.
+Against version 19, three warm QuickBuild runs reduced median anchor CPU from
+126.98 to 111.61 seconds, anchor wall from 4.262 to 4.069 seconds, and command
+wall from 6.97 to 6.82 seconds. Median peak RSS changed from 1,687,504 to
+1,675,944 KiB. Anchor and graph populations, DP work, failures, and the complete
+replay artifact remained exact.
 
 Version 8 replaces the per-candidate packed-node-key hash map with a direct
 `uint32_t` table over the already validated packed-key range. The table uses an

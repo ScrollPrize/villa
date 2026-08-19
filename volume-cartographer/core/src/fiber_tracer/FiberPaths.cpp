@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -28,7 +29,6 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 
 #include <opencv2/imgcodecs.hpp>
@@ -1149,10 +1149,130 @@ bool storedVoxelLess(const Voxel& left, const Voxel& right)
     return storedIndex(left) < storedIndex(right);
 }
 
+class SparseCornerBitmap {
+public:
+    static constexpr int64_t pageSize = 16;
+    static constexpr size_t pageSlotCount =
+        static_cast<size_t>(pageSize * pageSize * pageSize);
+    static constexpr size_t pageWordCount = pageSlotCount / 64;
+
+    struct Page {
+        std::array<uint64_t, pageWordCount> words{};
+    };
+
+    void insert(const Voxel& voxel)
+    {
+        const Voxel key = pageKey(voxel);
+        Page* page = nullptr;
+        if (lastPage_ != nullptr && key == lastKey_) {
+            ++samePageHits_;
+            page = lastPage_;
+        } else {
+            for (size_t index = 0; index < cacheSize_; ++index) {
+                if (cacheKeys_[index] == key) {
+                    ++cachedPageHits_;
+                    page = cachePages_[index];
+                    break;
+                }
+            }
+            if (page == nullptr) {
+                ++directoryProbes_;
+                auto [found, inserted] = pages_.try_emplace(key);
+                (void)inserted;
+                page = &found->second;
+                cacheKeys_[nextCacheSlot_] = key;
+                cachePages_[nextCacheSlot_] = page;
+                nextCacheSlot_ = (nextCacheSlot_ + 1) % cacheKeys_.size();
+                cacheSize_ = std::min(cacheSize_ + 1, cacheKeys_.size());
+            }
+            lastKey_ = key;
+            lastPage_ = page;
+        }
+        const size_t offset = localOffset(voxel);
+        const uint64_t bit = uint64_t{1} << (offset % 64);
+        uint64_t& word = page->words[offset / 64];
+        if ((word & bit) == 0) {
+            word |= bit;
+            ++uniqueVoxels_;
+        }
+    }
+
+    size_t uniqueVoxels() const noexcept { return uniqueVoxels_; }
+    size_t pageCount() const noexcept { return pages_.size(); }
+    size_t directoryProbes() const noexcept { return directoryProbes_; }
+    size_t samePageHits() const noexcept { return samePageHits_; }
+    size_t cachedPageHits() const noexcept { return cachedPageHits_; }
+
+    size_t payloadBytes() const
+    {
+        return checkedProduct(
+            pages_.size(), sizeof(std::pair<const Voxel, Page>),
+            "fiberlet corner page byte estimate");
+    }
+
+    const std::unordered_map<Voxel, Page, VoxelHash>& pages() const noexcept
+    {
+        return pages_;
+    }
+
+    void clear()
+    {
+        pages_.clear();
+        pages_.rehash(0);
+        lastPage_ = nullptr;
+        cacheSize_ = 0;
+        nextCacheSlot_ = 0;
+        uniqueVoxels_ = 0;
+    }
+
+    static size_t localOffset(const Voxel& voxel)
+    {
+        const auto local = [](int64_t value) {
+            int64_t remainder = value % pageSize;
+            if (remainder < 0)
+                remainder += pageSize;
+            return static_cast<size_t>(remainder);
+        };
+        return local(voxel[2]) *
+                static_cast<size_t>(pageSize * pageSize) +
+            local(voxel[1]) *
+                static_cast<size_t>(pageSize) +
+            local(voxel[0]);
+    }
+
+private:
+    static Voxel pageKey(const Voxel& voxel)
+    {
+        const auto page = [](int64_t value) {
+            int64_t quotient = value / pageSize;
+            if (value % pageSize < 0)
+                --quotient;
+            return quotient;
+        };
+        return {
+            page(voxel[0]),
+            page(voxel[1]),
+            page(voxel[2]),
+        };
+    }
+
+    std::unordered_map<Voxel, Page, VoxelHash> pages_;
+    Voxel lastKey_{};
+    Page* lastPage_ = nullptr;
+    std::array<Voxel, 8> cacheKeys_{};
+    std::array<Page*, 8> cachePages_{};
+    size_t cacheSize_ = 0;
+    size_t nextCacheSlot_ = 0;
+    size_t uniqueVoxels_ = 0;
+    size_t directoryProbes_ = 0;
+    size_t samePageHits_ = 0;
+    size_t cachedPageHits_ = 0;
+};
+
 void addInterpolationCorners(
     const cv::Vec3f& point,
     const FiberPredictionGridInfo& grid,
-    std::unordered_set<Voxel, VoxelHash>& corners,
+    SparseCornerBitmap& corners,
     size_t& insertionAttempts)
 {
     forEachInterpolationCorner(point, grid, [&](const Voxel& corner, float) {
@@ -1167,7 +1287,7 @@ PreparedCandidate prepareCandidate(
     int cellSize,
     const FiberletPathConfig& config,
     const FiberletPointPredicate& pointPredicate,
-    std::unordered_set<Voxel, VoxelHash>& corners,
+    SparseCornerBitmap& corners,
     PreparationProfile& profile)
 {
     PreparedCandidate prepared;
@@ -1209,13 +1329,91 @@ PreparedCandidate prepareCandidate(
     return prepared;
 }
 
-std::vector<Voxel> mergeSortedUnique(const std::vector<Voxel>& left, const std::vector<Voxel>& right)
+struct FinalizedCorners {
+    std::vector<Voxel> voxels;
+    size_t mergedPages = 0;
+    size_t peakTransientBytes = 0;
+};
+
+FinalizedCorners finalizeCornerSets(
+    std::vector<SparseCornerBitmap>& cornerSets,
+    size_t cornerSetBytes)
 {
-    std::vector<Voxel> merged;
-    merged.reserve(checkedSum(left.size(), right.size(), "fiberlet corner merge size"));
-    std::merge(left.begin(), left.end(), right.begin(), right.end(), std::back_inserter(merged), storedVoxelLess);
-    merged.erase(std::unique(merged.begin(), merged.end()), merged.end());
-    return merged;
+    FinalizedCorners result;
+    if (cornerSets.empty())
+        return result;
+    struct StoredPageLess {
+        bool operator()(const Voxel& left, const Voxel& right) const
+        {
+            return storedVoxelLess(left, right);
+        }
+    };
+    std::map<Voxel, SparseCornerBitmap::Page, StoredPageLess> mergedPages;
+    for (const auto& cornerSet : cornerSets) {
+        for (const auto& [key, page] : cornerSet.pages()) {
+            auto [found, inserted] = mergedPages.try_emplace(key);
+            if (inserted) {
+                found->second = page;
+            } else {
+                for (size_t word = 0; word < page.words.size(); ++word)
+                    found->second.words[word] |= page.words[word];
+            }
+        }
+    }
+    result.mergedPages = mergedPages.size();
+    const size_t mergedPageBytes = checkedProduct(
+        mergedPages.size(),
+        sizeof(std::pair<const Voxel, SparseCornerBitmap::Page>),
+        "fiberlet merged corner page byte estimate");
+    result.peakTransientBytes = checkedSum(
+        cornerSetBytes, mergedPageBytes,
+        "fiberlet corner finalization byte estimate");
+    for (auto& cornerSet : cornerSets)
+        cornerSet.clear();
+    cornerSets.clear();
+    cornerSets.shrink_to_fit();
+
+    size_t uniqueVoxels = 0;
+    for (const auto& [key, page] : mergedPages) {
+        (void)key;
+        for (const uint64_t word : page.words)
+            uniqueVoxels = checkedSum(
+                uniqueVoxels, static_cast<size_t>(std::popcount(word)),
+                "fiberlet unique corner count");
+    }
+    result.voxels.reserve(uniqueVoxels);
+    for (const auto& [key, page] : mergedPages) {
+        for (size_t wordIndex = 0; wordIndex < page.words.size(); ++wordIndex) {
+            uint64_t bits = page.words[wordIndex];
+            while (bits != 0) {
+                const size_t bit = static_cast<size_t>(std::countr_zero(bits));
+                const size_t offset = wordIndex * 64 + bit;
+                const int64_t x = static_cast<int64_t>(offset % SparseCornerBitmap::pageSize);
+                const int64_t y = static_cast<int64_t>(
+                    (offset / SparseCornerBitmap::pageSize) %
+                    SparseCornerBitmap::pageSize);
+                const int64_t z = static_cast<int64_t>(
+                    offset /
+                    (SparseCornerBitmap::pageSize * SparseCornerBitmap::pageSize));
+                result.voxels.push_back({
+                    key[0] * SparseCornerBitmap::pageSize + x,
+                    key[1] * SparseCornerBitmap::pageSize + y,
+                    key[2] * SparseCornerBitmap::pageSize + z,
+                });
+                bits &= bits - 1;
+            }
+        }
+    }
+    std::sort(result.voxels.begin(), result.voxels.end(), storedVoxelLess);
+    result.peakTransientBytes = std::max(
+        result.peakTransientBytes,
+        checkedSum(
+            mergedPageBytes,
+            checkedProduct(
+                result.voxels.capacity(), sizeof(Voxel),
+                "fiberlet finalized corner byte estimate"),
+            "fiberlet corner finalization byte estimate"));
+    return result;
 }
 
 size_t preparedPayloadBytes(const std::vector<PreparedCandidate>& prepared)
@@ -2850,7 +3048,7 @@ FiberletPathReport traceFiberletPaths(
     std::vector<PreparedCandidate> prepared(searchCandidateIndices.size());
     std::vector<PreparationProfile> preparationProfiles(
         searchCandidateIndices.size());
-    std::vector<std::unordered_set<Voxel, VoxelHash>> workerCorners(workerCount);
+    std::vector<SparseCornerBitmap> workerCorners(workerCount);
     std::vector<std::exception_ptr> errors(searchCandidateIndices.size());
 
     const auto preparationStart = Clock::now();
@@ -2965,9 +3163,24 @@ FiberletPathReport traceFiberletPaths(
         "fiberlet concurrent search transient byte estimate");
     size_t workerCornerBytes = 0;
     for (const auto& corners : workerCorners) {
+        report.cornerWorkerUniqueVoxels = checkedSum(
+            report.cornerWorkerUniqueVoxels, corners.uniqueVoxels(),
+            "fiberlet worker unique corner count");
+        report.cornerWorkerPages = checkedSum(
+            report.cornerWorkerPages, corners.pageCount(),
+            "fiberlet worker corner page count");
+        report.cornerPageDirectoryProbes = checkedSum(
+            report.cornerPageDirectoryProbes, corners.directoryProbes(),
+            "fiberlet corner page directory probe count");
+        report.cornerSamePageHits = checkedSum(
+            report.cornerSamePageHits, corners.samePageHits(),
+            "fiberlet corner same-page hit count");
+        report.cornerCachedPageHits = checkedSum(
+            report.cornerCachedPageHits, corners.cachedPageHits(),
+            "fiberlet corner cached-page hit count");
         workerCornerBytes = checkedSum(
             workerCornerBytes,
-            checkedProduct(corners.size(), sizeof(Voxel), "fiberlet corner byte estimate"),
+            corners.payloadBytes(),
             "fiberlet corner byte estimate");
     }
     report.estimatedPeakOwnedBytes = checkedSum(preparedBytes, workerCornerBytes, "fiberlet peak owned byte estimate");
@@ -2979,65 +3192,15 @@ FiberletPathReport traceFiberletPaths(
     const auto cornerMergeStart = Clock::now();
     const double cornerMergeCpuStart = processCpuSeconds();
     reportProgress("corner_merge", 0, workerCorners.size(), cornerMergeStart, true);
-    std::vector<std::vector<Voxel>> cornerVectors(workerCorners.size());
-    for (size_t index = 0; index < workerCorners.size(); ++index) {
-        cornerVectors[index].assign(workerCorners[index].begin(), workerCorners[index].end());
-        std::sort(cornerVectors[index].begin(), cornerVectors[index].end(), storedVoxelLess);
-    }
-    size_t sortedCornerBytes = 0;
-    for (const auto& corners : cornerVectors) {
-        sortedCornerBytes = checkedSum(
-            sortedCornerBytes,
-            checkedProduct(corners.capacity(), sizeof(Voxel), "fiberlet sorted corner byte estimate"),
-            "fiberlet sorted corner byte estimate");
-    }
+    auto finalizedCorners = finalizeCornerSets(
+        workerCorners, workerCornerBytes);
     report.estimatedPeakOwnedBytes = std::
         max(report.estimatedPeakOwnedBytes,
             checkedSum(
-                checkedSum(preparedBytes, workerCornerBytes, "fiberlet peak owned byte estimate"),
-                sortedCornerBytes,
+                preparedBytes, finalizedCorners.peakTransientBytes,
                 "fiberlet peak owned byte estimate"));
-    workerCorners.clear();
-    workerCorners.shrink_to_fit();
-    while (cornerVectors.size() > 1) {
-        const size_t pairCount = cornerVectors.size() / 2;
-        std::vector<std::vector<Voxel>> next((cornerVectors.size() + 1) / 2);
-        std::atomic<size_t> nextPair{0};
-        std::vector<std::exception_ptr> mergeErrors(pairCount);
-        const auto mergeWorker = [&]() {
-            while (true) {
-                const size_t pair = nextPair.fetch_add(1, std::memory_order_relaxed);
-                if (pair >= pairCount)
-                    return;
-                try {
-                    next[pair] = mergeSortedUnique(cornerVectors[pair * 2], cornerVectors[pair * 2 + 1]);
-                } catch (...) {
-                    mergeErrors[pair] = std::current_exception();
-                }
-            }
-        };
-        const size_t mergeWorkers = std::min(pairCount, static_cast<size_t>(report.config.parallelThreads));
-        if (mergeWorkers == 1) {
-            mergeWorker();
-        } else {
-            std::vector<std::thread> workers;
-            workers.reserve(mergeWorkers);
-            for (size_t index = 0; index < mergeWorkers; ++index)
-                workers.emplace_back(mergeWorker);
-            for (auto& thread : workers)
-                thread.join();
-        }
-        for (const auto& error : mergeErrors) {
-            if (error)
-                std::rethrow_exception(error);
-        }
-        if (cornerVectors.size() % 2 != 0)
-            next.back() = std::move(cornerVectors.back());
-        cornerVectors = std::move(next);
-    }
-    std::vector<Voxel> orderedVoxels;
-    if (!cornerVectors.empty())
-        orderedVoxels = std::move(cornerVectors.front());
+    std::vector<Voxel> orderedVoxels = std::move(finalizedCorners.voxels);
+    report.cornerMergedPages = finalizedCorners.mergedPages;
     reportProgress("corner_merge", workerCount, workerCount, cornerMergeStart, true);
     report.cornerMergeSeconds = std::chrono::duration<double>(Clock::now() - cornerMergeStart).count();
     report.cornerMergeCpuSeconds = processCpuSeconds() - cornerMergeCpuStart;
@@ -3869,6 +4032,22 @@ FiberletCorridorContainmentDebug debugFiberletCorridorContains(
         point, reference, radius * radius, adjacentSegment,
         result.segmentTests);
     return result;
+}
+
+std::vector<std::array<int64_t, 3>> debugFinalizeFiberletCornerSets(
+    const std::vector<std::vector<std::array<int64_t, 3>>>& cornerSets)
+{
+    std::vector<SparseCornerBitmap> uniqueSets(cornerSets.size());
+    size_t cornerSetBytes = 0;
+    for (size_t index = 0; index < cornerSets.size(); ++index) {
+        for (const auto& corner : cornerSets[index])
+            uniqueSets[index].insert(corner);
+        cornerSetBytes = checkedSum(
+            cornerSetBytes, uniqueSets[index].payloadBytes(),
+            "fiberlet test corner byte estimate");
+    }
+    return finalizeCornerSets(uniqueSets, cornerSetBytes)
+        .voxels;
 }
 
 }  // namespace testing

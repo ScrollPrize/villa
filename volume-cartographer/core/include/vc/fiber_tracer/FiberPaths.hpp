@@ -6,6 +6,7 @@
 #include <array>
 #include <compare>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <optional>
@@ -182,6 +183,12 @@ struct FiberletPathReport {
     size_t nodePointPredicateCalls = 0;
     size_t retainedSearchNodes = 0;
     size_t interpolationCornerInsertions = 0;
+    size_t cornerWorkerUniqueVoxels = 0;
+    size_t cornerWorkerPages = 0;
+    size_t cornerPageDirectoryProbes = 0;
+    size_t cornerSamePageHits = 0;
+    size_t cornerCachedPageHits = 0;
+    size_t cornerMergedPages = 0;
     size_t interpolatedScoringPoints = 0;
     size_t endpointScoringInterpolations = 0;
     size_t lazyNodeScoringRequests = 0;
@@ -318,6 +325,10 @@ struct FiberletCorridorContainmentDebug {
     const std::vector<cv::Vec3f>& reference,
     float radius,
     std::optional<size_t> adjacentSegment = std::nullopt);
+
+[[nodiscard]] std::vector<std::array<int64_t, 3>>
+debugFinalizeFiberletCornerSets(
+    const std::vector<std::vector<std::array<int64_t, 3>>>& cornerSets);
 
 }  // namespace testing
 #endif

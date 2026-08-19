@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -19,8 +20,11 @@
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <mutex>
 #include <random>
+#include <set>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -1817,15 +1821,19 @@ TEST_CASE("fiber anchor extraction preserves robust membership during axial peak
 TEST_CASE("fiber anchor extraction halo encloses every oblique peak kernel")
 {
     auto options = config();
-    std::array<size_t, 3> selectedMinimum{};
+    std::array<size_t, 3> selectedMinimum{
+        std::numeric_limits<size_t>::max(),
+        std::numeric_limits<size_t>::max(),
+        std::numeric_limits<size_t>::max()};
     std::array<size_t, 3> selectedMaximum{};
-    size_t calls = 0;
     const auto report = vc::fiber_tracer::extractRefinedFiberAnchorsForCells(
         {{80, 80, 80}, 1.0}, options,
         [&](const auto& indices, int, auto& samples) {
-            if (calls++ == 0) {
-                selectedMinimum = indices.front();
-                selectedMaximum = indices.back();
+            for (size_t axis = 0; axis < 3; ++axis) {
+                selectedMinimum[axis] = std::min(
+                    selectedMinimum[axis], indices.front()[axis]);
+                selectedMaximum[axis] = std::max(
+                    selectedMaximum[axis], indices.back()[axis]);
             }
             samples.assign(indices.size(), {
                 cv::Vec3d{1.0 / std::sqrt(3.0),
@@ -1848,13 +1856,19 @@ TEST_CASE("fiber anchor extraction halo encloses every oblique peak kernel")
     CHECK(selectedMaximum == std::array<size_t, 3>{56, 56, 56});
 
     options.peakGradientWeight = 0.0;
-    calls = 0;
+    selectedMinimum = {
+        std::numeric_limits<size_t>::max(),
+        std::numeric_limits<size_t>::max(),
+        std::numeric_limits<size_t>::max()};
+    selectedMaximum = {};
     const auto noGradientReport = vc::fiber_tracer::extractRefinedFiberAnchorsForCells(
         {{80, 80, 80}, 1.0}, options,
         [&](const auto& indices, int, auto& samples) {
-            if (calls++ == 0) {
-                selectedMinimum = indices.front();
-                selectedMaximum = indices.back();
+            for (size_t axis = 0; axis < 3; ++axis) {
+                selectedMinimum[axis] = std::min(
+                    selectedMinimum[axis], indices.front()[axis]);
+                selectedMaximum[axis] = std::max(
+                    selectedMaximum[axis], indices.back()[axis]);
             }
             samples.assign(indices.size(), {
                 cv::Vec3d{1.0, 0.0, 0.0}, 0.0, true});
@@ -2170,7 +2184,9 @@ TEST_CASE("fiber anchor artifacts are deterministic across outer worker counts")
     const auto first = vc::fiber_tracer::extractFiberAnchors(grid, one, sampler);
     const auto second = vc::fiber_tracer::extractFiberAnchors(grid, two, sampler);
     CHECK(allSamplerCallsSingleThreaded.load());
-    CHECK(samplerCalls.load() == 2);
+    CHECK(samplerCalls.load() ==
+          first.profile.predictionSamplerCalls +
+              second.profile.predictionSamplerCalls);
     vc::fiber_tracer::FiberAnchorArtifactInfo artifact;
     artifact.sourceLocator = "/tmp/fiber.lasagna.json";
     artifact.manifestContentHash = "fnv1a64:0123456789abcdef";
@@ -2227,8 +2243,9 @@ TEST_CASE("adjacent anchor cells share one dense tile sample")
             {{8, 8, 8}, {8, 8, 9}, {8, 9, 8}, {9, 8, 8}});
 
     CHECK(report.diagnostics.totalCells == 4);
-    CHECK(samplerCalls.load() == 1);
-    CHECK(submittedSamples.load() < 4 * 46 * 46 * 46);
+    CHECK(samplerCalls.load() == report.profile.predictionSamplerCalls);
+    CHECK(submittedSamples.load() ==
+          report.profile.uniqueTilePredictionVoxels);
 }
 
 TEST_CASE("fiber anchor extraction enforces its concurrent sample budget")
@@ -2620,10 +2637,12 @@ TEST_CASE("explicit anchor cells remain sparse and filter refinement before NMS"
           report.profile.selectedCells + report.profile.contextCells);
     CHECK(report.profile.contextCells > 0);
     CHECK(report.profile.tiles > 0);
-    CHECK(report.profile.samplingGroups > 0);
-    CHECK(report.profile.samplingGroups <= report.profile.tiles);
+    CHECK(report.profile.samplingPartitions > 0);
+    CHECK(report.profile.samplingPartitions <= report.profile.tiles);
     CHECK(report.profile.workers > 0);
-    CHECK(report.profile.predictionSamplerCalls == report.profile.tiles);
+    CHECK(report.profile.predictionSamplerCalls ==
+          report.profile.sharedSamplingBatches);
+    CHECK(report.profile.maximumSamplingBatchVoxels > 0);
     CHECK(report.profile.submittedPredictionVoxels > 0);
     CHECK(report.profile.uniqueTilePredictionVoxels > 0);
     CHECK(report.profile.uniqueTilePredictionVoxels <=
@@ -2654,6 +2673,21 @@ TEST_CASE("explicit anchor cells remain sparse and filter refinement before NMS"
     CHECK(report.profile.gradientConstructionWorkSeconds >= 0.0);
     CHECK(report.profile.observationConstructionWorkSeconds >= 0.0);
     CHECK(report.profile.fittingWorkSeconds >= 0.0);
+    CHECK(report.profile.partitionMaximumSeconds >=
+          report.profile.partitionP95Seconds);
+    CHECK(report.profile.partitionP95Seconds >=
+          report.profile.partitionP50Seconds);
+    CHECK(report.profile.partitionMaximumSeconds > 0.0);
+    CHECK(report.profile.tilePreparationMaximumSeconds >=
+          report.profile.tilePreparationP95Seconds);
+    CHECK(report.profile.tilePreparationP95Seconds >=
+          report.profile.tilePreparationP50Seconds);
+    CHECK(report.profile.tilePreparationMaximumSeconds > 0.0);
+    CHECK(report.profile.cellProcessingMaximumSeconds >=
+          report.profile.cellProcessingP95Seconds);
+    CHECK(report.profile.cellProcessingP95Seconds >=
+          report.profile.cellProcessingP50Seconds);
+    CHECK(report.profile.cellProcessingMaximumSeconds > 0.0);
     CHECK(report.profile.fit.invocations == report.profile.workCells);
     CHECK(report.profile.fit.nonemptyCells > 0);
     CHECK(report.profile.fit.nonemptyCells <= report.profile.fit.invocations);
@@ -2817,7 +2851,7 @@ TEST_CASE("anchor support stencil falls back only for clipped cells")
     }
 }
 
-TEST_CASE("adjacent anchor tile groups reuse overlapping prediction halos")
+TEST_CASE("adjacent anchor tiles share extraction-wide prediction samples")
 {
     vc::fiber_tracer::FiberPredictionGridInfo grid;
     grid.shapeZYX = {32, 8, 8};
@@ -2838,10 +2872,147 @@ TEST_CASE("adjacent anchor tile groups reuse overlapping prediction halos")
         {{5, 1, 1}, {6, 1, 1}});
 
     CHECK(report.profile.tiles >= 2);
-    CHECK(report.profile.samplingGroups < report.profile.tiles);
+    CHECK(report.profile.samplingPartitions == 1);
     CHECK(report.profile.reusedPredictionVoxels > 0);
-    CHECK(report.profile.uniqueTilePredictionVoxels <=
+    CHECK(report.profile.uniqueTilePredictionVoxels ==
           report.profile.submittedPredictionVoxels);
+}
+
+TEST_CASE("anchor partitions submit each shared prediction voxel once")
+{
+    auto value = config();
+    value.localWindowRadiusPredictionVoxels = 2.0;
+    value.peakGradientWeight = 0.0;
+    value.parallelThreads = 4;
+    std::mutex sampledMutex;
+    std::set<std::array<size_t, 3>> sampledCoordinates;
+    bool duplicate = false;
+    const auto report = vc::fiber_tracer::extractRefinedFiberAnchorsForCells(
+        {{96, 32, 32}, 1.0}, value,
+        [&](const auto& indices, int threads, auto& samples) {
+            CHECK(threads == 1);
+            {
+                std::lock_guard lock(sampledMutex);
+                for (const auto& index : indices) {
+                    if (!sampledCoordinates.insert(index).second)
+                        duplicate = true;
+                }
+            }
+            samples.assign(indices.size(), {
+                cv::Vec3d{1.0, 0.0, 0.0}, 1.0, true});
+        },
+        {{5, 4, 4}, {6, 4, 4}, {12, 4, 4}});
+
+    CHECK_FALSE(duplicate);
+    CHECK(report.profile.samplingPartitions == 1);
+    CHECK(sampledCoordinates.size() ==
+          report.profile.submittedPredictionVoxels);
+    CHECK(report.profile.submittedPredictionVoxels ==
+          report.profile.uniqueTilePredictionVoxels);
+    CHECK(report.profile.reusedPredictionVoxels > 0);
+    CHECK(report.profile.maximumSharedSampleBytes > 0);
+    CHECK(report.profile.maximumAccountedLiveBytes >=
+          report.profile.maximumSharedSampleBytes);
+}
+
+TEST_CASE("anchor sampling streams exact unions through bounded partitions")
+{
+    auto value = config();
+    value.localWindowRadiusPredictionVoxels = 2.0;
+    value.peakGradientWeight = 0.0;
+    value.parallelThreads = 1;
+    const auto sampler = [](const auto& indices, int threads, auto& samples) {
+        CHECK(threads == 1);
+        samples.assign(indices.size(), {
+            cv::Vec3d{1.0, 0.0, 0.0}, 1.0, true});
+    };
+    const vc::fiber_tracer::FiberPredictionGridInfo grid{{128, 64, 64}, 1.0};
+    const auto one = vc::fiber_tracer::extractRefinedFiberAnchorsForCells(
+        grid, value, sampler, {{8, 8, 8}});
+    const std::vector<std::array<size_t, 3>> cells{
+        {8, 8, 8}, {14, 8, 8}, {20, 8, 8}};
+    const auto unbounded =
+        vc::fiber_tracer::extractRefinedFiberAnchorsForCells(
+            grid, value, sampler, cells);
+    auto bounded = value;
+    bounded.maximumConcurrentSampleBytes =
+        one.profile.maximumAccountedLiveBytes +
+        one.profile.maximumSharedSampleBytes;
+    const auto streamed =
+        vc::fiber_tracer::extractRefinedFiberAnchorsForCells(
+            grid, bounded, sampler, cells);
+
+    CHECK(unbounded.profile.samplingPartitions == 1);
+    CHECK(streamed.profile.samplingPartitions > 1);
+    CHECK(streamed.profile.maximumAccountedLiveBytes <=
+          bounded.maximumConcurrentSampleBytes);
+    vc::fiber_tracer::FiberAnchorArtifactInfo artifact;
+    artifact.sourceLocator = "fiber.lasagna.json";
+    artifact.manifestContentHash = "fnv1a64:0123456789abcdef";
+    CHECK(vc::fiber_tracer::fiberAnchorReportJson(unbounded, artifact).dump() ==
+          vc::fiber_tracer::fiberAnchorReportJson(streamed, artifact).dump());
+}
+
+TEST_CASE("anchor shared sampling rejects wrong result sizes")
+{
+    auto value = config();
+    value.parallelThreads = 4;
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::extractRefinedFiberAnchorsForCells(
+            {{80, 80, 80}, 1.0}, value,
+            [](const auto&, int, auto& samples) { samples.clear(); },
+            {{8, 8, 8}}),
+        doctest::Contains("wrong sample count"), std::runtime_error);
+}
+
+TEST_CASE("anchor shared sampling reports the earliest canonical batch failure")
+{
+    auto value = config();
+    value.parallelThreads = 2;
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::extractRefinedFiberAnchorsForCells(
+            {{80, 80, 80}, 1.0}, value,
+            [](const auto& indices, int threads, auto&) {
+                CHECK(threads == 1);
+                if (indices.front() ==
+                    std::array<size_t, 3>{11, 11, 11}) {
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(20));
+                    throw std::runtime_error("canonical batch failed");
+                }
+                throw std::runtime_error("later batch failed");
+            },
+            {{8, 8, 8}}),
+        doctest::Contains("canonical batch failed"), std::runtime_error);
+}
+
+TEST_CASE("anchor sampling failures preserve canonical partition precedence")
+{
+    auto value = config();
+    value.peakGradientWeight = 0.0;
+    value.parallelThreads = 2;
+    const vc::fiber_tracer::FiberPredictionGridInfo grid{{128, 64, 64}, 1.0};
+    const auto successfulSampler = [](
+        const auto& indices, int, auto& samples) {
+        samples.assign(indices.size(), {
+            cv::Vec3d{1.0, 0.0, 0.0}, 1.0, true});
+    };
+    const auto one = vc::fiber_tracer::extractRefinedFiberAnchorsForCells(
+        grid, value, successfulSampler, {{8, 8, 8}});
+    value.maximumConcurrentSampleBytes =
+        one.profile.maximumAccountedLiveBytes +
+        one.profile.maximumSharedSampleBytes;
+
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::extractRefinedFiberAnchorsForCells(
+            grid, value,
+            [](const auto& indices, int, auto&) {
+                if (indices.front()[0] < 30)
+                    throw std::runtime_error("canonical partition failed");
+                throw std::runtime_error("later partition failed");
+            },
+            {{8, 8, 8}, {14, 8, 8}, {20, 8, 8}}),
+        doctest::Contains("canonical partition failed"), std::runtime_error);
 }
 
 TEST_CASE("anchor diagnostics retain unavailable attempts in zero-anchor cells")
