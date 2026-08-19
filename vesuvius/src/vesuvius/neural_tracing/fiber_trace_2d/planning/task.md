@@ -252,3 +252,13 @@ the equations; public callers prepare on demand, while the DP stores only a
 stack-local prepared descriptor. Retain the checkpoint only if exact branch
 coverage and byte-identical replay output hold and alternating canonical
 measurements show a repeatable enclosing gain.
+
+Checkpoint 37 will prepare the reusable sides of multiplicative alignment
+scoring. Current-side prediction orientation and its previous-direction factor
+will be prepared once per reached incoming state; candidate-side prediction
+orientation, presence, and candidate-direction factor will be prepared once
+per valid outgoing edge. Pair-dependent dot products and the original seven-
+factor multiplication order remain in the transition loop. The shared local
+scorer remains the sole owner of the equations, public callers continue to
+prepare on demand, and retention requires exact replay output plus a repeatable
+fiberlet-DP gain.

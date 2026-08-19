@@ -8,6 +8,9 @@
   edge and reused it across incoming states. Canonical search wall and DP worker
   time improved about 2.0% and 2.1%, respectively, with byte-identical replay
   artifacts.
+- Prepared current-side and candidate-side multiplicative alignment inputs at
+  their natural DP reuse boundaries. Canonical search wall and DP worker time
+  improved another 2.3% each with byte-identical replay artifacts.
 
 # 2026-08-18: solve-local fiberlet DP reuse
 

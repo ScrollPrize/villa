@@ -68,6 +68,32 @@ static inline float fiberLocalAlignmentLossInline(
     return 1.0f - score;
 }
 
+struct FiberLocalPreparedIncomingAlignment {
+    cv::Vec3f previousDirection{0.0f, 0.0f, 0.0f};
+    cv::Vec3f currentPredictionDirection{0.0f, 0.0f, 0.0f};
+    float previousCurrentAlignment = 0.0f;
+};
+
+static inline FiberLocalPreparedIncomingAlignment
+prepareFiberLocalIncomingAlignmentInline(
+    const FiberLocalMetricSample* currentPrediction,
+    const cv::Vec3f& previousStepDirection)
+{
+    FiberLocalPreparedIncomingAlignment prepared;
+    prepared.previousDirection = previousStepDirection;
+    prepared.currentPredictionDirection = previousStepDirection;
+    if (currentPrediction != nullptr && currentPrediction->valid) {
+        prepared.currentPredictionDirection = currentPrediction->direction;
+        if (prepared.currentPredictionDirection.dot(previousStepDirection) <
+            0.0f) {
+            prepared.currentPredictionDirection *= -1.0f;
+        }
+    }
+    prepared.previousCurrentAlignment = clampFiberLocalPositiveUnit(
+        previousStepDirection.dot(prepared.currentPredictionDirection));
+    return prepared;
+}
+
 enum class FiberLocalPreparedCandidateSmoothnessMode : std::uint8_t {
     InvalidDirection,
     IsotropicFallback,
@@ -81,6 +107,14 @@ struct FiberLocalPreparedCandidateSmoothness {
     float normalAngle = 0.0f;
     FiberLocalPreparedCandidateSmoothnessMode mode =
         FiberLocalPreparedCandidateSmoothnessMode::InvalidDirection;
+};
+
+struct FiberLocalPreparedCandidateMetric {
+    cv::Vec3f direction{0.0f, 0.0f, 0.0f};
+    cv::Vec3f predictionDirection{0.0f, 0.0f, 0.0f};
+    float presence = 0.0f;
+    float directionPredictionAlignment = 0.0f;
+    FiberLocalPreparedCandidateSmoothness smoothness;
 };
 
 static inline FiberLocalPreparedCandidateSmoothness
@@ -109,6 +143,57 @@ prepareFiberLocalCandidateSmoothnessInline(
         ? FiberLocalPreparedCandidateSmoothnessMode::NormalAware
         : FiberLocalPreparedCandidateSmoothnessMode::NormalAwareDegenerateTangent;
     return prepared;
+}
+
+static inline FiberLocalPreparedCandidateMetric
+prepareFiberLocalCandidateMetricInline(
+    const FiberLocalMetricSample& candidatePrediction,
+    const cv::Vec3f& candidateStepDirection,
+    const FiberLocalPreparedCandidateSmoothness& smoothness)
+{
+    FiberLocalPreparedCandidateMetric prepared;
+    prepared.direction = candidateStepDirection;
+    prepared.predictionDirection = candidatePrediction.direction;
+    if (prepared.predictionDirection.dot(candidateStepDirection) < 0.0f)
+        prepared.predictionDirection *= -1.0f;
+    prepared.presence = clampFiberLocalPositiveUnit(
+        candidatePrediction.presence);
+    prepared.directionPredictionAlignment = clampFiberLocalPositiveUnit(
+        candidateStepDirection.dot(prepared.predictionDirection));
+    prepared.smoothness = smoothness;
+    return prepared;
+}
+
+static inline FiberLocalPreparedCandidateMetric
+prepareFiberLocalCandidateMetricInline(
+    const FiberLocalMetricSample& candidatePrediction,
+    const cv::Vec3f& candidateStepDirection,
+    const cv::Vec3f& normal,
+    bool normalValid)
+{
+    return prepareFiberLocalCandidateMetricInline(
+        candidatePrediction, candidateStepDirection,
+        prepareFiberLocalCandidateSmoothnessInline(
+            candidateStepDirection, normal, normalValid));
+}
+
+static inline float fiberLocalAlignmentLossPreparedInline(
+    const FiberLocalPreparedIncomingAlignment& incoming,
+    const FiberLocalPreparedCandidateMetric& candidate)
+{
+    float score = candidate.presence;
+    score *= clampFiberLocalPositiveUnit(
+        incoming.previousDirection.dot(candidate.direction));
+    score *= incoming.previousCurrentAlignment;
+    score *= clampFiberLocalPositiveUnit(
+        incoming.previousDirection.dot(candidate.predictionDirection));
+    score *= clampFiberLocalPositiveUnit(
+        incoming.currentPredictionDirection.dot(candidate.direction));
+    score *= clampFiberLocalPositiveUnit(
+        incoming.currentPredictionDirection.dot(
+            candidate.predictionDirection));
+    score *= candidate.directionPredictionAlignment;
+    return 1.0f - score;
 }
 
 static inline FiberLocalSmoothnessCost
@@ -180,6 +265,30 @@ static inline FiberLocalSmoothnessCost fiberLocalSmoothnessCostInline(
 }
 
 static inline FiberLocalMetricCost
+fiberLocalMetricCostFullyPreparedInline(
+    const FiberLocalPreparedIncomingAlignment& incoming,
+    float previousStepLength,
+    float candidateStepLength,
+    const FiberLocalPreparedCandidateMetric& candidate,
+    const FiberLocalMetricConfig& config)
+{
+    FiberLocalMetricCost cost;
+    cost.alignment = fiberLocalAlignmentLossPreparedInline(
+        incoming, candidate) * std::max(0.0f, candidateStepLength);
+    const auto smoothness = fiberLocalSmoothnessCostCandidatePreparedInline(
+        incoming.previousDirection, candidate.direction,
+        candidate.smoothness, config.smoothness);
+    const float effectiveLength = std::max(
+        1.0f,
+        (std::max(0.0f, previousStepLength) +
+         std::max(0.0f, candidateStepLength)) * 0.5f);
+    cost.isotropicSmoothness = smoothness.isotropic / effectiveLength;
+    cost.tangentSmoothness = smoothness.tangent / effectiveLength;
+    cost.normalSmoothness = smoothness.normal / effectiveLength;
+    return cost;
+}
+
+static inline FiberLocalMetricCost
 fiberLocalMetricCostCandidatePreparedInline(
     const FiberLocalMetricSample* currentPrediction,
     const FiberLocalMetricSample& candidatePrediction,
@@ -196,30 +305,13 @@ fiberLocalMetricCostCandidatePreparedInline(
                                  std::max(0.0f, candidateStepLength);
         return cost;
     }
-    const cv::Vec3f& previous = previousStepUnitDirection;
-    const cv::Vec3f& candidate = candidateStepUnitDirection;
-    cv::Vec3f currentAxis = previous;
-    if (currentPrediction != nullptr && currentPrediction->valid) {
-        currentAxis = currentPrediction->direction;
-        if (currentAxis.dot(previous) < 0.0f)
-            currentAxis *= -1.0f;
-    }
-    cv::Vec3f candidateAxis = candidatePrediction.direction;
-    if (candidateAxis.dot(candidate) < 0.0f)
-        candidateAxis *= -1.0f;
-    cost.alignment = fiberLocalAlignmentLossInline(
-        candidatePrediction.presence, previous, candidate,
-        currentAxis, candidateAxis) * std::max(0.0f, candidateStepLength);
-    const auto smoothness = fiberLocalSmoothnessCostCandidatePreparedInline(
-        previous, candidate, candidateSmoothness, config.smoothness);
-    const float effectiveLength = std::max(
-        1.0f,
-        (std::max(0.0f, previousStepLength) +
-         std::max(0.0f, candidateStepLength)) * 0.5f);
-    cost.isotropicSmoothness = smoothness.isotropic / effectiveLength;
-    cost.tangentSmoothness = smoothness.tangent / effectiveLength;
-    cost.normalSmoothness = smoothness.normal / effectiveLength;
-    return cost;
+    const auto candidate = prepareFiberLocalCandidateMetricInline(
+        candidatePrediction, candidateStepUnitDirection,
+        candidateSmoothness);
+    return fiberLocalMetricCostFullyPreparedInline(
+        prepareFiberLocalIncomingAlignmentInline(
+            currentPrediction, previousStepUnitDirection),
+        previousStepLength, candidateStepLength, candidate, config);
 }
 
 static inline FiberLocalMetricCost fiberLocalMetricCostPreparedInline(

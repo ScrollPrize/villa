@@ -1,5 +1,16 @@
 # Status: staged fiberlet anchor acceleration
 
+- [x] Obtain approval for checkpoint 37 two-sided alignment preparation.
+- [x] Plan checkpoint 37 and its exactness/performance gates.
+- [x] Independently review checkpoint 37 against task and specifications.
+- [x] Implement shared incoming/candidate alignment preparation.
+- [x] Add independent-oracle and edge-case coverage.
+- [x] Run focused GCC and Clang validation and inspect optimized code.
+- [x] Establish one invariant benchmark launcher command.
+- [x] Check CPU availability and run counterbalanced canonical measurements.
+- [x] Retain or remove checkpoint 37 based on measured results.
+- [x] Update specifications, user documentation, changelog, and task log.
+
 - [x] Record the ordered optimization options and per-checkpoint review gates.
 - [x] Record commit `73fe64e09` and its canonical performance/quality baseline.
 - [x] Implement checkpoint 1 tile-owned compact observations.

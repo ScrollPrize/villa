@@ -341,9 +341,15 @@ fallback. Normal-aware transitions with valid projected tangents therefore
 avoid an otherwise unused inverse-cosine evaluation without changing any
 returned cost. Each reached node also prepares the outgoing edge's destination
 normal, projected candidate tangent, and candidate normal angle once, then
-reuses those exact intermediates across every incoming DP state. Public and
-non-DP callers prepare the same private descriptor on demand through the shared
-scorer; there is no separate scoring equation.
+reuses those exact intermediates across every incoming DP state. The same edge
+descriptor owns its sign-oriented candidate prediction axis and individual
+candidate-only alignment factors. Each reached incoming state similarly
+prepares its sign-oriented current prediction axis and previous/current factor
+once. Only the four genuinely pair-dependent alignment dots remain in the
+transition loop; factor multiplication order is unchanged. Public and non-DP
+metric callers prepare the same private descriptors on demand through the
+shared scorer, while the standalone alignment API keeps its raw caller-oriented
+semantics. There is no separate scoring equation.
 
 Source and sink transitions use the fitted endpoint axes as proxy endpoint
 predictions; sink presence is one. Curvature uses the native tracer's shared

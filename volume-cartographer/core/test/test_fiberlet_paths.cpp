@@ -14,7 +14,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cmath>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -383,6 +385,21 @@ vc::fiber_tracer::FiberLocalMetricCost legacyFiberLocalMetricCostPrepared(
     return cost;
 }
 
+void checkMetricCostBits(
+    const vc::fiber_tracer::FiberLocalMetricCost& actual,
+    const vc::fiber_tracer::FiberLocalMetricCost& expected)
+{
+    const auto check = [](float actualValue, float expectedValue) {
+        CHECK(std::bit_cast<uint32_t>(actualValue) ==
+              std::bit_cast<uint32_t>(expectedValue));
+    };
+    check(actual.invalidPrediction, expected.invalidPrediction);
+    check(actual.alignment, expected.alignment);
+    check(actual.isotropicSmoothness, expected.isotropicSmoothness);
+    check(actual.tangentSmoothness, expected.tangentSmoothness);
+    check(actual.normalSmoothness, expected.normalSmoothness);
+}
+
 }  // namespace
 
 TEST_CASE("fiber local smoothness preserves native split equations")
@@ -529,11 +546,15 @@ TEST_CASE("candidate-prepared fiber local scoring preserves legacy metric branch
         4.0f,
         FiberLocalSmoothnessConfig{2.0f, 0.1f, 10.0f, 0.05f},
     };
-    const FiberLocalMetricSample current{{0.8f, 0.6f, 0.0f}, 0.75f, true};
-    const FiberLocalMetricSample candidate{{0.6f, -0.8f, 0.0f}, 0.6f, true};
-    const FiberLocalMetricSample invalidCandidate{{}, 0.6f, false};
     const float nan = std::numeric_limits<float>::quiet_NaN();
     const float infinity = std::numeric_limits<float>::infinity();
+    const FiberLocalMetricSample current{{0.8f, 0.6f, 0.0f}, 0.75f, true};
+    const FiberLocalMetricSample candidate{{0.6f, -0.8f, 0.0f}, 0.6f, true};
+    const FiberLocalMetricSample nonFiniteCurrent{
+        {nan, 1.0f, 0.0f}, 0.75f, true};
+    const FiberLocalMetricSample nonFiniteCandidate{
+        {infinity, -1.0f, 0.0f}, 0.6f, true};
+    const FiberLocalMetricSample invalidCandidate{{}, 0.6f, false};
     struct TestCase {
         const FiberLocalMetricSample* currentPrediction;
         FiberLocalMetricSample candidatePrediction;
@@ -584,6 +605,18 @@ TEST_CASE("candidate-prepared fiber local scoring preserves legacy metric branch
         TestCase{&current, candidate, {1.0f, 0.0f, 0.0f}, -1.5f,
                  {0.0f, 1.0f, 0.0f}, -2.25f,
                  {0.0f, 0.0f, 1.0f}, true},
+        TestCase{&nonFiniteCurrent, candidate, {1.0f, 0.0f, 0.0f}, 1.5f,
+                 {0.0f, 1.0f, 0.0f}, 2.25f,
+                 {0.0f, 0.0f, 1.0f}, true},
+        TestCase{&current, nonFiniteCandidate, {1.0f, 0.0f, 0.0f}, 1.5f,
+                 {0.0f, 1.0f, 0.0f}, 2.25f,
+                 {0.0f, 0.0f, 1.0f}, true},
+        TestCase{&current, candidate, {-0.0f, 1.0f, 0.0f}, infinity,
+                 {1.0f, -0.0f, 0.0f}, infinity,
+                 {0.0f, 0.0f, 1.0f}, true},
+        TestCase{&current, invalidCandidate, {nan, infinity, -0.0f}, nan,
+                 {infinity, nan, -0.0f}, nan,
+                 {infinity, nan, -0.0f}, true},
     };
 
     for (const auto& test : cases) {
@@ -602,11 +635,70 @@ TEST_CASE("candidate-prepared fiber local scoring preserves legacy metric branch
                 test.previous, test.previousLength,
                 test.candidate, test.candidateLength,
                 candidateSmoothness, config);
-        CHECK(actual.invalidPrediction == expected.invalidPrediction);
-        CHECK(actual.alignment == expected.alignment);
-        CHECK(actual.isotropicSmoothness == expected.isotropicSmoothness);
-        CHECK(actual.tangentSmoothness == expected.tangentSmoothness);
-        CHECK(actual.normalSmoothness == expected.normalSmoothness);
+        checkMetricCostBits(actual, expected);
+        if (test.candidatePrediction.valid) {
+            const auto candidateMetric =
+                detail::prepareFiberLocalCandidateMetricInline(
+                    test.candidatePrediction, test.candidate,
+                    test.normal, test.normalValid);
+            const auto incoming =
+                detail::prepareFiberLocalIncomingAlignmentInline(
+                    test.currentPrediction, test.previous);
+            const auto fullyPrepared =
+                detail::fiberLocalMetricCostFullyPreparedInline(
+                    incoming, test.previousLength, test.candidateLength,
+                    candidateMetric, config);
+            checkMetricCostBits(fullyPrepared, expected);
+        }
+    }
+}
+
+TEST_CASE("fully prepared fiber local scoring matches randomized legacy metrics bitwise")
+{
+    using namespace vc::fiber_tracer;
+    const FiberLocalMetricConfig config{
+        4.0f,
+        FiberLocalSmoothnessConfig{2.0f, 0.1f, 10.0f, 0.05f},
+    };
+    std::mt19937 generator(0x37a11U);
+    const auto sampleValue = [&]() {
+        return static_cast<float>(static_cast<int32_t>(generator() % 4001U) -
+                                  2000) /
+               1000.0f;
+    };
+    const auto sampleUnit = [&]() {
+        cv::Vec3f value{sampleValue(), sampleValue(), sampleValue()};
+        if (value.dot(value) < 0.01f)
+            value[0] += 1.0f;
+        return prepareFiberLocalUnitDirection(value);
+    };
+
+    for (size_t index = 0; index < 1024; ++index) {
+        const cv::Vec3f previous = sampleUnit();
+        const cv::Vec3f candidateDirection = sampleUnit();
+        const cv::Vec3f normal = sampleUnit();
+        FiberLocalMetricSample current{
+            sampleUnit(), sampleValue(), (index % 5) != 0};
+        FiberLocalMetricSample candidate{
+            sampleUnit(), sampleValue(), true};
+        const FiberLocalMetricSample* currentPointer =
+            index % 7 == 0 ? nullptr : &current;
+        const float previousLength = sampleValue() * 4.0f;
+        const float candidateLength = sampleValue() * 4.0f;
+        const bool normalValid = index % 6 != 0;
+
+        const auto expected = legacyFiberLocalMetricCostPrepared(
+            currentPointer, candidate, previous, previousLength,
+            candidateDirection, candidateLength,
+            normal, normalValid, config);
+        const auto actual = detail::fiberLocalMetricCostFullyPreparedInline(
+            detail::prepareFiberLocalIncomingAlignmentInline(
+                currentPointer, previous),
+            previousLength, candidateLength,
+            detail::prepareFiberLocalCandidateMetricInline(
+                candidate, candidateDirection, normal, normalValid),
+            config);
+        checkMetricCostBits(actual, expected);
     }
 }
 
@@ -618,6 +710,7 @@ TEST_CASE("fiber local alignment loss preserves native multiplicative scoring")
     CHECK(fiberLocalAlignmentLoss(1.0f, x, x, x, x) == 0.0f);
     CHECK(fiberLocalAlignmentLoss(0.25f, x, x, x, x) == 0.75f);
     CHECK(fiberLocalAlignmentLoss(1.0f, x, x, x, y) == 1.0f);
+    CHECK(fiberLocalAlignmentLoss(1.0f, x, x, -x, x) == 1.0f);
     const float invSqrt2 = static_cast<float>(std::sqrt(0.5));
     const cv::Vec3f diagonal{invSqrt2, invSqrt2, 0.0f};
     float score = 0.5f;
@@ -1399,6 +1492,8 @@ TEST_CASE("fiberlet candidate workers preserve deterministic results")
         CHECK(report.dpNodeIndexEntries <= report.retainedSearchNodes);
         CHECK(report.dpNodeIndexSlots >= report.dpNodeIndexEntries);
         CHECK(report.dpRelaxations <= report.dpTransitionLookups);
+        CHECK(report.dpValidEdges > 0);
+        CHECK(report.dpReusedEdges > 0);
         CHECK(report.preparationGeometryWorkSeconds >= 0.0);
         CHECK(report.preparationNodeEnumerationWorkSeconds >= 0.0);
         CHECK(report.preparationCornerCollectionWorkSeconds >= 0.0);
@@ -1441,6 +1536,8 @@ TEST_CASE("fiberlet candidate workers preserve deterministic results")
     CHECK(serial.dpNodeIndexEntries == parallel.dpNodeIndexEntries);
     CHECK(serial.dpNodeIndexSlots == parallel.dpNodeIndexSlots);
     CHECK(serial.dpTransitionLookups == parallel.dpTransitionLookups);
+    CHECK(serial.dpValidEdges == parallel.dpValidEdges);
+    CHECK(serial.dpReusedEdges == parallel.dpReusedEdges);
     CHECK(serial.dpReachedStateVisits == parallel.dpReachedStateVisits);
     CHECK(serial.dpRelaxations == parallel.dpRelaxations);
     REQUIRE_FALSE(progress.empty());

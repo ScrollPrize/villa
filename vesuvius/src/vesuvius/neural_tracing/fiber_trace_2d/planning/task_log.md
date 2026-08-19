@@ -1771,3 +1771,91 @@
   output remained exact. Future performance checkpoints will use one invariant
   benchmark launcher command and change baseline/candidate/output selection
   only through local launcher configuration.
+
+## Checkpoint 37: prepared two-sided alignment inputs
+
+- Started from committed checkpoint 36 (`d9cebed3f`). The canonical run has
+  about 19.4 million reached incoming states, 28.3 million valid outgoing
+  edges, and 112.2 million scored transitions. Current-side orientation and one
+  clamped factor are therefore reused about 5.8 times per incoming state;
+  candidate-side orientation, presence clamping, and one clamped factor are
+  reused about four times per valid edge.
+- The experiment will move only side-local work into shared private prepared
+  descriptors. Four pair-dependent dot products and the original seven-factor
+  multiplication order remain in the transition scorer. Public callers prepare
+  on demand through the same implementation. Exact costs, populations,
+  failures, and replay bytes are the correctness gate; an invariant launcher
+  and load-checked alternating runs decide retention.
+- Independent review required preserving the standalone alignment API's raw
+  caller-oriented semantics, one owned authoritative candidate direction,
+  explicit exclusion of endpoint paths, exact factor-order wording, broader
+  nonfinite/randomized/DP-reuse coverage, and post-run load checks. The plan
+  now includes all constraints before implementation.
+- Implemented one owned 64-byte candidate metric descriptor containing its
+  authoritative direction, oriented prediction axis, individual clamped
+  candidate factors, and existing smoothness state. It replaces the former
+  direction-plus-smoothness edge fields, so `DpEdge` grows from 56 to 76 bytes
+  rather than carrying duplicated directions. A transient 28-byte incoming
+  descriptor is prepared once per reached interior state.
+- The standalone alignment API and all endpoint paths remain unchanged. The
+  shared private fully prepared scorer retains all four pair-dependent dots and
+  the exact original factor order. GCC and repository-local Clang each pass 52
+  focused path cases; GCC passes all 6 replay cases. Tests include 1,024
+  deterministic randomized bitwise comparisons against the independent legacy
+  equation, nonfinite/negative-zero branches, poisonous invalid candidates,
+  and explicit DP edge-reuse assertions. All five public scoring symbols remain
+  exported.
+- Candidate-side preparation maps to outgoing-edge construction and incoming-
+  side preparation maps before the transition scan in optimized GCC output.
+  The matching QuickBuild `VC_TESTING=ON` baseline at `d9cebed3f` is rebuilt.
+  A fixed no-argument launcher under the checkpoint build directory records
+  selection, output, and pre/post host load. Timed replay is waiting because an
+  unrelated `vc_fiberlets` process currently occupies about 25 cores.
+- The first baseline screening attempt is excluded. The unrelated
+  `vc_fiberlets` process remained present despite a low instantaneous load
+  average; the screening run received only 892% CPU, incurred 1,806 major
+  faults, and took 28.68 seconds rather than the established roughly 7.5
+  seconds. No timing from that run is used. Further runs wait until the other
+  process disappears and reuse the exact same launcher command.
+- Corrected the launcher scope after review: the checkpoint-specific command
+  was removed and replaced by the generic permanent command
+  `volume-cartographer/build/benchmarks/fiberlet_replay/run`. Checkpoint,
+  executable, commit, output root, and label are selection-file data, so future
+  checkpoints reuse the command unchanged.
+- After the competing process cleared, the permanent command was:
+
+  ```text
+  volume-cartographer/build/benchmarks/fiberlet_replay/run
+  ```
+
+  Its selection file expanded to the canonical `vc_fiberlets fiberlet-replay`
+  invocation on `fiber_s1_002.lasagna.json` and
+  `dj_20260805T025256484_000003.json`, with the Lasagna normal manifest, 32
+  threads, length 5,000, and two maximum iterations. Baseline and candidate
+  were matching QuickBuild `VC_TESTING=ON` builds; baseline was commit
+  `d9cebed3f`. Three warm pairs ran in order `B/C, C/B, B/C`. Logs and outputs
+  are under `volume-cartographer/build/benchmarks/checkpoint37/runs/`.
+
+  | metric | baseline min/median/max | candidate min/median/max | median change |
+  |---|---:|---:|---:|
+  | command wall | `7.51/7.52/7.53 s` | `7.53/7.58/7.62 s` | `+0.8%` |
+  | total CPU | `200.42/200.63/201.29 s` | `200.04/200.48/200.91 s` | `-0.1%` |
+  | anchor wall | `5.0801/5.0885/5.0988 s` | `5.1366/5.1479/5.1821 s` | `+1.2%` |
+  | anchor CPU | `143.271/143.317/143.726 s` | `143.295/143.519/143.875 s` | `+0.1%` |
+  | fiberlet wall | `1.8723/1.8768/1.8815 s` | `1.8612/1.8693/1.8785 s` | `-0.4%` |
+  | fiberlet CPU | `55.031/55.284/55.483 s` | `54.681/54.887/54.955 s` | `-0.7%` |
+  | search wall | `0.9488/0.9495/0.9549 s` | `0.9216/0.9279/0.9331 s` | `-2.3%` |
+  | search CPU | `29.825/29.907/30.037 s` | `29.002/29.060/29.197 s` | `-2.8%` |
+  | DP worker | `29.978/29.984/30.158 s` | `29.096/29.290/29.441 s` | `-2.3%` |
+  | peak RSS | `1,600,788/1,603,572/1,610,764 KiB` | `1,599,980/1,609,776/1,624,868 KiB` | `+0.4%` |
+
+- All six measured runs retained 2,519 anchors, 48,852 searched / 24,475
+  accepted candidates, 28,279,855 valid outgoing edges, 83,916,118 reused edge
+  evaluations, 58,058,924 relaxations, and 2 greedy / 1 fiberlet failures.
+  Every artifact was byte-identical with SHA-256
+  `904c39d08e39c6b7b65ac95fd47d28d50e254a33609201c92aef71c6cc131308`.
+- Retained the checkpoint because the targeted search and DP gains repeated in
+  all three pairs, enclosing fiberlet wall and CPU improved, total CPU did not
+  regress, and replay output remained exact. The command-wall increase tracks
+  the untouched anchor phase and is recorded rather than attributed to this
+  local DP change.

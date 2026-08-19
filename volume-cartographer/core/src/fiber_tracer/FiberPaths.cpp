@@ -275,9 +275,8 @@ struct DpNodeScoring {
 struct DpEdge {
     uint32_t next = std::numeric_limits<uint32_t>::max();
     uint32_t scoring = std::numeric_limits<uint32_t>::max();
-    cv::Vec3f metricDirection{0.0f, 0.0f, 0.0f};
     float metricLength = 0.0f;
-    detail::FiberLocalPreparedCandidateSmoothness candidateSmoothness;
+    detail::FiberLocalPreparedCandidateMetric candidateMetric;
 };
 
 struct DpAccumulatedCost {
@@ -1593,20 +1592,14 @@ FiberletPathCost pathStepCost(
 }
 
 FiberLocalMetricCost pathStepMetricCostPrepared(
-    const FiberLocalMetricSample* currentPrediction,
-    const FiberLocalMetricSample& candidatePrediction,
-    const cv::Vec3f& previousDirection,
+    const detail::FiberLocalPreparedIncomingAlignment& incoming,
     float previousLength,
-    const cv::Vec3f& candidateDirection,
     float candidateLength,
-    const detail::FiberLocalPreparedCandidateSmoothness& candidateSmoothness,
+    const detail::FiberLocalPreparedCandidateMetric& candidate,
     const FiberLocalMetricConfig& config)
 {
-    return detail::fiberLocalMetricCostCandidatePreparedInline(
-        currentPrediction, candidatePrediction,
-        previousDirection, previousLength,
-        candidateDirection, candidateLength,
-        candidateSmoothness, config);
+    return detail::fiberLocalMetricCostFullyPreparedInline(
+        incoming, previousLength, candidateLength, candidate, config);
 }
 
 bool betterCost(float candidate, float current)
@@ -2014,9 +2007,9 @@ FiberletCandidateResult solveCandidate(
                     outgoing[transitionState] = {
                         found,
                         nextScoringIndex,
-                        metricDirection,
                         stepLength,
-                        detail::prepareFiberLocalCandidateSmoothnessInline(
+                        detail::prepareFiberLocalCandidateMetricInline(
+                            nextScoring.metricPrediction,
                             metricDirection,
                             nextScoring.metricNormal,
                             (nextScoring.flags & kNodeNormalValid) != 0),
@@ -2038,6 +2031,10 @@ FiberletCandidateResult solveCandidate(
                 const DpIncoming incoming = incomingForState(
                     node, previousState, candidate, nodes, nodeIndex,
                     prepared.keyLayout, missingNode);
+                const auto incomingMetric =
+                    detail::prepareFiberLocalIncomingAlignmentInline(
+                        &currentScoring.metricPrediction,
+                        incoming.metricDirection);
                 for (int deltaU = -1; deltaU <= 1; ++deltaU) {
                     for (int deltaV = -1; deltaV <= 1; ++deltaV) {
                         const size_t transitionState =
@@ -2046,16 +2043,12 @@ FiberletCandidateResult solveCandidate(
                         if (edge.next == missingNode)
                             continue;
                         const size_t next = edge.next;
-                        const auto& nextScoring = dpNodes.at(edge.scoring);
                         DpAccumulatedCost nextCost = currentState.cost;
                         nextCost += pathStepMetricCostPrepared(
-                            &currentScoring.metricPrediction,
-                            nextScoring.metricPrediction,
-                            incoming.metricDirection,
+                            incomingMetric,
                             incoming.metricLength,
-                            edge.metricDirection,
                             edge.metricLength,
-                            edge.candidateSmoothness,
+                            edge.candidateMetric,
                             metricConfig);
                         auto& destination = nextStates[
                             (next - nextRange.begin) * stateCount +

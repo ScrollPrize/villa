@@ -2019,3 +2019,96 @@ unchanged populations and DP work, and 2 greedy / 1 fiberlet failures.
   `904c39d08e39c6b7b65ac95fd47d28d50e254a33609201c92aef71c6cc131308`,
   with exact populations, DP counters, routes, and 2 greedy / 1 fiberlet
   failures.
+
+### Checkpoint 37: prepared two-sided alignment inputs
+
+1. Extend the shared source-private local-scoring implementation with explicit
+   incoming-side and candidate-side alignment descriptors. The incoming
+   descriptor owns the previous direction, sign-oriented current prediction
+   axis, and clamped previous/current factor. The candidate descriptor owns the
+   candidate direction, sign-oriented candidate prediction axis, clamped
+   presence, and clamped candidate/candidate-axis factor. Combine candidate
+   alignment state with the existing candidate smoothness descriptor so one
+   valid `DpEdge` has one atomically constructed, authoritative candidate
+   direction. The descriptor owns all data and retains no references into the
+   reallocating lazy node-scoring cache.
+2. Add one shared metric entry point that consumes both prepared descriptors.
+   Preserve the invalid candidate-prediction early return before preparation.
+   Keep the four pair-dependent dots and the exact factor sequence: presence,
+   previous/candidate, stored previous/current-axis,
+   previous/candidate-axis, current-axis/candidate,
+   current-axis/candidate-axis, stored candidate/candidate-axis, followed by
+   `(1-score)*candidateLength`. Store individual clamped factors rather than a
+   pre-multiplied product. Keep metric entry points as on-demand wrappers over
+   the same implementation and do not copy equations into `FiberPaths.cpp`.
+   The standalone `fiberLocalAlignmentLoss()` API must retain its current raw,
+   caller-oriented semantics and must not implicitly orient axes.
+3. In DP, prepare incoming alignment once after reconstructing each reached
+   state and prepare candidate alignment/smoothness once per valid outgoing
+   edge. Reuse both descriptors for all transitions between them. Preserve
+   outgoing generation order, reached-state order, transition order,
+   accumulation order, tie policy, precision, and returned costs. Restrict the
+   prepared route to reused interior transitions; source initialization, sink
+   finalization, and the two-layer shortcut retain their existing paths and
+   endpoint semantics. `DpIncoming` continues to own its raw direction for sink
+   scoring alongside the transient prepared interior state.
+4. Add focused tests that compare the private prepared route with the
+   independent complete legacy metric oracle. Cover valid and invalid current
+   prediction, current/candidate sign flips, null current prediction,
+   non-finite presence, exact-zero and negative-zero dots, zero/non-finite
+   directions and lengths, valid-but-nonfinite prediction axes, invalid
+   candidate prediction with poisonous remaining inputs, and existing normal-
+   aware/fallback smoothness branches. Add deterministic randomized bitwise
+   comparison and a DP fixture with differently oriented incoming states
+   sharing outgoing edges. Run GCC path/replay tests and repository-local Clang
+   path tests. Verify public local-scoring symbols remain exported.
+5. Inspect optimized GCC and Clang DP code to confirm sign orientation and
+   side-only clamps are outside the transition reuse loop. Record descriptor
+   sizes and stack growth; reject or revise the layout if the extra state
+   causes spills that erase the targeted gain.
+6. Establish one generic invariant local fiberlet-replay benchmark launcher
+   command under the build tree, reusable by all future checkpoints. Switch
+   checkpoint, baseline/candidate executable, commit, output root, and run label
+   only through launcher configuration, never by changing the approved command.
+   Build a matching QuickBuild `VC_TESTING=ON` baseline at commit `d9cebed3f`.
+   Check host CPU load before and after every run, screen once, then run
+   counterbalanced warm pairs `B/C, C/B, B/C` on the canonical Paris4
+   5,000-length replay with 32
+   threads and two maximum iterations. Record command, dataset, build options,
+   min/median/max command/CPU/anchor/fiberlet/search/DP/RSS values, populations,
+   counters, failures, and hashes. The launcher creates fresh output
+   directories and records executable, commit, configuration, and output path.
+   Retain only a repeatable targeted and enclosing gain with byte-identical
+   replay output.
+
+#### Checkpoint 37 spec update
+
+- None. Preparation reuses values within one DP node/edge combination while
+  preserving the exact equations, precision, multiplication order, decisions,
+  and output.
+
+#### Checkpoint 37 documentation update
+
+- If retained, update `volume-cartographer/docs/fiberlets.md` with two-sided
+  alignment preparation, add a concise `planning/changelog.md` entry, and
+  record complete measurements in `planning/task_log.md`. If rejected, remove
+  source/test/documentation changes and retain only the experiment result in
+  the active task records.
+
+#### Checkpoint 37 result
+
+- Retained. Candidate-side preparation is owned by one combined 64-byte metric
+  descriptor; replacing the old separate direction and smoothness fields grows
+  `DpEdge` from 56 to 76 bytes. A 28-byte incoming descriptor is transient per
+  reached state. Optimized code places side-only orientation and clamping at
+  edge/state preparation, outside the pairwise transition scan.
+- Three counterbalanced warm QuickBuild pairs reduced median search wall from
+  `0.9495` to `0.9279` seconds (2.3%), search CPU from `29.9074` to `29.0604`
+  seconds (2.8%), DP worker time from `29.9843` to `29.2899` seconds (2.3%),
+  and fiberlet wall from `1.8768` to `1.8693` seconds (0.4%). Median total CPU
+  was effectively flat/slightly lower at `200.63/200.48` seconds. Command wall
+  was `7.52/7.58` seconds because the untouched anchor phase was slower in all
+  candidate slots.
+- Every measured artifact retained exact populations, DP counters, routes,
+  2 greedy / 1 fiberlet failures, and SHA-256
+  `904c39d08e39c6b7b65ac95fd47d28d50e254a33609201c92aef71c6cc131308`.
