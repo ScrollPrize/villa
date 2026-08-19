@@ -18,8 +18,11 @@ segmentation.
 3. Call `vc3d_fiber_launch` with an explicit viewer and seed. Re-read
    `vc3d_get_state`: line-annotation panes are created asynchronously and their
    viewer ids may change after edits.
-4. Add controls with plain `vc3d_click` on a line-annotation cut pane.
-   `vc3d_shift_click` invokes a different predicted-snap gesture. The current
+4. Add controls with plain `vc3d_click` on a generated line strip
+   (`*_line_surface` or `*_line_side_slice`); that click selects an along-line
+   position and places the control. A cut-pane click instead uses the already
+   current line position. `vc3d_shift_click` invokes a different predicted-snap
+   gesture. The current
    contract has no direct control-point add, move, remove, configuration, or
    in-progress workspace-state RPC; use visual evidence and save/list readback.
 
