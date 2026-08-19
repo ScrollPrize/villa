@@ -24,7 +24,10 @@ _TWO_PI = 2.0 * np.pi
 class _NodeSource:
     start: int
     count: int
-    get_zyxs: Callable[[torch.Tensor], torch.Tensor]
+    # Called with a source-local half-open ordinal range [lo, hi); returns the
+    # (hi - lo, 3) node geometry. Range-based so providers can slice resident
+    # tensors and stream compact storage without an index-tensor round trip.
+    get_zyxs: Callable[[int, int], torch.Tensor]
 
 
 @dataclass(slots=True)
@@ -406,8 +409,7 @@ class ThetaCrossingMap:
             for source in self._sources:
                 for lo in range(0, source.count, self.chunk_size):
                     hi = min(source.count, lo + self.chunk_size)
-                    local = torch.arange(lo, hi, dtype=torch.int64, device=self.device)
-                    zyxs = source.get_zyxs(local).to(
+                    zyxs = source.get_zyxs(lo, hi).to(
                         device=self.device, dtype=torch.float32)
                     if zyxs.shape != (hi - lo, 3):
                         raise RuntimeError(
@@ -592,12 +594,17 @@ class ThetaCrossingMap:
                 hi = min(self.edge_nodes.shape[0], lo + self.chunk_size)
                 yield (self.edge_nodes[lo:hi].to(self.device),
                        self.crossings[lo:hi].to(torch.int32))
+            # Neighbour slots are a pure streaming pass with no resident
+            # output, and each slot yields at most one pair, so they can be
+            # requested in larger chunks than the geometry/edge loops without
+            # raising the peak transient class.
+            slot_chunk = self.chunk_size * 8
             for source in self._potential_sources:
                 cursor = 0
                 end = source.count * 4
                 while cursor < end:
                     next_cursor, pairs_np = source.get_neighbor_chunk(
-                        cursor, self.chunk_size)
+                        cursor, slot_chunk)
                     next_cursor = int(next_cursor)
                     if next_cursor <= cursor or next_cursor > end:
                         raise RuntimeError(

@@ -75,7 +75,7 @@ def _run_losses(zyxs_list, cfg, num_steps=25, compute_dt=True, seed=0):
     flat = _flat_bundle(zyxs_list)
     crossing_map = ThetaCrossingMap('cpu')
     node_start = crossing_map.register_nodes(
-        flat['total'], lambda indices: flat['zyxs'][indices])
+        flat['total'], lambda lo, hi: flat['zyxs'][lo:hi])
     starts = flat['starts_cpu'].numpy()
     for strip_idx, strip in enumerate(strips):
         ids = node_start + np.arange(starts[strip_idx], starts[strip_idx + 1])

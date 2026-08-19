@@ -505,15 +505,14 @@ class PatchAtlas:
         """Register compact native patch trees and streamed neighbour edges."""
         if self.sampling_atlas is None:
             self._theta_node_start = crossing_map.register_nodes(
-                0, lambda local: torch.empty((0, 3), dtype=torch.float32))
+                0, lambda lo, hi: torch.empty((0, 3), dtype=torch.float32))
             self._theta_node_ranges = []
             return self._theta_node_start
         num_quads = int(self.sampling_atlas.total_valid_cells())
 
-        def get_centres(local_indices):
-            local_np = np.ascontiguousarray(
-                local_indices.detach().cpu().numpy(), dtype=np.int64)
-            resolved = self.sampling_atlas.node_ijs(local_np)
+        def get_centres(lo, hi):
+            resolved = self.sampling_atlas.node_ijs(
+                np.arange(lo, hi, dtype=np.int64))
             idx = torch.from_numpy(np.asarray(
                 resolved['patch_indices'], dtype=np.int64))
             ijs = torch.from_numpy(np.asarray(
@@ -2267,7 +2266,8 @@ class FitContext:
             self.unattached_pcl_strips, self.device)
         if flat is not None:
             start = crossing_map.register_nodes(
-                flat['total'], lambda local, points=flat['zyxs']: points[local])
+                flat['total'],
+                lambda lo, hi, points=flat['zyxs']: points[lo:hi])
             starts = flat['starts_cpu'].numpy()
             for strip_idx, strip in enumerate(self.unattached_pcl_strips):
                 node_ids = start + np.arange(
@@ -2297,7 +2297,7 @@ class FitContext:
                 np.stack([p['zyx'] for p in points]).astype(np.float32),
                 device=self.device)
             start = crossing_map.register_nodes(
-                len(points), lambda local, values=point_zyxs: values[local])
+                len(points), lambda lo, hi, values=point_zyxs: values[lo:hi])
             for local, point in enumerate(points):
                 point['_theta_node_id'] = start + local
             for pcl in self.cross_patch_pcls:

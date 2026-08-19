@@ -20,7 +20,7 @@ def _identity(value):
 def test_crossings_reverse_reanchor_padding_and_current_dr_scaling():
     points = _points_for_theta([-0.2, 0.2, 1.0, -0.2])
     crossing_map = ThetaCrossingMap('cpu')
-    crossing_map.register_nodes(len(points), lambda indices: points[indices])
+    crossing_map.register_nodes(len(points), lambda lo, hi: points[lo:hi])
     crossing_map.register_edges([[0, 1], [1, 2], [2, 3], [1, 0]])
     crossing_map.force_refresh(_identity)
 
@@ -54,7 +54,7 @@ def test_crossings_reverse_reanchor_padding_and_current_dr_scaling():
 def test_patch_local_correction_connects_centres_to_fractional_picks():
     points = _points_for_theta([0.1, 0.2])
     crossing_map = ThetaCrossingMap('cpu')
-    crossing_map.register_nodes(2, lambda indices: points[indices])
+    crossing_map.register_nodes(2, lambda lo, hi: points[lo:hi])
     crossing_map.register_edges([[0, 1]])
     crossing_map.force_refresh(_identity)
     packed = _pack_walks([
@@ -73,7 +73,7 @@ def test_absolute_winding_reference_survives_unsampled_walk_origin():
     # that crossing instead of reanchoring it away at the first sparse pick.
     points = _points_for_theta([6.0, 6.1, 0.1, 0.2])
     crossing_map = ThetaCrossingMap('cpu')
-    crossing_map.register_nodes(4, lambda indices: points[indices])
+    crossing_map.register_nodes(4, lambda lo, hi: points[lo:hi])
     crossing_map.register_edges([[1, 2], [2, 3]])
     crossing_map.force_refresh(_identity)
     packed = _pack_walks([
@@ -102,7 +102,7 @@ def test_relative_winding_walks_keep_each_annotation_frame():
         1.0, 1.1, 1.2, 1.3,
     ])
     crossing_map = ThetaCrossingMap('cpu')
-    crossing_map.register_nodes(8, lambda indices: points[indices])
+    crossing_map.register_nodes(8, lambda lo, hi: points[lo:hi])
     crossing_map.register_edges([
         [1, 2], [2, 3], [5, 6], [6, 7],
     ])
@@ -131,7 +131,7 @@ def test_reference_node_connects_exact_annotation_to_patch_walk_origin():
     # they are spatially adjacent; transport that final local branch step too.
     points = _points_for_theta([6.1, 0.1, 0.2])
     crossing_map = ThetaCrossingMap('cpu')
-    crossing_map.register_nodes(3, lambda indices: points[indices])
+    crossing_map.register_nodes(3, lambda lo, hi: points[lo:hi])
     crossing_map.register_edges([[1, 2]])
     crossing_map.force_refresh(_identity)
     packed = _pack_walks([
@@ -152,7 +152,7 @@ def test_unwrap_tree_caches_branching_multiwrap_node_potentials():
     unwrapped_theta = [5.8, 6.1, 6.4, 6.7, 5.5]
     points = _points_for_theta([value % (2 * math.pi) for value in unwrapped_theta])
     crossing_map = ThetaCrossingMap('cpu', chunk_size=2)
-    crossing_map.register_nodes(len(points), lambda indices: points[indices])
+    crossing_map.register_nodes(len(points), lambda lo, hi: points[lo:hi])
     crossing_map.register_edges([
         [0, 1], [1, 2], [2, 3], [1, 4],
         # Non-tree edge with the same continuous lift checks cycle consistency.
@@ -183,7 +183,7 @@ def test_potential_inconsistencies_returns_only_bad_edge_nodes_on_host():
     # can satisfy that cycle.
     points = _points_for_theta([0.1, 2.5, 4.9])
     crossing_map = ThetaCrossingMap('cpu', chunk_size=2)
-    crossing_map.register_nodes(3, lambda indices: points[indices])
+    crossing_map.register_nodes(3, lambda lo, hi: points[lo:hi])
     crossing_map.register_unwrap_tree([0, 1, 2], [-1, 0, 1])
     crossing_map.register_edges([[0, 2]])
     crossing_map.force_refresh(_identity)
@@ -206,7 +206,7 @@ def test_unordered_potentials_span_forty_wraps_without_sparse_aliasing():
     points = _points_for_theta(wrapped_theta.tolist())
     num_nodes = len(points)
     crossing_map = ThetaCrossingMap('cpu', chunk_size=37)
-    crossing_map.register_nodes(num_nodes, lambda indices: points[indices])
+    crossing_map.register_nodes(num_nodes, lambda lo, hi: points[lo:hi])
     crossing_map.register_unwrap_tree(
         torch.arange(num_nodes),
         torch.cat([torch.tensor([-1]), torch.arange(num_nodes - 1)]),
@@ -227,7 +227,7 @@ def test_potential_adjustments_handle_fractional_and_annotation_frames():
     # rooted at the attached quad (node 1) and cross theta=0 at node 2.
     points = _points_for_theta([6.0, 6.1, 0.1, 0.3])
     crossing_map = ThetaCrossingMap('cpu')
-    crossing_map.register_nodes(len(points), lambda indices: points[indices])
+    crossing_map.register_nodes(len(points), lambda lo, hi: points[lo:hi])
     crossing_map.register_unwrap_tree([1, 2, 3], [-1, 0, 1])
     crossing_map.force_refresh(_identity)
 
@@ -248,12 +248,12 @@ def test_potential_adjustments_handle_fractional_and_annotation_frames():
 def test_unwrap_tree_rejects_non_preorder_and_unregistered_potential_lookup():
     points = _points_for_theta([0.0, 0.1, 0.2])
     crossing_map = ThetaCrossingMap('cpu')
-    crossing_map.register_nodes(3, lambda indices: points[indices])
+    crossing_map.register_nodes(3, lambda lo, hi: points[lo:hi])
     with pytest.raises(ValueError, match='precede'):
         crossing_map.register_unwrap_tree([0, 1, 2], [-1, 2, 0])
     crossing_map_4 = ThetaCrossingMap('cpu')
     points_4 = _points_for_theta([0.0, 0.1, 0.2, 0.3])
-    crossing_map_4.register_nodes(4, lambda indices: points_4[indices])
+    crossing_map_4.register_nodes(4, lambda lo, hi: points_4[lo:hi])
     with pytest.raises(ValueError, match='depth-first preorder'):
         crossing_map_4.register_unwrap_tree([0, 1, 2, 3], [-1, 0, 0, 1])
     crossing_map.register_unwrap_tree([0, 1], [-1, 0])
@@ -265,7 +265,7 @@ def test_unwrap_tree_rejects_non_preorder_and_unregistered_potential_lookup():
 def test_single_node_unwrap_tree_needs_no_registered_edge():
     points = _points_for_theta([0.4])
     crossing_map = ThetaCrossingMap('cpu')
-    crossing_map.register_nodes(1, lambda indices: points[indices])
+    crossing_map.register_nodes(1, lambda lo, hi: points[lo:hi])
     crossing_map.register_unwrap_tree([0], [-1])
     crossing_map.force_refresh(_identity)
     assert crossing_map.edge_nodes.numel() == 0
@@ -281,7 +281,7 @@ def test_refresh_interval_chunking_force_refresh_and_interval_change():
         return value
 
     crossing_map = ThetaCrossingMap('cpu', update_interval=3, chunk_size=2)
-    crossing_map.register_nodes(len(points), lambda indices: points[indices])
+    crossing_map.register_nodes(len(points), lambda lo, hi: points[lo:hi])
     crossing_map.register_edges([[0, 1]])
     assert crossing_map.refresh_if_due(10, transform)
     assert calls == [2, 2, 1]
@@ -300,7 +300,7 @@ def test_refresh_interval_chunking_force_refresh_and_interval_change():
 def test_unregistered_sampled_edge_fails_clearly():
     points = _points_for_theta([0.0, 0.1, 0.2])
     crossing_map = ThetaCrossingMap('cpu')
-    crossing_map.register_nodes(3, lambda indices: points[indices])
+    crossing_map.register_nodes(3, lambda lo, hi: points[lo:hi])
     crossing_map.register_edges([[0, 1]])
     with pytest.raises(RuntimeError, match='unregistered edge'):
         _pack_walks([
@@ -312,7 +312,7 @@ def test_unregistered_sampled_edge_fails_clearly():
 def test_common_packer_handles_ragged_reverse_single_node_and_pick_modes():
     points = _points_for_theta([0.0, 0.1, 0.2, 0.3])
     crossing_map = ThetaCrossingMap('cpu')
-    crossing_map.register_nodes(4, lambda indices: points[indices])
+    crossing_map.register_nodes(4, lambda lo, hi: points[lo:hi])
     crossing_map.register_edges([[0, 1], [1, 2], [2, 3]])
     crossing_map.force_refresh(_identity)
 
@@ -346,7 +346,7 @@ def test_common_packer_handles_ragged_reverse_single_node_and_pick_modes():
 def test_new_adjustment_container_preserves_values_loss_and_gradients():
     points = _points_for_theta([-0.2, 0.2, 1.0, -0.2])
     crossing_map = ThetaCrossingMap('cpu')
-    crossing_map.register_nodes(4, lambda indices: points[indices])
+    crossing_map.register_nodes(4, lambda lo, hi: points[lo:hi])
     crossing_map.register_edges([[0, 1], [1, 2], [2, 3]])
     crossing_map.force_refresh(_identity)
     packed = _pack_walks([
@@ -410,7 +410,7 @@ def test_new_adjustment_container_preserves_values_loss_and_gradients():
 def test_common_packer_rejects_invalid_walks(nodes, picks, message):
     points = _points_for_theta([0.0, 0.1])
     crossing_map = ThetaCrossingMap('cpu')
-    crossing_map.register_nodes(2, lambda indices: points[indices])
+    crossing_map.register_nodes(2, lambda lo, hi: points[lo:hi])
     crossing_map.register_edges([[0, 1]])
     with pytest.raises(ValueError, match=message):
         _pack_walks([

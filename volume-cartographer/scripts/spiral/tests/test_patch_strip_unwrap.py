@@ -81,7 +81,7 @@ class FakeAtlas:
             centres = centres.reshape(-1, 3).to(self.device)
             start = crossing_map.register_nodes(
                 h * w,
-                lambda indices, values=centres: values[indices])
+                lambda lo, hi, values=centres: values[lo:hi])
             node_map = start + np.arange(h * w, dtype=np.int64).reshape(h, w)
             self.node_maps.append(node_map)
             edges = []

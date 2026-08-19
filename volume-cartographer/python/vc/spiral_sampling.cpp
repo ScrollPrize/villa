@@ -2,8 +2,12 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
+#include <new>
+#include <cstring>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <type_traits>
@@ -63,6 +67,57 @@ nb::ndarray<nb::numpy, T, nb::ndim<3>> own_3d(
     });
     return nb::ndarray<nb::numpy, T, nb::ndim<3>>(
         held->data(), {a, b, c}, owner);
+}
+
+// Uninitialised output buffer for parallel fills. std::vector's
+// value-initialisation memsets large chunk outputs serially before the
+// parallel loop ever runs; malloc defers the page faults to the filling
+// threads instead.
+template <typename T>
+struct RawBuffer {
+    T* data = nullptr;
+    size_t count = 0;
+
+    explicit RawBuffer(size_t count_)
+        : data(static_cast<T*>(std::malloc(count_ * sizeof(T)))),
+          count(count_)
+    {
+        if (count_ && data == nullptr)
+            throw std::bad_alloc();
+    }
+    RawBuffer(const RawBuffer&) = delete;
+    RawBuffer& operator=(const RawBuffer&) = delete;
+    ~RawBuffer() { std::free(data); }
+
+    T* release()
+    {
+        T* released = data;
+        data = nullptr;
+        return released;
+    }
+};
+
+template <typename T>
+nb::ndarray<nb::numpy, T, nb::ndim<1>> own_1d_raw(RawBuffer<T>&& values)
+{
+    const size_t count = values.count;
+    T* data = values.release();
+    nb::capsule owner(data, [](void* pointer) noexcept {
+        std::free(pointer);
+    });
+    return nb::ndarray<nb::numpy, T, nb::ndim<1>>(data, {count}, owner);
+}
+
+template <typename T>
+nb::ndarray<nb::numpy, T, nb::ndim<2>> own_2d_raw(
+    RawBuffer<T>&& values, size_t rows, size_t columns)
+{
+    T* data = values.release();
+    nb::capsule owner(data, [](void* pointer) noexcept {
+        std::free(pointer);
+    });
+    return nb::ndarray<nb::numpy, T, nb::ndim<2>>(
+        data, {rows, columns}, owner);
 }
 
 uint64_t splitmix64(uint64_t value)
@@ -195,29 +250,39 @@ public:
     nb::dict node_ijs(Int64Vector node_ordinals) const
     {
         const size_t count = node_ordinals.shape(0);
-        std::vector<int64_t> patch_indices(count);
-        std::vector<float> ijs(count * 2);
+        RawBuffer<int64_t> patch_indices(count);
+        RawBuffer<float> ijs(count * 2);
         {
             nb::gil_scoped_release release;
-            for (size_t index = 0; index < count; ++index) {
-                const int64_t requested = node_ordinals(index);
+            bool out_of_range = false;
+#pragma omp parallel for schedule(static) reduction(|| : out_of_range)
+            for (int64_t index = 0; index < static_cast<int64_t>(count);
+                 ++index) {
+                const int64_t requested = node_ordinals(
+                    static_cast<size_t>(index));
                 if (requested < 0
-                    || static_cast<uint64_t>(requested) >= total_valid_cells())
-                    throw std::runtime_error("node ordinal is out of range");
+                    || static_cast<uint64_t>(requested) >= total_valid_cells()) {
+                    out_of_range = true;
+                    continue;
+                }
                 const size_t patch_index = locate_node(
                     static_cast<uint64_t>(requested));
                 const PatchData& patch = patches_[patch_index];
                 const uint64_t local = static_cast<uint64_t>(requested)
                     - node_offsets_[patch_index];
                 const uint64_t linear = index_at(patch.valid_cells, local);
-                patch_indices[index] = static_cast<int64_t>(patch_index);
-                ijs[index * 2] = static_cast<float>(linear / patch.width);
-                ijs[index * 2 + 1] = static_cast<float>(linear % patch.width);
+                patch_indices.data[static_cast<size_t>(index)] =
+                    static_cast<int64_t>(patch_index);
+                ijs.data[index * 2] = static_cast<float>(linear / patch.width);
+                ijs.data[index * 2 + 1] =
+                    static_cast<float>(linear % patch.width);
             }
+            if (out_of_range)
+                throw std::runtime_error("node ordinal is out of range");
         }
         nb::dict result;
-        result["patch_indices"] = own_1d(std::move(patch_indices));
-        result["ijs"] = own_2d(std::move(ijs), count, 2);
+        result["patch_indices"] = own_1d_raw(std::move(patch_indices));
+        result["ijs"] = own_2d_raw(std::move(ijs), count, 2);
         return result;
     }
 
@@ -261,13 +326,24 @@ public:
         if (lo > hi || hi > total_valid_cells())
             throw std::runtime_error("tree chunk is out of range");
         const size_t count = static_cast<size_t>(hi - lo);
-        std::vector<int64_t> nodes(count);
-        std::vector<int64_t> parents(count);
-        std::vector<int64_t> exits(count);
+        RawBuffer<int64_t> nodes(count);
+        RawBuffer<int64_t> parents(count);
+        RawBuffer<int64_t> exits(count);
         {
             nb::gil_scoped_release release;
-            size_t patch_index = count ? locate_node(lo) : 0;
-            for (uint64_t position = lo; position < hi; ++position) {
+            // Contiguous position sub-ranges write disjoint output slices, so
+            // the result is identical to a serial pass for any thread count.
+            const uint64_t per_range = 262'144;
+            const size_t num_ranges = count
+                ? static_cast<size_t>((count + per_range - 1) / per_range) : 0;
+#pragma omp parallel for schedule(dynamic)
+            for (int64_t range_index = 0;
+                 range_index < static_cast<int64_t>(num_ranges); ++range_index) {
+            const uint64_t range_lo = lo
+                + static_cast<uint64_t>(range_index) * per_range;
+            const uint64_t range_hi = std::min(hi, range_lo + per_range);
+            size_t patch_index = locate_node(range_lo);
+            for (uint64_t position = range_lo; position < range_hi; ++position) {
                 while (position >= node_offsets_[patch_index + 1])
                     ++patch_index;
                 const PatchData& patch = patches_[patch_index];
@@ -303,15 +379,18 @@ public:
                     }
                 }
                 const size_t output = static_cast<size_t>(position - lo);
-                nodes[output] = static_cast<int64_t>(patch_start + node_local);
-                parents[output] = static_cast<int64_t>(patch_start + parent_local);
-                exits[output] = static_cast<int64_t>(exit_position);
+                nodes.data[output] =
+                    static_cast<int64_t>(patch_start + node_local);
+                parents.data[output] =
+                    static_cast<int64_t>(patch_start + parent_local);
+                exits.data[output] = static_cast<int64_t>(exit_position);
+            }
             }
         }
         nb::dict result;
-        result["node_ordinals"] = own_1d(std::move(nodes));
-        result["parent_ordinals"] = own_1d(std::move(parents));
-        result["exit_positions"] = own_1d(std::move(exits));
+        result["node_ordinals"] = own_1d_raw(std::move(nodes));
+        result["parent_ordinals"] = own_1d_raw(std::move(parents));
+        result["exit_positions"] = own_1d_raw(std::move(exits));
         return result;
     }
 
@@ -321,7 +400,7 @@ public:
         if (cursor > end || slot_count == 0)
             throw std::runtime_error("invalid neighbor chunk request");
         const uint64_t next = std::min(end, cursor + slot_count);
-        std::vector<int64_t> pairs;
+        std::optional<RawBuffer<int64_t>> pairs;
         {
             nb::gil_scoped_release release;
             // Contiguous slot sub-ranges are filled independently and
@@ -369,17 +448,27 @@ public:
                     out.push_back(static_cast<int64_t>(patch_start + next_local));
                 }
             }
-            size_t total_values = 0;
-            for (const std::vector<int64_t>& out : partial)
-                total_values += out.size();
-            pairs.reserve(total_values);
-            for (const std::vector<int64_t>& out : partial)
-                pairs.insert(pairs.end(), out.begin(), out.end());
+            std::vector<size_t> range_offsets(num_ranges + 1, 0);
+            for (size_t range_index = 0; range_index < num_ranges; ++range_index)
+                range_offsets[range_index + 1] = range_offsets[range_index]
+                    + partial[range_index].size();
+            pairs.emplace(range_offsets[num_ranges]);
+#pragma omp parallel for schedule(static)
+            for (int64_t range_index = 0;
+                 range_index < static_cast<int64_t>(num_ranges); ++range_index) {
+                const std::vector<int64_t>& out = partial[
+                    static_cast<size_t>(range_index)];
+                if (!out.empty())
+                    std::memcpy(
+                        pairs->data + range_offsets[
+                            static_cast<size_t>(range_index)],
+                        out.data(), out.size() * sizeof(int64_t));
+            }
         }
         nb::dict result;
         result["next_cursor"] = next;
-        const size_t pair_count = pairs.size() / 2;
-        result["node_pairs"] = own_2d(std::move(pairs), pair_count, 2);
+        const size_t pair_count = pairs->count / 2;
+        result["node_pairs"] = own_2d_raw(std::move(*pairs), pair_count, 2);
         return result;
     }
 

@@ -69,14 +69,14 @@ def _spiral_point(theta, raw_winding):
 def _setup(ref_points, patch_points, pcl_edges=()):
     crossing_map = ThetaCrossingMap('cpu')
     refs = torch.tensor(ref_points, dtype=torch.float32)
-    crossing_map.register_nodes(len(refs), lambda indices: refs[indices])
+    crossing_map.register_nodes(len(refs), lambda lo, hi: refs[lo:hi])
     if pcl_edges:
         crossing_map.register_edges(pcl_edges)
     node_maps = []
     for points in patch_points:
         values = torch.tensor(points, dtype=torch.float32)
         start = crossing_map.register_nodes(
-            len(values), lambda indices, values=values: values[indices])
+            len(values), lambda lo, hi, values=values: values[lo:hi])
         nodes = start + np.arange(len(values), dtype=np.int64)
         crossing_map.register_unwrap_tree(
             nodes, np.arange(-1, len(nodes) - 1, dtype=np.int64))
