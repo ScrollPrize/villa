@@ -2558,7 +2558,7 @@
   numeric values are float32; direct and indexed fitting differ only in storage
   and indexing.
 - Robust assignment, trimming, direct direction update, and position update run
-  for at most `maximum_iterations`, default 2. This is a bounded alternating
+  for at most `maximum_iterations`, default 1. This is a bounded alternating
   refinement budget, not convergence to exact equality of hard assignment or
   histogram membership sets. An earlier exit is allowed when projective
   direction change is within tolerance and accepted position movement is no

@@ -57,6 +57,19 @@
 - [x] Run focused GCC and Clang validation.
 - [x] Run three canonical checkpoint 10 replays and compare quality/performance.
 - [x] Update specifications, user documentation, changelog, and task log.
+- [x] Obtain approval for checkpoint 30 terminal membership reuse.
+- [x] Refine checkpoint 30 semantics and quality/performance gates.
+- [x] Independently review checkpoint 30 against the task and specifications.
+- [x] Correct checkpoint 30 terminology, scan accounting, compaction coverage,
+  paired-run gate, and stale specification default after review.
+- [x] Implement terminal robust-membership reuse without a compatibility path.
+- [x] Add focused one-pass, multi-iteration, and deterministic coverage.
+- [x] Build and run focused GCC and Clang anchor tests.
+- [x] Check host load and run the canonical checkpoint-30 screening replay.
+- [x] Compare matched-anchor and emitted-route quality against checkpoint 28.
+- [x] Remove checkpoint 30 after its fiberlet failure regression.
+- [x] Correct the pre-existing specification default; leave production docs and
+  changelog unchanged for the rejected experiment.
 - [x] Plan checkpoint 25 parallel corner finalization and its validation gates.
 - [x] Implement and retain checkpoint 25 from controlled measurements.
 - [x] Plan checkpoint 26 sparse paged corner deduplication.
@@ -76,9 +89,34 @@
 - [x] Checkpoint 28: add focused union, budget, failure, and parity coverage.
 - [x] Checkpoint 28: run GCC and Clang focused validation.
 - [x] Checkpoint 28: benchmark three warm canonical replays and retain exact-union reuse.
-- [ ] Checkpoint 29: test bounded peak Gaussian acceleration.
-- [ ] Checkpoint 30: test one-pass post-update membership reuse as a quality change.
-- [ ] Checkpoint 31: profile and optimize remaining DP throughput.
+- [x] Checkpoint 29: inspect the Gaussian hotspot and write the detailed plan.
+- [x] Checkpoint 29: independently review the plan against task and specs.
+- [x] Checkpoint 29: implement the isolated lookup and direct error coverage.
+- [x] Checkpoint 29: run GCC and Clang focused validation.
+- [x] Checkpoint 29: screen and benchmark the canonical replay.
+- [x] Checkpoint 29: remove both non-improving variants and update records.
+- [x] Checkpoint 30: reject one-pass post-update membership reuse after quality regression.
+- [x] Checkpoint 31: plan largest-candidate-first DP scheduling.
+- [x] Checkpoint 31: independently review the scheduling plan.
+- [x] Checkpoint 31: implement and test stable work-order scheduling.
+- [x] Checkpoint 31: screen performance and replay quality.
+- [x] Checkpoint 31: remove the rejected experiment and document the result.
+- [x] Checkpoint 32: plan DP transition-cost profiling.
+- [x] Checkpoint 32: independently review the profiling plan.
+- [x] Checkpoint 32: implement and validate phase profiling.
+- [x] Checkpoint 32: run the canonical profile and select the next target.
+- [x] Checkpoint 33: plan redundant direction-normalization removal.
+- [x] Checkpoint 33: independently review the optimization plan.
+- [x] Checkpoint 33: implement and validate prepared-direction reuse.
+- [x] Checkpoint 33: screen performance and replay quality.
+- [x] Checkpoint 33: reject and remove the uninstrumented no-op.
+- [x] Checkpoint 33: run final restored GCC/Clang validation.
+- [x] Checkpoint 34: inspect optimized call sites and plan shared metric inlining.
+- [x] Checkpoint 34: independently review the plan.
+- [x] Checkpoint 34: implement the shared private inline scorer.
+- [x] Checkpoint 34: run GCC/Clang validation and inspect optimized call sites.
+- [x] Checkpoint 34: screen canonical performance and replay quality.
+- [x] Checkpoint 34: retain or remove based on measured enclosing performance.
 - [x] Obtain approval for checkpoint 23 float final evaluation.
 - [x] Plan checkpoint 23 and its precision, quality, and performance gates.
 - [x] Independently review checkpoint 23 against task and specifications.

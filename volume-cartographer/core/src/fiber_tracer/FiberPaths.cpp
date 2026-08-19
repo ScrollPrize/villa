@@ -6,6 +6,7 @@
 #include "vc/fiber_tracer/FiberLocalScoring.hpp"
 #include "vc/fiber_tracer/FiberGraph.hpp"
 #include "FiberFloatGeometry.hpp"
+#include "FiberLocalScoringInternal.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1601,7 +1602,7 @@ FiberLocalMetricCost pathStepMetricCostPrepared(
     bool normalValid,
     const FiberLocalMetricConfig& config)
 {
-    return fiberLocalMetricCostPrepared(
+    return detail::fiberLocalMetricCostPreparedInline(
         currentPrediction, candidatePrediction,
         previousDirection, previousLength,
         candidateDirection, candidateLength,

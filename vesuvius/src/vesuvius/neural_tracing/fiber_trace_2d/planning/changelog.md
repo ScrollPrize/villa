@@ -651,3 +651,7 @@
 - Replaced pair-local raw prediction reuse with bounded exact-union sampling
   partitions. The canonical replay submitted 77% fewer prediction voxels;
   median anchor CPU improved 12.1% and command wall 2.2% with exact artifacts.
+- Shared one source-private inline implementation between exported local
+  scoring and the prepared fiberlet DP loop. Canonical median DP search wall
+  improved 9.8% and fiberlet wall 5.7% with exact replay artifacts and work
+  counters.

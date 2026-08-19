@@ -1502,41 +1502,384 @@ unchanged populations and DP work, and 2 greedy / 1 fiberlet failures.
 
 ### Checkpoint 29: peak Gaussian acceleration
 
-1. Isolate the radial Gaussian cost inside the scalar sequential response
-   scan; do not restore rejected response batching, CSR, or counting-sort
-   layouts unchanged.
-2. Evaluate a float lookup or bounded polynomial over the exact finite cutoff
-   interval. Record maximum/mean relative and absolute error against `expf` and
-   preserve exact zero outside the cutoff.
-3. Keep evidence traversal, response-cache behavior, hill-climb ordering, and
-   tie policy unchanged around the approximation.
-4. Compare peak worker time, selected peak displacement, anchor distributions,
-   populations, graph/DP changes, replay failures, and visual quality. Exact
-   artifact identity is not required.
+1. Isolate only the transverse radial Gaussian inside the existing scalar
+   sequential `responseAt()` scan. Keep the precomputed axial Gaussian, radial
+   cutoff, response/evidence record layouts, traversal, compensated sums,
+   response cache, hill-climb order, acceptance checks, and tie policy
+   unchanged. Do not restore rejected response batching, CSR, or counting-sort
+   layouts.
+2. Add one shared private peak-Gaussian helper used by production and direct
+   tests. Its input is the nonnegative normalized exponent
+   `distanceSquared / (2 * sigma^2)`. Start with a process-wide 512-interval
+   float table with 513 entries over `[0, 8]` and linear interpolation. The
+   default three-sigma cutoff ends at exponent `4.5`, so it is fully covered
+   while the 2,052-byte table remains small. Acquire the immutable table once
+   per peak search and use an inline lookup with no per-observation function
+   call or static-initialization guard. Use the existing `expf` calculation for
+   negative, non-finite, or above-domain inputs; preserve exact `1` at zero and
+   use only portable standard C++.
+3. Add deterministic dense-grid, interval-midpoint, exact-knot, fixed-seed
+   random, and `nextafter` endpoint tests against `expf`. Require maximum
+   absolute and relative error no greater than `3.5e-5`, and mean relative error
+   no greater than `2.2e-5` over `[0,8]`. Add fallback, monotonicity, positivity,
+   and deterministic multi-thread coverage. Preserve the caller's exact radial
+   cutoff rather than making the helper return zero. Do not add a production
+   runtime selector or duplicate the complete peak implementation for tests;
+   compare complete exact/candidate binaries externally.
+4. Build and run focused GCC and Clang anchor tests. Run one canonical screening
+   replay and compare peak-search worker time, anchor wall/CPU, command wall/CPU,
+   RSS, anchor/graph populations, DP work, failures, and artifact/route geometry
+   against checkpoint 28. Reuse the discrete, separable, and joint peak
+   positions already serialized in diagnostic records. Report changed discrete
+   peak count, matched peak-position p50/p95/maximum displacement, unmatched
+   diagnostics, matched axis-angle differences, and emitted-route displacement.
+   If the table regresses or has no useful signal,
+   remove it before considering a polynomial. Do not retain multiple runtime
+   implementations or compatibility switches.
+5. For a viable table, alternate three warm checkpoint-28 and three candidate
+   replays from separate libraries under the same QuickBuild executable,
+   command, inputs, thread count, warmed data, and host-load checks. Measure
+   min/median/max. Require deterministic candidate artifacts, unchanged anchor
+   count and diagnostic identity, peak-position p95 displacement at most `0.05`
+   prediction voxels and maximum at most `0.5`, maximum axis-angle difference
+   at most `1e-4` radians, unchanged replay failure counts, graph population
+   changes below `1%`, DP-work changes below `2%`, and emitted-route p95/maximum
+   displacement at most `0.1`/`1.0` base voxels. Report changed discrete peaks
+   separately. Exact artifact identity is not required. Retain only a repeatable
+   enclosing-runtime improvement; otherwise remove the experiment.
+6. Update profile schema only if a new permanent counter is required. Record
+   approximation bounds and retained performance/quality in
+   `volume-cartographer/docs/fiberlets.md` and `planning/changelog.md`; record
+   rejected variants and full measurements only in `planning/task_log.md`.
+
+#### Checkpoint 29 spec update
+
+- If retained, document the bounded interpolated transverse Gaussian, exact
+  cutoff ownership, fallback domain, determinism, and permitted numerical
+  differences. If rejected, leave production specifications unchanged.
+
+#### Checkpoint 29 documentation update
+
+- Document the direct approximation error and canonical performance/quality
+  result in `volume-cartographer/docs/fiberlets.md` only for a retained variant.
+- Record the retention decision in `planning/changelog.md`; retain all trial
+  details in `planning/task_log.md`.
+
+#### Checkpoint 29 result
+
+- Rejected the 513-entry linear-interpolation lookup. Its measured maximum
+  absolute/relative errors were `3.03e-5`/`3.07e-5`, but a direct paired replay
+  was tied at 6.84 seconds command wall while peak-search work increased from
+  31.11 to 31.43 worker-seconds.
+- Rejected the degree-six range-reduced polynomial. It improved approximation
+  error to `1.41e-5` maximum absolute and `2.81e-5` maximum relative, and
+  reproduced the exact checkpoint-28 artifact, but raised peak-search work to
+  35.54 worker-seconds, anchor wall to 4.204 seconds, and command wall to 6.97
+  seconds.
+- Removed both implementations and their direct tests. Production code,
+  specifications, user documentation, and changelog remain unchanged. Final
+  validation passes 83 GCC and 83 Clang anchor cases, 49 GCC path cases, and
+  6 GCC replay cases.
 
 ### Checkpoint 30: one-pass membership reuse experiment
 
-1. Reuse the robust assignments and retained membership from the accepted
-   default one-pass update instead of recomputing membership at its new
-   positions.
-2. Profile the removed scans explicitly. Keep the existing recomputation
-   available only as an experiment reference, not as a permanent compatibility
-   branch.
-3. Treat this as a fitting-quality change. Compare matched anchors, position
-   and angle tails, retained/unmatched populations, failure visualizations,
-   graph/DP work, and replay failures before retention.
-4. Do not repeat the rejected inline-membership experiment; this checkpoint
+1. Reuse the robust assignments and retained membership computed from the
+   geometry at the start of the terminal outer iteration and used to derive its
+   accepted geometry update, instead of unconditionally recomputing only
+   membership at the moved geometry after the refinement loop. In symbols,
+   change `M(S_n) -> S_(n+1) -> M(S_(n+1))` to
+   `M(S_n) -> S_(n+1)` for terminal membership. Axes,
+   centroids, backtracking, accepted positions, iteration stopping, component
+   removal, peak search, and final-support arithmetic remain unchanged.
+2. Preserve general multi-iteration behavior: every next outer iteration still
+   begins with a fresh robust proposal at the preceding iteration's accepted
+   geometry. Only the terminal membership-only refresh is removed. A component
+   removed as non-unique continues to restart the same iteration and cannot
+   leave stale component indices in the retained membership.
+3. Add a focused fixture where the accepted transverse move changes which
+   evidence would be assigned or retained by a post-move refresh. Verify that
+   final support and peak evidence attribution use the membership that justified
+   the accepted move. Also cover `maximumIterations > 1` with a forced
+   non-converged update that differs from one iteration, plus early convergence,
+   to prove ordinary between-iteration recomputation still occurs. Add explicit
+   compaction fixtures where original component zero is removed and component
+   one survives as compact index zero, where removal follows an earlier accepted
+   iteration, and where both components are removed; verify diagnostic IDs,
+   assigned counts, support, and peak evidence remain attached correctly.
+4. Use the existing `localTensorProposalWorkSeconds` and
+   `localTensorObservationVisits` counters to measure the removed scan; do not
+   add a profile field unless those aggregate counters cannot distinguish the
+   expected reduction in focused coverage. The removed terminal proposal makes
+   two complete observation scans, so expect `2 * observation_count` fewer
+   logical visits for every surviving terminal fit. Record that aggregate robust
+   mass/outlier counters no longer include a terminal refresh. Keep the
+   checkpoint-28 shared library as the external reference. Do not retain a
+   runtime selector or compatibility branch.
+5. Build and run focused GCC and Clang anchor tests, then one canonical
+   screening replay. Compare command/anchor wall and CPU, robust proposal work
+   and visits, RSS, matched-anchor position and projective-axis-angle p50/p95/max,
+   unmatched anchor counts, anchor/graph/fiberlet populations, DP work, emitted
+   route displacement, and greedy/fiberlet failures. Generate baseline and
+   candidate replay visualization artifacts for close/crossing fibers, large
+   moves, Gaussian/axial and robust-cutoff boundaries, and support-threshold
+   decisions. Exact numeric or artifact identity is not required. A screening
+   run may reject early; retention requires three interleaved baseline/candidate
+   runs with min/median/max. Retain only if quality remains comparable and the
+   removed pass yields a repeatable enclosing-runtime improvement; otherwise
+   restore the refresh and log rejection.
+6. Do not repeat the rejected inline-membership experiment: this checkpoint
    changes when membership is recomputed rather than adding its predicate to
    every downstream hot scan.
 
+#### Checkpoint 30 spec update
+
+- If retained, specify that terminal final evaluation and peak evidence
+  attribution use membership computed from the geometry at the start of the
+  terminal iteration, while every additional outer iteration still recomputes
+  membership. Correct the stale specification default for
+  `maximum_iterations` from two to the implemented and documented value one.
+  If rejected, leave production semantics unchanged but still correct that
+  pre-existing default-value inconsistency.
+
+#### Checkpoint 30 documentation update
+
+- If retained, update `volume-cartographer/docs/fiberlets.md` with terminal
+  membership semantics and measured performance/quality, and record the result
+  in `planning/changelog.md`. Keep rejected trial detail only in
+  `planning/task_log.md`.
+
+#### Checkpoint 30 result
+
+- Rejected terminal membership reuse after one canonical screening replay.
+  Command wall improved from the checkpoint-28 median `6.82` to `6.45` seconds,
+  anchor wall from `4.069` to `3.734` seconds, and anchor CPU from `111.61` to
+  `100.48` seconds. The candidate nevertheless reduced retained anchors from
+  2,603 to 2,568, graph nodes from 2,562 to 2,528, graph edges from 26,445 to
+  26,082, and DP relaxations from 62,873,000 to 62,214,882. Fiberlet replay
+  failures increased from one to two. Greedy output stayed exact, while the
+  fiberlet route had 351 points instead of 352.
+- Removed the production and focused-test experiment after that decisive quality
+  regression; three paired timing runs and visualization review were therefore
+  unnecessary. Production fitting semantics, user documentation, and changelog
+  remain unchanged. Corrected only the pre-existing specification typo that
+  listed two outer iterations as the default instead of one.
+
 ### Checkpoint 31: remaining DP throughput
 
-1. Profile transition-cost arithmetic and candidate completion tails under the
-   checkpoint-24 float representation.
-2. Test largest-candidate-first scheduling independently from any arithmetic
-   change. Preserve candidate result indexing and deterministic path decisions.
-3. If arithmetic remains material, test a portable vectorized transition
-   kernel with a scalar fallback for Ubuntu/macOS and amd64/arm64.
-4. Compare search wall/CPU, tail utilization, DP counters, selected paths,
-   artifact determinism, and replay quality. Its current 1.23-second wall-time
-   ceiling makes it lower priority than checkpoints 25-29.
+1. Use committed checkpoint 28 (`1675886b7`) as the production baseline. Test
+   scheduling independently from transition arithmetic, scoring, and DP data
+   representation.
+2. After candidate preparation, construct a stable work permutation ordered by
+   descending retained-node count. Retained-node count is already available and
+   is a cheap deterministic heuristic, but it is not assumed to predict direct
+   index initialization or reached-state/transition work exactly. Break ties by
+   original search index and measure its correlation with complete candidate
+   solve duration.
+3. Let search workers claim slots in that permutation while all candidates,
+   prepared data, errors, and solve profiles remain indexed by original search
+   index. Preserve each candidate's node order, edge order, state order,
+   arithmetic, and result placement.
+4. Record complete per-candidate solve duration and per-worker busy duration so
+   the screening run exposes completion-tail balance rather than only aggregate
+   CPU time. Add focused coverage for the pure descending-cost permutation,
+   stable ties, empty input, one-worker/multi-worker output equivalence,
+   canonical profile/index placement, and deterministic lowest-original-index
+   exception selection when failures complete out of order. Do not expose a
+   runtime selector or change serialized artifacts.
+5. Build and run focused GCC and repository-local Clang fiberlet-path tests.
+   Check host load, then run one canonical 32-thread screening replay. Compare
+   command wall/CPU, fiberlet search wall/CPU, DP work counters, candidate and
+   graph populations, route displacement, replay failures, artifact hash, and
+   peak RSS. Largest-first may otherwise hide a transient-memory regression by
+   starting the largest searches together.
+   Retain only if the enclosing search or command wall time improves beyond
+   ordinary run noise without a quality regression; otherwise remove it and
+   record the rejection.
+6. If scheduling is retained or rejected, profile transition-cost arithmetic
+   and candidate completion tails before testing a portable vectorized
+   transition kernel with a scalar fallback for Ubuntu/macOS and amd64/arm64.
+
+#### Checkpoint 31 spec update
+
+- If retained, specify only that independent fiberlet candidates may be
+  scheduled in estimated descending work order while their externally visible
+  order and all within-candidate decisions remain deterministic. If rejected,
+  leave production specifications unchanged.
+
+#### Checkpoint 31 documentation update
+
+- If retained, document the scheduling estimate and measured result in
+  `volume-cartographer/docs/fiberlets.md`, and add a concise changelog entry.
+  Keep rejected experiment details only in `planning/task_log.md`.
+
+#### Checkpoint 31 result
+
+- Rejected largest-candidate-first scheduling after one canonical screening
+  replay. Search wall remained `1.226` seconds, while worker busy times were
+  already tightly grouped from `1.214` to `1.219` seconds under the existing
+  dynamic queue. Retained-node count had only `0.476` Pearson correlation with
+  complete solve duration.
+- The candidate reproduced the exact checkpoint-28 artifact and replay quality,
+  but command wall was `6.92` seconds versus the `6.82`-second checkpoint-28
+  median. All scheduling and temporary timing code was removed. Production
+  source, profile schema, specifications, user documentation, and changelog
+  remain unchanged.
+
+### Checkpoint 32: DP transition-cost profiling
+
+1. Keep checkpoint 28 production behavior and first split existing DP worker
+   time with shared boundary timestamps into initialization/source seeding,
+   intermediate-layer propagation, final sink evaluation, traceback/result
+   materialization, and signed residual. The parent DP timer excludes local
+   vector/cache destruction; retain and document that existing boundary.
+2. Only for a deterministic hash sample of canonical candidate indices, time
+   the two interleaved propagation sections per reached node: outgoing-edge
+   construction including lazy scoring/deviation validation, and reached-state
+   transition scoring/relaxation. Report sampled propagation residual and work
+   counts as sampled evidence, not extrapolated exact totals.
+3. Record the existing generated/valid/reused edge, reached-state, transition
+   lookup, and relaxation counts beside the new work timings. Actual scored
+   transitions are `valid_edges + reused_edges`; transition lookups and
+   successful relaxations are different quantities.
+4. Add focused finite/nonnegative and signed-residual reconciliation invariants
+   for successful, no-path, direct, zero-length, and empty-corridor candidates.
+   Build GCC and Clang path tests, check host load, and run one canonical
+   profiling replay. Emit temporary diagnostics on a separate versioned profile
+   line and remove them if their overhead materially changes search wall time.
+5. Use the measured dominant phase to plan one isolated portable optimization.
+   Do not introduce SIMD, architecture-specific code, altered transition order,
+   or numerical changes during this profiling checkpoint.
+
+#### Checkpoint 32 spec update
+
+- None. This checkpoint measures existing implementation phases and does not
+  change search semantics or persistent output.
+
+#### Checkpoint 32 documentation update
+
+- Record profiling findings in `planning/task_log.md`. Do not update user docs
+  or the changelog unless a subsequent retained optimization changes the
+  implementation materially.
+
+#### Checkpoint 32 result
+
+- The canonical profile attributed `33.59` of `38.93` DP worker-seconds to
+  propagation, `3.93` to initialization/source seeding, `1.39` to sink
+  evaluation, `0.017` to traceback, and `0.004` to residual work. Search wall
+  was `1.230` seconds versus the `1.226`-second uninstrumented screening run, so
+  profiler overhead was negligible.
+- A deterministic 808-candidate sample covered 103,097 reached nodes. Within
+  sampled propagation, outgoing construction/lazy scoring used `0.2372` of
+  `0.5709` seconds (41.5%), transition scoring/relaxation used `0.3145` seconds
+  (55.1%), and residual control/allocation work used `0.0192` seconds (3.4%).
+  The exact checkpoint-28 artifact and replay quality were preserved.
+
+### Checkpoint 33: remove redundant DP direction normalization
+
+1. Directions produced as `delta / length` after positive finite length
+   validation are already unit directions to float precision. Add the explicit
+   finite checks missing from the current internal edge paths, then pass those
+   values directly into prepared metric scoring rather than immediately taking
+   a second square root and division through
+   `prepareFiberLocalUnitDirection()`.
+2. Collapse `DpIncoming`'s duplicate ordinary/metric direction and length
+   fields into one float direction and length. Rename the equivalent outgoing
+   edge fields if needed for clarity. Keep all geometry, traversal, metric,
+   state, accumulation, and tie ordering unchanged.
+3. Keep prediction-axis and normal-axis normalization unchanged; they are not
+   geometry-created directions. Add focused finite/near-epsilon/oblique geometry
+   coverage and multi-layer paths that exercise source and ordinary predecessor
+   states. Existing prepared-scoring and serial/parallel deterministic artifact
+   tests remain integration gates; comparisons affected by the removed second
+   normalization use tight tolerances rather than exact equality.
+4. Build GCC and Clang path/scoring tests. Run one canonical screening replay
+   with the checkpoint-32 profile retained temporarily, comparing outgoing,
+   transition, search, command, populations, artifact determinism, route
+   displacement, failures, and RSS. Small floating-point differences are
+   allowed, but retain only a measurable enclosing gain with comparable replay
+   quality.
+
+#### Checkpoint 33 spec update
+
+- If retained, clarify that DP geometry-created directions are validated once
+  and then consumed by prepared metric scoring as unit directions. No file or
+  user-facing configuration changes.
+
+#### Checkpoint 33 documentation update
+
+- If retained, record the prepared-direction invariant and measured result in
+  `volume-cartographer/docs/fiberlets.md` and add a concise changelog entry.
+  Keep rejected details only in `planning/task_log.md`.
+
+#### Checkpoint 33 result
+
+- Rejected. Three instrumented candidate runs measured median search wall
+  `1.216` seconds and DP worker time `38.466` seconds, versus
+  `1.230`/`38.932` for the identically instrumented checkpoint-28 path. The DP
+  worker reduction appeared to be 1.2%, but the required final uninstrumented
+  build measured `1.227`/`38.830`, effectively the checkpoint-28 baseline.
+- All candidate runs were deterministic. DP relaxations changed by eight and
+  accumulated costs changed slightly as expected, but emitted greedy and
+  fiberlet route points remained exact, with unchanged populations and 2 greedy
+  / 1 fiberlet failures. The direction change, temporary checkpoint-32
+  profiling, and proposed docs/spec/changelog updates were removed.
+
+### Checkpoint 34: inline prepared DP metric implementation
+
+1. Preserve the public `FiberLocalScoring` API and extract its alignment,
+   smoothness, and prepared-metric implementations into three private inline
+   primitives in one source-private header shared by the public wrappers and
+   `FiberPaths.cpp`. The private prepared primitive must call the private
+   alignment and smoothness primitives. Do not duplicate equations or
+   introduce a DP-specific scoring implementation.
+2. Route only the already-prepared DP transition path through the private
+   inline helper. Keep the generic normalization path, invalid-prediction path,
+   normal-aware fallback, arithmetic expression order, transition order,
+   accumulation, and tie policy unchanged. The source and sink paths may keep
+   using the public API because they are not the measured hot loop.
+3. Keep the private header under `core/src/fiber_tracer/` and use only portable
+   standard `inline`, without force-inline attributes. Verify with `nm -D` that
+   all public scoring symbols retain their signatures and visibility. Inspect
+   the optimized propagation call site specifically and require that it no
+   longer calls the interposable prepared-metric, alignment, or smoothness
+   symbols; calls elsewhere in the library remain legitimate.
+4. Extend exact generic/prepared branch coverage for invalid prediction, null
+   and invalid current prediction, sign flips, normal-aware and isotropic
+   fallback, degenerate directions, nonpositive lengths, and non-finite inputs.
+   Run focused GCC and repository-local Clang fiberlet-path tests plus GCC
+   replay tests. Require exact artifact hash, populations, DP counters, routes,
+   and failures because this is an implementation-placement change with
+   identical arithmetic.
+5. Build separate uninstrumented baseline and candidate libraries from the same
+   compiler configuration. Check host load, screen once, then, if viable, run
+   three alternating warm baseline/candidate pairs. Report min/median/max for
+   command wall/CPU, anchor wall/CPU, fiberlet wall/CPU, search wall/CPU, DP
+   worker time and counters, RSS, populations, routes, and failures. Retain only
+   a repeatable enclosing gain outside paired run noise; otherwise restore the
+   external-call path and log rejection.
+
+#### Checkpoint 34 spec update
+
+- None. Scoring equations, inputs, precision, and decisions remain unchanged.
+
+#### Checkpoint 34 documentation update
+
+- If retained, document only the shared inline prepared-scoring implementation
+  and measured result in `volume-cartographer/docs/fiberlets.md`, with a concise
+  changelog entry. Keep rejected details only in `planning/task_log.md`.
+
+#### Checkpoint 34 result
+
+- Retained. The optimized propagation loop has no calls to exported or
+  out-of-line private scoring helpers, while all five public scoring symbols
+  retain their exported signatures and visibility.
+- Three alternating, uninstrumented QuickBuild baseline/candidate pairs reduced
+  median search wall from `1.1652` to `1.0509` seconds (9.8%), search CPU from
+  `36.4426` to `32.9779` seconds (9.5%), DP worker time from `36.8775` to
+  `33.2330` seconds (9.9%), and fiberlet wall from `2.1290` to `2.0077` seconds
+  (5.7%). Median command wall improved from `7.87` to `7.75` seconds.
+- All six artifacts had SHA-256
+  `904c39d08e39c6b7b65ac95fd47d28d50e254a33609201c92aef71c6cc131308`,
+  with exact populations, DP counters, routes, and 2 greedy / 1 fiberlet
+  failures. Peak RSS medians were `1,611,932` KiB baseline and `1,601,256` KiB
+  candidate.

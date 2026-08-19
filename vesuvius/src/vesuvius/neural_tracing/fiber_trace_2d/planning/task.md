@@ -228,3 +228,18 @@ seconds, total CPU from 202.91 to 196.18 seconds, fiberlet wall from 2.519 to
 2.165 seconds, corner finalization from 0.268 to 0.0196 seconds, and peak RSS
 from 2,060,332 to 1,697,516 KiB. Exact artifact and replay behavior were
 retained. The sparse paged bitmap is retained.
+
+The current continuation accelerates the transverse Gaussian in the scalar
+direction-conditioned peak-response scan. Test a small process-wide float
+lookup with linear interpolation over a bounded normalized-exponent interval,
+with the existing `expf` calculation retained outside that interval. Keep the
+radial cutoff, response traversal, compensated accumulation, evidence handling,
+cache, hill climb, acceptance checks, and tie policy unchanged. Record direct
+approximation error and retain the change only when canonical peak work and
+end-to-end runtime improve with comparable anchor and replay quality.
+
+Checkpoint 29 tested both the bounded lookup and arithmetic-only polynomial.
+The lookup had no end-to-end gain and slightly increased peak-search work in a
+paired run. The polynomial met the error and replay-quality gates but clearly
+regressed peak, anchor, and command time. Both variants were removed; the
+committed `expf` implementation remains the production baseline.

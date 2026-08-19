@@ -331,6 +331,10 @@ axes, then charges `1-score`. This jointly penalizes trajectory turns,
 prediction discontinuities, and trajectory/prediction disagreement. The DP
 multiplies that loss by the actual mapped prediction-voxel edge length. There
 is no separate presence/direction weight or local direction quantization floor.
+The exported validating/prepared scoring functions and the prepared DP hot loop
+share one source-private inline implementation of alignment, smoothness, and
+metric composition. This preserves the public API and exact equations while
+avoiding interposable shared-library calls for every interior DP transition.
 
 Source and sink transitions use the fitted endpoint axes as proxy endpoint
 predictions; sink presence is one. Curvature uses the native tracer's shared
@@ -820,6 +824,13 @@ quantization are unchanged. `fiberlet_scoring_page_count` reports occupied
 pages, `fiberlet_scoring_page_slots` reports their dense index capacity, and
 `fiberlet_scoring_page_directory_probes` reports actual sparse-directory
 lookups after per-stencil reuse.
+
+On the canonical 5,000-base-voxel Paris4 replay, three alternating QuickBuild
+baseline/candidate pairs reduced median DP search wall from 1.165 to 1.051
+seconds and DP worker time from 36.88 to 33.23 seconds. Median fiberlet wall
+fell from 2.129 to 2.008 seconds and total command wall from 7.87 to 7.75
+seconds. Replay artifacts, populations, DP counters, routes, and failures were
+exact.
 
 Anchor-fit counters distinguish fitter invocations from nonempty cells and
 report seeds, seed pairs, seed-pair iterations, local-refinement attempts and

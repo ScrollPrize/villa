@@ -289,36 +289,72 @@ TEST_CASE("fiber local smoothness preserves native split equations")
 TEST_CASE("prepared fiber local scoring matches validating scoring")
 {
     using namespace vc::fiber_tracer;
-    const FiberLocalMetricSample current{{2.0f, 1.0f, 0.0f}, 0.75f, true};
-    const FiberLocalMetricSample candidate{{3.0f, -1.0f, 1.0f}, 0.6f, true};
-    const cv::Vec3f previousStep{4.0f, 1.0f, 0.0f};
-    const cv::Vec3f candidateStep{2.0f, -0.5f, 0.5f};
-    const cv::Vec3f normal{0.0f, 0.0f, 1.0f};
     const FiberLocalMetricConfig config{
         4.0f,
         FiberLocalSmoothnessConfig{2.0f, 0.1f, 10.0f, 0.05f},
     };
+    const auto checkExact = [&](const FiberLocalMetricSample* current,
+                                const FiberLocalMetricSample& candidate,
+                                const cv::Vec3f& previousStep,
+                                float previousLength,
+                                const cv::Vec3f& candidateStep,
+                                float candidateLength,
+                                const cv::Vec3f& normal,
+                                bool normalValid) {
+        const auto validating = fiberLocalMetricCost(
+            current, candidate, previousStep, previousLength,
+            candidateStep, candidateLength, normal, normalValid, config);
+        FiberLocalMetricSample preparedCurrent;
+        const FiberLocalMetricSample* preparedCurrentPointer = nullptr;
+        if (current != nullptr) {
+            preparedCurrent = *current;
+            preparedCurrent.direction =
+                prepareFiberLocalUnitDirection(preparedCurrent.direction);
+            preparedCurrentPointer = &preparedCurrent;
+        }
+        FiberLocalMetricSample preparedCandidate = candidate;
+        preparedCandidate.direction =
+            prepareFiberLocalUnitDirection(preparedCandidate.direction);
+        const auto prepared = fiberLocalMetricCostPrepared(
+            preparedCurrentPointer, preparedCandidate,
+            prepareFiberLocalUnitDirection(previousStep), previousLength,
+            prepareFiberLocalUnitDirection(candidateStep), candidateLength,
+            normal, normalValid, config);
 
-    const auto validating = fiberLocalMetricCost(
-        &current, candidate, previousStep, 1.5f, candidateStep, 2.25f,
-        normal, true, config);
-    FiberLocalMetricSample preparedCurrent = current;
-    preparedCurrent.direction =
-        prepareFiberLocalUnitDirection(preparedCurrent.direction);
-    FiberLocalMetricSample preparedCandidate = candidate;
-    preparedCandidate.direction =
-        prepareFiberLocalUnitDirection(preparedCandidate.direction);
-    const auto prepared = fiberLocalMetricCostPrepared(
-        &preparedCurrent, preparedCandidate,
-        prepareFiberLocalUnitDirection(previousStep), 1.5f,
-        prepareFiberLocalUnitDirection(candidateStep), 2.25f,
-        normal, true, config);
+        CHECK(prepared.invalidPrediction == validating.invalidPrediction);
+        CHECK(prepared.alignment == validating.alignment);
+        CHECK(prepared.isotropicSmoothness == validating.isotropicSmoothness);
+        CHECK(prepared.tangentSmoothness == validating.tangentSmoothness);
+        CHECK(prepared.normalSmoothness == validating.normalSmoothness);
+    };
 
-    CHECK(prepared.invalidPrediction == validating.invalidPrediction);
-    CHECK(prepared.alignment == validating.alignment);
-    CHECK(prepared.isotropicSmoothness == validating.isotropicSmoothness);
-    CHECK(prepared.tangentSmoothness == validating.tangentSmoothness);
-    CHECK(prepared.normalSmoothness == validating.normalSmoothness);
+    const FiberLocalMetricSample current{{2.0f, 1.0f, 0.0f}, 0.75f, true};
+    const FiberLocalMetricSample invalidCurrent{{2.0f, 1.0f, 0.0f}, 0.75f, false};
+    const FiberLocalMetricSample candidate{{3.0f, -1.0f, 1.0f}, 0.6f, true};
+    const FiberLocalMetricSample flippedCandidate{{-3.0f, 1.0f, -1.0f}, 0.6f, true};
+    const FiberLocalMetricSample invalidCandidate{{}, 0.6f, false};
+    const FiberLocalMetricSample nonFinitePresence{
+        {3.0f, -1.0f, 1.0f},
+        std::numeric_limits<float>::quiet_NaN(),
+        true};
+    const cv::Vec3f previousStep{4.0f, 1.0f, 0.0f};
+    const cv::Vec3f candidateStep{2.0f, -0.5f, 0.5f};
+    const cv::Vec3f normal{0.0f, 0.0f, 1.0f};
+
+    checkExact(&current, candidate, previousStep, 1.5f,
+               candidateStep, 2.25f, normal, true);
+    checkExact(nullptr, candidate, previousStep, 1.5f,
+               candidateStep, 2.25f, normal, true);
+    checkExact(&invalidCurrent, candidate, previousStep, 1.5f,
+               candidateStep, 2.25f, {}, false);
+    checkExact(&current, flippedCandidate, previousStep, 1.5f,
+               candidateStep, 2.25f, {}, false);
+    checkExact(&current, invalidCandidate, previousStep, -1.5f,
+               candidateStep, -2.25f, normal, true);
+    checkExact(&current, candidate, {}, 0.0f,
+               {}, 0.0f, normal, true);
+    checkExact(&current, nonFinitePresence, previousStep, 1.5f,
+               candidateStep, 2.25f, normal, true);
 }
 
 TEST_CASE("fiber local alignment loss preserves native multiplicative scoring")

@@ -1389,3 +1389,245 @@
 - Final validation passed GCC `test_fiber_anchors` (83),
   `test_fiberlet_paths` (49), and `test_fiber_replay` (6), plus repository-local
   Clang `test_fiber_anchors` (83). `git diff --check` passed.
+
+## Checkpoint 29: peak Gaussian acceleration
+
+- Inspected `findDirectionConditionedLocalPeak()`. The axial Gaussian is already
+  computed once during response-record preparation. The remaining target is
+  solely the transverse `expf` inside every in-cutoff `responseAt()` visit;
+  checkpoint-24 profiling attributes roughly 33.75 worker-seconds and 2.97
+  billion logical visits to the enclosing peak scan.
+- Planned a 512-interval, 2 KiB process-wide float table over normalized
+  exponents `[0,8]`, with linear interpolation and the library calculation as
+  fallback outside the bounded ordinary domain. The default cutoff's maximum
+  exponent is 4.5. Cutoff handling remains in the caller, and no response
+  traversal, accumulator, cache, hill-climb, or tie behavior changes.
+- Independent review corrected the target count: the 2.974 billion profile
+  value counts all response-record visits before radial rejection. Checkpoint-18
+  instrumentation measured 768.2 million in-cutoff grid passes and 65.6 million
+  in-cutoff acceptance passes, or about 833.9 million actual transverse
+  exponentials. The 33.75 worker-seconds is the complete peak-search phase, not
+  isolated exponential time.
+- The review also required concrete error/geometry gates, external comparison
+  instead of a second production runtime path, alternating baseline/candidate
+  QuickBuild runs, fixed-seed boundary tests, and an inline lookup with the
+  513-entry immutable table acquired outside the hot loop. The plan now uses
+  serialized discrete/separable/joint diagnostics for direct peak comparison
+  and records changed discrete peaks separately.
+- Implemented and directly tested the 513-entry lookup. Across 16,777,217
+  evenly spaced exponents in `[0,8]`, maximum/mean absolute error was
+  `3.0279e-5`/`2.5418e-6` and maximum/mean relative error was
+  `3.0651e-5`/`2.0344e-5`. GCC and Clang each passed 85 anchor cases.
+- The lookup screening run measured 6.85 seconds command wall, 4.095 seconds
+  anchor wall, 111.76 seconds anchor CPU, and 31.43 peak-search worker-seconds.
+  A subsequent direct alternating pair measured:
+
+  | metric | checkpoint 28 | lookup |
+  |---|---:|---:|
+  | command wall | 6.84 s | 6.84 s |
+  | anchor wall | 4.087 s | 4.087 s |
+  | anchor CPU | 111.45 s | 111.33 s |
+  | peak-search work | 31.11 s | 31.43 s |
+  | peak RSS | 1,684,644 KiB | 1,663,816 KiB |
+
+  Both lookup runs were deterministic with replay SHA-256
+  `e5df94aa0280b7f5401819e929bbf4df22e2434d79722a26bef2e2f4a9f7d4eb`,
+  unchanged populations and 2 greedy / 1 fiberlet failures. Greedy routes were
+  exact; fiberlet route displacement was p50/p95 zero and maximum 0.0081 base
+  voxels. With no enclosing gain and slightly worse target work, the lookup was
+  removed without running three pairs.
+- Tested an arithmetic-only degree-six polynomial after `ln(2)` range reduction.
+  Across the same dense exponent set, maximum/mean absolute error was
+  `1.4067e-5`/`3.0679e-7` and maximum/mean relative error was
+  `2.8133e-5`/`3.1395e-6`. It reproduced the exact checkpoint-28 replay SHA-256
+  `f2b8e679c23470d1221f7930a21b0c37fa0906845de0bc2cbf3e8ab7329f78ee`
+  and exact greedy/fiberlet routes, but regressed to 35.54 peak-search worker-
+  seconds, 4.204 anchor wall / 114.62 anchor CPU seconds, and 6.97 command wall
+  seconds. It was removed after this clear screening rejection.
+- Final production source matches checkpoint 28. GCC passes 83 anchor, 49 path,
+  and 6 replay cases; repository-local Clang passes all 83 anchor cases.
+  Production specifications, user documentation, and changelog are unchanged.
+
+## Checkpoint 30: terminal membership reuse
+
+- Reviewed the terminal robust-membership flow independently before editing.
+  Current production computes `M(S_n)`, derives accepted geometry `S_(n+1)`,
+  then computes a membership-only `M(S_(n+1))` for peak evidence attribution
+  and final support. The experiment removed only that terminal refresh; later
+  outer iterations still began with a fresh proposal.
+- The review corrected two planning errors: the reused membership belongs to
+  the geometry at the start of the terminal iteration rather than the accepted
+  final geometry, and it controls peak evidence attribution rather than
+  geometric peak ownership. It also established that the refresh makes two
+  complete observation scans and contributes to aggregate robust mass/outlier
+  counters.
+- Implemented the isolated removal without a runtime selector. Focused tests
+  asserted two observation scans per attempted outer iteration, forced a
+  two-iteration off-center fit, and checked deterministic repeated output. GCC
+  passed 84 anchor, 49 path, and 6 replay cases; repository-local Clang passed
+  all 84 anchor cases.
+- The canonical QuickBuild screening command used 32 threads, length 5000, the
+  Paris4 `fiber_s1_002.lasagna.json` prediction manifest, reviewed fiber
+  `dj_20260805T025256484_000003.json`, and Lasagna normals
+  `las008_s1_full/las_008.lasagna.json`. Host load was below the agreed two-core
+  exclusion threshold.
+- Candidate performance was command wall `6.45` seconds, total CPU `166.90`
+  seconds, anchor wall `3.734` seconds, anchor CPU `100.48` seconds, and peak RSS
+  `1,655,756` KiB. Relative to checkpoint-28 medians, command wall improved
+  `5.4%`, anchor wall `8.2%`, and anchor CPU `10.0%`.
+- Quality regressed: retained anchors changed `2603 -> 2568`, graph nodes
+  `2562 -> 2528`, graph edges `26445 -> 26082`, and DP relaxations
+  `62,873,000 -> 62,214,882`. Greedy output remained exact across 631 compared
+  points, but the fiberlet route changed from 352 to 351 points and fiberlet
+  replay failures increased `1 -> 2`. The candidate artifact SHA-256 was
+  `ff497ed5079b105a3371caf3735c96c86a694b6a08bda8fe092adfc77bb10616`,
+  versus checkpoint 28
+  `f2b8e679c23470d1221f7930a21b0c37fa0906845de0bc2cbf3e8ab7329f78ee`.
+- Rejected and removed the experiment after the decisive failure regression;
+  three paired runs and visualization review were skipped as planned for an
+  early quality rejection. Production behavior, user documentation, and
+  changelog remain unchanged. Corrected the pre-existing `specs.md` default
+  from two outer iterations to the implemented and documented value one.
+- Final restored validation passes 83 GCC anchor, 49 GCC path, 6 GCC replay,
+  and 83 repository-local Clang anchor cases. `git diff --check` passes and
+  there is no remaining production-source or test diff from checkpoint 28.
+
+## Checkpoint 31: largest-candidate-first DP scheduling
+
+- Started an isolated scheduling experiment from committed checkpoint 28.
+  Prepared retained-node count will be used as a stable, zero-extra-traversal
+  work estimate. Workers will consume a separate descending-cost permutation;
+  all candidate data, profiles, errors, and results remain in original order.
+- This checkpoint changes only inter-candidate execution order. It does not
+  change any candidate's node, transition, state, scoring, or accumulation
+  order. A canonical screening replay will decide retention before transition
+  arithmetic work begins.
+- Independent review accepted the isolated trial but corrected the estimate's
+  description: retained nodes are a deterministic heuristic, while direct-index
+  initialization depends on key-layout size and dominant DP work depends on
+  reached states and valid transitions. The implementation will record complete
+  candidate and worker durations, test canonical profile/error indexing, and
+  include peak RSS in the retention decision.
+- Implemented a stable descending retained-node-count permutation and temporary
+  complete candidate/worker timing. GCC and repository-local Clang each passed
+  all 50 fiberlet-path cases, including exact serial/parallel JSON and OBJ
+  equivalence.
+- The canonical 32-thread screening replay measured `1.2263` seconds search
+  wall and `38.36` seconds search CPU. Worker busy times ranged only
+  `1.2140-1.2191` seconds, maximum candidate solve time was `0.0173` seconds,
+  and retained-node-count/solve-duration Pearson correlation was `0.4762`.
+  Command wall was `6.92` seconds, total CPU `179.54` seconds, anchor wall
+  `4.135` seconds, and peak RSS `1,671,000` KiB.
+- The artifact SHA-256 remained exactly
+  `f2b8e679c23470d1221f7930a21b0c37fa0906845de0bc2cbf3e8ab7329f78ee`,
+  with 2,603 anchors, 2,562 graph nodes, 26,445 edges, 62,873,000 relaxations,
+  and 2 greedy / 1 fiberlet failures. Because the existing dynamic queue was
+  already balanced and no search or command gain appeared, the experiment and
+  profile-schema additions were removed.
+
+## Checkpoint 32: DP transition-cost profiling
+
+- Started a measurement-only split of the remaining DP work into coarse
+  per-candidate phases. Timing will stay outside individual transition calls so
+  the profiler does not manufacture the bottleneck it is intended to measure.
+- Independent review found that outgoing construction and transition scoring
+  are interleaved per reached node, so coarse timers cannot split them directly.
+  The revised two-tier profile uses four full candidate boundaries, then times
+  the interleaved sections only on a deterministic candidate sample. It also
+  distinguishes generated-edge lookups, scored transitions
+  (`valid + reused`), and successful relaxations.
+- GCC and repository-local Clang each passed all 49 fiberlet-path cases. The
+  canonical instrumented replay measured `1.2300` seconds search wall and
+  `38.56` seconds search CPU, versus `1.2263`/`38.36` for the immediately prior
+  uninstrumented scheduling run. The temporary profile therefore adds only
+  about 0.3% search-wall overhead.
+- Of `38.9321` aggregate DP worker-seconds, initialization/source seeding used
+  `3.9327`, propagation `33.5895`, sink evaluation `1.3890`, traceback
+  `0.0173`, and residual `0.0036`. The deterministic sample covered 808
+  candidates, 103,097 reached nodes, 504,620 valid edges, and 2,062,773 scored
+  transitions. Sampled propagation split into `0.2372` seconds outgoing
+  construction/lazy validation, `0.3145` transition scoring/relaxation, and
+  `0.0192` residual.
+- Command wall was `6.89` seconds, peak RSS `1,664,732` KiB, and artifact SHA
+  remained exactly
+  `f2b8e679c23470d1221f7930a21b0c37fa0906845de0bc2cbf3e8ab7329f78ee`,
+  with unchanged populations and 2 greedy / 1 fiberlet failures.
+
+## Checkpoint 33: prepared DP direction reuse
+
+- Started an isolated removal of second normalization for directions already
+  constructed from a checked positive finite length. The checkpoint-32 profile
+  remains temporarily active to show whether outgoing construction improves.
+- Independent review found that the current internal edge checks do not
+  explicitly reject infinite lengths; the existing second normalization only
+  sanitizes the resulting direction. The experiment will add explicit finite
+  guards, remain limited to geometry-created directions, and retain all decoded
+  prediction/normal normalization. Removing the second normalization permits
+  small cost changes near DP ties, so route quality rather than exact artifact
+  identity is the acceptance gate.
+- Implemented explicit finite edge-length checks, collapsed duplicate incoming
+  direction/length fields, and passed checked `delta / length` directions
+  directly to prepared metric scoring. Prediction and normal normalization are
+  unchanged. GCC and repository-local Clang each passed all 49 path cases.
+- Three canonical instrumented runs measured search wall
+  `1.2051/1.2156/1.2158` seconds and DP worker time
+  `38.1351/38.4658/38.4838` seconds (min/median/max). The identically
+  instrumented checkpoint-28 profile measured `1.2300`/`38.9321`; median DP
+  worker time improved 1.2%. Median command wall was `6.90` seconds, but that
+  remained dominated by anchor variation and is not claimed as an enclosing
+  gain.
+- All three candidate artifacts had SHA-256
+  `833bd8cbf8699fb2a3f4558402ee2112fa705adbe2d9036a97db34707f6d4882`.
+  Accumulated costs and eight relaxation decisions changed slightly, but both
+  fiberlet route-point arrays and greedy output were exact against checkpoint
+  28. Populations remained 2,603 anchors, 2,562 graph nodes, 26,445 edges, and
+  failures remained 2 greedy / 1 fiberlet. Temporary DP profiling was then
+  removed for the required production-build measurement.
+- The required final uninstrumented build disproved that retention decision:
+  search wall was `1.2266` seconds and DP worker time `38.8303` seconds, versus
+  checkpoint-28 `1.2263` and roughly `38.7-38.9`. The apparent instrumented
+  gain was a code-generation interaction with the temporary profile. Because
+  production had no measurable gain while costs and eight relaxations changed,
+  the direction reuse and its proposed docs/spec/changelog updates were removed.
+- After restoring the checkpoint-28 source exactly, final validation passed all
+  49 GCC fiberlet-path cases, 6 GCC replay cases, and 49 repository-local Clang
+  fiberlet-path cases. No checkpoint-31 through checkpoint-33 source,
+  documentation, specification, or changelog changes remain.
+
+## Checkpoint 34: inline prepared DP metric implementation
+
+- Optimized-binary inspection found that every hot prepared DP transition
+  crosses interposable calls to `fiberLocalMetricCostPrepared()`,
+  `fiberLocalAlignmentLoss()`, and `fiberLocalSmoothnessCost()`. Checkpoint 32
+  measured transition scoring/relaxation as 55.1% of sampled propagation, so a
+  shared private inline implementation is the next isolated target.
+- Independent review required three private primitives in one source-private
+  header, call-site-specific disassembly, exported-symbol verification, wider
+  exact branch parity, and alternating rebuilt baseline/candidate timing. These
+  constraints were incorporated before implementation.
+- The first helper version used external-linkage `inline` functions. Binary
+  inspection caught that GCC still emitted interposable helper calls. Changing
+  the source-private primitives to standard `static inline` removed every
+  scoring-helper call from the propagation loop while leaving the exported
+  wrappers and all five public symbols intact.
+- Exact generic/prepared parity now covers valid normal-aware scoring, null and
+  invalid current predictions, candidate-axis sign flips, invalid candidates,
+  isotropic fallback, degenerate directions, nonpositive lengths, and
+  non-finite presence. All 49 GCC path, 6 GCC replay, and 49 repository-local
+  Clang path cases pass.
+- An initial paired set was discarded because the detached baseline had
+  `VC_TESTING=OFF` while the established QuickBuild had `VC_TESTING=ON`. The
+  baseline was reconfigured to match the relevant main build options before
+  final timing; no result from the mismatched set is used below.
+- Three alternating uninstrumented pairs measured baseline/candidate medians:
+  command wall `7.87/7.75` seconds, search wall `1.1652/1.0509`, search CPU
+  `36.4426/32.9779`, DP worker time `36.8775/33.2330`, fiberlet wall
+  `2.1290/2.0077`, fiberlet CPU `62.5471/59.1116`, and peak RSS
+  `1,611,608/1,601,256` KiB. The search, DP, and fiberlet improvements were
+  repeatable in every pair; total command wall improved despite monotonically
+  rising anchor time across the alternating sequence.
+- All six runs retained 2,519 anchors, 48,852 searched candidates, 24,475
+  accepted candidates, 47,790,462 evaluated nodes, 58,058,924 relaxations, and
+  2 greedy / 1 fiberlet failures. Every `fiber_replay.json` was byte-identical
+  with SHA-256
+  `904c39d08e39c6b7b65ac95fd47d28d50e254a33609201c92aef71c6cc131308`.
