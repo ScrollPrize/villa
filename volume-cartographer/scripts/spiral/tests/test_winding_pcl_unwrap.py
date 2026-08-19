@@ -5,12 +5,12 @@ import numpy as np
 import torch
 
 import losses
-from native_spiral import load_native_spiral_sampling
+from spiral_sampling import load_spiral_sampling
 from theta_crossing_map import ThetaCrossingMap
 
 
 DR = 12.0
-native = load_native_spiral_sampling()
+spiral_sampling = load_spiral_sampling()
 
 
 class _IdentityTransform:
@@ -22,14 +22,14 @@ class _Atlas:
     device = torch.device('cpu')
 
     def __init__(self, patch_points, node_maps):
-        if native is None:
+        if spiral_sampling is None:
             raise RuntimeError('vc.spiral_sampling is required by this test')
         self.patch_points = [torch.tensor(p, dtype=torch.float32)
                              for p in patch_points]
         self.node_maps = node_maps
         self.id_to_idx = {f'p{idx + 1}': idx
                           for idx in range(len(patch_points))}
-        self.sampling_atlas = native.PatchSamplingAtlas([
+        self.sampling_atlas = spiral_sampling.PatchSamplingAtlas([
             np.ones((1, len(points)), dtype=bool)
             for points in patch_points
         ])

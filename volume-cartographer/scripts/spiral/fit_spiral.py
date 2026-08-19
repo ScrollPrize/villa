@@ -45,7 +45,7 @@ from lasagna_data import (ensure_fit_sparse_stores, prepare_lasagna_volume,
                           prepare_surf_sdt_volume)
 from checkpoint_io import load_checkpoint_cpu
 from influence import make_influence_state, subsample_rows
-from native_spiral import load_native_spiral_sampling
+from spiral_sampling import load_spiral_sampling
 from tifxyz import load_tifxyz
 from geom_utils import bilinear_atlas_lookup, interp1d
 from point_collection import (
@@ -304,22 +304,22 @@ class ShellPolarMap:
         return target_radius, radius, confidence, valid
 
 
-def _make_native_patch_sampling_atlas(masks):
-    """Construct the required native sampler, rejecting missing/stale builds."""
-    native = load_native_spiral_sampling()
+def _make_patch_sampling_atlas(masks):
+    """Construct the required sampler, rejecting missing or stale bindings."""
+    spiral_sampling = load_spiral_sampling()
     atlas_type = (
-        getattr(native, 'PatchSamplingAtlas', None)
-        if native is not None else None)
+        getattr(spiral_sampling, 'PatchSamplingAtlas', None)
+        if spiral_sampling is not None else None)
     if atlas_type is None:
         raise RuntimeError(
             'Patch sampling requires vc.spiral_sampling.PatchSamplingAtlas; '
-            'rebuild and install the vc_spiral_sampling native extension')
+            'rebuild and install the vc_spiral_sampling extension')
     atlas = atlas_type(masks)
     if not hasattr(atlas, 'sample_patch_points'):
         raise RuntimeError(
             'The installed vc.spiral_sampling binding is out of date: '
             'PatchSamplingAtlas.sample_patch_points is missing; rebuild and '
-            'install the vc_spiral_sampling native extension')
+            'install the vc_spiral_sampling extension')
     return atlas
 
 
@@ -360,7 +360,7 @@ class PatchAtlas:
             for p in patches_by_id.values()
         ]
         self.sampling_atlas = (
-            _make_native_patch_sampling_atlas(masks) if masks else None)
+            _make_patch_sampling_atlas(masks) if masks else None)
 
     def memory_mb(self):
         return self.zyxs_flat.numel() * 4 / 1e6
@@ -383,7 +383,7 @@ class PatchAtlas:
             for patch in self._patches
         ]
         self.sampling_atlas = (
-            _make_native_patch_sampling_atlas(masks) if masks else None)
+            _make_patch_sampling_atlas(masks) if masks else None)
 
     def lookup(self, patch_idx_per_sample, ijs):
         # Caller must ensure floor(ij) lies on a valid quad. CPU lookup remains
@@ -581,7 +581,7 @@ class PatchAtlas:
         if self.sampling_atlas is not None:
             self.sampling_atlas.append(masks)
         else:
-            self.sampling_atlas = _make_native_patch_sampling_atlas(masks)
+            self.sampling_atlas = _make_patch_sampling_atlas(masks)
 
 
 class _UnattachedPclStripList(list):

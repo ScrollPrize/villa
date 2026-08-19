@@ -30,14 +30,14 @@ unwrap-frame change (see snap_patch_dt_target / snap_strip_dt_target).
 import numpy as np
 import torch
 
-from native_spiral import load_native_spiral_sampling
+from spiral_sampling import load_spiral_sampling
 from sample_spiral import (
     get_theta_and_radii,
     get_theta_crossing_step_adjustments,
 )
 
 
-_native_spiral_sampling = load_native_spiral_sampling()
+_spiral_sampling = load_spiral_sampling()
 
 
 class DtTargetCacheManager:
@@ -329,8 +329,8 @@ def prepare_patch_dt_target_samples(patches, num_points, max_stride_voxels):
         row_edges = np.linspace(r0, r1, nr + 1)
         col_edges = np.linspace(c0, c1, nc + 1)
         patch._dt_target_anchor_max_dist_sq = 4.0 * ((box_h / nr) ** 2 + (box_w / nc) ** 2)
-        if _native_spiral_sampling is not None:
-            prepared = _native_spiral_sampling.prepare_dt_samples(
+        if _spiral_sampling is not None:
+            prepared = _spiral_sampling.prepare_dt_samples(
                 np.ascontiguousarray(mask, dtype=bool),
                 np.ascontiguousarray(row_edges, dtype=np.int64),
                 np.ascontiguousarray(col_edges, dtype=np.int64),
@@ -373,8 +373,8 @@ def _unwrap_block_samples(theta, block_rc, block_shape):
     # offset relative to it, so callers must exclude them from pooling.
     num_samples = len(theta)
     nr, nc = block_shape
-    if _native_spiral_sampling is not None:
-        result = _native_spiral_sampling.unwrap_block_samples(
+    if _spiral_sampling is not None:
+        result = _spiral_sampling.unwrap_block_samples(
             np.ascontiguousarray(theta, dtype=np.float32),
             np.ascontiguousarray(block_rc, dtype=np.int32),
             int(nr),

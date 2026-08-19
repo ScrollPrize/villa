@@ -160,15 +160,15 @@ def get_shell_outer_loss(shell_map, slice_to_spiral_transform, dr_per_winding, o
 
 
 def _sample_patch_points(patch_indices, cap, rng, patch_atlas):
-    """Sample patch quads through the required native sampling binding."""
-    native_atlas = getattr(patch_atlas, 'sampling_atlas', None)
-    if native_atlas is None or not hasattr(native_atlas, 'sample_patch_points'):
+    """Sample patch quads through the required vc sampling binding."""
+    sampling_atlas = getattr(patch_atlas, 'sampling_atlas', None)
+    if sampling_atlas is None or not hasattr(sampling_atlas, 'sample_patch_points'):
         raise RuntimeError(
             'Patch sampling requires '
             'vc.spiral_sampling.PatchSamplingAtlas.sample_patch_points; '
-            'rebuild and install the vc_spiral_sampling native extension')
+            'rebuild and install the vc_spiral_sampling extension')
     seed = int(rng.randint(0, np.iinfo(np.int64).max))
-    sampled = native_atlas.sample_patch_points(
+    sampled = sampling_atlas.sample_patch_points(
         np.ascontiguousarray(patch_indices, dtype=np.int64), cap, seed)
     return (
         np.asarray(sampled['ijs'], dtype=np.float32),

@@ -5,19 +5,19 @@ import pytest
 import torch
 
 import losses
-from native_spiral import load_native_spiral_sampling
+from spiral_sampling import load_spiral_sampling
 
 
-native = load_native_spiral_sampling()
+spiral_sampling = load_spiral_sampling()
 
 
 class _Atlas:
     device = torch.device('cpu')
 
     def __init__(self, masks):
-        if native is None:
+        if spiral_sampling is None:
             raise RuntimeError('vc.spiral_sampling is required by this test')
-        self.sampling_atlas = native.PatchSamplingAtlas(masks)
+        self.sampling_atlas = spiral_sampling.PatchSamplingAtlas(masks)
         self.node_maps = []
         start = 0
         for mask in masks:
@@ -48,7 +48,7 @@ def _patch(mask):
     )
 
 
-def test_patch_sampler_requires_current_native_binding():
+def test_patch_sampler_requires_current_binding():
     with pytest.raises(RuntimeError, match='sample_patch_points'):
         losses._sample_patch_points(
             np.array([0]), 8, np.random.RandomState(7),

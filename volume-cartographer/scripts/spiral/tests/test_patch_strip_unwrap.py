@@ -7,12 +7,12 @@ import torch
 from config import Config
 import losses
 from losses import get_unverified_patch_losses
-from native_spiral import load_native_spiral_sampling
+from spiral_sampling import load_spiral_sampling
 from theta_crossing_map import ThetaCrossingMap
 
 DR = 12.0
 CELL = 20.0
-native = load_native_spiral_sampling()
+spiral_sampling = load_spiral_sampling()
 
 class IdentityTransform:
     def __call__(self, zyxs):
@@ -46,12 +46,12 @@ class FakeAtlas:
     # bilinear lookup, results moved to `device`.
 
     def __init__(self, grids, device):
-        if native is None:
+        if spiral_sampling is None:
             raise RuntimeError('vc.spiral_sampling is required by this test')
         self.grids = grids
         self.device = torch.device(device)
         self.node_maps = []
-        self.sampling_atlas = native.PatchSamplingAtlas([
+        self.sampling_atlas = spiral_sampling.PatchSamplingAtlas([
             np.ones((grid.shape[0] - 1, grid.shape[1] - 1), dtype=bool)
             for grid in grids
         ])
