@@ -59,12 +59,6 @@ class ChunkKey:
     col: int
 
 
-_Z_REDUCTIONS = {
-    "max": lambda logits: logits.amax(dim=2),
-    "mean": lambda logits: logits.mean(dim=2),
-}
-
-
 class TargetHeadWrapper(nn.Module):
     def __init__(
         self,
@@ -72,18 +66,12 @@ class TargetHeadWrapper(nn.Module):
         *,
         target_name: str,
         input_pad_depth_to: int | None = None,
-        z_reduce: str = "max",
         z_window: tuple[int, int] | None = None,
     ):
         super().__init__()
         self.model = model
         self.target_name = str(target_name)
         self.input_pad_depth_to = input_pad_depth_to
-        self.z_reduce = str(z_reduce).strip().lower()
-        if self.z_reduce not in _Z_REDUCTIONS:
-            raise ValueError(
-                f"Unknown z reduction {z_reduce!r}; allowed: {sorted(_Z_REDUCTIONS)!r}"
-            )
         if z_window is not None:
             start, stop = (int(v) for v in z_window)
             if start < 0 or stop <= start:
@@ -112,10 +100,17 @@ class TargetHeadWrapper(nn.Module):
             logits = logits[0]
         if logits.ndim == 5:
             # A model trained on depth-resolved targets predicts a volume. The
-            # surface map this writes is that volume seen from above, which is
-            # also what a z-projecting model would have produced, so the two
-            # stay comparable on the same held-out split.
-            if self.z_window is not None:
+            # surface map this writes is that volume under a max over z, which
+            # is what a z-projecting model would have produced, so the two stay
+            # comparable on the same held-out split.
+            if self.z_window is None:
+                LOGGER.warning(
+                    "Reducing a volume prediction over its full depth. Slices the "
+                    "training loss did not cover carry no signal and a max over "
+                    "them can bury the ink; pass --z-window with the supervised "
+                    "range instead."
+                )
+            else:
                 # Only the slices the training loss actually covered. Outside
                 # the supervised column the network was free to predict
                 # anything, and it does: measured on a depth-target run, ink
@@ -128,7 +123,7 @@ class TargetHeadWrapper(nn.Module):
                         f"z window {self.z_window} starts past the prediction depth {depth}"
                     )
                 logits = logits[:, :, start:min(stop, depth)]
-            logits = _Z_REDUCTIONS[self.z_reduce](logits)
+            logits = logits.amax(dim=2)
         return logits
 
 
@@ -515,15 +510,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=(
             "Comma-separated CUDA device ids to use for inference, for example 0 or 0,1,2,3. "
             "When multiple GPUs are provided, each inference batch is split across those devices."
-        ),
-    )
-    parser.add_argument(
-        "--z-reduce",
-        default="max",
-        choices=sorted(_Z_REDUCTIONS),
-        help=(
-            "How a volume prediction becomes the surface map that gets written. "
-            "Only applies to models trained with depth-resolved targets."
         ),
     )
     parser.add_argument(
@@ -1407,7 +1393,6 @@ def build_repo_training_model_bundle(
     payload: dict[str, Any],
     checkpoint_path: Path | str,
     *,
-    z_reduce: str = "max",
     z_window: tuple[int, int] | None = None,
 ) -> ConfiguredModel:
     from koine_machines.models.make_model import make_model
@@ -1434,7 +1419,6 @@ def build_repo_training_model_bundle(
         base_model,
         target_name=infer_target_name_from_config(config),
         input_pad_depth_to=configured_input_pad_depth(config),
-        z_reduce=z_reduce,
         z_window=z_window,
     )
     model.eval()
@@ -1469,7 +1453,6 @@ def configure_model(args: argparse.Namespace) -> ConfiguredModel:
         configured_model = build_repo_training_model_bundle(
             checkpoint_payload,
             args.checkpoint,
-            z_reduce=getattr(args, "z_reduce", "max"),
             z_window=parse_z_window(getattr(args, "z_window", None)),
         )
         configured_model.amp_dtype = resolved_amp_dtype
