@@ -324,6 +324,11 @@ class SampledWalk:
     node_ids: np.ndarray
     pick_positions: np.ndarray
     connect_fractional_picks: bool
+    # Most strip losses define their theta frame at the first sparse pick.
+    # Anchor-supervised walks (relative/absolute winding PCLs) instead carry
+    # the exact annotated PCL node whose raw shifted-radius frame must be
+    # transported through the walk, even when position zero was not sampled.
+    reference_node_id: int | None = None
 
 
 @dataclass(slots=True)
@@ -343,6 +348,8 @@ class PackedWalks:
     edge_valid: torch.Tensor
     pick_positions: torch.Tensor
     correction_node_ids: torch.Tensor
+    walk_start_node_ids: torch.Tensor
+    reference_node_ids: torch.Tensor
 
 
 def _patch_sampled_walk(patch_atlas, patch_idx, path_ij, positions):
@@ -520,12 +527,21 @@ def _pack_walks(walks, crossing_map):
     edge_valid_np = np.zeros((num_walks, max_walk_len - 1), dtype=bool)
     correction_node_ids_np = np.full(
         (num_walks, num_points), -1, dtype=np.int64)
+    walk_start_node_ids_np = np.empty(num_walks, dtype=np.int64)
+    reference_node_ids_np = np.full(num_walks, -1, dtype=np.int64)
     for k, (walk, (walk_nodes, positions)) in enumerate(zip(walks, normalized)):
         walk_len = walk_nodes.size
         node_ids_np[k, :walk_len] = walk_nodes
         node_ids_np[k, walk_len:] = walk_nodes[-1]
         pick_positions_np[k] = positions
         edge_valid_np[k, :walk_len - 1] = True
+        walk_start_node_ids_np[k] = walk_nodes[0]
+        if walk.reference_node_id is not None:
+            reference_node_id = int(walk.reference_node_id)
+            if not 0 <= reference_node_id < crossing_map.num_nodes:
+                raise ValueError(
+                    f'sampled walk {k} contains an unregistered reference node id')
+            reference_node_ids_np[k] = reference_node_id
         if walk.connect_fractional_picks:
             correction_node_ids_np[k] = walk_nodes[positions]
 
@@ -536,6 +552,10 @@ def _pack_walks(walks, crossing_map):
         edge_valid_np, dtype=torch.bool, device=device)
     correction_node_ids = torch.as_tensor(
         correction_node_ids_np, dtype=torch.int64, device=device)
+    walk_start_node_ids = torch.as_tensor(
+        walk_start_node_ids_np, dtype=torch.int64, device=device)
+    reference_node_ids = torch.as_tensor(
+        reference_node_ids_np, dtype=torch.int64, device=device)
 
     edge_ids = torch.zeros_like(edge_valid, dtype=torch.int64)
     directions = torch.ones_like(edge_valid, dtype=torch.int8)
@@ -550,6 +570,8 @@ def _pack_walks(walks, crossing_map):
         edge_valid=edge_valid,
         pick_positions=pick_positions,
         correction_node_ids=correction_node_ids,
+        walk_start_node_ids=walk_start_node_ids,
+        reference_node_ids=reference_node_ids,
     )
 
 
@@ -1133,6 +1155,13 @@ def _sample_l_shapes_batch(patches_dict, patch_atlas, requests, num_points, cfg)
         sampled.append(shapes)
     return sampled
 
+
+def _set_walk_reference_node(patch_walks, reference_node_id):
+    """Anchor sampled patch walks in an exact PCL node's theta frame."""
+    for patch_walk in patch_walks:
+        patch_walk.walk.reference_node_id = int(reference_node_id)
+
+
 def _pcl_chain_seam_adjustments(crossing_map, dr_per_winding, chain_node_ids):
     values = []
     for node_ids in chain_node_ids:
@@ -1178,7 +1207,7 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
         sampling_strata['effective_size'],
     )
     if num_pcls_per_step <= 0:
-        return torch.zeros([], device='cuda')
+        return torch.zeros([], device=dr_per_winding.device)
     selected_idxs = _choose_pcl_indices(sampling_strata, num_pcls_per_step, cfg)
     selected_pcls = [point_collections[i] for i in selected_idxs]
 
@@ -1222,6 +1251,7 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
             pair_requests.append((
                 (pid1, i1, j1), (pid2, i2, j2),
                 pid1, pid2, winding_diff, pcl_chain_node_ids,
+                p1['_theta_node_id'], p2['_theta_node_id'],
             ))
 
     sampled_l_shapes = _sample_l_shapes_batch(
@@ -1236,10 +1266,14 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
         ls2 = sampled_l_shapes[2 * pair_index + 1]
         if ls1 is None or ls2 is None:
             continue
-        strip_pairs.append((ls1, ls2, *pair[2:]))
+        _set_walk_reference_node(ls1, pair[6])
+        _set_walk_reference_node(ls2, pair[7])
+        # Keep the downstream tuple limited to loss payload; the exact anchor
+        # node IDs now live on the sampled walks themselves.
+        strip_pairs.append((ls1, ls2, *pair[2:6]))
 
     if not strip_pairs:
-        return torch.zeros([], device='cuda')
+        return torch.zeros([], device=dr_per_winding.device)
 
     # Flatten: 8 strips per pair, ordered as p1's 4 strips followed by p2's 4 strips.
     total_strips = len(strip_pairs) * num_strips_per_pair
@@ -1289,7 +1323,7 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
 
     winding_diffs = torch.tensor(
         [sp[4] for sp in strip_pairs],
-        device='cuda',
+        device=dr_per_winding.device,
         dtype=torch.float32,
     )
     pcl_seam_adjustments = _pcl_chain_seam_adjustments(
@@ -1344,7 +1378,7 @@ def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
     abs_pcls = [pcl for pcl in point_collections if pcl.get('metadata', {}).get('winding_is_absolute', False)]
     num_pcls_per_step = min(cfg['sample_count_absolute_winding_pcls'], len(abs_pcls))
     if num_pcls_per_step <= 0:
-        return torch.zeros([], device='cuda')
+        return torch.zeros([], device=dr_per_winding.device)
     selected_idxs = np.random.choice(len(abs_pcls), num_pcls_per_step, replace=False)
     selected_pcls = [abs_pcls[i] for i in selected_idxs]
 
@@ -1359,7 +1393,10 @@ def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
             p = attached[idx]
             pid = p['on_patch']['id']
             i, j = int(p['on_patch']['ij'][0]), int(p['on_patch']['ij'][1])
-            strip_requests.append(((pid, i, j), pid, p['winding_annotation']))
+            strip_requests.append((
+                (pid, i, j), pid, p['winding_annotation'],
+                p['_theta_node_id'],
+            ))
 
     sampled_l_shapes = _sample_l_shapes_batch(
         patches_dict,
@@ -1370,10 +1407,11 @@ def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
     )
     for entry, ls in zip(strip_requests, sampled_l_shapes):
         if ls is not None:
+            _set_walk_reference_node(ls, entry[3])
             strips.append((ls, entry[1], entry[2]))
 
     if not strips:
-        return torch.zeros([], device='cuda')
+        return torch.zeros([], device=dr_per_winding.device)
 
     # Flatten: 4 strips per annotated point.
     total_strips = len(strips) * num_strips_per_point
@@ -1416,7 +1454,7 @@ def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
 
     winding_annotations = torch.tensor(
         [s[2] for s in strips],
-        device='cuda',
+        device=dr_per_winding.device,
         dtype=torch.float32,
     )
     target_shifted = (winding_annotations * dr_per_winding)[:, None]

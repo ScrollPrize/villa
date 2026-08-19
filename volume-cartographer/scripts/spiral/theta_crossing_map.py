@@ -206,7 +206,11 @@ class ThetaCrossingMap:
         Inputs are row-major. Packed edge IDs/directions describe each dense
         node step, and pick positions index nodes in that walk. A nonnegative
         correction-node ID connects a cached patch quad centre to its current
-        fractional pick before rows are reanchored; exact PCL nodes use -1.
+        fractional pick. Ordinary rows are reanchored at their first pick. A
+        row with a nonnegative reference-node ID is instead transported from
+        that exact node through the start of the dense walk; relative/absolute
+        winding losses use this to retain the annotated PCL point's frame even
+        when the random samples omit the walk origin.
         """
         if self.last_refresh_iteration is None and self.node_theta.numel() != self.num_nodes:
             raise RuntimeError('ThetaCrossingMap must be refreshed before use')
@@ -228,5 +232,19 @@ class ThetaCrossingMap:
                  - (local_delta < -np.pi).to(torch.int32))
         picked = picked + torch.where(
             correction_mask, local, torch.zeros_like(local))
-        picked = picked - picked[..., :1]
+
+        reference_node_ids = packed_walks.reference_node_ids
+        reference_mask = reference_node_ids >= 0
+        reference_theta = self.node_theta[reference_node_ids.clamp_min(0)]
+        start_theta = self.node_theta[packed_walks.walk_start_node_ids]
+        reference_delta = start_theta - reference_theta
+        reference_step = (
+            (reference_delta > np.pi).to(torch.int32)
+            - (reference_delta < -np.pi).to(torch.int32))
+        picked = picked + torch.where(
+            reference_mask, reference_step, torch.zeros_like(reference_step)
+        )[..., None]
+        picked = picked - torch.where(
+            reference_mask[..., None], torch.zeros_like(picked[..., :1]),
+            picked[..., :1])
         return picked.to(dr_per_winding.dtype) * dr_per_winding.detach()

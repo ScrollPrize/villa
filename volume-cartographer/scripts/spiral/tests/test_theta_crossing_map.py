@@ -67,6 +67,85 @@ def test_patch_local_correction_connects_centres_to_fractional_picks():
     assert torch.allclose(adjustment, torch.tensor([[0.0, -12.0]]))
 
 
+def test_absolute_winding_reference_survives_unsampled_walk_origin():
+    # The exact annotation and dense-walk origin are before theta=0, but the
+    # first random pick is after it. Anchor-supervised winding walks must retain
+    # that crossing instead of reanchoring it away at the first sparse pick.
+    points = _points_for_theta([6.0, 6.1, 0.1, 0.2])
+    crossing_map = ThetaCrossingMap('cpu')
+    crossing_map.register_nodes(4, lambda indices: points[indices])
+    crossing_map.register_edges([[1, 2], [2, 3]])
+    crossing_map.force_refresh(_identity)
+    packed = _pack_walks([
+        SampledWalk(
+            torch.tensor([1, 2, 3]).numpy(),
+            torch.tensor([1, 2]).numpy(), True,
+            reference_node_id=0),
+    ], crossing_map)
+    theta = crossing_map.node_theta[torch.tensor([[2, 3]])]
+    adjustment = crossing_map.adjustments(
+        packed, theta, torch.tensor(12.0))
+
+    assert torch.equal(adjustment, torch.tensor([[-12.0, -12.0]]))
+    raw_shifted = torch.tensor([[60.0, 60.0]])
+    absolute_target = torch.tensor(48.0)
+    assert torch.equal(
+        raw_shifted + adjustment,
+        absolute_target.expand_as(raw_shifted))
+
+
+def test_relative_winding_walks_keep_each_annotation_frame():
+    # Side one crosses theta=0 before its first pick; side two does not. The
+    # pooled values must still differ by the annotations' two-winding delta.
+    points = _points_for_theta([
+        6.0, 6.1, 0.1, 0.2,
+        1.0, 1.1, 1.2, 1.3,
+    ])
+    crossing_map = ThetaCrossingMap('cpu')
+    crossing_map.register_nodes(8, lambda indices: points[indices])
+    crossing_map.register_edges([
+        [1, 2], [2, 3], [5, 6], [6, 7],
+    ])
+    crossing_map.force_refresh(_identity)
+    packed = _pack_walks([
+        SampledWalk(
+            torch.tensor([1, 2, 3]).numpy(),
+            torch.tensor([1, 2]).numpy(), True,
+            reference_node_id=0),
+        SampledWalk(
+            torch.tensor([5, 6, 7]).numpy(),
+            torch.tensor([1, 2]).numpy(), True,
+            reference_node_id=4),
+    ], crossing_map)
+    theta = crossing_map.node_theta[torch.tensor([[2, 3], [6, 7]])]
+    adjustment = crossing_map.adjustments(
+        packed, theta, torch.tensor(12.0))
+
+    raw_shifted = torch.tensor([[60.0, 60.0], [72.0, 72.0]])
+    unwrapped = raw_shifted + adjustment
+    assert torch.equal(unwrapped[1] - unwrapped[0], torch.tensor([24.0, 24.0]))
+
+
+def test_reference_node_connects_exact_annotation_to_patch_walk_origin():
+    # The PCL point and its attached patch quad can straddle theta=0 even though
+    # they are spatially adjacent; transport that final local branch step too.
+    points = _points_for_theta([6.1, 0.1, 0.2])
+    crossing_map = ThetaCrossingMap('cpu')
+    crossing_map.register_nodes(3, lambda indices: points[indices])
+    crossing_map.register_edges([[1, 2]])
+    crossing_map.force_refresh(_identity)
+    packed = _pack_walks([
+        SampledWalk(
+            torch.tensor([1, 2]).numpy(),
+            torch.tensor([0, 1]).numpy(), True,
+            reference_node_id=0),
+    ], crossing_map)
+    theta = crossing_map.node_theta[torch.tensor([[1, 2]])]
+    adjustment = crossing_map.adjustments(
+        packed, theta, torch.tensor(12.0))
+    assert torch.equal(adjustment, torch.tensor([[-12.0, -12.0]]))
+
+
 def test_refresh_interval_chunking_force_refresh_and_interval_change():
     points = _points_for_theta([0.1, 0.2, 0.3, 0.4, 0.5])
     calls = []
