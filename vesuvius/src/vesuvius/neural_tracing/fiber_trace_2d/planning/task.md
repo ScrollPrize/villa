@@ -208,3 +208,13 @@ wall time from 8.96 to 8.23 seconds. Median total CPU increased from 199.47 to
 sample order, artifact hash, graph populations, DP work, and replay failures
 were unchanged. The wall-time gain is retained with the CPU/RSS tradeoff
 recorded.
+
+Checkpoint 26 replaces worker-local interpolation-corner hash sets with sparse
+`16^3` bit pages. A small page-pointer cache reduces 405.7 million insertion
+attempts to roughly 75 thousand page-directory probes, then corresponding pages
+are OR-merged and their exact set bits globally sorted in stored Z/Y/X order.
+Three controlled warm runs improved median command wall from 8.23 to 7.77
+seconds, total CPU from 202.91 to 196.18 seconds, fiberlet wall from 2.519 to
+2.165 seconds, corner finalization from 0.268 to 0.0196 seconds, and peak RSS
+from 2,060,332 to 1,697,516 KiB. Exact artifact and replay behavior were
+retained. The sparse paged bitmap is retained.

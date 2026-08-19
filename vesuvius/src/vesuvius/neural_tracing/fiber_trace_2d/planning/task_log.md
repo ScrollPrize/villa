@@ -1222,3 +1222,51 @@
   `f2b8e679c23470d1221f7930a21b0c37fa0906845de0bc2cbf3e8ab7329f78ee`.
   Checkpoint 25 is retained for its 8.1% median wall-time gain; its 1.7% CPU and
   2.7% RSS increases are recorded tradeoffs.
+
+## Checkpoint 26: sparse paged corner bitmap
+
+- Replaced the 32 worker-local interpolation-corner `unordered_set`s with
+  sparse `16^3` pages containing 4,096 occupancy bits each. The page edge
+  reuses the accepted scoring-index geometry, which previously measured only
+  199 occupied pages for the canonical 170,778 sampled voxels.
+- Added an immediate-page fast path and eight-entry page-pointer cache per
+  worker. Across the three retained runs, about 361.61 million insertions hit
+  the immediate page, 44.04 million hit the small cache, and only 75 thousand
+  reached the page directory.
+- Worker-local page populations varied slightly with scheduling: about 6,017
+  pages and 4.645 million worker-local unique voxels. Bitwise OR reduced these
+  to 199 merged pages and exactly 170,778 global voxels. Set-bit enumeration is
+  followed by the established stored-coordinate sort because page-major order
+  alone is not global Z/Y/X order.
+- GCC passed 49 `test_fiberlet_paths`, 78 `test_fiber_anchors`, and 6
+  `test_fiber_replay` cases. The repository-local Clang QuickBuild passed all
+  49 focused path cases. The serial-reference finalization fixture covers
+  empty, overlapping, duplicate-heavy, uneven, page-boundary, and signed
+  synthetic coordinates.
+- The canonical command used `build/bin/vc_fiberlets fiberlet-replay`, Paris4
+  `fiber_s1_002.lasagna.json`, fiber
+  `dj_20260805T025256484_000003.json`, `las_008` normals, 32 threads, and length
+  5000. Outputs are under `volume-cartographer/build/benchmarks/checkpoint26`.
+  Host process load was checked before and after every retained timing run and
+  stayed below the two-core exclusion threshold.
+- Three warm runs produced:
+
+  | metric | checkpoint 26 min / median / max | checkpoint 25 min / median / max | median change |
+  |---|---:|---:|---:|
+  | command wall | 7.65 / 7.77 / 7.84 s | 8.08 / 8.23 / 8.35 s | -5.6% |
+  | total CPU | 195.97 / 196.18 / 197.57 s | 201.66 / 202.91 / 205.02 s | -3.3% |
+  | anchor wall | 4.942 / 5.067 / 5.102 s | 5.011 / 5.124 / 5.236 s | -1.1% |
+  | anchor CPU | 129.51 / 129.78 / 130.80 s | 130.65 / 131.49 / 133.02 s | -1.3% |
+  | fiberlet wall | 2.151 / 2.165 / 2.181 s | 2.488 / 2.519 / 2.534 s | -14.0% |
+  | fiberlet CPU | 64.09 / 64.59 / 64.68 s | 68.26 / 69.31 / 69.89 s | -6.8% |
+  | corner finalization wall | 0.0190 / 0.0196 / 0.0202 s | 0.265 / 0.268 / 0.268 s | -92.7% |
+  | peak RSS | 1,692,124 / 1,697,516 / 1,715,028 KiB | 2,060,168 / 2,060,332 / 2,077,188 KiB | -17.6% |
+
+- Bitmap collection itself costs about 8.23 worker-seconds and remains a
+  preparation hot path; the retained gain comes from eliminating worker-vector
+  conversion/merge storage and reducing finalization to about 20 milliseconds.
+- Every run retained 2,603 anchors, 2,562 graph nodes, 26,445 edges,
+  62,873,000 DP relaxations, 2 greedy / 1 fiberlet failures, exact sampled-voxel
+  order, and artifact SHA-256
+  `f2b8e679c23470d1221f7930a21b0c37fa0906845de0bc2cbf3e8ab7329f78ee`.
+  Checkpoint 26 is retained.

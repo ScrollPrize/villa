@@ -57,8 +57,18 @@
 - [x] Run focused GCC and Clang validation.
 - [x] Run three canonical checkpoint 10 replays and compare quality/performance.
 - [x] Update specifications, user documentation, changelog, and task log.
+- [x] Plan checkpoint 25 parallel corner finalization and its validation gates.
+- [x] Implement and retain checkpoint 25 from controlled measurements.
+- [x] Plan checkpoint 26 sparse paged corner deduplication.
+- [x] Implement worker-local bit pages and cached page lookup.
+- [x] Preserve exact corner coverage and stored-coordinate ordering.
+- [x] Run focused GCC and Clang path validation plus GCC anchor/replay tests.
+- [x] Check host CPU load before and after each checkpoint-26 timing run.
+- [x] Run three warm canonical checkpoint-26 replays.
+- [x] Retain checkpoint 26 based on performance, memory, and exact replay parity.
+- [x] Update checkpoint planning and measurement records.
 - [x] Checkpoint 25: parallelize deterministic corner-set finalization.
-- [ ] Checkpoint 26: test sparse paged corner bitmaps if still justified.
+- [x] Checkpoint 26: retain sparse paged corner bitmaps after validation.
 - [ ] Checkpoint 27: measure and improve ready-cell anchor load balance.
 - [ ] Checkpoint 28: test bounded peak Gaussian acceleration.
 - [ ] Checkpoint 29: test one-pass post-update membership reuse as a quality change.

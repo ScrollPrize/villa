@@ -976,7 +976,7 @@ TEST_CASE("fiberlet global sampling coordinates are invariant under batching and
     }
 }
 
-TEST_CASE("parallel fiberlet corner finalization matches a serial reference")
+TEST_CASE("sparse bitmap corner finalization matches a serial reference")
 {
     using Voxel = std::array<int64_t, 3>;
     const auto check = [](const std::vector<std::vector<Voxel>>& sets) {
@@ -996,10 +996,8 @@ TEST_CASE("parallel fiberlet corner finalization matches a serial reference")
         std::sort(expected.begin(), expected.end(), storedLess);
         expected.erase(std::unique(expected.begin(), expected.end()), expected.end());
 
-        CHECK(vc::fiber_tracer::testing::debugFinalizeFiberletCornerSets(
-                  sets, 1) == expected);
-        CHECK(vc::fiber_tracer::testing::debugFinalizeFiberletCornerSets(
-                  sets, 8) == expected);
+        CHECK(vc::fiber_tracer::testing::debugFinalizeFiberletCornerSets(sets) ==
+              expected);
     };
 
     SUBCASE("empty")

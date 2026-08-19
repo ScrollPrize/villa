@@ -1357,6 +1357,28 @@ Proceed only if checkpoint 25 leaves corner collection or merging material.
 4. Compare all 405.7 million insertion attempts, 170,778 canonical unique
    voxels, corner collection/merge time, memory, and complete replay quality.
 
+Result: retained. The worker-local hash sets are replaced by sparse `16^3`
+pages with dense 4,096-bit occupancy. An immediate-page fast path plus an
+eight-entry worker cache served 405.65 million of 405.73 million insertion
+attempts without a page-directory lookup; only about 75 thousand probes
+remained. The 32 workers occupied about 6,017 pages and 4.645 million
+worker-local unique voxels, which OR-reduced to 199 pages and the exact prior
+170,778 globally unique voxels. One final Z/Y/X sort preserves the established
+sampler order.
+
+Three warm canonical runs measured command wall at 7.65 / 7.77 / 7.84 seconds,
+total CPU at 195.97 / 196.18 / 197.57 seconds, fiberlet wall at
+2.151 / 2.165 / 2.181 seconds, corner finalization wall at
+0.0190 / 0.0196 / 0.0202 seconds, and peak RSS at
+1,692,124 / 1,697,516 / 1,715,028 KiB. Against checkpoint 25 medians, command
+wall improved 5.6%, total CPU 3.3%, fiberlet wall 14.0%, corner finalization
+92.7%, and peak RSS 17.6%. Worker-local corner collection itself rose to about
+8.23 CPU-seconds because bitmap insertion remains in the preparation hot loop;
+the much cheaper finalization and lower transient storage still improve the
+enclosing workload. All runs retained exact artifact SHA-256
+`f2b8e679c23470d1221f7930a21b0c37fa0906845de0bc2cbf3e8ab7329f78ee`,
+unchanged populations and DP work, and 2 greedy / 1 fiberlet failures.
+
 ### Checkpoint 27: ready-cell anchor scheduling
 
 1. Add measurement-only per-sampling-group and per-cell fitting durations to
