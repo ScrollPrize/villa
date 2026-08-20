@@ -4458,15 +4458,30 @@ class FitContext:
                     )
                     by_param = ', '.join(f'{name}: {count}' for name, count in per_param)
                     print(f'  ({n_sanitised} non-finite-gradient steps sanitised so far; by param: {by_param})')
+                payload = {
+                    'total_loss': loss.item(),
+                    'nonfinite_grad_steps': self.nonfinite_grad_steps.item(),
+                    **{f'nonfinite_grad_steps/{name}': count.item() for name, count in self.nonfinite_grad_by_param.items()},
+                    **{name + '_loss': value for name, value in losses.items()},
+                    **shell_metrics,
+                    **log_metrics,
+                }
+                metrics_history = os.environ.get('FIT_SPIRAL_METRICS_HISTORY')
+                if metrics_history:
+                    scalar_payload = {
+                        name: (value.item() if hasattr(value, 'item') else value)
+                        for name, value in payload.items()
+                    }
+                    with open(metrics_history, 'a') as stream:
+                        stream.write(json.dumps({
+                            'iteration': iteration,
+                            'metrics': scalar_payload,
+                        }) + '\n')
                 if wandb.run is not None:
-                    wandb.log({
-                        'total_loss': loss.item(),
-                        'nonfinite_grad_steps': self.nonfinite_grad_steps.item(),
-                        **{f'nonfinite_grad_steps/{name}': count.item() for name, count in self.nonfinite_grad_by_param.items()},
-                        **{name + '_loss': value for name, value in losses.items()},
-                        **shell_metrics,
-                        **log_metrics,
-                    })
+                    if metrics_history:
+                        wandb.log(payload, step=iteration)
+                    else:
+                        wandb.log(payload)
 
     def run(self):
         """Drive one complete headless fit to the configured horizon.
@@ -4676,12 +4691,20 @@ if __name__ == '__main__':
         wandb_mode = os.environ.get('WANDB_MODE', 'disabled')
         if not dist_context.is_main_process:
             wandb_mode = 'disabled'
-        wandb.init(
-            project=os.environ.get('WANDB_PROJECT', 'scrolls'),
-            entity=os.environ.get('WANDB_ENTITY'),
-            config=config,
-            mode=wandb_mode,
-        )
+        wandb_init_kwargs = {
+            'project': os.environ.get('WANDB_PROJECT', 'scrolls'),
+            'entity': os.environ.get('WANDB_ENTITY'),
+            'config': config,
+            'mode': wandb_mode,
+        }
+        if os.environ.get('FIT_SPIRAL_BATCH_RUN') == '1':
+            wandb_init_kwargs.update({
+                'id': os.environ['WANDB_RUN_ID'],
+                'name': os.environ['WANDB_NAME'],
+                'group': os.environ['WANDB_RUN_GROUP'],
+                'resume': 'never',
+            })
+        wandb.init(**wandb_init_kwargs)
         # The CLI boundary is where the FIT_SPIRAL_* fit controls are parsed;
         # FitContext itself no longer reads them.
         main(
