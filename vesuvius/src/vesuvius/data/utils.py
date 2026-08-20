@@ -6,6 +6,92 @@ from typing import Union, Dict, Any, Optional, Tuple
 
 _ZARR_V3 = int(zarr.__version__.split('.', 1)[0]) >= 3
 
+
+def open_zarr_group(path: str,
+                    mode: str = 'r',
+                    storage_options: Optional[Dict[str, Any]] = None,
+                    **kwargs) -> zarr.Group:
+    """
+    Open a zarr group, creating it in the v2 format.
+
+    Groups this package creates hold arrays compressed with numcodecs, which are
+    v2 constructs: zarr 3 rejects `compressor=` on a v3 array, so a group that is
+    going to receive one has to be v2. zarr 2 has no `zarr_format` argument and
+    only writes v2, so it is left alone.
+
+    The format is pinned only when a group is being created. Pinning it while
+    opening an existing store would either hide a v3 store (modes 'r' and 'r+'
+    raise GroupNotFoundError) or write v2 metadata beside the v3 metadata already
+    there (mode 'a'), so an existing group is read in whatever format it was
+    written.
+    """
+    store_kwargs = {'storage_options': storage_options} if storage_options else {}
+
+    if not _ZARR_V3:
+        return zarr.open_group(path, mode=mode, **store_kwargs, **kwargs)
+
+    if mode in ('w', 'w-'):
+        return zarr.open_group(path, mode=mode, zarr_format=2, **store_kwargs, **kwargs)
+
+    if mode == 'a':
+        # 'a' means "open if it exists, else create". Split the two cases so the
+        # format is only pinned on the create.
+        try:
+            return zarr.open_group(path, mode='r+', **store_kwargs, **kwargs)
+        except FileNotFoundError:
+            return zarr.open_group(path, mode='w-', zarr_format=2, **store_kwargs, **kwargs)
+
+    return zarr.open_group(path, mode=mode, **store_kwargs, **kwargs)
+
+
+def create_group_array(group: zarr.Group,
+                       name: str,
+                       *,
+                       shape: Tuple[int, ...],
+                       chunks: Tuple[int, ...],
+                       dtype: Any,
+                       compressor: Any = None,
+                       write_empty_chunks: Optional[bool] = None,
+                       overwrite: bool = False,
+                       require: bool = False) -> zarr.Array:
+    """
+    Create an array inside an existing zarr group under either supported zarr API.
+
+    zarr 3 dropped `Group.create_dataset` and `Group.require_dataset` for
+    `create_array` and `require_array`, renamed `compressor` to `compressors`,
+    and moved `write_empty_chunks` into the array config. The arguments here are
+    the zarr 2 spelling the package already uses, so a call site only changes the
+    function it calls.
+
+    `require=True` returns the existing array when there is one, matching what
+    `require_dataset` did.
+
+    `group` must be zarr_format 2 when `compressor` is not None. Open it with
+    :func:`open_zarr_group`.
+    """
+    create_kwargs: Dict[str, Any] = {
+        'shape': shape,
+        'chunks': chunks,
+        'dtype': dtype,
+        'overwrite': overwrite,
+    }
+
+    if not _ZARR_V3:
+        create_kwargs['compressor'] = compressor
+        if write_empty_chunks is not None:
+            create_kwargs['write_empty_chunks'] = write_empty_chunks
+        if require:
+            return group.require_dataset(name, **create_kwargs)
+        return group.create_dataset(name, **create_kwargs)
+
+    create_kwargs['compressors'] = compressor
+    if write_empty_chunks is not None:
+        create_kwargs['config'] = {'write_empty_chunks': write_empty_chunks}
+    if require:
+        return group.require_array(name, **create_kwargs)
+    return group.create_array(name, **create_kwargs)
+
+
 # Function to get the maximum value of a dtype
 def get_max_value(dtype: np.dtype) -> Union[float, int]:
     """

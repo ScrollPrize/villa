@@ -1,12 +1,18 @@
 # tests/test_structure_tensor.py
 
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 import torch
 import numpy as np
+import numcodecs
 import zarr
 import os
 from math import isfinite
 
+from vesuvius.data.utils import create_group_array, open_zarr_group
 from vesuvius.image_proc.geometry.structure_tensor import (
     StructureTensorComputer,
     components_to_matrix,
@@ -20,6 +26,28 @@ from vesuvius.structure_tensor.create_st import (
     _compute_eigenvectors,
     _finalize_structure_tensor_torch
 )
+
+
+def _stored_format(path) -> int:
+    """Read the zarr format an array was written in, off disk."""
+    path = Path(path)
+    if (path / ".zarray").exists():
+        return json.loads((path / ".zarray").read_text())["zarr_format"]
+    return json.loads((path / "zarr.json").read_text())["zarr_format"]
+
+
+def _write_structure_tensor(zarr_path, st, chunks):
+    """Write a `structure_tensor` array the way the pipeline writes it.
+
+    Uses the package's own helpers so the store is the v2 layout the eigenanalysis
+    stage produces, on both supported zarr versions.
+    """
+    root = open_zarr_group(zarr_path, mode="w")
+    arr = create_group_array(
+        root, "structure_tensor", shape=st.shape, chunks=chunks, dtype=np.float32
+    )
+    arr[...] = st
+    return arr
 
 
 @pytest.fixture
@@ -273,7 +301,6 @@ def test_border_trim_math_matches_patch_extent():
         f"Trimmed shape {tuple(J.shape)} != expected {(1,6,*patch)}"
     )
 
-'''
 def test_eigenanalysis_right_handed_and_oriented(tmp_path):
     """
     End-to-end check of _finalize_structure_tensor_torch:
@@ -291,13 +318,7 @@ def test_eigenanalysis_right_handed_and_oriented(tmp_path):
 
     # Write a zarr group with 'structure_tensor'
     zarr_path = os.path.join(tmp_path, "st.zarr")
-    root = zarr.open_group(zarr_path, mode="w")
-    root.create_dataset(
-        "structure_tensor",
-        data=st,
-        chunks=(1, Z, Y, X),   # small chunks OK
-        dtype="f4"
-    )
+    _write_structure_tensor(zarr_path, st, chunks=(1, Z, Y, X))
 
     # Run eigenanalysis on CPU with small chunks
     _finalize_structure_tensor_torch(
@@ -308,6 +329,7 @@ def test_eigenanalysis_right_handed_and_oriented(tmp_path):
         verbose=False,
         swap_eigenvectors=False,
         device="cpu",
+        keep_eigen=True,
     )
 
     # Load results and validate
@@ -323,7 +345,6 @@ def test_eigenanalysis_right_handed_and_oriented(tmp_path):
     # 2) Orientation: mean x-component of first eigenvector is >= 0
     mean_x = v[0, 0, ...].mean().item()
     assert mean_x >= -1e-6, f"First eigenvector should point on average toward +X, got mean {mean_x}"
-'''
 
 def test_eigh_and_sanitize_handles_nans_infs():
     # A small batch of 3x3 matrices with NaNs/Infs
@@ -343,7 +364,6 @@ def test_eigh_and_sanitize_handles_nans_infs():
     assert (~torch.isnan(w)).all() and (~torch.isnan(v)).all()
     assert (~torch.isinf(w)).all() and (~torch.isinf(v)).all()
 
-'''
 def test_eigenanalysis_chunk_defaults_and_shapes(tmp_path):
     """
     If chunk_size=None, eigenanalysis should use the source chunks (minus the channel dim),
@@ -353,10 +373,9 @@ def test_eigenanalysis_chunk_defaults_and_shapes(tmp_path):
     st = np.zeros((6, Z, Y, X), dtype=np.float32)
     st[0] = 3.0; st[3] = 2.0; st[5] = 1.0
     zarr_path = os.path.join(tmp_path, "st.zarr")
-    root = zarr.open_group(zarr_path, mode="w")
     # choose specific chunks to propagate
     cz, cy, cx = 2, 2, 3
-    root.create_dataset("structure_tensor", data=st, chunks=(6, cz, cy, cx), dtype="f4")
+    _write_structure_tensor(zarr_path, st, chunks=(6, cz, cy, cx))
 
     _finalize_structure_tensor_torch(
         zarr_path=zarr_path,
@@ -365,6 +384,7 @@ def test_eigenanalysis_chunk_defaults_and_shapes(tmp_path):
         compressor=None,
         verbose=False,
         swap_eigenvectors=False,
+        keep_eigen=True,
     )
 
     ev = zarr.open_group(zarr_path, mode="r")["eigenvectors"]
@@ -384,8 +404,7 @@ def test_swap_eigenvectors_flag(tmp_path):
     # diag(J) = [Jzz, Jyy, Jxx] = [3,2,1]
     st[0] = 3.0; st[3] = 2.0; st[5] = 1.0
     zarr_path = os.path.join(tmp_path, "st.zarr")
-    root = zarr.open_group(zarr_path, mode="w")
-    root.create_dataset("structure_tensor", data=st, chunks=(1, Z, Y, X), dtype="f4")
+    _write_structure_tensor(zarr_path, st, chunks=(1, Z, Y, X))
 
     # no swap
     _finalize_structure_tensor_torch(
@@ -395,6 +414,7 @@ def test_swap_eigenvectors_flag(tmp_path):
         compressor=None,
         verbose=False,
         swap_eigenvectors=False,
+        keep_eigen=True,
     )
     w_no = zarr.open_group(zarr_path, mode="r")["eigenvalues"][...]
 
@@ -406,8 +426,71 @@ def test_swap_eigenvectors_flag(tmp_path):
         compressor=None,
         verbose=False,
         swap_eigenvectors=True,
+        keep_eigen=True,
     )
     w_sw = zarr.open_group(zarr_path, mode="r")["eigenvalues"][...]
     # eigenvalues channels 0 and 1 swapped
     assert np.allclose(w_sw[0], w_no[1]) and np.allclose(w_sw[1], w_no[0])
-    assert np.allclose(w_sw[2], w_no[2])'''
+    assert np.allclose(w_sw[2], w_no[2])
+
+
+def test_eigenanalysis_writes_compressed_v2_arrays(tmp_path):
+    """
+    The eigenanalysis stage is handed a numcodecs compressor by every caller
+    (compute_st builds a Blosc). numcodecs codecs are a zarr v2 construct, so
+    every array it creates has to land in the v2 format for the compressor to
+    be accepted at all.
+    """
+    Z, Y, X = 2, 2, 2
+    st = np.zeros((6, Z, Y, X), dtype=np.float32)
+    st[0] = 3.0; st[3] = 2.0; st[5] = 1.0
+    zarr_path = os.path.join(tmp_path, "st.zarr")
+    _write_structure_tensor(zarr_path, st, chunks=(1, Z, Y, X))
+
+    compressor = numcodecs.Blosc(cname="zstd", clevel=3, shuffle=numcodecs.blosc.SHUFFLE)
+    _finalize_structure_tensor_torch(
+        zarr_path=zarr_path,
+        chunk_size=(Z, Y, X),
+        num_workers=0,
+        compressor=compressor,
+        verbose=False,
+        swap_eigenvectors=False,
+        device="cpu",
+        keep_eigen=True,
+    )
+
+    root = zarr.open_group(zarr_path, mode="r")
+    for name in ("eigenvectors", "eigenvalues", "confidence/0",
+                 "first_component/z/0", "second_component/y/0", "normal/x/0"):
+        assert name in root, f"{name} was not written"
+        assert _stored_format(Path(zarr_path) / name) == 2, f"{name} is not zarr_format 2"
+
+    # the confidence map is uint8 and readable back through zarr
+    assert root["confidence/0"].shape == (Z, Y, X)
+    assert root["confidence/0"].dtype == np.uint8
+
+
+def test_structure_tensor_output_store_is_compressed_v2(tmp_path, monkeypatch, cpu_inferer):
+    """
+    _create_output_stores is the first thing compute_st does after reading the
+    input, and it has to produce a compressed v2 'structure_tensor' array.
+    """
+    cpu_inferer.output_dir = str(tmp_path / "out")
+    cpu_inferer.dataset = SimpleNamespace(input_shape=(8, 8, 8))
+    cpu_inferer.patch_start_coords_list = [(0, 0, 0)]
+    cpu_inferer.compressor_name = "zstd"
+    cpu_inferer.compression_level = 3
+
+    store = cpu_inferer._create_output_stores()
+
+    assert store.shape == (6, 8, 8, 8)
+    assert store.chunks == (6, 5, 5, 5)
+    array_path = Path(cpu_inferer.main_store_path) / "structure_tensor"
+    assert _stored_format(array_path) == 2
+    meta = json.loads((array_path / ".zarray").read_text())
+    assert meta["compressor"]["id"] == "blosc"
+    assert meta["compressor"]["cname"] == "zstd"
+
+    # the array accepts a real patch write
+    store[:, 0:5, 0:5, 0:5] = np.ones((6, 5, 5, 5), dtype=np.float32)
+    assert float(zarr.open_group(cpu_inferer.main_store_path, mode="r")["structure_tensor"][0, 0, 0, 0]) == 1.0

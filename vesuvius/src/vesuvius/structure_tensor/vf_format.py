@@ -5,6 +5,8 @@ import zarr
 from numcodecs import Blosc
 from typing import Optional, Tuple
 
+from vesuvius.data.utils import create_group_array, open_zarr_group
+
 def _default_compressor() -> Blosc:
     return Blosc(cname="zstd", clevel=1, shuffle=Blosc.SHUFFLE)
 
@@ -63,7 +65,7 @@ class OMEU8VectorWriter:
         Xds = (X + self.ds - 1) // self.ds
         self.shape_ds = (Zds, Yds, Xds)
 
-        root = zarr.open_group(output_path, mode="a")
+        root = open_zarr_group(output_path, mode="a")
         grp = root.require_group(group_name)
         self.ds_z = self._require_scale(grp.require_group("z"), chunks_zyx, compressor)
         self.ds_y = self._require_scale(grp.require_group("y"), chunks_zyx, compressor)
@@ -83,7 +85,8 @@ class OMEU8VectorWriter:
                     f"expected {self.shape_ds}"
                 )
             return ds
-        return g.create_dataset(
+        return create_group_array(
+            g,
             self.scale_name,
             shape=self.shape_ds,
             chunks=chunks,
