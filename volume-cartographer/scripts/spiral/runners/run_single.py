@@ -16,6 +16,8 @@ SPIRAL_DIR = Path(__file__).resolve().parent.parent
 VC_ROOT = SPIRAL_DIR.parent.parent
 DEFAULT_VC_RENDER_BIN = VC_ROOT / "build" / "bin" / "vc_render_tifxyz"
 DEFAULT_OUTPUT = SPIRAL_DIR / "out"
+DEFAULT_RUN_CONFIG = Path(__file__).with_name("default_run_config.json")
+WANDB_CONFIG_KEYS = ("wandb_project", "wandb_entity")
 
 # Executing this file directly puts only runners/ on sys.path.
 if str(SPIRAL_DIR) not in sys.path:
@@ -46,9 +48,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--ink-volume", required=True, type=Path)
     parser.add_argument(
-        "--overrides",
+        "--config",
         type=Path,
-        help="JSON object containing only Config keys to override",
+        help="JSON object overlaid on the default run configuration",
+    )
+    parser.add_argument(
+        "--no-wandb",
+        action="store_true",
+        help="disable Weights & Biases logging (enabled by default)",
     )
     parser.add_argument(
         "--num-threads",
@@ -64,18 +71,35 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def load_overrides(path: Path | None) -> dict:
-    """Load and validate an override object, retaining only declared keys."""
-    if path is None:
-        return {}
+def _load_json_object(path: Path, *, description: str) -> dict:
     try:
         value = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"could not read overrides from {path}: {exc}") from exc
+        raise ValueError(f"could not read {description} from {path}: {exc}") from exc
     if not isinstance(value, dict):
-        raise ValueError(f"overrides must be a JSON object: {path}")
-    Config(value)
+        raise ValueError(f"{description} must be a JSON object: {path}")
     return value
+
+
+def load_run_config(path: Path | None) -> tuple[dict, str, str]:
+    """Load defaults, overlay an optional user config, and validate all keys."""
+    merged = _load_json_object(
+        DEFAULT_RUN_CONFIG, description="default run config")
+    if path is not None:
+        merged.update(_load_json_object(path, description="run config"))
+
+    wandb_values = {}
+    for key in WANDB_CONFIG_KEYS:
+        value = merged.pop(key, None)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{key} must be a non-empty string")
+        wandb_values[key] = value
+
+    # Constructing Config rejects unknown keys, wrong types, and invalid
+    # values. Keep only the supplied overrides rather than expanding defaults;
+    # fit_spiral owns resolution of the complete fit configuration.
+    Config(merged)
+    return merged, wandb_values["wandb_project"], wandb_values["wandb_entity"]
 
 
 def require_empty_output(output: Path) -> None:
@@ -96,11 +120,22 @@ def _native_thread_env(num_threads: int) -> dict[str, str]:
     }
 
 
-def fit_environment(overrides: dict, output: Path, num_threads: int | None) -> dict[str, str]:
+def fit_environment(
+    overrides: dict,
+    output: Path,
+    num_threads: int | None,
+    *,
+    wandb_project: str,
+    wandb_entity: str,
+    wandb_enabled: bool,
+) -> dict[str, str]:
     env = os.environ.copy()
     # The runner owns these controls; do not inherit an unrelated outer fit.
     env.pop("FIT_SPIRAL_CONFIG_OVERRIDES", None)
     env["FIT_SPIRAL_OUT_DIR"] = str(output)
+    env["WANDB_MODE"] = "online" if wandb_enabled else "disabled"
+    env["WANDB_PROJECT"] = wandb_project
+    env["WANDB_ENTITY"] = wandb_entity
     if overrides:
         env["FIT_SPIRAL_CONFIG_OVERRIDES"] = json.dumps(overrides)
     if num_threads is not None:
@@ -144,7 +179,7 @@ def find_fit_outputs(output: Path) -> tuple[Path, Path]:
 def run(args: argparse.Namespace) -> None:
     output = args.output.resolve()
     require_empty_output(output)
-    overrides = load_overrides(args.overrides)
+    overrides, wandb_project, wandb_entity = load_run_config(args.config)
 
     fit_cmd = [
         sys.executable,
@@ -155,7 +190,14 @@ def run(args: argparse.Namespace) -> None:
     subprocess.run(
         fit_cmd,
         check=True,
-        env=fit_environment(overrides, output, args.num_threads),
+        env=fit_environment(
+            overrides,
+            output,
+            args.num_threads,
+            wandb_project=wandb_project,
+            wandb_entity=wandb_entity,
+            wandb_enabled=not args.no_wandb,
+        ),
     )
 
     _run_dir, fitted_dir = find_fit_outputs(output)

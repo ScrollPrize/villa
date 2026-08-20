@@ -4676,7 +4676,12 @@ if __name__ == '__main__':
         wandb_mode = os.environ.get('WANDB_MODE', 'disabled')
         if not dist_context.is_main_process:
             wandb_mode = 'disabled'
-        wandb.init(project='scrolls', config=config, mode=wandb_mode)
+        wandb.init(
+            project=os.environ.get('WANDB_PROJECT', 'scrolls'),
+            entity=os.environ.get('WANDB_ENTITY'),
+            config=config,
+            mode=wandb_mode,
+        )
         # The CLI boundary is where the FIT_SPIRAL_* fit controls are parsed;
         # FitContext itself no longer reads them.
         main(
