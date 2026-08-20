@@ -42,6 +42,8 @@ class SurfacePanelController;
 class ViewerManager;
 class VolumePkg;
 class QWidget;
+namespace vc::lasagna { class LasagnaDataset; class LasagnaNormalSampler; }
+namespace vc::fiber_tracer { class FiberPredictionField; }
 
 class LineAnnotationController : public QObject
 {
@@ -171,6 +173,30 @@ public:
                                              int,
                                              int)>;
 
+    struct ResolvedFiberOptimizationInputs {
+        std::shared_ptr<vc::lasagna::LasagnaDataset> normalDataset;
+        std::shared_ptr<vc::lasagna::LasagnaNormalSampler> baseNormalSampler;
+        std::shared_ptr<vc::lasagna::LasagnaDataset> traceNormalDataset;
+        std::shared_ptr<vc::lasagna::LasagnaNormalSampler> traceNormalSampler;
+        std::shared_ptr<vc::lasagna::LasagnaDataset> fiberDataset;
+        std::shared_ptr<vc::fiber_tracer::FiberPredictionField> predictions;
+        std::string normalManifestLocation;
+        std::string fiberManifestLocation;
+        double traceToBaseScale = 1.0;
+    };
+
+    struct HeadlessFiberOptimizationRequest {
+        std::vector<cv::Vec3d> controlPointsL0;
+        ResolvedFiberOptimizationInputs inputs;
+        std::filesystem::path destinationFiberSource;
+        // Evaluated on the controller's UI thread immediately before writing.
+        // A caller can invalidate an in-flight draft when its preview/session
+        // is replaced without attempting to interrupt native optimization.
+        std::function<bool()> shouldSave;
+    };
+    using HeadlessFiberCompletion =
+        std::function<void(bool, const QString&, uint64_t)>;
+
     LineAnnotationController(CState* state,
                              ViewerManager* viewerManager,
                              QWidget* parentWidget,
@@ -273,6 +299,27 @@ public:
     // running Spiral fit.
     [[nodiscard]] std::filesystem::path fiberFilePath(uint64_t fiberId) const;
 
+    // Merge an additional owning directory into the ordinary Fibers model.
+    // Runtime ids remain unique even when two roots contain the same filename.
+    bool registerExternalFiberSource(const std::filesystem::path& source,
+                                     QString* errorMessage = nullptr);
+    void unregisterExternalFiberSource(const std::filesystem::path& source);
+
+    // Resolve each model independently: a compatible project selection wins;
+    // otherwise the supplied fallback location is opened. No picker or pane is
+    // created by this entry point.
+    [[nodiscard]] std::optional<ResolvedFiberOptimizationInputs>
+        resolveFiberOptimizationInputs(
+            const std::string& fallbackNormalLocation,
+            const std::string& fallbackFiberLocation,
+            QString* errorMessage = nullptr) const;
+
+    // Initializes through the ordinary Lasagna optimizer, runs native fiber
+    // mode with closed tails, then atomically writes an ordinary v3 fiber in
+    // destinationFiberSource. It never requests a Line Annotation workspace.
+    void optimizeAndSaveFiberHeadless(HeadlessFiberOptimizationRequest request,
+                                      HeadlessFiberCompletion completion);
+
 signals:
     void lineAnnotationWorkspaceRequested(LineAnnotationDialog* dialog, const QString& title);
     void fibersChanged(std::vector<LineAnnotationController::FiberSummary> fibers);
@@ -326,6 +373,10 @@ private:
         std::string startedAt;
         uint64_t sequence = 0;
         std::string fileName;
+        // Empty for the ordinary project store. External fibers keep their
+        // canonical owning directory here so every mutation remains local to
+        // its source even when filenames collide across roots.
+        std::filesystem::path sourceRoot;
         uint64_t generation = 1;
         std::vector<vc3d::line_annotation::StoredControlPoint> controlPoints;
         std::vector<cv::Vec3d> linePoints;
@@ -781,6 +832,7 @@ private:
     int _nextPaneId = 1;
     std::vector<PaneRecord> _panes;
     std::vector<StoredFiber> _fibers;
+    std::vector<std::filesystem::path> _externalFiberSources;
     std::vector<std::string> _knownFiberTags;
     std::unordered_map<uint64_t, CachedFiberAlignmentMetrics> _fiberAlignmentMetrics;
     std::unordered_set<uint64_t> _pendingFiberAlignmentMetrics;

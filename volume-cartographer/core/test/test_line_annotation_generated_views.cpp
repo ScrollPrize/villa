@@ -2367,6 +2367,46 @@ TEST_CASE("fiber mode records only manifest identities used by direct interpolat
     CHECK(spline.controlPoints.front().segmentToNext->fiberManifestLocation.empty());
 }
 
+TEST_CASE("fiber mode can return only the inclusive control span")
+{
+    FiberModeNormalSampler normals;
+    vc3d::line_annotation::FiberModeOptimizationRequest request;
+    request.controlPoints = {
+        {2.0, {0.0, 0.0, 0.0}, true, 2},
+        {6.0, {16.0, 0.0, 0.0}, false, 6},
+    };
+    request.controlPoints.front().segmentToNext.emplace();
+    request.controlPoints.front().segmentToNext->interpGoal =
+        vc3d::line_annotation::SegmentInterpolationGoal::Cspline;
+    for (int x = -8; x <= 24; x += 4) {
+        request.linePointsBase.push_back({static_cast<double>(x), 0.0, 0.0});
+    }
+    request.baseNormalSampler = &normals;
+    request.globalMode =
+        vc3d::line_annotation::FiberOptimizationMode::NativeFiberTrace3d;
+    request.retainOpenTails = false;
+    request.extrapolationDistanceBaseVoxels = 8.0;
+    request.lasagnaConfig.segmentsPerSide = 2;
+    request.lasagnaConfig.segmentLength = 4.0;
+    request.lasagnaConfig.maxIterations = 20;
+    request.lasagnaConfig.printSolverProgress = false;
+
+    const auto result = vc3d::line_annotation::optimizeFiberWithNativeFallback(
+        std::move(request));
+
+    REQUIRE(result.optimization.line.points.size() >= 2);
+    CHECK(cv::norm(result.optimization.line.points.front().position -
+                   cv::Vec3d{0.0, 0.0, 0.0}) < 1.0e-12);
+    CHECK(cv::norm(result.optimization.line.points.back().position -
+                   cv::Vec3d{16.0, 0.0, 0.0}) < 1.0e-12);
+    CHECK(result.nativeExtrapolations == 0);
+    CHECK(result.lasagnaFallbackExtrapolations == 0);
+    REQUIRE(result.controlPoints.size() == 2);
+    CHECK(result.controlPoints.front().optimizedIndex == 0);
+    CHECK(result.controlPoints.back().optimizedIndex ==
+          static_cast<int>(result.optimization.line.points.size()) - 1);
+}
+
 TEST_CASE("fiber mode truncates extrapolation at an invalid prediction edge")
 {
     FiberModeNormalSampler normals;

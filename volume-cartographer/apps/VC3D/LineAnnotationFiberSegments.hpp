@@ -214,6 +214,11 @@ struct FiberModeOptimizationRequest {
     std::optional<std::vector<size_t>> dirtySegments;
     bool globalGoalsOnly = false;
     bool retraceAll = false;
+    // Ordinary line annotation keeps the optimizer's open geometry before
+    // the first and after the last control point. Workflows whose controls
+    // are explicit inclusive bounds (for example Spiral 2D annotation) opt
+    // out so the returned line starts and ends at those controls exactly.
+    bool retainOpenTails = true;
     std::function<void(const FiberExtrapolationFallbackDiagnostic&)>
         extrapolationFallbackCallback;
 };

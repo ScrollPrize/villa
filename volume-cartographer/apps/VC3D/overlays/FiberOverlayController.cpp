@@ -170,11 +170,63 @@ FiberOverlayController::~FiberOverlayController() = default;
 void FiberOverlayController::setChains(std::vector<Chain> chains)
 {
     clearPointChainProjectionCache();
+    _transformedChains.clear();
     _chains = std::move(chains);
     if (_chains.empty()) {
         _visible = false;
     }
     refreshAll();
+}
+
+void FiberOverlayController::setViewerBaseToViewerFactor(
+    VolumeViewerBase* viewer, double factor)
+{
+    if (!viewer || !(factor > 0.0) || !std::isfinite(factor)) {
+        return;
+    }
+    const auto found = _viewerFactors.find(viewer);
+    if (found != _viewerFactors.end() && found->second == factor) {
+        return;
+    }
+    _viewerFactors[viewer] = factor;
+    _transformedChains.erase(viewer);
+    clearPointChainProjectionCache();
+    refreshViewer(viewer);
+}
+
+double FiberOverlayController::viewerBaseToViewerFactor(
+    VolumeViewerBase* viewer) const
+{
+    const auto found = _viewerFactors.find(viewer);
+    return found == _viewerFactors.end() ? 1.0 : found->second;
+}
+
+void FiberOverlayController::detachViewer(VolumeViewerBase* viewer)
+{
+    _viewerFactors.erase(viewer);
+    _transformedChains.erase(viewer);
+    ViewerOverlayControllerBase::detachViewer(viewer);
+}
+
+const std::vector<FiberOverlayController::Chain>&
+FiberOverlayController::chainsForViewer(VolumeViewerBase* viewer) const
+{
+    const double factor = viewerBaseToViewerFactor(viewer);
+    if (factor == 1.0) {
+        return _chains;
+    }
+    if (auto found = _transformedChains.find(viewer);
+        found != _transformedChains.end()) {
+        return found->second;
+    }
+    std::vector<Chain> transformed = _chains;
+    const float scale = static_cast<float>(factor);
+    for (auto& chain : transformed) {
+        for (auto& point : chain.points) {
+            point *= scale;
+        }
+    }
+    return _transformedChains.emplace(viewer, std::move(transformed)).first->second;
 }
 
 void FiberOverlayController::setViewDistance(double distance)
@@ -246,7 +298,7 @@ FiberOverlayController::hitTestControlPoint(VolumeViewerBase* viewer,
     std::optional<ControlPointHit> best;
     qreal bestDistanceSq = maxDistancePx * maxDistancePx;
     std::vector<float> opacities;
-    for (const Chain& chain : _chains) {
+    for (const Chain& chain : chainsForViewer(viewer)) {
         const FilteredPoints filtered =
             projectedPointChain(viewer, chain.points, _viewDistance, &opacities);
         for (std::size_t i = 0; i < filtered.scenePoints.size(); ++i) {
@@ -273,8 +325,9 @@ void FiberOverlayController::collectPrimitives(VolumeViewerBase* viewer,
         return;
     }
 
-    for (std::size_t index = 0; index < _chains.size(); ++index) {
-        const Chain& chain = _chains[index];
+    const auto& viewerChains = chainsForViewer(viewer);
+    for (std::size_t index = 0; index < viewerChains.size(); ++index) {
+        const Chain& chain = viewerChains[index];
         const uint64_t colorId =
             (_showLinked && chain.colorId != 0) ? chain.colorId : chain.id;
         const PointChainStyle style = fiberStyle(fiberColor(colorId), _viewDistance);
@@ -289,7 +342,7 @@ void FiberOverlayController::collectPrimitives(VolumeViewerBase* viewer,
     // they paint last (FiberBatchItem draws commands in insertion order).
     // Colors match the Line Annotation GUI's branch control-point markers.
     std::vector<float> opacities;
-    for (const Chain& chain : _chains) {
+    for (const Chain& chain : viewerChains) {
         if (chain.pointLinkStates.empty()) {
             continue;
         }

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "LineAnnotationController.hpp"
+
 #include <QMainWindow>
 #include <QFutureWatcher>
 #include <QHash>
@@ -10,6 +12,7 @@
 #include <QStringList>
 #include <opencv2/core/mat.hpp>
 #include <opencv2/core/types.hpp>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -35,6 +38,7 @@ class Volume;
 class SpiralOverlayController;
 class SpiralMinimap;
 class SpiralBrushController;
+class SpiralLineDraftOverlay;
 class SegmentationOverlayController;
 class VolumeViewerBase;
 
@@ -58,6 +62,10 @@ public:
     void addFiberToCurrentFit(const QString& fiberJsonPath);
     void requestSessionExit(std::function<void()> continuation);
     bool hasPendingBrushWork() const;
+    void setLineAnnotationController(LineAnnotationController* controller);
+    [[nodiscard]] bool isFlattenedViewer(const VolumeViewerBase* viewer) const;
+    [[nodiscard]] QString lineAnnotationDraftUnavailableReason() const;
+    void startLineAnnotationDraft();
 
 signals:
     void spiralSessionActiveChanged(bool active);
@@ -147,6 +155,13 @@ private:
                                      const std::shared_ptr<QuadSurface>& surface,
                                      const std::optional<QColor>& color = std::nullopt);
     void finalizeBrushPaint();
+    void finalizeLineAnnotationDraft();
+    void cancelLineAnnotationDraft();
+    void undoLineAnnotationDraftPoint();
+    void appendLineAnnotationDraftPoint(const QPointF& scenePoint,
+                                        Qt::KeyboardModifiers modifiers);
+    [[nodiscard]] std::optional<LineAnnotationController::ResolvedFiberOptimizationInputs>
+        resolveLineAnnotationInputs(QString* errorMessage) const;
     void maybeCommitForPendingExit();
     QString provisionalBrushRoot() const;
     void discardBrushWork();
@@ -163,6 +178,8 @@ private:
     std::unique_ptr<AxisAlignedSliceController> _slices;
     std::unique_ptr<SpiralOverlayController> _overlay;
     std::unique_ptr<SpiralBrushController> _brush;
+    std::unique_ptr<SpiralLineDraftOverlay> _lineDraftOverlay;
+    LineAnnotationController* _lineAnnotationController = nullptr;
     std::unique_ptr<SegmentationOverlayController> _surfaceOverlapOverlay;
     SpiralServiceManager* _service = nullptr;
     SpiralPanel* _panel = nullptr;
@@ -173,6 +190,15 @@ private:
     SpiralMinimap* _windingMinimap = nullptr;
     qint64 _requestedPreviewGeneration = -1;
     QJsonObject _sessionPaths;
+    QJsonObject _sessionRunConfig;
+    QString _externalFiberSource;
+    struct LineAnnotationDraft {
+        std::shared_ptr<QuadSurface> surface;
+        std::vector<QPointF> surfacePoints;
+        std::shared_ptr<std::atomic_bool> saveAllowed;
+        bool optimizing = false;
+    };
+    std::optional<LineAnnotationDraft> _lineAnnotationDraft;
     QHash<QString, QStringList> _surfaceCategoryIds;
     QHash<QString, QString> _surfaceSourceIds;
     QHash<QString, bool> _surfaceCategoryVisible;

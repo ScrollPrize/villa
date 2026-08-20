@@ -14,6 +14,7 @@
 #include "elements/ViewerSplitGrid.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 #include "overlays/SpiralOverlayController.hpp"
+#include "overlays/ViewerOverlayControllerBase.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/CVolumeViewerView.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
@@ -29,11 +30,13 @@
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QDirIterator>
 #include <QGuiApplication>
 #include <QImageReader>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QJsonParseError>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QMessageBox>
@@ -44,6 +47,7 @@
 #include <QShortcut>
 #include <QStatusBar>
 #include <QTimer>
+#include <QTemporaryFile>
 #include <QVBoxLayout>
 #include <QWindow>
 #include <QtConcurrent/QtConcurrent>
@@ -56,7 +60,148 @@
 #include <set>
 #include <unordered_map>
 
+class SpiralLineDraftOverlay final : public ViewerOverlayControllerBase
+{
+public:
+    explicit SpiralLineDraftOverlay(QObject* parent = nullptr)
+        : ViewerOverlayControllerBase("spiral_line_annotation_draft", parent) {}
+
+    void setDraft(VolumeViewerBase* viewer, std::vector<cv::Vec2f> points)
+    {
+        _viewer = viewer;
+        _points = std::move(points);
+        refreshAll();
+    }
+
+protected:
+    bool isOverlayEnabledFor(VolumeViewerBase* viewer) const override
+    {
+        return viewer && viewer == _viewer && !_points.empty();
+    }
+
+    void collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder) override
+    {
+        if (!isOverlayEnabledFor(viewer)) return;
+        OverlayStyle line;
+        line.penColor = QColor(255, 205, 40, 245);
+        line.penWidth = 3.0;
+        line.z = 110.0;
+        if (_points.size() >= 2) builder.addSurfaceLineStrip(_points, false, line);
+        OverlayStyle point = line;
+        point.penColor = QColor(20, 20, 20, 255);
+        point.brushColor = QColor(255, 205, 40, 255);
+        point.penWidth = 1.5;
+        point.z = 111.0;
+        for (const auto& position : _points)
+            builder.addSurfacePoint(position, 5.0, point);
+    }
+
+private:
+    VolumeViewerBase* _viewer = nullptr;
+    std::vector<cv::Vec2f> _points;
+};
+
 namespace {
+
+std::optional<int> omeScaledownForGroup(
+    const QString& rootPath, const QString& group, QString* errorMessage)
+{
+    QFile attributesFile(QDir(rootPath).filePath(QStringLiteral(".zattrs")));
+    if (!attributesFile.open(QIODevice::ReadOnly)) {
+        if (errorMessage) {
+            *errorMessage = QObject::tr("Cannot read OME metadata at %1")
+                                .arg(attributesFile.fileName());
+        }
+        return std::nullopt;
+    }
+    QJsonParseError parseError;
+    const QJsonDocument document = QJsonDocument::fromJson(
+        attributesFile.readAll(), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
+        if (errorMessage) {
+            *errorMessage = QObject::tr("Malformed OME metadata at %1: %2")
+                                .arg(attributesFile.fileName(), parseError.errorString());
+        }
+        return std::nullopt;
+    }
+    const QJsonArray multiscales =
+        document.object().value(QStringLiteral("multiscales")).toArray();
+    if (multiscales.isEmpty()) {
+        if (errorMessage) *errorMessage = QObject::tr("OME multiscales metadata is missing");
+        return std::nullopt;
+    }
+    const QJsonArray datasets = multiscales.at(0).toObject()
+                                    .value(QStringLiteral("datasets")).toArray();
+    auto datasetScale = [&](const QString& wanted) -> std::optional<double> {
+        for (const QJsonValue& value : datasets) {
+            const QJsonObject dataset = value.toObject();
+            if (dataset.value(QStringLiteral("path")).toString() != wanted) continue;
+            std::optional<double> scale;
+            const QJsonArray transforms =
+                dataset.value(QStringLiteral("coordinateTransformations")).toArray();
+            for (const QJsonValue& transformValue : transforms) {
+                const QJsonObject transform = transformValue.toObject();
+                const QString type = transform.value(QStringLiteral("type")).toString();
+                if (type == QStringLiteral("translation")) {
+                    const QJsonArray translation =
+                        transform.value(QStringLiteral("translation")).toArray();
+                    if (translation.size() != 3 ||
+                        std::any_of(translation.begin(), translation.end(),
+                                    [](const QJsonValue& component) {
+                                        return !component.isDouble() ||
+                                               !std::isfinite(component.toDouble()) ||
+                                               std::abs(component.toDouble()) > 1.0e-9;
+                                    })) {
+                        return std::nullopt;
+                    }
+                } else if (type == QStringLiteral("scale")) {
+                    const QJsonArray values =
+                        transform.value(QStringLiteral("scale")).toArray();
+                    if (values.size() != 3) return std::nullopt;
+                    const double first = values.at(0).toDouble(
+                        std::numeric_limits<double>::quiet_NaN());
+                    if (!std::isfinite(first) || first <= 0.0) return std::nullopt;
+                    for (const QJsonValue& component : values) {
+                        const double current = component.toDouble(
+                            std::numeric_limits<double>::quiet_NaN());
+                        if (!std::isfinite(current) || current <= 0.0 ||
+                            std::abs(current - first) >
+                                1.0e-9 * std::max({1.0, current, first})) {
+                            return std::nullopt;
+                        }
+                    }
+                    scale = first;
+                } else {
+                    return std::nullopt;
+                }
+            }
+            return scale;
+        }
+        return std::nullopt;
+    };
+
+    const auto baseScale = datasetScale(QStringLiteral("0"));
+    const auto groupScale = datasetScale(group);
+    if (!baseScale || !groupScale) {
+        if (errorMessage) {
+            *errorMessage = QObject::tr(
+                "OME scale metadata for groups 0 and %1 is required").arg(group);
+        }
+        return std::nullopt;
+    }
+    const double ratio = *groupScale / *baseScale;
+    const double levelValue = std::log2(ratio);
+    const int level = static_cast<int>(std::llround(levelValue));
+    if (level < 0 || level > 30 || !std::isfinite(levelValue) ||
+        std::abs(levelValue - static_cast<double>(level)) > 1.0e-9) {
+        if (errorMessage) {
+            *errorMessage = QObject::tr(
+                "OME scale for group %1 is not a dyadic L0 scale").arg(group);
+        }
+        return std::nullopt;
+    }
+    return level;
+}
 
 QImage maskOverlayToSurface(
     QImage image, const std::shared_ptr<QuadSurface>& surface)
@@ -106,6 +251,8 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     _overlay->bindToViewerManager(_viewerManager.get());
     _brush = std::make_unique<SpiralBrushController>(this);
     _brush->bindToViewerManager(_viewerManager.get());
+    _lineDraftOverlay = std::make_unique<SpiralLineDraftOverlay>(this);
+    _lineDraftOverlay->bindToViewerManager(_viewerManager.get());
     _surfaceOverlapOverlay = std::make_unique<SegmentationOverlayController>(_state, this);
     _surfaceOverlapOverlay->setViewerManager(_viewerManager.get());
     _viewerManager->setSegmentationOverlay(_surfaceOverlapOverlay.get());
@@ -127,6 +274,14 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
         if (pane == 0) {
             _flattenedViewer = viewer;
             _brush->bindFlattenedViewer(viewer);
+            if (auto* view = viewer->graphicsView()) {
+                connect(view, &CVolumeViewerView::sendMouseRelease, this,
+                        [this](QPointF scenePoint, Qt::MouseButton button,
+                               Qt::KeyboardModifiers modifiers) {
+                            if (button == Qt::LeftButton)
+                                appendLineAnnotationDraftPoint(scenePoint, modifiers);
+                        });
+            }
         }
         viewer->setIntersects(specs[pane].intersects);
         _grid->setViewer(pane, qobject_cast<QWidget*>(viewer->asQObject()));
@@ -267,7 +422,10 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     auto* finalizeBrushShortcut = new QShortcut(QKeySequence(Qt::SHIFT | Qt::Key_E), this);
     finalizeBrushShortcut->setContext(Qt::WidgetWithChildrenShortcut);
     connect(finalizeBrushShortcut, &QShortcut::activated,
-            this, &SpiralWorkspace::finalizeBrushPaint);
+            this, [this]() {
+                if (_lineAnnotationDraft) finalizeLineAnnotationDraft();
+                else finalizeBrushPaint();
+            });
     connect(_brush.get(), &SpiralBrushController::brushDiameterChanged,
             this, [this](int diameter) {
                 statusBar()->showMessage(tr("Spiral brush diameter: %1 px").arg(diameter), 2500);
@@ -405,6 +563,27 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 const qint64 generation =
                     status.value(QStringLiteral("session_generation")).toInteger();
                 _sessionPaths = paths;
+                _sessionRunConfig = request.value(QStringLiteral("run")).toObject()
+                    .value(QStringLiteral("config")).toObject();
+                cancelLineAnnotationDraft();
+                if (_lineAnnotationController && !_externalFiberSource.isEmpty()) {
+                    _lineAnnotationController->unregisterExternalFiberSource(
+                        _externalFiberSource.toStdString());
+                }
+                _externalFiberSource.clear();
+                const QString fibersServicePath =
+                    paths.value(QStringLiteral("fibers")).toString();
+                const QString fibersLocalPath = fibersServicePath.isEmpty()
+                    ? QString() : mapServicePath(fibersServicePath);
+                if (_lineAnnotationController && !fibersLocalPath.isEmpty()) {
+                    QString error;
+                    if (_lineAnnotationController->registerExternalFiberSource(
+                            fibersLocalPath.toStdString(), &error)) {
+                        _externalFiberSource = fibersLocalPath;
+                    } else {
+                        statusBar()->showMessage(error, 15000);
+                    }
+                }
                 _previewSource.reset();
                 _previewComponents.clear();
                 _previewWindingIds.release();
@@ -434,6 +613,15 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 _overlay->publishRunDiff({}, {});
                 _overlay->publishLossMap({}, {}, _lossMapOpacity);
                 loadInputSurfaces(paths, static_cast<quint64>(generation));
+            });
+    connect(_service, &SpiralServiceManager::sessionActiveChanged, this,
+            [this](bool active) {
+                if (active) return;
+                cancelLineAnnotationDraft();
+                if (_lineAnnotationController && !_externalFiberSource.isEmpty())
+                    _lineAnnotationController->unregisterExternalFiberSource(
+                        _externalFiberSource.toStdString());
+                _externalFiberSource.clear();
             });
     synchronizeVolume(_mainState ? _mainState->currentVolume() : nullptr);
 }
@@ -723,6 +911,293 @@ bool SpiralWorkspace::hasActiveSpiralSession() const
     return _service && _service->hasActiveSession();
 }
 
+void SpiralWorkspace::setLineAnnotationController(LineAnnotationController* controller)
+{
+    if (_lineAnnotationController == controller) return;
+    if (_lineAnnotationController && !_externalFiberSource.isEmpty())
+        _lineAnnotationController->unregisterExternalFiberSource(
+            _externalFiberSource.toStdString());
+    _lineAnnotationController = controller;
+    if (_lineAnnotationController && !_externalFiberSource.isEmpty()) {
+        QString error;
+        if (!_lineAnnotationController->registerExternalFiberSource(
+                _externalFiberSource.toStdString(), &error))
+            statusBar()->showMessage(error, 15000);
+    }
+}
+
+bool SpiralWorkspace::isFlattenedViewer(const VolumeViewerBase* viewer) const
+{
+    return viewer && viewer == _flattenedViewer;
+}
+
+QString SpiralWorkspace::lineAnnotationDraftUnavailableReason() const
+{
+    if (!_lineAnnotationController)
+        return tr("Line Annotation is not initialized");
+    if (!_service || !_service->hasActiveSession())
+        return tr("Load a Spiral session first");
+    if (!_currentPreview || !_flattenedViewer ||
+        _flattenedViewer->currentSurface() != _currentPreview.get())
+        return tr("Wait for a flattened Spiral preview");
+    const QString servicePath =
+        _sessionPaths.value(QStringLiteral("fibers")).toString();
+    const QString localPath = servicePath.isEmpty()
+        ? QString() : mapServicePath(servicePath);
+    if (localPath.isEmpty())
+        return tr("paths.fibers is unavailable through the current service-path mapping");
+    QFileInfo info(localPath);
+    QFileInfo parent(info.absolutePath());
+    if ((info.exists() && (!info.isDir() || !info.isWritable())) ||
+        (!info.exists() && !parent.isWritable()))
+        return tr("The mapped paths.fibers directory is not writable");
+    return {};
+}
+
+void SpiralWorkspace::startLineAnnotationDraft()
+{
+    const QString reason = lineAnnotationDraftUnavailableReason();
+    if (!reason.isEmpty()) {
+        statusBar()->showMessage(reason, 10000);
+        return;
+    }
+    LineAnnotationDraft draft;
+    draft.surface = _currentPreview;
+    draft.saveAllowed = std::make_shared<std::atomic_bool>(true);
+    _lineAnnotationDraft = std::move(draft);
+    _lineDraftOverlay->setDraft(_flattenedViewer, {});
+    statusBar()->showMessage(
+        tr("2D line annotation: left-click controls, Backspace/Ctrl+Z undo, "
+           "Escape cancel, Shift+E optimize"));
+}
+
+void SpiralWorkspace::cancelLineAnnotationDraft()
+{
+    if (!_lineAnnotationDraft) return;
+    if (_lineAnnotationDraft->saveAllowed)
+        _lineAnnotationDraft->saveAllowed->store(false);
+    _lineAnnotationDraft.reset();
+    if (_lineDraftOverlay) _lineDraftOverlay->setDraft(_flattenedViewer, {});
+}
+
+void SpiralWorkspace::undoLineAnnotationDraftPoint()
+{
+    if (!_lineAnnotationDraft || _lineAnnotationDraft->optimizing ||
+        _lineAnnotationDraft->surfacePoints.empty()) return;
+    _lineAnnotationDraft->surfacePoints.pop_back();
+    std::vector<cv::Vec2f> points;
+    points.reserve(_lineAnnotationDraft->surfacePoints.size());
+    for (const auto& point : _lineAnnotationDraft->surfacePoints)
+        points.emplace_back(point.x(), point.y());
+    _lineDraftOverlay->setDraft(_flattenedViewer, std::move(points));
+}
+
+void SpiralWorkspace::appendLineAnnotationDraftPoint(
+    const QPointF& scenePoint, Qt::KeyboardModifiers modifiers)
+{
+    if (!_lineAnnotationDraft || _lineAnnotationDraft->optimizing ||
+        modifiers != Qt::NoModifier || !_flattenedViewer ||
+        _lineAnnotationDraft->surface.get() != _flattenedViewer->currentSurface()) return;
+    const cv::Vec2f surface =
+        _flattenedViewer->sceneToSurfaceCoords(scenePoint);
+    if (!std::isfinite(surface[0]) || !std::isfinite(surface[1]) ||
+        !_lineAnnotationDraft->surface->sampleAtSurface(
+            {surface[0], surface[1]})) {
+        statusBar()->showMessage(
+            tr("Point must lie on valid Spiral surface data"), 5000);
+        return;
+    }
+    _lineAnnotationDraft->surfacePoints.emplace_back(surface[0], surface[1]);
+    std::vector<cv::Vec2f> points;
+    points.reserve(_lineAnnotationDraft->surfacePoints.size());
+    for (const auto& point : _lineAnnotationDraft->surfacePoints)
+        points.emplace_back(point.x(), point.y());
+    _lineDraftOverlay->setDraft(_flattenedViewer, std::move(points));
+}
+
+std::optional<LineAnnotationController::ResolvedFiberOptimizationInputs>
+SpiralWorkspace::resolveLineAnnotationInputs(QString* errorMessage) const
+{
+    if (!_lineAnnotationController) return std::nullopt;
+    const QJsonObject scroll = _service->advertisedDataset()
+                                   .value(QStringLiteral("scroll_spec")).toObject();
+    const QString group = scroll.value(QStringLiteral("normal_zarr_group"))
+                              .toString(QStringLiteral("4"));
+    std::optional<int> omeScale;
+    QString omeError;
+    QString fallbackNormal;
+    QTemporaryFile manifest(
+        QDir(QDir::tempPath()).filePath(
+            QStringLiteral("vc3d-spiral-normal-XXXXXX.lasagna.json")));
+    manifest.setAutoRemove(false);
+    const QStringList normalKeys{QStringLiteral("normal_x"),
+                                 QStringLiteral("normal_y"),
+                                 QStringLiteral("gradient_magnitude")};
+    QStringList mapped;
+    for (const QString& key : normalKeys) {
+        const QString servicePath = _sessionPaths.value(key).toString();
+        mapped.push_back(servicePath.isEmpty() ? QString() : mapServicePath(servicePath));
+    }
+    if (std::all_of(mapped.begin(), mapped.end(),
+                    [](const QString& path) { return !path.isEmpty(); })) {
+        for (const QString& path : mapped) {
+            QString candidateError;
+            const auto candidate = omeScaledownForGroup(path, group, &candidateError);
+            if (!candidate) {
+                omeError = candidateError;
+                omeScale.reset();
+                break;
+            }
+            if (omeScale && *omeScale != *candidate) {
+                omeError = tr("Spiral normal inputs declare different OME scales");
+                omeScale.reset();
+                break;
+            }
+            omeScale = candidate;
+        }
+    }
+    if (omeScale &&
+        std::all_of(mapped.begin(), mapped.end(),
+                    [](const QString& path) { return !path.isEmpty(); }) &&
+        manifest.open()) {
+        const double encodeScale = _sessionRunConfig
+            .value(QStringLiteral("dense_grad_mag_encode_scale"))
+            .toDouble(1000.0);
+        const double gradFactor = _sessionRunConfig
+            .value(QStringLiteral("dense_grad_mag_factor"))
+            .toDouble(0.25);
+        QJsonObject groups;
+        const QStringList channels{QStringLiteral("nx"), QStringLiteral("ny"),
+                                   QStringLiteral("grad_mag")};
+        for (int i = 0; i < mapped.size(); ++i) {
+            groups[channels[i]] = QJsonObject{
+                {QStringLiteral("zarr"), QDir(mapped[i]).filePath(group)},
+                {QStringLiteral("scaledown"), *omeScale},
+                {QStringLiteral("channels"), QJsonArray{channels[i]}},
+            };
+        }
+        const QJsonObject root{
+            {QStringLiteral("version"), 2},
+            {QStringLiteral("source_to_base"), 1.0},
+            {QStringLiteral("grad_mag_encode_scale"), encodeScale},
+            {QStringLiteral("grad_mag_factor"), gradFactor},
+            {QStringLiteral("groups"), groups},
+        };
+        manifest.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+        manifest.close();
+        fallbackNormal = manifest.fileName();
+    }
+
+    QString fallbackFiber;
+    const QString serviceRoot =
+        _sessionPaths.value(QStringLiteral("dataset_root")).toString();
+    const QString localRoot = serviceRoot.isEmpty()
+        ? QString() : mapServicePath(serviceRoot);
+    QStringList manifests;
+    if (!localRoot.isEmpty()) {
+        QDirIterator it(QDir(localRoot).filePath(QStringLiteral("fiber_zarrs")),
+                        {QStringLiteral("*.lasagna.json")}, QDir::Files,
+                        QDirIterator::Subdirectories);
+        while (it.hasNext()) manifests.push_back(it.next());
+    }
+    if (manifests.size() == 1) fallbackFiber = manifests.front();
+
+    auto result = _lineAnnotationController->resolveFiberOptimizationInputs(
+        fallbackNormal.toStdString(), fallbackFiber.toStdString(), errorMessage);
+    if (result && result->normalManifestLocation == fallbackNormal.toStdString()) {
+        result->normalManifestLocation =
+            QStringLiteral("spiral-session:%1#normals")
+                .arg(serviceRoot).toStdString();
+    }
+    if (!fallbackNormal.isEmpty()) QFile::remove(fallbackNormal);
+    if (!result && errorMessage) {
+        if (fallbackNormal.isEmpty())
+            *errorMessage += tr(" Spiral fallback normals require mapped normal_x, "
+                                "normal_y, gradient_magnitude, and valid OME scale metadata: %1")
+                                 .arg(omeError);
+        if (manifests.size() != 1)
+            *errorMessage += manifests.isEmpty()
+                ? tr(" No fiber-inference manifest was found below fiber_zarrs.")
+                : tr(" Multiple fiber-inference manifests were found below fiber_zarrs; "
+                     "select one in the project.");
+    }
+    return result;
+}
+
+void SpiralWorkspace::finalizeLineAnnotationDraft()
+{
+    if (!_lineAnnotationDraft || _lineAnnotationDraft->optimizing) return;
+    if (_lineAnnotationDraft->surfacePoints.size() < 2) {
+        statusBar()->showMessage(
+            tr("A 2D line annotation needs at least two distinct points"), 10000);
+        return;
+    }
+    std::vector<cv::Vec3d> controls;
+    controls.reserve(_lineAnnotationDraft->surfacePoints.size());
+    for (const QPointF& point : _lineAnnotationDraft->surfacePoints) {
+        const auto sample = _lineAnnotationDraft->surface->sampleAtSurface(
+            {point.x(), point.y()});
+        if (!sample) {
+            statusBar()->showMessage(
+                tr("A saved control no longer samples valid preview geometry"), 10000);
+            return;
+        }
+        // Spiral's preview volume is explicitly L2; vc3d_fiber is canonical L0.
+        controls.emplace_back(sample.volume[0] * 4.0,
+                              sample.volume[1] * 4.0,
+                              sample.volume[2] * 4.0);
+    }
+    for (size_t i = 0; i < controls.size(); ++i) {
+        for (size_t j = 0; j < i; ++j) {
+            if (cv::norm(controls[i] - controls[j]) <= 1.0e-5) {
+                statusBar()->showMessage(
+                    tr("A 2D line annotation cannot contain duplicate controls"), 10000);
+                return;
+            }
+        }
+    }
+    QString error;
+    auto inputs = resolveLineAnnotationInputs(&error);
+    if (!inputs) {
+        statusBar()->showMessage(error, 15000);
+        return;
+    }
+    const QString destinationService =
+        _sessionPaths.value(QStringLiteral("fibers")).toString();
+    const QString destination = destinationService.isEmpty()
+        ? QString() : mapServicePath(destinationService);
+    if (destination.isEmpty()) {
+        statusBar()->showMessage(
+            tr("paths.fibers is unavailable through the current path mapping"), 15000);
+        return;
+    }
+    _lineAnnotationDraft->optimizing = true;
+    statusBar()->showMessage(tr("Optimizing 2D line annotation…"));
+    LineAnnotationController::HeadlessFiberOptimizationRequest request;
+    request.controlPointsL0 = std::move(controls);
+    request.inputs = std::move(*inputs);
+    request.destinationFiberSource = destination.toStdString();
+    const auto saveAllowed = _lineAnnotationDraft->saveAllowed;
+    request.shouldSave = [saveAllowed]() {
+        return saveAllowed && saveAllowed->load();
+    };
+    QPointer<SpiralWorkspace> self(this);
+    _lineAnnotationController->optimizeAndSaveFiberHeadless(
+        std::move(request),
+        [self](bool ok, const QString& message, uint64_t) {
+            if (!self || !self->_lineAnnotationDraft) return;
+            if (!ok) {
+                self->_lineAnnotationDraft->optimizing = false;
+                self->statusBar()->showMessage(
+                    self->tr("2D line annotation failed: %1").arg(message), 15000);
+                return;
+            }
+            self->cancelLineAnnotationDraft();
+            self->statusBar()->showMessage(
+                self->tr("Saved 2D line annotation to paths.fibers"), 10000);
+        });
+}
+
 void SpiralWorkspace::addPatchToCurrentFit(
     const QString& tifxyzDirectory, const std::shared_ptr<QuadSurface>& surface)
 {
@@ -916,6 +1391,9 @@ void SpiralWorkspace::maybeCommitForPendingExit()
 SpiralWorkspace::~SpiralWorkspace()
 {
     _shuttingDown = true;
+    if (_lineAnnotationController && !_externalFiberSource.isEmpty())
+        _lineAnnotationController->unregisterExternalFiberSource(
+            _externalFiberSource.toStdString());
     if (_viewerManager) _viewerManager->beginShutdown();
     // Disconnecting never terminates a service VC3D did not launch; only an
     // owned local process is stopped.
@@ -928,6 +1406,20 @@ SpiralWorkspace::~SpiralWorkspace()
 
 void SpiralWorkspace::keyPressEvent(QKeyEvent* event)
 {
+    if (event && _lineAnnotationDraft) {
+        if (event->key() == Qt::Key_Escape) {
+            cancelLineAnnotationDraft();
+            event->accept();
+            return;
+        }
+        if (event->key() == Qt::Key_Backspace ||
+            (event->key() == Qt::Key_Z &&
+             event->modifiers() == Qt::ControlModifier)) {
+            undoLineAnnotationDraftPoint();
+            event->accept();
+            return;
+        }
+    }
     using namespace vc3d::keybinds;
     if (event && event->key() == keypress::CenterFocusOnCursor.key &&
         event->modifiers() == keypress::CenterFocusOnCursor.modifiers) {
@@ -1256,6 +1748,7 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
 void SpiralWorkspace::installPreview(const PreviewLoadResult& result, qint64 generation)
 {
     if (!result.surface) { statusBar()->showMessage(result.error, 15000); return; }
+    cancelLineAnnotationDraft();
     _previewSource = result.surface;
     _previewSourceId = result.surfaceId;
     _previewComponents = result.components;
@@ -1777,6 +2270,8 @@ void SpiralWorkspace::installPreviewAliasWhenIndexed(
         return;
     }
     const QString previousRegistration = _currentPreviewRegistrationId;
+    if (_lineAnnotationDraft && _lineAnnotationDraft->surface != preview)
+        cancelLineAnnotationDraft();
     _currentPreview = preview;
     _brush->setPaintSurface(preview);
     _currentPreviewRegistrationId = registrationId;
