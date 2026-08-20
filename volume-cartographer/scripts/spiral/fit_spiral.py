@@ -9,10 +9,16 @@ import sys
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
 import copy
+import concurrent.futures
 import gc
+import multiprocessing
 import json
 import glob
 import re
+try:
+    import resource
+except ImportError:  # pragma: no cover - unavailable on Windows
+    resource = None
 from collections.abc import Mapping
 import zarr
 import torch
@@ -21,6 +27,8 @@ import datetime
 import time
 import numpy as np
 import scipy.ndimage
+import scipy.sparse
+import scipy.sparse.csgraph
 import torch.nn.functional as F
 from scipy.spatial import cKDTree
 from tqdm import tqdm
@@ -41,12 +49,27 @@ from config import (BACKFILLABLE_CONFIG_DEFAULTS, CHECKPOINT_MODEL_SHAPE_KEYS,
 from fit_session import (fit_input, input_source_enabled, pcl_input_enabled,
                          phase_bundle_enabled, shell_losses_enabled,
                          winding_inference_enabled)
+
+
+def _startup_resource_suffix(started_at=None):
+    """Small cross-platform startup timing/high-water diagnostic."""
+    fields = []
+    if started_at is not None:
+        fields.append(f'{time.perf_counter() - started_at:.1f}s')
+    if resource is not None:
+        high_water = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # Linux reports KiB; macOS reports bytes.
+        bytes_high_water = high_water if sys.platform == 'darwin' else high_water * 1024
+        fields.append(f'peak RSS {bytes_high_water / (1 << 30):.2f} GiB')
+    return ', '.join(fields)
+
+
 from lasagna_data import (ensure_fit_sparse_stores, prepare_lasagna_volume,
                           prepare_surf_sdt_volume)
 from checkpoint_io import load_checkpoint_cpu
 from influence import make_influence_state, subsample_rows
-from native_spiral import load_native_spiral_sampling
-from tifxyz import load_tifxyz
+from spiral_sampling import load_spiral_sampling
+from tifxyz import load_tifxyz, patch_from_payload
 from geom_utils import bilinear_atlas_lookup, interp1d
 from point_collection import (
     link_points_to_patches,
@@ -77,10 +100,8 @@ from sample_spiral import (
     get_theta,
     get_winding_xy,
 )
-import strip_path_pools
 from losses import (
     build_pcl_sampling_strata,
-    build_serpentine_quad_path,
     iter_lasagna_losses,
     get_patch_abs_winding_loss,
     get_patch_and_umbilicus_losses,
@@ -100,6 +121,7 @@ from sdt_losses import (
 from spiral_helpers import (
     REFERENCE_Z_RANGE_NUM_SLICES,
     erode_patch_valid_region,
+    load_patch_payload_chunk,
     load_patches,
     load_fiber_point_collection,
     load_fiber_point_collections,
@@ -123,6 +145,7 @@ from satisfaction_metrics import (
 )
 from visualization import overlay_patches_on_slices
 from transforms import SpiralAndTransform
+from theta_crossing_map import ThetaCrossingMap
 from winding_supervision import (
     get_winding_inference_losses,
     load_winding_inference_store,
@@ -131,6 +154,18 @@ from spiral_progress import ProgressReporter, progress_or_null
 
 
 configure_torch_threads_from_env()
+
+
+def largest_patch_quad_component(mask):
+    """Return only the largest 8-connected True component of a quad mask."""
+    mask = np.asarray(mask, dtype=bool)
+    component_labels, num_components = scipy.ndimage.label(
+        mask, structure=np.ones((3, 3), dtype=bool))
+    if num_components <= 1:
+        return mask.copy()
+    component_sizes = np.bincount(component_labels.reshape(-1))
+    component_sizes[0] = 0
+    return component_labels == int(component_sizes.argmax())
 
 
 # Fields of a surf-SDT fingerprint that describe where the store lives and how
@@ -295,79 +330,312 @@ class ShellPolarMap:
         return target_radius, radius, confidence, valid
 
 
+def _make_patch_sampling_atlas(masks):
+    """Construct the required sampler, rejecting missing or stale bindings."""
+    spiral_sampling = load_spiral_sampling()
+    atlas_type = (
+        getattr(spiral_sampling, 'PatchSamplingAtlas', None)
+        if spiral_sampling is not None else None)
+    if atlas_type is None:
+        raise RuntimeError(
+            'Patch sampling requires vc.spiral_sampling.PatchSamplingAtlas; '
+            'rebuild and install the vc_spiral_sampling extension')
+    atlas = atlas_type(masks)
+    required = (
+        'sample_patch_points', 'valid_counts', 'total_valid_cells',
+        'node_ijs', 'cell_node_ordinals', 'tree_chunk',
+        'neighbor_chunk', 'memory_stats',
+    )
+    missing = [name for name in required if not hasattr(atlas, name)]
+    if missing:
+        raise RuntimeError(
+            'The installed vc.spiral_sampling binding is out of date: '
+            f'PatchSamplingAtlas is missing {", ".join(missing)}; rebuild and '
+            'install the vc_spiral_sampling extension')
+    return atlas
+
+
 class PatchAtlas:
-    """All patches' (H, W, 3) zyxs grids packed into one flat tensor, batched
-    per lookup instead of per-patch dispatch. The packed grids stay resident in
-    host memory: the (i, j) samples are drawn on the CPU anyway, so the
-    bilinear gather runs there (mostly-contiguous strip reads, a few MB per
-    step) and only the interpolated points are uploaded to `device`. This
-    keeps the atlas - which scales with the input patch count, not with any
-    per-step budget - out of VRAM entirely."""
+    """Patch (H, W, 3) zyx grids packed for batched lookup.
+
+    Initial geometry is moved as one allocation by :meth:`materialize` during
+    device setup. Later interactive appends use independent resident chunks so
+    the original allocation never has to be copied. Sampling masks remain in
+    the native/CPU sampling atlas.
+    """
 
     def __init__(self, patches_by_id, device='cuda'):
         self.device = torch.device(device)
-        flat_pieces = []
         offsets = [0]
         widths = []
         heights = []
         for p in patches_by_id.values():
             z = p.zyxs  # (H, W, 3) on CPU
             H, W = z.shape[:2]
-            z_flat = z.reshape(-1, 3).to(dtype=torch.float32)
-            flat_pieces.append(z_flat)
             offsets.append(offsets[-1] + H * W)
             widths.append(W)
             heights.append(H)
-        self.zyxs_flat = (
-            torch.cat(flat_pieces, dim=0)
-            if flat_pieces
-            else torch.empty([0, 3], dtype=torch.float32))
+        # Geometry remains in each Patch until materialize().  Concatenating
+        # here used to retain a second full host copy for the entire session.
+        self.zyxs_flat = None
+        self._geometry_chunks = []
+        self._num_vertices = offsets[-1]
         self.offsets = torch.tensor(offsets, dtype=torch.int64)  # (N+1,)
         self.widths = torch.tensor(widths, dtype=torch.int64)  # (N,)
         self.heights = torch.tensor(heights, dtype=torch.int64)  # (N,)
         self.id_to_idx = {pid: i for i, pid in enumerate(patches_by_id.keys())}
-        native = load_native_spiral_sampling()
+        self._patches = list(patches_by_id.values())
+        self._theta_node_start = None
+        self._theta_node_ranges = []
+        masks = [
+            np.ascontiguousarray(p._sampling_valid_quad_mask_np, dtype=bool)
+            for p in patches_by_id.values()
+        ]
         self.sampling_atlas = (
-            native.PatchSamplingAtlas([
-                np.ascontiguousarray(p._sampling_valid_quad_mask_np, dtype=bool)
-                for p in patches_by_id.values()
-            ])
-            if native is not None and patches_by_id else None
-        )
+            _make_patch_sampling_atlas(masks) if masks else None)
+        self._quad_counts = (
+            np.asarray(self.sampling_atlas.valid_counts(), dtype=np.int64)
+            if self.sampling_atlas is not None
+            else np.empty(0, dtype=np.int64))
 
     def memory_mb(self):
-        return self.zyxs_flat.numel() * 4 / 1e6
+        return self._num_vertices * 3 * 4 / 1e6
+
+    def topology_memory_stats(self):
+        """Return printable native-topology stats, including for no patches."""
+        if self.sampling_atlas is None:
+            return {'num_valid_cells': 0, 'persistent_bytes': 0}
+        return dict(self.sampling_atlas.memory_stats())
+
+    @staticmethod
+    def _materialize_geometry(patches, num_vertices, device):
+        """Copy patch grids into one new resident chunk.
+
+        A chunk is allocated at its final size and filled in place, so adding
+        patches to an already-materialized atlas never needs a replacement
+        allocation for the existing geometry.
+        """
+        resident = torch.empty(
+            (num_vertices, 3), dtype=torch.float32, device=device)
+        if device.type == 'cpu':
+            offset = 0
+            for patch in patches:
+                piece = patch.zyxs.reshape(-1, 3).to(dtype=torch.float32)
+                resident[offset:offset + len(piece)].copy_(piece)
+                offset += len(piece)
+            return resident
+
+        # Amortise transfers without ever concatenating the whole atlas on
+        # the host.  256 MiB bounds the temporary independently of dataset
+        # size while preserving the exact float32 bytes and patch order.
+        staging_limit = 256 * (1 << 20) // (3 * 4)
+        pieces = []
+        staged = 0
+        offset = 0
+
+        def flush():
+            nonlocal pieces, staged, offset
+            if not pieces:
+                return
+            staging = torch.cat(pieces, dim=0)
+            resident[offset:offset + staged].copy_(
+                staging, non_blocking=True)
+            offset += staged
+            pieces = []
+            staged = 0
+
+        for patch in patches:
+            piece = patch.zyxs.reshape(-1, 3).to(dtype=torch.float32)
+            if pieces and staged + len(piece) > staging_limit:
+                flush()
+            # A single unusually large patch is copied directly so the
+            # advertised staging bound is not exceeded.
+            if len(piece) > staging_limit:
+                resident[offset:offset + len(piece)].copy_(
+                    piece, non_blocking=True)
+                offset += len(piece)
+            else:
+                pieces.append(piece)
+                staged += len(piece)
+        flush()
+        return resident
+
+    def materialize(self, device=None):
+        """Build one resident geometry allocation with bounded host staging."""
+        if device is not None:
+            self.device = torch.device(device)
+        if (self.zyxs_flat is not None
+                and self.zyxs_flat.device == self.device):
+            return self
+        resident = self._materialize_geometry(
+            self._patches, self._num_vertices, self.device)
+        self.zyxs_flat = resident
+        self.offsets = self.offsets.to(self.device)
+        self.widths = self.widths.to(self.device)
+        self.heights = self.heights.to(self.device)
+        self._geometry_chunks = [{
+            'zyxs_flat': resident,
+            'offsets': self.offsets,
+            'widths': self.widths,
+            'heights': self.heights,
+            'patch_start': 0,
+            'patch_end': len(self._patches),
+        }]
+        return self
+
+    def rebuild_sampling_atlas(self):
+        """Rebuild CPU/native lookup metadata after sampling masks change."""
+        masks = [
+            np.ascontiguousarray(
+                patch._sampling_valid_quad_mask_np, dtype=bool)
+            for patch in self._patches
+        ]
+        self.sampling_atlas = (
+            _make_patch_sampling_atlas(masks) if masks else None)
+        self._quad_counts = (
+            np.asarray(self.sampling_atlas.valid_counts(), dtype=np.int64)
+            if self.sampling_atlas is not None
+            else np.empty(0, dtype=np.int64))
 
     def lookup(self, patch_idx_per_sample, ijs):
-        # patch_idx_per_sample: (...,) int64 on CPU
-        # ijs: (..., 2) float on CPU
-        # Gathers and interpolates on the host-resident atlas and returns
-        # (..., 3) on self.device. Caller must ensure floor(ij) lies on a
-        # valid quad. Runs inside the batch prefetcher when that is enabled,
-        # so both the gather and the upload happen a step ahead.
-        assert not patch_idx_per_sample.is_cuda and not ijs.is_cuda, (
-            'the atlas is host-resident: pass CPU indices/ijs; only the '
-            'interpolated points are uploaded')
-        zyxs = bilinear_atlas_lookup(
-            self.zyxs_flat,
-            self.offsets,
-            self.widths,
-            patch_idx_per_sample,
-            ijs,
-            heights=self.heights,
-        )
-        return zyxs.to(device=self.device, non_blocking=True)
+        # Caller must ensure floor(ij) lies on a valid quad. CPU lookup remains
+        # supported before materialisation and for CPU-only tests.
+        if self.zyxs_flat is None:
+            patch_indices = torch.as_tensor(
+                patch_idx_per_sample, dtype=torch.int64, device='cpu')
+            ijs_cpu = torch.as_tensor(ijs, dtype=torch.float32, device='cpu')
+            shape = ijs_cpu.shape[:-1]
+            flat_indices = patch_indices.expand(shape).reshape(-1)
+            flat_ijs = ijs_cpu.reshape(-1, 2)
+            output = torch.empty((len(flat_ijs), 3), dtype=torch.float32)
+            for patch_idx in torch.unique(flat_indices).tolist():
+                selected = flat_indices == patch_idx
+                grid = self._patches[patch_idx].zyxs.to(dtype=torch.float32)
+                selected_ijs = flat_ijs[selected]
+                i0 = selected_ijs[:, 0].floor().to(torch.int64).clamp(
+                    0, grid.shape[0] - 2)
+                j0 = selected_ijs[:, 1].floor().to(torch.int64).clamp(
+                    0, grid.shape[1] - 2)
+                di = (selected_ijs[:, 0] - i0).unsqueeze(-1).clamp(0., 1.)
+                dj = (selected_ijs[:, 1] - j0).unsqueeze(-1).clamp(0., 1.)
+                tl = grid[i0, j0]
+                tr = grid[i0, j0 + 1]
+                bl = grid[i0 + 1, j0]
+                br = grid[i0 + 1, j0 + 1]
+                top = tl + (tr - tl) * dj
+                bottom = bl + (br - bl) * dj
+                output[selected] = top + (bottom - top) * di
+            return output.reshape(*shape, 3).to(self.device)
+        patch_idx_per_sample = patch_idx_per_sample.to(
+            device=self.zyxs_flat.device, dtype=torch.int64, non_blocking=True)
+        ijs = ijs.to(device=self.zyxs_flat.device, non_blocking=True)
+        if len(self._geometry_chunks) == 1:
+            chunk = self._geometry_chunks[0]
+            return bilinear_atlas_lookup(
+                chunk['zyxs_flat'], chunk['offsets'], chunk['widths'],
+                patch_idx_per_sample, ijs, heights=chunk['heights'])
+
+        # Appended geometry stays in independent resident chunks. Dispatch
+        # samples to their owning chunk instead of joining all geometry into a
+        # replacement atlas (which would briefly require roughly 2x VRAM).
+        sample_shape = ijs.shape[:-1]
+        patch_indices = patch_idx_per_sample.expand(sample_shape)
+        zyxs = torch.empty((*sample_shape, 3), dtype=torch.float32,
+                           device=self.zyxs_flat.device)
+        for chunk in self._geometry_chunks:
+            start = chunk['patch_start']
+            selected = ((patch_indices >= start)
+                        & (patch_indices < chunk['patch_end']))
+            local_indices = patch_indices[selected] - start
+            zyxs[selected] = bilinear_atlas_lookup(
+                chunk['zyxs_flat'], chunk['offsets'], chunk['widths'],
+                local_indices, ijs[selected], heights=chunk['heights'])
+        return zyxs
+
+    def register_theta_topology(self, crossing_map):
+        """Register compact native patch trees and streamed neighbour edges."""
+        if self.sampling_atlas is None:
+            self._theta_node_start = crossing_map.register_nodes(
+                0, lambda lo, hi: torch.empty((0, 3), dtype=torch.float32))
+            self._theta_node_ranges = []
+            return self._theta_node_start
+        num_quads = int(self.sampling_atlas.total_valid_cells())
+
+        def get_centres(lo, hi):
+            resolved = self.sampling_atlas.node_ijs(
+                np.arange(lo, hi, dtype=np.int64))
+            idx = torch.from_numpy(np.asarray(
+                resolved['patch_indices'], dtype=np.int64))
+            ijs = torch.from_numpy(np.asarray(
+                resolved['ijs'], dtype=np.float32))
+            return self.lookup(idx, ijs + 0.5)
+
+        start = crossing_map.register_nodes(num_quads, get_centres)
+        self._theta_node_start = start
+        ends = np.cumsum(self._quad_counts, dtype=np.int64) + start
+        begins = np.concatenate([
+            np.asarray([start], dtype=np.int64), ends[:-1]])
+        self._theta_node_ranges = list(zip(begins.tolist(), ends.tolist()))
+
+        def tree_chunk(lo, hi):
+            chunk = self.sampling_atlas.tree_chunk(int(lo), int(hi))
+            return (np.asarray(chunk['node_ordinals'], dtype=np.int64),
+                    np.asarray(chunk['parent_ordinals'], dtype=np.int64),
+                    np.asarray(chunk['exit_positions'], dtype=np.int64))
+
+        def neighbor_chunk(cursor, slot_count):
+            chunk = self.sampling_atlas.neighbor_chunk(
+                int(cursor), int(slot_count))
+            return (int(chunk['next_cursor']),
+                    np.asarray(chunk['node_pairs'], dtype=np.int64))
+
+        crossing_map.register_potential_source(
+            start, num_quads, tree_chunk, neighbor_chunk)
+        return start
+
+    def patch_ids_for_theta_nodes(self, node_ids):
+        """Return patches owning any of the supplied global theta node IDs."""
+        nodes = torch.as_tensor(node_ids, dtype=torch.int64).cpu().numpy()
+        if nodes.size == 0:
+            return []
+        nodes = np.unique(nodes)
+        patch_ids = list(self.id_to_idx)
+        found = []
+        for patch_id, (lo, hi) in zip(patch_ids, self._theta_node_ranges):
+            position = int(np.searchsorted(nodes, lo))
+            if position < nodes.size and nodes[position] < hi:
+                found.append(patch_id)
+        return found
+
+    def theta_node_ids(self, patch_indices, ijs):
+        """Resolve fractional samples/path cells to registered quad-centre ids."""
+        if self._theta_node_start is None:
+            raise RuntimeError('patch theta topology has not been registered')
+        patch_indices = np.broadcast_to(
+            np.asarray(patch_indices, dtype=np.int64), np.asarray(ijs).shape[:-1])
+        shape = patch_indices.shape
+        cells = np.floor(np.asarray(ijs)).astype(np.int64).reshape(-1, 2)
+        ordinals = self.sampling_atlas.cell_node_ordinals(
+            np.ascontiguousarray(patch_indices.reshape(-1), dtype=np.int64),
+            np.ascontiguousarray(cells, dtype=np.int64))
+        return (np.asarray(ordinals, dtype=np.int64).reshape(shape)
+                + self._theta_node_start)
+
+    def theta_node_ids_from_ordinals(self, node_ordinals):
+        """Resolve native sampler ordinals without a cell-to-node lookup."""
+        if self._theta_node_start is None:
+            raise RuntimeError('patch theta topology has not been registered')
+        return (np.asarray(node_ordinals, dtype=np.int64)
+                + self._theta_node_start)
 
     def append_patches(self, patches_by_id):
         """Append new patches without rebuilding the resident atlas.
 
-        A host-side concatenation of just the new grids, so a resident
-        interactive session can incorporate a handful of added patches in
-        seconds.
+        Only the new grids are transferred to the atlas device, so a resident
+        interactive session can incorporate a handful of patches quickly.
         """
         if not patches_by_id:
             return
-        flat_pieces = []
         offsets = [int(self.offsets[-1].item())]
         widths = []
         heights = []
@@ -376,20 +644,40 @@ class PatchAtlas:
                 raise ValueError(f'Patch {pid!r} is already in the atlas')
             z = p.zyxs
             H, W = z.shape[:2]
-            flat_pieces.append(z.reshape(-1, 3).to(dtype=torch.float32))
             offsets.append(offsets[-1] + H * W)
             widths.append(W)
             heights.append(H)
-        new_flat = torch.cat(flat_pieces, dim=0)
-        self.zyxs_flat = torch.cat([self.zyxs_flat, new_flat], dim=0)
+        if self.zyxs_flat is not None:
+            patch_start = len(self._patches)
+            patch_values = list(patches_by_id.values())
+            local_offsets = torch.tensor(
+                [value - offsets[0] for value in offsets],
+                dtype=torch.int64, device=self.zyxs_flat.device)
+            chunk = {
+                'zyxs_flat': self._materialize_geometry(
+                    patch_values, offsets[-1] - offsets[0],
+                    self.zyxs_flat.device),
+                'offsets': local_offsets,
+                'widths': torch.tensor(
+                    widths, dtype=torch.int64, device=self.zyxs_flat.device),
+                'heights': torch.tensor(
+                    heights, dtype=torch.int64, device=self.zyxs_flat.device),
+                'patch_start': patch_start,
+                'patch_end': patch_start + len(patch_values),
+            }
+            self._geometry_chunks.append(chunk)
         self.offsets = torch.cat([
             self.offsets,
-            torch.tensor(offsets[1:], dtype=torch.int64),
+            torch.tensor(offsets[1:], dtype=torch.int64, device=self.offsets.device),
         ])
         self.widths = torch.cat([
-            self.widths, torch.tensor(widths, dtype=torch.int64)])
+            self.widths, torch.tensor(widths, dtype=torch.int64, device=self.widths.device)])
         self.heights = torch.cat([
-            self.heights, torch.tensor(heights, dtype=torch.int64)])
+            self.heights, torch.tensor(heights, dtype=torch.int64, device=self.heights.device)])
+        self._patches.extend(patches_by_id.values())
+        self._num_vertices = offsets[-1]
+        self._theta_node_start = None
+        self._theta_node_ranges = []
         next_idx = len(self.id_to_idx)
         for pid in patches_by_id:
             self.id_to_idx[pid] = next_idx
@@ -401,9 +689,9 @@ class PatchAtlas:
         if self.sampling_atlas is not None:
             self.sampling_atlas.append(masks)
         else:
-            native = load_native_spiral_sampling()
-            if native is not None:
-                self.sampling_atlas = native.PatchSamplingAtlas(masks)
+            self.sampling_atlas = _make_patch_sampling_atlas(masks)
+        self._quad_counts = np.asarray(
+            self.sampling_atlas.valid_counts(), dtype=np.int64)
 
 
 class _UnattachedPclStripList(list):
@@ -807,6 +1095,7 @@ class FitContext:
         self.out_base_dir = out_base_dir if out_base_dir is not None else './out'
         self.run_tag = run_tag or None
         self.run_name = run_name
+        self.non_liftable_patch_paths = set()
         # Who this process is in the job, as an explicit value. Callers that
         # joined a process group pass the context maybe_init_distributed()
         # returned; the default is the process context installed there (a
@@ -870,11 +1159,6 @@ class FitContext:
 
         self._lasagna_store = None
         self._scalar_stores = []
-        # configure_losses() used to warm the geodesic strip-path worker
-        # pool as an import-time side effect of installing the config.
-        if config['patch_strip_sampling'] == 'dijkstra':
-            strip_path_pools.warm_workers()
-
     # The optimisation z window lives in the fit configuration (its catalog
     # metadata records the full effect list); these properties are the one
     # reading point for the many z-window consumers below.
@@ -895,8 +1179,8 @@ class FitContext:
         return fit_input('outer_shell').required(self.config)
 
     def _load_patches_from_dir(self, path, label='patches'):
+        started_at = time.perf_counter()
         progress = progress_or_null(self.progress)
-        patches = {}
         entries = sorted(os.listdir(path))
         filter_regex = self.config['patch_uuid_filter_regex']
         if filter_regex is not None:
@@ -905,16 +1189,95 @@ class FitContext:
                   f'{len(filtered)}/{len(entries)} {label} entries')
             entries = filtered
         progress.begin(
-            'loading', f'Loading {label}',
+            'loading', f'Loading and filtering {label}',
             step=0, total_steps=len(entries), unit='patches')
-        for entry_number, entry in enumerate(entries, start=1):
-            segment_path = os.path.join(path, entry)
-            try:
-                patches[entry] = load_tifxyz(segment_path)
-            except Exception as e:
-                print(f'Failed to load segment {entry}: {e}')
-            progress.update(
-                entry_number, detail=f'{len(patches):,} loaded')
+
+        # Patch decode is dominated by per-file Python overhead (PIL TIFF tag
+        # parsing etc.), so threads serialize on the GIL — worker processes
+        # are required to actually parallelize.  Each worker runs a few IO
+        # threads so per-file latency (e.g. NFS round trips) overlaps with
+        # decode; patches come back as numpy payloads (see patch_to_payload).
+        world_size = max(1, self.dist.world_size)
+        configured_workers = int(os.environ.get(
+            'FIT_SPIRAL_PATCH_LOAD_WORKERS',
+            max(1, min(16, os.cpu_count() or 1) // world_size)))
+        num_workers = max(1, min(configured_workers, len(entries)))
+        io_threads = max(1, int(os.environ.get(
+            'FIT_SPIRAL_PATCH_LOAD_IO_THREADS', 4)))
+        chunk_size = 256
+        erode_cells_default = self.config['patch_erode_patches']
+
+        results_by_entry = {}
+        loaded = 0
+        completed = 0
+
+        def consume(chunk_results):
+            nonlocal loaded, completed
+            for entry, payload, error, reason in chunk_results:
+                if payload is not None:
+                    patch = patch_from_payload(payload)
+                    patch._source_path = os.path.abspath(
+                        os.path.join(path, entry))
+                    results_by_entry[entry] = (patch, None, None)
+                    loaded += 1
+                else:
+                    results_by_entry[entry] = (None, error, reason)
+                completed += 1
+            progress.update(completed, detail=f'{loaded:,} loaded')
+
+        chunks = [entries[start:start + chunk_size]
+                  for start in range(0, len(entries), chunk_size)]
+        if num_workers == 1 or len(chunks) <= 1:
+            for chunk in chunks:
+                consume(load_patch_payload_chunk(
+                    path, chunk, self.z_begin, self.z_end,
+                    erode_cells_default, io_threads))
+        else:
+            # spawn/forkserver rather than fork: loader workers only touch
+            # CPU code, and forking after torch/OpenMP threads exist is not
+            # reliably safe.  Workers persist across chunks, so the import
+            # cost is paid once per worker.
+            mp_context = multiprocessing.get_context(
+                'forkserver'
+                if 'forkserver' in multiprocessing.get_all_start_methods()
+                else 'spawn')
+            with concurrent.futures.ProcessPoolExecutor(
+                    max_workers=min(num_workers, len(chunks)),
+                    mp_context=mp_context) as executor:
+                futures = [
+                    executor.submit(
+                        load_patch_payload_chunk, path, chunk,
+                        self.z_begin, self.z_end,
+                        erode_cells_default, io_threads)
+                    for chunk in chunks]
+                for future in concurrent.futures.as_completed(futures):
+                    consume(future.result())
+
+        patches = {}
+        dropped = {
+            'z ROI prefilter': 0,
+            'erosion': 0,
+            'z ROI after erosion': 0,
+        }
+        for entry in entries:
+            patch, error, reason = results_by_entry[entry]
+            if error is not None:
+                print(f'Failed to load segment {entry}: {error}')
+            elif reason is not None:
+                dropped[reason] += 1
+            else:
+                patches[entry] = patch
+        if dropped['z ROI prefilter']:
+            print(f"z ROI prefilter skipped {dropped['z ROI prefilter']}/"
+                  f'{len(entries)} {label} entries before full TIFF decode')
+        if dropped['erosion']:
+            print(f"erosion removed {dropped['erosion']}/{len(entries)} "
+                  f'{label} entries')
+        if dropped['z ROI after erosion']:
+            print(f"erosion moved {dropped['z ROI after erosion']}/"
+                  f'{len(entries)} {label} entries outside the z ROI')
+        print(f'loaded and filtered {len(patches):,}/{len(entries):,} {label} '
+              f'({_startup_resource_suffix(started_at)})')
         return patches
 
     def _prepare_patch_sampling_cache(self, patches):
@@ -922,7 +1285,6 @@ class FitContext:
         progress.begin(
             'loading', 'Preparing patch sampling',
             step=0, total_steps=len(patches), unit='patches')
-        native_sampling_available = load_native_spiral_sampling() is not None
         for patch_idx, patch in enumerate(patches):
             # Use the quad-valid mask so bilinear interpolation at (row_idx+di, j+dj)
             # is well-defined for di, dj in [0, 1).
@@ -940,50 +1302,19 @@ class FitContext:
                 # Fallback if no quad falls in the ROI; should be rare since patches
                 # entirely outside the z-ROI are dropped earlier.
                 in_roi_quad_mask_np = valid_quad_mask_np
+            # Every patch loss and its cached theta lift use one connected
+            # surface. Ignore detached islands rather than inventing an
+            # integer winding offset between components. Eight-connectivity
+            # matches both patch edge topology and the former Dijkstra graph.
+            in_roi_quad_mask_np = largest_patch_quad_component(
+                in_roi_quad_mask_np)
             patch._sampling_valid_quad_mask_np = in_roi_quad_mask_np
-            # Patches below the 2D-sampling area threshold get a serpentine
-            # walk over their in-ROI valid quads; the loss samplers draw sparse
-            # whole-patch 2D samples along it instead of 1D strips (see
-            # _build_patch_ijs / _sample_patch_batch in losses.py).
-            max_area_2d = self.config['patch_2d_sampling_max_area']
-            patch._sampling_2d_path = (
-                build_serpentine_quad_path(in_roi_quad_mask_np)
-                if max_area_2d is not None and float(patch.area) < max_area_2d
-                else None
-            )
-            if not native_sampling_available:
-                patch._sampling_valid_quad_rows = np.flatnonzero(in_roi_quad_mask_np.any(axis=1))
-                patch._sampling_valid_quad_cols = np.flatnonzero(in_roi_quad_mask_np.any(axis=0))
-
-                # Python fallback: precompute, per row and per column, the
-                # contiguous valid-quad runs. The native atlas owns an equivalent
-                # packed representation and avoids these many small Python arrays.
-                def _runs_per_line(mask_np, fixed_axis, valid_lines):
-                    # Returns parallel lists indexed by valid line.
-
-                    def _build_line_runs(line_valid):
-                        padded = np.concatenate([[False], line_valid, [False]]).astype(np.int8)
-                        diff = np.diff(padded)
-                        los = np.where(diff == 1)[0].astype(np.int64)
-                        his = np.where(diff == -1)[0].astype(np.int64)
-                        return los, his
-
-                    los_list, his_list, cum_list = [], [], []
-                    for r in valid_lines:
-                        line = mask_np[r] if fixed_axis == 0 else mask_np[:, r]
-                        los, his = _build_line_runs(line)
-                        los_list.append(los)
-                        his_list.append(his)
-                        cum_list.append(np.cumsum(his - los))
-                    return los_list, his_list, cum_list
-
-                patch._h_runs_los, patch._h_runs_his, patch._h_runs_cum = _runs_per_line(
-                    in_roi_quad_mask_np, 0, patch._sampling_valid_quad_rows
-                )
-                patch._v_runs_los, patch._v_runs_his, patch._v_runs_cum = _runs_per_line(
-                    in_roi_quad_mask_np, 1, patch._sampling_valid_quad_cols
-                )
-
+            patch_scale = np.asarray(
+                patch.scale.detach().cpu()
+                if hasattr(patch.scale, 'detach') else patch.scale,
+                dtype=np.float64)
+            patch._sampling_area = float(
+                in_roi_quad_mask_np.sum() * (1.0 / patch_scale).prod())
             progress.update(patch_idx + 1)
 
         return self._patch_sampling_probabilities(patches)
@@ -991,7 +1322,10 @@ class FitContext:
     def _patch_sampling_probabilities(self, patches):
         if not patches:
             return None
-        areas = np.asarray([float(patch.area) for patch in patches], dtype=np.float32)
+        areas = np.asarray([
+            float(getattr(patch, '_sampling_area', patch.area))
+            for patch in patches
+        ], dtype=np.float32)
         weights = areas ** self.config['patch_sampling_area_exponent']
         return weights / weights.sum()
 
@@ -1082,11 +1416,10 @@ class FitContext:
 
         Seeds the host RNG streams, then loads patches, point collections,
         fibers, tracks, and the outer shell; links and classifies PCLs;
-        builds the sampling caches, the host-resident patch atlases, the
+        builds the sampling caches, host-prepared patch atlases, the
         trusted-geometry index, the interactive influence anchor stash and
         the whole-object DT target samples. Requires no device state: the
-        patch atlases are host-resident (their `device` only selects where
-        each lookup's interpolated points are delivered), and the CUDA
+        patch atlases are moved as part of device-state setup, and the CUDA
         stores, model, and optimiser are built later by
         build_device_state().
 
@@ -1166,34 +1499,6 @@ class FitContext:
 
         print(f" loaded {len(verified_patches)} patches")
         print(f" loaded {len(unverified_patches)} unverified patches")
-
-        patch_filter_total = len(verified_patches) + len(unverified_patches)
-        progress.begin(
-            'loading', 'Filtering patches to fit region',
-            step=0, total_steps=patch_filter_total, unit='patches')
-        filtered_count = 0
-        for patches in (verified_patches, unverified_patches):
-            for patch_id, patch in list(patches.items()):
-                try:
-                    # we erode cells this distance from any invalid cell to catch annotation errors
-                    # which are hard to detect at the edges of patches
-                    cells_to_erode = patch.erosion_cells(self.config['patch_erode_patches'])
-                    if cells_to_erode > 0:
-                        if not erode_patch_valid_region(patch, cells_to_erode):
-                            del patches[patch_id]
-                            continue
-
-                    # remove any patches which do not intersect with the roi we are fitting
-                    if not patch_intersects_z_roi(patch, self.z_begin, self.z_end):
-                        del patches[patch_id]
-                        continue
-                    # ROI testing may materialise the compact valid-coordinate view.
-                    # Training retains the base grid and masks, so regenerate this view
-                    # lazily only for a later exporter that actually requests it.
-                    patch.release_derived_caches()
-                finally:
-                    filtered_count += 1
-                    progress.update(filtered_count)
 
         # ==========================================================================
         # Point collection loading
@@ -1617,8 +1922,13 @@ class FitContext:
                 'loading', 'Building verified-patch GPU atlas',
                 detail=f'{len(verified_patches):,} patches')
             patch_atlas = PatchAtlas(verified_patches, device='cuda')
+            print(f'patch atlas: {patch_atlas.memory_mb():.1f} MB')
+            topology_stats = patch_atlas.topology_memory_stats()
             print(
-                f'patch atlas (host-resident): {patch_atlas.memory_mb():.1f} MB')
+                'compact patch topology: '
+                f"{int(topology_stats['num_valid_cells']):,} quads, "
+                f"{int(topology_stats['persistent_bytes']) / (1 << 30):.2f} GiB host "
+                f"({_startup_resource_suffix()})")
 
         # ==========================================================================================
         # trusted geometry (verified patches and pcls) kdtree / unverified patches + tracks masking
@@ -1627,23 +1937,42 @@ class FitContext:
         # The trusted point cloud is consumed only by a CPU cKDTree. Build it directly
         # on CPU instead of storing it in the atlas on CUDA, concatenating it again on
         # CUDA, and immediately copying it back here.
-        verified_patches_and_pcls_cpu = []
+        trusted_counts = []
         for patch in verified_patches_list:
             z_flat = patch.zyxs.reshape(-1, 3).to(dtype=torch.float32)
             valid_flat = patch.valid_vertex_mask.reshape(-1)
             z_in_roi = (z_flat[:, 0] >= self.z_begin) & (z_flat[:, 0] < self.z_end)
-            if (valid_flat & z_in_roi).any():
-                verified_patches_and_pcls_cpu.append(z_flat[valid_flat & z_in_roi])
+            trusted_counts.append(int((valid_flat & z_in_roi).sum()))
         for strip in unattached_pcl_strips:
-            zyxs = torch.from_numpy(strip['zyxs']).to(dtype=torch.float32)
-            in_roi = (zyxs[..., 0] >= self.z_begin) & (zyxs[..., 0] < self.z_end)
-            if in_roi.any():
-                verified_patches_and_pcls_cpu.append(zyxs[in_roi])
-        verified_patches_and_pcls_cpu = (
-            torch.cat(verified_patches_and_pcls_cpu, dim=0)
-            if verified_patches_and_pcls_cpu
-            else torch.empty([0, 3], dtype=torch.float32)
-        )
+            zyxs_np = np.asarray(strip['zyxs'])
+            trusted_counts.append(int((
+                (zyxs_np[..., 0] >= self.z_begin)
+                & (zyxs_np[..., 0] < self.z_end)).sum()))
+        verified_patches_and_pcls_cpu = torch.empty(
+            (sum(trusted_counts), 3), dtype=torch.float32)
+        trusted_offset = 0
+        count_index = 0
+        for patch in verified_patches_list:
+            count = trusted_counts[count_index]
+            count_index += 1
+            if count:
+                z_flat = patch.zyxs.reshape(-1, 3).to(dtype=torch.float32)
+                valid_flat = patch.valid_vertex_mask.reshape(-1)
+                selected = valid_flat & (z_flat[:, 0] >= self.z_begin) \
+                    & (z_flat[:, 0] < self.z_end)
+                verified_patches_and_pcls_cpu[
+                    trusted_offset:trusted_offset + count].copy_(z_flat[selected])
+                trusted_offset += count
+        for strip in unattached_pcl_strips:
+            count = trusted_counts[count_index]
+            count_index += 1
+            if count:
+                zyxs = torch.from_numpy(strip['zyxs']).to(dtype=torch.float32)
+                selected = (zyxs[..., 0] >= self.z_begin) \
+                    & (zyxs[..., 0] < self.z_end)
+                verified_patches_and_pcls_cpu[
+                    trusted_offset:trusted_offset + count].copy_(zyxs[selected])
+                trusted_offset += count
 
         unverified_patches_list = []
         unverified_patch_sampling_probabilities = None
@@ -2015,6 +2344,211 @@ class FitContext:
 
         self._sdt_inactive_warned = set()
 
+    def _make_theta_crossing_map(self):
+        """Construct the shared patch/PCL source topology."""
+        crossing_map = ThetaCrossingMap(
+            self.device,
+            self.config['theta_crossing_map_update_interval'])
+        self.patch_atlas.register_theta_topology(crossing_map)
+        if self.unverified_patch_atlas is not None:
+            self.unverified_patch_atlas.register_theta_topology(crossing_map)
+
+        flat = get_or_build_unattached_pcl_flat(
+            self.unattached_pcl_strips, self.device)
+        if flat is not None:
+            start = crossing_map.register_nodes(
+                flat['total'],
+                lambda lo, hi, points=flat['zyxs']: points[lo:hi])
+            starts = flat['starts_cpu'].numpy()
+            for strip_idx, strip in enumerate(self.unattached_pcl_strips):
+                node_ids = start + np.arange(
+                    starts[strip_idx], starts[strip_idx + 1], dtype=np.int64)
+                strip['_theta_node_ids'] = node_ids
+                if len(node_ids) > 1:
+                    crossing_map.register_edges(
+                        np.stack([node_ids[:-1], node_ids[1:]], axis=1))
+            for edges in self.unattached_component_edges:
+                junctions = []
+                for strip_a, pos_a, strip_b, pos_b in edges:
+                    junctions.append((
+                        self.unattached_pcl_strips[strip_a]['_theta_node_ids'][pos_a],
+                        self.unattached_pcl_strips[strip_b]['_theta_node_ids'][pos_b]))
+                if junctions:
+                    crossing_map.register_edges(junctions)
+
+        points = []
+        seen = set()
+        for pcl in self.cross_patch_pcls:
+            for point in pcl['points'].values():
+                if id(point) not in seen:
+                    seen.add(id(point))
+                    points.append(point)
+        if points:
+            point_zyxs = torch.as_tensor(
+                np.stack([p['zyx'] for p in points]).astype(np.float32),
+                device=self.device)
+            start = crossing_map.register_nodes(
+                len(points), lambda lo, hi, values=point_zyxs: values[lo:hi])
+            for local, point in enumerate(points):
+                point['_theta_node_id'] = start + local
+            for pcl in self.cross_patch_pcls:
+                chain = list(pcl['chain'].iter_chain())
+                if len(chain) > 1:
+                    ids = np.fromiter(
+                        (p['_theta_node_id'] for p in chain), dtype=np.int64)
+                    crossing_map.register_edges(
+                        np.stack([ids[:-1], ids[1:]], axis=1))
+
+        return crossing_map
+
+    def _patch_input_path(self, patch_id, patch, root):
+        source_path = getattr(patch, '_source_path', None)
+        if source_path is None:
+            source_path = os.path.join(root, patch_id) if root else str(patch_id)
+        return os.path.abspath(source_path)
+
+    def _write_non_liftable_patch_report(self):
+        """Atomically publish the cumulative rejected-patch path list."""
+        if not self.dist.is_main_process or not hasattr(self, 'out_path'):
+            return
+        report_path = os.path.join(self.out_path, 'non_liftable_patches.txt')
+        temporary_path = f'{report_path}.tmp-{os.getpid()}'
+        with open(temporary_path, 'w', encoding='utf-8') as report:
+            for path in sorted(self.non_liftable_patch_paths):
+                report.write(f'{path}\n')
+        os.replace(temporary_path, report_path)
+
+    def _trusted_geometry_from_active_inputs(self):
+        """Rebuild retained trusted geometry after rejecting verified patches."""
+        pieces = []
+        for patch in self.verified_patches_list:
+            points = patch.zyxs.reshape(-1, 3).to(dtype=torch.float32).cpu()
+            valid = patch.valid_vertex_mask.reshape(-1).cpu()
+            in_roi = (points[:, 0] >= self.z_begin) & (points[:, 0] < self.z_end)
+            if bool((valid & in_roi).any()):
+                pieces.append(points[valid & in_roi])
+        for strip in self.unattached_pcl_strips:
+            points = torch.from_numpy(strip['zyxs']).to(dtype=torch.float32)
+            in_roi = (points[:, 0] >= self.z_begin) & (points[:, 0] < self.z_end)
+            if bool(in_roi.any()):
+                pieces.append(points[in_roi])
+        return torch.cat(pieces, dim=0) if pieces else torch.empty((0, 3))
+
+    def _exclude_non_liftable_patches(self, verified_ids, unverified_ids, report):
+        """Remove inconsistent patches from every active patch sampling pool."""
+        warnings = []
+        rejected_verified = set(verified_ids)
+
+        for patch_id in verified_ids:
+            patch = self.verified_patches[patch_id]
+            path = self._patch_input_path(
+                patch_id, patch, self.verified_patches_path)
+            self.non_liftable_patch_paths.add(path)
+            warning = (
+                f'non-liftable patch {path!r} has theta cycle inconsistencies; '
+                'excluding it from this fit')
+            print(f'WARNING: {warning}')
+            warnings.append(warning)
+            del self.verified_patches[patch_id]
+
+        for patch_id in unverified_ids:
+            patch = self.unverified_patches[patch_id]
+            path = self._patch_input_path(
+                patch_id, patch, self.unverified_patches_path)
+            self.non_liftable_patch_paths.add(path)
+            warning = (
+                f'non-liftable patch {path!r} has theta cycle inconsistencies; '
+                'excluding it from this fit')
+            print(f'WARNING: {warning}')
+            warnings.append(warning)
+            del self.unverified_patches[patch_id]
+
+        # Preserve list identities where possible because resident-session
+        # loss closures may already hold them.
+        self.verified_patches_list[:] = self.verified_patches.values()
+        self.patch_sampling_probabilities = (
+            self._patch_sampling_probabilities(self.verified_patches_list)
+            if self.verified_patches_list else np.empty(0, dtype=np.float32))
+        self.num_verified_patches = len(self.verified_patches_list)
+        self.patch_atlas = PatchAtlas(
+            self.verified_patches, device=self.device).materialize(self.device)
+
+        self.unverified_patches_list[:] = self.unverified_patches.values()
+        if self.unverified_patches_list:
+            self.unverified_patch_sampling_probabilities = \
+                self._patch_sampling_probabilities(self.unverified_patches_list)
+            self.unverified_patch_atlas = PatchAtlas(
+                self.unverified_patches, device=self.device).materialize(self.device)
+        else:
+            self.unverified_patch_sampling_probabilities = None
+            self.unverified_patch_atlas = None
+
+        if rejected_verified and self.cross_patch_pcls:
+            for pcl in self.cross_patch_pcls:
+                points_by_patch = pcl.get('points_by_patch', {})
+                for patch_id in rejected_verified:
+                    points_by_patch.pop(patch_id, None)
+            self._rebuild_pcl_sampling_strata()
+
+        if rejected_verified:
+            # Future interactive masking and influence anchors must not retain
+            # geometry from a patch that the consistency gate rejected.
+            if self.interactive_driver is not None:
+                trusted = self._trusted_geometry_from_active_inputs()
+                trusted_np = np.ascontiguousarray(
+                    trusted.numpy(), dtype=np.float32)
+                self.trusted_geometry_tree = (
+                    cKDTree(trusted_np) if trusted_np.shape[0] else None)
+                generator = torch.Generator().manual_seed(
+                    int(self.config['optimizer_random_seed']))
+                self.influence_anchor_geometry = subsample_rows(
+                    trusted,
+                    int(self.config['sample_count_influence_anchor_geometry_points']),
+                    generator,
+                ).clone()
+
+        if hasattr(self, 'dt_target_cache_manager'):
+            self.dt_target_cache_manager.reset()
+        self._write_non_liftable_patch_report()
+        print(
+            'WARNING: theta consistency gate rejected '
+            f'{len(verified_ids) + len(unverified_ids)} patch(es) from '
+            f'{report["inconsistent_edges"]} inconsistent edge(s)')
+        return warnings
+
+    def _enforce_theta_liftability(self):
+        """Reject patches whose cached tree potential is path-dependent."""
+        warnings = []
+        while True:
+            report, bad_nodes = \
+                self.theta_crossing_map.potential_inconsistencies()
+            if report['inconsistent_edges'] == 0:
+                self._write_non_liftable_patch_report()
+                return warnings
+            verified_ids = self.patch_atlas.patch_ids_for_theta_nodes(bad_nodes)
+            unverified_ids = (
+                self.unverified_patch_atlas.patch_ids_for_theta_nodes(bad_nodes)
+                if self.unverified_patch_atlas is not None else [])
+            if not verified_ids and not unverified_ids:
+                raise RuntimeError(
+                    'theta consistency gate found inconsistent potential edges '
+                    'that could not be attributed to a patch')
+            warnings.extend(self._exclude_non_liftable_patches(
+                verified_ids, unverified_ids, report))
+            self.theta_crossing_map = self._make_theta_crossing_map()
+            self.theta_crossing_map.force_refresh(
+                self.slice_to_spiral_transform)
+
+    def _build_theta_crossing_map(self):
+        """Rebuild, refresh, and validate shared patch/PCL theta topology."""
+        started_at = time.perf_counter()
+        self.theta_crossing_map = self._make_theta_crossing_map()
+        self.theta_crossing_map.force_refresh(self.slice_to_spiral_transform)
+        warnings = self._enforce_theta_liftability()
+        print('theta topology ready '
+              f'({_startup_resource_suffix(started_at)})')
+        return warnings
+
     def _build_model_state(self):
         """Construct the model, the optimiser, and everything after them.
 
@@ -2030,6 +2564,9 @@ class FitContext:
 
         self.num_slices_for_visualisation = self.config.get('output_num_slices_for_visualization', 20)
         self.device = torch.device('cuda')
+        self.patch_atlas.materialize(self.device)
+        if self.unverified_patch_atlas is not None:
+            self.unverified_patch_atlas.materialize(self.device)
 
         # The full z series is a model input. PNG-only slice grids and raster inputs
         # are prepared lazily at final export, and never in a resident VC3D session.
@@ -2285,6 +2822,7 @@ class FitContext:
 
         self.slice_to_spiral_transform = self.spiral_and_transform.get_slice_to_spiral_transform()
         self.dr_per_winding = self.spiral_and_transform.get_dr_per_winding()
+        self._build_theta_crossing_map()
 
         # Caches are recomputed lazily once the corresponding DT loss is active.
         # Updates are deterministic given the transform, so DDP ranks stay consistent.
@@ -2726,16 +3264,6 @@ class FitContext:
         if not self.unverified_patches_path:
             return {}, [], None, None
         candidates = self._load_patches_from_dir(self.unverified_patches_path)
-        for patch_id, patch in list(candidates.items()):
-            cells_to_erode = patch.erosion_cells(self.config['patch_erode_patches'])
-            if (cells_to_erode > 0
-                    and not erode_patch_valid_region(patch, cells_to_erode)):
-                del candidates[patch_id]
-                continue
-            if not patch_intersects_z_roi(patch, self.z_begin, self.z_end):
-                del candidates[patch_id]
-                continue
-            patch.release_derived_caches()
         candidates, n_masked, n_dropped = \
             _mask_unverified_patches_near_trusted_geometry(
                 candidates, self.trusted_geometry_tree, exclusion_radius)
@@ -2861,6 +3389,7 @@ class FitContext:
                     float(self.config['loss_weight_dense_spacing_density']), 1.0)
             transform = self.spiral_and_transform.get_slice_to_spiral_transform()
             dr = self.spiral_and_transform.get_dr_per_winding()
+            self.theta_crossing_map.force_refresh(transform)
             progress.begin(
                 'exporting_preview', 'Computing preview diagnostics')
             recorder = LossMapRecorder(
@@ -2881,6 +3410,7 @@ class FitContext:
                     compute_dt=self.config['loss_weight_patch_dt'] > 0,
                     shell_valid_zyxs=self.shell_valid_zyxs_gpu,
                     shell_outer_winding_idx=self.shell_outer_winding_idx,
+                    crossing_map=self.theta_crossing_map,
                     cfg=self.config,
                 )
                 if self.unverified_patch_atlas is not None:
@@ -2891,6 +3421,7 @@ class FitContext:
                         self.unverified_patches_list, self.unverified_patch_atlas,
                         self.unverified_patch_sampling_probabilities,
                         compute_dt=self.config['loss_weight_unverified_patch_dt'] > 0,
+                        crossing_map=self.theta_crossing_map,
                         cfg=self.config,
                     )
                 if self.config['loss_weight_sym_dirichlet'] > 0:
@@ -2902,11 +3433,13 @@ class FitContext:
                     get_patch_rel_winding_loss(
                         transform, dr, self.verified_patches, self.patch_atlas,
                         self.cross_patch_pcls, self.pcl_sampling_strata['cross_patch'],
+                        crossing_map=self.theta_crossing_map,
                         cfg=self.config, z_begin=self.z_begin, z_end=self.z_end)
                 if self.config['loss_weight_abs_winding'] > 0 and self.cross_patch_pcls:
                     get_patch_abs_winding_loss(
                         transform, dr, self.verified_patches, self.patch_atlas,
                         self.cross_patch_pcls,
+                        crossing_map=self.theta_crossing_map,
                         cfg=self.config, z_begin=self.z_begin, z_end=self.z_end)
                 if self.lasagna_volume is not None and (
                         (self.dense_normals_enabled
@@ -2947,6 +3480,7 @@ class FitContext:
                         self.config['sample_count_unattached_pcls_per_step'],
                         self.config['sample_count_unattached_pcl_points_per_step'],
                         compute_dt=self.config['loss_weight_unattached_pcl_dt'] > 0,
+                        crossing_map=self.theta_crossing_map,
                         cfg=self.config,
                     )
                 if self.prepared_main_tracks is not None:
@@ -3055,6 +3589,7 @@ class FitContext:
             run_cfg.update(dict(influence_config or {}))
             new_patches = {}
             new_collections = {}
+            theta_warnings = []
             # (input_id, pcl) per uploaded fiber, for the unresolved-link
             # warning below.
             new_fibers = []
@@ -3070,6 +3605,7 @@ class FitContext:
                     if input_id in self.verified_patches or input_id in new_patches:
                         raise RuntimeError(f'Patch {input_id!r} is already part of this session')
                     patch = load_tifxyz(path)
+                    patch._source_path = os.path.abspath(path)
                     cells_to_erode = patch.erosion_cells(self.config['patch_erode_patches'])
                     if cells_to_erode > 0 and not erode_patch_valid_region(patch, cells_to_erode):
                         raise RuntimeError(f'Patch {input_id!r} has no valid quads after erosion')
@@ -3249,6 +3785,13 @@ class FitContext:
                 # Whole-object DT target caches index the (now longer) object
                 # pools; force recomputation on next use.
                 self.dt_target_cache_manager.reset()
+                theta_warnings = self._build_theta_crossing_map()
+                # The gate may have rejected one of this incorporation's
+                # patches; downstream influence setup must see only survivors.
+                new_patches = {
+                    patch_id: patch for patch_id, patch in new_patches.items()
+                    if patch_id in self.verified_patches
+                }
 
             if run_cfg['influence_enabled'] and (new_patches or new_collections):
                 self.influence_state = make_influence_state(run_cfg, torch.device('cuda'))
@@ -3281,7 +3824,7 @@ class FitContext:
                   f'{len(new_collections)} point collections into the resident session; '
                   f'DT losses disabled until iteration {self.interactive_dt_resume_iteration}')
 
-            warnings = []
+            warnings = list(theta_warnings)
             link_warning = unresolved_fiber_link_warning(
                 new_fibers,
                 use_links=self.config['pcl_use_fiber_links'],
@@ -3348,10 +3891,12 @@ class FitContext:
             if 'patch_loss_z_margin' in changed:
                 self.patch_sampling_probabilities = \
                     self._prepare_patch_sampling_cache(self.verified_patches_list)
+                self.patch_atlas.rebuild_sampling_atlas()
                 if self.unverified_patches_list:
                     self.unverified_patch_sampling_probabilities = \
                         self._prepare_patch_sampling_cache(
                             self.unverified_patches_list)
+                    self.unverified_patch_atlas.rebuild_sampling_atlas()
             elif 'patch_sampling_area_exponent' in changed:
                 self.patch_sampling_probabilities = self._patch_sampling_probabilities(
                     self.verified_patches_list)
@@ -3440,6 +3985,17 @@ class FitContext:
         self.unverified_patch_sampling_probabilities = \
             rebuilt_unverified_probabilities
         self.unverified_patch_atlas = rebuilt_unverified_atlas
+        if self.unverified_patch_atlas is not None:
+            self.unverified_patch_atlas.materialize(self.device)
+        if changed & {
+                'patch_loss_z_margin',
+                'patch_unverified_patch_exclusion_radius',
+        }:
+            self._build_theta_crossing_map()
+        elif 'theta_crossing_map_update_interval' in changed:
+            # refresh_if_due observes the changed interval on the next step and
+            # resets its cadence without rebuilding immutable topology.
+            self.theta_crossing_map.invalidate()
 
     def step(self, iteration):
         self.step_timer.start('fwd')
@@ -3459,6 +4015,12 @@ class FitContext:
         self.slice_to_spiral_transform = self.spiral_and_transform.get_slice_to_spiral_transform(
             shared=shared_transform_leaves)
         self.dr_per_winding = shared_transform_leaves[0]
+        theta_map_refreshed = self.theta_crossing_map.refresh_if_due(
+            iteration,
+            self.slice_to_spiral_transform,
+            self.config['theta_crossing_map_update_interval'])
+        if theta_map_refreshed:
+            self._enforce_theta_liftability()
 
         losses = {}
         log_metrics = {
@@ -3556,6 +4118,7 @@ class FitContext:
             shell_outer_winding_idx=self.shell_outer_winding_idx,
             dt_max_winding=patch_dt_max_winding,
             dt_target_cache=patch_dt_target_cache,
+            crossing_map=self.theta_crossing_map,
             cfg=self.config,
         )
         patch_family = {
@@ -3590,6 +4153,7 @@ class FitContext:
                 compute_dt=compute_unverified_patch_dt,
                 dt_max_winding=unverified_patch_dt_max_winding,
                 dt_target_cache=unverified_patch_dt_target_cache,
+                crossing_map=self.theta_crossing_map,
                 cfg=self.config,
             )
             backward_family({
@@ -3618,6 +4182,7 @@ class FitContext:
                     self.patch_atlas,
                     self.cross_patch_pcls,
                     self.pcl_sampling_strata['cross_patch'],
+                    crossing_map=self.theta_crossing_map,
                     cfg=self.config, z_begin=self.z_begin, z_end=self.z_end,
                 ) * self.config['loss_weight_rel_winding'],
             })
@@ -3630,6 +4195,7 @@ class FitContext:
                     self.verified_patches,
                     self.patch_atlas,
                     self.cross_patch_pcls,
+                    crossing_map=self.theta_crossing_map,
                     cfg=self.config, z_begin=self.z_begin, z_end=self.z_end,
                 ) * self.config['loss_weight_abs_winding'],
             })
@@ -3766,6 +4332,7 @@ class FitContext:
                 compute_dt=compute_patch_dt,
                 dt_max_winding=patch_dt_max_winding,
                 dt_target_cache=unattached_pcl_dt_target_cache,
+                crossing_map=self.theta_crossing_map,
                 cfg=self.config,
             )
             backward_family({

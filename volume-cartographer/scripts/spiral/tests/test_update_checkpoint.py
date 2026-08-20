@@ -15,6 +15,8 @@ def test_migrate_legacy_config_to_exact_current_schema():
         "learning_rate": 2.25e-6,
         "use_tracks": True,
         "track_walk_require_loop_consistency": False,
+        "patch_strip_sampling": "dijkstra",
+        "patch_2d_sampling_max_area": 1000.0,
     })
 
     assert set(migrated) == set(Config().as_dict())
@@ -25,6 +27,8 @@ def test_migrate_legacy_config_to_exact_current_schema():
     assert migrated["input_use_tracks"] is True
     assert "use_tracks -> input_use_tracks" in renamed
     assert "track_walk_require_loop_consistency" in removed
+    assert "patch_strip_sampling" in removed
+    assert "patch_2d_sampling_max_area" in removed
     assert "flow_bounds_radius -> model_flow_bounds_radius" in renamed
     assert "influence_enabled" in added
 

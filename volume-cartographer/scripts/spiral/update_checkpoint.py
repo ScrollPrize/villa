@@ -142,8 +142,11 @@ LEGACY_RENAMES = {
         "influence_anchor_ramp_power",
 }
 
-# These settings were replaced by current track-walk controls.
+# These sampling settings moved out of the durable config, and the track-walk
+# setting was replaced by current controls.
 LEGACY_REMOVED = {
+    "patch_strip_sampling",
+    "patch_2d_sampling_max_area",
     "track_walk_require_loop_consistency",
 }
 
