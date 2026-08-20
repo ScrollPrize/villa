@@ -1,8 +1,7 @@
 """One-step-ahead prefetch of per-step CPU batch assembly.
 
-The training loop's per-step CPU work (numpy patch-strip sampling, the
-bilinear gather on the host-resident patch atlas, the track point gather, and
-their host->device uploads) otherwise runs serially while the GPU is idle:
+The training loop's per-step CPU work (numpy patch-strip/topology sampling and
+the track point gather) otherwise runs serially while the GPU is idle:
 the track gather even forces a device sync. Prefetching runs
 the *next* step's sampling on a worker thread while the GPU chews on the
 current step.
@@ -21,6 +20,7 @@ stream wait on the job's recorded event before using the returned tensors.
 """
 import os
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import fields, is_dataclass
 
 import numpy as np
 import torch
@@ -64,6 +64,21 @@ class LegacyNumpyRandom:
     randint = staticmethod(np.random.randint)
     uniform = staticmethod(np.random.uniform)
     choice = staticmethod(np.random.choice)
+
+
+def _iter_tensors(value):
+    """Yield tensors nested in the batch container types used by prefetch jobs."""
+    if isinstance(value, torch.Tensor):
+        yield value
+    elif is_dataclass(value) and not isinstance(value, type):
+        for field in fields(value):
+            yield from _iter_tensors(getattr(value, field.name))
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _iter_tensors(item)
+    elif isinstance(value, (tuple, list)):
+        for item in value:
+            yield from _iter_tensors(item)
 
 
 class StepPrefetcher:
@@ -133,8 +148,12 @@ class StepPrefetcher:
             result, evt = self.run_job(job)
         self._pending[key] = self._ensure_executor().submit(self.run_job, job)
         torch.cuda.current_stream().wait_event(evt)
-        for t in result if isinstance(result, tuple) else (result,):
-            if isinstance(t, torch.Tensor) and t.is_cuda:
+        # CUDA tensors may be nested in per-loss metadata containers (for
+        # example PackedWalks). Record every one on the
+        # consumer stream so the caching allocator cannot recycle its
+        # side-stream allocation while consumer kernels are still using it.
+        for t in _iter_tensors(result):
+            if t.is_cuda:
                 t.record_stream(torch.cuda.current_stream())
         return result
 

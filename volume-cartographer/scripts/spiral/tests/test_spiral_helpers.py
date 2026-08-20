@@ -99,6 +99,34 @@ class TifxyzMetadataTests(unittest.TestCase):
 
             self.assertEqual(patch.erosion_cells(7), 7)
 
+    def test_z_prefilter_skips_x_and_y_decode_for_out_of_roi_patch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "meta.json").write_text(json.dumps({
+                "format": "tifxyz", "scale": [1.0, 1.0],
+            }))
+            Image.fromarray(np.full((3, 4), 20, dtype=np.float32)).save(
+                root / "z.tif")
+            # x.tif and y.tif deliberately do not exist: returning None proves
+            # the expensive coordinate planes were never opened.
+            self.assertIsNone(load_tifxyz(root, z_range=(100, 200)))
+
+    def test_z_prefilter_respects_mask_and_half_open_interval(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "meta.json").write_text(json.dumps({
+                "format": "tifxyz", "scale": [1.0, 1.0],
+            }))
+            z = np.full((2, 2), 100, dtype=np.float32)
+            z[0, 0] = 150
+            Image.fromarray(z).save(root / "z.tif")
+            mask = np.ones((2, 2), dtype=np.uint8)
+            mask[0, 0] = 0
+            Image.fromarray(mask).save(root / "mask.tif")
+            self.assertIsNone(load_tifxyz(root, z_range=(150, 151)))
+            # z == end is excluded.
+            self.assertIsNone(load_tifxyz(root, z_range=(99, 100)))
+
 
 class ShellOuterWindingIdxResolutionTests(unittest.TestCase):
     # The index used to be resolved only inside the shell-loss branch, which
