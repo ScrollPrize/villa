@@ -18,6 +18,7 @@
 #include "segmentation/SegmentationModule.hpp"
 #include "ui_VCMain.h"
 #include "Keybinds.hpp"
+#include "FileWatcherService.hpp"
 #include "LineAnnotationController.hpp"
 
 #include "vc/core/types/Volume.hpp"
@@ -682,6 +683,32 @@ void MenuActionController::beginOpenDataSampleOpenTask(
     const bool hasSelection = selection != nullptr;
     const vc3d::opendata::OpenDataResourceSelection selectionCopy =
         selection ? *selection : vc3d::opendata::OpenDataResourceSelection{};
+    // CloseVolume() below is this flow's first destructive step: it emits
+    // vpkgChanged, whose defensive handler tears line sessions down without
+    // saving. Sessions must instead end -- finalized and saved -- while their
+    // package is still the active one, so the gate sits here, before the
+    // close; the completion-time gate stays only as a defense against
+    // sessions opened during the asynchronous fetch.
+    if (_window && _window->_lineAnnotationController &&
+        !_window->_lineAnnotationController->prepareForPackageSwitch()) {
+        if (onFinished) {
+            // Queued: callers were written against "returns immediately,
+            // completion arrives later on the GUI thread", and a synchronous
+            // callback would run before their post-begin bookkeeping.
+            QMetaObject::invokeMethod(
+                this,
+                [onFinished = std::move(onFinished)]() {
+                    OpenDataSampleOpenOutcome outcome;
+                    outcome.success = false;
+                    outcome.error = QObject::tr(
+                        "Open line annotation sessions could not be closed; "
+                        "the project was not switched.");
+                    onFinished(outcome);
+                },
+                Qt::QueuedConnection);
+        }
+        return;
+    }
     cancelOpenDataVolumePrefills();
     _window->CloseVolume();
 
@@ -894,7 +921,21 @@ void MenuActionController::finishOpenDataSampleOpen(OpenDataOpenTaskResult task,
     }
 
     if (_window && _window->_state) {
+        // The full close, not a bare setVpkg: another project may have been
+        // opened while the sample fetch ran (nothing blocks OpenVolume()
+        // during it), and replacing its package directly would skip the
+        // segmentation-editing teardown CloseVolume() performs and leave its
+        // active surface alive beside this sample's package. With nothing
+        // open — the common case, since this flow closed the volume when it
+        // began — CloseVolume() is a no-op.
+        _window->CloseVolume();
         _window->_state->setVpkg(pkg);
+        // CloseVolume() stopped all file watches; the ordinary open flow
+        // restarts them after its own setVpkg, and the sample flow gets the
+        // same treatment — previously it left the watcher stopped entirely.
+        if (_window->_fileWatcher) {
+            _window->_fileWatcher->startWatching();
+        }
     }
     if (!pkg->path().empty()) {
         updateRecentVolpkgList(QString::fromStdString(pkg->path().string()));
