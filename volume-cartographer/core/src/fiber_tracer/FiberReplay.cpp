@@ -1701,6 +1701,8 @@ struct FiberReplayTubeContainmentQuery::Impl {
     struct Segment {
         cv::Vec3f start{0.0f, 0.0f, 0.0f};
         cv::Vec3f finish{0.0f, 0.0f, 0.0f};
+        cv::Vec3d baseStart{0.0, 0.0, 0.0};
+        cv::Vec3d baseFinish{0.0, 0.0, 0.0};
     };
 
     using Entry = std::pair<Box, size_t>;
@@ -1710,6 +1712,8 @@ struct FiberReplayTubeContainmentQuery::Impl {
     Tree tree;
     float radius = 0.0f;
     float radiusSquared = 0.0f;
+    double predictionToBaseScale = 0.0;
+    double radiusBaseSquared = 0.0;
 
     static Point boostPoint(const cv::Vec3f& point)
     {
@@ -1770,6 +1774,64 @@ bool FiberReplayTubeContainmentQuery::containsPredictionPoint(
         if (Impl::pointSegmentDistanceSquared(
                 point, segment.start, segment.finish) <=
             impl_->radiusSquared) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool FiberReplayTubeContainmentQuery::intersectsPredictionCell(
+    const std::array<size_t, 3>& cellZYX,
+    const FiberPredictionGridInfo& grid,
+    int anchorCellSizePredictionVoxels) const
+{
+    if (!impl_)
+        throw std::logic_error("fiber replay tube containment query is empty");
+    if (anchorCellSizePredictionVoxels < 1 ||
+        grid.predictionToBaseScale != impl_->predictionToBaseScale) {
+        throw std::invalid_argument("fiber replay tube cell query grid is invalid");
+    }
+    const auto cellSize = static_cast<size_t>(anchorCellSizePredictionVoxels);
+    std::array<size_t, 3> begin{};
+    std::array<size_t, 3> end{};
+    for (size_t axis = 0; axis < 3; ++axis) {
+        const size_t cellCount =
+            (grid.shapeZYX[axis] + cellSize - 1) / cellSize;
+        if (cellZYX[axis] >= cellCount)
+            return false;
+        begin[axis] = cellZYX[axis] * cellSize;
+        end[axis] = std::min(grid.shapeZYX[axis], begin[axis] + cellSize);
+    }
+    const double scale = grid.predictionToBaseScale;
+    const cv::Vec3d lowBase{
+        (static_cast<double>(begin[2]) - 0.5) * scale,
+        (static_cast<double>(begin[1]) - 0.5) * scale,
+        (static_cast<double>(begin[0]) - 0.5) * scale,
+    };
+    const cv::Vec3d highBase{
+        (static_cast<double>(end[2]) - 0.5) * scale,
+        (static_cast<double>(end[1]) - 0.5) * scale,
+        (static_cast<double>(end[0]) - 0.5) * scale,
+    };
+    const cv::Vec3f lowPrediction{
+        static_cast<float>(lowBase[0] / scale),
+        static_cast<float>(lowBase[1] / scale),
+        static_cast<float>(lowBase[2] / scale),
+    };
+    const cv::Vec3f highPrediction{
+        static_cast<float>(highBase[0] / scale),
+        static_cast<float>(highBase[1] / scale),
+        static_cast<float>(highBase[2] / scale),
+    };
+    const Impl::Box queryBox(
+        Impl::boostPoint(lowPrediction), Impl::boostPoint(highPrediction));
+    const auto predicate = bgi::intersects(queryBox);
+    for (auto candidate = impl_->tree.qbegin(predicate);
+         candidate != impl_->tree.qend(); ++candidate) {
+        const auto& segment = impl_->segments[candidate->second];
+        if (segmentAabbDistanceSquared(
+                segment.baseStart, segment.baseFinish, lowBase, highBase) <=
+            impl_->radiusBaseSquared + static_cast<double>(1.0e-6F)) {
             return true;
         }
     }
@@ -1840,6 +1902,8 @@ FiberReplayTubeContainmentQuery FiberReplayTube::makePredictionContainmentQuery(
                 static_cast<float>(source.finish[1] / predictionToBaseScale),
                 static_cast<float>(source.finish[2] / predictionToBaseScale),
             },
+            source.start,
+            source.finish,
         };
         if (!finiteFloatPoint(segment.start) || !finiteFloatPoint(segment.finish)) {
             throw std::invalid_argument(
@@ -1850,11 +1914,19 @@ FiberReplayTubeContainmentQuery FiberReplayTube::makePredictionContainmentQuery(
         cv::Vec3f low;
         cv::Vec3f high;
         for (size_t axis = 0; axis < 3; ++axis) {
+            const double lowPrediction =
+                (std::min(source.start[axis], source.finish[axis]) -
+                    radiusBaseVoxels) /
+                predictionToBaseScale;
+            const double highPrediction =
+                (std::max(source.start[axis], source.finish[axis]) +
+                    radiusBaseVoxels) /
+                predictionToBaseScale;
             low[axis] = std::nextafter(
-                std::min(segment.start[axis], segment.finish[axis]) - radius,
+                static_cast<float>(lowPrediction),
                 negativeInfinity);
             high[axis] = std::nextafter(
-                std::max(segment.start[axis], segment.finish[axis]) + radius,
+                static_cast<float>(highPrediction),
                 positiveInfinity);
         }
         if (!finiteFloatPoint(low) || !finiteFloatPoint(high)) {
@@ -1869,13 +1941,15 @@ FiberReplayTubeContainmentQuery FiberReplayTube::makePredictionContainmentQuery(
     }
     impl->radius = radius;
     impl->radiusSquared = radius * radius;
+    impl->predictionToBaseScale = predictionToBaseScale;
+    impl->radiusBaseSquared = radiusBaseVoxels * radiusBaseVoxels;
     impl->tree = FiberReplayTubeContainmentQuery::Impl::Tree(
         entries.begin(), entries.end());
     return FiberReplayTubeContainmentQuery(std::move(impl));
 }
 
 FiberReplayTube makeFiberReplayTube(
-    const std::vector<cv::Vec3d>& referenceLineBase, double centerArcBase, double alongBaseVoxels, double radiusBaseVoxels, const FiberPredictionGridInfo& grid, int anchorCellSizePredictionVoxels)
+    const std::vector<cv::Vec3d>& referenceLineBase, double centerArcBase, double alongBaseVoxels, double radiusBaseVoxels, const FiberPredictionGridInfo& grid, int anchorCellSizePredictionVoxels, bool collectAnchorCells)
 {
     if (!(alongBaseVoxels >= 0.0) || !std::isfinite(alongBaseVoxels) || !(radiusBaseVoxels > 0.0) || !std::isfinite(radiusBaseVoxels)) {
         throw std::invalid_argument("fiber replay tube distances are invalid");
@@ -1906,7 +1980,11 @@ FiberReplayTube makeFiberReplayTube(
         tube.volumeCropBaseXYZWHD[axis + 3] = static_cast<size_t>(cropHigh - cropLow);
     }
 
-    tube.cellsZYX = fiberAnchorCellsNearPolyline(tube.referenceIntervalBase, radiusBaseVoxels, grid, anchorCellSizePredictionVoxels);
+    if (collectAnchorCells) {
+        tube.cellsZYX = fiberAnchorCellsNearPolyline(
+            tube.referenceIntervalBase, radiusBaseVoxels, grid,
+            anchorCellSizePredictionVoxels);
+    }
     return tube;
 }
 

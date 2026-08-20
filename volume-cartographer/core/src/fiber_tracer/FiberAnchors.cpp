@@ -46,65 +46,6 @@ double processCpuSeconds()
         : static_cast<double>(ticks) / static_cast<double>(CLOCKS_PER_SEC);
 }
 
-double segmentAabbDistanceSquared(
-    const cv::Vec3d& start,
-    const cv::Vec3d& end,
-    const cv::Vec3d& low,
-    const cv::Vec3d& high)
-{
-    const cv::Vec3d delta = end - start;
-    std::vector<double> breaks{0.0F, 1.0F};
-    for (int axis = 0; axis < 3; ++axis) {
-        if (std::abs(delta[axis]) <= kGeometryEpsilon)
-            continue;
-        for (const double bound : {low[axis], high[axis]}) {
-            const double t = (bound - start[axis]) / delta[axis];
-            if (t > 0.0F && t < 1.0F)
-                breaks.push_back(t);
-        }
-    }
-    std::sort(breaks.begin(), breaks.end());
-    breaks.erase(std::unique(breaks.begin(), breaks.end()), breaks.end());
-    double best = std::numeric_limits<double>::infinity();
-    const auto evaluate = [&](double t) {
-        const cv::Vec3d point = start + delta * t;
-        double squared = 0.0F;
-        for (int axis = 0; axis < 3; ++axis) {
-            const double outside = point[axis] < low[axis]
-                ? low[axis] - point[axis]
-                : point[axis] > high[axis]
-                    ? point[axis] - high[axis]
-                    : 0.0F;
-            squared += outside * outside;
-        }
-        best = std::min(best, squared);
-    };
-    for (size_t interval = 0; interval + 1 < breaks.size(); ++interval) {
-        const double begin = breaks[interval];
-        const double finish = breaks[interval + 1];
-        evaluate(begin);
-        evaluate(finish);
-        const double middle = 0.5F * (begin + finish);
-        double quadratic = 0.0F;
-        double linear = 0.0F;
-        for (int axis = 0; axis < 3; ++axis) {
-            const double point = start[axis] + delta[axis] * middle;
-            double offset = 0.0F;
-            if (point < low[axis])
-                offset = start[axis] - low[axis];
-            else if (point > high[axis])
-                offset = start[axis] - high[axis];
-            else
-                continue;
-            quadratic += delta[axis] * delta[axis];
-            linear += delta[axis] * offset;
-        }
-        if (quadratic > kGeometryEpsilon)
-            evaluate(std::clamp(-linear / quadratic, begin, finish));
-    }
-    return best;
-}
-
 float interpolatedQuantile(const std::vector<float>& sorted, float quantile)
 {
     if (sorted.empty())

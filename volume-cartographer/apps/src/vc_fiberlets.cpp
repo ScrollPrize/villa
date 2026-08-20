@@ -583,8 +583,7 @@ vc::fiber_tracer::FiberletDatasetMetadata replayDatasetMetadata(
     const vc::lasagna::LasagnaDataset& fiberDataset,
     const vc::lasagna::LasagnaDataset& normalDataset,
     const std::vector<cv::Vec3d>& corridorReferenceBase,
-    double corridorRadiusBaseVoxels,
-    const std::vector<std::array<std::size_t, 3>>& selectedCellsZYX)
+    double corridorRadiusBaseVoxels)
 {
     const double cellSideBase =
         static_cast<double>(options.anchors.cellSizePredictionVoxels) *
@@ -645,14 +644,11 @@ vc::fiber_tracer::FiberletDatasetMetadata replayDatasetMetadata(
              << options.paths.smoothnessTangentWeight << ','
              << options.paths.smoothnessFreeAngleDegrees
              << ";storage_schema=float_cache_v2"
-             << ";corridor_selector=segment_aabb_v1"
+             << ";corridor_selector=chunk_local_segment_aabb_v2"
              << ";corridor_radius_base=" << corridorRadiusBaseVoxels
              << ";corridor_reference=" << corridorReferenceBase.size();
     for (const auto& point : corridorReferenceBase)
         identity << ';' << point[0] << ',' << point[1] << ',' << point[2];
-    identity << ";corridor_cells=" << selectedCellsZYX.size();
-    for (const auto& cell : selectedCellsZYX)
-        identity << ';' << cell[0] << ',' << cell[1] << ',' << cell[2];
     const auto identityText = identity.str();
     vc::fiber_tracer::FiberletDatasetMetadata metadata;
     metadata.kind = kind;
@@ -1813,7 +1809,8 @@ int main(int argc, char** argv)
                         0.5 * (startArc + endArc),
                         0.5 * (endArc - startArc),
                         options.radiusBaseVoxels, grid,
-                        options.anchors.cellSizePredictionVoxels);
+                        options.anchors.cellSizePredictionVoxels,
+                        false);
                 const auto containmentQuery =
                     processingTube.makePredictionContainmentQuery(
                         grid.predictionToBaseScale);
@@ -1821,8 +1818,7 @@ int main(int argc, char** argv)
                     vc::fiber_tracer::FiberletDatasetKind::Anchors,
                     grid, options, dataset, canonicalNormalDataset,
                     processingTube.referenceIntervalBase,
-                    processingTube.radiusBaseVoxels,
-                    processingTube.cellsZYX);
+                    processingTube.radiusBaseVoxels);
                 auto fiberletMetadata = anchorMetadata;
                 fiberletMetadata.kind =
                     vc::fiber_tracer::FiberletDatasetKind::Fiberlets;
@@ -1859,7 +1855,13 @@ int main(int argc, char** argv)
                         field.sampleStoredGridBatch(indices, threads, samples);
                     };
                 onDemand.normalSampler = canonicalNormalSampler;
-                onDemand.selectedAnchorCellsZYX = processingTube.cellsZYX;
+                onDemand.anchorCellPredicate =
+                    [containmentQuery, grid,
+                     cellSize = options.anchors.cellSizePredictionVoxels](
+                        const std::array<size_t, 3>& cell) {
+                        return containmentQuery.intersectsPredictionCell(
+                            cell, grid, cellSize);
+                    };
                 onDemand.anchorRetainPredicate =
                     [containmentQuery](
                         const vc::fiber_tracer::FiberAnchor& anchor) {

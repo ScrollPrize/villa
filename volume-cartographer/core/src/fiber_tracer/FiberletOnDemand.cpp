@@ -49,6 +49,45 @@ std::size_t ownedCellCount(
     return result;
 }
 
+std::vector<std::array<std::size_t, 3>> selectedOwnedCells(
+    const FiberletStorageCodecConfig& codec,
+    const FiberletDatasetMetadata& metadata,
+    const FiberPredictionGridInfo& grid,
+    int cellSide,
+    const FiberletAnchorCellPredicate& predicate)
+{
+    const size_t side = static_cast<size_t>(cellSide);
+    const std::array<size_t, 3> cellShape{
+        (grid.shapeZYX[0] + side - 1) / side,
+        (grid.shapeZYX[1] + side - 1) / side,
+        (grid.shapeZYX[2] + side - 1) / side,
+    };
+    std::array<size_t, 3> begin{};
+    std::array<size_t, 3> end{};
+    for (size_t axis = 0; axis < 3; ++axis) {
+        begin[axis] = static_cast<size_t>(std::clamp<int64_t>(
+            codec.coordinateOriginZYX[axis], 0,
+            static_cast<int64_t>(cellShape[axis])));
+        end[axis] = static_cast<size_t>(std::clamp<int64_t>(
+            codec.coordinateOriginZYX[axis] +
+                metadata.coordinateUnitsPerChunkZYX[axis],
+            0, static_cast<int64_t>(cellShape[axis])));
+    }
+    std::vector<std::array<size_t, 3>> result;
+    result.reserve(
+        (end[0] - begin[0]) * (end[1] - begin[1]) * (end[2] - begin[2]));
+    for (size_t z = begin[0]; z < end[0]; ++z) {
+        for (size_t y = begin[1]; y < end[1]; ++y) {
+            for (size_t x = begin[2]; x < end[2]; ++x) {
+                const std::array<size_t, 3> cell{z, y, x};
+                if (predicate(cell))
+                    result.push_back(cell);
+            }
+        }
+    }
+    return result;
+}
+
 FiberletStorageKey storageKey(const FiberletAnchorId& id)
 {
     if (id.componentIndex > 1)
@@ -156,12 +195,16 @@ void FiberletOnDemandPreprocessor::initialize()
         throw std::invalid_argument("anchor and fiberlet cache grids must agree");
     validateFiberAnchorConfig(config.anchorConfig);
     validateFiberletPathConfig(config.pathConfig);
-    if (config.selectedAnchorCellsZYX.empty() ||
-        !std::is_sorted(config.selectedAnchorCellsZYX.begin(),
+    if (config.selectedAnchorCellsZYX.empty() == !config.anchorCellPredicate) {
+        throw std::invalid_argument(
+            "on-demand fiberlet preprocessing requires exactly one cell selector");
+    }
+    if (!config.selectedAnchorCellsZYX.empty() &&
+        (!std::is_sorted(config.selectedAnchorCellsZYX.begin(),
                         config.selectedAnchorCellsZYX.end()) ||
         std::adjacent_find(config.selectedAnchorCellsZYX.begin(),
                            config.selectedAnchorCellsZYX.end()) !=
-            config.selectedAnchorCellsZYX.end()) {
+            config.selectedAnchorCellsZYX.end())) {
         throw std::invalid_argument(
             "on-demand fiberlet selected cells must be nonempty, ordered, and unique");
     }
@@ -252,6 +295,8 @@ bool FiberletOnDemandPreprocessor::isSelectedAnchorCell(
         }
         cell[axis] = static_cast<std::size_t>(anchor.coordinateZYX[axis]);
     }
+    if (state_->config.anchorCellPredicate)
+        return state_->config.anchorCellPredicate(cell);
     const auto& selected = state_->config.selectedAnchorCellsZYX;
     return std::binary_search(selected.begin(), selected.end(), cell);
 }
@@ -263,12 +308,19 @@ FiberletOnDemandPreprocessor::generateAnchorChunk(
 {
     const auto start = std::chrono::steady_clock::now();
     const auto& config = state_->config;
-    const auto found = state_->selectedCellsByChunk.find(
-        {key.iz, key.iy, key.ix});
-    const std::vector<std::array<std::size_t, 3>> empty;
-    const auto& cells = found == state_->selectedCellsByChunk.end()
-        ? empty
-        : found->second;
+    std::vector<std::array<std::size_t, 3>> selectedCells;
+    if (config.anchorCellPredicate) {
+        selectedCells = selectedOwnedCells(
+            codec, config.anchorMetadata, config.grid,
+            config.anchorConfig.cellSizePredictionVoxels,
+            config.anchorCellPredicate);
+    } else {
+        const auto found = state_->selectedCellsByChunk.find(
+            {key.iz, key.iy, key.ix});
+        if (found != state_->selectedCellsByChunk.end())
+            selectedCells = found->second;
+    }
+    const auto& cells = selectedCells;
     const auto unfilteredInputCount = ownedCellCount(
         codec, config.anchorMetadata, config.grid,
         config.anchorConfig.cellSizePredictionVoxels);
@@ -388,37 +440,60 @@ std::vector<FiberletScheduledChunk> FiberletOnDemandPreprocessor::referenceChunk
     }
     const auto& config = state_->config;
     const auto line = slicePolylineArc(reference, beginArcBase, endArcBase);
-    const auto windowCells = fiberAnchorCellsNearPolyline(
-        line, radiusBaseVoxels, config.grid,
-        config.anchorConfig.cellSizePredictionVoxels);
-    std::vector<std::array<std::size_t, 3>> cells;
-    std::set_intersection(
-        config.selectedAnchorCellsZYX.begin(),
-        config.selectedAnchorCellsZYX.end(), windowCells.begin(),
-        windowCells.end(), std::back_inserter(cells));
-    std::map<std::array<int, 4>, FiberletScheduledChunk> unique;
-    for (const auto& cell : cells) {
-        vc::render::ChunkKey key{0, 0, 0, 0};
-        std::array<int, 3> chunkZYX{};
-        for (std::size_t axis = 0; axis < 3; ++axis) {
-            const auto coordinate = static_cast<std::int64_t>(cell[axis]);
-            const auto chunk =
-                floorDiv(coordinate - config.fiberletMetadata.coordinateOriginZYX[axis], config.fiberletMetadata.coordinateUnitsPerChunkZYX[axis]);
-            if (chunk < 0 || chunk >= config.fiberletMetadata.chunkGridShapeZYX[axis]) {
-                key.level = -1;
-                break;
+    const int64_t unitsPerChunk =
+        config.fiberletMetadata.coordinateUnitsPerChunkZYX[0];
+    if (unitsPerChunk < 1 ||
+        config.fiberletMetadata.coordinateUnitsPerChunkZYX !=
+            std::array<int64_t, 3>{unitsPerChunk, unitsPerChunk, unitsPerChunk} ||
+        unitsPerChunk > std::numeric_limits<int>::max() /
+                config.anchorConfig.cellSizePredictionVoxels) {
+        throw std::invalid_argument(
+            "fiberlet reference scheduling requires cubic cache chunks");
+    }
+    const int chunkSidePredictionVoxels =
+        static_cast<int>(unitsPerChunk) *
+        config.anchorConfig.cellSizePredictionVoxels;
+    const auto chunkCells = fiberAnchorCellsNearPolyline(
+        line, radiusBaseVoxels, config.grid, chunkSidePredictionVoxels);
+    std::set<std::array<int, 3>> explicitOwnerChunks;
+    if (!config.selectedAnchorCellsZYX.empty()) {
+        for (const auto& cell : config.selectedAnchorCellsZYX) {
+            std::array<int, 3> owner{};
+            for (size_t axis = 0; axis < 3; ++axis) {
+                owner[axis] = static_cast<int>(floorDiv(
+                    static_cast<int64_t>(cell[axis]) -
+                        config.fiberletMetadata.coordinateOriginZYX[axis],
+                    unitsPerChunk));
             }
-            chunkZYX[axis] = static_cast<int>(chunk);
+            explicitOwnerChunks.insert(owner);
         }
-        if (key.level < 0)
+    }
+    std::map<std::array<int, 4>, FiberletScheduledChunk> unique;
+    for (const auto& chunkCell : chunkCells) {
+        const std::array<int, 3> chunkZYX{
+            static_cast<int>(chunkCell[0]),
+            static_cast<int>(chunkCell[1]),
+            static_cast<int>(chunkCell[2]),
+        };
+        bool inGrid = true;
+        for (std::size_t axis = 0; axis < 3; ++axis) {
+            inGrid = inGrid && chunkZYX[axis] >= 0 &&
+                chunkZYX[axis] < config.fiberletMetadata.chunkGridShapeZYX[axis];
+        }
+        if (!inGrid || (!explicitOwnerChunks.empty() &&
+                !explicitOwnerChunks.contains(chunkZYX))) {
             continue;
-        key = {0, chunkZYX[0], chunkZYX[1], chunkZYX[2]};
+        }
+        const vc::render::ChunkKey key{
+            0, chunkZYX[0], chunkZYX[1], chunkZYX[2]};
         cv::Vec3d centerBaseXYZ;
         for (std::size_t axis = 0; axis < 3; ++axis) {
             const auto gridAxis = 2 - axis;
-            const auto cellBegin = cell[gridAxis] * static_cast<std::size_t>(config.anchorConfig.cellSizePredictionVoxels);
-            const auto cellEnd =
-                std::min(cellBegin + static_cast<std::size_t>(config.anchorConfig.cellSizePredictionVoxels), config.grid.shapeZYX[gridAxis]);
+            const auto cellBegin = static_cast<size_t>(chunkZYX[gridAxis]) *
+                static_cast<size_t>(chunkSidePredictionVoxels);
+            const auto cellEnd = std::min(
+                cellBegin + static_cast<size_t>(chunkSidePredictionVoxels),
+                config.grid.shapeZYX[gridAxis]);
             centerBaseXYZ[static_cast<int>(axis)] = 0.5 * static_cast<double>(cellBegin + cellEnd - 1) * config.grid.predictionToBaseScale;
         }
         const auto projection = projectPointToPolylineArc(reference, centerBaseXYZ, beginArcBase, endArcBase);

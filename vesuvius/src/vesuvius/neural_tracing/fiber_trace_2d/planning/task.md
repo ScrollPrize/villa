@@ -1,10 +1,11 @@
-# Task: concise replay progress and latest fiberlet optimizations
+# Task: remove serial full-corridor replay setup
 
-Make `vc_fiberlets fiberlet-replay` print one overall progress bar with elapsed
-time and ETA instead of per-stage, per-chunk, per-restart, and per-evaluator
-diagnostics during ordinary use.
+`vc_fiberlets fiberlet-replay` must not materialize every anchor cell in the
+full reference corridor before starting the cache-backed tracers. A full-fiber
+radius-768 replay currently spends tens of seconds on one core at zero progress
+because dense segment-to-cell expansion is performed serially and then repeated
+for scheduling.
 
-Retain the detailed diagnostics behind an explicit statistics option. Commit
-that output change, then merge the unmerged `fiber-lets2` performance work and
-adapt it to the chunked/cached replay implementation where necessary. Preserve
-exact float-cache/eager replay equivalence.
+Make cached replay select cache chunks directly, enumerate exact anchor cells
+only inside a requested chunk, and preserve the existing radius, NMS, path
+containment, cache identity, and eager/cached numerical contracts.

@@ -313,6 +313,42 @@ TEST_CASE("fiber replay tube float containment index matches direct segment scan
     }
 }
 
+TEST_CASE("fiber replay tube indexed cell selection matches the canonical selector")
+{
+    vc::fiber_tracer::FiberPredictionGridInfo grid;
+    grid.shapeZYX = {17, 19, 23};
+    grid.predictionToBaseScale = 2.0;
+    const auto tube = vc::fiber_tracer::makeFiberReplayTube(
+        {
+            {-2.0, 5.0, 7.0},
+            {14.0, 5.0, 7.0},
+            {18.0, 23.0, 11.0},
+            {38.0, 29.0, 17.0},
+        },
+        24.0,
+        24.0,
+        5.0,
+        grid,
+        4,
+        false);
+    CHECK(tube.cellsZYX.empty());
+    const auto query = tube.makePredictionContainmentQuery(
+        grid.predictionToBaseScale);
+    for (size_t z = 0; z < 5; ++z) {
+        for (size_t y = 0; y < 5; ++y) {
+            for (size_t x = 0; x < 6; ++x) {
+                const std::array<size_t, 3> cell{z, y, x};
+                CHECK(
+                    query.intersectsPredictionCell(cell, grid, 4) ==
+                    vc::fiber_tracer::fiberAnchorCellIntersectsPolylineTube(
+                        cell, tube.referenceIntervalBase,
+                        tube.radiusBaseVoxels, grid, 4));
+            }
+        }
+    }
+    CHECK_FALSE(query.intersectsPredictionCell({5, 0, 0}, grid, 4));
+}
+
 TEST_CASE("fiber replay tube float containment owns its data and supports concurrent queries")
 {
     vc::fiber_tracer::FiberPredictionGridInfo grid;

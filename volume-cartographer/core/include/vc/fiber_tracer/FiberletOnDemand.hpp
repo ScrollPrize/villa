@@ -29,6 +29,8 @@ struct FiberletOnDemandProgress {
 };
 
 using FiberletOnDemandProgressCallback = std::function<void(const FiberletOnDemandProgress&)>;
+using FiberletAnchorCellPredicate =
+    std::function<bool(const std::array<std::size_t, 3>& cellZYX)>;
 
 struct FiberletOnDemandConfig {
     std::filesystem::path anchorRoot;
@@ -41,6 +43,7 @@ struct FiberletOnDemandConfig {
     FiberStoredPredictionBatchSampler predictionSampler;
     std::shared_ptr<const vc::lasagna::NormalSampler> normalSampler;
     std::vector<std::array<std::size_t, 3>> selectedAnchorCellsZYX;
+    FiberletAnchorCellPredicate anchorCellPredicate;
     FiberAnchorRetainPredicate anchorRetainPredicate;
     FiberletPointPredicate pointPredicate;
     vc::render::ChunkCache::Options anchorCacheOptions;

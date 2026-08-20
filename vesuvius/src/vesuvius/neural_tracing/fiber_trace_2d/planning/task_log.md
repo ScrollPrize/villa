@@ -1,88 +1,61 @@
-# Task log: concise replay progress and latest fiberlet optimizations
+# Task log: remove serial full-corridor replay setup
 
-## Initial findings
+## Reproduction
 
-- `fiberlet-replay` previously printed setup, extraction, cache-open, every
-  cache chunk, every failure, both evaluator streams, cache statistics,
-  visualization, and publication details unconditionally.
-- `--stats` existed but was accepted only for the standalone `paths` command.
-- `fiber-lets2` had three unmerged commits: path-search optimization, anchor
-  extraction optimization, and their durable documentation.
-- The current branch already requires byte-identical eager and float-cache
-  replay, so that remains the merge correctness gate.
+- The CLI already defaults anchor, path, and trace worker counts to
+  `std::thread::hardware_concurrency()`; omitting `--threads` did not select one
+  worker.
+- A full-fiber radius-768 run consumed 43.3 CPU seconds over 43.7 wall seconds
+  before interruption, confirming one effective core.
+- A 20-second `--stats` diagnostic completed `trace_setup` in 0.006 seconds but
+  never reached `cache_open`. The blocked phase is the synchronous
+  `makeFiberReplayTube()` call.
+- Cached replay calls `fiberAnchorCellsNearPolyline()` once while constructing
+  the processing tube and again from `referenceChunkSchedule()`. The function
+  visits every dense reference segment, expands its radius-sized anchor-cell
+  box, performs exact segment/AABB tests, and inserts into a serial `std::set`.
+  Radius 768 is about 24 anchor cells for the current 32-base-voxel cell side,
+  so heavily overlapping work dominates before cache workers exist.
 
 ## Independent review
 
-- Accepted: make concurrent evaluator accumulation explicitly monotone; keep
-  100% reserved until requested output is published; test quiet/statistical
-  output and final-line handling; measure actual CPU as well as wall time; merge
-  cumulative specs/docs semantically; compare cache populations as well as the
-  final replay.
-- The review's shared-stage/sample-count findings describe an earlier benchmark
-  task and do not apply to this output-and-merge task. The merged optimizations
-  will still be checked for duplicate work through their existing diagnostics.
+- Incorporated explicit nonblocking prefetch placement, post-refinement anchor
+  and DP-interior corridor predicates, cross-chunk NMS equivalence, canonical
+  cache identity/versioning, schedule completeness, and repeated CPU/wall
+  measurement requirements into the implementation plan.
 
-## Progress implementation
+## Implementation
 
-- Default replay now displays one 24-column bar. Concurrent fractions are
-  clamped and accumulated independently; their minimum drives tracing progress.
-- Tracing reserves the final one percent for publication. Visualization runs
-  reserve twenty percent for the overview and per-failure artifacts, preventing
-  a displayed 100% while requested output is still being written.
-- `--stats` is now accepted by `fiberlet-replay` and restores all prior detailed
-  rows. Default eager/local visualization extraction also suppresses its nested
-  anchor and path progress callbacks.
-- Validation: `cmake --build volume-cartographer/build -j32 --target
-  vc_fiberlets` passed. A cold 500-base-voxel default replay printed only the
-  progress display and terminal result; a 128-base-voxel `--stats` replay
-  retained stage, chunk, evaluator, cache, and terminal rows.
+- Shared the canonical segment/AABB distance primitive with the replay tube's
+  indexed containment query.
+- Cache-backed replay no longer asks `makeFiberReplayTube()` to collect anchor
+  cells. The on-demand preprocessor enumerates and filters only the cells owned
+  by a requested anchor chunk.
+- Reference scheduling now uses the canonical exact tube selector at storage-
+  chunk resolution. Existing halo dependencies, cross-chunk NMS context,
+  post-refinement anchor filtering, fiberlet-interior filtering, cache LRU, and
+  nonblocking schedule prefetch are unchanged.
+- Removed the materialized cell list from cache identity and bumped the
+  corridor selector discriminator. The complete clipped reference geometry and
+  radius remain part of the fingerprint.
 
-## Merge
+## Verification
 
-- Merged the latest `fiber-lets2` path-search and anchor-extraction
-  optimizations. The shared production functions are used directly by both
-  eager extraction and on-demand cache chunk generation; no separate port or
-  copied implementation is required.
-- Combined the cache branch's sparse per-cell result retention with the newer
-  shared-observation/proposal buffers. Extraction profile version 30 reports
-  both memory-accounting families.
-- The incoming chordal interior-smoothness approximation was intentionally not
-  ported. It changed the objective and failed the bit-exact metric fixture.
-  This checkout requires performance changes to preserve numerics, so the
-  merged corridor and interpolation optimizations retain the existing angular
-  scorer.
-- The incoming direct-centroid mode, nearest-Gaussian lookup, and reordered
-  proposal geometry were also excluded because their own measurements reported
-  route movement. Compact proposal records retain absolute positions and the
-  original subtraction order; centroid updates always use the exact spatial
-  objective and peak weights retain `exp`.
-- The shared-observation, sparse proposal-index, retained-membership,
-  final-Gaussian reuse, corridor-admission, and interpolation-page changes are
-  used by both eager extraction and cache chunk generation without duplicated
-  implementations.
-
-## Validation and measurements
-
-- RelWithDebInfo build: `cmake --build volume-cartographer/build -j32 --target
-  vc_fiberlets test_fiber_anchors test_fiberlet_paths test_fiberlet_storage
-  test_fiber_replay`.
-- Passing suites: 85 anchor cases, 11 storage cases, and 11 replay cases.
-  `test_fiberlet_paths` retains 295 pre-existing bit-pattern fixture failures
-  at line 406 and the pre-existing synthetic lookahead expectation at line
-  1486; the merge introduced no additional loader/schema failure.
-- Workload: Paris4 fiber prediction and Lasagna normals, David fiber
-  `dj_20260805T025256484_000003.json`, first 5,000 base voxels, radius 64, 32
-  threads, three fresh output/cache roots per mode.
-- Eager wall seconds: 3.96, 3.93, 3.90; mean/median 3.93, range 3.90-3.96.
-  Mean process CPU was 98.8 seconds (25.1 effective cores), and peak RSS was
-  1.35 GiB.
-- Cold cached wall seconds: 5.78, 5.78, 5.76; mean 5.77, median 5.78, range
-  5.76-5.78. Mean process CPU was 122.7 seconds (21.3 effective cores), and
-  peak RSS was 0.51 GiB.
-- Relative to the immediately preceding measured 4.43-second eager and
-  7.04-second cold-cache runs, wall time improved about 11% and 18%,
-  respectively.
-- All six `fiber_replay.json` files are byte-identical with SHA-256
+- Built `vc_fiberlets`, `test_fiber_replay`, `test_fiberlet_storage`, and
+  `test_fiber_anchors` with `cmake --build volume-cartographer/build -j32`.
+- `test_fiber_replay`: 12 cases passed, including exhaustive indexed/canonical
+  anchor-cell selection equality and the no-materialized-cell path.
+- `test_fiberlet_storage`: 11 cases passed. `test_fiber_anchors`: 85 cases
+  passed.
+- A completed Paris4 5,000-base-voxel radius-64 replay took 5.90 seconds wall,
+  126.06 CPU seconds (21.3 effective cores), and 516372 KiB peak RSS. Its
+  `fiber_replay.json` SHA-256 remained
   `9781e00ae129b5fef098246c163ba1f737eca3b8a3fcceba6c90e45087b10a91`.
-  They also match the prior exact cached artifact, confirming that the retained
-  optimizations do not change emitted replay geometry or failures.
+- A fresh-cache full-fiber radius-768 run reached `cache_open` after 0.006
+  seconds. The bounded 20.06-second run used 549.55 user plus 10.61 system CPU
+  seconds (27.9 effective cores) and 643004 KiB peak RSS. The first nonempty
+  anchor chunk used 22.01 CPU seconds in 0.713 wall seconds.
+- Three additional fresh-cache radius-768 runs, each bounded at 10 seconds,
+  measured 28.08/28.25/28.27 reported CPU cores (mean 28.20, median 28.25,
+  min 28.08, max 28.27). Peak RSS was 586-591 MiB. These runs intentionally
+  ended before replay completion and measure startup/cache extraction only.

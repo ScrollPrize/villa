@@ -31,6 +31,10 @@ public:
 
     [[nodiscard]] bool containsPredictionPoint(
         const cv::Vec3d& pointPredictionXYZ) const;
+    [[nodiscard]] bool intersectsPredictionCell(
+        const std::array<size_t, 3>& cellZYX,
+        const FiberPredictionGridInfo& grid,
+        int anchorCellSizePredictionVoxels) const;
     [[nodiscard]] FiberAnchorRetainEvaluation evaluatePredictionAnchor(
         const FiberAnchor& anchor) const;
 
@@ -128,7 +132,8 @@ struct FiberReplayOverview {
     double alongBaseVoxels,
     double radiusBaseVoxels,
     const FiberPredictionGridInfo& grid,
-    int anchorCellSizePredictionVoxels);
+    int anchorCellSizePredictionVoxels,
+    bool collectAnchorCells = true);
 
 enum class FiberReplayTracer {
     Greedy,

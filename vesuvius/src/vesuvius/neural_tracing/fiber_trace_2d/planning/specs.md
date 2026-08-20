@@ -3054,6 +3054,15 @@
   adjacency and beam ranking do not retain unused route geometry. A fiberlet
   owner chunk blocks only on the complete bounded halo of anchor chunks needed
   by its endpoint search.
+- Lazy replay schedules the exact reference tube at storage-chunk resolution;
+  it must not enumerate the complete corridor's anchor-cell population before
+  cache workers start. Each requested anchor chunk enumerates its owned cells
+  in canonical Z/Y/X order and uses the canonical exact segment-to-cell test.
+  The post-refinement anchor-position predicate, fiberlet-interior point
+  predicate, and cross-chunk NMS dependency context remain mandatory. Cache
+  identity binds the complete clipped reference geometry, radius, source and
+  algorithm metadata, and corridor-selector version, not a serialized cell
+  list.
 - Generated anchor and fiberlet payloads use separate `ChunkCache` scheduler
   lanes and one shared decoded-byte budget. Stable coordinate-plus-variant
   anchor IDs and canonical endpoint-pair edge IDs are the only graph state held

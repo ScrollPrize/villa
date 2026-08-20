@@ -50,6 +50,12 @@ struct ForwardPolylineArcInterval {
     double endArc = 0.0;
 };
 
+[[nodiscard]] double segmentAabbDistanceSquared(
+    const cv::Vec3d& start,
+    const cv::Vec3d& end,
+    const cv::Vec3d& low,
+    const cv::Vec3d& high);
+
 [[nodiscard]] PolylineArcGeometry makePolylineArcGeometry(
     const std::vector<cv::Vec3d>& points);
 

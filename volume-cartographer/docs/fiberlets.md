@@ -534,6 +534,17 @@ pinned until the current graph query releases them. `--storage-chunk-side N`
 selects the spatial chunk side in base voxels and must be an exact multiple of
 the anchor cell side. The roots are local-only in this implementation.
 
+Cache-backed replay schedules exact tube intersections at storage-chunk
+resolution. It does not first materialize the complete anchor-cell population
+for the reference interval. When an anchor chunk is requested, its owned cells
+are enumerated in canonical Z/Y/X order and admitted by the same exact
+segment-to-cell distance test as eager extraction. The existing post-refinement
+anchor-position test and fiberlet-interior point test still apply. Neighboring
+anchor chunks remain dependencies of fiberlet chunks, preserving the context
+needed by cross-chunk NMS. Cache identity contains the complete clipped
+reference geometry, radius, source metadata, algorithm settings, and corridor
+selector version rather than a serialized cell list.
+
 The fiberlet root separates `prefix/` connectivity/cost blocks from `routes/`
 interior geometry. Beam/frontier state contains stable anchor and endpoint-pair
 IDs, not pointers or copied corridor-wide graph records. An incident query

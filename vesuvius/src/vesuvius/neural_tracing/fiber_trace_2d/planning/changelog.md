@@ -829,3 +829,15 @@
 - Split dense peak-denominator traversal from sparse positive evidence and
   removed the dense evidence-index stream, reducing peak and enclosing wall
   time with byte-identical replay output.
+
+# 2026-08-20: chunk-native replay corridor selection
+
+- Removed the serial full-corridor anchor-cell enumeration performed before
+  cache-backed replay could start. Reference scheduling now selects storage
+  chunks directly, while requested anchor chunks perform the canonical exact
+  segment-to-cell test locally and retain existing NMS and path containment.
+- On the Paris4 full-fiber radius-768 workload, cache work began after 0.006
+  seconds instead of remaining in serial setup beyond 20 seconds. A bounded
+  20.06-second cold-cache run consumed 560.16 CPU seconds (27.9 effective
+  cores). The 5,000-base-voxel radius-64 replay remained byte-identical and
+  completed in 5.90 seconds.
