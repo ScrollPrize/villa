@@ -285,6 +285,13 @@ public:
         return _umbilicusGeneration;
     }
 
+    // Ends every session — saving through the normal close path — while the
+    // current package is still the one the work belongs to. The project-open
+    // flows call this before replacing the package, and must not replace it
+    // when this returns false: an optimization is running, or a finalization
+    // failed, and the workspace is left intact for the user to resolve.
+    [[nodiscard]] bool prepareForPackageSwitch();
+
 signals:
     void lineAnnotationWorkspaceRequested(LineAnnotationDialog* dialog, const QString& title);
     void fibersChanged(std::vector<LineAnnotationController::FiberSummary> fibers);

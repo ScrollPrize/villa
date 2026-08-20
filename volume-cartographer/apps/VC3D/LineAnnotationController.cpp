@@ -2219,6 +2219,52 @@ bool LineAnnotationController::prepareForUserFacingLineAnnotationOpen()
     return true;
 }
 
+bool LineAnnotationController::prepareForPackageSwitch()
+{
+    // Ends every line-annotation session while its package is still the active
+    // one, so the existing finalize/save/close path writes into the paths the
+    // work belongs to. The project-open flows call this *before* replacing the
+    // package; the vpkgChanged handler is only the defensive net behind it,
+    // and that net must never save.
+    //
+    // Refused outright while any optimization runs, whichever pane owns it:
+    // switching mid-run would either discard the result or apply it to the
+    // wrong package, and a refusal the user can retry beats both. Checked
+    // before anything is torn down, so a refusal leaves the workspace intact.
+    for (const auto& pane : _panes) {
+        if (pane.session &&
+            pane.session->taskState == LineAnnotationSession::TaskState::Running) {
+            showError(tr("Finish or cancel the running line optimization before "
+                         "opening another project."));
+            return false;
+        }
+    }
+    // The inspection holds dialog-less sessions the finalize walk below never
+    // sees; its own cleanup removes its panes and surfaces, and it has nothing
+    // to save.
+    if (_intersectionInspection) {
+        cleanupIntersectionInspectionSurfaces();
+        _intersectionInspection.reset();
+    }
+    // Finalizes and saves idle sessions, then closes their dialogs
+    // (WA_DeleteOnClose deletes them) and cleans up their panes. Fails before
+    // closing anything if a finalization cannot complete.
+    if (!prepareForUserFacingLineAnnotationOpen()) {
+        return false;
+    }
+    // Whatever remains has no dialog; the normal close path still saves a
+    // succeeded session — into this, still-current, package.
+    std::vector<std::string> remaining;
+    remaining.reserve(_panes.size());
+    for (const auto& pane : _panes) {
+        remaining.push_back(pane.surfaceName);
+    }
+    for (const auto& name : remaining) {
+        cleanupSurfaceName(name);
+    }
+    return _panes.empty();
+}
+
 bool LineAnnotationController::launchSession(LineAnnotationController::SourceKind sourceKind,
                                              const std::string& surfaceName,
                                              std::shared_ptr<Surface> sourceSurface,
@@ -6406,10 +6452,21 @@ void LineAnnotationController::onVolumePackageChanged(std::shared_ptr<VolumePkg>
         _intersectionInspection.reset();
     }
     std::vector<PaneRecord> panes;
-    // Swapped out first: setSurface() below re-enters this controller through
-    // surfaceChanged, and no iterator over _panes may be live when it does.
+    // Swapped out first: setSurface() and the dialog closes below re-enter
+    // this controller through surfaceChanged and paneClosed, and no iterator
+    // over _panes may be live when they do.
     panes.swap(_panes);
     for (auto& pane : panes) {
+        if (pane.dialog) {
+            // Defensive net only: the project-open flows call
+            // prepareForPackageSwitch() first, which closes these through the
+            // finalize/save path while their package is still active. A dialog
+            // still open here belongs to a package that is already gone, so it
+            // is closed without saving — WA_DeleteOnClose deletes it — rather
+            // than left visible but disconnected from any session.
+            pane.dialog->setCloseAfterFinalizationAllowed(true);
+            pane.dialog->close();
+        }
         if (pane.session && pane.session->watcher) {
             auto* watcher = pane.session->watcher.data();
             disconnect(watcher, nullptr, this, nullptr);

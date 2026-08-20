@@ -878,6 +878,21 @@ void MenuActionController::finishOpenDataSampleOpen(OpenDataOpenTaskResult task,
         return;
     }
 
+    // Same gate as CWindow::OpenVolume(): sessions end — finalized and saved —
+    // while their own package is still the active one, or the switch does not
+    // happen.
+    if (_window && _window->_lineAnnotationController &&
+        !_window->_lineAnnotationController->prepareForPackageSwitch()) {
+        const QString msg = QObject::tr(
+            "Open line annotation sessions could not be closed; the project "
+            "was not switched.");
+        if (outcomeOut) {
+            outcomeOut->success = false;
+            outcomeOut->error = msg;
+        }
+        return;
+    }
+
     if (_window && _window->_state) {
         _window->_state->setVpkg(pkg);
     }
