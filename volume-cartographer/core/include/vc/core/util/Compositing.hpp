@@ -43,6 +43,11 @@ struct CompositeParams {
     // slab is thick, so 1:1 relief is barely visible under tilt.
     float wScale = 2.5f;
 
+    // Lambertian shading strength for the flattened volumetric view, in
+    // [0,1]. Normals are computed from finite differences in the extracted
+    // voxel layer stack. Zero preserves the existing unlit output.
+    float lightingStrength = 0.0f;
+
     bool operator==(const CompositeParams&) const = default;
 };
 

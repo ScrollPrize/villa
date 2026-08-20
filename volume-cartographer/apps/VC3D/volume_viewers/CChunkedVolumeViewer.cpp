@@ -2352,7 +2352,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     auto compositeVolumetricStack = [&](const std::vector<cv::Mat_<uint8_t>>& layerValues,
                                         const std::vector<cv::Mat_<uint8_t>>& layerCoverage,
                                         int zStart,
-                                        bool exaggerateW,
+                                        bool isFlattenedView,
                                         const vc3d::volumetric::SlabMargins& margins,
                                         cv::Mat_<cv::Vec3b>& colorDst,
                                         cv::Mat_<uint8_t>& cov) {
@@ -2374,11 +2374,17 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         // along the normal before the rotated render (the in-plane content
         // and the sampling itself are untouched). Flattened view only —
         // a slice slab has no surface relief worth amplifying.
-        const float wScale = exaggerateW ? std::max(cs.params.wScale, 0.01f) : 1.0f;
+        const float wScale = isFlattenedView
+            ? std::max(cs.params.wScale, 0.01f)
+            : 1.0f;
+        const float lightingStrength = isFlattenedView
+            ? cs.params.lightingStrength
+            : 0.0f;
         vc3d::volumetric::compositeVolumetric(layerValues, layerCoverage, cam,
                                               zStart, ctx.scale * wScale,
                                               colorLut, opacityLut,
-                                              colorDst, cov, margins);
+                                              colorDst, cov, margins,
+                                              lightingStrength);
     };
 
     QElapsedTimer prepassTimer;
@@ -2621,7 +2627,8 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             // orthographic/pinhole render is exact here (no bendy-slab
             // approximation).
             compositeVolumetricStack(layerValues, layerCoverage, zStart,
-                                     /*exaggerateW=*/false, margins, colorValues, cov);
+                                     /*isFlattenedView=*/false, margins,
+                                     colorValues, cov);
             return;
         }
         LayerStack stack;
@@ -2816,7 +2823,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                            nullptr, nullptr, cv::Mat_<uint8_t>(),
                            layerValues, layerCoverage, layerTargetCoverage);
         compositeVolumetricStack(layerValues, layerCoverage, zStart,
-                                 /*exaggerateW=*/true, margins, colorDst, cov);
+                                 /*isFlattenedView=*/true, margins, colorDst, cov);
     };
 
     auto sampleCoords = [&](const cv::Mat_<cv::Vec3f>& coords,

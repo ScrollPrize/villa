@@ -293,7 +293,8 @@ void compositeVolumetric(const std::vector<cv::Mat_<uint8_t>>& layerValues,
                          const std::array<float, 256>& opacityLut,
                          cv::Mat_<cv::Vec3b>& colorOut,
                          cv::Mat_<uint8_t>& coverageOut,
-                         const SlabMargins& margins)
+                         const SlabMargins& margins,
+                         float lightingStrength)
 {
     const int numLayers = int(layerValues.size());
     if (numLayers == 0 || layerCoverage.size() != layerValues.size() ||
@@ -410,9 +411,42 @@ void compositeVolumetric(const std::vector<cv::Mat_<uint8_t>>& layerValues,
                 if (alpha <= 0.0f)
                     continue;
                 const auto& e = premul[idx];
-                r += T * e[0];
-                g += T * e[1];
-                b += T * e[2];
+                float shade = 1.0f;
+                const float lightAmount = std::clamp(lightingStrength, 0.0f, 1.0f);
+                if (lightAmount > 0.0f) {
+                    // Central differences in the already-extracted voxel
+                    // stack. Missing neighbours fall back to the center, so
+                    // coverage boundaries do not create artificial normals.
+                    auto sample = [&](int layer, int sx, int sy) {
+                        if (layer < 0 || layer >= numLayers)
+                            return value;
+                        const int xx = std::clamp(x0 + sx, 0, cols - 1);
+                        const int yy = std::clamp(y0 + sy, 0, rows - 1);
+                        if (!layerCoverage[layer](yy, xx))
+                            return value;
+                        return float(layerValues[layer](yy, xx));
+                    };
+                    const float gx = sample(i, 1, 0) - sample(i, -1, 0);
+                    const float gy = sample(i, 0, 1) - sample(i, 0, -1);
+                    const float gz = sample(i + 1, 0, 0) - sample(i - 1, 0, 0);
+                    const float len2 = gx * gx + gy * gy + gz * gz;
+                    if (len2 > 1e-6f) {
+                        const float invLen = 1.0f / std::sqrt(len2);
+                        // Fixed upper-left raking light, 35 degrees above the
+                        // slab. At maximum strength, 10% ambient preserves
+                        // some detail on back-facing sides.
+                        constexpr float lx = -0.579228f;
+                        constexpr float ly = -0.579228f;
+                        constexpr float lz =  0.573576f;
+                        const float diffuse = std::max(
+                            0.0f, (gx * lx + gy * ly + gz * lz) * invLen);
+                        const float fullyLit = 0.10f + 0.90f * diffuse;
+                        shade = 1.0f + lightAmount * (fullyLit - 1.0f);
+                    }
+                }
+                r += T * e[0] * shade;
+                g += T * e[1] * shade;
+                b += T * e[2] * shade;
                 T *= 1.0f - alpha;
                 if (T < kEarlyOutT)
                     break;

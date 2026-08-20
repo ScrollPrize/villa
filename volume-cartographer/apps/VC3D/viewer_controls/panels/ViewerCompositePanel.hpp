@@ -11,6 +11,7 @@ class QComboBox;
 class QDoubleSpinBox;
 class QLabel;
 class QScrollArea;
+class QSlider;
 class QSpinBox;
 class QVBoxLayout;
 class ViewerManager;
@@ -76,5 +77,6 @@ private:
     QWidget* _volumetricGroup{nullptr};
     QWidget* _volumetricFlattenedGroup{nullptr};
     QDoubleSpinBox* _volumetricGamma{nullptr};
+    QSlider* _volumetricLighting{nullptr};
     QDoubleSpinBox* _volumetricWScale{nullptr};
 };

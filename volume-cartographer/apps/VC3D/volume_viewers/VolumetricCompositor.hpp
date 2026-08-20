@@ -167,6 +167,7 @@ void compositeVolumetric(const std::vector<cv::Mat_<uint8_t>>& layerValues,
                          const std::array<float, 256>& opacityLut,
                          cv::Mat_<cv::Vec3b>& colorOut,
                          cv::Mat_<uint8_t>& coverageOut,
-                         const SlabMargins& margins = {});
+                         const SlabMargins& margins = {},
+                         float lightingStrength = 0.0f);
 
 } // namespace vc3d::volumetric

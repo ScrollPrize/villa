@@ -10,6 +10,7 @@
 #include <QLabel>
 #include <QScrollArea>
 #include <QSignalBlocker>
+#include <QSlider>
 #include <QSpinBox>
 #include <QVBoxLayout>
 
@@ -220,6 +221,15 @@ void ViewerCompositePanel::setupVolumetricControls(QVBoxLayout* layout)
            "slab unstretched"));
     flattenedForm->addRow(tr("W scale"), _volumetricWScale);
 
+    _volumetricLighting = new QSlider(Qt::Horizontal, _volumetricFlattenedGroup);
+    _volumetricLighting->setRange(0, 100);
+    _volumetricLighting->setSingleStep(5);
+    _volumetricLighting->setValue(0);
+    _volumetricLighting->setToolTip(
+        tr("Raking Lambertian lighting using normals computed from central "
+           "differences in the extracted voxel layers"));
+    flattenedForm->addRow(tr("Raking light"), _volumetricLighting);
+
     // At the end of the flattened-view section (header, checkbox, layers
     // grid), just before the plane-view section.
     layout->insertWidget(7, _volumetricFlattenedGroup);
@@ -230,6 +240,13 @@ void ViewerCompositePanel::setupVolumetricControls(QVBoxLayout* layout)
         applyToAllViewers([value](VolumeViewerBase* viewer) {
             auto s = viewer->compositeRenderSettings();
             s.params.tfGamma = float(value);
+            viewer->setCompositeRenderSettings(s);
+        });
+    });
+    connect(_volumetricLighting, &QSlider::valueChanged, this, [this](int value) {
+        applyToSegmentationViewer([value](VolumeViewerBase* viewer) {
+            auto s = viewer->compositeRenderSettings();
+            s.params.lightingStrength = float(value) / 100.0f;
             viewer->setCompositeRenderSettings(s);
         });
     });
@@ -463,6 +480,9 @@ void ViewerCompositePanel::applyInitialSettingsToViewer(VolumeViewerBase* viewer
         if (_volumetricGamma) {
             s.params.tfGamma = float(_volumetricGamma->value());
         }
+        if (_volumetricLighting) {
+            s.params.lightingStrength = float(_volumetricLighting->value()) / 100.0f;
+        }
         if (_volumetricWScale) {
             s.params.wScale = float(_volumetricWScale->value());
         }
@@ -542,6 +562,11 @@ void ViewerCompositePanel::syncUiFromManager()
         if (_uiRefs.reverseDirection) {
             const QSignalBlocker blocker(_uiRefs.reverseDirection);
             _uiRefs.reverseDirection->setChecked(settings.reverseDirection);
+        }
+        if (_volumetricLighting) {
+            const QSignalBlocker blocker(_volumetricLighting);
+            _volumetricLighting->setValue(static_cast<int>(
+                std::lround(settings.params.lightingStrength * 100.0f)));
         }
     }
 

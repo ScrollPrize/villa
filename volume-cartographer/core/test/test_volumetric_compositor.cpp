@@ -362,6 +362,37 @@ TEST_CASE("compositeVolumetric treats uncovered texels as transparent")
     CHECK(int(color(3, 3)[0]) == 150);
 }
 
+TEST_CASE("compositeVolumetric optionally applies gradient Lambertian lighting")
+{
+    const int rows = 8, cols = 8;
+    auto values = uniformLayers(3, rows, cols, 0);
+    auto coverage = uniformLayers(3, rows, cols, 1);
+    for (auto& layer : values) {
+        for (int y = 0; y < rows; ++y)
+            for (int x = 0; x < cols; ++x)
+                layer(y, x) = uint8_t(200 - 10 * x);
+    }
+
+    CameraParams cam;
+    cv::Mat_<cv::Vec3b> unlit;
+    cv::Mat_<cv::Vec3b> lit;
+    cv::Mat_<uint8_t> cov;
+    compositeVolumetric(values, coverage, cam, -1, 1.0f,
+                        identityColorLut(), constantOpacityLut(1.0f), unlit, cov);
+    compositeVolumetric(values, coverage, cam, -1, 1.0f,
+                        identityColorLut(), constantOpacityLut(1.0f), lit, cov,
+                        {}, 1.0f);
+
+    // The -U-facing ramp receives the upper-left raking light. Lighting is
+    // intentionally non-destructive to opacity/coverage and modulates only
+    // the emitted RGB.
+    CHECK(cov(4, 3) == 1);
+    CHECK(int(unlit(4, 3)[0]) == 170);
+    CHECK(int(lit(4, 3)[0]) == doctest::Approx(105).epsilon(0.03));
+    CHECK(int(lit(4, 3)[1]) == int(lit(4, 3)[0]));
+    CHECK(int(lit(4, 3)[2]) == int(lit(4, 3)[0]));
+}
+
 
 TEST_CASE("slab point mapping matches the orthographic render and round-trips")
 {
