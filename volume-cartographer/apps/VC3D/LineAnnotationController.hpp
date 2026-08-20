@@ -652,6 +652,10 @@ private:
     [[nodiscard]] bool confirmLinkedControlPointEdit(const LineAnnotationSession& session,
                                                      int controlPointIndex,
                                                      const QString& action) const;
+    [[nodiscard]] bool confirmLinkedControlPointEdits(
+        const LineAnnotationSession& session,
+        const std::vector<size_t>& controlPointIndices,
+        const QString& action) const;
     [[nodiscard]] bool controlPointHasBranch(const LineAnnotationSession& session,
                                              int controlPointIndex) const;
     std::vector<uint64_t> syncBranchEndpointPositions(LineAnnotationSession& session);

@@ -4,35 +4,7 @@ Code and helpers to fit a canonical Archimedean spiral to deformed scrolls.
 `spiral_service.py` hosts one persistent interactive fit session over HTTP for
 the VC3D Spiral workspace; `fit_spiral.py` is the underlying fitter.
 
-## Neural winding-inference losses
 
-Set `dense_spacing_mode` to `winding_model` and provide the compact exported
-crossing directory at the conventional `<dataset>/winding_inference` path or
-override `paths.winding_inference` in `spiral-scroll.json`. Two vocabularies
-deliberately coexist: `winding_model` names the fitting mode and its tunables
-(`sample_count_winding_model_*`, `winding_model_relative_pair_delta`,
-`winding_model_huber_delta`, the `dense_spacing_winding_model_*` losses),
-while `winding_inference` names the exported artifact and everything tied to
-its on-disk identity (the input path, the `winding_inference_crossings`
-artifact type, and the checkpoint fingerprint field). The store is
-checksum-verified and copied to each fitting GPU at startup; rays whose
-crossings cannot intersect the configured z-range are excluded from sampling,
-and optimisation then does no inference-store filesystem I/O. The default
-24,000 samples per step are split evenly between long relative-winding pairs
-(`sample_count_winding_model_relative_pairs`, index separation drawn from
-`winding_model_relative_pair_delta`) and adjacent-passage density pairs
-(`sample_count_winding_model_density_pairs`). In this mode surf-SDT is
-neither loaded nor required, while the independent Lasagna normal and native
-minimum-spacing losses remain available.
-
-The compact store is created by the Vesuvius winding-model
-`export_spiral_supervision.py` tool; see its `NATIVE_PHASE_CACHE.md` for the
-exact export command and format.
-
-For a headless fit, pass the dataset root with `--dataset` and select inference
-mode (plus any independently disabled losses) through
-`FIT_SPIRAL_CONFIG_OVERRIDES`. The dataset's `spiral-scroll.json` and the
-declarative input catalog determine which conventional inputs are resolved.
 
 ## Flattening a fitted checkpoint
 
@@ -112,7 +84,10 @@ scroll) so those bricks drop out of the pool and sample as no-data. The
 fitter loads the sidecars restricted to the configured z-ROI in one
 sequential read per channel (for the full s1 ROI: ~33 GiB SDT + ~10 GiB
 normals); after that every gather is pure device indexing with no I/O and no
-eviction. A missing sidecar is a startup error naming the pack command.
+eviction. When a required sidecar is missing, the fitter builds it before GPU
+loading and reports chunk progress. In DDP runs only rank 0 builds it. Manual
+prepacking with `--ct` remains useful because the CT mask can substantially
+reduce the resident pool size.
 Set `FIT_SPIRAL_RESIDENT_BOUNDS_CHECK=1` to enable per-gather bounds
 assertions when debugging new sampling code.
 
@@ -432,3 +407,33 @@ plus one. The explicit forms avoid that extra pass for large databases.
 `--resume` continues an interrupted conversion. Multiple positional DBMs are
 combined into one output, so separate scrolls should be converted in separate
 commands.
+
+## Neural winding-inference losses
+
+Set `dense_spacing_mode` to `winding_model` and provide the compact exported
+crossing directory at the conventional `<dataset>/winding_inference` path or
+override `paths.winding_inference` in `spiral-scroll.json`. Two vocabularies
+deliberately coexist: `winding_model` names the fitting mode and its tunables
+(`sample_count_winding_model_*`, `winding_model_relative_pair_delta`,
+`winding_model_huber_delta`, the `dense_spacing_winding_model_*` losses),
+while `winding_inference` names the exported artifact and everything tied to
+its on-disk identity (the input path, the `winding_inference_crossings`
+artifact type, and the checkpoint fingerprint field). The store is
+checksum-verified and copied to each fitting GPU at startup; rays whose
+crossings cannot intersect the configured z-range are excluded from sampling,
+and optimisation then does no inference-store filesystem I/O. The default
+24,000 samples per step are split evenly between long relative-winding pairs
+(`sample_count_winding_model_relative_pairs`, index separation drawn from
+`winding_model_relative_pair_delta`) and adjacent-passage density pairs
+(`sample_count_winding_model_density_pairs`). In this mode surf-SDT is
+neither loaded nor required, while the independent Lasagna normal and native
+minimum-spacing losses remain available.
+
+The compact store is created by the Vesuvius winding-model
+`export_spiral_supervision.py` tool; see its `NATIVE_PHASE_CACHE.md` for the
+exact export command and format.
+
+For a headless fit, pass the dataset root with `--dataset` and select inference
+mode (plus any independently disabled losses) through
+`FIT_SPIRAL_CONFIG_OVERRIDES`. The dataset's `spiral-scroll.json` and the
+declarative input catalog determine which conventional inputs are resolved.

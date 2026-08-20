@@ -9,9 +9,15 @@ Ninja to generate a fresh eight-case Valgrind graph:
 
 - serial and four-worker parallel fixtures;
 - `full_res`, `fallback_3`, `mixed_correlated`, and `mixed_shuffled`;
-- separate-thread Callgrind profiles for all eight cases;
-- complete DRD dependency graphs for the four parallel cases;
+- periodic separate-thread Callgrind profiles for all eight cases;
+- scheduler and futex traces from each parallel case's same Callgrind run;
 - a relative modeled-runtime score and exact rendering checksum per case.
+
+The fixture renders through the production `ChunkCache`. A deterministic fake
+`IChunkFetcher` preloads all resident and missing states before measurement;
+the benchmark fails if a timed render reaches the fetcher. Storage, decode, and
+download work are therefore excluded while production cache lookup, locking,
+and request-context handling remain measured.
 
 Every score must stay at or below the reference plus the one-sided slowdown
 tolerance stored in `core/test/data/render_valgrind_ci_reference.json`. Faster
@@ -42,7 +48,7 @@ cmake --build volume-cartographer/build/ci-render-benchmark \
   --target bench_render_synthetic bench_thread_sync_replay --parallel "$jobs"
 ctest --test-dir volume-cartographer/build/ci-render-benchmark \
   --output-on-failure \
-  -R '^(test_render_synthetic_fixture|test_render_valgrind_ci_no_site)$'
+  -R '^(test_render_synthetic_fixture|test_thread_sync_replay_native)$'
 cmake --build volume-cartographer/build/ci-render-benchmark \
   --target render_valgrind_ci --parallel "$jobs"
 ```
@@ -51,42 +57,44 @@ Set `jobs` to a smaller positive number to limit local CPU or memory use. This
 only controls how many independent Ninja commands run at once. It does not
 change the fixed four-worker renderer fixture or five-core replay model.
 
-`test_render_valgrind_ci_no_site` runs the coordinator with `python3 -S`, parses
-a DRD fixture, and evaluates a profile through the real native replay engine.
-This prevents the dependency container from silently relying on host-installed
-Python packages. Python coordinates collection and artifact validation; all
-event-cost and replay computation is native C++.
+The regular estimate contains no Python process. Ninja invokes Valgrind
+directly, then `bench_thread_sync_replay evaluate-render` parses the raw
+Callgrind profiles and scheduler log, attributes costs to their originating
+threads, replays the synchronization graph, and writes the result in C++.
 
 Artifacts are under
 `build/ci-render-benchmark/render-valgrind-ci/<fixture>/<scenario>/`:
 
-- `callgrind/artifact.json` and raw per-thread profiles;
-- `drd/artifact.json`, `drd.log`, and `events.jsonl` for parallel cases;
+- `callgrind/callgrind.out.*`, benchmark metadata, and a collection stamp;
+- `callgrind/scheduler.log` for parallel cases;
 - `evaluation.json` for the ungated score;
 - `checked.json` after a passing comparison;
-- `checked.failed.json` after a failed comparison.
 
-Start failure diagnosis with `checked.failed.json`. Historical compiler, model,
-checksum, cache, fixture, repetition, and profiler changes do not fail the
-reference gate. The output records
-`reference_valgrind_version`, `observed_valgrind_version`, and whether they
-changed. Current-run artifact corruption or Callgrind/DRD inconsistency still
-fails because it prevents a valid score. An incomplete DRD failure means the
-trace must be recollected. A score above the allowed slowdown is a performance
-regression requiring investigation or an intentional reference update.
+Start failure diagnosis with the raw profiles, scheduler log, and
+`evaluation.json`.
+Historical compiler, model, checksum, cache, fixture, repetition, and profiler
+changes do not fail the reference gate. Current-run parse errors or
+incomplete futex dependencies still fail because they prevent a valid score. A
+score above the allowed slowdown is a performance regression requiring
+investigation or an intentional reference update.
+
+Parallel collection uses Callgrind's fair scheduler and a fixed
+10,000-basic-block quantum. Periodic event-counter deltas, scheduler quanta,
+and futex wait/wake operations all come from that one execution. Successful
+waits are linked to wakes on the same futex address, and each thread's profile
+is applied directly to that thread's replay windows. There is no cross-run
+worker assignment or second profiler trace.
 
 ## CI Activation
 
-The workflow runs on qualifying pull requests and pushes to `main`. The
+The workflow job runs on qualifying pull requests and pushes to `main`. The
 rendering job is selected when changes touch VC3D/core build inputs such as
 `volume-cartographer/core/**`, `volume-cartographer/scripts/**`, CMake files,
 VC3D sources, shared utilities/libraries, or `.github/workflows/vc3d-ci.yml`.
 Documentation-only changes under `volume-cartographer/docs/**` run the workflow
 path filter but do not select this expensive rendering job.
 
-Merging the implementation into `main` therefore makes the job available for
-all subsequent qualifying changes; the pull request containing the workflow
-change should also execute it. To make passing it mandatory before merge, add
+To make the job mandatory before merge, add
 the `Synthetic rendering regression (GCC Release / Valgrind replay)` check to
 the repository branch ruleset or branch protection. Merging alone runs the
 check but does not make it a required status check.
@@ -99,7 +107,7 @@ naturally bounded by available graph work.
 
 Model calibration, case references, and tolerance are independent controls:
 
-- **Recalibrate** only when changing how Callgrind/DRD events map to the score.
+- **Recalibrate** only when changing how Callgrind events map to the score.
 - **Refresh references** when an understood code or toolchain change shifts the
   expected score while the model remains valid.
 - **Change tolerance** when intentionally changing regression sensitivity.
@@ -187,8 +195,8 @@ baseline. Never use renderer observations to fit these coefficients.
 
 Use this when the model remains unchanged but an understood implementation,
 compiler, or Valgrind change alters expected scores. Use a new build directory
-to guarantee fresh Callgrind and DRD collection, and match the intended CI
-toolchain exactly:
+to guarantee fresh Callgrind collection, and match the intended CI toolchain
+exactly:
 
 ```bash
 build=volume-cartographer/build/render-reference-$(date +%Y%m%d-%H%M%S)
@@ -203,25 +211,26 @@ cmake -S volume-cartographer -B "$build" -G Ninja \
 cmake --build "$build" --target render_valgrind_ci_measure --parallel "$jobs"
 python3 volume-cartographer/scripts/run_render_valgrind_ci.py freeze-reference \
   --model volume-cartographer/core/test/data/render_valgrind_ci_model.json \
-  --tolerance 0.10 \
+  --tolerance 0.05 \
   --output volume-cartographer/core/test/data/render_valgrind_ci_reference.json \
   "$build"/render-valgrind-ci/*/*/evaluation.json
 cmake --build "$build" --target render_valgrind_ci --parallel "$jobs"
 ```
 
-The freeze command requires exactly all eight cases and records score,
-checksum, environment/workload identity, model hash, and tolerance. Only score
-and tolerance affect historical pass/fail; the remaining fields are diagnostic.
-Review every old/new score ratio. Run a second fresh collection before accepting
-references when parallel DRD replay variation is close to the chosen tolerance.
+The freeze command requires exactly all eight native evaluation artifacts and
+records score, checksum, model hash, and tolerance. Legacy evaluation artifacts
+also retain their environment/workload identity as diagnostic metadata. Only
+score and tolerance affect historical pass/fail.
+Review every old/new score ratio. Run a second fresh collection before
+accepting references when a parallel score is close to the chosen tolerance.
 
 ## Tightening Or Loosening Tolerance
 
 Tolerance is a fraction in `[0, 1)` stored once at the top level of
-`render_valgrind_ci_reference.json`. The default `0.10` accepts any finite,
-positive ratio at or below `1.10`:
+`render_valgrind_ci_reference.json`. The current `0.05` accepts any finite,
+positive ratio at or below `1.05`:
 
-- lowering it to `0.05` tightens the maximum accepted ratio to `1.05`;
+- lowering it to `0.03` tightens the maximum accepted ratio to `1.03`;
 - raising it to `0.15` loosens the maximum accepted ratio to `1.15`.
 
 Speedups do not fail the reference gate. A tolerance-only change must leave all
@@ -245,8 +254,9 @@ solely to change policy width.
 For any maintenance change, run:
 
 ```bash
-PYTHONPATH=volume-cartographer/scripts python3 -m unittest \
-  volume-cartographer/core/test/test_run_render_valgrind_ci.py
+cmake --build volume-cartographer/build/ci-render-benchmark \
+  --target test_thread_sync_replay_native --parallel "$(nproc)"
+volume-cartographer/build/ci-render-benchmark/bin/test_thread_sync_replay_native
 cmake --build volume-cartographer/build/ci-render-benchmark \
   --target render_valgrind_ci --parallel "$(nproc)"
 git diff --check

@@ -1,27 +1,35 @@
-# Direct Zarr mirror disk cache
+# VC3D render attribution and lookup performance repair
 
-Change persistent remote-volume caching so a newly encountered remote Zarr is
-cached as an incomplete but otherwise exact local mirror of the source Zarr.
+Repair the synthetic rendering performance gate before re-enabling it, then
+recover the lookup performance lost around the render-order changes.
 
-Requirements:
+Priorities:
 
-- Select the legacy cache layout whenever an existing cache directory contains
-  the legacy cache footprint, including for a remote volume newly added to a
-  project.
-- Keep legacy per-chunk reading and writing so existing mixed `.bin`, `.zst`,
-  `.c3d`, `.source`, and `.empty` caches remain usable.
-- Select the direct-mirror layout for a remote volume with no legacy footprint.
-- Mirror required Zarr metadata and store every downloaded encoded chunk at its
-  exact source-relative Zarr object key. The resulting directory must be
-  readable as an incomplete native Zarr volume.
-- For sharded arrays, download, deduplicate, persist, and account the complete
-  outer shard object while decoding only requested logical inner chunks.
-- Continue writing missing-chunk markers as an adjacent `<chunk-key>.empty`
-  file; native Zarr readers must continue to see the original chunk key as
-  absent and ignore the marker.
-- Ordinary remote reads, Open Data prefill, and cache redownload must all use
-  the selected layout and the shared source scheduler.
-- Remove VC3D options and production paths that recompress decoded cache data.
-  Keep legacy compressed-cache decoding, but do not create new recompressed
-  cache entries.
-- Preserve exact downloaded bytes and existing rendering values.
+1. Correct and stabilize the passive Valgrind attribution. Collect periodic
+   Callgrind cost slices and a DRD dependency graph from separate executions
+   with identical Valgrind scheduling parameters. Reconstruct logical worker
+   traces canonically instead of equating raw worker IDs, trim DRD to the same
+   existing timed render boundary, and reject any pair whose logical pattern is
+   ambiguous or not reproducible. The measured binary must remain unchanged:
+   no markers, affinity mode, deterministic executor, or added instructions.
+2. Measure and repair renderer lookup speed using the commit immediately before
+   `Vc3d renderorder` and the current implementation as an A/B case. Preserve
+   rendered bytes, fallback behavior, request priority, and scheduling
+   semantics.
+
+Speed investigation requirements:
+
+- Treat `ChunkRequestContext` as render-job-constant; verify and exploit that
+  without changing request publication semantics.
+- Investigate a prepared/source-bound key lookup path so level, source, and
+  request information are not repeatedly assembled in the hot lookup.
+- Avoid rebuilding and probing a full key when a correlated sample remains in
+  the same successfully resolved chunk.
+- Account for the existing `LocalChunkCache`: it already retains the last key
+  and result and up to eight pinned chunks. Do not duplicate that cache under a
+  different name; improve the work that happens before it can identify a hit.
+- Establish repeatable before/after Release measurements and verify exact output
+  checksums before accepting any optimization.
+
+The Valgrind attribution repair is first. Lookup optimization remains planned
+until the gate can produce stable, semantically valid scores.

@@ -357,6 +357,17 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		self.assertEqual(next(events), (0, 4, 4, True, 4))
 		self.assertEqual(next(events), (4, 0, 0, False, 8))
 
+	def test_progress_refresh_is_not_suppressed_for_piped_stdout(self):
+		ticks = iter((0.0, 0.5, 1.1, 61.1))
+		emitter = shared_predict3d._Predict3dProgressEmitter(clock=lambda: next(ticks))
+		with mock.patch.object(sys.stdout, "isatty", return_value=False), mock.patch(
+			"sys.stdout", new_callable=io.StringIO,
+		) as output:
+			emitter.emit("first", done=1, total=4)
+			emitter.emit("second", done=2, total=4)
+			emitter.emit("third", done=3, total=4)
+		self.assertEqual(output.getvalue(), "\rsecond  \rthird\n")
+
 	def test_shared_result_layout_is_packed_without_queue_payloads(self):
 		layouts, total = shared_predict3d._packed_layouts((
 			("product:a", (7, 16, 16, 16), np.float32),
