@@ -350,10 +350,13 @@ def _make_patch_sampling_atlas(masks):
 
 
 class PatchAtlas:
-    """All patches' (H, W, 3) zyxs grids packed into one flat tensor, batched
-    per lookup instead of per-patch dispatch. Geometry is initially prepared on
-    the host and moved as one allocation by :meth:`materialize` during device
-    setup. Sampling masks remain in the native/CPU sampling atlas."""
+    """Patch (H, W, 3) zyx grids packed for batched lookup.
+
+    Initial geometry is moved as one allocation by :meth:`materialize` during
+    device setup. Later interactive appends use independent resident chunks so
+    the original allocation never has to be copied. Sampling masks remain in
+    the native/CPU sampling atlas.
+    """
 
     def __init__(self, patches_by_id, device='cuda'):
         self.device = torch.device(device)
@@ -369,6 +372,7 @@ class PatchAtlas:
         # Geometry remains in each Patch until materialize().  Concatenating
         # here used to retain a second full host copy for the entire session.
         self.zyxs_flat = None
+        self._geometry_chunks = []
         self._num_vertices = offsets[-1]
         self.offsets = torch.tensor(offsets, dtype=torch.int64)  # (N+1,)
         self.widths = torch.tensor(widths, dtype=torch.int64)  # (N,)
@@ -391,6 +395,65 @@ class PatchAtlas:
     def memory_mb(self):
         return self._num_vertices * 3 * 4 / 1e6
 
+    def topology_memory_stats(self):
+        """Return printable native-topology stats, including for no patches."""
+        if self.sampling_atlas is None:
+            return {'num_valid_cells': 0, 'persistent_bytes': 0}
+        return dict(self.sampling_atlas.memory_stats())
+
+    @staticmethod
+    def _materialize_geometry(patches, num_vertices, device):
+        """Copy patch grids into one new resident chunk.
+
+        A chunk is allocated at its final size and filled in place, so adding
+        patches to an already-materialized atlas never needs a replacement
+        allocation for the existing geometry.
+        """
+        resident = torch.empty(
+            (num_vertices, 3), dtype=torch.float32, device=device)
+        if device.type == 'cpu':
+            offset = 0
+            for patch in patches:
+                piece = patch.zyxs.reshape(-1, 3).to(dtype=torch.float32)
+                resident[offset:offset + len(piece)].copy_(piece)
+                offset += len(piece)
+            return resident
+
+        # Amortise transfers without ever concatenating the whole atlas on
+        # the host.  256 MiB bounds the temporary independently of dataset
+        # size while preserving the exact float32 bytes and patch order.
+        staging_limit = 256 * (1 << 20) // (3 * 4)
+        pieces = []
+        staged = 0
+        offset = 0
+
+        def flush():
+            nonlocal pieces, staged, offset
+            if not pieces:
+                return
+            staging = torch.cat(pieces, dim=0)
+            resident[offset:offset + staged].copy_(
+                staging, non_blocking=True)
+            offset += staged
+            pieces = []
+            staged = 0
+
+        for patch in patches:
+            piece = patch.zyxs.reshape(-1, 3).to(dtype=torch.float32)
+            if pieces and staged + len(piece) > staging_limit:
+                flush()
+            # A single unusually large patch is copied directly so the
+            # advertised staging bound is not exceeded.
+            if len(piece) > staging_limit:
+                resident[offset:offset + len(piece)].copy_(
+                    piece, non_blocking=True)
+                offset += len(piece)
+            else:
+                pieces.append(piece)
+                staged += len(piece)
+        flush()
+        return resident
+
     def materialize(self, device=None):
         """Build one resident geometry allocation with bounded host staging."""
         if device is not None:
@@ -398,53 +461,20 @@ class PatchAtlas:
         if (self.zyxs_flat is not None
                 and self.zyxs_flat.device == self.device):
             return self
-        resident = torch.empty(
-            (self._num_vertices, 3), dtype=torch.float32,
-            device=self.device)
-        if self.device.type == 'cpu':
-            offset = 0
-            for patch in self._patches:
-                piece = patch.zyxs.reshape(-1, 3).to(dtype=torch.float32)
-                resident[offset:offset + len(piece)].copy_(piece)
-                offset += len(piece)
-        else:
-            # Amortise transfers without ever concatenating the whole atlas on
-            # the host.  256 MiB bounds the temporary independently of dataset
-            # size while preserving the exact float32 bytes and patch order.
-            staging_limit = 256 * (1 << 20) // (3 * 4)
-            pieces = []
-            staged = 0
-            offset = 0
-
-            def flush():
-                nonlocal pieces, staged, offset
-                if not pieces:
-                    return
-                staging = torch.cat(pieces, dim=0)
-                resident[offset:offset + staged].copy_(
-                    staging, non_blocking=True)
-                offset += staged
-                pieces = []
-                staged = 0
-
-            for patch in self._patches:
-                piece = patch.zyxs.reshape(-1, 3).to(dtype=torch.float32)
-                if pieces and staged + len(piece) > staging_limit:
-                    flush()
-                # A single unusually large patch is copied directly so the
-                # advertised staging bound is not exceeded.
-                if len(piece) > staging_limit:
-                    resident[offset:offset + len(piece)].copy_(
-                        piece, non_blocking=True)
-                    offset += len(piece)
-                else:
-                    pieces.append(piece)
-                    staged += len(piece)
-            flush()
+        resident = self._materialize_geometry(
+            self._patches, self._num_vertices, self.device)
         self.zyxs_flat = resident
         self.offsets = self.offsets.to(self.device)
         self.widths = self.widths.to(self.device)
         self.heights = self.heights.to(self.device)
+        self._geometry_chunks = [{
+            'zyxs_flat': resident,
+            'offsets': self.offsets,
+            'widths': self.widths,
+            'heights': self.heights,
+            'patch_start': 0,
+            'patch_end': len(self._patches),
+        }]
         return self
 
     def rebuild_sampling_atlas(self):
@@ -493,14 +523,27 @@ class PatchAtlas:
         patch_idx_per_sample = patch_idx_per_sample.to(
             device=self.zyxs_flat.device, dtype=torch.int64, non_blocking=True)
         ijs = ijs.to(device=self.zyxs_flat.device, non_blocking=True)
-        zyxs = bilinear_atlas_lookup(
-            self.zyxs_flat,
-            self.offsets,
-            self.widths,
-            patch_idx_per_sample,
-            ijs,
-            heights=self.heights,
-        )
+        if len(self._geometry_chunks) == 1:
+            chunk = self._geometry_chunks[0]
+            return bilinear_atlas_lookup(
+                chunk['zyxs_flat'], chunk['offsets'], chunk['widths'],
+                patch_idx_per_sample, ijs, heights=chunk['heights'])
+
+        # Appended geometry stays in independent resident chunks. Dispatch
+        # samples to their owning chunk instead of joining all geometry into a
+        # replacement atlas (which would briefly require roughly 2x VRAM).
+        sample_shape = ijs.shape[:-1]
+        patch_indices = patch_idx_per_sample.expand(sample_shape)
+        zyxs = torch.empty((*sample_shape, 3), dtype=torch.float32,
+                           device=self.zyxs_flat.device)
+        for chunk in self._geometry_chunks:
+            start = chunk['patch_start']
+            selected = ((patch_indices >= start)
+                        & (patch_indices < chunk['patch_end']))
+            local_indices = patch_indices[selected] - start
+            zyxs[selected] = bilinear_atlas_lookup(
+                chunk['zyxs_flat'], chunk['offsets'], chunk['widths'],
+                local_indices, ijs[selected], heights=chunk['heights'])
         return zyxs
 
     def register_theta_topology(self, crossing_map):
@@ -587,7 +630,6 @@ class PatchAtlas:
         """
         if not patches_by_id:
             return
-        flat_pieces = []
         offsets = [int(self.offsets[-1].item())]
         widths = []
         heights = []
@@ -596,13 +638,28 @@ class PatchAtlas:
                 raise ValueError(f'Patch {pid!r} is already in the atlas')
             z = p.zyxs
             H, W = z.shape[:2]
-            flat_pieces.append(z.reshape(-1, 3).to(dtype=torch.float32))
             offsets.append(offsets[-1] + H * W)
             widths.append(W)
             heights.append(H)
         if self.zyxs_flat is not None:
-            new_flat = torch.cat(flat_pieces, dim=0).to(self.zyxs_flat.device)
-            self.zyxs_flat = torch.cat([self.zyxs_flat, new_flat], dim=0)
+            patch_start = len(self._patches)
+            patch_values = list(patches_by_id.values())
+            local_offsets = torch.tensor(
+                [value - offsets[0] for value in offsets],
+                dtype=torch.int64, device=self.zyxs_flat.device)
+            chunk = {
+                'zyxs_flat': self._materialize_geometry(
+                    patch_values, offsets[-1] - offsets[0],
+                    self.zyxs_flat.device),
+                'offsets': local_offsets,
+                'widths': torch.tensor(
+                    widths, dtype=torch.int64, device=self.zyxs_flat.device),
+                'heights': torch.tensor(
+                    heights, dtype=torch.int64, device=self.zyxs_flat.device),
+                'patch_start': patch_start,
+                'patch_end': patch_start + len(patch_values),
+            }
+            self._geometry_chunks.append(chunk)
         self.offsets = torch.cat([
             self.offsets,
             torch.tensor(offsets[1:], dtype=torch.int64, device=self.offsets.device),
@@ -1832,7 +1889,7 @@ class FitContext:
             detail=f'{len(verified_patches):,} patches')
         patch_atlas = PatchAtlas(verified_patches, device='cuda')
         print(f'patch atlas: {patch_atlas.memory_mb():.1f} MB')
-        topology_stats = dict(patch_atlas.sampling_atlas.memory_stats())
+        topology_stats = patch_atlas.topology_memory_stats()
         print(
             'compact patch topology: '
             f"{int(topology_stats['num_valid_cells']):,} quads, "

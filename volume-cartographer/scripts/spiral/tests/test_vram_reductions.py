@@ -286,6 +286,14 @@ class DevicePatchAtlasTests(unittest.TestCase):
         self.assertEqual(atlas.zyxs_flat.device.type, 'cpu')
         torch.testing.assert_close(atlas.lookup(idx, ijs), expected)
 
+    def test_empty_atlas_reports_zero_topology_memory(self):
+        atlas = self.PatchAtlas({}, device='cpu')
+        self.assertIsNone(atlas.sampling_atlas)
+        self.assertEqual(atlas.topology_memory_stats(), {
+            'num_valid_cells': 0,
+            'persistent_bytes': 0,
+        })
+
     def test_cpu_fallback_append(self):
         atlas = self.PatchAtlas({'a': self._fake_patch(5, 5, 3)}, device='cpu')
         extra = self._fake_patch(4, 8, 4)
@@ -294,6 +302,26 @@ class DevicePatchAtlasTests(unittest.TestCase):
         self.assertEqual(atlas.id_to_idx['b'], 1)
         out = atlas.lookup(torch.tensor([1]), torch.tensor([[1.5, 2.5]]))
         torch.testing.assert_close(out[0], self._manual_bilinear(extra.zyxs, 1.5, 2.5))
+
+    def test_materialized_append_keeps_existing_geometry_allocation(self):
+        first = self._fake_patch(5, 5, 31)
+        extra = self._fake_patch(4, 8, 32)
+        atlas = self.PatchAtlas({'a': first}, device='cpu').materialize()
+        original_storage = atlas.zyxs_flat
+        original_pointer = original_storage.data_ptr()
+
+        atlas.append_patches({'b': extra})
+
+        self.assertIs(atlas.zyxs_flat, original_storage)
+        self.assertEqual(atlas.zyxs_flat.data_ptr(), original_pointer)
+        self.assertEqual(len(atlas._geometry_chunks), 2)
+        idx = torch.tensor([0, 1])
+        ijs = torch.tensor([[2.25, 1.5], [1.5, 2.5]])
+        expected = torch.stack([
+            self._manual_bilinear(first.zyxs, 2.25, 1.5),
+            self._manual_bilinear(extra.zyxs, 1.5, 2.5),
+        ])
+        torch.testing.assert_close(atlas.lookup(idx, ijs), expected)
 
     def test_largest_patch_component_uses_eight_connectivity(self):
         mask = np.zeros((8, 10), dtype=bool)
@@ -440,14 +468,43 @@ class DevicePatchAtlasTests(unittest.TestCase):
             {'a': self._fake_patch(6, 6, 2)}, device='cuda').materialize()
         self.assertEqual(atlas.zyxs_flat.device.type, 'cuda')
         self.assertTrue(atlas.offsets.is_cuda)
+        original_storage = atlas.zyxs_flat
+        original_pointer = original_storage.data_ptr()
         idx = torch.zeros(3, dtype=torch.int64, device='cuda')
         ijs = torch.tensor(
             [[0.5, 0.5], [2.25, 3.75], [4.0, 4.0]], device='cuda')
         out = atlas.lookup(idx, ijs)
         self.assertTrue(out.is_cuda)
-        atlas.append_patches({'b': self._fake_patch(4, 5, 8)})
+        extra = self._fake_patch(4, 5, 8)
+        atlas.append_patches({'b': extra})
+        self.assertIs(atlas.zyxs_flat, original_storage)
+        self.assertEqual(atlas.zyxs_flat.data_ptr(), original_pointer)
         self.assertTrue(atlas.zyxs_flat.is_cuda)
         self.assertTrue(atlas.widths.is_cuda)
+        appended = atlas.lookup(
+            torch.tensor([1], device='cuda'),
+            torch.tensor([[1.25, 2.5]], device='cuda'))
+        torch.testing.assert_close(
+            appended.cpu()[0], self._manual_bilinear(extra.zyxs, 1.25, 2.5))
+
+    @unittest.skipUnless(torch.cuda.is_available(), 'needs CUDA')
+    def test_cuda_append_peak_memory_scales_with_new_geometry(self):
+        atlas = self.PatchAtlas(
+            {'large': self._fake_patch(512, 512, 51)},
+            device='cuda').materialize()
+        extra = self._fake_patch(4, 5, 52)
+        torch.cuda.synchronize()
+        baseline = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+
+        atlas.append_patches({'small': extra})
+        torch.cuda.synchronize()
+
+        peak_growth = torch.cuda.max_memory_allocated() - baseline
+        appended_bytes = extra.zyxs.numel() * extra.zyxs.element_size()
+        # Tensor metadata is tiny. A 1 MiB allowance comfortably covers it
+        # while still catching a replacement copy of the 3 MiB base atlas.
+        self.assertLess(peak_growth, appended_bytes + (1 << 20))
 
     @unittest.skipUnless(torch.cuda.is_available(), 'needs CUDA')
     def test_sample_patch_batch_carries_pregathered_points(self):
