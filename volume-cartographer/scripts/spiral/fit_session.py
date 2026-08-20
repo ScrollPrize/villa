@@ -560,12 +560,6 @@ SCROLL_SPEC_SCHEMA_VERSION = 1
 SCROLL_SPEC_PATH_OVERRIDE_KEYS = tuple(
     spec.key for spec in FIT_INPUT_CATALOG if spec.kind != "pcl-set")
 
-_SCROLL_SPEC_TOP_LEVEL_KEYS = (
-    "schema_version", "name", "voxel_size_um", "spiral_outward_sense",
-    "umbilicus", "normal_zarr_group", "surf_sdt_zarr_group", "lasagna_scale",
-    "paths",
-)
-
 # Conventional dataset layout for the headless CLI, mirroring the historical
 # fit_spiral module-global defaults. resolve_dataset_root() shares the same
 # relative paths for the entries it discovers.
@@ -614,16 +608,14 @@ class ScrollSpec:
 
 def parse_scroll_spec(document: Any, dataset_root: str | os.PathLike[str],
                       *, source: str = SCROLL_SPEC_FILENAME) -> ScrollSpec:
-    """Validate a spiral-scroll.json document strictly and freeze it.
+    """Validate known spiral-scroll.json fields and freeze them.
 
-    Unknown keys are errors (named), schema_version is required, and path
-    overrides are resolved relative to the dataset root.
+    Unknown top-level keys are ignored for forward compatibility,
+    schema_version is required, and path overrides are resolved relative to
+    the dataset root.
     """
     if not isinstance(document, Mapping):
         raise ScrollSpecError(f"{source}: the scroll specification must be a JSON object")
-    unknown = sorted(set(document) - set(_SCROLL_SPEC_TOP_LEVEL_KEYS))
-    if unknown:
-        raise ScrollSpecError(f"{source}: unknown keys: {unknown}")
     if "schema_version" not in document:
         raise ScrollSpecError(f"{source}: schema_version is required")
     if document["schema_version"] != SCROLL_SPEC_SCHEMA_VERSION:
