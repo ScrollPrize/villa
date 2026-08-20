@@ -14,6 +14,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
@@ -724,13 +725,85 @@ std::string progressDuration(double seconds)
     return text.str();
 }
 
+using ReplayChunkId = std::array<int, 4>;
+
+struct ReplayPreprocessingSnapshot {
+    size_t expectedAnchors = 0;
+    size_t resolvedAnchors = 0;
+    size_t expectedPrefixes = 0;
+    size_t resolvedPrefixes = 0;
+};
+
+class ReplayPreprocessingProgress {
+public:
+    void configure(
+        std::set<ReplayChunkId> expectedAnchors,
+        std::set<ReplayChunkId> expectedPrefixes)
+    {
+        std::lock_guard lock(mutex_);
+        expectedAnchors_ = std::move(expectedAnchors);
+        expectedPrefixes_ = std::move(expectedPrefixes);
+        resolvedAnchors_.clear();
+        resolvedPrefixes_.clear();
+        enabled_ = true;
+    }
+
+    void resolve(
+        vc::fiber_tracer::FiberletStorageChunkKind kind,
+        const vc::render::ChunkKey& key,
+        vc::render::ChunkFetchStatus status)
+    {
+        if (status != vc::render::ChunkFetchStatus::Found)
+            return;
+        const ReplayChunkId id{key.level, key.iz, key.iy, key.ix};
+        std::lock_guard lock(mutex_);
+        if (!enabled_)
+            return;
+        if (kind == vc::fiber_tracer::FiberletStorageChunkKind::Anchors) {
+            if (expectedAnchors_.contains(id))
+                resolvedAnchors_.insert(id);
+        } else if (kind ==
+                vc::fiber_tracer::FiberletStorageChunkKind::FiberletPrefix) {
+            if (expectedPrefixes_.contains(id))
+                resolvedPrefixes_.insert(id);
+        }
+    }
+
+    [[nodiscard]] ReplayPreprocessingSnapshot snapshot() const
+    {
+        std::lock_guard lock(mutex_);
+        return {
+            expectedAnchors_.size(),
+            resolvedAnchors_.size(),
+            expectedPrefixes_.size(),
+            resolvedPrefixes_.size(),
+        };
+    }
+
+    void disable()
+    {
+        std::lock_guard lock(mutex_);
+        enabled_ = false;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::set<ReplayChunkId> expectedAnchors_;
+    std::set<ReplayChunkId> expectedPrefixes_;
+    std::set<ReplayChunkId> resolvedAnchors_;
+    std::set<ReplayChunkId> resolvedPrefixes_;
+    bool enabled_ = false;
+};
+
 class ReplayOverallProgress {
 public:
     ReplayOverallProgress(bool enabled, bool includesVisualization)
         : enabled_(enabled), traceWeight_(includesVisualization ? 0.80 : 0.99), start_(std::chrono::steady_clock::now())
     {
-        if (enabled_)
+        if (enabled_) {
             renderLocked(true, false);
+            ticker_ = std::thread([this] { tickerLoop(); });
+        }
     }
 
     ~ReplayOverallProgress() { endLine(); }
@@ -741,12 +814,23 @@ public:
     void updateGreedy(double fraction) { updateTracer(fraction, greedyFraction_); }
     void updateFiberlet(double fraction) { updateTracer(fraction, fiberletFraction_); }
 
+    void attachPreprocessing(
+        std::shared_ptr<ReplayPreprocessingProgress> preprocessing)
+    {
+        const auto snapshot = preprocessing->snapshot();
+        std::lock_guard lock(mutex_);
+        preprocessing_ = std::move(preprocessing);
+        updatePreprocessingLocked(snapshot);
+        updateTraceFractionLocked(true);
+    }
+
     void tracingComplete()
     {
         std::lock_guard lock(mutex_);
         greedyFraction_ = 1.0;
         fiberletFraction_ = 1.0;
-        updateAbsoluteLocked(traceWeight_, true);
+        preprocessingFraction_ = 1.0;
+        updateTraceFractionLocked(true);
     }
 
     void updatePostTrace(double fraction)
@@ -757,6 +841,8 @@ public:
 
     void finish()
     {
+        disablePreprocessing();
+        stopTicker();
         std::lock_guard lock(mutex_);
         if (!enabled_ || finished_)
             return;
@@ -768,6 +854,8 @@ public:
 
     void endLine()
     {
+        disablePreprocessing();
+        stopTicker();
         std::lock_guard lock(mutex_);
         if (enabled_ && lineOpen_) {
             std::cerr << '\n';
@@ -782,7 +870,82 @@ private:
             return;
         std::lock_guard lock(mutex_);
         current = std::max(current, std::clamp(fraction, 0.0, 1.0));
-        updateAbsoluteLocked(traceWeight_ * std::min(greedyFraction_, fiberletFraction_), false);
+        updateTraceFractionLocked(false);
+    }
+
+    void updateTraceFractionLocked(bool force)
+    {
+        const double tracerFraction =
+            std::min(greedyFraction_, fiberletFraction_);
+        const double traceFraction = preprocessing_
+            ? 0.95 * preprocessingFraction_ + 0.05 * tracerFraction
+            : tracerFraction;
+        updateAbsoluteLocked(traceWeight_ * traceFraction, force);
+    }
+
+    void updatePreprocessingLocked(
+        const ReplayPreprocessingSnapshot& snapshot)
+    {
+        constexpr double prefixWeight = 16.0;
+        const double expected =
+            static_cast<double>(snapshot.expectedAnchors) +
+            prefixWeight * static_cast<double>(snapshot.expectedPrefixes);
+        const double resolved =
+            static_cast<double>(snapshot.resolvedAnchors) +
+            prefixWeight * static_cast<double>(snapshot.resolvedPrefixes);
+        const double fraction = expected > 0.0
+            ? std::clamp(resolved / expected, 0.0, 1.0)
+            : 1.0;
+        preprocessingFraction_ = std::max(preprocessingFraction_, fraction);
+    }
+
+    void tickerLoop()
+    {
+        std::unique_lock waitLock(tickerMutex_);
+        while (!tickerCv_.wait_for(
+            waitLock, std::chrono::milliseconds(250),
+            [this] { return tickerStop_; })) {
+            waitLock.unlock();
+            std::shared_ptr<ReplayPreprocessingProgress> preprocessing;
+            {
+                std::lock_guard lock(mutex_);
+                preprocessing = preprocessing_;
+            }
+            const auto snapshot = preprocessing
+                ? std::optional{preprocessing->snapshot()}
+                : std::nullopt;
+            {
+                std::lock_guard lock(mutex_);
+                if (!finished_) {
+                    if (snapshot)
+                        updatePreprocessingLocked(*snapshot);
+                    updateTraceFractionLocked(true);
+                }
+            }
+            waitLock.lock();
+        }
+    }
+
+    void stopTicker()
+    {
+        {
+            std::lock_guard lock(tickerMutex_);
+            tickerStop_ = true;
+        }
+        tickerCv_.notify_all();
+        if (ticker_.joinable())
+            ticker_.join();
+    }
+
+    void disablePreprocessing()
+    {
+        std::shared_ptr<ReplayPreprocessingProgress> preprocessing;
+        {
+            std::lock_guard lock(mutex_);
+            preprocessing = preprocessing_;
+        }
+        if (preprocessing)
+            preprocessing->disable();
     }
 
     void updateAbsoluteLocked(double fraction, bool force)
@@ -806,8 +969,12 @@ private:
         constexpr int width = 24;
         const int filled = std::clamp(static_cast<int>(std::floor(fraction_ * width)), 0, width);
         std::ostringstream line;
-        line << "fiber replay [" << std::string(filled, '#') << std::string(width - filled, '-') << "] " << std::fixed
-             << std::setprecision(1) << 100.0 * fraction_ << "% elapsed=" << progressDuration(elapsed) << " eta=" << progressDuration(eta);
+        const double percent = 100.0 * fraction_;
+        line << "fiber replay [" << std::string(filled, '#')
+             << std::string(width - filled, '-') << "] " << std::fixed
+             << std::setprecision(percent < 10.0 ? 2 : 1) << percent
+             << "% elapsed=" << progressDuration(elapsed)
+             << " eta=" << progressDuration(eta);
         std::cerr << '\r' << line.str() << "   ";
         if (final)
             std::cerr << '\n';
@@ -823,9 +990,15 @@ private:
     std::chrono::steady_clock::time_point lastRender_{};
     double greedyFraction_ = 0.0;
     double fiberletFraction_ = 0.0;
+    double preprocessingFraction_ = 0.0;
     double fraction_ = 0.0;
+    std::shared_ptr<ReplayPreprocessingProgress> preprocessing_;
     bool lineOpen_ = false;
     bool finished_ = false;
+    std::mutex tickerMutex_;
+    std::condition_variable tickerCv_;
+    bool tickerStop_ = false;
+    std::thread ticker_;
 };
 
 void printRateProgress(const char* prefix, const std::string& phase, const char* rateName, size_t completed, size_t total, double elapsedSeconds)
@@ -1767,7 +1940,6 @@ int main(int argc, char** argv)
                 preprocessor;
             std::unique_ptr<vc::fiber_tracer::FiberletCachedReplayGraphSource>
                 cachedGraph;
-            using ReplayChunkId = std::array<int, 4>;
             struct ReplayChunkProgressLocation {
                 std::size_t scheduleIndex = 0;
                 double referenceArcBase = 0.0;
@@ -1778,6 +1950,8 @@ int main(int argc, char** argv)
                 anchorChunkProgressLocations;
             std::set<ReplayChunkId> completedFiberletChunks;
             std::set<ReplayChunkId> completedAnchorChunks;
+            auto preprocessingProgress =
+                std::make_shared<ReplayPreprocessingProgress>();
             if (options.eagerGraphReplay) {
                 if (options.printStats)
                     std::cerr << "fiber_replay_stage stage=full_extraction status=started\n";
@@ -1875,6 +2049,13 @@ int main(int argc, char** argv)
                 onDemand.anchorCacheOptions = std::move(anchorCacheOptions);
                 onDemand.fiberletCacheOptions =
                     std::move(fiberletCacheOptions);
+                onDemand.chunkResolved =
+                    [preprocessingProgress](
+                        vc::fiber_tracer::FiberletStorageChunkKind kind,
+                        const vc::render::ChunkKey& key,
+                        vc::render::ChunkFetchStatus status) {
+                        preprocessingProgress->resolve(kind, key, status);
+                    };
                 if (options.printStats) {
                     onDemand.progress = [&](const auto& progress) {
                     std::lock_guard lock(outputMutex);
@@ -1955,29 +2136,45 @@ int main(int argc, char** argv)
                     preprocessor->referenceChunkSchedule(
                         reference, startArc, endArc,
                         options.radiusBaseVoxels);
-                if (options.printStats) {
-                    for (std::size_t index = 0; index < chunkSchedule.size(); ++index) {
-                        const auto& scheduled = chunkSchedule[index];
-                        const ReplayChunkId fiberletId{scheduled.key.level,
-                            scheduled.key.iz, scheduled.key.iy,
-                            scheduled.key.ix};
-                        fiberletChunkProgressLocations.emplace(
-                            fiberletId,
-                            ReplayChunkProgressLocation{
-                                index, scheduled.nearestReferenceArcBase});
-                        for (const auto& dependency : preprocessor->anchorDependencies(scheduled.key)) {
-                            const ReplayChunkId anchorId{dependency.level,
-                                dependency.iz, dependency.iy, dependency.ix};
-                            const ReplayChunkProgressLocation candidate{
-                                index, scheduled.nearestReferenceArcBase};
-                            const auto found = anchorChunkProgressLocations.find(anchorId);
-                            if (found == anchorChunkProgressLocations.end() ||
-                                candidate.scheduleIndex < found->second.scheduleIndex) {
-                                anchorChunkProgressLocations[anchorId] = candidate;
-                            }
+                for (std::size_t index = 0; index < chunkSchedule.size(); ++index) {
+                    const auto& scheduled = chunkSchedule[index];
+                    const ReplayChunkId fiberletId{scheduled.key.level,
+                        scheduled.key.iz, scheduled.key.iy,
+                        scheduled.key.ix};
+                    fiberletChunkProgressLocations.emplace(
+                        fiberletId,
+                        ReplayChunkProgressLocation{
+                            index, scheduled.nearestReferenceArcBase});
+                    for (const auto& dependency :
+                         preprocessor->anchorDependencies(scheduled.key)) {
+                        const ReplayChunkId anchorId{dependency.level,
+                            dependency.iz, dependency.iy, dependency.ix};
+                        const ReplayChunkProgressLocation candidate{
+                            index, scheduled.nearestReferenceArcBase};
+                        const auto found =
+                            anchorChunkProgressLocations.find(anchorId);
+                        if (found == anchorChunkProgressLocations.end() ||
+                            candidate.scheduleIndex <
+                                found->second.scheduleIndex) {
+                            anchorChunkProgressLocations[anchorId] = candidate;
                         }
                     }
                 }
+                std::set<ReplayChunkId> expectedAnchors;
+                std::set<ReplayChunkId> expectedPrefixes;
+                for (const auto& [id, location] :
+                     anchorChunkProgressLocations) {
+                    (void)location;
+                    expectedAnchors.insert(id);
+                }
+                for (const auto& [id, location] :
+                     fiberletChunkProgressLocations) {
+                    (void)location;
+                    expectedPrefixes.insert(id);
+                }
+                preprocessingProgress->configure(
+                    std::move(expectedAnchors), std::move(expectedPrefixes));
+                overallProgress.attachPreprocessing(preprocessingProgress);
                 cachedGraph = std::make_unique<
                     vc::fiber_tracer::FiberletCachedReplayGraphSource>(
                     preprocessor, options.paths);

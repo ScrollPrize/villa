@@ -239,6 +239,7 @@ TEST_CASE("Fiberlet sparse dataset generates, publishes, and reuses opaque chunk
     metadata.datasetFingerprint[0] = 12;
     auto dataset = FiberletChunkDataset::createOrOpen(root, metadata);
     std::atomic<int> generated{0};
+    std::atomic<int> generatedResolutions{0};
     auto cache =
         createGeneratedFiberletChunkCache(dataset, [&](FiberletStorageChunkKind kind, const vc::render::ChunkKey&, const FiberletStorageCodecConfig& config) {
             ++generated;
@@ -246,21 +247,43 @@ TEST_CASE("Fiberlet sparse dataset generates, publishes, and reuses opaque chunk
             const auto origin = config.coordinateOriginZYX;
             const std::vector<FiberletStoredAnchor> anchors{{key(origin[0], origin[1], origin[2]), {1, 2, 3}, {1, 0, 0}}};
             return materialized(kind, serializeFiberletAnchors(config, anchors));
+        }, {}, [&](FiberletStorageChunkKind kind, const vc::render::ChunkKey& key,
+                   vc::render::ChunkFetchStatus status) {
+            CHECK(kind == FiberletStorageChunkKind::Anchors);
+            CHECK(key.level == 0);
+            CHECK(key.iz == 1);
+            CHECK(key.iy == 0);
+            CHECK(key.ix == 1);
+            CHECK(status == vc::render::ChunkFetchStatus::Found);
+            ++generatedResolutions;
+            throw std::runtime_error("observer failure must be isolated");
         });
     auto first = cache->getChunkBlocking(0, 1, 0, 1);
     REQUIRE(first.status == vc::render::ChunkStatus::Data);
     CHECK(generated.load() == 1);
+    CHECK(generatedResolutions.load() == 1);
     cache.reset();
 
     auto reopened = FiberletChunkDataset::createOrOpen(root, metadata);
+    std::atomic<int> persistedResolutions{0};
     auto secondCache =
         createGeneratedFiberletChunkCache(reopened, [&](FiberletStorageChunkKind, const vc::render::ChunkKey&, const FiberletStorageCodecConfig&) -> FiberletChunkDataset::MaterializedChunk {
             ++generated;
             throw std::runtime_error("existing chunk should have been reused");
+        }, {}, [&](FiberletStorageChunkKind kind, const vc::render::ChunkKey& key,
+                   vc::render::ChunkFetchStatus status) {
+            CHECK(kind == FiberletStorageChunkKind::Anchors);
+            CHECK(key.level == 0);
+            CHECK(key.iz == 1);
+            CHECK(key.iy == 0);
+            CHECK(key.ix == 1);
+            CHECK(status == vc::render::ChunkFetchStatus::Found);
+            ++persistedResolutions;
         });
     auto second = secondCache->getChunkBlocking(0, 1, 0, 1);
     REQUIRE(second.status == vc::render::ChunkStatus::Data);
     CHECK(generated.load() == 1);
+    CHECK(persistedResolutions.load() == 1);
     const auto firstPayload = std::dynamic_pointer_cast<const FiberletAnchorChunkPayload>(first.payload);
     const auto secondPayload = std::dynamic_pointer_cast<const FiberletAnchorChunkPayload>(second.payload);
     REQUIRE(firstPayload);

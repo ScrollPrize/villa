@@ -1,11 +1,7 @@
-# Task: remove serial full-corridor replay setup
+# Task: show live cached replay preprocessing progress
 
-`vc_fiberlets fiberlet-replay` must not materialize every anchor cell in the
-full reference corridor before starting the cache-backed tracers. A full-fiber
-radius-768 replay currently spends tens of seconds on one core at zero progress
-because dense segment-to-cell expansion is performed serially and then repeated
-for scheduling.
-
-Make cached replay select cache chunks directly, enumerate exact anchor cells
-only inside a requested chunk, and preserve the existing radius, NMS, path
-containment, cache identity, and eager/cached numerical contracts.
+The default `vc_fiberlets fiberlet-replay` progress display must keep elapsed
+time updating while cache work is in progress and must show a useful estimated
+fraction and ETA before the fiberlet graph evaluator advances along the
+reference. This must work for both newly generated and already persisted cache
+chunks and retain the single concise progress line.

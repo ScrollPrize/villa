@@ -1,68 +1,66 @@
-# Plan: remove serial full-corridor replay setup
+# Plan: show live cached replay preprocessing progress
 
-## Selection and scheduling
+## Resolution accounting
 
-1. Extract the exact segment-to-AABB distance calculation into the existing
-   shared fiber geometry module and make the replay tube's R-tree query support
-   exact anchor-cell intersection tests.
-2. Allow cache-backed preprocessing to use an exact anchor-cell predicate in
-   place of a globally materialized sorted cell vector. Enumerate owned cells
-   in canonical Z/Y/X order inside each requested anchor chunk, select them with
-   the shared tube query, and pass them through the existing extraction API's
-   external context expansion so neighboring NMS suppressors remain available
-   while only selected owner-cell anchors are persisted. Retain the existing
-   post-refinement anchor-position predicate as a second exact check.
-3. Build reference schedules directly at storage-chunk resolution. Preserve
-   deterministic arc-based ordering, schedule only chunks intersecting the
-   requested reference interval/radius, and retain the graph's existing lazy
-   cache loading and eviction behavior. Keep the indexed tube point predicate
-   on fiberlet DP interiors, not only endpoints. After progress bookkeeping and
-   callbacks are initialized, submit anchor dependencies and fiberlet chunks
-   through `prefetchScheduled(schedule, 0, schedule.size(), false)` before
-   graph evaluation starts.
-4. Stop collecting anchor cells when constructing the cached replay tube and
-   remove cell-list serialization from its cache identity. Keep the complete
-   canonical clipped reference points, interval semantics, radius, source and
-   algorithm metadata, and a selection-version discriminator identically in
-   both cache identities. Eager extraction and visualization retain their
-   explicit cell lists.
+1. Extend the generated fiberlet chunk-cache helper with an optional resolved-
+   chunk callback carrying chunk kind, key, and final status. Invoke it exactly
+   once for both persisted-cache reads and newly generated chunks, after fetch
+   resolution, without changing payload generation or cache scheduling.
+   Contain observer exceptions separately so they cannot change a successful
+   fetch into a cache error.
+2. Forward resolved anchor and prefix events through the on-demand
+   preprocessor. In the replay CLI, derive the unique expected anchor dependency
+   keys and scheduled fiberlet prefix keys from the existing deterministic
+   schedule. Install expected sets before prefetch begins. Count each successful
+   resolved key at most once under one mutex, including later reloads, and
+   ignore failed or out-of-model keys. Resolution callbacks capture only a
+   shared accounting state, not CLI stack objects; disabling the state makes
+   late worker callbacks harmless.
 
-## Progress and concurrency
+## Overall estimate and repaint
 
-5. Keep hardware concurrency as the CLI default. Ensure setup returns quickly
-   enough for the already-parallel greedy and fiberlet evaluators/cache workers
-   to start; detailed `--stats` output will expose chunk generation while the
-   default remains the single overall progress display.
+3. Give the single overall progress display an explicit preprocessing model.
+   Treat extraction as 95% of tracing work, matching the measured workload
+   where graph traversal is small. Define scheduled cache fraction as
+   `(resolvedAnchors + 16 * resolvedPrefixes) /
+   (expectedAnchors + 16 * expectedPrefixes)`; the 16:1 ratio reflects measured
+   roughly one-second anchor chunks versus roughly 15-20-second fiberlet
+   chunks. Tracing fraction is
+   `0.95 * cacheFraction + 0.05 * min(greedyFraction, fiberletFraction)` for
+   cached replay, or the existing tracer minimum for eager replay. Zero
+   scheduled work has cache fraction one. Clamp and retain every component
+   monotonically, and reserve final completion for actual tracer,
+   visualization, and publication completion. Prefix reach-neighborhood reads
+   outside the scheduled prefetch set and committed route reads remain covered
+   by the final 5% tracer term: they are data-dependent and historically small
+   compared with extraction, so they are deliberately not represented as
+   expected preprocessing keys.
+4. Run a private timer while the concise display is active and repaint at a
+   bounded interval even when no worker callback fires. ETA remains a live
+   elapsed/fraction estimate and may increase while the estimated fraction is
+   stationary. Signal and join the timer without holding the render mutex,
+   then terminate the line; success, error, and destructor shutdown are
+   idempotent and prevent output after the line closes. `--stats` creates no
+   ticker and remains callback-driven and unchanged.
 
 ## Verification
 
-6. Add focused tests comparing predicate-selected and explicit-selected anchor
-   chunks, including a winning suppressor across a storage-chunk boundary.
-   Compare retained bytes and IDs with eager extraction. Assert the scheduled
-   key set is complete against projecting the explicit eager cell population to
-   owner chunks, ordering is deterministic, and nonblocking prefetch submits
-   every anchor dependency and fiberlet chunk. Verify geometry/radius changes
-   change both cache fingerprints and stale chunks are rejected.
-7. Build with RelWithDebInfo and `-j32`; run anchor, storage, replay, and path
-   tests. Compare cached/eager 5,000-base-voxel radius-64 replay artifacts byte
-   for byte.
-8. On the RelWithDebInfo build, run three fresh-cache repetitions of the exact
-   full-fiber Paris4 radius-768 command from the task, recording time to
-   parallel cache/tracer work, wall time, process user+system CPU, effective
-   cores, sampled CPU utilization, and mean/median/min/max. Compare with the
-   reproduced greater-than-20-second serial setup baseline. Use shorter bounded
-   runs if full completion is impractical, but keep command, input, cache state,
-   stop condition, and any limitation explicit.
+5. Add a focused cache test proving resolution callbacks fire for both a newly
+   generated chunk and a persisted cache hit without rerunning the generator,
+   and that observer exceptions cannot alter successful cache results.
+6. Build with `-j32`; run fiberlet storage and replay tests. Run a fresh-cache
+   radius-768 replay under a short timeout and verify the captured default line
+   contains increasing elapsed values, a nonzero estimated percentage, and a
+   finite ETA while CPU work continues. Also verify `--stats` contains no
+   concise timer line and interrupt cleanup leaves one terminated line.
 
 ## Spec update
 
-Document that cache-backed replay stores corridor provenance but discovers
-anchor cells per requested chunk, and that reference scheduling is performed at
-storage-chunk resolution rather than by precomputing the complete anchor-cell
-population.
+Document that concise replay progress incorporates weighted scheduled cache
+resolution and is timer-refreshed; the fraction is an estimate and remains
+monotone, while completion still reflects real workflow completion.
 
 ## Documentation updates
 
-Update `volume-cartographer/docs/fiberlets.md`, the planning changelog, status,
-and task log with the chunk-native selection flow, exactness constraints,
-validation commands, and measured before/after startup behavior.
+Update `volume-cartographer/docs/fiberlets.md`, planning status/task log, and the
+changelog with the estimate, timer behavior, validation, and limitations.

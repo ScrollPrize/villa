@@ -259,8 +259,15 @@ json parseCompletion(const std::filesystem::path& path)
 class GeneratedFetcher final : public vc::render::IChunkFetcher
 {
 public:
-    GeneratedFetcher(std::shared_ptr<FiberletChunkDataset> dataset, FiberletStorageChunkKind kind, FiberletChunkGenerator generator)
-        : dataset_(std::move(dataset)), kind_(kind), generator_(std::move(generator))
+    GeneratedFetcher(
+        std::shared_ptr<FiberletChunkDataset> dataset,
+        FiberletStorageChunkKind kind,
+        FiberletChunkGenerator generator,
+        FiberletChunkResolvedCallback resolved)
+        : dataset_(std::move(dataset))
+        , kind_(kind)
+        , generator_(std::move(generator))
+        , resolved_(std::move(resolved))
     {
     }
 
@@ -271,23 +278,30 @@ public:
             if (auto chunk = dataset_->readMaterializedChunk(kind_, key)) {
                 result.status = vc::render::ChunkFetchStatus::Found;
                 result.payload = std::move(chunk->payload);
-                return result;
+            } else {
+                auto generated = generator_(
+                    kind_, key, dataset_->codecConfig(kind_, key));
+                if (!generated.payload)
+                    throw std::invalid_argument(
+                        "fiberlet generator returned no decoded payload");
+                if (!generated.alreadyPublished)
+                    dataset_->publishMaterializedChunk(kind_, key, generated);
+                result.status = vc::render::ChunkFetchStatus::Found;
+                result.payload = std::move(generated.payload);
             }
-            auto chunk = generator_(
-                kind_, key, dataset_->codecConfig(kind_, key));
-            if (!chunk.payload)
-                throw std::invalid_argument(
-                    "fiberlet generator returned no decoded payload");
-            if (!chunk.alreadyPublished)
-                dataset_->publishMaterializedChunk(kind_, key, chunk);
-            result.status = vc::render::ChunkFetchStatus::Found;
-            result.payload = std::move(chunk.payload);
         } catch (const std::invalid_argument& error) {
             result.status = vc::render::ChunkFetchStatus::DecodeError;
             result.message = error.what();
         } catch (const std::exception& error) {
             result.status = vc::render::ChunkFetchStatus::IoError;
             result.message = error.what();
+        }
+        if (resolved_) {
+            try {
+                resolved_(kind_, key, result.status);
+            } catch (...) {
+                // Progress observers must not alter an already resolved fetch.
+            }
         }
         return result;
     }
@@ -303,6 +317,7 @@ private:
     std::shared_ptr<FiberletChunkDataset> dataset_;
     FiberletStorageChunkKind kind_;
     FiberletChunkGenerator generator_;
+    FiberletChunkResolvedCallback resolved_;
 };
 
 }  // namespace
@@ -784,7 +799,10 @@ void FiberletChunkDataset::validateChunk(FiberletStorageChunkKind kind, const vc
 }
 
 std::shared_ptr<vc::render::ChunkCache> createGeneratedFiberletChunkCache(
-    std::shared_ptr<FiberletChunkDataset> dataset, FiberletChunkGenerator generator, vc::render::ChunkCache::Options options)
+    std::shared_ptr<FiberletChunkDataset> dataset,
+    FiberletChunkGenerator generator,
+    vc::render::ChunkCache::Options options,
+    FiberletChunkResolvedCallback resolved)
 {
     if (!dataset || !generator)
         throw std::invalid_argument("generated fiberlet cache requires a dataset and generator");
@@ -793,12 +811,17 @@ std::shared_ptr<vc::render::ChunkCache> createGeneratedFiberletChunkCache(
     std::vector<std::shared_ptr<vc::render::IChunkFetcher>> fetchers;
     if (dataset->metadata().kind == FiberletDatasetKind::Anchors) {
         levels.push_back({shape, {1, 1, 1}, {}});
-        fetchers.push_back(std::make_shared<GeneratedFetcher>(dataset, FiberletStorageChunkKind::Anchors, generator));
+        fetchers.push_back(std::make_shared<GeneratedFetcher>(
+            dataset, FiberletStorageChunkKind::Anchors, generator, resolved));
     } else {
         levels.push_back({shape, {1, 1, 1}, {}});
         levels.push_back({shape, {1, 1, 1}, {}});
-        fetchers.push_back(std::make_shared<GeneratedFetcher>(dataset, FiberletStorageChunkKind::FiberletPrefix, generator));
-        fetchers.push_back(std::make_shared<GeneratedFetcher>(dataset, FiberletStorageChunkKind::FiberletRoutes, generator));
+        fetchers.push_back(std::make_shared<GeneratedFetcher>(
+            dataset, FiberletStorageChunkKind::FiberletPrefix, generator,
+            resolved));
+        fetchers.push_back(std::make_shared<GeneratedFetcher>(
+            dataset, FiberletStorageChunkKind::FiberletRoutes, generator,
+            resolved));
     }
     options.detectAllFillChunks = false;
     options.persistentCachePath.reset();

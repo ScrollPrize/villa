@@ -3104,13 +3104,22 @@
   search over the complete immutable graph with the shared edge/join objective.
   The greedy evaluator and on-demand graph evaluator run concurrently;
   neither evaluator changes the other one's state.
-- Default replay progress is one command-wide terminal bar. During tracing its
-  fraction is the minimum of the independently monotone greedy and fiberlet
-  reference-arclength fractions. Non-finite values are ignored and stale or
-  restart-local callbacks cannot move either fraction backward. The bar reports
-  elapsed time and ETA, reserves completion for requested visualization and
-  durable bundle publication, terminates its line before result/error output,
-  and never exposes restart-local step counts as global work.
+- Default replay progress is one command-wide terminal bar. Cached replay uses
+  `cache = (resolvedAnchors + 16*resolvedPrefixes) /
+  (expectedAnchors + 16*expectedPrefixes)` over the deterministic scheduled
+  prefetch keys, then uses
+  `trace = 0.95*cache + 0.05*min(greedy,fiberlet)`. Resolution counts generated
+  and persisted chunks identically and deduplicates reloads. Eager replay uses
+  the evaluator minimum directly. Data-dependent reach-neighborhood prefix and
+  committed-route reads are represented by the reserved evaluator term rather
+  than predicted preprocessing keys. All components and the combined fraction
+  are monotone. Non-finite tracer values are ignored and stale or restart-local
+  callbacks cannot move either tracer fraction backward. A 250-millisecond
+  ticker refreshes elapsed time even without worker callbacks. ETA is a live
+  elapsed/fraction estimate and may increase while fraction is stationary. The
+  bar reserves completion for requested visualization and durable bundle
+  publication, terminates its line before result/error output, and never
+  exposes restart-local step counts as global work.
 - `--stats` replaces the concise bar with detailed machine-readable stage,
   chunk, restart, evaluator, cache, visualization, and publication diagnostics.
   It does not change scheduling, generated payloads, tracing, or artifacts.

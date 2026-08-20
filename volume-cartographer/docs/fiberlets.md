@@ -571,11 +571,19 @@ share one decode. `--eager-graph` runs the prior whole-tube graph construction
 for diagnostics.
 
 By default replay prints one terminal progress bar with elapsed time and ETA.
-Its tracing fraction is the minimum monotone reference-arc fraction completed
-by the greedy and fiberlet evaluators, so a fast greedy completion cannot hide
-unfinished graph work. Non-finite, stale, and restart-local callback values
-cannot move it backward. Completion is reserved until requested visualization
-and bundle publication finish.
+For cached replay, scheduled preprocessing contributes 95% of tracing work:
+resolved anchor chunks have weight one and resolved fiberlet prefix chunks have
+weight 16. The remaining 5% is the minimum monotone reference-arc fraction of
+the greedy and fiberlet evaluators. This is an estimate calibrated to measured
+roughly one-second anchor and 15-20-second fiberlet chunks; data-dependent
+neighbor-prefix and committed-route reads remain represented by the tracer
+term. Persisted and newly generated chunks both count, while reloads count only
+once. Eager replay continues to use only the evaluator minimum. A private
+250-millisecond ticker repaints elapsed time even while a long chunk emits no
+callback. ETA is recomputed from live elapsed time and may increase while the
+estimated fraction is stationary. Non-finite, stale, and restart-local tracer
+callbacks cannot move progress backward. Completion remains reserved until
+requested visualization and bundle publication finish.
 
 Pass `--stats` to replace the bar with the detailed machine-readable stage,
 chunk, failure, evaluator, and cache rows. These retain the stable chunk schedule

@@ -841,3 +841,12 @@
   20.06-second cold-cache run consumed 560.16 CPU seconds (27.9 effective
   cores). The 5,000-base-voxel radius-64 replay remained byte-identical and
   completed in 5.90 seconds.
+
+# 2026-08-20: live cached replay progress
+
+- Added generated-or-persisted chunk-resolution accounting to the concise
+  replay progress estimate and a bounded timer repaint so elapsed time, an
+  estimated fraction, and ETA remain live during long cache preprocessing.
+- Isolated progress observer failures from cache results and made ticker and
+  resolution-state shutdown safe for late worker completion. Radius-64 replay
+  output remained byte-identical.

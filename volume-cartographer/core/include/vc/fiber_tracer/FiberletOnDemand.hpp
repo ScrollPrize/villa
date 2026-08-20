@@ -49,6 +49,7 @@ struct FiberletOnDemandConfig {
     vc::render::ChunkCache::Options anchorCacheOptions;
     vc::render::ChunkCache::Options fiberletCacheOptions;
     FiberletOnDemandProgressCallback progress;
+    FiberletChunkResolvedCallback chunkResolved;
 };
 
 struct FiberletScheduledChunk {

@@ -144,8 +144,16 @@ using FiberletChunkGenerator =
         const vc::render::ChunkKey& key,
         const FiberletStorageCodecConfig& config)>;
 
+using FiberletChunkResolvedCallback = std::function<void(
+    FiberletStorageChunkKind kind,
+    const vc::render::ChunkKey& key,
+    vc::render::ChunkFetchStatus status)>;
+
 [[nodiscard]] std::shared_ptr<vc::render::ChunkCache> createGeneratedFiberletChunkCache(
-    std::shared_ptr<FiberletChunkDataset> dataset, FiberletChunkGenerator generator, vc::render::ChunkCache::Options options = {});
+    std::shared_ptr<FiberletChunkDataset> dataset,
+    FiberletChunkGenerator generator,
+    vc::render::ChunkCache::Options options = {},
+    FiberletChunkResolvedCallback resolved = {});
 
 [[nodiscard]] std::shared_ptr<const vc::render::DecodedChunkPayload>
 decodeFiberletChunkPayload(

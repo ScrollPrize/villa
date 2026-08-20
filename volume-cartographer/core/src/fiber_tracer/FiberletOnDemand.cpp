@@ -238,6 +238,14 @@ void FiberletOnDemandPreprocessor::initialize()
     config.anchorCacheOptions.schedulerLane = "fiberlet-anchors";
     config.fiberletCacheOptions.schedulerLane = "fiberlet-paths";
     const std::weak_ptr<FiberletOnDemandPreprocessor> weak = shared_from_this();
+    const auto resolved =
+        [weak](FiberletStorageChunkKind kind,
+               const vc::render::ChunkKey& key,
+               vc::render::ChunkFetchStatus status) {
+            const auto self = weak.lock();
+            if (self && self->state_->config.chunkResolved)
+                self->state_->config.chunkResolved(kind, key, status);
+        };
     state_->anchorCache = createGeneratedFiberletChunkCache(
         state_->anchorDataset,
         [weak](FiberletStorageChunkKind, const vc::render::ChunkKey& key, const FiberletStorageCodecConfig& codec) {
@@ -246,7 +254,8 @@ void FiberletOnDemandPreprocessor::initialize()
                 throw std::runtime_error("on-demand fiberlet preprocessor was destroyed");
             return self->generateAnchorChunk(key, codec);
         },
-        config.anchorCacheOptions);
+        config.anchorCacheOptions,
+        resolved);
     state_->fiberletCache = createGeneratedFiberletChunkCache(
         state_->fiberletDataset,
         [weak](FiberletStorageChunkKind kind, const vc::render::ChunkKey& key, const FiberletStorageCodecConfig& codec) {
@@ -255,7 +264,8 @@ void FiberletOnDemandPreprocessor::initialize()
                 throw std::runtime_error("on-demand fiberlet preprocessor was destroyed");
             return self->generateFiberletChunk(kind, key, codec);
         },
-        config.fiberletCacheOptions);
+        config.fiberletCacheOptions,
+        resolved);
 }
 
 const std::shared_ptr<vc::render::ChunkCache>& FiberletOnDemandPreprocessor::anchorCache() const noexcept
