@@ -57,7 +57,6 @@ class PatchSatisfactionEvaluation:
     quad_shapes: torch.Tensor
     corner_vertex_ids: torch.Tensor
     boundary_flags: torch.Tensor
-    center_scroll_zyxs: torch.Tensor
     center_spiral_zyxs: torch.Tensor
     center_theta: torch.Tensor
     target_raw_shifted: torch.Tensor
@@ -151,6 +150,7 @@ def _patch_aligned_chunks(offsets, chunk_size=PATCH_EVALUATION_CHUNK_SIZE):
         start = end
 
 
+@torch.inference_mode()
 def evaluate_patch_satisfaction_packed(
     slice_to_spiral_transform,
     dr_per_winding,
@@ -169,32 +169,37 @@ def evaluate_patch_satisfaction_packed(
     native_atlas = patch_atlas.satisfaction_atlas(z_begin, z_end)
     layout = native_atlas.packed_layout()
     offsets_np = np.asarray(layout['patch_offsets'], dtype=np.int64)
-    offsets = torch.from_numpy(offsets_np.copy())
+    offsets = torch.from_numpy(offsets_np)
     patch_indices_cpu = torch.from_numpy(
-        np.asarray(layout['patch_indices'], dtype=np.int64).copy())
-    quad_ijs = torch.from_numpy(np.asarray(layout['quad_ijs'], dtype=np.int64).copy())
+        np.asarray(layout['patch_indices'], dtype=np.int64))
+    quad_ijs = torch.from_numpy(np.asarray(layout['quad_ijs'], dtype=np.int64))
     quad_shapes = torch.from_numpy(
-        np.asarray(layout['quad_shapes'], dtype=np.int64).copy())
+        np.asarray(layout['quad_shapes'], dtype=np.int64))
     corners = torch.from_numpy(
-        np.asarray(layout['corner_vertex_ids'], dtype=np.int64).copy())
+        np.asarray(layout['corner_vertex_ids'], dtype=np.int64))
     boundary_cpu = torch.from_numpy(
-        np.asarray(layout['boundary_flags'], dtype=np.uint8).copy()).bool()
+        np.asarray(layout['boundary_flags'], dtype=np.uint8)).bool()
     full_valid_counts = torch.from_numpy(
-        np.asarray(layout['full_valid_counts'], dtype=np.int64).copy())
+        np.asarray(layout['full_valid_counts'], dtype=np.int64))
     patch_indices = patch_indices_cpu.to(device=device)
     boundary = boundary_cpu.to(device=device)
     count = int(offsets_np[-1]) if len(offsets_np) else 0
 
-    corner_zyxs = patch_atlas.vertex_zyxs(corners.to(device=device))
-    center_scroll = corner_zyxs.mean(dim=1)
-    spiral_pieces = []
+    center_scroll = torch.empty(
+        (count, 3), dtype=torch.float32, device=device)
+    center_spiral = torch.empty_like(center_scroll)
     forward_batches = 0
     with torch.no_grad():
         for begin, end in _patch_aligned_chunks(offsets_np):
-            spiral_pieces.append(slice_to_spiral_transform(center_scroll[begin:end]))
+            # Gather four-corner geometry only for this bounded batch.  On a
+            # production atlas the packed corner table can describe hundreds
+            # of millions of references; a full device gather would dominate
+            # peak VRAM even though the model itself is chunked.
+            centers = patch_atlas.vertex_zyxs(
+                corners[begin:end].to(device=device)).mean(dim=1)
+            center_scroll[begin:end] = centers
+            center_spiral[begin:end] = slice_to_spiral_transform(centers)
             forward_batches += 1
-    center_spiral = (torch.cat(spiral_pieces) if spiral_pieces else
-                     torch.empty((0, 3), dtype=torch.float32, device=device))
     theta, radius, shifted = get_theta_and_radii(
         center_spiral[..., 1:], dr_per_winding)
 
@@ -204,9 +209,9 @@ def evaluate_patch_satisfaction_packed(
         float(dr.cpu().item()),
     )
     target_raw_cpu = torch.from_numpy(np.asarray(
-        unwrap['target_raw_shifted'], dtype=np.float32).copy())
+        unwrap['target_raw_shifted'], dtype=np.float32))
     target_winding_cpu = torch.from_numpy(np.asarray(
-        unwrap['target_winding_indices'], dtype=np.int64).copy())
+        unwrap['target_winding_indices'], dtype=np.int64))
     disconnected = np.asarray(unwrap['disconnected_patches'], dtype=np.uint8)
     if verbose:
         for patch_index in np.flatnonzero(disconnected):
@@ -217,23 +222,23 @@ def evaluate_patch_satisfaction_packed(
     target_winding = target_winding_cpu.to(device=device)
     target_set = target_winding >= 0
     safe_target_raw = torch.where(target_set, target_raw, shifted)
-    target_radius = safe_target_raw + theta / (2 * np.pi) * dr
-    target_spiral = torch.stack([
-        center_spiral[..., 0],
-        torch.sin(theta) * target_radius,
-        torch.cos(theta) * target_radius,
-    ], dim=-1)
-    target_scroll_pieces = []
+    scan_residual = torch.empty(count, dtype=torch.float32, device=device)
     inverse_batches = 0
     with torch.no_grad():
         for begin, end in _patch_aligned_chunks(offsets_np):
-            target_scroll_pieces.append(
-                slice_to_spiral_transform.inv(target_spiral[begin:end]))
+            target_radius = (safe_target_raw[begin:end]
+                             + theta[begin:end] / (2 * np.pi) * dr)
+            target_spiral = torch.stack([
+                center_spiral[begin:end, 0],
+                torch.sin(theta[begin:end]) * target_radius,
+                torch.cos(theta[begin:end]) * target_radius,
+            ], dim=-1)
+            target_scroll = slice_to_spiral_transform.inv(target_spiral)
+            scan_residual[begin:end] = torch.linalg.norm(
+                target_scroll - center_scroll[begin:end], dim=-1)
             inverse_batches += 1
-    target_scroll = (torch.cat(target_scroll_pieces) if target_scroll_pieces else
-                     torch.empty_like(center_scroll))
     spiral_residual = (shifted - safe_target_raw).abs()
-    scan_residual = torch.linalg.norm(target_scroll - center_scroll, dim=-1)
+    del center_scroll
 
     patch_count = len(patches)
     roi_counts = offsets[1:] - offsets[:-1]
@@ -304,7 +309,7 @@ def evaluate_patch_satisfaction_packed(
           f'{elapsed:.2f}s')
     return PatchSatisfactionEvaluation(
         profiles, offsets, patch_indices_cpu, quad_ijs, quad_shapes, corners,
-        boundary_cpu, center_scroll, center_spiral, theta, target_raw,
+        boundary_cpu, center_spiral, theta, target_raw,
         target_winding, patch_extents, patch_min, patch_max,
         forward_batches, inverse_batches, elapsed)
 

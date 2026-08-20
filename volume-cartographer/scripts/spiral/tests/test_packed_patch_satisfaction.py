@@ -125,8 +125,9 @@ def test_strict_and_splicing_share_transform_residuals():
     patch = patch_from_centres([[spiral_point(.2, 3.47)]])
     patches = [patch]
     transform = CountingIdentityTransform()
+    trainable_dr = torch.tensor(10.0, requires_grad=True)
     evaluation = evaluate_patch_satisfaction_packed(
-        transform, torch.tensor(10.0), patches,
+        transform, trainable_dr, patches,
         _ListPatchAtlas(patches, torch.device('cpu')),
         -1, 1, include_splicing=True)
     assert transform.forward_calls == 1
