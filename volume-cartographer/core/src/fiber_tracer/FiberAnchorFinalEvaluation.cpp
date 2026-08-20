@@ -29,9 +29,11 @@ template <typename Range>
     for (size_t logicalIndex = 0; logicalIndex < observations.size();
          ++logicalIndex) {
         const auto& observation = observations[logicalIndex];
+        std::array<float, 2> gaussian{};
         for (size_t component = 0; component < activeComponents; ++component) {
-            result.denominators[component] += transverseGaussian<Range>(
+            gaussian[component] = transverseGaussian<Range>(
                 observation, components[component], pivot, config);
+            result.denominators[component] += gaussian[component];
         }
         const uint8_t assigned = assignments[logicalIndex];
         if (!retainedInliers[logicalIndex] || assigned >= activeComponents)
@@ -39,12 +41,11 @@ template <typename Range>
         cv::Vec3f direction;
         if (!usableDirection<Range>(observation, config.presenceFloor, direction))
             continue;
-        const float gaussian = transverseGaussian<Range>(
-            observation, components[assigned], pivot, config);
         const float presence = observation.presence;
         const float dot = direction.dot(components[assigned].axis);
-        result.numerators[assigned] += gaussian * presence * dot * dot;
-        result.presenceMasses[assigned] += gaussian * presence;
+        result.numerators[assigned] +=
+            gaussian[assigned] * presence * dot * dot;
+        result.presenceMasses[assigned] += gaussian[assigned] * presence;
         ++result.assignedCounts[assigned];
     }
     float numeratorTotal = 0.0F;

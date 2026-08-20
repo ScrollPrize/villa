@@ -2,6 +2,7 @@
 #include <doctest/doctest.h>
 
 #include "vc/fiber_tracer/FiberAnchors.hpp"
+#include "vc/fiber_tracer/detail/FiberAnchorPeakGaussian.hpp"
 #include "vc/fiber_tracer/detail/FiberAnchorPeakGrid.hpp"
 #include "vc/fiber_tracer/detail/FiberAnchorSupportStencil.hpp"
 #include "vc/lasagna/Dataset.hpp"
@@ -44,6 +45,7 @@ static_assert(std::is_same_v<
 static_assert(std::is_same_v<
               decltype(vc::fiber_tracer::FiberAnchor::alignedSupport),
               float>);
+
 static_assert(std::is_same_v<
               decltype(vc::fiber_tracer::detail::
                            CompactFiberAnchorObservation::direction),
@@ -369,6 +371,33 @@ TEST_CASE("fiber anchor peak grid layout maps every bounded coordinate directly"
     }
     CHECK_THROWS_AS(FiberAnchorPeakGridLayout{-1}, std::invalid_argument);
     CHECK_THROWS_AS(FiberAnchorPeakGridLayout{129}, std::invalid_argument);
+}
+
+TEST_CASE("fiber anchor peak Gaussian table is bounded and monotonic")
+{
+    namespace detail = vc::fiber_tracer::detail;
+    const auto& table = detail::fiberAnchorPeakGaussianTable();
+    CHECK(table.front() == 1.0F);
+    CHECK(table.back() == std::exp(
+        -detail::kFiberAnchorPeakGaussianTableMaximumExponent));
+    CHECK(std::is_sorted(table.rbegin(), table.rend()));
+
+    float maximumRelativeError = 0.0F;
+    constexpr size_t samples = 100000;
+    for (size_t index = 0; index <= samples; ++index) {
+        const float exponent = static_cast<float>(index) /
+            static_cast<float>(samples) *
+            detail::kFiberAnchorPeakGaussianTableMaximumExponent;
+        const float expected = std::exp(-exponent);
+        const float actual = detail::fiberAnchorPeakGaussian(table, exponent);
+        REQUIRE(actual > 0.0F);
+        maximumRelativeError = std::max(
+            maximumRelativeError, std::abs(actual - expected) / expected);
+    }
+    CHECK(maximumRelativeError < 0.0021F);
+    CHECK(detail::fiberAnchorPeakGaussian(table, 9.0F) == std::exp(-9.0F));
+    CHECK(std::isnan(detail::fiberAnchorPeakGaussian(
+        table, std::numeric_limits<float>::quiet_NaN())));
 }
 
 TEST_CASE("fiber anchor peak response cache stores every computed bit pattern")
@@ -1009,10 +1038,12 @@ TEST_CASE("fiber anchor fit profile separates repeated fitting work")
     CHECK(std::none_of(observations.begin(), observations.end(),
         [](const auto& observation) {
             return observation.presenceGradientValid;
-        }));
+    }));
     vc::fiber_tracer::FiberAnchorFitProfile profile;
+    auto options = config();
+    options.verifySpatialObjective = true;
     const auto result = vc::fiber_tracer::fitFiberCellAnchors(
-        {0, 0, 0}, {0, 0, 0}, {4, 4, 4}, observations, config(),
+        {0, 0, 0}, {0, 0, 0}, {4, 4, 4}, observations, options,
         &profile);
 
     CHECK(result.retainedAnchorCount == 2);
@@ -1033,26 +1064,41 @@ TEST_CASE("fiber anchor fit profile separates repeated fitting work")
           profile.localRefinementAttempts);
     CHECK(profile.backtrackingEvaluations >=
           profile.localRefinementAttempts);
+    CHECK(profile.directCentroidAcceptances == 0);
     CHECK(profile.localTensorObservationVisits > 0);
+    CHECK(profile.robustProposalBufferInitializations ==
+          profile.robustAxisProposalCalls +
+              profile.robustMembershipProposalCalls);
+    CHECK(profile.robustProposalInitializedBytes ==
+          2 * observations.size() *
+              profile.robustProposalBufferInitializations);
+    CHECK(profile.robustEvaluationCopiedBytes == 0);
+    CHECK(profile.robustPreparedObservationRecords == 0);
+    CHECK(profile.robustPreparedObservationRecordBytes == 0);
+    CHECK(profile.robustObservationPreparationWorkSeconds == 0.0);
     CHECK(profile.localCentroidObservationVisits > 0);
+    CHECK(profile.localCentroidIndexedObservationVisits <=
+          profile.localCentroidObservationVisits);
     CHECK(profile.refinedEvaluationObservationVisits > 0);
     CHECK(profile.peakComponents == 2);
     CHECK(profile.peakPreparedResponseObservations > 0);
     CHECK(profile.peakPreparedEvidenceObservations > 0);
     CHECK(profile.peakPreparedEvidenceObservations <
           profile.peakPreparedResponseObservations);
-    CHECK(profile.peakResponseObservationRecordBytes >= 4 * sizeof(float));
-    CHECK(profile.peakEvidenceIndexRecordBytes == sizeof(uint32_t));
-    CHECK(profile.peakEvidenceObservationRecordBytes >= 4 * sizeof(float));
+    CHECK(profile.peakResponseObservationRecordBytes == 3 * sizeof(float));
+    CHECK(profile.peakEvidenceObservationRecordBytes == 8 * sizeof(float));
     CHECK(profile.peakMaximumObservationStorageBytes > 0);
     CHECK(profile.peakGridResponseRequests >=
           profile.peakComputedGridResponses);
     CHECK(profile.peakComputedGridResponses > 0);
     CHECK(profile.peakAcceptanceResponses > 0);
     CHECK(profile.peakResponseObservationVisits > 0);
+    CHECK(profile.peakResponseRadialAcceptances > 0);
+    CHECK(profile.peakResponseRadialAcceptances <=
+          profile.peakResponseObservationVisits);
     CHECK(profile.peakResponseEvidenceObservationVisits > 0);
     CHECK(profile.peakResponseEvidenceObservationVisits <=
-          profile.peakResponseObservationVisits);
+          profile.peakResponseRadialAcceptances);
     CHECK(profile.finalEvaluationObservationVisits == observations.size());
     CHECK(profile.setupWorkSeconds >= 0.0);
     CHECK(profile.seedGenerationWorkSeconds >= 0.0);
@@ -2644,6 +2690,8 @@ TEST_CASE("explicit anchor cells remain sparse and filter refinement before NMS"
           report.profile.sharedSamplingBatches);
     CHECK(report.profile.maximumSamplingBatchVoxels > 0);
     CHECK(report.profile.submittedPredictionVoxels > 0);
+    CHECK(report.profile.sharedObservationVoxels ==
+          report.profile.submittedPredictionVoxels);
     CHECK(report.profile.uniqueTilePredictionVoxels > 0);
     CHECK(report.profile.uniqueTilePredictionVoxels <=
           report.profile.submittedPredictionVoxels);
@@ -2670,6 +2718,8 @@ TEST_CASE("explicit anchor cells remain sparse and filter refinement before NMS"
     CHECK(report.profile.cellProcessingSeconds >= 0.0);
     CHECK(report.profile.coordinateConstructionWorkSeconds >= 0.0);
     CHECK(report.profile.predictionSamplingWorkSeconds >= 0.0);
+    CHECK(report.profile.sharedObservationConstructionWorkSeconds >= 0.0);
+    CHECK(report.profile.tileObservationIndexWorkSeconds >= 0.0);
     CHECK(report.profile.gradientConstructionWorkSeconds >= 0.0);
     CHECK(report.profile.observationConstructionWorkSeconds >= 0.0);
     CHECK(report.profile.fittingWorkSeconds >= 0.0);
@@ -2695,8 +2745,38 @@ TEST_CASE("explicit anchor cells remain sparse and filter refinement before NMS"
     CHECK(report.profile.fit.seedPairs > 0);
     CHECK(report.profile.fit.peakComputedGridResponses > 0);
     CHECK(report.profile.fit.localTensorProposalWorkSeconds > 0.0);
+    CHECK(report.profile.fit.robustAxisProposalCalls > 0);
+    CHECK(report.profile.fit.robustMembershipProposalCalls > 0);
+    CHECK(report.profile.fit.robustAxisEligibleObservationVisits ==
+          report.profile.fit.robustAxisLogicalObservationVisits);
+    CHECK(report.profile.fit.robustAxisIndexedObservationVisits ==
+          report.profile.fit.robustAxisEligibleObservationVisits);
+    CHECK(report.profile.fit.robustAxisCutoffObservationVisits ==
+          report.profile.fit.robustAxisEligibleObservationVisits);
+    CHECK(report.profile.fit.robustMembershipEligibleObservationVisits ==
+          report.profile.fit.robustMembershipLogicalObservationVisits);
+    CHECK(report.profile.fit.robustMembershipIndexedObservationVisits ==
+          report.profile.fit.robustMembershipEligibleObservationVisits);
+    CHECK(report.profile.fit.robustMembershipCutoffObservationVisits ==
+          report.profile.fit.robustMembershipEligibleObservationVisits);
+    CHECK(report.profile.fit.robustPreparedObservationRecords > 0);
+    CHECK(report.profile.fit.robustPreparedObservationRecordBytes == 32);
+    CHECK(report.profile.fit.robustObservationPreparationWorkSeconds >= 0.0);
+    CHECK(report.profile.fit.localTensorObservationVisits ==
+          2 * (report.profile.fit.robustAxisLogicalObservationVisits +
+               report.profile.fit.robustMembershipLogicalObservationVisits));
+    CHECK(report.profile.fit.localTensorProposalWorkSeconds ==
+          doctest::Approx(
+              report.profile.fit.robustAxisProposalWorkSeconds +
+              report.profile.fit.robustMembershipProposalWorkSeconds));
     CHECK(report.profile.fit.localCentroidProposalWorkSeconds > 0.0);
-    CHECK(report.profile.fit.localStateEvaluationWorkSeconds > 0.0);
+    CHECK(report.profile.fit.localCentroidIndexedObservationVisits > 0);
+    CHECK(report.profile.fit.localCentroidIndexedObservationVisits <=
+          report.profile.fit.localCentroidObservationVisits);
+    CHECK(report.profile.fit.backtrackingEvaluations == 0);
+    CHECK(report.profile.fit.directCentroidAcceptances > 0);
+    CHECK(report.profile.fit.refinedEvaluationObservationVisits == 0);
+    CHECK(report.profile.fit.localStateEvaluationWorkSeconds == 0.0);
     CHECK(report.profile.duplicateSuppressionSeconds >= 0.0);
     CHECK(report.profile.elapsedCpuSeconds >= 0.0);
     const auto& initialized = report.diagnosticStages[static_cast<size_t>(

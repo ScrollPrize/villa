@@ -18,7 +18,17 @@ struct CompactFiberAnchorObservation {
     float presence = 0.0F;
     bool valid = false;
     bool presenceGradientValid = false;
+    bool directionUsable = false;
 };
+
+struct CompactFiberAnchorProposalObservation {
+    cv::Vec3f pivotOffsetPredictionXYZ{0.0F, 0.0F, 0.0F};
+    cv::Vec3f direction{0.0F, 0.0F, 0.0F};
+    float presence = 0.0F;
+    uint32_t logicalIndex = 0;
+};
+
+static_assert(sizeof(CompactFiberAnchorProposalObservation) == 32);
 
 struct FiberAnchorObjectiveComponent {
     cv::Vec3f axis{1.0F, 0.0F, 0.0F};
