@@ -146,6 +146,27 @@ def test_parser_accepts_config_and_no_wandb(tmp_path):
     assert args.no_wandb is True
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [("0", (0,)), ("0,1,2,3", (0, 1, 2, 3)), (" 3, 1 ", (3, 1))],
+)
+def test_parse_gpu_ids(text, expected):
+    assert run_single.parse_gpu_ids(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text", ["", " ", ",", "0,", ",0", "0,,1", "-1", "1.5", "gpu0"])
+def test_parse_gpu_ids_rejects_malformed_values(text):
+    with pytest.raises(Exception):
+        run_single.parse_gpu_ids(text)
+
+
+@pytest.mark.parametrize("text", ["0,0", "01,1", "2, 2"])
+def test_parse_gpu_ids_rejects_duplicates(text):
+    with pytest.raises(Exception, match="duplicate"):
+        run_single.parse_gpu_ids(text)
+
+
 def test_parser_no_longer_accepts_overrides(tmp_path):
     with pytest.raises(SystemExit):
         run_single.build_parser().parse_args([
@@ -198,7 +219,7 @@ def _runner_args(tmp_path, *extra):
 def _fake_pipeline_subprocess(calls, *, fail_seed=None):
     def fake_run(command, *, check, env):
         calls.append((command, env))
-        script = Path(command[1]).name
+        script = next(Path(part).name for part in command if part.endswith(".py"))
         if script == "fit_spiral.py":
             output = Path(env["FIT_SPIRAL_OUT_DIR"])
             seed = json.loads(env["FIT_SPIRAL_CONFIG_OVERRIDES"])[
@@ -222,6 +243,72 @@ def _fake_pipeline_subprocess(calls, *, fail_seed=None):
     return fake_run
 
 
+def _pipeline_script(command):
+    return next(Path(part).name for part in command if part.endswith(".py"))
+
+
+def test_omitted_gpus_preserves_direct_fit_and_inherited_visibility(
+    tmp_path, monkeypatch
+):
+    args = _runner_args(tmp_path, "--seeds", "1", "--no-wandb")
+    calls = []
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "5,6")
+    monkeypatch.setattr(
+        run_single.subprocess, "run", _fake_pipeline_subprocess(calls))
+
+    run_single.run(args)
+
+    fit_cmd, fit_env = calls[0]
+    assert fit_cmd[:2] == [
+        run_single.sys.executable,
+        str(run_single.SPIRAL_DIR / "fit_spiral.py"),
+    ]
+    assert all(env["CUDA_VISIBLE_DEVICES"] == "5,6" for _command, env in calls)
+    assert fit_env["CUDA_VISIBLE_DEVICES"] == "5,6"
+
+
+def test_one_gpu_pins_entire_pipeline_without_distributed_launch(
+    tmp_path, monkeypatch
+):
+    args = _runner_args(
+        tmp_path, "--seeds", "1", "--no-wandb", "--gpus", "3")
+    calls = []
+    monkeypatch.setattr(
+        run_single.subprocess, "run", _fake_pipeline_subprocess(calls))
+
+    run_single.run(args)
+
+    assert calls[0][0][:2] == [
+        run_single.sys.executable, str(run_single.SPIRAL_DIR / "fit_spiral.py")]
+    assert all(env["CUDA_VISIBLE_DEVICES"] == "3" for _command, env in calls)
+
+
+def test_multiple_gpus_launch_distributed_fit_and_pin_entire_pipeline(
+    tmp_path, monkeypatch
+):
+    args = _runner_args(
+        tmp_path, "--seeds", "1,2", "--no-wandb", "--gpus", "0,2,3")
+    calls = []
+    monkeypatch.setattr(
+        run_single.subprocess, "run", _fake_pipeline_subprocess(calls))
+
+    run_single.run(args)
+
+    expected_prefix = [
+        run_single.sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc-per-node=3",
+        str(run_single.SPIRAL_DIR / "fit_spiral.py"),
+    ]
+    fit_commands = [command for command, _env in calls
+                    if _pipeline_script(command) == "fit_spiral.py"]
+    assert len(fit_commands) == 2
+    assert all(command[:6] == expected_prefix for command in fit_commands)
+    assert all(env["CUDA_VISIBLE_DEVICES"] == "0,2,3" for _command, env in calls)
+
+
 def test_seeded_run_is_sequential_and_overrides_config_seed(tmp_path, monkeypatch):
     config = _write_json(tmp_path / "config.json", {"optimizer_random_seed": 99})
     args = _runner_args(
@@ -232,11 +319,12 @@ def test_seeded_run_is_sequential_and_overrides_config_seed(tmp_path, monkeypatc
 
     run_single.run(args)
 
-    assert [Path(command[1]).name for command, _env in calls] == [
+    assert [_pipeline_script(command) for command, _env in calls] == [
         "fit_spiral.py", "render_ink.py", "get_ink_metrics.py",
         "fit_spiral.py", "render_ink.py", "get_ink_metrics.py",
     ]
-    fit_envs = [env for command, env in calls if Path(command[1]).name == "fit_spiral.py"]
+    fit_envs = [env for command, env in calls
+                if _pipeline_script(command) == "fit_spiral.py"]
     assert [json.loads(env["FIT_SPIRAL_CONFIG_OVERRIDES"])["optimizer_random_seed"]
             for env in fit_envs] == [3, 1]
     assert [env["FIT_SPIRAL_OUT_DIR"] for env in fit_envs] == [
@@ -269,7 +357,8 @@ def test_seeded_run_fails_fast_without_aggregate(tmp_path, monkeypatch):
         run_single.run(args)
 
     fit_seeds = [json.loads(env["FIT_SPIRAL_CONFIG_OVERRIDES"])["optimizer_random_seed"]
-                 for command, env in calls if Path(command[1]).name == "fit_spiral.py"]
+                 for command, env in calls
+                 if _pipeline_script(command) == "fit_spiral.py"]
     assert fit_seeds == [1, 2]
     assert not (tmp_path / "output" / "aggregate_metrics.json").exists()
 

@@ -45,6 +45,25 @@ def positive_int(value: str) -> int:
     return parsed
 
 
+def parse_gpu_ids(value: str) -> tuple[int, ...]:
+    """Parse a comma-separated list of distinct physical CUDA device ids."""
+    parts = [part.strip() for part in value.split(",")]
+    if not parts or any(not part for part in parts):
+        raise argparse.ArgumentTypeError(
+            "must be a comma-separated list such as 0 or 0,1,2,3")
+    try:
+        gpu_ids = tuple(int(part) for part in parts)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "entries must be non-negative integer device indices") from exc
+    if any(gpu_id < 0 for gpu_id in gpu_ids):
+        raise argparse.ArgumentTypeError(
+            "entries must be non-negative integer device indices")
+    if len(set(gpu_ids)) != len(gpu_ids):
+        raise argparse.ArgumentTypeError("cannot contain duplicate devices")
+    return gpu_ids
+
+
 def parse_seeds(value: str) -> list[int]:
     """Parse a comma-separated list of distinct, non-negative seeds."""
     parts = value.split(",")
@@ -109,6 +128,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="positive per-run CPU thread budget",
     )
     parser.add_argument(
+        "--gpus",
+        type=parse_gpu_ids,
+        metavar="DEVICE[,DEVICE...]",
+        help="physical CUDA devices to use for the entire pipeline; multiple "
+             "devices launch one distributed fit rank per device",
+    )
+    parser.add_argument(
         "--vc-render-bin",
         type=Path,
         default=DEFAULT_VC_RENDER_BIN,
@@ -166,6 +192,13 @@ def _native_thread_env(num_threads: int) -> dict[str, str]:
     }
 
 
+def _set_gpu_visibility(
+    env: dict[str, str], gpu_ids: tuple[int, ...] | None
+) -> None:
+    if gpu_ids is not None:
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu_id) for gpu_id in gpu_ids)
+
+
 def fit_environment(
     overrides: dict,
     output: Path,
@@ -178,8 +211,10 @@ def fit_environment(
     wandb_run_name: str | None = None,
     wandb_group: str | None = None,
     metrics_history: Path | None = None,
+    gpu_ids: tuple[int, ...] | None = None,
 ) -> dict[str, str]:
     env = os.environ.copy()
+    _set_gpu_visibility(env, gpu_ids)
     # The runner owns these controls; do not inherit an unrelated outer fit.
     env.pop("FIT_SPIRAL_CONFIG_OVERRIDES", None)
     env["FIT_SPIRAL_OUT_DIR"] = str(output)
@@ -207,11 +242,35 @@ def fit_environment(
     return env
 
 
-def downstream_environment(num_threads: int | None, *, metrics: bool = False) -> dict[str, str]:
+def downstream_environment(
+    num_threads: int | None,
+    *,
+    metrics: bool = False,
+    gpu_ids: tuple[int, ...] | None = None,
+) -> dict[str, str]:
     env = os.environ.copy()
+    _set_gpu_visibility(env, gpu_ids)
     if num_threads is not None:
         env.update(_native_thread_env(1 if metrics else num_threads))
     return env
+
+
+def fit_command(dataset: Path, gpu_ids: tuple[int, ...] | None) -> list[str]:
+    script_args = [
+        str(SPIRAL_DIR / "fit_spiral.py"),
+        "--dataset",
+        str(dataset),
+    ]
+    if gpu_ids is not None and len(gpu_ids) > 1:
+        return [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            f"--nproc-per-node={len(gpu_ids)}",
+            *script_args,
+        ]
+    return [sys.executable, *script_args]
 
 
 def find_fit_outputs(output: Path) -> tuple[Path, Path]:
@@ -377,12 +436,8 @@ def run_pipeline(
     if seeded:
         output.mkdir(parents=True, exist_ok=False)
 
-    fit_cmd = [
-        sys.executable,
-        str(SPIRAL_DIR / "fit_spiral.py"),
-        "--dataset",
-        str(args.dataset),
-    ]
+    gpu_ids = getattr(args, "gpus", None)
+    fit_cmd = fit_command(args.dataset, gpu_ids)
     subprocess.run(
         fit_cmd,
         check=True,
@@ -397,6 +452,7 @@ def run_pipeline(
             wandb_run_name=seed_run_id,
             wandb_group=wandb_group,
             metrics_history=history_path,
+            gpu_ids=gpu_ids,
         ),
     )
 
@@ -418,7 +474,7 @@ def run_pipeline(
     subprocess.run(
         render_cmd,
         check=True,
-        env=downstream_environment(args.num_threads),
+        env=downstream_environment(args.num_threads, gpu_ids=gpu_ids),
     )
 
     metrics_cmd = [
@@ -431,7 +487,8 @@ def run_pipeline(
     subprocess.run(
         metrics_cmd,
         check=True,
-        env=downstream_environment(args.num_threads, metrics=True),
+        env=downstream_environment(
+            args.num_threads, metrics=True, gpu_ids=gpu_ids),
     )
     if not seeded:
         return [], {}
