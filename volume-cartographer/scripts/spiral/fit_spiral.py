@@ -1164,14 +1164,28 @@ class FitContext:
         self.grad_mag_zarr_path = paths.gradient_magnitude or None
         self.surf_sdt_zarr_path = paths.surf_sdt or None
         self.winding_inference_path = paths.winding_inference or None
-        self.fibers_path = paths.fibers or None
+        self.fibers_path = (
+            None if config['input_disable_fibers'] else (paths.fibers or None))
         self.verified_patches_path = paths.verified_patches or None
         self.unverified_patches_path = paths.unverified_patches or None
         self.shell_path = paths.outer_shell or None
-        self.tracks_dbm_path = paths.tracks_dbm or None
+        self.tracks_dbm_path = (
+            None if config['input_disable_tracks'] else (paths.tracks_dbm or None))
+        disabled_pcl_roles = {
+            role
+            for role, disabled in (
+                ('absolute', config['input_disable_absolute_pcls']),
+                ('relative', config['input_disable_relative_pcls']),
+                ('same_winding', config['input_disable_same_winding_pcls']),
+                ('drawn_control_points',
+                 config['input_disable_drawn_control_points']),
+            )
+            if disabled
+        }
         self.pcl_input_specs = [
             (spec.path, spec.role.value if spec.role is not None else None)
             for spec in paths.pcls
+            if spec.role is None or spec.role.value not in disabled_pcl_roles
         ]
 
         # Deployment/presentation values.

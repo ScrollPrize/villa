@@ -292,6 +292,14 @@ class Config:
         self.patch_sampling_area_exponent = 0.5
         self.patch_erode_patches = 1
         self.input_disable_patches = False
+        # Per-source ablations. Disabled inputs are not loaded, so they cannot
+        # affect attachment, trusted-geometry masking, or any loss term.
+        self.input_disable_tracks = False
+        self.input_disable_fibers = False
+        self.input_disable_absolute_pcls = False
+        self.input_disable_relative_pcls = False
+        self.input_disable_same_winding_pcls = False
+        self.input_disable_drawn_control_points = False
         # When set, only patch directory entries (uuid-named) whose name
         # matches this regex (re.search) are loaded; None loads everything.
         self.patch_uuid_filter_regex = None

@@ -1,0 +1,8 @@
+{
+    "dense_spacing_mode": "winding_model",
+    "sample_count_winding_model_relative_pairs": 96000,
+    "sample_count_winding_model_density_pairs": 96000,
+    "loss_weight_dense_spacing": 24.0,
+    "loss_weight_dense_spacing_density": 24.0,
+    "input_disable_fibers": true
+}

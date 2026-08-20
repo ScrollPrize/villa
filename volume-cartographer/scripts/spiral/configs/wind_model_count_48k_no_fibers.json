@@ -1,0 +1,6 @@
+{
+    "dense_spacing_mode": "winding_model",
+    "sample_count_winding_model_relative_pairs": 48000,
+    "sample_count_winding_model_density_pairs": 48000,
+    "input_disable_fibers": true
+}
