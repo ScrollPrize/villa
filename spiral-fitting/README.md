@@ -473,3 +473,28 @@ For a headless fit, pass the dataset root with `--dataset` and select inference
 mode (plus any independently disabled losses) through
 `FIT_SPIRAL_CONFIG_OVERRIDES`. The dataset's `spiral-scroll.json` and the
 declarative input catalog determine which conventional inputs are resolved.
+
+## Fiber direction samples
+
+The optional fiber-direction loss consumes one packed artifact extracted from a
+remote Lasagna fiber prediction. Extraction downloads only chunks intersecting
+the requested z ROI and keeps the highest-presence voxel in each fixed
+prediction-space cell:
+
+```bash
+./.venv/bin/python fiber_direction_samples.py \
+  https://example/fibers.lasagna.json \
+  /path/to/dataset/fiber_directions.npz \
+  --z-roi 10000,11000 --output-scale 4 \
+  --presence-threshold 160 --cell-size 2
+```
+
+The z ROI is half-open and expressed in the output/fitter coordinate system;
+`--output-scale 4` means one fitter `/2` coordinate is four base `/0` voxels. The
+extractor always covers the fiber volume's complete XY extent.
+
+Set `loss_weight_fiber_directions` above zero to enable the loss. The fitter
+loads the conventional `fiber_directions.npz` artifact and samples
+`sample_count_fiber_direction_points` observations per step. Positions and
+directions constrain only local fitted-sheet orientation; they do not attach a
+sample to a particular winding.

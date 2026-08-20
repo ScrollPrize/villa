@@ -1017,6 +1017,33 @@ def get_radial_normal_in_scroll_space(slice_to_spiral_transform, scroll_zyx, spi
 
 
 
+def get_fiber_direction_loss(transform, samples, num_points, epsilon, device):
+    """Penalize fiber axes that leave the fitted winding tangent plane."""
+    if samples is None or num_points <= 0:
+        return torch.zeros([], device=device)
+    count = len(samples["position_zyx"])
+    # Sampling with replacement avoids constructing a permutation of a
+    # potentially multi-million-point host pool every optimizer step.
+    indices = np.random.randint(0, count, size=num_points)
+    position = torch.as_tensor(samples["position_zyx"][indices], device=device)
+    nx = (torch.as_tensor(samples["nx"][indices], device=device).float() - 128.0) / 127.0
+    ny = (torch.as_tensor(samples["ny"][indices], device=device).float() - 128.0) / 127.0
+    nz = torch.sqrt(torch.clamp(1.0 - nx.square() - ny.square(), min=0.0))
+    direction = torch.stack((nz, ny, nx), dim=-1)
+    direction = direction / direction.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    confidence = torch.as_tensor(
+        samples["presence"][indices], device=device).float() / 255.0
+    normal = get_radial_normal_in_scroll_space(
+        transform, position, epsilon=epsilon)
+    residual = (normal * direction).sum(dim=-1).square()
+    if diagnostics_enabled():
+        with torch.no_grad():
+            spiral = transform(position)
+        record_loss_samples('fiber_directions', spiral, residual)
+    return (residual * confidence).sum() / confidence.sum().clamp(min=1e-8)
+
+
+
 def sample_spiral_surface_frame(dr_per_winding, outer_winding_idx, num_points, z_begin, z_end):
     # Sample points from discrete spiral windings embedded in spiral yx (over the z-ROI) and return
     # each point's orthonormal in-surface frame in spiral space: e1 = z-axis, e2 = the winding tangent.

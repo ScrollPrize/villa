@@ -67,6 +67,7 @@ def _startup_resource_suffix(started_at=None):
 from lasagna_data import (ensure_fit_sparse_stores, prepare_lasagna_volume,
                           prepare_surf_sdt_volume)
 from checkpoint_io import load_checkpoint_cpu
+from fiber_direction_samples import load_fiber_direction_samples
 from influence import make_influence_state, subsample_rows
 from spiral_sampling import load_spiral_sampling
 from tifxyz import load_tifxyz, patch_from_payload
@@ -102,6 +103,7 @@ from sample_spiral import (
 )
 from losses import (
     build_pcl_sampling_strata,
+    get_fiber_direction_loss,
     iter_lasagna_losses,
     get_patch_abs_winding_loss,
     get_patch_and_umbilicus_losses,
@@ -1180,6 +1182,9 @@ class FitContext:
         self.fibers_path = (
             (paths.fibers or None)
             if input_source_enabled(config, 'fibers') else None)
+        self.fiber_directions_path = (
+            (paths.fiber_directions or None)
+            if input_source_enabled(config, 'fiber_directions') else None)
         self.verified_patches_path = (
             (paths.verified_patches or None)
             if input_source_enabled(config, 'verified_patches') else None)
@@ -1506,6 +1511,24 @@ class FitContext:
             scroll_zarr = zarr.open(self.scroll_zarr_path, mode='r')
         else:
             scroll_zarr = None
+
+        progress.begin('loading', 'Loading fiber direction samples')
+        fiber_direction_samples = None
+        if (self.fiber_directions_path
+                and os.path.isfile(self.fiber_directions_path)):
+            fiber_direction_samples = load_fiber_direction_samples(
+                self.fiber_directions_path, self.z_begin, self.z_end)
+        elif self.config['loss_weight_fiber_directions'] > 0:
+            raise RuntimeError(
+                'fiber-direction loss is enabled, but its sample directory '
+                f'is missing: {self.fiber_directions_path!r}')
+        if fiber_direction_samples is not None:
+            print(f'fiber directions: {len(fiber_direction_samples["position_zyx"]):,} '
+                  f'samples in z ROI')
+        elif self.config['loss_weight_fiber_directions'] > 0:
+            raise RuntimeError(
+                f'fiber-direction sample directory contains no points in '
+                f'z ROI [{self.z_begin}, {self.z_end})')
 
         # ==========================================================================
         # Patch loading and ROI filtering
@@ -2081,6 +2104,7 @@ class FitContext:
         # pcl_sampling_strata were assigned above, before the strata build.
         self.umbilicus = umbilicus
         self.scroll_zarr = scroll_zarr
+        self.fiber_direction_samples = fiber_direction_samples
         self.filter_tracks_by_shell = filter_tracks_by_shell
         self.shell_patch = shell_patch
         self.shell_envelope = shell_envelope
@@ -4285,6 +4309,20 @@ class FitContext:
                     for name, value in self.lasagna_volume['store'].last_timings.items()
                 })
 
+        if (self.config['loss_weight_fiber_directions'] > 0
+                and self.fiber_direction_samples is not None):
+            fiber_direction_loss = get_fiber_direction_loss(
+                self.slice_to_spiral_transform,
+                self.fiber_direction_samples,
+                self.config['sample_count_fiber_direction_points'],
+                self.config['fiber_directions_finite_difference_epsilon'],
+                self.dr_per_winding.device,
+            )
+            backward_family({
+                'fiber_directions': fiber_direction_loss
+                * self.config['loss_weight_fiber_directions']
+            })
+
         self._warn_if_sdt_loss_inactive()
         self._warn_if_dense_losses_structurally_disabled()
         if self._winding_model_mode_active():
@@ -4751,6 +4789,7 @@ if __name__ == '__main__':
             'sample_count_unattached_pcls_per_step',
             'sample_count_tracks_per_step',
             'sample_count_dense_normal_points',
+            'sample_count_fiber_direction_points',
             'sample_count_dense_spacing_pairs',
             'sample_count_dense_spacing_density_extra_pairs',
             'sample_count_winding_model_relative_pairs',
