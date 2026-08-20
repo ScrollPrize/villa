@@ -2,11 +2,11 @@
 
 ## Initial findings
 
-- `fiberlet-replay` currently prints setup, extraction, cache-open, every cache
-  chunk, every failure, both evaluator streams, cache statistics,
+- `fiberlet-replay` previously printed setup, extraction, cache-open, every
+  cache chunk, every failure, both evaluator streams, cache statistics,
   visualization, and publication details unconditionally.
-- `--stats` exists but is accepted only for the standalone `paths` command.
-- `fiber-lets2` has three unmerged commits: path-search optimization, anchor
+- `--stats` existed but was accepted only for the standalone `paths` command.
+- `fiber-lets2` had three unmerged commits: path-search optimization, anchor
   extraction optimization, and their durable documentation.
 - The current branch already requires byte-identical eager and float-cache
   replay, so that remains the merge correctness gate.
@@ -36,3 +36,53 @@
   vc_fiberlets` passed. A cold 500-base-voxel default replay printed only the
   progress display and terminal result; a 128-base-voxel `--stats` replay
   retained stage, chunk, evaluator, cache, and terminal rows.
+
+## Merge
+
+- Merged the latest `fiber-lets2` path-search and anchor-extraction
+  optimizations. The shared production functions are used directly by both
+  eager extraction and on-demand cache chunk generation; no separate port or
+  copied implementation is required.
+- Combined the cache branch's sparse per-cell result retention with the newer
+  shared-observation/proposal buffers. Extraction profile version 30 reports
+  both memory-accounting families.
+- The incoming chordal interior-smoothness approximation was intentionally not
+  ported. It changed the objective and failed the bit-exact metric fixture.
+  This checkout requires performance changes to preserve numerics, so the
+  merged corridor and interpolation optimizations retain the existing angular
+  scorer.
+- The incoming direct-centroid mode, nearest-Gaussian lookup, and reordered
+  proposal geometry were also excluded because their own measurements reported
+  route movement. Compact proposal records retain absolute positions and the
+  original subtraction order; centroid updates always use the exact spatial
+  objective and peak weights retain `exp`.
+- The shared-observation, sparse proposal-index, retained-membership,
+  final-Gaussian reuse, corridor-admission, and interpolation-page changes are
+  used by both eager extraction and cache chunk generation without duplicated
+  implementations.
+
+## Validation and measurements
+
+- RelWithDebInfo build: `cmake --build volume-cartographer/build -j32 --target
+  vc_fiberlets test_fiber_anchors test_fiberlet_paths test_fiberlet_storage
+  test_fiber_replay`.
+- Passing suites: 85 anchor cases, 11 storage cases, and 11 replay cases.
+  `test_fiberlet_paths` retains 295 pre-existing bit-pattern fixture failures
+  at line 406 and the pre-existing synthetic lookahead expectation at line
+  1486; the merge introduced no additional loader/schema failure.
+- Workload: Paris4 fiber prediction and Lasagna normals, David fiber
+  `dj_20260805T025256484_000003.json`, first 5,000 base voxels, radius 64, 32
+  threads, three fresh output/cache roots per mode.
+- Eager wall seconds: 3.96, 3.93, 3.90; mean/median 3.93, range 3.90-3.96.
+  Mean process CPU was 98.8 seconds (25.1 effective cores), and peak RSS was
+  1.35 GiB.
+- Cold cached wall seconds: 5.78, 5.78, 5.76; mean 5.77, median 5.78, range
+  5.76-5.78. Mean process CPU was 122.7 seconds (21.3 effective cores), and
+  peak RSS was 0.51 GiB.
+- Relative to the immediately preceding measured 4.43-second eager and
+  7.04-second cold-cache runs, wall time improved about 11% and 18%,
+  respectively.
+- All six `fiber_replay.json` files are byte-identical with SHA-256
+  `9781e00ae129b5fef098246c163ba1f737eca3b8a3fcceba6c90e45087b10a91`.
+  They also match the prior exact cached artifact, confirming that the retained
+  optimizations do not change emitted replay geometry or failures.

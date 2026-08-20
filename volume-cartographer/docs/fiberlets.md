@@ -83,18 +83,47 @@ remains responsible for genuine duplicates.
 
 The retained aligned-evidence centroid is projected onto the plane through the
 cell pivot normal to the updated direction and clamped to the local transverse
-window. Deterministic backtracking changes position only, testing fractions
-`1, 1/2, ...` through the first displacement at or below the configured peak
-grid step. The first strict spatial-objective improvement is accepted;
-otherwise the projected baseline remains. Every sampled lattice site contributes
-the same geometric denominator term while only retained assigned evidence
-contributes positive signal. Because the denominator does not depend on a
-site's presence, direction, assignment, or trim state, rejected observations
-cannot create attractive or repulsive holes in the normalization.
+window. The previous and proposed positions are evaluated with the retained
+spatial objective using deterministic position-only backtracking at fractions
+`1, 1/2, ...` through the first displacement at or below the configured
+peak-grid step. The first strict improvement is accepted; otherwise the
+projected baseline is retained.
+Every sampled lattice site contributes the same geometric denominator term
+while only retained assigned evidence contributes positive signal. Because the
+denominator does not depend on a site's presence, direction, assignment, or
+trim state, rejected observations cannot create attractive or repulsive holes
+in the normalization.
 
 Each additional outer pass recomputes competitive assignments and robust
 inliers from the preceding direction and position update. The default budget
 is one pass.
+
+Compact extraction records retained observation indices per component while
+materializing each robust cutoff. The following centroid update traverses only
+those indices in original logical order; expanded/public fitting retains its
+defensive full-support scan. Worst-case index storage participates in worker
+memory admission.
+
+Compact extraction also evaluates configured direction/presence eligibility
+once per unique sampled voxel. Proposal, centroid, owned-cell initialization,
+and peak fitting reuse that cached result; direct/public observations retain
+defensive validation.
+
+The finite support bounds collected during that same refinement preparation
+are carried into peak Voronoi ownership; peak setup does not rescan the support
+to rediscover identical bounds.
+
+For full-halo production cells, those bounds come directly from the fixed
+support stencil translated by the cell sample origin. Clipped/general ranges
+derive bounds from their actual compact indices.
+
+The following direction-conditioned peak response evaluates its transverse and
+axial Gaussian weights with `exp` after their exact support cutoffs, matching
+the broad direction fit and final support calculations.
+
+Peak preparation constructs denominator geometry for every in-support lattice
+site, but direction validation and positive-evidence fields are evaluated only
+after the site's final retained component assignment is known.
 
 **Anchor quality knob:** `--maximum-iterations` trades extraction speed for
 additional robust reassignment and refinement. Increase it above `1` when
@@ -242,12 +271,17 @@ positions. Worker-local native-corner sets are derived directly from those
 positions, sorted, and
 merged into one deterministic stored-ZYX ordered global union. Required corners
 remain included even when a replay tube excludes the corner itself.
+For the common case where all eight positive-weight interpolation corners lie
+in one sparse `16^3` bitmap page, collection resolves the page once and sets
+the eight local bits as one cell operation. Integer-coordinate, volume-edge,
+and page-crossing cells retain the general per-corner path.
 
-Local corridor membership is an unordered union of continuous float32 segment
-capsules. Because a node belongs to a known curved-domain layer, preparation
-tests one centerline segment adjacent to that layer first. A miss falls back to
-the remaining segments; an immediate hit avoids the complete scan without
-changing the geometric predicate.
+Local corridor membership is the union of the two continuous float32 segment
+capsules incident to the node's curved-domain layer. Points strictly inside the
+layer center's transverse-radius circle are admitted directly; boundary and
+outer-square points test the incoming and outgoing segments. This keeps the
+search tube local to each layer and prevents a distant bend of the same
+candidate from admitting shortcut nodes.
 
 `--batch` is a coordinate-call limit, 65536 by default. It partitions only
 consecutive ranges of the global unique union. The path stage completes all
@@ -774,7 +808,7 @@ sampling, search, and total wall times. Use identical manifests, fiber, options,
 build type, and interval for before/after performance comparisons.
 
 Benchmark and replay extraction also emit a versioned
-`fiberlet_extraction_profile version=20` row. Both commands use the same field
+`fiberlet_extraction_profile version=26` row. Both commands use the same field
 names and units. Replay writes the row to stderr after full tube extraction;
 benchmark writes it to stdout after the existing summary. The row separates:
 
@@ -972,6 +1006,19 @@ Initialization does not rediscover owned observations from this support range.
 It traverses the clipped cell's dense tile rows directly in canonical Z/Y/X
 order after constant-time tile-shape, bounds-containment, and owned-cardinality
 validation. Refinement continues to use the support indices and gradient bytes.
+For compact production fitting, the same initial bounds pass also records the
+ascending logical indices whose immutable validity, direction, and presence
+meet robust-proposal eligibility. Robust axis and membership proposals traverse
+that subset directly, but write assignments and retained state at the original
+full-support indices. Expanded public fitting retains its general traversal.
+The reusable eligibility vector is bounded as worker scratch and included in
+the extraction memory budget.
+Robust axis proposals retain their independent return-value storage, but
+intermediate membership is not copied into fit state because the mandatory
+post-update membership refresh replaces it. That final membership is moved
+into the fit, and final support evaluation updates scalar summaries without
+copying the full membership arrays. The live proposal arrays are included in
+compact fitting worker admission.
 
 Version 20 shares raw prediction samples across bounded exact-union partitions.
 Canonical-order tiles are partitioned conservatively so workloads larger than
@@ -1038,6 +1085,40 @@ separately for seed assignment/tensors/objectives, local tensors/centroids,
 refined-state evaluations, peak preparation/responses, and final evaluation.
 They are logical work counts: an exact broad phase can skip detailed kernel
 calculations without reducing the corresponding visit count.
+Profile version 21 additionally splits robust axis-producing and membership-
+only calls. Its logical counts describe full support, eligible counts describe
+the immutable contributing subset, and indexed/cutoff counts describe physical
+compact-path traversal.
+Profile version 22 reports proposal-buffer initializations and bytes plus any
+membership bytes copied into evaluation state; production copy-elimination
+keeps the latter at zero.
+Profile version 23 stores direction-conditioned peak response geometry in a
+12-byte hot record and signal with sparse 20-byte evidence. Denominator scans
+still visit every response record; numerator and gradient work follows the
+parallel evidence index. Nonzero signal requires evidence, while zero-presence
+evidence remains valid and carries zero signal.
+Profile version 29 removes that dense evidence-index stream. Denominator work
+traverses the 12-byte response records, while numerator and gradient work
+traverses self-contained 32-byte sparse evidence records in original
+observation order. The profile no longer emits an evidence-index record size.
+Profile version 24 reports extraction-wide compact-observation construction
+separately from per-tile shared-index-map construction. Shared observations and
+presence gradients are built once per exact-union prediction voxel instead of
+once per overlapping tile occurrence. Gradient validity at tile boundaries is
+still evaluated per tile, preserving the fitting support seen by each cell.
+Profile version 25 prepares one contiguous 32-byte record for each robust-
+proposal-eligible compact observation in a cell. Records preserve logical
+order and carry their original logical destination, allowing both axis passes
+and final membership to reuse position, normalized direction, and presence
+without repeatedly dereferencing shared observation maps. Full-support fitting
+phases remain unchanged. The profile reports prepared record count/size and
+summed preparation work; these records replace the old eligible-index scratch
+in bounded worker-memory admission.
+Prepared proposal records store the finite absolute position, normalized
+direction, presence, and logical destination for each eligible observation.
+The compact proposal kernel reuses these records while retaining the original
+position-to-pivot and position-to-component arithmetic. Invalid arbitrary input
+is still handled by the checked expanded/detail fitting paths.
 Peak grid-response requests include cache hits;
 `anchor_fit_peak_computed_grid_responses` counts cache misses, while
 `anchor_fit_peak_acceptance_responses` counts uncached subpixel checks. The

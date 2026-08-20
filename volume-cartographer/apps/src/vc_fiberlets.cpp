@@ -921,6 +921,7 @@ void printTubeExtractionProfile(
         fit.localRefinementWorkSeconds + fit.peakSearchWorkSeconds +
         fit.finalEvaluationWorkSeconds;
     const double localProfiledWorkSeconds =
+        fit.robustObservationPreparationWorkSeconds +
         fit.localTensorProposalWorkSeconds +
         fit.localCentroidProposalWorkSeconds +
         fit.localStateEvaluationWorkSeconds;
@@ -934,7 +935,7 @@ void printTubeExtractionProfile(
         return encoded.str();
     };
     output << std::setprecision(17)
-           << "fiberlet_extraction_profile version=21"
+           << "fiberlet_extraction_profile version=30"
            << " anchor_elapsed_seconds=" << extraction.anchors.elapsedSeconds
            << " anchor_cpu_seconds=" << anchor.elapsedCpuSeconds
            << " anchor_profiled_seconds=" << anchorProfiledSeconds
@@ -961,6 +962,8 @@ void printTubeExtractionProfile(
            << anchor.cellResultHandleBytes
            << " anchor_max_raw_interval_bytes="
            << anchor.maximumRawIntervalBytes
+           << " anchor_shared_observation_voxels="
+           << anchor.sharedObservationVoxels
            << " anchor_max_shared_sample_bytes="
            << anchor.maximumSharedSampleBytes
            << " anchor_max_accounted_live_bytes="
@@ -993,8 +996,10 @@ void printTubeExtractionProfile(
            << anchor.coordinateConstructionWorkSeconds
            << " anchor_prediction_sampling_work_seconds="
            << anchor.predictionSamplingWorkSeconds
-           << " anchor_tile_sample_copy_work_seconds="
-           << anchor.tileSampleCopyWorkSeconds
+           << " anchor_shared_observation_construction_work_seconds="
+           << anchor.sharedObservationConstructionWorkSeconds
+           << " anchor_tile_observation_index_work_seconds="
+           << anchor.tileObservationIndexWorkSeconds
            << " anchor_gradient_construction_work_seconds="
            << anchor.gradientConstructionWorkSeconds
            << " anchor_observation_construction_work_seconds="
@@ -1068,8 +1073,40 @@ void printTubeExtractionProfile(
            << depthCounts(fit.spatialCandidatesAcceptedByDepth)
            << " anchor_fit_local_tensor_observation_visits="
            << fit.localTensorObservationVisits
+           << " anchor_fit_robust_axis_proposal_calls="
+           << fit.robustAxisProposalCalls
+           << " anchor_fit_robust_axis_logical_observation_visits="
+           << fit.robustAxisLogicalObservationVisits
+           << " anchor_fit_robust_axis_eligible_observation_visits="
+           << fit.robustAxisEligibleObservationVisits
+           << " anchor_fit_robust_axis_indexed_observation_visits="
+           << fit.robustAxisIndexedObservationVisits
+           << " anchor_fit_robust_axis_cutoff_observation_visits="
+           << fit.robustAxisCutoffObservationVisits
+           << " anchor_fit_robust_membership_proposal_calls="
+           << fit.robustMembershipProposalCalls
+           << " anchor_fit_robust_membership_logical_observation_visits="
+           << fit.robustMembershipLogicalObservationVisits
+           << " anchor_fit_robust_membership_eligible_observation_visits="
+           << fit.robustMembershipEligibleObservationVisits
+           << " anchor_fit_robust_membership_indexed_observation_visits="
+           << fit.robustMembershipIndexedObservationVisits
+           << " anchor_fit_robust_membership_cutoff_observation_visits="
+           << fit.robustMembershipCutoffObservationVisits
+           << " anchor_fit_robust_proposal_buffer_initializations="
+           << fit.robustProposalBufferInitializations
+           << " anchor_fit_robust_proposal_initialized_bytes="
+           << fit.robustProposalInitializedBytes
+           << " anchor_fit_robust_evaluation_copied_bytes="
+           << fit.robustEvaluationCopiedBytes
+           << " anchor_fit_robust_prepared_observation_records="
+           << fit.robustPreparedObservationRecords
+           << " anchor_fit_robust_prepared_observation_record_bytes="
+           << fit.robustPreparedObservationRecordBytes
            << " anchor_fit_local_centroid_observation_visits="
            << fit.localCentroidObservationVisits
+           << " anchor_fit_local_centroid_indexed_observation_visits="
+           << fit.localCentroidIndexedObservationVisits
            << " anchor_fit_refined_evaluation_observation_visits="
            << fit.refinedEvaluationObservationVisits
            << " anchor_fit_peak_components=" << fit.peakComponents
@@ -1081,8 +1118,6 @@ void printTubeExtractionProfile(
            << fit.peakPreparedEvidenceObservations
            << " anchor_fit_peak_response_observation_record_bytes="
            << fit.peakResponseObservationRecordBytes
-           << " anchor_fit_peak_evidence_index_record_bytes="
-           << fit.peakEvidenceIndexRecordBytes
            << " anchor_fit_peak_evidence_observation_record_bytes="
            << fit.peakEvidenceObservationRecordBytes
            << " anchor_fit_peak_maximum_observation_storage_bytes="
@@ -1095,6 +1130,8 @@ void printTubeExtractionProfile(
            << fit.peakAcceptanceResponses
            << " anchor_fit_peak_response_observation_visits="
            << fit.peakResponseObservationVisits
+           << " anchor_fit_peak_response_radial_acceptances="
+           << fit.peakResponseRadialAcceptances
            << " anchor_fit_peak_response_evidence_observation_visits="
            << fit.peakResponseEvidenceObservationVisits
            << " anchor_fit_final_evaluation_observation_visits="
@@ -1110,6 +1147,12 @@ void printTubeExtractionProfile(
            << fit.localRefinementWorkSeconds
            << " anchor_fit_local_tensor_proposal_work_seconds="
            << fit.localTensorProposalWorkSeconds
+           << " anchor_fit_robust_axis_proposal_work_seconds="
+           << fit.robustAxisProposalWorkSeconds
+           << " anchor_fit_robust_membership_proposal_work_seconds="
+           << fit.robustMembershipProposalWorkSeconds
+           << " anchor_fit_robust_observation_preparation_work_seconds="
+           << fit.robustObservationPreparationWorkSeconds
            << " anchor_fit_local_centroid_proposal_work_seconds="
            << fit.localCentroidProposalWorkSeconds
            << " anchor_fit_local_state_evaluation_work_seconds="

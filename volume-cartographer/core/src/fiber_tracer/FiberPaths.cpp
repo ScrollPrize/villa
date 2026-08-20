@@ -822,22 +822,51 @@ std::vector<SearchNode> enumerateLocalNodes(
     maximumActiveLayerNodes = 0;
     if (domain.layers.size() <= 2)
         return nodes;
+    const cv::Vec3f gridUpper{
+        static_cast<float>(grid.shapeZYX[2] - 1),
+        static_cast<float>(grid.shapeZYX[1] - 1),
+        static_cast<float>(grid.shapeZYX[0] - 1),
+    };
     size_t previousLayerNodes = 0;
+    const uint64_t packedLayerSize =
+        static_cast<uint64_t>(layout.transverseWidth) *
+        layout.transverseWidth;
     for (size_t layer = 1; layer + 1 < domain.layers.size(); ++layer) {
         const size_t layerBegin = nodes.size();
+        uint64_t packedKey = static_cast<uint64_t>(layer) * packedLayerSize;
         for (int u = -layout.transverseLimit; u <= layout.transverseLimit; ++u) {
-            for (int v = -layout.transverseLimit; v <= layout.transverseLimit; ++v) {
+            for (int v = -layout.transverseLimit;
+                 v <= layout.transverseLimit; ++v, ++packedKey) {
                 ++profile.latticeNodePositions;
                 const LocalNodeKey key{layer, u, v};
                 const cv::Vec3f point = localNodePoint(domain, key, config);
                 if (!finiteVector(point))
                     throw std::overflow_error("fiberlet local node is not finite as float32");
-                if (!insidePredictionGrid(point, grid) ||
-                    !insideCorridor(
-                        point, corridor.reference, corridor.radiusSquared,
-                        layer - 1,
-                        profile.corridorSegmentTests)) {
+                if (point[0] < 0.0F || point[0] > gridUpper[0] ||
+                    point[1] < 0.0F || point[1] > gridUpper[1] ||
+                    point[2] < 0.0F || point[2] > gridUpper[2]) {
                     continue;
+                }
+                const float transverseU = static_cast<float>(u) *
+                    config.transverseStepPredictionVoxels;
+                const float transverseV = static_cast<float>(v) *
+                    config.transverseStepPredictionVoxels;
+                const float localRadiusSquared =
+                    transverseU * transverseU + transverseV * transverseV;
+                if (!(localRadiusSquared < corridor.radiusSquared)) {
+                    ++profile.corridorSegmentTests;
+                    bool inside = pointSegmentDistanceSquared(
+                        point, corridor.reference[layer - 1],
+                        corridor.reference[layer]) <= corridor.radiusSquared;
+                    if (!inside && layer + 1 < corridor.reference.size()) {
+                        ++profile.corridorSegmentTests;
+                        inside = pointSegmentDistanceSquared(
+                            point, corridor.reference[layer],
+                            corridor.reference[layer + 1]) <=
+                            corridor.radiusSquared;
+                    }
+                    if (!inside)
+                        continue;
                 }
                 ++profile.corridorAcceptedNodes;
                 bool selected = true;
@@ -848,7 +877,7 @@ std::vector<SearchNode> enumerateLocalNodes(
                 if (selected) {
                     SearchNode node;
                     node.point = point;
-                    node.key = packLocalNodeKey(key, layout);
+                    node.key = static_cast<uint32_t>(packedKey);
                     nodes.push_back(node);
                 }
             }
@@ -862,37 +891,55 @@ std::vector<SearchNode> enumerateLocalNodes(
     return nodes;
 }
 
+struct InterpolationCell {
+    Voxel lower{};
+    Voxel upper{};
+    std::array<float, 3> fraction{};
+};
+
+InterpolationCell interpolationCell(
+    const cv::Vec3f& point,
+    const FiberPredictionGridInfo& grid)
+{
+    if (!insidePredictionGrid(point, grid))
+        throw std::out_of_range("fiberlet sample point is outside the prediction volume");
+    InterpolationCell cell;
+    for (size_t axis = 0; axis < 3; ++axis) {
+        cell.lower[axis] = static_cast<int64_t>(std::floor(point[axis]));
+        cell.fraction[axis] =
+            point[axis] - static_cast<float>(cell.lower[axis]);
+    }
+    const std::array<size_t, 3> shapeXYZ{grid.shapeZYX[2], grid.shapeZYX[1], grid.shapeZYX[0]};
+    for (size_t axis = 0; axis < 3; ++axis)
+        cell.upper[axis] = std::min<int64_t>(
+            cell.lower[axis] + 1,
+            static_cast<int64_t>(shapeXYZ[axis] - 1));
+    return cell;
+}
+
 template <typename Callback>
 void forEachInterpolationCorner(
     const cv::Vec3f& point,
     const FiberPredictionGridInfo& grid,
     Callback&& callback)
 {
-    if (!insidePredictionGrid(point, grid))
-        throw std::out_of_range("fiberlet sample point is outside the prediction volume");
-    Voxel lower{};
-    std::array<float, 3> fraction{};
-    for (size_t axis = 0; axis < 3; ++axis) {
-        lower[axis] = static_cast<int64_t>(std::floor(point[axis]));
-        fraction[axis] = point[axis] - static_cast<float>(lower[axis]);
-    }
-    const std::array<size_t, 3> shapeXYZ{grid.shapeZYX[2], grid.shapeZYX[1], grid.shapeZYX[0]};
-    Voxel upper{};
-    for (size_t axis = 0; axis < 3; ++axis)
-        upper[axis] = std::min<int64_t>(lower[axis] + 1, static_cast<int64_t>(shapeXYZ[axis] - 1));
+    const InterpolationCell cell = interpolationCell(point, grid);
     for (int z = 0; z <= 1; ++z) {
-        const float wz = z == 0 ? 1.0F - fraction[2] : fraction[2];
+        const float wz = z == 0 ? 1.0F - cell.fraction[2] : cell.fraction[2];
         if (!(wz > 0.0F))
             continue;
         for (int y = 0; y <= 1; ++y) {
-            const float wy = y == 0 ? 1.0F - fraction[1] : fraction[1];
+            const float wy = y == 0 ? 1.0F - cell.fraction[1] : cell.fraction[1];
             if (!(wy > 0.0F))
                 continue;
             for (int x = 0; x <= 1; ++x) {
-                const float wx = x == 0 ? 1.0F - fraction[0] : fraction[0];
+                const float wx = x == 0 ? 1.0F - cell.fraction[0] : cell.fraction[0];
                 const float weight = wx * wy * wz;
                 if (weight > 0.0F)
-                    callback(Voxel{x == 0 ? lower[0] : upper[0], y == 0 ? lower[1] : upper[1], z == 0 ? lower[2] : upper[2]}, weight);
+                    callback(Voxel{
+                        x == 0 ? cell.lower[0] : cell.upper[0],
+                        y == 0 ? cell.lower[1] : cell.upper[1],
+                        z == 0 ? cell.lower[2] : cell.upper[2]}, weight);
             }
         }
     }
@@ -1209,6 +1256,50 @@ public:
     void insert(const Voxel& voxel)
     {
         const Voxel key = pageKey(voxel);
+        Page* page = findPage(key);
+        setOffset(*page, localOffset(voxel));
+    }
+
+    void insertInterpolationCell(
+        const InterpolationCell& cell,
+        size_t& insertionAttempts)
+    {
+        const bool hasEightCorners =
+            cell.fraction[0] > 0.0F && cell.fraction[1] > 0.0F &&
+            cell.fraction[2] > 0.0F;
+        const Voxel lowerPage = pageKey(cell.lower);
+        if (hasEightCorners && lowerPage == pageKey(cell.upper)) {
+            insertionAttempts += 8;
+            Page* page = findPage(lowerPage);
+            const size_t base = localOffset(cell.lower);
+            for (size_t z : {size_t{0}, size_t{1}}) {
+                for (size_t y : {size_t{0}, size_t{1}}) {
+                    for (size_t x : {size_t{0}, size_t{1}}) {
+                        setOffset(
+                            *page,
+                            base + z * pageSize * pageSize + y * pageSize + x);
+                    }
+                }
+            }
+            return;
+        }
+        for (int z = 0; z <= (cell.fraction[2] > 0.0F ? 1 : 0); ++z) {
+            for (int y = 0; y <= (cell.fraction[1] > 0.0F ? 1 : 0); ++y) {
+                for (int x = 0; x <= (cell.fraction[0] > 0.0F ? 1 : 0); ++x) {
+                    ++insertionAttempts;
+                    insert({
+                        x == 0 ? cell.lower[0] : cell.upper[0],
+                        y == 0 ? cell.lower[1] : cell.upper[1],
+                        z == 0 ? cell.lower[2] : cell.upper[2],
+                    });
+                }
+            }
+        }
+    }
+
+private:
+    Page* findPage(const Voxel& key)
+    {
         Page* page = nullptr;
         if (lastPage_ != nullptr && key == lastKey_) {
             ++samePageHits_;
@@ -1234,14 +1325,20 @@ public:
             lastKey_ = key;
             lastPage_ = page;
         }
-        const size_t offset = localOffset(voxel);
+        return page;
+    }
+
+    void setOffset(Page& page, size_t offset)
+    {
         const uint64_t bit = uint64_t{1} << (offset % 64);
-        uint64_t& word = page->words[offset / 64];
+        uint64_t& word = page.words[offset / 64];
         if ((word & bit) == 0) {
             word |= bit;
             ++uniqueVoxels_;
         }
     }
+
+public:
 
     size_t uniqueVoxels() const noexcept { return uniqueVoxels_; }
     size_t pageCount() const noexcept { return pages_.size(); }
@@ -1321,10 +1418,8 @@ void addInterpolationCorners(
     SparseCornerBitmap& corners,
     size_t& insertionAttempts)
 {
-    forEachInterpolationCorner(point, grid, [&](const Voxel& corner, float) {
-        ++insertionAttempts;
-        corners.insert(corner);
-    });
+    corners.insertInterpolationCell(
+        interpolationCell(point, grid), insertionAttempts);
 }
 
 PreparedCandidate prepareCandidate(
