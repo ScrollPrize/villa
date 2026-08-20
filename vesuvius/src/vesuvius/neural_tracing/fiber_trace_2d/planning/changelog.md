@@ -689,3 +689,13 @@
 - Replaced pair-local raw prediction reuse with bounded exact-union sampling
   partitions. The canonical replay submitted 77% fewer prediction voxels;
   median anchor CPU improved 12.1% and command wall 2.2% with exact artifacts.
+
+# 2026-08-19: fiberlet storage quantization experiment
+
+- Added a one-extraction C++ benchmark for the proposed anchor-position,
+  compact-axis, and per-chunk cost encodings. Endpoint quantization now feeds
+  the regular curved-plane DP rather than attempting to reuse a baseline route.
+- On the canonical Paris4 interval, no quantization added a tracing failure.
+  Maximum Euclidean line separation was 10.15/9.07/11.46 base voxels for
+  position quanta `1/2/4`, 3.56 for compact axes, 5.35 for `uint8` costs, and
+  zero for `uint16` costs; no persistent encoding was selected.

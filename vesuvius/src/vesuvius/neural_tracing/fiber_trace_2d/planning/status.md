@@ -1,9 +1,39 @@
-# Status: merge current fiber-lets2 speed improvements
+# Status: fiberlet storage quantization experiment
 
-- [x] Commit the proposed storage format separately
-- [x] Start the merge and inventory conflicts
-- [x] Clear stale task-local planning conflicts
-- [x] Retain cleanly merged implementation and durable documentation
+- [x] Record the quantization experiment task
+- [x] Draft the implementation and validation plan
+- [x] Independently review the plan against task, specs, and storage proposal
+- [x] Quantize anchors before each distinct geometry DP solve
+- [x] Reuse geometry DP results across cost variants
+- [x] Update the quantization benchmark report
+- [x] Update focused regression tests
+- [x] Update specifications and documentation
 - [x] Build affected targets with 32 jobs
 - [x] Run focused tests
-- [ ] Commit the merge
+- [x] Run and report the canonical Paris4 experiment
+- [x] Update task log and changelog
+- [x] Replace identity-based replay quality with failure and line-distance metrics
+- [x] Rebuild, test, and rerun the canonical benchmark
+- [x] Record the revised quality result
+- [x] Add focused quantization-scenario selection
+- [x] Add baseline/scenario reference-distance distributions
+- [x] Add quality-comparison progress output
+- [x] Review the wide-corridor plan independently
+- [x] Build and run focused tests
+- [ ] Run the full-fiber 768-radius baseline versus P4+D+C8 benchmark
+- [ ] Record and report the wide-corridor result
+- [x] Diagnose wide-corridor single-thread and memory bottlenecks
+- [x] Parallelize deterministic anchor partition preparation
+- [x] Make diagnostics-free cell-result retention sparse
+- [x] Rebuild and run anchor/fiberlet regression tests
+- [ ] Compare bounded radius-768 runtime, CPU use, and peak RSS
+- [x] Extend the single format with float32 and compact encoding profiles
+- [x] Define separate and inline anchor layouts
+- [x] Define the custom-object Zarr metadata and chunk envelope
+- [x] Define bounded adaptive cache publication and strict resume semantics
+- [x] Independently review and harden the float32-cache/Zarr format plan
+- [x] Remove redundant float32-cache fields and specify area-local loading
+- [x] Specify the shared minimal graph adapter and inline completion constraint
+- [ ] Implement the float32 cache profile and Zarr store
+- [ ] Validate cached and uncached graph/replay equivalence
+- [ ] Run the full-fiber radius-768 evaluation from the bounded cache

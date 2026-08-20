@@ -2734,6 +2734,44 @@ TEST_CASE("explicit anchor cells remain sparse and filter refinement before NMS"
     CHECK(occurrenceCount(cellObj, "\nl ") == 1);
 }
 
+TEST_CASE("diagnostics-free anchor extraction preserves final anchors")
+{
+    vc::fiber_tracer::FiberPredictionGridInfo grid{{8, 8, 8}, 1.0};
+    auto value = config();
+    value.localWindowRadiusPredictionVoxels = 2.0;
+    value.parallelThreads = 2;
+    const auto sampler = [](const auto& indices, int, auto& samples) {
+        samples.assign(
+            indices.size(),
+            vc::fiber_tracer::FiberStoredPredictionSample{
+                {1.0, 0.0, 0.0}, 1.0, true});
+    };
+    const std::vector<std::array<size_t, 3>> cells{{0, 0, 0}, {1, 1, 1}};
+    const auto complete = vc::fiber_tracer::extractFiberAnchorsForCells(
+        grid, value, sampler, cells);
+    const auto compact = vc::fiber_tracer::extractFiberAnchorsForCells(
+        grid, value, sampler, cells, {}, {}, false);
+
+    CHECK(compact.diagnostics.totalCells == complete.diagnostics.totalCells);
+    CHECK(compact.diagnostics.oneAnchorCells == complete.diagnostics.oneAnchorCells);
+    CHECK(compact.diagnostics.twoAnchorCells == complete.diagnostics.twoAnchorCells);
+    REQUIRE(compact.nonEmptyCells.size() == complete.nonEmptyCells.size());
+    for (size_t cell = 0; cell < complete.nonEmptyCells.size(); ++cell) {
+        CHECK(compact.nonEmptyCells[cell].cellZYX ==
+              complete.nonEmptyCells[cell].cellZYX);
+        for (size_t component = 0; component < 2; ++component) {
+            const auto& actual = compact.nonEmptyCells[cell].components[component];
+            const auto& expected = complete.nonEmptyCells[cell].components[component];
+            CHECK(actual.retained == expected.retained);
+            CHECK(actual.anchor.positionPredictionXYZ ==
+                  expected.anchor.positionPredictionXYZ);
+            CHECK(actual.anchor.axisXYZ == expected.anchor.axisXYZ);
+        }
+    }
+    for (const auto& stage : compact.diagnosticStages)
+        CHECK(stage.empty());
+}
+
 TEST_CASE("interior anchor cells reuse the canonical support stencil")
 {
     const vc::fiber_tracer::FiberPredictionGridInfo grid{{64, 64, 64}, 1.0};

@@ -204,6 +204,7 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberReplayMetric.cpp
     src/fiber_tracer/PolylineGeometry.cpp
     src/fiber_tracer/FiberTrace.cpp
+    src/fiber_tracer/FiberletQuantization.cpp
 )
 target_link_libraries(vc_fiber_tracer PUBLIC vc_core vc_lasagna)
 if(VC_TESTING)

@@ -2,6 +2,7 @@
 #include "vc/fiber_tracer/FiberGraph.hpp"
 #include "vc/fiber_tracer/FiberPaths.hpp"
 #include "vc/fiber_tracer/FiberReplay.hpp"
+#include "vc/fiber_tracer/FiberletQuantization.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
@@ -34,6 +35,7 @@ enum class Command {
     Anchors,
     AnchorBenchmark,
     Benchmark,
+    QuantizationBenchmark,
     Paths,
     FiberletReplay,
 };
@@ -43,9 +45,20 @@ bool isReplayCommand(Command command)
     return command == Command::FiberletReplay;
 }
 
+bool isQuantizationCommand(Command command)
+{
+    return command == Command::QuantizationBenchmark;
+}
+
+bool usesGraphReplayOptions(Command command)
+{
+    return isReplayCommand(command) || isQuantizationCommand(command);
+}
+
 bool needsPathExtraction(Command command)
 {
-    return command == Command::Paths || command == Command::Benchmark || isReplayCommand(command);
+    return command == Command::Paths || command == Command::Benchmark ||
+           isReplayCommand(command) || isQuantizationCommand(command);
 }
 
 struct CliOptions {
@@ -81,6 +94,8 @@ struct CliOptions {
     double matchRefineSteps = 1.0;
     vc::fiber_tracer::FiberTraceConfig trace;
     vc::fiber_tracer::FiberletGraphReplayConfig graphReplay;
+    int storageChunkSideBaseVoxels = 512;
+    std::optional<std::string> quantizationScenario;
     vc::fiber_tracer::cli::SeenOptions seenTraceOptions;
 };
 
@@ -107,6 +122,9 @@ void usage(const char* executable)
               << "  " << executable << " anchor-benchmark <fiber.lasagna.json-or-url> <fiber.json> [options]\n"
               << "  " << executable
               << " benchmark <fiber.lasagna.json-or-url> <fiber.json>"
+                 " --normal-manifest <lasagna.json-or-url> [options]\n"
+              << "  " << executable
+              << " quantization-benchmark <fiber.lasagna.json-or-url> <fiber.json>"
                  " --normal-manifest <lasagna.json-or-url> [options]\n"
               << "  " << executable
               << " paths <fiber.lasagna.json-or-url> <anchors.json> <output-dir>"
@@ -162,7 +180,9 @@ void usage(const char* executable)
               << "  --match-refine N              forward match refinement in trace steps [1]\n"
               << "  --inference-scaledown-power N prediction scaledown relative to trace voxels [2]\n";
     std::cerr << "  --beam N                      graph replay beam width [16]\n"
-              << "  --lookahead N                 graph replay lookahead edges [3]\n";
+              << "  --lookahead N                 graph replay lookahead edges [3]\n"
+              << "  --storage-chunk-side N        quantization chunk side in base voxels [512]\n"
+              << "  --scenario NAME               quantization scenario; also runs baseline\n";
 }
 
 std::string valueAfter(int& index, int argc, char** argv, const char* name)
@@ -250,6 +270,11 @@ CliOptions parseArgs(int argc, char** argv)
         options.manifestLocation = argv[2];
         options.fiberJson = argv[3];
         firstOption = 4;
+    } else if (command == "quantization-benchmark") {
+        options.command = Command::QuantizationBenchmark;
+        options.manifestLocation = argv[2];
+        options.fiberJson = argv[3];
+        firstOption = 4;
     } else if (command == "fiberlet-replay") {
         if (argc < 5) {
             usage(argv[0]);
@@ -289,9 +314,9 @@ CliOptions parseArgs(int argc, char** argv)
             options.baseVoxelSizeUm = parseDouble(valueAfter(index, argc, argv, "base-voxel-size-um"), "base-voxel-size-um");
         } else if (argument == "--normal-manifest" && needsPathExtraction(options.command)) {
             options.normalManifestLocation = valueAfter(index, argc, argv, "normal-manifest");
-        } else if (argument == "--fail" && isReplayCommand(options.command)) {
+        } else if (argument == "--fail" && usesGraphReplayOptions(options.command)) {
             options.failureThresholdBaseVoxels = parseDouble(valueAfter(index, argc, argv, "fail"), "fail");
-        } else if (argument == "--length" && isReplayCommand(options.command)) {
+        } else if (argument == "--length" && usesGraphReplayOptions(options.command)) {
             options.replayLengthBaseVoxels =
                 parseDouble(valueAfter(index, argc, argv, "length"), "length");
         } else if (argument == "--vis" && isReplayCommand(options.command)) {
@@ -301,9 +326,9 @@ CliOptions parseArgs(int argc, char** argv)
         } else if (argument == "--along" && (isReplayCommand(options.command) || options.command == Command::Benchmark)) {
             options.alongBaseVoxels = parseDouble(valueAfter(index, argc, argv, "along"), "along");
             options.alongSpecified = true;
-        } else if (argument == "--radius" && (isReplayCommand(options.command) || options.command == Command::Benchmark)) {
+        } else if (argument == "--radius" && (usesGraphReplayOptions(options.command) || options.command == Command::Benchmark)) {
             options.radiusBaseVoxels = parseDouble(valueAfter(index, argc, argv, "radius"), "radius");
-        } else if (argument == "--match-refine" && isReplayCommand(options.command)) {
+        } else if (argument == "--match-refine" && usesGraphReplayOptions(options.command)) {
             options.matchRefineSteps = parseDouble(valueAfter(index, argc, argv, "match-refine"), "match-refine");
         } else if (argument == "--inference-scaledown-power" && isReplayCommand(options.command)) {
             options.inferenceScaledownPower =
@@ -384,16 +409,21 @@ CliOptions parseArgs(int argc, char** argv)
                 parseDouble(valueAfter(index, argc, argv, "smoothness-free-angle"), "smoothness-free-angle");
         } else if (argument == "--batch" && needsPathExtraction(options.command)) {
             options.paths.samplingBatchCoordinates = parseInt(valueAfter(index, argc, argv, "batch"), "batch");
-        } else if (argument == "--beam" && options.command == Command::FiberletReplay) {
+        } else if (argument == "--beam" && usesGraphReplayOptions(options.command)) {
             const int value = parseInt(valueAfter(index, argc, argv, "beam"), "beam");
             if (value < 1)
                 fail("--beam must be positive");
             options.graphReplay.beamWidth = static_cast<size_t>(value);
-        } else if (argument == "--lookahead" && options.command == Command::FiberletReplay) {
+        } else if (argument == "--lookahead" && usesGraphReplayOptions(options.command)) {
             const int value = parseInt(valueAfter(index, argc, argv, "lookahead"), "lookahead");
             if (value < 1)
                 fail("--lookahead must be positive");
             options.graphReplay.lookaheadEdges = static_cast<size_t>(value);
+        } else if (argument == "--storage-chunk-side" && isQuantizationCommand(options.command)) {
+            options.storageChunkSideBaseVoxels =
+                parseInt(valueAfter(index, argc, argv, "storage-chunk-side"), "storage-chunk-side");
+        } else if (argument == "--scenario" && isQuantizationCommand(options.command)) {
+            options.quantizationScenario = valueAfter(index, argc, argv, "scenario");
         } else if (
             isReplayCommand(options.command) &&
             vc::fiber_tracer::cli::parseTraceOption(argument, index, argc, argv, options.trace, &options.seenTraceOptions)) {
@@ -440,6 +470,28 @@ CliOptions parseArgs(int argc, char** argv)
         if (!options.writeReplayVisualizations &&
             !options.volumeZarr.empty()) {
             fail("fiber-replay volume strip options are only valid together with --vis");
+        }
+    }
+    if (isQuantizationCommand(options.command)) {
+        if (!(options.failureThresholdBaseVoxels >= 0.0) ||
+            !(options.radiusBaseVoxels > 0.0) ||
+            !(options.matchRefineSteps >= 0.0) ||
+            options.storageChunkSideBaseVoxels <= 0 ||
+            (options.replayLengthBaseVoxels.has_value() &&
+             !(*options.replayLengthBaseVoxels > 0.0))) {
+            fail("quantization-benchmark options are outside their valid range");
+        }
+        if (options.quantizationScenario.has_value()) {
+            const auto scenarios =
+                vc::fiber_tracer::standardFiberletQuantizationScenarios();
+            const bool known = std::any_of(
+                scenarios.begin(), scenarios.end(), [&](const auto& scenario) {
+                    return scenario.name == *options.quantizationScenario;
+                });
+            if (!known) {
+                fail("unknown fiberlet quantization scenario: " +
+                     *options.quantizationScenario);
+            }
         }
     }
     if (options.command == Command::Benchmark &&
@@ -555,6 +607,30 @@ void printFiberletProgress(const vc::fiber_tracer::FiberletPathProgress& progres
     printRateProgress("fiberlet_progress", progress.phase, rateName, progress.completed, progress.total, progress.elapsedSeconds);
 }
 
+void printQuantizationSummary(
+    std::ostream& output,
+    const char* name,
+    const vc::fiber_tracer::FiberletQuantizationSummary& summary)
+{
+    output << ' ' << name << "_count=" << summary.count
+           << ' ' << name << "_min=" << summary.minimum
+           << ' ' << name << "_mean=" << summary.mean
+           << ' ' << name << "_median=" << summary.median
+           << ' ' << name << "_max=" << summary.maximum;
+}
+
+void printQuantizationProgress(
+    const vc::fiber_tracer::FiberletQuantizationProgress& progress)
+{
+    printRateProgress(
+        "fiberlet_quantization_progress",
+        progress.phase + ":" + progress.scenario,
+        "samples_per_second",
+        progress.completed,
+        progress.total,
+        progress.elapsedSeconds);
+}
+
 struct TubeExtractionResult {
     vc::fiber_tracer::FiberReplayTube tube;
     vc::fiber_tracer::FiberAnchorExtractionReport anchors;
@@ -602,7 +678,7 @@ void printTubeExtractionProfile(
         return encoded.str();
     };
     output << std::setprecision(17)
-           << "fiberlet_extraction_profile version=20"
+           << "fiberlet_extraction_profile version=21"
            << " anchor_elapsed_seconds=" << extraction.anchors.elapsedSeconds
            << " anchor_cpu_seconds=" << anchor.elapsedCpuSeconds
            << " anchor_profiled_seconds=" << anchorProfiledSeconds
@@ -625,6 +701,10 @@ void printTubeExtractionProfile(
            << anchor.uniqueTilePredictionVoxels
            << " anchor_reused_prediction_voxels="
            << anchor.reusedPredictionVoxels
+           << " anchor_cell_result_handle_bytes="
+           << anchor.cellResultHandleBytes
+           << " anchor_max_raw_interval_bytes="
+           << anchor.maximumRawIntervalBytes
            << " anchor_max_shared_sample_bytes="
            << anchor.maximumSharedSampleBytes
            << " anchor_max_accounted_live_bytes="
@@ -642,6 +722,10 @@ void printTubeExtractionProfile(
            << " anchor_fit_iterations=" << anchor.fitIterations
            << " anchor_setup_seconds=" << anchor.setupSeconds
            << " anchor_tile_planning_seconds=" << anchor.tilePlanningSeconds
+           << " anchor_interval_preparation_seconds="
+           << anchor.intervalPreparationSeconds
+           << " anchor_interval_preparation_cpu_seconds="
+           << anchor.intervalPreparationCpuSeconds
            << " anchor_cell_processing_seconds=" << anchor.cellProcessingSeconds
            << " anchor_cell_processing_cpu_seconds="
            << anchor.cellProcessingCpuSeconds
@@ -937,7 +1021,8 @@ TubeExtractionResult extractTubeFiberlets(
     const vc::fiber_tracer::FiberPredictionGridInfo& grid,
     const CliOptions& options,
     const vc::fiber_tracer::FiberPredictionField& field,
-    const vc::lasagna::LasagnaNormalSampler& normalSampler)
+    const vc::lasagna::LasagnaNormalSampler& normalSampler,
+    bool retainAnchorDiagnostics = true)
 {
     if (!(endArcBase > beginArcBase))
         throw std::invalid_argument("fiberlet extraction interval must have positive length");
@@ -959,7 +1044,8 @@ TubeExtractionResult extractTubeFiberlets(
                 result.tube.radiusBaseVoxels,
             };
         },
-        printAnchorProgress);
+        printAnchorProgress,
+        retainAnchorDiagnostics);
     result.anchorSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - anchorStart).count();
     result.anchorCpuSeconds = processCpuSeconds() - anchorCpuStart;
 
@@ -1146,6 +1232,170 @@ int main(int argc, char** argv)
                       << " search_effective_cores=" << effectiveCores(extraction.paths.searchCpuSeconds, extraction.paths.searchSeconds)
                       << " total_seconds=" << totalSeconds << " total_cpu_seconds=" << totalCpuSeconds
                       << " total_effective_cores=" << effectiveCores(totalCpuSeconds, totalSeconds) << '\n';
+            printTubeExtractionProfile(std::cout, extraction);
+            return 0;
+        }
+
+        if (options.command == Command::QuantizationBenchmark) {
+            resolveAnchorConfig(options, grid);
+            if (options.corridorRadiusBaseVoxels.has_value()) {
+                options.paths.corridorRadiusPredictionVoxels =
+                    *options.corridorRadiusBaseVoxels / grid.predictionToBaseScale;
+                vc::fiber_tracer::validateFiberletPathConfig(options.paths);
+            }
+            const auto fiber = vc::fiber_tracer::loadFiberJson(options.fiberJson);
+            if (fiber.controlPointLineIndices.empty() ||
+                fiber.controlPointLineIndices.front() >= fiber.linePointsXyzBase.size()) {
+                fail("quantization benchmark fiber has no valid first control point");
+            }
+            const auto reference = vc::fiber_tracer::makePolylineArcGeometry(fiber.linePointsXyzBase);
+            const auto interval = vc::fiber_tracer::selectForwardPolylineArcInterval(
+                reference,
+                fiber.controlPointLineIndices.front(),
+                options.replayLengthBaseVoxels);
+
+            vc::lasagna::LasagnaDatasetOpenOptions normalOptions;
+            normalOptions.workingToBaseScale = grid.predictionToBaseScale;
+            normalOptions.remoteCacheRoot = options.remoteCacheDirectory;
+            const auto normalDataset = vc::lasagna::LasagnaDataset::openLocation(
+                options.normalManifestLocation, normalOptions);
+            const vc::lasagna::LasagnaNormalSampler normalSampler(
+                normalDataset,
+                vc::lasagna::LasagnaNormalSamplerOptions{options.decodedCacheBytes});
+
+            std::cerr << "fiberlet_quantization_stage stage=extraction status=started\n";
+            auto extraction = extractTubeFiberlets(
+                fiber.linePointsXyzBase,
+                interval.beginArc,
+                interval.endArc,
+                options.radiusBaseVoxels,
+                grid,
+                options,
+                field,
+                normalSampler,
+                false);
+            std::cerr << "fiberlet_quantization_stage stage=extraction status=completed"
+                      << " candidates=" << extraction.paths.candidates.size()
+                      << " successful=" << extraction.paths.diagnostics.successfulPaths
+                      << " elapsed_seconds=" << extraction.anchorSeconds + extraction.fiberletSeconds << '\n';
+
+            options.graphReplay.errorThresholdBaseVoxels = options.failureThresholdBaseVoxels;
+            options.graphReplay.matchRefineSteps = options.matchRefineSteps;
+            options.graphReplay.minimumResetAdvanceBaseVoxels =
+                options.paths.longitudinalStepPredictionVoxels * grid.predictionToBaseScale;
+            options.graphReplay.referenceBeginArcBase = interval.beginArc;
+            options.graphReplay.referenceEndArcBase = interval.endArc;
+
+            const auto containmentQuery = extraction.tube.makePredictionContainmentQuery(
+                grid.predictionToBaseScale);
+            size_t geometryDpRuns = 0;
+            const auto pathExtractor = [&](const vc::fiber_tracer::LoadedFiberAnchorArtifact& anchors) {
+                ++geometryDpRuns;
+                std::cerr << "fiberlet_quantization_stage stage=geometry_dp status=started"
+                          << " run=" << geometryDpRuns << '\n';
+                auto paths = vc::fiber_tracer::traceFiberletPaths(
+                    anchors,
+                    grid,
+                    options.paths,
+                    [&](const auto& indices, int threads, auto& samples) {
+                        field.sampleStoredGridBatch(indices, threads, samples);
+                    },
+                    normalSampler,
+                    printFiberletProgress,
+                    [&](const cv::Vec3d& pointPrediction) {
+                        return containmentQuery.containsPredictionPoint(pointPrediction);
+                    });
+                std::cerr << "fiberlet_quantization_stage stage=geometry_dp status=completed"
+                          << " run=" << geometryDpRuns
+                          << " successful=" << paths.diagnostics.successfulPaths
+                          << " elapsed_seconds=" << paths.elapsedSeconds << '\n';
+                return paths;
+            };
+
+            std::cerr << "fiberlet_quantization_stage stage=scenarios status=started\n";
+            const auto reports = vc::fiber_tracer::benchmarkFiberletQuantization(
+                vc::fiber_tracer::LoadedFiberAnchorArtifact{extraction.anchors, {}},
+                extraction.paths,
+                fiber.linePointsXyzBase,
+                normalSampler,
+                grid.predictionToBaseScale,
+                options.graphReplay,
+                pathExtractor,
+                options.storageChunkSideBaseVoxels,
+                options.quantizationScenario,
+                printQuantizationProgress);
+            for (const auto& report : reports) {
+                std::cout << std::setprecision(17)
+                          << "fiberlet_quantization"
+                          << " scenario=" << report.scenario.name
+                          << " valid=" << (report.valid ? "true" : "false")
+                          << " position_quantum_base=" << report.scenario.positionQuantumBaseVoxels
+                          << " compact_axis=" << (report.scenario.compactAxes ? "true" : "false")
+                          << " cost_bits=" << report.scenario.costBits
+                          << " chunk_side_base=" << options.storageChunkSideBaseVoxels
+                          << " position_bits=" << report.anchorPositionBits
+                          << " delta_bits=" << report.anchorDeltaBits
+                          << " anchors=" << report.anchors
+                          << " coincident_groups=" << report.coincidentPositionGroups
+                          << " maximum_variants=" << report.maximumVariants
+                          << " graph_nodes=" << report.graphNodes
+                          << " graph_edges=" << report.graphEdges
+                          << " graph_transitions=" << report.graphTransitions
+                          << " baseline_successful=" << report.baselineSuccessfulFiberlets
+                          << " scenario_successful=" << report.scenarioSuccessfulFiberlets
+                          << " common_successful=" << report.commonSuccessfulFiberlets
+                          << " added_successful=" << report.addedSuccessfulFiberlets
+                          << " removed_successful=" << report.removedSuccessfulFiberlets
+                          << " added_transitions=" << report.addedTransitions
+                          << " removed_transitions=" << report.removedTransitions
+                          << " cost_ordering_inversions=" << report.costOrderingInversions
+                          << " cost_ordering_pairs=" << report.costOrderingPairs
+                          << " chunk_cost_ordering_inversions=" << report.chunkCostOrderingInversions
+                          << " chunk_cost_ordering_pairs=" << report.chunkCostOrderingPairs
+                          << " cost_top_k=" << report.costTopK
+                          << " cost_top_k_agreement=" << report.costTopKAgreement
+                          << " baseline_replay_failures=" << report.baselineReplayFailures
+                          << " replay_failures=" << report.replayFailures
+                          << " replay_failure_delta=" << report.replayFailureDelta
+                          << " replay_completed_fraction=" << report.replayCompletedFraction
+                          << " replay_selected_edges=" << report.replaySelectedEdges
+                          << " line_distance_available=" << (report.lineDistanceAvailable ? "true" : "false")
+                          << " line_distance_samples=" << report.lineDistanceSamples
+                          << " line_distance_invalid_normal_samples=" << report.lineDistanceInvalidNormalSamples
+                          << " maximum_line_distance_base=" << report.maximumLineDistanceBaseVoxels
+                          << " maximum_line_normal_distance_base=" << report.maximumLineNormalDistanceBaseVoxels
+                          << " maximum_line_tangential_distance_base=" << report.maximumLineTangentialDistanceBaseVoxels
+                          << " baseline_reference_invalid_normal_samples=" << report.baselineReferenceInvalidNormalSamples
+                          << " scenario_reference_invalid_normal_samples=" << report.scenarioReferenceInvalidNormalSamples
+                          << " geometry_reference=" << report.geometryReferenceScenario
+                          << " geometry_cost_ordering_inversions=" << report.geometryCostOrderingInversions
+                          << " geometry_cost_ordering_pairs=" << report.geometryCostOrderingPairs
+                          << " geometry_cost_top_k=" << report.geometryCostTopK
+                          << " geometry_cost_top_k_agreement=" << report.geometryCostTopKAgreement
+                          << " geometry_dp_wall_seconds=" << report.geometryDpWallSeconds
+                          << " wall_seconds=" << report.wallSeconds;
+                printQuantizationSummary(std::cout, "position_error_base", report.positionErrorBaseVoxels);
+                printQuantizationSummary(std::cout, "axis_error_degrees", report.axisErrorDegrees);
+                printQuantizationSummary(std::cout, "path_point_error_base", report.pathPointErrorBaseVoxels);
+                printQuantizationSummary(std::cout, "path_length_error_prediction", report.pathLengthErrorPredictionVoxels);
+                printQuantizationSummary(std::cout, "cost_absolute_error", report.costAbsoluteError);
+                printQuantizationSummary(std::cout, "cost_relative_error", report.costRelativeError);
+                printQuantizationSummary(std::cout, "geometry_cost_absolute_error", report.geometryCostAbsoluteError);
+                printQuantizationSummary(std::cout, "geometry_cost_relative_error", report.geometryCostRelativeError);
+                printQuantizationSummary(std::cout, "join_angle_error_degrees", report.joinAngleErrorDegrees);
+                printQuantizationSummary(std::cout, "join_cost_absolute_error", report.joinCostAbsoluteError);
+                printQuantizationSummary(std::cout, "baseline_reference_distance_base", report.baselineReferenceDistanceBaseVoxels);
+                printQuantizationSummary(std::cout, "baseline_reference_normal_distance_base", report.baselineReferenceNormalDistanceBaseVoxels);
+                printQuantizationSummary(std::cout, "baseline_reference_tangential_distance_base", report.baselineReferenceTangentialDistanceBaseVoxels);
+                printQuantizationSummary(std::cout, "scenario_reference_distance_base", report.scenarioReferenceDistanceBaseVoxels);
+                printQuantizationSummary(std::cout, "scenario_reference_normal_distance_base", report.scenarioReferenceNormalDistanceBaseVoxels);
+                printQuantizationSummary(std::cout, "scenario_reference_tangential_distance_base", report.scenarioReferenceTangentialDistanceBaseVoxels);
+                if (!report.reason.empty())
+                    std::cout << " reason=" << std::quoted(report.reason);
+                std::cout << '\n';
+            }
+            std::cerr << "fiberlet_quantization_stage stage=scenarios status=completed"
+                      << " scenarios=" << reports.size() << '\n';
             printTubeExtractionProfile(std::cout, extraction);
             return 0;
         }

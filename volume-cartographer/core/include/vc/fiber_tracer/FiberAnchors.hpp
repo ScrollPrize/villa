@@ -280,6 +280,8 @@ struct FiberAnchorExtractionProfile {
     size_t submittedPredictionVoxels = 0;
     size_t uniqueTilePredictionVoxels = 0;
     size_t reusedPredictionVoxels = 0;
+    size_t cellResultHandleBytes = 0;
+    size_t maximumRawIntervalBytes = 0;
     size_t maximumSharedSampleBytes = 0;
     size_t maximumAccountedLiveBytes = 0;
     size_t candidateObservations = 0;
@@ -294,6 +296,8 @@ struct FiberAnchorExtractionProfile {
     size_t fitIterations = 0;
     double setupSeconds = 0.0;
     double tilePlanningSeconds = 0.0;
+    double intervalPreparationSeconds = 0.0;
+    double intervalPreparationCpuSeconds = 0.0;
     double cellProcessingSeconds = 0.0;
     double cellProcessingCpuSeconds = 0.0;
     double sharedSamplingSeconds = 0.0;
@@ -420,7 +424,8 @@ void validateFiberAnchorConfig(const FiberAnchorConfig& config);
     const FiberStoredPredictionBatchSampler& sampler,
     std::vector<std::array<size_t, 3>> cellsZYX,
     const FiberAnchorRetainPredicate& retainPredicate = {},
-    const FiberAnchorProgressCallback& progressCallback = {});
+    const FiberAnchorProgressCallback& progressCallback = {},
+    bool retainDiagnostics = true);
 
 [[nodiscard]] FiberAnchorExtractionReport extractRefinedFiberAnchorsForCells(
     const FiberPredictionGridInfo& grid,

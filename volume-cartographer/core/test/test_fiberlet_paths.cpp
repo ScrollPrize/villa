@@ -5,6 +5,7 @@
 #include "vc/fiber_tracer/FiberGraph.hpp"
 #include "vc/fiber_tracer/FiberLocalScoring.hpp"
 #include "vc/fiber_tracer/FiberPaths.hpp"
+#include "vc/fiber_tracer/FiberletQuantization.hpp"
 #include "vc/lasagna/ChannelSampler.hpp"
 
 #include <opencv2/imgcodecs.hpp>
@@ -459,6 +460,160 @@ TEST_CASE("fiberlet DP preserves a short pair as one exact transition")
     CHECK(report.lazyNodeScoringMaterializations == 0);
     CHECK(report.lazyNodeScoringCacheHits == 0);
     CHECK(report.interpolatedScoringPoints == 2);
+}
+
+TEST_CASE("fiberlet quantization benchmark evaluates the complete scenario matrix")
+{
+    const auto anchors = twoAnchorArtifact(
+        {1.0, 0.0, 0.0}, {1.0, 0.0, 0.0},
+        {2.5, 4.0, 4.0}, {10.5, 4.0, 4.0});
+    auto config = pathConfig();
+    config.corridorRadiusPredictionVoxels = 0.01F;
+    const ConstantNormalSampler normals;
+    const auto paths = vc::fiber_tracer::traceFiberletPaths(
+        anchors, anchors.report.grid, config, constantPredictions(), normals);
+    vc::fiber_tracer::FiberletGraphReplayConfig replay;
+    replay.errorThresholdBaseVoxels = 100.0;
+    replay.referenceEndArcBase = 16.0;
+    size_t extractionCalls = 0;
+    const auto extractor = [&](const auto& quantizedAnchors) {
+        ++extractionCalls;
+        return vc::fiber_tracer::traceFiberletPaths(
+            quantizedAnchors,
+            quantizedAnchors.report.grid,
+            config,
+            constantPredictions(),
+            normals);
+    };
+
+    const auto reports = vc::fiber_tracer::benchmarkFiberletQuantization(
+        anchors, paths, {{5.0, 8.0, 8.0}, {21.0, 8.0, 8.0}},
+        normals, 2.0, replay, extractor, 512);
+
+    REQUIRE(reports.size() == 16);
+    CHECK(extractionCalls == 7);
+    CHECK(reports.front().scenario.name == "baseline");
+    for (const auto& report : reports) {
+        INFO(report.scenario.name << ": " << report.reason);
+        CHECK(report.valid);
+        CHECK(report.graphEdges == 1);
+        CHECK(report.replayCompletedFraction == doctest::Approx(1.0));
+        CHECK(report.baselineReplayFailures == 0);
+        CHECK(report.replayFailureDelta == static_cast<int64_t>(report.replayFailures));
+        CHECK(report.lineDistanceAvailable);
+        CHECK(report.lineDistanceInvalidNormalSamples == 0);
+    }
+    CHECK(reports.front().replayFailures == 0);
+    CHECK(reports.front().replayFailureDelta == 0);
+    CHECK(reports.front().maximumLineDistanceBaseVoxels == 0.0);
+    CHECK(reports.front().maximumLineNormalDistanceBaseVoxels == 0.0);
+    CHECK(reports.front().maximumLineTangentialDistanceBaseVoxels == 0.0);
+    const auto q1 = std::find_if(reports.begin(), reports.end(), [](const auto& report) {
+        return report.scenario.name == "position_q1";
+    });
+    REQUIRE(q1 != reports.end());
+    CHECK(q1->anchorPositionBits == 16);
+    CHECK(q1->anchorDeltaBits == 8);
+    const auto q2 = std::find_if(reports.begin(), reports.end(), [](const auto& report) {
+        return report.scenario.name == "position_q2";
+    });
+    REQUIRE(q2 != reports.end());
+    CHECK(q2->maximumLineDistanceBaseVoxels == doctest::Approx(1.0));
+    CHECK(q2->maximumLineNormalDistanceBaseVoxels == doctest::Approx(0.0));
+    CHECK(q2->maximumLineTangentialDistanceBaseVoxels == doctest::Approx(1.0));
+}
+
+TEST_CASE("fiberlet quantization benchmark selects one scenario and reports reference distances")
+{
+    const auto anchors = twoAnchorArtifact(
+        {1.0, 0.0, 0.0}, {1.0, 0.0, 0.0},
+        {2.5, 4.0, 4.0}, {10.5, 4.0, 4.0});
+    auto config = pathConfig();
+    config.corridorRadiusPredictionVoxels = 0.01F;
+    const ConstantNormalSampler normals;
+    const auto paths = vc::fiber_tracer::traceFiberletPaths(
+        anchors, anchors.report.grid, config, constantPredictions(), normals);
+    vc::fiber_tracer::FiberletGraphReplayConfig replay;
+    replay.errorThresholdBaseVoxels = 100.0;
+    replay.referenceEndArcBase = 16.0;
+    size_t extractionCalls = 0;
+    std::vector<vc::fiber_tracer::FiberletQuantizationProgress> progress;
+    const auto reports = vc::fiber_tracer::benchmarkFiberletQuantization(
+        anchors,
+        paths,
+        {{5.0, 8.0, 8.0}, {21.0, 8.0, 8.0}},
+        normals,
+        2.0,
+        replay,
+        [&](const auto& quantizedAnchors) {
+            ++extractionCalls;
+            return vc::fiber_tracer::traceFiberletPaths(
+                quantizedAnchors,
+                quantizedAnchors.report.grid,
+                config,
+                constantPredictions(),
+                normals);
+        },
+        512,
+        "combined_q4_axis_cost_u8",
+        [&](const auto& update) { progress.push_back(update); });
+
+    REQUIRE(reports.size() == 2);
+    CHECK(extractionCalls == 1);
+    CHECK(reports[0].scenario.name == "baseline");
+    CHECK(reports[1].scenario.name == "combined_q4_axis_cost_u8");
+    for (const auto& report : reports) {
+        INFO(report.scenario.name << ": " << report.reason);
+        REQUIRE(report.valid);
+        CHECK(report.baselineReferenceDistanceBaseVoxels.count > 0);
+        CHECK(report.scenarioReferenceDistanceBaseVoxels.count > 0);
+        CHECK(report.baselineReferenceDistanceBaseVoxels.median >= 0.0);
+        CHECK(report.scenarioReferenceDistanceBaseVoxels.median >= 0.0);
+        CHECK(report.baselineReferenceInvalidNormalSamples == 0);
+        CHECK(report.scenarioReferenceInvalidNormalSamples == 0);
+    }
+    REQUIRE_FALSE(progress.empty());
+    CHECK(progress.front().phase == "reference_distance");
+    CHECK(progress.front().scenario == "baseline");
+    CHECK(progress.front().completed == 0);
+    CHECK(progress.front().total > 0);
+    CHECK(progress.back().completed == progress.back().total);
+}
+
+TEST_CASE("fiberlet quantization rejects more than two coordinate variants")
+{
+    auto anchors = chainAnchorArtifact();
+    anchors.report.nonEmptyCells[0].components[0].anchor.positionPredictionXYZ[0] = 2.05F;
+    anchors.report.nonEmptyCells[1].components[0].anchor.positionPredictionXYZ[0] = 2.10F;
+    anchors.report.nonEmptyCells[2].components[0].anchor.positionPredictionXYZ[0] = 2.15F;
+    const ConstantNormalSampler normals;
+    auto config = pathConfig();
+    config.cellRadius = 8;
+    const auto paths = vc::fiber_tracer::traceFiberletPaths(
+        anchors, anchors.report.grid, config, constantPredictions(), normals);
+    vc::fiber_tracer::FiberletGraphReplayConfig replay;
+    replay.errorThresholdBaseVoxels = 100.0;
+    replay.referenceEndArcBase = 47.0;
+    size_t extractionCalls = 0;
+    const auto extractor = [&](const auto& quantizedAnchors) {
+        ++extractionCalls;
+        return vc::fiber_tracer::traceFiberletPaths(
+            quantizedAnchors,
+            quantizedAnchors.report.grid,
+            config,
+            constantPredictions(),
+            normals);
+    };
+    const auto reports = vc::fiber_tracer::benchmarkFiberletQuantization(
+        anchors, paths, {{4.1, 8.0, 8.0}, {52.0, 8.0, 8.0}},
+        normals, 2.0, replay, extractor);
+    const auto q4 = std::find_if(reports.begin(), reports.end(), [](const auto& report) {
+        return report.scenario.name == "position_q4";
+    });
+    REQUIRE(q4 != reports.end());
+    CHECK_FALSE(q4->valid);
+    CHECK(q4->reason.find("more than two variants") != std::string::npos);
+    CHECK(extractionCalls < 7);
 }
 
 TEST_CASE("fiberlet DP enforces a strict sampled fiber-direction bound")

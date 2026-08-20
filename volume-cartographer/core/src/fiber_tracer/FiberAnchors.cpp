@@ -2820,7 +2820,8 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
     std::vector<std::array<size_t, 3>> explicitCells,
     const FiberAnchorRetainPredicate& retainPredicate,
     const FiberAnchorProgressCallback& progressCallback,
-    bool refinedOnly = false)
+    bool refinedOnly = false,
+    bool retainDiagnostics = true)
 {
     validateFiberAnchorConfig(config);
     if (!sampler)
@@ -3204,100 +3205,89 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                 return left.cells.front() < right.cells.front();
             });
         const auto exactTileSampleUnion = [&]() {
-            std::vector<size_t> zBoundaries;
-            zBoundaries.reserve(2 * tiles.size());
-            for (const auto& tile : tiles) {
-                zBoundaries.push_back(tile.sampleBegin[0]);
-                zBoundaries.push_back(tile.sampleEnd[0]);
-            }
-            std::sort(zBoundaries.begin(), zBoundaries.end());
-            zBoundaries.erase(
-                std::unique(zBoundaries.begin(), zBoundaries.end()),
-                zBoundaries.end());
-
-            size_t unionVoxels = 0;
-            for (size_t zIndex = 0;
-                 zIndex + 1 < zBoundaries.size(); ++zIndex) {
-                const size_t zBegin = zBoundaries[zIndex];
-                const size_t zEnd = zBoundaries[zIndex + 1];
-                std::vector<const Tile*> zTiles;
-                std::vector<size_t> yBoundaries;
-                for (const auto& tile : tiles) {
-                    if (tile.sampleBegin[0] > zBegin ||
-                        tile.sampleEnd[0] < zEnd) {
-                        continue;
-                    }
-                    zTiles.push_back(&tile);
-                    yBoundaries.push_back(tile.sampleBegin[1]);
-                    yBoundaries.push_back(tile.sampleEnd[1]);
-                }
-                std::sort(yBoundaries.begin(), yBoundaries.end());
-                yBoundaries.erase(
-                    std::unique(yBoundaries.begin(), yBoundaries.end()),
-                    yBoundaries.end());
-
-                size_t unionArea = 0;
-                for (size_t yIndex = 0;
-                     yIndex + 1 < yBoundaries.size(); ++yIndex) {
-                    const size_t yBegin = yBoundaries[yIndex];
-                    const size_t yEnd = yBoundaries[yIndex + 1];
-                    std::vector<std::pair<size_t, size_t>> xIntervals;
-                    for (const Tile* tile : zTiles) {
-                        if (tile->sampleBegin[1] <= yBegin &&
-                            tile->sampleEnd[1] >= yEnd) {
-                            xIntervals.emplace_back(
-                                tile->sampleBegin[2],
-                                tile->sampleEnd[2]);
-                        }
-                    }
-                    std::sort(xIntervals.begin(), xIntervals.end());
-                    size_t coveredX = 0;
-                    if (!xIntervals.empty()) {
-                        size_t intervalBegin = xIntervals.front().first;
-                        size_t intervalEnd = xIntervals.front().second;
-                        for (size_t interval = 1;
-                             interval < xIntervals.size(); ++interval) {
-                            if (xIntervals[interval].first <= intervalEnd) {
-                                intervalEnd = std::max(
-                                    intervalEnd,
-                                    xIntervals[interval].second);
+            const size_t zBegin = std::min_element(
+                tiles.begin(), tiles.end(), [](const auto& left, const auto& right) {
+                    return left.sampleBegin[0] < right.sampleBegin[0];
+                })->sampleBegin[0];
+            const size_t zEnd = std::max_element(
+                tiles.begin(), tiles.end(), [](const auto& left, const auto& right) {
+                    return left.sampleEnd[0] < right.sampleEnd[0];
+                })->sampleEnd[0];
+            struct RowInterval {
+                size_t y = 0;
+                size_t xBegin = 0;
+                size_t xEnd = 0;
+            };
+            std::vector<size_t> unionByZ(zEnd - zBegin, 0);
+            std::vector<std::exception_ptr> errors(zEnd - zBegin);
+            std::atomic<size_t> nextZ{0};
+            const size_t workerCount = std::min(
+                static_cast<size_t>(config.parallelThreads), zEnd - zBegin);
+            const auto worker = [&]() {
+                while (true) {
+                    const size_t localZ = nextZ.fetch_add(1);
+                    if (localZ >= unionByZ.size())
+                        return;
+                    try {
+                        const size_t z = zBegin + localZ;
+                        std::vector<RowInterval> intervals;
+                        for (const auto& tile : tiles) {
+                            if (z < tile.sampleBegin[0] ||
+                                z >= tile.sampleEnd[0]) {
                                 continue;
                             }
-                            coveredX += intervalEnd - intervalBegin;
-                            intervalBegin = xIntervals[interval].first;
-                            intervalEnd = xIntervals[interval].second;
+                            for (size_t y = tile.sampleBegin[1];
+                                 y < tile.sampleEnd[1]; ++y) {
+                                intervals.push_back({
+                                    y, tile.sampleBegin[2], tile.sampleEnd[2]});
+                            }
                         }
-                        coveredX += intervalEnd - intervalBegin;
+                        std::sort(intervals.begin(), intervals.end(),
+                            [](const auto& left, const auto& right) {
+                                return std::tie(left.y, left.xBegin, left.xEnd) <
+                                    std::tie(right.y, right.xBegin, right.xEnd);
+                            });
+                        size_t covered = 0;
+                        size_t mergedCount = 0;
+                        for (const auto& interval : intervals) {
+                            if (mergedCount != 0) {
+                                auto& previous = intervals[mergedCount - 1];
+                                if (previous.y == interval.y &&
+                                    interval.xBegin <= previous.xEnd) {
+                                    previous.xEnd = std::max(
+                                        previous.xEnd, interval.xEnd);
+                                    continue;
+                                }
+                            }
+                            intervals[mergedCount++] = interval;
+                        }
+                        for (size_t index = 0; index < mergedCount; ++index) {
+                            covered = checkedAdd(
+                                covered,
+                                intervals[index].xEnd - intervals[index].xBegin,
+                                "fiber anchor tile union area");
+                        }
+                        unionByZ[localZ] = covered;
+                    } catch (...) {
+                        errors[localZ] = std::current_exception();
                     }
-                    const size_t yExtent = yEnd - yBegin;
-                    if (coveredX != 0 &&
-                        yExtent >
-                            std::numeric_limits<size_t>::max() / coveredX) {
-                        throw std::overflow_error(
-                            "fiber anchor tile union area overflows");
-                    }
-                    const size_t stripArea = yExtent * coveredX;
-                    if (unionArea >
-                        std::numeric_limits<size_t>::max() - stripArea) {
-                        throw std::overflow_error(
-                            "fiber anchor tile union area overflows");
-                    }
-                    unionArea += stripArea;
                 }
-                const size_t zExtent = zEnd - zBegin;
-                if (unionArea != 0 &&
-                    zExtent >
-                        std::numeric_limits<size_t>::max() / unionArea) {
-                    throw std::overflow_error(
-                        "fiber anchor tile union volume overflows");
-                }
-                const size_t slabVoxels = zExtent * unionArea;
-                if (unionVoxels >
-                    std::numeric_limits<size_t>::max() - slabVoxels) {
-                    throw std::overflow_error(
-                        "fiber anchor tile union volume overflows");
-                }
-                unionVoxels += slabVoxels;
+            };
+            std::vector<std::thread> workers;
+            workers.reserve(workerCount);
+            for (size_t workerIndex = 0; workerIndex < workerCount; ++workerIndex)
+                workers.emplace_back(worker);
+            for (auto& thread : workers)
+                thread.join();
+            for (const auto& error : errors) {
+                if (error)
+                    std::rethrow_exception(error);
+            }
+            size_t unionVoxels = 0;
+            for (const size_t covered : unionByZ) {
+                unionVoxels = checkedAdd(
+                    unionVoxels, covered,
+                    "fiber anchor tile union volume");
             }
             return unionVoxels;
         };
@@ -3421,9 +3411,18 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
         report.profile.tilePlanningSeconds += std::chrono::duration<double>(
             std::chrono::steady_clock::now() - tilePlanningStart).count();
 
-        std::vector<std::optional<FiberCellAnchorResult>> jobResults(
+        std::vector<std::unique_ptr<FiberCellAnchorResult>> jobResults(
             requestedCells.size());
         std::vector<std::exception_ptr> jobErrors(requestedCells.size());
+        report.profile.cellResultHandleBytes += checkedAdd(
+            checkedMultiply(
+                jobResults.capacity(),
+                sizeof(std::unique_ptr<FiberCellAnchorResult>),
+                "fiber anchor result handles"),
+            checkedMultiply(
+                jobErrors.capacity(), sizeof(std::exception_ptr),
+                "fiber anchor error handles"),
+            "fiber anchor cell-result handles");
         struct WorkerProfile {
             size_t candidateObservations = 0;
             size_t retainedObservations = 0;
@@ -3434,6 +3433,12 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             size_t gradientComputations = 0;
             size_t validGradientComputations = 0;
             size_t fitIterations = 0;
+            size_t retainPredicateCalls = 0;
+            size_t emptyComponents = 0;
+            size_t degenerateComponents = 0;
+            size_t belowSupportComponents = 0;
+            size_t mergedComponentPairs = 0;
+            size_t outsideSelectionComponents = 0;
             double coordinateConstructionSeconds = 0.0F;
             double predictionSamplingSeconds = 0.0F;
             double tileSampleCopySeconds = 0.0F;
@@ -3595,6 +3600,59 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             return result;
         };
 
+        const auto prepareSparseCellResult = [&]
+            (FiberCellAnchorResult& cell,
+             bool tallyCell,
+             WorkerProfile& workerProfile) {
+            if (tallyCell && retainPredicate) {
+                for (auto& component : cell.components) {
+                    if (!component.retained)
+                        continue;
+                    ++workerProfile.retainPredicateCalls;
+                    const FiberAnchorRetainEvaluation evaluation =
+                        retainPredicate(component.anchor);
+                    if (!evaluation.retained &&
+                        (!evaluation.testedValue.has_value() ||
+                         !evaluation.threshold.has_value())) {
+                        throw std::invalid_argument(
+                            "fiber anchor selection rejection requires tested value and threshold");
+                    }
+                    component.selectionTestedValue = evaluation.testedValue;
+                    component.selectionThreshold = evaluation.threshold;
+                    if (!evaluation.retained) {
+                        component.retained = false;
+                        component.rejectionReason = "outside_selection";
+                        --cell.retainedAnchorCount;
+                        ++workerProfile.outsideSelectionComponents;
+                    }
+                }
+            }
+            if (tallyCell) {
+                for (auto& component : cell.components)
+                    component.retainedAfterSelection = component.retained;
+                if (cell.mergeEvaluation.has_value() &&
+                    cell.mergeEvaluation->merged) {
+                    ++workerProfile.mergedComponentPairs;
+                }
+                for (const auto& component : cell.components) {
+                    if (component.rejectionReason == "empty")
+                        ++workerProfile.emptyComponents;
+                    else if (component.rejectionReason == "degenerate")
+                        ++workerProfile.degenerateComponents;
+                    else if (component.rejectionReason == "below_support")
+                        ++workerProfile.belowSupportComponents;
+                }
+            }
+            cell.initializedDiagnostics = {};
+            for (auto& component : cell.components) {
+                component.discretePeakPositionPredictionXYZ.reset();
+                component.separablePeakPositionPredictionXYZ.reset();
+                component.jointPeakPositionPredictionXYZ.reset();
+                std::vector<size_t>().swap(component.diagnosticParentIds);
+            }
+            return cell.retainedAnchorCount > 0;
+        };
+
         std::atomic<size_t> completedJobs{0};
         std::mutex progressMutex;
         auto lastProgressTime = phaseStart;
@@ -3626,47 +3684,151 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
         const double cellProcessingCpuStart = processCpuSeconds();
         for (const auto& partition : partitions) {
             const auto partitionStart = std::chrono::steady_clock::now();
-            std::vector<SharedSampleInterval> intervals;
+            const auto intervalPreparationStart =
+                std::chrono::steady_clock::now();
+            const double intervalPreparationCpuStart = processCpuSeconds();
+            size_t partitionZBegin = grid.shapeZYX[0];
+            size_t partitionZEnd = 0;
             for (size_t tileIndex = partition.tileBegin;
                  tileIndex < partition.tileEnd; ++tileIndex) {
                 const auto& tile = tiles[tileIndex];
-                const size_t rows = checkedMultiply(
-                    tile.sampleEnd[0] - tile.sampleBegin[0],
-                    tile.sampleEnd[1] - tile.sampleBegin[1],
-                    "fiber anchor shared interval count");
-                if (intervals.size() >
-                    std::numeric_limits<size_t>::max() - rows) {
-                    throw std::overflow_error(
-                        "fiber anchor shared interval count overflows");
-                }
-                intervals.reserve(intervals.size() + rows);
-                for (size_t z = tile.sampleBegin[0];
-                     z < tile.sampleEnd[0]; ++z) {
-                    for (size_t y = tile.sampleBegin[1];
-                         y < tile.sampleEnd[1]; ++y) {
-                        intervals.push_back({
-                            z, y, tile.sampleBegin[2], tile.sampleEnd[2], 0});
-                    }
-                }
+                partitionZBegin = std::min(
+                    partitionZBegin, tile.sampleBegin[0]);
+                partitionZEnd = std::max(
+                    partitionZEnd, tile.sampleEnd[0]);
             }
-            std::sort(intervals.begin(), intervals.end(),
-                [](const auto& left, const auto& right) {
-                    return std::tie(left.z, left.y, left.xBegin, left.xEnd) <
-                        std::tie(right.z, right.y, right.xBegin, right.xEnd);
-                });
-            size_t mergedCount = 0;
-            for (const auto& interval : intervals) {
-                if (mergedCount != 0) {
-                    auto& previous = intervals[mergedCount - 1];
-                    if (previous.z == interval.z && previous.y == interval.y &&
-                        interval.xBegin <= previous.xEnd) {
-                        previous.xEnd = std::max(previous.xEnd, interval.xEnd);
-                        continue;
+            const size_t zExtent = partitionZEnd - partitionZBegin;
+            std::vector<size_t> additions(zExtent + 1, 0);
+            std::vector<size_t> removals(zExtent + 1, 0);
+            for (size_t tileIndex = partition.tileBegin;
+                 tileIndex < partition.tileEnd; ++tileIndex) {
+                const auto& tile = tiles[tileIndex];
+                const size_t yExtent = tile.sampleEnd[1] - tile.sampleBegin[1];
+                const size_t begin = tile.sampleBegin[0] - partitionZBegin;
+                const size_t end = tile.sampleEnd[0] - partitionZBegin;
+                additions[begin] = checkedAdd(
+                    additions[begin], yExtent,
+                    "fiber anchor shared interval additions");
+                removals[end] = checkedAdd(
+                    removals[end], yExtent,
+                    "fiber anchor shared interval removals");
+            }
+            std::vector<size_t> rawIntervalsByZ(zExtent, 0);
+            std::vector<size_t> rawIntervalOffsets(zExtent + 1, 0);
+            size_t activeIntervals = 0;
+            for (size_t localZ = 0; localZ < zExtent; ++localZ) {
+                if (activeIntervals < removals[localZ]) {
+                    throw std::logic_error(
+                        "fiber anchor shared interval activity underflows");
+                }
+                activeIntervals -= removals[localZ];
+                activeIntervals = checkedAdd(
+                    activeIntervals, additions[localZ],
+                    "fiber anchor active shared intervals");
+                rawIntervalsByZ[localZ] = activeIntervals;
+                rawIntervalOffsets[localZ + 1] = checkedAdd(
+                    rawIntervalOffsets[localZ], activeIntervals,
+                    "fiber anchor shared interval count");
+            }
+            std::vector<SharedSampleInterval> intervals(
+                rawIntervalOffsets.back());
+            const size_t rawIntervalBytes = checkedMultiply(
+                intervals.capacity(), sizeof(SharedSampleInterval),
+                "fiber anchor raw shared intervals");
+            report.profile.maximumRawIntervalBytes = std::max(
+                report.profile.maximumRawIntervalBytes, rawIntervalBytes);
+            std::vector<size_t> mergedIntervalsByZ(zExtent, 0);
+            std::vector<std::exception_ptr> intervalErrors(zExtent);
+            std::atomic<size_t> nextIntervalZ{0};
+            const size_t intervalWorkerCount = std::min(
+                static_cast<size_t>(config.parallelThreads), zExtent);
+            const auto intervalWorker = [&]() {
+                while (true) {
+                    const size_t localZ = nextIntervalZ.fetch_add(1);
+                    if (localZ >= zExtent)
+                        return;
+                    try {
+                        const size_t z = partitionZBegin + localZ;
+                        const size_t rawBegin = rawIntervalOffsets[localZ];
+                        const size_t rawEnd = rawIntervalOffsets[localZ + 1];
+                        size_t output = rawBegin;
+                        for (size_t tileIndex = partition.tileBegin;
+                             tileIndex < partition.tileEnd; ++tileIndex) {
+                            const auto& tile = tiles[tileIndex];
+                            if (z < tile.sampleBegin[0] ||
+                                z >= tile.sampleEnd[0]) {
+                                continue;
+                            }
+                            for (size_t y = tile.sampleBegin[1];
+                                 y < tile.sampleEnd[1]; ++y) {
+                                intervals[output++] = {
+                                    z, y, tile.sampleBegin[2],
+                                    tile.sampleEnd[2], 0};
+                            }
+                        }
+                        if (output != rawEnd) {
+                            throw std::logic_error(
+                                "fiber anchor shared interval count changed");
+                        }
+                        auto beginIt = intervals.begin() +
+                            static_cast<std::ptrdiff_t>(rawBegin);
+                        auto endIt = intervals.begin() +
+                            static_cast<std::ptrdiff_t>(rawEnd);
+                        std::sort(beginIt, endIt,
+                            [](const auto& left, const auto& right) {
+                                return std::tie(left.y, left.xBegin, left.xEnd) <
+                                    std::tie(right.y, right.xBegin, right.xEnd);
+                            });
+                        size_t mergedCount = 0;
+                        for (auto interval = beginIt; interval != endIt;
+                             ++interval) {
+                            if (mergedCount != 0) {
+                                auto& previous = intervals[
+                                    rawBegin + mergedCount - 1];
+                                if (previous.y == interval->y &&
+                                    interval->xBegin <= previous.xEnd) {
+                                    previous.xEnd = std::max(
+                                        previous.xEnd, interval->xEnd);
+                                    continue;
+                                }
+                            }
+                            intervals[rawBegin + mergedCount++] = *interval;
+                        }
+                        mergedIntervalsByZ[localZ] = mergedCount;
+                    } catch (...) {
+                        intervalErrors[localZ] = std::current_exception();
                     }
                 }
-                intervals[mergedCount++] = interval;
+            };
+            std::vector<std::thread> intervalWorkers;
+            intervalWorkers.reserve(intervalWorkerCount);
+            for (size_t workerIndex = 0;
+                 workerIndex < intervalWorkerCount; ++workerIndex) {
+                intervalWorkers.emplace_back(intervalWorker);
+            }
+            for (auto& thread : intervalWorkers)
+                thread.join();
+            for (const auto& error : intervalErrors) {
+                if (error)
+                    std::rethrow_exception(error);
+            }
+            size_t mergedCount = 0;
+            for (size_t localZ = 0; localZ < zExtent; ++localZ) {
+                const size_t rawBegin = rawIntervalOffsets[localZ];
+                const size_t count = mergedIntervalsByZ[localZ];
+                for (size_t index = 0; index < count; ++index) {
+                    intervals[mergedCount + index] =
+                        intervals[rawBegin + index];
+                }
+                mergedCount += count;
             }
             intervals.resize(mergedCount);
+            report.profile.intervalPreparationSeconds +=
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() -
+                    intervalPreparationStart).count();
+            report.profile.intervalPreparationCpuSeconds +=
+                processCpuSeconds() - intervalPreparationCpuStart;
             std::vector<SharedSampleRow> rows;
             rows.reserve(intervals.size());
             size_t unionSamples = 0;
@@ -3983,11 +4145,22 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                     const auto cellStart = std::chrono::steady_clock::now();
                     try {
                         const auto& ready = *task.readyTile;
-                        jobResults[task.cellIndex] = processCell(
+                        auto result = processCell(
                             requestedCells[task.cellIndex], *ready.tile,
                             *ready.observations, ready.sampleShape,
                             cellObservationIndices, cellGradientValidity,
                             workerProfile);
+                        const bool retainResult = retainDiagnostics ||
+                            prepareSparseCellResult(
+                                result,
+                                tallySelectedDiagnostics && selectedCell(
+                                    result.cellZYX),
+                                workerProfile);
+                        if (retainResult) {
+                            jobResults[task.cellIndex] =
+                                std::make_unique<FiberCellAnchorResult>(
+                                    std::move(result));
+                        }
                     } catch (...) {
                         jobErrors[task.cellIndex] = std::current_exception();
                     }
@@ -4258,6 +4431,18 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             report.profile.validGradientComputations +=
                 workerProfile.validGradientComputations;
             report.profile.fitIterations += workerProfile.fitIterations;
+            report.profile.retainPredicateCalls +=
+                workerProfile.retainPredicateCalls;
+            report.diagnostics.emptyComponents +=
+                workerProfile.emptyComponents;
+            report.diagnostics.degenerateComponents +=
+                workerProfile.degenerateComponents;
+            report.diagnostics.belowSupportComponents +=
+                workerProfile.belowSupportComponents;
+            report.diagnostics.mergedComponentPairs +=
+                workerProfile.mergedComponentPairs;
+            report.diagnostics.outsideSelectionComponents +=
+                workerProfile.outsideSelectionComponents;
             report.profile.coordinateConstructionWorkSeconds +=
                 workerProfile.coordinateConstructionSeconds;
             report.profile.predictionSamplingWorkSeconds +=
@@ -4330,12 +4515,17 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
 
         const auto selectionStart = std::chrono::steady_clock::now();
         std::vector<FiberCellAnchorResult> results;
-        results.reserve(requestedCells.size());
+        results.reserve(retainDiagnostics
+            ? requestedCells.size()
+            : std::min<size_t>(requestedCells.size(), 4096));
         for (auto& result : jobResults) {
+            if (!result)
+                continue;
             FiberCellAnchorResult cell = std::move(*result);
+            result.reset();
             const bool tallyCell =
                 tallySelectedDiagnostics && selectedCell(cell.cellZYX);
-            if (tallyCell && retainPredicate) {
+            if (retainDiagnostics && tallyCell && retainPredicate) {
                 for (auto& component : cell.components) {
                     if (!component.retained)
                         continue;
@@ -4358,7 +4548,7 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                     }
                 }
             }
-            if (tallyCell) {
+            if (retainDiagnostics && tallyCell) {
                 for (auto& component : cell.components)
                     component.retainedAfterSelection = component.retained;
                 if (cell.mergeEvaluation.has_value() &&
@@ -4374,8 +4564,10 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                         ++report.diagnostics.belowSupportComponents;
                 }
             }
-            if (cell.retainedAnchorCount > 0 || tallyCell)
+            if (cell.retainedAnchorCount > 0 ||
+                (retainDiagnostics && tallyCell)) {
                 results.push_back(std::move(cell));
+            }
         }
         report.profile.selectionSeconds += std::chrono::duration<double>(
             std::chrono::steady_clock::now() - selectionStart).count();
@@ -4417,39 +4609,41 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             component.anchor.refinementIterations;
         return record;
     };
-    for (const auto& cell : contextResults) {
-        if (!selectedCell(cell.cellZYX))
-            continue;
-        for (const auto& initialized : cell.initializedDiagnostics) {
-            report.diagnosticStages[static_cast<size_t>(
-                FiberAnchorDiagnosticStage::Initialized)].push_back(initialized);
-        }
-        for (const auto& component : cell.components) {
-            if (component.diagnosticId == kNoDiagnosticId)
+    if (retainDiagnostics) {
+        for (const auto& cell : contextResults) {
+            if (!selectedCell(cell.cellZYX))
                 continue;
-            FiberAnchorDiagnosticRecord refined =
-                makeComponentRecord(cell, component);
-            if (component.retainedAfterSupport) {
-                refined.transition.outcome = "continue";
-            } else {
-                refined.transition.outcome = "rejected";
-                refined.transition.reason = component.rejectionReason;
-                if (component.rejectionReason == "below_support") {
-                    refined.transition.testedValue =
-                        component.anchor.alignedSupport;
-                    refined.transition.threshold = config.minimumAlignedSupport;
-                }
+            for (const auto& initialized : cell.initializedDiagnostics) {
+                report.diagnosticStages[static_cast<size_t>(
+                    FiberAnchorDiagnosticStage::Initialized)].push_back(initialized);
             }
-            report.diagnosticStages[static_cast<size_t>(
-                FiberAnchorDiagnosticStage::Refined)].push_back(
-                    std::move(refined));
+            for (const auto& component : cell.components) {
+                if (component.diagnosticId == kNoDiagnosticId)
+                    continue;
+                FiberAnchorDiagnosticRecord refined =
+                    makeComponentRecord(cell, component);
+                if (component.retainedAfterSupport) {
+                    refined.transition.outcome = "continue";
+                } else {
+                    refined.transition.outcome = "rejected";
+                    refined.transition.reason = component.rejectionReason;
+                    if (component.rejectionReason == "below_support") {
+                        refined.transition.testedValue =
+                            component.anchor.alignedSupport;
+                        refined.transition.threshold = config.minimumAlignedSupport;
+                    }
+                }
+                report.diagnosticStages[static_cast<size_t>(
+                    FiberAnchorDiagnosticStage::Refined)].push_back(
+                        std::move(refined));
+            }
         }
-    }
-    for (auto& stage : report.diagnosticStages) {
-        std::sort(stage.begin(), stage.end(), [](const auto& left, const auto& right) {
-            return std::tie(left.cellZYX, left.candidateId) <
-                std::tie(right.cellZYX, right.candidateId);
-        });
+        for (auto& stage : report.diagnosticStages) {
+            std::sort(stage.begin(), stage.end(), [](const auto& left, const auto& right) {
+                return std::tie(left.cellZYX, left.candidateId) <
+                    std::tie(right.cellZYX, right.candidateId);
+            });
+        }
     }
     report.profile.initialDiagnosticsSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - initialDiagnosticsStart).count();
@@ -4479,46 +4673,48 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                 ++report.diagnostics.nmsSuppressedComponents;
         }
         for (const auto& component : cell.components) {
-            if (component.diagnosticId == kNoDiagnosticId)
-                continue;
-            if (!component.retainedAfterSupport)
-                continue;
-            FiberAnchorDiagnosticRecord support =
-                makeComponentRecord(cell, component);
-            if (component.retainedAfterSelection) {
-                support.transition.outcome = "continue";
-            } else {
-                support.transition.outcome = "rejected";
-                support.transition.reason = "outside_selection";
-                support.transition.testedValue = component.selectionTestedValue;
-                support.transition.threshold = component.selectionThreshold;
-            }
-            report.diagnosticStages[static_cast<size_t>(
-                FiberAnchorDiagnosticStage::Support)].push_back(
-                    std::move(support));
+            if (retainDiagnostics) {
+                if (component.diagnosticId == kNoDiagnosticId)
+                    continue;
+                if (!component.retainedAfterSupport)
+                    continue;
+                FiberAnchorDiagnosticRecord support =
+                    makeComponentRecord(cell, component);
+                if (component.retainedAfterSelection) {
+                    support.transition.outcome = "continue";
+                } else {
+                    support.transition.outcome = "rejected";
+                    support.transition.reason = "outside_selection";
+                    support.transition.testedValue = component.selectionTestedValue;
+                    support.transition.threshold = component.selectionThreshold;
+                }
+                report.diagnosticStages[static_cast<size_t>(
+                    FiberAnchorDiagnosticStage::Support)].push_back(
+                        std::move(support));
 
-            if (!component.retainedAfterSelection)
-                continue;
-            FiberAnchorDiagnosticRecord selection =
-                makeComponentRecord(cell, component);
-            if (component.retained) {
-                selection.transition.outcome = "continue";
-            } else {
-                selection.transition.outcome = "rejected";
-                selection.transition.reason = "nms_suppressed";
-                selection.transition.suppressor = component.nmsSuppressor;
-            }
-            report.diagnosticStages[static_cast<size_t>(
-                FiberAnchorDiagnosticStage::Selection)].push_back(
-                    std::move(selection));
+                if (!component.retainedAfterSelection)
+                    continue;
+                FiberAnchorDiagnosticRecord selection =
+                    makeComponentRecord(cell, component);
+                if (component.retained) {
+                    selection.transition.outcome = "continue";
+                } else {
+                    selection.transition.outcome = "rejected";
+                    selection.transition.reason = "nms_suppressed";
+                    selection.transition.suppressor = component.nmsSuppressor;
+                }
+                report.diagnosticStages[static_cast<size_t>(
+                    FiberAnchorDiagnosticStage::Selection)].push_back(
+                        std::move(selection));
 
-            if (!component.retained)
-                continue;
-            FiberAnchorDiagnosticRecord nms =
-                makeComponentRecord(cell, component);
-            nms.transition.outcome = "final";
-            report.diagnosticStages[static_cast<size_t>(
-                FiberAnchorDiagnosticStage::Nms)].push_back(std::move(nms));
+                if (!component.retained)
+                    continue;
+                FiberAnchorDiagnosticRecord nms =
+                    makeComponentRecord(cell, component);
+                nms.transition.outcome = "final";
+                report.diagnosticStages[static_cast<size_t>(
+                    FiberAnchorDiagnosticStage::Nms)].push_back(std::move(nms));
+            }
         }
         if (componentLess(cell.components[1], cell.components[0]))
             std::swap(cell.components[0], cell.components[1]);
@@ -4564,7 +4760,8 @@ FiberAnchorExtractionReport extractFiberAnchorsForCells(
     const FiberStoredPredictionBatchSampler& sampler,
     std::vector<std::array<size_t, 3>> cellsZYX,
     const FiberAnchorRetainPredicate& retainPredicate,
-    const FiberAnchorProgressCallback& progressCallback)
+    const FiberAnchorProgressCallback& progressCallback,
+    bool retainDiagnostics)
 {
     if (cellsZYX.empty())
         throw std::invalid_argument("fiber anchor explicit cell selection must not be empty");
@@ -4576,7 +4773,8 @@ FiberAnchorExtractionReport extractFiberAnchorsForCells(
         std::move(cellsZYX),
         retainPredicate,
         progressCallback,
-        false);
+        false,
+        retainDiagnostics);
 }
 
 FiberAnchorExtractionReport extractRefinedFiberAnchorsForCells(

@@ -3457,3 +3457,51 @@
   radii to their replacement full sources, including transitions between empty
   and nonempty displayed populations; later widening uses replacement full
   sources rather than subsets visible during reload.
+
+# Fiberlet storage quantization experiment
+
+- `vc_fiberlets quantization-benchmark` uses one production anchor extraction.
+  It reruns regular candidate generation, dense sampling, and DP exactly once
+  for each distinct endpoint geometry: float baseline; position quanta `1/2/4`
+  base voxels; compact fitted axes; and `q=1/2/4` plus compact axes. These eight
+  geometry results feed a fixed 16-row matrix that also contains isolated
+  per-chunk `uint8/uint16` total costs and six combined cost layouts.
+- Quantized endpoints are globally nearest-rounded before DP. The regular DP
+  constructs the resulting Hermite domain and chooses a new interior route; a
+  baseline `(u,v)` route must not be transplanted onto changed endpoint planes.
+- Variants `0/1` are assigned by persisted compact-axis bytes and then stable
+  original anchor identity, even when a position-only scenario uses the float
+  fitted axis for DP.
+- More than two variants, duplicate/unresolvable decoded keys, out-of-volume
+  endpoints, endpoint-key collapse, or unsupported local-position/delta widths
+  invalidate the complete scenario. Ordinary candidate rejection or no-path
+  after otherwise valid quantization is a measured result and remains visible
+  in the scenario graph population.
+- Cost offset and scale are float32 per first-endpoint spatial chunk. Encoding
+  nearest-rounds onto the complete unsigned range with an exact-maximum case;
+  decoding evaluates float32 `offset + scale * code`. The decoded scalar is the
+  authoritative edge total. The beam denominator is the float32 path length
+  computed by that geometry's DP; cost variants reuse it unchanged.
+- Geometry scenarios use the existing graph builder and replay. Reports include
+  scalar widths, collisions, successful-candidate additions/removals,
+  geometry/cost errors, global and per-chunk cost inversions, top-k agreement,
+  transition changes, comparisons with the global baseline and matching
+  float-cost geometry, baseline/scenario tracing failure counts and signed
+  delta, symmetric maximum Euclidean/normal/tangential line distance, invalid
+  normal samples, and separate cached-geometry DP time. Anchor/candidate and
+  point-index identity are not tracing-quality metrics.
+- `--scenario NAME` selects one exact matrix scenario plus the baseline. The
+  focused `combined_q4_axis_cost_u8` scenario means a 4-base-voxel endpoint
+  position quantum, the existing compact two-byte fitted-direction encoding,
+  and per-chunk 8-bit total cost. An unknown scenario name is an error.
+- Maximum line distance treats replay restart segments as disconnected. It
+  samples both directions at no more than one base voxel spacing and projects
+  onto the other replay's actual segments. Normal/tangential components use the
+  existing replay measurement with the Lasagna normal at the projected point.
+- Baseline and scenario noise-floor summaries are directed from each replay to
+  the annotated reference. Replay segments are sampled at no more than one base
+  voxel spacing and projected onto actual reference segments. Euclidean,
+  Lasagna-normal, and Lasagna-tangential summaries contain count, minimum, mean,
+  median, and maximum in base voxels. Invalid reference normals are counted and
+  excluded only from the component summaries. Long extraction, DP, line-to-line,
+  and reference-distance stages report initial, periodic, and terminal progress.

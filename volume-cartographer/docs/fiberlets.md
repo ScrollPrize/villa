@@ -962,3 +962,46 @@ the deterministic global union. `*_profiled_seconds` is the sum of disjoint
 wall phases and `*_residual_seconds` is unassigned elapsed wall time. Existing
 progress callbacks remain inside their enclosing wall phases. Profiling is
 diagnostic only and does not alter extraction decisions, ordering, or artifacts.
+
+## Storage quantization benchmark
+
+`quantization-benchmark` extracts anchors once with the production
+implementation. It quantizes anchor endpoints and fitted directions before
+running the regular candidate generation, dense sampling, and fiberlet DP for
+each distinct geometry. Geometry results are cached and reused by their
+`uint8`/`uint16` cost variants. It writes no persistent quantized format.
+
+```bash
+vc_fiberlets quantization-benchmark FIBER_MANIFEST FIBER_JSON --normal-manifest NORMAL_MANIFEST --length 5000 --threads 32 --radius 64
+```
+
+Use `--scenario combined_q4_axis_cost_u8` to run only the baseline and the
+4-base-voxel endpoint-position, compact two-byte fitted-direction, 8-bit-cost
+case. The selector names are the exact `scenario=` values printed by the full
+matrix; an unknown name is an error.
+
+The fixed 16-row matrix contains the float32 baseline; isolated position quanta
+`1`, `2`, and `4` base voxels; isolated compact fitted axes; all three
+position-plus-compact-axis float-cost geometries; isolated `uint8` and `uint16`
+per-chunk total costs; and all six combined position/axis/cost cases.
+`--storage-chunk-side` defaults to 512 base voxels.
+
+Every `fiberlet_quantization` row is machine-readable. A scenario is
+`valid=false` if any anchor key, variant, scalar, or endpoint cannot be
+represented by the proposed format. Ordinary candidate or no-path rejection
+after valid quantization is instead recorded as a changed DP result. Valid rows
+report candidate additions/removals, graph and transition populations, global
+and within-chunk cost ordering changes, top-100 agreement, comparisons against
+both the float baseline and matching float-cost geometry, baseline/scenario
+tracing failure counts, and symmetric maximum Euclidean, Lasagna-normal, and
+Lasagna-tangential line distance. Restart segments remain disconnected; both
+lines are sampled at no more than one base voxel spacing and projected onto the
+other line's actual segments. Exact anchor, candidate, point-count, and
+point-index agreement are not quality criteria. Separate
+`baseline_reference_*` and `scenario_reference_*` summaries measure each replay
+toward the annotated reference only. They report count, minimum, mean, median,
+and maximum Euclidean, normal, and tangential distance in base voxels. The
+Lasagna normal is sampled at the matched reference point; invalid normal samples
+remain in the Euclidean summary and are counted separately. Extraction, DP,
+baseline-to-scenario distance, and replay-to-reference distance stages emit
+machine-readable progress and ETA updates.
