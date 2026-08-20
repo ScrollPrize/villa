@@ -11,6 +11,7 @@ os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 import copy
 import concurrent.futures
 import gc
+import multiprocessing
 import json
 import glob
 import re
@@ -64,7 +65,7 @@ from lasagna_data import (ensure_fit_sparse_stores, prepare_lasagna_volume,
 from checkpoint_io import load_checkpoint_cpu
 from influence import make_influence_state, subsample_rows
 from spiral_sampling import load_spiral_sampling
-from tifxyz import load_tifxyz
+from tifxyz import load_tifxyz, patch_from_payload
 from geom_utils import bilinear_atlas_lookup, interp1d
 from point_collection import (
     link_points_to_patches,
@@ -116,6 +117,7 @@ from sdt_losses import (
 from spiral_helpers import (
     REFERENCE_Z_RANGE_NUM_SLICES,
     erode_patch_valid_region,
+    load_patch_payload_chunk,
     load_patches,
     load_fiber_point_collection,
     load_fiber_point_collections,
@@ -1106,71 +1108,66 @@ class FitContext:
             'loading', f'Loading and filtering {label}',
             step=0, total_steps=len(entries), unit='patches')
 
+        # Patch decode is dominated by per-file Python overhead (PIL TIFF tag
+        # parsing etc.), so threads serialize on the GIL — worker processes
+        # are required to actually parallelize.  Each worker runs a few IO
+        # threads so per-file latency (e.g. NFS round trips) overlaps with
+        # decode; patches come back as numpy payloads (see patch_to_payload).
+        world_size = max(1, self.dist.world_size)
         configured_workers = int(os.environ.get(
-            'FIT_SPIRAL_PATCH_LOAD_WORKERS', min(8, os.cpu_count() or 1)))
+            'FIT_SPIRAL_PATCH_LOAD_WORKERS',
+            max(1, min(16, os.cpu_count() or 1) // world_size)))
         num_workers = max(1, min(configured_workers, len(entries)))
+        io_threads = max(1, int(os.environ.get(
+            'FIT_SPIRAL_PATCH_LOAD_IO_THREADS', 4)))
+        chunk_size = 256
+        erode_cells_default = self.config['patch_erode_patches']
 
-        def load_entry(entry):
-            segment_path = os.path.join(path, entry)
-            try:
-                patch = load_tifxyz(
-                    segment_path, z_range=(self.z_begin, self.z_end))
-                if patch is None:
-                    return None, None, 'z ROI prefilter'
-                cells_to_erode = patch.erosion_cells(
-                    self.config['patch_erode_patches'])
-                if (cells_to_erode > 0
-                        and not erode_patch_valid_region(
-                            patch, cells_to_erode)):
-                    return None, None, 'erosion'
-                if not patch_intersects_z_roi(
-                        patch, self.z_begin, self.z_end):
-                    return None, None, 'z ROI after erosion'
-                patch.release_derived_caches()
-                patch._source_path = os.path.abspath(segment_path)
-                return patch, None, None
-            except Exception as error:
-                return None, error, None
-
-        results = [None] * len(entries)
+        results_by_entry = {}
         loaded = 0
         completed = 0
-        if num_workers == 1:
-            for index, entry in enumerate(entries):
-                results[index] = load_entry(entry)
-                loaded += results[index][0] is not None
+
+        def consume(chunk_results):
+            nonlocal loaded, completed
+            for entry, payload, error, reason in chunk_results:
+                if payload is not None:
+                    patch = patch_from_payload(payload)
+                    patch._source_path = os.path.abspath(
+                        os.path.join(path, entry))
+                    results_by_entry[entry] = (patch, None, None)
+                    loaded += 1
+                else:
+                    results_by_entry[entry] = (None, error, reason)
                 completed += 1
-                progress.update(completed, detail=f'{loaded:,} loaded')
-        elif entries:
-            # Keep no more than two tasks per worker outstanding.  Submitting
-            # one Future per 100k-patch dataset adds a needless startup/RSS
-            # spike even though only a handful can decode concurrently.
-            with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=num_workers,
-                    thread_name_prefix='patch-loader') as executor:
-                pending = {}
-                next_index = 0
+            progress.update(completed, detail=f'{loaded:,} loaded')
 
-                def submit_one():
-                    nonlocal next_index
-                    future = executor.submit(load_entry, entries[next_index])
-                    pending[future] = next_index
-                    next_index += 1
-
-                for _ in range(min(len(entries), num_workers * 2)):
-                    submit_one()
-                while pending:
-                    done, _ = concurrent.futures.wait(
-                        pending, return_when=concurrent.futures.FIRST_COMPLETED)
-                    for future in done:
-                        index = pending.pop(future)
-                        results[index] = future.result()
-                        loaded += results[index][0] is not None
-                        completed += 1
-                        progress.update(
-                            completed, detail=f'{loaded:,} loaded')
-                        if next_index < len(entries):
-                            submit_one()
+        chunks = [entries[start:start + chunk_size]
+                  for start in range(0, len(entries), chunk_size)]
+        if num_workers == 1 or len(chunks) <= 1:
+            for chunk in chunks:
+                consume(load_patch_payload_chunk(
+                    path, chunk, self.z_begin, self.z_end,
+                    erode_cells_default, io_threads))
+        else:
+            # spawn/forkserver rather than fork: loader workers only touch
+            # CPU code, and forking after torch/OpenMP threads exist is not
+            # reliably safe.  Workers persist across chunks, so the import
+            # cost is paid once per worker.
+            mp_context = multiprocessing.get_context(
+                'forkserver'
+                if 'forkserver' in multiprocessing.get_all_start_methods()
+                else 'spawn')
+            with concurrent.futures.ProcessPoolExecutor(
+                    max_workers=min(num_workers, len(chunks)),
+                    mp_context=mp_context) as executor:
+                futures = [
+                    executor.submit(
+                        load_patch_payload_chunk, path, chunk,
+                        self.z_begin, self.z_end,
+                        erode_cells_default, io_threads)
+                    for chunk in chunks]
+                for future in concurrent.futures.as_completed(futures):
+                    consume(future.result())
 
         patches = {}
         dropped = {
@@ -1178,7 +1175,8 @@ class FitContext:
             'erosion': 0,
             'z ROI after erosion': 0,
         }
-        for entry, (patch, error, reason) in zip(entries, results):
+        for entry in entries:
+            patch, error, reason = results_by_entry[entry]
             if error is not None:
                 print(f'Failed to load segment {entry}: {error}')
             elif reason is not None:

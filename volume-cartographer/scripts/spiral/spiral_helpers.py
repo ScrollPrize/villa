@@ -1,3 +1,4 @@
+import concurrent.futures
 import json
 import glob
 import os
@@ -8,7 +9,8 @@ import torch
 from tqdm import tqdm
 
 from sample_spiral import get_spiral_yxs, get_theta_and_radii
-from tifxyz import load_tifxyz, save_tifxyz, save_combined_tifxyz
+from tifxyz import (load_tifxyz, patch_to_payload, save_tifxyz,
+                    save_combined_tifxyz)
 from vc3d_fiber_format_adapter import (
     parse_vc3d_fiber_format,
 )
@@ -26,6 +28,43 @@ def patch_intersects_z_roi(patch, z_begin, z_end):
     if zs.numel() == 0:
         return False
     return bool(((zs >= z_begin) & (zs < z_end)).any().item())
+
+
+def load_patch_payload_chunk(path, entries, z_begin, z_end,
+                             erode_cells_default, io_threads=1):
+    """Load, erode, and z-filter a chunk of patch directories.
+
+    Runs inside patch-loader worker processes (must stay a picklable
+    module-level function). Returns one (entry, payload, error, drop_reason)
+    tuple per entry, where payload is patch_to_payload() output for kept
+    patches and exactly one of payload/error/drop_reason is set otherwise.
+    io_threads > 1 overlaps per-file latency (e.g. NFS round trips) within
+    the chunk; the per-entry work itself is unchanged and per-entry results
+    stay in a fixed order, so the outcome is identical either way.
+    """
+    def load_one(entry):
+        segment_path = os.path.join(path, entry)
+        try:
+            patch = load_tifxyz(segment_path, z_range=(z_begin, z_end))
+            if patch is None:
+                return entry, None, None, 'z ROI prefilter'
+            cells_to_erode = patch.erosion_cells(erode_cells_default)
+            if (cells_to_erode > 0
+                    and not erode_patch_valid_region(patch, cells_to_erode)):
+                return entry, None, None, 'erosion'
+            if not patch_intersects_z_roi(patch, z_begin, z_end):
+                return entry, None, None, 'z ROI after erosion'
+            patch.release_derived_caches()
+            return entry, patch_to_payload(patch), None, None
+        except Exception as error:
+            return entry, None, str(error), None
+
+    if io_threads <= 1 or len(entries) <= 1:
+        return [load_one(entry) for entry in entries]
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(io_threads, len(entries)),
+            thread_name_prefix='patch-io') as executor:
+        return list(executor.map(load_one, entries))
 
 
 def scale_counts_for_z_range(

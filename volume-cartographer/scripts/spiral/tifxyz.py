@@ -300,6 +300,56 @@ class Patch:
                 f.write(f"f {bl + 1} {tr + 1} {br + 1}\n")
 
 
+def patch_to_payload(patch):
+    """Convert a Patch into a picklable dict of numpy arrays / plain values.
+
+    Used to move patches out of loader worker processes. Numpy transport is
+    deliberate: torch registers ForkingPickler reductions, so pickling torch
+    tensors through multiprocessing queues would route every tensor through
+    its own shared-memory segment, which is wasteful for many small patches.
+    """
+    winding = patch.winding
+    if isinstance(winding, torch.Tensor):
+        winding = winding.numpy()
+    return {
+        'zyxs': patch.zyxs.numpy(),
+        'scale': patch.scale.numpy(),
+        'overlapping_ids': patch.overlapping_ids,
+        'winding': winding,
+        'uuid': patch.uuid,
+        'erosion_cells_override': patch.erosion_cells_override,
+        'valid_vertex_mask': patch.valid_vertex_mask.numpy(),
+        'valid_quad_mask': patch.valid_quad_mask.numpy(),
+        'area': patch.area.numpy(),
+    }
+
+
+def patch_from_payload(payload):
+    """Rebuild a Patch from patch_to_payload() output.
+
+    Bypasses __init__/__post_init__ so the parent process does not redo the
+    mask/area computations already performed in the worker; torch.from_numpy
+    is zero-copy, so the arrays are adopted verbatim.
+    """
+    patch = object.__new__(Patch)
+    patch.zyxs = torch.from_numpy(payload['zyxs'])
+    patch.scale = torch.from_numpy(payload['scale'])
+    patch.overlapping_ids = payload['overlapping_ids']
+    winding = payload['winding']
+    if isinstance(winding, np.ndarray):
+        winding = torch.from_numpy(winding)
+    patch.winding = winding
+    patch.uuid = payload['uuid']
+    patch.erosion_cells_override = payload['erosion_cells_override']
+    patch.valid_vertex_mask = torch.from_numpy(payload['valid_vertex_mask'])
+    patch.valid_quad_mask = torch.from_numpy(payload['valid_quad_mask'])
+    patch.area = torch.from_numpy(payload['area'])
+    patch._valid_vertex_indices = None
+    patch._valid_quad_indices = None
+    patch._valid_zyxs = None
+    return patch
+
+
 def load_tifxyz(path, *, z_range=None):
     """Load a patch, optionally rejecting it before x/y TIFF decoding.
 
