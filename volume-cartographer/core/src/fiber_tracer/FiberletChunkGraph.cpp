@@ -408,8 +408,6 @@ FiberletCachedReplayGraphSource::FiberletCachedReplayGraphSource(
     const FiberPredictionSource& predictionSource,
     std::shared_ptr<const vc::lasagna::NormalSampler> normalSampler,
     FiberletPathConfig pathConfig,
-    std::vector<cv::Vec3d> corridorReferenceBaseXYZ,
-    double corridorRadiusBaseVoxels,
     float maximumJoinAngleDegrees)
     : preprocessor_(std::move(preprocessor))
     , chunks_(
@@ -421,12 +419,11 @@ FiberletCachedReplayGraphSource::FiberletCachedReplayGraphSource(
     , predictionSource_(&predictionSource)
     , normalSampler_(std::move(normalSampler))
     , pathConfig_(std::move(pathConfig))
-    , corridorReferenceBaseXYZ_(std::move(corridorReferenceBaseXYZ))
-    , corridorRadiusBaseVoxels_(corridorRadiusBaseVoxels)
     , maximumJoinAngleDegrees_(maximumJoinAngleDegrees)
 {
-    if (!preprocessor_ || !normalSampler_ || corridorReferenceBaseXYZ_.size() < 2 || !(corridorRadiusBaseVoxels_ > 0.0) ||
-        !std::isfinite(corridorRadiusBaseVoxels_) || !(maximumJoinAngleDegrees_ >= 0.0F) || !(maximumJoinAngleDegrees_ <= 180.0F) ||
+    if (!preprocessor_ || !normalSampler_ ||
+        !(maximumJoinAngleDegrees_ >= 0.0F) ||
+        !(maximumJoinAngleDegrees_ <= 180.0F) ||
         !std::isfinite(maximumJoinAngleDegrees_)) {
         throw std::invalid_argument("cached fiberlet replay graph configuration is invalid");
     }
@@ -451,15 +448,7 @@ float FiberletCachedReplayGraphSource::maximumJoinAngleDegrees() const noexcept
 
 bool FiberletCachedReplayGraphSource::anchorCellInCorridor(const FiberletStorageKey& anchorKey) const
 {
-    std::array<std::size_t, 3> cell{};
-    for (std::size_t axis = 0; axis < 3; ++axis) {
-        if (anchorKey.coordinateZYX[axis] < 0 || static_cast<std::uint64_t>(anchorKey.coordinateZYX[axis]) > std::numeric_limits<std::size_t>::max()) {
-            return false;
-        }
-        cell[axis] = static_cast<std::size_t>(anchorKey.coordinateZYX[axis]);
-    }
-    return fiberAnchorCellIntersectsPolylineTube(
-        cell, corridorReferenceBaseXYZ_, corridorRadiusBaseVoxels_, preprocessor_->grid(), preprocessor_->anchorConfig().cellSizePredictionVoxels);
+    return preprocessor_->isSelectedAnchorCell(anchorKey);
 }
 
 std::vector<FiberletReplaySourceAnchor> FiberletCachedReplayGraphSource::anchorsNearReference(

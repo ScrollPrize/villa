@@ -98,8 +98,6 @@ public:
         const FiberPredictionSource& predictionSource,
         std::shared_ptr<const vc::lasagna::NormalSampler> normalSampler,
         FiberletPathConfig pathConfig,
-        std::vector<cv::Vec3d> corridorReferenceBaseXYZ,
-        double corridorRadiusBaseVoxels,
         float maximumJoinAngleDegrees = 45.0F);
 
     [[nodiscard]] float predictionToBaseScale() const noexcept override;
@@ -120,8 +118,6 @@ private:
     const FiberPredictionSource* predictionSource_ = nullptr;
     std::shared_ptr<const vc::lasagna::NormalSampler> normalSampler_;
     FiberletPathConfig pathConfig_;
-    std::vector<cv::Vec3d> corridorReferenceBaseXYZ_;
-    double corridorRadiusBaseVoxels_ = 0.0;
     float maximumJoinAngleDegrees_ = 45.0F;
 };
 

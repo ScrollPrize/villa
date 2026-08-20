@@ -31,6 +31,8 @@ public:
 
     [[nodiscard]] bool containsPredictionPoint(
         const cv::Vec3d& pointPredictionXYZ) const;
+    [[nodiscard]] FiberAnchorRetainEvaluation evaluatePredictionAnchor(
+        const FiberAnchor& anchor) const;
 
 private:
     struct Impl;

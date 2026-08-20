@@ -383,8 +383,12 @@ ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix)
 
     std::unique_lock lock(state->mutex_);
     auto [it, inserted] = state->entries_.emplace(key, Entry{});
-    if (inserted)
+    if (inserted) {
         queueFetchLocked(state, key, state->generation_, 0);
+    } else if (it->second.status == EntryStatus::InFlight &&
+               fetchBasePriority(*state, key, 0) < it->second.basePriority) {
+        queueFetchLocked(state, key, state->generation_, 0);
+    }
     waitForResolvedLocked(*state, lock, key);
     it = state->entries_.find(key);
     if (it == state->entries_.end())

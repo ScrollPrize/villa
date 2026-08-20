@@ -17,6 +17,7 @@ struct FiberletOnDemandProgress {
     std::string phase;
     vc::render::ChunkKey key;
     std::size_t inputCount = 0;
+    std::size_t unfilteredInputCount = 0;
     std::size_t outputCount = 0;
     std::size_t phaseCompleted = 0;
     std::size_t phaseTotal = 0;
@@ -39,6 +40,9 @@ struct FiberletOnDemandConfig {
     FiberletPathConfig pathConfig;
     FiberStoredPredictionBatchSampler predictionSampler;
     std::shared_ptr<const vc::lasagna::NormalSampler> normalSampler;
+    std::vector<std::array<std::size_t, 3>> selectedAnchorCellsZYX;
+    FiberAnchorRetainPredicate anchorRetainPredicate;
+    FiberletPointPredicate pointPredicate;
     vc::render::ChunkCache::Options anchorCacheOptions;
     vc::render::ChunkCache::Options fiberletCacheOptions;
     FiberletOnDemandProgressCallback progress;
@@ -61,6 +65,8 @@ public:
     [[nodiscard]] const std::shared_ptr<FiberletChunkDataset>& fiberletDataset() const noexcept;
     [[nodiscard]] const FiberPredictionGridInfo& grid() const noexcept;
     [[nodiscard]] const FiberAnchorConfig& anchorConfig() const noexcept;
+    [[nodiscard]] bool isSelectedAnchorCell(
+        const FiberletStorageKey& anchor) const noexcept;
 
     [[nodiscard]] std::vector<vc::render::ChunkKey> anchorDependencies(const vc::render::ChunkKey& fiberletChunk) const;
     [[nodiscard]] std::vector<FiberletScheduledChunk> referenceChunkSchedule(

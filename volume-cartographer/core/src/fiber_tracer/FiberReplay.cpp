@@ -1708,6 +1708,7 @@ struct FiberReplayTubeContainmentQuery::Impl {
 
     std::vector<Segment> segments;
     Tree tree;
+    float radius = 0.0f;
     float radiusSquared = 0.0f;
 
     static Point boostPoint(const cv::Vec3f& point)
@@ -1773,6 +1774,20 @@ bool FiberReplayTubeContainmentQuery::containsPredictionPoint(
         }
     }
     return false;
+}
+
+FiberAnchorRetainEvaluation
+FiberReplayTubeContainmentQuery::evaluatePredictionAnchor(
+    const FiberAnchor& anchor) const
+{
+    if (!impl_)
+        throw std::logic_error("fiber replay tube containment query is empty");
+    if (containsPredictionPoint(anchor.positionPredictionXYZ))
+        return {true, {}, {}};
+    return {
+        false,
+        std::nextafter(impl_->radius, std::numeric_limits<float>::infinity()),
+        impl_->radius};
 }
 
 bool FiberReplayTube::containsBasePoint(const cv::Vec3d& point) const
@@ -1852,6 +1867,7 @@ FiberReplayTubeContainmentQuery FiberReplayTube::makePredictionContainmentQuery(
                 FiberReplayTubeContainmentQuery::Impl::boostPoint(high)),
             segmentIndex);
     }
+    impl->radius = radius;
     impl->radiusSquared = radius * radius;
     impl->tree = FiberReplayTubeContainmentQuery::Impl::Tree(
         entries.begin(), entries.end());

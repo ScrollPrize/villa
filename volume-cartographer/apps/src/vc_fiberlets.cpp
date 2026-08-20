@@ -581,7 +581,10 @@ vc::fiber_tracer::FiberletDatasetMetadata replayDatasetMetadata(
     const vc::fiber_tracer::FiberPredictionGridInfo& grid,
     const CliOptions& options,
     const vc::lasagna::LasagnaDataset& fiberDataset,
-    const vc::lasagna::LasagnaDataset& normalDataset)
+    const vc::lasagna::LasagnaDataset& normalDataset,
+    const std::vector<cv::Vec3d>& corridorReferenceBase,
+    double corridorRadiusBaseVoxels,
+    const std::vector<std::array<std::size_t, 3>>& selectedCellsZYX)
 {
     const double cellSideBase =
         static_cast<double>(options.anchors.cellSizePredictionVoxels) *
@@ -640,7 +643,15 @@ vc::fiber_tracer::FiberletDatasetMetadata replayDatasetMetadata(
              << ";smooth=" << options.paths.smoothnessWeight << ','
              << options.paths.smoothnessNormalWeight << ','
              << options.paths.smoothnessTangentWeight << ','
-             << options.paths.smoothnessFreeAngleDegrees;
+             << options.paths.smoothnessFreeAngleDegrees
+             << ";corridor_selector=segment_aabb_v1"
+             << ";corridor_radius_base=" << corridorRadiusBaseVoxels
+             << ";corridor_reference=" << corridorReferenceBase.size();
+    for (const auto& point : corridorReferenceBase)
+        identity << ';' << point[0] << ',' << point[1] << ',' << point[2];
+    identity << ";corridor_cells=" << selectedCellsZYX.size();
+    for (const auto& cell : selectedCellsZYX)
+        identity << ';' << cell[0] << ',' << cell[1] << ',' << cell[2];
     const auto identityText = identity.str();
     vc::fiber_tracer::FiberletDatasetMetadata metadata;
     metadata.kind = kind;
@@ -1152,6 +1163,8 @@ TubeExtractionResult extractTubeFiberlets(
     TubeExtractionResult result;
     result.tube = vc::fiber_tracer::makeFiberReplayTube(
         referenceBase, 0.5 * (beginArcBase + endArcBase), 0.5 * (endArcBase - beginArcBase), radiusBaseVoxels, grid, options.anchors.cellSizePredictionVoxels);
+    const auto containmentQuery = result.tube.makePredictionContainmentQuery(
+        grid.predictionToBaseScale);
     const auto anchorStart = std::chrono::steady_clock::now();
     const double anchorCpuStart = processCpuSeconds();
     result.anchors = vc::fiber_tracer::extractFiberAnchorsForCells(
@@ -1159,13 +1172,8 @@ TubeExtractionResult extractTubeFiberlets(
         options.anchors,
         [&](const auto& indices, int threads, auto& samples) { field.sampleStoredGridBatch(indices, threads, samples); },
         result.tube.cellsZYX,
-        [&](const vc::fiber_tracer::FiberAnchor& anchor) {
-            const double distance = result.tube.distanceToBasePoint(anchor.positionPredictionXYZ * grid.predictionToBaseScale);
-            return vc::fiber_tracer::FiberAnchorRetainEvaluation{
-                distance <= result.tube.radiusBaseVoxels + 1.0e-12,
-                distance,
-                result.tube.radiusBaseVoxels,
-            };
+        [containmentQuery](const vc::fiber_tracer::FiberAnchor& anchor) {
+            return containmentQuery.evaluatePredictionAnchor(anchor);
         },
         printAnchorProgress,
         retainAnchorDiagnostics);
@@ -1173,8 +1181,6 @@ TubeExtractionResult extractTubeFiberlets(
     result.anchorCpuSeconds = processCpuSeconds() - anchorCpuStart;
 
     vc::fiber_tracer::LoadedFiberAnchorArtifact loaded{result.anchors, {}};
-    const auto containmentQuery = result.tube.makePredictionContainmentQuery(
-        grid.predictionToBaseScale);
     const auto fiberletStart = std::chrono::steady_clock::now();
     const double fiberletCpuStart = processCpuSeconds();
     result.paths = vc::fiber_tracer::traceFiberletPaths(
@@ -1626,18 +1632,35 @@ int main(int argc, char** argv)
                 eagerGraph.emplace(vc::fiber_tracer::buildFiberletGraph(
                     fullExtraction.paths));
             } else {
-                const auto anchorRoot = options.anchorCacheRoot.empty()
-                    ? options.outputDirectory / "cache" / "anchors.zarr"
-                    : options.anchorCacheRoot;
-                const auto fiberletRoot = options.fiberletCacheRoot.empty()
-                    ? options.outputDirectory / "cache" / "fiberlets.zarr"
-                    : options.fiberletCacheRoot;
+                const auto processingTube =
+                    vc::fiber_tracer::makeFiberReplayTube(
+                        fiber.linePointsXyzBase,
+                        0.5 * (startArc + endArc),
+                        0.5 * (endArc - startArc),
+                        options.radiusBaseVoxels, grid,
+                        options.anchors.cellSizePredictionVoxels);
+                const auto containmentQuery =
+                    processingTube.makePredictionContainmentQuery(
+                        grid.predictionToBaseScale);
                 auto anchorMetadata = replayDatasetMetadata(
                     vc::fiber_tracer::FiberletDatasetKind::Anchors,
-                    grid, options, dataset, canonicalNormalDataset);
+                    grid, options, dataset, canonicalNormalDataset,
+                    processingTube.referenceIntervalBase,
+                    processingTube.radiusBaseVoxels,
+                    processingTube.cellsZYX);
                 auto fiberletMetadata = anchorMetadata;
                 fiberletMetadata.kind =
                     vc::fiber_tracer::FiberletDatasetKind::Fiberlets;
+                auto cacheNamespace = anchorMetadata.algorithmFingerprint;
+                std::replace(cacheNamespace.begin(), cacheNamespace.end(), ':', '-');
+                const auto defaultCacheRoot =
+                    options.outputDirectory / "cache" / cacheNamespace;
+                const auto anchorRoot = options.anchorCacheRoot.empty()
+                    ? defaultCacheRoot / "anchors.zarr"
+                    : options.anchorCacheRoot;
+                const auto fiberletRoot = options.fiberletCacheRoot.empty()
+                    ? defaultCacheRoot / "fiberlets.zarr"
+                    : options.fiberletCacheRoot;
                 auto graphBudget =
                     std::make_shared<vc::render::DecodedChunkCacheBudget>(
                         options.decodedCacheBytes);
@@ -1661,6 +1684,17 @@ int main(int argc, char** argv)
                         field.sampleStoredGridBatch(indices, threads, samples);
                     };
                 onDemand.normalSampler = canonicalNormalSampler;
+                onDemand.selectedAnchorCellsZYX = processingTube.cellsZYX;
+                onDemand.anchorRetainPredicate =
+                    [containmentQuery](
+                        const vc::fiber_tracer::FiberAnchor& anchor) {
+                        return containmentQuery.evaluatePredictionAnchor(anchor);
+                    };
+                onDemand.pointPredicate =
+                    [containmentQuery](const cv::Vec3d& pointPrediction) {
+                        return containmentQuery.containsPredictionPoint(
+                            pointPrediction);
+                    };
                 onDemand.anchorCacheOptions = std::move(anchorCacheOptions);
                 onDemand.fiberletCacheOptions =
                     std::move(fiberletCacheOptions);
@@ -1684,6 +1718,14 @@ int main(int argc, char** argv)
                               << " key=" << progress.key.iz << ','
                               << progress.key.iy << ',' << progress.key.ix
                               << " inputs=" << progress.inputCount
+                              << " unfiltered_inputs="
+                              << progress.unfilteredInputCount
+                              << " filtered_inputs="
+                              << (progress.unfilteredInputCount >=
+                                          progress.inputCount
+                                      ? progress.unfilteredInputCount -
+                                            progress.inputCount
+                                      : 0)
                               << " outputs=" << progress.outputCount
                               << " generated_chunks=" << completed.size()
                               << " scheduled_chunks=" << locations.size();
@@ -1762,8 +1804,9 @@ int main(int argc, char** argv)
                 cachedGraph = std::make_unique<
                     vc::fiber_tracer::FiberletCachedReplayGraphSource>(
                     preprocessor, field, canonicalNormalSampler,
-                    options.paths, referenceGeometry,
-                    options.radiusBaseVoxels);
+                    options.paths);
+                preprocessor->prefetchScheduled(
+                    chunkSchedule, 0, chunkSchedule.size(), false);
                 std::cerr << "fiber_replay_stage stage=cache_open status=completed\n";
             }
 

@@ -1,19 +1,18 @@
-# Task: cache decoded fiberlet graph chunks
+# Task: corridor-filter on-demand fiberlet preprocessing
 
-Fix on-demand fiberlet replay so the existing `ChunkCache` and its LRU own the
-decoded, indexed anchor and fiberlet chunk representations.
+Make cached fiberlet replay retain the chunk caches as bounded processing swap
+storage without extracting every anchor cell in each touched spatial chunk.
 
-- Keep anchors and fiberlets in separate caches with independent local limits
-  and their existing shared decoded-byte budget.
-- A cache miss may read or generate serialized storage, but it must decode and
-  index the chunk once before publishing the cache entry.
-- A cache hit must return a lease to the decoded chunk. Graph queries must not
-  deserialize whole chunks per anchor, edge, or beam candidate.
-- Incident-edge lookup must prefetch the complete neighboring owner-chunk halo
-  through the fiberlet cache, then use per-chunk endpoint indices.
-- Beam lookahead must use cached prefix/connectivity data only. The separate
-  route level in the fiberlet cache is loaded for the committed edge, not every
-  candidate expansion.
-- The existing cache LRU must account for and evict the decoded objects. Do not
-  add a second graph or fiberlet LRU.
-- Preserve stable ordering, costs, replay choices, and numeric behavior.
+- Select anchor cells by their exact distance from the active reference-fiber
+  interval and replay radius.
+- Build that selection with a spatially bounded/indexed method, never an
+  all-cells-by-all-reference-segments scan.
+- Generate and persist only selected anchors; fiberlet chunks must consequently
+  contain only paths whose endpoint anchors belong to the selected corridor.
+- Make persisted cache identity include the corridor selection so incompatible
+  filtered chunks cannot be reused by another replay.
+- Actually submit the already-computed reference chunk schedule for background
+  anchor/fiberlet preprocessing, while keeping cache misses authoritative and
+  blocking only when traversal reaches unavailable data.
+- Preserve deterministic anchor, fiberlet, and replay results relative to the
+  existing eager tube extraction for the same reference interval and radius.

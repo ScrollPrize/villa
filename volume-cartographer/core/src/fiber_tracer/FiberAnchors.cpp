@@ -3604,7 +3604,7 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             (FiberCellAnchorResult& cell,
              bool tallyCell,
              WorkerProfile& workerProfile) {
-            if (tallyCell && retainPredicate) {
+            if (retainPredicate) {
                 for (auto& component : cell.components) {
                     if (!component.retained)
                         continue;
@@ -4531,7 +4531,7 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             result.reset();
             const bool tallyCell =
                 tallySelectedDiagnostics && selectedCell(cell.cellZYX);
-            if (retainDiagnostics && tallyCell && retainPredicate) {
+            if (retainDiagnostics && retainPredicate) {
                 for (auto& component : cell.components) {
                     if (!component.retained)
                         continue;

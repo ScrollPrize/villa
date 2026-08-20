@@ -2603,6 +2603,7 @@ TEST_CASE("explicit anchor cells remain sparse and filter refinement before NMS"
     value.localWindowRadiusPredictionVoxels = 2.0;
     value.parallelThreads = 7;
     std::atomic<bool> allSamplerCallsSingleThreaded{true};
+    std::atomic<size_t> contextPredicateCalls{0};
     std::vector<vc::fiber_tracer::FiberAnchorProgress> progress;
     const auto report = vc::fiber_tracer::extractFiberAnchorsForCells(
         grid,
@@ -2616,7 +2617,16 @@ TEST_CASE("explicit anchor cells remain sparse and filter refinement before NMS"
             }
         },
         {{0, 0, 0}, {1, 1, 1}},
-        [](const vc::fiber_tracer::FiberAnchor& anchor) {
+        [&](const vc::fiber_tracer::FiberAnchor& anchor) {
+            const std::array<size_t, 3> cellZYX{
+                static_cast<size_t>(anchor.positionPredictionXYZ[2]) / 4,
+                static_cast<size_t>(anchor.positionPredictionXYZ[1]) / 4,
+                static_cast<size_t>(anchor.positionPredictionXYZ[0]) / 4,
+            };
+            if (cellZYX != std::array<size_t, 3>{0, 0, 0} &&
+                cellZYX != std::array<size_t, 3>{1, 1, 1}) {
+                contextPredicateCalls.fetch_add(1);
+            }
             return vc::fiber_tracer::FiberAnchorRetainEvaluation{
                 anchor.positionPredictionXYZ[0] < 4.0,
                 anchor.positionPredictionXYZ[0],
@@ -2665,6 +2675,7 @@ TEST_CASE("explicit anchor cells remain sparse and filter refinement before NMS"
     CHECK(report.profile.gradientComputations <
           report.profile.gradientAttempts);
     CHECK(report.profile.retainPredicateCalls > 0);
+    CHECK(contextPredicateCalls.load() > 0);
     CHECK(report.profile.setupSeconds >= 0.0);
     CHECK(report.profile.tilePlanningSeconds >= 0.0);
     CHECK(report.profile.cellProcessingSeconds >= 0.0);
