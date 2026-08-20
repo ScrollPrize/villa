@@ -1,5 +1,161 @@
 # Status: staged fiberlet anchor acceleration
 
+- [x] Select and plan checkpoint 54 trusted bounded subpixel fits.
+- [x] Independently review checkpoint 54 against task and specifications.
+- [x] Implement checkpoint 54a diagnostic joint acceptance only.
+- [x] Run focused validation and canonical replay.
+- [x] Remove checkpoint 54a after its repeatable peak-search regression.
+- [x] Test checkpoint 54b separately only after 54a is decided.
+- [x] Remove checkpoint 54b after changed populations and no peak-time gain.
+- [x] Record checkpoint 54 outcome.
+
+- [x] Implement checkpoint 55 weighted-direction proposal records.
+- [x] Run focused validation and canonical replay.
+- [x] Remove checkpoint 55 after robust-proposal and anchor-CPU regression.
+- [x] Record checkpoint 55 outcome.
+
+- [x] Implement checkpoint 57 compile-time proposal modes.
+- [x] Run focused validation and canonical replay.
+- [x] Remove checkpoint 57 after total proposal work failed to improve.
+- [x] Record checkpoint 57 outcome.
+
+- [x] Implement checkpoint 58 fixed component-count proposal kernels.
+- [x] Run focused validation and canonical replay.
+- [x] Remove checkpoint 58 after robust-proposal and anchor-CPU regression.
+- [x] Record checkpoint 58 outcome.
+
+- [x] Implement checkpoint 59 split proposal logical-index stream.
+- [x] Run focused validation and canonical replay.
+- [x] Remove checkpoint 59 after preparation and anchor-CPU regression.
+- [x] Record checkpoint 59 outcome.
+
+- [x] Implement checkpoint 60 hoisted compact proposal geometry.
+- [x] Run focused validation and canonical replay.
+- [x] Retain checkpoint 60 from measured performance and quality.
+- [x] Record checkpoint 60 outcome.
+
+- [x] Implement checkpoint 61 pivot-relative compact proposal records.
+- [x] Run focused validation and canonical replay.
+- [x] Retain checkpoint 61 from measured performance and quality.
+- [x] Record checkpoint 61 outcome.
+
+- [x] Implement checkpoint 62 scalar transverse-distance evaluation.
+- [x] Run focused validation; stop before canonical replay after correctness failure.
+- [x] Remove checkpoint 62 and restore the stable projected-vector calculation.
+- [x] Record checkpoint 62 outcome.
+
+- [x] Implement checkpoint 63 precomputed compact Gaussian constants.
+- [x] Run focused validation and canonical replay.
+- [x] Remove checkpoint 63 after no targeted or enclosing improvement.
+- [x] Record checkpoint 63 outcome.
+
+- [x] Implement checkpoint 64 fused objective denominator/numerator traversal.
+- [x] Run focused validation and canonical replay.
+- [x] Remove checkpoint 64 after a state-evaluation and enclosing regression.
+- [x] Record checkpoint 64 outcome.
+
+- [x] Implement checkpoint 65 selected-cell-first ready-queue ordering.
+- [x] Run focused validation and canonical replay.
+- [x] Retain checkpoint 65 as a small deterministic scheduling improvement.
+- [x] Record checkpoint 65 outcome.
+
+- [x] Implement checkpoint 66 finite prepared-proposal invariant.
+- [x] Run focused validation and canonical replay.
+- [x] Retain checkpoint 66 after repeatable proposal and anchor-CPU gains.
+- [x] Record checkpoint 66 outcome.
+
+- [x] Implement checkpoint 67 finite-position production objective kernel.
+- [x] Run focused validation and canonical replay.
+- [x] Remove checkpoint 67 after a severe state-evaluation regression.
+- [x] Record checkpoint 67 outcome.
+
+- [x] Select and plan checkpoint 53 portable SIMD peak responses.
+- [x] Independently review checkpoint 53 against task and specifications.
+- [x] Implement SoA response storage and portable SIMD Gaussian evaluation.
+- [x] Run focused GCC and canonical replay; skip Clang after rejection.
+- [x] Remove checkpoint 53 after its peak-search regression.
+- [x] Record checkpoint 53 outcome.
+
+- [x] Select and plan checkpoint 52 one-pass robust refinement.
+- [x] Review checkpoint 52 quality and configuration boundaries.
+- [x] Run canonical one-pass quality/performance screen.
+- [x] Compare populations, graph/DP work, and replay failures.
+- [x] Retain as an already documented quality knob; keep defaults unchanged.
+- [x] Record checkpoint 52 outcome.
+
+- [x] Select and plan checkpoint 51 prepared compact centroid evidence.
+- [x] Review checkpoint 51 eligibility and accumulation-order constraints.
+- [x] Implement compact centroid traversal over prepared evidence.
+- [x] Run focused GCC and canonical validation; skip Clang after rejection.
+- [x] Benchmark and remove checkpoint 51.
+- [x] Record checkpoint 51 outcome.
+
+- [x] Select and plan checkpoint 50 trusted compact evaluation paths.
+- [x] Review checkpoint 50 construction and validation boundaries.
+- [x] Implement production-only trusted objective/final-evaluation calls.
+- [x] Run focused GCC and canonical validation; skip Clang after rejection.
+- [x] Benchmark and remove checkpoint 50.
+- [x] Record checkpoint 50 outcome.
+
+- [x] Select and plan checkpoint 49 prepared compact spatial objectives.
+- [x] Review checkpoint 49 ordering, cardinality, and memory constraints.
+- [x] Implement split compact denominator/evidence traversal.
+- [x] Run focused GCC and canonical validation; skip Clang after rejection.
+- [x] Benchmark and remove checkpoint 49.
+- [x] Record checkpoint 49 outcome.
+
+- [x] Select and plan checkpoint 48 contiguous robust-proposal evidence.
+- [x] Independently review checkpoint 48 against task and specifications.
+- [x] Implement reusable eligible proposal records and profiling.
+- [x] Run focused GCC/Clang and canonical quality validation.
+- [x] Benchmark and retain checkpoint 48.
+- [x] Record checkpoint 48 outcome.
+
+- [x] Select and plan checkpoint 47 packed robust membership.
+- [x] Independently review checkpoint 47 against task and specifications.
+- [x] Implement one normalized membership stream.
+- [x] Run focused GCC and optimized anchor validation.
+- [x] Benchmark and remove checkpoint 47 as performance-neutral.
+- [x] Record checkpoint 47 outcome; retained documentation remains unchanged.
+
+- [x] Implement checkpoint 46 shared-union compact observations and gradients.
+- [x] Preserve tile-local traversal and gradient-boundary semantics.
+- [x] Update bounded memory admission and profile schema version 24.
+- [x] Run GCC and Clang anchor/path/replay validation.
+- [x] Run controlled baseline/candidate replay measurements.
+- [x] Retain checkpoint 46 with exact artifacts and lower wall/CPU/RSS.
+- [x] Update specifications, documentation, changelog, and task log.
+
+- [x] Select and plan checkpoint 42 sparse peak signal storage.
+- [x] Independently review checkpoint 42 against task and specifications.
+- [x] Implement the 12-byte hot record and sparse signal field.
+- [x] Run GCC and Clang focused validation.
+- [x] Benchmark and retain checkpoint 42.
+- [x] Update specifications, documentation, changelog, and task log.
+
+- [x] Select and plan checkpoint 41 float peak-response accumulation.
+- [x] Independently review checkpoint 41 against task and specifications.
+- [x] Reject the already-implemented premise without production edits.
+- [x] Skip redundant validation and benchmarking.
+- [x] Record the rejection; specifications/docs/changelog remain unchanged.
+
+- [x] Select and plan checkpoint 40 reusable robust-proposal storage.
+- [x] Independently review checkpoint 40 against task and specifications.
+- [x] Add proposal storage/copy profiling and confirm the target.
+- [x] Test and reject proposal reuse; retain dead-copy elimination.
+- [x] Run GCC and Clang focused validation.
+- [x] Benchmark and retain the narrowed checkpoint 40.
+- [x] Update specifications, documentation, changelog, and task log.
+
+- [x] Select checkpoint 39 from the post-checkpoint-38 profile.
+- [x] Plan reusable robust-proposal eligibility and retention gates.
+- [x] Independently review checkpoint 39 against task and specifications.
+- [x] Add eligibility/call-type profiling without behavior changes.
+- [x] Run the canonical profiling replay and decide whether to proceed.
+- [x] Implement and test reusable compact-path eligibility.
+- [x] Benchmark and retain checkpoint 39.
+- [x] Update specifications, documentation, changelog, and task log.
+
 - [x] Obtain approval for checkpoint 38 portable transition batching.
 - [x] Inspect the remaining DP scoring loop and write the detailed plan.
 - [x] Independently review checkpoint 38 against task and specifications.
@@ -9,6 +165,91 @@
 - [x] Check CPU availability and run invariant canonical measurements.
 - [x] Retain checkpoint 38 based on measured results.
 - [x] Update specifications, user documentation, changelog, and task log.
+- [x] Reject checkpoint 91 compact robust-proposal Gaussian lookup after its
+  small speedup caused disproportionate anchor and fiberlet population drift.
+- [x] Retain checkpoint 92 exact final-evaluation Gaussian reuse after an
+  identical replay artifact and lower final-evaluation worker time.
+- [x] Retain checkpoint 93 nearest-table axial peak Gaussian after lower peak,
+  anchor, and wall time with negligible route displacement.
+- [x] Retain checkpoint 94 radial-survivor profiling after negligible overhead.
+- [x] Reject checkpoint 95 peak-plane CSR broad phase after lower visit counts
+  nevertheless increased peak and enclosing time.
+- [x] Reject checkpoint 96 one-axis peak buckets after contiguous skipping
+  still increased peak work.
+- [x] Retain checkpoint 97 sparse retained centroid traversal after a 64%
+  centroid-work reduction and byte-identical replay output.
+- [x] Retain checkpoint 98 membership-first peak evidence preparation after a
+  12% peak-work gain and byte-identical replay output.
+- [x] Retain checkpoint 99 refinement-bound reuse after removing a complete
+  support scan with byte-identical replay output.
+- [x] Retain checkpoint 100 finite compact-position specialization after lower
+  preparation and enclosing time with byte-identical replay output.
+- [x] Retain checkpoint 101 known compact support bounds after lower
+  preparation and anchor wall time with byte-identical replay output.
+- [x] Retain checkpoint 102 cached compact direction eligibility after lower
+  preparation and anchor CPU time with byte-identical replay output.
+- [x] Retain checkpoint 103 split peak denominator/evidence traversal after
+  lower peak and wall time with byte-identical replay output.
+- [x] Test and reject checkpoint 76 two-sided incident-segment prioritization.
+- [x] Test and reject checkpoint 77 reusable rolling DP layer buffers.
+- [x] Retain checkpoint 78 local incident-segment corridor after repeated exact
+  replay validation.
+- [x] Test and reject checkpoint 79 layer-local prepared corridor segments.
+- [x] Retain checkpoint 80 single-page interpolation-cell corner insertion
+  after repeated exact replay validation.
+- [x] Retain checkpoint 81 chordal interior-DP smoothness after repeated
+  canonical replay retained exact route geometry and improved search CPU.
+- [x] Retain checkpoint 82 chordal-only outgoing-edge preparation after
+  byte-identical replay and a repeatable search-CPU improvement.
+- [x] Reject checkpoint 83 batched chordal smoothness after no measurable
+  search-CPU improvement and restore checkpoint 82.
+- [x] Retain checkpoint 84 projected-component chordal smoothness after exact
+  canonical routes and a repeatable approximately 3% search-CPU gain.
+- [x] Retain checkpoint 85 compact projected-chordal edge descriptors after
+  byte-identical replay and a repeatable approximately 1% search-CPU gain.
+- [x] Reject checkpoint 86 direct outgoing alignment append after changed cost
+  bits and only a sub-percent search-CPU change.
+- [x] Retain checkpoint 87 direct centroid acceptance after deterministic
+  replay, comparable quality, and an approximately 11% command-wall reduction;
+  preserve spatial-objective verification as an explicit quality mode.
+- [x] Reject checkpoint 88 lazy separable grid-Gaussian streams after a 38%
+  peak-work regression.
+- [x] Reject checkpoint 89 post-cutoff compact tensor accumulation after no
+  enclosing gain and slightly changed populations.
+- [x] Retain checkpoint 90 nearest-table peak Gaussian after deterministic
+  replay, direct error-bound coverage, and an approximately 11% peak-work gain.
+- [x] Validate and retain checkpoint 68 finite generated positions in existing peak kernels.
+- [x] Validate and retain checkpoint 69 square-root-free peak gradient votes.
+- [x] Validate and retain checkpoint 70 corridor endpoint fast acceptance.
+- [x] Validate and retain checkpoint 71 monotonic enumerated node keys.
+- [x] Validate and reject checkpoint 72 row-invariant lattice geometry.
+- [x] Validate and retain checkpoint 73 finite-grid bounds in node enumeration.
+- [x] Validate and reject checkpoint 74 layer-corner finite validation.
+- [x] Validate and reject checkpoint 75 prepared corridor segments.
+- [x] Validate checkpoint 76 two-sided incident-segment fast path.
+- [x] Checkpoint 42: implement sparse signal storage and focused layout coverage.
+- [x] Checkpoint 42: run GCC validation and three optimized counterbalanced pairs.
+- [x] Checkpoint 42: retain the measured peak-search improvement and exact replay output.
+- [x] Checkpoint 42: update specifications, documentation, changelog, and task log.
+- [x] Checkpoint 43: plan packed evidence-presence storage and measurement gates.
+- [x] Checkpoint 43: independently review the plan against task and specifications.
+- [x] Checkpoint 43: implement packed evidence presence and focused coverage.
+- [x] Checkpoint 43: run the optimized screen and preserve exact replay output.
+- [x] Checkpoint 43: remove the candidate after its decisive peak-search regression.
+- [x] Checkpoint 44: plan robust-proposal isolation and reusable workspace gates.
+- [x] Checkpoint 44: independently review the plan against task and specifications.
+- [x] Checkpoint 44a: extract shared robust proposal code and validate neutrality.
+- [x] Checkpoint 44b: test fit-local reusable proposal workspace after isolation.
+- [x] Plan checkpoint 45 final accepted-membership reuse and quality gates.
+- [x] Review checkpoint 45 for component-removal, zero-component, and profile semantics.
+- [x] Implement checkpoint 45 with focused regression coverage.
+- [x] Run GCC validation and canonical quality/performance screen.
+- [x] Remove checkpoint 45 after the measured extraction-coverage regression.
+- [x] Plan checkpoint 46 shared-union compact observations.
+- [x] Review checkpoint 46 coordinate order, gradient boundary, and memory semantics.
+- [x] Implement checkpoint 46 union observations and mapped tile ranges.
+- [x] Validate checkpoint 46 with GCC/Clang and canonical replay.
+- [x] Retain checkpoint 46 and document measurements.
 
 - [x] Obtain approval for checkpoint 37 two-sided alignment preparation.
 - [x] Plan checkpoint 37 and its exactness/performance gates.

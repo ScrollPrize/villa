@@ -1,3 +1,36 @@
+# 2026-08-20: shared anchor observations and proposal evidence
+
+- Built compact anchor observations and presence gradients once per bounded
+  exact-union sample, replacing overlapping tile copies with uint32 index maps.
+- Canonical median anchor wall and CPU improved by 11.7% and 11.4%, total wall
+  by 6.7%, and peak RSS by 7.1%, with byte-identical replay artifacts.
+- Added extraction-profile version 24 with shared-observation and tile-map work
+  counters plus complete raw/compact coexistence memory accounting.
+- Materialized eligible robust-proposal evidence once per cell and reused its
+  contiguous 32-byte records across axis and final-membership passes. Median
+  local-refinement work improved 2.5% and anchor CPU 1.3% with byte-identical
+  replay artifacts; profile version 25 reports record preparation and storage.
+- Restricted production fiberlet corridor admission to the two centerline
+  segments incident to each curved-domain layer. Canonical segment tests fell
+  72%, node-enumeration work about 6.6%, and fiberlet CPU about 1.5%, while the
+  complete replay artifact remained byte-identical.
+- Inserted common eight-corner interpolation cells into one resolved sparse
+  bitmap page. Corner-collection work fell about 65%, preparation CPU about
+  28%, and command wall about 4%, with unchanged sampled voxels and byte-
+  identical replay output.
+- Replaced inverse-trigonometric interior fiberlet-DP smoothness with a chordal
+  approximation while retaining angular source/sink and public scoring.
+  Canonical routes stayed exactly unchanged while search CPU fell about 12%.
+- Omitted the now-unused angular normal coordinate from chordal outgoing-edge
+  preparation, preserving byte-identical output and reducing search CPU by a
+  further approximately 0.8%.
+- Decomposed normal-aware interior smoothness into normal-projection and
+  unnormalized tangent-plane chord components. Canonical emitted routes stayed
+  exact while search CPU fell a further approximately 3%.
+- Replaced full angular metrics in stored interior outgoing edges with compact
+  projected-chordal descriptors, preserving byte-identical output and reducing
+  search CPU by a further approximately 1%.
+
 # 2026-08-19: float final anchor support reduction
 
 - Isolated final refined-anchor evaluation in its own translation unit and kept
@@ -669,3 +702,66 @@
   valid outgoing lanes while retaining scalar transition relaxation order.
   Matching optimized runs improved median DP search wall by 5.9% and fiberlet
   wall by 5.7% with byte-identical replay artifacts.
+- Pre-indexed immutable robust-proposal eligibility during compact anchor
+  fitting. Matching optimized runs reduced median proposal work by 20.4%,
+  anchor CPU by 2.2%, and command wall by 0.9% with byte-identical replay
+  artifacts.
+- Removed redundant robust-membership state copies while retaining the original
+  proposal kernel. Matching optimized runs improved median fitting work 1.6%
+  and command wall 1.1% with byte-identical replay artifacts.
+- Moved direction-conditioned peak signal from the dense response stream into
+  sparse evidence, reducing hot records from 16 to 12 bytes. Matching optimized
+  runs improved median peak-search work 5.0% and anchor CPU 1.5% with byte-
+  identical replay artifacts.
+
+# 2026-08-20: hoisted compact robust-proposal geometry
+
+- Reused observation-to-pivot and component-to-pivot geometry across each
+  compact robust-proposal component evaluation. Matched replay runs reduced
+  robust-proposal worker time by about 35% and command wall by about 4%, with
+  unchanged populations/failures and at most `0.00437` base-voxel route motion.
+- Stored private prepared proposal positions relative to the fixed cell pivot,
+  eliminating repeated coordinate subtraction in all three proposal passes.
+  Two replays remained byte-identical and reduced proposal work another 3%.
+- Published selected anchor cells ahead of context-only cells in each prepared
+  tile's cooperative queue, modestly reducing the measured anchor wall tail
+  while preserving byte-identical output.
+- Enforced finite positions once while preparing compact robust-proposal
+  records, eliminating redundant finite checks in three hot passes and reducing
+  proposal worker time by about 9% with byte-identical replay output.
+- Made bounded retained-evidence centroid updates direct by default and exposed
+  the former complete-support objective/backtracking check through
+  `--verify-spatial-objective`. Two deterministic canonical runs reduced anchor
+  CPU by about 22% and command wall by about 11%, with unchanged failures and
+  at most `0.005524` base-voxel route displacement.
+- Replaced transverse peak-response exponentials with a bounded nearest lookup
+  after the exact radial cutoff. Three deterministic canonical runs reduced
+  peak worker time by about 11%, anchor CPU by about 3.6%, and command wall by
+  about 2.7%, with unchanged failure locations and comparable route geometry.
+- Reused each final-evaluation component Gaussian for its denominator and
+  retained numerator, preserving byte-identical replay output while removing
+  duplicate geometry and exponential evaluation.
+- Extended the bounded nearest lookup to axial peak preparation after the exact
+  support cutoff. Peak work fell another 5%, with unchanged anchor count and
+  failure locations and less than `0.009` base-voxel route displacement.
+- Reused robust-cutoff membership as sparse per-component centroid indices.
+  This removed 98.8% of centroid visits and reduced centroid worker time by
+  64% while preserving a byte-identical canonical replay artifact.
+- Deferred peak direction validation until after retained-component membership
+  succeeds, reducing peak worker time by another 12% with byte-identical replay
+  output.
+- Reused refinement's exact observed support bounds for peak ownership,
+  removing a complete support scan and another 1.04 worker-seconds from peak
+  work with byte-identical replay output.
+- Reused the generated compact range's finite-position invariant in robust
+  preparation, reducing preparation worker time by 11% with byte-identical
+  replay output.
+- Carried full-halo support bounds from the fixed stencil into compact
+  refinement, reducing robust preparation another 12% with byte-identical
+  replay output.
+- Cached configured direction eligibility once per unique compact observation,
+  reducing robust preparation another 33% and anchor CPU by 2.5% with byte-
+  identical replay output and no compact-record size increase.
+- Split dense peak-denominator traversal from sparse positive evidence and
+  removed the dense evidence-index stream, reducing peak and enclosing wall
+  time with byte-identical replay output.

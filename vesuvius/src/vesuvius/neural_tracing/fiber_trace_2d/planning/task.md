@@ -3,8 +3,10 @@
 Continue accelerating anchor and fiberlet extraction from commit `73fe64e09`.
 Implement the remaining optimization options one at a time. After every option,
 run the canonical 5,000-base-voxel replay, report wall/CPU phase measurements,
-anchor and fiberlet populations, DP work, and replay failures, then stop for
-user review before beginning the next option.
+anchor and fiberlet populations, DP work, and replay failures. Continue through
+subsequent options autonomously, logging each result, retaining useful changes,
+and removing candidates that do not improve the measured workload. Leave the
+work uncommitted until the user explicitly requests a commit.
 
 The ordered options are:
 
@@ -279,3 +281,199 @@ counterbalanced runs reduced median search and DP worker time by about 5.9%
 and median fiberlet wall by 5.7%, while all replay artifacts remained byte-
 identical. The fixed-nine neutral-lane alternative was not pursued after the
 compact layout both vectorized and avoided invalid-lane work.
+
+Checkpoint 39 targets repeated robust direction-eligibility work in anchor
+fitting. Measure how many logical support observations pass the immutable
+validity, finite direction, and presence-floor predicate, and split proposal
+time between axis-producing and membership-only calls. If the eligible subset
+is materially smaller, build its stable logical-index list while the fitter is
+already scanning observations for bounds, then reuse it for every robust
+proposal call. Preserve full-size assignment and retained-inlier arrays,
+canonical logical indices, histogram/tensor arithmetic order among eligible
+observations, and every downstream objective, peak, support, and serialization
+decision.
+
+Checkpoint 39 retained that compact eligibility index. Matching GCC `-O3`
+counterbalanced runs reduced median robust-proposal work by 20.4%, anchor CPU
+by 2.2%, anchor wall by 1.7%, and command wall by 0.9%. Fiberlet time remained
+flat, memory did not regress, and every replay artifact was byte-identical.
+Continue autonomously from the resulting profile: plan, implement, validate,
+and measure one optimization at a time; retain measured improvements, remove
+regressions, record every result, and leave the accumulated work uncommitted.
+
+Checkpoint 40 targets robust-proposal buffer churn. A normal nonempty cell
+constructs two full-logical-support byte vectors for each of two axis proposals
+and one final membership proposal, copies the axis proposal into evaluation
+state after each accepted step even though final membership replaces it, and
+copies final membership once more on return. Reuse one initialized proposal
+buffer per cell, overwrite every eligible entry on each call, keep permanently
+ineligible entries at their initialized sentinels, remove only the dead
+intermediate evaluation copies, and move final membership into the returned
+state. Preserve every proposal calculation, traversal, decision, and public
+result.
+
+Checkpoint 40 retained only the copy-elimination subset. Reusing one proposal
+object perturbed hot-kernel code generation and did not improve enclosing time,
+so it was removed. Axis proposals retain their original return-value kernel;
+dead intermediate membership copies are gone, final membership is moved into
+the fit, and final support updates scalar summaries in that existing state.
+Matching optimized measurements improved median fitting work 1.6%, anchor CPU
+1.2%, and command wall 1.1% with byte-identical output.
+
+Checkpoint 41 tests ordinary float accumulation in the remaining direction-
+conditioned peak response. The hot loop performs about 2.37 billion response-
+record visits and currently maintains six compensated float sums around its
+Gaussian, presence, and gradient votes. Keep candidate traversal, radial gates,
+Gaussian evaluation, evidence access, response formulas, cache, hill climb,
+acceptance checks, and tie rules unchanged; replace only compensated updates
+with same-order float additions. Exact numeric identity is not required, but
+determinism, anchor/support distributions, replay quality, and measured speed
+are retention gates.
+
+Checkpoint 41 was rejected during independent review without implementation:
+`FloatSum` has already been a trivial inline ordinary-float accumulator since
+checkpoint 24. There is no compensated peak accumulator left to remove, so a
+source-spelling change would not constitute an optimization.
+
+Checkpoint 42 narrows the peak hot record. Every prepared response currently
+stores transverse coordinates, axial Gaussian, and signal, although only about
+5% of records can carry retained signal and those records already own sparse
+evidence. Move signal into the sparse evidence record, reduce the hot
+response record from four floats to three, and add numerator contributions only
+after a valid evidence index is found. Zero additions disappear; nonzero
+numerator additions retain their original order. Preserve all gates, Gaussian
+and evidence formulas, response traversal, cache, and peak decisions.
+
+Checkpoint 42 retained the sparse signal layout. Three matching optimized
+pairs reduced median peak-search work by 5.0%, anchor CPU by 1.5%, and total
+CPU by 1.1%; command wall improved slightly and every replay artifact remained
+byte-identical. Continue with checkpoint 43 by replacing the dense 32-bit
+evidence-index stream with a packed evidence-presence bitmap and sequential
+sparse-evidence traversal. Preserve response and evidence order, equations,
+and deterministic output; retain only a repeatable enclosing improvement.
+
+Checkpoint 43 rejected packed evidence presence after one decisive optimized
+screen. It preserved exact output and reduced maximum peak scratch, but the
+required per-record bit/cursor work raised peak-search worker time by about
+15%. The dense index is retained because radial filtering avoids loading it for
+most records.
+
+Checkpoint 44 will isolate robust direction proposal implementation in a
+private translation unit without changing its API-visible behavior or math.
+This prepares a controlled revisit of checkpoint 40's caller-owned proposal
+storage: that storage removed substantial initialization/copy work, but its
+same-translation-unit code-generation perturbation erased the enclosing gain.
+First retain isolation only if exact replay output and optimized performance are
+neutral; then test reusable fit-local buffers against the isolated baseline.
+
+Checkpoint 45 tests eliminating the final membership-only robust proposal.
+After each accepted refinement step, retain that axis proposal's assignments
+and robust inlier mask. At termination, move the last accepted membership into
+the final evaluation instead of rescanning the full support at the updated
+position. This intentionally changes membership semantics by one accepted
+spatial update and is not behavior-preserving. Retain it only if canonical
+anchor/fiberlet populations, support distributions, replay failures, and
+geometry remain comparable while enclosing runtime improves materially.
+
+Checkpoint 46 removes the remaining tile-local expansion after extraction-wide
+raw sampling. Build compact observations and gradients once in shared-union
+order, then represent each prepared tile by a dense local-to-union uint32 map.
+Cells continue to visit observations in the same canonical tile-local Z/Y/X
+order through shared storage. Preserve tile-local gradient-boundary semantics,
+fitting equations, and deterministic results while eliminating repeated sample
+copies, gradient stencils, and compact-observation materialization.
+
+Checkpoint 47 tests one packed robust-membership stream. Robust proposals
+currently initialize and traverse separate assignment and retained/residual
+byte arrays, while centroid, objective, peak, and final evaluation repeatedly
+load both. Store transient component plus residual bin in one uint16 value,
+then normalize each entry after cutoff to component or unassigned. All fitting
+math, histogram/tensor order, observation order, component decisions, and
+serialized output remain unchanged. Retain only if enclosing anchor and command
+time improve without population or replay-quality changes.
+
+Checkpoint 47 was rejected after three counterbalanced pairs. It preserved the
+exact replay artifact, but median command wall changed only `4.89 -> 4.88 s`,
+anchor wall slightly regressed `2.9049 -> 2.9062 s`, and anchor CPU changed
+`76.112 -> 75.838 s`. The extra encoding protocol is not justified by a
+noise-sized result, so production remains at checkpoint 46.
+
+Checkpoint 48 targets robust-proposal observation locality. Production compact
+fits currently store eligible logical indices; each of roughly 788.5 million
+axis/membership proposal visits dereferences that logical index through the
+cell index into partition-shared observations. Build one canonical-order
+eligible proposal array per cell containing position, normalized direction,
+presence, and original logical index. Reuse it for both axis proposals and the
+final membership proposal. Preserve assignment destinations, histogram/tensor
+order, cutoff order, all fitting math, and expanded public fitting behavior.
+Retain only if the one-time materialization is repaid by an enclosing gain.
+
+Checkpoint 48 is retained. Three clean pairs reduced median local-refinement
+work by `2.5%` and anchor CPU by `1.3%`; command wall improved slightly. The
+canonical artifact stayed byte-identical. Worst-case accounted fitting memory
+rises by about 87 MB for the reusable per-worker records, while measured RSS
+did not regress.
+
+Checkpoint 49 targets compact retained spatial objectives. Add one contiguous
+logical-order position stream during checkpoint-48 preparation. Compact state
+evaluation computes denominator Gaussians from that stream and retained
+numerators from the already contiguous eligible proposal records, using each
+record's original logical index for membership. Keep expanded/public objective
+evaluation unchanged. Preserve each accumulator's logical contribution order,
+component mapping, Gaussian equations, and backtracking decisions; retain only
+if the extra position storage improves enclosing state and anchor time.
+
+Checkpoint 49 was rejected. It preserved the exact replay artifact but raised
+anchor CPU from the checkpoint-48 median `74.530 s` to `76.874 s`; state
+evaluation reached `15.155` worker-seconds and preparation `4.938` worker-
+seconds. The contiguous position stream and split objective traversal were
+removed, returning production to checkpoint 48.
+
+Checkpoint 50 removes redundant validation scans from trusted production
+compact evaluations. Internal cell indices are generated against the same
+shared observation vector and membership has the exact logical cardinality,
+yet every spatial-objective and final-evaluation call currently checks every
+index again. Keep checked detail APIs for arbitrary fixture/caller spans and
+route only production fitting through shared-kernel trusted entry points.
+
+Checkpoint 50 was rejected. Exact output was preserved, but a matched rebuilt
+checkpoint-48 runtime was as fast as or faster than both trusted variants. The
+validation scans are not a material enclosing cost, so the additional private
+APIs were removed.
+
+Checkpoint 51 reuses checkpoint-48 proposal records for compact centroid
+updates. Only robust-retained, proposal-eligible observations can contribute,
+yet centroid currently checks the complete logical range once per component.
+Traverse the prepared records in original logical order and use their already
+normalized direction, position, and presence without adding storage.
+
+Checkpoint 51 was rejected. The targeted centroid phase measured `1.526`
+worker-seconds against `1.511` for the matched checkpoint-48 runtime, so the
+specialized traversal was removed.
+
+Checkpoint 52 tests the existing robust-refinement iteration knob at one pass
+instead of two. This can remove roughly half of local robust proposal,
+centroid, and state-evaluation work, but it is a deliberate quality tradeoff.
+Keep the implementation unchanged and retain only as an explicit documented
+knob if canonical extraction and replay quality remain acceptable.
+
+Checkpoint 54 tests trusting the bounded parabolic subpixel peak estimate
+without rescanning all peak observations solely to prove its response is not
+below the discrete center. The discrete hill climb, complete-neighborhood and
+negative-curvature requirements, half-grid-step clamp, owner/window bounds,
+and fallback behavior remain. This deliberately relaxes the real-response
+guard and must be retained only if anchor geometry and replay quality remain
+comparable.
+
+Checkpoint 55 tests reducing the retained checkpoint-48 proposal record from
+32 to 28 bytes. The private production record stores presence-weighted unit
+direction instead of separate normalized direction and presence. Robust scores,
+mass, residual alignment, and tensor entries are reconstructed algebraically;
+expanded/public fitting remains unchanged. This is a numeric quality-screened
+memory-traffic experiment across roughly 788 million proposal visits.
+
+Checkpoint 64 revisits objective Gaussian reuse after later translation-unit
+isolation and float specialization. Unlike checkpoint 17's explicit temporary
+arrays, it fuses denominator and retained numerator updates around each single
+Gaussian evaluation. Retain it only if the isolated objective and enclosing
+anchor measurements improve with comparable deterministic replay quality.

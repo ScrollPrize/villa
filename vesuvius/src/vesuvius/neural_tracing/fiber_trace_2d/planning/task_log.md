@@ -1938,3 +1938,1165 @@
   lanes per average batch; it would add masked invalid-lane work without
   addressing a measured deficiency. This is the checkpoint's only functional
   experiment-plan simplification.
+
+## Checkpoint 39: reusable robust-proposal eligibility
+
+- Selected anchor robust proposal after checkpoint 38 because the canonical
+  candidate medians leave anchor fitting at about 91.5 CPU-seconds and 3.53
+  seconds wall. Robust tensor proposal alone costs about 29.0 worker-seconds
+  over 2.43 billion reported logical visits, versus 23.3 CPU-seconds for the
+  now-optimized fiberlet search.
+- Current compact proposal repeatedly checks the same observation validity,
+  finite normalized direction, and presence-floor predicate. The fitter already
+  performs one complete logical-observation scan to derive bounds before any
+  proposal. The planned candidate reuses that scan to build ascending eligible
+  logical indices, retaining complete-cardinality output arrays and original
+  accumulation order among observations that can contribute.
+- The first stage is measurement-only: split axis-producing and membership-only
+  calls and report logical/eligible visits and time. No reusable index will be
+  added unless the measured eligible fraction and repeated-call count justify
+  its allocation and indirection.
+- Added profile schema version 21 without changing proposal traversal or
+  decisions. The regular build passed 83 anchor, 54 path, and 6 replay tests.
+- One canonical run reported 24,550 axis proposals over 809,364,400 logical /
+  525,650,776 eligible observations and 12,275 membership proposals over
+  404,682,200 logical / 262,825,388 eligible observations. Eligibility was
+  64.9%, so repeated proposals performed 425,570,436 predicate checks on
+  observations that could never contribute. Axis proposals cost 21.56 worker-
+  seconds and membership refreshes 10.61 worker-seconds. This justifies a
+  production-path candidate.
+- The candidate is restricted to compact observations. It will gather ascending
+  `uint32_t` logical indices during the existing bounds scan, then use them for
+  proposal accumulation and cutoff application. Expanded/public observations
+  retain their current per-call direction normalization and traversal.
+- Independent review required version-21 schema documentation, unambiguous
+  logical/eligible/indexed/cutoff counters, checked compact indices, memory-
+  budgeted reusable per-worker scratch, explicit optimized-path semantics, and
+  matching checkpoint-38 benchmark conditions. The plan now includes these
+  corrections. A private proposal test hook is intentionally not added: public
+  zero-eligible input exits before refinement and zero iterations is rejected,
+  while existing compact extraction parity and profile counters cover the
+  reachable production path without duplicating private equations.
+- Implemented one checked ascending `uint32_t` eligibility index per compact
+  cell during the fitter's existing bounds scan. Every robust proposal reuses
+  it, while assignments and retained-inlier state remain indexed to the full
+  logical support. The vector is reusable worker scratch and its worst-case
+  capacity is included in anchor live-memory admission. Expanded/public fitting
+  retains its previous traversal.
+- The regular GCC build passes 83 anchor, 54 path, and 6 replay tests. The
+  matching GCC `-O3` build passes anchor and replay coverage; its path suite has
+  the same 295 failures in the old optimizer-dependent bitwise oracle at line
+  393 as checkpoint 38, while the new tests pass. The regular candidate screen
+  preserved exact output and reduced proposal work by 21.9%.
+- The first checkpoint-39 baseline was mistakenly configured at QuickBuild
+  optimization level one while the candidate used level three. Results under
+  `checkpoint39/o3-runs` are excluded. Both corrected builds use GCC 16,
+  QuickBuild optimization level three, no LTO, `VC_TESTING=ON`, and the
+  invariant launcher. Corrected logs are under
+  `volume-cartographer/build/benchmarks/checkpoint39/o3-corrected-runs/`.
+
+  | metric | baseline min/median/max | candidate min/median/max | median change |
+  |---|---:|---:|---:|
+  | command wall | `5.41/5.41/5.44 s` | `5.26/5.36/5.38 s` | `-0.9%` |
+  | total CPU | `139.57/139.70/140.67 s` | `135.13/137.95/137.96 s` | `-1.3%` |
+  | anchor wall | `3.4303/3.4382/3.4609 s` | `3.3026/3.3788/3.4056 s` | `-1.7%` |
+  | anchor CPU | `91.339/91.402/92.109 s` | `87.326/89.404/89.568 s` | `-2.2%` |
+  | robust proposal work | `27.6979/27.7541/27.9421 s` | `21.6085/22.0790/22.3082 s` | `-20.4%` |
+  | fiberlet wall | `1.5764/1.5780/1.5827 s` | `1.5594/1.5759/1.5843 s` | `-0.1%` |
+  | peak RSS | `1,354,772/1,356,116/1,362,628 KiB` | `1,350,988/1,353,100/1,354,280 KiB` | `-0.2%` |
+
+- Every corrected run retained 2,521 anchors, 48,944 searched / 24,526
+  accepted candidates, identical DP populations and failures, and byte-
+  identical SHA-256
+  `79e9163de700ed1f93e3ae2c15073cf1fb196d5678f296d8126b5c6dbcc291aa`.
+  Retained the checkpoint because the targeted and enclosing gains repeat with
+  no quality or memory regression.
+
+## Checkpoint 40: reusable robust-proposal result storage
+
+- Selected full-support proposal allocation, initialization, and copying as the
+  next behavior-preserving target. Each canonical nonempty cell normally runs
+  two axis proposals plus one final membership proposal. Each call constructs
+  two complete-cardinality byte vectors. Every accepted iteration additionally
+  copies both vectors into evaluation state, but no consumer reads that state
+  before the unconditional final membership refresh replaces it.
+- The candidate will initialize one pair of full-support vectors per cell,
+  overwrite all traversed entries on every proposal, retain sentinel values for
+  immutable compact-path ineligible entries, remove only the dead intermediate
+  copies, and move final membership into the returned evaluation. Arithmetic,
+  traversal, membership refresh, and empty-component behavior remain unchanged.
+- Measurement-only profile schema 22 confirms 36,825 proposal-buffer
+  initializations, zero reuses, 2,428,093,200 initialized bytes, and another
+  2,428,093,200 bytes copied from proposals into evaluation state on the
+  canonical run. This first copy count excludes the additional final-support
+  copy identified during review and added to the measurement before the
+  candidate.
+- Independent review required fit-local ownership, explicit two-byte-per-
+  observation memory admission, complete fixed-summary and traversed-entry
+  reset, formula-based rather than workload-fixed profile assertions, and
+  coverage for component removal and empty output. It also identified a second
+  full membership copy when final support evaluation replaces the state after
+  peak search. The candidate now updates final scalar summaries in place and
+  does not attempt cross-cell buffer reuse.
+- The combined reuse candidate reduced initialized bytes from 2,428,093,200 to
+  809,364,400 and evaluation-copy bytes from 3,237,457,600 to zero. Despite a
+  roughly 10% local-control improvement, three matching GCC `-O3` pairs left
+  total CPU flat and changed median command wall from `5.23` to `5.24` seconds.
+  Caller-owned proposal reuse was therefore removed rather than retained for
+  its apparent cleanliness.
+- The narrowed candidate restores the original return-value robust-proposal
+  kernel. It removes the dead per-iteration copies, moves final membership into
+  the result, updates final support scalars in place after peak search, and
+  includes its two membership bytes per observation in worker memory admission.
+  Proposal initialization remains unchanged; evaluation-copy bytes are zero.
+- One narrowed-candidate run stopped making progress after 12,492 / 13,027
+  cells and was interrupted. Four other narrowed-candidate runs and all prior
+  checkpoint-40 runs completed. The stalled run is excluded from timing and
+  recorded as an isolated concurrency anomaly; it did not recur in two
+  immediate confirmation runs.
+- Three completed narrowed-candidate runs are compared with the same three
+  fresh matching optimized baselines under
+  `volume-cartographer/build/benchmarks/checkpoint40/`:
+
+  | metric | baseline min/median/max | candidate min/median/max | median change |
+  |---|---:|---:|---:|
+  | command wall | `5.19/5.23/5.23 s` | `5.12/5.17/5.17 s` | `-1.1%` |
+  | total CPU | `133.59/133.83/133.85 s` | `131.59/132.11/132.38 s` | `-1.3%` |
+  | anchor wall | `3.2613/3.2804/3.2927 s` | `3.2112/3.2391/3.2583 s` | `-1.3%` |
+  | anchor CPU | `86.219/86.344/86.446 s` | `84.882/85.284/85.375 s` | `-1.2%` |
+  | fitting work | `67.0548/67.2324/67.5103 s` | `65.9451/66.1249/66.9410 s` | `-1.6%` |
+  | local control work | `4.0345/4.0604/4.0914 s` | `3.8848/3.8947/3.9233 s` | `-4.1%` |
+  | fiberlet wall | `1.5414/1.5442/1.5539 s` | `1.5204/1.5253/1.5360 s` | `-1.2%` |
+  | peak RSS | `1,350,692/1,352,552/1,356,436 KiB` | `1,345,272/1,358,412/1,363,088 KiB` | `+0.4%` |
+
+- Every completed run retained identical populations, failures, DP work, and
+  byte-identical SHA-256
+  `79e9163de700ed1f93e3ae2c15073cf1fb196d5678f296d8126b5c6dbcc291aa`.
+  The narrowed candidate is retained; reusable proposal storage is rejected.
+
+## Checkpoint 41: float peak-response accumulation
+
+- Selected the remaining peak response loop because retained checkpoint 40
+  leaves roughly 21 worker-seconds over about 2.37 billion hot response-record
+  visits. Each response maintains six compensated float sums. The experiment
+  changes only those accumulators to same-order ordinary float addition; all
+  record traversal, Gaussian/evidence arithmetic, response caching, candidate
+  order, and decisions remain structurally unchanged.
+- Independent review found the premise stale: `FloatSum::add()` is already
+  exactly `sum += value`, and checkpoint 24 applied it to these peak-response
+  accumulators. The proposed raw-float spelling would not remove any arithmetic
+  or memory traffic. The experiment was rejected before source changes or
+  timing; an in-progress duplicate baseline build was stopped. No production,
+  test, specification, user-documentation, or changelog changes result.
+
+## Checkpoint 42: sparse peak signal storage
+
+- Retained checkpoint 40 prepares about 199.3 million response records and
+  only 10.1 million evidence records across the canonical extraction. The hot
+  loop performs about 2.37 billion response-record visits but only about 80.2
+  million evidence visits. Signal is nonzero only for evidence-bearing records,
+  so storing it in every 16-byte hot record wastes one field load plus a
+  multiply/add on the dominant no-evidence population.
+- The candidate moves signal into sparse evidence, reducing the hot record to
+  12 bytes and growing the evidence record from 16 to 20 bytes. It removes only
+  exact-zero numerator additions; every nonzero numerator contribution retains
+  its original response-record order.
+- Independent review corrected the invariant to one-way implication: nonzero
+  signal requires evidence, but positive-alignment evidence can have zero
+  signal when presence is zero. The implementation must branch on the evidence
+  index and still add a zero signal for such evidence. Review also required
+  compile-time 12/20-byte layout assertions and explicit boundary coverage. It
+  confirmed this extends checkpoint 16 rather than repeating its rejected
+  evidence-index-in-hot-record prototype.
+- Implemented a 12-byte response record containing only transverse coordinates
+  and axial Gaussian. Signal now lives in the 20-byte sparse evidence record.
+  Response evaluation accumulates every denominator term, then loads evidence
+  and adds its signal and gradient terms. Positive-alignment, zero-presence
+  evidence remains represented and contributes an explicit zero numerator.
+- Regular GCC passed 83 anchor, 54 path, and 6 replay tests. The optimized
+  candidate also passed the anchor suite. Three counterbalanced GCC `-O3`,
+  no-LTO pairs are under
+  `volume-cartographer/build/benchmarks/checkpoint42/runs/`:
+
+  | metric | baseline min/median/max | candidate min/median/max | median change |
+  |---|---:|---:|---:|
+  | command wall | `5.11/5.13/5.14 s` | `5.10/5.10/5.12 s` | `-0.6%` |
+  | total CPU | `132.37/133.18/133.66 s` | `131.66/131.71/132.12 s` | `-1.1%` |
+  | anchor wall | `3.2198/3.2216/3.2356 s` | `3.1935/3.2005/3.2133 s` | `-0.7%` |
+  | anchor CPU | `85.697/86.310/86.589 s` | `84.931/85.030/85.366 s` | `-1.5%` |
+  | fitting work | `66.1087/66.4133/66.6739 s` | `65.3739/65.4847/65.4928 s` | `-1.4%` |
+  | peak-search work | `19.9842/20.0239/20.0694 s` | `19.0222/19.0278/19.0543 s` | `-5.0%` |
+  | fiberlet wall | `1.5057/1.5151/1.5261 s` | `1.5092/1.5136/1.5150 s` | `-0.1%` |
+  | peak RSS | `1,347,508/1,347,528/1,350,648 KiB` | `1,350,176/1,355,920/1,357,304 KiB` | `+0.6%` |
+
+- Every run retained identical populations, failures, DP work, and byte-
+  identical SHA-256
+  `79e9163de700ed1f93e3ae2c15073cf1fb196d5678f296d8126b5c6dbcc291aa`.
+  The candidate is retained because its targeted 5.0% gain and enclosing CPU
+  gain repeat without a quality regression.
+
+## Checkpoint 43: packed peak evidence presence
+
+- Selected the dense 32-bit evidence-index stream as the next peak bandwidth
+  target. Evidence records are appended in response order and only about 5% of
+  response records carry evidence, so random indices encode more information
+  than response evaluation needs. A packed bit identifies evidence-bearing
+  responses; a sequential cursor consumes sparse evidence in the same order.
+- The experiment keeps the response record and evidence record from checkpoint
+  42, denominator traversal, nonzero contribution order, peak equations, and
+  all decisions. Retention requires focused word-boundary coverage, complete
+  memory accounting, GCC/Clang validation, exact canonical replay parity, and
+  a repeatable enclosing gain.
+- Independent review found one critical ordering requirement: the sparse cursor
+  must advance for a set bit even when that response record is radially
+  rejected, although the evidence itself need not be loaded. It also required
+  explicit profile-schema replacement, separate allocation/admission
+  accounting, unsigned overflow-safe packing, and adversarial repeated-scan and
+  63/64/65-boundary tests. The plan now includes all corrections. The bitmap
+  remains a valid experiment, but the universal bit test may outweigh the
+  substantial memory reduction; measurement decides retention.
+- Implemented the reviewed candidate with a reusable packed-map helper,
+  version-24 bitmap allocation counters, worst-case worker admission, and
+  direct 0/1/63/64/65/129-record boundary coverage. GCC passed 84 anchor, 54
+  path, and 6 replay tests; the optimized anchor suite also passed.
+- The canonical optimized screen preserved exact artifact SHA-256
+  `79e9163de700ed1f93e3ae2c15073cf1fb196d5678f296d8126b5c6dbcc291aa`
+  and reduced maximum peak-observation storage from roughly 0.92 MiB to
+  `729,424` bytes. However, the bitmap had to be tested and its sparse cursor
+  advanced before radial rejection for all 2.37 billion response visits.
+  Peak-search work regressed to `21.9527` worker-seconds versus checkpoint 42's
+  `19.02-19.05`, anchor CPU to `87.9517` seconds, and command wall to `5.22`
+  seconds. The candidate was removed without further pairs or Clang testing.
+- Checkpoint 43 is rejected. Production source is restored exactly to the
+  checkpoint-42 baseline; only this experiment record remains.
+
+## Checkpoint 44: isolated robust proposal workspace
+
+- Selected a controlled revisit of checkpoint 40's rejected caller-owned
+  proposal storage. That candidate removed about 1.6 GiB of initialization and
+  3.2 GiB of copies and improved local control around 10%, but neighboring hot
+  code in the same translation unit regressed enough to erase total benefit.
+- First extract the single shared robust implementation behind compact and
+  expanded entry points and verify a neutral exact-output baseline. Only then
+  add fit-local reusable workspace in that isolated module. This directly
+  addresses the prior code-generation failure rather than repeating the
+  rejected implementation unchanged.
+- Independent review approved the two-gate experiment but required explicit
+  compact storage/logical/eligible index spans, complete workspace reset and
+  transfer semantics, one owner for histogram/Gaussian/cutoff policy, and a
+  profile-version bump when initialization semantics change. It also stressed
+  that TU isolation changes the kernel's own ABI/inlining and is therefore only
+  an experiment, not a guaranteed fix. The plan now includes those corrections
+  and limits extraction to one private proposal module; refinement remains in
+  `FiberAnchors.cpp`.
+- Checkpoint 44a extracted the shared robust proposal and cutoff implementation
+  into a private translation unit. GCC anchor/path/replay tests passed and the
+  canonical replay retained SHA-256
+  `79e9163de700ed1f93e3ae2c15073cf1fb196d5678f296d8126b5c6dbcc291aa`.
+  An initial comparison was invalid because the isolated baseline was
+  accidentally configured as `RelWithDebInfo -O2`; it produced a different
+  artifact and is excluded. After rebuilding the exact snapshot as
+  `QuickBuild -O3`, paired baseline/candidate command wall was `5.20/5.21 s`,
+  anchor wall `3.2566/3.2802 s`, and anchor CPU `85.922/86.592 s`. Robust axis
+  and membership work rose from `14.4616/7.1267` to `14.6748/7.2303` worker-
+  seconds. The extraction is wall-neutral enough to run checkpoint 44b, but it
+  is not independently a performance win and will survive only if workspace
+  reuse produces an enclosing gain.
+- Checkpoint 44b initialized one logical-cardinality workspace per nonempty fit,
+  reused it for the second axis proposal and final membership proposal, reset
+  only the compact eligible entries, and moved final membership into the fit
+  result. The canonical screen remained byte-identical. Initializations fell
+  from `36,825` / `2,428,093,200` bytes to `12,275` / `809,364,400` bytes, with
+  `24,550` reuses resetting `525,650,776` indexed entries. Despite that traffic
+  reduction, robust axis/membership work regressed further to
+  `14.9992/7.4334` worker-seconds. Command wall was unchanged at `5.20 s`,
+  anchor wall was `3.2760 s`, and anchor CPU was `86.640 s`; there is no
+  enclosing gain over either the `5.20 s` checkpoint-42 baseline or 44a.
+  Checkpoints 44a and 44b were therefore both removed, including the private
+  module and version-24 profile additions. Production returns exactly to
+  checkpoint 42.
+
+## Checkpoint 45: final accepted robust membership reuse
+
+- Selected the remaining membership-only robust refresh, which costs about
+  `7.13` worker-seconds over `404,682,200` logical and `262,825,388` eligible
+  observation visits in the canonical run. The experiment will move the last
+  accepted axis proposal's membership into final evaluation instead of
+  recomputing it after the final spatial update.
+- Review identified the semantic boundary: component-removal retries cannot
+  publish their old component labels; zero-component exits keep their explicit
+  empty state; only a proposal associated with an accepted component state may
+  be retained. The final assignments may differ because the membership was
+  evaluated one accepted spatial update earlier. Exact output is therefore not
+  a gate; geometry/support distributions and replay quality are.
+- The optimized canonical screen removed all `12,275` final membership calls,
+  `404,682,200` logical visits, and `262,825,388` eligible/cutoff visits. Anchor
+  CPU fell from `85.92` to `77.90` worker-seconds and command wall from `5.20`
+  to `5.13` seconds. However, retained anchors fell `2,519 -> 2,490`, searched
+  fiberlets `48,944 -> 48,078`, accepted fiberlets `24,526 -> 24,095`, and
+  graph nodes `2,473 -> 2,438`. The artifact changed to SHA-256
+  `fa744ce59c3f197910624252c75313513a1b653064bfe0cb733941c1e8eeb3f4`.
+  Greedy/fiberlet failure counts stayed `2/1`, but losing 1.1-1.8% extraction
+  coverage for about 1.3% wall improvement is not acceptable. The candidate,
+  profile field, tests, and schema bump were removed without further pairs or
+  Clang testing.
+
+## Checkpoint 46: shared-union compact observations
+
+- Current exact-union sampling stores 6,162,456 raw samples, then copies them
+  into 39,539,352 additional tile occurrences before independently computing
+  35,843,136 gradients and building tile compact observations. Canonical work
+  is about `2.94` worker-seconds for tile sample copies, `4.9` for gradients,
+  and `11.9` for observation construction including cell indexing.
+- The candidate will construct gradients and compact observations once in
+  shared-union order and use dense tile-local uint32 maps. Review requires
+  preserving tile-local Z/Y/X traversal and original tile-interior gradient
+  validity even when the larger union happens to provide neighbors outside a
+  tile. Exact row/interval lookup avoids both a full-volume array and a copied
+  private paged-index implementation.
+- Implemented partition-owned compact observations and gradients. Tile-local
+  support and owned traversal map through dense uint32 indices; explicit tile-
+  interior checks preserve the old gradient-validity boundary. Raw samples are
+  released before fitting. Admission includes raw-plus-compact coexistence,
+  preparation control, persistent compact storage, tile maps, ready queues,
+  timing storage, and per-cell scratch.
+- Profile version 24 reports shared-observation voxels/construction and tile-
+  index-map work separately. On the canonical workload, gradient construction
+  fell from `35,843,136` repeated tile computations to `7,138,880` partition-
+  union computations. Tile map construction costs about `0.05-0.07` worker-
+  seconds, shared observation construction about `0.48`, and gradient work
+  about `0.95`, replacing roughly `19.5` worker-seconds of tile copies,
+  repeated gradients, and compact-observation construction.
+- Three clean checkpoint-42 baselines and three matching candidate runs are in
+  `volume-cartographer/build/benchmarks/checkpoint46/runs/`. The first attempted
+  third baseline (`pair3-baseline`) overlapped an unrelated compile/LTO job and
+  is excluded; `pair4-baseline` is its clean replacement.
+
+  | metric | baseline min/median/max | candidate min/median/max | median change |
+  |---|---:|---:|---:|
+  | command wall | `5.15/5.22/5.26 s` | `4.87/4.87/4.89 s` | `-6.7%` |
+  | total CPU | `132.53/132.98/133.88 s` | `123.36/123.82/123.94 s` | `-6.9%` |
+  | anchor wall | `3.2245/3.2766/3.2843 s` | `2.8866/2.8916/2.9017 s` | `-11.7%` |
+  | anchor CPU | `85.636/85.724/85.953 s` | `75.898/75.933/76.163 s` | `-11.4%` |
+  | peak RSS | `1,350,328/1,351,736/1,361,404 KiB` | `1,240,440/1,255,576/1,255,728 KiB` | `-7.1%` |
+
+- The finalized schema/accounting replay remained at `4.86 s` wall,
+  `2.8847 s` anchor wall, and `75.282 s` anchor CPU. GCC and Clang passed 83
+  anchor, 54 path, and 6 replay cases. Every canonical run retained populations
+  (`2521` anchors, `48944` searched, `24526` accepted, `2473` graph nodes),
+  failures (`2/1`), and byte-identical SHA-256
+  `79e9163de700ed1f93e3ae2c15073cf1fb196d5678f296d8126b5c6dbcc291aa`.
+  Checkpoint 46 is retained.
+
+## Checkpoint 47: packed robust membership
+
+- Selected the two-stream robust membership state after checkpoint 46. The
+  canonical fit performs about `788.5M` physically indexed robust proposal/
+  cutoff visits, `1.61B` centroid visits, `1.62B` refined-state visits,
+  `804.4M` peak-preparation visits, and `404.7M` final-evaluation visits.
+  Most downstream scans currently inspect separate assignment and retained
+  arrays.
+- The experiment packs transient component and 8-bit residual bin into one
+  uint16 stream, then rewrites it after cutoff to component or unassigned.
+  This preserves two bytes of bounded storage per logical observation while
+  reducing stream count, initialization passes, and downstream loads. It does
+  not reuse stale membership or alter fitting semantics.
+- Independent review required disjoint tagged transient/normalized encodings,
+  one shared unsigned decoder across all translation units, explicit loss of
+  otherwise-unobserved trimmed assignments, non-identity compact-index tests,
+  zero/component-removal paths, and 16-bit/256-bin static assertions. The plan
+  now includes each correction. Payload remains two bytes per observation;
+  the experiment targets one stream and one downstream load, not smaller
+  bounded storage.
+- Implemented the reviewed uint16 representation and shared decoder, including
+  cutoff-boundary, component, invalid, and non-identity indexed coverage. GCC
+  and optimized anchor suites passed, and the canonical replay retained the
+  exact artifact SHA-256
+  `79e9163de700ed1f93e3ae2c15073cf1fb196d5678f296d8126b5c6dbcc291aa`.
+- Three clean counterbalanced checkpoint-46/candidate pairs measured median
+  command wall `4.89/4.88 s`, anchor wall `2.9049/2.9062 s`, and anchor CPU
+  `76.112/75.838 s`. The differences are within run noise: wall improved only
+  `0.2%`, anchor wall regressed `0.05%`, and anchor CPU improved `0.36%`.
+  Peak RSS was also effectively unchanged because one uint16 stream has the
+  same payload as two uint8 streams.
+- Checkpoint 47 is rejected as performance-neutral. The private membership
+  helper and all production/test edits were removed, restoring checkpoint 46;
+  only this experiment record remains.
+
+## Checkpoint 48: contiguous robust-proposal evidence
+
+- Selected the repeated compact proposal dereference as the next measured
+  target. Checkpoint 46 uses partition-shared observations, so every eligible
+  proposal visit follows an eligible logical index through the cell index into
+  shared storage. The canonical run performs `525,650,776` axis and
+  `262,825,388` final-membership indexed visits.
+- The experiment pays one canonical-order materialization per compact cell for
+  a proposal-only record containing position, already-normalized direction,
+  presence, and logical destination. Both axis proposals and final membership
+  reuse it. All downstream full-support consumers remain unchanged.
+- Retention requires bounded memory accounting, focused indexed/parity tests,
+  unchanged fit decisions and replay quality, and a repeatable enclosing gain.
+- Review confirmed that eligibility does not imply a finite position: invalid
+  positions must remain in the prepared stream and naturally receive zero
+  Gaussian mass. It also requires original logical destinations, increasing
+  logical-order traversal, immutable reuse across component-removal retries,
+  an explicit empty-evidence path, and replacing rather than adding the old
+  eligible-index bytes in bounded admission.
+- Implemented a 32-byte record and reused worker-local capacity across cells.
+  Version 25 reports `262,825,388` prepared records in the canonical run and
+  `3.97` worker-seconds of one-time preparation. The two axis passes fell from
+  a median `13.727` to `12.732` worker-seconds and final membership from
+  `6.828` to `6.330`.
+- Three clean counterbalanced pairs measured median command wall
+  `4.82 -> 4.81 s`, anchor wall `2.8644 -> 2.8503 s`, anchor CPU
+  `75.504 -> 74.530 s`, and local refinement `39.905 -> 38.910 s`. Accounted
+  worst-case live fitting memory increases `220,209,496 -> 307,422,552` bytes,
+  while measured median RSS did not increase (`1,253,484 -> 1,242,400 KiB`).
+- GCC and Clang anchor/path/replay suites pass. All measured candidates retain
+  `2521` anchors, `48944` searched and `24526` accepted fiberlets, `2473` graph
+  nodes, failures `2/1`, and exact SHA-256
+  `79e9163de700ed1f93e3ae2c15073cf1fb196d5678f296d8126b5c6dbcc291aa`.
+  Checkpoint 48 is retained for its repeatable `1.3%` anchor-CPU and `2.5%`
+  local-refinement gains.
+
+## Checkpoint 49: prepared compact spatial objectives
+
+- Selected the `~14.2` worker-second refined-state phase. Its compact kernel
+  repeatedly follows cell-to-shared indices for every denominator site and
+  again for retained numerator evidence.
+- The experiment adds one logical-order float position stream and consumes the
+  retained checkpoint-48 evidence for numerators. Denominator and numerator
+  accumulators are independent; splitting their traversals preserves each
+  contribution order. Expanded/public fitting stays on the original path.
+- Review requires preserving invalid positions in the position stream, using
+  original logical membership indices, checked cardinalities, component and
+  zero-active behavior, worker-local capacity reuse, and complete additional
+  memory admission.
+- Implemented the compact-only split traversal and profile schema 26. The
+  optimized anchor test passed and the canonical replay preserved populations,
+  failures, and exact SHA-256
+  `79e9163de700ed1f93e3ae2c15073cf1fb196d5678f296d8126b5c6dbcc291aa`.
+- The screen decisively regressed: command wall was `4.92 s`, anchor wall
+  `2.9271 s`, and anchor CPU `76.874 s`, versus checkpoint-48 medians of
+  `4.81 s`, `2.8503 s`, and `74.530 s`. State evaluation rose to `15.155`
+  worker-seconds, preparation rose to `4.938` worker-seconds, and accounted
+  live bytes increased to `344,799,576`.
+- Checkpoint 49 is rejected. The position stream, split objective APIs, profile
+  fields, tests, and schema bump were removed. Production returns to retained
+  checkpoint 48; Clang testing and repeated pairs were skipped because the
+  targeted and enclosing metrics both regressed.
+
+## Checkpoint 50: trusted compact evaluation paths
+
+- Selected repeated compact input validation. Every retained spatial-objective
+  and final-evaluation call scans the full logical index span before scanning
+  it again for arithmetic, although production indices and membership vectors
+  are generated together from bounded internal storage.
+- The experiment keeps checked compact APIs and their failure tests unchanged.
+  New explicitly trusted private calls share the same kernels and are used only
+  by production `IndexedObservationRange` fitting. Expanded/public fitting and
+  all equations, traversal, accumulation, and decisions remain unchanged.
+- The combined spatial/final screen produced the exact artifact at `74.614 s`
+  anchor CPU. Isolating trusted spatial objectives produced `73.845` and
+  `74.648 s`, with state evaluation near `14.0-14.1` worker-seconds.
+- A matched checkpoint-48 runtime rebuilt from the same source/build context
+  measured `73.375 s` anchor CPU, `14.090 s` state evaluation, and `4.517 s`
+  final evaluation. The candidates therefore have no repeatable enclosing
+  gain. Checkpoint 50 is rejected and all trusted APIs/tests were removed.
+
+## Checkpoint 51: prepared compact centroid evidence
+
+- Selected the `~1.5` worker-second centroid phase. It reports `1.61B` logical
+  visits because it loops the complete range once per active component, even
+  though only robust-retained proposal-eligible records can reach an
+  accumulator.
+- Production compact fitting can reuse checkpoint-48 records without new
+  storage. Their original logical indices preserve membership lookup and their
+  increasing order preserves every contributing accumulation. Expanded/public
+  fitting remains unchanged.
+- The canonical screen preserved `2521` anchors, `48944/24526` searched/
+  accepted fiberlets, failures `2/1`, and exact artifact SHA-256
+  `79e9163de700ed1f93e3ae2c15073cf1fb196d5678f296d8126b5c6dbcc291aa`.
+  Centroid work was `1.526` worker-seconds versus `1.511` in the matched
+  checkpoint-48 runtime. Checkpoint 51 is rejected and removed.
+
+## Checkpoint 52: one-pass robust refinement
+
+- Selected the existing `maximumIterations` quality knob. The canonical
+  checkpoint-48 run executes `24,550` robust attempts for `12,275` nonempty
+  cells, exactly two per fit, and spends about `38` worker-seconds in local
+  refinement.
+- The experiment changes only benchmark configuration from two passes to one.
+  Production code and defaults remain unchanged until quality and speed are
+  measured. Retention requires explicit quality-knob documentation rather than
+  presenting the result as behavior-preserving.
+- One pass measured `4.50 s` command wall, `2.435 s` anchor wall, and `61.588 s`
+  anchor CPU, versus the matched two-pass runtime's `4.77 s`, `2.819 s`, and
+  `73.375 s`. Local refinement fell `38.224 -> 24.140` worker-seconds.
+- Failures remained `2/1`, while anchors rose `2521 -> 2604`, searched/accepted
+  fiberlets `48944/24526 -> 51780/26494`, graph nodes `2473 -> 2563`, and DP
+  relaxations `58.21M -> 63.01M`. The fiberlet failure arc moved from
+  `8135.66` to `8138.96` base voxels. This is a real quality/population change.
+- Retained only as guidance for the existing knob. User documentation already
+  states that one pass is the speed default and two passes are the first
+  quality-oriented setting for nearby/crossing fibers, so no production or
+  documentation edit is needed.
+
+## Checkpoint 53: portable SIMD peak-response Gaussian
+
+- Selected the peak search, currently about `18.7` worker-seconds in the
+  matched two-pass replay. The hot response loop evaluates roughly `2.36B`
+  transverse Gaussian contributions; prior scalar LUT and polynomial
+  approximations did not improve it.
+- The experiment changes the 12-byte response payload from AoS to three float
+  streams and uses OpenCV universal intrinsics for distance and exponential
+  evaluation. Accumulation and sparse evidence handling remain scalar and in
+  original observation order. This uses the existing portable OpenCV dependency
+  and avoids x86-only code.
+- Numerical identity is not required for this task, but replay populations,
+  failure behavior, and geometry must remain comparable. The candidate will be
+  removed if the enclosing replay does not improve.
+- Independent review required an OpenCV 4/non-SIMD scalar fallback, scalar
+  cutoff decisions at the support boundary, padded SIMD tails, a bounded
+  vector-exponential input range, direct numerical tests, and explicit compiled-
+  ISA rather than runtime-dispatch portability language. The plan now includes
+  each correction and uses checkpoint 48 as the matched baseline.
+- The focused GCC anchor and replay tests passed. The optimized canonical
+  replay preserved `2521` anchors, `48944/24526` searched/accepted fiberlets,
+  `2473` graph nodes, failures `2/1`, and the same failure arc positions.
+- Performance did not improve: command wall was `4.80 s`, anchor wall
+  `2.832 s`, anchor CPU `74.774 s`, and peak search `20.095` worker-seconds,
+  versus the matched checkpoint-48 run's `4.77 s`, `2.819 s`, `73.375 s`, and
+  `18.695` worker-seconds. Checkpoint 53 is rejected and all production, test,
+  and helper edits were removed. Clang/OpenCV-4 validation was skipped after
+  the targeted phase decisively regressed.
+
+## Checkpoint 54: trust bounded subpixel peak fits
+
+- Selected the `28,348` uncached acceptance response scans in the canonical
+  peak search. At least `24,400` are the separable candidates used as final
+  anchor positions; the remainder validate diagnostic joint candidates.
+- The experiment retains the discrete local maximum, feasible neighbors,
+  negative curvature, half-step clamp, and owner/window bounds, but trusts the
+  bounded parabolic candidate instead of rescanning the complete observation
+  stream. This is a deliberate quality tradeoff, not a numeric-equivalent
+  optimization.
+- Independent review required splitting diagnostic joint and production
+  separable guards. Checkpoint 54a now changes only diagnostic joint acceptance;
+  separable anchor positions and their response guard remain exact. A later
+  54b must explicitly cover cross-coupled lower-response fits, near-flat
+  curvature, partial axes, domain rejection, and matched-anchor geometry.
+- Checkpoint 54a removed `3,948` diagnostic joint response scans and preserved
+  the exact replay artifact. Two alternating pairs nevertheless increased peak
+  work from `18.701/18.880` to `19.442/19.436` worker-seconds; a minimal
+  branch-local variant still measured `19.396`. Anchor CPU and command wall did
+  not improve consistently. The joint guard is restored and 54a is rejected.
+- A temporary guarded profile for 54b found `8,144/24,400` separable candidates
+  rejected by the owner/response guard. Their proposed offset sum was `452.05`
+  and maximum `0.3373` prediction voxels. The candidate therefore adds a
+  scale-aware curvature floor and is evaluated as an explicit geometry tradeoff.
+- Checkpoint 54b removed all `28,348` acceptance scans and added a scale-aware
+  negative-curvature floor. The optimized replay changed anchors `2521 -> 2516`,
+  accepted fiberlets `24526 -> 24496`, and graph nodes `2473 -> 2469`; failure
+  counts and arc locations remained stable. Peak work was `18.701 s` versus
+  `18.695 s` in the matched checkpoint-48 baseline, with command wall `4.76 s`
+  versus `4.77 s`. With no measurable saving and changed geometry/populations,
+  checkpoint 54b is rejected and the response guards are restored.
+
+## Checkpoint 55: weighted-direction proposal records
+
+- Replaced separate normalized direction and presence in the private compact
+  proposal record with `sqrt(presence) * direction`, reducing each record from
+  `32` to `28` bytes. Expanded/public fitting remained unchanged and focused
+  anchor/replay tests passed.
+- The canonical screen retained `2521` anchors and failures `2/1`, but accepted
+  fiberlets changed `24526 -> 24523`. Robust proposal work regressed from the
+  matched checkpoint-48 `18.768 s` to `19.585 s`; anchor CPU rose
+  `73.375 -> 74.573 s`, and command wall was `4.79 s` versus `4.77 s`.
+- The added square root, norm reconstruction, and alignment division cost more
+  than the 12.5% record shrink saved. Checkpoint 55 is rejected and removed.
+
+## Checkpoint 56: robust proposal subphase profile
+
+- Temporary exclusive timing on the restored checkpoint-48 implementation
+  measured `18.580 s` total proposal work: accumulation `17.412 s` (93.7%),
+  cutoff materialization `0.966 s`, cutoff selection `0.088 s`, buffer setup
+  `0.078 s`, and tensor reduction `0.025 s`.
+- The diagnostic replay preserved exact checkpoint-48 populations and failure
+  locations. Temporary profile schema 26 and all timers were removed. Further
+  work should target the accumulation kernel rather than buffer initialization
+  or histogram reduction.
+
+## Checkpoint 57: compile-time robust proposal modes
+
+- Instantiated separate axis-producing and membership-only private proposal
+  kernels so the latter had no tensor storage or per-observation tensor branch.
+  Focused tests passed and the canonical artifact remained exact.
+- Membership proposal work improved `6.167 -> 6.115 s`, but axis proposal work
+  regressed `12.413 -> 12.719 s`; total proposal work was `18.834 s` versus the
+  instrumented restored kernel's `18.580 s`. Command wall remained `4.76 s`.
+- The split is rejected because code-generation growth displaced more axis-path
+  performance than it saved in membership. The single runtime kernel is
+  restored.
+
+## Checkpoint 58: fixed component-count proposal kernels
+
+- Instantiated one- and two-component proposal kernels and dispatched once per
+  call. Focused tests and canonical output remained exact.
+- Proposal work regressed to `19.296 s` (`12.902 s` axis and `6.394 s`
+  membership), preparation rose to `4.099 s`, and anchor CPU reached
+  `75.034 s`; command wall was `4.79 s`. The restored instrumented kernel was
+  `18.580 s` proposal work and `73.737 s` anchor CPU.
+- Checkpoint 58 is rejected. Compiler specialization/code-size growth did not
+  improve the already small component loops, so runtime component count is
+  restored.
+
+## Checkpoint 59: split proposal logical-index stream
+
+- Split the exact 32-byte proposal payload into a 28-byte hot observation and
+  parallel 4-byte logical-index stream. Accumulation consumed both in lockstep;
+  cutoff materialization consumed only indices. Focused tests and canonical
+  output remained exact, and bounded scratch bytes were unchanged.
+- Proposal work was effectively flat at `18.558 s` versus `18.580 s`, while
+  proposal preparation rose `3.754 -> 4.251 s`. Anchor CPU regressed to
+  `75.795 s` and command wall to `4.82 s`.
+- Checkpoint 59 is rejected. The extra stream write/access costs as much as the
+  narrow cutoff scan saves, so the contiguous 32-byte record is restored.
+
+## Checkpoint 60: hoisted compact proposal geometry
+
+- Hoisted compact-path position loading and finite checks out of the component
+  loop, computed each observation's pivot offset once, and precomputed the two
+  component-to-pivot offsets once per robust proposal call. The generic
+  expanded/public Gaussian helper remains unchanged.
+- Focused tests passed. A matched baseline measured `18.791 s` robust-proposal
+  work, `74.140 s` anchor CPU, `2.815 s` anchor wall, and `4.76 s` command wall.
+  Two candidate runs measured `12.168/12.187 s`, `67.995/67.841 s`,
+  `2.622/2.624 s`, and `4.56/4.57 s`, respectively.
+- Anchors remained `2521`, searched/accepted fiberlets remained
+  `48944/24526`, graph nodes remained `2473`, and failures remained `2/1` at
+  identical arc locations. Of 349 emitted route points, 9 changed; p95
+  displacement was zero, mean displacement `8.43e-5`, and maximum displacement
+  `0.00436732` base voxels.
+- Checkpoint 60 is retained. It removes repeated invariant compact geometry
+  without changing the fitting model or accepted extraction populations.
+
+## Checkpoint 61: pivot-relative compact proposal records
+
+- Changed the private production record to store position relative to its
+  cell's fixed pivot. Compact proposal passes consume this offset directly,
+  removing one vector subtraction per eligible record per pass. Record size,
+  order, logical destinations, and expanded/public fitting are unchanged.
+- All 83 focused anchor tests passed. Two canonical runs produced the exact
+  checkpoint-60 SHA-256
+  `29f583fbb254e1b0f48d2783430e01a1d6f7294ba5cfd40358434a105b092780`
+  with unchanged populations and failures.
+- Robust-proposal work improved from `12.168/12.187` to `11.770/11.813`
+  worker-seconds. Anchor CPU was `67.430/67.638` seconds and command wall
+  `4.55/4.56` seconds versus checkpoint 60's `67.995/67.841` and
+  `4.56/4.57`. Checkpoint 61 is retained.
+
+## Checkpoint 62: scalar transverse-distance evaluation
+
+- Tested `dot(offset, offset) - dot(offset, axis)^2` in the private compact
+  Gaussian kernel to avoid constructing the projected transverse vector. The
+  large-coordinate translation fixture failed with `1.125` prediction-voxel
+  anchor displacement due to cancellation.
+- Tested the more stable cross-product norm as a narrowed alternative. The same
+  fixture still failed with `0.166667` prediction-voxel displacement.
+- No replay benchmark was run because focused correctness coverage decisively
+  rejected both forms. The original projected-vector calculation is restored.
+
+## Checkpoint 63: precomputed compact Gaussian constants
+
+- Precomputed the cutoff square and reciprocal Gaussian denominator once per
+  proposal call, replacing hot-loop division with multiplication. All 83
+  focused tests passed and replay output remained byte-identical.
+- Robust-proposal work measured `11.890` worker-seconds and command wall
+  `4.57` seconds, slightly worse than checkpoint 61's `11.770/11.813` and
+  `4.55/4.56`. Checkpoint 63 is rejected and removed.
+
+## Checkpoint 64: fused objective denominator/numerator traversal
+
+- Fused denominator and retained numerator updates around one Gaussian value,
+  without checkpoint 17's temporary Gaussian arrays. All 83 focused anchor
+  tests passed.
+- The isolated objective nevertheless regressed: local state evaluation rose
+  from `14.334` to `17.223` worker-seconds, anchor CPU from `67.638` to
+  `70.679` seconds, and command wall from `4.56` to `4.65` seconds.
+- Checkpoint 64 is rejected and removed. The compiler favors the original
+  branch-free denominator pass despite its source-level numerator call.
+
+## Checkpoint 65: selected-cell-first ready-queue ordering
+
+- Stable-partitioned each prepared tile's ready tasks so selected cells enter
+  the cooperative queue before context-only cells. Results remain indexed by
+  canonical cell index; fitting and output order are unchanged.
+- All 83 focused tests passed. Two canonical runs retained exact SHA-256
+  `29f583fbb254e1b0f48d2783430e01a1d6f7294ba5cfd40358434a105b092780`
+  and unchanged populations/failures.
+- Anchor wall measured `2.586/2.615` seconds (median `2.601`) versus checkpoint
+  61's `2.607/2.622` (median `2.615`). CPU was flat and command wall
+  `4.53/4.57` versus `4.55/4.56`. Checkpoint 65 is retained as a small,
+  deterministic scheduling improvement.
+
+## Checkpoint 66: finite prepared-proposal invariant
+
+- Required finite positions when preparing private compact proposal records,
+  then removed repeated finite checks from all compact robust-proposal passes.
+  Invalid positions still remain unassigned; public/expanded fitting remains
+  defensive.
+- All 83 focused tests passed. Both canonical runs retained exact SHA-256
+  `29f583fbb254e1b0f48d2783430e01a1d6f7294ba5cfd40358434a105b092780`,
+  populations, counters, and failures. Unchanged prepared-record counts confirm
+  production generated positions were already all finite.
+- Proposal work improved from checkpoint 65's `11.780/11.839` to
+  `10.771/10.818` worker-seconds. Anchor CPU fell to `66.445/66.340` seconds
+  and command wall to `4.53/4.52`. Checkpoint 66 is retained.
+
+## Checkpoint 67: finite-position production objective kernel
+
+- Added checked and finite-position compact objective instantiations and routed
+  only production extraction through the latter. Focused invalid-position and
+  valid parity tests passed.
+- The additional instantiation severely perturbed the isolated objective code:
+  state evaluation regressed from `14.309` to `21.240` worker-seconds, anchor
+  CPU from `66.340` to `72.396` seconds, and command wall from `4.52` to
+  `4.67` seconds.
+- Checkpoint 67 is rejected and fully removed. This repeats the earlier trusted-
+  objective code-size warning; no analogous final-evaluation specialization is
+  attempted without a different implementation strategy.
+
+## Checkpoint 68: finite generated positions in existing peak kernels
+
+- Marked only the existing internally generated indexed compact observation
+  range as having finite positions. Peak-owner bounds and peak-record
+  preparation compile out their repeated finite checks for this range; generic
+  and public paths remain defensive. No additional template instantiation or
+  compatibility API was added.
+- All 83 focused anchor tests passed. Two canonical replays retained exact
+  SHA-256 `29f583fbb254e1b0f48d2783430e01a1d6f7294ba5cfd40358434a105b092780`,
+  with unchanged populations and failures.
+- Peak-search work measured `17.533/17.565` worker-seconds versus approximately
+  `18.94` before this checkpoint. Anchor CPU measured `65.027/65.175` seconds
+  versus `66.340`, and command wall measured `4.50/4.51` seconds versus `4.52`.
+  Checkpoint 68 is retained.
+
+## Checkpoint 69: square-root-free peak gradient votes
+
+- Rewrote the clamped peak gradient vote into its algebraically equivalent
+  squared-dot form. Inward/outward attribution uses the unchanged radial-dot
+  sign; response traversal, sparse evidence, accumulation order, and peak
+  search remain unchanged. This removes one square root from each of roughly
+  `80.2M` evidence visits.
+- All 83 focused anchor tests passed. Both canonical runs retained `2521`
+  anchors, `48944/24526` searched/accepted fiberlets, `2473` graph nodes, and
+  failures `2/1` at the same locations. Ten internal DP nodes changed from
+  expression rounding, but all 349 emitted route points were exactly unchanged.
+- Peak-search work improved from checkpoint 68's `17.533/17.565` to
+  `17.366/17.422` worker-seconds. Anchor CPU improved from `65.027/65.175` to
+  `64.736/64.792` seconds, and command wall from `4.50/4.51` to `4.48/4.48`.
+  Checkpoint 69 is retained.
+
+## Checkpoint 70: corridor endpoint fast acceptance
+
+- Added a direct fast acceptance for lattice offsets strictly inside the
+  transverse corridor radius. The corresponding layer center is a corridor
+  polyline vertex, so these points cannot fail the segment-distance test.
+  Exact-boundary and outer-square points retain the original segment search.
+- The initial non-strict endpoint-distance variant admitted 691 boundary nodes
+  because its floating endpoint test did not reproduce the segment routine's
+  boundary rounding. That form is discarded. The strict lattice-radius form
+  retains exact SHA-256
+  `29f583fbb254e1b0f48d2783430e01a1d6f7294ba5cfd40358434a105b092780`,
+  populations, DP counters, routes, and failures in both canonical runs.
+- Corridor segment tests fell from `222.879M` to `172.709M`. Node-enumeration
+  work improved from approximately `13.03/13.21` to `12.40/12.61` worker-
+  seconds, fiberlet CPU from `45.04/45.33` to `44.58/44.94` seconds, and command
+  wall measured `4.45/4.49` seconds. Checkpoint 70 is retained.
+
+## Checkpoint 71: monotonic enumerated node keys
+
+- Replaced repeated checked packed-key construction in local-node enumeration
+  with the key already implied by the validated monotonic lattice traversal.
+  The checked packing helper remains for independent callers. Node order,
+  coordinates, key values, and all downstream behavior are unchanged.
+- Both canonical runs retained exact SHA-256
+  `29f583fbb254e1b0f48d2783430e01a1d6f7294ba5cfd40358434a105b092780`
+  and all populations, counters, routes, and failures.
+- Node-enumeration work improved from checkpoint 70's `12.399/12.615` to
+  `12.159/12.250` worker-seconds, preparation CPU from `20.527/20.646` to
+  `20.189/20.216`, and fiberlet CPU from `44.580/44.940` to `44.014/44.110`.
+  Command wall was `4.45/4.47` seconds. Checkpoint 71 is retained.
+
+## Checkpoint 72: row-invariant lattice geometry
+
+- Explicitly hoisted each layer and fixed-`u` row base out of the inner lattice
+  loop while preserving arithmetic parenthesization and exact replay output.
+- Node enumeration measured `12.238` worker-seconds versus checkpoint 71's
+  `12.159/12.250`, while fiberlet CPU regressed to `44.419` seconds versus
+  `44.014/44.110`. The compiler already performs the useful invariant motion;
+  the source rewrite does not improve the enclosing phase.
+- Checkpoint 72 is rejected and the explicit row-base code is removed.
+
+## Checkpoint 73: validated finite-grid bounds in node enumeration
+
+- Reused the existing per-node finite assertion and the corridor builder's
+  validated nonzero grid dimensions. Node enumeration now precomputes the XYZ
+  float upper bounds once per candidate and performs only the inclusive range
+  comparisons; the general defensive grid helper remains unchanged elsewhere.
+- Both canonical runs retained `2521` anchors, `48944/24526` searched/accepted
+  fiberlets, `2473` graph nodes, and failures `2/1` at identical locations.
+  Eight internal retained/DP nodes changed from code-generation rounding, but
+  all 349 emitted route points were exactly unchanged.
+- Node-enumeration work improved from checkpoint 71's `12.159/12.250` to
+  `11.602/11.702` worker-seconds, preparation CPU from `20.189/20.216` to
+  `19.695/19.771`, fiberlet CPU to `43.437/43.469`, and command wall to
+  `4.42/4.44`. Checkpoint 73 is retained.
+
+## Checkpoint 74: layer-corner finite validation
+
+- Replaced per-lattice-point finite checks with four affine transverse-corner
+  validations per layer. Replay behavior remained comparable.
+- Node enumeration measured `11.734` worker-seconds versus checkpoint 73's
+  `11.602/11.702`, while geometry setup also increased. The compiler already
+  exploits the finite/range relationship well enough that the explicit layer
+  proof provides no target gain.
+- Checkpoint 74 is rejected and the per-point finite guard is restored.
+
+## Checkpoint 75: prepared corridor segments
+
+- Precomputed each corridor segment's start, delta, and squared length while
+  preserving segment traversal and point-distance arithmetic.
+- The larger prepared-segment stream regressed node enumeration to `11.935`
+  worker-seconds versus checkpoint 73's `11.602/11.702`, and fiberlet CPU to
+  `43.691` seconds versus `43.437/43.469`. Saved arithmetic did not offset the
+  additional memory traffic.
+- Checkpoint 75 is rejected and the compact reference-point representation is
+  restored.
+
+## Checkpoint 76: two-sided incident-segment fast path
+
+- Tested both centerline segments incident to each curved-domain layer before
+  the complete corridor fallback scan. Containment, populations, routes, and
+  failures remained unchanged.
+- Corridor segment tests fell only from checkpoint 73's `172.709M` to
+  `172.379M` (`0.19%`). Node-enumeration work regressed to `11.780` worker-
+  seconds versus `11.602/11.702`, and fiberlet CPU regressed to `43.541`
+  seconds versus `43.437/43.469`.
+- Checkpoint 76 is rejected and the single preferred incoming segment is
+  restored.
+
+## Checkpoint 77: reusable rolling DP layer buffers
+
+- Reused two candidate-local vectors for alternating current and next DP
+  layers instead of constructing the next-layer vector on every layer.
+  Populations, routes, counters, and failures remained unchanged.
+- Search CPU regressed to `22.280` seconds and DP work to `22.396` worker-
+  seconds versus the retained baseline's approximately `21.82/21.91` seconds.
+  The saved allocations do not offset the retained capacities and repeated
+  assignment path.
+- Checkpoint 77 is rejected and the original per-layer vector construction is
+  restored.
+
+## Checkpoint 78: local incident-segment corridor
+
+- Replaced the production complete-polyline corridor scan with the two segment
+  capsules incident to each curved-domain layer. The general complete-polyline
+  helper remains available for diagnostics. This also prevents a distant bend
+  from admitting shortcut nodes into an unrelated layer.
+- Two canonical runs retained `2521` anchors, `48944/24526` searched/accepted
+  fiberlets, `2473` graph nodes, identical routes and failures, and exact
+  replay SHA-256
+  `29f583fbb254e1b0f48d2783430e01a1d6f7294ba5cfd40358434a105b092780`.
+  Only `2606` of `47.8M` internal retained nodes were removed.
+- Segment tests fell from checkpoint 73's `172.709M` to `48.911M`. Node-
+  enumeration work improved from `11.602/11.702` to `10.888/10.930` worker-
+  seconds, preparation CPU from `19.695/19.771` to `18.933/18.952`, and
+  fiberlet CPU from `43.437/43.469` to `42.702/43.010`. Command wall measured
+  `4.41/4.43` seconds. Checkpoint 78 is retained.
+
+## Checkpoint 79: layer-local prepared corridor segments
+
+- Hoisted the two incident segments' delta and squared length into each layer
+  and routed local corridor tests through a prepared scalar helper. Replay
+  output and all populations remained unchanged.
+- Node-enumeration work measured `10.935` worker-seconds versus checkpoint 78's
+  `10.888/10.930`, and fiberlet CPU measured `42.885` seconds versus
+  `42.702/43.010`. There is no measurable benefit.
+- Checkpoint 79 is rejected and the original compact point/segment helper is
+  restored.
+
+## Checkpoint 80: single-page interpolation-cell corner insertion
+
+- Extracted one authoritative interpolation-cell decomposition shared by
+  weighted interpolation and corner collection. Cells with eight active
+  corners in one `16^3` sparse bitmap page resolve that page once and set the
+  eight local bits directly; integer, boundary, and page-crossing cells retain
+  general insertion.
+- Two canonical runs retained exactly `170512` globally sampled voxels in the
+  same order, all path/graph populations and failures, and replay SHA-256
+  `29f583fbb254e1b0f48d2783430e01a1d6f7294ba5cfd40358434a105b092780`.
+- Corner-collection work improved from checkpoint 78's `8.054/8.068` to
+  `2.827/2.854` worker-seconds, preparation CPU from `18.933/18.952` to
+  `13.541/13.637`, fiberlet CPU to `37.004/37.541`, and command wall from
+  `4.41/4.43` to `4.23/4.27` seconds. Checkpoint 80 is retained.
+
+## Checkpoint 81: chordal interior-DP smoothness
+
+- Replaced inverse-trigonometric angular squares only in reused interior DP
+  transitions with squared chordal angular distance. Source, sink, direct,
+  public, and diagnostic scoring remain on the angular implementation.
+- Two canonical runs retained `2521` anchors, `48944/24526`
+  searched/accepted fiberlets, `2473` graph nodes, failures `2/1`, and exact
+  emitted route coordinates and lengths. Total and component costs changed as
+  expected; DP relaxations changed by about ten thousand out of `58.2M`.
+- Search CPU improved from checkpoint 80's approximately `21.94/22.02` to
+  `19.334/19.478` seconds. Fiberlet CPU improved from `37.004/37.541` to about
+  `35.0` seconds and command wall from `4.23/4.27` to `4.15/4.16` seconds.
+  Checkpoint 81 is retained as an intentional numerical approximation with
+  unchanged canonical geometry.
+
+## Checkpoint 82: chordal-only outgoing-edge preparation
+
+- Split the shared candidate-smoothness preparation at compile time so public
+  angular callers still compute `normalAngle`, while interior chordal DP does
+  not compute the unused per-edge `asin`.
+- Both canonical runs were byte-identical to checkpoint 81, including costs,
+  populations, routes, graph, and failures.
+- Search CPU measured `19.156/19.205` seconds versus checkpoint 81's
+  `19.334/19.478`, and wall measured `4.15/4.17` seconds. Checkpoint 82 is
+  retained as a small behavior-neutral removal of dead work.
+
+## Checkpoint 83: batched chordal smoothness
+
+- Extended the outgoing alignment SoA with normal/tangent fields and evaluated
+  chordal smoothness across its valid lanes before scalar DP relaxation.
+- Canonical populations, routes, and failures remained unchanged, but search
+  CPU measured `19.132` seconds versus checkpoint 82's `19.156/19.205`, which
+  is performance-neutral.
+- Checkpoint 83 is rejected. The widened batch, batched kernel, and tolerance-
+  based oracle are removed; checkpoint 82's compact scalar path is restored.
+
+## Checkpoint 84: projected-component chordal smoothness
+
+- Replaced normalized tangent/normal-angle chordal interior smoothness with a
+  decomposition into the scalar normal projection and unnormalized tangent-
+  plane vector. At equal weights their squared differences sum exactly to the
+  full direction chord. Zero-free-angle evaluation needs no square root,
+  normalization, division, or trigonometry per transition.
+- Two canonical runs kept `2521` anchors, `48944/24526` searched/accepted
+  fiberlets, `2473` graph nodes, failures `2/1`, and exact emitted route points
+  and lengths. Internal reached nodes and graph transitions changed slightly.
+- Search CPU improved from checkpoint 82's `19.156/19.205` to
+  `18.612/18.612` seconds; wall measured `4.14/4.15` seconds. Checkpoint 84 is
+  retained and the superseded private normalized-chordal implementation is
+  removed.
+
+## Checkpoint 85: compact projected-chordal edge descriptor
+
+- Replaced each stored outgoing edge's full angular candidate metric with a
+  private projected descriptor containing only direction, normal, normal
+  projection, and mode; its layout is asserted at no more than 32 bytes.
+- Both canonical artifacts were byte-identical to checkpoint 84. Search CPU
+  improved from `18.612/18.612` to `18.414/18.438` seconds and wall remained
+  about `4.14` seconds. Checkpoint 85 is retained.
+
+## Checkpoint 86: direct outgoing alignment append
+
+- Wrote prediction orientation and alignment factors directly into the SoA
+  batch instead of constructing a full temporary candidate metric.
+- Search CPU measured `18.355` seconds versus checkpoint 85's
+  `18.414/18.438`, but cost serialization changed from floating-point
+  instruction-order differences. The small gain does not justify the duplicate
+  implementation or additional numerical divergence.
+- Checkpoint 86 is rejected and the shared candidate preparation plus append
+  path is restored.
+
+## Checkpoint 87: optional spatial-objective verification
+
+- Made direct installation of the projected, clamped retained-evidence centroid
+  the default local position update. Added `--verify-spatial-objective` to retain
+  the previous full-support objective comparison and deterministic halving.
+- Profile schema version 26 adds direct-centroid acceptances. Fast mode reports
+  `24550` direct acceptances, zero backtracking evaluations, and zero refined-
+  state evaluation visits; verification-focused tests retain the old path.
+- Two canonical fast-mode runs were byte-identical. Compared with checkpoint
+  85, anchors changed `2521 -> 2520`, accepted fiberlets `24526 -> 24493`, and
+  graph nodes `2473 -> 2472`; failures remained `2/1`. Route p50/p95 movement
+  was zero and maximum displacement was `0.005524` base voxels.
+- Anchor CPU improved from `64.837` to `50.797/50.251` seconds and command wall
+  from about `4.14` to `3.68/3.69` seconds. Checkpoint 87 is retained as an
+  explicit speed/quality policy with the stricter verifier still available.
+
+## Checkpoint 88: lazy separable grid-Gaussian streams
+
+- Cached signed radial offsets and one-dimensional Gaussian factors for each
+  first/second grid coordinate actually requested by peak search. Subpixel
+  acceptance retained the original scalar response, and the 2D cutoff,
+  evidence traversal, gradients, response order, and hill climb were unchanged.
+- The canonical run materialized `169282` streams containing `1.382B` values.
+  Peak work regressed `17.294 -> 23.871` worker-seconds, anchor CPU
+  `50.251 -> 57.638` seconds, and command wall `3.69 -> 3.89` seconds.
+- Checkpoint 88 is rejected. The stream cache and temporary version-27 profile
+  fields are removed, restoring checkpoint 87.
+
+## Checkpoint 89: post-cutoff compact tensor accumulation
+
+- Replaced per-residual-bin compact tensor updates with one assigned-mass value
+  per prepared observation and accumulated retained tensors during cutoff
+  materialization. Public/expanded fitting remained unchanged.
+- The canonical run kept command wall at `3.69` seconds, while robust-axis work
+  regressed `7.130 -> 7.356` worker-seconds and local refinement
+  `16.197 -> 16.642` seconds. Anchors changed `2520 -> 2519` and accepted
+  fiberlets `24493 -> 24480`.
+- Checkpoint 89 is rejected. The mass stream, changed accumulation order, and
+  extra bounded-memory accounting are removed.
+
+## Checkpoint 90: nearest-table peak Gaussian
+
+- Replaced only the transverse peak-response `exp(-x)` after the exact radial
+  cutoff with a nearest lookup in an immutable 2049-entry float table over
+  `[0,8]`. Out-of-domain/nonfinite values retain `exp`; axial Gaussians and all
+  search, evidence, gradient, and acceptance logic are unchanged.
+- Added one shared private helper and direct coverage for exact endpoints,
+  monotonicity, fallback, NaN propagation, and less than `0.21%` maximum
+  relative error. All 84 focused anchor cases pass.
+- Three canonical runs were deterministic with SHA-256
+  `d4277b5f87a189aa4a1f96118733120ae25d7d80438b53459ad3dc9ce4f5ee2b`.
+  Peak work improved `17.294 -> 15.465/15.496/15.328`, anchor CPU
+  `50.251 -> 48.452/48.592/48.308`, and wall
+  `3.69 -> 3.59/3.63/3.58` seconds.
+- Anchors remained `2520`, accepted fiberlets changed by three, graph nodes
+  remained `2472`, and failures remained `2/1`. Route geometry remained close;
+  one route omitted one point, with symmetric nearest-path p95 zero and maximum
+  `6.57` base voxels. Checkpoint 90 is retained.
+
+## Checkpoint 91: compact robust-proposal Gaussian lookup
+
+- Reused the checkpoint-90 lookup for the compact robust direction proposal
+  while retaining exact cutoff predicates and the expanded/public path.
+- Wall improved only `3.58 -> 3.56` seconds and anchor CPU
+  `48.308 -> 47.845` seconds. In exchange, anchors changed `2520 -> 2513` and
+  searched/accepted fiberlets changed `48897/24490 -> 48660/24388`.
+- Checkpoint 91 is rejected. Robust membership is too sensitive to this
+  approximation for its small enclosing gain, and exact `exp` is restored.
+
+## Checkpoint 92: reuse final-evaluation Gaussian values
+
+- Reused the Gaussian already computed for each component denominator when
+  accumulating the retained assigned component's numerator and presence mass.
+- The replay artifact remained byte-identical to checkpoint 90. Final-
+  evaluation work improved `4.495 -> 4.312` worker-seconds; enclosing wall and
+  CPU stayed within run noise.
+- Checkpoint 92 is retained as a small exact simplification.
+
+## Checkpoint 93: nearest-table peak axial Gaussian
+
+- Extended checkpoint 90's tested lookup to axial peak preparation after the
+  exact support cutoff, removing roughly 199 million remaining peak-search
+  exponential evaluations in the canonical run.
+- Peak work improved `15.380 -> 14.589` worker-seconds, anchor CPU
+  `48.111 -> 47.480` seconds, and wall `3.61 -> 3.56` seconds.
+- Anchors and failures were unchanged. Accepted fiberlets changed by three;
+  greedy routes were identical and fiberlet p95/max displacement was
+  `0.00437/0.00895` base voxels. Checkpoint 93 is retained.
+
+## Checkpoint 94: quantify peak radial survivors
+
+- Profile schema 27 records exact radial-cutoff survivors with one local hot-
+  loop increment. The canonical run found `663893054/2367683884`, or `28.0%`.
+- The replay artifact was byte-identical to checkpoint 93 and measured overhead
+  was negligible. The diagnostic is retained.
+
+## Checkpoint 95: peak-plane CSR broad phase
+
+- Reordered peak response records into a bounded 2D CSR grid and visited only
+  buckets intersecting each response's cutoff square.
+- Indexed visits fell 45.5%, but peak work regressed `14.603 -> 15.118`
+  worker-seconds and wall changed `3.61 -> 3.62` seconds. Route points were
+  unchanged.
+- Checkpoint 95 is rejected. CSR construction and fragmented traversal cost
+  more than the skipped arithmetic; the index and its schema field are removed.
+
+## Checkpoint 96: one-axis contiguous peak buckets
+
+- Stable counting-reordered response records by one transverse coordinate so
+  each response traversed one contiguous cutoff range.
+- Examined records fell 30.4%, but peak work regressed
+  `14.603 -> 15.353` worker-seconds. Emitted route points were unchanged.
+- Checkpoint 96 is rejected. Even contiguous bucketing is not amortized by the
+  small number of responses per component; all candidate code is removed.
+
+## Checkpoint 97: sparse retained centroid traversal
+
+- Built component-local retained logical-index lists during the existing
+  compact cutoff pass and traversed them directly for centroid accumulation.
+  Expanded/public fitting retains its full defensive scan.
+- Actual centroid visits fell `1608838400 -> 19153533` and centroid work
+  `1.492 -> 0.536` worker-seconds. Anchor CPU improved
+  `47.615 -> 46.606` seconds; command wall measured `3.58` seconds.
+- The replay artifact remained byte-identical. Checkpoint 97 is retained and
+  worst-case index storage is covered by worker admission.
+
+## Checkpoint 98: membership-first peak evidence preparation
+
+- Moved direction validation and alignment behind the existing retained-
+  assignment test during peak record preparation. Denominator geometry and all
+  evidence order/equations remain unchanged.
+- Peak work improved `14.603 -> 12.873` worker-seconds, anchor CPU
+  `46.606 -> 45.004` seconds, anchor wall `1.975 -> 1.906` seconds, and command
+  wall `3.58 -> 3.49` seconds.
+- The replay artifact remained byte-identical. Checkpoint 98 is retained.
+
+## Checkpoint 99: reuse refinement support bounds for peak ownership
+
+- Carried the exact six support-bound floats already computed during refinement
+  into peak ownership instead of rescanning the complete support.
+- Peak work improved `12.873 -> 11.833` worker-seconds and anchor CPU
+  `45.004 -> 44.014` seconds. Anchor wall stayed `1.906` seconds; command wall
+  measured `3.51` seconds while the unrelated fiberlet phase was slower.
+- The canonical artifact remained byte-identical. Checkpoint 99 is retained.
+
+## Checkpoint 100: finite compact positions in robust preparation
+
+- Reused the generated compact range's finite-position invariant while
+  collecting observed bounds and proposal records, removing two repeated
+  finite checks per compact observation. Expanded/public inputs stay defensive.
+- Preparation improved `3.952 -> 3.527` worker-seconds, local refinement
+  `14.990 -> 14.534`, anchor CPU `44.014 -> 43.231` seconds, and wall
+  `3.51 -> 3.46` seconds.
+- The canonical artifact remained byte-identical. Checkpoint 100 is retained.
+
+## Checkpoint 101: carry known compact support bounds
+
+- Derived full-halo observation bounds from the fixed support stencil once and
+  carried them through the indexed compact range. Clipped/general ranges still
+  derive bounds from their actual indices.
+- Preparation improved `3.527 -> 3.105` worker-seconds, local refinement
+  `14.534 -> 14.148`, anchor wall `1.882 -> 1.850`, and command wall
+  `3.46 -> 3.45` seconds. Anchor CPU measured `43.036` seconds.
+- The canonical artifact remained byte-identical. Checkpoint 101 is retained.
+
+## Checkpoint 102: cache compact direction eligibility
+
+- Computed the complete configured compact direction/presence eligibility
+  predicate once per unique shared observation and stored it in existing record
+  padding. Reused it across all compact fitting consumers; arbitrary expanded
+  observations retain defensive validation.
+- Preparation improved `3.105 -> 2.065` worker-seconds, local refinement
+  `14.148 -> 12.997`, anchor CPU `43.036 -> 41.942` seconds, and command wall
+  `3.45 -> 3.44` seconds.
+- The canonical artifact remained byte-identical. Checkpoint 102 is retained.
+
+## Checkpoint 103: split peak denominator and evidence traversal
+
+- Removed the dense evidence-index stream from peak search. Dense 12-byte
+  response records now serve denominator traversal, while sparse self-contained
+  32-byte evidence records carry the geometry needed by numerator and gradient
+  traversal in original observation order.
+- Peak work improved `11.805 -> 11.586` worker-seconds, anchor wall
+  `1.850 -> 1.804` seconds, command wall `3.44 -> 3.40` seconds, and anchor CPU
+  `41.942 -> 41.811` seconds.
+- The canonical artifact remained byte-identical. Checkpoint 103 is retained;
+  profile schema 29 removes the obsolete evidence-index-size field.

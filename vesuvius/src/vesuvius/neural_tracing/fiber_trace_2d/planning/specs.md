@@ -2532,13 +2532,26 @@
   angular line search. A retained tensor without the existing unique principal
   axis removes only that component while preserving stable diagnostic ancestry.
   Supported close components are not merged before refinement.
+- Production compact cutoff materialization also records retained logical
+  indices per component in the same order. The immediately following centroid
+  traverses those sparse indices rather than rescanning the complete support;
+  expanded/public fitting retains the full defensive scan. Worst-case index
+  storage is included in worker memory admission.
+- Production compact observations cache the complete configured direction and
+  presence eligibility predicate once per unique sampled voxel. All compact
+  fitting consumers reuse that bit; arbitrary expanded/public observations
+  continue to validate direction, presence, and validity on each use. The bit
+  occupies existing trailing record padding and does not enlarge the compact
+  observation.
 - Its position target is the retained assigned
   `g_ik p_i (d_i dot u_k)^2` centroid projected onto the plane through the cell
-  pivot normal to the updated direction. Deterministic backtracking changes
-  position only and tests `1, 1/2, ...` through the first displacement at or
-  below the peak-grid step; the first strict spatial-objective improvement is
-  accepted. Direction remains installed even when position does not improve.
-  Transverse displacement is clamped to the local window and prediction grid.
+  pivot normal to the updated direction. The default fast path accepts the
+  projected, clamped centroid directly. `--verify-spatial-objective` enables
+  deterministic position-only backtracking at `1, 1/2, ...` through the first
+  displacement at or below the peak-grid step and accepts the first strict
+  objective improvement. Direction remains installed even when verified
+  position does not improve. Transverse displacement is clamped to the local
+  window and prediction grid in both modes.
 - The spatial objective and final aligned support use retained evidence in the
   numerator and `sum g_ik` over every sampled lattice site for each active
   component in the denominator. The denominator is independent of site
@@ -2601,6 +2614,12 @@
   bounds independent of presence, direction, assignment, or trim state. The
   broad direction fit
   continues to use its separate fixed axial half-width.
+- After the exact transverse and axial support cutoffs, peak search uses the
+  nearest value in an immutable 2049-entry float table for `exp(-x)` over
+  normalized exponent `[0,8]`. Inputs outside that range retain `exp`. The
+  default cutoff reaches exponent `4.5`; the lookup's maximum tested relative
+  error is below `0.21%`. All robust-direction and final-support Gaussian
+  calculations retain the standard exponential.
 - The peak grid is anchored at the fixed cell pivot and uses canonical
   transverse basis construction, configured prediction-voxel step, a circular
   local window, and continuous voxel-Voronoi ownership
@@ -2792,11 +2811,18 @@
   domain, one corridor enumeration, checked packed local keys, and mapped
   positions. DP reuses this representation and never reconstructs the domain,
   corridor, or local nodes. Local corridor admission uses float32 continuous
-  point-to-segment distance. It tests one segment adjacent to the node's layer
-  first and scans the remaining segments only when that test fails; this is the
-  same unordered union-of-segment-capsules predicate as a complete scan.
+  point-to-segment distance against only the two centerline segments incident
+  to the node's curved-domain layer. Points strictly inside the layer center's
+  transverse-radius circle are admitted directly. This is a layer-local tube,
+  not a union over distant candidate segments, so separate bends cannot admit
+  shortcut nodes into one another's layers.
 - Preparation accumulates positive-weight native corners in worker-local sets.
-  Sorted worker vectors are reduced by deterministic pairwise unique merges to
+  The authoritative interpolation-cell decomposition is shared with weighted
+  interpolation. When all eight positive-weight corners occupy one `16^3`
+  bitmap page, preparation resolves that page once and sets the eight local
+  bits directly; lower-cardinality and page-crossing cells use the general
+  per-corner insertion path. Sorted worker vectors are reduced by deterministic
+  pairwise unique merges to
   one complete stored-ZYX ordered global union. Its exact contents and size are
   invariant under worker count and `--batch`, including shared corners and
   selection-boundary corners.
@@ -2922,8 +2948,19 @@
   normal-tilt costs; otherwise it emits only the isotropic fallback. Fiberlet
   defaults are isotropic/normal/tangent weights `2/0.1/10` and a zero-degree
   free angle, matching greedy tracing. The per-turn value is divided by
-  `max(1,(previous_edge_length+candidate_edge_length)/2)`. Cumulative history
-  smoothness is not part of this DP.
+  `max(1,(previous_edge_length+candidate_edge_length)/2)`. Public scoring and
+  exact source/sink transitions retain squared angular distance. For a valid
+  normal, reused interior DP transitions split each unit direction into its
+  scalar normal projection and unnormalized tangent-plane vector, then apply
+  the configured normal/tangent weights to the squared component differences.
+  At equal weights these sum exactly to the full squared direction chord.
+  Invalid normals use isotropic squared chordal distance
+  `2*(1-cos(theta))`. A nonzero free angle is converted to chord length and
+  subtracted from each component magnitude before squaring. This avoids
+  inverse trigonometry and, at the zero-free-angle default, all per-transition
+  square roots and divisions. It intentionally permits cost and path
+  differences from the angular API. Cumulative history smoothness is not part
+  of this DP.
 - `fiberlets.json` stores explicit source paths/hashes, base-volume coordinates,
   parameters, diagnostics, every considered endpoint pair and reason, component
   cost totals, and successful base-coordinate paths. Every successful scored
@@ -3091,7 +3128,7 @@
   Benchmark comparisons must retain identical inputs, parameters, build type,
   and interval.
 - Benchmark and full replay extraction emit the same versioned
-  `fiberlet_extraction_profile version=20` key/value schema. The profile exposes
+  `fiberlet_extraction_profile version=26` key/value schema. The profile exposes
   deterministic workload counters and finer anchor/fiberlet phase timings.
   Enclosing phase fields are wall time, `_work_seconds` fields are summed
   worker/candidate time, and CPU fields are process CPU time. Corner insertion
@@ -3101,12 +3138,42 @@
   cost remains in its enclosing phase. Diagnostics must not change sampling,
   fitting, candidate generation, DP math, ordering, serialized artifacts, or
   determinism.
+- Version 22 retains the version-21 split of robust direction proposals into
+  axis-producing and final membership-only calls. For each kind, logical visits count the complete
+  candidate range considered by the first pass, eligible visits count entries
+  passing the immutable validity/presence/direction predicate, indexed visits
+  count entries physically traversed by proposal scoring, and cutoff visits
+  count entries physically traversed while materializing retained membership.
+  The legacy local-tensor visit count remains two times complete logical
+  cardinality per proposal for comparison across implementations.
+- Proposal-buffer counters report complete-cardinality assignment/retained
+  storage initializations plus actual bytes initialized and copied into
+  returned evaluation state. They are diagnostics and do not change fitting
+  behavior.
+- Version 25 materializes compact robust-proposal evidence once per cell in
+  increasing logical-observation order. Each record stores float position,
+  already-normalized direction, presence, and its original logical destination;
+  both axis proposals and final membership reuse the same immutable records.
+  Invalid positions remain represented and naturally contribute zero Gaussian
+  mass. Full-support centroid, objective, peak, and final-support scans retain
+  their shared indexed observation ranges. The profile reports prepared record
+  count/size and summed preparation work, and bounded worker admission replaces
+  the former eligible-index scratch with the full record bytes.
+- Version 26 adds `anchor_fit_direct_centroid_acceptances`. The default fast
+  path increments it for each installed bounded centroid and performs no
+  refined-state objective/backtracking scans. Verification mode leaves it zero
+  and preserves the version-25 objective-candidate, depth, evaluation, and
+  backtracking accounting.
 - Version 20 replaces pair-local tile sampling groups with bounded exact-union
   partitions. Tiles remain in canonical order. Each partition merges exact X
   intervals for structured `(z,y)` rows, samples every union coordinate once
-  in deterministic bounded batches, joins sampling, and then copies contiguous
-  shared ranges into tile-local raw buffers. Large extractions stream through
-  multiple partitions rather than requiring the whole union to remain resident.
+  in deterministic bounded batches, and joins sampling. Version 24 then builds
+  one compact observation and one presence gradient per partition-union voxel.
+  Tiles retain only dense uint32 local-to-union maps. Cell support and owned-
+  observation traversal remain in canonical tile-local Z/Y/X order, and a
+  shared gradient remains usable only where it was interior to that tile's
+  original sample bounds. Large extractions stream through multiple partitions
+  rather than requiring the whole union to remain resident.
   Sampling and fitting worker counts are admitted independently against
   `maximumConcurrentSampleBytes`; shared samples, row metadata, sampler scratch,
   batch/error control, ready-cell queue storage, timing storage, tile buffers,
@@ -3114,10 +3181,12 @@
   reported maximum live-byte ceiling. Every sampler call receives one lower-
   level thread. A failed batch is selected by batch order and assigned to its
   partition cells so final failure propagation remains canonical by cell.
-  Tile owners retain immutable compact observations until all published cells
-  finish. Version 20 reports partition count and duration quantiles, shared
+  Partition owners retain immutable compact observations until all published
+  cells finish. Version 20 reports partition count and duration quantiles, shared
   batch count/maximum size, shared-sampling wall/CPU, shared/accounted bytes,
-  and tile-copy worker time. Submitted voxels count partition unions; reused
+  while version 24 separately reports shared-observation construction and tile
+  index-map worker time. Submitted voxels and shared-observation voxels count
+  partition unions; reused
   voxels count tile occurrences not submitted. The exact whole-extraction tile
   union remains a diagnostic and may be lower than submissions when bounded
   partition boundaries repeat overlap.
@@ -3194,6 +3263,19 @@
   count every hot scan, while evidence-observation visits count indexed records
   actually loaded after radial rejection. Record sizes and maximum temporary
   peak-observation storage are reported explicitly.
+- Version 23 moves peak signal into sparse evidence. Hot response records are
+  12-byte float32 geometry records; sparse evidence records are 20 bytes and
+  contain signal plus direction/gradient evidence. Every radial survivor still
+  contributes to the denominator. Numerator and gradient terms are evaluated
+  only for indexed evidence; nonzero numerator contribution order and all peak
+  equations remain unchanged. Nonzero signal implies evidence, but valid
+  positive-alignment evidence may contain zero signal.
+- Version 29 removes the parallel dense peak-evidence index. Dense 12-byte
+  response records are traversed only for the denominator; self-contained
+  32-byte sparse evidence records carry transverse/axial geometry, signal, and
+  gradient state for a second traversal. Denominator and evidence accumulator
+  orders remain the original observation order. The obsolete evidence-index
+  record-size profile field is removed.
 - Peak response implementations may regroup equivalent accumulation work;
   exact floating-point identity and fixed accumulation order are not required.
   Deterministic repeatability, anchor axis/position distributions, populations,
