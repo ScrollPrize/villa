@@ -9,6 +9,7 @@
 
 #include <opencv2/core.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -51,6 +52,30 @@ public:
     void removeChunkReadyListener(ChunkReadyCallbackId) override {}
 private:
     uint8_t value_;
+};
+
+class ZRampChunkArray : public ConstChunkArray {
+public:
+    vc::render::ChunkResult tryGetChunk(int level, int iz, int iy, int ix) override
+    {
+        auto result = ConstChunkArray::tryGetChunk(level, iz, iy, ix);
+        if (result.status != vc::render::ChunkStatus::Data) return result;
+
+        auto bytes = std::make_shared<std::vector<std::byte>>(*result.bytes);
+        for (int z = 0; z < 8; ++z) {
+            const auto value = std::byte{static_cast<uint8_t>(20 + 40 * z)};
+            for (int y = 0; y < 8; ++y)
+                for (int x = 0; x < 8; ++x)
+                    (*bytes)[(z * 8 + y) * 8 + x] = value;
+        }
+        result.bytes = std::move(bytes);
+        return result;
+    }
+
+    vc::render::ChunkResult getChunkBlocking(int level, int iz, int iy, int ix) override
+    {
+        return tryGetChunk(level, iz, iy, ix);
+    }
 };
 
 cv::Mat_<cv::Vec3f> coordsGrid(int rows, int cols, float z = 0.f)
@@ -215,6 +240,28 @@ TEST_CASE("readCompositeFast: beerLambert is not silently a mean")
     CompositeParams brighter = params;
     brighter.blEmission = params.blEmission * 3.0f;
     CHECK(int(compositeConst(100, brighter)(0, 0)) > int(out(0, 0)));
+}
+
+TEST_CASE("readCompositeFast matches the shared compositor on an ordered ramp")
+{
+    ZRampChunkArray array;
+    auto base = coordsGrid(4, 4);
+    cv::Mat_<cv::Vec3f> normals(4, 4, cv::Vec3f(0.f, 0.f, 1.f));
+
+    LayerStack expectedStack;
+    expectedStack.values = {20.f, 60.f, 100.f, 140.f};
+    expectedStack.validCount = 4;
+
+    for (const std::string method : {"alpha", "beerLambert"}) {
+        CompositeParams params;
+        params.method = method;
+        cv::Mat_<uint8_t> out(4, 4, uint8_t{0});
+        readCompositeFast(out, &array, 0, base, normals, 1.0f, 0, 3, params);
+
+        const auto expected = static_cast<uint8_t>(
+            std::clamp(compositeLayerStack(expectedStack, params), 0.0f, 255.0f));
+        CHECK(out(0, 0) == expected);
+    }
 }
 
 TEST_CASE("readCompositeFast: isoCutoff drops layers below the threshold")
