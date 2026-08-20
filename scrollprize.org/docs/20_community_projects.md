@@ -194,6 +194,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [spiralcheck](https://github.com/Nicodol/spiralcheck) by Nicolas Dolegieviez. Held-out evaluation for whole-scroll spiral fits: scores a finished run from its output meshes alone (CPU-only, no checkpoint, producer-agnostic) against verified patches withheld from that fit, and measures geometrically how much of the withheld evidence actually sits within touching distance of the fit's real inputs — on PHerc. Paris 4, 54.8% of a naive name-level split leaked that way, which no hash-level check can see. Also ships ground-truth-free winding-order checks around the umbilicus, a planted-defect matrix with computed null-control bounds, and `spiralcheck demo`, which runs the whole pipeline on a synthetic scroll with planted defects and needs no data.
 
+- [sheet-topo-bench](https://github.com/tonclap/sheet-topo-bench) by tonclap. A benchmark for topological errors (sheet switch / merger) of scroll surfaces - open problems #3/#4: an error injector with self-generating ground truth, a no-GPU detector (frozen v1 AP 0.65 on two held-out sets; a learned CPU re-ranking examined once on a fresh held-out generation - AP 0.70/0.89, paired gain +0.11/+0.25 significant - against naive baselines <= 0.006), an ERL-for-sheets metric (mm of sheet traced before a topological error), three real-error corpora with three validated prediction-free channels, an address list of verified real 2026 tracing errors, published negative results, and `verify.py`, which recomputes every README number from the shipped runs offline.
+
 ### 📦 Materials
 
 #### 🌟 Highlighted
