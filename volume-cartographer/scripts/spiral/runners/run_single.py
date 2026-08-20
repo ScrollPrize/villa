@@ -25,6 +25,8 @@ DEFAULT_RUN_CONFIG = Path(__file__).with_name("default_run_config.json")
 WANDB_CONFIG_KEYS = ("wandb_project", "wandb_entity")
 TRAINING_HISTORY_FILENAME = "training_metrics.jsonl"
 AGGREGATE_METRICS_FILENAME = "aggregate_metrics.json"
+STATE_FILENAME = ".run_single_state.json"
+STATE_VERSION = 1
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 
 # Executing this file directly puts only runners/ on sys.path.
@@ -92,8 +94,10 @@ def run_id(value: str) -> str:
     return value
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+def add_common_arguments(
+    parser: argparse.ArgumentParser, *, include_gpus: bool = True
+) -> None:
+    """Register operational arguments shared by the single and sweep runners."""
     parser.add_argument("--dataset", required=True, type=Path)
     parser.add_argument(
         "--output",
@@ -102,11 +106,6 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"fit output root (default: {DEFAULT_OUTPUT})",
     )
     parser.add_argument("--ink-volume", required=True, type=Path)
-    parser.add_argument(
-        "--config",
-        type=Path,
-        help="JSON object overlaid on the default run configuration",
-    )
     parser.add_argument(
         "--no-wandb",
         action="store_true",
@@ -127,18 +126,34 @@ def build_parser() -> argparse.ArgumentParser:
         type=positive_int,
         help="positive per-run CPU thread budget",
     )
-    parser.add_argument(
-        "--gpus",
-        type=parse_gpu_ids,
-        metavar="DEVICE[,DEVICE...]",
-        help="physical CUDA devices to use for the entire pipeline; multiple "
-             "devices launch one distributed fit rank per device",
-    )
+    if include_gpus:
+        parser.add_argument(
+            "--gpus",
+            type=parse_gpu_ids,
+            metavar="DEVICE[,DEVICE...]",
+            help="physical CUDA devices to use for the entire pipeline; multiple "
+                 "devices launch one distributed fit rank per device",
+        )
     parser.add_argument(
         "--vc-render-bin",
         type=Path,
         default=DEFAULT_VC_RENDER_BIN,
         help=f"vc_render_tifxyz binary (default: {DEFAULT_VC_RENDER_BIN})",
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    add_common_arguments(parser)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="JSON object overlaid on the default run configuration",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="resume completed stages from a compatible saved run state",
     )
     return parser
 
@@ -495,10 +510,301 @@ def run_pipeline(
     return _load_training_history(history_path), _load_final_summary(fitted_dir)
 
 
+def _atomic_write_json(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _resume_invocation(
+    args: argparse.Namespace, overrides: dict, project: str, entity: str
+) -> dict:
+    gpu_ids = getattr(args, "gpus", None)
+    return {
+        "effective_config": {
+            **overrides,
+            "wandb_project": project,
+            "wandb_entity": entity,
+        },
+        "inputs": {
+            "dataset": str(args.dataset.resolve()),
+            "ink_volume": str(args.ink_volume.resolve()),
+        },
+        "operational_args": {
+            "num_threads": args.num_threads,
+            "no_wandb": args.no_wandb,
+            "vc_render_bin": str(args.vc_render_bin.resolve()),
+        },
+        # Physical IDs may change between attempts; resource shape may not.
+        "gpu_count": None if gpu_ids is None else len(gpu_ids),
+        "seeds": getattr(args, "seeds", None),
+        "requested_run_id": getattr(args, "run_id", None),
+    }
+
+
+def _new_resume_state(invocation: dict) -> dict:
+    seeds = invocation["seeds"]
+    keys = ["single"] if seeds is None else [str(seed) for seed in seeds]
+    batch_id = invocation["requested_run_id"] or uuid.uuid4().hex[:8]
+    return {
+        "version": STATE_VERSION,
+        "invocation": invocation,
+        "effective_config": invocation["effective_config"],
+        "resolved_inputs": invocation["inputs"],
+        "operational_args": invocation["operational_args"],
+        "gpu_count": invocation["gpu_count"],
+        "seeds": seeds,
+        "run_id": batch_id,
+        "batch_id": batch_id if seeds is not None else None,
+        "runs": {
+            key: {
+                "fit": {"status": "pending"},
+                "render": {"status": "pending"},
+                "metrics": {"status": "pending"},
+            }
+            for key in keys
+        },
+    }
+
+
+def _state_artifact(output: Path, stage: dict, key: str) -> Path:
+    value = stage.get(key)
+    if not isinstance(value, str):
+        raise RuntimeError(f"completed stage has no recorded {key}")
+    candidate = (output / value).resolve()
+    try:
+        candidate.relative_to(output)
+    except ValueError as exc:
+        raise RuntimeError(f"state contains an unsafe artifact path: {value}") from exc
+    return candidate
+
+
+def _validate_completed_stages(output: Path, state: dict) -> None:
+    for label, stages in state["runs"].items():
+        fit = stages["fit"]
+        if fit.get("status") == "complete":
+            fitted = _state_artifact(output, fit, "fitted_output")
+            if not fitted.is_dir():
+                raise RuntimeError(
+                    f"completed fit artifact is missing for {label}: {fitted}")
+            history_value = fit.get("training_history")
+            if history_value is not None:
+                history = _state_artifact(output, fit, "training_history")
+                _load_training_history(history)
+        render = stages["render"]
+        if render.get("status") == "complete":
+            ink = _state_artifact(output, render, "ink_output")
+            if not ink.is_dir():
+                raise RuntimeError(
+                    f"completed render artifact is missing for {label}: {ink}")
+        metrics = stages["metrics"]
+        if metrics.get("status") == "complete":
+            metrics_path = _state_artifact(output, metrics, "metrics_output")
+            _load_final_summary(metrics_path.parent.parent)
+
+
+def _load_or_create_state(output: Path, invocation: dict) -> tuple[dict, Path]:
+    state_path = output / STATE_FILENAME
+    if state_path.exists():
+        try:
+            state = _load_json_object(state_path, description="run state")
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        if state.get("version") != STATE_VERSION or not isinstance(state.get("runs"), dict):
+            raise RuntimeError(f"unsupported or malformed run state: {state_path}")
+        if state.get("invocation") != invocation:
+            raise RuntimeError("saved run state does not match the current invocation")
+        seeds = invocation["seeds"]
+        expected_labels = {"single"} if seeds is None else {
+            str(seed) for seed in seeds}
+        if set(state["runs"]) != expected_labels:
+            raise RuntimeError(f"run state has unexpected pipeline entries: {state_path}")
+        if not isinstance(state.get("run_id"), str):
+            raise RuntimeError(f"run state has no valid run ID: {state_path}")
+        if seeds is not None and state.get("batch_id") != state["run_id"]:
+            raise RuntimeError(f"run state has no valid batch ID: {state_path}")
+        for label, stages in state["runs"].items():
+            if (not isinstance(stages, dict)
+                    or any(not isinstance(stages.get(name), dict)
+                           for name in ("fit", "render", "metrics"))):
+                raise RuntimeError(f"malformed stage state for {label}: {state_path}")
+            if any(stages[name].get("status") not in {
+                    "pending", "running", "complete", "failed", "interrupted"}
+                   for name in ("fit", "render", "metrics")):
+                raise RuntimeError(f"invalid stage status for {label}: {state_path}")
+            fit_status = stages.get("fit", {}).get("status")
+            render_status = stages["render"]["status"]
+            metrics_status = stages["metrics"]["status"]
+            if ((render_status != "pending" and fit_status != "complete")
+                    or (metrics_status != "pending" and render_status != "complete")):
+                raise RuntimeError(
+                    f"inconsistent stage dependencies for {label}: {state_path}")
+            if fit_status in {"running", "failed", "interrupted"}:
+                raise RuntimeError(
+                    f"cannot automatically recover {fit_status} fit for {label}")
+        _validate_completed_stages(output, state)
+        return state, state_path
+
+    require_empty_output(output)
+    output.mkdir(parents=True, exist_ok=True)
+    state = _new_resume_state(invocation)
+    _atomic_write_json(state_path, state)
+    return state, state_path
+
+
+def _run_saved_stage(state: dict, state_path: Path, stage: dict, action) -> None:
+    stage["status"] = "running"
+    stage.pop("error", None)
+    _atomic_write_json(state_path, state)
+    try:
+        action()
+    except KeyboardInterrupt:
+        stage["status"] = "interrupted"
+        _atomic_write_json(state_path, state)
+        raise
+    except BaseException as exc:
+        stage["status"] = "failed"
+        stage["error"] = f"{type(exc).__name__}: {exc}"
+        _atomic_write_json(state_path, state)
+        raise
+    stage["status"] = "complete"
+    _atomic_write_json(state_path, state)
+
+
+def _run_resumable_pipeline(
+    args: argparse.Namespace, *, root_output: Path, output: Path,
+    overrides: dict, project: str, entity: str, state: dict,
+    state_path: Path, label: str, seed_run_id: str | None,
+) -> tuple[list[dict], dict]:
+    stages = state["runs"][label]
+    seeded = label != "single"
+    history_path = output / TRAINING_HISTORY_FILENAME if seeded else None
+    gpu_ids = getattr(args, "gpus", None)
+
+    if stages["fit"]["status"] != "complete":
+        output.mkdir(parents=True, exist_ok=True)
+
+        def fit() -> None:
+            subprocess.run(
+                fit_command(args.dataset, gpu_ids), check=True,
+                env=fit_environment(
+                    overrides, output, args.num_threads, wandb_project=project,
+                    wandb_entity=entity, wandb_enabled=not args.no_wandb,
+                    wandb_run_id=seed_run_id, wandb_run_name=seed_run_id,
+                    wandb_group=state["batch_id"] if seeded else None,
+                    metrics_history=history_path,
+                    gpu_ids=gpu_ids))
+            _run_dir, fitted = find_fit_outputs(output)
+            if seeded:
+                _load_training_history(history_path)
+            stages["fit"]["fitted_output"] = str(fitted.resolve().relative_to(root_output))
+            if seeded:
+                stages["fit"]["training_history"] = str(
+                    history_path.resolve().relative_to(root_output))
+
+        _run_saved_stage(state, state_path, stages["fit"], fit)
+
+    fitted_dir = _state_artifact(root_output, stages["fit"], "fitted_output")
+    if stages["render"]["status"] != "complete":
+        def render() -> None:
+            command = [
+                sys.executable, str(SPIRAL_DIR / "render_ink.py"), str(fitted_dir),
+                "--volume", str(args.ink_volume), "--vc-render-bin",
+                str(args.vc_render_bin),
+            ]
+            if args.num_threads is not None:
+                command.extend(["--flatboi-threads", str(args.num_threads),
+                                "--num-processes", "1"])
+            subprocess.run(command, check=True,
+                           env=downstream_environment(args.num_threads, gpu_ids=gpu_ids))
+            ink = fitted_dir / "ink"
+            if not ink.is_dir():
+                raise RuntimeError(f"render completed without expected artifact: {ink}")
+            stages["render"]["ink_output"] = str(ink.resolve().relative_to(root_output))
+
+        _run_saved_stage(state, state_path, stages["render"], render)
+
+    if stages["metrics"]["status"] != "complete":
+        def metrics() -> None:
+            command = [sys.executable, str(SPIRAL_DIR / "get_ink_metrics.py"),
+                       str(fitted_dir / "ink")]
+            if args.num_threads is not None:
+                command.extend(["--procs", str(max(1, args.num_threads // 3))])
+            subprocess.run(command, check=True, env=downstream_environment(
+                args.num_threads, metrics=True, gpu_ids=gpu_ids))
+            metrics_path = fitted_dir / "ink_metric" / "metrics.json"
+            _load_json_object(metrics_path, description="ink metrics")
+            stages["metrics"]["metrics_output"] = str(
+                metrics_path.resolve().relative_to(root_output))
+
+        _run_saved_stage(state, state_path, stages["metrics"], metrics)
+
+    if not seeded:
+        return [], {}
+    return _load_training_history(history_path), _load_final_summary(fitted_dir)
+
+
+def run_resumable(
+    args: argparse.Namespace, overrides: dict, project: str, entity: str
+) -> None:
+    output = args.output.resolve()
+    invocation = _resume_invocation(args, overrides, project, entity)
+    state, state_path = _load_or_create_state(output, invocation)
+    seeds = getattr(args, "seeds", None)
+
+    if seeds is None:
+        _run_resumable_pipeline(
+            args, root_output=output, output=output, overrides=overrides,
+            project=project, entity=entity, state=state, state_path=state_path,
+            label="single", seed_run_id=state["run_id"])
+        return
+
+    histories = []
+    summaries = []
+    batch_id = state["batch_id"]
+    for seed in seeds:
+        seed_overrides = dict(overrides)
+        seed_overrides["optimizer_random_seed"] = seed
+        seed_id = f"{batch_id}_seed_{seed}"
+        history, summary = _run_resumable_pipeline(
+            args, root_output=output, output=output / f"seed-{seed}",
+            overrides=seed_overrides, project=project, entity=entity,
+            state=state, state_path=state_path, label=str(seed),
+            seed_run_id=seed_id)
+        histories.append(history)
+        summaries.append(summary)
+        if not args.no_wandb:
+            log_seed_final_metrics(
+                summary, project=project, entity=entity,
+                seed_run_id=seed_id, group=batch_id)
+
+    if len(seeds) < 2:
+        return
+    training, final = aggregate_metrics(histories, summaries)
+    aggregate = {"run_id": batch_id, "seeds": seeds,
+                 "training": training, "final": final}
+    aggregate_path = output / AGGREGATE_METRICS_FILENAME
+    _atomic_write_json(aggregate_path, aggregate)
+    if not args.no_wandb:
+        log_aggregate_metrics(
+            training, final, seed_count=len(seeds), project=project,
+            entity=entity, aggregate_run_id=f"{batch_id}_aggregate", group=batch_id)
+
+
 def run(args: argparse.Namespace) -> None:
     output = args.output.resolve()
-    require_empty_output(output)
     overrides, wandb_project, wandb_entity = load_run_config(args.config)
+    if getattr(args, "resume", False):
+        run_resumable(args, overrides, wandb_project, wandb_entity)
+        return
+    require_empty_output(output)
     seeds = getattr(args, "seeds", None)
     caller_run_id = getattr(args, "run_id", None)
 
