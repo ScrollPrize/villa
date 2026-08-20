@@ -1,11 +1,11 @@
-"""Optional loader for the VC native Spiral sampling helpers."""
+"""Loader for the compiled VC Spiral sampling helpers."""
 
 import importlib
 import os
 from pathlib import Path
 
 
-def load_native_spiral_sampling():
+def load_spiral_sampling():
     if os.environ.get('VC_DISABLE_NATIVE_SPIRAL_SAMPLING') == '1':
         return None
     try:
@@ -19,4 +19,3 @@ def load_native_spiral_sampling():
             return importlib.import_module('vc.spiral_sampling')
         except ImportError:
             return None
-
