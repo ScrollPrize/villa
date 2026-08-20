@@ -2558,7 +2558,7 @@
   numeric values are float32; direct and indexed fitting differ only in storage
   and indexing.
 - Robust assignment, trimming, direct direction update, and position update run
-  for at most `maximum_iterations`, default 2. This is a bounded alternating
+  for at most `maximum_iterations`, default 1. This is a bounded alternating
   refinement budget, not convergence to exact equality of hard assignment or
   histogram membership sets. An earlier exit is allowed when projective
   direction change is within tolerance and accepted position movement is no
@@ -2901,7 +2901,11 @@
   direction floor and independent presence/direction weights do not exist.
   Fiberlet DP calls the shared prepared-input scoring path with cached unit
   vectors; the regular validating scoring API normalizes and delegates to the
-  same arithmetic.
+  same arithmetic. Interior DP may evaluate the four pair-dependent alignment
+  dots for its valid outgoing slots as one compact structure-of-arrays batch.
+  Valid lanes remain in ascending transition-slot order. Smoothness, complete
+  cost assembly, accumulated-state addition, strict-less relaxation decisions,
+  and backpointer writes remain scalar in the existing order.
 - The source transition uses the fitted start axis as both `a` and `c`, its
   actual mapped direction as `b`, and the dense destination prediction as `d`.
   The sink transition uses the current dense prediction and incoming step, its

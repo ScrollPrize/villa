@@ -4,6 +4,13 @@
   both compact and expanded observation paths in checked float32 arithmetic.
 - Reduced canonical final-evaluation worker time by 4.9%, anchor CPU by 1.4%,
   and total wall by 0.4% with byte-identical replay artifacts.
+- Prepared candidate-side normal-aware smoothness once per outgoing fiberlet DP
+  edge and reused it across incoming states. Canonical search wall and DP worker
+  time improved about 2.0% and 2.1%, respectively, with byte-identical replay
+  artifacts.
+- Prepared current-side and candidate-side multiplicative alignment inputs at
+  their natural DP reuse boundaries. Canonical search wall and DP worker time
+  improved another 2.3% each with byte-identical replay artifacts.
 
 # 2026-08-18: solve-local fiberlet DP reuse
 
@@ -689,6 +696,17 @@
 - Replaced pair-local raw prediction reuse with bounded exact-union sampling
   partitions. The canonical replay submitted 77% fewer prediction voxels;
   median anchor CPU improved 12.1% and command wall 2.2% with exact artifacts.
+- Shared one source-private inline implementation between exported local
+  scoring and the prepared fiberlet DP loop. Canonical median DP search wall
+  improved 9.8% and fiberlet wall 5.7% with exact replay artifacts and work
+  counters.
+- Deferred isotropic-angle evaluation in shared local scoring until an invalid
+  normal or degenerate projected tangent requires it. Canonical median DP
+  search wall improved another 6.2% with byte-identical replay artifacts.
+- Batched the four pair-dependent interior-DP alignment dots across compact
+  valid outgoing lanes while retaining scalar transition relaxation order.
+  Matching optimized runs improved median DP search wall by 5.9% and fiberlet
+  wall by 5.7% with byte-identical replay artifacts.
 
 # 2026-08-19: fiberlet storage quantization experiment
 

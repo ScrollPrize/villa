@@ -6,6 +6,7 @@
 #include "vc/fiber_tracer/FiberLocalScoring.hpp"
 #include "vc/fiber_tracer/FiberGraph.hpp"
 #include "FiberFloatGeometry.hpp"
+#include "FiberLocalScoringInternal.hpp"
 
 #include <algorithm>
 #include <array>
@@ -274,8 +275,8 @@ struct DpNodeScoring {
 struct DpEdge {
     uint32_t next = std::numeric_limits<uint32_t>::max();
     uint32_t scoring = std::numeric_limits<uint32_t>::max();
-    cv::Vec3f metricDirection{0.0f, 0.0f, 0.0f};
     float metricLength = 0.0f;
+    detail::FiberLocalPreparedCandidateMetric candidateMetric;
 };
 
 struct DpAccumulatedCost {
@@ -1590,24 +1591,6 @@ FiberletPathCost pathStepCost(
     return fiberletPathCost(local);
 }
 
-FiberLocalMetricCost pathStepMetricCostPrepared(
-    const FiberLocalMetricSample* currentPrediction,
-    const FiberLocalMetricSample& candidatePrediction,
-    const cv::Vec3f& previousDirection,
-    float previousLength,
-    const cv::Vec3f& candidateDirection,
-    float candidateLength,
-    const cv::Vec3f& normal,
-    bool normalValid,
-    const FiberLocalMetricConfig& config)
-{
-    return fiberLocalMetricCostPrepared(
-        currentPrediction, candidatePrediction,
-        previousDirection, previousLength,
-        candidateDirection, candidateLength,
-        normal, normalValid, config);
-}
-
 bool betterCost(float candidate, float current)
 {
     return candidate < current;
@@ -1972,6 +1955,8 @@ FiberletCandidateResult solveCandidate(
             const uint32_t currentScoringIndex = dpNodes.existing(node);
 
             std::array<DpEdge, transitionStateCount> outgoing;
+            detail::FiberLocalPreparedCandidateAlignmentBatch<
+                transitionStateCount> outgoingAlignment;
             size_t generatedEdges = 0;
             size_t validEdges = 0;
             for (int deltaU = -1; deltaU <= 1; ++deltaU) {
@@ -2007,12 +1992,25 @@ FiberletCandidateResult solveCandidate(
                             maximumPredictionDeviation)) {
                         continue;
                     }
+                    const auto& nextScoring = dpNodes.at(nextScoringIndex);
+                    const cv::Vec3f metricDirection =
+                        prepareFiberLocalUnitDirection(direction);
+                    const auto candidateMetric =
+                        detail::prepareFiberLocalCandidateMetricInline(
+                            nextScoring.metricPrediction,
+                            metricDirection,
+                            nextScoring.metricNormal,
+                            (nextScoring.flags & kNodeNormalValid) != 0);
                     outgoing[transitionState] = {
                         found,
                         nextScoringIndex,
-                        prepareFiberLocalUnitDirection(direction),
                         stepLength,
+                        candidateMetric,
                     };
+                    detail::appendFiberLocalCandidateAlignmentInline(
+                        outgoingAlignment,
+                        static_cast<std::uint8_t>(transitionState),
+                        candidateMetric);
                     ++validEdges;
                 }
             }
@@ -2030,37 +2028,37 @@ FiberletCandidateResult solveCandidate(
                 const DpIncoming incoming = incomingForState(
                     node, previousState, candidate, nodes, nodeIndex,
                     prepared.keyLayout, missingNode);
-                for (int deltaU = -1; deltaU <= 1; ++deltaU) {
-                    for (int deltaV = -1; deltaV <= 1; ++deltaV) {
-                        const size_t transitionState =
-                            static_cast<size_t>((deltaU + 1) * 3 + (deltaV + 1));
-                        const auto& edge = outgoing[transitionState];
-                        if (edge.next == missingNode)
-                            continue;
-                        const size_t next = edge.next;
-                        const auto& nextScoring = dpNodes.at(edge.scoring);
-                        DpAccumulatedCost nextCost = currentState.cost;
-                        nextCost += pathStepMetricCostPrepared(
-                            &currentScoring.metricPrediction,
-                            nextScoring.metricPrediction,
-                            incoming.metricDirection,
+                const auto incomingMetric =
+                    detail::prepareFiberLocalIncomingAlignmentInline(
+                        &currentScoring.metricPrediction,
+                        incoming.metricDirection);
+                std::array<float, transitionStateCount> alignmentLosses;
+                detail::fiberLocalAlignmentLossPreparedBatchInline(
+                    incomingMetric, outgoingAlignment, alignmentLosses);
+                for (size_t lane = 0; lane < outgoingAlignment.count; ++lane) {
+                    const size_t transitionState =
+                        outgoingAlignment.slotOfLane[lane];
+                    const auto& edge = outgoing[transitionState];
+                    const size_t next = edge.next;
+                    DpAccumulatedCost nextCost = currentState.cost;
+                    nextCost +=
+                        detail::fiberLocalMetricCostFromPreparedAlignmentInline(
+                            alignmentLosses[lane],
+                            incomingMetric,
                             incoming.metricLength,
-                            edge.metricDirection,
                             edge.metricLength,
-                            nextScoring.metricNormal,
-                            (nextScoring.flags & kNodeNormalValid) != 0,
+                            edge.candidateMetric,
                             metricConfig);
-                        auto& destination = nextStates[
-                            (next - nextRange.begin) * stateCount +
-                            transitionState];
-                        if (!destination.reached || betterCost(
-                                nextCost.total(), destination.cost.total())) {
-                            ++profile.relaxations;
-                            destination.reached = true;
-                            destination.cost = nextCost;
-                            previousStates[next * stateCount + transitionState] =
-                                static_cast<uint8_t>(previousState);
-                        }
+                    auto& destination = nextStates[
+                        (next - nextRange.begin) * stateCount +
+                        transitionState];
+                    if (!destination.reached || betterCost(
+                            nextCost.total(), destination.cost.total())) {
+                        ++profile.relaxations;
+                        destination.reached = true;
+                        destination.cost = nextCost;
+                        previousStates[next * stateCount + transitionState] =
+                            static_cast<uint8_t>(previousState);
                     }
                 }
             }
