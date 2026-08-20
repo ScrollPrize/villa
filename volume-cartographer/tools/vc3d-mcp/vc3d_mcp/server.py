@@ -99,7 +99,17 @@ def resolve_launch_binary(explicit: str | None) -> str | None:
 
 
 def _launch_command(binary: str, volpkg: str | None) -> list[str]:
-    command = [binary, "--agent-bridge"]
+    # A VC3D AppImage is a multitool dispatcher (scripts/appimage/AppRun): its
+    # first argument selects the bundled executable, so GUI options must follow
+    # an explicit ``VC3D`` subcommand — ``VC3D-x86_64.AppImage VC3D
+    # --agent-bridge``. Passing ``--agent-bridge`` as argv[1] makes AppRun
+    # reject it as an unknown tool and exit 2, so auto-launch never comes up.
+    # A plain executable (Linux dev build, the macOS .app binary, the Windows
+    # .exe) takes the flags directly.
+    command = [binary]
+    if binary.lower().endswith(".appimage"):
+        command.append("VC3D")
+    command.append("--agent-bridge")
     if volpkg:
         command += ["--volpkg", volpkg]
     return command

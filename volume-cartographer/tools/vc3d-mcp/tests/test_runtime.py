@@ -162,6 +162,26 @@ class AutoLaunchTest(unittest.TestCase):
             ["/tmp/VC3D", "--agent-bridge", "--volpkg", "/tmp/demo.volpkg.json"],
         )
 
+    def test_appimage_needs_explicit_gui_subcommand(self) -> None:
+        # An AppImage dispatches on argv[1]; the flags must follow ``VC3D`` or
+        # AppRun rejects ``--agent-bridge`` as an unknown tool.
+        self.assertEqual(
+            server_module._launch_command("/tmp/VC3D-x86_64.AppImage", None),
+            ["/tmp/VC3D-x86_64.AppImage", "VC3D", "--agent-bridge"],
+        )
+        self.assertEqual(
+            server_module._launch_command(
+                "/tmp/VC3D-abc.AppImage", "/tmp/demo.volpkg.json"
+            ),
+            [
+                "/tmp/VC3D-abc.AppImage",
+                "VC3D",
+                "--agent-bridge",
+                "--volpkg",
+                "/tmp/demo.volpkg.json",
+            ],
+        )
+
     def test_path_binary_is_used_before_repo_builds(self) -> None:
         with (
             mock.patch.dict(os.environ, {}, clear=True),
