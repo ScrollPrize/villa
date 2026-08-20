@@ -37,6 +37,7 @@ _PREPARED_INPUT_FIELDS = {
     "track_crossing_mode",
     "track_exclusion_radius",
     "dense_spacing_mode",
+    "loss_weight_fiber_directions",
     "output_first_winding",
     "output_winding_margin",
     "output_step_size",
@@ -60,6 +61,7 @@ _SCALE_WITH_Z_FIELDS = {
     "sample_count_unattached_pcls_per_step",
     "sample_count_tracks_per_step",
     "sample_count_dense_normal_points",
+    "sample_count_fiber_direction_points",
     "sample_count_regularisation_points",
     "sample_count_dense_spacing_pairs",
     "sample_count_dense_spacing_density_extra_pairs",
@@ -102,6 +104,8 @@ _INPUT_TOGGLE_DESCRIPTIONS = {
         "Load tracks and allow track sampling and losses.",
     "input_use_fibers":
         "Load fiber annotations into the point-collection supervision pools.",
+    "input_use_fiber_directions":
+        "Load packed fiber-direction samples and allow their orientation loss.",
     "input_use_pcl_absolute":
         "Load absolute-winding point-collection inputs.",
     "input_use_pcl_relative":
@@ -357,6 +361,7 @@ class Config:
         self.sample_count_tracks_per_step = 48000
         self.sample_count_track_points_per_step = 96
         self.sample_count_dense_normal_points = 60000
+        self.sample_count_fiber_direction_points = 60000
         self.sample_count_regularisation_points = 4500
         self.sample_count_dense_spacing_pairs = 12000
         self.sample_count_dense_spacing_count_extra_pairs = 0
@@ -385,6 +390,7 @@ class Config:
         self.input_use_unverified_patches = True
         self.input_use_tracks = True
         self.input_use_fibers = True
+        self.input_use_fiber_directions = True
         self.input_use_pcl_absolute = True
         self.input_use_pcl_relative = True
         self.input_use_pcl_same_winding = True
@@ -500,6 +506,7 @@ class Config:
         self.loss_weight_track_dt = 10.0
         self.loss_weight_sym_dirichlet = 10.0
         self.loss_weight_dense_normals = 100.0
+        self.loss_weight_fiber_directions = 0.0
         self.loss_weight_dense_spacing = 12.0
         self.loss_weight_umbilicus = 1.25
         self.loss_weight_shell_outer = 1.0
@@ -512,6 +519,7 @@ class Config:
         self.dense_attachment_warmup_steps = 3000
         self.dense_attachment_ramp_steps = 3000
         self.dense_normals_finite_difference_epsilon = 8.0
+        self.fiber_directions_finite_difference_epsilon = 8.0
         self.model_sym_dirichlet_finite_difference_epsilon = 4.0
         self.optimizer_weight_decay_gap_expander = 0.01
         self.optimizer_weight_decay_flow_field = 0.0
