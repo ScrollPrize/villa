@@ -127,13 +127,35 @@
   another LOD. A transient renderable producer must provide a finite positive
   scale; serialized surfaces use their stored declaration.
 - Line-annotation ribbons are derived views of the authoritative stored line.
-  Every distinct control point is an exact ribbon support so generated quads
-  cannot shortcut stored bends. Each control-point segment is independently
-  subdivided at the interval count whose spacing is closest to the default
-  50-base-voxel target. Explicit support arclengths provide the bidirectional
-  mapping between original fractional point positions and nonuniform ribbon
-  grid columns. Input line spacing may be arbitrary; control points, cuts, and
-  persistence remain in original line-position coordinates.
+  Every annotation control point and both line endpoints are exact ribbon
+  supports. Optimized line points between adjacent controls define the path but
+  are not mandatory columns. Each control-point span is independently
+  resampled by optimized-polyline arclength using the interval count whose
+  physical spacing is closest to the 32-base-voxel target; a shorter span
+  remains one interval.
+  The along-strip grid density is always declared as `1/32` samples per base
+  voxel, so a short physical control-point span expands to one nominal display
+  interval. Explicit support arclengths provide the bidirectional mapping
+  between original fractional point positions and nonuniform ribbon columns.
+  Both generated ribbons have seven cross rows at `1/32` samples per base voxel,
+  giving a fixed 192-base-voxel first-to-last-row extent close to the previous
+  typical width without depending on optimized-line spacing.
+  Generated-view clicks collapse all controls within an inclusive 32-base-voxel
+  optimized-polyline arclength radius into one control at the clicked point.
+  Before automatic full optimization, every insertion, replacement, or
+  multi-control collapse first reconstructs the replacement's surviving
+  adjacent spans from its authoritative line position. A multi-control collapse
+  must not optimize the replacement directly against the unchanged old line by
+  nearest 3-D position. If only one control survives, its reinitialization
+  tangent comes from that authoritative old-line position rather than spatial
+  projection. Synchronous preparation failure leaves the pre-edit geometry and
+  optimization state unchanged; reciprocal branch changes for multi-collapse
+  are committed only after asynchronous optimization succeeds.
+  The separate maximum control-point extrapolation setting applies only outside
+  the outermost controls, measures optimized-polyline arclength in base voxels,
+  and does not restrict insertion between existing controls.
+  Input line spacing may otherwise be arbitrary; cuts and persistence remain in
+  original line-position coordinates.
 - A completed pre-pass atomically replaces that source's previous snapshot for
   the view. The accepted render's captured focus is used locally to reduce each
   chunk's retained occurrences to its nearest squared distance. Snapshot

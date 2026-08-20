@@ -16,6 +16,10 @@ namespace vc::lasagna
 inline constexpr std::string_view kLasagnaVolumeManifestTagPrefix = "vc-lasagna-manifest:";
 inline constexpr std::string_view kLasagnaVolumeGroupTagPrefix = "vc-lasagna-group:";
 
+[[nodiscard]] std::vector<std::string> lasagnaProjectVolumeTags(
+    const LasagnaChannelGroup& group,
+    std::string_view manifestLocation);
+
 struct PreparedLasagnaProjectVolume {
     std::string location;
     std::vector<std::string> tags;

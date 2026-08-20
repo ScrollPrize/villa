@@ -2798,6 +2798,10 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             this, [this]() {
                 _segmentationCommandHandler->onMergePatch(QStringList{});
             });
+    connect(_menuController.get(), &MenuActionController::growTrackPatchesFromMenuRequested,
+            this, [this]() {
+                _segmentationCommandHandler->onGrowTrackPatches();
+            });
     connect(_menuController.get(), &MenuActionController::openDataCatalogVisibilityChanged,
             this, [this](bool) {
                 updateVolumePackageEmptyState();
@@ -8693,6 +8697,23 @@ bool CWindow::OpenVolume(const QString& path,
             }
             return false;
         }
+    }
+
+    // Line-annotation sessions must end — finalized and saved — while the
+    // package they belong to is still the active one; after the swap, their
+    // close path would save into the new package. A refusal (a running
+    // optimization, a failed finalization) aborts the switch with the
+    // workspace intact.
+    if (_lineAnnotationController &&
+        !_lineAnnotationController->prepareForPackageSwitch()) {
+        if (errorMessage) {
+            *errorMessage = tr("Open line annotation sessions could not be "
+                               "closed; the project was not switched.");
+        }
+        if (openError) {
+            *openError = VolumeOpenError::PackageLoadFailed;
+        }
+        return false;
     }
 
     CloseVolume();

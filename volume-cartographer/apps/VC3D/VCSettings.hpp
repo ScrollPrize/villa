@@ -321,6 +321,8 @@ namespace line_annotation {
     constexpr int INITIAL_CENTERLINE_LENGTH_VX_DEFAULT = 2400;
     constexpr auto EXTRAPOLATION_DISTANCE_VX = "lineAnnotation/extrapolation_distance_vx";
     constexpr int EXTRAPOLATION_DISTANCE_VX_DEFAULT = 1200;
+    // Maximum base-voxel polyline arclength for control-point extrapolation.
+    // Keep the existing persisted key for settings compatibility.
     constexpr auto MAX_CONTROL_POINT_DISTANCE_VX = "lineAnnotation/max_control_point_distance_vx";
     constexpr int MAX_CONTROL_POINT_DISTANCE_VX_DEFAULT = 0;
     // Cruise speed of the Left/Right arrow pan between control points, in line
@@ -386,6 +388,8 @@ namespace aws {
 namespace tools {
     constexpr auto FLATBOI_PATH = "tools/flatboi_path";
     constexpr auto FLATBOI = "tools/flatboi";  // Legacy key
+    constexpr auto GROW_TRACK_VENV = "tools/grow_track_venv";
+    constexpr auto GROW_TRACK_VENV_DEFAULT = "";
 }
 
 // -----------------------------------------------------------------------------

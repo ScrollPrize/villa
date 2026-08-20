@@ -91,8 +91,15 @@ public:
     std::vector<POI*> pois();
     std::vector<std::string> poiNames();
 
+    // Announces that the project's attached umbilicus changed. Nothing else
+    // reports it: setUmbilicus() only persists a project field, so a consumer
+    // holding geometry placed relative to the umbilicus has no way to hear about
+    // an attach or a detach.
+    void notifyUmbilicusChanged() { emit umbilicusChanged(); }
+
 signals:
     void vpkgChanged(std::shared_ptr<VolumePkg> vpkg);
+    void umbilicusChanged();
     void volumeChanged(std::shared_ptr<Volume> volume, const std::string& volumeId);
     void surfacesLoaded();
     void volumeClosing();

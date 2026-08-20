@@ -33,6 +33,8 @@ set(srcs
     FiberNameDisplay.hpp
     FiberSliceGeometry.cpp
     FiberSliceGeometry.hpp
+    AnnotationFrame.hpp
+    UmbilicusOrientationFreshness.hpp
     LineAnnotationController.cpp
     LineAnnotationController.hpp
     LineAnnotationFiberSegments.cpp

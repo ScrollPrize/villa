@@ -26,7 +26,10 @@ from lasagna.manager.prefetch import (
 )
 from lasagna.manager.runner import main as runner_main
 from lasagna.manager.runs import atomic_json, launch_inference, read_runs, reconcile_runs
-from lasagna.manager.snapshots import discover_snapshot_paths, index_snapshots, resolve_snapshot
+from lasagna.manager.snapshots import (
+    completion_snapshot_candidates, discover_snapshot_paths, index_snapshots,
+    resolve_snapshot,
+)
 from lasagna.manager.tmux import Tmux
 
 
@@ -463,6 +466,25 @@ def test_snapshot_roots_metadata_cache_and_selector(tmp_path):
     assert index_snapshots(config, cached_only=True) == []
 
 
+def test_snapshot_completion_rescans_uncached_files_without_loading_them(tmp_path, monkeypatch):
+    runs = tmp_path / "runs"
+    snapshots = runs / "new-run" / "snapshots"
+    snapshots.mkdir(parents=True)
+    checkpoint = snapshots / "best.pt"
+    checkpoint.write_bytes(b"not a checkpoint; completion must not load it")
+    config = configured(tmp_path, snapshot_dirs=(runs,))
+
+    assert completion_snapshot_candidates(config) == [
+        ("new-run/best.pt", "unindexed snapshot"),
+    ]
+    assert not (tmp_path / "cache" / "snapshots" / "index.json").exists()
+    values = [
+        value for value, _description
+        in contextual_candidates(config, ["inference", "run", "new"])
+    ]
+    assert values == ["new-run/best.pt"]
+
+
 def test_lasagna_snapshot_discovery_is_namespaced_and_extracts_metadata(tmp_path):
     torch = pytest.importorskip("torch")
     snapshots = tmp_path / "runs" / "las-run" / "snapshots"
@@ -665,6 +687,49 @@ def test_no_prefetch_respects_explicit_backend_no_download(tmp_path):
     assert argv[-1] == "--no-download"
 
 
+@pytest.mark.parametrize("backend", ["fiber3d", "lasagna"])
+def test_live_fetch_skips_bulk_prefetch_and_records_shared_backend_options(tmp_path, backend):
+    config, fiber_snapshot = _snapshot_and_config(tmp_path)
+    snapshot = fiber_snapshot
+    if backend == "lasagna":
+        snapshot = fiber_snapshot.__class__(**{
+            **fiber_snapshot.__dict__, "backend": "lasagna",
+            "selector": "lasagna/run one/best model.pt", "architecture": "lasagna_3d",
+        })
+    volume = index_volumes(CatalogCache(sample_catalog(), {"sha256": "digest"}))[0]
+    run_dir = launch_inference(
+        config, snapshot, volume, 1, original_argv=["inference", "run"],
+        prefetch=False, live_fetch=True, live_cache_gib=12.5,
+        live_fetch_ahead_tiles=4321, download_workers=123, tmux=FakeTmux(),
+    )
+    command = json.loads((run_dir / "command.json").read_text())
+    metadata = json.loads((run_dir / "metadata.json").read_text())
+    argv = command["resolved_argv"]
+    assert command["prefetch"] is None
+    assert "--no-download" not in argv
+    assert argv[argv.index("--live-cache-gib") + 1] == "12.5"
+    assert argv[argv.index("--live-fetch-ahead-tiles") + 1] == "4321"
+    assert argv[argv.index("--download-workers") + 1] == "123"
+    assert metadata["live_fetch"] == {
+        "enabled": True, "cache_target_gib": 12.5,
+        "lookahead_tiles": 4321, "download_workers": 123,
+    }
+    cache_attrs = json.loads((volume_cache_root(config, volume) / ".zattrs").read_text())
+    assert cache_attrs["_download"]["source"] == volume.s3_url
+
+
+def test_live_fetch_rejects_backend_no_download_before_source_initialization(tmp_path):
+    config, snapshot = _snapshot_and_config(tmp_path)
+    config = replace(config, params=("--no-download",))
+    volume = index_volumes(CatalogCache(sample_catalog(), {"sha256": "digest"}))[0]
+    with pytest.raises(ValueError, match="conflicts with --no-download"):
+        launch_inference(
+            config, snapshot, volume, 1, original_argv=["inference", "run"],
+            prefetch=False, live_fetch=True, tmux=FakeTmux(),
+        )
+    assert not (volume_cache_root(config, volume) / ".zattrs").exists()
+
+
 def test_lasagna_launch_reuses_shared_run_and_tmux_workflow(tmp_path):
     config, fiber_snapshot = _snapshot_and_config(tmp_path)
     snapshot = fiber_snapshot.__class__(**{
@@ -860,12 +925,17 @@ def test_runner_copies_direct_inference_inventory(tmp_path):
     })
     atomic_json(run_dir / "artifacts" / "inference.json", {
         "status": "completed", "artifacts": [{"kind": "manifest", "path": "x.json"}],
+        "inference": {"live_fetch": {
+            "enabled": True, "cache_target_gib": 10240.0,
+            "final_stats": {"downloaded_chunks": 12},
+        }},
     })
 
     assert runner_main([str(run_dir)]) == 0
     metadata = json.loads((run_dir / "metadata.json").read_text())
     assert metadata["status"] == "completed"
     assert metadata["artifacts"]["inventory"] == [{"kind": "manifest", "path": "x.json"}]
+    assert metadata["live_fetch"]["final_stats"]["downloaded_chunks"] == 12
 
 
 def test_runner_rejects_zero_exit_without_completed_provenance(tmp_path):

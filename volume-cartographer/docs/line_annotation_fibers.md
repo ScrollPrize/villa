@@ -50,17 +50,45 @@ show the per-span status labels described below. Cameras and splitter sizes
 survive generated-view updates.
 
 The rendered strips are derived views, not stored line geometry. Their columns
-retain every distinct control point and subdivide each control-point segment at
-the interval count whose spacing is closest to the 50-base-voxel target. This
-keeps every stored bend in the generated quad geometry. Explicit support
-arclengths provide a bidirectional mapping that keeps control points, span
-labels, hover positions, cut planes, and saved line positions in the original
-fractional point-index coordinate. The strip grid's scalar along-line scale is
-the mean support density; exact geometry and interaction use the point grid and
-support arclengths. Scales remain declared in base-volume voxel units, so input
-line spacing does not change render LOD. Automatic strip height retains the
-legacy behavior: its cross-row spacing is the median optimized control-point
-step, independent of the 50-voxel along-line target.
+retain every annotation control point and both line endpoints. The optimized
+line points between adjacent controls define the polyline path but are not
+mandatory columns. Each control-point span is resampled by polyline arclength
+using the interval count whose physical spacing is closest to the
+32-base-voxel target; a short span remains one interval with both controls
+unchanged. Explicit
+support arclengths provide a bidirectional mapping that keeps control points,
+span labels, hover positions, cut planes, and saved line positions in the
+original fractional point-index coordinate. The strip grid always declares an
+along-line scale of `1/32`, so a short physical control-point span expands to
+one nominal display interval instead of changing the scale of the rest of the
+strip. Both ribbons have a fixed seven-row cross grid at 32 voxels per row,
+giving a 192-base-voxel first-to-last-row extent close to the previous typical
+width without depending on optimized-line spacing.
+
+Clicking to place a control point uses optimized-polyline arclength in base
+voxels. Every existing control within an inclusive 32-voxel radius is collapsed
+into one control at the clicked location. This keeps adjacent control spans from
+becoming shorter than the generated strip's nominal sampling distance. Seed,
+surviving span policy, and branch links follow the collapsed control.
+
+With automatic reoptimization, VC3D prepares the edit before changing the live
+session. The same local update is used for insertion, one-control replacement,
+and collapse: it reconstructs the surviving spans on both sides of the clicked
+control from that control's known line position, then starts full fiber
+optimization from the updated line. A collapse that leaves only one control
+reinitializes from the clicked point and derives its tangent from the known old-
+line position. It does not locate that tangent by nearest 3-D distance, which
+could select a neighboring winding. If local preparation fails, the prior line,
+controls, branches, focus, and optimization status remain unchanged. Reciprocal
+branch updates for a multi-control collapse are saved only after asynchronous
+optimization and generated-view rebuilding succeed.
+
+The independent **Max extrap CP dist** setting limits how far a new control may
+be placed beyond the first or last control point. It is measured along the
+optimized polyline in base-volume voxels from the relevant outer control. It
+does not restrict insertion between existing controls, and `0` means unlimited.
+The current-position marker shows allowed or blocked state using this same
+base-voxel arclength calculation.
 
 The current cut view draws its solid yellow control-point marker only while the
 control point is inside the cut plane's thin slab, so fast panning would
@@ -85,8 +113,9 @@ the nearest control point in that direction; holding the key cruises straight
 through the intermediate points at a constant speed and, when it is released,
 decelerates onto the next control point ahead (never short of the one a tap
 would have reached). Beyond the outermost control point the pan continues one
-more hop, to the Max CP distance allowance or the end of the extrapolated
-line, whichever is shorter. Pressing the opposite arrow
+more hop, to the Max extrap CP distance allowance or the end of the extrapolated
+line, whichever is shorter. The boundary is converted from base-voxel
+arclength back into optimized-line position. Pressing the opposite arrow
 mid-pan decelerates through zero and reverses. Up and Down scale the cruising
 speed (default 12 line positions per second, roughly 360 voxels per second),
 which is shown in a transient badge and remembered between sessions. A Left or
