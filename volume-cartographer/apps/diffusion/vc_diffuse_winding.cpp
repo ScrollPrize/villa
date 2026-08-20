@@ -23,6 +23,7 @@
 #include <ceres/ceres.h>
 
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/render/ChunkCache.hpp"
 
 #include "vc/ui/VCCollection.hpp"
 #include "vc/core/util/GridStore.hpp"
@@ -210,7 +211,8 @@ int main(int argc, char** argv) {
     std::cout << "Found umbilicus point at: " << *umbilicus_point << std::endl;
 
     Volume volume(volume_path);
-    volume.setCacheBudget(4llu * 1024 * 1024 * 1024);
+    vc::render::processChunkCacheService()->configureDecodedByteCapacity(
+        4llu * 1024 * 1024 * 1024);
     const auto parsedLevel = parseScaleLevelDatasetName(dataset_name, volume.numScales(), std::cerr);
     if (!parsedLevel) {
         return 1;

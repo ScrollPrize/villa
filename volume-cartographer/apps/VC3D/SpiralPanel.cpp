@@ -520,6 +520,18 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     connect(runDiff, &QCheckBox::toggled, this, &SpiralPanel::runDiffChanged);
     displayDialogLayout->addWidget(runDiff);
 
+    auto* windingTransitions = new QCheckBox(tr("Winding transitions"), _displayDialog);
+    windingTransitions->setObjectName(QStringLiteral("spiralWindingTransitions"));
+    windingTransitions->setChecked(true);
+    windingTransitions->setToolTip(
+        tr("Draw the boundaries between adjacent windings on the flattened "
+           "output, labeled with the winding numbers on either side. A red "
+           "boundary joins non-adjacent windings and usually indicates a "
+           "mapping problem."));
+    connect(windingTransitions, &QCheckBox::toggled,
+            this, &SpiralPanel::windingTransitionsChanged);
+    displayDialogLayout->addWidget(windingTransitions);
+
     auto* lossMapRow = new QWidget(_displayDialog);
     auto* lossMapLayout = new QHBoxLayout(lossMapRow);
     lossMapLayout->setContentsMargins(0, 0, 0, 0);
@@ -537,6 +549,18 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     lossMapLayout->addWidget(new QLabel(tr("Opacity"), lossMapRow));
     lossMapLayout->addWidget(_lossMapOpacity);
     displayDialogLayout->addWidget(lossMapRow);
+    _lossMapDiagnostics = new QCheckBox(
+        tr("Compute loss overlays with the next preview"), _displayDialog);
+    _lossMapDiagnostics->setObjectName(
+        QStringLiteral("spiralPreviewDiagnostics"));
+    _lossMapDiagnostics->setToolTip(
+        tr("Loss overlays roughly double the cost of a preview: every enabled "
+           "loss is evaluated again and each overlay is mapped onto the "
+           "flattened output. They are published after the surface, so the "
+           "preview itself still appears as soon as it is ready."));
+    connect(_lossMapDiagnostics, &QCheckBox::toggled,
+            this, &SpiralPanel::previewDiagnosticsChanged);
+    displayDialogLayout->addWidget(_lossMapDiagnostics);
     _lossMapLegend = new QLabel(_displayDialog);
     _lossMapLegend->setWordWrap(true);
     _lossMapLegend->setTextInteractionFlags(Qt::TextSelectableByMouse);
@@ -1183,8 +1207,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         _service->removeEphemeralInput(item->data(Qt::UserRole).toString(),
                                        item->data(Qt::UserRole + 1).toString());
     });
-    connect(_volumeSelector->comboBox(), qOverload<int>(&QComboBox::currentIndexChanged), this,
-            [this](int) { emit volumeSelected(_volumeSelector->selectedVolumeId()); });
     for (QSpinBox* spin : {_zBegin, _zEnd, _legacyCheckpointStep,
                            _renderVolumeScale})
         connect(spin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int) { refreshReloadRequired(); });
@@ -1467,11 +1489,6 @@ void SpiralPanel::addPclItem(const QString& path, const QString& role, bool requ
     item->setToolTip(path);
 }
 
-void SpiralPanel::setVolumes(const QVector<VolumeSelector::VolumeOption>& volumes, const QString& selectedId)
-{
-    _volumeSelector->setVolumes(volumes, selectedId);
-}
-
 void SpiralPanel::setLossMapOptions(const QStringList& names)
 {
     const QString selected = _lossMap ? _lossMap->currentData().toString() : QString();
@@ -1484,7 +1501,15 @@ void SpiralPanel::setLossMapOptions(const QStringList& names)
     const int selectedIndex = _lossMap->findData(selected);
     _lossMap->setCurrentIndex(selectedIndex >= 0 ? selectedIndex : 0);
     if (selectedIndex < 0) {
-        _lossMapLegend->clear();
+        // Say why the list is empty rather than leaving an inert combo: the
+        // overlays exist only when a preview was asked to compute them.
+        if (names.isEmpty() && _lossMapDiagnostics
+            && !_lossMapDiagnostics->isChecked())
+            _lossMapLegend->setText(
+                tr("This preview carries no loss overlays. Tick "
+                   "\"Compute loss overlays\" and export another preview."));
+        else
+            _lossMapLegend->clear();
         emit lossMapChanged({}, _lossMapOpacity->value() / 100.0);
     }
 }

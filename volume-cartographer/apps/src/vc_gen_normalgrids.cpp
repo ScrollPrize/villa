@@ -36,6 +36,7 @@ inline uint32_t be32(uint32_t v) {
 
 
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/render/ChunkCache.hpp"
 #include <vc/core/util/GridStore.hpp>
 #include "vc/core/util/NormalGridGenerate.hpp"
 #include "vc/core/util/Thinning.hpp"
@@ -1306,7 +1307,8 @@ void run_generate(const po::variables_map& vm) {
 
     std::cout << "Setting cache budget: " << (cache_budget_bytes / (1024 * 1024))
               << " MiB" << std::endl;
-    input_volume.setCacheBudget(cache_budget_bytes);
+    vc::render::processChunkCacheService()->configureDecodedByteCapacity(
+        cache_budget_bytes);
 
     struct DirectionShardPlan {
         SliceDirection dir;

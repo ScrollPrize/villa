@@ -34,17 +34,22 @@ class SpiralPanel : public QWidget
     Q_OBJECT
 public:
     explicit SpiralPanel(SpiralServiceManager* service, QWidget* parent = nullptr);
-    void setVolumes(const QVector<VolumeSelector::VolumeOption>& volumes, const QString& selectedId);
+    QComboBox* volumeSelectionControl() const
+    {
+        return _volumeSelector ? _volumeSelector->comboBox() : nullptr;
+    }
     void setLossMapOptions(const QStringList& names);
     void setLossMapLegend(const QString& text);
     void setSessionExitGuard(
         std::function<void(std::function<void()>)> guard) { _sessionExitGuard = std::move(guard); }
 
 signals:
-    void volumeSelected(const QString& id);
     void visibilityChanged(const QString& category, bool visible);
     void runDiffChanged(bool visible);
+    void windingTransitionsChanged(bool visible);
     void lossMapChanged(const QString& name, qreal opacity);
+    // Whether the next preview export should compute the loss overlays.
+    void previewDiagnosticsChanged(bool enabled);
     void windingRangeChanged(int minimum, int maximum);
     void surfaceIntersectionsChanged(bool shown);
     void surfaceIntersectionStrideChanged(int stride);
@@ -98,6 +103,7 @@ private:
     QSpinBox* _maximumDisplayedWinding = nullptr;
     QCheckBox* _showSurfaceIntersections = nullptr;
     QComboBox* _lossMap = nullptr;
+    QCheckBox* _lossMapDiagnostics = nullptr;
     QSlider* _lossMapOpacity = nullptr;
     QLabel* _lossMapLegend = nullptr;
     QSpinBox* _zBegin = nullptr;

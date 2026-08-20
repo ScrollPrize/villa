@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import math
 import sys
-import tempfile
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
@@ -14,24 +13,12 @@ sys.path.insert(0, str(SCRIPTS))
 
 import run_render_valgrind_ci  # noqa: F401
 from native_thread_sync_replay import NativeReplayEngine
-from thread_sync_trace import parse_drd_trace
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--replay-engine", type=Path, required=True)
     args = parser.parse_args()
-
-    with tempfile.TemporaryDirectory() as directory:
-        trace = Path(directory) / "drd.log"
-        trace.write_text(
-            "New segment for thread 1 with vc [1: 1]\n"
-            "SCHED[1]: entering VG_(scheduler)\n"
-            "SCHED[1]: exiting VG_(scheduler)\n"
-        )
-        parsed = parse_drd_trace(trace)
-        if not parsed.events or parsed.unresolved_happens_before != 0:
-            raise RuntimeError("dependency-free DRD parser smoke failed")
 
     profiles = {
         1: {

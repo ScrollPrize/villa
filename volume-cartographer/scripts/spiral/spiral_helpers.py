@@ -1,3 +1,4 @@
+import concurrent.futures
 import json
 import glob
 import os
@@ -8,7 +9,8 @@ import torch
 from tqdm import tqdm
 
 from sample_spiral import get_spiral_yxs, get_theta_and_radii
-from tifxyz import load_tifxyz, save_tifxyz, save_combined_tifxyz
+from tifxyz import (load_tifxyz, patch_to_payload, save_tifxyz,
+                    save_combined_tifxyz)
 from vc3d_fiber_format_adapter import (
     parse_vc3d_fiber_format,
 )
@@ -26,6 +28,43 @@ def patch_intersects_z_roi(patch, z_begin, z_end):
     if zs.numel() == 0:
         return False
     return bool(((zs >= z_begin) & (zs < z_end)).any().item())
+
+
+def load_patch_payload_chunk(path, entries, z_begin, z_end,
+                             erode_cells_default, io_threads=1):
+    """Load, erode, and z-filter a chunk of patch directories.
+
+    Runs inside patch-loader worker processes (must stay a picklable
+    module-level function). Returns one (entry, payload, error, drop_reason)
+    tuple per entry, where payload is patch_to_payload() output for kept
+    patches and exactly one of payload/error/drop_reason is set otherwise.
+    io_threads > 1 overlaps per-file latency (e.g. NFS round trips) within
+    the chunk; the per-entry work itself is unchanged and per-entry results
+    stay in a fixed order, so the outcome is identical either way.
+    """
+    def load_one(entry):
+        segment_path = os.path.join(path, entry)
+        try:
+            patch = load_tifxyz(segment_path, z_range=(z_begin, z_end))
+            if patch is None:
+                return entry, None, None, 'z ROI prefilter'
+            cells_to_erode = patch.erosion_cells(erode_cells_default)
+            if (cells_to_erode > 0
+                    and not erode_patch_valid_region(patch, cells_to_erode)):
+                return entry, None, None, 'erosion'
+            if not patch_intersects_z_roi(patch, z_begin, z_end):
+                return entry, None, None, 'z ROI after erosion'
+            patch.release_derived_caches()
+            return entry, patch_to_payload(patch), None, None
+        except Exception as error:
+            return entry, None, str(error), None
+
+    if io_threads <= 1 or len(entries) <= 1:
+        return [load_one(entry) for entry in entries]
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(io_threads, len(entries)),
+            thread_name_prefix='patch-io') as executor:
+        return list(executor.map(load_one, entries))
 
 
 def scale_counts_for_z_range(
@@ -392,6 +431,9 @@ class Chain:
         revisit points; consumers wanting each adjacency once must dedupe)."""
 
     def zyxs_between(self, p1, p2):
+        return self._zyxs(self.points_between(p1, p2))
+
+    def points_between(self, p1, p2):
         raise NotImplementedError
 
     def iter_chain(self):
@@ -427,14 +469,12 @@ class SequenceChain(Chain):
             self._index_of = {id(p): k for k, p in enumerate(self._ordered)}
         return self._ordered, self._index_of
 
-    def zyxs_between(self, p1, p2):
+    def points_between(self, p1, p2):
         ordered, index_of = self._sorted()
         i1, i2 = index_of[id(p1)], index_of[id(p2)]
         if i1 <= i2:
-            chain = ordered[i1:i2 + 1]
-        else:
-            chain = list(reversed(ordered[i2:i1 + 1]))
-        return self._zyxs(chain)
+            return ordered[i1:i2 + 1]
+        return list(reversed(ordered[i2:i1 + 1]))
 
     def iter_chain(self):
         return self._sorted()[0]
@@ -484,7 +524,7 @@ class ComponentChain(Chain):
             return points[pos_from:pos_to + 1]
         return list(reversed(points[pos_to:pos_from + 1]))
 
-    def zyxs_between(self, p1, p2):
+    def points_between(self, p1, p2):
         # Within-member index ranges concatenated across the spanning-tree path
         # from p1's member to p2's, hopping fibers at each junction.
         m1, i1 = self.pos_of[id(p1)]
@@ -505,7 +545,7 @@ class ComponentChain(Chain):
             chain.extend(self._member_segment(m_from, pos, leave))
             pos = arrive
         chain.extend(self._member_segment(member_path[-1], pos, i2))
-        return self._zyxs(chain)
+        return chain
 
     def iter_chain(self):
         # Euler tour of the member tree: walk each member end-to-end and back,
@@ -728,6 +768,35 @@ def get_face_indices(h, w):
     ], dim=0)
 
 
+#: Points transformed per input kind when a caller asks for an estimated
+#: winding range rather than an exact one. Each transform call is an RK4 flow
+#: integration, so an exact pass over a multi-million-point track database
+#: costs minutes; see ``point_budget`` below.
+ESTIMATED_WINDING_RANGE_POINT_BUDGET = 1_000_000
+
+#: Points a patch keeps when the budget is spread over many patches. Patches
+#: are small local grids, so a floor per patch matters more than an exactly
+#: honoured total.
+MIN_ESTIMATED_POINTS_PER_PATCH = 4096
+
+
+def _stride_to_budget(points, budget):
+    """Subsample ``points`` along its first dimension to at most ``budget``.
+
+    Striding is sound here because the winding index is
+    ``round(shifted_radius / dr_per_winding)`` with ``dr_per_winding`` in the
+    hundreds of voxels, while consecutive samples within a patch grid or along
+    a track lie a single output step apart and the transform is a
+    diffeomorphism with an O(1) local Jacobian. Dropping every ``k``-th sample
+    therefore moves the observed extreme by roughly ``k * spacing / dr``
+    windings, well under the ``output_winding_margin`` the caller already adds,
+    and it can only ever *under*-report the range, never overstate it.
+    """
+    if budget is None or points.shape[0] <= budget:
+        return points
+    return points[::-(-points.shape[0] // int(budget))]
+
+
 @torch.inference_mode()
 def compute_winding_range_and_input_extents(
     slice_to_spiral_transform,
@@ -739,8 +808,19 @@ def compute_winding_range_and_input_extents(
     z_end,
     get_or_build_unattached_pcl_flat,
     authoritative_zyx_lines=(),
+    point_budget=None,
 ):
-    """Compute output winding range plus max observed radius/winding per patch and PCL."""
+    """Compute output winding range plus max observed radius/winding per patch and PCL.
+
+    ``point_budget`` caps how many points of each input kind are actually
+    transformed (per patch for patches, in total for PCL strips and for
+    tracks). ``None`` transforms every point, which is what a run's
+    authoritative output needs; a budget trades a fraction of a winding of
+    accuracy for a bounded, dataset-size-independent cost, which is what an
+    interactive preview needs. Per-patch and per-strip extents are estimated
+    from the same subsample, so a caller that needs them exactly must leave the
+    budget unset.
+    """
     device = dr_per_winding.device
     dr = dr_per_winding.detach()
     min_w = None
@@ -753,7 +833,13 @@ def compute_winding_range_and_input_extents(
         min_w = local_min if min_w is None else min(min_w, local_min)
         max_w = local_max if max_w is None else max(max_w, local_max)
 
-    chunk = 65536
+    patch_budget = (
+        None if point_budget is None
+        else max(MIN_ESTIMATED_POINTS_PER_PATCH,
+                 int(point_budget) // max(1, len(patches))))
+    # The flow integration is elementwise, so the chunk size only trades
+    # transient memory against kernel-launch overhead.
+    chunk = 1 << 18
 
     def transform_in_chunks(zyxs):
         spiral_pieces = []
@@ -783,7 +869,8 @@ def compute_winding_range_and_input_extents(
         mask = valid_quad_mask & quad_touches_roi
         if not mask.any():
             continue
-        spiral_zyxs = transform_in_chunks(quad_center_zyxs[mask])
+        spiral_zyxs = transform_in_chunks(
+            _stride_to_budget(quad_center_zyxs[mask], patch_budget))
         _, radius, shifted_radius = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
         winding_indices = (shifted_radius / dr).round().to(torch.int64).clamp_min(0)
         update_from_winding_indices(winding_indices)
@@ -801,8 +888,8 @@ def compute_winding_range_and_input_extents(
             num_strips = flat['num_strips']
             in_roi = (zyxs[:, 0] >= z_begin) & (zyxs[:, 0] < z_end)
             if in_roi.any():
-                zyxs_roi = zyxs[in_roi]
-                strip_id_roi = strip_id[in_roi]
+                zyxs_roi = _stride_to_budget(zyxs[in_roi], point_budget)
+                strip_id_roi = _stride_to_budget(strip_id[in_roi], point_budget)
                 spiral_zyxs = transform_in_chunks(zyxs_roi)
                 _, radius, shifted_radius = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
                 winding_indices = (shifted_radius / dr).round().to(torch.int64).clamp_min(0)
@@ -850,15 +937,35 @@ def compute_winding_range_and_input_extents(
         pending_track_points.clear()
         pending_track_point_count = 0
 
-    for line in authoritative_zyx_lines or ():
+    lines = authoritative_zyx_lines or ()
+    if point_budget is not None and not isinstance(lines, (list, tuple)):
+        # A track collection is walked line by line below. Thin the walk itself
+        # rather than only the transform: with a budget the estimate is drawn
+        # from a uniform sample of the whole collection, never from its first
+        # tracks (which are not representative of the outermost winding).
+        lines = list(lines)
+    if point_budget is not None and len(lines) > 1:
+        expected_points_per_line = max(1.0, float(np.mean(
+            [len(line) for line in lines[:min(len(lines), 1024)]]) or 1.0))
+        wanted_lines = max(1, int(int(point_budget) / expected_points_per_line))
+        if wanted_lines < len(lines):
+            lines = lines[::-(-len(lines) // wanted_lines)]
+
+    for line in lines:
         if torch.is_tensor(line):
             # Keep tensor callers supported without trying to convert CUDA data
             # through NumPy.  Flush host-side points first to preserve the bound.
             flush_pending_track_points()
-            zyxs = line.to(device=device, dtype=torch.float32).reshape(-1, 3)
+            # Thin before the host-to-device copy, coarsely, so the ROI filter
+            # still sees enough points to leave the budget's worth behind.
+            zyxs = _stride_to_budget(
+                line.reshape(-1, 3),
+                None if point_budget is None else 8 * int(point_budget))
+            zyxs = zyxs.to(device=device, dtype=torch.float32)
             in_roi = (zyxs[:, 0] >= z_begin) & (zyxs[:, 0] < z_end)
             if in_roi.any():
-                update_from_track_points(zyxs[in_roi])
+                update_from_track_points(
+                    _stride_to_budget(zyxs[in_roi], point_budget))
             continue
 
         points = np.asarray(line, dtype=np.float32).reshape(-1, 3)
@@ -1375,29 +1482,39 @@ def save_combined_preview(
     surface_id,
     progress=None,
 ):
-    """Write the authoritative connected preview used by VC3D and Lasagna."""
-    (_, derived_upper), _, _ = compute_winding_range_and_input_extents(
-        slice_to_spiral_transform,
-        dr_per_winding,
-        patches,
-        unattached_pcl_strips,
-        cfg,
-        z_begin,
-        z_end,
-        get_or_build_unattached_pcl_flat,
-        authoritative_zyx_lines=tracks,
-    )
+    """Write the authoritative connected preview used by VC3D and Lasagna.
+
+    The preview's outer bound is the configured ``shell_outer_winding_idx``
+    whenever there is one: it is the winding every dense sampler already
+    integrates out to, so the model is defined there, and taking it directly
+    skips a pass that transformed every patch, PCL and track point through the
+    flow ODE to derive a bound the configuration already states. Only a run
+    that leaves the index unset derives the bound, and then from a bounded
+    sample rather than from every point.
+    """
     configured_outer = cfg.get('shell_outer_winding_idx')
-    exclusive_upper = derived_upper
     if configured_outer is not None:
-        configured_upper = int(configured_outer) + 1
-        exclusive_upper = (configured_upper if derived_upper <= int(cfg['output_first_winding'])
-                           else min(exclusive_upper, configured_upper))
+        exclusive_upper = int(configured_outer) + 1
+    else:
+        (_, exclusive_upper), _, _ = compute_winding_range_and_input_extents(
+            slice_to_spiral_transform,
+            dr_per_winding,
+            patches,
+            unattached_pcl_strips,
+            cfg,
+            z_begin,
+            z_end,
+            get_or_build_unattached_pcl_flat,
+            authoritative_zyx_lines=tracks,
+            point_budget=ESTIMATED_WINDING_RANGE_POINT_BUDGET,
+        )
     first_winding = 10
     last_winding = int(exclusive_upper) - 1
     if last_winding < first_winding:
         raise RuntimeError(
-            f'No preview winding is at or above {first_winding}; derived last winding is {last_winding}'
+            f'No preview winding is at or above {first_winding}; last winding '
+            f'is {last_winding} (from '
+            f'{"configured shell_outer_winding_idx" if configured_outer is not None else "the derived input extent"})'
         )
 
     grid_spacing = int(cfg['output_step_size'])

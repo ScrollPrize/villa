@@ -14,6 +14,7 @@ import sys
 import threading
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 import torch
 
@@ -116,6 +117,7 @@ class CheckpointPreflightTests(unittest.TestCase):
         self.assertFalse(_inspect(_checkpoint(z_begin=0)).accepted)
         self.assertTrue(_inspect(_checkpoint()).accepted)
         self.assertEqual(context.config, before)
+
 
     def test_schema_invariants(self):
         self.assertIn("not a state dictionary",
@@ -227,6 +229,52 @@ class CheckpointPreflightTests(unittest.TestCase):
         verdict = _inspect(_checkpoint(lasagna_scale=2, z_begin=0))
         self.assertFalse(verdict.accepted)
         self.assertEqual(len(verdict.reasons), 2, verdict.reasons)
+
+
+class SparseStoreDdpTests(unittest.TestCase):
+    def _context(self, *, rank):
+        return SimpleNamespace(
+            dist=fit_spiral.DistributedContext(
+                rank=rank, world_size=2, local_rank=rank),
+            grad_mag_spacing_enabled=False,
+            phase_mode=True,
+            normal_nx_zarr_path='/data/nx',
+            normal_ny_zarr_path='/data/ny',
+            grad_mag_zarr_path=None,
+            normal_zarr_group='4',
+            surf_sdt_zarr_path='/data/sdt',
+            surf_sdt_zarr_group='1',
+        )
+
+    def test_nonzero_rank_waits_for_rank_zero_without_building(self):
+        context = self._context(rank=1)
+
+        def rank_zero_succeeded(payload, src):
+            self.assertEqual(src, 0)
+            payload[0] = None
+
+        with mock.patch.object(
+                fit_spiral, 'ensure_fit_sparse_stores') as build, \
+             mock.patch.object(
+                 fit_spiral.torch.distributed, 'broadcast_object_list',
+                 side_effect=rank_zero_succeeded) as broadcast:
+            fit_spiral.FitContext._ensure_sparse_volume_stores(
+                context, use_normals=True, progress=NullProgressReporter())
+
+        build.assert_not_called()
+        broadcast.assert_called_once()
+
+    def test_rank_zero_builds_before_releasing_other_ranks(self):
+        context = self._context(rank=0)
+        with mock.patch.object(
+                fit_spiral, 'ensure_fit_sparse_stores') as build, \
+             mock.patch.object(
+                 fit_spiral.torch.distributed, 'broadcast_object_list') as broadcast:
+            fit_spiral.FitContext._ensure_sparse_volume_stores(
+                context, use_normals=True, progress=NullProgressReporter())
+
+        build.assert_called_once()
+        broadcast.assert_called_once()
 
 
 class _StubContext(fit_spiral.FitContext):

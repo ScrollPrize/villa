@@ -38,7 +38,8 @@ _OPTIONS: dict[Command, dict[str, tuple[str, ...] | None]] = {
     ("volume", "prefetch"): {"--workers": (), "--no-remote-inventory": None},
     ("inference", "run"): {
         "--backend": ("fiber3d", "lasagna"), "--download-workers": (),
-        "--no-prefetch": None, "--legacy-config": (),
+        "--no-prefetch": None, "--legacy-config": (), "--live-fetch": None,
+        "--live-cache-gib": (), "--live-fetch-ahead-tiles": (),
     },
     ("open-data", "validate"): {},
     ("open-data", "upload"): {},
@@ -190,8 +191,9 @@ def contextual_candidates(config, words: Sequence[str]) -> list[tuple[str, str]]
     elif command == ("inference", "run"):
         if position == 0 and config is not None:
             try:
-                from .snapshots import index_snapshots
-                candidates = [_candidate(record.selector, "snapshot") for record in index_snapshots(config, cached_only=True)]
+                from .snapshots import completion_snapshot_candidates
+
+                candidates = completion_snapshot_candidates(config)
             except (FileNotFoundError, RuntimeError, ValueError, OSError):
                 candidates = []
         elif position == 1:

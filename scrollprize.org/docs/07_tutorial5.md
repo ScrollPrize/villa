@@ -41,7 +41,7 @@ import BeforeAfter from '@site/src/components/BeforeAfter';
 import ChatCallout from '@site/src/components/ChatWidget/ChatCallout';
 
 
-*Last updated: July 10, 2026*
+*Last updated: August 14, 2026*
 
 <ChatCallout prefill="Walk me through the ink detection tutorial" />
 
@@ -165,19 +165,18 @@ The filename prefixes must exactly match the segment folder name: a segment fold
 
 ### Setting up the pipeline
 
-The ink detection pipeline lives in the [villa repository](https://github.com/ScrollPrize/villa), under `ink-detection/`. It uses [uv](https://docs.astral.sh/uv/getting-started/installation/) to manage its Python environment.
+The ink detection pipeline lives in the [villa repository](https://github.com/ScrollPrize/villa), as the `ink_detection` subpackage of the `vesuvius` package. It uses [uv](https://docs.astral.sh/uv/getting-started/installation/) to manage its Python environment.
 
 ```bash
 git clone https://github.com/ScrollPrize/villa.git
-cd villa/ink-detection
-git checkout merge-ink-pipelines
-uv sync
+cd villa/vesuvius
+uv sync --extra models
 ```
 
-`uv sync` creates a virtual environment and installs the exact locked dependencies (PyTorch, zarr, and friends). Verify that PyTorch sees your GPU:
+`uv sync --extra models` creates a virtual environment and installs the exact locked dependencies (PyTorch, zarr, and friends). The `models` extra is the machine-learning stack; every command below passes it too. Verify that PyTorch sees your GPU:
 
 ```bash
-uv run python -c "import torch; print(torch.__version__, '| cuda:', torch.cuda.is_available())"
+uv run --extra models python -c "import torch; print(torch.__version__, '| cuda:', torch.cuda.is_available())"
 ```
 
 ### Training
@@ -208,9 +207,13 @@ Training runs are configured with a single JSON file. Create `configs/ink_tutori
   "val_every": 500,
   "save_every": 1000,
 
+  "verify_finite_gradients_steps": 200,
+  "max_amp_overflow_events": 4,
+
   "datasets": [
     {
       "segments_path": "/path/to/ink-dataset/phercparis4",
+      "segments": ["w00_20231016151002"],
       "volume_scale": "0"
     }
   ]
@@ -225,12 +228,13 @@ The important options:
 * `patch_overlap: 0.5` means training patches are sampled with a half-patch stride across each segment.
 * `patch_min_labeled_coverage: 0.05` skips training patches whose ink labels cover less than 5% of the patch, so training focuses on labeled regions.
 * `val_every` controls how often validation metrics are computed on the validation-mask regions, and `save_every` how often checkpoints are written.
-* `segments_path` points at the *folder of segments*, not a single segment — the trainer picks up every valid segment it finds there, so the same config keeps working as you add more. One segment is enough for a real first model.
+* `verify_finite_gradients_steps` and `max_amp_overflow_events` audit the start of mixed-precision training: for the first 200 steps the gradients are checked to be finite, tolerating up to four gradient-scaler overflow events (an overflow on the very first fp16 step is common and harmless).
+* `segments_path` points at the *folder of segments*, not a single segment — the trainer picks up every valid segment it finds there, so the same config keeps working as you add more. One segment is enough for a real first model. The explicit `segments` list narrows discovery to the named segments, which keeps the run deterministic if the folder also contains helper directories that aren't complete labeled segments; drop it to train on everything in the folder.
 
 Then start training:
 
 ```bash
-uv run python -m koine_machines.training.train configs/ink_tutorial.json
+uv run --extra models python -m vesuvius.ink_detection.training.train configs/ink_tutorial.json
 ```
 
 The trainer discovers your segments, finds all training patches inside the supervision masks (excluding the validation regions), and starts training. Patch discovery can take a while on large datasets; the result is cached as a JSON file in `out_dir`, keyed by patch size, overlap, and label version, so re-runs with the same settings skip it. With this config, the full 20,000-iteration run takes about an hour and a half on a single H100. While it runs you will see the loss printed to the console, and in `runs/ink_tutorial/` you will find:
@@ -241,7 +245,7 @@ The trainer discovers your segments, finds all training patches inside the super
 If your dataset includes segments with validation masks, the model is also evaluated on those held-out regions at each validation step, reporting balanced accuracy — how well it detects ink in areas it was never trained on. If training loss keeps dropping while validation accuracy stalls, the model is starting to overfit your labels. (The tutorial segment has no validation mask, so this first run reports training loss only.) You can stop training at any time with `ctrl+c` and use the most recently saved checkpoint.
 
 :::tip
-If you run out of GPU memory, reduce `batch_size` to 1, or reduce the `patch_size` to `[64, 128, 128]`. For multi-GPU training, launch through Accelerate instead: `uv run accelerate launch --num_processes 2 --module koine_machines.training.train configs/ink_tutorial.json`.
+If you run out of GPU memory, reduce `batch_size` to 1, or reduce the `patch_size` to `[64, 128, 128]`. For multi-GPU training, launch through Accelerate instead: `uv run --extra models accelerate launch --num_processes 2 --module vesuvius.ink_detection.training.train configs/ink_tutorial.json`.
 :::
 
 :::tip
@@ -253,14 +257,15 @@ To log metrics and previews to Weights & Biases, add `"wandb_project": "ink-dete
 To run your trained model on the same segment and produce an ink prediction image:
 
 ```bash
-uv run python -m koine_machines.inference.infer \
+uv run --extra models python -m vesuvius.ink_detection.inference.infer \
   /path/to/ink-dataset/phercparis4/w00_20231016151002/w00_20231016151002.zarr \
   runs/ink_tutorial/ckpt_020000.pth \
   predictions/w00_20231016151002.tif \
+  --overlap 0.5 --blend-mode hann \
   --batch-size 4
 ```
 
-The three positional arguments are the segment's surface volume, the checkpoint (here the last one written by the 20,000-iteration run above), and the output path. The model slides across the whole segment in overlapping windows, blends the overlapping predictions, and writes a grayscale TIFF where each pixel's brightness (0–255) is the predicted probability of ink. Expect this to take on the order of an hour on a single GPU for a full segment. Open the result in any image viewer, and if all went well, you'll see letters, including outside the regions you had labels for.
+The three positional arguments are the segment's surface volume, the checkpoint (here the last one written by the 20,000-iteration run above), and the output path. (`--overlap 0.5 --blend-mode hann` spell out the defaults, 50% overlap with Hann blending, so the command stays reproducible.) The model slides across the whole segment in overlapping windows, blends the overlapping predictions, and writes a grayscale TIFF where each pixel's brightness (0–255) is the predicted probability of ink. Expect this to take on the order of an hour on a single GPU for a full segment. Open the result in any image viewer, and if all went well, you'll see letters, including outside the regions you had labels for.
 
 :::tip
 For a faster first look, pass `--mask-path region.tif` — a grayscale TIFF the size of the segment where nonzero pixels mark the region to predict — to limit inference to an area of interest.
@@ -271,6 +276,7 @@ Useful options:
 * `--gpus 0,1` — run on multiple GPUs.
 * `--tta-mirror` — average predictions over mirrored versions of each patch (slower, slightly better).
 * `--layer-start` / `--layer-end` — restrict which depth layers of the surface volume are used.
+* `--direction both` — also write a depth-reversed prediction (as `<output>_reverse.tif`), useful when you aren't sure which side of the surface volume faces the ink.
 
 Here is the result on the tutorial segment — the model's prediction in white, with the ink labels it was trained on overlaid in red:
 
@@ -304,26 +310,32 @@ Create `configs/ink_full3d.json`. It is the same shape as the 2.5D config with a
   "patch_min_labeled_coverage": 0.05,
 
   "full_3d": {
-    "label_projection_half_thickness": 16,
-    "background_projection_half_thickness": 16
+    "label_projection_half_thickness": 8,
+    "background_projection_half_thickness": 8
   },
 
   "batch_size": 8,
   "num_iterations": 20000,
   "learning_rate": 0.01,
+  "warmup_steps": 1000,
   "mixed_precision": "fp16",
-  "dataloader_workers": 8,
+  "dataloader_workers": 16,
   "prefetch_factor": 2,
+  "pin_memory": true,
 
   "volume_cache_dir": "volume_cache",
   "volume_cache_max_gb": 120,
 
-  "val_every": 500,
+  "val_every": 1000,
   "save_every": 1000,
+
+  "verify_finite_gradients_steps": 200,
+  "max_amp_overflow_events": 4,
 
   "datasets": [
     {
       "segments_path": "/path/to/ink-dataset/phercparis4",
+      "segments": ["w00_20231016151002"],
       "volume_path": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/",
       "volume_scale": "2"
     }
@@ -331,27 +343,27 @@ Create `configs/ink_full3d.json`. It is the same shape as the 2.5D config with a
 }
 ```
 
-* `volume_path` is where the 3D crops come from. The public `vesuvius-challenge-open-data` S3 bucket is read anonymously — no AWS account needed. You can also download the volume locally (or just the chunks your segments touch, with `koine_machines.preprocessing.download_required_zarr_chunks`) and point `volume_path` at the local copy instead.
+* `volume_path` is where the 3D crops come from. The public `vesuvius-challenge-open-data` S3 bucket is read anonymously — no AWS account needed. You can also download the volume locally (or just the chunks your segments touch, with `vesuvius.ink_detection.preprocessing.download_required_zarr_chunks`) and point `volume_path` at the local copy instead.
 * `volume_scale: "2"` samples the crops from level 2 of the volume pyramid — 4× downsampled in each axis. That's enough for the tutorial; training at native resolution (`"0"`) can bring further gains, at the cost of a much longer run. Distances in the config are always given in **full-resolution voxels** regardless of `volume_scale` — the pipeline converts them to the trained level internally.
-* The `full_3d` block sets how far above and below the surface the 2D ink labels and supervision mask are projected into the crop, in full-resolution voxels (here ±16, so ±4 voxels at level 2).
+* The `full_3d` block sets how far above and below the surface the 2D ink labels and supervision mask are projected into the crop, in full-resolution voxels (here ±8, so ±2 voxels at level 2).
 * `volume_cache_dir` enables an on-disk LRU cache (capped at `volume_cache_max_gb`) for the chunks streamed from `volume_path`: each chunk is downloaded once and re-read from local disk afterwards, which makes both re-runs and inference (which shares the cache) much faster.
-* There is no `in_channels` — the native 3D modes set it automatically before model construction. `full_3d_single_wrap` uses two input channels (the volume image and the reconstructed surface mask), as does `normal_pooled_3d`; plain `full_3d` uses one.
+* There is no `in_channels` — the native 3D modes set it automatically before model construction. `full_3d_single_wrap` uses two input channels (the volume image and the reconstructed surface mask); plain `full_3d` uses one.
 
 Training starts the same way:
 
 ```bash
-uv run python -m koine_machines.training.train configs/ink_full3d.json
+uv run --extra models python -m vesuvius.ink_detection.training.train configs/ink_full3d.json
 ```
 
-This run — 20,000 iterations at batch size 8 — takes about eight hours on an H100 with the tutorial segment and uses about 17&nbsp;GB of VRAM.
+This run — 20,000 iterations at batch size 8 — takes about ten hours on an H100 with the tutorial segment.
 
 :::tip
-You don't have to wait eight hours to see results. Checkpoints land in the run folder every `save_every` iterations, so while training continues you can run the inference command below on an intermediate checkpoint, say `ckpt_005000.pth`, and watch the predictions improve from checkpoint to checkpoint.
+You don't have to wait ten hours to see results. Checkpoints land in the run folder every `save_every` iterations, so while training continues you can run the inference command below on an intermediate checkpoint, say `ckpt_005000.pth`, and watch the predictions improve from checkpoint to checkpoint.
 :::
 
 #### Native 3D inference
 
-Native 3D checkpoints use a different inference script, `koine_machines.inference.infer_full3d_tifxyz`, which samples patches the same way and writes a sparse 3D OME-Zarr prediction volume instead of a 2D image.
+Native 3D checkpoints use a different inference script, `vesuvius.ink_detection.inference.infer_full3d_tifxyz`, which samples patches the same way and writes a sparse 3D OME-Zarr prediction volume instead of a 2D image.
 
 For inference the segment folder must contain a `volume_source.txt` — a single line with the path or URL of the original scroll volume:
 
@@ -360,24 +372,25 @@ echo "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400
   > /path/to/ink-dataset/phercparis4/w00_20231016151002/volume_source.txt
 ```
 
-Then, with your native-3D checkpoint:
+Then, with your native-3D checkpoint, preview the work first: `--plan-only` validates the volume mapping and prints the occupied-chunk and patch counts without creating any output:
 
 ```bash
-uv run python -m koine_machines.inference.infer_full3d_tifxyz \
+uv run --extra models python -m vesuvius.ink_detection.inference.infer_full3d_tifxyz \
   /path/to/ink-dataset/phercparis4/w00_20231016151002 \
   runs/ink_full3d/ckpt_020000.pth \
   predictions/w00_20231016151002_ink.ome.zarr \
   --resolution 2 \
-  --write-region occupied --chunk-halo 0 \
+  --overlap 0.5 \
   --batch-size 8 --num-workers 8 \
   --cache-dir volume_cache --cache-max-gb 120 \
-  --overwrite
+  --plan-only
 ```
 
+Even at level 2 a single segment plans tens of thousands of patches (the tutorial segment plans about 78,000; at full resolution it would be hundreds of thousands). When the printed patch count fits your compute budget, drop `--plan-only` and run the same command for real; the tutorial segment takes about two and a half hours on an H100.
+
 * `--resolution 2` must match the `volume_scale` the checkpoint was trained at.
-* At `--batch-size 8`, inference uses about 6.5&nbsp;GB of VRAM.
 * `--num-workers 8` prepares patches in parallel worker processes, keeping the GPU supplied.
-* `--write-region occupied --chunk-halo 0` restricts the output to just the chunks that actually contain surface points, which is much faster than the default (which also writes a halo of neighboring chunks). Even at level 2 a single segment plans thousands of patches (hundreds of thousands at full resolution) — add `--plan-only` to preview the chunk/patch plan first, and only launch the full command when the printed patch count fits your compute budget.
+* `--write-region occupied --chunk-halo 0` restricts the output to just the chunks that actually contain surface points, a useful optimization when you want a smaller, faster run than the default (which also writes a halo of neighboring chunks).
 * For `full_3d_single_wrap` checkpoints, the script reconstructs the surface-mask input channel from the `.tifxyz` geometry automatically.
 
 The result is an ink prediction in scroll coordinates rather than a flattened image:
@@ -414,17 +427,11 @@ tifffile.imwrite('renders/w00_20231016151002_ink_max.tif', stack.max(axis=0))
 "
 ```
 
-The model trained on a single segment, so the interesting test is a segment it has never seen. Here are the same two checkpoints rendered this way on the central region of `w05_4424`, elsewhere in the scroll:
+The model trained on a single segment, so the interesting test is a segment it has never seen. Here is the final checkpoint rendered this way on the central region of `w05_4424`, elsewhere in the scroll:
 
 <figure>
-  <BeforeAfter
-    beforeImage="/img/tutorials/ink-3d-w05-15k.webp"
-    afterImage="/img/tutorials/ink-3d-w05-19k.webp"
-    beforeLabel="15,000 iterations"
-    afterLabel="19,000 iterations"
-    heightClass="aspect-[2/1]"
-  />
-  <figcaption className="mt-0">Predictions on a segment the model never trained on. Drag to compare the two checkpoints. Letters are starting to show, and the predictions have mostly converged, with the later checkpoint just slightly cleaner. This is still far from a good read.</figcaption>
+  <a href="/img/tutorials/ink-3d-w05-20k.webp" target="_blank"><img src="/img/tutorials/ink-3d-w05-20k.webp" /></a>
+  <figcaption className="mt-0">The 20,000-iteration checkpoint's prediction on a segment the model never trained on. Letters are starting to show, but this is still far from a good read.</figcaption>
 </figure>
 
 The run above is a starting point. For better results, give the trainer more segments and train longer; the next section covers where to get them.
@@ -442,7 +449,7 @@ The training config doesn't change — `segments_path` already points at the fol
 For inference across many segments, use folder mode — it runs the checkpoint on every segment in the folder and writes each prediction into a `preds/` directory inside that segment:
 
 ```bash
-uv run python -m koine_machines.inference.infer \
+uv run --extra models python -m vesuvius.ink_detection.inference.infer \
   --folder /path/to/ink-dataset/phercparis4 \
   --checkpoint-path runs/ink_tutorial/ckpt_020000.pth \
   --batch-size 4
@@ -461,7 +468,7 @@ A first model trained on a small dataset will reveal some letters clearly, other
 Labels are ordinary image files, so you can edit them in any image editor that handles large images (e.g. GIMP or Photoshop). If you edit or create labels as TIFF/PNG files, convert them to the `.zarr` format the trainer expects with:
 
 ```bash
-uv run python -m koine_machines.preprocessing.create_label_zarrs /path/to/ink-dataset/phercparis4
+uv run --extra models python -m vesuvius.ink_detection.preprocessing.create_label_zarrs /path/to/ink-dataset/phercparis4
 ```
 
 The figure below shows this loop in action on PHerc. 1667: with each iteration the labels (row a) grow from a handful of strokes to dense coverage, the model's predictions (row b) get cleaner, and the reading improves even on a held-out region that was never labeled (row c).
@@ -470,6 +477,121 @@ The figure below shows this loop in action on PHerc. 1667: with each iteration t
   <a href="/img/tutorials/ink-iterative-labeling.webp" target="_blank"><img src="/img/tutorials/ink-iterative-labeling.webp" /></a>
   <figcaption className="mt-0">Pseudo-labeling process. Each column is an iteration. Model 0 is the starting point, not trained on PHerc. 1667. Row a: the training labels created from the previous iteration's inference. Row b: this iteration's prediction, with the labels used overlaid in magenta. Row c: the validation region, never used for creating labels. Source: <a href="https://arxiv.org/abs/2606.29085">the PHerc. 1667 paper</a>.</figcaption>
 </figure>
+
+### Ink detection at 9 µm: pretrained cross-scroll models
+
+Everything above trains a model on one scroll and runs it on segments of that same scroll. But the goal — and the open [First Letters Prizes](/prizes#first-letters-prizes) — is finding ink in scrolls nobody has read yet, where there are no labels to train on. For that, we share pretrained **cross-scroll models**: ink detectors trained on aligned labels from four scrolls (PHerc. 0139, PHerc. 1667, PHerc. Paris 4, and PHerc. 0814) at a common working resolution of roughly 9&nbsp;µm isotropic.
+
+The models live at [`scrollprize/ink_9um`](https://huggingface.co/scrollprize/ink_9um) on Hugging Face: a small local 3D stem feeding a 2D U-Net, trained twice with only the seed changed (`hybrid_3d2d-seed42/` and `hybrid_3d2d-seed43/`), with seven checkpoints each along the training trajectory (`step-010000.pth` up to `step-075000.pth`). Different checkpoints behave a bit differently on different segments, so it's worth trying a few. Grab one to start:
+
+```bash
+uvx --from huggingface_hub hf download scrollprize/ink_9um \
+  hybrid_3d2d-seed42/step-075000.pth --local-dir checkpoints/ink_9um
+```
+
+This section runs one of these models on a segment, starting from nothing but its `.tifxyz` surface geometry. That is the first-letters workflow: take a segment of an unread scroll, render it, run the shared models, and look.
+
+#### Render your segment at 9 µm
+
+The worked example is **w035**, a PHerc. 0139 segment from the models' own training set, so you know what a good result looks like before trying an unread scroll. Its `.tifxyz` is published on the open-data server (you can find it, along with every other public segment, in the [Data Browser](data_browser/PHerc0139)); for your own segment, use the `.tifxyz` you produced with [VC3D](/tutorial_VC3D) instead:
+
+```bash
+aws s3 sync --no-sign-request \
+  s3://vesuvius-challenge-open-data/PHerc0139/segments/20260317000000-w035_2026031718/mesh/20260317000000-on-20250728140407-9.362um.tifxyz/ \
+  ink-dataset/pherc0139/w035/w035.tifxyz
+```
+
+Render the geometry against the scroll's native 9.362&nbsp;µm volume with `vc_render_tifxyz`, the same tool that rendered the prediction volumes above. This time it streams the scroll volume from S3 and writes the surface volume as a Zarr. The 28-slice depth matches how the released segments on the data server are rendered; you can render deeper or shallower if you want to experiment:
+
+```bash
+vc_render_tifxyz \
+  --volume volume-cache/20250728140407.zarr \
+  --remote-url s3://vesuvius-challenge-open-data/PHerc0139/volumes/20250728140407-9.362um-1.2m-113keV-masked.zarr/ \
+  --segmentation ink-dataset/pherc0139/w035/w035.tifxyz \
+  --zarr-output ink-dataset/pherc0139/w035/w035_9um.zarr \
+  --scale 1 --group-idx 0 --num-slices 28 \
+  --cache-gb 16 \
+  --voxel-size 9.362 --voxel-unit micrometer \
+  --flip-normals
+```
+
+* `--remote-url` takes the S3 volume; `--volume` names a local directory where fetched chunks are cached, so only the parts of the scroll your segment touches ever get downloaded. `--voxel-size` and `--voxel-unit` record the physical metadata the remote volume can't provide.
+* `--flip-normals` reproduces the depth orientation of the published renders and the training labels; for your own segment the orientation is unknown, which is what `--direction both` at inference time is for.
+
+For w035 this takes about five minutes and writes a ~900&nbsp;MB Zarr:
+
+<figure>
+  <div className="flex flex-wrap justify-center">
+    <div className="w-[48%] mr-[2%]">
+      <a href="/img/tutorials/ink-9um-w035-render-middle.webp" target="_blank"><img src="/img/tutorials/ink-9um-w035-render-middle.webp" /></a>
+      <div className="text-center text-sm text-dim">(a) Middle slice</div>
+    </div>
+    <div className="w-[48%]">
+      <a href="/img/tutorials/ink-9um-w035-render-max.webp" target="_blank"><img src="/img/tutorials/ink-9um-w035-render-max.webp" /></a>
+      <div className="text-center text-sm text-dim">(b) Max projection over depth</div>
+    </div>
+  </div>
+  <figcaption className="mt-0">The rendered w035 surface volume: 28 slices of 5820×5240 at 9.362&nbsp;µm. No ink is visible to the eye; that's the model's job.</figcaption>
+</figure>
+
+:::tip
+If you are already in VC3D, you don't need the command line for this: right-clicking a segment and choosing **Render** runs the same `vc_render_tifxyz` under the hood, with the same parameters in a dialog.
+:::
+
+(For w035 the rendered surface volume is also already published, under the segment's `surface-volumes/` folder on the data server, so you can skip the render and try the model immediately.)
+
+#### Run the models
+
+The rendered surface volume goes through the same flat inference command as before; only the input and the checkpoint change:
+
+```bash
+uv run --extra models python -m vesuvius.ink_detection.inference.infer \
+  ink-dataset/pherc0139/w035/w035_9um.zarr \
+  checkpoints/ink_9um/hybrid_3d2d-seed42/step-075000.pth \
+  predictions/w035_9um.tif \
+  --overlap 0.5 --blend-mode hann \
+  --batch-size 32
+```
+
+The `--batch-size 32` assumes a large GPU; drop it to 4 or 1 if you run out of memory.
+
+Checkpoints embed their training config, so inference rebuilds the model and its normalization automatically. Two things to know when reading the output:
+
+* **The models are sensitive to depth offsets.** If a checkpoint doesn't respond well on your data, the surface may sit at a slightly different depth than the model expects. Try shifting the window with `--layer-start` / `--layer-end`, or average the predictions over a few nearby windows as a simple ensemble. Training jitters the depth window, so the models tolerate small offsets; larger ones can still throw them off.
+* **The background doesn't sit at zero.** With label smoothing 0.5, the training targets are 0.25 for background and 0.75 for ink, so predictions tend to occupy a compressed range. If a prediction looks washed out, you may want to rescale it for display (for example `(p − 0.25) / 0.5`, clipped to [0, 1]).
+
+Run both seeds and a few different steps; and when you don't know which way the surface faces, run both directions too (`--direction both`). Here is how the two seeds compare on the w035 render from above:
+
+<figure>
+  <div className="max-w-[480px] mx-auto">
+    <BeforeAfter
+      beforeImage="/img/tutorials/ink-9um-w035-seed42-20k.webp"
+      afterImage="/img/tutorials/ink-9um-w035-seed43-20k.webp"
+      beforeLabel="seed 42"
+      afterLabel="seed 43"
+      heightClass="aspect-[1441/1600]"
+    />
+  </div>
+  <figcaption className="mt-0">The two seeds on the w035 surface volume, both at checkpoint step-020000, rescaled for display. Drag to compare.</figcaption>
+</figure>
+
+#### Train the 9 µm recipe yourself
+
+There is plenty of room to improve on these models: better augmentation, longer training, other architectures, ensembling, and more data are all open directions. The full training setup is public. The labels live in the [`ink_9um` dataset](https://huggingface.co/buckets/scrollprize/datasets/tree/ink_9um):
+
+```bash
+uvx --from huggingface_hub hf buckets sync hf://buckets/scrollprize/datasets/ink_9um ./ink_9um
+```
+
+It contains labels only: 24 segments annotated on pooled 2.4&nbsp;µm renders (`labels/aligned-scrollprizeorg-21slices/`) and 5 on native 9.362&nbsp;µm renders (`labels/native9-scrollprizeorg-21slices/`), in exactly the segment-folder layout the trainer consumes. The surface volumes come from the open-data server; the dataset README's per-segment tables say which public volume each segment annotates.
+
+The full recipe lives in a single config file. Copy `src/vesuvius/ink_detection/configs/aligned21_hybrid_3d2d.json` from the repo into your `configs/` folder. It defines the hybrid 3D→2D model, a jittered 17-of-21 depth window, robust normalization, and batches drawn with fixed per-scroll quotas (29/22/11/2 of 64), and its `datasets` block already lists all 29 training representations: 24 aligned and 5 native, covering 25 physical segments. What it expects from you is each segment's surface volume, at `<segment>/surface-volume.zarr` next to its labels: the native 9.362&nbsp;µm renders are used as they come from the server, and the 2.4&nbsp;µm ones are first pooled to ~9.6&nbsp;µm with `python -m vesuvius.ink_detection.preprocessing.prepare_9um_isotropic_input <in.zarr> <out.zarr>`. Point the `/path/to/ink_9um` placeholder at your synced folder, set `out_dir`, and train:
+
+```bash
+uv run --extra models python -m vesuvius.ink_detection.training.train configs/aligned21_hybrid_3d2d.json
+```
+
+The full 78,125-iteration run takes about five hours on one H100. To add your own data, label your segments with the same iterative loop from the previous section, place them beside the downloaded ones, and add them to a `datasets` entry. If your scroll mix differs from the released one, adjust (or remove) the `fixed_scroll_prior` quotas: the sampler enforces the per-batch scroll counts and fails fast on a scroll it has no data for.
 
 ### What's next
 

@@ -50,22 +50,25 @@ class _TeeText:
         return self.pane.fileno()
 
 
-def _load_completed_provenance(path: Path) -> tuple[list[object], str | None]:
+def _load_completed_provenance(path: Path) -> tuple[list[object], dict | None, str | None]:
     if not path.is_file():
-        return [], f"portable provenance was not created: {path.name}"
+        return [], None, f"portable provenance was not created: {path.name}"
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
-        return [], f"portable provenance is unreadable: {error}"
+        return [], None, f"portable provenance is unreadable: {error}"
     if not isinstance(value, dict):
-        return [], "portable provenance must contain a JSON object"
+        return [], None, "portable provenance must contain a JSON object"
     artifacts = value.get("artifacts")
     inventory = list(artifacts) if isinstance(artifacts, list) else []
+    inference = value.get("inference")
+    live_fetch = inference.get("live_fetch") if isinstance(inference, dict) else None
+    live_fetch = dict(live_fetch) if isinstance(live_fetch, dict) else None
     if value.get("status") != "completed":
-        return inventory, f"portable provenance status is {value.get('status')!r}, expected 'completed'"
+        return inventory, live_fetch, f"portable provenance status is {value.get('status')!r}, expected 'completed'"
     if not isinstance(artifacts, list):
-        return [], "portable provenance has no artifact inventory"
-    return inventory, None
+        return [], live_fetch, "portable provenance has no artifact inventory"
+    return inventory, live_fetch, None
 
 
 def _process_start_time(pid: int) -> str | None:
@@ -187,8 +190,10 @@ def main(argv: list[str] | None = None) -> int:
     metadata.update(status=status, ended_at=utc_now(), exit_code=returncode)
     metadata["lifecycle"]["inference"] = status
     provenance_path = run_dir / metadata.get("artifacts", {}).get("provenance", "artifacts/inference.json")
-    inventory, provenance_error = _load_completed_provenance(provenance_path)
+    inventory, live_fetch, provenance_error = _load_completed_provenance(provenance_path)
     metadata.setdefault("artifacts", {})["inventory"] = inventory
+    if live_fetch is not None:
+        metadata["live_fetch"] = live_fetch
     if returncode == 0 and not interrupted and provenance_error:
         status = "failed"
         metadata.update(status=status)

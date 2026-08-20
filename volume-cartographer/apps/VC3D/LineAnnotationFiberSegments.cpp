@@ -250,19 +250,6 @@ bool anyAcceptedTraceSpan(const std::vector<ControlPointT>& controls) noexcept
                        });
 }
 
-void eraseTag(std::vector<std::string>& tags, const std::string& tag)
-{
-    tags.erase(std::remove(tags.begin(), tags.end(), tag), tags.end());
-}
-
-void addTagSorted(std::vector<std::string>& tags, const std::string& tag)
-{
-    const auto position = std::lower_bound(tags.begin(), tags.end(), tag);
-    if (position == tags.end() || *position != tag) {
-        tags.insert(position, tag);
-    }
-}
-
 }  // namespace
 
 bool hasAcceptedTraceSpan(const std::vector<LineControlPoint>& controls) noexcept
@@ -285,15 +272,6 @@ FiberTraceState deriveTraceState(
     return mode == FiberOptimizationMode::NativeFiberTrace3d
         ? FiberTraceState::Predictions
         : FiberTraceState::Mixed;
-}
-
-void applyTraceReviewTags(std::vector<std::string>& tags, bool hasTraceSpans)
-{
-    if (hasTraceSpans) {
-        addTagSorted(tags, kTraceNeedsReviewTag);
-    } else {
-        eraseTag(tags, kTraceNeedsReviewTag);
-    }
 }
 
 FiberTraceSegmentMetadata fiberTraceSegmentMetadataForResult(
@@ -575,20 +553,8 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
     FiberModeOptimizationResult output;
     if (request.controlPoints.size() == 1) {
         auto config = request.lasagnaConfig;
-        const size_t inputControlIndex = nearestPointIndex(
-            request.linePointsBase, request.controlPoints.front().volumePoint);
-        cv::Vec3d tangent;
-        if (inputControlIndex > 0 &&
-            inputControlIndex + 1 < request.linePointsBase.size()) {
-            tangent = request.linePointsBase[inputControlIndex + 1] -
-                request.linePointsBase[inputControlIndex - 1];
-        } else if (inputControlIndex + 1 < request.linePointsBase.size()) {
-            tangent = request.linePointsBase[inputControlIndex + 1] -
-                request.linePointsBase[inputControlIndex];
-        } else {
-            tangent = request.linePointsBase[inputControlIndex] -
-                request.linePointsBase[inputControlIndex - 1];
-        }
+        const cv::Vec3d tangent = lineTangentAtPosition(
+            request.linePointsBase, request.controlPoints.front().linePosition);
         const double tangentLength = cv::norm(tangent);
         if (tangentLength > 1.0e-12 && std::isfinite(tangentLength)) {
             config.initialTangent = tangent * (1.0 / tangentLength);
@@ -1193,19 +1159,191 @@ std::vector<vc::lasagna::LineControlPoint> optimizerControlPoints(const std::vec
 
 std::vector<LineControlPoint> mergeOptimizerControlPoints(std::vector<vc::lasagna::LineControlPoint> optimized, const std::vector<LineControlPoint>& original)
 {
+    if (optimized.size() != original.size()) {
+        throw std::invalid_argument(
+            "optimizer and annotation control counts must match");
+    }
     std::vector<LineControlPoint> result;
     result.reserve(optimized.size());
-    for (auto& control : optimized) {
-        LineControlPoint merged{control};
-        const auto found = std::find_if(original.begin(), original.end(), [&control](const LineControlPoint& candidate) {
-            return candidate.volumePoint == control.volumePoint;
-        });
-        if (found != original.end()) {
-            merged.segmentToNext = found->segmentToNext;
-        }
+    for (size_t index = 0; index < optimized.size(); ++index) {
+        LineControlPoint merged{optimized[index]};
+        merged.segmentToNext = original[index].segmentToNext;
         result.push_back(std::move(merged));
     }
     return result;
+}
+
+ControlPointCollapseResult collapseControlPointsAtClick(
+    const std::vector<LineControlPoint>& controls,
+    std::vector<size_t> collapsedIndices,
+    double clickedLinePosition,
+    const cv::Vec3d& clickedPoint)
+{
+    if (!std::isfinite(clickedLinePosition) ||
+        !std::isfinite(clickedPoint[0]) ||
+        !std::isfinite(clickedPoint[1]) ||
+        !std::isfinite(clickedPoint[2])) {
+        throw std::invalid_argument(
+            "control-point collapse requires a finite clicked position");
+    }
+
+    std::sort(collapsedIndices.begin(), collapsedIndices.end());
+    collapsedIndices.erase(
+        std::unique(collapsedIndices.begin(), collapsedIndices.end()),
+        collapsedIndices.end());
+    if (!collapsedIndices.empty() && collapsedIndices.back() >= controls.size()) {
+        throw std::out_of_range("collapsed control-point index is out of range");
+    }
+
+    std::vector<bool> collapsed(controls.size(), false);
+    for (const size_t index : collapsedIndices) {
+        collapsed[index] = true;
+    }
+
+    LineControlPoint replacement;
+    replacement.linePosition = clickedLinePosition;
+    replacement.volumePoint = clickedPoint;
+    replacement.optimizedIndex = -1;
+    if (!collapsedIndices.empty()) {
+        size_t rightmost = collapsedIndices.front();
+        for (const size_t index : collapsedIndices) {
+            replacement.isSeed = replacement.isSeed || controls[index].isSeed;
+            if (controls[index].linePosition > controls[rightmost].linePosition) {
+                rightmost = index;
+            }
+        }
+        replacement.segmentToNext = controls[rightmost].segmentToNext;
+    }
+
+    struct PendingControl {
+        LineControlPoint control;
+        std::optional<size_t> oldIndex;
+        bool replacement = false;
+    };
+    std::vector<PendingControl> pending;
+    pending.reserve(controls.size() + (collapsedIndices.empty() ? 1 : 0));
+    for (size_t index = 0; index < controls.size(); ++index) {
+        if (!collapsed[index]) {
+            pending.push_back({controls[index], index, false});
+        }
+    }
+    pending.push_back({std::move(replacement), std::nullopt, true});
+    std::stable_sort(pending.begin(), pending.end(),
+                     [](const PendingControl& lhs, const PendingControl& rhs) {
+                         return lhs.control.linePosition < rhs.control.linePosition;
+                     });
+
+    ControlPointCollapseResult result;
+    result.oldToNewIndices.resize(controls.size());
+    result.collapsedOldIndices = std::move(collapsedIndices);
+    result.controlPoints.reserve(pending.size());
+    for (size_t newIndex = 0; newIndex < pending.size(); ++newIndex) {
+        auto& item = pending[newIndex];
+        if (item.replacement) {
+            result.replacementIndex = newIndex;
+        } else {
+            result.oldToNewIndices[*item.oldIndex] = newIndex;
+        }
+        result.controlPoints.push_back(std::move(item.control));
+    }
+    for (const size_t oldIndex : result.collapsedOldIndices) {
+        result.oldToNewIndices[oldIndex] = result.replacementIndex;
+    }
+
+    if (!result.replacedExisting() && result.replacementIndex > 0) {
+        result.controlPoints[result.replacementIndex].segmentToNext =
+            result.controlPoints[result.replacementIndex - 1].segmentToNext;
+    }
+    if (result.replacementIndex + 1 == result.controlPoints.size()) {
+        result.controlPoints[result.replacementIndex].segmentToNext.reset();
+    }
+    if (result.replacementIndex > 0) {
+        result.dirtySegmentIndices.push_back(result.replacementIndex - 1);
+    }
+    if (result.replacementIndex + 1 < result.controlPoints.size()) {
+        result.dirtySegmentIndices.push_back(result.replacementIndex);
+    }
+    return result;
+}
+
+PreparedControlPointEdit prepareAutomaticControlPointEdit(
+    const std::vector<cv::Vec3d>& linePoints,
+    const std::vector<LineControlPoint>& controls,
+    std::vector<size_t> collapsedIndices,
+    double clickedLinePosition,
+    const cv::Vec3d& clickedPoint,
+    const vc::lasagna::NormalSampler& sampler,
+    const vc::lasagna::LineOptimizationConfig& config)
+{
+    if (linePoints.size() < 2) {
+        throw std::invalid_argument(
+            "automatic control-point edit requires at least two line points");
+    }
+
+    ControlPointCollapseResult collapse = collapseControlPointsAtClick(
+        controls,
+        std::move(collapsedIndices),
+        clickedLinePosition,
+        clickedPoint);
+
+    PreparedControlPointEdit prepared;
+    prepared.linePoints = linePoints;
+    prepared.oldToNewIndices = std::move(collapse.oldToNewIndices);
+    prepared.collapsedOldIndices = std::move(collapse.collapsedOldIndices);
+    prepared.replacementIndex = collapse.replacementIndex;
+    prepared.controlPoints = std::move(collapse.controlPoints);
+    prepared.controlPointsBeforeLineUpdate = prepared.controlPoints;
+
+    if (prepared.controlPoints.size() == 1) {
+        return prepared;
+    }
+
+    auto update = vc::lasagna::updateExistingLineControlPoint(
+        prepared.linePoints,
+        optimizerControlPoints(prepared.controlPointsBeforeLineUpdate),
+        prepared.replacementIndex,
+        sampler,
+        config);
+    prepared.linePoints = std::move(update.linePoints);
+    prepared.controlPoints = mergeOptimizerControlPoints(
+        std::move(update.controlPoints), prepared.controlPointsBeforeLineUpdate);
+    prepared.replacementIndex = static_cast<size_t>(update.changedControlIndex);
+    prepared.lineReconstructed = true;
+    if (update.changedControlIndex > 0) {
+        prepared.dirtySegmentIndices.push_back(
+            static_cast<size_t>(update.changedControlIndex - 1));
+    }
+    if (update.changedControlIndex >= 0 &&
+        update.changedControlIndex + 1 <
+            static_cast<int>(prepared.controlPoints.size())) {
+        prepared.dirtySegmentIndices.push_back(
+            static_cast<size_t>(update.changedControlIndex));
+    }
+    return prepared;
+}
+
+cv::Vec3d lineTangentAtPosition(
+    const std::vector<cv::Vec3d>& linePoints,
+    double linePosition)
+{
+    if (linePoints.size() < 2 || !std::isfinite(linePosition)) {
+        throw std::invalid_argument(
+            "line tangent requires two points and a finite line position");
+    }
+
+    const double clamped = std::clamp(
+        linePosition, 0.0, static_cast<double>(linePoints.size() - 1));
+    const size_t lower = static_cast<size_t>(std::floor(clamped));
+    const size_t upper = static_cast<size_t>(std::ceil(clamped));
+    const size_t first = upper > 0 ? upper - 1 : 0;
+    const size_t last = std::min(lower + 1, linePoints.size() - 1);
+    if (first != last) {
+        return linePoints[last] - linePoints[first];
+    }
+    if (last + 1 < linePoints.size()) {
+        return linePoints[last + 1] - linePoints[last];
+    }
+    return linePoints[last] - linePoints[last - 1];
 }
 
 void invalidateSegmentsAdjacentToControl(std::vector<LineControlPoint>& controls, size_t controlIndex)
