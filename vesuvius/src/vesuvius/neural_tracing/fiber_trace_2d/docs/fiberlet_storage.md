@@ -1,8 +1,78 @@
-# Precomputed Fiberlet Storage Proposal
+# Fiberlet Storage
 
-This is a proposed compressed structure-of-arrays format. It is not implemented
-and is not a compatibility contract. Cost and field compression must be
-validated on representative extracted data before the format is fixed.
+The version-1 envelope, separate local sparse datasets, float32 cache profile,
+compact codec, and cache-backed graph reader described here are implemented.
+The format remains unpublished and is not a compatibility contract: readers
+reject unknown versions and malformed or mismatched metadata without repair.
+The compact profile remains experimental and is not currently emitted by the
+on-demand generator; current replay caches use `float32_cache`.
+
+## Implemented local layout
+
+On-demand replay uses two independent Zarr-v2-layout group roots:
+
+```text
+anchors.zarr/
+|- .zgroup
+|- .zattrs
+`- anchors/
+   |- .zarray
+   `- z.y.x
+
+fiberlets.zarr/
+|- .zgroup
+|- .zattrs
+|- complete/                     # pair-completion marker per spatial key
+|  `- z.y.x
+|- prefix/
+|  |- .zarray
+|  `- z.y.x
+`- routes/
+   |- .zarray
+   `- z.y.x
+```
+
+The `.zarray` files declare `dtype: "|O"`, `chunks: [1,1,1]`, no outer
+compressor, and the mandatory `vc-fiberlet-chunk` filter descriptor. Stock
+Zarr readers can inspect or transport the hierarchy but cannot interpret chunk
+payloads as tensor samples.
+
+Each chunk begins with the eight-byte `VCFLTV1\0` magic and a fixed 144-byte
+little-endian header. The header binds payload kind, encoding profile, scalar
+widths, spatial chunk ZYX, coordinate origin, 256-bit dataset fingerprint,
+record/auxiliary counts, position quantum, prediction-to-base scale, optional
+cost affine parameters, descriptor count, header size, and an FNV-1a checksum
+over the complete payload. Each 40-byte field descriptor contains field ID,
+scalar type, raw/Zstd codec, element count, byte offset, encoded byte count,
+decoded byte count, and a zero reserved field. Fields are independently Zstd
+level-3 compressed only when that is smaller than their raw representation.
+
+The anchor payload stores sorted key Z/Y/X plus variant. `float32_cache` also
+stores exact float32 prediction-space XYZ position and fitted XYZ axis;
+`compact_quantized` derives position from its quantized global key and stores
+the fitted unoriented axis in the existing two-byte Lasagna encoding. Prefix
+payloads store canonical first key, signed second-key delta, endpoint variants,
+interior count, entry/exit U/V, float32 path length, and float32 or chunk-affine
+8/16-bit total cost. Route payloads store a uint32 offset table and the middle
+U/V arrays. Prefix and route record orders must match exactly.
+
+Anchor chunks own stable anchor cells. Fiberlet chunks own edges by their
+canonical lexicographically first endpoint and load the complete configured
+endpoint-reach halo of anchor chunks before generation. The graph derives
+adjacency from leased prefix payloads, keeps only stable IDs in beam/frontier
+state, and reconstructs selected routes from leased prefix, route, and endpoint
+anchor payloads. Thus connectivity and geometry can be evicted and reloaded;
+there is no second corridor-wide materialized graph.
+
+Prefix and route files are immutable once written. A strict completion marker
+containing both payload hashes is atomically published only after both files
+exist and validate. Readers treat an unmarked partial pair as missing and may
+regenerate it; a marked pair with a missing or mismatched member is corruption.
+
+The remaining sections retain the broader compact production design and size
+estimates. Bounded spill/merge generation and direct on-demand compact-profile
+generation are not implemented yet; one generated owner chunk is currently
+the extraction memory bound.
 
 ## Quantization experiment result
 

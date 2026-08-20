@@ -1,3 +1,27 @@
+# 2026-08-20: on-demand fiberlet storage and replay
+
+- Added strict version-1 float32 and compact fiberlet structure-of-arrays
+  codecs with independently compressed fields, checksummed headers, stable
+  anchor/edge identities, and separate connectivity and route payloads.
+- Added local sparse Zarr-v2-layout anchor/fiberlet datasets with atomic chunk
+  publication and on-demand float32 generation through the shared chunk cache.
+- Extended `ChunkCache` with variable-length opaque payloads, independent
+  scheduler lanes, lease-aware eviction, and byte-accurate per-cache/shared
+  accounting.
+- Replaced default corridor-wide replay graph materialization with stable-ID,
+  cache-backed adjacency and route queries. The beam retains no permanent graph
+  copy, and evicted connectivity/geometry reloads transparently. The old eager
+  path remains available only through `--eager-graph` for diagnostics.
+- Fixed a lost completion wakeup in parallel anchor fitting by publishing tile
+  and ready-cell completion under the condition predicate mutex. No polling or
+  timeout recovery was added.
+- Added globally referenced replay progress, stable chunk schedule diagnostics,
+  internal fiberlet phases, and independent greedy/fiberlet terminal rows.
+- Parallelized canonical source-anchor candidate generation and released large
+  prepared candidates on their search workers. On the measured Paris4 chunk
+  `107,34,45`, generation wall fell from 34.795 to 4.344 seconds while prefix
+  and route cache payloads remained byte-identical.
+
 # 2026-08-19: float final anchor support reduction
 
 - Isolated final refined-anchor evaluation in its own translation unit and kept

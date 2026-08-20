@@ -2131,10 +2131,20 @@ FiberletCandidateResult solveCandidate(
     }
 
     std::vector<cv::Vec3f> reversed;
+    std::vector<std::array<std::int16_t, 2>> reversedLattice;
     size_t node = bestNode;
     size_t state = bestState;
     while (true) {
         reversed.push_back(nodePoint(nodes[node]));
+        const auto local = unpackLocalNodeKey(nodes[node].key, prepared.keyLayout);
+        if (local.transverseU < std::numeric_limits<std::int16_t>::min() ||
+            local.transverseU > std::numeric_limits<std::int16_t>::max() ||
+            local.transverseV < std::numeric_limits<std::int16_t>::min() ||
+            local.transverseV > std::numeric_limits<std::int16_t>::max())
+            throw std::overflow_error("fiberlet route lattice exceeds int16");
+        reversedLattice.push_back({
+            static_cast<std::int16_t>(local.transverseU),
+            static_cast<std::int16_t>(local.transverseV)});
         if (state == sourceState)
             break;
         const uint8_t previousState =
@@ -2146,6 +2156,8 @@ FiberletCandidateResult solveCandidate(
         state = previousState;
     }
     std::reverse(reversed.begin(), reversed.end());
+    std::reverse(reversedLattice.begin(), reversedLattice.end());
+    candidate.routeLatticeUV = std::move(reversedLattice);
     candidate.pointsPredictionXYZ.push_back(candidate.startPositionPredictionXYZ);
     for (const auto& point : reversed) {
         if (vectorLength(point - candidate.pointsPredictionXYZ.back()) > kEpsilon)
@@ -2887,6 +2899,45 @@ std::vector<std::array<int, 3>> fiberletCellNeighborhoodOffsets(int radius, floa
     return offsets;
 }
 
+std::vector<cv::Vec3f> reconstructFiberletRoutePoints(
+    const cv::Vec3f& startPositionPredictionXYZ,
+    const cv::Vec3f& startAxisXYZ,
+    const cv::Vec3f& targetPositionPredictionXYZ,
+    const cv::Vec3f& targetAxisXYZ,
+    std::span<const std::array<std::int16_t, 2>> interiorLatticeUV,
+    const FiberletPathConfig& config)
+{
+    FiberletCandidateResult candidate;
+    candidate.startPositionPredictionXYZ = startPositionPredictionXYZ;
+    candidate.targetPositionPredictionXYZ = targetPositionPredictionXYZ;
+    const cv::Vec3f chord =
+        targetPositionPredictionXYZ - startPositionPredictionXYZ;
+    candidate.startAxisXYZ = normalized(startAxisXYZ);
+    candidate.targetAxisXYZ = normalized(targetAxisXYZ);
+    if (candidate.startAxisXYZ.dot(chord) < 0.0F)
+        candidate.startAxisXYZ *= -1.0F;
+    if (candidate.targetAxisXYZ.dot(chord) < 0.0F)
+        candidate.targetAxisXYZ *= -1.0F;
+    const auto domain = makeCurvedDomain(candidate, config);
+    if (domain.layers.size() < 2 ||
+        interiorLatticeUV.size() != domain.layers.size() - 2) {
+        throw std::invalid_argument(
+            "stored fiberlet route lattice count does not match its curved domain");
+    }
+    std::vector<cv::Vec3f> points;
+    points.reserve(interiorLatticeUV.size() + 2);
+    points.push_back(startPositionPredictionXYZ);
+    for (std::size_t index = 0; index < interiorLatticeUV.size(); ++index) {
+        const auto& uv = interiorLatticeUV[index];
+        points.push_back(localNodePoint(
+            domain,
+            {index + 1, static_cast<int>(uv[0]), static_cast<int>(uv[1])},
+            config));
+    }
+    points.push_back(targetPositionPredictionXYZ);
+    return points;
+}
+
 FiberletPathReport traceFiberletPaths(
     const LoadedFiberAnchorArtifact& anchors,
     const FiberPredictionGridInfo& grid,
@@ -2894,7 +2945,9 @@ FiberletPathReport traceFiberletPaths(
     const FiberStoredPredictionBatchSampler& predictionSampler,
     const vc::lasagna::NormalSampler& normalSampler,
     const FiberletPathProgressCallback& progressCallback,
-    const FiberletPointPredicate& pointPredicate)
+    const FiberletPointPredicate& pointPredicate,
+    const FiberletCandidatePredicate& candidatePredicate,
+    const FiberletSourcePredicate& sourcePredicate)
 {
     validateFiberletPathConfig(inputConfig);
     if (!predictionSampler)
@@ -2926,86 +2979,11 @@ FiberletPathReport traceFiberletPaths(
     const std::array<size_t, 3>
         cellShape{(grid.shapeZYX[0] + cellSize - 1) / cellSize, (grid.shapeZYX[1] + cellSize - 1) / cellSize, (grid.shapeZYX[2] + cellSize - 1) / cellSize};
     const float minimumAxisDot = std::cos(report.config.maximumEndpointAngleDegrees * kPi / 180.0F);
-    std::vector<size_t> searchCandidateIndices;
-    for (const auto& source : flat) {
-        for (const auto& offset : offsets) {
-            std::array<size_t, 3> targetCell{};
-            bool inside = true;
-            for (size_t axis = 0; axis < 3; ++axis) {
-                const int64_t value = static_cast<int64_t>(source.id.cellZYX[axis]) + static_cast<int64_t>(offset[axis]);
-                if (value < 0 || static_cast<uint64_t>(value) >= cellShape[axis]) {
-                    inside = false;
-                    break;
-                }
-                targetCell[axis] = static_cast<size_t>(value);
-            }
-            if (!inside) {
-                ++report.diagnostics.neighborhoodTargetsOutOfGrid;
-                continue;
-            }
-            const auto targetAnchors = byCell.find(targetCell);
-            if (targetAnchors == byCell.end())
-                continue;
-            for (const FlatAnchor* target : targetAnchors->second) {
-                if (!(source.id < target->id))
-                    continue;
-                FiberletCandidateResult candidate;
-                candidate.start = source.id;
-                candidate.target = target->id;
-                candidate.startPositionPredictionXYZ = source.anchor.positionPredictionXYZ;
-                candidate.targetPositionPredictionXYZ = target->anchor.positionPredictionXYZ;
-                const cv::Vec3f chordVector = candidate.targetPositionPredictionXYZ - candidate.startPositionPredictionXYZ;
-                const float distance = vectorLength(chordVector);
-                ++report.diagnostics.generatedPairs;
-                if (!(distance > kEpsilon)) {
-                    candidate.reason = "zero_length";
-                    ++report.diagnostics.zeroLengthPairs;
-                    report.candidates.push_back(std::move(candidate));
-                    continue;
-                }
-                const cv::Vec3f chord = chordVector / distance;
-                candidate.startAxisXYZ = normalized(source.anchor.axisXYZ);
-                candidate.targetAxisXYZ = normalized(target->anchor.axisXYZ);
-                bool endpointsSelected = true;
-                if (pointPredicate) {
-                    ++report.candidatePointPredicateCalls;
-                    endpointsSelected =
-                        pointPredicate(candidate.startPositionPredictionXYZ);
-                    if (endpointsSelected) {
-                        ++report.candidatePointPredicateCalls;
-                        endpointsSelected = pointPredicate(
-                            candidate.targetPositionPredictionXYZ);
-                    }
-                }
-                if (!endpointsSelected) {
-                    candidate.reason = "outside_selection";
-                    report.candidates.push_back(std::move(candidate));
-                    continue;
-                }
-                if (candidate.startAxisXYZ.dot(chord) < 0.0F)
-                    candidate.startAxisXYZ *= -1.0F;
-                if (candidate.targetAxisXYZ.dot(chord) < 0.0F)
-                    candidate.targetAxisXYZ *= -1.0F;
-                if (candidate.startAxisXYZ.dot(chord) + kEpsilon < minimumAxisDot || candidate.targetAxisXYZ.dot(chord) + kEpsilon < minimumAxisDot) {
-                    candidate.reason = "axis_mismatch";
-                    ++report.diagnostics.axisRejectedPairs;
-                    report.candidates.push_back(std::move(candidate));
-                    continue;
-                }
-                searchCandidateIndices.push_back(report.candidates.size());
-                report.candidates.push_back(std::move(candidate));
-            }
-        }
-    }
-    const auto candidateGenerationEnd = Clock::now();
-    report.candidateGenerationSeconds = std::chrono::duration<double>(candidateGenerationEnd - startTime).count();
-    report.candidateGenerationCpuSeconds = processCpuSeconds() - startCpuSeconds;
-
     std::mutex progressMutex;
     std::exception_ptr progressError;
     std::string progressPhase;
     size_t lastReportedCompleted = 0;
-    auto lastProgressTime = candidateGenerationEnd;
+    auto lastProgressTime = startTime;
     const auto reportProgress = [&](const char* phase, size_t completed, size_t total, const Clock::time_point& phaseStart, bool terminal) noexcept {
         if (!progressCallback)
             return;
@@ -3041,6 +3019,182 @@ FiberletPathReport traceFiberletPaths(
             progressError = std::current_exception();
         }
     };
+
+    struct CandidateGenerationResult {
+        FiberletPathDiagnostics diagnostics;
+        std::vector<FiberletCandidateResult> candidates;
+        std::vector<size_t> searchedOffsets;
+        size_t pointPredicateCalls = 0;
+        std::exception_ptr error;
+    };
+    std::vector<uint8_t> selectedSources(flat.size(), 1);
+    if (sourcePredicate) {
+        for (size_t index = 0; index < flat.size(); ++index)
+            selectedSources[index] = sourcePredicate(flat[index].id) ? 1 : 0;
+    }
+    std::vector<CandidateGenerationResult> generated(flat.size());
+    const size_t generationWorkerCount = pointPredicate || candidatePredicate
+        ? std::min<size_t>(flat.size(), 1)
+        : std::min(
+              flat.size(), static_cast<size_t>(report.config.parallelThreads));
+    report.candidateGenerationWorkers = generationWorkerCount;
+    reportProgress("candidate_generation", 0, flat.size(), startTime, true);
+    std::atomic<size_t> nextSource{0};
+    std::atomic<size_t> completedSources{0};
+    const auto generationWorker = [&]() {
+        while (true) {
+            const size_t sourceIndex =
+                nextSource.fetch_add(1, std::memory_order_relaxed);
+            if (sourceIndex >= flat.size())
+                return;
+            auto& local = generated[sourceIndex];
+            try {
+                const auto& source = flat[sourceIndex];
+                if (selectedSources[sourceIndex] != 0) {
+                    for (const auto& offset : offsets) {
+                        std::array<size_t, 3> targetCell{};
+                        bool inside = true;
+                        for (size_t axis = 0; axis < 3; ++axis) {
+                            const int64_t value =
+                                static_cast<int64_t>(source.id.cellZYX[axis]) +
+                                static_cast<int64_t>(offset[axis]);
+                            if (value < 0 ||
+                                static_cast<uint64_t>(value) >=
+                                    cellShape[axis]) {
+                                inside = false;
+                                break;
+                            }
+                            targetCell[axis] = static_cast<size_t>(value);
+                        }
+                        if (!inside) {
+                            ++local.diagnostics.neighborhoodTargetsOutOfGrid;
+                            continue;
+                        }
+                        const auto targetAnchors = byCell.find(targetCell);
+                        if (targetAnchors == byCell.end())
+                            continue;
+                        for (const FlatAnchor* target : targetAnchors->second) {
+                            if (!(source.id < target->id))
+                                continue;
+                            if (candidatePredicate &&
+                                !candidatePredicate(source.id, target->id)) {
+                                continue;
+                            }
+                            FiberletCandidateResult candidate;
+                            candidate.start = source.id;
+                            candidate.target = target->id;
+                            candidate.startPositionPredictionXYZ =
+                                source.anchor.positionPredictionXYZ;
+                            candidate.targetPositionPredictionXYZ =
+                                target->anchor.positionPredictionXYZ;
+                            const cv::Vec3f chordVector =
+                                candidate.targetPositionPredictionXYZ -
+                                candidate.startPositionPredictionXYZ;
+                            const float distance = vectorLength(chordVector);
+                            ++local.diagnostics.generatedPairs;
+                            if (!(distance > kEpsilon)) {
+                                candidate.reason = "zero_length";
+                                ++local.diagnostics.zeroLengthPairs;
+                                local.candidates.push_back(std::move(candidate));
+                                continue;
+                            }
+                            const cv::Vec3f chord = chordVector / distance;
+                            candidate.startAxisXYZ =
+                                normalized(source.anchor.axisXYZ);
+                            candidate.targetAxisXYZ =
+                                normalized(target->anchor.axisXYZ);
+                            bool endpointsSelected = true;
+                            if (pointPredicate) {
+                                ++local.pointPredicateCalls;
+                                endpointsSelected = pointPredicate(
+                                    candidate.startPositionPredictionXYZ);
+                                if (endpointsSelected) {
+                                    ++local.pointPredicateCalls;
+                                    endpointsSelected = pointPredicate(
+                                        candidate.targetPositionPredictionXYZ);
+                                }
+                            }
+                            if (!endpointsSelected) {
+                                candidate.reason = "outside_selection";
+                                local.candidates.push_back(std::move(candidate));
+                                continue;
+                            }
+                            if (candidate.startAxisXYZ.dot(chord) < 0.0F)
+                                candidate.startAxisXYZ *= -1.0F;
+                            if (candidate.targetAxisXYZ.dot(chord) < 0.0F)
+                                candidate.targetAxisXYZ *= -1.0F;
+                            if (candidate.startAxisXYZ.dot(chord) + kEpsilon <
+                                    minimumAxisDot ||
+                                candidate.targetAxisXYZ.dot(chord) + kEpsilon <
+                                    minimumAxisDot) {
+                                candidate.reason = "axis_mismatch";
+                                ++local.diagnostics.axisRejectedPairs;
+                                local.candidates.push_back(std::move(candidate));
+                                continue;
+                            }
+                            local.searchedOffsets.push_back(
+                                local.candidates.size());
+                            local.candidates.push_back(std::move(candidate));
+                        }
+                    }
+                }
+            } catch (...) {
+                local.error = std::current_exception();
+            }
+            const size_t completed = completedSources.fetch_add(
+                1, std::memory_order_relaxed) + 1;
+            reportProgress("candidate_generation", completed, flat.size(),
+                startTime, false);
+        }
+    };
+    if (generationWorkerCount == 1) {
+        generationWorker();
+    } else if (generationWorkerCount > 1) {
+        std::vector<std::thread> workers;
+        workers.reserve(generationWorkerCount);
+        for (size_t index = 0; index < generationWorkerCount; ++index)
+            workers.emplace_back(generationWorker);
+        for (auto& worker : workers)
+            worker.join();
+    }
+    reportProgress(
+        "candidate_generation", flat.size(), flat.size(), startTime, true);
+
+    size_t candidateCount = 0;
+    size_t searchedCount = 0;
+    for (const auto& local : generated) {
+        if (local.error)
+            std::rethrow_exception(local.error);
+        candidateCount += local.candidates.size();
+        searchedCount += local.searchedOffsets.size();
+    }
+    report.candidates.reserve(candidateCount);
+    std::vector<size_t> searchCandidateIndices;
+    searchCandidateIndices.reserve(searchedCount);
+    for (auto& local : generated) {
+        const size_t candidateBase = report.candidates.size();
+        for (const size_t offset : local.searchedOffsets)
+            searchCandidateIndices.push_back(candidateBase + offset);
+        report.diagnostics.neighborhoodTargetsOutOfGrid +=
+            local.diagnostics.neighborhoodTargetsOutOfGrid;
+        report.diagnostics.generatedPairs +=
+            local.diagnostics.generatedPairs;
+        report.diagnostics.zeroLengthPairs +=
+            local.diagnostics.zeroLengthPairs;
+        report.diagnostics.axisRejectedPairs +=
+            local.diagnostics.axisRejectedPairs;
+        report.candidatePointPredicateCalls += local.pointPredicateCalls;
+        report.candidates.insert(report.candidates.end(),
+            std::make_move_iterator(local.candidates.begin()),
+            std::make_move_iterator(local.candidates.end()));
+    }
+    const auto candidateGenerationEnd = Clock::now();
+    report.candidateGenerationSeconds =
+        std::chrono::duration<double>(candidateGenerationEnd - startTime)
+            .count();
+    report.candidateGenerationCpuSeconds =
+        processCpuSeconds() - startCpuSeconds;
+
     const size_t workerCount = std::min(searchCandidateIndices.size(), static_cast<size_t>(report.config.parallelThreads));
     report.candidateWorkers = workerCount;
     std::vector<PreparedCandidate> prepared(searchCandidateIndices.size());
@@ -3483,6 +3637,7 @@ FiberletPathReport traceFiberletPaths(
             } catch (...) {
                 errors[searchIndex] = std::current_exception();
             }
+            prepared[searchIndex] = {};
             const size_t completed = completedSearches.fetch_add(1, std::memory_order_relaxed) + 1;
             reportProgress("search", completed, searchCandidateIndices.size(), searchStart, false);
         }

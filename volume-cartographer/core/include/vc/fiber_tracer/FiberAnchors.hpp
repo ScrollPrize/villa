@@ -441,6 +441,13 @@ fiberAnchorCellsNearPolyline(
     const FiberPredictionGridInfo& grid,
     int anchorCellSizePredictionVoxels);
 
+[[nodiscard]] bool fiberAnchorCellIntersectsPolylineTube(
+    const std::array<size_t, 3>& cellZYX,
+    const std::vector<cv::Vec3d>& referenceLineBase,
+    double radiusBaseVoxels,
+    const FiberPredictionGridInfo& grid,
+    int anchorCellSizePredictionVoxels);
+
 [[nodiscard]] FiberAnchorBenchmarkReport benchmarkRefinedFiberAnchors(
     const FiberAnchorExtractionReport& anchors,
     const std::vector<cv::Vec3d>& referenceLineBase,

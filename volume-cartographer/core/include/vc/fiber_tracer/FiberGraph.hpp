@@ -1,7 +1,9 @@
 #pragma once
 
 #include "vc/fiber_tracer/FiberPaths.hpp"
+#include "vc/fiber_tracer/FiberletStorage.hpp"
 #include "vc/fiber_tracer/FiberTrace.hpp"
+#include "vc/fiber_tracer/PolylineGeometry.hpp"
 
 #include <cstddef>
 #include <optional>
@@ -119,6 +121,59 @@ struct FiberletGraphReplayResult {
     std::vector<FiberReplayFailure> failures;
 };
 
+struct FiberletGraphReplayProgress {
+    size_t segmentIndex = 0;
+    double referenceArcBase = 0.0;
+    double referenceArcFraction = 0.0;
+    std::string state;
+};
+
+using FiberletGraphReplayProgressCallback =
+    std::function<void(const FiberletGraphReplayProgress&)>;
+
+struct FiberletReplaySourceAnchor {
+    FiberletStorageKey id;
+    cv::Vec3f positionBaseXYZ{0.0F, 0.0F, 0.0F};
+};
+
+struct FiberletReplaySourceArc {
+    DirectedFiberletStorageId id;
+    FiberletStorageKey source;
+    FiberletStorageKey target;
+    std::vector<cv::Vec3d> pointsBaseXYZ;
+    float pathLengthPredictionVoxels = 0.0F;
+    FiberletPathCost cost;
+    std::optional<size_t> diagnosticCandidateIndex;
+    std::optional<size_t> diagnosticArcIndex;
+};
+
+struct FiberletReplaySourceTransition {
+    DirectedFiberletStorageId incoming;
+    DirectedFiberletStorageId outgoing;
+    FiberletPathCost cost;
+    std::optional<size_t> diagnosticTransitionIndex;
+};
+
+class FiberletReplayGraphSource {
+public:
+    virtual ~FiberletReplayGraphSource() = default;
+    [[nodiscard]] virtual float predictionToBaseScale() const noexcept = 0;
+    [[nodiscard]] virtual int anchorCellSizePredictionVoxels() const noexcept = 0;
+    [[nodiscard]] virtual float maximumJoinAngleDegrees() const noexcept = 0;
+    [[nodiscard]] virtual std::vector<FiberletReplaySourceAnchor> anchorsNearReference(
+        const PolylineArcGeometry& reference,
+        double beginArcBase,
+        double endArcBase,
+        double broadPhaseRadiusBaseVoxels) const = 0;
+    [[nodiscard]] virtual std::vector<DirectedFiberletStorageId> outgoing(
+        const FiberletStorageKey& anchor) const = 0;
+    [[nodiscard]] virtual FiberletReplaySourceArc arc(
+        const DirectedFiberletStorageId& id) const = 0;
+    [[nodiscard]] virtual std::optional<FiberletReplaySourceTransition> transition(
+        const FiberletReplaySourceArc& incoming,
+        const FiberletReplaySourceArc& outgoing) const = 0;
+};
+
 [[nodiscard]] FiberletGraph buildFiberletGraph(const FiberletPathReport& paths, float maximumJoinAngleDegrees = 45.0F);
 
 [[nodiscard]] FiberletGraphReplayResult traceFiberletGraphReplay(
@@ -127,7 +182,17 @@ struct FiberletGraphReplayResult {
     const vc::lasagna::NormalSampler& normalSampler,
     double normalWorkingToBaseScale,
     const FiberletGraphReplayConfig& config,
-    const FiberReplayFailureCallback& failure = {});
+    const FiberReplayFailureCallback& failure = {},
+    const FiberletGraphReplayProgressCallback& progress = {});
+
+[[nodiscard]] FiberletGraphReplayResult traceFiberletGraphReplay(
+    const FiberletReplayGraphSource& graph,
+    const std::vector<cv::Vec3d>& referencePointsBaseXYZ,
+    const vc::lasagna::NormalSampler& normalSampler,
+    double normalWorkingToBaseScale,
+    const FiberletGraphReplayConfig& config,
+    const FiberReplayFailureCallback& failure = {},
+    const FiberletGraphReplayProgressCallback& progress = {});
 
 [[nodiscard]] nlohmann::json fiberletGraphJson(const FiberletGraph& graph);
 

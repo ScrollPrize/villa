@@ -1003,9 +1003,9 @@ TEST_CASE("fiberlet DP follows curved Hermite-normal planes with exact endpoints
     CHECK(bowedAwayFromChord);
     CHECK(path.cost.alignment >= 0.0);
     REQUIRE(progress.size() >= 2);
-    CHECK(progress.front().phase == "preparation");
+    CHECK(progress.front().phase == "candidate_generation");
     CHECK(progress.front().completed == 0);
-    CHECK(progress.front().total == 1);
+    CHECK(progress.front().total == 2);
     CHECK(progress.back().phase == "search");
     CHECK(progress.back().completed == 1);
     CHECK(progress.back().total == 1);
@@ -1440,14 +1440,27 @@ TEST_CASE("fiberlet graph replay scores joins with the shared local metric")
     config.beamWidth = 4;
     config.lookaheadEdges = 2;
     config.errorThresholdBaseVoxels = 2.0;
+    std::vector<vc::fiber_tracer::FiberletGraphReplayProgress> replayProgress;
     const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(
-        graph, {{0, 0, 0}, {3, 0, 0}}, replayYNormals(), 1.0, config);
+        graph, {{0, 0, 0}, {3, 0, 0}}, replayYNormals(), 1.0, config,
+        {}, [&](const auto& update) { replayProgress.push_back(update); });
     REQUIRE(replay.segments.size() == 1);
     CHECK(replay.segments[0].candidateIndices == std::vector<size_t>{0, 1});
     REQUIRE(replay.segments[0].transitionIndices.size() == 1);
     CHECK(replay.segments[0].transitionCost.total() == doctest::Approx(0.0));
     CHECK(replay.completedReferenceArcBase == doctest::Approx(3.0));
     CHECK(replay.failures.empty());
+    REQUIRE_FALSE(replayProgress.empty());
+    CHECK(replayProgress.front().state == "segment_start");
+    CHECK(replayProgress.front().referenceArcFraction == doctest::Approx(0.0));
+    CHECK(replayProgress.back().state == "completed");
+    CHECK(replayProgress.back().referenceArcFraction == doctest::Approx(1.0));
+    for (size_t index = 1; index < replayProgress.size(); ++index) {
+        CHECK(replayProgress[index].referenceArcBase >=
+              replayProgress[index - 1].referenceArcBase);
+        CHECK(replayProgress[index].referenceArcFraction >=
+              replayProgress[index - 1].referenceArcFraction);
+    }
     const auto json = vc::fiber_tracer::fiberletGraphJson(graph);
     CHECK(
         json.at("transitions").at(static_cast<size_t>(std::distance(graph.transitions.begin(), transition))).at("cost").at("total") ==
@@ -1867,6 +1880,8 @@ TEST_CASE("fiberlet candidate workers preserve deterministic results")
     REQUIRE(parallel.diagnostics.searchedPairs == 2);
     CHECK(serial.candidateWorkers == 1);
     CHECK(parallel.candidateWorkers == 2);
+    CHECK(serial.candidateGenerationWorkers == 1);
+    CHECK(parallel.candidateGenerationWorkers == 4);
     const auto checkProfile = [](const auto& report) {
         CHECK(report.latticeNodePositions >= report.corridorAcceptedNodes);
         CHECK(report.corridorAcceptedNodes >= report.retainedSearchNodes);
@@ -2037,10 +2052,12 @@ TEST_CASE("fiberlet pairing rejects an incompatible unoriented endpoint axis")
     CHECK(report.candidateWorkers == 0);
     CHECK(report.candidates[0].reason == "axis_mismatch");
     REQUIRE_FALSE(progress.empty());
-    for (const auto& update : progress) {
-        CHECK(update.completed == 0);
-        CHECK(update.total == 0);
-    }
+    CHECK(progress.front().phase == "candidate_generation");
+    CHECK(progress.front().completed == 0);
+    CHECK(progress.front().total == 2);
+    CHECK(progress.back().phase == "search");
+    CHECK(progress.back().completed == 0);
+    CHECK(progress.back().total == 0);
 }
 
 TEST_CASE("fiberlet progress callback failures are rethrown after search")

@@ -4169,8 +4169,25 @@ FiberReplayTraceResult traceFiberReplay(
 
         std::string terminationReason;
         try {
+            FiberTraceProgressCallback segmentProgress;
+            if (progress) {
+                const size_t segmentIndex = result.segments.size();
+                segmentProgress = [&](const FiberTraceProgress& event) {
+                    auto replayEvent = event;
+                    replayEvent.replaySegmentIndex = segmentIndex;
+                    replayEvent.referenceArcBase = previousArcBase;
+                    replayEvent.referenceArcFraction = std::clamp(
+                        (previousArcBase - startArcBase) / remainingArcBase,
+                        0.0, 1.0);
+                    progress(replayEvent);
+                };
+            }
             const auto native =
-                traceOneWayCore(predictions, oneWay, &normalSampler, progress, "replay", static_cast<double>(maximumSteps) * request.config.stepVoxels, maximumSteps, observe);
+                traceOneWayCore(predictions, oneWay, &normalSampler,
+                    segmentProgress, "replay",
+                    static_cast<double>(maximumSteps) *
+                        request.config.stepVoxels,
+                    maximumSteps, observe);
             terminationReason = native.reason;
         } catch (const std::invalid_argument& error) {
             if (std::string_view(error.what()) != "fiber trace start point has no valid prediction direction") {

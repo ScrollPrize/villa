@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <functional>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -84,6 +85,9 @@ struct FiberletCandidateResult {
     bool success = false;
     std::string reason;
     FiberletPathCost cost;
+    // Exact selected transverse lattice coordinate for every interior DP
+    // layer. This is the persistence geometry; expanded XYZ is an adapter.
+    std::vector<std::array<std::int16_t, 2>> routeLatticeUV;
     std::vector<cv::Vec3f> pointsPredictionXYZ;
 };
 
@@ -175,6 +179,7 @@ struct FiberletPathReport {
     size_t preparedGeometryBytes = 0;
     size_t peakSearchTransientBytes = 0;
     size_t estimatedPeakOwnedBytes = 0;
+    size_t candidateGenerationWorkers = 0;
     size_t candidateWorkers = 0;
     size_t candidatePointPredicateCalls = 0;
     size_t latticeNodePositions = 0;
@@ -276,6 +281,19 @@ struct FiberletPathProgress {
 
 using FiberletPathProgressCallback = std::function<void(const FiberletPathProgress& progress)>;
 using FiberletPointPredicate = std::function<bool(const cv::Vec3f& pointPredictionXYZ)>;
+using FiberletCandidatePredicate = std::function<bool(
+    const FiberletAnchorId& first,
+    const FiberletAnchorId& second)>;
+using FiberletSourcePredicate =
+    std::function<bool(const FiberletAnchorId& source)>;
+
+[[nodiscard]] std::vector<cv::Vec3f> reconstructFiberletRoutePoints(
+    const cv::Vec3f& startPositionPredictionXYZ,
+    const cv::Vec3f& startAxisXYZ,
+    const cv::Vec3f& targetPositionPredictionXYZ,
+    const cv::Vec3f& targetAxisXYZ,
+    std::span<const std::array<std::int16_t, 2>> interiorLatticeUV,
+    const FiberletPathConfig& config);
 
 void validateFiberletPathConfig(const FiberletPathConfig& config);
 
@@ -290,7 +308,9 @@ void validateFiberletPathConfig(const FiberletPathConfig& config);
     const FiberStoredPredictionBatchSampler& predictionSampler,
     const vc::lasagna::NormalSampler& normalSampler,
     const FiberletPathProgressCallback& progressCallback = {},
-    const FiberletPointPredicate& pointPredicate = {});
+    const FiberletPointPredicate& pointPredicate = {},
+    const FiberletCandidatePredicate& candidatePredicate = {},
+    const FiberletSourcePredicate& sourcePredicate = {});
 
 [[nodiscard]] FiberletPathStatistics fiberletPathStatistics(const FiberletPathReport& report);
 

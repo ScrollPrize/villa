@@ -2916,6 +2916,39 @@ TEST_CASE("adjacent anchor tiles share extraction-wide prediction samples")
           report.profile.submittedPredictionVoxels);
 }
 
+TEST_CASE("parallel anchor fitting completes after every ready tile finishes")
+{
+    auto value = config();
+    value.parallelThreads = 32;
+    value.gaussianSigmaPredictionVoxels = 0.1;
+    value.localWindowRadiusPredictionVoxels = 0.1;
+    value.axialSupportHalfWidthPredictionVoxels = 0.1;
+    value.peakSigmaPredictionVoxels = 0.1;
+    value.peakAxialSigmaPredictionVoxels = 0.1;
+    value.peakGradientWeight = 0.0;
+
+    std::vector<std::array<size_t, 3>> cells;
+    for (size_t z = 0; z < 4; ++z) {
+        for (size_t y = 0; y < 4; ++y) {
+            for (size_t x = 0; x < 4; ++x)
+                cells.push_back({z * 6 + 1, y * 6 + 1, x * 6 + 1});
+        }
+    }
+
+    const auto report =
+        vc::fiber_tracer::extractRefinedFiberAnchorsForCells(
+            {{100, 100, 100}, 1.0}, value,
+            [](const auto& indices, int threads, auto& samples) {
+                CHECK(threads == 1);
+                samples.assign(indices.size(), {
+                    cv::Vec3d{1.0, 0.0, 0.0}, 0.0, true});
+            },
+            cells);
+
+    CHECK(report.profile.tiles == 64);
+    CHECK(report.diagnostics.totalCells == cells.size());
+}
+
 TEST_CASE("anchor partitions submit each shared prediction voxel once")
 {
     auto value = config();

@@ -4075,7 +4075,7 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                 const std::vector<CompactFiberAnchorObservation>* observations =
                     nullptr;
                 std::array<size_t, 3> sampleShape{};
-                std::atomic<size_t> remainingCells{0};
+                size_t remainingCells = 0;
             };
             struct ReadyCellTask {
                 ReadyTile* readyTile = nullptr;
@@ -4136,7 +4136,7 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
             readyCells.reserve(partitionCellCount);
             size_t nextReadyCell = 0;
             std::atomic<size_t> nextTile{partition.tileBegin};
-            std::atomic<size_t> completedTiles{0};
+            size_t completedTiles = 0;
             const auto fitWorker = [&](size_t workerIndex) {
                 auto& workerProfile = workerProfiles[workerIndex];
                 std::vector<uint32_t> cellObservationIndices;
@@ -4166,7 +4166,10 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                     }
                     const double duration = std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - cellStart).count();
-                    task.readyTile->remainingCells.fetch_sub(1);
+                    {
+                        std::lock_guard lock(readyCellMutex);
+                        --task.readyTile->remainingCells;
+                    }
                     readyCellCondition.notify_all();
                     try {
                         workerProfile.cellProcessingDurations.push_back(duration);
@@ -4184,8 +4187,8 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                             readyCellCondition.wait(lock, [&]() {
                                 return nextReadyCell < readyCells.size() ||
                                     (ownTile != nullptr
-                                        ? ownTile->remainingCells.load() == 0
-                                        : completedTiles.load() ==
+                                        ? ownTile->remainingCells == 0
+                                        : completedTiles ==
                                             partitionTileCount);
                             });
                             if (nextReadyCell == readyCells.size())
@@ -4377,7 +4380,7 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                     readyTile.tile = &tile;
                     readyTile.observations = &observations;
                     readyTile.sampleShape = sampleShape;
-                    readyTile.remainingCells.store(tile.cells.size());
+                    readyTile.remainingCells = tile.cells.size();
                     {
                         std::lock_guard lock(readyCellMutex);
                         for (const size_t cellIndex : tile.cells)
@@ -4392,7 +4395,10 @@ static FiberAnchorExtractionReport extractFiberAnchorsImpl(
                             reportCellCompleted();
                         }
                     }
-                    completedTiles.fetch_add(1);
+                    {
+                        std::lock_guard lock(readyCellMutex);
+                        ++completedTiles;
+                    }
                     readyCellCondition.notify_all();
                 }
             };
@@ -4878,6 +4884,54 @@ std::vector<std::array<size_t, 3>> fiberAnchorCellsNearPolyline(
     if (cells.empty())
         throw std::runtime_error("reference fiber selects no prediction cells");
     return {cells.begin(), cells.end()};
+}
+
+bool fiberAnchorCellIntersectsPolylineTube(
+    const std::array<size_t, 3>& cellZYX,
+    const std::vector<cv::Vec3d>& referenceLineBase,
+    double radiusBaseVoxels,
+    const FiberPredictionGridInfo& grid,
+    int anchorCellSizePredictionVoxels)
+{
+    if (!(radiusBaseVoxels >= 0.0) || !std::isfinite(radiusBaseVoxels) ||
+        !(grid.predictionToBaseScale > 0.0F) ||
+        !std::isfinite(grid.predictionToBaseScale) ||
+        anchorCellSizePredictionVoxels < 1 || referenceLineBase.size() < 2) {
+        throw std::invalid_argument(
+            "fiber anchor cell tube test configuration is invalid");
+    }
+    const auto cellSize = static_cast<size_t>(
+        anchorCellSizePredictionVoxels);
+    std::array<size_t, 3> begin{};
+    std::array<size_t, 3> end{};
+    for (size_t axis = 0; axis < 3; ++axis) {
+        const size_t cellCount =
+            (grid.shapeZYX[axis] + cellSize - 1) / cellSize;
+        if (cellZYX[axis] >= cellCount)
+            return false;
+        begin[axis] = cellZYX[axis] * cellSize;
+        end[axis] = std::min(grid.shapeZYX[axis], begin[axis] + cellSize);
+    }
+    const double scale = grid.predictionToBaseScale;
+    const cv::Vec3d cellLow{
+        (static_cast<double>(begin[2]) - 0.5) * scale,
+        (static_cast<double>(begin[1]) - 0.5) * scale,
+        (static_cast<double>(begin[0]) - 0.5) * scale,
+    };
+    const cv::Vec3d cellHigh{
+        (static_cast<double>(end[2]) - 0.5) * scale,
+        (static_cast<double>(end[1]) - 0.5) * scale,
+        (static_cast<double>(end[0]) - 0.5) * scale,
+    };
+    const double radiusSquared = radiusBaseVoxels * radiusBaseVoxels;
+    for (size_t index = 1; index < referenceLineBase.size(); ++index) {
+        if (segmentAabbDistanceSquared(
+                referenceLineBase[index - 1], referenceLineBase[index],
+                cellLow, cellHigh) <= radiusSquared + kGeometryEpsilon) {
+            return true;
+        }
+    }
+    return false;
 }
 
 FiberAnchorBenchmarkReport benchmarkRefinedFiberAnchors(

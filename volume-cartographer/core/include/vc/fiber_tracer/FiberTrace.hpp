@@ -116,6 +116,9 @@ struct FiberTraceProgress {
     double targetPlaneProgress = 0.0;
     std::string phase;
     std::string reason;
+    std::optional<size_t> replaySegmentIndex;
+    std::optional<double> referenceArcBase;
+    std::optional<double> referenceArcFraction;
 };
 
 struct FiberPredictionSampleOption {

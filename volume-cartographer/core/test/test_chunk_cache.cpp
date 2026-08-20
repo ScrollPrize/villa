@@ -60,6 +60,26 @@ private:
     std::unordered_map<ChunkKey, ChunkFetchResult, vc::render::ChunkKeyHash> canned_;
 };
 
+class DependentFetcher : public IChunkFetcher {
+public:
+    std::shared_ptr<ChunkCache> dependency;
+
+    ChunkFetchResult fetch(const ChunkKey& key) override
+    {
+        const auto resolved = dependency->getChunkBlocking(
+            key.level, key.iz, key.iy, key.ix);
+        ChunkFetchResult result;
+        if (resolved.status != ChunkStatus::Data || !resolved.bytes) {
+            result.status = ChunkFetchStatus::IoError;
+            result.message = "dependency did not resolve to data";
+            return result;
+        }
+        result.status = ChunkFetchStatus::Found;
+        result.bytes = *resolved.bytes;
+        return result;
+    }
+};
+
 std::vector<std::byte> makeBytes(std::size_t n, std::byte v = std::byte{99})
 {
     return std::vector<std::byte>(n, v);
@@ -147,6 +167,105 @@ TEST_CASE("ChunkCache: first tryGetChunk queues; second returns the data")
     auto cached = c->tryGetChunk(0, 0, 0, 0);
     CHECK(cached.status == ChunkStatus::Data);
     CHECK(f->fetchCalls.load() == callsAfter);
+}
+
+TEST_CASE("ChunkCache: opaque chunks accept variable decoded byte lengths")
+{
+    auto f = std::make_shared<CountingFetcher>();
+    ChunkFetchResult first;
+    first.status = ChunkFetchStatus::Found;
+    first.bytes = makeBytes(3, std::byte{0});
+    f->setCanned({0, 0, 0, 0}, first);
+    ChunkFetchResult second;
+    second.status = ChunkFetchStatus::Found;
+    second.bytes = makeBytes(117, std::byte{9});
+    f->setCanned({0, 0, 0, 1}, second);
+
+    std::vector<ChunkCache::LevelInfo> levels = {{{1, 1, 2}, {1, 1, 1}, {}}};
+    ChunkCache::Options opts;
+    opts.detectAllFillChunks = true;
+    ChunkCache cache(
+        std::move(levels),
+        std::vector<std::shared_ptr<IChunkFetcher>>{f},
+        0.0,
+        ChunkDtype::Opaque,
+        opts);
+
+    auto a = cache.getChunkBlocking(0, 0, 0, 0);
+    REQUIRE(a.status == ChunkStatus::Data);
+    REQUIRE(a.bytes);
+    CHECK(a.bytes->size() == 3);
+    auto b = cache.getChunkBlocking(0, 0, 0, 1);
+    REQUIRE(b.status == ChunkStatus::Data);
+    REQUIRE(b.bytes);
+    CHECK(b.bytes->size() == 117);
+    CHECK(cache.stats().decodedBytes == 120);
+}
+
+TEST_CASE("ChunkCache: externally leased chunks remain resident until released")
+{
+    auto f = std::make_shared<CountingFetcher>();
+    for (int ix = 0; ix < 3; ++ix) {
+        ChunkFetchResult result;
+        result.status = ChunkFetchStatus::Found;
+        result.bytes = makeBytes(64, std::byte{static_cast<unsigned char>(ix + 1)});
+        f->setCanned({0, 0, 0, ix}, std::move(result));
+    }
+    std::vector<ChunkCache::LevelInfo> levels = {{{1, 1, 3}, {1, 1, 1}, {}}};
+    ChunkCache::Options opts;
+    opts.decodedByteCapacity = 64;
+    opts.detectAllFillChunks = false;
+    ChunkCache cache(
+        std::move(levels),
+        std::vector<std::shared_ptr<IChunkFetcher>>{f},
+        0.0,
+        ChunkDtype::Opaque,
+        opts);
+
+    auto leased = cache.getChunkBlocking(0, 0, 0, 0);
+    REQUIRE(leased.status == ChunkStatus::Data);
+    REQUIRE(leased.bytes);
+    auto newer = cache.getChunkBlocking(0, 0, 0, 1);
+    REQUIRE(newer.status == ChunkStatus::Data);
+    CHECK(cache.stats().decodedBytes == 128);
+    CHECK(cache.getChunkIfCached(0, 0, 0, 0).status == ChunkStatus::Data);
+
+    leased.bytes.reset();
+    newer.bytes.reset();
+    REQUIRE(cache.getChunkBlocking(0, 0, 0, 2).status == ChunkStatus::Data);
+    CHECK(cache.stats().decodedBytes == 64);
+    CHECK(cache.getChunkIfCached(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+}
+
+TEST_CASE("ChunkCache: independent scheduler lanes allow blocking generated dependencies")
+{
+    auto anchorFetcher = std::make_shared<CountingFetcher>();
+    ChunkFetchResult anchorResult;
+    anchorResult.status = ChunkFetchStatus::Found;
+    anchorResult.bytes = makeBytes(17, std::byte{42});
+    anchorFetcher->setCanned({0, 0, 0, 0}, anchorResult);
+    const std::vector<ChunkCache::LevelInfo> levels{{{1, 1, 1}, {1, 1, 1}, {}}};
+
+    ChunkCache::Options anchorOptions;
+    anchorOptions.maxConcurrentReads = 1;
+    anchorOptions.schedulerLane = "test-anchor-dependencies";
+    anchorOptions.detectAllFillChunks = false;
+    auto anchorCache = std::make_shared<ChunkCache>(
+        levels, std::vector<std::shared_ptr<IChunkFetcher>>{anchorFetcher},
+        0.0, ChunkDtype::Opaque, anchorOptions);
+
+    auto fiberletFetcher = std::make_shared<DependentFetcher>();
+    fiberletFetcher->dependency = anchorCache;
+    ChunkCache::Options fiberletOptions = anchorOptions;
+    fiberletOptions.schedulerLane = "test-fiberlet-generation";
+    ChunkCache fiberletCache(
+        levels, std::vector<std::shared_ptr<IChunkFetcher>>{fiberletFetcher},
+        0.0, ChunkDtype::Opaque, fiberletOptions);
+
+    const auto result = fiberletCache.getChunkBlocking(0, 0, 0, 0);
+    REQUIRE(result.status == ChunkStatus::Data);
+    REQUIRE(result.bytes);
+    CHECK(result.bytes->size() == 17);
 }
 
 TEST_CASE("ChunkCache: cache-only reads neither queue nor promote decoded chunks")

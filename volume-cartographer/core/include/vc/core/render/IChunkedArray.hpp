@@ -22,7 +22,9 @@ enum class ChunkStatus {
 
 enum class ChunkDtype {
     UInt8,
-    UInt16
+    UInt16,
+    // Variable-length application records, never dense tensor samples.
+    Opaque
 };
 
 struct ChunkResult {

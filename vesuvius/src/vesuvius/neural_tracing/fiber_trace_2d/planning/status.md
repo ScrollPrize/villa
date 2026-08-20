@@ -1,39 +1,21 @@
-# Status: fiberlet storage quantization experiment
+# Status: reliable and parallel on-demand fiber replay
 
-- [x] Record the quantization experiment task
-- [x] Draft the implementation and validation plan
-- [x] Independently review the plan against task, specs, and storage proposal
-- [x] Quantize anchors before each distinct geometry DP solve
-- [x] Reuse geometry DP results across cost variants
-- [x] Update the quantization benchmark report
-- [x] Update focused regression tests
-- [x] Update specifications and documentation
-- [x] Build affected targets with 32 jobs
-- [x] Run focused tests
-- [x] Run and report the canonical Paris4 experiment
-- [x] Update task log and changelog
-- [x] Replace identity-based replay quality with failure and line-distance metrics
-- [x] Rebuild, test, and rerun the canonical benchmark
-- [x] Record the revised quality result
-- [x] Add focused quantization-scenario selection
-- [x] Add baseline/scenario reference-distance distributions
-- [x] Add quality-comparison progress output
-- [x] Review the wide-corridor plan independently
-- [x] Build and run focused tests
-- [ ] Run the full-fiber 768-radius baseline versus P4+D+C8 benchmark
-- [ ] Record and report the wide-corridor result
-- [x] Diagnose wide-corridor single-thread and memory bottlenecks
-- [x] Parallelize deterministic anchor partition preparation
-- [x] Make diagnostics-free cell-result retention sparse
-- [x] Rebuild and run anchor/fiberlet regression tests
-- [ ] Compare bounded radius-768 runtime, CPU use, and peak RSS
-- [x] Extend the single format with float32 and compact encoding profiles
-- [x] Define separate and inline anchor layouts
-- [x] Define the custom-object Zarr metadata and chunk envelope
-- [x] Define bounded adaptive cache publication and strict resume semantics
-- [x] Independently review and harden the float32-cache/Zarr format plan
-- [x] Remove redundant float32-cache fields and specify area-local loading
-- [x] Specify the shared minimal graph adapter and inline completion constraint
-- [ ] Implement the float32 cache profile and Zarr store
-- [ ] Validate cached and uncached graph/replay equivalence
-- [ ] Run the full-fiber radius-768 evaluation from the bounded cache
+- [x] Record the current task
+- [x] Draft implementation, regression, spec, docs, and changelog plan
+- [x] Independently review the expanded plan against task and specifications
+- [x] Reproduce the observed final greedy progress sequence
+- [x] Preserve exact nested chunk dependency errors
+- [x] Identify the on-demand stall as a ready-cell completion lost wakeup
+- [x] Fix completion publication under the scheduler mutex
+- [x] Build `vc_fiberlets` and pass all 85 anchor tests
+- [x] Add focused multi-tile scheduler regression coverage
+- [x] Add replay-specific global/local progress and evaluator completion
+- [x] Add scheduled anchor/fiberlet preprocessing progress
+- [x] Parallelize deterministic per-chunk fiberlet candidate generation
+- [x] Parallelize prepared-geometry teardown on search workers
+- [x] Add on-demand fiberlet phase and measured CPU diagnostics
+- [x] Add focused regression tests
+- [x] Update specifications, docs, changelog, and task log
+- [x] Build affected targets with 32 jobs and run focused tests
+- [x] Validate an uncached Paris4 chunk and exact stored bytes
+- [ ] Validate the full cached Paris4 replay

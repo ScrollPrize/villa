@@ -1452,10 +1452,12 @@ TEST_CASE("greedy replay resets after dense-line failures and reaches reference 
     request.config.cumulativeSmoothnessTangentWeight = 0.0;
 
     std::vector<vc::fiber_tracer::FiberReplayFailure> events;
+    std::vector<vc::fiber_tracer::FiberTraceProgress> progress;
     ConstantNormalSampler normals;
     const auto result =
         vc::fiber_tracer::traceFiberReplay(
-            predictions, request, normals, 1.0, {},
+            predictions, request, normals, 1.0,
+            [&](const auto& update) { progress.push_back(update); },
             [&](const auto& event) { events.push_back(event); });
 
     CHECK(result.completedReferenceArcBase == doctest::Approx(40.0));
@@ -1463,6 +1465,20 @@ TEST_CASE("greedy replay resets after dense-line failures and reaches reference 
     CHECK(events.size() == result.failures.size());
     CHECK(result.segments.size() >= result.failures.size());
     CHECK(result.segments.size() <= result.failures.size() + 1);
+    REQUIRE_FALSE(progress.empty());
+    double previousProgressArc = 0.0;
+    size_t previousProgressSegment = 0;
+    for (const auto& update : progress) {
+        REQUIRE(update.replaySegmentIndex.has_value());
+        REQUIRE(update.referenceArcBase.has_value());
+        REQUIRE(update.referenceArcFraction.has_value());
+        CHECK(*update.referenceArcBase >= previousProgressArc);
+        CHECK(*update.referenceArcFraction >= 0.0);
+        CHECK(*update.referenceArcFraction <= 1.0);
+        CHECK(*update.replaySegmentIndex >= previousProgressSegment);
+        previousProgressArc = *update.referenceArcBase;
+        previousProgressSegment = *update.replaySegmentIndex;
+    }
     for (size_t failureIndex = 0; failureIndex < result.failures.size(); ++failureIndex) {
         const auto& failure = result.failures[failureIndex];
         CHECK(failure.index == failureIndex);

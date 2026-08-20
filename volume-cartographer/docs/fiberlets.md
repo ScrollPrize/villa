@@ -472,12 +472,14 @@ compatibility path. Obsolete `mtllib` or `usemtl` records are rejected.
 
 ## Dense-fiber failure replay
 
-`fiberlet-replay` builds anchors and one canonical fiberlet graph in a tube
-around the selected reference interval, starting at the first control point.
-It then runs two independent evaluators over exactly that interval: the regular
-native 3D greedy tracer and the fiberlet graph tracer. The interval reaches the
-reference end by default; `--length N` limits it to `N` base voxels and clamps
-an oversized request at the reference end.
+`fiberlet-replay` exposes one canonical fiberlet graph in a tube around the
+selected reference interval, starting at the first control point. By default,
+anchor and fiberlet chunks are generated as the graph is traversed and reused
+from local sparse cache roots; the complete corridor graph is not retained in
+memory. It then runs two independent evaluators over exactly that interval: the
+regular native 3D greedy tracer and the fiberlet graph tracer. The interval
+reaches the reference end by default; `--length N` limits it to `N` base voxels
+and clamps an oversized request at the reference end.
 
 ```bash
 volume-cartographer/build/bin/vc_fiberlets fiberlet-replay \
@@ -489,6 +491,53 @@ volume-cartographer/build/bin/vc_fiberlets fiberlet-replay \
   --lookahead 3 \
   --length 4096
 ```
+
+The default cache roots are `<output>/cache/anchors.zarr` and
+`<output>/cache/fiberlets.zarr`. Override them independently with
+`--anchor-cache PATH` and `--fiberlet-cache PATH`. `--cache-gib` is one shared
+decoded-byte budget across both caches; active adjacency or route leases remain
+pinned until the current graph query releases them. `--storage-chunk-side N`
+selects the spatial chunk side in base voxels and must be an exact multiple of
+the anchor cell side. The roots are local-only in this implementation.
+
+The fiberlet root separates `prefix/` connectivity/cost blocks from `routes/`
+interior geometry. Beam/frontier state contains stable anchor and endpoint-pair
+IDs, not pointers or copied corridor-wide graph records. An incident query
+loads the complete declared endpoint-reach neighborhood, sorts its stable IDs,
+and can transparently reload evicted chunks. Route blocks are loaded only when
+an edge is expanded or emitted. `--eager-graph` runs the prior whole-tube graph
+construction for diagnostics.
+
+Replay progress uses the selected reference interval as its only global axis.
+`fiber_replay_progress` rows report `reference_arc_base` and a monotone
+`reference_arc_fraction`; greedy native `local_step` and `local_budget` are
+explicitly restart-segment-local diagnostics. Each evaluator emits its own
+`fiber_replay_evaluator` terminal row, so completion or failure of one cannot
+be hidden while the command waits for the other.
+
+Generated chunk progress is printed as `fiber_replay_cache_chunk` rows with
+stage, status, key, a stable `schedule_index`, the nearest reference arc,
+monotone generated-chunk count, total scheduled chunks, input/output counts,
+and elapsed/CPU time. Fiberlet rows also expose the current internal phase and
+its completed/total work. Completed fiberlet chunks report candidate-generation
+workers, wall time, CPU time, and effective cores. Schedule indices may finish
+out of order because graph queries request independent spatial chunks; the
+generated count remains monotone. Cache hits do not increment the generated
+count. The final `fiber_replay_cache` row reports resident anchor/fiberlet
+decoded bytes and the configured shared budget.
+
+On-demand anchor fitting publishes completion while holding the same mutex
+used by its ready-cell condition predicate. Cache waits are ordinary blocking
+dependency waits: there is no polling, heartbeat, or timeout recovery. A
+failed dependency reports its exact dataset stage, chunk key, status, and
+underlying cache error.
+
+Within one fiberlet chunk, canonical source anchors are enumerated in parallel
+and their results are concatenated in source order. Preparation, sampling, and
+DP keep their existing parallel paths. Finished prepared geometry is released
+by the worker that solved it, avoiding a serial multi-gigabyte teardown after
+the search phase. These scheduling changes do not alter candidate order,
+floating-point evaluation order within a candidate, or serialized payloads.
 
 Both evaluators use the same monotone exact reference matcher. `--fail 20`
 means a 20-base-voxel radius along the local Lasagna surface normal and an
@@ -528,12 +577,13 @@ Console arrival order is
 diagnostic only. Publication sorts visualization identity by reference arc,
 tracer, and tracer-local index.
 
-The graph retains every successful fiberlet over the selected reference tube;
-failure-local graphs are not used for evaluation. Fiberlet curve volume samples
-use the complete globally deduplicated coordinate union and `--batch` only
-limits coordinates per sampler call, as described above. The final summary
-reports both evaluator failure counts and confirms reference fraction one for
-both.
+The logical graph contains every successful fiberlet over the selected
+reference tube; failure-local graphs are not used for evaluation. In the
+default path, its chunks are generated and loaded on demand and unleased chunks
+remain evictable. The eager diagnostic path still uses the complete globally
+deduplicated coordinate union and `--batch` only limits coordinates per sampler
+call, as described above. The final summary reports both evaluator failure
+counts and confirms reference fraction one for both.
 
 The root manifest contains one `threshold` descriptor with the normal radius,
 fixed factor and tangential radius, strict comparison, and invalid-normal

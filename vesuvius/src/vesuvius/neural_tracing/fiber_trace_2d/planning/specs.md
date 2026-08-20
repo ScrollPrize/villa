@@ -3014,22 +3014,67 @@
   oversized request at the reference end. One shared effective begin/end pair
   bounds anchor/path extraction, both evaluators, failure fractions, artifacts,
   and visualizations. Anchor extraction is local to cells intersecting the
-  exact radius tube around that selected interval. One
-  canonical fiberlet graph is built before evaluation; it is never partitioned
-  into reference windows, so spatially close but arclength-distant candidates
-  remain eligible.
-- Replay uses the same global staged path extraction contract:
+  exact radius tube around that selected interval. The normal replay path
+  exposes one logical graph through sparse anchor and fiberlet chunks; it must
+  not materialize the whole corridor graph before evaluation. `--eager-graph`
+  retains the complete graph path only as a diagnostic equivalence
+  implementation. Spatially close but arclength-distant candidates remain
+  eligible in either path.
+- Eager replay uses the same global staged path extraction contract:
   prepare every curve once in parallel, merge one global unique corner union,
   batch only consecutive coordinate ranges, materialize all scores, then solve
   all curves in parallel. Required corners remain present outside the tube
   predicate. Batch and worker counts cannot change serialized path/graph
   results or the unique request population.
+- Lazy replay stores anchors and fiberlets in separate local Zarr-v2-layout
+  roots. Their arrays contain explicitly identified custom version-1 object
+  payloads rather than tensor samples. Prefix and route arrays are separate so
+  adjacency and beam ranking do not retain unused route geometry. A fiberlet
+  owner chunk blocks only on the complete bounded halo of anchor chunks needed
+  by its endpoint search.
+- Generated anchor and fiberlet payloads use separate `ChunkCache` scheduler
+  lanes and one shared decoded-byte budget. Stable coordinate-plus-variant
+  anchor IDs and canonical endpoint-pair edge IDs are the only graph state held
+  by beam/frontier records. Incident queries lease every possible owner chunk,
+  derive complete sorted connectivity from prefix payloads, and release those
+  leases after the query; route payloads are loaded only for expanded/selected
+  edges. Cache eviction and reload therefore cannot invalidate graph identity
+  or alter tie order. Active payload leases may temporarily exceed the nominal
+  cache budget, but unleased connectivity and geometry remain LRU-bound.
+- Sparse payloads are strict and unpublished: no version repair or compatibility
+  reader exists. Each payload binds kind, profile, chunk coordinate, dataset
+  fingerprint, scalar widths, source scale, field directory, and checksum.
+  Fields are deterministic little-endian structure-of-arrays blocks compressed
+  independently with Zstd when smaller. Local publication uses a same-directory
+  temporary file, file `fsync`, atomic rename, and parent-directory `fsync`.
+  Prefix and route members are immutable and become readable only after an
+  atomically published completion marker binds both payload hashes. Empty
+  completed chunks are explicit valid payloads.
 - Greedy replay uses the regular native one-way candidate generation,
   prediction loss, Lasagna-normal curvature, and validity rules, forcing beam
   width/lookahead to one. Graph replay uses deterministic receding-horizon beam
   search over the complete immutable graph with the shared edge/join objective.
-  After preprocessing, the two selected-interval evaluators run concurrently;
+  The greedy evaluator and on-demand graph evaluator run concurrently;
   neither evaluator changes the other one's state.
+- Replay progress is measured globally by reference arclength. Greedy native
+  step/budget counters are restart-local and must be labelled as such; they
+  are never presented as whole-fiber completion. Fiberlet graph progress uses
+  the same reference arc/fraction, and each evaluator publishes an independent
+  terminal status.
+- On-demand chunk diagnostics bind every generated anchor/fiberlet chunk to a
+  stable full-interval schedule index and nearest reference arc. Generated
+  counts are monotone, while spatial chunks may complete out of schedule order.
+  Fiberlet generation exposes candidate generation, preparation, sampling,
+  materialization, and search phases with their own completed/total counts.
+- Anchor ready-cell completion and its condition predicate are synchronized by
+  the same mutex. Cache dependency waits do not poll, emit heartbeats, or use
+  timeout recovery. A failed generated dependency preserves the exact dataset
+  stage, chunk key, cache status, and underlying error.
+- Fiberlet candidates may be generated concurrently by canonical source
+  anchor. Per-source output is merged in source order, and completed prepared
+  geometry may be released by its owning search worker. Neither operation may
+  change candidate order, per-candidate arithmetic, graph identity, or encoded
+  payload bytes.
 - Dense-reference matching is monotone and local. Greedy supplies its nominal
   step and graph replay each actual dense fiberlet edge length. Failure is the
   first Lasagna-oriented threshold error strictly above `--fail T`; equality is

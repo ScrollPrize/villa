@@ -41,9 +41,12 @@ public:
         // unbounded empty chunk grids during exploration.
         std::size_t metadataEntryCapacity = 1ULL << 20;
         // Number of process-wide chunk I/O workers used by this cache. The
-        // pool is shared by caches with the same worker count and is not
-        // destroyed when a viewer is closed.
+        // pool is shared by caches with the same worker count and scheduler
+        // lane and is not destroyed when a viewer is closed.
         std::size_t maxConcurrentReads = 16;
+        // Generated caches can use independent lanes so a fetcher waiting on a
+        // dependency cache cannot exhaust the dependency's worker pool.
+        std::string schedulerLane = "default";
         bool detectAllFillChunks = true;
         std::optional<std::filesystem::path> persistentCachePath;
         // When set to a root registered with PersistentZarrCacheBudget, disk
@@ -64,6 +67,7 @@ public:
     };
 
     struct Stats {
+        std::size_t localDecodedBytes = 0;
         std::size_t decodedBytes = 0;
         std::size_t decodedByteCapacity = 0;
         std::size_t persistentCacheBytes = 0;

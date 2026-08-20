@@ -69,7 +69,8 @@ std::size_t normalizedWorkerCount(std::size_t requested)
     return std::max<std::size_t>(1, requested);
 }
 
-utils::PriorityThreadPool& chunkWorkerPool(std::size_t workerCount)
+utils::PriorityThreadPool& chunkWorkerPool(
+    std::size_t workerCount, const std::string& schedulerLane)
 {
     // Keep chunk I/O executors process-wide instead of viewer/cache-owned.
     // Destroying a viewer invalidates its cache state, but does not join
@@ -82,19 +83,20 @@ utils::PriorityThreadPool& chunkWorkerPool(std::size_t workerCount)
     // them while vc_core.dll is detaching.
     static auto* mutex = new std::mutex;
     static auto* pools = new std::unordered_map<
-        std::size_t, std::unique_ptr<utils::PriorityThreadPool>>;
+        std::string, std::unique_ptr<utils::PriorityThreadPool>>;
 #else
     static std::mutex mutex;
-    static std::unordered_map<std::size_t, std::unique_ptr<utils::PriorityThreadPool>> pools;
+    static std::unordered_map<std::string, std::unique_ptr<utils::PriorityThreadPool>> pools;
 #endif
 
     workerCount = normalizedWorkerCount(workerCount);
+    const std::string poolKey = schedulerLane + "\n" + std::to_string(workerCount);
 #if defined(_WIN32)
     std::lock_guard lock(*mutex);
-    auto& pool = (*pools)[workerCount];
+    auto& pool = (*pools)[poolKey];
 #else
     std::lock_guard lock(mutex);
-    auto& pool = pools[workerCount];
+    auto& pool = pools[poolKey];
 #endif
     if (!pool)
         pool = std::make_unique<utils::PriorityThreadPool>(workerCount);
@@ -478,6 +480,8 @@ ChunkCache::Stats ChunkCache::stats() const
             recentBytes += bytes;
         }
 
+        result.localDecodedBytes = state->decodedBytes_;
+
         if (state->options_.decodedByteBudget) {
             const auto budget = state->options_.decodedByteBudget->stats();
             result.decodedBytes = budget.decodedBytes;
@@ -528,7 +532,7 @@ void ChunkCache::invalidate()
         state->remoteFetchesInFlight_ = 0;
         state->remoteDownloadHistory_.clear();
     }
-    chunkWorkerPool(state->options_.maxConcurrentReads)
+    chunkWorkerPool(state->options_.maxConcurrentReads, state->options_.schedulerLane)
         .cancel_group_before(state->schedulerGroup_, schedulerEpoch);
     if (state->options_.persistentCachePath) {
         persistentCacheProbePool().cancel_group_before(
@@ -564,7 +568,7 @@ void ChunkCache::beginViewRequest(bool discardPending)
         // entries_ cancellation alone is insufficient: the shared executors
         // would otherwise retain one stale lambda per chunk until their queues
         // drained. Compact only this cache's task group immediately.
-        chunkWorkerPool(state->options_.maxConcurrentReads)
+        chunkWorkerPool(state->options_.maxConcurrentReads, state->options_.schedulerLane)
             .cancel_group_before(state->schedulerGroup_, schedulerEpoch);
         if (state->options_.persistentCachePath) {
             persistentCacheProbePool().cancel_group_before(
@@ -660,7 +664,7 @@ void ChunkCache::queueFetchLocked(const std::shared_ptr<State>& state,
                 }
             });
     } else {
-        chunkWorkerPool(state->options_.maxConcurrentReads)
+        chunkWorkerPool(state->options_.maxConcurrentReads, state->options_.schedulerLane)
             .submit(priority, state->schedulerGroup_, schedulerEpoch,
                     [weakState, key, generation, fetchSerial] {
                         if (auto state = weakState.lock()) {
@@ -677,6 +681,7 @@ void ChunkCache::probePersistentAndStore(const std::shared_ptr<State>& state,
                                          std::int64_t priority,
                                          std::uint64_t schedulerEpoch)
 {
+    std::shared_ptr<const std::vector<std::byte>> freshLease;
     {
         std::lock_guard lock(state->mutex_);
         if (generation != state->generation_) {
@@ -696,7 +701,8 @@ void ChunkCache::probePersistentAndStore(const std::shared_ptr<State>& state,
             fetch = state->fetchers_.at(static_cast<std::size_t>(key.level))
                         ->decodePersistentBytes(key, std::move(*cached));
             resolved = fetch.status == ChunkFetchStatus::Found &&
-                       fetch.bytes.size() == expectedChunkBytes(*state, key);
+                       (state->dtype_ == ChunkDtype::Opaque ||
+                        fetch.bytes.size() == expectedChunkBytes(*state, key));
         } else if (readPersistentEmpty(*state, key)) {
             fetch.status = ChunkFetchStatus::Missing;
             resolved = true;
@@ -710,7 +716,7 @@ void ChunkCache::probePersistentAndStore(const std::shared_ptr<State>& state,
         // fetchAndStore re-checks the disk cache, which is cheap on a miss
         // and picks up writebacks that landed while this job was queued.
         std::weak_ptr<State> weakState = state;
-        chunkWorkerPool(state->options_.maxConcurrentReads)
+        chunkWorkerPool(state->options_.maxConcurrentReads, state->options_.schedulerLane)
             .submit(priority, state->schedulerGroup_, schedulerEpoch,
                     [weakState, key, generation, fetchSerial] {
                         if (auto s = weakState.lock()) {
@@ -731,6 +737,11 @@ void ChunkCache::probePersistentAndStore(const std::shared_ptr<State>& state,
             return;
         }
         storeFetchResultLocked(state, key, std::move(fetch), true);
+        const auto stored = state->entries_.find(key);
+        if (stored != state->entries_.end() &&
+            stored->second.status == EntryStatus::Data) {
+            freshLease = stored->second.bytes;
+        }
     }
     enforceSharedBudget(state);
     state->cv_.notify_all();
@@ -771,7 +782,8 @@ void ChunkCache::fetchAndStore(const std::shared_ptr<State>& state,
             fetch = state->fetchers_.at(static_cast<std::size_t>(key.level))
                         ->decodePersistentBytes(key, std::move(*cached));
             if (fetch.status == ChunkFetchStatus::Found &&
-                fetch.bytes.size() == expectedChunkBytes(*state, key)) {
+                (state->dtype_ == ChunkDtype::Opaque ||
+                 fetch.bytes.size() == expectedChunkBytes(*state, key))) {
                 loadedFromPersistentCache = true;
             } else {
                 fetch = fetchRemote();
@@ -803,6 +815,7 @@ void ChunkCache::fetchAndStore(const std::shared_ptr<State>& state,
             key.ix);
     }
 
+    std::shared_ptr<const std::vector<std::byte>> freshLease;
     {
         std::lock_guard lock(state->mutex_);
         if (trackedRemoteFetch && state->remoteFetchesInFlight_ > 0)
@@ -824,6 +837,11 @@ void ChunkCache::fetchAndStore(const std::shared_ptr<State>& state,
             return;
         }
         storeFetchResultLocked(state, key, std::move(fetch), loadedFromPersistentCache);
+        const auto stored = state->entries_.find(key);
+        if (stored != state->entries_.end() &&
+            stored->second.status == EntryStatus::Data) {
+            freshLease = stored->second.bytes;
+        }
     }
     enforceSharedBudget(state);
     state->cv_.notify_all();
@@ -857,12 +875,14 @@ void ChunkCache::storeFetchResultLocked(const std::shared_ptr<State>& state,
 
     switch (fetch.status) {
     case ChunkFetchStatus::Found: {
-        if (fetch.bytes.size() != expectedChunkBytes(*state, key)) {
+        if (state->dtype_ != ChunkDtype::Opaque &&
+            fetch.bytes.size() != expectedChunkBytes(*state, key)) {
             entry.status = EntryStatus::Error;
             entry.error = "decoded chunk byte size does not match full chunk shape";
             break;
         }
-        if (state->options_.detectAllFillChunks && isAllFill(*state, fetch.bytes)) {
+        if (state->dtype_ != ChunkDtype::Opaque &&
+            state->options_.detectAllFillChunks && isAllFill(*state, fetch.bytes)) {
             entry.status = EntryStatus::AllFill;
             // `persisted` is set by the writer's completion callback once
             // the bytes are actually on disk (same for the cases below).
@@ -941,7 +961,7 @@ std::optional<std::vector<std::byte>> ChunkCache::readPersistent(const State& st
         pin.complete(bytes.has_value());
         return bytes;
     };
-    if (rawEntry) {
+    if (rawEntry && state.dtype_ != ChunkDtype::Opaque) {
         // Compressed variant wins when both formats exist: compaction and
         // compressed writes leave ".zst" as the authoritative copy.
         if (auto compressed = readManaged(persistentCompressedPath(state, key))) {
@@ -961,7 +981,8 @@ std::optional<std::vector<std::byte>> ChunkCache::readPersistent(const State& st
     auto bytes = readManaged(persistentPath(state, key));
     if (!bytes)
         return std::nullopt;
-    if (rawEntry && bytes->size() != expectedChunkBytes(state, key))
+    if (rawEntry && state.dtype_ != ChunkDtype::Opaque &&
+        bytes->size() != expectedChunkBytes(state, key))
         return std::nullopt;
     return bytes;
 }
@@ -986,7 +1007,8 @@ bool ChunkCache::queuePersistentWrite(const std::shared_ptr<State>& state,
 {
     if (!state || !state->options_.persistentCachePath || !bytes)
         return false;
-    if (persistentEntryIsRaw(*state, key) &&
+    if (state->dtype_ != ChunkDtype::Opaque &&
+        persistentEntryIsRaw(*state, key) &&
         bytes->size() != expectedChunkBytes(*state, key))
         return false;
 
@@ -1071,10 +1093,12 @@ bool ChunkCache::writePersistent(State& state, const ChunkKey& key, const std::v
     if (!state.options_.persistentCachePath)
         return false;
     const bool rawEntry = persistentEntryIsRaw(state, key);
-    if (rawEntry && bytes.size() != expectedChunkBytes(state, key))
+    if (rawEntry && state.dtype_ != ChunkDtype::Opaque &&
+        bytes.size() != expectedChunkBytes(state, key))
         return false;
 
-    bool compress = rawEntry && state.options_.compressPersistentCache;
+    bool compress = rawEntry && state.dtype_ != ChunkDtype::Opaque &&
+                    state.options_.compressPersistentCache;
     const std::vector<std::byte>* payload = &bytes;
     std::vector<std::byte> compressed;
     if (compress) {
@@ -1366,8 +1390,23 @@ void ChunkCache::enforceCapacityLocked(const std::shared_ptr<State>& state)
     if (!overBudget())
         return;
 
-    while (overBudget() && !state->lru_.empty()) {
-        auto victimIt = std::prev(state->lru_.end());
+    while (overBudget()) {
+        auto victimIt = state->lru_.end();
+        for (auto it = state->lru_.end(); it != state->lru_.begin();) {
+            --it;
+            if (it == state->lru_.begin())
+                break;
+            const auto entryIt = state->entries_.find(*it);
+            if (entryIt == state->entries_.end() ||
+                entryIt->second.status != EntryStatus::Data ||
+                !entryIt->second.bytes ||
+                entryIt->second.bytes.use_count() <= 1) {
+                victimIt = it;
+                break;
+            }
+        }
+        if (victimIt == state->lru_.end())
+            break;
         auto entryIt = state->entries_.find(*victimIt);
         if (entryIt == state->entries_.end()) {
             state->lru_.erase(victimIt);
@@ -1395,6 +1434,8 @@ std::optional<std::uint64_t> ChunkCache::oldestDecodedTouch(
         auto entry = state->entries_.find(*it);
         if (entry != state->entries_.end() &&
             entry->second.status == EntryStatus::Data) {
+            if (entry->second.bytes && entry->second.bytes.use_count() > 1)
+                continue;
             return entry->second.budgetTouch;
         }
     }
@@ -1418,6 +1459,8 @@ std::size_t ChunkCache::evictOldestDecodedLocked(const std::shared_ptr<State>& s
         }
         Entry& entry = entryIt->second;
         if (entry.status != EntryStatus::Data)
+            continue;
+        if (entry.bytes && entry.bytes.use_count() > 1)
             continue;
 
         const ChunkKey victim = *it;
@@ -1472,6 +1515,8 @@ bool ChunkCache::isValidKey(const State& state, const ChunkKey& key)
 
 bool ChunkCache::isAllFill(const State& state, const std::vector<std::byte>& bytes)
 {
+    if (state.dtype_ == ChunkDtype::Opaque)
+        return false;
     if (state.dtype_ == ChunkDtype::UInt8) {
         const auto fill = static_cast<unsigned char>(std::clamp(
             state.fillValue_, 0.0, static_cast<double>(std::numeric_limits<unsigned char>::max())));
@@ -1498,12 +1543,16 @@ std::size_t ChunkCache::dtypeSize(ChunkDtype dtype)
         return 1;
     case ChunkDtype::UInt16:
         return 2;
+    case ChunkDtype::Opaque:
+        throw std::logic_error("opaque chunks do not have a fixed element size");
     }
     return 1;
 }
 
 std::size_t ChunkCache::expectedChunkBytes(const State& state, const ChunkKey& key)
 {
+    if (state.dtype_ == ChunkDtype::Opaque)
+        throw std::logic_error("opaque chunks do not have a fixed decoded byte size");
     const auto& chunk = state.levels_[static_cast<std::size_t>(key.level)].chunkShape;
     return static_cast<std::size_t>(chunk[0]) *
            static_cast<std::size_t>(chunk[1]) *

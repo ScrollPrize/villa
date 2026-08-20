@@ -3,6 +3,8 @@
 #include "vc/fiber_tracer/FiberPaths.hpp"
 #include "vc/fiber_tracer/FiberReplay.hpp"
 #include "vc/fiber_tracer/FiberletQuantization.hpp"
+#include "vc/fiber_tracer/FiberletChunkGraph.hpp"
+#include "vc/fiber_tracer/FiberletOnDemand.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
@@ -23,6 +25,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -96,6 +99,9 @@ struct CliOptions {
     vc::fiber_tracer::FiberletGraphReplayConfig graphReplay;
     int storageChunkSideBaseVoxels = 512;
     std::optional<std::string> quantizationScenario;
+    std::filesystem::path anchorCacheRoot;
+    std::filesystem::path fiberletCacheRoot;
+    bool eagerGraphReplay = false;
     vc::fiber_tracer::cli::SeenOptions seenTraceOptions;
 };
 
@@ -181,7 +187,10 @@ void usage(const char* executable)
               << "  --inference-scaledown-power N prediction scaledown relative to trace voxels [2]\n";
     std::cerr << "  --beam N                      graph replay beam width [16]\n"
               << "  --lookahead N                 graph replay lookahead edges [3]\n"
-              << "  --storage-chunk-side N        quantization chunk side in base voxels [512]\n"
+              << "  --anchor-cache PATH           generated anchor cache [output/cache/anchors.zarr]\n"
+              << "  --fiberlet-cache PATH         generated fiberlet cache [output/cache/fiberlets.zarr]\n"
+              << "  --eager-graph                 diagnostic corridor-wide graph extraction\n"
+              << "  --storage-chunk-side N        storage chunk side in base voxels [512]\n"
               << "  --scenario NAME               quantization scenario; also runs baseline\n";
 }
 
@@ -333,6 +342,12 @@ CliOptions parseArgs(int argc, char** argv)
         } else if (argument == "--inference-scaledown-power" && isReplayCommand(options.command)) {
             options.inferenceScaledownPower =
                 parseInt(valueAfter(index, argc, argv, "inference-scaledown-power"), "inference-scaledown-power");
+        } else if (argument == "--anchor-cache" && isReplayCommand(options.command)) {
+            options.anchorCacheRoot = valueAfter(index, argc, argv, "anchor-cache");
+        } else if (argument == "--fiberlet-cache" && isReplayCommand(options.command)) {
+            options.fiberletCacheRoot = valueAfter(index, argc, argv, "fiberlet-cache");
+        } else if (argument == "--eager-graph" && isReplayCommand(options.command)) {
+            options.eagerGraphReplay = true;
         } else if (argument == "--cell-size" && options.command != Command::Paths) {
             options.anchors.cellSizePredictionVoxels = parseInt(valueAfter(index, argc, argv, "cell-size"), "cell-size");
         } else if (argument == "--falloff" && options.command != Command::Paths) {
@@ -419,7 +434,9 @@ CliOptions parseArgs(int argc, char** argv)
             if (value < 1)
                 fail("--lookahead must be positive");
             options.graphReplay.lookaheadEdges = static_cast<size_t>(value);
-        } else if (argument == "--storage-chunk-side" && isQuantizationCommand(options.command)) {
+        } else if (argument == "--storage-chunk-side" &&
+                   (isQuantizationCommand(options.command) ||
+                    isReplayCommand(options.command))) {
             options.storageChunkSideBaseVoxels =
                 parseInt(valueAfter(index, argc, argv, "storage-chunk-side"), "storage-chunk-side");
         } else if (argument == "--scenario" && isQuantizationCommand(options.command)) {
@@ -454,6 +471,7 @@ CliOptions parseArgs(int argc, char** argv)
     if (isReplayCommand(options.command)) {
         if (!(options.failureThresholdBaseVoxels >= 0.0) || !(options.alongBaseVoxels > 0.0) || !(options.radiusBaseVoxels > 0.0) ||
             !(options.matchRefineSteps >= 0.0) ||
+            options.storageChunkSideBaseVoxels <= 0 ||
             (options.replayLengthBaseVoxels.has_value() &&
              (!(*options.replayLengthBaseVoxels > 0.0) ||
               !std::isfinite(*options.replayLengthBaseVoxels))) ||
@@ -538,6 +556,111 @@ std::string stringHash(const std::string& value)
     std::ostringstream output;
     output << "fnv1a64:" << std::hex << std::setfill('0') << std::setw(16) << hash;
     return output.str();
+}
+
+std::string datasetLocator(const vc::lasagna::LasagnaDataset& dataset);
+
+std::array<std::uint8_t, 32> storageFingerprint(const std::string& value)
+{
+    std::array<std::uint8_t, 32> result{};
+    for (std::size_t lane = 0; lane < 4; ++lane) {
+        std::uint64_t hash = 14695981039346656037ULL ^
+            (0x9e3779b97f4a7c15ULL * static_cast<std::uint64_t>(lane + 1));
+        for (const unsigned char byte : value) {
+            hash ^= byte;
+            hash *= 1099511628211ULL;
+        }
+        for (std::size_t byte = 0; byte < 8; ++byte)
+            result[lane * 8 + byte] = static_cast<std::uint8_t>(hash >> (byte * 8));
+    }
+    return result;
+}
+
+vc::fiber_tracer::FiberletDatasetMetadata replayDatasetMetadata(
+    vc::fiber_tracer::FiberletDatasetKind kind,
+    const vc::fiber_tracer::FiberPredictionGridInfo& grid,
+    const CliOptions& options,
+    const vc::lasagna::LasagnaDataset& fiberDataset,
+    const vc::lasagna::LasagnaDataset& normalDataset)
+{
+    const double cellSideBase =
+        static_cast<double>(options.anchors.cellSizePredictionVoxels) *
+        grid.predictionToBaseScale;
+    const auto roundedCellSideBase = std::llround(cellSideBase);
+    if (!(roundedCellSideBase > 0) ||
+        std::abs(cellSideBase - static_cast<double>(roundedCellSideBase)) > 1.0e-9 ||
+        options.storageChunkSideBaseVoxels % roundedCellSideBase != 0) {
+        fail("storage chunk side must be an exact multiple of the anchor cell side in base voxels");
+    }
+    const std::int64_t unitsPerChunk =
+        options.storageChunkSideBaseVoxels / roundedCellSideBase;
+    std::array<std::int64_t, 3> cellShape{};
+    std::array<std::int32_t, 3> chunkShape{};
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        cellShape[axis] = static_cast<std::int64_t>(
+            (grid.shapeZYX[axis] +
+                static_cast<std::size_t>(options.anchors.cellSizePredictionVoxels) - 1) /
+            static_cast<std::size_t>(options.anchors.cellSizePredictionVoxels));
+        const auto chunks = (cellShape[axis] + unitsPerChunk - 1) / unitsPerChunk;
+        if (chunks > std::numeric_limits<std::int32_t>::max())
+            fail("fiberlet storage chunk grid exceeds int32");
+        chunkShape[axis] = static_cast<std::int32_t>(chunks);
+    }
+    std::int64_t maximumReach = 0;
+    for (const auto& offset : vc::fiber_tracer::fiberletCellNeighborhoodOffsets(
+             options.paths.cellRadius,
+             options.paths.neighborhoodMarginCells)) {
+        for (const auto coordinate : offset)
+            maximumReach = std::max(maximumReach,
+                static_cast<std::int64_t>(std::abs(coordinate)));
+    }
+    std::ostringstream identity;
+    identity << std::setprecision(17)
+             << "fiber=" << datasetLocator(fiberDataset)
+             << ";fiber_hash=" << fileHash(fiberDataset.manifest().manifestPath)
+             << ";normal=" << datasetLocator(normalDataset)
+             << ";normal_hash=" << fileHash(normalDataset.manifest().manifestPath)
+             << ";grid=" << grid.shapeZYX[0] << ',' << grid.shapeZYX[1] << ',' << grid.shapeZYX[2]
+             << ";scale=" << grid.predictionToBaseScale
+             << ";cell=" << options.anchors.cellSizePredictionVoxels
+             << ";anchor_sigma=" << options.anchors.gaussianSigmaPredictionVoxels
+             << ";peak_sigma=" << options.anchors.peakSigmaPredictionVoxels
+             << ";axial_sigma=" << options.anchors.peakAxialSigmaPredictionVoxels
+             << ";peak_step=" << options.anchors.peakGridStepPredictionVoxels
+             << ";gradient=" << options.anchors.peakGradientWeight
+             << ";window=" << options.anchors.localWindowRadiusPredictionVoxels
+             << ";path_radius=" << options.paths.cellRadius
+             << ";path_margin=" << options.paths.neighborhoodMarginCells
+             << ";long_step=" << options.paths.longitudinalStepPredictionVoxels
+             << ";transverse_step=" << options.paths.transverseStepPredictionVoxels
+             << ";endpoint_angle=" << options.paths.maximumEndpointAngleDegrees
+             << ";prediction_angle=" << options.paths.maximumPredictionDeviationDegrees
+             << ";corridor=" << options.paths.corridorRadiusPredictionVoxels
+             << ";invalid=" << options.paths.invalidPredictionCostPerVoxel
+             << ";smooth=" << options.paths.smoothnessWeight << ','
+             << options.paths.smoothnessNormalWeight << ','
+             << options.paths.smoothnessTangentWeight << ','
+             << options.paths.smoothnessFreeAngleDegrees;
+    const auto identityText = identity.str();
+    vc::fiber_tracer::FiberletDatasetMetadata metadata;
+    metadata.kind = kind;
+    metadata.profile = vc::fiber_tracer::FiberletStorageProfile::Float32Cache;
+    metadata.chunkGridShapeZYX = chunkShape;
+    metadata.coordinateOriginZYX = {0, 0, 0};
+    metadata.coordinateUnitsPerChunkZYX = {
+        unitsPerChunk, unitsPerChunk, unitsPerChunk};
+    metadata.maximumEndpointReachCoordinateUnitsZYX = {
+        maximumReach, maximumReach, maximumReach};
+    metadata.datasetFingerprint = storageFingerprint(identityText);
+    metadata.spatialChunkSideBaseVoxels =
+        static_cast<std::uint32_t>(options.storageChunkSideBaseVoxels);
+    metadata.predictionToBaseScale = grid.predictionToBaseScale;
+    metadata.algorithmFingerprint = stringHash(identityText);
+    metadata.fiberManifest = datasetLocator(fiberDataset);
+    metadata.fiberManifestHash = fileHash(fiberDataset.manifest().manifestPath);
+    metadata.normalManifest = datasetLocator(normalDataset);
+    metadata.normalManifestHash = fileHash(normalDataset.manifest().manifestPath);
+    return metadata;
 }
 
 std::string credentialFreeLocator(std::string locator)
@@ -1448,6 +1571,7 @@ int main(int argc, char** argv)
                       << " elapsed_seconds=" << std::chrono::duration<double>(std::chrono::steady_clock::now() - traceSetupStart).count() << '\n';
             const auto referenceGeometry = vc::fiber_tracer::slicePolylineArc(reference, startArc, endArc);
             resolveAnchorConfig(options, grid);
+            std::mutex outputMutex;
 
             vc::fiber_tracer::FiberAnchorArtifactInfo baseAnchorArtifact;
             baseAnchorArtifact.sourceLocator = datasetLocator(dataset);
@@ -1459,29 +1583,189 @@ int main(int argc, char** argv)
             canonicalNormalOptions.workingToBaseScale = grid.predictionToBaseScale;
             canonicalNormalOptions.remoteCacheRoot = options.remoteCacheDirectory;
             const auto canonicalNormalDataset = vc::lasagna::LasagnaDataset::openLocation(options.normalManifestLocation, canonicalNormalOptions);
-            const vc::lasagna::LasagnaNormalSampler
-                canonicalNormalSampler(canonicalNormalDataset, vc::lasagna::LasagnaNormalSamplerOptions{options.decodedCacheBytes});
-            std::cerr << "fiber_replay_stage stage=full_extraction status=started\n";
-            auto fullExtraction =
-                extractTubeFiberlets(fiber.linePointsXyzBase, startArc, endArc, options.radiusBaseVoxels, grid, options, field, canonicalNormalSampler);
-            const auto& fullTube = fullExtraction.tube;
-            const size_t fullAnchorCount = fullExtraction.anchors.diagnostics.oneAnchorCells + 2 * fullExtraction.anchors.diagnostics.twoAnchorCells;
-            std::cerr << "fiber_replay_stage stage=full_extraction status=completed"
-                      << " cells=" << fullTube.cellsZYX.size() << " anchors=" << fullAnchorCount
-                      << " anchor_seconds=" << fullExtraction.anchorSeconds << " fiberlet_seconds=" << fullExtraction.fiberletSeconds
-                      << " searched=" << fullExtraction.paths.diagnostics.searchedPairs << " accepted=" << fullExtraction.paths.diagnostics.successfulPaths
-                      << " sampling_batches=" << fullExtraction.paths.samplingCoordinateBatches
-                      << " sampled_voxels=" << fullExtraction.paths.sampledVoxels << " peak_batch_voxels=" << fullExtraction.paths.peakCoordinateBatchVoxels
-                      << " evaluated_dp_nodes=" << fullExtraction.paths.evaluatedDpNodes << '\n';
-            printTubeExtractionProfile(std::cerr, fullExtraction);
-            auto fullPaths = std::move(fullExtraction.paths);
-            const auto graphStart = std::chrono::steady_clock::now();
-            std::cerr << "fiber_replay_stage stage=graph status=started\n";
-            const auto graph = vc::fiber_tracer::buildFiberletGraph(fullPaths);
-            std::cerr << "fiber_replay_stage stage=graph status=completed"
-                      << " elapsed_seconds=" << std::chrono::duration<double>(std::chrono::steady_clock::now() - graphStart).count()
-                      << " nodes=" << graph.nodes.size() << " edges=" << graph.edges.size() << " transitions=" << graph.transitions.size() << '\n';
-            fullPaths = {};
+            const auto canonicalNormalSampler =
+                std::make_shared<vc::lasagna::LasagnaNormalSampler>(
+                    canonicalNormalDataset,
+                    vc::lasagna::LasagnaNormalSamplerOptions{
+                        options.decodedCacheBytes});
+            std::optional<vc::fiber_tracer::FiberletGraph> eagerGraph;
+            std::shared_ptr<vc::fiber_tracer::FiberletOnDemandPreprocessor>
+                preprocessor;
+            std::unique_ptr<vc::fiber_tracer::FiberletCachedReplayGraphSource>
+                cachedGraph;
+            using ReplayChunkId = std::array<int, 4>;
+            struct ReplayChunkProgressLocation {
+                std::size_t scheduleIndex = 0;
+                double referenceArcBase = 0.0;
+            };
+            std::map<ReplayChunkId, ReplayChunkProgressLocation>
+                fiberletChunkProgressLocations;
+            std::map<ReplayChunkId, ReplayChunkProgressLocation>
+                anchorChunkProgressLocations;
+            std::set<ReplayChunkId> completedFiberletChunks;
+            std::set<ReplayChunkId> completedAnchorChunks;
+            if (options.eagerGraphReplay) {
+                std::cerr << "fiber_replay_stage stage=full_extraction status=started\n";
+                auto fullExtraction = extractTubeFiberlets(
+                    fiber.linePointsXyzBase, startArc, endArc,
+                    options.radiusBaseVoxels, grid, options, field,
+                    *canonicalNormalSampler);
+                const auto& fullTube = fullExtraction.tube;
+                const size_t fullAnchorCount =
+                    fullExtraction.anchors.diagnostics.oneAnchorCells +
+                    2 * fullExtraction.anchors.diagnostics.twoAnchorCells;
+                std::cerr << "fiber_replay_stage stage=full_extraction status=completed"
+                          << " cells=" << fullTube.cellsZYX.size()
+                          << " anchors=" << fullAnchorCount
+                          << " anchor_seconds=" << fullExtraction.anchorSeconds
+                          << " fiberlet_seconds=" << fullExtraction.fiberletSeconds
+                          << " searched=" << fullExtraction.paths.diagnostics.searchedPairs
+                          << " accepted=" << fullExtraction.paths.diagnostics.successfulPaths
+                          << '\n';
+                printTubeExtractionProfile(std::cerr, fullExtraction);
+                eagerGraph.emplace(vc::fiber_tracer::buildFiberletGraph(
+                    fullExtraction.paths));
+            } else {
+                const auto anchorRoot = options.anchorCacheRoot.empty()
+                    ? options.outputDirectory / "cache" / "anchors.zarr"
+                    : options.anchorCacheRoot;
+                const auto fiberletRoot = options.fiberletCacheRoot.empty()
+                    ? options.outputDirectory / "cache" / "fiberlets.zarr"
+                    : options.fiberletCacheRoot;
+                auto anchorMetadata = replayDatasetMetadata(
+                    vc::fiber_tracer::FiberletDatasetKind::Anchors,
+                    grid, options, dataset, canonicalNormalDataset);
+                auto fiberletMetadata = anchorMetadata;
+                fiberletMetadata.kind =
+                    vc::fiber_tracer::FiberletDatasetKind::Fiberlets;
+                auto graphBudget =
+                    std::make_shared<vc::render::DecodedChunkCacheBudget>(
+                        options.decodedCacheBytes);
+                vc::render::ChunkCache::Options anchorCacheOptions;
+                anchorCacheOptions.decodedByteCapacity =
+                    options.decodedCacheBytes;
+                anchorCacheOptions.decodedByteBudget = graphBudget;
+                anchorCacheOptions.maxConcurrentReads = 1;
+                vc::render::ChunkCache::Options fiberletCacheOptions =
+                    anchorCacheOptions;
+                vc::fiber_tracer::FiberletOnDemandConfig onDemand;
+                onDemand.anchorRoot = anchorRoot;
+                onDemand.fiberletRoot = fiberletRoot;
+                onDemand.anchorMetadata = anchorMetadata;
+                onDemand.fiberletMetadata = fiberletMetadata;
+                onDemand.grid = grid;
+                onDemand.anchorConfig = options.anchors;
+                onDemand.pathConfig = options.paths;
+                onDemand.predictionSampler =
+                    [&](const auto& indices, int threads, auto& samples) {
+                        field.sampleStoredGridBatch(indices, threads, samples);
+                    };
+                onDemand.normalSampler = canonicalNormalSampler;
+                onDemand.anchorCacheOptions = std::move(anchorCacheOptions);
+                onDemand.fiberletCacheOptions =
+                    std::move(fiberletCacheOptions);
+                onDemand.progress = [&](const auto& progress) {
+                    std::lock_guard lock(outputMutex);
+                    const ReplayChunkId id{progress.key.level, progress.key.iz,
+                        progress.key.iy, progress.key.ix};
+                    const bool anchorStage = progress.stage == "anchors";
+                    const auto& locations = anchorStage
+                        ? anchorChunkProgressLocations
+                        : fiberletChunkProgressLocations;
+                    auto& completed = anchorStage
+                        ? completedAnchorChunks
+                        : completedFiberletChunks;
+                    if (progress.status == "completed")
+                        completed.insert(id);
+                    const auto location = locations.find(id);
+                    std::cerr << "fiber_replay_cache_chunk"
+                              << " stage=" << progress.stage
+                              << " status=" << progress.status
+                              << " key=" << progress.key.iz << ','
+                              << progress.key.iy << ',' << progress.key.ix
+                              << " inputs=" << progress.inputCount
+                              << " outputs=" << progress.outputCount
+                              << " generated_chunks=" << completed.size()
+                              << " scheduled_chunks=" << locations.size();
+                    if (location != locations.end()) {
+                        std::cerr << " schedule_index="
+                                  << location->second.scheduleIndex + 1
+                                  << " nearest_reference_arc_base="
+                                  << location->second.referenceArcBase
+                                  << " nearest_reference_arc_fraction="
+                                  << std::clamp(
+                                         (location->second.referenceArcBase -
+                                             startArc) /
+                                             (endArc - startArc),
+                                         0.0, 1.0);
+                    }
+                    if (!progress.phase.empty()) {
+                        std::cerr << " phase=" << progress.phase
+                                  << " phase_completed="
+                                  << progress.phaseCompleted
+                                  << " phase_total=" << progress.phaseTotal;
+                    }
+                    std::cerr << " elapsed_seconds=" << progress.elapsedSeconds
+                              << " cpu_seconds=" << progress.cpuSeconds;
+                    if (progress.candidateGenerationWorkers > 0) {
+                        std::cerr << " candidate_generation_workers="
+                                  << progress.candidateGenerationWorkers
+                                  << " candidate_generation_seconds="
+                                  << progress.candidateGenerationSeconds
+                                  << " candidate_generation_cpu_seconds="
+                                  << progress.candidateGenerationCpuSeconds
+                                  << " candidate_generation_effective_cores="
+                                  << (progress.candidateGenerationSeconds > 0.0
+                                          ? progress.candidateGenerationCpuSeconds /
+                                                progress.candidateGenerationSeconds
+                                          : 0.0);
+                    }
+                    std::cerr << '\n';
+                };
+                std::cerr << "fiber_replay_stage stage=cache_open status=started"
+                          << " anchor_root=" << std::quoted(anchorRoot.string())
+                          << " fiberlet_root=" << std::quoted(fiberletRoot.string())
+                          << " decoded_budget_bytes=" << options.decodedCacheBytes
+                          << '\n';
+                preprocessor =
+                    vc::fiber_tracer::FiberletOnDemandPreprocessor::create(
+                        std::move(onDemand));
+                const auto chunkSchedule =
+                    preprocessor->referenceChunkSchedule(
+                        reference, startArc, endArc,
+                        options.radiusBaseVoxels);
+                for (std::size_t index = 0; index < chunkSchedule.size();
+                     ++index) {
+                    const auto& scheduled = chunkSchedule[index];
+                    const ReplayChunkId fiberletId{scheduled.key.level,
+                        scheduled.key.iz, scheduled.key.iy,
+                        scheduled.key.ix};
+                    fiberletChunkProgressLocations.emplace(
+                        fiberletId,
+                        ReplayChunkProgressLocation{
+                            index, scheduled.nearestReferenceArcBase});
+                    for (const auto& dependency :
+                         preprocessor->anchorDependencies(scheduled.key)) {
+                        const ReplayChunkId anchorId{dependency.level,
+                            dependency.iz, dependency.iy, dependency.ix};
+                        const ReplayChunkProgressLocation candidate{
+                            index, scheduled.nearestReferenceArcBase};
+                        const auto found =
+                            anchorChunkProgressLocations.find(anchorId);
+                        if (found == anchorChunkProgressLocations.end() ||
+                            candidate.scheduleIndex <
+                                found->second.scheduleIndex) {
+                            anchorChunkProgressLocations[anchorId] = candidate;
+                        }
+                    }
+                }
+                cachedGraph = std::make_unique<
+                    vc::fiber_tracer::FiberletCachedReplayGraphSource>(
+                    preprocessor, field, canonicalNormalSampler,
+                    options.paths, referenceGeometry,
+                    options.radiusBaseVoxels);
+                std::cerr << "fiber_replay_stage stage=cache_open status=completed\n";
+            }
 
             options.graphReplay.errorThresholdBaseVoxels = options.failureThresholdBaseVoxels;
             options.graphReplay.matchRefineSteps = options.matchRefineSteps;
@@ -1489,7 +1773,6 @@ int main(int argc, char** argv)
             options.graphReplay.referenceBeginArcBase = startArc;
             options.graphReplay.referenceEndArcBase = endArc;
 
-            std::mutex outputMutex;
             size_t greedyFailureCount = 0;
             size_t fiberletFailureCount = 0;
             const auto failurePrinter = [&](vc::fiber_tracer::FiberReplayTracer tracer) {
@@ -1541,26 +1824,113 @@ int main(int argc, char** argv)
             const auto traceStart = std::chrono::steady_clock::now();
             std::cerr << "fiber_replay_stage stage=parallel_trace status=started\n";
             auto greedyFuture = std::async(std::launch::async, [&]() {
-                return vc::fiber_tracer::traceFiberReplay(
-                    traceField,
-                    replayRequest,
-                    traceNormalSampler,
-                    scales.traceToBaseScale,
-                    [&](const vc::fiber_tracer::FiberTraceProgress& event) {
-                        if (event.step == event.maxSteps || event.step % 100 == 0) {
-                            std::lock_guard lock(outputMutex);
-                            std::cerr << "fiber_replay_progress tracer=greedy step=" << event.step << '/' << event.maxSteps
-                                      << " reason=" << event.reason << '\n';
-                        }
-                    },
-                    failurePrinter(vc::fiber_tracer::FiberReplayTracer::Greedy));
+                try {
+                    auto result = vc::fiber_tracer::traceFiberReplay(
+                        traceField,
+                        replayRequest,
+                        traceNormalSampler,
+                        scales.traceToBaseScale,
+                        [&](const vc::fiber_tracer::FiberTraceProgress& event) {
+                            if (event.step == event.maxSteps ||
+                                event.step % 100 == 0) {
+                                std::lock_guard lock(outputMutex);
+                                std::cerr << std::setprecision(17)
+                                          << "fiber_replay_progress tracer=greedy"
+                                          << " state=running"
+                                          << " reference_arc_base="
+                                          << event.referenceArcBase.value_or(startArc)
+                                          << " reference_arc_fraction="
+                                          << event.referenceArcFraction.value_or(0.0)
+                                          << " segment="
+                                          << event.replaySegmentIndex.value_or(0)
+                                          << " local_step=" << event.step
+                                          << " local_budget=" << event.maxSteps
+                                          << " local_reason=" << event.reason
+                                          << '\n';
+                            }
+                        },
+                        failurePrinter(
+                            vc::fiber_tracer::FiberReplayTracer::Greedy));
+                    {
+                        std::lock_guard lock(outputMutex);
+                        std::cerr << std::setprecision(17)
+                                  << "fiber_replay_evaluator tracer=greedy"
+                                  << " status=completed"
+                                  << " reference_arc_base="
+                                  << result.completedReferenceArcBase
+                                  << " reference_arc_fraction=1"
+                                  << " failures=" << result.failures.size()
+                                  << '\n';
+                    }
+                    return result;
+                } catch (const std::exception& error) {
+                    std::lock_guard lock(outputMutex);
+                    std::cerr << "fiber_replay_evaluator tracer=greedy"
+                              << " status=failed error="
+                              << std::quoted(error.what()) << '\n';
+                    throw;
+                } catch (...) {
+                    std::lock_guard lock(outputMutex);
+                    std::cerr << "fiber_replay_evaluator tracer=greedy"
+                              << " status=failed error=\"unknown exception\"\n";
+                    throw;
+                }
             });
             auto fiberletFuture = std::async(std::launch::async, [&]() {
-                return vc::fiber_tracer::traceFiberletGraphReplay(
-                    graph, fiber.linePointsXyzBase,
-                    canonicalNormalSampler, grid.predictionToBaseScale,
-                    options.graphReplay,
-                    failurePrinter(vc::fiber_tracer::FiberReplayTracer::Fiberlet));
+                try {
+                    const auto progress =
+                        [&](const vc::fiber_tracer::
+                                FiberletGraphReplayProgress& event) {
+                            std::lock_guard lock(outputMutex);
+                            std::cerr << std::setprecision(17)
+                                      << "fiber_replay_progress tracer=fiberlet"
+                                      << " state=" << event.state
+                                      << " reference_arc_base="
+                                      << event.referenceArcBase
+                                      << " reference_arc_fraction="
+                                      << event.referenceArcFraction
+                                      << " segment=" << event.segmentIndex
+                                      << '\n';
+                        };
+                    auto result = eagerGraph.has_value()
+                        ? vc::fiber_tracer::traceFiberletGraphReplay(
+                              *eagerGraph, fiber.linePointsXyzBase,
+                              *canonicalNormalSampler,
+                              grid.predictionToBaseScale, options.graphReplay,
+                              failurePrinter(vc::fiber_tracer::
+                                      FiberReplayTracer::Fiberlet),
+                              progress)
+                        : vc::fiber_tracer::traceFiberletGraphReplay(
+                              *cachedGraph, fiber.linePointsXyzBase,
+                              *canonicalNormalSampler,
+                              grid.predictionToBaseScale, options.graphReplay,
+                              failurePrinter(vc::fiber_tracer::
+                                      FiberReplayTracer::Fiberlet),
+                              progress);
+                    {
+                        std::lock_guard lock(outputMutex);
+                        std::cerr << std::setprecision(17)
+                                  << "fiber_replay_evaluator tracer=fiberlet"
+                                  << " status=completed"
+                                  << " reference_arc_base="
+                                  << result.completedReferenceArcBase
+                                  << " reference_arc_fraction=1"
+                                  << " failures=" << result.failures.size()
+                                  << '\n';
+                    }
+                    return result;
+                } catch (const std::exception& error) {
+                    std::lock_guard lock(outputMutex);
+                    std::cerr << "fiber_replay_evaluator tracer=fiberlet"
+                              << " status=failed error="
+                              << std::quoted(error.what()) << '\n';
+                    throw;
+                } catch (...) {
+                    std::lock_guard lock(outputMutex);
+                    std::cerr << "fiber_replay_evaluator tracer=fiberlet"
+                              << " status=failed error=\"unknown exception\"\n";
+                    throw;
+                }
             });
             std::optional<vc::fiber_tracer::FiberReplayTraceResult> greedyReplay;
             std::optional<vc::fiber_tracer::FiberletGraphReplayResult> fiberletReplay;
@@ -1578,6 +1948,19 @@ int main(int argc, char** argv)
             }
             if (traceError)
                 std::rethrow_exception(traceError);
+            if (preprocessor) {
+                const auto anchorStats = preprocessor->anchorCache()->stats();
+                const auto fiberletStats = preprocessor->fiberletCache()->stats();
+                const std::size_t residentBytes =
+                    anchorStats.localDecodedBytes +
+                    fiberletStats.localDecodedBytes;
+                std::cerr << "fiber_replay_cache"
+                          << " anchor_decoded_bytes=" << anchorStats.localDecodedBytes
+                          << " fiberlet_decoded_bytes=" << fiberletStats.localDecodedBytes
+                          << " total_decoded_bytes=" << residentBytes
+                          << " configured_budget_bytes=" << options.decodedCacheBytes
+                          << '\n';
+            }
             std::cerr << "fiber_replay_stage stage=parallel_trace status=completed"
                       << " elapsed_seconds=" << std::chrono::duration<double>(std::chrono::steady_clock::now() - traceStart).count()
                       << " greedy_failures=" << greedyReplay->failures.size() << " fiberlet_failures=" << fiberletReplay->failures.size() << '\n';
@@ -1619,7 +2002,7 @@ int main(int argc, char** argv)
                     bundle.referenceGeometryBase,
                     bundle.greedyReplay,
                     bundle.fiberletReplay,
-                    canonicalNormalSampler,
+                    *canonicalNormalSampler,
                     grid.predictionToBaseScale,
                     options.paths.parallelThreads,
                     *replayCtVolume,
@@ -1648,7 +2031,7 @@ int main(int argc, char** argv)
                             grid,
                             options,
                             field,
-                            canonicalNormalSampler);
+                            *canonicalNormalSampler);
                         visual.tube = std::move(local.tube);
                         visual.anchors = std::move(local.anchors);
                         visual.paths = std::move(local.paths);
@@ -1665,7 +2048,7 @@ int main(int argc, char** argv)
                             visual.tube,
                             bundle.greedyReplay,
                             bundle.fiberletReplay,
-                            canonicalNormalSampler,
+                            *canonicalNormalSampler,
                             grid.predictionToBaseScale,
                             options.paths.parallelThreads);
                         vc::fiber_tracer::renderFiberReplayStripTextures(
@@ -1822,7 +2205,14 @@ int main(int argc, char** argv)
                   << " prepared_geometry_bytes=" << report.preparedGeometryBytes
                   << " peak_search_transient_bytes=" << report.peakSearchTransientBytes
                   << " estimated_peak_owned_bytes=" << report.estimatedPeakOwnedBytes
-                  << " candidate_workers=" << report.candidateWorkers << " candidate_seconds=" << report.candidateGenerationSeconds
+                  << " candidate_generation_workers="
+                  << report.candidateGenerationWorkers
+                  << " candidate_preparation_workers="
+                  << report.candidateWorkers
+                  << " candidate_generation_seconds="
+                  << report.candidateGenerationSeconds
+                  << " candidate_generation_cpu_seconds="
+                  << report.candidateGenerationCpuSeconds
                   << " preparation_seconds=" << report.preparationSeconds << " search_seconds=" << report.searchSeconds
                   << " elapsed_seconds=" << report.elapsedSeconds << '\n';
         if (options.printStats) {
