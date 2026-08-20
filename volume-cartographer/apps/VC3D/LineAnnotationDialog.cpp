@@ -1632,20 +1632,21 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         _generatedViews.sideCutName == views.sideCutName &&
         _generatedViews.lineSurfaceName == views.lineSurfaceName &&
         _generatedViews.lineSideSliceName == views.lineSideSliceName) {
-        // The re-optimized views renumber line positions, so an in-flight
-        // keyboard pan's velocity and targets refer to the old line: stop it.
-        cancelArrowPan();
         // Snapshot the on-screen view data: each pane keeps drawing its overlays
         // from this until it adopts a rendered frame of the re-optimized
-        // surfaces (hooks below), so overlays and image update together.
+        // surfaces (hooks below), so overlays and image update together. Taken
+        // before the adoption below, these copies of the previous state also
+        // serve as the rollback if the cut frames cannot be built: the caller
+        // restores the previous surfaces on failure, and this dialog must not
+        // keep the new geometry metadata beside them.
         _heldGeneratedViews = _generatedViews;
         _heldControlIndex = _generatedControlIndex;
         _heldLinePosition = _currentLinePosition;
-        _currentCutOverlaySwapPending = true;
-        _sideCutOverlaySwapPending = true;
-        _stripOverlaySwapPending.assign(_stripViewers.size(), true);
 
         const double previousLinePosition = _currentLinePosition;
+        const float previousDisplayTangentSign = _displayTangentSign;
+        const std::optional<cv::Vec3f> previousPendingPlacementFocus =
+            _pendingPlacementFocus;
         _generatedViews = views;
         _displayTangentSign = vc3d::line_annotation::generatedDisplayTangentSign(
             _generatedViews.linePoints,
@@ -1673,16 +1674,36 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         }
         _currentLinePosition =
             std::clamp(targetLinePosition, 0.0, maxLinePosition);
-        _currentCutNormalOffsetVx = 0.0;
-        _sideCutNormalOffsetVx = 0.0;
-        _currentCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
-        _sideCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
+        // The one step of the in-place update that can fail, validated before
+        // the overlay-swap flags, offsets and viewer properties are touched:
+        // set earlier, those would describe an update that never happened, for
+        // swap callbacks that are never installed. The two update calls write
+        // only into the *new* cut surfaces, which the caller discards on
+        // failure, so restoring the fields above is the whole rollback.
         if (!updatePlaneSurface(_generatedViews.currentCutSurface.get(),
                                 _currentLinePosition) ||
             !updateSidePlaneSurface(_generatedViews.sideCutSurface.get(),
                                     _currentLinePosition)) {
+            _generatedViews = _heldGeneratedViews;
+            _generatedControlIndex = _heldControlIndex;
+            _currentLinePosition = previousLinePosition;
+            _displayTangentSign = previousDisplayTangentSign;
+            _pendingPlacementFocus = previousPendingPlacementFocus;
             return false;
         }
+        // The re-optimized views renumber line positions, so an in-flight
+        // keyboard pan's velocity and targets refer to the old line: stop it.
+        // After validation, deliberately — a rejected update leaves the old
+        // line on screen, where that pan is still valid. No timer can fire
+        // between here and the mutations above; this function is synchronous.
+        cancelArrowPan();
+        _currentCutOverlaySwapPending = true;
+        _sideCutOverlaySwapPending = true;
+        _stripOverlaySwapPending.assign(_stripViewers.size(), true);
+        _currentCutNormalOffsetVx = 0.0;
+        _sideCutNormalOffsetVx = 0.0;
+        _currentCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
+        _sideCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
         _currentCutViewer->markSurfaceGeometryChanged();
         _currentCutViewer->renderVisible(true, "line annotation views updated");
         _sideCutViewer->markSurfaceGeometryChanged();
