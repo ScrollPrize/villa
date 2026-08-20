@@ -2579,7 +2579,10 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                         configureChunkedViewerConnections(chunked);
                     if (_fiberOverlay && viewer) {
                         _fiberOverlay->attachViewer(viewer);
-                        _fiberOverlay->setViewerBaseToViewerFactor(viewer, 0.25);
+                        _fiberOverlay->setViewerBaseToViewerFactor(
+                            viewer,
+                            _spiralWorkspace->fiberBaseToPreviewFactor()
+                                .value_or(1.0));
                     }
                 });
         for (auto* viewer : _spiralWorkspace->viewerManager()->baseViewers()) {
@@ -2594,6 +2597,18 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             if (_surfacePanel) _surfacePanel->setSpiralFitAvailable(active);
             if (_fiberWidget) _fiberWidget->setSpiralFitAvailable(active);
         });
+        connect(_spiralWorkspace,
+                &SpiralWorkspace::fiberBaseToPreviewFactorChanged,
+                this, [this](double factor, bool valid) {
+                    if (!_fiberOverlay || !_spiralWorkspace ||
+                        !_spiralWorkspace->viewerManager()) return;
+                    const double applied = valid ? factor : 1.0;
+                    _spiralWorkspace->viewerManager()->forEachBaseViewer(
+                        [this, applied](VolumeViewerBase* viewer) {
+                            _fiberOverlay->setViewerBaseToViewerFactor(
+                                viewer, applied);
+                        });
+                });
     }
     _lineAnnotationController = std::make_unique<LineAnnotationController>(_state,
                                                                            _viewerManager.get(),
@@ -2711,7 +2726,10 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         _spiralWorkspace->viewerManager()->forEachBaseViewer(
             [this](VolumeViewerBase* viewer) {
                 _fiberOverlay->attachViewer(viewer);
-                _fiberOverlay->setViewerBaseToViewerFactor(viewer, 0.25);
+                _fiberOverlay->setViewerBaseToViewerFactor(
+                    viewer,
+                    _spiralWorkspace->fiberBaseToPreviewFactor()
+                        .value_or(1.0));
             });
     }
     const auto updateMainFiberViewerScales = [this]() {

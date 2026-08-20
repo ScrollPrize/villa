@@ -1440,6 +1440,7 @@ def save_combined_preview(
     tracks=(),
     *,
     surface_id,
+    base_shape_zyx=None,
     progress=None,
 ):
     """Write the authoritative connected preview used by VC3D and Lasagna.
@@ -1532,6 +1533,7 @@ def save_combined_preview(
         source='fit_spiral interactive preview',
         first_winding=first_winding,
         cleanup_erosion_cells=3,
+        base_shape_zyx=base_shape_zyx,
     )
     return manifest
 

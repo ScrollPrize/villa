@@ -92,11 +92,24 @@ class ScrollSpecTests(unittest.TestCase):
             spec = load_scroll_spec(temporary)
             self.assertEqual(spec.name, "s1")
             self.assertEqual(spec.spiral_outward_sense, "CW")
+            self.assertIsNone(spec.base_shape_zyx)
             self.assertEqual(spec.umbilicus_coordinate_scale, 1.0)
             self.assertEqual(spec.normal_zarr_group, "4")
             self.assertEqual(spec.surf_sdt_zarr_group, "1")
             self.assertEqual(spec.lasagna_scale, 4)
             self.assertEqual(spec.path_overrides, ())
+
+    def test_base_shape_is_validated_and_preserved(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            write_scroll_spec(temporary, base_shape_zyx=[100, 200, 300])
+            spec = load_scroll_spec(temporary)
+            self.assertEqual(spec.base_shape_zyx, (100, 200, 300))
+            self.assertEqual(spec.manifest()["base_shape_zyx"], (100, 200, 300))
+
+            for invalid in ([100, 200], [100, 0, 300], [100, 2.5, 300]):
+                write_scroll_spec(temporary, base_shape_zyx=invalid)
+                with self.assertRaisesRegex(ScrollSpecError, "base_shape_zyx"):
+                    load_scroll_spec(temporary)
 
     def test_relative_path_overrides_resolve_against_dataset_root(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -192,10 +205,16 @@ class HandoffTests(unittest.TestCase):
             destination = Path(temporary) / "generation-1"
             blocks = {winding: np.full((3, 2, 3), winding, dtype=np.float32)
                       for winding in range(10, 13)}
-            save_combined_tifxyz(blocks, destination, "preview", 20, 9.6, "test")
+            save_combined_tifxyz(
+                blocks, destination, "preview", 20, 9.6, "test",
+                base_shape_zyx=(100, 200, 300))
             metadata = json.loads((destination / "preview" / "meta.json").read_text())
             manifest = json.loads((destination / "manifest.json").read_text())
             self.assertEqual(manifest["schema_version"], 2)
+            self.assertEqual(manifest["base_shape_zyx"], [100, 200, 300])
+            self.assertEqual(manifest["voxel_size_um"], 9.6)
+            self.assertEqual(metadata["base_shape_zyx"], [100, 200, 300])
+            self.assertEqual(metadata["voxel_size_um"], 9.6)
             self.assertEqual(
                 metadata["winding_column_ranges"], [[0, 2], [2, 4], [4, 6]]
             )

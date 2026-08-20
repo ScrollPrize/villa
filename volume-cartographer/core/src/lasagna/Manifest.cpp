@@ -90,6 +90,49 @@ std::vector<LasagnaChannelGroup> parseGroups(
 
 } // namespace
 
+double dyadicCoordinateScaleBetweenShapes(
+    const std::array<std::size_t, 3>& fromShapeZYX,
+    const std::array<std::size_t, 3>& toShapeZYX,
+    int maximumAbsoluteLevel)
+{
+    if (maximumAbsoluteLevel < 0 || maximumAbsoluteLevel > 30) {
+        throw std::invalid_argument(
+            "maximum dyadic coordinate level must be between 0 and 30");
+    }
+    if (std::any_of(fromShapeZYX.begin(), fromShapeZYX.end(),
+                    [](std::size_t extent) { return extent == 0; }) ||
+        std::any_of(toShapeZYX.begin(), toShapeZYX.end(),
+                    [](std::size_t extent) { return extent == 0; })) {
+        throw std::invalid_argument("coordinate-domain shapes must be positive");
+    }
+
+    std::vector<int> matches;
+    for (int level = -maximumAbsoluteLevel;
+         level <= maximumAbsoluteLevel; ++level) {
+        const std::size_t divisor = std::size_t{1} << std::abs(level);
+        const auto& larger = level >= 0 ? toShapeZYX : fromShapeZYX;
+        const auto& smaller = level >= 0 ? fromShapeZYX : toShapeZYX;
+        bool compatible = true;
+        for (std::size_t axis = 0; axis < larger.size(); ++axis) {
+            const std::size_t ceilExtent =
+                (larger[axis] + divisor - 1) / divisor;
+            const std::size_t floorExtent =
+                std::max<std::size_t>(1, larger[axis] / divisor);
+            if (smaller[axis] != ceilExtent && smaller[axis] != floorExtent) {
+                compatible = false;
+                break;
+            }
+        }
+        if (compatible) matches.push_back(level);
+    }
+    if (matches.size() != 1) {
+        throw std::runtime_error(
+            "coordinate-domain shapes do not identify exactly one supported "
+            "power-of-two scale");
+    }
+    return std::ldexp(1.0, matches.front());
+}
+
 int LasagnaChannelGroup::scaleFactor() const noexcept
 {
     return 1 << scaledown;

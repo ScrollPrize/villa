@@ -21,6 +21,8 @@
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/lasagna/Dataset.hpp"
+#include "vc/lasagna/Manifest.hpp"
 
 #include <opencv2/imgcodecs.hpp>
 
@@ -102,6 +104,35 @@ private:
 };
 
 namespace {
+
+std::optional<std::array<std::size_t, 3>> parseBaseShapeZYX(
+    const QJsonValue& value, QString* errorMessage)
+{
+    const QJsonArray shape = value.toArray();
+    if (shape.size() != 3) {
+        if (errorMessage) {
+            *errorMessage = QObject::tr(
+                "Spiral preview base_shape_zyx must contain three positive integers");
+        }
+        return std::nullopt;
+    }
+    std::array<std::size_t, 3> parsed{};
+    for (int axis = 0; axis < shape.size(); ++axis) {
+        const double extent = shape.at(axis).toDouble(
+            std::numeric_limits<double>::quiet_NaN());
+        if (!std::isfinite(extent) || extent < 1.0 || std::floor(extent) != extent ||
+            extent > static_cast<double>(std::numeric_limits<std::size_t>::max())) {
+            if (errorMessage) {
+                *errorMessage = QObject::tr(
+                    "Spiral preview base_shape_zyx must contain three positive integers");
+            }
+            return std::nullopt;
+        }
+        parsed[static_cast<std::size_t>(axis)] =
+            static_cast<std::size_t>(extent);
+    }
+    return parsed;
+}
 
 std::optional<int> omeScaledownForGroup(
     const QString& rootPath, const QString& group, QString* errorMessage)
@@ -585,6 +616,12 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                     }
                 }
                 _previewSource.reset();
+                _previewBaseShapeZYX.reset();
+                _fiberBaseShapeZYX.reset();
+                _previewToFiberBaseScale.reset();
+                _fiberBaseToPreviewFactor.reset();
+                _previewCoordinateError.clear();
+                emit fiberBaseToPreviewFactorChanged(1.0, false);
                 _previewComponents.clear();
                 _previewWindingIds.release();
                 _previewRunDiffImagePath.clear();
@@ -940,6 +977,10 @@ QString SpiralWorkspace::lineAnnotationDraftUnavailableReason() const
     if (!_currentPreview || !_flattenedViewer ||
         _flattenedViewer->currentSurface() != _currentPreview.get())
         return tr("Wait for a flattened Spiral preview");
+    if (!_previewToFiberBaseScale)
+        return _previewCoordinateError.isEmpty()
+            ? tr("Spiral preview and fiber coordinates have not been paired")
+            : _previewCoordinateError;
     const QString servicePath =
         _sessionPaths.value(QStringLiteral("fibers")).toString();
     const QString localPath = servicePath.isEmpty()
@@ -1015,6 +1056,112 @@ void SpiralWorkspace::appendLineAnnotationDraftPoint(
     _lineDraftOverlay->setDraft(_flattenedViewer, std::move(points));
 }
 
+QStringList SpiralWorkspace::fallbackFiberManifests() const
+{
+    const QString serviceRoot =
+        _sessionPaths.value(QStringLiteral("dataset_root")).toString();
+    const QString localRoot = serviceRoot.isEmpty()
+        ? QString() : mapServicePath(serviceRoot);
+    QStringList manifests;
+    if (!localRoot.isEmpty()) {
+        QDirIterator it(QDir(localRoot).filePath(QStringLiteral("fiber_zarrs")),
+                        {QStringLiteral("*.lasagna.json")}, QDir::Files,
+                        QDirIterator::Subdirectories);
+        while (it.hasNext()) manifests.push_back(it.next());
+    }
+    manifests.sort();
+    return manifests;
+}
+
+std::optional<std::array<std::size_t, 3>>
+SpiralWorkspace::resolveFiberBaseShape(QString* errorMessage) const
+{
+    if (!_state || !_state->vpkg()) {
+        if (errorMessage) *errorMessage = tr("No volume package is loaded");
+        return std::nullopt;
+    }
+    const auto vpkg = _state->vpkg();
+    QStringList candidates;
+    const QString selected = QString::fromStdString(
+        vpkg->selectedFiberInferenceDataset());
+    if (!selected.isEmpty()) candidates.push_back(selected);
+    const QStringList fallbacks = fallbackFiberManifests();
+    if (fallbacks.size() == 1 && !candidates.contains(fallbacks.front()))
+        candidates.push_back(fallbacks.front());
+
+    vc::lasagna::LasagnaDatasetOpenOptions options;
+    options.remoteCacheRoot = vpkg->remoteCacheRootOrEmpty();
+    QStringList failures;
+    for (const QString& candidate : candidates) {
+        try {
+            const std::string location = candidate.toStdString();
+            const std::string resolved = vc::project::isLocationRemote(location)
+                ? location
+                : vc::project::resolveLocalPath(
+                      location, vpkg->path().parent_path()).string();
+            const auto dataset = vc::lasagna::LasagnaDataset::openLocation(
+                resolved, options);
+            if (!dataset.manifest().baseShapeZYX) {
+                failures.push_back(
+                    tr("%1 has no base_shape_zyx").arg(candidate));
+                continue;
+            }
+            return dataset.manifest().baseShapeZYX;
+        } catch (const std::exception& ex) {
+            failures.push_back(
+                tr("%1: %2").arg(candidate, QString::fromUtf8(ex.what())));
+        }
+    }
+    if (errorMessage) {
+        if (candidates.isEmpty()) {
+            *errorMessage = fallbacks.isEmpty()
+                ? tr("No fiber-inference manifest was found below fiber_zarrs")
+                : tr("Multiple fiber-inference manifests were found below "
+                     "fiber_zarrs; select one in the project");
+        } else {
+            *errorMessage = tr("No fiber-inference base shape is available: %1")
+                                .arg(failures.join(QStringLiteral("; ")));
+        }
+    }
+    return std::nullopt;
+}
+
+void SpiralWorkspace::updatePreviewCoordinateScale()
+{
+    _fiberBaseShapeZYX.reset();
+    _previewToFiberBaseScale.reset();
+    _fiberBaseToPreviewFactor.reset();
+    _previewCoordinateError.clear();
+    if (!_previewBaseShapeZYX) {
+        _previewCoordinateError = tr(
+            "Spiral preview metadata has no base_shape_zyx; publish a new preview");
+        emit fiberBaseToPreviewFactorChanged(1.0, false);
+        return;
+    }
+    QString error;
+    const auto fiberShape = resolveFiberBaseShape(&error);
+    if (!fiberShape) {
+        _previewCoordinateError = error;
+        emit fiberBaseToPreviewFactorChanged(1.0, false);
+        return;
+    }
+    try {
+        const double previewToFiber =
+            vc::lasagna::dyadicCoordinateScaleBetweenShapes(
+                *_previewBaseShapeZYX, *fiberShape, 5);
+        _fiberBaseShapeZYX = fiberShape;
+        _previewToFiberBaseScale = previewToFiber;
+        _fiberBaseToPreviewFactor = 1.0 / previewToFiber;
+        emit fiberBaseToPreviewFactorChanged(
+            *_fiberBaseToPreviewFactor, true);
+    } catch (const std::exception& ex) {
+        _previewCoordinateError = tr(
+            "Spiral preview and fiber base shapes are incompatible: %1")
+                                      .arg(QString::fromUtf8(ex.what()));
+        emit fiberBaseToPreviewFactorChanged(1.0, false);
+    }
+}
+
 std::optional<LineAnnotationController::ResolvedFiberOptimizationInputs>
 SpiralWorkspace::resolveLineAnnotationInputs(QString* errorMessage) const
 {
@@ -1076,13 +1223,19 @@ SpiralWorkspace::resolveLineAnnotationInputs(QString* errorMessage) const
                 {QStringLiteral("channels"), QJsonArray{channels[i]}},
             };
         }
-        const QJsonObject root{
+        QJsonObject root{
             {QStringLiteral("version"), 2},
             {QStringLiteral("source_to_base"), 1.0},
             {QStringLiteral("grad_mag_encode_scale"), encodeScale},
             {QStringLiteral("grad_mag_factor"), gradFactor},
             {QStringLiteral("groups"), groups},
         };
+        if (_fiberBaseShapeZYX) {
+            QJsonArray baseShape;
+            for (const std::size_t extent : *_fiberBaseShapeZYX)
+                baseShape.append(static_cast<qint64>(extent));
+            root[QStringLiteral("base_shape_zyx")] = baseShape;
+        }
         manifest.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
         manifest.close();
         fallbackNormal = manifest.fileName();
@@ -1091,15 +1244,7 @@ SpiralWorkspace::resolveLineAnnotationInputs(QString* errorMessage) const
     QString fallbackFiber;
     const QString serviceRoot =
         _sessionPaths.value(QStringLiteral("dataset_root")).toString();
-    const QString localRoot = serviceRoot.isEmpty()
-        ? QString() : mapServicePath(serviceRoot);
-    QStringList manifests;
-    if (!localRoot.isEmpty()) {
-        QDirIterator it(QDir(localRoot).filePath(QStringLiteral("fiber_zarrs")),
-                        {QStringLiteral("*.lasagna.json")}, QDir::Files,
-                        QDirIterator::Subdirectories);
-        while (it.hasNext()) manifests.push_back(it.next());
-    }
+    const QStringList manifests = fallbackFiberManifests();
     if (manifests.size() == 1) fallbackFiber = manifests.front();
 
     auto result = _lineAnnotationController->resolveFiberOptimizationInputs(
@@ -1132,6 +1277,29 @@ void SpiralWorkspace::finalizeLineAnnotationDraft()
             tr("A 2D line annotation needs at least two distinct points"), 10000);
         return;
     }
+    QString error;
+    auto inputs = resolveLineAnnotationInputs(&error);
+    if (!inputs) {
+        statusBar()->showMessage(error, 15000);
+        return;
+    }
+    const auto& fiberShape = inputs->fiberDataset->manifest().baseShapeZYX;
+    if (!_previewBaseShapeZYX || !fiberShape) {
+        statusBar()->showMessage(
+            tr("Spiral preview and fiber-inference metadata must both declare "
+               "base_shape_zyx"), 15000);
+        return;
+    }
+    double previewToFiberBase = 1.0;
+    try {
+        previewToFiberBase = vc::lasagna::dyadicCoordinateScaleBetweenShapes(
+            *_previewBaseShapeZYX, *fiberShape, 5);
+    } catch (const std::exception& ex) {
+        statusBar()->showMessage(
+            tr("Spiral preview and fiber coordinates are incompatible: %1")
+                .arg(QString::fromUtf8(ex.what())), 15000);
+        return;
+    }
     std::vector<cv::Vec3d> controls;
     controls.reserve(_lineAnnotationDraft->surfacePoints.size());
     for (const QPointF& point : _lineAnnotationDraft->surfacePoints) {
@@ -1142,10 +1310,9 @@ void SpiralWorkspace::finalizeLineAnnotationDraft()
                 tr("A saved control no longer samples valid preview geometry"), 10000);
             return;
         }
-        // Spiral's preview volume is explicitly L2; vc3d_fiber is canonical L0.
-        controls.emplace_back(sample.volume[0] * 4.0,
-                              sample.volume[1] * 4.0,
-                              sample.volume[2] * 4.0);
+        controls.emplace_back(sample.volume[0] * previewToFiberBase,
+                              sample.volume[1] * previewToFiberBase,
+                              sample.volume[2] * previewToFiberBase);
     }
     for (size_t i = 0; i < controls.size(); ++i) {
         for (size_t j = 0; j < i; ++j) {
@@ -1155,12 +1322,6 @@ void SpiralWorkspace::finalizeLineAnnotationDraft()
                 return;
             }
         }
-    }
-    QString error;
-    auto inputs = resolveLineAnnotationInputs(&error);
-    if (!inputs) {
-        statusBar()->showMessage(error, 15000);
-        return;
     }
     const QString destinationService =
         _sessionPaths.value(QStringLiteral("fibers")).toString();
@@ -1572,6 +1733,10 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
         if (schemaVersion != 3
             || manifest.value(QStringLiteral("kind")).toString() != QStringLiteral("spiral_combined_preview"))
             return failure(QObject::tr("Unsupported Spiral preview manifest"));
+        QString shapeError;
+        const auto baseShapeZYX = parseBaseShapeZYX(
+            manifest.value(QStringLiteral("base_shape_zyx")), &shapeError);
+        if (!baseShapeZYX) return failure(shapeError);
         QString surfacePath = manifest.value(QStringLiteral("surface_path")).toString();
         const QString surfaceId = manifest.value(QStringLiteral("surface_id")).toString();
         if (surfacePath.isEmpty() || surfaceId.isEmpty())
@@ -1689,6 +1854,8 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
                 != manifest.value(QStringLiteral("grid_shape"))
             || meta.value(QStringLiteral("output_step_vx"))
                 != manifest.value(QStringLiteral("output_step_vx"))
+            || meta.value(QStringLiteral("base_shape_zyx"))
+                != manifest.value(QStringLiteral("base_shape_zyx"))
             || meta.value(QStringLiteral("uuid")).toString() != surfaceId)
             return failure(QObject::tr(
                 "Spiral preview metadata does not match its generation manifest"));
@@ -1734,6 +1901,7 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
             PreviewLoadResult result;
             result.surface = std::move(surface);
             result.surfaceId = surfaceId;
+            result.baseShapeZYX = baseShapeZYX;
             result.components = std::move(previewComponents);
             result.windingIds = std::move(mappedWindings);
             result.lossMaps = std::move(lossMaps);
@@ -1751,6 +1919,8 @@ void SpiralWorkspace::installPreview(const PreviewLoadResult& result, qint64 gen
     cancelLineAnnotationDraft();
     _previewSource = result.surface;
     _previewSourceId = result.surfaceId;
+    _previewBaseShapeZYX = result.baseShapeZYX;
+    updatePreviewCoordinateScale();
     _previewComponents = result.components;
     _previewWindingIds = result.windingIds;
     _previewRunDiffImagePath = result.runDiffImagePath;

@@ -721,6 +721,15 @@ class LasagnaPublisher:
                     output_step_vx=LASAGNA_PREVIEW_OUTPUT_STEP_VX)
                 metadata = json.loads(
                     (surface_path / "meta.json").read_text(encoding="utf-8"))
+                base_shape_zyx = manifest.get("base_shape_zyx")
+                if metadata.get("base_shape_zyx") != base_shape_zyx:
+                    raise RuntimeError(
+                        "Spiral preview base_shape_zyx differs between its "
+                        "surface metadata and manifest")
+                if metadata.get("voxel_size_um") != manifest.get("voxel_size_um"):
+                    raise RuntimeError(
+                        "Spiral preview voxel_size_um differs between its "
+                        "surface metadata and manifest")
                 cleanup = metadata.get("lasagna_input_cleanup")
                 if (not isinstance(cleanup, dict)
                         or cleanup.get("erosion_cells") != 3
@@ -908,6 +917,10 @@ class LasagnaPublisher:
                 flattened_metadata["winding_bounds"] = winding_bounds
                 flattened_metadata["component_winding_ids"] = [
                     item["winding"] for item in winding_bounds]
+                if base_shape_zyx is not None:
+                    flattened_metadata["base_shape_zyx"] = base_shape_zyx
+                if metadata.get("voxel_size_um") is not None:
+                    flattened_metadata["voxel_size_um"] = metadata["voxel_size_um"]
                 flattened_metadata_path.write_text(
                     json.dumps(flattened_metadata, indent=4) + "\n",
                     encoding="utf-8")

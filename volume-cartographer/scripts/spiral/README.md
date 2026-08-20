@@ -257,8 +257,10 @@ service paths are translated from; without it those overlays are simply marked
 unavailable.
 
 `spiral-scroll.json` in the dataset root is the only source of the scroll's
-name and voxel resolution and of the Lasagna store layout (zarr groups,
-coordinate scale). None of them are panel settings: the panel reports them
+name, voxel resolution, `base_shape_zyx` coordinate-domain shape, and Lasagna
+store layout (zarr groups, coordinate scale). The shape is carried into new
+checkpoints and previews; an older checkpoint that lacks it inherits the live
+dataset value. None of these are panel settings: the panel reports them
 read-only, and the service rejects a session request that carries
 `scroll_name`, `voxel_size_um`, `lasagna_group` or `lasagna_scale`.
 

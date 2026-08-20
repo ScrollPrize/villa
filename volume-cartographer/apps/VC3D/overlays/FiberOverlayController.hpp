@@ -31,7 +31,8 @@ public:
     void setShowLinked(bool show);
     // Fiber geometry is canonical L0. This factor converts it into the
     // coordinate space consumed by one viewer before both projection and hit
-    // testing. Main viewers default to identity; Spiral uses 0.25 (L2).
+    // testing. Main viewers default to identity; derived workspaces calculate
+    // their factor from coordinate-domain shapes.
     void setViewerBaseToViewerFactor(VolumeViewerBase* viewer, double factor);
     [[nodiscard]] double viewerBaseToViewerFactor(VolumeViewerBase* viewer) const;
     void detachViewer(VolumeViewerBase* viewer) override;

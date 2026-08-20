@@ -813,6 +813,7 @@ class FitContext:
         # Scroll physical facts.
         self.scroll_name = scroll.name
         self.voxel_size_um = float(scroll.voxel_size_um)
+        self.base_shape_zyx = scroll.base_shape_zyx
         self.spiral_outward_sense = scroll.spiral_outward_sense
         self.normal_zarr_group = scroll.normal_zarr_group
         # The surf-SDT store's scale/encoding are read from the store's own
@@ -2350,6 +2351,9 @@ class FitContext:
             'resolved_config': durable_config(self.config),
             'lasagna_scale': self.lasagna_scale,
             'lasagna_group': self.normal_zarr_group,
+            'base_shape_zyx': (
+                list(self.base_shape_zyx)
+                if self.base_shape_zyx is not None else None),
             'surf_sdt_fingerprint': (
                 self.sdt_volume['fingerprint'] if self.sdt_volume is not None else None),
             'winding_inference_fingerprint': (
@@ -2450,6 +2454,27 @@ class FitContext:
                     f'checkpoint outward sense '
                     f'{checkpoint.get("spiral_outward_sense")!r} does not '
                     f'match requested sense {self.spiral_outward_sense!r}')
+        checkpoint_base_shape = checkpoint.get('base_shape_zyx')
+        if checkpoint_base_shape is not None:
+            if (not isinstance(checkpoint_base_shape, (list, tuple))
+                    or len(checkpoint_base_shape) != 3
+                    or any(type(value) is not int or value <= 0
+                           for value in checkpoint_base_shape)):
+                reasons.append(
+                    'checkpoint base_shape_zyx is not a ZYX list of three '
+                    'positive integers')
+            else:
+                checkpoint_base_shape = tuple(checkpoint_base_shape)
+                live_base_shape = getattr(self, 'base_shape_zyx', None)
+                if live_base_shape is None:
+                    reasons.append(
+                        'checkpoint declares base_shape_zyx but this dataset '
+                        'scroll spec does not')
+                elif checkpoint_base_shape != tuple(live_base_shape):
+                    reasons.append(
+                        f'checkpoint base_shape_zyx='
+                        f'{list(checkpoint_base_shape)!r} does not match this '
+                        f'dataset ({list(live_base_shape)!r})')
         checkpoint_dataset = str(
             (checkpoint.get('input_manifest') or {}).get('dataset_root') or '')
         dataset_root = str(getattr(self.paths, 'dataset_root', '') or '')
@@ -2783,6 +2808,7 @@ class FitContext:
                 get_or_build_unattached_pcl_flat,
                 tracks=self.preview_extent_tracks,
                 surface_id=surface_id,
+                base_shape_zyx=self.base_shape_zyx,
                 progress=progress,
             )
             if not diagnostics:

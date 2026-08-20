@@ -92,6 +92,15 @@ struct LasagnaDatasetManifest {
         const std::filesystem::path& manifestPath = {});
 };
 
+// Return the power-of-two coordinate factor that maps points expressed in
+// ``fromShapeZYX`` into ``toShapeZYX``.  Pyramid construction may round an odd
+// extent up or down, so both conventions are accepted on every axis; the
+// shapes must still identify exactly one level in the requested range.
+[[nodiscard]] double dyadicCoordinateScaleBetweenShapes(
+    const std::array<std::size_t, 3>& fromShapeZYX,
+    const std::array<std::size_t, 3>& toShapeZYX,
+    int maximumAbsoluteLevel = 30);
+
 [[nodiscard]] std::string toString(NormalSourceKind kind);
 
 } // namespace vc::lasagna

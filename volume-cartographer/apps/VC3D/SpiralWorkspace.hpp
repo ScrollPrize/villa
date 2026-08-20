@@ -13,6 +13,7 @@
 #include <opencv2/core/mat.hpp>
 #include <opencv2/core/types.hpp>
 #include <atomic>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -65,10 +66,14 @@ public:
     void setLineAnnotationController(LineAnnotationController* controller);
     [[nodiscard]] bool isFlattenedViewer(const VolumeViewerBase* viewer) const;
     [[nodiscard]] QString lineAnnotationDraftUnavailableReason() const;
+    [[nodiscard]] std::optional<double> fiberBaseToPreviewFactor() const {
+        return _fiberBaseToPreviewFactor;
+    }
     void startLineAnnotationDraft();
 
 signals:
     void spiralSessionActiveChanged(bool active);
+    void fiberBaseToPreviewFactorChanged(double factor, bool valid);
 
 protected:
     void keyPressEvent(QKeyEvent* event) override;
@@ -86,6 +91,7 @@ private:
         QString surfaceId;
         std::vector<PreviewComponent> components;
         cv::Mat_<int32_t> windingIds;
+        std::optional<std::array<std::size_t, 3>> baseShapeZYX;
         QString error;
         struct LossMap {
             QString name;
@@ -162,6 +168,10 @@ private:
                                         Qt::KeyboardModifiers modifiers);
     [[nodiscard]] std::optional<LineAnnotationController::ResolvedFiberOptimizationInputs>
         resolveLineAnnotationInputs(QString* errorMessage) const;
+    [[nodiscard]] QStringList fallbackFiberManifests() const;
+    [[nodiscard]] std::optional<std::array<std::size_t, 3>>
+        resolveFiberBaseShape(QString* errorMessage) const;
+    void updatePreviewCoordinateScale();
     void maybeCommitForPendingExit();
     QString provisionalBrushRoot() const;
     void discardBrushWork();
@@ -210,6 +220,11 @@ private:
     quint64 _inputSurfaceGeneration = 0;
     std::shared_ptr<QuadSurface> _previewSource;
     QString _previewSourceId;
+    std::optional<std::array<std::size_t, 3>> _previewBaseShapeZYX;
+    std::optional<std::array<std::size_t, 3>> _fiberBaseShapeZYX;
+    std::optional<double> _previewToFiberBaseScale;
+    std::optional<double> _fiberBaseToPreviewFactor;
+    QString _previewCoordinateError;
     std::vector<PreviewComponent> _previewComponents;
     cv::Mat_<int32_t> _previewWindingIds;
     QString _previewRunDiffImagePath;
