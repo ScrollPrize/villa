@@ -30,6 +30,7 @@
 #include "vc/core/util/HttpFetch.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 #include "vc/core/util/RemoteFileCache.hpp"
+#include "vc/core/util/RemoteVolumeMetadata.hpp"
 #include "vc/core/util/PostProcess.hpp"
 #include "vc/core/render/IChunkedArray.hpp"
 #include "vc/core/render/ChunkFetch.hpp"
@@ -41,28 +42,6 @@ static const std::filesystem::path METADATA_FILE_ALT = "metadata.json";
 
 namespace
 {
-
-/** The beamline pixel-size record is not always at the document root: the m7 surface
- *  stores nest it under source/metadata/, and the 1.129um volumes omit the scan/ wrapper.
- *  Look for it wherever it is. No published store carries two different values, so the
- *  traversal order cannot change a value that already resolves today. */
-const utils::Json* findSamplePixelSize(const utils::Json& node, int depth = 0)
-{
-    if (depth > 12 || !node.is_object()) {
-        return nullptr;
-    }
-    if (node.contains("samplePixelSize") && node["samplePixelSize"].is_number()) {
-        return &node["samplePixelSize"];
-    }
-    for (auto it = node.begin(); it != node.end(); ++it) {
-        if ((*it).is_object()) {
-            if (const auto* hit = findSamplePixelSize(*it, depth + 1)) {
-                return hit;
-            }
-        }
-    }
-    return nullptr;
-}
 
 std::string normalizeRemoteVolumeUrl(std::string url)
 {
@@ -150,10 +129,9 @@ std::optional<utils::Json> loadRemoteVolumeMetadata(const std::string& remoteUrl
             }
         }
         if (!hasVoxelSize) {
-            if (const auto* found = findSamplePixelSize(json)) {
-                const double millimeters = found->get_double();
-                if (std::isfinite(millimeters) && millimeters > 0.0)
-                    json["voxelsize"] = millimeters * 1000.0;
+            if (const auto millimeters =
+                    vc::findUnambiguousSamplePixelSizeMillimeters(json)) {
+                json["voxelsize"] = *millimeters * 1000.0;
             }
         }
         return json;
