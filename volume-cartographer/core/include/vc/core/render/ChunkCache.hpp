@@ -228,6 +228,9 @@ public:
                         bool wait,
                         int priorityOffset,
                         const ChunkRequestContext& request) override;
+    bool prefetchChunksUntil(const std::vector<ChunkKey>& keys,
+                             std::chrono::steady_clock::time_point deadline,
+                             int priorityOffset = 0) override;
     void replaceViewDemand(const ChunkRequestContext& request,
                            const std::array<float, 2>& focus,
                            std::vector<ChunkViewportSample> samples) override;

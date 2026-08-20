@@ -858,6 +858,19 @@ TEST_CASE("ChunkCacheService deduplicates an in-flight fetch across handles")
     CHECK(fetcher->fetchCalls.load() == 1);
 }
 
+TEST_CASE("ChunkCache: timed prefetch returns while a fetch is unresolved")
+{
+    auto fetcher = std::make_shared<BlockingFetcher>();
+    auto cache = makeServiceCache(makeService(), "timed-prefetch", fetcher);
+    const std::vector<ChunkKey> keys{{0, 0, 0, 0}};
+
+    const bool resolved = cache->prefetchChunksUntil(
+        keys, std::chrono::steady_clock::now() + std::chrono::milliseconds(50));
+    CHECK_FALSE(resolved);
+    fetcher->release();
+    CHECK(waitForResolved(*cache, 0, 0, 0, 0).status == ChunkStatus::Data);
+}
+
 TEST_CASE("ChunkCacheService rejects stale publication after source invalidation")
 {
     auto service = makeService();
