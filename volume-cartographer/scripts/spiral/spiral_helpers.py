@@ -1,3 +1,4 @@
+import concurrent.futures
 import json
 import glob
 import os
@@ -8,7 +9,8 @@ import torch
 from tqdm import tqdm
 
 from sample_spiral import get_spiral_yxs, get_theta_and_radii
-from tifxyz import load_tifxyz, save_tifxyz, save_combined_tifxyz
+from tifxyz import (load_tifxyz, patch_to_payload, save_tifxyz,
+                    save_combined_tifxyz)
 from vc3d_fiber_format_adapter import (
     parse_vc3d_fiber_format,
 )
@@ -26,6 +28,43 @@ def patch_intersects_z_roi(patch, z_begin, z_end):
     if zs.numel() == 0:
         return False
     return bool(((zs >= z_begin) & (zs < z_end)).any().item())
+
+
+def load_patch_payload_chunk(path, entries, z_begin, z_end,
+                             erode_cells_default, io_threads=1):
+    """Load, erode, and z-filter a chunk of patch directories.
+
+    Runs inside patch-loader worker processes (must stay a picklable
+    module-level function). Returns one (entry, payload, error, drop_reason)
+    tuple per entry, where payload is patch_to_payload() output for kept
+    patches and exactly one of payload/error/drop_reason is set otherwise.
+    io_threads > 1 overlaps per-file latency (e.g. NFS round trips) within
+    the chunk; the per-entry work itself is unchanged and per-entry results
+    stay in a fixed order, so the outcome is identical either way.
+    """
+    def load_one(entry):
+        segment_path = os.path.join(path, entry)
+        try:
+            patch = load_tifxyz(segment_path, z_range=(z_begin, z_end))
+            if patch is None:
+                return entry, None, None, 'z ROI prefilter'
+            cells_to_erode = patch.erosion_cells(erode_cells_default)
+            if (cells_to_erode > 0
+                    and not erode_patch_valid_region(patch, cells_to_erode)):
+                return entry, None, None, 'erosion'
+            if not patch_intersects_z_roi(patch, z_begin, z_end):
+                return entry, None, None, 'z ROI after erosion'
+            patch.release_derived_caches()
+            return entry, patch_to_payload(patch), None, None
+        except Exception as error:
+            return entry, None, str(error), None
+
+    if io_threads <= 1 or len(entries) <= 1:
+        return [load_one(entry) for entry in entries]
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(io_threads, len(entries)),
+            thread_name_prefix='patch-io') as executor:
+        return list(executor.map(load_one, entries))
 
 
 def scale_counts_for_z_range(
@@ -392,6 +431,9 @@ class Chain:
         revisit points; consumers wanting each adjacency once must dedupe)."""
 
     def zyxs_between(self, p1, p2):
+        return self._zyxs(self.points_between(p1, p2))
+
+    def points_between(self, p1, p2):
         raise NotImplementedError
 
     def iter_chain(self):
@@ -427,14 +469,12 @@ class SequenceChain(Chain):
             self._index_of = {id(p): k for k, p in enumerate(self._ordered)}
         return self._ordered, self._index_of
 
-    def zyxs_between(self, p1, p2):
+    def points_between(self, p1, p2):
         ordered, index_of = self._sorted()
         i1, i2 = index_of[id(p1)], index_of[id(p2)]
         if i1 <= i2:
-            chain = ordered[i1:i2 + 1]
-        else:
-            chain = list(reversed(ordered[i2:i1 + 1]))
-        return self._zyxs(chain)
+            return ordered[i1:i2 + 1]
+        return list(reversed(ordered[i2:i1 + 1]))
 
     def iter_chain(self):
         return self._sorted()[0]
@@ -484,7 +524,7 @@ class ComponentChain(Chain):
             return points[pos_from:pos_to + 1]
         return list(reversed(points[pos_to:pos_from + 1]))
 
-    def zyxs_between(self, p1, p2):
+    def points_between(self, p1, p2):
         # Within-member index ranges concatenated across the spanning-tree path
         # from p1's member to p2's, hopping fibers at each junction.
         m1, i1 = self.pos_of[id(p1)]
@@ -505,7 +545,7 @@ class ComponentChain(Chain):
             chain.extend(self._member_segment(m_from, pos, leave))
             pos = arrive
         chain.extend(self._member_segment(member_path[-1], pos, i2))
-        return self._zyxs(chain)
+        return chain
 
     def iter_chain(self):
         # Euler tour of the member tree: walk each member end-to-end and back,
