@@ -2204,7 +2204,21 @@ bool LineAnnotationController::prepareForUserFacingLineAnnotationOpen()
             session.taskState == LineAnnotationSession::TaskState::Succeeded &&
             !session.optimizedLine.points.empty() &&
             !session.controlPoints.empty()) {
+            // A save that fails synchronously — a serialization or validation
+            // exception — never queues a job, and it can fail before the fiber
+            // list was updated, so this session may hold the only copy of the
+            // work. Refuse before anything closes, and leave the session
+            // saveable rather than suppressed, so retrying is possible.
+            // Asynchronous write failures are different: their job holds a
+            // full snapshot and the fiber list was already updated, so they
+            // are handled by the flush-and-compare gate a caller runs before
+            // acting destructively.
+            const uint64_t saveFailuresBefore = _fiberSaveFailureCount;
             saveSessionAsFiber(session);
+            if (_fiberSaveFailureCount != saveFailuresBefore) {
+                session.suppressFiberSave = suppressBeforeFinalize;
+                return false;
+            }
             session.suppressFiberSave = true;
         }
     }
@@ -2227,6 +2241,10 @@ bool LineAnnotationController::prepareForPackageSwitch()
     // package; the vpkgChanged handler is only the defensive net behind it,
     // and that net must never save.
     //
+    // Captured before any save this function can trigger — synchronous
+    // serialization failures bump the count during the finalize walk itself,
+    // not only during the flush at the end.
+    const uint64_t saveFailuresBefore = _fiberSaveFailureCount;
     // Refused outright while any optimization runs, whichever pane owns it:
     // switching mid-run would either discard the result or apply it to the
     // wrong package, and a refusal the user can retry beats both. Checked
@@ -2239,18 +2257,21 @@ bool LineAnnotationController::prepareForPackageSwitch()
             return false;
         }
     }
-    // The inspection holds dialog-less sessions the finalize walk below never
-    // sees; its own cleanup removes its panes and surfaces, and it has nothing
-    // to save.
+    // Finalizes and saves idle sessions, then closes their dialogs
+    // (WA_DeleteOnClose deletes them) and cleans up their panes. Fails before
+    // closing anything if a finalization cannot complete — which is why it
+    // runs before any teardown below: every way this function can refuse must
+    // come before anything it destroys, or a refused switch would still have
+    // cost the user work.
+    if (!prepareForUserFacingLineAnnotationOpen()) {
+        return false;
+    }
+    // Past every refusal point. The inspection holds dialog-less sessions the
+    // finalize walk above never sees; its own cleanup removes its panes and
+    // surfaces, and it has nothing to save.
     if (_intersectionInspection) {
         cleanupIntersectionInspectionSurfaces();
         _intersectionInspection.reset();
-    }
-    // Finalizes and saves idle sessions, then closes their dialogs
-    // (WA_DeleteOnClose deletes them) and cleans up their panes. Fails before
-    // closing anything if a finalization cannot complete.
-    if (!prepareForUserFacingLineAnnotationOpen()) {
-        return false;
     }
     // Whatever remains has no dialog; the normal close path still saves a
     // succeeded session — into this, still-current, package.
@@ -2261,6 +2282,19 @@ bool LineAnnotationController::prepareForPackageSwitch()
     }
     for (const auto& name : remaining) {
         cleanupSurfaceName(name);
+    }
+    // The close path above only *queues* fiber writes; the switch must not
+    // proceed until they have actually reached this package's disk. The flush
+    // and the failure-count comparison are the same gate the header documents
+    // for destructive follow-ups (and saveOpenFibers() makes the same flush on
+    // shutdown); the count also covers a save that failed before it could
+    // queue a job. The fiber list keeps the failed fiber in memory, so
+    // refusing here leaves the user able to save it again.
+    waitForFiberSaves();
+    if (_fiberSaveFailureCount != saveFailuresBefore) {
+        showError(tr("A fiber save failed while closing sessions; the project "
+                     "was not switched."));
+        return false;
     }
     return _panes.empty();
 }
@@ -13360,6 +13394,11 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
         emitFiberSummaries();
         refreshBranchLineViews(savedFiberId);
     } catch (const std::exception& ex) {
+        // Counted like an asynchronous write failure: callers that gate
+        // destructive follow-ups on _fiberSaveFailureCount around a
+        // waitForFiberSaves() flush must see a save that died before it could
+        // even queue a job, or they would proceed as though it had succeeded.
+        ++_fiberSaveFailureCount;
         showError(tr("Could not save fiber: %1").arg(QString::fromStdString(ex.what())),
                   session.suppressErrorDialogs);
     }
