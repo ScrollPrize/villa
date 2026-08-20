@@ -25,6 +25,17 @@ utils::HttpClient makeTextClient(const HttpAuth& auth)
     return utils::HttpClient(std::move(cfg));
 }
 
+// Binary payloads (100+ MB mesh bands) need longer than makeTextClient's 30s.
+utils::HttpClient makeBinaryClient(const HttpAuth& auth)
+{
+    utils::HttpClient::Config cfg;
+    cfg.aws_auth = auth;
+    cfg.transfer_timeout = std::chrono::seconds{300};
+    cfg.connect_timeout = std::chrono::seconds{5};
+    cfg.max_retries = 2;
+    return utils::HttpClient(std::move(cfg));
+}
+
 bool isAuthError(long status, const std::string& body)
 {
     if (status == 401 || status == 403)
@@ -116,7 +127,7 @@ std::string httpGetString(const std::string& url, const HttpAuth& auth)
 
 std::vector<std::byte> httpGetBytes(const std::string& url, const HttpAuth& auth)
 {
-    auto client = makeTextClient(auth);
+    auto client = makeBinaryClient(auth);
     auto resp = client.get(url);
     if (resp.ok()) {
         return std::move(resp.body);
