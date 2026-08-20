@@ -124,13 +124,11 @@ TEST_CASE("DistLossAnalytic Evaluate() is substantially faster than a raw AutoDi
     std::unique_ptr<ceres::CostFunction> auto_cf(
         new ceres::AutoDiffCostFunction<DistLoss, 1, 3, 3>(new DistLoss(5.0f, 1.0f)));
     std::unique_ptr<ceres::CostFunction> analytic_cf(new DistLossAnalytic(5.0, 1.0));
-
     std::mt19937 rng(2024);
     std::uniform_real_distribution<double> coord(-10.0, 10.0);
     const int n_inputs = 4096;
     std::vector<std::array<double, 6>> inputs(n_inputs);
     for (auto& in : inputs) for (double& c : in) c = coord(rng);
-
     volatile double sink_res = 0.0;
     volatile double sink_jac = 0.0;
 
@@ -176,6 +174,166 @@ TEST_CASE("DistLossAnalytic Evaluate() is substantially faster than a raw AutoDi
             << "SizedCostFunction: " << ms_analytic << " ms  ("
             << (ms_analytic * 1e6 / n_calls) << " ns/call)  |  "
             << "speedup: " << ms_auto / ms_analytic << "x");
-
     CHECK(ms_analytic * 1.5 < ms_auto);
+}
+
+TEST_CASE("StraightLoss2Analytic reproduces AutoDiffCostFunction<StraightLoss2> exactly")
+{
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<double> coord(-50.0, 50.0);
+    std::uniform_real_distribution<double> wd(0.1, 5.0);
+
+    double max_res = 0.0, max_jac = 0.0;
+    for (int trial = 0; trial < 50000; ++trial) {
+        double a[3] = {coord(rng), coord(rng), coord(rng)};
+        double b[3] = {coord(rng), coord(rng), coord(rng)};
+        double c[3] = {coord(rng), coord(rng), coord(rng)};
+        float w = wd(rng);
+
+        std::unique_ptr<ceres::CostFunction> auto_cf(
+            new ceres::AutoDiffCostFunction<StraightLoss2, 3, 3, 3, 3>(new StraightLoss2(w)));
+        std::unique_ptr<ceres::CostFunction> ana_cf(CreateStraightLoss2Analytic(w));
+
+        double r_auto[3], r_ana[3];
+        double j_auto[3][9], j_ana[3][9];
+        double* jp_auto[3] = {j_auto[0], j_auto[1], j_auto[2]};
+        double* jp_ana[3]  = {j_ana[0],  j_ana[1],  j_ana[2]};
+        const double* params[3] = {a, b, c};
+        auto_cf->Evaluate(params, r_auto, jp_auto);
+        ana_cf->Evaluate(params, r_ana, jp_ana);
+
+        for (int i = 0; i < 3; ++i) max_res = std::max(max_res, relerr(r_auto[i], r_ana[i]));
+        for (int k = 0; k < 3; ++k)
+            for (int i = 0; i < 9; ++i)
+                max_jac = std::max(max_jac, relerr(j_auto[k][i], j_ana[k][i]));
+    }
+    CHECK(max_res < 1e-14);
+    CHECK(max_jac < 1e-14);
+}
+
+TEST_CASE("StraightLossAnalytic matches AutoDiffCostFunction<StraightLoss> away from the cos30 kink and degenerate cases")
+{
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<double> coord(-10.0, 10.0);
+    std::uniform_real_distribution<double> wd(0.1, 5.0);
+
+    double max_res = 0.0, max_jac = 0.0;
+    int n_checked = 0;
+    for (int trial = 0; trial < 50000; ++trial) {
+        double a[3] = {coord(rng), coord(rng), coord(rng)};
+        double b[3] = {coord(rng), coord(rng), coord(rng)};
+        double c[3] = {coord(rng), coord(rng), coord(rng)};
+
+        double d1[3] = {b[0]-a[0], b[1]-a[1], b[2]-a[2]};
+        double d2[3] = {c[0]-b[0], c[1]-b[1], c[2]-b[2]};
+        double l1_sq = d1[0]*d1[0]+d1[1]*d1[1]+d1[2]*d1[2];
+        double l2_sq = d2[0]*d2[0]+d2[1]*d2[1]+d2[2]*d2[2];
+        if (l1_sq < 0.01 || l2_sq < 0.01) continue;
+        double dot = (d1[0]*d2[0]+d1[1]*d2[1]+d1[2]*d2[2]) / std::sqrt(l1_sq*l2_sq);
+        if (std::fabs(dot - StraightLoss::kStraightAngleCosThreshold) < 0.01) continue;
+
+        float w = wd(rng);
+        std::unique_ptr<ceres::CostFunction> auto_cf(
+            new ceres::AutoDiffCostFunction<StraightLoss, 1, 3, 3, 3>(new StraightLoss(w)));
+        std::unique_ptr<ceres::CostFunction> ana_cf(CreateStraightLossAnalytic(w));
+
+        double r_auto[1], r_ana[1];
+        double j_auto[3][3], j_ana[3][3];
+        double* jp_auto[3] = {j_auto[0], j_auto[1], j_auto[2]};
+        double* jp_ana[3]  = {j_ana[0],  j_ana[1],  j_ana[2]};
+        const double* params[3] = {a, b, c};
+        auto_cf->Evaluate(params, r_auto, jp_auto);
+        ana_cf->Evaluate(params, r_ana, jp_ana);
+
+        max_res = std::max(max_res, relerr(r_auto[0], r_ana[0]));
+        for (int k = 0; k < 3; ++k)
+            for (int i = 0; i < 3; ++i)
+                max_jac = std::max(max_jac, relerr(j_auto[k][i], j_ana[k][i]));
+        n_checked++;
+    }
+    CHECK(n_checked > 45000);
+    CHECK(max_res < 1e-12);
+    CHECK(max_jac < 1e-11);
+}
+
+TEST_CASE("StraightLossAnalytic degenerate case: b == a returns residual 0 and Jacobian 0")
+{
+    double a[3] = {1.0, 2.0, 3.0};
+    double b[3] = {1.0, 2.0, 3.0};
+    double c[3] = {4.0, 5.0, 6.0};
+    std::unique_ptr<ceres::CostFunction> ana_cf(CreateStraightLossAnalytic(1.0f));
+    double res[1];
+    double j0[3], j1[3], j2[3];
+    double* jacs[3] = {j0, j1, j2};
+    const double* params[3] = {a, b, c};
+    ana_cf->Evaluate(params, res, jacs);
+    CHECK(res[0] == doctest::Approx(0.0));
+    for (int i = 0; i < 3; ++i) {
+        CHECK(j0[i] == doctest::Approx(0.0));
+        CHECK(j1[i] == doctest::Approx(0.0));
+        CHECK(j2[i] == doctest::Approx(0.0));
+    }
+}
+
+TEST_CASE("StraightLoss2DAnalytic matches AutoDiffCostFunction<StraightLoss2D> on non-degenerate inputs")
+{
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<double> coord(-10.0, 10.0);
+    std::uniform_real_distribution<double> wd(0.1, 5.0);
+
+    double max_res = 0.0, max_jac = 0.0;
+    int n_checked = 0;
+    for (int trial = 0; trial < 50000; ++trial) {
+        double a[2] = {coord(rng), coord(rng)};
+        double b[2] = {coord(rng), coord(rng)};
+        double c[2] = {coord(rng), coord(rng)};
+        double d1[2] = {b[0]-a[0], b[1]-a[1]};
+        double d2[2] = {c[0]-b[0], c[1]-b[1]};
+        double l1_sq = d1[0]*d1[0]+d1[1]*d1[1];
+        double l2_sq = d2[0]*d2[0]+d2[1]*d2[1];
+        if (l1_sq < 0.01 || l2_sq < 0.01) continue;
+
+        float w = wd(rng);
+        std::unique_ptr<ceres::CostFunction> auto_cf(
+            new ceres::AutoDiffCostFunction<StraightLoss2D, 1, 2, 2, 2>(new StraightLoss2D(w)));
+        std::unique_ptr<ceres::CostFunction> ana_cf(CreateStraightLoss2DAnalytic(w));
+
+        double r_auto[1], r_ana[1];
+        double j_auto[3][2], j_ana[3][2];
+        double* jp_auto[3] = {j_auto[0], j_auto[1], j_auto[2]};
+        double* jp_ana[3]  = {j_ana[0],  j_ana[1],  j_ana[2]};
+        const double* params[3] = {a, b, c};
+        auto_cf->Evaluate(params, r_auto, jp_auto);
+        ana_cf->Evaluate(params, r_ana, jp_ana);
+
+        max_res = std::max(max_res, relerr(r_auto[0], r_ana[0]));
+        for (int k = 0; k < 3; ++k)
+            for (int i = 0; i < 2; ++i)
+                max_jac = std::max(max_jac, relerr(j_auto[k][i], j_ana[k][i]));
+        n_checked++;
+    }
+    CHECK(n_checked > 45000);
+    CHECK(max_res < 1e-12);
+    CHECK(max_jac < 1e-11);
+}
+
+TEST_CASE("StraightLoss2DAnalytic degenerate branch (b == a) matches original residual formula and Jacobian")
+{
+    double a[2] = {1.0, 2.0};
+    double b[2] = {1.0, 2.0};
+    double c[2] = {3.0, 4.0};
+    std::unique_ptr<ceres::CostFunction> auto_cf(
+        new ceres::AutoDiffCostFunction<StraightLoss2D, 1, 2, 2, 2>(new StraightLoss2D(1.0f)));
+    std::unique_ptr<ceres::CostFunction> ana_cf(CreateStraightLoss2DAnalytic(1.0f));
+    double r_auto[1], r_ana[1];
+    double j_auto[3][2], j_ana[3][2];
+    double* jp_auto[3] = {j_auto[0], j_auto[1], j_auto[2]};
+    double* jp_ana[3]  = {j_ana[0],  j_ana[1],  j_ana[2]};
+    const double* params[3] = {a, b, c};
+    auto_cf->Evaluate(params, r_auto, jp_auto);
+    ana_cf->Evaluate(params, r_ana, jp_ana);
+    CHECK(std::fabs(r_auto[0] - r_ana[0]) < 1e-12);
+    for (int k = 0; k < 3; ++k)
+        for (int i = 0; i < 2; ++i)
+            CHECK(std::fabs(j_auto[k][i] - j_ana[k][i]) < 1e-12);
 }
