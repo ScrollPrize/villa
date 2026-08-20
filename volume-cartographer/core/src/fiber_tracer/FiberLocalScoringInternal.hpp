@@ -123,9 +123,21 @@ struct FiberLocalPreparedCandidateSmoothness {
     cv::Vec3f normal{0.0f, 0.0f, 0.0f};
     cv::Vec3f tangent{0.0f, 0.0f, 0.0f};
     float normalAngle = 0.0f;
+    float normalProjection = 0.0f;
+    float transverseMagnitude = 0.0f;
     FiberLocalPreparedCandidateSmoothnessMode mode =
         FiberLocalPreparedCandidateSmoothnessMode::InvalidDirection;
 };
+
+struct FiberLocalPreparedProjectedChordalCandidate {
+    cv::Vec3f direction{0.0f, 0.0f, 0.0f};
+    cv::Vec3f normal{0.0f, 0.0f, 0.0f};
+    float normalProjection = 0.0f;
+    FiberLocalPreparedCandidateSmoothnessMode mode =
+        FiberLocalPreparedCandidateSmoothnessMode::InvalidDirection;
+};
+
+static_assert(sizeof(FiberLocalPreparedProjectedChordalCandidate) <= 32);
 
 struct FiberLocalPreparedCandidateMetric {
     cv::Vec3f direction{0.0f, 0.0f, 0.0f};
@@ -235,6 +247,9 @@ prepareFiberLocalCandidateSmoothnessInline(
 
     const float candidateNormal = clampFiberLocalUnit(
         candidateStepDirection.dot(normal));
+    prepared.normalProjection = candidateNormal;
+    prepared.transverseMagnitude = std::sqrt(std::max(
+        0.0f, 1.0f - candidateNormal * candidateNormal));
     prepared.tangent = normalizeFiberLocalOrZero(
         candidateStepDirection - normal * candidateNormal);
     prepared.normalAngle = std::asin(candidateNormal);
@@ -242,6 +257,92 @@ prepareFiberLocalCandidateSmoothnessInline(
         ? FiberLocalPreparedCandidateSmoothnessMode::NormalAware
         : FiberLocalPreparedCandidateSmoothnessMode::NormalAwareDegenerateTangent;
     return prepared;
+}
+
+static inline FiberLocalPreparedProjectedChordalCandidate
+prepareFiberLocalProjectedChordalCandidateInline(
+    const cv::Vec3f& candidateStepDirection,
+    const cv::Vec3f& normal,
+    bool normalValid)
+{
+    FiberLocalPreparedProjectedChordalCandidate prepared;
+    prepared.direction = candidateStepDirection;
+    prepared.normal = normal;
+    constexpr float epsilon2 = kFiberLocalEpsilon * kFiberLocalEpsilon;
+    if (candidateStepDirection.dot(candidateStepDirection) <= epsilon2)
+        return prepared;
+    if (!normalValid || normal.dot(normal) <= epsilon2) {
+        prepared.mode =
+            FiberLocalPreparedCandidateSmoothnessMode::IsotropicFallback;
+        return prepared;
+    }
+    prepared.normalProjection = clampFiberLocalUnit(
+        candidateStepDirection.dot(normal));
+    prepared.mode = FiberLocalPreparedCandidateSmoothnessMode::NormalAware;
+    return prepared;
+}
+
+static inline float fiberLocalChordalComponentExcessSquared(
+    float componentSquared, float freeChord)
+{
+    const float magnitudeSquared = std::max(0.0f, componentSquared);
+    if (!(freeChord > 0.0f))
+        return magnitudeSquared;
+    const float excess = std::max(
+        0.0f, std::sqrt(magnitudeSquared) - freeChord);
+    return excess * excess;
+}
+
+static inline float fiberLocalChordalExcessSquared(
+    float cosine, float freeChord)
+{
+    const float chordSquared = std::max(
+        0.0f, 2.0f * (1.0f - clampFiberLocalUnit(cosine)));
+    return fiberLocalChordalComponentExcessSquared(chordSquared, freeChord);
+}
+
+static inline FiberLocalSmoothnessCost
+fiberLocalSmoothnessCostCandidatePreparedProjectedChordalInline(
+    const cv::Vec3f& previousStepDirection,
+    const FiberLocalPreparedProjectedChordalCandidate& candidatePrepared,
+    const FiberLocalSmoothnessConfig& config,
+    float freeChord)
+{
+    FiberLocalSmoothnessCost cost;
+    constexpr float epsilon2 = kFiberLocalEpsilon * kFiberLocalEpsilon;
+    if (previousStepDirection.dot(previousStepDirection) <= epsilon2 ||
+        candidatePrepared.mode ==
+            FiberLocalPreparedCandidateSmoothnessMode::InvalidDirection) {
+        return cost;
+    }
+    if (candidatePrepared.mode ==
+            FiberLocalPreparedCandidateSmoothnessMode::IsotropicFallback) {
+        cost.isotropic = config.isotropicWeight *
+            fiberLocalChordalExcessSquared(
+                previousStepDirection.dot(candidatePrepared.direction),
+                freeChord);
+        cost.mode = FiberLocalSmoothnessMode::IsotropicFallback;
+        return cost;
+    }
+
+    const float previousNormal = clampFiberLocalUnit(
+        previousStepDirection.dot(candidatePrepared.normal));
+    const cv::Vec3f previousTangent =
+        previousStepDirection - candidatePrepared.normal * previousNormal;
+    const cv::Vec3f candidateTangent =
+        candidatePrepared.direction - candidatePrepared.normal *
+            candidatePrepared.normalProjection;
+    const cv::Vec3f tangentDelta = previousTangent - candidateTangent;
+    const float normalDelta =
+        previousNormal - candidatePrepared.normalProjection;
+    cost.tangent = config.tangentWeight *
+        fiberLocalChordalComponentExcessSquared(
+            tangentDelta.dot(tangentDelta), freeChord);
+    cost.normal = config.normalWeight *
+        fiberLocalChordalComponentExcessSquared(
+            normalDelta * normalDelta, freeChord);
+    cost.mode = FiberLocalSmoothnessMode::NormalAware;
+    return cost;
 }
 
 static inline FiberLocalPreparedCandidateMetric
@@ -386,6 +487,33 @@ fiberLocalMetricCostFromPreparedAlignmentInline(
     cost.normalSmoothness = smoothness.normal / effectiveLength;
     return cost;
 }
+
+static inline FiberLocalMetricCost
+fiberLocalMetricCostFromPreparedAlignmentProjectedChordalInline(
+    float alignmentLoss,
+    const FiberLocalPreparedIncomingAlignment& incoming,
+    float previousStepLength,
+    float candidateStepLength,
+    const FiberLocalPreparedProjectedChordalCandidate& candidate,
+    const FiberLocalMetricConfig& config,
+    float freeChord)
+{
+    FiberLocalMetricCost cost;
+    cost.alignment = alignmentLoss * std::max(0.0f, candidateStepLength);
+    const auto smoothness =
+        fiberLocalSmoothnessCostCandidatePreparedProjectedChordalInline(
+            incoming.previousDirection, candidate,
+            config.smoothness, freeChord);
+    const float effectiveLength = std::max(
+        1.0f,
+        (std::max(0.0f, previousStepLength) +
+         std::max(0.0f, candidateStepLength)) * 0.5f);
+    cost.isotropicSmoothness = smoothness.isotropic / effectiveLength;
+    cost.tangentSmoothness = smoothness.tangent / effectiveLength;
+    cost.normalSmoothness = smoothness.normal / effectiveLength;
+    return cost;
+}
+
 
 static inline FiberLocalMetricCost
 fiberLocalMetricCostFullyPreparedInline(

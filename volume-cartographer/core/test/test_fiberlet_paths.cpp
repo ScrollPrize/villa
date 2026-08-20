@@ -915,6 +915,37 @@ TEST_CASE("fiber local alignment loss preserves native multiplicative scoring")
     CHECK(fiberLocalAlignmentLoss(0.5f, x, diagonal, x, diagonal) == 1.0f - score);
 }
 
+TEST_CASE("projected chordal smoothness decomposes the direction chord")
+{
+    using namespace vc::fiber_tracer;
+    const cv::Vec3f normal = cv::normalize(cv::Vec3f{0.2f, -0.1f, 1.0f});
+    const cv::Vec3f previous =
+        cv::normalize(cv::Vec3f{1.0f, 0.3f, 0.2f});
+    const cv::Vec3f candidate =
+        cv::normalize(cv::Vec3f{0.9f, -0.2f, 0.35f});
+    const FiberLocalSmoothnessConfig splitConfig{0.0f, 1.0f, 1.0f, 0.0f};
+    const auto prepared =
+        detail::prepareFiberLocalProjectedChordalCandidateInline(
+            candidate, normal, true);
+    const auto split =
+        detail::fiberLocalSmoothnessCostCandidatePreparedProjectedChordalInline(
+            previous, prepared, splitConfig, 0.0f);
+    const cv::Vec3f delta = previous - candidate;
+    CHECK(split.tangent + split.normal ==
+          doctest::Approx(delta.dot(delta)).epsilon(1.0e-6));
+
+    const FiberLocalSmoothnessConfig fallbackConfig{2.0f, 0.1f, 10.0f, 0.0f};
+    const auto fallbackPrepared =
+        detail::prepareFiberLocalProjectedChordalCandidateInline(
+            candidate, {}, false);
+    const auto fallback =
+        detail::fiberLocalSmoothnessCostCandidatePreparedProjectedChordalInline(
+            previous, fallbackPrepared, fallbackConfig, 0.0f);
+    CHECK(fallback.isotropic == doctest::Approx(
+        fallbackConfig.isotropicWeight * delta.dot(delta)).epsilon(1.0e-6));
+    CHECK(fallback.mode == FiberLocalSmoothnessMode::IsotropicFallback);
+}
+
 TEST_CASE("compact fiber axes preserve unoriented directions")
 {
     for (const cv::Vec3d axis : {
