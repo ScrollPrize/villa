@@ -1,3 +1,9 @@
+# 2026-08-20: concise fiberlet replay progress
+
+- Replaced default per-stage, per-chunk, and per-evaluator replay chatter with
+  one monotone overall reference-progress bar and ETA. Detailed profiling rows
+  remain available through `fiberlet-replay --stats`.
+
 # 2026-08-20: on-demand fiberlet storage and replay
 
 - Replaced the unpublished cache payload with strict version 2. Float-cache

@@ -525,23 +525,17 @@ anchor, prefix, and route chunks; multiple committed edges in one route chunk
 share one decode. `--eager-graph` runs the prior whole-tube graph construction
 for diagnostics.
 
-Replay progress uses the selected reference interval as its only global axis.
-`fiber_replay_progress` rows report `reference_arc_base` and a monotone
-`reference_arc_fraction`; greedy native `local_step` and `local_budget` are
-explicitly restart-segment-local diagnostics. Each evaluator emits its own
-`fiber_replay_evaluator` terminal row, so completion or failure of one cannot
-be hidden while the command waits for the other.
+By default replay prints one terminal progress bar with elapsed time and ETA.
+Its tracing fraction is the minimum monotone reference-arc fraction completed
+by the greedy and fiberlet evaluators, so a fast greedy completion cannot hide
+unfinished graph work. Non-finite, stale, and restart-local callback values
+cannot move it backward. Completion is reserved until requested visualization
+and bundle publication finish.
 
-Generated chunk progress is printed as `fiber_replay_cache_chunk` rows with
-stage, status, key, a stable `schedule_index`, the nearest reference arc,
-monotone generated-chunk count, total scheduled chunks, input/output counts,
-and elapsed/CPU time. Fiberlet rows also expose the current internal phase and
-its completed/total work. Completed fiberlet chunks report candidate-generation
-workers, wall time, CPU time, and effective cores. Schedule indices may finish
-out of order because graph queries request independent spatial chunks; the
-generated count remains monotone. Cache hits do not increment the generated
-count. The final `fiber_replay_cache` row reports resident anchor/fiberlet
-decoded bytes and the configured shared budget.
+Pass `--stats` to replace the bar with the detailed machine-readable stage,
+chunk, failure, evaluator, and cache rows. These retain the stable chunk schedule
+indices, internal generation phases, worker and CPU timings, cache residency,
+and restart-local greedy step diagnostics used for profiling.
 
 On-demand anchor fitting publishes completion while holding the same mutex
 used by its ready-cell condition predicate. Cache waits are ordinary blocking

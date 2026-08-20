@@ -3073,11 +3073,16 @@
   search over the complete immutable graph with the shared edge/join objective.
   The greedy evaluator and on-demand graph evaluator run concurrently;
   neither evaluator changes the other one's state.
-- Replay progress is measured globally by reference arclength. Greedy native
-  step/budget counters are restart-local and must be labelled as such; they
-  are never presented as whole-fiber completion. Fiberlet graph progress uses
-  the same reference arc/fraction, and each evaluator publishes an independent
-  terminal status.
+- Default replay progress is one command-wide terminal bar. During tracing its
+  fraction is the minimum of the independently monotone greedy and fiberlet
+  reference-arclength fractions. Non-finite values are ignored and stale or
+  restart-local callbacks cannot move either fraction backward. The bar reports
+  elapsed time and ETA, reserves completion for requested visualization and
+  durable bundle publication, terminates its line before result/error output,
+  and never exposes restart-local step counts as global work.
+- `--stats` replaces the concise bar with detailed machine-readable stage,
+  chunk, restart, evaluator, cache, visualization, and publication diagnostics.
+  It does not change scheduling, generated payloads, tracing, or artifacts.
 - On-demand chunk diagnostics bind every generated anchor/fiberlet chunk to a
   stable full-interval schedule index and nearest reference arc. Generated
   counts are monotone, while spatial chunks may complete out of schedule order.

@@ -1,15 +1,10 @@
-# Task: exact float-cache fiberlet replay
+# Task: concise replay progress and latest fiberlet optimizations
 
-Make the unpublished float32 anchor/fiberlet processing cache transparent to
-fiberlet graph replay.
+Make `vc_fiberlets fiberlet-replay` print one overall progress bar with elapsed
+time and ETA instead of per-stage, per-chunk, per-restart, and per-evaluator
+diagnostics during ordinary use.
 
-- Cached and eager graph sources must expose identical anchor positions,
-  fiberlet geometry, endpoint steps, edge-cost components, transition
-  eligibility, transition costs, beam choices, replay geometry, and failures.
-- Persist canonical interpolated prediction/normal scoring once per anchor.
-- Persist exact nonzero endpoint steps and full edge-cost components per
-  fiberlet prefix; connectivity lookahead must not require route payloads.
-- Reconstruct route geometry with the same duplicate-point suppression as the
-  original DP result.
-- Replace the strict unpublished payload schema directly. Do not add a legacy
-  reader or repair path.
+Retain the detailed diagnostics behind an explicit statistics option. Commit
+that output change, then merge the unmerged `fiber-lets2` performance work and
+adapt it to the chunked/cached replay implementation where necessary. Preserve
+exact float-cache/eager replay equivalence.
