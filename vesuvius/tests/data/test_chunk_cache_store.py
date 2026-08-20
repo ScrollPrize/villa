@@ -753,3 +753,18 @@ def test_read_refetches_when_cached_file_vanishes(tmp_path, monkeypatch):
     monkeypatch.undo()
 
     assert _cached_path(store, key).exists()
+
+
+def test_tilde_cache_dir_expands_to_home(tmp_path, monkeypatch):
+    # The docs advertise ~/.cache/vesuvius/chunks as the cache location; a
+    # tilde handed to the API unexpanded must land in the home directory, not
+    # in a literal "~" directory under the working directory.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    remote = _remote_with({_chunk_key(0): b"x"})
+    store = DiskCacheStore(remote, "~/chunk-cache", url="memory://dataset")
+    expanded = tmp_path / "chunk-cache"
+    assert Path(store._cache_root) == expanded
+    assert (expanded / ".vesuvius-chunk-cache").exists()
+    assert not Path("~").exists()
+

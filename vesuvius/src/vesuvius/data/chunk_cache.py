@@ -333,6 +333,9 @@ class DiskCacheStoreV3(getattr(zarr.storage, 'WrapperStore', object)):
         max_bytes: int | None = None,
     ) -> None:
         super().__init__(remote)
+        # The docs advertise ~/.cache/vesuvius/chunks; expand it here so API
+        # callers and quoted CLI values do not get a literal "~" directory.
+        cache_dir = os.path.expanduser(cache_dir)
         _check_max_bytes(max_bytes)
         self._remote = remote
         # The cap applies to the whole user-supplied cache root, not just this
@@ -551,6 +554,7 @@ class DiskCacheStoreV2(_V2_STORE_BASE):
         retry_budget_seconds: float = 0.0,
         max_bytes: int | None = None,
     ) -> None:
+        cache_dir = os.path.expanduser(cache_dir)
         _check_max_bytes(max_bytes)
         self._remote = remote
         # The cap applies to the whole user-supplied cache root, not just this
