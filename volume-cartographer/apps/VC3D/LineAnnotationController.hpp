@@ -112,13 +112,9 @@ public:
         int linkedFiberCount = 0;
         // Number of branch links on this fiber still awaiting review approval.
         int pendingLinkCount = 0;
-        // Interpolation provenance of the stored geometry plus the human
-        // review state carried by the interp_unreviewed tag; traceVerified
-        // is derived (traced geometry without the tag has been reviewed).
+        // Interpolation provenance of the stored geometry (see deriveTraceState).
         vc3d::line_annotation::FiberTraceState traceState =
             vc3d::line_annotation::FiberTraceState::Legacy;
-        bool traceNeedsReview = false;
-        bool traceVerified = false;
     };
 
     struct FiberSnapshotWithPath {
@@ -196,13 +192,6 @@ public:
     void exportFibers();
     void setFiberManualHvTag(uint64_t fiberId, const QString& tag);
     void setFiberTag(uint64_t fiberId, const QString& tag, bool enabled);
-    // Marks a traced fiber reviewed (removes interp_unreviewed) or flags
-    // it for review (re-adds it) and saves. Rejects untraced fibers; the
-    // generic tag paths refuse to touch the reserved tag. The batch form
-    // refreshes fiber summaries once instead of per fiber.
-    void setFiberTraceReviewed(uint64_t fiberId, bool verified);
-    void setFibersTraceReviewed(const std::vector<uint64_t>& fiberIds,
-                                bool verified);
     void recalculateFiberHvClassification(uint64_t fiberId);
     void recalculateAllFiberHvClassifications();
     void calculateFiberAlignmentMetrics();
@@ -570,10 +559,6 @@ private:
     [[nodiscard]] QString fiberHvDirectionTag(uint64_t fiberId) const;
     // Pushes the H/V tag and the clickable tag buttons to the pane's dialog.
     void pushFiberUiState(const PaneRecord& pane) const;
-    // Shared body of setFiberTraceReviewed / setFibersTraceReviewed: tag
-    // change + save + pane sync WITHOUT the summary emission. Returns
-    // whether anything changed.
-    bool applyFiberTraceReview(uint64_t fiberId, bool verified);
     [[nodiscard]] std::optional<std::string> pickDataset(QWidget* parent,
                                                           const std::filesystem::path& startDir) const;
     [[nodiscard]] OptimizationTaskResult runOptimizationTask(std::filesystem::path manifestPath,
@@ -667,6 +652,10 @@ private:
     [[nodiscard]] bool confirmLinkedControlPointEdit(const LineAnnotationSession& session,
                                                      int controlPointIndex,
                                                      const QString& action) const;
+    [[nodiscard]] bool confirmLinkedControlPointEdits(
+        const LineAnnotationSession& session,
+        const std::vector<size_t>& controlPointIndices,
+        const QString& action) const;
     [[nodiscard]] bool controlPointHasBranch(const LineAnnotationSession& session,
                                              int controlPointIndex) const;
     std::vector<uint64_t> syncBranchEndpointPositions(LineAnnotationSession& session);

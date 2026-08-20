@@ -203,11 +203,16 @@ bool VolumeAttachmentController::start(
             try {
                 const std::string location = request.location.toStdString();
                 if (vc::project::isLocationRemote(location)) {
+                    const bool anonymous = std::find(
+                        request.tags.begin(), request.tags.end(),
+                        vc::project::kAnonymousRemoteAuthTag) !=
+                        request.tags.end();
                     result.volume = Volume::NewFromUrl(
                         location,
                         request.remoteCacheRoot.toStdString(),
-                        request.auth,
-                        vc::project::volumeMetadataFromEntryTags(request.tags));
+                        anonymous ? vc::HttpAuth{} : request.auth,
+                        vc::project::volumeMetadataFromEntryTags(request.tags),
+                        !anonymous);
                 } else {
                     result.volume = Volume::New(std::filesystem::path(location));
                 }

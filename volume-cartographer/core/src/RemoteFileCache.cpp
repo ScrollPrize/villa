@@ -137,7 +137,9 @@ struct RemoteClientDetails {
     std::string region;
 };
 
-RemoteClientDetails makeRemoteClientDetails(const vc::ResolvedUrl& endpoint, const vc::HttpAuth& explicitAuth)
+RemoteClientDetails makeRemoteClientDetails(const vc::ResolvedUrl& endpoint,
+                                            const vc::HttpAuth& explicitAuth,
+                                            bool discoverAwsCredentials)
 {
     RemoteClientDetails details;
     details.config.transfer_timeout = std::chrono::seconds{60};
@@ -145,7 +147,8 @@ RemoteClientDetails makeRemoteClientDetails(const vc::ResolvedUrl& endpoint, con
     details.config.max_retries = 2;
     details.config.aws_auth = explicitAuth;
     details.isS3 = endpoint.useAwsSigv4;
-    if (details.isS3 && details.config.aws_auth.empty())
+    if (details.isS3 && details.config.aws_auth.empty() &&
+        discoverAwsCredentials)
         details.config.aws_auth = vc::loadAwsCredentials();
     if (details.isS3 && details.config.aws_auth.region.empty())
         details.config.aws_auth.region = endpoint.awsRegion;
@@ -232,10 +235,14 @@ std::string fetchFailureMessage(const std::string& sourceLocation, const vc::Res
     return message;
 }
 
-void defaultFetch(const std::string& sourceLocation, const std::filesystem::path& temporaryPath, const vc::HttpAuth& explicitAuth)
+void defaultFetch(const std::string& sourceLocation,
+                  const std::filesystem::path& temporaryPath,
+                  const vc::HttpAuth& explicitAuth,
+                  bool discoverAwsCredentials)
 {
     const auto endpoint = vc::resolveRemoteUrl(sourceLocation);
-    auto details = makeRemoteClientDetails(endpoint, explicitAuth);
+    auto details = makeRemoteClientDetails(
+        endpoint, explicitAuth, discoverAwsCredentials);
     utils::HttpClient client(std::move(details.config));
     const auto response = client.get(endpoint.httpsUrl);
     if (!response.ok())
@@ -380,7 +387,8 @@ RemoteFileCacheResult cacheRemoteFile(const std::string& sourceLocation, const R
             if (options.fetcher)
                 options.fetcher(sourceLocation, tmp);
             else
-                defaultFetch(sourceLocation, tmp, options.auth);
+                defaultFetch(sourceLocation, tmp, options.auth,
+                             options.discoverAwsCredentials);
             if (!std::filesystem::is_regular_file(tmp))
                 throw std::runtime_error("remote file fetcher did not create its temporary file");
             temporarySidecar = writeTemporarySidecar(payload, tmp, source, options.accounting);

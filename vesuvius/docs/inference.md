@@ -27,7 +27,8 @@ vesuvius.predict \
 | Argument | Description |
 |----------|-------------|
 | `--model_path` (required) | Path to a model directory, a `.pth` checkpoint, or `hf://` repository.
-| `--input_dir` (required) | Volume input: Zarr root, TIFF stack, or a directory understood by the `Volume` helper.
+| `--input_dir` (required) | Volume input: Zarr root, TIFF stack, or a directory understood by the `Volume` helper. For open data use the `s3://` access root the catalog publishes, together with `--input_anon`.
+| `--input_anon` | Read the input bucket anonymously. Required for `s3://vesuvius-challenge-open-data/...`, which is public but unsigned.
 | `--output_dir` (required) | Destination folder for logits (`logits_part_{id}.zarr`) and coordinates.
 | `--input_format` | Force `zarr`, `tiff`, or `volume` detection. Usually optional.
 | `--tta_type` / `--disable_tta` | Choose `rotation` (default) or `mirroring`, or disable test-time augmentation.
@@ -68,7 +69,7 @@ and either bound may be omitted to reach the volume edge:
 
 ```bash
 vesuvius.predict --model_path hf://scrollprize/surface_recto \
-    --input_dir https://vesuvius-challenge-open-data.s3.amazonaws.com/PHercParis4/volumes/<volume>.zarr \
+    --input_dir s3://vesuvius-challenge-open-data/PHercParis4/volumes/<volume>.zarr --input_anon \
     --output_dir /tmp/logits \
     --bbox "2000:2200,1000:1200,1000:1200"
 

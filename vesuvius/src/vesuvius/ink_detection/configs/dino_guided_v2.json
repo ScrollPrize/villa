@@ -1,0 +1,89 @@
+{
+  "description": "DINO-guided v2 (W&B af3pga3d): full-state continuation of v1 with the same frozen U-Net × DINO labels and an added strict raw-intensity > 50 foreground gate.",
+  "mode": "full_3d",
+  "model_type": "unet",
+  "model_config": {
+    "autoconfigure": true,
+    "z_projection_mode": "none"
+  },
+  "targets": {
+    "ink": {
+      "activation": "none",
+      "out_channels": 1,
+      "z_projection_mode": "none"
+    }
+  },
+  "in_channels": 1,
+  "patch_size": [256, 256, 256],
+  "patch_overlap": 0.5,
+  "patch_min_labeled_coverage": 0.02,
+  "patch_finding_scale": 4,
+  "full_3d": {
+    "projection_half_thickness": 3
+  },
+  "image_normalization": "percentile_minmax",
+  "loss": {
+    "terms": [
+      {
+        "name": "LabelSmoothedDCAndBCELoss",
+        "metric_name": "base",
+        "weight": 1.0,
+        "weight_ce": 1.0,
+        "weight_dice": 1.0,
+        "bce_label_smoothing": 0.1,
+        "dice_label_smoothing": 0.1
+      }
+    ]
+  },
+  "optimizer": "sgd",
+  "learning_rate": 0.01,
+  "weight_decay": 0.00003,
+  "optimizer_momentum": 0.99,
+  "optimizer_nesterov": true,
+  "scheduler": {"name": "diffusers_cosine_warmup"},
+  "warmup_steps": 5000,
+  "ema": {
+    "enabled": true,
+    "decay": 0.9995,
+    "start_step": 1000,
+    "update_every_steps": 1,
+    "validate": true,
+    "save_in_checkpoint": true
+  },
+  "checkpoint": "/path/to/runs/dino-guided-v1/ckpt_063001.pth",
+  "weights_only": false,
+  "dynamic_label": {
+    "enabled": true,
+    "kind": "dino_guided",
+    "unet_ckpt": "/path/to/runs/dino-guided-v1/ckpt_063001.pth",
+    "dino_ckpt": "/path/to/checkpoints/dinovol/checkpoint_step_352500_paris4.pt",
+    "ref_embedding": "/path/to/checkpoints/dinovol/avg_ref_embedding.npy",
+    "dino_stride": 128,
+    "dino_minibatch": 16,
+    "dino_blend_sigma": 4.0,
+    "threshold": 0.5,
+    "input_mask_threshold": 50
+  },
+  "mixed_precision": "bf16",
+  "batch_size": 2,
+  "num_iterations": 77001,
+  "max_steps": 250000,
+  "save_iterations": [64001, 77001],
+  "seed": 27,
+  "save_every": 1000,
+  "val_every": 200,
+  "val_steps": 8,
+  "dataloader_workers": 8,
+  "prefetch_factor": 8,
+  "stitch_factor": 1,
+  "use_stitched_forward": false,
+  "stitched_gradient_checkpointing": true,
+  "out_dir": "/path/to/runs/dino-guided-v2",
+  "datasets": [
+    {
+      "segments_path": "/path/to/ink-dataset/phercparis4",
+      "volume_path": "/path/to/volumes/phercparis4.zarr",
+      "volume_scale": 0
+    }
+  ]
+}

@@ -1,8 +1,23 @@
+import inspect
 import json
 
 import pytest
 
-from config import Config
+from config import Config, FitConfig, MODEL_STAGE_KEYS, rebuild_stage
+
+
+def test_fit_config_wraps_a_resolved_mapping_with_dict_style_access():
+    values = Config().as_dict()
+    fit_config = FitConfig(values)
+    assert fit_config["optimizer_random_seed"] == values["optimizer_random_seed"]
+    assert fit_config.get("missing_key", 42) == 42
+    assert "optimizer_random_seed" in fit_config
+    assert dict(fit_config) == values
+
+    fit_config.update({"optimizer_random_seed": 7})
+    assert fit_config["optimizer_random_seed"] == 7
+    # Construction copied the mapping: the caller's dict is untouched.
+    assert values["optimizer_random_seed"] == 1
 
 
 def test_catalog_is_complete_and_presets_are_resolved():
@@ -14,8 +29,7 @@ def test_catalog_is_complete_and_presets_are_resolved():
 
 def test_every_key_has_generated_metadata():
     catalog = Config.catalog()
-    required = {
-        "type", "nullable", "label", "runtime_impact", "dependencies"}
+    required = {"type", "nullable", "label", "runtime_impact"}
     for key, field in catalog["schema"]["fields"].items():
         assert required <= set(field)
         assert field["label"] == key.split("_", 1)[1].replace("_", " ").title()
@@ -35,22 +49,29 @@ def test_interactive_runtime_impacts_match_resident_capabilities():
     for key, field in fields.items():
         if key.startswith("patch_"):
             expected = (
-                "prepared_input_rebuild"
-                if key == "patch_erode_patches" else "run_boundary")
+                "new_fit"
+                if key in {"patch_erode_patches", "patch_uuid_filter_regex"}
+                else "run_boundary")
             assert field["runtime_impact"] == expected
         if key.startswith("dense_"):
             expected = (
-                "prepared_input_rebuild"
+                "new_fit"
                 if key == "dense_spacing_mode" else "run_boundary")
             assert field["runtime_impact"] == expected
         if key.startswith("dt_"):
             assert field["runtime_impact"] == "run_boundary"
         if key.startswith("shell_"):
-            assert field["runtime_impact"] == "shell_reload"
-    assert schema["paths"]["outer_shell"] == {
-        "runtime_impact": "shell_reload",
-        "dependencies": ["shell"],
-    }
+            expected = (
+                "new_fit"
+                if key in {"shell_num_theta_bins",
+                           "shell_table_smooth_sigma_z",
+                           "shell_table_smooth_sigma_theta",
+                           "shell_min_confidence"}
+                else "run_boundary")
+            assert field["runtime_impact"] == expected
+    # Input identities and shell-atlas construction are fixed for a resident
+    # session; ordinary shell loss settings remain run-mutable.
+    assert schema["paths"] == {}
 
     mutable_tracks = {
         "track_min_sample_spacing", "track_max_sample_spacing",
@@ -65,11 +86,54 @@ def test_interactive_runtime_impacts_match_resident_capabilities():
     }
     assert all(fields[key]["runtime_impact"] == "run_boundary"
                for key in mutable_tracks)
-    assert all(fields[key]["runtime_impact"] == "prepared_input_rebuild"
+    assert all(fields[key]["runtime_impact"] == "new_fit"
                for key in {
                    "track_crossing_precompute_max", "track_crossing_mode",
                    "track_exclusion_radius",
                })
+
+
+def test_rebuild_stage_is_model_only_for_the_allowlist():
+    assert rebuild_stage([]) == "model"
+    assert rebuild_stage(["model_num_flow_integration_steps"]) == "model"
+    assert rebuild_stage(["model_num_flow_integration_steps",
+                          "model_linear_z_resolution"]) == "model"
+    # One unlisted key in the set is enough to demand the whole build.
+    assert rebuild_stage(["model_num_flow_integration_steps",
+                          "z_begin"]) == "all"
+    assert rebuild_stage(["optimizer_random_seed"]) == "all"
+    assert rebuild_stage(["model_flow_bounds_z_margin"]) == "all"
+    # Unaudited/unknown keys fail safe rather than raising.
+    assert rebuild_stage(["not_a_setting"]) == "all"
+
+
+def test_the_allowlist_is_a_subset_of_the_new_fit_settings():
+    fields = Config.catalog()["schema"]["fields"]
+    assert MODEL_STAGE_KEYS <= set(fields)
+    assert all(fields[key]["runtime_impact"] == "new_fit"
+               for key in MODEL_STAGE_KEYS)
+
+
+def test_no_allowlisted_key_is_named_while_loading_host_inputs():
+    # The mechanism behind the allowlist's promise: a model-stage rebuild
+    # retains whatever host preparation produced, so a key host preparation
+    # reads cannot be on the list. This is exactly the leak
+    # model_flow_bounds_z_margin (the host-side ShellPolarMap) and
+    # optimizer_random_seed (the host RNG seeding) would have introduced.
+    import fit_spiral
+
+    context = fit_spiral.FitContext
+    source = "".join(inspect.getsource(member) for member in (
+        context.load_host_inputs,
+        context._load_patches_from_dir,
+        context._prepare_patch_sampling_cache,
+        context._rebuild_pcl_sampling_strata,
+    ))
+    # The positive control: both keys the audit disqualified are named here,
+    # so a scan that stops matching fails rather than silently passing.
+    assert "model_flow_bounds_z_margin" in source
+    assert "optimizer_random_seed" in source
+    assert not [key for key in MODEL_STAGE_KEYS if key in source]
 
 
 def test_mapping_and_json_overrides_and_validation(tmp_path):
@@ -91,3 +155,12 @@ def test_mapping_and_json_overrides_and_validation(tmp_path):
         Config({"dense_spacing_pair_m_short": [1]})
     with pytest.raises(ValueError):
         Config({"track_max_tortuosity": "unlimited"})
+
+
+def test_obsolete_patch_sampling_fields_are_not_in_the_schema():
+    catalog = Config.catalog()
+    for key in ("patch_strip_sampling", "patch_2d_sampling_max_area"):
+        assert key not in catalog["defaults"]
+        assert key not in catalog["schema"]["fields"]
+        with pytest.raises(ValueError, match="Unknown"):
+            Config({key: "straight" if key.endswith("sampling") else 1.0})

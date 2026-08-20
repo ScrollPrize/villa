@@ -30,14 +30,14 @@ unwrap-frame change (see snap_patch_dt_target / snap_strip_dt_target).
 import numpy as np
 import torch
 
-from native_spiral import load_native_spiral_sampling
+from spiral_sampling import load_spiral_sampling
 from sample_spiral import (
     get_theta_and_radii,
     get_theta_crossing_step_adjustments,
 )
 
 
-_native_spiral_sampling = load_native_spiral_sampling()
+_spiral_sampling = load_spiral_sampling()
 
 
 class DtTargetCacheManager:
@@ -132,19 +132,33 @@ def strip_dt_target_in_sample_frame(
 
 def patch_dt_target_in_sample_frame(
     sample_radii, sample_ijs, sample_theta, sample_adjustments,
-    dr_per_winding, cache, patch_indices,
+    dr_per_winding, cache, patch_indices, sample_mask=None,
 ):
-    """Per-strip DT target winding for patch row/column strips; see strip_dt_target_in_sample_frame.
+    """Per-patch DT target winding for padded uniform 2D samples.
 
-    patch_indices (numpy or tensor; one cache row per sampled patch) is broadcast
-    over any leading sample dims (e.g. the row/column direction axis)."""
-    median_target = snap_dt_target(sample_radii.median(dim=-1, keepdim=True).values, dr_per_winding)
+    ``sample_mask`` excludes padding from both the median fallback and cache
+    anchor selection. ``patch_indices`` has one cache row per sampled patch and
+    is broadcast over any leading sample dimensions."""
+    if sample_mask is None:
+        sample_mask = torch.ones_like(sample_radii, dtype=torch.bool)
+    else:
+        sample_mask = torch.as_tensor(
+            sample_mask, dtype=torch.bool, device=sample_radii.device)
+    counts = sample_mask.sum(dim=-1).clamp(min=1)
+    sortable = torch.where(
+        sample_mask, sample_radii, torch.full_like(sample_radii, torch.inf))
+    sorted_radii = sortable.sort(dim=-1).values
+    median_idx = torch.div(counts - 1, 2, rounding_mode='floor')
+    sample_median = torch.gather(
+        sorted_radii, -1, median_idx[..., None])
+    median_target = snap_dt_target(sample_median, dr_per_winding)
     if cache is None:
         return median_target
     cache_idx = torch.as_tensor(patch_indices, dtype=torch.int64, device=sample_theta.device)
     cache_idx = torch.broadcast_to(cache_idx, sample_theta.shape[:-1])
     target, valid = snap_patch_dt_target(
-        sample_ijs, sample_theta, sample_adjustments, dr_per_winding, cache, cache_idx,
+        sample_ijs, sample_theta, sample_adjustments, dr_per_winding, cache,
+        cache_idx, sample_mask=sample_mask,
     )
     return torch.where(valid[..., None], target, median_target)
 
@@ -179,36 +193,43 @@ def snap_strip_dt_target(
 
     sample_local_idx (K, P) are the sampled points' within-strip indices,
     sample_theta / sample_adjustments (K, P) the loss sample's wrapped theta and
-    cumulative crossing adjustments (radius units), cache_idx (K,) the strip rows.
+    cumulative crossing adjustments (radius units), cache_idx the strip rows --
+    (K,) when a row samples a single strip, or (K, P) per-point when a row mixes
+    strips (a chain walk through a fiber-link component); the anchor is then the
+    row's best valid (point, cache) pair and the target comes from the anchor
+    point's strip.
     Returns (target (K, 1), valid (K,)); valid is False where the cache holds no
-    usable entry for the strip (strip_dt_target_in_sample_frame then falls back to the
-    snapped sample median).
+    usable entry for any of the row's strips (strip_dt_target_in_sample_frame then
+    falls back to the snapped sample median).
     """
-    valid = cache['valid'][cache_idx]
+    if cache_idx.dim() == 1:
+        cache_idx = cache_idx[:, None].expand_as(sample_local_idx)
+    point_valid = cache['valid'][cache_idx]  # (K, P)
+    valid = point_valid.any(dim=-1)
     keys = cache['keys']
     if keys.numel() == 0:
-        target = torch.zeros(*cache_idx.shape, 1, device=cache_idx.device, dtype=sample_theta.dtype)
+        target = torch.zeros(cache_idx.shape[0], 1, device=cache_idx.device, dtype=sample_theta.dtype)
         return target, torch.zeros_like(valid)
     # Composite keys (strip * key_scale + local index) are globally sorted, so the
     # nearest cached point of the right strip brackets each sample key's insertion
     # position; at least one bracket lies in the strip's own segment whenever the
     # strip has any cached points.
-    sample_keys = cache_idx[:, None] * cache['key_scale'] + sample_local_idx
+    sample_keys = cache_idx * cache['key_scale'] + sample_local_idx
     positions = torch.searchsorted(keys, sample_keys)
     candidates = torch.stack(
         [(positions - 1).clamp(min=0), positions.clamp(max=keys.numel() - 1)], dim=-1,
     )  # (K, P, 2)
     candidate_keys = keys[candidates]
-    same_strip = torch.div(candidate_keys, cache['key_scale'], rounding_mode='floor') == cache_idx[:, None, None]
+    same_strip = torch.div(candidate_keys, cache['key_scale'], rounding_mode='floor') == cache_idx[..., None]
     gaps = (candidate_keys - sample_keys[..., None]).abs()
-    gaps = gaps.masked_fill(~same_strip, torch.iinfo(torch.int64).max)
-    best = gaps.flatten(start_dim=1).argmin(dim=-1)  # closest sample/cache pair per strip
+    gaps = gaps.masked_fill(~same_strip | ~point_valid[..., None], torch.iinfo(torch.int64).max)
+    best = gaps.flatten(start_dim=1).argmin(dim=-1)  # closest sample/cache pair per row
     rows = torch.arange(best.shape[0], device=best.device)
     sample_anchor_idx = torch.div(best, 2, rounding_mode='floor')
     cache_anchor_idx = candidates.flatten(start_dim=1)[rows, best]
 
     target_winding = _transfer_target_through_anchor(
-        cache['target_relative'][cache_idx],
+        cache['target_relative'][cache_idx[rows, sample_anchor_idx]],
         sample_theta.detach()[rows, sample_anchor_idx],
         sample_adjustments[rows, sample_anchor_idx] / dr_per_winding.detach(),
         cache['theta'][cache_anchor_idx],
@@ -219,26 +240,31 @@ def snap_strip_dt_target(
 
 def snap_patch_dt_target(
     sample_ijs, sample_theta, sample_adjustments,
-    dr_per_winding, cache, cache_idx,
+    dr_per_winding, cache, cache_idx, sample_mask=None,
 ):
-    """Express cached patch targets in sampled-strip unwrap frames.
+    """Express cached patch targets in sampled-set unwrap frames.
 
-    Each sampled strip is anchored to its closest valid sparse cache point in UV
+    Each sampled set is anchored to its closest valid sparse cache point in UV
     space.  Only integer unwrap adjustments establish the frame correspondence;
     radii deliberately appear nowhere among the inputs, so real radial variation
     cannot shift the target by a winding.  Returns (target (..., 1), valid (...,));
     valid is False where the cache holds no usable entry for the patch, or where the
     nearest usable anchor is farther than the patch's anchor_dist_sq_limit in UV --
-    e.g. a strip sampled from a fragment disconnected from the main component --
+    e.g. a sample from a fragment disconnected from the main component --
     since the transfer's |dtheta| < pi assumption may fail across such a gap
     (patch_dt_target_in_sample_frame then falls back to the snapped sample median).
     """
     cache_ijs = cache['ijs'][cache_idx]
     cache_valid_points = cache['point_valid'][cache_idx]
     # (..., P, K): find the closest sample/cache pair, rather than committing to a
-    # particular point on the randomly sampled strip.
+    # particular point in the randomly sampled set.
     distances_sq = ((sample_ijs[..., :, None, :] - cache_ijs[..., None, :, :]) ** 2).sum(dim=-1)
     distances_sq = distances_sq.masked_fill(~cache_valid_points[..., None, :], float('inf'))
+    if sample_mask is not None:
+        sample_mask = torch.as_tensor(
+            sample_mask, dtype=torch.bool, device=distances_sq.device)
+        distances_sq = distances_sq.masked_fill(
+            ~sample_mask[..., :, None], float('inf'))
     num_cache_points = cache_ijs.shape[-2]
     anchor_dist_sq, nearest_flat = distances_sq.flatten(start_dim=-2).min(dim=-1)
     sample_anchor_idx = torch.div(nearest_flat, num_cache_points, rounding_mode='floor')
@@ -303,8 +329,8 @@ def prepare_patch_dt_target_samples(patches, num_points, max_stride_voxels):
         row_edges = np.linspace(r0, r1, nr + 1)
         col_edges = np.linspace(c0, c1, nc + 1)
         patch._dt_target_anchor_max_dist_sq = 4.0 * ((box_h / nr) ** 2 + (box_w / nc) ** 2)
-        if _native_spiral_sampling is not None:
-            prepared = _native_spiral_sampling.prepare_dt_samples(
+        if _spiral_sampling is not None:
+            prepared = _spiral_sampling.prepare_dt_samples(
                 np.ascontiguousarray(mask, dtype=bool),
                 np.ascontiguousarray(row_edges, dtype=np.int64),
                 np.ascontiguousarray(col_edges, dtype=np.int64),
@@ -347,8 +373,8 @@ def _unwrap_block_samples(theta, block_rc, block_shape):
     # offset relative to it, so callers must exclude them from pooling.
     num_samples = len(theta)
     nr, nc = block_shape
-    if _native_spiral_sampling is not None:
-        result = _native_spiral_sampling.unwrap_block_samples(
+    if _spiral_sampling is not None:
+        result = _spiral_sampling.unwrap_block_samples(
             np.ascontiguousarray(theta, dtype=np.float32),
             np.ascontiguousarray(block_rc, dtype=np.int32),
             int(nr),

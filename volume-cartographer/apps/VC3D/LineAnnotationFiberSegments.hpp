@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -114,6 +115,49 @@ struct LineControlPoint : vc::lasagna::LineControlPoint {
     explicit LineControlPoint(const vc::lasagna::LineControlPoint& value) : vc::lasagna::LineControlPoint(value) {}
 };
 
+struct ControlPointCollapseResult {
+    std::vector<LineControlPoint> controlPoints;
+    std::vector<size_t> oldToNewIndices;
+    std::vector<size_t> collapsedOldIndices;
+    std::vector<size_t> dirtySegmentIndices;
+    size_t replacementIndex = std::numeric_limits<size_t>::max();
+
+    [[nodiscard]] bool replacedExisting() const noexcept
+    {
+        return !collapsedOldIndices.empty();
+    }
+};
+
+[[nodiscard]] ControlPointCollapseResult collapseControlPointsAtClick(
+    const std::vector<LineControlPoint>& controls,
+    std::vector<size_t> collapsedIndices,
+    double clickedLinePosition,
+    const cv::Vec3d& clickedPoint);
+
+struct PreparedControlPointEdit {
+    std::vector<cv::Vec3d> linePoints;
+    std::vector<LineControlPoint> controlPointsBeforeLineUpdate;
+    std::vector<LineControlPoint> controlPoints;
+    std::vector<size_t> oldToNewIndices;
+    std::vector<size_t> collapsedOldIndices;
+    std::vector<size_t> dirtySegmentIndices;
+    size_t replacementIndex = std::numeric_limits<size_t>::max();
+    bool lineReconstructed = false;
+};
+
+[[nodiscard]] PreparedControlPointEdit prepareAutomaticControlPointEdit(
+    const std::vector<cv::Vec3d>& linePoints,
+    const std::vector<LineControlPoint>& controls,
+    std::vector<size_t> collapsedIndices,
+    double clickedLinePosition,
+    const cv::Vec3d& clickedPoint,
+    const vc::lasagna::NormalSampler& sampler,
+    const vc::lasagna::LineOptimizationConfig& config);
+
+[[nodiscard]] cv::Vec3d lineTangentAtPosition(
+    const std::vector<cv::Vec3d>& linePoints,
+    double linePosition);
+
 struct StoredControlPoint : cv::Vec3d {
     std::optional<FiberTraceSegmentMetadata> segmentToNext;
 
@@ -121,14 +165,11 @@ struct StoredControlPoint : cv::Vec3d {
     explicit StoredControlPoint(const cv::Vec3d& position) : cv::Vec3d(position) {}
 };
 
-// Review workflow for prediction-traced geometry: a fiber whose saved line
-// contains accepted native-trace spans must be inspected by a human before
-// it counts as trustworthy. The tag lives in the ordinary fiber tags array
-// (mirrored in scripts/fiber_merge.py) and is applied automatically
-// whenever freshly optimized geometry contains trace spans; a traced fiber
-// WITHOUT it counts as reviewed, so review state changes only through the
-// dedicated review actions, never the generic tag controls.
-inline constexpr const char* kTraceNeedsReviewTag = "interp_unreviewed";
+// Ordinary free-form fiber tag carrying the human review verdict; also the
+// default publish gate of scripts/vc_sync.py hfsync — keep the literal in
+// sync. A toolbar interpolation-mode switch strips it on the save after a
+// successful re-optimization; nothing else touches it programmatically.
+inline constexpr const char* kReviewedTag = "reviewed";
 
 enum class FiberTraceState {
     Legacy,       // no prediction-traced spans in the stored geometry
@@ -144,11 +185,6 @@ enum class FiberTraceState {
 [[nodiscard]] FiberTraceState deriveTraceState(
     FiberOptimizationMode mode,
     const std::vector<StoredControlPoint>& controls) noexcept;
-
-// Tag transition after a geometry-changing optimization was saved: traced
-// geometry demands a (new) review, un-traced geometry leaves the review
-// workflow entirely. Keeps the tags vector sorted and unique.
-void applyTraceReviewTags(std::vector<std::string>& tags, bool hasTraceSpans);
 
 struct FiberExtrapolationFallbackDiagnostic {
     enum class Side {

@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "model_id": "synthetic-data-reads-v1",
+  "source": "synthetic thread-pool calibration only",
+  "renderer_inputs_used": false,
+  "timing_claims_enabled": false,
+  "score_semantics": "relative modeled runtime, not absolute wall time",
+  "cross_thread_release_ns": 3157.1798928563853,
+  "event_cost_model": {
+    "feature_names": [
+      "non_data_instructions",
+      "data_reads",
+      "data_writes",
+      "l1_data_misses",
+      "last_level_data_misses",
+      "branch_misses",
+      "branch_weighted_l1_misses"
+    ],
+    "coefficients_ns": [
+      0.0682424946141637,
+      0.08722409382639101,
+      0.07965943313753411,
+      0.1010390740046069,
+      0.057354535242114466,
+      6.95596634721648,
+      56.8285555220827
+    ],
+    "stall_overlap_fraction": 0.0
+  },
+  "replay": {
+    "workers": 4,
+    "cores": 5,
+    "tie_policy": "fifo",
+    "split_policy": "equal",
+    "residual_fraction": 0.5,
+    "wake_latency_ns": 0.0,
+    "replay_idle_scale": 1.0,
+    "dependency_excess_scale": 1.0
+  }
+}

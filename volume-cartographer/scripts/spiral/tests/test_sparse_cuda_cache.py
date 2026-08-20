@@ -1,9 +1,16 @@
+import json
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
 import zarr
 
+import lasagna_data
 from pack_resident_pools import pack_arrays, sidecar_path
+from lasagna_data import ensure_fit_sparse_stores
 from sdt_losses import sample_sdt_trilinear
 from sparse_cuda_cache import ResidentBrickPool, SparseScalarStore
 
@@ -23,6 +30,142 @@ def make_pool(tmp_path, arrays, name, **kwargs):
              for i, a in enumerate(arrays)]
     out = pack_arrays(paths, sidecar_path(paths[0], '0'), label=name)
     return ResidentBrickPool(out, device='cpu', label=name, **kwargs)
+
+
+def write_raw_pack_source(path, data):
+    """Write the minimal uncompressed Zarr v2 array consumed by the packer."""
+    path.mkdir(parents=True)
+    (path / '.zarray').write_text(json.dumps({
+        'zarr_format': 2,
+        'shape': list(data.shape),
+        'chunks': list(data.shape),
+        'dtype': '|u1',
+        'compressor': None,
+        'fill_value': 0,
+        'order': 'C',
+        'filters': None,
+        'dimension_separator': '.',
+    }))
+    (path / '0.0.0').write_bytes(data.tobytes())
+
+
+class RecordingProgress:
+    def __init__(self):
+        self.begins = []
+        self.updates = []
+        self.finishes = []
+
+    def begin(self, operation, stage_name, **kwargs):
+        self.begins.append((operation, stage_name, kwargs))
+
+    def update(self, step=None, **kwargs):
+        self.updates.append((step, kwargs))
+
+    def finish(self, detail=None):
+        self.finishes.append(detail)
+
+
+def test_fit_builds_missing_sparse_stores_and_reports_progress(tmp_path):
+    shape = (16, 16, 16)
+    data = np.ones(shape, dtype=np.uint8)
+    nx = tmp_path / 'nx.ome.zarr'
+    ny = tmp_path / 'ny.ome.zarr'
+    grad = tmp_path / 'grad.ome.zarr'
+    sdt = tmp_path / 'sdt.ome.zarr'
+    for root in (nx, ny, grad):
+        write_raw_pack_source(root / '4', data)
+    write_raw_pack_source(sdt / '1', data)
+
+    progress = RecordingProgress()
+    kwargs = dict(
+        use_normals=True,
+        use_spacing=True,
+        use_sdt=True,
+        normal_nx_zarr_path=str(nx),
+        normal_ny_zarr_path=str(ny),
+        grad_mag_zarr_path=str(grad),
+        normal_zarr_group='4',
+        sdt_zarr_path=str(sdt),
+        sdt_zarr_group='1',
+        progress=progress,
+    )
+    ensure_fit_sparse_stores(**kwargs)
+
+    expected = [
+        sidecar_path(str(nx), '4', pair=True),
+        sidecar_path(str(grad), '4'),
+        sidecar_path(str(sdt), '1'),
+    ]
+    assert all((Path(path) / 'meta.json').is_file() for path in expected)
+    assert [stage for _, stage, _ in progress.begins] == [
+        'Building Lasagna normal sparse store',
+        'Building Lasagna gradient sparse store',
+        'Building surface-distance sparse store',
+    ]
+    assert len(progress.finishes) == 3
+    assert progress.updates
+    assert all(update[1]['total_steps'] > 0 for update in progress.updates)
+
+    # Complete sidecars are reused on subsequent fits without another build.
+    event_counts = (len(progress.begins), len(progress.updates),
+                    len(progress.finishes))
+    ensure_fit_sparse_stores(**kwargs)
+    assert event_counts == (len(progress.begins), len(progress.updates),
+                            len(progress.finishes))
+
+
+def test_missing_sparse_store_uses_windows_file_lock(tmp_path, monkeypatch):
+    sidecar = tmp_path / 'pool'
+    lock_calls = []
+    fake_msvcrt = SimpleNamespace(
+        LK_LOCK=1,
+        LK_UNLCK=2,
+        locking=lambda _fd, mode, length: lock_calls.append((mode, length)),
+    )
+    monkeypatch.setitem(sys.modules, 'msvcrt', fake_msvcrt)
+    monkeypatch.setattr(lasagna_data, 'fcntl', None)
+
+    def fake_pack_arrays(_array_dirs, out_dir, **_kwargs):
+        Path(out_dir).mkdir()
+        (Path(out_dir) / 'meta.json').write_text('{}')
+
+    monkeypatch.setattr(lasagna_data, 'pack_arrays', fake_pack_arrays)
+
+    result = lasagna_data._ensure_sidecar(
+        [], str(sidecar), label='test', stage_name='test')
+
+    assert result == str(sidecar)
+    assert lock_calls == [(fake_msvcrt.LK_LOCK, 1),
+                          (fake_msvcrt.LK_UNLCK, 1)]
+    assert Path(f'{sidecar}.lock').read_bytes() == b'\0'
+
+
+def test_pack_progress_callback_uses_console_report_cadence(tmp_path):
+    source = tmp_path / 'source'
+    source.mkdir()
+    (source / '.zarray').write_text(json.dumps({
+        'zarr_format': 2,
+        'shape': [32, 16, 16],
+        'chunks': [16, 16, 16],
+        'dtype': '|u1',
+        'compressor': None,
+        'fill_value': 0,
+        'order': 'C',
+        'filters': None,
+        'dimension_separator': '.',
+    }))
+    chunk = np.ones((16, 16, 16), dtype=np.uint8).tobytes()
+    (source / '0.0.0').write_bytes(chunk)
+    (source / '1.0.0').write_bytes(chunk)
+    updates = []
+
+    pack_arrays(
+        [str(source)], str(tmp_path / 'pool'), label='test',
+        progress_callback=lambda current, total, detail: updates.append(
+            (current, total, detail)),
+    )
+
+    assert [current for current, _, _ in updates] == [0, 2]
 
 
 def test_gather_matches_dense_multichannel(tmp_path):

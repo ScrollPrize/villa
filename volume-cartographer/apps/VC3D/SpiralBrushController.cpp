@@ -947,7 +947,8 @@ bool SpiralBrushController::eventFilter(QObject* watched, QEvent* event)
             beginPolyline(devicePos);
             return _dragMode == DragMode::Polyline;
         }
-        if (mouse->button() == Qt::RightButton && mouse->modifiers() == Qt::ControlModifier) {
+        if (mouse->button() == Qt::RightButton &&
+            mouse->modifiers() == (Qt::ControlModifier | Qt::ShiftModifier)) {
             beginErase(devicePos);
             return _dragMode == DragMode::Erase;
         }
