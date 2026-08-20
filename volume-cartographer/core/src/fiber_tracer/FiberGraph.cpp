@@ -174,10 +174,10 @@ const FiberletStorageKey& targetAnchor(const DirectedFiberletStorageId& id)
 
 cv::Vec3f sourceArcStartDirection(const FiberletReplaySourceArc& arc)
 {
-    if (arc.pointsBaseXYZ.size() < 2)
-        throw std::invalid_argument("fiberlet replay source arc is too short");
-    const cv::Vec3d direction = arc.pointsBaseXYZ[1] - arc.pointsBaseXYZ[0];
-    return normalized(cv::Vec3f(direction));
+    const auto direction = normalized(arc.startStepBaseXYZ);
+    if (!(length(direction) > kFloatEpsilon))
+        throw std::invalid_argument("fiberlet replay source arc has no start tangent");
+    return direction;
 }
 
 struct SourceRouteCandidate {
@@ -349,15 +349,31 @@ public:
             throw std::out_of_range("fiberlet replay arc is absent");
         const auto numericArc = found->second;
         const auto& edge = graph_.edges.at(arcEdge(numericArc));
-        return {
-            id,
-            sourceAnchor(id),
-            targetAnchor(id),
-            orientedArcPoints(graph_, numericArc),
-            edge.pathLengthPredictionVoxels,
-            edge.cost,
-            edge.candidateIndex,
-            numericArc};
+        const auto points = orientedArcPoints(graph_, numericArc);
+        if (points.size() < 2)
+            throw std::invalid_argument("fiberlet replay source arc is too short");
+        FiberletReplaySourceArc result;
+        result.id = id;
+        result.source = sourceAnchor(id);
+        result.target = targetAnchor(id);
+        result.sourcePositionBaseXYZ = points.front();
+        result.targetPositionBaseXYZ = points.back();
+        result.startStepBaseXYZ = cv::Vec3f(points[1] - points[0]);
+        result.endStepBaseXYZ = cv::Vec3f(points.back() - points[points.size() - 2]);
+        result.pathLengthPredictionVoxels = edge.pathLengthPredictionVoxels;
+        result.cost = edge.cost;
+        result.diagnosticCandidateIndex = edge.candidateIndex;
+        result.diagnosticArcIndex = numericArc;
+        return result;
+    }
+
+    std::vector<cv::Vec3d> routePoints(
+        const DirectedFiberletStorageId& id) const override
+    {
+        const auto found = arcById_.find(id);
+        if (found == arcById_.end())
+            throw std::out_of_range("fiberlet replay arc is absent");
+        return orientedArcPoints(graph_, found->second);
     }
 
     std::optional<FiberletReplaySourceTransition> transition(
@@ -798,7 +814,9 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
                 break;
             const auto arcId = selected->arcs.front();
             const auto edge = graph.arc(arcId);
-            const auto& points = edge.pointsBaseXYZ;
+            const auto points = graph.routePoints(arcId);
+            if (points.size() < 2)
+                throw std::logic_error("selected fiberlet route is too short");
             const size_t candidateIndex = edge.diagnosticCandidateIndex.value_or(
                 stableIndex(candidateIndices, arcId.fiberlet));
             const size_t arcIndex = edge.diagnosticArcIndex.value_or(
@@ -852,16 +870,15 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
             segment.edgeCost += edge.cost;
             segment.totalLoss += edge.cost.total();
             if (incomingArc.has_value()) {
-                const auto incomingView = graph.arc(*incomingArc);
-                const auto join = graph.transition(incomingView, edge);
-                if (!join.has_value())
+                if (selected->transitions.empty())
                     throw std::logic_error("selected fiberlet route has no graph transition");
+                const auto& join = selected->transitions.front();
                 const size_t transitionIndexValue =
-                    join->diagnosticTransitionIndex.value_or(stableIndex(
+                    join.diagnosticTransitionIndex.value_or(stableIndex(
                         transitionIndices, std::pair{*incomingArc, arcId}));
                 segment.transitionIndices.push_back(transitionIndexValue);
-                segment.transitionCost += join->cost;
-                segment.totalLoss += join->cost.total();
+                segment.transitionCost += join.cost;
+                segment.totalLoss += join.cost.total();
             }
             segment.pathLengthPredictionVoxels += edge.pathLengthPredictionVoxels;
             if (!terminalPartialEdge) {

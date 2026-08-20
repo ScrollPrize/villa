@@ -21,6 +21,11 @@
   prepared candidates on their search workers. On the measured Paris4 chunk
   `107,34,45`, generation wall fell from 34.795 to 4.344 seconds while prefix
   and route cache payloads remained byte-identical.
+- Stored decoded anchor, prefix, and route objects directly in the existing
+  lease-aware `ChunkCache` LRU. Prefix chunks build one charged incident index,
+  lookahead uses exact endpoint descriptors, and route geometry is loaded only
+  for committed edges. A cache-warm 100-base-voxel Paris4 replay fell from a
+  17.13-second median to 0.20 seconds with byte-identical output.
 
 # 2026-08-19: float final anchor support reduction
 

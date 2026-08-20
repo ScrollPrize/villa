@@ -1,21 +1,19 @@
-# Task: reliable and parallel on-demand fiber replay
+# Task: cache decoded fiberlet graph chunks
 
-Make `vc_fiberlets fiberlet-replay` progress coherent across greedy restart
-segments: distinguish local native-trace steps and their safety budget from
-global reference progress, and identify the current replay segment/restart.
+Fix on-demand fiberlet replay so the existing `ChunkCache` and its LRU own the
+decoded, indexed anchor and fiberlet chunk representations.
 
-Fix the observed post-greedy on-demand replay stall. Cache waits remain ordinary
-blocking waits; the generation scheduler itself must always reach completion or
-return the exact chunk key and underlying error. Do not add polling,
-heartbeats, or timeout-based recovery.
-
-Use the configured worker count for the expensive work inside one on-demand
-fiberlet chunk. Preserve deterministic candidate ordering and numerical
-results.
-
-Report replay and cache preprocessing on one monotone global reference-arc
-basis. Restart-local native steps may be shown only as explicitly local
-diagnostics. Report explicit terminal state for greedy and fiberlet evaluators.
-
-Reproduce and validate against the full Paris4 reference and existing sparse
-anchor/fiberlet cache that produced the final visible `step=300/1055` line.
+- Keep anchors and fiberlets in separate caches with independent local limits
+  and their existing shared decoded-byte budget.
+- A cache miss may read or generate serialized storage, but it must decode and
+  index the chunk once before publishing the cache entry.
+- A cache hit must return a lease to the decoded chunk. Graph queries must not
+  deserialize whole chunks per anchor, edge, or beam candidate.
+- Incident-edge lookup must prefetch the complete neighboring owner-chunk halo
+  through the fiberlet cache, then use per-chunk endpoint indices.
+- Beam lookahead must use cached prefix/connectivity data only. The separate
+  route level in the fiberlet cache is loaded for the committed edge, not every
+  candidate expansion.
+- The existing cache LRU must account for and evict the decoded objects. Do not
+  add a second graph or fiberlet LRU.
+- Preserve stable ordering, costs, replay choices, and numeric behavior.

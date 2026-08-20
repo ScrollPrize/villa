@@ -41,6 +41,27 @@ FiberletGraphQuery<T> chunkFailure(const vc::render::ChunkResult& chunk)
     return result;
 }
 
+template <typename Payload, typename Query>
+std::shared_ptr<const Payload> chunkPayload(
+    const vc::render::ChunkResult& chunk, Query& result)
+{
+    if (chunk.status != vc::render::ChunkStatus::Data || !chunk.payload) {
+        result.status = chunk.status == vc::render::ChunkStatus::MissQueued
+            ? FiberletGraphQueryStatus::Pending
+            : FiberletGraphQueryStatus::Error;
+        result.error = chunk.status == vc::render::ChunkStatus::Error
+            ? chunk.error
+            : "required generated fiberlet chunk has no decoded payload";
+        return {};
+    }
+    auto payload = std::dynamic_pointer_cast<const Payload>(chunk.payload);
+    if (!payload) {
+        result.status = FiberletGraphQueryStatus::Error;
+        result.error = "generated fiberlet chunk has the wrong decoded payload type";
+    }
+    return payload;
+}
+
 float vectorLength(const cv::Vec3f& value)
 {
     return std::sqrt(value.dot(value));
@@ -171,6 +192,7 @@ FiberletGraphQuery<FiberletIncidentLease> FiberletChunkGraphSource::incidentEdge
 {
     FiberletGraphQuery<FiberletIncidentLease> result;
     const auto keys = incidentOwnerChunks(anchorKey);
+    fiberletCache_->prefetchChunks(keys, blocking);
     std::vector<vc::render::ChunkResult> chunks;
     chunks.reserve(keys.size());
     bool pending = false;
@@ -178,7 +200,7 @@ FiberletGraphQuery<FiberletIncidentLease> FiberletChunkGraphSource::incidentEdge
         auto chunk = fetchChunk(fiberletCache_, key, blocking);
         if (chunk.status == vc::render::ChunkStatus::MissQueued) {
             pending = true;
-        } else if (chunk.status != vc::render::ChunkStatus::Data || !chunk.bytes) {
+        } else if (chunk.status != vc::render::ChunkStatus::Data || !chunk.payload) {
             return chunkFailure<FiberletIncidentLease>(chunk);
         }
         chunks.push_back(std::move(chunk));
@@ -187,15 +209,13 @@ FiberletGraphQuery<FiberletIncidentLease> FiberletChunkGraphSource::incidentEdge
         result.status = FiberletGraphQueryStatus::Pending;
         return result;
     }
-    for (auto& chunk : chunks) {
-        auto decoded = deserializeFiberletPrefixes(*chunk.bytes);
-        for (const auto& prefix : decoded.prefixes) {
-            if (prefix.id.first == anchorKey)
-                result.value.edges.push_back({{prefix.id, false}, prefix});
-            else if (prefix.id.second == anchorKey)
-                result.value.edges.push_back({{prefix.id, true}, prefix});
-        }
-        result.value.payloadLeases.push_back(std::move(chunk.bytes));
+    for (const auto& chunk : chunks) {
+        auto payload = chunkPayload<FiberletPrefixChunkPayload>(chunk, result);
+        if (!payload)
+            return result;
+        for (auto&& incident : payload->incident(anchorKey))
+            result.value.edges.push_back({incident.id, std::move(incident.prefix)});
+        result.value.payloadLeases.push_back(std::move(payload));
     }
     std::sort(result.value.edges.begin(), result.value.edges.end(), [](const auto& left, const auto& right) { return left.id < right.id; });
     const auto duplicate = std::adjacent_find(result.value.edges.begin(), result.value.edges.end(), [](const auto& left, const auto& right) {
@@ -215,21 +235,18 @@ FiberletGraphQuery<FiberletAnchorLease> FiberletChunkGraphSource::anchor(const F
 {
     const auto key = ownerChunk(anchorKey, 0);
     auto chunk = fetchChunk(anchorCache_, key, blocking);
-    if (chunk.status != vc::render::ChunkStatus::Data || !chunk.bytes)
-        return chunkFailure<FiberletAnchorLease>(chunk);
-    auto decoded = deserializeFiberletAnchors(*chunk.bytes);
-    const auto found = std::lower_bound(decoded.anchors.begin(), decoded.anchors.end(), anchorKey, [](const auto& candidate, const auto& value) {
-        return candidate.key < value;
-    });
-    if (found == decoded.anchors.end() || found->key != anchorKey) {
-        FiberletGraphQuery<FiberletAnchorLease> result;
+    FiberletGraphQuery<FiberletAnchorLease> result;
+    auto payload = chunkPayload<FiberletAnchorChunkPayload>(chunk, result);
+    if (!payload)
+        return result;
+    const auto* found = payload->find(anchorKey);
+    if (!found) {
         result.status = FiberletGraphQueryStatus::Error;
         result.error = "fiberlet graph endpoint anchor is absent from its owner chunk";
         return result;
     }
-    FiberletGraphQuery<FiberletAnchorLease> result;
     result.status = FiberletGraphQueryStatus::Ready;
-    result.value.payloadLease = std::move(chunk.bytes);
+    result.value.payloadLease = std::move(payload);
     result.value.anchor = *found;
     return result;
 }
@@ -243,13 +260,69 @@ FiberletGraphQuery<FiberletAnchorChunkLease> FiberletChunkGraphSource::anchorsIn
         return result;
     }
     auto chunk = fetchChunk(anchorCache_, key, blocking);
-    if (chunk.status != vc::render::ChunkStatus::Data || !chunk.bytes)
-        return chunkFailure<FiberletAnchorChunkLease>(chunk);
-    auto decoded = deserializeFiberletAnchors(*chunk.bytes);
     FiberletGraphQuery<FiberletAnchorChunkLease> result;
+    auto payload = chunkPayload<FiberletAnchorChunkPayload>(chunk, result);
+    if (!payload)
+        return result;
     result.status = FiberletGraphQueryStatus::Ready;
-    result.value.payloadLease = std::move(chunk.bytes);
-    result.value.anchors = std::move(decoded.anchors);
+    result.value.payloadLease = std::move(payload);
+    return result;
+}
+
+FiberletGraphQuery<FiberletEdgeLease> FiberletChunkGraphSource::edge(
+    const FiberletStorageId& fiberlet, bool blocking) const
+{
+    const auto prefixKey = ownerChunk(fiberlet.first, 0);
+    const auto firstAnchorKey = ownerChunk(fiberlet.first, 0);
+    const auto secondAnchorKey = ownerChunk(fiberlet.second, 0);
+    fiberletCache_->prefetchChunks({prefixKey}, blocking);
+    anchorCache_->prefetchChunks({firstAnchorKey, secondAnchorKey}, blocking);
+
+    FiberletGraphQuery<FiberletEdgeLease> result;
+    const auto prefixChunk = fetchChunk(fiberletCache_, prefixKey, blocking);
+    auto prefixPayload = chunkPayload<FiberletPrefixChunkPayload>(prefixChunk, result);
+    if (!prefixPayload)
+        return result;
+    const auto* prefix = prefixPayload->find(fiberlet);
+    if (!prefix) {
+        result.status = FiberletGraphQueryStatus::Error;
+        result.error = "fiberlet edge is absent from its owner chunk";
+        return result;
+    }
+    const auto firstAnchor = anchor(fiberlet.first, blocking);
+    if (firstAnchor.status != FiberletGraphQueryStatus::Ready) {
+        result.status = firstAnchor.status;
+        result.error = firstAnchor.error;
+        return result;
+    }
+    const auto secondAnchor = anchor(fiberlet.second, blocking);
+    if (secondAnchor.status != FiberletGraphQueryStatus::Ready) {
+        result.status = secondAnchor.status;
+        result.error = secondAnchor.error;
+        return result;
+    }
+    try {
+        result.value.endpointSteps = reconstructFiberletRouteEndpointSteps(
+            firstAnchor.value.anchor.positionPredictionXYZ,
+            firstAnchor.value.anchor.fittedAxisXYZ,
+            secondAnchor.value.anchor.positionPredictionXYZ,
+            secondAnchor.value.anchor.fittedAxisXYZ,
+            prefix->interiorPointCount,
+            prefix->entryUV,
+            prefix->exitUV,
+            pathConfig_);
+    } catch (const std::exception& error) {
+        result.status = FiberletGraphQueryStatus::Error;
+        result.error = error.what();
+        return result;
+    }
+    result.status = FiberletGraphQueryStatus::Ready;
+    result.value.prefixPayloadLease = std::move(prefixPayload);
+    result.value.anchorPayloadLeases = {
+        firstAnchor.value.payloadLease, secondAnchor.value.payloadLease};
+    result.value.prefix = *prefix;
+    result.value.firstAnchor = firstAnchor.value.anchor;
+    result.value.secondAnchor = secondAnchor.value.anchor;
     return result;
 }
 
@@ -258,36 +331,36 @@ FiberletGraphQuery<FiberletRouteLease> FiberletChunkGraphSource::route(const Fib
     const auto prefixKey = ownerChunk(fiberlet.first, 0);
     auto routeKey = prefixKey;
     routeKey.level = 1;
-    auto prefixChunk = fetchChunk(fiberletCache_, prefixKey, blocking);
-    if (prefixChunk.status != vc::render::ChunkStatus::Data || !prefixChunk.bytes)
-        return chunkFailure<FiberletRouteLease>(prefixChunk);
-    auto routeChunk = fetchChunk(fiberletCache_, routeKey, blocking);
-    if (routeChunk.status != vc::render::ChunkStatus::Data || !routeChunk.bytes)
-        return chunkFailure<FiberletRouteLease>(routeChunk);
-    auto prefixes = deserializeFiberletPrefixes(*prefixChunk.bytes);
-    auto routes = deserializeFiberletRoutes(*routeChunk.bytes);
-    if (prefixes.prefixes.size() != routes.routes.size()) {
-        FiberletGraphQuery<FiberletRouteLease> result;
+    fiberletCache_->prefetchChunks({prefixKey, routeKey}, blocking);
+    const auto firstAnchorKey = ownerChunk(fiberlet.first, 0);
+    const auto secondAnchorKey = ownerChunk(fiberlet.second, 0);
+    anchorCache_->prefetchChunks({firstAnchorKey, secondAnchorKey}, blocking);
+    FiberletGraphQuery<FiberletRouteLease> result;
+    const auto prefixChunk = fetchChunk(fiberletCache_, prefixKey, blocking);
+    auto prefixPayload = chunkPayload<FiberletPrefixChunkPayload>(prefixChunk, result);
+    if (!prefixPayload)
+        return result;
+    const auto routeChunk = fetchChunk(fiberletCache_, routeKey, blocking);
+    auto routePayload = chunkPayload<FiberletRouteChunkPayload>(routeChunk, result);
+    if (!routePayload)
+        return result;
+    if (prefixPayload->prefixes.size() != routePayload->routes.size()) {
         result.status = FiberletGraphQueryStatus::Error;
         result.error = "fiberlet prefix and route chunk record counts differ";
         return result;
     }
-    const auto found = std::lower_bound(prefixes.prefixes.begin(), prefixes.prefixes.end(), fiberlet, [](const auto& candidate, const auto& value) {
-        return candidate.id < value;
-    });
-    if (found == prefixes.prefixes.end() || found->id != fiberlet) {
-        FiberletGraphQuery<FiberletRouteLease> result;
+    const auto* found = prefixPayload->find(fiberlet);
+    if (!found) {
         result.status = FiberletGraphQueryStatus::Error;
         result.error = "fiberlet route is absent from its owner chunk";
         return result;
     }
-    const auto index = static_cast<std::size_t>(found - prefixes.prefixes.begin());
-    FiberletGraphQuery<FiberletRouteLease> result;
+    const auto index = static_cast<std::size_t>(found - prefixPayload->prefixes.data());
     result.status = FiberletGraphQueryStatus::Ready;
-    result.value.prefixPayloadLease = std::move(prefixChunk.bytes);
-    result.value.routePayloadLease = std::move(routeChunk.bytes);
+    result.value.prefixPayloadLease = std::move(prefixPayload);
+    result.value.routePayloadLease = std::move(routePayload);
     result.value.prefix = *found;
-    result.value.route = std::move(routes.routes[index]);
+    result.value.route = result.value.routePayloadLease->routes[index];
     const auto firstAnchor = anchor(fiberlet.first, blocking);
     if (firstAnchor.status != FiberletGraphQueryStatus::Ready) {
         result.status = firstAnchor.status;
@@ -400,7 +473,7 @@ std::vector<FiberletReplaySourceAnchor> FiberletCachedReplayGraphSource::anchors
         const auto loaded = chunks_.anchorsInChunk(scheduled.key, true);
         if (loaded.status != FiberletGraphQueryStatus::Ready)
             throw std::runtime_error("cached fiberlet seed chunk failed: " + loaded.error);
-        for (const auto& anchor : loaded.value.anchors) {
+        for (const auto& anchor : loaded.value.payloadLease->anchors) {
             if (!anchorCellInCorridor(anchor.key))
                 continue;
             const cv::Vec3f positionBase = anchor.positionPredictionXYZ * predictionToBaseScale();
@@ -439,20 +512,48 @@ std::vector<DirectedFiberletStorageId> FiberletCachedReplayGraphSource::outgoing
 
 FiberletReplaySourceArc FiberletCachedReplayGraphSource::arc(const DirectedFiberletStorageId& id) const
 {
-    const auto loaded = chunks_.route(id.fiberlet, true);
+    const auto loaded = chunks_.edge(id.fiberlet, true);
     if (loaded.status != FiberletGraphQueryStatus::Ready)
-        throw std::runtime_error("cached fiberlet route failed: " + loaded.error);
+        throw std::runtime_error("cached fiberlet edge failed: " + loaded.error);
     FiberletReplaySourceArc result;
     result.id = id;
     result.source = directedSource(id);
     result.target = directedTarget(id);
     result.pathLengthPredictionVoxels = loaded.value.prefix.pathLengthPredictionVoxels;
     result.cost = storedTotalCost(loaded.value.prefix.totalCost);
-    result.pointsBaseXYZ.reserve(loaded.value.pointsPredictionXYZ.size());
+    const float scale = predictionToBaseScale();
+    const cv::Vec3d firstPosition(
+        loaded.value.firstAnchor.positionPredictionXYZ * scale);
+    const cv::Vec3d secondPosition(
+        loaded.value.secondAnchor.positionPredictionXYZ * scale);
+    const cv::Vec3f firstStep = loaded.value.endpointSteps.firstPredictionXYZ * scale;
+    const cv::Vec3f lastStep = loaded.value.endpointSteps.lastPredictionXYZ * scale;
+    if (!id.reverse) {
+        result.sourcePositionBaseXYZ = firstPosition;
+        result.targetPositionBaseXYZ = secondPosition;
+        result.startStepBaseXYZ = firstStep;
+        result.endStepBaseXYZ = lastStep;
+    } else {
+        result.sourcePositionBaseXYZ = secondPosition;
+        result.targetPositionBaseXYZ = firstPosition;
+        result.startStepBaseXYZ = -lastStep;
+        result.endStepBaseXYZ = -firstStep;
+    }
+    return result;
+}
+
+std::vector<cv::Vec3d> FiberletCachedReplayGraphSource::routePoints(
+    const DirectedFiberletStorageId& id) const
+{
+    const auto loaded = chunks_.route(id.fiberlet, true);
+    if (loaded.status != FiberletGraphQueryStatus::Ready)
+        throw std::runtime_error("cached fiberlet route failed: " + loaded.error);
+    std::vector<cv::Vec3d> result;
+    result.reserve(loaded.value.pointsPredictionXYZ.size());
     for (const auto& point : loaded.value.pointsPredictionXYZ)
-        result.pointsBaseXYZ.emplace_back(point * predictionToBaseScale());
+        result.emplace_back(point * predictionToBaseScale());
     if (id.reverse)
-        std::reverse(result.pointsBaseXYZ.begin(), result.pointsBaseXYZ.end());
+        std::reverse(result.begin(), result.end());
     return result;
 }
 
@@ -463,10 +564,8 @@ std::optional<FiberletReplaySourceTransition> FiberletCachedReplayGraphSource::t
     const auto& outgoingId = outgoingArc.id;
     if (incoming.fiberlet == outgoingId.fiberlet || directedTarget(incoming) != directedSource(outgoingId))
         return std::nullopt;
-    if (incomingArc.pointsBaseXYZ.size() < 2 || outgoingArc.pointsBaseXYZ.size() < 2)
-        throw std::runtime_error("cached fiberlet transition has a short route");
-    const cv::Vec3f incomingStepBase(incomingArc.pointsBaseXYZ.back() - incomingArc.pointsBaseXYZ[incomingArc.pointsBaseXYZ.size() - 2]);
-    const cv::Vec3f outgoingStepBase(outgoingArc.pointsBaseXYZ[1] - outgoingArc.pointsBaseXYZ[0]);
+    const cv::Vec3f incomingStepBase = incomingArc.endStepBaseXYZ;
+    const cv::Vec3f outgoingStepBase = outgoingArc.startStepBaseXYZ;
     const cv::Vec3f incomingDirection = normalized(incomingStepBase);
     const cv::Vec3f outgoingDirection = normalized(outgoingStepBase);
     const float joinDot = incomingDirection.dot(outgoingDirection);
@@ -474,7 +573,7 @@ std::optional<FiberletReplaySourceTransition> FiberletCachedReplayGraphSource::t
     if (!(joinDot > minimumJoinDot))
         return std::nullopt;
 
-    const cv::Vec3d sharedPrediction = incomingArc.pointsBaseXYZ.back() / static_cast<double>(predictionToBaseScale());
+    const cv::Vec3d sharedPrediction = incomingArc.targetPositionBaseXYZ / static_cast<double>(predictionToBaseScale());
     const auto sampled = predictionSource_->sample(sharedPrediction, cv::Vec3d(outgoingDirection));
     const auto prediction = bestAlignedSample(sampled, outgoingDirection);
     if (!prediction.valid)

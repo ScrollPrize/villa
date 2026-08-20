@@ -216,7 +216,10 @@ const FiberAnchorConfig& FiberletOnDemandPreprocessor::anchorConfig() const noex
     return state_->config.anchorConfig;
 }
 
-std::vector<std::byte> FiberletOnDemandPreprocessor::generateAnchorChunk(const vc::render::ChunkKey& key, const FiberletStorageCodecConfig& codec)
+FiberletChunkDataset::MaterializedChunk
+FiberletOnDemandPreprocessor::generateAnchorChunk(
+    const vc::render::ChunkKey& key,
+    const FiberletStorageCodecConfig& codec)
 {
     const auto start = std::chrono::steady_clock::now();
     const auto& config = state_->config;
@@ -229,7 +232,12 @@ std::vector<std::byte> FiberletOnDemandPreprocessor::generateAnchorChunk(const v
         if (config.progress)
             config.progress(FiberletOnDemandProgress{
                 .stage = "anchors", .status = "completed", .key = key});
-        return serializeFiberletAnchors(codec, {});
+        FiberletDecodedAnchors decoded{codec, {}};
+        return {
+            serializeFiberletAnchors(codec, {}),
+            std::make_shared<const FiberletAnchorChunkPayload>(
+                std::move(decoded)),
+            false};
     }
     auto extracted = extractFiberAnchorsForCells(config.grid, config.anchorConfig, config.predictionSampler, cells, {}, {}, false);
     std::vector<FiberletStoredAnchor> stored;
@@ -255,7 +263,12 @@ std::vector<std::byte> FiberletOnDemandPreprocessor::generateAnchorChunk(const v
                 std::chrono::steady_clock::now() - start).count(),
             .cpuSeconds = extracted.profile.elapsedCpuSeconds});
     }
-    return serializeFiberletAnchors(codec, stored);
+    auto bytes = serializeFiberletAnchors(codec, stored);
+    FiberletDecodedAnchors decoded{codec, std::move(stored)};
+    return {
+        std::move(bytes),
+        std::make_shared<const FiberletAnchorChunkPayload>(std::move(decoded)),
+        false};
 }
 
 std::vector<vc::render::ChunkKey> FiberletOnDemandPreprocessor::anchorDependencies(const vc::render::ChunkKey& fiberletChunk) const
@@ -387,7 +400,11 @@ void FiberletOnDemandPreprocessor::prefetchScheduled(std::span<const FiberletSch
     }
 }
 
-std::vector<std::byte> FiberletOnDemandPreprocessor::generateFiberletChunk(FiberletStorageChunkKind kind, const vc::render::ChunkKey& key, const FiberletStorageCodecConfig& codec)
+FiberletChunkDataset::MaterializedChunk
+FiberletOnDemandPreprocessor::generateFiberletChunk(
+    FiberletStorageChunkKind kind,
+    const vc::render::ChunkKey& key,
+    const FiberletStorageCodecConfig& codec)
 {
     const auto start = std::chrono::steady_clock::now();
     auto prefixKey = key;
@@ -402,14 +419,19 @@ std::vector<std::byte> FiberletOnDemandPreprocessor::generateFiberletChunk(Fiber
     }
     std::lock_guard keyLock(state_->fiberletGenerationStripes[stripe % state_->fiberletGenerationStripes.size()]);
     const auto& requestedKey = kind == FiberletStorageChunkKind::FiberletPrefix ? prefixKey : routeKey;
-    if (auto cached = state_->fiberletDataset->readChunk(kind, requestedKey))
-        return *cached;
+    if (auto cached = state_->fiberletDataset->readMaterializedChunk(
+            kind, requestedKey))
+        return std::move(*cached);
 
     const auto& config = state_->config;
     std::vector<FiberletStoredAnchor> storedAnchors;
-    for (const auto& dependency : anchorDependencies(prefixKey)) {
+    const auto dependencies = anchorDependencies(prefixKey);
+    state_->anchorCache->prefetchChunks(dependencies, true);
+    for (const auto& dependency : dependencies) {
         const auto chunk = state_->anchorCache->getChunkBlocking(dependency.level, dependency.iz, dependency.iy, dependency.ix);
-        if (chunk.status != vc::render::ChunkStatus::Data || !chunk.bytes) {
+        const auto anchors = std::dynamic_pointer_cast<
+            const FiberletAnchorChunkPayload>(chunk.payload);
+        if (chunk.status != vc::render::ChunkStatus::Data || !anchors) {
             std::string message =
                 "required fiberlet anchor chunk " +
                 std::to_string(dependency.level) + '/' +
@@ -421,8 +443,9 @@ std::vector<std::byte> FiberletOnDemandPreprocessor::generateFiberletChunk(Fiber
                 message += ": " + chunk.error;
             throw std::runtime_error(std::move(message));
         }
-        auto decoded = deserializeFiberletAnchors(*chunk.bytes);
-        storedAnchors.insert(storedAnchors.end(), std::make_move_iterator(decoded.anchors.begin()), std::make_move_iterator(decoded.anchors.end()));
+        storedAnchors.insert(
+            storedAnchors.end(), anchors->anchors.begin(),
+            anchors->anchors.end());
     }
     std::sort(storedAnchors.begin(), storedAnchors.end(), [](const auto& left, const auto& right) { return left.key < right.key; });
     const auto duplicate = std::adjacent_find(storedAnchors.begin(), storedAnchors.end(), [](const auto& left, const auto& right) {
@@ -503,15 +526,28 @@ std::vector<std::byte> FiberletOnDemandPreprocessor::generateFiberletChunk(Fiber
     const auto routeCodec = state_->fiberletDataset->codecConfig(FiberletStorageChunkKind::FiberletRoutes, routeKey);
     auto prefixBytes = serializeFiberletPrefixes(prefixCodec, prefixes);
     auto routeBytes = serializeFiberletRoutes(routeCodec, routes);
-    state_->fiberletDataset->publishChunk(FiberletStorageChunkKind::FiberletPrefix, prefixKey, prefixBytes);
-    state_->fiberletDataset->publishChunk(FiberletStorageChunkKind::FiberletRoutes, routeKey, routeBytes);
+    FiberletChunkDataset::MaterializedChunk prefixChunk{
+        std::move(prefixBytes),
+        std::make_shared<const FiberletPrefixChunkPayload>(
+            FiberletDecodedPrefixes{prefixCodec, std::move(prefixes)}),
+        true};
+    FiberletChunkDataset::MaterializedChunk routeChunk{
+        std::move(routeBytes),
+        std::make_shared<const FiberletRouteChunkPayload>(
+            FiberletDecodedRoutes{routeCodec, std::move(routes)}),
+        true};
+    state_->fiberletDataset->publishFiberletChunkPair(
+        prefixKey, prefixChunk, routeKey, routeChunk);
     if (config.progress) {
         config.progress(FiberletOnDemandProgress{
             .stage = "fiberlets",
             .status = "completed",
             .key = prefixKey,
             .inputCount = inputAnchorCount,
-            .outputCount = prefixes.size(),
+            .outputCount = std::dynamic_pointer_cast<
+                               const FiberletPrefixChunkPayload>(
+                               prefixChunk.payload)
+                               ->prefixes.size(),
             .elapsedSeconds = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - start).count(),
             .cpuSeconds = report.elapsedCpuSeconds,
@@ -521,7 +557,9 @@ std::vector<std::byte> FiberletOnDemandPreprocessor::generateFiberletChunk(Fiber
             .candidateGenerationCpuSeconds =
                 report.candidateGenerationCpuSeconds});
     }
-    return kind == FiberletStorageChunkKind::FiberletPrefix ? std::move(prefixBytes) : std::move(routeBytes);
+    return kind == FiberletStorageChunkKind::FiberletPrefix
+        ? std::move(prefixChunk)
+        : std::move(routeChunk);
 }
 
 }  // namespace vc::fiber_tracer

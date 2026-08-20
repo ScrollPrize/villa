@@ -80,6 +80,41 @@ public:
     }
 };
 
+class TestDecodedPayload final : public vc::render::DecodedChunkPayload {
+public:
+    explicit TestDecodedPayload(std::size_t bytes, int value)
+        : bytes_(bytes), value(value)
+    {
+    }
+
+    std::size_t residentBytes() const noexcept override { return bytes_; }
+
+    int value = 0;
+
+private:
+    std::size_t bytes_ = 0;
+};
+
+class GeneratingPayloadFetcher final : public IChunkFetcher {
+public:
+    explicit GeneratingPayloadFetcher(int base) : base_(base) {}
+
+    ChunkFetchResult fetch(const ChunkKey& key) override
+    {
+        ++fetchCalls;
+        ChunkFetchResult result;
+        result.status = ChunkFetchStatus::Found;
+        result.payload =
+            std::make_shared<TestDecodedPayload>(64, base_ + key.ix);
+        return result;
+    }
+
+    std::atomic<int> fetchCalls{0};
+
+private:
+    int base_ = 0;
+};
+
 std::vector<std::byte> makeBytes(std::size_t n, std::byte v = std::byte{99})
 {
     return std::vector<std::byte>(n, v);
@@ -200,6 +235,108 @@ TEST_CASE("ChunkCache: opaque chunks accept variable decoded byte lengths")
     REQUIRE(b.bytes);
     CHECK(b.bytes->size() == 117);
     CHECK(cache.stats().decodedBytes == 120);
+}
+
+TEST_CASE("ChunkCache: opaque decoded payload is cached, accounted, and pinned")
+{
+    auto fetcher = std::make_shared<GeneratingPayloadFetcher>(1);
+    const std::vector<ChunkCache::LevelInfo> levels{{{1, 1, 3}, {1, 1, 1}, {}}};
+    ChunkCache::Options options;
+    options.decodedByteCapacity = 64;
+    options.detectAllFillChunks = false;
+    ChunkCache cache(
+        levels, {fetcher}, 0.0, ChunkDtype::Opaque, options);
+
+    auto leased = cache.getChunkBlocking(0, 0, 0, 0);
+    REQUIRE(leased.status == ChunkStatus::Data);
+    REQUIRE_FALSE(leased.bytes);
+    auto payload = std::dynamic_pointer_cast<const TestDecodedPayload>(leased.payload);
+    REQUIRE(payload);
+    CHECK(payload->value == 1);
+    CHECK(cache.stats().decodedBytes == 64);
+    auto cached = cache.getChunkBlocking(0, 0, 0, 0);
+    CHECK(cached.payload == leased.payload);
+    CHECK(fetcher->fetchCalls.load() == 1);
+
+    auto newer = cache.getChunkBlocking(0, 0, 0, 1);
+    REQUIRE(newer.status == ChunkStatus::Data);
+    CHECK(cache.stats().decodedBytes == 128);
+    leased.payload.reset();
+    cached.payload.reset();
+    payload.reset();
+    newer.payload.reset();
+    const auto calls = fetcher->fetchCalls.load();
+    (void)cache.getChunkBlocking(0, 0, 0, 2);
+    CHECK(cache.stats().decodedBytes == 64);
+    CHECK(fetcher->fetchCalls.load() == calls + 1);
+    (void)cache.getChunkBlocking(0, 0, 0, 0);
+    CHECK(fetcher->fetchCalls.load() == calls + 2);
+}
+
+TEST_CASE("ChunkCache: separate typed caches share the aggregate decoded budget")
+{
+    auto budget = std::make_shared<DecodedChunkCacheBudget>(128);
+    const std::vector<ChunkCache::LevelInfo> levels{{{1, 1, 2}, {1, 1, 1}, {}}};
+    const auto makeTypedCache = [&](int base) {
+        auto fetcher = std::make_shared<GeneratingPayloadFetcher>(base);
+        ChunkCache::Options options;
+        options.decodedByteCapacity = 128;
+        options.decodedByteBudget = budget;
+        options.detectAllFillChunks = false;
+        return std::pair{
+            std::make_shared<ChunkCache>(
+                levels, std::vector<std::shared_ptr<IChunkFetcher>>{fetcher},
+                0.0, ChunkDtype::Opaque, options),
+            fetcher};
+    };
+    auto [anchorCache, anchorFetcher] = makeTypedCache(10);
+    auto [fiberletCache, fiberletFetcher] = makeTypedCache(20);
+    {
+        auto anchor = anchorCache->getChunkBlocking(0, 0, 0, 0);
+        auto fiberlet = fiberletCache->getChunkBlocking(0, 0, 0, 0);
+        REQUIRE(anchor.payload);
+        REQUIRE(fiberlet.payload);
+    }
+    REQUIRE(anchorCache->getChunkIfCached(0, 0, 0, 0).status == ChunkStatus::Data);
+    REQUIRE(fiberletCache->getChunkIfCached(0, 0, 0, 0).status == ChunkStatus::Data);
+    {
+        auto newest = anchorCache->getChunkBlocking(0, 0, 0, 1);
+        REQUIRE(newest.payload);
+    }
+    CHECK(anchorCache->stats().decodedBytes <= 128);
+    CHECK(anchorCache->getChunkIfCached(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+    CHECK(fiberletCache->getChunkIfCached(0, 0, 0, 0).status == ChunkStatus::Data);
+    CHECK(anchorFetcher->fetchCalls.load() == 2);
+    CHECK(fiberletFetcher->fetchCalls.load() == 1);
+}
+
+TEST_CASE("ChunkCache: concurrent typed requests coalesce to one payload")
+{
+    auto fetcher = std::make_shared<GeneratingPayloadFetcher>(30);
+    const std::vector<ChunkCache::LevelInfo> levels{{{1, 1, 1}, {1, 1, 1}, {}}};
+    ChunkCache::Options options;
+    options.maxConcurrentReads = 4;
+    options.detectAllFillChunks = false;
+    ChunkCache cache(
+        levels, {fetcher}, 0.0, ChunkDtype::Opaque, options);
+
+    std::array<std::shared_ptr<const vc::render::DecodedChunkPayload>, 16>
+        payloads;
+    std::vector<std::thread> workers;
+    workers.reserve(payloads.size());
+    for (auto& payload : payloads) {
+        workers.emplace_back([&cache, &payload] {
+            const auto result = cache.getChunkBlocking(0, 0, 0, 0);
+            if (result.status == ChunkStatus::Data)
+                payload = result.payload;
+        });
+    }
+    for (auto& worker : workers)
+        worker.join();
+    CHECK(fetcher->fetchCalls.load() == 1);
+    REQUIRE(payloads.front());
+    for (const auto& payload : payloads)
+        CHECK(payload == payloads.front());
 }
 
 TEST_CASE("ChunkCache: externally leased chunks remain resident until released")

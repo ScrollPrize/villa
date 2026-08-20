@@ -1,21 +1,16 @@
-# Status: reliable and parallel on-demand fiber replay
+# Status: cache decoded fiberlet graph chunks
 
-- [x] Record the current task
-- [x] Draft implementation, regression, spec, docs, and changelog plan
-- [x] Independently review the expanded plan against task and specifications
-- [x] Reproduce the observed final greedy progress sequence
-- [x] Preserve exact nested chunk dependency errors
-- [x] Identify the on-demand stall as a ready-cell completion lost wakeup
-- [x] Fix completion publication under the scheduler mutex
-- [x] Build `vc_fiberlets` and pass all 85 anchor tests
-- [x] Add focused multi-tile scheduler regression coverage
-- [x] Add replay-specific global/local progress and evaluator completion
-- [x] Add scheduled anchor/fiberlet preprocessing progress
-- [x] Parallelize deterministic per-chunk fiberlet candidate generation
-- [x] Parallelize prepared-geometry teardown on search workers
-- [x] Add on-demand fiberlet phase and measured CPU diagnostics
+- [x] Record the task
+- [x] Read the storage specification and current cache/graph implementation
+- [x] Draft implementation, test, spec, docs, and changelog plan
+- [x] Independently review the plan against task and specifications
+- [x] Establish a cache-warm replay baseline
+- [x] Add typed decoded payloads to `ChunkCache`
+- [x] Add parse-once dataset validation/materialization
+- [x] Materialize indexed anchor/prefix/route cache entries
+- [x] Convert graph traversal to chunk payload leases and neighbor prefetch
+- [x] Keep route payloads out of lookahead
 - [x] Add focused regression tests
+- [x] Build with 32 jobs and run focused tests
+- [x] Measure cache-warm replay after the change and verify identical results
 - [x] Update specifications, docs, changelog, and task log
-- [x] Build affected targets with 32 jobs and run focused tests
-- [x] Validate an uncached Paris4 chunk and exact stored bytes
-- [ ] Validate the full cached Paris4 replay

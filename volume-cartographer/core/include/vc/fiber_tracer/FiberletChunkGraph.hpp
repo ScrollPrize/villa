@@ -32,24 +32,32 @@ struct FiberletIncidentEdge {
 };
 
 struct FiberletIncidentLease {
-    std::vector<std::shared_ptr<const std::vector<std::byte>>> payloadLeases;
+    std::vector<std::shared_ptr<const FiberletPrefixChunkPayload>> payloadLeases;
     std::vector<FiberletIncidentEdge> edges;
 };
 
 struct FiberletAnchorLease {
-    std::shared_ptr<const std::vector<std::byte>> payloadLease;
+    std::shared_ptr<const FiberletAnchorChunkPayload> payloadLease;
     FiberletStoredAnchor anchor;
 };
 
 struct FiberletAnchorChunkLease {
-    std::shared_ptr<const std::vector<std::byte>> payloadLease;
-    std::vector<FiberletStoredAnchor> anchors;
+    std::shared_ptr<const FiberletAnchorChunkPayload> payloadLease;
+};
+
+struct FiberletEdgeLease {
+    std::shared_ptr<const FiberletPrefixChunkPayload> prefixPayloadLease;
+    std::array<std::shared_ptr<const FiberletAnchorChunkPayload>, 2> anchorPayloadLeases;
+    FiberletStoredPrefix prefix;
+    FiberletStoredAnchor firstAnchor;
+    FiberletStoredAnchor secondAnchor;
+    FiberletRouteEndpointSteps endpointSteps;
 };
 
 struct FiberletRouteLease {
-    std::shared_ptr<const std::vector<std::byte>> prefixPayloadLease;
-    std::shared_ptr<const std::vector<std::byte>> routePayloadLease;
-    std::array<std::shared_ptr<const std::vector<std::byte>>, 2> anchorPayloadLeases;
+    std::shared_ptr<const FiberletPrefixChunkPayload> prefixPayloadLease;
+    std::shared_ptr<const FiberletRouteChunkPayload> routePayloadLease;
+    std::array<std::shared_ptr<const FiberletAnchorChunkPayload>, 2> anchorPayloadLeases;
     FiberletStoredPrefix prefix;
     FiberletStoredRoute route;
     std::vector<cv::Vec3f> pointsPredictionXYZ;
@@ -68,6 +76,7 @@ public:
     [[nodiscard]] FiberletGraphQuery<FiberletIncidentLease> incidentEdges(const FiberletStorageKey& anchor, bool blocking = false) const;
     [[nodiscard]] FiberletGraphQuery<FiberletAnchorLease> anchor(const FiberletStorageKey& anchor, bool blocking = false) const;
     [[nodiscard]] FiberletGraphQuery<FiberletAnchorChunkLease> anchorsInChunk(const vc::render::ChunkKey& chunk, bool blocking = false) const;
+    [[nodiscard]] FiberletGraphQuery<FiberletEdgeLease> edge(const FiberletStorageId& fiberlet, bool blocking = false) const;
     [[nodiscard]] FiberletGraphQuery<FiberletRouteLease> route(const FiberletStorageId& fiberlet, bool blocking = false) const;
 
 private:
@@ -100,6 +109,7 @@ public:
         const PolylineArcGeometry& reference, double beginArcBase, double endArcBase, double broadPhaseRadiusBaseVoxels) const override;
     [[nodiscard]] std::vector<DirectedFiberletStorageId> outgoing(const FiberletStorageKey& anchor) const override;
     [[nodiscard]] FiberletReplaySourceArc arc(const DirectedFiberletStorageId& id) const override;
+    [[nodiscard]] std::vector<cv::Vec3d> routePoints(const DirectedFiberletStorageId& id) const override;
     [[nodiscard]] std::optional<FiberletReplaySourceTransition> transition(const FiberletReplaySourceArc& incoming, const FiberletReplaySourceArc& outgoing) const override;
 
 private:

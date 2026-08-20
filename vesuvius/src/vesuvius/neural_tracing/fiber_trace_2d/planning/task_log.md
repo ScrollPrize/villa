@@ -1,81 +1,102 @@
-# Task log: reliable and parallel on-demand fiber replay
+# Task log: cache decoded fiberlet graph chunks
 
-## Initial state and reproduction
+## Initial finding
 
-- The worktree already contains the uncommitted on-demand fiberlet storage and
-  cache implementation from the preceding task. Those changes are retained.
-- The CLI currently prints `FiberTraceProgress` directly. Its `step/maxSteps`
-  fields are local to one greedy restart segment, while failure arc/fraction is
-  global to the replay interval. The missing segment identity makes successive
-  denominators appear to be changing whole-run targets.
-- The main thread joins the greedy future first and then the fiberlet future,
-  without printing independent evaluator completion.
-- Reproduced the user's exact final greedy sequence against the existing full
-  Paris4 sparse caches. This checkout then terminates with
-  `cached fiberlet adjacency failed: required fiberlet anchor chunk did not
-  resolve to data`. The fiberlet generator currently discards the dependency
-  chunk key, `ChunkStatus`, and underlying `ChunkResult.error`, obscuring the
-  actual failure and making the silent interval look like a hang.
+- Revision `74af727e8` stores materialized serialized bytes in `ChunkCache`, but
+  `FiberletChunkGraphSource` deserializes entire prefix, route, and anchor
+  chunks for individual graph queries.
+- `bestLookaheadRoute` repeatedly calls `outgoing`, `arc`, and `transition` for
+  overlapping beam candidates. The cached adapter therefore repeats whole-
+  chunk decoding, route reconstruction, and source-volume sampling on one
+  thread, whereas the earlier eager graph used indexed resident objects.
+- This contradicts the existing storage specification, which requires a
+  memory-bounded LRU of decoded anchor prefixes, fiberlet search prefixes, and
+  selected route blocks.
+- The correction will extend the existing shared cache abstraction. It will not
+  add a fiberlet-only secondary LRU or change the persisted chunk format.
 
-## Captured deadlock
+## Baseline
 
-- The user captured the stalled live process with GDB. The fiberlet cache worker
-  was blocked waiting for an anchor chunk; the anchor chunk parent was joining
-  its fit workers; one fit worker was asleep in the ready-cell condition
-  variable.
-- Scheduler state was already terminal: `nextReadyCell=7776`,
-  `readyCells.size()=7776`, `completedTiles=64`, and
-  `partitionTileCount=64`. This proves a missed completion notification rather
-  than I/O, missing workers, or unfinished computation.
-- `remainingCells` and `completedTiles` were atomically modified and notified
-  without holding `readyCellMutex`. A waiter could evaluate its predicate as
-  false while holding the mutex, then miss a notification issued before it
-  actually entered the wait.
-- Both completion counters now use the same mutex as the condition-variable
-  predicate. No heartbeat, polling, timeout, or recovery behavior was added.
-- Built `test_fiber_anchors` and `vc_fiberlets` with `-j32`; all 84 anchor tests
-  pass.
+- Dataset: Paris4 `fiber_s1_002`, David fiber `...000003`, existing anchor and
+  fiberlet cache roots under `data/workdir3/fiberlet-replay-full/cache`.
+- Command settings: `fiberlet-replay`, `--length 100`, `--radius 64`,
+  `--threads 32`, default beam 16 and lookahead 3, current build.
+- Three cache-warm runs took 17.17, 17.09, and 17.13 seconds wall
+  (mean/median 17.13 s, min/max 17.09/17.17 s; with three samples p95 is
+  represented by the 17.17 s maximum). No chunks were generated and there were
+  no replay failures. The run committed two fiberlet edges over 100 base
+  voxels. Process CPU was 101-134%; after greedy completion, graph replay was
+  visibly one-core work.
 
-## Expanded scope
+## Independent plan review
 
-- The user also requires globally coherent replay progress and parallel work
-  inside one on-demand fiberlet chunk. The current candidate enumeration phase
-  in `traceFiberletPaths` is serial even though later preparation and search
-  phases use `pathConfig.parallelThreads`.
+- The review identified two blockers: the dataset read/publication path already
+  deserialized during validation, and on-demand fiberlet generation still
+  consumed anchor-cache bytes. The plan now requires one parsed payload to be
+  reused for validation/cache publication and converts every anchor dependency
+  consumer to typed leases.
+- The review also required a shared curved-domain endpoint helper, explicit
+  two-cache/shared-budget tests, an unambiguous typed-payload persistence
+  contract, route-fetch instrumentation across discarded candidates and
+  reseeding, non-owning chunk query results, and a repeated cache-state-aware
+  performance protocol. These are incorporated above.
 
-## Implementation and focused validation
+## Implementation
 
-- Independent plan review required exact serial/parallel artifacts, isolated
-  per-chunk CPU measurement, explicit evaluator terminal states, and preserving
-  serial semantics for arbitrary predicates. Source ownership is evaluated in
-  canonical order; generic point/pair predicates keep serial enumeration.
-- Candidate enumeration now assigns canonical source indices to workers and
-  merges per-source candidates/counters in source order. The selected output,
-  graph ordering, and per-candidate arithmetic do not change.
-- Greedy replay progress now reports global reference arc/fraction, restart
-  segment, and explicitly local step/budget. Fiberlet graph replay reports the
-  same global axis. Both async evaluators print completion or failure before
-  the main thread joins them.
-- Generated cache rows report stable schedule index, nearest global reference
-  arc, monotone generated count, scheduled count, and internal fiberlet phase.
-  Completed rows include measured wall/CPU time and candidate-generation
-  effective cores. Cached chunks are not misreported as newly generated.
-- The first instrumented Paris4 chunk revealed a serial teardown after search:
-  151,802 independent prepared-candidate vectors retained about 11 GiB and were
-  destroyed on the caller thread after the phase timer stopped. Each search
-  worker now releases its own prepared candidate after producing the result.
-- For Paris4 chunk `107,34,45` with 105,730 input anchors and 63,932 stored
-  fiberlets, wall time changed from 34.7949 s to 4.3440 s. The new run used
-  122.665 CPU-s overall; candidate generation used 0.1075 s wall and 1.2423
-  CPU-s, or 11.55 effective cores. The prefix and route payloads are
-  byte-identical (`8b1cec2b...` and `806eefaf...`).
-- The 64-tile/32-worker anchor regression completed 50 consecutive runs. All
-  85 anchor tests, 54 trace tests, 10 storage tests, and 28 cache tests pass.
-  `test_fiberlet_paths` has no new failure from this work but still reports 295
-  existing bit-exact local-scoring checks at line 406 in this checkout.
+- Extended `ChunkCache` with a type-erased decoded payload lease. Typed opaque
+  entries participate in the existing local and shared byte budgets, pinning,
+  invalidation, and LRU eviction. Fiberlet caches disable generic persistence;
+  their sparse datasets remain the sole serialized authority.
+- Added decoded anchor, prefix, and route payloads. Prefix payloads build one
+  deterministic two-endpoint incident index and include it in their resident
+  byte charge. Dataset reads decode and validate once before cache publication.
+- Converted anchor dependencies and graph queries from serialized bytes to
+  typed cache leases. Incident queries batch-prefetch the complete possible
+  owner halo through the fiberlet cache.
+- Extracted exact endpoint-step reconstruction from the existing curved-domain
+  geometry. Beam expansion now reads prefix/anchor descriptors only. Full route
+  payloads and polyline reconstruction occur only after selecting the edge to
+  commit; the already-selected transition is reused.
+- Added materialization diagnostics to the final `fiber_replay_cache` row. The
+  measured run decoded four anchor chunks, four prefix chunks, and one route
+  chunk; its two committed edges shared that route chunk.
 
-## Validation command
+## Validation
 
-```bash
-volume-cartographer/build/bin/vc_fiberlets fiberlet-replay /home/hendrik/business/aiconsulting/vesuviuschallenge/data/s1/PHercParis4.volpkg/volumes/fiber_s1_002.lasagna.json /home/hendrik/business/aiconsulting/vesuviuschallenge/data/fibers/david/Paris4_fibers/dj_20260805T025256484_000003.json /tmp/fiberlet-replay-debug --normal-manifest /home/hendrik/business/aiconsulting/vesuviuschallenge/data/lasagna3d_inf/las008_s1_full/las_008.lasagna.json --anchor-cache /home/hendrik/business/aiconsulting/vesuviuschallenge/data/workdir3/fiberlet-replay-full/cache/anchors.zarr --fiberlet-cache /home/hendrik/business/aiconsulting/vesuviuschallenge/data/workdir3/fiberlet-replay-full/cache/fiberlets.zarr --radius 64
-```
+- Build: `cmake --build volume-cartographer/build -j32 --target vc_fiberlets test_chunk_cache test_fiberlet_storage test_fiberlet_paths test_fiber_trace3d`.
+- `test_chunk_cache`: 31 cases passed, including typed-object reuse, pinning,
+  eviction/refetch, two local caches under one shared budget, and concurrent
+  same-key coalescing.
+- `test_fiberlet_storage`: 11 cases passed, including exact endpoint steps for
+  zero/one/many interior points, cross-chunk adjacency, route deferral, and LRU
+  reload.
+- `test_fiber_trace3d`: 54 cases passed.
+- `test_fiberlet_paths` still reports the same pre-existing 295 bit-exact
+  failures at `test_fiberlet_paths.cpp:406`; no new failure location appeared.
+- The post-change `/tmp/fiberlet-cache-fix-final/fiber_replay.json` is byte-for-
+  byte identical to the baseline artifact.
+
+## Performance result
+
+- Protocol: same Paris4 manifests, existing serialized cache roots,
+  `--length 100 --radius 64 --threads 32`, default beam 16/lookahead 3,
+  serialized-storage-warm and decoded-cache-cold process per run.
+- Baseline wall seconds: 17.17, 17.09, 17.13; mean/median 17.13, min/max
+  17.09/17.17.
+- Changed wall seconds: 0.21, 0.19, 0.20; mean/median 0.20, min/max
+  0.19/0.21. Median speedup is 85.7x.
+- Changed process user time was 5.63, 5.05, and 5.29 seconds; RSS was
+  89.1-89.9 MiB. Parallel cache materialization explains process CPU exceeding
+  wall time; replay itself retained zero failures and the same committed path.
+- `perf` is unavailable on this machine. Callgrind collected 6.00 billion
+  instruction references for the full concurrent command; the largest named
+  exclusive entry was the OpenMP runtime dispatcher at 36.7%. The former
+  graph-side repeated deserialization/reconstruction path did not appear as a
+  remaining hotspot.
+
+## Deviations and limitations
+
+- No install was performed to obtain `perf`; Callgrind was used instead.
+- The post-change profile includes the concurrent greedy evaluator and cache
+  decode workers because the CLI has no graph-only profiling mode. Disk decode
+  counts provide the graph-specific route-load check.

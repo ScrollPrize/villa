@@ -785,8 +785,11 @@ fiberlet boundary, so the compressed stream still mostly contains `-1`, `0`,
 and `1`.
 
 These arrays contain the actual DP-selected geometry. They are not consulted
-when ranking beam candidates. They are loaded only when a selected fiberlet's
-polyline must be emitted, visualized, or evaluated point by point.
+when ranking beam candidates. The prefix entry/exit values and the two anchor
+records reconstruct the exact first and last route steps without reading the
+middle-point arrays. Route arrays are loaded only after a fiberlet is selected
+for commitment, when its polyline must be emitted, visualized, or evaluated
+point by point.
 
 ### Interior path resolution
 
@@ -852,9 +855,9 @@ by replay and are not stored.
 
 ## Adjacency construction
 
-Neither anchor stores nor owns a fiberlet list. When a chunk neighborhood is
-loaded, the consumer scans the explicit first and second endpoint arrays and
-builds an in-memory adjacency map:
+Neither anchor stores nor owns a fiberlet list. When a prefix chunk is decoded
+into the existing `ChunkCache`, the payload scans the explicit first and second
+endpoint arrays once and builds a deterministic two-endpoint incident index:
 
 ```text
 AnchorKey -> [FiberletId, ...]

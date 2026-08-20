@@ -2938,6 +2938,51 @@ std::vector<cv::Vec3f> reconstructFiberletRoutePoints(
     return points;
 }
 
+FiberletRouteEndpointSteps reconstructFiberletRouteEndpointSteps(
+    const cv::Vec3f& startPositionPredictionXYZ,
+    const cv::Vec3f& startAxisXYZ,
+    const cv::Vec3f& targetPositionPredictionXYZ,
+    const cv::Vec3f& targetAxisXYZ,
+    std::size_t interiorPointCount,
+    const std::array<std::int16_t, 2>& entryUV,
+    const std::array<std::int16_t, 2>& exitUV,
+    const FiberletPathConfig& config)
+{
+    FiberletCandidateResult candidate;
+    candidate.startPositionPredictionXYZ = startPositionPredictionXYZ;
+    candidate.targetPositionPredictionXYZ = targetPositionPredictionXYZ;
+    const cv::Vec3f chord =
+        targetPositionPredictionXYZ - startPositionPredictionXYZ;
+    candidate.startAxisXYZ = normalized(startAxisXYZ);
+    candidate.targetAxisXYZ = normalized(targetAxisXYZ);
+    if (candidate.startAxisXYZ.dot(chord) < 0.0F)
+        candidate.startAxisXYZ *= -1.0F;
+    if (candidate.targetAxisXYZ.dot(chord) < 0.0F)
+        candidate.targetAxisXYZ *= -1.0F;
+    const auto domain = makeCurvedDomain(candidate, config);
+    if (domain.layers.size() < 2 ||
+        interiorPointCount != domain.layers.size() - 2) {
+        throw std::invalid_argument(
+            "stored fiberlet endpoint lattice count does not match its curved domain");
+    }
+    if (interiorPointCount == 0)
+        return {chord, chord};
+
+    const cv::Vec3f first = localNodePoint(
+        domain, {1, static_cast<int>(entryUV[0]),
+                    static_cast<int>(entryUV[1])},
+        config);
+    const auto& finalUV = interiorPointCount == 1 ? entryUV : exitUV;
+    const cv::Vec3f last = localNodePoint(
+        domain,
+        {domain.layers.size() - 2, static_cast<int>(finalUV[0]),
+            static_cast<int>(finalUV[1])},
+        config);
+    return {
+        first - startPositionPredictionXYZ,
+        targetPositionPredictionXYZ - last};
+}
+
 FiberletPathReport traceFiberletPaths(
     const LoadedFiberAnchorArtifact& anchors,
     const FiberPredictionGridInfo& grid,

@@ -503,10 +503,18 @@ the anchor cell side. The roots are local-only in this implementation.
 The fiberlet root separates `prefix/` connectivity/cost blocks from `routes/`
 interior geometry. Beam/frontier state contains stable anchor and endpoint-pair
 IDs, not pointers or copied corridor-wide graph records. An incident query
-loads the complete declared endpoint-reach neighborhood, sorts its stable IDs,
-and can transparently reload evicted chunks. Route blocks are loaded only when
-an edge is expanded or emitted. `--eager-graph` runs the prior whole-tube graph
-construction for diagnostics.
+batch-prefetches the complete declared endpoint-reach neighborhood and queries
+the deterministic two-endpoint index built once in each decoded prefix chunk.
+The separate anchor and fiberlet `ChunkCache` instances retain typed decoded
+payloads directly and charge their vectors and indices to the shared LRU
+budget; they do not retain another serialized copy or use a graph-private LRU.
+Prefix records and exact endpoint steps are sufficient for beam ranking and
+join scoring. A route block is loaded and its full polyline reconstructed only
+after an edge is selected for commitment. Evicted chunks reload transparently.
+The final `fiber_replay_cache` row reports disk materialization counts for
+anchor, prefix, and route chunks; multiple committed edges in one route chunk
+share one decode. `--eager-graph` runs the prior whole-tube graph construction
+for diagnostics.
 
 Replay progress uses the selected reference interval as its only global axis.
 `fiber_replay_progress` rows report `reference_arc_base` and a monotone

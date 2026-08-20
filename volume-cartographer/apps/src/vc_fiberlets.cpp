@@ -1951,6 +1951,10 @@ int main(int argc, char** argv)
             if (preprocessor) {
                 const auto anchorStats = preprocessor->anchorCache()->stats();
                 const auto fiberletStats = preprocessor->fiberletCache()->stats();
+                const auto anchorMaterialization =
+                    preprocessor->anchorDataset()->materializationStats();
+                const auto fiberletMaterialization =
+                    preprocessor->fiberletDataset()->materializationStats();
                 const std::size_t residentBytes =
                     anchorStats.localDecodedBytes +
                     fiberletStats.localDecodedBytes;
@@ -1959,6 +1963,9 @@ int main(int argc, char** argv)
                           << " fiberlet_decoded_bytes=" << fiberletStats.localDecodedBytes
                           << " total_decoded_bytes=" << residentBytes
                           << " configured_budget_bytes=" << options.decodedCacheBytes
+                          << " anchor_chunk_decodes=" << anchorMaterialization.anchorDecodes
+                          << " prefix_chunk_decodes=" << fiberletMaterialization.prefixDecodes
+                          << " route_chunk_decodes=" << fiberletMaterialization.routeDecodes
                           << '\n';
             }
             std::cerr << "fiber_replay_stage stage=parallel_trace status=completed"

@@ -33,6 +33,7 @@ struct ChunkResult {
     std::array<int, 3> shape{};
     std::shared_ptr<const std::vector<std::byte>> bytes;
     std::string error;
+    std::shared_ptr<const DecodedChunkPayload> payload;
 };
 
 class IChunkedArray {

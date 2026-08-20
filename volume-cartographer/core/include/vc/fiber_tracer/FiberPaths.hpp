@@ -295,6 +295,21 @@ using FiberletSourcePredicate =
     std::span<const std::array<std::int16_t, 2>> interiorLatticeUV,
     const FiberletPathConfig& config);
 
+struct FiberletRouteEndpointSteps {
+    cv::Vec3f firstPredictionXYZ{0.0F, 0.0F, 0.0F};
+    cv::Vec3f lastPredictionXYZ{0.0F, 0.0F, 0.0F};
+};
+
+[[nodiscard]] FiberletRouteEndpointSteps reconstructFiberletRouteEndpointSteps(
+    const cv::Vec3f& startPositionPredictionXYZ,
+    const cv::Vec3f& startAxisXYZ,
+    const cv::Vec3f& targetPositionPredictionXYZ,
+    const cv::Vec3f& targetAxisXYZ,
+    std::size_t interiorPointCount,
+    const std::array<std::int16_t, 2>& entryUV,
+    const std::array<std::int16_t, 2>& exitUV,
+    const FiberletPathConfig& config);
+
 void validateFiberletPathConfig(const FiberletPathConfig& config);
 
 [[nodiscard]] LoadedFiberAnchorArtifact loadFiberAnchorArtifact(const std::filesystem::path& path);

@@ -158,6 +158,7 @@ private:
     struct Entry {
         EntryStatus status = EntryStatus::InFlight;
         std::shared_ptr<const std::vector<std::byte>> bytes;
+        std::shared_ptr<const DecodedChunkPayload> payload;
         std::string error;
         std::size_t decodedBytes = 0;
         bool persisted = false;

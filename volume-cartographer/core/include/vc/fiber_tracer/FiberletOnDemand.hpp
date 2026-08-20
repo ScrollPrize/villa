@@ -70,8 +70,13 @@ public:
 private:
     explicit FiberletOnDemandPreprocessor(FiberletOnDemandConfig config);
     void initialize();
-    std::vector<std::byte> generateAnchorChunk(const vc::render::ChunkKey& key, const FiberletStorageCodecConfig& codec);
-    std::vector<std::byte> generateFiberletChunk(FiberletStorageChunkKind kind, const vc::render::ChunkKey& key, const FiberletStorageCodecConfig& codec);
+    FiberletChunkDataset::MaterializedChunk generateAnchorChunk(
+        const vc::render::ChunkKey& key,
+        const FiberletStorageCodecConfig& codec);
+    FiberletChunkDataset::MaterializedChunk generateFiberletChunk(
+        FiberletStorageChunkKind kind,
+        const vc::render::ChunkKey& key,
+        const FiberletStorageCodecConfig& codec);
 
     struct State;
     std::shared_ptr<State> state_;

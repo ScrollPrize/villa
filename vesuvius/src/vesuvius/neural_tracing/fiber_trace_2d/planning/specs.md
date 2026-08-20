@@ -3035,12 +3035,19 @@
 - Generated anchor and fiberlet payloads use separate `ChunkCache` scheduler
   lanes and one shared decoded-byte budget. Stable coordinate-plus-variant
   anchor IDs and canonical endpoint-pair edge IDs are the only graph state held
-  by beam/frontier records. Incident queries lease every possible owner chunk,
-  derive complete sorted connectivity from prefix payloads, and release those
-  leases after the query; route payloads are loaded only for expanded/selected
-  edges. Cache eviction and reload therefore cannot invalidate graph identity
-  or alter tie order. Active payload leases may temporarily exceed the nominal
-  cache budget, but unleased connectivity and geometry remain LRU-bound.
+  by beam/frontier records. Serialized chunks are decoded exactly once when
+  entering the existing `ChunkCache` LRU; there is no graph-private LRU and no
+  resident serialized duplicate. Anchor and fiberlet caches remain separate
+  participants in the shared budget. A decoded prefix payload builds and
+  charges a deterministic two-endpoint incident index once. Incident queries
+  batch-prefetch every possible owner chunk, lease those indexed payloads, and
+  release the leases after the query. Beam ranking and transition scoring use
+  prefix data plus exact endpoint steps reconstructed from the two anchors.
+  Route payloads and full polyline reconstruction are requested only for the
+  edge selected for commitment, not for lookahead candidates. Cache eviction
+  and reload therefore cannot invalidate graph identity or alter tie order.
+  Active payload leases may temporarily exceed the nominal cache budget, but
+  unleased connectivity and geometry remain LRU-bound.
 - Sparse payloads are strict and unpublished: no version repair or compatibility
   reader exists. Each payload binds kind, profile, chunk coordinate, dataset
   fingerprint, scalar widths, source scale, field directory, and checksum.

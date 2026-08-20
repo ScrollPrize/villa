@@ -140,7 +140,10 @@ struct FiberletReplaySourceArc {
     DirectedFiberletStorageId id;
     FiberletStorageKey source;
     FiberletStorageKey target;
-    std::vector<cv::Vec3d> pointsBaseXYZ;
+    cv::Vec3d sourcePositionBaseXYZ{0.0, 0.0, 0.0};
+    cv::Vec3d targetPositionBaseXYZ{0.0, 0.0, 0.0};
+    cv::Vec3f startStepBaseXYZ{0.0F, 0.0F, 0.0F};
+    cv::Vec3f endStepBaseXYZ{0.0F, 0.0F, 0.0F};
     float pathLengthPredictionVoxels = 0.0F;
     FiberletPathCost cost;
     std::optional<size_t> diagnosticCandidateIndex;
@@ -168,6 +171,8 @@ public:
     [[nodiscard]] virtual std::vector<DirectedFiberletStorageId> outgoing(
         const FiberletStorageKey& anchor) const = 0;
     [[nodiscard]] virtual FiberletReplaySourceArc arc(
+        const DirectedFiberletStorageId& id) const = 0;
+    [[nodiscard]] virtual std::vector<cv::Vec3d> routePoints(
         const DirectedFiberletStorageId& id) const = 0;
     [[nodiscard]] virtual std::optional<FiberletReplaySourceTransition> transition(
         const FiberletReplaySourceArc& incoming,

@@ -611,6 +611,7 @@ ChunkResult ChunkCache::resultFromEntryLocked(
     case EntryStatus::Data:
         result.status = ChunkStatus::Data;
         result.bytes = entry.bytes;
+        result.payload = entry.payload;
         if (promote)
             touchLocked(state, key, entry);
         break;
@@ -682,6 +683,7 @@ void ChunkCache::probePersistentAndStore(const std::shared_ptr<State>& state,
                                          std::uint64_t schedulerEpoch)
 {
     std::shared_ptr<const std::vector<std::byte>> freshLease;
+    std::shared_ptr<const DecodedChunkPayload> freshPayloadLease;
     {
         std::lock_guard lock(state->mutex_);
         if (generation != state->generation_) {
@@ -741,6 +743,7 @@ void ChunkCache::probePersistentAndStore(const std::shared_ptr<State>& state,
         if (stored != state->entries_.end() &&
             stored->second.status == EntryStatus::Data) {
             freshLease = stored->second.bytes;
+            freshPayloadLease = stored->second.payload;
         }
     }
     enforceSharedBudget(state);
@@ -816,6 +819,7 @@ void ChunkCache::fetchAndStore(const std::shared_ptr<State>& state,
     }
 
     std::shared_ptr<const std::vector<std::byte>> freshLease;
+    std::shared_ptr<const DecodedChunkPayload> freshPayloadLease;
     {
         std::lock_guard lock(state->mutex_);
         if (trackedRemoteFetch && state->remoteFetchesInFlight_ > 0)
@@ -841,6 +845,7 @@ void ChunkCache::fetchAndStore(const std::shared_ptr<State>& state,
         if (stored != state->entries_.end() &&
             stored->second.status == EntryStatus::Data) {
             freshLease = stored->second.bytes;
+            freshPayloadLease = stored->second.payload;
         }
     }
     enforceSharedBudget(state);
@@ -868,6 +873,7 @@ void ChunkCache::storeFetchResultLocked(const std::shared_ptr<State>& state,
     }
 
     entry.bytes.reset();
+    entry.payload.reset();
     entry.error.clear();
     entry.decodedBytes = 0;
     entry.persisted = false;
@@ -875,6 +881,16 @@ void ChunkCache::storeFetchResultLocked(const std::shared_ptr<State>& state,
 
     switch (fetch.status) {
     case ChunkFetchStatus::Found: {
+        if (fetch.payload && state->dtype_ != ChunkDtype::Opaque) {
+            entry.status = EntryStatus::Error;
+            entry.error = "typed decoded payload requires opaque chunk dtype";
+            break;
+        }
+        if (fetch.payload && !fetch.bytes.empty()) {
+            entry.status = EntryStatus::Error;
+            entry.error = "chunk fetch returned both byte and typed decoded payloads";
+            break;
+        }
         if (state->dtype_ != ChunkDtype::Opaque &&
             fetch.bytes.size() != expectedChunkBytes(*state, key)) {
             entry.status = EntryStatus::Error;
@@ -892,8 +908,13 @@ void ChunkCache::storeFetchResultLocked(const std::shared_ptr<State>& state,
             break;
         }
         entry.status = EntryStatus::Data;
-        entry.decodedBytes = fetch.bytes.size();
-        entry.bytes = std::make_shared<const std::vector<std::byte>>(std::move(fetch.bytes));
+        if (fetch.payload) {
+            entry.decodedBytes = fetch.payload->residentBytes();
+            entry.payload = std::move(fetch.payload);
+        } else {
+            entry.decodedBytes = fetch.bytes.size();
+            entry.bytes = std::make_shared<const std::vector<std::byte>>(std::move(fetch.bytes));
+        }
         state->decodedBytes_ += entry.decodedBytes;
         addDecodedBytesLocked(*state, entry.decodedBytes);
         std::shared_ptr<const std::vector<std::byte>> persistentBytes = entry.bytes;
@@ -902,7 +923,7 @@ void ChunkCache::storeFetchResultLocked(const std::shared_ptr<State>& state,
                 std::move(fetch.persistentBytes));
         }
         entry.persisted = loadedFromPersistentCache;
-        if (!loadedFromPersistentCache)
+        if (!loadedFromPersistentCache && persistentBytes)
             entry.persistentWriteQueued =
                 queuePersistentWrite(state, key, std::move(persistentBytes));
         break;
@@ -1399,8 +1420,10 @@ void ChunkCache::enforceCapacityLocked(const std::shared_ptr<State>& state)
             const auto entryIt = state->entries_.find(*it);
             if (entryIt == state->entries_.end() ||
                 entryIt->second.status != EntryStatus::Data ||
-                !entryIt->second.bytes ||
-                entryIt->second.bytes.use_count() <= 1) {
+                ((!entryIt->second.bytes ||
+                     entryIt->second.bytes.use_count() <= 1) &&
+                    (!entryIt->second.payload ||
+                     entryIt->second.payload.use_count() <= 1))) {
                 victimIt = it;
                 break;
             }
@@ -1434,7 +1457,9 @@ std::optional<std::uint64_t> ChunkCache::oldestDecodedTouch(
         auto entry = state->entries_.find(*it);
         if (entry != state->entries_.end() &&
             entry->second.status == EntryStatus::Data) {
-            if (entry->second.bytes && entry->second.bytes.use_count() > 1)
+            if ((entry->second.bytes && entry->second.bytes.use_count() > 1) ||
+                (entry->second.payload &&
+                    entry->second.payload.use_count() > 1))
                 continue;
             return entry->second.budgetTouch;
         }
@@ -1460,7 +1485,8 @@ std::size_t ChunkCache::evictOldestDecodedLocked(const std::shared_ptr<State>& s
         Entry& entry = entryIt->second;
         if (entry.status != EntryStatus::Data)
             continue;
-        if (entry.bytes && entry.bytes.use_count() > 1)
+        if ((entry.bytes && entry.bytes.use_count() > 1) ||
+            (entry.payload && entry.payload.use_count() > 1))
             continue;
 
         const ChunkKey victim = *it;
