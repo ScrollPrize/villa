@@ -287,6 +287,23 @@ using FiberletCandidatePredicate = std::function<bool(
 using FiberletSourcePredicate =
     std::function<bool(const FiberletAnchorId& source)>;
 
+struct FiberletScoringSample {
+    FiberletPredictionSample prediction;
+    cv::Vec3f normalXYZ{0.0F, 0.0F, 0.0F};
+    bool normalValid = false;
+};
+
+[[nodiscard]] std::vector<FiberletScoringSample>
+sampleFiberletScoringPoints(
+    std::span<const cv::Vec3f> pointsPredictionXYZ,
+    const FiberPredictionGridInfo& grid,
+    const FiberletPathConfig& config,
+    const FiberStoredPredictionBatchSampler& predictionSampler,
+    const vc::lasagna::NormalSampler& normalSampler);
+
+[[nodiscard]] float fiberletCandidatePathLength(
+    const FiberletCandidateResult& candidate);
+
 [[nodiscard]] std::vector<cv::Vec3f> reconstructFiberletRoutePoints(
     const cv::Vec3f& startPositionPredictionXYZ,
     const cv::Vec3f& startAxisXYZ,

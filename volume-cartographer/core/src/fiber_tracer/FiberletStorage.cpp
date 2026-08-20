@@ -22,8 +22,8 @@ namespace
 {
 
 constexpr std::array<std::byte, 8>
-    kMagic{std::byte{'V'}, std::byte{'C'}, std::byte{'F'}, std::byte{'L'}, std::byte{'T'}, std::byte{'V'}, std::byte{'1'}, std::byte{0}};
-constexpr std::uint32_t kVersion = 1;
+    kMagic{std::byte{'V'}, std::byte{'C'}, std::byte{'F'}, std::byte{'L'}, std::byte{'T'}, std::byte{'V'}, std::byte{'2'}, std::byte{0}};
+constexpr std::uint32_t kVersion = 2;
 constexpr std::size_t kFixedHeaderBytes = 144;
 constexpr std::size_t kDescriptorBytes = 40;
 constexpr std::size_t kChecksumOffset = 136;
@@ -53,6 +53,14 @@ enum Field : std::uint16_t {
     AxisX = 8,
     AxisY = 9,
     AxisZ = 10,
+    PredictionAxisX = 11,
+    PredictionAxisY = 12,
+    PredictionAxisZ = 13,
+    PredictionPresence = 14,
+    NormalX = 15,
+    NormalY = 16,
+    NormalZ = 17,
+    ScoringFlags = 18,
     FirstZ = 20,
     FirstY = 21,
     FirstX = 22,
@@ -71,6 +79,17 @@ enum Field : std::uint16_t {
     RouteOffsets = 40,
     MiddleU = 41,
     MiddleV = 42,
+    InvalidPredictionCost = 50,
+    AlignmentCost = 51,
+    IsotropicSmoothnessCost = 52,
+    TangentSmoothnessCost = 53,
+    NormalSmoothnessCost = 54,
+    FirstStepX = 55,
+    FirstStepY = 56,
+    FirstStepZ = 57,
+    LastStepX = 58,
+    LastStepY = 59,
+    LastStepZ = 60,
 };
 
 struct FieldBlock {
@@ -546,12 +565,20 @@ std::vector<std::byte> serializeFiberletAnchors(const FiberletStorageCodecConfig
         fields.push_back(makeField(id, coordinateScalar, anchors.size()));
     fields.push_back(makeField(Variant, Scalar::U8, anchors.size()));
     if (config.profile == FiberletStorageProfile::Float32Cache) {
-        for (const auto id : {PositionX, PositionY, PositionZ, AxisX, AxisY, AxisZ})
+        for (const auto id : {
+                 PositionX, PositionY, PositionZ, AxisX, AxisY, AxisZ,
+                 PredictionAxisX, PredictionAxisY, PredictionAxisZ,
+                 PredictionPresence, NormalX, NormalY, NormalZ}) {
             fields.push_back(makeField(id, Scalar::F32, anchors.size()));
+        }
     } else {
-        fields.push_back(makeField(AxisX, Scalar::U8, anchors.size()));
-        fields.push_back(makeField(AxisY, Scalar::U8, anchors.size()));
+        for (const auto id : {
+                 AxisX, AxisY, PredictionAxisX, PredictionAxisY,
+                 PredictionPresence, NormalX, NormalY}) {
+            fields.push_back(makeField(id, Scalar::U8, anchors.size()));
+        }
     }
+    fields.push_back(makeField(ScoringFlags, Scalar::U8, anchors.size()));
     auto field = [&](Field id) -> FieldBlock& {
         return *std::find_if(fields.begin(), fields.end(), [&](const auto& item) { return item.id == id; });
     };
@@ -568,12 +595,26 @@ std::vector<std::byte> serializeFiberletAnchors(const FiberletStorageCodecConfig
         appendUnsigned(field(KeyX).decoded, coordinateScalar, static_cast<std::uint64_t>(local[2]));
         appendLittle(field(Variant).decoded, anchor.key.variant);
         validateFinite(anchor.fittedAxisXYZ, "anchor axis");
+        if (!std::isfinite(anchor.predictionPresence))
+            throw std::invalid_argument("fiberlet anchor presence is not finite");
+        if (anchor.predictionValid)
+            validateFinite(anchor.predictionAxisXYZ, "anchor prediction axis");
+        if (anchor.normalValid)
+            validateFinite(anchor.normalXYZ, "anchor normal");
+        const std::uint8_t scoringFlags =
+            (anchor.predictionValid ? std::uint8_t{1} : std::uint8_t{0}) |
+            (anchor.predictionPresenceValid ? std::uint8_t{2} : std::uint8_t{0}) |
+            (anchor.normalValid ? std::uint8_t{4} : std::uint8_t{0});
+        appendLittle(field(ScoringFlags).decoded, scoringFlags);
         if (config.profile == FiberletStorageProfile::Float32Cache) {
             validateFinite(anchor.positionPredictionXYZ, "anchor position");
             for (int axis = 0; axis < 3; ++axis) {
                 appendLittle(field(static_cast<Field>(PositionX + axis)).decoded, anchor.positionPredictionXYZ[axis]);
                 appendLittle(field(static_cast<Field>(AxisX + axis)).decoded, anchor.fittedAxisXYZ[axis]);
+                appendLittle(field(static_cast<Field>(PredictionAxisX + axis)).decoded, anchor.predictionAxisXYZ[axis]);
+                appendLittle(field(static_cast<Field>(NormalX + axis)).decoded, anchor.normalXYZ[axis]);
             }
+            appendLittle(field(PredictionPresence).decoded, anchor.predictionPresence);
         } else {
             const auto encoded =
                 vc::lasagna::encodeCompactNormalToRaw(cv::Vec3d(anchor.fittedAxisXYZ[0], anchor.fittedAxisXYZ[1], anchor.fittedAxisXYZ[2]));
@@ -581,6 +622,29 @@ std::vector<std::byte> serializeFiberletAnchors(const FiberletStorageCodecConfig
                 throw std::invalid_argument("fiberlet anchor axis cannot be compactly encoded");
             appendLittle(field(AxisX).decoded, (*encoded)[0]);
             appendLittle(field(AxisY).decoded, (*encoded)[1]);
+            const auto prediction = anchor.predictionValid
+                ? vc::lasagna::encodeCompactNormalToRaw(cv::Vec3d(
+                      anchor.predictionAxisXYZ[0], anchor.predictionAxisXYZ[1],
+                      anchor.predictionAxisXYZ[2]))
+                : std::optional<std::array<std::uint8_t, 2>>{
+                      std::array<std::uint8_t, 2>{128, 128}};
+            const auto normal = anchor.normalValid
+                ? vc::lasagna::encodeCompactNormalToRaw(cv::Vec3d(
+                      anchor.normalXYZ[0], anchor.normalXYZ[1],
+                      anchor.normalXYZ[2]))
+                : std::optional<std::array<std::uint8_t, 2>>{
+                      std::array<std::uint8_t, 2>{128, 128}};
+            if (!prediction || !normal)
+                throw std::invalid_argument("fiberlet anchor scoring axis cannot be compactly encoded");
+            appendLittle(field(PredictionAxisX).decoded, (*prediction)[0]);
+            appendLittle(field(PredictionAxisY).decoded, (*prediction)[1]);
+            appendLittle(
+                field(PredictionPresence).decoded,
+                static_cast<std::uint8_t>(std::lround(
+                    std::clamp(anchor.predictionPresence, 0.0F, 1.0F) *
+                    255.0F)));
+            appendLittle(field(NormalX).decoded, (*normal)[0]);
+            appendLittle(field(NormalY).decoded, (*normal)[1]);
         }
     }
     return encodePayload(config, FiberletStorageChunkKind::Anchors, anchors.size(), 0, 0.0F, 0.0F, std::move(fields));
@@ -605,18 +669,29 @@ std::vector<std::byte> serializeFiberletPrefixes(const FiberletStorageCodecConfi
     for (const auto id : {EntryU, EntryV, ExitU, ExitV})
         fields.push_back(makeField(id, latticeScalar, prefixes.size()));
     fields.push_back(makeField(PathLength, Scalar::F32, prefixes.size()));
-    fields.push_back(makeField(TotalCost, costScalar, prefixes.size()));
+    if (config.profile == FiberletStorageProfile::Float32Cache) {
+        for (const auto id : {InvalidPredictionCost, AlignmentCost,
+                 IsotropicSmoothnessCost, TangentSmoothnessCost,
+                 NormalSmoothnessCost})
+            fields.push_back(makeField(id, Scalar::F32, prefixes.size()));
+    } else {
+        fields.push_back(makeField(TotalCost, costScalar, prefixes.size()));
+    }
+    for (const auto id : {FirstStepX, FirstStepY, FirstStepZ,
+             LastStepX, LastStepY, LastStepZ})
+        fields.push_back(makeField(id, Scalar::F32, prefixes.size()));
     auto field = [&](Field id) -> FieldBlock& {
         return *std::find_if(fields.begin(), fields.end(), [&](const auto& item) { return item.id == id; });
     };
 
     float costOffset = 0.0F;
     float costScale = 0.0F;
-    if (config.costBits != 32 && !prefixes.empty()) {
+    if (config.profile == FiberletStorageProfile::CompactQuantized &&
+        config.costBits != 32 && !prefixes.empty()) {
         auto [minimum, maximum] =
-            std::minmax_element(prefixes.begin(), prefixes.end(), [](const auto& a, const auto& b) { return a.totalCost < b.totalCost; });
-        costOffset = minimum->totalCost;
-        const float range = maximum->totalCost - costOffset;
+            std::minmax_element(prefixes.begin(), prefixes.end(), [](const auto& a, const auto& b) { return a.cost.total() < b.cost.total(); });
+        costOffset = minimum->cost.total();
+        const float range = maximum->cost.total() - costOffset;
         const float maximumCode = config.costBits == 8 ? 255.0F : 65535.0F;
         costScale = range == 0.0F ? 0.0F : range / maximumCode;
     }
@@ -629,8 +704,22 @@ std::vector<std::byte> serializeFiberletPrefixes(const FiberletStorageCodecConfi
             throw std::invalid_argument("fiberlet prefixes must be strictly sorted by stable id");
         previous = prefix.id;
         havePrevious = true;
-        if (!std::isfinite(prefix.pathLengthPredictionVoxels) || !(prefix.pathLengthPredictionVoxels > 0.0F) || !std::isfinite(prefix.totalCost))
+        const auto validCost = [](float value) {
+            return std::isfinite(value) && value >= 0.0F;
+        };
+        if (!std::isfinite(prefix.pathLengthPredictionVoxels) ||
+            !(prefix.pathLengthPredictionVoxels > 0.0F) ||
+            !validCost(prefix.cost.invalidPrediction) ||
+            !validCost(prefix.cost.alignment) ||
+            !validCost(prefix.cost.isotropicSmoothness) ||
+            !validCost(prefix.cost.tangentSmoothness) ||
+            !validCost(prefix.cost.normalSmoothness))
             throw std::invalid_argument("fiberlet prefix length or cost is invalid");
+        validateFinite(prefix.firstStepBaseXYZ, "prefix first step");
+        validateFinite(prefix.lastStepBaseXYZ, "prefix last step");
+        if (!(prefix.firstStepBaseXYZ.dot(prefix.firstStepBaseXYZ) > 0.0F) ||
+            !(prefix.lastStepBaseXYZ.dot(prefix.lastStepBaseXYZ) > 0.0F))
+            throw std::invalid_argument("fiberlet prefix endpoint step is zero");
         const auto local = keyLocal(config, prefix.id.first);
         for (std::size_t axis = 0; axis < 3; ++axis)
             appendUnsigned(field(static_cast<Field>(FirstZ + axis)).decoded, coordinateScalar, static_cast<std::uint64_t>(local[axis]));
@@ -648,15 +737,31 @@ std::vector<std::byte> serializeFiberletPrefixes(const FiberletStorageCodecConfi
         appendSigned(field(ExitU).decoded, latticeScalar, prefix.exitUV[0]);
         appendSigned(field(ExitV).decoded, latticeScalar, prefix.exitUV[1]);
         appendLittle(field(PathLength).decoded, prefix.pathLengthPredictionVoxels);
-        if (config.costBits == 32) {
-            appendLittle(field(TotalCost).decoded, prefix.totalCost);
+        if (config.profile == FiberletStorageProfile::Float32Cache) {
+            appendLittle(field(InvalidPredictionCost).decoded,
+                prefix.cost.invalidPrediction);
+            appendLittle(field(AlignmentCost).decoded, prefix.cost.alignment);
+            appendLittle(field(IsotropicSmoothnessCost).decoded,
+                prefix.cost.isotropicSmoothness);
+            appendLittle(field(TangentSmoothnessCost).decoded,
+                prefix.cost.tangentSmoothness);
+            appendLittle(field(NormalSmoothnessCost).decoded,
+                prefix.cost.normalSmoothness);
+        } else if (config.costBits == 32) {
+            appendLittle(field(TotalCost).decoded, prefix.cost.total());
         } else {
             const std::uint64_t maximumCode = config.costBits == 8 ? 255 : 65535;
             const auto code = costScale == 0.0F ? std::uint64_t{0}
-                                                : static_cast<std::uint64_t>(std::floor((prefix.totalCost - costOffset) / costScale + 0.5F));
+                                                : static_cast<std::uint64_t>(std::floor((prefix.cost.total() - costOffset) / costScale + 0.5F));
             if (code > maximumCode)
                 throw std::invalid_argument("fiberlet compact cost exceeds its chunk-local range");
             appendUnsigned(field(TotalCost).decoded, costScalar, code);
+        }
+        for (int axis = 0; axis < 3; ++axis) {
+            appendLittle(field(static_cast<Field>(FirstStepX + axis)).decoded,
+                prefix.firstStepBaseXYZ[axis]);
+            appendLittle(field(static_cast<Field>(LastStepX + axis)).decoded,
+                prefix.lastStepBaseXYZ[axis]);
         }
     }
     return encodePayload(config, FiberletStorageChunkKind::FiberletPrefix, prefixes.size(), 0, costOffset, costScale, std::move(fields));
@@ -701,10 +806,18 @@ FiberletDecodedAnchors deserializeFiberletAnchors(std::span<const std::byte> byt
     const auto& axisX = requireField(payload, AxisX, compact ? Scalar::U8 : Scalar::F32, payload.recordCount).second;
     const auto& axisY = requireField(payload, AxisY, compact ? Scalar::U8 : Scalar::F32, payload.recordCount).second;
     const std::vector<std::byte>* axisZ = compact ? nullptr : &requireField(payload, AxisZ, Scalar::F32, payload.recordCount).second;
+    const auto& predictionAxisX = requireField(payload, PredictionAxisX, compact ? Scalar::U8 : Scalar::F32, payload.recordCount).second;
+    const auto& predictionAxisY = requireField(payload, PredictionAxisY, compact ? Scalar::U8 : Scalar::F32, payload.recordCount).second;
+    const std::vector<std::byte>* predictionAxisZ = compact ? nullptr : &requireField(payload, PredictionAxisZ, Scalar::F32, payload.recordCount).second;
+    const auto& predictionPresence = requireField(payload, PredictionPresence, compact ? Scalar::U8 : Scalar::F32, payload.recordCount).second;
+    const auto& normalX = requireField(payload, NormalX, compact ? Scalar::U8 : Scalar::F32, payload.recordCount).second;
+    const auto& normalY = requireField(payload, NormalY, compact ? Scalar::U8 : Scalar::F32, payload.recordCount).second;
+    const std::vector<std::byte>* normalZ = compact ? nullptr : &requireField(payload, NormalZ, Scalar::F32, payload.recordCount).second;
+    const auto& scoringFlags = requireField(payload, ScoringFlags, Scalar::U8, payload.recordCount).second;
     const std::vector<std::byte>* positionX = compact ? nullptr : &requireField(payload, PositionX, Scalar::F32, payload.recordCount).second;
     const std::vector<std::byte>* positionY = compact ? nullptr : &requireField(payload, PositionY, Scalar::F32, payload.recordCount).second;
     const std::vector<std::byte>* positionZ = compact ? nullptr : &requireField(payload, PositionZ, Scalar::F32, payload.recordCount).second;
-    const std::size_t expectedFields = compact ? 6 : 10;
+    const std::size_t expectedFields = compact ? 12 : 18;
     if (payload.fields.size() != expectedFields)
         throw std::invalid_argument("fiberlet anchor payload contains unknown fields");
 
@@ -715,10 +828,31 @@ FiberletDecodedAnchors deserializeFiberletAnchors(std::span<const std::byte> byt
         FiberletStoredAnchor anchor;
         anchor.key =
             decodeKey(payload.config, {readUnsigned(z, coordinateScalar, index), readUnsigned(y, coordinateScalar, index), readUnsigned(x, coordinateScalar, index)}, readLittle<std::uint8_t>(variant, index));
+        const auto flags = readLittle<std::uint8_t>(scoringFlags, index);
+        if ((flags & ~std::uint8_t{7}) != 0)
+            throw std::invalid_argument("fiberlet anchor scoring flags are invalid");
+        anchor.predictionValid = (flags & 1U) != 0;
+        anchor.predictionPresenceValid = (flags & 2U) != 0;
+        anchor.normalValid = (flags & 4U) != 0;
         if (compact) {
             const auto decoded =
                 vc::lasagna::decodeCompactNormalFromRaw(readLittle<std::uint8_t>(axisX, index), readLittle<std::uint8_t>(axisY, index));
             anchor.fittedAxisXYZ = cv::Vec3f(decoded[0], decoded[1], decoded[2]);
+            const auto predictionDecoded =
+                vc::lasagna::decodeCompactNormalFromRaw(
+                    readLittle<std::uint8_t>(predictionAxisX, index),
+                    readLittle<std::uint8_t>(predictionAxisY, index));
+            anchor.predictionAxisXYZ = cv::Vec3f(
+                predictionDecoded[0], predictionDecoded[1],
+                predictionDecoded[2]);
+            anchor.predictionPresence = static_cast<float>(
+                readLittle<std::uint8_t>(predictionPresence, index)) / 255.0F;
+            const auto normalDecoded =
+                vc::lasagna::decodeCompactNormalFromRaw(
+                    readLittle<std::uint8_t>(normalX, index),
+                    readLittle<std::uint8_t>(normalY, index));
+            anchor.normalXYZ = cv::Vec3f(
+                normalDecoded[0], normalDecoded[1], normalDecoded[2]);
             const double scale = static_cast<double>(payload.config.positionQuantumBaseVoxels) / payload.config.predictionToBaseScale;
             anchor.positionPredictionXYZ = cv::Vec3f(
                 static_cast<float>(anchor.key.coordinateZYX[2] * scale),
@@ -729,9 +863,25 @@ FiberletDecodedAnchors deserializeFiberletAnchors(std::span<const std::byte> byt
                 cv::Vec3f(readLittle<float>(*positionX, index * 4), readLittle<float>(*positionY, index * 4), readLittle<float>(*positionZ, index * 4));
             anchor.fittedAxisXYZ =
                 cv::Vec3f(readLittle<float>(axisX, index * 4), readLittle<float>(axisY, index * 4), readLittle<float>(*axisZ, index * 4));
+            anchor.predictionAxisXYZ = cv::Vec3f(
+                readLittle<float>(predictionAxisX, index * 4),
+                readLittle<float>(predictionAxisY, index * 4),
+                readLittle<float>(*predictionAxisZ, index * 4));
+            anchor.predictionPresence =
+                readLittle<float>(predictionPresence, index * 4);
+            anchor.normalXYZ = cv::Vec3f(
+                readLittle<float>(normalX, index * 4),
+                readLittle<float>(normalY, index * 4),
+                readLittle<float>(*normalZ, index * 4));
         }
         validateFinite(anchor.positionPredictionXYZ, "decoded anchor position");
         validateFinite(anchor.fittedAxisXYZ, "decoded anchor axis");
+        if (!std::isfinite(anchor.predictionPresence))
+            throw std::invalid_argument("decoded fiberlet anchor presence is not finite");
+        if (anchor.predictionValid)
+            validateFinite(anchor.predictionAxisXYZ, "decoded anchor prediction axis");
+        if (anchor.normalValid)
+            validateFinite(anchor.normalXYZ, "decoded anchor normal");
         if (!result.anchors.empty() && !(result.anchors.back().key < anchor.key))
             throw std::invalid_argument("decoded fiberlet anchors are not strictly sorted");
         result.anchors.push_back(anchor);
@@ -764,8 +914,36 @@ FiberletDecodedPrefixes deserializeFiberletPrefixes(std::span<const std::byte> b
     const auto& exitU = get(ExitU, latticeScalar);
     const auto& exitV = get(ExitV, latticeScalar);
     const auto& length = get(PathLength, Scalar::F32);
-    const auto& cost = get(TotalCost, costScalar);
-    if (payload.fields.size() != 15)
+    const bool floatCache =
+        payload.config.profile == FiberletStorageProfile::Float32Cache;
+    const std::vector<std::byte>* totalCost = floatCache
+        ? nullptr
+        : &get(TotalCost, costScalar);
+    const std::vector<std::byte>* invalidPredictionCost = floatCache
+        ? &get(InvalidPredictionCost, Scalar::F32)
+        : nullptr;
+    const std::vector<std::byte>* alignmentCost = floatCache
+        ? &get(AlignmentCost, Scalar::F32)
+        : nullptr;
+    const std::vector<std::byte>* isotropicSmoothnessCost = floatCache
+        ? &get(IsotropicSmoothnessCost, Scalar::F32)
+        : nullptr;
+    const std::vector<std::byte>* tangentSmoothnessCost = floatCache
+        ? &get(TangentSmoothnessCost, Scalar::F32)
+        : nullptr;
+    const std::vector<std::byte>* normalSmoothnessCost = floatCache
+        ? &get(NormalSmoothnessCost, Scalar::F32)
+        : nullptr;
+    std::array<const std::vector<std::byte>*, 3> firstStep{};
+    std::array<const std::vector<std::byte>*, 3> lastStep{};
+    for (int axis = 0; axis < 3; ++axis) {
+        firstStep[axis] =
+            &get(static_cast<Field>(FirstStepX + axis), Scalar::F32);
+        lastStep[axis] =
+            &get(static_cast<Field>(LastStepX + axis), Scalar::F32);
+    }
+    const std::size_t expectedFields = floatCache ? 25 : 21;
+    if (payload.fields.size() != expectedFields)
         throw std::invalid_argument("fiberlet prefix payload contains unknown fields");
     if (!std::isfinite(payload.costOffset) || !std::isfinite(payload.costScale) || payload.costScale < 0.0F)
         throw std::invalid_argument("fiberlet cost affine range is invalid");
@@ -801,12 +979,43 @@ FiberletDecodedPrefixes deserializeFiberletPrefixes(std::span<const std::byte> b
         prefix.entryUV = {lattice(entryU), lattice(entryV)};
         prefix.exitUV = {lattice(exitU), lattice(exitV)};
         prefix.pathLengthPredictionVoxels = readLittle<float>(length, index * 4);
-        if (payload.config.costBits == 32)
-            prefix.totalCost = readLittle<float>(cost, index * 4);
-        else
-            prefix.totalCost = payload.costOffset + payload.costScale * static_cast<float>(readUnsigned(cost, costScalar, index));
-        if (!(prefix.pathLengthPredictionVoxels > 0.0F) || !std::isfinite(prefix.pathLengthPredictionVoxels) || !std::isfinite(prefix.totalCost))
+        if (floatCache) {
+            prefix.cost = {
+                readLittle<float>(*invalidPredictionCost, index * 4),
+                readLittle<float>(*alignmentCost, index * 4),
+                readLittle<float>(*isotropicSmoothnessCost, index * 4),
+                readLittle<float>(*tangentSmoothnessCost, index * 4),
+                readLittle<float>(*normalSmoothnessCost, index * 4),
+            };
+        } else {
+            prefix.cost.alignment = payload.config.costBits == 32
+                ? readLittle<float>(*totalCost, index * 4)
+                : payload.costOffset + payload.costScale *
+                    static_cast<float>(readUnsigned(
+                        *totalCost, costScalar, index));
+        }
+        for (int axis = 0; axis < 3; ++axis) {
+            prefix.firstStepBaseXYZ[axis] =
+                readLittle<float>(*firstStep[axis], index * 4);
+            prefix.lastStepBaseXYZ[axis] =
+                readLittle<float>(*lastStep[axis], index * 4);
+        }
+        const auto validCost = [](float value) {
+            return std::isfinite(value) && value >= 0.0F;
+        };
+        if (!(prefix.pathLengthPredictionVoxels > 0.0F) ||
+            !std::isfinite(prefix.pathLengthPredictionVoxels) ||
+            !validCost(prefix.cost.invalidPrediction) ||
+            !validCost(prefix.cost.alignment) ||
+            !validCost(prefix.cost.isotropicSmoothness) ||
+            !validCost(prefix.cost.tangentSmoothness) ||
+            !validCost(prefix.cost.normalSmoothness))
             throw std::invalid_argument("decoded fiberlet length or cost is invalid");
+        validateFinite(prefix.firstStepBaseXYZ, "decoded prefix first step");
+        validateFinite(prefix.lastStepBaseXYZ, "decoded prefix last step");
+        if (!(prefix.firstStepBaseXYZ.dot(prefix.firstStepBaseXYZ) > 0.0F) ||
+            !(prefix.lastStepBaseXYZ.dot(prefix.lastStepBaseXYZ) > 0.0F))
+            throw std::invalid_argument("decoded fiberlet prefix endpoint step is zero");
         if (!result.prefixes.empty() && !(result.prefixes.back().id < prefix.id))
             throw std::invalid_argument("decoded fiberlet prefixes are not strictly sorted");
         result.prefixes.push_back(prefix);

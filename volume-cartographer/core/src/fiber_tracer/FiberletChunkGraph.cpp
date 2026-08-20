@@ -75,10 +75,14 @@ cv::Vec3f normalized(const cv::Vec3f& value)
     return value / magnitude;
 }
 
-FiberletPathCost storedTotalCost(float total)
+FiberletPathCost storedPathCost(const FiberletStoredPathCost& stored)
 {
     FiberletPathCost result;
-    result.alignment = total;
+    result.invalidPrediction = stored.invalidPrediction;
+    result.alignment = stored.alignment;
+    result.isotropicSmoothness = stored.isotropicSmoothness;
+    result.tangentSmoothness = stored.tangentSmoothness;
+    result.normalSmoothness = stored.normalSmoothness;
     return result;
 }
 
@@ -91,26 +95,6 @@ FiberletPathCost pathCost(const FiberLocalMetricCost& local)
     result.tangentSmoothness = local.tangentSmoothness;
     result.normalSmoothness = local.normalSmoothness;
     return result;
-}
-
-FiberLocalMetricSample bestAlignedSample(const FiberPredictionSample& sampled, const cv::Vec3f& reference)
-{
-    const cv::Vec3f unitReference = normalized(reference);
-    FiberLocalMetricSample best;
-    float bestScore = -1.0F;
-    for (const auto& option : sampled.options) {
-        if (!option.valid)
-            continue;
-        cv::Vec3f direction = normalized(option.direction);
-        if (direction.dot(unitReference) < 0.0F)
-            direction = -direction;
-        const float score = std::max(0.0F, direction.dot(unitReference)) * std::clamp(option.presence, 0.0F, 1.0F);
-        if (score > bestScore) {
-            bestScore = score;
-            best = {direction, option.presence, true};
-        }
-    }
-    return best;
 }
 
 const FiberletStorageKey& directedSource(const DirectedFiberletStorageId& id)
@@ -301,21 +285,6 @@ FiberletGraphQuery<FiberletEdgeLease> FiberletChunkGraphSource::edge(
         result.error = secondAnchor.error;
         return result;
     }
-    try {
-        result.value.endpointSteps = reconstructFiberletRouteEndpointSteps(
-            firstAnchor.value.anchor.positionPredictionXYZ,
-            firstAnchor.value.anchor.fittedAxisXYZ,
-            secondAnchor.value.anchor.positionPredictionXYZ,
-            secondAnchor.value.anchor.fittedAxisXYZ,
-            prefix->interiorPointCount,
-            prefix->entryUV,
-            prefix->exitUV,
-            pathConfig_);
-    } catch (const std::exception& error) {
-        result.status = FiberletGraphQueryStatus::Error;
-        result.error = error.what();
-        return result;
-    }
     result.status = FiberletGraphQueryStatus::Ready;
     result.value.prefixPayloadLease = std::move(prefixPayload);
     result.value.anchorPayloadLeases = {
@@ -405,8 +374,6 @@ FiberletGraphQuery<FiberletRouteLease> FiberletChunkGraphSource::route(const Fib
 
 FiberletCachedReplayGraphSource::FiberletCachedReplayGraphSource(
     std::shared_ptr<FiberletOnDemandPreprocessor> preprocessor,
-    const FiberPredictionSource& predictionSource,
-    std::shared_ptr<const vc::lasagna::NormalSampler> normalSampler,
     FiberletPathConfig pathConfig,
     float maximumJoinAngleDegrees)
     : preprocessor_(std::move(preprocessor))
@@ -416,12 +383,10 @@ FiberletCachedReplayGraphSource::FiberletCachedReplayGraphSource(
           preprocessor_ ? preprocessor_->fiberletDataset() : nullptr,
           preprocessor_ ? preprocessor_->fiberletCache() : nullptr,
           pathConfig)
-    , predictionSource_(&predictionSource)
-    , normalSampler_(std::move(normalSampler))
     , pathConfig_(std::move(pathConfig))
     , maximumJoinAngleDegrees_(maximumJoinAngleDegrees)
 {
-    if (!preprocessor_ || !normalSampler_ ||
+    if (!preprocessor_ ||
         !(maximumJoinAngleDegrees_ >= 0.0F) ||
         !(maximumJoinAngleDegrees_ <= 180.0F) ||
         !std::isfinite(maximumJoinAngleDegrees_)) {
@@ -509,14 +474,14 @@ FiberletReplaySourceArc FiberletCachedReplayGraphSource::arc(const DirectedFiber
     result.source = directedSource(id);
     result.target = directedTarget(id);
     result.pathLengthPredictionVoxels = loaded.value.prefix.pathLengthPredictionVoxels;
-    result.cost = storedTotalCost(loaded.value.prefix.totalCost);
+    result.cost = storedPathCost(loaded.value.prefix.cost);
     const float scale = predictionToBaseScale();
     const cv::Vec3d firstPosition(
         loaded.value.firstAnchor.positionPredictionXYZ * scale);
     const cv::Vec3d secondPosition(
         loaded.value.secondAnchor.positionPredictionXYZ * scale);
-    const cv::Vec3f firstStep = loaded.value.endpointSteps.firstPredictionXYZ * scale;
-    const cv::Vec3f lastStep = loaded.value.endpointSteps.lastPredictionXYZ * scale;
+    const cv::Vec3f firstStep = loaded.value.prefix.firstStepBaseXYZ;
+    const cv::Vec3f lastStep = loaded.value.prefix.lastStepBaseXYZ;
     if (!id.reverse) {
         result.sourcePositionBaseXYZ = firstPosition;
         result.targetPositionBaseXYZ = secondPosition;
@@ -562,12 +527,15 @@ std::optional<FiberletReplaySourceTransition> FiberletCachedReplayGraphSource::t
     if (!(joinDot > minimumJoinDot))
         return std::nullopt;
 
-    const cv::Vec3d sharedPrediction = incomingArc.targetPositionBaseXYZ / static_cast<double>(predictionToBaseScale());
-    const auto sampled = predictionSource_->sample(sharedPrediction, cv::Vec3d(outgoingDirection));
-    const auto prediction = bestAlignedSample(sampled, outgoingDirection);
-    if (!prediction.valid)
+    const auto shared = chunks_.anchor(incomingArc.target, true);
+    if (shared.status != FiberletGraphQueryStatus::Ready)
+        throw std::runtime_error("cached fiberlet transition anchor failed: " + shared.error);
+    if (!shared.value.anchor.predictionValid)
         return std::nullopt;
-    const auto normal = normalSampler_->sampleNormal(sharedPrediction);
+    const FiberLocalMetricSample prediction{
+        shared.value.anchor.predictionAxisXYZ,
+        shared.value.anchor.predictionPresence,
+        true};
     const auto local = fiberLocalMetricCost(
         &prediction,
         prediction,
@@ -575,8 +543,8 @@ std::optional<FiberletReplaySourceTransition> FiberletCachedReplayGraphSource::t
         vectorLength(incomingStepBase) / predictionToBaseScale(),
         outgoingDirection,
         vectorLength(outgoingStepBase) / predictionToBaseScale(),
-        cv::Vec3f(normal.normal),
-        normal.valid,
+        shared.value.anchor.normalXYZ,
+        shared.value.anchor.normalValid,
         FiberLocalMetricConfig{
             pathConfig_.invalidPredictionCostPerVoxel,
             FiberLocalSmoothnessConfig{

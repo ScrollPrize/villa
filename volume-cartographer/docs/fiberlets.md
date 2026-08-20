@@ -511,6 +511,15 @@ budget; they do not retain another serialized copy or use a graph-private LRU.
 Prefix records and exact endpoint steps are sufficient for beam ranking and
 join scoring. A route block is loaded and its full polyline reconstructed only
 after an edge is selected for commitment. Evicted chunks reload transparently.
+For the float cache, anchors own the exact interpolated prediction/presence and
+normal samples used by eager graph construction, while prefixes own all five
+float path-cost components, the authoritative float path length, and the exact
+first/last base-space steps. Cached joins consume those records directly; they
+do not resample source volumes or reconstruct scoring geometry. Reconstructed
+committed routes apply the same adjacent-point epsilon suppression as DP
+finalization. Therefore cold and warm float-cache replay are required to be
+byte-identical to eager replay for the same graph. The compact profile remains
+intentionally quantized and does not provide that identity guarantee.
 The final `fiber_replay_cache` row reports disk materialization counts for
 anchor, prefix, and route chunks; multiple committed edges in one route chunk
 share one decode. `--eager-graph` runs the prior whole-tube graph construction

@@ -50,6 +50,26 @@ struct FiberletStoredAnchor {
     FiberletStorageKey key;
     cv::Vec3f positionPredictionXYZ{0.0F, 0.0F, 0.0F};
     cv::Vec3f fittedAxisXYZ{1.0F, 0.0F, 0.0F};
+    cv::Vec3f predictionAxisXYZ{0.0F, 0.0F, 0.0F};
+    float predictionPresence = 0.0F;
+    cv::Vec3f normalXYZ{0.0F, 0.0F, 0.0F};
+    bool predictionValid = false;
+    bool predictionPresenceValid = false;
+    bool normalValid = false;
+};
+
+struct FiberletStoredPathCost {
+    float invalidPrediction = 0.0F;
+    float alignment = 0.0F;
+    float isotropicSmoothness = 0.0F;
+    float tangentSmoothness = 0.0F;
+    float normalSmoothness = 0.0F;
+
+    [[nodiscard]] float total() const noexcept
+    {
+        return invalidPrediction + alignment + isotropicSmoothness +
+            tangentSmoothness + normalSmoothness;
+    }
 };
 
 struct FiberletStoredPrefix {
@@ -58,7 +78,9 @@ struct FiberletStoredPrefix {
     std::array<std::int16_t, 2> entryUV{0, 0};
     std::array<std::int16_t, 2> exitUV{0, 0};
     float pathLengthPredictionVoxels = 0.0F;
-    float totalCost = 0.0F;
+    FiberletStoredPathCost cost;
+    cv::Vec3f firstStepBaseXYZ{0.0F, 0.0F, 0.0F};
+    cv::Vec3f lastStepBaseXYZ{0.0F, 0.0F, 0.0F};
 };
 
 struct FiberletStoredRoute {

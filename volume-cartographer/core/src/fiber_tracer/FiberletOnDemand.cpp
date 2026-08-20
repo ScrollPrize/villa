@@ -56,19 +56,6 @@ FiberletStorageKey storageKey(const FiberletAnchorId& id)
     return {{static_cast<std::int64_t>(id.cellZYX[0]), static_cast<std::int64_t>(id.cellZYX[1]), static_cast<std::int64_t>(id.cellZYX[2])}, static_cast<std::uint8_t>(id.componentIndex)};
 }
 
-float pathLength(std::span<const cv::Vec3f> points)
-{
-    double length = 0.0;
-    for (std::size_t index = 1; index < points.size(); ++index) {
-        const auto delta = points[index] - points[index - 1];
-        length += std::sqrt(static_cast<double>(delta.dot(delta)));
-    }
-    const float result = static_cast<float>(length);
-    if (!(result > 0.0F) || !std::isfinite(result))
-        throw std::invalid_argument("fiberlet path has invalid length");
-    return result;
-}
-
 const char* chunkStatusName(vc::render::ChunkStatus status) noexcept
 {
     switch (status) {
@@ -317,6 +304,24 @@ FiberletOnDemandPreprocessor::generateAnchorChunk(
         }
     }
     std::sort(stored.begin(), stored.end(), [](const auto& left, const auto& right) { return left.key < right.key; });
+    std::vector<cv::Vec3f> scoringPoints;
+    scoringPoints.reserve(stored.size());
+    for (const auto& anchor : stored)
+        scoringPoints.push_back(anchor.positionPredictionXYZ);
+    const auto scoring = sampleFiberletScoringPoints(
+        scoringPoints, config.grid, config.pathConfig,
+        config.predictionSampler, *config.normalSampler);
+    if (scoring.size() != stored.size())
+        throw std::logic_error("fiberlet anchor scoring count is inconsistent");
+    for (std::size_t index = 0; index < stored.size(); ++index) {
+        stored[index].predictionAxisXYZ = scoring[index].prediction.direction;
+        stored[index].predictionPresence = scoring[index].prediction.presence;
+        stored[index].normalXYZ = scoring[index].normalXYZ;
+        stored[index].predictionValid = scoring[index].prediction.valid;
+        stored[index].predictionPresenceValid =
+            scoring[index].prediction.presenceValid;
+        stored[index].normalValid = scoring[index].normalValid;
+    }
     if (config.progress) {
         config.progress(FiberletOnDemandProgress{
             .stage = "anchors",
@@ -532,6 +537,9 @@ FiberletOnDemandPreprocessor::generateFiberletChunk(
             .inputCount = storedAnchors.size()});
     }
     const std::size_t inputAnchorCount = storedAnchors.size();
+    std::map<FiberletStorageKey, FiberletStoredAnchor> scoringByAnchor;
+    for (const auto& anchor : storedAnchors)
+        scoringByAnchor.emplace(anchor.key, anchor);
     auto loaded = loadedAnchors(config.grid, config.anchorConfig, std::move(storedAnchors));
     const auto ownerBegin = codec.coordinateOriginZYX;
     std::array<std::int64_t, 3> ownerEnd{};
@@ -567,9 +575,31 @@ FiberletOnDemandPreprocessor::generateFiberletChunk(
         FiberletStoredRoute route;
     };
     std::vector<StoredPair> pairs;
+    const auto validateEndpointScoring = [&](const FiberletAnchorId& id,
+                                             const FiberletPredictionSample& prediction,
+                                             const cv::Vec3f& normal,
+                                             bool normalValid) {
+        const auto found = scoringByAnchor.find(storageKey(id));
+        if (found == scoringByAnchor.end())
+            throw std::logic_error("fiberlet endpoint scoring anchor is absent");
+        const auto& stored = found->second;
+        if (stored.predictionValid != prediction.valid ||
+            stored.predictionPresenceValid != prediction.presenceValid ||
+            stored.normalValid != normalValid ||
+            stored.predictionPresence != prediction.presence ||
+            (prediction.valid && stored.predictionAxisXYZ != prediction.direction) ||
+            (normalValid && stored.normalXYZ != normal)) {
+            throw std::logic_error(
+                "fiberlet endpoint scoring differs from its cached anchor sample");
+        }
+    };
     for (const auto& candidate : report.candidates) {
         if (!candidate.success)
             continue;
+        validateEndpointScoring(candidate.start, candidate.startPrediction,
+            candidate.startNormalXYZ, candidate.startNormalValid);
+        validateEndpointScoring(candidate.target, candidate.targetPrediction,
+            candidate.targetNormalXYZ, candidate.targetNormalValid);
         if (candidate.routeLatticeUV.size() > std::numeric_limits<std::uint16_t>::max())
             throw std::overflow_error("fiberlet route has too many interior layers");
         StoredPair stored;
@@ -582,8 +612,24 @@ FiberletOnDemandPreprocessor::generateFiberletChunk(
         if (candidate.routeLatticeUV.size() > 2) {
             stored.route.middleUV.assign(candidate.routeLatticeUV.begin() + 1, candidate.routeLatticeUV.end() - 1);
         }
-        stored.prefix.pathLengthPredictionVoxels = pathLength(candidate.pointsPredictionXYZ);
-        stored.prefix.totalCost = candidate.cost.total();
+        if (candidate.pointsPredictionXYZ.size() < 2)
+            throw std::logic_error("successful fiberlet has no endpoint steps");
+        stored.prefix.pathLengthPredictionVoxels =
+            fiberletCandidatePathLength(candidate);
+        stored.prefix.cost = {
+            candidate.cost.invalidPrediction,
+            candidate.cost.alignment,
+            candidate.cost.isotropicSmoothness,
+            candidate.cost.tangentSmoothness,
+            candidate.cost.normalSmoothness,
+        };
+        const float scale = static_cast<float>(config.grid.predictionToBaseScale);
+        stored.prefix.firstStepBaseXYZ =
+            candidate.pointsPredictionXYZ[1] * scale -
+            candidate.pointsPredictionXYZ.front() * scale;
+        stored.prefix.lastStepBaseXYZ =
+            candidate.pointsPredictionXYZ.back() * scale -
+            candidate.pointsPredictionXYZ[candidate.pointsPredictionXYZ.size() - 2] * scale;
         pairs.push_back(std::move(stored));
     }
     std::sort(pairs.begin(), pairs.end(), [](const auto& left, const auto& right) { return left.prefix.id < right.prefix.id; });

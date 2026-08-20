@@ -1,5 +1,15 @@
 # 2026-08-20: on-demand fiberlet storage and replay
 
+- Replaced the unpublished cache payload with strict version 2. Float-cache
+  anchors now retain canonical endpoint prediction/normal samples, and
+  prefixes retain all five cost components, authoritative path length, and
+  exact base-space endpoint steps. Cached joins no longer resample source
+  volumes, and committed route reconstruction matches DP duplicate suppression.
+- Canonicalized replay diagnostic indices across eager and cached graph
+  adapters. On the 5,000-base-voxel Paris4 corridor, cold-cache, warm-cache,
+  and eager replay produce byte-identical 342-point/65-edge fiberlet JSON and
+  OBJ, total loss `91.7058129850775`, and loss density
+  `0.14645713824432563`.
 - Added strict version-1 float32 and compact fiberlet structure-of-arrays
   codecs with independently compressed fields, checksummed headers, stable
   anchor/edge identities, and separate connectivity and route payloads.

@@ -3027,7 +3027,7 @@
   predicate. Batch and worker counts cannot change serialized path/graph
   results or the unique request population.
 - Lazy replay stores anchors and fiberlets in separate local Zarr-v2-layout
-  roots. Their arrays contain explicitly identified custom version-1 object
+  roots. Their arrays contain explicitly identified custom version-2 object
   payloads rather than tensor samples. Prefix and route arrays are separate so
   adjacency and beam ranking do not retain unused route geometry. A fiberlet
   owner chunk blocks only on the complete bounded halo of anchor chunks needed
@@ -3041,11 +3041,21 @@
   participants in the shared budget. A decoded prefix payload builds and
   charges a deterministic two-endpoint incident index once. Incident queries
   batch-prefetch every possible owner chunk, lease those indexed payloads, and
-  release the leases after the query. Beam ranking and transition scoring use
-  prefix data plus exact endpoint steps reconstructed from the two anchors.
+  release the leases after the query. Float-cache anchors persist the exact
+  endpoint prediction direction, presence, validity flags, Lasagna normal, and
+  normal validity produced by canonical DP interpolation. Float-cache prefixes
+  persist all five additive path-cost components, authoritative float path
+  length, and exact base-space first/final nonzero steps. Beam ranking and
+  transition scoring consume those records directly; replay must not resample
+  source volumes or reconstruct endpoint scoring geometry.
   Route payloads and full polyline reconstruction are requested only for the
   edge selected for commitment, not for lookahead candidates. Cache eviction
   and reload therefore cannot invalidate graph identity or alter tie order.
+  Committed route reconstruction applies the same adjacent-point epsilon
+  suppression as eager DP finalization. For the same extracted graph, cold and
+  warm float-cache replay artifacts must be byte-identical to eager replay.
+  Compact storage is intentionally quantized and excluded from this identity
+  contract.
   Active payload leases may temporarily exceed the nominal cache budget, but
   unleased connectivity and geometry remain LRU-bound.
 - Sparse payloads are strict and unpublished: no version repair or compatibility

@@ -1,88 +1,52 @@
-# Plan: corridor-filter on-demand fiberlet preprocessing
+# Plan: exact float-cache fiberlet replay
 
-## 1. Corridor selection and cache identity
+## 1. Canonical scoring and geometry
 
-1. Reuse the existing exact fiber replay tube cell selector. It enumerates only
-   the bounded coarse-cell neighborhoods of reference segments and performs an
-   exact segment-to-cell-AABB test; do not add a brute-force cell/segment scan.
-2. Compute the selected cells once for the active reference interval and radius,
-   preserve canonical Z/Y/X order, and bind the canonical clipped reference
-   geometry, exact radius, selector version, and cell selection into both
-   generated dataset fingerprints.
-3. Pass the immutable selection and the existing R-tree-backed replay-tube
-   containment query into the on-demand preprocessor. Validate that
-   cells are ordered, unique, in the prediction grid, and consistent with both
-   cache grids.
+1. Expose one canonical batched fiberlet scoring-point sampler from the existing
+   `FiberPaths` interpolation implementation. It must use the same stored-grid
+   corners, prepared tensors, closed-form principal-axis resolution, float32
+   arithmetic, and Lasagna normal sampling as DP endpoint materialization.
+2. Evaluate that sampler for the accepted anchors in each generated anchor
+   chunk and persist prediction direction, presence, both prediction-validity
+   bits, normal, and normal validity. Assert that independently materialized DP
+   endpoint samples have the same float bits for shared anchors.
+3. Persist each accepted fiberlet's authoritative eager float path length and
+   exact first/final nonzero **base-space** steps. Eager scales endpoint points
+   to float32 base coordinates before subtraction; do not subtract in prediction
+   space and scale afterward. Reconstruct committed routes with the same
+   epsilon-based adjacent duplicate suppression used when DP output is finalized.
 
-## 2. Filtered chunk generation
+## 2. Exact costs and graph adapter
 
-4. Partition the selected cells by anchor owner chunk once during preprocessor
-   initialization. Anchor generation must look up only its selected cells; it
-   must not enumerate all 4,096 cells and then perform geometry checks. The
-   existing extraction pipeline must still construct neighboring NMS context as
-   suppressors while publishing only selected cells owned by the requested
-   chunk, including across owner-chunk boundaries.
-5. Apply the shared exact-tube query to fitted-anchor retention and every
-   fiberlet DP point, matching eager tube extraction. Keep empty valid chunks
-   representable. Fiberlet generation continues to consume cached anchor
-   dependency chunks and therefore excludes unselected endpoint cells.
-6. Retain stable cell, anchor, candidate, and serialized ordering so the cached
-   result agrees with eager extraction over the same selected cell set.
+4. Replace the float prefix's scalar total with all five `FiberletPathCost`
+   components. Preserve their float32 bits and summation order. Compact storage
+   may continue to quantize a scalar total because it is intentionally lossy.
+5. Make cached `arc()` return the persisted steps and full cost. Make cached
+   `transition()` use the persisted shared-anchor scoring sample and the same
+   `fiberLocalMetricCost` call as eager graph construction; remove the separate
+   prediction/normal resampling path.
+6. Replace the unpublished strict payload magic/schema and cache algorithm
+   identity. Do not decode prior payloads.
+7. Make replay diagnostic node/edge/arc/transition indices canonical functions
+   of stable IDs in both graph adapters. Adapter-local encounter indices must
+   not obscure otherwise identical replay JSON.
 
-## 3. Ahead-of-traversal scheduling
+## 3. Verification
 
-7. Derive both owner partitions and the complete ordered reference chunk
-   schedule from the single immutable selected-cell population. Submit that
-   schedule through the existing `prefetchScheduled()` entry point. After the
-   app initializes progress bookkeeping and before graph evaluation starts,
-   call `prefetchScheduled(schedule, 0, schedule.size(), false)`. Do not
-   wait for the complete schedule: cache workers should prepare upcoming anchor
-   dependencies and fiberlet chunks while traversal consumes earlier chunks.
-8. Keep ordinary blocking graph lookups as the correctness fallback and promote
-   an already queued background request to foreground priority when demanded.
-   Scheduling must not create a second queue or cache outside `ChunkCache` and
-   its LRU.
-9. Report global schedule counts and completed chunk counts through the existing
-   replay progress records so foreground graph progress and background
-   preprocessing can be distinguished.
+8. Extend codec tests for bit-exact scoring, endpoint-step, and cost-component
+   round trips. Add direct tests that reconstructed routes suppress the same
+   duplicate points and cached joins match eager joins.
+9. Build with `-j32` and run storage, path, graph/replay, cache, and anchor
+   tests.
+10. Run identical cold eager and cached 5,000-base-voxel Paris4 corridors.
+   Require equal populations and byte-identical `fiberlet` replay JSON, then
+   Also compare stable edge IDs, path-length/step/cost bits, transition
+   eligibility/cost bits, route IDs and route-point bits. Report wall/CPU/RSS
+   and any remaining performance difference.
 
-## 4. Validation and measurement
+## Spec and documentation
 
-10. Add focused tests showing a touched chunk generates only selected cells,
-    displaced out-of-corridor anchors and paths are absent, geometry/radius
-    changes reject stale persisted datasets, schedule/partition coverage is
-    exact, scheduled prefetch materializes data without a foreground request,
-    and a later blocking request promotes queued work with one worker. Cover
-    radius-zero selection, shared cell boundaries, partial volume cells, clipped
-    endpoints, repeated reference points, non-unit prediction scale,
-    cross-chunk NMS, and a retained-endpoint path whose interior leaves the tube.
-11. Compare eager and cached replay fixtures for deterministic geometry, costs,
-    failures, and ordering. Run the affected cache, storage, path, and replay
-    tests and build `vc_fiberlets` with `-j32`.
-12. Run same-checkout eager and before/after on-demand canonical
-    5,000-base-voxel Paris4 replays with identical build, arguments, threads,
-    and cold generated-cache/OS-cache policy. Profile hotspots, repeat at least
-    three times, and report mean, median, min/max or p95 wall/CPU time, selected
-    versus avoided cells, generated chunks, effective core use, and any
-    remaining gap.
-
-## Spec update
-
-Change the on-demand preprocessing contract to make generated anchor/fiberlet
-datasets corridor-specific processing caches. Specify bounded exact cell
-selection, geometry/radius-dependent dataset identity, shared indexed tube
-containment for fitted anchors and DP points, per-owner-chunk selected-cell
-lookup, foreground priority promotion, and nonblocking submission of the
-ordered reference schedule through the existing chunk-cache scheduler.
-
-## Documentation update
-
-Update `volume-cartographer/docs/fiberlets.md` and the fiberlet storage
-documentation with corridor-specific cache identity, filtered anchor ownership,
-and the relationship between scheduled background preprocessing and blocking
-cache lookup.
-
-## Changelog update
-
-Record removal of full-chunk anchor overprocessing and activation of the
-previously unused replay schedule, including the measured 5,000-voxel result.
+Document float-cache transparency, canonical anchor scoring ownership, exact
+prefix steps/costs, duplicate-free route reconstruction, and the intentionally
+lossy compact profile. Record the schema replacement and measured equivalence
+in the changelog and task log.

@@ -62,8 +62,12 @@ TEST_CASE("Fiberlet storage float anchors round trip exact float bits")
 {
     const auto config = floatConfig();
     const std::vector<FiberletStoredAnchor> anchors{
-        {key(101, 202, 303), {3.25F, 2.5F, 1.75F}, {0.0F, 0.6F, 0.8F}},
-        {key(101, 202, 303, 1), {3.5F, 2.75F, 1.5F}, {1.0F, 0.0F, 0.0F}},
+        {key(101, 202, 303), {3.25F, 2.5F, 1.75F},
+         {0.0F, 0.6F, 0.8F}, {0.3F, 0.4F, 0.8660254F}, 0.625F,
+         {0.0F, 1.0F, 0.0F}, true, true, true},
+        {key(101, 202, 303, 1), {3.5F, 2.75F, 1.5F},
+         {1.0F, 0.0F, 0.0F}, {0.0F, 0.0F, 0.0F}, 0.125F,
+         {0.0F, 0.0F, 0.0F}, false, true, false},
     };
     const auto bytes = serializeFiberletAnchors(config, anchors);
     const auto decoded = deserializeFiberletAnchors(bytes);
@@ -71,6 +75,16 @@ TEST_CASE("Fiberlet storage float anchors round trip exact float bits")
     CHECK(decoded.anchors[0].key == anchors[0].key);
     CHECK(decoded.anchors[0].positionPredictionXYZ == anchors[0].positionPredictionXYZ);
     CHECK(decoded.anchors[0].fittedAxisXYZ == anchors[0].fittedAxisXYZ);
+    CHECK(decoded.anchors[0].predictionAxisXYZ == anchors[0].predictionAxisXYZ);
+    CHECK(decoded.anchors[0].predictionPresence == anchors[0].predictionPresence);
+    CHECK(decoded.anchors[0].normalXYZ == anchors[0].normalXYZ);
+    CHECK(decoded.anchors[0].predictionValid == anchors[0].predictionValid);
+    CHECK(decoded.anchors[0].predictionPresenceValid ==
+          anchors[0].predictionPresenceValid);
+    CHECK(decoded.anchors[0].normalValid == anchors[0].normalValid);
+    CHECK_FALSE(decoded.anchors[1].predictionValid);
+    CHECK(decoded.anchors[1].predictionPresenceValid);
+    CHECK_FALSE(decoded.anchors[1].normalValid);
     CHECK(serializeFiberletAnchors(config, anchors) == bytes);
 }
 
@@ -93,8 +107,18 @@ TEST_CASE("Fiberlet storage prefixes and independently cached routes round trip"
 {
     auto config = floatConfig();
     const std::vector<FiberletStoredPrefix> prefixes{
-        {{key(101, 202, 303), key(102, 203, 304)}, 4, {-1, 2}, {3, -4}, 7.5F, 2.25F},
-        {{key(101, 202, 303), key(104, 204, 305)}, 2, {0, 1}, {0, 1}, 9.0F, 8.5F},
+        {.id = {key(101, 202, 303), key(102, 203, 304)},
+         .interiorPointCount = 4, .entryUV = {-1, 2}, .exitUV = {3, -4},
+         .pathLengthPredictionVoxels = 7.5F,
+         .cost = {0.25F, 0.5F, 0.375F, 0.625F, 0.5F},
+         .firstStepBaseXYZ = {1.0F, 0.25F, 0.0F},
+         .lastStepBaseXYZ = {0.75F, -0.25F, 0.0F}},
+        {.id = {key(101, 202, 303), key(104, 204, 305)},
+         .interiorPointCount = 2, .entryUV = {0, 1}, .exitUV = {0, 1},
+         .pathLengthPredictionVoxels = 9.0F,
+         .cost = {1.0F, 2.0F, 1.5F, 2.5F, 1.5F},
+         .firstStepBaseXYZ = {1.0F, 0.0F, 0.25F},
+         .lastStepBaseXYZ = {1.0F, 0.0F, -0.25F}},
     };
     const std::vector<FiberletStoredRoute> routes{{{{0, 1}, {1, 1}}}, {}};
     const auto decodedPrefixes = deserializeFiberletPrefixes(serializeFiberletPrefixes(config, prefixes));
@@ -102,7 +126,20 @@ TEST_CASE("Fiberlet storage prefixes and independently cached routes round trip"
     REQUIRE(decodedPrefixes.prefixes.size() == 2);
     CHECK(decodedPrefixes.prefixes[0].id == prefixes[0].id);
     CHECK(decodedPrefixes.prefixes[0].entryUV == prefixes[0].entryUV);
-    CHECK(decodedPrefixes.prefixes[0].totalCost == prefixes[0].totalCost);
+    CHECK(decodedPrefixes.prefixes[0].cost.invalidPrediction ==
+          prefixes[0].cost.invalidPrediction);
+    CHECK(decodedPrefixes.prefixes[0].cost.alignment ==
+          prefixes[0].cost.alignment);
+    CHECK(decodedPrefixes.prefixes[0].cost.isotropicSmoothness ==
+          prefixes[0].cost.isotropicSmoothness);
+    CHECK(decodedPrefixes.prefixes[0].cost.tangentSmoothness ==
+          prefixes[0].cost.tangentSmoothness);
+    CHECK(decodedPrefixes.prefixes[0].cost.normalSmoothness ==
+          prefixes[0].cost.normalSmoothness);
+    CHECK(decodedPrefixes.prefixes[0].firstStepBaseXYZ ==
+          prefixes[0].firstStepBaseXYZ);
+    CHECK(decodedPrefixes.prefixes[0].lastStepBaseXYZ ==
+          prefixes[0].lastStepBaseXYZ);
     REQUIRE(decodedRoutes.routes.size() == 2);
     CHECK(decodedRoutes.routes[0].middleUV == routes[0].middleUV);
     CHECK(decodedRoutes.routes[1].middleUV.empty());
@@ -156,12 +193,16 @@ TEST_CASE("Fiberlet storage compact cost is decoded from the authoritative chunk
 {
     auto config = compactConfig();
     const std::vector<FiberletStoredPrefix> prefixes{
-        {{key(101, 202, 303), key(102, 203, 304)}, 0, {}, {}, 2.0F, 10.0F},
-        {{key(101, 202, 303), key(104, 204, 305)}, 0, {}, {}, 3.0F, 20.0F},
+        {.id = {key(101, 202, 303), key(102, 203, 304)},
+         .pathLengthPredictionVoxels = 2.0F, .cost = {0, 10.0F},
+         .firstStepBaseXYZ = {1, 0, 0}, .lastStepBaseXYZ = {1, 0, 0}},
+        {.id = {key(101, 202, 303), key(104, 204, 305)},
+         .pathLengthPredictionVoxels = 3.0F, .cost = {0, 20.0F},
+         .firstStepBaseXYZ = {1, 0, 0}, .lastStepBaseXYZ = {1, 0, 0}},
     };
     const auto decoded = deserializeFiberletPrefixes(serializeFiberletPrefixes(config, prefixes));
-    CHECK(decoded.prefixes[0].totalCost == doctest::Approx(10.0F));
-    CHECK(decoded.prefixes[1].totalCost == doctest::Approx(20.0F));
+    CHECK(decoded.prefixes[0].cost.total() == doctest::Approx(10.0F));
+    CHECK(decoded.prefixes[1].cost.total() == doctest::Approx(20.0F));
 }
 
 TEST_CASE("Fiberlet storage rejects corruption and noncanonical input")
@@ -169,6 +210,9 @@ TEST_CASE("Fiberlet storage rejects corruption and noncanonical input")
     const auto config = floatConfig();
     std::vector<FiberletStoredAnchor> anchors{{key(101, 202, 303), {1, 2, 3}, {1, 0, 0}}};
     auto bytes = serializeFiberletAnchors(config, anchors);
+    auto oldMagic = bytes;
+    oldMagic[6] = std::byte{'1'};
+    CHECK_THROWS_AS(deserializeFiberletAnchors(oldMagic), std::invalid_argument);
     bytes.back() ^= std::byte{1};
     CHECK_THROWS_AS(deserializeFiberletAnchors(bytes), std::invalid_argument);
 
@@ -340,7 +384,13 @@ TEST_CASE("Fiberlet chunk graph loads complete cross-chunk adjacency and routes"
             const bool owner = chunk.iz == 0 && chunk.iy == 1 && chunk.ix == 1;
             if (kind == FiberletStorageChunkKind::FiberletPrefix) {
                 const std::vector<FiberletStoredPrefix> prefixes =
-                    owner ? std::vector<FiberletStoredPrefix>{{edgeId, 0, {}, {}, 1.0F, 9.25F}} : std::vector<FiberletStoredPrefix>{};
+                    owner ? std::vector<FiberletStoredPrefix>{{
+                        .id = edgeId,
+                        .pathLengthPredictionVoxels = 1.0F,
+                        .cost = {0.25F, 4.0F, 1.0F, 2.0F, 2.0F},
+                        .firstStepBaseXYZ = {1, 0, 0},
+                        .lastStepBaseXYZ = {1, 0, 0}}}
+                          : std::vector<FiberletStoredPrefix>{};
                 return materialized(kind, serializeFiberletPrefixes(config, prefixes));
             }
             ++routeRequests;
@@ -364,13 +414,13 @@ TEST_CASE("Fiberlet chunk graph loads complete cross-chunk adjacency and routes"
 
     const auto edge = graph.edge(edgeId, true);
     REQUIRE(edge.status == FiberletGraphQueryStatus::Ready);
-    CHECK(edge.value.prefix.totalCost == 9.25F);
-    CHECK((edge.value.endpointSteps.firstPredictionXYZ == cv::Vec3f{1, 0, 0}));
+    CHECK(edge.value.prefix.cost.total() == 9.25F);
+    CHECK((edge.value.prefix.firstStepBaseXYZ == cv::Vec3f{1, 0, 0}));
     CHECK(routeRequests.load() == 0);
 
     auto route = graph.route(edgeId, true);
     REQUIRE(route.status == FiberletGraphQueryStatus::Ready);
-    CHECK(route.value.prefix.totalCost == 9.25F);
+    CHECK(route.value.prefix.cost.total() == 9.25F);
     CHECK(route.value.route.middleUV.empty());
     CHECK(route.value.pointsPredictionXYZ.size() == 2);
     CHECK(routeRequests.load() == 1);

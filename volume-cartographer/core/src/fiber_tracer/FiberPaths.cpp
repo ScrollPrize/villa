@@ -380,6 +380,51 @@ bool finiteVector(const cv::Vec3f& value)
     return std::isfinite(value[0]) && std::isfinite(value[1]) && std::isfinite(value[2]);
 }
 
+FiberletPredictionSample checkedStoredPrediction(
+    const FiberStoredPredictionSample& sample)
+{
+    FiberletPredictionSample stored;
+    stored.valid = sample.valid;
+    stored.presenceValid = sample.presenceValid;
+    if (sample.valid) {
+        stored.direction = cv::Vec3f(sample.direction);
+        if (!std::isfinite(sample.direction[0]) ||
+            !std::isfinite(sample.direction[1]) ||
+            !std::isfinite(sample.direction[2]) ||
+            !finiteVector(stored.direction)) {
+            throw std::runtime_error(
+                "fiberlet prediction direction is not finite float32");
+        }
+    }
+    if (std::isfinite(sample.presence)) {
+        stored.presence = static_cast<float>(sample.presence);
+        if (!std::isfinite(stored.presence)) {
+            throw std::runtime_error(
+                "fiberlet prediction presence is not finite float32");
+        }
+    } else {
+        stored.presence = std::numeric_limits<float>::quiet_NaN();
+    }
+    return stored;
+}
+
+void assignCheckedNormal(
+    ScoringVoxel& scoring,
+    const vc::lasagna::NormalSample& sample)
+{
+    if (sample.valid) {
+        const cv::Vec3f normal(sample.normal);
+        if (!std::isfinite(sample.normal[0]) ||
+            !std::isfinite(sample.normal[1]) ||
+            !std::isfinite(sample.normal[2]) || !finiteVector(normal)) {
+            throw std::runtime_error(
+                "fiberlet normal is not finite float32");
+        }
+        scoring.normal = normal;
+    }
+    scoring.normalValid = sample.valid;
+}
+
 bool insidePredictionGrid(const cv::Vec3f& point, const FiberPredictionGridInfo& grid)
 {
     const std::array<size_t, 3> shapeXYZ{grid.shapeZYX[2], grid.shapeZYX[1], grid.shapeZYX[0]};
@@ -2518,6 +2563,99 @@ void validateFiberletPathConfig(const FiberletPathConfig& config)
         throw std::invalid_argument("fiberlet thread count must be positive");
 }
 
+std::vector<FiberletScoringSample> sampleFiberletScoringPoints(
+    std::span<const cv::Vec3f> pointsPredictionXYZ,
+    const FiberPredictionGridInfo& grid,
+    const FiberletPathConfig& config,
+    const FiberStoredPredictionBatchSampler& predictionSampler,
+    const vc::lasagna::NormalSampler& normalSampler)
+{
+    validateFiberletPathConfig(config);
+    if (!predictionSampler)
+        throw std::invalid_argument(
+            "fiberlet scoring points require a prediction sampler");
+    if (!detail::floatGridShapeExactlyRepresentable(grid.shapeZYX)) {
+        throw std::invalid_argument(
+            "fiberlet prediction grid is not exactly representable in float32");
+    }
+    if (pointsPredictionXYZ.empty())
+        return {};
+
+    std::vector<SparseCornerBitmap> cornerSets(1);
+    size_t insertionAttempts = 0;
+    for (const auto& point : pointsPredictionXYZ) {
+        if (!insidePredictionGrid(point, grid)) {
+            throw std::invalid_argument(
+                "fiberlet scoring point lies outside the prediction grid");
+        }
+        addInterpolationCorners(
+            point, grid, cornerSets.front(), insertionAttempts);
+    }
+    const size_t cornerBytes = cornerSets.front().payloadBytes();
+    auto finalized = finalizeCornerSets(cornerSets, cornerBytes);
+    std::vector<Voxel> orderedVoxels = std::move(finalized.voxels);
+    std::vector<ScoringVoxel> scoringVoxels(orderedVoxels.size());
+    const size_t batchSize = static_cast<size_t>(
+        config.samplingBatchCoordinates);
+
+    for (size_t begin = 0; begin < orderedVoxels.size(); begin += batchSize) {
+        const size_t end = std::min(orderedVoxels.size(), begin + batchSize);
+        std::vector<std::array<size_t, 3>> indices;
+        indices.reserve(end - begin);
+        for (size_t index = begin; index < end; ++index)
+            indices.push_back(storedIndex(orderedVoxels[index]));
+        std::vector<FiberStoredPredictionSample> samples;
+        predictionSampler(indices, config.parallelThreads, samples);
+        if (samples.size() != indices.size()) {
+            throw std::runtime_error(
+                "fiberlet prediction sampler returned the wrong coordinate batch sample count");
+        }
+        for (size_t index = 0; index < samples.size(); ++index) {
+            scoringVoxels[begin + index].prediction =
+                checkedStoredPrediction(samples[index]);
+        }
+    }
+
+    for (size_t begin = 0; begin < orderedVoxels.size(); begin += batchSize) {
+        const size_t end = std::min(orderedVoxels.size(), begin + batchSize);
+        std::vector<cv::Vec3d> points;
+        points.reserve(end - begin);
+        for (size_t index = begin; index < end; ++index)
+            points.emplace_back(nativeVoxelPoint(orderedVoxels[index]));
+        std::vector<vc::lasagna::NormalSampleWithDerivative> samples;
+        (void)normalSampler.sampleNormalBatch(
+            points, false, config.parallelThreads, samples);
+        if (samples.size() != points.size()) {
+            throw std::runtime_error(
+                "fiberlet normal sampler returned the wrong coordinate batch sample count");
+        }
+        for (size_t index = 0; index < samples.size(); ++index)
+            assignCheckedNormal(
+                scoringVoxels[begin + index], samples[index].sample);
+    }
+
+    std::vector<PreparedScoringVoxel> prepared;
+    prepared.reserve(scoringVoxels.size());
+    for (const auto& scoring : scoringVoxels)
+        prepared.push_back(prepareScoringVoxel(scoring));
+    const PagedScoringIndex index(orderedVoxels);
+    std::vector<FiberletScoringSample> result;
+    result.reserve(pointsPredictionXYZ.size());
+    for (const auto& point : pointsPredictionXYZ) {
+        size_t directoryProbes = 0;
+        auto lookup = index.lookup(prepared, directoryProbes);
+        const auto scoring = interpolateScoringPoint(point, grid, lookup);
+        result.push_back({
+            scoring.prediction, scoring.normal, scoring.normalValid});
+    }
+    return result;
+}
+
+float fiberletCandidatePathLength(const FiberletCandidateResult& candidate)
+{
+    return fiberletPathLength(candidate);
+}
+
 LoadedFiberAnchorArtifact loadFiberAnchorArtifact(const std::filesystem::path& path)
 {
     std::ifstream input(path);
@@ -2929,12 +3067,17 @@ std::vector<cv::Vec3f> reconstructFiberletRoutePoints(
     points.push_back(startPositionPredictionXYZ);
     for (std::size_t index = 0; index < interiorLatticeUV.size(); ++index) {
         const auto& uv = interiorLatticeUV[index];
-        points.push_back(localNodePoint(
+        const auto point = localNodePoint(
             domain,
             {index + 1, static_cast<int>(uv[0]), static_cast<int>(uv[1])},
-            config));
+            config);
+        if (vectorLength(point - points.back()) > kEpsilon)
+            points.push_back(point);
     }
-    points.push_back(targetPositionPredictionXYZ);
+    if (vectorLength(targetPositionPredictionXYZ - points.back()) > kEpsilon)
+        points.push_back(targetPositionPredictionXYZ);
+    if (points.size() < 2)
+        throw std::invalid_argument("stored fiberlet route collapses to one point");
     return points;
 }
 
@@ -3426,32 +3569,9 @@ FiberletPathReport traceFiberletPaths(
         predictionSampler(indices, report.config.parallelThreads, samples);
         if (samples.size() != indices.size())
             throw std::runtime_error("fiberlet prediction sampler returned the wrong coordinate batch sample count");
-        for (size_t index = 0; index < samples.size(); ++index) {
-            const auto& sample = samples[index];
-            FiberletPredictionSample stored;
-            stored.valid = sample.valid;
-            stored.presenceValid = sample.presenceValid;
-            if (sample.valid) {
-                stored.direction = cv::Vec3f(sample.direction);
-                if (!std::isfinite(sample.direction[0]) ||
-                    !std::isfinite(sample.direction[1]) ||
-                    !std::isfinite(sample.direction[2]) ||
-                    !finiteVector(stored.direction)) {
-                    throw std::runtime_error(
-                        "fiberlet prediction direction is not finite float32");
-                }
-            }
-            if (std::isfinite(sample.presence)) {
-                stored.presence = static_cast<float>(sample.presence);
-                if (!std::isfinite(stored.presence)) {
-                    throw std::runtime_error(
-                        "fiberlet prediction presence is not finite float32");
-                }
-            } else {
-                stored.presence = std::numeric_limits<float>::quiet_NaN();
-            }
-            scoringVoxels[begin + index].prediction = stored;
-        }
+        for (size_t index = 0; index < samples.size(); ++index)
+            scoringVoxels[begin + index].prediction =
+                checkedStoredPrediction(samples[index]);
         ++report.predictionSamplingCalls;
         reportProgress("prediction_sampling", end, orderedVoxels.size(), predictionStart, false);
     }
@@ -3472,20 +3592,9 @@ FiberletPathReport traceFiberletPaths(
         (void)normalSampler.sampleNormalBatch(points, false, report.config.parallelThreads, samples);
         if (samples.size() != points.size())
             throw std::runtime_error("fiberlet normal sampler returned the wrong coordinate batch sample count");
-        for (size_t index = 0; index < samples.size(); ++index) {
-            const auto& sample = samples[index].sample;
-            if (sample.valid) {
-                const cv::Vec3f normal(sample.normal);
-                if (!std::isfinite(sample.normal[0]) ||
-                    !std::isfinite(sample.normal[1]) ||
-                    !std::isfinite(sample.normal[2]) || !finiteVector(normal)) {
-                    throw std::runtime_error(
-                        "fiberlet normal is not finite float32");
-                }
-                scoringVoxels[begin + index].normal = normal;
-            }
-            scoringVoxels[begin + index].normalValid = sample.valid;
-        }
+        for (size_t index = 0; index < samples.size(); ++index)
+            assignCheckedNormal(
+                scoringVoxels[begin + index], samples[index].sample);
         ++report.normalSamplingCalls;
         reportProgress("normal_sampling", end, orderedVoxels.size(), normalStart, false);
     }

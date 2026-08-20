@@ -171,9 +171,9 @@ FiberletDatasetMetadata parseMetadata(const json& value)
 
 json arrayMetadata(const FiberletDatasetMetadata& metadata, FiberletStorageChunkKind kind)
 {
-    const char* sampleFormat = kind == FiberletStorageChunkKind::Anchors          ? "fiberlet-anchor-v1"
-                               : kind == FiberletStorageChunkKind::FiberletPrefix ? "fiberlet-edge-prefix-v1"
-                                                                                  : "fiberlet-route-v1";
+    const char* sampleFormat = kind == FiberletStorageChunkKind::Anchors          ? "fiberlet-anchor-v2"
+                               : kind == FiberletStorageChunkKind::FiberletPrefix ? "fiberlet-edge-prefix-v2"
+                                                                                  : "fiberlet-route-v2";
     return {
         {"zarr_format", 2},
         {"shape", metadata.chunkGridShapeZYX},
@@ -181,7 +181,7 @@ json arrayMetadata(const FiberletDatasetMetadata& metadata, FiberletStorageChunk
         {"dtype", "|O"},
         {"fill_value", nullptr},
         {"order", "C"},
-        {"filters", {{{"id", "vc-fiberlet-chunk"}, {"codec_version", 1}, {"sample_format", sampleFormat}}}},
+        {"filters", {{{"id", "vc-fiberlet-chunk"}, {"codec_version", 2}, {"sample_format", sampleFormat}}}},
         {"compressor", nullptr},
     };
 }

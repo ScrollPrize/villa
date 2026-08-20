@@ -51,7 +51,6 @@ struct FiberletEdgeLease {
     FiberletStoredPrefix prefix;
     FiberletStoredAnchor firstAnchor;
     FiberletStoredAnchor secondAnchor;
-    FiberletRouteEndpointSteps endpointSteps;
 };
 
 struct FiberletRouteLease {
@@ -95,8 +94,6 @@ class FiberletCachedReplayGraphSource final : public FiberletReplayGraphSource
 public:
     FiberletCachedReplayGraphSource(
         std::shared_ptr<FiberletOnDemandPreprocessor> preprocessor,
-        const FiberPredictionSource& predictionSource,
-        std::shared_ptr<const vc::lasagna::NormalSampler> normalSampler,
         FiberletPathConfig pathConfig,
         float maximumJoinAngleDegrees = 45.0F);
 
@@ -115,8 +112,6 @@ private:
 
     std::shared_ptr<FiberletOnDemandPreprocessor> preprocessor_;
     FiberletChunkGraphSource chunks_;
-    const FiberPredictionSource* predictionSource_ = nullptr;
-    std::shared_ptr<const vc::lasagna::NormalSampler> normalSampler_;
     FiberletPathConfig pathConfig_;
     float maximumJoinAngleDegrees_ = 45.0F;
 };

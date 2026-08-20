@@ -644,6 +644,7 @@ vc::fiber_tracer::FiberletDatasetMetadata replayDatasetMetadata(
              << options.paths.smoothnessNormalWeight << ','
              << options.paths.smoothnessTangentWeight << ','
              << options.paths.smoothnessFreeAngleDegrees
+             << ";storage_schema=float_cache_v2"
              << ";corridor_selector=segment_aabb_v1"
              << ";corridor_radius_base=" << corridorRadiusBaseVoxels
              << ";corridor_reference=" << corridorReferenceBase.size();
@@ -1803,8 +1804,7 @@ int main(int argc, char** argv)
                 }
                 cachedGraph = std::make_unique<
                     vc::fiber_tracer::FiberletCachedReplayGraphSource>(
-                    preprocessor, field, canonicalNormalSampler,
-                    options.paths);
+                    preprocessor, options.paths);
                 preprocessor->prefetchScheduled(
                     chunkSchedule, 0, chunkSchedule.size(), false);
                 std::cerr << "fiber_replay_stage stage=cache_open status=completed\n";

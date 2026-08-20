@@ -362,8 +362,6 @@ public:
         result.endStepBaseXYZ = cv::Vec3f(points.back() - points[points.size() - 2]);
         result.pathLengthPredictionVoxels = edge.pathLengthPredictionVoxels;
         result.cost = edge.cost;
-        result.diagnosticCandidateIndex = edge.candidateIndex;
-        result.diagnosticArcIndex = numericArc;
         return result;
     }
 
@@ -389,7 +387,7 @@ public:
         if (!index.has_value())
             return std::nullopt;
         return FiberletReplaySourceTransition{
-            incoming.id, outgoing.id, graph_.transitions[*index].cost, *index};
+            incoming.id, outgoing.id, graph_.transitions[*index].cost};
     }
 
 private:
