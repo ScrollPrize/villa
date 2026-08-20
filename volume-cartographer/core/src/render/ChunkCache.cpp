@@ -1723,6 +1723,54 @@ void ChunkCache::prefetchChunks(const std::vector<ChunkKey>& keys,
     });
 }
 
+bool ChunkCache::prefetchChunksUntil(const std::vector<ChunkKey>& keys,
+                                     std::chrono::steady_clock::time_point deadline,
+                                     int priorityOffset)
+{
+    auto state = state_;
+    std::unique_lock lock(state->mutex_);
+    std::vector<ChunkKey> remoteStarts;
+    for (auto key : keys) {
+        if (std::chrono::steady_clock::now() >= deadline)
+            return false;
+        key = sourceKey(*state, key);
+        if (!isValidKey(*state, key))
+            continue;
+        auto [it, inserted] = state->entries_.emplace(key, Entry{});
+        if (inserted) {
+            if (addRequestDemandLocked(*state, key, it->second, {})) {
+                if (queueFetchLocked(state, key, state->generation_, priorityOffset))
+                    remoteStarts.push_back(key);
+            } else {
+                state->entries_.erase(it);
+            }
+        } else if (it->second.status == EntryStatus::InFlight) {
+            if (addRequestDemandLocked(*state, key, it->second, {})) {
+                it->second.basePriority = std::min(
+                    it->second.basePriority,
+                    fetchBasePriority(*state, key, priorityOffset));
+                reprioritizeEntryLocked(*state, key, it->second);
+            }
+        }
+    }
+    lock.unlock();
+    for (const auto& key : remoteStarts) {
+        if (std::chrono::steady_clock::now() >= deadline)
+            return false;
+        notifyRemoteFetchListeners(state, key, true);
+    }
+    lock.lock();
+    return state->cv_.wait_until(lock, deadline, [&] {
+        for (auto key : keys) {
+            key = sourceKey(*state, key);
+            auto it = state->entries_.find(key);
+            if (it != state->entries_.end() && it->second.status == EntryStatus::InFlight)
+                return false;
+        }
+        return true;
+    });
+}
+
 IChunkedArray::ChunkReadyCallbackId ChunkCache::addChunkReadyListener(ChunkReadyCallback cb)
 {
     auto state = state_;

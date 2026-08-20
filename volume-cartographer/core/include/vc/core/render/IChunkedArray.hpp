@@ -3,12 +3,14 @@
 #include "vc/core/render/ChunkFetch.hpp"
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace vc::render {
@@ -106,6 +108,28 @@ public:
     {
         (void)request;
         prefetchChunks(keys, wait, priorityOffset);
+    }
+    virtual bool prefetchChunksUntil(const std::vector<ChunkKey>& keys,
+                                     std::chrono::steady_clock::time_point deadline,
+                                     int priorityOffset = 0)
+    {
+        prefetchChunks(keys, false, priorityOffset);
+        while (std::chrono::steady_clock::now() < deadline) {
+            bool pending = false;
+            for (const auto& key : keys) {
+                const auto result = getChunkIfCached(key.level, key.iz, key.iy, key.ix);
+                if (result.status == ChunkStatus::MissQueued) {
+                    pending = true;
+                    break;
+                }
+                if (result.status == ChunkStatus::Error)
+                    return false;
+            }
+            if (!pending)
+                return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return false;
     }
 
     // Atomically replaces one view's located demand for this source. Building
