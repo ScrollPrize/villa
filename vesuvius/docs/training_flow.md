@@ -338,7 +338,7 @@ Auxiliary tasks let you add side objectives that are derived from a primary “s
   - `loss_weight`: Optional overall weight for the task.
   - `out_channels`: Optional for `distance_transform` (defaults to 1); for `surface_normals` it is set automatically based on dimensionality (2 for 2D, 3 for 3D).
 
-Example (excerpt):
+Example (excerpt; auxiliary targets are currently rejected by `ZarrDataset` with a clear startup error until derived-target generation is implemented):
 
 ```yaml
 dataset_config:
@@ -415,7 +415,7 @@ auxiliary_tasks:
 
 How it works in code:
 - Config injection: `ConfigManager` reads `auxiliary_tasks` and calls a small factory to append derived targets into `mgr.targets` with `auxiliary_task: true` and a reference to `source_target`.
-- Dataset loading: Datasets only load label volumes for primary targets. Auxiliary targets do not require separate label files and are not looked up on disk.
+- Dataset loading: `ZarrDataset` currently loads label volumes only for primary targets. It fails fast when `auxiliary_task: true` targets are configured because it does not yet generate their derived tensors; this prevents a configuration from silently training zero-loss auxiliary heads.
 - Loss computation: During training, losses are computed per key present in the batch label dict. The helper `compute_auxiliary_loss` passes `source_pred=outputs[source_target]` to losses that accept it. This enables:
   - Self-consistency/regularization losses that don’t need explicit GT (e.g., `NormalSmoothnessLoss` using only predicted normals with optional masking from `source_pred`).
   - Losses that need derived GT (e.g., `SignedDistanceLoss`, cosine loss on normals) use the dataset-provided tensors for aux targets.
@@ -423,11 +423,11 @@ How it works in code:
   - For deep supervision, auxiliary targets default to `ds_interpolation: linear`, mapping to bilinear (2D) or trilinear (3D) in downsampling to preserve regression continuity.
 
 Important notes and current behavior:
-- The dataset now auto-generates ground-truth tensors for `distance_transform` (signed DT) and `surface_normals` per patch from the `source_target` labels, so related losses work out of the box.
-- Auxiliary losses that are self-supervised or use only predictions (e.g., `NormalSmoothnessLoss`) also work and can be masked using `source_pred` passed through `compute_auxiliary_loss`.
-- If you prefer, you can still precompute and store auxiliary labels on disk using the same naming convention; the dataset will ignore them unless you wire them explicitly.
+- `ZarrDataset` does not currently generate `distance_transform` or `surface_normals` tensors. Configuring them raises a clear `ValueError` during dataset startup instead of allowing the model to run with missing targets and zero auxiliary loss.
+- The auxiliary trainer implementations remain available for dataset implementations that provide the required tensors.
+- Adding on-the-fly auxiliary-target generation is a separate feature; it must define dimensionality, padding, augmentation, and numerical semantics before being enabled here.
 
-This design allows mixing fully supervised targets with auxiliary/self-supervised regularizers and keeps disk I/O simple by deriving common auxiliary targets on the fly.
+This fail-closed behavior keeps a documented training configuration from silently becoming a different experiment.
 
 4. **Mixed Precision Training**:
    - GradScaler for CUDA devices
