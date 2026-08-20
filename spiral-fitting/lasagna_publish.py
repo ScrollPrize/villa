@@ -61,7 +61,7 @@ def _find_lasagna_service():
     candidates = [Path(configured).expanduser()] if configured else []
     here = Path(__file__).resolve()
     candidates.extend([
-        here.parents[3] / "lasagna" / "fit_service.py",
+        here.parents[1] / "lasagna" / "fit_service.py",
         Path.home() / "villa" / "lasagna" / "fit_service.py",
     ])
     for candidate in candidates:

@@ -14,7 +14,7 @@ grid by normalized column index aligns them; the reducer then yields a robust
 consensus surface that stays on the true sheet.
 
 Invalid points use the -1 sentinel (z<=0 is also treated invalid, matching the
-QuadSurface reader). Output format mirrors scripts/spiral/tifxyz.py:save_tifxyz.
+QuadSurface reader). Output format mirrors spiral-fitting/tifxyz.py:save_tifxyz.
 
 Example:
     python merge_concat_runs.py /path/to/parent --out /path/to/merged --method median \\
@@ -103,7 +103,7 @@ def step_from_meta(meta_path):
 
 
 def save_tifxyz(pts, out_winding_dir, uuid, step_size, voxel_um, source):
-    """Write x/y/z.tif + meta.json, mirroring scripts/spiral/tifxyz.py:save_tifxyz.
+    """Write x/y/z.tif + meta.json, mirroring spiral-fitting/tifxyz.py:save_tifxyz.
     `pts` is (H,W,3) in x,y,z order with -1 for invalid."""
     os.makedirs(out_winding_dir, exist_ok=True)
     tifffile.imwrite(os.path.join(out_winding_dir, "x.tif"), pts[..., 0].astype(np.float32))

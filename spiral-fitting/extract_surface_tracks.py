@@ -9,7 +9,7 @@ import numpy as np
 import networkx as nx
 from tqdm import tqdm
 
-sys.path.insert(0, f'{os.path.dirname(__file__)}/../../../vesuvius/src')
+sys.path.insert(0, f'{os.path.dirname(__file__)}/../vesuvius/src')
 from vesuvius.data.utils import open_zarr
 
 

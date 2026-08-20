@@ -13,7 +13,8 @@ def load_spiral_sampling():
     except ImportError:
         try:
             import vc
-            build_package = Path(__file__).resolve().parents[2] / 'build/python/vc'
+            build_package = (Path(__file__).resolve().parents[1]
+                             / 'volume-cartographer/build/python/vc')
             if build_package.is_dir() and str(build_package) not in vc.__path__:
                 vc.__path__.append(str(build_package))
             return importlib.import_module('vc.spiral_sampling')

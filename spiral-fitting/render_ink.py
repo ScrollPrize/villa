@@ -23,7 +23,7 @@ is passed; by default they are skipped.
 
 By default (unless --no-full-scroll), *all* windings are concatenated into a single
 full-scroll tifxyz (concat/wLLL-HHH), which is then flattened with the lasagna forward
-flattener (../../../lasagna/fit.py, config flatten_fast_nofilter.json plus a generated
+flattener (../lasagna/fit.py, config flatten_fast_nofilter.json plus a generated
 overlay that points external_surfaces at the concat) rather than flatboi. The flattened
 tifxyz is written as a top-level mesh at concat/wLLL-HHH_flat (meta.json + x/y/z.tif),
 trimmed to its valid-cell bounding box with vc_tifxyz_trim (dropping the flatten's invalid
@@ -346,7 +346,7 @@ def max_composite(tif_paths):
 @click.option('--max-strip-width', type=int, default=16384, show_default=True, help='Max width (px) of each saved ink jpg. Strips wider than this are chopped into <name>.NNN.jpg tiles of this width (no downsampling); narrower strips stay a single <name>.jpg')
 @click.option('--full-scroll-trim/--no-full-scroll-trim', default=True, show_default=True, help='After the lasagna flatten, trim the flattened tifxyz to its valid-cell bounding box (removes the flatten output-margin border that renders as black bands) with vc_tifxyz_trim')
 @click.option('--tifxyz-trim-bin', default='vc_tifxyz_trim', show_default=True, help='Path to the vc_tifxyz_trim binary (crops a tifxyz to its valid-cell bbox in place)')
-@click.option('--lasagna-dir', default='', help='Path to the lasagna repo dir (holds fit.py). Default: <this script>/../../../lasagna')
+@click.option('--lasagna-dir', default='', help='Path to the lasagna repo dir (holds fit.py). Default: <this script>/../lasagna')
 @click.option('--lasagna-config', default='', help='Base lasagna flatten config json. Default: <lasagna-dir>/configs/flatten_fast_nofilter.json')
 @click.option('--lasagna-fit-script', default='', help='Lasagna fit entrypoint run for the full-scroll flatten. Default: _run_flatten_threaded.py if present, else fit.py')
 @click.option('--lasagna-device', default='cuda', show_default=True, help='--device passed to the lasagna flattener for the full-scroll flatten')

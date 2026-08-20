@@ -61,12 +61,12 @@ The service host needs the Spiral environment (a CUDA-capable PyTorch plus the
 dependencies in `pyproject.toml`, Python ≥ 3.14). With [uv](https://docs.astral.sh/uv/):
 
 ```sh
-cd scripts/spiral
+cd spiral-fitting
 uv sync            # creates .venv from pyproject.toml
 ```
 
 or with conda/pip, install `torch` for your CUDA version and then
-`pip install -e scripts/spiral`.
+`pip install -e .` from `spiral-fitting/`.
 
 ### Resident sparse field pools
 
@@ -98,11 +98,11 @@ each independently operated service a stable session name, port, and GPU.
 Nothing is exposed on the network; VC3D tunnels to it over SSH:
 
 ```sh
-tmux new -s spiral-alice 'python scripts/spiral/spiral_service.py --port 8765 \
+tmux new -s spiral-alice 'python spiral_service.py --port 8765 \
     --dataset /data/scrolls/s1 --output /data/spiral-output/s1 \
     --gpus 0 --session-name alice'
 
-tmux new -s spiral-bob 'python scripts/spiral/spiral_service.py --port 8766 \
+tmux new -s spiral-bob 'python spiral_service.py --port 8766 \
     --dataset /data/scrolls/s1 --output /data/spiral-output/s1 \
     --gpus 1 --session-name bob'
 ```
@@ -112,7 +112,7 @@ device or enable distributed fitting across several GPUs with a comma-separated
 host-side list:
 
 ```sh
-python scripts/spiral/spiral_service.py --port 8765 \
+python spiral_service.py --port 8765 \
     --dataset /data/scrolls/s1 --output /data/spiral-output/s1 --gpus 0,1,2,3
 ```
 
@@ -164,7 +164,7 @@ attached terminal is not disconnected.
 ### Trusted-LAN flow (direct HTTP)
 
 ```sh
-python scripts/spiral/spiral_service.py --bind 0.0.0.0 --port 8765 \
+python spiral_service.py --bind 0.0.0.0 --port 8765 \
     --dataset /data/scrolls/s1 --output /data/spiral-output/s1
 ```
 
@@ -297,9 +297,9 @@ interpreter and can slow iterations somewhat.
 Description=VC3D Spiral fitting service
 
 [Service]
-WorkingDirectory=%h/volume-cartographer
-ExecStart=%h/volume-cartographer/scripts/spiral/.venv/bin/python \
-    %h/volume-cartographer/scripts/spiral/spiral_service.py \
+WorkingDirectory=%h/villa/spiral-fitting
+ExecStart=%h/villa/spiral-fitting/.venv/bin/python \
+    %h/villa/spiral-fitting/spiral_service.py \
     --port 8765 --dataset /data/scrolls/s1 \
     --output /data/spiral-output/s1 --gpus 0
 Restart=on-failure
@@ -323,7 +323,7 @@ datasets this spends minutes decoding millions of Python objects each time a
 fit starts. Convert a DBM once to the adjacent packed format:
 
 ```sh
-python scripts/spiral/convert_track_store.py \
+python convert_track_store.py \
     /data/tracks/2um_ds2_ps256_surf_v2.dbm
 ```
 
@@ -346,7 +346,7 @@ horizontal and vertical track families. Build that index once as a CSR
 sidecar instead of sorting every track point whenever a fit session loads:
 
 ```sh
-python scripts/spiral/build_track_crossings.py \
+python build_track_crossings.py \
     /data/tracks/2um_ds2_ps256_surf_v2.dbm \
     --z-min 4000 --z-max 17000 \
     --temp-dir /fast/disk/tmp
@@ -394,7 +394,7 @@ thread pool using Zstandard level 3.
 Use a paired OME-Zarr to copy the exact volume shape and physical geometry:
 
 ```sh
-python scripts/spiral/tracks_to_ome_zarr.py \
+python tracks_to_ome_zarr.py \
     /data/tracks/2um_ds2_ps256_surf_v2.dbm \
     --out /data/tracks/2um_ds2_ps256_tracks.ome.zarr \
     --like /data/volumes/2um.ome.zarr \

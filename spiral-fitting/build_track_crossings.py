@@ -7,11 +7,11 @@ packed-coordinate sort at every session load.
 
 Example:
 
-    python scripts/spiral/build_track_crossings.py /path/to/tracks.dbm
+    python spiral-fitting/build_track_crossings.py /path/to/tracks.dbm
 
 To build only the tracks wholly contained in a fitting ROI:
 
-    python scripts/spiral/build_track_crossings.py /path/to/tracks.dbm \
+    python spiral-fitting/build_track_crossings.py /path/to/tracks.dbm \
         --z-min 4000 --z-max 17000 --temp-dir /fast/disk/tmp
 
 The z range is half-open: ``[z_min, z_max)``. A range-limited build replaces

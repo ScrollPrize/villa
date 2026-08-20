@@ -50,7 +50,8 @@ def _load_native_track_crossings():
         # developer build so repo scripts use the matching native kernel
         # immediately after ``ninja -C build vc_track_crossings``.
         import vc
-        build_package = Path(__file__).resolve().parents[2] / 'build/python/vc'
+        build_package = (Path(__file__).resolve().parents[1]
+                         / 'volume-cartographer/build/python/vc')
         if build_package.is_dir() and str(build_package) not in vc.__path__:
             vc.__path__.insert(0, str(build_package))
         return importlib.import_module('vc.track_crossings')
@@ -65,7 +66,8 @@ def _load_native_track_store():
     except ImportError:
         try:
             import vc
-            build_package = Path(__file__).resolve().parents[2] / 'build/python/vc'
+            build_package = (Path(__file__).resolve().parents[1]
+                             / 'volume-cartographer/build/python/vc')
             if build_package.is_dir() and str(build_package) not in vc.__path__:
                 vc.__path__.append(str(build_package))
             return importlib.import_module('vc.track_store')

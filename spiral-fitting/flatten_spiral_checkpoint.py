@@ -117,7 +117,7 @@ def _resolve_lasagna(explicit: Path | None) -> tuple[Path, Path]:
             else configured_path)
     here = Path(__file__).resolve()
     candidates.extend([
-        here.parents[3] / "lasagna",
+        here.parents[1] / "lasagna",
         Path.home() / "villa/lasagna",
     ])
     for root in candidates:

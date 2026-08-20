@@ -413,7 +413,7 @@ endif()
 # The manager checks this location after the development-tree and explicit
 # SPIRAL_SERVICE_PATH candidates.  Install the complete module set because the
 # service deliberately reuses the existing fitter rather than duplicating it.
-install(DIRECTORY ${CMAKE_SOURCE_DIR}/scripts/spiral/
+install(DIRECTORY ${CMAKE_SOURCE_DIR}/../spiral-fitting/
     DESTINATION share/volume-cartographer/spiral
     FILES_MATCHING
         PATTERN "*.py"

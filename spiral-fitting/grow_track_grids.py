@@ -7,7 +7,7 @@ spatially separated seed tracks without copying that index.
 
 Example:
 
-    python scripts/spiral/grow_track_grids.py \
+    python spiral-fitting/grow_track_grids.py \
       /path/to/tracks.dbm /tmp/track-grids \
       --center-xyz 3848 2775 8212 \
       --bbox-size-zyx 3000 1000 1000 \
