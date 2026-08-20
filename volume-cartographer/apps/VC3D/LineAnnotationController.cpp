@@ -10384,6 +10384,26 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
         return false;
     }
 
+    // Everything the session currently shows, retained so a failed install can
+    // put it back. The registered surfaces are replaced under the same names
+    // before the dialog has accepted their replacements — live viewers render
+    // the new planes immediately, and the pose carry-over below deliberately
+    // reads what is registered at replacement time — so a failure must restore
+    // rather than blank. That mattered less when only an edit reached this
+    // path; it now also runs after umbilicus and volume changes, where the
+    // user changed nothing and losing the on-screen views is a pure loss.
+    const std::vector<std::string> previousSurfaceNames =
+        session.generatedSurfaceNames;
+    std::vector<std::pair<std::string, std::shared_ptr<Surface>>>
+        previousSurfaces;
+    previousSurfaces.reserve(previousSurfaceNames.size());
+    for (const auto& name : previousSurfaceNames) {
+        previousSurfaces.emplace_back(name, _state->surface(name));
+    }
+    const std::string previousLineSurfaceName = session.generatedLineSurfaceName;
+    const std::string previousLineSideSliceName =
+        session.generatedLineSideSliceName;
+
     for (const auto& name : session.generatedSurfaceNames) {
         _state->setSurface(name, nullptr);
     }
@@ -10516,10 +10536,22 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     }
 
     if (!pane->dialog->setGeneratedLineViews(generatedViews, camera)) {
+        // Restore what was on screen: drop the rejected replacements, then
+        // re-register the retained surfaces under their old names and hand the
+        // session its previous metadata back. The epoch is deliberately not
+        // advanced (success-only, above), so the next umbilicus or volume
+        // change retries this rebuild instead of skipping it.
         for (const auto& name : session.generatedSurfaceNames) {
             _state->setSurface(name, nullptr);
         }
-        session.generatedSurfaceNames.clear();
+        for (const auto& [name, surface] : previousSurfaces) {
+            if (surface) {
+                _state->setSurface(name, surface);
+            }
+        }
+        session.generatedSurfaceNames = previousSurfaceNames;
+        session.generatedLineSurfaceName = previousLineSurfaceName;
+        session.generatedLineSideSliceName = previousLineSideSliceName;
         session.error = "Failed to create generated annotation viewers.";
         showError(tr("Could not create generated line annotation viewers."),
                   session.suppressErrorDialogs);
