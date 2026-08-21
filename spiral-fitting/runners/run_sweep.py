@@ -210,6 +210,17 @@ def _start_child(
 def execute(args: argparse.Namespace) -> int:
     configs = discover_configs(args.config_folder, args.sweep_config)
     output = args.output.resolve()
+    if getattr(args, "overwrite", False):
+        run_single.overwrite_output(
+            args.output,
+            protected_paths=(
+                args.dataset,
+                args.ink_volume,
+                args.vc_render_bin,
+                args.config_folder,
+                args.sweep_config,
+            ),
+        )
     sweep_dir = output / ".sweep"
     valid, failures = prepare_configs(configs, args.sweep_config, sweep_dir)
     groups, idle = partition_gpus(visible_gpu_ids(), args.gpus_per_run)

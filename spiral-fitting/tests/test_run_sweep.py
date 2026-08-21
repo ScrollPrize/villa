@@ -21,6 +21,18 @@ def test_child_command_forwards_optional_wandb_group(tmp_path):
     assert command[command.index("--wandb-group") + 1] == "experiment"
 
 
+def test_sweep_parser_supports_opt_in_overwrite(tmp_path):
+    args = run_sweep.build_parser().parse_args([
+        "--dataset", str(tmp_path / "dataset"),
+        "--ink-volume", str(tmp_path / "ink"),
+        "--config-folder", str(tmp_path / "configs"),
+        "--sweep-config", str(tmp_path / "sweep.json"),
+        "--overwrite",
+    ])
+
+    assert args.overwrite is True
+
+
 def test_relay_logs_everything_and_echoes_only_live_fit_updates():
     source = io.StringIO(
         "loading configuration\n"
