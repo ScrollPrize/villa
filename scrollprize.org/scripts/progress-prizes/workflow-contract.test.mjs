@@ -23,36 +23,9 @@ const workflowNames = [
   'progress-prizes-page-pr.yml',
   'progress-prizes-pr-safety.yml',
   'progress-prizes-production.yml',
-  'progress-prizes-rehearsal.yml',
   'progress-prizes-schedule.yml',
   'progress-prizes-vercel-preview.yml',
 ];
-const googleJobNames = [
-  'bootstrap-staging',
-  'inject-copy-fault',
-  'recover-prepare',
-  'verify-prepared',
-  'inject-close-fault',
-  'recover-activate',
-  'verify-active',
-  'prove-activation-idempotency',
-  'reconcile-active-once',
-  'reconcile-active-twice',
-  'cleanup-full-rehearsal',
-  'verify-cleaned-full-rehearsal',
-  'cleanup-standalone',
-  'verify-cleaned-standalone',
-];
-const protectedSecretMappings = new Map([
-  ['workload-identity-provider', 'GOOGLE_WORKLOAD_IDENTITY_PROVIDER'],
-  ['service-account-email', 'GOOGLE_SERVICE_ACCOUNT_EMAIL'],
-  ['drive-admin-email', 'PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL'],
-  ['drive-id', 'PROGRESS_PRIZE_DRIVE_ID'],
-  ['folder-id', 'PROGRESS_PRIZE_FOLDER_ID'],
-  ['archive-folder-id', 'PROGRESS_PRIZE_ARCHIVE_FOLDER_ID'],
-  ['source-form-id', 'PROGRESS_PRIZE_SOURCE_FORM_ID'],
-  ['editor-group-email', 'PROGRESS_PRIZE_EDITOR_GROUP_EMAIL'],
-]);
 
 async function workflow(name) {
   return readFile(resolve(repositoryRoot, '.github/workflows', name), 'utf8');
@@ -141,339 +114,6 @@ test('every literal Progress Prize run block has valid Bash syntax after YAML in
         `${name}:${script.line} is not valid Bash:\n${result.stderr}`,
       );
     }
-  }
-});
-
-test('Google OIDC is confined to direct literal Environment jobs and one composite', async () => {
-  const rehearsal = await workflow('progress-prizes-rehearsal.yml');
-  const action = await googleAction();
-  const readme = await readFile(
-    resolve(repositoryRoot, 'scrollprize.org/scripts/progress-prizes/README.md'),
-    'utf8',
-  );
-  await assert.rejects(
-    workflow('progress-prizes-google.yml'),
-    (error) => error?.code === 'ENOENT',
-    'Google-secret jobs must not be reintroduced behind workflow_call',
-  );
-  assert.match(rehearsal, /^on:\n  workflow_dispatch:/m);
-  assert.match(
-    rehearsal,
-    /^concurrency:\n  group: progress-prizes-staging-rehearsal\n  cancel-in-progress: false$/m,
-  );
-  assert.doesNotMatch(rehearsal, /workflow_call:|pull_request(?:_target)?:/);
-  assert.doesNotMatch(rehearsal, /uses: \.\/\.github\/workflows\/progress-prizes-google\.yml/);
-  assert.doesNotMatch(rehearsal, /secrets:\s*inherit/);
-  assert.doesNotMatch(rehearsal, /environment:\s*\$\{\{/);
-  assert.match(
-    readme,
-    /attribute\.workflow_ref == 'ScrollPrize\/villa\/\.github\/workflows\/progress-prizes-rehearsal\.yml@refs\/heads\/main'/,
-  );
-  assert.match(readme, /attribute\.workflow_sha\s+= assertion\.workflow_sha/);
-  assert.match(readme, /assertion\.workflow_sha == assertion\.sha/);
-  assert.doesNotMatch(readme, /job_workflow_ref|workflow_ref.*progress-prizes-google\.yml/);
-  assert.match(readme, /1200-second access token/);
-
-  for (const name of googleJobNames) {
-    const protectedJob = jobBlock(rehearsal, name);
-    assert.match(protectedJob, /runs-on: ubuntu-24\.04/);
-    assert.match(protectedJob, /timeout-minutes: 20/);
-    assert.match(protectedJob, /environment: progress-prizes-staging/);
-    assert.match(protectedJob, /contents: read\n      id-token: write/);
-    assert.match(protectedJob, /ref: \$\{\{ github\.sha \}\}/);
-    assert.match(protectedJob, /persist-credentials: false/);
-    assert.match(protectedJob, /id: google/);
-    assert.match(protectedJob, /uses: \.\/\.github\/actions\/progress-prizes-google/);
-    assert.match(protectedJob, /^          environment: staging$/m);
-    assert.match(
-      protectedJob,
-      /responder-uri: \$\{\{ steps\.google\.outputs\['responder-uri'\] \}\}/,
-    );
-    for (const [input, secret] of protectedSecretMappings) {
-      assert.match(
-        protectedJob,
-        new RegExp(`^          ${input}: \\$\\{\\{ secrets\\.${secret} \\}\\}$`, 'm'),
-      );
-    }
-  }
-
-  assert.equal([...rehearsal.matchAll(/id-token: write/g)].length, googleJobNames.length);
-  const rehearsalCheckoutCount = [...rehearsal.matchAll(/uses: actions\/checkout@/g)].length;
-  assert.equal(
-    [...rehearsal.matchAll(/ref: \$\{\{ github\.sha \}\}/g)].length,
-    rehearsalCheckoutCount,
-    'every rehearsal checkout must execute the exact trigger commit',
-  );
-  assert.doesNotMatch(rehearsal, /ref: refs\/heads\/main/);
-  assert.equal(
-    [...rehearsal.matchAll(/environment: progress-prizes-production/g)].length,
-    0,
-  );
-  assert.equal(
-    [...rehearsal.matchAll(/environment: progress-prizes-staging/g)].length,
-    googleJobNames.length,
-  );
-  const productionValidationJob = jobBlock(rehearsal, 'validate-production');
-  assert.match(productionValidationJob, /actions: write\n      contents: read/);
-  assert.match(productionValidationJob, /progress-prizes-schedule\.mjs dispatch/);
-  assert.match(productionValidationJob, /--operation validate/);
-  assert.match(productionValidationJob, /REQUEST_ID: \$\{\{ github\.run_id \}\}/);
-  assert.match(productionValidationJob, /steps\.child\.outputs\['child-run-id'\]/);
-  assert.match(productionValidationJob, /gh run watch "\$CHILD_RUN_ID" --repo ScrollPrize\/villa --exit-status/);
-  assert.doesNotMatch(productionValidationJob, /id-token:|environment: progress-prizes-|secrets\./);
-  assert.equal(
-    [...rehearsal.matchAll(/secrets\.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL/g)].length,
-    googleJobNames.length,
-    'every Google job must receive an independently protected staging identity',
-  );
-  assert.doesNotMatch(productionValidationJob, /staging-folder-id|PROGRESS_PRIZE_STAGING_FOLDER_ID/);
-  for (const name of googleJobNames) {
-    const stagingJob = jobBlock(rehearsal, name);
-    assert.match(
-      stagingJob,
-      /^          staging-service-account-email: \$\{\{ secrets\.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL \}\}$/m,
-    );
-    assert.match(
-      stagingJob,
-      /^          staging-folder-id: \$\{\{ secrets\.PROGRESS_PRIZE_STAGING_FOLDER_ID \}\}$/m,
-    );
-  }
-  assert.equal(
-    [...rehearsal.matchAll(/secrets\.PROGRESS_PRIZE_STAGING_FOLDER_ID/g)].length,
-    googleJobNames.length,
-  );
-
-  for (const name of jobNames(rehearsal).filter((name) => !googleJobNames.includes(name))) {
-    const ordinaryJob = jobBlock(rehearsal, name);
-    assert.doesNotMatch(ordinaryJob, /id-token: write/);
-    assert.doesNotMatch(ordinaryJob, /secrets\.(?:GOOGLE_|PROGRESS_PRIZE_)/);
-  }
-
-  for (const [input] of protectedSecretMappings) {
-    if (input === 'archive-folder-id') {
-      assert.match(action, /^  archive-folder-id:\n(?:    .*\n)*?    required: false\n    default: ""$/m);
-    } else {
-      assert.match(action, new RegExp(`^  ${input}:\\n(?:    .*\\n)*?    required: true$`, 'm'));
-    }
-  }
-  assert.match(
-    action,
-    /^  staging-service-account-email:\n(?:    .*\n)*?    required: false\n    default: ""$/m,
-  );
-  assert.match(
-    action,
-    /^  staging-folder-id:\n(?:    .*\n)*?    required: false\n    default: ""$/m,
-  );
-  assert.match(
-    action,
-    /PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL:\s+\$\{\{ inputs\['staging-service-account-email'\] \}\}/,
-  );
-  assert.match(
-    action,
-    /PROGRESS_PRIZE_STAGING_FOLDER_ID:\s+\$\{\{ inputs\['staging-folder-id'\] \}\}/,
-  );
-  assert.match(
-    action,
-    /PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL \\\n\s+PROGRESS_PRIZE_STAGING_FOLDER_ID \\\n\s+PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL/,
-    'the independent staging identity and folder must be masked before validation',
-  );
-  assert.doesNotMatch(
-    action,
-    /inputs\.environment == 'staging' && inputs\['(?:service-account-email|folder-id)'\]/,
-    'the expected staging identity and folder must not be derived from operational inputs',
-  );
-  assert.doesNotMatch(
-    action,
-    /\$\{\{\s*(?:secrets|vars)(?:\.|\[)/,
-    'the composite must receive protected values only through explicit inputs',
-  );
-  assert.doesNotMatch(rehearsal, /google-github-actions\/auth/);
-  assert.equal([...action.matchAll(/google-github-actions\/auth@/g)].length, 4);
-  assert.match(action, /create_credentials_file: false/);
-  assert.match(action, /export_environment_variables: false/);
-  assert.match(action, /printf '::add-mask::%s\\n' "\$value"/);
-  const maskStep = action.indexOf('- name: Register protected Google configuration masks');
-  const validationStep = action.indexOf('- name: Validate protected environment configuration');
-  const readAuthStep = action.indexOf('- name: Authenticate read-only validation');
-  assert.ok(maskStep >= 0 && maskStep < validationStep, 'mask registration must precede validation');
-  assert.ok(
-    validationStep < readAuthStep,
-    'protected configuration must be validated before requesting an OIDC token',
-  );
-  assert.match(
-    action,
-    /if test "\$AUTOMATION_ENVIRONMENT" = production \\\n\s+&& test "\$OPERATION" = validate \\\n\s+&& test "\$SOURCE_CYCLE" = 2026-07\n\s+then\n\s+test -n "\$PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL"/,
-    'initial production validation must require the exact staging identity before authentication',
-  );
-  assert.match(
-    action,
-    /test "\$GOOGLE_SERVICE_ACCOUNT_EMAIL" = "\$PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL"/,
-  );
-  assert.match(
-    action,
-    /test "\$PROGRESS_PRIZE_FOLDER_ID" = "\$PROGRESS_PRIZE_STAGING_FOLDER_ID"/,
-  );
-  assert.equal([...action.matchAll(/access_token_lifetime: 1200s/g)].length, 4);
-  assert.doesNotMatch(action, /access_token_scopes: >-/);
-  assert.match(
-    action,
-    /access_token_scopes: \|-\n\s+https:\/\/www\.googleapis\.com\/auth\/forms\.body\.readonly\n\s+https:\/\/www\.googleapis\.com\/auth\/forms\.responses\.readonly\n\s+https:\/\/www\.googleapis\.com\/auth\/drive\.readonly\n\s+https:\/\/www\.googleapis\.com\/auth\/spreadsheets\.readonly/,
-  );
-  assert.match(
-    action,
-    /access_token_scopes: \|-\n\s+https:\/\/www\.googleapis\.com\/auth\/forms\.body\n\s+https:\/\/www\.googleapis\.com\/auth\/forms\.responses\.readonly\n\s+https:\/\/www\.googleapis\.com\/auth\/drive\n\s+https:\/\/www\.googleapis\.com\/auth\/spreadsheets\n/,
-  );
-  assert.match(
-    action,
-    /Authenticate append-only response sync without a credential file[\s\S]*access_token_scopes: \|-\n\s+https:\/\/www\.googleapis\.com\/auth\/forms\.body\.readonly\n\s+https:\/\/www\.googleapis\.com\/auth\/forms\.responses\.readonly\n\s+https:\/\/www\.googleapis\.com\/auth\/drive\n\s+https:\/\/www\.googleapis\.com\/auth\/spreadsheets\n/,
-  );
-  assert.match(
-    action,
-    /Authenticate marker-only reconciliation without a credential file[\s\S]*access_token_scopes: \|-\n\s+https:\/\/www\.googleapis\.com\/auth\/forms\.body\.readonly\n\s+https:\/\/www\.googleapis\.com\/auth\/forms\.responses\.readonly\n\s+https:\/\/www\.googleapis\.com\/auth\/drive\n\s+https:\/\/www\.googleapis\.com\/auth\/spreadsheets\.readonly\n/,
-  );
-  assert.doesNotMatch(action, /drive\.file/);
-  assert.match(action, /automation-cli\.mjs/);
-  assert.match(action, /error-diagnostic-cli\.mjs/);
-  assert.doesNotMatch(action, /(?:cat|head|tail|read|wc) .*progress-prizes-error/);
-  assert.equal([...action.matchAll(/\bgrep\b/g)].length, 1);
-  assert.match(
-    action,
-    /grep -Fxq "progress-prizes: Injected staging rollover failure at \$FAULT" \\\n\s+"\$RUNNER_TEMP\/progress-prizes-error\.txt"/,
-  );
-  assert.doesNotMatch(`${rehearsal}\n${action}`, /credentials_json|service_account_key|private_key/i);
-
-  const publicSafety = await workflow('progress-prizes-pr-safety.yml');
-  assert.match(publicSafety, /\.github\/actions\/progress-prizes-google\/\*\*/);
-  assert.doesNotMatch(publicSafety, /id-token|google-github-actions|GOOGLE_/);
-  assert.doesNotMatch(publicSafety, /secrets\./);
-  assert.doesNotMatch(publicSafety, /pull_request_target/);
-});
-
-test('secret-free preflight and composite guards reject unsafe controls before OIDC', async () => {
-  const rehearsal = await workflow('progress-prizes-rehearsal.yml');
-  const action = await googleAction();
-  const preflight = jobBlock(rehearsal, 'preflight');
-
-  assert.match(preflight, /permissions: \{\}/);
-  assert.doesNotMatch(preflight, /secrets\.|id-token|environment:/);
-  assert.match(preflight, /HEAD_SHA: \$\{\{ github\.sha \}\}/);
-  assert.match(preflight, /assert\.equal\(process\.env\.REPOSITORY, 'ScrollPrize\/villa'\)/);
-  assert.match(preflight, /assert\.equal\(process\.env\.REPOSITORY_ID, '890972577'\)/);
-  assert.match(preflight, /assert\.equal\(process\.env\.REPOSITORY_OWNER_ID, '121906140'\)/);
-  assert.match(preflight, /assert\.equal\(process\.env\.REF, 'refs\/heads\/main'\)/);
-  assert.match(preflight, /assert\.match\(process\.env\.HEAD_SHA/);
-  assert.match(preflight, /assert\.equal\(process\.env\.EVENT_NAME, 'workflow_dispatch'\)/);
-  assert.match(preflight, /allowedOperations\.has\(process\.env\.OPERATION/);
-  assert.match(preflight, /SOURCE_CYCLE/);
-  assert.match(preflight, /TARGET_CYCLE/);
-  assert.match(preflight, /assert\.equal\(process\.env\.SOURCE_CYCLE, '2026-07'\)/);
-  assert.match(preflight, /assert\.equal\(process\.env\.TARGET_CYCLE, '2026-08'\)/);
-  assert.match(preflight, /PREPARATION_NOW/);
-  assert.match(preflight, /ACTIVATION_NOW/);
-  assert.match(jobBlock(rehearsal, 'validate-production'), /needs: preflight/);
-  assert.match(jobBlock(rehearsal, 'cleanup-standalone'), /needs: preflight/);
-
-  assert.match(action, /test "\$REPOSITORY" = ScrollPrize\/villa/);
-  assert.match(action, /test "\$REPOSITORY_ID" = 890972577/);
-  assert.match(action, /test "\$REPOSITORY_OWNER_ID" = 121906140/);
-  assert.match(action, /test "\$REF" = refs\/heads\/main/);
-  assert.match(action, /test "\$OPERATION" != bootstrap/);
-  assert.match(action, /test "\$OPERATION" != cleanup/);
-  assert.match(action, /test "\$SOURCE_CYCLE" = 2026-07/);
-  assert.match(
-    action,
-    /test "\$OPERATION" = bootstrap && test -n "\$TARGET_CYCLE"/,
-  );
-  assert.match(action, /test "\$ALLOW_ACTIVATION_REWIND" = true/);
-  assert.match(action, /test "\$TARGET_CYCLE" = 2026-08/);
-
-  const actionOutputs = action.slice(action.indexOf('outputs:\n'), action.indexOf('\nruns:'));
-  const actionOutputNames = [...actionOutputs.matchAll(/^  ([a-z][a-z-]+):\n/gm)]
-    .map((match) => match[1]);
-  assert.deepEqual(actionOutputNames, ['responder-uri']);
-  assert.doesNotMatch(
-    `${rehearsal}\n${action}`,
-    /GITHUB_OUTPUT.*(?:form-id|folder-id|drive-id|editor)/i,
-  );
-});
-
-test('composite boolean inputs stay strings across authentication and fault handling', async () => {
-  const action = await googleAction();
-  for (const input of ['expect-fault', 'dry-run', 'allow-activation-rewind']) {
-    assert.match(
-      action,
-      new RegExp(`^  ${input}:\\n(?:    .*\\n)*?    default: "false"$`, 'm'),
-    );
-  }
-  assert.match(action, /inputs\['dry-run'\] == 'true'/);
-  assert.match(action, /inputs\['dry-run'\] != 'true'/);
-  assert.match(action, /case "\$EXPECT_FAULT" in true\|false/);
-  assert.match(action, /case "\$DRY_RUN" in true\|false/);
-  assert.match(action, /case "\$ALLOW_ACTIVATION_REWIND" in true\|false/);
-  assert.match(action, /test "\$DRY_RUN" = false \|\| arguments\+=\(--dry-run\)/);
-  assert.match(
-    action,
-    /test "\$ALLOW_ACTIVATION_REWIND" = false \|\| arguments\+=\(--allow-activation-rewind\)/,
-  );
-});
-
-test('composite pre-auth guard executes the activation rewind matrix before OIDC', async () => {
-  const action = await googleAction();
-  const guard = literalRunScripts(action)[0]?.source;
-  assert.equal(typeof guard, 'string');
-  const valid = {
-    REPOSITORY: 'ScrollPrize/villa',
-    REPOSITORY_ID: '890972577',
-    REPOSITORY_OWNER_ID: '121906140',
-    REF: 'refs/heads/main',
-    AUTOMATION_ENVIRONMENT: 'staging',
-    EVENT_NAME: 'workflow_dispatch',
-    OPERATION: 'bootstrap',
-    SIMULATED_NOW: '',
-    FAULT: '',
-    EXPECT_FAULT: 'false',
-    DRY_RUN: 'false',
-    ALLOW_ACTIVATION_REWIND: 'true',
-    VERIFY_MODE: 'prepared',
-    BRANCH: 'codex/progress-prize-smoke-20260720',
-    TARGET_BRANCH: 'codex/progress-prize-smoke-base-20260720',
-    SOURCE_CYCLE: '2026-07',
-    TARGET_CYCLE: '2026-08',
-    HEAD_SHA: '',
-    BASE_SHA: '',
-  };
-  const run = (override = {}) => spawnSync('bash', ['--noprofile', '--norc'], {
-    input: guard,
-    encoding: 'utf8',
-    env: { ...valid, ...override },
-  });
-
-  assert.equal(run().status, 0);
-  for (const override of [
-    { ALLOW_ACTIVATION_REWIND: 'TRUE' },
-    { ALLOW_ACTIVATION_REWIND: '1' },
-    { ALLOW_ACTIVATION_REWIND: '' },
-    { ALLOW_ACTIVATION_REWIND: 'false' },
-    { TARGET_CYCLE: '' },
-    { TARGET_CYCLE: '2026-09' },
-    { SOURCE_CYCLE: '2026-12', TARGET_CYCLE: '2027-01' },
-    { OPERATION: 'prepare' },
-    { EVENT_NAME: 'schedule' },
-    { BRANCH: 'feature/not-smoke' },
-    { TARGET_BRANCH: 'main' },
-    {
-      AUTOMATION_ENVIRONMENT: 'production',
-      BRANCH: 'main',
-      TARGET_BRANCH: 'main',
-    },
-    {
-      AUTOMATION_ENVIRONMENT: 'production',
-      EVENT_NAME: 'schedule',
-      BRANCH: 'main',
-      TARGET_BRANCH: 'main',
-    },
-  ]) {
-    assert.notEqual(run(override).status, 0, JSON.stringify(override));
   }
 });
 
@@ -571,80 +211,6 @@ test('composite reconcile-active guard is manual, real-clock, and marker-only', 
   }
 });
 
-test('rehearsal controls are fixed to staging and its ephemeral branches', async () => {
-  const rehearsal = await workflow('progress-prizes-rehearsal.yml');
-  assert.match(rehearsal, /^on:\n  workflow_dispatch:/m);
-  assert.doesNotMatch(rehearsal, /schedule:|pull_request/);
-  assert.doesNotMatch(
-    rehearsal,
-    /^ {4}secrets:/m,
-    'the top-level workflow must not forward a workflow-level secret map',
-  );
-  assert.doesNotMatch(rehearsal, /secrets:\s*inherit/);
-  assert.match(rehearsal, /codex\/progress-prize-smoke-20260720/);
-  assert.match(rehearsal, /codex\/progress-prize-smoke-base-20260720/);
-  assert.match(rehearsal, /fault: after-copy/);
-  assert.match(rehearsal, /fault: after-close-source/);
-  assert.match(rehearsal, /expect-fault: true/g);
-  assert.match(rehearsal, /verify-post-merge-preview/);
-  assert.match(rehearsal, /prove-activation-idempotency/);
-  assert.match(rehearsal, /reconcile-active-once/);
-  assert.match(rehearsal, /reconcile-active-twice/);
-  assert.match(rehearsal, /verify-cleaned-full-rehearsal/);
-  assert.match(rehearsal, /actions: read\n      checks: read/);
-  assert.match(rehearsal, /actions: read\n      contents: read\n      statuses: read/);
-  assert.match(rehearsal, /--base-sha \"\$EXPECTED_BASE_SHA\"/);
-  assert.match(rehearsal, /--source-cycle \"\$SOURCE_CYCLE\"/);
-
-  const bootstrap = jobBlock(rehearsal, 'bootstrap-staging');
-  assert.equal([...rehearsal.matchAll(/allow-activation-rewind:/g)].length, 1);
-  assert.match(bootstrap, /^          operation: bootstrap$/m);
-  assert.match(bootstrap, /^          environment: staging$/m);
-  assert.match(
-    bootstrap,
-    /^          allow-activation-rewind: \$\{\{ inputs\.operation == 'full-rehearsal' \|\| inputs\.operation == 'activation-fault-recovery' \}\}$/m,
-  );
-  assert.match(
-    bootstrap,
-    /^          target-cycle: \$\{\{ \(inputs\.operation == 'full-rehearsal' \|\| inputs\.operation == 'activation-fault-recovery'\) && inputs\['target-cycle'\] \|\| '' \}\}$/m,
-  );
-  for (const name of googleJobNames.filter((name) => name !== 'bootstrap-staging')) {
-    assert.doesNotMatch(jobBlock(rehearsal, name), /allow-activation-rewind/);
-  }
-  for (const name of ['reconcile-active-once', 'reconcile-active-twice']) {
-    const reconciliation = jobBlock(rehearsal, name);
-    assert.match(reconciliation, /^          operation: reconcile-active$/m);
-    assert.match(reconciliation, /^          environment: staging$/m);
-    assert.match(reconciliation, /Fetch exact merged smoke page as data/);
-    assert.match(reconciliation, /MERGE_SHA: \$\{\{ needs\.merge-smoke\.outputs\['merge-sha'\] \}\}/);
-    assert.doesNotMatch(reconciliation, /simulated-now:|fault:|expect-fault:|head-sha:|base-sha:/);
-  }
-  assert.match(
-    jobBlock(rehearsal, 'cleanup-full-rehearsal'),
-    /^      - reconcile-active-twice$/m,
-  );
-
-  const pagePr = await workflow('progress-prizes-page-pr.yml');
-  assert.match(pagePr, /--force-with-lease=\"refs\/heads\/\$HEAD_BRANCH:\$REMOTE_HEAD_SHA\"/);
-  assert.match(pagePr, /--force-with-lease=\"refs\/heads\/\$HEAD_BRANCH:\"/);
-  assert.match(pagePr, /--head-sha \"\$HEAD_SHA\"/);
-  assert.match(pagePr, /--base-sha \"\$BASE_SHA\"/);
-  assert.match(pagePr, /--source-cycle \"\$SOURCE_CYCLE\"/);
-  assert.match(pagePr, /--responder-uri \"\$RESPONDER_URI\"/);
-  assert.match(pagePr, /test \"\$\{remote_after%%\[\[:space:\]\]\*\}\" = \"\$HEAD_SHA\"/);
-  assert.match(pagePr, /ref: \$\{\{ github\.sha \}\}/);
-  assert.match(pagePr, /TRIGGER_SHA: \$\{\{ github\.sha \}\}/);
-  assert.match(pagePr, /origin \"\$TRIGGER_SHA:refs\/heads\/\$BASE_BRANCH\"/);
-  assert.match(pagePr, /test \"\$base_sha\" = \"\$TRIGGER_SHA\"/);
-  assert.doesNotMatch(pagePr, /ref: refs\/heads\/main/);
-
-  const action = await googleAction();
-  assert.match(action, /passedCopyFault/);
-  assert.match(action, /passedCloseFault/);
-  assert.match(action, /result\.created === false/);
-  assert.match(action, /result\.resumed === true/);
-});
-
 test('Vercel verification runs trusted default-branch code and requires GitHub association', async () => {
   const vercel = await workflow('progress-prizes-vercel-preview.yml');
   assert.match(vercel, /environment: progress-prizes-preview/);
@@ -653,17 +219,14 @@ test('Vercel verification runs trusted default-branch code and requires GitHub a
   assert.doesNotMatch(vercel, /- vercel\.deployment\.success/);
   assert.match(
     vercel,
-    /github\.event\.client_payload\.git\.ref == 'refs\/heads\/codex\/progress-prize-smoke-20260720'/,
-  );
-  assert.match(
-    vercel,
     /startsWith\(github\.event\.client_payload\.git\.ref, 'refs\/heads\/codex\/progress-prize-'\)/,
   );
+  assert.match(vercel, /!startsWith\(github\.event\.client_payload\.git\.ref, 'refs\/heads\/codex\/progress-prize-smoke-'\)/);
   assert.match(vercel, /run-name: Progress Prize Vercel preview \$\{\{ github\.event\.client_payload\.git\.sha \}\}/);
   assert.match(vercel, /ref: \$\{\{ github\.sha \}\}/);
   assert.doesNotMatch(vercel, /ref: refs\/heads\/main/);
   assert.match(vercel, /pulls\?state=open&head=/);
-  assert.match(vercel, /git\/ref\/heads/);
+  assert.doesNotMatch(vercel, /git\/ref\/heads/);
   assert.match(vercel, /payload\.git\?\.sha/);
   assert.match(vercel, /payload\.git\?\.ref/);
   assert.match(vercel, /progress-prizes\/vercel-preview/);
@@ -689,7 +252,7 @@ test('preview gates use creator-bearing newest-first commit status history', asy
   );
   const historyEndpoint = 'github(`/repos/${OWNER}/${REPO}/commits/${sha}/statuses?per_page=100`)';
   const combinedEndpoint = 'github(`/repos/${OWNER}/${REPO}/commits/${sha}/status`)';
-  assert.equal(helper.split(historyEndpoint).length - 1, 2);
+  assert.equal(helper.split(historyEndpoint).length - 1, 1);
   assert.equal(helper.includes(combinedEndpoint), false);
 });
 
@@ -708,13 +271,6 @@ test('PR preparation discovers by immutable head and waits for exact SHA converg
 });
 
 test('trusted branch and exact-check gate helpers reject ambiguous automation state', () => {
-  assert.deepEqual(
-    assertAutomationBranch(
-      'codex/progress-prize-smoke-20260720',
-      'codex/progress-prize-smoke-base-20260720',
-    ).kind,
-    'smoke',
-  );
   assert.equal(assertAutomationBranch('codex/progress-prize-2026-08', 'main').kind, 'production');
   assert.throws(() => assertAutomationBranch('feature/untrusted', 'main'));
 
@@ -927,8 +483,8 @@ test('trusted branch and exact-check gate helpers reject ambiguous automation st
 test('the GitHub helper binds the PR and exact deterministic page-only commit', () => {
   const headSha = 'a'.repeat(40);
   const baseSha = 'b'.repeat(40);
-  const head = 'codex/progress-prize-smoke-20260720';
-  const base = 'codex/progress-prize-smoke-base-20260720';
+  const head = 'codex/progress-prize-2026-08';
+  const base = 'main';
   const baseMarkdown = [
     '# Prizes',
     '',
@@ -1189,8 +745,8 @@ test('GitHub coordination diagnostics are bounded to an allowlist', () => {
 });
 
 test('PR binding retry tolerates only bounded stale SHAs', async () => {
-  const head = 'codex/progress-prize-smoke-20260720';
-  const base = 'codex/progress-prize-smoke-base-20260720';
+  const head = 'codex/progress-prize-2026-08';
+  const base = 'main';
   const headSha = 'a'.repeat(40);
   const baseSha = 'b'.repeat(40);
   const exactPull = {
@@ -1243,7 +799,7 @@ test('PR binding retry tolerates only bounded stale SHAs', async () => {
       delayMs: 0,
       readPull: async () => {
         unsafeReads += 1;
-        return { ...stalePull, base: { ...stalePull.base, ref: 'main' } };
+        return { ...stalePull, base: { ...stalePull.base, ref: 'release' } };
       },
       sleep: async () => { unsafeSleeps += 1; },
     }),
