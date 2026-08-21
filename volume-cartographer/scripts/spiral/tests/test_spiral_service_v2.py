@@ -1830,8 +1830,11 @@ class ExplicitInitializationTests(HttpServiceFixture):
 
             # A run that changes a new-fit configuration key is refused: the
             # resident model keeps its domain.
-            configuration = Config({**_NO_DENSE_LOSSES,
-                                    "model_num_flow_stages": 3}).as_dict()
+            configuration = {
+                **Config.catalog()["defaults"],
+                **_NO_DENSE_LOSSES,
+                "model_num_flow_stages": 3,
+            }
             with self.assertRaisesRegex(ApiError, "requires rebuilding"):
                 self.state.run({
                     "configuration": configuration,
