@@ -3155,8 +3155,8 @@ QString GrowTrackPatchesDialog::scriptPath() const
 {
     const QString appDir = QCoreApplication::applicationDirPath();
     const QStringList candidates = {
-        QDir(appDir).filePath("../../../../spiral-fitting/grow_track_graph.py"),
         QDir(appDir).filePath("../../../spiral-fitting/grow_track_graph.py"),
+        QDir(appDir).filePath("../../../../spiral-fitting/grow_track_graph.py"),
         QDir(QDir::currentPath()).filePath("spiral-fitting/grow_track_graph.py"),
         QDir(QDir::currentPath()).filePath("../spiral-fitting/grow_track_graph.py"),
         QDir(appDir).filePath("../share/volume-cartographer/spiral/grow_track_graph.py"),

@@ -196,8 +196,8 @@ QString SpiralServiceManager::findService() const
         qEnvironmentVariable("SPIRAL_SERVICE_PATH"),
         QDir::current().filePath(QStringLiteral("spiral-fitting/spiral_service.py")),
         QDir::current().filePath(QStringLiteral("../spiral-fitting/spiral_service.py")),
-        QDir(app).filePath(QStringLiteral("../../../../spiral-fitting/spiral_service.py")),
         QDir(app).filePath(QStringLiteral("../../../spiral-fitting/spiral_service.py")),
+        QDir(app).filePath(QStringLiteral("../../../../spiral-fitting/spiral_service.py")),
         QDir(app).filePath(QStringLiteral("../share/volume-cartographer/spiral/spiral_service.py")),
     };
     for (const QString& candidate : candidates)
