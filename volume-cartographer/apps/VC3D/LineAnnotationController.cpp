@@ -22,6 +22,7 @@
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/ScrollUmbilicus.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/ui/VCCollection.hpp"
@@ -6239,6 +6240,400 @@ std::vector<LineAnnotationController::FiberSummary> LineAnnotationController::fi
     return summaries;
 }
 
+QString LineAnnotationController::umbilicusFingerprint() const
+{
+    if (!_state || !_state->vpkg()) {
+        return {};
+    }
+    const VolumePkg& pkg = *_state->vpkg();
+    // Deliberately cheap: this is compared whenever a derived view is about to be
+    // trusted, so it must not run the resolver's JSON parse. The project's field
+    // covers attaching, detaching and repointing; stat()ing what the resolver
+    // depends on covers a file being added, replaced or rewritten underneath
+    // VC3D, which nothing in-process announces.
+    //
+    // What that set is comes from the resolver rather than from a second guess
+    // here: scanUmbilicusCandidates() applies the resolver's own short circuits,
+    // so a file the resolver would never open — one shadowed by the project's
+    // field, or by a higher-priority name — cannot invalidate anything by
+    // changing.
+    QString fingerprint = QString::fromStdString(pkg.umbilicus());
+    for (const auto& candidate : vc::core::util::scanUmbilicusCandidates(pkg)) {
+        std::error_code ec;
+        const auto size = std::filesystem::file_size(candidate.path, ec);
+        if (ec) {
+            // Absent is itself a state worth recording: a file appearing later has
+            // to read as a change.
+            fingerprint += QStringLiteral("|-");
+            continue;
+        }
+        fingerprint += QStringLiteral("|%1").arg(size);
+        const auto written =
+            std::filesystem::last_write_time(candidate.path, ec);
+        if (!ec) {
+            fingerprint += QStringLiteral(":%1").arg(
+                static_cast<qlonglong>(written.time_since_epoch().count()));
+        }
+    }
+    return fingerprint;
+}
+
+LineAnnotationController::UmbilicusStatus
+LineAnnotationController::umbilicusStatus() const
+{
+    if (!_state || !_state->vpkg()) {
+        return {};
+    }
+    const VolumePkg& pkg = *_state->vpkg();
+    const vc::core::util::ScrollUmbilicusResolution resolved =
+        vc::core::util::resolveScrollUmbilicus(pkg);
+    if (!resolved.path.empty()) {
+        QString text = QString::fromStdString(resolved.path.filename().string());
+        if (!vc::core::util::umbilicusFrameClaim(resolved.info).any()) {
+            // Only a file stating nothing at all. Dimensions alone are a complete
+            // statement — the preferred one — so calling that unstamped labelled
+            // the better-stamped file as the worse. Conditional wording, because
+            // an unstamped file is only usable here if the grid inference can
+            // place it: the Fiber Map has no legacy reading to fall back on, so
+            // a rebuild refuses when inference fails, and this line must not
+            // have called that file plainly usable.
+            text += tr(" (unstamped — frame must be inferred)");
+        }
+        return {true, std::move(text)};
+    }
+    if (!resolved.ambiguous.empty()) {
+        // The candidate paths are what makes this error long; a count is enough
+        // for a status line and the full list still appears on rebuild.
+        return {false, tr("multiple umbilicus files found (%1)")
+                           .arg(resolved.ambiguous.size())};
+    }
+    if (!pkg.umbilicusPath().empty()) {
+        // The project named a file the resolver refused: that is worth spelling
+        // out, since nothing in the package directory can fix it. The resolver
+        // keeps the detail after a semicolon, which a status line drops.
+        QString error = QString::fromStdString(resolved.error);
+        const int detail = error.indexOf(QLatin1String("; "));
+        if (detail > 0) {
+            error.truncate(detail);
+        }
+        return {false, std::move(error)};
+    }
+    // Nothing found, or the single candidate would not load; either way the
+    // package has no usable umbilicus and the rebuild carries the resolver's
+    // own words.
+    return {false, tr("no umbilicus")};
+}
+
+LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSnapshot() const
+{
+    FiberMapSnapshot snapshot;
+    snapshot.generation = _fiberDataGeneration;
+
+    // Fibers are annotated in a source frame the current volume may only
+    // describe indirectly, so the resolution and the voxel counts both come from
+    // one derivation — deriving them separately is what let a rebased store pair
+    // a level-0 resolution with level-N counts.
+    const auto frame = annotationFrame();
+    snapshot.frame = frame;
+    snapshot.voxelSizeUm = frame.voxelSizeUm;
+    if (snapshot.voxelSizeUm) {
+        Logger()->info(
+            "Fiber map: annotation voxel size {:g} um, volume grid scaled by "
+            "x{:g} into the annotation frame",
+            *snapshot.voxelSizeUm,
+            frame.factor);
+    } else {
+        Logger()->info("Fiber map: no voxel size available; the map will report "
+                       "lengths in voxels");
+    }
+
+    // The scroll's z extent in that same frame, so it pairs with voxelSizeUm.
+    if (frame.extentXyz[2] > 0.0) {
+        snapshot.annotationZSlices =
+            static_cast<int>(std::llround(frame.extentXyz[2]));
+    }
+
+    std::unordered_set<uint64_t> loadedIds;
+    loadedIds.reserve(_fibers.size());
+    for (const StoredFiber& fiber : _fibers) {
+        loadedIds.insert(fiber.id);
+    }
+
+    snapshot.fibers.reserve(_fibers.size());
+    for (const StoredFiber& fiber : _fibers) {
+        FiberMapFiber entry;
+        entry.id = fiber.id;
+        // The user part of the label comes from the file name, not the
+        // username field: for some fibers the two disagree and the file name
+        // is what the fiber panel shows.
+        entry.fileName = fiber.fileName;
+        const QString stem =
+            vc3d::displayStemForFiberFile(QString::fromStdString(fiber.fileName));
+        const int separator = stem.indexOf(QLatin1Char('_'));
+        entry.label = QStringLiteral("%1-%2")
+                          .arg(separator >= 0 ? stem.left(separator) : stem)
+                          .arg(fiber.sequence);
+        switch (vc::atlas::effectiveFiberHvTag(fiber.hvClassification, fiber.manualHvTag)) {
+        case vc3d::line_annotation::FiberHvTag::H:
+            entry.hvTag = 'H';
+            break;
+        case vc3d::line_annotation::FiberHvTag::V:
+            entry.hvTag = 'V';
+            break;
+        case vc3d::line_annotation::FiberHvTag::Unknown:
+        default:
+            entry.hvTag = '?';
+            break;
+        }
+        entry.controlPoints.assign(fiber.controlPoints.begin(), fiber.controlPoints.end());
+        entry.linePoints = fiber.linePoints;
+        const size_t spanCount =
+            fiber.controlPoints.empty() ? 0 : fiber.controlPoints.size() - 1;
+        entry.tracedSegments.reserve(spanCount);
+        for (size_t i = 0; i < spanCount; ++i) {
+            entry.tracedSegments.push_back(vc3d::line_annotation::isAcceptedNativeTrace(
+                fiber.controlPoints[i].segmentToNext));
+        }
+        for (const FiberBranchRef& branch : fiber.branches) {
+            if (loadedIds.count(branch.branchFiberId) == 0) {
+                continue;
+            }
+            entry.links.push_back(FiberMapLink{branch.controlPointIndex,
+                                               branch.branchFiberId,
+                                               branch.branchControlPointIndex,
+                                               branch.pending});
+        }
+        snapshot.fibers.push_back(std::move(entry));
+    }
+
+    // Which umbilicus resolves, which frame it is in, and what to say about it
+    // are one question with several exits, answered by umbilicusForSnapshot()
+    // so this function stays the data export it reads as.
+    SnapshotUmbilicus umbilicus = umbilicusForSnapshot(frame);
+    snapshot.umbilicusMessage = std::move(umbilicus.message);
+    snapshot.umbilicusLabel = std::move(umbilicus.label);
+    snapshot.umbilicusCenters = std::move(umbilicus.centers);
+    return snapshot;
+}
+
+LineAnnotationController::SnapshotUmbilicus
+LineAnnotationController::umbilicusForSnapshot(
+    const vc3d::annotation::AnnotationFrame& frame) const
+{
+    SnapshotUmbilicus result;
+    // Which umbilicus a package uses is the shared resolver's call: the
+    // project's "umbilicus" field wins, otherwise the package root and the
+    // segment parents are searched and ambiguity is refused outright.
+    if (!_state || !_state->vpkg()) {
+        return result;
+    }
+    const vc::core::util::ScrollUmbilicusResolution resolved =
+        vc::core::util::resolveScrollUmbilicus(*_state->vpkg());
+    if (resolved.path.empty()) {
+        result.message = QString::fromStdString(resolved.error);
+        for (const auto& candidate : resolved.ambiguous) {
+            result.message += QLatin1Char('\n');
+            result.message += QString::fromStdString(candidate.string());
+        }
+        Logger()->warn("Fiber map: no usable umbilicus: {}", resolved.error);
+        return result;
+    }
+
+    std::vector<cv::Vec3f> points = resolved.info.controlPoints;
+    if (points.empty()) {
+        Logger()->warn("Fiber map: umbilicus {} has no points",
+                       resolved.path.string());
+        return result;
+    }
+
+    // The umbilicus may be annotated on a downsampled grid while the fibers
+    // live in the volume's level-0 source frame (PHercParis4's is x4), so its
+    // coordinates have to be brought into that frame first. Framing is the
+    // shared implementation's job: deriveUmbilicusScale() knows the
+    // stamped-dimension test, the voxel-size fallback and the grid inference,
+    // umbilicusStampContradiction() knows when the volume a stamp names
+    // disproves it, and decideUmbilicusLoadAction() knows which readings may
+    // be acted on. Fiber geometry is never consulted: where the annotation
+    // happens to reach says nothing about the grid the umbilicus was drawn on.
+    const std::array<double, 3>& fiberGridXyz = frame.extentXyz;
+    const bool haveFiberGrid = fiberGridXyz[0] > 0.0 && fiberGridXyz[1] > 0.0 &&
+                               fiberGridXyz[2] > 0.0;
+
+    const auto derived = vc::core::util::deriveUmbilicusScale(
+        resolved.info, fiberGridXyz, frame.voxelSizeUm);
+    const auto claim = vc::core::util::umbilicusFrameClaim(resolved.info);
+
+    // A stamp naming a volume this project has can be checked against it; one
+    // it does not have merely goes unverified, which is not a contradiction.
+    // The named volume is also what the transform.json note further down
+    // reads, so it is looked up once here.
+    std::optional<std::string> stampContradiction;
+    std::shared_ptr<Volume> stampedVolume;
+    if (resolved.info.volume && !resolved.info.volume->empty()) {
+        stampedVolume =
+            attachedVolumeByStoreName(*_state->vpkg(), *resolved.info.volume);
+        if (stampedVolume) {
+            std::array<double, 3> namedGrid{0.0, 0.0, 0.0};
+            std::optional<double> namedVoxelUm;
+            try {
+                namedGrid = {static_cast<double>(stampedVolume->sliceWidth()),
+                             static_cast<double>(stampedVolume->sliceHeight()),
+                             static_cast<double>(stampedVolume->numSlices())};
+                const double voxel = stampedVolume->voxelSize();
+                if (std::isfinite(voxel) && voxel > 0.0) {
+                    namedVoxelUm = voxel;
+                }
+            } catch (...) {
+            }
+            stampContradiction = vc::core::util::umbilicusStampContradiction(
+                resolved.info, namedGrid, namedVoxelUm);
+        }
+    }
+
+    const auto action = vc::core::util::decideUmbilicusLoadAction(
+        derived, claim, haveFiberGrid, stampContradiction.has_value());
+
+    if (stampContradiction) {
+        // Refused rather than drawn with a warning beside it: whatever scale
+        // was derived came from a statement the named volume disproves, and an
+        // actionable map unrolled from it is the confidently wrong picture
+        // this whole path exists to prevent.
+        Logger()->warn("Fiber map: refusing umbilicus {}: {}",
+                       resolved.path.string(),
+                       *stampContradiction);
+        result.message =
+            tr("umbilicus %1 refused: %2")
+                .arg(QString::fromStdString(resolved.path.filename().string()),
+                     QString::fromStdString(*stampContradiction));
+        return result;
+    }
+    if (action != vc::core::util::UmbilicusLoadAction::Apply) {
+        // One message for every remaining way of failing, including a stated
+        // frame that does not fit, which this consumer used to accept by
+        // falling through to a weaker reading — and UseLegacy, deliberately:
+        // the legacy reading is line annotation's compatibility path (its
+        // registration inverse or raw points), and this consumer has no such
+        // reading to apply, so a file that states nothing and defeats
+        // inference is refused with the same remedy.
+        Logger()->warn(
+            "Fiber map: could not determine the frame of umbilicus {} against "
+            "the {:g}x{:g}x{:g} annotation grid",
+            resolved.path.string(),
+            fiberGridXyz[0],
+            fiberGridXyz[1],
+            fiberGridXyz[2]);
+        result.message =
+            tr("Could not determine the umbilicus frame for %1. Stamp it with "
+               "volume_width, volume_height and volume_slices.")
+                .arg(QString::fromStdString(resolved.path.filename().string()));
+        return result;
+    }
+
+    const double scale = derived->factor;
+    // Which source decided it: only the µm comparison licenses the label to
+    // describe the frame in micrometres, and only an inference has to admit it
+    // is one.
+    const bool guessed =
+        derived->source == vc::core::util::UmbilicusScaleSource::InferredFromGrid;
+    const bool scaleFromStampedVoxelSize =
+        derived->source == vc::core::util::UmbilicusScaleSource::StampedVoxelSize;
+    Logger()->info("Fiber map: umbilicus {} at scale x{:g} ({})",
+                   resolved.path.string(),
+                   scale,
+                   derived->description);
+
+    // A bare factor says how much the coordinates moved but not what frame they
+    // came from. Within one volpkg the volumes are levels of a single
+    // coordinate space with power-of-two voxel ratios, so a stamped
+    // power-of-two ratio *is* a level offset and reads far better as one; a
+    // ratio that is not a power of two means the stamped grid is not a level of
+    // this one, which the grid size states more usefully than a level would.
+    const QString factor = QString::number(scale, 'g', 6);
+    QString label;
+    if (guessed) {
+        // Inferred from the volume's grid rather than stated by the file, so say
+        // so: it is the one scale a reader may want to double-check.
+        label = tr("umbilicus ×%1 (inferred)").arg(factor);
+    } else {
+        const double level = std::log2(scale);
+        const double rounded = std::round(level);
+        if (std::abs(level - rounded) < 1e-6) {
+            // The stamped store name is the most recognizable frame label;
+            // a file that stamped only its voxel size falls back to its own
+            // name, which at least says which umbilicus is in play.
+            const QString frameName =
+                resolved.info.volume && !resolved.info.volume->empty()
+                    ? QString::fromStdString(*resolved.info.volume)
+                    : QString::fromStdString(resolved.path.filename().string());
+            const int levelOffset = static_cast<int>(rounded);
+            label = tr("umbilicus: %1 → level %2%3 vs base (×%4)")
+                        .arg(frameName)
+                        .arg(levelOffset >= 0 ? QStringLiteral("+") : QString())
+                        .arg(levelOffset)
+                        .arg(factor);
+        } else if (scaleFromStampedVoxelSize && resolved.info.voxelsizeUm) {
+            // Only said when the µm comparison is what produced the scale: with
+            // the annotation voxel size unknown that path is skipped, and a
+            // scale that came from the stamped grid is described by that grid
+            // below rather than by a µm figure this mapping never used.
+            label = tr("umbilicus: %1 µm grid → ×%2")
+                        .arg(QString::number(*resolved.info.voxelsizeUm, 'g', 6))
+                        .arg(factor);
+        } else {
+            // Dimensions stamped but not a power-of-two ratio: the grid it was
+            // drawn on is the only description that fits.
+            label = tr("umbilicus: %1×%2×%3 grid → ×%4")
+                        .arg(*resolved.info.volumeWidth)
+                        .arg(*resolved.info.volumeHeight)
+                        .arg(*resolved.info.volumeSlices)
+                        .arg(factor);
+        }
+    }
+
+    // The scalar mapping above is only correct because the stamped volume is
+    // assumed to share this consumer's coordinate space. A stamp whose named
+    // volume is absent went unchecked, and a volume registered through an
+    // affine transform is outside what a scalar can express; both are said on
+    // the label rather than blocking the unroll, since neither disproves the
+    // stamp the way a contradiction does. Known limit: these notes are read at
+    // build time only — neither the named volume nor its transform.json is part
+    // of the Fiber Map's staleness dependencies, so a registration added or
+    // removed after a build changes only what the next rebuild's label says.
+    if (resolved.info.volume && !resolved.info.volume->empty()) {
+        if (stampedVolume) {
+            const std::filesystem::path transform =
+                stampedVolume->path() / "transform.json";
+            std::error_code transformCheck;
+            if (std::filesystem::exists(transform, transformCheck)) {
+                label += tr(" (registered volume — scalar mapping may not apply)");
+                Logger()->warn(
+                    "Fiber map: umbilicus volume {} is registered via {}; the "
+                    "scalar frame mapping assumes a shared coordinate space "
+                    "and may not apply",
+                    *resolved.info.volume,
+                    transform.string());
+            }
+        } else {
+            label += tr(" (stamp unverified: %1 not attached)")
+                         .arg(QString::fromStdString(*resolved.info.volume));
+            Logger()->warn(
+                "Fiber map: umbilicus {} names volume {}, which is not "
+                "attached; its stamp could not be verified",
+                resolved.path.string(),
+                *resolved.info.volume);
+        }
+    }
+
+    for (auto& point : points) {
+        point *= static_cast<float>(scale);
+    }
+    std::sort(points.begin(), points.end(),
+              [](const cv::Vec3f& a, const cv::Vec3f& b) { return a[2] < b[2]; });
+    result.centers = std::move(points);
+    result.label = std::move(label);
+    return result;
+}
+
 std::vector<LineAnnotationController::FiberLinkOverlayInfo>
 LineAnnotationController::fiberLinkOverlayInfos() const
 {
@@ -6539,6 +6934,7 @@ void LineAnnotationController::onVolumePackageChanged(std::shared_ptr<VolumePkg>
     // Dropped outright rather than left to the frame comparison: two projects can
     // sit in one directory with identical grids, so both halves of the cache key
     // can match while the umbilicus file behind them differs.
+    ++_packageGeneration;
     invalidateScrollUmbilicus();
     loadFibersForCurrentPackage();
 }
@@ -7566,6 +7962,15 @@ void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
             *it = std::move(merged);
         }
     }
+    // _fibers now deviates from what the previous generation described — the
+    // merged fiber coexists with both originals until the deferred retirement
+    // below settles — and that retirement runs nested event loops. Bumping here
+    // makes any map built before this edit stale immediately, and the settling
+    // emitFiberSummaries() bumping again makes a map built *inside* the window
+    // stale at settlement. What no counter can give is a map built inside the
+    // window reading as stale while still inside it; the gates catch it at the
+    // settling bump instead.
+    ++_fiberDataGeneration;
 
     // Redirect third-party reciprocal refs from either original onto the
     // merged fiber, indices through the orientation remaps.
@@ -7963,6 +8368,11 @@ void LineAnnotationController::handleGeneratedControlPointSplitFromCandidate(
     const std::string suffixFileName = suffix.fileName;
     upsertFiber(std::move(prefix));
     upsertFiber(std::move(suffix));
+    // As in the merge above: both halves coexist with the parent until the
+    // deferred retirement settles, and that retirement runs nested event
+    // loops. A map built before this edit goes stale now; one built inside the
+    // window goes stale at the settling bump.
+    ++_fiberDataGeneration;
 
     // Fan-out of syncBranchFiberFileRename: reciprocal refs on peers move to
     // whichever half now owns their control point.
@@ -9966,13 +10376,9 @@ vc3d::annotation::AnnotationFrame LineAnnotationController::annotationFrame() co
     }
 }
 
-std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
-    const LineAnnotationSession& session)
+const std::optional<vc::core::util::Umbilicus>&
+LineAnnotationController::ensureScrollUmbilicusLoaded()
 {
-    constexpr float kNan = std::numeric_limits<float>::quiet_NaN();
-    std::vector<cv::Vec3f> normals;
-    normals.reserve(session.optimizedLine.points.size());
-
     std::shared_ptr<Volume> volume;
     try {
         volume = _state ? _state->currentVolume() : nullptr;
@@ -9980,9 +10386,6 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
         volume.reset();
     }
 
-    // One way to find umbilicus data: the shared resolver honours the project's
-    // attachment, refuses several candidates rather than picking one, and
-    // refuses a file whose frame metadata is malformed.
     fs::path volpkgRoot;
     if (_state && _state->vpkg()) {
         auto vpkg = _state->vpkg();
@@ -10032,6 +10435,9 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
         _umbilicusNotice.clear();
         try {
             if (_state && _state->vpkg() && volume) {
+                // One way to find umbilicus data: the shared resolver honours the
+                // project's attachment, refuses several candidates rather than
+                // picking one, and refuses malformed frame metadata.
                 const auto resolved =
                     vc::core::util::resolveScrollUmbilicus(*_state->vpkg());
                 if (resolved.path.empty()) {
@@ -10044,17 +10450,15 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
                     }
                 } else {
                     std::vector<cv::Vec3f> controlPoints = resolved.info.controlPoints;
-
-                    // The line's own points are in the annotation frame, so the
-                    // umbilicus has to be too, and the dense per-slice centres
-                    // have to be built at that frame's extent rather than the
-                    // volume's own.
+                    // Line points live in the annotation frame, so that is the
+                    // frame to reach, and the dense per-slice centres have to be
+                    // built at its extent rather than the volume's own.
+                    //
                     // The frame from the cache key above, not a fresh derivation:
                     // the two must agree or the cache would record a frame the
                     // geometry was not built in.
                     const auto& frame = currentAnnotationFrame;
-                    const std::array<double, 3>& annotationGrid =
-                        frame.extentXyz;
+                    const std::array<double, 3>& annotationGrid = frame.extentXyz;
                     const auto scale = vc::core::util::deriveUmbilicusScale(
                         resolved.info, annotationGrid, frame.voxelSizeUm);
 
@@ -10293,8 +10697,8 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
                             _scrollUmbilicus = vc::core::util::Umbilicus::FromPoints(
                                 std::move(*framed), volumeShape);
                             Logger()->info(
-                                "Line annotation: umbilicus {} carries no frame "
-                                "metadata; read as before",
+                                "Line annotation: umbilicus {} states no frame; "
+                                "read as before",
                                 resolved.path.string());
                         }
                     }
@@ -10304,6 +10708,24 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
             _scrollUmbilicus.reset();
         }
         publishUmbilicusNotice();
+    }
+    return _scrollUmbilicus;
+}
+
+std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
+    const LineAnnotationSession& session)
+{
+    constexpr float kNan = std::numeric_limits<float>::quiet_NaN();
+    std::vector<cv::Vec3f> normals;
+    normals.reserve(session.optimizedLine.points.size());
+
+    ensureScrollUmbilicusLoaded();
+
+    std::shared_ptr<Volume> volume;
+    try {
+        volume = _state ? _state->currentVolume() : nullptr;
+    } catch (...) {
+        volume.reset();
     }
 
     cv::Vec2f volumeCenterXY{kNan, kNan};
@@ -10919,6 +11341,12 @@ void LineAnnotationController::loadFibersForCurrentPackage()
     _linkCandidate.reset();
     _splitCandidate.reset();
     _fibers.clear();
+    // The set no longer matches what the previous generation described, and
+    // the broken-link prompt below can hand control to a nested event loop
+    // mid-load. Bumping now makes a map built before this load stale
+    // immediately; one built against the part-loaded set inside the prompt goes
+    // stale at the final emitFiberSummaries() bump.
+    ++_fiberDataGeneration;
     _fiberAlignmentMetrics.clear();
     _pendingFiberAlignmentMetrics.clear();
     _pendingFiberAlignmentMetricTokens.clear();
@@ -11356,7 +11784,25 @@ void LineAnnotationController::reoptimizeMergedFibers(
 
 void LineAnnotationController::emitFiberSummaries()
 {
+    // Most in-memory fiber mutations land here, and this is where derived data
+    // becomes stale for them. The exceptions bump the counter themselves --
+    // scheduleBranchMetadataSaves() upserts the peers of a structural edit and some
+    // of its callers return without emitting summaries -- so a holder comparing
+    // fiberDataGeneration() sees every change, not only the ones reaching here.
+    ++_fiberDataGeneration;
     emit fibersChanged(fiberSummaries());
+}
+
+uint64_t LineAnnotationController::fiberIdForFileName(const std::string& fileName) const
+{
+    if (fileName.empty()) {
+        return 0;
+    }
+    const auto it = std::find_if(_fibers.begin(), _fibers.end(),
+                                 [&fileName](const StoredFiber& fiber) {
+                                     return fiber.fileName == fileName;
+                                 });
+    return it != _fibers.end() ? it->id : 0;
 }
 
 void LineAnnotationController::addKnownFiberTags(const std::vector<std::string>& tags)
@@ -12458,6 +12904,13 @@ void LineAnnotationController::scheduleBranchMetadataSaves(
         }
     }
     if (!snapshots.empty()) {
+        // This function inserts into and overwrites _fibers to keep the peers of a
+        // structural edit in step, and some callers return straight afterwards
+        // without going through emitFiberSummaries(). Holders comparing
+        // fiberDataGeneration() -- the Fiber Map's click, list and menu gates --
+        // would then accept geometry and links that had already changed. The counter
+        // belongs with the mutation, not with whichever caller emits summaries later.
+        ++_fiberDataGeneration;
         scheduleFiberSaveSnapshots(std::move(snapshots));
     }
 }
@@ -13886,6 +14339,10 @@ void LineAnnotationController::finishFiberSaveJob(
 
     QString errorMessage;
     if (result.ok) {
+        // No generation bump here: the mutation that prompted this save already
+        // updated _fibers and went through emitFiberSummaries(), and writing it
+        // to disk changes nothing a snapshot reads. Bumping again only made
+        // every save look like fresh fiber data to derived views.
         for (size_t i = 0; i < result.fiberIds.size(); ++i) {
             const uint64_t generation =
                 i < result.generations.size() ? result.generations[i] : 0;
