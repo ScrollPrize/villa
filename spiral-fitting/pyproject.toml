@@ -27,6 +27,7 @@ dependencies = [
     "tifffile>=2026.6.1",
     "tensorstore>=0.1.80",
     "threadpoolctl>=3.6.0",
+    "torch>=2.11,<2.13",
     "torchdiffeq>=0.2.5",
     "tqdm>=4.68.3",
     "trimesh>=4.12.2",
@@ -34,6 +35,16 @@ dependencies = [
     "wandb>=0.28.0",
     "zarr>=3.2.1",
 ]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [build-system]
 requires = [

@@ -28,6 +28,7 @@ AGGREGATE_METRICS_FILENAME = "aggregate_metrics.json"
 STATE_FILENAME = ".run_single_state.json"
 STATE_VERSION = 1
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+_INK_STRIP_SUFFIX = ".jpg"
 
 # Executing this file directly puts only runners/ on sys.path.
 if str(SPIRAL_DIR) not in sys.path:
@@ -586,6 +587,16 @@ def _state_artifact(output: Path, stage: dict, key: str) -> Path:
     return candidate
 
 
+def _require_ink_output(ink: Path) -> None:
+    if not ink.is_dir():
+        raise RuntimeError(f"render completed without expected artifact: {ink}")
+    if not any(
+        path.is_file() and path.suffix.lower() == _INK_STRIP_SUFFIX
+        for path in ink.iterdir()
+    ):
+        raise RuntimeError(f"render completed without ink strip images: {ink}")
+
+
 def _validate_completed_stages(output: Path, state: dict) -> None:
     for label, stages in state["runs"].items():
         fit = stages["fit"]
@@ -601,9 +612,12 @@ def _validate_completed_stages(output: Path, state: dict) -> None:
         render = stages["render"]
         if render.get("status") == "complete":
             ink = _state_artifact(output, render, "ink_output")
-            if not ink.is_dir():
+            try:
+                _require_ink_output(ink)
+            except RuntimeError as exc:
                 raise RuntimeError(
-                    f"completed render artifact is missing for {label}: {ink}")
+                    f"completed render artifact is invalid for {label}: {ink}"
+                ) from exc
         metrics = stages["metrics"]
         if metrics.get("status") == "complete":
             metrics_path = _state_artifact(output, metrics, "metrics_output")
@@ -725,8 +739,7 @@ def _run_resumable_pipeline(
             subprocess.run(command, check=True,
                            env=downstream_environment(args.num_threads, gpu_ids=gpu_ids))
             ink = fitted_dir / "ink"
-            if not ink.is_dir():
-                raise RuntimeError(f"render completed without expected artifact: {ink}")
+            _require_ink_output(ink)
             stages["render"]["ink_output"] = str(ink.resolve().relative_to(root_output))
 
         _run_saved_stage(state, state_path, stages["render"], render)
