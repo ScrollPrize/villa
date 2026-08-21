@@ -18,6 +18,7 @@ import zarr
 
 from ..base import TaskConfig, ZarrTask, make_task_config
 from ..registry import register_task
+from vesuvius.zarr_compat import create_array
 
 
 @dataclass
@@ -291,7 +292,7 @@ class ResizeTask(ZarrTask):
 
             # Create output array for this resolution
             output_store = zarr.open(str(output_path), mode="a")
-            output_store.create_dataset(
+            create_array(output_store,
                 resolution,
                 shape=self._target_shape,
                 chunks=self._out_chunks,

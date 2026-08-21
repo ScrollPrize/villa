@@ -15,6 +15,7 @@ from vesuvius.ink_detection.preprocessing.staged_write import publish_staged_out
 from vesuvius.ink_detection.volume_io import ZARR_V3, open_volume_root
 from vesuvius.label_zarr import open_v2_group
 from vesuvius.utils.cli import HyphenUnderscoreParser
+from vesuvius.zarr_compat import create_array
 
 
 OUTPUT_Z = 21
@@ -68,7 +69,7 @@ def _create_target_array(
     if ZARR_V3:
         target = group.create_array("0", **create_kwargs)
     else:
-        target = group.create_dataset("0", **create_kwargs)
+        target = create_array(group, "0", **create_kwargs)
     return group, target
 
 

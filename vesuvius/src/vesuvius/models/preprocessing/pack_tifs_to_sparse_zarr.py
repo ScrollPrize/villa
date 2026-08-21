@@ -40,6 +40,7 @@ import zarr
 from scipy import ndimage
 from numcodecs import Blosc
 from tqdm import tqdm
+from vesuvius.zarr_compat import create_array
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -380,7 +381,7 @@ def create_ome_zarr_group(
             current_shape = level_shape
 
         # Create array for this level
-        root.create_dataset(
+        create_array(root,
             str(level),
             shape=level_shape,
             chunks=level_chunks,

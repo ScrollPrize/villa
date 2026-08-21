@@ -26,6 +26,7 @@ from vesuvius.ink_detection.types import Segment
 from vesuvius.ink_detection.volume_io import ZARR_V3, open_volume, open_volume_root
 from vesuvius.label_zarr import open_v2_group
 from vesuvius.utils.cli import HyphenUnderscoreParser
+from vesuvius.zarr_compat import create_array
 
 
 DEFAULT_PATCH_SIZE_ZYX = (512, 512, 512)
@@ -408,7 +409,7 @@ def _create_output_arrays(source_group, output_path: Path, recompress: str):
         if ZARR_V3:
             output_array = root.create_array(key, **create_kwargs)
         else:
-            output_array = root.create_dataset(key, **create_kwargs)
+            output_array = create_array(root, key, **create_kwargs)
         output_array.attrs.update(dict(source_array.attrs))
     return root
 

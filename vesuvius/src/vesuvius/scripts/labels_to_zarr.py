@@ -70,6 +70,7 @@ def distance_transform_edt(mask: np.ndarray) -> np.ndarray:
         return scipy_edt(mask)
 
 from vesuvius.tifxyz import read_tifxyz
+from vesuvius.zarr_compat import create_array
 
 
 def parse_args() -> argparse.Namespace:
@@ -1664,7 +1665,7 @@ def generate_pyramid_levels(
 
         # Create array for this level
         level_chunks = tuple(min(c, s) for c, s in zip(chunks, new_shape))
-        new_arr = root.create_dataset(
+        new_arr = create_array(root,
             str(level),
             shape=new_shape,
             chunks=level_chunks,
@@ -1846,7 +1847,7 @@ def main() -> None:
 
     # Create level 0 array (full resolution)
     level0_path = output_path / "0"
-    zarr_array = root.create_dataset(
+    zarr_array = create_array(root,
         "0",
         shape=(z_dim, y_dim, x_dim),
         chunks=chunks,

@@ -29,6 +29,7 @@ from numcodecs import Blosc
 from tqdm import tqdm
 
 from vesuvius.tifxyz import read_tifxyz
+from vesuvius.zarr_compat import create_array
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -428,7 +429,7 @@ def extract_sparse_ome_zarr(
         level_shape = tuple((s + scale - 1) // scale for s in volume_shape)
         level_chunks = tuple(min(c, s) for c, s in zip(chunk_size, level_shape))
 
-        root.create_dataset(
+        create_array(root,
             str(level),
             shape=level_shape,
             chunks=level_chunks,

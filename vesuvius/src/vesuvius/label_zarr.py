@@ -7,6 +7,7 @@ from typing import Any, Sequence
 
 from numcodecs import Blosc
 import zarr
+from vesuvius.zarr_compat import create_array
 
 
 AXES = [
@@ -138,7 +139,7 @@ def create_v2_array(
             config={"write_empty_chunks": False},
         )
     else:
-        array = group.create_dataset(
+        array = create_array(group,
             name,
             **kwargs,
             dimension_separator="/",
