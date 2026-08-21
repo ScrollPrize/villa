@@ -1,4 +1,4 @@
 {
-  "input_disable_same_winding_pcls": true,
-  "input_disable_drawn_control_points": true
+  "input_use_pcl_same_winding": false,
+  "input_use_pcl_drawn_control_points": false
 }

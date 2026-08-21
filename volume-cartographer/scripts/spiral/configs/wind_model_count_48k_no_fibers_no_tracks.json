@@ -2,6 +2,6 @@
     "dense_spacing_mode": "winding_model",
     "sample_count_winding_model_relative_pairs": 48000,
     "sample_count_winding_model_density_pairs": 48000,
-    "input_disable_fibers": true,
-    "input_disable_tracks": true
+    "input_use_fibers": false,
+    "input_use_tracks": false
 }
