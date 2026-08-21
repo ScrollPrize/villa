@@ -6,7 +6,6 @@ on:
   repository_dispatch:
     types:
       - vercel.deployment.ready
-      - vercel.deployment.success
 
 permissions: {}
 
@@ -18,7 +17,15 @@ jobs:
       github.repository_id == '890972577' &&
       github.repository_owner_id == '121906140' &&
       github.ref == 'refs/heads/main' &&
-      github.actor == 'vercel[bot]'
+      github.actor == 'vercel[bot]' &&
+      (
+        github.event.client_payload.git.ref == 'codex/progress-prize-smoke-20260720' ||
+        github.event.client_payload.git.ref == 'refs/heads/codex/progress-prize-smoke-20260720' ||
+        github.event.client_payload.git.ref == 'codex/progress-prize-smoke-base-20260720' ||
+        github.event.client_payload.git.ref == 'refs/heads/codex/progress-prize-smoke-base-20260720' ||
+        startsWith(github.event.client_payload.git.ref, 'codex/progress-prize-') ||
+        startsWith(github.event.client_payload.git.ref, 'refs/heads/codex/progress-prize-')
+      )
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment: progress-prizes-preview

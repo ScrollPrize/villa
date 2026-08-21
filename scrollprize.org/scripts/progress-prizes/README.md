@@ -305,10 +305,13 @@ Before rehearsal, an administrator must:
    closed. GitHub places `pull_request` checks triggered by a PR created with
    `GITHUB_TOKEN` into an approval-required state; approve the no-secret test run
    on each automation PR before the exact-commit gate expires.
-3. Configure Vercel to send `repository_dispatch` events
-   `vercel.deployment.ready` or `vercel.deployment.success`. The documented
-   payload fields `environment`, `project.id`, `url`, `git.sha`, and `git.ref`
-   are validated; the workflow run title is bound to `git.sha`.
+3. Configure Vercel to send the `repository_dispatch` event
+   `vercel.deployment.ready`. The workflow runs only for the fixed smoke
+   branches or a `codex/progress-prize-YYYY-MM` automation branch; all other
+   Vercel deployments are ignored before a runner or protected Environment is
+   requested. The documented payload fields `environment`, `project.id`, `url`,
+   `git.sha`, and `git.ref` are validated; the workflow run title is bound to
+   `git.sha`.
 4. Confirm the authenticated dispatch actor is exactly `vercel[bot]`. If the
    supported Vercel integration uses a different documented immutable GitHub App
    identity, update and review the allowlist and its contract test; never remove
