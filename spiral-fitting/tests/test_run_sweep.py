@@ -5,6 +5,22 @@ import threading
 from runners import run_sweep
 
 
+def test_child_command_forwards_optional_wandb_group(tmp_path):
+    args = run_sweep.build_parser().parse_args([
+        "--dataset", str(tmp_path / "dataset"),
+        "--ink-volume", str(tmp_path / "ink"),
+        "--output", str(tmp_path / "output"),
+        "--config-folder", str(tmp_path / "configs"),
+        "--sweep-config", str(tmp_path / "sweep.json"),
+        "--wandb-group", "experiment",
+    ])
+
+    command = run_sweep.child_command(
+        args, "baseline", tmp_path / "baseline.json", (0,))
+
+    assert command[command.index("--wandb-group") + 1] == "experiment"
+
+
 def test_relay_logs_everything_and_echoes_only_live_fit_updates():
     source = io.StringIO(
         "loading configuration\n"

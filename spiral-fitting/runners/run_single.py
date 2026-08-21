@@ -113,6 +113,11 @@ def add_common_arguments(
         help="disable Weights & Biases logging (enabled by default)",
     )
     parser.add_argument(
+        "--wandb-group",
+        type=run_id,
+        help="optional Weights & Biases run group",
+    )
+    parser.add_argument(
         "--seeds",
         type=parse_seeds,
         help="comma-separated distinct non-negative optimizer seeds",
@@ -244,8 +249,8 @@ def fit_environment(
         env["WANDB_RUN_ID"] = wandb_run_id
         if wandb_run_name is not None:
             env["WANDB_NAME"] = wandb_run_name
-        if wandb_group is not None:
-            env["WANDB_RUN_GROUP"] = wandb_group
+    if wandb_group is not None:
+        env["WANDB_RUN_GROUP"] = wandb_group
     if metrics_history is not None:
         env["FIT_SPIRAL_METRICS_HISTORY"] = str(metrics_history)
     if overrides:
@@ -391,7 +396,7 @@ def aggregate_metrics(
 
 
 def _wandb_init(*, project: str, entity: str, run_id: str, name: str,
-                group: str, resume: str):
+                group: str | None = None, resume: str):
     import wandb
     return wandb.init(
         project=project,
@@ -404,7 +409,8 @@ def _wandb_init(*, project: str, entity: str, run_id: str, name: str,
 
 
 def log_seed_final_metrics(
-    summary: dict, *, project: str, entity: str, seed_run_id: str, group: str
+    summary: dict, *, project: str, entity: str, seed_run_id: str,
+    group: str | None = None
 ) -> None:
     run = _wandb_init(
         project=project, entity=entity, run_id=seed_run_id,
@@ -418,7 +424,7 @@ def log_seed_final_metrics(
 
 def log_aggregate_metrics(
     training: list[dict], final: dict[str, dict], *, seed_count: int,
-    project: str, entity: str, aggregate_run_id: str, group: str
+    project: str, entity: str, aggregate_run_id: str, group: str | None = None
 ) -> None:
     run = _wandb_init(
         project=project, entity=entity, run_id=aggregate_run_id,
@@ -541,6 +547,7 @@ def _resume_invocation(
         "operational_args": {
             "num_threads": args.num_threads,
             "no_wandb": args.no_wandb,
+            "wandb_group": getattr(args, "wandb_group", None),
             "vc_render_bin": str(args.vc_render_bin.resolve()),
         },
         # Physical IDs may change between attempts; resource shape may not.
@@ -696,6 +703,7 @@ def _run_resumable_pipeline(
     args: argparse.Namespace, *, root_output: Path, output: Path,
     overrides: dict, project: str, entity: str, state: dict,
     state_path: Path, label: str, seed_run_id: str | None,
+    wandb_group: str | None = None,
 ) -> tuple[list[dict], dict]:
     stages = state["runs"][label]
     seeded = label != "single"
@@ -712,7 +720,7 @@ def _run_resumable_pipeline(
                     overrides, output, args.num_threads, wandb_project=project,
                     wandb_entity=entity, wandb_enabled=not args.no_wandb,
                     wandb_run_id=seed_run_id, wandb_run_name=seed_run_id,
-                    wandb_group=state["batch_id"] if seeded else None,
+                    wandb_group=wandb_group,
                     metrics_history=history_path,
                     gpu_ids=gpu_ids))
             _run_dir, fitted = find_fit_outputs(output)
@@ -771,12 +779,14 @@ def run_resumable(
     invocation = _resume_invocation(args, overrides, project, entity)
     state, state_path = _load_or_create_state(output, invocation)
     seeds = getattr(args, "seeds", None)
+    wandb_group = getattr(args, "wandb_group", None)
 
     if seeds is None:
         _run_resumable_pipeline(
             args, root_output=output, output=output, overrides=overrides,
             project=project, entity=entity, state=state, state_path=state_path,
-            label="single", seed_run_id=state["run_id"])
+            label="single", seed_run_id=state["run_id"],
+            wandb_group=wandb_group)
         return
 
     histories = []
@@ -790,13 +800,13 @@ def run_resumable(
             args, root_output=output, output=output / f"seed-{seed}",
             overrides=seed_overrides, project=project, entity=entity,
             state=state, state_path=state_path, label=str(seed),
-            seed_run_id=seed_id)
+            seed_run_id=seed_id, wandb_group=wandb_group)
         histories.append(history)
         summaries.append(summary)
         if not args.no_wandb:
             log_seed_final_metrics(
                 summary, project=project, entity=entity,
-                seed_run_id=seed_id, group=batch_id)
+                seed_run_id=seed_id, group=wandb_group)
 
     if len(seeds) < 2:
         return
@@ -808,7 +818,8 @@ def run_resumable(
     if not args.no_wandb:
         log_aggregate_metrics(
             training, final, seed_count=len(seeds), project=project,
-            entity=entity, aggregate_run_id=f"{batch_id}_aggregate", group=batch_id)
+            entity=entity, aggregate_run_id=f"{batch_id}_aggregate",
+            group=wandb_group)
 
 
 def run(args: argparse.Namespace) -> None:
@@ -820,13 +831,15 @@ def run(args: argparse.Namespace) -> None:
     require_empty_output(output)
     seeds = getattr(args, "seeds", None)
     caller_run_id = getattr(args, "run_id", None)
+    wandb_group = getattr(args, "wandb_group", None)
 
     if seeds is None:
         if caller_run_id is not None:
             raise ValueError("--run-id requires --seeds")
         run_pipeline(
             args, output=output, overrides=overrides,
-            wandb_project=wandb_project, wandb_entity=wandb_entity)
+            wandb_project=wandb_project, wandb_entity=wandb_entity,
+            wandb_group=wandb_group)
         return
 
     batch_id = caller_run_id or uuid.uuid4().hex[:8]
@@ -843,14 +856,14 @@ def run(args: argparse.Namespace) -> None:
             wandb_project=wandb_project,
             wandb_entity=wandb_entity,
             seed_run_id=seed_id,
-            wandb_group=batch_id,
+            wandb_group=wandb_group,
         )
         histories.append(history)
         summaries.append(summary)
         if not args.no_wandb:
             log_seed_final_metrics(
                 summary, project=wandb_project, entity=wandb_entity,
-                seed_run_id=seed_id, group=batch_id)
+                seed_run_id=seed_id, group=wandb_group)
 
     if len(seeds) < 2:
         return
@@ -869,7 +882,7 @@ def run(args: argparse.Namespace) -> None:
         log_aggregate_metrics(
             training, final, seed_count=len(seeds),
             project=wandb_project, entity=wandb_entity,
-            aggregate_run_id=aggregate_id, group=batch_id)
+            aggregate_run_id=aggregate_id, group=wandb_group)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
