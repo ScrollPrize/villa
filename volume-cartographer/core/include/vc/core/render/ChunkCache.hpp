@@ -643,20 +643,29 @@ private:
                                const ChunkKey& key,
                                FetchContext context,
                                ChunkFetchResult fetch,
-                               bool loadedFromPersistentCache,
-                               std::shared_ptr<PersistenceOperation> persistence = {});
+                               bool loadedFromPersistentCache);
+    static void finishDelta3dAndStore(
+        const std::shared_ptr<State>& state,
+        const ChunkKey& key,
+        FetchContext context,
+        ChunkFetchResult fetch,
+        std::shared_ptr<PersistenceOperation> persistence);
     static PersistentProbeResult probePersistent(const State& state,
                                                   const ChunkKey& key);
     static std::optional<PersistentReadResult> readPersistent(
         const State& state,
         const ChunkKey& key,
         const PersistentProbeResult& probe);
-    [[nodiscard]] static bool storeFetchResultLocked(
+    static void storeFetchResultLocked(
         const std::shared_ptr<State>& state,
         const ChunkKey& key,
         ChunkFetchResult fetch,
-        bool loadedFromPersistentCache,
-        const std::shared_ptr<PersistenceOperation>& persistence = {});
+        bool loadedFromPersistentCache);
+    [[nodiscard]] static bool storeDelta3dFetchResultLocked(
+        const std::shared_ptr<State>& state,
+        const ChunkKey& key,
+        ChunkFetchResult fetch,
+        const std::shared_ptr<PersistenceOperation>& persistence);
     static bool queuePersistentWrite(const std::shared_ptr<State>& state,
                                      const ChunkKey& key,
                                      std::shared_ptr<const std::vector<std::byte>> bytes);
@@ -688,10 +697,17 @@ private:
         const ChunkKey& key,
         const std::vector<std::byte>& bytes);
     static bool writePersistent(State& state, const ChunkKey& key, const std::vector<std::byte>& bytes);
+    static bool writeDelta3dPersistent(
+        State& state,
+        const ChunkKey& key,
+        const std::vector<std::byte>& bytes);
     static bool writePersistentEmpty(State& state, const ChunkKey& key);
     static std::filesystem::path persistentPath(const State& state, const ChunkKey& key);
     static std::filesystem::path persistentCompressedPath(const State& state, const ChunkKey& key);
     static std::filesystem::path persistentDelta3dPath(const State& state, const ChunkKey& key);
+    static std::filesystem::path persistentDelta3dEmptyPath(
+        const State& state,
+        const ChunkKey& key);
     static std::filesystem::path persistentEmptyPath(const State& state, const ChunkKey& key);
     static std::filesystem::path persistentSourcePath(const State& state, const ChunkKey& key);
     static std::filesystem::path mirrorObjectPath(

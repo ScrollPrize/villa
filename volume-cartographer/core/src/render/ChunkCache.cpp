@@ -678,7 +678,10 @@ struct ChunkCacheService::Impl {
         }
         fetchScheduler = std::make_shared<ChunkRequestScheduler>(
             workerCapacity, 7, schedulerSelectionGate,
-            adaptiveOptions, initialState, 1);
+            adaptiveOptions, initialState,
+            persistentCacheEncoding == PersistentCacheEncoding::Delta3dLossless
+                ? 1
+                : 0);
         if (!activeFetchAdaptive) {
             fetchScheduler->configureConcurrency(activeFetchWorkers);
         }
@@ -1809,7 +1812,7 @@ ChunkCache::PersistentChunkDependency ChunkCache::persistentChunkDependency(
     }
     if (state->persistentLayout_ == PersistentCacheLayout::Delta3d) {
         result.persistentPath = persistentDelta3dPath(*state, key);
-        result.persistentEmptyPath = persistentEmptyPath(*state, key);
+        result.persistentEmptyPath = persistentDelta3dEmptyPath(*state, key);
         result.persistentExtension.clear();
         result.sourcePayloadMatchesPersistentCache = false;
         return result;
@@ -2639,7 +2642,6 @@ ChunkWorkPriority ChunkCache::storageObjectPriorityLocked(
         }
     }
     best.maintenance = !have;
-    best.reserveForegroundSlot = best.maintenance && !transfer.refreshRequested;
     return best;
 }
 
@@ -3933,21 +3935,20 @@ void ChunkCache::decodeFetchedAndStore(
         // source-codec bytes are never candidates for private-format writes.
         decoded.persistentBytes.clear();
         decoded.hasPersistentBytes = false;
+        finishDelta3dAndStore(
+            state, key, context, std::move(decoded),
+            std::move(persistence));
+    } else {
+        finishAndStore(state, key, context, std::move(decoded), false);
     }
-
-    finishAndStore(
-        state, key, context, std::move(decoded), false,
-        std::move(persistence));
 }
 
 void ChunkCache::finishAndStore(const std::shared_ptr<State>& state,
                                 const ChunkKey& key,
                                 FetchContext context,
                                 ChunkFetchResult fetch,
-                                bool loadedFromPersistentCache,
-                                std::shared_ptr<PersistenceOperation> persistence)
+                                bool loadedFromPersistentCache)
 {
-    bool persistenceQueued = !persistence;
     {
         std::lock_guard lock(state->mutex_);
         auto it = state->entries_.find(key);
@@ -3960,9 +3961,36 @@ void ChunkCache::finishAndStore(const std::shared_ptr<State>& state,
         it->second.probeTaskId = 0;
         it->second.fetchTaskId = 0;
         it->second.decodeTaskId = 0;
-        persistenceQueued = storeFetchResultLocked(
-            state, key, std::move(fetch), loadedFromPersistentCache,
-            persistence);
+        storeFetchResultLocked(
+            state, key, std::move(fetch), loadedFromPersistentCache);
+    }
+    enforceSharedBudget(state);
+    state->cv_.notify_all();
+    notifyListeners(state);
+}
+
+void ChunkCache::finishDelta3dAndStore(
+    const std::shared_ptr<State>& state,
+    const ChunkKey& key,
+    FetchContext context,
+    ChunkFetchResult fetch,
+    std::shared_ptr<PersistenceOperation> persistence)
+{
+    bool persistenceQueued = false;
+    {
+        std::lock_guard lock(state->mutex_);
+        auto it = state->entries_.find(key);
+        if (context.generation != state->generation_ ||
+            context.fetcherGeneration != state->fetcherGeneration_ ||
+            it == state->entries_.end() ||
+            it->second.fetchSerial != context.fetchSerial) {
+            return;
+        }
+        it->second.probeTaskId = 0;
+        it->second.fetchTaskId = 0;
+        it->second.decodeTaskId = 0;
+        persistenceQueued = storeDelta3dFetchResultLocked(
+            state, key, std::move(fetch), persistence);
     }
     if (persistence && !persistenceQueued) {
         completePersistenceOperation(
@@ -3975,16 +4003,15 @@ void ChunkCache::finishAndStore(const std::shared_ptr<State>& state,
     notifyListeners(state);
 }
 
-bool ChunkCache::storeFetchResultLocked(
+void ChunkCache::storeFetchResultLocked(
     const std::shared_ptr<State>& state,
     const ChunkKey& key,
     ChunkFetchResult fetch,
-    bool loadedFromPersistentCache,
-    const std::shared_ptr<PersistenceOperation>& persistence)
+    bool loadedFromPersistentCache)
 {
     auto it = state->entries_.find(key);
     if (it == state->entries_.end())
-        return !persistence;
+        return;
 
     Entry& entry = it->second;
     if (entry.unresolvedCounted &&
@@ -4023,13 +4050,8 @@ bool ChunkCache::storeFetchResultLocked(
             // `persisted` is set by the writer's completion callback once
             // the bytes are actually on disk (same for the cases below).
             entry.persisted = loadedFromPersistentCache;
-            if (persistence) {
-                entry.persistentWriteQueued = queuePersistentSourceEmptyWrite(
-                    state, key, persistence);
-            } else if (!loadedFromPersistentCache &&
-                       !fetch.persistentWriteHandled) {
+            if (!loadedFromPersistentCache && !fetch.persistentWriteHandled)
                 entry.persistentWriteQueued = queuePersistentEmptyWrite(state, key);
-            }
             break;
         }
         entry.status = EntryStatus::Data;
@@ -4043,24 +4065,16 @@ bool ChunkCache::storeFetchResultLocked(
                 std::move(fetch.persistentBytes));
         }
         entry.persisted = loadedFromPersistentCache;
-        if (persistence) {
-            entry.persistentWriteQueued = queueDelta3dWrite(
-                state, key, std::move(persistentBytes), persistence, true);
-        } else if (!loadedFromPersistentCache && !fetch.persistentWriteHandled) {
+        if (!loadedFromPersistentCache && !fetch.persistentWriteHandled)
             entry.persistentWriteQueued =
                 queuePersistentWrite(state, key, std::move(persistentBytes));
-        }
         break;
     }
     case ChunkFetchStatus::Missing:
         entry.status = EntryStatus::Missing;
         entry.persisted = loadedFromPersistentCache;
-        if (persistence) {
-            entry.persistentWriteQueued = queuePersistentSourceEmptyWrite(
-                state, key, persistence);
-        } else if (!loadedFromPersistentCache && !fetch.persistentWriteHandled) {
+        if (!loadedFromPersistentCache && !fetch.persistentWriteHandled)
             entry.persistentWriteQueued = queuePersistentEmptyWrite(state, key);
-        }
         break;
     case ChunkFetchStatus::HttpError:
     case ChunkFetchStatus::IoError:
@@ -4071,8 +4085,87 @@ bool ChunkCache::storeFetchResultLocked(
     }
 
     touchLocked(*state, key, entry);
-    const bool persistenceQueued =
-        !persistence || entry.persistentWriteQueued;
+    enforceCapacityLocked(state);
+}
+
+bool ChunkCache::storeDelta3dFetchResultLocked(
+    const std::shared_ptr<State>& state,
+    const ChunkKey& key,
+    ChunkFetchResult fetch,
+    const std::shared_ptr<PersistenceOperation>& persistence)
+{
+    // This deliberately owns the Delta3D-only decisions instead of adding
+    // mode checks to storeFetchResultLocked. The ordinary SourceMirror store
+    // therefore remains instruction-for-instruction equivalent to its
+    // pre-Delta3D implementation.
+    auto entry = state->entries_.find(key);
+    if (entry == state->entries_.end())
+        return false;
+
+    Entry& value = entry->second;
+    if (value.unresolvedCounted && key.level >= 0 &&
+        key.level < static_cast<int>(state->unresolvedFetchesByLevel_.size())) {
+        auto& unresolved =
+            state->unresolvedFetchesByLevel_[static_cast<std::size_t>(key.level)];
+        if (unresolved > 0)
+            --unresolved;
+        value.unresolvedCounted = false;
+    }
+    if (value.inLru) {
+        state->lru_.erase(value.lruIt);
+        value.inLru = false;
+    }
+    if (value.status == EntryStatus::Data) {
+        state->decodedBytes_ -= value.decodedBytes;
+        removeDecodedBytesLocked(*state, value.decodedBytes);
+    }
+
+    value.bytes.reset();
+    value.error.clear();
+    value.decodedBytes = 0;
+    value.persisted = false;
+    value.persistentWriteQueued = false;
+
+    switch (fetch.status) {
+    case ChunkFetchStatus::Found:
+        if (fetch.bytes.size() != expectedChunkBytes(*state, key)) {
+            value.status = EntryStatus::Error;
+            value.error = "decoded chunk byte size does not match full chunk shape";
+            break;
+        }
+        if (state->options_.detectAllFillChunks &&
+            isAllFill(*state, fetch.bytes)) {
+            value.status = EntryStatus::AllFill;
+            value.persistentWriteQueued = persistence
+                ? queuePersistentSourceEmptyWrite(state, key, persistence)
+                : queuePersistentEmptyWrite(state, key);
+            break;
+        }
+        value.status = EntryStatus::Data;
+        value.decodedBytes = fetch.bytes.size();
+        value.bytes = std::make_shared<const std::vector<std::byte>>(
+            std::move(fetch.bytes));
+        state->decodedBytes_ += value.decodedBytes;
+        addDecodedBytesLocked(*state, value.decodedBytes);
+        value.persistentWriteQueued = queueDelta3dWrite(
+            state, key, value.bytes, persistence, true);
+        break;
+    case ChunkFetchStatus::Missing:
+        value.status = EntryStatus::Missing;
+        value.persistentWriteQueued = persistence
+            ? queuePersistentSourceEmptyWrite(state, key, persistence)
+            : queuePersistentEmptyWrite(state, key);
+        break;
+    case ChunkFetchStatus::HttpError:
+    case ChunkFetchStatus::IoError:
+    case ChunkFetchStatus::DecodeError:
+        value.status = EntryStatus::Error;
+        value.error = fetchErrorMessage(fetch);
+        break;
+    }
+
+    touchLocked(*state, key, value);
+    const bool persistenceQueued = value.persistentWriteQueued;
     enforceCapacityLocked(state);
     return persistenceQueued;
 }
@@ -4115,7 +4208,7 @@ ChunkCache::PersistentProbeResult ChunkCache::probePersistent(
     if (state.persistentLayout_ == PersistentCacheLayout::Delta3d) {
         result.primaryData = exists(persistentDelta3dPath(state, key));
         if (!result.primaryData) {
-            const auto path = persistentEmptyPath(state, key);
+            const auto path = persistentDelta3dEmptyPath(state, key);
             auto pin = state.persistentBudget_
                 ? state.persistentBudget_->pinRead(path)
                 : PersistentZarrCacheBudget::ReadPin{};
@@ -4148,7 +4241,6 @@ std::optional<ChunkCache::PersistentReadResult> ChunkCache::readPersistent(
     if (!state.options_.persistentCachePath || !probe.hasData())
         return std::nullopt;
 
-    const bool rawEntry = persistentEntryIsRaw(state, key);
     auto readManaged = [&](const std::filesystem::path& path) {
         auto pin = state.persistentBudget_
             ? state.persistentBudget_->pinRead(path)
@@ -4172,6 +4264,7 @@ std::optional<ChunkCache::PersistentReadResult> ChunkCache::readPersistent(
         }
         return PersistentReadResult{std::move(*decoded), false, true};
     }
+    const bool rawEntry = persistentEntryIsRaw(state, key);
     if (probe.sourceData) {
         if (auto source = readManaged(persistentSourcePath(state, key)))
             return PersistentReadResult{std::move(*source), true, false};
@@ -4209,8 +4302,6 @@ bool ChunkCache::queuePersistentWrite(const std::shared_ptr<State>& state,
 {
     if (!state || !state->options_.persistentCachePath || !bytes)
         return false;
-    if (state->persistentLayout_ == PersistentCacheLayout::Delta3d)
-        return queueDelta3dWrite(state, key, std::move(bytes));
     if (persistentEntryIsRaw(*state, key) &&
         bytes->size() != expectedChunkBytes(*state, key))
         return false;
@@ -4328,7 +4419,8 @@ bool ChunkCache::queueDelta3dWrite(
                              operation] {
                                 bool written = false;
                                 try {
-                                    written = writePersistent(*state, key, *encoded);
+                                    written = writeDelta3dPersistent(
+                                        *state, key, *encoded);
                                 } catch (...) {
                                 }
                                 {
@@ -4638,24 +4730,15 @@ bool ChunkCache::writePersistent(State& state, const ChunkKey& key, const std::v
     const bool compress = false;
     const std::vector<std::byte>* payload = &bytes;
 
-    const auto path = state.persistentLayout_ == PersistentCacheLayout::Delta3d
-        ? persistentDelta3dPath(state, key)
-        : (compress ? persistentCompressedPath(state, key)
-                    : persistentPath(state, key));
+    const auto path = compress ? persistentCompressedPath(state, key)
+                               : persistentPath(state, key);
     const auto counterpart = rawEntry
         ? (compress ? persistentPath(state, key) : persistentCompressedPath(state, key))
         : std::filesystem::path{};
-    // A Delta3D cache is initialized under a format lease after incompatible
-    // layouts have been retired, so legacy logical/source paths cannot coexist
-    // with it. Avoid putting those guaranteed-missing paths through the single
-    // writer's filesystem and budget bookkeeping hot path.
-    std::vector<std::filesystem::path> replacements;
-    if (state.persistentLayout_ == PersistentCacheLayout::Delta3d) {
-        replacements.push_back(persistentEmptyPath(state, key));
-    } else {
-        replacements.push_back(persistentSourcePath(state, key));
-        replacements.push_back(persistentEmptyPath(state, key));
-    }
+    std::vector<std::filesystem::path> replacements{
+        persistentSourcePath(state, key),
+        persistentEmptyPath(state, key),
+    };
     if (!counterpart.empty())
         replacements.push_back(counterpart);
     replacements.erase(
@@ -4723,14 +4806,81 @@ bool ChunkCache::writePersistent(State& state, const ChunkKey& key, const std::v
     return true;
 }
 
-bool ChunkCache::writePersistentSource(
+bool ChunkCache::writeDelta3dPersistent(
     State& state,
     const ChunkKey& key,
     const std::vector<std::byte>& bytes)
 {
     if (!state.options_.persistentCachePath)
         return false;
-    if (state.persistentLayout_ == PersistentCacheLayout::Delta3d)
+
+    const auto path = persistentDelta3dPath(state, key);
+    std::vector<std::filesystem::path> replacements{
+        persistentDelta3dEmptyPath(state, key),
+    };
+    auto reservation = state.persistentBudget_
+        ? state.persistentBudget_->reserveWrite(
+              path, bytes.size(), replacements)
+        : PersistentZarrCacheBudget::WriteReservation{};
+    if (state.persistentBudget_ && !reservation)
+        return false;
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    if (ec)
+        return false;
+    const auto oldSize = regularFileSize(path).value_or(0);
+    const auto tmp = path.string() + uniqueTmpSuffix();
+    {
+        std::ofstream file(tmp, std::ios::binary | std::ios::trunc);
+        if (!file)
+            return false;
+        file.write(reinterpret_cast<const char*>(bytes.data()),
+                   static_cast<std::streamsize>(bytes.size()));
+        if (!file) {
+            file.close();
+            std::filesystem::remove(tmp, ec);
+            return false;
+        }
+    }
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+        std::filesystem::remove(path, ec);
+        ec.clear();
+        std::filesystem::rename(tmp, path, ec);
+    }
+    if (ec) {
+        std::filesystem::remove(tmp, ec);
+        const auto finalSize = regularFileSize(path).value_or(0);
+        addPersistentCacheBytesDelta(
+            state,
+            static_cast<std::int64_t>(finalSize) -
+                static_cast<std::int64_t>(oldSize));
+        reservation.commit();
+        return false;
+    }
+    std::int64_t removedBytes = 0;
+    for (const auto& replacement : replacements) {
+        if (const auto size = regularFileSize(replacement)) {
+            std::error_code removeEc;
+            if (std::filesystem::remove(replacement, removeEc) && !removeEc)
+                removedBytes += static_cast<std::int64_t>(*size);
+        }
+    }
+    const auto newSize = regularFileSize(path).value_or(bytes.size());
+    addPersistentCacheBytesDelta(
+        state,
+        static_cast<std::int64_t>(newSize) -
+            static_cast<std::int64_t>(oldSize) - removedBytes);
+    reservation.commit();
+    return true;
+}
+
+bool ChunkCache::writePersistentSource(
+    State& state,
+    const ChunkKey& key,
+    const std::vector<std::byte>& bytes)
+{
+    if (!state.options_.persistentCachePath)
         return false;
 
     const auto path = persistentSourcePath(state, key);
@@ -4805,7 +4955,9 @@ bool ChunkCache::writePersistentEmpty(State& state, const ChunkKey& key)
     if (!state.options_.persistentCachePath)
         return false;
 
-    const auto path = persistentEmptyPath(state, key);
+    const auto path = state.persistentLayout_ == PersistentCacheLayout::Delta3d
+        ? persistentDelta3dEmptyPath(state, key)
+        : persistentEmptyPath(state, key);
     std::vector<std::filesystem::path> replacements{
         persistentSourcePath(state, key),
         persistentPath(state, key),
@@ -4911,27 +5063,29 @@ std::filesystem::path ChunkCache::persistentDelta3dPath(
 
 bool ChunkCache::persistentEntryIsRaw(const State& state, const ChunkKey& key)
 {
-    if (state.persistentLayout_ == PersistentCacheLayout::Delta3d)
-        return false;
     return state.persistentExtensions_.at(static_cast<std::size_t>(key.level)) == ".bin";
 }
 
 std::filesystem::path ChunkCache::persistentEmptyPath(const State& state, const ChunkKey& key)
 {
-    if (state.persistentLayout_ == PersistentCacheLayout::Delta3d) {
-        const auto dataPath = persistentDelta3dPath(state, key);
-        const auto relative = dataPath.lexically_relative(
-            *state.options_.persistentCachePath);
-        auto markerRelative = relative;
-        markerRelative += ".empty";
-        return *state.options_.persistentCachePath / ".vc_cache_empty" /
-               markerRelative;
-    }
     return *state.options_.persistentCachePath /
            ("level_" + std::to_string(key.level)) /
            std::to_string(key.iz) /
            std::to_string(key.iy) /
-           (std::to_string(key.ix) + ".empty");
+            (std::to_string(key.ix) + ".empty");
+}
+
+std::filesystem::path ChunkCache::persistentDelta3dEmptyPath(
+    const State& state,
+    const ChunkKey& key)
+{
+    const auto dataPath = persistentDelta3dPath(state, key);
+    const auto relative = dataPath.lexically_relative(
+        *state.options_.persistentCachePath);
+    auto markerRelative = relative;
+    markerRelative += ".empty";
+    return *state.options_.persistentCachePath / ".vc_cache_empty" /
+           markerRelative;
 }
 
 std::filesystem::path ChunkCache::persistentSourcePath(

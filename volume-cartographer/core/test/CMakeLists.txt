@@ -326,6 +326,10 @@ endif()
 add_executable(bench_chunked_plane_sampler bench_chunked_plane_sampler.cpp)
 target_link_libraries(bench_chunked_plane_sampler PRIVATE doctest::doctest vc_core)
 vc_register_test_target(bench_chunked_plane_sampler)
+
+add_executable(bench_chunk_cache_source_mirror bench_chunk_cache_source_mirror.cpp)
+target_link_libraries(bench_chunk_cache_source_mirror PRIVATE vc_core)
+vc_register_test_target(bench_chunk_cache_source_mirror)
 # Perf guard for the slice sampler hot path. Like bench_volume_sample it
 # carries only a loose wall-clock assertion, so it stays out of default
 # ctest unless the user opts in via VC_RUN_BENCHES; the target is always

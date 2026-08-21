@@ -338,18 +338,32 @@ struct ChunkRequestScheduler::Impl {
         return item;
     }
 
+    template <bool ReserveMaintenanceCapacity>
     bool canSelectLocked() const
     {
-        std::size_t effectiveAdmission = admissionLimit;
-        const bool onlyBulkMaintenance =
-            gui.empty() && background.empty() && !maintenance.empty() &&
-            (*maintenance.begin())->priority.reserveForegroundSlot;
-        if (onlyBulkMaintenance && admissionLimit > 1) {
-            effectiveAdmission = std::max<std::size_t>(
-                1, admissionLimit - maintenanceReservedSlots);
+        if constexpr (!ReserveMaintenanceCapacity) {
+            // Keep the ordinary scheduler predicate identical to the
+            // pre-Delta3D path. The encoding choice is process-lifetime
+            // state, so workers specialize once at startup instead of paying
+            // a mode check for every selected cache task.
+            return (!gui.empty() || !background.empty() ||
+                    !maintenance.empty()) &&
+                   activeCount.load(std::memory_order_acquire) <
+                       admissionLimit;
+        } else {
+            std::size_t effectiveAdmission = admissionLimit;
+            const bool onlyBulkMaintenance =
+                gui.empty() && background.empty() && !maintenance.empty() &&
+                (*maintenance.begin())->priority.reserveForegroundSlot;
+            if (onlyBulkMaintenance && admissionLimit > 1) {
+                effectiveAdmission = std::max<std::size_t>(
+                    1, admissionLimit - maintenanceReservedSlots);
+            }
+            return (!gui.empty() || !background.empty() ||
+                    !maintenance.empty()) &&
+                   activeCount.load(std::memory_order_acquire) <
+                       effectiveAdmission;
         }
-        return (!gui.empty() || !background.empty() || !maintenance.empty()) &&
-               activeCount.load(std::memory_order_acquire) < effectiveAdmission;
     }
 
     void configureConcurrencyLocked(
@@ -862,14 +876,16 @@ struct ChunkRequestScheduler::Impl {
             completeEpochLocked(*measurement);
     }
 
-    void workerLoop(std::stop_token stop)
+    template <bool ReserveMaintenanceCapacity>
+    void workerLoopImpl(std::stop_token stop)
     {
         while (!stop.stop_requested()) {
             std::shared_ptr<Item> item;
             {
                 std::unique_lock lock(mutex);
                 cv.wait(lock, [&] {
-                    return stop.stop_requested() || canSelectLocked();
+                    return stop.stop_requested() ||
+                           canSelectLocked<ReserveMaintenanceCapacity>();
                 });
                 if (stop.stop_requested() && gui.empty() && background.empty() &&
                     maintenance.empty())
@@ -883,7 +899,7 @@ struct ChunkRequestScheduler::Impl {
                 if (stop.stop_requested() && gui.empty() && background.empty() &&
                     maintenance.empty())
                     return;
-                if (!canSelectLocked())
+                if (!canSelectLocked<ReserveMaintenanceCapacity>())
                     continue;
                 item = popLocked();
                 if (!item)
@@ -911,6 +927,14 @@ struct ChunkRequestScheduler::Impl {
                 idleCv.notify_all();
             }
         }
+    }
+
+    void workerLoop(std::stop_token stop)
+    {
+        if (maintenanceReservedSlots == 0)
+            workerLoopImpl<false>(stop);
+        else
+            workerLoopImpl<true>(stop);
     }
 
     mutable std::mutex mutex;
