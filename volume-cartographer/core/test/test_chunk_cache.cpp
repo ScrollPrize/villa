@@ -2238,8 +2238,8 @@ TEST_CASE("ChunkRequestScheduler reserves fetch admission from maintenance work"
     std::atomic<int> maintenanceStarted{0};
     std::latch firstMaintenanceStarted{1};
     auto maintenanceTask = [&] {
-        ++maintenanceStarted;
-        firstMaintenanceStarted.count_down();
+        if (maintenanceStarted.fetch_add(1) == 0)
+            firstMaintenanceStarted.count_down();
         std::unique_lock lock(mutex);
         cv.wait(lock, [&] { return releaseMaintenance; });
     };
