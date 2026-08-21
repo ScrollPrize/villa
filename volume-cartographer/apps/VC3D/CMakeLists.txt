@@ -31,6 +31,8 @@ set(srcs
     LineAnnotationFiberSaveJob.hpp
     FiberNameDisplay.cpp
     FiberNameDisplay.hpp
+    FiberMapWorkspace.cpp
+    FiberMapWorkspace.hpp
     FiberNetworkLayout.cpp
     FiberNetworkLayout.hpp
     FiberSliceGeometry.cpp
