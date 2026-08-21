@@ -959,13 +959,15 @@ def realign_optimizer_lr_schedule(
 
 def _query_near_trusted_geometry(points_np, trusted_geometry_tree, threshold):
     # Returns True for each point with at least one trusted-geometry anchor
-    # within `threshold`. query returns dist == inf for misses.
+    # within `threshold`. query returns dist == inf for misses. Respect the
+    # process CPU budget configured from FIT_SPIRAL_NUM_THREADS instead of
+    # letting scipy consume every host CPU via workers=-1.
     points_np = np.ascontiguousarray(points_np, dtype=np.float32)
     dist, _ = trusted_geometry_tree.query(
         points_np,
         k=1,
         distance_upper_bound=float(threshold),
-        workers=-1,
+        workers=torch.get_num_threads(),
     )
     return np.isfinite(dist)
 

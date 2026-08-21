@@ -23,11 +23,13 @@ from config import Config  # noqa: E402
 
 
 _STEM_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+DEFAULT_NUM_THREADS = 6
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     run_single.add_common_arguments(parser, include_gpus=False)
+    parser.set_defaults(num_threads=DEFAULT_NUM_THREADS)
     parser.add_argument("--config-folder", required=True, type=Path)
     parser.add_argument("--sweep-config", required=True, type=Path)
     parser.add_argument(

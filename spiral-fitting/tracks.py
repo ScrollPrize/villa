@@ -2178,7 +2178,8 @@ def _track_points_far_from_anchors_mask(track_zyx, anchor_tree, threshold,
             end = min(begin + chunk_size, track_np.shape[0])
             dist, _ = anchor_tree.query(
                 track_np[begin:end], k=1,
-                distance_upper_bound=float(threshold), workers=-1)
+                distance_upper_bound=float(threshold),
+                workers=torch.get_num_threads())
             keep[begin:end] = np.isinf(dist)
             bar.update(end - begin)
             reporter.update(end)
