@@ -50,6 +50,11 @@ bool hasEntryTag(const Entry& entry, std::string_view tag)
     return std::find(entry.tags.begin(), entry.tags.end(), tag) != entry.tags.end();
 }
 
+bool usesAnonymousRemoteAuth(const Entry& entry)
+{
+    return hasEntryTag(entry, kAnonymousRemoteAuthTag);
+}
+
 bool isFiberLasagnaEntry(const Entry& entry)
 {
     return hasEntryTag(entry, kFiberLasagnaTag);
@@ -878,13 +883,16 @@ bool VolumePkg::reconcileVolumeEntryTags(
                 !samePersistedVolumeIdentity(volume->remoteLocator(), entry.location))
                 continue;
             try {
+                const bool anonymous =
+                    vc::project::usesAnonymousRemoteAuth(entry);
                 auto refreshed = Volume::NewFromUrl(
                     entry.location,
                     opts_.remoteCacheRoot.empty()
                         ? volume->remoteCacheRoot()
                         : opts_.remoteCacheRoot,
-                    volume->remoteAuth(),
-                    vc::project::volumeMetadataFromEntryTags(entry.tags));
+                    anonymous ? vc::HttpAuth{} : volume->remoteAuth(),
+                    vc::project::volumeMetadataFromEntryTags(entry.tags),
+                    !anonymous);
                 const auto oldId = it->first;
                 const auto newId = refreshed->id();
                 if (newId != oldId && loadedVolumes_.count(newId) != 0) {
@@ -935,12 +943,15 @@ bool VolumePkg::mergeVolumeEntryTags(const std::string& location, const std::vec
                 auto metadata = vc::project::volumeMetadataFromEntryTags(e.tags);
                 if (!metadata.empty()) {
                     try {
+                        const bool anonymous =
+                            vc::project::usesAnonymousRemoteAuth(e);
                         auto refreshed = Volume::NewFromUrl(
                             e.location,
                             opts_.remoteCacheRoot.empty()
                                 ? volume->remoteCacheRoot()
                                 : opts_.remoteCacheRoot,
-                            volume->remoteAuth(), metadata);
+                            anonymous ? vc::HttpAuth{} : volume->remoteAuth(),
+                            metadata, !anonymous);
                         const auto refreshedId = refreshed->id();
                         if (refreshedId != id && loadedVolumes_.count(refreshedId) == 0) {
                             loadedVolumes_.erase(it);
@@ -1516,6 +1527,30 @@ fs::path VolumePkg::selectedFiberInferenceDatasetPath() const
     return vc::project::resolveLocalPath(*selectedFiberInferenceDataset_, path_.parent_path());
 }
 
+std::string VolumePkg::umbilicus() const
+{
+    return umbilicus_.value_or(std::string{});
+}
+
+void VolumePkg::setUmbilicus(std::string location)
+{
+    if (location.empty()) {
+        if (!umbilicus_) return;
+        umbilicus_.reset();
+        persistProjectState();
+        return;
+    }
+    umbilicus_ = std::move(location);
+    persistProjectState();
+}
+
+fs::path VolumePkg::umbilicusPath() const
+{
+    if (!umbilicus_) return {};
+    if (vc::project::isLocationRemote(*umbilicus_)) return {};
+    return vc::project::resolveLocalPath(*umbilicus_, path_.parent_path());
+}
+
 bool VolumePkg::hasVolumes() const { return !loadedVolumes_.empty(); }
 bool VolumePkg::hasVolume(const std::string& id) const { return loadedVolumes_.count(id) > 0; }
 std::size_t VolumePkg::numberOfVolumes() const { return loadedVolumes_.size(); }
@@ -1908,7 +1943,8 @@ void VolumePkg::resolveAll()
                 remoteResults[i] = {
                     Volume::NewFromUrl(
                         entry.location, remoteCacheRoot, {},
-                        vc::project::volumeMetadataFromEntryTags(entry.tags)),
+                        vc::project::volumeMetadataFromEntryTags(entry.tags),
+                        !vc::project::usesAnonymousRemoteAuth(entry)),
                     {}};
             } catch (const std::exception& ex) {
                 remoteResults[i] = {nullptr, ex.what()};
@@ -2019,7 +2055,8 @@ void VolumePkg::resolveVolumeEntry(const vc::project::Entry& e)
                 e.location,
                 opts_.remoteCacheRoot,
                 {},
-                vc::project::volumeMetadataFromEntryTags(e.tags));
+                vc::project::volumeMetadataFromEntryTags(e.tags),
+                !vc::project::usesAnonymousRemoteAuth(e));
             const auto id = v->id();
             if (loadedVolumes_.count(id) > 0) {
                 Logger()->warn("Duplicate remote volume id '{}' from '{}', skipping", id, e.location);
@@ -2257,6 +2294,7 @@ utils::Json VolumePkg::toJson() const
     if (outputSegments_) j["output_segments"] = *outputSegments_;
     if (selectedLasagnaDataset_) j["selected_lasagna_dataset"] = *selectedLasagnaDataset_;
     if (selectedFiberInferenceDataset_) j["selected_fiber_inference_dataset"] = *selectedFiberInferenceDataset_;
+    if (umbilicus_) j["umbilicus"] = *umbilicus_;
     return j;
 }
 
@@ -2302,6 +2340,10 @@ void VolumePkg::fromJson(const utils::Json& j)
     if (j.contains("selected_fiber_inference_dataset")) {
         selectedFiberInferenceDataset_ = j.at("selected_fiber_inference_dataset").get_string();
         if (selectedFiberInferenceDataset_->empty()) selectedFiberInferenceDataset_.reset();
+    }
+    if (j.contains("umbilicus")) {
+        umbilicus_ = j.at("umbilicus").get_string();
+        if (umbilicus_->empty()) umbilicus_.reset();
     }
 }
 

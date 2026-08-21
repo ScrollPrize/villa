@@ -21,6 +21,8 @@ class QuadSurface;
 namespace vc::project {
 
 inline constexpr std::string_view kFiberLasagnaTag = "vc-lasagna-fiber";
+inline constexpr std::string_view kAnonymousRemoteAuthTag =
+    "vc-remote-auth:anonymous";
 
 struct Entry {
     std::string location;
@@ -28,6 +30,7 @@ struct Entry {
 };
 
 [[nodiscard]] bool hasEntryTag(const Entry& entry, std::string_view tag);
+[[nodiscard]] bool usesAnonymousRemoteAuth(const Entry& entry);
 [[nodiscard]] bool isFiberLasagnaEntry(const Entry& entry);
 
 enum class Category { Volumes, Segments, NormalGrids };
@@ -184,6 +187,13 @@ public:
     void clearSelectedFiberInferenceDataset();
     [[nodiscard]] std::filesystem::path selectedFiberInferenceDatasetPath() const;
 
+    // The project's umbilicus polyline, if one has been attached explicitly.
+    // Declaring it here removes the ambiguity of searching directories for
+    // umbilicus.json when a project references several packages.
+    [[nodiscard]] std::string umbilicus() const;
+    void setUmbilicus(std::string location);
+    [[nodiscard]] std::filesystem::path umbilicusPath() const;
+
     [[nodiscard]] bool hasVolumes() const;
     [[nodiscard]] bool hasVolume(const std::string& id) const;
     [[nodiscard]] std::size_t numberOfVolumes() const;
@@ -256,6 +266,7 @@ private:
     std::optional<std::string> outputSegments_;
     std::optional<std::string> selectedLasagnaDataset_;
     std::optional<std::string> selectedFiberInferenceDataset_;
+    std::optional<std::string> umbilicus_;
 
     std::map<std::string, std::shared_ptr<Volume>> loadedVolumes_;
     std::map<std::string, std::vector<std::string>> volumeTagsByID_;
