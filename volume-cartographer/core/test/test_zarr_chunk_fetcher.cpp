@@ -229,6 +229,22 @@ TEST_CASE("openLocalZarrPyramid: missing dir throws")
     CHECK_THROWS(openLocalZarrPyramid("/__no__/__where__"));
 }
 
+TEST_CASE("optional remote metadata probes accept least-privilege S3 403s")
+{
+    CHECK(vc::render::isOptionalRemoteMetadataMiss(
+        403, ".zgroup", "<Code>AccessDenied</Code>"));
+    CHECK(vc::render::isOptionalRemoteMetadataMiss(
+        403, "1/.zarray"));
+    CHECK_FALSE(vc::render::isOptionalRemoteMetadataMiss(
+        403, "1/0.0.0", "<Code>AccessDenied</Code>"));
+    CHECK_FALSE(vc::render::isOptionalRemoteMetadataMiss(
+        403, ".zgroup", "<Code>InvalidAccessKeyId</Code>"));
+    CHECK_FALSE(vc::render::isOptionalRemoteMetadataMiss(
+        403, ".zattrs", "<Code>ExpiredToken</Code>"));
+    CHECK_FALSE(vc::render::isOptionalRemoteMetadataMiss(
+        404, ".zgroup"));
+}
+
 TEST_CASE("createChunkCache wraps openLocalZarrPyramid result")
 {
     auto d = tmpDir("cc_wrap");

@@ -100,6 +100,10 @@
   classification, source download/read, and CPU decode queues so cached decode
   work no longer delays discovery and admission of remote misses.
 
+## 2026-08-19
+
+- Replaced paired Callgrind/DRD render scoring with same-run Callgrind scheduler and futex replay.
+
 ## 2026-08-18
 
 - Re-enabled the 5% synthetic-rendering gate with native scheduler-matched paired attribution and production-cache lookup coverage.
