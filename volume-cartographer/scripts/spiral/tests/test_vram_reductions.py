@@ -294,6 +294,15 @@ class DevicePatchAtlasTests(unittest.TestCase):
             'persistent_bytes': 0,
         })
 
+    def test_empty_atlas_supports_session_initialization_consumers(self):
+        atlas = self.PatchAtlas({}, device='cpu').materialize()
+        self.assertEqual(tuple(atlas.zyxs_flat.shape), (0, 3))
+
+        crossing_map = types.SimpleNamespace(
+            register_nodes=lambda count, get_centres: 17)
+        self.assertEqual(atlas.register_theta_topology(crossing_map), 17)
+        self.assertEqual(atlas._theta_node_ranges, [])
+
     def test_cpu_fallback_append(self):
         atlas = self.PatchAtlas({'a': self._fake_patch(5, 5, 3)}, device='cpu')
         extra = self._fake_patch(4, 8, 4)
@@ -561,6 +570,44 @@ class DevicePatchAtlasTests(unittest.TestCase):
             os.environ.pop('FIT_SPIRAL_PREFETCH', None)
             prefetch_module.get_prefetcher().drop(
                 ('test_prefetch_patches', id(crossing_map), 4, 6))
+
+
+class LiveShellConfigTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from fit_spiral import FitContext
+        cls.FitContext = FitContext
+
+    def test_enabling_shell_weights_without_shell_keeps_resources_disabled(self):
+        context = self.FitContext.__new__(self.FitContext)
+        context.config = {
+            'loss_weight_shell_outer': 0.0,
+            'loss_weight_shell_patch_radius': 0.0,
+        }
+        context.shell_patch = None
+        context.shell_map = None
+        context.shell_valid_zyxs_gpu = None
+        context.shell_outer_winding_idx = 4
+        context.winding_model_mode = False
+        context.device = torch.device('cpu')
+        context.tracks = None
+        context.prepared_main_tracks = None
+        context.unverified_patches = {}
+        context.unverified_patches_list = []
+        context.unverified_patch_sampling_probabilities = None
+        context.unverified_patch_atlas = None
+
+        def unexpected_subsample(_shell):
+            self.fail('a disabled outer-shell source must not be subsampled')
+
+        context._subsample_shell_radius_pool = unexpected_subsample
+        context.apply_config({
+            'loss_weight_shell_outer': 1.0,
+            'loss_weight_shell_patch_radius': 1.0,
+        }, current_iteration=0)
+
+        self.assertIsNone(context.shell_map)
+        self.assertIsNone(context.shell_valid_zyxs_gpu)
 
 
 class NonFiniteGradCheckTests(unittest.TestCase):

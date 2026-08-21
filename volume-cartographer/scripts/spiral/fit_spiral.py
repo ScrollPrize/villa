@@ -1916,12 +1916,15 @@ class FitContext:
         num_verified_patches = len(verified_patches_list)
         print(f'fitting {num_verified_patches} patches')
 
-        patch_atlas = None
+        # Keep the verified atlas as a required session object even when this
+        # run has no verified patches.  Device setup and theta-topology
+        # registration deliberately consume an empty atlas without special
+        # casing, and interactive patch incorporation can append to it later.
+        patch_atlas = PatchAtlas(verified_patches, device='cuda')
         if verified_patches:
             progress.begin(
                 'loading', 'Building verified-patch GPU atlas',
                 detail=f'{len(verified_patches):,} patches')
-            patch_atlas = PatchAtlas(verified_patches, device='cuda')
             print(f'patch atlas: {patch_atlas.memory_mb():.1f} MB')
             topology_stats = patch_atlas.topology_memory_stats()
             print(
@@ -3928,13 +3931,16 @@ class FitContext:
                         z_max=self.z_end + self.config['model_flow_bounds_z_margin'],
                         num_theta_bins=self.config['shell_num_theta_bins'],
                         device=self.device, config=self.config)
-                    if (self.config['loss_weight_shell_outer'] > 0
-                        or self.winding_model_mode) else None
+                    if (self.shell_patch is not None
+                        and (self.config['loss_weight_shell_outer'] > 0
+                             or self.winding_model_mode)) else None
                 )
             if 'loss_weight_shell_patch_radius' in changed:
                 rebuilt_shell_valid = (
                     self._subsample_shell_radius_pool(self.shell_patch)
-                    if self.config['loss_weight_shell_patch_radius'] > 0 else None
+                    if (self.shell_patch is not None
+                        and self.config['loss_weight_shell_patch_radius'] > 0)
+                    else None
                 )
             if 'shell_outer_winding_idx' in changed:
                 rebuilt_shell_outer = int(self.config['shell_outer_winding_idx'])
