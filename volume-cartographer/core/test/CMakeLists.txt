@@ -872,6 +872,8 @@ vc_add_test(NAME test_thinning)
 
 vc_add_test(NAME test_umbilicus)
 
+vc_add_test(NAME test_scroll_umbilicus)
+
 vc_add_test(NAME test_colormaps)
 
 vc_add_test(NAME test_quadsurface_io)
