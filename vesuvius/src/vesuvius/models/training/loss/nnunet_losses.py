@@ -19,18 +19,17 @@ class AllGatherGrad(torch.autograd.Function):
             # Gather tensors from all ranks
             x_list = [torch.zeros_like(x) for _ in range(world_size)]
             torch.distributed.all_gather(x_list, x)
-            return torch.cat(x_list, dim=0)
+            # stack, not cat: the callers sum over dim 0 to reduce the world
+            # axis, so it has to be a new axis rather than the existing one
+            return torch.stack(x_list, dim=0)
         else:
             return x
 
     @staticmethod
     def backward(ctx, grad_output):
         if torch.distributed.is_available() and torch.distributed.is_initialized():
-            world_size = torch.distributed.get_world_size()
-            rank = torch.distributed.get_rank()
-            # Return only the gradient for this rank
-            grad_per_rank = grad_output.shape[0] // world_size
-            return grad_output[rank * grad_per_rank:(rank + 1) * grad_per_rank]
+            # forward stacked along a new dim 0, so this rank's slice is one index
+            return grad_output[torch.distributed.get_rank()]
         else:
             return grad_output
 
