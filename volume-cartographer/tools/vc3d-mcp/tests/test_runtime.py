@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
@@ -70,6 +71,7 @@ class RegistryDiscoveryTest(unittest.TestCase):
             [entry.endpoint for entry in entries],
             [newer_path, older_path],
         )
+        self.assertEqual([entry.pid for entry in entries], [1002, 1001])
 
     def test_malformed_file_is_reaped(self) -> None:
         bad_file = os.path.join(self.registry_dir, "99999.json")
@@ -156,6 +158,9 @@ class RegistryResolutionTest(unittest.IsolatedAsyncioTestCase):
 
 
 class AutoLaunchTest(unittest.TestCase):
+    def tearDown(self) -> None:
+        server_module._launched_process = None
+
     def test_volume_package_uses_its_own_cli_option(self) -> None:
         self.assertEqual(
             server_module._launch_command("/tmp/VC3D", "/tmp/demo.volpkg.json"),
@@ -194,6 +199,51 @@ class AutoLaunchTest(unittest.TestCase):
     def test_protocol_check_rejects_stale_bridge(self) -> None:
         with self.assertRaisesRegex(BridgeConnectionError, "expected 2, got None"):
             server_module._validate_protocol({"pong": True})
+
+    def test_windows_launch_uses_its_registry_record_when_stdout_closes(self) -> None:
+        class WindowsGuiProcess:
+            pid = 4242
+            stdout = io.StringIO()
+            returncode = None
+
+            def poll(self):
+                return self.returncode
+
+        process = WindowsGuiProcess()
+        entries = [
+            [
+                RegistryEntry(
+                    r"\\.\pipe\stale",
+                    r"C:\Users\runner\.vc3d\agent_bridge\4242.json",
+                    999.0,
+                    pid=4242,
+                )
+            ],
+            [
+                RegistryEntry(
+                    r"\\.\pipe\vc3d-agent-4242",
+                    r"C:\Users\runner\.vc3d\agent_bridge\4242.json",
+                    1001.0,
+                    pid=4242,
+                )
+            ],
+        ]
+        with (
+            mock.patch.object(server_module.os, "name", "nt"),
+            mock.patch.object(server_module.subprocess, "Popen", return_value=process),
+            mock.patch.object(
+                server_module,
+                "discover_registry_entries",
+                side_effect=entries,
+            ),
+            mock.patch.object(server_module.time, "time", return_value=1.0),
+            mock.patch.object(server_module.atexit, "register"),
+        ):
+            endpoint = server_module.launch_vc3d("VC3D.exe", timeout=1.0)
+
+        self.assertEqual(endpoint, r"\\.\pipe\vc3d-agent-4242")
+        self.assertIs(server_module._launched_process, process)
+        self.assertTrue(process.stdout.closed)
 
 
 class NewTailLinesTest(unittest.TestCase):
