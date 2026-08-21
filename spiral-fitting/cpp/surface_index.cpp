@@ -560,7 +560,7 @@ private:
 
         {
             nb::gil_scoped_release release;
-            if (tolerance > 0.0f) {
+            if (tolerance >= 0.0f) {
                 const float tolerance_squared = tolerance * tolerance;
                 for (size_t point_index = 0; point_index < count; ++point_index) {
                     const Vec3 point{
@@ -575,7 +575,23 @@ private:
 
                     std::vector<uint32_t> candidates;
                     find_candidate_tiles(point, tolerance, candidates);
-                    std::vector<BestHit> best_by_surface(surfaces_.size());
+                    // Keep per-point storage proportional to BVH candidates while
+                    // retaining the API's ascending surface-index order.
+                    std::vector<int32_t> candidate_surfaces;
+                    candidate_surfaces.reserve(candidates.size());
+                    for (const uint32_t tile_index : candidates) {
+                        const int32_t surface_index = tiles_[tile_index].surface;
+                        if (included == nullptr
+                            || (*included)[static_cast<size_t>(surface_index)]) {
+                            candidate_surfaces.push_back(surface_index);
+                        }
+                    }
+                    std::sort(candidate_surfaces.begin(), candidate_surfaces.end());
+                    candidate_surfaces.erase(
+                        std::unique(candidate_surfaces.begin(), candidate_surfaces.end()),
+                        candidate_surfaces.end());
+
+                    std::vector<BestHit> best_hits(candidate_surfaces.size());
                     for (const uint32_t tile_index : candidates) {
                         const Tile& tile = tiles_[tile_index];
                         const size_t surface_index = static_cast<size_t>(tile.surface);
@@ -583,18 +599,23 @@ private:
                             continue;
                         }
                         const BestHit tile_hit = evaluate_tile(tile, point);
-                        BestHit& best = best_by_surface[surface_index];
+                        const auto surface = std::lower_bound(
+                            candidate_surfaces.begin(), candidate_surfaces.end(), tile.surface);
+                        BestHit& best = best_hits[static_cast<size_t>(
+                            surface - candidate_surfaces.begin())];
                         if (tile_hit.valid && tile_hit.distance_squared < best.distance_squared) {
                             best = tile_hit;
                         }
                     }
 
-                    for (size_t surface_index = 0; surface_index < best_by_surface.size(); ++surface_index) {
-                        const BestHit& hit = best_by_surface[surface_index];
+                    for (size_t candidate_index = 0;
+                         candidate_index < candidate_surfaces.size();
+                         ++candidate_index) {
+                        const BestHit& hit = best_hits[candidate_index];
                         if (!hit.valid || hit.distance_squared > tolerance_squared) {
                             continue;
                         }
-                        surface_indices.push_back(static_cast<int32_t>(surface_index));
+                        surface_indices.push_back(candidate_surfaces[candidate_index]);
                         distances.push_back(std::sqrt(hit.distance_squared));
                         ij.push_back(hit.j);
                         ij.push_back(hit.i);

@@ -419,7 +419,14 @@ install(DIRECTORY ${CMAKE_SOURCE_DIR}/../spiral-fitting/
         PATTERN "*.py"
         PATTERN "*.json"
         PATTERN "tests" EXCLUDE
-        PATTERN "__pycache__" EXCLUDE)
+        PATTERN "__pycache__" EXCLUDE
+        PATTERN ".venv" EXCLUDE
+        PATTERN "build" EXCLUDE
+        PATTERN "dist" EXCLUDE
+        PATTERN "_skbuild" EXCLUDE
+        PATTERN ".pytest_cache" EXCLUDE
+        PATTERN ".mypy_cache" EXCLUDE
+        PATTERN ".ruff_cache" EXCLUDE)
 
 set(_vc3d_fiber_format_src
     "${CMAKE_SOURCE_DIR}/../vesuvius/src/vc3d_fiber_format")

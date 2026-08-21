@@ -67,6 +67,19 @@ def test_tolerance_boundary_is_inclusive():
     np.testing.assert_array_equal(outside[0], [0, 0])
 
 
+def test_zero_tolerance_returns_exact_hits():
+    _, surface = make_surface("flat")
+    index = surface_index.SurfacePatchIndex()
+    index.rebuild([surface])
+
+    exact = query(index, [[0.5, 0.5, 0.0], [0.5, 0.5, 0.1]], 0.0)
+
+    np.testing.assert_array_equal(exact[0], [0, 1, 1])
+    np.testing.assert_array_equal(exact[1], [0])
+    np.testing.assert_array_equal(exact[2], [0.0])
+    np.testing.assert_allclose(exact[3], [[0.5, 0.5]], atol=1e-6)
+
+
 def test_multiple_surfaces_and_subset_filtering():
     _, low = make_surface("low", z_fn=lambda _row, _col: 0.0)
     _, high = make_surface("high", z_fn=lambda _row, _col: 0.2)
