@@ -1,6 +1,7 @@
 #include "SpiralServiceManager.hpp"
 
 #include "SpiralArtifactCache.hpp"
+#include "SpiralSessionSync.hpp"
 #include "SpiralSshTunnel.hpp"
 #include "VCSettings.hpp"
 
@@ -557,10 +558,21 @@ QNetworkRequest SpiralServiceManager::makeRequest(const QString& path, int timeo
     return request;
 }
 
+void SpiralServiceManager::initializeSession(QJsonObject request)
+{
+    prepareSessionRequest(std::move(request), true);
+}
+
 void SpiralServiceManager::rebuildSession(QJsonObject request)
 {
-    // The service always owns its base inputs (it is launched with
-    // --dataset), so a rebuild request carries run
+    prepareSessionRequest(std::move(request), false);
+}
+
+void SpiralServiceManager::prepareSessionRequest(QJsonObject request,
+                                                 bool initialize)
+{
+    // The service owns its base inputs (it is launched with --dataset), so a
+    // session construction request carries run
     // parameters plus the client-selectable checkpoint/tracks values only.
     const QJsonObject requested =
         request.value(QStringLiteral("paths")).toObject();
@@ -569,14 +581,16 @@ void SpiralServiceManager::rebuildSession(QJsonObject request)
     if (!tracks.isEmpty()) selectable[QStringLiteral("tracks_dbm")] = tracks;
     const QString checkpoint = requested.value(QStringLiteral("checkpoint")).toString().trimmed();
 
-    auto finish = [this, request, selectable](const QString& checkpointHostPath) mutable {
+    auto finish = [this, request, selectable, initialize](
+                      const QString& checkpointHostPath) mutable {
         if (!checkpointHostPath.isEmpty())
             selectable[QStringLiteral("checkpoint")] = checkpointHostPath;
         QJsonObject load = request;
         if (selectable.isEmpty()) load.remove(QStringLiteral("paths"));
         else load[QStringLiteral("paths")] = selectable;
         load[QStringLiteral("command_id")] = commandId();
-        sendRebuildRequest(load);
+        if (initialize) sendInitializeRequest(load);
+        else sendRebuildRequest(load);
     };
 
     if (checkpoint.isEmpty()) {
@@ -624,6 +638,14 @@ void SpiralServiceManager::sendRebuildRequest(QJsonObject request)
 {
     postWithRetry(QStringLiteral("/session/rebuild"), request, Timeout::Load, kMutationRetries,
                   [this](const QJsonObject& response) {
+                      handleStatus(response);
+                  });
+}
+
+void SpiralServiceManager::sendInitializeRequest(QJsonObject request)
+{
+    postWithRetry(QStringLiteral("/session/initialize"), request, Timeout::Load,
+                  kMutationRetries, [this](const QJsonObject& response) {
                       handleStatus(response);
                   });
 }
@@ -740,22 +762,21 @@ void SpiralServiceManager::uploadCheckpointForResume(
 
 void SpiralServiceManager::runIterations(int iterations,
                                          const QJsonObject& influenceConfig,
-                                         const QJsonObject& runConfig,
-                                         const QJsonObject& inputs)
+                                         const QJsonObject& runConfig)
 {
-    QJsonObject configuration = _configurationDefaults;
-    for (auto it = _appliedConfiguration.begin();
-         it != _appliedConfiguration.end(); ++it)
-        configuration[it.key()] = it.value();
-    for (auto it = runConfig.begin(); it != runConfig.end(); ++it)
-        configuration[it.key()] = it.value();
+    const QJsonObject configuration =
+        vc3d::completeSpiralRunConfiguration(
+            _configurationDefaults, _appliedConfiguration, runConfig);
+    // Base inputs are owned and canonicalized by the service.  A Run changes
+    // neither their paths nor their contents, so restating the panel's
+    // necessarily partial path view here can only create a false mismatch
+    // (for example, winding_inference has no editable panel row).
     postWithRetry(
         QStringLiteral("/session/run"),
         {{QStringLiteral("command_id"), commandId()},
          {QStringLiteral("configuration"), configuration},
          {QStringLiteral("iterations"), iterations},
          {QStringLiteral("influence"), influenceConfig},
-         {QStringLiteral("inputs"), inputs},
          {QStringLiteral("expected_session_revision"), _sessionRevision}},
         Timeout::Command, kMutationRetries, {});
 }
@@ -1304,9 +1325,8 @@ void SpiralServiceManager::handleStatus(const QJsonObject& status)
     if (!applied.isEmpty()) _appliedConfiguration = applied;
     const QString sessionId =
         status.value(QStringLiteral("session_id")).toString();
-    // The service always holds a session; there is no "no session" state to
-    // check for. A session identity is present from the moment the service
-    // starts building one.
+    // A session identity appears when explicit initialization starts. Until
+    // then the service remains connected for dataset/checkpoint discovery.
     const bool active = !sessionId.isEmpty();
     if (active != _hasActiveSession) {
         _hasActiveSession = active;

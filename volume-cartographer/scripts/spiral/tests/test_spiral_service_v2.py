@@ -51,7 +51,7 @@ from fit_session import (API_VERSION, AUTOSAVE_CHECKPOINT_NAME,
                          SpiralPreviewConfig, SpiralRunConfig,
                          resolve_dataset_root, select_startup_autosave,
                          validate_autosave, write_autosave_metadata)
-from config import Config, durable_config
+from config import BACKFILLABLE_CONFIG_DEFAULTS, Config, durable_config
 
 
 class FakeSession:
@@ -261,7 +261,8 @@ class ProgressStatusTests(unittest.TestCase):
 
 def _planned_run(state, request):
     request = dict(request)
-    configuration = Config(request.pop("run_config", {})).as_dict()
+    configuration = dict(Config.catalog()["defaults"])
+    configuration.update(request.pop("run_config", {}))
     return state.run({
         "configuration": configuration,
         "iterations": request.pop("iterations"),
@@ -520,21 +521,20 @@ class RouteTableTests(HttpServiceFixture):
         self.assertEqual(json.loads(payload)["api_version"], API_VERSION)
 
         # A command-ID route still refuses an unstamped request, and reaches
-        # the operation (whose session is still being built) when stamped.
+        # the operation (whose session is not initialized) when stamped.
         status, payload, _ = self.request("POST", "/session/stop", body={})
         self.assertEqual(status, 400)
         self.assertIn("command_id", json.loads(payload)["error"])
         status, payload, _ = self.request("POST", "/session/stop",
                                           body={"command_id": "stop-1"})
         self.assertEqual(status, 409)
-        self.assertIn("still loading", json.loads(payload)["error"])
+        self.assertIn("not been initialized", json.loads(payload)["error"])
 
         status, _, _ = self.request("GET", "/nonexistent")
         self.assertEqual(status, 404)
 
     def test_session_deletion_is_not_part_of_the_surface(self):
-        # The service always holds a session; there is no verb that removes
-        # one, so the path resolves for nothing but its own sub-resources.
+        # There is no verb that removes a session once initialized.
         self.assertEqual(spiral_service.resolve_route("DELETE", "/session"),
                          (None, ()))
         self.assertIsNone(
@@ -544,6 +544,10 @@ class RouteTableTests(HttpServiceFixture):
         self.assertEqual(status, 404)
         route, _ = spiral_service.resolve_route("POST", "/session/rebuild")
         self.assertEqual(route.operation, "session_rebuild")
+        self.assertEqual(route.idempotency,
+                         spiral_service.Idempotency.COMMAND_ID)
+        route, _ = spiral_service.resolve_route("POST", "/session/initialize")
+        self.assertEqual(route.operation, "session_initialize")
         self.assertEqual(route.idempotency,
                          spiral_service.Idempotency.COMMAND_ID)
 
@@ -925,18 +929,18 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertTrue(ephemeral.is_relative_to(self.output))
         self.assertFalse(ephemeral.is_relative_to(self.root))
 
-    def test_rebuild_rejects_client_base_input_paths(self):
+    def test_initialize_rejects_client_base_input_paths(self):
         with self.assertRaises(ApiError) as caught:
-            self.state.rebuild({"paths": {"umbilicus": "/attacker/umbilicus.json"},
-                                "run": {"z_begin": 0, "z_end": 10}})
+            self.state.initialize({"paths": {"umbilicus": "/attacker/umbilicus.json"},
+                                   "run": {"z_begin": 0, "z_end": 10}})
         self.assertEqual(caught.exception.status, 400)
         fields = {detail["field"] for detail in caught.exception.details}
         self.assertEqual(fields, {"umbilicus"})
 
-    def test_rebuild_rejects_unadvertised_checkpoint(self):
+    def test_initialize_rejects_unadvertised_checkpoint(self):
         with self.assertRaises(ApiError) as caught:
-            self.state.rebuild({"paths": {"checkpoint": "/attacker/model.ckpt"},
-                                "run": {"z_begin": 0, "z_end": 10}})
+            self.state.initialize({"paths": {"checkpoint": "/attacker/model.ckpt"},
+                                   "run": {"z_begin": 0, "z_end": 10}})
         self.assertEqual(caught.exception.status, 400)
 
     def _attach_session_for_request(self, config=None):
@@ -1020,7 +1024,7 @@ class DatasetOwnershipTests(unittest.TestCase):
             self.state.session_request["run"]["config"]
             ["model_num_flow_integration_steps"], 5)
 
-    def test_dataset_request_uses_resolved_paths_without_input_toggles(self):
+    def test_dataset_request_filters_resolved_paths_with_input_toggles(self):
         request = self.state._dataset_session_request({
             "run": {"z_begin": 0, "z_end": 10},
         })
@@ -1028,6 +1032,76 @@ class DatasetOwnershipTests(unittest.TestCase):
             request["paths"]["verified_patches"],
             str(self.root / "verified_patches"))
         self.assertEqual(request["paths"]["unverified_patches"], "")
+
+        disabled = self.state._dataset_session_request({
+            "paths": {"tracks_dbm": "/not/an/advertised/store.dbm"},
+            "run": {"z_begin": 0, "z_end": 10, "config": {
+                "input_use_verified_patches": False,
+                "input_use_tracks": False,
+                "input_use_pcl_absolute": False,
+                "input_use_pcl_relative": False,
+                "input_use_pcl_same_winding": False,
+                "input_use_pcl_drawn_control_points": False,
+            }},
+        })
+        self.assertEqual(disabled["paths"]["verified_patches"], "")
+        self.assertEqual(disabled["paths"]["tracks_dbm"], "")
+        self.assertEqual(disabled["paths"]["pcls"], [])
+
+    def test_checkpoint_config_selects_winding_model_inputs(self):
+        winding = self.root / "winding_inference"
+        winding.mkdir()
+        (winding / "manifest.json").write_text(json.dumps({
+            "artifact_type": "winding_inference_crossings",
+            "format_version": 1,
+        }))
+        shell = self.root / "outer_shell"
+        shell.mkdir()
+        self.state.dataset_resolution = spiral_service.bind_service_paths(
+            resolve_dataset_root(self.root), self.output, self.cache)
+
+        checkpoint_config = Config({
+            **_NO_DENSE_LOSSES,
+            "dense_spacing_mode": "winding_model",
+            "input_use_winding_inference": True,
+            "input_use_outer_shell": True,
+        }).as_dict()
+        checkpoint = self._write_checkpoint(
+            "winding-model.ckpt", checkpoint_config)
+
+        request, input_config = self.state._dataset_session_request({
+            "paths": {"checkpoint": str(checkpoint)},
+            "run": {"z_begin": 0, "z_end": 10, "config": {}},
+        }, include_input_config=True)
+
+        self.assertEqual(request["paths"]["winding_inference"], str(winding))
+        self.assertEqual(request["paths"]["outer_shell"], str(shell))
+        self.assertEqual(input_config["dense_spacing_mode"], "winding_model")
+
+        # Preflight validates against the same checkpoint-derived selection
+        # config while preserving an empty override object for the runtime.
+        paths, run, _, _ = self.state._prepare_session_request({
+            "paths": {"checkpoint": str(checkpoint)},
+            "run": {"z_begin": 0, "z_end": 10, "config": {}},
+        })
+        self.assertEqual(paths.winding_inference, str(winding))
+        self.assertEqual(run.config, {})
+        self.assertEqual((run.z_begin, run.z_end), (0, 10))
+
+        # Loading the checkpoint seeds the canonical run range (and therefore
+        # the VC3D dock), even though ordinary request preparation leaves later
+        # explicit dock edits alone.
+        with mock.patch("spiral_runtime.create_session",
+                        return_value=FakeSession()):
+            response = self.state.initialize({
+                "paths": {"checkpoint": str(checkpoint)},
+                "run": {"z_begin": 0, "z_end": 10, "config": {}},
+            })
+            _await_build(self.state)
+        attached_run = response["session_request"]["run"]
+        self.assertEqual(
+            (attached_run["z_begin"], attached_run["z_end"]),
+            (checkpoint_config["z_begin"], checkpoint_config["z_end"]))
 
     def test_status_advertises_canonical_active_session_request(self):
         config = {
@@ -1048,11 +1122,11 @@ class DatasetOwnershipTests(unittest.TestCase):
         }
         with mock.patch("spiral_runtime.create_session",
                         return_value=FakeSession()):
-            # A rebuild is accepted immediately; the runtime is constructed
+            # Initialization is accepted immediately; the runtime is constructed
             # off the request thread (the fake finishes instantly, so the
             # accepted response may already report Idle rather than Loading).
-            response = self.state.rebuild(request)
-            self.assertTrue(response["rebuilding"])
+            response = self.state.initialize(request)
+            self.assertTrue(response["initializing"])
             self.assertIn(response["state"],
                           {SessionState.Loading, SessionState.Idle})
             _await_build(self.state)
@@ -1071,17 +1145,28 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(attached["preview"],
                          {"first_winding": 12, "variant": "raw"})
 
-    def test_a_rebuild_refuses_run_keys_the_scroll_spec_owns(self):
+    def test_initialization_refuses_run_keys_the_scroll_spec_owns(self):
         for key, value in (("scroll_name", "renamed"), ("voxel_size_um", 4.0),
                            ("lasagna_group", "8"), ("lasagna_scale", 2)):
             with self.subTest(key=key):
                 with self.assertRaises(ApiError) as caught:
-                    self.state.rebuild({"run": {"z_begin": 100, "z_end": 900,
-                                                key: value}})
+                    self.state.initialize({"run": {"z_begin": 100, "z_end": 900,
+                                                   key: value}})
                 self.assertEqual(caught.exception.status, 400)
                 self.assertEqual([detail["field"] for detail
                                   in caught.exception.details],
                                  [f"run.{key}"])
+
+    def test_initialization_refuses_z_range_in_advanced_config(self):
+        with self.assertRaises(ApiError) as caught:
+            self.state.initialize({
+                "run": {"z_begin": 100, "z_end": 900,
+                        "config": {"z_begin": 200, "z_end": 800}},
+            })
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(
+            [detail["field"] for detail in caught.exception.details],
+            ["run.config.z_begin", "run.config.z_end"])
 
     def test_a_failed_build_reports_error_and_a_rebuild_recovers(self):
         request = {
@@ -1099,7 +1184,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         }
         with mock.patch("spiral_runtime.create_session",
                         side_effect=RuntimeError("startup failed")):
-            self.state.rebuild(request)
+            self.state.initialize(request)
             status = _await_build(self.state)
         # A build that fails is Error with the cause, not a service that has
         # quietly stopped having a session.
@@ -1318,6 +1403,27 @@ class DatasetOwnershipTests(unittest.TestCase):
             "domain.ckpt", {**live, "z_end": live["z_end"] + 1000}))
         self.assertEqual(error.payload["stage"], "all")
 
+        # Input toggles have an unambiguous historical default. Their absence
+        # in a legacy checkpoint must not turn an otherwise rebuildable model
+        # mismatch into a permanent refusal.
+        pre_toggles = {
+            key: value for key, value in live.items()
+            if key not in BACKFILLABLE_CONFIG_DEFAULTS
+        }
+        pre_toggles["model_num_flow_stages"] = 3
+        error = self._refuse_load(session, self._write_checkpoint(
+            "pre-input-toggles.ckpt", pre_toggles))
+        self.assertEqual(error.payload["stage"], "model")
+        self.assertNotIn("refused", error.payload)
+
+        # The stage calculation uses the same historical True defaults as the
+        # rebuild. A live disabled input therefore promotes the rebuild to the
+        # full host-input stage.
+        session.applied_config["input_use_tracks"] = False
+        error = self._refuse_load(session, self._write_checkpoint(
+            "pre-input-toggles-disabled-live.ckpt", pre_toggles))
+        self.assertEqual(error.payload["stage"], "all")
+
     def test_a_refusal_no_rebuild_can_fix_offers_nothing(self):
         session = _attach_fake_session(self.state, self.output, self.root)
         live = Config().as_dict()
@@ -1357,16 +1463,21 @@ class DatasetOwnershipTests(unittest.TestCase):
 
         rebuilds = []
         self.state.rebuild = lambda request: rebuilds.append(request) or {}
-        self.state.load_checkpoint({"host_checkpoint": str(checkpoint),
-                                    "allow_rebuild": True})
+        response = self.state.load_checkpoint({
+            "host_checkpoint": str(checkpoint), "allow_rebuild": True})
 
         self.assertEqual(len(rebuilds), 1)
+        self.assertEqual(response["checkpoint_path"], str(checkpoint))
         self.assertEqual(rebuilds[0]["paths"]["checkpoint"], str(checkpoint))
+        self.assertNotIn("dataset_root", rebuilds[0]["paths"])
+        self.assertNotIn("verified_patches", rebuilds[0]["paths"])
+        self.assertNotIn("output_directory", rebuilds[0]["paths"])
         # No advanced overrides: the runtime layers run.config on top of the
         # checkpoint's own cfg, so resending the profile would re-impose the
         # very keys the preflight just refused.
         self.assertEqual(rebuilds[0]["run"]["config"], {})
-        self.assertEqual(rebuilds[0]["run"]["z_end"], 10)
+        self.assertEqual(rebuilds[0]["run"]["z_begin"], live["z_begin"])
+        self.assertEqual(rebuilds[0]["run"]["z_end"], live["z_end"])
 
     def test_allow_rebuild_must_be_a_boolean(self):
         _attach_fake_session(self.state, self.output, self.root)
@@ -1407,6 +1518,46 @@ class DatasetOwnershipTests(unittest.TestCase):
             self.state.load_checkpoint({"host_checkpoint": str(checkpoint)})
         self.assertEqual(caught.exception.status, 409)
         self.assertEqual(session.loaded, [])
+
+    def test_error_session_can_rebuild_from_a_different_checkpoint(self):
+        _attach_fake_session(self.state, self.output, self.root)
+        # A failed build has a canonical request and identity to recover, but
+        # no usable resident object on which an in-place load could operate.
+        self.state.session = None
+        self.state._session_state = SessionState.Error
+        self.state._session_error = "bad checkpoint"
+        checkpoint = self.output / "uploaded-checkpoints" / "recovery.ckpt"
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        import torch
+        torch.save({
+            "schema_version": 2,
+            "cfg": durable_config({**Config().as_dict(), **_NO_DENSE_LOSSES}),
+            "input_manifest": {"dataset_root": str(self.root)},
+        }, checkpoint)
+
+        with self.assertRaises(ApiError) as caught:
+            self.state.load_checkpoint(
+                {"uploaded_checkpoint": str(checkpoint)})
+        self.assertEqual(caught.exception.status, 409)
+
+        # Exercise the real rebuild request parser.  The stored session
+        # request contains all canonical service-owned paths, but retrying a
+        # checkpoint must feed only client-selectable paths back through the
+        # dataset-mode boundary.
+        with mock.patch.object(self.state, "_begin_build") as begin_build:
+            response = self.state.load_checkpoint({
+                "uploaded_checkpoint": str(checkpoint),
+                "allow_rebuild": True,
+            })
+
+        begin_build.assert_called_once()
+        rebuilt_paths, rebuilt_run = begin_build.call_args.args[:2]
+        self.assertEqual(rebuilt_paths.checkpoint, str(checkpoint))
+        self.assertEqual(rebuilt_paths.dataset_root, str(self.root))
+        self.assertEqual(rebuilt_paths.output_directory, str(self.output))
+        self.assertEqual(rebuilt_run.config, {})
+        self.assertTrue(response["rebuilding"])
+        self.assertEqual(response["checkpoint_path"], str(checkpoint))
 
 
 def _write_autosave(directory, *, iterations, namespace, dataset_root,
@@ -1519,8 +1670,8 @@ class StartupAutosaveSelectionTests(unittest.TestCase):
         validate_autosave(self._select().selected)
 
 
-class AlwaysLoadedSessionTests(HttpServiceFixture):
-    """The service is up, and answers, before and without a session."""
+class ExplicitInitializationTests(HttpServiceFixture):
+    """The service is useful before a client explicitly creates a fit."""
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -1572,7 +1723,17 @@ class AlwaysLoadedSessionTests(HttpServiceFixture):
                              "sha256": "0" * 64}]})
         self.assertNotIn(status, (404, 405, 500))
 
-    def test_every_read_endpoint_answers_while_the_session_is_loading(self):
+    def test_every_read_endpoint_answers_before_initialization(self):
+        with mock.patch("spiral_runtime.create_session") as create:
+            self._assert_service_answers(SessionState.Uninitialized)
+        create.assert_not_called()
+        status = self.state.status()
+        self.assertIsNone(status["session_id"])
+        self.assertIsNone(status["session_request"])
+        health = json.loads(self.request("GET", "/health")[1])
+        self.assertIs(health["cuda_ready"], False)
+
+    def test_every_read_endpoint_answers_while_initialization_is_loading(self):
         blocked = threading.Event()
         release = threading.Event()
 
@@ -1582,7 +1743,7 @@ class AlwaysLoadedSessionTests(HttpServiceFixture):
             return FakeSession()
 
         with mock.patch("spiral_runtime.create_session", slow_create):
-            self.state.start_initial_session()
+            self.state.initialize(self.state.startup_session_request())
             self.assertTrue(blocked.wait(10))
             # The HTTP surface is fully responsive while CUDA and the model
             # are being built.
@@ -1596,7 +1757,7 @@ class AlwaysLoadedSessionTests(HttpServiceFixture):
     def test_every_read_endpoint_answers_while_the_session_is_in_error(self):
         with mock.patch("spiral_runtime.create_session",
                         side_effect=RuntimeError("no CUDA device")):
-            self.state.start_initial_session()
+            self.state.initialize(self.state.startup_session_request())
             status = _await_build(self.state)
         self.assertEqual(status["state"], SessionState.Error)
         self.assertIn("no CUDA device", status["error"])
@@ -1604,65 +1765,76 @@ class AlwaysLoadedSessionTests(HttpServiceFixture):
         health = json.loads(self.request("GET", "/health")[1])
         self.assertIs(health["cuda_ready"], False)
 
-    def test_startup_resumes_the_autosave_metadata_selects(self):
+    def test_initialization_does_not_select_an_autosave(self):
         _write_autosave(self.output / "old-run", iterations=5,
                         namespace=self.output, dataset_root=self.dataset)
-        chosen = _write_autosave(self.output / "new-run", iterations=500,
-                                 namespace=self.output,
-                                 dataset_root=self.dataset)
+        _write_autosave(self.output / "new-run", iterations=500,
+                        namespace=self.output, dataset_root=self.dataset)
         with mock.patch("spiral_runtime.create_session",
                         return_value=FakeSession()) as create:
-            self.state.start_initial_session()
+            self.state.initialize(self.state.startup_session_request())
             _await_build(self.state)
-        self.assertEqual(create.call_args.args[0].checkpoint, str(chosen))
-        self.assertEqual(
-            self.state.status()["autosave_selection"]["selected"]["checkpoint"],
-            str(chosen))
+        self.assertEqual(create.call_args.args[0].checkpoint, "")
+        self.assertNotIn("autosave_selection", self.state.status())
 
-    def test_a_corrupt_startup_autosave_is_an_error_a_rebuild_recovers(self):
+    def test_a_corrupt_autosave_is_ignored_unless_selected(self):
         _write_autosave(self.output / "run", iterations=50,
                         namespace=self.output, dataset_root=self.dataset,
                         corrupt=True)
         with mock.patch("spiral_runtime.create_session",
                         return_value=FakeSession()) as create:
-            self.state.start_initial_session()
+            self.state.initialize(self.state.startup_session_request())
             status = _await_build(self.state)
-            # The service does not silently start from scratch, and does not
-            # fall back to an older autosave: it says what is wrong.
-            self.assertEqual(status["state"], SessionState.Error)
-            self.assertIn("Startup autosave cannot be loaded", status["error"])
-            self.assertEqual(create.call_count, 0)
-            self._assert_service_answers(SessionState.Error)
-
-            # Rebuild with defaults ignores every autosave and recovers.
-            status, payload, _ = self.request(
-                "POST", "/session/rebuild",
-                body={"command_id": "rebuild-1", "defaults": True})
-            self.assertEqual(status, 200, payload)
-            settled = _await_build(self.state)
-        self.assertEqual(settled["state"], SessionState.Idle)
-        self.assertIsNone(settled["error"])
+        self.assertEqual(status["state"], SessionState.Idle)
+        self.assertEqual(create.call_count, 1)
         self.assertEqual(create.call_args.args[0].checkpoint, "")
 
-    def test_no_client_request_is_needed_to_get_a_session(self):
+    def test_initialize_route_creates_the_first_session_once(self):
         with mock.patch("spiral_runtime.create_session",
                         return_value=FakeSession()):
-            self.state.start_initial_session()
+            status, payload, _ = self.request(
+                "POST", "/session/initialize",
+                body={"command_id": "initialize-1",
+                      **self.state.startup_session_request()})
+            self.assertEqual(status, 200, payload)
             _await_build(self.state)
         status = json.loads(self.request("GET", "/session/status")[1])
         self.assertEqual(status["state"], SessionState.Idle)
         self.assertTrue(status["session_id"])
+        duplicate, payload, _ = self.request(
+            "POST", "/session/initialize",
+            body={"command_id": "initialize-2"})
+        self.assertEqual(duplicate, 409, payload)
+
+    def test_initialize_route_rejects_non_mapping_advanced_config(self):
+        status, payload, _ = self.request(
+            "POST", "/session/initialize",
+            body={"command_id": "initialize-malformed",
+                  "run": {"z_begin": 0, "z_end": 10, "config": 1}})
+        self.assertEqual(status, 400, payload)
+        self.assertIn("Malformed session request",
+                      json.loads(payload)["error"])
+
+    def test_rebuild_before_initialization_is_rejected(self):
+        status, payload, _ = self.request(
+            "POST", "/session/rebuild",
+            body={"command_id": "rebuild-1"})
+        self.assertEqual(status, 409, payload)
+        self.assertIn("initialize it first", json.loads(payload)["error"])
 
     def test_only_a_rebuild_may_replace_the_model_domain(self):
         with mock.patch("spiral_runtime.create_session",
                         return_value=FakeSession()):
-            self.state.start_initial_session()
+            self.state.initialize(self.state.startup_session_request())
             _await_build(self.state)
 
             # A run that changes a new-fit configuration key is refused: the
             # resident model keeps its domain.
-            configuration = Config({**_NO_DENSE_LOSSES,
-                                    "model_num_flow_stages": 3}).as_dict()
+            configuration = {
+                **Config.catalog()["defaults"],
+                **_NO_DENSE_LOSSES,
+                "model_num_flow_stages": 3,
+            }
             with self.assertRaisesRegex(ApiError, "requires rebuilding"):
                 self.state.run({
                     "configuration": configuration,
@@ -1958,11 +2130,11 @@ class UploadTests(unittest.TestCase):
             _planned_run(self.state, {"iterations": 10, "run_config": {
                 "model_num_flow_stages": 2,
             }})
-        with self.assertRaisesRegex(ValueError, "Invalid value"):
+        with self.assertRaisesRegex(ApiError, "Invalid value"):
             _planned_run(self.state, {"iterations": 10, "run_config": {
                 "output_save_png_visualizations": 1,
             }})
-        with self.assertRaisesRegex(ValueError, "vector length"):
+        with self.assertRaisesRegex(ApiError, "vector length"):
             _planned_run(self.state, {"iterations": 10, "run_config": {
                 "track_length_bin_weights": [1, 2],
             }})
@@ -1988,7 +2160,7 @@ class UploadTests(unittest.TestCase):
         inputs["outer_shell"] = str(shell)
         with self.assertRaisesRegex(ApiError, "Static dataset inputs") as caught:
             self.state.run({
-                "configuration": Config().as_dict(),
+                "configuration": dict(Config.catalog()["defaults"]),
                 "iterations": 3,
                 "inputs": inputs,
                 "expected_session_revision": self.state.session_revision,
@@ -2001,7 +2173,7 @@ class UploadTests(unittest.TestCase):
         inputs["verified_patches"] = str(self.dataset / "other-patches")
         with self.assertRaisesRegex(ApiError, "Static dataset inputs") as caught:
             self.state.run({
-                "configuration": Config().as_dict(),
+                "configuration": dict(Config.catalog()["defaults"]),
                 "iterations": 3,
                 "inputs": inputs,
                 "expected_session_revision": self.state.session_revision,

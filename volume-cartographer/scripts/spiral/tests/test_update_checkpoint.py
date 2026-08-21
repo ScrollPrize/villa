@@ -24,7 +24,8 @@ def test_migrate_legacy_config_to_exact_current_schema():
     assert migrated["sample_count_patches_per_step"] == 77
     assert migrated["patch_unverified_patch_exclusion_radius"] == 12.5
     assert migrated["optimizer_learning_rate"] == 2.25e-6
-    assert "use_tracks" in removed
+    assert migrated["input_use_tracks"] is True
+    assert "use_tracks -> input_use_tracks" in renamed
     assert "track_walk_require_loop_consistency" in removed
     assert "patch_strip_sampling" in removed
     assert "patch_2d_sampling_max_area" in removed
