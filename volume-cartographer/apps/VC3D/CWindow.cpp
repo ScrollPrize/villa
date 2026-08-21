@@ -8769,6 +8769,23 @@ bool CWindow::OpenVolume(const QString& path,
         }
     }
 
+    // Line-annotation sessions must end — finalized and saved — while the
+    // package they belong to is still the active one; after the swap, their
+    // close path would save into the new package. A refusal (a running
+    // optimization, a failed finalization) aborts the switch with the
+    // workspace intact.
+    if (_lineAnnotationController &&
+        !_lineAnnotationController->prepareForPackageSwitch()) {
+        if (errorMessage) {
+            *errorMessage = tr("Open line annotation sessions could not be "
+                               "closed; the project was not switched.");
+        }
+        if (openError) {
+            *openError = VolumeOpenError::PackageLoadFailed;
+        }
+        return false;
+    }
+
     CloseVolume();
     _state->setVpkg(std::move(package));
     refreshCurrentVolumePackageUi(preferredVolumeId, true);

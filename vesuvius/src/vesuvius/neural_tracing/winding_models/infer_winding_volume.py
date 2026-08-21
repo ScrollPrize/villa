@@ -221,7 +221,7 @@ def _iter_winding_aggregates(path):
 
 
 def _spiral_scripts_dir():
-    """volume-cartographer/scripts/spiral, for the raw-spiral seed fallback.
+    """spiral-fitting, for the raw-spiral seed fallback.
 
     Resolved from $SPIRAL_SCRIPTS_DIR, or the villa checkout layout relative
     to this file (vesuvius/src/vesuvius/neural_tracing/winding_models).
@@ -229,13 +229,13 @@ def _spiral_scripts_dir():
     override = os.environ.get("SPIRAL_SCRIPTS_DIR")
     candidates = [Path(override)] if override else []
     here = Path(__file__).resolve()
-    candidates += [parent / "volume-cartographer/scripts/spiral"
+    candidates += [parent / "spiral-fitting"
                    for parent in here.parents]
     for candidate in candidates:
         if (candidate / "transforms.py").is_file():
             return str(candidate)
     raise FileNotFoundError(
-        "cannot locate volume-cartographer/scripts/spiral; set "
+        "cannot locate spiral-fitting; set "
         "SPIRAL_SCRIPTS_DIR (only needed for --seed-source spiral)")
 
 

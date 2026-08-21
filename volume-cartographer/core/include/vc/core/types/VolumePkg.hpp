@@ -45,6 +45,13 @@ bool isLocationRemote(const std::string& location);
 std::filesystem::path resolveLocalPath(const std::string& location,
                                        const std::filesystem::path& base = {});
 
+// Open-data volume entries carry their sample identity in a tag. Keep their
+// chunk caches grouped with the other catalog data while leaving ordinary
+// remote volumes directly beneath the configured cache root.
+std::filesystem::path remoteVolumeCacheRootForEntry(
+    const std::filesystem::path& configuredRoot,
+    const Entry& entry);
+
 std::string validateLocation(Category category, const std::string& location);
 std::string validateSingleVolumeLocation(const std::string& location);
 utils::Json volumeMetadataFromEntryTags(const std::vector<std::string>& tags);
@@ -187,6 +194,13 @@ public:
     void clearSelectedFiberInferenceDataset();
     [[nodiscard]] std::filesystem::path selectedFiberInferenceDatasetPath() const;
 
+    // The project's umbilicus polyline, if one has been attached explicitly.
+    // Declaring it here removes the ambiguity of searching directories for
+    // umbilicus.json when a project references several packages.
+    [[nodiscard]] std::string umbilicus() const;
+    void setUmbilicus(std::string location);
+    [[nodiscard]] std::filesystem::path umbilicusPath() const;
+
     [[nodiscard]] bool hasVolumes() const;
     [[nodiscard]] bool hasVolume(const std::string& id) const;
     [[nodiscard]] std::size_t numberOfVolumes() const;
@@ -259,6 +273,7 @@ private:
     std::optional<std::string> outputSegments_;
     std::optional<std::string> selectedLasagnaDataset_;
     std::optional<std::string> selectedFiberInferenceDataset_;
+    std::optional<std::string> umbilicus_;
 
     std::map<std::string, std::shared_ptr<Volume>> loadedVolumes_;
     std::map<std::string, std::vector<std::string>> volumeTagsByID_;

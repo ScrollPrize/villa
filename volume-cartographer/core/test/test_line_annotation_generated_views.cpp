@@ -2650,3 +2650,116 @@ TEST_CASE("line spline honors hard endpoint directions")
     CHECK(first.dot(cv::Vec3d{1.0, 0.0, 0.0}) / cv::norm(first) > 0.99);
     CHECK(last.dot(cv::Vec3d{0.0, 1.0, 0.0}) / cv::norm(last) > 0.99);
 }
+
+// ---------------------------------------------------------------------------
+// Orientation freshness: the decisions behind the umbilicus cache and the
+// stale-view refresh, extracted so they are asserted rather than read.
+
+#include "UmbilicusOrientationFreshness.hpp"
+
+namespace {
+
+vc3d::annotation::UmbilicusCacheInputs cacheInputs()
+{
+    vc3d::annotation::UmbilicusCacheInputs inputs;
+    inputs.root = "/proj";
+    inputs.volumeId = "vol-a";
+    inputs.dependencyToken = "field|/proj/umbilicus.json=100:1";
+    inputs.frame = vc3d::annotation::deriveAnnotationFrame(
+        2.4, 0, std::nullopt, std::nullopt, {100.0, 100.0, 1000.0});
+    return inputs;
+}
+
+} // namespace
+
+TEST_CASE("umbilicus cache: reused only while every input it was built from holds")
+{
+    using vc3d::annotation::umbilicusReloadNeeded;
+
+    const auto cached = cacheInputs();
+
+    // Never attempted resolves regardless of the inputs matching.
+    CHECK(umbilicusReloadNeeded(false, cached, cached));
+    // Identical inputs reuse.
+    CHECK_FALSE(umbilicusReloadNeeded(true, cached, cached));
+
+    auto otherRoot = cached;
+    otherRoot.root = "/other";
+    CHECK(umbilicusReloadNeeded(true, cached, otherRoot));
+
+    // The finding this pins: a volume switch whose annotation frame is
+    // byte-identical must still re-resolve, because the legacy reading's
+    // registration transform and the volume-centre fallback belong to the
+    // volume, not to the frame.
+    auto otherVolume = cached;
+    otherVolume.volumeId = "vol-b";
+    CHECK(umbilicusReloadNeeded(true, cached, otherVolume));
+
+    // Any resolver dependency changing on disk — the attached file fixed in
+    // place, a discovery candidate appearing, the registration transform
+    // edited — lands in the token.
+    auto editedFile = cached;
+    editedFile.dependencyToken = "field|/proj/umbilicus.json=100:2";
+    CHECK(umbilicusReloadNeeded(true, cached, editedFile));
+
+    // A frame change rescales the cached points, so it cannot be reused...
+    auto otherFrame = cached;
+    otherFrame.frame = vc3d::annotation::deriveAnnotationFrame(
+        2.4, 0, std::nullopt, std::nullopt, {100.0, 100.0, 2000.0});
+    CHECK(umbilicusReloadNeeded(true, cached, otherFrame));
+
+    // ...but an imprecisely round-tripped voxel size is the same frame.
+    auto rounded = cached;
+    rounded.frame = vc3d::annotation::deriveAnnotationFrame(
+        2.4 + 1e-12, 0, std::nullopt, std::nullopt, {100.0, 100.0, 1000.0});
+    CHECK_FALSE(umbilicusReloadNeeded(true, cached, rounded));
+}
+
+TEST_CASE("stale-view refresh: rebuilds exactly the panes built before the change")
+{
+    using vc3d::annotation::GeneratedViewsPaneState;
+    using vc3d::annotation::paneNeedsOrientationRefresh;
+
+    constexpr int kEpoch = 3;
+
+    GeneratedViewsPaneState stale;
+    stale.hasSession = true;
+    stale.hasGeneratedSurfaces = true;
+    stale.hasLinePoints = true;
+    stale.orientationEpoch = kEpoch - 1;
+    CHECK(paneNeedsOrientationRefresh(stale, kEpoch));
+
+    // Already built at the current epoch: nothing changed underneath it.
+    auto current = stale;
+    current.orientationEpoch = kEpoch;
+    CHECK_FALSE(paneNeedsOrientationRefresh(current, kEpoch));
+
+    // No session, nothing to rebuild.
+    auto empty = stale;
+    empty.hasSession = false;
+    CHECK_FALSE(paneNeedsOrientationRefresh(empty, kEpoch));
+
+    // Intersection sides suppress ordinary generated views and are rebuilt
+    // through the inspection instead; rebuilding them here would build views
+    // the session exists to suppress.
+    auto suppressed = stale;
+    suppressed.suppressesGeneratedViews = true;
+    CHECK_FALSE(paneNeedsOrientationRefresh(suppressed, kEpoch));
+
+    // Nothing materialized means nothing stale on screen — and the builder
+    // rejects an empty model, which used to turn a successful attach into a
+    // modal complaint mid-trace.
+    auto unmaterialized = stale;
+    unmaterialized.hasGeneratedSurfaces = false;
+    CHECK_FALSE(paneNeedsOrientationRefresh(unmaterialized, kEpoch));
+
+    auto noLine = stale;
+    noLine.hasLinePoints = false;
+    CHECK_FALSE(paneNeedsOrientationRefresh(noLine, kEpoch));
+
+    // A pane that has never been built (default epoch) counts as stale once it
+    // has surfaces to correct.
+    auto neverRecorded = stale;
+    neverRecorded.orientationEpoch = -1;
+    CHECK(paneNeedsOrientationRefresh(neverRecorded, kEpoch));
+}
