@@ -13,6 +13,7 @@ import math
 import time
 from typing import List, Tuple, Optional
 import concurrent.futures
+import hashlib
 
 import numpy as np
 import cv2
@@ -577,8 +578,11 @@ def reduce_partitions(
     H, W = pred_shape
     logger.info(f"Starting reduce phase: will blend {num_parts} partitions tile-by-tile (tile_size={tile_size})")
 
-    # Cache directory for partition zarrs (network filesystem -> local /tmp)
-    cache_dir = "/tmp/partition_cache"
+    # Cache directory for partition zarrs (network filesystem -> local /tmp).
+    # Keyed on the source directory so that separate runs writing to different
+    # ZARR_OUTPUT_DIRs do not collide on the part_id-derived filenames below.
+    _cache_key = hashlib.sha1(os.path.realpath(zarr_output_dir).encode()).hexdigest()[:12]
+    cache_dir = os.path.join("/tmp/partition_cache", _cache_key)
     os.makedirs(cache_dir, exist_ok=True)
 
     # Open all partition zarr arrays once (outside the generator loop)
