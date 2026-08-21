@@ -17,6 +17,11 @@ from torch.utils.data import Dataset
 
 from dinovol_2.augmentation.pipelines import create_training_transforms
 from dinovol_2.dataset.normalization import get_normalization
+from dinovol_2.dataset.point_annotations import (
+    load_point_collection,
+    map_scale0_voxel_centers,
+    xyz_to_zyx,
+)
 
 
 @dataclass
@@ -26,6 +31,8 @@ class Volume:
     scale: int
     path: str
     weight: float = 0.0
+    point_coordinates: np.ndarray | None = None
+    point_type_ids: np.ndarray | None = None
 
 
 @dataclass
@@ -194,6 +201,39 @@ class SSLZarrDataset(Dataset):
         self.s3_storage_options = self.config.get("s3_storage_options")
         self.vol_trim_pct = self.config.get("vol_trim_pct", 0.60)
         self.normalizer = get_normalization(self.config.get("normalization_scheme", "robust"))
+        point_config = dict(self.config.get("point_supervision") or {})
+        self.point_supervision_enabled = bool(point_config.get("enabled", False)) and not self.single_crop_only
+        self.point_sampling_probability = float(point_config.get("sampling_probability", 0.1))
+        self.max_points_per_view = int(point_config.get("max_points_per_view", 64))
+        if not 0.0 <= self.point_sampling_probability <= 1.0:
+            raise ValueError(
+                f"point sampling_probability must be in [0, 1], got {self.point_sampling_probability}."
+            )
+        if self.max_points_per_view <= 0:
+            raise ValueError(f"max_points_per_view must be positive, got {self.max_points_per_view}.")
+        configured_types = []
+        if self.point_supervision_enabled:
+            discovered_types = set()
+            for dataset in self.config["datasets"]:
+                entries = dataset.get("point_collections", [])
+                if not isinstance(entries, list):
+                    raise ValueError("point_collections must be a list of {path, type} objects.")
+                for entry_index, collection in enumerate(entries):
+                    if not isinstance(collection, dict) or "path" not in collection or "type" not in collection:
+                        raise ValueError(
+                            f"point_collections entry {entry_index} must contain path and type."
+                        )
+                    if not isinstance(collection["type"], str) or not collection["type"]:
+                        raise ValueError("Point collection types must be non-empty strings.")
+                    discovered_types.add(collection["type"])
+            configured_types = sorted(discovered_types)
+        if any(not type_name for type_name in configured_types):
+            raise ValueError("Point collection types must be non-empty strings.")
+        self.point_type_to_id = {type_name: index for index, type_name in enumerate(configured_types)}
+        self.global_point_crop_offset = tuple(
+            (float(view) - float(crop)) / 2.0
+            for view, crop in zip(self.global_view_size, self.global_crop_size)
+        )
         self._volume_handles: dict[tuple[str, int], ZarrHandle] = {}
         self._handle_pid: int | None = None
         self._atexit_pid: int | None = None
@@ -275,11 +315,18 @@ class SSLZarrDataset(Dataset):
                 valid_x = max(0, (x1 - x0) - crop_x + 1)
                 valid_crop_starts = valid_z * valid_y * valid_x
 
+                point_coordinates, point_type_ids = self._load_volume_points(
+                    dataset,
+                    selected_shape=(z, y, x),
+                    usable_bbox=usable_bbox,
+                )
                 self.volumes.append(Volume(
                     path=str(volume_path),
                     scale=volume_scale,
                     usable_bbox=usable_bbox,
                     valid_crop_starts=valid_crop_starts,
+                    point_coordinates=point_coordinates,
+                    point_type_ids=point_type_ids,
                 ))
             finally:
                 handle.close()
@@ -290,6 +337,70 @@ class SSLZarrDataset(Dataset):
 
         for volume in self.volumes:
             volume.weight = volume.valid_crop_starts / self.total_valid_crop_starts
+
+    def _load_volume_points(self, dataset_config, *, selected_shape, usable_bbox):
+        entries = dataset_config.get("point_collections", [])
+        if not self.point_supervision_enabled or not entries:
+            return np.empty((0, 3), dtype=np.float64), np.empty((0,), dtype=np.int64)
+        if not isinstance(entries, list):
+            raise ValueError("point_collections must be a list of {path, type} objects.")
+
+        volume_path = dataset_config["volume_path"]
+        volume_scale = int(dataset_config["volume_scale"])
+        scale0_handle = None
+        try:
+            if volume_scale == 0:
+                scale0_shape = selected_shape
+            else:
+                scale0_handle = open_zarr_handle(
+                    volume_path,
+                    0,
+                    self.volume_auth,
+                    self.s3_storage_options,
+                )
+                scale0_shape = tuple(int(value) for value in scale0_handle.array.shape)
+
+            all_coordinates = []
+            all_type_ids = []
+            nominal_slices = self._nominal_source_slices(self.source_read_window_size)
+            usable_start = np.asarray([
+                int(bbox_start) + int(nominal_slice.start)
+                for bbox_start, nominal_slice in zip(usable_bbox[:3], nominal_slices)
+            ], dtype=np.float64)
+            usable_stop = np.asarray([
+                int(bbox_stop) - int(read_size) + int(nominal_slice.stop)
+                for bbox_stop, read_size, nominal_slice in zip(
+                    usable_bbox[3:], self.source_read_window_size, nominal_slices
+                )
+            ], dtype=np.float64)
+            for entry_index, entry in enumerate(entries):
+                if not isinstance(entry, dict) or "path" not in entry or "type" not in entry:
+                    raise ValueError(
+                        f"point_collections entry {entry_index} for {volume_path} must contain path and type."
+                    )
+                type_name = entry["type"]
+                if not isinstance(type_name, str) or not type_name:
+                    raise ValueError("Point collection types must be non-empty strings.")
+                points = map_scale0_voxel_centers(
+                    xyz_to_zyx(load_point_collection(entry["path"])),
+                    scale0_shape,
+                    selected_shape,
+                )
+                usable = np.all((points >= usable_start) & (points < usable_stop), axis=1)
+                points = points[usable]
+                if points.shape[0] == 0:
+                    raise ValueError(
+                        f"Point collection {entry['path']} has no annotations usable in the trimmed bounds "
+                        f"of volume {volume_path} at scale {volume_scale}."
+                    )
+                all_coordinates.append(points)
+                all_type_ids.append(
+                    np.full((points.shape[0],), self.point_type_to_id[type_name], dtype=np.int64)
+                )
+            return np.concatenate(all_coordinates), np.concatenate(all_type_ids)
+        finally:
+            if scale0_handle is not None:
+                scale0_handle.close()
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -374,6 +485,41 @@ class SSLZarrDataset(Dataset):
             ]
         )
 
+    def _read_point_centered_source_crop_3d(self, d_zarr, usable_bbox, anchor):
+        starts = []
+        nominal_slices = self._nominal_source_slices(self.source_read_window_size)
+        for bbox_start, bbox_stop, crop_size, coordinate, nominal_slice in zip(
+            usable_bbox[:3],
+            usable_bbox[3:],
+            self.source_read_window_size,
+            anchor,
+            nominal_slices,
+        ):
+            minimum = max(
+                int(bbox_start),
+                int(np.ceil(float(coordinate) - (int(nominal_slice.stop) - 1))),
+            )
+            maximum = min(
+                int(bbox_stop) - int(crop_size),
+                int(np.floor(float(coordinate) - int(nominal_slice.start))),
+            )
+            if maximum < minimum:
+                raise ValueError(
+                    f"Annotated point {tuple(float(value) for value in anchor)} cannot fit in a source window "
+                    f"of size {self.source_read_window_size} inside bounds {usable_bbox}."
+                )
+            starts.append(int(np.random.randint(minimum, maximum + 1)))
+        z_start, y_start, x_start = starts
+        crop_d, crop_h, crop_w = self.source_read_window_size
+        crop = np.asarray(
+            d_zarr[
+                z_start:z_start + crop_d,
+                y_start:y_start + crop_h,
+                x_start:x_start + crop_w,
+            ]
+        )
+        return crop, (z_start, y_start, x_start)
+
     @staticmethod
     def _expand_crop_shape(crop_shape, target_size, reference_size):
         return tuple(
@@ -412,7 +558,17 @@ class SSLZarrDataset(Dataset):
             )
         return _max_3tuple(*required_sizes)
 
-    def _sample_random_resized_crop_region(self, source_shape, scale_range, target_size, *, reference_size=None):
+    def _sample_random_resized_crop_region(
+        self,
+        source_shape,
+        scale_range,
+        target_size,
+        *,
+        reference_size=None,
+        anchor=None,
+        anchor_target_size=None,
+        anchor_output_size=None,
+    ):
         if reference_size is None:
             reference_size = target_size
         source_depth, source_height, source_width = source_shape
@@ -436,15 +592,42 @@ class SSLZarrDataset(Dataset):
 
         nominal_source_slices = self._nominal_source_slices(source_shape)
         nominal_starts = []
-        for nominal_slice, nominal_dim in zip(nominal_source_slices, nominal_crop_shape):
+        for axis, (nominal_slice, nominal_dim, raw_dim) in enumerate(zip(
+            nominal_source_slices,
+            nominal_crop_shape,
+            expanded_crop_shape,
+        )):
             low = int(nominal_slice.start)
-            high = int(nominal_slice.stop) - int(nominal_dim) + 1
-            if high <= low:
-                raise ValueError(
-                    "nominal crop does not fit inside source_sampling_size; "
-                    f"source_sampling_size={self.source_sampling_size}, nominal_crop_shape={nominal_crop_shape}"
+            high_inclusive = int(nominal_slice.stop) - int(nominal_dim)
+            if anchor is not None:
+                if anchor_target_size is None or anchor_output_size is None:
+                    raise ValueError("anchor_target_size and anchor_output_size are required with an anchor.")
+                raw_offset = (int(raw_dim) - int(nominal_dim)) // 2
+                output_offset = (float(anchor_target_size[axis]) - float(anchor_output_size[axis])) / 2.0
+                relative_min = (
+                    (output_offset + 0.5) * int(raw_dim) / float(anchor_target_size[axis]) - 0.5
                 )
-            nominal_starts.append(int(np.random.randint(low, high)))
+                relative_max = (
+                    (output_offset + float(anchor_output_size[axis]) - 0.5)
+                    * int(raw_dim)
+                    / float(anchor_target_size[axis])
+                    - 0.5
+                )
+                low = max(
+                    low,
+                    int(np.ceil(float(anchor[axis]) - relative_max + raw_offset - 1e-7)),
+                )
+                high_inclusive = min(
+                    high_inclusive,
+                    int(np.floor(float(anchor[axis]) - relative_min + raw_offset + 1e-7)),
+                )
+            if high_inclusive < low:
+                raise ValueError(
+                    "nominal crop cannot contain the requested annotation; "
+                    f"source_sampling_size={self.source_sampling_size}, nominal_crop_shape={nominal_crop_shape}, "
+                    f"anchor={anchor}"
+                )
+            nominal_starts.append(int(np.random.randint(low, high_inclusive + 1)))
 
         raw_starts = []
         for nominal_start, nominal_dim, raw_dim, source_dim in zip(
@@ -532,10 +715,103 @@ class SSLZarrDataset(Dataset):
         self._restore_rng_state(state_after)
         return augmented_global, augmented_gram_teacher
 
+    def _apply_paired_global_transform_with_points(
+        self,
+        transform,
+        global_view,
+        gram_teacher_view,
+        point_coordinates,
+    ):
+        transform_input = {
+            "image": global_view,
+            "keypoints": point_coordinates,
+            "crop_shape": tuple(int(value) for value in self.global_view_size),
+        }
+        if gram_teacher_view is None or self.gram_teacher_no_augmentations:
+            transformed = transform(**transform_input)
+            return transformed["image"], gram_teacher_view, transformed["keypoints"]
+
+        state_before = self._capture_rng_state()
+        transformed = transform(**transform_input)
+        state_after = self._capture_rng_state()
+        self._restore_rng_state(state_before)
+        augmented_gram_teacher = transform(image=gram_teacher_view)["image"]
+        self._restore_rng_state(state_after)
+        return transformed["image"], augmented_gram_teacher, transformed["keypoints"]
+
+    @staticmethod
+    def _map_points_to_view(points, crop_region, target_size):
+        if points.shape[0] == 0:
+            return torch.empty((0, 3), dtype=torch.float32)
+        starts = np.asarray(crop_region.starts, dtype=np.float64)
+        shape = np.asarray(crop_region.shape, dtype=np.float64)
+        target = np.asarray(target_size, dtype=np.float64)
+        mapped = (points - starts + 0.5) * (target / shape) - 0.5
+        return torch.from_numpy(mapped.astype(np.float32, copy=False))
+
+    def _visible_points_for_crop(self, volume, source_starts, crop_region, anchor_index):
+        source_starts_array = np.asarray(source_starts, dtype=np.float64)
+        source_points = volume.point_coordinates - source_starts_array
+        crop_starts = np.asarray(crop_region.starts, dtype=np.float64)
+        crop_stops = crop_starts + np.asarray(crop_region.shape, dtype=np.float64) - 1.0
+        visible = np.all((source_points >= crop_starts) & (source_points <= crop_stops), axis=1)
+        visible_indices = np.flatnonzero(visible)
+        if anchor_index not in visible_indices:
+            raise RuntimeError("The selected point anchor was not retained in its global crop.")
+        ordered_indices = np.concatenate((
+            np.asarray([anchor_index], dtype=np.int64),
+            visible_indices[visible_indices != anchor_index],
+        ))
+        return (
+            self._map_points_to_view(source_points[ordered_indices], crop_region, self.global_view_size),
+            torch.from_numpy(volume.point_type_ids[ordered_indices].copy()).long(),
+        )
+
+    def _filter_and_cap_view_points(self, coordinates, type_ids):
+        offset = coordinates.new_tensor(self.global_point_crop_offset)
+        coordinates = coordinates - offset
+        maximum = coordinates.new_tensor(tuple(float(value - 1) for value in self.global_crop_size))
+        visible = torch.all((coordinates >= 0.0) & (coordinates <= maximum), dim=1)
+        if coordinates.shape[0] and not bool(visible[0]):
+            raise RuntimeError("The selected point anchor fell outside the student output crop.")
+        coordinates = coordinates[visible]
+        type_ids = type_ids[visible]
+        if coordinates.shape[0] <= self.max_points_per_view:
+            return coordinates, type_ids
+
+        selected = [0]
+        remaining_budget = self.max_points_per_view - 1
+        candidates_by_type = {}
+        for type_id in torch.unique(type_ids, sorted=True).tolist():
+            candidates = torch.nonzero(type_ids == type_id, as_tuple=False).flatten().tolist()
+            candidates = [index for index in candidates if index != 0]
+            random.shuffle(candidates)
+            candidates_by_type[int(type_id)] = candidates
+        type_order = list(candidates_by_type)
+        while remaining_budget > 0 and type_order:
+            next_order = []
+            for type_id in type_order:
+                candidates = candidates_by_type[type_id]
+                if candidates and remaining_budget > 0:
+                    selected.append(candidates.pop())
+                    remaining_budget -= 1
+                if candidates:
+                    next_order.append(type_id)
+            type_order = next_order
+        selected_tensor = torch.tensor(selected, dtype=torch.long)
+        return coordinates[selected_tensor], type_ids[selected_tensor]
+
     def __len__(self):
         if self.epoch_length is not None:
             return self.epoch_length
         return self.total_valid_crop_starts
+
+    @staticmethod
+    def _sample_volume_anchor(volume):
+        represented_types = np.unique(volume.point_type_ids)
+        selected_type = int(np.random.choice(represented_types))
+        candidates = np.flatnonzero(volume.point_type_ids == selected_type)
+        return int(np.random.choice(candidates))
 
     def __getitem__(self, idx):
         vol_weights = [vol.weight for vol in self.volumes]
@@ -545,7 +821,22 @@ class SSLZarrDataset(Dataset):
             vol_idx = np.random.choice(len(self.volumes), p=vol_weights)
             vol = self.volumes[vol_idx]
             d_zarr = self._get_volume_array(vol)
-            source_crop = self._read_source_crop_3d(d_zarr, vol.usable_bbox)
+            anchor_index = None
+            source_starts = None
+            if (
+                self.point_supervision_enabled
+                and vol.point_coordinates is not None
+                and vol.point_coordinates.shape[0] > 0
+                and np.random.random() < self.point_sampling_probability
+            ):
+                anchor_index = self._sample_volume_anchor(vol)
+                source_crop, source_starts = self._read_point_centered_source_crop_3d(
+                    d_zarr,
+                    vol.usable_bbox,
+                    vol.point_coordinates[anchor_index],
+                )
+            else:
+                source_crop = self._read_source_crop_3d(d_zarr, vol.usable_bbox)
             nominal_source = self._extract_nominal_source_region(source_crop)
             if nominal_source.size > 0 and (np.count_nonzero(nominal_source) / nominal_source.size) >= nonzero_threshold:
                 break
@@ -563,6 +854,8 @@ class SSLZarrDataset(Dataset):
 
         global_views = []
         gram_teacher_views = []
+        global_point_coordinates = []
+        global_point_type_ids = []
         for transform in self.global_transforms:
             # Sample one shared region so the student and Gram teacher observe the
             # exact same 3D field of view, optionally at different resolutions.
@@ -571,6 +864,13 @@ class SSLZarrDataset(Dataset):
                 self.global_crop_scale,
                 self.paired_global_view_size,
                 reference_size=self.paired_global_crop_size,
+                anchor=(
+                    vol.point_coordinates[anchor_index] - np.asarray(source_starts, dtype=np.float64)
+                    if anchor_index is not None
+                    else None
+                ),
+                anchor_target_size=self.global_view_size if anchor_index is not None else None,
+                anchor_output_size=self.global_crop_size if anchor_index is not None else None,
             )
             global_view = self._materialize_crop_from_region(source_crop, crop_region, self.global_view_size)
             gram_teacher_view = None
@@ -580,13 +880,38 @@ class SSLZarrDataset(Dataset):
                     crop_region,
                     self.gram_teacher_view_size,
                 )
-            if self.do_augmentations:
-                global_view, gram_teacher_view = self._apply_paired_global_transform(
-                    transform,
-                    global_view,
-                    gram_teacher_view,
+            if anchor_index is not None:
+                point_coordinates, point_type_ids = self._visible_points_for_crop(
+                    vol,
+                    source_starts,
+                    crop_region,
+                    anchor_index,
                 )
+                if self.do_augmentations:
+                    global_view, gram_teacher_view, point_coordinates = (
+                        self._apply_paired_global_transform_with_points(
+                            transform,
+                            global_view,
+                            gram_teacher_view,
+                            point_coordinates,
+                        )
+                    )
+                point_coordinates, point_type_ids = self._filter_and_cap_view_points(
+                    point_coordinates,
+                    point_type_ids,
+                )
+            else:
+                point_coordinates = torch.empty((0, 3), dtype=torch.float32)
+                point_type_ids = torch.empty((0,), dtype=torch.long)
+                if self.do_augmentations:
+                    global_view, gram_teacher_view = self._apply_paired_global_transform(
+                        transform,
+                        global_view,
+                        gram_teacher_view,
+                    )
             global_views.append(global_view)
+            global_point_coordinates.append(point_coordinates)
+            global_point_type_ids.append(point_type_ids)
             if gram_teacher_view is not None:
                 gram_teacher_views.append(gram_teacher_view)
 
@@ -610,6 +935,8 @@ class SSLZarrDataset(Dataset):
         sample = {
             "global_views": global_views,
             "local_views": local_views,
+            "global_point_coordinates": global_point_coordinates,
+            "global_point_type_ids": global_point_type_ids,
         }
         if gram_teacher_views:
             sample["gram_teacher_views"] = gram_teacher_views

@@ -21,8 +21,20 @@ configure_file(vc/compression/__init__.py
     "${CMAKE_CURRENT_BINARY_DIR}/vc/compression/__init__.py"
     COPYONLY
 )
+# Removed native target migration: extension modules take precedence over the
+# forwarding .py module, so discard only stale generated vcz1 modules from an
+# existing build tree before copying the compatibility shim.
+file(GLOB VC_STALE_VCZ1_MODULES
+    "${CMAKE_CURRENT_BINARY_DIR}/vc/compression/vcz1*${CMAKE_SHARED_MODULE_SUFFIX}")
+if(VC_STALE_VCZ1_MODULES)
+    file(REMOVE ${VC_STALE_VCZ1_MODULES})
+endif()
 configure_file(vc/compression/vcz1_numcodecs.py
     "${CMAKE_CURRENT_BINARY_DIR}/vc/compression/vcz1_numcodecs.py"
+    COPYONLY
+)
+configure_file(vc/compression/vcz1.py
+    "${CMAKE_CURRENT_BINARY_DIR}/vc/compression/vcz1.py"
     COPYONLY
 )
 
@@ -55,19 +67,6 @@ set_target_properties(vc_volume PROPERTIES
 )
 target_link_libraries(vc_volume PRIVATE vc_core)
 target_compile_features(vc_volume PRIVATE cxx_std_23)
-
-nanobind_add_module(vc_compression_vcz1
-    NOMINSIZE
-    vc/compression/vcz1.cpp
-)
-set_target_properties(vc_compression_vcz1 PROPERTIES
-    OUTPUT_NAME vcz1
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vc/compression"
-    # Module lives in vc/compression; libs install to site-packages root.
-    INSTALL_RPATH "$ORIGIN:$ORIGIN/../.."
-)
-target_link_libraries(vc_compression_vcz1 PRIVATE vc_core)
-target_compile_features(vc_compression_vcz1 PRIVATE cxx_std_23)
 
 nanobind_add_module(vc_surface_index
     vc/surface_index.cpp
@@ -150,10 +149,10 @@ install(TARGETS vc_volume vc_surface_index vc_track_crossings vc_track_store vc_
     LIBRARY DESTINATION vc
     RUNTIME DESTINATION vc
 )
-install(TARGETS vc_compression_vcz1
-    LIBRARY DESTINATION vc/compression
-    RUNTIME DESTINATION vc/compression
-)
 install(FILES vc/__init__.py DESTINATION vc)
 install(FILES vc/compression/__init__.py DESTINATION vc/compression)
-install(FILES vc/compression/vcz1_numcodecs.py DESTINATION vc/compression)
+install(FILES
+    vc/compression/vcz1.py
+    vc/compression/vcz1_numcodecs.py
+    DESTINATION vc/compression
+)

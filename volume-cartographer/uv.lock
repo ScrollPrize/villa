@@ -1950,18 +1950,36 @@ wheels = [
 ]
 
 [[package]]
+name = "vc-delta3d"
+version = "0.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numcodecs" },
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/30/f2/c405e3570db6d95557af179e160b9635c4f580ed659b2a2bbe4836b05ddd/vc_delta3d-0.1.0.tar.gz", hash = "sha256:27994e05fc20aed55a5b9eed1da933bf764a3f67cf3be7e57eae1ba2e15c4557", size = 41468, upload-time = "2026-08-18T18:41:07.076Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4a/99/fbf2469810ee4e581a0f6df3c036cc5af3b05dc82e915170dd427e6eaa9e/vc_delta3d-0.1.0-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:7cac802e47582ddfb67a02f8f92441ea580733299273ed2ee110f36c84b5d53d", size = 68383, upload-time = "2026-08-18T18:41:02.253Z" },
+    { url = "https://files.pythonhosted.org/packages/19/47/a1d8502dfef221ba61779019671adcf70554d250f02f05dd6ddaa050e93b/vc_delta3d-0.1.0-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:0a6ea6259f030af496d7cf2fbde614fed41dd9b11d449c0f986643f7a356ad2a", size = 74200, upload-time = "2026-08-18T18:41:03.319Z" },
+    { url = "https://files.pythonhosted.org/packages/42/e2/b1f9d4096a0beb69be7b9d0bd43b9e5d57dd1b4b9d9509aa7e96f97b7ba3/vc_delta3d-0.1.0-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:873730b1912181689140d60370deb629d3b646d93e2132aadedf93586c485ffd", size = 75404, upload-time = "2026-08-18T18:41:04.585Z" },
+    { url = "https://files.pythonhosted.org/packages/69/cc/e23947fba4c43bea363592066de88427e9ad65da0541bf9f4efd5a2df0d4/vc_delta3d-0.1.0-cp314-cp314-win_amd64.whl", hash = "sha256:bd1826f9aa3c1c79c56a23828c4edabbd82187c4adc07acad02ec67c784e92ce", size = 263905, upload-time = "2026-08-18T18:41:05.811Z" },
+]
+
+[[package]]
 name = "volume-cartographer"
 version = "3.0.3"
 source = { editable = "." }
 dependencies = [
     { name = "numcodecs" },
     { name = "numpy" },
+    { name = "vc-delta3d" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "numcodecs", specifier = ">=0.15.1,<0.17" },
     { name = "numpy" },
+    { name = "vc-delta3d", specifier = ">=0.1.0,<0.2" },
 ]
 
 [[package]]

@@ -6219,6 +6219,10 @@ void CChunkedVolumeViewer::updateStatusLabel()
             sharedCacheItems << QString("⚠ low disk: %1 free")
                 .arg(formatByteSize(stats.persistentCacheFreeBytes));
         }
+        if (!stats.persistentCacheWarning.empty()) {
+            sharedCacheItems << QStringLiteral("⚠ disk cache disabled: ") +
+                QString::fromStdString(stats.persistentCacheWarning);
+        }
         const QString network = vc3d::formatNetworkDownloadStats(
             stats, _volume && _volume->isRemote());
         if (!network.isEmpty())

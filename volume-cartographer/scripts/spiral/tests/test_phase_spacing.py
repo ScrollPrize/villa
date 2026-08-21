@@ -543,11 +543,14 @@ class TestModeContract:
         })
         fields = {error['field']
                   for error in validate_session_request(paths, run)}
-        assert 'winding_inference' in fields
+        assert {'winding_inference', 'outer_shell'} <= fields
 
         store = tmp_path / 'winding_inference'
         store.mkdir()
-        paths = replace(paths, winding_inference=str(store))
+        shell = tmp_path / 'outer_shell'
+        shell.mkdir()
+        paths = replace(
+            paths, winding_inference=str(store), outer_shell=str(shell))
         messages = {error['field']: error['message']
                     for error in validate_session_request(paths, run)}
         assert messages['winding_inference'] == 'manifest.json is missing'
@@ -578,6 +581,20 @@ class TestModeContract:
         fields = {error['field'] for error in validate_session_request(paths, run)}
         assert {'normal_x', 'normal_y', 'surf_sdt'} <= fields
 
+    @pytest.mark.parametrize('disabled', [
+        'input_use_normals', 'input_use_surf_sdt',
+    ])
+    def test_a_disabled_phase_prerequisite_cascades_the_bundle_off(
+        self, tmp_path, disabled,
+    ):
+        paths, run = self.base_request(tmp_path, {
+            disabled: False,
+            'loss_weight_dense_spacing': 12.0,
+        })
+        paths = replace(paths, surf_sdt=str(tmp_path / 'missing-sdt.zarr'))
+        fields = {error['field'] for error in validate_session_request(paths, run)}
+        assert not {'normal_x', 'normal_y', 'surf_sdt'} & fields
+
     def test_grad_mag_mode_requires_grad_mag_not_sdt(self, tmp_path):
         paths, run = self.base_request(tmp_path, {
             'dense_spacing_mode': 'grad_mag',
@@ -595,6 +612,24 @@ class TestModeContract:
         })
         fields = {error['field'] for error in validate_session_request(paths, run)}
         assert 'gradient_magnitude' not in fields
+
+    def test_disabled_grad_mag_source_is_not_required(self, tmp_path):
+        paths, run = self.base_request(tmp_path, {
+            'dense_spacing_mode': 'grad_mag',
+            'loss_weight_dense_spacing': 12.0,
+            'input_use_gradient_magnitude': False,
+        })
+        fields = {error['field'] for error in validate_session_request(paths, run)}
+        assert 'gradient_magnitude' not in fields
+
+    def test_disabled_outer_shell_cascades_winding_inference_off(self, tmp_path):
+        paths, run = self.base_request(tmp_path, {
+            'dense_spacing_mode': 'winding_model',
+            'input_use_outer_shell': False,
+        })
+        fields = {error['field'] for error in validate_session_request(paths, run)}
+        assert 'outer_shell' not in fields
+        assert 'winding_inference' not in fields
 
     def test_invalid_mode_is_rejected_before_asset_errors(self, tmp_path):
         paths, run = self.base_request(tmp_path, {

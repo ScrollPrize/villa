@@ -31,8 +31,9 @@ from dinovol_2.eval.task_eval import TaskEvalRunner
 from dinovol_2.ops.collate import build_dino_ibot_collate_fn
 from dinovol_2.ops.distributed_utils import build_distributed_sampler, resolve_distributed_config
 from dinovol_2.ops.weighted_loader import WeightedCombinedLoader
-from dinovol_2.loss import DINOLoss, GramLoss, KoLeoLoss, iBOTPatchLoss
+from dinovol_2.loss import DINOLoss, GramLoss, KoLeoLoss, PointCosineLoss, PointLossResult, iBOTPatchLoss
 from dinovol_2.model.model import DinoVitStudentTeacher, _materialize_backbone_config, _upgrade_weight_norm_state_dict_keys
+from dinovol_2.ops.point_embeddings import gather_variable_points, sample_normalized_patch_embeddings
 
 
 def _as_float_pair(value: Any, default: tuple[float, float]) -> tuple[float, float]:
@@ -221,6 +222,25 @@ class DinoIBOTPretrainer:
         self.ibot_loss_weight = float(self.config.get("ibot_loss_weight", 1.0))
         self.koleo_loss_weight = float(self.config.get("koleo_loss_weight", 0.1))
         self.gram_loss_weight = float(self.gram_config.get("loss_weight", 2.0))
+        self.point_config = {
+            "enabled": True,
+            "sampling_probability": 0.1,
+            "loss_weight": 0.05,
+            "different_type_margin": 0.0,
+            "max_points_per_view": 64,
+        }
+        self.point_config.update(dict(self.config.get("point_supervision") or {}))
+        self.config["point_supervision"] = dict(self.point_config)
+        configured_train_dataset = self.config.get("dataset") or {}
+        train_datasets = list(configured_train_dataset.get("datasets", []))
+        for variant in configured_train_dataset.get("variants", []) or []:
+            train_datasets.extend(dict(variant).get("datasets", []))
+        has_point_collections = any(dataset.get("point_collections") for dataset in train_datasets)
+        self.do_point_supervision = bool(self.point_config["enabled"]) and has_point_collections
+        self.point_loss_weight = float(self.point_config["loss_weight"])
+        self.point_loss = PointCosineLoss(
+            different_type_margin=float(self.point_config["different_type_margin"])
+        ).to(self.device)
         self.do_dino = self.dino_loss_weight > 0.0
         self.do_ibot = self.ibot_loss_weight > 0.0
         self.do_koleo = self.koleo_loss_weight > 0.0 and self.do_dino
@@ -524,7 +544,12 @@ class DinoIBOTPretrainer:
 
         return kwargs
 
-    def _prepare_dataset_config(self, dataset_config: Mapping[str, Any]) -> dict[str, Any]:
+    def _prepare_dataset_config(
+        self,
+        dataset_config: Mapping[str, Any],
+        *,
+        enable_point_supervision: bool = False,
+    ) -> dict[str, Any]:
         resolved_config = dict(dataset_config)
         resolved_config.setdefault(
             "epoch_length",
@@ -536,12 +561,21 @@ class DinoIBOTPretrainer:
                 resolved_config.get("global_crop_size", resolved_config.get("crop_size")),
             )
             resolved_config.setdefault("gram_teacher_no_augmentations", True)
+        if enable_point_supervision and self.do_point_supervision:
+            resolved_config["point_supervision"] = dict(self.point_config)
+        else:
+            resolved_config.pop("point_supervision", None)
         deeper_overrides = self._deeper_embed_dataset_overrides(resolved_config)
         if deeper_overrides:
             resolved_config.update(deeper_overrides)
         return resolved_config
 
-    def _resolved_dataset_configs(self, key: str) -> list[dict[str, Any]] | None:
+    def _resolved_dataset_configs(
+        self,
+        key: str,
+        *,
+        enable_point_supervision: bool = False,
+    ) -> list[dict[str, Any]] | None:
         dataset_config = self.config.get(key)
         if dataset_config is None:
             return None
@@ -549,14 +583,20 @@ class DinoIBOTPretrainer:
         base_config = dict(dataset_config)
         variants = base_config.pop("variants", None)
         if not variants:
-            return [self._prepare_dataset_config(base_config)]
+            return [self._prepare_dataset_config(
+                base_config,
+                enable_point_supervision=enable_point_supervision,
+            )]
 
         resolved_configs: list[dict[str, Any]] = []
         for variant in variants:
             variant_overrides = {name: value for name, value in dict(variant).items() if name != "ratio"}
             merged_config = dict(base_config)
             merged_config.update(variant_overrides)
-            resolved_configs.append(self._prepare_dataset_config(merged_config))
+            resolved_configs.append(self._prepare_dataset_config(
+                merged_config,
+                enable_point_supervision=enable_point_supervision,
+            ))
         return resolved_configs
 
     def _dataset_variant_weights(self, key: str) -> tuple[float, ...] | None:
@@ -569,7 +609,7 @@ class DinoIBOTPretrainer:
         return tuple(float(dict(variant).get("ratio", 1.0)) for variant in variants)
 
     def _dataset_config(self, key: str) -> Mapping[str, Any] | None:
-        resolved_configs = self._resolved_dataset_configs(key)
+        resolved_configs = self._resolved_dataset_configs(key, enable_point_supervision=False)
         if resolved_configs is None:
             return None
         return dict(resolved_configs[0])
@@ -684,7 +724,7 @@ class DinoIBOTPretrainer:
         )
 
     def build_dataloader(self) -> DataLoader | WeightedCombinedLoader:
-        dataset_configs = self._resolved_dataset_configs("dataset")
+        dataset_configs = self._resolved_dataset_configs("dataset", enable_point_supervision=True)
         if dataset_configs is None:
             raise ValueError("dataset configuration is required")
         return self._build_loader_from_configs(
@@ -694,10 +734,10 @@ class DinoIBOTPretrainer:
         )
 
     def build_val_dataloader(self) -> DataLoader | WeightedCombinedLoader | None:
-        val_dataset_configs = self._resolved_dataset_configs("val_dataset")
+        val_dataset_configs = self._resolved_dataset_configs("val_dataset", enable_point_supervision=False)
         val_weights = self._dataset_variant_weights("val_dataset")
         if val_dataset_configs is None:
-            train_dataset_configs = self._resolved_dataset_configs("dataset")
+            train_dataset_configs = self._resolved_dataset_configs("dataset", enable_point_supervision=False)
             if train_dataset_configs is None or len(train_dataset_configs) <= 1:
                 return None
             val_dataset_configs = [dict(train_dataset_configs[0])]
@@ -1021,6 +1061,41 @@ class DinoIBOTPretrainer:
         )
         return gram_loss, gram_teacher_patch_tokens, resized_teacher_patch_tokens
 
+    def _compute_point_loss(
+        self,
+        *,
+        student_patch_tokens: torch.Tensor,
+        batch: Mapping[str, Any],
+        global_crops: torch.Tensor,
+    ) -> tuple[PointLossResult, torch.Tensor]:
+        zero = global_crops.new_zeros(())
+        coordinates = batch.get("collated_point_coordinates")
+        type_ids = batch.get("collated_point_type_ids")
+        row_indices = batch.get("collated_point_rows")
+        if not self.do_point_supervision or coordinates is None or type_ids is None or row_indices is None:
+            return PointLossResult(zero, zero, zero, 0, 0, 0), student_patch_tokens.new_empty(
+                (0, student_patch_tokens.shape[-1])
+            )
+
+        coordinates = coordinates.to(self.device, non_blocking=True)
+        type_ids = type_ids.to(self.device, non_blocking=True)
+        row_indices = row_indices.to(self.device, non_blocking=True)
+        backbone = self.model_module.student.backbone
+        feature_map_shape = self._feature_map_shape(
+            backbone,
+            tuple(int(dim) for dim in global_crops.shape[2:]),
+            view_kind="global",
+        )
+        embeddings = sample_normalized_patch_embeddings(
+            student_patch_tokens,
+            row_indices,
+            coordinates,
+            tuple(int(value) for value in backbone.patch_size),
+            feature_map_shape,
+        )
+        embeddings, type_ids = gather_variable_points(embeddings, type_ids)
+        return self.point_loss(embeddings, type_ids), embeddings
+
     @staticmethod
     def _tensor_stats(tensor: torch.Tensor) -> dict[str, Any]:
         stats: dict[str, Any] = {
@@ -1170,12 +1245,18 @@ class DinoIBOTPretrainer:
                 global_crops=global_crops,
                 gram_teacher_crops=gram_teacher_crops,
             )
+            point_result, point_embeddings = self._compute_point_loss(
+                student_patch_tokens=student_global["patch_tokens"],
+                batch=batch,
+                global_crops=global_crops,
+            )
 
             loss = (
                 self.dino_loss_weight * (dino_global_loss + dino_local_loss) +
                 self.ibot_loss_weight * ibot_loss +
                 self.koleo_loss_weight * koleo_loss +
-                self.gram_loss_weight * gram_loss
+                self.gram_loss_weight * gram_loss +
+                self.point_loss_weight * point_result.loss
             )
 
         backbone = self.model_module.student.backbone
@@ -1211,6 +1292,7 @@ class DinoIBOTPretrainer:
             "student_patch_count_matches_masked_count": student_patch.shape[0] == n_masked,
             "global_cls_chunks_match_batch": global_cls_0.shape[0] == batch_size and global_cls_1.shape[0] == batch_size,
             "loss_is_finite": bool(torch.isfinite(loss).item()),
+            "point_loss_is_finite": bool(torch.isfinite(point_result.loss).item()),
         }
         if global_feature_map_shape is not None:
             checks["global_patch_grid_matches_resolved_shape"] = student_global["patch_tokens"].shape[1] == int(np.prod(global_feature_map_shape))
@@ -1276,6 +1358,15 @@ class DinoIBOTPretrainer:
                 "masks": self._tensor_stats(masks),
                 "mask_indices": self._tensor_stats(mask_indices),
                 "masks_weight": self._tensor_stats(masks_weight),
+                "point_coordinates": self._tensor_stats(
+                    batch.get("collated_point_coordinates", torch.empty((0, 3)))
+                ),
+                "point_type_ids": self._tensor_stats(
+                    batch.get("collated_point_type_ids", torch.empty((0,), dtype=torch.long))
+                ),
+                "point_rows": self._tensor_stats(
+                    batch.get("collated_point_rows", torch.empty((0,), dtype=torch.long))
+                ),
             },
             "teacher": {
                 "cls_tokens": self._tensor_stats(teacher_outputs["cls_tokens"]) if teacher_outputs is not None else None,
@@ -1299,6 +1390,14 @@ class DinoIBOTPretrainer:
                 "raw_teacher_patch_tokens": self._tensor_stats(gram_teacher_patch_tokens) if gram_teacher_patch_tokens is not None else None,
                 "resized_teacher_patch_tokens": self._tensor_stats(resized_gram_teacher_patch_tokens) if resized_gram_teacher_patch_tokens is not None else None,
             },
+            "point_supervision": {
+                "enabled": self.do_point_supervision,
+                "loss_weight": float(self.point_loss_weight),
+                "embeddings": self._tensor_stats(point_embeddings),
+                "point_count": point_result.point_count,
+                "same_pair_count": point_result.same_pair_count,
+                "different_pair_count": point_result.different_pair_count,
+            },
             "losses": {
                 "total": float(loss.detach().item()),
                 "dino_global": float(dino_global_loss.detach().item()),
@@ -1306,6 +1405,9 @@ class DinoIBOTPretrainer:
                 "ibot": float(ibot_loss.detach().item()),
                 "koleo": float(koleo_loss.detach().item()),
                 "gram": float(gram_loss.detach().item()),
+                "point": float(point_result.loss.detach().item()),
+                "point_same_type": float(point_result.same_type.detach().item()),
+                "point_different_type": float(point_result.different_type.detach().item()),
                 "term_count": total_terms,
             },
             "checks": checks,
@@ -1481,12 +1583,18 @@ class DinoIBOTPretrainer:
                 global_crops=global_crops,
                 gram_teacher_crops=gram_teacher_crops,
             )
+            point_result, _ = self._compute_point_loss(
+                student_patch_tokens=student_global["patch_tokens"],
+                batch=batch,
+                global_crops=global_crops,
+            )
 
             loss = (
                 self.dino_loss_weight * (dino_global_loss + dino_local_loss) +
                 self.ibot_loss_weight * ibot_loss +
                 self.koleo_loss_weight * koleo_loss +
-                self.gram_loss_weight * gram_loss
+                self.gram_loss_weight * gram_loss +
+                self.point_loss_weight * point_result.loss
             )
 
         self.scaler.scale(loss).backward()
@@ -1505,6 +1613,13 @@ class DinoIBOTPretrainer:
             "koleo_loss": float(koleo_loss.detach()),
             "gram_loss": float(gram_loss.detach()),
             "gram_loss_weight": float(self.gram_loss_weight),
+            "point_loss": float(point_result.loss.detach()),
+            "point_same_type_loss": float(point_result.same_type.detach()),
+            "point_different_type_loss": float(point_result.different_type.detach()),
+            "point_loss_weight": float(self.point_loss_weight),
+            "point_count": float(point_result.point_count),
+            "point_same_pair_count": float(point_result.same_pair_count),
+            "point_different_pair_count": float(point_result.different_pair_count),
             "lr": lr,
             "weight_decay": weight_decay,
             "teacher_temp": teacher_temp,
@@ -1690,7 +1805,8 @@ class DinoIBOTPretrainer:
             f"step={step} monitor_image={image_path.name} "
             f"loss={metrics['loss']:.4f} glob={metrics['dino_global_loss']:.4f} "
             f"loc={metrics['dino_local_loss']:.4f} ibot={metrics['ibot_loss']:.4f} "
-            f"koleo={metrics['koleo_loss']:.4f} gram={metrics['gram_loss']:.4f}"
+            f"koleo={metrics['koleo_loss']:.4f} gram={metrics['gram_loss']:.4f} "
+            f"point={metrics.get('point_loss', 0.0):.4f}"
         )
         return image_path
 
@@ -1774,12 +1890,18 @@ class DinoIBOTPretrainer:
                 global_crops=global_crops,
                 gram_teacher_crops=gram_teacher_crops,
             )
+            point_result, _ = self._compute_point_loss(
+                student_patch_tokens=student_global["patch_tokens"],
+                batch=batch,
+                global_crops=global_crops,
+            )
 
             loss = (
                 self.dino_loss_weight * (dino_global_loss + dino_local_loss) +
                 self.ibot_loss_weight * ibot_loss +
                 self.koleo_loss_weight * koleo_loss +
-                self.gram_loss_weight * gram_loss
+                self.gram_loss_weight * gram_loss +
+                self.point_loss_weight * point_result.loss
             )
 
         return {
@@ -1790,6 +1912,13 @@ class DinoIBOTPretrainer:
             "koleo_loss": float(koleo_loss.detach()),
             "gram_loss": float(gram_loss.detach()),
             "gram_loss_weight": float(self.gram_loss_weight),
+            "point_loss": float(point_result.loss.detach()),
+            "point_same_type_loss": float(point_result.same_type.detach()),
+            "point_different_type_loss": float(point_result.different_type.detach()),
+            "point_loss_weight": float(self.point_loss_weight),
+            "point_count": float(point_result.point_count),
+            "point_same_pair_count": float(point_result.same_pair_count),
+            "point_different_pair_count": float(point_result.different_pair_count),
             "teacher_temp": teacher_temp,
         }
 
@@ -1867,6 +1996,7 @@ class DinoIBOTPretrainer:
                         ibot_loss=f"{metrics['ibot_loss']:.4f}",
                         koleo_loss=f"{metrics['koleo_loss']:.4f}",
                         gram_loss=f"{metrics['gram_loss']:.4f}",
+                        point_loss=f"{metrics['point_loss']:.4f}",
                     )
                     progress.update(1)
                 if self.is_main_process:
@@ -1875,7 +2005,12 @@ class DinoIBOTPretrainer:
                 if self.is_main_process and step % self.log_every == 0:
                     print(
                         f"step={step} loss={metrics['loss']:.4f} lr={metrics['lr']:.2e} "
-                        f"gram={metrics['gram_loss']:.4f}"
+                        f"gram={metrics['gram_loss']:.4f} point={metrics['point_loss']:.4f} "
+                        f"point_same={metrics['point_same_type_loss']:.4f} "
+                        f"point_diff={metrics['point_different_type_loss']:.4f} "
+                        f"points={metrics['point_count']:.0f} "
+                        f"same_pairs={metrics['point_same_pair_count']:.0f} "
+                        f"diff_pairs={metrics['point_different_pair_count']:.0f}"
                     )
                 if self.val_every_n and step > 0 and step % self.val_every_n == 0:
                     if val_dataloader_iter is None:

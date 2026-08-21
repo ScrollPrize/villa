@@ -33,6 +33,10 @@ struct ChunkWorkPriority {
     // Maintenance shares this scheduler and its workers, but is selected only
     // after both interactive and ordinary background queues are empty.
     bool maintenance = false;
+    // Bulk maintenance such as cache prefill may leave scheduler capacity for
+    // foreground work. Correctness-critical maintenance such as Refresh does
+    // not set this flag and may use the scheduler's full admission limit.
+    bool reserveForegroundSlot = false;
     bool activeView = false;
     // Interactive work uses view-relative level offsets; larger is coarser.
     // ChunkCache adds 100 for a source's terminal pyramid level.
@@ -123,7 +127,8 @@ public:
                                    std::size_t interactiveBurst = 7,
                                    std::shared_ptr<ChunkRequestSelectionGate> selectionGate = {},
                                    std::optional<AdaptiveConcurrency> adaptiveConcurrency = {},
-                                   std::optional<AdaptiveState> initialAdaptiveState = {});
+                                   std::optional<AdaptiveState> initialAdaptiveState = {},
+                                   std::size_t maintenanceReservedSlots = 0);
     ~ChunkRequestScheduler();
 
     ChunkRequestScheduler(const ChunkRequestScheduler&) = delete;

@@ -15,6 +15,7 @@ from typing import Any, Mapping
 import torch
 
 from .masking import MaskingGenerator3d
+from .point_embeddings import interpolation_support_indices
 
 
 def _as_3tuple(value: int | tuple[int, int, int]) -> tuple[int, int, int]:
@@ -30,6 +31,8 @@ def collate_dino_ibot_batch(
     mask_sample_probability: float,
     n_tokens: int,
     mask_generator: MaskingGenerator3d,
+    patch_size: tuple[int, int, int],
+    feature_map_size: tuple[int, int, int],
     dtype: torch.dtype = torch.float32,
 ) -> dict[str, Any]:
     n_global_views = len(samples[0]["global_views"])
@@ -72,6 +75,42 @@ def collate_dino_ibot_batch(
     random.shuffle(masks_list)
 
     collated_masks = torch.stack(masks_list).flatten(1)
+    point_coordinates_parts: list[torch.Tensor] = []
+    point_type_parts: list[torch.Tensor] = []
+    point_row_parts: list[torch.Tensor] = []
+    for view_index in range(n_global_views):
+        for sample_index, sample in enumerate(samples):
+            coordinates_by_view = sample.get("global_point_coordinates")
+            types_by_view = sample.get("global_point_type_ids")
+            if coordinates_by_view is None:
+                coordinates = torch.empty((0, 3), dtype=torch.float32)
+                type_ids = torch.empty((0,), dtype=torch.long)
+            else:
+                coordinates = torch.as_tensor(coordinates_by_view[view_index], dtype=torch.float32)
+                type_ids = torch.as_tensor(types_by_view[view_index], dtype=torch.long)
+            if coordinates.ndim != 2 or coordinates.shape[1:] != (3,) or type_ids.shape != (coordinates.shape[0],):
+                raise ValueError("Each global view must provide matching Nx3 point coordinates and N type IDs.")
+            if coordinates.shape[0]:
+                row_index = view_index * len(samples) + sample_index
+                point_coordinates_parts.append(coordinates)
+                point_type_parts.append(type_ids)
+                point_row_parts.append(torch.full((coordinates.shape[0],), row_index, dtype=torch.long))
+
+    if point_coordinates_parts:
+        collated_point_coordinates = torch.cat(point_coordinates_parts)
+        collated_point_type_ids = torch.cat(point_type_parts)
+        collated_point_rows = torch.cat(point_row_parts)
+        support = interpolation_support_indices(
+            collated_point_coordinates,
+            patch_size,
+            feature_map_size,
+        )
+        collated_masks[collated_point_rows[:, None], support] = False
+    else:
+        collated_point_coordinates = torch.empty((0, 3), dtype=torch.float32)
+        collated_point_type_ids = torch.empty((0,), dtype=torch.long)
+        collated_point_rows = torch.empty((0,), dtype=torch.long)
+
     mask_indices_list = collated_masks.flatten().nonzero().flatten()
     tokens_per_sample = collated_masks.shape[1]
     inverse_mask_counts = 1.0 / collated_masks.sum(-1).clamp(min=1.0)
@@ -89,6 +128,9 @@ def collate_dino_ibot_batch(
         "n_global_views": n_global_views,
         "n_local_views": n_local_views,
         "batch_size": len(samples),
+        "collated_point_coordinates": collated_point_coordinates,
+        "collated_point_type_ids": collated_point_type_ids,
+        "collated_point_rows": collated_point_rows,
     }
     if collated_gram_teacher_crops is not None:
         batch["collated_gram_teacher_crops"] = collated_gram_teacher_crops
@@ -107,5 +149,7 @@ def build_dino_ibot_collate_fn(config: Mapping[str, Any]) -> partial:
         mask_sample_probability=float(config.get("mask_sample_probability", 0.5)),
         n_tokens=n_tokens,
         mask_generator=mask_generator,
+        patch_size=patch_size,
+        feature_map_size=feature_map_size,
         dtype=config.get("dtype", torch.float32),
     )
