@@ -35,7 +35,8 @@ def test_migrate_legacy_config_to_exact_current_schema():
     assert migrated["winding_model_relative_pair_delta"] == [2, 9]
     assert migrated["winding_model_huber_delta"] == 0.75
     assert migrated["dense_spacing_mode"] == "winding_model"
-    assert "use_tracks" in removed
+    assert migrated["input_use_tracks"] is True
+    assert "use_tracks -> input_use_tracks" in renamed
     assert "track_walk_require_loop_consistency" in removed
     assert "patch_strip_sampling" in removed
     assert "patch_2d_sampling_max_area" in removed

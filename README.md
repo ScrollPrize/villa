@@ -16,7 +16,7 @@ A Python library for accessing CT scans of ancient scrolls, and for training and
 
 ---
 
-## Dataset & Rendering Tools
+## Machine Learning, Dataset & Rendering Tools
 
 ### [foundation](foundation/)
 Tools to build/manage scroll datasets and cloud infrastructure, including photogrammetry masking.
@@ -24,6 +24,9 @@ Tools to build/manage scroll datasets and cloud infrastructure, including photog
 ### [ink-detection](ink-detection/)
 Training and inference tools for Vesuvius Challenge ink detection models, built on the model that won the 2023 Grand Prize.  
 Originally developed by [Youssef Nader](https://github.com/younader) and [Luke Farritor](https://github.com/lukeboi), extended by the Vesuvius Challenge team.
+
+### [dinovol](dinovol/)
+A self-supervised 3D DINO implementation for learning volumetric representations from scroll CT scans.
 
 ---
 

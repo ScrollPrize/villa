@@ -97,6 +97,13 @@ LEGACY_RENAMES = {
         "sample_count_influence_anchor_samples_per_step",
     "erode_patches": "patch_erode_patches",
     "disable_patches": "input_disable_patches",
+    "use_verified_patches": "input_use_verified_patches",
+    "use_unverified_patches": "input_use_unverified_patches",
+    "use_normals": "input_use_normals",
+    "use_surf_sdt": "input_use_surf_sdt",
+    "use_tracks": "input_use_tracks",
+    "use_gradient_magnitude": "input_use_gradient_magnitude",
+    "use_fibers": "input_use_fibers",
     "unverified_patch_radius_loss_margin":
         "patch_unverified_patch_radius_loss_margin",
     "unverified_patch_radius_loss_inv":
@@ -141,18 +148,11 @@ LEGACY_RENAMES = {
         "influence_anchor_ramp_power",
 }
 
-# These settings moved out of the durable config or were replaced by current
-# track-walk controls.  VC3D now derives input enablement from selected paths.
+# These sampling settings moved out of the durable config, and the track-walk
+# setting was replaced by current controls.
 LEGACY_REMOVED = {
     "patch_strip_sampling",
     "patch_2d_sampling_max_area",
-    "use_verified_patches",
-    "use_unverified_patches",
-    "use_normals",
-    "use_surf_sdt",
-    "use_tracks",
-    "use_gradient_magnitude",
-    "use_fibers",
     "track_walk_require_loop_consistency",
 }
 

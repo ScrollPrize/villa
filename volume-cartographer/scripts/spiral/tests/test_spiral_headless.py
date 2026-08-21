@@ -65,12 +65,16 @@ class ScrollSpecTests(unittest.TestCase):
             with self.assertRaisesRegex(ScrollSpecError, "schema_version"):
                 load_scroll_spec(temporary)
 
-    def test_unknown_keys_are_rejected_by_name(self):
+    def test_unknown_top_level_keys_are_ignored(self):
         with tempfile.TemporaryDirectory() as temporary:
-            write_scroll_spec(temporary, render_volume_scale=16)
-            with self.assertRaisesRegex(
-                    ScrollSpecError, r"unknown keys: \['render_volume_scale'\]"):
-                load_scroll_spec(temporary)
+            write_scroll_spec(
+                temporary,
+                base_shape_zyx=[18946, 8174, 8174],
+                future_extension={"enabled": True})
+            spec = load_scroll_spec(temporary)
+            self.assertEqual(spec.name, "s1")
+            self.assertNotIn("base_shape_zyx", spec.manifest())
+            self.assertNotIn("future_extension", spec.manifest())
 
     def test_unknown_path_override_keys_are_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:

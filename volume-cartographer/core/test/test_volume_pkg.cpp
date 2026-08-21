@@ -478,6 +478,67 @@ TEST_CASE("VolumePkg: selectedLasagnaDatasetPath resolves relative to project fi
     fs::remove_all(d);
 }
 
+TEST_CASE("VolumePkg: missing umbilicus loads as empty")
+{
+    auto d = tmpDir("umbilicus_missing");
+    auto jsonPath = d / "project.json";
+    {
+        auto p = VolumePkg::newEmpty();
+        p->save(jsonPath);
+    }
+
+    auto loaded = VolumePkg::load(jsonPath);
+    REQUIRE(loaded);
+    CHECK(loaded->umbilicus().empty());
+    CHECK(loaded->umbilicusPath().empty());
+    fs::remove_all(d);
+}
+
+TEST_CASE("VolumePkg: umbilicus round-trips through save/load")
+{
+    auto d = tmpDir("umbilicus_roundtrip");
+    auto jsonPath = d / "project.json";
+    const std::string location = (d / "umbilicus.json").string();
+    {
+        auto p = VolumePkg::newEmpty();
+        p->setUmbilicus(location);
+        CHECK(p->umbilicus() == location);
+        p->save(jsonPath);
+    }
+
+    auto loaded = VolumePkg::load(jsonPath);
+    REQUIRE(loaded);
+    CHECK(loaded->umbilicus() == location);
+    CHECK(loaded->umbilicusPath() == fs::path(location));
+
+    // An empty location clears the field, and the cleared state persists.
+    loaded->setUmbilicus("");
+    CHECK(loaded->umbilicus().empty());
+    CHECK(loaded->umbilicusPath().empty());
+    loaded->save(jsonPath);
+    auto reloaded = VolumePkg::load(jsonPath);
+    REQUIRE(reloaded);
+    CHECK(reloaded->umbilicus().empty());
+    fs::remove_all(d);
+}
+
+TEST_CASE("VolumePkg: umbilicusPath resolves relative to project file")
+{
+    auto d = tmpDir("umbilicus_relative");
+    auto jsonPath = d / "project.json";
+    {
+        auto p = VolumePkg::newEmpty();
+        p->save(jsonPath);
+        p->setUmbilicus("annotations/umbilicus.json");
+    }
+
+    auto loaded = VolumePkg::load(jsonPath);
+    REQUIRE(loaded);
+    CHECK(loaded->umbilicus() == "annotations/umbilicus.json");
+    CHECK(loaded->umbilicusPath() == d / "annotations" / "umbilicus.json");
+    fs::remove_all(d);
+}
+
 TEST_CASE("VolumePkg::New is an alias for load")
 {
     auto d = tmpDir("new_alias");
