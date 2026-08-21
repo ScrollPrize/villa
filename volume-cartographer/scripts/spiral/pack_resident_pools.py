@@ -63,13 +63,20 @@ def _read_zarray_meta(array_dir: Path) -> dict:
 
 
 def _register_codec(compressor: dict | None) -> None:
-    if compressor is not None and compressor.get('id') == 'vcz1':
-        try:
-            import vc_delta3d  # noqa: F401 registers vcz1
-        except ImportError as exc:
-            raise RuntimeError(
-                'the CT store uses the vcz1 codec; install the '
-                'volume-cartographer python bindings (vc.compression)') from exc
+    codec_id = compressor.get('id') if compressor is not None else None
+    try:
+        if codec_id == 'vc-delta3d':
+            import vc_delta3d  # noqa: F401 registers vc-delta3d
+        elif codec_id == 'vcz1':
+            import vc.compression.vcz1_numcodecs  # noqa: F401 registers vcz1
+    except ImportError as exc:
+        dependency = (
+            'the vc-delta3d package' if codec_id == 'vc-delta3d' else
+            'the volume-cartographer Python bindings (vc.compression)'
+        )
+        raise RuntimeError(
+            f'the CT store uses the {codec_id} codec; install {dependency}'
+        ) from exc
 
 
 def _list_chunk_keys(array_dir: Path, separator: str) -> set[tuple[int, int, int]]:
