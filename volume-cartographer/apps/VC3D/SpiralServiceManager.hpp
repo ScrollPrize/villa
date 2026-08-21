@@ -39,7 +39,7 @@ public:
 
     // The one service API version this build speaks; the handshake refuses
     // anything else. Reported to the user so a mismatch is self-explanatory.
-    static constexpr int kApiVersion = 29;
+    static constexpr int kApiVersion = 30;
 
     explicit SpiralServiceManager(QObject* parent = nullptr);
     ~SpiralServiceManager() override;
@@ -60,16 +60,17 @@ public:
     const SpiralServiceProfile& profile() const { return _profile; }
     bool ownsProcess() const;
 
-    // Rebuild the always-loaded session: the service holds one from
-    // startup, so this replaces it rather than creating it. It is also the
-    // only verb that may change the model domain or structural config.
+    // Create the first resident session. The service exposes dataset and
+    // checkpoint discovery before this without importing the fit runtime.
+    void initializeSession(QJsonObject request);
+    // Replace an initialized session. This is also the only later verb that
+    // may change the model domain or structural configuration.
     void rebuildSession(QJsonObject request);
     // Rebuild from the service's own launch defaults, ignoring any autosave.
     // This is how a service stuck in Error recovers.
     void rebuildWithDefaults();
     void runIterations(int iterations, const QJsonObject& influenceConfig,
-                       const QJsonObject& runConfig,
-                       const QJsonObject& inputs = {});
+                       const QJsonObject& runConfig);
     void stopAfterIteration();
     // Save on service: writes to a service-host path.
     void saveCheckpoint(const QString& name);
@@ -203,6 +204,8 @@ private:
     void continueUpload(const QString& uploadId, const QString& inputId,
                         const QString& baseDir, QStringList pendingFiles);
     void sendRebuildRequest(QJsonObject request);
+    void sendInitializeRequest(QJsonObject request);
+    void prepareSessionRequest(QJsonObject request, bool initialize);
     void sendLoadCheckpoint(QJsonObject body, const QString& hostPath,
                             const QString& localPath);
     // Streams a client-local resume checkpoint into the service's
