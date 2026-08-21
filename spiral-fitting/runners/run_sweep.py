@@ -143,6 +143,9 @@ def child_command(
         command.extend(["--seeds", ",".join(map(str, args.seeds))])
     if args.run_id is not None:
         command.extend(["--run-id", f"{args.run_id}_{stem}"])
+    wandb_group = getattr(args, "wandb_group", None)
+    if wandb_group is not None:
+        command.extend(["--wandb-group", wandb_group])
     if args.num_threads is not None:
         command.extend(["--num-threads", str(args.num_threads)])
     if args.no_wandb:

@@ -141,16 +141,32 @@ def test_fit_environment_can_disable_wandb(tmp_path, monkeypatch):
     assert env["WANDB_MODE"] == "disabled"
 
 
-def test_parser_accepts_config_and_no_wandb(tmp_path):
+def test_parser_accepts_config_and_wandb_options(tmp_path):
     args = run_single.build_parser().parse_args([
         "--dataset", str(tmp_path / "dataset"),
         "--ink-volume", str(tmp_path / "ink"),
         "--config", str(tmp_path / "config.json"),
+        "--wandb-group", "experiment-1",
         "--no-wandb",
     ])
 
     assert args.config == tmp_path / "config.json"
+    assert args.wandb_group == "experiment-1"
     assert args.no_wandb is True
+
+
+def test_fit_environment_sets_an_explicit_wandb_group(tmp_path, monkeypatch):
+    monkeypatch.delenv("WANDB_RUN_GROUP", raising=False)
+
+    ungrouped = run_single.fit_environment(
+        {}, tmp_path, None, wandb_project="project", wandb_entity="entity",
+        wandb_enabled=True)
+    grouped = run_single.fit_environment(
+        {}, tmp_path, None, wandb_project="project", wandb_entity="entity",
+        wandb_enabled=True, wandb_group="explicit-group")
+
+    assert "WANDB_RUN_GROUP" not in ungrouped
+    assert grouped["WANDB_RUN_GROUP"] == "explicit-group"
 
 
 @pytest.mark.parametrize(
@@ -350,7 +366,7 @@ def test_seeded_run_is_sequential_and_overrides_config_seed(tmp_path, monkeypatc
     config = _write_json(tmp_path / "config.json", {"optimizer_random_seed": 99})
     args = _runner_args(
         tmp_path, "--seeds", "3,1", "--run-id", "batch",
-        "--config", str(config), "--no-wandb")
+        "--config", str(config), "--wandb-group", "experiment", "--no-wandb")
     calls = []
     monkeypatch.setattr(run_single.subprocess, "run", _fake_pipeline_subprocess(calls))
 
@@ -370,8 +386,8 @@ def test_seeded_run_is_sequential_and_overrides_config_seed(tmp_path, monkeypatc
     ]
     assert [(env["WANDB_RUN_ID"], env["WANDB_NAME"], env["WANDB_RUN_GROUP"])
             for env in fit_envs] == [
-        ("batch_seed_3", "batch_seed_3", "batch"),
-        ("batch_seed_1", "batch_seed_1", "batch"),
+        ("batch_seed_3", "batch_seed_3", "experiment"),
+        ("batch_seed_1", "batch_seed_1", "experiment"),
     ]
     aggregate = json.loads(
         (tmp_path / "output" / "aggregate_metrics.json").read_text())
@@ -432,9 +448,12 @@ def test_no_wandb_suppresses_all_runner_uploads(tmp_path, monkeypatch):
     assert (tmp_path / "output" / "aggregate_metrics.json").exists()
 
 
-def test_generated_run_id_is_used_for_seed_runs(tmp_path, monkeypatch):
+def test_generated_run_id_does_not_implicitly_group_seed_runs(
+    tmp_path, monkeypatch
+):
     args = _runner_args(tmp_path, "--seeds", "5", "--no-wandb")
     calls = []
+    monkeypatch.delenv("WANDB_RUN_GROUP", raising=False)
     monkeypatch.setattr(run_single.subprocess, "run", _fake_pipeline_subprocess(calls))
     monkeypatch.setattr(run_single.uuid, "uuid4", lambda: SimpleNamespace(hex="abc12345more"))
 
@@ -442,7 +461,7 @@ def test_generated_run_id_is_used_for_seed_runs(tmp_path, monkeypatch):
 
     fit_env = calls[0][1]
     assert fit_env["WANDB_RUN_ID"] == "abc12345_seed_5"
-    assert fit_env["WANDB_RUN_GROUP"] == "abc12345"
+    assert "WANDB_RUN_GROUP" not in fit_env
 
 
 def test_aggregate_metrics_aligns_steps_and_excludes_non_numeric_values():
