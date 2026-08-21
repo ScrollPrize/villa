@@ -4707,6 +4707,26 @@ def main(config, *, scroll, paths, progress=None, resume_path=None,
     ).run()
 
 
+def _wandb_init_kwargs(config, mode, environment):
+    """Build CLI W&B settings, including an explicitly requested group."""
+    kwargs = {
+        'project': environment.get('WANDB_PROJECT', 'scrolls'),
+        'entity': environment.get('WANDB_ENTITY'),
+        'config': config,
+        'mode': mode,
+    }
+    if environment.get('FIT_SPIRAL_BATCH_RUN') == '1':
+        kwargs.update({
+            'id': environment['WANDB_RUN_ID'],
+            'name': environment['WANDB_NAME'],
+            'resume': 'never',
+        })
+        group = environment.get('WANDB_RUN_GROUP')
+        if group is not None:
+            kwargs['group'] = group
+    return kwargs
+
+
 if __name__ == '__main__':
     import argparse
 
@@ -4781,19 +4801,8 @@ if __name__ == '__main__':
         wandb_mode = os.environ.get('WANDB_MODE', 'disabled')
         if not dist_context.is_main_process:
             wandb_mode = 'disabled'
-        wandb_init_kwargs = {
-            'project': os.environ.get('WANDB_PROJECT', 'scrolls'),
-            'entity': os.environ.get('WANDB_ENTITY'),
-            'config': config,
-            'mode': wandb_mode,
-        }
-        if os.environ.get('FIT_SPIRAL_BATCH_RUN') == '1':
-            wandb_init_kwargs.update({
-                'id': os.environ['WANDB_RUN_ID'],
-                'name': os.environ['WANDB_NAME'],
-                'group': os.environ['WANDB_RUN_GROUP'],
-                'resume': 'never',
-            })
+        wandb_init_kwargs = _wandb_init_kwargs(
+            config, wandb_mode, os.environ)
         wandb.init(**wandb_init_kwargs)
         # The CLI boundary is where the FIT_SPIRAL_* fit controls are parsed;
         # FitContext itself no longer reads them.

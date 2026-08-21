@@ -147,12 +147,53 @@ def test_parser_accepts_config_and_wandb_options(tmp_path):
         "--ink-volume", str(tmp_path / "ink"),
         "--config", str(tmp_path / "config.json"),
         "--wandb-group", "experiment-1",
+        "--overwrite",
         "--no-wandb",
     ])
 
     assert args.config == tmp_path / "config.json"
     assert args.wandb_group == "experiment-1"
+    assert args.overwrite is True
     assert args.no_wandb is True
+
+
+def test_overwrite_output_removes_only_the_selected_directory(tmp_path):
+    output = tmp_path / "output"
+    output.mkdir()
+    (output / "stale.txt").write_text("stale")
+    sibling = tmp_path / "keep.txt"
+    sibling.write_text("keep")
+
+    run_single.overwrite_output(output)
+
+    assert not output.exists()
+    assert sibling.read_text() == "keep"
+
+
+def test_overwrite_output_refuses_to_delete_a_directory_containing_an_input(
+    tmp_path,
+):
+    output = tmp_path / "output"
+    dataset = output / "dataset"
+    dataset.mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="containing an input"):
+        run_single.overwrite_output(output, protected_paths=(dataset,))
+
+    assert dataset.is_dir()
+
+
+def test_overwrite_and_resume_are_mutually_exclusive(tmp_path):
+    args = _runner_args(tmp_path, "--overwrite", "--resume")
+    output = tmp_path / "output"
+    output.mkdir()
+    marker = output / "keep.txt"
+    marker.write_text("keep")
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        run_single.run(args)
+
+    assert marker.read_text() == "keep"
 
 
 def test_fit_environment_sets_an_explicit_wandb_group(tmp_path, monkeypatch):

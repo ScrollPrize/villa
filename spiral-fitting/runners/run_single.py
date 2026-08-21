@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 from numbers import Real
 from statistics import fmean, pstdev
 import subprocess
@@ -106,6 +107,11 @@ def add_common_arguments(
         default=DEFAULT_OUTPUT,
         help=f"fit output root (default: {DEFAULT_OUTPUT})",
     )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="delete the existing output directory before starting",
+    )
     parser.add_argument("--ink-volume", required=True, type=Path)
     parser.add_argument(
         "--no-wandb",
@@ -201,6 +207,36 @@ def require_empty_output(output: Path) -> None:
             raise ValueError(f"output exists and is not a directory: {output}")
         if any(output.iterdir()):
             raise ValueError(f"output directory must be empty: {output}")
+
+
+def overwrite_output(output: Path, *, protected_paths: Sequence[Path] = ()) -> None:
+    """Delete an explicitly selected output directory after safety checks."""
+    if output.is_symlink():
+        raise ValueError(f"refusing to overwrite symlinked output directory: {output}")
+    output = output.resolve()
+    if not output.exists():
+        return
+    if not output.is_dir():
+        raise ValueError(f"output exists and is not a directory: {output}")
+
+    forbidden = {
+        Path(output.anchor),
+        Path.home().resolve(),
+        SPIRAL_DIR.resolve(),
+        SPIRAL_DIR.parent.resolve(),
+    }
+    if output in forbidden:
+        raise ValueError(f"refusing to overwrite unsafe output directory: {output}")
+
+    for path in protected_paths:
+        protected = path.resolve()
+        if protected == output or output in protected.parents:
+            raise ValueError(
+                f"refusing to overwrite output directory containing an input: "
+                f"{protected}")
+
+    print(f"Removing existing output directory: {output}", flush=True)
+    shutil.rmtree(output)
 
 
 def _native_thread_env(num_threads: int) -> dict[str, str]:
@@ -825,6 +861,14 @@ def run_resumable(
 def run(args: argparse.Namespace) -> None:
     output = args.output.resolve()
     overrides, wandb_project, wandb_entity = load_run_config(args.config)
+    overwrite = getattr(args, "overwrite", False)
+    if overwrite and getattr(args, "resume", False):
+        raise ValueError("--overwrite cannot be combined with --resume")
+    if overwrite:
+        protected_paths = [args.dataset, args.ink_volume, args.vc_render_bin]
+        if args.config is not None:
+            protected_paths.append(args.config)
+        overwrite_output(args.output, protected_paths=protected_paths)
     if getattr(args, "resume", False):
         run_resumable(args, overrides, wandb_project, wandb_entity)
         return
