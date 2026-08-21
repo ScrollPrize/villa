@@ -26,7 +26,8 @@ from fit_session import (AUTOSAVE_CHECKPOINT_NAME, ScrollSpec, SessionState,
                          SpiralInputPaths, SpiralPreviewConfig,
                          SpiralRunConfig, run_mutable_config,
                          write_autosave_metadata)
-from config import Config, FitConfig, durable_config
+from config import (BACKFILLABLE_CONFIG_DEFAULTS, Config, FitConfig,
+                    durable_config)
 from spiral_progress import NullProgressReporter, ProgressReporter
 
 
@@ -791,18 +792,19 @@ class InteractiveFitSession:
                 durable = dict(checkpoint_config['cfg'])
                 # Checkpoints store the durable subset of the schema
                 # (see config.durable_config), so key sets compare
-                # against that subset. z_begin/z_end joined the schema
-                # after many checkpoints were written: a stored cfg
-                # lacking exactly those keys is accepted with defaults
-                # from the session request; every other key-set
-                # mismatch stays a strict error.
+                # against that subset. A small explicit allowlist records
+                # fields whose historical default is unambiguous; every
+                # other key-set mismatch stays a strict error.
                 durable_schema = set(durable_config(config))
                 missing = durable_schema - set(durable)
-                if set(durable) - durable_schema or missing - {"z_begin", "z_end"}:
+                backfillable = set(BACKFILLABLE_CONFIG_DEFAULTS) | {
+                    "z_begin", "z_end"}
+                if set(durable) - durable_schema or missing - backfillable:
                     raise ValueError(
                         "Checkpoint configuration does not match the current schema")
                 if missing:
                     assumed = {
+                        **BACKFILLABLE_CONFIG_DEFAULTS,
                         "z_begin": int(self.run_config.z_begin),
                         "z_end": int(self.run_config.z_end),
                     }
@@ -810,7 +812,7 @@ class InteractiveFitSession:
                         {key: assumed[key] for key in missing})
                     warning = (
                         f"Checkpoint {self.paths.checkpoint} predates "
-                        "z_begin/z_end in the stored configuration; "
+                        "defaultable fields in the stored configuration; "
                         "assuming "
                         + ", ".join(f"{key}={assumed[key]}"
                                     for key in sorted(missing))
@@ -819,9 +821,10 @@ class InteractiveFitSession:
                     with self._condition:
                         self._warnings.append(warning)
                 durable = Config(durable).as_dict()
-                # The optimisation z window is owned by the session
-                # request; the checkpoint's stored range only documents
-                # what it trained with.
+                # Keep the durable configuration aligned with the canonical
+                # run window. The service restores a newly loaded checkpoint's
+                # range into this run block; later dock edits remain free to
+                # choose a narrower or otherwise compatible window.
                 durable["z_begin"] = int(self.run_config.z_begin)
                 durable["z_end"] = int(self.run_config.z_end)
                 config.update(durable)
@@ -833,8 +836,9 @@ class InteractiveFitSession:
                 # not retain a complete model + optimiser checkpoint for the
                 # lifetime of the resident fitter thread.
                 del checkpoint_config
-        # The session request's z window is authoritative for this fit,
-        # both for the applied configuration and the Default profile.
+        # The canonical run window (the request normally, or the restored
+        # checkpoint window above) owns the applied configuration and Default
+        # profile.
         config["z_begin"] = int(self.run_config.z_begin)
         config["z_end"] = int(self.run_config.z_end)
         unknown = sorted(set(self.run_config.config) - set(config))
@@ -873,6 +877,8 @@ class InteractiveFitSession:
                 self.run_config.z_end, count_keys,
                 world_size=world_size)
         config.update(explicit_sampling_counts)
+        for key in ('z_begin', 'z_end'):
+            default_advanced_config.pop(key, None)
         self.requested_config = dict(config)
         with self._condition:
             self._applied_config = copy.deepcopy(config)

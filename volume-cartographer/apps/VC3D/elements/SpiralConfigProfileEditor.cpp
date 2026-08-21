@@ -417,6 +417,14 @@ void SpiralConfigProfileEditor::setSessionDefault(const QJsonObject& config)
     emit textChanged();
 }
 
+void SpiralConfigProfileEditor::setSessionDefaultLabel(const QString& label)
+{
+    const QString normalized = label.trimmed();
+    if (_sessionDefaultLabel == normalized) return;
+    _sessionDefaultLabel = normalized;
+    rebuildCombo();
+}
+
 void SpiralConfigProfileEditor::showSessionDefault()
 {
     selectProfile(kDefaultId, false);
@@ -424,6 +432,7 @@ void SpiralConfigProfileEditor::showSessionDefault()
 
 void SpiralConfigProfileEditor::clearSessionDefault()
 {
+    setSessionDefaultLabel({});
     const QJsonObject defaults =
         _catalog.value(QStringLiteral("defaults")).toObject();
     _sessionDefaultText = formatted(defaults);
@@ -750,7 +759,10 @@ void SpiralConfigProfileEditor::rebuildCombo()
     _programmatic = true;
     const QSignalBlocker blocker(_profileCombo);
     _profileCombo->clear();
-    _profileCombo->addItem(tr("Current Session"), kDefaultId);
+    _profileCombo->addItem(
+        _sessionDefaultLabel.isEmpty() ? tr("Current Session")
+                                       : _sessionDefaultLabel,
+        kDefaultId);
     _profileCombo->addItem(tr("Defaults"), kDefaultsId);
     const QJsonObject presets = _catalog.value(QStringLiteral("presets")).toObject();
     for (auto it = presets.begin(); it != presets.end(); ++it)
@@ -849,7 +861,9 @@ void SpiralConfigProfileEditor::updateUi()
     const int index = _profileCombo->findData(_currentProfileId);
     if (index >= 0) {
         QString label;
-        if (_currentProfileId == kDefaultId) label = tr("Default");
+        if (_currentProfileId == kDefaultId)
+            label = _sessionDefaultLabel.isEmpty() ? tr("Current Session")
+                                                    : _sessionDefaultLabel;
         else if (_currentProfileId == kCustomId) label = tr("Custom");
         else if (const StoredProfile* profile = findStored(_currentProfileId)) label = profile->name;
         if (_dirty) label += QStringLiteral(" *");

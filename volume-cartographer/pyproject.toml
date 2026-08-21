@@ -14,6 +14,7 @@ requires-python = ">=3.14"
 dependencies = [
     "numpy",
     "numcodecs>=0.15.1,<0.17",
+    "vc-delta3d>=0.1.0,<0.2",
 ]
 license = { file = "LICENSE" }
 

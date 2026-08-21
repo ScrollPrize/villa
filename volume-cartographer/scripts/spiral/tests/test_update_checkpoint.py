@@ -3,7 +3,7 @@ from collections import OrderedDict
 import pytest
 import torch
 
-from config import Config
+from config import Config, durable_config
 from update_checkpoint import migrate_config, update_checkpoint
 
 
@@ -17,14 +17,26 @@ def test_migrate_legacy_config_to_exact_current_schema():
         "track_walk_require_loop_consistency": False,
         "patch_strip_sampling": "dijkstra",
         "patch_2d_sampling_max_area": 1000.0,
+        "sample_count_inference_relative_pairs": 123,
+        "sample_count_inference_density_pairs": 456,
+        "inference_relative_pair_delta": [2, 9],
+        "inference_huber_delta": 0.75,
+        "dense_spacing_mode": "inference",
     })
 
-    assert set(migrated) == set(Config().as_dict())
+    assert set(migrated) == set(durable_config(Config().as_dict()))
+    assert "loss_weight_anchor" not in migrated
     assert migrated["model_flow_bounds_radius"] == 1234
     assert migrated["sample_count_patches_per_step"] == 77
     assert migrated["patch_unverified_patch_exclusion_radius"] == 12.5
     assert migrated["optimizer_learning_rate"] == 2.25e-6
-    assert "use_tracks" in removed
+    assert migrated["sample_count_winding_model_relative_pairs"] == 123
+    assert migrated["sample_count_winding_model_density_pairs"] == 456
+    assert migrated["winding_model_relative_pair_delta"] == [2, 9]
+    assert migrated["winding_model_huber_delta"] == 0.75
+    assert migrated["dense_spacing_mode"] == "winding_model"
+    assert migrated["input_use_tracks"] is True
+    assert "use_tracks -> input_use_tracks" in renamed
     assert "track_walk_require_loop_consistency" in removed
     assert "patch_strip_sampling" in removed
     assert "patch_2d_sampling_max_area" in removed

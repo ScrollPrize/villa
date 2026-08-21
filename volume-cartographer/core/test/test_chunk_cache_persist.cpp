@@ -11,9 +11,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -52,10 +54,152 @@ public:
         std::lock_guard<std::mutex> lk(m_);
         canned_[k] = std::move(r);
     }
+    std::optional<std::string> sourceChunkKey(const ChunkKey& key) const override
+    {
+        return "0/" + std::to_string(key.iz) + "." +
+               std::to_string(key.iy) + "." + std::to_string(key.ix);
+    }
+    std::optional<vc::render::ChunkStorageObject>
+    storageObject(const ChunkKey& key) const override
+    {
+        vc::render::ChunkStorageObject object;
+        object.representativeKey = key;
+        object.outerZ = key.iz;
+        object.outerY = key.iy;
+        object.outerX = key.ix;
+        object.sourceKey = *sourceChunkKey(key);
+        return object;
+    }
     std::atomic<int> fetchCalls{0};
 private:
     std::mutex m_;
     std::unordered_map<ChunkKey, ChunkFetchResult, vc::render::ChunkKeyHash> canned_;
+};
+
+class MirrorFetcher final : public CountingFetcher {
+public:
+    std::optional<vc::render::ChunkStorageObject>
+    storageObject(const ChunkKey& key) const override
+    {
+        vc::render::ChunkStorageObject object;
+        object.representativeKey = key;
+        object.outerZ = key.iz;
+        object.outerY = key.iy;
+        object.outerX = key.ix;
+        object.sourceKey = "scale0/" + std::to_string(key.iz) + "." +
+                           std::to_string(key.iy) + "." +
+                           std::to_string(key.ix);
+        return object;
+    }
+
+    ChunkFetchResult fetchStorageObject(
+        const vc::render::ChunkStorageObject& object,
+        const DownloadProgressCallback&) override
+    {
+        return fetch(object.representativeKey);
+    }
+
+    ChunkFetchResult decodeStorageObject(
+        const ChunkKey&,
+        std::span<const std::byte> bytes) const override
+    {
+        ChunkFetchResult result;
+        result.status = ChunkFetchStatus::Found;
+        result.bytes.assign(bytes.begin(), bytes.end());
+        return result;
+    }
+
+    bool supportsSourcePayloadPersistence(const ChunkKey&) const override
+    {
+        return true;
+    }
+};
+
+class BlockingDecodeCountingFetcher final : public CountingFetcher {
+public:
+    ChunkFetchResult fetch(const ChunkKey& key) override
+    {
+        {
+            std::lock_guard lock(blockMutex_);
+            fetchEntered_ = true;
+        }
+        blockCv_.notify_all();
+        {
+            std::unique_lock lock(blockMutex_);
+            blockCv_.wait(lock, [&] { return fetchReleased_; });
+        }
+        return CountingFetcher::fetch(key);
+    }
+
+    ChunkFetchResult decodeFetched(
+        const ChunkKey&, ChunkFetchResult fetched) const override
+    {
+        decodeCalls.fetch_add(1, std::memory_order_relaxed);
+        return fetched;
+    }
+
+    void waitForFetch()
+    {
+        std::unique_lock lock(blockMutex_);
+        blockCv_.wait(lock, [&] { return fetchEntered_; });
+    }
+
+    void releaseFetch()
+    {
+        {
+            std::lock_guard lock(blockMutex_);
+            fetchReleased_ = true;
+        }
+        blockCv_.notify_all();
+    }
+
+    mutable std::atomic<int> decodeCalls{0};
+
+private:
+    std::mutex blockMutex_;
+    std::condition_variable blockCv_;
+    bool fetchEntered_ = false;
+    bool fetchReleased_ = false;
+};
+
+class BlockingMaintenanceDecodeFetcher final : public CountingFetcher {
+public:
+    ChunkFetchResult decodeFetched(
+        const ChunkKey&, ChunkFetchResult fetched) const override
+    {
+        ++decodeCalls;
+        {
+            std::lock_guard lock(mutex_);
+            decodeEntered_ = true;
+        }
+        cv_.notify_all();
+        std::unique_lock lock(mutex_);
+        cv_.wait(lock, [&] { return decodeReleased_; });
+        return fetched;
+    }
+
+    void waitForDecode()
+    {
+        std::unique_lock lock(mutex_);
+        cv_.wait(lock, [&] { return decodeEntered_; });
+    }
+
+    void releaseDecode()
+    {
+        {
+            std::lock_guard lock(mutex_);
+            decodeReleased_ = true;
+        }
+        cv_.notify_all();
+    }
+
+    mutable std::atomic<int> decodeCalls{0};
+
+private:
+    mutable std::mutex mutex_;
+    mutable std::condition_variable cv_;
+    mutable bool decodeEntered_ = false;
+    mutable bool decodeReleased_ = false;
 };
 
 fs::path tmpDir(const std::string& tag)
@@ -78,6 +222,58 @@ std::shared_ptr<ChunkCache> makeCache(std::shared_ptr<CountingFetcher> f,
     if (persist) opts.persistentCachePath = *persist;
     if (budgetRoot) opts.persistentCacheBudgetRoot = *budgetRoot;
     opts.compressPersistentCache = compress;
+    ChunkCacheService::Options serviceOptions;
+    serviceOptions.fetchConcurrency.workerCapacity = 4;
+    serviceOptions.fetchConcurrency.maxConcurrentReads = 4;
+    return std::make_shared<ChunkCache>(
+        std::move(levels),
+        std::vector<std::shared_ptr<IChunkFetcher>>{f},
+        0.0, ChunkDtype::UInt8, opts, std::move(serviceOptions));
+}
+
+std::shared_ptr<ChunkCache> makeDelta3dCache(
+    std::shared_ptr<CountingFetcher> f,
+    const fs::path& persist,
+    std::optional<fs::path> budgetRoot = {})
+{
+    std::vector<ChunkCache::LevelInfo> levels = {{{8, 8, 8}, {4, 4, 4}, {}}};
+    ChunkCache::Options opts;
+    opts.detectAllFillChunks = true;
+    opts.persistentCachePath = persist;
+    const std::string group = R"({"zarr_format":2})";
+    const std::string array =
+        R"({"zarr_format":2,"shape":[8,8,8],"chunks":[4,4,4],"dtype":"|u1","compressor":null,"fill_value":0,"order":"C","filters":null,"dimension_separator":"."})";
+    opts.zarrMirrorMetadata = {
+        {".zgroup", {reinterpret_cast<const std::byte*>(group.data()),
+                     reinterpret_cast<const std::byte*>(group.data() + group.size())}},
+        {"0/.zarray", {reinterpret_cast<const std::byte*>(array.data()),
+                       reinterpret_cast<const std::byte*>(array.data() + array.size())}},
+    };
+    if (budgetRoot)
+        opts.persistentCacheBudgetRoot = *budgetRoot;
+    ChunkCacheService::Options serviceOptions;
+    serviceOptions.fetchConcurrency.workerCapacity = 4;
+    serviceOptions.fetchConcurrency.maxConcurrentReads = 4;
+    serviceOptions.persistentCacheEncoding =
+        vc::render::PersistentCacheEncoding::Delta3dLossless;
+    return std::make_shared<ChunkCache>(
+        std::move(levels),
+        std::vector<std::shared_ptr<IChunkFetcher>>{f},
+        0.0, ChunkDtype::UInt8, opts, std::move(serviceOptions));
+}
+
+std::shared_ptr<ChunkCache> makeMirrorCache(
+    std::shared_ptr<MirrorFetcher> f,
+    const fs::path& persist,
+    std::optional<fs::path> budgetRoot = {})
+{
+    std::vector<ChunkCache::LevelInfo> levels = {{{8, 8, 8}, {4, 4, 4}, {}}};
+    ChunkCache::Options opts;
+    opts.persistentCachePath = persist;
+    if (budgetRoot)
+        opts.persistentCacheBudgetRoot = *budgetRoot;
+    opts.zarrMirrorMetadata.push_back(
+        {".zgroup", {std::byte{'{'}, std::byte{'}'}}});
     ChunkCacheService::Options serviceOptions;
     serviceOptions.fetchConcurrency.workerCapacity = 4;
     serviceOptions.fetchConcurrency.maxConcurrentReads = 4;
@@ -137,6 +333,20 @@ void writeBytes(const fs::path& path, std::span<const std::byte> bytes)
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
     file.write(reinterpret_cast<const char*>(bytes.data()),
                static_cast<std::streamsize>(bytes.size()));
+}
+
+std::vector<std::byte> readFileBytes(const fs::path& path)
+{
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file)
+        return {};
+    const auto size = file.tellg();
+    if (size < 0)
+        return {};
+    std::vector<std::byte> bytes(static_cast<std::size_t>(size));
+    file.seekg(0);
+    file.read(reinterpret_cast<char*>(bytes.data()), size);
+    return file ? bytes : std::vector<std::byte>{};
 }
 
 template <typename Predicate>
@@ -519,8 +729,7 @@ TEST_CASE("Reopen cache: compressed .zst entry is loaded without a fetch")
     auto persist = tmpDir("compress_reload");
     const auto expected = variedBytes(64);
     const auto compressed = vc::cacheCompress(
-        expected, {4, 4, 4}, 1, vc::kCacheCompressionLevel,
-        vc::kCacheQuantLossless);
+        expected, {4, 4, 4}, 1, vc::kCacheQuantLossless);
     writeBytes(
         persist / "level_0" / "0" / "0" / "0.zst", compressed);
 
@@ -554,4 +763,344 @@ TEST_CASE("Corrupt .zst entry falls back to a remote fetch")
     CHECK(*r.bytes == fr.bytes);
     CHECK(f->fetchCalls.load() == 1);
     fs::remove_all(persist);
+}
+
+TEST_CASE("Delta3D mode writes a regular Zarr with verified D3D1 chunks and reopens offline")
+{
+    auto persist = tmpDir("delta3d_write");
+    auto f = std::make_shared<CountingFetcher>();
+    const auto expected = variedBytes(64);
+    ChunkFetchResult fetched;
+    fetched.status = ChunkFetchStatus::Found;
+    fetched.bytes = expected;
+    f->setCanned({0, 0, 0, 0}, fetched);
+
+    {
+        auto cache = makeDelta3dCache(f, persist);
+        REQUIRE(cache->persistentCacheLayout() ==
+                vc::render::PersistentCacheLayout::Delta3d);
+        const auto rendered = waitForResolved(*cache, 0, 0, 0, 0);
+        REQUIRE(rendered.status == ChunkStatus::Data);
+        REQUIRE(rendered.bytes);
+        CHECK(*rendered.bytes == expected);
+        cache->waitForPersistentWrites();
+    }
+
+    const auto path = persist / "0" / "0.0.0";
+    REQUIRE(fs::is_regular_file(path));
+    const auto encoded = readFileBytes(path);
+    REQUIRE(encoded.size() >= 4);
+    CHECK(std::to_integer<char>(encoded[0]) == 'D');
+    CHECK(std::to_integer<char>(encoded[1]) == '3');
+    CHECK(std::to_integer<char>(encoded[2]) == 'D');
+    CHECK(std::to_integer<char>(encoded[3]) == '1');
+    CHECK_FALSE(fs::exists(persist / "level_0"));
+    const auto metadata = readFileBytes(persist / "0" / ".zarray");
+    const std::string metadataText(
+        reinterpret_cast<const char*>(metadata.data()), metadata.size());
+    CHECK(metadataText.find("vc-delta3d") != std::string::npos);
+
+    auto offline = std::make_shared<CountingFetcher>();
+    auto reopened = makeDelta3dCache(offline, persist);
+    const auto cached = waitForResolved(*reopened, 0, 0, 0, 0);
+    REQUIRE(cached.status == ChunkStatus::Data);
+    REQUIRE(cached.bytes);
+    CHECK(*cached.bytes == expected);
+    CHECK(offline->fetchCalls.load() == 0);
+    reopened.reset();
+    fs::remove_all(persist);
+}
+
+TEST_CASE("Delta3D mode uses empty markers for missing and all-fill chunks")
+{
+    auto persist = tmpDir("delta3d_empty");
+    auto f = std::make_shared<CountingFetcher>();
+    ChunkFetchResult fill;
+    fill.status = ChunkFetchStatus::Found;
+    fill.bytes = makeBytes(64, std::byte{0});
+    f->setCanned({0, 0, 0, 1}, fill);
+
+    auto cache = makeDelta3dCache(f, persist);
+    CHECK(waitForResolved(*cache, 0, 0, 0, 0).status == ChunkStatus::Missing);
+    CHECK(waitForResolved(*cache, 0, 0, 0, 1).status == ChunkStatus::AllFill);
+    cache->waitForPersistentWrites();
+    CHECK(fs::is_regular_file(
+        persist / ".vc_cache_empty" / "0" / "0.0.0.empty"));
+    CHECK(fs::is_regular_file(
+        persist / ".vc_cache_empty" / "0" / "0.0.1.empty"));
+    CHECK_FALSE(fs::exists(
+        persist / "0" / "0.0.1"));
+    cache.reset();
+    fs::remove_all(persist);
+}
+
+TEST_CASE("Corrupt Delta3D payload is refetched and replaced")
+{
+    auto persist = tmpDir("delta3d_corrupt");
+    auto seed = std::make_shared<CountingFetcher>();
+    ChunkFetchResult fetched;
+    fetched.status = ChunkFetchStatus::Found;
+    fetched.bytes = variedBytes(64);
+    seed->setCanned({0, 0, 0, 0}, fetched);
+    {
+        auto cache = makeDelta3dCache(seed, persist);
+        REQUIRE(waitForResolved(*cache, 0, 0, 0, 0).status == ChunkStatus::Data);
+        cache->waitForPersistentWrites();
+    }
+    writeSizedFile(
+        persist / "0" / "0.0.0", 16, 0xAB);
+
+    auto refetch = std::make_shared<CountingFetcher>();
+    refetch->setCanned({0, 0, 0, 0}, fetched);
+    auto cache = makeDelta3dCache(refetch, persist);
+    const auto result = waitForResolved(*cache, 0, 0, 0, 0);
+    REQUIRE(result.status == ChunkStatus::Data);
+    CHECK(refetch->fetchCalls.load() == 1);
+    cache->waitForPersistentWrites();
+    const auto repaired = readFileBytes(
+        persist / "0" / "0.0.0");
+    REQUIRE(repaired.size() >= 4);
+    CHECK(std::to_integer<char>(repaired[0]) == 'D');
+    cache.reset();
+    fs::remove_all(persist);
+}
+
+TEST_CASE("Delta3D prefill decodes and persists without populating decoded RAM")
+{
+    auto persist = tmpDir("delta3d_prefill");
+    auto f = std::make_shared<CountingFetcher>();
+    ChunkFetchResult fetched;
+    fetched.status = ChunkFetchStatus::Found;
+    fetched.bytes = variedBytes(64);
+    f->setCanned({0, 0, 0, 0}, fetched);
+    auto cache = makeDelta3dCache(f, persist);
+
+    const auto result = cache->persistChunkBlocking(0, 0, 0, 0);
+    REQUIRE(result.status == ChunkCache::PersistentRequestStatus::Data);
+    cache->waitForPersistentWrites();
+    CHECK(cache->stats().decodedBytes == 0);
+    CHECK(fs::is_regular_file(
+        persist / "0" / "0.0.0"));
+    cache.reset();
+    fs::remove_all(persist);
+}
+
+TEST_CASE("Delta3D foreground and persistence requests share one source decode")
+{
+    auto persist = tmpDir("delta3d_shared_decode");
+    auto fetcher = std::make_shared<BlockingDecodeCountingFetcher>();
+    ChunkFetchResult fetched;
+    fetched.status = ChunkFetchStatus::Found;
+    fetched.bytes = variedBytes(64);
+    fetcher->setCanned({0, 0, 0, 0}, fetched);
+    auto cache = makeDelta3dCache(fetcher, persist);
+
+    auto rendered = std::async(std::launch::async, [&] {
+        return cache->getChunkBlocking(0, 0, 0, 0);
+    });
+    fetcher->waitForFetch();
+    auto persisted = std::async(std::launch::async, [&] {
+        return cache->persistChunkBlocking(
+            0, 0, 0, 0, ChunkCache::PersistentRequestMode::Refresh);
+    });
+    // Refresh joins the already-running keyed source transfer. Give its
+    // scheduler publication a chance to complete before releasing the source.
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    fetcher->releaseFetch();
+
+    REQUIRE(rendered.wait_for(std::chrono::seconds(2)) ==
+            std::future_status::ready);
+    REQUIRE(persisted.wait_for(std::chrono::seconds(2)) ==
+            std::future_status::ready);
+    CHECK(rendered.get().status == ChunkStatus::Data);
+    CHECK(persisted.get().status ==
+          ChunkCache::PersistentRequestStatus::Data);
+    cache->waitForPersistentWrites();
+    CHECK(fetcher->fetchCalls.load() == 1);
+    CHECK(fetcher->decodeCalls.load() == 1);
+    CHECK(fs::is_regular_file(persist / "0" / "0.0.0"));
+
+    cache.reset();
+    fs::remove_all(persist);
+}
+
+TEST_CASE("Delta3D foreground waits for maintenance publication without refetching")
+{
+    auto persist = tmpDir("delta3d_publication_join");
+    auto fetcher = std::make_shared<BlockingMaintenanceDecodeFetcher>();
+    ChunkFetchResult fetched;
+    fetched.status = ChunkFetchStatus::Found;
+    fetched.bytes = variedBytes(64);
+    fetcher->setCanned({0, 0, 0, 0}, fetched);
+    auto cache = makeDelta3dCache(fetcher, persist);
+
+    auto persisted = std::async(std::launch::async, [&] {
+        return cache->persistChunkBlocking(0, 0, 0, 0);
+    });
+    fetcher->waitForDecode();
+    REQUIRE(fetcher->fetchCalls.load() == 1);
+
+    auto rendered = std::async(std::launch::async, [&] {
+        return cache->getChunkBlocking(0, 0, 0, 0);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK(fetcher->fetchCalls.load() == 1);
+    CHECK(rendered.wait_for(std::chrono::milliseconds(0)) ==
+          std::future_status::timeout);
+
+    fetcher->releaseDecode();
+    REQUIRE(persisted.wait_for(std::chrono::seconds(2)) ==
+            std::future_status::ready);
+    REQUIRE(rendered.wait_for(std::chrono::seconds(2)) ==
+            std::future_status::ready);
+    CHECK(persisted.get().status ==
+          ChunkCache::PersistentRequestStatus::Data);
+    CHECK(rendered.get().status == ChunkStatus::Data);
+    CHECK(fetcher->fetchCalls.load() == 1);
+    CHECK(fetcher->decodeCalls.load() == 1);
+
+    cache.reset();
+    fs::remove_all(persist);
+}
+
+TEST_CASE("Delta3D disk budget accounts the final encoded payload size")
+{
+    const auto root = tmpDir("delta3d_budget");
+    auto budget = vc::render::PersistentZarrCacheBudget::configure(
+        root, {}, [](const fs::path&, std::error_code& ec) {
+            ec.clear();
+            return fs::space_info{1ULL << 40, 1ULL << 40, 1ULL << 40};
+        });
+    budget->waitForIdle();
+
+    auto f = std::make_shared<CountingFetcher>();
+    ChunkFetchResult fetched;
+    fetched.status = ChunkFetchStatus::Found;
+    fetched.bytes = variedBytes(64);
+    f->setCanned({0, 0, 0, 0}, fetched);
+    auto cache = makeDelta3dCache(f, root / "volume", root);
+    REQUIRE(waitForResolved(*cache, 0, 0, 0, 0).status == ChunkStatus::Data);
+    cache->waitForPersistentWrites();
+
+    const auto path = root / "volume" / "0" / "0.0.0";
+    REQUIRE(fs::is_regular_file(path));
+    CHECK(budget->stats().managedBytes == fs::file_size(path));
+    cache.reset();
+    fs::remove_all(root);
+}
+
+TEST_CASE("failed Delta3D publication leaves rendering usable and no raw fallback")
+{
+    const auto root = tmpDir("delta3d_write_failure");
+    auto budget = vc::render::PersistentZarrCacheBudget::configure(
+        root, {1, 0}, [](const fs::path&, std::error_code& ec) {
+            ec.clear();
+            return fs::space_info{1024, 1024, 1024};
+        });
+    budget->waitForIdle();
+
+    auto f = std::make_shared<CountingFetcher>();
+    const auto expected = variedBytes(64);
+    ChunkFetchResult fetched;
+    fetched.status = ChunkFetchStatus::Found;
+    fetched.bytes = expected;
+    f->setCanned({0, 0, 0, 0}, fetched);
+    auto cache = makeDelta3dCache(f, root / "volume", root);
+    const auto rendered = waitForResolved(*cache, 0, 0, 0, 0);
+    REQUIRE(rendered.status == ChunkStatus::Data);
+    REQUIRE(rendered.bytes);
+    CHECK(*rendered.bytes == expected);
+    cache->waitForPersistentWrites();
+
+    const auto chunkDir = root / "volume" / "0";
+    CHECK_FALSE(fs::exists(chunkDir / "0.0.0"));
+    CHECK_FALSE(fs::exists(root / "volume" / "level_0"));
+    CHECK(budget->stats().managedBytes == 0);
+    cache.reset();
+    fs::remove_all(root);
+}
+
+TEST_CASE("persistent cache format transitions are leased and volume-local")
+{
+    const auto parent = tmpDir("delta3d_transition");
+    const auto persist = parent / "volume-a";
+    const auto sibling = parent / "volume-b" / "keep.bin";
+    writeSizedFile(sibling, 7);
+    auto budget = vc::render::PersistentZarrCacheBudget::configure(
+        parent, {}, [](const fs::path&, std::error_code& ec) {
+            ec.clear();
+            return fs::space_info{1ULL << 40, 1ULL << 40, 1ULL << 40};
+        });
+    budget->waitForIdle();
+    const auto bookkeeping = parent / ".vc_cache_bookkeeping" /
+                             persist.filename() / ".vc_prefill_level_0.json";
+
+    ChunkFetchResult fetched;
+    fetched.status = ChunkFetchStatus::Found;
+    fetched.bytes = variedBytes(64);
+    auto mirrorFetcher = std::make_shared<MirrorFetcher>();
+    mirrorFetcher->setCanned({0, 0, 0, 0}, fetched);
+    auto mirror = makeMirrorCache(mirrorFetcher, persist, parent);
+    REQUIRE(mirror->persistentCacheLayout() ==
+            vc::render::PersistentCacheLayout::ZarrMirror);
+    REQUIRE(waitForResolved(*mirror, 0, 0, 0, 0).status == ChunkStatus::Data);
+    mirror->waitForPersistentWrites();
+    REQUIRE(fs::is_regular_file(persist / "scale0" / "0.0.0"));
+    REQUIRE(budget->stats().managedBytes > 0);
+    writeSizedFile(bookkeeping, 3);
+
+    // An incompatible process cannot replace a cache while this mirror holds
+    // its shared lease; rendering remains available with persistence disabled.
+    auto blockedFetcher = std::make_shared<CountingFetcher>();
+    blockedFetcher->setCanned({0, 0, 0, 0}, fetched);
+    auto blocked = makeDelta3dCache(blockedFetcher, persist, parent);
+    CHECK_FALSE(blocked->stats().persistentCacheEnabled);
+    CHECK_FALSE(blocked->stats().persistentCacheWarning.empty());
+    REQUIRE(waitForResolved(*blocked, 0, 0, 0, 0).status == ChunkStatus::Data);
+    CHECK_FALSE(fs::exists(
+        persist / "0" / "0.0.0"));
+    blocked.reset();
+    mirror.reset();
+
+    auto deltaFetcher = std::make_shared<CountingFetcher>();
+    deltaFetcher->setCanned({0, 0, 0, 0}, fetched);
+    auto delta = makeDelta3dCache(deltaFetcher, persist, parent);
+    REQUIRE(delta->persistentCacheLayout() ==
+            vc::render::PersistentCacheLayout::Delta3d);
+    budget->waitForIdle();
+    CHECK(budget->stats().managedBytes == 0);
+    CHECK_FALSE(fs::exists(persist / "scale0" / "0.0.0"));
+    CHECK_FALSE(fs::exists(bookkeeping));
+    CHECK(fs::is_regular_file(sibling));
+    REQUIRE(waitForResolved(*delta, 0, 0, 0, 0).status == ChunkStatus::Data);
+    delta->waitForPersistentWrites();
+    REQUIRE(fs::is_regular_file(
+        persist / "0" / "0.0.0"));
+
+    // Same-format processes can share the derived Zarr cache concurrently.
+    auto sameModeFetcher = std::make_shared<CountingFetcher>();
+    auto sameMode = makeDelta3dCache(sameModeFetcher, persist, parent);
+    CHECK(sameMode->stats().persistentCacheEnabled);
+    REQUIRE(waitForResolved(*sameMode, 0, 0, 0, 0).status == ChunkStatus::Data);
+    CHECK(sameModeFetcher->fetchCalls.load() == 0);
+
+    auto blockedMirrorFetcher = std::make_shared<MirrorFetcher>();
+    blockedMirrorFetcher->setCanned({0, 0, 0, 0}, fetched);
+    auto blockedMirror = makeMirrorCache(blockedMirrorFetcher, persist, parent);
+    CHECK_FALSE(blockedMirror->stats().persistentCacheEnabled);
+    blockedMirror.reset();
+    sameMode.reset();
+    delta.reset();
+
+    auto restoredFetcher = std::make_shared<MirrorFetcher>();
+    restoredFetcher->setCanned({0, 0, 0, 0}, fetched);
+    auto restored = makeMirrorCache(restoredFetcher, persist, parent);
+    REQUIRE(restored->persistentCacheLayout() ==
+            vc::render::PersistentCacheLayout::ZarrMirror);
+    CHECK_FALSE(fs::exists(persist / ".vc_delta3d_cache"));
+    CHECK_FALSE(fs::exists(
+        persist / "0" / "0.0.0"));
+    CHECK(fs::is_regular_file(sibling));
+    restored.reset();
+    fs::remove_all(parent);
 }

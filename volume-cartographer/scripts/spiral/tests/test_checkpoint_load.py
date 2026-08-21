@@ -21,7 +21,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import fit_spiral
-from config import Config, durable_config
+from config import BACKFILLABLE_CONFIG_DEFAULTS, Config, durable_config
 from fit_session import SessionState
 from spiral_progress import NullProgressReporter
 import spiral_runtime
@@ -55,6 +55,8 @@ def _live_context():
         spiral_outward_sense="CW",
         paths=SimpleNamespace(dataset_root="/data/scroll1"),
         phase_mode=True,
+        winding_model_mode=False,
+        winding_inference=None,
         sdt_volume={"fingerprint": {"sha256": "abc", "path": "/store/a",
                                     "complete": True}},
         config=dict(CONFIG),
@@ -96,6 +98,41 @@ def _inspect(checkpoint, context=None, **kwargs):
     return fit_spiral.FitContext.inspect_checkpoint(
         context or _live_context(), checkpoint, source="/ckpt/a.ckpt",
         **kwargs)
+
+
+class HeadlessCheckpointTests(unittest.TestCase):
+    def test_periodic_save_refreshes_the_final_path_at_global_step_boundaries(self):
+        context = SimpleNamespace(
+            num_training_steps=2500,
+            dist=SimpleNamespace(is_main_process=True),
+            _save_model=mock.Mock(return_value="/out/checkpoint_fitted.ckpt"),
+        )
+
+        results = [
+            fit_spiral.FitContext._maybe_save_headless_checkpoint(context, step)
+            for step in (999, 1000, 1001, 2000, 2500)
+        ]
+
+        self.assertEqual(
+            context._save_model.call_args_list,
+            [mock.call("fitted", 1000), mock.call("fitted", 2000)],
+        )
+        self.assertEqual(
+            results,
+            [None, "/out/checkpoint_fitted.ckpt", None,
+             "/out/checkpoint_fitted.ckpt", None],
+        )
+
+    def test_periodic_save_is_main_process_only(self):
+        context = SimpleNamespace(
+            num_training_steps=2500,
+            dist=SimpleNamespace(is_main_process=False),
+            _save_model=mock.Mock(),
+        )
+
+        fit_spiral.FitContext._maybe_save_headless_checkpoint(context, 1000)
+
+        context._save_model.assert_not_called()
 
 
 class CheckpointPreflightTests(unittest.TestCase):
@@ -182,6 +219,10 @@ class CheckpointPreflightTests(unittest.TestCase):
         carve_out.pop("z_begin", None)
         carve_out.pop("z_end", None)
         self.assertTrue(_inspect(_checkpoint(cfg=carve_out)).accepted)
+        pre_toggles = durable_config(CONFIG)
+        for key in BACKFILLABLE_CONFIG_DEFAULTS:
+            pre_toggles.pop(key)
+        self.assertTrue(_inspect(_checkpoint(cfg=pre_toggles)).accepted)
         shaped = durable_config(CONFIG)
         shaped["model_flow_bounds_radius"] = (
             int(shaped["model_flow_bounds_radius"]) + 1)

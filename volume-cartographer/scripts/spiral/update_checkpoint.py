@@ -18,7 +18,7 @@ from pathlib import Path
 import torch
 
 from checkpoint_io import load_checkpoint_cpu
-from config import Config
+from config import Config, durable_config
 
 
 MODEL_KEYS = (
@@ -79,6 +79,10 @@ LEGACY_RENAMES = {
         "sample_count_minimum_spacing_independent_samples",
     "dense_attachment_num_points":
         "sample_count_dense_attachment_points",
+    "sample_count_inference_relative_pairs":
+        "sample_count_winding_model_relative_pairs",
+    "sample_count_inference_density_pairs":
+        "sample_count_winding_model_density_pairs",
     "patch_dt_target_num_points": "sample_count_patch_dt_target_points",
     "dt_target_num_points_per_strip":
         "sample_count_dt_target_points_per_strip",
@@ -93,6 +97,13 @@ LEGACY_RENAMES = {
         "sample_count_influence_anchor_samples_per_step",
     "erode_patches": "patch_erode_patches",
     "disable_patches": "input_disable_patches",
+    "use_verified_patches": "input_use_verified_patches",
+    "use_unverified_patches": "input_use_unverified_patches",
+    "use_normals": "input_use_normals",
+    "use_surf_sdt": "input_use_surf_sdt",
+    "use_tracks": "input_use_tracks",
+    "use_gradient_magnitude": "input_use_gradient_magnitude",
+    "use_fibers": "input_use_fibers",
     "unverified_patch_radius_loss_margin":
         "patch_unverified_patch_radius_loss_margin",
     "unverified_patch_radius_loss_inv":
@@ -122,6 +133,8 @@ LEGACY_RENAMES = {
     "min_spacing_d_min_wv": "dense_min_spacing_d_min_wv",
     "sym_dirichlet_finite_difference_epsilon":
         "model_sym_dirichlet_finite_difference_epsilon",
+    "inference_relative_pair_delta": "winding_model_relative_pair_delta",
+    "inference_huber_delta": "winding_model_huber_delta",
     "weight_decay_gap_expander": "optimizer_weight_decay_gap_expander",
     "weight_decay_flow_field": "optimizer_weight_decay_flow_field",
     "save_png_visualizations": "output_save_png_visualizations",
@@ -135,18 +148,11 @@ LEGACY_RENAMES = {
         "influence_anchor_ramp_power",
 }
 
-# These settings moved out of the durable config or were replaced by current
-# track-walk controls.  VC3D now derives input enablement from selected paths.
+# These sampling settings moved out of the durable config, and the track-walk
+# setting was replaced by current controls.
 LEGACY_REMOVED = {
     "patch_strip_sampling",
     "patch_2d_sampling_max_area",
-    "use_verified_patches",
-    "use_unverified_patches",
-    "use_normals",
-    "use_surf_sdt",
-    "use_tracks",
-    "use_gradient_magnitude",
-    "use_fibers",
     "track_walk_require_loop_consistency",
 }
 
@@ -155,7 +161,7 @@ CONFIG_FIELDS = ("cfg", "requested_config", "resolved_config")
 
 def migrate_config(source: Mapping) -> tuple[dict, list[str], list[str], list[str]]:
     """Return a current-schema config and a summary of the migration."""
-    defaults = Config().as_dict()
+    defaults = durable_config(Config().as_dict())
     migrated = dict(defaults)
     renamed = []
     removed = []
@@ -181,8 +187,14 @@ def migrate_config(source: Mapping) -> tuple[dict, list[str], list[str], list[st
             + ", ".join(unknown)
         )
 
+    # The mode and its supervision artifact were renamed together; retaining
+    # the legacy enum spelling would otherwise fail current Config validation.
+    if migrated.get("dense_spacing_mode") == "inference":
+        migrated["dense_spacing_mode"] = "winding_model"
+        renamed.append("dense_spacing_mode: inference -> winding_model")
+
     # Validate types, ranges, enum values, and the exact current key set.
-    validated = Config(migrated).as_dict()
+    validated = durable_config(Config(migrated).as_dict())
     added = sorted(set(defaults) - {
         LEGACY_RENAMES.get(key, key)
         for key in source
@@ -298,7 +310,7 @@ def main(argv: list[str] | None = None) -> int:
     # the exact invariant that VC3D checks before starting a session.
     del checkpoint, updated
     reloaded = load_checkpoint_cpu(destination)
-    expected_keys = set(Config().as_dict())
+    expected_keys = set(durable_config(Config().as_dict()))
     if not isinstance(reloaded, dict) or set(reloaded.get("cfg", {})) != expected_keys:
         raise RuntimeError("written checkpoint failed current-schema validation")
     print(f"[spiral] updated checkpoint: {destination}")

@@ -44,8 +44,11 @@ from ddp_helpers import (
     maybe_init_distributed,
     process_context,
 )
-from config import (CHECKPOINT_MODEL_SHAPE_KEYS, Config, FitConfig,
-                    durable_config)
+from config import (BACKFILLABLE_CONFIG_DEFAULTS, CHECKPOINT_MODEL_SHAPE_KEYS,
+                    Config, FitConfig, durable_config)
+from fit_session import (fit_input, input_source_enabled, pcl_input_enabled,
+                         phase_bundle_enabled, shell_losses_enabled,
+                         winding_inference_enabled)
 
 
 def _startup_resource_suffix(started_at=None):
@@ -59,7 +62,8 @@ def _startup_resource_suffix(started_at=None):
         bytes_high_water = high_water if sys.platform == 'darwin' else high_water * 1024
         fields.append(f'peak RSS {bytes_high_water / (1 << 30):.2f} GiB')
     return ', '.join(fields)
-from fit_session import fit_input
+
+
 from lasagna_data import (ensure_fit_sparse_stores, prepare_lasagna_volume,
                           prepare_surf_sdt_volume)
 from checkpoint_io import load_checkpoint_cpu
@@ -169,6 +173,8 @@ def largest_patch_quad_component(mask):
 _SDT_COVERAGE_AND_LOCATION_KEYS = (
     'path', 'source', 'complete', 'z_range_working', 'built_z_ranges_working',
 )
+
+_HEADLESS_AUTOSAVE_INTERVAL = 1000
 
 
 def comparable_sdt_fingerprint(fingerprint):
@@ -381,6 +387,7 @@ class PatchAtlas:
         self._patches = list(patches_by_id.values())
         self._theta_node_start = None
         self._theta_node_ranges = []
+        self._satisfaction_atlases = {}
         masks = [
             np.ascontiguousarray(p._sampling_valid_quad_mask_np, dtype=bool)
             for p in patches_by_id.values()
@@ -490,6 +497,50 @@ class PatchAtlas:
             np.asarray(self.sampling_atlas.valid_counts(), dtype=np.int64)
             if self.sampling_atlas is not None
             else np.empty(0, dtype=np.int64))
+        self._satisfaction_atlases.clear()
+
+    def satisfaction_atlas(self, z_begin, z_end):
+        """Return exact packed ROI quad metadata, cached by z interval."""
+        key = (float(z_begin), float(z_end))
+        cached = self._satisfaction_atlases.get(key)
+        if cached is not None:
+            return cached
+        native = load_spiral_sampling()
+        atlas_type = (getattr(native, 'PatchSatisfactionAtlas', None)
+                      if native is not None else None)
+        if atlas_type is None:
+            raise RuntimeError(
+                'Packed satisfaction requires '
+                'vc.spiral_sampling.PatchSatisfactionAtlas; rebuild the '
+                'vc_spiral_sampling extension')
+        masks = [np.ascontiguousarray(
+            patch.valid_quad_mask.cpu().numpy(), dtype=bool)
+            for patch in self._patches]
+        vertex_zs = [np.ascontiguousarray(
+            patch.zyxs[..., 0].cpu().numpy(), dtype=np.float32)
+            for patch in self._patches]
+        cached = atlas_type(masks, vertex_zs, key[0], key[1])
+        self._satisfaction_atlases[key] = cached
+        return cached
+
+    def vertex_zyxs(self, vertex_ids):
+        """Gather exact atlas vertices by their stable packed vertex IDs."""
+        if self.zyxs_flat is None:
+            self.materialize(self.device)
+        ids = torch.as_tensor(
+            vertex_ids, dtype=torch.int64, device=self.zyxs_flat.device)
+        if len(self._geometry_chunks) == 1:
+            return self.zyxs_flat[ids]
+        result = torch.empty((*ids.shape, 3), dtype=torch.float32,
+                             device=self.zyxs_flat.device)
+        patch_indices = torch.bucketize(ids, self.offsets[1:], right=True)
+        for chunk in self._geometry_chunks:
+            selected = ((patch_indices >= chunk['patch_start'])
+                        & (patch_indices < chunk['patch_end']))
+            if selected.any():
+                base = self.offsets[chunk['patch_start']]
+                result[selected] = chunk['zyxs_flat'][ids[selected] - base]
+        return result
 
     def lookup(self, patch_idx_per_sample, ijs):
         # Caller must ensure floor(ij) lies on a valid quad. CPU lookup remains
@@ -672,6 +723,7 @@ class PatchAtlas:
         self._num_vertices = offsets[-1]
         self._theta_node_start = None
         self._theta_node_ranges = []
+        self._satisfaction_atlases.clear()
         next_idx = len(self.id_to_idx)
         for pid in patches_by_id:
             self.id_to_idx[pid] = next_idx
@@ -1113,19 +1165,37 @@ class FitContext:
 
         # Resolved input paths ('' means absent).
         self.scroll_zarr_path = paths.scroll_zarr or None
-        self.normal_nx_zarr_path = paths.normal_x or None
-        self.normal_ny_zarr_path = paths.normal_y or None
-        self.grad_mag_zarr_path = paths.gradient_magnitude or None
-        self.surf_sdt_zarr_path = paths.surf_sdt or None
-        self.winding_inference_path = paths.winding_inference or None
-        self.fibers_path = paths.fibers or None
-        self.verified_patches_path = paths.verified_patches or None
-        self.unverified_patches_path = paths.unverified_patches or None
-        self.shell_path = paths.outer_shell or None
-        self.tracks_dbm_path = paths.tracks_dbm or None
+        use_normals = input_source_enabled(config, 'normals')
+        self.normal_nx_zarr_path = (paths.normal_x or None) if use_normals else None
+        self.normal_ny_zarr_path = (paths.normal_y or None) if use_normals else None
+        self.grad_mag_zarr_path = (
+            (paths.gradient_magnitude or None)
+            if input_source_enabled(config, 'gradient_magnitude') else None)
+        self.surf_sdt_zarr_path = (
+            (paths.surf_sdt or None)
+            if phase_bundle_enabled(config) else None)
+        self.winding_inference_path = (
+            (paths.winding_inference or None)
+            if winding_inference_enabled(config) else None)
+        self.fibers_path = (
+            (paths.fibers or None)
+            if input_source_enabled(config, 'fibers') else None)
+        self.verified_patches_path = (
+            (paths.verified_patches or None)
+            if input_source_enabled(config, 'verified_patches') else None)
+        self.unverified_patches_path = (
+            (paths.unverified_patches or None)
+            if input_source_enabled(config, 'unverified_patches') else None)
+        self.shell_path = (
+            (paths.outer_shell or None)
+            if input_source_enabled(config, 'outer_shell') else None)
+        self.tracks_dbm_path = (
+            (paths.tracks_dbm or None)
+            if input_source_enabled(config, 'tracks_dbm') else None)
         self.pcl_input_specs = [
             (spec.path, spec.role.value if spec.role is not None else None)
             for spec in paths.pcls
+            if pcl_input_enabled(config, spec.role, spec.path)
         ]
 
         # Deployment/presentation values.
@@ -1147,8 +1217,11 @@ class FitContext:
         return int(self.config['z_end'])
 
     def shell_losses_enabled(self):
-        # The outer-shell enabling predicate is fit-input catalog data,
-        # shared with request validation and run admission.
+        return shell_losses_enabled(self.config)
+
+    def outer_shell_required(self):
+        # The outer-shell requirement is fit-input catalog data, shared with
+        # request validation and run admission.
         return fit_input('outer_shell').required(self.config)
 
     def _load_patches_from_dir(self, path, label='patches'):
@@ -1293,6 +1366,8 @@ class FitContext:
         return self._patch_sampling_probabilities(patches)
 
     def _patch_sampling_probabilities(self, patches):
+        if not patches:
+            return None
         areas = np.asarray([
             float(getattr(patch, '_sampling_area', patch.area))
             for patch in patches
@@ -1438,9 +1513,11 @@ class FitContext:
 
         filter_tracks_by_shell = bool(self.tracks_dbm_path) and bool(self.shell_path)
         shell_patch = None
-        if self.shell_losses_enabled() or filter_tracks_by_shell:
+        if self.outer_shell_required() or filter_tracks_by_shell:
             if not self.shell_path:
-                raise RuntimeError('shell losses are enabled, but no outer shell path is set')
+                raise RuntimeError(
+                    'the outer shell is required by shell losses or winding-model '
+                    'supervision, but no outer shell path is set')
             progress.begin('loading', 'Loading outer shell')
             shell_patch = load_tifxyz(self.shell_path)
 
@@ -1812,10 +1889,11 @@ class FitContext:
             raise ValueError(
                 f'dense_spacing_mode={dense_spacing_mode!r} must be '
                 "'phase', 'grad_mag', or 'winding_model'")
-        phase_mode = dense_spacing_mode == 'phase'
-        winding_model_mode = dense_spacing_mode == 'winding_model'
+        phase_mode = phase_bundle_enabled(self.config)
+        winding_model_mode = winding_inference_enabled(self.config)
         grad_mag_spacing_enabled = (
             dense_spacing_mode == 'grad_mag'
+            and input_source_enabled(self.config, 'gradient_magnitude')
             and self.config['loss_weight_dense_spacing'] > 0
         )
         shell_envelope = None
@@ -1884,17 +1962,22 @@ class FitContext:
         num_verified_patches = len(verified_patches_list)
         print(f'fitting {num_verified_patches} patches')
 
-        progress.begin(
-            'loading', 'Building verified-patch GPU atlas',
-            detail=f'{len(verified_patches):,} patches')
+        # Keep the verified atlas as a required session object even when this
+        # run has no verified patches.  Device setup and theta-topology
+        # registration deliberately consume an empty atlas without special
+        # casing, and interactive patch incorporation can append to it later.
         patch_atlas = PatchAtlas(verified_patches, device='cuda')
-        print(f'patch atlas: {patch_atlas.memory_mb():.1f} MB')
-        topology_stats = patch_atlas.topology_memory_stats()
-        print(
-            'compact patch topology: '
-            f"{int(topology_stats['num_valid_cells']):,} quads, "
-            f"{int(topology_stats['persistent_bytes']) / (1 << 30):.2f} GiB host "
-            f"({_startup_resource_suffix()})")
+        if verified_patches:
+            progress.begin(
+                'loading', 'Building verified-patch GPU atlas',
+                detail=f'{len(verified_patches):,} patches')
+            print(f'patch atlas: {patch_atlas.memory_mb():.1f} MB')
+            topology_stats = patch_atlas.topology_memory_stats()
+            print(
+                'compact patch topology: '
+                f"{int(topology_stats['num_valid_cells']):,} quads, "
+                f"{int(topology_stats['persistent_bytes']) / (1 << 30):.2f} GiB host "
+                f"({_startup_resource_suffix()})")
 
         # ==========================================================================================
         # trusted geometry (verified patches and pcls) kdtree / unverified patches + tracks masking
@@ -2008,6 +2091,8 @@ class FitContext:
         self.dense_spacing_mode = dense_spacing_mode
         self.phase_mode = phase_mode
         self.winding_model_mode = winding_model_mode
+        self.dense_normals_enabled = input_source_enabled(
+            self.config, 'normals')
         self.grad_mag_spacing_enabled = grad_mag_spacing_enabled
         self.track_sampling_config = track_sampling_config
         self.tracks = tracks
@@ -2231,7 +2316,7 @@ class FitContext:
         # lasagna and SDT stores
         # ==========================================================================
 
-        use_normals = (
+        use_normals = self.dense_normals_enabled and (
             self.config['loss_weight_dense_normals'] > 0 or self.phase_mode)
         self._ensure_sparse_volume_stores(
             use_normals=use_normals, progress=progress)
@@ -2604,7 +2689,7 @@ class FitContext:
         self.spiral_and_transform.to(self.device)
 
         # ==========================================================================
-        # Shell loss setup
+        # Outer-shell setup
         # ==========================================================================
 
         self.shell_map = None
@@ -2612,18 +2697,20 @@ class FitContext:
 
         shell_active = self.shell_patch is not None and self.shell_losses_enabled()
         if shell_active:
-            if self.config['loss_weight_shell_outer'] > 0:
-                self.shell_map = ShellPolarMap(
-                    self.shell_patch,
-                    self.umbilicus,
-                    z_min=self.z_begin - self.config['model_flow_bounds_z_margin'],
-                    z_max=self.z_end + self.config['model_flow_bounds_z_margin'],
-                    num_theta_bins=self.config['shell_num_theta_bins'],
-                    device=self.device,
-                    config=self.config,
-                )
             if self.config['loss_weight_shell_patch_radius'] > 0:
                 self.shell_valid_zyxs_gpu = self._subsample_shell_radius_pool(self.shell_patch)
+        if (self.shell_patch is not None
+                and (self.config['loss_weight_shell_outer'] > 0
+                     or self.winding_model_mode)):
+            self.shell_map = ShellPolarMap(
+                self.shell_patch,
+                self.umbilicus,
+                z_min=self.z_begin - self.config['model_flow_bounds_z_margin'],
+                z_max=self.z_end + self.config['model_flow_bounds_z_margin'],
+                num_theta_bins=self.config['shell_num_theta_bins'],
+                device=self.device,
+                config=self.config,
+            )
 
         # Dense losses sample out to this index even when shell losses are off.
         self.shell_outer_winding_idx, outer_winding_notes = resolve_outer_winding_idx_and_notes(
@@ -2933,6 +3020,19 @@ class FitContext:
             completed_iterations = self._initial_num_training_steps
         return self.save_checkpoint(f'{self.out_path}/checkpoint_{suffix}.ckpt', completed_iterations)
 
+    def _maybe_save_headless_checkpoint(self, completed_iterations):
+        """Refresh the final checkpoint path at each headless autosave boundary.
+
+        The completed run writes this same path once more, so an interrupted
+        fit leaves one resumable checkpoint while a successful fit leaves only
+        the conventional final checkpoint.
+        """
+        if (completed_iterations % _HEADLESS_AUTOSAVE_INTERVAL != 0
+                or completed_iterations >= self.num_training_steps
+                or not self.dist.is_main_process):
+            return None
+        return self._save_model('fitted', completed_iterations)
+
     def inspect_checkpoint(self, checkpoint, *, source='',
                            allow_legacy_schema=False):
         """Decide, on the CPU and without mutating anything, whether this
@@ -3043,7 +3143,8 @@ class FitContext:
             # request either way, so exactly those two may be absent.
             durable_schema = set(durable_config(dict(self.config)))
             unknown = set(checkpoint_cfg) - durable_schema
-            missing = durable_schema - set(checkpoint_cfg) - {'z_begin', 'z_end'}
+            missing = durable_schema - set(checkpoint_cfg) - (
+                {'z_begin', 'z_end'} | set(BACKFILLABLE_CONFIG_DEFAULTS))
             if unknown or missing:
                 reasons.append(
                     'checkpoint configuration does not match the current '
@@ -3389,12 +3490,18 @@ class FitContext:
                         self.cross_patch_pcls,
                         crossing_map=self.theta_crossing_map,
                         cfg=self.config, z_begin=self.z_begin, z_end=self.z_end)
-                if self.lasagna_volume is not None:
+                if self.lasagna_volume is not None and (
+                        (self.dense_normals_enabled
+                         and self.config['loss_weight_dense_normals'] > 0)
+                        or self.grad_mag_spacing_enabled):
                     for _loss_name, _loss_value in iter_lasagna_losses(
                             transform, dr, self.lasagna_volume,
                             self.shell_outer_winding_idx,
                             self.config['sample_count_dense_normal_points'],
                             compute_spacing=self.grad_mag_spacing_enabled,
+                            compute_normals=(
+                                self.dense_normals_enabled
+                                and self.config['loss_weight_dense_normals'] > 0),
                             cfg=self.config, z_begin=self.z_begin, z_end=self.z_end):
                         pass
                 if self._phase_mode_active():
@@ -3540,8 +3647,10 @@ class FitContext:
                 path = record.get('path')
                 input_id = record.get('id')
                 if kind == 'patch':
-                    if self.config['input_disable_patches']:
-                        raise RuntimeError('disable_patches=True: this session takes no patches')
+                    if not input_source_enabled(
+                            self.config, 'verified_patches'):
+                        raise RuntimeError(
+                            'verified-patch inputs are disabled for this session')
                     if input_id in self.verified_patches or input_id in new_patches:
                         raise RuntimeError(f'Patch {input_id!r} is already part of this session')
                     patch = load_tifxyz(path)
@@ -3556,6 +3665,9 @@ class FitContext:
                     patch.release_derived_caches()
                     new_patches[input_id] = patch
                 elif kind == 'fiber':
+                    if not input_source_enabled(self.config, 'fibers'):
+                        raise RuntimeError(
+                            'fiber inputs are disabled for this session')
                     pcl = load_fiber_point_collection(
                         path, self.next_id, min_point_spacing=self.config['pcl_fiber_min_point_spacing'])
                     if pcl is None:
@@ -3569,6 +3681,10 @@ class FitContext:
                     self.next_id += 1
                 elif kind == 'pcl':
                     role = record.get('role')
+                    if not pcl_input_enabled(self.config, role, path):
+                        raise RuntimeError(
+                            f'{role or "legacy"} PCL inputs are disabled for '
+                            'this session')
                     loaded = load_point_collection(path) or {}
                     if not loaded:
                         raise RuntimeError(f'PCL document {input_id!r} contains no collections')
@@ -3861,12 +3977,16 @@ class FitContext:
                         z_max=self.z_end + self.config['model_flow_bounds_z_margin'],
                         num_theta_bins=self.config['shell_num_theta_bins'],
                         device=self.device, config=self.config)
-                    if self.config['loss_weight_shell_outer'] > 0 else None
+                    if (self.shell_patch is not None
+                        and (self.config['loss_weight_shell_outer'] > 0
+                             or self.winding_model_mode)) else None
                 )
             if 'loss_weight_shell_patch_radius' in changed:
                 rebuilt_shell_valid = (
                     self._subsample_shell_radius_pool(self.shell_patch)
-                    if self.config['loss_weight_shell_patch_radius'] > 0 else None
+                    if (self.shell_patch is not None
+                        and self.config['loss_weight_shell_patch_radius'] > 0)
+                    else None
                 )
             if 'shell_outer_winding_idx' in changed:
                 rebuilt_shell_outer = int(self.config['shell_outer_winding_idx'])
@@ -4054,10 +4174,17 @@ class FitContext:
             cfg=self.config,
         )
         patch_family = {
-            'patch_radius': patch_loss_values[0] * self.config['loss_weight_patch_radius'],
-            'patch_dt': patch_loss_values[2] * self.config['loss_weight_patch_dt'],
             'umbilicus': patch_loss_values[1] * self.config['loss_weight_umbilicus'],
         }
+        if self.verified_patches_list:
+            patch_family.update({
+                'patch_radius': (
+                    patch_loss_values[0]
+                    * self.config['loss_weight_patch_radius']),
+                'patch_dt': (
+                    patch_loss_values[2]
+                    * self.config['loss_weight_patch_dt']),
+            })
         if self.shell_valid_zyxs_gpu is not None:
             patch_family['shell_patch_radius'] = patch_loss_values[3] * self.config['loss_weight_shell_patch_radius']
         backward_family(patch_family)
@@ -4126,7 +4253,9 @@ class FitContext:
             })
 
         if (
-            (self.config['loss_weight_dense_normals'] > 0 or self.grad_mag_spacing_enabled)
+            ((self.dense_normals_enabled
+              and self.config['loss_weight_dense_normals'] > 0)
+             or self.grad_mag_spacing_enabled)
             and self.lasagna_volume is not None
         ):
             for dense_loss_name, dense_loss_value in iter_lasagna_losses(
@@ -4136,6 +4265,9 @@ class FitContext:
                 self.shell_outer_winding_idx,
                 self.config['sample_count_dense_normal_points'],
                 compute_spacing=self.grad_mag_spacing_enabled,
+                compute_normals=(
+                    self.dense_normals_enabled
+                    and self.config['loss_weight_dense_normals'] > 0),
                 cfg=self.config, z_begin=self.z_begin, z_end=self.z_end,
             ):
                 weight = (
@@ -4282,7 +4414,8 @@ class FitContext:
                 del track_loss_value
 
         shell_metrics = {}
-        if self.shell_map is not None:
+        if (self.shell_map is not None
+                and self.config['loss_weight_shell_outer'] > 0):
             shell_outer_loss, shell_metrics = get_shell_outer_loss(
                 self.shell_map,
                 self.slice_to_spiral_transform,
@@ -4412,15 +4545,30 @@ class FitContext:
                     )
                     by_param = ', '.join(f'{name}: {count}' for name, count in per_param)
                     print(f'  ({n_sanitised} non-finite-gradient steps sanitised so far; by param: {by_param})')
+                payload = {
+                    'total_loss': loss.item(),
+                    'nonfinite_grad_steps': self.nonfinite_grad_steps.item(),
+                    **{f'nonfinite_grad_steps/{name}': count.item() for name, count in self.nonfinite_grad_by_param.items()},
+                    **{name + '_loss': value for name, value in losses.items()},
+                    **shell_metrics,
+                    **log_metrics,
+                }
+                metrics_history = os.environ.get('FIT_SPIRAL_METRICS_HISTORY')
+                if metrics_history:
+                    scalar_payload = {
+                        name: (value.item() if hasattr(value, 'item') else value)
+                        for name, value in payload.items()
+                    }
+                    with open(metrics_history, 'a') as stream:
+                        stream.write(json.dumps({
+                            'iteration': iteration,
+                            'metrics': scalar_payload,
+                        }) + '\n')
                 if wandb.run is not None:
-                    wandb.log({
-                        'total_loss': loss.item(),
-                        'nonfinite_grad_steps': self.nonfinite_grad_steps.item(),
-                        **{f'nonfinite_grad_steps/{name}': count.item() for name, count in self.nonfinite_grad_by_param.items()},
-                        **{name + '_loss': value for name, value in losses.items()},
-                        **shell_metrics,
-                        **log_metrics,
-                    })
+                    if metrics_history:
+                        wandb.log(payload, step=iteration)
+                    else:
+                        wandb.log(payload)
 
     def run(self):
         """Drive one complete headless fit to the configured horizon.
@@ -4449,6 +4597,7 @@ class FitContext:
             loss, losses, log_metrics, shell_metrics = self.step(iteration)
             progress.update(iteration - self.start_iteration + 1)
             self.log_step_metrics(iteration, loss, losses, log_metrics, shell_metrics)
+            self._maybe_save_headless_checkpoint(iteration + 1)
 
         # ==========================================================================
         # Final outputs
@@ -4485,10 +4634,12 @@ class FitContext:
                 dr_per_winding=self.dr_per_winding,
                 patches_list=self.verified_patches_list,
                 patches_dict=self.verified_patches,
+                patch_atlas=self.patch_atlas,
                 unattached_pcl_strips=self.unattached_pcl_strips,
                 tracks=self.tracks,
                 unverified_patches_list=self.unverified_patches_list,
                 unverified_patches_dict=self.unverified_patches,
+                unverified_patch_atlas=self.unverified_patch_atlas,
                 out_path=self.out_path,
                 cfg=self.config,
                 z_begin=self.z_begin,
@@ -4628,7 +4779,20 @@ if __name__ == '__main__':
         wandb_mode = os.environ.get('WANDB_MODE', 'disabled')
         if not dist_context.is_main_process:
             wandb_mode = 'disabled'
-        wandb.init(project='scrolls', config=config, mode=wandb_mode)
+        wandb_init_kwargs = {
+            'project': os.environ.get('WANDB_PROJECT', 'scrolls'),
+            'entity': os.environ.get('WANDB_ENTITY'),
+            'config': config,
+            'mode': wandb_mode,
+        }
+        if os.environ.get('FIT_SPIRAL_BATCH_RUN') == '1':
+            wandb_init_kwargs.update({
+                'id': os.environ['WANDB_RUN_ID'],
+                'name': os.environ['WANDB_NAME'],
+                'group': os.environ['WANDB_RUN_GROUP'],
+                'resume': 'never',
+            })
+        wandb.init(**wandb_init_kwargs)
         # The CLI boundary is where the FIT_SPIRAL_* fit controls are parsed;
         # FitContext itself no longer reads them.
         main(
