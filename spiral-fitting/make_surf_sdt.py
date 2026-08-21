@@ -48,9 +48,9 @@ beyond the CT extent also count as zero.
 
 Chunks are uncompressed by default (--codec none): at the scales in use the
 store is small enough that compression is not worth the read-speed penalty.
---codec vcz1-rans (delta + rANS lossless, quant bin width 1) and blosc-zstd
-remain available; vcz1 consumers must have the numcodecs wrapper registered
-(import vc.compression.vcz1_numcodecs) to decode.
+--codec vc-delta3d (delta + rANS lossless, quant bin width 1) and blosc-zstd
+remain available; consumers must have the numcodecs wrapper registered
+(import vc_delta3d) to decode.
 """
 
 import importlib.metadata
@@ -72,9 +72,9 @@ from scipy import ndimage
 from tqdm import tqdm
 
 try:
-    from vc.compression.vcz1_numcodecs import Vcz1  # also registers the codec
+    from vc_delta3d.numcodecs import Delta3D
 except ImportError:
-    Vcz1 = None
+    Delta3D = None
 
 ENCODING_OFFSET = 128
 MIN_EDT_VERSION = (3, 1, 2)
@@ -466,9 +466,9 @@ def _human_bytes(n):
               help='binary-erode the binarized prediction by this many source voxels before the '
                    'EDT (the halo is enlarged to keep windowed distances exact)')
 @click.option('--codec', default='none', show_default=True,
-              type=click.Choice(['none', 'vcz1-rans', 'blosc-zstd']),
-              help='chunk compression; none = uncompressed (fastest reads), vcz1-rans is the '
-                   'VCZ1 delta + rANS lossless configuration')
+              type=click.Choice(['none', 'vc-delta3d', 'vcz1-rans', 'blosc-zstd']),
+              help='chunk compression; none = uncompressed (fastest reads), vc-delta3d is the '
+                   'axis-adaptive delta + rANS lossless configuration; vcz1-rans is an alias')
 @click.option('--pyramid-levels', default=2, type=int, show_default=True,
               help='number of 2x mean-pooled pyramid groups after the base group')
 @click.option('--workers', default=4, type=int, show_default=True, help='worker processes')
@@ -482,11 +482,11 @@ def main(surf_path, group_name, out_path, threshold, scale, working_voxel_um, un
     command_line = shlex.join(sys.argv)
 
     ct_zero = ct_zero and ct_path is not None
-    if codec == 'vcz1-rans':
-        if Vcz1 is None:
-            sys.exit('the vcz1-rans codec needs the volume-cartographer python bindings '
-                     '(vc.compression.vcz1); install them or pass another --codec')
-        compressor = Vcz1(codec='rans', quant=1)  # delta + rANS, quant 1 = lossless
+    if codec in {'vc-delta3d', 'vcz1-rans'}:
+        if Delta3D is None:
+            sys.exit('the VC-Delta3D codec needs the volume-cartographer Python dependencies '
+                     '(vc-delta3d); install it or pass another --codec')
+        compressor = Delta3D(quant=1)
     elif codec == 'blosc-zstd':
         compressor = Blosc(cname='zstd', clevel=3, shuffle=Blosc.SHUFFLE)
     else:

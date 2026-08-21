@@ -90,6 +90,43 @@ _Z_RANGE_DESCRIPTIONS = {
              "rendering, and model/checkpoint z-domain compatibility.",
 }
 
+_INPUT_TOGGLE_DESCRIPTIONS = {
+    "input_use_verified_patches":
+        "Load verified patches and allow their radius/DT supervision.",
+    "input_use_unverified_patches":
+        "Load unverified patches and allow their radius/DT supervision.",
+    "input_use_tracks":
+        "Load tracks and allow track sampling and losses.",
+    "input_use_fibers":
+        "Load fiber annotations into the point-collection supervision pools.",
+    "input_use_pcl_absolute":
+        "Load absolute-winding point-collection inputs.",
+    "input_use_pcl_relative":
+        "Load relative-winding point-collection inputs.",
+    "input_use_pcl_same_winding":
+        "Load same-winding point-collection inputs.",
+    "input_use_pcl_drawn_control_points":
+        "Load drawn-control-point point-collection inputs.",
+    "input_use_normals":
+        "Allow dense normal stores, sampling, and normal-dependent losses.",
+    "input_use_surf_sdt":
+        "Allow the surface-SDT store and SDT-dependent phase losses.",
+    "input_use_gradient_magnitude":
+        "Allow gradient-magnitude dense-spacing supervision.",
+    "input_use_winding_inference":
+        "Allow compact winding-inference supervision.",
+    "input_use_outer_shell":
+        "Allow outer-shell losses, lookup maps, and shell-based track filtering.",
+}
+
+# These fields were added after durable checkpoints already existed. Missing
+# values are unambiguous: historical fits used every available input, so a
+# missing toggle means True. Checkpoint readers use this mapping instead of
+# weakening strict schema checks for unrelated future fields.
+BACKFILLABLE_CONFIG_DEFAULTS = {
+    key: True for key in _INPUT_TOGGLE_DESCRIPTIONS
+}
+
 # Configuration keys that shape the model's parameter tensors. A checkpoint
 # whose stored value for any of them differs describes a different model, and
 # is refused rather than reshaped: a domain/structure change is the explicit
@@ -211,6 +248,12 @@ def _field_spec(key, default):
         spec["scale_with_z"] = True
     if key in _Z_RANGE_DESCRIPTIONS:
         spec["description"] = _Z_RANGE_DESCRIPTIONS[key]
+        # These values remain part of the resolved/checkpoint configuration,
+        # but interactive clients edit them through the run-level z controls,
+        # not as independent advanced-JSON settings.
+        spec["ui_owner"] = "run"
+    elif key in _INPUT_TOGGLE_DESCRIPTIONS:
+        spec["description"] = _INPUT_TOGGLE_DESCRIPTIONS[key]
     return spec
 
 
@@ -291,6 +334,23 @@ class Config:
         # probabilities: 0 = uniform, 1 = proportional to area.
         self.patch_sampling_area_exponent = 0.5
         self.patch_erode_patches = 1
+        # Rebuild-scoped supervision-source switches. A false value is a hard
+        # participation gate: the source is not loaded, prepared, sampled, or
+        # used by losses. Loss weights and sample counts remain unchanged so
+        # re-enabling a source restores its previous tuning.
+        self.input_use_verified_patches = True
+        self.input_use_unverified_patches = True
+        self.input_use_tracks = True
+        self.input_use_fibers = True
+        self.input_use_pcl_absolute = True
+        self.input_use_pcl_relative = True
+        self.input_use_pcl_same_winding = True
+        self.input_use_pcl_drawn_control_points = True
+        self.input_use_normals = True
+        self.input_use_surf_sdt = True
+        self.input_use_gradient_magnitude = True
+        self.input_use_winding_inference = True
+        self.input_use_outer_shell = True
         self.input_disable_patches = False
         # When set, only patch directory entries (uuid-named) whose name
         # matches this regex (re.search) are loaded; None loads everything.
@@ -492,13 +552,25 @@ class Config:
 
     @classmethod
     def catalog(cls):
-        defaults = cls().as_dict()
+        resolved_defaults = cls().as_dict()
+        run_owned = {"z_begin", "z_end"}
+        defaults = {
+            key: value for key, value in resolved_defaults.items()
+            if key not in run_owned
+        }
         fields = {
             key: _field_spec(key, value)
             for key, value in defaults.items()
         }
+        run_fields = {
+            key: _field_spec(key, resolved_defaults[key])
+            for key in sorted(run_owned)
+        }
         presets = {
-            path.stem: cls(path).as_dict()
+            path.stem: {
+                key: value for key, value in cls(path).as_dict().items()
+                if key not in run_owned
+            }
             for path in (Path(__file__).parent / "configs").glob("*.json")
         }
         return {
@@ -514,6 +586,10 @@ class Config:
                 # answers still come from the service (see rebuild_stage).
                 "model_stage_keys": sorted(MODEL_STAGE_KEYS),
                 "fields": fields,
+                # API run-block fields shown in the left-side dock. They are
+                # catalogued for clients but deliberately absent from the
+                # advanced configuration defaults, fields, and presets.
+                "run_fields": run_fields,
             },
             "presets": presets,
         }

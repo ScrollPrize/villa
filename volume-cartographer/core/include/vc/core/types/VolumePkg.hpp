@@ -45,6 +45,13 @@ bool isLocationRemote(const std::string& location);
 std::filesystem::path resolveLocalPath(const std::string& location,
                                        const std::filesystem::path& base = {});
 
+// Open-data volume entries carry their sample identity in a tag. Keep their
+// chunk caches grouped with the other catalog data while leaving ordinary
+// remote volumes directly beneath the configured cache root.
+std::filesystem::path remoteVolumeCacheRootForEntry(
+    const std::filesystem::path& configuredRoot,
+    const Entry& entry);
+
 std::string validateLocation(Category category, const std::string& location);
 std::string validateSingleVolumeLocation(const std::string& location);
 utils::Json volumeMetadataFromEntryTags(const std::vector<std::string>& tags);
