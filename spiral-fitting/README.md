@@ -4,6 +4,14 @@ Code and helpers to fit a canonical Archimedean spiral to deformed scrolls.
 `spiral_service.py` hosts one persistent interactive fit session over HTTP for
 the VC3D Spiral workspace; `fit_spiral.py` is the underlying fitter.
 
+## Sweep runner output
+
+`runners/run_sweep.py` prefixes each active fit's live `PROGRESS` and
+every-200-step loss lines with its configuration name. Optimization progress
+includes the average iteration rate for the current stage (`it/s`). Complete
+combined stdout/stderr for every attempt remains available under
+`<output>/.sweep/logs/<config>.log`.
+
 
 
 ## Flattening a fitted checkpoint
