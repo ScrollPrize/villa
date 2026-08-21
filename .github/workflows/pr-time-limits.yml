@@ -35,11 +35,15 @@ jobs:
 
             if [ "$updated_ts" -le "$inactive_cutoff" ]; then
               gh pr close "$number" \
+                --repo "${{ github.repository }}"
+              gh pr comment "$number" \
                 --repo "${{ github.repository }}" \
-                --comment "Closing automatically under the repository PR time limits because this PR has had no activity for 14 days."
+                --body "Closed automatically under the repository PR time limits because this PR has had no activity for 14 days."
             elif [ "$created_ts" -le "$age_cutoff" ]; then
               gh pr close "$number" \
+                --repo "${{ github.repository }}"
+              gh pr comment "$number" \
                 --repo "${{ github.repository }}" \
-                --comment "Closing automatically under the repository PR time limits because this PR has been open for 28 days without being merged."
+                --body "Closed automatically under the repository PR time limits because this PR has been open for 28 days without being merged."
             fi
           done
