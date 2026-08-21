@@ -573,7 +573,7 @@ In supervised learning, a model learns from direct supervision, which usually is
 
 An **embedding** is a vector representation learned by the model. If ink-like voxels form a recognizable cluster in embedding space, a small number of expert-selected examples may help generate many candidate labels.
 
-This is especially attractive for our data because the volumes are enormous and labels are scarce. The project's 3D DINO implementation, [dinovol](https://github.com/ScrollPrize/dinovol), is open-source, with two trained checkpoints released on Hugging Face: [dinovol\_v2\_ps8\_with\_paris4\_352500](https://huggingface.co/scrollprize/dinovol_v2_ps8_with_paris4_352500) and [dinovol\_v2\_ps6\_step032350](https://huggingface.co/scrollprize/dinovol_v2_ps6_step032350).
+This is especially attractive for our data because the volumes are enormous and labels are scarce. The project's 3D DINO implementation, [dinovol](https://github.com/ScrollPrize/villa/tree/main/dinovol), is open-source, with two trained checkpoints released on Hugging Face: [dinovol\_v2\_ps8\_with\_paris4\_352500](https://huggingface.co/scrollprize/dinovol_v2_ps8_with_paris4_352500) and [dinovol\_v2\_ps6\_step032350](https://huggingface.co/scrollprize/dinovol_v2_ps6_step032350).
 
 **DINO-guided segmentation targets**
 
@@ -744,5 +744,5 @@ High effective resolution matters here too: some ink information may live at ver
 * Ink detection inference code: [ink-detection/optimized_inference](https://github.com/ScrollPrize/villa/tree/main/ink-detection/optimized_inference)
 * Neural tracing inference service (heatmap / dense-displacement / copy modes): [trace_service.py](https://github.com/ScrollPrize/villa/blob/main/vesuvius/src/vesuvius/neural_tracing/trace_service.py)
 * Neural mesh autoregression (MVP): [neural_tracing/autoreg_mesh](https://github.com/ScrollPrize/villa/tree/main/vesuvius/src/vesuvius/neural_tracing/autoreg_mesh)
-* 3D DINO implementation: [https://github.com/ScrollPrize/dinovol](https://github.com/ScrollPrize/dinovol)
+* 3D DINO implementation: [https://github.com/ScrollPrize/villa/tree/main/dinovol](https://github.com/ScrollPrize/villa/tree/main/dinovol)
 * ScrollFiesta, community automatic mesher: [https://github.com/Hob3rMallow/scrollfiesta_public](https://github.com/Hob3rMallow/scrollfiesta_public)

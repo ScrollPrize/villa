@@ -1,6 +1,7 @@
 #include "vc/lasagna/ProjectVolumes.hpp"
 
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/types/VolumePkg.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -91,13 +92,33 @@ std::shared_ptr<Volume> openRegularVolumeForGroup(
 {
     const std::string location = attachmentLocationForGroup(group);
     if (group.isRemote()) {
-        return Volume::NewFromUrl(location, group.remoteCacheRoot,
-                                  group.remoteAuth);
+        const auto auth = group.discoverAwsCredentials
+            ? group.remoteAuth
+            : vc::HttpAuth{};
+        return Volume::NewFromUrl(
+            location, group.remoteCacheRoot, auth, {},
+            group.discoverAwsCredentials);
     }
     return Volume::New(std::filesystem::path(location));
 }
 
 }  // namespace
+
+std::vector<std::string> lasagnaProjectVolumeTags(
+    const LasagnaChannelGroup& group,
+    std::string_view manifestLocation)
+{
+    std::vector<std::string> tags;
+    addUniqueTag(
+        tags, std::string(kLasagnaVolumeManifestTagPrefix) +
+                  std::string(manifestLocation));
+    addUniqueTag(tags, std::string(kLasagnaVolumeGroupTagPrefix) + group.name);
+    if (group.isRemote() && !group.discoverAwsCredentials) {
+        addUniqueTag(
+            tags, std::string(vc::project::kAnonymousRemoteAuthTag));
+    }
+    return tags;
+}
 
 std::vector<PreparedLasagnaProjectVolume> prepareLasagnaProjectVolumes(
     const LasagnaDataset& dataset,
@@ -118,20 +139,14 @@ std::vector<PreparedLasagnaProjectVolume> prepareLasagnaProjectVolumes(
                 return candidate.location == location;
             });
 
-        const std::string manifestTag =
-            std::string(kLasagnaVolumeManifestTagPrefix) + manifestLocation;
-        const std::string groupTag =
-            std::string(kLasagnaVolumeGroupTagPrefix) + group.name;
+        auto tags = lasagnaProjectVolumeTags(group, manifestLocation);
 
         if (existing != prepared.end()) {
-            addUniqueTag(existing->tags, manifestTag);
-            addUniqueTag(existing->tags, groupTag);
+            for (auto& tag : tags)
+                addUniqueTag(existing->tags, std::move(tag));
             continue;
         }
 
-        std::vector<std::string> tags;
-        addUniqueTag(tags, manifestTag);
-        addUniqueTag(tags, groupTag);
         prepared.push_back({
             location,
             std::move(tags),

@@ -151,6 +151,14 @@ TEST_CASE("Segmentation: canLoadSurface requires the tifxyz payload")
     CHECK_FALSE(seg.canLoadSurface());
     CHECK(seg.loadSurface() == nullptr);
 
+    SUBCASE("catalog provenance alone is not a lazy placeholder")
+    {
+        std::ofstream(t.dir / "catalog-origin.json") << "{}";
+        Segmentation catalogSegment(t.dir);
+        CHECK_FALSE(catalogSegment.canLoadSurface());
+        CHECK(catalogSegment.loadSurface() == nullptr);
+    }
+
     SUBCASE("a partial payload is still not loadable")
     {
         std::ofstream(t.dir / "x.tif") << "stub";

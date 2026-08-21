@@ -50,7 +50,8 @@ def test_interactive_runtime_impacts_match_resident_capabilities():
         if key.startswith("patch_"):
             expected = (
                 "new_fit"
-                if key == "patch_erode_patches" else "run_boundary")
+                if key in {"patch_erode_patches", "patch_uuid_filter_regex"}
+                else "run_boundary")
             assert field["runtime_impact"] == expected
         if key.startswith("dense_"):
             expected = (
@@ -154,3 +155,12 @@ def test_mapping_and_json_overrides_and_validation(tmp_path):
         Config({"dense_spacing_pair_m_short": [1]})
     with pytest.raises(ValueError):
         Config({"track_max_tortuosity": "unlimited"})
+
+
+def test_obsolete_patch_sampling_fields_are_not_in_the_schema():
+    catalog = Config.catalog()
+    for key in ("patch_strip_sampling", "patch_2d_sampling_max_area"):
+        assert key not in catalog["defaults"]
+        assert key not in catalog["schema"]["fields"]
+        with pytest.raises(ValueError, match="Unknown"):
+            Config({key: "straight" if key.endswith("sampling") else 1.0})
