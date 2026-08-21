@@ -251,7 +251,8 @@ public:
         // avoiding a decode+re-encode round trip on the cache writer.
         if (array_->stores_chunks_with_codec("c3d"))
             persistEncodedExtension_ = ".c3d";
-        else if (array_->stores_chunks_with_codec(vc::kVcz1CodecName))
+        else if (array_->stores_chunks_with_codec(vc::kDelta3dCodecName) ||
+                 array_->stores_chunks_with_codec(vc::kVcz1CodecName))
             persistEncodedExtension_ = vc::kCompressedCacheExtension;
     }
 
