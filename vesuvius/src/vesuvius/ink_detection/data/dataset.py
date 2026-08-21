@@ -15,6 +15,7 @@ from torch.utils.data import Dataset
 from vesuvius.ink_detection.data.augmentations import (
     build_augmentations,
     maybe_translate_crop_bbox,
+    split_augmentations_by_geometry,
 )
 from vesuvius.ink_detection.config import InkDataConfig
 from vesuvius.ink_detection.data.geometry import (
@@ -114,11 +115,19 @@ class InkDataset(Dataset):
         do_augmentations: bool = True,
         patches: list[Patch] | None = None,
         segments: list[Segment] | None = None,
+        emit_image_for_label: bool = False,
+        input_mask_threshold: float | None = None,
     ) -> None:
         self.config = config
         self.patch_size = config.patch_size
         self.mode = config.mode
         self.do_augmentations = bool(do_augmentations)
+        self.emit_image_for_label = bool(emit_image_for_label)
+        self.input_mask_threshold = (
+            None
+            if input_mask_threshold is None
+            else float(input_mask_threshold)
+        )
         self._zarr_cache: dict[tuple, object] = {}
         self._tifxyz_cache: dict[str, object] = {}
         self._stored_resolution_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
@@ -129,6 +138,13 @@ class InkDataset(Dataset):
                 config.patch_size,
                 rotation_axes=config.augmentation.rotation_axes,
             )
+        self.geometric_augmentations = None
+        self.photometric_augmentations = None
+        if self.emit_image_for_label and self.augmentations is not None:
+            (
+                self.geometric_augmentations,
+                self.photometric_augmentations,
+            ) = split_augmentations_by_geometry(self.augmentations)
 
         if patches is None:
             self.segments = list(gather_segments(config))
@@ -537,6 +553,16 @@ class InkDataset(Dataset):
         surface_mask: np.ndarray | None,
     ) -> dict[str, torch.Tensor]:
         image = image.astype(np.float32, copy=False)
+        raw_mean = None
+        raw_std = None
+        image_mask = None
+        if self.emit_image_for_label:
+            raw_mean = float(image.mean())
+            raw_std = float(image.std())
+            if self.input_mask_threshold is not None:
+                image_mask = (image > self.input_mask_threshold).astype(
+                    np.float32
+                )
         if image_valid_slices is not None:
             image[image_valid_slices] = normalize_image(
                 image[image_valid_slices], self.config.normalization
@@ -558,12 +584,37 @@ class InkDataset(Dataset):
         }
         if surface_mask is not None:
             data["surface_mask"] = torch.from_numpy(surface_mask).float().unsqueeze(0)
-        if self.augmentations is not None:
+        if image_mask is not None:
+            data["image_mask_for_label"] = (
+                torch.from_numpy(image_mask).float().unsqueeze(0)
+            )
+        if self.geometric_augmentations is not None:
+            augmentation_data = data
+            if self.mode == "full_3d_single_wrap":
+                augmentation_data = dict(data)
+                augmentation_data["regression_keys"] = ["surface_mask"]
+            after_geometry = self.geometric_augmentations(**augmentation_data)
+            image_for_label = after_geometry["image"].clone()
+            mask_for_label = after_geometry.pop("image_mask_for_label", None)
+            data = self.photometric_augmentations(**after_geometry)
+            data["image_for_label"] = image_for_label
+            if mask_for_label is not None:
+                data["image_mask_for_label"] = (mask_for_label > 0.5).float()
+        elif self.augmentations is not None:
             augmentation_data = data
             if self.mode == "full_3d_single_wrap":
                 augmentation_data = dict(data)
                 augmentation_data["regression_keys"] = ["surface_mask"]
             data = self.augmentations(**augmentation_data)
+        elif self.emit_image_for_label:
+            data["image_for_label"] = data["image"].clone()
+            if "image_mask_for_label" in data:
+                data["image_mask_for_label"] = (
+                    data["image_mask_for_label"] > 0.5
+                ).float()
+        if raw_mean is not None and raw_std is not None:
+            data["image_raw_mean"] = torch.tensor(raw_mean, dtype=torch.float32)
+            data["image_raw_std"] = torch.tensor(raw_std, dtype=torch.float32)
         data["is_unlabeled"] = torch.tensor(patch.is_unlabeled, dtype=torch.bool)
         return data
 

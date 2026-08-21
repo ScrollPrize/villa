@@ -138,6 +138,8 @@ LEGACY_RENAMES = {
 # These settings moved out of the durable config or were replaced by current
 # track-walk controls.  VC3D now derives input enablement from selected paths.
 LEGACY_REMOVED = {
+    "patch_strip_sampling",
+    "patch_2d_sampling_max_area",
     "use_verified_patches",
     "use_unverified_patches",
     "use_normals",

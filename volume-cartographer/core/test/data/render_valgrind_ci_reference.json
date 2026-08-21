@@ -2,35 +2,35 @@
   "cases": {
     "parallel/fallback_3": {
       "checksum": 4092684805825541122,
-      "modeled_runtime_score_ns": 2652456.159123063
+      "modeled_runtime_score_ns": 2605277.8967071185
     },
     "parallel/full_res": {
       "checksum": 8319256024933588756,
-      "modeled_runtime_score_ns": 927228.2439746696
+      "modeled_runtime_score_ns": 896747.1151190569
     },
     "parallel/mixed_correlated": {
       "checksum": 9419607384140948446,
-      "modeled_runtime_score_ns": 1985726.0110827591
+      "modeled_runtime_score_ns": 1708503.75388749
     },
     "parallel/mixed_shuffled": {
       "checksum": 2698931263477305860,
-      "modeled_runtime_score_ns": 16127550.905297693
+      "modeled_runtime_score_ns": 8961775.524007399
     },
     "serial/fallback_3": {
       "checksum": 2611257448726826058,
-      "modeled_runtime_score_ns": 893519.018267335
+      "modeled_runtime_score_ns": 893407.7850907209
     },
     "serial/full_res": {
       "checksum": 8712995097771526824,
-      "modeled_runtime_score_ns": 335043.091084441
+      "modeled_runtime_score_ns": 334923.4415747905
     },
     "serial/mixed_correlated": {
       "checksum": 2185938871354150015,
-      "modeled_runtime_score_ns": 621631.7372745703
+      "modeled_runtime_score_ns": 621331.3474646086
     },
     "serial/mixed_shuffled": {
       "checksum": 1627454152496030813,
-      "modeled_runtime_score_ns": 927876.6449918726
+      "modeled_runtime_score_ns": 927652.3631373289
     }
   },
   "model_sha256": "c75069f4fc1580029bf4013c1bbf999f2388a1ddda481d53f108f1412e11e409",
