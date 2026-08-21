@@ -104,8 +104,40 @@ def test_non_tty_console_uses_stable_progress_lines():
     output = stream.getvalue()
     assert "PROGRESS Optimizing" in output
     assert "1/4 iterations (25.0%)" in output
+    assert "0.2 it/s" in output
     assert "ETA 15s" in output
     assert "4/4 iterations (100.0%)" in output
+
+
+def test_iteration_rate_is_console_only_and_requires_completed_work():
+    clock = FakeClock()
+    stream = io.StringIO()
+    reporter = ProgressReporter(
+        stream=stream, clock=clock, heartbeat_interval=0)
+    reporter.begin(
+        "optimizing", "Optimizing",
+        step=0, total_steps=100, unit="iterations")
+    assert "it/s" not in stream.getvalue()
+
+    clock.advance(5)
+    reporter.update(10)
+
+    assert "2.0 it/s" in stream.getvalue()
+    assert "rate_per_second" not in reporter.snapshot()
+
+
+def test_non_iteration_progress_does_not_show_iteration_rate():
+    clock = FakeClock()
+    stream = io.StringIO()
+    reporter = ProgressReporter(
+        stream=stream, clock=clock, heartbeat_interval=0)
+    reporter.begin(
+        "loading", "Loading patches",
+        step=0, total_steps=100, unit="patches")
+    clock.advance(5)
+    reporter.update(20)
+
+    assert "it/s" not in stream.getvalue()
 
 
 def test_updates_and_snapshots_are_thread_safe():

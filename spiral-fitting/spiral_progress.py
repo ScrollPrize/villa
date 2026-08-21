@@ -186,6 +186,7 @@ class ProgressReporter:
         detail = snapshot.get("detail")
         step, total = snapshot.get("step"), snapshot.get("total_steps")
         unit = snapshot.get("unit")
+        elapsed = float(snapshot["elapsed_seconds"])
         parts = [f"PROGRESS {stage}"]
         if isinstance(step, int) and isinstance(total, int) and total > 0:
             label = f"{step:,}/{total:,}"
@@ -195,7 +196,9 @@ class ProgressReporter:
             parts.append(label)
         elif detail:
             parts.append(str(detail))
-        parts.append(f"elapsed {_format_duration(float(snapshot['elapsed_seconds']))}")
+        if unit == "iterations" and isinstance(step, int) and step > 0 and elapsed > 0:
+            parts.append(f"{step / elapsed:.1f} it/s")
+        parts.append(f"elapsed {_format_duration(elapsed)}")
         eta = snapshot.get("eta_seconds")
         if isinstance(eta, (int, float)):
             parts.append(f"ETA {_format_duration(float(eta))}")

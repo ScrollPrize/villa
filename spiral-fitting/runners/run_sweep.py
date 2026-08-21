@@ -10,8 +10,9 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import threading
 import time
-from typing import Sequence
+from typing import Sequence, TextIO
 
 # Direct execution puts runners/ rather than the Spiral directory on sys.path.
 SPIRAL_DIR = Path(__file__).resolve().parent.parent
@@ -23,6 +24,7 @@ from config import Config  # noqa: E402
 
 
 _STEM_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+_LIVE_OUTPUT_RE = re.compile(r"(?:PROGRESS |step \d+: loss = )")
 DEFAULT_NUM_THREADS = 6
 
 
@@ -148,6 +150,60 @@ def child_command(
     return command
 
 
+def _relay_child_output(
+    stream: TextIO,
+    log: TextIO,
+    stem: str,
+    console: TextIO,
+    console_lock: threading.Lock,
+) -> None:
+    """Copy a child's complete output to its log and selected lines live."""
+    try:
+        for line in stream:
+            log.write(line)
+            log.flush()
+            if _LIVE_OUTPUT_RE.match(line):
+                with console_lock:
+                    console.write(f"[{stem}] {line}")
+                    console.flush()
+    finally:
+        stream.close()
+
+
+def _start_child(
+    command: list[str],
+    log: TextIO,
+    stem: str,
+    console: TextIO,
+    console_lock: threading.Lock,
+) -> tuple[subprocess.Popen[str], threading.Thread]:
+    env = os.environ.copy()
+    # run_single passes its environment to fit_spiral, so this also makes the
+    # fitter's stdout loss records observable immediately through the pipe.
+    env["PYTHONUNBUFFERED"] = "1"
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        shell=False,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        env=env,
+    )
+    if process.stdout is None:  # pragma: no cover - guaranteed by PIPE
+        raise RuntimeError("child stdout pipe was not created")
+    relay = threading.Thread(
+        target=_relay_child_output,
+        args=(process.stdout, log, stem, console, console_lock),
+        name=f"sweep-output-{stem}",
+        daemon=True,
+    )
+    relay.start()
+    return process, relay
+
+
 def execute(args: argparse.Namespace) -> int:
     configs = discover_configs(args.config_folder, args.sweep_config)
     output = args.output.resolve()
@@ -161,7 +217,12 @@ def execute(args: argparse.Namespace) -> int:
     logs_dir.mkdir(parents=True, exist_ok=True)
     pending = list(valid)
     free_groups = list(groups)
-    active: dict[subprocess.Popen, tuple[str, tuple[int, ...], object]] = {}
+    console = sys.stdout
+    console_lock = threading.Lock()
+    active: dict[
+        subprocess.Popen[str],
+        tuple[str, tuple[int, ...], TextIO, threading.Thread],
+    ] = {}
     results: dict[str, str] = {stem: f"FAILED: {message}"
                                for stem, message in failures.items()}
     attempts: dict[str, int] = {}
@@ -176,9 +237,9 @@ def execute(args: argparse.Namespace) -> int:
                 log.write(f"\n=== attempt {attempts[stem]} GPUs {','.join(map(str, group))} ===\n")
                 log.flush()
                 command = child_command(args, stem, config, group)
-                process = subprocess.Popen(
-                    command, stdout=log, stderr=subprocess.STDOUT, shell=False)
-                active[process] = (stem, group, log)
+                process, relay = _start_child(
+                    command, log, stem, console, console_lock)
+                active[process] = (stem, group, log, relay)
                 print(f"LAUNCH {stem} GPUs={','.join(map(str, group))}", flush=True)
 
             completed = [process for process in active if process.poll() is not None]
@@ -186,7 +247,8 @@ def execute(args: argparse.Namespace) -> int:
                 time.sleep(0.05)
                 continue
             for process in completed:
-                stem, group, log = active.pop(process)
+                stem, group, log, relay = active.pop(process)
+                relay.join()
                 log.close()
                 free_groups.append(group)
                 free_groups.sort(key=lambda item: groups.index(item))
@@ -200,8 +262,9 @@ def execute(args: argparse.Namespace) -> int:
         print("Interrupted; terminating active runs", file=sys.stderr, flush=True)
         for process in active:
             process.terminate()
-        for process, (stem, _group, log) in list(active.items()):
+        for process, (stem, _group, log, relay) in list(active.items()):
             process.wait()
+            relay.join()
             log.close()
             results[stem] = "FAILED: interrupted"
         raise
