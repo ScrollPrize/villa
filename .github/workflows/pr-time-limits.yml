@@ -16,6 +16,7 @@ jobs:
 
     steps:
       - name: Close inactive or unmerged PRs
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
