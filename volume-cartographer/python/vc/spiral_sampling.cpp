@@ -32,6 +32,7 @@ using BoolMatrix = nb::ndarray<nb::numpy, const bool, nb::ndim<2>, nb::c_contig>
 using Int64Vector = nb::ndarray<nb::numpy, const int64_t, nb::ndim<1>, nb::c_contig>;
 using Int64Pairs = nb::ndarray<nb::numpy, const int64_t, nb::shape<-1, 2>, nb::c_contig>;
 using FloatVector = nb::ndarray<nb::numpy, const float, nb::ndim<1>, nb::c_contig>;
+using FloatMatrix = nb::ndarray<nb::numpy, const float, nb::ndim<2>, nb::c_contig>;
 using Int32Pairs = nb::ndarray<nb::numpy, const int32_t, nb::shape<-1, 2>, nb::c_contig>;
 
 template <typename T>
@@ -765,6 +766,378 @@ private:
     std::vector<uint64_t> node_offsets_;
 };
 
+// Threshold-independent metadata for exhaustive patch satisfaction.  The
+// atlas is deliberately CPU/native: constructing ragged connected components
+// with tens of thousands of tiny Python/Torch calls costs much more than the
+// model transforms themselves on production patch sets.
+struct SatisfactionPatch {
+    int64_t quad_rows = 0;
+    int64_t quad_columns = 0;
+    int64_t full_valid_count = 0;
+    int64_t center_column = -1;
+    uint64_t vertex_offset = 0;
+    std::vector<int64_t> linear_quads;
+    std::vector<uint8_t> boundary;
+};
+
+class PatchSatisfactionAtlas {
+public:
+    PatchSatisfactionAtlas(
+        const nb::list& masks, const nb::list& vertex_zs,
+        float z_begin, float z_end)
+    {
+        if (nb::len(masks) != nb::len(vertex_zs))
+            throw std::runtime_error("masks and vertex_zs must have equal length");
+        std::vector<BoolMatrix> mask_views;
+        std::vector<FloatMatrix> z_views;
+        mask_views.reserve(nb::len(masks));
+        z_views.reserve(nb::len(vertex_zs));
+        for (nb::handle item : masks)
+            mask_views.push_back(nb::cast<BoolMatrix>(item));
+        for (nb::handle item : vertex_zs)
+            z_views.push_back(nb::cast<FloatMatrix>(item));
+
+        patches_.resize(mask_views.size());
+        std::vector<uint64_t> vertex_offsets(mask_views.size() + 1, 0);
+        for (size_t index = 0; index < mask_views.size(); ++index) {
+            if (z_views[index].shape(0) != mask_views[index].shape(0) + 1
+                || z_views[index].shape(1) != mask_views[index].shape(1) + 1)
+                throw std::runtime_error("vertex_zs shape must be mask shape + (1, 1)");
+            vertex_offsets[index + 1] = vertex_offsets[index]
+                + z_views[index].shape(0) * z_views[index].shape(1);
+        }
+        {
+            nb::gil_scoped_release release;
+#pragma omp parallel for schedule(dynamic)
+            for (int64_t index = 0;
+                 index < static_cast<int64_t>(mask_views.size()); ++index) {
+                build_patch(mask_views[static_cast<size_t>(index)],
+                            z_views[static_cast<size_t>(index)], z_begin, z_end,
+                            vertex_offsets[static_cast<size_t>(index)],
+                            patches_[static_cast<size_t>(index)]);
+            }
+        }
+        offsets_.reserve(patches_.size() + 1);
+        offsets_.push_back(0);
+        for (const auto& patch : patches_)
+            offsets_.push_back(offsets_.back() + patch.linear_quads.size());
+    }
+
+    size_t size() const { return patches_.size(); }
+    uint64_t total_quads() const { return offsets_.empty() ? 0 : offsets_.back(); }
+
+    nb::dict packed_layout() const
+    {
+        const size_t count = static_cast<size_t>(total_quads());
+        RawBuffer<int64_t> patch_indices(count);
+        RawBuffer<int64_t> quad_ijs(count * 2);
+        RawBuffer<int64_t> corner_vertex_ids(count * 4);
+        RawBuffer<uint8_t> boundary(count);
+        std::vector<int64_t> offsets(offsets_.begin(), offsets_.end());
+        std::vector<int64_t> full_valid_counts;
+        std::vector<int64_t> shapes;
+        full_valid_counts.reserve(patches_.size());
+        shapes.reserve(patches_.size() * 2);
+        {
+            nb::gil_scoped_release release;
+#pragma omp parallel for schedule(static)
+            for (int64_t patch_index = 0;
+                 patch_index < static_cast<int64_t>(patches_.size()); ++patch_index) {
+                const auto& patch = patches_[static_cast<size_t>(patch_index)];
+                const size_t out0 = static_cast<size_t>(offsets_[static_cast<size_t>(patch_index)]);
+                const int64_t vertex_columns = patch.quad_columns + 1;
+                for (size_t local = 0; local < patch.linear_quads.size(); ++local) {
+                    const size_t out = out0 + local;
+                    const int64_t linear = patch.linear_quads[local];
+                    const int64_t row = linear / patch.quad_columns;
+                    const int64_t column = linear % patch.quad_columns;
+                    const int64_t top_left = static_cast<int64_t>(patch.vertex_offset)
+                        + row * vertex_columns + column;
+                    patch_indices.data[out] = patch_index;
+                    quad_ijs.data[out * 2] = row;
+                    quad_ijs.data[out * 2 + 1] = column;
+                    corner_vertex_ids.data[out * 4] = top_left;
+                    corner_vertex_ids.data[out * 4 + 1] = top_left + 1;
+                    corner_vertex_ids.data[out * 4 + 2] = top_left + vertex_columns;
+                    corner_vertex_ids.data[out * 4 + 3] = top_left + vertex_columns + 1;
+                    boundary.data[out] = patch.boundary[local];
+                }
+            }
+        }
+        for (const auto& patch : patches_) {
+            full_valid_counts.push_back(patch.full_valid_count);
+            shapes.push_back(patch.quad_rows);
+            shapes.push_back(patch.quad_columns);
+        }
+        nb::dict result;
+        result["patch_offsets"] = own_1d(std::move(offsets));
+        result["patch_indices"] = own_1d_raw(std::move(patch_indices));
+        result["quad_ijs"] = own_2d_raw(std::move(quad_ijs), count, 2);
+        result["corner_vertex_ids"] = own_2d_raw(
+            std::move(corner_vertex_ids), count, 4);
+        result["boundary_flags"] = own_1d_raw(std::move(boundary));
+        result["full_valid_counts"] = own_1d(std::move(full_valid_counts));
+        result["quad_shapes"] = own_2d(std::move(shapes), patches_.size(), 2);
+        return result;
+    }
+
+    nb::dict unwrap_targets(FloatVector theta, FloatVector shifted_radius, float dr) const
+    {
+        if (theta.shape(0) != total_quads()
+            || shifted_radius.shape(0) != total_quads())
+            throw std::runtime_error("theta and shifted_radius must match packed quad count");
+        if (!(dr > 0))
+            throw std::runtime_error("dr must be positive");
+        const size_t count = static_cast<size_t>(total_quads());
+        RawBuffer<float> raw_targets(count);
+        RawBuffer<int64_t> target_windings(count);
+        std::vector<uint8_t> disconnected(patches_.size(), 0);
+        std::fill(raw_targets.data, raw_targets.data + count,
+                  std::numeric_limits<float>::quiet_NaN());
+        std::fill(target_windings.data, target_windings.data + count, -1);
+        {
+            nb::gil_scoped_release release;
+#pragma omp parallel for schedule(dynamic)
+            for (int64_t patch_index = 0;
+                 patch_index < static_cast<int64_t>(patches_.size()); ++patch_index) {
+                unwrap_patch(static_cast<size_t>(patch_index), theta,
+                             shifted_radius, dr, raw_targets.data,
+                             target_windings.data,
+                             disconnected[static_cast<size_t>(patch_index)]);
+            }
+        }
+        nb::dict result;
+        result["target_raw_shifted"] = own_1d_raw(std::move(raw_targets));
+        result["target_winding_indices"] = own_1d_raw(std::move(target_windings));
+        result["disconnected_patches"] = own_1d(std::move(disconnected));
+        return result;
+    }
+
+private:
+    struct Subrow {
+        int64_t row = 0;
+        int64_t column_begin = 0;
+        int64_t column_end = 0;
+        std::vector<float> cumulative;
+        std::vector<float> unwrapped;
+        float branch_offset = std::numeric_limits<float>::quiet_NaN();
+        struct Link { size_t target; size_t source_position; size_t target_position; };
+        std::vector<Link> links;
+    };
+
+    static void build_patch(const BoolMatrix& mask, const FloatMatrix& zs,
+                            float z_begin, float z_end, uint64_t vertex_offset,
+                            SatisfactionPatch& patch)
+    {
+        patch.quad_rows = static_cast<int64_t>(mask.shape(0));
+        patch.quad_columns = static_cast<int64_t>(mask.shape(1));
+        patch.vertex_offset = vertex_offset;
+        const size_t area = static_cast<size_t>(patch.quad_rows * patch.quad_columns);
+        std::vector<uint8_t> selected(area, 0);
+        for (int64_t row = 0; row < patch.quad_rows; ++row) {
+            for (int64_t column = 0; column < patch.quad_columns; ++column) {
+                if (!mask(row, column))
+                    continue;
+                ++patch.full_valid_count;
+                const float z00 = zs(row, column);
+                const float z01 = zs(row, column + 1);
+                const float z10 = zs(row + 1, column);
+                const float z11 = zs(row + 1, column + 1);
+                const float minimum = std::min(std::min(z00, z01), std::min(z10, z11));
+                const float maximum = std::max(std::max(z00, z01), std::max(z10, z11));
+                if (maximum >= z_begin && minimum < z_end) {
+                    const int64_t linear = row * patch.quad_columns + column;
+                    selected[static_cast<size_t>(linear)] = 1;
+                    patch.linear_quads.push_back(linear);
+                }
+            }
+        }
+        if (patch.linear_quads.empty())
+            return;
+        std::vector<uint8_t> columns(static_cast<size_t>(patch.quad_columns), 0);
+        for (int64_t linear : patch.linear_quads)
+            columns[static_cast<size_t>(linear % patch.quad_columns)] = 1;
+        std::vector<int64_t> valid_columns;
+        for (int64_t column = 0; column < patch.quad_columns; ++column)
+            if (columns[static_cast<size_t>(column)]) valid_columns.push_back(column);
+        patch.center_column = valid_columns[valid_columns.size() / 2];
+        patch.boundary.reserve(patch.linear_quads.size());
+        constexpr int offsets[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+        for (int64_t linear : patch.linear_quads) {
+            const int64_t row = linear / patch.quad_columns;
+            const int64_t column = linear % patch.quad_columns;
+            bool is_boundary = false;
+            for (const auto& offset : offsets) {
+                const int64_t next_row = row + offset[0];
+                const int64_t next_column = column + offset[1];
+                if (next_row < 0 || next_row >= patch.quad_rows
+                    || next_column < 0 || next_column >= patch.quad_columns
+                    || !selected[static_cast<size_t>(
+                        next_row * patch.quad_columns + next_column)]) {
+                    is_boundary = true;
+                    break;
+                }
+            }
+            patch.boundary.push_back(is_boundary ? 1 : 0);
+        }
+    }
+
+    void unwrap_patch(size_t patch_index, const FloatVector& theta,
+                      const FloatVector& shifted, float dr, float* raw_targets,
+                      int64_t* target_windings, uint8_t& disconnected) const
+    {
+        const SatisfactionPatch& patch = patches_[patch_index];
+        if (patch.linear_quads.empty())
+            return;
+        const size_t global_begin = static_cast<size_t>(offsets_[patch_index]);
+        const size_t grid_size = static_cast<size_t>(patch.quad_rows * patch.quad_columns);
+        std::vector<int64_t> packed_position(grid_size, -1);
+        for (size_t local = 0; local < patch.linear_quads.size(); ++local)
+            packed_position[static_cast<size_t>(patch.linear_quads[local])]
+                = static_cast<int64_t>(global_begin + local);
+
+        std::vector<Subrow> subrows;
+        std::vector<std::vector<size_t>> rows(static_cast<size_t>(patch.quad_rows));
+        for (int64_t row = 0; row < patch.quad_rows; ++row) {
+            int64_t column = 0;
+            while (column < patch.quad_columns) {
+                while (column < patch.quad_columns
+                       && packed_position[static_cast<size_t>(row * patch.quad_columns + column)] < 0)
+                    ++column;
+                if (column == patch.quad_columns) break;
+                const int64_t begin = column;
+                while (column < patch.quad_columns
+                       && packed_position[static_cast<size_t>(row * patch.quad_columns + column)] >= 0)
+                    ++column;
+                Subrow subrow;
+                subrow.row = row;
+                subrow.column_begin = begin;
+                subrow.column_end = column;
+                const size_t length = static_cast<size_t>(column - begin);
+                subrow.cumulative.resize(length, 0.0F);
+                subrow.unwrapped.resize(length);
+                for (size_t position = 0; position < length; ++position) {
+                    const int64_t packed = packed_position[static_cast<size_t>(
+                        row * patch.quad_columns + begin + static_cast<int64_t>(position))];
+                    if (position > 0) {
+                        const int64_t previous = packed_position[static_cast<size_t>(
+                            row * patch.quad_columns + begin + static_cast<int64_t>(position) - 1)];
+                        const float difference = theta(static_cast<size_t>(packed))
+                            - theta(static_cast<size_t>(previous));
+                        const float step = (difference > static_cast<float>(M_PI) ? dr : 0.0F)
+                            - (difference < -static_cast<float>(M_PI) ? dr : 0.0F);
+                        subrow.cumulative[position] = subrow.cumulative[position - 1] + step;
+                    }
+                    subrow.unwrapped[position] = shifted(static_cast<size_t>(packed))
+                        + subrow.cumulative[position];
+                }
+                rows[static_cast<size_t>(row)].push_back(subrows.size());
+                subrows.push_back(std::move(subrow));
+            }
+        }
+        for (int64_t row = 0; row + 1 < patch.quad_rows; ++row) {
+            size_t upper_position = 0;
+            size_t lower_position = 0;
+            auto& upper_row = rows[static_cast<size_t>(row)];
+            auto& lower_row = rows[static_cast<size_t>(row + 1)];
+            while (upper_position < upper_row.size() && lower_position < lower_row.size()) {
+                const size_t upper_index = upper_row[upper_position];
+                const size_t lower_index = lower_row[lower_position];
+                auto& upper = subrows[upper_index];
+                auto& lower = subrows[lower_index];
+                const int64_t overlap_begin = std::max(upper.column_begin, lower.column_begin);
+                const int64_t overlap_end = std::min(upper.column_end, lower.column_end);
+                if (overlap_end > overlap_begin) {
+                    const int64_t anchor = (overlap_begin + overlap_end - 1) / 2;
+                    const size_t upper_anchor = static_cast<size_t>(anchor - upper.column_begin);
+                    const size_t lower_anchor = static_cast<size_t>(anchor - lower.column_begin);
+                    upper.links.push_back({lower_index, upper_anchor, lower_anchor});
+                    lower.links.push_back({upper_index, lower_anchor, upper_anchor});
+                }
+                if (upper.column_end <= lower.column_end) ++upper_position;
+                else ++lower_position;
+            }
+        }
+
+        std::vector<int64_t> center_rows;
+        for (int64_t row = 0; row < patch.quad_rows; ++row)
+            if (packed_position[static_cast<size_t>(
+                    row * patch.quad_columns + patch.center_column)] >= 0)
+                center_rows.push_back(row);
+        if (center_rows.empty()) return;
+        const int64_t center_row = center_rows[center_rows.size() / 2];
+        size_t seed = std::numeric_limits<size_t>::max();
+        for (size_t candidate : rows[static_cast<size_t>(center_row)]) {
+            auto& subrow = subrows[candidate];
+            if (subrow.column_begin <= patch.center_column
+                && patch.center_column < subrow.column_end) {
+                const size_t position = static_cast<size_t>(
+                    patch.center_column - subrow.column_begin);
+                subrow.branch_offset = subrow.cumulative[position];
+                seed = candidate;
+                break;
+            }
+        }
+        if (seed == std::numeric_limits<size_t>::max()) return;
+        std::vector<size_t> queue {seed};
+        for (size_t queue_position = 0; queue_position < queue.size(); ++queue_position) {
+            const size_t source_index = queue[queue_position];
+            const auto links = subrows[source_index].links;
+            for (const auto& link : links) {
+                if (!std::isnan(subrows[link.target].branch_offset)) continue;
+                const float difference = subrows[link.target].unwrapped[link.target_position]
+                    - subrows[source_index].unwrapped[link.source_position];
+                const float winding_delta = std::nearbyint(difference / dr) * dr;
+                subrows[link.target].branch_offset =
+                    subrows[source_index].branch_offset + winding_delta;
+                queue.push_back(link.target);
+            }
+        }
+
+        std::vector<float> center_values;
+        for (const auto& subrow : subrows) {
+            if (std::isnan(subrow.branch_offset)) {
+                disconnected = 1;
+                continue;
+            }
+            if (subrow.column_begin <= patch.center_column
+                && patch.center_column < subrow.column_end) {
+                const size_t position = static_cast<size_t>(
+                    patch.center_column - subrow.column_begin);
+                center_values.push_back(
+                    subrow.unwrapped[position] - subrow.branch_offset);
+            }
+        }
+        if (center_values.empty()) return;
+        const size_t median_position = (center_values.size() - 1) / 2;
+        std::nth_element(center_values.begin(),
+                         center_values.begin() + median_position,
+                         center_values.end());
+        const float median = center_values[median_position];
+        float modulus = std::fmod(median, dr);
+        if (modulus < 0) modulus += dr;
+        const float target = modulus < dr / 2
+            ? median - modulus : median + dr - modulus;
+        for (const auto& subrow : subrows) {
+            if (std::isnan(subrow.branch_offset)) continue;
+            for (int64_t column = subrow.column_begin;
+                 column < subrow.column_end; ++column) {
+                const size_t position = static_cast<size_t>(column - subrow.column_begin);
+                const int64_t packed = packed_position[static_cast<size_t>(
+                    subrow.row * patch.quad_columns + column)];
+                const float raw_target = target - subrow.cumulative[position]
+                    + subrow.branch_offset;
+                raw_targets[static_cast<size_t>(packed)] = raw_target;
+                target_windings[static_cast<size_t>(packed)] =
+                    static_cast<int64_t>(std::nearbyint(raw_target / dr));
+            }
+        }
+    }
+
+    std::vector<SatisfactionPatch> patches_;
+    std::vector<uint64_t> offsets_;
+};
+
 nb::dict prepare_dt_samples(
     BoolMatrix mask, Int64Vector row_edges, Int64Vector column_edges)
 {
@@ -911,6 +1284,15 @@ NB_MODULE(spiral_sampling, module)
         .def("sample_patch_points", &PatchSamplingAtlas::sample_patch_points,
              nb::arg("patch_indices"), nb::arg("point_cap"), nb::arg("seed"))
         .def("__len__", &PatchSamplingAtlas::size);
+    nb::class_<PatchSatisfactionAtlas>(module, "PatchSatisfactionAtlas")
+        .def(nb::init<const nb::list&, const nb::list&, float, float>(),
+             nb::arg("masks"), nb::arg("vertex_zs"),
+             nb::arg("z_begin"), nb::arg("z_end"))
+        .def("packed_layout", &PatchSatisfactionAtlas::packed_layout)
+        .def("unwrap_targets", &PatchSatisfactionAtlas::unwrap_targets,
+             nb::arg("theta"), nb::arg("shifted_radius"), nb::arg("dr"))
+        .def("total_quads", &PatchSatisfactionAtlas::total_quads)
+        .def("__len__", &PatchSatisfactionAtlas::size);
     module.def("prepare_dt_samples", &prepare_dt_samples,
                nb::arg("mask"), nb::arg("row_edges"), nb::arg("column_edges"));
     module.def("unwrap_block_samples", &unwrap_block_samples,

@@ -1,5 +1,7 @@
 import json
 import os
+import time
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -17,6 +19,7 @@ from spiral_helpers import (
 )
 from tracks import get_track_satisfied_counts_in_chunks
 from visualization import save_overlay
+from spiral_sampling import load_spiral_sampling
 
 
 # Thresholds defining the patch-satisfaction metrics.
@@ -27,6 +30,289 @@ metrics_config = {
     'boundary_satisfied_patch_quad_fraction': 0.90,  # min fraction of boundary quads satisfied for the boundary metric
 }
 
+SPLICING_METRICS_CONFIG = {
+    'satisfaction_radius_tolerance': 0.495,
+    'satisfaction_distance_tolerance': 12.0,
+    'satisfied_patch_quad_fraction': 0.90,
+}
+PATCH_EVALUATION_CHUNK_SIZE = 65536
+
+
+@dataclass
+class PatchSatisfactionProfile:
+    satisfied_patches: torch.Tensor
+    satisfied_areas: torch.Tensor
+    total_areas: torch.Tensor
+    boundary_satisfied_patches: torch.Tensor
+    packed_satisfied_quads: torch.Tensor
+
+
+@dataclass
+class PatchSatisfactionEvaluation:
+    """One threshold-independent packed geometry pass and its profiles."""
+    profiles: dict
+    patch_offsets: torch.Tensor
+    patch_indices: torch.Tensor
+    quad_ijs: torch.Tensor
+    quad_shapes: torch.Tensor
+    corner_vertex_ids: torch.Tensor
+    boundary_flags: torch.Tensor
+    center_spiral_zyxs: torch.Tensor
+    center_theta: torch.Tensor
+    target_raw_shifted: torch.Tensor
+    target_winding_indices: torch.Tensor
+    patch_extents: list
+    patch_winding_min: int | None
+    patch_winding_max: int | None
+    forward_batches: int
+    inverse_batches: int
+    elapsed_seconds: float
+
+    def dense_masks(self, profile='strict'):
+        """Materialize legacy per-patch dense masks only for PNG/callers."""
+        packed = self.profiles[profile].packed_satisfied_quads
+        offsets = self.patch_offsets.tolist()
+        shapes = self.quad_shapes.tolist()
+        ijs = self.quad_ijs
+        masks = []
+        for patch_index, (rows, columns) in enumerate(shapes):
+            mask = torch.zeros((rows, columns), dtype=torch.bool)
+            begin, end = offsets[patch_index:patch_index + 2]
+            if end > begin:
+                selected_ij = ijs[begin:end]
+                mask[selected_ij[:, 0], selected_ij[:, 1]] = packed[begin:end]
+            masks.append(mask)
+        return masks
+
+    def dense_target_windings(self):
+        offsets = self.patch_offsets.tolist()
+        shapes = self.quad_shapes.tolist()
+        ijs = self.quad_ijs
+        packed = self.target_winding_indices.cpu()
+        outputs = []
+        for patch_index, (rows, columns) in enumerate(shapes):
+            output = torch.full((rows, columns), -1, dtype=torch.int64)
+            begin, end = offsets[patch_index:patch_index + 2]
+            if end > begin:
+                selected_ij = ijs[begin:end]
+                output[selected_ij[:, 0], selected_ij[:, 1]] = packed[begin:end]
+            outputs.append(output)
+        return outputs
+
+
+class _ListPatchAtlas:
+    """Compatibility adapter for callers that do not own a resident atlas."""
+    def __init__(self, patches, device):
+        self.patches = list(patches)
+        pieces = [patch.zyxs.reshape(-1, 3).to(dtype=torch.float32)
+                  for patch in self.patches]
+        self.zyxs_flat = (torch.cat(pieces).to(device=device) if pieces
+                          else torch.empty((0, 3), device=device))
+        self._native = {}
+
+    def vertex_zyxs(self, vertex_ids):
+        return self.zyxs_flat[torch.as_tensor(
+            vertex_ids, dtype=torch.int64, device=self.zyxs_flat.device)]
+
+    def satisfaction_atlas(self, z_begin, z_end):
+        key = (float(z_begin), float(z_end))
+        if key in self._native:
+            return self._native[key]
+        native = load_spiral_sampling()
+        atlas_type = (getattr(native, 'PatchSatisfactionAtlas', None)
+                      if native is not None else None)
+        if atlas_type is None:
+            raise RuntimeError(
+                'Packed satisfaction requires '
+                'vc.spiral_sampling.PatchSatisfactionAtlas')
+        masks = [np.ascontiguousarray(
+            patch.valid_quad_mask.cpu().numpy(), dtype=bool)
+            for patch in self.patches]
+        zs = [np.ascontiguousarray(
+            patch.zyxs[..., 0].cpu().numpy(), dtype=np.float32)
+            for patch in self.patches]
+        self._native[key] = atlas_type(masks, zs, *key)
+        return self._native[key]
+
+
+def _patch_aligned_chunks(offsets, chunk_size=PATCH_EVALUATION_CHUNK_SIZE):
+    """Yield bounded ranges, ending at a patch boundary whenever possible."""
+    offsets = np.asarray(offsets, dtype=np.int64)
+    total = int(offsets[-1]) if offsets.size else 0
+    start = 0
+    while start < total:
+        limit = min(start + chunk_size, total)
+        boundary = int(np.searchsorted(offsets, limit, side='right') - 1)
+        end = int(offsets[boundary]) if boundary > 0 else limit
+        if end <= start:
+            end = limit  # one patch is larger than the chunk bound
+        yield start, end
+        start = end
+
+
+@torch.inference_mode()
+def evaluate_patch_satisfaction_packed(
+    slice_to_spiral_transform,
+    dr_per_winding,
+    patches,
+    patch_atlas,
+    z_begin,
+    z_end,
+    *,
+    include_splicing=True,
+    verbose=False,
+):
+    """Evaluate all ROI quad centres with two bounded model passes."""
+    started = time.perf_counter()
+    device = dr_per_winding.device
+    dr = dr_per_winding.detach()
+    native_atlas = patch_atlas.satisfaction_atlas(z_begin, z_end)
+    layout = native_atlas.packed_layout()
+    offsets_np = np.asarray(layout['patch_offsets'], dtype=np.int64)
+    offsets = torch.from_numpy(offsets_np)
+    patch_indices_cpu = torch.from_numpy(
+        np.asarray(layout['patch_indices'], dtype=np.int64))
+    quad_ijs = torch.from_numpy(np.asarray(layout['quad_ijs'], dtype=np.int64))
+    quad_shapes = torch.from_numpy(
+        np.asarray(layout['quad_shapes'], dtype=np.int64))
+    corners = torch.from_numpy(
+        np.asarray(layout['corner_vertex_ids'], dtype=np.int64))
+    boundary_cpu = torch.from_numpy(
+        np.asarray(layout['boundary_flags'], dtype=np.uint8)).bool()
+    full_valid_counts = torch.from_numpy(
+        np.asarray(layout['full_valid_counts'], dtype=np.int64))
+    patch_indices = patch_indices_cpu.to(device=device)
+    boundary = boundary_cpu.to(device=device)
+    count = int(offsets_np[-1]) if len(offsets_np) else 0
+
+    center_scroll = torch.empty(
+        (count, 3), dtype=torch.float32, device=device)
+    center_spiral = torch.empty_like(center_scroll)
+    forward_batches = 0
+    with torch.no_grad():
+        for begin, end in _patch_aligned_chunks(offsets_np):
+            # Gather four-corner geometry only for this bounded batch.  On a
+            # production atlas the packed corner table can describe hundreds
+            # of millions of references; a full device gather would dominate
+            # peak VRAM even though the model itself is chunked.
+            centers = patch_atlas.vertex_zyxs(
+                corners[begin:end].to(device=device)).mean(dim=1)
+            center_scroll[begin:end] = centers
+            center_spiral[begin:end] = slice_to_spiral_transform(centers)
+            forward_batches += 1
+    theta, radius, shifted = get_theta_and_radii(
+        center_spiral[..., 1:], dr_per_winding)
+
+    unwrap = native_atlas.unwrap_targets(
+        np.ascontiguousarray(theta.float().cpu().numpy()),
+        np.ascontiguousarray(shifted.float().cpu().numpy()),
+        float(dr.cpu().item()),
+    )
+    target_raw_cpu = torch.from_numpy(np.asarray(
+        unwrap['target_raw_shifted'], dtype=np.float32))
+    target_winding_cpu = torch.from_numpy(np.asarray(
+        unwrap['target_winding_indices'], dtype=np.int64))
+    disconnected = np.asarray(unwrap['disconnected_patches'], dtype=np.uint8)
+    if verbose:
+        for patch_index in np.flatnonzero(disconnected):
+            print(f'Warning: patch {patch_index} has multiple disconnected '
+                  'subrow components; using only the component containing '
+                  'the center column')
+    target_raw = target_raw_cpu.to(device=device)
+    target_winding = target_winding_cpu.to(device=device)
+    target_set = target_winding >= 0
+    safe_target_raw = torch.where(target_set, target_raw, shifted)
+    scan_residual = torch.empty(count, dtype=torch.float32, device=device)
+    inverse_batches = 0
+    with torch.no_grad():
+        for begin, end in _patch_aligned_chunks(offsets_np):
+            target_radius = (safe_target_raw[begin:end]
+                             + theta[begin:end] / (2 * np.pi) * dr)
+            target_spiral = torch.stack([
+                center_spiral[begin:end, 0],
+                torch.sin(theta[begin:end]) * target_radius,
+                torch.cos(theta[begin:end]) * target_radius,
+            ], dim=-1)
+            target_scroll = slice_to_spiral_transform.inv(target_spiral)
+            scan_residual[begin:end] = torch.linalg.norm(
+                target_scroll - center_scroll[begin:end], dim=-1)
+            inverse_batches += 1
+    spiral_residual = (shifted - safe_target_raw).abs()
+    del center_scroll
+
+    patch_count = len(patches)
+    roi_counts = offsets[1:] - offsets[:-1]
+    patch_areas = torch.tensor(
+        [float(patch.area) for patch in patches], dtype=torch.float64)
+    total_areas = patch_areas * roi_counts.to(torch.float64) / full_valid_counts.clamp_min(1)
+
+    def build_profile(overrides):
+        thresholds = dict(metrics_config)
+        thresholds.update(overrides)
+        satisfied = (target_set
+                     & (spiral_residual <= dr * thresholds['satisfaction_radius_tolerance'])
+                     & (scan_residual <= thresholds['satisfaction_distance_tolerance']))
+        satisfied_counts = torch.zeros(
+            patch_count, dtype=torch.int64, device=device)
+        boundary_counts = torch.zeros_like(satisfied_counts)
+        satisfied_boundary_counts = torch.zeros_like(satisfied_counts)
+        if count:
+            satisfied_counts.scatter_add_(
+                0, patch_indices, satisfied.to(torch.int64))
+            boundary_counts.scatter_add_(
+                0, patch_indices, boundary.to(torch.int64))
+            satisfied_boundary_counts.scatter_add_(
+                0, patch_indices, (satisfied & boundary).to(torch.int64))
+        roi_counts_dev = roi_counts.to(device=device)
+        satisfied_patches = (satisfied_counts.to(torch.float64)
+            >= thresholds['satisfied_patch_quad_fraction']
+               * roi_counts_dev.to(torch.float64))
+        boundary_satisfied = (satisfied_boundary_counts.to(torch.float64)
+            >= thresholds['boundary_satisfied_patch_quad_fraction']
+               * boundary_counts.to(torch.float64))
+        satisfied_areas = (patch_areas
+            * satisfied_counts.cpu().to(torch.float64)
+            / full_valid_counts.clamp_min(1))
+        return PatchSatisfactionProfile(
+            satisfied_patches.cpu(), satisfied_areas, total_areas.clone(),
+            boundary_satisfied.cpu(), satisfied.cpu())
+
+    profiles = {'strict': build_profile({})}
+    if include_splicing:
+        profiles['splicing'] = build_profile(SPLICING_METRICS_CONFIG)
+
+    patch_extents = [(None, None)] * patch_count
+    patch_min = patch_max = None
+    if count:
+        raw_windings = (shifted / dr).round().to(torch.int64).clamp_min(0)
+        max_radius = torch.full((patch_count,), -torch.inf, device=device)
+        max_winding = torch.full((patch_count,), -1, dtype=torch.int64, device=device)
+        min_winding = torch.full(
+            (patch_count,), torch.iinfo(torch.int64).max,
+            dtype=torch.int64, device=device)
+        max_radius.scatter_reduce_(0, patch_indices, radius.float(), reduce='amax')
+        max_winding.scatter_reduce_(0, patch_indices, raw_windings, reduce='amax')
+        min_winding.scatter_reduce_(0, patch_indices, raw_windings, reduce='amin')
+        has_roi = roi_counts > 0
+        max_radius_cpu = max_radius.cpu().tolist()
+        max_winding_cpu = max_winding.cpu().tolist()
+        for index in torch.where(has_roi)[0].tolist():
+            patch_extents[index] = (
+                float(max_radius_cpu[index]), int(max_winding_cpu[index]))
+        patch_min = int(min_winding[has_roi.to(device=device)].min().item())
+        patch_max = int(max_winding[has_roi.to(device=device)].max().item())
+
+    elapsed = time.perf_counter() - started
+    print('patch satisfaction: '
+          f'{patch_count:,} patches, {count:,} quad centers, '
+          f'{forward_batches} forward + {inverse_batches} inverse batches, '
+          f'{elapsed:.2f}s')
+    return PatchSatisfactionEvaluation(
+        profiles, offsets, patch_indices_cpu, quad_ijs, quad_shapes, corners,
+        boundary_cpu, center_spiral, theta, target_raw,
+        target_winding, patch_extents, patch_min, patch_max,
+        forward_batches, inverse_batches, elapsed)
+
 
 def get_patch_satisfied_areas(
     slice_to_spiral_transform,
@@ -36,6 +322,7 @@ def get_patch_satisfied_areas(
     z_end,
     verbose=False,
     metrics_overrides=None,
+    patch_atlas=None,
 ):
     """Per-patch satisfaction metrics.
 
@@ -69,6 +356,27 @@ def get_patch_satisfied_areas(
     ``metrics_overrides`` optionally overrides individual ``metrics_config`` entries
     for this call only, such as the looser thresholds used for mesh splicing.
     """
+    native = load_spiral_sampling()
+    packed_profile = (
+        'strict' if not metrics_overrides
+        else 'splicing' if metrics_overrides == SPLICING_METRICS_CONFIG
+        else None)
+    if (packed_profile is not None and native is not None
+            and hasattr(native, 'PatchSatisfactionAtlas')):
+        atlas = patch_atlas or _ListPatchAtlas(patches, dr_per_winding.device)
+        evaluation = evaluate_patch_satisfaction_packed(
+            slice_to_spiral_transform, dr_per_winding, patches, atlas,
+            z_begin, z_end, include_splicing=packed_profile == 'splicing',
+            verbose=verbose)
+        profile = evaluation.profiles[packed_profile]
+        return (
+            profile.satisfied_patches,
+            profile.satisfied_areas,
+            profile.total_areas,
+            evaluation.dense_masks(packed_profile),
+            profile.boundary_satisfied_patches,
+            evaluation.dense_target_windings(),
+        )
     thresholds = dict(metrics_config)
     if metrics_overrides:
         thresholds.update(metrics_overrides)
@@ -498,10 +806,12 @@ def save_overlay_and_print_satisfaction(
     dr_per_winding,
     patches_list,
     patches_dict,
+    patch_atlas,
     unattached_pcl_strips,
     tracks,
     unverified_patches_list,
     unverified_patches_dict,
+    unverified_patch_atlas,
     out_path,
     cfg,
     z_begin,
@@ -526,9 +836,15 @@ def save_overlay_and_print_satisfaction(
         progress.begin(
             'finalizing', 'Evaluating verified patches',
             detail=f'{len(patches_list):,} patches')
-    satisfied_patches, satisfied_areas, total_areas, satisfied_quad_masks, boundary_satisfied_patches, target_winding_idx_per_patch = get_patch_satisfied_areas(
-        slice_to_spiral_transform, dr_per_winding, patches_list, z_begin, z_end, verbose=True,
+    patch_evaluation = evaluate_patch_satisfaction_packed(
+        slice_to_spiral_transform, dr_per_winding, patches_list, patch_atlas,
+        z_begin, z_end, include_splicing=True, verbose=True,
     )
+    strict_profile = patch_evaluation.profiles['strict']
+    satisfied_patches = strict_profile.satisfied_patches
+    satisfied_areas = strict_profile.satisfied_areas
+    total_areas = strict_profile.total_areas
+    boundary_satisfied_patches = strict_profile.boundary_satisfied_patches
     satisfied_count = satisfied_patches.sum().item()
     boundary_satisfied_count = boundary_satisfied_patches.sum().item()
     total_count = satisfied_patches.numel()
@@ -598,9 +914,14 @@ def save_overlay_and_print_satisfaction(
     # satisfaction numbers.
     unverified_patch_satisfaction_entries = []
     if unverified_patches_list:
-        u_satisfied, u_sat_areas, u_tot_areas, _, _, _ = get_patch_satisfied_areas(
-            slice_to_spiral_transform, dr_per_winding, unverified_patches_list, z_begin, z_end, verbose=False,
-        )
+        unverified_evaluation = evaluate_patch_satisfaction_packed(
+            slice_to_spiral_transform, dr_per_winding,
+            unverified_patches_list, unverified_patch_atlas,
+            z_begin, z_end, include_splicing=False, verbose=False)
+        unverified_profile = unverified_evaluation.profiles['strict']
+        u_satisfied = unverified_profile.satisfied_patches
+        u_sat_areas = unverified_profile.satisfied_areas
+        u_tot_areas = unverified_profile.total_areas
         u_count = int(u_satisfied.sum().item())
         u_total = u_satisfied.numel()
         u_ratio = u_count / max(u_total, 1)
@@ -651,33 +972,59 @@ def save_overlay_and_print_satisfaction(
             'pcls': pcl_satisfaction_entries,
             'unverified_patches': unverified_patch_satisfaction_entries,
         }, f, indent=2)
-    # Flatten per-patch (H-1, W-1) masks in patch order to match the rasteriser's quad-id offsets,
-    # then combine with patch-level overall satisfaction into a 0/1/2 status per quad.
-    if satisfied_quad_masks:
-        satisfied_quads_flat = torch.cat([m.flatten() for m in satisfied_quad_masks])
-        quads_per_patch = torch.tensor([m.numel() for m in satisfied_quad_masks], dtype=torch.int64)
-        overall_satisfied_per_quad = satisfied_patches.to(torch.bool).repeat_interleave(quads_per_patch)
-    else:
-        satisfied_quads_flat = torch.zeros([0], dtype=torch.bool)
-        overall_satisfied_per_quad = torch.zeros([0], dtype=torch.bool)
-    quad_status_flat = torch.where(
-        overall_satisfied_per_quad,
-        torch.full_like(satisfied_quads_flat, 2, dtype=torch.int64),
-        satisfied_quads_flat.to(torch.int64),
-    )
-    if save_png_visualizations and os.environ.get('FIT_SPIRAL_SKIP_SAVE_OVERLAY') != '1':
-        if progress is not None:
-            progress.begin('finalizing', 'Rendering satisfaction overlay')
-        winding_range, patch_extents, pcl_extents = compute_winding_range_and_input_extents(
-            slice_to_spiral_transform, dr_per_winding, patches_list, unattached_pcl_strips,
-            cfg, z_begin, z_end, get_or_build_unattached_pcl_flat,
+    need_overlay = (save_png_visualizations
+                    and os.environ.get('FIT_SPIRAL_SKIP_SAVE_OVERLAY') != '1')
+    need_mesh = os.environ.get('FIT_SPIRAL_SKIP_SAVE_MESH') != '1'
+    winding_range = None
+    patch_extents = patch_evaluation.patch_extents
+    pcl_extents = [(None, None)] * len(unattached_pcl_strips)
+    if need_overlay or need_mesh:
+        pcl_track_range, _, pcl_extents = compute_winding_range_and_input_extents(
+            slice_to_spiral_transform, dr_per_winding, [],
+            unattached_pcl_strips, cfg, z_begin, z_end,
+            get_or_build_unattached_pcl_flat,
             authoritative_zyx_lines=tracks,
         )
+        winding_range = pcl_track_range
+        if patch_evaluation.patch_winding_min is not None:
+            margin = cfg['output_winding_margin']
+            patch_range = (
+                max(patch_evaluation.patch_winding_min - margin,
+                    cfg['output_first_winding']),
+                patch_evaluation.patch_winding_max + 1 + margin,
+            )
+            if winding_range[0] == winding_range[1]:
+                winding_range = patch_range
+            else:
+                winding_range = (
+                    min(winding_range[0], patch_range[0]),
+                    max(winding_range[1], patch_range[1]),
+                )
+    if need_overlay:
+        if progress is not None:
+            progress.begin('finalizing', 'Rendering satisfaction overlay')
         _warn_if_inputs_exceed_flow_bounds(
             list(patches_dict.keys()), patch_extents,
             unattached_pcl_strips, pcl_extents,
             flow_field_radius,
             cfg,
+        )
+        satisfied_quad_masks = patch_evaluation.dense_masks('strict')
+        if satisfied_quad_masks:
+            satisfied_quads_flat = torch.cat(
+                [mask.flatten() for mask in satisfied_quad_masks])
+            quads_per_patch = torch.tensor(
+                [mask.numel() for mask in satisfied_quad_masks],
+                dtype=torch.int64)
+            overall_satisfied_per_quad = satisfied_patches.repeat_interleave(
+                quads_per_patch)
+        else:
+            satisfied_quads_flat = torch.zeros(0, dtype=torch.bool)
+            overall_satisfied_per_quad = torch.zeros(0, dtype=torch.bool)
+        quad_status_flat = torch.where(
+            overall_satisfied_per_quad,
+            torch.full_like(satisfied_quads_flat, 2, dtype=torch.int64),
+            satisfied_quads_flat.to(torch.int64),
         )
         save_overlay(
             spiral_and_transform,
@@ -692,23 +1039,14 @@ def save_overlay_and_print_satisfaction(
             out_path, suffix,
             render_volume_scale=render_volume_scale,
         )
-    if os.environ.get('FIT_SPIRAL_SKIP_SAVE_MESH') != '1':
-        def get_patch_satisfied_areas_for_mesh(
-            transform,
-            winding_delta,
-            patches,
-            verbose=False,
-            metrics_overrides=None,
-        ):
-            return get_patch_satisfied_areas(
-                transform, winding_delta, patches, z_begin, z_end, verbose=verbose,
-                metrics_overrides=metrics_overrides,
-            )
-
+    if need_mesh:
         save_mesh(
             slice_to_spiral_transform, dr_per_winding, patches_list, unattached_pcl_strips,
             out_path, cfg, z_begin, z_end, voxel_size_um,
-            get_or_build_unattached_pcl_flat, get_patch_satisfied_areas_for_mesh,
+            get_or_build_unattached_pcl_flat,
+            winding_range=winding_range,
+            patch_satisfaction_evaluation=patch_evaluation,
+            patch_atlas=patch_atlas,
             tracks=tracks,
             run_tag=run_tag, name=suffix, progress=progress,
         )

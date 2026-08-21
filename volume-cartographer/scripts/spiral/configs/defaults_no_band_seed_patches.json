@@ -1,0 +1,3 @@
+{
+    "patch_uuid_filter_regex": "^(?!band-seed)"
+}
