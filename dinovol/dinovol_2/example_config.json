@@ -54,6 +54,13 @@
     "remove_neg": false,
     "remove_only_teacher_neg": false
   },
+  "point_supervision": {
+    "enabled": true,
+    "sampling_probability": 0.1,
+    "loss_weight": 0.05,
+    "different_type_margin": 0.0,
+    "max_points_per_view": 64
+  },
   "use_amp": true,
   "dataset": {
     "global_crop_size": [
