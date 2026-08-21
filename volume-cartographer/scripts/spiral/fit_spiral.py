@@ -387,6 +387,7 @@ class PatchAtlas:
         self._patches = list(patches_by_id.values())
         self._theta_node_start = None
         self._theta_node_ranges = []
+        self._satisfaction_atlases = {}
         masks = [
             np.ascontiguousarray(p._sampling_valid_quad_mask_np, dtype=bool)
             for p in patches_by_id.values()
@@ -496,6 +497,50 @@ class PatchAtlas:
             np.asarray(self.sampling_atlas.valid_counts(), dtype=np.int64)
             if self.sampling_atlas is not None
             else np.empty(0, dtype=np.int64))
+        self._satisfaction_atlases.clear()
+
+    def satisfaction_atlas(self, z_begin, z_end):
+        """Return exact packed ROI quad metadata, cached by z interval."""
+        key = (float(z_begin), float(z_end))
+        cached = self._satisfaction_atlases.get(key)
+        if cached is not None:
+            return cached
+        native = load_spiral_sampling()
+        atlas_type = (getattr(native, 'PatchSatisfactionAtlas', None)
+                      if native is not None else None)
+        if atlas_type is None:
+            raise RuntimeError(
+                'Packed satisfaction requires '
+                'vc.spiral_sampling.PatchSatisfactionAtlas; rebuild the '
+                'vc_spiral_sampling extension')
+        masks = [np.ascontiguousarray(
+            patch.valid_quad_mask.cpu().numpy(), dtype=bool)
+            for patch in self._patches]
+        vertex_zs = [np.ascontiguousarray(
+            patch.zyxs[..., 0].cpu().numpy(), dtype=np.float32)
+            for patch in self._patches]
+        cached = atlas_type(masks, vertex_zs, key[0], key[1])
+        self._satisfaction_atlases[key] = cached
+        return cached
+
+    def vertex_zyxs(self, vertex_ids):
+        """Gather exact atlas vertices by their stable packed vertex IDs."""
+        if self.zyxs_flat is None:
+            self.materialize(self.device)
+        ids = torch.as_tensor(
+            vertex_ids, dtype=torch.int64, device=self.zyxs_flat.device)
+        if len(self._geometry_chunks) == 1:
+            return self.zyxs_flat[ids]
+        result = torch.empty((*ids.shape, 3), dtype=torch.float32,
+                             device=self.zyxs_flat.device)
+        patch_indices = torch.bucketize(ids, self.offsets[1:], right=True)
+        for chunk in self._geometry_chunks:
+            selected = ((patch_indices >= chunk['patch_start'])
+                        & (patch_indices < chunk['patch_end']))
+            if selected.any():
+                base = self.offsets[chunk['patch_start']]
+                result[selected] = chunk['zyxs_flat'][ids[selected] - base]
+        return result
 
     def lookup(self, patch_idx_per_sample, ijs):
         # Caller must ensure floor(ij) lies on a valid quad. CPU lookup remains
@@ -678,6 +723,7 @@ class PatchAtlas:
         self._num_vertices = offsets[-1]
         self._theta_node_start = None
         self._theta_node_ranges = []
+        self._satisfaction_atlases.clear()
         next_idx = len(self.id_to_idx)
         for pid in patches_by_id:
             self.id_to_idx[pid] = next_idx
@@ -4499,15 +4545,30 @@ class FitContext:
                     )
                     by_param = ', '.join(f'{name}: {count}' for name, count in per_param)
                     print(f'  ({n_sanitised} non-finite-gradient steps sanitised so far; by param: {by_param})')
+                payload = {
+                    'total_loss': loss.item(),
+                    'nonfinite_grad_steps': self.nonfinite_grad_steps.item(),
+                    **{f'nonfinite_grad_steps/{name}': count.item() for name, count in self.nonfinite_grad_by_param.items()},
+                    **{name + '_loss': value for name, value in losses.items()},
+                    **shell_metrics,
+                    **log_metrics,
+                }
+                metrics_history = os.environ.get('FIT_SPIRAL_METRICS_HISTORY')
+                if metrics_history:
+                    scalar_payload = {
+                        name: (value.item() if hasattr(value, 'item') else value)
+                        for name, value in payload.items()
+                    }
+                    with open(metrics_history, 'a') as stream:
+                        stream.write(json.dumps({
+                            'iteration': iteration,
+                            'metrics': scalar_payload,
+                        }) + '\n')
                 if wandb.run is not None:
-                    wandb.log({
-                        'total_loss': loss.item(),
-                        'nonfinite_grad_steps': self.nonfinite_grad_steps.item(),
-                        **{f'nonfinite_grad_steps/{name}': count.item() for name, count in self.nonfinite_grad_by_param.items()},
-                        **{name + '_loss': value for name, value in losses.items()},
-                        **shell_metrics,
-                        **log_metrics,
-                    })
+                    if metrics_history:
+                        wandb.log(payload, step=iteration)
+                    else:
+                        wandb.log(payload)
 
     def run(self):
         """Drive one complete headless fit to the configured horizon.
@@ -4573,10 +4634,12 @@ class FitContext:
                 dr_per_winding=self.dr_per_winding,
                 patches_list=self.verified_patches_list,
                 patches_dict=self.verified_patches,
+                patch_atlas=self.patch_atlas,
                 unattached_pcl_strips=self.unattached_pcl_strips,
                 tracks=self.tracks,
                 unverified_patches_list=self.unverified_patches_list,
                 unverified_patches_dict=self.unverified_patches,
+                unverified_patch_atlas=self.unverified_patch_atlas,
                 out_path=self.out_path,
                 cfg=self.config,
                 z_begin=self.z_begin,
@@ -4716,7 +4779,20 @@ if __name__ == '__main__':
         wandb_mode = os.environ.get('WANDB_MODE', 'disabled')
         if not dist_context.is_main_process:
             wandb_mode = 'disabled'
-        wandb.init(project='scrolls', config=config, mode=wandb_mode)
+        wandb_init_kwargs = {
+            'project': os.environ.get('WANDB_PROJECT', 'scrolls'),
+            'entity': os.environ.get('WANDB_ENTITY'),
+            'config': config,
+            'mode': wandb_mode,
+        }
+        if os.environ.get('FIT_SPIRAL_BATCH_RUN') == '1':
+            wandb_init_kwargs.update({
+                'id': os.environ['WANDB_RUN_ID'],
+                'name': os.environ['WANDB_NAME'],
+                'group': os.environ['WANDB_RUN_GROUP'],
+                'resume': 'never',
+            })
+        wandb.init(**wandb_init_kwargs)
         # The CLI boundary is where the FIT_SPIRAL_* fit controls are parsed;
         # FitContext itself no longer reads them.
         main(
