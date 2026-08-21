@@ -1,28 +1,29 @@
-# Task: exact cost-bounded fiberlet lookahead
+# Task: bounded intermediate fiberlet lookahead
 
-Replace exhaustive whole-fiberlet lookahead enumeration with an exact
-uniform-cost lookahead search.
+Accelerate the expensive fiberlet replay decisions while retaining the improved
+route quality demonstrated by long lookahead.
 
-At checkpoint `C`, every candidate is scored over the exact common interval
-ending at `C+H`. The route state retains the complete fiberlet crossing the
-horizon, but only the fraction of that fiberlet inside the interval contributes
-path cost. Its entering join contributes fully. Candidate scoring must not
-penalize geometry beyond the horizon.
+Record and evaluate three search options in this order:
 
-Search partial routes in nondecreasing accumulated nonnegative cost. Maintain
-the best completed continuation for each distinct whole-fiberlet prefix through
-`C+D`. Once 16 distinct prefixes have completions, reject or leave unexpanded
-only partial routes whose admissible cost lower bound is strictly worse than
-the current 16th completion. Preserve valid joins, cycle rejection,
-deterministic tie ordering, whole-fiberlet commitment, failure/reseed behavior,
-active float or quantized costs, cache behavior, and cache identities.
+1. First implement wider intermediate pruning. Keep the 192-base-voxel logical
+   lookahead, but prune a wider working population at equal 48-base-voxel
+   fronts before the final 16-prefix selection. Within each front use a
+   distance-binned uniform-cost label search and close reconvergent states by
+   keeping only their best history, so the implementation does not enumerate
+   every complete route combination before applying the width bound.
+2. Later evaluate a deterministic adaptive horizon that shortens lookahead when
+   generated-state counts expose combinatorial growth.
+3. Keep exact A* over the complete horizon as the oracle. Evaluate the existing
+   relaxed distance-to-go DP against uniform-cost ordering, and retain the
+   simpler ordering unless the heuristic provides a measured benefit.
 
-Record two alternatives for later comparison without implementing them now:
+Intermediate scoring must use the same exact physical horizon, proportional
+terminal-fiberlet cost, complete terminal geometry, join ownership, graph
+validity, cycle rejection, deterministic ordering, failure handling, and cache
+semantics as the exact implementation. The approximation must be explicit and
+diagnosed. Preserve the exact implementation as a benchmark oracle selected by
+`--search-width 0`.
 
-- approximate speculative-beam pruning at equal 48-base-voxel fronts;
-- a stronger A* heuristic based on a relaxed minimum future-cost problem.
-
-The interrupted exhaustive full-fiber run reached 94.4% without a search error
-but did not publish a partial result. Validate the exact search first on focused
-fixtures and the completed 600-base-voxel radius-768 interval, then retry the
-full fiber only if those results are correct and practical.
+Start with working width 128 and prune distance 48 base voxels. Preserve route
+diversity by retaining the best continuation for each currently represented
+committed prefix before filling the remaining working slots globally.

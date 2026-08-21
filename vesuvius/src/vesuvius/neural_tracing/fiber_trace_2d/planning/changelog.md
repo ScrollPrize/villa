@@ -1,3 +1,14 @@
+# 2026-08-21: bounded intermediate fiberlet lookahead
+
+- Added deterministic equal-distance intermediate pruning for graph replay,
+  defaulting to a 128-route working frontier at 48-base-voxel intervals over
+  the existing 192-base-voxel lookahead. Exact A* remains selectable with
+  `--search-width 0` for focused comparisons.
+- Preserved exact logical-front cost semantics: the terminal fiberlet remains
+  whole in graph state while only its in-horizon edge fraction is scored, with
+  its entering join charged once. Replay JSON now records search mode and
+  per-front population/pruning diagnostics.
+
 # 2026-08-20: concise fiberlet replay progress
 
 - Replaced default per-stage, per-chunk, and per-evaluator replay chatter with
@@ -924,3 +935,10 @@
   `--threads` setting. The focused 600-base-voxel radius-768 hot-cache replay
   fell from 17.30 to 6.97 seconds while preserving the same failure and distance
   results.
+- Added bounded equal-distance fronts and deterministic uniform-cost label
+  search. Reconvergent histories now retain only the best logical-incoming-arc
+  and front-offset label, while exact proportional front scoring and the exact
+  A* oracle remain available for comparison.
+- Restored immediate `fiber_replay_failure` output in compact-progress mode;
+  failure lines now interrupt and redraw the progress bar instead of being
+  suppressed unless `--stats` is enabled.

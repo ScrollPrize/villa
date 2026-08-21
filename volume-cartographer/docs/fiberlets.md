@@ -524,37 +524,68 @@ volume-cartographer/build/bin/vc_fiberlets fiberlet-replay \
   --beam 16 \
   --beam-step-distance 48 \
   --lookahead-distance 192 \
+  --search-width 128 \
+  --prune-distance 48 \
   --length 4096
 ```
 
-`--beam-step-distance D` and `--lookahead-distance H` use base voxels. The
-lookahead defaults to 192 base voxels and the step defaults to `H/4`, or 48 base
-voxels. The search maintains up to 16 whole-fiberlet histories and one shared
-logical checkpoint `C`, which never exceeds the shortest retained history.
-Every history is expanded through all valid graph branches until it reaches or
-passes `C+H`. The last fiberlet is kept whole, so completed candidates may
-overshoot that logical horizon by different small amounts. They are ranked by
-whole-route loss per prediction voxel, then raw loss and logical route ID. One
-global prune retains the best 16 committed prefixes.
+`--beam-step-distance D`, `--lookahead-distance H`, and `--prune-distance P`
+use base voxels. The defaults are `D=48`, `H=192`, and `P=48`.
+`--search-width K` defaults to 128 and must be at least the final beam width.
+Set it to zero to run the exact A* implementation as a focused benchmark
+oracle.
+
+The bounded search maintains whole-fiberlet histories and one shared logical
+checkpoint `C`. Its first exact front is the next checkpoint `C+D`; subsequent
+fronts are no farther than `P` apart and end exactly at `C+H`. At each
+intermediate front it keeps the best continuation for each stable `C+D` prefix
+before filling the remaining `K` slots by global score. At the final front it
+keeps one continuation per actual next-checkpoint prefix and retains the best
+16. This can discard a route that would become better later in the horizon;
+that is the explicit bounded-search approximation.
+
+Expansion between fronts is a uniform-cost label search. Labels are keyed by
+the logical incoming directed fiberlet and a 0.5-prediction-voxel front-offset
+bin. If multiple histories reach that state, only the lowest accumulated-cost
+history survives; ordered logical arc IDs break exact-cost ties. The survivor's
+visited-node set is used for later cycle rejection. This deliberate state merge
+closes reconvergent paths instead of enumerating every history. Exact crossing
+scores still use the proportional terminal fiberlet cost, and equal-bound
+labels are processed before a width cutoff. Diagnostics report dominated
+labels separately from cost-bound pruning and exact completed candidates. Once
+stable prefixes exist, a worker searches for one prefix representative plus
+only enough extra candidates to fill globally unoccupied slots; it does not
+try to prove a local top 128 for every prefix.
+
+Costs are cumulative from the segment seed to each exact front. The entering
+join of a front-crossing fiberlet is charged fully and its edge cost is charged
+only in proportion to the distance inside the front. The complete crossing
+fiberlet remains in route geometry and visited state. Stable logical IDs,
+canonical worker merging, and one decision-wide state budget make output
+independent of expansion thread scheduling.
 
 After pruning, the checkpoint advances by `D`. Each retained history is
 committed through the complete fiberlet containing the new checkpoint. A beam
 may therefore commit no new fiberlet, one fiberlet, or several fiberlets during
 one iteration, and its stored endpoint may lie beyond the shared checkpoint.
-There is no intermediate per-depth or per-parent prune. Complete edges and
-their entering joins contribute their full active graph-view cost. Routes that
-cannot reach the common lookahead horizon are excluded, and exceeding the
-explicit per-iteration state bound fails rather than changing the search.
+Routes that cannot reach the common lookahead horizon are excluded, and
+exceeding the explicit per-decision state bound fails rather than changing the
+search.
+
+Replay failures are printed immediately in both compact-progress and `--stats`
+modes. In compact mode, the failure line interrupts the progress bar and the
+bar is redrawn afterward; `--stats` only controls the additional stage and
+per-tracer progress diagnostics.
 
 Only final reference-end or failure materialization may clip the displayed
 route inside a fiberlet; this does not alter search costs or beam state. A
 reference failure, graph exhaustion, or the selected end closes the persistent
 population.
 
-The beam-step and lookahead distances are replay state only. They are absent from anchor/fiberlet
-cache fingerprints, extraction settings, and serialized chunk payloads. A new
-horizon can request previously untouched on-demand chunks, but a fully hot
-cache is reopened without rewriting it.
+Beam-step, lookahead, prune distance, and search width are replay state only.
+They are absent from anchor/fiberlet cache fingerprints, extraction settings,
+and serialized chunk payloads. A new horizon can request previously untouched
+on-demand chunks, but a fully hot cache is reopened without rewriting it.
 
 The default cache roots are `<output>/cache/anchors.zarr` and
 `<output>/cache/fiberlets.zarr`. Override them independently with

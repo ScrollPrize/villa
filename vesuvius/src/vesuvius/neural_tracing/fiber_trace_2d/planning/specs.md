@@ -3107,27 +3107,63 @@
   the shared edge/join objective.
   The greedy evaluator and on-demand graph evaluator run concurrently;
   neither evaluator changes the other one's state.
-- Graph replay has separate finite positive beam-front and lookahead distances
-  in base voxels. It keeps up to 16 complete route histories and a shared
-  logical checkpoint `C` that is no greater than the shortest retained history.
-  At every iteration it expands every history through every valid acyclic graph
-  branch until the candidate reaches or passes `C+H`. The final fiberlet stays
-  whole, so candidates may overshoot the horizon by different small amounts.
-- Completed candidates are ranked globally by complete-route loss per
-  prediction voxel, raw loss, and deterministic logical route IDs. Exactly one
-  global prune retains the best 16 distinct committed prefixes. There is no
-  intermediate per-depth, per-parent, or unequal-distance prune. Parallel
-  expansion must yield the same ranking and output as single-thread expansion.
+- Graph replay has separate finite positive checkpoint-step, lookahead, and
+  intermediate-prune distances in base voxels. It keeps up to 16 complete route
+  histories and a shared logical checkpoint `C` that is no greater than the
+  shortest retained history. The default bounded search uses a 192-base-voxel
+  lookahead, 48-base-voxel checkpoint step, 48-base-voxel prune interval, and
+  working width 128. `--search-width 0` selects the exact A* oracle.
+- Bounded search first advances to the next checkpoint `C+D`, then to fronts at
+  most `P` apart until the exact `C+H` horizon. All fronts are clamped at the
+  selected route end; a final nondivisible interval is shorter. The final
+  fiberlet stays whole in graph state and may overshoot a front.
+- Between fronts, search is a deterministic uniform-cost label search. A label
+  state is `(logical incoming directed fiberlet, absolute front-offset bin)`;
+  front-offset bins are 0.5 prediction voxels. When histories reconverge at the
+  same state, only the lowest accumulated-cost history remains, with ordered
+  logical arc IDs breaking exact-cost ties. Its visited-node state becomes the
+  state's cycle state; alternatives with different visited histories are
+  intentionally discarded. Crossing labels use exact proportional terminal-
+  edge scoring. Once `K` exact completions exist, expansion stops only when the
+  next accumulated-cost lower bound is strictly greater than the `K`th exact
+  completion, so equal-cost ties remain eligible. Queue exhaustion returns all
+  available completions when fewer than `K` exist.
+- A route is scored cumulatively from the segment seed to the exact logical
+  front. When the front lies inside the terminal fiberlet, only the traversed
+  fraction of that edge cost contributes, while its entering join contributes
+  fully. When the front is exactly an anchor, the edge ending there and its
+  entering join contribute, but no outgoing edge or join does. The complete
+  terminal geometry and visited-node state remain attached to the candidate.
+- At an intermediate front, identical complete logical routes are deduplicated
+  and ranked by exact-front loss and stable logical IDs. The best continuation
+  for every represented stable prefix is retained first, up to working width;
+  remaining slots are filled by the globally best unselected routes. The
+  stable prefix is the segment seed plus ordered logical arc IDs through
+  `C+D`, never a history pointer. At the final front, only the best
+  continuation for each actual next-checkpoint prefix is eligible for the
+  globally best 16. Pruning a prefix that would become better by `C+H` is the
+  explicit approximation boundary.
+- Each expansion worker retains bounded local global candidates and stable-
+  prefix representatives. Dominated labels and stale queued labels are counted
+  separately from exact front completions and cost-bound pruning. Worker
+  candidate limits are the sufficient local bound: one representative for the
+  worker's stable prefix plus only the number of globally unoccupied fill
+  slots. The first `C+D` front uses the full target width because its stable
+  prefixes do not exist until that front is reached. Worker results merge in
+  canonical input order and are reranked by deterministic
+  logical IDs, so 1-thread and multi-thread executions produce identical
+  output. One generated-state limit covers the complete decision and aborts it
+  without retaining partial worker output.
 - After pruning, `C` advances by `D`. Each winner commits through the complete
   fiberlet containing the new checkpoint. Depending on its existing overshoot,
   a beam may add no fiberlet, one fiberlet, or several fiberlets in that step.
   Its physical endpoint may remain beyond `C`, preserving the invariant
   `C <= min(committed_history_length)`.
-- Every edge and entering join contributes its complete active graph-view cost;
-  compact-cost replay consumes the decoded authoritative scalar. Only final
-  reference-end or failure materialization may clip display/output geometry
-  inside a fiberlet, without altering beam scores. Exceeding the deterministic
-  per-iteration one-million-state bound is an explicit error. A route that
+- Compact-cost replay consumes the decoded authoritative edge and join costs.
+  Logical-front scoring may proportionally clip only the terminal edge cost;
+  final reference-end or failure materialization may additionally clip output
+  geometry without altering persistent graph state. Exceeding the deterministic
+  per-decision one-million-state bound is an explicit error. A route that
   exhausts before the common horizon is excluded; if all routes do, normal
   graph exhaustion applies.
 - Persistent histories use shared immutable parent records and retain IDs,
@@ -3135,10 +3171,11 @@
   not duplicate route geometry. A reference failure closes the chosen history,
   resets the segment origin, and reseeds the full population. The reference
   never removes graph candidates during ranking.
-- Beam-step and lookahead distances are replay-only metadata. They must not affect anchor or
-  fiberlet cache identity, corridor selection, generation settings, chunk
-  payloads, or prefetch scheduling. On-demand traversal may populate a missing
-  chunk, but repeating against a hot cache must not rewrite cache files.
+- Beam-step, lookahead, prune distance, and search width are replay-only
+  metadata. They must not affect anchor or fiberlet cache identity, corridor
+  selection, generation settings, chunk payloads, or prefetch scheduling.
+  On-demand traversal may populate a missing chunk, but repeating against a hot
+  cache must not rewrite cache files.
 - Default replay progress is one command-wide terminal bar. Cached replay uses
   `cache = (resolvedAnchors + 16*resolvedPrefixes) /
   (expectedAnchors + 16*expectedPrefixes)` over the deterministic scheduled

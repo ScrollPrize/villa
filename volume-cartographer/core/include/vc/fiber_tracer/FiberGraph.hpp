@@ -57,6 +57,8 @@ struct FiberletGraphReplayConfig {
     size_t expansionThreads = 1;
     double beamStepDistanceBaseVoxels = 48.0;
     double lookaheadDistanceBaseVoxels = 192.0;
+    size_t searchWidth = 128;
+    double pruneDistanceBaseVoxels = 48.0;
     size_t maximumGeneratedStatesPerIteration = 1'000'000;
     double errorThresholdBaseVoxels = 20.0;
     double matchRefineSteps = 1.0;
@@ -86,8 +88,7 @@ struct FiberletGraphReplayCost {
 
     [[nodiscard]] double total() const noexcept
     {
-        return invalidPrediction + alignment + isotropicSmoothness +
-            tangentSmoothness + normalSmoothness;
+        return invalidPrediction + alignment + isotropicSmoothness + tangentSmoothness + normalSmoothness;
     }
 
     FiberletGraphReplayCost& operator+=(const FiberletPathCost& other) noexcept
@@ -116,6 +117,25 @@ struct FiberletGraphReplayDecisionRoute {
     double lossPerPredictionVoxel = 0.0;
 };
 
+struct FiberletGraphReplayPruneFront {
+    double horizonPathLengthPredictionVoxels = 0.0;
+    size_t inputRouteCount = 0;
+    size_t localCandidateLimit = 0;
+    size_t generatedStateCount = 0;
+    size_t expandedStateCount = 0;
+    size_t rejectedStateCount = 0;
+    size_t dominatedStateCount = 0;
+    size_t costPrunedStateCount = 0;
+    size_t completedCandidateCount = 0;
+    size_t distinctPrefixCount = 0;
+    size_t diversityProtectedCount = 0;
+    size_t globalFillCount = 0;
+    size_t retainedRouteCount = 0;
+    size_t prunedCandidateCount = 0;
+    size_t cumulativeGeneratedStateCount = 0;
+    bool searchWidthBound = false;
+};
+
 struct FiberletGraphReplayDecision {
     size_t routePointIndex = 0;
     double referenceArcBase = 0.0;
@@ -127,7 +147,13 @@ struct FiberletGraphReplayDecision {
     size_t evaluatedCandidateCount = 0;
     size_t costPrunedStateCount = 0;
     size_t rejectedStateCount = 0;
+    size_t dominatedStateCount = 0;
     size_t retainedBeamCount = 0;
+    std::string searchMode;
+    size_t searchWidth = 0;
+    double pruneDistancePredictionVoxels = 0.0;
+    std::vector<FiberletGraphReplayPruneFront> pruneFronts;
+    std::vector<DirectedFiberletStorageId> selectedPrefixLogicalArcs;
     FiberletStorageKey sourceKey;
     std::optional<DirectedFiberletStorageId> incomingLogicalArc;
     std::optional<size_t> selectedRouteIndex;
@@ -188,8 +214,7 @@ struct FiberletGraphReplayProgress {
     std::string state;
 };
 
-using FiberletGraphReplayProgressCallback =
-    std::function<void(const FiberletGraphReplayProgress&)>;
+using FiberletGraphReplayProgressCallback = std::function<void(const FiberletGraphReplayProgress&)>;
 
 struct FiberletReplaySourceAnchor {
     FiberletStorageKey id;
@@ -217,36 +242,22 @@ struct FiberletReplaySourceTransition {
     std::optional<size_t> diagnosticTransitionIndex;
 };
 
-class FiberletReplayGraphSource {
+class FiberletReplayGraphSource
+{
 public:
     virtual ~FiberletReplayGraphSource() = default;
     [[nodiscard]] virtual float predictionToBaseScale() const noexcept = 0;
     [[nodiscard]] virtual int anchorCellSizePredictionVoxels() const noexcept = 0;
     [[nodiscard]] virtual float maximumJoinAngleDegrees() const noexcept = 0;
-    [[nodiscard]] virtual FiberletStorageKey logicalAnchorId(
-        const FiberletStorageKey& physical) const
-    {
-        return physical;
-    }
-    [[nodiscard]] virtual DirectedFiberletStorageId logicalArcId(
-        const DirectedFiberletStorageId& physical) const
-    {
-        return physical;
-    }
+    [[nodiscard]] virtual FiberletStorageKey logicalAnchorId(const FiberletStorageKey& physical) const { return physical; }
+    [[nodiscard]] virtual DirectedFiberletStorageId logicalArcId(const DirectedFiberletStorageId& physical) const { return physical; }
     [[nodiscard]] virtual std::vector<FiberletReplaySourceAnchor> anchorsNearReference(
-        const PolylineArcGeometry& reference,
-        double beginArcBase,
-        double endArcBase,
-        double broadPhaseRadiusBaseVoxels) const = 0;
-    [[nodiscard]] virtual std::vector<DirectedFiberletStorageId> outgoing(
-        const FiberletStorageKey& anchor) const = 0;
-    [[nodiscard]] virtual FiberletReplaySourceArc arc(
-        const DirectedFiberletStorageId& id) const = 0;
-    [[nodiscard]] virtual std::vector<cv::Vec3d> routePoints(
-        const DirectedFiberletStorageId& id) const = 0;
+        const PolylineArcGeometry& reference, double beginArcBase, double endArcBase, double broadPhaseRadiusBaseVoxels) const = 0;
+    [[nodiscard]] virtual std::vector<DirectedFiberletStorageId> outgoing(const FiberletStorageKey& anchor) const = 0;
+    [[nodiscard]] virtual FiberletReplaySourceArc arc(const DirectedFiberletStorageId& id) const = 0;
+    [[nodiscard]] virtual std::vector<cv::Vec3d> routePoints(const DirectedFiberletStorageId& id) const = 0;
     [[nodiscard]] virtual std::optional<FiberletReplaySourceTransition> transition(
-        const FiberletReplaySourceArc& incoming,
-        const FiberletReplaySourceArc& outgoing) const = 0;
+        const FiberletReplaySourceArc& incoming, const FiberletReplaySourceArc& outgoing) const = 0;
 };
 
 [[nodiscard]] FiberletGraph buildFiberletGraph(const FiberletPathReport& paths, float maximumJoinAngleDegrees = 45.0F);
@@ -275,7 +286,6 @@ public:
 
 [[nodiscard]] nlohmann::json fiberletGraphReplayJson(const FiberletGraphReplayResult& replay, const FiberletGraphReplayConfig& config);
 
-[[nodiscard]] std::vector<FiberletGraphReplayFailureWindow>
-fiberletGraphReplayFailureWindows(const FiberletGraphReplayResult& replay);
+[[nodiscard]] std::vector<FiberletGraphReplayFailureWindow> fiberletGraphReplayFailureWindows(const FiberletGraphReplayResult& replay);
 
 }  // namespace vc::fiber_tracer
