@@ -1,10 +1,21 @@
-# Status: show live cached replay preprocessing progress
+# Status: canonical anchor reuse across quantized fiberlets
 
-- [x] Record the requested behavior
-- [x] Inspect the progress and cache-resolution paths
-- [x] Write the implementation and verification plan
+- [x] Capture the requested task
+- [x] Write the task plan
 - [x] Complete independent plan review
-- [x] Implement resolved-chunk accounting and timer-driven repaint
+- [x] Make canonical anchor metadata/root scenario-independent
+- [x] Derive transformed endpoint views under a bounded single-flight LRU
+- [x] Apply transformed anchors consistently in the graph
+- [x] Add regression coverage
+- [x] Update specs and docs
 - [x] Build and run focused tests
-- [x] Verify live percentage, elapsed time, and ETA on radius 768
-- [x] Update specifications, documentation, changelog, and task log
+- [x] Validate compact-direction and Q4-position scenarios
+- [x] Fix deterministic cache-backed replay teardown
+- [x] Validate both scenarios over the full radius-768 corridor with hot caches
+- [x] Extend the task and plan for compact-axis cost-only scenarios
+- [x] Complete independent plan review
+- [x] Add compact-axis `uint8` and `uint16` scenarios and tests
+- [x] Build and run focused tests
+- [x] Run both full radius-768 comparisons from the compact-axis cache
+- [x] Measure and document partial-cache completion during cost-range scans
+- [x] Update specs, docs, changelog, and task log

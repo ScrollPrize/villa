@@ -4,6 +4,9 @@
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
 #include "vc/lasagna/ChannelSampler.hpp"
 
+#include <boost/geometry.hpp>
+#include <boost/geometry/index/rtree.hpp>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -48,7 +51,7 @@ struct SummaryBuilder {
 };
 
 struct QuantizedAnchorKey {
-    std::array<int64_t, 3> xyz{0, 0, 0};
+    std::array<size_t, 3> cellZYX{0, 0, 0};
     uint8_t variant = 0;
 
     auto operator<=>(const QuantizedAnchorKey&) const = default;
@@ -138,9 +141,52 @@ std::vector<size_t> replayCandidates(const FiberletGraphReplayResult& replay)
 }
 
 struct ReplayPolylineSet {
+    using IndexPoint = boost::geometry::model::point<
+        double, 3, boost::geometry::cs::cartesian>;
+    using IndexBox = boost::geometry::model::box<IndexPoint>;
+    using IndexValue = std::pair<IndexBox, size_t>;
+    using Index = boost::geometry::index::rtree<
+        IndexValue, boost::geometry::index::quadratic<16>>;
+    struct Segment {
+        cv::Vec3d first;
+        cv::Vec3d second;
+    };
     std::vector<PolylineArcGeometry> polylines;
     std::vector<cv::Vec3d> singletons;
+    std::vector<Segment> segments;
+    Index index;
 };
+
+ReplayPolylineSet::IndexPoint indexPoint(const cv::Vec3d& point)
+{
+    return {point[0], point[1], point[2]};
+}
+
+void finishReplayIndex(ReplayPolylineSet& lines)
+{
+    std::vector<ReplayPolylineSet::IndexValue> values;
+    for (const auto& polyline : lines.polylines) {
+        const auto& points = polyline.points;
+        for (size_t index = 1; index < points.size(); ++index)
+            lines.segments.push_back({points[index - 1], points[index]});
+    }
+    for (const auto& point : lines.singletons)
+        lines.segments.push_back({point, point});
+    values.reserve(lines.segments.size());
+    for (size_t index = 0; index < lines.segments.size(); ++index) {
+        const auto& segment = lines.segments[index];
+        ReplayPolylineSet::IndexPoint minimum;
+        ReplayPolylineSet::IndexPoint maximum;
+        boost::geometry::set<0>(minimum, std::min(segment.first[0], segment.second[0]));
+        boost::geometry::set<1>(minimum, std::min(segment.first[1], segment.second[1]));
+        boost::geometry::set<2>(minimum, std::min(segment.first[2], segment.second[2]));
+        boost::geometry::set<0>(maximum, std::max(segment.first[0], segment.second[0]));
+        boost::geometry::set<1>(maximum, std::max(segment.first[1], segment.second[1]));
+        boost::geometry::set<2>(maximum, std::max(segment.first[2], segment.second[2]));
+        values.emplace_back(ReplayPolylineSet::IndexBox{minimum, maximum}, index);
+    }
+    lines.index = ReplayPolylineSet::Index(values.begin(), values.end());
+}
 
 ReplayPolylineSet replayPolylineSet(const FiberletGraphReplayResult& replay)
 {
@@ -157,6 +203,7 @@ ReplayPolylineSet replayPolylineSet(const FiberletGraphReplayResult& replay)
         else if (points.size() == 1)
             result.singletons.push_back(points.front());
     }
+    finishReplayIndex(result);
     return result;
 }
 
@@ -170,16 +217,37 @@ ClosestLinePoint closestLinePoint(
     const cv::Vec3d& point)
 {
     ClosestLinePoint best;
-    for (const auto& polyline : target.polylines) {
-        const auto projection = projectPointToPolylineArc(
-            polyline, point, 0.0, polyline.length());
-        if (projection.distance < best.distance)
-            best = {projection.point, projection.distance};
-    }
-    for (const auto& singleton : target.singletons) {
-        const double distance = cv::norm(point - singleton);
-        if (distance < best.distance)
-            best = {singleton, distance};
+    if (target.segments.empty())
+        return best;
+    const auto query = indexPoint(point);
+    size_t count = std::min<size_t>(16, target.segments.size());
+    while (true) {
+        std::vector<ReplayPolylineSet::IndexValue> nearest;
+        nearest.reserve(count);
+        target.index.query(
+            boost::geometry::index::nearest(query, count),
+            std::back_inserter(nearest));
+        double maximumLowerBound = 0.0;
+        for (const auto& [box, index] : nearest) {
+            maximumLowerBound = std::max(maximumLowerBound,
+                boost::geometry::distance(query, box));
+            const auto& segment = target.segments[index];
+            const cv::Vec3d delta = segment.second - segment.first;
+            const double squared = delta.dot(delta);
+            const double fraction = squared > kEpsilon
+                ? std::clamp((point - segment.first).dot(delta) / squared,
+                      0.0, 1.0)
+                : 0.0;
+            const cv::Vec3d closest = segment.first + fraction * delta;
+            const double distance = cv::norm(point - closest);
+            if (distance < best.distance)
+                best = {closest, distance};
+        }
+        if (count == target.segments.size() ||
+            best.distance <= maximumLowerBound + kEpsilon) {
+            break;
+        }
+        count = std::min(target.segments.size(), count * 2);
     }
     return best;
 }
@@ -380,6 +448,7 @@ ReplayPolylineSet referencePolylineSet(
         result.polylines.push_back(makePolylineArcGeometry(selected));
     else if (selected.size() == 1)
         result.singletons.push_back(selected.front());
+    finishReplayIndex(result);
     return result;
 }
 
@@ -435,24 +504,12 @@ std::vector<size_t> orderedCosts(const FiberletPathReport& paths, const std::vec
 
 FiberletAnchorId graphAnchorId(const QuantizedAnchorKey& key)
 {
-    return {{static_cast<size_t>(key.xyz[2]), static_cast<size_t>(key.xyz[1]), static_cast<size_t>(key.xyz[0])}, key.variant};
+    return {key.cellZYX, key.variant};
 }
 
 cv::Vec3f compactAxis(const cv::Vec3f& axis)
 {
-    const auto encoded = vc::lasagna::encodeCompactNormalToRaw({axis[0], axis[1], axis[2]});
-    if (!encoded.has_value())
-        throw std::invalid_argument("fitted axis is not compact-encodable");
-    const cv::Vec3d decoded = vc::lasagna::decodeCompactNormalFromRaw((*encoded)[0], (*encoded)[1]);
-    return normalized({static_cast<float>(decoded[0]), static_cast<float>(decoded[1]), static_cast<float>(decoded[2])});
-}
-
-std::array<uint8_t, 2> encodedAxis(const cv::Vec3f& axis)
-{
-    const auto encoded = vc::lasagna::encodeCompactNormalToRaw({axis[0], axis[1], axis[2]});
-    if (!encoded.has_value())
-        throw std::invalid_argument("fitted axis is not compact-encodable");
-    return *encoded;
+    return quantizeFiberletDirectionForEvaluation(axis);
 }
 
 struct QuantizedAnchorLayout {
@@ -483,8 +540,7 @@ QuantizedAnchorLayout quantizeAnchors(
     QuantizedAnchorLayout layout;
     layout.loaded = baselineAnchors;
     const double scale = paths.grid.predictionToBaseScale;
-    std::map<std::array<int64_t, 3>, std::vector<FiberletAnchorId>> groups;
-    std::map<FiberletAnchorId, std::array<uint8_t, 2>> persistedAxes;
+    std::map<std::array<int64_t, 3>, std::size_t> quantizedPositionCounts;
     SummaryBuilder positionErrors;
     SummaryBuilder axisErrors;
     for (auto& cell : layout.loaded.report.nonEmptyCells) {
@@ -496,24 +552,28 @@ QuantizedAnchorLayout quantizeAnchors(
             const cv::Vec3f sourcePosition = component.anchor.positionPredictionXYZ;
             const cv::Vec3f sourceAxis = component.anchor.axisXYZ;
             QuantizedAnchor anchor;
+            anchor.key = {cell.cellZYX,
+                static_cast<uint8_t>(componentIndex)};
             anchor.positionPredictionXYZ = sourcePosition;
             if (quantum > 0) {
+                std::array<int64_t, 3> quantizedPosition{};
                 for (size_t axis = 0; axis < 3; ++axis) {
                     const double base = static_cast<double>(sourcePosition[axis]) * scale;
                     if (!(base >= 0.0) || !std::isfinite(base))
                         throw std::invalid_argument("anchor position is outside nonnegative volume coordinates");
-                    anchor.key.xyz[axis] = static_cast<int64_t>(std::floor(base / static_cast<double>(quantum) + 0.5));
-                    const double decodedBase = static_cast<double>(anchor.key.xyz[axis] * quantum);
+                    quantizedPosition[axis] = static_cast<int64_t>(
+                        std::floor(base / static_cast<double>(quantum) + 0.5));
+                    const double decodedBase = static_cast<double>(
+                        quantizedPosition[axis] * quantum);
                     const size_t shapeAxis = paths.grid.shapeZYX[2 - axis];
                     if (!(decodedBase < static_cast<double>(shapeAxis) * scale))
                         throw std::invalid_argument("quantized anchor position leaves the prediction volume");
                     anchor.positionPredictionXYZ[axis] = static_cast<float>(decodedBase / scale);
                 }
-                groups[anchor.key.xyz].push_back(id);
+                ++quantizedPositionCounts[quantizedPosition];
                 positionErrors.values.push_back(length(anchor.positionPredictionXYZ - sourcePosition) * scale);
             }
             anchor.compactAxisXYZ = compactAxis(sourceAxis);
-            persistedAxes.emplace(id, encodedAxis(sourceAxis));
             axisErrors.values.push_back(
                 useCompactAxes ? unorientedAngleDegrees(sourceAxis, anchor.compactAxisXYZ) : 0.0);
             component.anchor.positionPredictionXYZ = anchor.positionPredictionXYZ;
@@ -521,29 +581,26 @@ QuantizedAnchorLayout quantizeAnchors(
             if (!layout.anchors.emplace(id, anchor).second)
                 throw std::invalid_argument("duplicate original fiberlet anchor identity");
             ++report.anchors;
+            report.maximumVariants = std::max(
+                report.maximumVariants, componentIndex + 1);
         }
     }
-    for (auto& [position, ids] : groups) {
-        std::sort(ids.begin(), ids.end(), [&](const auto& left, const auto& right) {
-            return std::tuple{persistedAxes.at(left), left} < std::tuple{persistedAxes.at(right), right};
-        });
-        report.maximumVariants = std::max(report.maximumVariants, ids.size());
-        if (ids.size() > 1)
+    for (const auto& [position, count] : quantizedPositionCounts) {
+        (void)position;
+        if (count > 1)
             ++report.coincidentPositionGroups;
-        if (ids.size() > 2)
-            throw std::invalid_argument("quantized anchor position requires more than two variants");
-        for (size_t variant = 0; variant < ids.size(); ++variant)
-            layout.anchors.at(ids[variant]).key.variant = static_cast<uint8_t>(variant);
     }
 
     if (quantum > 0) {
         int64_t maximumDelta = 0;
         for (const size_t index : successful) {
             const auto& candidate = paths.candidates[index];
-            const auto& start = layout.anchors.at(candidate.start).key.xyz;
-            const auto& target = layout.anchors.at(candidate.target).key.xyz;
+            const auto& start = layout.anchors.at(candidate.start).key.cellZYX;
+            const auto& target = layout.anchors.at(candidate.target).key.cellZYX;
             for (size_t axis = 0; axis < 3; ++axis)
-                maximumDelta = std::max(maximumDelta, std::abs(target[axis] - start[axis]));
+                maximumDelta = std::max(maximumDelta,
+                    std::abs(static_cast<int64_t>(target[axis]) -
+                        static_cast<int64_t>(start[axis])));
         }
         report.anchorDeltaBits = maximumDelta <= 127 ? 8 : maximumDelta <= 32767 ? 16 : 0;
         if (report.anchorDeltaBits == 0)
@@ -610,34 +667,17 @@ void quantizeCosts(
 {
     if (bits != 8 && bits != 16)
         return;
-    const uint32_t levels = bits == 8 ? 255U : 65535U;
     const auto chunks = costChunks(baseline, successful, chunkSide);
     for (const auto& [chunk, indices] : chunks) {
         (void)chunk;
-        float minimum = std::numeric_limits<float>::infinity();
-        float maximum = -std::numeric_limits<float>::infinity();
-        for (const size_t index : indices) {
-            const float cost = baseline.candidates[index].cost.total();
-            minimum = std::min(minimum, cost);
-            maximum = std::max(maximum, cost);
-        }
-        const float offset = minimum;
-        const float scale = maximum == minimum ? 0.0F : static_cast<float>((maximum - offset) / static_cast<float>(levels));
-        for (const size_t index : indices) {
-            const float original = baseline.candidates[index].cost.total();
-            uint32_t code = 0;
-            if (original == maximum) {
-                code = levels;
-            } else if (scale > 0.0F) {
-                const float raw = (original - offset) / scale;
-                if (!std::isfinite(raw) || raw < 0.0F || raw > static_cast<float>(levels)) {
-                    throw std::invalid_argument("fiberlet cost lies outside its chunk affine range");
-                }
-                code = static_cast<uint32_t>(std::floor(raw + 0.5F));
-            }
-            const float decoded = offset + scale * static_cast<float>(code);
-            measured.candidates[index].cost = {decoded, 0.0F, 0.0F, 0.0F, 0.0F};
-        }
+        std::vector<float> costs;
+        costs.reserve(indices.size());
+        for (const size_t index : indices)
+            costs.push_back(baseline.candidates[index].cost.total());
+        const auto decoded = quantizeFiberletCostsForEvaluation(costs, bits);
+        for (size_t local = 0; local < indices.size(); ++local)
+            measured.candidates[indices[local]].cost =
+                {decoded[local], 0.0F, 0.0F, 0.0F, 0.0F};
     }
 }
 
@@ -824,6 +864,94 @@ FiberletQuantizationScenarioReport compareScenario(
 
 }  // namespace
 
+cv::Vec3f quantizeFiberletPositionForEvaluation(
+    const cv::Vec3f& positionPredictionXYZ,
+    const FiberPredictionGridInfo& grid,
+    int quantumBaseVoxels)
+{
+    if (quantumBaseVoxels <= 0)
+        return positionPredictionXYZ;
+    if (!(grid.predictionToBaseScale > 0.0) ||
+        !std::isfinite(grid.predictionToBaseScale)) {
+        throw std::invalid_argument(
+            "fiberlet evaluation position scale is invalid");
+    }
+    cv::Vec3f result;
+    for (size_t xyz = 0; xyz < 3; ++xyz) {
+        const double base = static_cast<double>(positionPredictionXYZ[xyz]) *
+            grid.predictionToBaseScale;
+        if (!(base >= 0.0) || !std::isfinite(base))
+            throw std::invalid_argument(
+                "fiberlet evaluation position is outside nonnegative coordinates");
+        const double decodedBase = static_cast<double>(quantumBaseVoxels) *
+            std::floor(base / static_cast<double>(quantumBaseVoxels) + 0.5);
+        const size_t shapeAxis = grid.shapeZYX[2 - xyz];
+        if (!(decodedBase < static_cast<double>(shapeAxis) *
+                grid.predictionToBaseScale)) {
+            throw std::invalid_argument(
+                "fiberlet evaluation position leaves the prediction volume");
+        }
+        result[static_cast<int>(xyz)] = static_cast<float>(
+            decodedBase / grid.predictionToBaseScale);
+    }
+    return result;
+}
+
+cv::Vec3f quantizeFiberletDirectionForEvaluation(
+    const cv::Vec3f& directionXYZ)
+{
+    const auto encoded = vc::lasagna::encodeCompactNormalToRaw(
+        {directionXYZ[0], directionXYZ[1], directionXYZ[2]});
+    if (!encoded.has_value())
+        throw std::invalid_argument(
+            "fiberlet evaluation direction is not compact-encodable");
+    const cv::Vec3d decoded = vc::lasagna::decodeCompactNormalFromRaw(
+        (*encoded)[0], (*encoded)[1]);
+    return normalized({static_cast<float>(decoded[0]),
+        static_cast<float>(decoded[1]), static_cast<float>(decoded[2])});
+}
+
+std::vector<float> quantizeFiberletCostsForEvaluation(
+    std::span<const float> costs,
+    int bits)
+{
+    if (bits != 8 && bits != 16)
+        return {costs.begin(), costs.end()};
+    if (costs.empty())
+        return {};
+    for (const float cost : costs) {
+        if (!(cost >= 0.0F) || !std::isfinite(cost))
+            throw std::invalid_argument(
+                "fiberlet evaluation cost is invalid");
+    }
+    const auto [minimumIt, maximumIt] =
+        std::minmax_element(costs.begin(), costs.end());
+    const float minimum = *minimumIt;
+    const float maximum = *maximumIt;
+    const std::uint32_t levels = bits == 8 ? 255U : 65535U;
+    const float scale = maximum == minimum
+        ? 0.0F
+        : (maximum - minimum) / static_cast<float>(levels);
+    std::vector<float> result;
+    result.reserve(costs.size());
+    for (const float cost : costs) {
+        std::uint32_t code = 0;
+        if (cost == maximum) {
+            code = levels;
+        } else if (scale > 0.0F) {
+            const float raw = (cost - minimum) / scale;
+            if (!std::isfinite(raw) || raw < 0.0F ||
+                raw > static_cast<float>(levels)) {
+                throw std::invalid_argument(
+                    "fiberlet evaluation cost lies outside its affine range");
+            }
+            code = static_cast<std::uint32_t>(std::floor(raw + 0.5F));
+        }
+        result.push_back(minimum + scale * static_cast<float>(code));
+    }
+    return result;
+}
+
 std::vector<FiberletQuantizationScenario> standardFiberletQuantizationScenarios()
 {
     std::vector<FiberletQuantizationScenario> result{
@@ -832,6 +960,8 @@ std::vector<FiberletQuantizationScenario> standardFiberletQuantizationScenarios(
         {"position_q2", 2, false, 0},
         {"position_q4", 4, false, 0},
         {"compact_axis", 0, true, 0},
+        {"compact_axis_cost_u8", 0, true, 8},
+        {"compact_axis_cost_u16", 0, true, 16},
         {"position_q1_compact_axis", 1, true, 0},
         {"position_q2_compact_axis", 2, true, 0},
         {"position_q4_compact_axis", 4, true, 0},
@@ -844,6 +974,26 @@ std::vector<FiberletQuantizationScenario> standardFiberletQuantizationScenarios(
         }
     }
     return result;
+}
+
+FiberletGeometryCacheProfile fiberletGeometryCacheProfile(
+    FiberletEvaluationQuantization replayQuantization)
+{
+    const bool quantizedGeometry =
+        replayQuantization.positionQuantumBaseVoxels > 0 ||
+        replayQuantization.compactDirections;
+    return {
+        .geometry = {
+            replayQuantization.positionQuantumBaseVoxels,
+            replayQuantization.compactDirections,
+        },
+        // Existing generated geometry caches were fingerprinted by the
+        // combined u8 scenarios. This is an opaque namespace compatibility
+        // tag; it is deliberately absent from FiberletGeometryQuantization.
+        .compatibilityCostTagBits = quantizedGeometry ? 8 : 0,
+        .storageChunkSideBaseVoxels =
+            replayQuantization.storageChunkSideBaseVoxels,
+    };
 }
 
 std::vector<FiberletQuantizationScenarioReport> benchmarkFiberletQuantization(
@@ -1051,6 +1201,80 @@ std::vector<FiberletQuantizationScenarioReport> benchmarkFiberletQuantization(
         }
     }
     return reports;
+}
+
+FiberletCachedReplayComparisonReport compareFiberletCachedReplays(
+    const FiberletQuantizationScenario& scenario,
+    const FiberletGraphReplayResult& baseline,
+    const FiberletGraphReplayResult& measured,
+    const std::vector<cv::Vec3d>& referencePointsBaseXYZ,
+    const vc::lasagna::NormalSampler& normalSampler,
+    double normalWorkingToBaseScale,
+    double normalThresholdBaseVoxels,
+    const FiberletQuantizationProgressCallback& progress)
+{
+    const auto completedFraction = [](const FiberletGraphReplayResult& replay) {
+        const double length = replay.referenceEndArcBase -
+            replay.referenceBeginArcBase;
+        return length > 0.0
+            ? std::clamp((replay.completedReferenceArcBase -
+                  replay.referenceBeginArcBase) / length, 0.0, 1.0)
+            : 1.0;
+    };
+    FiberletCachedReplayComparisonReport result;
+    result.scenario = scenario;
+    result.baselineFailures = baseline.failures.size();
+    result.scenarioFailures = measured.failures.size();
+    result.baselineCompletedFraction = completedFraction(baseline);
+    result.scenarioCompletedFraction = completedFraction(measured);
+
+    const auto baselineLines = replayPolylineSet(baseline);
+    const auto measuredLines = replayPolylineSet(measured);
+    const auto referenceLines = referencePolylineSet(
+        referencePointsBaseXYZ,
+        std::min(baseline.referenceBeginArcBase,
+            measured.referenceBeginArcBase),
+        std::max(baseline.referenceEndArcBase,
+            measured.referenceEndArcBase));
+    const auto lineDistance = symmetricReplayLineDistance(
+        baselineLines, measuredLines, normalSampler,
+        normalWorkingToBaseScale, normalThresholdBaseVoxels, false,
+        "line_distance", scenario.name, progress);
+    result.lineDistanceAvailable = lineDistance.available;
+    result.lineDistanceSamples = lineDistance.samples;
+    result.lineDistanceInvalidNormalSamples =
+        lineDistance.invalidNormalSamples;
+    result.lineDistanceBaseVoxels = lineDistance.euclideanBaseVoxels;
+    result.lineNormalDistanceBaseVoxels = lineDistance.normalBaseVoxels;
+    result.lineTangentialDistanceBaseVoxels =
+        lineDistance.tangentialBaseVoxels;
+
+    const auto baselineReference = directedReferenceLineDistance(
+        baselineLines, referenceLines, normalSampler,
+        normalWorkingToBaseScale, normalThresholdBaseVoxels,
+        "baseline", progress);
+    result.baselineReferenceInvalidNormalSamples =
+        baselineReference.invalidNormalSamples;
+    result.baselineReferenceDistanceBaseVoxels =
+        baselineReference.euclideanBaseVoxels;
+    result.baselineReferenceNormalDistanceBaseVoxels =
+        baselineReference.normalBaseVoxels;
+    result.baselineReferenceTangentialDistanceBaseVoxels =
+        baselineReference.tangentialBaseVoxels;
+
+    const auto measuredReference = directedReferenceLineDistance(
+        measuredLines, referenceLines, normalSampler,
+        normalWorkingToBaseScale, normalThresholdBaseVoxels,
+        scenario.name, progress);
+    result.scenarioReferenceInvalidNormalSamples =
+        measuredReference.invalidNormalSamples;
+    result.scenarioReferenceDistanceBaseVoxels =
+        measuredReference.euclideanBaseVoxels;
+    result.scenarioReferenceNormalDistanceBaseVoxels =
+        measuredReference.normalBaseVoxels;
+    result.scenarioReferenceTangentialDistanceBaseVoxels =
+        measuredReference.tangentialBaseVoxels;
+    return result;
 }
 
 }  // namespace vc::fiber_tracer

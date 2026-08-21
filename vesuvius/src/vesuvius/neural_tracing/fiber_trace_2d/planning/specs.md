@@ -3611,40 +3611,81 @@
 
 # Fiberlet storage quantization experiment
 
-- `vc_fiberlets quantization-benchmark` uses one production anchor extraction.
-  It reruns regular candidate generation, dense sampling, and DP exactly once
-  for each distinct endpoint geometry: float baseline; position quanta `1/2/4`
-  base voxels; compact fitted axes; and `q=1/2/4` plus compact axes. These eight
-  geometry results feed a fixed 16-row matrix that also contains isolated
-  per-chunk `uint8/uint16` total costs and six combined cost layouts.
+- `vc_fiberlets quantization-benchmark` runs one float baseline and one selected
+  quantized scenario through persistent, fingerprinted on-demand caches. It
+  never materializes the complete corridor graph.
+  The default scenario is `combined_q4_axis_cost_u8`; the command requires an
+  output directory so interrupted and warm runs reuse complete chunks.
+  The standard matrix has 18 entries: one baseline and 17 non-baseline rows in
+  deterministic order.
+- One canonical float anchor dataset belongs to each exact source, extraction,
+  corridor, grid, and chunk-layout identity. Baseline and every geometry or cost
+  scenario reuse that dataset. Quantization never changes serialized anchors or
+  reruns anchor extraction.
 - Quantized endpoints are globally nearest-rounded before DP. The regular DP
   constructs the resulting Hermite domain and chooses a new interior route; a
   baseline `(u,v)` route must not be transplanted onto changed endpoint planes.
-- Variants `0/1` are assigned by persisted compact-axis bytes and then stable
-  original anchor identity, even when a position-only scenario uses the float
-  fitted axis for DP.
-- More than two variants, duplicate/unresolvable decoded keys, out-of-volume
-  endpoints, endpoint-key collapse, or unsupported local-position/delta widths
-  invalidate the complete scenario. Ordinary candidate rejection or no-path
-  after otherwise valid quantization is a measured result and remains visible
-  in the scenario graph population.
+- Stable anchor IDs remain source cell coordinate plus component `0/1`.
+  Rounded positions are geometry, not identity: anchors from adjacent cells may
+  legitimately round to the same base coordinate and must not be merged.
+- Duplicate/unresolvable source-cell keys, out-of-volume endpoints, or
+  unsupported local-position/delta widths invalidate the complete scenario.
+  Ordinary candidate rejection or no-path after otherwise valid quantization is
+  a measured result and remains visible in the scenario graph population.
 - Cost offset and scale are float32 per first-endpoint spatial chunk. Encoding
   nearest-rounds onto the complete unsigned range with an exact-maximum case;
   decoding evaluates float32 `offset + scale * code`. The decoded scalar is the
   authoritative edge total. The beam denominator is the float32 path length
   computed by that geometry's DP; cost variants reuse it unchanged.
-- Geometry scenarios use the existing graph builder and replay. Reports include
-  scalar widths, collisions, successful-candidate additions/removals,
-  geometry/cost errors, global and per-chunk cost inversions, top-k agreement,
-  transition changes, comparisons with the global baseline and matching
-  float-cost geometry, baseline/scenario tracing failure counts and signed
-  delta, symmetric maximum Euclidean/normal/tangential line distance, invalid
-  normal samples, and separate cached-geometry DP time. Anchor/candidate and
-  point-index identity are not tracing-quality metrics.
+- Each geometry scenario derives a chunk-local endpoint view from canonical
+  anchors and runs fresh candidate generation, Hermite construction, dense
+  sampling, and DP. Compact direction changes only the fitted axis and retains
+  canonical scoring. Position quantization also resamples prediction direction,
+  presence, validity, and Lasagna normal fields at every rounded endpoint.
+  It reuses no float candidate, interior route, endpoint step, path length, or
+  cost. Source cell/component IDs address evaluation-cache data and define
+  canonical graph ordering; quantized positions affect geometry only.
+- Derived anchor chunks use single-flight construction and a bounded LRU. The
+  same derived chunk view supplies candidate DP, replay seeds, individual
+  endpoint lookup, arcs, route reconstruction, transitions, and compact-cost
+  ownership; no consumer may mix canonical and transformed endpoint geometry.
+- Reports include explicit scalar settings, logical-key collisions, failure
+  counts, completed fractions, bounded decoded residency, wall/CPU time,
+  symmetric Euclidean/normal/tangential line-distance distributions, and both
+  replay-to-reference distributions. Anchor/candidate and point-index identity
+  are not tracing-quality metrics.
+- Batch replay teardown cancels and drains only its own speculative cache task
+  groups. Fiberlet work drains before anchor work because an active fiberlet
+  producer may synchronously request anchor dependencies. Issued persistent
+  writes finish before the replay context is released, and each completed
+  machine-readable result row is flushed immediately.
+- Geometry-cache identity separates generated fiberlets from the replay cost
+  view. Its generation settings contain only endpoint position quantum and
+  fitted-direction encoding. Float, `uint8`, and `uint16` cost views for one
+  geometry share the same fiberlet prefixes, routes, path lengths, endpoint
+  steps, and float component costs. All of them share the one canonical anchor
+  cache; cost-only views also reuse baseline fiberlets.
+- `compact_axis`, `compact_axis_cost_u8`, and `compact_axis_cost_u16` all use
+  float positions and the identical compact-direction geometry cache. Their
+  selected graph costs are respectively float, `uint8`, and `uint16`; the
+  geometry namespace's opaque historical u8 compatibility tag does not select
+  graph cost precision and never changes persisted prefixes or routes.
+- Compact costs use one affine range per first-endpoint storage chunk. Building
+  that stable range may complete missing on-demand chunks in the shared
+  geometry cache, but it must not create a cost-specific cache namespace or
+  rewrite existing geometry payloads.
+- For compatibility with already completed experiments, every non-float
+  geometry cache uses the historical internal `cost_bits=8` namespace tag.
+  This tag is opaque cache identity data and cannot reach preprocessing. The
+  replay graph alone receives the selected cost precision. Cache chunk side is
+  still shared physical layout metadata and remains part of cache identity.
 - `--scenario NAME` selects one exact matrix scenario plus the baseline. The
   focused `combined_q4_axis_cost_u8` scenario means a 4-base-voxel endpoint
   position quantum, the existing compact two-byte fitted-direction encoding,
   and per-chunk 8-bit total cost. An unknown scenario name is an error.
+- `--scenario all` runs the baseline once, then emits 15 comparison rows for
+  every non-baseline standard scenario in deterministic matrix order. Each
+  geometry group is generated at most once and later cost views reopen it.
 - Maximum line distance treats replay restart segments as disconnected. It
   samples both directions at no more than one base voxel spacing and projects
   onto the other replay's actual segments. Normal/tangential components use the

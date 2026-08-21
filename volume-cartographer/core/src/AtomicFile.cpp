@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
+#include <random>
 #include <stdexcept>
 #include <system_error>
 
@@ -21,6 +22,22 @@
 #endif
 
 namespace vc::core::util {
+
+namespace {
+
+std::string uniqueTemporarySuffix()
+{
+    // Isolated/containerized processes can reuse the same PID while sharing a
+    // cache directory. Include a per-process random tag so an interrupted run
+    // cannot collide with a later writer's temporary name.
+    static const auto processTag = static_cast<std::uint64_t>(
+        std::random_device{}());
+    static std::atomic<std::uint64_t> counter{0};
+    return ".tmp." + std::to_string(processTag) + "." +
+        std::to_string(counter.fetch_add(1, std::memory_order_relaxed));
+}
+
+} // namespace
 
 void replaceFileAtomically(
     const std::filesystem::path& source,
@@ -56,67 +73,69 @@ void atomicWriteBytes(
     if (!target.parent_path().empty())
         std::filesystem::create_directories(target.parent_path());
     auto temporary = target;
-    static std::atomic<std::uint64_t> counter{0};
+    temporary += uniqueTemporarySuffix();
+    try {
+        {
+            errno = 0;
+            std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+            if (!output) {
+                const std::error_code error(errno, std::generic_category());
+                throw std::filesystem::filesystem_error(
+                    "cannot open temporary file for write", temporary, error);
+            }
+            output.write(
+                reinterpret_cast<const char*>(bytes.data()),
+                static_cast<std::streamsize>(bytes.size()));
+            if (!output)
+                throw std::runtime_error("write failed for " + temporary.string());
+            output.flush();
+            if (!output)
+                throw std::runtime_error("flush failed for " + temporary.string());
+        }
 #if defined(_WIN32)
-    const auto processId = static_cast<std::uint64_t>(::GetCurrentProcessId());
+        HANDLE file = ::CreateFileW(
+            temporary.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE || !::FlushFileBuffers(file)) {
+            const auto error = static_cast<int>(::GetLastError());
+            if (file != INVALID_HANDLE_VALUE)
+                ::CloseHandle(file);
+            throw std::filesystem::filesystem_error(
+                "cannot flush temporary file", temporary,
+                std::error_code(error, std::system_category()));
+        }
+        ::CloseHandle(file);
 #else
-    const auto processId = static_cast<std::uint64_t>(::getpid());
+        const int file = ::open(temporary.c_str(), O_RDONLY);
+        if (file < 0 || ::fsync(file) != 0) {
+            const std::error_code error(errno, std::generic_category());
+            if (file >= 0)
+                ::close(file);
+            throw std::filesystem::filesystem_error(
+                "cannot fsync temporary file", temporary, error);
+        }
+        ::close(file);
 #endif
-    temporary += ".tmp." + std::to_string(processId) + "." +
-        std::to_string(counter.fetch_add(1, std::memory_order_relaxed));
-    {
-        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
-        if (!output)
-            throw std::runtime_error(
-                "cannot open " + temporary.string() + " for write");
-        output.write(
-            reinterpret_cast<const char*>(bytes.data()),
-            static_cast<std::streamsize>(bytes.size()));
-        if (!output)
-            throw std::runtime_error("write failed for " + temporary.string());
-        output.flush();
-        if (!output)
-            throw std::runtime_error("flush failed for " + temporary.string());
-    }
-#if defined(_WIN32)
-    HANDLE file = ::CreateFileW(
-        temporary.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE || !::FlushFileBuffers(file)) {
-        const auto error = static_cast<int>(::GetLastError());
-        if (file != INVALID_HANDLE_VALUE)
-            ::CloseHandle(file);
-        throw std::filesystem::filesystem_error(
-            "cannot flush temporary file", temporary,
-            std::error_code(error, std::system_category()));
-    }
-    ::CloseHandle(file);
-#else
-    const int file = ::open(temporary.c_str(), O_RDONLY);
-    if (file < 0 || ::fsync(file) != 0) {
-        const std::error_code error(errno, std::generic_category());
-        if (file >= 0)
-            ::close(file);
-        throw std::filesystem::filesystem_error(
-            "cannot fsync temporary file", temporary, error);
-    }
-    ::close(file);
-#endif
-    replaceFileAtomically(temporary, target);
+        replaceFileAtomically(temporary, target);
 #if !defined(_WIN32)
-    const auto parent = target.parent_path().empty()
-        ? std::filesystem::path{"."}
-        : target.parent_path();
-    const int directory = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY);
-    if (directory < 0 || ::fsync(directory) != 0) {
-        const std::error_code error(errno, std::generic_category());
-        if (directory >= 0)
-            ::close(directory);
-        throw std::filesystem::filesystem_error(
-            "cannot fsync parent directory", parent, error);
-    }
-    ::close(directory);
+        const auto parent = target.parent_path().empty()
+            ? std::filesystem::path{"."}
+            : target.parent_path();
+        const int directory = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY);
+        if (directory < 0 || ::fsync(directory) != 0) {
+            const std::error_code error(errno, std::generic_category());
+            if (directory >= 0)
+                ::close(directory);
+            throw std::filesystem::filesystem_error(
+                "cannot fsync parent directory", parent, error);
+        }
+        ::close(directory);
 #endif
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        throw;
+    }
 }
 
 } // namespace vc::core::util

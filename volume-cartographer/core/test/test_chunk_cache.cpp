@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <filesystem>
+#include <future>
 #include <latch>
 #include <memory>
 #include <mutex>
@@ -115,6 +116,43 @@ private:
     int base_ = 0;
 };
 
+class BlockingFetcher final : public IChunkFetcher {
+public:
+    ChunkFetchResult fetch(const ChunkKey&) override
+    {
+        ++fetchCalls;
+        std::unique_lock lock(mutex_);
+        entered_ = true;
+        cv_.notify_all();
+        cv_.wait(lock, [&] { return released_; });
+        ChunkFetchResult result;
+        result.status = ChunkFetchStatus::Found;
+        result.bytes = {std::byte{99}};
+        return result;
+    }
+
+    void waitUntilEntered()
+    {
+        std::unique_lock lock(mutex_);
+        cv_.wait(lock, [&] { return entered_; });
+    }
+
+    void release()
+    {
+        std::lock_guard lock(mutex_);
+        released_ = true;
+        cv_.notify_all();
+    }
+
+    std::atomic<int> fetchCalls{0};
+
+private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool entered_ = false;
+    bool released_ = false;
+};
+
 std::vector<std::byte> makeBytes(std::size_t n, std::byte v = std::byte{99})
 {
     return std::vector<std::byte>(n, v);
@@ -163,6 +201,33 @@ TEST_CASE("ChunkCache basic IChunkedArray accessors")
     CHECK(c->fillValue() == 0.0);
     auto lt = c->levelTransform(0);
     CHECK(lt.scaleFromLevel0[0] == doctest::Approx(1.0));
+}
+
+TEST_CASE("ChunkCache cancelPendingAndWait drains active work and cancels queued work")
+{
+    auto fetcher = std::make_shared<BlockingFetcher>();
+    const std::vector<ChunkCache::LevelInfo> levels{{{1, 1, 8}, {1, 1, 1}, {}}};
+    ChunkCache::Options options;
+    options.maxConcurrentReads = 1;
+    options.schedulerLane = "test-cancel-and-drain";
+    ChunkCache cache(levels, {fetcher}, 0.0, ChunkDtype::UInt8, options);
+
+    std::vector<ChunkKey> keys;
+    for (int x = 0; x < 8; ++x)
+        keys.push_back({0, 0, 0, x});
+    cache.prefetchChunks(keys, false);
+    fetcher->waitUntilEntered();
+
+    auto drained = std::async(std::launch::async, [&] {
+        cache.cancelPendingAndWait();
+    });
+    CHECK(drained.wait_for(std::chrono::milliseconds{25}) ==
+          std::future_status::timeout);
+    fetcher->release();
+    REQUIRE(drained.wait_for(std::chrono::seconds{2}) ==
+            std::future_status::ready);
+    drained.get();
+    CHECK(fetcher->fetchCalls.load() == 1);
 }
 
 TEST_CASE("ChunkCache: out-of-range keys do not return Data; no fetcher hit")

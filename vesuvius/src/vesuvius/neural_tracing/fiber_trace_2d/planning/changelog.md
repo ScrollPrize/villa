@@ -850,3 +850,38 @@
 - Isolated progress observer failures from cache results and made ticker and
   resolution-state shutdown safe for late worker completion. Radius-64 replay
   output remained byte-identical.
+
+# 2026-08-20: cache-backed quantization comparison
+
+- Replaced the eager full-population quantization CLI with sequential baseline
+  and selected-scenario replays over persistent, fingerprinted, bounded caches.
+- Applied endpoint position/direction quantization before fresh sampling and DP,
+  projected compact logical IDs for ordering, and decoded per-owner-chunk costs.
+- Added indexed line comparison with Euclidean, normal, and tangential
+  distributions for baseline-to-scenario and both replay-to-reference paths.
+- Kept quantized anchor identity cell-local after a full-corridor run showed
+  that anchors from several adjacent cells can round to one Q4 coordinate.
+- Added explicit exact-baseline cache reuse and collision-resistant atomic
+  temporary writes so long interrupted comparisons resume safely.
+
+# 2026-08-21: geometry-cache reuse across cost experiments
+
+- Split anchor/fiberlet geometry quantization from replay-only cost decoding,
+  allowing float, uint8, and uint16 cost comparisons to share persistent
+  geometry and DP caches.
+- Added `--scenario all`, which runs one baseline and all 17 non-baseline
+  scenarios while creating at most eight geometry cache groups.
+- Retained the historical u8-tagged namespace only as opaque compatibility
+  metadata so the completed radius-768 Q4+axis cache remains reusable.
+- Made anchor extraction canonical across all geometry scenarios. Quantized
+  endpoint views are now derived once per loaded anchor chunk under a bounded
+  single-flight LRU, while only fiberlet geometry remains scenario-specific.
+- Added producer-group cache cancellation and draining for batch replay so
+  completed full-corridor quantization results no longer hang or crash during
+  process worker-pool teardown.
+- Added float-position compact-axis `uint8` and `uint16` cost scenarios. Both
+  are graph-only views over the existing compact-axis geometry cache.
+- Full radius-768 validation confirmed the shared namespace. Because the
+  existing compact-axis cache was only partially populated, its per-owner cost
+  range scan completed missing geometry chunks in place; it did not create a
+  cost-specific cache.

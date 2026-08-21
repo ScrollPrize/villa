@@ -182,6 +182,7 @@ cv::Vec3f sourceArcStartDirection(const FiberletReplaySourceArc& arc)
 
 struct SourceRouteCandidate {
     std::vector<DirectedFiberletStorageId> arcs;
+    std::vector<DirectedFiberletStorageId> logicalArcs;
     std::vector<FiberletReplaySourceTransition> transitions;
     std::set<FiberletStorageKey> visitedNodes;
     double loss = 0.0;
@@ -197,8 +198,8 @@ double routeDensity(const SourceRouteCandidate& route)
 
 bool routeLess(const SourceRouteCandidate& left, const SourceRouteCandidate& right)
 {
-    return std::tuple{routeDensity(left), left.loss, left.arcs} <
-        std::tuple{routeDensity(right), right.loss, right.arcs};
+    return std::tuple{routeDensity(left), left.loss, left.logicalArcs} <
+        std::tuple{routeDensity(right), right.loss, right.logicalArcs};
 }
 
 void pruneRoutes(std::vector<SourceRouteCandidate>& routes, size_t beamWidth)
@@ -238,6 +239,7 @@ std::optional<SourceRouteCandidate> bestLookaheadRoute(
             continue;
         SourceRouteCandidate candidate;
         candidate.arcs.push_back(arcId);
+        candidate.logicalArcs.push_back(graph.logicalArcId(arcId));
         candidate.visitedNodes = committedVisitedNodes;
         candidate.visitedNodes.insert(arc.target);
         candidate.loss = arc.cost.total();
@@ -266,6 +268,7 @@ std::optional<SourceRouteCandidate> bestLookaheadRoute(
                     continue;
                 SourceRouteCandidate next = route;
                 next.arcs.push_back(arcId);
+                next.logicalArcs.push_back(graph.logicalArcId(arcId));
                 next.transitions.push_back(*join);
                 next.visitedNodes.insert(arc.target);
                 next.loss += arc.cost.total() + join->cost.total();
@@ -319,7 +322,8 @@ public:
                 projection.arc > endArcBase + kReplayEpsilon ||
                 projection.distance > broadPhaseRadiusBaseVoxels)
                 continue;
-            result.push_back({storageKey(node.anchor), node.positionBaseXYZ});
+            const auto id = storageKey(node.anchor);
+            result.push_back({id, node.positionBaseXYZ});
         }
         std::sort(result.begin(), result.end(), [](const auto& left, const auto& right) {
             return left.id < right.id;
@@ -707,10 +711,11 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
                     continue;
                 if (!selected.has_value() ||
                     std::tuple{projection.arc,
-                        thresholdMeasurement.thresholdErrorRatio, node.id} <
+                        thresholdMeasurement.thresholdErrorRatio,
+                        graph.logicalAnchorId(node.id)} <
                         std::tuple{selected->projection.arc,
                             selected->thresholdMeasurement.thresholdErrorRatio,
-                            selected->node.id}) {
+                            graph.logicalAnchorId(selected->node.id)}) {
                     selected = Seed{node, projection, thresholdMeasurement};
                 }
             }

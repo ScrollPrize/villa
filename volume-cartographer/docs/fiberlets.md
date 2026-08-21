@@ -1157,43 +1157,78 @@ diagnostic only and does not alter extraction decisions, ordering, or artifacts.
 
 ## Storage quantization benchmark
 
-`quantization-benchmark` extracts anchors once with the production
-implementation. It quantizes anchor endpoints and fitted directions before
-running the regular candidate generation, dense sampling, and fiberlet DP for
-each distinct geometry. Geometry results are cached and reused by their
-`uint8`/`uint16` cost variants. It writes no persistent quantized format.
+`quantization-benchmark` compares two cache-backed production replays. The
+baseline uses the float cache profile. Every run shares one canonical float
+anchor dataset under `OUTPUT/cache` for the exact source, extraction settings,
+corridor, grid, and chunk layout. The selected scenario derives rounded
+positions or compact fitted directions from those anchors, then performs fresh
+candidate generation, Hermite geometry, dense sampling, and DP in a separate
+fiberlet namespace. Quantization therefore never reruns anchor fitting or
+changes persisted anchor chunks. These are evaluation caches, not final compact
+interchange data.
 
 ```bash
-vc_fiberlets quantization-benchmark FIBER_MANIFEST FIBER_JSON --normal-manifest NORMAL_MANIFEST --length 5000 --threads 32 --radius 64
+vc_fiberlets quantization-benchmark FIBER_MANIFEST FIBER_JSON OUTPUT --normal-manifest NORMAL_MANIFEST --radius 768 --threads 32
 ```
 
-Use `--scenario combined_q4_axis_cost_u8` to run only the baseline and the
-4-base-voxel endpoint-position, compact two-byte fitted-direction, 8-bit-cost
-case. The selector names are the exact `scenario=` values printed by the full
-matrix; an unknown name is an error.
+The default scenario is `combined_q4_axis_cost_u8`: 4-base-voxel endpoint
+positions, compact two-byte fitted directions, and per-canonical-first-endpoint
+chunk `uint8` total costs. `--scenario NAME` selects another standard scenario;
+`--scenario all` runs one baseline followed by all 17 non-baseline scenarios in
+their fixed matrix order. An unknown name is an error. `--length N` limits the
+reference interval in base voxels for a shorter comparison.
 
-The fixed 16-row matrix contains the float32 baseline; isolated position quanta
-`1`, `2`, and `4` base voxels; isolated compact fitted axes; all three
-position-plus-compact-axis float-cost geometries; isolated `uint8` and `uint16`
-per-chunk total costs; and all six combined position/axis/cost cases.
-`--storage-chunk-side` defaults to 512 base voxels.
+`compact_axis_cost_u8` and `compact_axis_cost_u16` keep float endpoint
+positions, use compact two-byte fitted directions, and decode the stored float
+component totals through per-owner-chunk `uint8` or `uint16` cost views. Along
+with `compact_axis`, all three reopen the same compact-axis prefix/route cache;
+cost precision is graph-view state and never rewrites stored geometry or float
+component costs. The cache is populated on demand. A cost view can therefore
+complete missing compact-axis chunks in that same cache while establishing the
+stable minimum/maximum for a first-endpoint storage chunk; it does not create a
+cost-specific geometry cache.
 
-Every `fiberlet_quantization` row is machine-readable. A scenario is
-`valid=false` if any anchor key, variant, scalar, or endpoint cannot be
-represented by the proposed format. Ordinary candidate or no-path rejection
-after valid quantization is instead recorded as a changed DP result. Valid rows
-report candidate additions/removals, graph and transition populations, global
-and within-chunk cost ordering changes, top-100 agreement, comparisons against
-both the float baseline and matching float-cost geometry, baseline/scenario
-tracing failure counts, and symmetric maximum Euclidean, Lasagna-normal, and
-Lasagna-tangential line distance. Restart segments remain disconnected; both
-lines are sampled at no more than one base voxel spacing and projected onto the
-other line's actual segments. Exact anchor, candidate, point-count, and
-point-index agreement are not quality criteria. Separate
+Fiberlet caches are grouped by endpoint position quantum and fitted-direction
+encoding. Float, `uint8`, and `uint16` cost views over the same geometry reopen
+the same fiberlet prefixes, routes, endpoint steps, path lengths, and float
+component costs; cost decoding happens only in the replay graph. All scenarios
+read the same canonical anchor cache, and cost-only scenarios also reuse the
+exact baseline fiberlets. Geometry-
+quantized scenarios retain the pre-existing internal `cost_bits=8` cache tag so
+completed experimental caches remain reusable, but that tag is opaque and is
+never passed to anchor extraction or DP. The selected cost precision remains
+the `cost_bits` field in each output row. `geometry_cache_cost_tag_bits` reports
+the internal compatibility tag. Storage chunk side remains part of both the
+physical cache layout and its identity.
+
+The `fiberlet_cached_quantization` row is machine-readable. It reports the
+explicit position/direction/cost settings, failure counts, completed fractions,
+logical-key collision diagnostics, cache residency, timing, and symmetric
+Euclidean, Lasagna-normal, and Lasagna-tangential line-distance distributions.
+Restart segments remain disconnected; both lines are sampled at no more than
+one base voxel spacing and projected onto the other line's actual segments.
+The row is flushed as soon as its comparison finishes. Before a batch context
+is released, speculative fiberlet jobs are cancelled and drained, followed by
+their anchor dependencies and issued persistent writes. This prevents late
+cache generation from racing process-wide worker-pool teardown while leaving
+unrelated cache users running.
+Exact anchor, candidate, point-count, and point-index agreement are not quality
+criteria. Separate
 `baseline_reference_*` and `scenario_reference_*` summaries measure each replay
 toward the annotated reference only. They report count, minimum, mean, median,
 and maximum Euclidean, normal, and tangential distance in base voxels. The
 Lasagna normal is sampled at the matched reference point; invalid normal samples
-remain in the Euclidean summary and are counted separately. Extraction, DP,
-baseline-to-scenario distance, and replay-to-reference distance stages emit
-machine-readable progress and ETA updates.
+remain in the Euclidean summary and are counted separately. Quantized anchor
+geometry uses rounded positions, but stable logical IDs remain the source cell
+coordinate plus its zero-or-one component. This preserves the two-anchor limit
+per cell without merging anchors from adjacent cells that round to the same
+position. Unrepresentable endpoint deltas fail the scenario instead of silently
+changing identity.
+
+Derived endpoint views are chunk scoped. Compact direction changes only the
+fitted axis; canonical prediction/presence/normal scoring remains exact. A
+position quantum additionally resamples every endpoint scoring field at the
+rounded point. Single-flight construction prevents overlapping fiberlet chunks
+from repeating that sampling, and a bounded LRU releases derived chunks after
+use. Replay seed selection, endpoint lookup, route reconstruction, transitions,
+and compact-cost ownership all use the same view as fiberlet DP.

@@ -1,66 +1,92 @@
-# Plan: show live cached replay preprocessing progress
+# Plan: canonical anchor reuse across quantized fiberlets
 
-## Resolution accounting
+## Contract
 
-1. Extend the generated fiberlet chunk-cache helper with an optional resolved-
-   chunk callback carrying chunk kind, key, and final status. Invoke it exactly
-   once for both persisted-cache reads and newly generated chunks, after fetch
-   resolution, without changing payload generation or cache scheduling.
-   Contain observer exceptions separately so they cannot change a successful
-   fetch into a cache error.
-2. Forward resolved anchor and prefix events through the on-demand
-   preprocessor. In the replay CLI, derive the unique expected anchor dependency
-   keys and scheduled fiberlet prefix keys from the existing deterministic
-   schedule. Install expected sets before prefetch begins. Count each successful
-   resolved key at most once under one mutex, including later reloads, and
-   ignore failed or out-of-model keys. Resolution callbacks capture only a
-   shared accounting state, not CLI stack objects; disabling the state makes
-   late worker callbacks harmless.
+- Canonical anchor extraction, fitting, filtering, endpoint scoring, serialized
+  chunks, and cache identity are independent of every evaluation quantization.
+- Position and fitted-direction transforms are derived from canonical anchors
+  inside the scenario context. Position transforms resample endpoint prediction
+  and normal metadata; direction-only transforms retain canonical endpoint
+  scoring. Transformed endpoints must be shared consistently by fiberlet DP,
+  route reconstruction, replay seeding/arcs, transitions, and cost ownership.
+- Fiberlet cache identity continues to include position/direction geometry and
+  the opaque legacy u8 tag, preserving existing Q4 fiberlet cache reuse.
+- Cost decoding remains graph-only and shares the matching fiberlet geometry.
+- Keep strict metadata validation. Do not accept an arbitrary incompatible
+  canonical anchor or fiberlet cache merely because its files exist.
 
-## Overall estimate and repaint
+## Implementation
 
-3. Give the single overall progress display an explicit preprocessing model.
-   Treat extraction as 95% of tracing work, matching the measured workload
-   where graph traversal is small. Define scheduled cache fraction as
-   `(resolvedAnchors + 16 * resolvedPrefixes) /
-   (expectedAnchors + 16 * expectedPrefixes)`; the 16:1 ratio reflects measured
-   roughly one-second anchor chunks versus roughly 15-20-second fiberlet
-   chunks. Tracing fraction is
-   `0.95 * cacheFraction + 0.05 * min(greedyFraction, fiberletFraction)` for
-   cached replay, or the existing tracer minimum for eager replay. Zero
-   scheduled work has cache fraction one. Clamp and retain every component
-   monotonically, and reserve final completion for actual tracer,
-   visualization, and publication completion. Prefix reach-neighborhood reads
-   outside the scheduled prefetch set and committed route reads remain covered
-   by the final 5% tracer term: they are data-dependent and historically small
-   compared with extraction, so they are deliberately not represented as
-   expected preprocessing keys.
-4. Run a private timer while the concise display is active and repaint at a
-   bounded interval even when no worker callback fires. ETA remains a live
-   elapsed/fraction estimate and may increase while the estimated fraction is
-   stationary. Signal and join the timer without holding the render mutex,
-   then terminate the line; success, error, and destructor shutdown are
-   idempotent and prevent output after the line closes. `--stats` creates no
-   ticker and remains callback-driven and unchanged.
+1. Build anchor metadata/root only from the canonical profile. Build fiberlet
+   metadata/root from the selected geometry profile. Allow the paired datasets
+   to have different fingerprints while strictly checking source, grid, scale,
+   chunk layout, and extraction compatibility.
+2. Move position/direction evaluation transforms out of anchor chunk generation
+   into a shared preprocessor endpoint-view helper. Batch-resample each
+   position-transformed anchor chunk once per scenario. Retain transformed
+   chunks through a bounded LRU with single-flight construction so overlapping
+   fiberlet chunks share work without accumulating the whole corridor.
+3. Make the chunk graph consume the same transformed anchor view for chunk
+   enumeration, individual anchors, edges, route reconstruction, transitions,
+   and compact-cost ownership.
+4. Keep the exact anchor cache root common across baseline and every scenario,
+   including explicit `--anchor-cache`. Keep scenario fiberlet roots unchanged
+   so completed Q4 data is reused.
+5. Document the one-anchor-cache plus per-geometry-fiberlet-cache model.
+6. Add explicit `compact_axis_cost_u8` and `compact_axis_cost_u16` scenario
+   descriptors. Keep their geometry key exactly `(position quantum 0, compact
+   direction true)` so both reopen the existing compact-axis fiberlet cache and
+   differ only in graph-side cost decoding.
+7. Update the deterministic standard matrix to 18 total scenarios and 17
+   non-baseline `--scenario all` rows. Preserve selected cost bits `0/8/16`
+   independently of the compact-axis geometry namespace's opaque historical
+   u8 compatibility tag.
 
-## Verification
+## Testing
 
-5. Add a focused cache test proving resolution callbacks fire for both a newly
-   generated chunk and a persisted cache hit without rerunning the generator,
-   and that observer exceptions cannot alter successful cache results.
-6. Build with `-j32`; run fiberlet storage and replay tests. Run a fresh-cache
-   radius-768 replay under a short timeout and verify the captured default line
-   contains increasing elapsed values, a nonzero estimated percentage, and a
-   finite ETA while CPU work continues. Also verify `--stats` contains no
-   concise timer line and interrupt cleanup leaves one terminated line.
+- Unit-test endpoint transformation for exact, compact-direction, and Q4
+  position views and ensure canonical input is unchanged.
+- Test graph anchor/edge/route consumers with a transformed anchor callback.
+- Run the focused storage and replay tests.
+- Run short cold/warm `compact_axis` and `position_q4` comparisons against one
+  output root. Verify both use the same canonical anchor root, the second run
+  does not modify anchor files, and scientific outputs match the earlier
+  scenario implementation.
+- Open the existing radius-768 scenario fiberlet caches through canonical
+  anchors and run both requested full-corridor comparisons. Explicitly cancel
+  and drain batch-owned speculative cache work before process-static worker
+  teardown, and preserve each completed result line immediately.
+- Assert the two compact-axis cost scenarios map to the same geometry-cache
+  profile, algorithm identity, and anchor/fiberlet roots as `compact_axis`,
+  while each graph sees its selected cost bits. Add a no-mutation sequence over
+  float/u8/u16/float views and an existing-cache replay whose generators fail
+  if invoked.
+- Run focused tests, then both full radius-768 comparisons with the canonical
+  anchor and baseline fiberlet overrides. Snapshot the canonical anchor and
+  compact-axis prefix/route cache trees before and after. Require the same
+  cache namespaces and no rewriting of existing payloads; record any missing
+  on-demand compact-axis chunks completed while forming stable per-owner cost
+  ranges. Report failure counts plus Euclidean/normal/tangential summaries.
 
-## Spec update
+## Spec Update
 
-Document that concise replay progress incorporates weighted scheduled cache
-resolution and is timer-refreshed; the fraction is an estimate and remains
-monotone, while completion still reflects real workflow completion.
+- State that anchor cache identity is always canonical and evaluation geometry
+  begins only at the fiberlet layer.
+- Define all transformed-anchor consumers and position-rescoring behavior.
+- Add the two compact-axis cost views and update the standard matrix count.
+- Define their fixed matrix order and distinguish selected cost bits from the
+  opaque geometry-cache compatibility tag.
 
-## Documentation updates
+## Docs Update
 
-Update `volume-cartographer/docs/fiberlets.md`, planning status/task log, and the
-changelog with the estimate, timer behavior, validation, and limitations.
+- Document one shared anchor cache, scenario fiberlet caches, and what work is
+  repeated for position/direction variants.
+- Document that compact-axis `uint8`/`uint16` costs reuse compact-axis geometry.
+
+## Changelog
+
+- Record elimination of repeated anchor extraction across geometry scenarios.
+- Record the added compact-axis replay-cost comparisons.
+- Record exact commands, cache paths, revision/build mode, cache snapshots,
+  wall/CPU/RSS, failure counts, and distance summaries in `task_log.md`; finish
+  the matching `status.md` checklist.

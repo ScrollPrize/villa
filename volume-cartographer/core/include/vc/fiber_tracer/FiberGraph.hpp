@@ -163,6 +163,16 @@ public:
     [[nodiscard]] virtual float predictionToBaseScale() const noexcept = 0;
     [[nodiscard]] virtual int anchorCellSizePredictionVoxels() const noexcept = 0;
     [[nodiscard]] virtual float maximumJoinAngleDegrees() const noexcept = 0;
+    [[nodiscard]] virtual FiberletStorageKey logicalAnchorId(
+        const FiberletStorageKey& physical) const
+    {
+        return physical;
+    }
+    [[nodiscard]] virtual DirectedFiberletStorageId logicalArcId(
+        const DirectedFiberletStorageId& physical) const
+    {
+        return physical;
+    }
     [[nodiscard]] virtual std::vector<FiberletReplaySourceAnchor> anchorsNearReference(
         const PolylineArcGeometry& reference,
         double beginArcBase,
