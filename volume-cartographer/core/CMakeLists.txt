@@ -36,6 +36,7 @@ add_library(vc_core
         src/surface_metrics.cpp
         src/Thinning.cpp
         src/Umbilicus.cpp
+        src/ScrollUmbilicus.cpp
         src/render/ChunkCache.cpp
         src/render/ChunkRequestScheduler.cpp
         src/render/DecodedChunkCacheBudget.cpp
