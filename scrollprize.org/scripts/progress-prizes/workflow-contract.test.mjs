@@ -649,6 +649,16 @@ test('Vercel verification runs trusted default-branch code and requires GitHub a
   const vercel = await workflow('progress-prizes-vercel-preview.yml');
   assert.match(vercel, /environment: progress-prizes-preview/);
   assert.match(vercel, /github\.actor == 'vercel\[bot\]'/);
+  assert.match(vercel, /- vercel\.deployment\.ready/);
+  assert.doesNotMatch(vercel, /- vercel\.deployment\.success/);
+  assert.match(
+    vercel,
+    /github\.event\.client_payload\.git\.ref == 'refs\/heads\/codex\/progress-prize-smoke-20260720'/,
+  );
+  assert.match(
+    vercel,
+    /startsWith\(github\.event\.client_payload\.git\.ref, 'refs\/heads\/codex\/progress-prize-'\)/,
+  );
   assert.match(vercel, /run-name: Progress Prize Vercel preview \$\{\{ github\.event\.client_payload\.git\.sha \}\}/);
   assert.match(vercel, /ref: \$\{\{ github\.sha \}\}/);
   assert.doesNotMatch(vercel, /ref: refs\/heads\/main/);
