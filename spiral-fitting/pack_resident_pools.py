@@ -62,21 +62,14 @@ def _read_zarray_meta(array_dir: Path) -> dict:
     return meta
 
 
-def _register_codec(compressor: dict | None) -> None:
-    codec_id = compressor.get('id') if compressor is not None else None
+def _load_delta3d(codec_id: str):
     try:
-        if codec_id == 'vc-delta3d':
-            import vc_delta3d  # noqa: F401 registers vc-delta3d
-        elif codec_id == 'vcz1':
-            import vc.compression.vcz1_numcodecs  # noqa: F401 registers vcz1
+        import vc_delta3d
     except ImportError as exc:
-        dependency = (
-            'the vc-delta3d package' if codec_id == 'vc-delta3d' else
-            'the volume-cartographer Python bindings (vc.compression)'
-        )
         raise RuntimeError(
-            f'the CT store uses the {codec_id} codec; install {dependency}'
+            f'the store uses the {codec_id} codec; install the vc-delta3d package'
         ) from exc
+    return vc_delta3d
 
 
 def _list_chunk_keys(array_dir: Path, separator: str) -> set[tuple[int, int, int]]:
@@ -110,6 +103,23 @@ def _make_chunk_reader(compressor: dict | None, chunk_voxels: int):
                 raise ValueError(f'{path}: raw chunk has {data.size} bytes, expected {chunk_voxels}')
             return data
         return read
+    codec_id = compressor.get('id')
+    if codec_id == 'vcz1':
+        delta3d = _load_delta3d(codec_id)
+
+        def read(path: Path) -> np.ndarray:
+            with open(path, 'rb') as f:
+                decoded = delta3d.decompress_with_magic(
+                    f.read(), chunk_voxels, b'VCZ1')
+            decoded = np.frombuffer(decoded, dtype=np.uint8)
+            if decoded.size != chunk_voxels:
+                raise ValueError(
+                    f'{path}: decoded chunk has {decoded.size} bytes, '
+                    f'expected {chunk_voxels}')
+            return decoded
+        return read
+    if codec_id == 'vc-delta3d':
+        _load_delta3d(codec_id)  # Import registers the numcodecs adapter.
     import numcodecs
     codec = numcodecs.get_codec(compressor)
 
@@ -136,7 +146,6 @@ class CtMasker:
                  cache_chunks: int = 512):
         self.array_dir = Path(ct_zarr_path) / str(ct_group)
         meta = _read_zarray_meta(self.array_dir)
-        _register_codec(meta['compressor'])
         self.shape = tuple(meta['shape'])
         self.chunks = tuple(meta['chunks'])
         self.separator = meta.get('dimension_separator', '.')

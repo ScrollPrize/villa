@@ -1,3 +1,4 @@
+import builtins
 import json
 import sys
 from pathlib import Path
@@ -9,7 +10,7 @@ import torch
 import zarr
 
 import lasagna_data
-from pack_resident_pools import pack_arrays, sidecar_path
+from pack_resident_pools import _make_chunk_reader, pack_arrays, sidecar_path
 from lasagna_data import ensure_fit_sparse_stores
 from sdt_losses import sample_sdt_trilinear
 from sparse_cuda_cache import ResidentBrickPool, SparseScalarStore
@@ -47,6 +48,38 @@ def write_raw_pack_source(path, data):
         'dimension_separator': '.',
     }))
     (path / '0.0.0').write_bytes(data.tobytes())
+
+
+def test_legacy_vcz1_reader_uses_standalone_delta3d(tmp_path, monkeypatch):
+    payload = b'VCZ1 encoded chunk'
+    chunk = bytes([1, 2, 3, 4])
+    calls = []
+
+    def decompress_with_magic(encoded, expected_size, magic):
+        calls.append((encoded, expected_size, magic))
+        return chunk
+
+    monkeypatch.setitem(
+        sys.modules,
+        'vc_delta3d',
+        SimpleNamespace(decompress_with_magic=decompress_with_magic),
+    )
+    original_import = builtins.__import__
+
+    def import_without_volume_cartographer(name, *args, **kwargs):
+        if name == 'vc' or name.startswith('vc.'):
+            raise AssertionError(f'unexpected Volume Cartographer import: {name}')
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, '__import__', import_without_volume_cartographer)
+    chunk_path = tmp_path / '0.0.0'
+    chunk_path.write_bytes(payload)
+
+    reader = _make_chunk_reader({'id': 'vcz1'}, len(chunk))
+
+    np.testing.assert_array_equal(
+        reader(chunk_path), np.frombuffer(chunk, dtype=np.uint8))
+    assert calls == [(payload, len(chunk), b'VCZ1')]
 
 
 class RecordingProgress:

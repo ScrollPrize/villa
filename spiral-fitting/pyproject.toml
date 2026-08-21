@@ -30,6 +30,7 @@ dependencies = [
     "torchdiffeq>=0.2.5",
     "tqdm>=4.68.3",
     "trimesh>=4.12.2",
+    "vc-delta3d>=0.1.0,<0.2",
     "wandb>=0.28.0",
     "zarr>=3.2.1",
 ]
