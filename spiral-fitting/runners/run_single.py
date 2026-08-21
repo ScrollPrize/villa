@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 from numbers import Real
 from statistics import fmean, pstdev
 import subprocess
@@ -28,6 +29,7 @@ AGGREGATE_METRICS_FILENAME = "aggregate_metrics.json"
 STATE_FILENAME = ".run_single_state.json"
 STATE_VERSION = 1
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+_INK_STRIP_SUFFIX = ".jpg"
 
 # Executing this file directly puts only runners/ on sys.path.
 if str(SPIRAL_DIR) not in sys.path:
@@ -105,11 +107,21 @@ def add_common_arguments(
         default=DEFAULT_OUTPUT,
         help=f"fit output root (default: {DEFAULT_OUTPUT})",
     )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="delete the existing output directory before starting",
+    )
     parser.add_argument("--ink-volume", required=True, type=Path)
     parser.add_argument(
         "--no-wandb",
         action="store_true",
         help="disable Weights & Biases logging (enabled by default)",
+    )
+    parser.add_argument(
+        "--wandb-group",
+        type=run_id,
+        help="optional Weights & Biases run group",
     )
     parser.add_argument(
         "--seeds",
@@ -197,6 +209,36 @@ def require_empty_output(output: Path) -> None:
             raise ValueError(f"output directory must be empty: {output}")
 
 
+def overwrite_output(output: Path, *, protected_paths: Sequence[Path] = ()) -> None:
+    """Delete an explicitly selected output directory after safety checks."""
+    if output.is_symlink():
+        raise ValueError(f"refusing to overwrite symlinked output directory: {output}")
+    output = output.resolve()
+    if not output.exists():
+        return
+    if not output.is_dir():
+        raise ValueError(f"output exists and is not a directory: {output}")
+
+    forbidden = {
+        Path(output.anchor),
+        Path.home().resolve(),
+        SPIRAL_DIR.resolve(),
+        SPIRAL_DIR.parent.resolve(),
+    }
+    if output in forbidden:
+        raise ValueError(f"refusing to overwrite unsafe output directory: {output}")
+
+    for path in protected_paths:
+        protected = path.resolve()
+        if protected == output or output in protected.parents:
+            raise ValueError(
+                f"refusing to overwrite output directory containing an input: "
+                f"{protected}")
+
+    print(f"Removing existing output directory: {output}", flush=True)
+    shutil.rmtree(output)
+
+
 def _native_thread_env(num_threads: int) -> dict[str, str]:
     value = str(num_threads)
     return {
@@ -243,8 +285,8 @@ def fit_environment(
         env["WANDB_RUN_ID"] = wandb_run_id
         if wandb_run_name is not None:
             env["WANDB_NAME"] = wandb_run_name
-        if wandb_group is not None:
-            env["WANDB_RUN_GROUP"] = wandb_group
+    if wandb_group is not None:
+        env["WANDB_RUN_GROUP"] = wandb_group
     if metrics_history is not None:
         env["FIT_SPIRAL_METRICS_HISTORY"] = str(metrics_history)
     if overrides:
@@ -390,7 +432,7 @@ def aggregate_metrics(
 
 
 def _wandb_init(*, project: str, entity: str, run_id: str, name: str,
-                group: str, resume: str):
+                group: str | None = None, resume: str):
     import wandb
     return wandb.init(
         project=project,
@@ -403,7 +445,8 @@ def _wandb_init(*, project: str, entity: str, run_id: str, name: str,
 
 
 def log_seed_final_metrics(
-    summary: dict, *, project: str, entity: str, seed_run_id: str, group: str
+    summary: dict, *, project: str, entity: str, seed_run_id: str,
+    group: str | None = None
 ) -> None:
     run = _wandb_init(
         project=project, entity=entity, run_id=seed_run_id,
@@ -417,7 +460,7 @@ def log_seed_final_metrics(
 
 def log_aggregate_metrics(
     training: list[dict], final: dict[str, dict], *, seed_count: int,
-    project: str, entity: str, aggregate_run_id: str, group: str
+    project: str, entity: str, aggregate_run_id: str, group: str | None = None
 ) -> None:
     run = _wandb_init(
         project=project, entity=entity, run_id=aggregate_run_id,
@@ -540,6 +583,7 @@ def _resume_invocation(
         "operational_args": {
             "num_threads": args.num_threads,
             "no_wandb": args.no_wandb,
+            "wandb_group": getattr(args, "wandb_group", None),
             "vc_render_bin": str(args.vc_render_bin.resolve()),
         },
         # Physical IDs may change between attempts; resource shape may not.
@@ -586,6 +630,16 @@ def _state_artifact(output: Path, stage: dict, key: str) -> Path:
     return candidate
 
 
+def _require_ink_output(ink: Path) -> None:
+    if not ink.is_dir():
+        raise RuntimeError(f"render completed without expected artifact: {ink}")
+    if not any(
+        path.is_file() and path.suffix.lower() == _INK_STRIP_SUFFIX
+        for path in ink.iterdir()
+    ):
+        raise RuntimeError(f"render completed without ink strip images: {ink}")
+
+
 def _validate_completed_stages(output: Path, state: dict) -> None:
     for label, stages in state["runs"].items():
         fit = stages["fit"]
@@ -601,9 +655,12 @@ def _validate_completed_stages(output: Path, state: dict) -> None:
         render = stages["render"]
         if render.get("status") == "complete":
             ink = _state_artifact(output, render, "ink_output")
-            if not ink.is_dir():
+            try:
+                _require_ink_output(ink)
+            except RuntimeError as exc:
                 raise RuntimeError(
-                    f"completed render artifact is missing for {label}: {ink}")
+                    f"completed render artifact is invalid for {label}: {ink}"
+                ) from exc
         metrics = stages["metrics"]
         if metrics.get("status") == "complete":
             metrics_path = _state_artifact(output, metrics, "metrics_output")
@@ -682,6 +739,7 @@ def _run_resumable_pipeline(
     args: argparse.Namespace, *, root_output: Path, output: Path,
     overrides: dict, project: str, entity: str, state: dict,
     state_path: Path, label: str, seed_run_id: str | None,
+    wandb_group: str | None = None,
 ) -> tuple[list[dict], dict]:
     stages = state["runs"][label]
     seeded = label != "single"
@@ -698,7 +756,7 @@ def _run_resumable_pipeline(
                     overrides, output, args.num_threads, wandb_project=project,
                     wandb_entity=entity, wandb_enabled=not args.no_wandb,
                     wandb_run_id=seed_run_id, wandb_run_name=seed_run_id,
-                    wandb_group=state["batch_id"] if seeded else None,
+                    wandb_group=wandb_group,
                     metrics_history=history_path,
                     gpu_ids=gpu_ids))
             _run_dir, fitted = find_fit_outputs(output)
@@ -725,8 +783,7 @@ def _run_resumable_pipeline(
             subprocess.run(command, check=True,
                            env=downstream_environment(args.num_threads, gpu_ids=gpu_ids))
             ink = fitted_dir / "ink"
-            if not ink.is_dir():
-                raise RuntimeError(f"render completed without expected artifact: {ink}")
+            _require_ink_output(ink)
             stages["render"]["ink_output"] = str(ink.resolve().relative_to(root_output))
 
         _run_saved_stage(state, state_path, stages["render"], render)
@@ -758,12 +815,14 @@ def run_resumable(
     invocation = _resume_invocation(args, overrides, project, entity)
     state, state_path = _load_or_create_state(output, invocation)
     seeds = getattr(args, "seeds", None)
+    wandb_group = getattr(args, "wandb_group", None)
 
     if seeds is None:
         _run_resumable_pipeline(
             args, root_output=output, output=output, overrides=overrides,
             project=project, entity=entity, state=state, state_path=state_path,
-            label="single", seed_run_id=state["run_id"])
+            label="single", seed_run_id=state["run_id"],
+            wandb_group=wandb_group)
         return
 
     histories = []
@@ -777,13 +836,13 @@ def run_resumable(
             args, root_output=output, output=output / f"seed-{seed}",
             overrides=seed_overrides, project=project, entity=entity,
             state=state, state_path=state_path, label=str(seed),
-            seed_run_id=seed_id)
+            seed_run_id=seed_id, wandb_group=wandb_group)
         histories.append(history)
         summaries.append(summary)
         if not args.no_wandb:
             log_seed_final_metrics(
                 summary, project=project, entity=entity,
-                seed_run_id=seed_id, group=batch_id)
+                seed_run_id=seed_id, group=wandb_group)
 
     if len(seeds) < 2:
         return
@@ -795,25 +854,36 @@ def run_resumable(
     if not args.no_wandb:
         log_aggregate_metrics(
             training, final, seed_count=len(seeds), project=project,
-            entity=entity, aggregate_run_id=f"{batch_id}_aggregate", group=batch_id)
+            entity=entity, aggregate_run_id=f"{batch_id}_aggregate",
+            group=wandb_group)
 
 
 def run(args: argparse.Namespace) -> None:
     output = args.output.resolve()
     overrides, wandb_project, wandb_entity = load_run_config(args.config)
+    overwrite = getattr(args, "overwrite", False)
+    if overwrite and getattr(args, "resume", False):
+        raise ValueError("--overwrite cannot be combined with --resume")
+    if overwrite:
+        protected_paths = [args.dataset, args.ink_volume, args.vc_render_bin]
+        if args.config is not None:
+            protected_paths.append(args.config)
+        overwrite_output(args.output, protected_paths=protected_paths)
     if getattr(args, "resume", False):
         run_resumable(args, overrides, wandb_project, wandb_entity)
         return
     require_empty_output(output)
     seeds = getattr(args, "seeds", None)
     caller_run_id = getattr(args, "run_id", None)
+    wandb_group = getattr(args, "wandb_group", None)
 
     if seeds is None:
         if caller_run_id is not None:
             raise ValueError("--run-id requires --seeds")
         run_pipeline(
             args, output=output, overrides=overrides,
-            wandb_project=wandb_project, wandb_entity=wandb_entity)
+            wandb_project=wandb_project, wandb_entity=wandb_entity,
+            wandb_group=wandb_group)
         return
 
     batch_id = caller_run_id or uuid.uuid4().hex[:8]
@@ -830,14 +900,14 @@ def run(args: argparse.Namespace) -> None:
             wandb_project=wandb_project,
             wandb_entity=wandb_entity,
             seed_run_id=seed_id,
-            wandb_group=batch_id,
+            wandb_group=wandb_group,
         )
         histories.append(history)
         summaries.append(summary)
         if not args.no_wandb:
             log_seed_final_metrics(
                 summary, project=wandb_project, entity=wandb_entity,
-                seed_run_id=seed_id, group=batch_id)
+                seed_run_id=seed_id, group=wandb_group)
 
     if len(seeds) < 2:
         return
@@ -856,7 +926,7 @@ def run(args: argparse.Namespace) -> None:
         log_aggregate_metrics(
             training, final, seed_count=len(seeds),
             project=wandb_project, entity=wandb_entity,
-            aggregate_run_id=aggregate_id, group=batch_id)
+            aggregate_run_id=aggregate_id, group=wandb_group)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
