@@ -183,11 +183,59 @@ cv::Vec3f sourceArcStartDirection(const FiberletReplaySourceArc& arc)
 struct SourceRouteCandidate {
     std::vector<DirectedFiberletStorageId> arcs;
     std::vector<DirectedFiberletStorageId> logicalArcs;
+    std::vector<double> includedArcFractions;
     std::vector<FiberletReplaySourceTransition> transitions;
     std::set<FiberletStorageKey> visitedNodes;
+    FiberletGraphReplayCost edgeCost;
+    FiberletGraphReplayCost transitionCost;
     double loss = 0.0;
     double pathLength = 0.0;
 };
+
+void addScaledCost(
+    FiberletGraphReplayCost& target,
+    const FiberletPathCost& source,
+    double scale)
+{
+    if (!(scale >= 0.0) || !(scale <= 1.0) || !std::isfinite(scale))
+        throw std::invalid_argument("fiberlet route cost scale is invalid");
+    target.invalidPrediction +=
+        scale * static_cast<double>(source.invalidPrediction);
+    target.alignment += scale * static_cast<double>(source.alignment);
+    target.isotropicSmoothness +=
+        scale * static_cast<double>(source.isotropicSmoothness);
+    target.tangentSmoothness +=
+        scale * static_cast<double>(source.tangentSmoothness);
+    target.normalSmoothness +=
+        scale * static_cast<double>(source.normalSmoothness);
+}
+
+void appendRouteArc(
+    SourceRouteCandidate& route,
+    const FiberletReplayGraphSource& graph,
+    const DirectedFiberletStorageId& arcId,
+    const FiberletReplaySourceArc& arc,
+    const std::optional<FiberletReplaySourceTransition>& join,
+    double includedFraction)
+{
+    if (!(arc.pathLengthPredictionVoxels > kFloatEpsilon) ||
+        !std::isfinite(arc.pathLengthPredictionVoxels)) {
+        throw std::invalid_argument(
+            "fiberlet replay source arc has invalid path length");
+    }
+    route.arcs.push_back(arcId);
+    route.logicalArcs.push_back(graph.logicalArcId(arcId));
+    route.includedArcFractions.push_back(includedFraction);
+    route.visitedNodes.insert(arc.target);
+    addScaledCost(route.edgeCost, arc.cost, includedFraction);
+    route.pathLength +=
+        includedFraction * static_cast<double>(arc.pathLengthPredictionVoxels);
+    if (join.has_value()) {
+        route.transitions.push_back(*join);
+        route.transitionCost += join->cost;
+    }
+    route.loss = route.edgeCost.total() + route.transitionCost.total();
+}
 
 double routeDensity(const SourceRouteCandidate& route)
 {
@@ -218,7 +266,8 @@ std::optional<SourceRouteCandidate> bestLookaheadRoute(
     const std::set<FiberletStorageKey>& committedVisitedNodes,
     size_t beamWidth,
     size_t lookahead,
-    const std::optional<cv::Vec3d>& initialDirection)
+    const std::optional<cv::Vec3d>& initialDirection,
+    std::vector<SourceRouteCandidate>* diagnosticFrontier)
 {
     std::vector<SourceRouteCandidate> frontier;
     const auto incomingView = incomingArc.has_value()
@@ -240,12 +289,15 @@ std::optional<SourceRouteCandidate> bestLookaheadRoute(
         SourceRouteCandidate candidate;
         candidate.arcs.push_back(arcId);
         candidate.logicalArcs.push_back(graph.logicalArcId(arcId));
+        candidate.includedArcFractions.push_back(1.0);
         candidate.visitedNodes = committedVisitedNodes;
         candidate.visitedNodes.insert(arc.target);
+        candidate.edgeCost += arc.cost;
         candidate.loss = arc.cost.total();
         candidate.pathLength = arc.pathLengthPredictionVoxels;
         if (join.has_value()) {
             candidate.transitions.push_back(*join);
+            candidate.transitionCost += join->cost;
             candidate.loss += join->cost.total();
         }
         frontier.push_back(std::move(candidate));
@@ -269,8 +321,11 @@ std::optional<SourceRouteCandidate> bestLookaheadRoute(
                 SourceRouteCandidate next = route;
                 next.arcs.push_back(arcId);
                 next.logicalArcs.push_back(graph.logicalArcId(arcId));
+                next.includedArcFractions.push_back(1.0);
                 next.transitions.push_back(*join);
                 next.visitedNodes.insert(arc.target);
+                next.edgeCost += arc.cost;
+                next.transitionCost += join->cost;
                 next.loss += arc.cost.total() + join->cost.total();
                 next.pathLength += arc.pathLengthPredictionVoxels;
                 expanded.push_back(std::move(next));
@@ -281,10 +336,156 @@ std::optional<SourceRouteCandidate> bestLookaheadRoute(
         pruneRoutes(expanded, beamWidth);
         frontier = std::move(expanded);
     }
-    return *std::min_element(frontier.begin(), frontier.end(),
-        [](const auto& left, const auto& right) {
-            return routeLess(left, right);
-        });
+    pruneRoutes(frontier, beamWidth);
+    if (diagnosticFrontier != nullptr)
+        *diagnosticFrontier = frontier;
+    return frontier.front();
+}
+
+std::optional<SourceRouteCandidate> bestDistanceLookaheadRoute(
+    const FiberletReplayGraphSource& graph,
+    const FiberletStorageKey& currentNode,
+    const std::optional<DirectedFiberletStorageId>& incomingArc,
+    const std::set<FiberletStorageKey>& committedVisitedNodes,
+    size_t diagnosticRouteLimit,
+    double targetLengthPredictionVoxels,
+    const std::optional<cv::Vec3d>& initialDirection,
+    std::vector<SourceRouteCandidate>* diagnosticFrontier)
+{
+    constexpr size_t kMaximumGeneratedRoutes = 1'000'000;
+    if (!(targetLengthPredictionVoxels > kReplayEpsilon) ||
+        !std::isfinite(targetLengthPredictionVoxels)) {
+        throw std::invalid_argument(
+            "fiberlet distance lookahead target is invalid");
+    }
+
+    std::vector<SourceRouteCandidate> frontier;
+    std::vector<SourceRouteCandidate> completed;
+    size_t generatedRoutes = 0;
+    const auto incomingView = incomingArc.has_value()
+        ? std::make_optional(graph.arc(*incomingArc))
+        : std::nullopt;
+    const auto appendCandidate = [&](SourceRouteCandidate candidate,
+                                     const DirectedFiberletStorageId& arcId,
+                                     const FiberletReplaySourceArc& arc,
+                                     const std::optional<
+                                         FiberletReplaySourceTransition>& join,
+                                     auto& incomplete,
+                                     auto& complete) {
+        const double remaining =
+            targetLengthPredictionVoxels - candidate.pathLength;
+        if (!(remaining > kReplayEpsilon)) {
+            candidate.pathLength = targetLengthPredictionVoxels;
+            complete.push_back(std::move(candidate));
+            return;
+        }
+        if (!(arc.pathLengthPredictionVoxels > kFloatEpsilon) ||
+            !std::isfinite(arc.pathLengthPredictionVoxels)) {
+            throw std::invalid_argument(
+                "fiberlet replay source arc has invalid path length");
+        }
+        const double fraction = std::min(
+            1.0,
+            remaining /
+                static_cast<double>(arc.pathLengthPredictionVoxels));
+        appendRouteArc(candidate, graph, arcId, arc, join, fraction);
+        ++generatedRoutes;
+        if (generatedRoutes > kMaximumGeneratedRoutes) {
+            throw std::runtime_error(
+                "fiberlet distance lookahead exceeded the canonical route-state limit");
+        }
+        if (candidate.pathLength >=
+            targetLengthPredictionVoxels - kReplayEpsilon) {
+            candidate.pathLength = targetLengthPredictionVoxels;
+            complete.push_back(std::move(candidate));
+        } else {
+            incomplete.push_back(std::move(candidate));
+        }
+    };
+
+    for (const auto& arcId : graph.outgoing(currentNode)) {
+        const auto arc = graph.arc(arcId);
+        const auto join = incomingView.has_value()
+            ? graph.transition(*incomingView, arc)
+            : std::nullopt;
+        if (incomingArc.has_value() && !join.has_value())
+            continue;
+        if (initialDirection.has_value() &&
+            !(angleDegrees(*initialDirection, sourceArcStartDirection(arc)) <
+              graph.maximumJoinAngleDegrees()))
+            continue;
+        if (committedVisitedNodes.contains(arc.target))
+            continue;
+        SourceRouteCandidate candidate;
+        candidate.visitedNodes = committedVisitedNodes;
+        appendCandidate(std::move(candidate), arcId, arc, join, frontier,
+            completed);
+    }
+
+    while (!frontier.empty()) {
+        std::vector<SourceRouteCandidate> expanded;
+        for (const auto& route : frontier) {
+            const auto& tailArc = route.arcs.back();
+            const auto& tailNode = targetAnchor(tailArc);
+            const auto tailView = graph.arc(tailArc);
+            for (const auto& arcId : graph.outgoing(tailNode)) {
+                const auto arc = graph.arc(arcId);
+                const auto join = graph.transition(tailView, arc);
+                if (!join.has_value() ||
+                    route.visitedNodes.contains(arc.target)) {
+                    continue;
+                }
+                appendCandidate(route, arcId, arc, join, expanded,
+                    completed);
+            }
+        }
+        frontier = std::move(expanded);
+    }
+    if (completed.empty())
+        return std::nullopt;
+    std::sort(completed.begin(), completed.end(), routeLess);
+    const auto selected = completed.front();
+    if (completed.size() > diagnosticRouteLimit)
+        completed.resize(diagnosticRouteLimit);
+    if (diagnosticFrontier != nullptr)
+        *diagnosticFrontier = std::move(completed);
+    return selected;
+}
+
+std::vector<cv::Vec3d> routePointPrefix(
+    const std::vector<cv::Vec3d>& points,
+    double fraction)
+{
+    if (points.size() < 2 || !(fraction >= 0.0) || !(fraction <= 1.0) ||
+        !std::isfinite(fraction)) {
+        throw std::invalid_argument(
+            "fiberlet diagnostic route prefix is invalid");
+    }
+    if (fraction >= 1.0 - kReplayEpsilon)
+        return points;
+    double totalLength = 0.0;
+    for (size_t index = 1; index < points.size(); ++index)
+        totalLength += length(points[index] - points[index - 1]);
+    if (!(totalLength > kReplayEpsilon))
+        throw std::invalid_argument(
+            "fiberlet diagnostic route has zero length");
+    const double targetLength = fraction * totalLength;
+    std::vector<cv::Vec3d> result{points.front()};
+    double covered = 0.0;
+    for (size_t index = 1; index < points.size(); ++index) {
+        const cv::Vec3d step = points[index] - points[index - 1];
+        const double stepLength = length(step);
+        if (covered + stepLength >= targetLength - kReplayEpsilon) {
+            const double stepFraction = stepLength > kReplayEpsilon
+                ? std::clamp((targetLength - covered) / stepLength, 0.0, 1.0)
+                : 0.0;
+            result.push_back(points[index - 1] + stepFraction * step);
+            return result;
+        }
+        result.push_back(points[index]);
+        covered += stepLength;
+    }
+    return points;
 }
 
 class EagerReplayGraphSource final : public FiberletReplayGraphSource {
@@ -617,7 +818,14 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
     const FiberReplayFailureCallback& failureCallback,
     const FiberletGraphReplayProgressCallback& progressCallback)
 {
-    if (config.beamWidth < 1 || config.lookaheadEdges < 1 || !(config.errorThresholdBaseVoxels >= 0.0) ||
+    const double predictionToBaseScale = graph.predictionToBaseScale();
+    if (!(predictionToBaseScale > 0.0) ||
+        !std::isfinite(predictionToBaseScale) ||
+        config.beamWidth < 1 || config.lookaheadEdges < 1 ||
+        (config.lookaheadDistanceBaseVoxels.has_value() &&
+         (!std::isfinite(*config.lookaheadDistanceBaseVoxels) ||
+          !(*config.lookaheadDistanceBaseVoxels > 0.0))) ||
+        !(config.errorThresholdBaseVoxels >= 0.0) ||
         !std::isfinite(config.errorThresholdBaseVoxels) || !(config.matchRefineSteps >= 0.0) || !std::isfinite(config.matchRefineSteps) ||
         !(config.minimumResetAdvanceBaseVoxels > 0.0) || !std::isfinite(config.minimumResetAdvanceBaseVoxels) ||
         !(config.referenceBeginArcBase >= 0.0) || !std::isfinite(config.referenceBeginArcBase) ||
@@ -639,6 +847,7 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
     if (config.referenceBeginArcBase >= referenceEndArcBase - kReplayEpsilon)
         throw std::invalid_argument("fiberlet graph replay has no usable reference interval");
     FiberletGraphReplayResult result;
+    result.predictionToBaseScale = predictionToBaseScale;
     result.referenceBeginArcBase = config.referenceBeginArcBase;
     result.referenceEndArcBase = referenceEndArcBase;
     result.completedReferenceArcBase = config.referenceBeginArcBase;
@@ -669,7 +878,9 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
         PolylineArcProjection projection;
         FiberReplayThresholdMeasurement thresholdMeasurement;
     };
-    const auto selectSeed = [&](double resetArc) -> std::optional<Seed> {
+    const auto selectSeed = [&](double resetArc,
+                                std::optional<FiberletStorageKey> forcedKey)
+        -> std::optional<Seed> {
         double scanBegin = resetArc;
         while (scanBegin < referenceEndArcBase - kReplayEpsilon) {
             const double scanEnd = std::min(
@@ -678,7 +889,9 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
             for (const auto& node : graph.anchorsNearReference(
                      reference, scanBegin, scanEnd,
                      seedBroadPhaseBase)) {
-                if (consumedNodes.contains(node.id))
+                if (forcedKey.has_value() && node.id != *forcedKey)
+                    continue;
+                if (!forcedKey.has_value() && consumedNodes.contains(node.id))
                     continue;
                 const auto projection = projectPointToPolylineArc(
                     reference, cv::Vec3d(node.positionBaseXYZ), resetArc,
@@ -721,6 +934,8 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
             }
             if (selected.has_value())
                 return selected;
+            if (forcedKey.has_value())
+                break;
             if (scanEnd >= referenceEndArcBase - kReplayEpsilon)
                 break;
             scanBegin = scanEnd;
@@ -756,7 +971,13 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
     for (size_t iteration = 0; iteration < maximumSegments &&
          resetArc < referenceEndArcBase - kReplayEpsilon; ++iteration) {
         emitProgress(result.segments.size(), resetArc, "segment_start");
-        const auto seed = selectSeed(resetArc);
+        const auto seed = selectSeed(
+            resetArc, iteration == 0 ? config.initialSeedKey : std::nullopt);
+        if (iteration == 0 && config.initialSeedKey.has_value() &&
+            !seed.has_value()) {
+            throw std::invalid_argument(
+                "fiberlet graph replay initial seed key is not usable in the focused interval");
+        }
         if (!seed.has_value()) {
             FiberletGraphReplaySegment empty;
             empty.startReferenceArcBase = resetArc;
@@ -787,6 +1008,7 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
 
         FiberletGraphReplaySegment segment;
         (void)stableIndex(nodeIndices, seed->node.id);
+        segment.seedKey = seed->node.id;
         segment.startReferenceArcBase = seed->projection.arc;
         segment.endReferenceArcBase = seed->projection.arc;
         segment.routePointsBaseXYZ.emplace_back(seed->node.positionBaseXYZ);
@@ -811,8 +1033,84 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
         while (!distanceFailure.has_value() &&
                previousReferenceArc < referenceEndArcBase - kReplayEpsilon) {
             const cv::Vec3d startDirection = samplePolylineArc(reference, previousReferenceArc).tangent;
-            const auto selected =
-                bestLookaheadRoute(graph, currentNode, incomingArc, visitedNodes, config.beamWidth, config.lookaheadEdges, incomingArc.has_value() ? std::nullopt : std::make_optional(startDirection));
+            std::vector<SourceRouteCandidate> diagnosticFrontier;
+            const auto initialDirection = incomingArc.has_value()
+                ? std::nullopt
+                : std::make_optional(startDirection);
+            std::optional<SourceRouteCandidate> selected;
+            if (config.lookaheadDistanceBaseVoxels.has_value()) {
+                const double effectiveDistanceBase = std::min(
+                    *config.lookaheadDistanceBaseVoxels,
+                    referenceEndArcBase - previousReferenceArc);
+                selected = bestDistanceLookaheadRoute(
+                    graph, currentNode, incomingArc, visitedNodes,
+                    config.beamWidth,
+                    effectiveDistanceBase / predictionToBaseScale,
+                    initialDirection,
+                    config.recordDecisionDiagnostics
+                        ? &diagnosticFrontier
+                        : nullptr);
+            } else {
+                selected = bestLookaheadRoute(
+                    graph, currentNode, incomingArc, visitedNodes,
+                    config.beamWidth, config.lookaheadEdges,
+                    initialDirection,
+                    config.recordDecisionDiagnostics
+                        ? &diagnosticFrontier
+                        : nullptr);
+            }
+            if (config.recordDecisionDiagnostics) {
+                FiberletGraphReplayDecision decision;
+                decision.routePointIndex = segment.routePointsBaseXYZ.size() - 1;
+                decision.referenceArcBase = previousReferenceArc;
+                decision.sourceKey = graph.logicalAnchorId(currentNode);
+                if (incomingArc.has_value())
+                    decision.incomingLogicalArc = graph.logicalArcId(*incomingArc);
+                decision.routes.reserve(diagnosticFrontier.size());
+                for (size_t routeIndex = 0;
+                     routeIndex < diagnosticFrontier.size(); ++routeIndex) {
+                    const auto& candidate = diagnosticFrontier[routeIndex];
+                    FiberletGraphReplayDecisionRoute route;
+                    route.logicalArcs = candidate.logicalArcs;
+                    route.includedArcFractions =
+                        candidate.includedArcFractions;
+                    route.edgeCost = candidate.edgeCost;
+                    route.transitionCost = candidate.transitionCost;
+                    const auto committedArc = graph.arc(candidate.arcs.front());
+                    route.committedEdgeCost += committedArc.cost;
+                    route.committedPathLengthPredictionVoxels =
+                        committedArc.pathLengthPredictionVoxels;
+                    if (incomingArc.has_value()) {
+                        const auto committedJoin = graph.transition(
+                            graph.arc(*incomingArc), committedArc);
+                        if (!committedJoin.has_value()) {
+                            throw std::logic_error(
+                                "diagnostic replay route lost its committed transition");
+                        }
+                        route.committedTransitionCost += committedJoin->cost;
+                    }
+                    route.pathLengthPredictionVoxels = candidate.pathLength;
+                    route.totalLoss = candidate.loss;
+                    route.lossPerPredictionVoxel = routeDensity(candidate);
+                    for (size_t arcOffset = 0;
+                         arcOffset < candidate.arcs.size(); ++arcOffset) {
+                        auto points = routePointPrefix(
+                            graph.routePoints(candidate.arcs[arcOffset]),
+                            candidate.includedArcFractions[arcOffset]);
+                        if (!route.routePointsBaseXYZ.empty() && !points.empty())
+                            points.erase(points.begin());
+                        route.routePointsBaseXYZ.insert(
+                            route.routePointsBaseXYZ.end(), points.begin(),
+                            points.end());
+                    }
+                    if (selected.has_value() &&
+                        candidate.logicalArcs == selected->logicalArcs) {
+                        decision.selectedRouteIndex = routeIndex;
+                    }
+                    decision.routes.push_back(std::move(route));
+                }
+                segment.decisions.push_back(std::move(decision));
+            }
             if (!selected.has_value())
                 break;
             const auto arcId = selected->arcs.front();
@@ -824,6 +1122,17 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
                 stableIndex(candidateIndices, arcId.fiberlet));
             const size_t arcIndex = edge.diagnosticArcIndex.value_or(
                 stableIndex(arcIndices, arcId));
+            FiberletGraphReplayCommittedStep committedStep;
+            committedStep.referenceBeginArcBase = previousReferenceArc;
+            committedStep.edgeCost += edge.cost;
+            committedStep.pathLengthPredictionVoxels =
+                edge.pathLengthPredictionVoxels;
+            if (incomingArc.has_value()) {
+                if (selected->transitions.empty())
+                    throw std::logic_error(
+                        "selected fiberlet route has no graph transition");
+                committedStep.transitionCost += selected->transitions.front().cost;
+            }
             for (size_t index = 1; index < points.size(); ++index) {
                 const double stepBase = length(points[index] - segment.routePointsBaseXYZ.back());
                 const auto forwardMatch = matchForwardPolylinePoint(
@@ -884,6 +1193,8 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
                 segment.totalLoss += join.cost.total();
             }
             segment.pathLengthPredictionVoxels += edge.pathLengthPredictionVoxels;
+            committedStep.referenceEndArcBase = previousReferenceArc;
+            segment.committedSteps.push_back(std::move(committedStep));
             if (!terminalPartialEdge) {
                 incomingArc = arcId;
                 currentNode = edge.target;
@@ -1030,6 +1341,15 @@ std::string fiberletGraphReplayObj(const FiberletGraphReplayResult& replay)
 
 nlohmann::json fiberletGraphReplayJson(const FiberletGraphReplayResult& replay, const FiberletGraphReplayConfig& config)
 {
+    const auto storageKeyJson = [](const FiberletStorageKey& key) {
+        return nlohmann::json::array({key.coordinateZYX[0],
+            key.coordinateZYX[1], key.coordinateZYX[2], key.variant});
+    };
+    const auto arcIdJson = [&](const DirectedFiberletStorageId& arc) {
+        return nlohmann::json::array(
+            {storageKeyJson(arc.fiberlet.first),
+                storageKeyJson(arc.fiberlet.second), arc.reverse});
+    };
     nlohmann::json root = {
         {"format", "vc_fiberlet_graph_replay"},
         {"version", 2},
@@ -1042,13 +1362,34 @@ nlohmann::json fiberletGraphReplayJson(const FiberletGraphReplayResult& replay, 
         {"config",
          {
              {"beam_width", config.beamWidth},
-             {"lookahead_edges", config.lookaheadEdges},
+             {"lookahead_mode",
+                 config.lookaheadDistanceBaseVoxels.has_value()
+                     ? "distance"
+                     : "edges"},
+             {"lookahead_edges",
+                 config.lookaheadDistanceBaseVoxels.has_value()
+                     ? nlohmann::json(nullptr)
+                     : nlohmann::json(config.lookaheadEdges)},
+             {"lookahead_distance_base_voxels",
+                 config.lookaheadDistanceBaseVoxels.has_value()
+                     ? nlohmann::json(*config.lookaheadDistanceBaseVoxels)
+                     : nlohmann::json(nullptr)},
+             {"lookahead_distance_prediction_voxels",
+                 config.lookaheadDistanceBaseVoxels.has_value()
+                     ? nlohmann::json(
+                           *config.lookaheadDistanceBaseVoxels /
+                           replay.predictionToBaseScale)
+                     : nlohmann::json(nullptr)},
              {"threshold", fiberReplayThresholdDescriptorJson(
                  config.errorThresholdBaseVoxels)},
              {"match_refine_steps", config.matchRefineSteps},
              {"minimum_reset_advance_base_voxels", config.minimumResetAdvanceBaseVoxels},
              {"reference_begin_arc_base", config.referenceBeginArcBase},
              {"reference_end_arc_base", replay.referenceEndArcBase},
+             {"initial_seed_key", config.initialSeedKey.has_value()
+                     ? storageKeyJson(*config.initialSeedKey)
+                     : nlohmann::json(nullptr)},
+             {"record_decision_diagnostics", config.recordDecisionDiagnostics},
          }},
         {"reference_begin_arc_base", replay.referenceBeginArcBase},
         {"reference_end_arc_base", replay.referenceEndArcBase},
@@ -1077,6 +1418,51 @@ nlohmann::json fiberletGraphReplayJson(const FiberletGraphReplayResult& replay, 
             });
             matches.push_back(std::move(matchJson));
         }
+        nlohmann::json decisions = nlohmann::json::array();
+        for (const auto& decision : segment.decisions) {
+            nlohmann::json routes = nlohmann::json::array();
+            for (const auto& route : decision.routes) {
+                nlohmann::json logicalArcs = nlohmann::json::array();
+                for (const auto& arc : route.logicalArcs)
+                    logicalArcs.push_back(arcIdJson(arc));
+                nlohmann::json routePoints = nlohmann::json::array();
+                for (const auto& point : route.routePointsBaseXYZ)
+                    routePoints.push_back(pointJson(point));
+                routes.push_back({
+                    {"logical_arcs", std::move(logicalArcs)},
+                    {"included_arc_fractions",
+                        route.includedArcFractions},
+                    {"route_points_base_xyz", std::move(routePoints)},
+                    {"edge_cost", costJson(route.edgeCost)},
+                    {"transition_cost", costJson(route.transitionCost)},
+                    {"committed_edge_cost",
+                        costJson(route.committedEdgeCost)},
+                    {"committed_transition_cost",
+                        costJson(route.committedTransitionCost)},
+                    {"committed_path_length_prediction_voxels",
+                        route.committedPathLengthPredictionVoxels},
+                    {"path_length_prediction_voxels",
+                        route.pathLengthPredictionVoxels},
+                    {"total_loss", route.totalLoss},
+                    {"loss_per_prediction_voxel",
+                        route.lossPerPredictionVoxel},
+                });
+            }
+            decisions.push_back({
+                {"route_point_index", decision.routePointIndex},
+                {"reference_arc_base", decision.referenceArcBase},
+                {"source_key", storageKeyJson(decision.sourceKey)},
+                {"incoming_logical_arc",
+                    decision.incomingLogicalArc.has_value()
+                        ? arcIdJson(*decision.incomingLogicalArc)
+                        : nlohmann::json(nullptr)},
+                {"selected_route_index",
+                    decision.selectedRouteIndex.has_value()
+                        ? nlohmann::json(*decision.selectedRouteIndex)
+                        : nlohmann::json(nullptr)},
+                {"routes", std::move(routes)},
+            });
+        }
         root["segments"].push_back({
             {"start_reference_arc_base", segment.startReferenceArcBase},
             {"end_reference_arc_base", segment.endReferenceArcBase},
@@ -1086,8 +1472,12 @@ nlohmann::json fiberletGraphReplayJson(const FiberletGraphReplayResult& replay, 
             {"arc_indices", segment.arcIndices},
             {"transition_indices", segment.transitionIndices},
             {"stop_node_index", segment.stopNodeIndex.has_value() ? nlohmann::json(*segment.stopNodeIndex) : nlohmann::json(nullptr)},
+            {"seed_key", segment.seedKey.has_value()
+                    ? storageKeyJson(*segment.seedKey)
+                    : nlohmann::json(nullptr)},
             {"terminal_partial_edge", segment.terminalPartialEdge},
             {"matches", std::move(matches)},
+            {"decisions", std::move(decisions)},
             {"total_loss", segment.totalLoss},
             {"edge_cost", costJson(segment.edgeCost)},
             {"transition_cost", costJson(segment.transitionCost)},
@@ -1118,6 +1508,47 @@ nlohmann::json fiberletGraphReplayJson(const FiberletGraphReplayResult& replay, 
         root["failures"].push_back(std::move(failureJson));
     }
     return root;
+}
+
+std::vector<FiberletGraphReplayFailureWindow>
+fiberletGraphReplayFailureWindows(const FiberletGraphReplayResult& replay)
+{
+    std::vector<FiberletGraphReplayFailureWindow> result;
+    result.reserve(replay.failures.size());
+    for (const auto& failure : replay.failures) {
+        if (failure.index != result.size())
+            throw std::invalid_argument(
+                "fiberlet replay failures are not in stable index order");
+        if (failure.segmentIndex >= replay.segments.size())
+            throw std::invalid_argument(
+                "fiberlet replay failure segment index is out of range");
+        const auto& segment = replay.segments[failure.segmentIndex];
+        const double begin = !segment.matches.empty()
+            ? segment.matches.front().searchBeginArcBase
+            : segment.startReferenceArcBase;
+        const double end = std::max(
+            failure.referenceArcBase, segment.endReferenceArcBase);
+        if (!std::isfinite(failure.referenceArcBase) ||
+            !std::isfinite(begin) || !std::isfinite(end) ||
+            begin < replay.referenceBeginArcBase - kReplayEpsilon ||
+            end > replay.referenceEndArcBase + kReplayEpsilon ||
+            failure.referenceArcBase < begin - kReplayEpsilon ||
+            end < failure.referenceArcBase - kReplayEpsilon ||
+            !(end > begin + kReplayEpsilon)) {
+            throw std::invalid_argument(
+                "fiberlet replay failure window is inconsistent");
+        }
+        result.push_back({
+            failure.index,
+            failure.segmentIndex,
+            failure.reason,
+            failure.referenceArcBase,
+            begin,
+            end,
+            segment.seedKey,
+        });
+    }
+    return result;
 }
 
 }  // namespace vc::fiber_tracer

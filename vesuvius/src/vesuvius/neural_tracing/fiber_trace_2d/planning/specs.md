@@ -3104,6 +3104,34 @@
   search over the complete immutable graph with the shared edge/join objective.
   The greedy evaluator and on-demand graph evaluator run concurrently;
   neither evaluator changes the other one's state.
+- Graph replay optionally accepts a finite positive fixed lookahead distance in
+  base voxels instead of a fixed fiberlet count. The two modes are mutually
+  exclusive at the CLI and fixed-edge mode retains its existing arithmetic and
+  pruning. For each decision, distance mode uses
+  `min(requested_distance, remaining_selected_reference_arc)` and converts that
+  common base distance through the graph's prediction-to-base scale for the
+  prediction-voxel density denominator.
+- Fixed-distance replay enumerates acyclic routes to the common horizon in
+  canonical outgoing-arc order; it must not prune incomplete candidates at
+  unequal accumulated lengths. Completed candidates sort by density, raw loss,
+  and logical arc sequence. The configured beam width limits retained
+  diagnostic routes after global selection. Exceeding the deterministic
+  experimental route-state bound is an explicit error, never a fallback to
+  unequal-distance comparison. A route that exhausts the graph before the
+  horizon is excluded; if all routes do, normal graph exhaustion applies.
+- Every fully covered edge and entering join contributes its complete active
+  graph-view cost. When the horizon lies inside the final edge, that edge's
+  authoritative component vector is multiplied by
+  `remaining_length / edge_length`, while its entering join remains complete.
+  An exact-boundary edge is complete and the next join is excluded. Compact
+  cost views expose the decoded scalar as their authoritative component, so
+  proportional scoring cannot silently recover the float cost. Diagnostic
+  route geometry is clipped to the same final-edge fraction. This uniform-cost
+  approximation remains explicit until sub-fiberlet cost segments exist.
+- Lookahead distance is replay-only metadata. It must not affect anchor or
+  fiberlet cache identity, corridor selection, generation settings, chunk
+  payloads, or prefetch scheduling. On-demand traversal may populate a missing
+  chunk, but repeating against a hot cache must not rewrite cache files.
 - Default replay progress is one command-wide terminal bar. Cached replay uses
   `cache = (resolvedAnchors + 16*resolvedPrefixes) /
   (expectedAnchors + 16*expectedPrefixes)` over the deterministic scheduled
@@ -3697,3 +3725,34 @@
   median, and maximum in base voxels. Invalid reference normals are counted and
   excluded only from the component summaries. Long extraction, DP, line-to-line,
   and reference-distance stages report initial, periodic, and terminal progress.
+- Every quantization comparison atomically writes its complete baseline and
+  scenario `vc_fiberlet_graph_replay` JSON files and prints a deterministic
+  failure-window row. The window begins at the owning segment's reset-search
+  arc, extends through the complete failure-containing edge, and carries the
+  segment's graph seed key. `--arc` and `--length` select that base-voxel
+  interval; `--seed-key` forces the original first seed so prior consumed-node
+  state cannot change the focused replay. Focused diagnostics retain the full
+  corridor cache identity, disable prefetch, and request only chunks touched by
+  seed selection and beam traversal. They persist every final ranked beam
+  frontier with logical routes, geometry, decomposed edge/join costs, length,
+  and density, plus a comparison artifact containing the first selected-route
+  difference, cross-ranks, and maximum paired-route distance.
+- Every full or focused comparison also records one lightweight cost entry for
+  each actually committed fiberlet; lookahead alternatives are not counted.
+  `route-cost-statistics-<scenario>.json` reports complete-route and
+  failure-excluded min/mean/median/max/sum distributions for combined, edge,
+  transition, and decomposed objective loss per prediction voxel. Every value
+  in these distributions is the committed occurrence's component cost divided
+  by its edge path length; raw per-fiberlet cost distributions are not exposed
+  because replay does not compare them across unequal lengths. Aggregate raw
+  loss and aggregate path length remain only to verify the length-weighted
+  whole-route density. Failure exclusion uses
+  the baseline replay's failure arcs for both baseline and scenario statistics
+  so they describe the same reference neighborhoods. An occurrence is excluded
+  exactly when its matched-reference interval intersects a closed
+  `[failure_arc-margin, failure_arc+margin]` interval.
+  `--route-stats-failure-margin` controls this distance in base voxels and
+  defaults to 128. Repeated commitments of one logical fiberlet remain separate
+  observations. Each observation owns the selected edge's stored component
+  costs and the incoming join from the immediately preceding committed edge in
+  the same segment; the first edge after every reset owns no transition.

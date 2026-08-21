@@ -1,21 +1,14 @@
-# Status: canonical anchor reuse across quantized fiberlets
+# Status: persistent equal-arc fiberlet beam search
 
-- [x] Capture the requested task
-- [x] Write the task plan
-- [x] Complete independent plan review
-- [x] Make canonical anchor metadata/root scenario-independent
-- [x] Derive transformed endpoint views under a bounded single-flight LRU
-- [x] Apply transformed anchors consistently in the graph
-- [x] Add regression coverage
-- [x] Update specs and docs
-- [x] Build and run focused tests
-- [x] Validate compact-direction and Q4-position scenarios
-- [x] Fix deterministic cache-backed replay teardown
-- [x] Validate both scenarios over the full radius-768 corridor with hot caches
-- [x] Extend the task and plan for compact-axis cost-only scenarios
-- [x] Complete independent plan review
-- [x] Add compact-axis `uint8` and `uint16` scenarios and tests
-- [x] Build and run focused tests
-- [x] Run both full radius-768 comparisons from the compact-axis cache
-- [x] Measure and document partial-cache completion during cost-range scans
-- [x] Update specs, docs, changelog, and task log
+- [x] Capture the corrected task in `task.md`.
+- [x] Draft the implementation, documentation, and validation plan.
+- [x] Complete independent plan review and incorporate findings.
+- [ ] Obtain user agreement on the beam-front and lookahead semantics.
+- [ ] Update specs before implementation.
+- [ ] Implement persistent partial-edge beam state and equal-arc advancement.
+- [ ] Implement lookahead ranking and width-16 retention.
+- [ ] Rework replay output, failure, reset, and diagnostics.
+- [ ] Add focused regression coverage.
+- [ ] Update docs, changelog, and task log.
+- [ ] Build and run tests with `-j32`.
+- [ ] Run focused and whole-fiber float/Q1 comparisons.

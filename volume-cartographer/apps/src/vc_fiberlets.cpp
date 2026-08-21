@@ -5,6 +5,7 @@
 #include "vc/fiber_tracer/FiberletQuantization.hpp"
 #include "vc/fiber_tracer/FiberletChunkGraph.hpp"
 #include "vc/fiber_tracer/FiberletOnDemand.hpp"
+#include "vc/core/util/AtomicFile.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
@@ -25,6 +26,7 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -84,9 +86,13 @@ struct CliOptions {
     std::optional<double> localWindowBaseVoxels;
     std::optional<double> baseVoxelSizeUm;
     std::optional<double> replayLengthBaseVoxels;
+    std::optional<double> replayBeginArcBaseVoxels;
+    std::optional<vc::fiber_tracer::FiberletStorageKey> replayInitialSeedKey;
+    double routeStatsFailureMarginBaseVoxels = 128.0;
     double glyphLengthBaseVoxels = 16.0;
     size_t decodedCacheBytes = 512ULL * 1024ULL * 1024ULL;
     bool printStats = false;
+    bool lookaheadEdgesSpecified = false;
     bool writePresenceSlices = true;
     bool writeReplayVisualizations = false;
     bool alongSpecified = false;
@@ -179,6 +185,10 @@ void usage(const char* executable)
     std::cerr << "\nReplay options:\n"
               << "  --fail N                      Lasagna-normal failure radius in base voxels; tangent-plane radius is 4N [20]\n"
               << "  --length N                    compared reference length in base voxels [full]\n"
+              << "  --arc N                       absolute reference-polyline start arc in base voxels\n"
+              << "  --seed-key Z,Y,X,V            exact first graph-anchor key for a focused replay\n"
+              << "  --route-stats-failure-margin N exclude this base-voxel distance around failures [128]\n"
+              << "  --lookahead-distance N        fixed graph lookahead arc in base voxels\n"
               << "  --vis                         write indexed local failure visualizations\n"
               << "  --volume PATH                 required CT OME-Zarr array/group path for --vis\n"
               << "  --along N                     replay visualization half-width [128]; benchmark length [full]\n"
@@ -218,6 +228,32 @@ int parseInt(const std::string& text, const char* name)
         fail(std::string("--") + name + " requires an integer");
     }
     return static_cast<int>(value);
+}
+
+vc::fiber_tracer::FiberletStorageKey parseStorageKey(const std::string& text)
+{
+    std::array<std::int64_t, 3> coordinate{};
+    std::uint8_t variant = 0;
+    std::stringstream input(text);
+    std::string token;
+    for (size_t index = 0; index < 4; ++index) {
+        if (!std::getline(input, token, ',') || token.empty())
+            fail("--seed-key requires Z,Y,X,V");
+        size_t parsed = 0;
+        const long long value = std::stoll(token, &parsed);
+        if (parsed != token.size())
+            fail("--seed-key requires four integers");
+        if (index < 3) {
+            coordinate[index] = static_cast<std::int64_t>(value);
+        } else {
+            if (value < 0 || value > 1)
+                fail("--seed-key variant must be zero or one");
+            variant = static_cast<std::uint8_t>(value);
+        }
+    }
+    if (std::getline(input, token, ','))
+        fail("--seed-key requires exactly four integers");
+    return {coordinate, variant};
 }
 
 vc::fiber_tracer::FiberAnchorCrop parseCrop(const std::string& text)
@@ -333,6 +369,16 @@ CliOptions parseArgs(int argc, char** argv)
             options.failureThresholdBaseVoxels = parseDouble(valueAfter(index, argc, argv, "fail"), "fail");
         } else if (argument == "--length" && usesGraphReplayOptions(options.command)) {
             options.replayLengthBaseVoxels = parseDouble(valueAfter(index, argc, argv, "length"), "length");
+        } else if (argument == "--arc" && isQuantizationCommand(options.command)) {
+            options.replayBeginArcBaseVoxels = parseDouble(valueAfter(index, argc, argv, "arc"), "arc");
+        } else if (argument == "--seed-key" && isQuantizationCommand(options.command)) {
+            options.replayInitialSeedKey = parseStorageKey(
+                valueAfter(index, argc, argv, "seed-key"));
+        } else if (argument == "--route-stats-failure-margin" &&
+                   isQuantizationCommand(options.command)) {
+            options.routeStatsFailureMarginBaseVoxels = parseDouble(
+                valueAfter(index, argc, argv, "route-stats-failure-margin"),
+                "route-stats-failure-margin");
         } else if (argument == "--vis" && isReplayCommand(options.command)) {
             options.writeReplayVisualizations = true;
         } else if (argument == "--volume" && isReplayCommand(options.command)) {
@@ -437,6 +483,12 @@ CliOptions parseArgs(int argc, char** argv)
             if (value < 1)
                 fail("--lookahead must be positive");
             options.graphReplay.lookaheadEdges = static_cast<size_t>(value);
+            options.lookaheadEdgesSpecified = true;
+        } else if (argument == "--lookahead-distance" &&
+                   usesGraphReplayOptions(options.command)) {
+            options.graphReplay.lookaheadDistanceBaseVoxels = parseDouble(
+                valueAfter(index, argc, argv, "lookahead-distance"),
+                "lookahead-distance");
         } else if (argument == "--storage-chunk-side" && (isQuantizationCommand(options.command) || isReplayCommand(options.command))) {
             options.storageChunkSideBaseVoxels = parseInt(valueAfter(index, argc, argv, "storage-chunk-side"), "storage-chunk-side");
         } else if (argument == "--scenario" && isQuantizationCommand(options.command)) {
@@ -468,6 +520,16 @@ CliOptions parseArgs(int argc, char** argv)
             fail("paths and replay commands require --normal-manifest");
         vc::fiber_tracer::validateFiberletPathConfig(options.paths);
     }
+    if (usesGraphReplayOptions(options.command) &&
+        options.graphReplay.lookaheadDistanceBaseVoxels.has_value()) {
+        if (options.lookaheadEdgesSpecified) {
+            fail("--lookahead and --lookahead-distance are mutually exclusive");
+        }
+        if (!std::isfinite(*options.graphReplay.lookaheadDistanceBaseVoxels) ||
+            !(*options.graphReplay.lookaheadDistanceBaseVoxels > 0.0)) {
+            fail("--lookahead-distance must be finite and positive");
+        }
+    }
     if (isReplayCommand(options.command)) {
         if (!(options.failureThresholdBaseVoxels >= 0.0) || !(options.alongBaseVoxels > 0.0) || !(options.radiusBaseVoxels > 0.0) ||
             !(options.matchRefineSteps >= 0.0) || options.storageChunkSideBaseVoxels <= 0 ||
@@ -488,8 +550,17 @@ CliOptions parseArgs(int argc, char** argv)
     }
     if (isQuantizationCommand(options.command)) {
         if (!(options.failureThresholdBaseVoxels >= 0.0) || !(options.radiusBaseVoxels > 0.0) || !(options.matchRefineSteps >= 0.0) ||
+            !(options.routeStatsFailureMarginBaseVoxels >= 0.0) ||
             options.storageChunkSideBaseVoxels <= 0 || (options.replayLengthBaseVoxels.has_value() && !(*options.replayLengthBaseVoxels > 0.0))) {
             fail("quantization-benchmark options are outside their valid range");
+        }
+        if (options.replayBeginArcBaseVoxels.has_value() &&
+            !(*options.replayBeginArcBaseVoxels >= 0.0)) {
+            fail("quantization-benchmark --arc must be non-negative");
+        }
+        if (options.replayInitialSeedKey.has_value() &&
+            !options.replayBeginArcBaseVoxels.has_value()) {
+            fail("quantization-benchmark --seed-key requires --arc");
         }
         if (options.quantizationScenario.has_value() && *options.quantizationScenario != "all") {
             const auto scenarios = vc::fiber_tracer::standardFiberletQuantizationScenarios();
@@ -672,6 +743,596 @@ double resolveAnchorConfig(CliOptions& options, const vc::fiber_tracer::FiberPre
     options.anchors.axialSupportHalfWidthPredictionVoxels = 1.5 * options.anchors.cellSizePredictionVoxels;
     vc::fiber_tracer::validateFiberAnchorConfig(options.anchors);
     return cellSideBase;
+}
+
+vc::fiber_tracer::ForwardPolylineArcInterval resolveQuantizationReplayInterval(
+    const vc::fiber_tracer::PolylineArcGeometry& reference,
+    size_t firstControlPointLineIndex,
+    const CliOptions& options)
+{
+    const auto available = vc::fiber_tracer::selectForwardPolylineArcInterval(
+        reference, firstControlPointLineIndex);
+    if (!options.replayBeginArcBaseVoxels.has_value()) {
+        return vc::fiber_tracer::selectForwardPolylineArcInterval(
+            reference, firstControlPointLineIndex,
+            options.replayLengthBaseVoxels);
+    }
+    const double begin = *options.replayBeginArcBaseVoxels;
+    if (begin < available.beginArc - 1.0e-9 ||
+        begin >= available.endArc - 1.0e-9) {
+        fail("quantization-benchmark --arc lies outside the first-CP reference interval");
+    }
+    const double end = options.replayLengthBaseVoxels.has_value()
+        ? std::min(available.endArc,
+              begin + *options.replayLengthBaseVoxels)
+        : available.endArc;
+    if (!(end > begin + 1.0e-9))
+        fail("quantization-benchmark focused replay interval is empty");
+    return {begin, end};
+}
+
+double quantizationExtractionArcPaddingBaseVoxels(
+    const CliOptions& options,
+    const vc::fiber_tracer::FiberPredictionGridInfo& grid)
+{
+    const double cellSideBase =
+        static_cast<double>(options.anchors.cellSizePredictionVoxels) *
+        grid.predictionToBaseScale;
+    double maximumCellOffset = 0.0;
+    for (const auto& offset : vc::fiber_tracer::fiberletCellNeighborhoodOffsets(
+             options.paths.cellRadius,
+             options.paths.neighborhoodMarginCells)) {
+        maximumCellOffset = std::max(maximumCellOffset,
+            std::sqrt(static_cast<double>(offset[0] * offset[0] +
+                offset[1] * offset[1] + offset[2] * offset[2])));
+    }
+    const double maximumFiberletReachBase =
+        (maximumCellOffset + std::sqrt(3.0)) * cellSideBase;
+    const double seedWindowBase = std::max(
+        options.graphReplay.minimumResetAdvanceBaseVoxels, cellSideBase);
+    return seedWindowBase +
+        static_cast<double>(options.graphReplay.lookaheadEdges + 1) *
+            maximumFiberletReachBase;
+}
+
+std::filesystem::path writeQuantizationReplay(
+    const CliOptions& options,
+    const vc::fiber_tracer::FiberletGraphReplayResult& replay,
+    const vc::fiber_tracer::FiberletGraphReplayConfig& config,
+    const vc::fiber_tracer::FiberletQuantizationScenario& scenario,
+    std::string_view source,
+    const vc::lasagna::LasagnaDataset& fiberDataset,
+    const vc::lasagna::LasagnaDataset& normalDataset)
+{
+    std::ostringstream intervalIdentity;
+    intervalIdentity << std::setprecision(17)
+                     << replay.referenceBeginArcBase << ','
+                     << replay.referenceEndArcBase;
+    std::string intervalHash = stringHash(intervalIdentity.str());
+    std::replace(intervalHash.begin(), intervalHash.end(), ':', '-');
+    const auto directory = options.outputDirectory /
+        "quantization-replays" / intervalHash;
+    auto json = vc::fiber_tracer::fiberletGraphReplayJson(replay, config);
+    json["quantization"] = {
+        {"source", source},
+        {"scenario", scenario.name},
+        {"position_quantum_base_voxels",
+            scenario.positionQuantumBaseVoxels},
+        {"compact_directions", scenario.compactAxes},
+        {"cost_bits", scenario.costBits},
+    };
+    json["inputs"] = {
+        {"fiber_prediction_manifest", datasetLocator(fiberDataset)},
+        {"fiber_prediction_manifest_hash",
+            fileHash(fiberDataset.manifest().manifestPath)},
+        {"normal_manifest", datasetLocator(normalDataset)},
+        {"normal_manifest_hash",
+            fileHash(normalDataset.manifest().manifestPath)},
+        {"reference_fiber", std::filesystem::absolute(options.fiberJson)
+            .lexically_normal().string()},
+        {"reference_fiber_hash", fileHash(options.fiberJson)},
+    };
+    const auto path = directory /
+        (std::string(source) + "-" + scenario.name + ".json");
+    vc::core::util::atomicWriteString(path, json.dump(2) + "\n");
+    return path;
+}
+
+void printQuantizationFailureWindows(
+    std::string_view source,
+    const vc::fiber_tracer::FiberletGraphReplayResult& replay)
+{
+    const auto windows =
+        vc::fiber_tracer::fiberletGraphReplayFailureWindows(replay);
+    for (const auto& window : windows) {
+        const auto& failure = replay.failures.at(window.failureIndex);
+        std::cout << std::setprecision(17)
+                  << "fiberlet_quantization_failure_window"
+                  << " source=" << source
+                  << " index=" << window.failureIndex
+                  << " segment=" << window.segmentIndex
+                  << " reason=" << window.reason
+                  << " failure_arc_base="
+                  << window.failureReferenceArcBase
+                  << " arc=" << window.replayBeginArcBase
+                  << " length="
+                  << window.replayEndArcBase - window.replayBeginArcBase;
+        if (failure.evaluatorPointBase.has_value()) {
+            std::cout << " evaluator_base_xyz="
+                      << (*failure.evaluatorPointBase)[0] << ','
+                      << (*failure.evaluatorPointBase)[1] << ','
+                      << (*failure.evaluatorPointBase)[2];
+        }
+        if (failure.candidateIndex.has_value())
+            std::cout << " candidate=" << *failure.candidateIndex;
+        if (failure.arcIndex.has_value())
+            std::cout << " graph_arc=" << *failure.arcIndex;
+        if (failure.candidatePathPointIndex.has_value()) {
+            std::cout << " path_point="
+                      << *failure.candidatePathPointIndex;
+        }
+        if (window.seedKey.has_value()) {
+            std::cout << " seed_key="
+                      << window.seedKey->coordinateZYX[0] << ','
+                      << window.seedKey->coordinateZYX[1] << ','
+                      << window.seedKey->coordinateZYX[2] << ','
+                      << static_cast<unsigned>(window.seedKey->variant);
+        }
+        std::cout << '\n';
+    }
+}
+
+nlohmann::json replayCostJson(
+    const vc::fiber_tracer::FiberletGraphReplayCost& cost)
+{
+    return {
+        {"invalid_prediction", cost.invalidPrediction},
+        {"alignment", cost.alignment},
+        {"isotropic_smoothness", cost.isotropicSmoothness},
+        {"tangent_smoothness", cost.tangentSmoothness},
+        {"normal_smoothness", cost.normalSmoothness},
+        {"total", cost.total()},
+    };
+}
+
+nlohmann::json replayStorageKeyJson(
+    const vc::fiber_tracer::FiberletStorageKey& key)
+{
+    return nlohmann::json::array({key.coordinateZYX[0],
+        key.coordinateZYX[1], key.coordinateZYX[2], key.variant});
+}
+
+nlohmann::json replayArcIdJson(
+    const vc::fiber_tracer::DirectedFiberletStorageId& arc)
+{
+    return nlohmann::json::array({replayStorageKeyJson(arc.fiberlet.first),
+        replayStorageKeyJson(arc.fiberlet.second), arc.reverse});
+}
+
+std::vector<const vc::fiber_tracer::FiberletGraphReplayDecision*>
+replayDecisions(const vc::fiber_tracer::FiberletGraphReplayResult& replay)
+{
+    std::vector<const vc::fiber_tracer::FiberletGraphReplayDecision*> result;
+    for (const auto& segment : replay.segments) {
+        for (const auto& decision : segment.decisions)
+            result.push_back(&decision);
+    }
+    return result;
+}
+
+const vc::fiber_tracer::FiberletGraphReplayDecisionRoute* selectedRoute(
+    const vc::fiber_tracer::FiberletGraphReplayDecision& decision)
+{
+    if (!decision.selectedRouteIndex.has_value() ||
+        *decision.selectedRouteIndex >= decision.routes.size()) {
+        return nullptr;
+    }
+    return &decision.routes[*decision.selectedRouteIndex];
+}
+
+nlohmann::json decisionRouteJson(
+    const vc::fiber_tracer::FiberletGraphReplayDecisionRoute* route,
+    std::optional<size_t> rank)
+{
+    if (route == nullptr)
+        return nullptr;
+    nlohmann::json arcs = nlohmann::json::array();
+    for (const auto& arc : route->logicalArcs)
+        arcs.push_back(replayArcIdJson(arc));
+    nlohmann::json points = nlohmann::json::array();
+    for (const auto& point : route->routePointsBaseXYZ)
+        points.push_back(nlohmann::json::array({point[0], point[1], point[2]}));
+    return {
+        {"rank", rank.has_value() ? nlohmann::json(*rank)
+                                    : nlohmann::json(nullptr)},
+        {"logical_arcs", std::move(arcs)},
+        {"route_points_base_xyz", std::move(points)},
+        {"edge_cost", replayCostJson(route->edgeCost)},
+        {"transition_cost", replayCostJson(route->transitionCost)},
+        {"committed_edge_cost", replayCostJson(route->committedEdgeCost)},
+        {"committed_transition_cost",
+            replayCostJson(route->committedTransitionCost)},
+        {"committed_path_length_prediction_voxels",
+            route->committedPathLengthPredictionVoxels},
+        {"total_loss", route->totalLoss},
+        {"path_length_prediction_voxels",
+            route->pathLengthPredictionVoxels},
+        {"loss_per_prediction_voxel", route->lossPerPredictionVoxel},
+    };
+}
+
+nlohmann::json decisionRouteDeltaJson(
+    const vc::fiber_tracer::FiberletGraphReplayDecisionRoute* baseline,
+    const vc::fiber_tracer::FiberletGraphReplayDecisionRoute* scenario)
+{
+    if (baseline == nullptr || scenario == nullptr)
+        return nullptr;
+    const auto costDelta = [](const auto& first, const auto& second) {
+        return nlohmann::json{
+            {"invalid_prediction",
+                second.invalidPrediction - first.invalidPrediction},
+            {"alignment", second.alignment - first.alignment},
+            {"isotropic_smoothness",
+                second.isotropicSmoothness - first.isotropicSmoothness},
+            {"tangent_smoothness",
+                second.tangentSmoothness - first.tangentSmoothness},
+            {"normal_smoothness",
+                second.normalSmoothness - first.normalSmoothness},
+            {"total", second.total() - first.total()},
+        };
+    };
+    return {
+        {"edge_cost", costDelta(baseline->edgeCost, scenario->edgeCost)},
+        {"transition_cost",
+            costDelta(baseline->transitionCost, scenario->transitionCost)},
+        {"total_loss", scenario->totalLoss - baseline->totalLoss},
+        {"path_length_prediction_voxels",
+            scenario->pathLengthPredictionVoxels -
+                baseline->pathLengthPredictionVoxels},
+        {"loss_per_prediction_voxel",
+            scenario->lossPerPredictionVoxel -
+                baseline->lossPerPredictionVoxel},
+    };
+}
+
+std::optional<size_t> decisionRouteRank(
+    const vc::fiber_tracer::FiberletGraphReplayDecision& decision,
+    const vc::fiber_tracer::FiberletGraphReplayDecisionRoute* target)
+{
+    if (target == nullptr)
+        return std::nullopt;
+    for (size_t index = 0; index < decision.routes.size(); ++index) {
+        if (decision.routes[index].logicalArcs == target->logicalArcs)
+            return index;
+    }
+    return std::nullopt;
+}
+
+double symmetricDecisionRouteDistance(
+    const vc::fiber_tracer::FiberletGraphReplayDecisionRoute& first,
+    const vc::fiber_tracer::FiberletGraphReplayDecisionRoute& second)
+{
+    if (first.routePointsBaseXYZ.size() < 2 ||
+        second.routePointsBaseXYZ.size() < 2) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    const auto firstGeometry = vc::fiber_tracer::makePolylineArcGeometry(
+        first.routePointsBaseXYZ);
+    const auto secondGeometry = vc::fiber_tracer::makePolylineArcGeometry(
+        second.routePointsBaseXYZ);
+    const auto directed = [](const auto& source, const auto& target) {
+        double maximum = 0.0;
+        const size_t samples = std::max<size_t>(1,
+            static_cast<size_t>(std::ceil(source.length())));
+        for (size_t index = 0; index <= samples; ++index) {
+            const double arc = source.length() *
+                static_cast<double>(index) / static_cast<double>(samples);
+            const auto point = vc::fiber_tracer::samplePolylineArc(source, arc).point;
+            maximum = std::max(maximum,
+                vc::fiber_tracer::projectPointToPolylineArc(
+                    target, point, 0.0, target.length()).distance);
+        }
+        return maximum;
+    };
+    return std::max(directed(firstGeometry, secondGeometry),
+        directed(secondGeometry, firstGeometry));
+}
+
+nlohmann::json scalarStatisticsJson(std::vector<double> values)
+{
+    if (values.empty())
+        return nullptr;
+    std::sort(values.begin(), values.end());
+    const double sum =
+        std::accumulate(values.begin(), values.end(), 0.0);
+    const size_t middle = values.size() / 2;
+    const double median = values.size() % 2 == 0
+        ? 0.5 * (values[middle - 1] + values[middle])
+        : values[middle];
+    return {
+        {"count", values.size()},
+        {"sum", sum},
+        {"minimum", values.front()},
+        {"mean", sum / static_cast<double>(values.size())},
+        {"median", median},
+        {"maximum", values.back()},
+    };
+}
+
+nlohmann::json replayRouteCostStatisticsJson(
+    const vc::fiber_tracer::FiberletGraphReplayResult& replay,
+    std::optional<double> failureMarginBaseVoxels = std::nullopt,
+    const vc::fiber_tracer::FiberletGraphReplayResult* failureSource = nullptr)
+{
+    std::vector<double> invalidPredictionDensity;
+    std::vector<double> alignmentDensity;
+    std::vector<double> isotropicSmoothnessDensity;
+    std::vector<double> normalSmoothnessDensity;
+    std::vector<double> tangentSmoothnessDensity;
+    std::vector<double> edgeDensity;
+    std::vector<double> transitionDensity;
+    std::vector<double> combinedDensity;
+    std::vector<double> failureArcs;
+    if (failureMarginBaseVoxels.has_value()) {
+        if (failureSource == nullptr)
+            failureSource = &replay;
+        failureArcs.reserve(failureSource->failures.size());
+        for (const auto& failure : failureSource->failures)
+            failureArcs.push_back(failure.referenceArcBase);
+        std::sort(failureArcs.begin(), failureArcs.end());
+    }
+    size_t excludedFiberlets = 0;
+    double totalPathLength = 0.0;
+    double totalLoss = 0.0;
+    for (const auto& segment : replay.segments) {
+        for (const auto& step : segment.committedSteps) {
+            if (!(step.pathLengthPredictionVoxels > 0.0))
+                continue;
+            if (failureMarginBaseVoxels.has_value()) {
+                const double begin = std::min(
+                    step.referenceBeginArcBase, step.referenceEndArcBase) -
+                    *failureMarginBaseVoxels;
+                const double end = std::max(
+                    step.referenceBeginArcBase, step.referenceEndArcBase) +
+                    *failureMarginBaseVoxels;
+                const auto failure = std::lower_bound(
+                    failureArcs.begin(), failureArcs.end(), begin);
+                if (failure != failureArcs.end() && *failure <= end) {
+                    ++excludedFiberlets;
+                    continue;
+                }
+            }
+            const auto& edge = step.edgeCost;
+            const auto& transition = step.transitionCost;
+            const double inverseLength =
+                1.0 / step.pathLengthPredictionVoxels;
+            invalidPredictionDensity.push_back(
+                (edge.invalidPrediction + transition.invalidPrediction) *
+                inverseLength);
+            alignmentDensity.push_back(
+                (edge.alignment + transition.alignment) * inverseLength);
+            isotropicSmoothnessDensity.push_back(
+                (edge.isotropicSmoothness + transition.isotropicSmoothness) *
+                inverseLength);
+            normalSmoothnessDensity.push_back(
+                (edge.normalSmoothness + transition.normalSmoothness) *
+                inverseLength);
+            tangentSmoothnessDensity.push_back(
+                (edge.tangentSmoothness + transition.tangentSmoothness) *
+                inverseLength);
+            edgeDensity.push_back(edge.total() * inverseLength);
+            transitionDensity.push_back(transition.total() * inverseLength);
+            const double combined = edge.total() + transition.total();
+            combinedDensity.push_back(combined * inverseLength);
+            totalPathLength += step.pathLengthPredictionVoxels;
+            totalLoss += combined;
+        }
+    }
+    return {
+        {"committed_fiberlets", combinedDensity.size()},
+        {"excluded_fiberlets", excludedFiberlets},
+        {"replay_failure_count", replay.failures.size()},
+        {"exclusion_failure_count", failureArcs.size()},
+        {"failure_exclusion_margin_base_voxels",
+            failureMarginBaseVoxels.has_value()
+                ? nlohmann::json(*failureMarginBaseVoxels)
+                : nlohmann::json(nullptr)},
+        {"total_path_length_prediction_voxels", totalPathLength},
+        {"total_loss", totalLoss},
+        {"whole_route_loss_per_prediction_voxel",
+            totalPathLength > 0.0 ? nlohmann::json(totalLoss / totalPathLength)
+                                  : nlohmann::json(nullptr)},
+        {"combined_loss_per_prediction_voxel",
+            scalarStatisticsJson(std::move(combinedDensity))},
+        {"edge_loss_per_prediction_voxel",
+            scalarStatisticsJson(std::move(edgeDensity))},
+        {"transition_loss_per_prediction_voxel",
+            scalarStatisticsJson(std::move(transitionDensity))},
+        {"invalid_prediction_loss_per_prediction_voxel",
+            scalarStatisticsJson(std::move(invalidPredictionDensity))},
+        {"alignment_loss_per_prediction_voxel",
+            scalarStatisticsJson(std::move(alignmentDensity))},
+        {"isotropic_smoothness_loss_per_prediction_voxel",
+            scalarStatisticsJson(std::move(isotropicSmoothnessDensity))},
+        {"normal_smoothness_loss_per_prediction_voxel",
+            scalarStatisticsJson(std::move(normalSmoothnessDensity))},
+        {"tangent_smoothness_loss_per_prediction_voxel",
+            scalarStatisticsJson(std::move(tangentSmoothnessDensity))},
+    };
+}
+
+std::filesystem::path writeQuantizationRouteCostStatistics(
+    const std::filesystem::path& directory,
+    const vc::fiber_tracer::FiberletGraphReplayResult& baseline,
+    const vc::fiber_tracer::FiberletGraphReplayResult& scenario,
+    std::string_view scenarioName,
+    double failureMarginBaseVoxels)
+{
+    const nlohmann::json root = {
+        {"format", "vc_fiberlet_quantization_route_cost_statistics"},
+        {"version", 1},
+        {"scenario", scenarioName},
+        {"baseline_all", replayRouteCostStatisticsJson(baseline)},
+        {"baseline_away_from_failures", replayRouteCostStatisticsJson(
+            baseline, failureMarginBaseVoxels, &baseline)},
+        {"scenario_all", replayRouteCostStatisticsJson(scenario)},
+        {"scenario_away_from_failures", replayRouteCostStatisticsJson(
+            scenario, failureMarginBaseVoxels, &baseline)},
+    };
+    const auto path = directory /
+        ("route-cost-statistics-" + std::string(scenarioName) + ".json");
+    vc::core::util::atomicWriteString(path, root.dump(2) + "\n");
+    std::cout << "fiberlet_quantization_route_cost_statistics"
+              << " artifact=" << path.string()
+              << " baseline_all=" << root["baseline_all"].dump()
+              << " baseline_away_from_failures="
+              << root["baseline_away_from_failures"].dump() << '\n';
+    return path;
+}
+
+std::filesystem::path writeQuantizationDecisionComparison(
+    const std::filesystem::path& directory,
+    const vc::fiber_tracer::FiberletGraphReplayResult& baseline,
+    const vc::fiber_tracer::FiberletGraphReplayResult& scenario,
+    std::string_view scenarioName)
+{
+    const auto baselineDecisions = replayDecisions(baseline);
+    const auto scenarioDecisions = replayDecisions(scenario);
+    const size_t commonCount =
+        std::min(baselineDecisions.size(), scenarioDecisions.size());
+    std::optional<size_t> firstDifference;
+    std::optional<size_t> maximumDistanceIndex;
+    double maximumDistance = -1.0;
+    for (size_t index = 0; index < commonCount; ++index) {
+        const auto& baselineDecision = *baselineDecisions[index];
+        const auto& scenarioDecision = *scenarioDecisions[index];
+        const auto* baselineSelected = selectedRoute(baselineDecision);
+        const auto* scenarioSelected = selectedRoute(scenarioDecision);
+        if (!firstDifference.has_value() &&
+            (baselineDecision.sourceKey != scenarioDecision.sourceKey ||
+                baselineSelected == nullptr || scenarioSelected == nullptr ||
+                baselineSelected->logicalArcs != scenarioSelected->logicalArcs)) {
+            firstDifference = index;
+        }
+        if (baselineSelected != nullptr && scenarioSelected != nullptr) {
+            const double distance = symmetricDecisionRouteDistance(
+                *baselineSelected, *scenarioSelected);
+            if (std::isfinite(distance) && distance > maximumDistance) {
+                maximumDistance = distance;
+                maximumDistanceIndex = index;
+            }
+        }
+    }
+    if (!firstDifference.has_value() &&
+        baselineDecisions.size() != scenarioDecisions.size()) {
+        firstDifference = commonCount;
+    }
+
+    nlohmann::json root = {
+        {"format", "vc_fiberlet_quantization_decision_comparison"},
+        {"version", 1},
+        {"scenario", scenarioName},
+        {"baseline_decisions", baselineDecisions.size()},
+        {"scenario_decisions", scenarioDecisions.size()},
+        {"first_selected_route_difference", nullptr},
+        {"maximum_selected_route_distance", nullptr},
+        {"baseline_route_cost_statistics",
+            replayRouteCostStatisticsJson(baseline)},
+        {"scenario_route_cost_statistics",
+            replayRouteCostStatisticsJson(scenario)},
+    };
+    if (firstDifference.has_value() && *firstDifference < commonCount) {
+        const auto& baselineDecision = *baselineDecisions[*firstDifference];
+        const auto& scenarioDecision = *scenarioDecisions[*firstDifference];
+        const auto* baselineSelected = selectedRoute(baselineDecision);
+        const auto* scenarioSelected = selectedRoute(scenarioDecision);
+        const auto baselineInScenario =
+            decisionRouteRank(scenarioDecision, baselineSelected);
+        const auto scenarioInBaseline =
+            decisionRouteRank(baselineDecision, scenarioSelected);
+        root["first_selected_route_difference"] = {
+            {"decision_index", *firstDifference},
+            {"baseline_reference_arc_base", baselineDecision.referenceArcBase},
+            {"scenario_reference_arc_base", scenarioDecision.referenceArcBase},
+            {"baseline_source_key", replayStorageKeyJson(baselineDecision.sourceKey)},
+            {"scenario_source_key", replayStorageKeyJson(scenarioDecision.sourceKey)},
+            {"baseline_selected_in_baseline", decisionRouteJson(
+                baselineSelected, baselineDecision.selectedRouteIndex)},
+            {"baseline_selected_in_scenario", decisionRouteJson(
+                baselineInScenario.has_value()
+                    ? &scenarioDecision.routes[*baselineInScenario]
+                    : nullptr,
+                baselineInScenario)},
+            {"scenario_selected_in_baseline", decisionRouteJson(
+                scenarioInBaseline.has_value()
+                    ? &baselineDecision.routes[*scenarioInBaseline]
+                    : nullptr,
+                scenarioInBaseline)},
+            {"scenario_selected_in_scenario", decisionRouteJson(
+                scenarioSelected, scenarioDecision.selectedRouteIndex)},
+            {"baseline_choice_scenario_minus_baseline",
+                decisionRouteDeltaJson(baselineSelected,
+                    baselineInScenario.has_value()
+                        ? &scenarioDecision.routes[*baselineInScenario]
+                        : nullptr)},
+            {"scenario_choice_scenario_minus_baseline",
+                decisionRouteDeltaJson(
+                    scenarioInBaseline.has_value()
+                        ? &baselineDecision.routes[*scenarioInBaseline]
+                        : nullptr,
+                    scenarioSelected)},
+        };
+        if (baselineSelected != nullptr && scenarioInBaseline.has_value()) {
+            root["first_selected_route_difference"]
+                ["baseline_choice_margin_loss_per_prediction_voxel"] =
+                baselineDecision.routes[*scenarioInBaseline]
+                    .lossPerPredictionVoxel -
+                baselineSelected->lossPerPredictionVoxel;
+        }
+        if (scenarioSelected != nullptr && baselineInScenario.has_value()) {
+            root["first_selected_route_difference"]
+                ["scenario_choice_margin_loss_per_prediction_voxel"] =
+                scenarioDecision.routes[*baselineInScenario]
+                    .lossPerPredictionVoxel -
+                scenarioSelected->lossPerPredictionVoxel;
+        }
+    } else if (firstDifference.has_value()) {
+        root["first_selected_route_difference"] = {
+            {"decision_index", *firstDifference},
+            {"reason", "decision_count_differs_after_common_prefix"},
+        };
+    }
+    if (maximumDistanceIndex.has_value()) {
+        root["maximum_selected_route_distance"] = {
+            {"decision_index", *maximumDistanceIndex},
+            {"symmetric_max_base_voxels", maximumDistance},
+        };
+    }
+    const auto path = directory /
+        ("decision-comparison-" + std::string(scenarioName) + ".json");
+    vc::core::util::atomicWriteString(path, root.dump(2) + "\n");
+    std::cout << std::setprecision(17)
+              << "fiberlet_quantization_decision_comparison"
+              << " artifact=" << path.string()
+              << " baseline_decisions=" << baselineDecisions.size()
+              << " scenario_decisions=" << scenarioDecisions.size();
+    if (firstDifference.has_value())
+        std::cout << " first_selected_route_difference=" << *firstDifference;
+    else
+        std::cout << " first_selected_route_difference=none";
+    if (maximumDistanceIndex.has_value()) {
+        std::cout << " maximum_route_distance_decision="
+                  << *maximumDistanceIndex
+                  << " maximum_route_distance_base=" << maximumDistance;
+    }
+    std::cout << '\n';
+    std::cout << "fiberlet_quantization_route_cost_statistics"
+              << " source=baseline json="
+              << root["baseline_route_cost_statistics"].dump() << '\n';
+    std::cout << "fiberlet_quantization_route_cost_statistics"
+              << " source=scenario json="
+              << root["scenario_route_cost_statistics"].dump() << '\n';
+    return path;
 }
 
 std::string progressDuration(double seconds)
@@ -1281,8 +1942,11 @@ CachedReplayContext createCachedReplayContext(
     std::shared_ptr<const vc::lasagna::NormalSampler> normalSampler,
     const std::vector<cv::Vec3d>& referenceBase,
     const vc::fiber_tracer::PolylineArcGeometry& reference,
-    double beginArcBase,
-    double endArcBase,
+    double processingBeginArcBase,
+    double processingEndArcBase,
+    double scheduleBeginArcBase,
+    double scheduleEndArcBase,
+    bool prefetchSchedule,
     const std::filesystem::path& cacheBaseRoot,
     const vc::fiber_tracer::FiberletGeometryCacheProfile& cacheProfile,
     const vc::fiber_tracer::FiberletEvaluationQuantization& replayQuantization,
@@ -1291,7 +1955,11 @@ CachedReplayContext createCachedReplayContext(
     ReplayOverallProgress& overallProgress)
 {
     const auto processingTube = vc::fiber_tracer::makeFiberReplayTube(
-        referenceBase, 0.5 * (beginArcBase + endArcBase), 0.5 * (endArcBase - beginArcBase), options.radiusBaseVoxels, grid, options.anchors.cellSizePredictionVoxels, false);
+        referenceBase,
+        0.5 * (processingBeginArcBase + processingEndArcBase),
+        0.5 * (processingEndArcBase - processingBeginArcBase),
+        options.radiusBaseVoxels, grid,
+        options.anchors.cellSizePredictionVoxels, false);
     const auto containmentQuery = processingTube.makePredictionContainmentQuery(grid.predictionToBaseScale);
     auto anchorMetadata = replayDatasetMetadata(
         vc::fiber_tracer::FiberletDatasetKind::Anchors,
@@ -1360,7 +2028,9 @@ CachedReplayContext createCachedReplayContext(
             progress->resolve(kind, key, status);
         };
     result.preprocessor = vc::fiber_tracer::FiberletOnDemandPreprocessor::create(std::move(onDemand));
-    result.schedule = result.preprocessor->referenceChunkSchedule(reference, beginArcBase, endArcBase, options.radiusBaseVoxels);
+    result.schedule = result.preprocessor->referenceChunkSchedule(reference,
+        scheduleBeginArcBase, scheduleEndArcBase,
+        options.radiusBaseVoxels);
     std::set<ReplayChunkId> expectedAnchors;
     std::set<ReplayChunkId> expectedPrefixes;
     for (const auto& scheduled : result.schedule) {
@@ -1372,7 +2042,10 @@ CachedReplayContext createCachedReplayContext(
     result.preprocessingProgress->configure(std::move(expectedAnchors), std::move(expectedPrefixes));
     overallProgress.attachPreprocessing(result.preprocessingProgress);
     result.graph = std::make_unique<vc::fiber_tracer::FiberletCachedReplayGraphSource>(result.preprocessor, options.paths, replayQuantization);
-    result.preprocessor->prefetchScheduled(result.schedule, 0, result.schedule.size(), false);
+    if (prefetchSchedule) {
+        result.preprocessor->prefetchScheduled(
+            result.schedule, 0, result.schedule.size(), false);
+    }
     return result;
 }
 
@@ -1546,8 +2219,11 @@ int main(int argc, char** argv)
                 fail("quantization benchmark fiber has no valid first control point");
             }
             const auto reference = vc::fiber_tracer::makePolylineArcGeometry(fiber.linePointsXyzBase);
-            const auto interval =
-                vc::fiber_tracer::selectForwardPolylineArcInterval(reference, fiber.controlPointLineIndices.front(), options.replayLengthBaseVoxels);
+            const auto availableInterval =
+                vc::fiber_tracer::selectForwardPolylineArcInterval(
+                    reference, fiber.controlPointLineIndices.front());
+            const auto interval = resolveQuantizationReplayInterval(
+                reference, fiber.controlPointLineIndices.front(), options);
             vc::lasagna::LasagnaDatasetOpenOptions normalOptions;
             normalOptions.workingToBaseScale = grid.predictionToBaseScale;
             normalOptions.remoteCacheRoot = options.remoteCacheDirectory;
@@ -1559,6 +2235,25 @@ int main(int argc, char** argv)
             options.graphReplay.minimumResetAdvanceBaseVoxels = options.paths.longitudinalStepPredictionVoxels * grid.predictionToBaseScale;
             options.graphReplay.referenceBeginArcBase = interval.beginArc;
             options.graphReplay.referenceEndArcBase = interval.endArc;
+            options.graphReplay.initialSeedKey = options.replayInitialSeedKey;
+            options.graphReplay.recordDecisionDiagnostics =
+                options.replayBeginArcBaseVoxels.has_value();
+            const double extractionPaddingBase =
+                quantizationExtractionArcPaddingBaseVoxels(options, grid);
+            const vc::fiber_tracer::ForwardPolylineArcInterval extractionInterval{
+                std::max(availableInterval.beginArc,
+                    interval.beginArc - extractionPaddingBase),
+                std::min(availableInterval.endArc,
+                    interval.endArc + extractionPaddingBase),
+            };
+            const bool focusedDiagnostics =
+                options.replayBeginArcBaseVoxels.has_value();
+            const auto cacheIdentityInterval = focusedDiagnostics
+                ? availableInterval
+                : extractionInterval;
+            const auto scheduledInterval = focusedDiagnostics
+                ? interval
+                : extractionInterval;
             const auto scenarios = vc::fiber_tracer::standardFiberletQuantizationScenarios();
             std::vector<vc::fiber_tracer::FiberletQuantizationScenario> selectedScenarios;
             if (*options.quantizationScenario == "all") {
@@ -1597,8 +2292,11 @@ int main(int argc, char** argv)
                     normalSampler,
                     fiber.linePointsXyzBase,
                     reference,
-                    interval.beginArc,
-                    interval.endArc,
+                    cacheIdentityInterval.beginArc,
+                    cacheIdentityInterval.endArc,
+                    scheduledInterval.beginArc,
+                    scheduledInterval.endArc,
+                    !focusedDiagnostics,
                     options.outputDirectory / "cache",
                     cacheProfile,
                     replayQuantization,
@@ -1639,6 +2337,43 @@ int main(int argc, char** argv)
                 const auto& measured = measuredRun.has_value() ? *measuredRun : baseline;
                 const auto comparison = vc::fiber_tracer::compareFiberletCachedReplays(
                     scenario, baseline.replay, measured.replay, fiber.linePointsXyzBase, *normalSampler, grid.predictionToBaseScale, options.failureThresholdBaseVoxels, printQuantizationProgress);
+                const auto baselineReplayPath = writeQuantizationReplay(
+                    options, baseline.replay, options.graphReplay, scenario,
+                    "baseline", dataset, normalDataset);
+                const auto scenarioReplayPath = writeQuantizationReplay(
+                    options, measured.replay, options.graphReplay, scenario,
+                    "scenario", dataset, normalDataset);
+                (void)writeQuantizationRouteCostStatistics(
+                    baselineReplayPath.parent_path(), baseline.replay,
+                    measured.replay, scenario.name,
+                    options.routeStatsFailureMarginBaseVoxels);
+                if (options.graphReplay.recordDecisionDiagnostics) {
+                    (void)writeQuantizationDecisionComparison(
+                        baselineReplayPath.parent_path(), baseline.replay,
+                        measured.replay, scenario.name);
+                }
+                std::cout << "fiberlet_quantization_replay_artifacts"
+                          << " baseline=" << baselineReplayPath.string()
+                          << " scenario=" << scenarioReplayPath.string()
+                          << " replay_arc_base=" << interval.beginArc
+                          << " replay_end_arc_base=" << interval.endArc
+                          << " extraction_arc_base="
+                          << extractionInterval.beginArc
+                          << " extraction_end_arc_base="
+                          << extractionInterval.endArc
+                          << " extraction_padding_base="
+                          << extractionPaddingBase
+                          << " cache_arc_base="
+                          << cacheIdentityInterval.beginArc
+                          << " cache_end_arc_base="
+                          << cacheIdentityInterval.endArc
+                          << " cache_prefetch="
+                          << (!focusedDiagnostics ? "true" : "false")
+                          << '\n';
+                printQuantizationFailureWindows(
+                    "baseline", baseline.replay);
+                printQuantizationFailureWindows(
+                    "scenario", measured.replay);
                 std::cout << std::setprecision(17) << "fiberlet_cached_quantization"
                           << " scenario=" << scenario.name << " position_quantum_base=" << scenario.positionQuantumBaseVoxels
                           << " compact_directions=" << (scenario.compactAxes ? "true" : "false") << " cost_bits=" << scenario.costBits

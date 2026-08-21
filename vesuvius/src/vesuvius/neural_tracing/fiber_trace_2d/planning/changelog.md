@@ -885,3 +885,28 @@
   existing compact-axis cache was only partially populated, its per-owner cost
   range scan completed missing geometry chunks in place; it did not create a
   cost-specific cache.
+
+# 2026-08-21: focused quantization failure replay
+
+- Added atomic baseline/scenario replay artifacts and exact failure-window
+  reporting to the cache-backed quantization benchmark.
+- Added base-voxel `--arc`/`--length` focused intervals and an original
+  `--seed-key` override for deterministic replay of later failure segments.
+- Replaced focused corridor pre-generation with demand-only access to the
+  completed full-corridor cache and added ranked beam-frontier/cost/route
+  comparison artifacts.
+- Added full-route committed-fiberlet cost distributions plus configurable
+  base-voxel exclusion around replay failures.
+
+# 2026-08-21: fixed-distance fiberlet lookahead experiment
+
+- Added mutually exclusive base-voxel `--lookahead-distance` graph replay with
+  equal-horizon route ranking, proportional active-cost scoring and clipped
+  geometry for a partial final fiberlet, full entering-join ownership, and
+  selected-end horizon shortening. The default fixed-three-edge path is
+  unchanged.
+- On the focused Q1 failure section, 192 base voxels approximates the measured
+  three-edge median (189.1 base voxels). A hot-cache float/Q1 comparison
+  completed with zero failures in both runs, no committed first-edge
+  divergence, and 0.443/0.305/3.689 base-voxel mean/median/maximum line
+  separation. Float/Q1 replay wall times were 2.05/2.26 seconds.

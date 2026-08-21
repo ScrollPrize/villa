@@ -526,6 +526,24 @@ volume-cartographer/build/bin/vc_fiberlets fiberlet-replay \
   --length 4096
 ```
 
+`--lookahead-distance N` is an experimental alternative to `--lookahead` and
+uses base voxels. The two options are mutually exclusive. Distance mode ranks
+every completed candidate over one common physical horizon rather than over a
+fixed number of variable-length fiberlets. Complete edges contribute their
+full stored cost. If the horizon cuts the last edge, every component of that
+edge's active graph cost view is multiplied by the included-length fraction;
+the incoming join remains full. Thus compact `uint8`/`uint16` scenarios scale
+their decoded authoritative scalar, not the underlying float total. Near the
+selected reference end the common horizon shortens to the remaining reference
+arc. Incomplete routes are not pruned at unequal lengths; completed routes are
+ordered canonically by density, total, and logical arc sequence. The mode fails
+explicitly if its bounded experimental route-state limit is exceeded.
+
+The distance option is replay state only. It is absent from anchor/fiberlet
+cache fingerprints, extraction settings, and serialized chunk payloads. A new
+horizon can request previously untouched on-demand chunks, but a fully hot
+cache is reopened without rewriting it.
+
 The default cache roots are `<output>/cache/anchors.zarr` and
 `<output>/cache/fiberlets.zarr`. Override them independently with
 `--anchor-cache PATH` and `--fiberlet-cache PATH`. `--cache-gib` is one shared
@@ -1200,6 +1218,52 @@ never passed to anchor extraction or DP. The selected cost precision remains
 the `cost_bits` field in each output row. `geometry_cache_cost_tag_bits` reports
 the internal compatibility tag. Storage chunk side remains part of both the
 physical cache layout and its identity.
+
+Each comparison writes complete baseline and scenario graph-replay JSON files
+under `OUTPUT/quantization-replays/<interval-hash>/`. It also prints one
+`fiberlet_quantization_failure_window` row per failure. That row gives the
+exact segment reset arc, the length through the complete failure-containing
+fiberlet, and the original graph seed key. A single failure can then be rerun
+without tracing the full reference fiber:
+
+```bash
+vc_fiberlets quantization-benchmark FIBER_MANIFEST FIBER_JSON OUTPUT --normal-manifest NORMAL_MANIFEST --radius 768 --threads 32 --scenario position_q1_compact_axis --arc ARC --length LENGTH --seed-key Z,Y,X,V
+```
+
+The same directory contains `route-cost-statistics-<scenario>.json`. Its
+`baseline_all` and `scenario_all` objects summarize only fiberlets actually
+committed by replay, not overlapping beam-lookahead candidates. Each objective
+term and the edge/transition/combined losses are divided by the committed
+edge's prediction-voxel path length before reporting count, sum, minimum, mean,
+median, and maximum. Raw per-fiberlet totals are deliberately omitted because
+route ranking normalizes unequal-length candidates. The artifact retains only
+aggregate total route loss, prediction-voxel path length, and their
+length-weighted whole-route density. `baseline_away_from_failures` and
+`scenario_away_from_failures`
+exclude any committed fiberlet whose covered reference-arc interval is within
+128 base voxels of a baseline failure. The same baseline windows filter both
+runs so their regions are comparable. The interval test is inclusive. Repeated
+commitments are counted as separate route occurrences, and each entry owns its
+edge cost plus only the incoming join from the preceding edge in that replay
+segment. Change the distance with `--route-stats-failure-margin N`.
+
+`--arc` and `--length` are base-volume arc lengths. `--seed-key` is the
+diagnostic anchor identity printed by the full run; it makes a later segment
+exact even though the full replay excludes graph nodes consumed by earlier
+segments. Focused diagnostics reopen the completed full-corridor cache identity
+but disable its schedule prefetch. The graph therefore loads, or generates when
+missing, only chunks reached by seed selection and the completed beam route.
+
+Focused replay JSON includes each decision's final ranked beam frontier. Every
+route records logical fiberlet IDs, route points in base coordinates, edge and
+transition cost components, path length, total loss, and loss per prediction
+voxel. Distance-mode routes additionally record one included fraction per arc;
+their final diagnostic polyline is clipped at the scored fraction. A sibling
+`decision-comparison-<scenario>.json` reports the first
+selected-route difference, cross-ranks each run's choice in the other run when
+that route exists, and reports the maximum symmetric distance between paired
+selected route geometries. This distinguishes a disproportionate scoring bug
+from a small cost change that flips an already near-tied discrete decision.
 
 The `fiberlet_cached_quantization` row is machine-readable. It reports the
 explicit position/direction/cost settings, failure counts, completed fractions,

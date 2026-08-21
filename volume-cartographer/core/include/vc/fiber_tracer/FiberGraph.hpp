@@ -55,11 +55,14 @@ struct FiberletGraph {
 struct FiberletGraphReplayConfig {
     size_t beamWidth = 16;
     size_t lookaheadEdges = 3;
+    std::optional<double> lookaheadDistanceBaseVoxels;
     double errorThresholdBaseVoxels = 20.0;
     double matchRefineSteps = 1.0;
     double minimumResetAdvanceBaseVoxels = 1.0;
     double referenceBeginArcBase = 0.0;
     std::optional<double> referenceEndArcBase;
+    std::optional<FiberletStorageKey> initialSeedKey;
+    bool recordDecisionDiagnostics = false;
 };
 
 struct FiberletGraphReplayMatch {
@@ -96,6 +99,37 @@ struct FiberletGraphReplayCost {
     }
 };
 
+struct FiberletGraphReplayDecisionRoute {
+    std::vector<DirectedFiberletStorageId> logicalArcs;
+    std::vector<double> includedArcFractions;
+    std::vector<cv::Vec3d> routePointsBaseXYZ;
+    FiberletGraphReplayCost edgeCost;
+    FiberletGraphReplayCost transitionCost;
+    FiberletGraphReplayCost committedEdgeCost;
+    FiberletGraphReplayCost committedTransitionCost;
+    double committedPathLengthPredictionVoxels = 0.0;
+    double pathLengthPredictionVoxels = 0.0;
+    double totalLoss = 0.0;
+    double lossPerPredictionVoxel = 0.0;
+};
+
+struct FiberletGraphReplayDecision {
+    size_t routePointIndex = 0;
+    double referenceArcBase = 0.0;
+    FiberletStorageKey sourceKey;
+    std::optional<DirectedFiberletStorageId> incomingLogicalArc;
+    std::optional<size_t> selectedRouteIndex;
+    std::vector<FiberletGraphReplayDecisionRoute> routes;
+};
+
+struct FiberletGraphReplayCommittedStep {
+    double referenceBeginArcBase = 0.0;
+    double referenceEndArcBase = 0.0;
+    FiberletGraphReplayCost edgeCost;
+    FiberletGraphReplayCost transitionCost;
+    double pathLengthPredictionVoxels = 0.0;
+};
+
 struct FiberletGraphReplaySegment {
     double startReferenceArcBase = 0.0;
     double endReferenceArcBase = 0.0;
@@ -105,6 +139,9 @@ struct FiberletGraphReplaySegment {
     std::vector<size_t> arcIndices;
     std::vector<size_t> transitionIndices;
     std::optional<size_t> stopNodeIndex;
+    std::optional<FiberletStorageKey> seedKey;
+    std::vector<FiberletGraphReplayDecision> decisions;
+    std::vector<FiberletGraphReplayCommittedStep> committedSteps;
     bool terminalPartialEdge = false;
     std::vector<FiberletGraphReplayMatch> matches;
     double totalLoss = 0.0;
@@ -114,11 +151,22 @@ struct FiberletGraphReplaySegment {
 };
 
 struct FiberletGraphReplayResult {
+    double predictionToBaseScale = 1.0;
     double referenceBeginArcBase = 0.0;
     double referenceEndArcBase = 0.0;
     double completedReferenceArcBase = 0.0;
     std::vector<FiberletGraphReplaySegment> segments;
     std::vector<FiberReplayFailure> failures;
+};
+
+struct FiberletGraphReplayFailureWindow {
+    size_t failureIndex = 0;
+    size_t segmentIndex = 0;
+    std::string reason;
+    double failureReferenceArcBase = 0.0;
+    double replayBeginArcBase = 0.0;
+    double replayEndArcBase = 0.0;
+    std::optional<FiberletStorageKey> seedKey;
 };
 
 struct FiberletGraphReplayProgress {
@@ -214,5 +262,8 @@ public:
 [[nodiscard]] std::string fiberletGraphReplayObj(const FiberletGraphReplayResult& replay);
 
 [[nodiscard]] nlohmann::json fiberletGraphReplayJson(const FiberletGraphReplayResult& replay, const FiberletGraphReplayConfig& config);
+
+[[nodiscard]] std::vector<FiberletGraphReplayFailureWindow>
+fiberletGraphReplayFailureWindows(const FiberletGraphReplayResult& replay);
 
 }  // namespace vc::fiber_tracer

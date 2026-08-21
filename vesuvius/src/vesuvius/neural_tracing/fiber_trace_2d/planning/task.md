@@ -1,18 +1,21 @@
-# Task: share canonical anchors across fiberlet quantization
+# Task: persistent equal-arc fiberlet beam search
 
-Extract, fit, filter, and persist canonical float anchors once. Every position
-or fitted-direction quantization scenario must reuse that anchor dataset and
-derive its endpoint view without rerunning anchor extraction. Only fiberlet
-candidate generation, sampling, DP, routes, and prefixes remain specific to a
-position/direction geometry scenario.
+Replace fiberlet replay's per-fiberlet collapse to one locally selected route
+with a persistent beam of up to 16 route histories. Beam comparison and pruning
+must use absolute traveled arc length from the original seed of the current
+uninterrupted trace segment.
 
-Preserve strict cache identity and reuse of existing fiberlet caches. Validate
-the float-position plus compact-direction plus float-cost scenario and the Q4
-position plus float-direction plus float-cost scenario.
+Use separate base-voxel distances for the beam-front step and lookahead. At one
+iteration, a beam may finish zero, one, or multiple fiberlets depending on its
+current sub-fiberlet position and the lengths of the following fiberlets. Beam
+fronts and lookahead endpoints may therefore lie inside fiberlets.
 
-Add and validate float-position plus compact-direction scenarios with `uint8`
-and `uint16` replay costs. Both must reuse the existing compact-axis geometry
-cache namespace rather than create cost-specific geometry. Because that cache
-is populated on demand, computing a stable per-owner cost range may complete
-missing compact-axis chunks in place. Run both over the full radius-768
-corridor.
+Before pruning, every candidate must cover the same total distance from the
+segment seed, including the same lookahead distance. Keep the best 16 beam
+prefixes instead of selecting one fiberlet and restarting the search. Select a
+single route only when the uninterrupted trace terminates or fails and is
+reseeded.
+
+Preserve the existing on-demand anchor/fiberlet caches and active float or
+quantized graph cost view. This search change must not regenerate cache data or
+change cache identity.
