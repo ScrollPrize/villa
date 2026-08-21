@@ -1,21 +1,28 @@
-# Task: persistent equal-arc fiberlet beam search
+# Task: exact cost-bounded fiberlet lookahead
 
-Replace fiberlet replay's per-fiberlet collapse to one locally selected route
-with a persistent beam of up to 16 route histories. Beam comparison and pruning
-must use absolute traveled arc length from the original seed of the current
-uninterrupted trace segment.
+Replace exhaustive whole-fiberlet lookahead enumeration with an exact
+uniform-cost lookahead search.
 
-Use separate base-voxel distances for the beam-front step and lookahead. At one
-iteration, a beam may finish zero, one, or multiple fiberlets depending on its
-current sub-fiberlet position and the lengths of the following fiberlets. Beam
-fronts and lookahead endpoints may therefore lie inside fiberlets.
+At checkpoint `C`, every candidate is scored over the exact common interval
+ending at `C+H`. The route state retains the complete fiberlet crossing the
+horizon, but only the fraction of that fiberlet inside the interval contributes
+path cost. Its entering join contributes fully. Candidate scoring must not
+penalize geometry beyond the horizon.
 
-Before pruning, every candidate must cover the same total distance from the
-segment seed, including the same lookahead distance. Keep the best 16 beam
-prefixes instead of selecting one fiberlet and restarting the search. Select a
-single route only when the uninterrupted trace terminates or fails and is
-reseeded.
+Search partial routes in nondecreasing accumulated nonnegative cost. Maintain
+the best completed continuation for each distinct whole-fiberlet prefix through
+`C+D`. Once 16 distinct prefixes have completions, reject or leave unexpanded
+only partial routes whose admissible cost lower bound is strictly worse than
+the current 16th completion. Preserve valid joins, cycle rejection,
+deterministic tie ordering, whole-fiberlet commitment, failure/reseed behavior,
+active float or quantized costs, cache behavior, and cache identities.
 
-Preserve the existing on-demand anchor/fiberlet caches and active float or
-quantized graph cost view. This search change must not regenerate cache data or
-change cache identity.
+Record two alternatives for later comparison without implementing them now:
+
+- approximate speculative-beam pruning at equal 48-base-voxel fronts;
+- a stronger A* heuristic based on a relaxed minimum future-cost problem.
+
+The interrupted exhaustive full-fiber run reached 94.4% without a search error
+but did not publish a partial result. Validate the exact search first on focused
+fixtures and the completed 600-base-voxel radius-768 interval, then retry the
+full fiber only if those results are correct and practical.

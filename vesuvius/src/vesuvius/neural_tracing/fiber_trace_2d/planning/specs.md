@@ -3029,7 +3029,9 @@
   strict VC3D fiber JSON, required regular-normal Lasagna manifest, and output
   directory. All spatial arguments and artifacts use base-volume XYZ/base
   voxels. Defaults are `--fail 20`, `--radius 64`, `--match-refine 1`,
-  `--beam 16`, `--lookahead 3`, and `--batch 65536` native coordinates.
+  `--beam 16`, `--lookahead-distance 192`, and `--batch 65536` native
+  coordinates. The beam-front step defaults to one quarter of the lookahead,
+  48 base voxels, and is overridden by `--beam-step-distance`.
 - The evaluated interval begins at the first control point's dense-line arc and
   ends at the final dense reference point by default. Replay-only `--length N`
   selects at most `N` positive finite base voxels from that point and clamps an
@@ -3080,8 +3082,9 @@
   transition scoring consume those records directly; replay must not resample
   source volumes or reconstruct endpoint scoring geometry.
   Route payloads and full polyline reconstruction are requested only for the
-  edge selected for commitment, not for lookahead candidates. Cache eviction
-  and reload therefore cannot invalidate graph identity or alter tie order.
+  current provisional best history during reference-error evaluation and for
+  final output, never for lookahead alternatives. Cache eviction and reload
+  therefore cannot invalidate graph identity or alter tie order.
   Committed route reconstruction applies the same adjacent-point epsilon
   suppression as eager DP finalization. For the same extracted graph, cold and
   warm float-cache replay artifacts must be byte-identical to eager replay.
@@ -3099,36 +3102,40 @@
   atomically published completion marker binds both payload hashes. Empty
   completed chunks are explicit valid payloads.
 - Greedy replay uses the regular native one-way candidate generation,
-  prediction loss, Lasagna-normal curvature, and validity rules, forcing beam
-  width/lookahead to one. Graph replay uses deterministic receding-horizon beam
-  search over the complete immutable graph with the shared edge/join objective.
+  prediction loss, Lasagna-normal curvature, and validity rules. Graph replay
+  uses a deterministic persistent beam over the complete immutable graph with
+  the shared edge/join objective.
   The greedy evaluator and on-demand graph evaluator run concurrently;
   neither evaluator changes the other one's state.
-- Graph replay optionally accepts a finite positive fixed lookahead distance in
-  base voxels instead of a fixed fiberlet count. The two modes are mutually
-  exclusive at the CLI and fixed-edge mode retains its existing arithmetic and
-  pruning. For each decision, distance mode uses
-  `min(requested_distance, remaining_selected_reference_arc)` and converts that
-  common base distance through the graph's prediction-to-base scale for the
-  prediction-voxel density denominator.
-- Fixed-distance replay enumerates acyclic routes to the common horizon in
-  canonical outgoing-arc order; it must not prune incomplete candidates at
-  unequal accumulated lengths. Completed candidates sort by density, raw loss,
-  and logical arc sequence. The configured beam width limits retained
-  diagnostic routes after global selection. Exceeding the deterministic
-  experimental route-state bound is an explicit error, never a fallback to
-  unequal-distance comparison. A route that exhausts the graph before the
-  horizon is excluded; if all routes do, normal graph exhaustion applies.
-- Every fully covered edge and entering join contributes its complete active
-  graph-view cost. When the horizon lies inside the final edge, that edge's
-  authoritative component vector is multiplied by
-  `remaining_length / edge_length`, while its entering join remains complete.
-  An exact-boundary edge is complete and the next join is excluded. Compact
-  cost views expose the decoded scalar as their authoritative component, so
-  proportional scoring cannot silently recover the float cost. Diagnostic
-  route geometry is clipped to the same final-edge fraction. This uniform-cost
-  approximation remains explicit until sub-fiberlet cost segments exist.
-- Lookahead distance is replay-only metadata. It must not affect anchor or
+- Graph replay has separate finite positive beam-front and lookahead distances
+  in base voxels. It keeps up to 16 complete route histories and a shared
+  logical checkpoint `C` that is no greater than the shortest retained history.
+  At every iteration it expands every history through every valid acyclic graph
+  branch until the candidate reaches or passes `C+H`. The final fiberlet stays
+  whole, so candidates may overshoot the horizon by different small amounts.
+- Completed candidates are ranked globally by complete-route loss per
+  prediction voxel, raw loss, and deterministic logical route IDs. Exactly one
+  global prune retains the best 16 distinct committed prefixes. There is no
+  intermediate per-depth, per-parent, or unequal-distance prune. Parallel
+  expansion must yield the same ranking and output as single-thread expansion.
+- After pruning, `C` advances by `D`. Each winner commits through the complete
+  fiberlet containing the new checkpoint. Depending on its existing overshoot,
+  a beam may add no fiberlet, one fiberlet, or several fiberlets in that step.
+  Its physical endpoint may remain beyond `C`, preserving the invariant
+  `C <= min(committed_history_length)`.
+- Every edge and entering join contributes its complete active graph-view cost;
+  compact-cost replay consumes the decoded authoritative scalar. Only final
+  reference-end or failure materialization may clip display/output geometry
+  inside a fiberlet, without altering beam scores. Exceeding the deterministic
+  per-iteration one-million-state bound is an explicit error. A route that
+  exhausts before the common horizon is excluded; if all routes do, normal
+  graph exhaustion applies.
+- Persistent histories use shared immutable parent records and retain IDs,
+  cumulative costs, path length, incoming transition, and visited-node state,
+  not duplicate route geometry. A reference failure closes the chosen history,
+  resets the segment origin, and reseeds the full population. The reference
+  never removes graph candidates during ranking.
+- Beam-step and lookahead distances are replay-only metadata. They must not affect anchor or
   fiberlet cache identity, corridor selection, generation settings, chunk
   payloads, or prefetch scheduling. On-demand traversal may populate a missing
   chunk, but repeating against a hot cache must not rewrite cache files.

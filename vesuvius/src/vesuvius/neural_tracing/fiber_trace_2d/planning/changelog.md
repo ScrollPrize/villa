@@ -900,13 +900,27 @@
 
 # 2026-08-21: fixed-distance fiberlet lookahead experiment
 
-- Added mutually exclusive base-voxel `--lookahead-distance` graph replay with
-  equal-horizon route ranking, proportional active-cost scoring and clipped
-  geometry for a partial final fiberlet, full entering-join ownership, and
-  selected-end horizon shortening. The default fixed-three-edge path is
-  unchanged.
+- Added an initial local base-voxel lookahead experiment with proportional
+  active-cost scoring and clipped final-fiberlet geometry. It was not shipped
+  and has now been replaced by the persistent search below.
 - On the focused Q1 failure section, 192 base voxels approximates the measured
   three-edge median (189.1 base voxels). A hot-cache float/Q1 comparison
   completed with zero failures in both runs, no committed first-edge
   divergence, and 0.443/0.305/3.689 base-voxel mean/median/maximum line
   separation. Float/Q1 replay wall times were 2.05/2.26 seconds.
+
+# 2026-08-21: rolling whole-fiberlet beam search
+
+- Replaced both unpublished local lookahead implementations with one persistent
+  beam of up to 16 whole-fiberlet histories from each uninterrupted segment
+  seed.
+- Added a shared logical checkpoint, 192-base-voxel lookahead, and default
+  48-base-voxel checkpoint advance. Every retained history expands through all
+  valid branches to the common logical horizon; the final edge remains whole.
+- Added one deterministic global top-16 prune, whole-fiberlet commitment through
+  the next checkpoint, shared immutable parent histories, explicit state bounds,
+  clipped final-output materialization, and decision diagnostics.
+- Parallelized independent retained-beam expansion under the existing
+  `--threads` setting. The focused 600-base-voxel radius-768 hot-cache replay
+  fell from 17.30 to 6.97 seconds while preserving the same failure and distance
+  results.

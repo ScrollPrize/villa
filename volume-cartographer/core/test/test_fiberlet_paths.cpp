@@ -1438,7 +1438,8 @@ TEST_CASE("fiberlet graph replay scores joins with the shared local metric")
 
     vc::fiber_tracer::FiberletGraphReplayConfig config;
     config.beamWidth = 4;
-    config.lookaheadEdges = 2;
+    config.beamStepDistanceBaseVoxels = 1.0;
+    config.lookaheadDistanceBaseVoxels = 2.0;
     config.errorThresholdBaseVoxels = 2.0;
     std::vector<vc::fiber_tracer::FiberletGraphReplayProgress> replayProgress;
     const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(
@@ -1477,8 +1478,10 @@ TEST_CASE("fiberlet graph replay lookahead avoids the greedy dead-end cost")
     const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
     vc::fiber_tracer::FiberletGraphReplayConfig config;
     config.beamWidth = 4;
-    config.lookaheadEdges = 2;
+    config.beamStepDistanceBaseVoxels = 1.0;
+    config.lookaheadDistanceBaseVoxels = 2.0;
     config.errorThresholdBaseVoxels = 0.5;
+    config.recordDecisionDiagnostics = true;
     const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(
         graph, {{0, 0, 0}, {2, 0, 0}}, replayNormals(), 1.0, config);
 
@@ -1489,78 +1492,75 @@ TEST_CASE("fiberlet graph replay lookahead avoids the greedy dead-end cost")
     CHECK(replay.failures.empty());
 }
 
-TEST_CASE("fiberlet graph distance lookahead compares a common physical arc")
+TEST_CASE("exact fiberlet lookahead scores terminal edges at the horizon")
 {
     auto report = graphPathReport();
-    report.grid.predictionToBaseScale = 2.0;
-    addGraphPath(report, 0, 1, {{0, 0, 0}, {1, 0, 0}}, 0.0);
-    addGraphPath(report, 1, 2, {{1, 0, 0}, {4, 0.5, 0}}, 12.0);
-    report.candidates.back().cost.alignment = 3.0F;
-    report.candidates.back().cost.tangentSmoothness = 6.0F;
-    report.candidates.back().cost.normalSmoothness = 3.0F;
-    addGraphPath(report, 0, 3, {{0, 0, 0}, {2, 0, 0}}, 3.0);
-    addGraphPath(report, 3, 4, {{2, 0, 0}, {3, 0, 0}}, 3.0);
+    addGraphPath(report, 0, 10, {{0, 0, 0}, {5, 0, 0}}, 5.0);
+    addGraphPath(report, 10, 11, {{5, 0, 0}, {10, 0, 0}}, 5.0);
+    addGraphPath(report, 0, 1, {{0, 0, 0}, {3, 0.1, 0}}, 2.0);
+    addGraphPath(report, 1, 2, {{3, 0.1, 0}, {6, 0.1, 0}}, 2.0);
+    addGraphPath(report, 2, 3, {{6, 0.1, 0}, {9, 0.1, 0}}, 2.0);
     const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
 
     vc::fiber_tracer::FiberletGraphReplayConfig config;
-    config.beamWidth = 8;
-    config.lookaheadDistanceBaseVoxels = 6.0;
+    config.beamWidth = 16;
+    config.beamStepDistanceBaseVoxels = 2.0;
+    config.lookaheadDistanceBaseVoxels = 4.0;
     config.errorThresholdBaseVoxels = 100.0;
-    config.referenceEndArcBase = 6.0;
+    config.referenceEndArcBase = 8.0;
     config.recordDecisionDiagnostics = true;
     const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(
-        graph, {{0, 0, 0}, {8, 0, 0}}, replayYNormals(), 1.0, config);
+        graph, {{0, 0, 0}, {10, 0, 0}}, replayYNormals(), 1.0, config);
 
-    REQUIRE(replay.segments.size() == 1);
+    REQUIRE_FALSE(replay.segments.empty());
     REQUIRE_FALSE(replay.segments.front().decisions.empty());
     const auto& decision = replay.segments.front().decisions.front();
+    CHECK(decision.checkpointPathLengthPredictionVoxels ==
+          doctest::Approx(0.0));
+    CHECK(decision.nextCheckpointPathLengthPredictionVoxels ==
+          doctest::Approx(2.0));
+    CHECK(decision.scoringHorizonPathLengthPredictionVoxels ==
+          doctest::Approx(4.0));
+    CHECK(decision.evaluatedCandidateCount == 2);
+    CHECK(decision.retainedBeamCount == 2);
     REQUIRE(decision.routes.size() == 2);
+    std::vector<double> completeCandidateLengths;
+    for (const auto& route : decision.routes)
+        completeCandidateLengths.push_back(
+            route.completePathLengthPredictionVoxels);
+    std::sort(completeCandidateLengths.begin(),
+        completeCandidateLengths.end());
+    CHECK(completeCandidateLengths[0] == doctest::Approx(5.0));
+    CHECK(completeCandidateLengths[1] ==
+          doctest::Approx(std::sqrt(9.01) + 3.0));
     for (const auto& route : decision.routes) {
-        CHECK(route.pathLengthPredictionVoxels == doctest::Approx(3.0));
-        CHECK(route.lossPerPredictionVoxel ==
-              doctest::Approx(route.totalLoss / 3.0));
+        CHECK(route.pathLengthPredictionVoxels ==
+              doctest::Approx(
+                  decision.scoringHorizonPathLengthPredictionVoxels));
+        CHECK(route.completePathLengthPredictionVoxels >=
+              route.pathLengthPredictionVoxels);
+        CHECK(route.committedPathLengthPredictionVoxels >=
+              decision.nextCheckpointPathLengthPredictionVoxels);
+        CHECK(route.lossPerPredictionVoxel == doctest::Approx(
+                  route.totalLoss / route.pathLengthPredictionVoxels));
     }
-    const auto partial = std::find_if(
-        decision.routes.begin(), decision.routes.end(), [](const auto& route) {
-            return route.edgeCost.tangentSmoothness > 0.0 &&
-                !route.includedArcFractions.empty() &&
-                route.includedArcFractions.back() < 1.0 - 1.0e-9;
-        });
-    REQUIRE(partial != decision.routes.end());
-    REQUIRE(partial->includedArcFractions.size() == 2);
-    const double fraction = partial->includedArcFractions.back();
-    CHECK(partial->edgeCost.alignment == doctest::Approx(3.0 * fraction));
-    CHECK(partial->edgeCost.tangentSmoothness ==
-          doctest::Approx(6.0 * fraction));
-    CHECK(partial->edgeCost.normalSmoothness ==
-          doctest::Approx(3.0 * fraction));
-    CHECK(partial->edgeCost.total() ==
-          doctest::Approx(12.0 * fraction));
-    CHECK(partial->transitionCost.total() > 0.0);
-    REQUIRE_FALSE(partial->routePointsBaseXYZ.empty());
-    CHECK(partial->routePointsBaseXYZ.back()[0] < 8.0);
+    CHECK(decision.routes.front().lossPerPredictionVoxel <
+          decision.routes.back().lossPerPredictionVoxel);
 
-    REQUIRE(decision.selectedRouteIndex.has_value());
-    const auto& selected =
-        decision.routes.at(*decision.selectedRouteIndex);
-    CHECK(selected.includedArcFractions == std::vector<double>{1.0, 1.0});
     const auto json =
         vc::fiber_tracer::fiberletGraphReplayJson(replay, config);
-    CHECK(json.at("config").at("lookahead_mode") == "distance");
-    CHECK(json.at("config").at("lookahead_edges").is_null());
-    CHECK(json.at("config").at("lookahead_distance_base_voxels") ==
-          doctest::Approx(6.0));
-    CHECK(json.at("config").at("lookahead_distance_prediction_voxels") ==
-          doctest::Approx(3.0));
+    CHECK(json.at("config").at("lookahead_mode") ==
+          "exact_cost_bounded");
 }
 
-TEST_CASE("fiberlet graph distance lookahead shortens at the selected end")
+TEST_CASE("rolling fiberlet beam clips selected output inside a full search edge")
 {
     auto report = graphPathReport();
-    report.grid.predictionToBaseScale = 2.0;
-    addGraphPath(report, 0, 1, {{0, 0, 0}, {4, 0, 0}}, 8.0);
+    addGraphPath(report, 0, 1,
+        {{0, 0, 0}, {4, 0, 0}, {8, 0, 0}}, 8.0);
     const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
     vc::fiber_tracer::FiberletGraphReplayConfig config;
+    config.beamStepDistanceBaseVoxels = 1.0;
     config.lookaheadDistanceBaseVoxels = 6.0;
     config.errorThresholdBaseVoxels = 100.0;
     config.referenceEndArcBase = 2.0;
@@ -1569,14 +1569,273 @@ TEST_CASE("fiberlet graph distance lookahead shortens at the selected end")
     const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(
         graph, {{0, 0, 0}, {8, 0, 0}}, replayYNormals(), 1.0, config);
     REQUIRE(replay.failures.empty());
-    REQUIRE(replay.segments.size() == 1);
-    CHECK(replay.segments.front().terminationReason == "reference_end");
-    REQUIRE(replay.segments.front().decisions.size() == 1);
-    const auto& route = replay.segments.front().decisions.front().routes.front();
-    CHECK(route.pathLengthPredictionVoxels == doctest::Approx(1.0));
+    REQUIRE_FALSE(replay.segments.empty());
+    const auto& segment = replay.segments.front();
+    CHECK(segment.terminationReason == "reference_end");
+    CHECK(segment.terminalPartialEdge);
+    CHECK(segment.pathLengthPredictionVoxels == doctest::Approx(2.0));
+    CHECK(segment.edgeCost.total() == doctest::Approx(2.0));
+    REQUIRE_FALSE(segment.routePointsBaseXYZ.empty());
+    CHECK(segment.routePointsBaseXYZ.back()[0] == doctest::Approx(2.0));
+    REQUIRE(segment.decisions.size() == 1);
+    const auto& route = segment.decisions.back().routes.front();
+    CHECK(route.pathLengthPredictionVoxels == doctest::Approx(2.0));
+    CHECK(route.completePathLengthPredictionVoxels == doctest::Approx(8.0));
     CHECK(route.edgeCost.total() == doctest::Approx(2.0));
-    REQUIRE(route.includedArcFractions.size() == 1);
-    CHECK(route.includedArcFractions.front() == doctest::Approx(0.25));
+    CHECK(route.committedPathLengthPredictionVoxels ==
+          doctest::Approx(8.0));
+}
+
+TEST_CASE("exact fiberlet lookahead does not charge a join at its boundary")
+{
+    auto report = graphPathReport();
+    addGraphPath(report, 0, 1, {{0, 0, 0}, {2, 0, 0}}, 2.0);
+    addGraphPath(report, 1, 2, {{2, 0, 0}, {4, 0.2, 0}}, 100.0);
+    const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
+
+    vc::fiber_tracer::FiberletGraphReplayConfig config;
+    config.beamWidth = 16;
+    config.beamStepDistanceBaseVoxels = 1.0;
+    config.lookaheadDistanceBaseVoxels = 2.0;
+    config.errorThresholdBaseVoxels = 100.0;
+    config.referenceEndArcBase = 2.0;
+    config.recordDecisionDiagnostics = true;
+    const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(
+        graph, {{0, 0, 0}, {4, 0, 0}}, replayYNormals(), 1.0, config);
+
+    REQUIRE_FALSE(replay.segments.empty());
+    REQUIRE_FALSE(replay.segments.front().decisions.empty());
+    const auto& route = replay.segments.front().decisions.front().routes.front();
+    CHECK(route.pathLengthPredictionVoxels == doctest::Approx(2.0));
+    CHECK(route.completePathLengthPredictionVoxels == doctest::Approx(2.0));
+    CHECK(route.edgeCost.total() == doctest::Approx(2.0));
+    CHECK(route.transitionCost.total() == doctest::Approx(0.0));
+    CHECK(route.totalLoss == doctest::Approx(2.0));
+}
+
+TEST_CASE("exact fiberlet lookahead rejects invalid active costs")
+{
+    auto report = graphPathReport();
+    addGraphPath(report, 0, 1, {{0, 0, 0}, {1, 0, 0}}, 1.0);
+    addGraphPath(report, 1, 2, {{1, 0, 0}, {2, 0, 0}}, 1.0);
+    auto graph = vc::fiber_tracer::buildFiberletGraph(report);
+    vc::fiber_tracer::FiberletGraphReplayConfig config;
+    config.beamStepDistanceBaseVoxels = 1.0;
+    config.lookaheadDistanceBaseVoxels = 2.0;
+    config.errorThresholdBaseVoxels = 100.0;
+    config.referenceEndArcBase = 2.0;
+
+    graph.edges.front().cost.alignment = -1.0F;
+    CHECK_THROWS_AS(
+        vc::fiber_tracer::traceFiberletGraphReplay(
+            graph, {{0, 0, 0}, {2, 0, 0}}, replayYNormals(), 1.0,
+            config),
+        std::invalid_argument);
+    graph.edges.front().cost.alignment = 1.0F;
+    REQUIRE_FALSE(graph.transitions.empty());
+    graph.transitions.front().cost.alignment =
+        std::numeric_limits<float>::infinity();
+    CHECK_THROWS_AS(
+        vc::fiber_tracer::traceFiberletGraphReplay(
+            graph, {{0, 0, 0}, {2, 0, 0}}, replayYNormals(), 1.0,
+            config),
+        std::invalid_argument);
+}
+
+TEST_CASE("rolling fiberlet beam commits through the checkpoint fiberlet")
+{
+    auto report = graphPathReport();
+    addGraphPath(report, 0, 10, {{0, 0, 0}, {10, 0, 0}}, 3.0);
+    addGraphPath(report, 0, 1, {{0, 0, 0}, {2, 0.1, 0}}, 1.0);
+    addGraphPath(report, 1, 11, {{2, 0.1, 0}, {12, 0.1, 0}}, 4.0);
+    addGraphPath(report, 0, 2, {{0, 0, 0}, {1, -0.1, 0}}, 0.5);
+    addGraphPath(report, 2, 3, {{1, -0.1, 0}, {2, -0.1, 0}}, 0.5);
+    addGraphPath(report, 3, 12, {{2, -0.1, 0}, {12, -0.1, 0}}, 5.0);
+    const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
+
+    vc::fiber_tracer::FiberletGraphReplayConfig config;
+    config.beamWidth = 16;
+    config.beamStepDistanceBaseVoxels = 3.0;
+    config.lookaheadDistanceBaseVoxels = 4.0;
+    config.errorThresholdBaseVoxels = 100.0;
+    config.referenceEndArcBase = 20.0;
+    config.recordDecisionDiagnostics = true;
+    const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(
+        graph, {{0, 0, 0}, {20, 0, 0}}, replayYNormals(), 1.0, config);
+
+    REQUIRE_FALSE(replay.failures.empty());
+    REQUIRE_FALSE(replay.segments.empty());
+    REQUIRE(replay.segments.front().decisions.size() >= 2);
+    const auto& first = replay.segments.front().decisions.front();
+    CHECK(first.checkpointPathLengthPredictionVoxels == doctest::Approx(0.0));
+    CHECK(first.nextCheckpointPathLengthPredictionVoxels ==
+          doctest::Approx(3.0));
+    CHECK(first.scoringHorizonPathLengthPredictionVoxels ==
+          doctest::Approx(4.0));
+    CHECK(first.retainedBeamCount == 3);
+    std::set<size_t> prefixEdgeCounts;
+    for (const auto& route : first.routes) {
+        CHECK(route.committedPathLengthPredictionVoxels >=
+              first.nextCheckpointPathLengthPredictionVoxels);
+        CHECK(route.pathLengthPredictionVoxels >=
+              first.scoringHorizonPathLengthPredictionVoxels);
+        prefixEdgeCounts.insert(route.prefixLogicalArcs.size());
+    }
+    CHECK(prefixEdgeCounts == std::set<size_t>{1, 2, 3});
+    const auto& second = replay.segments.front().decisions[1];
+    CHECK(second.checkpointPathLengthPredictionVoxels ==
+          doctest::Approx(3.0));
+    CHECK(second.nextCheckpointPathLengthPredictionVoxels ==
+          doctest::Approx(6.0));
+    for (const auto& route : second.routes) {
+        CHECK(route.committedPathLengthPredictionVoxels >=
+              second.nextCheckpointPathLengthPredictionVoxels);
+    }
+}
+
+TEST_CASE("persistent fiberlet beam retains an alternative until it wins")
+{
+    auto report = graphPathReport();
+    addGraphPath(report, 0, 1, {{0, 0, 0}, {1, 0.1, 0}}, 0.0);
+    addGraphPath(report, 1, 2, {{1, 0.1, 0}, {2, 0.1, 0}}, 0.0);
+    addGraphPath(report, 2, 3, {{2, 0.1, 0}, {3, 0.1, 0}}, 100.0);
+    addGraphPath(report, 3, 4, {{3, 0.1, 0}, {4, 0.1, 0}}, 0.0);
+    addGraphPath(report, 0, 10, {{0, 0, 0}, {1, -0.1, 0}}, 5.0);
+    addGraphPath(report, 10, 11, {{1, -0.1, 0}, {2, -0.1, 0}}, 0.0);
+    addGraphPath(report, 11, 12, {{2, -0.1, 0}, {3, -0.1, 0}}, 0.0);
+    addGraphPath(report, 12, 13, {{3, -0.1, 0}, {4, -0.1, 0}}, 0.0);
+    const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
+
+    vc::fiber_tracer::FiberletGraphReplayConfig config;
+    config.beamWidth = 16;
+    config.beamStepDistanceBaseVoxels = 1.0;
+    config.lookaheadDistanceBaseVoxels = 1.0;
+    config.errorThresholdBaseVoxels = 100.0;
+    config.referenceEndArcBase = 4.0;
+    config.recordDecisionDiagnostics = true;
+    const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(
+        graph, {{0, 0, 0}, {4, 0, 0}}, replayYNormals(), 1.0, config);
+
+    REQUIRE(replay.failures.empty());
+    REQUIRE(replay.segments.size() == 1);
+    REQUIRE(replay.segments.front().decisions.size() == 4);
+    const auto& first = replay.segments.front().decisions[0];
+    const auto& second = replay.segments.front().decisions[1];
+    REQUIRE(first.routes.size() == 2);
+    REQUIRE(replay.segments.front().decisions.size() >= 3);
+    const auto& third = replay.segments.front().decisions[2];
+    REQUIRE(second.routes.size() == 2);
+    REQUIRE(third.routes.size() == 2);
+    CHECK(first.retainedBeamCount == 2);
+    const vc::fiber_tracer::FiberletStorageKey seedKey{{0, 0, 0}, 0};
+    const vc::fiber_tracer::FiberletStorageKey firstBranchKey{{0, 0, 1}, 0};
+    const vc::fiber_tracer::FiberletStorageKey secondBranchKey{{0, 0, 10}, 0};
+    CHECK(first.routes.front().prefixLogicalArcs.front().fiberlet.first ==
+          seedKey);
+    CHECK(first.routes.front().prefixLogicalArcs.front().fiberlet.second ==
+          firstBranchKey);
+    CHECK(third.routes.front().prefixLogicalArcs.front().fiberlet.second ==
+          secondBranchKey);
+    CHECK(replay.segments.front().candidateIndices.front() == 4);
+}
+
+TEST_CASE("rolling fiberlet beam prunes globally across prior beams")
+{
+    auto report = graphPathReport();
+    addGraphPath(report, 0, 1, {{0, 0, 0}, {1, 0, 0}}, 0.0);
+    addGraphPath(report, 0, 10, {{0, 0, 0}, {1, 0.2, 0}}, 0.5);
+    addGraphPath(report, 1, 2, {{1, 0, 0}, {2, 0, 0}}, 0.0);
+    addGraphPath(report, 1, 3, {{1, 0, 0}, {2, 0.1, 0}}, 0.1);
+    addGraphPath(report, 1, 4, {{1, 0, 0}, {2, -0.1, 0}}, 0.2);
+    addGraphPath(report, 10, 11, {{1, 0.2, 0}, {2, 0.2, 0}}, 10.0);
+    const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
+
+    vc::fiber_tracer::FiberletGraphReplayConfig config;
+    config.beamWidth = 2;
+    config.beamStepDistanceBaseVoxels = 1.0;
+    config.lookaheadDistanceBaseVoxels = 1.0;
+    config.errorThresholdBaseVoxels = 100.0;
+    config.referenceEndArcBase = 2.0;
+    config.recordDecisionDiagnostics = true;
+    const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(
+        graph, {{0, 0, 0}, {2, 0, 0}}, replayYNormals(), 1.0, config);
+
+    REQUIRE_FALSE(replay.segments.empty());
+    REQUIRE(replay.segments.front().decisions.size() == 2);
+    const auto& second = replay.segments.front().decisions[1];
+    REQUIRE(second.routes.size() == 2);
+    const vc::fiber_tracer::FiberletStorageKey firstBranch{{0, 0, 1}, 0};
+    for (const auto& route : second.routes) {
+        REQUIRE(route.prefixLogicalArcs.size() == 2);
+        CHECK(route.prefixLogicalArcs.front().fiberlet.second ==
+              firstBranch);
+    }
+}
+
+TEST_CASE("rolling fiberlet beam counts one slot per committed prefix")
+{
+    auto report = graphPathReport();
+    addGraphPath(report, 0, 1, {{0, 0, 0}, {1, 0, 0}}, 0.0);
+    addGraphPath(report, 1, 2, {{1, 0, 0}, {2, 0, 0}}, 0.0);
+    addGraphPath(report, 1, 3, {{1, 0, 0}, {2, 0.1, 0}}, 0.1);
+    addGraphPath(report, 0, 10, {{0, 0, 0}, {1, 0.2, 0}}, 1.0);
+    addGraphPath(report, 10, 11, {{1, 0.2, 0}, {2, 0.2, 0}}, 1.0);
+    const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
+
+    vc::fiber_tracer::FiberletGraphReplayConfig config;
+    config.beamWidth = 2;
+    config.beamStepDistanceBaseVoxels = 1.0;
+    config.lookaheadDistanceBaseVoxels = 2.0;
+    config.errorThresholdBaseVoxels = 100.0;
+    config.referenceEndArcBase = 2.0;
+    config.recordDecisionDiagnostics = true;
+    const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(
+        graph, {{0, 0, 0}, {2, 0, 0}}, replayYNormals(), 1.0, config);
+
+    REQUIRE_FALSE(replay.segments.empty());
+    REQUIRE_FALSE(replay.segments.front().decisions.empty());
+    const auto& first = replay.segments.front().decisions.front();
+    REQUIRE(first.evaluatedCandidateCount == 3);
+    REQUIRE(first.routes.size() == 2);
+    std::set<vc::fiber_tracer::FiberletStorageKey> committedTargets;
+    for (const auto& route : first.routes) {
+        REQUIRE(route.prefixLogicalArcs.size() == 1);
+        committedTargets.insert(
+            route.prefixLogicalArcs.front().fiberlet.second);
+    }
+    CHECK(committedTargets.size() == 2);
+}
+
+TEST_CASE("rolling fiberlet beam expansion is deterministic across threads")
+{
+    auto report = graphPathReport();
+    addGraphPath(report, 0, 1, {{0, 0, 0}, {1, 0, 0}}, 0.0);
+    addGraphPath(report, 0, 10, {{0, 0, 0}, {1, 0.2, 0}}, 0.5);
+    addGraphPath(report, 1, 2, {{1, 0, 0}, {2, 0, 0}}, 0.0);
+    addGraphPath(report, 1, 3, {{1, 0, 0}, {2, 0.1, 0}}, 0.1);
+    addGraphPath(report, 1, 4, {{1, 0, 0}, {2, -0.1, 0}}, 0.2);
+    addGraphPath(report, 10, 11, {{1, 0.2, 0}, {2, 0.2, 0}}, 10.0);
+    const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
+
+    vc::fiber_tracer::FiberletGraphReplayConfig config;
+    config.beamWidth = 2;
+    config.beamStepDistanceBaseVoxels = 1.0;
+    config.lookaheadDistanceBaseVoxels = 1.0;
+    config.errorThresholdBaseVoxels = 100.0;
+    config.referenceEndArcBase = 2.0;
+    config.recordDecisionDiagnostics = true;
+    config.expansionThreads = 1;
+    const auto serial = vc::fiber_tracer::traceFiberletGraphReplay(
+        graph, {{0, 0, 0}, {2, 0, 0}}, replayYNormals(), 1.0, config);
+    auto serialJson = vc::fiber_tracer::fiberletGraphReplayJson(serial, config);
+
+    config.expansionThreads = 4;
+    const auto parallel = vc::fiber_tracer::traceFiberletGraphReplay(
+        graph, {{0, 0, 0}, {2, 0, 0}}, replayYNormals(), 1.0, config);
+    auto parallelJson =
+        vc::fiber_tracer::fiberletGraphReplayJson(parallel, config);
+    serialJson["config"]["expansion_threads"] = config.expansionThreads;
+    CHECK(serialJson == parallelJson);
 }
 
 TEST_CASE("fiberlet graph distance lookahead rejects an uncovered horizon")
@@ -1585,6 +1844,7 @@ TEST_CASE("fiberlet graph distance lookahead rejects an uncovered horizon")
     addGraphPath(report, 0, 1, {{0, 0, 0}, {1, 0, 0}}, 1.0);
     const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
     vc::fiber_tracer::FiberletGraphReplayConfig config;
+    config.beamStepDistanceBaseVoxels = 1.0;
     config.lookaheadDistanceBaseVoxels = 3.0;
     config.errorThresholdBaseVoxels = 100.0;
     config.referenceEndArcBase = 4.0;
@@ -1598,6 +1858,33 @@ TEST_CASE("fiberlet graph distance lookahead rejects an uncovered horizon")
     CHECK_THROWS_AS(
         vc::fiber_tracer::traceFiberletGraphReplay(
             graph, {{0, 0, 0}, {4, 0, 0}}, replayYNormals(), 1.0, config),
+        std::invalid_argument);
+}
+
+TEST_CASE("persistent fiberlet beam enforces configuration and state bounds")
+{
+    auto report = graphPathReport();
+    addGraphPath(report, 0, 1, {{0, 0, 0}, {2, 0, 0}}, 1.0);
+    addGraphPath(report, 0, 2, {{0, 0, 0}, {2, 0.1, 0}}, 1.0);
+    const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
+    vc::fiber_tracer::FiberletGraphReplayConfig config;
+    config.beamStepDistanceBaseVoxels = 0.5;
+    config.lookaheadDistanceBaseVoxels = 0.5;
+    config.errorThresholdBaseVoxels = 100.0;
+    config.referenceEndArcBase = 1.0;
+    config.maximumGeneratedStatesPerIteration = 1;
+
+    CHECK_THROWS_AS(
+        vc::fiber_tracer::traceFiberletGraphReplay(
+            graph, {{0, 0, 0}, {2, 0, 0}}, replayYNormals(), 1.0,
+            config),
+        std::runtime_error);
+    config.maximumGeneratedStatesPerIteration = 100;
+    config.beamWidth = 17;
+    CHECK_THROWS_AS(
+        vc::fiber_tracer::traceFiberletGraphReplay(
+            graph, {{0, 0, 0}, {2, 0, 0}}, replayYNormals(), 1.0,
+            config),
         std::invalid_argument);
 }
 
@@ -1631,7 +1918,7 @@ TEST_CASE("fiberlet graph replay uses the Lasagna ellipsoid for seeds and route 
           "no_usable_seed_for_remaining_reference");
 }
 
-TEST_CASE("fiberlet graph replay completes a failure edge then records an uncovered tail")
+TEST_CASE("fiberlet graph replay clips a failure edge then records an uncovered tail")
 {
     auto report = graphPathReport();
     addGraphPath(report, 0, 1, {{0, 0, 0}, {1, 0, 0}, {2, 2, 0}}, 3.0);
@@ -1645,8 +1932,10 @@ TEST_CASE("fiberlet graph replay completes a failure edge then records an uncove
     CHECK(replay.segments[0].routePointsBaseXYZ.size() == 3);
     CHECK(replay.segments[0].candidateIndices == std::vector<size_t>{0});
     CHECK(replay.segments[0].arcIndices == std::vector<size_t>{0});
-    CHECK(replay.segments[0].stopNodeIndex == 1);
-    CHECK(replay.segments[0].totalLoss == doctest::Approx(3.0));
+    CHECK_FALSE(replay.segments[0].stopNodeIndex.has_value());
+    CHECK(replay.segments[0].terminalPartialEdge);
+    CHECK(replay.segments[0].totalLoss > 0.0);
+    CHECK(replay.segments[0].totalLoss < 3.0);
     CHECK(replay.segments[0].pathLengthPredictionVoxels > 0.0);
     REQUIRE(replay.segments[0].seedKey.has_value());
     CHECK(replay.segments[0].seedKey->coordinateZYX ==
@@ -1676,20 +1965,17 @@ TEST_CASE("fiberlet graph replay completes a failure edge then records an uncove
     CHECK(json.at("failures").size() == 2);
     const auto& failedMatch =
         json.at("segments").at(0).at("matches").back();
-    CHECK(failedMatch.at("euclidean_error_base_voxels") ==
-          doctest::Approx(2.0));
-    CHECK(failedMatch.at("normal_error_base_voxels") ==
-          doctest::Approx(2.0));
-    CHECK(failedMatch.at("tangential_error_base_voxels") ==
-          doctest::Approx(0.0));
-    CHECK(failedMatch.at("threshold_error_base_voxels") ==
-          doctest::Approx(2.0));
-    CHECK(failedMatch.at("threshold_error_ratio") ==
-          doctest::Approx(4.0));
+    CHECK(failedMatch.at("euclidean_error_base_voxels").get<double>() >
+          config.errorThresholdBaseVoxels);
+    CHECK(failedMatch.at("normal_error_base_voxels").get<double>() >
+          config.errorThresholdBaseVoxels);
+    CHECK(failedMatch.at("threshold_error_base_voxels").get<double>() >
+          config.errorThresholdBaseVoxels);
+    CHECK(failedMatch.at("threshold_error_ratio").get<double>() > 1.0);
     CHECK(failedMatch.at("local_normal_valid") == true);
     CHECK_FALSE(failedMatch.contains("error_base_voxels"));
-    CHECK(json.at("failures").at(0).at("threshold_error_ratio") ==
-          doctest::Approx(4.0));
+    CHECK(json.at("failures").at(0).at("threshold_error_ratio").get<double>() >
+          1.0);
     CHECK(json.at("failures").at(1).at(
               "euclidean_error_base_voxels").is_null());
     const auto windows =
@@ -1828,15 +2114,17 @@ TEST_CASE("fiberlet graph replay reports a boundary failure before completion")
         {{0, 0, 0}, {1, 0, 0}, {2, 2, 0}, {3, 2, 0}}, 3.0);
     const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
     vc::fiber_tracer::FiberletGraphReplayConfig config;
-    config.errorThresholdBaseVoxels = 0.5;
+    config.beamStepDistanceBaseVoxels = 1.0;
+    config.lookaheadDistanceBaseVoxels = 0.25;
+    config.errorThresholdBaseVoxels = 0.4;
     config.referenceEndArcBase = 1.5;
     const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(
         graph, {{0, 0, 0}, {4, 0, 0}}, replayYNormals(), 1.0, config);
 
     REQUIRE_FALSE(replay.failures.empty());
     CHECK(replay.failures.front().reason == "distance_above_threshold");
-    CHECK(replay.failures.front().referenceArcBase == doctest::Approx(1.5));
-    CHECK(replay.failures.front().referenceArcFraction == doctest::Approx(1.0));
+    CHECK(replay.failures.front().referenceArcBase < 1.5);
+    CHECK(replay.failures.front().referenceArcFraction < 1.0);
     REQUIRE_FALSE(replay.segments.empty());
     CHECK(replay.segments.front().routePointsBaseXYZ.size() == 3);
     CHECK(replay.segments.front().terminalPartialEdge);
@@ -1849,6 +2137,8 @@ TEST_CASE("fiberlet graph replay reseeds independently after multiple failures")
     addGraphPath(report, 2, 3, {{3, 0, 0}, {4, 0.6, 0}, {5, 0.6, 0}}, 2.0);
     const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
     vc::fiber_tracer::FiberletGraphReplayConfig config;
+    config.beamStepDistanceBaseVoxels = 1.0;
+    config.lookaheadDistanceBaseVoxels = 0.25;
     config.errorThresholdBaseVoxels = 0.5;
     const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(
         graph, {{0, 0, 0}, {6, 0, 0}}, replayYNormals(), 1.0, config);

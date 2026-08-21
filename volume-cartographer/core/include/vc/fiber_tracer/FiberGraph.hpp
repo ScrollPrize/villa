@@ -54,8 +54,10 @@ struct FiberletGraph {
 
 struct FiberletGraphReplayConfig {
     size_t beamWidth = 16;
-    size_t lookaheadEdges = 3;
-    std::optional<double> lookaheadDistanceBaseVoxels;
+    size_t expansionThreads = 1;
+    double beamStepDistanceBaseVoxels = 48.0;
+    double lookaheadDistanceBaseVoxels = 192.0;
+    size_t maximumGeneratedStatesPerIteration = 1'000'000;
     double errorThresholdBaseVoxels = 20.0;
     double matchRefineSteps = 1.0;
     double minimumResetAdvanceBaseVoxels = 1.0;
@@ -100,8 +102,8 @@ struct FiberletGraphReplayCost {
 };
 
 struct FiberletGraphReplayDecisionRoute {
+    std::vector<DirectedFiberletStorageId> prefixLogicalArcs;
     std::vector<DirectedFiberletStorageId> logicalArcs;
-    std::vector<double> includedArcFractions;
     std::vector<cv::Vec3d> routePointsBaseXYZ;
     FiberletGraphReplayCost edgeCost;
     FiberletGraphReplayCost transitionCost;
@@ -109,6 +111,7 @@ struct FiberletGraphReplayDecisionRoute {
     FiberletGraphReplayCost committedTransitionCost;
     double committedPathLengthPredictionVoxels = 0.0;
     double pathLengthPredictionVoxels = 0.0;
+    double completePathLengthPredictionVoxels = 0.0;
     double totalLoss = 0.0;
     double lossPerPredictionVoxel = 0.0;
 };
@@ -116,6 +119,15 @@ struct FiberletGraphReplayDecisionRoute {
 struct FiberletGraphReplayDecision {
     size_t routePointIndex = 0;
     double referenceArcBase = 0.0;
+    double checkpointPathLengthPredictionVoxels = 0.0;
+    double nextCheckpointPathLengthPredictionVoxels = 0.0;
+    double scoringHorizonPathLengthPredictionVoxels = 0.0;
+    size_t generatedStateCount = 0;
+    size_t expandedStateCount = 0;
+    size_t evaluatedCandidateCount = 0;
+    size_t costPrunedStateCount = 0;
+    size_t rejectedStateCount = 0;
+    size_t retainedBeamCount = 0;
     FiberletStorageKey sourceKey;
     std::optional<DirectedFiberletStorageId> incomingLogicalArc;
     std::optional<size_t> selectedRouteIndex;

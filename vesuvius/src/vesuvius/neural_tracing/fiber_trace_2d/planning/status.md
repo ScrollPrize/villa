@@ -1,14 +1,14 @@
-# Status: persistent equal-arc fiberlet beam search
+# Status: exact cost-bounded fiberlet lookahead
 
-- [x] Capture the corrected task in `task.md`.
-- [x] Draft the implementation, documentation, and validation plan.
+- [x] Capture the corrected task and alternative search candidates.
+- [x] Write the implementation, spec, docs, and validation plan.
 - [x] Complete independent plan review and incorporate findings.
-- [ ] Obtain user agreement on the beam-front and lookahead semantics.
-- [ ] Update specs before implementation.
-- [ ] Implement persistent partial-edge beam state and equal-arc advancement.
-- [ ] Implement lookahead ranking and width-16 retention.
-- [ ] Rework replay output, failure, reset, and diagnostics.
-- [ ] Add focused regression coverage.
-- [ ] Update docs, changelog, and task log.
-- [ ] Build and run tests with `-j32`.
-- [ ] Run focused and whole-fiber float/Q1 comparisons.
+- [x] Correct terminal-edge scoring to the exact horizon.
+- [x] Implement deterministic parallel fixed-prefix exact lookahead, admissible
+  relaxed A* bound, and strict per-prefix cutoff.
+- [ ] Add focused scoring, optimality, pruning, and determinism tests.
+- [ ] Update specs, documentation, and changelog.
+- [ ] Build and run relevant tests with `-j32`.
+- [x] Run the focused radius-768 hot-cache validation.
+- [ ] Complete the full-fiber validation; exact search remains impractical at
+  the dense 95.8% decision.

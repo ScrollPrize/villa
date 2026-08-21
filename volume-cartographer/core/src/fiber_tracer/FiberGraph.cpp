@@ -4,10 +4,15 @@
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <future>
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <memory>
+#include <mutex>
+#include <queue>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -180,18 +185,6 @@ cv::Vec3f sourceArcStartDirection(const FiberletReplaySourceArc& arc)
     return direction;
 }
 
-struct SourceRouteCandidate {
-    std::vector<DirectedFiberletStorageId> arcs;
-    std::vector<DirectedFiberletStorageId> logicalArcs;
-    std::vector<double> includedArcFractions;
-    std::vector<FiberletReplaySourceTransition> transitions;
-    std::set<FiberletStorageKey> visitedNodes;
-    FiberletGraphReplayCost edgeCost;
-    FiberletGraphReplayCost transitionCost;
-    double loss = 0.0;
-    double pathLength = 0.0;
-};
-
 void addScaledCost(
     FiberletGraphReplayCost& target,
     const FiberletPathCost& source,
@@ -208,248 +201,6 @@ void addScaledCost(
         scale * static_cast<double>(source.tangentSmoothness);
     target.normalSmoothness +=
         scale * static_cast<double>(source.normalSmoothness);
-}
-
-void appendRouteArc(
-    SourceRouteCandidate& route,
-    const FiberletReplayGraphSource& graph,
-    const DirectedFiberletStorageId& arcId,
-    const FiberletReplaySourceArc& arc,
-    const std::optional<FiberletReplaySourceTransition>& join,
-    double includedFraction)
-{
-    if (!(arc.pathLengthPredictionVoxels > kFloatEpsilon) ||
-        !std::isfinite(arc.pathLengthPredictionVoxels)) {
-        throw std::invalid_argument(
-            "fiberlet replay source arc has invalid path length");
-    }
-    route.arcs.push_back(arcId);
-    route.logicalArcs.push_back(graph.logicalArcId(arcId));
-    route.includedArcFractions.push_back(includedFraction);
-    route.visitedNodes.insert(arc.target);
-    addScaledCost(route.edgeCost, arc.cost, includedFraction);
-    route.pathLength +=
-        includedFraction * static_cast<double>(arc.pathLengthPredictionVoxels);
-    if (join.has_value()) {
-        route.transitions.push_back(*join);
-        route.transitionCost += join->cost;
-    }
-    route.loss = route.edgeCost.total() + route.transitionCost.total();
-}
-
-double routeDensity(const SourceRouteCandidate& route)
-{
-    return route.pathLength > kReplayEpsilon
-        ? route.loss / route.pathLength
-        : std::numeric_limits<double>::infinity();
-}
-
-bool routeLess(const SourceRouteCandidate& left, const SourceRouteCandidate& right)
-{
-    return std::tuple{routeDensity(left), left.loss, left.logicalArcs} <
-        std::tuple{routeDensity(right), right.loss, right.logicalArcs};
-}
-
-void pruneRoutes(std::vector<SourceRouteCandidate>& routes, size_t beamWidth)
-{
-    std::sort(routes.begin(), routes.end(), [](const auto& left, const auto& right) {
-        return routeLess(left, right);
-    });
-    if (routes.size() > beamWidth)
-        routes.resize(beamWidth);
-}
-
-std::optional<SourceRouteCandidate> bestLookaheadRoute(
-    const FiberletReplayGraphSource& graph,
-    const FiberletStorageKey& currentNode,
-    const std::optional<DirectedFiberletStorageId>& incomingArc,
-    const std::set<FiberletStorageKey>& committedVisitedNodes,
-    size_t beamWidth,
-    size_t lookahead,
-    const std::optional<cv::Vec3d>& initialDirection,
-    std::vector<SourceRouteCandidate>* diagnosticFrontier)
-{
-    std::vector<SourceRouteCandidate> frontier;
-    const auto incomingView = incomingArc.has_value()
-        ? std::make_optional(graph.arc(*incomingArc))
-        : std::nullopt;
-    for (const auto& arcId : graph.outgoing(currentNode)) {
-        const auto arc = graph.arc(arcId);
-        const auto join = incomingView.has_value()
-            ? graph.transition(*incomingView, arc)
-            : std::nullopt;
-        if (incomingArc.has_value() && !join.has_value())
-            continue;
-        if (initialDirection.has_value() &&
-            !(angleDegrees(*initialDirection, sourceArcStartDirection(arc)) <
-              graph.maximumJoinAngleDegrees()))
-            continue;
-        if (committedVisitedNodes.contains(arc.target))
-            continue;
-        SourceRouteCandidate candidate;
-        candidate.arcs.push_back(arcId);
-        candidate.logicalArcs.push_back(graph.logicalArcId(arcId));
-        candidate.includedArcFractions.push_back(1.0);
-        candidate.visitedNodes = committedVisitedNodes;
-        candidate.visitedNodes.insert(arc.target);
-        candidate.edgeCost += arc.cost;
-        candidate.loss = arc.cost.total();
-        candidate.pathLength = arc.pathLengthPredictionVoxels;
-        if (join.has_value()) {
-            candidate.transitions.push_back(*join);
-            candidate.transitionCost += join->cost;
-            candidate.loss += join->cost.total();
-        }
-        frontier.push_back(std::move(candidate));
-    }
-    if (frontier.empty())
-        return std::nullopt;
-    pruneRoutes(frontier, beamWidth);
-    for (size_t depth = 1; depth < lookahead; ++depth) {
-        std::vector<SourceRouteCandidate> expanded;
-        for (const auto& route : frontier) {
-            const auto& tailArc = route.arcs.back();
-            const auto& tailNode = targetAnchor(tailArc);
-            const auto tailView = graph.arc(tailArc);
-            for (const auto& arcId : graph.outgoing(tailNode)) {
-                const auto arc = graph.arc(arcId);
-                const auto join = graph.transition(tailView, arc);
-                if (!join.has_value())
-                    continue;
-                if (route.visitedNodes.contains(arc.target))
-                    continue;
-                SourceRouteCandidate next = route;
-                next.arcs.push_back(arcId);
-                next.logicalArcs.push_back(graph.logicalArcId(arcId));
-                next.includedArcFractions.push_back(1.0);
-                next.transitions.push_back(*join);
-                next.visitedNodes.insert(arc.target);
-                next.edgeCost += arc.cost;
-                next.transitionCost += join->cost;
-                next.loss += arc.cost.total() + join->cost.total();
-                next.pathLength += arc.pathLengthPredictionVoxels;
-                expanded.push_back(std::move(next));
-            }
-        }
-        if (expanded.empty())
-            break;
-        pruneRoutes(expanded, beamWidth);
-        frontier = std::move(expanded);
-    }
-    pruneRoutes(frontier, beamWidth);
-    if (diagnosticFrontier != nullptr)
-        *diagnosticFrontier = frontier;
-    return frontier.front();
-}
-
-std::optional<SourceRouteCandidate> bestDistanceLookaheadRoute(
-    const FiberletReplayGraphSource& graph,
-    const FiberletStorageKey& currentNode,
-    const std::optional<DirectedFiberletStorageId>& incomingArc,
-    const std::set<FiberletStorageKey>& committedVisitedNodes,
-    size_t diagnosticRouteLimit,
-    double targetLengthPredictionVoxels,
-    const std::optional<cv::Vec3d>& initialDirection,
-    std::vector<SourceRouteCandidate>* diagnosticFrontier)
-{
-    constexpr size_t kMaximumGeneratedRoutes = 1'000'000;
-    if (!(targetLengthPredictionVoxels > kReplayEpsilon) ||
-        !std::isfinite(targetLengthPredictionVoxels)) {
-        throw std::invalid_argument(
-            "fiberlet distance lookahead target is invalid");
-    }
-
-    std::vector<SourceRouteCandidate> frontier;
-    std::vector<SourceRouteCandidate> completed;
-    size_t generatedRoutes = 0;
-    const auto incomingView = incomingArc.has_value()
-        ? std::make_optional(graph.arc(*incomingArc))
-        : std::nullopt;
-    const auto appendCandidate = [&](SourceRouteCandidate candidate,
-                                     const DirectedFiberletStorageId& arcId,
-                                     const FiberletReplaySourceArc& arc,
-                                     const std::optional<
-                                         FiberletReplaySourceTransition>& join,
-                                     auto& incomplete,
-                                     auto& complete) {
-        const double remaining =
-            targetLengthPredictionVoxels - candidate.pathLength;
-        if (!(remaining > kReplayEpsilon)) {
-            candidate.pathLength = targetLengthPredictionVoxels;
-            complete.push_back(std::move(candidate));
-            return;
-        }
-        if (!(arc.pathLengthPredictionVoxels > kFloatEpsilon) ||
-            !std::isfinite(arc.pathLengthPredictionVoxels)) {
-            throw std::invalid_argument(
-                "fiberlet replay source arc has invalid path length");
-        }
-        const double fraction = std::min(
-            1.0,
-            remaining /
-                static_cast<double>(arc.pathLengthPredictionVoxels));
-        appendRouteArc(candidate, graph, arcId, arc, join, fraction);
-        ++generatedRoutes;
-        if (generatedRoutes > kMaximumGeneratedRoutes) {
-            throw std::runtime_error(
-                "fiberlet distance lookahead exceeded the canonical route-state limit");
-        }
-        if (candidate.pathLength >=
-            targetLengthPredictionVoxels - kReplayEpsilon) {
-            candidate.pathLength = targetLengthPredictionVoxels;
-            complete.push_back(std::move(candidate));
-        } else {
-            incomplete.push_back(std::move(candidate));
-        }
-    };
-
-    for (const auto& arcId : graph.outgoing(currentNode)) {
-        const auto arc = graph.arc(arcId);
-        const auto join = incomingView.has_value()
-            ? graph.transition(*incomingView, arc)
-            : std::nullopt;
-        if (incomingArc.has_value() && !join.has_value())
-            continue;
-        if (initialDirection.has_value() &&
-            !(angleDegrees(*initialDirection, sourceArcStartDirection(arc)) <
-              graph.maximumJoinAngleDegrees()))
-            continue;
-        if (committedVisitedNodes.contains(arc.target))
-            continue;
-        SourceRouteCandidate candidate;
-        candidate.visitedNodes = committedVisitedNodes;
-        appendCandidate(std::move(candidate), arcId, arc, join, frontier,
-            completed);
-    }
-
-    while (!frontier.empty()) {
-        std::vector<SourceRouteCandidate> expanded;
-        for (const auto& route : frontier) {
-            const auto& tailArc = route.arcs.back();
-            const auto& tailNode = targetAnchor(tailArc);
-            const auto tailView = graph.arc(tailArc);
-            for (const auto& arcId : graph.outgoing(tailNode)) {
-                const auto arc = graph.arc(arcId);
-                const auto join = graph.transition(tailView, arc);
-                if (!join.has_value() ||
-                    route.visitedNodes.contains(arc.target)) {
-                    continue;
-                }
-                appendCandidate(route, arcId, arc, join, expanded,
-                    completed);
-            }
-        }
-        frontier = std::move(expanded);
-    }
-    if (completed.empty())
-        return std::nullopt;
-    std::sort(completed.begin(), completed.end(), routeLess);
-    const auto selected = completed.front();
-    if (completed.size() > diagnosticRouteLimit)
-        completed.resize(diagnosticRouteLimit);
-    if (diagnosticFrontier != nullptr)
-        *diagnosticFrontier = std::move(completed);
-    return selected;
 }
 
 std::vector<cv::Vec3d> routePointPrefix(
@@ -486,6 +237,715 @@ std::vector<cv::Vec3d> routePointPrefix(
         covered += stepLength;
     }
     return points;
+}
+
+struct PersistentVisitedNodes {
+    std::shared_ptr<const std::set<FiberletStorageKey>> base;
+    std::shared_ptr<const PersistentVisitedNodes> parent;
+    std::optional<FiberletStorageKey> added;
+};
+
+std::shared_ptr<const PersistentVisitedNodes> makeVisitedRoot(
+    std::set<FiberletStorageKey> nodes)
+{
+    return std::make_shared<const PersistentVisitedNodes>(
+        PersistentVisitedNodes{
+            std::make_shared<const std::set<FiberletStorageKey>>(
+                std::move(nodes)),
+            nullptr, std::nullopt});
+}
+
+bool persistentVisitedContains(
+    const std::shared_ptr<const PersistentVisitedNodes>& visited,
+    const FiberletStorageKey& key)
+{
+    for (auto node = visited; node != nullptr; node = node->parent) {
+        if (node->added.has_value() && *node->added == key)
+            return true;
+        if (node->base != nullptr && node->base->contains(key))
+            return true;
+    }
+    return false;
+}
+
+std::shared_ptr<const PersistentVisitedNodes> persistentVisitedAdd(
+    const std::shared_ptr<const PersistentVisitedNodes>& visited,
+    FiberletStorageKey key)
+{
+    return std::make_shared<const PersistentVisitedNodes>(
+        PersistentVisitedNodes{nullptr, visited, std::move(key)});
+}
+
+std::shared_ptr<const PersistentVisitedNodes> compactPersistentVisited(
+    const std::shared_ptr<const PersistentVisitedNodes>& visited)
+{
+    std::set<FiberletStorageKey> nodes;
+    std::vector<FiberletStorageKey> additions;
+    for (auto node = visited; node != nullptr; node = node->parent) {
+        if (node->added.has_value())
+            additions.push_back(*node->added);
+        if (node->base != nullptr) {
+            nodes = *node->base;
+            break;
+        }
+    }
+    nodes.insert(additions.begin(), additions.end());
+    return makeVisitedRoot(std::move(nodes));
+}
+
+struct PersistentRouteHistory {
+    std::shared_ptr<const PersistentRouteHistory> parent;
+    DirectedFiberletStorageId arc;
+    DirectedFiberletStorageId logicalArc;
+    std::optional<FiberletReplaySourceTransition> enteringTransition;
+    std::shared_ptr<const PersistentVisitedNodes> visitedNodes;
+    FiberletGraphReplayCost cumulativeEdgeCost;
+    FiberletGraphReplayCost cumulativeTransitionCost;
+    double cumulativePathLength = 0.0;
+    size_t arcCount = 0;
+};
+
+struct PersistentRouteCandidate {
+    FiberletStorageKey seed;
+    std::shared_ptr<const PersistentRouteHistory> tail;
+    std::shared_ptr<const PersistentVisitedNodes> visitedNodes;
+    FiberletGraphReplayCost edgeCost;
+    FiberletGraphReplayCost transitionCost;
+    double pathLength = 0.0;
+};
+
+std::vector<const PersistentRouteHistory*> persistentRouteHistory(
+    const PersistentRouteCandidate& route)
+{
+    std::vector<const PersistentRouteHistory*> result;
+    if (route.tail != nullptr)
+        result.reserve(route.tail->arcCount);
+    for (auto node = route.tail; node != nullptr; node = node->parent)
+        result.push_back(node.get());
+    std::reverse(result.begin(), result.end());
+    return result;
+}
+
+std::vector<DirectedFiberletStorageId> persistentRouteLogicalArcs(
+    const PersistentRouteCandidate& route)
+{
+    std::vector<DirectedFiberletStorageId> result;
+    for (const auto* node : persistentRouteHistory(route))
+        result.push_back(node->logicalArc);
+    return result;
+}
+
+double persistentRouteLoss(const PersistentRouteCandidate& route)
+{
+    return route.edgeCost.total() + route.transitionCost.total();
+}
+
+void validateReplayCost(
+    const FiberletPathCost& cost,
+    const char* description)
+{
+    const std::array values{
+        cost.invalidPrediction,
+        cost.alignment,
+        cost.isotropicSmoothness,
+        cost.tangentSmoothness,
+        cost.normalSmoothness,
+    };
+    if (std::any_of(values.begin(), values.end(), [](float value) {
+            return !(value >= 0.0F) || !std::isfinite(value);
+        })) {
+        throw std::invalid_argument(description);
+    }
+}
+
+FiberletStorageKey persistentRouteAnchor(
+    const PersistentRouteCandidate& route)
+{
+    return route.tail == nullptr ? route.seed : targetAnchor(route.tail->arc);
+}
+
+std::optional<DirectedFiberletStorageId> persistentRouteIncoming(
+    const PersistentRouteCandidate& route)
+{
+    if (route.tail == nullptr)
+        return std::nullopt;
+    return route.tail->arc;
+}
+
+struct ExactPersistentStateBudget {
+    std::atomic_size_t generated{0};
+    size_t maximum = 0;
+
+    void consume()
+    {
+        const size_t previous = generated.fetch_add(1,
+            std::memory_order_relaxed);
+        if (previous >= maximum) {
+            throw std::runtime_error(
+                "persistent fiberlet beam exceeded the route-state limit");
+        }
+    }
+};
+
+std::vector<PersistentRouteCandidate> persistentRouteSuccessors(
+    const FiberletReplayGraphSource& graph,
+    const PersistentRouteCandidate& route,
+    const std::optional<cv::Vec3d>& initialDirection,
+    ExactPersistentStateBudget& stateBudget,
+    size_t& rejectedStates)
+{
+    std::vector<PersistentRouteCandidate> result;
+    const auto anchor = persistentRouteAnchor(route);
+    const auto incomingId = persistentRouteIncoming(route);
+    const auto incoming = incomingId.has_value()
+        ? std::make_optional(graph.arc(*incomingId))
+        : std::nullopt;
+    auto outgoing = graph.outgoing(anchor);
+    std::sort(outgoing.begin(), outgoing.end());
+    result.reserve(outgoing.size());
+    for (const auto& outgoingId : outgoing) {
+        const auto edge = graph.arc(outgoingId);
+        if (persistentVisitedContains(route.visitedNodes, edge.target)) {
+            ++rejectedStates;
+            continue;
+        }
+        std::optional<FiberletReplaySourceTransition> transition;
+        if (incoming.has_value()) {
+            transition = graph.transition(*incoming, edge);
+            if (!transition.has_value()) {
+                ++rejectedStates;
+                continue;
+            }
+        } else if (initialDirection.has_value() &&
+                   !(angleDegrees(*initialDirection,
+                         sourceArcStartDirection(edge)) <
+                       graph.maximumJoinAngleDegrees())) {
+            ++rejectedStates;
+            continue;
+        }
+        stateBudget.consume();
+        const double edgeLength = edge.pathLengthPredictionVoxels;
+        if (!(edgeLength > kFloatEpsilon) || !std::isfinite(edgeLength))
+            throw std::invalid_argument(
+                "persistent beam edge length is invalid");
+        validateReplayCost(edge.cost,
+            "persistent beam edge cost must be finite and nonnegative");
+        if (transition.has_value()) {
+            validateReplayCost(transition->cost,
+                "persistent beam join cost must be finite and nonnegative");
+        }
+        PersistentRouteCandidate next = route;
+        next.edgeCost += edge.cost;
+        if (transition.has_value())
+            next.transitionCost += transition->cost;
+        next.pathLength += edgeLength;
+        next.visitedNodes = persistentVisitedAdd(
+            route.visitedNodes, edge.target);
+        next.tail = std::make_shared<PersistentRouteHistory>(
+            PersistentRouteHistory{route.tail, outgoingId,
+                graph.logicalArcId(outgoingId), transition,
+                next.visitedNodes, next.edgeCost, next.transitionCost,
+                next.pathLength,
+                route.tail == nullptr ? 1 : route.tail->arcCount + 1});
+        result.push_back(std::move(next));
+    }
+    return result;
+}
+
+struct ExactPersistentRouteScore {
+    FiberletGraphReplayCost edgeCost;
+    FiberletGraphReplayCost transitionCost;
+    double scoredLength = 0.0;
+
+    [[nodiscard]] double total() const noexcept
+    {
+        return edgeCost.total() + transitionCost.total();
+    }
+};
+
+ExactPersistentRouteScore scorePersistentRouteAtHorizon(
+    const FiberletReplayGraphSource& graph,
+    const PersistentRouteCandidate& route,
+    double horizonPredictionVoxels)
+{
+    if (!(horizonPredictionVoxels >= 0.0) ||
+        !std::isfinite(horizonPredictionVoxels) ||
+        route.pathLength < horizonPredictionVoxels - kReplayEpsilon) {
+        throw std::invalid_argument(
+            "persistent route does not cover its scoring horizon");
+    }
+    ExactPersistentRouteScore score;
+    if (horizonPredictionVoxels <= kReplayEpsilon) {
+        score.scoredLength = horizonPredictionVoxels;
+        return score;
+    }
+    auto crossing = route.tail;
+    while (crossing != nullptr && crossing->parent != nullptr &&
+           crossing->parent->cumulativePathLength >=
+               horizonPredictionVoxels - kReplayEpsilon) {
+        crossing = crossing->parent;
+    }
+    if (crossing == nullptr ||
+        crossing->cumulativePathLength <
+            horizonPredictionVoxels - kReplayEpsilon) {
+        throw std::logic_error("persistent route scoring ended before horizon");
+    }
+    const double precedingLength = crossing->parent != nullptr
+        ? crossing->parent->cumulativePathLength
+        : 0.0;
+    const auto edge = graph.arc(crossing->arc);
+    const double edgeLength = edge.pathLengthPredictionVoxels;
+    if (!(edgeLength > kFloatEpsilon) || !std::isfinite(edgeLength))
+        throw std::invalid_argument("persistent beam edge length is invalid");
+    validateReplayCost(edge.cost,
+        "persistent beam edge cost must be finite and nonnegative");
+    if (crossing->parent != nullptr) {
+        score.edgeCost = crossing->parent->cumulativeEdgeCost;
+        score.transitionCost = crossing->parent->cumulativeTransitionCost;
+    }
+    const double includedLength =
+        horizonPredictionVoxels - precedingLength;
+    if (!(includedLength > kReplayEpsilon) ||
+        includedLength > edgeLength + kReplayEpsilon) {
+        throw std::logic_error(
+            "persistent route terminal scoring fraction is invalid");
+    }
+    if (crossing->enteringTransition.has_value()) {
+        validateReplayCost(crossing->enteringTransition->cost,
+            "persistent beam join cost must be finite and nonnegative");
+        score.transitionCost += crossing->enteringTransition->cost;
+    }
+    addScaledCost(score.edgeCost, edge.cost,
+        std::clamp(includedLength / edgeLength, 0.0, 1.0));
+    score.scoredLength = horizonPredictionVoxels;
+    return score;
+}
+
+PersistentRouteCandidate persistentRouteCommittedPrefix(
+    const FiberletReplayGraphSource& graph,
+    const PersistentRouteCandidate& route,
+    double checkpointPredictionVoxels)
+{
+    (void)graph;
+    if (!(checkpointPredictionVoxels >= 0.0) ||
+        !std::isfinite(checkpointPredictionVoxels) ||
+        route.pathLength < checkpointPredictionVoxels - kReplayEpsilon) {
+        throw std::invalid_argument(
+            "persistent beam route does not cover the checkpoint");
+    }
+    PersistentRouteCandidate prefix;
+    prefix.seed = route.seed;
+    auto visited = makeVisitedRoot(
+        std::set<FiberletStorageKey>{route.seed});
+    prefix.visitedNodes = visited;
+    if (checkpointPredictionVoxels <= kReplayEpsilon)
+        return prefix;
+    auto crossing = route.tail;
+    while (crossing != nullptr && crossing->parent != nullptr &&
+           crossing->parent->cumulativePathLength >=
+               checkpointPredictionVoxels - kReplayEpsilon) {
+        crossing = crossing->parent;
+    }
+    if (crossing == nullptr ||
+        crossing->cumulativePathLength <
+            checkpointPredictionVoxels - kReplayEpsilon) {
+        throw std::logic_error(
+            "persistent beam checkpoint prefix was not found");
+    }
+    prefix.tail = crossing;
+    prefix.edgeCost = crossing->cumulativeEdgeCost;
+    prefix.transitionCost = crossing->cumulativeTransitionCost;
+    prefix.pathLength = crossing->cumulativePathLength;
+    prefix.visitedNodes = crossing->visitedNodes;
+    return prefix;
+}
+
+std::vector<cv::Vec3d> persistentRoutePoints(
+    const FiberletReplayGraphSource& graph,
+    const PersistentRouteCandidate& route,
+    const cv::Vec3d& seedPoint)
+{
+    std::vector<cv::Vec3d> result{seedPoint};
+    for (const auto* node : persistentRouteHistory(route)) {
+        auto points = graph.routePoints(node->arc);
+        if (!points.empty() && !result.empty())
+            points.erase(points.begin());
+        result.insert(result.end(), points.begin(), points.end());
+    }
+    return result;
+}
+
+struct RankedPersistentPrefix {
+    PersistentRouteCandidate prefix;
+    PersistentRouteCandidate lookahead;
+    std::vector<DirectedFiberletStorageId> prefixLogicalArcs;
+    std::vector<DirectedFiberletStorageId> lookaheadLogicalArcs;
+    FiberletGraphReplayCost scoredEdgeCost;
+    FiberletGraphReplayCost scoredTransitionCost;
+    double scoredPathLength = 0.0;
+    double completePathLength = 0.0;
+    double lossPerPredictionVoxel = 0.0;
+    double totalLoss = 0.0;
+};
+
+RankedPersistentPrefix makeRankedPersistentPrefix(
+    const FiberletReplayGraphSource& graph,
+    PersistentRouteCandidate candidate,
+    double checkpointPredictionVoxels,
+    double scoringHorizonPredictionVoxels)
+{
+    RankedPersistentPrefix entry;
+    const auto score = scorePersistentRouteAtHorizon(
+        graph, candidate, scoringHorizonPredictionVoxels);
+    entry.prefix = persistentRouteCommittedPrefix(
+        graph, candidate, checkpointPredictionVoxels);
+    entry.lookahead = std::move(candidate);
+    entry.scoredEdgeCost = score.edgeCost;
+    entry.scoredTransitionCost = score.transitionCost;
+    entry.scoredPathLength = score.scoredLength;
+    entry.completePathLength = entry.lookahead.pathLength;
+    entry.totalLoss = score.total();
+    entry.lossPerPredictionVoxel = entry.scoredPathLength > kReplayEpsilon
+        ? entry.totalLoss / entry.scoredPathLength
+        : std::numeric_limits<double>::infinity();
+    return entry;
+}
+
+bool rankedPersistentPrefixLess(
+    const RankedPersistentPrefix& left,
+    const RankedPersistentPrefix& right)
+{
+    if (left.totalLoss != right.totalLoss)
+        return left.totalLoss < right.totalLoss;
+    const auto leftLookahead = persistentRouteLogicalArcs(left.lookahead);
+    const auto rightLookahead = persistentRouteLogicalArcs(right.lookahead);
+    if (leftLookahead != rightLookahead)
+        return leftLookahead < rightLookahead;
+    return persistentRouteLogicalArcs(left.prefix) <
+        persistentRouteLogicalArcs(right.prefix);
+}
+
+void retainRankedPersistentPrefix(
+    RankedPersistentPrefix entry,
+    size_t beamWidth,
+    std::vector<RankedPersistentPrefix>& ranked)
+{
+    const auto entryPrefixArcs = persistentRouteLogicalArcs(entry.prefix);
+    const auto equivalent = std::find_if(
+        ranked.begin(), ranked.end(),
+        [&](const auto& existing) {
+            return existing.prefix.seed == entry.prefix.seed &&
+                persistentRouteLogicalArcs(existing.prefix) ==
+                    entryPrefixArcs;
+        });
+    if (equivalent != ranked.end()) {
+        if (rankedPersistentPrefixLess(entry, *equivalent))
+            *equivalent = std::move(entry);
+    } else {
+        ranked.push_back(std::move(entry));
+    }
+    std::sort(ranked.begin(), ranked.end(), rankedPersistentPrefixLess);
+    if (ranked.size() > beamWidth)
+        ranked.resize(beamWidth);
+}
+
+struct ExactPersistentSearchStats {
+    size_t generated = 0;
+    size_t expanded = 0;
+    size_t completed = 0;
+    size_t costPruned = 0;
+    size_t rejected = 0;
+};
+
+struct PersistentQueueEntry {
+    PersistentRouteCandidate route;
+    double lowerBound = 0.0;
+    size_t sequence = 0;
+};
+
+struct PersistentQueueGreater {
+    bool operator()(
+        const PersistentQueueEntry& left,
+        const PersistentQueueEntry& right) const noexcept
+    {
+        return std::tie(left.lowerBound, left.sequence) >
+            std::tie(right.lowerBound, right.sequence);
+    }
+};
+
+class RelaxedPersistentCostToGo {
+public:
+    explicit RelaxedPersistentCostToGo(
+        const FiberletReplayGraphSource& graph) : graph_(graph)
+    {
+    }
+
+    double lowerBound(
+        const DirectedFiberletStorageId& incoming,
+        double remainingPredictionVoxels)
+    {
+        if (!(remainingPredictionVoxels >= 0.0) ||
+            !std::isfinite(remainingPredictionVoxels)) {
+            throw std::invalid_argument(
+                "persistent route remaining distance is invalid");
+        }
+        std::scoped_lock lock(mutex_);
+        return lowerBoundUnlocked(incoming, remainingPredictionVoxels);
+    }
+
+private:
+    double lowerBoundUnlocked(
+        const DirectedFiberletStorageId& incoming,
+        double remainingPredictionVoxels)
+    {
+        size_t bins = static_cast<size_t>(std::floor(
+            remainingPredictionVoxels / kDistanceBin));
+        while (bins > 0 &&
+               static_cast<double>(bins) * kDistanceBin >
+                   remainingPredictionVoxels) {
+            --bins;
+        }
+        return solve(incoming, bins);
+    }
+
+    double solve(const DirectedFiberletStorageId& incomingId, size_t bins)
+    {
+        if (bins == 0)
+            return 0.0;
+        const auto key = std::pair{incomingId, bins};
+        if (const auto found = memo_.find(key); found != memo_.end())
+            return found->second;
+        const auto incoming = graph_.arc(incomingId);
+        const double targetDistance =
+            static_cast<double>(bins) * kDistanceBin;
+        double best = std::numeric_limits<double>::infinity();
+        auto outgoingIds = graph_.outgoing(incoming.target);
+        std::sort(outgoingIds.begin(), outgoingIds.end());
+        for (const auto& outgoingId : outgoingIds) {
+            const auto outgoing = graph_.arc(outgoingId);
+            const auto transition = graph_.transition(incoming, outgoing);
+            if (!transition.has_value())
+                continue;
+            validateReplayCost(transition->cost,
+                "persistent beam join cost must be finite and nonnegative");
+            validateReplayCost(outgoing.cost,
+                "persistent beam edge cost must be finite and nonnegative");
+            const double edgeLength = outgoing.pathLengthPredictionVoxels;
+            if (!(edgeLength > kFloatEpsilon) ||
+                !std::isfinite(edgeLength)) {
+                throw std::invalid_argument(
+                    "persistent beam edge length is invalid");
+            }
+            const double joinCost = transition->cost.total();
+            const double edgeCost = outgoing.cost.total();
+            double candidate = joinCost;
+            if (edgeLength >= targetDistance - kReplayEpsilon) {
+                candidate += edgeCost * std::clamp(
+                    targetDistance / edgeLength, 0.0, 1.0);
+            } else {
+                candidate += edgeCost;
+                candidate += lowerBoundUnlocked(
+                    outgoingId, targetDistance - edgeLength);
+            }
+            best = std::min(best, candidate);
+        }
+        memo_.emplace(key, best);
+        return best;
+    }
+
+    static constexpr double kDistanceBin = 0.5;
+    const FiberletReplayGraphSource& graph_;
+    std::mutex mutex_;
+    std::map<std::pair<DirectedFiberletStorageId, size_t>, double> memo_;
+};
+
+std::vector<PersistentRouteCandidate> persistentCheckpointPrefixes(
+    const FiberletReplayGraphSource& graph,
+    const std::vector<PersistentRouteCandidate>& initialRoutes,
+    double checkpointPredictionVoxels,
+    const cv::Vec3d& initialDirection,
+    ExactPersistentStateBudget& stateBudget,
+    ExactPersistentSearchStats& stats)
+{
+    if (!(checkpointPredictionVoxels >= 0.0) ||
+        !std::isfinite(checkpointPredictionVoxels)) {
+        throw std::invalid_argument(
+            "persistent beam checkpoint is invalid");
+    }
+    std::vector<PersistentRouteCandidate> pending;
+    std::vector<PersistentRouteCandidate> prefixes;
+    for (const auto& initial : initialRoutes) {
+        if (initial.pathLength >= checkpointPredictionVoxels - kReplayEpsilon)
+            prefixes.push_back(initial);
+        else
+            pending.push_back(initial);
+    }
+    for (size_t index = 0; index < pending.size(); ++index) {
+        auto route = std::move(pending[index]);
+        ++stats.expanded;
+        auto successors = persistentRouteSuccessors(
+            graph, route,
+            route.tail == nullptr
+                ? std::make_optional(initialDirection)
+                : std::nullopt,
+            stateBudget, stats.rejected);
+        for (auto successor : successors) {
+            if (successor.pathLength >=
+                checkpointPredictionVoxels - kReplayEpsilon)
+                prefixes.push_back(std::move(successor));
+            else
+                pending.push_back(std::move(successor));
+        }
+    }
+    return prefixes;
+}
+
+std::optional<RankedPersistentPrefix> exactPersistentPrefixContinuation(
+    const FiberletReplayGraphSource& graph,
+    const PersistentRouteCandidate& prefix,
+    double scoringHorizonPredictionVoxels,
+    double checkpointPredictionVoxels,
+    RelaxedPersistentCostToGo& costToGo,
+    ExactPersistentStateBudget& stateBudget,
+    ExactPersistentSearchStats& stats)
+{
+    std::priority_queue<PersistentQueueEntry,
+        std::vector<PersistentQueueEntry>, PersistentQueueGreater> pending;
+    std::optional<RankedPersistentPrefix> best;
+    size_t sequence = 0;
+    const auto retainCompletion = [&](PersistentRouteCandidate candidate) {
+        ++stats.completed;
+        auto entry = makeRankedPersistentPrefix(graph,
+            std::move(candidate), checkpointPredictionVoxels,
+            scoringHorizonPredictionVoxels);
+        if (!best.has_value() || rankedPersistentPrefixLess(entry, *best))
+            best = std::move(entry);
+    };
+    const auto routeLowerBound = [&](const PersistentRouteCandidate& route) {
+        const double accumulated = persistentRouteLoss(route);
+        const auto incoming = persistentRouteIncoming(route);
+        if (!incoming.has_value()) {
+            throw std::logic_error(
+                "persistent lookahead prefix has no incoming fiberlet");
+        }
+        const double future = costToGo.lowerBound(*incoming,
+            std::max(0.0,
+                scoringHorizonPredictionVoxels - route.pathLength));
+        return accumulated + future;
+    };
+    const auto enqueue = [&](PersistentRouteCandidate candidate,
+                             double lowerBound) {
+        if (!(lowerBound >= 0.0) || std::isnan(lowerBound)) {
+            throw std::invalid_argument(
+                "persistent route lower bound must be finite and nonnegative");
+        }
+        if (!std::isfinite(lowerBound)) {
+            ++stats.costPruned;
+            return;
+        }
+        pending.push(PersistentQueueEntry{
+            std::move(candidate), lowerBound, sequence++});
+    };
+    if (prefix.pathLength >=
+        scoringHorizonPredictionVoxels - kReplayEpsilon) {
+        retainCompletion(prefix);
+    } else {
+        enqueue(prefix, routeLowerBound(prefix));
+    }
+    while (!pending.empty()) {
+        if (best.has_value() &&
+            pending.top().lowerBound > best->totalLoss) {
+            stats.costPruned += pending.size();
+            break;
+        }
+        auto route = std::move(pending.top().route);
+        pending.pop();
+        ++stats.expanded;
+        auto successors = persistentRouteSuccessors(
+            graph, route, std::nullopt, stateBudget, stats.rejected);
+        for (auto successor : successors) {
+            if (successor.pathLength >=
+                scoringHorizonPredictionVoxels - kReplayEpsilon) {
+                retainCompletion(std::move(successor));
+            } else {
+                const double lowerBound = routeLowerBound(successor);
+                if (best.has_value() &&
+                    lowerBound > best->totalLoss) {
+                    ++stats.costPruned;
+                } else {
+                    enqueue(std::move(successor), lowerBound);
+                }
+            }
+        }
+    }
+    return best;
+}
+
+std::vector<RankedPersistentPrefix> exactPersistentRouteLookahead(
+    const FiberletReplayGraphSource& graph,
+    const std::vector<PersistentRouteCandidate>& initialRoutes,
+    double scoringHorizonPredictionVoxels,
+    double checkpointPredictionVoxels,
+    const cv::Vec3d& initialDirection,
+    size_t beamWidth,
+    size_t expansionThreads,
+    size_t maximumGeneratedStates,
+    ExactPersistentSearchStats& stats)
+{
+    if (!(scoringHorizonPredictionVoxels > 0.0) ||
+        !std::isfinite(scoringHorizonPredictionVoxels) ||
+        !(checkpointPredictionVoxels >= 0.0) ||
+        !std::isfinite(checkpointPredictionVoxels)) {
+        throw std::invalid_argument(
+            "persistent exact lookahead horizon is invalid");
+    }
+    ExactPersistentStateBudget stateBudget;
+    stateBudget.maximum = maximumGeneratedStates;
+    auto prefixes = persistentCheckpointPrefixes(graph, initialRoutes,
+        checkpointPredictionVoxels, initialDirection, stateBudget, stats);
+    RelaxedPersistentCostToGo costToGo(graph);
+    std::vector<std::optional<RankedPersistentPrefix>> completions(
+        prefixes.size());
+    std::vector<ExactPersistentSearchStats> prefixStats(prefixes.size());
+    std::atomic_size_t nextPrefix{0};
+    const size_t workerCount = std::min(
+        std::max<size_t>(1, expansionThreads), prefixes.size());
+    std::vector<std::future<void>> workers;
+    workers.reserve(workerCount);
+    for (size_t worker = 0; worker < workerCount; ++worker) {
+        workers.push_back(std::async(std::launch::async, [&]() {
+            while (true) {
+                const size_t index = nextPrefix.fetch_add(
+                    1, std::memory_order_relaxed);
+                if (index >= prefixes.size())
+                    return;
+                completions[index] = exactPersistentPrefixContinuation(
+                    graph, prefixes[index], scoringHorizonPredictionVoxels,
+                    checkpointPredictionVoxels, costToGo, stateBudget,
+                    prefixStats[index]);
+            }
+        }));
+    }
+    for (auto& worker : workers)
+        worker.get();
+    stats.generated = stateBudget.generated.load(std::memory_order_relaxed);
+    std::vector<RankedPersistentPrefix> ranked;
+    ranked.reserve(beamWidth);
+    for (size_t index = 0; index < completions.size(); ++index) {
+        stats.expanded += prefixStats[index].expanded;
+        stats.completed += prefixStats[index].completed;
+        stats.costPruned += prefixStats[index].costPruned;
+        stats.rejected += prefixStats[index].rejected;
+        if (completions[index].has_value()) {
+            retainRankedPersistentPrefix(
+                std::move(*completions[index]), beamWidth, ranked);
+        }
+    }
+    for (auto& entry : ranked) {
+        entry.prefixLogicalArcs = persistentRouteLogicalArcs(entry.prefix);
+        entry.lookaheadLogicalArcs = persistentRouteLogicalArcs(entry.lookahead);
+    }
+    return ranked;
 }
 
 class EagerReplayGraphSource final : public FiberletReplayGraphSource {
@@ -567,6 +1027,8 @@ public:
         result.endStepBaseXYZ = cv::Vec3f(points.back() - points[points.size() - 2]);
         result.pathLengthPredictionVoxels = edge.pathLengthPredictionVoxels;
         result.cost = edge.cost;
+        result.diagnosticCandidateIndex = edge.candidateIndex;
+        result.diagnosticArcIndex = numericArc;
         return result;
     }
 
@@ -591,8 +1053,8 @@ public:
             graph_, incomingFound->second, outgoingFound->second);
         if (!index.has_value())
             return std::nullopt;
-        return FiberletReplaySourceTransition{
-            incoming.id, outgoing.id, graph_.transitions[*index].cost};
+        return FiberletReplaySourceTransition{incoming.id, outgoing.id,
+            graph_.transitions[*index].cost, *index};
     }
 
 private:
@@ -821,10 +1283,13 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
     const double predictionToBaseScale = graph.predictionToBaseScale();
     if (!(predictionToBaseScale > 0.0) ||
         !std::isfinite(predictionToBaseScale) ||
-        config.beamWidth < 1 || config.lookaheadEdges < 1 ||
-        (config.lookaheadDistanceBaseVoxels.has_value() &&
-         (!std::isfinite(*config.lookaheadDistanceBaseVoxels) ||
-          !(*config.lookaheadDistanceBaseVoxels > 0.0))) ||
+        config.beamWidth < 1 || config.beamWidth > 16 ||
+        config.expansionThreads < 1 ||
+        config.maximumGeneratedStatesPerIteration == 0 ||
+        !(config.beamStepDistanceBaseVoxels > 0.0) ||
+        !std::isfinite(config.beamStepDistanceBaseVoxels) ||
+        !(config.lookaheadDistanceBaseVoxels > 0.0) ||
+        !std::isfinite(config.lookaheadDistanceBaseVoxels) ||
         !(config.errorThresholdBaseVoxels >= 0.0) ||
         !std::isfinite(config.errorThresholdBaseVoxels) || !(config.matchRefineSteps >= 0.0) || !std::isfinite(config.matchRefineSteps) ||
         !(config.minimumResetAdvanceBaseVoxels > 0.0) || !std::isfinite(config.minimumResetAdvanceBaseVoxels) ||
@@ -1021,192 +1486,283 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
             seed->projection.arc,
             seed->thresholdMeasurement,
         });
-        FiberletStorageKey currentNode = seed->node.id;
-        std::optional<DirectedFiberletStorageId> incomingArc;
-        std::set<FiberletStorageKey> visitedNodes{currentNode};
-        double previousReferenceArc = seed->projection.arc;
+        const double maximumRouteLengthPredictionVoxels =
+            (referenceEndArcBase - seed->projection.arc) /
+            predictionToBaseScale;
+        const double beamStepPredictionVoxels =
+            config.beamStepDistanceBaseVoxels / predictionToBaseScale;
+        const double lookaheadPredictionVoxels =
+            config.lookaheadDistanceBaseVoxels / predictionToBaseScale;
+        PersistentRouteCandidate initialBeam;
+        initialBeam.seed = seed->node.id;
+        initialBeam.visitedNodes = makeVisitedRoot(
+            std::set<FiberletStorageKey>{seed->node.id});
+        std::vector<PersistentRouteCandidate> beams{initialBeam};
+        std::vector<FiberletGraphReplayDecision> decisions;
+        PersistentRouteCandidate selectedRoute = initialBeam;
         std::optional<FiberReplayFailure> distanceFailure;
-        bool referenceExhausted =
-            previousReferenceArc >= referenceEndArcBase - kReplayEpsilon;
-        bool terminalPartialEdge = false;
+        bool referenceExhausted = maximumRouteLengthPredictionVoxels <= kReplayEpsilon;
+        double previousReferenceArc = seed->projection.arc;
+        std::set<FiberletStorageKey> selectedTraversedNodes{seed->node.id};
+        const cv::Vec3d initialDirection =
+            samplePolylineArc(reference, seed->projection.arc).tangent;
+        const size_t maximumGeneratedStates =
+            config.maximumGeneratedStatesPerIteration;
 
-        while (!distanceFailure.has_value() &&
-               previousReferenceArc < referenceEndArcBase - kReplayEpsilon) {
-            const cv::Vec3d startDirection = samplePolylineArc(reference, previousReferenceArc).tangent;
-            std::vector<SourceRouteCandidate> diagnosticFrontier;
-            const auto initialDirection = incomingArc.has_value()
-                ? std::nullopt
-                : std::make_optional(startDirection);
-            std::optional<SourceRouteCandidate> selected;
-            if (config.lookaheadDistanceBaseVoxels.has_value()) {
-                const double effectiveDistanceBase = std::min(
-                    *config.lookaheadDistanceBaseVoxels,
-                    referenceEndArcBase - previousReferenceArc);
-                selected = bestDistanceLookaheadRoute(
-                    graph, currentNode, incomingArc, visitedNodes,
-                    config.beamWidth,
-                    effectiveDistanceBase / predictionToBaseScale,
-                    initialDirection,
-                    config.recordDecisionDiagnostics
-                        ? &diagnosticFrontier
-                        : nullptr);
-            } else {
-                selected = bestLookaheadRoute(
-                    graph, currentNode, incomingArc, visitedNodes,
-                    config.beamWidth, config.lookaheadEdges,
-                    initialDirection,
-                    config.recordDecisionDiagnostics
-                        ? &diagnosticFrontier
-                        : nullptr);
-            }
-            if (config.recordDecisionDiagnostics) {
-                FiberletGraphReplayDecision decision;
-                decision.routePointIndex = segment.routePointsBaseXYZ.size() - 1;
-                decision.referenceArcBase = previousReferenceArc;
-                decision.sourceKey = graph.logicalAnchorId(currentNode);
-                if (incomingArc.has_value())
-                    decision.incomingLogicalArc = graph.logicalArcId(*incomingArc);
-                decision.routes.reserve(diagnosticFrontier.size());
-                for (size_t routeIndex = 0;
-                     routeIndex < diagnosticFrontier.size(); ++routeIndex) {
-                    const auto& candidate = diagnosticFrontier[routeIndex];
-                    FiberletGraphReplayDecisionRoute route;
-                    route.logicalArcs = candidate.logicalArcs;
-                    route.includedArcFractions =
-                        candidate.includedArcFractions;
-                    route.edgeCost = candidate.edgeCost;
-                    route.transitionCost = candidate.transitionCost;
-                    const auto committedArc = graph.arc(candidate.arcs.front());
-                    route.committedEdgeCost += committedArc.cost;
-                    route.committedPathLengthPredictionVoxels =
-                        committedArc.pathLengthPredictionVoxels;
-                    if (incomingArc.has_value()) {
-                        const auto committedJoin = graph.transition(
-                            graph.arc(*incomingArc), committedArc);
-                        if (!committedJoin.has_value()) {
-                            throw std::logic_error(
-                                "diagnostic replay route lost its committed transition");
-                        }
-                        route.committedTransitionCost += committedJoin->cost;
-                    }
-                    route.pathLengthPredictionVoxels = candidate.pathLength;
-                    route.totalLoss = candidate.loss;
-                    route.lossPerPredictionVoxel = routeDensity(candidate);
-                    for (size_t arcOffset = 0;
-                         arcOffset < candidate.arcs.size(); ++arcOffset) {
-                        auto points = routePointPrefix(
-                            graph.routePoints(candidate.arcs[arcOffset]),
-                            candidate.includedArcFractions[arcOffset]);
-                        if (!route.routePointsBaseXYZ.empty() && !points.empty())
-                            points.erase(points.begin());
-                        route.routePointsBaseXYZ.insert(
-                            route.routePointsBaseXYZ.end(), points.begin(),
-                            points.end());
-                    }
-                    if (selected.has_value() &&
-                        candidate.logicalArcs == selected->logicalArcs) {
-                        decision.selectedRouteIndex = routeIndex;
-                    }
-                    decision.routes.push_back(std::move(route));
+        const auto materializeSelected = [&](const PersistentRouteCandidate& route) {
+            FiberletGraphReplaySegment built;
+            std::set<FiberletStorageKey> traversedNodes{seed->node.id};
+            built.seedKey = seed->node.id;
+            built.startReferenceArcBase = seed->projection.arc;
+            built.endReferenceArcBase = seed->projection.arc;
+            built.routePointsBaseXYZ.emplace_back(seed->node.positionBaseXYZ);
+            built.matches.push_back({0, seed->projection.arc,
+                seed->projection.arc, seed->projection.point, resetArc,
+                seed->projection.arc, seed->thresholdMeasurement});
+            double matchedArc = seed->projection.arc;
+            std::optional<FiberReplayFailure> firstFailure;
+            bool reachedEnd = false;
+            const auto history = persistentRouteHistory(route);
+            for (size_t arcOffset = 0; arcOffset < history.size(); ++arcOffset) {
+                const auto* historyNode = history[arcOffset];
+                const auto arcId = historyNode->arc;
+                const auto edge = graph.arc(arcId);
+                const auto fullPoints = graph.routePoints(arcId);
+                const double remainingPathLength = std::max(0.0,
+                    maximumRouteLengthPredictionVoxels -
+                        built.pathLengthPredictionVoxels);
+                const double includedArcFraction = std::clamp(
+                    remainingPathLength /
+                        static_cast<double>(
+                            edge.pathLengthPredictionVoxels),
+                    0.0, 1.0);
+                const auto points = routePointPrefix(
+                    fullPoints, includedArcFraction);
+                if (points.size() < 2)
+                    throw std::logic_error("persistent beam route is too short");
+                double fullGeometryLengthBase = 0.0;
+                for (size_t pointIndex = 1; pointIndex < fullPoints.size();
+                     ++pointIndex) {
+                    fullGeometryLengthBase += length(
+                        fullPoints[pointIndex] - fullPoints[pointIndex - 1]);
                 }
-                segment.decisions.push_back(std::move(decision));
-            }
-            if (!selected.has_value())
-                break;
-            const auto arcId = selected->arcs.front();
-            const auto edge = graph.arc(arcId);
-            const auto points = graph.routePoints(arcId);
-            if (points.size() < 2)
-                throw std::logic_error("selected fiberlet route is too short");
-            const size_t candidateIndex = edge.diagnosticCandidateIndex.value_or(
-                stableIndex(candidateIndices, arcId.fiberlet));
-            const size_t arcIndex = edge.diagnosticArcIndex.value_or(
-                stableIndex(arcIndices, arcId));
-            FiberletGraphReplayCommittedStep committedStep;
-            committedStep.referenceBeginArcBase = previousReferenceArc;
-            committedStep.edgeCost += edge.cost;
-            committedStep.pathLengthPredictionVoxels =
-                edge.pathLengthPredictionVoxels;
-            if (incomingArc.has_value()) {
-                if (selected->transitions.empty())
-                    throw std::logic_error(
-                        "selected fiberlet route has no graph transition");
-                committedStep.transitionCost += selected->transitions.front().cost;
-            }
-            for (size_t index = 1; index < points.size(); ++index) {
-                const double stepBase = length(points[index] - segment.routePointsBaseXYZ.back());
-                const auto forwardMatch = matchForwardPolylinePoint(
-                    reference, points[index], previousReferenceArc, stepBase,
-                    config.matchRefineSteps, referenceEndArcBase);
-                const auto& match = forwardMatch.projection;
-                const auto thresholdMeasurement = measureFiberReplayThreshold(
-                    points[index], match.point, normalSampler,
-                    normalWorkingToBaseScale,
-                    config.errorThresholdBaseVoxels);
-                segment.routePointsBaseXYZ.push_back(points[index]);
-                segment.matches.push_back({
-                    segment.routePointsBaseXYZ.size() - 1,
-                    forwardMatch.predictedArc,
-                    match.arc,
-                    match.point,
-                    previousReferenceArc,
-                    forwardMatch.searchEndArc,
-                    thresholdMeasurement,
-                });
-                previousReferenceArc = match.arc;
-                segment.endReferenceArcBase = match.arc;
-                if (!distanceFailure.has_value() &&
-                    fiberReplayThresholdExceeded(
+                if (!(fullGeometryLengthBase > kReplayEpsilon))
+                    throw std::logic_error("persistent beam route has zero geometry length");
+                const size_t candidateIndex = edge.diagnosticCandidateIndex.value_or(
+                    stableIndex(candidateIndices, arcId.fiberlet));
+                const size_t arcIndex = edge.diagnosticArcIndex.value_or(
+                    stableIndex(arcIndices, arcId));
+                built.candidateIndices.push_back(candidateIndex);
+                built.arcIndices.push_back(arcIndex);
+                FiberletGraphReplayCommittedStep step;
+                step.referenceBeginArcBase = matchedArc;
+                double traversedGeometryLengthBase = 0.0;
+                if (historyNode->enteringTransition.has_value()) {
+                    const auto& join = *historyNode->enteringTransition;
+                    step.transitionCost += join.cost;
+                    built.transitionCost += join.cost;
+                    built.transitionIndices.push_back(
+                        join.diagnosticTransitionIndex.value_or(stableIndex(
+                            transitionIndices,
+                            std::pair{join.incoming, join.outgoing})));
+                }
+                for (size_t pointIndex = 1; pointIndex < points.size(); ++pointIndex) {
+                    const double stepBase = length(
+                        points[pointIndex] - built.routePointsBaseXYZ.back());
+                    traversedGeometryLengthBase += stepBase;
+                    const auto forwardMatch = matchForwardPolylinePoint(
+                        reference, points[pointIndex], matchedArc, stepBase,
+                        config.matchRefineSteps, referenceEndArcBase);
+                    const auto thresholdMeasurement = measureFiberReplayThreshold(
+                        points[pointIndex], forwardMatch.projection.point,
+                        normalSampler, normalWorkingToBaseScale,
+                        config.errorThresholdBaseVoxels);
+                    built.routePointsBaseXYZ.push_back(points[pointIndex]);
+                    built.matches.push_back({
+                        built.routePointsBaseXYZ.size() - 1,
+                        forwardMatch.predictedArc,
+                        forwardMatch.projection.arc,
+                        forwardMatch.projection.point,
+                        matchedArc,
+                        forwardMatch.searchEndArc,
                         thresholdMeasurement,
-                        config.errorThresholdBaseVoxels)) {
-                    FiberReplayFailure event;
-                    event.segmentIndex = result.segments.size();
-                    event.reason = "distance_above_threshold";
-                    event.referenceArcBase = match.arc;
-                    event.evaluatorPointBase = points[index];
-                    event.segmentPointIndex = segment.routePointsBaseXYZ.size() - 1;
-                    event.candidateIndex = candidateIndex;
-                    event.arcIndex = arcIndex;
-                    event.candidatePathPointIndex = index;
-                    event.thresholdMeasurement = thresholdMeasurement;
-                    distanceFailure = std::move(event);
+                    });
+                    matchedArc = forwardMatch.projection.arc;
+                    built.endReferenceArcBase = matchedArc;
+                    if (!firstFailure.has_value() &&
+                        fiberReplayThresholdExceeded(
+                            thresholdMeasurement,
+                            config.errorThresholdBaseVoxels)) {
+                        FiberReplayFailure event;
+                        event.segmentIndex = result.segments.size();
+                        event.reason = "distance_above_threshold";
+                        event.referenceArcBase = matchedArc;
+                        event.evaluatorPointBase = points[pointIndex];
+                        event.segmentPointIndex =
+                            built.routePointsBaseXYZ.size() - 1;
+                        event.candidateIndex = candidateIndex;
+                        event.arcIndex = arcIndex;
+                        event.candidatePathPointIndex = pointIndex;
+                        event.thresholdMeasurement = thresholdMeasurement;
+                        firstFailure = std::move(event);
+                    }
+                    if (matchedArc >= referenceEndArcBase - kReplayEpsilon) {
+                        reachedEnd = true;
+                        break;
+                    }
                 }
-                if (previousReferenceArc >= referenceEndArcBase - kReplayEpsilon) {
-                    referenceExhausted = true;
-                    terminalPartialEdge = index + 1 < points.size();
+                const double traversedFraction = std::clamp(
+                    traversedGeometryLengthBase / fullGeometryLengthBase,
+                    0.0, includedArcFraction);
+                addScaledCost(step.edgeCost, edge.cost, traversedFraction);
+                step.pathLengthPredictionVoxels = traversedFraction *
+                    edge.pathLengthPredictionVoxels;
+                built.edgeCost.invalidPrediction += step.edgeCost.invalidPrediction;
+                built.edgeCost.alignment += step.edgeCost.alignment;
+                built.edgeCost.isotropicSmoothness += step.edgeCost.isotropicSmoothness;
+                built.edgeCost.tangentSmoothness += step.edgeCost.tangentSmoothness;
+                built.edgeCost.normalSmoothness += step.edgeCost.normalSmoothness;
+                built.pathLengthPredictionVoxels +=
+                    step.pathLengthPredictionVoxels;
+                if (traversedFraction >= 1.0 - kReplayEpsilon)
+                    traversedNodes.insert(edge.target);
+                step.referenceEndArcBase = matchedArc;
+                built.committedSteps.push_back(std::move(step));
+                if (firstFailure.has_value() || reachedEnd)
+                    break;
+                if (includedArcFraction < 1.0 - kReplayEpsilon) {
+                    reachedEnd = true;
                     break;
                 }
             }
-            segment.candidateIndices.push_back(candidateIndex);
-            segment.arcIndices.push_back(arcIndex);
-            segment.edgeCost += edge.cost;
-            segment.totalLoss += edge.cost.total();
-            if (incomingArc.has_value()) {
-                if (selected->transitions.empty())
-                    throw std::logic_error("selected fiberlet route has no graph transition");
-                const auto& join = selected->transitions.front();
-                const size_t transitionIndexValue =
-                    join.diagnosticTransitionIndex.value_or(stableIndex(
-                        transitionIndices, std::pair{*incomingArc, arcId}));
-                segment.transitionIndices.push_back(transitionIndexValue);
-                segment.transitionCost += join.cost;
-                segment.totalLoss += join.cost.total();
+            built.totalLoss = built.edgeCost.total() +
+                built.transitionCost.total();
+            built.terminalPartialEdge = !built.arcIndices.empty() &&
+                traversedNodes.size() <= built.arcIndices.size();
+            if (!built.terminalPartialEdge && !built.arcIndices.empty())
+                built.stopNodeIndex = stableIndex(
+                    nodeIndices,
+                    targetAnchor(history[built.arcIndices.size() - 1]->arc));
+            return std::tuple{std::move(built), std::move(firstFailure),
+                reachedEnd, std::move(traversedNodes)};
+        };
+
+        double checkpointPredictionVoxels = 0.0;
+        for (size_t beamIteration = 0;
+             !distanceFailure.has_value() && !referenceExhausted;
+             ++beamIteration) {
+            const double currentCheckpoint = checkpointPredictionVoxels;
+            const double scoringHorizon = std::min(
+                maximumRouteLengthPredictionVoxels,
+                currentCheckpoint + lookaheadPredictionVoxels);
+            const double nextCheckpoint = std::min(
+                maximumRouteLengthPredictionVoxels,
+                currentCheckpoint + beamStepPredictionVoxels);
+            ExactPersistentSearchStats searchStats;
+            auto ranked = exactPersistentRouteLookahead(
+                graph, beams, scoringHorizon, nextCheckpoint,
+                initialDirection, config.beamWidth,
+                config.expansionThreads,
+                maximumGeneratedStates, searchStats);
+            if (ranked.empty())
+                break;
+            beams.clear();
+            beams.reserve(ranked.size());
+            for (const auto& entry : ranked) {
+                auto prefix = entry.prefix;
+                prefix.visitedNodes = compactPersistentVisited(
+                    prefix.visitedNodes);
+                beams.push_back(std::move(prefix));
             }
-            segment.pathLengthPredictionVoxels += edge.pathLengthPredictionVoxels;
-            committedStep.referenceEndArcBase = previousReferenceArc;
-            segment.committedSteps.push_back(std::move(committedStep));
-            if (!terminalPartialEdge) {
-                incomingArc = arcId;
-                currentNode = edge.target;
-                visitedNodes.insert(currentNode);
+            checkpointPredictionVoxels = nextCheckpoint;
+            if (std::any_of(beams.begin(), beams.end(),
+                    [&](const auto& beam) {
+                        return beam.pathLength + kReplayEpsilon <
+                            checkpointPredictionVoxels;
+                    })) {
+                throw std::logic_error(
+                    "persistent beam checkpoint exceeds a committed route");
             }
-            emitProgress(
-                result.segments.size(), previousReferenceArc, "running");
+            selectedRoute = beams.front();
+
+            auto [provisional, provisionalFailure, reachedEnd,
+                  provisionalTraversedNodes] =
+                materializeSelected(selectedRoute);
+            previousReferenceArc = provisional.endReferenceArcBase;
+            if (config.recordDecisionDiagnostics) {
+                FiberletGraphReplayDecision decision;
+                decision.routePointIndex =
+                    provisional.routePointsBaseXYZ.empty()
+                    ? 0
+                    : provisional.routePointsBaseXYZ.size() - 1;
+                decision.referenceArcBase = previousReferenceArc;
+                decision.checkpointPathLengthPredictionVoxels =
+                    currentCheckpoint;
+                decision.nextCheckpointPathLengthPredictionVoxels =
+                    checkpointPredictionVoxels;
+                decision.scoringHorizonPathLengthPredictionVoxels =
+                    scoringHorizon;
+                decision.generatedStateCount = searchStats.generated;
+                decision.expandedStateCount = searchStats.expanded;
+                decision.evaluatedCandidateCount = searchStats.completed;
+                decision.costPrunedStateCount = searchStats.costPruned;
+                decision.rejectedStateCount = searchStats.rejected;
+                decision.retainedBeamCount = ranked.size();
+                decision.sourceKey = graph.logicalAnchorId(seed->node.id);
+                decision.selectedRouteIndex = 0;
+                for (const auto& entry : ranked) {
+                    FiberletGraphReplayDecisionRoute route;
+                    route.prefixLogicalArcs =
+                        entry.prefixLogicalArcs;
+                    route.logicalArcs =
+                        entry.lookaheadLogicalArcs;
+                    route.routePointsBaseXYZ = persistentRoutePoints(
+                        graph, entry.lookahead,
+                        cv::Vec3d(seed->node.positionBaseXYZ));
+                    route.edgeCost = entry.scoredEdgeCost;
+                    route.transitionCost = entry.scoredTransitionCost;
+                    route.committedEdgeCost = entry.prefix.edgeCost;
+                    route.committedTransitionCost =
+                        entry.prefix.transitionCost;
+                    route.committedPathLengthPredictionVoxels =
+                        entry.prefix.pathLength;
+                    route.pathLengthPredictionVoxels =
+                        entry.scoredPathLength;
+                    route.completePathLengthPredictionVoxels =
+                        entry.completePathLength;
+                    route.totalLoss = entry.totalLoss;
+                    route.lossPerPredictionVoxel =
+                        entry.lossPerPredictionVoxel;
+                    decision.routes.push_back(std::move(route));
+                }
+                decisions.push_back(std::move(decision));
+            }
+            if (provisionalFailure.has_value()) {
+                segment = std::move(provisional);
+                selectedTraversedNodes =
+                    std::move(provisionalTraversedNodes);
+                distanceFailure = std::move(provisionalFailure);
+            } else if (reachedEnd ||
+                       checkpointPredictionVoxels >=
+                           maximumRouteLengthPredictionVoxels -
+                           kReplayEpsilon) {
+                segment = std::move(provisional);
+                selectedTraversedNodes =
+                    std::move(provisionalTraversedNodes);
+                referenceExhausted = true;
+            }
+            emitProgress(result.segments.size(), previousReferenceArc, "running");
         }
-        segment.terminalPartialEdge = terminalPartialEdge;
-        if (!terminalPartialEdge)
-            segment.stopNodeIndex = stableIndex(nodeIndices, currentNode);
-        consumedNodes.insert(visitedNodes.begin(), visitedNodes.end());
+        if (segment.routePointsBaseXYZ.size() <= 1) {
+            auto materialized = materializeSelected(selectedRoute);
+            segment = std::move(std::get<0>(materialized));
+            selectedTraversedNodes = std::move(std::get<3>(materialized));
+            if (!distanceFailure.has_value())
+                distanceFailure = std::move(std::get<1>(materialized));
+        }
+        segment.decisions = std::move(decisions);
+        consumedNodes.insert(selectedTraversedNodes.begin(),
+            selectedTraversedNodes.end());
 
         if (referenceExhausted && !distanceFailure.has_value()) {
             segment.endReferenceArcBase = referenceEndArcBase;
@@ -1362,24 +1918,20 @@ nlohmann::json fiberletGraphReplayJson(const FiberletGraphReplayResult& replay, 
         {"config",
          {
              {"beam_width", config.beamWidth},
-             {"lookahead_mode",
-                 config.lookaheadDistanceBaseVoxels.has_value()
-                     ? "distance"
-                     : "edges"},
-             {"lookahead_edges",
-                 config.lookaheadDistanceBaseVoxels.has_value()
-                     ? nlohmann::json(nullptr)
-                     : nlohmann::json(config.lookaheadEdges)},
+             {"expansion_threads", config.expansionThreads},
+             {"lookahead_mode", "exact_cost_bounded"},
+             {"beam_step_distance_base_voxels",
+                 config.beamStepDistanceBaseVoxels},
+             {"beam_step_distance_prediction_voxels",
+                 config.beamStepDistanceBaseVoxels /
+                     replay.predictionToBaseScale},
              {"lookahead_distance_base_voxels",
-                 config.lookaheadDistanceBaseVoxels.has_value()
-                     ? nlohmann::json(*config.lookaheadDistanceBaseVoxels)
-                     : nlohmann::json(nullptr)},
+                 config.lookaheadDistanceBaseVoxels},
              {"lookahead_distance_prediction_voxels",
-                 config.lookaheadDistanceBaseVoxels.has_value()
-                     ? nlohmann::json(
-                           *config.lookaheadDistanceBaseVoxels /
-                           replay.predictionToBaseScale)
-                     : nlohmann::json(nullptr)},
+                 config.lookaheadDistanceBaseVoxels /
+                     replay.predictionToBaseScale},
+             {"maximum_generated_states_per_iteration",
+                 config.maximumGeneratedStatesPerIteration},
              {"threshold", fiberReplayThresholdDescriptorJson(
                  config.errorThresholdBaseVoxels)},
              {"match_refine_steps", config.matchRefineSteps},
@@ -1422,6 +1974,9 @@ nlohmann::json fiberletGraphReplayJson(const FiberletGraphReplayResult& replay, 
         for (const auto& decision : segment.decisions) {
             nlohmann::json routes = nlohmann::json::array();
             for (const auto& route : decision.routes) {
+                nlohmann::json prefixLogicalArcs = nlohmann::json::array();
+                for (const auto& arc : route.prefixLogicalArcs)
+                    prefixLogicalArcs.push_back(arcIdJson(arc));
                 nlohmann::json logicalArcs = nlohmann::json::array();
                 for (const auto& arc : route.logicalArcs)
                     logicalArcs.push_back(arcIdJson(arc));
@@ -1429,9 +1984,8 @@ nlohmann::json fiberletGraphReplayJson(const FiberletGraphReplayResult& replay, 
                 for (const auto& point : route.routePointsBaseXYZ)
                     routePoints.push_back(pointJson(point));
                 routes.push_back({
+                    {"prefix_logical_arcs", std::move(prefixLogicalArcs)},
                     {"logical_arcs", std::move(logicalArcs)},
-                    {"included_arc_fractions",
-                        route.includedArcFractions},
                     {"route_points_base_xyz", std::move(routePoints)},
                     {"edge_cost", costJson(route.edgeCost)},
                     {"transition_cost", costJson(route.transitionCost)},
@@ -1443,6 +1997,8 @@ nlohmann::json fiberletGraphReplayJson(const FiberletGraphReplayResult& replay, 
                         route.committedPathLengthPredictionVoxels},
                     {"path_length_prediction_voxels",
                         route.pathLengthPredictionVoxels},
+                    {"complete_path_length_prediction_voxels",
+                        route.completePathLengthPredictionVoxels},
                     {"total_loss", route.totalLoss},
                     {"loss_per_prediction_voxel",
                         route.lossPerPredictionVoxel},
@@ -1451,6 +2007,20 @@ nlohmann::json fiberletGraphReplayJson(const FiberletGraphReplayResult& replay, 
             decisions.push_back({
                 {"route_point_index", decision.routePointIndex},
                 {"reference_arc_base", decision.referenceArcBase},
+                {"checkpoint_path_length_prediction_voxels",
+                    decision.checkpointPathLengthPredictionVoxels},
+                {"next_checkpoint_path_length_prediction_voxels",
+                    decision.nextCheckpointPathLengthPredictionVoxels},
+                {"scoring_horizon_path_length_prediction_voxels",
+                    decision.scoringHorizonPathLengthPredictionVoxels},
+                {"generated_state_count", decision.generatedStateCount},
+                {"expanded_state_count", decision.expandedStateCount},
+                {"evaluated_candidate_count",
+                    decision.evaluatedCandidateCount},
+                {"cost_pruned_state_count",
+                    decision.costPrunedStateCount},
+                {"rejected_state_count", decision.rejectedStateCount},
+                {"retained_beam_count", decision.retainedBeamCount},
                 {"source_key", storageKeyJson(decision.sourceKey)},
                 {"incoming_logical_arc",
                     decision.incomingLogicalArc.has_value()

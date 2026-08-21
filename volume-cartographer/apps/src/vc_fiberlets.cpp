@@ -92,7 +92,7 @@ struct CliOptions {
     double glyphLengthBaseVoxels = 16.0;
     size_t decodedCacheBytes = 512ULL * 1024ULL * 1024ULL;
     bool printStats = false;
-    bool lookaheadEdgesSpecified = false;
+    bool beamStepDistanceSpecified = false;
     bool writePresenceSlices = true;
     bool writeReplayVisualizations = false;
     bool alongSpecified = false;
@@ -188,15 +188,15 @@ void usage(const char* executable)
               << "  --arc N                       absolute reference-polyline start arc in base voxels\n"
               << "  --seed-key Z,Y,X,V            exact first graph-anchor key for a focused replay\n"
               << "  --route-stats-failure-margin N exclude this base-voxel distance around failures [128]\n"
-              << "  --lookahead-distance N        fixed graph lookahead arc in base voxels\n"
+              << "  --beam-step-distance N        rolling checkpoint step in base voxels [lookahead/4]\n"
+              << "  --lookahead-distance N        persistent beam lookahead in base voxels [192]\n"
               << "  --vis                         write indexed local failure visualizations\n"
               << "  --volume PATH                 required CT OME-Zarr array/group path for --vis\n"
               << "  --along N                     replay visualization half-width [128]; benchmark length [full]\n"
               << "  --radius N                    extraction tube radius in base voxels [64]\n"
               << "  --match-refine N              forward match refinement in trace steps [1]\n"
               << "  --inference-scaledown-power N prediction scaledown relative to trace voxels [2]\n";
-    std::cerr << "  --beam N                      graph replay beam width [16]\n"
-              << "  --lookahead N                 graph replay lookahead edges [3]\n"
+    std::cerr << "  --beam N                      graph replay beam width, 1..16 [16]\n"
               << "  --anchor-cache PATH           generated anchor cache [output/cache/anchors.zarr]\n"
               << "  --fiberlet-cache PATH         generated fiberlet cache [output/cache/fiberlets.zarr]\n"
               << "  --eager-graph                 diagnostic corridor-wide graph extraction\n"
@@ -344,6 +344,8 @@ CliOptions parseArgs(int argc, char** argv)
     options.anchors.parallelThreads = workers;
     options.paths.parallelThreads = workers;
     options.trace.parallelThreads = workers;
+    options.graphReplay.expansionThreads =
+        static_cast<size_t>(workers);
     for (int index = firstOption; index < argc; ++index) {
         const std::string argument = argv[index];
         if (argument == "--help" || argument == "-h") {
@@ -354,6 +356,8 @@ CliOptions parseArgs(int argc, char** argv)
             options.anchors.parallelThreads = value;
             options.paths.parallelThreads = value;
             options.trace.parallelThreads = value;
+            options.graphReplay.expansionThreads =
+                static_cast<size_t>(value);
         } else if (argument == "--cache-gib") {
             const double gib = parseDouble(valueAfter(index, argc, argv, "cache-gib"), "cache-gib");
             if (!(gib > 0.0) || gib > 1024.0)
@@ -475,15 +479,15 @@ CliOptions parseArgs(int argc, char** argv)
             options.paths.samplingBatchCoordinates = parseInt(valueAfter(index, argc, argv, "batch"), "batch");
         } else if (argument == "--beam" && usesGraphReplayOptions(options.command)) {
             const int value = parseInt(valueAfter(index, argc, argv, "beam"), "beam");
-            if (value < 1)
-                fail("--beam must be positive");
+            if (value < 1 || value > 16)
+                fail("--beam must be between one and 16");
             options.graphReplay.beamWidth = static_cast<size_t>(value);
-        } else if (argument == "--lookahead" && usesGraphReplayOptions(options.command)) {
-            const int value = parseInt(valueAfter(index, argc, argv, "lookahead"), "lookahead");
-            if (value < 1)
-                fail("--lookahead must be positive");
-            options.graphReplay.lookaheadEdges = static_cast<size_t>(value);
-            options.lookaheadEdgesSpecified = true;
+        } else if (argument == "--beam-step-distance" &&
+                   usesGraphReplayOptions(options.command)) {
+            options.graphReplay.beamStepDistanceBaseVoxels = parseDouble(
+                valueAfter(index, argc, argv, "beam-step-distance"),
+                "beam-step-distance");
+            options.beamStepDistanceSpecified = true;
         } else if (argument == "--lookahead-distance" &&
                    usesGraphReplayOptions(options.command)) {
             options.graphReplay.lookaheadDistanceBaseVoxels = parseDouble(
@@ -521,14 +525,11 @@ CliOptions parseArgs(int argc, char** argv)
         vc::fiber_tracer::validateFiberletPathConfig(options.paths);
     }
     if (usesGraphReplayOptions(options.command) &&
-        options.graphReplay.lookaheadDistanceBaseVoxels.has_value()) {
-        if (options.lookaheadEdgesSpecified) {
-            fail("--lookahead and --lookahead-distance are mutually exclusive");
-        }
-        if (!std::isfinite(*options.graphReplay.lookaheadDistanceBaseVoxels) ||
-            !(*options.graphReplay.lookaheadDistanceBaseVoxels > 0.0)) {
-            fail("--lookahead-distance must be finite and positive");
-        }
+        (!(options.graphReplay.beamStepDistanceBaseVoxels > 0.0) ||
+         !std::isfinite(options.graphReplay.beamStepDistanceBaseVoxels) ||
+         !(options.graphReplay.lookaheadDistanceBaseVoxels > 0.0) ||
+         !std::isfinite(options.graphReplay.lookaheadDistanceBaseVoxels))) {
+        fail("beam step and lookahead distances must be finite and positive");
     }
     if (isReplayCommand(options.command)) {
         if (!(options.failureThresholdBaseVoxels >= 0.0) || !(options.alongBaseVoxels > 0.0) || !(options.radiusBaseVoxels > 0.0) ||
@@ -741,6 +742,10 @@ double resolveAnchorConfig(CliOptions& options, const vc::fiber_tracer::FiberPre
     options.anchors.peakGridStepPredictionVoxels = options.peakStepBaseVoxels.value_or(0.5 * grid.predictionToBaseScale) / grid.predictionToBaseScale;
     options.anchors.localWindowRadiusPredictionVoxels = options.localWindowBaseVoxels.value_or(cellSideBase) / grid.predictionToBaseScale;
     options.anchors.axialSupportHalfWidthPredictionVoxels = 1.5 * options.anchors.cellSizePredictionVoxels;
+    if (!options.beamStepDistanceSpecified) {
+        options.graphReplay.beamStepDistanceBaseVoxels =
+            options.graphReplay.lookaheadDistanceBaseVoxels * 0.25;
+    }
     vc::fiber_tracer::validateFiberAnchorConfig(options.anchors);
     return cellSideBase;
 }
@@ -790,9 +795,9 @@ double quantizationExtractionArcPaddingBaseVoxels(
         (maximumCellOffset + std::sqrt(3.0)) * cellSideBase;
     const double seedWindowBase = std::max(
         options.graphReplay.minimumResetAdvanceBaseVoxels, cellSideBase);
-    return seedWindowBase +
-        static_cast<double>(options.graphReplay.lookaheadEdges + 1) *
-            maximumFiberletReachBase;
+    return seedWindowBase + options.graphReplay.beamStepDistanceBaseVoxels +
+        options.graphReplay.lookaheadDistanceBaseVoxels +
+        maximumFiberletReachBase;
 }
 
 std::filesystem::path writeQuantizationReplay(
@@ -957,6 +962,8 @@ nlohmann::json decisionRouteJson(
         {"total_loss", route->totalLoss},
         {"path_length_prediction_voxels",
             route->pathLengthPredictionVoxels},
+        {"complete_path_length_prediction_voxels",
+            route->completePathLengthPredictionVoxels},
         {"loss_per_prediction_voxel", route->lossPerPredictionVoxel},
     };
 }
@@ -989,6 +996,9 @@ nlohmann::json decisionRouteDeltaJson(
         {"path_length_prediction_voxels",
             scenario->pathLengthPredictionVoxels -
                 baseline->pathLengthPredictionVoxels},
+        {"complete_path_length_prediction_voxels",
+            scenario->completePathLengthPredictionVoxels -
+                baseline->completePathLengthPredictionVoxels},
         {"loss_per_prediction_voxel",
             scenario->lossPerPredictionVoxel -
                 baseline->lossPerPredictionVoxel},
@@ -2303,8 +2313,38 @@ int main(int argc, char** argv)
                     options.anchorCacheRoot,
                     cacheProfile.enabled() ? std::filesystem::path{} : options.fiberletCacheRoot,
                     progress);
+                const auto failurePrinter = [&](const vc::fiber_tracer::FiberReplayFailure& event) {
+                    std::cerr << std::setprecision(17)
+                              << "fiberlet_quantization_failure run=" << std::quoted(label)
+                              << " index=" << event.index
+                              << " reference_arc_base=" << event.referenceArcBase
+                              << " reference_arc_fraction=" << event.referenceArcFraction
+                              << " reason=" << event.reason;
+                    if (event.thresholdMeasurement.has_value()) {
+                        const auto& measurement = *event.thresholdMeasurement;
+                        std::cerr << " euclidean_error_base_voxels="
+                                  << measurement.euclideanErrorBaseVoxels
+                                  << " normal_error_base_voxels=";
+                        if (measurement.normalErrorBaseVoxels.has_value())
+                            std::cerr << *measurement.normalErrorBaseVoxels;
+                        else
+                            std::cerr << "n/a";
+                        std::cerr << " tangential_error_base_voxels=";
+                        if (measurement.tangentialErrorBaseVoxels.has_value())
+                            std::cerr << *measurement.tangentialErrorBaseVoxels;
+                        else
+                            std::cerr << "n/a";
+                        std::cerr << " threshold_error_base_voxels="
+                                  << measurement.thresholdErrorBaseVoxels
+                                  << " threshold_error_ratio="
+                                  << measurement.thresholdErrorRatio
+                                  << " local_normal_valid="
+                                  << (measurement.localNormalValid ? "true" : "false");
+                    }
+                    std::cerr << '\n' << std::flush;
+                };
                 auto replay = vc::fiber_tracer::
-                    traceFiberletGraphReplay(*context.graph, fiber.linePointsXyzBase, *normalSampler, grid.predictionToBaseScale, options.graphReplay, {}, [&](const auto& event) {
+                    traceFiberletGraphReplay(*context.graph, fiber.linePointsXyzBase, *normalSampler, grid.predictionToBaseScale, options.graphReplay, failurePrinter, [&](const auto& event) {
                         progress.updateFiberlet(event.referenceArcFraction);
                     });
                 progress.tracingComplete();

@@ -522,24 +522,36 @@ volume-cartographer/build/bin/vc_fiberlets fiberlet-replay \
   /tmp/fiberlet-replay \
   --normal-manifest /path/to/lasagna.lasagna.json \
   --beam 16 \
-  --lookahead 3 \
+  --beam-step-distance 48 \
+  --lookahead-distance 192 \
   --length 4096
 ```
 
-`--lookahead-distance N` is an experimental alternative to `--lookahead` and
-uses base voxels. The two options are mutually exclusive. Distance mode ranks
-every completed candidate over one common physical horizon rather than over a
-fixed number of variable-length fiberlets. Complete edges contribute their
-full stored cost. If the horizon cuts the last edge, every component of that
-edge's active graph cost view is multiplied by the included-length fraction;
-the incoming join remains full. Thus compact `uint8`/`uint16` scenarios scale
-their decoded authoritative scalar, not the underlying float total. Near the
-selected reference end the common horizon shortens to the remaining reference
-arc. Incomplete routes are not pruned at unequal lengths; completed routes are
-ordered canonically by density, total, and logical arc sequence. The mode fails
-explicitly if its bounded experimental route-state limit is exceeded.
+`--beam-step-distance D` and `--lookahead-distance H` use base voxels. The
+lookahead defaults to 192 base voxels and the step defaults to `H/4`, or 48 base
+voxels. The search maintains up to 16 whole-fiberlet histories and one shared
+logical checkpoint `C`, which never exceeds the shortest retained history.
+Every history is expanded through all valid graph branches until it reaches or
+passes `C+H`. The last fiberlet is kept whole, so completed candidates may
+overshoot that logical horizon by different small amounts. They are ranked by
+whole-route loss per prediction voxel, then raw loss and logical route ID. One
+global prune retains the best 16 committed prefixes.
 
-The distance option is replay state only. It is absent from anchor/fiberlet
+After pruning, the checkpoint advances by `D`. Each retained history is
+committed through the complete fiberlet containing the new checkpoint. A beam
+may therefore commit no new fiberlet, one fiberlet, or several fiberlets during
+one iteration, and its stored endpoint may lie beyond the shared checkpoint.
+There is no intermediate per-depth or per-parent prune. Complete edges and
+their entering joins contribute their full active graph-view cost. Routes that
+cannot reach the common lookahead horizon are excluded, and exceeding the
+explicit per-iteration state bound fails rather than changing the search.
+
+Only final reference-end or failure materialization may clip the displayed
+route inside a fiberlet; this does not alter search costs or beam state. A
+reference failure, graph exhaustion, or the selected end closes the persistent
+population.
+
+The beam-step and lookahead distances are replay state only. They are absent from anchor/fiberlet
 cache fingerprints, extraction settings, and serialized chunk payloads. A new
 horizon can request previously untouched on-demand chunks, but a fully hot
 cache is reopened without rewriting it.
@@ -572,8 +584,9 @@ The separate anchor and fiberlet `ChunkCache` instances retain typed decoded
 payloads directly and charge their vectors and indices to the shared LRU
 budget; they do not retain another serialized copy or use a graph-private LRU.
 Prefix records and exact endpoint steps are sufficient for beam ranking and
-join scoring. A route block is loaded and its full polyline reconstructed only
-after an edge is selected for commitment. Evicted chunks reload transparently.
+join scoring. Route blocks are loaded only for the current provisional best
+history during reference-error evaluation and for final output. Evicted chunks
+reload transparently.
 For the float cache, anchors own the exact interpolated prediction/presence and
 normal samples used by eager graph construction, while prefixes own all five
 float path-cost components, the authoritative float path length, and the exact
@@ -1254,11 +1267,13 @@ segments. Focused diagnostics reopen the completed full-corridor cache identity
 but disable its schedule prefetch. The graph therefore loads, or generates when
 missing, only chunks reached by seed selection and the completed beam route.
 
-Focused replay JSON includes each decision's final ranked beam frontier. Every
-route records logical fiberlet IDs, route points in base coordinates, edge and
-transition cost components, path length, total loss, and loss per prediction
-voxel. Distance-mode routes additionally record one included fraction per arc;
-their final diagnostic polyline is clipped at the scored fraction. A sibling
+Focused replay JSON includes each decision's retained beam frontier, current
+and next logical checkpoints, whole-fiberlet scoring horizon, expansion thread
+count, and evaluated/retained candidate counts. Every route records its
+committed whole-fiberlet prefix IDs separately from its best lookahead
+continuation, plus route points in base coordinates, edge and transition costs,
+actual path length including final-edge overshoot, total loss, and loss per
+prediction voxel. A sibling
 `decision-comparison-<scenario>.json` reports the first
 selected-route difference, cross-ranks each run's choice in the other run when
 that route exists, and reports the maximum symmetric distance between paired
