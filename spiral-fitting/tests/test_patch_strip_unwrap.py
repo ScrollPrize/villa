@@ -47,7 +47,7 @@ class FakeAtlas:
 
     def __init__(self, grids, device):
         if spiral_sampling is None:
-            raise RuntimeError('vc.spiral_sampling is required by this test')
+            raise RuntimeError('vc_spiral.spiral_sampling is required by this test')
         self.grids = grids
         self.device = torch.device(device)
         self.node_maps = []

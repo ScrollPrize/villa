@@ -23,7 +23,7 @@ class _Atlas:
 
     def __init__(self, patch_points, node_maps):
         if spiral_sampling is None:
-            raise RuntimeError('vc.spiral_sampling is required by this test')
+            raise RuntimeError('vc_spiral.spiral_sampling is required by this test')
         self.patch_points = [torch.tensor(p, dtype=torch.float32)
                              for p in patch_points]
         self.node_maps = node_maps

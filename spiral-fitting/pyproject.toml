@@ -35,8 +35,13 @@ dependencies = [
 ]
 
 [build-system]
-requires = ["setuptools"]
-build-backend = "setuptools.build_meta"
+requires = [
+    "scikit-build-core>=0.10",
+    "nanobind>=2.0",
+]
+build-backend = "scikit_build_core.build"
 
-[tool.setuptools]
-py-modules = []
+[tool.scikit-build]
+cmake.source-dir = "cpp"
+cmake.version = ">=3.22"
+wheel.packages = ["vc_spiral"]

@@ -2,7 +2,7 @@
 """Find pairs of overlapping tifxyz patches via the surface patch spatial index.
 
 Loads a folder of tifxyz patches (as fit_spiral.py does), builds a
-``vc.surface_index.SurfacePatchIndex`` over all of them, then for each patch
+``vc_spiral.surface_index.SurfacePatchIndex`` over all of them, then for each patch
 queries the index with all of that patch's valid vertices in a batch. Every
 *other* patch whose surface lies within ``--tolerance`` of those vertices is an
 overlap candidate; the number of the patch's vertices that land on the other
@@ -74,7 +74,7 @@ def load_patches(patches_path, limit=None, segment_id_filter=lambda s: True):
 
 def build_surface_index(patches, bbox_padding, sampling_stride):
     """Build a SurfacePatchIndex containing every patch, keyed by patch id."""
-    from vc import surface_index
+    from vc_spiral import surface_index
 
     surfaces = []
     for patch_id, patch in patches.items():

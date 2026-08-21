@@ -8,7 +8,7 @@ import os
 import numpy as np
 from scipy.sparse import csr_array
 from scipy.sparse.csgraph import breadth_first_order, connected_components, maximum_flow
-import vc.track_store as track_store
+import vc_spiral.track_store as track_store
 import vc_delta3d  # Registers VC-Delta3D with numcodecs.
 import zarr
 import fsspec

@@ -41,38 +41,21 @@ TRACK_STORE_MAGIC = b'VCTRK01\0'
 
 
 def _load_native_track_crossings():
-    """Load the optional VC native crossing kernel without making Spiral depend on it."""
+    """Load the optional native crossing kernel shipped with Spiral."""
     if os.environ.get('VC_DISABLE_NATIVE_TRACK_CROSSINGS') == '1':
         return None
     try:
-        # Editable VC installs may point ``vc`` at site-packages even while a
-        # newer extension exists in this checkout's build tree. Prefer that
-        # developer build so repo scripts use the matching native kernel
-        # immediately after ``ninja -C build vc_track_crossings``.
-        import vc
-        build_package = (Path(__file__).resolve().parents[1]
-                         / 'volume-cartographer/build/python/vc')
-        if build_package.is_dir() and str(build_package) not in vc.__path__:
-            vc.__path__.insert(0, str(build_package))
-        return importlib.import_module('vc.track_crossings')
+        return importlib.import_module('vc_spiral.track_crossings')
     except ImportError:
         return None
 
 
 def _load_native_track_store():
-    """Load the mmap-backed packed-track extension from install or build tree."""
+    """Load the mmap-backed packed-track extension shipped with Spiral."""
     try:
-        return importlib.import_module('vc.track_store')
+        return importlib.import_module('vc_spiral.track_store')
     except ImportError:
-        try:
-            import vc
-            build_package = (Path(__file__).resolve().parents[1]
-                             / 'volume-cartographer/build/python/vc')
-            if build_package.is_dir() and str(build_package) not in vc.__path__:
-                vc.__path__.append(str(build_package))
-            return importlib.import_module('vc.track_store')
-        except ImportError:
-            return None
+        return None
 
 
 class PackedTrackCollection:
@@ -1463,7 +1446,7 @@ def build_crossing_partner_csr_disk_backed(
         tracks = _MemmapTrackCollection(coordinates, offsets)
         if native is None:
             print(
-                'WARNING: vc.track_crossings is unavailable; using the much '
+                'WARNING: vc_spiral.track_crossings is unavailable; using the much '
                 'slower high-memory Python crossing consolidator')
             raw_events = _scan_hybrid_crossing_index(
                 tracks, offsets, family_codes, packed, order,
@@ -2423,7 +2406,7 @@ def prepare_main_phase_tracks(
                         'compatible exact-crossing cache')
                 if native is None or not hasattr(native, 'prepare_walk_index'):
                     raise RuntimeError(
-                        'track_walk requires the native vc.track_crossings module')
+                        'track_walk requires the native vc_spiral.track_crossings module')
                 if walk_index is None:
                     walk_offsets = np.asarray(
                         restricted_csr['offsets'], dtype=np.int64)

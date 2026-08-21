@@ -87,7 +87,7 @@ def load_point_collection(filename: str) -> Optional[Dict[int, Dict[str, Any]]]:
 
 def _load_surface_index_backend():
     try:
-        from vc import surface_index
+        from vc_spiral import surface_index
         return surface_index
     except ImportError:
         return None
@@ -230,7 +230,7 @@ def _link_points_to_patches_with_surface_index(
     if not point_collections:
         return links
 
-    print(f'linking points to patches with vc.surface_index ({len(surface_ids)} patches)')
+    print(f'linking points to patches with vc_spiral.surface_index ({len(surface_ids)} patches)')
 
     if not hasattr(index, 'locate_all_xyz_batch'):
         for collection_id, collection in tqdm(point_collections.items(), 'linking points to patches'):
@@ -317,7 +317,7 @@ def _link_between_patch_collections_with_surface_index(
     surface_id_to_idx = {surface_id: idx for idx, surface_id in enumerate(surface_ids)}
     use_subset_query = hasattr(index, 'locate_all_xyz_batch_in')
     print(
-        f'linking between-patch pcls with vc.surface_index ({len(surface_ids)} patches'
+        f'linking between-patch pcls with vc_spiral.surface_index ({len(surface_ids)} patches'
         f'{", subset query" if use_subset_query else ""})'
     )
 

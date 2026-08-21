@@ -124,7 +124,7 @@ class _ListPatchAtlas:
         if atlas_type is None:
             raise RuntimeError(
                 'Packed satisfaction requires '
-                'vc.spiral_sampling.PatchSatisfactionAtlas')
+                'vc_spiral.spiral_sampling.PatchSatisfactionAtlas')
         masks = [np.ascontiguousarray(
             patch.valid_quad_mask.cpu().numpy(), dtype=bool)
             for patch in self.patches]

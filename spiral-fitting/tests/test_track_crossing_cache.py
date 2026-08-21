@@ -72,6 +72,7 @@ class TrackCrossingCacheTests(unittest.TestCase):
             prepared = prepare_main_phase_tracks(
                 tracks, None, 0.0, 'cpu',
                 sampling_config={
+                    'track_crossing_mode': 'count',
                     'track_crossing_precompute_max': 1,
                     'track_max_track_crossing_per_step': 1,
                 },
@@ -117,6 +118,7 @@ class TrackCrossingCacheTests(unittest.TestCase):
             prepared = prepare_main_phase_tracks(
                 tracks, None, 0.0, 'cpu',
                 sampling_config={
+                    'track_crossing_mode': 'count',
                     'track_crossing_precompute_max': 1,
                     'track_max_track_crossing_per_step': 1,
                 },
@@ -151,6 +153,7 @@ class TrackCrossingCacheTests(unittest.TestCase):
             prepared = prepare_main_phase_tracks(
                 tracks, None, 0.0, 'cpu',
                 sampling_config={
+                    'track_crossing_mode': 'count',
                     'track_crossing_precompute_max': 1,
                     'track_max_track_crossing_per_step': 1,
                 },

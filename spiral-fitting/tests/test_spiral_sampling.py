@@ -13,7 +13,7 @@ spiral_sampling = load_spiral_sampling()
 class PatchSamplingBindingTests(unittest.TestCase):
     def setUp(self):
         self.assertIsNotNone(
-            spiral_sampling, 'vc.spiral_sampling is required for patch sampling')
+            spiral_sampling, 'vc_spiral.spiral_sampling is required for patch sampling')
         self.mask = np.ones((31, 37), dtype=bool)
         self.mask[8:14, 10:22] = False
         self.atlas = spiral_sampling.PatchSamplingAtlas([self.mask])
@@ -123,7 +123,7 @@ class PatchSamplingBindingTests(unittest.TestCase):
             expected_edges[np.lexsort((expected_edges[:, 1], expected_edges[:, 0]))])
 
 
-@unittest.skipUnless(spiral_sampling is not None, "vc.spiral_sampling is not built")
+@unittest.skipUnless(spiral_sampling is not None, "vc_spiral.spiral_sampling is not built")
 class DtTargetBindingTests(unittest.TestCase):
     def setUp(self):
         self.previous_binding = dt_targets._spiral_sampling

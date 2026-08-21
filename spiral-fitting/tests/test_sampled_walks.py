@@ -16,7 +16,7 @@ class _Atlas:
 
     def __init__(self, masks):
         if spiral_sampling is None:
-            raise RuntimeError('vc.spiral_sampling is required by this test')
+            raise RuntimeError('vc_spiral.spiral_sampling is required by this test')
         self.sampling_atlas = spiral_sampling.PatchSamplingAtlas(masks)
         self.node_maps = []
         start = 0

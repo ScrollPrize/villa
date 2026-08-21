@@ -229,7 +229,11 @@ class TrackWalkConfigurationTests(unittest.TestCase):
             torch.tensor([1, 3, 5]),
             torch.tensor([1, 2, 3]),
             row_count=4,
-            chain=True)
+            chain=True,
+            edge_group_id=torch.tensor([0, 0, 0]),
+            edge_slot=torch.tensor([0, 1, 2]),
+            group_count=1,
+            maximum_hops=3)
         # +8 aligns row 1; row 2 then sees 5+8 at its source crossing,
         # and row 3 likewise inherits the full preceding-chain offset.
         torch.testing.assert_close(
@@ -246,7 +250,11 @@ class TrackWalkConfigurationTests(unittest.TestCase):
             torch.tensor([1, 3, 5, 7]),
             torch.tensor([1, 2, 4, 5]),
             row_count=6,
-            chain=True)
+            chain=True,
+            edge_group_id=torch.tensor([0, 0, 1, 1]),
+            edge_slot=torch.tensor([0, 1, 0, 1]),
+            group_count=2,
+            maximum_hops=2)
         torch.testing.assert_close(
             alignment, torch.tensor([0.0, 8.0, 12.0, 0.0, 1.0, 4.0]))
 

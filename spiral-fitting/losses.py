@@ -165,8 +165,8 @@ def _sample_patch_points(patch_indices, cap, rng, patch_atlas):
     if sampling_atlas is None or not hasattr(sampling_atlas, 'sample_patch_points'):
         raise RuntimeError(
             'Patch sampling requires '
-            'vc.spiral_sampling.PatchSamplingAtlas.sample_patch_points; '
-            'rebuild and install the vc_spiral_sampling extension')
+            'vc_spiral.spiral_sampling.PatchSamplingAtlas.sample_patch_points; '
+            'rebuild and install the Spiral native extensions')
     seed = int(rng.randint(0, np.iinfo(np.int64).max))
     sampled = sampling_atlas.sample_patch_points(
         np.ascontiguousarray(patch_indices, dtype=np.int64), cap, seed)

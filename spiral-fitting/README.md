@@ -65,6 +65,11 @@ cd spiral-fitting
 uv sync            # creates .venv from pyproject.toml
 ```
 
+This also builds Spiral's native helpers as `vc_spiral.spiral_sampling`,
+`vc_spiral.track_crossings`, `vc_spiral.track_store`, and
+`vc_spiral.surface_index`. OpenMP is used when the toolchain provides it; the
+same modules build with serial kernels when it does not.
+
 or with conda/pip, install `torch` for your CUDA version and then
 `pip install -e .` from `spiral-fitting/`.
 
@@ -365,7 +370,7 @@ a current adjacent packed store while retaining the DBM as the authoritative
 source and compatibility fallback. A source-file fingerprint prevents a stale
 store from being used after the DBM changes; rerun with `--force` to replace it.
 
-The native `vc.track_store` loader memory-maps the packed files, applies the Z
+The native `vc_spiral.track_store` loader memory-maps the packed files, applies the Z
 ROI from per-track metadata, and emits one compact float32 ragged array without
 constructing per-track Python objects. The crossing builder also stages
 directly from a current packed store, bypassing DBM and pickle decoding.
@@ -388,10 +393,10 @@ entirely contained in that range. Omit both options to index the whole DBM.
 The standalone builder uses a hybrid memory/disk index: it streams DBM tracks
 into temporary coordinate and packed-voxel files, keeps the coordinates
 memory-mapped, then loads and radix-sorts the packed keys in RAM. The native
-`vc.track_crossings` kernel uses all requested workers for sorting, exact-voxel
-discovery, arclength calculation, and pair consolidation. Build it for a source
-checkout with `ninja -C build vc_track_crossings`; installed VC Python packages
-include it automatically. A slower Python fallback remains available.
+`vc_spiral.track_crossings` kernel uses all requested workers for sorting,
+exact-voxel discovery, arclength calculation, and pair consolidation. The
+extension is built with the other Spiral native modules by `uv sync` from this
+directory. A slower Python fallback remains available.
 
 The builder needs roughly 20 bytes of temporary disk space per selected point.
 The native radix sort temporarily holds about 32 RAM bytes per point; after the

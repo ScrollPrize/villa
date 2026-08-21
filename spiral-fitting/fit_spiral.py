@@ -338,8 +338,8 @@ def _make_patch_sampling_atlas(masks):
         if spiral_sampling is not None else None)
     if atlas_type is None:
         raise RuntimeError(
-            'Patch sampling requires vc.spiral_sampling.PatchSamplingAtlas; '
-            'rebuild and install the vc_spiral_sampling extension')
+            'Patch sampling requires vc_spiral.spiral_sampling.PatchSamplingAtlas; '
+            'rebuild and install the Spiral native extensions')
     atlas = atlas_type(masks)
     required = (
         'sample_patch_points', 'valid_counts', 'total_valid_cells',
@@ -349,9 +349,9 @@ def _make_patch_sampling_atlas(masks):
     missing = [name for name in required if not hasattr(atlas, name)]
     if missing:
         raise RuntimeError(
-            'The installed vc.spiral_sampling binding is out of date: '
+            'The installed vc_spiral.spiral_sampling binding is out of date: '
             f'PatchSamplingAtlas is missing {", ".join(missing)}; rebuild and '
-            'install the vc_spiral_sampling extension')
+            'install the Spiral native extensions')
     return atlas
 
 
@@ -511,8 +511,8 @@ class PatchAtlas:
         if atlas_type is None:
             raise RuntimeError(
                 'Packed satisfaction requires '
-                'vc.spiral_sampling.PatchSatisfactionAtlas; rebuild the '
-                'vc_spiral_sampling extension')
+                'vc_spiral.spiral_sampling.PatchSatisfactionAtlas; rebuild the '
+                'Spiral native extensions')
         masks = [np.ascontiguousarray(
             patch.valid_quad_mask.cpu().numpy(), dtype=bool)
             for patch in self._patches]
