@@ -2127,11 +2127,11 @@ class UploadTests(unittest.TestCase):
             _planned_run(self.state, {"iterations": 10, "run_config": {
                 "model_num_flow_stages": 2,
             }})
-        with self.assertRaisesRegex(ValueError, "Invalid value"):
+        with self.assertRaisesRegex(ApiError, "Invalid value"):
             _planned_run(self.state, {"iterations": 10, "run_config": {
                 "output_save_png_visualizations": 1,
             }})
-        with self.assertRaisesRegex(ValueError, "vector length"):
+        with self.assertRaisesRegex(ApiError, "vector length"):
             _planned_run(self.state, {"iterations": 10, "run_config": {
                 "track_length_bin_weights": [1, 2],
             }})
@@ -2157,7 +2157,7 @@ class UploadTests(unittest.TestCase):
         inputs["outer_shell"] = str(shell)
         with self.assertRaisesRegex(ApiError, "Static dataset inputs") as caught:
             self.state.run({
-                "configuration": Config().as_dict(),
+                "configuration": dict(Config.catalog()["defaults"]),
                 "iterations": 3,
                 "inputs": inputs,
                 "expected_session_revision": self.state.session_revision,
@@ -2170,7 +2170,7 @@ class UploadTests(unittest.TestCase):
         inputs["verified_patches"] = str(self.dataset / "other-patches")
         with self.assertRaisesRegex(ApiError, "Static dataset inputs") as caught:
             self.state.run({
-                "configuration": Config().as_dict(),
+                "configuration": dict(Config.catalog()["defaults"]),
                 "iterations": 3,
                 "inputs": inputs,
                 "expected_session_revision": self.state.session_revision,
