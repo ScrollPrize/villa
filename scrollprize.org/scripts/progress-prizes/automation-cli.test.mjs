@@ -65,10 +65,10 @@ function stagingEnv(overrides = {}) {
     PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL: PRIVATE.account,
     PROGRESS_PRIZE_SOURCE_FORM_ID: PRIVATE.form,
     PROGRESS_PRIZE_EDITOR_GROUP_EMAIL: PRIVATE.group,
-    PROGRESS_PRIZE_BRANCH: 'codex/progress-prize-smoke-20260720',
-    PROGRESS_PRIZE_TARGET_BRANCH: 'codex/progress-prize-smoke-base-20260720',
+    PROGRESS_PRIZE_BRANCH: 'staging/progress-prize-rehearsal',
+    PROGRESS_PRIZE_TARGET_BRANCH: 'staging/progress-prize-base',
     PROGRESS_PRIZE_DEFAULT_TARGET_BRANCH: 'main',
-    PROGRESS_PRIZE_SMOKE_BRANCH_PREFIX: 'codex/progress-prize-smoke-',
+    PROGRESS_PRIZE_SMOKE_BRANCH_PREFIX: 'staging/progress-prize-',
     PROGRESS_PRIZE_SMOKE_DATE: '2026-07-20',
     ...overrides,
   };

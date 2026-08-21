@@ -19,12 +19,14 @@ jobs:
       github.ref == 'refs/heads/main' &&
       github.actor == 'vercel[bot]' &&
       (
-        github.event.client_payload.git.ref == 'codex/progress-prize-smoke-20260720' ||
-        github.event.client_payload.git.ref == 'refs/heads/codex/progress-prize-smoke-20260720' ||
-        github.event.client_payload.git.ref == 'codex/progress-prize-smoke-base-20260720' ||
-        github.event.client_payload.git.ref == 'refs/heads/codex/progress-prize-smoke-base-20260720' ||
-        startsWith(github.event.client_payload.git.ref, 'codex/progress-prize-') ||
-        startsWith(github.event.client_payload.git.ref, 'refs/heads/codex/progress-prize-')
+        (
+          startsWith(github.event.client_payload.git.ref, 'codex/progress-prize-') &&
+          !startsWith(github.event.client_payload.git.ref, 'codex/progress-prize-smoke-')
+        ) ||
+        (
+          startsWith(github.event.client_payload.git.ref, 'refs/heads/codex/progress-prize-') &&
+          !startsWith(github.event.client_payload.git.ref, 'refs/heads/codex/progress-prize-smoke-')
+        )
       )
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -155,28 +157,19 @@ jobs:
               ? deployment.ref.slice('refs/heads/'.length)
               : deployment.ref;
 
-            const smokeHead = branch === 'codex/progress-prize-smoke-20260720';
-            const smokeBase = branch === 'codex/progress-prize-smoke-base-20260720';
             const productionHead = /^codex\/progress-prize-\d{4}-\d{2}$/.test(branch);
-            if (!smokeHead && !smokeBase && !productionHead) {
+            if (!productionHead) {
               throw new Error('Deployment ref is outside the automation allowlist.');
             }
 
-            let associated = false;
-            if (smokeBase) {
-              const ref = await github(`/repos/${owner}/${repo}/git/ref/heads/${encodeURIComponent(branch)}`);
-              associated = ref?.object?.type === 'commit' && ref.object.sha === deployment.sha;
-            } else {
-              const pulls = await github(
-                `/repos/${owner}/${repo}/pulls?state=open&head=${encodeURIComponent(`${owner}:${branch}`)}&per_page=10`,
-              );
-              const expectedBase = smokeHead ? 'codex/progress-prize-smoke-base-20260720' : 'main';
-              associated = Array.isArray(pulls)
-                && pulls.length === 1
-                && pulls[0].head?.sha === deployment.sha
-                && pulls[0].head?.ref === branch
-                && pulls[0].base?.ref === expectedBase;
-            }
+            const pulls = await github(
+              `/repos/${owner}/${repo}/pulls?state=open&head=${encodeURIComponent(`${owner}:${branch}`)}&per_page=10`,
+            );
+            const associated = Array.isArray(pulls)
+              && pulls.length === 1
+              && pulls[0].head?.sha === deployment.sha
+              && pulls[0].head?.ref === branch
+              && pulls[0].base?.ref === 'main';
             if (!associated) throw new Error('Deployment does not match trusted GitHub state.');
             associatedSha = deployment.sha;
             await status(associatedSha, 'pending', 'Verifying the exact Vercel preview');
