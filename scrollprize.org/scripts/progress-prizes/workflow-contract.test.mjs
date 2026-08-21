@@ -163,6 +163,52 @@ test('composite production activation guard requires an exact immutable base lea
   }
 });
 
+test('composite action rejects retired staging inputs before authentication', async () => {
+  const action = await googleAction();
+  const guard = literalRunScripts(action)[0]?.source;
+  const valid = {
+    REPOSITORY: 'ScrollPrize/villa',
+    REPOSITORY_ID: '890972577',
+    REPOSITORY_OWNER_ID: '121906140',
+    REF: 'refs/heads/main',
+    AUTOMATION_ENVIRONMENT: 'production',
+    EVENT_NAME: 'workflow_dispatch',
+    OPERATION: 'prepare',
+    SIMULATED_NOW: '',
+    FAULT: '',
+    EXPECT_FAULT: 'false',
+    DRY_RUN: 'false',
+    ALLOW_ACTIVATION_REWIND: 'false',
+    VERIFY_MODE: 'prepared',
+    BRANCH: 'codex/progress-prize-2026-08',
+    TARGET_BRANCH: 'main',
+    SOURCE_CYCLE: '2026-07',
+    TARGET_CYCLE: '2026-08',
+    HEAD_SHA: '',
+    BASE_SHA: '',
+  };
+  const run = (override = {}) => spawnSync('bash', ['--noprofile', '--norc'], {
+    input: guard,
+    encoding: 'utf8',
+    env: { ...valid, ...override },
+  });
+
+  for (const override of [
+    { AUTOMATION_ENVIRONMENT: 'staging' },
+    { AUTOMATION_ENVIRONMENT: 'staging', SIMULATED_NOW: '2026-08-01T07:01:00.000Z' },
+    { AUTOMATION_ENVIRONMENT: 'staging', FAULT: 'after-copy' },
+    { AUTOMATION_ENVIRONMENT: 'staging', FAULT: 'after-copy', EXPECT_FAULT: 'true' },
+    {
+      AUTOMATION_ENVIRONMENT: 'staging',
+      OPERATION: 'bootstrap',
+      TARGET_CYCLE: '2026-08',
+      ALLOW_ACTIVATION_REWIND: 'true',
+    },
+  ]) {
+    assert.notEqual(run(override).status, 0, JSON.stringify(override));
+  }
+});
+
 test('composite reconcile-active guard is manual, real-clock, and marker-only', async () => {
   const action = await googleAction();
   const guard = literalRunScripts(action)[0]?.source;
