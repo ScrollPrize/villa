@@ -130,6 +130,26 @@ add_test(NAME fiber_save_batch_tracker COMMAND test_fiber_save_batch_tracker)
 vc_register_test_target(test_fiber_save_batch_tracker)
 vc_register_ctest(fiber_save_batch_tracker test_fiber_save_batch_tracker)
 
+add_executable(test_fiber_network_layout
+    test_fiber_network_layout.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberNetworkLayout.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberNetworkLayout.hpp)
+
+set_target_properties(test_fiber_network_layout PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_fiber_network_layout PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D
+    ${OpenCV_INCLUDE_DIRS})
+
+target_link_libraries(test_fiber_network_layout PRIVATE
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME fiber_network_layout COMMAND test_fiber_network_layout)
+vc_register_test_target(test_fiber_network_layout)
+vc_register_ctest(fiber_network_layout test_fiber_network_layout)
+
 add_executable(test_command_line_tool_runner
     test_command_line_tool_runner.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/CommandLineToolRunner.cpp
