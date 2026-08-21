@@ -533,6 +533,7 @@ def main(meshes_dir, volume, vc_render_bin, scale, group_idx, num_slices, num_pr
             return None
         return max_composite(tif_paths)
 
+    rendered_strips = 0
     with ThreadPoolExecutor(max_workers=max(1, num_processes)) as pool:
         futures = {pool.submit(render, name, cp): name for name, cp in render_items}
         for n, future in enumerate(as_completed(futures)):
@@ -563,6 +564,11 @@ def main(meshes_dir, volume, vc_render_bin, scale, group_idx, num_slices, num_pr
                 print(f'[{n + 1}/{len(render_items)}] wrote {n_tiles} tiles '
                       f'{name}.000-{n_tiles - 1:03d}.jpg ({width}px wide total, '
                       f'p95={p95:.1f})')
+            rendered_strips += 1
+
+    if rendered_strips == 0:
+        raise click.ClickException(
+            f'render produced no ink strip images in {collect_dir}')
 
     print(f'Done. Strips in {collect_dir}')
 

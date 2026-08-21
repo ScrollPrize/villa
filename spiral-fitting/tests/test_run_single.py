@@ -223,6 +223,36 @@ def _runner_args(tmp_path, *extra):
     ])
 
 
+def test_render_artifact_requires_at_least_one_strip_image(tmp_path):
+    ink = tmp_path / "ink"
+    ink.mkdir()
+
+    with pytest.raises(RuntimeError, match="without ink strip images"):
+        run_single._require_ink_output(ink)
+
+    (ink / "renderer.log").write_text("not an image")
+    with pytest.raises(RuntimeError, match="without ink strip images"):
+        run_single._require_ink_output(ink)
+
+    (ink / "w001-002_flat.000.jpg").touch()
+    run_single._require_ink_output(ink)
+
+
+def test_completed_render_state_rejects_an_empty_ink_directory(tmp_path):
+    fitted = tmp_path / "fitted"
+    fitted.mkdir()
+    ink = tmp_path / "ink"
+    ink.mkdir()
+    state = {"runs": {"single": {
+        "fit": {"status": "complete", "fitted_output": "fitted"},
+        "render": {"status": "complete", "ink_output": "ink"},
+        "metrics": {"status": "pending"},
+    }}}
+
+    with pytest.raises(RuntimeError, match="render artifact is invalid"):
+        run_single._validate_completed_stages(tmp_path, state)
+
+
 def _fake_pipeline_subprocess(calls, *, fail_seed=None):
     def fake_run(command, *, check, env):
         calls.append((command, env))
