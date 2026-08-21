@@ -53,6 +53,12 @@ Image.MAX_IMAGE_PIXELS = None
 from tifxyz import load_tifxyz, save_tifxyz
 
 
+def default_lasagna_dir(script_path=__file__):
+    """Return the sibling Lasagna checkout for a render_ink script path."""
+    script_dir = os.path.dirname(os.path.abspath(script_path))
+    return os.path.abspath(os.path.join(script_dir, '..', 'lasagna'))
+
+
 def is_tifxyz(path):
     meta_path = os.path.join(path, 'meta.json')
     if not os.path.isdir(path) or not os.path.exists(meta_path):
@@ -465,9 +471,7 @@ def main(meshes_dir, volume, vc_render_bin, scale, group_idx, num_slices, num_pr
     # unflattened).
     full_items = []  # (name, mesh_path) rendered in addition to `chunks`
     if full_scroll:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        l_dir = os.path.abspath(lasagna_dir) if lasagna_dir else os.path.abspath(
-            os.path.join(script_dir, '..', '..', '..', 'lasagna'))
+        l_dir = os.path.abspath(lasagna_dir) if lasagna_dir else default_lasagna_dir()
         l_cfg = lasagna_config or os.path.join(l_dir, 'configs', 'flatten_fast_nofilter.json')
         if lasagna_fit_script:
             l_fit = lasagna_fit_script
