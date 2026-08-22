@@ -350,6 +350,8 @@ class Inferer():
                  model_cache_dir: str = DEFAULT_MODEL_CACHE_DIR,
                  max_patches: int = None,
                  bbox: [list, tuple] = None,
+                 chunk_cache_dir: str = None,
+                 chunk_cache_max_gb: float = None,
                  ):
         print(f"Initializing Inferer with output_dir: '{output_dir}'")
         if output_dir and not output_dir.strip():
@@ -387,6 +389,8 @@ class Inferer():
         self.model_cache_dir = model_cache_dir
         self.max_patches = max_patches
         self.bbox = tuple(bbox) if bbox is not None else None
+        self.chunk_cache_dir = chunk_cache_dir
+        self.chunk_cache_max_gb = chunk_cache_max_gb
         self.model_patch_size = None
         self.num_classes = None
 
@@ -840,6 +844,8 @@ class Inferer():
             anon=self.input_anon,
             bbox=self.bbox,
             read_retries=self.read_retries,
+            chunk_cache_dir=self.chunk_cache_dir,
+            chunk_cache_max_gb=self.chunk_cache_max_gb,
             # The float16 default suits the CUDA autocast path. CPU convolutions
             # have no float16 kernels, so half patches meet float32 weights and
             # raise "Input type (c10::Half) and bias type (float) should be the
@@ -1306,6 +1312,15 @@ def build_parser():
                            '(dropped connections, truncated payloads, 429/5xx) are retried '
                            'with exponential backoff so one hiccup does not abort a long '
                            'streaming run. Set to 1 to disable.')
+    parser.add_argument('--chunk_cache_dir', type=str, default=None,
+                      help='Directory for a persistent chunk cache for remote volumes, '
+                           'for example ~/.cache/vesuvius/chunks. '
+                           'Reused across runs; safe with multiple workers.')
+    parser.add_argument('--chunk_cache_max_gb', type=float, default=None,
+                      help='Size cap in GiB for the chunk cache. Unbounded if omitted. '
+                           'Eviction only sweeps a directory the cache created or that '
+                           'carries its stamp file, so give the cache a directory of its '
+                           'own if you want the cap enforced.')
     parser.add_argument('--max_patches', type=int, default=None,
                       help='Optional cap on patch positions processed by this part. '
                            'Intended for smoke tests; production inference leaves this unset.')
@@ -1389,6 +1404,8 @@ def main():
         model_cache_dir=args.model_cache_dir,
         max_patches=args.max_patches,
         bbox=bbox,
+        chunk_cache_dir=args.chunk_cache_dir,
+        chunk_cache_max_gb=args.chunk_cache_max_gb,
     )
 
     try:
