@@ -12,6 +12,7 @@
 #include <QWidget>
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -30,6 +31,7 @@
 #include "segmentation/SegmentationWidget.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
+#include "vc/core/util/PlaneSurface.hpp"
 
 #include "vc/core/types/Segmentation.hpp"
 #include "vc/core/types/Volume.hpp"
@@ -186,6 +188,16 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         v["kind"] = (dynamic_cast<CChunkedVolumeViewer*>(e.viewer) != nullptr)
                         ? QStringLiteral("chunked") : QStringLiteral("other");
         v["scale"] = e.viewer->getCurrentScale();
+        // Current world normal of an axis-aligned slice plane. Exposed so
+        // clients (and tests) can observe plane orientation, e.g. that the
+        // xy/xz/yz planes stay distinct rather than collapsing onto one normal.
+        if (Surface* surf = e.viewer->currentSurface()) {
+            if (dynamic_cast<PlaneSurface*>(surf) != nullptr) {
+                const cv::Vec3f n = surf->normal(cv::Vec3f(0, 0, 0));
+                if (std::isfinite(n[0]) && std::isfinite(n[1]) && std::isfinite(n[2]))
+                    v["planeNormal"] = vec3ToJson(n);
+            }
+        }
         viewers.push_back(v);
     }
     result["viewers"] = viewers;

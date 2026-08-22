@@ -206,8 +206,41 @@ QJsonObject AgentBridgeServer::handleViewerCenterOnPoint(const QJsonValue& param
     const bool forceRender = p.value("forceRender").toBool(true);
     viewer->centerOnVolumePoint(point, forceRender);
 
+    // Recenter every slice plane (xy / seg xz / seg yz) on the point via the
+    // canonical CWindow::centerFocusAt path -- the same one the location box and
+    // ctrl-click use -- so the planes move through the point and reapply their
+    // orientation (-> applyOrientation). Poking focus->p directly skips the
+    // reapply, leaving the planes collapsed onto the focus normal.
+    //
+    // Orientation matches VC3D's own coordinate navigation: with no active
+    // segment (or axis-aligned slice mode on) the planes are canonical
+    // axis-aligned; with an active segmentation surface and axis-aligned mode off
+    // the seg xz/yz planes take the segment's local tangent frame at the nearest
+    // surface point.
+    //
+    // Before centering, clear the focus POI's orientation source (surfaceId +
+    // surfacePtr) and zero its normal. Clearing surfaceId drops any stale surface
+    // left by a prior click so applyOrientation orients to the *active* segment
+    // (or canonical when none), not a no-longer-relevant one. Zeroing the normal
+    // stops onPOIChanged collapsing all planes onto that normal when
+    // applyOrientation cannot derive a segment frame (point off the surface) --
+    // the case the plain location-box path leaves collapsed.
+    bool focusMoved = false;
+    if (_window) {
+        if (CState* state = _window->_state) {
+            if (POI* focus = state->poi("focus")) {
+                focus->surfaceId.clear();
+                focus->surfacePtr.reset();
+                focus->n = cv::Vec3f(0.0f, 0.0f, 0.0f);
+            }
+        }
+        focusMoved = _window->centerFocusAt(point, cv::Vec3f(0.0f, 0.0f, 0.0f),
+                                            std::string());
+    }
+
     QJsonObject result;
     result["centered"] = true;
+    result["focusMoved"] = focusMoved;
     result["viewerId"] = viewerIdFor(viewer);
     return result;
 }
