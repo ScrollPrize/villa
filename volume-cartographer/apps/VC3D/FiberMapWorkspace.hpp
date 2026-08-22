@@ -28,7 +28,6 @@ class QGraphicsScene;
 class QLabel;
 class QMouseEvent;
 class QShowEvent;
-class QSpinBox;
 class QTreeWidget;
 class QWheelEvent;
 
@@ -63,9 +62,10 @@ private:
     bool _menuPending = false;
 };
 
-// Interactive 2D map of the linked fiber networks, unrolled about the scroll
-// umbilicus. The layout is only ever rebuilt on explicit request; fiber
-// changes just mark the current one stale.
+// Interactive 2D map of every fiber, unrolled about the scroll umbilicus onto
+// one plane at the winding the solver inferred for it. The layout is only
+// ever rebuilt on explicit request; fiber changes just mark the current one
+// stale.
 class FiberMapWorkspace : public QMainWindow
 {
     Q_OBJECT
@@ -160,10 +160,8 @@ private:
     QGraphicsScene* _scene = nullptr;
     QTreeWidget* _tree = nullptr;
     QDockWidget* _fiberDock = nullptr;
-    QSpinBox* _topNetworkSpin = nullptr;
-    QSpinBox* _minFiberSpin = nullptr;
     QLabel* _statusLabel = nullptr;
-    vc3d::fiber_map::Result _layout;
+    vc3d::fiber_map::GlobalResult _layout;
     QHash<uint64_t, FiberEntry> _entries;
     std::vector<QGraphicsItem*> _controlPointDots;
     // Annotation voxel size of the snapshot the current layout came from, in µm;
@@ -193,12 +191,8 @@ private:
     // this workspace existing costs annotation work nothing.
     uint64_t _layoutPackageGeneration = 0;
     uint64_t _layoutUmbilicusGeneration = 0;
-    // The layout-shaping settings as of the build, compared against the live
-    // spinboxes like every other dependency.
-    int _layoutMaxNetworks = 0;
-    int _layoutMinFibers = 0;
     // Whether a layout has ever been built. Distinct from "the layout has no
-    // networks": an empty result is still a result, built from dependencies that
+    // fibers": an empty result is still a result, built from dependencies that
     // can go out of date, and conflating the two left a map that had found no
     // umbilicus saying so forever. Also what keeps the dependency comparison from
     // firing against a default-constructed frame before the first build.

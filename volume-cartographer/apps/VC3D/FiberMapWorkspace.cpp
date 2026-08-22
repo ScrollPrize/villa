@@ -27,7 +27,6 @@
 #include <QPen>
 #include <QPushButton>
 #include <QScrollBar>
-#include <QSpinBox>
 #include <QStyleOptionGraphicsItem>
 #include <QTimer>
 #include <QToolBar>
@@ -520,18 +519,6 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
     auto* toolBar = addToolBar(tr("Fiber Map"));
     toolBar->setObjectName(QStringLiteral("fiberMapToolBar"));
     toolBar->setMovable(false);
-    toolBar->addWidget(new QLabel(tr("Top networks"), toolBar));
-    _topNetworkSpin = new QSpinBox(toolBar);
-    _topNetworkSpin->setRange(1, 20);
-    _topNetworkSpin->setValue(3);
-    toolBar->addWidget(_topNetworkSpin);
-    toolBar->addSeparator();
-    toolBar->addWidget(new QLabel(tr("Min fibers"), toolBar));
-    _minFiberSpin = new QSpinBox(toolBar);
-    _minFiberSpin->setRange(2, 99);
-    _minFiberSpin->setValue(3);
-    toolBar->addWidget(_minFiberSpin);
-    toolBar->addSeparator();
     auto* rebuildButton = new QPushButton(tr("Rebuild layout"), toolBar);
     toolBar->addWidget(rebuildButton);
     toolBar->addSeparator();
@@ -540,14 +527,17 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
     toolBar->addWidget(_statusLabel);
 
     _tree = new QTreeWidget(this);
-    _tree->setColumnCount(3);
-    _tree->setHeaderLabels({tr("Fiber"), tr("H/V"), tr("Annotation")});
+    _tree->setColumnCount(5);
+    _tree->setHeaderLabels(
+        {tr("Fiber"), tr("H/V"), tr("Winding"), tr("Anchor"), tr("Annotation")});
     _tree->setUniformRowHeights(true);
+    _tree->setRootIsDecorated(false);
     _tree->setSelectionMode(QAbstractItemView::SingleSelection);
-    // The short label and H/V take only what they need; the annotation name gets
-    // the rest of the dock.
-    _tree->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
-    _tree->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    // Everything but the annotation name takes only what it needs; the
+    // annotation name gets the rest of the dock.
+    for (int column = 0; column < 4; ++column) {
+        _tree->header()->setSectionResizeMode(column, QHeaderView::ResizeToContents);
+    }
     _tree->header()->setStretchLastSection(true);
     _fiberDock = new QDockWidget(tr("Fibers"), this);
     _fiberDock->setObjectName(QStringLiteral("fiberMapFiberDock"));
@@ -573,12 +563,6 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
     }
 
     connect(rebuildButton, &QPushButton::clicked, this, &FiberMapWorkspace::rebuildLayout);
-    // Settings are dependencies (FiberMapDependencies), so the comparison, not
-    // a latch, decides staleness: refreshed eagerly here so the banner appears
-    // as the spinbox moves — and clears again if it moves back.
-    const auto settingsMoved = [this]() { refreshStaleState(); };
-    connect(_topNetworkSpin, &QSpinBox::valueChanged, this, settingsMoved);
-    connect(_minFiberSpin, &QSpinBox::valueChanged, this, settingsMoved);
     connect(_view, &FiberMapView::clicked, this, &FiberMapWorkspace::handleSceneClick);
     connect(_view, &FiberMapView::controlPointMenuRequested,
             this, &FiberMapWorkspace::handleControlPointMenu);
@@ -695,8 +679,6 @@ void FiberMapWorkspace::clearLayout(const QString& reason)
     _layoutUmbilicusFingerprint.clear();
     _layoutPackageGeneration = 0;
     _layoutUmbilicusGeneration = 0;
-    _layoutMaxNetworks = 0;
-    _layoutMinFibers = 0;
     _layoutBuilt = false;
     _voxelSizeUm.reset();
     _scrollZMaxVx = 0.0;
@@ -732,8 +714,6 @@ FiberMapWorkspace::currentDependencies() const
     deps.umbilicusGeneration = _controller->umbilicusGeneration();
     deps.umbilicusFingerprint = _controller->umbilicusFingerprint();
     deps.frame = _controller->annotationFrame();
-    deps.maxNetworks = _topNetworkSpin ? _topNetworkSpin->value() : 0;
-    deps.minFibers = _minFiberSpin ? _minFiberSpin->value() : 0;
     return deps;
 }
 
@@ -746,8 +726,6 @@ FiberMapWorkspace::layoutDependencies() const
     deps.umbilicusGeneration = _layoutUmbilicusGeneration;
     deps.umbilicusFingerprint = _layoutUmbilicusFingerprint;
     deps.frame = _layoutFrame;
-    deps.maxNetworks = _layoutMaxNetworks;
-    deps.minFibers = _layoutMinFibers;
     return deps;
 }
 
@@ -874,28 +852,28 @@ void FiberMapWorkspace::rebuildLayout()
 
     _voxelSizeUm = snapshot.voxelSizeUm;
 
-    vc3d::fiber_map::LayoutParams params;
-    params.minFibers = _minFiberSpin->value();
-    params.maxNetworks = _topNetworkSpin->value();
-    // Recorded as built dependencies beside the counters above: a later spinbox
-    // move compares unequal and marks the map out of date, and moving it back
-    // compares equal again.
-    _layoutMinFibers = params.minFibers;
-    _layoutMaxNetworks = params.maxNetworks;
-    // The layout is unit-free, so the physical intents behind its tuning lengths
-    // are converted here — once the voxel size is known, exactly as documented on
-    // LayoutParams. Left alone when it is not, so the defaults (the same intents
-    // at 2.4 µm) stand in and the map still lays out sensibly.
+    vc3d::fiber_map::GlobalLayoutParams params;
+    // The layout and solver are unit-free, so the physical intents behind
+    // their tuning lengths are converted here — once the voxel size is known,
+    // exactly as documented on GlobalLayoutParams and SolverParams. Left
+    // alone when it is not, so the defaults (the same intents at 2.4 µm)
+    // stand in and the map still lays out sensibly.
     if (_voxelSizeUm) {
         const double vxPerCm = sceneVxPerCm();
         params.smoothVx = 0.12 * vxPerCm;         // 1.2 mm arclength sigma
         params.resampleStepVx = 0.025 * vxPerCm;  // 0.025 cm resample step
         params.minPadXVx = 2.2 * vxPerCm;         // 2.2 cm label pad across
         params.minPadYVx = 1.6 * vxPerCm;         // 1.6 cm label pad up
-        params.panelTickVx = 5.0 * vxPerCm;       // 5 cm winding-label grid
-        params.minGapVx = 1.0 * vxPerCm;          // 1 cm minimum panel gap
+        params.solver.tieBandVx = 0.03 * vxPerCm;            // sheet-thickness tie band
+        params.solver.minUmbilicusRadiusVx = 0.1 * vxPerCm;   // angular conditioning
+        params.solver.zMergeVx = 0.2 * vxPerCm;               // crossing dedup span
+        params.solver.neighborhoodZVx = 0.5 * vxPerCm;        // ordinal window
+        params.solver.neighborhoodArcVx = 0.5 * vxPerCm;
     }
-    _layout = vc3d::fiber_map::buildLayout(inputs, snapshot.umbilicusCenters, params);
+    // One suspicion threshold for links, wherever it is applied.
+    params.solver.linkSuspectTurns = params.suspectTurns;
+    _layout = vc3d::fiber_map::buildGlobalLayout(inputs, snapshot.umbilicusCenters,
+                                                 params);
     // Scene space is voxels and the slice count already is one, so the scroll
     // extent needs no voxel size at all.
     _scrollZMaxVx = snapshot.annotationZSlices > 0
@@ -914,8 +892,8 @@ void FiberMapWorkspace::rebuildLayout()
         // Whatever the resolver's complaint was, the way out is the same.
         emptyMessage += QLatin1Char('\n');
         emptyMessage += tr("Attach one via File > Attach Umbilicus…");
-    } else if (_layout.networks.empty()) {
-        emptyMessage = tr("no networks with ≥ %1 linked fibers").arg(params.minFibers);
+    } else if (_layout.fibers.empty()) {
+        emptyMessage = tr("no placeable fibers");
     }
     rebuildScene(emptyMessage);
     rebuildTree();
@@ -935,14 +913,20 @@ void FiberMapWorkspace::rebuildLayout()
         _fiberDockSized = true;
     }
 
-    int placedFibers = 0;
-    for (const auto& network : _layout.networks) {
-        placedFibers += static_cast<int>(network.fibers.size());
-    }
-    QString status = tr("%1 fibers · %2 networks · %3 suspect links")
-                         .arg(placedFibers)
-                         .arg(_layout.networks.size())
+    QString status = tr("%1 fibers · %2 windings · %3 islands · %4 suspect links")
+                         .arg(_layout.fibers.size())
+                         .arg(_layout.windings.size())
+                         .arg(_layout.islandCount)
                          .arg(_layout.suspectLinkCount);
+    if (!_layout.unplaced.empty()) {
+        status += tr(" · %1 unplaceable").arg(_layout.unplaced.size());
+    }
+    if (_layout.unresolvedCount > 0) {
+        status += tr(" · %1 unresolved").arg(_layout.unresolvedCount);
+    }
+    if (_layout.droppedCrossingCount > 0) {
+        status += tr(" · %1 dropped crossings").arg(_layout.droppedCrossingCount);
+    }
     if (!_voxelSizeUm) {
         // No physical figure on the map means anything, so say why once rather
         // than leave the voxel counts looking like an odd choice of unit.
@@ -957,7 +941,7 @@ void FiberMapWorkspace::rebuildLayout()
     _freshStatus = status;
     _statusLabel->setText(status);
 
-    if (!_viewFitted && !_layout.networks.empty()) {
+    if (!_viewFitted && !_layout.fibers.empty()) {
         _view->fitInView(_contentRect, Qt::KeepAspectRatio);
         _viewFitted = true;
     }
@@ -984,7 +968,7 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
     const FiberMapPalette& theme = activePalette();
     _scene->setBackgroundBrush(theme.surface);
 
-    if (_layout.networks.empty()) {
+    if (_layout.fibers.empty()) {
         auto* message = _scene->addSimpleText(emptyMessage);
         message->setBrush(theme.ink);
         _contentRect = message->boundingRect().adjusted(-40.0, -40.0, 40.0, 40.0);
@@ -996,7 +980,7 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
     // scroll axis reading upward without ever mirroring text.
     const double topY = -_layout.yMaxVx;
     const double bottomY = -_layout.yMinVx;
-    const double sceneWidth = std::max(_layout.widthVx, 1e-6);
+    const double sceneWidth = std::max(_layout.x1Vx - _layout.x0Vx, 1e-6);
     // The one conversion of this rebuild. Every scene-space size below that was
     // chosen as a physical length goes through it, and nothing else does.
     const double vxPerCm = sceneVxPerCm();
@@ -1006,187 +990,190 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
     const qreal suspectRingBounds = kSuspectRingBoundsCm * vxPerCm;
     QFont labelFont = font();
     labelFont.setPointSizeF(8.0);
-    QFont headerFont = font();
-    headerFont.setPointSizeF(10.5);
 
-    // The scroll floor and ceiling, so the networks read against the volume's
-    // own z extent instead of floating on their own; the winding gridlines and
-    // the panel grounds span the same range. Without that extent the layout's
-    // own y range has to do.
+    // The scroll floor and ceiling, so the map reads against the volume's own
+    // z extent instead of floating on its own; the winding gridlines and the
+    // ground span the same range. Without that extent the layout's own y
+    // range has to do.
     const bool scrollExtentKnown = _scrollZMaxVx > 0.0;
     const double extentBottomY = scrollExtentKnown ? 0.0 : bottomY;
     const double extentTopY = scrollExtentKnown ? -_scrollZMaxVx : topY;
     const double sceneTopY = std::min(extentTopY, topY);
     const double sceneBottomY = std::max(extentBottomY, bottomY);
 
-    // Link endpoints always live in the same network as the link, and each
-    // network registers its fibers before its links are drawn, so the entries
-    // built so far always cover both ends.
+    // Each link's endpoints were registered as fibers before the links are
+    // drawn, so the entries always cover both ends.
     const auto hvTagOf = [this](uint64_t fiberId) {
         const auto entry = _entries.constFind(fiberId);
         return entry == _entries.constEnd() ? '?' : entry->fiber.hvTag;
     };
 
-    for (const vc3d::fiber_map::PlacedNetwork& network : _layout.networks) {
-        // A hair-lighter ground per panel, spanning exactly the scroll extent:
-        // with no break line between panels, the gap between the grounds is
-        // what says where one network ends and the next begins, and their
-        // top/bottom edges are the scroll ceiling and floor.
-        auto* panel = _scene->addRect(
-            QRectF(QPointF(network.x0Vx, extentTopY), QPointF(network.x1Vx, extentBottomY)),
-            QPen(Qt::NoPen), QBrush(tint(theme.surface, theme.ink, 0.045)));
-        panel->setZValue(kPanelZ);
+    // One ground for the whole map, spanning the scroll's own z extent.
+    auto* ground = _scene->addRect(
+        QRectF(QPointF(_layout.x0Vx, extentTopY), QPointF(_layout.x1Vx, extentBottomY)),
+        QPen(Qt::NoPen), QBrush(tint(theme.surface, theme.ink, 0.045)));
+    ground->setZValue(kPanelZ);
 
-        for (const vc3d::fiber_map::WindingMark& mark : network.windings) {
-            auto* line = _scene->addLine(mark.xVx, extentTopY, mark.xVx, extentBottomY);
-            QPen pen(theme.winding);
-            pen.setWidthF(0.8);
-            pen.setCosmetic(true);
-            pen.setStyle(Qt::DotLine);
-            line->setPen(pen);
-            line->setZValue(0.0);
-        }
-
-        // The reference radius belongs to the fiber tree's network rows; the map
-        // only needs to say which panel this is.
-        auto* header = _scene->addSimpleText(
-            tr("network %1").arg(network.networkIndex + 1), headerFont);
-        header->setBrush(theme.inkSoft);
-        pinText(header, QPointF(0.5 * (network.x0Vx + network.x1Vx), topY), 0.0, -36.0, true);
-
-        for (const vc3d::fiber_map::PlacedFiber& placed : network.fibers) {
-            FiberEntry entry;
-            entry.fiber = placed;
-            for (vc3d::fiber_map::Run& run : entry.fiber.runs) {
-                for (QPointF& point : run.points) {
-                    point.setY(-point.y());
-                }
-            }
-            for (QPointF& point : entry.fiber.controlPoints) {
-                point.setY(-point.y());
-            }
-
-            // The path items only carry geometry: clicks resolve through
-            // fiberAt()'s proximity search, never through the items themselves.
-            const QColor color = fiberColor(entry.fiber.hvTag, theme);
-            const QPainterPath tracedPath = pathForRuns(entry.fiber, true);
-            if (!tracedPath.isEmpty()) {
-                entry.tracedItem = _scene->addPath(tracedPath, cosmeticPen(color, kTracedWidth));
-                entry.tracedItem->setZValue(kFiberZ);
-            }
-            const QPainterPath interpolatedPath = pathForRuns(entry.fiber, false);
-            if (!interpolatedPath.isEmpty()) {
-                entry.interpolatedItem = _scene->addPath(
-                    interpolatedPath,
-                    interpolatedPen(tint(color, theme.surface, 0.45), kInterpolatedWidth));
-                entry.interpolatedItem->setZValue(kFiberZ);
-            }
-
-            // Label chip at whichever fiber end sits nearest its panel edge
-            // (H fibers: left vs right, V fibers: bottom vs top).
-            const QRectF bounds = fiberBounds(entry.fiber);
-            if (!bounds.isNull()) {
-                QPointF anchor;
-                qreal offsetX = 0.0;
-                qreal offsetY = 0.0;
-                bool anchorRight = false;
-                const auto endpoint = [&entry](bool minimizeX, bool useX) {
-                    QPointF best;
-                    double bestValue = minimizeX ? std::numeric_limits<double>::infinity()
-                                                 : -std::numeric_limits<double>::infinity();
-                    for (const vc3d::fiber_map::Run& run : entry.fiber.runs) {
-                        for (const QPointF& point : run.points) {
-                            const double value = useX ? point.x() : point.y();
-                            if (minimizeX ? value < bestValue : value > bestValue) {
-                                bestValue = value;
-                                best = point;
-                            }
-                        }
-                    }
-                    return best;
-                };
-                if (entry.fiber.hvTag == 'V') {
-                    // Scene y is inverted, so the smaller y is the top end.
-                    const QPointF top = endpoint(true, false);
-                    const QPointF low = endpoint(false, false);
-                    const bool atTop = (top.y() - topY) < (bottomY - low.y());
-                    anchor = atTop ? top : low;
-                    offsetX = 8.0;
-                    offsetY = atTop ? -10.0 : 10.0;
-                } else {
-                    const QPointF left = endpoint(true, true);
-                    const QPointF right = endpoint(false, true);
-                    const bool atRight = (network.x1Vx - right.x()) < (left.x() - network.x0Vx);
-                    anchor = atRight ? right : left;
-                    offsetX = atRight ? 10.0 : -10.0;
-                    anchorRight = !atRight;
-                }
-                auto* chip = new FiberLabelChip(
-                    entry.fiber.label,
-                    entry.fiber.hvTag == 'V' ? theme.chipVertical : theme.chipHorizontal,
-                    theme.chipInk, labelFont);
-                chip->setData(0, QVariant::fromValue<qulonglong>(entry.fiber.id));
-                chip->setZValue(6.0);
-                chip->setPos(anchor);
-                chip->setTransform(QTransform::fromTranslate(
-                    anchorRight ? offsetX - chip->width() : offsetX, offsetY));
-                _scene->addItem(chip);
-            }
-
-            const uint64_t fiberId = entry.fiber.id;
-            _entries.insert(fiberId, std::move(entry));
-        }
-
-        for (const vc3d::fiber_map::PlacedLink& link : network.links) {
-            const QPointF a(link.a.x(), -link.a.y());
-            const QPointF b(link.b.x(), -link.b.y());
-            const QPointF middle = 0.5 * (a + b);
-            if (!link.suspect) {
-                // A winding-suspect link keeps its own red treatment below;
-                // everything else takes the annotation's branch-link colours.
-                const LinkPalette& palette =
-                    linkPalette(hvTagOf(link.fiberA), hvTagOf(link.fiberB), link.pending);
-                auto* dot = new ScaledDot(QBrush(palette.brush),
-                                          cosmeticPen(palette.pen, 1.0),
-                                          crossingDotRadius,
-                                          kMinCrossingDotPx, crossingDotBounds);
-                _scene->addItem(dot);
-                dot->setPos(middle);
-                dot->setZValue(4.0);
-                continue;
-            }
-            QPen suspectPen(kSuspect);
-            suspectPen.setWidthF(1.0);
-            suspectPen.setCosmetic(true);
-            suspectPen.setStyle(Qt::DashLine);
-            auto* line = _scene->addLine(QLineF(a, b));
-            line->setPen(suspectPen);
-            line->setZValue(4.0);
-            for (const QPointF& endpoint : {a, b}) {
-                auto* ring = new ScaledDot(QBrush(Qt::NoBrush), cosmeticPen(kSuspect, 1.4),
-                                           suspectRingRadius, kMinSuspectRingPx,
-                                           suspectRingBounds);
-                _scene->addItem(ring);
-                ring->setPos(endpoint);
-                ring->setZValue(5.0);
-            }
-            auto* label = _scene->addSimpleText(
-                tr("+%1 turn").arg(link.turnErr, 0, 'f', 1), labelFont);
-            label->setBrush(kSuspect);
-            pinText(label, middle, 0.0, -14.0, true);
-            label->setZValue(5.0);
-        }
+    // The winding grid, one numbered line per integer winding: the number IS
+    // the winding coordinate, innermost anchored winding zero.
+    for (const vc3d::fiber_map::WindingMark& mark : _layout.windings) {
+        auto* line = _scene->addLine(mark.xVx, extentTopY, mark.xVx, extentBottomY);
+        QPen pen(theme.winding);
+        pen.setWidthF(0.8);
+        pen.setCosmetic(true);
+        pen.setStyle(Qt::DotLine);
+        line->setPen(pen);
+        line->setZValue(0.0);
+        auto* number = _scene->addSimpleText(QString::number(mark.number), labelFont);
+        number->setBrush(theme.winding);
+        pinText(number, QPointF(mark.xVx, extentTopY), 0.0, -16.0, true);
     }
 
-    // The panel headers hang above the top edge in device pixels, so the scene
-    // keeps a slice of room for them above the layout. The scroll extent, when
-    // known, is part of what the first-build fit shows.
+    for (const vc3d::fiber_map::GlobalPlacedFiber& placed : _layout.fibers) {
+        FiberEntry entry;
+        entry.fiber = placed.fiber;
+        for (vc3d::fiber_map::Run& run : entry.fiber.runs) {
+            for (QPointF& point : run.points) {
+                point.setY(-point.y());
+            }
+        }
+        for (QPointF& point : entry.fiber.controlPoints) {
+            point.setY(-point.y());
+        }
+
+        // The path items only carry geometry: clicks resolve through
+        // fiberAt()'s proximity search, never through the items themselves.
+        const QColor color = fiberColor(entry.fiber.hvTag, theme);
+        const QPainterPath tracedPath = pathForRuns(entry.fiber, true);
+        if (!tracedPath.isEmpty()) {
+            entry.tracedItem = _scene->addPath(tracedPath, cosmeticPen(color, kTracedWidth));
+            entry.tracedItem->setZValue(kFiberZ);
+        }
+        const QPainterPath interpolatedPath = pathForRuns(entry.fiber, false);
+        if (!interpolatedPath.isEmpty()) {
+            entry.interpolatedItem = _scene->addPath(
+                interpolatedPath,
+                interpolatedPen(tint(color, theme.surface, 0.45), kInterpolatedWidth));
+            entry.interpolatedItem->setZValue(kFiberZ);
+        }
+
+        // Label chip at whichever fiber end sits nearest a map edge
+        // (H fibers: left vs right, V fibers: bottom vs top).
+        const QRectF bounds = fiberBounds(entry.fiber);
+        if (!bounds.isNull()) {
+            QPointF anchor;
+            qreal offsetX = 0.0;
+            qreal offsetY = 0.0;
+            bool anchorRight = false;
+            const auto endpoint = [&entry](bool minimizeX, bool useX) {
+                QPointF best;
+                double bestValue = minimizeX ? std::numeric_limits<double>::infinity()
+                                             : -std::numeric_limits<double>::infinity();
+                for (const vc3d::fiber_map::Run& run : entry.fiber.runs) {
+                    for (const QPointF& point : run.points) {
+                        const double value = useX ? point.x() : point.y();
+                        if (minimizeX ? value < bestValue : value > bestValue) {
+                            bestValue = value;
+                            best = point;
+                        }
+                    }
+                }
+                return best;
+            };
+            if (entry.fiber.hvTag == 'V') {
+                // Scene y is inverted, so the smaller y is the top end.
+                const QPointF top = endpoint(true, false);
+                const QPointF low = endpoint(false, false);
+                const bool atTop = (top.y() - topY) < (bottomY - low.y());
+                anchor = atTop ? top : low;
+                offsetX = 8.0;
+                offsetY = atTop ? -10.0 : 10.0;
+            } else {
+                const QPointF left = endpoint(true, true);
+                const QPointF right = endpoint(false, true);
+                const bool atRight =
+                    (_layout.x1Vx - right.x()) < (left.x() - _layout.x0Vx);
+                anchor = atRight ? right : left;
+                offsetX = atRight ? 10.0 : -10.0;
+                anchorRight = !atRight;
+            }
+            auto* chip = new FiberLabelChip(
+                entry.fiber.label,
+                entry.fiber.hvTag == 'V' ? theme.chipVertical : theme.chipHorizontal,
+                theme.chipInk, labelFont);
+            chip->setData(0, QVariant::fromValue<qulonglong>(entry.fiber.id));
+            chip->setZValue(6.0);
+            chip->setPos(anchor);
+            chip->setTransform(QTransform::fromTranslate(
+                anchorRight ? offsetX - chip->width() : offsetX, offsetY));
+            _scene->addItem(chip);
+        }
+
+        const uint64_t fiberId = entry.fiber.id;
+        _entries.insert(fiberId, std::move(entry));
+    }
+
+    for (const vc3d::fiber_map::PlacedLink& link : _layout.links) {
+        const QPointF a(link.a.x(), -link.a.y());
+        const QPointF b(link.b.x(), -link.b.y());
+        const QPointF middle = 0.5 * (a + b);
+        if (!link.suspect) {
+            // A winding-suspect link keeps its own red treatment below;
+            // everything else takes the annotation's branch-link colours.
+            const LinkPalette& palette =
+                linkPalette(hvTagOf(link.fiberA), hvTagOf(link.fiberB), link.pending);
+            auto* dot = new ScaledDot(QBrush(palette.brush),
+                                      cosmeticPen(palette.pen, 1.0),
+                                      crossingDotRadius,
+                                      kMinCrossingDotPx, crossingDotBounds);
+            _scene->addItem(dot);
+            dot->setPos(middle);
+            dot->setZValue(4.0);
+            continue;
+        }
+        QPen suspectPen(kSuspect);
+        suspectPen.setWidthF(1.0);
+        suspectPen.setCosmetic(true);
+        suspectPen.setStyle(Qt::DashLine);
+        auto* line = _scene->addLine(QLineF(a, b));
+        line->setPen(suspectPen);
+        line->setZValue(4.0);
+        for (const QPointF& endpoint : {a, b}) {
+            auto* ring = new ScaledDot(QBrush(Qt::NoBrush), cosmeticPen(kSuspect, 1.4),
+                                       suspectRingRadius, kMinSuspectRingPx,
+                                       suspectRingBounds);
+            _scene->addItem(ring);
+            ring->setPos(endpoint);
+            ring->setZValue(5.0);
+        }
+        auto* label = _scene->addSimpleText(
+            tr("+%1 turn").arg(link.turnErr, 0, 'f', 1), labelFont);
+        label->setBrush(kSuspect);
+        pinText(label, middle, 0.0, -14.0, true);
+        label->setZValue(5.0);
+    }
+
+    // Crossings the winding repair had to drop: contradicted evidence, marked
+    // where the H fiber made the pass.
+    for (const vc3d::fiber_map::CrossingMark& mark : _layout.suspectCrossings) {
+        auto* ring = new ScaledDot(QBrush(Qt::NoBrush), cosmeticPen(kSuspect, 1.4),
+                                   suspectRingRadius, kMinSuspectRingPx,
+                                   suspectRingBounds);
+        _scene->addItem(ring);
+        ring->setPos(QPointF(mark.posVx.x(), -mark.posVx.y()));
+        ring->setZValue(5.0);
+    }
+
+    // The winding numbers hang above the top edge in device pixels, so the
+    // scene keeps a slice of room for them above the layout. The scroll
+    // extent, when known, is part of what the first-build fit shows.
     const double height = std::max(sceneBottomY - sceneTopY, 1e-6);
-    _contentRect = QRectF(0.0, sceneTopY - 0.10 * height, sceneWidth, 1.12 * height);
+    _contentRect =
+        QRectF(_layout.x0Vx, sceneTopY - 0.10 * height, sceneWidth, 1.12 * height);
 
     // Panning stops at the scene rect, so the rect runs wider than the content:
-    // zoomed in, the outermost panels can be dragged away from the edge instead
-    // of being pinned to it.
+    // zoomed in, the map's edges can be dragged away from the viewport edge
+    // instead of being pinned to it.
     const double xMargin = std::max(0.25 * sceneWidth, kMinSceneMarginCm * vxPerCm);
     _scene->setSceneRect(_contentRect.adjusted(-xMargin, 0.0, xMargin, 0.0));
 }
@@ -1199,35 +1186,83 @@ void FiberMapWorkspace::rebuildTree()
     // The rows carry the map's own colours, so they follow the theme with it;
     // everything else about the tree is the widget palette's business.
     const FiberMapPalette& theme = activePalette();
-    for (const vc3d::fiber_map::PlacedNetwork& network : _layout.networks) {
-        const int suspectCount = static_cast<int>(
-            std::count_if(network.links.begin(), network.links.end(),
-                          [](const vc3d::fiber_map::PlacedLink& link) { return link.suspect; }));
-        QString title = tr("Network %1 — %2 fibers · r ≈ %3")
-                            .arg(network.networkIndex + 1)
-                            .arg(network.fibers.size())
-                            .arg(formatMapLength(network.rRefVx));
-        if (suspectCount > 0) {
-            title += tr(" · %1 winding-suspect").arg(suspectCount);
+
+    // Inner -> outer by winding, then by label; every placed fiber is a row,
+    // and the fibers that could not be placed at all close the list.
+    std::vector<const vc3d::fiber_map::GlobalPlacedFiber*> rows;
+    rows.reserve(_layout.fibers.size());
+    for (const vc3d::fiber_map::GlobalPlacedFiber& fiber : _layout.fibers) {
+        rows.push_back(&fiber);
+    }
+    std::sort(rows.begin(), rows.end(),
+              [](const vc3d::fiber_map::GlobalPlacedFiber* a,
+                 const vc3d::fiber_map::GlobalPlacedFiber* b) {
+                  if (a->meta.windingLo != b->meta.windingLo) {
+                      return a->meta.windingLo < b->meta.windingLo;
+                  }
+                  if (a->fiber.label != b->fiber.label) {
+                      return a->fiber.label < b->fiber.label;
+                  }
+                  return a->fiber.id < b->fiber.id;
+              });
+
+    // A multi-turn H fiber has no single winding, so the column shows the
+    // range it spans.
+    const auto windingText = [](const vc3d::fiber_map::GlobalFiberMeta& meta) {
+        const auto lo = static_cast<long long>(std::floor(meta.windingLo));
+        const auto hi = static_cast<long long>(std::floor(meta.windingHi));
+        if (lo == hi) {
+            return QString::number(lo);
         }
-        auto* networkItem = new QTreeWidgetItem(_tree, {title});
-        networkItem->setForeground(0, theme.inkSoft);
-        // The network line is a header, not a cell of the label column: it runs
-        // across the whole row so the columns can stay narrow.
-        networkItem->setFirstColumnSpanned(true);
-        for (const vc3d::fiber_map::PlacedFiber& fiber : network.fibers) {
-            const QString annotationName =
-                _controller ? _controller->fiberDisplayName(fiber.id) : QString();
-            auto* fiberItem = new QTreeWidgetItem(
-                networkItem,
-                {fiber.label, QString(QLatin1Char(fiber.hvTag)), annotationName});
-            fiberItem->setData(0, Qt::UserRole, QVariant::fromValue<qulonglong>(fiber.id));
-            const QColor color = fiberColor(fiber.hvTag, theme);
-            for (int column = 0; column < 3; ++column) {
-                fiberItem->setForeground(column, color);
-            }
+        return QStringLiteral("%1–%2").arg(lo).arg(hi);
+    };
+    // How the fiber's component got its absolute winding — the UI must not
+    // imply winding knowledge the solve does not have.
+    const auto anchorText = [this](const vc3d::fiber_map::GlobalFiberMeta& meta) {
+        QString text;
+        switch (meta.anchor) {
+        case vc3d::fiber_map::GlobalAnchor::Primary:
+            text = tr("crossings");
+            break;
+        case vc3d::fiber_map::GlobalAnchor::Radius:
+            text = tr("radius");
+            break;
+        case vc3d::fiber_map::GlobalAnchor::AmbiguousRadius:
+            text = tr("radius?");
+            break;
+        case vc3d::fiber_map::GlobalAnchor::Unresolved:
+            text = tr("unresolved");
+            break;
         }
-        networkItem->setExpanded(true);
+        if (meta.sheetDriftSuspect) {
+            text += tr(" · drift?");
+        }
+        return text;
+    };
+
+    for (const vc3d::fiber_map::GlobalPlacedFiber* row : rows) {
+        const QString annotationName =
+            _controller ? _controller->fiberDisplayName(row->fiber.id) : QString();
+        auto* item = new QTreeWidgetItem(
+            _tree, {row->fiber.label, QString(QLatin1Char(row->fiber.hvTag)),
+                    windingText(row->meta), anchorText(row->meta), annotationName});
+        item->setData(0, Qt::UserRole, QVariant::fromValue<qulonglong>(row->fiber.id));
+        const QColor color = fiberColor(row->fiber.hvTag, theme);
+        for (int column = 0; column < _tree->columnCount(); ++column) {
+            item->setForeground(column, color);
+        }
+        item->setForeground(3, theme.inkSoft);
+    }
+    for (const vc3d::fiber_map::UnplacedFiber& unplaced : _layout.unplaced) {
+        const QString annotationName =
+            _controller ? _controller->fiberDisplayName(unplaced.id) : QString();
+        auto* item = new QTreeWidgetItem(
+            _tree, {unplaced.label, QString(QLatin1Char(unplaced.hvTag)),
+                    QStringLiteral("—"), tr("unplaceable"), annotationName});
+        item->setData(0, Qt::UserRole, QVariant::fromValue<qulonglong>(unplaced.id));
+        for (int column = 0; column < _tree->columnCount(); ++column) {
+            item->setForeground(column, theme.inkSoft);
+        }
     }
     _syncingSelection = guard;
 }
@@ -1336,16 +1371,13 @@ void FiberMapWorkspace::selectFiberRow(uint64_t fiberId)
 {
     const bool guard = _syncingSelection;
     _syncingSelection = true;
-    for (int networkRow = 0; networkRow < _tree->topLevelItemCount(); ++networkRow) {
-        QTreeWidgetItem* networkItem = _tree->topLevelItem(networkRow);
-        for (int fiberRow = 0; fiberRow < networkItem->childCount(); ++fiberRow) {
-            QTreeWidgetItem* fiberItem = networkItem->child(fiberRow);
-            if (fiberItem->data(0, Qt::UserRole).toULongLong() == fiberId) {
-                _tree->setCurrentItem(fiberItem);
-                _tree->scrollToItem(fiberItem);
-                _syncingSelection = guard;
-                return;
-            }
+    for (int row = 0; row < _tree->topLevelItemCount(); ++row) {
+        QTreeWidgetItem* fiberItem = _tree->topLevelItem(row);
+        if (fiberItem->data(0, Qt::UserRole).toULongLong() == fiberId) {
+            _tree->setCurrentItem(fiberItem);
+            _tree->scrollToItem(fiberItem);
+            _syncingSelection = guard;
+            return;
         }
     }
     _syncingSelection = guard;

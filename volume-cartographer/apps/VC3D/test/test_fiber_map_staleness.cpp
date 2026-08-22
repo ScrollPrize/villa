@@ -58,8 +58,6 @@ namespace
         deps.umbilicusGeneration = 2;
         deps.umbilicusFingerprint = QStringLiteral("umb|1024:99");
         deps.frame = frameAt(9.596);
-        deps.maxNetworks = 3;
-        deps.minFibers = 3;
         return deps;
     }
 
@@ -181,44 +179,6 @@ private slots:
         const auto result = verdict(deps, deps, true, /*latched=*/true);
         QCOMPARE(result.action, StaleVerdict::Action::MarkStale);
         QCOMPARE(result.reason, QStringLiteral("already stale"));
-    }
-
-    // Settings are dependencies, not a latch: a changed spinbox marks the map
-    // out of date through the same comparison as everything else...
-    void changedSettingsMarkStale()
-    {
-        auto current = baseline();
-        current.maxNetworks = 4;
-        const auto result = verdict(baseline(), current);
-        QCOMPARE(result.action, StaleVerdict::Action::MarkStale);
-        QVERIFY(result.reason.contains(QStringLiteral("Settings")));
-
-        auto fewer = baseline();
-        fewer.minFibers = 2;
-        QCOMPARE(verdict(baseline(), fewer).action, StaleVerdict::Action::MarkStale);
-    }
-
-    // ...which is exactly what lets a setting changed and then changed back
-    // read as current again — there is nothing latched to outlast the revert.
-    void revertedSettingsAreFresh()
-    {
-        auto current = baseline();
-        current.maxNetworks = 4;
-        QCOMPARE(verdict(baseline(), current).action, StaleVerdict::Action::MarkStale);
-        current.maxNetworks = baseline().maxNetworks;
-        QCOMPARE(verdict(baseline(), current).action, StaleVerdict::Action::Fresh);
-    }
-
-    // When data and settings both moved, the status line should name the data:
-    // a rebuild is needed for the fibers whatever the spinboxes say.
-    void changedFibersOutrankChangedSettings()
-    {
-        auto current = baseline();
-        current.fiberGeneration += 1;
-        current.maxNetworks = 4;
-        const auto result = verdict(baseline(), current);
-        QCOMPARE(result.action, StaleVerdict::Action::MarkStale);
-        QVERIFY(result.reason.contains(QStringLiteral("Fibers")));
     }
 
     // The unknown->known voxel-size transition: an untagged store derives

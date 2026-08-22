@@ -26,13 +26,6 @@ struct FiberMapDependencies {
     // covering a file changing underneath VC3D, which no counter reports.
     QString umbilicusFingerprint;
     vc3d::annotation::AnnotationFrame frame;
-    // The layout-shaping settings the build consumed. Dependencies like any
-    // other: a map rebuilt under different settings is a different picture,
-    // and comparing them — rather than latching a flag when a spinbox moves —
-    // is what lets a setting changed and then changed back read as current
-    // again.
-    int maxNetworks = 0;
-    int minFibers = 0;
 };
 
 // What a comparison concluded, separately from acting on it.
@@ -54,8 +47,8 @@ struct StaleVerdict {
 //  - A different package, or a different *grid*, leaves the layout meaningless:
 //    geometry unrolled over one set of voxels says nothing about another set.
 //    Clearing is right.
-//  - Changed fibers, a changed umbilicus, changed settings, or a changed voxel
-//    size leave it out of date. The banner says so and the map refuses to act,
+//  - Changed fibers, a changed umbilicus, or a changed voxel size leave it
+//    out of date. The banner says so and the map refuses to act,
 //    but the geometry survives for the rebuild. The voxel size belongs here
 //    whether or not the umbilicus scale came from it: the layout's smoothing
 //    sigma, resample step, label pads, panel tick and minimum gap are all
@@ -129,13 +122,6 @@ inline StaleVerdict staleVerdictFor(const FiberMapDependencies& built,
         current.umbilicusFingerprint != built.umbilicusFingerprint) {
         verdict.action = StaleVerdict::Action::MarkStale;
         verdict.reason = QObject::tr("Umbilicus changed — press Rebuild layout");
-        return verdict;
-    }
-
-    if (current.maxNetworks != built.maxNetworks ||
-        current.minFibers != built.minFibers) {
-        verdict.action = StaleVerdict::Action::MarkStale;
-        verdict.reason = QObject::tr("Settings changed — press Rebuild layout");
         return verdict;
     }
 
