@@ -288,7 +288,7 @@ def upsample_coordinates(
     mask : NDArray[np.bool_]
         Validity mask at source scale.
     source_scale : Tuple[float, float]
-        Current scale (scale_y, scale_x), typically (20.0, 20.0).
+        Current scale (scale_y, scale_x) in grid cells per voxel, typically (0.05, 0.05).
     target_scale : float
         Target scale factor. 1.0 = full resolution.
     order : int
@@ -299,9 +299,12 @@ def upsample_coordinates(
     Tuple[NDArray, NDArray, NDArray, NDArray]
         Upsampled (x, y, z, mask) arrays.
     """
-    # Calculate output size
-    zoom_y = source_scale[0] / target_scale
-    zoom_x = source_scale[1] / target_scale
+    # Calculate output size. `scale` counts grid cells per volume voxel (a
+    # segment written at step 20 carries scale 0.05), so going to a finer target
+    # multiplies the grid by target/source, not the other way round -- the same
+    # convention Tifxyz.full_resolution_shape uses.
+    zoom_y = target_scale / source_scale[0]
+    zoom_x = target_scale / source_scale[1]
 
     h, w = x.shape
     new_h = int(round(h * zoom_y))
