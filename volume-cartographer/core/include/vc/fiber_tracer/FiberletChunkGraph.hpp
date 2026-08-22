@@ -128,6 +128,7 @@ public:
         const PolylineArcGeometry& reference, double beginArcBase, double endArcBase, double broadPhaseRadiusBaseVoxels) const override;
     [[nodiscard]] std::vector<DirectedFiberletStorageId> outgoing(const FiberletStorageKey& anchor) const override;
     [[nodiscard]] FiberletReplaySourceArc arc(const DirectedFiberletStorageId& id) const override;
+    [[nodiscard]] FiberletReplaySourceCostProfile costProfile(const DirectedFiberletStorageId& id) const override;
     [[nodiscard]] std::vector<cv::Vec3d> routePoints(const DirectedFiberletStorageId& id) const override;
     [[nodiscard]] std::optional<FiberletReplaySourceTransition> transition(const FiberletReplaySourceArc& incoming, const FiberletReplaySourceArc& outgoing) const override;
     [[nodiscard]] FiberletLogicalProjectionStats logicalProjectionStats() const;

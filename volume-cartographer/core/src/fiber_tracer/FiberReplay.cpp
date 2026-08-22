@@ -2314,8 +2314,12 @@ nlohmann::json writeFiberReplayBundle(const std::filesystem::path& outputDirecto
         makePolylineArcGeometry(input.request.fiber.linePointsXyzBase);
     const size_t startLineIndex = input.request.fiber.controlPointLineIndices[
         input.request.startControlPointIndex];
+    const double requestedBeginArc = input.request.referenceBeginArcBase.value_or(
+        startLineIndex < fullReference.vertexArcs.size()
+            ? fullReference.vertexArcs[startLineIndex]
+            : std::numeric_limits<double>::quiet_NaN());
     if (startLineIndex >= fullReference.vertexArcs.size() ||
-        !nearlyEqual(fullReference.vertexArcs[startLineIndex], beginArc) ||
+        !nearlyEqual(requestedBeginArc, beginArc) ||
         endArc > fullReference.length() + kEpsilon) {
         throw std::invalid_argument(
             "fiber replay selected interval differs from its request");

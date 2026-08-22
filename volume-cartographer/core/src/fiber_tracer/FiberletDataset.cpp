@@ -202,7 +202,8 @@ json arrayMetadata(const FiberletDatasetMetadata& metadata, FiberletStorageChunk
 {
     const char* sampleFormat = kind == FiberletStorageChunkKind::Anchors          ? "fiberlet-anchor-v2"
                                : kind == FiberletStorageChunkKind::FiberletPrefix ? "fiberlet-edge-prefix-v2"
-                                                                                  : "fiberlet-route-v2";
+                                                                                  : "fiberlet-route-v3";
+    const int codecVersion = kind == FiberletStorageChunkKind::FiberletRoutes ? 3 : 2;
     return {
         {"zarr_format", 2},
         {"shape", metadata.chunkGridShapeZYX},
@@ -210,7 +211,7 @@ json arrayMetadata(const FiberletDatasetMetadata& metadata, FiberletStorageChunk
         {"dtype", "|O"},
         {"fill_value", nullptr},
         {"order", "C"},
-        {"filters", {{{"id", "vc-fiberlet-chunk"}, {"codec_version", 2}, {"sample_format", sampleFormat}}}},
+        {"filters", {{{"id", "vc-fiberlet-chunk"}, {"codec_version", codecVersion}, {"sample_format", sampleFormat}}}},
         {"compressor", nullptr},
     };
 }
@@ -464,6 +465,10 @@ std::size_t FiberletRouteChunkPayload::residentBytes() const noexcept
         if (bytes > std::numeric_limits<std::size_t>::max() - result)
             return std::numeric_limits<std::size_t>::max();
         result += bytes;
+        const auto costBytes = route.segmentCostDensities.capacity() * sizeof(float);
+        if (costBytes > std::numeric_limits<std::size_t>::max() - result)
+            return std::numeric_limits<std::size_t>::max();
+        result += costBytes;
     }
     return result;
 }

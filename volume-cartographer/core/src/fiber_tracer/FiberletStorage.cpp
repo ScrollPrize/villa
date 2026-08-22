@@ -79,6 +79,8 @@ enum Field : std::uint16_t {
     RouteOffsets = 40,
     MiddleU = 41,
     MiddleV = 42,
+    CostOffsets = 43,
+    SegmentCostDensity = 44,
     InvalidPredictionCost = 50,
     AlignmentCost = 51,
     IsotropicSmoothnessCost = 52,
@@ -565,9 +567,21 @@ void validateFinite(const cv::Vec3f& value, const char* name)
 
 }  // namespace
 
-std::vector<std::byte> serializeFiberletAnchors(
-    const FiberletStorageCodecConfig& config,
-    std::span<const FiberletStoredAnchor> anchors)
+std::uint16_t encodeFiberletStoredCostDensity(float density)
+{
+    if (!(density >= 0.0F) || !std::isfinite(density))
+        throw std::invalid_argument("fiberlet route cost density must be finite and nonnegative");
+    const float transformed = std::sqrt(std::min(density / kFiberletStoredCostDensityMaximum, 1.0F));
+    return static_cast<std::uint16_t>(std::lround(transformed * 65535.0F));
+}
+
+float decodeFiberletStoredCostDensity(std::uint16_t code)
+{
+    const float transformed = static_cast<float>(code) / 65535.0F;
+    return transformed * transformed * kFiberletStoredCostDensityMaximum;
+}
+
+std::vector<std::byte> serializeFiberletAnchors(const FiberletStorageCodecConfig& config, std::span<const FiberletStoredAnchor> anchors)
 {
     validateConfig(config);
     const Scalar coordinateScalar = unsignedScalar(config.coordinateBits);
@@ -814,17 +828,27 @@ std::vector<std::byte> serializeFiberletRoutes(
     validateConfig(config);
     const Scalar latticeScalar = signedScalar(config.routeLatticeBits);
     std::uint64_t total = 0;
+    std::uint64_t totalCosts = 0;
     for (const auto& route : routes) {
         if (route.middleUV.size() > std::numeric_limits<std::uint32_t>::max() - total)
             throw std::invalid_argument("fiberlet route offsets overflow uint32");
+        if (route.segmentCostDensities.empty())
+            throw std::invalid_argument("fiberlet route has no segment cost densities");
+        if (route.segmentCostDensities.size() > std::numeric_limits<std::uint32_t>::max() - totalCosts)
+            throw std::invalid_argument("fiberlet route cost offsets overflow uint32");
         total += route.middleUV.size();
+        totalCosts += route.segmentCostDensities.size();
     }
     std::vector<FieldBlock> fields;
     fields.push_back(makeField(RouteOffsets, Scalar::U32, routes.size() + 1));
     fields.push_back(makeField(MiddleU, latticeScalar, total));
     fields.push_back(makeField(MiddleV, latticeScalar, total));
+    fields.push_back(makeField(CostOffsets, Scalar::U32, routes.size() + 1));
+    fields.push_back(makeField(SegmentCostDensity, Scalar::U16, totalCosts));
     appendLittle(fields[0].decoded, std::uint32_t{0});
+    appendLittle(fields[3].decoded, std::uint32_t{0});
     std::uint32_t offset = 0;
+    std::uint32_t costOffset = 0;
     for (const auto& route : routes) {
         for (const auto& uv : route.middleUV) {
             appendSigned(fields[1].decoded, latticeScalar, uv[0]);
@@ -832,6 +856,10 @@ std::vector<std::byte> serializeFiberletRoutes(
         }
         offset += static_cast<std::uint32_t>(route.middleUV.size());
         appendLittle(fields[0].decoded, offset);
+        for (const float density : route.segmentCostDensities)
+            appendLittle(fields[4].decoded, encodeFiberletStoredCostDensity(density));
+        costOffset += static_cast<std::uint32_t>(route.segmentCostDensities.size());
+        appendLittle(fields[3].decoded, costOffset);
     }
     return encodePayload(config, FiberletStorageChunkKind::FiberletRoutes,
         routes.size(), total, 0.0F, 0.0F, std::move(fields));
@@ -1089,18 +1117,26 @@ FiberletDecodedRoutes deserializeFiberletRoutes(std::span<const std::byte> bytes
     const auto& offsets = requireField(payload, RouteOffsets, Scalar::U32, payload.recordCount + 1).second;
     const auto& u = requireField(payload, MiddleU, latticeScalar, payload.auxiliaryCount).second;
     const auto& v = requireField(payload, MiddleV, latticeScalar, payload.auxiliaryCount).second;
-    if (payload.fields.size() != 3)
+    const auto& costOffsets = requireField(payload, CostOffsets, Scalar::U32, payload.recordCount + 1).second;
+    const auto costCount = readLittle<std::uint32_t>(costOffsets, payload.recordCount * 4);
+    const auto& costDensities = requireField(payload, SegmentCostDensity, Scalar::U16, costCount).second;
+    if (payload.fields.size() != 5)
         throw std::invalid_argument("fiberlet route payload contains unknown fields");
     FiberletDecodedRoutes result;
     result.config = payload.config;
     result.routes.resize(static_cast<std::size_t>(payload.recordCount));
     std::uint32_t previous = 0;
+    std::uint32_t previousCost = 0;
     for (std::size_t index = 0; index <= payload.recordCount; ++index) {
         const auto current = readLittle<std::uint32_t>(offsets, index * 4);
+        const auto currentCost = readLittle<std::uint32_t>(costOffsets, index * 4);
         if (current < previous || current > payload.auxiliaryCount)
             throw std::invalid_argument("fiberlet route offsets are invalid");
+        if (currentCost < previousCost || currentCost > costCount)
+            throw std::invalid_argument("fiberlet route cost offsets are invalid");
         if (index > 0) {
-            auto& route = result.routes[index - 1].middleUV;
+            auto& storedRoute = result.routes[index - 1];
+            auto& route = storedRoute.middleUV;
             route.reserve(current - previous);
             for (std::uint32_t point = previous; point < current; ++point) {
                 const auto ru = readSigned(u, latticeScalar, point);
@@ -1110,10 +1146,18 @@ FiberletDecodedRoutes deserializeFiberletRoutes(std::span<const std::byte> bytes
                     throw std::invalid_argument("fiberlet route coordinate exceeds logical range");
                 route.push_back({static_cast<std::int16_t>(ru), static_cast<std::int16_t>(rv)});
             }
+            if (currentCost == previousCost)
+                throw std::invalid_argument("fiberlet route has no segment cost densities");
+            storedRoute.segmentCostDensities.reserve(currentCost - previousCost);
+            for (std::uint32_t sample = previousCost; sample < currentCost; ++sample) {
+                storedRoute.segmentCostDensities.push_back(
+                    decodeFiberletStoredCostDensity(readLittle<std::uint16_t>(costDensities, sample * 2)));
+            }
         }
         previous = current;
+        previousCost = currentCost;
     }
-    if (previous != payload.auxiliaryCount)
+    if (previous != payload.auxiliaryCount || previousCost != costCount)
         throw std::invalid_argument("fiberlet route offsets do not consume all points");
     return result;
 }

@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -32,6 +33,8 @@ struct FiberletGraphEdge {
     std::vector<cv::Vec3f> pointsBaseXYZ;
     float pathLengthPredictionVoxels = 0.0F;
     FiberletPathCost cost;
+    std::vector<float> segmentLengthsPredictionVoxels;
+    std::vector<float> segmentCostDensities;
 };
 
 struct FiberletGraphTransition {
@@ -52,11 +55,21 @@ struct FiberletGraph {
     std::vector<FiberletGraphTransition> transitions;
 };
 
+enum class FiberletGraphReplayCostMode {
+    Fiberlet,
+    Stepped,
+};
+
 struct FiberletGraphReplayConfig {
     size_t beamWidth = 16;
     size_t expansionThreads = 1;
     double beamStepDistanceBaseVoxels = 48.0;
     double lookaheadDistanceBaseVoxels = 384.0;
+    FiberletGraphReplayCostMode costMode = FiberletGraphReplayCostMode::Fiberlet;
+    double geometricCostWeightPerBaseVoxel = 1.0;
+    double geometricCostDelayBaseVoxels = 0.0;
+    double costIntegrationStepBaseVoxels = 16.0;
+    double costProfileWeight = 1.0;
     size_t searchWidth = 0;
     double pruneDistanceBaseVoxels = 48.0;
     size_t maximumGeneratedStatesPerIteration = 1'000'000;
@@ -67,6 +80,7 @@ struct FiberletGraphReplayConfig {
     std::optional<double> referenceEndArcBase;
     std::optional<FiberletStorageKey> initialSeedKey;
     bool recordDecisionDiagnostics = false;
+    std::vector<std::pair<double, double>> decisionDiagnosticReferenceArcWindowsBase;
 };
 
 struct FiberletGraphReplayMatch {
@@ -111,8 +125,11 @@ struct FiberletGraphReplayDecisionRoute {
     FiberletGraphReplayCost committedEdgeCost;
     FiberletGraphReplayCost committedTransitionCost;
     double committedPathLengthPredictionVoxels = 0.0;
+    double routePointsBeginPathLengthPredictionVoxels = 0.0;
     double pathLengthPredictionVoxels = 0.0;
     double completePathLengthPredictionVoxels = 0.0;
+    double weightedEdgeLoss = 0.0;
+    double weightedTransitionLoss = 0.0;
     double totalLoss = 0.0;
     double lossPerPredictionVoxel = 0.0;
 };
@@ -149,6 +166,12 @@ struct FiberletGraphReplayDecision {
     size_t costPrunedStateCount = 0;
     size_t rejectedStateCount = 0;
     size_t dominatedStateCount = 0;
+    size_t relaxedBoundStateCount = 0;
+    size_t relaxedBoundHitCount = 0;
+    size_t relaxedBoundZeroFallbackCount = 0;
+    size_t initializationHistoryNodeCount = 0;
+    size_t logicalRouteInternCount = 0;
+    size_t logicalRouteCleanupVisitedCount = 0;
     size_t retainedBeamCount = 0;
     std::string searchMode;
     size_t searchWidth = 0;
@@ -238,6 +261,11 @@ struct FiberletReplaySourceArc {
     std::optional<size_t> diagnosticArcIndex;
 };
 
+struct FiberletReplaySourceCostProfile {
+    std::vector<float> segmentLengthsPredictionVoxels;
+    std::vector<float> segmentCostDensities;
+};
+
 struct FiberletReplaySourceTransition {
     DirectedFiberletStorageId incoming;
     DirectedFiberletStorageId outgoing;
@@ -258,6 +286,7 @@ public:
         const PolylineArcGeometry& reference, double beginArcBase, double endArcBase, double broadPhaseRadiusBaseVoxels) const = 0;
     [[nodiscard]] virtual std::vector<DirectedFiberletStorageId> outgoing(const FiberletStorageKey& anchor) const = 0;
     [[nodiscard]] virtual FiberletReplaySourceArc arc(const DirectedFiberletStorageId& id) const = 0;
+    [[nodiscard]] virtual FiberletReplaySourceCostProfile costProfile(const DirectedFiberletStorageId& id) const = 0;
     [[nodiscard]] virtual std::vector<cv::Vec3d> routePoints(const DirectedFiberletStorageId& id) const = 0;
     [[nodiscard]] virtual std::optional<FiberletReplaySourceTransition> transition(
         const FiberletReplaySourceArc& incoming, const FiberletReplaySourceArc& outgoing) const = 0;

@@ -1,3 +1,59 @@
+# 2026-08-22: geometrically weighted fiberlet substep costs
+
+- Restored stored whole-fiberlet and join scoring as the default replay cost
+  evaluator. The slower subsegment/grid evaluator is available explicitly as
+  `--cost-mode stepped`; its profile-weight default remains 1. Aggregate mode
+  does not load cost profiles, and cache identity is unchanged.
+- Added replay-only stepped-mode `--cost-profile-weight` in `[0,1]` to blend
+  each fiberlet's decoded average density with its decoded subsegment densities
+  before geometric weighting.
+- On the full Paris4 radius-768 hot-cache corridor, delayed `W=0.99` falloff
+  produced 5/5/3/2/2 failures at profile weights 0/0.25/0.5/0.75/1. With
+  `W=1`, profile weight zero exactly reproduced the two aggregate-baseline
+  failure arcs.
+- A matched-terminal-weight lookahead sweep found no zero-or-one-failure
+  configuration. H384/T0.25 retained two failures; every H512 setting produced
+  four, H768 produced three or four, and H768/T0.5 hit the route-state limit.
+- Removed two long-route quadratic paths discovered after the 5k validation.
+  Score initialization now reads cumulative prefix scalars and visits only the
+  checkpoint/lookahead suffix, while logical-route cleanup uses a bounded
+  persistent cursor instead of rescanning the complete registry.
+- Made `fiberlet-replay --threads` one shared budget for its concurrently
+  running greedy and fiberlet evaluators. This removes the 32-logical-CPU
+  oversubscription cliff without changing search ordering.
+- A hot-cache full Paris4 radius-768 replay crossed the former 65-percent
+  slowdown point at 12 seconds and completed in 22.34 seconds wall time, with
+  14 greedy and 5 fiberlet failures.
+- Repaired the scorer after the first profile integration changed more than the
+  checkpoint-forward term. Ranking now preserves the authoritative unweighted
+  prefix through the checkpoint and integrates decoded subsegment costs only
+  from the checkpoint through the horizon. Decoded profiles are not rescaled to
+  the separately stored whole-edge cost, and one integrator handles every
+  weight, including `W=1`.
+- Restored conservative relaxed cost-to-go pruning and incremental scalar score
+  state. Ordinary cached arc queries no longer load route payloads; profiles use
+  a bounded decision-local cache. On the Paris4 5k hot-cache benchmark, repaired
+  `W=1` had zero fiberlet failures and median wall/CPU ratios of 1.18x/1.21x
+  versus pinned revision `64e5341`.
+- Added opt-in delayed geometric falloff through replay-only `--cost-delay`;
+  zero preserves immediate decay and 192 base voxels covers half the default
+  lookahead before decay begins.
+- Persisted fixed-sqrt `uint16` cost density for every selected DP route
+  segment and changed exact and bounded graph lookahead to integrate those
+  profiles on a checkpoint-rooted base-distance grid.
+- Added replay-only `--cost-weight` and `--cost-step` controls. Weighted ranking
+  remains separate from the unchanged five-component committed diagnostics.
+- On the Paris4 5,000-base-voxel interval, `W=0.99` at both 16- and
+  32-base-voxel spacing completed with zero fiberlet failures, matching the
+  unweighted stored-profile run.
+- Added bounded decision windows and common-start `fiberlet-replay --arc`
+  diagnostics. Two Paris4 wide-radius failures now have constrained-radius
+  proxy routes and ranked alternative cost decompositions without full-fiber
+  reruns; the proxy is explicitly not treated as a same-graph oracle.
+- Clipped retained diagnostic polylines exactly at their checkpoint and
+  lookahead boundaries. The diagnostic-filter regression now also proves that
+  filtering leaves selected geometry and failure counts unchanged.
+
 # 2026-08-22: fractional fiberlet endpoint evaluation
 
 - Replaced the unpublished combined q1/u8 matrix row with a 0.125-base-voxel

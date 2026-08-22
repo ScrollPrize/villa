@@ -537,18 +537,187 @@ upper policy limit. A positive `K` opts into approximate intermediate
 pruning, must be at least the final beam width, and uses `--prune-distance P`.
 The prune distance is ignored in exact mode.
 
+`--cost-mode fiberlet` is the default. It uses the stored whole-fiberlet and
+join costs directly from the segment seed through the common lookahead horizon.
+Only the horizon-crossing fiberlet is prorated by length; an entering join is
+charged in full. This mode does not load route cost profiles or walk the
+integration grid. `--cost-mode stepped` explicitly enables the experimental
+subsegment integration described below. The stepped-only `--cost-weight`,
+`--cost-delay`, `--cost-step`, and `--cost-profile-weight` options are rejected
+unless that mode is selected.
+
+Every successful fiberlet stores one total-cost density per emitted route
+segment next to its route lattice. Density is selected DP segment cost divided
+by prediction-voxel segment length. It uses the fixed nonlinear `uint16`
+mapping `round(65535 * sqrt(clamp(density / 256, 0, 1)))`; decoding squares
+the unit-range code value and multiplies by 256. This codec mapping is the only
+normalization involved. Decoded segment costs are used directly and are never
+rescaled to make their sum equal the separately stored whole-edge cost.
+Geometry and cost profiles have independent route-payload offsets. Prefixes
+retain the five-component whole-edge cost used by committed-route diagnostics.
+
+In stepped mode, `--cost-profile-weight A` linearly blends the density used by replay before
+geometric weighting:
+
+```text
+effective_density = (1 - A) * fiberlet_average_density
+                  + A * subsegment_density
+```
+
+`A` must be finite and in `[0,1]` and defaults to 1. The fiberlet average is
+computed from the same decoded additive profile as
+`sum(density * segment_length) / fiberlet_length`; it is not taken from, or
+normalized to, the separately stored whole-edge cost. Consequently, every
+complete unweighted fiberlet retains the same decoded total at all blend
+values, apart from floating-point accumulation. Blend zero makes density
+constant within each fiberlet while preserving geometric weighting across the
+fiberlet. Blend one preserves the full stored subsegment profile and is the
+stepped-mode default.
+The option is replay-only and does not affect anchor or fiberlet cache identity.
+
+Stepped lookahead ranking adds the authoritative unweighted route cost from the segment
+seed through the current checkpoint to the decoded-profile cost from the
+checkpoint through the common horizon. `--cost-weight W` is the geometric
+weight per base voxel and
+must be in `(0,1]`; it defaults to 1. `--cost-delay L` keeps weight equal to
+one through the first `L` base voxels and then weights cost at checkpoint-local
+base distance `s` by `W^(s-L)`; it must be finite and nonnegative and
+defaults to zero, preserving immediate decay. A delay of 192 is half the
+default 384-base-voxel lookahead and is the initial delayed-falloff experiment.
+`--cost-step N` is the positive regular integration spacing in
+base voxels and defaults to 16. The grid is anchored once at the checkpoint
+and continues across fiberlet boundaries; a non-grid-aligned delay splits its
+containing integration cell exactly. Partial interval cost comes from
+linear interpolation of the piecewise-linear cumulative cost curve, and each
+interval uses the weight at its midpoint. The same integration path is used for
+all weights. At `W=1`, the decoded additive profile therefore reproduces its
+own total apart from codec, interpolation, and floating-point rounding; no
+special compatibility path or corrective scaling is applied. `--cost-step`
+remains active at `W=1`, so small route sensitivity from those numerical effects
+is possible, but material failure-count changes indicate a defect or a genuine
+near tie. An entering join before the checkpoint belongs to the authoritative
+prefix. A join at the checkpoint is included in the forward term with weight
+one, and a join exactly at the horizon is excluded. Ranking's weighted scalar
+is recorded separately from the unchanged unweighted component diagnostics.
+
+On the Paris4 5,000-base-voxel validation interval, the pinned pre-profile
+revision and repaired scorer all completed without a fiberlet failure. Five
+serial hot-cache runs gave these timings; CPU is `user + sys` and p95 is the
+nearest-rank sample:
+
+| Mode | Wall mean/p50/p95 | CPU mean/p50/p95 | Peak RSS |
+| --- | --- | --- | --- |
+| Pinned `64e5341` | 0.558/0.550/0.640 s | 15.684/15.480/18.550 s | 96.4 MiB |
+| Repaired `W=1`, step 16 | 0.666/0.650/0.800 s | 18.992/18.800/23.260 s | 97.6 MiB |
+| `W=0.99`, delay 0, step 16 | 0.642/0.630/0.710 s | 18.584/18.410/20.800 s | 97.1 MiB |
+| `W=0.99`, delay 192, step 16 | 0.616/0.610/0.650 s | 17.076/17.430/17.800 s | 97.4 MiB |
+
+The repaired `W=1` median wall and CPU times are respectively 1.18x and 1.21x
+the pinned baseline. `W=1` step 8 and step 32 selected the same canonical
+55-edge route on this interval. Both `W=0.99` modes also had zero fiberlet
+failures; delayed falloff remains an explicit experiment rather than a default
+quality change.
+
+On the full Paris4 radius-768 hot-cache corridor, `W=0.99`, delay 192, and
+step 16 produced 5/5/3/2/2 fiberlet failures for profile weights
+0/0.25/0.5/0.75/1 respectively. Wall time was 21.47-22.63 seconds and peak RSS
+was 1.18-1.23 GiB. With `W=1`, profile weight zero reproduced the two-failure
+aggregate baseline at exactly the same failure arcs in 21.68 seconds. Profile
+weight one retained the current five-failure behavior in 21.44 seconds.
+
+A matched-terminal-weight sweep then tested whether more lookahead helps the
+0.75 profile blend. Each run used delay `H/2` and
+`W = terminal_weight^(1 / (H - delay))`, so horizon changes did not also change
+the requested endpoint decay:
+
+| Lookahead H | Terminal 0.10 | Terminal 0.25 | Terminal 0.50 |
+| ---: | ---: | ---: | ---: |
+| 384 | 4 failures, 22.11s | 2 failures, 21.13s | 4 failures, 21.00s |
+| 512 | 4 failures, 31.90s | 4 failures, 36.88s | 4 failures, 37.18s |
+| 768 | 3 failures, 110.70s | 4 failures, 147.12s | route-state limit, 36.07s |
+
+These full-reference radius-768 hot-cache runs used beam 16, checkpoint step
+48, exact search, integration step 16, and the existing one-million-state cap.
+No larger horizon improved on the two-failure H384 control; H768 also increased
+peak RSS from about 1.2 GiB to 1.4-1.9 GiB.
+
+The two H384/T0.25 failures were then compared with constrained-radius runs at
+the same objective settings. Radius 64 was not a usable correctness reference:
+it failed at 41,744 and 48,159 base-voxel reference arc. Radius 32 followed the
+reference through both radius-768 failure regions and stopped only with graph
+exhaustion at 50,753, near the reference endpoint and below the distance
+threshold. That full run took 29.11 seconds wall time and 927,040 KiB peak RSS.
+It is a supervised reference-following baseline, not proof that its exact
+discrete route exists in the wider graph; radius-dependent cell selection and
+anchor NMS can change graph topology.
+
+Two focused common-start replays isolate the persistent failures without the
+earlier route and restart history:
+
+| Start arc | Length | Radius 32 | Radius 768 |
+| ---: | ---: | --- | --- |
+| 40,500 | 1,600 | no fiberlet failure | failure at 41,744 |
+| 41,744.240 | 1,400 | no fiberlet failure | failure at 42,747 |
+
+At reference arc 41,289, a radius-32-like continuation was present in the wide
+frontier at rank 7. The selected and
+reference-following losses were respectively 0.283476 and 0.284211 per
+prediction voxel. The reference-following route had lower weighted edge loss
+(12.2647 versus 12.3026) but higher weighted join loss (1.5219 versus 1.3826),
+and matched the constrained geometry to 0.28 base voxels over the clipped
+lookahead. The selected candidate was 7.08 base voxels from that continuation.
+A close continuation remained available at the next two checkpoints, then the
+closest top-16 candidate was already 32.2 base voxels away at checkpoint 108.
+At the reported checkpoint the selected and rank-7 routes share their committed
+prefix and differ only in future lookahead, so this does not identify a causal
+wrong commit.
+
+In the second focused window both radii selected the same geometry through
+reference arc 42,404. At checkpoint 66 the selected wide route was 13.52 base
+voxels from the constrained continuation, and no closer candidate survived in
+the top 16. Increasing the beam to 128 recovered a marginally closer 13.11-
+base-voxel alternative only at rank 99: its loss was 0.235793 versus 0.231951
+for the selected route. The alternative's weighted edge loss was slightly
+lower (7.4989 versus 7.5524), but its join loss was 0.7827 versus 0.2075. Beam
+128 therefore delayed the failure to 42,781 but did not remove it. Radius 32
+changes the extracted graph and is not a same-graph correctness oracle, so
+these costs are descriptive and do not prove that join weighting caused either
+failure. A causal comparison requires the best reference-admissible route in
+the same radius-768 graph, with identical seed and checkpoint history.
+
+The two replay events exceed the configured Lasagna-normal ellipsoid even
+though their normal and tangential components are individually below 20 and 80
+base voxels. Their component pairs and normalized ratios are respectively
+`19.134/38.976, 1.0736` and `10.618/68.473, 1.0072`, where
+`ratio = sqrt((normal/20)^2 + (tangential/80)^2)`. A future evaluation can also
+test bounded excursions that rejoin the admissible region within a configured
+reference arc, but must report excursion length and severity rather than
+silently suppressing persistent switches.
+
+The focused collections can support offline tuning of objective-only values
+when they retain stable logical route IDs, raw decoded subsegment profiles,
+edge and join components, route geometry, checkpoint history, and cache/profile
+fingerprints. Fixed candidates can then be relabeled by distance to the
+reference and rescored for profile blend, decay, delay, integration spacing,
+and explicit component multipliers. They cannot faithfully tune radius,
+fiberlet generation, beam/checkpoint/lookahead policy, state limits, or any
+setting that changes the candidate frontier or later checkpoint history; those
+settings require focused replay, although the hot-cache focused runs above take
+only about 0.2 seconds at radius 32 and 1.3-1.5 seconds at radius 768. These two
+windows are tuning diagnostics and must not also be used as validation data.
+
 Exact mode keeps each winning route through the full common lookahead horizon,
 not just through the next checkpoint. The following decision extends those
 retained routes only from their existing endpoints; a whole terminal fiberlet
 that already crosses the new horizon is rescored there without expansion. One
 multi-source priority frontier feeds one global top-`beam` completion set. Routes
-are ranked by raw exact-horizon total loss and canonical persistent logical
+are ranked by checkpoint-relative weighted exact-horizon loss and canonical persistent logical
 identity, and only identical complete logical routes are deduplicated. Several
 retained routes may therefore share the same checkpoint prefix and diverge
 later in the lookahead.
 
 The global cutoff appears only after `beam` distinct complete logical routes
-are known. Its value is the worst retained raw total, shared by all input beams.
+are known. Its value is the worst retained weighted total, shared by all input beams.
 Increasing the beam therefore delays cutoff activation and can substantially
 increase exact-search work; the generated-state limit remains the hard bound.
 Lower bounds equal to the cutoff remain eligible. Expansion uses a fixed-size
@@ -577,18 +746,19 @@ bin. If multiple histories reach that state, only the lowest accumulated-cost
 history survives; ordered logical arc IDs break exact-cost ties. The survivor's
 visited-node set is used for later cycle rejection. This deliberate state merge
 closes reconvergent paths instead of enumerating every history. Exact crossing
-scores still use the proportional terminal fiberlet cost, and equal-bound
+scores integrate the segment profile through the terminal fiberlet, and equal-bound
 labels are processed before a width cutoff. Diagnostics report dominated
 labels separately from cost-bound pruning and exact completed candidates. Once
 stable prefixes exist, a worker searches for one prefix representative plus
 only enough extra candidates to fill globally unoccupied slots; it does not
 try to prove a local top 128 for every prefix.
 
-Costs are cumulative from the segment seed to each exact front. The entering
-join of a front-crossing fiberlet is charged fully and its edge cost is charged
-only in proportion to the distance inside the front. The complete crossing
-fiberlet remains in route geometry and visited state. Stable logical IDs,
-canonical worker merging, and one decision-wide state budget make output
+Front ranking retains the authoritative unweighted prefix through the decision
+checkpoint and adds the decoded weighted profile through each exact front. The
+entering join of a front-crossing fiberlet is charged at its checkpoint-relative
+weight and its edge profile is integrated only through the front. The complete
+crossing fiberlet remains in route geometry and visited state. Stable logical
+IDs, canonical worker merging, and one decision-wide state budget make output
 independent of expansion thread scheduling.
 
 In bounded mode, after pruning the checkpoint advances by `D`. Each retained history is
@@ -615,12 +785,28 @@ remain distinct. Visited anchors live in an immutable exact-key Patricia trie,
 so advancing a checkpoint does not copy the accumulated cycle set. Reference
 matching and Lasagna-normal threshold evaluation resume at the nearest already
 evaluated physical-history ancestor and process only the newly selected suffix.
+Decision scoring initializes the authoritative prefix from cumulative scalar
+cost at the history immediately before the checkpoint, then walks only the
+checkpoint-to-horizon suffix. Expired logical-route interning entries are
+reclaimed through a bounded persistent cursor rather than a whole-registry scan
+at every checkpoint. These bounds keep per-checkpoint bookkeeping independent
+of the distance already committed in the segment.
 The public point, match, step, and consumed-node vectors are assembled once at
 segment termination. Focused replay decision diagnostics are the deliberate
 exception: they request complete route payloads for every recorded decision and
 therefore may materialize those diagnostic histories.
 
-Beam-step, lookahead, prune distance, and search width are replay state only.
+The greedy and fiberlet evaluators run concurrently. `--threads N` is their
+shared evaluator worker budget: replay deterministically divides it between the
+two nested evaluators instead of creating up to `2N` workers. On the full
+46,148-base-voxel Paris4 interval at radius 768, the repaired hot-cache run with
+`--threads 32` crossed 64.7 percent at 11 seconds and completed in 22.34 seconds
+wall time (41.27 seconds user, 4.97 seconds system, 1.19 GiB peak RSS). It
+reported 14 greedy and 5 fiberlet failures; the complexity and scheduling
+changes do not alter failure evaluation.
+
+Beam-step, lookahead, prune distance, search width, geometric cost weight, and
+cost integration spacing are replay state only.
 They are absent from anchor/fiberlet cache fingerprints, extraction settings,
 and serialized chunk payloads. A new horizon can request previously untouched
 on-demand chunks, but a fully hot cache is reopened without rewriting it.
@@ -738,10 +924,12 @@ the deterministic two-endpoint index built once in each decoded prefix chunk.
 The separate anchor and fiberlet `ChunkCache` instances retain typed decoded
 payloads directly and charge their vectors and indices to the shared LRU
 budget; they do not retain another serialized copy or use a graph-private LRU.
-Prefix records and exact endpoint steps are sufficient for beam ranking and
-join scoring. Route blocks are loaded only for the current provisional best
-history during reference-error evaluation and for final output. Evicted chunks
-reload transparently.
+Prefix records and exact endpoint steps remain sufficient for connectivity and
+join scoring. Lookahead loads route blocks to obtain decoded segment densities
+and the route-lattice segment lengths; only selected routes are retained after
+the query. The current provisional best is additionally reconstructed for
+reference-error evaluation and final output. Evicted chunks reload
+transparently.
 For the float cache, anchors own the exact interpolated prediction/presence and
 normal samples used by eager graph construction, while prefixes own all five
 float path-cost components, the authoritative float path length, and the exact
@@ -1498,14 +1686,16 @@ segment. Change the distance with `--route-stats-failure-margin N`.
 diagnostic anchor identity printed by the full run; it makes a later segment
 exact even though the full replay excludes graph nodes consumed by earlier
 segments. Focused diagnostics reopen the completed full-corridor cache identity
-but disable its schedule prefetch. The graph therefore loads, or generates when
-missing, only chunks reached by seed selection and the completed beam route.
+and schedule the chunks intersecting the focused reference tube. Missing chunks
+are generated with the full-corridor containment predicate, so their persisted
+contents remain compatible with an unfocused replay.
 
 Focused replay JSON includes each decision's retained beam frontier, current
 and next logical checkpoints, whole-fiberlet scoring horizon, expansion thread
 count, and evaluated/retained candidate counts. Every route records its
 committed whole-fiberlet prefix IDs separately from its best lookahead
-continuation, plus route points in base coordinates, edge and transition costs,
+continuation, plus checkpoint-to-lookahead route points in base coordinates,
+the path-length origin of those points, edge and transition costs,
 actual path length including final-edge overshoot, total loss, and loss per
 prediction voxel. A sibling
 `decision-comparison-<scenario>.json` reports the first
@@ -1513,6 +1703,23 @@ selected-route difference, cross-ranks each run's choice in the other run when
 that route exists, and reports the maximum symmetric distance between paired
 selected route geometries. This distinguishes a disproportionate scoring bug
 from a small cost change that flips an already near-tied discrete decision.
+
+For full-history replay diagnostics, `--stats --decision-window BEGIN,END`
+retains those decision records only when the selected route's matched reference
+arc lies in the inclusive base-voxel interval. The option is repeatable. Search,
+matching, restart history, and cache identity are unchanged; only diagnostic
+materialization is filtered. This is preferable to unrestricted `--stats` for
+long fibers because each retained route owns its lookahead IDs and geometry.
+Decision-frontier recording is disabled by default; `--decision-window` is
+rejected unless `--stats` is also present.
+
+`fiberlet-replay --arc BEGIN --length LENGTH` starts both evaluators at an
+absolute base-voxel reference arc. This is a diagnostic interval, not a new
+fiber control point. The greedy evaluator uses the sampled reference point and
+tangent, and graph replay selects its seed there. Focused runs retain the full
+reference corridor's cache identity and containment rules while scheduling
+only the requested interval, so compatible completed cache chunks are reused
+and any missing chunk is generated with the same contents as a full replay.
 
 The `fiberlet_cached_quantization` row is machine-readable. It reports the
 explicit position/direction/cost settings, failure counts, completed fractions,

@@ -85,6 +85,9 @@ struct FiberletCandidateResult {
     bool success = false;
     std::string reason;
     FiberletPathCost cost;
+    // One additive local metric cost for every consecutive pair in
+    // pointsPredictionXYZ. Their sum is the selected DP objective.
+    std::vector<FiberletPathCost> segmentCosts;
     // Exact selected transverse lattice coordinate for every interior DP
     // layer. This is the persistence geometry; expanded XYZ is an adapter.
     std::vector<std::array<std::int16_t, 2>> routeLatticeUV;
