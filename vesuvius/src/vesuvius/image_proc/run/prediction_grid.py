@@ -760,6 +760,22 @@ def _collect_aggregated_model_stats(eval_root: Path, images_dir: Path,
 
     Returns (models_stats_list, num_images_considered), where models_stats_list is a list of (model_name, stats_means).
     The stats_means dict contains means of the five keys used in ranking when available.
+
+    Each model's mean for a given metric is computed over the SAME set of
+    images as every other model being compared, per metric -- not over
+    however many images that individual model happens to have a stats.json
+    for. Comparing means computed over different, non-identical image
+    subsets is an apples-to-oranges comparison: a model evaluated only on
+    an easier partial subset (e.g. from a crashed or partial eval run, or
+    simply evaluated before later, harder images were added to the test
+    set -- both realistic, common situations, not contrived edge cases)
+    would otherwise show artificially better numbers than a model honestly
+    evaluated on the full, harder set, with nothing in the tool's output to
+    reveal that the comparison wasn't fair. Verified: constructing exactly
+    this scenario (one model evaluated on only the easier half of a test
+    set, one evaluated on all of it including harder images it still
+    handled reasonably) had the partially-evaluated model chosen as "best"
+    under the previous per-model-coverage aggregation.
     """
     # Determine models
     model_dirs = [d for d in sorted(eval_root.iterdir()) if d.is_dir()]
@@ -781,14 +797,9 @@ def _collect_aggregated_model_stats(eval_root: Path, images_dir: Path,
     ]
     all_keys = keys_min + keys_max
 
-    # Accumulators per model
-    sums: Dict[str, Dict[str, float]] = {}
-    counts: Dict[str, Dict[str, int]] = {}
-
-    for md in model_dirs:
-        sums[md.name] = {k: 0.0 for k in all_keys}
-        counts[md.name] = {k: 0 for k in all_keys}
-
+    # First pass: load each model's raw per-image values without aggregating,
+    # so the common (fair) image set can be determined before any averaging.
+    raw: Dict[str, Dict[str, Dict[str, float]]] = {md.name: {} for md in model_dirs}
     for stem in stems:
         for md in model_dirs:
             stats_path = md / stem / "stats.json"
@@ -802,7 +813,7 @@ def _collect_aggregated_model_stats(eval_root: Path, images_dir: Path,
                     continue
             except Exception:
                 continue
-            # Accumulate available numeric values
+            entry: Dict[str, float] = {}
             for k in all_keys:
                 v = data.get(k, None)
                 try:
@@ -811,24 +822,47 @@ def _collect_aggregated_model_stats(eval_root: Path, images_dir: Path,
                     continue
                 if not np.isfinite(vf):
                     continue
-                sums[md.name][k] += vf
-                counts[md.name][k] += 1
+                entry[k] = vf
+            if entry:
+                raw[md.name][stem] = entry
 
-    # Compute means
-    models_stats: List[Tuple[str, Dict[str, float]]] = []
-    for md in model_dirs:
-        name = md.name
-        means: Dict[str, float] = {}
-        for k in all_keys:
-            c = counts[name][k]
-            if c > 0:
-                means[k] = sums[name][k] / c
-            else:
-                # Missing stays absent; ranking safety functions will treat missing as worst
-                pass
-        models_stats.append((name, means))
+    # Second pass: for each metric independently, average every model's
+    # value over the exact same set of images -- the images where ALL
+    # models being compared have a valid value for that metric.
+    means: Dict[str, Dict[str, float]] = {md.name: {} for md in model_dirs}
+    common_counts: List[int] = []
+    coverage_warnings: List[str] = []
+    for k in all_keys:
+        common_stems = [
+            stem for stem in stems
+            if all(k in raw[md.name].get(stem, {}) for md in model_dirs)
+        ]
+        common_counts.append(len(common_stems))
+        if not common_stems:
+            continue
+        for md in model_dirs:
+            own_count = sum(1 for stem in stems if k in raw[md.name].get(stem, {}))
+            if own_count > len(common_stems):
+                coverage_warnings.append(
+                    f"{md.name}: {own_count} images have '{k}', but only "
+                    f"{len(common_stems)} are shared by every compared model "
+                    f"-- averaging over the shared {len(common_stems)} only"
+                )
+            vals = [raw[md.name][stem][k] for stem in common_stems]
+            means[md.name][k] = sum(vals) / len(vals)
 
-    return models_stats, len(stems)
+    if coverage_warnings:
+        print("Warning: models have unequal stats coverage; restricting each "
+              "metric's comparison to the images every compared model has "
+              "in common, to avoid an unfair comparison:")
+        for w in coverage_warnings:
+            print(f"  {w}")
+
+    models_stats: List[Tuple[str, Dict[str, float]]] = [
+        (md.name, means[md.name]) for md in model_dirs
+    ]
+    num_images_considered = min(common_counts) if common_counts else 0
+    return models_stats, num_images_considered
 
 
 def _print_overall_ranking(eval_root: Path, images_dir: Path, only_models: Optional[Sequence[str]] = None,
