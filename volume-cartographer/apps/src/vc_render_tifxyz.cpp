@@ -1050,6 +1050,38 @@ static std::optional<double> readVolumeVoxelSize(const std::filesystem::path& vo
 }
 
 // ============================================================
+// availableMemoryBytes – smallest visible memory budget, 0 if unknown
+// ============================================================
+
+static size_t availableMemoryBytes()
+{
+#ifdef __linux__
+    auto readValue = [](const char* path) -> size_t {
+        std::ifstream f(path);
+        std::string s;
+        if (!f || !(f >> s) || s == "max") return 0;
+        try { return std::stoull(s); } catch (...) { return 0; }
+    };
+    size_t budget = readValue("/sys/fs/cgroup/memory.max");
+    if (!budget) budget = readValue("/sys/fs/cgroup/memory/memory.limit_in_bytes");
+    std::ifstream meminfo("/proc/meminfo");
+    std::string key;
+    size_t kb = 0;
+    while (meminfo >> key >> kb) {
+        meminfo.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+        if (key == "MemAvailable:") {
+            const size_t avail = kb * 1024;
+            budget = budget ? std::min(budget, avail) : avail;
+            break;
+        }
+    }
+    return budget;
+#else
+    return 0;
+#endif
+}
+
+// ============================================================
 // main
 // ============================================================
 
@@ -1341,7 +1373,23 @@ int main(int argc, char *argv[])
     // --- Open source volume ---
     const int cacheLevel = group_idx;
 
-    const size_t cache_bytes = parsed["cache-gb"].as<size_t>() * 1024ull * 1024ull * 1024ull;
+    size_t cache_bytes = parsed["cache-gb"].as<size_t>() * 1024ull * 1024ull * 1024ull;
+    if (const size_t mem_budget = availableMemoryBytes(); mem_budget && cache_bytes > mem_budget / 2) {
+        if (parsed["cache-gb"].defaulted()) {
+            const size_t clamped = std::max(mem_budget / 2, size_t(1) << 30);
+            logPrintf(stdout,
+                      "Chunk cache: clamping default %zu GB to %.1f GB (half of the %.1f GB visible memory budget); "
+                      "override with --cache-gb.\n",
+                      parsed["cache-gb"].as<size_t>(),
+                      double(clamped) / (1ull << 30), double(mem_budget) / (1ull << 30));
+            cache_bytes = clamped;
+        } else {
+            logPrintf(stderr,
+                      "Warning: --cache-gb %zu exceeds half of the %.1f GB visible memory budget; "
+                      "the render may stall against the memory ceiling with no further output.\n",
+                      parsed["cache-gb"].as<size_t>(), double(mem_budget) / (1ull << 30));
+        }
+    }
     std::unique_ptr<vc::render::ChunkCache> ownedChunkCache;
     vc::render::IChunkedArray* chunk_cache = nullptr;
 
@@ -1652,11 +1700,28 @@ int main(int argc, char *argv[])
                 return p;
             };
 
-            // Skip if all exist
+            // Skip only when every slice exists AND decodes: an interrupted
+            // render leaves stubs without a TIFF directory (written on close),
+            // which TIFFOpen rejects, so existence alone would poison resume.
+            auto sliceDecodes = [](const std::filesystem::path& p) -> bool {
+                TIFF* tif = TIFFOpen(p.string().c_str(), "r");
+                if (!tif) return false;
+                TIFFClose(tif);
+                return true;
+            };
             bool tifSkip = false;
             if (numParts <= 1) {
                 bool all = true;
-                for (int z = 0; z < tifSlices; z++) if (!std::filesystem::exists(makePartPath(z))) { all = false; break; }
+                for (int z = 0; z < tifSlices; z++) {
+                    const auto p = makePartPath(z);
+                    if (!std::filesystem::exists(p)) { all = false; break; }
+                    if (!sliceDecodes(p)) {
+                        logPrintf(stdout, "[tif] %s exists but does not decode (interrupted render?); re-rendering.\n",
+                                  p.string().c_str());
+                        all = false;
+                        break;
+                    }
+                }
                 if (all) {
                     if (!wantZarr) { logPrintf(stdout, "[tif] all slices exist, skipping.\n"); return true; }
                     logPrintf(stdout, "[tif] all slices exist, skipping tif output.\n");
