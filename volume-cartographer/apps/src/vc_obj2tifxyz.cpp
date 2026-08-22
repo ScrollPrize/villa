@@ -313,10 +313,19 @@ public:
         std::cout << "Valid grid points: " << valid_count << " / " << (grid_size[0] * grid_size[1]) 
                   << " (" << (100.0f * valid_count / (grid_size[0] * grid_size[1])) << "%)" << std::endl;
         
-        // Scale is currently in OBJ units. Convert to micrometers now.
         if (valid_count == 0) {
-            std::cerr << "Warning: no valid grid points were rasterized." << std::endl;
+            delete points;
+            std::cerr << "Error: no valid grid points were rasterized; refusing to write an empty tifxyz." << std::endl;
+            const cv::Vec2f uv_range = uv_max - uv_min;
+            if (uv_range[0] <= 1.5f && uv_range[1] <= 1.5f) {
+                std::cerr << "UVs span only " << uv_range[0] << " x " << uv_range[1]
+                          << " — they look normalised to [0,1]. Pass a stretch_factor"
+                          << " (e.g. 800) so the grid has usable resolution." << std::endl;
+            }
+            return nullptr;
         }
+
+        // Scale is currently in OBJ units. Convert to micrometers now.
         const bool src_scale_mode = (src_scale[0] > 0.f && src_scale[1] > 0.f);
         if (src_scale_mode) {
             // Scale was adopted verbatim from the source tifxyz; do not rescale.
@@ -523,7 +532,8 @@ int main(int argc, char *argv[])
         std::cout << "Converts an OBJ file to tifxyz format" << std::endl;
         std::cout << std::endl;
         std::cout << "Parameters:" << std::endl;
-        std::cout << "  stretch_factor: UV scaling factor (default: 1.0)" << std::endl;
+        std::cout << "  stretch_factor: UV scaling factor (default: 1.0). UVs normalised to [0,1]" << std::endl;
+        std::cout << "                  need an explicit value (e.g. 800) or no grid points survive." << std::endl;
         std::cout << "  mesh_units    : micrometers per OBJ unit (default: 1.0)" << std::endl;
         std::cout << "Flags:" << std::endl;
         std::cout << "  --uv-metric         : UVs are metric (default; UV units == OBJ units unless --uv-to-obj is set)" << std::endl;
@@ -539,7 +549,7 @@ int main(int argc, char *argv[])
         std::cout << std::endl;
         std::cout << "Note: Scale factors are automatically calculated from the mesh grid structure." << std::endl;
         std::cout << "Examples:" << std::endl;
-        std::cout << "  " << argv[0] << " mesh.obj outdir                       (legacy behavior)" << std::endl;
+        std::cout << "  " << argv[0] << " mesh.obj outdir                       (UV-metric mode, default)" << std::endl;
         std::cout << "  " << argv[0] << " mesh.obj outdir 800 1.0 --uv-metric  (UV is metric, OBJ units == UV units)" << std::endl;
         std::cout << "  " << argv[0] << " mesh.obj outdir --uv-metric --uv-to-obj=0.001" << std::endl;
         return EXIT_SUCCESS;
