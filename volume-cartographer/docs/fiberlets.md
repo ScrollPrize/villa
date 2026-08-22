@@ -633,6 +633,67 @@ pinned until the current graph query releases them. `--storage-chunk-side N`
 selects the spatial chunk side in base voxels and must be an exact multiple of
 the anchor cell side. The roots are local-only in this implementation.
 
+## Whole-volume preprocessing
+
+Use `preprocess-volume` to materialize sparse anchors and fiberlets for an
+entire stored prediction volume without a reference fiber:
+
+```bash
+volume-cartographer/build/bin/vc_fiberlets preprocess-volume \
+  /path/to/fiber.lasagna.json /path/to/fiberlets.zarr \
+  --normal-manifest /path/to/normals.lasagna.json \
+  --threads 32
+```
+
+The command retains two outputs. The default intermediate anchor cache is
+`<output-stem>.anchors.zarr`; override it with `--anchor-cache PATH`. The final
+combined Zarr contains only its metadata and the sparse `anchors/`, `prefix/`,
+and `routes/` payload arrays. It uses float positions, compact directions, and
+fixed sqrt-density `uint16` costs with ceiling 256. It has no active-chunk index
+or completion-marker files.
+
+Sparse eligibility depends only on canonical stored presence chunks. A final
+spatial chunk is active when it overlaps a present, decoded-nonzero presence
+chunk. Direction channels do not affect this first-stage decision. Missing and
+decoded-all-zero presence chunks do not activate output. The intermediate
+anchor cache additionally materializes the exact neighboring dependency halo
+needed to evaluate active fiberlet chunks; those halo-only chunks are not added
+to the final sparse index.
+
+Work is submitted in stable Z/Y/X order. Every invocation rescans canonical
+input presence to reconstruct the expected final chunks, then checks the
+required intermediate anchors and final output tuples directly. A final chunk
+is complete only when its anchor, prefix, and route payloads all exist, decode
+against the expected dataset and chunk identity, and form a matching
+prefix/route pair. Missing tuple members are regenerated while matching members
+left by an interrupted run are reused. Corrupt or conflicting members fail
+loudly.
+
+Anchor and final generation each report a live progress line about once per
+second and preserve a newline at least once per minute and at stage completion.
+The line includes completed/total chunks, percent, elapsed time, throughput,
+ETA, and current/projected compressed payload size. Projection uses the mean
+payload size of completed or resumed expected chunks and excludes Zarr
+metadata.
+
+Each payload file is independently published by temporary write, file sync,
+atomic rename, and directory sync. The three final files are a logical
+completeness unit rather than one filesystem transaction. The command holds
+exclusive locks on both output roots, removes abandoned atomic-write temporary
+files before scanning and after workers stop, and removes obsolete
+`active_chunks.bin`, `dataset.complete`, and `complete/` artifacts from earlier
+development versions. Concurrent writers to either root are rejected.
+
+Stored graph readers for a combined output must perform the same input-presence
+scan and configure the resulting expected set after every reopen. Chunks outside
+that set resolve as canonical empty payloads; missing expected tuples keep the
+dataset incomplete. Extra intermediate halo anchors remain reusable.
+
+`--presence-floor` defaults to `0.05`. It is the inclusive owned-observation
+eligibility floor: a cell with no usable owned observation at or above the
+floor returns before seed generation or refinement. `--minimum-support` is a
+separate post-fit acceptance threshold.
+
 Pass `--storage-compression-chunks N` to select up to `N` spatial regions that
 intersect the replay and run complete anchor and fiberlet extraction for every
 cell in those regions. Extraction also includes the neighboring anchor-cell

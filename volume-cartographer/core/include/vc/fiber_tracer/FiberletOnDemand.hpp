@@ -60,6 +60,9 @@ struct FiberletScheduledChunk {
     double nearestReferenceDistanceBase = 0.0;
 };
 
+[[nodiscard]] std::vector<vc::render::ChunkKey> fiberletOutputChunksForNonemptyPresence(
+    const FiberPresenceChunkScanReport& presence, const FiberletDatasetMetadata& outputMetadata, int anchorCellSizePredictionVoxels);
+
 class FiberletOnDemandPreprocessor : public std::enable_shared_from_this<FiberletOnDemandPreprocessor>
 {
 public:

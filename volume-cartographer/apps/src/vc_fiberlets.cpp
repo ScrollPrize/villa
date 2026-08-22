@@ -14,6 +14,7 @@
 #include <zstd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -37,6 +38,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -50,11 +52,17 @@ enum class Command {
     QuantizationBenchmark,
     Paths,
     FiberletReplay,
+    PreprocessVolume,
 };
 
 bool isReplayCommand(Command command)
 {
     return command == Command::FiberletReplay;
+}
+
+bool isWholeVolumeCommand(Command command)
+{
+    return command == Command::PreprocessVolume;
 }
 
 bool isQuantizationCommand(Command command)
@@ -69,7 +77,8 @@ bool usesGraphReplayOptions(Command command)
 
 bool needsPathExtraction(Command command)
 {
-    return command == Command::Paths || command == Command::Benchmark || isReplayCommand(command) || isQuantizationCommand(command);
+    return command == Command::Paths || command == Command::Benchmark || isReplayCommand(command) || isQuantizationCommand(command) ||
+           isWholeVolumeCommand(command);
 }
 
 struct CliOptions {
@@ -151,6 +160,9 @@ void usage(const char* executable)
                  " --normal-manifest <lasagna.json-or-url> [options]\n\n"
               << "  " << executable
               << " fiberlet-replay <fiber.lasagna.json-or-url> <fiber.json> <output-dir>"
+                 " --normal-manifest <lasagna.json-or-url> [options]\n\n"
+              << "  " << executable
+              << " preprocess-volume <fiber.lasagna.json-or-url> <output.zarr>"
                  " --normal-manifest <lasagna.json-or-url> [options]\n\n"
               << "Common options:\n"
               << "  --threads N                   decode/search workers [hardware]\n"
@@ -350,6 +362,11 @@ CliOptions parseArgs(int argc, char** argv)
         options.fiberJson = argv[3];
         options.outputDirectory = argv[4];
         firstOption = 5;
+    } else if (command == "preprocess-volume") {
+        options.command = Command::PreprocessVolume;
+        options.manifestLocation = argv[2];
+        options.outputDirectory = argv[3];
+        firstOption = 4;
     } else {
         usage(argv[0]);
         std::exit(2);
@@ -406,34 +423,24 @@ CliOptions parseArgs(int argc, char** argv)
         } else if (argument == "--inference-scaledown-power" && isReplayCommand(options.command)) {
             options.inferenceScaledownPower =
                 parseInt(valueAfter(index, argc, argv, "inference-scaledown-power"), "inference-scaledown-power");
-        } else if (argument == "--anchor-cache" && usesGraphReplayOptions(options.command)) {
+        } else if (argument == "--anchor-cache" && (usesGraphReplayOptions(options.command) || isWholeVolumeCommand(options.command))) {
             options.anchorCacheRoot = valueAfter(index, argc, argv, "anchor-cache");
         } else if (argument == "--fiberlet-cache" && usesGraphReplayOptions(options.command)) {
             options.fiberletCacheRoot = valueAfter(index, argc, argv, "fiberlet-cache");
         } else if (argument == "--eager-graph" && isReplayCommand(options.command)) {
             options.eagerGraphReplay = true;
-        } else if (argument == "--storage-compression-chunks" &&
-                   isReplayCommand(options.command)) {
-            const int value = parseInt(
-                valueAfter(index, argc, argv, "storage-compression-chunks"),
-                "storage-compression-chunks");
+        } else if (argument == "--storage-compression-chunks" && isReplayCommand(options.command)) {
+            const int value = parseInt(valueAfter(index, argc, argv, "storage-compression-chunks"), "storage-compression-chunks");
             if (value <= 0)
                 fail("--storage-compression-chunks must be positive");
             options.storageCompressionChunks = static_cast<std::size_t>(value);
-        } else if (argument == "--storage-compression-seed" &&
-                   isReplayCommand(options.command)) {
-            const int value = parseInt(
-                valueAfter(index, argc, argv, "storage-compression-seed"),
-                "storage-compression-seed");
+        } else if (argument == "--storage-compression-seed" && isReplayCommand(options.command)) {
+            const int value = parseInt(valueAfter(index, argc, argv, "storage-compression-seed"), "storage-compression-seed");
             if (value < 0)
                 fail("--storage-compression-seed must be nonnegative");
             options.storageCompressionSeed = static_cast<std::uint64_t>(value);
-        } else if (argument == "--storage-compression-chunk-side" &&
-                   isReplayCommand(options.command)) {
-            const int value = parseInt(
-                valueAfter(index, argc, argv,
-                    "storage-compression-chunk-side"),
-                "storage-compression-chunk-side");
+        } else if (argument == "--storage-compression-chunk-side" && isReplayCommand(options.command)) {
+            const int value = parseInt(valueAfter(index, argc, argv, "storage-compression-chunk-side"), "storage-compression-chunk-side");
             if (value <= 0)
                 fail("--storage-compression-chunk-side must be positive");
             options.storageCompressionChunkSideBaseVoxels = value;
@@ -491,7 +498,8 @@ CliOptions parseArgs(int argc, char** argv)
             options.corridorRadiusBaseVoxels = parseDouble(valueAfter(index, argc, argv, "corridor-radius"), "corridor-radius");
             if (!(*options.corridorRadiusBaseVoxels > 0.0))
                 fail("--corridor-radius must be positive");
-        } else if (argument == "--stats" && (options.command == Command::Paths || isReplayCommand(options.command))) {
+        } else if (
+            argument == "--stats" && (options.command == Command::Paths || isReplayCommand(options.command) || isWholeVolumeCommand(options.command))) {
             options.printStats = true;
         } else if (argument == "--no-slices" && options.command == Command::Paths) {
             options.writePresenceSlices = false;
@@ -529,7 +537,9 @@ CliOptions parseArgs(int argc, char** argv)
             options.graphReplay.searchWidth = static_cast<size_t>(value);
         } else if (argument == "--prune-distance" && usesGraphReplayOptions(options.command)) {
             options.graphReplay.pruneDistanceBaseVoxels = parseDouble(valueAfter(index, argc, argv, "prune-distance"), "prune-distance");
-        } else if (argument == "--storage-chunk-side" && (isQuantizationCommand(options.command) || isReplayCommand(options.command))) {
+        } else if (
+            argument == "--storage-chunk-side" &&
+            (isQuantizationCommand(options.command) || isReplayCommand(options.command) || isWholeVolumeCommand(options.command))) {
             options.storageChunkSideBaseVoxels = parseInt(valueAfter(index, argc, argv, "storage-chunk-side"), "storage-chunk-side");
         } else if (argument == "--scenario" && isQuantizationCommand(options.command)) {
             options.quantizationScenario = valueAfter(index, argc, argv, "scenario");
@@ -557,9 +567,11 @@ CliOptions parseArgs(int argc, char** argv)
     }
     if (needsPathExtraction(options.command)) {
         if (options.normalManifestLocation.empty())
-            fail("paths and replay commands require --normal-manifest");
+            fail("path and whole-volume commands require --normal-manifest");
         vc::fiber_tracer::validateFiberletPathConfig(options.paths);
     }
+    if (isWholeVolumeCommand(options.command) && options.storageChunkSideBaseVoxels <= 0)
+        fail("preprocess-volume --storage-chunk-side must be positive");
     if (usesGraphReplayOptions(options.command) &&
         (!(options.graphReplay.beamStepDistanceBaseVoxels > 0.0) || !std::isfinite(options.graphReplay.beamStepDistanceBaseVoxels) ||
          !(options.graphReplay.lookaheadDistanceBaseVoxels > 0.0) || !std::isfinite(options.graphReplay.lookaheadDistanceBaseVoxels) ||
@@ -679,7 +691,9 @@ vc::fiber_tracer::FiberletDatasetMetadata replayDatasetMetadata(
     const vc::lasagna::LasagnaDataset& normalDataset,
     const std::vector<cv::Vec3d>& corridorReferenceBase,
     double corridorRadiusBaseVoxels,
-    const vc::fiber_tracer::FiberletGeometryCacheProfile& cacheProfile = {})
+    const vc::fiber_tracer::FiberletGeometryCacheProfile& cacheProfile = {},
+    vc::fiber_tracer::FiberletStorageProfile storageProfile = vc::fiber_tracer::FiberletStorageProfile::Float32Cache,
+    std::string_view selectionIdentity = "chunk_local_segment_aabb_v2")
 {
     const double cellSideBase = static_cast<double>(options.anchors.cellSizePredictionVoxels) * grid.predictionToBaseScale;
     const auto roundedCellSideBase = std::llround(cellSideBase);
@@ -718,8 +732,23 @@ vc::fiber_tracer::FiberletDatasetMetadata replayDatasetMetadata(
              << ";corridor=" << options.paths.corridorRadiusPredictionVoxels << ";invalid=" << options.paths.invalidPredictionCostPerVoxel
              << ";smooth=" << options.paths.smoothnessWeight << ',' << options.paths.smoothnessNormalWeight << ','
              << options.paths.smoothnessTangentWeight << ',' << options.paths.smoothnessFreeAngleDegrees << ";storage_schema=float_cache_v2"
-             << ";corridor_selector=chunk_local_segment_aabb_v2"
-             << ";corridor_radius_base=" << corridorRadiusBaseVoxels << ";corridor_reference=" << corridorReferenceBase.size();
+             << ";selection=" << selectionIdentity << ";corridor_radius_base=" << corridorRadiusBaseVoxels
+             << ";corridor_reference=" << corridorReferenceBase.size();
+    identity << ";anchor_gradient_reliability=" << options.anchors.peakGradientReliabilityScale
+             << ";anchor_gaussian_cutoff=" << options.anchors.gaussianCutoffSigmas
+             << ";anchor_axial_support=" << options.anchors.axialSupportHalfWidthPredictionVoxels
+             << ";anchor_position_tolerance=" << options.anchors.positionConvergenceTolerancePredictionVoxels
+             << ";anchor_nms=" << options.anchors.nmsMaximumAngleDegrees << ',' << options.anchors.nmsTransverseRadiusPredictionVoxels << ','
+             << options.anchors.nmsLongitudinalRadiusPredictionVoxels << ";anchor_presence_floor=" << options.anchors.observationPresenceFloor
+             << ";anchor_minimum_support=" << options.anchors.minimumAlignedSupport
+             << ";anchor_robust=" << options.anchors.robustMaximumTrimMassFraction << ',' << options.anchors.robustMadMultiplier << ','
+             << options.anchors.robustMinimumAngleDegrees << ";anchor_merge=" << options.anchors.mergeMaximumAngleDegrees << ','
+             << options.anchors.mergeMaximumAbsoluteObjectiveLoss << ',' << options.anchors.mergeMaximumRelativeObjectiveLoss
+             << ";anchor_seed_limit=" << options.anchors.maximumSeedCount << ";anchor_iteration_limit=" << options.anchors.maximumIterations
+             << ";anchor_convergence=" << options.anchors.convergenceTolerance;
+    if (storageProfile != vc::fiber_tracer::FiberletStorageProfile::Float32Cache) {
+        identity << ";storage_profile=" << static_cast<int>(storageProfile);
+    }
     if (cacheProfile.enabled()) {
         identity << ";evaluation_quantization_v=2"
                  << ";position_quantum_base=" << cacheProfile.geometry.positionQuantumBaseVoxels
@@ -731,13 +760,16 @@ vc::fiber_tracer::FiberletDatasetMetadata replayDatasetMetadata(
     const auto identityText = identity.str();
     vc::fiber_tracer::FiberletDatasetMetadata metadata;
     metadata.kind = kind;
-    metadata.profile = vc::fiber_tracer::FiberletStorageProfile::Float32Cache;
+    metadata.profile = storageProfile;
     metadata.chunkGridShapeZYX = chunkShape;
     metadata.coordinateOriginZYX = {0, 0, 0};
     metadata.coordinateUnitsPerChunkZYX = {unitsPerChunk, unitsPerChunk, unitsPerChunk};
     metadata.maximumEndpointReachCoordinateUnitsZYX = {maximumReach, maximumReach, maximumReach};
     metadata.datasetFingerprint = storageFingerprint(identityText);
     metadata.spatialChunkSideBaseVoxels = static_cast<std::uint32_t>(options.storageChunkSideBaseVoxels);
+    if (storageProfile == vc::fiber_tracer::FiberletStorageProfile::CompactDirectionsFixedCost) {
+        metadata.costBits = 16;
+    }
     metadata.predictionToBaseScale = grid.predictionToBaseScale;
     metadata.algorithmFingerprint = stringHash(identityText);
     metadata.fiberManifest = datasetLocator(fiberDataset);
@@ -2507,47 +2539,33 @@ void benchmarkFullRegionStorageCompression(
     onDemand.grid = grid;
     onDemand.anchorConfig = options.anchors;
     onDemand.pathConfig = options.paths;
-    onDemand.predictionSampler =
-        [&](const auto& indices, int threads, auto& samples) {
-            field.sampleStoredGridBatch(indices, threads, samples);
-        };
-    onDemand.normalSampler = normalSampler;
-    onDemand.selectedAnchorCellsZYX.assign(
-        selectedCells.begin(), selectedCells.end());
-    onDemand.anchorRetainPredicate = [](const FiberAnchor&) {
-        return FiberAnchorRetainEvaluation{true, {}, {}};
+    onDemand.predictionSampler = [&](const auto& indices, int threads, auto& samples) {
+        field.sampleStoredGridBatch(indices, threads, samples);
     };
+    onDemand.normalSampler = normalSampler;
+    onDemand.selectedAnchorCellsZYX.assign(selectedCells.begin(), selectedCells.end());
+    onDemand.anchorRetainPredicate = [](const FiberAnchor&) { return FiberAnchorRetainEvaluation{true, {}, {}}; };
     onDemand.pointPredicate = [](const cv::Vec3d&) { return true; };
     onDemand.anchorCacheOptions = anchorCacheOptions;
     onDemand.fiberletCacheOptions = anchorCacheOptions;
     onDemand.progress = [](const FiberletOnDemandProgress& progress) {
         if (progress.status == "completed") {
             std::cerr << "fiberlet_storage_region"
-                      << " stage=" << progress.stage
-                      << " key=" << progress.key.iz << '/'
-                      << progress.key.iy << '/' << progress.key.ix
-                      << " inputs=" << progress.inputCount
-                      << " outputs=" << progress.outputCount
-                      << " elapsed_seconds=" << progress.elapsedSeconds
-                      << '\n';
+                      << " stage=" << progress.stage << " key=" << progress.key.iz << '/' << progress.key.iy << '/' << progress.key.ix
+                      << " inputs=" << progress.inputCount << " outputs=" << progress.outputCount
+                      << " elapsed_seconds=" << progress.elapsedSeconds << '\n';
         }
     };
-    auto fullPreprocessor = FiberletOnDemandPreprocessor::create(
-        std::move(onDemand));
+    auto fullPreprocessor = FiberletOnDemandPreprocessor::create(std::move(onDemand));
     std::vector<FiberletScheduledChunk> targetSchedule;
     targetSchedule.reserve(reportOwners.size());
     for (const auto& owner : reportOwners) {
-        targetSchedule.push_back({
-            {0, owner[0], owner[1], owner[2]}, 0.0, 0.0});
+        targetSchedule.push_back({{0, owner[0], owner[1], owner[2]}, 0.0, 0.0});
     }
     std::cout << "fiberlet_storage_full_region"
-              << " chunk_side_base=" << targetSide
-              << " chunks=" << targetSchedule.size()
-              << " selected_cells_with_halo=" << selectedCells.size()
-              << '\n';
-    benchmarkReplayStorageCompression(fullPreprocessor, targetSchedule,
-        targetSchedule.size(), options.storageCompressionSeed, targetSide,
-        reportOwners);
+              << " chunk_side_base=" << targetSide << " chunks=" << targetSchedule.size()
+              << " selected_cells_with_halo=" << selectedCells.size() << '\n';
+    benchmarkReplayStorageCompression(fullPreprocessor, targetSchedule, targetSchedule.size(), options.storageCompressionSeed, targetSide, reportOwners);
 }
 
 struct CachedReplayContext {
@@ -2570,6 +2588,350 @@ struct CachedReplayContext {
     std::filesystem::path anchorRoot;
     std::filesystem::path fiberletRoot;
 };
+
+std::filesystem::path defaultWholeVolumeAnchorRoot(const std::filesystem::path& outputRoot)
+{
+    const auto stem = outputRoot.stem().empty() ? outputRoot.filename().string() : outputRoot.stem().string();
+    return outputRoot.parent_path() / (stem + ".anchors.zarr");
+}
+
+class AtomicTemporaryCleanup final
+{
+public:
+    explicit AtomicTemporaryCleanup(std::vector<std::filesystem::path> roots)
+        : roots_(std::move(roots))
+    {
+    }
+
+    ~AtomicTemporaryCleanup()
+    {
+        for (const auto& root : roots_) {
+            try {
+                (void)vc::core::util::cleanupAtomicWriteTemporaryFiles(root);
+            } catch (...) {
+                // Cleanup must not mask the preprocessing result or exception.
+            }
+        }
+    }
+
+private:
+    std::vector<std::filesystem::path> roots_;
+};
+
+std::string progressBytes(std::uint64_t bytes)
+{
+    constexpr double kib = 1024.0;
+    constexpr double mib = kib * 1024.0;
+    constexpr double gib = mib * 1024.0;
+    std::ostringstream text;
+    if (bytes >= static_cast<std::uint64_t>(gib))
+        text << std::fixed << std::setprecision(2) << static_cast<double>(bytes) / gib << "GiB";
+    else if (bytes >= static_cast<std::uint64_t>(mib))
+        text << std::fixed << std::setprecision(1) << static_cast<double>(bytes) / mib << "MiB";
+    else if (bytes >= static_cast<std::uint64_t>(kib))
+        text << std::fixed << std::setprecision(1) << static_cast<double>(bytes) / kib << "KiB";
+    else
+        text << bytes << 'B';
+    return text.str();
+}
+
+std::uint64_t existingFileSize(const std::filesystem::path& path)
+{
+    std::error_code error;
+    const auto size = std::filesystem::file_size(path, error);
+    if (error)
+        throw std::filesystem::filesystem_error("cannot measure fiberlet payload", path, error);
+    return static_cast<std::uint64_t>(size);
+}
+
+class WholeVolumeStageProgress final
+{
+public:
+    WholeVolumeStageProgress(std::string stage, std::size_t total)
+        : stage_(std::move(stage)), total_(total), ticker_([this] { tickerLoop(); })
+    {
+    }
+
+    ~WholeVolumeStageProgress() { finish(); }
+
+    WholeVolumeStageProgress(const WholeVolumeStageProgress&) = delete;
+    WholeVolumeStageProgress& operator=(const WholeVolumeStageProgress&) = delete;
+
+    void update(std::size_t completed, std::uint64_t payloadBytes)
+    {
+        payloadBytes_.store(payloadBytes, std::memory_order_relaxed);
+        completed_.store(completed, std::memory_order_release);
+    }
+
+    void finish()
+    {
+        bool expected = false;
+        if (!finished_.compare_exchange_strong(expected, true))
+            return;
+        {
+            std::lock_guard lock(waitMutex_);
+            stop_ = true;
+        }
+        waitCv_.notify_all();
+        if (ticker_.joinable())
+            ticker_.join();
+        render(true);
+    }
+
+private:
+    void tickerLoop()
+    {
+        render(false);
+        std::unique_lock lock(waitMutex_);
+        while (!waitCv_.wait_for(lock, std::chrono::seconds(1), [this] { return stop_; })) {
+            lock.unlock();
+            render(false);
+            lock.lock();
+        }
+    }
+
+    void render(bool final)
+    {
+        const auto now = std::chrono::steady_clock::now();
+        const auto completed = completed_.load(std::memory_order_acquire);
+        const auto payloadBytes = payloadBytes_.load(std::memory_order_relaxed);
+        const double elapsed = std::chrono::duration<double>(now - started_).count();
+        const double fraction = total_ == 0 ? 1.0 : std::clamp(static_cast<double>(completed) / static_cast<double>(total_), 0.0, 1.0);
+        const double rate = elapsed > 0.0 ? static_cast<double>(completed) / elapsed : 0.0;
+        const double eta = completed > 0 && completed < total_ ? static_cast<double>(total_ - completed) / rate
+                           : completed >= total_                 ? 0.0
+                                                                 : std::numeric_limits<double>::infinity();
+        const auto projectedBytes = completed > 0
+            ? static_cast<std::uint64_t>(std::llround(static_cast<double>(payloadBytes) * static_cast<double>(total_) / static_cast<double>(completed)))
+            : std::uint64_t{0};
+        std::ostringstream line;
+        line << "fiberlet_preprocess_progress stage=" << stage_
+             << " chunks=" << completed << '/' << total_
+             << " percent=" << std::fixed << std::setprecision(1) << 100.0 * fraction
+             << " elapsed=" << progressDuration(elapsed)
+             << " rate=" << std::setprecision(2) << rate << "chunks/s"
+             << " eta=" << progressDuration(eta)
+             << " size=" << progressBytes(payloadBytes) << '/';
+        if (completed > 0 || total_ == 0)
+            line << progressBytes(projectedBytes);
+        else
+            line << "n/a";
+        const auto rendered = line.str();
+        std::cerr << '\r' << rendered;
+        if (renderedWidth_ > rendered.size())
+            std::cerr << std::string(renderedWidth_ - rendered.size(), ' ');
+        const bool persistent = final || now - lastPersistent_ >= std::chrono::minutes(1);
+        if (persistent) {
+            std::cerr << '\n';
+            renderedWidth_ = 0;
+            lastPersistent_ = now;
+        } else {
+            std::cerr << std::flush;
+            renderedWidth_ = rendered.size();
+        }
+    }
+
+    const std::string stage_;
+    const std::size_t total_;
+    const std::chrono::steady_clock::time_point started_ = std::chrono::steady_clock::now();
+    std::atomic_size_t completed_{0};
+    std::atomic<std::uint64_t> payloadBytes_{0};
+    std::atomic_bool finished_{false};
+    std::mutex waitMutex_;
+    std::condition_variable waitCv_;
+    bool stop_ = false;
+    std::chrono::steady_clock::time_point lastPersistent_ = started_;
+    std::size_t renderedWidth_ = 0;
+    std::thread ticker_;
+};
+
+std::uint64_t finalTupleSize(
+    const vc::fiber_tracer::FiberletChunkDataset& dataset,
+    const vc::render::ChunkKey& owner)
+{
+    auto route = owner;
+    route.level = 1;
+    return existingFileSize(dataset.chunkPath(vc::fiber_tracer::FiberletStorageChunkKind::Anchors, owner)) +
+        existingFileSize(dataset.chunkPath(vc::fiber_tracer::FiberletStorageChunkKind::FiberletPrefix, owner)) +
+        existingFileSize(dataset.chunkPath(vc::fiber_tracer::FiberletStorageChunkKind::FiberletRoutes, route));
+}
+
+int runWholeVolumePreprocessing(
+    CliOptions& options,
+    const vc::lasagna::LasagnaDataset& fiberDataset,
+    const vc::fiber_tracer::FiberPredictionField& field,
+    const vc::fiber_tracer::FiberPredictionGridInfo& grid)
+{
+    using namespace vc::fiber_tracer;
+    const auto started = std::chrono::steady_clock::now();
+    resolveAnchorConfig(options, grid);
+    if (options.corridorRadiusBaseVoxels.has_value()) {
+        options.paths.corridorRadiusPredictionVoxels = *options.corridorRadiusBaseVoxels / grid.predictionToBaseScale;
+        validateFiberletPathConfig(options.paths);
+    }
+
+    vc::lasagna::LasagnaDatasetOpenOptions normalOptions;
+    normalOptions.workingToBaseScale = grid.predictionToBaseScale;
+    normalOptions.remoteCacheRoot = options.remoteCacheDirectory;
+    const auto normalDataset = vc::lasagna::LasagnaDataset::openLocation(options.normalManifestLocation, normalOptions);
+    auto normalSampler =
+        std::make_shared<vc::lasagna::LasagnaNormalSampler>(normalDataset, vc::lasagna::LasagnaNormalSamplerOptions{options.decodedCacheBytes});
+
+    auto anchorMetadata = replayDatasetMetadata(
+        FiberletDatasetKind::Anchors,
+        grid,
+        options,
+        fiberDataset,
+        normalDataset,
+        {},
+        0.0,
+        {},
+        FiberletStorageProfile::Float32Cache,
+        "whole_volume_presence_chunks_v1");
+    auto finalMetadata = replayDatasetMetadata(
+        FiberletDatasetKind::Combined,
+        grid,
+        options,
+        fiberDataset,
+        normalDataset,
+        {},
+        0.0,
+        FiberletGeometryCacheProfile{
+            .geometry = {.positionQuantumBaseVoxels = 0.0, .compactDirections = true},
+            .compatibilityCostTagBits = 16,
+            .storageChunkSideBaseVoxels = options.storageChunkSideBaseVoxels},
+        FiberletStorageProfile::CompactDirectionsFixedCost,
+        "whole_volume_presence_chunks_v1");
+
+    const auto anchorRoot = options.anchorCacheRoot.empty() ? defaultWholeVolumeAnchorRoot(options.outputDirectory) : options.anchorCacheRoot;
+    std::filesystem::create_directories(options.outputDirectory);
+    std::filesystem::create_directories(anchorRoot);
+    const auto outputCanonical = std::filesystem::canonical(options.outputDirectory);
+    const auto anchorCanonical = std::filesystem::canonical(anchorRoot);
+    if (outputCanonical == anchorCanonical)
+        throw std::invalid_argument("whole-volume anchor cache and final output must use different roots");
+    const bool outputFirst = outputCanonical.string() < anchorCanonical.string();
+    auto firstLock = std::make_unique<vc::core::util::ExclusiveDirectoryLock>(outputFirst ? outputCanonical : anchorCanonical);
+    auto secondLock = std::make_unique<vc::core::util::ExclusiveDirectoryLock>(outputFirst ? anchorCanonical : outputCanonical);
+    (void)vc::core::util::cleanupAtomicWriteTemporaryFiles(anchorRoot);
+    (void)vc::core::util::cleanupAtomicWriteTemporaryFiles(options.outputDirectory);
+    AtomicTemporaryCleanup temporaryCleanup{{anchorRoot, options.outputDirectory}};
+
+    auto finalDataset = FiberletChunkDataset::createOrOpen(options.outputDirectory, finalMetadata);
+    std::cerr << "fiberlet_preprocess_presence status=started\n";
+    const auto scan = field.scanStoredPresenceChunks(options.anchors.parallelThreads);
+    auto activeChunks = fiberletOutputChunksForNonemptyPresence(scan, finalMetadata, options.anchors.cellSizePredictionVoxels);
+    finalDataset->configureExpectedChunks(activeChunks);
+    const auto totalInput = scan.missingChunks + scan.emptyChunks + scan.nonemptyChunksZYX.size();
+    std::cout << "fiberlet_preprocess_presence status=completed"
+              << " input_chunks=" << totalInput << " missing_chunks=" << scan.missingChunks << " empty_chunks=" << scan.emptyChunks
+              << " nonempty_chunks=" << scan.nonemptyChunksZYX.size() << " active_output_chunks=" << activeChunks.size() << '\n';
+
+    auto budget = std::make_shared<vc::render::DecodedChunkCacheBudget>(options.decodedCacheBytes);
+    vc::render::ChunkCache::Options cacheOptions;
+    cacheOptions.decodedByteCapacity = options.decodedCacheBytes;
+    cacheOptions.decodedByteBudget = budget;
+    // Each extraction already consumes the configured worker team.
+    cacheOptions.maxConcurrentReads = 1;
+
+    FiberletOnDemandConfig onDemand;
+    onDemand.anchorRoot = anchorRoot;
+    onDemand.fiberletRoot = options.outputDirectory;
+    onDemand.anchorMetadata = anchorMetadata;
+    onDemand.fiberletMetadata = finalMetadata;
+    onDemand.grid = grid;
+    onDemand.anchorConfig = options.anchors;
+    onDemand.pathConfig = options.paths;
+    onDemand.geometryQuantization = {.positionQuantumBaseVoxels = 0.0, .compactDirections = true};
+    onDemand.predictionSampler = [&field](const auto& indices, int threads, auto& samples) {
+        field.sampleStoredGridBatch(indices, threads, samples);
+    };
+    onDemand.normalSampler = normalSampler;
+    onDemand.anchorCellPredicate = [](const std::array<size_t, 3>&) { return true; };
+    onDemand.anchorRetainPredicate = [](const FiberAnchor&) { return FiberAnchorRetainEvaluation{true, {}, {}}; };
+    onDemand.pointPredicate = [](const cv::Vec3d&) { return true; };
+    onDemand.anchorCacheOptions = cacheOptions;
+    onDemand.fiberletCacheOptions = cacheOptions;
+    if (options.printStats) {
+        onDemand.progress = [](const FiberletOnDemandProgress& progress) {
+            if (progress.status == "completed") {
+                std::cerr << "fiberlet_preprocess_chunk"
+                          << " stage=" << progress.stage << " key=" << progress.key.iz << '/' << progress.key.iy << '/' << progress.key.ix
+                          << " inputs=" << progress.inputCount << " outputs=" << progress.outputCount
+                          << " elapsed_seconds=" << progress.elapsedSeconds << '\n';
+            }
+        };
+    }
+    auto preprocessor = FiberletOnDemandPreprocessor::create(std::move(onDemand));
+
+    std::set<std::array<int, 3>> dependencyCoordinates;
+    for (const auto& key : activeChunks) {
+        for (const auto& dependency : preprocessor->anchorDependencies(key))
+            dependencyCoordinates.insert({dependency.iz, dependency.iy, dependency.ix});
+    }
+    std::vector<vc::render::ChunkKey> anchorChunks;
+    anchorChunks.reserve(dependencyCoordinates.size());
+    for (const auto& coordinate : dependencyCoordinates)
+        anchorChunks.push_back({0, coordinate[0], coordinate[1], coordinate[2]});
+
+    size_t completedAnchors = 0;
+    std::uint64_t anchorPayloadBytes = 0;
+    WholeVolumeStageProgress anchorProgress("anchors", anchorChunks.size());
+    for (const auto& key : anchorChunks) {
+        const auto chunk = preprocessor->anchorCache()->getChunkBlocking(key.level, key.iz, key.iy, key.ix);
+        if (chunk.status != vc::render::ChunkStatus::Data || !chunk.payload) {
+            throw std::runtime_error(
+                "whole-volume anchor chunk generation failed at " + std::to_string(key.iz) + '/' + std::to_string(key.iy) + '/' +
+                std::to_string(key.ix) + (chunk.error.empty() ? std::string{} : ": " + chunk.error));
+        }
+        anchorPayloadBytes += existingFileSize(
+            preprocessor->anchorDataset()->chunkPath(FiberletStorageChunkKind::Anchors, key));
+        ++completedAnchors;
+        anchorProgress.update(completedAnchors, anchorPayloadBytes);
+    }
+    anchorProgress.finish();
+
+    size_t completedFiberlets = 0;
+    size_t resumedFiberlets = 0;
+    std::uint64_t fiberletPayloadBytes = 0;
+    WholeVolumeStageProgress fiberletProgress("fiberlets", activeChunks.size());
+    for (const auto& key : activeChunks) {
+        if (finalDataset->readMaterializedChunk(FiberletStorageChunkKind::FiberletPrefix, key)) {
+            ++resumedFiberlets;
+            ++completedFiberlets;
+            fiberletPayloadBytes += finalTupleSize(*finalDataset, key);
+            fiberletProgress.update(completedFiberlets, fiberletPayloadBytes);
+            continue;
+        }
+        const auto anchorChunk = preprocessor->anchorCache()->getChunkBlocking(key.level, key.iz, key.iy, key.ix);
+        const auto anchors = std::dynamic_pointer_cast<const FiberletAnchorChunkPayload>(anchorChunk.payload);
+        if (anchorChunk.status != vc::render::ChunkStatus::Data || !anchors)
+            throw std::runtime_error("whole-volume final anchor source is unavailable");
+        const auto compactCodec = finalDataset->codecConfig(FiberletStorageChunkKind::Anchors, key);
+        finalDataset->publishChunk(FiberletStorageChunkKind::Anchors, key, serializeFiberletAnchors(compactCodec, anchors->anchors));
+
+        const auto fiberletChunk = preprocessor->fiberletCache()->getChunkBlocking(key.level, key.iz, key.iy, key.ix);
+        if (fiberletChunk.status != vc::render::ChunkStatus::Data || !fiberletChunk.payload) {
+            throw std::runtime_error(
+                "whole-volume fiberlet chunk generation failed at " + std::to_string(key.iz) + '/' + std::to_string(key.iy) + '/' +
+                std::to_string(key.ix) + (fiberletChunk.error.empty() ? std::string{} : ": " + fiberletChunk.error));
+        }
+        if (!finalDataset->readMaterializedChunk(FiberletStorageChunkKind::FiberletPrefix, key))
+            throw std::runtime_error("whole-volume final tuple is incomplete after publication");
+        ++completedFiberlets;
+        fiberletPayloadBytes += finalTupleSize(*finalDataset, key);
+        fiberletProgress.update(completedFiberlets, fiberletPayloadBytes);
+    }
+    fiberletProgress.finish();
+    preprocessor->shutdown();
+    (void)vc::core::util::cleanupAtomicWriteTemporaryFiles(anchorRoot);
+    (void)vc::core::util::cleanupAtomicWriteTemporaryFiles(options.outputDirectory);
+    std::cout << "fiberlet_preprocess_volume status=completed"
+              << " active_chunks=" << activeChunks.size() << " anchor_chunks=" << anchorChunks.size() << " resumed_chunks=" << resumedFiberlets
+              << " elapsed_seconds=" << std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count()
+              << " anchor_cache=" << anchorRoot << " output=" << options.outputDirectory << '\n';
+    return 0;
+}
 
 CachedReplayContext createCachedReplayContext(
     const vc::lasagna::LasagnaDataset& fiberDataset,
@@ -2706,6 +3068,9 @@ int main(int argc, char** argv)
         const auto dataset = vc::lasagna::LasagnaDataset::openLocation(options.manifestLocation, openOptions);
         const vc::fiber_tracer::FiberPredictionField field(dataset, options.decodedCacheBytes, vc::fiber_tracer::FiberPredictionFieldBindingMode::CanonicalStoredGrid);
         const auto grid = field.storedGridInfo();
+
+        if (isWholeVolumeCommand(options.command))
+            return runWholeVolumePreprocessing(options, dataset, field, grid);
 
         if (options.command == Command::AnchorBenchmark) {
             const double cellSideBase = resolveAnchorConfig(options, grid);

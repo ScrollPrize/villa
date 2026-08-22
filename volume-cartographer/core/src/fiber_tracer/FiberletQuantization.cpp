@@ -1175,7 +1175,9 @@ std::vector<FiberletQuantizationScenario> standardFiberletQuantizationScenarios(
                     256.0F,
                 });
             } else {
-                result.push_back({"combined_q" + std::to_string(quantum) + "_axis_cost_u" + std::to_string(bits), quantum, true, bits});
+                result.push_back({
+                    "combined_q" + std::to_string(quantum) + "_axis_cost_u" + std::to_string(bits),
+                    static_cast<double>(quantum), true, bits});
             }
         }
     }

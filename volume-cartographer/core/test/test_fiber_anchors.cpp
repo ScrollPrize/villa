@@ -2568,6 +2568,47 @@ TEST_CASE("fiber stored-grid metadata rejects missing explicit source scale")
     std::filesystem::remove_all(directory);
 }
 
+TEST_CASE("fiber presence chunk scan distinguishes missing empty and nonempty chunks")
+{
+    const auto directory = temporaryDirectory("presence_chunk_scan");
+    utils::ZarrMetadata metadata;
+    metadata.version = utils::ZarrVersion::v2;
+    metadata.shape = {2, 2, 6};
+    metadata.chunks = {2, 2, 2};
+    metadata.dtype = utils::ZarrDtype::uint8;
+    metadata.compressor_id.clear();
+    metadata.fill_value = 0.0;
+    auto presence = utils::ZarrArray::create(directory / "presence.zarr", metadata);
+    const std::vector<std::byte> empty(8, std::byte{0});
+    const std::vector<std::byte> nonempty(8, std::byte{17});
+    const std::array<size_t, 3> emptyKey{0, 0, 0};
+    const std::array<size_t, 3> nonemptyKey{0, 0, 2};
+    presence.write_chunk(emptyKey, empty);
+    presence.write_chunk(nonemptyKey, nonempty);
+    createConstantZarr(directory / "nx.zarr", {2, 2, 6}, {2, 2, 2}, 255);
+    createConstantZarr(directory / "ny.zarr", {2, 2, 6}, {2, 2, 2}, 128);
+    const auto manifestPath = directory / "fiber.lasagna.json";
+    writeText(manifestPath, R"({
+      "version": 2,
+      "source_to_base": 1.0,
+      "groups": {
+        "presence": {"zarr":"presence.zarr","scaledown":0,"channels":["presence"]},
+        "nx": {"zarr":"nx.zarr","scaledown":0,"channels":["nx"]},
+        "ny": {"zarr":"ny.zarr","scaledown":0,"channels":["ny"]}
+      }
+    })");
+    const auto dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
+    const vc::fiber_tracer::FiberPredictionField field(dataset, 1024 * 1024, vc::fiber_tracer::FiberPredictionFieldBindingMode::CanonicalStoredGrid);
+    const auto report = field.scanStoredPresenceChunks(3);
+    CHECK(report.shapeZYX == std::array<size_t, 3>{2, 2, 6});
+    CHECK(report.chunksZYX == std::array<size_t, 3>{2, 2, 2});
+    CHECK(report.chunkGridShapeZYX == std::array<size_t, 3>{1, 1, 3});
+    CHECK(report.missingChunks == 1);
+    CHECK(report.emptyChunks == 1);
+    CHECK(report.nonemptyChunksZYX == std::vector<std::array<size_t, 3>>{{0, 0, 2}});
+    std::filesystem::remove_all(directory);
+}
+
 TEST_CASE("fiber stored-grid metadata rejects mismatched canonical shapes")
 {
     const auto directory = temporaryDirectory("shape_mismatch");

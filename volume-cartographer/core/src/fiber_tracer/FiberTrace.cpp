@@ -6,6 +6,7 @@
 #include "vc/lasagna/ChannelSampler.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "vc/core/render/DecodedChunkCacheBudget.hpp"
+#include <utils/zarr.hpp>
 
 #include <algorithm>
 #include <array>
@@ -3457,6 +3458,68 @@ public:
         return canonicalGridInfo_;
     }
 
+    [[nodiscard]] FiberPresenceChunkScanReport scanStoredPresenceChunks(int parallelThreads) const
+    {
+        (void)storedGridInfo();
+        const auto& binding = options_[*canonicalOptionIndex_].presence;
+        FiberPresenceChunkScanReport report;
+        report.shapeZYX = binding.shapeZYX;
+        report.chunksZYX = binding.chunksZYX;
+        size_t total = 1;
+        for (size_t axis = 0; axis < 3; ++axis) {
+            report.chunkGridShapeZYX[axis] = (binding.shapeZYX[axis] + binding.chunksZYX[axis] - 1) / binding.chunksZYX[axis];
+            if (report.chunkGridShapeZYX[axis] > std::numeric_limits<size_t>::max() / total) {
+                throw std::overflow_error("fiber presence chunk grid size overflows size_t");
+            }
+            total *= report.chunkGridShapeZYX[axis];
+        }
+
+        struct Partial {
+            size_t missing = 0;
+            size_t empty = 0;
+            std::vector<std::array<size_t, 3>> nonempty;
+        };
+        const size_t workerCount = std::min<size_t>(total, static_cast<size_t>(std::max(1, parallelThreads)));
+        std::vector<std::future<Partial>> futures;
+        futures.reserve(workerCount);
+        for (size_t worker = 0; worker < workerCount; ++worker) {
+            const size_t begin = total * worker / workerCount;
+            const size_t end = total * (worker + 1) / workerCount;
+            futures.push_back(std::async(std::launch::async, [&, begin, end]() {
+                Partial partial;
+                partial.nonempty.reserve((end - begin) / 4);
+                const size_t yx = report.chunkGridShapeZYX[1] * report.chunkGridShapeZYX[2];
+                for (size_t linear = begin; linear < end; ++linear) {
+                    const size_t z = linear / yx;
+                    const size_t remainder = linear % yx;
+                    const size_t y = remainder / report.chunkGridShapeZYX[2];
+                    const size_t x = remainder % report.chunkGridShapeZYX[2];
+                    const std::array<size_t, 3> key{z, y, x};
+                    const auto bytes = binding.array->read_chunk(key);
+                    if (!bytes.has_value()) {
+                        ++partial.missing;
+                        continue;
+                    }
+                    const bool nonempty = std::any_of(bytes->begin(), bytes->end(), [](std::byte value) { return value != std::byte{0}; });
+                    if (nonempty)
+                        partial.nonempty.push_back(key);
+                    else
+                        ++partial.empty;
+                }
+                return partial;
+            }));
+        }
+        for (auto& future : futures) {
+            auto partial = future.get();
+            report.missingChunks += partial.missing;
+            report.emptyChunks += partial.empty;
+            report.nonemptyChunksZYX.insert(
+                report.nonemptyChunksZYX.end(), std::make_move_iterator(partial.nonempty.begin()), std::make_move_iterator(partial.nonempty.end()));
+        }
+        std::sort(report.nonemptyChunksZYX.begin(), report.nonemptyChunksZYX.end());
+        return report;
+    }
+
     [[nodiscard]] static cv::Vec3d storedGridPoint(const Option& option, const std::array<size_t, 3>& zyx)
     {
         if (zyx[0] >= option.presence.shapeZYX[0] || zyx[1] >= option.presence.shapeZYX[1] || zyx[2] >= option.presence.shapeZYX[2]) {
@@ -3646,6 +3709,11 @@ FiberPredictionSample FiberPredictionField::sample(const cv::Vec3d& volumePoint,
 FiberPredictionGridInfo FiberPredictionField::storedGridInfo() const
 {
     return impl_->storedGridInfo();
+}
+
+FiberPresenceChunkScanReport FiberPredictionField::scanStoredPresenceChunks(int parallelThreads) const
+{
+    return impl_->scanStoredPresenceChunks(parallelThreads);
 }
 
 void FiberPredictionField::sampleStoredGridBatch(

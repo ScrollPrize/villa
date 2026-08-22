@@ -3098,9 +3098,11 @@
   Fields are deterministic little-endian structure-of-arrays blocks compressed
   independently with Zstd when smaller. Local publication uses a same-directory
   temporary file, file `fsync`, atomic rename, and parent-directory `fsync`.
-  Prefix and route members are immutable and become readable only after an
-  atomically published completion marker binds both payload hashes. Empty
-  completed chunks are explicit valid payloads.
+  Prefix and route members are immutable and become readable only when both
+  payload files are present, decode against the expected dataset/chunk codec,
+  and have matching record counts. There are no per-chunk completion markers.
+  A partial pair is incomplete and resumable; empty complete pairs are explicit
+  valid payloads.
 - Greedy replay uses the regular native one-way candidate generation,
   prediction loss, Lasagna-normal curvature, and validity rules. Graph replay
   uses a deterministic persistent beam over the complete immutable graph with
@@ -3910,3 +3912,55 @@
   observations. Each observation owns the selected edge's stored component
   costs and the incoming join from the immediately preceding committed edge in
   the same segment; the first edge after every reset owns no transition.
+
+## Whole-volume fiberlet preprocessing
+
+- `vc_fiberlets preprocess-volume FIBER_MANIFEST OUTPUT_ZARR
+  --normal-manifest NORMAL_MANIFEST` materializes an entire prediction volume
+  without a reference-fiber corridor.
+- The command has two durable outputs: a float intermediate anchor cache and a
+  combined final Zarr containing anchors, edge prefixes, and routes. The anchor
+  cache defaults beside the final output and is not deleted after completion.
+- Sparse eligibility is based only on canonical stored presence chunks. Missing
+  and decoded-all-zero chunks are inactive; every final output chunk that
+  overlaps a decoded-nonzero presence chunk is active. Direction channels never
+  participate in sparse eligibility.
+- The sorted expected output-chunk set is reconstructed from a fresh canonical
+  presence scan on every invocation and kept only in memory. No active index,
+  per-chunk marker, or whole-dataset completion marker is persisted.
+- A combined chunk is found only when its anchor, prefix, and route files all
+  exist, decode against their expected codecs/fingerprint, and have a matching
+  prefix/route record count. Completeness is the direct check that every
+  source-derived expected chunk has such a valid triple. Missing members make
+  a tuple incomplete and resumable; corrupt or conflicting members fail.
+- Source-derived inactive chunks resolve as canonical empty anchor/prefix/route
+  payloads after the current expected set is configured. Every standalone
+  combined graph reader must rescan the source presence and configure this set
+  before constructing stored graph facets. Unexpected old final payloads are
+  inaccessible unless the current scan expects them.
+- Intermediate anchors include the exact dependency halo required by each
+  active fiberlet owner. Halo-only chunks remain in the intermediate cache and
+  are absent from the final active set.
+- Every required intermediate anchor is checked directly: a present payload
+  must decode against its expected codec/fingerprint, a missing payload is
+  generated, and a conflicting payload fails. Extra cached halo chunks remain
+  reusable.
+- Final payloads use float positions, compact directions, and fixed sqrt-density
+  `uint16` costs with ceiling 256. The intermediate cache remains float.
+- Presence scan, anchor generation, and final generation are scheduled in
+  stable Z/Y/X priority order. Resume rescans source presence, then scans the
+  expected anchor dependencies and final tuples to reuse valid payloads.
+- Anchor and final generation expose one live progress line refreshed about
+  once per second, with a persistent newline every minute and at completion.
+  It reports completed/total chunks, percentage, elapsed time, chunk rate, ETA,
+  and current/projected compressed payload bytes. The projection is the visited
+  expected-chunk mean and excludes Zarr metadata.
+- Every payload file uses same-directory temporary publication, file `fsync`,
+  atomic rename, and parent-directory `fsync`. The final three-file tuple is a
+  logical completeness unit, not one filesystem transaction. Preprocessing
+  exclusively locks both roots, removes exact abandoned atomic-write temporary
+  files before resume and after workers stop, and removes legacy activity and
+  completion bookkeeping.
+- `--presence-floor` is an inclusive owned-observation gate. Cells with no
+  usable owned observation at or above it return before seed generation and
+  refinement. `--minimum-support` remains a post-fit threshold.

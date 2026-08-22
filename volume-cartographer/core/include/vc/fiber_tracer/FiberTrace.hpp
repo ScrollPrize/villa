@@ -233,6 +233,15 @@ struct FiberStoredPresenceSample {
     bool valid = false;
 };
 
+struct FiberPresenceChunkScanReport {
+    std::array<size_t, 3> shapeZYX{0, 0, 0};
+    std::array<size_t, 3> chunksZYX{0, 0, 0};
+    std::array<size_t, 3> chunkGridShapeZYX{0, 0, 0};
+    size_t missingChunks = 0;
+    size_t emptyChunks = 0;
+    std::vector<std::array<size_t, 3>> nonemptyChunksZYX;
+};
+
 enum class FiberPredictionFieldBindingMode {
     TraceOptions,
     CanonicalStoredGrid,
@@ -332,6 +341,7 @@ public:
         FiberTraceProfile* profile) const;
     [[nodiscard]] FiberPredictionSample sample(const cv::Vec3d& volumePoint, const cv::Vec3d& referenceDirection) const override;
     [[nodiscard]] FiberPredictionGridInfo storedGridInfo() const;
+    [[nodiscard]] FiberPresenceChunkScanReport scanStoredPresenceChunks(int parallelThreads) const;
     void sampleStoredGridBatch(const std::vector<std::array<size_t, 3>>& indicesZYX, int parallelThreads, std::vector<FiberStoredPredictionSample>& samples) const;
     void sampleStoredPresenceBatch(const std::vector<std::array<size_t, 3>>& indicesZYX, int parallelThreads, std::vector<FiberStoredPresenceSample>& samples) const;
     [[nodiscard]] size_t optionCount() const noexcept;

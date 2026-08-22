@@ -139,6 +139,56 @@ LoadedFiberAnchorArtifact loadedAnchors(const FiberPredictionGridInfo& grid, con
 
 }  // namespace
 
+std::vector<vc::render::ChunkKey> fiberletOutputChunksForNonemptyPresence(
+    const FiberPresenceChunkScanReport& presence, const FiberletDatasetMetadata& outputMetadata, int anchorCellSizePredictionVoxels)
+{
+    if (anchorCellSizePredictionVoxels <= 0)
+        throw std::invalid_argument("fiberlet sparse selection requires a positive anchor cell size");
+    for (size_t axis = 0; axis < 3; ++axis) {
+        if (presence.shapeZYX[axis] == 0 || presence.chunksZYX[axis] == 0 || outputMetadata.coordinateUnitsPerChunkZYX[axis] <= 0 ||
+            outputMetadata.chunkGridShapeZYX[axis] <= 0) {
+            throw std::invalid_argument("fiberlet sparse selection has invalid grid metadata");
+        }
+    }
+
+    std::set<std::array<int, 3>> owners;
+    const auto cellSide = static_cast<size_t>(anchorCellSizePredictionVoxels);
+    for (const auto& source : presence.nonemptyChunksZYX) {
+        std::array<size_t, 3> firstOwner{};
+        std::array<size_t, 3> lastOwner{};
+        for (size_t axis = 0; axis < 3; ++axis) {
+            if (source[axis] >= presence.chunkGridShapeZYX[axis])
+                throw std::invalid_argument("fiber presence scan contains an out-of-grid chunk");
+            const size_t begin = source[axis] * presence.chunksZYX[axis];
+            const size_t end = std::min(presence.shapeZYX[axis], begin + presence.chunksZYX[axis]);
+            if (begin >= end)
+                throw std::invalid_argument("fiber presence scan contains an empty chunk extent");
+            const size_t firstCell = begin / cellSide;
+            const size_t endCell = (end + cellSide - 1) / cellSide;
+            const auto units = static_cast<size_t>(outputMetadata.coordinateUnitsPerChunkZYX[axis]);
+            firstOwner[axis] = firstCell / units;
+            lastOwner[axis] = (endCell - 1) / units;
+            const auto grid = static_cast<size_t>(outputMetadata.chunkGridShapeZYX[axis]);
+            if (firstOwner[axis] >= grid)
+                throw std::invalid_argument("fiber presence chunk lies outside the output grid");
+            lastOwner[axis] = std::min(lastOwner[axis], grid - 1);
+        }
+        for (size_t z = firstOwner[0]; z <= lastOwner[0]; ++z) {
+            for (size_t y = firstOwner[1]; y <= lastOwner[1]; ++y) {
+                for (size_t x = firstOwner[2]; x <= lastOwner[2]; ++x) {
+                    owners.insert({static_cast<int>(z), static_cast<int>(y), static_cast<int>(x)});
+                }
+            }
+        }
+    }
+
+    std::vector<vc::render::ChunkKey> result;
+    result.reserve(owners.size());
+    for (const auto& owner : owners)
+        result.push_back({0, owner[0], owner[1], owner[2]});
+    return result;
+}
+
 struct FiberletOnDemandPreprocessor::State {
     explicit State(FiberletOnDemandConfig input) : config(std::move(input)) {}
 
@@ -180,10 +230,11 @@ void FiberletOnDemandPreprocessor::initialize()
     if (!config.predictionSampler || !config.normalSampler || !config.anchorRetainPredicate || !config.pointPredicate) {
         throw std::invalid_argument("on-demand fiberlet preprocessing requires samplers and corridor predicates");
     }
-    if (config.anchorMetadata.kind != FiberletDatasetKind::Anchors || config.fiberletMetadata.kind != FiberletDatasetKind::Fiberlets)
+    if (config.anchorMetadata.kind != FiberletDatasetKind::Anchors ||
+        (config.fiberletMetadata.kind != FiberletDatasetKind::Fiberlets && config.fiberletMetadata.kind != FiberletDatasetKind::Combined))
         throw std::invalid_argument("on-demand fiberlet preprocessing dataset kinds are invalid");
-    if (config.anchorMetadata.profile != FiberletStorageProfile::Float32Cache || config.fiberletMetadata.profile != FiberletStorageProfile::Float32Cache)
-        throw std::invalid_argument("on-demand extraction currently requires float32 cache profiles");
+    if (config.anchorMetadata.profile != FiberletStorageProfile::Float32Cache)
+        throw std::invalid_argument("on-demand anchor extraction requires a float32 intermediate cache");
     if (config.anchorMetadata.chunkGridShapeZYX != config.fiberletMetadata.chunkGridShapeZYX ||
         config.anchorMetadata.coordinateOriginZYX != config.fiberletMetadata.coordinateOriginZYX ||
         config.anchorMetadata.coordinateUnitsPerChunkZYX != config.fiberletMetadata.coordinateUnitsPerChunkZYX)

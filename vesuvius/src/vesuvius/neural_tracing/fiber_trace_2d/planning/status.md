@@ -1,13 +1,22 @@
-# Status: compact float-position fiberlet default
+# Status: whole-volume fiberlet preprocessing
 
-- [x] Capture the requested task and implementation plan.
-- [x] Review the plan independently against task and specifications.
-- [x] Add explicit default and exact-oracle profile constructors.
-- [x] Wire the accepted profile into normal cache-backed replay.
-- [x] Make the accepted scenario the benchmark default.
-- [x] Implement fractional q1/8 evaluation and regression coverage.
-- [x] Run the full radius-768 q1/8 comparison.
-- [x] Run the full radius-768 accepted-profile comparison.
-- [x] Build and run focused tests with `-j32`.
-- [x] Finish specification, documentation, changelog, and task-log updates.
-- [x] Commit the intended changes.
+- [x] Capture the user requirements in `task.md`.
+- [x] Write the implementation and validation plan.
+- [x] Independently review the plan against the task and specifications.
+- [x] Implement presence-only sparse eligibility.
+- [x] Implement combined dataset completion and resume semantics.
+- [x] Implement whole-volume orchestration and CLI.
+- [x] Add focused regression tests.
+- [x] Update specification, docs, changelog, and task log.
+- [x] Build and run focused tests.
+- [ ] Run a bounded representative smoke test.
+- [x] Capture marker/index removal and temporary cleanup requirements.
+- [x] Update the implementation plan for scan-only completion.
+- [x] Independently review the revised plan.
+- [x] Remove persisted activity and completion metadata.
+- [x] Implement payload-only completeness scans and partial-tuple recovery.
+- [x] Implement stale atomic temporary cleanup.
+- [x] Update focused tests and documentation.
+- [x] Rebuild and run focused validation.
+- [x] Add one-second progress, ETA, and size reporting.
+- [x] Rebuild and re-run focused validation after progress reporting.

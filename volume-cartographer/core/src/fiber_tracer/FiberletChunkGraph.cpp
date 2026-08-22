@@ -137,7 +137,8 @@ FiberletChunkGraphSource::FiberletChunkGraphSource(
 {
     if (!anchorDataset_ || !anchorCache_ || !fiberletDataset_ || !fiberletCache_)
         throw std::invalid_argument("fiberlet chunk graph requires both datasets and caches");
-    if (anchorDataset_->metadata().kind != FiberletDatasetKind::Anchors || fiberletDataset_->metadata().kind != FiberletDatasetKind::Fiberlets)
+    if ((anchorDataset_->metadata().kind != FiberletDatasetKind::Anchors && anchorDataset_->metadata().kind != FiberletDatasetKind::Combined) ||
+        (fiberletDataset_->metadata().kind != FiberletDatasetKind::Fiberlets && fiberletDataset_->metadata().kind != FiberletDatasetKind::Combined))
         throw std::invalid_argument("fiberlet chunk graph dataset kinds are invalid");
     if (anchorDataset_->metadata().profile != fiberletDataset_->metadata().profile ||
         anchorDataset_->metadata().chunkGridShapeZYX != fiberletDataset_->metadata().chunkGridShapeZYX ||

@@ -1,10 +1,12 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include "vc/core/util/AtomicFile.hpp"
 #include "vc/fiber_tracer/FiberletStorage.hpp"
 #include "vc/fiber_tracer/FiberletDataset.hpp"
 #include "vc/fiber_tracer/FiberletChunkGraph.hpp"
 #include "vc/fiber_tracer/FiberletQuantization.hpp"
+#include "vc/fiber_tracer/FiberletOnDemand.hpp"
 
 #include <cmath>
 #include <atomic>
@@ -596,7 +598,7 @@ TEST_CASE("Fiberlet single-cell tube test agrees with the canonical selector")
     }
 }
 
-TEST_CASE("Fiberlet prefix and routes become visible through one completion marker")
+TEST_CASE("Fiberlet prefix and routes become visible only as a complete payload pair")
 {
     std::mt19937_64 random(std::random_device{}());
     const auto root = std::filesystem::temp_directory_path() / ("vc_fiberlet_pair_" + std::to_string(random()));
@@ -622,6 +624,174 @@ TEST_CASE("Fiberlet prefix and routes become visible through one completion mark
     dataset->publishChunk(FiberletStorageChunkKind::FiberletRoutes, routeKey, routes);
     CHECK(dataset->readChunk(FiberletStorageChunkKind::FiberletPrefix, prefixKey).has_value());
     CHECK(dataset->readChunk(FiberletStorageChunkKind::FiberletRoutes, routeKey).has_value());
+    std::filesystem::remove_all(root);
+}
+
+TEST_CASE("Fiberlet sparse output selection conservatively covers nonempty presence chunks")
+{
+    FiberPresenceChunkScanReport presence;
+    presence.shapeZYX = {9, 9, 9};
+    presence.chunksZYX = {4, 4, 4};
+    presence.chunkGridShapeZYX = {3, 3, 3};
+    presence.nonemptyChunksZYX = {{0, 0, 0}, {1, 1, 1}, {2, 2, 2}};
+    FiberletDatasetMetadata output;
+    output.chunkGridShapeZYX = {3, 3, 3};
+    output.coordinateUnitsPerChunkZYX = {2, 2, 2};
+
+    const auto selected = fiberletOutputChunksForNonemptyPresence(presence, output, 2);
+    REQUIRE(selected.size() == 3);
+    CHECK((std::array{selected[0].iz, selected[0].iy, selected[0].ix} == std::array{0, 0, 0}));
+    CHECK((std::array{selected[1].iz, selected[1].iy, selected[1].ix} == std::array{1, 1, 1}));
+    CHECK((std::array{selected[2].iz, selected[2].iy, selected[2].ix} == std::array{2, 2, 2}));
+}
+
+TEST_CASE("Combined fiberlet dataset exposes complete sparse graph facets")
+{
+    std::mt19937_64 random(std::random_device{}());
+    const auto root = std::filesystem::temp_directory_path() / ("vc_fiberlet_combined_" + std::to_string(random()));
+    FiberletDatasetMetadata metadata;
+    metadata.kind = FiberletDatasetKind::Combined;
+    metadata.profile = FiberletStorageProfile::CompactDirectionsFixedCost;
+    metadata.chunkGridShapeZYX = {2, 2, 2};
+    metadata.coordinateUnitsPerChunkZYX = {8, 8, 8};
+    metadata.maximumEndpointReachCoordinateUnitsZYX = {4, 4, 4};
+    metadata.coordinateBits = 8;
+    metadata.deltaBits = 8;
+    metadata.routeCountBits = 8;
+    metadata.routeLatticeBits = 8;
+    metadata.costBits = 16;
+    metadata.algorithmFingerprint = "combined-test";
+    metadata.datasetFingerprint[0] = 99;
+    auto dataset = FiberletChunkDataset::createOrOpen(root, metadata);
+    const vc::render::ChunkKey owner{0, 0, 0, 0};
+    dataset->configureExpectedChunks(std::span<const vc::render::ChunkKey>(&owner, 1));
+    CHECK_THROWS_AS(createStoredFiberletAnchorChunkCache(dataset), std::invalid_argument);
+    CHECK_THROWS_AS(createStoredFiberletPathChunkCache(dataset), std::invalid_argument);
+
+    const auto first = key(6, 7, 7);
+    const auto second = key(7, 7, 7);
+    const std::vector<FiberletStoredAnchor> anchors{{first, {1, 2, 3}, {1, 0, 0}}, {second, {2, 2, 3}, {1, 0, 0}}};
+    dataset->publishChunk(FiberletStorageChunkKind::Anchors, owner, serializeFiberletAnchors(dataset->codecConfig(FiberletStorageChunkKind::Anchors, owner), anchors));
+    CHECK_FALSE(dataset->datasetComplete());
+    const std::vector<FiberletStoredPrefix> prefixes{
+        {.id = {first, second},
+         .pathLengthPredictionVoxels = 1.0F,
+         .cost = {0.0F, 1.0F, 0.0F, 0.0F, 0.0F},
+         .firstStepBaseXYZ = {1, 0, 0},
+         .lastStepBaseXYZ = {1, 0, 0}}};
+    const std::vector<FiberletStoredRoute> routes(1);
+    const vc::render::ChunkKey routeKey{1, 0, 0, 0};
+    const auto prefixBytes = serializeFiberletPrefixes(dataset->codecConfig(FiberletStorageChunkKind::FiberletPrefix, owner), prefixes);
+    dataset->publishChunk(FiberletStorageChunkKind::FiberletPrefix, owner, prefixBytes);
+    CHECK_FALSE(dataset->datasetComplete());
+    dataset->publishFiberletChunkPair(
+        owner,
+        materialized(FiberletStorageChunkKind::FiberletPrefix, prefixBytes),
+        routeKey,
+        materialized(FiberletStorageChunkKind::FiberletRoutes, serializeFiberletRoutes(dataset->codecConfig(FiberletStorageChunkKind::FiberletRoutes, routeKey), routes)));
+    CHECK(dataset->datasetComplete());
+    CHECK_FALSE(std::filesystem::exists(root / "active_chunks.bin"));
+    CHECK_FALSE(std::filesystem::exists(root / "dataset.complete"));
+    CHECK_FALSE(std::filesystem::exists(root / "complete"));
+
+    {
+        std::ofstream(root / "active_chunks.bin") << "legacy";
+        std::ofstream(root / "dataset.complete") << "legacy";
+        std::filesystem::create_directories(root / "complete");
+        std::ofstream(root / "complete" / "0.0.0") << "legacy";
+    }
+
+    auto reopened = FiberletChunkDataset::createOrOpen(root, metadata);
+    CHECK_FALSE(std::filesystem::exists(root / "active_chunks.bin"));
+    CHECK_FALSE(std::filesystem::exists(root / "dataset.complete"));
+    CHECK_FALSE(std::filesystem::exists(root / "complete"));
+    CHECK_THROWS_AS(reopened->datasetComplete(), std::invalid_argument);
+    reopened->configureExpectedChunks(std::span<const vc::render::ChunkKey>(&owner, 1));
+    CHECK(reopened->datasetComplete());
+    const vc::render::ChunkKey inactive{0, 1, 1, 1};
+    const vc::render::ChunkKey inactiveRoute{1, 1, 1, 1};
+    const auto emptyAnchorsBytes = serializeFiberletAnchors(reopened->codecConfig(FiberletStorageChunkKind::Anchors, inactive), {});
+    const auto emptyPrefixesBytes = serializeFiberletPrefixes(reopened->codecConfig(FiberletStorageChunkKind::FiberletPrefix, inactive), {});
+    const auto emptyRoutesBytes = serializeFiberletRoutes(reopened->codecConfig(FiberletStorageChunkKind::FiberletRoutes, inactiveRoute), {});
+    reopened->publishChunk(FiberletStorageChunkKind::Anchors, inactive, emptyAnchorsBytes);
+    reopened->publishFiberletChunkPair(
+        inactive,
+        materialized(FiberletStorageChunkKind::FiberletPrefix, emptyPrefixesBytes),
+        inactiveRoute,
+        materialized(FiberletStorageChunkKind::FiberletRoutes, emptyRoutesBytes));
+    CHECK(std::filesystem::exists(reopened->chunkPath(FiberletStorageChunkKind::Anchors, inactive)));
+    const auto empty = reopened->readMaterializedChunk(FiberletStorageChunkKind::Anchors, inactive);
+    REQUIRE(empty.has_value());
+    const auto emptyAnchors = std::dynamic_pointer_cast<const FiberletAnchorChunkPayload>(empty->payload);
+    REQUIRE(emptyAnchors);
+    CHECK(emptyAnchors->anchors.empty());
+
+    auto anchorCache = createStoredFiberletAnchorChunkCache(reopened);
+    auto pathCache = createStoredFiberletPathChunkCache(reopened);
+    FiberletChunkGraphSource graph(reopened, anchorCache, reopened, pathCache);
+    const auto incident = graph.incidentEdges(second, true);
+    REQUIRE(incident.status == FiberletGraphQueryStatus::Ready);
+    REQUIRE(incident.value.edges.size() == 1);
+    CHECK(incident.value.edges.front().id.fiberlet == FiberletStorageId{first, second});
+    const auto loaded = graph.anchor(second, true);
+    REQUIRE(loaded.status == FiberletGraphQueryStatus::Ready);
+    CHECK(loaded.value.anchor.key == second);
+
+    pathCache->cancelPendingAndWait();
+    anchorCache->cancelPendingAndWait();
+    std::filesystem::remove_all(root);
+}
+
+TEST_CASE("Combined fiberlet dataset with no expected chunks is complete from found payloads")
+{
+    std::mt19937_64 random(std::random_device{}());
+    const auto root = std::filesystem::temp_directory_path() / ("vc_fiberlet_combined_empty_" + std::to_string(random()));
+    FiberletDatasetMetadata metadata;
+    metadata.kind = FiberletDatasetKind::Combined;
+    metadata.profile = FiberletStorageProfile::CompactDirectionsFixedCost;
+    metadata.chunkGridShapeZYX = {1, 1, 1};
+    metadata.coordinateUnitsPerChunkZYX = {8, 8, 8};
+    metadata.maximumEndpointReachCoordinateUnitsZYX = {4, 4, 4};
+    metadata.coordinateBits = 8;
+    metadata.deltaBits = 8;
+    metadata.routeCountBits = 8;
+    metadata.routeLatticeBits = 8;
+    metadata.costBits = 16;
+    metadata.algorithmFingerprint = "combined-empty-test";
+    auto dataset = FiberletChunkDataset::createOrOpen(root, metadata);
+    dataset->configureExpectedChunks(std::span<const vc::render::ChunkKey>{});
+    CHECK(dataset->datasetComplete());
+    auto anchorCache = createStoredFiberletAnchorChunkCache(dataset);
+    auto pathCache = createStoredFiberletPathChunkCache(dataset);
+    pathCache->cancelPendingAndWait();
+    anchorCache->cancelPendingAndWait();
+    std::filesystem::remove_all(root);
+}
+
+TEST_CASE("Fiberlet atomic temporary cleanup removes only exact abandoned write names")
+{
+    std::mt19937_64 random(std::random_device{}());
+    const auto root = std::filesystem::temp_directory_path() / ("vc_fiberlet_atomic_cleanup_" + std::to_string(random()));
+    std::filesystem::create_directories(root / "nested");
+    std::ofstream(root / "anchors" ".tmp.123.0") << "abandoned";
+    std::ofstream(root / "nested" / "routes.tmp.456.789") << "abandoned";
+    std::ofstream(root / "keep.tmp.invalid.0") << "keep";
+    std::ofstream(root / "keep.tmp.1.invalid") << "keep";
+
+    {
+        vc::core::util::ExclusiveDirectoryLock lock(root);
+        CHECK_THROWS_AS(
+            vc::core::util::ExclusiveDirectoryLock(root),
+            std::filesystem::filesystem_error);
+        CHECK(vc::core::util::cleanupAtomicWriteTemporaryFiles(root) == 2);
+        CHECK_FALSE(std::filesystem::exists(root / "anchors.tmp.123.0"));
+        CHECK_FALSE(std::filesystem::exists(root / "nested" / "routes.tmp.456.789"));
+        CHECK(std::filesystem::exists(root / "keep.tmp.invalid.0"));
+        CHECK(std::filesystem::exists(root / "keep.tmp.1.invalid"));
+    }
+    std::filesystem::create_directories(root / "occupied-target");
+    CHECK_THROWS(vc::core::util::atomicWriteString(root / "occupied-target", "cannot replace a directory"));
+    CHECK(vc::core::util::cleanupAtomicWriteTemporaryFiles(root) == 0);
     std::filesystem::remove_all(root);
 }
 

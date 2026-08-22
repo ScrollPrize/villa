@@ -1021,3 +1021,16 @@
   q1/u8 matrix row with the q1/8 compact-direction sqrt-u16 experiment.
 - Full Paris4 radius-768 evaluation produced two failures for both the new
   default and exact oracle; q1/8 produced three.
+
+# 2026-08-22: sparse whole-volume fiberlet preprocessing
+
+- Added presence-only sparse scanning and deterministic output-chunk mapping.
+- Added a retained intermediate anchor cache and a combined compact final Zarr
+  with anchors, prefixes, and routes. Expected chunks and completeness are
+  reconstructed directly from source presence, intermediate anchors, and final
+  payload tuples without persisted activity or completion markers.
+- Added read-only combined-dataset cache facets configured from a fresh source
+  scan, atomic partial-tuple recovery, and locked stale-temp cleanup.
+- Added `vc_fiberlets preprocess-volume` with Z/Y/X scheduling, resume, and
+  one-second progress, ETA, and compressed-size projection with persistent
+  minute checkpoints.
