@@ -45,6 +45,14 @@ private:
     cv::Vec3d normal_;
 };
 
+class ThrowingFiberModeNormalSampler final : public vc::lasagna::NormalSampler {
+public:
+    vc::lasagna::NormalSample sampleNormal(const cv::Vec3d&) const override
+    {
+        throw std::runtime_error("test sampler failure");
+    }
+};
+
 class FiberModePrediction final : public vc::fiber_tracer::FiberPredictionSource {
 public:
     explicit FiberModePrediction(double invalidX =
@@ -865,6 +873,183 @@ TEST_CASE("line annotation control collapse handles insertion endpoints and all 
         CHECK(collapsed.controlPoints.front().isSeed);
         CHECK_FALSE(collapsed.controlPoints.front().segmentToNext.has_value());
     }
+}
+
+TEST_CASE("line annotation automatic multi-control edit reconstructs the clicked span")
+{
+    const std::vector<cv::Vec3d> linePoints{
+        {0.0, 0.0, 0.0},
+        {10.0, 0.0, 0.0},
+        {20.0, 0.0, 0.0},
+        {30.0, 0.0, 0.0},
+        {40.0, 0.0, 0.0},
+        {40.0, 1.0, 0.0},
+        {30.0, 1.0, 0.0},
+        {20.0, 1.0, 0.0},
+        {10.0, 1.0, 0.0},
+        {0.0, 1.0, 0.0},
+    };
+    std::vector<vc3d::line_annotation::LineControlPoint> controls{
+        {1.0, linePoints[1], true, 1},
+        {3.0, linePoints[3], false, 3},
+        {4.0, linePoints[4], false, 4},
+        {8.0, linePoints[8], false, 8},
+    };
+    const cv::Vec3d clicked{30.0, 1.1, 0.0};
+    FiberModeNormalSampler sampler;
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentLength = 4.0;
+    config.segmentsPerSide = 3;
+    config.maxIterations = 0;
+    config.normalAlignmentWeight = 0.0;
+    config.distanceWeight = 0.0;
+    config.tangentStraightnessWeight = 0.0;
+    config.normalStraightnessWeight = 0.0;
+    config.initialTangentWeight = 0.0;
+    config.tangentGuideWeight = 0.0;
+
+    const auto prepared = vc3d::line_annotation::prepareAutomaticControlPointEdit(
+        linePoints, controls, {1, 2}, 3.5, clicked, sampler, config);
+
+    REQUIRE(prepared.controlPoints.size() == 3);
+    REQUIRE(prepared.replacementIndex == 1);
+    CHECK(prepared.lineReconstructed);
+    CHECK(prepared.collapsedOldIndices == std::vector<size_t>{1, 2});
+    CHECK(prepared.oldToNewIndices == std::vector<size_t>{0, 1, 1, 2});
+    CHECK(prepared.dirtySegmentIndices == std::vector<size_t>{0, 1});
+    CHECK(prepared.controlPoints[prepared.replacementIndex].volumePoint == clicked);
+    const int replacementLineIndex =
+        prepared.controlPoints[prepared.replacementIndex].optimizedIndex;
+    REQUIRE(replacementLineIndex > 0);
+    REQUIRE(replacementLineIndex < static_cast<int>(prepared.linePoints.size()) - 1);
+    CHECK(prepared.linePoints[static_cast<size_t>(replacementLineIndex)] == clicked);
+    CHECK(prepared.controlPoints[0].optimizedIndex < replacementLineIndex);
+    CHECK(replacementLineIndex < prepared.controlPoints[2].optimizedIndex);
+}
+
+TEST_CASE("line annotation automatic edit preparation leaves inputs unchanged on failure")
+{
+    const std::vector<cv::Vec3d> linePoints{
+        {0.0, 0.0, 0.0},
+        {10.0, 0.0, 0.0},
+        {20.0, 0.0, 0.0},
+    };
+    const std::vector<vc3d::line_annotation::LineControlPoint> controls{
+        {0.0, linePoints[0], true, 0},
+        {2.0, linePoints[2], false, 2},
+    };
+    const std::vector<cv::Vec3d> originalLinePoints = linePoints;
+    ThrowingFiberModeNormalSampler sampler;
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentLength = 4.0;
+    config.segmentsPerSide = 3;
+
+    CHECK_THROWS_AS(
+        vc3d::line_annotation::prepareAutomaticControlPointEdit(
+            linePoints, controls, {}, 1.0, {10.0, 1.0, 0.0}, sampler, config),
+        std::runtime_error);
+    CHECK(linePoints == originalLinePoints);
+    REQUIRE(controls.size() == 2);
+    CHECK(controls[0].linePosition == doctest::Approx(0.0));
+    CHECK(controls[0].volumePoint == linePoints[0]);
+    CHECK(controls[1].linePosition == doctest::Approx(2.0));
+    CHECK(controls[1].volumePoint == linePoints[2]);
+}
+
+TEST_CASE("line annotation one-control tangent follows authoritative line position")
+{
+    const std::vector<cv::Vec3d> linePoints{
+        {0.0, 0.0, 0.0},
+        {10.0, 0.0, 0.0},
+        {20.0, 0.0, 0.0},
+        {20.0, 10.0, 0.0},
+        {10.0, 10.0, 0.0},
+        {10.0, 0.1, 0.0},
+    };
+
+    CHECK(vc3d::line_annotation::lineTangentAtPosition(linePoints, 1.5) ==
+          cv::Vec3d(10.0, 0.0, 0.0));
+    CHECK(vc3d::line_annotation::lineTangentAtPosition(linePoints, 4.5) ==
+          cv::Vec3d(0.0, -9.9, 0.0));
+
+    FiberModeNormalSampler sampler;
+    vc3d::line_annotation::FiberModeOptimizationRequest request;
+    request.controlPoints = {
+        {1.5, {10.0, 0.1, 0.0}, true, -1},
+    };
+    request.linePointsBase = linePoints;
+    request.baseNormalSampler = &sampler;
+    request.globalMode = vc3d::line_annotation::FiberOptimizationMode::Lasagna;
+    request.lasagnaConfig.segmentsPerSide = 2;
+    request.lasagnaConfig.segmentLength = 2.0;
+    request.lasagnaConfig.runGlobalOptimization = false;
+    request.lasagnaConfig.printSolverProgress = false;
+
+    const auto optimized =
+        vc3d::line_annotation::optimizeFiberWithNativeFallback(std::move(request));
+    REQUIRE(optimized.optimization.line.points.size() >= 3);
+    const cv::Vec3d optimizedDirection =
+        optimized.optimization.line.points.back().position -
+        optimized.optimization.line.points.front().position;
+    CHECK(std::abs(optimizedDirection[0]) > std::abs(optimizedDirection[1]));
+}
+
+TEST_CASE("line annotation all-control collapse prepares one clicked control")
+{
+    const std::vector<cv::Vec3d> linePoints{
+        {0.0, 0.0, 0.0},
+        {10.0, 0.0, 0.0},
+        {20.0, 0.0, 0.0},
+    };
+    const std::vector<vc3d::line_annotation::LineControlPoint> controls{
+        {0.0, linePoints[0], true, 0},
+        {2.0, linePoints[2], false, 2},
+    };
+    const cv::Vec3d clicked{10.0, 1.0, 0.0};
+    FiberModeNormalSampler sampler;
+
+    const auto prepared = vc3d::line_annotation::prepareAutomaticControlPointEdit(
+        linePoints,
+        controls,
+        {0, 1},
+        1.0,
+        clicked,
+        sampler,
+        vc::lasagna::LineOptimizationConfig{});
+
+    CHECK_FALSE(prepared.lineReconstructed);
+    CHECK(prepared.linePoints == linePoints);
+    REQUIRE(prepared.controlPoints.size() == 1);
+    CHECK(prepared.replacementIndex == 0);
+    CHECK(prepared.controlPoints[0].linePosition == doctest::Approx(1.0));
+    CHECK(prepared.controlPoints[0].volumePoint == clicked);
+    CHECK(prepared.controlPoints[0].isSeed);
+    CHECK(prepared.dirtySegmentIndices.empty());
+}
+
+TEST_CASE("line annotation optimizer metadata merge follows control order")
+{
+    std::vector<vc3d::line_annotation::LineControlPoint> original{
+        {1.0, {5.0, 5.0, 5.0}, true, 1},
+        {3.0, {5.0, 5.0, 5.0}, false, 3},
+        {5.0, {9.0, 5.0, 5.0}, false, 5},
+    };
+    original[0].segmentToNext.emplace();
+    original[0].segmentToNext->message = "first winding";
+    original[1].segmentToNext.emplace();
+    original[1].segmentToNext->message = "second winding";
+    auto optimizerControls =
+        vc3d::line_annotation::optimizerControlPoints(original);
+
+    const auto merged = vc3d::line_annotation::mergeOptimizerControlPoints(
+        std::move(optimizerControls), original);
+
+    REQUIRE(merged.size() == 3);
+    REQUIRE(merged[0].segmentToNext.has_value());
+    REQUIRE(merged[1].segmentToNext.has_value());
+    CHECK(merged[0].segmentToNext->message == "first winding");
+    CHECK(merged[1].segmentToNext->message == "second winding");
+    CHECK_FALSE(merged[2].segmentToNext.has_value());
 }
 
 TEST_CASE("line annotation fiber naming uses username timestamp and sequence")
@@ -2424,4 +2609,117 @@ TEST_CASE("line spline honors hard endpoint directions")
     const cv::Vec3d last = result.points.back() - result.points[result.points.size() - 2];
     CHECK(first.dot(cv::Vec3d{1.0, 0.0, 0.0}) / cv::norm(first) > 0.99);
     CHECK(last.dot(cv::Vec3d{0.0, 1.0, 0.0}) / cv::norm(last) > 0.99);
+}
+
+// ---------------------------------------------------------------------------
+// Orientation freshness: the decisions behind the umbilicus cache and the
+// stale-view refresh, extracted so they are asserted rather than read.
+
+#include "UmbilicusOrientationFreshness.hpp"
+
+namespace {
+
+vc3d::annotation::UmbilicusCacheInputs cacheInputs()
+{
+    vc3d::annotation::UmbilicusCacheInputs inputs;
+    inputs.root = "/proj";
+    inputs.volumeId = "vol-a";
+    inputs.dependencyToken = "field|/proj/umbilicus.json=100:1";
+    inputs.frame = vc3d::annotation::deriveAnnotationFrame(
+        2.4, 0, std::nullopt, std::nullopt, {100.0, 100.0, 1000.0});
+    return inputs;
+}
+
+} // namespace
+
+TEST_CASE("umbilicus cache: reused only while every input it was built from holds")
+{
+    using vc3d::annotation::umbilicusReloadNeeded;
+
+    const auto cached = cacheInputs();
+
+    // Never attempted resolves regardless of the inputs matching.
+    CHECK(umbilicusReloadNeeded(false, cached, cached));
+    // Identical inputs reuse.
+    CHECK_FALSE(umbilicusReloadNeeded(true, cached, cached));
+
+    auto otherRoot = cached;
+    otherRoot.root = "/other";
+    CHECK(umbilicusReloadNeeded(true, cached, otherRoot));
+
+    // The finding this pins: a volume switch whose annotation frame is
+    // byte-identical must still re-resolve, because the legacy reading's
+    // registration transform and the volume-centre fallback belong to the
+    // volume, not to the frame.
+    auto otherVolume = cached;
+    otherVolume.volumeId = "vol-b";
+    CHECK(umbilicusReloadNeeded(true, cached, otherVolume));
+
+    // Any resolver dependency changing on disk — the attached file fixed in
+    // place, a discovery candidate appearing, the registration transform
+    // edited — lands in the token.
+    auto editedFile = cached;
+    editedFile.dependencyToken = "field|/proj/umbilicus.json=100:2";
+    CHECK(umbilicusReloadNeeded(true, cached, editedFile));
+
+    // A frame change rescales the cached points, so it cannot be reused...
+    auto otherFrame = cached;
+    otherFrame.frame = vc3d::annotation::deriveAnnotationFrame(
+        2.4, 0, std::nullopt, std::nullopt, {100.0, 100.0, 2000.0});
+    CHECK(umbilicusReloadNeeded(true, cached, otherFrame));
+
+    // ...but an imprecisely round-tripped voxel size is the same frame.
+    auto rounded = cached;
+    rounded.frame = vc3d::annotation::deriveAnnotationFrame(
+        2.4 + 1e-12, 0, std::nullopt, std::nullopt, {100.0, 100.0, 1000.0});
+    CHECK_FALSE(umbilicusReloadNeeded(true, cached, rounded));
+}
+
+TEST_CASE("stale-view refresh: rebuilds exactly the panes built before the change")
+{
+    using vc3d::annotation::GeneratedViewsPaneState;
+    using vc3d::annotation::paneNeedsOrientationRefresh;
+
+    constexpr int kEpoch = 3;
+
+    GeneratedViewsPaneState stale;
+    stale.hasSession = true;
+    stale.hasGeneratedSurfaces = true;
+    stale.hasLinePoints = true;
+    stale.orientationEpoch = kEpoch - 1;
+    CHECK(paneNeedsOrientationRefresh(stale, kEpoch));
+
+    // Already built at the current epoch: nothing changed underneath it.
+    auto current = stale;
+    current.orientationEpoch = kEpoch;
+    CHECK_FALSE(paneNeedsOrientationRefresh(current, kEpoch));
+
+    // No session, nothing to rebuild.
+    auto empty = stale;
+    empty.hasSession = false;
+    CHECK_FALSE(paneNeedsOrientationRefresh(empty, kEpoch));
+
+    // Intersection sides suppress ordinary generated views and are rebuilt
+    // through the inspection instead; rebuilding them here would build views
+    // the session exists to suppress.
+    auto suppressed = stale;
+    suppressed.suppressesGeneratedViews = true;
+    CHECK_FALSE(paneNeedsOrientationRefresh(suppressed, kEpoch));
+
+    // Nothing materialized means nothing stale on screen — and the builder
+    // rejects an empty model, which used to turn a successful attach into a
+    // modal complaint mid-trace.
+    auto unmaterialized = stale;
+    unmaterialized.hasGeneratedSurfaces = false;
+    CHECK_FALSE(paneNeedsOrientationRefresh(unmaterialized, kEpoch));
+
+    auto noLine = stale;
+    noLine.hasLinePoints = false;
+    CHECK_FALSE(paneNeedsOrientationRefresh(noLine, kEpoch));
+
+    // A pane that has never been built (default epoch) counts as stale once it
+    // has surfaces to correct.
+    auto neverRecorded = stale;
+    neverRecorded.orientationEpoch = -1;
+    CHECK(paneNeedsOrientationRefresh(neverRecorded, kEpoch));
 }

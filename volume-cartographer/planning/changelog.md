@@ -2,6 +2,9 @@
 
 ## 2026-08-17
 
+- Anchored multi-control collapse through the ordinary local span update before
+  fiber optimization and made failed synchronous edit preparation leave the
+  prior session state unchanged.
 - Resampled generated strips between exact control-point supports at a 32-vx pitch, fixed their cross width near the previous default, and made nearby control-point replacement use physical polyline arclength.
 
 - Added a VC3D Download parallelism setting that switches the process-wide
@@ -96,6 +99,14 @@
 - Split regular chunk loading into independent 32-worker persistent-cache
   classification, source download/read, and CPU decode queues so cached decode
   work no longer delays discovery and admission of remote misses.
+
+## 2026-08-19
+
+- Replaced paired Callgrind/DRD render scoring with same-run Callgrind scheduler and futex replay.
+
+## 2026-08-18
+
+- Re-enabled the 5% synthetic-rendering gate with native scheduler-matched paired attribution and production-cache lookup coverage.
 
 ## 2026-08-12
 

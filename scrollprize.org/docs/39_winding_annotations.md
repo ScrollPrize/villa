@@ -256,6 +256,6 @@ a deep learning model to excel at.
 - [Understand and run the spiral fit](/tutorial_spiral)
 - [Browse the current `spiral-input` dataset](/data_datasets#spiral-input-2026-07)
 - [Read the dataset layout and annotation files](pathname:///data/datasets/spiral-input-PHercParis4-README.md)
-- [Inspect the spiral-fitting code](https://github.com/ScrollPrize/villa/tree/main/volume-cartographer/scripts/spiral)
+- [Inspect the spiral-fitting code](https://github.com/ScrollPrize/villa/tree/main/spiral-fitting)
 
 Join the [Discord](https://discord.gg/V4fJhvtaQn) 

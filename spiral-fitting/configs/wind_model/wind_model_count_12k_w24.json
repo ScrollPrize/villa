@@ -1,0 +1,6 @@
+{
+    "dense_spacing_mode": "winding_model",
+    "loss_weight_dense_spacing": 24.0,
+    "loss_weight_dense_spacing_density": 24.0
+
+}

@@ -142,6 +142,15 @@
   typical width without depending on optimized-line spacing.
   Generated-view clicks collapse all controls within an inclusive 32-base-voxel
   optimized-polyline arclength radius into one control at the clicked point.
+  Before automatic full optimization, every insertion, replacement, or
+  multi-control collapse first reconstructs the replacement's surviving
+  adjacent spans from its authoritative line position. A multi-control collapse
+  must not optimize the replacement directly against the unchanged old line by
+  nearest 3-D position. If only one control survives, its reinitialization
+  tangent comes from that authoritative old-line position rather than spatial
+  projection. Synchronous preparation failure leaves the pre-edit geometry and
+  optimization state unchanged; reciprocal branch changes for multi-collapse
+  are committed only after asynchronous optimization succeeds.
   The separate maximum control-point extrapolation setting applies only outside
   the outermost controls, measures optimized-polyline arclength in base voxels,
   and does not restrict insertion between existing controls.

@@ -8,6 +8,7 @@
 #include <QSpinBox>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QRadioButton>
 #include <QJsonObject>
 #include <QJsonDocument>
 #include <QJsonArray>
@@ -20,6 +21,7 @@
 
 class JsonProfileEditor;
 class VolumeSelector;
+class QGroupBox;
 
 class RenderParamsDialog : public QDialog {
     Q_OBJECT
@@ -666,4 +668,59 @@ private:
     QCheckBox* chkLossNormal_{nullptr};
     QCheckBox* chkMesh_{nullptr};
     QCheckBox* chkConn_{nullptr};
+};
+
+class GrowTrackPatchesDialog : public QDialog {
+    Q_OBJECT
+public:
+    explicit GrowTrackPatchesDialog(QWidget* parent = nullptr);
+
+    QString tracksPath() const;
+    QString crossingsPath() const;
+    QString outputPath() const;
+    QString venvPath() const;
+    // Resolved python executable (handles venv dir -> bin/python)
+    QString resolvedPython() const;
+    // Absolute path to grow_track_graph.py (resolved at runtime)
+    QString scriptPath() const;
+    // Full argument list for the script invocation excluding the python
+    // executable and script path: [tracks, crossings, output, ...options]
+    QStringList buildArgs() const;
+    int ompThreads() const; // -1 if unset
+
+protected:
+    void accept() override;
+
+private:
+    void applySavedVenv();
+    void saveVenv() const;
+
+    QLineEdit* edtTracks_{nullptr};
+    QLineEdit* edtCrossings_{nullptr};
+    QLineEdit* edtOutput_{nullptr};
+    QLineEdit* edtVenv_{nullptr};
+
+    QRadioButton* rbSeeds_{nullptr};
+    QRadioButton* rbRandom_{nullptr};
+    QLineEdit* edtSeeds_{nullptr};
+    QSpinBox* spRandomCount_{nullptr};
+    QSpinBox* spRandomSeed_{nullptr};
+    QDoubleSpinBox* spRandomTopPercent_{nullptr};
+    QSpinBox* spMinValidVertices_{nullptr};
+
+    QGroupBox* advBox_{nullptr};
+    QDoubleSpinBox* spGrowthMinSpan_{nullptr};
+    QSpinBox* spMinConnect_{nullptr};
+    QDoubleSpinBox* spMinSize_{nullptr};
+    QDoubleSpinBox* spMaxSize_{nullptr};
+    QDoubleSpinBox* spMaxThickFrac_{nullptr};
+    QCheckBox* chkRejectFold_{nullptr};
+    QDoubleSpinBox* spGateTol_{nullptr};
+    QDoubleSpinBox* spResampleSpacing_{nullptr};
+    QDoubleSpinBox* spMinTrackArclength_{nullptr};
+    QDoubleSpinBox* spOutputSpacing_{nullptr};
+    QDoubleSpinBox* spBorderErode_{nullptr};
+    QSpinBox* spWorkers_{nullptr};
+    QCheckBox* chkOverwrite_{nullptr};
+    QLineEdit* edtOmpThreads_{nullptr};
 };

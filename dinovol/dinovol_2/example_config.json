@@ -1,0 +1,343 @@
+{
+  "output_dir": "./dinov2_test/",
+  "resume": true,
+  "auto_resume": true,
+  "wandb_project": "dinovol_2",
+  "wandb_entity": null,
+  "wandb_run_name": "example-pretrain",
+  "wandb_resume": "allow",
+  "wandb_run_id": null,
+  "volume_auth": "/path/to/some/credentials.json",
+  "lr": 2.5e-5,
+  "min_lr": 1e-6,
+  "weight_decay": 0.04,
+  "weight_decay_end": 0.2,
+  "patch_embed_lr_mult": 0.2,
+  "freeze_last_layer_steps": 1250,
+  "momentum_teacher": 0.994,
+  "final_momentum_teacher": 1.0,
+  "warmup_teacher_temp": 0.04,
+  "teacher_temp": 0.07,
+  "warmup_teacher_temp_steps": 37500,
+  "clip_grad": 3.0,
+  "ibot_masked_loss_chunk_size": 4096,
+  "max_iterations": 1000000,
+  "val_every_n": 50,
+  "save_every_n": 5000,
+  "task_eval_every": 0,
+  "eval_task": "both",
+  "eval_task_train_iters": 500,
+  "eval_task_decoder_type": "simple",
+  "batch_size": 2,
+  "model": {
+    "model_type": "v2",
+    "embedding_type": "default",
+    "global_crops_size": [
+      96,
+      96,
+      96
+    ],
+    "local_crops_size": [
+      48,
+      48,
+      48
+    ]
+  },
+  "gram": {
+    "enabled": false,
+    "loss_weight": 2.0,
+    "teacher_checkpoint": null,
+    "teacher_refresh_every": 10000,
+    "teacher_refresh_start_step": 0,
+    "normalized": true,
+    "img_level": true,
+    "remove_neg": false,
+    "remove_only_teacher_neg": false
+  },
+  "point_supervision": {
+    "enabled": true,
+    "sampling_probability": 0.1,
+    "loss_weight": 0.05,
+    "different_type_margin": 0.0,
+    "max_points_per_view": 64
+  },
+  "use_amp": true,
+  "dataset": {
+    "global_crop_size": [
+      96,
+      96,
+      96
+    ],
+    "local_crop_size": [
+      48,
+      48,
+      48
+    ],
+    "gram_teacher_crop_size": [
+      96,
+      96,
+      96
+    ],
+    "gram_teacher_no_augmentations": true,
+    "volume_auth": "/path/to/some/credentials.json",
+    "datasets": [
+      {
+        "volume_path": "https://somehttpsfileserver.com/someomezarrvolume.zarr",
+        "volume_scale": 0
+      }
+    ]
+  },
+  "recipes": {
+    "base_pretrain": {
+      "output_dir": "./dinov2_base_pretrain/",
+      "resume": true,
+      "auto_resume": true,
+      "lr": 2.5e-5,
+      "min_lr": 1e-6,
+      "weight_decay": 0.04,
+      "weight_decay_end": 0.2,
+      "patch_embed_lr_mult": 0.2,
+      "freeze_last_layer_steps": 1250,
+      "momentum_teacher": 0.994,
+      "final_momentum_teacher": 1.0,
+      "warmup_teacher_temp": 0.04,
+      "teacher_temp": 0.07,
+      "warmup_teacher_temp_steps": 37500,
+      "clip_grad": 3.0,
+      "ibot_masked_loss_chunk_size": 4096,
+      "max_iterations": 1000000,
+      "batch_size": 2,
+      "model": {
+        "model_type": "v2",
+        "embedding_type": "default",
+        "global_crops_size": [
+          96,
+          96,
+          96
+        ],
+        "local_crops_size": [
+          48,
+          48,
+          48
+        ]
+      },
+      "gram": {
+        "enabled": false,
+        "loss_weight": 2.0,
+        "teacher_checkpoint": null,
+        "teacher_refresh_every": 10000,
+        "teacher_refresh_start_step": 0,
+        "normalized": true,
+        "img_level": true,
+        "remove_neg": false,
+        "remove_only_teacher_neg": false
+      },
+      "dataset": {
+        "global_crop_size": [
+          96,
+          96,
+          96
+        ],
+        "local_crop_size": [
+          48,
+          48,
+          48
+        ],
+        "datasets": [
+          {
+            "volume_path": "https://somehttpsfileserver.com/someomezarrvolume.zarr",
+            "volume_scale": 0
+          }
+        ]
+      }
+    },
+    "gram_refinement": {
+      "output_dir": "./dinov2_gram_refinement/",
+      "resume": false,
+      "auto_resume": false,
+      "lr": 1.25e-5,
+      "min_lr": 1.25e-5,
+      "weight_decay": 0.04,
+      "weight_decay_end": 0.04,
+      "patch_embed_lr_mult": 0.2,
+      "freeze_last_layer_steps": 0,
+      "momentum_teacher": 0.999,
+      "final_momentum_teacher": 0.999,
+      "warmup_teacher_temp": 0.07,
+      "teacher_temp": 0.07,
+      "warmup_teacher_temp_steps": 0,
+      "clip_grad": 3.0,
+      "max_iterations": 10000,
+      "batch_size": 2,
+      "model": {
+        "model_type": "v2",
+        "embedding_type": "default",
+        "global_crops_size": [
+          96,
+          96,
+          96
+        ],
+        "local_crops_size": [
+          48,
+          48,
+          48
+        ],
+        "pretrained_weights": "/path/to/base_pretrain/checkpoint_step_010000.pt",
+        "pretrained_backbone_only": false
+      },
+      "gram": {
+        "enabled": true,
+        "loss_weight": 2.0,
+        "teacher_checkpoint": "/path/to/base_pretrain/checkpoint_step_010000.pt",
+        "teacher_refresh_every": 10000,
+        "teacher_refresh_start_step": 0,
+        "normalized": true,
+        "img_level": true,
+        "remove_neg": false,
+        "remove_only_teacher_neg": false
+      },
+      "dataset": {
+        "global_crop_size": [
+          96,
+          96,
+          96
+        ],
+        "local_crop_size": [
+          48,
+          48,
+          48
+        ],
+        "gram_teacher_crop_size": [
+          128,
+          128,
+          128
+        ],
+        "gram_teacher_no_augmentations": true,
+        "datasets": [
+          {
+            "volume_path": "https://somehttpsfileserver.com/someomezarrvolume.zarr",
+            "volume_scale": 0
+          }
+        ]
+      }
+    },
+    "hr_adaptation": {
+      "output_dir": "./dinov2_hr_adaptation/",
+      "resume": false,
+      "auto_resume": false,
+      "lr": 1.25e-5,
+      "min_lr": 1.25e-5,
+      "weight_decay": 0.04,
+      "weight_decay_end": 0.04,
+      "patch_embed_lr_mult": 0.2,
+      "freeze_last_layer_steps": 0,
+      "momentum_teacher": 0.999,
+      "final_momentum_teacher": 0.999,
+      "warmup_teacher_temp": 0.07,
+      "teacher_temp": 0.07,
+      "warmup_teacher_temp_steps": 0,
+      "clip_grad": 3.0,
+      "max_iterations": 10000,
+      "batch_size": 1,
+      "model": {
+        "model_type": "v2",
+        "embedding_type": "default",
+        "global_crops_size": [
+          96,
+          96,
+          96
+        ],
+        "local_crops_size": [
+          48,
+          48,
+          48
+        ],
+        "pretrained_weights": "/path/to/gram_refinement/checkpoint_step_010000.pt",
+        "pretrained_backbone_only": false
+      },
+      "gram": {
+        "enabled": true,
+        "loss_weight": 2.0,
+        "teacher_checkpoint": "/path/to/gram_refinement/checkpoint_step_010000.pt",
+        "teacher_refresh_every": 10000,
+        "teacher_refresh_start_step": 0,
+        "normalized": true,
+        "img_level": true,
+        "remove_neg": false,
+        "remove_only_teacher_neg": false
+      },
+      "dataset": {
+        "global_crop_size": [
+          96,
+          96,
+          96
+        ],
+        "local_crop_size": [
+          48,
+          48,
+          48
+        ],
+        "gram_teacher_crop_size": [
+          128,
+          128,
+          128
+        ],
+        "gram_teacher_no_augmentations": true,
+        "variants": [
+          {
+            "ratio": 0.3,
+            "global_crop_size": [
+              128,
+              128,
+              128
+            ],
+            "local_crop_size": [
+              48,
+              48,
+              48
+            ],
+            "gram_teacher_crop_size": [
+              160,
+              160,
+              160
+            ],
+            "source_sampling_size": [
+              160,
+              160,
+              160
+            ]
+          },
+          {
+            "ratio": 0.7,
+            "global_crop_size": [
+              160,
+              160,
+              160
+            ],
+            "local_crop_size": [
+              80,
+              80,
+              80
+            ],
+            "gram_teacher_crop_size": [
+              192,
+              192,
+              192
+            ],
+            "source_sampling_size": [
+              192,
+              192,
+              192
+            ]
+          }
+        ],
+        "datasets": [
+          {
+            "volume_path": "https://somehttpsfileserver.com/someomezarrvolume.zarr",
+            "volume_scale": 0
+          }
+        ]
+      }
+    }
+  }
+}
