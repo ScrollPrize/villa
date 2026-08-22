@@ -417,3 +417,28 @@ def test_common_packer_rejects_invalid_walks(nodes, picks, message):
             SampledWalk(
                 torch.tensor(nodes).numpy(), torch.tensor(picks).numpy(), False),
         ], crossing_map)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='needs CUDA')
+def test_cuda_unset_potential_raises_at_assert_boundary():
+    # On CUDA the unset-potential hard error is deferred (the verdict is
+    # copied off-device asynchronously); the guarantee is that it surfaces
+    # no later than assert_no_pending_potential_errors(), which the training
+    # loop calls before every optimizer step.
+    points = _points_for_theta([0.0, 0.1, 0.2])
+    crossing_map = ThetaCrossingMap('cuda')
+    crossing_map.register_nodes(3, lambda lo, hi: points[lo:hi])
+    crossing_map.register_unwrap_tree([0, 1], [-1, 0])
+    crossing_map.force_refresh(_identity)
+
+    # Node 2 is outside the tree; the call itself may return the sentinel
+    # without raising, but the boundary must raise.
+    crossing_map.winding_potentials(torch.tensor([2], device='cuda'))
+    with pytest.raises(RuntimeError, match='no registered unwrap potential'):
+        crossing_map.assert_no_pending_potential_errors()
+
+    # A healthy query afterwards passes the boundary cleanly.
+    crossing_map._pending_potential_checks.clear()
+    assert crossing_map.winding_potentials(
+        torch.tensor([0], device='cuda')).tolist() == [0]
+    crossing_map.assert_no_pending_potential_errors()

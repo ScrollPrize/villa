@@ -536,6 +536,19 @@ class ThetaCrossingMap:
         raise RuntimeError(
             f'{bad} has no registered unwrap potential')
 
+    def assert_no_pending_potential_errors(self):
+        """Resolve every queued unset-potential verdict now (blocking).
+
+        winding_potentials() defers its unset-node hard error to avoid a
+        per-call device synchronisation, so a caller must invoke this at any
+        boundary that must not proceed on unvalidated potentials — the
+        training loop calls it before each optimizer step, the preview
+        export after its diagnostics pass. One-shot tools that call
+        winding_potentials()/adjustments_from_potentials() directly should
+        call it before returning their results.
+        """
+        self._drain_potential_checks(blocking=True)
+
     def _drain_potential_checks(self, blocking=False):
         """Verify completed asynchronous unset-potential checks.
 
@@ -568,8 +581,9 @@ class ThetaCrossingMap:
         # would stall the CPU on all queued GPU work. When the table has no
         # unset entries at all the check is skipped outright; otherwise the
         # verdict is copied to pinned memory asynchronously and raised from
-        # a later call once its event has fired (detection is delayed by a
-        # few sampler calls, never lost).
+        # a later call, a refresh, or an assert_no_pending_potential_errors()
+        # boundary (the training loop places one before each optimizer step,
+        # so no parameter update ever applies unvalidated potentials).
         self._drain_potential_checks()
         if self._any_unset_potential:
             if self.device.type == 'cuda':
