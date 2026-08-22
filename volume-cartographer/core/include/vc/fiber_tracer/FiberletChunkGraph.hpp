@@ -115,7 +115,8 @@ public:
     FiberletCachedReplayGraphSource(
         std::shared_ptr<FiberletOnDemandPreprocessor> preprocessor,
         FiberletPathConfig pathConfig,
-        FiberletEvaluationQuantization evaluationQuantization = {},
+        FiberletEvaluationQuantization evaluationQuantization =
+            defaultFiberletReplayQuantization(),
         float maximumJoinAngleDegrees = 45.0F);
 
     [[nodiscard]] float predictionToBaseScale() const noexcept override;

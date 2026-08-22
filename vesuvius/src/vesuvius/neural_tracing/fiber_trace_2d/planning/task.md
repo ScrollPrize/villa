@@ -1,12 +1,17 @@
-# Task: evaluate fixed nonlinear uint16 fiberlet costs
+# Task: adopt the compact float-position fiberlet default
 
-Evaluate a fixed, dataset-independent nonlinear `uint16` representation of
-fiberlet edge cost density. Encode
-`sqrt(clamp(total_cost / path_length_prediction_voxels / 256, 0, 1))` over the
-complete uint16 range and reconstruct total edge cost from the decoded density
-and existing stored path length.
+Make the accepted float-position, compact-direction, fixed nonlinear `uint16`
+cost profile the default for cache-backed fiberlet replay and future compact
+storage work. Keep the all-float profile available explicitly as the correctness
+oracle. Do not change the unpublished persistent compact payload schema as part
+of this default-selection task.
 
-The encoding must never derive ranges from chunks or observed samples. Retain
-the existing raw-total scenarios unchanged, reuse the existing
-compact-direction geometry cache, and run the full Paris4 radius-768 comparison
-at `H=384`, `D=48`, beam 16, exact search, and 32 threads.
+The accepted profile is:
+
+- exact float endpoint positions;
+- compact two-byte fitted directions;
+- fixed sqrt-density `uint16` edge costs with density ceiling 256;
+- float path length and float join costs.
+
+Commit this default together with the completed one-eighth-base-voxel
+quantization experiment.

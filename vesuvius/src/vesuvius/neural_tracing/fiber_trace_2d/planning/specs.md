@@ -3754,12 +3754,22 @@
   The default scenario is `combined_q4_axis_cost_u8`; the command requires an
   output directory so interrupted and warm runs reuse complete chunks.
   The standard matrix has 19 entries: one baseline and 18 non-baseline rows in
-  deterministic order.
+  deterministic order. The unpublished `combined_q1_axis_cost_u8` row is
+  replaced by `position_q1_8_compact_axis_cost_sqrt_u16_max256`; no alias is
+  retained.
 - One canonical float anchor dataset belongs to each exact source, extraction,
   corridor, grid, and chunk-layout identity. Baseline and every geometry or cost
   scenario reuse that dataset. Quantization never changes serialized anchors or
   reruns anchor extraction.
-- Quantized endpoints are globally nearest-rounded before DP. The regular DP
+- Evaluation position quantum is a finite positive spacing in base voxels;
+  zero selects exact float positions. Fractional values are permitted and must
+  survive scenario state, cache fingerprints, JSON, and CLI output without
+  integer truncation. Chunk side divided by the quantum must be an integral,
+  representable bin count. This evaluation type does not change the unrelated
+  compact physical storage header's integer quantum.
+- Quantized endpoints are globally nearest-rounded in base coordinates before
+  conversion back to prediction coordinates and DP. Positive half steps round
+  upward. The regular DP
   constructs the resulting Hermite domain and chooses a new interior route; a
   baseline `(u,v)` route must not be transplanted onto changed endpoint planes.
 - Stable anchor IDs remain source cell coordinate plus component `0/1`.
@@ -3815,6 +3825,20 @@
   density `uint16`; the
   geometry namespace's opaque historical u8 compatibility tag does not select
   graph cost precision and never changes persisted prefixes or routes.
+- Cache-backed fiberlet replay defaults to
+  `compact_axis_cost_sqrt_u16_max256`: exact float positions, compact fitted
+  directions, fixed sqrt-density `uint16` edge costs with ceiling 256, float
+  path lengths, and float join costs. The same profile must select both the
+  compact-direction fiberlet cache namespace and the graph cost view. Canonical
+  anchors remain exact float. The all-float correctness oracle is selected
+  explicitly and cannot inherit this production default.
+- Replay bundles record the selected evaluation profile. Eager graph replay is
+  the explicit exact-float oracle and must identify itself as such; it is not a
+  compact-cache parity mode.
+- This default does not change the unpublished `CompactQuantized` payload
+  schema. On-demand evaluation cache payloads remain `Float32Cache`; the
+  accepted profile is the baseline for subsequent compact resident/persistent
+  representation work.
 - Compact costs use one affine range per first-endpoint storage chunk. Building
   that stable range may complete missing on-demand chunks in the shared
   geometry cache, but it must not create a cost-specific cache namespace or
@@ -3833,6 +3857,14 @@
   focused `combined_q4_axis_cost_u8` scenario means a 4-base-voxel endpoint
   position quantum, the existing compact two-byte fitted-direction encoding,
   and per-chunk 8-bit total cost. An unknown scenario name is an error.
+- `position_q1_8_compact_axis_cost_sqrt_u16_max256` means a 0.125-base-voxel
+  endpoint quantum, compact fitted directions, and fixed-sqrt density `uint16`
+  cost with ceiling 256. At prediction-to-base scale 8 this is 0.015625
+  prediction voxel, not 0.125 prediction voxel. All endpoint scoring fields are
+  resampled at the rounded position, fresh fiberlet geometry and DP are built,
+  and float join costs are added exactly once. It shares canonical float
+  anchors but owns a distinct position-plus-direction fiberlet cache; all cost
+  views with the same geometry reopen that cache.
 - `--scenario all` runs the baseline once, then emits 18 comparison rows for
   every non-baseline standard scenario in deterministic matrix order. Each
   geometry group is generated at most once and later cost views reopen it.

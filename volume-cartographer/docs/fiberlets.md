@@ -1312,12 +1312,22 @@ interchange data.
 vc_fiberlets quantization-benchmark FIBER_MANIFEST FIBER_JSON OUTPUT --normal-manifest NORMAL_MANIFEST --radius 768 --threads 32
 ```
 
-The default scenario is `combined_q4_axis_cost_u8`: 4-base-voxel endpoint
-positions, compact two-byte fitted directions, and per-canonical-first-endpoint
-chunk `uint8` total costs. `--scenario NAME` selects another standard scenario;
+The default scenario is `compact_axis_cost_sqrt_u16_max256`: exact float
+endpoint positions, compact two-byte fitted directions, and the fixed
+sqrt-density `uint16` cost view with ceiling 256. `--scenario NAME` selects another standard scenario;
 `--scenario all` runs one baseline followed by all 18 non-baseline scenarios in
 their fixed matrix order. An unknown name is an error. `--length N` limits the
 reference interval in base voxels for a shorter comparison.
+
+`position_q1_8_compact_axis_cost_sqrt_u16_max256` replaces the unpublished
+`combined_q1_axis_cost_u8` matrix row. It globally rounds endpoint coordinates
+to the nearest 0.125 base voxel, uses compact fitted directions, and applies the
+fixed sqrt-density `uint16` cost view with ceiling 256. Positive half steps
+round upward. At prediction-to-base scale 8, the position quantum is 0.015625
+prediction voxel; it is not one eighth of a prediction voxel. Endpoint
+prediction direction, presence, validity, and Lasagna normal are resampled at
+the rounded coordinates before fresh Hermite construction, dense sampling,
+DP, and graph replay. Join costs remain float and are added once.
 
 `compact_axis_cost_u8` and `compact_axis_cost_u16` keep float endpoint
 positions, use compact two-byte fitted directions, and decode the stored float
@@ -1345,6 +1355,28 @@ a completed compact-axis cache is reused without range scans, anchor
 extraction, fiberlet DP, new payloads, or payload rewrites. Result rows and
 replay JSON identify `sqrt_per_prediction_voxel` and the fixed ceiling.
 
+Normal cache-backed `fiberlet-replay` uses this profile by default. It shares
+the canonical float anchor cache, generates or reopens the compact-direction
+fiberlet namespace, and applies the fixed sqrt-density `uint16` view while
+ranking graph edges. Its replay bundle records the position quantum, direction
+encoding, cost width/domain/ceiling, storage chunk side, and persistent payload
+profile under `fiberlet_evaluation_profile`. `--eager-graph` remains an explicit
+exact-float diagnostic and records `exact_float_oracle` instead.
+
+The exact-float profile remains the correctness oracle used as the baseline of
+every quantization comparison. It is selected through an explicit named
+profile, not inherited from the production replay default. This default change
+does not alter the unpublished `CompactQuantized` serializer: on-demand cache
+payloads still use `Float32Cache`, while compact in-memory/persistent payloads
+will use this accepted profile when that representation is materialized.
+
+On the full Paris4 46,148-base-voxel reference interval at radius 768, beam 16,
+checkpoint 48, lookahead 384, and exact search, both the exact oracle and the
+new default produced two failures. Mean/median reference distance changed from
+5.712/3.625 base voxels to 5.611/3.549. The default differed from the oracle by
+1.172 base voxels mean and 0.172 median; its 71.778 maximum occurred around a
+shifted restart.
+
 Fiberlet caches are grouped by endpoint position quantum and fitted-direction
 encoding. Float, raw `uint8`, raw `uint16`, and fixed-sqrt `uint16` cost views
 over the same geometry reopen the same fiberlet prefixes, routes, endpoint
@@ -1358,6 +1390,14 @@ never passed to anchor extraction or DP. The selected cost precision remains
 the `cost_bits` field in each output row. `geometry_cache_cost_tag_bits` reports
 the internal compatibility tag. Storage chunk side remains part of both the
 physical cache layout and its identity.
+
+Evaluation position quanta are finite positive base-voxel spacings; zero means
+exact float positions. Fractional values are represented in cache identities
+and reports without integer truncation. They affect only derived evaluation
+geometry: canonical float anchor payloads and the unrelated compact physical
+storage header remain unchanged. Thus the 0.125 scenario reuses canonical
+anchors, creates one distinct position-plus-direction fiberlet cache on its
+first run, and reopens that cache without DP or rewrites on later runs.
 
 Each comparison writes complete baseline and scenario graph-replay JSON files
 under `OUTPUT/quantization-replays/<interval-hash>/`. It also prints one

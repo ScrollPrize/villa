@@ -2665,6 +2665,7 @@ nlohmann::json writeFiberReplayBundle(const std::filesystem::path& outputDirecto
         {"coordinates", {{"position_order", "XYZ"}, {"position_space", "base_volume"}, {"distance_unit", "base_voxels"}}},
         {"sources", input.sources},
         {"bindings", {{"trace", input.traceBinding}, {"prediction", input.predictionBinding}}},
+        {"fiberlet_evaluation_profile", input.fiberletEvaluationProfile},
         {"trace_config", {{"requested", input.requestedTraceConfig}, {"effective", input.effectiveTraceConfig}}},
         {"threshold", fiberReplayThresholdDescriptorJson(
              input.request.errorThresholdBaseVoxels)},

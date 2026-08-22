@@ -25,7 +25,7 @@ enum class FiberletCostQuantizationDomain : std::uint8_t {
 
 struct FiberletQuantizationScenario {
     std::string name;
-    int positionQuantumBaseVoxels = 0;
+    double positionQuantumBaseVoxels = 0.0;
     bool compactAxes = false;
     int costBits = 0;
     FiberletCostQuantizationDomain costDomain =
@@ -34,7 +34,7 @@ struct FiberletQuantizationScenario {
 };
 
 struct FiberletEvaluationQuantization {
-    int positionQuantumBaseVoxels = 0;
+    double positionQuantumBaseVoxels = 0.0;
     bool compactDirections = false;
     int costBits = 0;
     int storageChunkSideBaseVoxels = 512;
@@ -51,8 +51,14 @@ struct FiberletEvaluationQuantization {
     }
 };
 
+[[nodiscard]] FiberletEvaluationQuantization
+defaultFiberletReplayQuantization(int storageChunkSideBaseVoxels = 512);
+
+[[nodiscard]] FiberletEvaluationQuantization
+exactFiberletReplayQuantization(int storageChunkSideBaseVoxels = 512);
+
 struct FiberletGeometryQuantization {
-    int positionQuantumBaseVoxels = 0;
+    double positionQuantumBaseVoxels = 0.0;
     bool compactDirections = false;
 
     auto operator<=>(const FiberletGeometryQuantization&) const = default;
@@ -83,7 +89,13 @@ fiberletGeometryCacheProfile(
 [[nodiscard]] cv::Vec3f quantizeFiberletPositionForEvaluation(
     const cv::Vec3f& positionPredictionXYZ,
     const FiberPredictionGridInfo& grid,
-    int quantumBaseVoxels);
+    double quantumBaseVoxels);
+
+void validateFiberletPositionQuantumForEvaluation(double quantumBaseVoxels);
+
+[[nodiscard]] std::uint64_t fiberletPositionBinCountForEvaluation(
+    int chunkSideBaseVoxels,
+    double quantumBaseVoxels);
 
 [[nodiscard]] cv::Vec3f quantizeFiberletDirectionForEvaluation(
     const cv::Vec3f& directionXYZ);

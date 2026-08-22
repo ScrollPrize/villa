@@ -9,15 +9,18 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <iomanip>
 #include <iterator>
 #include <limits>
 #include <map>
 #include <numeric>
 #include <numbers>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <tuple>
 
@@ -523,15 +526,14 @@ QuantizedAnchorLayout quantizeAnchors(
     const LoadedFiberAnchorArtifact& baselineAnchors,
     const FiberletPathReport& paths,
     const std::vector<size_t>& successful,
-    int quantum,
+    double quantum,
     bool useCompactAxes,
     int chunkSide,
     FiberletQuantizationScenarioReport& report)
 {
-    if (quantum < 0 || chunkSide <= 0 || (quantum > 0 && chunkSide % quantum != 0))
-        throw std::invalid_argument("anchor position quantum does not divide chunk side");
+    const std::uint64_t bins =
+        fiberletPositionBinCountForEvaluation(chunkSide, quantum);
     if (quantum > 0) {
-        const int64_t bins = chunkSide / quantum;
         report.anchorPositionBits = bins <= 256 ? 8 : bins <= 65536 ? 16 : 0;
         if (report.anchorPositionBits == 0)
             throw std::invalid_argument("anchor chunk-local position exceeds uint16");
@@ -540,7 +542,8 @@ QuantizedAnchorLayout quantizeAnchors(
     QuantizedAnchorLayout layout;
     layout.loaded = baselineAnchors;
     const double scale = paths.grid.predictionToBaseScale;
-    std::map<std::array<int64_t, 3>, std::size_t> quantizedPositionCounts;
+    std::map<std::array<std::uint32_t, 3>, std::size_t>
+        quantizedPositionCounts;
     SummaryBuilder positionErrors;
     SummaryBuilder axisErrors;
     for (auto& cell : layout.loaded.report.nonEmptyCells) {
@@ -556,19 +559,13 @@ QuantizedAnchorLayout quantizeAnchors(
                 static_cast<uint8_t>(componentIndex)};
             anchor.positionPredictionXYZ = sourcePosition;
             if (quantum > 0) {
-                std::array<int64_t, 3> quantizedPosition{};
+                anchor.positionPredictionXYZ =
+                    quantizeFiberletPositionForEvaluation(
+                        sourcePosition, paths.grid, quantum);
+                std::array<std::uint32_t, 3> quantizedPosition{};
                 for (size_t axis = 0; axis < 3; ++axis) {
-                    const double base = static_cast<double>(sourcePosition[axis]) * scale;
-                    if (!(base >= 0.0) || !std::isfinite(base))
-                        throw std::invalid_argument("anchor position is outside nonnegative volume coordinates");
-                    quantizedPosition[axis] = static_cast<int64_t>(
-                        std::floor(base / static_cast<double>(quantum) + 0.5));
-                    const double decodedBase = static_cast<double>(
-                        quantizedPosition[axis] * quantum);
-                    const size_t shapeAxis = paths.grid.shapeZYX[2 - axis];
-                    if (!(decodedBase < static_cast<double>(shapeAxis) * scale))
-                        throw std::invalid_argument("quantized anchor position leaves the prediction volume");
-                    anchor.positionPredictionXYZ[axis] = static_cast<float>(decodedBase / scale);
+                    quantizedPosition[axis] = std::bit_cast<std::uint32_t>(
+                        anchor.positionPredictionXYZ[static_cast<int>(axis)]);
                 }
                 ++quantizedPositionCounts[quantizedPosition];
                 positionErrors.values.push_back(length(anchor.positionPredictionXYZ - sourcePosition) * scale);
@@ -899,9 +896,10 @@ FiberletQuantizationScenarioReport compareScenario(
 cv::Vec3f quantizeFiberletPositionForEvaluation(
     const cv::Vec3f& positionPredictionXYZ,
     const FiberPredictionGridInfo& grid,
-    int quantumBaseVoxels)
+    double quantumBaseVoxels)
 {
-    if (quantumBaseVoxels <= 0)
+    validateFiberletPositionQuantumForEvaluation(quantumBaseVoxels);
+    if (quantumBaseVoxels == 0.0)
         return positionPredictionXYZ;
     if (!(grid.predictionToBaseScale > 0.0) ||
         !std::isfinite(grid.predictionToBaseScale)) {
@@ -915,8 +913,8 @@ cv::Vec3f quantizeFiberletPositionForEvaluation(
         if (!(base >= 0.0) || !std::isfinite(base))
             throw std::invalid_argument(
                 "fiberlet evaluation position is outside nonnegative coordinates");
-        const double decodedBase = static_cast<double>(quantumBaseVoxels) *
-            std::floor(base / static_cast<double>(quantumBaseVoxels) + 0.5);
+        const double decodedBase = quantumBaseVoxels *
+            std::floor(base / quantumBaseVoxels + 0.5);
         const size_t shapeAxis = grid.shapeZYX[2 - xyz];
         if (!(decodedBase < static_cast<double>(shapeAxis) *
                 grid.predictionToBaseScale)) {
@@ -927,6 +925,41 @@ cv::Vec3f quantizeFiberletPositionForEvaluation(
             decodedBase / grid.predictionToBaseScale);
     }
     return result;
+}
+
+void validateFiberletPositionQuantumForEvaluation(double quantumBaseVoxels)
+{
+    if (quantumBaseVoxels == 0.0)
+        return;
+    if (!(quantumBaseVoxels > 0.0) || !std::isfinite(quantumBaseVoxels)) {
+        throw std::invalid_argument(
+            "fiberlet evaluation position quantum must be zero or positive and finite");
+    }
+}
+
+std::uint64_t fiberletPositionBinCountForEvaluation(
+    int chunkSideBaseVoxels,
+    double quantumBaseVoxels)
+{
+    validateFiberletPositionQuantumForEvaluation(quantumBaseVoxels);
+    if (chunkSideBaseVoxels <= 0)
+        throw std::invalid_argument(
+            "fiberlet evaluation position chunk side must be positive");
+    if (quantumBaseVoxels == 0.0)
+        return 0;
+    const double bins =
+        static_cast<double>(chunkSideBaseVoxels) / quantumBaseVoxels;
+    const double roundedBins = std::round(bins);
+    const double tolerance = 16.0 * std::numeric_limits<double>::epsilon() *
+        std::max(1.0, std::abs(bins));
+    if (!(roundedBins >= 1.0) || !std::isfinite(roundedBins) ||
+        std::abs(bins - roundedBins) > tolerance ||
+        roundedBins > static_cast<double>(
+            std::numeric_limits<std::uint64_t>::max())) {
+        throw std::invalid_argument(
+            "fiberlet evaluation position quantum does not form an integral chunk grid");
+    }
+    return static_cast<std::uint64_t>(roundedBins);
 }
 
 cv::Vec3f quantizeFiberletDirectionForEvaluation(
@@ -1080,6 +1113,38 @@ std::vector<float> quantizeFiberletCostsForEvaluation(
     return result;
 }
 
+FiberletEvaluationQuantization defaultFiberletReplayQuantization(
+    int storageChunkSideBaseVoxels)
+{
+    if (storageChunkSideBaseVoxels <= 0)
+        throw std::invalid_argument(
+            "fiberlet replay storage chunk side must be positive");
+    return {
+        0.0,
+        true,
+        16,
+        storageChunkSideBaseVoxels,
+        FiberletCostQuantizationDomain::SqrtPerPredictionVoxel,
+        256.0F,
+    };
+}
+
+FiberletEvaluationQuantization exactFiberletReplayQuantization(
+    int storageChunkSideBaseVoxels)
+{
+    if (storageChunkSideBaseVoxels <= 0)
+        throw std::invalid_argument(
+            "fiberlet replay storage chunk side must be positive");
+    return {
+        0.0,
+        false,
+        0,
+        storageChunkSideBaseVoxels,
+        FiberletCostQuantizationDomain::RawTotal,
+        0.0F,
+    };
+}
+
 std::vector<FiberletQuantizationScenario> standardFiberletQuantizationScenarios()
 {
     std::vector<FiberletQuantizationScenario> result{
@@ -1100,7 +1165,18 @@ std::vector<FiberletQuantizationScenario> standardFiberletQuantizationScenarios(
     };
     for (const int quantum : {1, 2, 4}) {
         for (const int bits : {8, 16}) {
-            result.push_back({"combined_q" + std::to_string(quantum) + "_axis_cost_u" + std::to_string(bits), quantum, true, bits});
+            if (quantum == 1 && bits == 8) {
+                result.push_back({
+                    "position_q1_8_compact_axis_cost_sqrt_u16_max256",
+                    0.125,
+                    true,
+                    16,
+                    FiberletCostQuantizationDomain::SqrtPerPredictionVoxel,
+                    256.0F,
+                });
+            } else {
+                result.push_back({"combined_q" + std::to_string(quantum) + "_axis_cost_u" + std::to_string(bits), quantum, true, bits});
+            }
         }
     }
     return result;
@@ -1109,6 +1185,9 @@ std::vector<FiberletQuantizationScenario> standardFiberletQuantizationScenarios(
 FiberletGeometryCacheProfile fiberletGeometryCacheProfile(
     FiberletEvaluationQuantization replayQuantization)
 {
+    (void)fiberletPositionBinCountForEvaluation(
+        replayQuantization.storageChunkSideBaseVoxels,
+        replayQuantization.positionQuantumBaseVoxels);
     const bool quantizedGeometry =
         replayQuantization.positionQuantumBaseVoxels > 0 ||
         replayQuantization.compactDirections;
@@ -1189,7 +1268,7 @@ std::vector<FiberletQuantizationScenarioReport> benchmarkFiberletQuantization(
         FiberletGraphReplayResult replay;
         double wallSeconds = 0.0;
     };
-    using GeometryKey = std::pair<int, bool>;
+    using GeometryKey = std::pair<double, bool>;
     std::map<GeometryKey, GeometryRun> geometries;
     GeometryRun baselineGeometry;
     baselineGeometry.valid = true;
@@ -1207,7 +1286,10 @@ std::vector<FiberletQuantizationScenarioReport> benchmarkFiberletQuantization(
             return std::string{"compact_axis"};
         if (!key.second)
             return std::string{"position_q"} + std::to_string(key.first);
-        return std::string{"position_q"} + std::to_string(key.first) + "_compact_axis";
+        std::ostringstream result;
+        result << std::setprecision(17) << "position_q" << key.first
+               << "_compact_axis";
+        return result.str();
     };
     const auto geometry = [&](const GeometryKey& key) -> GeometryRun& {
         if (const auto found = geometries.find(key); found != geometries.end())
