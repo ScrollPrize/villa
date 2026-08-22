@@ -25,7 +25,6 @@ add_library(vc_core
         src/Tiff.cpp
         src/Zarr.cpp
         src/VcDataset.cpp
-        src/CacheCompression.cpp
         src/LoadJson.cpp
         src/RemoteUrl.cpp
         src/RemoteFileCache.cpp
@@ -36,13 +35,16 @@ add_library(vc_core
         src/surface_metrics.cpp
         src/Thinning.cpp
         src/Umbilicus.cpp
+        src/ScrollUmbilicus.cpp
         src/render/ChunkCache.cpp
+        src/render/ChunkRequestScheduler.cpp
         src/render/DecodedChunkCacheBudget.cpp
         src/render/PersistentZarrCacheBudget.cpp
         src/render/ChunkedPlaneSampler.cpp
         src/render/SurfaceCache.cpp
         src/render/Colormaps.cpp
         src/render/PostProcess.cpp
+        src/render/ZarrDownloadBenchmark.cpp
         src/render/ZarrChunkFetcher.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../apps/src/vc_merge_tifxyz_grid.cpp
         ${CMAKE_CURRENT_BINARY_DIR}/Version.cpp
@@ -70,6 +72,7 @@ target_link_libraries(vc_core
 target_link_libraries(vc_core PUBLIC
     $<BUILD_INTERFACE:utils>
     $<BUILD_INTERFACE:utils_c3d_codec>
+    vc_delta3d::vc_delta3d
 )
 target_link_libraries(vc_core PRIVATE
     Blosc::blosc

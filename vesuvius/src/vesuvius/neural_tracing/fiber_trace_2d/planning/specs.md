@@ -184,6 +184,32 @@
 - Automatic OME-Zarr download uses `--download-workers` independently of
   inference prefetch, GPU slots, and pyramid workers. It defaults to 64 and
   must be positive even when automatic download is disabled.
+- Fiber and Lasagna expose the same opt-in `--live-fetch` selected-level disk
+  cache through the shared runner. It is valid only for full, non-cropped
+  inference on a local numeric OME-Zarr-v2 level backed by S3 `_download`
+  metadata, and conflicts with `--no-download`. The disk target defaults to
+  10240 GiB (10 TiB), the materialization window defaults to 10,000 canonical
+  tile descriptors, and `--download-workers` controls raw chunk transfers.
+  This descriptor window is independent of the smaller TensorStore full-tile
+  read window and must not materialize a global Cartesian job list.
+- Live source support is authoritative per active remote Z-chunk inventory;
+  transient local absence and advisory `.noremote` data cannot suppress valid
+  inference. Completed output work is rejected before remote materialization.
+  Downloads use unique temporary files and atomic replacement, and terminal
+  list/GET/write failure is fatal rather than reclassified as masked fill.
+- Live cache accounting and deletion apply only to valid chunks in the exact
+  selected scale. On each completely committed canonical model Z row, the
+  runner advances a safe input frontier. If actual completed resident bytes
+  exceed the target, it removes oldest whole cached Z-chunk planes whose ends
+  are at or before that frontier, repeating until under target or no safe plane
+  remains. It never evicts by Y/X, LRU, or ahead of inference; insufficient
+  obsolete data permits a reported temporary overshoot.
+- Cooperating ordinary inference readers hold a shared selected-level advisory
+  lock, while live mutation and bulk download hold the exclusive lock. Lock
+  files live below `.dl_cache`; non-cooperating external readers are outside
+  this protection. Live mode initially supports only the primary input source;
+  separately remote Lasagna `pred_dt` is rejected while local `pred_dt` remains
+  supported.
 - `.dl_cache/<level>.noremote.json` is advisory only. Missing, unreadable,
   malformed, or schema-invalid cache data warns and behaves as an empty set;
   it must never abort inference or suppress remote validation. Saves snapshot

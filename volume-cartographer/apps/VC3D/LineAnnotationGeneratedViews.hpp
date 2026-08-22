@@ -1,5 +1,7 @@
 #pragma once
 
+#include "vc/lasagna/LineViewBuilder.hpp"
+
 #include <opencv2/core/types.hpp>
 
 #include <QPoint>
@@ -133,6 +135,9 @@ struct GeneratedOverlay {
     bool emphasizedPointMarker = false;
     bool useSurfaceCenterLine = false;
     bool currentLineMarkerAsCross = false;
+    // Present for strip overlays. Line positions above remain in original
+    // LineModel point-index coordinates and are mapped only while projecting.
+    vc::lasagna::LineStripPositionMap stripPositionMap;
 };
 
 struct GeneratedSpanAlignmentMetric {
@@ -177,6 +182,7 @@ struct GeneratedViews {
     std::shared_ptr<PlaneSurface> sideCutSurface;
     std::vector<cv::Vec3f> linePoints;
     std::vector<cv::Vec3f> lineUpVectors;
+    vc::lasagna::LineStripPositionMap stripPositionMap;
     // Per-line-point sampled sheet normals, sign-oriented away from the
     // scroll center (NaN where the sample is invalid). Empty when
     // unavailable.
@@ -1010,190 +1016,6 @@ inline std::optional<double> generatedArrowPanStopTarget(
     return best;
 }
 
-// One extra pan target beyond the outermost control point in `direction`: the
-// outer control point plus the max-control-point-distance allowance, clamped
-// to `lineEndPosition` (the end of the extrapolated line) - whichever is
-// shorter. `maxControlPointDistance` uses the same line-position
-// interpretation as the current-line marker state; a non-finite or <= 0 value
-// means unlimited (the line end alone bounds the hop). Returns nullopt when
-// there are no finite control positions or no room beyond the outer one.
-inline std::optional<double> generatedArrowPanBoundaryTarget(
-    const std::vector<double>& sortedControlLinePositions,
-    int direction,
-    double lineEndPosition,
-    double maxControlPointDistance)
-{
-    if (direction == 0 || !std::isfinite(lineEndPosition)) {
-        return std::nullopt;
-    }
-    std::optional<double> outer;
-    for (const double position : sortedControlLinePositions) {
-        if (!std::isfinite(position)) {
-            continue;
-        }
-        if (!outer || (direction > 0 ? position > *outer : position < *outer)) {
-            outer = position;
-        }
-    }
-    if (!outer) {
-        return std::nullopt;
-    }
-    double limit = lineEndPosition;
-    if (std::isfinite(maxControlPointDistance) && maxControlPointDistance > 0.0) {
-        limit = (direction > 0) ? std::min(limit, *outer + maxControlPointDistance)
-                                : std::max(limit, *outer - maxControlPointDistance);
-    }
-    if (direction > 0 ? limit <= *outer : limit >= *outer) {
-        return std::nullopt;
-    }
-    return limit;
-}
-
-inline bool generatedControlPointPlacementWithinAnyDistance(
-    double linePosition,
-    const std::vector<double>& controlLinePositions,
-    double maxDistance,
-    double existingControlTolerance = 0.5)
-{
-    if (!std::isfinite(maxDistance) || maxDistance <= 0.0) {
-        return true;
-    }
-    if (!std::isfinite(linePosition)) {
-        return false;
-    }
-
-    bool hasFiniteControl = false;
-    double nearestDistance = std::numeric_limits<double>::infinity();
-    for (const double controlPosition : controlLinePositions) {
-        if (!std::isfinite(controlPosition)) {
-            continue;
-        }
-        hasFiniteControl = true;
-        const double distance = std::abs(controlPosition - linePosition);
-        if (distance <= existingControlTolerance) {
-            return true;
-        }
-        nearestDistance = std::min(nearestDistance, distance);
-    }
-    if (!hasFiniteControl) {
-        return controlLinePositions.empty();
-    }
-    return nearestDistance <= maxDistance + 1.0e-6;
-}
-
-inline bool generatedControlPointPlacementWithinPreviousDistance(
-    double linePosition,
-    const std::vector<double>& controlLinePositions,
-    double maxDistance,
-    double existingControlTolerance = 0.5)
-{
-    return generatedControlPointPlacementWithinAnyDistance(linePosition,
-                                                          controlLinePositions,
-                                                          maxDistance,
-                                                          existingControlTolerance);
-}
-
-inline bool generatedControlPointPlacementWithinPreviousDistance(
-    double linePosition,
-    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
-    double maxDistance,
-    double existingControlTolerance = 0.5)
-{
-    std::vector<double> positions;
-    positions.reserve(controlPoints.size());
-    for (const auto& control : controlPoints) {
-        positions.push_back(control.linePosition);
-    }
-    return generatedControlPointPlacementWithinPreviousDistance(linePosition,
-                                                               positions,
-                                                               maxDistance,
-                                                               existingControlTolerance);
-}
-
-inline bool generatedControlPointPlacementWithinAnyDistance(
-    double linePosition,
-    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
-    double maxDistance,
-    double existingControlTolerance = 0.5)
-{
-    std::vector<double> positions;
-    positions.reserve(controlPoints.size());
-    for (const auto& control : controlPoints) {
-        positions.push_back(control.linePosition);
-    }
-    return generatedControlPointPlacementWithinAnyDistance(linePosition,
-                                                          positions,
-                                                          maxDistance,
-                                                          existingControlTolerance);
-}
-
-inline bool generatedLinePositionWithinAnyControlDistance(
-    double linePosition,
-    const std::vector<double>& controlLinePositions,
-    double maxDistance)
-{
-    if (!std::isfinite(maxDistance) || maxDistance <= 0.0) {
-        return true;
-    }
-    if (!std::isfinite(linePosition)) {
-        return false;
-    }
-
-    constexpr double kExactControlTolerance = 1.0e-6;
-    bool hasFiniteControl = false;
-    double nearestDistance = std::numeric_limits<double>::infinity();
-    for (const double controlPosition : controlLinePositions) {
-        if (!std::isfinite(controlPosition)) {
-            continue;
-        }
-        hasFiniteControl = true;
-        const double distance = std::abs(controlPosition - linePosition);
-        if (distance <= kExactControlTolerance) {
-            return true;
-        }
-        nearestDistance = std::min(nearestDistance, distance);
-    }
-    if (!hasFiniteControl) {
-        return controlLinePositions.empty();
-    }
-    return nearestDistance <= maxDistance + 1.0e-6;
-}
-
-inline bool generatedLinePositionWithinPreviousControlDistance(
-    double linePosition,
-    const std::vector<double>& controlLinePositions,
-    double maxDistance)
-{
-    return generatedLinePositionWithinAnyControlDistance(linePosition,
-                                                        controlLinePositions,
-                                                        maxDistance);
-}
-
-inline bool generatedLinePositionWithinAnyControlDistance(
-    double linePosition,
-    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
-    double maxDistance)
-{
-    std::vector<double> positions;
-    positions.reserve(controlPoints.size());
-    for (const auto& control : controlPoints) {
-        positions.push_back(control.linePosition);
-    }
-    return generatedLinePositionWithinAnyControlDistance(linePosition,
-                                                        positions,
-                                                        maxDistance);
-}
-
-inline bool generatedLinePositionWithinPreviousControlDistance(
-    double linePosition,
-    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
-    double maxDistance)
-{
-    return generatedLinePositionWithinAnyControlDistance(linePosition,
-                                                        controlPoints,
-                                                        maxDistance);
-}
-
 inline std::optional<size_t> nearestGeneratedControlPointIndex(
     const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
     const cv::Vec3f& point)
@@ -1244,6 +1066,7 @@ inline GeneratedOverlay makeGeneratedStripOverlay(
     overlay.controlPoints = views.controlPoints;
     overlay.predSnapPoints = views.predSnapPoints;
     overlay.markerLinePositions = markerLinePositions;
+    overlay.stripPositionMap = views.stripPositionMap;
     return overlay;
 }
 
@@ -1257,6 +1080,7 @@ inline GeneratedOverlay makeGeneratedStaticStripOverlay(const GeneratedViews& vi
     overlay.useSurfaceCenterLine = true;
     overlay.controlPoints = views.controlPoints;
     overlay.predSnapPoints = views.predSnapPoints;
+    overlay.stripPositionMap = views.stripPositionMap;
     return overlay;
 }
 
@@ -1269,6 +1093,7 @@ inline GeneratedOverlay makeGeneratedDynamicStripOverlay(
     overlay.useSurfaceCenterLine = true;
     overlay.currentLinePosition = currentLinePosition;
     overlay.markerLinePositions = markerLinePositions;
+    overlay.stripPositionMap = views.stripPositionMap;
     return overlay;
 }
 
@@ -1353,6 +1178,7 @@ struct GeneratedControlPointContextMenuOptions {
     size_t linePointCount = 0;
     double linePosition = std::numeric_limits<double>::quiet_NaN();
     bool stripViewer = false;
+    vc::lasagna::LineStripPositionMap stripPositionMap;
     bool linkWithCandidateEnabled = false;
     QString linkWithCandidateLabel;
     bool mergeWithCandidateEnabled = false;
@@ -1381,9 +1207,11 @@ struct GeneratedControlPointContextMenuOptions {
 
 QPointF generatedStripLinePositionToScene(CChunkedVolumeViewer* viewer,
                                           QuadSurface* surface,
-                                          double linePosition);
+                                          double linePosition,
+                                          const vc::lasagna::LineStripPositionMap* positionMap = nullptr);
 double generatedLinePositionFromStripScene(CChunkedVolumeViewer* viewer,
-                                           const QPointF& scenePoint);
+                                           const QPointF& scenePoint,
+                                           const vc::lasagna::LineStripPositionMap* positionMap = nullptr);
 std::optional<float> generatedCrossSliceControlPointDistanceThreshold(CChunkedVolumeViewer* viewer);
 GeneratedOverlay makeGeneratedCrossSliceOverlayForPlane(const GeneratedViews& views,
                                                         double linePosition,

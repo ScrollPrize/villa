@@ -17,7 +17,6 @@ class Volume;
 class QuadSurface;
 class Surface;
 class VCCollection;
-namespace vc::render { class DecodedChunkCacheBudget; }
 
 struct POI
 {
@@ -34,10 +33,8 @@ class CState : public QObject
     Q_OBJECT
 
 public:
-    explicit CState(
-        size_t cacheSizeBytes,
-        QObject* parent = nullptr,
-        std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedCacheBudget = {});
+    explicit CState(QObject* parent = nullptr,
+                    bool debugDownloadQueue = false);
     ~CState();
 
     // --- VolumePkg ---
@@ -64,9 +61,7 @@ public:
     // --- Collections ---
     VCCollection* pointCollection() const;
 
-    // --- Cache budget ---
-    size_t cacheSizeBytes() const;
-    std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedCacheBudget() const;
+    bool debugDownloadQueueEnabled() const { return _debugDownloadQueue; }
 
     // --- Teardown ---
     void closeAll();
@@ -96,8 +91,15 @@ public:
     std::vector<POI*> pois();
     std::vector<std::string> poiNames();
 
+    // Announces that the project's attached umbilicus changed. Nothing else
+    // reports it: setUmbilicus() only persists a project field, so a consumer
+    // holding geometry placed relative to the umbilicus has no way to hear about
+    // an attach or a detach.
+    void notifyUmbilicusChanged() { emit umbilicusChanged(); }
+
 signals:
     void vpkgChanged(std::shared_ptr<VolumePkg> vpkg);
+    void umbilicusChanged();
     void volumeChanged(std::shared_ptr<Volume> volume, const std::string& volumeId);
     void surfacesLoaded();
     void volumeClosing();
@@ -108,7 +110,6 @@ signals:
     void poiChanged(std::string, POI*);
 
 private:
-    void applyCacheBudget(const std::shared_ptr<Volume>& vol) const;
     void resolveCurrentVolumeId();
 
     std::shared_ptr<VolumePkg> _vpkg;
@@ -120,8 +121,7 @@ private:
 
     VCCollection* _pointCollection;
 
-    size_t _cacheSizeBytes;
-    std::shared_ptr<vc::render::DecodedChunkCacheBudget> _decodedCacheBudget;
+    bool _debugDownloadQueue = false;
 
     // Surface/POI data (formerly in CSurfaceCollection)
     std::unordered_map<std::string, std::shared_ptr<Surface>> _surfs;

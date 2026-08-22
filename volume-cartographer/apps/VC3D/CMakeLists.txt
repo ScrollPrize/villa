@@ -33,6 +33,8 @@ set(srcs
     FiberNameDisplay.hpp
     FiberSliceGeometry.cpp
     FiberSliceGeometry.hpp
+    AnnotationFrame.hpp
+    UmbilicusOrientationFreshness.hpp
     LineAnnotationController.cpp
     LineAnnotationController.hpp
     LineAnnotationFiberSegments.cpp
@@ -93,6 +95,10 @@ set(srcs
     elements/RangeSlider.hpp
     elements/ViewerStatsBar.cpp
     elements/ViewerStatsBar.hpp
+    elements/DownloadQueueStats.cpp
+    elements/DownloadQueueStats.hpp
+    elements/DownloadQueueDebugOverlay.cpp
+    elements/DownloadQueueDebugOverlay.hpp
     elements/ViewerSplitGrid.cpp
     elements/ViewerSplitGrid.hpp
     RemoteVolumeCachePaths.cpp
@@ -212,6 +218,8 @@ set(srcs
     SpiralSshTunnel.hpp
     SpiralPanel.cpp
     SpiralPanel.hpp
+    SpiralMinimap.cpp
+    SpiralMinimap.hpp
     SpiralWorkspace.cpp
     SpiralWorkspace.hpp
     LasagnaBatchWindow.cpp
@@ -405,13 +413,20 @@ endif()
 # The manager checks this location after the development-tree and explicit
 # SPIRAL_SERVICE_PATH candidates.  Install the complete module set because the
 # service deliberately reuses the existing fitter rather than duplicating it.
-install(DIRECTORY ${CMAKE_SOURCE_DIR}/scripts/spiral/
+install(DIRECTORY ${CMAKE_SOURCE_DIR}/../spiral-fitting/
     DESTINATION share/volume-cartographer/spiral
     FILES_MATCHING
         PATTERN "*.py"
         PATTERN "*.json"
         PATTERN "tests" EXCLUDE
-        PATTERN "__pycache__" EXCLUDE)
+        PATTERN "__pycache__" EXCLUDE
+        PATTERN ".venv" EXCLUDE
+        PATTERN "build" EXCLUDE
+        PATTERN "dist" EXCLUDE
+        PATTERN "_skbuild" EXCLUDE
+        PATTERN ".pytest_cache" EXCLUDE
+        PATTERN ".mypy_cache" EXCLUDE
+        PATTERN ".ruff_cache" EXCLUDE)
 
 set(_vc3d_fiber_format_src
     "${CMAKE_SOURCE_DIR}/../vesuvius/src/vc3d_fiber_format")

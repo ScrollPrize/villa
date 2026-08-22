@@ -17,6 +17,163 @@ SamplingStrategy = Literal[
 ]
 
 
+@dataclass(frozen=True)
+class DinoGuidedLabelConfig:
+    """Frozen inputs for the v1/v2 DINO-guided label recipe."""
+
+    kind: Literal["dino_guided"]
+    unet_ckpt: Path
+    dino_ckpt: Path
+    ref_embedding: Path
+    dino_stride: int
+    dino_minibatch: int
+    dino_blend_sigma: float
+    threshold: float
+    input_mask_threshold: float | None
+
+
+@dataclass(frozen=True)
+class SelfDistillLabelConfig:
+    """Frozen inputs for the v3 teacher-student label recipe."""
+
+    kind: Literal["self_distill"]
+    primary_ckpt: Path
+    ensemble_ckpt: Path
+    primary_threshold: float
+    ensemble_threshold: float
+    mean_hi: float
+    std_lo: float
+    tta: bool
+    input_mask_threshold: float
+
+
+DynamicLabelConfig = DinoGuidedLabelConfig | SelfDistillLabelConfig
+
+
+@dataclass(frozen=True)
+class ExtraPatchesConfig:
+    """Optional v3 coordinate-patch sampling controls."""
+
+    enabled: bool = False
+    coords_xyz: tuple[tuple[int, int, int], ...] = ()
+    jitter: int = 1024
+    fraction: float = 0.25
+
+
+def _required_path(authored: Mapping[str, Any], key: str, *, parent: str) -> Path:
+    value = authored.get(key)
+    if value in (None, ""):
+        raise ValueError(f"{parent}.{key} is required")
+    return Path(str(value))
+
+
+def _dynamic_label_config(
+    authored: Mapping[str, Any], *, mode: str, patch_size: tuple[int, int, int]
+) -> DynamicLabelConfig | None:
+    value = authored.get("dynamic_label") or {}
+    if not isinstance(value, Mapping):
+        raise TypeError("dynamic_label must be an object or null")
+    if not bool(value.get("enabled", False)):
+        return None
+    if mode != "full_3d":
+        raise ValueError("dynamic_label is supported only in mode='full_3d'")
+    if patch_size != (256, 256, 256):
+        raise ValueError(
+            "dynamic_label requires patch_size [256, 256, 256], got "
+            f"{list(patch_size)!r}"
+        )
+    kind = str(value.get("kind", "dino_guided")).strip().lower()
+    if kind == "dino_guided":
+        stride = int(value.get("dino_stride", 64))
+        minibatch = int(value.get("dino_minibatch", 8))
+        sigma = float(value.get("dino_blend_sigma", 4.0))
+        threshold = float(value.get("threshold", 0.5))
+        mask_threshold = value.get("input_mask_threshold")
+        if stride <= 0 or minibatch <= 0 or sigma <= 0.0:
+            raise ValueError(
+                "dynamic_label DINO stride, minibatch, and blend sigma must be positive"
+            )
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("dynamic_label.threshold must be in [0,1]")
+        return DinoGuidedLabelConfig(
+            kind="dino_guided",
+            unet_ckpt=_required_path(value, "unet_ckpt", parent="dynamic_label"),
+            dino_ckpt=_required_path(value, "dino_ckpt", parent="dynamic_label"),
+            ref_embedding=_required_path(
+                value, "ref_embedding", parent="dynamic_label"
+            ),
+            dino_stride=stride,
+            dino_minibatch=minibatch,
+            dino_blend_sigma=sigma,
+            threshold=threshold,
+            input_mask_threshold=(
+                None if mask_threshold is None else float(mask_threshold)
+            ),
+        )
+    if kind == "self_distill":
+        primary_threshold = float(value["primary_threshold"])
+        ensemble_threshold = float(value["ensemble_threshold"])
+        if not 0.0 <= primary_threshold <= 1.0:
+            raise ValueError("dynamic_label.primary_threshold must be in [0,1]")
+        if not 0.0 <= ensemble_threshold <= 1.0:
+            raise ValueError("dynamic_label.ensemble_threshold must be in [0,1]")
+        return SelfDistillLabelConfig(
+            kind="self_distill",
+            primary_ckpt=_required_path(
+                value, "primary_ckpt", parent="dynamic_label"
+            ),
+            ensemble_ckpt=_required_path(
+                value, "ensemble_ckpt", parent="dynamic_label"
+            ),
+            primary_threshold=primary_threshold,
+            ensemble_threshold=ensemble_threshold,
+            mean_hi=float(value["mean_hi"]),
+            std_lo=float(value["std_lo"]),
+            tta=bool(value.get("tta", True)),
+            input_mask_threshold=float(value.get("input_mask_threshold", 50.0)),
+        )
+    raise ValueError(
+        "dynamic_label.kind must be 'dino_guided' or 'self_distill', "
+        f"got {kind!r}"
+    )
+
+
+def _extra_patches_config(
+    authored: Mapping[str, Any], *, dynamic_label: DynamicLabelConfig | None
+) -> ExtraPatchesConfig:
+    value = authored.get("extra_patches") or {}
+    if not isinstance(value, Mapping):
+        raise TypeError("extra_patches must be an object or null")
+    if not bool(value.get("enabled", False)):
+        return ExtraPatchesConfig()
+    if not isinstance(dynamic_label, SelfDistillLabelConfig):
+        raise ValueError("extra_patches requires dynamic_label.kind='self_distill'")
+    coords_value = value.get("coords_xyz") or ()
+    if not isinstance(coords_value, (list, tuple)):
+        raise TypeError("extra_patches.coords_xyz must be an array")
+    coords: list[tuple[int, int, int]] = []
+    for index, coord in enumerate(coords_value):
+        if not isinstance(coord, (list, tuple)) or len(coord) != 3:
+            raise ValueError(
+                f"extra_patches.coords_xyz[{index}] must be one XYZ triple"
+            )
+        coords.append(tuple(int(item) for item in coord))
+    if not coords:
+        raise ValueError("extra_patches.coords_xyz cannot be empty")
+    jitter = int(value.get("jitter", 1024))
+    fraction = float(value.get("fraction", 0.25))
+    if jitter < 0:
+        raise ValueError("extra_patches.jitter must be nonnegative")
+    if not 0.0 < fraction < 1.0:
+        raise ValueError("extra_patches.fraction must be in (0,1)")
+    return ExtraPatchesConfig(
+        enabled=True,
+        coords_xyz=tuple(coords),
+        jitter=jitter,
+        fraction=fraction,
+    )
+
+
 class _FrozenMapping(Mapping):
     """Small ordered immutable mapping that remains safe across spawn/pickle."""
 
@@ -1295,6 +1452,10 @@ class TrainingConfig:
     sampling_audit_every: int
     verify_finite_gradients_steps: int
     max_amp_overflow_events: int
+    dynamic_label: DynamicLabelConfig | None
+    extra_patches: ExtraPatchesConfig
+    force_full_supervision: bool
+    save_iterations: tuple[int, ...]
 
     @classmethod
     def from_mapping(cls, canonical: Mapping[str, Any]) -> "TrainingConfig":
@@ -1342,6 +1503,45 @@ class TrainingConfig:
         if "wandb_project" in canonical and "wandb_entity" not in canonical:
             raise ValueError("wandb_project requires wandb_entity")
         raw_wandb_run_id = canonical.get("wandb_run_id")
+        dynamic_label = _dynamic_label_config(
+            canonical,
+            mode=ink.data.mode,
+            patch_size=ink.data.patch_size,
+        )
+        extra_patches = _extra_patches_config(
+            canonical, dynamic_label=dynamic_label
+        )
+        if extra_patches.enabled and ink.data.sampling.strategy != "uniform":
+            raise ValueError(
+                "extra_patches requires sampling_strategy='uniform'"
+            )
+        force_full_supervision = bool(
+            canonical.get("force_full_supervision", False)
+        )
+        if force_full_supervision and not isinstance(
+            dynamic_label, SelfDistillLabelConfig
+        ):
+            raise ValueError(
+                "force_full_supervision requires dynamic_label.kind='self_distill'"
+            )
+        if (
+            dynamic_label is not None
+            and ink.data.discovery_mode == "unlabeled"
+            and not force_full_supervision
+        ):
+            raise ValueError(
+                "dynamic_label with patch_discovery_mode='unlabeled' requires "
+                "force_full_supervision=true"
+            )
+        save_iterations_value = canonical.get("save_iterations") or ()
+        if not isinstance(save_iterations_value, (list, tuple)):
+            raise TypeError("save_iterations must be an array")
+        save_iterations = tuple(sorted({int(item) for item in save_iterations_value}))
+        if any(item <= 0 or item > num_iterations for item in save_iterations):
+            raise ValueError(
+                "save_iterations values must be completed-iteration counts in "
+                f"[1, {num_iterations}]"
+            )
         return cls(
             ink=ink,
             num_iterations=num_iterations,
@@ -1395,6 +1595,10 @@ class TrainingConfig:
             sampling_audit_every=sampling_audit_every,
             verify_finite_gradients_steps=verify_finite,
             max_amp_overflow_events=max_overflows,
+            dynamic_label=dynamic_label,
+            extra_patches=extra_patches,
+            force_full_supervision=force_full_supervision,
+            save_iterations=save_iterations,
         )
 
     @property

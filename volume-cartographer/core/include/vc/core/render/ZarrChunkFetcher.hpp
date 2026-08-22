@@ -4,11 +4,13 @@
 #include "vc/core/render/ChunkFetch.hpp"
 #include "vc/core/render/IChunkedArray.hpp"
 #include "vc/core/util/RemoteAuth.hpp"
+#include "vc/core/util/RemoteUrl.hpp"
 
 #include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace utils {
@@ -32,6 +34,20 @@ struct OpenedChunkedZarr {
     // identity scale with zero translation. This survives logical rebasing so
     // catalog prediction/source preflight can enforce prediction identity.
     bool physicalLevelZeroTransformIsIdentity = true;
+    std::vector<PersistentCacheMetadataObject> zarrMirrorMetadata;
+};
+
+struct RemoteZarrOpenOptions {
+    vc::HttpAuth auth;
+    // Match Volume::NewFromUrl by discovering AWS credentials for S3 when no
+    // explicit credentials were supplied. Disable for forced anonymous reads.
+    bool discoverAwsCredentials = true;
+};
+
+struct OpenedRemoteChunkedZarr {
+    OpenedChunkedZarr opened;
+    vc::HttpAuth auth;
+    vc::RemoteVolumeSpec spec;
 };
 
 OpenedChunkedZarr openLocalZarrPyramid(const std::filesystem::path& root);
@@ -40,6 +56,22 @@ OpenedChunkedZarr openHttpZarrPyramid(
     const std::string& url,
     const vc::HttpAuth& auth,
     std::optional<int> baseScaleLevel = std::nullopt);
+
+// Production remote-volume open policy shared by VC3D and standalone tools:
+// resolve the locator, discover credentials when requested, and retry public
+// S3 data anonymously when stale credentials cause an authentication error.
+OpenedRemoteChunkedZarr openRemoteZarrPyramid(
+    const std::string& url,
+    RemoteZarrOpenOptions options = {});
+
+// S3 deliberately returns AccessDenied rather than NotFound for a missing key
+// when the caller lacks ListBucket. Optional discovery probes must therefore
+// accept a generic 403 while preserving explicit credential failures so the
+// anonymous retry policy can still run. Exposed for deterministic tests.
+bool isOptionalRemoteMetadataMiss(
+    long status,
+    std::string_view key,
+    std::string_view responseBody = {});
 
 // Enforce the supported contiguous dyadic VC pyramid contract and make
 // physical level baseScaleLevel logical level zero. Exposed for deterministic
@@ -65,6 +97,17 @@ std::unique_ptr<ChunkCache> createChunkCache(
 // Wrap an already-open scalar 3D Zarr array in the same decoded cache and
 // process-wide threaded reader used by VC3D volume rendering.
 std::unique_ptr<ChunkCache> createChunkCache(
+    std::shared_ptr<utils::ZarrArray> array,
+    ChunkCache::Options options = {});
+std::unique_ptr<ChunkCache> createChunkCache(
+    std::shared_ptr<utils::ZarrArray> array,
+    ChunkCache::Options options,
+    ChunkCacheService::Options serviceOptions);
+
+// Acquire an already-open scalar array from the process-wide cache service.
+// Equal source identities share decoded chunks, scheduling, and persistence.
+std::shared_ptr<ChunkCache> acquireProcessChunkCache(
+    std::string sourceIdentity,
     std::shared_ptr<utils::ZarrArray> array,
     ChunkCache::Options options = {});
 

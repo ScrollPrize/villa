@@ -1,23 +1,32 @@
 #include "vc/core/render/PersistentZarrCacheBudget.hpp"
 
+#include "vc/core/render/ChunkFetch.hpp"
+
 #include "vc/core/util/Logging.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <fstream>
 #include <limits>
 #include <map>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <optional>
+#include <random>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 namespace vc::render {
 namespace fs = std::filesystem;
 namespace {
+
+constexpr std::string_view kRetiredCacheDirectory = ".vc_cache_retired";
 
 fs::path normalizedPath(const fs::path& path)
 {
@@ -41,6 +50,17 @@ bool isWithin(const fs::path& path, const fs::path& root)
     return true;
 }
 
+fs::path retiredCachePath(const fs::path& subtree)
+{
+    static const auto processTag =
+        static_cast<std::uint64_t>(std::random_device{}());
+    static std::atomic<std::uint64_t> counter{0};
+    return subtree.parent_path() / kRetiredCacheDirectory /
+           (subtree.filename().string() + "." + std::to_string(processTag) +
+            "." + std::to_string(
+                      counter.fetch_add(1, std::memory_order_relaxed)));
+}
+
 bool isUnsignedNumber(const std::string& value)
 {
     return !value.empty() &&
@@ -52,7 +72,8 @@ bool isUnsignedNumber(const std::string& value)
 bool isVolumeChunk(const fs::path& path, const fs::path& root)
 {
     const auto ext = path.extension().string();
-    if (ext != ".bin" && ext != ".zst" && ext != ".c3d" && ext != ".empty")
+    if (ext != ".bin" && ext != ".zst" && ext != ".c3d" &&
+        ext != kPersistentSourcePayloadExtension && ext != ".empty")
         return false;
     auto y = path.parent_path();
     auto z = y.parent_path();
@@ -72,6 +93,106 @@ bool isVolumeChunk(const fs::path& path, const fs::path& root)
            isUnsignedNumber(z.filename().string()) &&
            levelName.rfind("level_", 0) == 0 &&
            isUnsignedNumber(levelName.substr(6));
+}
+
+bool isZarrMetadataFile(const fs::path& path)
+{
+    const auto name = path.filename().string();
+    return name == ".zarray" || name == ".zattrs" || name == ".zgroup" ||
+           name == ".zmetadata" || name == "zarr.json";
+}
+
+struct NativeZarrArrayLayout {
+    fs::path root;
+    std::size_t rank = 0;
+    std::string separator;
+    bool chunkPrefix = false;
+};
+
+std::optional<NativeZarrArrayLayout>
+nativeZarrArrayLayout(const fs::path& path)
+{
+    try {
+        std::ifstream input(path);
+        const auto metadata = nlohmann::json::parse(input);
+        NativeZarrArrayLayout result;
+        result.root = path.parent_path();
+        if (path.filename() == ".zarray") {
+            if (metadata.value("zarr_format", 0) != 2 ||
+                !metadata.contains("shape") ||
+                !metadata["shape"].is_array()) {
+                return std::nullopt;
+            }
+            result.rank = metadata["shape"].size();
+            result.separator = metadata.value("dimension_separator", ".");
+        } else if (path.filename() == "zarr.json" &&
+                   metadata.value("zarr_format", 0) == 3 &&
+                   metadata.value("node_type", std::string{}) == "array" &&
+                   metadata.contains("shape") &&
+                   metadata["shape"].is_array()) {
+            result.rank = metadata["shape"].size();
+            const auto encoding = metadata.value(
+                "chunk_key_encoding", nlohmann::json::object());
+            const auto name = encoding.value("name", "default");
+            const auto configuration = encoding.value(
+                "configuration", nlohmann::json::object());
+            if (name == "default") {
+                result.chunkPrefix = true;
+                result.separator = configuration.value("separator", "/");
+            } else if (name == "v2") {
+                result.separator = configuration.value("separator", ".");
+            } else {
+                return std::nullopt;
+            }
+        } else {
+            return std::nullopt;
+        }
+        if (result.rank == 0 ||
+            (result.separator != "." && result.separator != "/")) {
+            return std::nullopt;
+        }
+        return result;
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+bool hasNumericComponents(std::string_view key,
+                          std::string_view separator,
+                          std::size_t rank)
+{
+    std::size_t count = 0;
+    while (true) {
+        const auto end = key.find(separator);
+        const auto component = key.substr(0, end);
+        if (!isUnsignedNumber(std::string(component)))
+            return false;
+        ++count;
+        if (end == std::string_view::npos)
+            return count == rank;
+        key.remove_prefix(end + separator.size());
+    }
+}
+
+bool isNativeZarrPayload(const fs::path& path,
+                         const std::vector<NativeZarrArrayLayout>& arrays)
+{
+    if (isZarrMetadataFile(path) || path.filename().string().ends_with(".tmp"))
+        return false;
+    return std::any_of(arrays.begin(), arrays.end(), [&](const auto& array) {
+        if (!isWithin(path, array.root) || path == array.root)
+            return false;
+        auto key = path.lexically_relative(array.root).generic_string();
+        if (key.ends_with(".empty"))
+            key.resize(key.size() - std::string_view(".empty").size());
+        if (array.chunkPrefix) {
+            const auto prefix = std::string("c") + array.separator;
+            if (!key.starts_with(prefix))
+                return false;
+            key.erase(0, prefix.size());
+        }
+        return hasNumericComponents(key, array.separator, array.rank);
+    });
 }
 
 bool isLasagnaData(const fs::path& path, const std::vector<fs::path>& artifacts)
@@ -159,7 +280,12 @@ struct PersistentZarrCacheBudget::Impl {
     std::uint64_t freeBytes = 0;
     bool lowSpace = false;
     bool scanInFlight = true;
+    // A subtree may be renamed while the startup scan is running. Discard that
+    // scan's potentially stale paths and repeat it once the filesystem layout
+    // is stable instead of blocking the caller that performs the rename.
+    bool scanRestartRequested = false;
     bool trimInFlight = false;
+    std::size_t retirementsInFlight = 0;
 };
 
 PersistentZarrCacheBudget::PersistentZarrCacheBudget(
@@ -248,50 +374,106 @@ void PersistentZarrCacheBudget::startScan()
 {
     auto self = shared_from_this();
     std::thread([self] {
-        std::vector<fs::path> files;
-        std::vector<fs::path> artifacts;
-        std::error_code ec;
-        fs::recursive_directory_iterator it(
-            self->impl_->root, fs::directory_options::skip_permission_denied, ec);
-        const fs::recursive_directory_iterator end;
-        while (!ec && it != end) {
-            if (it->is_regular_file(ec)) {
-                const auto path = normalizedPath(it->path());
-                files.push_back(path);
-                if (path.filename() == "lasagna-remote.json")
-                    artifacts.push_back(path.parent_path());
+        for (;;) {
+            std::vector<fs::path> files;
+            std::vector<fs::path> artifacts;
+            std::vector<NativeZarrArrayLayout> zarrArrays;
+            std::vector<fs::path> retiredRoots;
+            std::error_code ec;
+            fs::recursive_directory_iterator it(
+                self->impl_->root,
+                fs::directory_options::skip_permission_denied, ec);
+            const fs::recursive_directory_iterator end;
+            while (!ec && it != end) {
+                if (it->is_directory(ec) && !ec &&
+                    it->path().filename() == kRetiredCacheDirectory) {
+                    retiredRoots.push_back(normalizedPath(it->path()));
+                    it.disable_recursion_pending();
+                } else if (it->is_regular_file(ec)) {
+                    const auto path = normalizedPath(it->path());
+                    files.push_back(path);
+                    if (path.filename() == "lasagna-remote.json")
+                        artifacts.push_back(path.parent_path());
+                    if (path.filename() == ".zarray" ||
+                        path.filename() == "zarr.json") {
+                        if (auto layout = nativeZarrArrayLayout(path))
+                            zarrArrays.push_back(std::move(*layout));
+                    }
+                }
+                if (ec)
+                    ec.clear();
+                it.increment(ec);
             }
-            if (ec)
-                ec.clear();
-            it.increment(ec);
-        }
 
-        std::unordered_map<std::string, Impl::Entry> found;
-        std::uint64_t total = 0;
-        const auto genericPayloads = managedGenericPayloads(files);
-        for (const auto& path : files) {
-            if (!isVolumeChunk(path, self->impl_->root) &&
-                !isLasagnaData(path, artifacts) &&
-                !genericPayloads.contains(path.string()))
-                continue;
-            std::error_code fileEc;
-            const auto size = fs::file_size(path, fileEc);
-            if (fileEc)
-                continue;
-            const auto touched = fs::last_write_time(path, fileEc);
-            if (fileEc)
-                continue;
-            found.emplace(path.string(), Impl::Entry{size, touched});
-            total += size;
-        }
+            std::unordered_map<std::string, Impl::Entry> found;
+            std::uint64_t total = 0;
+            const auto genericPayloads = managedGenericPayloads(files);
+            for (const auto& path : files) {
+                if (!isVolumeChunk(path, self->impl_->root) &&
+                    !isLasagnaData(path, artifacts) &&
+                    !isNativeZarrPayload(path, zarrArrays) &&
+                    !genericPayloads.contains(path.string()))
+                    continue;
+                std::error_code fileEc;
+                const auto size = fs::file_size(path, fileEc);
+                if (fileEc)
+                    continue;
+                const auto touched = fs::last_write_time(path, fileEc);
+                if (fileEc)
+                    continue;
+                found.emplace(path.string(), Impl::Entry{size, touched});
+                total += size;
+            }
 
-        {
-            std::lock_guard lock(self->impl_->mutex);
-            self->impl_->entries = std::move(found);
-            self->impl_->managedBytes = total;
-            self->impl_->scanInFlight = false;
+            bool restart = false;
+            {
+                std::lock_guard lock(self->impl_->mutex);
+                restart = self->impl_->scanRestartRequested;
+                self->impl_->scanRestartRequested = false;
+                if (!restart) {
+                    self->impl_->entries = std::move(found);
+                    self->impl_->managedBytes = total;
+                    self->impl_->scanInFlight = false;
+                    self->impl_->retirementsInFlight += retiredRoots.size();
+                }
+            }
+            if (!restart) {
+                for (auto& retired : retiredRoots) {
+                    self->removeRetiredSubtreeAsync(
+                        std::move(retired), true);
+                }
+                break;
+            }
         }
         self->startTrim();
+        self->impl_->cv.notify_all();
+        self->pollSpace();
+    }).detach();
+}
+
+void PersistentZarrCacheBudget::removeRetiredSubtreeAsync(
+    fs::path retired, bool alreadyRegistered)
+{
+    if (!alreadyRegistered) {
+        std::lock_guard lock(impl_->mutex);
+        ++impl_->retirementsInFlight;
+    }
+    auto self = shared_from_this();
+    std::thread([self, retired = std::move(retired)] {
+        std::error_code ec;
+        fs::remove_all(retired, ec);
+        if (ec) {
+            Logger()->warn("Could not delete retired persistent cache {}: {}",
+                           retired.string(), ec.message());
+        }
+        if (retired.filename() != kRetiredCacheDirectory) {
+            std::error_code parentEc;
+            fs::remove(retired.parent_path(), parentEc);
+        }
+        {
+            std::lock_guard lock(self->impl_->mutex);
+            --self->impl_->retirementsInFlight;
+        }
         self->impl_->cv.notify_all();
         self->pollSpace();
     }).detach();
@@ -409,12 +591,34 @@ PersistentZarrCacheBudget::ReadPin PersistentZarrCacheBudget::pinRead(const fs::
 PersistentZarrCacheBudget::WriteReservation PersistentZarrCacheBudget::reserveWrite(
     const fs::path& target, std::uint64_t newSize, std::vector<fs::path> replacements)
 {
+    return reserveWriteImpl(
+        target, newSize, std::move(replacements), true);
+}
+
+PersistentZarrCacheBudget::WriteReservation
+PersistentZarrCacheBudget::reserveProtectedWrite(
+    const fs::path& target, std::uint64_t newSize)
+{
+    return reserveWriteImpl(target, newSize, {}, false);
+}
+
+PersistentZarrCacheBudget::WriteReservation
+PersistentZarrCacheBudget::reserveWriteImpl(
+    const fs::path& target,
+    std::uint64_t newSize,
+    std::vector<fs::path> replacements,
+    bool managed)
+{
     const auto normalizedTarget = normalizedPath(target);
     for (auto& path : replacements)
         path = normalizedPath(path);
 
     std::unique_lock lock(impl_->mutex);
-    impl_->cv.wait(lock, [&] { return !impl_->scanInFlight; });
+    // Protected structural metadata is not part of the managed chunk index, so
+    // it can be published while an accounting scan is running. Managed payload
+    // writes still wait for an exact index before enforcing size limits.
+    if (managed)
+        impl_->cv.wait(lock, [&] { return !impl_->scanInFlight; });
     impl_->cv.wait(lock, [&] {
         if (impl_->writePins.contains(normalizedTarget.string()) ||
             impl_->readPins.contains(normalizedTarget.string()))
@@ -431,10 +635,15 @@ PersistentZarrCacheBudget::WriteReservation PersistentZarrCacheBudget::reserveWr
         const auto it = impl_->entries.find(path.string());
         return it == impl_->entries.end() ? 0 : it->second.size;
     };
-    std::uint64_t oldSize = trackedSize(normalizedTarget);
-    for (const auto& path : replacements)
-        oldSize += trackedSize(path);
-    const auto netGrowth = newSize > oldSize ? newSize - oldSize : 0;
+    std::uint64_t oldSize = 0;
+    if (managed) {
+        oldSize = trackedSize(normalizedTarget);
+        for (const auto& path : replacements)
+            oldSize += trackedSize(path);
+    }
+    const auto netGrowth = managed && newSize > oldSize
+        ? newSize - oldSize
+        : 0;
 
     std::error_code spaceEc;
     const auto space = impl_->spaceProvider(impl_->root, spaceEc);
@@ -444,7 +653,7 @@ PersistentZarrCacheBudget::WriteReservation PersistentZarrCacheBudget::reserveWr
                       free < impl_->limits.minimumFreeBytes;
 
     std::uint64_t needed = 0;
-    if (impl_->limits.maximumBytes) {
+    if (managed && impl_->limits.maximumBytes) {
         const auto projected = impl_->managedBytes + impl_->reservedGrowth + netGrowth;
         if (projected > *impl_->limits.maximumBytes)
             needed = projected - *impl_->limits.maximumBytes;
@@ -517,7 +726,133 @@ PersistentZarrCacheBudget::WriteReservation PersistentZarrCacheBudget::reserveWr
     for (const auto& path : replacements)
         impl_->writePins.insert(path.string());
     return WriteReservation(shared_from_this(), normalizedTarget,
-                            std::move(replacements), netGrowth, newSize);
+                            std::move(replacements), netGrowth, newSize,
+                            managed);
+}
+
+bool PersistentZarrCacheBudget::removeCacheSubtree(
+    const fs::path& subtree, std::error_code& ec)
+{
+    const auto normalized = normalizedPath(subtree);
+    if (normalized == impl_->root || !isWithin(normalized, impl_->root)) {
+        ec = std::make_error_code(std::errc::invalid_argument);
+        return false;
+    }
+
+    const auto overlaps = [&](const std::string& path) {
+        return isWithin(fs::path(path), normalized);
+    };
+    std::unique_lock lock(impl_->mutex);
+    impl_->cv.wait(lock, [&] {
+        if (impl_->trimInFlight && !impl_->scanInFlight)
+            return false;
+        for (const auto& [path, count] : impl_->readPins) {
+            (void)count;
+            if (overlaps(path))
+                return false;
+        }
+        return std::none_of(
+            impl_->writePins.begin(), impl_->writePins.end(), overlaps);
+    });
+
+    std::optional<fs::path> retired;
+    if (fs::exists(normalized, ec)) {
+        const auto retiredRoot = normalized.parent_path() /
+                                 kRetiredCacheDirectory;
+        fs::create_directories(retiredRoot, ec);
+        if (ec)
+            return false;
+        retired = retiredCachePath(normalized);
+        fs::rename(normalized, *retired, ec);
+        if (ec)
+            return false;
+    } else if (ec) {
+        return false;
+    }
+
+    const bool startRescan = retired && !impl_->scanInFlight;
+    if (startRescan)
+        impl_->scanInFlight = true;
+    else if (retired)
+        impl_->scanRestartRequested = true;
+    lock.unlock();
+    if (retired) {
+        // The restarted scan skips retired cache trees, accounts the live root,
+        // and schedules deletion exactly once after publishing that index.
+        if (startRescan)
+            startScan();
+    } else {
+        pollSpace();
+    }
+    return true;
+}
+
+bool PersistentZarrCacheBudget::moveCacheSubtree(
+    const fs::path& source,
+    const fs::path& destination,
+    std::error_code& ec)
+{
+    const auto normalizedSource = normalizedPath(source);
+    const auto normalizedDestination = normalizedPath(destination);
+    ec.clear();
+    if (normalizedSource == normalizedDestination)
+        return true;
+    if (normalizedSource == impl_->root ||
+        normalizedDestination == impl_->root ||
+        !isWithin(normalizedSource, impl_->root) ||
+        !isWithin(normalizedDestination, impl_->root) ||
+        isWithin(normalizedSource, normalizedDestination) ||
+        isWithin(normalizedDestination, normalizedSource)) {
+        ec = std::make_error_code(std::errc::invalid_argument);
+        return false;
+    }
+
+    const auto overlapsEither = [&](const std::string& path) {
+        const auto candidate = fs::path(path);
+        return isWithin(candidate, normalizedSource) ||
+               isWithin(candidate, normalizedDestination);
+    };
+    std::unique_lock lock(impl_->mutex);
+    impl_->cv.wait(lock, [&] {
+        // A trim that is waiting for the startup scan has not touched the
+        // filesystem yet. The scan will be restarted after this rename and the
+        // trim will consume the resulting paths. An active post-scan trim must
+        // still finish first.
+        if (impl_->trimInFlight && !impl_->scanInFlight)
+            return false;
+        for (const auto& [path, count] : impl_->readPins) {
+            (void)count;
+            if (overlapsEither(path))
+                return false;
+        }
+        return std::none_of(
+            impl_->writePins.begin(), impl_->writePins.end(), overlapsEither);
+    });
+
+    if (!fs::exists(normalizedSource, ec))
+        return !ec;
+    if (fs::exists(normalizedDestination, ec)) {
+        ec = std::make_error_code(std::errc::file_exists);
+        return false;
+    }
+    if (ec)
+        return false;
+    fs::create_directories(normalizedDestination.parent_path(), ec);
+    if (ec)
+        return false;
+    fs::rename(normalizedSource, normalizedDestination, ec);
+    if (ec)
+        return false;
+
+    const bool startRescan = !impl_->scanInFlight;
+    if (startRescan)
+        impl_->scanInFlight = true;
+    else
+        impl_->scanRestartRequested = true;
+    lock.unlock();
+    if (startRescan)
+        startScan();
+    return true;
 }
 
 void PersistentZarrCacheBudget::releaseRead(const fs::path& path, bool touch)
@@ -550,7 +885,7 @@ void PersistentZarrCacheBudget::releaseRead(const fs::path& path, bool touch)
 void PersistentZarrCacheBudget::finishWrite(
     const fs::path& target, const std::vector<fs::path>& replacements,
     std::uint64_t reservedGrowth, std::uint64_t reservedTemporaryBytes,
-    bool committed)
+    bool committed, bool managed)
 {
     bool needsTrim = false;
     {
@@ -562,12 +897,14 @@ void PersistentZarrCacheBudget::finishWrite(
         for (const auto& path : replacements)
             impl_->writePins.erase(path.string());
         if (committed) {
-            auto refresh = [&](const fs::path& path) {
+            auto refresh = [&](const fs::path& path, bool track) {
                 const auto key = path.string();
                 if (auto it = impl_->entries.find(key); it != impl_->entries.end()) {
                     impl_->managedBytes -= std::min(impl_->managedBytes, it->second.size);
                     impl_->entries.erase(it);
                 }
+                if (!track)
+                    return;
                 std::error_code ec;
                 if (!fs::is_regular_file(path, ec) || ec)
                     return;
@@ -580,9 +917,9 @@ void PersistentZarrCacheBudget::finishWrite(
                 impl_->entries.emplace(key, Impl::Entry{size, touched});
                 impl_->managedBytes += size;
             };
-            refresh(target);
+            refresh(target, managed);
             for (const auto& path : replacements)
-                refresh(path);
+                refresh(path, managed);
         }
         needsTrim = impl_->limits.maximumBytes &&
                     impl_->managedBytes > *impl_->limits.maximumBytes;
@@ -597,7 +934,7 @@ void PersistentZarrCacheBudget::waitForIdle()
     std::unique_lock lock(impl_->mutex);
     impl_->cv.wait(lock, [&] {
         return !impl_->scanInFlight && !impl_->trimInFlight &&
-               impl_->writePins.empty();
+               impl_->writePins.empty() && impl_->retirementsInFlight == 0;
     });
 }
 
@@ -635,10 +972,10 @@ void PersistentZarrCacheBudget::ReadPin::release(bool touch)
 PersistentZarrCacheBudget::WriteReservation::WriteReservation(
     std::shared_ptr<PersistentZarrCacheBudget> owner, fs::path target,
     std::vector<fs::path> replacements, std::uint64_t growth,
-    std::uint64_t temporaryBytes)
+    std::uint64_t temporaryBytes, bool managed)
     : owner_(std::move(owner)), target_(std::move(target)),
       replacements_(std::move(replacements)), reservedGrowth_(growth),
-      reservedTemporaryBytes_(temporaryBytes) {}
+      reservedTemporaryBytes_(temporaryBytes), managed_(managed) {}
 PersistentZarrCacheBudget::WriteReservation::WriteReservation(WriteReservation&& other) noexcept = default;
 PersistentZarrCacheBudget::WriteReservation& PersistentZarrCacheBudget::WriteReservation::operator=(WriteReservation&& other) noexcept
 {
@@ -649,6 +986,7 @@ PersistentZarrCacheBudget::WriteReservation& PersistentZarrCacheBudget::WriteRes
         replacements_ = std::move(other.replacements_);
         reservedGrowth_ = other.reservedGrowth_;
         reservedTemporaryBytes_ = other.reservedTemporaryBytes_;
+        managed_ = other.managed_;
         other.reservedGrowth_ = 0;
         other.reservedTemporaryBytes_ = 0;
     }
@@ -660,7 +998,7 @@ void PersistentZarrCacheBudget::WriteReservation::commit()
     if (owner_) {
         auto owner = std::move(owner_);
         owner->finishWrite(target_, replacements_, reservedGrowth_,
-                           reservedTemporaryBytes_, true);
+                           reservedTemporaryBytes_, true, managed_);
     }
 }
 void PersistentZarrCacheBudget::WriteReservation::cancel()
@@ -668,7 +1006,7 @@ void PersistentZarrCacheBudget::WriteReservation::cancel()
     if (owner_) {
         auto owner = std::move(owner_);
         owner->finishWrite(target_, replacements_, reservedGrowth_,
-                           reservedTemporaryBytes_, false);
+                           reservedTemporaryBytes_, false, managed_);
     }
 }
 

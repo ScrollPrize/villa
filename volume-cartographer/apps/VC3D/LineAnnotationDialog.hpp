@@ -128,7 +128,7 @@ public:
     ReoptimizationMode reoptimizationMode() const;
     int initialCenterlineLengthVx() const;
     int extrapolationDistanceVx() const;
-    int maxControlPointDistanceVx() const;
+    int maxControlPointExtrapolationDistanceVx() const;
     vc3d::line_annotation::FiberOptimizationMode fiberOptimizationMode() const;
     void setFiberOptimizationMode(vc3d::line_annotation::FiberOptimizationMode mode);
     void setLasagnaDatasetOptions(
@@ -159,6 +159,8 @@ public:
         std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics);
     void setOptimizationBusy(bool busy);
     void setOptimizationStatus(bool optimized);
+    // Empty retracts the notice; see updateUmbilicusNotice().
+    void setUmbilicusNotice(const QString& notice);
     void setFiberDisplayName(const QString& name);
     // "H"/"V" (or empty) shown next to the fiber name in the top-right label.
     void setFiberHvTag(const QString& tag);
@@ -260,6 +262,11 @@ private:
     // projection + crosshair update per non-hovered pane per tick.
     void requestLinkedCursorMirror(CChunkedVolumeViewer* source,
                                    const std::optional<cv::Vec3f>& point);
+    // Pushes the "Mirror cursor across panes" state onto the panes. The block
+    // has to sit on the receiving side: the panes belong to the same
+    // ViewerManager as the main window, so the global cursor sync would keep
+    // feeding them even with this dialog's own broadcast silenced.
+    void applyLinkedCursorMirroringToPanes();
     void connectGeneratedOverlayRefresh(CChunkedVolumeViewer* viewer);
     void clearGeneratedOverlayRefreshConnections();
     void setGeneratedOverlay(const std::string& surfaceName,
@@ -287,8 +294,8 @@ private:
     // next one after the key comes up, and the opposite arrow reverses mid-pan.
     void startArrowPan(int direction);
     // Control-point line positions plus (when there is room) one boundary
-    // target beyond each outer control point: Max CP distance or the
-    // extrapolated line end, whichever is shorter.
+    // target beyond each outer control point: the maximum base-voxel
+    // arclength extrapolation distance or the line end, whichever is shorter.
     std::vector<double> arrowPanTargetPositions() const;
     void releaseArrowPanKey(int direction);
     void updateArrowPanStopTarget();
@@ -344,6 +351,7 @@ private:
     void installGeneratedViewShortcuts();
     void resetGeneratedViews();
     bool toggleCurrentCutFollowFromKeyboard();
+    bool placeControlPointAtCurrentLinePosition();
     bool rotateCurrentCut(vc3d::line_annotation::GeneratedCutRotationAxis axis, float radians);
     cv::Vec3f currentCutViewerCenterVolumePoint() const;
     void captureInitialGeneratedViewState();
@@ -394,6 +402,10 @@ private:
     void updatePauseIndicator();
     // "optimized"/"not optimized" badge in the bottom strip's top-right corner.
     void updateOptimizationStatusIndicator();
+    // Red notice at the bottom strip's top-left when the package's umbilicus
+    // could not be used, so that falling back to the volume centre is visible
+    // rather than only logged.
+    void updateUmbilicusNotice();
     void updateOptimizationOverlayGeometry();
     void updateFiberNameLabel();
     void rebuildDatasetMenus();
@@ -421,13 +433,17 @@ private:
     // uncommitted edits until then (and revert when the menu reopens).
     int _appliedInitialCenterlineLengthVx = 0;
     int _appliedExtrapolationDistanceVx = 0;
-    QSpinBox* _maxControlPointDistanceSpin = nullptr;
+    QSpinBox* _maxControlPointExtrapolationDistanceSpin = nullptr;
     QLabel* _fiberNameLabel = nullptr;
     QPointer<QLabel> _optimizationStatusLabel;
     bool _optimizationStatusOptimized = false;
+    // The overlay only blocks the mouse, so keyboard-driven edits have to test
+    // this themselves before they queue any deferred state.
+    bool _optimizationBusy = false;
     QWidget* _tagRowWidget = nullptr;
     QHBoxLayout* _tagRowLayout = nullptr;
     QProgressBar* _sideStripIntersectionProgress = nullptr;
+    QAction* _mirrorCursorAction = nullptr;
     QAction* _resetViewsAction = nullptr;
     QPointer<QWidget> _optimizationOverlay;
     QMdiArea* _mdiArea = nullptr;
@@ -480,6 +496,8 @@ private:
     // control points (LineAnnotationOverviewBar, file-local in the .cpp).
     QPointer<QWidget> _overviewBar;
     QPointer<QLabel> _pauseIndicator;
+    QPointer<QLabel> _umbilicusNoticeLabel;
+    QString _umbilicusNotice;
     GeneratedViews _generatedViews;
     // Sign applied to the displayed line tangent so the current cut's screen
     // left/right and the side cut's vertical do not depend on the arbitrary
