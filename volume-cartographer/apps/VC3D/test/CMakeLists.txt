@@ -214,3 +214,22 @@ target_link_libraries(test_fiber_map_staleness PRIVATE
 add_test(NAME fiber_map_staleness COMMAND test_fiber_map_staleness)
 vc_register_test_target(test_fiber_map_staleness)
 vc_register_ctest(fiber_map_staleness test_fiber_map_staleness)
+
+add_executable(test_fiber_winding_solver
+    test_fiber_winding_solver.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberWindingSolver.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberWindingSolver.hpp)
+
+set_target_properties(test_fiber_winding_solver PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_fiber_winding_solver PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_fiber_winding_solver PRIVATE
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME fiber_winding_solver COMMAND test_fiber_winding_solver)
+vc_register_test_target(test_fiber_winding_solver)
+vc_register_ctest(fiber_winding_solver test_fiber_winding_solver)
