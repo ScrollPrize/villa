@@ -556,22 +556,35 @@ class Inferer():
         self.model_patch_size = tuple(model_info.get('patch_size', (192, 192, 192)))
         self.num_classes = model_info.get('num_seg_heads', None)
         
-        # Check if this is a multi-task model from targets info
+        # Check if this is a multi-task model from targets info.
+        # Checkpoints can carry out_channels: None (e.g. auxiliary targets whose
+        # channel count is resolved at build time); in that case leave
+        # num_classes as None so the dummy-inference path below measures the
+        # real per-target channels from the model output.
         if 'targets' in model_info and model_info['targets']:
-            self.is_multi_task = True
-            self.target_info = {}
-            self.num_classes = 0
-            for target_name, target_config in model_info['targets'].items():
-                target_channels = target_config.get('out_channels', 1)
-                self.target_info[target_name] = {
-                    'out_channels': target_channels,
-                    'start_channel': self.num_classes,
-                    'end_channel': self.num_classes + target_channels
-                }
-                self.num_classes += target_channels
-            if self.verbose:
-                print(f"Detected multi-task model with targets: {list(model_info['targets'].keys())}")
-                print(f"Total output channels: {self.num_classes}")
+            targets_cfg = model_info['targets']
+            if all(cfg.get('out_channels') is not None for cfg in targets_cfg.values()):
+                self.is_multi_task = True
+                self.target_info = {}
+                self.num_classes = 0
+                for target_name, target_config in targets_cfg.items():
+                    target_channels = target_config.get('out_channels')
+                    self.target_info[target_name] = {
+                        'out_channels': target_channels,
+                        'start_channel': self.num_classes,
+                        'end_channel': self.num_classes + target_channels
+                    }
+                    self.num_classes += target_channels
+                if self.verbose:
+                    print(f"Detected multi-task model with targets: {list(targets_cfg.keys())}")
+                    print(f"Total output channels: {self.num_classes}")
+            else:
+                self.num_classes = None
+                if self.verbose:
+                    unresolved = [t for t, c in targets_cfg.items()
+                                  if c.get('out_channels') is None]
+                    print(f"Targets with unresolved out_channels {unresolved}; "
+                          "determining channels via dummy inference")
         
         # use models patch size if one wasn't specified
         if self.patch_size is None:
@@ -710,13 +723,26 @@ class Inferer():
         # Note: 'reduce-overhead' mode uses CUDA graphs which can cause tensor reuse issues
         # when outputs are accessed after subsequent runs. Using 'default' mode instead.
         if self.device.type == 'cuda':
+            # torch.compile's inductor backend needs triton, and compilation is
+            # lazy: without this check the failure escapes the try/except below
+            # and surfaces as TritonMissing at the first forward pass (e.g. on
+            # Windows, where CUDA wheels do not bundle triton).
             try:
+                from torch.utils._triton import has_triton
+            except ImportError:
+                has_triton = None
+            if has_triton is not None and not has_triton():
                 if self.verbose:
-                    print("Compiling model with torch.compile for inference optimization")
-                model = torch.compile(model, mode='default')
-            except Exception as e:
-                if self.verbose:
-                    print(f"torch.compile failed, using eager mode: {e}")
+                    print("torch.compile requires triton, which is unavailable; "
+                          "using eager mode")
+            else:
+                try:
+                    if self.verbose:
+                        print("Compiling model with torch.compile for inference optimization")
+                    model = torch.compile(model, mode='default')
+                except Exception as e:
+                    if self.verbose:
+                        print(f"torch.compile failed, using eager mode: {e}")
 
         # Handle multi-target models
         if len(mgr.targets) > 1:
@@ -725,22 +751,33 @@ class Inferer():
             
             # Set multi-task flag
             self.is_multi_task = True
-            
-            # Calculate total output channels and store target info
-            self.target_info = {}
-            num_classes = 0
-            for target_name, target_config in mgr.targets.items():
-                target_channels = target_config.get('out_channels', 1)
-                self.target_info[target_name] = {
-                    'out_channels': target_channels,
-                    'start_channel': num_classes,
-                    'end_channel': num_classes + target_channels
-                }
-                num_classes += target_channels
-            
-            if self.verbose:
-                print(f"Total output channels across all targets: {num_classes}")
-                print(f"Target channel mapping: {self.target_info}")
+
+            # Calculate total output channels and store target info.
+            # out_channels can be an explicit None (e.g. auxiliary targets
+            # resolved at build time) — in that case report num_seg_heads as
+            # None so _setup falls back to dummy inference, which measures the
+            # real channel counts from the model output.
+            if all(cfg.get('out_channels') is not None
+                   for cfg in mgr.targets.values()):
+                self.target_info = {}
+                num_classes = 0
+                for target_name, target_config in mgr.targets.items():
+                    target_channels = target_config.get('out_channels')
+                    self.target_info[target_name] = {
+                        'out_channels': target_channels,
+                        'start_channel': num_classes,
+                        'end_channel': num_classes + target_channels
+                    }
+                    num_classes += target_channels
+
+                if self.verbose:
+                    print(f"Total output channels across all targets: {num_classes}")
+                    print(f"Target channel mapping: {self.target_info}")
+            else:
+                num_classes = None
+                if self.verbose:
+                    print("Some targets have out_channels=None; channel counts "
+                          "will be determined by dummy inference")
         else:
             # Single target model
             target_name = list(mgr.targets.keys())[0] if mgr.targets else 'output'
@@ -1208,7 +1245,10 @@ class Inferer():
         except Exception as e:
             print(f"An error occurred during inference: {e}")
             import traceback
-            traceback.print_exc() 
+            traceback.print_exc()
+            # Re-raise so callers fail with the real error instead of
+            # unpacking the implicit None return.
+            raise
 
 
 def _parse_bbox_arg(value):
