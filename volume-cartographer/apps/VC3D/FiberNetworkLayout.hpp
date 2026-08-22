@@ -157,6 +157,10 @@ struct Result {
 // throughout, like buildLayout.
 
 struct GlobalLayoutParams {
+    // One link-suspicion threshold: this value also overrides
+    // solver.linkSuspectTurns inside buildGlobalLayout, so the confidence a
+    // link solves with and the suspicion it is reported with can never
+    // disagree.
     double suspectTurns = 0.25;
     // Same intents as the LayoutParams entries of the same names.
     double smoothVx = 500.0;
@@ -191,8 +195,9 @@ struct CrossingMark {
     QPointF posVx;
 };
 
-// A fiber that could not be unrolled at all (no geometry); listed so "every
-// fiber" stays honest.
+// A fiber that could not be placed: no geometry, no umbilicus to unroll
+// about, or geometry too degenerate to draw. Listed so "every fiber" stays
+// honest.
 struct UnplacedFiber {
     uint64_t id = 0;
     std::string fileName;
@@ -219,6 +224,11 @@ struct GlobalResult {
     int tieCount = 0;
     int suspectLinkCount = 0;
     int droppedCrossingCount = 0;
+    // Geometry the solver refused to learn from: angularly ill-conditioned
+    // or wild segments, and tangential contacts. Nonzero values say the map
+    // may be underconstrained for a reason the fibers themselves can't show.
+    int gatedSegmentCount = 0;
+    int tangentialCount = 0;
 };
 
 [[nodiscard]] GlobalResult buildGlobalLayout(

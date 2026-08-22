@@ -94,10 +94,12 @@ struct SolverParams {
     // Neighbourhood for the local radial-ordering cost. Intent: 0.5 cm each.
     double neighborhoodZVx = 2083.0;
     double neighborhoodArcVx = 2083.0;
-    // A crumpled sheet's radius drifts with z; two samples a |dz| apart only
-    // assert a strict radial order when |dr| clears the tie band plus this
-    // slope allowance times |dz|. Pairs in between carry no information.
+    // A crumpled sheet's radius drifts with z and with angle; two samples a
+    // |dz| and an arc apart only assert a strict radial order when |dr|
+    // clears the tie band plus these slope allowances times the separations.
+    // Pairs in between carry no information.
     double radialSlopePerZVx = 1.0;
+    double radialSlopePerArcVx = 0.3;
     // Second-best anchoring cost within this of the best marks the island
     // ambiguous (violation-count units).
     double anchorAmbiguityMargin = 2.0;
@@ -129,9 +131,13 @@ struct Crossing {
 };
 
 enum class ComponentAnchor {
-    // In the primary constraint component: placed by crossings/links.
+    // In the primary constraint component: placed by crossings/links. The
+    // primary component is the largest one that actually carries a crossing
+    // constraint (a link-only network, however large, proves no winding).
     Primary,
-    // Island shifted onto the primary map by local radial ordering.
+    // Island shifted onto the primary map by local radial ordering. A later
+    // island can anchor onto an earlier ambiguous one and still read Radius:
+    // ambiguity is per-island evidence, not inherited down the chain.
     Radius,
     // Radius-anchored, but a second shift scored within the ambiguity margin.
     AmbiguousRadius,
@@ -160,7 +166,9 @@ struct SolveResult {
     // cycle repair.
     std::vector<std::size_t> droppedLinks;
     // Per input link: residual in turns after placement (|.| of the gauge
-    // disagreement), for suspect marking by the caller.
+    // disagreement), for suspect marking by the caller. Infinity for a link
+    // that never took part (an endpoint out of range or on a degenerate
+    // trace), so it can never read as a perfect link.
     std::vector<double> linkTurnErrors;
     int islandCount = 0;
     int unresolvedCount = 0;

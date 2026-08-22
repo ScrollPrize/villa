@@ -696,6 +696,7 @@ void FiberMapWorkspace::clearLayout(const QString& reason)
         _tree->clear();
     }
     rebuildScene(reason);
+    _restingReason = reason;
     _freshStatus = withCachedUmbilicusStatus(reason);
     if (_statusLabel) {
         _statusLabel->setText(_freshStatus);
@@ -792,10 +793,13 @@ void FiberMapWorkspace::showEvent(QShowEvent* event)
     // that is where the umbilicus state gets looked up, so a package that will
     // not unroll says so before the user presses Rebuild.
     if (!_layoutBuilt && _statusLabel) {
-        _statusLabel->setText(
-            _freshStatus.isEmpty()
-                ? withCachedUmbilicusStatus(tr("press Rebuild layout"))
-                : _freshStatus);
+        // Recomposed rather than replayed: _freshStatus froze its umbilicus
+        // suffix when the layout was cleared, and the package may have
+        // changed since (nothing is built, so no dependency comparison will
+        // ever say so). The cache re-resolves when the fingerprint moved.
+        _statusLabel->setText(withCachedUmbilicusStatus(
+            _restingReason.isEmpty() ? tr("press Rebuild layout")
+                                     : _restingReason));
     }
 }
 
@@ -826,6 +830,7 @@ void FiberMapWorkspace::rebuildLayout()
     _layoutBuilt = true;
     _staleReason.clear();
     _latchedReason.clear();
+    _restingReason.clear();
 
     // The snapshot's geometry is handed straight to the layout; every fiber of
     // the package is in it, so a second copy is worth avoiding.
@@ -870,8 +875,6 @@ void FiberMapWorkspace::rebuildLayout()
         params.solver.neighborhoodZVx = 0.5 * vxPerCm;        // ordinal window
         params.solver.neighborhoodArcVx = 0.5 * vxPerCm;
     }
-    // One suspicion threshold for links, wherever it is applied.
-    params.solver.linkSuspectTurns = params.suspectTurns;
     _layout = vc3d::fiber_map::buildGlobalLayout(inputs, snapshot.umbilicusCenters,
                                                  params);
     // Scene space is voxels and the slice count already is one, so the scroll
@@ -926,6 +929,12 @@ void FiberMapWorkspace::rebuildLayout()
     }
     if (_layout.droppedCrossingCount > 0) {
         status += tr(" · %1 dropped crossings").arg(_layout.droppedCrossingCount);
+    }
+    if (_layout.gatedSegmentCount > 0 || _layout.tangentialCount > 0) {
+        // Geometry the solver refused to learn from; a map can be
+        // underconstrained for reasons the drawn fibers cannot show.
+        status += tr(" · %1 segments unusable")
+                      .arg(_layout.gatedSegmentCount + _layout.tangentialCount);
     }
     if (!_voxelSizeUm) {
         // No physical figure on the map means anything, so say why once rather

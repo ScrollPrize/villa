@@ -112,7 +112,14 @@ void smoothPolyline(const std::vector<QPointF>& points, double sigma, double ste
 {
     const std::vector<double> sRaw = arclengths(points);
     const double total = sRaw.empty() ? 0.0 : sRaw.back();
-    if (total < 2.0 * step || points.size() < 3) {
+    // The unsmoothed fallback also covers parameters that cannot be resampled
+    // sanely: non-finite lengths, and steps so small the sample count would
+    // not fit an int (a public parameter must not be able to reach the
+    // undefined float-to-int conversion or an absurd allocation).
+    constexpr double kMaxSamples = 16.0 * 1024.0 * 1024.0;
+    if (!(total >= 2.0 * step) || points.size() < 3 ||
+        !std::isfinite(total) || !std::isfinite(sigma) ||
+        total / step > kMaxSamples) {
         sOut = sRaw;
         qOut = points;
         return;
@@ -141,8 +148,9 @@ void smoothPolyline(const std::vector<QPointF>& points, double sigma, double ste
         return;
     }
 
-    const int radius =
-        std::max(1, static_cast<int>(std::nearbyint(3.0 * sigma / step)));
+    const int radius = std::clamp(
+        static_cast<int>(std::nearbyint(std::min(3.0 * sigma / step, 4096.0))),
+        1, 4096);
     std::vector<double> kernel(static_cast<std::size_t>(2 * radius + 1));
     double kernelSum = 0.0;
     for (int i = -radius; i <= radius; ++i) {
@@ -500,10 +508,13 @@ FiberGeometry buildFiberGeometry(const PreparedFiber& entry, double thetaScale,
                     interpolate(s, geo.sampleArclength, sampleY));
     }
 
-    const std::size_t begin =
-        searchSortedLeft(geo.sampleArclength, geo.controlArclength.front());
-    const std::size_t end =
-        searchSortedRight(geo.sampleArclength, geo.controlArclength.back());
+    // Extremes, not front/back: a malformed fiber whose control points map
+    // backwards along the line points must clip to a valid (possibly whole)
+    // range rather than erase past the end of a shortened vector.
+    const auto [minArc, maxArc] = std::minmax_element(
+        geo.controlArclength.begin(), geo.controlArclength.end());
+    const std::size_t begin = searchSortedLeft(geo.sampleArclength, *minArc);
+    const std::size_t end = searchSortedRight(geo.sampleArclength, *maxArc);
     const std::size_t clipBegin = begin > 0 ? begin - 1 : 0;
     const std::size_t clipEnd = std::min(geo.samples.size(), end + 1);
     geo.sampleArclength.erase(geo.sampleArclength.begin() +
@@ -827,27 +838,37 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
                                const GlobalLayoutParams& params)
 {
     GlobalResult result;
+    const auto sortUnplaced = [&result]() {
+        std::sort(result.unplaced.begin(), result.unplaced.end(),
+                  [](const UnplacedFiber& a, const UnplacedFiber& b) {
+                      if (a.label != b.label) {
+                          return a.label < b.label;
+                      }
+                      return a.id < b.id;
+                  });
+    };
+    if (umbilicusCenters.empty()) {
+        // Nothing can be unrolled, and "every fiber" still has to hold: the
+        // whole input is unplaceable, not silently absent.
+        for (const InputFiber& fiber : fibers) {
+            result.unplaced.push_back(
+                UnplacedFiber{fiber.id, fiber.fileName, fiber.label, fiber.hvTag});
+        }
+        sortUnplaced();
+        return result;
+    }
     for (const InputFiber& fiber : fibers) {
         if (fiber.controlPoints.empty() || fiber.linePoints.empty()) {
             result.unplaced.push_back(
                 UnplacedFiber{fiber.id, fiber.fileName, fiber.label, fiber.hvTag});
         }
     }
-    std::sort(result.unplaced.begin(), result.unplaced.end(),
-              [](const UnplacedFiber& a, const UnplacedFiber& b) {
-                  if (a.label != b.label) {
-                      return a.label < b.label;
-                  }
-                  return a.id < b.id;
-              });
-    if (umbilicusCenters.empty()) {
-        return result;
-    }
     const UmbilicusInterp umbilicus = interpolateUmbilicus(umbilicusCenters);
 
     const std::vector<const InputFiber*> ordered = orderPlaceableFibers(fibers);
     const std::size_t fiberCount = ordered.size();
     if (fiberCount == 0) {
+        sortUnplaced();
         return result;
     }
     std::unordered_map<uint64_t, std::size_t> indexById;
@@ -905,13 +926,19 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
                 domainBegin[link.b]});
     }
 
+    winding::SolverParams solverParams = params.solver;
+    // One suspicion threshold: the confidence a link solves with and the
+    // suspicion it is reported with must never disagree.
+    solverParams.linkSuspectTurns = params.suspectTurns;
     const winding::SolveResult solve =
-        winding::solveWindings(traces, linkInputs, params.solver);
+        winding::solveWindings(traces, linkInputs, solverParams);
     result.chirality = solve.chirality;
     result.islandCount = solve.islandCount;
     result.unresolvedCount = solve.unresolvedCount;
     result.tieCount = solve.tieCount;
     result.droppedCrossingCount = solve.droppedCrossingCount;
+    result.gatedSegmentCount = solve.gatedSegmentCount;
+    result.tangentialCount = solve.tangentialCount;
 
     // One reference radius for the whole map. It is a display scale, never
     // evidence, so the median over everything is enough.
@@ -932,6 +959,7 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     double loY = std::numeric_limits<double>::infinity();
     double hiY = -std::numeric_limits<double>::infinity();
     std::vector<FiberGeometry> geometry;
+    std::vector<char> drawable(fiberCount, 0);
     geometry.reserve(fiberCount);
     result.fibers.reserve(fiberCount);
     for (std::size_t i = 0; i < fiberCount; ++i) {
@@ -939,14 +967,26 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         const double offsetRad = kTwoPi * placement.turns;
         FiberGeometry geo = buildFiberGeometry(prepared[i], thetaScale, offsetRad,
                                                rRefVx, sigmaVx, resampleStepVx);
+        GlobalPlacedFiber placed;
+        placed.fiber = makePlacedFiber(*ordered[i], geo);
+        // Geometry too degenerate to draw a single run (a one-point trace,
+        // say) is unplaceable, honestly, rather than a placed fiber the map
+        // never shows.
+        if (placed.fiber.runs.empty()) {
+            result.unplaced.push_back(UnplacedFiber{ordered[i]->id,
+                                                    ordered[i]->fileName,
+                                                    ordered[i]->label,
+                                                    ordered[i]->hvTag});
+            geometry.push_back(std::move(geo));
+            continue;
+        }
+        drawable[i] = 1;
         for (const QPointF& point : geo.samples) {
             loX = std::min(loX, point.x());
             hiX = std::max(hiX, point.x());
             loY = std::min(loY, point.y());
             hiY = std::max(hiY, point.y());
         }
-        GlobalPlacedFiber placed;
-        placed.fiber = makePlacedFiber(*ordered[i], geo);
         placed.meta.linked = placement.linked;
         placed.meta.sheetDriftSuspect = placement.sheetDriftSuspect;
         placed.meta.windingLo = placement.windingLo;
@@ -970,6 +1010,7 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     }
     if (!(loX <= hiX) || !(loY <= hiY)) {
         result.fibers.clear();
+        sortUnplaced();
         return result;
     }
 
@@ -978,6 +1019,9 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     result.links.reserve(allLinks.size());
     for (std::size_t l = 0; l < allLinks.size(); ++l) {
         const LinkRecord& link = allLinks[l];
+        if (!drawable[link.a] || !drawable[link.b]) {
+            continue;
+        }
         PlacedLink placedLink;
         placedLink.fiberA = ordered[link.a]->id;
         placedLink.cpA = link.ia;
@@ -990,8 +1034,10 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         placedLink.turnErr = solve.linkTurnErrors[l];
         placedLink.pending = link.pending;
         // A link the repair had to drop is winding-suspect whatever its
-        // residual now reads: the map placed its endpoints against it.
-        placedLink.suspect = placedLink.turnErr > params.suspectTurns ||
+        // residual now reads: the map placed its endpoints against it. The
+        // boundary is inclusive because a residual AT the threshold already
+        // solves with zero confidence.
+        placedLink.suspect = placedLink.turnErr >= params.suspectTurns ||
                              droppedLinks.count(l) != 0;
         if (placedLink.suspect) {
             ++result.suspectLinkCount;
@@ -1000,7 +1046,8 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     }
 
     for (const winding::Crossing& crossing : solve.crossings) {
-        if (crossing.status != winding::CrossingStatus::Dropped) {
+        if (crossing.status != winding::CrossingStatus::Dropped ||
+            !drawable[crossing.hFiber]) {
             continue;
         }
         const double x =
@@ -1027,6 +1074,7 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         result.windings.push_back(WindingMark{
             static_cast<double>(mark) * circumference, static_cast<int>(mark)});
     }
+    sortUnplaced();
     return result;
 }
 

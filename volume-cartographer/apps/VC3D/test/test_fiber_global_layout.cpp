@@ -299,18 +299,45 @@ private slots:
         QVERIFY(minW < 1.0);
     }
 
-    // No umbilicus: nothing can be unrolled, but the unplaceable report still
-    // stands.
-    void noUmbilicusYieldsOnlyTheUnplacedReport()
+    // No umbilicus: nothing can be unrolled, and EVERY fiber - not just the
+    // geometryless one - is reported unplaceable rather than silently absent.
+    void noUmbilicusReportsEveryFiberUnplaceable()
     {
         InputFiber empty;
         empty.id = 901;
         empty.fileName = "broken.json";
         empty.label = QStringLiteral("broken");
+        InputFiber whole = makeFiber(902, QStringLiteral("whole"), 'H',
+                                     arcPoints(30000.0, 4000.0, 300.0, 0.0, 2.0),
+                                     {100, 400});
         const GlobalResult result = vc3d::fiber_map::buildGlobalLayout(
-            {empty}, {}, defaultParams());
+            {empty, whole}, {}, defaultParams());
         QVERIFY(result.fibers.empty());
+        QCOMPARE(result.unplaced.size(), std::size_t{2});
+    }
+
+    // Geometry too degenerate to draw is unplaceable too: a one-point trace
+    // must not become a placed fiber the map never shows.
+    void degenerateGeometryIsReportedUnplaceable()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        std::vector<InputFiber> fibers =
+            makeWeave(100, QStringLiteral("a-"), 30000.0, 4000.0, 300.0,
+                      0.0, 1.5 * kTwoPi, {200, 900, 1600});
+        InputFiber dot;
+        dot.id = 903;
+        dot.fileName = "dot.json";
+        dot.label = QStringLiteral("dot");
+        dot.hvTag = 'V';
+        dot.linePoints.push_back(cv::Vec3d(4000.0, 0.0, 30000.0));
+        dot.controlPoints.push_back(dot.linePoints.front());
+        fibers.push_back(dot);
+        const GlobalResult result =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+        QCOMPARE(result.fibers.size(), std::size_t{4});
         QCOMPARE(result.unplaced.size(), std::size_t{1});
+        QCOMPARE(result.unplaced.front().id, uint64_t{903});
+        QVERIFY(findFiber(result, 903) == nullptr);
     }
 };
 

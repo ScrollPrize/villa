@@ -5,6 +5,7 @@
 #include <limits>
 #include <cstdlib>
 #include <map>
+#include <set>
 #include <tuple>
 #include <utility>
 
@@ -18,6 +19,12 @@ constexpr double kTwoPi = 2.0 * M_PI;
 // Sample points per fiber for the local radial-ordering cost. Ordinal
 // comparisons need coverage, not density.
 constexpr std::size_t kOrdinalSamples = 48;
+// An island whose runner-up shift scores within this fraction of the
+// runner-up's own cost is ambiguous: ordinal costs scale with the pair
+// count, so a purely absolute margin stops registering near-ties the moment
+// the neighbourhoods hold more than a handful of samples - while a winner
+// whose runner-up carries real violations stays decisive at any scale.
+constexpr double kRelativeAmbiguityFraction = 0.15;
 // Coordinate-ascent search window (turns) and pass cap. The window keeps each
 // step's candidate evaluation cheap; the pass cap bounds total travel (window
 // times passes), and real data has shown slack chains packed tens of windings
@@ -164,7 +171,8 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
     SolveResult result;
     const std::size_t count = fibers.size();
     result.placements.assign(count, Placement{});
-    result.linkTurnErrors.assign(links.size(), 0.0);
+    result.linkTurnErrors.assign(links.size(),
+                                 std::numeric_limits<double>::infinity());
     if (count == 0) {
         return result;
     }
@@ -175,35 +183,48 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
     int chirality = params.chiralityOverride;
     if (chirality == 0) {
         // Radius one whole turn along the same fiber is the same ray one
-        // winding out: crumpling cancels exactly and only the spiral's sign
-        // survives. Anything short of a full turn measures the crumple, not
-        // the chirality, so the covariance fallback only decides when no
-        // fiber wraps.
-        double turnLag = 0.0;
-        double covariance = 0.0;
+        // winding out: crumpling in angle cancels exactly and only the
+        // spiral's sign survives (z drift along the turn does not cancel,
+        // which is one reason each fiber gets one vote rather than one vote
+        // per sample - no single dense or drifting fiber can flip the map).
+        // Fibers that never wrap a full turn measure the crumple, not the
+        // chirality, so the covariance fallback only decides when no fiber
+        // wraps.
+        int turnVotes = 0;
+        int covarianceVotes = 0;
         for (const FiberTrace& fiber : fibers) {
             const std::size_t n = fiber.theta.size();
             if (n < 2 || fiber.radius.size() != n) {
                 continue;
             }
             const bool ascending = fiber.theta.back() >= fiber.theta.front();
+            double lagSum = 0.0;
             std::size_t j = 0;
             for (std::size_t i = 0; i < n; ++i) {
-                if (ascending) {
-                    while (j < n && fiber.theta[j] < fiber.theta[i] + kTwoPi) {
-                        ++j;
-                    }
-                    if (j < n) {
-                        turnLag += fiber.radius[j] - fiber.radius[i];
-                    }
-                } else {
-                    while (j < n && fiber.theta[j] > fiber.theta[i] - kTwoPi) {
-                        ++j;
-                    }
-                    if (j < n) {
-                        turnLag += fiber.radius[i] - fiber.radius[j];
-                    }
+                const double target = ascending ? fiber.theta[i] + kTwoPi
+                                                : fiber.theta[i] - kTwoPi;
+                while (j < n && (ascending ? fiber.theta[j] < target
+                                           : fiber.theta[j] > target)) {
+                    ++j;
                 }
+                if (j >= n || j == 0) {
+                    continue;
+                }
+                // Interpolate the radius at exactly one turn's lag, so the
+                // vote is not polluted by however far the next sample
+                // overshoots the turn.
+                const double span = fiber.theta[j] - fiber.theta[j - 1];
+                const double t = span != 0.0
+                    ? (target - fiber.theta[j - 1]) / span
+                    : 0.0;
+                const double lagged =
+                    fiber.radius[j - 1] + t * (fiber.radius[j] - fiber.radius[j - 1]);
+                lagSum += ascending ? lagged - fiber.radius[i]
+                                    : fiber.radius[i] - lagged;
+            }
+            if (lagSum != 0.0) {
+                turnVotes += lagSum > 0.0 ? 1 : -1;
+                continue;
             }
             double meanTheta = 0.0;
             double meanR = 0.0;
@@ -213,23 +234,41 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
             }
             meanTheta /= static_cast<double>(n);
             meanR /= static_cast<double>(n);
+            double covariance = 0.0;
             for (std::size_t i = 0; i < n; ++i) {
                 covariance +=
                     (fiber.theta[i] - meanTheta) * (fiber.radius[i] - meanR);
             }
+            if (covariance != 0.0) {
+                covarianceVotes += covariance > 0.0 ? 1 : -1;
+            }
         }
-        const double vote = turnLag != 0.0 ? turnLag : covariance;
-        chirality = vote < 0.0 ? -1 : 1;
+        const int vote = turnVotes != 0 ? turnVotes : covarianceVotes;
+        chirality = vote < 0 ? -1 : 1;
     }
     result.chirality = chirality;
 
-    // psi = s * theta: everything below works in a frame where the winding
-    // coordinate grows outward.
+    // psi = s * theta - 2*pi*gauge: everything below works in a frame where
+    // the winding coordinate grows outward AND every fiber's own median sits
+    // within one turn of zero. The canonical gauge matters because the
+    // densest-from-below solve floors every fiber at zero: without it that
+    // floor lives in each fiber's arbitrary unwrap branch, and two physically
+    // identical inputs whose gauges differ produce different maps. The
+    // caller-facing turn offsets compensate on output, so W = s*theta/2pi +
+    // turns holds in the caller's own gauge.
     std::vector<std::vector<double>> psi(count);
+    std::vector<long long> gauge(count, 0);
     for (std::size_t f = 0; f < count; ++f) {
         psi[f].resize(fibers[f].theta.size());
         for (std::size_t i = 0; i < fibers[f].theta.size(); ++i) {
             psi[f][i] = chirality * fibers[f].theta[i];
+        }
+        if (!psi[f].empty()) {
+            gauge[f] = static_cast<long long>(
+                std::llround(median(psi[f]) / kTwoPi));
+            for (double& value : psi[f]) {
+                value -= kTwoPi * static_cast<double>(gauge[f]);
+            }
         }
     }
     const auto usable = [&](std::size_t f) {
@@ -317,15 +356,31 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
                             const double t = (qpx * sz - qpz * sx) / denom;
                             const double u = (qpx * rz - qpz * rx) / denom;
                             // Half-open on both segments so a crossing at a
-                            // shared polyline vertex is counted once.
-                            if (t < 0.0 || t >= 1.0 || u < 0.0 || u >= 1.0) {
+                            // shared interior vertex is counted once - except
+                            // that each polyline's FINAL segment closes at its
+                            // end, so a crossing at a terminal vertex (or at a
+                            // branch apex, which is the reversed end of both
+                            // branches) is owned rather than lost. The apex's
+                            // double detection is exactly what the dedup
+                            // clustering exists to merge.
+                            const bool tEnd = i + 2 == hPsi.size();
+                            const bool uEnd = j + 2 == branch.z.size();
+                            if (t < 0.0 || u < 0.0 ||
+                                (tEnd ? t > 1.0 : t >= 1.0) ||
+                                (uEnd ? u > 1.0 : u >= 1.0)) {
                                 continue;
                             }
+                            const double rH = hR[i] + t * (hR[i + 1] - hR[i]);
+                            const double rV =
+                                branch.r[j] + u * (branch.r[j + 1] - branch.r[j]);
                             // Transversality in arc-length-scaled coordinates:
                             // psi is radians, z voxels, so psi is scaled by the
-                            // branch's radius to compare directions honestly.
-                            const double hx = rx * branch.rScale;
-                            const double vx = sx * branch.rScale;
+                            // crossing's own radius - a branch-wide scale would
+                            // let geometry far along the branch decide whether
+                            // THIS pass counts as transversal.
+                            const double rScale = 0.5 * (rH + rV);
+                            const double hx = rx * rScale;
+                            const double vx = sx * rScale;
                             const double hNorm = std::hypot(hx, rz);
                             const double vNorm = std::hypot(vx, sz);
                             if (hNorm == 0.0 || vNorm == 0.0) {
@@ -342,12 +397,10 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
                             crossing.vFiber = v;
                             crossing.zVx = hZ[i] + t * rz;
                             crossing.psiH = hPsi[i] + t * (hPsi[i + 1] - hPsi[i]);
-                            const double psiV = branch.psi[j] + u * sx;
-                            crossing.n = static_cast<long long>(
-                                std::llround((psiV - crossing.psiH) / kTwoPi));
-                            const double rH = hR[i] + t * (hR[i + 1] - hR[i]);
-                            const double rV =
-                                branch.r[j] + u * (branch.r[j + 1] - branch.r[j]);
+                            // The translate integer IS the turn gap, exactly;
+                            // reconstructing it from large-angle subtraction
+                            // would only reintroduce floating point.
+                            crossing.n = m;
                             crossing.deltaR = rH - rV;
                             const double magnitude = std::abs(crossing.deltaR);
                             if (magnitude <= params.tieBandVx) {
@@ -380,21 +433,29 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
     std::sort(order.begin(), order.end(), [&raw](std::size_t a, std::size_t b) {
         const Crossing& ca = raw[a];
         const Crossing& cb = raw[b];
-        return std::tie(ca.hFiber, ca.vFiber, ca.n, ca.zVx) <
-               std::tie(cb.hFiber, cb.vFiber, cb.n, cb.zVx);
+        return std::tie(ca.hFiber, ca.vFiber, ca.n, ca.zVx, ca.deltaR) <
+               std::tie(cb.hFiber, cb.vFiber, cb.n, cb.zVx, cb.deltaR);
     });
     std::vector<Crossing> merged;
     std::size_t index = 0;
     while (index < order.size()) {
         std::size_t end = index + 1;
         const Crossing& first = raw[order[index]];
-        auto key = std::tie(first.hFiber, first.vFiber, first.n, first.kind);
+        auto key = std::tie(first.hFiber, first.vFiber, first.n);
         double lastZ = first.zVx;
         std::size_t best = index;
         while (end < order.size()) {
             const Crossing& next = raw[order[end]];
-            if (std::tie(next.hFiber, next.vFiber, next.n, next.kind) != key ||
-                next.zVx - lastZ > params.zMergeVx) {
+            // One physical traversal seen twice has nearly the same z AND
+            // nearly the same radial separation. The kind is deliberately not
+            // part of the identity - duplicate detections straddling the tie
+            // band must merge, not turn into a manufactured conflict - while
+            // the deltaR gate keeps genuinely distinct traversals apart (two
+            // branches of a U-shaped fiber can share z, n and kind at wildly
+            // different radii).
+            if (std::tie(next.hFiber, next.vFiber, next.n) != key ||
+                next.zVx - lastZ > params.zMergeVx ||
+                std::abs(next.deltaR - first.deltaR) > params.tieBandVx) {
                 break;
             }
             lastZ = next.zVx;
@@ -605,6 +666,52 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
                   return a.front() < b.front();
               });
 
+    // The primary component must actually carry a crossing constraint: a
+    // link-only network, however large, proves no winding. Fall back to the
+    // largest component only when no crossings survived anywhere.
+    std::set<std::size_t> rootsWithCrossings;
+    for (const Constraint& constraint : constraints) {
+        if (constraint.active && constraint.source >= 0) {
+            rootsWithCrossings.insert(findRoot(constraint.from));
+        }
+    }
+    std::size_t primaryIndex = 0;
+    for (std::size_t c = 0; c < components.size(); ++c) {
+        if (rootsWithCrossings.count(findRoot(components[c].front())) != 0) {
+            primaryIndex = c;
+            break;
+        }
+    }
+
+    // Movable blocks: fibers locked together by equality constraints (links
+    // and ties) can only satisfy their local radial ordering by moving as one
+    // unit - each member alone reads lo == hi and could never move.
+    std::vector<std::size_t> blockParent(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        blockParent[i] = i;
+    }
+    const auto blockRoot = [&blockParent](std::size_t i) {
+        while (blockParent[i] != i) {
+            blockParent[i] = blockParent[blockParent[i]];
+            i = blockParent[i];
+        }
+        return i;
+    };
+    for (const Constraint& constraint : constraints) {
+        if (!constraint.active || constraint.pair < 0) {
+            continue;
+        }
+        const std::size_t a = blockRoot(constraint.from);
+        const std::size_t b = blockRoot(constraint.to);
+        if (a != b) {
+            blockParent[a] = b;
+        }
+    }
+    std::vector<std::size_t> blockOf(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        blockOf[i] = blockRoot(i);
+    }
+
     // --- Local radial-ordering cost. One z-sorted point set over every fiber;
     // membership in the comparison set is a flag consulted per query.
     std::vector<OrdinalPoint> points;
@@ -624,12 +731,18 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
         pointZ[i] = points[i].z;
     }
     std::vector<bool> active(count, false);
+    constexpr std::size_t kNoBlock = std::numeric_limits<std::size_t>::max();
 
     // Ordering violations of fiber f at offset turns kf against the active
     // set. Neighbouring samples share a ray to within the window, so their
     // winding difference is near-integer; the tie band says whether the radii
-    // demand the same winding or a strict order.
-    const auto ordinalCost = [&](std::size_t f, long long kf, std::size_t* pairs) {
+    // demand the same winding, and a strict order is only asserted once |dr|
+    // clears the crumple-slope allowances for the pair's z and arc
+    // separation - anything in between carries no information. Pairs inside
+    // excludeBlock are skipped: a block evaluating its own move must not
+    // score against members it is about to move with.
+    const auto ordinalCost = [&](std::size_t f, long long kf,
+                                 std::size_t excludeBlock, std::size_t* pairs) {
         double cost = 0.0;
         std::size_t pairCount = 0;
         for (const std::size_t i : sampleIndices(psi[f].size())) {
@@ -643,7 +756,8 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
             for (auto it = lo; it != hi; ++it) {
                 const OrdinalPoint& q = points[static_cast<std::size_t>(
                     it - pointZ.begin())];
-                if (q.fiber == f || !active[q.fiber]) {
+                if (q.fiber == f || !active[q.fiber] ||
+                    (excludeBlock != kNoBlock && blockOf[q.fiber] == excludeBlock)) {
                     continue;
                 }
                 const double arc =
@@ -657,7 +771,8 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
                 const long long dw = std::llround(wp - wq);
                 const double dr = r - q.r;
                 const double strictFloor = params.tieBandVx +
-                    params.radialSlopePerZVx * std::abs(z - q.z);
+                    params.radialSlopePerZVx * std::abs(z - q.z) +
+                    params.radialSlopePerArcVx * arc;
                 if (std::abs(dr) <= params.tieBandVx) {
                     ++pairCount;
                     cost += 0.5 * static_cast<double>(std::min<long long>(
@@ -676,57 +791,69 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
         return cost;
     };
 
-    // Feasible interval of one fiber's k given every other fiber's current
-    // value; infinity when unbounded on that side.
-    const auto bounds = [&](std::size_t f) {
-        long long lo = std::numeric_limits<long long>::min();
-        long long hi = std::numeric_limits<long long>::max();
-        for (const Constraint& constraint : constraints) {
-            if (!constraint.active) {
-                continue;
-            }
-            if (constraint.to == f && constraint.from != f) {
-                lo = std::max(lo, k[constraint.from] + constraint.weight);
-            }
-            if (constraint.from == f && constraint.to != f) {
-                hi = std::min(hi, k[constraint.to] - constraint.weight);
+    // Slack moves within the feasible interval toward the best local radial
+    // ordering, one equality block at a time; constraints internal to the
+    // moving block cancel, and everything else is clamped against the
+    // neighbours' current values, so feasibility is invariant.
+    const auto ascend = [&](const std::vector<std::size_t>& members) {
+        std::map<std::size_t, std::vector<std::size_t>> blocks;
+        for (const std::size_t f : members) {
+            if (usable(f)) {
+                blocks[blockOf[f]].push_back(f);
             }
         }
-        return std::make_pair(lo, hi);
-    };
-
-    // Slack nodes move within their feasible interval toward the best local
-    // radial ordering; constraints stay satisfied because every move is
-    // clamped against the neighbours' current values.
-    const auto ascend = [&](const std::vector<std::size_t>& members) {
         for (int pass = 0; pass < kAscentPasses; ++pass) {
             bool changed = false;
-            for (const std::size_t f : members) {
-                if (!usable(f)) {
-                    continue;
-                }
-                const auto [lo, hi] = bounds(f);
-                if (lo >= hi) {
-                    continue;
-                }
-                const long long begin = std::max(lo, k[f] - kAscentWindow);
-                const long long end = std::min(hi, k[f] + kAscentWindow);
-                long long best = k[f];
-                double bestCost = ordinalCost(f, k[f], nullptr);
-                for (long long candidate = begin; candidate <= end; ++candidate) {
-                    if (candidate == k[f]) {
+            for (const auto& [block, blockMembers] : blocks) {
+                long long deltaLo = -kAscentWindow;
+                long long deltaHi = kAscentWindow;
+                for (const Constraint& constraint : constraints) {
+                    if (!constraint.active) {
                         continue;
                     }
-                    const double cost = ordinalCost(f, candidate, nullptr);
-                    if (cost < bestCost ||
-                        (cost == bestCost &&
-                         std::llabs(candidate - k[f]) < std::llabs(best - k[f]))) {
-                        bestCost = cost;
-                        best = candidate;
+                    const bool fromIn = blockOf[constraint.from] == block;
+                    const bool toIn = blockOf[constraint.to] == block;
+                    if (fromIn == toIn) {
+                        continue;
+                    }
+                    if (toIn) {
+                        deltaLo = std::max(deltaLo, k[constraint.from] +
+                                                        constraint.weight -
+                                                        k[constraint.to]);
+                    } else {
+                        deltaHi = std::min(deltaHi, k[constraint.to] -
+                                                        constraint.weight -
+                                                        k[constraint.from]);
                     }
                 }
-                if (best != k[f]) {
-                    k[f] = best;
+                if (deltaLo > 0 || deltaHi < 0 || deltaLo == deltaHi) {
+                    continue;
+                }
+                const auto costAt = [&](long long delta) {
+                    double cost = 0.0;
+                    for (const std::size_t f : blockMembers) {
+                        cost += ordinalCost(f, k[f] + delta, block, nullptr);
+                    }
+                    return cost;
+                };
+                long long best = 0;
+                double bestCost = costAt(0);
+                for (long long delta = deltaLo; delta <= deltaHi; ++delta) {
+                    if (delta == 0) {
+                        continue;
+                    }
+                    const double cost = costAt(delta);
+                    if (cost < bestCost ||
+                        (cost == bestCost &&
+                         std::llabs(delta) < std::llabs(best))) {
+                        bestCost = cost;
+                        best = delta;
+                    }
+                }
+                if (best != 0) {
+                    for (const std::size_t f : blockMembers) {
+                        k[f] += best;
+                    }
                     changed = true;
                 }
             }
@@ -753,7 +880,7 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
     // --- Primary component: gauge fixed at innermost winding zero, slack
     // spent on local ordering against its own members.
     if (!components.empty()) {
-        const std::vector<std::size_t>& primary = components.front();
+        const std::vector<std::size_t>& primary = components[primaryIndex];
         for (const std::size_t f : primary) {
             active[f] = true;
         }
@@ -770,10 +897,16 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
     // everything anchored so far, then their own slack ascent. Anchored
     // islands join the comparison set, so ordering is defined but
     // deterministic.
-    for (std::size_t c = 1; c < components.size(); ++c) {
+    for (std::size_t c = 0; c < components.size(); ++c) {
+        if (c == primaryIndex) {
+            continue;
+        }
         const std::vector<std::size_t>& island = components[c];
         ++result.islandCount;
-        // Candidate shifts implied by neighbouring anchored samples.
+        // Candidate shifts implied by neighbouring anchored samples - but
+        // only pairs that would actually score (tie or strict) may nominate:
+        // a shift suggested by dead-zone geometry would be a guess that every
+        // candidate then scores at zero.
         std::map<long long, std::size_t> candidates;
         for (const std::size_t f : island) {
             if (!usable(f)) {
@@ -798,6 +931,14 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
                     if (arc > params.neighborhoodArcVx) {
                         continue;
                     }
+                    const double dr = r - q.r;
+                    const double strictFloor = params.tieBandVx +
+                        params.radialSlopePerZVx * std::abs(z - q.z) +
+                        params.radialSlopePerArcVx * arc;
+                    if (std::abs(dr) > params.tieBandVx &&
+                        std::abs(dr) <= strictFloor) {
+                        continue;
+                    }
                     const double wp = windingAt(f, i);
                     const double wq = q.psi / kTwoPi +
                                       static_cast<double>(k[q.fiber]);
@@ -806,7 +947,7 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
             }
         }
         if (candidates.empty()) {
-            // Nothing anchored anywhere near: not comparable, not guessed.
+            // Nothing informative anywhere near: not comparable, not guessed.
             const long long shift = static_cast<long long>(
                 std::floor(componentMinWinding(island)));
             for (const std::size_t f : island) {
@@ -826,26 +967,32 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
         for (auto& [shift, cost] : costs) {
             for (const std::size_t f : island) {
                 if (usable(f)) {
-                    cost += ordinalCost(f, k[f] + shift, nullptr);
+                    cost += ordinalCost(f, k[f] + shift, kNoBlock, nullptr);
                 }
             }
         }
-        long long bestShift = costs.begin()->first;
-        double bestCost = costs.begin()->second;
+        long long bestShift = 0;
+        double bestCost = std::numeric_limits<double>::infinity();
         double secondCost = std::numeric_limits<double>::infinity();
         for (const auto& [shift, cost] : costs) {
-            if (cost < bestCost ||
-                (cost == bestCost && std::llabs(shift) < std::llabs(bestShift))) {
+            if (cost < bestCost) {
                 secondCost = bestCost;
                 bestCost = cost;
                 bestShift = shift;
-            } else if (cost < secondCost) {
+            } else if (cost == bestCost &&
+                       std::llabs(shift) < std::llabs(bestShift)) {
+                // An exact cost tie: the old best is a genuine runner-up.
                 secondCost = cost;
+                bestShift = shift;
+            } else {
+                secondCost = std::min(secondCost, cost);
             }
         }
         const bool ambiguous =
             std::isfinite(secondCost) &&
-            secondCost - bestCost <= params.anchorAmbiguityMargin;
+            secondCost - bestCost <=
+                std::max(params.anchorAmbiguityMargin,
+                         kRelativeAmbiguityFraction * secondCost);
         for (const std::size_t f : island) {
             k[f] += bestShift;
             result.placements[f].anchor = ambiguous
@@ -859,7 +1006,7 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
     // --- Outputs.
     for (std::size_t f = 0; f < count; ++f) {
         Placement& placement = result.placements[f];
-        placement.turns = static_cast<double>(k[f]);
+        placement.turns = static_cast<double>(k[f] - gauge[f]);
         if (usable(f)) {
             double lo = std::numeric_limits<double>::infinity();
             double hi = -std::numeric_limits<double>::infinity();
@@ -884,18 +1031,24 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
     std::sort(result.droppedLinks.begin(), result.droppedLinks.end());
     // Sheet drift: rule 1 constrains "that section" of an H fiber; one k per
     // fiber assumes the annotation stays on one sheet. Repeated drops against
-    // distinct evidence on one H fiber are the signature of that assumption
-    // failing, surfaced rather than solved.
-    std::vector<int> dropsPerFiber(count, 0);
+    // DISTINCT evidence on one H fiber - different V fibers or different
+    // turns - are the signature of that assumption failing, surfaced rather
+    // than solved; two drops of one contested traversal are not.
+    std::map<std::size_t, std::set<std::pair<std::size_t, long long>>> dropsPerFiber;
     for (const Crossing& crossing : merged) {
         if (crossing.status == CrossingStatus::Dropped) {
-            ++dropsPerFiber[crossing.hFiber];
+            dropsPerFiber[crossing.hFiber].emplace(crossing.vFiber, crossing.n);
         }
     }
-    for (std::size_t f = 0; f < count; ++f) {
-        if (dropsPerFiber[f] >= 2) {
+    for (const auto& [f, evidence] : dropsPerFiber) {
+        if (evidence.size() >= 2) {
             result.placements[f].sheetDriftSuspect = true;
         }
+    }
+    // Crossing psiH goes back out in the caller's gauge, matching turns.
+    for (Crossing& crossing : merged) {
+        crossing.psiH +=
+            kTwoPi * static_cast<double>(gauge[crossing.hFiber]);
     }
     result.crossings = std::move(merged);
     return result;

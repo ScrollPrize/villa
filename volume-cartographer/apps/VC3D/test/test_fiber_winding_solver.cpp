@@ -380,9 +380,132 @@ private slots:
         const SolveResult result = solveWindings(gaugeShifted.fibers,
                                                  gaugeShifted.links, params);
         QCOMPARE(result.crossings.size(), std::size_t{1});
-        QCOMPARE(result.crossings.front().n, static_cast<long long>(-5));
         QCOMPARE(result.crossings.front().kind, CrossingKind::Tie);
+        // The canonical gauge absorbs the five-turn input gauge before
+        // detection, so the recorded gap is small; the output turn offsets
+        // compensate, which checkRelativeTurns verifies.
+        QCOMPARE(result.crossings.front().n, static_cast<long long>(0));
         checkRelativeTurns(result, gaugeShifted, {0, 1});
+    }
+
+    // The whole solve must be invariant to each fiber's arbitrary unwrap
+    // branch: re-gauging fibers by whole turns changes nothing but the
+    // compensating turn offsets.
+    void solveIsGaugeInvariant()
+    {
+        const World base = threeWindingWorld();
+        World shifted = base;
+        for (double& theta : shifted.fibers[0].theta) {
+            theta += kTwoPi * 7.0;
+        }
+        shifted.trueM[0] -= 7;
+        for (double& theta : shifted.fibers[3].theta) {
+            theta -= kTwoPi * 3.0;
+        }
+        shifted.trueM[3] += 3;
+        const SolveResult a = solveWindings(base.fibers, base.links, SolverParams{});
+        const SolveResult b =
+            solveWindings(shifted.fibers, shifted.links, SolverParams{});
+        QCOMPARE(b.tieCount, a.tieCount);
+        QCOMPARE(b.droppedCrossingCount, a.droppedCrossingCount);
+        checkRelativeTurns(b, shifted, {0, 1, 2, 3});
+        // Identical physical windings: the turn offsets differ by exactly the
+        // injected gauges.
+        QCOMPARE(b.placements[0].turns, a.placements[0].turns - 7.0);
+        QCOMPARE(b.placements[3].turns, a.placements[3].turns + 3.0);
+        for (std::size_t f = 0; f < base.fibers.size(); ++f) {
+            QCOMPARE(b.placements[f].windingLo, a.placements[f].windingLo);
+            QCOMPARE(b.placements[f].windingHi, a.placements[f].windingHi);
+        }
+    }
+
+    // A crossing landing exactly on a V fiber's z apex (the reversed end of
+    // both monotone branches) is owned by the branches' final segments and
+    // merged into one piece of evidence, not lost twice.
+    void apexCrossingsAreOwned()
+    {
+        World world;
+        const std::size_t h = addH(world, 1.2, 1.4, 31000.0);
+        FiberTrace u;
+        u.hvTag = 'V';
+        for (double z = 29000.0; z <= 31000.0 + 1e-9; z += 25.0) {
+            u.theta.push_back(kTwoPi * 0.3);
+            u.z.push_back(z);
+            u.radius.push_back(sheetR(1.3, z));
+        }
+        for (double z = 31000.0 - 25.0; z >= 29500.0; z -= 25.0) {
+            u.theta.push_back(kTwoPi * 0.3);
+            u.z.push_back(z);
+            u.radius.push_back(sheetR(1.3, z));
+        }
+        world.fibers.push_back(std::move(u));
+        world.trueM.push_back(1);
+        const SolveResult result =
+            solveWindings(world.fibers, world.links, SolverParams{});
+        QCOMPARE(result.crossings.size(), std::size_t{1});
+        QCOMPARE(result.crossings.front().kind, CrossingKind::Tie);
+        QCOMPARE(result.crossings.front().mergedCount, 2);
+        checkRelativeTurns(result, world, {h, world.fibers.size() - 1});
+    }
+
+    // A link-only network proves no winding: however large, it must not be
+    // the primary component while any crossing-connected component exists.
+    void linkOnlyNetworksAreNotPrimary()
+    {
+        World world;
+        const std::size_t h0 = addH(world, 0.1, 0.5, 30000.0);
+        const std::size_t v0 = addV(world, 0.3, 27000.0, 33000.0);
+        // A four-fiber linked chain far away in z, crossing nothing.
+        std::vector<std::size_t> chain;
+        for (int i = 0; i < 4; ++i) {
+            chain.push_back(
+                addH(world, 0.05 + 0.5 * i, 0.55 + 0.5 * i, 42000.0));
+        }
+        for (int i = 0; i + 1 < 4; ++i) {
+            world.links.push_back(LinkInput{
+                chain[static_cast<std::size_t>(i)],
+                world.fibers[chain[static_cast<std::size_t>(i)]].theta.size() - 1,
+                chain[static_cast<std::size_t>(i + 1)], 0});
+        }
+        const SolveResult result =
+            solveWindings(world.fibers, world.links, SolverParams{});
+        QCOMPARE(result.placements[h0].anchor, ComponentAnchor::Primary);
+        QCOMPARE(result.placements[v0].anchor, ComponentAnchor::Primary);
+        QCOMPARE(result.islandCount, 1);
+        for (const std::size_t f : chain) {
+            QCOMPARE(result.placements[f].anchor, ComponentAnchor::Unresolved);
+        }
+        checkRelativeTurns(result, world, {chain[0], chain[1], chain[2], chain[3]});
+    }
+
+    // A link that never took part must not read as a perfect link.
+    void invalidLinksReadAsSuspect()
+    {
+        World world;
+        addH(world, 0.05, 0.55, 30000.0);
+        addV(world, 0.3, 27000.0, 33000.0);
+        world.links.push_back(LinkInput{0, 999999, 1, 0});
+        const SolveResult result =
+            solveWindings(world.fibers, world.links, SolverParams{});
+        QVERIFY(std::isinf(result.linkTurnErrors[0]));
+        QVERIFY(result.droppedLinks.empty());
+    }
+
+    // The island fixture, mirrored: local radial ordering must anchor the
+    // same map in the opposite chirality.
+    void mirroredIslandsAnchorTheSameWay()
+    {
+        World world = threeWindingWorld();
+        const std::size_t island = addV(world, 2.31, 30500.0, 33000.0);
+        world.fibers[island].theta.assign(world.fibers[island].theta.size(),
+                                          kTwoPi * 0.31);
+        world.trueM[island] = 2;
+        const World flipped = mirrored(world);
+        const SolveResult result =
+            solveWindings(flipped.fibers, flipped.links, SolverParams{});
+        QCOMPARE(result.chirality, -1);
+        QCOMPARE(result.placements[island].anchor, ComponentAnchor::Radius);
+        checkRelativeTurns(result, flipped, {0, 1, 2, 3, island});
     }
 
     // A crossing landing exactly on a shared polyline vertex is one crossing,
@@ -475,12 +598,16 @@ private slots:
         World world = threeWindingWorld();
         const std::size_t island = world.fibers.size();
         {
+            // Beyond the H fiber's neighbourhood in z, so only the two V
+            // fibers weigh in - and they weigh exactly evenly, the island
+            // radius being the midpoint on their own ray.
             FiberTrace fiber;
             fiber.hvTag = 'V';
-            for (double z = 30500.0; z <= 33000.0; z += 25.0) {
-                fiber.theta.push_back(kTwoPi * 0.31);
+            for (double z = 32200.0; z <= 33000.0; z += 25.0) {
+                fiber.theta.push_back(kTwoPi * 0.3);
                 fiber.z.push_back(z);
-                fiber.radius.push_back(sheetR(1.81, z));
+                fiber.radius.push_back(
+                    0.5 * (sheetR(1.3, z) + sheetR(2.3, z)));
             }
             world.fibers.push_back(std::move(fiber));
             world.trueM.push_back(1);

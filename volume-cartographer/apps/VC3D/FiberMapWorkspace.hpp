@@ -211,6 +211,10 @@ private:
     // What the status line says when nothing is stale: the last build summary,
     // or the clear reason. Restored when a derived stale reason reverts.
     QString _freshStatus;
+    // The clear reason alone, without the umbilicus suffix _freshStatus
+    // froze into itself: showEvent() recomposes the suffix from the live
+    // package, which can change while nothing is built.
+    QString _restingReason;
     QString _umbilicusStatusText;
     QString _umbilicusStatusFingerprint;
     bool _umbilicusStatusValid = false;
