@@ -87,7 +87,7 @@ models = [
     "opencv-python-headless>=4.11.0.86",
     "tifffile>=2024.8.30",
     "imagecodecs>=2026.3.6",
-    "cucim-cu13>=26.6",
+    "cucim-cu13>=26.6; sys_platform == 'linux'",
 ]
 # Rendering and geometry utilities
 render = [
@@ -198,7 +198,7 @@ all = [
     "dask>=2024.8.0",
     "dask-image>=2024.5.3",
     "lxml>=6.0.2",
-    "cucim-cu13>=26.6",
+    "cucim-cu13>=26.6; sys_platform == 'linux'",
 ]
 
 [project.urls]
