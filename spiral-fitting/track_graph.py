@@ -19,7 +19,7 @@ class TrackGraph:
 
     def __init__(
             self, crossing_cache, *, track_chunk_size=250_000,
-            node_chunk_size=1_000_000):
+            node_chunk_size=1_000_000, build_topology=True):
         self.source_ids = np.asarray(
             crossing_cache["source_ids"], dtype=np.uint64)
         self.offsets = np.asarray(
@@ -37,6 +37,17 @@ class TrackGraph:
         self._validate()
 
         started = time.perf_counter()
+        self.graph = None
+        if not build_topology:
+            # Fitting only restricts and remaps the packed CSR above; it never
+            # traverses the graph.  Materialising the same tracks and crossings
+            # a second time as rustworkx nodes and edges costs several GiB of
+            # anonymous memory that nothing on that path reads.  Leave the
+            # arrays authoritative and let traversal clients opt in, which is
+            # the historical default.
+            self.build_seconds = time.perf_counter() - started
+            return
+
         self.graph = rx.PyGraph(multigraph=True)
         for begin in range(0, len(self.source_ids), node_chunk_size):
             count = min(node_chunk_size, len(self.source_ids) - begin)
@@ -91,7 +102,8 @@ class TrackGraph:
             raise ValueError("crossing local indices must be non-negative")
 
     def __len__(self):
-        return self.graph.num_nodes()
+        return (len(self.source_ids) if self.graph is None
+                else self.graph.num_nodes())
 
     def __getitem__(self, name):
         if name not in {
@@ -102,7 +114,14 @@ class TrackGraph:
 
     @property
     def edge_count(self):
-        return self.graph.num_edges()
+        return (len(self.partners) // 2 if self.graph is None
+                else self.graph.num_edges())
+
+    def _require_topology(self):
+        if self.graph is None:
+            raise RuntimeError(
+                'this TrackGraph was built without traversal topology; '
+                'construct it with build_topology=True to walk it')
 
     def node_for_source_id(self, source_id):
         """Return the graph node for one stable track source ID."""
@@ -116,7 +135,7 @@ class TrackGraph:
         """Return the directed CSR record for track -> partner."""
         track = int(track)
         partner = int(partner)
-        if not self.graph.has_node(track):
+        if track < 0 or track >= len(self.source_ids):
             raise IndexError(f"track graph has no node {track}")
         begin = int(self.offsets[track])
         end = int(self.offsets[track + 1])
@@ -129,6 +148,7 @@ class TrackGraph:
     def _bounded_path_to_root(
             self, current, root, remaining_new_tracks, forbidden):
         """Return one simple path suffix to root, or None."""
+        self._require_topology()
         for neighbor in self.graph.neighbors(current):
             neighbor = int(neighbor)
             if neighbor == root:
@@ -238,6 +258,7 @@ class TrackGraph:
         steps = int(steps)
         if steps < 0:
             raise ValueError("walk steps must be non-negative")
+        self._require_topology()
         if not self.graph.has_node(original):
             raise IndexError(f"track graph has no node {original}")
         rng = np.random.default_rng() if rng is None else rng
@@ -269,6 +290,7 @@ class TrackGraph:
         if max_tracks > 4:
             raise ValueError(
                 "short-cycle queries support at most four tracks")
+        self._require_topology()
         if not self.graph.has_node(node):
             raise IndexError(f"track graph has no node {node}")
         root_neighbors = sorted(set(self.graph.neighbors(node)))

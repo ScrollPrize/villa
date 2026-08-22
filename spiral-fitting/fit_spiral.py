@@ -1928,7 +1928,10 @@ class FitContext:
                     or track_sampling_config['crossing_mode'] == 'track_walk'):
                 track_crossing_cache = load_track_crossing_cache(self.tracks_dbm_path)
                 if track_crossing_cache is not None:
-                    track_graph = TrackGraph(track_crossing_cache)
+                    # Training restricts and remaps the exact-crossing CSR;
+                    # it never traverses the duplicate rustworkx topology.
+                    track_graph = TrackGraph(
+                        track_crossing_cache, build_topology=False)
                     print(
                         f'built TrackGraph: {len(track_graph)} tracks, '
                         f'{track_graph.edge_count} crossings in '
