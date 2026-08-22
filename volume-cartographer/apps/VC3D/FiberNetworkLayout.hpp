@@ -9,6 +9,8 @@
 #include <string>
 #include <vector>
 
+#include "FiberWindingSolver.hpp"
+
 // Extrinsic unroll of manually linked H/V fiber networks about the scroll
 // umbilicus, ported from the fiber_network_unroll.py review script.
 //
@@ -148,5 +150,80 @@ struct Result {
 [[nodiscard]] Result buildLayout(const std::vector<InputFiber>& fibers,
                                  const std::vector<cv::Vec3f>& umbilicusCenters,
                                  const LayoutParams& params);
+
+// ---------------------------------------------------------------------------
+// The global map: every fiber on one unrolled plane, each at the winding the
+// solver inferred for it, x = (s*theta + 2*pi*k) * rRef, y = z. Voxels
+// throughout, like buildLayout.
+
+struct GlobalLayoutParams {
+    double suspectTurns = 0.25;
+    // Same intents as the LayoutParams entries of the same names.
+    double smoothVx = 500.0;
+    double resampleStepVx = 104.0;
+    double minPadXVx = 9167.0;
+    double minPadYVx = 6667.0;
+    winding::SolverParams solver;
+};
+
+// How a fiber's component got its absolute winding; mirrors the solver's
+// ComponentAnchor so the UI never implies winding knowledge the solve does
+// not have.
+enum class GlobalAnchor { Primary, Radius, AmbiguousRadius, Unresolved };
+
+struct GlobalFiberMeta {
+    GlobalAnchor anchor = GlobalAnchor::Unresolved;
+    bool linked = false;
+    bool sheetDriftSuspect = false;
+    // W range over the fiber; a multi-turn H fiber has no single winding.
+    double windingLo = 0.0;
+    double windingHi = 0.0;
+};
+
+struct GlobalPlacedFiber {
+    PlacedFiber fiber;
+    GlobalFiberMeta meta;
+};
+
+// A crossing constraint the repair had to drop, marked on the map (y = +z,
+// like every placed coordinate here).
+struct CrossingMark {
+    QPointF posVx;
+};
+
+// A fiber that could not be unrolled at all (no geometry); listed so "every
+// fiber" stays honest.
+struct UnplacedFiber {
+    uint64_t id = 0;
+    std::string fileName;
+    QString label;
+    char hvTag = '?';
+};
+
+struct GlobalResult {
+    // Ordered by (label, id), every placeable fiber of the input.
+    std::vector<GlobalPlacedFiber> fibers;
+    std::vector<PlacedLink> links;
+    // One mark per integer winding across the padded extent.
+    std::vector<WindingMark> windings;
+    std::vector<CrossingMark> suspectCrossings;
+    std::vector<UnplacedFiber> unplaced;
+    double rRefVx = 0.0;
+    double x0Vx = 0.0;
+    double x1Vx = 0.0;
+    double yMinVx = 0.0;
+    double yMaxVx = 0.0;
+    int chirality = 1;
+    int islandCount = 0;
+    int unresolvedCount = 0;
+    int tieCount = 0;
+    int suspectLinkCount = 0;
+    int droppedCrossingCount = 0;
+};
+
+[[nodiscard]] GlobalResult buildGlobalLayout(
+    const std::vector<InputFiber>& fibers,
+    const std::vector<cv::Vec3f>& umbilicusCenters,
+    const GlobalLayoutParams& params);
 
 } // namespace vc3d::fiber_map

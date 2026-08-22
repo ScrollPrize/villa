@@ -133,7 +133,9 @@ vc_register_ctest(fiber_save_batch_tracker test_fiber_save_batch_tracker)
 add_executable(test_fiber_network_layout
     test_fiber_network_layout.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberNetworkLayout.cpp
-    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberNetworkLayout.hpp)
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberNetworkLayout.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberWindingSolver.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberWindingSolver.hpp)
 
 set_target_properties(test_fiber_network_layout PROPERTIES
     AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
@@ -233,3 +235,25 @@ target_link_libraries(test_fiber_winding_solver PRIVATE
 add_test(NAME fiber_winding_solver COMMAND test_fiber_winding_solver)
 vc_register_test_target(test_fiber_winding_solver)
 vc_register_ctest(fiber_winding_solver test_fiber_winding_solver)
+
+add_executable(test_fiber_global_layout
+    test_fiber_global_layout.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberNetworkLayout.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberNetworkLayout.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberWindingSolver.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberWindingSolver.hpp)
+
+set_target_properties(test_fiber_global_layout PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_fiber_global_layout PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D
+    ${OpenCV_INCLUDE_DIRS})
+
+target_link_libraries(test_fiber_global_layout PRIVATE
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME fiber_global_layout COMMAND test_fiber_global_layout)
+vc_register_test_target(test_fiber_global_layout)
+vc_register_ctest(fiber_global_layout test_fiber_global_layout)

@@ -200,6 +200,30 @@ std::size_t searchSortedRight(const std::vector<double>& values, double query)
         std::upper_bound(values.begin(), values.end(), query) - values.begin());
 }
 
+// The umbilicus as three z-sorted interpolation tables.
+struct UmbilicusInterp {
+    std::vector<double> z;
+    std::vector<double> x;
+    std::vector<double> y;
+};
+
+UmbilicusInterp interpolateUmbilicus(const std::vector<cv::Vec3f>& umbilicusCenters)
+{
+    std::vector<cv::Vec3f> centers = umbilicusCenters;
+    std::stable_sort(centers.begin(), centers.end(),
+                     [](const cv::Vec3f& a, const cv::Vec3f& b) { return a[2] < b[2]; });
+    UmbilicusInterp interp;
+    interp.z.resize(centers.size());
+    interp.x.resize(centers.size());
+    interp.y.resize(centers.size());
+    for (std::size_t i = 0; i < centers.size(); ++i) {
+        interp.z[i] = centers[i][2];
+        interp.x[i] = centers[i][0];
+        interp.y[i] = centers[i][1];
+    }
+    return interp;
+}
+
 // A fiber unrolled about the umbilicus; angles are fiber-local until the
 // whole-turn offset is applied.
 struct PreparedFiber {
@@ -218,6 +242,37 @@ struct PreparedFiber {
         return thetaAt(controlIndex) + offset;
     }
 };
+
+PreparedFiber prepareFiber(const InputFiber& fiber, const UmbilicusInterp& umbilicus)
+{
+    PreparedFiber entry;
+    entry.input = &fiber;
+    std::vector<double> raw(fiber.linePoints.size());
+    entry.radius.resize(fiber.linePoints.size());
+    for (std::size_t i = 0; i < fiber.linePoints.size(); ++i) {
+        const cv::Vec3d& point = fiber.linePoints[i];
+        const double dx = point[0] - interpolate(point[2], umbilicus.z, umbilicus.x);
+        const double dy = point[1] - interpolate(point[2], umbilicus.z, umbilicus.y);
+        raw[i] = std::atan2(dy, dx);
+        entry.radius[i] = std::sqrt(dx * dx + dy * dy);
+    }
+    entry.thetaLine = unwrapAngles(raw);
+    entry.controlLineIndex.resize(fiber.controlPoints.size());
+    for (std::size_t i = 0; i < fiber.controlPoints.size(); ++i) {
+        double best = std::numeric_limits<double>::infinity();
+        std::size_t bestIndex = 0;
+        for (std::size_t j = 0; j < fiber.linePoints.size(); ++j) {
+            const cv::Vec3d delta = fiber.linePoints[j] - fiber.controlPoints[i];
+            const double distance = delta.dot(delta);
+            if (distance < best) {
+                best = distance;
+                bestIndex = j;
+            }
+        }
+        entry.controlLineIndex[i] = bestIndex;
+    }
+    return entry;
+}
 
 struct LinkRecord {
     std::size_t a = 0;
@@ -262,31 +317,11 @@ struct NetworkDraft {
     double hiYVx = 0.0;
 };
 
-} // namespace
-
-Result buildLayout(const std::vector<InputFiber>& fibers,
-                   const std::vector<cv::Vec3f>& umbilicusCenters,
-                   const LayoutParams& params)
+// Fibers without geometry cannot be unrolled, so they take no part in the
+// link graph either; both entry points share one notion of "placeable" and
+// one deterministic order.
+std::vector<const InputFiber*> orderPlaceableFibers(const std::vector<InputFiber>& fibers)
 {
-    Result result;
-    if (umbilicusCenters.empty()) {
-        return result;
-    }
-
-    std::vector<cv::Vec3f> centers = umbilicusCenters;
-    std::stable_sort(centers.begin(), centers.end(),
-                     [](const cv::Vec3f& a, const cv::Vec3f& b) { return a[2] < b[2]; });
-    std::vector<double> centerZ(centers.size());
-    std::vector<double> centerX(centers.size());
-    std::vector<double> centerY(centers.size());
-    for (std::size_t i = 0; i < centers.size(); ++i) {
-        centerZ[i] = centers[i][2];
-        centerX[i] = centers[i][0];
-        centerY[i] = centers[i][1];
-    }
-
-    // Fibers without geometry cannot be unrolled, so they take no part in the
-    // link graph either.
     std::vector<const InputFiber*> ordered;
     ordered.reserve(fibers.size());
     for (const InputFiber& fiber : fibers) {
@@ -301,6 +336,251 @@ Result buildLayout(const std::vector<InputFiber>& fibers,
                   }
                   return a->id < b->id;
               });
+    return ordered;
+}
+
+// Links validated and deduped once, over every placeable fiber. Deduped by
+// their sorted endpoint pair: the reciprocal ref of an already-seen crossing
+// is the same physical link, and a half-updated reciprocal pair still reads
+// as pending. Validation matters beyond placement: a link naming a control
+// point that does not exist cannot position anything, but joining on it
+// anyway pulled an otherwise unconnected fiber into the component - it then
+// counted towards minFibers, skewed the network's median radius, and was
+// drawn at its default zero turn offset as though it were linked to
+// something.
+std::vector<LinkRecord> collectValidLinks(
+    const std::vector<const InputFiber*>& ordered,
+    const std::unordered_map<uint64_t, std::size_t>& indexById)
+{
+    std::vector<LinkRecord> links;
+    std::map<std::pair<std::pair<std::size_t, int>, std::pair<std::size_t, int>>,
+             std::size_t>
+        seen;
+    for (std::size_t member = 0; member < ordered.size(); ++member) {
+        const InputFiber& fiber = *ordered[member];
+        const int controlCount = static_cast<int>(fiber.controlPoints.size());
+        for (const InputLink& link : fiber.links) {
+            const auto target = indexById.find(link.branchFiberId);
+            if (target == indexById.end()) {
+                continue;
+            }
+            const std::size_t other = target->second;
+            const int otherCount =
+                static_cast<int>(ordered[other]->controlPoints.size());
+            const int ia = link.controlPointIndex;
+            const int ib = link.branchControlPointIndex;
+            if (ia < 0 || ia >= controlCount || ib < 0 || ib >= otherCount) {
+                qWarning() << "fiber map: link" << fiber.label << ia << "->"
+                           << ordered[other]->label << ib << "out of range; skipped";
+                continue;
+            }
+            const std::pair<std::size_t, int> here{member, ia};
+            const std::pair<std::size_t, int> there{other, ib};
+            const auto inserted =
+                seen.emplace(here < there ? std::make_pair(here, there)
+                                          : std::make_pair(there, here),
+                             links.size());
+            if (!inserted.second) {
+                links[inserted.first->second].pending |= link.pending;
+                continue;
+            }
+            links.push_back(LinkRecord{member, ia, other, ib, 0.0, link.pending});
+        }
+    }
+    std::sort(links.begin(), links.end(),
+              [](const LinkRecord& a, const LinkRecord& b) {
+                  return std::tie(a.a, a.ia, a.b, a.ib) <
+                         std::tie(b.a, b.ia, b.b, b.ib);
+              });
+    return links;
+}
+
+// Snap each fiber's whole-turn offset to its neighbours, growing the link
+// tree Prim-style from the best-agreeing link so one wrong-winding link
+// cannot decide a fiber's offset when a clean link to the same fiber exists.
+// Writes the offsets into `prepared` and each link's residual turn error into
+// `links`.
+void snapComponentOffsets(const std::vector<std::size_t>& component,
+                          std::vector<LinkRecord>& links,
+                          std::unordered_map<std::size_t, PreparedFiber>& prepared)
+{
+    std::unordered_map<std::size_t, std::vector<std::pair<std::size_t, std::size_t>>> adjacency;
+    adjacency.reserve(component.size());
+    for (std::size_t li = 0; li < links.size(); ++li) {
+        adjacency[links[li].a].emplace_back(links[li].b, li);
+        adjacency[links[li].b].emplace_back(links[li].a, li);
+    }
+    std::size_t root = component.front();
+    std::size_t rootDegree = 0;
+    for (const std::size_t member : component) {
+        const auto entry = adjacency.find(member);
+        const std::size_t degree = entry == adjacency.end() ? 0 : entry->second.size();
+        if (degree >= rootDegree) {
+            rootDegree = degree;
+            root = member;
+        }
+    }
+    std::set<std::size_t> placed{root};
+    std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>> heap;
+    const auto pushEdges = [&](std::size_t from) {
+        const auto entry = adjacency.find(from);
+        if (entry == adjacency.end()) {
+            return;
+        }
+        for (const auto& [to, li] : entry->second) {
+            if (placed.count(to) != 0) {
+                continue;
+            }
+            const LinkRecord& link = links[li];
+            const int here = link.a == from ? link.ia : link.ib;
+            const int there = link.a == from ? link.ib : link.ia;
+            const double thetaHere = prepared.at(from).placedThetaAt(here);
+            const double thetaThere = prepared.at(to).thetaAt(there);
+            const double offset =
+                roundTurns((thetaHere - thetaThere) / kTwoPi) * kTwoPi;
+            const double frac =
+                std::fabs(thetaHere - (thetaThere + offset)) / kTwoPi;
+            heap.push(HeapEntry{frac, li, from, to, offset});
+        }
+    };
+    pushEdges(root);
+    while (!heap.empty()) {
+        const HeapEntry entry = heap.top();
+        heap.pop();
+        if (placed.count(entry.to) != 0) {
+            continue;
+        }
+        prepared.at(entry.to).offset = entry.offset;
+        placed.insert(entry.to);
+        pushEdges(entry.to);
+    }
+
+    for (LinkRecord& link : links) {
+        const double thetaA = prepared.at(link.a).placedThetaAt(link.ia);
+        const double thetaB = prepared.at(link.b).placedThetaAt(link.ib);
+        link.turnErr = std::fabs(thetaA - thetaB) / kTwoPi;
+    }
+}
+
+// Unroll one fiber at x = (thetaScale * theta + offsetRad) * rRef, y = z,
+// smooth and resample it, read the control points off the smoothed curve, and
+// clip to the control span. line_points overshoot the outermost control
+// points by over a cm on many fibers; those tails carry no segment metadata
+// and are not drawn, so they are clipped out of the geometry entirely --
+// otherwise label anchors and the extents would be computed from invisible
+// curve.
+FiberGeometry buildFiberGeometry(const PreparedFiber& entry, double thetaScale,
+                                 double offsetRad, double rRefVx, double sigmaVx,
+                                 double resampleStepVx)
+{
+    const InputFiber& fiber = *entry.input;
+    std::vector<QPointF> unrolled(fiber.linePoints.size());
+    for (std::size_t i = 0; i < fiber.linePoints.size(); ++i) {
+        unrolled[i] = QPointF((thetaScale * entry.thetaLine[i] + offsetRad) * rRefVx,
+                              fiber.linePoints[i][2]);
+    }
+
+    FiberGeometry geo;
+    const std::vector<double> rawArclength = arclengths(unrolled);
+    smoothPolyline(unrolled, sigmaVx, resampleStepVx, geo.sampleArclength,
+                   geo.samples);
+    std::vector<double> sampleX(geo.samples.size());
+    std::vector<double> sampleY(geo.samples.size());
+    for (std::size_t i = 0; i < geo.samples.size(); ++i) {
+        sampleX[i] = geo.samples[i].x();
+        sampleY[i] = geo.samples[i].y();
+    }
+    geo.controlArclength.resize(entry.controlLineIndex.size());
+    geo.controlPoints.resize(entry.controlLineIndex.size());
+    for (std::size_t i = 0; i < entry.controlLineIndex.size(); ++i) {
+        const double s = rawArclength[entry.controlLineIndex[i]];
+        geo.controlArclength[i] = s;
+        geo.controlPoints[i] =
+            QPointF(interpolate(s, geo.sampleArclength, sampleX),
+                    interpolate(s, geo.sampleArclength, sampleY));
+    }
+
+    const std::size_t begin =
+        searchSortedLeft(geo.sampleArclength, geo.controlArclength.front());
+    const std::size_t end =
+        searchSortedRight(geo.sampleArclength, geo.controlArclength.back());
+    const std::size_t clipBegin = begin > 0 ? begin - 1 : 0;
+    const std::size_t clipEnd = std::min(geo.samples.size(), end + 1);
+    geo.sampleArclength.erase(geo.sampleArclength.begin() +
+                                  static_cast<std::ptrdiff_t>(clipEnd),
+                              geo.sampleArclength.end());
+    geo.sampleArclength.erase(geo.sampleArclength.begin(),
+                              geo.sampleArclength.begin() +
+                                  static_cast<std::ptrdiff_t>(clipBegin));
+    geo.samples.erase(geo.samples.begin() +
+                          static_cast<std::ptrdiff_t>(clipEnd),
+                      geo.samples.end());
+    geo.samples.erase(geo.samples.begin(),
+                      geo.samples.begin() +
+                          static_cast<std::ptrdiff_t>(clipBegin));
+    return geo;
+}
+
+// Traced runs draw solid, thick and vivid; segments that are only
+// interpolations draw thin, dashed and faded -- "dashed = not real trace
+// data" at a glance.
+PlacedFiber makePlacedFiber(const InputFiber& fiber, const FiberGeometry& geo)
+{
+    PlacedFiber placedFiber;
+    placedFiber.id = fiber.id;
+    placedFiber.fileName = fiber.fileName;
+    placedFiber.label = fiber.label;
+    placedFiber.hvTag = fiber.hvTag;
+    placedFiber.controlPoints = geo.controlPoints;
+
+    const std::size_t spanCount =
+        fiber.controlPoints.empty() ? 0 : fiber.controlPoints.size() - 1;
+    const bool haveFlags = spanCount > 0 &&
+                           fiber.tracedSegments.size() == spanCount;
+    if (!haveFlags) {
+        if (geo.samples.size() > 1) {
+            placedFiber.runs.push_back(Run{true, geo.samples});
+        }
+    } else {
+        std::size_t k = 0;
+        while (k < spanCount) {
+            std::size_t j = k;
+            while (j + 1 < spanCount &&
+                   fiber.tracedSegments[j + 1] == fiber.tracedSegments[k]) {
+                ++j;
+            }
+            const std::size_t begin = searchSortedLeft(
+                geo.sampleArclength, geo.controlArclength[k]);
+            const std::size_t end = searchSortedRight(
+                geo.sampleArclength, geo.controlArclength[j + 1]);
+            const std::size_t from = begin > 0 ? begin - 1 : 0;
+            const std::size_t to = std::min(geo.samples.size(), end + 1);
+            if (to > from + 1) {
+                placedFiber.runs.push_back(Run{
+                    fiber.tracedSegments[k],
+                    std::vector<QPointF>(
+                        geo.samples.begin() + static_cast<std::ptrdiff_t>(from),
+                        geo.samples.begin() + static_cast<std::ptrdiff_t>(to))});
+            }
+            k = j + 1;
+        }
+    }
+    return placedFiber;
+}
+
+} // namespace
+
+Result buildLayout(const std::vector<InputFiber>& fibers,
+                   const std::vector<cv::Vec3f>& umbilicusCenters,
+                   const LayoutParams& params)
+{
+    Result result;
+    if (umbilicusCenters.empty()) {
+        return result;
+    }
+    const UmbilicusInterp umbilicus = interpolateUmbilicus(umbilicusCenters);
+
+    const std::vector<const InputFiber*> ordered = orderPlaceableFibers(fibers);
     const std::size_t fiberCount = ordered.size();
     if (fiberCount == 0) {
         return result;
@@ -311,6 +591,8 @@ Result buildLayout(const std::vector<InputFiber>& fibers,
     for (std::size_t i = 0; i < fiberCount; ++i) {
         indexById.emplace(ordered[i]->id, i);
     }
+
+    const std::vector<LinkRecord> allLinks = collectValidLinks(ordered, indexById);
 
     std::vector<std::size_t> parent(fiberCount);
     for (std::size_t i = 0; i < fiberCount; ++i) {
@@ -323,32 +605,11 @@ Result buildLayout(const std::vector<InputFiber>& fibers,
         }
         return index;
     };
-    for (std::size_t i = 0; i < fiberCount; ++i) {
-        const int controlCount = static_cast<int>(ordered[i]->controlPoints.size());
-        for (const InputLink& link : ordered[i]->links) {
-            const auto target = indexById.find(link.branchFiberId);
-            if (target == indexById.end()) {
-                continue;
-            }
-            // Validated here, not only where the link is placed. A link naming a
-            // control point that does not exist cannot position anything, but
-            // joining on it anyway pulled an otherwise unconnected fiber into the
-            // component: it then counted towards minFibers, skewed the network's
-            // median radius, and was drawn at its default zero turn offset as though
-            // it were linked to something.
-            const int otherCount =
-                static_cast<int>(ordered[target->second]->controlPoints.size());
-            if (link.controlPointIndex < 0 ||
-                link.controlPointIndex >= controlCount ||
-                link.branchControlPointIndex < 0 ||
-                link.branchControlPointIndex >= otherCount) {
-                continue;
-            }
-            const std::size_t a = findRoot(i);
-            const std::size_t b = findRoot(target->second);
-            if (a != b) {
-                parent[a] = b;
-            }
+    for (const LinkRecord& link : allLinks) {
+        const std::size_t a = findRoot(link.a);
+        const std::size_t b = findRoot(link.b);
+        if (a != b) {
+            parent[a] = b;
         }
     }
     std::unordered_map<std::size_t, std::vector<std::size_t>> componentsByRoot;
@@ -396,146 +657,23 @@ Result buildLayout(const std::vector<InputFiber>& fibers,
         std::unordered_map<std::size_t, PreparedFiber> prepared;
         prepared.reserve(component.size());
         for (const std::size_t member : component) {
-            const InputFiber& fiber = *ordered[member];
-            PreparedFiber entry;
-            entry.input = &fiber;
-            std::vector<double> raw(fiber.linePoints.size());
-            entry.radius.resize(fiber.linePoints.size());
-            for (std::size_t i = 0; i < fiber.linePoints.size(); ++i) {
-                const cv::Vec3d& point = fiber.linePoints[i];
-                const double dx = point[0] - interpolate(point[2], centerZ, centerX);
-                const double dy = point[1] - interpolate(point[2], centerZ, centerY);
-                raw[i] = std::atan2(dy, dx);
-                entry.radius[i] = std::sqrt(dx * dx + dy * dy);
-            }
-            entry.thetaLine = unwrapAngles(raw);
-            entry.controlLineIndex.resize(fiber.controlPoints.size());
-            for (std::size_t i = 0; i < fiber.controlPoints.size(); ++i) {
-                double best = std::numeric_limits<double>::infinity();
-                std::size_t bestIndex = 0;
-                for (std::size_t j = 0; j < fiber.linePoints.size(); ++j) {
-                    const cv::Vec3d delta = fiber.linePoints[j] - fiber.controlPoints[i];
-                    const double distance = delta.dot(delta);
-                    if (distance < best) {
-                        best = distance;
-                        bestIndex = j;
-                    }
-                }
-                entry.controlLineIndex[i] = bestIndex;
-            }
-            prepared.emplace(member, std::move(entry));
+            prepared.emplace(member, prepareFiber(*ordered[member], umbilicus));
         }
 
-        // Links, deduped by their sorted endpoint pair: the reciprocal ref of
-        // an already-seen crossing is the same physical link. The map values
-        // are indices into links, so the pending flags of both refs can be
-        // merged onto the record that survived.
+        // This component's slice of the validated links; both endpoints are
+        // members by construction (links are what defined the components).
+        const std::size_t componentRoot = findRoot(component.front());
         std::vector<LinkRecord> links;
-        std::map<std::pair<std::pair<std::size_t, int>, std::pair<std::size_t, int>>,
-                 std::size_t>
-            seen;
-        for (const std::size_t member : component) {
-            const InputFiber& fiber = *ordered[member];
-            const int controlCount = static_cast<int>(fiber.controlPoints.size());
-            for (const InputLink& link : fiber.links) {
-                const auto target = indexById.find(link.branchFiberId);
-                if (target == indexById.end() ||
-                    prepared.find(target->second) == prepared.end()) {
-                    continue;
-                }
-                const std::size_t other = target->second;
-                const int otherCount =
-                    static_cast<int>(ordered[other]->controlPoints.size());
-                const int ia = link.controlPointIndex;
-                const int ib = link.branchControlPointIndex;
-                if (ia < 0 || ia >= controlCount || ib < 0 || ib >= otherCount) {
-                    qWarning() << "fiber map: link" << fiber.label << ia << "->"
-                               << ordered[other]->label << ib << "out of range; skipped";
-                    continue;
-                }
-                const std::pair<std::size_t, int> here{member, ia};
-                const std::pair<std::size_t, int> there{other, ib};
-                const auto inserted =
-                    seen.emplace(here < there ? std::make_pair(here, there)
-                                              : std::make_pair(there, here),
-                                 links.size());
-                if (!inserted.second) {
-                    // A half-updated reciprocal pair still reads as pending.
-                    links[inserted.first->second].pending |= link.pending;
-                    continue;
-                }
-                links.push_back(LinkRecord{member, ia, other, ib, 0.0, link.pending});
+        for (const LinkRecord& link : allLinks) {
+            if (findRoot(link.a) == componentRoot) {
+                links.push_back(link);
             }
         }
         if (links.empty()) {
             continue;
         }
-        std::sort(links.begin(), links.end(),
-                  [](const LinkRecord& a, const LinkRecord& b) {
-                      return std::tie(a.a, a.ia, a.b, a.ib) <
-                             std::tie(b.a, b.ia, b.b, b.ib);
-                  });
 
-        // Snap each fiber's whole-turn offset to its neighbours, growing the
-        // link tree Prim-style from the best-agreeing link so one
-        // wrong-winding link cannot decide a fiber's offset when a clean link
-        // to the same fiber exists.
-        std::unordered_map<std::size_t, std::vector<std::pair<std::size_t, std::size_t>>> adjacency;
-        adjacency.reserve(component.size());
-        for (std::size_t li = 0; li < links.size(); ++li) {
-            adjacency[links[li].a].emplace_back(links[li].b, li);
-            adjacency[links[li].b].emplace_back(links[li].a, li);
-        }
-        std::size_t root = component.front();
-        std::size_t rootDegree = 0;
-        for (const std::size_t member : component) {
-            const auto entry = adjacency.find(member);
-            const std::size_t degree = entry == adjacency.end() ? 0 : entry->second.size();
-            if (degree >= rootDegree) {
-                rootDegree = degree;
-                root = member;
-            }
-        }
-        std::set<std::size_t> placed{root};
-        std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>> heap;
-        const auto pushEdges = [&](std::size_t from) {
-            const auto entry = adjacency.find(from);
-            if (entry == adjacency.end()) {
-                return;
-            }
-            for (const auto& [to, li] : entry->second) {
-                if (placed.count(to) != 0) {
-                    continue;
-                }
-                const LinkRecord& link = links[li];
-                const int here = link.a == from ? link.ia : link.ib;
-                const int there = link.a == from ? link.ib : link.ia;
-                const double thetaHere = prepared.at(from).placedThetaAt(here);
-                const double thetaThere = prepared.at(to).thetaAt(there);
-                const double offset =
-                    roundTurns((thetaHere - thetaThere) / kTwoPi) * kTwoPi;
-                const double frac =
-                    std::fabs(thetaHere - (thetaThere + offset)) / kTwoPi;
-                heap.push(HeapEntry{frac, li, from, to, offset});
-            }
-        };
-        pushEdges(root);
-        while (!heap.empty()) {
-            const HeapEntry entry = heap.top();
-            heap.pop();
-            if (placed.count(entry.to) != 0) {
-                continue;
-            }
-            prepared.at(entry.to).offset = entry.offset;
-            placed.insert(entry.to);
-            pushEdges(entry.to);
-        }
-
-        for (LinkRecord& link : links) {
-            const double thetaA = prepared.at(link.a).placedThetaAt(link.ia);
-            const double thetaB = prepared.at(link.b).placedThetaAt(link.ib);
-            link.turnErr = std::fabs(thetaA - thetaB) / kTwoPi;
-        }
+        snapComponentOffsets(component, links, prepared);
 
         // Centre the component on a whole turn so the winding numbers stay
         // small, and take the reference radius from the crossings.
@@ -567,57 +705,8 @@ Result buildLayout(const std::vector<InputFiber>& fibers,
         geometry.reserve(component.size());
         for (const std::size_t member : component) {
             const PreparedFiber& entry = prepared.at(member);
-            const InputFiber& fiber = *entry.input;
-            std::vector<QPointF> unrolled(fiber.linePoints.size());
-            for (std::size_t i = 0; i < fiber.linePoints.size(); ++i) {
-                unrolled[i] = QPointF((entry.thetaLine[i] + entry.offset) * rRefVx,
-                                      fiber.linePoints[i][2]);
-            }
-
-            FiberGeometry geo;
-            const std::vector<double> rawArclength = arclengths(unrolled);
-            smoothPolyline(unrolled, sigmaVx, resampleStepVx, geo.sampleArclength,
-                           geo.samples);
-            std::vector<double> sampleX(geo.samples.size());
-            std::vector<double> sampleY(geo.samples.size());
-            for (std::size_t i = 0; i < geo.samples.size(); ++i) {
-                sampleX[i] = geo.samples[i].x();
-                sampleY[i] = geo.samples[i].y();
-            }
-            geo.controlArclength.resize(entry.controlLineIndex.size());
-            geo.controlPoints.resize(entry.controlLineIndex.size());
-            for (std::size_t i = 0; i < entry.controlLineIndex.size(); ++i) {
-                const double s = rawArclength[entry.controlLineIndex[i]];
-                geo.controlArclength[i] = s;
-                geo.controlPoints[i] =
-                    QPointF(interpolate(s, geo.sampleArclength, sampleX),
-                            interpolate(s, geo.sampleArclength, sampleY));
-            }
-
-            // line_points overshoot the outermost control points by over a cm
-            // on many fibers; those tails carry no segment metadata and are
-            // not drawn, so they are clipped out of the geometry entirely --
-            // otherwise label anchors and the extents would be computed from
-            // invisible curve.
-            const std::size_t begin =
-                searchSortedLeft(geo.sampleArclength, geo.controlArclength.front());
-            const std::size_t end =
-                searchSortedRight(geo.sampleArclength, geo.controlArclength.back());
-            const std::size_t clipBegin = begin > 0 ? begin - 1 : 0;
-            const std::size_t clipEnd = std::min(geo.samples.size(), end + 1);
-            geo.sampleArclength.erase(geo.sampleArclength.begin() +
-                                          static_cast<std::ptrdiff_t>(clipEnd),
-                                      geo.sampleArclength.end());
-            geo.sampleArclength.erase(geo.sampleArclength.begin(),
-                                      geo.sampleArclength.begin() +
-                                          static_cast<std::ptrdiff_t>(clipBegin));
-            geo.samples.erase(geo.samples.begin() +
-                                  static_cast<std::ptrdiff_t>(clipEnd),
-                              geo.samples.end());
-            geo.samples.erase(geo.samples.begin(),
-                              geo.samples.begin() +
-                                  static_cast<std::ptrdiff_t>(clipBegin));
-
+            FiberGeometry geo = buildFiberGeometry(entry, 1.0, entry.offset,
+                                                   rRefVx, sigmaVx, resampleStepVx);
             for (const QPointF& point : geo.samples) {
                 draft.loXVx = std::min(draft.loXVx, point.x());
                 draft.hiXVx = std::max(draft.hiXVx, point.x());
@@ -630,52 +719,9 @@ Result buildLayout(const std::vector<InputFiber>& fibers,
             continue;
         }
 
-        // Traced runs draw solid, thick and vivid; segments that are only
-        // interpolations draw thin, dashed and faded -- "dashed = not real
-        // trace data" at a glance.
         for (const std::size_t member : component) {
-            const InputFiber& fiber = *prepared.at(member).input;
-            const FiberGeometry& geo = geometry.at(member);
-            PlacedFiber placedFiber;
-            placedFiber.id = fiber.id;
-            placedFiber.fileName = fiber.fileName;
-            placedFiber.label = fiber.label;
-            placedFiber.hvTag = fiber.hvTag;
-            placedFiber.controlPoints = geo.controlPoints;
-
-            const std::size_t spanCount =
-                fiber.controlPoints.empty() ? 0 : fiber.controlPoints.size() - 1;
-            const bool haveFlags = spanCount > 0 &&
-                                   fiber.tracedSegments.size() == spanCount;
-            if (!haveFlags) {
-                if (geo.samples.size() > 1) {
-                    placedFiber.runs.push_back(Run{true, geo.samples});
-                }
-            } else {
-                std::size_t k = 0;
-                while (k < spanCount) {
-                    std::size_t j = k;
-                    while (j + 1 < spanCount &&
-                           fiber.tracedSegments[j + 1] == fiber.tracedSegments[k]) {
-                        ++j;
-                    }
-                    const std::size_t begin = searchSortedLeft(
-                        geo.sampleArclength, geo.controlArclength[k]);
-                    const std::size_t end = searchSortedRight(
-                        geo.sampleArclength, geo.controlArclength[j + 1]);
-                    const std::size_t from = begin > 0 ? begin - 1 : 0;
-                    const std::size_t to = std::min(geo.samples.size(), end + 1);
-                    if (to > from + 1) {
-                        placedFiber.runs.push_back(Run{
-                            fiber.tracedSegments[k],
-                            std::vector<QPointF>(
-                                geo.samples.begin() + static_cast<std::ptrdiff_t>(from),
-                                geo.samples.begin() + static_cast<std::ptrdiff_t>(to))});
-                    }
-                    k = j + 1;
-                }
-            }
-            draft.fibers.push_back(std::move(placedFiber));
+            draft.fibers.push_back(makePlacedFiber(*prepared.at(member).input,
+                                                   geometry.at(member)));
         }
 
         for (const LinkRecord& link : links) {
@@ -772,6 +818,214 @@ Result buildLayout(const std::vector<InputFiber>& fibers,
         result.widthVx = panelStart + width;
         result.networks.push_back(std::move(network));
         panelStart = tickVx * std::ceil((panelStart + width + params.minGapVx) / tickVx);
+    }
+    return result;
+}
+
+GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
+                               const std::vector<cv::Vec3f>& umbilicusCenters,
+                               const GlobalLayoutParams& params)
+{
+    GlobalResult result;
+    for (const InputFiber& fiber : fibers) {
+        if (fiber.controlPoints.empty() || fiber.linePoints.empty()) {
+            result.unplaced.push_back(
+                UnplacedFiber{fiber.id, fiber.fileName, fiber.label, fiber.hvTag});
+        }
+    }
+    std::sort(result.unplaced.begin(), result.unplaced.end(),
+              [](const UnplacedFiber& a, const UnplacedFiber& b) {
+                  if (a.label != b.label) {
+                      return a.label < b.label;
+                  }
+                  return a.id < b.id;
+              });
+    if (umbilicusCenters.empty()) {
+        return result;
+    }
+    const UmbilicusInterp umbilicus = interpolateUmbilicus(umbilicusCenters);
+
+    const std::vector<const InputFiber*> ordered = orderPlaceableFibers(fibers);
+    const std::size_t fiberCount = ordered.size();
+    if (fiberCount == 0) {
+        return result;
+    }
+    std::unordered_map<uint64_t, std::size_t> indexById;
+    indexById.reserve(fiberCount);
+    for (std::size_t i = 0; i < fiberCount; ++i) {
+        indexById.emplace(ordered[i]->id, i);
+    }
+
+    std::vector<PreparedFiber> prepared;
+    prepared.reserve(fiberCount);
+    for (std::size_t i = 0; i < fiberCount; ++i) {
+        prepared.push_back(prepareFiber(*ordered[i], umbilicus));
+    }
+
+    // The solver sees only the control-point-bounded domain of every fiber:
+    // the undrawn line-point tails must not constrain the solve any more than
+    // they may set the drawn extents.
+    std::vector<std::size_t> domainBegin(fiberCount, 0);
+    std::vector<winding::FiberTrace> traces(fiberCount);
+    std::vector<double> allRadii;
+    for (std::size_t i = 0; i < fiberCount; ++i) {
+        const PreparedFiber& entry = prepared[i];
+        const auto [minIt, maxIt] = std::minmax_element(
+            entry.controlLineIndex.begin(), entry.controlLineIndex.end());
+        // One sample beyond each outer control, matching the drawn clip -
+        // and keeping linked crossings, which sit exactly on the outermost
+        // controls, interior to the trace instead of on an fp-fragile edge.
+        const std::size_t begin = *minIt > 0 ? *minIt - 1 : 0;
+        const std::size_t end =
+            std::min(*maxIt + 1, entry.thetaLine.size() - 1);
+        domainBegin[i] = begin;
+        winding::FiberTrace& trace = traces[i];
+        trace.hvTag = ordered[i]->hvTag;
+        trace.theta.assign(entry.thetaLine.begin() + static_cast<std::ptrdiff_t>(begin),
+                           entry.thetaLine.begin() + static_cast<std::ptrdiff_t>(end) + 1);
+        trace.radius.assign(entry.radius.begin() + static_cast<std::ptrdiff_t>(begin),
+                            entry.radius.begin() + static_cast<std::ptrdiff_t>(end) + 1);
+        trace.z.reserve(end - begin + 1);
+        for (std::size_t j = begin; j <= end; ++j) {
+            trace.z.push_back(ordered[i]->linePoints[j][2]);
+        }
+        allRadii.insert(allRadii.end(), trace.radius.begin(), trace.radius.end());
+    }
+
+    const std::vector<LinkRecord> allLinks = collectValidLinks(ordered, indexById);
+    std::vector<winding::LinkInput> linkInputs;
+    linkInputs.reserve(allLinks.size());
+    for (const LinkRecord& link : allLinks) {
+        linkInputs.push_back(winding::LinkInput{
+            link.a,
+            prepared[link.a].controlLineIndex[static_cast<std::size_t>(link.ia)] -
+                domainBegin[link.a],
+            link.b,
+            prepared[link.b].controlLineIndex[static_cast<std::size_t>(link.ib)] -
+                domainBegin[link.b]});
+    }
+
+    const winding::SolveResult solve =
+        winding::solveWindings(traces, linkInputs, params.solver);
+    result.chirality = solve.chirality;
+    result.islandCount = solve.islandCount;
+    result.unresolvedCount = solve.unresolvedCount;
+    result.tieCount = solve.tieCount;
+    result.droppedCrossingCount = solve.droppedCrossingCount;
+
+    // One reference radius for the whole map. It is a display scale, never
+    // evidence, so the median over everything is enough.
+    double rRefVx = median(std::move(allRadii));
+    if (!(rRefVx > 0.0)) {
+        rRefVx = 1.0;
+    }
+    result.rRefVx = rRefVx;
+
+    const double sigmaVx = std::max(0.0, params.smoothVx);
+    const double resampleStepVx = params.resampleStepVx > 0.0
+        ? params.resampleStepVx
+        : GlobalLayoutParams{}.resampleStepVx;
+    const double thetaScale = static_cast<double>(solve.chirality);
+
+    double loX = std::numeric_limits<double>::infinity();
+    double hiX = -std::numeric_limits<double>::infinity();
+    double loY = std::numeric_limits<double>::infinity();
+    double hiY = -std::numeric_limits<double>::infinity();
+    std::vector<FiberGeometry> geometry;
+    geometry.reserve(fiberCount);
+    result.fibers.reserve(fiberCount);
+    for (std::size_t i = 0; i < fiberCount; ++i) {
+        const winding::Placement& placement = solve.placements[i];
+        const double offsetRad = kTwoPi * placement.turns;
+        FiberGeometry geo = buildFiberGeometry(prepared[i], thetaScale, offsetRad,
+                                               rRefVx, sigmaVx, resampleStepVx);
+        for (const QPointF& point : geo.samples) {
+            loX = std::min(loX, point.x());
+            hiX = std::max(hiX, point.x());
+            loY = std::min(loY, point.y());
+            hiY = std::max(hiY, point.y());
+        }
+        GlobalPlacedFiber placed;
+        placed.fiber = makePlacedFiber(*ordered[i], geo);
+        placed.meta.linked = placement.linked;
+        placed.meta.sheetDriftSuspect = placement.sheetDriftSuspect;
+        placed.meta.windingLo = placement.windingLo;
+        placed.meta.windingHi = placement.windingHi;
+        switch (placement.anchor) {
+        case winding::ComponentAnchor::Primary:
+            placed.meta.anchor = GlobalAnchor::Primary;
+            break;
+        case winding::ComponentAnchor::Radius:
+            placed.meta.anchor = GlobalAnchor::Radius;
+            break;
+        case winding::ComponentAnchor::AmbiguousRadius:
+            placed.meta.anchor = GlobalAnchor::AmbiguousRadius;
+            break;
+        case winding::ComponentAnchor::Unresolved:
+            placed.meta.anchor = GlobalAnchor::Unresolved;
+            break;
+        }
+        result.fibers.push_back(std::move(placed));
+        geometry.push_back(std::move(geo));
+    }
+    if (!(loX <= hiX) || !(loY <= hiY)) {
+        result.fibers.clear();
+        return result;
+    }
+
+    std::set<std::size_t> droppedLinks(solve.droppedLinks.begin(),
+                                       solve.droppedLinks.end());
+    result.links.reserve(allLinks.size());
+    for (std::size_t l = 0; l < allLinks.size(); ++l) {
+        const LinkRecord& link = allLinks[l];
+        PlacedLink placedLink;
+        placedLink.fiberA = ordered[link.a]->id;
+        placedLink.cpA = link.ia;
+        placedLink.fiberB = ordered[link.b]->id;
+        placedLink.cpB = link.ib;
+        placedLink.a =
+            geometry[link.a].controlPoints[static_cast<std::size_t>(link.ia)];
+        placedLink.b =
+            geometry[link.b].controlPoints[static_cast<std::size_t>(link.ib)];
+        placedLink.turnErr = solve.linkTurnErrors[l];
+        placedLink.pending = link.pending;
+        // A link the repair had to drop is winding-suspect whatever its
+        // residual now reads: the map placed its endpoints against it.
+        placedLink.suspect = placedLink.turnErr > params.suspectTurns ||
+                             droppedLinks.count(l) != 0;
+        if (placedLink.suspect) {
+            ++result.suspectLinkCount;
+        }
+        result.links.push_back(std::move(placedLink));
+    }
+
+    for (const winding::Crossing& crossing : solve.crossings) {
+        if (crossing.status != winding::CrossingStatus::Dropped) {
+            continue;
+        }
+        const double x =
+            (crossing.psiH + kTwoPi * solve.placements[crossing.hFiber].turns) *
+            rRefVx;
+        result.suspectCrossings.push_back(CrossingMark{QPointF(x, crossing.zVx)});
+    }
+
+    const double padX = std::max(kPadFraction * (hiX - loX), params.minPadXVx);
+    const double padY = std::max(kPadFraction * (hiY - loY), params.minPadYVx);
+    result.x0Vx = loX - padX;
+    result.x1Vx = hiX + padX;
+    result.yMinVx = loY - padY;
+    result.yMaxVx = hiY + padY;
+
+    // One gridline per integer winding across the padded extent; the mark
+    // number IS the winding coordinate (innermost anchored winding = 0).
+    const double circumference = kTwoPi * rRefVx;
+    const long long first =
+        static_cast<long long>(std::ceil(result.x0Vx / circumference));
+    const long long last =
+        static_cast<long long>(std::floor(result.x1Vx / circumference));
+    for (long long mark = first; mark <= last; ++mark) {
+        result.windings.push_back(WindingMark{
+            static_cast<double>(mark) * circumference, static_cast<int>(mark)});
     }
     return result;
 }

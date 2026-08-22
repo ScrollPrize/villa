@@ -1,0 +1,318 @@
+// Coverage for buildGlobalLayout in apps/VC3D/FiberNetworkLayout.cpp: the
+// all-fibers map built on the winding solver. The solver's own arithmetic is
+// covered by test_fiber_winding_solver; this asserts the layout contract on
+// top of it - every fiber accounted for, links landing coincident, winding
+// gridlines numbered by the winding coordinate, both chiralities.
+
+#include <QtTest/QtTest>
+
+#include <algorithm>
+#include <cmath>
+#include <vector>
+
+#include "FiberNetworkLayout.hpp"
+
+using vc3d::fiber_map::GlobalAnchor;
+using vc3d::fiber_map::GlobalLayoutParams;
+using vc3d::fiber_map::GlobalPlacedFiber;
+using vc3d::fiber_map::GlobalResult;
+using vc3d::fiber_map::InputFiber;
+using vc3d::fiber_map::PlacedLink;
+
+namespace
+{
+
+constexpr double kTwoPi = 2.0 * M_PI;
+constexpr int kStepsPerTurn = 1256;
+constexpr double kStep = kTwoPi / static_cast<double>(kStepsPerTurn);
+constexpr double kVxPerCm = 10000.0 / 2.4;
+
+constexpr double vx(double centimetres)
+{
+    return centimetres * kVxPerCm;
+}
+
+std::vector<cv::Vec3f> straightUmbilicus(int zMax)
+{
+    std::vector<cv::Vec3f> centers;
+    centers.reserve(static_cast<std::size_t>(zMax) + 1);
+    for (int z = 0; z <= zMax; ++z) {
+        centers.push_back(cv::Vec3f(0.0f, 0.0f, static_cast<float>(z)));
+    }
+    return centers;
+}
+
+std::vector<cv::Vec3d> arcPoints(double z, double radius, double radiusPerTurn,
+                                 double thetaBegin, double thetaEnd)
+{
+    std::vector<cv::Vec3d> points;
+    const int count = static_cast<int>(std::floor((thetaEnd - thetaBegin) / kStep)) + 1;
+    points.reserve(static_cast<std::size_t>(std::max(count, 0)));
+    for (int i = 0; i < count; ++i) {
+        const double theta = thetaBegin + static_cast<double>(i) * kStep;
+        const double r = radius + radiusPerTurn * theta / kTwoPi;
+        points.push_back(cv::Vec3d(r * std::cos(theta), r * std::sin(theta), z));
+    }
+    return points;
+}
+
+std::vector<cv::Vec3d> verticalPoints(double theta, double radius, double zBegin,
+                                      double zEnd, double zStep)
+{
+    std::vector<cv::Vec3d> points;
+    const int count = static_cast<int>(std::floor((zEnd - zBegin) / zStep)) + 1;
+    points.reserve(static_cast<std::size_t>(std::max(count, 0)));
+    for (int i = 0; i < count; ++i) {
+        const double z = zBegin + static_cast<double>(i) * zStep;
+        points.push_back(cv::Vec3d(radius * std::cos(theta), radius * std::sin(theta), z));
+    }
+    return points;
+}
+
+InputFiber makeFiber(uint64_t id, const QString& label, char hvTag,
+                     std::vector<cv::Vec3d> linePoints,
+                     const std::vector<int>& controlIndices)
+{
+    InputFiber fiber;
+    fiber.id = id;
+    fiber.fileName = label.toStdString() + ".json";
+    fiber.label = label;
+    fiber.hvTag = hvTag;
+    fiber.linePoints = std::move(linePoints);
+    for (int index : controlIndices) {
+        fiber.controlPoints.push_back(fiber.linePoints[static_cast<std::size_t>(index)]);
+    }
+    if (fiber.controlPoints.size() > 1) {
+        fiber.tracedSegments.assign(fiber.controlPoints.size() - 1, true);
+    }
+    return fiber;
+}
+
+void addLink(InputFiber& a, int controlA, InputFiber& b, int controlB)
+{
+    a.links.push_back({controlA, b.id, controlB});
+    b.links.push_back({controlB, a.id, controlA});
+}
+
+double angleOf(const cv::Vec3d& point)
+{
+    return std::atan2(point[1], point[0]);
+}
+
+// One H fiber winding around the scroll with a V fiber linked at every
+// requested crossing (same-winding contacts: the V is drawn through the H
+// fiber's own point).
+std::vector<InputFiber> makeWeave(uint64_t firstId, const QString& prefix, double z,
+                                  double radius, double radiusPerTurn,
+                                  double thetaBegin, double thetaEnd,
+                                  const std::vector<int>& controlIndices)
+{
+    std::vector<InputFiber> fibers;
+    std::vector<cv::Vec3d> line = arcPoints(z, radius, radiusPerTurn, thetaBegin, thetaEnd);
+    fibers.push_back(makeFiber(firstId, prefix + QStringLiteral("h-1"), 'H', line,
+                               controlIndices));
+    for (std::size_t i = 0; i < controlIndices.size(); ++i) {
+        const cv::Vec3d crossing = fibers.front().controlPoints[i];
+        std::vector<cv::Vec3d> verticalLine =
+            verticalPoints(angleOf(crossing), std::hypot(crossing[0], crossing[1]),
+                           z - 400.0, z + 400.0, 4.0);
+        const int last = static_cast<int>(verticalLine.size()) - 1;
+        InputFiber vertical = makeFiber(firstId + 1 + i,
+                                        prefix + QStringLiteral("v-%1").arg(i + 1), 'V',
+                                        std::move(verticalLine), {0, last / 2, last});
+        addLink(fibers.front(), static_cast<int>(i), vertical, 1);
+        fibers.push_back(std::move(vertical));
+    }
+    return fibers;
+}
+
+GlobalLayoutParams defaultParams()
+{
+    GlobalLayoutParams params;
+    params.smoothVx = 0.0;
+    params.resampleStepVx = vx(0.025);
+    params.minPadXVx = vx(2.2);
+    params.minPadYVx = vx(1.6);
+    return params;
+}
+
+std::vector<InputFiber> mirrored(std::vector<InputFiber> fibers)
+{
+    for (InputFiber& fiber : fibers) {
+        for (cv::Vec3d& point : fiber.linePoints) {
+            point[1] = -point[1];
+        }
+        for (cv::Vec3d& point : fiber.controlPoints) {
+            point[1] = -point[1];
+        }
+    }
+    return fibers;
+}
+
+const GlobalPlacedFiber* findFiber(const GlobalResult& result, uint64_t id)
+{
+    for (const GlobalPlacedFiber& fiber : result.fibers) {
+        if (fiber.fiber.id == id) {
+            return &fiber;
+        }
+    }
+    return nullptr;
+}
+
+} // namespace
+
+class TestFiberGlobalLayout : public QObject
+{
+    Q_OBJECT
+
+private slots:
+    // Every input fiber is either placed or reported unplaceable; no gate on
+    // network size, no top-N cut.
+    void everyFiberIsAccountedFor()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        std::vector<InputFiber> fibers =
+            makeWeave(100, QStringLiteral("a-"), 30000.0, 4000.0, 300.0,
+                      0.0, 1.5 * kTwoPi, {200, 900, 1600});
+        // An unlinked fiber on the weave's own sheet, a little above it: no
+        // crossings (the V fibers stop below its z), so it is an island whose
+        // local radial ordering ties it back to the sheet.
+        fibers.push_back(makeFiber(900, QStringLiteral("c-h-9"), 'H',
+                                   arcPoints(30500.0, 4000.0, 300.0, 0.0, 0.8 * kTwoPi),
+                                   {100, 800}));
+        // And one with no geometry at all.
+        InputFiber empty;
+        empty.id = 901;
+        empty.fileName = "broken.json";
+        empty.label = QStringLiteral("broken");
+        empty.hvTag = 'V';
+        fibers.push_back(empty);
+
+        const GlobalResult result =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+        QCOMPARE(result.fibers.size(), std::size_t{5});
+        QCOMPARE(result.unplaced.size(), std::size_t{1});
+        QCOMPARE(result.unplaced.front().id, uint64_t{901});
+        QCOMPARE(QString::fromStdString(result.unplaced.front().fileName),
+                 QStringLiteral("broken.json"));
+
+        const GlobalPlacedFiber* island = findFiber(result, 900);
+        QVERIFY(island != nullptr);
+        QCOMPARE(island->meta.anchor, GlobalAnchor::Radius);
+        QVERIFY(!island->meta.linked);
+        QCOMPARE(result.islandCount, 1);
+        // Ties to the weave H fiber's own sheet: the island's winding range
+        // starts 100 angular samples before the weave H fiber's domain.
+        const GlobalPlacedFiber* weaveH = findFiber(result, 100);
+        QVERIFY(weaveH != nullptr);
+        QVERIFY2(std::abs(island->meta.windingLo -
+                          (weaveH->meta.windingLo - 100.0 * kStep / kTwoPi)) < 0.01,
+                 qPrintable(QStringLiteral("island %1 weave %2")
+                                .arg(island->meta.windingLo)
+                                .arg(weaveH->meta.windingLo)));
+
+        for (const GlobalPlacedFiber& fiber : result.fibers) {
+            QVERIFY(fiber.meta.windingHi >= fiber.meta.windingLo);
+            QVERIFY(!fiber.fiber.runs.empty());
+        }
+    }
+
+    // Linked crossings coincide on the global map exactly as they do on the
+    // per-network panels, and the winding gridlines are numbered by the
+    // winding coordinate with the innermost anchored winding at zero.
+    void linksCoincideAndWindingsAreNumbered()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        const std::vector<InputFiber> fibers =
+            makeWeave(100, QStringLiteral("a-"), 30000.0, 4000.0, 300.0,
+                      -0.4, kTwoPi + 0.4, {100, 100 + kStepsPerTurn});
+        const GlobalResult result =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+        QCOMPARE(result.chirality, 1);
+        QCOMPARE(result.fibers.size(), std::size_t{3});
+        QCOMPARE(result.links.size(), std::size_t{2});
+        QCOMPARE(result.suspectLinkCount, 0);
+        for (const PlacedLink& link : result.links) {
+            QVERIFY2(link.turnErr < 1e-9, qPrintable(QString::number(link.turnErr)));
+            QVERIFY(std::abs(link.a.x() - link.b.x()) < vx(0.01));
+            QVERIFY(std::abs(link.a.y() - link.b.y()) < vx(0.01));
+        }
+        // The two crossings sit one winding apart.
+        QVERIFY(std::abs(std::abs(result.links[1].a.x() - result.links[0].a.x()) -
+                         kTwoPi * result.rRefVx) < vx(0.05));
+
+        QVERIFY(!result.windings.empty());
+        for (std::size_t i = 0; i < result.windings.size(); ++i) {
+            QVERIFY(result.windings[i].xVx >= result.x0Vx);
+            QVERIFY(result.windings[i].xVx <= result.x1Vx);
+            QVERIFY(std::abs(result.windings[i].xVx -
+                             static_cast<double>(result.windings[i].number) *
+                                 kTwoPi * result.rRefVx) < 1e-6);
+            if (i > 0) {
+                QCOMPARE(result.windings[i].number, result.windings[i - 1].number + 1);
+            }
+        }
+
+        double minW = std::numeric_limits<double>::infinity();
+        for (const GlobalPlacedFiber& fiber : result.fibers) {
+            QCOMPARE(fiber.meta.anchor, GlobalAnchor::Primary);
+            QVERIFY(fiber.meta.linked);
+            minW = std::min(minW, fiber.meta.windingLo);
+        }
+        QVERIFY(minW >= 0.0);
+        QVERIFY(minW < 1.0);
+
+        // Determinism: same input, identical map.
+        const GlobalResult repeat =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+        QVERIFY(repeat.x0Vx == result.x0Vx);
+        QVERIFY(repeat.x1Vx == result.x1Vx);
+        QVERIFY(repeat.rRefVx == result.rRefVx);
+        for (std::size_t f = 0; f < result.fibers.size(); ++f) {
+            QCOMPARE(repeat.fibers[f].fiber.label, result.fibers[f].fiber.label);
+            QCOMPARE(repeat.fibers[f].meta.windingLo, result.fibers[f].meta.windingLo);
+        }
+    }
+
+    // A mirrored scroll (opposite chirality) produces the same map: the
+    // winding coordinate still grows outward and crossings still coincide.
+    void mirroredChiralityLaysOutTheSameMap()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        const std::vector<InputFiber> fibers = mirrored(
+            makeWeave(100, QStringLiteral("a-"), 30000.0, 4000.0, 300.0,
+                      -0.4, kTwoPi + 0.4, {100, 100 + kStepsPerTurn}));
+        const GlobalResult result =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+        QCOMPARE(result.chirality, -1);
+        QCOMPARE(result.fibers.size(), std::size_t{3});
+        QCOMPARE(result.suspectLinkCount, 0);
+        for (const PlacedLink& link : result.links) {
+            QVERIFY(link.turnErr < 1e-9);
+            QVERIFY(std::abs(link.a.x() - link.b.x()) < vx(0.01));
+        }
+        double minW = std::numeric_limits<double>::infinity();
+        for (const GlobalPlacedFiber& fiber : result.fibers) {
+            minW = std::min(minW, fiber.meta.windingLo);
+        }
+        QVERIFY(minW >= 0.0);
+        QVERIFY(minW < 1.0);
+    }
+
+    // No umbilicus: nothing can be unrolled, but the unplaceable report still
+    // stands.
+    void noUmbilicusYieldsOnlyTheUnplacedReport()
+    {
+        InputFiber empty;
+        empty.id = 901;
+        empty.fileName = "broken.json";
+        empty.label = QStringLiteral("broken");
+        const GlobalResult result = vc3d::fiber_map::buildGlobalLayout(
+            {empty}, {}, defaultParams());
+        QVERIFY(result.fibers.empty());
+        QCOMPARE(result.unplaced.size(), std::size_t{1});
+    }
+};
+
+QTEST_APPLESS_MAIN(TestFiberGlobalLayout)
+#include "test_fiber_global_layout.moc"
