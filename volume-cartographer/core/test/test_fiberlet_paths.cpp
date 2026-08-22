@@ -889,7 +889,7 @@ TEST_CASE("fiberlet quantization benchmark evaluates the complete scenario matri
         vc::fiber_tracer::benchmarkFiberletQuantization(anchors, paths, {{5.0, 8.0, 8.0}, {21.0, 8.0, 8.0}}, normals, 2.0, replay, extractor, 512);
 
     REQUIRE(reports.size() == 19);
-    CHECK(extractionCalls == 7);
+    CHECK(extractionCalls == 8);
     CHECK(reports.front().scenario.name == "baseline");
     for (const auto& report : reports) {
         INFO(report.scenario.name << ": " << report.reason);

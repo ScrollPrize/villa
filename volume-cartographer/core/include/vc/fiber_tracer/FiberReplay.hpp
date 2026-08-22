@@ -190,6 +190,7 @@ struct FiberReplayBundleInput {
     nlohmann::json sources;
     nlohmann::json traceBinding;
     nlohmann::json predictionBinding;
+    nlohmann::json fiberletEvaluationProfile;
     nlohmann::json requestedTraceConfig;
     nlohmann::json effectiveTraceConfig;
     std::optional<FiberReplayOverview> overview;

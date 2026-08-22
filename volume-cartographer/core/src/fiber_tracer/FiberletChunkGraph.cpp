@@ -449,18 +449,18 @@ FiberletCachedReplayGraphSource::FiberletCachedReplayGraphSource(
     if (!preprocessor_ || !(maximumJoinAngleDegrees_ >= 0.0F) || !(maximumJoinAngleDegrees_ <= 180.0F) || !std::isfinite(maximumJoinAngleDegrees_)) {
         throw std::invalid_argument("cached fiberlet replay graph configuration is invalid");
     }
-    if (evaluationQuantization_.positionQuantumBaseVoxels < 0 ||
-        (evaluationQuantization_.costBits != 0 && evaluationQuantization_.costBits != 8 && evaluationQuantization_.costBits != 16) ||
+    if ((evaluationQuantization_.costBits != 0 && evaluationQuantization_.costBits != 8 && evaluationQuantization_.costBits != 16) ||
         (evaluationQuantization_.costDomain != FiberletCostQuantizationDomain::RawTotal &&
          evaluationQuantization_.costDomain != FiberletCostQuantizationDomain::SqrtPerPredictionVoxel) ||
         (evaluationQuantization_.costDomain == FiberletCostQuantizationDomain::SqrtPerPredictionVoxel &&
          (!(evaluationQuantization_.costDensityMaximum > 0.0F) ||
           !std::isfinite(evaluationQuantization_.costDensityMaximum))) ||
-        evaluationQuantization_.storageChunkSideBaseVoxels <= 0 ||
-        (evaluationQuantization_.positionQuantumBaseVoxels > 0 &&
-         evaluationQuantization_.storageChunkSideBaseVoxels % evaluationQuantization_.positionQuantumBaseVoxels != 0)) {
+        evaluationQuantization_.storageChunkSideBaseVoxels <= 0) {
         throw std::invalid_argument("cached fiberlet logical quantization is invalid");
     }
+    (void)fiberletPositionBinCountForEvaluation(
+        evaluationQuantization_.storageChunkSideBaseVoxels,
+        evaluationQuantization_.positionQuantumBaseVoxels);
 }
 
 float FiberletCachedReplayGraphSource::predictionToBaseScale() const noexcept

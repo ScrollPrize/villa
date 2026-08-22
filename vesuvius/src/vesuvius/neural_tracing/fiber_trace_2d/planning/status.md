@@ -1,11 +1,13 @@
-# Status: fixed nonlinear uint16 fiberlet costs
+# Status: compact float-position fiberlet default
 
-- [x] Capture the revised fixed-range task and implementation plan.
-- [x] Remove the rejected adaptive per-chunk density design.
-- [x] Remove the unpublished uint8 fixed-sqrt scenarios.
-- [x] Implement fixed sqrt-density uint16 encode/decode.
-- [x] Add focused regression coverage.
-- [x] Rebuild and run focused tests with `-j32`.
-- [x] Run the full radius-768 Paris4 comparison using existing caches.
-- [x] Verify the warm cache remains unchanged.
+- [x] Capture the requested task and implementation plan.
+- [x] Review the plan independently against task and specifications.
+- [x] Add explicit default and exact-oracle profile constructors.
+- [x] Wire the accepted profile into normal cache-backed replay.
+- [x] Make the accepted scenario the benchmark default.
+- [x] Implement fractional q1/8 evaluation and regression coverage.
+- [x] Run the full radius-768 q1/8 comparison.
+- [x] Run the full radius-768 accepted-profile comparison.
+- [x] Build and run focused tests with `-j32`.
 - [x] Finish specification, documentation, changelog, and task-log updates.
+- [x] Commit the intended changes.

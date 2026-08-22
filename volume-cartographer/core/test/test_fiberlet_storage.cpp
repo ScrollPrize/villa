@@ -71,6 +71,44 @@ TEST_CASE("Fiberlet evaluation quantization uses base positions and shared codec
     CHECK(position[1] == doctest::Approx(2.5));
     CHECK(position[2] == doctest::Approx(3.5));
 
+    const auto fractional = quantizeFiberletPositionForEvaluation(
+        {static_cast<float>(8.0625 / 8.0),
+         static_cast<float>(8.0624 / 8.0),
+         static_cast<float>(8.0626 / 8.0)},
+        grid,
+        0.125);
+    CHECK(fractional[0] == doctest::Approx(8.125 / 8.0));
+    CHECK(fractional[1] == doctest::Approx(8.0 / 8.0));
+    CHECK(fractional[2] == doctest::Approx(8.125 / 8.0));
+    CHECK(fiberletPositionBinCountForEvaluation(512, 0.125) == 4096);
+    CHECK(fiberletPositionBinCountForEvaluation(512, 0.0) == 0);
+    CHECK_THROWS_AS(
+        fiberletPositionBinCountForEvaluation(512, 0.3),
+        std::invalid_argument);
+    CHECK_THROWS_AS(
+        fiberletPositionBinCountForEvaluation(
+            512, std::numeric_limits<double>::denorm_min()),
+        std::invalid_argument);
+    CHECK_THROWS_AS(
+        quantizeFiberletPositionForEvaluation(
+            {1.0F, 1.0F, 1.0F}, grid, -0.125),
+        std::invalid_argument);
+    CHECK_THROWS_AS(
+        quantizeFiberletPositionForEvaluation(
+            {1.0F, 1.0F, 1.0F}, grid,
+            std::numeric_limits<double>::quiet_NaN()),
+        std::invalid_argument);
+    CHECK_THROWS_AS(
+        quantizeFiberletPositionForEvaluation(
+            {1.0F, 1.0F, 1.0F}, grid,
+            std::numeric_limits<double>::infinity()),
+        std::invalid_argument);
+    CHECK_THROWS_AS(
+        quantizeFiberletPositionForEvaluation(
+            {static_cast<float>(127.95 / 8.0), 1.0F, 1.0F}, grid,
+            0.125),
+        std::invalid_argument);
+
     const cv::Vec3f inputDirection{0.25F, -0.4F, 0.881759F};
     const auto direction = quantizeFiberletDirectionForEvaluation(inputDirection);
     CHECK(cv::norm(direction) == doctest::Approx(1.0).epsilon(1.0e-5));
@@ -145,10 +183,18 @@ TEST_CASE("Fiberlet geometry caches ignore replay cost representation")
     compactAxisSqrtU16.costDomain =
         FiberletCostQuantizationDomain::SqrtPerPredictionVoxel;
     compactAxisSqrtU16.costDensityMaximum = 256.0F;
+    FiberletEvaluationQuantization qOneEighthFloat{
+        0.125, true, 0, 512};
+    FiberletEvaluationQuantization qOneEighthSqrtU16{
+        0.125, true, 16, 512};
+    qOneEighthSqrtU16.costDomain =
+        FiberletCostQuantizationDomain::SqrtPerPredictionVoxel;
+    qOneEighthSqrtU16.costDensityMaximum = 256.0F;
 
     const FiberletGeometryCacheProfile exact{{0, false}, 0, 512};
     const FiberletGeometryCacheProfile compactAxis{{0, true}, 8, 512};
     const FiberletGeometryCacheProfile legacyQ4U8{{4, true}, 8, 512};
+    const FiberletGeometryCacheProfile qOneEighth{{0.125, true}, 8, 512};
     CHECK(fiberletGeometryCacheProfile(baseline) == exact);
     CHECK(fiberletGeometryCacheProfile(costOnly) == exact);
     CHECK(fiberletGeometryCacheProfile(q4Float) == legacyQ4U8);
@@ -158,11 +204,53 @@ TEST_CASE("Fiberlet geometry caches ignore replay cost representation")
     CHECK(fiberletGeometryCacheProfile(compactAxisU8) == compactAxis);
     CHECK(fiberletGeometryCacheProfile(compactAxisU16) == compactAxis);
     CHECK(fiberletGeometryCacheProfile(compactAxisSqrtU16) == compactAxis);
+    CHECK(fiberletGeometryCacheProfile(qOneEighthFloat) == qOneEighth);
+    CHECK(fiberletGeometryCacheProfile(qOneEighthSqrtU16) == qOneEighth);
+    CHECK(qOneEighth != compactAxis);
+    CHECK(qOneEighth != legacyQ4U8);
+    FiberletEvaluationQuantization invalidQuantum;
+    invalidQuantum.positionQuantumBaseVoxels =
+        std::numeric_limits<double>::quiet_NaN();
+    CHECK_THROWS_AS(
+        fiberletGeometryCacheProfile(invalidQuantum),
+        std::invalid_argument);
+    invalidQuantum.positionQuantumBaseVoxels = 0.3;
+    CHECK_THROWS_AS(
+        fiberletGeometryCacheProfile(invalidQuantum),
+        std::invalid_argument);
     CHECK(compactAxisFloat.costBits == 0);
     CHECK(compactAxisU8.costBits == 8);
     CHECK(compactAxisU16.costBits == 16);
     CHECK(compactAxisSqrtU16.costDomain ==
           FiberletCostQuantizationDomain::SqrtPerPredictionVoxel);
+}
+
+TEST_CASE("Fiberlet replay profiles distinguish the compact default from the exact oracle")
+{
+    const auto compact = defaultFiberletReplayQuantization(512);
+    CHECK(compact.positionQuantumBaseVoxels == 0.0);
+    CHECK(compact.compactDirections);
+    CHECK(compact.costBits == 16);
+    CHECK(compact.storageChunkSideBaseVoxels == 512);
+    CHECK(compact.costDomain ==
+          FiberletCostQuantizationDomain::SqrtPerPredictionVoxel);
+    CHECK(compact.costDensityMaximum == 256.0F);
+    CHECK(fiberletGeometryCacheProfile(compact).enabled());
+
+    const auto exact = exactFiberletReplayQuantization(512);
+    CHECK(exact.positionQuantumBaseVoxels == 0.0);
+    CHECK_FALSE(exact.compactDirections);
+    CHECK(exact.costBits == 0);
+    CHECK(exact.storageChunkSideBaseVoxels == 512);
+    CHECK(exact.costDomain == FiberletCostQuantizationDomain::RawTotal);
+    CHECK(exact.costDensityMaximum == 0.0F);
+    CHECK_FALSE(exact.enabled());
+    CHECK_FALSE(fiberletGeometryCacheProfile(exact).enabled());
+
+    CHECK_THROWS_AS(defaultFiberletReplayQuantization(0),
+                    std::invalid_argument);
+    CHECK_THROWS_AS(exactFiberletReplayQuantization(-1),
+                    std::invalid_argument);
 }
 
 TEST_CASE("Fiberlet standard quantization matrix includes compact-axis cost views")
@@ -189,6 +277,22 @@ TEST_CASE("Fiberlet standard quantization matrix includes compact-axis cost view
         if (names[index].starts_with("compact_axis_cost_sqrt_u16"))
             CHECK(found->costDensityMaximum == doctest::Approx(256.0F));
     }
+    const auto fractional = std::find_if(
+        scenarios.begin(), scenarios.end(), [](const auto& scenario) {
+            return scenario.name ==
+                "position_q1_8_compact_axis_cost_sqrt_u16_max256";
+        });
+    REQUIRE(fractional != scenarios.end());
+    CHECK(fractional->positionQuantumBaseVoxels == doctest::Approx(0.125));
+    CHECK(fractional->compactAxes);
+    CHECK(fractional->costBits == 16);
+    CHECK(fractional->costDomain ==
+          FiberletCostQuantizationDomain::SqrtPerPredictionVoxel);
+    CHECK(fractional->costDensityMaximum == doctest::Approx(256.0F));
+    CHECK(std::none_of(
+        scenarios.begin(), scenarios.end(), [](const auto& scenario) {
+            return scenario.name == "combined_q1_axis_cost_u8";
+        }));
 }
 
 TEST_CASE("Fiberlet storage float anchors round trip exact float bits")

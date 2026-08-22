@@ -1,3 +1,10 @@
+# 2026-08-22: fractional fiberlet endpoint evaluation
+
+- Replaced the unpublished combined q1/u8 matrix row with a 0.125-base-voxel
+  endpoint, compact-direction, fixed-sqrt `uint16` scenario. Fractional
+  evaluation quanta use shared eager/cache rounding while canonical float
+  anchors and the persistent compact storage schema remain unchanged.
+
 # 2026-08-22: fixed nonlinear uint16 fiberlet cost view
 
 - Added fixed global square-root encoding of cost per prediction voxel with a
@@ -1004,3 +1011,13 @@
   retaining the independent default checkpoint advance of 48 base voxels.
 - Failure-window diagnostics now use the available match search span when a
   replay reset fails without advancing near the reference end.
+# 2026-08-22: compact float-position fiberlet default
+
+- Adopted exact float endpoint positions, compact fitted directions, and fixed
+  sqrt-density `uint16` edge costs with ceiling 256 as the default cache-backed
+  fiberlet replay profile. Preserved an explicit all-float correctness oracle,
+  canonical float anchors, and the unchanged unpublished compact serializer.
+- Added fractional base-voxel endpoint evaluation and replaced the unpublished
+  q1/u8 matrix row with the q1/8 compact-direction sqrt-u16 experiment.
+- Full Paris4 radius-768 evaluation produced two failures for both the new
+  default and exact oracle; q1/8 produced three.

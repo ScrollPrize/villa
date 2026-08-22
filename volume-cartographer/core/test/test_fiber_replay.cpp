@@ -865,6 +865,14 @@ TEST_CASE("dual replay publication is deterministic and no-vis has only full tra
         {"prediction_to_base_scale", 1.0},
         {"prediction_shape_zyx", {8, 8, 8}},
     };
+    input.fiberletEvaluationProfile = {
+        {"role", "default_compact"},
+        {"position_quantum_base_voxels", 0.0},
+        {"compact_directions", true},
+        {"cost_bits", 16},
+        {"cost_domain", "sqrt_per_prediction_voxel"},
+        {"cost_density_maximum", 256.0},
+    };
     input.requestedTraceConfig = nlohmann::json::object();
     input.effectiveTraceConfig = nlohmann::json::object();
 
@@ -887,6 +895,8 @@ TEST_CASE("dual replay publication is deterministic and no-vis has only full tra
           bundle.at("threshold"));
     CHECK(bundle.at("fiberlet_config").at("threshold") ==
           bundle.at("threshold"));
+    CHECK(bundle.at("fiberlet_evaluation_profile") ==
+          input.fiberletEvaluationProfile);
     const auto& initialMatch =
         bundle.at("greedy").at("segments").at(0).at("matches").at(0);
     CHECK(initialMatch.at("euclidean_error_base_voxels") ==

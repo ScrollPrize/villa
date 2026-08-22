@@ -191,9 +191,9 @@ void FiberletOnDemandPreprocessor::initialize()
     validateFiberAnchorConfig(config.anchorConfig);
     validateFiberletPathConfig(config.pathConfig);
     const auto& quantization = config.geometryQuantization;
-    if (quantization.positionQuantumBaseVoxels < 0) {
-        throw std::invalid_argument("on-demand fiberlet evaluation quantization is invalid");
-    }
+    (void)fiberletPositionBinCountForEvaluation(
+        static_cast<int>(config.fiberletMetadata.spatialChunkSideBaseVoxels),
+        quantization.positionQuantumBaseVoxels);
     if (config.selectedAnchorCellsZYX.empty() == !config.anchorCellPredicate) {
         throw std::invalid_argument("on-demand fiberlet preprocessing requires exactly one cell selector");
     }

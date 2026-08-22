@@ -326,7 +326,8 @@ CliOptions parseArgs(int argc, char** argv)
         options.manifestLocation = argv[2];
         options.fiberJson = argv[3];
         options.outputDirectory = argv[4];
-        options.quantizationScenario = "combined_q4_axis_cost_u8";
+        options.quantizationScenario =
+            "compact_axis_cost_sqrt_u16_max256";
         firstOption = 5;
     } else if (command == "fiberlet-replay") {
         if (argc < 5) {
@@ -2307,8 +2308,14 @@ int main(int argc, char** argv)
                 return result;
             };
 
-            const auto baseline =
-                run("quantization baseline", vc::fiber_tracer::FiberletGeometryCacheProfile{}, vc::fiber_tracer::FiberletEvaluationQuantization{});
+            const auto exactQuantization =
+                vc::fiber_tracer::exactFiberletReplayQuantization(
+                    options.storageChunkSideBaseVoxels);
+            const auto baseline = run(
+                "quantization baseline",
+                vc::fiber_tracer::fiberletGeometryCacheProfile(
+                    exactQuantization),
+                exactQuantization);
             for (const auto& scenario : selectedScenarios) {
                 vc::fiber_tracer::FiberletEvaluationQuantization replayQuantization{
                     scenario.positionQuantumBaseVoxels,
@@ -2440,6 +2447,14 @@ int main(int argc, char** argv)
             const auto canonicalNormalDataset = vc::lasagna::LasagnaDataset::openLocation(options.normalManifestLocation, canonicalNormalOptions);
             const auto canonicalNormalSampler =
                 std::make_shared<vc::lasagna::LasagnaNormalSampler>(canonicalNormalDataset, vc::lasagna::LasagnaNormalSamplerOptions{options.decodedCacheBytes});
+            const auto fiberletEvaluationQuantization = options.eagerGraphReplay
+                ? vc::fiber_tracer::exactFiberletReplayQuantization(
+                      options.storageChunkSideBaseVoxels)
+                : vc::fiber_tracer::defaultFiberletReplayQuantization(
+                      options.storageChunkSideBaseVoxels);
+            const auto fiberletCacheProfile =
+                vc::fiber_tracer::fiberletGeometryCacheProfile(
+                    fiberletEvaluationQuantization);
             std::optional<vc::fiber_tracer::FiberletGraph> eagerGraph;
             std::shared_ptr<vc::fiber_tracer::FiberletOnDemandPreprocessor> preprocessor;
             std::unique_ptr<vc::fiber_tracer::FiberletCachedReplayGraphSource> cachedGraph;
@@ -2495,13 +2510,27 @@ int main(int argc, char** argv)
                     canonicalNormalDataset,
                     processingTube.referenceIntervalBase,
                     processingTube.radiusBaseVoxels);
-                auto fiberletMetadata = anchorMetadata;
-                fiberletMetadata.kind = vc::fiber_tracer::FiberletDatasetKind::Fiberlets;
-                auto cacheNamespace = anchorMetadata.algorithmFingerprint;
-                std::replace(cacheNamespace.begin(), cacheNamespace.end(), ':', '-');
-                const auto defaultCacheRoot = options.outputDirectory / "cache" / cacheNamespace;
-                const auto anchorRoot = options.anchorCacheRoot.empty() ? defaultCacheRoot / "anchors.zarr" : options.anchorCacheRoot;
-                const auto fiberletRoot = options.fiberletCacheRoot.empty() ? defaultCacheRoot / "fiberlets.zarr" : options.fiberletCacheRoot;
+                auto fiberletMetadata = replayDatasetMetadata(
+                    vc::fiber_tracer::FiberletDatasetKind::Fiberlets,
+                    grid,
+                    options,
+                    dataset,
+                    canonicalNormalDataset,
+                    processingTube.referenceIntervalBase,
+                    processingTube.radiusBaseVoxels,
+                    fiberletCacheProfile);
+                auto anchorNamespace = anchorMetadata.algorithmFingerprint;
+                auto fiberletNamespace = fiberletMetadata.algorithmFingerprint;
+                std::replace(anchorNamespace.begin(), anchorNamespace.end(), ':', '-');
+                std::replace(fiberletNamespace.begin(), fiberletNamespace.end(), ':', '-');
+                const auto anchorRoot = options.anchorCacheRoot.empty()
+                    ? options.outputDirectory / "cache" / anchorNamespace /
+                        "anchors.zarr"
+                    : options.anchorCacheRoot;
+                const auto fiberletRoot = options.fiberletCacheRoot.empty()
+                    ? options.outputDirectory / "cache" / fiberletNamespace /
+                        "fiberlets.zarr"
+                    : options.fiberletCacheRoot;
                 auto graphBudget = std::make_shared<vc::render::DecodedChunkCacheBudget>(options.decodedCacheBytes);
                 vc::render::ChunkCache::Options anchorCacheOptions;
                 anchorCacheOptions.decodedByteCapacity = options.decodedCacheBytes;
@@ -2516,6 +2545,7 @@ int main(int argc, char** argv)
                 onDemand.grid = grid;
                 onDemand.anchorConfig = options.anchors;
                 onDemand.pathConfig = options.paths;
+                onDemand.geometryQuantization = fiberletCacheProfile.geometry;
                 onDemand.predictionSampler = [&](const auto& indices, int threads, auto& samples) {
                     field.sampleStoredGridBatch(indices, threads, samples);
                 };
@@ -2604,7 +2634,10 @@ int main(int argc, char** argv)
                 }
                 preprocessingProgress->configure(std::move(expectedAnchors), std::move(expectedPrefixes));
                 overallProgress.attachPreprocessing(preprocessingProgress);
-                cachedGraph = std::make_unique<vc::fiber_tracer::FiberletCachedReplayGraphSource>(preprocessor, options.paths);
+                cachedGraph = std::make_unique<
+                    vc::fiber_tracer::FiberletCachedReplayGraphSource>(
+                    preprocessor, options.paths,
+                    fiberletEvaluationQuantization);
                 preprocessor->prefetchScheduled(chunkSchedule, 0, chunkSchedule.size(), false);
                 if (options.printStats)
                     std::cerr << "fiber_replay_stage stage=cache_open status=completed\n";
@@ -2837,6 +2870,23 @@ int main(int argc, char** argv)
                 {"mode", "canonical_stored_grid"},
                 {"prediction_to_base_scale", grid.predictionToBaseScale},
                 {"prediction_shape_zyx", grid.shapeZYX},
+            };
+            bundle.fiberletEvaluationProfile = {
+                {"role", options.eagerGraphReplay ? "exact_float_oracle"
+                                                   : "default_compact"},
+                {"position_quantum_base_voxels",
+                 fiberletEvaluationQuantization.positionQuantumBaseVoxels},
+                {"compact_directions",
+                 fiberletEvaluationQuantization.compactDirections},
+                {"cost_bits", fiberletEvaluationQuantization.costBits},
+                {"cost_domain",
+                 vc::fiber_tracer::fiberletCostQuantizationDomainName(
+                     fiberletEvaluationQuantization.costDomain)},
+                {"cost_density_maximum",
+                 fiberletEvaluationQuantization.costDensityMaximum},
+                {"storage_chunk_side_base_voxels",
+                 fiberletEvaluationQuantization.storageChunkSideBaseVoxels},
+                {"persistent_payload_profile", "float32_cache"},
             };
             bundle.requestedTraceConfig = vc::fiber_tracer::cli::traceConfigJson(requestedTrace);
             bundle.effectiveTraceConfig = vc::fiber_tracer::cli::traceConfigJson(effectiveTrace);
