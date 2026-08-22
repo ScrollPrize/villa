@@ -56,8 +56,8 @@ struct FiberletGraphReplayConfig {
     size_t beamWidth = 16;
     size_t expansionThreads = 1;
     double beamStepDistanceBaseVoxels = 48.0;
-    double lookaheadDistanceBaseVoxels = 192.0;
-    size_t searchWidth = 128;
+    double lookaheadDistanceBaseVoxels = 384.0;
+    size_t searchWidth = 0;
     double pruneDistanceBaseVoxels = 48.0;
     size_t maximumGeneratedStatesPerIteration = 1'000'000;
     double errorThresholdBaseVoxels = 20.0;

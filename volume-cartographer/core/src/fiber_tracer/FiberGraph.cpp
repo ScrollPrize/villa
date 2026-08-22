@@ -3,10 +3,13 @@
 #include "vc/fiber_tracer/FiberLocalScoring.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
 
+#include <utils/thread_pool.hpp>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <exception>
 #include <future>
 #include <iomanip>
 #include <limits>
@@ -534,13 +537,13 @@ struct ExactPersistentStateBudget {
     }
 };
 
+template <typename AccountGenerated>
 std::vector<PersistentRouteCandidate> persistentRouteSuccessors(
     const FiberletReplayGraphSource& graph,
     PersistentLogicalRouteRegistry& logicalRoutes,
     const PersistentRouteCandidate& route,
     const std::optional<cv::Vec3d>& initialDirection,
-    ExactPersistentStateBudget& stateBudget,
-    size_t& generatedStates,
+    AccountGenerated&& accountGenerated,
     size_t& rejectedStates)
 {
     std::vector<PersistentRouteCandidate> result;
@@ -567,8 +570,7 @@ std::vector<PersistentRouteCandidate> persistentRouteSuccessors(
             ++rejectedStates;
             continue;
         }
-        stateBudget.consume();
-        ++generatedStates;
+        accountGenerated();
         const double edgeLength = edge.pathLengthPredictionVoxels;
         if (!(edgeLength > kFloatEpsilon) || !std::isfinite(edgeLength))
             throw std::invalid_argument("persistent beam edge length is invalid");
@@ -597,6 +599,27 @@ std::vector<PersistentRouteCandidate> persistentRouteSuccessors(
         result.push_back(std::move(next));
     }
     return result;
+}
+
+std::vector<PersistentRouteCandidate> persistentRouteSuccessors(
+    const FiberletReplayGraphSource& graph,
+    PersistentLogicalRouteRegistry& logicalRoutes,
+    const PersistentRouteCandidate& route,
+    const std::optional<cv::Vec3d>& initialDirection,
+    ExactPersistentStateBudget& stateBudget,
+    size_t& generatedStates,
+    size_t& rejectedStates)
+{
+    return persistentRouteSuccessors(
+        graph,
+        logicalRoutes,
+        route,
+        initialDirection,
+        [&]() {
+            stateBudget.consume();
+            ++generatedStates;
+        },
+        rejectedStates);
 }
 
 struct ExactPersistentRouteScore {
@@ -647,7 +670,11 @@ ExactPersistentRouteScore scorePersistentRouteAtHorizon(const FiberletReplayGrap
     return score;
 }
 
-PersistentRouteCandidate persistentRouteCommittedPrefix(const FiberletReplayGraphSource& graph, const PersistentRouteCandidate& route, double checkpointPredictionVoxels)
+PersistentRouteCandidate persistentRouteCommittedPrefix(
+    const FiberletReplayGraphSource& graph,
+    const PersistentRouteCandidate& route,
+    double checkpointPredictionVoxels,
+    const std::shared_ptr<const PersistentLogicalRouteNode>& logicalRoot)
 {
     (void)graph;
     if (!(checkpointPredictionVoxels >= 0.0) || !std::isfinite(checkpointPredictionVoxels) || route.pathLength < checkpointPredictionVoxels - kReplayEpsilon) {
@@ -656,9 +683,7 @@ PersistentRouteCandidate persistentRouteCommittedPrefix(const FiberletReplayGrap
     PersistentRouteCandidate prefix;
     prefix.seed = route.seed;
     prefix.visitedNodes = persistentVisitedAdd(nullptr, route.seed);
-    prefix.logicalRoute = route.logicalRoute;
-    while (prefix.logicalRoute->depth > 0)
-        prefix.logicalRoute = prefix.logicalRoute->parent;
+    prefix.logicalRoute = logicalRoot;
     prefix.evaluation = route.evaluation;
     if (checkpointPredictionVoxels <= kReplayEpsilon)
         return prefix;
@@ -702,11 +727,15 @@ struct RankedPersistentPrefix {
 };
 
 RankedPersistentPrefix makeRankedPersistentPrefix(
-    const FiberletReplayGraphSource& graph, PersistentRouteCandidate candidate, double checkpointPredictionVoxels, double scoringHorizonPredictionVoxels)
+    const FiberletReplayGraphSource& graph,
+    PersistentRouteCandidate candidate,
+    double checkpointPredictionVoxels,
+    double scoringHorizonPredictionVoxels,
+    const std::shared_ptr<const PersistentLogicalRouteNode>& logicalRoot)
 {
     RankedPersistentPrefix entry;
     const auto score = scorePersistentRouteAtHorizon(graph, candidate, scoringHorizonPredictionVoxels);
-    entry.prefix = persistentRouteCommittedPrefix(graph, candidate, checkpointPredictionVoxels);
+    entry.prefix = persistentRouteCommittedPrefix(graph, candidate, checkpointPredictionVoxels, logicalRoot);
     entry.lookahead = std::move(candidate);
     entry.scoredEdgeCost = score.edgeCost;
     entry.scoredTransitionCost = score.transitionCost;
@@ -725,22 +754,6 @@ bool rankedPersistentPrefixLess(const RankedPersistentPrefix& left, const Ranked
     if (left.lookahead.logicalRoute != right.lookahead.logicalRoute)
         return logicalRouteLess(left.lookahead.logicalRoute.get(), right.lookahead.logicalRoute.get());
     return logicalRouteLess(left.prefix.logicalRoute.get(), right.prefix.logicalRoute.get());
-}
-
-void retainRankedPersistentPrefix(RankedPersistentPrefix entry, size_t beamWidth, std::vector<RankedPersistentPrefix>& ranked)
-{
-    const auto equivalent = std::find_if(ranked.begin(), ranked.end(), [&](const auto& existing) {
-        return existing.prefix.seed == entry.prefix.seed && existing.prefix.logicalRoute == entry.prefix.logicalRoute;
-    });
-    if (equivalent != ranked.end()) {
-        if (rankedPersistentPrefixLess(entry, *equivalent))
-            *equivalent = std::move(entry);
-    } else {
-        ranked.push_back(std::move(entry));
-    }
-    std::sort(ranked.begin(), ranked.end(), rankedPersistentPrefixLess);
-    if (ranked.size() > beamWidth)
-        ranked.resize(beamWidth);
 }
 
 struct ExactPersistentSearchStats {
@@ -762,6 +775,19 @@ struct PersistentQueueGreater {
     bool operator()(const PersistentQueueEntry& left, const PersistentQueueEntry& right) const noexcept
     {
         return std::tie(left.lowerBound, left.sequence) > std::tie(right.lowerBound, right.sequence);
+    }
+};
+
+struct ExactPersistentQueueGreater {
+    bool operator()(const PersistentQueueEntry& left, const PersistentQueueEntry& right) const
+    {
+        if (left.lowerBound != right.lowerBound)
+            return left.lowerBound > right.lowerBound;
+        if (left.route.seed != right.route.seed)
+            return right.route.seed < left.route.seed;
+        if (left.route.logicalRoute != right.route.logicalRoute)
+            return logicalRouteLess(right.route.logicalRoute.get(), left.route.logicalRoute.get());
+        return left.sequence > right.sequence;
     }
 };
 
@@ -833,113 +859,42 @@ private:
     std::map<std::pair<DirectedFiberletStorageId, size_t>, double> memo_;
 };
 
-std::vector<PersistentRouteCandidate> persistentCheckpointPrefixes(
-    const FiberletReplayGraphSource& graph,
-    PersistentLogicalRouteRegistry& logicalRoutes,
-    const std::vector<PersistentRouteCandidate>& initialRoutes,
-    double checkpointPredictionVoxels,
-    const cv::Vec3d& initialDirection,
-    ExactPersistentStateBudget& stateBudget,
-    ExactPersistentSearchStats& stats)
+struct RankedPersistentCompletion {
+    PersistentRouteCandidate route;
+    FiberletGraphReplayCost scoredEdgeCost;
+    FiberletGraphReplayCost scoredTransitionCost;
+    double scoredPathLength = 0.0;
+    double completePathLength = 0.0;
+    double totalLoss = 0.0;
+    size_t sequence = 0;
+};
+
+bool rankedPersistentCompletionLess(const RankedPersistentCompletion& left, const RankedPersistentCompletion& right)
 {
-    if (!(checkpointPredictionVoxels >= 0.0) || !std::isfinite(checkpointPredictionVoxels)) {
-        throw std::invalid_argument("persistent beam checkpoint is invalid");
-    }
-    std::vector<PersistentRouteCandidate> pending;
-    std::vector<PersistentRouteCandidate> prefixes;
-    for (const auto& initial : initialRoutes) {
-        if (initial.pathLength >= checkpointPredictionVoxels - kReplayEpsilon)
-            prefixes.push_back(initial);
-        else
-            pending.push_back(initial);
-    }
-    for (size_t index = 0; index < pending.size(); ++index) {
-        auto route = std::move(pending[index]);
-        ++stats.expanded;
-        auto successors = persistentRouteSuccessors(
-            graph,
-            logicalRoutes,
-            route,
-            route.tail == nullptr ? std::make_optional(initialDirection) : std::nullopt,
-            stateBudget,
-            stats.generated,
-            stats.rejected);
-        for (auto successor : successors) {
-            if (successor.pathLength >= checkpointPredictionVoxels - kReplayEpsilon)
-                prefixes.push_back(std::move(successor));
-            else
-                pending.push_back(std::move(successor));
-        }
-    }
-    return prefixes;
+    if (left.totalLoss != right.totalLoss)
+        return left.totalLoss < right.totalLoss;
+    if (left.route.seed != right.route.seed)
+        return left.route.seed < right.route.seed;
+    if (left.route.logicalRoute != right.route.logicalRoute)
+        return logicalRouteLess(left.route.logicalRoute.get(), right.route.logicalRoute.get());
+    return left.sequence < right.sequence;
 }
 
-std::optional<RankedPersistentPrefix> exactPersistentPrefixContinuation(
-    const FiberletReplayGraphSource& graph,
-    PersistentLogicalRouteRegistry& logicalRoutes,
-    const PersistentRouteCandidate& prefix,
-    double scoringHorizonPredictionVoxels,
-    double checkpointPredictionVoxels,
-    RelaxedPersistentCostToGo& costToGo,
-    ExactPersistentStateBudget& stateBudget,
-    ExactPersistentSearchStats& stats)
+void retainRankedPersistentCompletion(RankedPersistentCompletion entry, size_t beamWidth, std::vector<RankedPersistentCompletion>& ranked)
 {
-    std::priority_queue<PersistentQueueEntry, std::vector<PersistentQueueEntry>, PersistentQueueGreater> pending;
-    std::optional<RankedPersistentPrefix> best;
-    size_t sequence = 0;
-    const auto retainCompletion = [&](PersistentRouteCandidate candidate) {
-        ++stats.completed;
-        auto entry = makeRankedPersistentPrefix(graph, std::move(candidate), checkpointPredictionVoxels, scoringHorizonPredictionVoxels);
-        if (!best.has_value() || rankedPersistentPrefixLess(entry, *best))
-            best = std::move(entry);
-    };
-    const auto routeLowerBound = [&](const PersistentRouteCandidate& route) {
-        const double accumulated = persistentRouteLoss(route);
-        const auto incoming = persistentRouteIncoming(route);
-        if (!incoming.has_value()) {
-            throw std::logic_error("persistent lookahead prefix has no incoming fiberlet");
-        }
-        const double future = costToGo.lowerBound(*incoming, std::max(0.0, scoringHorizonPredictionVoxels - route.pathLength));
-        return accumulated + future;
-    };
-    const auto enqueue = [&](PersistentRouteCandidate candidate, double lowerBound) {
-        if (!(lowerBound >= 0.0) || std::isnan(lowerBound)) {
-            throw std::invalid_argument("persistent route lower bound must be finite and nonnegative");
-        }
-        if (!std::isfinite(lowerBound)) {
-            ++stats.costPruned;
+    const auto equivalent = std::find_if(ranked.begin(), ranked.end(), [&](const auto& existing) {
+        return existing.route.seed == entry.route.seed && existing.route.logicalRoute == entry.route.logicalRoute;
+    });
+    if (equivalent != ranked.end()) {
+        if (!rankedPersistentCompletionLess(entry, *equivalent))
             return;
-        }
-        pending.push(PersistentQueueEntry{std::move(candidate), lowerBound, sequence++});
-    };
-    if (prefix.pathLength >= scoringHorizonPredictionVoxels - kReplayEpsilon) {
-        retainCompletion(prefix);
-    } else {
-        enqueue(prefix, routeLowerBound(prefix));
+        ranked.erase(equivalent);
     }
-    while (!pending.empty()) {
-        if (best.has_value() && pending.top().lowerBound > best->totalLoss) {
-            stats.costPruned += pending.size();
-            break;
-        }
-        auto route = std::move(pending.top().route);
-        pending.pop();
-        ++stats.expanded;
-        auto successors = persistentRouteSuccessors(graph, logicalRoutes, route, std::nullopt, stateBudget, stats.generated, stats.rejected);
-        for (auto successor : successors) {
-            if (successor.pathLength >= scoringHorizonPredictionVoxels - kReplayEpsilon) {
-                retainCompletion(std::move(successor));
-            } else {
-                const double lowerBound = routeLowerBound(successor);
-                if (best.has_value() && lowerBound > best->totalLoss) {
-                    ++stats.costPruned;
-                } else {
-                    enqueue(std::move(successor), lowerBound);
-                }
-            }
-        }
-    }
-    return best;
+
+    const auto insertion = std::lower_bound(ranked.begin(), ranked.end(), entry, rankedPersistentCompletionLess);
+    ranked.insert(insertion, std::move(entry));
+    if (ranked.size() > beamWidth)
+        ranked.pop_back();
 }
 
 std::vector<RankedPersistentPrefix> exactPersistentRouteLookahead(
@@ -950,7 +905,7 @@ std::vector<RankedPersistentPrefix> exactPersistentRouteLookahead(
     double checkpointPredictionVoxels,
     const cv::Vec3d& initialDirection,
     size_t beamWidth,
-    size_t expansionThreads,
+    utils::ThreadPool& expansionPool,
     size_t maximumGeneratedStates,
     ExactPersistentSearchStats& stats)
 {
@@ -958,41 +913,129 @@ std::vector<RankedPersistentPrefix> exactPersistentRouteLookahead(
         !std::isfinite(checkpointPredictionVoxels)) {
         throw std::invalid_argument("persistent exact lookahead horizon is invalid");
     }
+    constexpr size_t kExpansionBatchSize = 32;
     ExactPersistentStateBudget stateBudget;
     stateBudget.maximum = maximumGeneratedStates;
-    auto prefixes =
-        persistentCheckpointPrefixes(graph, logicalRoutes, initialRoutes, checkpointPredictionVoxels, initialDirection, stateBudget, stats);
     RelaxedPersistentCostToGo costToGo(graph);
-    std::vector<std::optional<RankedPersistentPrefix>> completions(prefixes.size());
-    std::vector<ExactPersistentSearchStats> prefixStats(prefixes.size());
-    std::atomic_size_t nextPrefix{0};
-    const size_t workerCount = std::min(std::max<size_t>(1, expansionThreads), prefixes.size());
-    std::vector<std::future<void>> workers;
-    workers.reserve(workerCount);
-    for (size_t worker = 0; worker < workerCount; ++worker) {
-        workers.push_back(std::async(std::launch::async, [&]() {
-            while (true) {
-                const size_t index = nextPrefix.fetch_add(1, std::memory_order_relaxed);
-                if (index >= prefixes.size())
-                    return;
-                completions[index] =
-                    exactPersistentPrefixContinuation(graph, logicalRoutes, prefixes[index], scoringHorizonPredictionVoxels, checkpointPredictionVoxels, costToGo, stateBudget, prefixStats[index]);
-            }
-        }));
-    }
-    for (auto& worker : workers)
-        worker.get();
-    stats.generated = stateBudget.generated.load(std::memory_order_relaxed);
-    std::vector<RankedPersistentPrefix> ranked;
-    ranked.reserve(beamWidth);
-    for (size_t index = 0; index < completions.size(); ++index) {
-        stats.expanded += prefixStats[index].expanded;
-        stats.completed += prefixStats[index].completed;
-        stats.costPruned += prefixStats[index].costPruned;
-        stats.rejected += prefixStats[index].rejected;
-        if (completions[index].has_value()) {
-            retainRankedPersistentPrefix(std::move(*completions[index]), beamWidth, ranked);
+    std::priority_queue<PersistentQueueEntry, std::vector<PersistentQueueEntry>, ExactPersistentQueueGreater> pending;
+    std::vector<RankedPersistentCompletion> completions;
+    size_t queueSequence = 0;
+    size_t completionSequence = 0;
+
+    const auto completionCutoff = [&]() -> std::optional<double> {
+        if (completions.size() < beamWidth)
+            return std::nullopt;
+        return completions.back().totalLoss;
+    };
+    const auto retainCompletion = [&](PersistentRouteCandidate candidate) {
+        ++stats.completed;
+        const auto score = scorePersistentRouteAtHorizon(graph, candidate, scoringHorizonPredictionVoxels);
+        const double completePathLength = candidate.pathLength;
+        retainRankedPersistentCompletion(
+            RankedPersistentCompletion{
+                std::move(candidate),
+                score.edgeCost,
+                score.transitionCost,
+                score.scoredLength,
+                completePathLength,
+                score.total(),
+                completionSequence++},
+            beamWidth,
+            completions);
+    };
+    const auto routeLowerBound = [&](const PersistentRouteCandidate& route) {
+        const double accumulated = persistentRouteLoss(route);
+        const auto incoming = persistentRouteIncoming(route);
+        if (!incoming.has_value())
+            return accumulated;
+        return accumulated + costToGo.lowerBound(*incoming, std::max(0.0, scoringHorizonPredictionVoxels - route.pathLength));
+    };
+    const auto enqueue = [&](PersistentRouteCandidate candidate) {
+        const double lowerBound = routeLowerBound(candidate);
+        if (!(lowerBound >= 0.0) || std::isnan(lowerBound))
+            throw std::invalid_argument("persistent route lower bound must be finite and nonnegative");
+        const auto cutoff = completionCutoff();
+        if (!std::isfinite(lowerBound) || (cutoff.has_value() && lowerBound > *cutoff)) {
+            ++stats.costPruned;
+            return;
         }
+        pending.push(PersistentQueueEntry{std::move(candidate), lowerBound, queueSequence++});
+    };
+
+    for (const auto& route : initialRoutes) {
+        if (route.pathLength >= scoringHorizonPredictionVoxels - kReplayEpsilon)
+            retainCompletion(route);
+        else
+            enqueue(route);
+    }
+
+    struct Expansion {
+        std::vector<PersistentRouteCandidate> successors;
+        size_t rejected = 0;
+        std::exception_ptr error;
+    };
+    while (!pending.empty()) {
+        const auto cutoff = completionCutoff();
+        if (cutoff.has_value() && pending.top().lowerBound > *cutoff) {
+            stats.costPruned += pending.size();
+            break;
+        }
+        std::vector<PersistentQueueEntry> batch;
+        batch.reserve(kExpansionBatchSize);
+        while (batch.size() < kExpansionBatchSize && !pending.empty()) {
+            if (cutoff.has_value() && pending.top().lowerBound > *cutoff)
+                break;
+            batch.push_back(pending.top());
+            pending.pop();
+        }
+        std::vector<Expansion> expansions(batch.size());
+        expansionPool.run_indexed_batch(batch.size(), [&](size_t index) {
+            auto& expansion = expansions[index];
+            try {
+                expansion.successors = persistentRouteSuccessors(
+                    graph,
+                    logicalRoutes,
+                    batch[index].route,
+                    batch[index].route.tail == nullptr ? std::make_optional(initialDirection) : std::nullopt,
+                    []() {},
+                    expansion.rejected);
+            } catch (...) {
+                expansion.error = std::current_exception();
+            }
+        });
+        for (const auto& expansion : expansions) {
+            if (expansion.error)
+                std::rethrow_exception(expansion.error);
+        }
+        stats.expanded += batch.size();
+        for (auto& expansion : expansions) {
+            stats.rejected += expansion.rejected;
+            for (auto& successor : expansion.successors) {
+                stateBudget.consume();
+                ++stats.generated;
+                if (successor.pathLength >= scoringHorizonPredictionVoxels - kReplayEpsilon)
+                    retainCompletion(std::move(successor));
+                else
+                    enqueue(std::move(successor));
+            }
+        }
+    }
+
+    std::vector<RankedPersistentPrefix> ranked;
+    ranked.reserve(completions.size());
+    for (auto& completion : completions) {
+        RankedPersistentPrefix entry;
+        entry.prefix = persistentRouteCommittedPrefix(graph, completion.route, checkpointPredictionVoxels, logicalRoutes.root());
+        entry.lookahead = std::move(completion.route);
+        entry.scoredEdgeCost = completion.scoredEdgeCost;
+        entry.scoredTransitionCost = completion.scoredTransitionCost;
+        entry.scoredPathLength = completion.scoredPathLength;
+        entry.completePathLength = completion.completePathLength;
+        entry.totalLoss = completion.totalLoss;
+        entry.lossPerPredictionVoxel = entry.scoredPathLength > kReplayEpsilon
+            ? entry.totalLoss / entry.scoredPathLength
+            : std::numeric_limits<double>::infinity();
+        ranked.push_back(std::move(entry));
     }
     return ranked;
 }
@@ -1183,10 +1226,10 @@ BoundedPersistentExpansionResult expandPersistentRouteToFront(
         }
         if (route.pathLength >= frontPredictionVoxels - kReplayEpsilon) {
             ++result.stats.completed;
-            auto ranked = makeRankedPersistentPrefix(graph, std::move(route), checkpointPredictionVoxels, frontPredictionVoxels);
+            auto ranked = makeRankedPersistentPrefix(graph, std::move(route), checkpointPredictionVoxels, frontPredictionVoxels, logicalRoutes.root());
             auto stablePrefix = initial.stablePrefixLogicalRoute;
             if (!stablePrefix) {
-                stablePrefix = persistentRouteCommittedPrefix(graph, ranked.lookahead, stablePrefixPredictionVoxels).logicalRoute;
+                stablePrefix = persistentRouteCommittedPrefix(graph, ranked.lookahead, stablePrefixPredictionVoxels, logicalRoutes.root()).logicalRoute;
             }
             BoundedRankedPersistentRoute completed{std::move(ranked), std::move(stablePrefix)};
             const auto completionKey = persistentLabelKey(graph, completed.ranked.lookahead, frontPredictionVoxels);
@@ -1754,7 +1797,7 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
     const FiberletGraphReplayProgressCallback& progressCallback)
 {
     const double predictionToBaseScale = graph.predictionToBaseScale();
-    if (!(predictionToBaseScale > 0.0) || !std::isfinite(predictionToBaseScale) || config.beamWidth < 1 || config.beamWidth > 16 ||
+    if (!(predictionToBaseScale > 0.0) || !std::isfinite(predictionToBaseScale) || config.beamWidth < 1 ||
         config.expansionThreads < 1 || config.maximumGeneratedStatesPerIteration == 0 || !(config.beamStepDistanceBaseVoxels > 0.0) ||
         !std::isfinite(config.beamStepDistanceBaseVoxels) || !(config.lookaheadDistanceBaseVoxels > 0.0) ||
         !std::isfinite(config.lookaheadDistanceBaseVoxels) || (config.searchWidth != 0 && config.searchWidth < config.beamWidth) ||
@@ -1866,6 +1909,9 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
             minimumAppliedLocalPruneLossCutoffPerPredictionVoxel,
         });
     };
+    std::unique_ptr<utils::ThreadPool> exactExpansionPool;
+    if (config.searchWidth == 0)
+        exactExpansionPool = std::make_unique<utils::ThreadPool>(config.expansionThreads);
 
     double resetArc = config.referenceBeginArcBase;
     for (size_t iteration = 0; iteration < maximumSegments && resetArc < referenceEndArcBase - kReplayEpsilon; ++iteration) {
@@ -2140,7 +2186,7 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
             std::shared_ptr<const PersistentLogicalRouteNode> selectedPrefixLogicalRoute;
             if (config.searchWidth == 0) {
                 ranked = exactPersistentRouteLookahead(
-                    graph, logicalRoutes, beams, scoringHorizon, nextCheckpoint, initialDirection, config.beamWidth, config.expansionThreads, maximumGeneratedStates, searchStats);
+                    graph, logicalRoutes, beams, scoringHorizon, nextCheckpoint, initialDirection, config.beamWidth, *exactExpansionPool, maximumGeneratedStates, searchStats);
                 if (!ranked.empty()) {
                     selectedPrefixLogicalRoute = ranked.front().prefix.logicalRoute;
                 }
@@ -2171,10 +2217,9 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
                 config.searchWidth == 0 || pruneFronts.empty() ? std::nullopt : pruneFronts.back().minimumAppliedLocalCompletionLossCutoffPerPredictionVoxel;
             beams.clear();
             beams.reserve(ranked.size());
-            for (const auto& entry : ranked) {
-                auto prefix = entry.prefix;
-                beams.push_back(std::move(prefix));
-            }
+            selectedRoute = ranked.front().prefix;
+            for (const auto& entry : ranked)
+                beams.push_back(config.searchWidth == 0 ? entry.lookahead : entry.prefix);
             logicalRoutes.pruneExpired();
             checkpointPredictionVoxels = nextCheckpoint;
             if (std::any_of(beams.begin(), beams.end(), [&](const auto& beam) {
@@ -2182,7 +2227,6 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
                 })) {
                 throw std::logic_error("persistent beam checkpoint exceeds a committed route");
             }
-            selectedRoute = beams.front();
             evaluateRoute(selectedRoute);
 
             const auto& selectedEvaluation = selectedRoute.evaluation;
@@ -2573,7 +2617,9 @@ std::vector<FiberletGraphReplayFailureWindow> fiberletGraphReplayFailureWindows(
             throw std::invalid_argument("fiberlet replay failure segment index is out of range");
         const auto& segment = replay.segments[failure.segmentIndex];
         const double begin = !segment.matches.empty() ? segment.matches.front().searchBeginArcBase : segment.startReferenceArcBase;
-        const double end = std::max(failure.referenceArcBase, segment.endReferenceArcBase);
+        double end = std::max(failure.referenceArcBase, segment.endReferenceArcBase);
+        if (!(end > begin + kReplayEpsilon) && !segment.matches.empty())
+            end = std::min(replay.referenceEndArcBase, std::max(end, segment.matches.back().searchEndArcBase));
         if (!std::isfinite(failure.referenceArcBase) || !std::isfinite(begin) || !std::isfinite(end) ||
             begin < replay.referenceBeginArcBase - kReplayEpsilon || end > replay.referenceEndArcBase + kReplayEpsilon ||
             failure.referenceArcBase < begin - kReplayEpsilon || end < failure.referenceArcBase - kReplayEpsilon || !(end > begin + kReplayEpsilon)) {

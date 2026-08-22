@@ -647,12 +647,16 @@ std::map<std::array<int64_t, 3>, std::vector<size_t>> costChunks(
     for (const size_t index : successful) {
         std::array<int64_t, 3> chunk{};
         const auto& candidate = paths.candidates[index];
-        cv::Vec3f first = candidate.startPositionPredictionXYZ * static_cast<float>(paths.grid.predictionToBaseScale);
-        cv::Vec3f second = candidate.targetPositionPredictionXYZ * static_cast<float>(paths.grid.predictionToBaseScale);
-        if (std::tuple{second[0], second[1], second[2]} < std::tuple{first[0], first[1], first[2]})
-            std::swap(first, second);
+        const float scale = static_cast<float>(paths.grid.predictionToBaseScale);
+        const cv::Vec3f first = candidate.startPositionPredictionXYZ * scale;
+        const cv::Vec3f second = candidate.targetPositionPredictionXYZ * scale;
+        cv::Vec3f owner = first;
+        if (std::tuple{second[0], second[1], second[2]} <
+            std::tuple{first[0], first[1], first[2]}) {
+            owner = second;
+        }
         for (size_t axis = 0; axis < 3; ++axis)
-            chunk[axis] = static_cast<int64_t>(std::floor(first[axis] / chunkSide));
+            chunk[axis] = static_cast<int64_t>(std::floor(owner[axis] / chunkSide));
         chunks[chunk].push_back(index);
     }
     return chunks;
@@ -663,18 +667,36 @@ void quantizeCosts(
     const FiberletPathReport& baseline,
     const std::vector<size_t>& successful,
     int chunkSide,
-    int bits)
+    int bits,
+    FiberletCostQuantizationDomain domain,
+    float costDensityMaximum)
 {
     if (bits != 8 && bits != 16)
         return;
+    if (domain == FiberletCostQuantizationDomain::SqrtPerPredictionVoxel) {
+        for (const size_t index : successful) {
+            const auto& candidate = baseline.candidates[index];
+            const float decoded = quantizeFiberletCostForEvaluation(
+                candidate.cost.total(),
+                fiberletCandidatePathLength(candidate),
+                0.0F, 1.0F, bits, domain, costDensityMaximum);
+            measured.candidates[index].cost =
+                {decoded, 0.0F, 0.0F, 0.0F, 0.0F};
+        }
+        return;
+    }
     const auto chunks = costChunks(baseline, successful, chunkSide);
     for (const auto& [chunk, indices] : chunks) {
         (void)chunk;
         std::vector<float> costs;
+        std::vector<float> lengths;
         costs.reserve(indices.size());
-        for (const size_t index : indices)
+        lengths.reserve(indices.size());
+        for (const size_t index : indices) {
             costs.push_back(baseline.candidates[index].cost.total());
-        const auto decoded = quantizeFiberletCostsForEvaluation(costs, bits);
+            lengths.push_back(fiberletCandidatePathLength(baseline.candidates[index]));
+        }
+        const auto decoded = quantizeFiberletCostsForEvaluation(costs, lengths, bits, domain);
         for (size_t local = 0; local < indices.size(); ++local)
             measured.candidates[indices[local]].cost =
                 {decoded[local], 0.0F, 0.0F, 0.0F, 0.0F};
@@ -685,10 +707,20 @@ std::pair<uint64_t, uint64_t> chunkOrderingChanges(
     const FiberletPathReport& baseline,
     const FiberletPathReport& measured,
     const std::vector<size_t>& successful,
-    int chunkSide)
+    int chunkSide,
+    FiberletCostQuantizationDomain domain)
 {
     uint64_t inversions = 0;
     uint64_t pairs = 0;
+    if (domain == FiberletCostQuantizationDomain::SqrtPerPredictionVoxel) {
+        const auto baselineOrder = orderedCosts(baseline, successful);
+        const auto measuredOrder = orderedCosts(measured, successful);
+        inversions = inversionCount(baselineOrder, measuredOrder);
+        pairs = successful.size() < 2 ? 0 :
+            static_cast<uint64_t>(successful.size()) *
+                static_cast<uint64_t>(successful.size() - 1) / 2;
+        return {inversions, pairs};
+    }
     for (const auto& [chunk, indices] : costChunks(baseline, successful, chunkSide)) {
         (void)chunk;
         const auto baselineOrder = orderedCosts(baseline, indices);
@@ -928,26 +960,122 @@ std::vector<float> quantizeFiberletCostsForEvaluation(
         std::minmax_element(costs.begin(), costs.end());
     const float minimum = *minimumIt;
     const float maximum = *maximumIt;
-    const std::uint32_t levels = bits == 8 ? 255U : 65535U;
-    const float scale = maximum == minimum
-        ? 0.0F
-        : (maximum - minimum) / static_cast<float>(levels);
     std::vector<float> result;
     result.reserve(costs.size());
-    for (const float cost : costs) {
-        std::uint32_t code = 0;
-        if (cost == maximum) {
-            code = levels;
-        } else if (scale > 0.0F) {
-            const float raw = (cost - minimum) / scale;
-            if (!std::isfinite(raw) || raw < 0.0F ||
-                raw > static_cast<float>(levels)) {
-                throw std::invalid_argument(
-                    "fiberlet evaluation cost lies outside its affine range");
-            }
-            code = static_cast<std::uint32_t>(std::floor(raw + 0.5F));
+    for (const float cost : costs)
+        result.push_back(quantizeFiberletCostForEvaluation(
+            cost, 1.0F, minimum, maximum, bits,
+            FiberletCostQuantizationDomain::RawTotal));
+    return result;
+}
+
+std::string_view fiberletCostQuantizationDomainName(
+    FiberletCostQuantizationDomain domain)
+{
+    switch (domain) {
+    case FiberletCostQuantizationDomain::RawTotal:
+        return "raw_total";
+    case FiberletCostQuantizationDomain::SqrtPerPredictionVoxel:
+        return "sqrt_per_prediction_voxel";
+    }
+    throw std::invalid_argument("unknown fiberlet cost quantization domain");
+}
+
+float fiberletCostQuantizationValueForEvaluation(
+    float totalCost,
+    float pathLengthPredictionVoxels,
+    FiberletCostQuantizationDomain domain,
+    float costDensityMaximum)
+{
+    if (!(totalCost >= 0.0F) || !std::isfinite(totalCost))
+        throw std::invalid_argument("fiberlet evaluation cost is invalid");
+    if (domain == FiberletCostQuantizationDomain::RawTotal)
+        return totalCost;
+    if (domain != FiberletCostQuantizationDomain::SqrtPerPredictionVoxel ||
+        !(pathLengthPredictionVoxels > 0.0F) ||
+        !std::isfinite(pathLengthPredictionVoxels) ||
+        !(costDensityMaximum > 0.0F) || !std::isfinite(costDensityMaximum)) {
+        throw std::invalid_argument("fiberlet evaluation cost density length is invalid");
+    }
+    const float density = totalCost / pathLengthPredictionVoxels;
+    if (!(density >= 0.0F) || !std::isfinite(density))
+        throw std::invalid_argument("fiberlet evaluation cost density is invalid");
+    return std::sqrt(std::min(density / costDensityMaximum, 1.0F));
+}
+
+float quantizeFiberletCostForEvaluation(
+    float totalCost,
+    float pathLengthPredictionVoxels,
+    float minimumValue,
+    float maximumValue,
+    int bits,
+    FiberletCostQuantizationDomain domain,
+    float costDensityMaximum)
+{
+    if (bits != 8 && bits != 16)
+        return totalCost;
+    const float value = fiberletCostQuantizationValueForEvaluation(
+        totalCost, pathLengthPredictionVoxels, domain,
+        costDensityMaximum);
+    if (domain == FiberletCostQuantizationDomain::SqrtPerPredictionVoxel) {
+        minimumValue = 0.0F;
+        maximumValue = 1.0F;
+    }
+    if (!(minimumValue >= 0.0F) || !std::isfinite(minimumValue) ||
+        maximumValue < minimumValue || !std::isfinite(maximumValue) ||
+        value < minimumValue || value > maximumValue) {
+        throw std::invalid_argument("fiberlet evaluation cost lies outside its affine range");
+    }
+    const std::uint32_t levels = bits == 8 ? 255U : 65535U;
+    const float scale = maximumValue == minimumValue
+        ? 0.0F
+        : (maximumValue - minimumValue) / static_cast<float>(levels);
+    std::uint32_t code = 0;
+    if (value == maximumValue) {
+        code = levels;
+    } else if (scale > 0.0F) {
+        const float raw = (value - minimumValue) / scale;
+        if (!std::isfinite(raw) || raw < 0.0F ||
+            raw > static_cast<float>(levels)) {
+            throw std::invalid_argument("fiberlet evaluation cost lies outside its affine range");
         }
-        result.push_back(minimum + scale * static_cast<float>(code));
+        code = static_cast<std::uint32_t>(std::floor(raw + 0.5F));
+    }
+    const float decodedValue = minimumValue + scale * static_cast<float>(code);
+    const float decodedTotal = domain == FiberletCostQuantizationDomain::SqrtPerPredictionVoxel
+        ? decodedValue * decodedValue * costDensityMaximum *
+            pathLengthPredictionVoxels
+        : decodedValue;
+    if (!(decodedTotal >= 0.0F) || !std::isfinite(decodedTotal))
+        throw std::invalid_argument("decoded fiberlet evaluation cost is invalid");
+    return decodedTotal;
+}
+
+std::vector<float> quantizeFiberletCostsForEvaluation(
+    std::span<const float> costs,
+    std::span<const float> pathLengthsPredictionVoxels,
+    int bits,
+    FiberletCostQuantizationDomain domain,
+    float costDensityMaximum)
+{
+    if (costs.size() != pathLengthsPredictionVoxels.size())
+        throw std::invalid_argument("fiberlet evaluation cost and length counts differ");
+    if (costs.empty())
+        return {};
+    std::vector<float> values;
+    values.reserve(costs.size());
+    for (size_t index = 0; index < costs.size(); ++index) {
+        values.push_back(fiberletCostQuantizationValueForEvaluation(
+            costs[index], pathLengthsPredictionVoxels[index], domain,
+            costDensityMaximum));
+    }
+    const auto [minimum, maximum] = std::minmax_element(values.begin(), values.end());
+    std::vector<float> result;
+    result.reserve(costs.size());
+    for (size_t index = 0; index < costs.size(); ++index) {
+        result.push_back(quantizeFiberletCostForEvaluation(
+            costs[index], pathLengthsPredictionVoxels[index], *minimum, *maximum,
+            bits, domain, costDensityMaximum));
     }
     return result;
 }
@@ -962,6 +1090,8 @@ std::vector<FiberletQuantizationScenario> standardFiberletQuantizationScenarios(
         {"compact_axis", 0, true, 0},
         {"compact_axis_cost_u8", 0, true, 8},
         {"compact_axis_cost_u16", 0, true, 16},
+        {"compact_axis_cost_sqrt_u16_max256", 0, true, 16,
+         FiberletCostQuantizationDomain::SqrtPerPredictionVoxel, 256.0F},
         {"position_q1_compact_axis", 1, true, 0},
         {"position_q2_compact_axis", 2, true, 0},
         {"position_q4_compact_axis", 4, true, 0},
@@ -1129,7 +1259,9 @@ std::vector<FiberletQuantizationScenarioReport> benchmarkFiberletQuantization(
                 source.paths,
                 successful,
                 storageChunkSideBaseVoxels,
-                scenario.costBits);
+                scenario.costBits,
+                scenario.costDomain,
+                scenario.costDensityMaximum);
 
             FiberletGraph graph = buildFiberletGraph(measured);
             const FiberletGraphReplayResult replay =
@@ -1185,7 +1317,8 @@ std::vector<FiberletQuantizationScenarioReport> benchmarkFiberletQuantization(
                     source.paths,
                     measured,
                     successful,
-                    storageChunkSideBaseVoxels);
+                    storageChunkSideBaseVoxels,
+                    scenario.costDomain);
                 result.chunkCostOrderingInversions = inversions;
                 result.chunkCostOrderingPairs = pairs;
             }

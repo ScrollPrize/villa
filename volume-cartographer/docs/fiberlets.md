@@ -523,19 +523,46 @@ volume-cartographer/build/bin/vc_fiberlets fiberlet-replay \
   --normal-manifest /path/to/lasagna.lasagna.json \
   --beam 16 \
   --beam-step-distance 48 \
-  --lookahead-distance 192 \
-  --search-width 128 \
-  --prune-distance 48 \
+  --lookahead-distance 384 \
   --length 4096
 ```
 
 `--beam-step-distance D`, `--lookahead-distance H`, and `--prune-distance P`
-use base voxels. The defaults are `D=48`, `H=192`, and `P=48`.
-`--search-width K` defaults to 128 and must be at least the final beam width.
-Set it to zero to run the exact A* implementation as a focused benchmark
-oracle.
+use base voxels. The defaults are `D=48`, `H=384`, and `P=48`.
+`--search-width K` defaults to zero and runs the exact cost-bounded lookahead.
+Full width refers to the untruncated lookahead search; replay still retains at
+most the configured positive `--beam` width and enforces exact cycle rejection
+and the per-decision state limit. Beam width defaults to 16 but has no fixed
+upper policy limit. A positive `K` opts into approximate intermediate
+pruning, must be at least the final beam width, and uses `--prune-distance P`.
+The prune distance is ignored in exact mode.
 
-The bounded search maintains whole-fiberlet histories and one shared logical
+Exact mode keeps each winning route through the full common lookahead horizon,
+not just through the next checkpoint. The following decision extends those
+retained routes only from their existing endpoints; a whole terminal fiberlet
+that already crosses the new horizon is rescored there without expansion. One
+multi-source priority frontier feeds one global top-`beam` completion set. Routes
+are ranked by raw exact-horizon total loss and canonical persistent logical
+identity, and only identical complete logical routes are deduplicated. Several
+retained routes may therefore share the same checkpoint prefix and diverge
+later in the lookahead.
+
+The global cutoff appears only after `beam` distinct complete logical routes
+are known. Its value is the worst retained raw total, shared by all input beams.
+Increasing the beam therefore delays cutoff activation and can substantially
+increase exact-search work; the generated-state limit remains the hard bound.
+Lower bounds equal to the cutoff remain eligible. Expansion uses a fixed-size
+batch independent of thread count; workers produce ordered successors and the
+coordinator merges them canonically before updating the cutoff and the one-
+million-state decision budget. Queue ranking and cutoff maintenance use scalar
+cost/path state plus persistent route handles, never materialized route or
+point vectors.
+
+After selection, only the best route's prefix through the complete fiberlet
+containing `C+D` is reference-matched and committed. Its retained future suffix
+is not inspected for a reference failure until a later checkpoint commits it.
+
+The optional bounded search maintains whole-fiberlet histories and one shared logical
 checkpoint `C`. Its first exact front is the next checkpoint `C+D`; subsequent
 fronts are no farther than `P` apart and end exactly at `C+H`. At each
 intermediate front it keeps the best continuation for each stable `C+D` prefix
@@ -564,7 +591,7 @@ fiberlet remains in route geometry and visited state. Stable logical IDs,
 canonical worker merging, and one decision-wide state budget make output
 independent of expansion thread scheduling.
 
-After pruning, the checkpoint advances by `D`. Each retained history is
+In bounded mode, after pruning the checkpoint advances by `D`. Each retained history is
 committed through the complete fiberlet containing the new checkpoint. A beam
 may therefore commit no new fiberlet, one fiberlet, or several fiberlets during
 one iteration, and its stored endpoint may lie beyond the shared checkpoint.
@@ -1269,7 +1296,7 @@ vc_fiberlets quantization-benchmark FIBER_MANIFEST FIBER_JSON OUTPUT --normal-ma
 The default scenario is `combined_q4_axis_cost_u8`: 4-base-voxel endpoint
 positions, compact two-byte fitted directions, and per-canonical-first-endpoint
 chunk `uint8` total costs. `--scenario NAME` selects another standard scenario;
-`--scenario all` runs one baseline followed by all 17 non-baseline scenarios in
+`--scenario all` runs one baseline followed by all 18 non-baseline scenarios in
 their fixed matrix order. An unknown name is an error. `--length N` limits the
 reference interval in base voxels for a shorter comparison.
 
@@ -1283,10 +1310,27 @@ complete missing compact-axis chunks in that same cache while establishing the
 stable minimum/maximum for a first-endpoint storage chunk; it does not create a
 cost-specific geometry cache.
 
+`compact_axis_cost_sqrt_u16_max256` reopens that same compact-axis cache and
+uses a fixed two-byte-equivalent evaluation view. It encodes
+`round(65535 * sqrt(clamp((total_cost / path_length) / 256, 0, 1)))` and
+decodes the edge total as `256 * (code / 65535)^2 * path_length`. The fixed
+ceiling is global: no chunk statistics, dataset scan, or observed min/max
+contributes to the mapping. The authoritative positive float32 path length
+comes from the existing prefix. Join costs stay in their original float
+representation and are added once by graph search.
+
+The fixed-sqrt scenario does not persist a two-byte cost field. It derives an
+ephemeral decoded cost view from existing float component costs and lengths.
+Cost domain and ceiling are absent from geometry identities and cache paths, so
+a completed compact-axis cache is reused without range scans, anchor
+extraction, fiberlet DP, new payloads, or payload rewrites. Result rows and
+replay JSON identify `sqrt_per_prediction_voxel` and the fixed ceiling.
+
 Fiberlet caches are grouped by endpoint position quantum and fitted-direction
-encoding. Float, `uint8`, and `uint16` cost views over the same geometry reopen
-the same fiberlet prefixes, routes, endpoint steps, path lengths, and float
-component costs; cost decoding happens only in the replay graph. All scenarios
+encoding. Float, raw `uint8`, raw `uint16`, and fixed-sqrt `uint16` cost views
+over the same geometry reopen the same fiberlet prefixes, routes, endpoint
+steps, path lengths, and float component costs; cost decoding happens only in
+the replay graph. All scenarios
 read the same canonical anchor cache, and cost-only scenarios also reuse the
 exact baseline fiberlets. Geometry-
 quantized scenarios retain the pre-existing internal `cost_bits=8` cache tag so

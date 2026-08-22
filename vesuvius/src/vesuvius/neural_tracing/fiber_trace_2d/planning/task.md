@@ -1,15 +1,12 @@
-# Task: make fiberlet replay prefix processing incremental
+# Task: evaluate fixed nonlinear uint16 fiberlet costs
 
-Remove replay work whose cost grows with the already committed segment prefix.
-The fixed-distance lookahead must do work proportional to the new search and
-newly selected suffix, not repeatedly rebuild route geometry, logical route
-keys, reference matches, normals, or visited-node state from the segment seed.
+Evaluate a fixed, dataset-independent nonlinear `uint16` representation of
+fiberlet edge cost density. Encode
+`sqrt(clamp(total_cost / path_length_prediction_voxels / 256, 0, 1))` over the
+complete uint16 range and reconstruct total edge cost from the decoded density
+and existing stored path length.
 
-Preserve route selection, exact cycle rejection, failure locations, costs,
-serialized replay results, cache behavior, and numerical evaluation order.
-Final result materialization may make one linear pass because the result itself
-contains the complete route.
-
-Measure the change on a hot-cache replay and retain the existing focused replay
-tests. No approximation, probabilistic identity, or relaxed cycle handling is
-acceptable.
+The encoding must never derive ranges from chunks or observed samples. Retain
+the existing raw-total scenarios unchanged, reuse the existing
+compact-direction geometry cache, and run the full Paris4 radius-768 comparison
+at `H=384`, `D=48`, beam 16, exact search, and 32 threads.

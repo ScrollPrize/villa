@@ -451,6 +451,11 @@ FiberletCachedReplayGraphSource::FiberletCachedReplayGraphSource(
     }
     if (evaluationQuantization_.positionQuantumBaseVoxels < 0 ||
         (evaluationQuantization_.costBits != 0 && evaluationQuantization_.costBits != 8 && evaluationQuantization_.costBits != 16) ||
+        (evaluationQuantization_.costDomain != FiberletCostQuantizationDomain::RawTotal &&
+         evaluationQuantization_.costDomain != FiberletCostQuantizationDomain::SqrtPerPredictionVoxel) ||
+        (evaluationQuantization_.costDomain == FiberletCostQuantizationDomain::SqrtPerPredictionVoxel &&
+         (!(evaluationQuantization_.costDensityMaximum > 0.0F) ||
+          !std::isfinite(evaluationQuantization_.costDensityMaximum))) ||
         evaluationQuantization_.storageChunkSideBaseVoxels <= 0 ||
         (evaluationQuantization_.positionQuantumBaseVoxels > 0 &&
          evaluationQuantization_.storageChunkSideBaseVoxels % evaluationQuantization_.positionQuantumBaseVoxels != 0)) {
@@ -536,19 +541,35 @@ std::array<int, 3> FiberletCachedReplayGraphSource::compactCostOwner(const Fiber
     return result;
 }
 
-float FiberletCachedReplayGraphSource::quantizedCost(const FiberletStorageId& physical, float cost) const
+float FiberletCachedReplayGraphSource::quantizedCost(
+    const FiberletStorageId& physical,
+    float cost,
+    float pathLengthPredictionVoxels) const
 {
     if (evaluationQuantization_.costBits != 8 && evaluationQuantization_.costBits != 16) {
         return cost;
+    }
+    if (evaluationQuantization_.costDomain ==
+        FiberletCostQuantizationDomain::SqrtPerPredictionVoxel) {
+        return quantizeFiberletCostForEvaluation(
+            cost, pathLengthPredictionVoxels, 0.0F, 1.0F,
+            evaluationQuantization_.costBits,
+            evaluationQuantization_.costDomain,
+            evaluationQuantization_.costDensityMaximum);
     }
     const ChunkCoordinate compactOwner = compactCostOwner(physical);
     {
         std::lock_guard lock(quantizationState_->mutex);
         if (const auto found = quantizationState_->compactCostRanges.find(compactOwner); found != quantizationState_->compactCostRanges.end()) {
             const auto& range = found->second;
-            const auto decoded =
-                quantizeFiberletCostsForEvaluation(std::array<float, 3>{range.minimum, range.maximum, cost}, evaluationQuantization_.costBits);
-            return decoded[2];
+            return quantizeFiberletCostForEvaluation(
+                cost,
+                pathLengthPredictionVoxels,
+                range.minimum,
+                range.maximum,
+                evaluationQuantization_.costBits,
+                evaluationQuantization_.costDomain,
+                evaluationQuantization_.costDensityMaximum);
         }
     }
 
@@ -580,8 +601,13 @@ float FiberletCachedReplayGraphSource::quantizedCost(const FiberletStorageId& ph
                     for (const auto& prefix : loaded.value.payloadLease->prefixes) {
                         const ChunkCoordinate group = compactCostOwner(prefix.id);
                         auto& contribution = contributions[group];
-                        contribution.minimum = std::min(contribution.minimum, prefix.cost.total());
-                        contribution.maximum = std::max(contribution.maximum, prefix.cost.total());
+                        const float value = fiberletCostQuantizationValueForEvaluation(
+                            prefix.cost.total(),
+                            prefix.pathLengthPredictionVoxels,
+                            evaluationQuantization_.costDomain,
+                            evaluationQuantization_.costDensityMaximum);
+                        contribution.minimum = std::min(contribution.minimum, value);
+                        contribution.maximum = std::max(contribution.maximum, value);
                         contribution.populated = true;
                     }
                     std::lock_guard lock(quantizationState_->mutex);
@@ -603,9 +629,14 @@ float FiberletCachedReplayGraphSource::quantizedCost(const FiberletStorageId& ph
         std::lock_guard lock(quantizationState_->mutex);
         quantizationState_->compactCostRanges.emplace(compactOwner, combined);
     }
-    const auto decoded =
-        quantizeFiberletCostsForEvaluation(std::array<float, 3>{combined.minimum, combined.maximum, cost}, evaluationQuantization_.costBits);
-    return decoded[2];
+    return quantizeFiberletCostForEvaluation(
+        cost,
+        pathLengthPredictionVoxels,
+        combined.minimum,
+        combined.maximum,
+        evaluationQuantization_.costBits,
+        evaluationQuantization_.costDomain,
+        evaluationQuantization_.costDensityMaximum);
 }
 
 std::vector<FiberletReplaySourceAnchor> FiberletCachedReplayGraphSource::anchorsNearReference(
@@ -676,7 +707,15 @@ FiberletReplaySourceArc FiberletCachedReplayGraphSource::arc(const DirectedFiber
     result.pathLengthPredictionVoxels = loaded.value.prefix.pathLengthPredictionVoxels;
     result.cost = storedPathCost(loaded.value.prefix.cost);
     if (evaluationQuantization_.costBits == 8 || evaluationQuantization_.costBits == 16) {
-        result.cost = {quantizedCost(id.fiberlet, result.cost.total()), 0.0F, 0.0F, 0.0F, 0.0F};
+        result.cost = {
+            quantizedCost(
+                id.fiberlet,
+                result.cost.total(),
+                loaded.value.prefix.pathLengthPredictionVoxels),
+            0.0F,
+            0.0F,
+            0.0F,
+            0.0F};
     }
     const float scale = predictionToBaseScale();
     const cv::Vec3d firstPosition(loaded.value.firstAnchor.positionPredictionXYZ * scale);

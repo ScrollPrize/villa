@@ -93,7 +93,6 @@ struct CliOptions {
     double glyphLengthBaseVoxels = 16.0;
     size_t decodedCacheBytes = 512ULL * 1024ULL * 1024ULL;
     bool printStats = false;
-    bool beamStepDistanceSpecified = false;
     bool writePresenceSlices = true;
     bool writeReplayVisualizations = false;
     bool alongSpecified = false;
@@ -189,17 +188,17 @@ void usage(const char* executable)
               << "  --arc N                       absolute reference-polyline start arc in base voxels\n"
               << "  --seed-key Z,Y,X,V            exact first graph-anchor key for a focused replay\n"
               << "  --route-stats-failure-margin N exclude this base-voxel distance around failures [128]\n"
-              << "  --beam-step-distance N        rolling checkpoint step in base voxels [lookahead/4]\n"
-              << "  --lookahead-distance N        persistent beam lookahead in base voxels [192]\n"
-              << "  --search-width N              intermediate search width; zero selects exact search [128]\n"
-              << "  --prune-distance N            intermediate pruning interval in base voxels [48]\n"
+              << "  --beam-step-distance N        rolling checkpoint step in base voxels [48]\n"
+              << "  --lookahead-distance N        persistent beam lookahead in base voxels [384]\n"
+              << "  --search-width N              approximate intermediate width; zero is exact [0]\n"
+              << "  --prune-distance N            approximate-mode pruning interval in base voxels [48]\n"
               << "  --vis                         write indexed local failure visualizations\n"
               << "  --volume PATH                 required CT OME-Zarr array/group path for --vis\n"
               << "  --along N                     replay visualization half-width [128]; benchmark length [full]\n"
               << "  --radius N                    extraction tube radius in base voxels [64]\n"
               << "  --match-refine N              forward match refinement in trace steps [1]\n"
               << "  --inference-scaledown-power N prediction scaledown relative to trace voxels [2]\n";
-    std::cerr << "  --beam N                      graph replay beam width, 1..16 [16]\n"
+    std::cerr << "  --beam N                      positive graph replay beam width [16]\n"
               << "  --anchor-cache PATH           generated anchor cache [output/cache/anchors.zarr]\n"
               << "  --fiberlet-cache PATH         generated fiberlet cache [output/cache/fiberlets.zarr]\n"
               << "  --eager-graph                 diagnostic corridor-wide graph extraction\n"
@@ -477,13 +476,12 @@ CliOptions parseArgs(int argc, char** argv)
             options.paths.samplingBatchCoordinates = parseInt(valueAfter(index, argc, argv, "batch"), "batch");
         } else if (argument == "--beam" && usesGraphReplayOptions(options.command)) {
             const int value = parseInt(valueAfter(index, argc, argv, "beam"), "beam");
-            if (value < 1 || value > 16)
-                fail("--beam must be between one and 16");
+            if (value < 1)
+                fail("--beam must be positive");
             options.graphReplay.beamWidth = static_cast<size_t>(value);
         } else if (argument == "--beam-step-distance" && usesGraphReplayOptions(options.command)) {
             options.graphReplay.beamStepDistanceBaseVoxels =
                 parseDouble(valueAfter(index, argc, argv, "beam-step-distance"), "beam-step-distance");
-            options.beamStepDistanceSpecified = true;
         } else if (argument == "--lookahead-distance" && usesGraphReplayOptions(options.command)) {
             options.graphReplay.lookaheadDistanceBaseVoxels =
                 parseDouble(valueAfter(index, argc, argv, "lookahead-distance"), "lookahead-distance");
@@ -741,9 +739,6 @@ double resolveAnchorConfig(CliOptions& options, const vc::fiber_tracer::FiberPre
     options.anchors.peakGridStepPredictionVoxels = options.peakStepBaseVoxels.value_or(0.5 * grid.predictionToBaseScale) / grid.predictionToBaseScale;
     options.anchors.localWindowRadiusPredictionVoxels = options.localWindowBaseVoxels.value_or(cellSideBase) / grid.predictionToBaseScale;
     options.anchors.axialSupportHalfWidthPredictionVoxels = 1.5 * options.anchors.cellSizePredictionVoxels;
-    if (!options.beamStepDistanceSpecified) {
-        options.graphReplay.beamStepDistanceBaseVoxels = options.graphReplay.lookaheadDistanceBaseVoxels * 0.25;
-    }
     vc::fiber_tracer::validateFiberAnchorConfig(options.anchors);
     return cellSideBase;
 }
@@ -800,6 +795,8 @@ std::filesystem::path writeQuantizationReplay(
         {"position_quantum_base_voxels", scenario.positionQuantumBaseVoxels},
         {"compact_directions", scenario.compactAxes},
         {"cost_bits", scenario.costBits},
+        {"cost_domain", vc::fiber_tracer::fiberletCostQuantizationDomainName(scenario.costDomain)},
+        {"cost_density_maximum", scenario.costDensityMaximum},
     };
     json["inputs"] = {
         {"fiber_prediction_manifest", datasetLocator(fiberDataset)},
@@ -2313,12 +2310,15 @@ int main(int argc, char** argv)
             const auto baseline =
                 run("quantization baseline", vc::fiber_tracer::FiberletGeometryCacheProfile{}, vc::fiber_tracer::FiberletEvaluationQuantization{});
             for (const auto& scenario : selectedScenarios) {
-                const vc::fiber_tracer::FiberletEvaluationQuantization replayQuantization{
+                vc::fiber_tracer::FiberletEvaluationQuantization replayQuantization{
                     scenario.positionQuantumBaseVoxels,
                     scenario.compactAxes,
                     scenario.costBits,
                     options.storageChunkSideBaseVoxels,
                 };
+                replayQuantization.costDomain = scenario.costDomain;
+                replayQuantization.costDensityMaximum =
+                    scenario.costDensityMaximum;
                 const auto cacheProfile = vc::fiber_tracer::fiberletGeometryCacheProfile(replayQuantization);
                 std::optional<CachedRun> measuredRun;
                 if (scenario.name != "baseline") {
@@ -2348,6 +2348,8 @@ int main(int argc, char** argv)
                 std::cout << std::setprecision(17) << "fiberlet_cached_quantization"
                           << " scenario=" << scenario.name << " position_quantum_base=" << scenario.positionQuantumBaseVoxels
                           << " compact_directions=" << (scenario.compactAxes ? "true" : "false") << " cost_bits=" << scenario.costBits
+                          << " cost_domain=" << vc::fiber_tracer::fiberletCostQuantizationDomainName(scenario.costDomain)
+                          << " cost_density_maximum=" << scenario.costDensityMaximum
                           << " geometry_cache_cost_tag_bits=" << cacheProfile.compatibilityCostTagBits
                           << " radius_base=" << options.radiusBaseVoxels << " reference_length_base=" << interval.endArc - interval.beginArc
                           << " baseline_failures=" << comparison.baselineFailures << " scenario_failures=" << comparison.scenarioFailures

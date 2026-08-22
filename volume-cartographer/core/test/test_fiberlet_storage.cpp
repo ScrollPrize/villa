@@ -9,8 +9,10 @@
 #include <cmath>
 #include <atomic>
 #include <array>
+#include <bit>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <random>
 #include <set>
 
@@ -77,10 +79,56 @@ TEST_CASE("Fiberlet evaluation quantization uses base positions and shared codec
     const std::array<float, 4> costs{1.0F, 2.0F, 5.0F, 9.0F};
     const auto decoded = quantizeFiberletCostsForEvaluation(costs, 8);
     REQUIRE(decoded.size() == costs.size());
-    CHECK(decoded.front() == costs.front());
-    CHECK(decoded.back() == costs.back());
-    CHECK(decoded[1] >= costs.front());
-    CHECK(decoded[1] <= costs.back());
+    const std::array<std::uint32_t, 4> expectedBits{
+        0x3f800000U, 0x40004040U, 0x409f7f80U, 0x41100000U};
+    for (size_t index = 0; index < decoded.size(); ++index)
+        CHECK(std::bit_cast<std::uint32_t>(decoded[index]) == expectedBits[index]);
+}
+
+TEST_CASE("Fiberlet sqrt cost-density evaluation uses a fixed global range")
+{
+    const std::array<float, 3> costs{0.5F, 2.0F, 512.0F};
+    const std::array<float, 3> lengths{2.0F, 8.0F, 2.0F};
+    const auto decoded = quantizeFiberletCostsForEvaluation(
+        costs,
+        lengths,
+        16,
+        FiberletCostQuantizationDomain::SqrtPerPredictionVoxel,
+        256.0F);
+    REQUIRE(decoded.size() == costs.size());
+    const float code = 2048.0F;
+    const float decodedDensity = 256.0F *
+        (code / 65535.0F) * (code / 65535.0F);
+    CHECK(decoded[0] == doctest::Approx(decodedDensity * lengths[0]));
+    CHECK(decoded[1] == doctest::Approx(decodedDensity * lengths[1]));
+    CHECK(decoded[2] == doctest::Approx(512.0F));
+
+    const std::array<float, 1> isolatedCost{costs[0]};
+    const std::array<float, 1> isolatedLength{lengths[0]};
+    const auto isolated = quantizeFiberletCostsForEvaluation(
+        isolatedCost, isolatedLength, 16,
+        FiberletCostQuantizationDomain::SqrtPerPredictionVoxel,
+        256.0F);
+    CHECK(std::bit_cast<std::uint32_t>(isolated[0]) ==
+          std::bit_cast<std::uint32_t>(decoded[0]));
+    CHECK_THROWS_AS(
+        fiberletCostQuantizationValueForEvaluation(
+            1.0F, 0.0F,
+            FiberletCostQuantizationDomain::SqrtPerPredictionVoxel,
+            256.0F),
+        std::invalid_argument);
+    CHECK_THROWS_AS(
+        fiberletCostQuantizationValueForEvaluation(
+            1.0F, std::numeric_limits<float>::infinity(),
+            FiberletCostQuantizationDomain::SqrtPerPredictionVoxel,
+            256.0F),
+        std::invalid_argument);
+    CHECK_THROWS_AS(
+        fiberletCostQuantizationValueForEvaluation(
+            1.0F, 1.0F,
+            FiberletCostQuantizationDomain::SqrtPerPredictionVoxel,
+            0.0F),
+        std::invalid_argument);
 }
 
 TEST_CASE("Fiberlet geometry caches ignore replay cost representation")
@@ -93,6 +141,10 @@ TEST_CASE("Fiberlet geometry caches ignore replay cost representation")
     const FiberletEvaluationQuantization compactAxisFloat{0, true, 0, 512};
     const FiberletEvaluationQuantization compactAxisU8{0, true, 8, 512};
     const FiberletEvaluationQuantization compactAxisU16{0, true, 16, 512};
+    FiberletEvaluationQuantization compactAxisSqrtU16{0, true, 16, 512};
+    compactAxisSqrtU16.costDomain =
+        FiberletCostQuantizationDomain::SqrtPerPredictionVoxel;
+    compactAxisSqrtU16.costDensityMaximum = 256.0F;
 
     const FiberletGeometryCacheProfile exact{{0, false}, 0, 512};
     const FiberletGeometryCacheProfile compactAxis{{0, true}, 8, 512};
@@ -105,18 +157,22 @@ TEST_CASE("Fiberlet geometry caches ignore replay cost representation")
     CHECK(fiberletGeometryCacheProfile(compactAxisFloat) == compactAxis);
     CHECK(fiberletGeometryCacheProfile(compactAxisU8) == compactAxis);
     CHECK(fiberletGeometryCacheProfile(compactAxisU16) == compactAxis);
+    CHECK(fiberletGeometryCacheProfile(compactAxisSqrtU16) == compactAxis);
     CHECK(compactAxisFloat.costBits == 0);
     CHECK(compactAxisU8.costBits == 8);
     CHECK(compactAxisU16.costBits == 16);
+    CHECK(compactAxisSqrtU16.costDomain ==
+          FiberletCostQuantizationDomain::SqrtPerPredictionVoxel);
 }
 
 TEST_CASE("Fiberlet standard quantization matrix includes compact-axis cost views")
 {
     const auto scenarios = standardFiberletQuantizationScenarios();
-    REQUIRE(scenarios.size() == 18);
-    const std::array<std::string, 3> names{
-        "compact_axis", "compact_axis_cost_u8", "compact_axis_cost_u16"};
-    const std::array<int, 3> costBits{0, 8, 16};
+    REQUIRE(scenarios.size() == 19);
+    const std::array<std::string, 4> names{
+        "compact_axis", "compact_axis_cost_u8", "compact_axis_cost_u16",
+        "compact_axis_cost_sqrt_u16_max256"};
+    const std::array<int, 4> costBits{0, 8, 16, 16};
     for (std::size_t index = 0; index < names.size(); ++index) {
         const auto found = std::find_if(
             scenarios.begin(), scenarios.end(), [&](const auto& scenario) {
@@ -126,6 +182,12 @@ TEST_CASE("Fiberlet standard quantization matrix includes compact-axis cost view
         CHECK(found->positionQuantumBaseVoxels == 0);
         CHECK(found->compactAxes);
         CHECK(found->costBits == costBits[index]);
+        CHECK(found->costDomain ==
+              (names[index].starts_with("compact_axis_cost_sqrt_u16")
+                   ? FiberletCostQuantizationDomain::SqrtPerPredictionVoxel
+                   : FiberletCostQuantizationDomain::RawTotal));
+        if (names[index].starts_with("compact_axis_cost_sqrt_u16"))
+            CHECK(found->costDensityMaximum == doctest::Approx(256.0F));
     }
 }
 

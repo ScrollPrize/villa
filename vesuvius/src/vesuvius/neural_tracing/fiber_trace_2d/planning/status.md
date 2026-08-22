@@ -1,13 +1,11 @@
-# Status: incremental fiberlet replay prefixes
+# Status: fixed nonlinear uint16 fiberlet costs
 
-- [x] Capture the prefix-scaling performance defect.
-- [x] Write the implementation and validation plan.
-- [x] Complete independent plan review.
-- [x] Record a hot-cache baseline and exact output fixture.
-- [x] Implement persistent logical-route identities.
-- [x] Implement exact persistent visited state.
-- [x] Implement incremental selected-route reference evaluation.
+- [x] Capture the revised fixed-range task and implementation plan.
+- [x] Remove the rejected adaptive per-chunk density design.
+- [x] Remove the unpublished uint8 fixed-sqrt scenarios.
+- [x] Implement fixed sqrt-density uint16 encode/decode.
 - [x] Add focused regression coverage.
-- [x] Update specification, documentation, changelog, and task log.
-- [x] Build and validate with `-j32`.
-- [x] Measure hot-cache before/after performance and compare outputs.
+- [x] Rebuild and run focused tests with `-j32`.
+- [x] Run the full radius-768 Paris4 comparison using existing caches.
+- [x] Verify the warm cache remains unchanged.
+- [x] Finish specification, documentation, changelog, and task-log updates.

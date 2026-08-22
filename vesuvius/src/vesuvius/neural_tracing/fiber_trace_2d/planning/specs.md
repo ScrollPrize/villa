@@ -3029,9 +3029,9 @@
   strict VC3D fiber JSON, required regular-normal Lasagna manifest, and output
   directory. All spatial arguments and artifacts use base-volume XYZ/base
   voxels. Defaults are `--fail 20`, `--radius 64`, `--match-refine 1`,
-  `--beam 16`, `--lookahead-distance 192`, and `--batch 65536` native
-  coordinates. The beam-front step defaults to one quarter of the lookahead,
-  48 base voxels, and is overridden by `--beam-step-distance`.
+  `--beam 16`, `--lookahead-distance 384`, and `--batch 65536` native
+  coordinates. The independent beam-front step defaults to 48 base voxels and
+  is overridden by `--beam-step-distance`.
 - The evaluated interval begins at the first control point's dense-line arc and
   ends at the final dense reference point by default. Replay-only `--length N`
   selects at most `N` positive finite base voxels from that point and clamps an
@@ -3108,11 +3108,43 @@
   The greedy evaluator and on-demand graph evaluator run concurrently;
   neither evaluator changes the other one's state.
 - Graph replay has separate finite positive checkpoint-step, lookahead, and
-  intermediate-prune distances in base voxels. It keeps up to 16 complete route
+  intermediate-prune distances in base voxels. It keeps up to the configured
+  positive beam width of complete route
   histories and a shared logical checkpoint `C` that is no greater than the
-  shortest retained history. The default bounded search uses a 192-base-voxel
-  lookahead, 48-base-voxel checkpoint step, 48-base-voxel prune interval, and
-  working width 128. `--search-width 0` selects the exact A* oracle.
+  shortest retained history. Exact cost-bounded lookahead is the default, with
+  a 384-base-voxel lookahead and 48-base-voxel checkpoint step. It expands
+  without an intermediate width approximation, then retains at most the final
+  configured beam width, which defaults to 16 and has no fixed upper policy
+  limit. The existing exact cycle rules and one-million-state per-decision bound
+  remain mandatory. Positive `--search-width N` explicitly selects
+  approximate intermediate pruning at the configured `--prune-distance`,
+  which defaults to 48 base voxels and is ignored in exact mode.
+- Exact search seeds one cost-ordered frontier from every retained live route
+  and maintains one global set of the best configured-beam-width completions at
+  `C+H`. Completion
+  order is raw exact-horizon total loss followed by canonical persistent
+  logical-route order; loss per voxel is diagnostic only. Completions are
+  deduplicated only by seed plus their complete logical route, so any number of
+  winning routes may share the same route through `C+D` and diverge later.
+  Distinct physical expansion states are not merged merely because they have
+  the same logical identity.
+- The exact cutoff does not exist until the configured beam width of distinct
+  full-route completions is available. Thereafter the worst retained raw total
+  is the one shared cutoff
+  for every source route. A pending state is pruned only when its admissible
+  lower bound is strictly greater than the cutoff; equal bounds remain eligible
+  for canonical tie ordering. Fixed-size expansion batches are independent of
+  worker count. All entries admitted under the batch-start cutoff count as
+  expanded, workers publish ordered successor arrays, and the coordinator
+  merges/account them in popped-route and successor order. Only that canonical
+  merge mutates the decision-wide state budget.
+- Exact winners remain live through their complete `C+H` lookahead routes when
+  `C` advances by `D`. At the next decision, a retained terminal fiberlet that
+  already covers the new horizon is immediately rescored with proportional
+  terminal-edge clipping; otherwise expansion resumes only at the retained
+  physical endpoint. The globally best winner's prefix through the complete
+  fiberlet containing `C+D` is the only route reference-evaluated and committed
+  at that decision. Its future suffix is not reference-evaluated early.
 - Bounded search first advances to the next checkpoint `C+D`, then to fronts at
   most `P` apart until the exact `C+H` horizon. All fronts are clamped at the
   selected route end; a final nondivisible interval is shorter. The final
@@ -3154,11 +3186,12 @@
   logical IDs, so 1-thread and multi-thread executions produce identical
   output. One generated-state limit covers the complete decision and aborts it
   without retaining partial worker output.
-- After pruning, `C` advances by `D`. Each winner commits through the complete
-  fiberlet containing the new checkpoint. Depending on its existing overshoot,
-  a beam may add no fiberlet, one fiberlet, or several fiberlets in that step.
-  Its physical endpoint may remain beyond `C`, preserving the invariant
-  `C <= min(committed_history_length)`.
+- In bounded search, after pruning `C` advances by `D` and each winner is
+  retained through the complete fiberlet containing the new checkpoint.
+  Depending on its existing overshoot, a beam may add no fiberlet, one
+  fiberlet, or several fiberlets in that step. Exact search instead retains the
+  full lookahead route described above. Both preserve
+  `C <= min(retained_history_length)`.
 - Compact-cost replay consumes the decoded authoritative edge and join costs.
   Logical-front scoring may proportionally clip only the terminal edge cost;
   final reference-end or failure materialization may additionally clip output
@@ -3174,6 +3207,9 @@
 - Persistent search bookkeeping must not scale with the already committed
   prefix. Logical routes use exact canonical parent/arc identity plus exact
   ancestor/first-divergence ordering; physical candidates remain separate.
+  Exact queue ordering, completion deduplication, and cutoff maintenance use
+  scalar cumulative state and those persistent identities only; they never
+  materialize logical arc or route-point vectors.
   Cycle membership uses an immutable exact-key Patricia trie and is never
   compacted by copying the accumulated prefix. Selected-route reference
   matching resumes from the nearest evaluated physical-history ancestor and
@@ -3717,7 +3753,7 @@
   never materializes the complete corridor graph.
   The default scenario is `combined_q4_axis_cost_u8`; the command requires an
   output directory so interrupted and warm runs reuse complete chunks.
-  The standard matrix has 18 entries: one baseline and 17 non-baseline rows in
+  The standard matrix has 19 entries: one baseline and 18 non-baseline rows in
   deterministic order.
 - One canonical float anchor dataset belongs to each exact source, extraction,
   corridor, grid, and chunk-layout identity. Baseline and every geometry or cost
@@ -3733,11 +3769,16 @@
   unsupported local-position/delta widths invalidate the complete scenario.
   Ordinary candidate rejection or no-path after otherwise valid quantization is
   a measured result and remains visible in the scenario graph population.
-- Cost offset and scale are float32 per first-endpoint spatial chunk. Encoding
+- Raw-total cost offset and scale are float32 per first-endpoint spatial chunk. Encoding
   nearest-rounds onto the complete unsigned range with an exact-maximum case;
-  decoding evaluates float32 `offset + scale * code`. The decoded scalar is the
-  authoritative edge total. The beam denominator is the float32 path length
-  computed by that geometry's DP; cost variants reuse it unchanged.
+  decoding evaluates float32 `offset + scale * code`. Raw-total scenarios use
+  the decoded scalar as the authoritative edge total. Fixed nonlinear density
+  scenario instead uses the fixed constant `Cmax=256` and encodes
+  `round(65535 * sqrt(clamp((total / path_length) / 256, 0, 1)))`. Decoding uses
+  `256 * (code / 65535)^2 * path_length`. No chunk contents or observed values
+  influence this mapping. The same geometry's stored positive float32 path
+  length is used throughout. Entering join costs remain unquantized float
+  components and are added exactly once.
 - Each geometry scenario derives a chunk-local endpoint view from canonical
   anchors and runs fresh candidate generation, Hermite construction, dense
   sampling, and DP. Compact direction changes only the fitted axis and retains
@@ -3762,19 +3803,27 @@
   machine-readable result row is flushed immediately.
 - Geometry-cache identity separates generated fiberlets from the replay cost
   view. Its generation settings contain only endpoint position quantum and
-  fitted-direction encoding. Float, `uint8`, and `uint16` cost views for one
+  fitted-direction encoding. Float, raw `uint8`, raw `uint16`, and fixed-sqrt
+  `uint16` cost view for one
   geometry share the same fiberlet prefixes, routes, path lengths, endpoint
   steps, and float component costs. All of them share the one canonical anchor
   cache; cost-only views also reuse baseline fiberlets.
-- `compact_axis`, `compact_axis_cost_u8`, and `compact_axis_cost_u16` all use
-  float positions and the identical compact-direction geometry cache. Their
-  selected graph costs are respectively float, `uint8`, and `uint16`; the
+- `compact_axis`, `compact_axis_cost_u8`, `compact_axis_cost_u16`, and
+  `compact_axis_cost_sqrt_u16_max256` all use float positions and the
+  identical compact-direction geometry cache. Their selected graph costs are
+  respectively float, raw-total `uint8`, raw-total `uint16`, and fixed-sqrt
+  density `uint16`; the
   geometry namespace's opaque historical u8 compatibility tag does not select
   graph cost precision and never changes persisted prefixes or routes.
 - Compact costs use one affine range per first-endpoint storage chunk. Building
   that stable range may complete missing on-demand chunks in the shared
   geometry cache, but it must not create a cost-specific cache namespace or
   rewrite existing geometry payloads.
+- Fixed-sqrt density cost has no spatial owner or adaptive range. Its domain and
+  ceiling are replay-view state only: they are absent from geometry
+  fingerprints, cache roots, dataset metadata, and persisted payloads. A warm
+  fixed-sqrt replay reads the existing float total and path length and performs
+  no range scan, anchor extraction, DP/fiberlet generation, or payload rewrite.
 - For compatibility with already completed experiments, every non-float
   geometry cache uses the historical internal `cost_bits=8` namespace tag.
   This tag is opaque cache identity data and cannot reach preprocessing. The
@@ -3784,7 +3833,7 @@
   focused `combined_q4_axis_cost_u8` scenario means a 4-base-voxel endpoint
   position quantum, the existing compact two-byte fitted-direction encoding,
   and per-chunk 8-bit total cost. An unknown scenario name is an error.
-- `--scenario all` runs the baseline once, then emits 15 comparison rows for
+- `--scenario all` runs the baseline once, then emits 18 comparison rows for
   every non-baseline standard scenario in deterministic matrix order. Each
   geometry group is generated at most once and later cost views reopen it.
 - Maximum line distance treats replay restart segments as disconnected. It

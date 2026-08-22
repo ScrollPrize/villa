@@ -136,7 +136,10 @@ private:
     [[nodiscard]] FiberletStorageKey logicalAnchorKey(const FiberletStorageKey& physical) const;
     [[nodiscard]] DirectedFiberletStorageId logicalFiberletId(const DirectedFiberletStorageId& physical) const;
     [[nodiscard]] std::array<int, 3> compactCostOwner(const FiberletStorageId& physical) const;
-    [[nodiscard]] float quantizedCost(const FiberletStorageId& physical, float cost) const;
+    [[nodiscard]] float quantizedCost(
+        const FiberletStorageId& physical,
+        float cost,
+        float pathLengthPredictionVoxels) const;
 
     std::shared_ptr<FiberletOnDemandPreprocessor> preprocessor_;
     FiberletChunkGraphSource chunks_;

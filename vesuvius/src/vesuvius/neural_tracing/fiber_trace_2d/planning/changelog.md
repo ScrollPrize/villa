@@ -1,3 +1,32 @@
+# 2026-08-22: fixed nonlinear uint16 fiberlet cost view
+
+- Added fixed global square-root encoding of cost per prediction voxel with a
+  ceiling of 256. It reconstructs edge totals with the stored path
+  length without adaptive chunk ranges, cache identity changes, or persisted
+  geometry changes.
+- On the full Paris4 radius-768 replay it matched the compact-float control's
+  two failure arcs and reference-distance distribution while reusing the same
+  unchanged geometry cache.
+
+# 2026-08-22: globally ranked incremental exact fiberlet lookahead
+
+- Replaced one-best-continuation-per-checkpoint-prefix exact replay with one
+  multi-source frontier and globally ranked full-horizon beam population.
+  Winning routes now retain their lookahead suffix across checkpoint advances;
+  multiple winners may share a checkpoint prefix.
+- Added a single raw-loss cutoff shared by all source beams, deterministic
+  fixed-batch parallel expansion and state accounting, and selected-prefix-only
+  reference evaluation.
+
+# 2026-08-22: exact full-width fiberlet replay default
+
+- Restored exact cost-bounded lookahead as the replay default after incremental
+  prefix processing removed the actual long-route slowdown. Finite search
+  widths remain available only as an explicit approximate experiment.
+- On the full Paris4 radius-768 replay, exact search completed in 82.66 seconds
+  with five fiberlet failures versus 58.34 seconds and seven failures for width
+  128, using the same hot cache and unchanged one-million-state cap.
+
 # 2026-08-22: explicit fiber replay phases
 
 - Replaced the misleading weighted replay percentage with independent
@@ -963,3 +992,15 @@
 - Restored immediate `fiber_replay_failure` output in compact-progress mode;
   failure lines now interrupt and redraw the progress bar instead of being
   suppressed unless `--stats` is enabled.
+
+# 2026-08-22: configurable exact replay beam width
+
+- Removed the unpublished fixed maximum of 16 graph-replay beams. `--beam`
+  now accepts any positive width while retaining 16 as its default and the
+  generated-state limit as the exact-search work bound.
+- Changed exact completion retention to ordered insertion so wider experiments
+  do not sort the complete retained set after every discovered route.
+- Changed the graph replay default lookahead from 192 to 384 base voxels while
+  retaining the independent default checkpoint advance of 48 base voxels.
+- Failure-window diagnostics now use the available match search span when a
+  replay reset fails without advancing near the reference end.

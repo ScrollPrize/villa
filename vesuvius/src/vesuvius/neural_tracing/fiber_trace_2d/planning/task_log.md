@@ -1,98 +1,35 @@
-# Task log: incremental fiberlet replay prefixes
+# Task log: fixed nonlinear uint16 fiberlet costs
 
-## Finding
-
-- `materializeSelected()` currently walks from the segment seed after every
-  checkpoint, reloads all historical route geometry, reconstructs all points,
-  and repeats reference matching plus normal-threshold evaluation. With fixed
-  checkpoint spacing this makes a failure-free segment approximately quadratic
-  in length and can repeatedly churn route chunks through the bounded LRU.
-- Search also repeatedly materializes full logical-arc vectors for candidate
-  keys and copies every retained beam's complete visited-node set. Those costs
-  are absent from `fiberlet_rollout_expansions` and contain substantial serial
-  work.
-
-## Constraints
-
-- Search decisions and numerical results must remain unchanged.
-- Logical identity and cycle rejection must remain exact; hashes may accelerate
-  lookup but may not define equality.
-- Normal replay must perform only incremental prefix work. A single final
-  linear assembly is required by the full-route output contract.
-
-## Baseline
-
-- Build: current `volume-cartographer/build` executable at `f93a8fa96`.
-- Input: Paris4 `fiber_s1_002`, David fiber `...025256484_000003`, Lasagna
-  normals `las_008`, 5,000 base voxels from the default start, radius 64, 32
-  threads, hot float cache.
-- Result: 7.57 s wall, 222.22 s user, 6.51 s system, 202,872 KiB maximum RSS;
-  one greedy failure and zero fiberlet failures.
-- The baseline replay JSON is retained at
-  `/tmp/fiberlet-incremental-baseline.json` for exact post-change comparison.
-
-## Independent review
-
-- Use an exact fixed-key-depth Patricia trie for visited anchors; a balanced
-  tree would still grow logarithmically with prefix length.
-- Canonical logical identity must not merge physical states or use allocation
-  order. Exact ancestor/first-divergence ordering must match vector ordering.
-- Incremental materialization must retain all matcher continuation fields,
-  authoritative cumulative costs, partial-edge semantics, and terminal state.
-- Evaluation state follows live beam ancestry rather than an unbounded strong
-  side cache. Full diagnostic payloads remain explicitly diagnostic-only.
-- Validation must cover both search modes, diagnostics modes, thread counts,
-  cached/eager float graphs, terminal edge cases, and exact replay artifacts.
-
-## Implementation
-
-- Canonical seed-local logical-route nodes replace root-to-tip logical vectors
-  in ranking, equality, diversity selection, and reconvergent-label tie breaks.
-  Binary lifting preserves exact vector lexicographic order; physical histories
-  are never merged by logical identity.
-- Exact cycle state is an immutable Patricia trie over all 200 bits of the
-  signed Z/Y/X plus variant key. Checkpoint advancement shares the trie root and
-  no longer copies a complete `std::set`.
-- Selected-route evaluation stores matcher continuation, appended points and
-  matches, per-edge committed steps, cumulative component costs, terminal
-  state, and physical history identity. A segment-local history table resumes a
-  later branch at its nearest evaluated ancestor. Unselected route payloads are
-  not read.
-- Normal checkpoints read scalar evaluator state only. Complete output vectors
-  are assembled once at failure/reference end. Stable diagnostic IDs are
-  assigned incrementally from newly selected history suffixes, preserving the
-  former serialized ordering without rebuilding the route.
-
-## Validation
-
-- Built `vc_fiberlets`, `test_fiberlet_paths`, `test_fiber_replay`, and
-  `test_fiberlet_storage` from `volume-cartographer/build` with `-j32`.
-- `test_fiber_replay`: 12 test cases passed.
-- `test_fiberlet_storage`: 14 test cases passed.
-- `test_fiberlet_paths` retains exactly the known 298 pre-existing checks at
-  the float bitwise fixture and Q4 fixture; the new long-route incremental
-  matching regression passed and introduced no additional failure.
-- Three final hot-cache runs on the baseline workload measured 3.84/3.87/3.89
-  seconds wall (min/median/max), 65.61/68.03/69.35 seconds total CPU, and
-  102,424/104,440/104,900 KiB peak RSS (min/median/max). Baseline was 7.57
-  seconds wall, 228.73 seconds total CPU, and 202,872 KiB RSS.
-- Every final run produced SHA-256
-  `a15fdd46fdcc38085adaa262ec3b0038bb3e5ead677b918bc646b12dbb6e5318`,
-  byte-identical to `/tmp/fiberlet-incremental-baseline.json`; failure counts
-  remained one greedy and zero fiberlet.
-- A sampling-profiler capture could not be produced because `perf` is not
-  installed in this checkout. The removed serial hotspots were established by
-  direct call-site accounting: per checkpoint, `materializeSelected()` walked
-  every prior history, reloaded every route payload, rematched every point, and
-  resampled every normal; logical-vector construction and visited-set
-  compaction performed two additional full-prefix traversals/copies. The new
-  long-chain regression bounds scalar normal sampling linearly, and the exact
-  command-level CPU reduction validates removal of that repeated work.
-
-## Deviations
-
-- No user-visible or numerical behavior was intentionally changed. The
-  implementation keeps selected evaluator contributions for the segment rather
-  than eagerly attaching evaluation state to every retained beam; this avoids
-  reading unselected route payloads while still resuming branch switches from
-  shared evaluated ancestry.
+- Raw-total per-chunk uint8 previously produced three failures versus two for
+  float. The rejected adaptive density variant produced five failures because
+  outliers yielded a median density step of `0.0363` and a maximum of `0.563`.
+- A discarded fixed-sqrt uint8 sweep produced 4, 4, 2, and 4 failures for
+  ceilings 1, 2, 4, and 8. Even ceiling 4 was considered too close to the
+  precision limit, so none of those scenarios remain in the implementation.
+- The retained mapping is
+  `q = round(65535 * sqrt(clamp((total / length) / 256, 0, 1)))` and
+  `decoded_total = 256 * (q / 65535)^2 * length`.
+- Full Paris4 input: `fiber_s1_002.lasagna.json` and
+  `dj_20260805T025256484_000003.json`; radius 768 base voxels, 32 threads,
+  beam 16, exact search, lookahead 384 prediction voxels, checkpoint distance
+  48 prediction voxels.
+- Results: the exact-geometry baseline, compact-direction float-cost control,
+  and compact-direction fixed-sqrt uint16 scenario all produced two failures.
+  The uint16 scenario and compact-float control have identical failure arcs
+  `42747.298` and `44748.209` base voxels.
+- Fixed-sqrt uint16 line distance versus the exact-geometry baseline: mean
+  `1.1717`, median `0.1716`, maximum `71.7780` base voxels. The compact-float
+  control gives `1.1743`, `0.1724`, and `71.7780`, showing that these differences
+  are dominated by compact direction geometry rather than uint16 cost storage.
+- Fixed-sqrt uint16 replay-to-reference distance: mean `5.6107`, median
+  `3.5495`, maximum `71.5886` base voxels. The compact-float control gives
+  `5.6147`, `3.5520`, and `71.5886`.
+- The warm cache remained at 28,959 files with fingerprint
+  `1d0810a4cecf8017697adc0f3a20d41b179947c7f07aac6cb0a8a6f32cc4ec85`.
+  Fixed sqrt uint16 cost evaluation used zero compact cost-range chunks and generated
+  no cost-specific cache namespace.
+- Build: `cmake --build volume-cartographer/build --target vc_fiberlets
+  test_fiberlet_storage test_fiberlet_paths test_fiber_replay -j32`.
+- `test_fiberlet_storage`: 15 cases passed. `test_fiber_replay`: 12 cases
+  passed. `test_fiberlet_paths` retains exactly 298 known fixture failures; no
+  additional failure was introduced.
