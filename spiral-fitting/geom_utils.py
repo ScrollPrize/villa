@@ -3,6 +3,32 @@ import os
 import torch
 
 
+def pinned_to_device(cpu_tensor, device):
+    # Upload through a pinned staging tensor: a pageable H2D copy
+    # synchronises the CPU on all queued GPU work, while pin_memory() (a
+    # host memcpy into torch's recycling pinned allocator) plus a
+    # non_blocking copy overlaps with whatever the GPU is still running.
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    if device.type != 'cuda' or cpu_tensor.device.type != 'cpu':
+        return cpu_tensor.to(device=device)
+    return cpu_tensor.pin_memory().to(device=device, non_blocking=True)
+
+
+_scalar_tensor_cache = {}
+
+
+def cached_scalar_tensor(value, device, dtype=torch.float32):
+    # Device-resident scalar constant without a per-call host-to-device copy
+    # (which would stall the CPU behind all queued GPU work).
+    key = (float(value), str(device), dtype)
+    cached = _scalar_tensor_cache.get(key)
+    if cached is None:
+        cached = torch.as_tensor(value, device=device, dtype=dtype)
+        _scalar_tensor_cache[key] = cached
+    return cached
+
+
 def maybe_compile(fn):
     # torch.compile the hot pure-tensor helpers when FIT_SPIRAL_COMPILE=1.
     # Inductor fuses the elementwise chains (fwd and generated bwd) but uses
@@ -33,12 +59,14 @@ def expm_2x2(L):
     em = torch.exp(m)
     f_diag = em * cosh_term
     f_off = em * sinc_term
-    out = torch.empty_like(L)
-    out[..., 0, 0] = f_diag + f_off * (a - m)
-    out[..., 0, 1] = f_off * b
-    out[..., 1, 0] = f_off * c
-    out[..., 1, 1] = f_diag + f_off * (d - m)
-    return out
+    # One coalesced stack instead of four strided advanced-indexing writes;
+    # the element values are identical.
+    return torch.stack([
+        f_diag + f_off * (a - m),
+        f_off * b,
+        f_off * c,
+        f_diag + f_off * (d - m),
+    ], dim=-1).view(*L.shape)
 
 
 @maybe_compile

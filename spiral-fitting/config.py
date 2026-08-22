@@ -383,8 +383,8 @@ class Config:
         self.track_length_bin_weights = [0.0, 0.15, 0.85]
         self.track_max_tortuosity = None
         self.track_crossing_precompute_max = 8
-        self.track_max_track_crossing_per_step = 1
-        self.track_crossing_mode = "track_walk"
+        self.track_max_track_crossing_per_step = 2
+        self.track_crossing_mode = "count"
         self.track_min_walk_steps_per_track = 24
         self.track_max_walk_steps_per_track = 256
         self.track_min_walks_per_track = 2

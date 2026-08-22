@@ -95,6 +95,8 @@ class ThetaCrossingMap:
         self._unset_potential = torch.iinfo(torch.int32).min
         self.node_winding_potential = torch.empty(
             0, dtype=torch.int32, device=self.device)
+        self._any_unset_potential = True
+        self._pending_potential_checks = []
         self._potential_node_ids = torch.empty(
             0, dtype=torch.int64, device=self.topology_device)
         self._potential_edge_ids = torch.empty(
@@ -331,6 +333,7 @@ class ThetaCrossingMap:
         self.node_winding_potential = torch.full(
             (self.num_nodes,), self._unset_potential,
             dtype=torch.int32, device=self.device)
+        self._any_unset_potential = True
 
     def resolve_edges(self, node_pairs):
         """Resolve directed node pairs to ``(edge_ids, directions)``.
@@ -403,6 +406,9 @@ class ThetaCrossingMap:
         self._fresh_without_iteration = True
 
     def _refresh(self, transform):
+        # Resolve outstanding unset-potential verdicts against the outgoing
+        # table before it is replaced.
+        self._drain_potential_checks(blocking=True)
         self._finalize_topology()
         theta = torch.empty(self.num_nodes, dtype=torch.float32, device=self.device)
         with torch.no_grad():
@@ -510,7 +516,42 @@ class ThetaCrossingMap:
                         nodes_np, dtype=torch.int64, device=self.device)
                     node_potential[source.start + nodes] = ordered_potential[lo:hi]
             self.node_winding_potential = node_potential
+            # One sync per refresh so the common all-registered case skips
+            # the per-call unset check below (that check's .any() would
+            # otherwise stall every sampler call on the full GPU queue).
+            self._any_unset_potential = bool(
+                (node_potential == self._unset_potential).any())
         self.node_theta = theta
+
+    def _raise_unset_potential(self, ids):
+        values = self.node_winding_potential[ids]
+        unset_positions = (values == self._unset_potential).nonzero(
+            as_tuple=True)[0]
+        if unset_positions.numel():
+            bad = f'theta node {int(ids[unset_positions[0]])}'
+        else:
+            # The table was replaced after the offending gather; the ids are
+            # still the batch that failed against the previous table.
+            bad = 'a theta node (from a since-replaced potential table)'
+        raise RuntimeError(
+            f'{bad} has no registered unwrap potential')
+
+    def _drain_potential_checks(self, blocking=False):
+        """Verify completed asynchronous unset-potential checks.
+
+        Non-blocking by default: only verdicts whose copy event has fired
+        are consumed, so this never waits on queued GPU work. blocking=True
+        forces all pending verdicts to resolve.
+        """
+        pending = self._pending_potential_checks
+        while pending:
+            event, verdict, ids = pending[0]
+            if not blocking and not event.query():
+                break
+            event.synchronize()
+            if bool(verdict):
+                self._raise_unset_potential(ids)
+            pending.pop(0)
 
     def winding_potentials(self, node_ids, sampled_theta=None):
         """Return root-relative integer winding potentials for arbitrary nodes.
@@ -522,10 +563,25 @@ class ThetaCrossingMap:
         if self.node_winding_potential.numel() != self.num_nodes:
             raise RuntimeError('ThetaCrossingMap must be refreshed before use')
         values = self.node_winding_potential[ids]
-        if bool((values == self._unset_potential).any()):
-            bad = ids[(values == self._unset_potential).nonzero(as_tuple=True)[0][0]]
-            raise RuntimeError(
-                f'theta node {int(bad)} has no registered unwrap potential')
+        # Unset entries (a sampler querying a node with no registered
+        # potential) are a hard error, but reading the check's verdict here
+        # would stall the CPU on all queued GPU work. When the table has no
+        # unset entries at all the check is skipped outright; otherwise the
+        # verdict is copied to pinned memory asynchronously and raised from
+        # a later call once its event has fired (detection is delayed by a
+        # few sampler calls, never lost).
+        self._drain_potential_checks()
+        if self._any_unset_potential:
+            if self.device.type == 'cuda':
+                verdict = torch.empty((), dtype=torch.bool, pin_memory=True)
+                verdict.copy_(
+                    (values == self._unset_potential).any(),
+                    non_blocking=True)
+                event = torch.cuda.Event()
+                event.record()
+                self._pending_potential_checks.append((event, verdict, ids))
+            elif bool((values == self._unset_potential).any()):
+                self._raise_unset_potential(ids)
         if sampled_theta is not None:
             theta = torch.as_tensor(
                 sampled_theta, device=self.device).detach()

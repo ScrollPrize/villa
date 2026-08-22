@@ -23,6 +23,10 @@ def _masked_mean(values, mask):
     return (values * mask_f).sum() / mask_f.sum().clamp(min=1.)
 
 
+_pinned_to_device = geom_utils.pinned_to_device
+_cached_scalar_tensor = geom_utils.cached_scalar_tensor
+
+
 def _pcl_sampling_group_weight(group, cfg):
     # Look up the per-step sampling weight of a sampling group in
     # cfg['pcl_sampling_weights']. Keys are matched on the group's basename with the
@@ -129,14 +133,19 @@ def _choose_pcl_indices(sampling_strata, num_to_sample, cfg):
 
 
 
-def get_shell_outer_loss(shell_map, slice_to_spiral_transform, dr_per_winding, outer_winding_idx, *, cfg, z_begin, z_end):
+def get_shell_outer_loss(shell_map, slice_to_spiral_transform, dr_per_winding, outer_winding_idx, *, cfg, z_begin, z_end, with_metrics=True):
+    # with_metrics=False skips the residual summary block: its data-dependent
+    # `valid.any()` branch synchronises the CPU on all queued GPU work, so
+    # callers that only log every N steps request metrics on those steps
+    # alone.
     device = dr_per_winding.device
     zero = torch.zeros([], device=device)
     if shell_map is None or outer_winding_idx is None:
         return zero, {}
 
     num_samples = max(1, int(cfg['sample_count_shell_samples']))
-    huber_delta = torch.as_tensor(cfg['shell_huber_delta'], device=device, dtype=torch.float32)
+    huber_delta = _cached_scalar_tensor(
+        cfg['shell_huber_delta'], device, dtype=torch.float32)
 
     outer_spiral = canonical_winding_samples([outer_winding_idx], num_samples, dr_per_winding, device, z_begin, z_end)[0]
     outer_scan = slice_to_spiral_transform.inv(outer_spiral)
@@ -146,14 +155,15 @@ def get_shell_outer_loss(shell_map, slice_to_spiral_transform, dr_per_winding, o
     shell_outer_loss = _masked_mean(_huber_abs(residual, huber_delta), valid)
 
     metrics = {}
-    with torch.no_grad():
-        if valid.any():
-            abs_residual = residual[valid].abs()
-            metrics = {
-                'shell_outer_error_mean': abs_residual.mean(),
-                'shell_outer_error_p95': torch.quantile(abs_residual, 0.95),
-                'shell_confidence_mean': confidence[valid].mean(),
-            }
+    if with_metrics:
+        with torch.no_grad():
+            if valid.any():
+                abs_residual = residual[valid].abs()
+                metrics = {
+                    'shell_outer_error_mean': abs_residual.mean(),
+                    'shell_outer_error_p95': torch.quantile(abs_residual, 0.95),
+                    'shell_confidence_mean': confidence[valid].mean(),
+                }
 
     return shell_outer_loss, metrics
 
@@ -332,21 +342,21 @@ def _pack_walks(walks, crossing_map):
         edge_ids_np[edge_valid_np] = resolved.numpy()
         directions_np[edge_valid_np] = resolved_dir.numpy()
 
-    pick_positions = torch.as_tensor(
-        pick_positions_np, dtype=torch.int64, device=device)
-    edge_valid = torch.as_tensor(
-        edge_valid_np, dtype=torch.bool, device=device)
-    correction_node_ids = torch.as_tensor(
-        correction_node_ids_np, dtype=torch.int64, device=device)
-    walk_start_node_ids = torch.as_tensor(
-        walk_start_node_ids_np, dtype=torch.int64, device=device)
-    reference_node_ids = torch.as_tensor(
-        reference_node_ids_np, dtype=torch.int64, device=device)
+    pick_positions = _pinned_to_device(
+        torch.from_numpy(pick_positions_np), device)
+    edge_valid = _pinned_to_device(
+        torch.from_numpy(edge_valid_np), device)
+    correction_node_ids = _pinned_to_device(
+        torch.from_numpy(correction_node_ids_np), device)
+    walk_start_node_ids = _pinned_to_device(
+        torch.from_numpy(walk_start_node_ids_np), device)
+    reference_node_ids = _pinned_to_device(
+        torch.from_numpy(reference_node_ids_np), device)
 
-    edge_ids = torch.as_tensor(
-        edge_ids_np, dtype=torch.int64, device=device)
-    directions = torch.as_tensor(
-        directions_np, dtype=torch.int8, device=device)
+    edge_ids = _pinned_to_device(
+        torch.from_numpy(edge_ids_np), device)
+    directions = _pinned_to_device(
+        torch.from_numpy(directions_np), device)
     return PackedWalks(
         edge_ids=edge_ids,
         directions=directions,
@@ -388,14 +398,15 @@ def _sample_patch_batch(key, patches, sampling_probabilities, num_to_sample,
             np.ascontiguousarray(counts_np, dtype=np.int64))
         sample_mask_cpu = (
             torch.arange(point_cap)[None, :] < counts_cpu[:, None])
-        slice_zyxs_gpu = patch_atlas.lookup(
-            idx_cpu[:, None].expand(num_to_sample, point_cap), ijs_cpu)
         target_device = patch_atlas.device
-        ijs_gpu = ijs_cpu.to(device=target_device, non_blocking=True)
-        idx_gpu = idx_cpu.to(device=target_device, non_blocking=True)
-        node_ids_gpu = node_ids_cpu.to(device=target_device, non_blocking=True)
-        sample_mask_gpu = sample_mask_cpu.to(
-            device=target_device, non_blocking=True)
+        # Upload before the atlas lookup so it receives device tensors and
+        # skips its own (pageable, synchronising) transfers.
+        ijs_gpu = _pinned_to_device(ijs_cpu, target_device)
+        idx_gpu = _pinned_to_device(idx_cpu, target_device)
+        node_ids_gpu = _pinned_to_device(node_ids_cpu, target_device)
+        sample_mask_gpu = _pinned_to_device(sample_mask_cpu, target_device)
+        slice_zyxs_gpu = patch_atlas.lookup(
+            idx_gpu[:, None].expand(num_to_sample, point_cap), ijs_gpu)
         return (ijs_gpu, idx_gpu, slice_zyxs_gpu, node_ids_gpu,
                 sample_mask_gpu)
 
@@ -750,13 +761,15 @@ def _pcl_chain_seam_adjustments(crossing_map, dr_per_winding, chain_node_ids):
             np.stack([chain[:-1], chain[1:]], axis=-1)
             for chain in chains if len(chain) > 1])
         edge_ids, directions = crossing_map.resolve_edges(pairs)
-        edge_ids = edge_ids.to(device)
-        directions = directions.to(device)
+        edge_ids = _pinned_to_device(edge_ids, device)
+        directions = _pinned_to_device(directions, device)
         winding_steps = (
             crossing_map.crossings[edge_ids]
             * directions.to(crossing_map.crossings.dtype)).to(torch.int32)
-        row_ids = torch.from_numpy(np.repeat(
-            np.arange(len(chains), dtype=np.int64), edge_counts)).to(device)
+        row_ids = _pinned_to_device(
+            torch.from_numpy(np.repeat(
+                np.arange(len(chains), dtype=np.int64), edge_counts)),
+            device)
         sums.index_add_(0, row_ids, winding_steps)
     return sums.to(dr_per_winding.dtype) * dr_per_winding.detach()
 
@@ -790,14 +803,16 @@ def _sample_requested_patch_rows(patch_indices, point_cap, patch_atlas):
             and hasattr(patch_atlas, 'theta_node_ids_from_ordinals'))
         else patch_atlas.theta_node_ids(row_patch_indices, ijs_np)
     )
-    ijs = torch.from_numpy(ijs_np).to(patch_atlas.device)
-    patch_indices_t = torch.from_numpy(patch_indices).to(patch_atlas.device)
+    ijs = _pinned_to_device(torch.from_numpy(ijs_np), patch_atlas.device)
+    patch_indices_t = _pinned_to_device(
+        torch.from_numpy(patch_indices), patch_atlas.device)
     zyxs = patch_atlas.lookup(
         patch_indices_t[:, None].expand(-1, point_cap), ijs)
-    node_ids = torch.from_numpy(
-        np.ascontiguousarray(node_ids_np, dtype=np.int64)).to(
-            patch_atlas.device)
-    counts = torch.from_numpy(counts_np).to(patch_atlas.device)
+    node_ids = _pinned_to_device(
+        torch.from_numpy(np.ascontiguousarray(node_ids_np, dtype=np.int64)),
+        patch_atlas.device)
+    counts = _pinned_to_device(
+        torch.from_numpy(counts_np), patch_atlas.device)
     mask = torch.arange(point_cap, device=patch_atlas.device)[None, :] < counts[:, None]
     return ijs, zyxs, node_ids, mask
 
@@ -864,12 +879,16 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding,
         flat_zyxs.reshape(-1, 3)).reshape(*flat_zyxs.shape)
     theta, _, shifted = get_theta_and_radii(
         flat_spiral[..., 1:], dr_per_winding)
-    reference_nodes = torch.as_tensor(
-        [node for row in rows for node in row['reference_nodes']],
-        dtype=torch.int64, device=dr_per_winding.device)
-    patch_nodes = torch.as_tensor(
-        [node for row in rows for node in row['patch_nodes']],
-        dtype=torch.int64, device=dr_per_winding.device)
+    reference_nodes = _pinned_to_device(
+        torch.as_tensor(
+            [node for row in rows for node in row['reference_nodes']],
+            dtype=torch.int64),
+        dr_per_winding.device)
+    patch_nodes = _pinned_to_device(
+        torch.as_tensor(
+            [node for row in rows for node in row['patch_nodes']],
+            dtype=torch.int64),
+        dr_per_winding.device)
     adjustments = crossing_map.adjustments_from_potentials(
         flat_node_ids, theta, dr_per_winding,
         reference_node_ids=reference_nodes,
@@ -882,9 +901,11 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding,
         & (flat_zyxs[..., 0] < z_end + z_margin)
     ).reshape(len(rows), 2, point_cap)
     mask = mask & z_mask
-    expected = torch.as_tensor(
-        [row['winding_diff'] for row in rows],
-        dtype=dr_per_winding.dtype, device=dr_per_winding.device,
+    expected = _pinned_to_device(
+        torch.as_tensor(
+            [row['winding_diff'] for row in rows],
+            dtype=dr_per_winding.dtype),
+        dr_per_winding.device,
     ) * dr_per_winding
     expected -= _pcl_chain_seam_adjustments(
         crossing_map, dr_per_winding,
@@ -947,12 +968,12 @@ def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding,
         zyxs.reshape(-1, 3)).reshape(*zyxs.shape)
     theta, _, shifted = get_theta_and_radii(
         spiral[..., 1:], dr_per_winding)
-    reference_nodes = torch.as_tensor(
-        [row[2] for row in rows], dtype=torch.int64,
-        device=dr_per_winding.device)
-    patch_nodes = torch.as_tensor(
-        [row[1] for row in rows], dtype=torch.int64,
-        device=dr_per_winding.device)
+    reference_nodes = _pinned_to_device(
+        torch.as_tensor([row[2] for row in rows], dtype=torch.int64),
+        dr_per_winding.device)
+    patch_nodes = _pinned_to_device(
+        torch.as_tensor([row[1] for row in rows], dtype=torch.int64),
+        dr_per_winding.device)
     adjustments = crossing_map.adjustments_from_potentials(
         node_ids, theta, dr_per_winding,
         reference_node_ids=reference_nodes,
@@ -961,9 +982,9 @@ def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding,
     z_margin = cfg['patch_loss_z_margin']
     mask = mask & (zyxs[..., 0] >= z_begin - z_margin) & (
         zyxs[..., 0] < z_end + z_margin)
-    target = torch.as_tensor(
-        [row[3] for row in rows], dtype=dr_per_winding.dtype,
-        device=dr_per_winding.device)[:, None] * dr_per_winding
+    target = _pinned_to_device(
+        torch.as_tensor([row[3] for row in rows], dtype=dr_per_winding.dtype),
+        dr_per_winding.device)[:, None] * dr_per_winding
     error = (shifted - target).abs()
 
     target_radii = radius_from_unwrapped_shifted(
@@ -1346,7 +1367,8 @@ def get_unattached_pcl_strip_losses(
             connect_fractional_picks=False,
         ))
 
-    sampled_flat_indices_t = torch.from_numpy(sampled_flat_indices).to(device=device)
+    sampled_flat_indices_t = _pinned_to_device(
+        torch.from_numpy(sampled_flat_indices), device)
     zyxs_t = flat['zyxs'][sampled_flat_indices_t]
     winding_t = flat['windings'][sampled_flat_indices_t]
 

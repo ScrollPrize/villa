@@ -152,7 +152,8 @@ def get_spiral_density(relative_yx, dr_per_winding=10., sigma=3., winding_range=
 
 
 def canonical_winding_samples(winding_indices, num_samples, dr_per_winding, device, z_begin, z_end):
-    winding_indices_t = torch.as_tensor(winding_indices, device=device, dtype=torch.float32)
+    winding_indices_t = geom_utils.pinned_to_device(
+        torch.as_tensor(winding_indices, dtype=torch.float32), device)
     theta = torch.rand([len(winding_indices), num_samples], device=device) * (2 * torch.pi)
     z = torch.empty([len(winding_indices), num_samples], device=device).uniform_(float(z_begin), float(z_end - 1))
     radius = (winding_indices_t[:, None] + theta / (2 * torch.pi)) * dr_per_winding

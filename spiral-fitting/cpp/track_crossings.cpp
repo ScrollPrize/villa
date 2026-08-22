@@ -116,6 +116,16 @@ struct WalkIndex {
     }
 };
 
+struct WalkPrimarySampler {
+    // Prebuilt weighted primary-track distribution for sample_walks_adaptive.
+    // Validating the weights and building std::discrete_distribution is
+    // O(track count) with allocations; callers sampling every step cache
+    // this object instead of paying that per call. Reusing the distribution
+    // draws the same sequence a freshly constructed one would.
+    std::discrete_distribution<int32_t> distribution;
+    size_t track_count = 0;  // 0 = uniform over the index
+};
+
 template <typename T>
 nb::ndarray<nb::numpy, T, nb::ndim<1>> own_1d(std::vector<T>&& values)
 {
@@ -2008,12 +2018,38 @@ nb::dict sample_walks(
     return result;
 }
 
+WalkPrimarySampler* prepare_walk_primary_sampler(
+    Float64Vector primary_probabilities)
+{
+    auto sampler = std::make_unique<WalkPrimarySampler>();
+    const size_t count = primary_probabilities.shape(0);
+    if (count != 0) {
+        std::vector<double> weights(
+            primary_probabilities.data(),
+            primary_probabilities.data() + count);
+        double total = 0.0;
+        for (double weight : weights) {
+            if (!std::isfinite(weight) || weight < 0.0)
+                throw std::runtime_error(
+                    "primary probabilities must be finite and non-negative");
+            total += weight;
+        }
+        if (!(total > 0.0))
+            throw std::runtime_error(
+                "primary probabilities must have positive total mass");
+        sampler->distribution = std::discrete_distribution<int32_t>(
+            weights.begin(), weights.end());
+        sampler->track_count = count;
+    }
+    return sampler.release();
+}
+
 nb::dict sample_walks_adaptive(
     const WalkIndex& index, Float64Vector primary_probabilities,
     uint64_t seed, int groups, int target_points,
     int minimum_hops, int maximum_hops,
     int minimum_steps, int maximum_steps, double minimum_candidate_travel,
-    int maximum_attempts)
+    int maximum_attempts, WalkPrimarySampler* primary_sampler)
 {
     if (groups < 0 || target_points < 1 || minimum_hops < 1
         || maximum_hops < minimum_hops
@@ -2024,13 +2060,20 @@ nb::dict sample_walks_adaptive(
         throw std::runtime_error("invalid adaptive track-walk sampling parameters");
     if (index.track_count() == 0 && groups > 0)
         throw std::runtime_error("cannot sample walks from an empty index");
-    if (primary_probabilities.shape(0) != 0
-        && primary_probabilities.shape(0) != index.track_count())
+
+    // A prebuilt sampler replaces the per-call weight copy/validation and
+    // distribution construction; primary_probabilities is ignored with it.
+    if (primary_sampler != nullptr
+        && primary_sampler->track_count != 0
+        && primary_sampler->track_count != index.track_count())
         throw std::runtime_error(
-            "primary probabilities must be empty or match the track count");
+            "primary sampler track count must match the walk index");
 
     std::vector<double> weights;
-    if (primary_probabilities.shape(0) != 0) {
+    if (primary_sampler == nullptr && primary_probabilities.shape(0) != 0) {
+        if (primary_probabilities.shape(0) != index.track_count())
+            throw std::runtime_error(
+                "primary probabilities must be empty or match the track count");
         weights.assign(
             primary_probabilities.data(),
             primary_probabilities.data() + primary_probabilities.shape(0));
@@ -2045,6 +2088,9 @@ nb::dict sample_walks_adaptive(
             throw std::runtime_error(
                 "primary probabilities must have positive total mass");
     }
+    const bool use_weighted = primary_sampler != nullptr
+        ? primary_sampler->track_count != 0
+        : !weights.empty();
 
     std::vector<int32_t> tracks(
         static_cast<size_t>(groups) * (maximum_hops + 1), -1);
@@ -2060,8 +2106,12 @@ nb::dict sample_walks_adaptive(
             0, std::max(
                 int32_t{0},
                 static_cast<int32_t>(index.track_count()) - int32_t{1}));
-        std::discrete_distribution<int32_t> weighted_primary(
+        std::discrete_distribution<int32_t> local_weighted_primary(
             weights.begin(), weights.end());
+        std::discrete_distribution<int32_t>& weighted_primary =
+            primary_sampler != nullptr && primary_sampler->track_count != 0
+                ? primary_sampler->distribution
+                : local_weighted_primary;
         const int batch_capacity = std::min(
             maximum_attempts, std::max(1024, groups * 2));
         std::vector<int32_t> batch_primaries(
@@ -2081,8 +2131,8 @@ nb::dict sample_walks_adaptive(
             const int batch_size = std::min(
                 next_batch_size, maximum_attempts - attempted);
             for (int candidate = 0; candidate < batch_size; ++candidate) {
-                batch_primaries[candidate] = weights.empty()
-                    ? uniform_primary(random) : weighted_primary(random);
+                batch_primaries[candidate] = use_weighted
+                    ? weighted_primary(random) : uniform_primary(random);
                 batch_seeds[candidate] = random();
                 batch_success[candidate] = 0;
                 batch_hops[candidate] = 0;
@@ -2173,6 +2223,12 @@ NB_MODULE(track_crossings, module)
         .def_prop_ro("track_count", &WalkIndex::track_count)
         .def_prop_ro("crossing_count", &WalkIndex::crossing_count)
         .def_prop_ro("memory_bytes", &WalkIndex::memory_bytes);
+    nb::class_<WalkPrimarySampler>(module, "WalkPrimarySampler")
+        .def_prop_ro(
+            "track_count",
+            [](const WalkPrimarySampler& sampler) {
+                return sampler.track_count;
+            });
     module.def(
         "parallel_argsort", &parallel_argsort,
         nb::arg("packed"), nb::arg("workers") = 1,
@@ -2246,11 +2302,16 @@ NB_MODULE(track_crossings, module)
         nb::arg("minimum_steps"), nb::arg("maximum_steps"),
         nb::arg("minimum_candidate_travel"));
     module.def(
+        "prepare_walk_primary_sampler", &prepare_walk_primary_sampler,
+        nb::rv_policy::take_ownership,
+        nb::arg("primary_probabilities"));
+    module.def(
         "sample_walks_adaptive", &sample_walks_adaptive,
         nb::arg("index"), nb::arg("primary_probabilities"), nb::arg("seed"),
         nb::arg("groups"), nb::arg("target_points"),
         nb::arg("minimum_hops"), nb::arg("maximum_hops"),
         nb::arg("minimum_steps"), nb::arg("maximum_steps"),
         nb::arg("minimum_candidate_travel"),
-        nb::arg("maximum_attempts"));
+        nb::arg("maximum_attempts"),
+        nb::arg("primary_sampler") = nullptr);
 }
