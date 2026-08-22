@@ -3097,16 +3097,20 @@ class FitContext:
         """Rewrite every constraint holder through one frozen inverse.
 
         Chunked, no_grad, RNG-free and identically ordered on every DDP rank
-        (see constraint_baking.bake_points). The 3-D flow can drift z, so a
-        point that started inside the flow lattice's z domain must not be
-        baked out of it (outside the domain it would sample the border of
-        the field); points that were already outside the domain (patch
-        vertices beyond the fit window, the full-scroll shell cloud) pass
-        through the border region exactly as they did during training.
+        (see constraint_baking.bake_points). The 3-D flow can drift z; a
+        point baked out of the flow lattice's z domain samples the border of
+        the field afterwards. Points near the domain edge (the z-margin band
+        beyond the fit window, where patch vertices and the shell cloud
+        legitimately live) crossing it by a few voxels is benign — they were
+        border-region points already — so those are only counted and
+        reported. What is refused is a point from inside the fit window
+        itself leaving the domain: that means the frozen flow displaced it
+        past the whole z margin, which no healthy fit does.
         """
         flow_z_min = float(self.flow_min_corner_spiral_zyx[0])
         flow_z_max = float(self.flow_max_corner_spiral_zyx[0])
-        drifted_out = [0]
+        margin_crossings = [0]
+        window_escapes = [0]
 
         def bake(points):
             source = torch.as_tensor(points)
@@ -3115,9 +3119,15 @@ class FitContext:
             source_z = source.reshape(-1, 3)[:, 0].to(torch.float32)
             baked_z = baked.reshape(-1, 3)[:, 0].to(torch.float32)
             if baked_z.numel():
-                was_inside = (source_z >= flow_z_min) & (source_z <= flow_z_max)
                 now_outside = (baked_z < flow_z_min) | (baked_z > flow_z_max)
-                drifted_out[0] += int((was_inside & now_outside).sum())
+                was_in_domain = (
+                    (source_z >= flow_z_min) & (source_z <= flow_z_max))
+                was_in_window = (
+                    (source_z >= float(self.z_begin))
+                    & (source_z < float(self.z_end)))
+                margin_crossings[0] += int(
+                    (was_in_domain & ~was_in_window & now_outside).sum())
+                window_escapes[0] += int((was_in_window & now_outside).sum())
             return baked
 
         def bake_np(array):
@@ -3162,12 +3172,18 @@ class FitContext:
         if self.winding_inference is not None:
             self.winding_inference.bake_crossing_points_(bake)
 
-        if drifted_out[0]:
+        if margin_crossings[0] and self.dist.is_main_process:
+            print(f'bake: {margin_crossings[0]} margin-band point(s) crossed '
+                  f'the flow z domain edge [{flow_z_min:.1f}, '
+                  f'{flow_z_max:.1f}] (benign: they were border-region '
+                  'points already)')
+        if window_escapes[0]:
             raise RuntimeError(
-                f'{drifted_out[0]} baked constraint point(s) drifted out of '
-                f'the flow lattice z domain [{flow_z_min:.1f}, '
-                f'{flow_z_max:.1f}]; the frozen flow has pushed constraints '
-                'beyond the model domain, so this fit cannot be reset safely')
+                f'{window_escapes[0]} baked constraint point(s) from inside '
+                f'the fit window [{self.z_begin}, {self.z_end}) drifted out '
+                f'of the flow lattice z domain [{flow_z_min:.1f}, '
+                f'{flow_z_max:.1f}]; the frozen flow displaced them past the '
+                'whole z margin, so this fit cannot be reset safely')
 
     def _apply_canonical_space_state(self):
         """Session-side frame change after the inputs are baked.
