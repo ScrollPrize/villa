@@ -556,10 +556,21 @@ static std::vector<vc::render::ChunkKey> collectPrefetchKeysForRows(
 
 static bool prefetchChunkKeys(
     vc::render::IChunkedArray* cache,
-    const std::vector<vc::render::ChunkKey>& keys)
+    const std::vector<vc::render::ChunkKey>& keys,
+    int timeoutMinutes)
 {
     if (!cache || keys.empty()) return true;
-    cache->prefetchChunks(keys, true);
+    if (timeoutMinutes <= 0) {
+        cache->prefetchChunks(keys, true);
+        if (!g_logFile) std::fprintf(stderr, "\n");
+        return true;
+    }
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::minutes(timeoutMinutes);
+    if (!cache->prefetchChunksUntil(keys, deadline)) {
+        std::fprintf(stderr, "Error: remote prefetch exceeded --timeout budget\n");
+        return false;
+    }
     if (!g_logFile) std::fprintf(stderr, "\n");
     return true;
 }
@@ -1728,7 +1739,9 @@ int main(int argc, char *argv[])
                       prefetchKeys.size(),
                       rowStart,
                       rowEnd > rowStart ? rowEnd - 1 : rowStart);
-            if (!prefetchChunkKeys(chunk_cache, prefetchKeys)) {
+            const int renderTimeout = parsed["timeout"].as<int>();
+            const int prefetchTimeout = renderTimeout > 1 ? renderTimeout - 1 : renderTimeout;
+            if (!prefetchChunkKeys(chunk_cache, prefetchKeys, prefetchTimeout)) {
                 return false;
             }
         }
