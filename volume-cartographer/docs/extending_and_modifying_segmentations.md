@@ -4,7 +4,7 @@ This is relatively untested, but (should) work. It's possible to easily create r
 
 **rotate and flip a surface**
 
-Select a segmentation, then open `Actions > Transforms > Rotate`. Adjust the angle and, if needed, enable `Flip horizontally`; the segmentation view previews rotation followed by the horizontal flip. Select `Apply` to write the transformed surface. Rotation preview remains available for surfaces with multipage `multilayer_mask.tif` sidecars or disconnected component ranges, but `Apply` is disabled because those structures cannot yet be transformed safely.
+Select a segmentation, then open `Actions > Transforms > Rotate`. Adjust the angle and, if needed, enable `Flip horizontally`; the segmentation view previews rotation followed by the horizontal flip. Select `Apply` to write the transformed surface. Rotation and flip preview remain available for surfaces with multipage `mask.tif` sidecars or disconnected component ranges, but `Apply` is disabled because those structures cannot yet be transformed safely.
 
 The captures below use sample `PHerc0800`, segment `20251028220955`, from the Vesuvius Challenge Open Data catalog.
 

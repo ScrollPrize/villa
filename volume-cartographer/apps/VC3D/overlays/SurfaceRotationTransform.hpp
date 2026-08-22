@@ -4,36 +4,63 @@
 #include <filesystem>
 #include <utility>
 
+#include <tiffio.h>
+
 namespace vc3d::surface_rotation
 {
 constexpr float kMinimumAngleDegrees = 0.01f;
 
 struct TransformPersistenceCompatibility {
     bool hasMultipageMask{false};
+    bool maskInspectionFailed{false};
     bool hasDisconnectedComponents{false};
 
-    [[nodiscard]] bool allowed() const { return !hasMultipageMask && !hasDisconnectedComponents; }
+    [[nodiscard]] bool allowed() const
+    {
+        return !hasMultipageMask && !maskInspectionFailed && !hasDisconnectedComponents;
+    }
 };
+
+inline void inspectMaskForTransformPersistence(
+    const std::filesystem::path& maskPath,
+    TransformPersistenceCompatibility& compatibility)
+{
+    std::error_code ec;
+    const bool exists = std::filesystem::exists(maskPath, ec);
+    if (ec) {
+        compatibility.maskInspectionFailed = true;
+        return;
+    }
+    if (!exists) {
+        return;
+    }
+
+    TIFF* tiff = TIFFOpen(maskPath.string().c_str(), "r");
+    if (!tiff) {
+        compatibility.maskInspectionFailed = true;
+        return;
+    }
+
+    const auto directoryCount = TIFFNumberOfDirectories(tiff);
+    TIFFClose(tiff);
+    if (directoryCount == 0) {
+        compatibility.maskInspectionFailed = true;
+    } else if (directoryCount > 1) {
+        compatibility.hasMultipageMask = true;
+    }
+}
 
 [[nodiscard]] inline TransformPersistenceCompatibility transformPersistenceCompatibility(
     const std::filesystem::path& surfacePath,
     bool hasDisconnectedComponents)
 {
-    std::error_code ec;
-    const bool hasMultipageMask = !surfacePath.empty() &&
-                                  (std::filesystem::exists(surfacePath / "multilayer_mask.tif", ec) || bool(ec));
-    return {hasMultipageMask, hasDisconnectedComponents};
-}
-
-struct HorizontalFlipSelection {
-    bool selected{false};
-    bool selectionCleared{false};
-};
-
-[[nodiscard]] inline HorizontalFlipSelection reconcileHorizontalFlipSelection(bool selected, const TransformPersistenceCompatibility& compatibility)
-{
-    const bool allowed = compatibility.allowed();
-    return {selected && allowed, selected && !allowed};
+    TransformPersistenceCompatibility compatibility;
+    compatibility.hasDisconnectedComponents = hasDisconnectedComponents;
+    if (!surfacePath.empty()) {
+        inspectMaskForTransformPersistence(surfacePath / "mask.tif", compatibility);
+        inspectMaskForTransformPersistence(surfacePath / "multilayer_mask.tif", compatibility);
+    }
+    return compatibility;
 }
 
 struct Transform {

@@ -8,7 +8,8 @@ target_include_directories(test_surface_rotation_transform PRIVATE
 
 target_link_libraries(test_surface_rotation_transform PRIVATE
     Qt6::Core
-    Qt6::Test)
+    Qt6::Test
+    TIFF::TIFF)
 
 set_target_properties(test_surface_rotation_transform PROPERTIES
     AUTOMOC ON AUTOUIC OFF AUTORCC OFF)

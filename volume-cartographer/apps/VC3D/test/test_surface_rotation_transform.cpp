@@ -3,11 +3,15 @@
 #include <QTemporaryDir>
 #include <QTest>
 
+#include <array>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include <tiffio.h>
 
 namespace
 {
@@ -33,6 +37,42 @@ struct RecordingSurface {
         }
     }
 };
+
+bool writeTestTiff(const std::filesystem::path& path, int directoryCount)
+{
+    TIFF* tiff = TIFFOpen(path.string().c_str(), "w");
+    if (!tiff) {
+        return false;
+    }
+
+    bool success = true;
+    for (int directory = 0; directory < directoryCount && success; ++directory) {
+        TIFFSetField(tiff, TIFFTAG_IMAGEWIDTH, 2U);
+        TIFFSetField(tiff, TIFFTAG_IMAGELENGTH, 2U);
+        TIFFSetField(tiff, TIFFTAG_BITSPERSAMPLE, 8);
+        TIFFSetField(tiff, TIFFTAG_SAMPLESPERPIXEL, 1);
+        TIFFSetField(tiff, TIFFTAG_ROWSPERSTRIP, 2U);
+        TIFFSetField(tiff, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
+        TIFFSetField(tiff, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
+        TIFFSetField(tiff, TIFFTAG_COMPRESSION, COMPRESSION_NONE);
+
+        std::array<std::uint8_t, 2> row{
+            static_cast<std::uint8_t>(directory + 1),
+            static_cast<std::uint8_t>(directory + 2)};
+        for (std::uint32_t y = 0; y < 2; ++y) {
+            if (TIFFWriteScanline(tiff, row.data(), y, 0) < 0) {
+                success = false;
+                break;
+            }
+        }
+        if (success && TIFFWriteDirectory(tiff) != 1) {
+            success = false;
+        }
+    }
+
+    TIFFClose(tiff);
+    return success;
+}
 }  // namespace
 
 class SurfaceRotationTransformTest : public QObject
@@ -111,51 +151,73 @@ private slots:
     void blocksTransformPersistenceForUnsupportedSurfaceFeatures()
     {
         const vc3d::surface_rotation::TransformPersistenceCompatibility supported;
-        const vc3d::surface_rotation::TransformPersistenceCompatibility mask{true, false};
-        const vc3d::surface_rotation::TransformPersistenceCompatibility components{false, true};
-        const vc3d::surface_rotation::TransformPersistenceCompatibility both{true, true};
+        const vc3d::surface_rotation::TransformPersistenceCompatibility mask{true, false, false};
+        const vc3d::surface_rotation::TransformPersistenceCompatibility inspectionFailure{false, true, false};
+        const vc3d::surface_rotation::TransformPersistenceCompatibility components{false, false, true};
+        const vc3d::surface_rotation::TransformPersistenceCompatibility all{true, true, true};
 
         QVERIFY(supported.allowed());
         QVERIFY(!mask.allowed());
+        QVERIFY(!inspectionFailure.allowed());
         QVERIFY(!components.allowed());
-        QVERIFY(!both.allowed());
+        QVERIFY(!all.allowed());
     }
 
-    void detectsPersistenceCompatibilityFromSurfaceFiles()
+    void detectsActualMaskPageCount()
     {
         QTemporaryDir temporaryDirectory;
         QVERIFY(temporaryDirectory.isValid());
         const std::filesystem::path root{temporaryDirectory.path().toStdString()};
+        const auto maskPath = root / "mask.tif";
 
-        const auto supported = vc3d::surface_rotation::transformPersistenceCompatibility(root, false);
-        QVERIFY(supported.allowed());
+        const auto noMask = vc3d::surface_rotation::transformPersistenceCompatibility(root, false);
+        QVERIFY(noMask.allowed());
 
-        std::ofstream(root / "multilayer_mask.tif").put('\0');
-        const auto mask = vc3d::surface_rotation::transformPersistenceCompatibility(root, false);
-        QVERIFY(mask.hasMultipageMask);
-        QVERIFY(!mask.allowed());
+        QVERIFY(writeTestTiff(maskPath, 1));
+        const auto singlePage = vc3d::surface_rotation::transformPersistenceCompatibility(root, false);
+        QVERIFY(!singlePage.hasMultipageMask);
+        QVERIFY(!singlePage.maskInspectionFailed);
+        QVERIFY(singlePage.allowed());
+
+        QVERIFY(writeTestTiff(maskPath, 2));
+        const auto multipage = vc3d::surface_rotation::transformPersistenceCompatibility(root, false);
+        QVERIFY(multipage.hasMultipageMask);
+        QVERIFY(!multipage.maskInspectionFailed);
+        QVERIFY(!multipage.allowed());
 
         const auto components = vc3d::surface_rotation::transformPersistenceCompatibility(std::filesystem::path{}, true);
         QVERIFY(components.hasDisconnectedComponents);
         QVERIFY(!components.allowed());
     }
 
-    void reconcilesHorizontalFlipSelectionWithCompatibility()
+    void detectsLegacyMaskByPageCountRatherThanFilename()
     {
-        const vc3d::surface_rotation::TransformPersistenceCompatibility supported;
-        const vc3d::surface_rotation::TransformPersistenceCompatibility unsupported{true, false};
+        QTemporaryDir temporaryDirectory;
+        QVERIFY(temporaryDirectory.isValid());
+        const std::filesystem::path root{temporaryDirectory.path().toStdString()};
+        const auto maskPath = root / "multilayer_mask.tif";
 
-        const auto retained = vc3d::surface_rotation::reconcileHorizontalFlipSelection(true, supported);
-        QVERIFY(retained.selected);
-        QVERIFY(!retained.selectionCleared);
+        QVERIFY(writeTestTiff(maskPath, 1));
+        const auto singlePage = vc3d::surface_rotation::transformPersistenceCompatibility(root, false);
+        QVERIFY(singlePage.allowed());
 
-        const auto cleared = vc3d::surface_rotation::reconcileHorizontalFlipSelection(true, unsupported);
-        QVERIFY(!cleared.selected);
-        QVERIFY(cleared.selectionCleared);
+        QVERIFY(writeTestTiff(maskPath, 2));
+        const auto multipage = vc3d::surface_rotation::transformPersistenceCompatibility(root, false);
+        QVERIFY(multipage.hasMultipageMask);
+        QVERIFY(!multipage.allowed());
+    }
 
-        const auto alreadyClear = vc3d::surface_rotation::reconcileHorizontalFlipSelection(false, unsupported);
-        QVERIFY(!alreadyClear.selected);
-        QVERIFY(!alreadyClear.selectionCleared);
+    void blocksPersistenceWhenMaskInspectionFails()
+    {
+        QTemporaryDir temporaryDirectory;
+        QVERIFY(temporaryDirectory.isValid());
+        const std::filesystem::path root{temporaryDirectory.path().toStdString()};
+
+        std::ofstream(root / "mask.tif") << "not a TIFF";
+        const auto unreadable = vc3d::surface_rotation::transformPersistenceCompatibility(root, false);
+        QVERIFY(!unreadable.hasMultipageMask);
+        QVERIFY(unreadable.maskInspectionFailed);
+        QVERIFY(!unreadable.allowed());
     }
 };
 

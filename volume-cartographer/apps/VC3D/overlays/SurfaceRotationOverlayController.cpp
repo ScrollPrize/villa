@@ -61,25 +61,12 @@ vc3d::surface_rotation::TransformPersistenceCompatibility surfaceTransformPersis
     return vc3d::surface_rotation::transformPersistenceCompatibility(surface->path, hasComponents);
 }
 
-QString horizontalFlipUnavailableTooltip(const vc3d::surface_rotation::TransformPersistenceCompatibility& compatibility)
-{
-    if (compatibility.hasMultipageMask && compatibility.hasDisconnectedComponents) {
-        return QObject::tr(
-            "Horizontal flip is unavailable because this surface has a multipage mask and "
-            "disconnected component ranges.");
-    }
-    if (compatibility.hasMultipageMask) {
-        return QObject::tr(
-            "Horizontal flip is unavailable because this surface has a multipage "
-            "multilayer_mask.tif sidecar.");
-    }
-    return QObject::tr(
-        "Horizontal flip is unavailable because this surface has disconnected component "
-        "ranges.");
-}
-
 QString transformPersistenceUnavailableTooltip(const vc3d::surface_rotation::TransformPersistenceCompatibility& compatibility)
 {
+    if (compatibility.maskInspectionFailed) {
+        return QObject::tr(
+            "Apply is unavailable because a mask TIFF could not be inspected safely.");
+    }
     if (compatibility.hasMultipageMask && compatibility.hasDisconnectedComponents) {
         return QObject::tr(
             "Apply is unavailable because multipage masks and disconnected component "
@@ -87,8 +74,8 @@ QString transformPersistenceUnavailableTooltip(const vc3d::surface_rotation::Tra
     }
     if (compatibility.hasMultipageMask) {
         return QObject::tr(
-            "Apply is unavailable because multipage multilayer_mask.tif sidecars cannot "
-            "yet be transformed safely.");
+            "Apply is unavailable because multipage mask TIFFs cannot yet be transformed "
+            "safely.");
     }
     return QObject::tr(
         "Apply is unavailable because disconnected component ranges cannot yet be "
@@ -520,11 +507,7 @@ void SurfaceRotationOverlayController::ensureWidgetForTarget()
     viewer->graphicsView()->scene()->addItem(proxy);
     it->proxy = proxy;
     viewer->setOverlayGroup(kOverlayGroupKey, {proxy});
-    const bool flipWasSelected = _horizontalFlip;
     synchronizeTransformPersistenceCompatibility();
-    if (flipWasSelected && !_horizontalFlip) {
-        updatePreview();
-    }
     positionWidget(*it);
 }
 
@@ -562,12 +545,9 @@ bool SurfaceRotationOverlayController::setHorizontalFlip(bool enabled)
 {
     const bool previouslySelected = _horizontalFlip;
     _horizontalFlip = enabled;
-    const bool available = synchronizeTransformPersistenceCompatibility();
+    synchronizeTransformPersistenceCompatibility();
     if (_horizontalFlip != previouslySelected) {
         updatePreview();
-    }
-    if (enabled && !available) {
-        return false;
     }
     return true;
 }
@@ -575,11 +555,11 @@ bool SurfaceRotationOverlayController::setHorizontalFlip(bool enabled)
 bool SurfaceRotationOverlayController::synchronizeTransformPersistenceCompatibility()
 {
     const auto compatibility = surfaceTransformPersistenceCompatibility(_sourceSurface);
-    const auto selection = vc3d::surface_rotation::reconcileHorizontalFlipSelection(_horizontalFlip, compatibility);
-    _horizontalFlip = selection.selected;
-
     const bool available = compatibility.allowed();
-    const QString tooltip = available ? QString{} : horizontalFlipUnavailableTooltip(compatibility);
+    const QString previewTooltip = available
+        ? QString{}
+        : QObject::tr("Preview remains available. %1")
+              .arg(transformPersistenceUnavailableTooltip(compatibility));
     for (const auto& entry : _viewers) {
         if (!entry.proxy || !entry.proxy->widget()) {
             continue;
@@ -587,8 +567,8 @@ bool SurfaceRotationOverlayController::synchronizeTransformPersistenceCompatibil
         if (auto* checkbox = entry.proxy->widget()->findChild<QCheckBox*>(QString::fromLatin1(kHorizontalFlipObjectName))) {
             const QSignalBlocker blocker(checkbox);
             checkbox->setChecked(_horizontalFlip);
-            checkbox->setEnabled(available);
-            checkbox->setToolTip(tooltip);
+            checkbox->setEnabled(true);
+            checkbox->setToolTip(previewTooltip);
         }
 
         if (auto* apply = entry.proxy->widget()->findChild<QPushButton*>(QString::fromLatin1(kApplyTransformObjectName))) {
@@ -644,12 +624,8 @@ void SurfaceRotationOverlayController::applyRotation()
         return;
     }
 
-    const bool flipWasSelected = _horizontalFlip;
     const bool persistenceAvailable = synchronizeTransformPersistenceCompatibility();
     if (!persistenceAvailable) {
-        if (flipWasSelected && !_horizontalFlip) {
-            updatePreview();
-        }
         QMessageBox::warning(
             nullptr,
             tr("Surface Transform Unavailable"),
