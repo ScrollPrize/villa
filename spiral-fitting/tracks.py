@@ -123,6 +123,54 @@ class PackedTrackCollection:
     def selected_lengths(self):
         return self.offsets[self.rows + 1] - self.offsets[self.rows]
 
+    @property
+    def selected_offsets(self):
+        """Where each selected track starts once materialised, without
+        materialising anything: the lengths are already in `offsets`."""
+        out = np.empty(len(self.rows) + 1, dtype=np.int64)
+        out[0] = 0
+        np.cumsum(self.selected_lengths, out=out[1:])
+        return out
+
+    def iter_selected_blocks(self, block_points=1 << 22):
+        """Yield ``(begin, coordinates)`` over the selected points in
+        materialised order, holding one block at a time.
+
+        This is what materialize() returns, produced in pieces.  The caller
+        that only needs to look at every point once, or to write a filtered
+        copy of them, never has to have all of them at once: on the 2 um store
+        at three thousand slices the whole selection is 1.98 GiB and a block is
+        48 MiB.  Blocks break on track boundaries, so a consumer that needs
+        whole tracks still gets them.
+        """
+        lengths = self.selected_lengths
+        if len(lengths) == 0:
+            return
+        starts = self.offsets[self.rows]
+        cumulative = self.selected_offsets
+        total = int(cumulative[-1])
+        block_points = max(1, int(block_points))
+        # Block boundaries at track granularity, found once rather than by
+        # walking tracks in Python.
+        cuts = np.unique(np.concatenate((
+            [0],
+            np.searchsorted(cumulative, np.arange(block_points, total,
+                                                  block_points)),
+            [len(lengths)])))
+        for first, last in zip(cuts[:-1], cuts[1:]):
+            if last <= first:
+                continue
+            block_lengths = lengths[first:last]
+            taken = int(block_lengths.sum())
+            local = np.empty(len(block_lengths), dtype=np.int64)
+            local[0] = 0
+            if len(block_lengths) > 1:
+                np.cumsum(block_lengths[:-1], out=local[1:])
+            index = (np.arange(taken, dtype=np.int64)
+                     - np.repeat(local, block_lengths)
+                     + np.repeat(starts[first:last], block_lengths))
+            yield int(cumulative[first]), self.coordinates[index]
+
     def materialize(self, workers=None):
         identity = (len(self.rows) == len(self.source_ids)
                     and np.array_equal(
@@ -2381,6 +2429,63 @@ def _track_points_far_from_anchors_mask(track_zyx, anchor_tree, threshold,
     return keep
 
 
+def _mask_far_from_anchors_blocked(
+        blocks, total_points, anchor_tree, threshold, progress=None):
+    """The exclusion mask, built from blocks instead of from one array.
+
+    Same question as _track_points_far_from_anchors_mask and the same answer,
+    but the points arrive a block at a time, so nothing the size of the whole
+    selection has to exist.  Only the one-byte mask is resident.
+    """
+    keep = np.empty(total_points, dtype=bool)
+    if threshold <= 0 or anchor_tree is None:
+        keep[:] = True
+        return keep
+    reporter = progress_or_null(progress)
+    reporter.begin('loading', 'Excluding track points near patches',
+                   step=0, total_steps=total_points, unit='points')
+    bar = tqdm(total=total_points, desc='excluding track points',
+               unit='point', unit_scale=True, disable=progress is not None)
+    seen = 0
+    try:
+        for begin, block in blocks:
+            block = np.ascontiguousarray(block, dtype=np.float32)
+            distance, _ = anchor_tree.query(
+                block, k=1, distance_upper_bound=float(threshold), workers=-1)
+            keep[begin:begin + len(block)] = np.isinf(distance)
+            seen = begin + len(block)
+            bar.update(len(block))
+            reporter.update(seen)
+    finally:
+        bar.close()
+    if seen != total_points:
+        raise ValueError(
+            f'the blocks covered {seen} points, not {total_points}')
+    return keep
+
+
+def _compact_blocked(blocks, keep, out_points):
+    """Write the surviving points straight out of the blocks.
+
+    The pair (mask, blocks) already says what the answer is; building the full
+    selection first and then compacting it means two arrays of that size exist
+    at once, which is the peak this avoids.  One allocation, the size of the
+    result, filled a block at a time.
+    """
+    out = np.empty((out_points, 3), dtype=np.float32)
+    written = 0
+    for begin, block in blocks:
+        selected = keep[begin:begin + len(block)]
+        count = int(np.count_nonzero(selected))
+        if count:
+            np.compress(selected, block, axis=0, out=out[written:written + count])
+        written += count
+    if written != out_points:
+        raise ValueError(
+            f'compaction wrote {written} points, expected {out_points}')
+    return out
+
+
 def prepare_main_phase_tracks(
         tracks, anchor_scroll_zyxs, exclusion_radius, device, anchor_tree=None,
         sampling_config=None, track_families=None, track_source_ids=None,
@@ -2688,7 +2793,21 @@ def prepare_main_phase_tracks(
         return finish_prepared(
             flat_zyx_np, lengths_new, surviving, surviving_tracks)
 
-    if packed_input:
+    # A packed store can answer the exclusion question a block at a time, and
+    # then write the survivors straight out.  Materialising the selection first
+    # puts a second copy of every selected point beside the store's own, and
+    # compacting that copy puts a third beside it: measured on the 2 um store
+    # at three thousand slices, 2.01 + 1.98 + 1.75 GiB inside a 14.3 GiB peak.
+    # Streaming needs one array the size of the result and one block.
+    streamed = (packed_input and exclusion_radius > 0
+                and anchor_tree is not None)
+    flat_zyx_np = None
+    if streamed:
+        input_offsets = working_tracks.selected_offsets
+        keep_np = _mask_far_from_anchors_blocked(
+            working_tracks.iter_selected_blocks(), int(input_offsets[-1]),
+            anchor_tree, exclusion_radius, progress=progress)
+    elif packed_input:
         flat_zyx_np, packed_offsets = working_tracks.materialize()
         flat_zyx_np = np.asarray(flat_zyx_np, dtype=np.float32)
         input_offsets = np.asarray(packed_offsets, dtype=np.int64)
@@ -2701,8 +2820,9 @@ def prepare_main_phase_tracks(
         np.cumsum(input_lengths, out=input_offsets[1:])
         flat_zyx_np = np.concatenate(
             [t.astype(np.float32) for t in working_tracks], axis=0)
-    keep_np = _track_points_far_from_anchors_mask(
-        flat_zyx_np, anchor_tree, exclusion_radius, progress=progress)
+    if not streamed:
+        keep_np = _track_points_far_from_anchors_mask(
+            flat_zyx_np, anchor_tree, exclusion_radius, progress=progress)
     num_tracks_orig = len(working_tracks)
     # Points are already grouped by track.  Segment reduction replaces the old
     # int64 track-id-per-point array (7.3 GiB for the 2um store).
@@ -2723,7 +2843,12 @@ def prepare_main_phase_tracks(
     # below, and on the 2 um store at three thousand slices each is 2.16 GB
     # inside a 14.5 GiB peak. Compaction preserves order and writes a prefix,
     # so the survivors can be moved down within the array they came from.
-    compact_zyx_np = _compact_rows_in_place(flat_zyx_np, keep_np)
+    if streamed:
+        compact_zyx_np = _compact_blocked(
+            working_tracks.iter_selected_blocks(), keep_np,
+            int(lengths_new.sum()))
+    else:
+        compact_zyx_np = _compact_rows_in_place(flat_zyx_np, keep_np)
     crossing_csr_override = None
     if track_graph is not None:
         if int(keep_np.sum()) >= np.iinfo(np.int32).max:
