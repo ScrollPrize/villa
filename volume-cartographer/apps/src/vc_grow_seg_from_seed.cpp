@@ -604,6 +604,8 @@ int main(int argc, char *argv[])
     meta_params["vc_gsfs_params"] = params;
     meta_params["vc_gsfs_mode"] = mode;
     meta_params["vc_gsfs_version"] = "dev";
+    meta_params["vc_gsfs_rng_seed"] = static_cast<uint64_t>(growpatch_rng_base_seed());
+    meta_params["vc_gsfs_omp_max_threads"] = omp_get_max_threads();
     add_target_context(meta_params, vol_path);
     if (mode == "expansion")
         meta_params["seed_overlap"] = count_overlap;
