@@ -154,3 +154,37 @@ Full validation command:
 ```bash
 /usr/bin/time -f 'wall=%e user=%U sys=%S maxrss_kib=%M' volume-cartographer/build/bin/vc_fiberlets fiberlet-replay /home/hendrik/business/aiconsulting/vesuviuschallenge/data/s1/PHercParis4.volpkg/volumes/fiber_s1_002.lasagna.json /home/hendrik/business/aiconsulting/vesuviuschallenge/data/fibers/david/Paris4_fibers/dj_20260805T025256484_000003.json /tmp/fiberlet-prefix-fix-full-r768 --normal-manifest /home/hendrik/business/aiconsulting/vesuviuschallenge/data/lasagna3d_inf/las008_s1_full/las_008.lasagna.json --threads 32 --radius 768 --anchor-cache /home/hendrik/business/aiconsulting/vesuviuschallenge/data/workdir3/fiberlet-replay-full/cache/fnv1a64-28da47830cd793ba/anchors.zarr --fiberlet-cache /home/hendrik/business/aiconsulting/vesuviuschallenge/data/workdir3/fiberlet-replay-full/cache/fnv1a64-92a6fb9b1512f01b/fiberlets.zarr
 ```
+
+## W=1 quality-regression diagnosis
+
+- The pinned aggregate-cost baseline has two full-corridor fiberlet failures at
+  reference arcs `42747.297592184739` and `44748.20886432947`; direct decoded
+  profile scoring at `W=1` has five failures.
+- Decision diagnostics locate the first geometry divergence at checkpoint six.
+  At checkpoint zero both implementations commit the same prefix, but profile
+  integration changes candidate scores by roughly `0.15` to `0.34`, far beyond
+  uint16 codec or floating-point error. A route needed by the aggregate scorer
+  at the next horizon falls outside the profile-ranked retained set, and the
+  profile scorer then commits a longer one-fiberlet shortcut.
+- Increasing the retained beam from 16 to 64 does not change that first wrong
+  committed prefix. This is not ordinary beam-width truncation.
+- A temporary diagnostic build kept the repaired persistent search and cache
+  path unchanged but replaced all `W=1` profile integration with uniform
+  whole-edge density. It reproduced the pinned baseline's exact two failure
+  arcs (`20.84 s` wall, `38.48 s` user, `5.70 s` system, `1,223,900 KiB` peak
+  RSS).
+- A second temporary build used decoded profiles for every complete fiberlet
+  and uniform whole-edge density only for checkpoint- or horizon-cut partial
+  fiberlets. It again reproduced the exact two baseline failure arcs (`21.18
+  s` wall, `38.99 s` user, `5.45 s` system, `1,269,548 KiB` peak RSS).
+- Therefore the complete decoded profiles, cost codec, persistent checkpoint
+  state, pruning, and cached graph reconstruction are not responsible. The
+  regression is caused specifically by raw subsegment cost distribution on
+  partial boundary fiberlets. At `W=1`, a terminal fiberlet with a cheap prefix
+  and expensive tail beyond the common horizon is ranked substantially better
+  than the aggregate baseline, effectively shortening and destabilizing the
+  usable lookahead.
+- Both diagnostic substitutions were removed after measurement and the normal
+  binary was rebuilt from the committed source. A production boundary policy
+  remains to be selected; silently retaining uniform partial-edge scoring would
+  conflict with the requested subsegment-resolved integration semantics.

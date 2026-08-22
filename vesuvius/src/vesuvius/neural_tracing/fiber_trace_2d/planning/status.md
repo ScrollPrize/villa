@@ -15,3 +15,5 @@
 - [x] Remove score-initialization walks over the committed prefix.
 - [x] Replace full logical-route registry sweeps with bounded cleanup.
 - [x] Add long-prefix regression coverage and remeasure hot-cache replay.
+- [x] Isolate the remaining `W=1` quality regression with controlled full-corridor runs.
+- [ ] Select and validate a partial-boundary fiberlet scoring policy.
