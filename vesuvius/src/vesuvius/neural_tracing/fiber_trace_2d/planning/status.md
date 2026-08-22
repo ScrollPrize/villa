@@ -20,3 +20,6 @@
 - [x] Rebuild and run focused validation.
 - [x] Add one-second progress, ETA, and size reporting.
 - [x] Rebuild and re-run focused validation after progress reporting.
+- [x] Replace the global anchor barrier with dynamic dependency scheduling.
+- [x] Add fiberlet-first and Z-frontier scheduler regression coverage.
+- [x] Rebuild and re-run focused validation after pipeline scheduling.

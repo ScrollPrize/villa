@@ -7,6 +7,8 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
+#include <span>
 #include <string>
 
 namespace vc::fiber_tracer
@@ -62,6 +64,47 @@ struct FiberletScheduledChunk {
 
 [[nodiscard]] std::vector<vc::render::ChunkKey> fiberletOutputChunksForNonemptyPresence(
     const FiberPresenceChunkScanReport& presence, const FiberletDatasetMetadata& outputMetadata, int anchorCellSizePredictionVoxels);
+
+enum class FiberletPreprocessWorkKind {
+    Anchor,
+    Fiberlet,
+};
+
+struct FiberletPreprocessWork {
+    FiberletPreprocessWorkKind kind = FiberletPreprocessWorkKind::Anchor;
+    vc::render::ChunkKey key;
+};
+
+class FiberletPreprocessSchedule final
+{
+public:
+    FiberletPreprocessSchedule(
+        std::vector<vc::render::ChunkKey> outputChunks,
+        std::vector<std::vector<vc::render::ChunkKey>> anchorDependencies,
+        std::span<const vc::render::ChunkKey> completedOutputs,
+        std::span<const vc::render::ChunkKey> availableAnchors);
+    ~FiberletPreprocessSchedule();
+
+    FiberletPreprocessSchedule(const FiberletPreprocessSchedule&) = delete;
+    FiberletPreprocessSchedule& operator=(const FiberletPreprocessSchedule&) = delete;
+    FiberletPreprocessSchedule(FiberletPreprocessSchedule&&) noexcept;
+    FiberletPreprocessSchedule& operator=(FiberletPreprocessSchedule&&) noexcept;
+
+    // Ready fiberlets in the current Z slab always precede anchor lookahead.
+    [[nodiscard]] std::optional<FiberletPreprocessWork> takeNext();
+    void complete(const FiberletPreprocessWork& work);
+
+    [[nodiscard]] bool done() const noexcept;
+    [[nodiscard]] std::optional<int> currentOutputZ() const noexcept;
+    [[nodiscard]] std::size_t anchorTotal() const noexcept;
+    [[nodiscard]] std::size_t anchorsCompleted() const noexcept;
+    [[nodiscard]] std::size_t outputTotal() const noexcept;
+    [[nodiscard]] std::size_t outputsCompleted() const noexcept;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
 
 class FiberletOnDemandPreprocessor : public std::enable_shared_from_this<FiberletOnDemandPreprocessor>
 {

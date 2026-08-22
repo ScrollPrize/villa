@@ -6,12 +6,17 @@ fiberlets for every relevant spatial chunk of a fiber inference volume.
 - Scan only the canonical presence array to determine sparse eligibility.
 - Do not process an output chunk when every overlapping input presence chunk
   is missing or decodes to all zero.
-- Generate a durable, resumable float anchor-cache Zarr first.
+- Generate a durable, resumable float anchor-cache Zarr as the dependency
+  source for final chunks; do not impose a whole-volume anchor barrier.
 - Keep that anchor cache after successful completion.
 - Generate a second, final Zarr containing anchors, fiberlet prefixes, and
   routes together using the compact default representation: float positions,
   compact directions, and fixed sqrt-density `uint16` costs.
 - Schedule work in Z/Y/X order. Parallel work may complete out of order.
+- Use one global chunk-worker budget. Schedule every ready final fiberlet in the
+  current Z slab first, then spend remaining worker capacity on the earliest
+  missing anchor dependencies. Anchor work may look ahead, but final output
+  work must not cross the current Z-slab frontier.
 - Reuse the existing anchor extraction, fiberlet extraction, dependency,
   serialization, and generated-cache implementations.
 - Retain `--presence-floor` as the observation threshold. A cell with no

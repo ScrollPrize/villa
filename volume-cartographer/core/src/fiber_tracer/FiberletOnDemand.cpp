@@ -189,6 +189,198 @@ std::vector<vc::render::ChunkKey> fiberletOutputChunksForNonemptyPresence(
     return result;
 }
 
+struct FiberletPreprocessSchedule::Impl {
+    using Key = std::array<int, 4>;
+
+    enum class State {
+        Pending,
+        Running,
+        Complete,
+    };
+
+    struct Output {
+        vc::render::ChunkKey key;
+        State state = State::Pending;
+        std::size_t missingAnchors = 0;
+    };
+
+    struct Anchor {
+        vc::render::ChunkKey key;
+        State state = State::Pending;
+        std::vector<std::size_t> dependents;
+        std::size_t firstDependent = 0;
+        std::size_t firstIncompleteDependent = std::numeric_limits<std::size_t>::max();
+    };
+
+    static Key id(const vc::render::ChunkKey& key) { return {key.level, key.iz, key.iy, key.ix}; }
+
+    void advanceOutputZ()
+    {
+        currentZ.reset();
+        for (const auto& output : outputs) {
+            if (output.state != State::Complete) {
+                currentZ = output.key.iz;
+                return;
+            }
+        }
+    }
+
+    std::vector<Output> outputs;
+    std::map<Key, std::size_t> outputByKey;
+    std::map<Key, Anchor> anchors;
+    std::set<std::pair<std::size_t, Key>> pendingAnchors;
+    std::set<std::size_t> readyOutputs;
+    std::optional<int> currentZ;
+    std::size_t completedAnchorCount = 0;
+    std::size_t completedOutputCount = 0;
+};
+
+FiberletPreprocessSchedule::FiberletPreprocessSchedule(
+    std::vector<vc::render::ChunkKey> outputChunks,
+    std::vector<std::vector<vc::render::ChunkKey>> anchorDependencies,
+    std::span<const vc::render::ChunkKey> completedOutputs,
+    std::span<const vc::render::ChunkKey> availableAnchors)
+    : impl_(std::make_unique<Impl>())
+{
+    if (outputChunks.size() != anchorDependencies.size())
+        throw std::invalid_argument("fiberlet preprocess outputs and dependency lists differ in size");
+    const auto keyLess = [](const auto& left, const auto& right) { return Impl::id(left) < Impl::id(right); };
+    if (!std::is_sorted(outputChunks.begin(), outputChunks.end(), keyLess) ||
+        std::adjacent_find(outputChunks.begin(), outputChunks.end()) != outputChunks.end()) {
+        throw std::invalid_argument("fiberlet preprocess outputs must be ordered and unique");
+    }
+
+    std::set<Impl::Key> completedOutputIds;
+    for (const auto& key : completedOutputs)
+        completedOutputIds.insert(Impl::id(key));
+    std::set<Impl::Key> availableAnchorIds;
+    for (const auto& key : availableAnchors)
+        availableAnchorIds.insert(Impl::id(key));
+
+    impl_->outputs.reserve(outputChunks.size());
+    for (std::size_t index = 0; index < outputChunks.size(); ++index) {
+        auto& dependencies = anchorDependencies[index];
+        std::sort(dependencies.begin(), dependencies.end(), keyLess);
+        dependencies.erase(std::unique(dependencies.begin(), dependencies.end()), dependencies.end());
+        const auto outputId = Impl::id(outputChunks[index]);
+        const bool complete = completedOutputIds.contains(outputId);
+        if (!impl_->outputByKey.emplace(outputId, index).second)
+            throw std::invalid_argument("fiberlet preprocess output is duplicated");
+        impl_->outputs.push_back({outputChunks[index], complete ? Impl::State::Complete : Impl::State::Pending, 0});
+        impl_->completedOutputCount += complete;
+        for (const auto& dependency : dependencies) {
+            const auto dependencyId = Impl::id(dependency);
+            auto [found, inserted] = impl_->anchors.try_emplace(
+                dependencyId,
+                Impl::Anchor{
+                    dependency,
+                    Impl::State::Pending,
+                    {},
+                    index,
+                    complete ? std::numeric_limits<std::size_t>::max() : index});
+            found->second.firstDependent = std::min(found->second.firstDependent, index);
+            if (!complete)
+                found->second.firstIncompleteDependent = std::min(found->second.firstIncompleteDependent, index);
+            found->second.dependents.push_back(index);
+        }
+    }
+    if (completedOutputIds.size() != impl_->completedOutputCount)
+        throw std::invalid_argument("fiberlet preprocess completed output is not in the active output set");
+
+    for (auto& [anchorId, anchor] : impl_->anchors) {
+        if (availableAnchorIds.contains(anchorId)) {
+            anchor.state = Impl::State::Complete;
+            ++impl_->completedAnchorCount;
+        } else {
+            const auto priority = anchor.firstIncompleteDependent != std::numeric_limits<std::size_t>::max()
+                ? anchor.firstIncompleteDependent
+                : impl_->outputs.size() + anchor.firstDependent;
+            impl_->pendingAnchors.emplace(priority, anchorId);
+            for (const auto dependent : anchor.dependents) {
+                if (impl_->outputs[dependent].state != Impl::State::Complete)
+                    ++impl_->outputs[dependent].missingAnchors;
+            }
+        }
+    }
+    for (std::size_t index = 0; index < impl_->outputs.size(); ++index) {
+        const auto& output = impl_->outputs[index];
+        if (output.state == Impl::State::Pending && output.missingAnchors == 0)
+            impl_->readyOutputs.insert(index);
+    }
+    impl_->advanceOutputZ();
+}
+
+FiberletPreprocessSchedule::~FiberletPreprocessSchedule() = default;
+FiberletPreprocessSchedule::FiberletPreprocessSchedule(FiberletPreprocessSchedule&&) noexcept = default;
+FiberletPreprocessSchedule& FiberletPreprocessSchedule::operator=(FiberletPreprocessSchedule&&) noexcept = default;
+
+std::optional<FiberletPreprocessWork> FiberletPreprocessSchedule::takeNext()
+{
+    if (impl_->currentZ && !impl_->readyOutputs.empty()) {
+        const auto ready = impl_->readyOutputs.begin();
+        auto& output = impl_->outputs[*ready];
+        if (output.key.iz == *impl_->currentZ) {
+            const auto work = FiberletPreprocessWork{FiberletPreprocessWorkKind::Fiberlet, output.key};
+            output.state = Impl::State::Running;
+            impl_->readyOutputs.erase(ready);
+            return work;
+        }
+    }
+    if (!impl_->pendingAnchors.empty()) {
+        const auto pending = impl_->pendingAnchors.begin();
+        const auto anchorId = pending->second;
+        auto& anchor = impl_->anchors.at(anchorId);
+        anchor.state = Impl::State::Running;
+        impl_->pendingAnchors.erase(pending);
+        return FiberletPreprocessWork{FiberletPreprocessWorkKind::Anchor, anchor.key};
+    }
+    return std::nullopt;
+}
+
+void FiberletPreprocessSchedule::complete(const FiberletPreprocessWork& work)
+{
+    const auto id = Impl::id(work.key);
+    if (work.kind == FiberletPreprocessWorkKind::Anchor) {
+        auto found = impl_->anchors.find(id);
+        if (found == impl_->anchors.end() || found->second.state != Impl::State::Running)
+            throw std::logic_error("completed fiberlet preprocess anchor was not running");
+        found->second.state = Impl::State::Complete;
+        ++impl_->completedAnchorCount;
+        for (const auto dependent : found->second.dependents) {
+            auto& output = impl_->outputs[dependent];
+            if (output.state == Impl::State::Complete)
+                continue;
+            if (output.missingAnchors == 0)
+                throw std::logic_error("fiberlet preprocess dependency count underflow");
+            --output.missingAnchors;
+            if (output.missingAnchors == 0 && output.state == Impl::State::Pending)
+                impl_->readyOutputs.insert(dependent);
+        }
+        return;
+    }
+
+    const auto found = impl_->outputByKey.find(id);
+    if (found == impl_->outputByKey.end())
+        throw std::logic_error("completed fiberlet preprocess output is unknown");
+    auto& output = impl_->outputs[found->second];
+    if (output.state != Impl::State::Running)
+        throw std::logic_error("completed fiberlet preprocess output was not running");
+    output.state = Impl::State::Complete;
+    ++impl_->completedOutputCount;
+    impl_->advanceOutputZ();
+}
+
+bool FiberletPreprocessSchedule::done() const noexcept
+{
+    return impl_->completedAnchorCount == impl_->anchors.size() && impl_->completedOutputCount == impl_->outputs.size();
+}
+
+std::optional<int> FiberletPreprocessSchedule::currentOutputZ() const noexcept { return impl_->currentZ; }
+std::size_t FiberletPreprocessSchedule::anchorTotal() const noexcept { return impl_->anchors.size(); }
+std::size_t FiberletPreprocessSchedule::anchorsCompleted() const noexcept { return impl_->completedAnchorCount; }
+std::size_t FiberletPreprocessSchedule::outputTotal() const noexcept { return impl_->outputs.size(); }
+std::size_t FiberletPreprocessSchedule::outputsCompleted() const noexcept { return impl_->completedOutputCount; }
+
 struct FiberletOnDemandPreprocessor::State {
     explicit State(FiberletOnDemandConfig input) : config(std::move(input)) {}
 

@@ -20,26 +20,28 @@
    standalone combined reader must therefore reopen the source manifest, run
    the same canonical presence scan, and configure that expected set before it
    can construct stored graph facets.
-4. Add a core whole-volume preprocessing driver around
-   `FiberletOnDemandPreprocessor`. First generate the union of anchor chunks
-   required by all active output chunks, including existing exact dependency
-   halos. Then convert each owned float anchor chunk into the compact final
-   dataset and generate its compact prefix/route pair from the intermediate
-   anchors.
+4. Add a core dependency scheduler around `FiberletOnDemandPreprocessor`.
+   Build the deduplicated union of exact anchor dependencies, but do not process
+   that union as a separate phase. Track dependency readiness per final owner,
+   dispatch ready final owners in current-slab Y/X order, and use every
+   remaining worker slot for the earliest anchor dependency. Publish each
+   owner's compact anchor before its compact prefix/route pair.
 5. Add `vc_fiberlets preprocess-volume FIBER_MANIFEST OUTPUT_ZARR` with
    required `--normal-manifest` and optional `--anchor-cache`. Default the
    durable anchor output beside the final output as `<stem>.anchors.zarr`.
    Reuse the existing extraction, path, cache-budget, thread, remote-cache,
    storage-chunk, and threshold options.
-6. Schedule both stages in stable Z/Y/X order and report presence scan,
-   eligible/skipped chunks, anchor progress, fiberlet progress, resume hits,
-   elapsed wall time, and output locations. A stage reporter runs independently
-   of chunk completion, refreshes one terminal line about once per second,
-   writes a persistent newline every minute and at stage completion, and shows
-   completed/total chunks, percent, elapsed, rate, ETA, and current/projected
-   payload bytes based on the visited-chunk mean. Re-scan input, anchor
-   dependencies, and final triples on every invocation; do not require strict
-   completion order from parallel workers.
+6. Use `--threads` as one global chunk-worker budget and run each extraction
+   single-threaded in whole-volume mode. Every dispatch first consumes ready
+   fiberlets in the current Z slab and then fills idle slots with ordered anchor
+   lookahead. Advance the final-output Z frontier only after its current slab is
+   complete; work within a slab may complete out of order. Report presence
+   scan, eligible/skipped chunks, anchor/output progress, resume hits, elapsed
+   wall time, and output locations. One pipeline reporter refreshes about once
+   per second, writes a persistent newline every minute and at completion, and
+   shows the Z frontier plus separate anchor/output counts, rates, ETAs, and
+   current/projected payload bytes. Re-scan input, anchor dependencies, and
+   final triples on every invocation.
 7. Keep payload writes individually atomic and use the validated three-file
    final tuple as the logical completeness unit. An interrupted tuple may leave one
    or two canonical payload files; resume must accept matching existing files,
@@ -60,7 +62,8 @@
    rejection, empty tuples, corrupt and mismatched tuples, zero active chunks,
    unexpected final payloads, legacy-artifact removal, stale temporary cleanup,
    cleanup on exception, reconstructed-reader reopening, dependency-halo anchor
-   generation, Z-priority schedules, resume behavior, and the existing
+   generation, fiberlet-first dynamic worker allocation, dependency
+   deduplication, Z-slab output barriers, resume behavior, and the existing
    presence-floor early exit. Build validation covers the CLI-local progress
    reporter; a bounded production smoke remains unavailable because the command
    has no bounded-region mode.

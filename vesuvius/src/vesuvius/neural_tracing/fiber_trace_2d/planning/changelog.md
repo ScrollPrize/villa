@@ -1034,3 +1034,6 @@
 - Added `vc_fiberlets preprocess-volume` with Z/Y/X scheduling, resume, and
   one-second progress, ETA, and compressed-size projection with persistent
   minute checkpoints.
+- Replaced the whole-volume anchor barrier with a dependency-driven Z-slab
+  pipeline. Ready fiberlets dynamically consume the shared worker budget first;
+  remaining workers generate deduplicated anchor lookahead.

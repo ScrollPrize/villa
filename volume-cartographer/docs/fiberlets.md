@@ -660,18 +660,24 @@ anchor cache additionally materializes the exact neighboring dependency halo
 needed to evaluate active fiberlet chunks; those halo-only chunks are not added
 to the final sparse index.
 
-Work is submitted in stable Z/Y/X order. Every invocation rescans canonical
-input presence to reconstruct the expected final chunks, then checks the
-required intermediate anchors and final output tuples directly. A final chunk
-is complete only when its anchor, prefix, and route payloads all exist, decode
-against the expected dataset and chunk identity, and form a matching
-prefix/route pair. Missing tuple members are regenerated while matching members
-left by an interrupted run are reused. Corrupt or conflicting members fail
-loudly.
+Every invocation rescans canonical input presence to reconstruct the expected
+final chunks, then checks the required intermediate anchors and final output
+tuples directly. It does not generate the entire anchor cache before starting
+fiberlets. Instead, one global `--threads` chunk-worker budget first runs every
+ready fiberlet in the current Z slab and uses remaining slots for the earliest
+missing anchor dependencies. Anchor generation can look ahead, but final-output
+generation advances to a later Z slab only after the current slab completes;
+work within a slab may finish out of order. Each chunk extraction is
+single-threaded in this mode so nested worker teams cannot oversubscribe the
+global budget. A final chunk is complete only when its anchor, prefix, and route
+payloads all exist, decode against the expected dataset and chunk identity, and
+form a matching prefix/route pair. Missing tuple members are regenerated while
+matching members left by an interrupted run are reused. Corrupt or conflicting
+members fail loudly.
 
-Anchor and final generation each report a live progress line about once per
-second and preserve a newline at least once per minute and at stage completion.
-The line includes completed/total chunks, percent, elapsed time, throughput,
+The combined pipeline reports one live progress line about once per second and
+preserves a newline at least once per minute and at completion. It includes the
+current Z frontier and separate anchor/output completed counts, throughput,
 ETA, and current/projected compressed payload size. Projection uses the mean
 payload size of completed or resumed expected chunks and excludes Zarr
 metadata.

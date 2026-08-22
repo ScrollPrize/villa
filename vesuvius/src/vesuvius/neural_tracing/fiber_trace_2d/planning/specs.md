@@ -3947,13 +3947,16 @@
   reusable.
 - Final payloads use float positions, compact directions, and fixed sqrt-density
   `uint16` costs with ceiling 256. The intermediate cache remains float.
-- Presence scan, anchor generation, and final generation are scheduled in
-  stable Z/Y/X priority order. Resume rescans source presence, then scans the
-  expected anchor dependencies and final tuples to reuse valid payloads.
-- Anchor and final generation expose one live progress line refreshed about
-  once per second, with a persistent newline every minute and at completion.
-  It reports completed/total chunks, percentage, elapsed time, chunk rate, ETA,
-  and current/projected compressed payload bytes. The projection is the visited
+- Resume rescans source presence, anchor dependencies, and final tuples. One
+  global `--threads` chunk-worker budget dispatches all ready current-Z
+  fiberlets before filling remaining capacity with anchor dependencies ordered
+  by their earliest dependent output. Anchor work may look ahead; final-output
+  dispatch cannot cross the current Z slab. Each whole-volume chunk extraction
+  is single-threaded so nested teams cannot exceed that global budget.
+- The pipeline exposes one live progress line refreshed about once per second,
+  with a persistent newline every minute and at completion. It reports the Z
+  frontier plus separate anchor/output completed counts, rates, ETAs, and
+  current/projected compressed payload bytes. The projection is the visited
   expected-chunk mean and excludes Zarr metadata.
 - Every payload file uses same-directory temporary publication, file `fsync`,
   atomic rename, and parent-directory `fsync`. The final three-file tuple is a

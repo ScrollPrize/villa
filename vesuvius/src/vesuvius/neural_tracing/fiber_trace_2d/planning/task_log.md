@@ -75,3 +75,15 @@
 - Rebuilt `vc_fiberlets`, `test_fiberlet_storage`, and `test_fiber_anchors` in
   the quick Clang tree and reran both focused tests successfully. Rebuilt the
   regular `build/bin/vc_fiberlets` target successfully.
+- The initial implementation incorrectly treated anchor and final Z/Y/X order
+  as two independent phases. Replaced that global barrier with a tested dynamic
+  scheduler: ready fiberlets in the current Z slab have priority, remaining
+  slots generate earliest-needed anchors, and anchor lookahead cannot cause
+  later-Z final output to overtake the active slab.
+- Whole-volume extraction now uses single-threaded chunk kernels behind one
+  `--threads`-sized pool, so ready fiberlets and anchor dependencies share a
+  single extraction-worker budget. Resume-only anchor-cache repairs rank after
+  dependencies that unblock incomplete final outputs.
+- The quick Clang `vc_fiberlets`, `test_fiberlet_storage`, and
+  `test_fiber_anchors` targets rebuilt successfully; both focused tests passed.
+  The regular `build/bin/vc_fiberlets` target also rebuilt successfully.

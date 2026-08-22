@@ -10,6 +10,7 @@
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "FiberTraceCli.hpp"
+#include "utils/thread_pool.hpp"
 
 #include <zstd.h>
 
@@ -2644,23 +2645,49 @@ std::uint64_t existingFileSize(const std::filesystem::path& path)
     return static_cast<std::uint64_t>(size);
 }
 
-class WholeVolumeStageProgress final
+class WholeVolumePipelineProgress final
 {
 public:
-    WholeVolumeStageProgress(std::string stage, std::size_t total)
-        : stage_(std::move(stage)), total_(total), ticker_([this] { tickerLoop(); })
+    WholeVolumePipelineProgress(
+        std::size_t anchorTotal,
+        std::size_t initialAnchors,
+        std::uint64_t initialAnchorBytes,
+        std::size_t outputTotal,
+        std::size_t initialOutputs,
+        std::uint64_t initialOutputBytes,
+        std::optional<int> currentOutputZ,
+        int maximumOutputZ)
+        : anchorTotal_(anchorTotal),
+          initialAnchors_(initialAnchors),
+          outputTotal_(outputTotal),
+          initialOutputs_(initialOutputs),
+          maximumOutputZ_(maximumOutputZ),
+          anchorsCompleted_(initialAnchors),
+          anchorBytes_(initialAnchorBytes),
+          outputsCompleted_(initialOutputs),
+          outputBytes_(initialOutputBytes),
+          currentOutputZ_(currentOutputZ.value_or(-1)),
+          ticker_([this] { tickerLoop(); })
     {
     }
 
-    ~WholeVolumeStageProgress() { finish(); }
+    ~WholeVolumePipelineProgress() { finish(); }
 
-    WholeVolumeStageProgress(const WholeVolumeStageProgress&) = delete;
-    WholeVolumeStageProgress& operator=(const WholeVolumeStageProgress&) = delete;
+    WholeVolumePipelineProgress(const WholeVolumePipelineProgress&) = delete;
+    WholeVolumePipelineProgress& operator=(const WholeVolumePipelineProgress&) = delete;
 
-    void update(std::size_t completed, std::uint64_t payloadBytes)
+    void update(
+        std::size_t anchorsCompleted,
+        std::uint64_t anchorBytes,
+        std::size_t outputsCompleted,
+        std::uint64_t outputBytes,
+        std::optional<int> currentOutputZ)
     {
-        payloadBytes_.store(payloadBytes, std::memory_order_relaxed);
-        completed_.store(completed, std::memory_order_release);
+        anchorBytes_.store(anchorBytes, std::memory_order_relaxed);
+        anchorsCompleted_.store(anchorsCompleted, std::memory_order_relaxed);
+        outputBytes_.store(outputBytes, std::memory_order_relaxed);
+        outputsCompleted_.store(outputsCompleted, std::memory_order_relaxed);
+        currentOutputZ_.store(currentOutputZ.value_or(-1), std::memory_order_release);
     }
 
     void finish()
@@ -2693,29 +2720,52 @@ private:
     void render(bool final)
     {
         const auto now = std::chrono::steady_clock::now();
-        const auto completed = completed_.load(std::memory_order_acquire);
-        const auto payloadBytes = payloadBytes_.load(std::memory_order_relaxed);
+        const auto anchorsCompleted = anchorsCompleted_.load(std::memory_order_relaxed);
+        const auto anchorBytes = anchorBytes_.load(std::memory_order_relaxed);
+        const auto outputsCompleted = outputsCompleted_.load(std::memory_order_relaxed);
+        const auto outputBytes = outputBytes_.load(std::memory_order_relaxed);
+        const auto currentOutputZ = currentOutputZ_.load(std::memory_order_acquire);
         const double elapsed = std::chrono::duration<double>(now - started_).count();
-        const double fraction = total_ == 0 ? 1.0 : std::clamp(static_cast<double>(completed) / static_cast<double>(total_), 0.0, 1.0);
-        const double rate = elapsed > 0.0 ? static_cast<double>(completed) / elapsed : 0.0;
-        const double eta = completed > 0 && completed < total_ ? static_cast<double>(total_ - completed) / rate
-                           : completed >= total_                 ? 0.0
-                                                                 : std::numeric_limits<double>::infinity();
-        const auto projectedBytes = completed > 0
-            ? static_cast<std::uint64_t>(std::llround(static_cast<double>(payloadBytes) * static_cast<double>(total_) / static_cast<double>(completed)))
-            : std::uint64_t{0};
+        const auto progressRate = [elapsed](std::size_t completed, std::size_t initial) {
+            return elapsed > 0.0 ? static_cast<double>(completed - initial) / elapsed : 0.0;
+        };
+        const auto progressEta = [](std::size_t completed, std::size_t total, double rate) {
+            if (completed >= total)
+                return 0.0;
+            return rate > 0.0 ? static_cast<double>(total - completed) / rate : std::numeric_limits<double>::infinity();
+        };
+        const auto projectedSize = [](std::uint64_t bytes, std::size_t completed, std::size_t total) {
+            return completed > 0
+                ? static_cast<std::uint64_t>(std::llround(
+                      static_cast<double>(bytes) * static_cast<double>(total) / static_cast<double>(completed)))
+                : std::uint64_t{0};
+        };
+        const double anchorRate = progressRate(anchorsCompleted, initialAnchors_);
+        const double outputRate = progressRate(outputsCompleted, initialOutputs_);
+        const double anchorPercent = anchorTotal_ == 0 ? 100.0 : 100.0 * static_cast<double>(anchorsCompleted) / static_cast<double>(anchorTotal_);
+        const double outputPercent = outputTotal_ == 0 ? 100.0 : 100.0 * static_cast<double>(outputsCompleted) / static_cast<double>(outputTotal_);
+        const double anchorEta = progressEta(anchorsCompleted, anchorTotal_, anchorRate);
+        const double outputEta = progressEta(outputsCompleted, outputTotal_, outputRate);
+        const auto projectedAnchorBytes = projectedSize(anchorBytes, anchorsCompleted, anchorTotal_);
+        const auto projectedOutputBytes = projectedSize(outputBytes, outputsCompleted, outputTotal_);
         std::ostringstream line;
-        line << "fiberlet_preprocess_progress stage=" << stage_
-             << " chunks=" << completed << '/' << total_
-             << " percent=" << std::fixed << std::setprecision(1) << 100.0 * fraction
-             << " elapsed=" << progressDuration(elapsed)
-             << " rate=" << std::setprecision(2) << rate << "chunks/s"
-             << " eta=" << progressDuration(eta)
-             << " size=" << progressBytes(payloadBytes) << '/';
-        if (completed > 0 || total_ == 0)
-            line << progressBytes(projectedBytes);
+        line << "fiberlet_preprocess_progress z=";
+        if (currentOutputZ >= 0)
+            line << currentOutputZ << '/' << maximumOutputZ_;
         else
-            line << "n/a";
+            line << "done";
+        line << " anchors=" << anchorsCompleted << '/' << anchorTotal_ << '(' << std::fixed << std::setprecision(1) << anchorPercent << "%)"
+             << " anchor_rate=" << std::fixed << std::setprecision(2) << anchorRate << "chunks/s"
+             << " anchor_eta=" << progressDuration(anchorEta)
+             << " anchor_size=" << progressBytes(anchorBytes) << '/'
+             << (anchorsCompleted > 0 || anchorTotal_ == 0 ? progressBytes(projectedAnchorBytes) : "n/a")
+             << " outputs=" << outputsCompleted << '/' << outputTotal_ << '(' << std::setprecision(1) << outputPercent << "%)"
+             << std::setprecision(2)
+             << " output_rate=" << outputRate << "chunks/s"
+             << " output_eta=" << progressDuration(outputEta)
+             << " output_size=" << progressBytes(outputBytes) << '/'
+             << (outputsCompleted > 0 || outputTotal_ == 0 ? progressBytes(projectedOutputBytes) : "n/a")
+             << " elapsed=" << progressDuration(elapsed);
         const auto rendered = line.str();
         std::cerr << '\r' << rendered;
         if (renderedWidth_ > rendered.size())
@@ -2731,11 +2781,17 @@ private:
         }
     }
 
-    const std::string stage_;
-    const std::size_t total_;
+    const std::size_t anchorTotal_;
+    const std::size_t initialAnchors_;
+    const std::size_t outputTotal_;
+    const std::size_t initialOutputs_;
+    const int maximumOutputZ_;
     const std::chrono::steady_clock::time_point started_ = std::chrono::steady_clock::now();
-    std::atomic_size_t completed_{0};
-    std::atomic<std::uint64_t> payloadBytes_{0};
+    std::atomic_size_t anchorsCompleted_{0};
+    std::atomic<std::uint64_t> anchorBytes_{0};
+    std::atomic_size_t outputsCompleted_{0};
+    std::atomic<std::uint64_t> outputBytes_{0};
+    std::atomic_int currentOutputZ_{-1};
     std::atomic_bool finished_{false};
     std::mutex waitMutex_;
     std::condition_variable waitCv_;
@@ -2831,8 +2887,8 @@ int runWholeVolumePreprocessing(
     vc::render::ChunkCache::Options cacheOptions;
     cacheOptions.decodedByteCapacity = options.decodedCacheBytes;
     cacheOptions.decodedByteBudget = budget;
-    // Each extraction already consumes the configured worker team.
-    cacheOptions.maxConcurrentReads = 1;
+    const auto workerCount = static_cast<std::size_t>(std::max(1, options.anchors.parallelThreads));
+    cacheOptions.maxConcurrentReads = workerCount;
 
     FiberletOnDemandConfig onDemand;
     onDemand.anchorRoot = anchorRoot;
@@ -2842,6 +2898,10 @@ int runWholeVolumePreprocessing(
     onDemand.grid = grid;
     onDemand.anchorConfig = options.anchors;
     onDemand.pathConfig = options.paths;
+    // Whole-volume parallelism is across chunks so one global worker budget can
+    // move dynamically between ready fiberlets and their anchor dependencies.
+    onDemand.anchorConfig.parallelThreads = 1;
+    onDemand.pathConfig.parallelThreads = 1;
     onDemand.geometryQuantization = {.positionQuantumBaseVoxels = 0.0, .compactDirections = true};
     onDemand.predictionSampler = [&field](const auto& indices, int threads, auto& samples) {
         field.sampleStoredGridBatch(indices, threads, samples);
@@ -2864,70 +2924,140 @@ int runWholeVolumePreprocessing(
     }
     auto preprocessor = FiberletOnDemandPreprocessor::create(std::move(onDemand));
 
-    std::set<std::array<int, 3>> dependencyCoordinates;
+    std::set<std::array<int, 4>> dependencyCoordinates;
+    std::vector<std::vector<vc::render::ChunkKey>> outputDependencies;
+    outputDependencies.reserve(activeChunks.size());
     for (const auto& key : activeChunks) {
-        for (const auto& dependency : preprocessor->anchorDependencies(key))
-            dependencyCoordinates.insert({dependency.iz, dependency.iy, dependency.ix});
+        auto dependencies = preprocessor->anchorDependencies(key);
+        for (const auto& dependency : dependencies)
+            dependencyCoordinates.insert({dependency.level, dependency.iz, dependency.iy, dependency.ix});
+        outputDependencies.push_back(std::move(dependencies));
     }
     std::vector<vc::render::ChunkKey> anchorChunks;
     anchorChunks.reserve(dependencyCoordinates.size());
     for (const auto& coordinate : dependencyCoordinates)
-        anchorChunks.push_back({0, coordinate[0], coordinate[1], coordinate[2]});
+        anchorChunks.push_back({coordinate[0], coordinate[1], coordinate[2], coordinate[3]});
 
-    size_t completedAnchors = 0;
-    std::uint64_t anchorPayloadBytes = 0;
-    WholeVolumeStageProgress anchorProgress("anchors", anchorChunks.size());
-    for (const auto& key : anchorChunks) {
-        const auto chunk = preprocessor->anchorCache()->getChunkBlocking(key.level, key.iz, key.iy, key.ix);
-        if (chunk.status != vc::render::ChunkStatus::Data || !chunk.payload) {
-            throw std::runtime_error(
-                "whole-volume anchor chunk generation failed at " + std::to_string(key.iz) + '/' + std::to_string(key.iy) + '/' +
-                std::to_string(key.ix) + (chunk.error.empty() ? std::string{} : ": " + chunk.error));
-        }
-        anchorPayloadBytes += existingFileSize(
-            preprocessor->anchorDataset()->chunkPath(FiberletStorageChunkKind::Anchors, key));
-        ++completedAnchors;
-        anchorProgress.update(completedAnchors, anchorPayloadBytes);
-    }
-    anchorProgress.finish();
-
-    size_t completedFiberlets = 0;
-    size_t resumedFiberlets = 0;
+    std::vector<vc::render::ChunkKey> completedOutputs;
+    completedOutputs.reserve(activeChunks.size());
     std::uint64_t fiberletPayloadBytes = 0;
-    WholeVolumeStageProgress fiberletProgress("fiberlets", activeChunks.size());
     for (const auto& key : activeChunks) {
-        if (finalDataset->readMaterializedChunk(FiberletStorageChunkKind::FiberletPrefix, key)) {
-            ++resumedFiberlets;
-            ++completedFiberlets;
-            fiberletPayloadBytes += finalTupleSize(*finalDataset, key);
-            fiberletProgress.update(completedFiberlets, fiberletPayloadBytes);
+        if (!finalDataset->readMaterializedChunk(FiberletStorageChunkKind::FiberletPrefix, key))
+            continue;
+        completedOutputs.push_back(key);
+        fiberletPayloadBytes += finalTupleSize(*finalDataset, key);
+    }
+
+    std::vector<vc::render::ChunkKey> availableAnchors;
+    availableAnchors.reserve(anchorChunks.size());
+    std::uint64_t anchorPayloadBytes = 0;
+    for (const auto& key : anchorChunks) {
+        if (!preprocessor->anchorDataset()->readMaterializedChunk(FiberletStorageChunkKind::Anchors, key))
+            continue;
+        availableAnchors.push_back(key);
+        anchorPayloadBytes += existingFileSize(preprocessor->anchorDataset()->chunkPath(FiberletStorageChunkKind::Anchors, key));
+    }
+
+    FiberletPreprocessSchedule schedule(
+        activeChunks,
+        std::move(outputDependencies),
+        completedOutputs,
+        availableAnchors);
+    const int maximumOutputZ = activeChunks.empty() ? -1 : activeChunks.back().iz;
+    WholeVolumePipelineProgress progress(
+        schedule.anchorTotal(),
+        schedule.anchorsCompleted(),
+        anchorPayloadBytes,
+        schedule.outputTotal(),
+        schedule.outputsCompleted(),
+        fiberletPayloadBytes,
+        schedule.currentOutputZ(),
+        maximumOutputZ);
+
+    struct RunningWork {
+        FiberletPreprocessWork work;
+        std::future<std::uint64_t> result;
+    };
+    utils::ThreadPool workers(workerCount);
+    std::vector<RunningWork> running;
+    running.reserve(workerCount);
+    const auto submit = [&](const FiberletPreprocessWork& work) {
+        return workers.submit([&, work] {
+            if (work.kind == FiberletPreprocessWorkKind::Anchor) {
+                const auto chunk = preprocessor->anchorCache()->getChunkBlocking(work.key.level, work.key.iz, work.key.iy, work.key.ix);
+                if (chunk.status != vc::render::ChunkStatus::Data || !chunk.payload) {
+                    throw std::runtime_error(
+                        "whole-volume anchor chunk generation failed at " + std::to_string(work.key.iz) + '/' +
+                        std::to_string(work.key.iy) + '/' + std::to_string(work.key.ix) +
+                        (chunk.error.empty() ? std::string{} : ": " + chunk.error));
+                }
+                return existingFileSize(
+                    preprocessor->anchorDataset()->chunkPath(FiberletStorageChunkKind::Anchors, work.key));
+            }
+
+            const auto anchorChunk =
+                preprocessor->anchorCache()->getChunkBlocking(work.key.level, work.key.iz, work.key.iy, work.key.ix);
+            const auto anchors = std::dynamic_pointer_cast<const FiberletAnchorChunkPayload>(anchorChunk.payload);
+            if (anchorChunk.status != vc::render::ChunkStatus::Data || !anchors)
+                throw std::runtime_error("whole-volume final anchor source is unavailable");
+            const auto compactCodec = finalDataset->codecConfig(FiberletStorageChunkKind::Anchors, work.key);
+            finalDataset->publishChunk(
+                FiberletStorageChunkKind::Anchors,
+                work.key,
+                serializeFiberletAnchors(compactCodec, anchors->anchors));
+
+            const auto fiberletChunk =
+                preprocessor->fiberletCache()->getChunkBlocking(work.key.level, work.key.iz, work.key.iy, work.key.ix);
+            if (fiberletChunk.status != vc::render::ChunkStatus::Data || !fiberletChunk.payload) {
+                throw std::runtime_error(
+                    "whole-volume fiberlet chunk generation failed at " + std::to_string(work.key.iz) + '/' +
+                    std::to_string(work.key.iy) + '/' + std::to_string(work.key.ix) +
+                    (fiberletChunk.error.empty() ? std::string{} : ": " + fiberletChunk.error));
+            }
+            if (!finalDataset->readMaterializedChunk(FiberletStorageChunkKind::FiberletPrefix, work.key))
+                throw std::runtime_error("whole-volume final tuple is incomplete after publication");
+            return finalTupleSize(*finalDataset, work.key);
+        });
+    };
+
+    while (!schedule.done()) {
+        while (running.size() < workerCount) {
+            const auto work = schedule.takeNext();
+            if (!work)
+                break;
+            running.push_back({*work, submit(*work)});
+        }
+        if (running.empty())
+            throw std::logic_error("whole-volume preprocessing schedule stalled");
+
+        auto completed = std::find_if(running.begin(), running.end(), [](auto& work) {
+            return work.result.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+        });
+        if (completed == running.end()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
-        const auto anchorChunk = preprocessor->anchorCache()->getChunkBlocking(key.level, key.iz, key.iy, key.ix);
-        const auto anchors = std::dynamic_pointer_cast<const FiberletAnchorChunkPayload>(anchorChunk.payload);
-        if (anchorChunk.status != vc::render::ChunkStatus::Data || !anchors)
-            throw std::runtime_error("whole-volume final anchor source is unavailable");
-        const auto compactCodec = finalDataset->codecConfig(FiberletStorageChunkKind::Anchors, key);
-        finalDataset->publishChunk(FiberletStorageChunkKind::Anchors, key, serializeFiberletAnchors(compactCodec, anchors->anchors));
-
-        const auto fiberletChunk = preprocessor->fiberletCache()->getChunkBlocking(key.level, key.iz, key.iy, key.ix);
-        if (fiberletChunk.status != vc::render::ChunkStatus::Data || !fiberletChunk.payload) {
-            throw std::runtime_error(
-                "whole-volume fiberlet chunk generation failed at " + std::to_string(key.iz) + '/' + std::to_string(key.iy) + '/' +
-                std::to_string(key.ix) + (fiberletChunk.error.empty() ? std::string{} : ": " + fiberletChunk.error));
-        }
-        if (!finalDataset->readMaterializedChunk(FiberletStorageChunkKind::FiberletPrefix, key))
-            throw std::runtime_error("whole-volume final tuple is incomplete after publication");
-        ++completedFiberlets;
-        fiberletPayloadBytes += finalTupleSize(*finalDataset, key);
-        fiberletProgress.update(completedFiberlets, fiberletPayloadBytes);
+        const auto bytes = completed->result.get();
+        schedule.complete(completed->work);
+        if (completed->work.kind == FiberletPreprocessWorkKind::Anchor)
+            anchorPayloadBytes += bytes;
+        else
+            fiberletPayloadBytes += bytes;
+        progress.update(
+            schedule.anchorsCompleted(),
+            anchorPayloadBytes,
+            schedule.outputsCompleted(),
+            fiberletPayloadBytes,
+            schedule.currentOutputZ());
+        running.erase(completed);
     }
-    fiberletProgress.finish();
+    progress.finish();
     preprocessor->shutdown();
     (void)vc::core::util::cleanupAtomicWriteTemporaryFiles(anchorRoot);
     (void)vc::core::util::cleanupAtomicWriteTemporaryFiles(options.outputDirectory);
     std::cout << "fiberlet_preprocess_volume status=completed"
-              << " active_chunks=" << activeChunks.size() << " anchor_chunks=" << anchorChunks.size() << " resumed_chunks=" << resumedFiberlets
+              << " active_chunks=" << activeChunks.size() << " anchor_chunks=" << anchorChunks.size()
+              << " resumed_chunks=" << completedOutputs.size()
               << " elapsed_seconds=" << std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count()
               << " anchor_cache=" << anchorRoot << " output=" << options.outputDirectory << '\n';
     return 0;

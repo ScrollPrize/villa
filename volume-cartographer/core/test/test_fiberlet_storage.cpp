@@ -645,6 +645,97 @@ TEST_CASE("Fiberlet sparse output selection conservatively covers nonempty prese
     CHECK((std::array{selected[2].iz, selected[2].iy, selected[2].ix} == std::array{2, 2, 2}));
 }
 
+TEST_CASE("Whole-volume scheduler prioritizes ready fiberlets within a Z frontier")
+{
+    const vc::render::ChunkKey outputA{0, 3, 0, 0};
+    const vc::render::ChunkKey outputB{0, 3, 0, 1};
+    const vc::render::ChunkKey outputC{0, 4, 0, 0};
+    const vc::render::ChunkKey anchorA{0, 2, 0, 0};
+    const vc::render::ChunkKey anchorB{0, 3, 0, 0};
+    const vc::render::ChunkKey anchorC{0, 4, 0, 0};
+    FiberletPreprocessSchedule schedule(
+        {outputA, outputB, outputC},
+        {{anchorA, anchorB}, {anchorB, anchorB}, {anchorC}},
+        {},
+        std::array{anchorA, anchorB});
+
+    CHECK(schedule.anchorTotal() == 3);
+    CHECK(schedule.anchorsCompleted() == 2);
+    CHECK(schedule.outputTotal() == 3);
+    CHECK(schedule.currentOutputZ() == 3);
+
+    const auto first = schedule.takeNext();
+    REQUIRE(first);
+    CHECK(first->kind == FiberletPreprocessWorkKind::Fiberlet);
+    CHECK(first->key == outputA);
+    const auto second = schedule.takeNext();
+    REQUIRE(second);
+    CHECK(second->kind == FiberletPreprocessWorkKind::Fiberlet);
+    CHECK(second->key == outputB);
+    const auto third = schedule.takeNext();
+    REQUIRE(third);
+    CHECK(third->kind == FiberletPreprocessWorkKind::Anchor);
+    CHECK(third->key == anchorC);
+
+    schedule.complete(*third);
+    CHECK_FALSE(schedule.takeNext().has_value());
+    schedule.complete(*second);
+    CHECK_FALSE(schedule.takeNext().has_value());
+    schedule.complete(*first);
+    CHECK(schedule.currentOutputZ() == 4);
+    const auto fourth = schedule.takeNext();
+    REQUIRE(fourth);
+    CHECK(fourth->kind == FiberletPreprocessWorkKind::Fiberlet);
+    CHECK(fourth->key == outputC);
+    schedule.complete(*fourth);
+    CHECK(schedule.done());
+}
+
+TEST_CASE("Whole-volume scheduler retains missing anchor-cache work for resumed outputs")
+{
+    const vc::render::ChunkKey output{0, 8, 2, 1};
+    const vc::render::ChunkKey anchor{0, 8, 2, 1};
+    FiberletPreprocessSchedule schedule({output}, {{anchor}}, std::array{output}, {});
+    CHECK(schedule.outputsCompleted() == 1);
+    CHECK_FALSE(schedule.currentOutputZ().has_value());
+    const auto work = schedule.takeNext();
+    REQUIRE(work);
+    CHECK(work->kind == FiberletPreprocessWorkKind::Anchor);
+    CHECK(work->key == anchor);
+    schedule.complete(*work);
+    CHECK(schedule.done());
+}
+
+TEST_CASE("Whole-volume scheduler prioritizes anchors that unblock incomplete outputs")
+{
+    const vc::render::ChunkKey completedOutput{0, 7, 0, 0};
+    const vc::render::ChunkKey pendingOutput{0, 8, 0, 0};
+    const vc::render::ChunkKey cacheRepairAnchor{0, 7, 0, 0};
+    const vc::render::ChunkKey blockingAnchor{0, 8, 0, 0};
+    FiberletPreprocessSchedule schedule(
+        {completedOutput, pendingOutput},
+        {{cacheRepairAnchor}, {blockingAnchor}},
+        std::array{completedOutput},
+        {});
+
+    const auto first = schedule.takeNext();
+    REQUIRE(first);
+    CHECK(first->kind == FiberletPreprocessWorkKind::Anchor);
+    CHECK(first->key == blockingAnchor);
+    schedule.complete(*first);
+    const auto second = schedule.takeNext();
+    REQUIRE(second);
+    CHECK(second->kind == FiberletPreprocessWorkKind::Fiberlet);
+    CHECK(second->key == pendingOutput);
+    schedule.complete(*second);
+    const auto third = schedule.takeNext();
+    REQUIRE(third);
+    CHECK(third->kind == FiberletPreprocessWorkKind::Anchor);
+    CHECK(third->key == cacheRepairAnchor);
+    schedule.complete(*third);
+    CHECK(schedule.done());
+}
+
 TEST_CASE("Combined fiberlet dataset exposes complete sparse graph facets")
 {
     std::mt19937_64 random(std::random_device{}());
