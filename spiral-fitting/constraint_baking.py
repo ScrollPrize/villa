@@ -253,16 +253,21 @@ def composed_slice_to_spiral_transform(frozen_models, live_slice_to_spiral):
 
 
 def bake_refusal_reasons(*, interactive, influence_active, phase_mode,
-                         dense_normals_enabled, grad_mag_enabled,
                          warmup_active=False):
     """Why a bake must be refused right now (empty when it may proceed).
 
-    Dense volume stores (lasagna normals / grad-mag) and the SDT phase bundle
-    cannot be baked proportionately (warping direction channels needs
-    per-voxel Jacobians over on-disk stores), interactive sessions ingest
-    scroll-space inputs and masks mid-run, influence grad masks are derived
-    on the pre-bake flow lattice, and a truncated (warm-up) transform is not
-    the transform the constraints were fitted against.
+    The SDT phase bundle cannot be baked (nor can its lasagna dependency),
+    interactive sessions ingest scroll-space inputs and masks mid-run,
+    influence grad masks are derived on the pre-bake flow lattice, and a
+    truncated (warm-up) transform is not the transform the constraints were
+    fitted against.
+
+    Dense lasagna supervision (normals / grad-mag) is deliberately NOT a
+    refusal: its volumes describe true scroll space and cannot be baked, but
+    the losses stay valid for as long as the inputs are still in that space
+    — so the caller runs them until the first bake and disables them there
+    (FitContext._disable_lasagna_losses_for_baked_inputs) instead of
+    refusing resets outright.
     """
     reasons = []
     if interactive:
@@ -277,14 +282,6 @@ def bake_refusal_reasons(*, interactive, influence_active, phase_mode,
         reasons.append(
             'the SDT phase bundle is enabled: the surf-SDT store cannot be '
             'baked')
-    if dense_normals_enabled:
-        reasons.append(
-            'dense normals are enabled: the lasagna direction channels '
-            'cannot be baked')
-    if grad_mag_enabled:
-        reasons.append(
-            'gradient-magnitude spacing is enabled: the grad-mag store '
-            'cannot be baked')
     if warmup_active:
         reasons.append(
             'transform warm-up truncation is active: constraints must be '

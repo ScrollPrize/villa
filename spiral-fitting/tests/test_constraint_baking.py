@@ -262,12 +262,12 @@ class RefusalGateTests(unittest.TestCase):
 
     def test_no_reasons_when_everything_is_bakeable(self):
         self.assertEqual(constraint_baking.bake_refusal_reasons(
-            interactive=False, influence_active=False, phase_mode=False,
-            dense_normals_enabled=False, grad_mag_enabled=False), [])
+            interactive=False, influence_active=False, phase_mode=False), [])
 
     def test_each_unbakeable_input_is_named(self):
+        # Dense lasagna supervision (normals/grad-mag) is deliberately not a
+        # refusal: it runs until the first bake and is disabled there.
         flags = ('interactive', 'influence_active', 'phase_mode',
-                 'dense_normals_enabled', 'grad_mag_enabled',
                  'warmup_active')
         for flag in flags:
             kwargs = {name: name == flag for name in flags}

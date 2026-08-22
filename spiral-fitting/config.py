@@ -282,7 +282,10 @@ class Config:
         # input is baked through its inverse into (near-)canonical spiral
         # space, and the live parameters restart from the identity (dr
         # preserved). 0 disables resets. Headless fits only; refused while
-        # SDT/lasagna dense losses or influence windows are enabled.
+        # SDT phase losses or influence windows are enabled. Dense lasagna
+        # losses (normals/grad-mag) run until the first reset and are then
+        # disabled: their volume stores describe true scroll space, which
+        # the baked inputs leave at that point.
         self.optimizer_reset_interval = 0
         # Warn when a bake's round-trip probe error (RK4 forward/inverse
         # inconsistency, in scroll voxels) exceeds this; the error is

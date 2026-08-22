@@ -2921,13 +2921,17 @@ class FitContext:
                 interactive=self.interactive_driver is not None,
                 influence_active=False,
                 phase_mode=self.phase_mode,
-                dense_normals_enabled=self.dense_normals_enabled,
-                grad_mag_enabled=self.grad_mag_spacing_enabled,
             )
             if reasons:
                 raise RuntimeError(
                     'optimizer_reset_interval > 0 but constraint bakes would '
                     'be refused: ' + '; '.join(reasons))
+            if self.dist.is_main_process and (
+                    self.dense_normals_enabled
+                    or self.grad_mag_spacing_enabled):
+                print('note: dense lasagna losses (normals/grad-mag) run '
+                      'only until the first constraint-bake reset, then are '
+                      'disabled (their stores describe true scroll space)')
 
         # A resumed baked checkpoint's host inputs loaded from disk in scroll
         # space; replay the frozen bake stack over them before anything below
@@ -3180,6 +3184,32 @@ class FitContext:
         if self.shell_map is not None:
             self.shell_map = self._make_shell_polar_map()
 
+    def _disable_lasagna_losses_for_baked_inputs(self):
+        """End dense lasagna supervision at the first bake.
+
+        The normal/grad-mag stores are volumes describing true scroll space
+        and cannot be baked (the direction channels would need per-voxel
+        Jacobian rotation over on-disk stores), but their losses stay valid
+        for as long as the inputs are still in that space. So they run until
+        the first reset; from the first bake onwards the resident inputs no
+        longer live in the space the stores describe, the losses are
+        structurally disabled, and the resident brick pools are released.
+        """
+        if not (self.dense_normals_enabled or self.grad_mag_spacing_enabled):
+            return
+        self.dense_normals_enabled = False
+        self.grad_mag_spacing_enabled = False
+        volume, self.lasagna_volume = self.lasagna_volume, None
+        self._lasagna_store = None
+        if volume is not None:
+            store = volume.get('store')
+            if store is not None:
+                store.close()
+        if self.dist.is_main_process:
+            print('dense lasagna losses (normals/grad-mag) disabled: their '
+                  'stores describe true scroll space, which the baked inputs '
+                  'have left; released the resident brick pools')
+
     def bake_and_reset(self, completed_iterations):
         """Freeze the live transform, bake every input through it, reset.
 
@@ -3187,7 +3217,8 @@ class FitContext:
         boundary (parameters are identical post-allreduce; baking consumes no
         RNG). Refused whenever an input in play cannot be baked
         proportionately — the caller should surface the error rather than
-        skip silently.
+        skip silently. Dense lasagna losses are not a refusal: they run
+        until this first bake and are disabled here.
         """
         reasons = constraint_baking.bake_refusal_reasons(
             interactive=self.interactive_driver is not None,
@@ -3195,8 +3226,6 @@ class FitContext:
                 self.influence_state is not None
                 and self.influence_state.active),
             phase_mode=self.phase_mode,
-            dense_normals_enabled=self.dense_normals_enabled,
-            grad_mag_enabled=self.grad_mag_spacing_enabled,
         )
         if reasons:
             raise RuntimeError(
@@ -3233,6 +3262,7 @@ class FitContext:
             self.spiral_and_transform.get_slice_to_spiral_transform())
         self.frozen_epochs.append(snapshot)
         self._baked_epoch_count = len(self.frozen_epochs)
+        self._disable_lasagna_losses_for_baked_inputs()
         self._apply_canonical_space_state()
 
         constraint_baking.reset_live_transform_(self.spiral_and_transform)
@@ -3292,7 +3322,9 @@ class FitContext:
             self._baked_epoch_count = epoch_index
         if self.frozen_epochs:
             # The restored live parameters are post-reset values; the frame
-            # they were trained in is the canonical one.
+            # they were trained in is the canonical one, and dense lasagna
+            # supervision ended at that fit's first bake.
+            self._disable_lasagna_losses_for_baked_inputs()
             self._apply_canonical_space_state()
 
     def composed_slice_to_spiral_transform(self):
