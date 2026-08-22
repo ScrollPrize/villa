@@ -3131,7 +3131,15 @@
   at the current checkpoint. Its finite positive integration spacing is in
   base voxels. Arbitrary edge/grid/horizon boundaries linearly interpolate the
   piecewise-linear cumulative cost implied by piecewise-constant segment
-  densities. Each interval cost is multiplied by `W^s`, where `0 < W <= 1`
+  densities. Before geometric weighting, replay linearly blends each decoded
+  subsegment density with the decoded-profile average of its complete
+  fiberlet: `effective = (1-A)*average + A*subsegment`, where finite
+  `0 <= A <= 1`. The average is
+  `sum(decoded_density * segment_length) / fiberlet_length`; it is not derived
+  from or normalized to the separately stored whole-edge cost. `A=0` is a
+  constant density within each fiberlet, `A=1` is the stored profile, and the
+  default is 1. The blend is replay-only and does not participate in anchor or
+  fiberlet cache identity. Each interval cost is multiplied by `W^s`, where `0 < W <= 1`
   is the configured per-base-voxel weight and `s` is the interval midpoint's
   base distance from the checkpoint after the configured finite nonnegative
   delay `L`: the exponent is `max(0, s-L)`, so weight remains one through the
@@ -3315,6 +3323,20 @@
 - `--stats` replaces the concise bar with detailed machine-readable stage,
   chunk, restart, evaluator, cache, visualization, and publication diagnostics.
   It does not change scheduling, generated payloads, tracing, or artifacts.
+- Repeated `--decision-window BEGIN,END` options require `--stats` and retain
+  complete decision records only when the selected matched reference arc is in
+  an inclusive window. They alter diagnostic materialization only, not search,
+  matching, restart history, cache identity, or generated chunks. Serialized
+  route geometry begins at the checkpoint and ends at the lookahead; it must
+  not rebuild the already committed prefix.
+- `fiberlet-replay --arc BEGIN` selects an absolute base-voxel reference start
+  for both greedy and graph replay; `--length` then limits that focused
+  interval. Greedy starts from the sampled point and tangent at `BEGIN`, and
+  graph replay seeds at the same reference arc. A focused run retains the full
+  first-control-point corridor's cache identity and containment predicate but
+  schedules only the focused interval. Missing chunks therefore have the same
+  complete contents as full replay chunks; focused geometry must never be
+  persisted under a full-corridor identity.
 - On-demand chunk diagnostics bind every generated anchor/fiberlet chunk to a
   stable full-interval schedule index and nearest reference arc. Generated
   counts are monotone, while spatial chunks may complete out of schedule order.

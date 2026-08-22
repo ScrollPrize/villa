@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -62,6 +63,7 @@ struct FiberletGraphReplayConfig {
     double geometricCostWeightPerBaseVoxel = 1.0;
     double geometricCostDelayBaseVoxels = 0.0;
     double costIntegrationStepBaseVoxels = 16.0;
+    double costProfileWeight = 1.0;
     size_t searchWidth = 0;
     double pruneDistanceBaseVoxels = 48.0;
     size_t maximumGeneratedStatesPerIteration = 1'000'000;
@@ -72,6 +74,7 @@ struct FiberletGraphReplayConfig {
     std::optional<double> referenceEndArcBase;
     std::optional<FiberletStorageKey> initialSeedKey;
     bool recordDecisionDiagnostics = false;
+    std::vector<std::pair<double, double>> decisionDiagnosticReferenceArcWindowsBase;
 };
 
 struct FiberletGraphReplayMatch {
@@ -116,6 +119,7 @@ struct FiberletGraphReplayDecisionRoute {
     FiberletGraphReplayCost committedEdgeCost;
     FiberletGraphReplayCost committedTransitionCost;
     double committedPathLengthPredictionVoxels = 0.0;
+    double routePointsBeginPathLengthPredictionVoxels = 0.0;
     double pathLengthPredictionVoxels = 0.0;
     double completePathLengthPredictionVoxels = 0.0;
     double weightedEdgeLoss = 0.0;

@@ -4079,7 +4079,15 @@ FiberReplayTraceResult traceFiberReplay(
     }
 
     const auto reference = makePolylineArcGeometry(request.fiber.linePointsXyzBase);
-    const double startArcBase = reference.vertexArcs[startLineIndex];
+    const double controlPointStartArcBase = reference.vertexArcs[startLineIndex];
+    if (request.referenceBeginArcBase.has_value() &&
+        (!std::isfinite(*request.referenceBeginArcBase) ||
+         *request.referenceBeginArcBase < controlPointStartArcBase - kEpsilon)) {
+        throw std::invalid_argument(
+            "fiber replay reference begin must be finite and not precede the start control point");
+    }
+    const double startArcBase = request.referenceBeginArcBase.value_or(
+        controlPointStartArcBase);
     if (request.referenceEndArcBase.has_value() &&
         (!std::isfinite(*request.referenceEndArcBase) ||
          *request.referenceEndArcBase > reference.length() + kEpsilon)) {

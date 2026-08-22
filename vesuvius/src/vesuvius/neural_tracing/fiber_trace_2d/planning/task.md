@@ -1,23 +1,28 @@
-# Task: restore baseline fiberlet search around weighted lookahead
+# Task: diagnose persistent wide-radius fiberlet replay failures
 
-Fix the regressions introduced by checkpoint-relative subsegment scoring.
+Use a small extraction radius to obtain a matched, correct fiberlet replay, then
+compare it with the best radius-768 replay's two persistent failures.
 
-The fiberlet graph replay must remain identical to the prior search design except
-for how cost is integrated from the current checkpoint through the lookahead:
+- Preserve the completed larger-lookahead sweep results in durable documentation.
+- Run the same replay objective and search settings at a small radius and confirm
+  whether it follows the reference through the two wide-radius failure regions.
+- Record decision diagnostics for both runs and identify where their selected
+  routes first diverge, which alternatives were retained, and which edge, join,
+  or weighted profile costs cause the wide-radius search to prefer the wrong path.
+- Assess whether route collections can support offline parameter tuning without
+  rerunning complete traces. Distinguish objective-only rescoring from search
+  parameters that change which route candidates are generated.
 
-- Preserve the accumulated route cost before the current checkpoint.
-- From the checkpoint onward, integrate stored subsegment costs with the
-  configured integration step, delay, and geometric falloff.
-- With weight one, behavior should remain close to the old baseline. Decoded
-  subsegment costs remain the source of truth and should naturally add to the
-  whole-fiberlet cost apart from codec and floating-point rounding; do not
-  rescale them to force exact equality.
-- Cost integration must be incremental and cheap. It must not repeatedly walk
-  complete route histories or rescan complete segment profiles.
-- Exact and bounded search must retain effective admissible pruning under the
-  new objective.
-- Use one general integration algorithm for every weight. At weight one,
-  changing integration spacing may cause small interpolation or accumulation
-  differences, but must not cause a material route or failure-count regression.
-- Validate quality and performance against the actual pre-change baseline, not
-  against a new-profile control mislabeled as baseline.
+## Deferred evaluation options
+
+- Replace the smaller-radius proxy with an oracle over the same wide-radius
+  graph that minimizes the ordinary replay objective while constraining route
+  geometry to the reference threshold. The constraint must use the configured
+  Lasagna-normal ellipsoid, not an unrelated isotropic corridor.
+- Compare the unconstrained winner with that best admissible route from the
+  same seed, checkpoint history, graph, and cost model. Report both geometric
+  error components and the complete ranked objective decomposition.
+- Later evaluate a tolerant correctness rule that permits a route to leave the
+  reference threshold temporarily when it returns within a bounded base-arc
+  distance. This needs explicit limits on excursion length and severity so it
+  does not hide a real fiber switch when the annotated reference is accurate.

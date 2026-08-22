@@ -741,6 +741,7 @@ struct GeometricReplayCostConfig {
     double weightPerBaseVoxel = 1.0;
     double delayPredictionVoxels = 0.0;
     double integrationStepPredictionVoxels = 1.0;
+    double profileWeight = 1.0;
 };
 
 double geometricCostWeight(
@@ -765,6 +766,7 @@ double integrateArcCostProfile(
         throw std::invalid_argument("fiberlet cost profile interval is invalid");
     }
     double profileLength = 0.0;
+    double profileCost = 0.0;
     for (size_t segment = 0; segment < profile.segmentLengthsPredictionVoxels.size(); ++segment) {
         const double segmentLength = profile.segmentLengthsPredictionVoxels[segment];
         const double density = profile.segmentCostDensities[segment];
@@ -773,6 +775,7 @@ double integrateArcCostProfile(
             throw std::invalid_argument("fiberlet cost profile is invalid");
         }
         profileLength += segmentLength;
+        profileCost += density * segmentLength;
     }
     const double lengthTolerance =
         1.0e-4 * std::max(1.0, edgeLengthPredictionVoxels);
@@ -781,6 +784,7 @@ double integrateArcCostProfile(
         throw std::invalid_argument(
             "fiberlet cost profile length differs from its edge length");
     }
+    const double averageDensity = profileCost / profileLength;
 
     double result = 0.0;
     size_t segment = 0;
@@ -846,7 +850,10 @@ double integrateArcCostProfile(
         }
         const double weightPosition =
             0.5 * (weightRegionBegin + weightRegionEnd);
-        result += profile.segmentCostDensities[segment] * (partEnd - cursor) *
+        const double density =
+            (1.0 - config.profileWeight) * averageDensity +
+            config.profileWeight * profile.segmentCostDensities[segment];
+        result += density * (partEnd - cursor) *
             geometricCostWeight(config, weightPosition);
         cursor = partEnd;
         if (cursor >= segmentEnd - kReplayEpsilon &&
@@ -1033,7 +1040,9 @@ DecisionPersistentRouteScore scorePersistentRouteForDecision(
         !(config.delayPredictionVoxels >= 0.0) ||
         !std::isfinite(config.delayPredictionVoxels) ||
         !(config.integrationStepPredictionVoxels > 0.0) ||
-        !std::isfinite(config.integrationStepPredictionVoxels)) {
+        !std::isfinite(config.integrationStepPredictionVoxels) ||
+        !(config.profileWeight >= 0.0) || config.profileWeight > 1.0 ||
+        !std::isfinite(config.profileWeight)) {
         throw std::invalid_argument("persistent weighted route interval is invalid");
     }
     std::vector<const PersistentRouteHistory*> suffix;
@@ -1151,6 +1160,65 @@ std::vector<cv::Vec3d> persistentRoutePoints(const FiberletReplayGraphSource& gr
         auto points = graph.routePoints(node->arc);
         if (!points.empty() && !result.empty())
             points.erase(points.begin());
+        result.insert(result.end(), points.begin(), points.end());
+    }
+    return result;
+}
+
+std::vector<cv::Vec3d> persistentRoutePointsBetween(
+    const FiberletReplayGraphSource& graph,
+    const PersistentRouteCandidate& route,
+    double beginPathLengthPredictionVoxels,
+    double endPathLengthPredictionVoxels)
+{
+    if (!(beginPathLengthPredictionVoxels >= 0.0) ||
+        !(endPathLengthPredictionVoxels >= beginPathLengthPredictionVoxels) ||
+        !std::isfinite(beginPathLengthPredictionVoxels) ||
+        !std::isfinite(endPathLengthPredictionVoxels)) {
+        throw std::invalid_argument("persistent route geometry interval is invalid");
+    }
+    std::vector<const PersistentRouteHistory*> suffix;
+    for (auto node = route.tail;
+         node != nullptr &&
+         node->cumulativePathLength > beginPathLengthPredictionVoxels +
+             kReplayEpsilon;
+         node = node->parent) {
+        const double edgeBegin = node->parent != nullptr
+            ? node->parent->cumulativePathLength
+            : 0.0;
+        if (edgeBegin < endPathLengthPredictionVoxels - kReplayEpsilon)
+            suffix.push_back(node.get());
+    }
+    if (suffix.empty())
+        return {};
+    std::reverse(suffix.begin(), suffix.end());
+
+    std::vector<cv::Vec3d> result;
+    for (const auto* node : suffix) {
+        const double edgeBegin = node->parent != nullptr
+            ? node->parent->cumulativePathLength
+            : 0.0;
+        const double edgeEnd = node->cumulativePathLength;
+        const double overlapBegin =
+            std::max(beginPathLengthPredictionVoxels, edgeBegin);
+        const double overlapEnd =
+            std::min(endPathLengthPredictionVoxels, edgeEnd);
+        if (!(overlapEnd > overlapBegin + kReplayEpsilon))
+            continue;
+
+        const auto edgeGeometry = makePolylineArcGeometry(
+            graph.routePoints(node->arc));
+        const double edgeLength = edgeEnd - edgeBegin;
+        const double geometryBegin = edgeGeometry.length() *
+            (overlapBegin - edgeBegin) / edgeLength;
+        const double geometryEnd = edgeGeometry.length() *
+            (overlapEnd - edgeBegin) / edgeLength;
+        auto points = slicePolylineArc(
+            edgeGeometry, geometryBegin, geometryEnd);
+        if (!result.empty() && !points.empty() &&
+            length(result.back() - points.front()) <= kReplayEpsilon) {
+            points.erase(points.begin());
+        }
         result.insert(result.end(), points.begin(), points.end());
     }
     return result;
@@ -2457,12 +2525,18 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
         !std::isfinite(config.geometricCostDelayBaseVoxels) ||
         !(config.costIntegrationStepBaseVoxels > 0.0) ||
         !std::isfinite(config.costIntegrationStepBaseVoxels) ||
+        !(config.costProfileWeight >= 0.0) ||
+        config.costProfileWeight > 1.0 ||
+        !std::isfinite(config.costProfileWeight) ||
         (config.searchWidth != 0 && config.searchWidth < config.beamWidth) ||
         !(config.pruneDistanceBaseVoxels > 0.0) || !std::isfinite(config.pruneDistanceBaseVoxels) || !(config.errorThresholdBaseVoxels >= 0.0) ||
         !std::isfinite(config.errorThresholdBaseVoxels) || !(config.matchRefineSteps >= 0.0) || !std::isfinite(config.matchRefineSteps) ||
         !(config.minimumResetAdvanceBaseVoxels > 0.0) || !std::isfinite(config.minimumResetAdvanceBaseVoxels) ||
         !(config.referenceBeginArcBase >= 0.0) || !std::isfinite(config.referenceBeginArcBase) || !(normalWorkingToBaseScale > 0.0) ||
-        !std::isfinite(normalWorkingToBaseScale) || (config.referenceEndArcBase.has_value() && !std::isfinite(*config.referenceEndArcBase))) {
+        !std::isfinite(normalWorkingToBaseScale) || (config.referenceEndArcBase.has_value() && !std::isfinite(*config.referenceEndArcBase)) ||
+        std::any_of(config.decisionDiagnosticReferenceArcWindowsBase.begin(), config.decisionDiagnosticReferenceArcWindowsBase.end(), [](const auto& window) {
+            return !(window.first >= 0.0) || !(window.second >= window.first) || !std::isfinite(window.first) || !std::isfinite(window.second);
+        })) {
         throw std::invalid_argument("fiberlet graph replay configuration is invalid");
     }
     const auto reference = makePolylineArcGeometry(referencePointsBaseXYZ);
@@ -2628,7 +2702,8 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
             predictionToBaseScale,
             config.geometricCostWeightPerBaseVoxel,
             config.geometricCostDelayBaseVoxels / predictionToBaseScale,
-            config.costIntegrationStepBaseVoxels / predictionToBaseScale};
+            config.costIntegrationStepBaseVoxels / predictionToBaseScale,
+            config.costProfileWeight};
         PersistentLogicalRouteRegistry logicalRoutes;
         PersistentRouteCandidate initialBeam;
         initialBeam.seed = seed->node.id;
@@ -2910,7 +2985,12 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
             const auto& selectedEvaluation = selectedRoute.evaluation;
             indexSelectedRouteSuffix(selectedEvaluation);
             previousReferenceArc = selectedEvaluation->matchedReferenceArcBase;
-            if (config.recordDecisionDiagnostics) {
+            const bool inDecisionDiagnosticWindow = config.decisionDiagnosticReferenceArcWindowsBase.empty() ||
+                std::any_of(
+                    config.decisionDiagnosticReferenceArcWindowsBase.begin(),
+                    config.decisionDiagnosticReferenceArcWindowsBase.end(),
+                    [&](const auto& window) { return previousReferenceArc >= window.first && previousReferenceArc <= window.second; });
+            if (config.recordDecisionDiagnostics && inDecisionDiagnosticWindow) {
                 FiberletGraphReplayDecision decision;
                 decision.routePointIndex = selectedEvaluation->routePointCount == 0 ? 0 : selectedEvaluation->routePointCount - 1;
                 decision.referenceArcBase = previousReferenceArc;
@@ -2945,12 +3025,17 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
                     FiberletGraphReplayDecisionRoute route;
                     route.prefixLogicalArcs = persistentRouteLogicalArcs(entry.prefix);
                     route.logicalArcs = persistentRouteLogicalArcs(entry.lookahead);
-                    route.routePointsBaseXYZ = persistentRoutePoints(graph, entry.lookahead, cv::Vec3d(seed->node.positionBaseXYZ));
+                    route.routePointsBaseXYZ = persistentRoutePointsBetween(
+                        graph,
+                        entry.lookahead,
+                        currentCheckpoint,
+                        entry.scoredPathLength);
                     route.edgeCost = entry.scoredEdgeCost;
                     route.transitionCost = entry.scoredTransitionCost;
                     route.committedEdgeCost = entry.prefix.edgeCost;
                     route.committedTransitionCost = entry.prefix.transitionCost;
                     route.committedPathLengthPredictionVoxels = entry.prefix.pathLength;
+                    route.routePointsBeginPathLengthPredictionVoxels = currentCheckpoint;
                     route.pathLengthPredictionVoxels = entry.scoredPathLength;
                     route.completePathLengthPredictionVoxels = entry.completePathLength;
                     route.weightedEdgeLoss = entry.weightedEdgeLoss;
@@ -3117,6 +3202,9 @@ nlohmann::json fiberletGraphReplayJson(const FiberletGraphReplayResult& replay, 
     const auto arcIdJson = [&](const DirectedFiberletStorageId& arc) {
         return nlohmann::json::array({storageKeyJson(arc.fiberlet.first), storageKeyJson(arc.fiberlet.second), arc.reverse});
     };
+    nlohmann::json diagnosticWindows = nlohmann::json::array();
+    for (const auto& [begin, end] : config.decisionDiagnosticReferenceArcWindowsBase)
+        diagnosticWindows.push_back(nlohmann::json::array({begin, end}));
     nlohmann::json root = {
         {"format", "vc_fiberlet_graph_replay"},
         {"version", 3},
@@ -3143,6 +3231,7 @@ nlohmann::json fiberletGraphReplayJson(const FiberletGraphReplayResult& replay, 
              {"geometric_cost_delay_prediction_voxels", config.geometricCostDelayBaseVoxels / replay.predictionToBaseScale},
              {"cost_integration_step_base_voxels", config.costIntegrationStepBaseVoxels},
              {"cost_integration_step_prediction_voxels", config.costIntegrationStepBaseVoxels / replay.predictionToBaseScale},
+             {"cost_profile_weight", config.costProfileWeight},
              {"maximum_generated_states_per_iteration", config.maximumGeneratedStatesPerIteration},
              {"threshold", fiberReplayThresholdDescriptorJson(config.errorThresholdBaseVoxels)},
              {"match_refine_steps", config.matchRefineSteps},
@@ -3151,6 +3240,7 @@ nlohmann::json fiberletGraphReplayJson(const FiberletGraphReplayResult& replay, 
              {"reference_end_arc_base", replay.referenceEndArcBase},
              {"initial_seed_key", config.initialSeedKey.has_value() ? storageKeyJson(*config.initialSeedKey) : nlohmann::json(nullptr)},
              {"record_decision_diagnostics", config.recordDecisionDiagnostics},
+             {"decision_diagnostic_reference_arc_windows_base", std::move(diagnosticWindows)},
          }},
         {"reference_begin_arc_base", replay.referenceBeginArcBase},
         {"reference_end_arc_base", replay.referenceEndArcBase},
@@ -3227,6 +3317,7 @@ nlohmann::json fiberletGraphReplayJson(const FiberletGraphReplayResult& replay, 
                     {"committed_edge_cost", costJson(route.committedEdgeCost)},
                     {"committed_transition_cost", costJson(route.committedTransitionCost)},
                     {"committed_path_length_prediction_voxels", route.committedPathLengthPredictionVoxels},
+                    {"route_points_begin_path_length_prediction_voxels", route.routePointsBeginPathLengthPredictionVoxels},
                     {"path_length_prediction_voxels", route.pathLengthPredictionVoxels},
                     {"complete_path_length_prediction_voxels", route.completePathLengthPredictionVoxels},
                     {"weighted_edge_loss", route.weightedEdgeLoss},

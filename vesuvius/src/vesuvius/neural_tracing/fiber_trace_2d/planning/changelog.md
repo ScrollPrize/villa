@@ -1,5 +1,16 @@
 # 2026-08-22: geometrically weighted fiberlet substep costs
 
+- Added replay-only `--cost-profile-weight` in `[0,1]` to blend each
+  fiberlet's decoded average density with its decoded subsegment densities
+  before geometric weighting. The default remains 1 and cache identity is
+  unchanged.
+- On the full Paris4 radius-768 hot-cache corridor, delayed `W=0.99` falloff
+  produced 5/5/3/2/2 failures at profile weights 0/0.25/0.5/0.75/1. With
+  `W=1`, profile weight zero exactly reproduced the two aggregate-baseline
+  failure arcs.
+- A matched-terminal-weight lookahead sweep found no zero-or-one-failure
+  configuration. H384/T0.25 retained two failures; every H512 setting produced
+  four, H768 produced three or four, and H768/T0.5 hit the route-state limit.
 - Removed two long-route quadratic paths discovered after the 5k validation.
   Score initialization now reads cumulative prefix scalars and visits only the
   checkpoint/lookahead suffix, while logical-route cleanup uses a bounded
@@ -32,6 +43,13 @@
 - On the Paris4 5,000-base-voxel interval, `W=0.99` at both 16- and
   32-base-voxel spacing completed with zero fiberlet failures, matching the
   unweighted stored-profile run.
+- Added bounded decision windows and common-start `fiberlet-replay --arc`
+  diagnostics. Two Paris4 wide-radius failures now have constrained-radius
+  proxy routes and ranked alternative cost decompositions without full-fiber
+  reruns; the proxy is explicitly not treated as a same-graph oracle.
+- Clipped retained diagnostic polylines exactly at their checkpoint and
+  lookahead boundaries. The diagnostic-filter regression now also proves that
+  filtering leaves selected geometry and failure counts unchanged.
 
 # 2026-08-22: fractional fiberlet endpoint evaluation
 
