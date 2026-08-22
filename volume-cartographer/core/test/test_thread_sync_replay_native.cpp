@@ -1,19 +1,57 @@
 #include "thread_sync_replay/Replay.hpp"
+#include "thread_sync_replay/RenderValgrind.hpp"
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
 #include <cmath>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace replay = vc::thread_sync_replay;
 
 namespace
 {
+
+class TemporaryDirectory
+{
+public:
+    TemporaryDirectory()
+    {
+        path = std::filesystem::temp_directory_path() /
+               ("vc-thread-sync-replay-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        std::filesystem::create_directories(path);
+    }
+
+    ~TemporaryDirectory() { std::filesystem::remove_all(path); }
+
+    std::filesystem::path path;
+};
+
+void writeText(const std::filesystem::path& path, const std::string& value)
+{
+    std::ofstream stream(path);
+    REQUIRE(stream.good());
+    stream << value;
+}
+
+std::string callgrindProfile(std::int64_t thread, const std::vector<std::int64_t>& totals)
+{
+    std::string result = "thread: " + std::to_string(thread) + "\n";
+    result += "events: Ir Dr Dw I1mr D1mr D1mw ILmr DLmr DLmw Bc Bcm Bi Bim\n";
+    result += "totals:";
+    for (const auto value : totals) {
+        result += " " + std::to_string(value);
+    }
+    return result + "\n";
+}
 
 replay::EventProfile representativeProfile()
 {
@@ -25,7 +63,9 @@ replay::EventProfile representativeProfile()
         {"D1mw", 1},
         {"DLmr", 1},
         {"DLmw", 0},
+        {"Bc", 20},
         {"Bcm", 2},
+        {"Bi", 4},
         {"Bim", 1},
     };
 }
@@ -45,6 +85,16 @@ replay::EventCostModel dataReadModel()
             },
         .coefficients_ns = std::vector<double>(7, 1.0),
     };
+}
+
+replay::EventProfile scaledProfile(std::int64_t scale)
+{
+    auto result = representativeProfile();
+    for (auto& [name, value] : result) {
+        (void)name;
+        value *= scale;
+    }
+    return result;
 }
 
 }  // namespace
@@ -109,6 +159,210 @@ TEST_CASE("native replay attributes a sole zero-weight trailing window")
     const auto durations = graph.assignCosts({{1, 120.0}}, 0.0, "equal");
     CHECK(durations[0] == 0.0);
     CHECK(durations[1] == 120.0);
+}
+
+TEST_CASE("native replay attributes explicit chronological window costs")
+{
+    replay::Graph graph({
+        {.thread = 1, .kind = "work"},
+        {.thread = 1, .kind = "work_quantum"},
+        {.thread = 1, .kind = "work"},
+        {.thread = 1, .kind = "thread_finish"},
+    });
+    const auto windows = graph.attributionWindows(0.5);
+    REQUIRE(windows.at(1).size() == 2);
+    CHECK(windows.at(1)[0].units == 1.0);
+    CHECK(windows.at(1)[1].units == 0.5);
+
+    const auto durations = graph.assignWindowCosts({{1, {10.0, 30.0}}}, 0.5, "front");
+    CHECK(durations[0] == 10.0);
+    CHECK(durations[1] == 0.0);
+    CHECK(durations[2] == 30.0);
+    CHECK(durations[3] == 0.0);
+}
+
+TEST_CASE("native replay rejects malformed explicit window costs")
+{
+    replay::Graph graph({
+        {.thread = 1, .kind = "work"},
+        {.thread = 1, .kind = "work_quantum"},
+        {.thread = 2, .kind = "work"},
+    });
+    CHECK_THROWS_AS(graph.assignWindowCosts({{1, {1.0}}}, 0.5, "front"), std::runtime_error);
+    CHECK_THROWS_AS(graph.assignWindowCosts({{1, {1.0}}, {2, {2.0, 3.0}}}, 0.5, "front"), std::runtime_error);
+    CHECK_THROWS_AS(graph.assignWindowCosts({{1, {-1.0}}, {2, {2.0}}}, 0.5, "front"), std::runtime_error);
+}
+
+TEST_CASE("native Callgrind parser preserves chronological deltas and totals")
+{
+    TemporaryDirectory temporary;
+    const auto prefix = temporary.path / "callgrind.out";
+    writeText(temporary.path / "callgrind.out.1-01", callgrindProfile(1, {10, 2, 1, 0, 1, 0, 0, 0, 0, 2, 1, 0, 0}));
+    writeText(temporary.path / "callgrind.out.2-01", callgrindProfile(1, {20, 4, 2, 0, 2, 0, 0, 1, 0, 4, 2, 0, 0}));
+    writeText(temporary.path / "callgrind.out-01", callgrindProfile(1, {3, 1, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0}));
+
+    const auto parsed = replay::parsePeriodicCallgrind(prefix);
+    CHECK(parsed.periodic_dump_count == 2);
+    REQUIRE(parsed.slices.at(1).size() == 3);
+    CHECK(parsed.slices.at(1)[0].at("Ir") == 10);
+    CHECK(parsed.slices.at(1)[1].at("Ir") == 20);
+    CHECK(parsed.slices.at(1)[2].at("Ir") == 3);
+    CHECK(parsed.totals.at(1).at("Ir") == 33);
+    CHECK(parsed.totals.at(1).at("D1mr") == 3);
+}
+
+TEST_CASE("native Callgrind parser ignores zero residual-only idle threads")
+{
+    TemporaryDirectory temporary;
+    const auto prefix = temporary.path / "callgrind.out";
+    writeText(temporary.path / "callgrind.out.1-01", callgrindProfile(1, {10, 2, 1}));
+    writeText(temporary.path / "callgrind.out.1-02", callgrindProfile(2, {0, 0, 0}));
+    writeText(temporary.path / "callgrind.out-01", callgrindProfile(1, {0, 0, 0}));
+    writeText(temporary.path / "callgrind.out-02", callgrindProfile(2, {0, 0, 0}));
+    writeText(temporary.path / "callgrind.out-03", callgrindProfile(3, {0, 0, 0}));
+
+    const auto parsed = replay::parsePeriodicCallgrind(prefix);
+    REQUIRE(parsed.totals.size() == 1);
+    CHECK(parsed.totals.contains(1));
+    CHECK_FALSE(parsed.totals.contains(2));
+    CHECK_FALSE(parsed.totals.contains(3));
+}
+
+TEST_CASE("native Callgrind parser rejects nonzero residual-only threads")
+{
+    TemporaryDirectory temporary;
+    const auto prefix = temporary.path / "callgrind.out";
+    writeText(temporary.path / "callgrind.out.1-01", callgrindProfile(1, {10, 2, 1}));
+    writeText(temporary.path / "callgrind.out-01", callgrindProfile(1, {0, 0, 0}));
+    writeText(temporary.path / "callgrind.out-02", callgrindProfile(2, {1, 0, 0}));
+
+    CHECK_THROWS_WITH_AS(replay::parsePeriodicCallgrind(prefix), doctest::Contains("Callgrind residual-only thread contains measured work"), std::runtime_error);
+}
+
+TEST_CASE("native Callgrind synchronization parser pairs measured futex wakeups")
+{
+    TemporaryDirectory temporary;
+    const auto trace = temporary.path / "scheduler.log";
+    writeText(
+        trace,
+        "SYSCALL[2,2](202) sys_futex ( 0xbbb, 393, 0, 0x0, 0x0 ) --> [async] ...\n"
+        "SYSCALL[2,1](228) sys_clock_gettime( 1, 0xaaa )[sync] --> Success(0x0)\n"
+        "SYSCALL[2,1](202) sys_futex ( 0xbbb, 129, 1, 0x0, 0x0 ) --> [async] ...\n"
+        "SYSCALL[2,1](202) ... [async] --> Success(0x1)\n"
+        "SYSCALL[2,2](202) ... [async] --> Success(0x0)\n"
+        "-- SCHED[2]: releasing lock (VG_(scheduler):timeslice) -> VgTs_Yielding\n"
+        "SYSCALL[2,2](202) sys_futex ( 0xccc, 393, 0, 0x0, 0x0 ) --> [async] ...\n"
+        "SYSCALL[2,1](228) sys_clock_gettime( 1, 0xaaa )[sync] --> Success(0x0)\n"
+        "-- SCHED[9]: releasing lock (VG_(scheduler):timeslice) -> VgTs_Yielding\n");
+
+    const auto parsed = replay::parseMeasuredCallgrindSync(trace);
+    REQUIRE(parsed.events.size() == 4);
+    CHECK(parsed.parsed_futex_calls == 2);
+    CHECK(parsed.blocking_futex_waits == 1);
+    CHECK(parsed.futex_happens_before_edges == 1);
+    CHECK(parsed.dropped_pre_window_edges == 0);
+    CHECK(parsed.scheduler.full_quanta.at(2) == 1);
+    CHECK(parsed.events[0].kind == "futex_wake");
+    CHECK(parsed.events[1].kind == "futex_resume");
+    CHECK(parsed.events[1].dependencies.back().kind == "futex_wake");
+    CHECK(parsed.events[2].kind == "work_quantum");
+    CHECK(parsed.events[3].kind == "futex_wait");
+    CHECK(parsed.events[3].blocked);
+}
+
+TEST_CASE("native Callgrind synchronization parser preserves measured quantum order")
+{
+    TemporaryDirectory temporary;
+    const auto trace = temporary.path / "scheduler.log";
+    writeText(
+        trace,
+        "-- SCHED[9]: releasing lock (VG_(scheduler):timeslice) -> VgTs_Yielding\n"
+        "SYSCALL[2,1](228) sys_clock_gettime( 1, 0xaaa )[sync] --> Success(0x0)\n"
+        "-- SCHED[2]: releasing lock (VG_(scheduler):timeslice) -> VgTs_Yielding\n"
+        "-- SCHED[3]: releasing lock (VG_(scheduler):timeslice) -> VgTs_Yielding\n"
+        "-- SCHED[2]: releasing lock (VG_(scheduler):timeslice) -> VgTs_Yielding\n"
+        "SYSCALL[2,1](228) sys_clock_gettime( 1, 0xaaa )[sync] --> Success(0x0)\n"
+        "-- SCHED[9]: releasing lock (VG_(scheduler):timeslice) -> VgTs_Yielding\n");
+
+    const auto parsed = replay::parseMeasuredCallgrindSync(trace);
+    CHECK(parsed.scheduler.quantum_threads == std::vector<std::int64_t>{2, 3, 2});
+    CHECK(parsed.scheduler.full_quanta.at(2) == 2);
+    CHECK(parsed.scheduler.full_quanta.at(3) == 1);
+    CHECK(parsed.scheduler.begin_line == 2);
+    CHECK(parsed.scheduler.end_line == 6);
+}
+
+TEST_CASE("native Callgrind synchronization parser ignores nonblocking futex waits")
+{
+    TemporaryDirectory temporary;
+    const auto trace = temporary.path / "scheduler.log";
+    writeText(
+        trace,
+        "SYSCALL[2,1](228) sys_clock_gettime( 1, 0xaaa )[sync] --> Success(0x0)\n"
+        "SYSCALL[2,2](202) sys_futex ( 0xbbb, 393, 0, 0x0, 0x0 ) --> [async] ...\n"
+        "SYSCALL[2,2](202) ... [async] --> Failure(0xb)\n"
+        "-- SCHED[2]: releasing lock (VG_(scheduler):timeslice) -> VgTs_Yielding\n"
+        "SYSCALL[2,1](228) sys_clock_gettime( 1, 0xaaa )[sync] --> Success(0x0)\n");
+
+    const auto parsed = replay::parseMeasuredCallgrindSync(trace);
+    REQUIRE(parsed.events.size() == 2);
+    CHECK(parsed.events[0].kind == "futex_wait");
+    CHECK_FALSE(parsed.events[0].blocked);
+    CHECK(parsed.blocking_futex_waits == 0);
+    CHECK(parsed.futex_happens_before_edges == 0);
+}
+
+TEST_CASE("native Callgrind synchronization parser rejects an unmatched measured wakeup")
+{
+    TemporaryDirectory temporary;
+    const auto trace = temporary.path / "scheduler.log";
+    writeText(
+        trace,
+        "SYSCALL[2,1](228) sys_clock_gettime( 1, 0xaaa )[sync] --> Success(0x0)\n"
+        "SYSCALL[2,2](202) sys_futex ( 0xbbb, 393, 0, 0x0, 0x0 ) --> [async] ...\n"
+        "SYSCALL[2,2](202) ... [async] --> Success(0x0)\n"
+        "-- SCHED[2]: releasing lock (VG_(scheduler):timeslice) -> VgTs_Yielding\n"
+        "SYSCALL[2,1](228) sys_clock_gettime( 1, 0xaaa )[sync] --> Success(0x0)\n");
+
+    CHECK_THROWS_WITH_AS(replay::parseMeasuredCallgrindSync(trace), doctest::Contains("no matching wake"), std::runtime_error);
+}
+
+TEST_CASE("native Callgrind replay attributes costs directly to same-run threads")
+{
+    replay::CallgrindTrace callgrind;
+    for (std::int64_t thread = 1; thread <= 3; ++thread) {
+        callgrind.slices[thread] = {scaledProfile(thread)};
+        callgrind.totals[thread] = scaledProfile(thread);
+    }
+    replay::CallgrindSyncTrace sync{
+        .events =
+            {
+                {.thread = 1, .kind = "work_quantum"},
+                {.thread = 2, .kind = "work_quantum"},
+                {.thread = 3, .kind = "work_quantum"},
+            },
+    };
+    const auto result = replay::replayCallgrind(callgrind, sync, dataReadModel(), {.replay = {.cores = 3}});
+    const double expected = replay::modeledProfileCostNs(scaledProfile(1), dataReadModel()) +
+                            replay::modeledProfileCostNs(scaledProfile(2), dataReadModel()) +
+                            replay::modeledProfileCostNs(scaledProfile(3), dataReadModel());
+    CHECK(result.modeled_work == doctest::Approx(expected));
+}
+
+TEST_CASE("native Callgrind replay retains short threads without a full quantum")
+{
+    replay::CallgrindTrace callgrind;
+    callgrind.slices[1] = {scaledProfile(1)};
+    callgrind.totals[1] = scaledProfile(1);
+    callgrind.slices[2] = {scaledProfile(2)};
+    callgrind.totals[2] = scaledProfile(2);
+    replay::CallgrindSyncTrace sync{
+        .events = {{.thread = 1, .kind = "work_quantum"}},
+    };
+    const auto result = replay::replayCallgrind(callgrind, sync, dataReadModel(), {.replay = {.cores = 2}});
+    CHECK(
+        result.modeled_work ==
+        doctest::Approx(replay::modeledProfileCostNs(scaledProfile(1), dataReadModel()) + replay::modeledProfileCostNs(scaledProfile(2), dataReadModel())));
 }
 
 TEST_CASE("native replay applies cross-thread and wake latency cumulatively")

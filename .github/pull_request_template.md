@@ -1,5 +1,3 @@
-## Show us what you made
-
 **In one sentence:** <!-- Explain what someone can do with this; don’t list features. -->
 
 **One real example:** Starting with [real data/input], I [action], and it produced [result].

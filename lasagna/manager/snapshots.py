@@ -233,6 +233,37 @@ def index_snapshots(
     return sorted(records, key=lambda record: (record.run, record.checkpoint, record.path))
 
 
+def completion_snapshot_candidates(config: ManagerConfig) -> list[tuple[str, str]]:
+    """Discover every checkpoint cheaply, enriching candidates from the index."""
+    cache = _load_cache(_cache_path(config))
+    candidates: dict[str, str] = {}
+    for run, path in discover_snapshot_paths(config.resolved_snapshot_dirs()):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        cached = cache.get(str(path))
+        if (
+            cached
+            and cached.get("size") == stat.st_size
+            and cached.get("mtime_ns") == stat.st_mtime_ns
+        ):
+            try:
+                record = SnapshotRecord(**cached)
+            except TypeError:
+                pass
+            else:
+                candidates[record.selector] = (
+                    f"step {record.step}" if record.step is not None else "snapshot"
+                )
+                continue
+        # Backend classification requires loading the checkpoint. The
+        # backend-free alias is accepted by resolve_snapshot and keeps shell
+        # completion fast even for newly copied multi-gigabyte checkpoints.
+        candidates[f"{run}/{path.name}"] = "unindexed snapshot"
+    return sorted(candidates.items())
+
+
 def resolve_snapshot(records: list[SnapshotRecord], selector: str) -> SnapshotRecord:
     aliases: dict[str, list[SnapshotRecord]] = {}
     for record in records:

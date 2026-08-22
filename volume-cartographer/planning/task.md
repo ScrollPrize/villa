@@ -1,22 +1,35 @@
-# VC3D control-point collapse rollback fixes
+# VC3D render attribution and lookup performance repair
 
-Correct two regressions in generated-view control-point editing introduced by
-the 32-base-voxel multi-control collapse behavior.
+Repair the synthetic rendering performance gate before re-enabling it, then
+recover the lookup performance lost around the render-order changes.
 
-Requirements:
+Priorities:
 
-- Automatic multi-control collapse must use the same local line-update sequence
-  as insertion and single-control replacement: reconstruct the adjacent spans
-  around the replacement's authoritative `linePosition`, then start fiber-mode
-  optimization from that updated line.
-- Do not start multi-control optimization directly against the unchanged old
-  line. In particular, a replacement on a self-approaching fiber must not be
-  associated with another winding by nearest 3-D position.
-- Preserve the existing 32-base-voxel inclusive collapse selection, control
-  metadata ownership, branch-index remapping, dirty-span scope, seed/focus
-  behavior, no-reoptimization behavior, and asynchronous failure rollback.
-- If synchronous local update preparation throws, leave the pre-edit controls,
-  line, branches, seed/focus, and optimization state unchanged.
-- Keep the broader persisted-control/legacy nearest-3-D reconstruction issue out
-  of scope; this task fixes the PR 1484 regression without changing the fiber
-  file format.
+1. Correct and stabilize the passive Valgrind attribution. Collect periodic
+   Callgrind cost slices and a DRD dependency graph from separate executions
+   with identical Valgrind scheduling parameters. Reconstruct logical worker
+   traces canonically instead of equating raw worker IDs, trim DRD to the same
+   existing timed render boundary, and reject any pair whose logical pattern is
+   ambiguous or not reproducible. The measured binary must remain unchanged:
+   no markers, affinity mode, deterministic executor, or added instructions.
+2. Measure and repair renderer lookup speed using the commit immediately before
+   `Vc3d renderorder` and the current implementation as an A/B case. Preserve
+   rendered bytes, fallback behavior, request priority, and scheduling
+   semantics.
+
+Speed investigation requirements:
+
+- Treat `ChunkRequestContext` as render-job-constant; verify and exploit that
+  without changing request publication semantics.
+- Investigate a prepared/source-bound key lookup path so level, source, and
+  request information are not repeatedly assembled in the hot lookup.
+- Avoid rebuilding and probing a full key when a correlated sample remains in
+  the same successfully resolved chunk.
+- Account for the existing `LocalChunkCache`: it already retains the last key
+  and result and up to eight pinned chunks. Do not duplicate that cache under a
+  different name; improve the work that happens before it can identify a hit.
+- Establish repeatable before/after Release measurements and verify exact output
+  checksums before accepting any optimization.
+
+The Valgrind attribution repair is first. Lookup optimization remains planned
+until the gate can produce stable, semantically valid scores.

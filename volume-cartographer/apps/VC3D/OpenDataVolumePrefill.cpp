@@ -7,10 +7,13 @@
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <exception>
 #include <fstream>
+#include <future>
+#include <mutex>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -21,6 +24,7 @@ namespace {
 constexpr const char* kMarkerVersion = "vc3d_open_data_prefill_v2";
 constexpr const char* kLegacyMarkerVersion = "vc3d_open_data_prefill_v1";
 constexpr std::size_t kProgressIntervalChunks = 32;
+constexpr std::size_t kMaximumPrefillWorkers = 8;
 
 std::size_t chunkCountForGrid(const std::array<int, 3>& grid)
 {
@@ -328,46 +332,78 @@ OpenDataVolumePrefillResult prefillOpenDataVolumeLevel(
             return result;
         }
 
-        for (const auto& key : requests) {
-            if (cancelled(cancelFlag)) {
-                result.status = OpenDataVolumePrefillResult::Status::Cancelled;
-                result.message = "cancelled";
-                cache->waitForPersistentWrites();
-                return result;
-            }
+        // Keep several chunks in different pipeline stages at once: remote
+        // fetch, source decode, Delta3D compression, and the single ordered
+        // writer. The cap bounds retained payload memory while still allowing
+        // the cache service and its two compression workers to make progress in
+        // parallel.
+        const auto fetchConcurrency =
+            vc::render::processChunkCacheService()->fetchConcurrency();
+        const std::size_t workerCount = std::min<std::size_t>(
+            result.totalChunks,
+            std::max<std::size_t>(
+                1, std::min(kMaximumPrefillWorkers,
+                            fetchConcurrency.maxConcurrentReads)));
+        std::atomic<std::size_t> nextRequest{0};
+        std::mutex resultMutex;
+        auto worker = [&] {
+            for (;;) {
+                if (cancelled(cancelFlag))
+                    return;
+                const auto requestIndex =
+                    nextRequest.fetch_add(1, std::memory_order_relaxed);
+                if (requestIndex >= requests.size())
+                    return;
+                const auto& key = requests[requestIndex];
+                const auto chunk = cache->persistChunkBlocking(
+                    level, key.iz, key.iy, key.ix,
+                    vc::render::ChunkCache::PersistentRequestMode::Ensure);
 
-            const auto chunk = cache->persistChunkBlocking(
-                level, key.iz, key.iy, key.ix,
-                vc::render::ChunkCache::PersistentRequestMode::Ensure);
-            ++result.resolvedChunks;
-            switch (chunk.status) {
-            case vc::render::ChunkCache::PersistentRequestStatus::Data:
-                ++result.dataChunks;
-                break;
-            case vc::render::ChunkCache::PersistentRequestStatus::Missing:
-                ++result.emptyChunks;
-                break;
-            case vc::render::ChunkCache::PersistentRequestStatus::Error:
-                ++result.errorChunks;
-                Logger()->warn(
-                    "Open-data volume prefill error for {} level {} chunk {}/{}/{}: {}",
-                    result.volumeId,
-                    level,
-                    key.iz,
-                    key.iy,
-                    key.ix,
-                    chunk.error);
-                break;
-            }
+                std::lock_guard lock(resultMutex);
+                ++result.resolvedChunks;
+                switch (chunk.status) {
+                case vc::render::ChunkCache::PersistentRequestStatus::Data:
+                    ++result.dataChunks;
+                    break;
+                case vc::render::ChunkCache::PersistentRequestStatus::Missing:
+                    ++result.emptyChunks;
+                    break;
+                case vc::render::ChunkCache::PersistentRequestStatus::Error:
+                    ++result.errorChunks;
+                    Logger()->warn(
+                        "Open-data volume prefill error for {} level {} chunk {}/{}/{}: {}",
+                        result.volumeId,
+                        level,
+                        key.iz,
+                        key.iy,
+                        key.ix,
+                        chunk.error);
+                    break;
+                }
 
-            if (progressCallback &&
-                (result.resolvedChunks == result.totalChunks ||
-                 result.resolvedChunks % kProgressIntervalChunks == 0)) {
-                progressCallback(result.resolvedChunks, result.totalChunks);
+                if (progressCallback &&
+                    (result.resolvedChunks == result.totalChunks ||
+                     result.resolvedChunks % kProgressIntervalChunks == 0)) {
+                    progressCallback(result.resolvedChunks, result.totalChunks);
+                }
             }
-        }
+        };
+
+        std::vector<std::future<void>> workers;
+        workers.reserve(workerCount - 1);
+        for (std::size_t i = 1; i < workerCount; ++i)
+            workers.emplace_back(std::async(std::launch::async, worker));
+        worker();
+        for (auto& future : workers)
+            future.get();
 
         cache->waitForPersistentWrites();
+        if (cancelled(cancelFlag) &&
+            result.resolvedChunks < result.totalChunks) {
+            result.status = OpenDataVolumePrefillResult::Status::Cancelled;
+            result.message = "cancelled";
+            return result;
+        }
         if (result.errorChunks > 0) {
             result.status = OpenDataVolumePrefillResult::Status::Failed;
             result.message = std::to_string(result.errorChunks) + " chunk(s) failed";

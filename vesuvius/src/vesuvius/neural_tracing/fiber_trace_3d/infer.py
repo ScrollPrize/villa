@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from functools import wraps
 import hashlib
 import json
 import math
@@ -12,6 +13,19 @@ from typing import Any
 
 import torch
 import zarr
+
+try:
+    from lasagna.live_omezarr_cache import (
+        DEFAULT_LIVE_CACHE_GIB,
+        DEFAULT_LIVE_FETCH_AHEAD_TILES,
+        LiveOmeZarrCache,
+    )
+except ImportError:  # pragma: no cover - supports PYTHONPATH=lasagna style runs.
+    from live_omezarr_cache import (
+        DEFAULT_LIVE_CACHE_GIB,
+        DEFAULT_LIVE_FETCH_AHEAD_TILES,
+        LiveOmeZarrCache,
+    )
 
 try:
     from lasagna.tiled_predict3d import (
@@ -178,6 +192,35 @@ def _storage_ds_end(value: int, scaledown: int) -> int:
     value_i = max(0, int(value))
     scaledown_i = max(1, int(scaledown))
     return (value_i + scaledown_i - 1) // scaledown_i
+
+
+def _manage_live_cache(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        enabled = bool(kwargs.get("live_fetch", False))
+        if not enabled:
+            kwargs["_live_cache"] = None
+            return function(*args, **kwargs)
+        if kwargs.get("no_download", False):
+            raise ValueError("--live-fetch conflicts with --no-download")
+        if kwargs.get("crop_xyzwhd") is not None:
+            raise ValueError("--live-fetch supports only full, non-cropped inference")
+        cache_gib = float(kwargs.get("live_cache_gib", DEFAULT_LIVE_CACHE_GIB))
+        lookahead = int(kwargs.get("live_fetch_ahead_tiles", DEFAULT_LIVE_FETCH_AHEAD_TILES))
+        workers = int(kwargs.get("download_workers", 64))
+        if not math.isfinite(cache_gib) or cache_gib <= 0:
+            raise ValueError("live_cache_gib must be finite and > 0")
+        if lookahead <= 0:
+            raise ValueError("live_fetch_ahead_tiles must be > 0")
+        with LiveOmeZarrCache(
+            kwargs["input_path"],
+            max_bytes=int(cache_gib * (1 << 30)),
+            lookahead_tiles=lookahead,
+            workers=workers,
+        ) as live_cache:
+            kwargs["_live_cache"] = live_cache
+            return function(*args, **kwargs)
+    return wrapped
 
 
 def _input_scaledown_from_base(
@@ -362,6 +405,7 @@ def _select_and_expand_crop(
     )
 
 
+@_manage_live_cache
 def run_fiber_trace_3d_inference(
     *,
     config_path: str | Path | None = None,
@@ -393,10 +437,14 @@ def run_fiber_trace_3d_inference(
     input_io_threads: int = DEFAULT_INPUT_IO_THREADS,
     input_copy_threads: int = DEFAULT_INPUT_COPY_THREADS,
     download_workers: int = 64,
+    live_fetch: bool = False,
+    live_cache_gib: float = DEFAULT_LIVE_CACHE_GIB,
+    live_fetch_ahead_tiles: int = DEFAULT_LIVE_FETCH_AHEAD_TILES,
     profile_pipeline: bool = False,
     inference_precision: str = "auto",
     product_accumulator_dtype: str = "float16",
     provenance_context_path: str | Path | None = None,
+    _live_cache: LiveOmeZarrCache | None = None,
 ) -> None:
     if int(download_workers) <= 0:
         raise ValueError("download_workers must be a positive integer")
@@ -419,7 +467,7 @@ def run_fiber_trace_3d_inference(
     if not json_stem:
         raise ValueError("output .lasagna.json path must have a non-empty stem")
 
-    if not no_download:
+    if not no_download and not live_fetch:
         _auto_download(input_path, crop_xyzwhd, download_workers=int(download_workers))
 
     a_in = zarr.open(str(input_path), mode="r")
@@ -572,6 +620,12 @@ def run_fiber_trace_3d_inference(
             "precision": precision_mode,
             "product_accumulator_dtype": str(product_accumulator_dtype),
             "recurrent_steps": predict_adapter.recurrent_steps,
+            "live_fetch": {
+                "enabled": bool(live_fetch),
+                "cache_target_gib": float(live_cache_gib),
+                "lookahead_tiles": int(live_fetch_ahead_tiles),
+                "download_workers": int(download_workers),
+            },
         },
         "checkpoint": checkpoint_provenance,
         "atlas_model_identity": {
@@ -651,7 +705,12 @@ def run_fiber_trace_3d_inference(
             profile_pipeline=bool(profile_pipeline),
             product_accumulator_dtype=str(product_accumulator_dtype),
             accumulator_workers=int(accumulator_workers),
+            live_cache=_live_cache,
         )
+        if _live_cache is not None:
+            _live_cache.close()
+            provenance["inference"]["live_fetch"]["final_stats"] = _live_cache.snapshot()
+            write_provenance(provenance_path, provenance)
         del model
         if torch_device.type == "cuda":
             torch.cuda.empty_cache()
@@ -683,6 +742,9 @@ def run_fiber_trace_3d_inference(
             flush=True,
         )
     except BaseException as error:
+        if _live_cache is not None:
+            _live_cache.close()
+            provenance["inference"]["live_fetch"]["final_stats"] = _live_cache.snapshot()
         finalize_document(
             provenance, path=provenance_path,
             status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
@@ -784,6 +846,18 @@ def main(argv: list[str] | None = None) -> int:
         help="Parallel S3 chunk download threads used by automatic download.",
     )
     parser.add_argument(
+        "--live-fetch", action="store_true",
+        help="Fetch the selected input scale lazily and evict only safe old Z-chunk planes.",
+    )
+    parser.add_argument(
+        "--live-cache-gib", type=float, default=None,
+        help=f"Selected-scale disk-cache target in GiB (default: {DEFAULT_LIVE_CACHE_GIB}).",
+    )
+    parser.add_argument(
+        "--live-fetch-ahead-tiles", type=int, default=None,
+        help=f"Lazy materialization lookahead in canonical tiles (default: {DEFAULT_LIVE_FETCH_AHEAD_TILES}).",
+    )
+    parser.add_argument(
         "--base-ref",
         default=None,
         help="Reference zarr for base shape. With --base-scale N, base = ref_shape * 2^N.",
@@ -837,6 +911,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--input-io-threads must be > 0")
     if int(args.input_copy_threads) <= 0:
         parser.error("--input-copy-threads must be > 0")
+    if not args.live_fetch and (args.live_cache_gib is not None or args.live_fetch_ahead_tiles is not None):
+        parser.error("--live-cache-gib/--live-fetch-ahead-tiles require --live-fetch")
+    if args.live_fetch and args.no_download:
+        parser.error("--live-fetch conflicts with --no-download")
+    if args.live_fetch and args.crop_xyzwhd is not None:
+        parser.error("--live-fetch supports only full, non-cropped inference")
 
     run_fiber_trace_3d_inference(
         config_path=args.config,
@@ -871,6 +951,14 @@ def main(argv: list[str] | None = None) -> int:
         inference_precision=str(args.inference_precision),
         product_accumulator_dtype=str(args.product_accumulator_dtype),
         download_workers=int(args.download_workers),
+        live_fetch=bool(args.live_fetch),
+        live_cache_gib=(
+            DEFAULT_LIVE_CACHE_GIB if args.live_cache_gib is None else float(args.live_cache_gib)
+        ),
+        live_fetch_ahead_tiles=(
+            DEFAULT_LIVE_FETCH_AHEAD_TILES
+            if args.live_fetch_ahead_tiles is None else int(args.live_fetch_ahead_tiles)
+        ),
         provenance_context_path=args.provenance_context,
     )
     return 0

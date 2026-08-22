@@ -16,7 +16,7 @@ A Python library for accessing CT scans of ancient scrolls, and for training and
 
 ---
 
-## Dataset & Rendering Tools
+## Machine Learning, Dataset & Rendering Tools
 
 ### [foundation](foundation/)
 Tools to build/manage scroll datasets and cloud infrastructure, including photogrammetry masking.
@@ -24,6 +24,9 @@ Tools to build/manage scroll datasets and cloud infrastructure, including photog
 ### [ink-detection](ink-detection/)
 Training and inference tools for Vesuvius Challenge ink detection models, built on the model that won the 2023 Grand Prize.  
 Originally developed by [Youssef Nader](https://github.com/younader) and [Luke Farritor](https://github.com/lukeboi), extended by the Vesuvius Challenge team.
+
+### [dinovol](dinovol/)
+A self-supervised 3D DINO implementation for learning volumetric representations from scroll CT scans.
 
 ---
 
@@ -37,7 +40,7 @@ Developed by [Hendrik Schilling](https://github.com/hendrikschilling) and [Sean 
 ### [lasagna](lasagna/)
 A PyTorch-based optimization framework for growing and refining papyrus surface meshes, offered as an alternative to VC3D's GrowPatch. It can jointly optimize several stacked sheets so they stay consistent with each other, and also drives fiber tracing.
 
-### [spiral fitting](volume-cartographer/scripts/spiral)
+### [spiral fitting](spiral-fitting)
 A fully automatic unwrapping pipeline that fits a single, globally coherent spiral to an entire scroll by deforming an ideal spiral to match traced patches, fiber skeletons, and winding annotations.
 Originally developed by [Paul Henderson](https://github.com/pmh47).
 

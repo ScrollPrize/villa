@@ -6,8 +6,6 @@ labels: ""
 assignees: ""
 ---
 
-## Show us the problem or request
-
 **In one sentence:** <!-- What is the problem, or what is currently missing? -->
 
 **I was trying to:** <!-- Describe the real task you were working on. -->
