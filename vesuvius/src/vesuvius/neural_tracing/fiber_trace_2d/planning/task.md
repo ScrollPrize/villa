@@ -1,18 +1,15 @@
-# Task: separate fiber replay progress
+# Task: make fiberlet replay prefix processing incremental
 
-Replace the misleading composite fiber replay progress percentage with explicit
-cache/preprocessing and reference-tracing progress. The tracing value must be
-the actual minimum reference-arc fraction reached by the greedy and fiberlet
-tracers. Keep cache generation, prefetching, tracing, and output behavior
-unchanged.
+Remove replay work whose cost grows with the already committed segment prefix.
+The fixed-distance lookahead must do work proportional to the new search and
+newly selected suffix, not repeatedly rebuild route geometry, logical route
+keys, reference matches, normals, or visited-node state from the segment seed.
 
-When visualization or publication continues after tracing, report it as output
-work rather than folding it into either cache or trace progress.
+Preserve route selection, exact cycle rejection, failure locations, costs,
+serialized replay results, cache behavior, and numerical evaluation order.
+Final result materialization may make one linear pass because the result itself
+contains the complete route.
 
-Show `elapsed` only once on the active compact line, and remove the cache/prep
-field as soon as its scheduled fraction reaches 100%.
-
-For trace progress, additionally show an ETA based on recent progress speed,
-the number of search states expanded by the latest bounded lookahead decision,
-and the minimum local loss-per-prediction-voxel cutoff that actually stopped
-candidate expansion at its maximum-lookahead front.
+Measure the change on a hot-cache replay and retain the existing focused replay
+tests. No approximation, probabilistic identity, or relaxed cycle handling is
+acceptable.

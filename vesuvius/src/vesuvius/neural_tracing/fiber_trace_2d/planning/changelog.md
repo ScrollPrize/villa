@@ -872,6 +872,17 @@
   resolution-state shutdown safe for late worker completion. Radius-64 replay
   output remained byte-identical.
 
+# 2026-08-22: incremental fiberlet replay prefixes
+
+- Replaced repeated logical-route vector construction and visited-set copying
+  with exact canonical logical histories and immutable Patricia cycle state.
+- Made selected-route reference matching, normal-threshold evaluation, and
+  diagnostic index assignment process only newly selected history suffixes;
+  complete public route output is assembled once at segment termination.
+- Preserved the canonical hot-cache replay bundle byte-for-byte while reducing
+  its median wall time from 7.57 to 3.87 seconds and peak RSS from 202,872 KiB
+  to 102,424-104,900 KiB.
+
 # 2026-08-20: cache-backed quantization comparison
 
 - Replaced the eager full-population quantization CLI with sequential baseline

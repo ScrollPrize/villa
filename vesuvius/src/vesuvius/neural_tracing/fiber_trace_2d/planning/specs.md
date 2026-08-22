@@ -3171,6 +3171,19 @@
   not duplicate route geometry. A reference failure closes the chosen history,
   resets the segment origin, and reseeds the full population. The reference
   never removes graph candidates during ranking.
+- Persistent search bookkeeping must not scale with the already committed
+  prefix. Logical routes use exact canonical parent/arc identity plus exact
+  ancestor/first-divergence ordering; physical candidates remain separate.
+  Cycle membership uses an immutable exact-key Patricia trie and is never
+  compacted by copying the accumulated prefix. Selected-route reference
+  matching resumes from the nearest evaluated physical-history ancestor and
+  evaluates each newly selected suffix once. Diagnostic indices are allocated
+  from that same newly selected suffix in their historical order. Full route
+  vectors, matches, steps, and consumed-node output are assembled once when a
+  segment terminates. Explicit decision diagnostics may additionally build the
+  complete route payloads they serialize. These are implementation constraints
+  only and must not change ranking, costs, failure locations, cache identity,
+  or replay JSON.
 - Beam-step, lookahead, prune distance, and search width are replay-only
   metadata. They must not affect anchor or fiberlet cache identity, corridor
   selection, generation settings, chunk payloads, or prefetch scheduling.

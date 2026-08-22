@@ -582,6 +582,17 @@ route inside a fiberlet; this does not alter search costs or beam state. A
 reference failure, graph exhaustion, or the selected end closes the persistent
 population.
 
+Replay prefix state is incremental. Logical route keys are canonical immutable
+parent/arc nodes with exact lexicographic ordering, while physical histories
+remain distinct. Visited anchors live in an immutable exact-key Patricia trie,
+so advancing a checkpoint does not copy the accumulated cycle set. Reference
+matching and Lasagna-normal threshold evaluation resume at the nearest already
+evaluated physical-history ancestor and process only the newly selected suffix.
+The public point, match, step, and consumed-node vectors are assembled once at
+segment termination. Focused replay decision diagnostics are the deliberate
+exception: they request complete route payloads for every recorded decision and
+therefore may materialize those diagnostic histories.
+
 Beam-step, lookahead, prune distance, and search width are replay state only.
 They are absent from anchor/fiberlet cache fingerprints, extraction settings,
 and serialized chunk payloads. A new horizon can request previously untouched

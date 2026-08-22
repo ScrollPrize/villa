@@ -1,86 +1,93 @@
-# Plan: separate fiber replay progress
+# Plan: incremental fiberlet replay prefixes
 
-## Output contract
+## Baseline and invariants
 
-1. Track cache/preprocessing and evaluator progress as independent monotone
-   fractions. Cache progress retains the existing anchor weight one and
-   fiberlet-prefix weight sixteen. Trace progress remains
-   `min(greedy_fraction, fiberlet_fraction)` and therefore denotes actual
-   progress along the selected reference interval.
-2. Render both labeled values in compact mode while preprocessing and tracing
-   overlap. Give each its own ETA but show one overall replay elapsed time on the line;
-   never combine them into a weighted percentage. Remove the cache/prep field
-   once its scheduled fraction reaches 100%, and clear any remainder from the
-   previously longer terminal line.
-   Render both values on one terminal line so event output can close and redraw
-   it atomically. Omit cache for eager replay.
-3. Cache timing starts when the deterministic schedule is attached, trace
-   timing immediately before evaluator launch, and output timing after both
-   futures join. Never force unresolved cache work to 100% at trace completion.
-4. Once both tracers complete, close the cache/trace display. Report overview,
-   per-failure visualization, and bundle publication as named output stages.
-   Do not reuse the old unexplained 82/98/99-percent estimates. Only the
-   visualization stage has a real completed/total denominator and ETA.
-5. Preserve immediate failure lines, periodic redraws during long cache work,
-   `--stats` behavior, cache scheduling, and all numerical replay behavior.
-   Cache progress intentionally excludes data-dependent neighbor-prefix and
-   committed-route reads, which remain part of tracing.
-6. Alongside the whole-trace average ETA, show `eta_current` from a rolling
-   ten-second trace-fraction window. Ticker samples with no progress must lower
-   the measured recent rate; report `n/a` when the window has no positive
-   progress.
-7. Extend fiberlet replay progress with diagnostics from its latest completed
-   bounded lookahead decision. `fiberlet_rollout_expansions` is the total number
-   of states whose successors were enumerated across all intermediate fronts.
-   `fiberlet_local_cutoff_loss_per_vx_min` is the minimum applied final-front
-   cutoff after subtracting the input route's loss at the front start and
-   dividing by that front's prediction-voxel length. Publish a cutoff only when
-   the existing strict queued-lower-bound stop actually fires. Omit both values
-   in exact-search mode.
+1. Record a hot-cache bounded replay runtime and preserve its replay JSON as a
+   correctness baseline. Use the same graph, cache, interval, radius, build,
+   and thread count before and after the change.
+2. Preserve cumulative cost arithmetic, successor order, cutoff comparisons,
+   route tie ordering, reference matching, threshold measurements, and final
+   serialized segment contents exactly.
 
-## Implementation
+## Persistent search state
 
-1. Refactor the local replay progress reporter to hold independent cache,
-   trace, and output state and independent phase start times.
-2. Keep existing call sites and callbacks narrowly adapted to the new reporter
-   contract. Quantization replay uses its fiberlet evaluator fraction as trace
-   progress and routes failure events through the reporter.
-3. Carry bounded expansion count and local cutoff density through the existing graph replay
-   progress callback and detailed `--stats` row. Do not infer search internals
-   in the CLI.
-4. Document the terminal output semantics and remove the obsolete 95/5
-   composite formula from the specification and user documentation.
+1. Replace root-to-tip logical-arc vectors used during search with canonical
+   seed-local persistent logical-route nodes. Intern `(logical parent, logical
+   arc)` exactly so physically distinct aliases of the same logical route share
+   identity while retaining their separate physical histories, costs, joins,
+   geometry, and visited state.
+2. Compare logical routes exactly and deterministically with fixed-width binary
+   lifting: an ancestor sorts before its descendant and otherwise the first
+   divergent logical arc determines order exactly as the former vectors did.
+   Allocation addresses/IDs never determine ordering. Use a sharded weak
+   interner and sweep expired entries after decisions so worker scheduling does
+   not affect results or retain pruned states. Materialize logical-arc vectors
+   only when explicit decision diagnostics require them.
+3. Replace the linked visited delta plus full `std::set` compaction with an
+   immutable deterministic Patricia trie over the complete fixed-width
+   `FiberletStorageKey`. Full keys remain at leaves, so membership is exact and
+   insertion/query depth is bounded by key width rather than prefix length.
+4. Keep per-front candidate selection and tie behavior equivalent while using
+   canonical logical nodes only at the equality/diversity/order boundaries
+   where the former implementation used logical vectors.
+
+## Incremental reference evaluation
+
+1. Associate materialization state with live persistent physical-route
+   candidates. Each immutable contribution records its physical history node,
+   parent contribution, last emitted point, exact matched reference arc,
+   output point/step counts, per-edge points and matches, terminal status, and
+   authoritative cumulative five-component costs and prediction length.
+2. Retain a segment-local table of evaluated physical-history nodes. When a
+   selected beam changes, walk back only to its nearest evaluated ancestor and
+   evaluate the previously unseen suffix once. Do not reread or rematch its
+   established prefix, and do not touch unselected route payloads.
+3. Preserve the exact point-by-point reference matcher and Lasagna-normal
+   threshold evaluation for each newly encountered route point.
+4. Never evaluate a descendant after a contribution records a failure or
+   reference-end termination. Retain selected contributions only for the
+   current segment, reuse them through shared physical ancestry, and reset all
+   state at reseed. Route payload leases are not retained.
+5. Assemble the public segment, matches, indices, committed steps, and consumed
+   nodes once at failure/reference end. Explicit full decision diagnostics may
+   materialize their requested full route payloads because that artifact itself
+   stores full per-decision routes; normal replay must not pay that cost.
+
+## Performance accounting
+
+1. Keep search counters semantically unchanged.
+2. Benchmark hot-cache replay before and after, reporting wall time, CPU time,
+   interval, radius, and failure counts. Confirm later checkpoints do not
+   degrade merely because the selected prefix is longer.
 
 ## Testing
 
-1. Build `vc_fiberlets` with `-j32`.
-2. Run a short hot-cache replay in compact mode and verify that output contains
-   separately labeled cache/prep and trace progress with the trace fraction
-   matching the detailed reference fraction.
-3. Run the focused fiber replay tests to ensure progress-only changes do not
-   alter replay results.
-4. Exercise cold-cache overlap, cache below 100% at trace completion, monotone
-   trace high-water updates, eager cache omission, event-line redraw, output
-   stage transitions, cache-field removal without stale terminal text, and
-   error termination without false completion. Verify a `--stats` run emits no
-   compact progress labels.
-5. Add focused replay checks that bounded running-progress events expose the
-   same total expanded-state count and minimum applied final-front local cutoff
-   density as decision/front diagnostics. Verify exact mode omits them and that
-   expansion diagnostics persist until the next completed decision.
+1. Add focused tests for canonical logical-route equality/order including
+   logical aliases and equal-cost ties, exact persistent visited membership,
+   and switching to a beam whose suffix was not previously materialized.
+2. Cover bounded/exact search, diagnostics off/on, 1/32 threads, mid-edge
+   failure, terminal partial edges, and checkpoints that add no fiberlet.
+3. Compare before/after replay JSON byte-for-byte for the hot-cache workload,
+   including component costs, matches, committed steps, failure locations, and
+   geometry. Progress text is excluded.
+4. Build `vc_fiberlets`, `test_fiberlet_paths`, `test_fiber_replay`, and
+   `test_fiberlet_storage` with `-j32`; report the known
+   existing fixture failures separately from new failures.
 
 ## Spec update
 
-- Replace the single weighted replay progress contract with independent
-  cache/prep and trace progress, plus a separate output phase after tracing.
-- Define recent-speed ETA, bounded rollout expansions, and local pruning-cutoff
-  semantics.
+- Specify that persistent identities are an implementation optimization only:
+  bounded reconvergence, exact search, cutoff rules, whole-fiberlet commitment,
+  cache/publication formats, and final output remain unchanged. Search
+  identities, cycle state, and selected-route reference evaluation are
+  incremental; only final output assembly is linear in segment length.
 
 ## Docs update
 
-- Update `volume-cartographer/docs/fiberlets.md` with the new labels, fraction
-  definitions, and overlapping-phase behavior.
+- Document the incremental prefix state and clarify that full route payload
+  construction is restricted to final output and explicit decision diagnostics.
 
 ## Changelog
 
-- Record the correction from composite to explicit replay progress.
+- Record removal of repeated root-to-tip replay materialization, logical-key
+  construction, and visited-set copying.

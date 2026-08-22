@@ -1,11 +1,13 @@
-# Status: separate fiber replay progress
+# Status: incremental fiberlet replay prefixes
 
-- [x] Capture the requested progress split.
-- [x] Write the implementation, documentation, and validation plan.
-- [x] Complete independent plan review and incorporate findings.
-- [x] Implement independent cache/prep and trace progress.
-- [x] Update specification, documentation, and changelog.
-- [x] Build and run focused validation with `-j32`.
-- [x] Remove duplicate elapsed fields and hide completed cache progress.
-- [x] Add recent-speed ETA, bounded rollout expansion count, and local cutoff density.
-- [x] Rebuild and validate compact line shortening and final diagnostics.
+- [x] Capture the prefix-scaling performance defect.
+- [x] Write the implementation and validation plan.
+- [x] Complete independent plan review.
+- [x] Record a hot-cache baseline and exact output fixture.
+- [x] Implement persistent logical-route identities.
+- [x] Implement exact persistent visited state.
+- [x] Implement incremental selected-route reference evaluation.
+- [x] Add focused regression coverage.
+- [x] Update specification, documentation, changelog, and task log.
+- [x] Build and validate with `-j32`.
+- [x] Measure hot-cache before/after performance and compare outputs.

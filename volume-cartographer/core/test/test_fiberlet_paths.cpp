@@ -92,6 +92,18 @@ public:
     mutable std::vector<cv::Vec3d> sampledPoints;
 };
 
+class CountingReplayNormalSampler final : public vc::lasagna::NormalSampler
+{
+public:
+    vc::lasagna::NormalSample sampleNormal(const cv::Vec3d&) const override
+    {
+        ++calls;
+        return {{0.0, 1.0, 0.0}, true, {}};
+    }
+
+    mutable size_t calls = 0;
+};
+
 vc::fiber_tracer::LoadedFiberAnchorArtifact twoAnchorArtifact(
     cv::Vec3d firstAxis = {1.0, 0.0, 0.0},
     cv::Vec3d secondAxis = {1.0, 0.0, 0.0},
@@ -1458,6 +1470,33 @@ TEST_CASE("persistent fiberlet beam retains an alternative until it wins")
     CHECK(first.routes.front().prefixLogicalArcs.front().fiberlet.second == firstBranchKey);
     CHECK(third.routes.front().prefixLogicalArcs.front().fiberlet.second == secondBranchKey);
     CHECK(replay.segments.front().candidateIndices.front() == 4);
+}
+
+TEST_CASE("persistent fiberlet replay matches a long selected route incrementally")
+{
+    auto report = graphPathReport();
+    constexpr size_t edgeCount = 32;
+    for (size_t edge = 0; edge < edgeCount; ++edge) {
+        addGraphPath(report, edge, edge + 1, {{static_cast<float>(edge), 0, 0}, {static_cast<float>(edge + 1), 0, 0}}, 0.0);
+    }
+    const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
+    vc::fiber_tracer::FiberletGraphReplayConfig config;
+    config.beamWidth = 1;
+    config.searchWidth = 1;
+    config.beamStepDistanceBaseVoxels = 1.0;
+    config.lookaheadDistanceBaseVoxels = 2.0;
+    config.pruneDistanceBaseVoxels = 1.0;
+    config.errorThresholdBaseVoxels = 100.0;
+    config.referenceEndArcBase = edgeCount;
+    config.recordDecisionDiagnostics = false;
+    CountingReplayNormalSampler normals;
+
+    const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(graph, {{0, 0, 0}, {static_cast<double>(edgeCount), 0, 0}}, normals, 1.0, config);
+
+    REQUIRE(replay.failures.empty());
+    REQUIRE(replay.segments.size() == 1);
+    CHECK(replay.segments.front().candidateIndices.size() == edgeCount);
+    CHECK(normals.calls <= edgeCount * 3);
 }
 
 TEST_CASE("rolling fiberlet beam prunes globally across prior beams")

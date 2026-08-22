@@ -4,6 +4,7 @@
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <future>
@@ -217,54 +218,225 @@ std::vector<cv::Vec3d> routePointPrefix(const std::vector<cv::Vec3d>& points, do
     return points;
 }
 
+constexpr size_t kFiberletStorageKeyBits = 3 * 64 + 8;
+
+bool storageKeyBit(const FiberletStorageKey& key, size_t bit)
+{
+    if (bit >= kFiberletStorageKeyBits)
+        throw std::out_of_range("fiberlet storage key bit is out of range");
+    if (bit < 3 * 64) {
+        const size_t axis = bit / 64;
+        const size_t shift = 63 - bit % 64;
+        return (static_cast<std::uint64_t>(key.coordinateZYX[axis]) >> shift) & 1U;
+    }
+    return (static_cast<std::uint8_t>(key.variant) >> (7 - (bit - 3 * 64))) & 1U;
+}
+
+size_t firstDifferentStorageKeyBit(const FiberletStorageKey& left, const FiberletStorageKey& right)
+{
+    for (size_t bit = 0; bit < kFiberletStorageKeyBits; ++bit) {
+        if (storageKeyBit(left, bit) != storageKeyBit(right, bit))
+            return bit;
+    }
+    return kFiberletStorageKeyBits;
+}
+
 struct PersistentVisitedNodes {
-    std::shared_ptr<const std::set<FiberletStorageKey>> base;
-    std::shared_ptr<const PersistentVisitedNodes> parent;
-    std::optional<FiberletStorageKey> added;
+    bool leaf = false;
+    std::uint16_t branchBit = 0;
+    FiberletStorageKey key;
+    std::shared_ptr<const PersistentVisitedNodes> zero;
+    std::shared_ptr<const PersistentVisitedNodes> one;
 };
 
-std::shared_ptr<const PersistentVisitedNodes> makeVisitedRoot(std::set<FiberletStorageKey> nodes)
+std::shared_ptr<const PersistentVisitedNodes> makeVisitedLeaf(FiberletStorageKey key)
 {
-    return std::make_shared<const PersistentVisitedNodes>(
-        PersistentVisitedNodes{std::make_shared<const std::set<FiberletStorageKey>>(std::move(nodes)), nullptr, std::nullopt});
+    return std::make_shared<const PersistentVisitedNodes>(PersistentVisitedNodes{true, 0, std::move(key), nullptr, nullptr});
 }
 
 bool persistentVisitedContains(const std::shared_ptr<const PersistentVisitedNodes>& visited, const FiberletStorageKey& key)
 {
-    for (auto node = visited; node != nullptr; node = node->parent) {
-        if (node->added.has_value() && *node->added == key)
-            return true;
-        if (node->base != nullptr && node->base->contains(key))
-            return true;
-    }
-    return false;
+    auto node = visited;
+    while (node != nullptr && !node->leaf)
+        node = storageKeyBit(key, node->branchBit) ? node->one : node->zero;
+    return node != nullptr && node->key == key;
 }
 
 std::shared_ptr<const PersistentVisitedNodes> persistentVisitedAdd(const std::shared_ptr<const PersistentVisitedNodes>& visited, FiberletStorageKey key)
 {
-    return std::make_shared<const PersistentVisitedNodes>(PersistentVisitedNodes{nullptr, visited, std::move(key)});
+    if (visited == nullptr)
+        return makeVisitedLeaf(std::move(key));
+    auto leaf = visited;
+    while (!leaf->leaf)
+        leaf = storageKeyBit(key, leaf->branchBit) ? leaf->one : leaf->zero;
+    if (leaf->key == key)
+        return visited;
+    const size_t differingBit = firstDifferentStorageKeyBit(key, leaf->key);
+    if (differingBit >= kFiberletStorageKeyBits)
+        throw std::logic_error("distinct fiberlet storage keys have identical bits");
+    const auto inserted = makeVisitedLeaf(std::move(key));
+    const auto rebuild = [&](const auto& self, const std::shared_ptr<const PersistentVisitedNodes>& node) -> std::shared_ptr<const PersistentVisitedNodes> {
+        if (node->leaf || node->branchBit >= differingBit) {
+            if (storageKeyBit(inserted->key, differingBit))
+                return std::make_shared<const PersistentVisitedNodes>(
+                    PersistentVisitedNodes{false, static_cast<std::uint16_t>(differingBit), {}, node, inserted});
+            return std::make_shared<const PersistentVisitedNodes>(
+                PersistentVisitedNodes{false, static_cast<std::uint16_t>(differingBit), {}, inserted, node});
+        }
+        if (storageKeyBit(inserted->key, node->branchBit)) {
+            return std::make_shared<const PersistentVisitedNodes>(PersistentVisitedNodes{false, node->branchBit, {}, node->zero, self(self, node->one)});
+        }
+        return std::make_shared<const PersistentVisitedNodes>(PersistentVisitedNodes{false, node->branchBit, {}, self(self, node->zero), node->one});
+    };
+    return rebuild(rebuild, visited);
 }
 
-std::shared_ptr<const PersistentVisitedNodes> compactPersistentVisited(const std::shared_ptr<const PersistentVisitedNodes>& visited)
+constexpr size_t kLogicalRouteAncestorLevels = std::numeric_limits<size_t>::digits;
+
+struct PersistentLogicalRouteNode {
+    std::shared_ptr<const PersistentLogicalRouteNode> parent;
+    DirectedFiberletStorageId arc;
+    size_t depth = 0;
+    std::array<const PersistentLogicalRouteNode*, kLogicalRouteAncestorLevels> ancestors{};
+};
+
+struct PersistentLogicalRouteInternKey {
+    const PersistentLogicalRouteNode* parent = nullptr;
+    DirectedFiberletStorageId arc;
+};
+
+struct PersistentLogicalRouteInternKeyLess {
+    bool operator()(const PersistentLogicalRouteInternKey& left, const PersistentLogicalRouteInternKey& right) const
+    {
+        if (left.parent != right.parent)
+            return std::less<const PersistentLogicalRouteNode*>{}(left.parent, right.parent);
+        return left.arc < right.arc;
+    }
+};
+
+class PersistentLogicalRouteRegistry
 {
-    std::set<FiberletStorageKey> nodes;
-    std::vector<FiberletStorageKey> additions;
-    for (auto node = visited; node != nullptr; node = node->parent) {
-        if (node->added.has_value())
-            additions.push_back(*node->added);
-        if (node->base != nullptr) {
-            nodes = *node->base;
-            break;
+public:
+    PersistentLogicalRouteRegistry() : root_(std::make_shared<const PersistentLogicalRouteNode>()) {}
+
+    [[nodiscard]] const std::shared_ptr<const PersistentLogicalRouteNode>& root() const noexcept { return root_; }
+
+    [[nodiscard]] std::shared_ptr<const PersistentLogicalRouteNode> extend(const std::shared_ptr<const PersistentLogicalRouteNode>& parent, const DirectedFiberletStorageId& arc)
+    {
+        if (!parent)
+            throw std::invalid_argument("persistent logical route parent is missing");
+        const PersistentLogicalRouteInternKey key{parent.get(), arc};
+        auto& shard = shards_[shardIndex(key)];
+        std::lock_guard lock(shard.mutex);
+        if (const auto found = shard.nodes.find(key); found != shard.nodes.end()) {
+            if (auto existing = found->second.lock())
+                return existing;
+            shard.nodes.erase(found);
+        }
+        auto node = std::make_shared<PersistentLogicalRouteNode>();
+        node->parent = parent;
+        node->arc = arc;
+        node->depth = parent->depth + 1;
+        node->ancestors[0] = parent.get();
+        for (size_t level = 1; level < node->ancestors.size(); ++level) {
+            const auto* previous = node->ancestors[level - 1];
+            node->ancestors[level] = previous == nullptr ? nullptr : previous->ancestors[level - 1];
+        }
+        shard.nodes.emplace(key, node);
+        return node;
+    }
+
+    void pruneExpired()
+    {
+        for (auto& shard : shards_) {
+            std::lock_guard lock(shard.mutex);
+            std::erase_if(shard.nodes, [](const auto& item) { return item.second.expired(); });
         }
     }
-    nodes.insert(additions.begin(), additions.end());
-    return makeVisitedRoot(std::move(nodes));
+
+private:
+    struct Shard {
+        std::mutex mutex;
+        std::map<PersistentLogicalRouteInternKey, std::weak_ptr<const PersistentLogicalRouteNode>, PersistentLogicalRouteInternKeyLess> nodes;
+    };
+
+    static size_t shardIndex(const PersistentLogicalRouteInternKey& key)
+    {
+        size_t value = reinterpret_cast<std::uintptr_t>(key.parent) >> 4;
+        for (const auto coordinate : key.arc.fiberlet.first.coordinateZYX)
+            value ^= static_cast<size_t>(coordinate) + 0x9e3779b9U + (value << 6) + (value >> 2);
+        value ^= static_cast<size_t>(key.arc.fiberlet.first.variant) + (value << 6) + (value >> 2);
+        return value % kShardCount;
+    }
+
+    static constexpr size_t kShardCount = 32;
+    std::shared_ptr<const PersistentLogicalRouteNode> root_;
+    std::array<Shard, kShardCount> shards_;
+};
+
+const PersistentLogicalRouteNode* logicalRouteAncestorAtDepth(const PersistentLogicalRouteNode* node, size_t depth)
+{
+    if (node == nullptr || depth > node->depth)
+        throw std::invalid_argument("persistent logical route ancestor depth is invalid");
+    size_t distance = node->depth - depth;
+    for (size_t level = 0; distance != 0; ++level) {
+        if (distance & 1U)
+            node = node->ancestors[level];
+        distance >>= 1;
+    }
+    return node;
+}
+
+const PersistentLogicalRouteNode* logicalRouteLowestCommonAncestor(const PersistentLogicalRouteNode* left, const PersistentLogicalRouteNode* right)
+{
+    if (left == nullptr || right == nullptr)
+        throw std::invalid_argument("persistent logical route is missing");
+    const size_t commonDepth = std::min(left->depth, right->depth);
+    left = logicalRouteAncestorAtDepth(left, commonDepth);
+    right = logicalRouteAncestorAtDepth(right, commonDepth);
+    if (left == right)
+        return left;
+    for (size_t level = kLogicalRouteAncestorLevels; level-- > 0;) {
+        if (left->ancestors[level] != right->ancestors[level]) {
+            left = left->ancestors[level];
+            right = right->ancestors[level];
+        }
+    }
+    return left->parent.get();
+}
+
+bool logicalRouteLess(const PersistentLogicalRouteNode* left, const PersistentLogicalRouteNode* right)
+{
+    if (left == right)
+        return false;
+    const auto* originalLeft = left;
+    const auto* originalRight = right;
+    const auto* common = logicalRouteLowestCommonAncestor(left, right);
+    if (common == originalLeft)
+        return true;
+    if (common == originalRight)
+        return false;
+    const auto* leftChild = logicalRouteAncestorAtDepth(originalLeft, common->depth + 1);
+    const auto* rightChild = logicalRouteAncestorAtDepth(originalRight, common->depth + 1);
+    return leftChild->arc < rightChild->arc;
+}
+
+std::vector<DirectedFiberletStorageId> logicalRouteArcs(const PersistentLogicalRouteNode* route)
+{
+    if (route == nullptr)
+        throw std::invalid_argument("persistent logical route is missing");
+    std::vector<DirectedFiberletStorageId> result(route->depth);
+    for (size_t offset = route->depth; offset > 0; --offset) {
+        result[offset - 1] = route->arc;
+        route = route->parent.get();
+    }
+    return result;
 }
 
 struct PersistentRouteHistory {
     std::shared_ptr<const PersistentRouteHistory> parent;
     DirectedFiberletStorageId arc;
-    DirectedFiberletStorageId logicalArc;
+    std::shared_ptr<const PersistentLogicalRouteNode> logicalRoute;
     std::optional<FiberletReplaySourceTransition> enteringTransition;
     std::shared_ptr<const PersistentVisitedNodes> visitedNodes;
     FiberletGraphReplayCost cumulativeEdgeCost;
@@ -273,10 +445,30 @@ struct PersistentRouteHistory {
     size_t arcCount = 0;
 };
 
+struct PersistentRouteEvaluation {
+    std::shared_ptr<const PersistentRouteEvaluation> parent;
+    std::shared_ptr<const PersistentRouteHistory> history;
+    std::vector<cv::Vec3d> appendedPointsBaseXYZ;
+    std::vector<FiberletGraphReplayMatch> appendedMatches;
+    std::optional<FiberletGraphReplayCommittedStep> committedStep;
+    FiberletGraphReplayCost cumulativeEdgeCost;
+    FiberletGraphReplayCost cumulativeTransitionCost;
+    double cumulativePathLengthPredictionVoxels = 0.0;
+    double matchedReferenceArcBase = 0.0;
+    size_t routePointCount = 0;
+    cv::Vec3d lastPointBaseXYZ{0.0, 0.0, 0.0};
+    std::optional<FiberReplayFailure> failure;
+    std::optional<size_t> failureCandidatePathPointIndex;
+    bool reachedReferenceEnd = false;
+    bool traversedFullEdge = false;
+};
+
 struct PersistentRouteCandidate {
     FiberletStorageKey seed;
     std::shared_ptr<const PersistentRouteHistory> tail;
     std::shared_ptr<const PersistentVisitedNodes> visitedNodes;
+    std::shared_ptr<const PersistentLogicalRouteNode> logicalRoute;
+    std::shared_ptr<const PersistentRouteEvaluation> evaluation;
     FiberletGraphReplayCost edgeCost;
     FiberletGraphReplayCost transitionCost;
     double pathLength = 0.0;
@@ -295,10 +487,7 @@ std::vector<const PersistentRouteHistory*> persistentRouteHistory(const Persiste
 
 std::vector<DirectedFiberletStorageId> persistentRouteLogicalArcs(const PersistentRouteCandidate& route)
 {
-    std::vector<DirectedFiberletStorageId> result;
-    for (const auto* node : persistentRouteHistory(route))
-        result.push_back(node->logicalArc);
-    return result;
+    return logicalRouteArcs(route.logicalRoute.get());
 }
 
 double persistentRouteLoss(const PersistentRouteCandidate& route)
@@ -347,6 +536,7 @@ struct ExactPersistentStateBudget {
 
 std::vector<PersistentRouteCandidate> persistentRouteSuccessors(
     const FiberletReplayGraphSource& graph,
+    PersistentLogicalRouteRegistry& logicalRoutes,
     const PersistentRouteCandidate& route,
     const std::optional<cv::Vec3d>& initialDirection,
     ExactPersistentStateBudget& stateBudget,
@@ -392,10 +582,12 @@ std::vector<PersistentRouteCandidate> persistentRouteSuccessors(
             next.transitionCost += transition->cost;
         next.pathLength += edgeLength;
         next.visitedNodes = persistentVisitedAdd(route.visitedNodes, edge.target);
+        const auto logicalArc = graph.logicalArcId(outgoingId);
+        next.logicalRoute = logicalRoutes.extend(route.logicalRoute, logicalArc);
         next.tail = std::make_shared<PersistentRouteHistory>(PersistentRouteHistory{
             route.tail,
             outgoingId,
-            graph.logicalArcId(outgoingId),
+            next.logicalRoute,
             transition,
             next.visitedNodes,
             next.edgeCost,
@@ -463,8 +655,11 @@ PersistentRouteCandidate persistentRouteCommittedPrefix(const FiberletReplayGrap
     }
     PersistentRouteCandidate prefix;
     prefix.seed = route.seed;
-    auto visited = makeVisitedRoot(std::set<FiberletStorageKey>{route.seed});
-    prefix.visitedNodes = visited;
+    prefix.visitedNodes = persistentVisitedAdd(nullptr, route.seed);
+    prefix.logicalRoute = route.logicalRoute;
+    while (prefix.logicalRoute->depth > 0)
+        prefix.logicalRoute = prefix.logicalRoute->parent;
+    prefix.evaluation = route.evaluation;
     if (checkpointPredictionVoxels <= kReplayEpsilon)
         return prefix;
     auto crossing = route.tail;
@@ -479,6 +674,7 @@ PersistentRouteCandidate persistentRouteCommittedPrefix(const FiberletReplayGrap
     prefix.transitionCost = crossing->cumulativeTransitionCost;
     prefix.pathLength = crossing->cumulativePathLength;
     prefix.visitedNodes = crossing->visitedNodes;
+    prefix.logicalRoute = crossing->logicalRoute;
     return prefix;
 }
 
@@ -497,8 +693,6 @@ std::vector<cv::Vec3d> persistentRoutePoints(const FiberletReplayGraphSource& gr
 struct RankedPersistentPrefix {
     PersistentRouteCandidate prefix;
     PersistentRouteCandidate lookahead;
-    std::vector<DirectedFiberletStorageId> prefixLogicalArcs;
-    std::vector<DirectedFiberletStorageId> lookaheadLogicalArcs;
     FiberletGraphReplayCost scoredEdgeCost;
     FiberletGraphReplayCost scoredTransitionCost;
     double scoredPathLength = 0.0;
@@ -528,18 +722,15 @@ bool rankedPersistentPrefixLess(const RankedPersistentPrefix& left, const Ranked
 {
     if (left.totalLoss != right.totalLoss)
         return left.totalLoss < right.totalLoss;
-    const auto leftLookahead = persistentRouteLogicalArcs(left.lookahead);
-    const auto rightLookahead = persistentRouteLogicalArcs(right.lookahead);
-    if (leftLookahead != rightLookahead)
-        return leftLookahead < rightLookahead;
-    return persistentRouteLogicalArcs(left.prefix) < persistentRouteLogicalArcs(right.prefix);
+    if (left.lookahead.logicalRoute != right.lookahead.logicalRoute)
+        return logicalRouteLess(left.lookahead.logicalRoute.get(), right.lookahead.logicalRoute.get());
+    return logicalRouteLess(left.prefix.logicalRoute.get(), right.prefix.logicalRoute.get());
 }
 
 void retainRankedPersistentPrefix(RankedPersistentPrefix entry, size_t beamWidth, std::vector<RankedPersistentPrefix>& ranked)
 {
-    const auto entryPrefixArcs = persistentRouteLogicalArcs(entry.prefix);
     const auto equivalent = std::find_if(ranked.begin(), ranked.end(), [&](const auto& existing) {
-        return existing.prefix.seed == entry.prefix.seed && persistentRouteLogicalArcs(existing.prefix) == entryPrefixArcs;
+        return existing.prefix.seed == entry.prefix.seed && existing.prefix.logicalRoute == entry.prefix.logicalRoute;
     });
     if (equivalent != ranked.end()) {
         if (rankedPersistentPrefixLess(entry, *equivalent))
@@ -644,6 +835,7 @@ private:
 
 std::vector<PersistentRouteCandidate> persistentCheckpointPrefixes(
     const FiberletReplayGraphSource& graph,
+    PersistentLogicalRouteRegistry& logicalRoutes,
     const std::vector<PersistentRouteCandidate>& initialRoutes,
     double checkpointPredictionVoxels,
     const cv::Vec3d& initialDirection,
@@ -665,7 +857,13 @@ std::vector<PersistentRouteCandidate> persistentCheckpointPrefixes(
         auto route = std::move(pending[index]);
         ++stats.expanded;
         auto successors = persistentRouteSuccessors(
-            graph, route, route.tail == nullptr ? std::make_optional(initialDirection) : std::nullopt, stateBudget, stats.generated, stats.rejected);
+            graph,
+            logicalRoutes,
+            route,
+            route.tail == nullptr ? std::make_optional(initialDirection) : std::nullopt,
+            stateBudget,
+            stats.generated,
+            stats.rejected);
         for (auto successor : successors) {
             if (successor.pathLength >= checkpointPredictionVoxels - kReplayEpsilon)
                 prefixes.push_back(std::move(successor));
@@ -678,6 +876,7 @@ std::vector<PersistentRouteCandidate> persistentCheckpointPrefixes(
 
 std::optional<RankedPersistentPrefix> exactPersistentPrefixContinuation(
     const FiberletReplayGraphSource& graph,
+    PersistentLogicalRouteRegistry& logicalRoutes,
     const PersistentRouteCandidate& prefix,
     double scoringHorizonPredictionVoxels,
     double checkpointPredictionVoxels,
@@ -726,7 +925,7 @@ std::optional<RankedPersistentPrefix> exactPersistentPrefixContinuation(
         auto route = std::move(pending.top().route);
         pending.pop();
         ++stats.expanded;
-        auto successors = persistentRouteSuccessors(graph, route, std::nullopt, stateBudget, stats.generated, stats.rejected);
+        auto successors = persistentRouteSuccessors(graph, logicalRoutes, route, std::nullopt, stateBudget, stats.generated, stats.rejected);
         for (auto successor : successors) {
             if (successor.pathLength >= scoringHorizonPredictionVoxels - kReplayEpsilon) {
                 retainCompletion(std::move(successor));
@@ -745,6 +944,7 @@ std::optional<RankedPersistentPrefix> exactPersistentPrefixContinuation(
 
 std::vector<RankedPersistentPrefix> exactPersistentRouteLookahead(
     const FiberletReplayGraphSource& graph,
+    PersistentLogicalRouteRegistry& logicalRoutes,
     const std::vector<PersistentRouteCandidate>& initialRoutes,
     double scoringHorizonPredictionVoxels,
     double checkpointPredictionVoxels,
@@ -760,7 +960,8 @@ std::vector<RankedPersistentPrefix> exactPersistentRouteLookahead(
     }
     ExactPersistentStateBudget stateBudget;
     stateBudget.maximum = maximumGeneratedStates;
-    auto prefixes = persistentCheckpointPrefixes(graph, initialRoutes, checkpointPredictionVoxels, initialDirection, stateBudget, stats);
+    auto prefixes =
+        persistentCheckpointPrefixes(graph, logicalRoutes, initialRoutes, checkpointPredictionVoxels, initialDirection, stateBudget, stats);
     RelaxedPersistentCostToGo costToGo(graph);
     std::vector<std::optional<RankedPersistentPrefix>> completions(prefixes.size());
     std::vector<ExactPersistentSearchStats> prefixStats(prefixes.size());
@@ -775,7 +976,7 @@ std::vector<RankedPersistentPrefix> exactPersistentRouteLookahead(
                 if (index >= prefixes.size())
                     return;
                 completions[index] =
-                    exactPersistentPrefixContinuation(graph, prefixes[index], scoringHorizonPredictionVoxels, checkpointPredictionVoxels, costToGo, stateBudget, prefixStats[index]);
+                    exactPersistentPrefixContinuation(graph, logicalRoutes, prefixes[index], scoringHorizonPredictionVoxels, checkpointPredictionVoxels, costToGo, stateBudget, prefixStats[index]);
             }
         }));
     }
@@ -793,33 +994,46 @@ std::vector<RankedPersistentPrefix> exactPersistentRouteLookahead(
             retainRankedPersistentPrefix(std::move(*completions[index]), beamWidth, ranked);
         }
     }
-    for (auto& entry : ranked) {
-        entry.prefixLogicalArcs = persistentRouteLogicalArcs(entry.prefix);
-        entry.lookaheadLogicalArcs = persistentRouteLogicalArcs(entry.lookahead);
-    }
     return ranked;
 }
 
 struct BoundedPersistentRoute {
     PersistentRouteCandidate route;
-    std::vector<DirectedFiberletStorageId> stablePrefixLogicalArcs;
+    std::shared_ptr<const PersistentLogicalRouteNode> stablePrefixLogicalRoute;
 };
 
 struct BoundedRankedPersistentRoute {
     RankedPersistentPrefix ranked;
-    std::vector<DirectedFiberletStorageId> stablePrefixLogicalArcs;
+    std::shared_ptr<const PersistentLogicalRouteNode> stablePrefixLogicalRoute;
 };
 
-using StablePersistentPrefixKey = std::pair<FiberletStorageKey, std::vector<DirectedFiberletStorageId>>;
+struct StablePersistentPrefixKey {
+    FiberletStorageKey seed;
+    std::shared_ptr<const PersistentLogicalRouteNode> logicalRoute;
+};
+
+struct StablePersistentPrefixKeyLess {
+    bool operator()(const StablePersistentPrefixKey& left, const StablePersistentPrefixKey& right) const
+    {
+        if (left.seed != right.seed)
+            return left.seed < right.seed;
+        return logicalRouteLess(left.logicalRoute.get(), right.logicalRoute.get());
+    }
+};
+
+bool operator==(const StablePersistentPrefixKey& left, const StablePersistentPrefixKey& right)
+{
+    return left.seed == right.seed && left.logicalRoute == right.logicalRoute;
+}
 
 StablePersistentPrefixKey stablePersistentPrefixKey(const BoundedRankedPersistentRoute& route)
 {
-    return {route.ranked.lookahead.seed, route.stablePrefixLogicalArcs};
+    return {route.ranked.lookahead.seed, route.stablePrefixLogicalRoute};
 }
 
 StablePersistentPrefixKey completePersistentRouteKey(const BoundedRankedPersistentRoute& route)
 {
-    return {route.ranked.lookahead.seed, route.ranked.lookaheadLogicalArcs};
+    return {route.ranked.lookahead.seed, route.ranked.lookahead.logicalRoute};
 }
 
 bool boundedRankedPersistentRouteLess(const BoundedRankedPersistentRoute& left, const BoundedRankedPersistentRoute& right)
@@ -828,7 +1042,7 @@ bool boundedRankedPersistentRouteLess(const BoundedRankedPersistentRoute& left, 
         return true;
     if (rankedPersistentPrefixLess(right.ranked, left.ranked))
         return false;
-    return stablePersistentPrefixKey(left) < stablePersistentPrefixKey(right);
+    return StablePersistentPrefixKeyLess{}(stablePersistentPrefixKey(left), stablePersistentPrefixKey(right));
 }
 
 void retainLocalBoundedRoute(BoundedRankedPersistentRoute entry, size_t searchWidth, std::vector<BoundedRankedPersistentRoute>& retained)
@@ -900,11 +1114,12 @@ bool persistentLabelLess(const PersistentRouteCandidate& route, double loss, con
 {
     if (loss != winner.accumulatedLoss)
         return loss < winner.accumulatedLoss;
-    return persistentRouteLogicalArcs(route) < persistentRouteLogicalArcs(winner.route);
+    return logicalRouteLess(route.logicalRoute.get(), winner.route.logicalRoute.get());
 }
 
 BoundedPersistentExpansionResult expandPersistentRouteToFront(
     const FiberletReplayGraphSource& graph,
+    PersistentLogicalRouteRegistry& logicalRoutes,
     const BoundedPersistentRoute& initial,
     double frontPredictionVoxels,
     double frontBeginPredictionVoxels,
@@ -969,11 +1184,9 @@ BoundedPersistentExpansionResult expandPersistentRouteToFront(
         if (route.pathLength >= frontPredictionVoxels - kReplayEpsilon) {
             ++result.stats.completed;
             auto ranked = makeRankedPersistentPrefix(graph, std::move(route), checkpointPredictionVoxels, frontPredictionVoxels);
-            ranked.prefixLogicalArcs = persistentRouteLogicalArcs(ranked.prefix);
-            ranked.lookaheadLogicalArcs = persistentRouteLogicalArcs(ranked.lookahead);
-            auto stablePrefix = initial.stablePrefixLogicalArcs;
-            if (stablePrefix.empty()) {
-                stablePrefix = persistentRouteLogicalArcs(persistentRouteCommittedPrefix(graph, ranked.lookahead, stablePrefixPredictionVoxels));
+            auto stablePrefix = initial.stablePrefixLogicalRoute;
+            if (!stablePrefix) {
+                stablePrefix = persistentRouteCommittedPrefix(graph, ranked.lookahead, stablePrefixPredictionVoxels).logicalRoute;
             }
             BoundedRankedPersistentRoute completed{std::move(ranked), std::move(stablePrefix)};
             const auto completionKey = persistentLabelKey(graph, completed.ranked.lookahead, frontPredictionVoxels);
@@ -999,6 +1212,7 @@ BoundedPersistentExpansionResult expandPersistentRouteToFront(
         ++result.stats.expanded;
         auto successors = persistentRouteSuccessors(
             graph,
+            logicalRoutes,
             route,
             route.tail == nullptr ? std::make_optional(initialDirection) : std::nullopt,
             stateBudget,
@@ -1030,7 +1244,7 @@ std::vector<BoundedRankedPersistentRoute> selectBoundedFront(
     std::sort(candidates.begin(), candidates.end(), boundedRankedPersistentRouteLess);
     std::vector<BoundedRankedPersistentRoute> unique;
     unique.reserve(candidates.size());
-    std::set<StablePersistentPrefixKey> completeRoutes;
+    std::set<StablePersistentPrefixKey, StablePersistentPrefixKeyLess> completeRoutes;
     for (auto& candidate : candidates) {
         if (completeRoutes.insert(completePersistentRouteKey(candidate)).second)
             unique.push_back(std::move(candidate));
@@ -1038,23 +1252,24 @@ std::vector<BoundedRankedPersistentRoute> selectBoundedFront(
 
     std::vector<BoundedRankedPersistentRoute> selected;
     selected.reserve(std::min(retainedWidth, unique.size()));
-    std::set<StablePersistentPrefixKey> selectedPrefixes;
-    std::set<StablePersistentPrefixKey> selectedRoutes;
+    std::set<StablePersistentPrefixKey, StablePersistentPrefixKeyLess> selectedPrefixes;
+    std::set<StablePersistentPrefixKey, StablePersistentPrefixKeyLess> selectedRoutes;
     for (auto& candidate : unique) {
         if (selected.size() >= retainedWidth)
             break;
-        const StablePersistentPrefixKey prefixKey = finalFront ? StablePersistentPrefixKey{candidate.ranked.prefix.seed, candidate.ranked.prefixLogicalArcs}
-                                                               : stablePersistentPrefixKey(candidate);
+        const StablePersistentPrefixKey prefixKey =
+            finalFront ? StablePersistentPrefixKey{candidate.ranked.prefix.seed, candidate.ranked.prefix.logicalRoute}
+                       : stablePersistentPrefixKey(candidate);
         if (!selectedPrefixes.insert(prefixKey).second)
             continue;
         selectedRoutes.insert(completePersistentRouteKey(candidate));
         selected.push_back(candidate);
         ++diagnostics.diversityProtectedCount;
     }
-    std::set<StablePersistentPrefixKey> allPrefixes;
+    std::set<StablePersistentPrefixKey, StablePersistentPrefixKeyLess> allPrefixes;
     for (const auto& candidate : unique) {
         allPrefixes.insert(
-            finalFront ? StablePersistentPrefixKey{candidate.ranked.prefix.seed, candidate.ranked.prefixLogicalArcs}
+            finalFront ? StablePersistentPrefixKey{candidate.ranked.prefix.seed, candidate.ranked.prefix.logicalRoute}
                        : stablePersistentPrefixKey(candidate));
     }
     diagnostics.distinctPrefixCount = allPrefixes.size();
@@ -1079,11 +1294,12 @@ std::vector<BoundedRankedPersistentRoute> selectBoundedFront(
 struct BoundedPersistentLookaheadResult {
     std::vector<RankedPersistentPrefix> ranked;
     std::vector<FiberletGraphReplayPruneFront> fronts;
-    std::vector<DirectedFiberletStorageId> selectedPrefixLogicalArcs;
+    std::shared_ptr<const PersistentLogicalRouteNode> selectedPrefixLogicalRoute;
 };
 
 BoundedPersistentLookaheadResult boundedPersistentRouteLookahead(
     const FiberletReplayGraphSource& graph,
+    PersistentLogicalRouteRegistry& logicalRoutes,
     const std::vector<PersistentRouteCandidate>& initialRoutes,
     double scoringHorizonPredictionVoxels,
     double rolloutBeginPredictionVoxels,
@@ -1113,7 +1329,7 @@ BoundedPersistentLookaheadResult boundedPersistentRouteLookahead(
     std::vector<BoundedPersistentRoute> active;
     active.reserve(initialRoutes.size());
     for (const auto& route : initialRoutes)
-        active.push_back({route, {}});
+        active.push_back({route, nullptr});
 
     BoundedPersistentLookaheadResult result;
     for (size_t frontIndex = 0; frontIndex < fronts.size(); ++frontIndex) {
@@ -1125,9 +1341,9 @@ BoundedPersistentLookaheadResult boundedPersistentRouteLookahead(
         const size_t targetWidth = finalFront ? beamWidth : searchWidth;
         size_t localCandidateLimit = targetWidth;
         if (frontIndex > 0) {
-            std::set<StablePersistentPrefixKey> activePrefixes;
+            std::set<StablePersistentPrefixKey, StablePersistentPrefixKeyLess> activePrefixes;
             for (const auto& route : active)
-                activePrefixes.insert({route.route.seed, route.stablePrefixLogicalArcs});
+                activePrefixes.insert({route.route.seed, route.stablePrefixLogicalRoute});
             const size_t globalFillSlots = targetWidth > activePrefixes.size() ? targetWidth - activePrefixes.size() : 0;
             localCandidateLimit = std::min(targetWidth, globalFillSlots + 1);
         }
@@ -1137,10 +1353,10 @@ BoundedPersistentLookaheadResult boundedPersistentRouteLookahead(
             size_t rootGenerated = 0;
             size_t rootRejected = 0;
             auto successors =
-                persistentRouteSuccessors(graph, active.front().route, active.front().route.tail == nullptr ? std::make_optional(initialDirection) : std::nullopt, stateBudget, rootGenerated, rootRejected);
+                persistentRouteSuccessors(graph, logicalRoutes, active.front().route, active.front().route.tail == nullptr ? std::make_optional(initialDirection) : std::nullopt, stateBudget, rootGenerated, rootRejected);
             frontDiagnostics.generatedStateCount += rootGenerated;
             frontDiagnostics.rejectedStateCount += rootRejected;
-            const auto stablePrefix = active.front().stablePrefixLogicalArcs;
+            const auto stablePrefix = active.front().stablePrefixLogicalRoute;
             active.clear();
             active.reserve(successors.size());
             for (auto& successor : successors)
@@ -1158,7 +1374,7 @@ BoundedPersistentLookaheadResult boundedPersistentRouteLookahead(
                     if (inputIndex >= active.size())
                         return;
                     expanded[inputIndex] =
-                        expandPersistentRouteToFront(graph, active[inputIndex], fronts[frontIndex], frontBeginPredictionVoxels, checkpointPredictionVoxels, firstFront, initialDirection, localCandidateLimit, stateBudget);
+                        expandPersistentRouteToFront(graph, logicalRoutes, active[inputIndex], fronts[frontIndex], frontBeginPredictionVoxels, checkpointPredictionVoxels, firstFront, initialDirection, localCandidateLimit, stateBudget);
                 }
             }));
         }
@@ -1212,13 +1428,13 @@ BoundedPersistentLookaheadResult boundedPersistentRouteLookahead(
             for (auto& candidate : selected)
                 result.ranked.push_back(std::move(candidate.ranked));
             if (!selected.empty()) {
-                result.selectedPrefixLogicalArcs = selected.front().stablePrefixLogicalArcs;
+                result.selectedPrefixLogicalRoute = selected.front().stablePrefixLogicalRoute;
             }
         } else {
             active.clear();
             active.reserve(selected.size());
             for (auto& candidate : selected) {
-                active.push_back({std::move(candidate.ranked.lookahead), std::move(candidate.stablePrefixLogicalArcs)});
+                active.push_back({std::move(candidate.ranked.lookahead), std::move(candidate.stablePrefixLogicalRoute)});
             }
             if (active.empty())
                 break;
@@ -1704,9 +1920,19 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
         const double beamStepPredictionVoxels = config.beamStepDistanceBaseVoxels / predictionToBaseScale;
         const double lookaheadPredictionVoxels = config.lookaheadDistanceBaseVoxels / predictionToBaseScale;
         const double pruneDistancePredictionVoxels = config.pruneDistanceBaseVoxels / predictionToBaseScale;
+        PersistentLogicalRouteRegistry logicalRoutes;
         PersistentRouteCandidate initialBeam;
         initialBeam.seed = seed->node.id;
-        initialBeam.visitedNodes = makeVisitedRoot(std::set<FiberletStorageKey>{seed->node.id});
+        initialBeam.visitedNodes = persistentVisitedAdd(nullptr, seed->node.id);
+        initialBeam.logicalRoute = logicalRoutes.root();
+        auto rootEvaluation = std::make_shared<PersistentRouteEvaluation>();
+        rootEvaluation->appendedPointsBaseXYZ.emplace_back(seed->node.positionBaseXYZ);
+        rootEvaluation->appendedMatches.push_back(
+            {0, seed->projection.arc, seed->projection.arc, seed->projection.point, resetArc, seed->projection.arc, seed->thresholdMeasurement});
+        rootEvaluation->matchedReferenceArcBase = seed->projection.arc;
+        rootEvaluation->routePointCount = 1;
+        rootEvaluation->lastPointBaseXYZ = cv::Vec3d(seed->node.positionBaseXYZ);
+        initialBeam.evaluation = rootEvaluation;
         std::vector<PersistentRouteCandidate> beams{initialBeam};
         std::vector<FiberletGraphReplayDecision> decisions;
         PersistentRouteCandidate selectedRoute = initialBeam;
@@ -1717,111 +1943,190 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
         const cv::Vec3d initialDirection = samplePolylineArc(reference, seed->projection.arc).tangent;
         const size_t maximumGeneratedStates = config.maximumGeneratedStatesPerIteration;
 
-        const auto materializeSelected = [&](const PersistentRouteCandidate& route) {
-            FiberletGraphReplaySegment built;
-            std::set<FiberletStorageKey> traversedNodes{seed->node.id};
-            built.seedKey = seed->node.id;
-            built.startReferenceArcBase = seed->projection.arc;
-            built.endReferenceArcBase = seed->projection.arc;
-            built.routePointsBaseXYZ.emplace_back(seed->node.positionBaseXYZ);
-            built.matches.push_back(
-                {0, seed->projection.arc, seed->projection.arc, seed->projection.point, resetArc, seed->projection.arc, seed->thresholdMeasurement});
-            double matchedArc = seed->projection.arc;
-            std::optional<FiberReplayFailure> firstFailure;
-            bool reachedEnd = false;
-            const auto history = persistentRouteHistory(route);
-            for (size_t arcOffset = 0; arcOffset < history.size(); ++arcOffset) {
-                const auto* historyNode = history[arcOffset];
+        const auto addReplayCost = [](FiberletGraphReplayCost& target, const FiberletGraphReplayCost& source) {
+            target.invalidPrediction += source.invalidPrediction;
+            target.alignment += source.alignment;
+            target.isotropicSmoothness += source.isotropicSmoothness;
+            target.tangentSmoothness += source.tangentSmoothness;
+            target.normalSmoothness += source.normalSmoothness;
+        };
+        std::map<const PersistentRouteHistory*, std::shared_ptr<const PersistentRouteEvaluation>> evaluatedHistory;
+        const auto evaluateRoute = [&](PersistentRouteCandidate& route) {
+            auto evaluated = route.evaluation;
+            if (!evaluated)
+                throw std::logic_error("persistent beam evaluator continuation is missing");
+            std::vector<std::shared_ptr<const PersistentRouteHistory>> missing;
+            for (auto history = route.tail; history != nullptr; history = history->parent) {
+                if (const auto found = evaluatedHistory.find(history.get()); found != evaluatedHistory.end()) {
+                    evaluated = found->second;
+                    break;
+                }
+                if (history == evaluated->history)
+                    break;
+                missing.push_back(history);
+            }
+            if (!missing.empty() && missing.back()->parent != evaluated->history)
+                throw std::logic_error("persistent beam evaluator is not an ancestor of the route");
+            std::reverse(missing.begin(), missing.end());
+            for (const auto& historyNode : missing) {
+                if (evaluated->failure.has_value() || evaluated->reachedReferenceEnd)
+                    break;
                 const auto arcId = historyNode->arc;
                 const auto edge = graph.arc(arcId);
                 const auto fullPoints = graph.routePoints(arcId);
-                const double remainingPathLength = std::max(0.0, maximumRouteLengthPredictionVoxels - built.pathLengthPredictionVoxels);
+                const double remainingPathLength = std::max(0.0, maximumRouteLengthPredictionVoxels - evaluated->cumulativePathLengthPredictionVoxels);
                 const double includedArcFraction = std::clamp(remainingPathLength / static_cast<double>(edge.pathLengthPredictionVoxels), 0.0, 1.0);
                 const auto points = routePointPrefix(fullPoints, includedArcFraction);
                 if (points.size() < 2)
                     throw std::logic_error("persistent beam route is too short");
                 double fullGeometryLengthBase = 0.0;
-                for (size_t pointIndex = 1; pointIndex < fullPoints.size(); ++pointIndex) {
+                for (size_t pointIndex = 1; pointIndex < fullPoints.size(); ++pointIndex)
                     fullGeometryLengthBase += length(fullPoints[pointIndex] - fullPoints[pointIndex - 1]);
-                }
                 if (!(fullGeometryLengthBase > kReplayEpsilon))
                     throw std::logic_error("persistent beam route has zero geometry length");
-                const size_t candidateIndex = edge.diagnosticCandidateIndex.value_or(stableIndex(candidateIndices, arcId.fiberlet));
-                const size_t arcIndex = edge.diagnosticArcIndex.value_or(stableIndex(arcIndices, arcId));
-                built.candidateIndices.push_back(candidateIndex);
-                built.arcIndices.push_back(arcIndex);
+
+                auto next = std::make_shared<PersistentRouteEvaluation>();
+                next->parent = evaluated;
+                next->history = historyNode;
+                next->cumulativeEdgeCost = evaluated->cumulativeEdgeCost;
+                next->cumulativeTransitionCost = evaluated->cumulativeTransitionCost;
+                next->cumulativePathLengthPredictionVoxels = evaluated->cumulativePathLengthPredictionVoxels;
+                next->matchedReferenceArcBase = evaluated->matchedReferenceArcBase;
+                next->routePointCount = evaluated->routePointCount;
+                next->lastPointBaseXYZ = evaluated->lastPointBaseXYZ;
+
                 FiberletGraphReplayCommittedStep step;
-                step.referenceBeginArcBase = matchedArc;
-                double traversedGeometryLengthBase = 0.0;
+                step.referenceBeginArcBase = next->matchedReferenceArcBase;
                 if (historyNode->enteringTransition.has_value()) {
                     const auto& join = *historyNode->enteringTransition;
                     step.transitionCost += join.cost;
-                    built.transitionCost += join.cost;
-                    built.transitionIndices.push_back(
-                        join.diagnosticTransitionIndex.value_or(stableIndex(transitionIndices, std::pair{join.incoming, join.outgoing})));
+                    next->cumulativeTransitionCost += join.cost;
                 }
+                double traversedGeometryLengthBase = 0.0;
                 for (size_t pointIndex = 1; pointIndex < points.size(); ++pointIndex) {
-                    const double stepBase = length(points[pointIndex] - built.routePointsBaseXYZ.back());
+                    const double stepBase = length(points[pointIndex] - next->lastPointBaseXYZ);
                     traversedGeometryLengthBase += stepBase;
                     const auto forwardMatch =
-                        matchForwardPolylinePoint(reference, points[pointIndex], matchedArc, stepBase, config.matchRefineSteps, referenceEndArcBase);
+                        matchForwardPolylinePoint(reference, points[pointIndex], next->matchedReferenceArcBase, stepBase, config.matchRefineSteps, referenceEndArcBase);
                     const auto thresholdMeasurement = measureFiberReplayThreshold(
                         points[pointIndex], forwardMatch.projection.point, normalSampler, normalWorkingToBaseScale, config.errorThresholdBaseVoxels);
-                    built.routePointsBaseXYZ.push_back(points[pointIndex]);
-                    built.matches.push_back({
-                        built.routePointsBaseXYZ.size() - 1,
+                    next->appendedPointsBaseXYZ.push_back(points[pointIndex]);
+                    next->appendedMatches.push_back({
+                        next->routePointCount,
                         forwardMatch.predictedArc,
                         forwardMatch.projection.arc,
                         forwardMatch.projection.point,
-                        matchedArc,
+                        next->matchedReferenceArcBase,
                         forwardMatch.searchEndArc,
                         thresholdMeasurement,
                     });
-                    matchedArc = forwardMatch.projection.arc;
-                    built.endReferenceArcBase = matchedArc;
-                    if (!firstFailure.has_value() && fiberReplayThresholdExceeded(thresholdMeasurement, config.errorThresholdBaseVoxels)) {
+                    ++next->routePointCount;
+                    next->lastPointBaseXYZ = points[pointIndex];
+                    next->matchedReferenceArcBase = forwardMatch.projection.arc;
+                    if (!next->failure.has_value() && fiberReplayThresholdExceeded(thresholdMeasurement, config.errorThresholdBaseVoxels)) {
                         FiberReplayFailure event;
                         event.segmentIndex = result.segments.size();
                         event.reason = "distance_above_threshold";
-                        event.referenceArcBase = matchedArc;
+                        event.referenceArcBase = next->matchedReferenceArcBase;
                         event.evaluatorPointBase = points[pointIndex];
-                        event.segmentPointIndex = built.routePointsBaseXYZ.size() - 1;
-                        event.candidateIndex = candidateIndex;
-                        event.arcIndex = arcIndex;
-                        event.candidatePathPointIndex = pointIndex;
+                        event.segmentPointIndex = next->routePointCount - 1;
                         event.thresholdMeasurement = thresholdMeasurement;
-                        firstFailure = std::move(event);
+                        next->failure = std::move(event);
+                        next->failureCandidatePathPointIndex = pointIndex;
                     }
-                    if (matchedArc >= referenceEndArcBase - kReplayEpsilon) {
-                        reachedEnd = true;
+                    if (next->matchedReferenceArcBase >= referenceEndArcBase - kReplayEpsilon) {
+                        next->reachedReferenceEnd = true;
                         break;
                     }
                 }
                 const double traversedFraction = std::clamp(traversedGeometryLengthBase / fullGeometryLengthBase, 0.0, includedArcFraction);
                 addScaledCost(step.edgeCost, edge.cost, traversedFraction);
                 step.pathLengthPredictionVoxels = traversedFraction * edge.pathLengthPredictionVoxels;
-                built.edgeCost.invalidPrediction += step.edgeCost.invalidPrediction;
-                built.edgeCost.alignment += step.edgeCost.alignment;
-                built.edgeCost.isotropicSmoothness += step.edgeCost.isotropicSmoothness;
-                built.edgeCost.tangentSmoothness += step.edgeCost.tangentSmoothness;
-                built.edgeCost.normalSmoothness += step.edgeCost.normalSmoothness;
-                built.pathLengthPredictionVoxels += step.pathLengthPredictionVoxels;
-                if (traversedFraction >= 1.0 - kReplayEpsilon)
-                    traversedNodes.insert(edge.target);
-                step.referenceEndArcBase = matchedArc;
-                built.committedSteps.push_back(std::move(step));
-                if (firstFailure.has_value() || reachedEnd)
-                    break;
-                if (includedArcFraction < 1.0 - kReplayEpsilon) {
-                    reachedEnd = true;
-                    break;
-                }
+                addReplayCost(next->cumulativeEdgeCost, step.edgeCost);
+                next->cumulativePathLengthPredictionVoxels += step.pathLengthPredictionVoxels;
+                next->traversedFullEdge = traversedFraction >= 1.0 - kReplayEpsilon;
+                step.referenceEndArcBase = next->matchedReferenceArcBase;
+                next->committedStep = std::move(step);
+                if (includedArcFraction < 1.0 - kReplayEpsilon)
+                    next->reachedReferenceEnd = true;
+                evaluated = std::move(next);
+                evaluatedHistory.insert_or_assign(historyNode.get(), evaluated);
             }
+            route.evaluation = evaluated;
+            return evaluated;
+        };
+
+        const auto materializeSelected = [&](const std::shared_ptr<const PersistentRouteEvaluation>& terminal) {
+            if (!terminal)
+                throw std::logic_error("persistent beam terminal evaluation is missing");
+            FiberletGraphReplaySegment built;
+            std::set<FiberletStorageKey> traversedNodes{seed->node.id};
+            built.seedKey = seed->node.id;
+            built.startReferenceArcBase = seed->projection.arc;
+            built.endReferenceArcBase = terminal->matchedReferenceArcBase;
+            std::vector<const PersistentRouteEvaluation*> contributions;
+            for (auto current = terminal.get(); current != nullptr; current = current->parent.get())
+                contributions.push_back(current);
+            std::reverse(contributions.begin(), contributions.end());
+            std::optional<FiberReplayFailure> failure = terminal->failure;
+            for (const auto* contribution : contributions) {
+                built.routePointsBaseXYZ
+                    .insert(built.routePointsBaseXYZ.end(), contribution->appendedPointsBaseXYZ.begin(), contribution->appendedPointsBaseXYZ.end());
+                built.matches.insert(built.matches.end(), contribution->appendedMatches.begin(), contribution->appendedMatches.end());
+                if (contribution->history != nullptr) {
+                    const auto& arcId = contribution->history->arc;
+                    const auto edge = graph.arc(arcId);
+                    const size_t candidateIndex = edge.diagnosticCandidateIndex.value_or(stableIndex(candidateIndices, arcId.fiberlet));
+                    const size_t arcIndex = edge.diagnosticArcIndex.value_or(stableIndex(arcIndices, arcId));
+                    built.candidateIndices.push_back(candidateIndex);
+                    built.arcIndices.push_back(arcIndex);
+                    if (contribution->history->enteringTransition.has_value()) {
+                        const auto& join = *contribution->history->enteringTransition;
+                        built.transitionIndices.push_back(
+                            join.diagnosticTransitionIndex.value_or(stableIndex(transitionIndices, std::pair{join.incoming, join.outgoing})));
+                    }
+                    if (failure.has_value() && contribution->failure.has_value() && contribution->failure->segmentPointIndex == failure->segmentPointIndex) {
+                        failure->candidateIndex = candidateIndex;
+                        failure->arcIndex = arcIndex;
+                        failure->candidatePathPointIndex = contribution->failureCandidatePathPointIndex;
+                    }
+                }
+                if (contribution->committedStep.has_value())
+                    built.committedSteps.push_back(*contribution->committedStep);
+                if (contribution->history != nullptr && contribution->traversedFullEdge)
+                    traversedNodes.insert(targetAnchor(contribution->history->arc));
+            }
+            built.edgeCost = terminal->cumulativeEdgeCost;
+            built.transitionCost = terminal->cumulativeTransitionCost;
+            built.pathLengthPredictionVoxels = terminal->cumulativePathLengthPredictionVoxels;
             built.totalLoss = built.edgeCost.total() + built.transitionCost.total();
-            built.terminalPartialEdge = !built.arcIndices.empty() && traversedNodes.size() <= built.arcIndices.size();
-            if (!built.terminalPartialEdge && !built.arcIndices.empty())
-                built.stopNodeIndex = stableIndex(nodeIndices, targetAnchor(history[built.arcIndices.size() - 1]->arc));
-            return std::tuple{std::move(built), std::move(firstFailure), reachedEnd, std::move(traversedNodes)};
+            built.terminalPartialEdge = terminal->history != nullptr && !terminal->traversedFullEdge;
+            if (!built.terminalPartialEdge && terminal->history != nullptr)
+                built.stopNodeIndex = stableIndex(nodeIndices, targetAnchor(terminal->history->arc));
+            return std::tuple{std::move(built), std::move(failure), terminal->reachedReferenceEnd, std::move(traversedNodes)};
+        };
+        std::set<const PersistentRouteHistory*> indexedSelectedHistory;
+        const auto indexSelectedRouteSuffix = [&](const std::shared_ptr<const PersistentRouteEvaluation>& terminal) {
+            std::vector<const PersistentRouteEvaluation*> unindexed;
+            for (auto current = terminal.get(); current != nullptr && current->history != nullptr; current = current->parent.get()) {
+                if (indexedSelectedHistory.contains(current->history.get()))
+                    break;
+                unindexed.push_back(current);
+            }
+            std::reverse(unindexed.begin(), unindexed.end());
+            for (const auto* contribution : unindexed) {
+                const auto& history = *contribution->history;
+                const auto edge = graph.arc(history.arc);
+                (void)edge.diagnosticCandidateIndex.value_or(stableIndex(candidateIndices, history.arc.fiberlet));
+                (void)edge.diagnosticArcIndex.value_or(stableIndex(arcIndices, history.arc));
+                if (history.enteringTransition.has_value()) {
+                    const auto& join = *history.enteringTransition;
+                    (void)join.diagnosticTransitionIndex.value_or(stableIndex(transitionIndices, std::pair{join.incoming, join.outgoing}));
+                }
+                indexedSelectedHistory.insert(contribution->history.get());
+            }
+            if (terminal->history != nullptr && terminal->traversedFullEdge)
+                (void)stableIndex(nodeIndices, targetAnchor(terminal->history->arc));
         };
 
         double checkpointPredictionVoxels = 0.0;
@@ -1832,16 +2137,17 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
             ExactPersistentSearchStats searchStats;
             std::vector<RankedPersistentPrefix> ranked;
             std::vector<FiberletGraphReplayPruneFront> pruneFronts;
-            std::vector<DirectedFiberletStorageId> selectedPrefixLogicalArcs;
+            std::shared_ptr<const PersistentLogicalRouteNode> selectedPrefixLogicalRoute;
             if (config.searchWidth == 0) {
-                ranked =
-                    exactPersistentRouteLookahead(graph, beams, scoringHorizon, nextCheckpoint, initialDirection, config.beamWidth, config.expansionThreads, maximumGeneratedStates, searchStats);
+                ranked = exactPersistentRouteLookahead(
+                    graph, logicalRoutes, beams, scoringHorizon, nextCheckpoint, initialDirection, config.beamWidth, config.expansionThreads, maximumGeneratedStates, searchStats);
                 if (!ranked.empty()) {
-                    selectedPrefixLogicalArcs = ranked.front().prefixLogicalArcs;
+                    selectedPrefixLogicalRoute = ranked.front().prefix.logicalRoute;
                 }
             } else {
                 auto bounded = boundedPersistentRouteLookahead(
                     graph,
+                    logicalRoutes,
                     beams,
                     scoringHorizon,
                     currentCheckpoint,
@@ -1855,7 +2161,7 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
                     searchStats);
                 ranked = std::move(bounded.ranked);
                 pruneFronts = std::move(bounded.fronts);
-                selectedPrefixLogicalArcs = std::move(bounded.selectedPrefixLogicalArcs);
+                selectedPrefixLogicalRoute = std::move(bounded.selectedPrefixLogicalRoute);
             }
             if (ranked.empty())
                 break;
@@ -1867,9 +2173,9 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
             beams.reserve(ranked.size());
             for (const auto& entry : ranked) {
                 auto prefix = entry.prefix;
-                prefix.visitedNodes = compactPersistentVisited(prefix.visitedNodes);
                 beams.push_back(std::move(prefix));
             }
+            logicalRoutes.pruneExpired();
             checkpointPredictionVoxels = nextCheckpoint;
             if (std::any_of(beams.begin(), beams.end(), [&](const auto& beam) {
                     return beam.pathLength + kReplayEpsilon < checkpointPredictionVoxels;
@@ -1877,12 +2183,14 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
                 throw std::logic_error("persistent beam checkpoint exceeds a committed route");
             }
             selectedRoute = beams.front();
+            evaluateRoute(selectedRoute);
 
-            auto [provisional, provisionalFailure, reachedEnd, provisionalTraversedNodes] = materializeSelected(selectedRoute);
-            previousReferenceArc = provisional.endReferenceArcBase;
+            const auto& selectedEvaluation = selectedRoute.evaluation;
+            indexSelectedRouteSuffix(selectedEvaluation);
+            previousReferenceArc = selectedEvaluation->matchedReferenceArcBase;
             if (config.recordDecisionDiagnostics) {
                 FiberletGraphReplayDecision decision;
-                decision.routePointIndex = provisional.routePointsBaseXYZ.empty() ? 0 : provisional.routePointsBaseXYZ.size() - 1;
+                decision.routePointIndex = selectedEvaluation->routePointCount == 0 ? 0 : selectedEvaluation->routePointCount - 1;
                 decision.referenceArcBase = previousReferenceArc;
                 decision.checkpointPathLengthPredictionVoxels = currentCheckpoint;
                 decision.nextCheckpointPathLengthPredictionVoxels = checkpointPredictionVoxels;
@@ -1898,13 +2206,13 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
                 decision.searchWidth = config.searchWidth;
                 decision.pruneDistancePredictionVoxels = pruneDistancePredictionVoxels;
                 decision.pruneFronts = std::move(pruneFronts);
-                decision.selectedPrefixLogicalArcs = std::move(selectedPrefixLogicalArcs);
+                decision.selectedPrefixLogicalArcs = logicalRouteArcs(selectedPrefixLogicalRoute.get());
                 decision.sourceKey = graph.logicalAnchorId(seed->node.id);
                 decision.selectedRouteIndex = 0;
                 for (const auto& entry : ranked) {
                     FiberletGraphReplayDecisionRoute route;
-                    route.prefixLogicalArcs = entry.prefixLogicalArcs;
-                    route.logicalArcs = entry.lookaheadLogicalArcs;
+                    route.prefixLogicalArcs = persistentRouteLogicalArcs(entry.prefix);
+                    route.logicalArcs = persistentRouteLogicalArcs(entry.lookahead);
                     route.routePointsBaseXYZ = persistentRoutePoints(graph, entry.lookahead, cv::Vec3d(seed->node.positionBaseXYZ));
                     route.edgeCost = entry.scoredEdgeCost;
                     route.transitionCost = entry.scoredTransitionCost;
@@ -1919,19 +2227,21 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
                 }
                 decisions.push_back(std::move(decision));
             }
-            if (provisionalFailure.has_value()) {
-                segment = std::move(provisional);
-                selectedTraversedNodes = std::move(provisionalTraversedNodes);
-                distanceFailure = std::move(provisionalFailure);
-            } else if (reachedEnd || checkpointPredictionVoxels >= maximumRouteLengthPredictionVoxels - kReplayEpsilon) {
-                segment = std::move(provisional);
-                selectedTraversedNodes = std::move(provisionalTraversedNodes);
+            if (selectedEvaluation->failure.has_value()) {
+                auto materialized = materializeSelected(selectedEvaluation);
+                segment = std::move(std::get<0>(materialized));
+                distanceFailure = std::move(std::get<1>(materialized));
+                selectedTraversedNodes = std::move(std::get<3>(materialized));
+            } else if (selectedEvaluation->reachedReferenceEnd || checkpointPredictionVoxels >= maximumRouteLengthPredictionVoxels - kReplayEpsilon) {
+                auto materialized = materializeSelected(selectedEvaluation);
+                segment = std::move(std::get<0>(materialized));
+                selectedTraversedNodes = std::move(std::get<3>(materialized));
                 referenceExhausted = true;
             }
             emitProgress(result.segments.size(), previousReferenceArc, "running", rolloutExpandedStateCount, minimumAppliedLocalPruneLossCutoffPerPredictionVoxel);
         }
         if (segment.routePointsBaseXYZ.size() <= 1) {
-            auto materialized = materializeSelected(selectedRoute);
+            auto materialized = materializeSelected(evaluateRoute(selectedRoute));
             segment = std::move(std::get<0>(materialized));
             selectedTraversedNodes = std::move(std::get<3>(materialized));
             if (!distanceFailure.has_value())
