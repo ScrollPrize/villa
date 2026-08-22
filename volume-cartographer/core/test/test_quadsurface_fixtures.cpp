@@ -7,6 +7,12 @@
 //   vc_obj2tifxyz <seg>_flat.obj <outdir> 128 1.0 --uv-metric
 // Result: ~210 KiB per segment, 129x129 grid (84% valid points), uuid in
 // meta.json matches the directory name.
+//
+// NOTE (scroll-prize/villa#1319): these fixtures were generated with the
+// pre-fix vc_obj2tifxyz, which wrote `scale` as a UV-derived length instead
+// of the correct grid-cells-per-voxel density. The 0.0078125 value checked
+// below is that old convention baked into the committed fixture data, not
+// the semantics newly-generated tifxyz files should follow.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
@@ -65,7 +71,7 @@ TEST_CASE("Fixture: segment 770 loads with the meta.json pins we converted")
     CHECK(qs.meta["uuid"].get_string() == std::string(kSeg770));
     CHECK(qs.meta["type"].get_string() == "seg");
     CHECK(qs.meta["format"].get_string() == "tifxyz");
-    // stretch_factor=128 -> scale = 1/128 = 0.0078125
+    // Pre-#1319-fix value baked into this fixture (see file header).
     CHECK(qs.scale()[0] == doctest::Approx(0.0078125f).epsilon(1e-5));
     CHECK(qs.scale()[1] == doctest::Approx(0.0078125f).epsilon(1e-5));
 }
