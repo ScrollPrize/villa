@@ -71,7 +71,17 @@ class PackedTrackCollection:
     def __init__(
             self, coordinates, offsets, source_ids, family_codes,
             arclengths, tortuosities, *, store_path=None, rows=None):
-        self.coordinates = np.asarray(coordinates, dtype=np.float32)
+        # The store keeps coordinates as int32 and the native loader maps the
+        # file, so they arrive as reclaimable file pages.  Converting the whole
+        # ROI to float32 here turns 2.01 GiB of them into anonymous memory
+        # before anyone has asked for a single point -- on a swapless host that
+        # is the one kind of page that cannot be given back.  Keep what the
+        # store gave us and convert where the points are used; `coordinates`
+        # still hands out the float32 array, but only if something wants it.
+        self._coordinates_raw = np.asarray(coordinates)
+        self._coordinates_f32 = (
+            self._coordinates_raw
+            if self._coordinates_raw.dtype == np.float32 else None)
         self.offsets = np.asarray(offsets, dtype=np.int64)
         self.source_ids = np.asarray(source_ids, dtype=np.uint64)
         self.family_codes = np.asarray(family_codes, dtype=np.int8)
@@ -87,6 +97,28 @@ class PackedTrackCollection:
                 or self.tortuosities.shape != self.source_ids.shape):
             raise ValueError('packed track metadata arrays are not parallel')
 
+    @property
+    def coordinates(self):
+        """Every point as float32, materialising the conversion on first use.
+
+        Callers that only need some of the points should take them through
+        `points_at` or `iter_selected_blocks`, which convert a gather or a
+        block at a time and leave the store's own pages file-backed.
+        """
+        if self._coordinates_f32 is None:
+            self._coordinates_f32 = np.asarray(
+                self._coordinates_raw, dtype=np.float32)
+        return self._coordinates_f32
+
+    @property
+    def point_count(self):
+        """How many points the store holds, without converting any of them."""
+        return len(self._coordinates_raw)
+
+    def points_at(self, index):
+        """Gather these point indices as float32, converting only the gather."""
+        return np.asarray(self._coordinates_raw[index], dtype=np.float32)
+
     def __len__(self):
         return len(self.rows)
 
@@ -94,12 +126,13 @@ class PackedTrackCollection:
         if isinstance(index, slice):
             return self.subset(np.arange(len(self), dtype=np.int64)[index])
         row = int(self.rows[index])
-        return self.coordinates[self.offsets[row]:self.offsets[row + 1]]
+        return self.points_at(
+            slice(int(self.offsets[row]), int(self.offsets[row + 1])))
 
     def subset(self, indices):
         indices = np.asarray(indices, dtype=np.int64)
         return PackedTrackCollection(
-            self.coordinates, self.offsets, self.source_ids,
+            self._coordinates_raw, self.offsets, self.source_ids,
             self.family_codes, self.arclengths, self.tortuosities,
             store_path=self.store_path, rows=self.rows[indices])
 
@@ -169,7 +202,7 @@ class PackedTrackCollection:
             index = (np.arange(taken, dtype=np.int64)
                      - np.repeat(local, block_lengths)
                      + np.repeat(starts[first:last], block_lengths))
-            yield int(cumulative[first]), self.coordinates[index]
+            yield int(cumulative[first]), self.points_at(index)
 
     def materialize(self, workers=None):
         identity = (len(self.rows) == len(self.source_ids)
@@ -527,7 +560,7 @@ def _load_packed_track_collection(path, z_lo=None, z_hi=None, warn=True):
             result['tortuosities'], store_path=store)
         print(
             f'loaded packed track store {store}: {len(collection)} tracks, '
-            f'{len(collection.coordinates)} points in ROI')
+            f'{collection.point_count} points in ROI')
         return collection
     except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as error:
         if warn:
@@ -837,7 +870,7 @@ def filter_tracks_to_outer_shell(
             begin = tracks.offsets[rows]
             end = tracks.offsets[rows + 1] - 1
             endpoints = np.stack((
-                tracks.coordinates[begin], tracks.coordinates[end]), axis=1)
+                tracks.points_at(begin), tracks.points_at(end)), axis=1)
             with torch.no_grad():
                 target_radius, radius, _confidence, _valid = shell_envelope.lookup(
                     torch.from_numpy(endpoints.reshape(-1, 3)))
