@@ -23,11 +23,6 @@ enum class FiberletStorageChunkKind : std::uint8_t {
     FiberletRoutes = 3,
 };
 
-enum class FiberletStorageFieldCodec : std::uint8_t {
-    Zstd = 1,
-    Rans = 2,
-};
-
 struct FiberletStorageKey {
     // Float profile: global anchor-cell Z/Y/X. Compact profile: global
     // quantized base-coordinate Z/Y/X. The profile gives the interpretation.
@@ -121,35 +116,23 @@ struct FiberletDecodedRoutes {
     std::vector<FiberletStoredRoute> routes;
 };
 
-struct FiberletStorageFieldCodecCounts {
-    std::size_t raw = 0;
-    std::size_t zstd = 0;
-    std::size_t rans = 0;
-};
-
 [[nodiscard]] std::vector<std::byte> serializeFiberletAnchors(
     const FiberletStorageCodecConfig& config,
-    std::span<const FiberletStoredAnchor> anchors,
-    FiberletStorageFieldCodec fieldCodec = FiberletStorageFieldCodec::Zstd);
+    std::span<const FiberletStoredAnchor> anchors);
 
 [[nodiscard]] std::vector<std::byte> serializeFiberletPrefixes(
     const FiberletStorageCodecConfig& config,
-    std::span<const FiberletStoredPrefix> prefixes,
-    FiberletStorageFieldCodec fieldCodec = FiberletStorageFieldCodec::Zstd);
+    std::span<const FiberletStoredPrefix> prefixes);
 
 [[nodiscard]] std::vector<std::byte> serializeFiberletRoutes(
     const FiberletStorageCodecConfig& config,
-    std::span<const FiberletStoredRoute> routes,
-    FiberletStorageFieldCodec fieldCodec = FiberletStorageFieldCodec::Zstd);
+    std::span<const FiberletStoredRoute> routes);
 
 [[nodiscard]] FiberletDecodedAnchors deserializeFiberletAnchors(std::span<const std::byte> bytes);
 
 [[nodiscard]] FiberletDecodedPrefixes deserializeFiberletPrefixes(std::span<const std::byte> bytes);
 
 [[nodiscard]] FiberletDecodedRoutes deserializeFiberletRoutes(std::span<const std::byte> bytes);
-
-[[nodiscard]] FiberletStorageFieldCodecCounts
-fiberletStorageFieldCodecCounts(std::span<const std::byte> bytes);
 
 // Decode field compression while retaining the same strict payload envelope.
 // Generated ChunkCache instances keep this byte form in their decoded LRU and

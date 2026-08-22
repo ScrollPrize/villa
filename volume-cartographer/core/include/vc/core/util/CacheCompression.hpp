@@ -74,13 +74,6 @@ inline constexpr const char* kCompressedCacheExtension = ".zst";
 enum class CacheCodec : unsigned char { Zstd = 0, Rans = 1 };
 inline constexpr CacheCodec kCacheDefaultCodec = CacheCodec::Rans;
 
-// Raw order-0 rANS frames without the VCZ1 header, quantization, or spatial
-// delta filter. These are useful when the caller already owns a typed stream
-// and its framing metadata.
-std::vector<std::byte> ransCompressBytes(std::span<const std::byte> input);
-bool ransDecompressBytes(std::span<const std::byte> frame,
-                         std::span<std::byte> output);
-
 // Codec name used when a zarr array stores chunks in this format directly
 // (v2 "compressor" id / v3 codec name).
 inline constexpr const char* kVcz1CodecName = "vcz1";

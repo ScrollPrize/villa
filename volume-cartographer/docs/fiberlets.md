@@ -545,10 +545,8 @@ whose quantized positions cross a chunk boundary are still attributed to their
 source extraction region for this comparison. The diagnostic also reports the
 size produced by wrapping the complete payload in an additional Zstd level-3
 frame. It materializes the raw field blocks and compares replacing field-wise
-compression with one whole-payload Zstd level-3 frame. It also
-compares Zstd against the existing order-0 rANS codec independently for each
-homogeneous field array; fields that do not shrink remain raw under both codecs.
-Selection is deterministic; change
+compression with one whole-payload Zstd level-3 frame. Selection is
+deterministic; change
 `--storage-compression-seed` from its default of `1` to sample a different
 ordering. This diagnostic does not change or publish the authoritative float32
 replay cache.

@@ -1592,8 +1592,6 @@ struct StorageCompressionSample {
     std::size_t outerZstdBytes = 0;
     std::size_t rawFieldBytes = 0;
     std::size_t wholeZstdBytes = 0;
-    std::size_t fieldRansBytes = 0;
-    std::size_t fieldRansStreams = 0;
 };
 
 std::size_t outerZstdSize(std::span<const std::byte> bytes)
@@ -1611,20 +1609,15 @@ std::size_t outerZstdSize(std::span<const std::byte> bytes)
 
 StorageCompressionSample storageCompressionSample(
     std::size_t records,
-    std::span<const std::byte> payload,
-    std::span<const std::byte> fieldRansPayload)
+    std::span<const std::byte> payload)
 {
     const auto rawFields = vc::fiber_tracer::materializeFiberletPayload(payload);
-    const auto ransCounts =
-        vc::fiber_tracer::fiberletStorageFieldCodecCounts(fieldRansPayload);
     return {
         records,
         payload.size(),
         outerZstdSize(payload),
         rawFields.size(),
         outerZstdSize(rawFields),
-        fieldRansPayload.size(),
-        ransCounts.rans,
     };
 }
 
@@ -1695,8 +1688,6 @@ void printStorageCompressionSummary(
     std::uint64_t outerBytes = 0;
     std::uint64_t rawFieldBytes = 0;
     std::uint64_t wholeZstdBytes = 0;
-    std::uint64_t fieldRansBytes = 0;
-    std::uint64_t fieldRansStreams = 0;
     std::vector<std::size_t> payloadSizes;
     std::vector<std::size_t> outerSizes;
     payloadSizes.reserve(samples.size());
@@ -1707,8 +1698,6 @@ void printStorageCompressionSummary(
         outerBytes += sample.outerZstdBytes;
         rawFieldBytes += sample.rawFieldBytes;
         wholeZstdBytes += sample.wholeZstdBytes;
-        fieldRansBytes += sample.fieldRansBytes;
-        fieldRansStreams += sample.fieldRansStreams;
         payloadSizes.push_back(sample.payloadBytes);
         outerSizes.push_back(sample.outerZstdBytes);
     }
@@ -1738,18 +1727,6 @@ void printStorageCompressionSummary(
               << " whole_zstd_bytes=" << wholeZstdBytes
               << " whole_zstd_to_payload_ratio="
               << static_cast<double>(wholeZstdBytes) /
-                     static_cast<double>(payloadBytes)
-              << " field_rans_bytes=" << fieldRansBytes
-              << " field_rans_streams=" << fieldRansStreams
-              << " field_rans_table_bytes=" << fieldRansStreams * 512
-              << " field_rans_without_tables_bytes="
-              << fieldRansBytes - fieldRansStreams * 512
-              << " field_rans_without_tables_to_payload_ratio="
-              << static_cast<double>(fieldRansBytes -
-                     fieldRansStreams * 512) /
-                     static_cast<double>(payloadBytes)
-              << " field_rans_to_payload_ratio="
-              << static_cast<double>(fieldRansBytes) /
                      static_cast<double>(payloadBytes)
               << " payload_mean_bytes="
               << static_cast<double>(payloadBytes) /
@@ -2010,17 +1987,12 @@ void benchmarkReplayStorageCompression(
             const auto codec = compactCodec(metadata, compactOwner,
                 chunkSideBaseVoxels, coordinateUnitsPerBaseVoxel);
             const auto bytes = serializeFiberletAnchors(codec, anchors);
-            const auto ransBytes = serializeFiberletAnchors(
-                codec, anchors, FiberletStorageFieldCodec::Rans);
-            const auto sample = storageCompressionSample(
-                anchors.size(), bytes, ransBytes);
+            const auto sample = storageCompressionSample(anchors.size(), bytes);
             total.records += sample.records;
             total.payloadBytes += sample.payloadBytes;
             total.outerZstdBytes += sample.outerZstdBytes;
             total.rawFieldBytes += sample.rawFieldBytes;
             total.wholeZstdBytes += sample.wholeZstdBytes;
-            total.fieldRansBytes += sample.fieldRansBytes;
-            total.fieldRansStreams += sample.fieldRansStreams;
             anchorSamples.push_back(sample);
         }
         anchorByOwner.emplace(sourceOwner, total);
@@ -2047,28 +2019,20 @@ void benchmarkReplayStorageCompression(
                 chunkSideBaseVoxels, coordinateUnitsPerBaseVoxel);
             const auto prefixBytes = serializeFiberletPrefixes(codec, prefixes);
             const auto routeBytes = serializeFiberletRoutes(codec, routes);
-            const auto prefixRansBytes = serializeFiberletPrefixes(
-                codec, prefixes, FiberletStorageFieldCodec::Rans);
-            const auto routeRansBytes = serializeFiberletRoutes(
-                codec, routes, FiberletStorageFieldCodec::Rans);
             const auto prefixSample = storageCompressionSample(
-                prefixes.size(), prefixBytes, prefixRansBytes);
+                prefixes.size(), prefixBytes);
             const auto routeSample = storageCompressionSample(
-                routes.size(), routeBytes, routeRansBytes);
+                routes.size(), routeBytes);
             prefixTotal.records += prefixSample.records;
             prefixTotal.payloadBytes += prefixSample.payloadBytes;
             prefixTotal.outerZstdBytes += prefixSample.outerZstdBytes;
             prefixTotal.rawFieldBytes += prefixSample.rawFieldBytes;
             prefixTotal.wholeZstdBytes += prefixSample.wholeZstdBytes;
-            prefixTotal.fieldRansBytes += prefixSample.fieldRansBytes;
-            prefixTotal.fieldRansStreams += prefixSample.fieldRansStreams;
             routeTotal.records += routeSample.records;
             routeTotal.payloadBytes += routeSample.payloadBytes;
             routeTotal.outerZstdBytes += routeSample.outerZstdBytes;
             routeTotal.rawFieldBytes += routeSample.rawFieldBytes;
             routeTotal.wholeZstdBytes += routeSample.wholeZstdBytes;
-            routeTotal.fieldRansBytes += routeSample.fieldRansBytes;
-            routeTotal.fieldRansStreams += routeSample.fieldRansStreams;
             prefixSamples.push_back(prefixSample);
             routeSamples.push_back(routeSample);
         }

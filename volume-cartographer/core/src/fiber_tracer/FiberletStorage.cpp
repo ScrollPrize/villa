@@ -1,6 +1,5 @@
 #include "vc/fiber_tracer/FiberletStorage.hpp"
 
-#include "vc/core/util/CacheCompression.hpp"
 #include "vc/lasagna/ChannelSampler.hpp"
 
 #include <utils/hash.hpp>
@@ -41,7 +40,7 @@ enum class Scalar : std::uint8_t {
     F32 = 9,
 };
 
-enum class BlockCodec : std::uint8_t { Raw = 0, Zstd = 1, Rans = 2 };
+enum class BlockCodec : std::uint8_t { Raw = 0, Zstd = 1 };
 
 enum Field : std::uint16_t {
     KeyZ = 1,
@@ -299,10 +298,7 @@ FieldBlock makeField(std::uint16_t id, Scalar scalar, std::uint64_t count)
     return field;
 }
 
-void finishField(
-    FieldBlock& field,
-    bool compress,
-    FiberletStorageFieldCodec fieldCodec)
+void finishField(FieldBlock& field, bool compress)
 {
     const std::size_t expected = static_cast<std::size_t>(field.count) * scalarBytes(field.scalar);
     if (field.decoded.size() != expected)
@@ -312,27 +308,17 @@ void finishField(
         field.encoded = field.decoded;
         return;
     }
-    std::vector<std::byte> compressed;
-    if (fieldCodec == FiberletStorageFieldCodec::Zstd) {
-        compressed.resize(ZSTD_compressBound(field.decoded.size()));
-        const std::size_t size = ZSTD_compress(
-            compressed.data(), compressed.size(), field.decoded.data(),
-            field.decoded.size(), 3);
-        if (ZSTD_isError(size))
-            throw std::runtime_error(
-                std::string("fiberlet zstd encode failed: ") +
-                ZSTD_getErrorName(size));
-        compressed.resize(size);
-    } else if (fieldCodec == FiberletStorageFieldCodec::Rans) {
-        compressed = vc::ransCompressBytes(field.decoded);
-    } else {
-        throw std::invalid_argument("unknown fiberlet field codec");
-    }
-    const std::size_t size = compressed.size();
+    std::vector<std::byte> compressed(ZSTD_compressBound(field.decoded.size()));
+    const std::size_t size = ZSTD_compress(
+        compressed.data(), compressed.size(), field.decoded.data(),
+        field.decoded.size(), 3);
+    if (ZSTD_isError(size))
+        throw std::runtime_error(
+            std::string("fiberlet zstd encode failed: ") +
+            ZSTD_getErrorName(size));
+    compressed.resize(size);
     if (size < field.decoded.size()) {
-        field.codec = fieldCodec == FiberletStorageFieldCodec::Zstd
-            ? BlockCodec::Zstd
-            : BlockCodec::Rans;
+        field.codec = BlockCodec::Zstd;
         field.encoded = std::move(compressed);
     } else {
         field.codec = BlockCodec::Raw;
@@ -367,8 +353,7 @@ std::vector<std::byte> encodePayload(
     float costOffset,
     float costScale,
     std::vector<FieldBlock> fields,
-    bool compress = true,
-    FiberletStorageFieldCodec fieldCodec = FiberletStorageFieldCodec::Zstd)
+    bool compress = true)
 {
     validateConfig(config);
     std::sort(fields.begin(), fields.end(), [](const auto& left, const auto& right) { return left.id < right.id; });
@@ -377,7 +362,7 @@ std::vector<std::byte> encodePayload(
             throw std::logic_error("duplicate fiberlet field id");
     }
     for (auto& field : fields)
-        finishField(field, compress, fieldCodec);
+        finishField(field, compress);
 
     if (fields.size() > std::numeric_limits<std::uint32_t>::max())
         throw std::invalid_argument("too many fiberlet fields");
@@ -446,7 +431,6 @@ struct DecodedPayload {
     std::uint64_t auxiliaryCount = 0;
     float costOffset = 0.0F;
     float costScale = 0.0F;
-    FiberletStorageFieldCodecCounts codecCounts;
     std::map<std::uint16_t, std::pair<Scalar, std::vector<std::byte>>> fields;
 };
 
@@ -514,19 +498,13 @@ DecodedPayload decodePayload(std::span<const std::byte> bytes, FiberletStorageCh
         std::vector<std::byte> decoded(static_cast<std::size_t>(decodedBytes));
         const auto source = bytes.subspan(static_cast<std::size_t>(blockOffset), static_cast<std::size_t>(encodedBytes));
         if (codec == BlockCodec::Raw) {
-            ++result.codecCounts.raw;
             if (source.size() != decoded.size())
                 throw std::invalid_argument("fiberlet raw field length is invalid");
             std::copy(source.begin(), source.end(), decoded.begin());
         } else if (codec == BlockCodec::Zstd) {
-            ++result.codecCounts.zstd;
             const auto size = ZSTD_decompress(decoded.data(), decoded.size(), source.data(), source.size());
             if (ZSTD_isError(size) || size != decoded.size())
                 throw std::invalid_argument("fiberlet zstd field is invalid");
-        } else if (codec == BlockCodec::Rans) {
-            ++result.codecCounts.rans;
-            if (!vc::ransDecompressBytes(source, decoded))
-                throw std::invalid_argument("fiberlet rANS field is invalid");
         } else {
             throw std::invalid_argument("fiberlet field codec is unknown");
         }
@@ -583,8 +561,7 @@ void validateFinite(const cv::Vec3f& value, const char* name)
 
 std::vector<std::byte> serializeFiberletAnchors(
     const FiberletStorageCodecConfig& config,
-    std::span<const FiberletStoredAnchor> anchors,
-    FiberletStorageFieldCodec fieldCodec)
+    std::span<const FiberletStoredAnchor> anchors)
 {
     validateConfig(config);
     const Scalar coordinateScalar = unsignedScalar(config.coordinateBits);
@@ -676,13 +653,12 @@ std::vector<std::byte> serializeFiberletAnchors(
         }
     }
     return encodePayload(config, FiberletStorageChunkKind::Anchors,
-        anchors.size(), 0, 0.0F, 0.0F, std::move(fields), true, fieldCodec);
+        anchors.size(), 0, 0.0F, 0.0F, std::move(fields));
 }
 
 std::vector<std::byte> serializeFiberletPrefixes(
     const FiberletStorageCodecConfig& config,
-    std::span<const FiberletStoredPrefix> prefixes,
-    FiberletStorageFieldCodec fieldCodec)
+    std::span<const FiberletStoredPrefix> prefixes)
 {
     validateConfig(config);
     const Scalar coordinateScalar = unsignedScalar(config.coordinateBits);
@@ -797,14 +773,12 @@ std::vector<std::byte> serializeFiberletPrefixes(
         }
     }
     return encodePayload(config, FiberletStorageChunkKind::FiberletPrefix,
-        prefixes.size(), 0, costOffset, costScale, std::move(fields), true,
-        fieldCodec);
+        prefixes.size(), 0, costOffset, costScale, std::move(fields));
 }
 
 std::vector<std::byte> serializeFiberletRoutes(
     const FiberletStorageCodecConfig& config,
-    std::span<const FiberletStoredRoute> routes,
-    FiberletStorageFieldCodec fieldCodec)
+    std::span<const FiberletStoredRoute> routes)
 {
     validateConfig(config);
     const Scalar latticeScalar = signedScalar(config.routeLatticeBits);
@@ -829,8 +803,7 @@ std::vector<std::byte> serializeFiberletRoutes(
         appendLittle(fields[0].decoded, offset);
     }
     return encodePayload(config, FiberletStorageChunkKind::FiberletRoutes,
-        routes.size(), total, 0.0F, 0.0F, std::move(fields), true,
-        fieldCodec);
+        routes.size(), total, 0.0F, 0.0F, std::move(fields));
 }
 
 FiberletDecodedAnchors deserializeFiberletAnchors(std::span<const std::byte> bytes)
@@ -1115,16 +1088,6 @@ std::vector<std::byte> materializeFiberletPayload(std::span<const std::byte> byt
         fields.push_back(std::move(field));
     }
     return encodePayload(payload.config, payload.kind, payload.recordCount, payload.auxiliaryCount, payload.costOffset, payload.costScale, std::move(fields), false);
-}
-
-FiberletStorageFieldCodecCounts fiberletStorageFieldCodecCounts(
-    std::span<const std::byte> bytes)
-{
-    if (bytes.size() < 13)
-        throw std::invalid_argument("fiberlet payload is truncated");
-    const auto kind = static_cast<FiberletStorageChunkKind>(
-        readLittle<std::uint8_t>(bytes, 12));
-    return decodePayload(bytes, kind).codecCounts;
 }
 
 }  // namespace vc::fiber_tracer

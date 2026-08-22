@@ -103,36 +103,6 @@ TEST_CASE("Fiberlet storage compact anchors use quantized keys and compact axes"
     CHECK(std::abs(decoded.anchors[0].fittedAxisXYZ.dot(anchors[0].fittedAxisXYZ)) > 0.99F);
 }
 
-TEST_CASE("Fiberlet storage field rANS round trips independently coded arrays")
-{
-    auto config = floatConfig();
-    config.coordinateBits = 16;
-    std::vector<FiberletStoredAnchor> anchors;
-    anchors.reserve(512);
-    for (std::int64_t index = 0; index < 512; ++index) {
-        anchors.push_back(
-            {key(101, 202, 303 + index), {3.25F, 2.5F, 1.75F},
-                {0.0F, 0.6F, 0.8F}, {0.3F, 0.4F, 0.8660254F}, 0.625F,
-                {0.0F, 1.0F, 0.0F}, true, true, true});
-    }
-    const auto bytes = serializeFiberletAnchors(
-        config, anchors, FiberletStorageFieldCodec::Rans);
-    const auto decoded = deserializeFiberletAnchors(bytes);
-    REQUIRE(decoded.anchors.size() == anchors.size());
-    for (std::size_t index = 0; index < anchors.size(); ++index) {
-        CHECK(decoded.anchors[index].key == anchors[index].key);
-        CHECK(decoded.anchors[index].positionPredictionXYZ ==
-              anchors[index].positionPredictionXYZ);
-        CHECK(decoded.anchors[index].fittedAxisXYZ ==
-              anchors[index].fittedAxisXYZ);
-        CHECK(decoded.anchors[index].predictionAxisXYZ ==
-              anchors[index].predictionAxisXYZ);
-        CHECK(decoded.anchors[index].predictionPresence ==
-              anchors[index].predictionPresence);
-        CHECK(decoded.anchors[index].normalXYZ == anchors[index].normalXYZ);
-    }
-}
-
 TEST_CASE("Fiberlet storage prefixes and independently cached routes round trip")
 {
     auto config = floatConfig();
