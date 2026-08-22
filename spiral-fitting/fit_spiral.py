@@ -3539,6 +3539,10 @@ class FitContext:
                             transform, dr, self.prepared_main_tracks, self.config,
                             compute_dt=self.config['loss_weight_track_dt'] > 0):
                         pass
+            # This block is a one-shot consumer: no later sampler call would
+            # drain its deferred unset-potential verdicts, so resolve them
+            # before the diagnostics are published.
+            self.theta_crossing_map.assert_no_pending_potential_errors()
             # Per-pair aggregated crossing counts: mean_count - m per winding
             # pair, the measurement behind any future discrete
             # insert/remove/reindex operation (gradient descent cannot perform
@@ -4494,6 +4498,11 @@ class FitContext:
             # every rank masks identical averaged gradients on both flow paths.
             self.influence_state.apply_grad_masks_(self.spiral_and_transform)
 
+        # The unset-potential hard error is deferred off the sampler hot path
+        # (theta_crossing_map.winding_potentials); resolve every pending
+        # verdict before mutating parameters so an invalid batch can never
+        # complete an optimizer update.
+        self.theta_crossing_map.assert_no_pending_potential_errors()
         self.step_timer.start('opt')
         self.optimiser.step()
         self.step_timer.stop('opt')
