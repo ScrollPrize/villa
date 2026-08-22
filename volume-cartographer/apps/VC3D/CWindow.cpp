@@ -3347,8 +3347,6 @@ void CWindow::populateDockToggleMenu(QMenu* menu) const
     addDock(menu, ui.dockWidgetSegmentation);
     addDock(menu, ui.dockWidgetDistanceTransform);
     addDock(menu, ui.dockWidgetViewerControls);
-    addDock(menu, ui.dockWidgetNormalVis);
-    addDock(menu, ui.dockWidgetView);
     addDock(menu, ui.dockWidgetOverlay);
     addDock(menu, _inkDetectionDock);
     addDock(menu, _transformsDock);
