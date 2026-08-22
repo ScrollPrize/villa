@@ -2,6 +2,7 @@
 
 #include "vc/fiber_tracer/FiberletDataset.hpp"
 #include "vc/fiber_tracer/FiberPaths.hpp"
+#include "vc/fiber_tracer/FiberletQuantization.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
 
 #include <functional>
@@ -29,8 +30,7 @@ struct FiberletOnDemandProgress {
 };
 
 using FiberletOnDemandProgressCallback = std::function<void(const FiberletOnDemandProgress&)>;
-using FiberletAnchorCellPredicate =
-    std::function<bool(const std::array<std::size_t, 3>& cellZYX)>;
+using FiberletAnchorCellPredicate = std::function<bool(const std::array<std::size_t, 3>& cellZYX)>;
 
 struct FiberletOnDemandConfig {
     std::filesystem::path anchorRoot;
@@ -46,6 +46,8 @@ struct FiberletOnDemandConfig {
     FiberletAnchorCellPredicate anchorCellPredicate;
     FiberAnchorRetainPredicate anchorRetainPredicate;
     FiberletPointPredicate pointPredicate;
+    FiberletGeometryQuantization geometryQuantization;
+    std::size_t evaluationAnchorCacheBytes = 256ULL * 1024ULL * 1024ULL;
     vc::render::ChunkCache::Options anchorCacheOptions;
     vc::render::ChunkCache::Options fiberletCacheOptions;
     FiberletOnDemandProgressCallback progress;
@@ -69,24 +71,23 @@ public:
     [[nodiscard]] const std::shared_ptr<FiberletChunkDataset>& fiberletDataset() const noexcept;
     [[nodiscard]] const FiberPredictionGridInfo& grid() const noexcept;
     [[nodiscard]] const FiberAnchorConfig& anchorConfig() const noexcept;
-    [[nodiscard]] bool isSelectedAnchorCell(
-        const FiberletStorageKey& anchor) const noexcept;
+    [[nodiscard]] std::shared_ptr<const std::vector<FiberletStoredAnchor>> evaluationAnchorChunk(
+        const vc::render::ChunkKey& key, std::shared_ptr<const FiberletAnchorChunkPayload> canonicalChunk) const;
+    [[nodiscard]] bool isSelectedAnchorCell(const FiberletStorageKey& anchor) const noexcept;
 
     [[nodiscard]] std::vector<vc::render::ChunkKey> anchorDependencies(const vc::render::ChunkKey& fiberletChunk) const;
     [[nodiscard]] std::vector<FiberletScheduledChunk> referenceChunkSchedule(
         const PolylineArcGeometry& reference, double beginArcBase, double endArcBase, double radiusBaseVoxels) const;
     void prefetchScheduled(std::span<const FiberletScheduledChunk> schedule, std::size_t begin, std::size_t count, bool wait = false) const;
+    // Stop speculative generation in dependency order and drain writes. Call
+    // this before releasing a batch-owned preprocessor.
+    void shutdown();
 
 private:
     explicit FiberletOnDemandPreprocessor(FiberletOnDemandConfig config);
     void initialize();
-    FiberletChunkDataset::MaterializedChunk generateAnchorChunk(
-        const vc::render::ChunkKey& key,
-        const FiberletStorageCodecConfig& codec);
-    FiberletChunkDataset::MaterializedChunk generateFiberletChunk(
-        FiberletStorageChunkKind kind,
-        const vc::render::ChunkKey& key,
-        const FiberletStorageCodecConfig& codec);
+    FiberletChunkDataset::MaterializedChunk generateAnchorChunk(const vc::render::ChunkKey& key, const FiberletStorageCodecConfig& codec);
+    FiberletChunkDataset::MaterializedChunk generateFiberletChunk(FiberletStorageChunkKind kind, const vc::render::ChunkKey& key, const FiberletStorageCodecConfig& codec);
 
     struct State;
     std::shared_ptr<State> state_;

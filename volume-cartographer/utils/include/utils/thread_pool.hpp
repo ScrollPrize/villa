@@ -325,8 +325,17 @@ public:
             kept.push(std::move(entry));
         }
         queue_ = std::move(kept);
-        if (queue_.empty() && active_.load(std::memory_order_acquire) == 0)
-            idle_cv_.notify_all();
+        idle_cv_.notify_all();
+    }
+
+    // Wait only for work owned by one producer. Other caches can continue to
+    // use the process-wide pool while this producer shuts down deterministically.
+    void wait_group_idle(TaskGroup group) {
+        std::unique_lock lk(mu_);
+        idle_cv_.wait(lk, [this, group] {
+            return !group_pending_.contains(group) &&
+                   !group_active_.contains(group);
+        });
     }
 
     [[nodiscard]] std::size_t pending() const noexcept {
@@ -377,6 +386,7 @@ private:
     void worker_loop(std::stop_token stop) {
         while (!stop.stop_requested()) {
             std::function<void()> task;
+            TaskGroup group = 0;
             {
                 std::unique_lock lk(mu_);
                 cv_.wait(lk, [&] {
@@ -424,13 +434,25 @@ private:
                         --pending->second == 0) {
                         group_pending_.erase(pending);
                     }
+                    ++group_active_[next.group];
                 }
+                group = next.group;
                 task = std::move(next.func);
                 queue_.pop();
                 active_.fetch_add(1, std::memory_order_acq_rel);
             }
             task();
-            active_.fetch_sub(1, std::memory_order_release);
+            {
+                std::lock_guard lk(mu_);
+                if (group != 0) {
+                    auto active = group_active_.find(group);
+                    if (active != group_active_.end() &&
+                        --active->second == 0) {
+                        group_active_.erase(active);
+                    }
+                }
+                active_.fetch_sub(1, std::memory_order_release);
+            }
             idle_cv_.notify_all();
         }
     }
@@ -440,6 +462,7 @@ private:
     PQ                          queue_;
     std::unordered_map<TaskGroup, std::uint64_t> group_epochs_;
     std::unordered_map<TaskGroup, std::size_t> group_pending_;
+    std::unordered_map<TaskGroup, std::size_t> group_active_;
     mutable std::mutex          mu_;
     std::condition_variable     cv_;
     std::condition_variable     idle_cv_;

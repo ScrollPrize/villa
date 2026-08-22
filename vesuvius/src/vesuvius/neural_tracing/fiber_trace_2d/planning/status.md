@@ -1,10 +1,11 @@
-# Status: show live cached replay preprocessing progress
+# Status: fixed nonlinear uint16 fiberlet costs
 
-- [x] Record the requested behavior
-- [x] Inspect the progress and cache-resolution paths
-- [x] Write the implementation and verification plan
-- [x] Complete independent plan review
-- [x] Implement resolved-chunk accounting and timer-driven repaint
-- [x] Build and run focused tests
-- [x] Verify live percentage, elapsed time, and ETA on radius 768
-- [x] Update specifications, documentation, changelog, and task log
+- [x] Capture the revised fixed-range task and implementation plan.
+- [x] Remove the rejected adaptive per-chunk density design.
+- [x] Remove the unpublished uint8 fixed-sqrt scenarios.
+- [x] Implement fixed sqrt-density uint16 encode/decode.
+- [x] Add focused regression coverage.
+- [x] Rebuild and run focused tests with `-j32`.
+- [x] Run the full radius-768 Paris4 comparison using existing caches.
+- [x] Verify the warm cache remains unchanged.
+- [x] Finish specification, documentation, changelog, and task-log updates.

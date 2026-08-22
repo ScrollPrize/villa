@@ -86,6 +86,11 @@
 - [ ] beamsearch
 - [ ] short brute-force lookahead
 - [ ] substep evaluation
+- [ ] store sub-fiberlet cost segments so fixed-distance lookahead can score a
+      final partial fiberlet from local evidence instead of proportional
+      average cost
+- [ ] test distance-decayed lookahead costs so farther evidence changes the
+      decision smoothly instead of treating every point in the horizon equally
 
 # multidir
 - [ ] test a loss on multi-dir outputs being perpendicular

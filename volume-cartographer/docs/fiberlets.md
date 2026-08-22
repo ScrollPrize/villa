@@ -522,9 +522,108 @@ volume-cartographer/build/bin/vc_fiberlets fiberlet-replay \
   /tmp/fiberlet-replay \
   --normal-manifest /path/to/lasagna.lasagna.json \
   --beam 16 \
-  --lookahead 3 \
+  --beam-step-distance 48 \
+  --lookahead-distance 384 \
   --length 4096
 ```
+
+`--beam-step-distance D`, `--lookahead-distance H`, and `--prune-distance P`
+use base voxels. The defaults are `D=48`, `H=384`, and `P=48`.
+`--search-width K` defaults to zero and runs the exact cost-bounded lookahead.
+Full width refers to the untruncated lookahead search; replay still retains at
+most the configured positive `--beam` width and enforces exact cycle rejection
+and the per-decision state limit. Beam width defaults to 16 but has no fixed
+upper policy limit. A positive `K` opts into approximate intermediate
+pruning, must be at least the final beam width, and uses `--prune-distance P`.
+The prune distance is ignored in exact mode.
+
+Exact mode keeps each winning route through the full common lookahead horizon,
+not just through the next checkpoint. The following decision extends those
+retained routes only from their existing endpoints; a whole terminal fiberlet
+that already crosses the new horizon is rescored there without expansion. One
+multi-source priority frontier feeds one global top-`beam` completion set. Routes
+are ranked by raw exact-horizon total loss and canonical persistent logical
+identity, and only identical complete logical routes are deduplicated. Several
+retained routes may therefore share the same checkpoint prefix and diverge
+later in the lookahead.
+
+The global cutoff appears only after `beam` distinct complete logical routes
+are known. Its value is the worst retained raw total, shared by all input beams.
+Increasing the beam therefore delays cutoff activation and can substantially
+increase exact-search work; the generated-state limit remains the hard bound.
+Lower bounds equal to the cutoff remain eligible. Expansion uses a fixed-size
+batch independent of thread count; workers produce ordered successors and the
+coordinator merges them canonically before updating the cutoff and the one-
+million-state decision budget. Queue ranking and cutoff maintenance use scalar
+cost/path state plus persistent route handles, never materialized route or
+point vectors.
+
+After selection, only the best route's prefix through the complete fiberlet
+containing `C+D` is reference-matched and committed. Its retained future suffix
+is not inspected for a reference failure until a later checkpoint commits it.
+
+The optional bounded search maintains whole-fiberlet histories and one shared logical
+checkpoint `C`. Its first exact front is the next checkpoint `C+D`; subsequent
+fronts are no farther than `P` apart and end exactly at `C+H`. At each
+intermediate front it keeps the best continuation for each stable `C+D` prefix
+before filling the remaining `K` slots by global score. At the final front it
+keeps one continuation per actual next-checkpoint prefix and retains the best
+16. This can discard a route that would become better later in the horizon;
+that is the explicit bounded-search approximation.
+
+Expansion between fronts is a uniform-cost label search. Labels are keyed by
+the logical incoming directed fiberlet and a 0.5-prediction-voxel front-offset
+bin. If multiple histories reach that state, only the lowest accumulated-cost
+history survives; ordered logical arc IDs break exact-cost ties. The survivor's
+visited-node set is used for later cycle rejection. This deliberate state merge
+closes reconvergent paths instead of enumerating every history. Exact crossing
+scores still use the proportional terminal fiberlet cost, and equal-bound
+labels are processed before a width cutoff. Diagnostics report dominated
+labels separately from cost-bound pruning and exact completed candidates. Once
+stable prefixes exist, a worker searches for one prefix representative plus
+only enough extra candidates to fill globally unoccupied slots; it does not
+try to prove a local top 128 for every prefix.
+
+Costs are cumulative from the segment seed to each exact front. The entering
+join of a front-crossing fiberlet is charged fully and its edge cost is charged
+only in proportion to the distance inside the front. The complete crossing
+fiberlet remains in route geometry and visited state. Stable logical IDs,
+canonical worker merging, and one decision-wide state budget make output
+independent of expansion thread scheduling.
+
+In bounded mode, after pruning the checkpoint advances by `D`. Each retained history is
+committed through the complete fiberlet containing the new checkpoint. A beam
+may therefore commit no new fiberlet, one fiberlet, or several fiberlets during
+one iteration, and its stored endpoint may lie beyond the shared checkpoint.
+Routes that cannot reach the common lookahead horizon are excluded, and
+exceeding the explicit per-decision state bound fails rather than changing the
+search.
+
+Replay failures are printed immediately in both compact-progress and `--stats`
+modes. In compact mode, the failure line interrupts the progress bar and the
+bar is redrawn afterward; `--stats` only controls the additional stage and
+per-tracer progress diagnostics.
+
+Only final reference-end or failure materialization may clip the displayed
+route inside a fiberlet; this does not alter search costs or beam state. A
+reference failure, graph exhaustion, or the selected end closes the persistent
+population.
+
+Replay prefix state is incremental. Logical route keys are canonical immutable
+parent/arc nodes with exact lexicographic ordering, while physical histories
+remain distinct. Visited anchors live in an immutable exact-key Patricia trie,
+so advancing a checkpoint does not copy the accumulated cycle set. Reference
+matching and Lasagna-normal threshold evaluation resume at the nearest already
+evaluated physical-history ancestor and process only the newly selected suffix.
+The public point, match, step, and consumed-node vectors are assembled once at
+segment termination. Focused replay decision diagnostics are the deliberate
+exception: they request complete route payloads for every recorded decision and
+therefore may materialize those diagnostic histories.
+
+Beam-step, lookahead, prune distance, and search width are replay state only.
+They are absent from anchor/fiberlet cache fingerprints, extraction settings,
+and serialized chunk payloads. A new horizon can request previously untouched
+on-demand chunks, but a fully hot cache is reopened without rewriting it.
 
 The default cache roots are `<output>/cache/anchors.zarr` and
 `<output>/cache/fiberlets.zarr`. Override them independently with
@@ -538,24 +637,20 @@ Pass `--storage-compression-chunks N` to select up to `N` spatial regions that
 intersect the replay and run complete anchor and fiberlet extraction for every
 cell in those regions. Extraction also includes the neighboring anchor-cell
 halo needed to evaluate all fiberlets owned by a selected region. The
-diagnostic remaps the extracted records to the compact-axis, `uint8`-cost
-storage profile and reports its field-wise Zstd payload size alongside the
-existing float32-cache size for the same source-region records. Compact records
-whose quantized positions cross a chunk boundary are still attributed to their
-source extraction region for this comparison. The diagnostic also reports the
-size produced by wrapping the complete payload in an additional Zstd level-3
-frame. It materializes the raw field blocks and compares replacing field-wise
-compression with one whole-payload Zstd level-3 frame. Selection is
-deterministic; change
+diagnostic remaps the extracted records to the default compact replay profile:
+float endpoint positions, compact two-byte directions, and fixed sqrt-density
+`uint16` costs with ceiling 256. It reports the field-wise Zstd payload size
+alongside the existing float32-cache size for the same source-region records.
+The diagnostic also reports the size produced by wrapping the complete payload
+in an additional Zstd level-3 frame. It materializes the raw field blocks and
+compares replacing field-wise compression with one whole-payload Zstd level-3
+frame. Selection is deterministic; change
 `--storage-compression-seed` from its default of `1` to sample a different
 ordering. This diagnostic does not change or publish the authoritative float32
 replay cache.
 
-Use `--storage-compression-chunk-side` to set the extracted spatial-region side
-and compact ownership side in base voxels, and
-`--storage-compression-coordinate-units` to test subvoxel coordinate units.
-For example, coordinate units `8` represent positions at one eighth of a base
-voxel. These two options affect only the diagnostic payloads.
+Use `--storage-compression-chunk-side` to set the extracted spatial-region and
+compact ownership side in base voxels. It affects only the diagnostic payloads.
 
 Cache-backed replay schedules exact tube intersections at storage-chunk
 resolution. It does not first materialize the complete anchor-cell population
@@ -577,8 +672,9 @@ The separate anchor and fiberlet `ChunkCache` instances retain typed decoded
 payloads directly and charge their vectors and indices to the shared LRU
 budget; they do not retain another serialized copy or use a graph-private LRU.
 Prefix records and exact endpoint steps are sufficient for beam ranking and
-join scoring. A route block is loaded and its full polyline reconstructed only
-after an edge is selected for commitment. Evicted chunks reload transparently.
+join scoring. Route blocks are loaded only for the current provisional best
+history during reference-error evaluation and for final output. Evicted chunks
+reload transparently.
 For the float cache, anchors own the exact interpolated prediction/presence and
 normal samples used by eager graph construction, while prefixes own all five
 float path-cost components, the authoritative float path length, and the exact
@@ -593,25 +689,47 @@ anchor, prefix, and route chunks; multiple committed edges in one route chunk
 share one decode. `--eager-graph` runs the prior whole-tube graph construction
 for diagnostics.
 
-By default replay prints one terminal progress bar with elapsed time and ETA.
-For cached replay, scheduled preprocessing contributes 95% of tracing work:
-resolved anchor chunks have weight one and resolved fiberlet prefix chunks have
-weight 16. The remaining 5% is the minimum monotone reference-arc fraction of
-the greedy and fiberlet evaluators. This is an estimate calibrated to measured
-roughly one-second anchor and 15-20-second fiberlet chunks; data-dependent
-neighbor-prefix and committed-route reads remain represented by the tracer
-term. Persisted and newly generated chunks both count, while reloads count only
-once. Eager replay continues to use only the evaluator minimum. A private
-250-millisecond ticker repaints elapsed time even while a long chunk emits no
-callback. ETA is recomputed from live elapsed time and may increase while the
-estimated fraction is stationary. Non-finite, stale, and restart-local tracer
-callbacks cannot move progress backward. Completion remains reserved until
-requested visualization and bundle publication finish.
+By default cached replay prints independent `cache/prep` and `trace` terminal
+progress bars while those operations overlap. Cache progress covers the
+deterministic scheduled prefetch keys: resolved anchor chunks have weight one
+and resolved fiberlet prefix chunks have weight 16. Persisted and newly
+generated chunks both count, while reloads count only once. Trace progress is
+the minimum monotone reference-arc fraction of the greedy and fiberlet
+evaluators. It is therefore actual progress through the selected reference
+interval, not a weighted estimate of preprocessing work. Eager replay prints
+only the trace bar. Cache progress covers the scheduled anchor and prefix
+population only; data-dependent neighbor-prefix and committed-route reads are
+not predicted by that denominator and occur as part of tracing.
 
-Pass `--stats` to replace the bar with the detailed machine-readable stage,
+The active compact line shows one overall replay elapsed time. While cache and trace
+overlap, each retains its own ETA; once scheduled cache progress reaches 100%,
+the cache field is removed and the remaining terminal line is cleared to avoid
+stale text. Trace also reports `eta_current`, computed from its progress during
+the latest ten-second window. A stalled window reports `n/a` instead of
+reusing an old rate. A private 250-millisecond ticker repaints the line even
+while a long chunk emits no callback. Non-finite, stale, and restart-local
+tracer callbacks cannot move trace progress backward. After both evaluators
+complete, requested overview, failure visualizations, and durable publication
+use separately named output stages and cannot be mistaken for tracing.
+
+Fiberlet decisions add `fiberlet_rollout_expansions`, the total number of search
+states expanded across all fronts of the latest bounded lookahead decision. An
+expanded state is one whose successors were enumerated, so this value tracks
+the search work that grows during slow decisions. Bounded search also adds
+`fiberlet_local_cutoff_loss_per_vx_min`. For each final-front input where the
+existing strict cutoff actually stops the queue, this subtracts the input
+route's loss at the front start from the cumulative cutoff and divides by the
+front length in prediction voxels; the displayed value is the minimum of those
+local densities. The search itself still compares unchanged cumulative raw
+losses. Both diagnostics are absent in exact mode, and the cutoff is absent
+when it never binds. The most recent values remain visible while the other
+evaluator controls the combined trace fraction.
+
+Pass `--stats` to replace the bars with the detailed machine-readable stage,
 chunk, failure, evaluator, and cache rows. These retain the stable chunk schedule
 indices, internal generation phases, worker and CPU timings, cache residency,
-and restart-local greedy step diagnostics used for profiling.
+restart-local greedy step diagnostics, and the fiberlet rollout expansion and
+local cutoff diagnostics used for profiling.
 
 On-demand anchor fitting publishes completion while holding the same mutex
 used by its ready-cell condition predicate. Cache waits are ordinary blocking
@@ -1180,43 +1298,143 @@ diagnostic only and does not alter extraction decisions, ordering, or artifacts.
 
 ## Storage quantization benchmark
 
-`quantization-benchmark` extracts anchors once with the production
-implementation. It quantizes anchor endpoints and fitted directions before
-running the regular candidate generation, dense sampling, and fiberlet DP for
-each distinct geometry. Geometry results are cached and reused by their
-`uint8`/`uint16` cost variants. It writes no persistent quantized format.
+`quantization-benchmark` compares two cache-backed production replays. The
+baseline uses the float cache profile. Every run shares one canonical float
+anchor dataset under `OUTPUT/cache` for the exact source, extraction settings,
+corridor, grid, and chunk layout. The selected scenario derives rounded
+positions or compact fitted directions from those anchors, then performs fresh
+candidate generation, Hermite geometry, dense sampling, and DP in a separate
+fiberlet namespace. Quantization therefore never reruns anchor fitting or
+changes persisted anchor chunks. These are evaluation caches, not final compact
+interchange data.
 
 ```bash
-vc_fiberlets quantization-benchmark FIBER_MANIFEST FIBER_JSON --normal-manifest NORMAL_MANIFEST --length 5000 --threads 32 --radius 64
+vc_fiberlets quantization-benchmark FIBER_MANIFEST FIBER_JSON OUTPUT --normal-manifest NORMAL_MANIFEST --radius 768 --threads 32
 ```
 
-Use `--scenario combined_q4_axis_cost_u8` to run only the baseline and the
-4-base-voxel endpoint-position, compact two-byte fitted-direction, 8-bit-cost
-case. The selector names are the exact `scenario=` values printed by the full
-matrix; an unknown name is an error.
+The default scenario is `combined_q4_axis_cost_u8`: 4-base-voxel endpoint
+positions, compact two-byte fitted directions, and per-canonical-first-endpoint
+chunk `uint8` total costs. `--scenario NAME` selects another standard scenario;
+`--scenario all` runs one baseline followed by all 18 non-baseline scenarios in
+their fixed matrix order. An unknown name is an error. `--length N` limits the
+reference interval in base voxels for a shorter comparison.
 
-The fixed 16-row matrix contains the float32 baseline; isolated position quanta
-`1`, `2`, and `4` base voxels; isolated compact fitted axes; all three
-position-plus-compact-axis float-cost geometries; isolated `uint8` and `uint16`
-per-chunk total costs; and all six combined position/axis/cost cases.
-`--storage-chunk-side` defaults to 512 base voxels.
+`compact_axis_cost_u8` and `compact_axis_cost_u16` keep float endpoint
+positions, use compact two-byte fitted directions, and decode the stored float
+component totals through per-owner-chunk `uint8` or `uint16` cost views. Along
+with `compact_axis`, all three reopen the same compact-axis prefix/route cache;
+cost precision is graph-view state and never rewrites stored geometry or float
+component costs. The cache is populated on demand. A cost view can therefore
+complete missing compact-axis chunks in that same cache while establishing the
+stable minimum/maximum for a first-endpoint storage chunk; it does not create a
+cost-specific geometry cache.
 
-Every `fiberlet_quantization` row is machine-readable. A scenario is
-`valid=false` if any anchor key, variant, scalar, or endpoint cannot be
-represented by the proposed format. Ordinary candidate or no-path rejection
-after valid quantization is instead recorded as a changed DP result. Valid rows
-report candidate additions/removals, graph and transition populations, global
-and within-chunk cost ordering changes, top-100 agreement, comparisons against
-both the float baseline and matching float-cost geometry, baseline/scenario
-tracing failure counts, and symmetric maximum Euclidean, Lasagna-normal, and
-Lasagna-tangential line distance. Restart segments remain disconnected; both
-lines are sampled at no more than one base voxel spacing and projected onto the
-other line's actual segments. Exact anchor, candidate, point-count, and
-point-index agreement are not quality criteria. Separate
+`compact_axis_cost_sqrt_u16_max256` reopens that same compact-axis cache and
+uses a fixed two-byte-equivalent evaluation view. It encodes
+`round(65535 * sqrt(clamp((total_cost / path_length) / 256, 0, 1)))` and
+decodes the edge total as `256 * (code / 65535)^2 * path_length`. The fixed
+ceiling is global: no chunk statistics, dataset scan, or observed min/max
+contributes to the mapping. The authoritative positive float32 path length
+comes from the existing prefix. Join costs stay in their original float
+representation and are added once by graph search.
+
+The fixed-sqrt scenario does not persist a two-byte cost field. It derives an
+ephemeral decoded cost view from existing float component costs and lengths.
+Cost domain and ceiling are absent from geometry identities and cache paths, so
+a completed compact-axis cache is reused without range scans, anchor
+extraction, fiberlet DP, new payloads, or payload rewrites. Result rows and
+replay JSON identify `sqrt_per_prediction_voxel` and the fixed ceiling.
+
+Fiberlet caches are grouped by endpoint position quantum and fitted-direction
+encoding. Float, raw `uint8`, raw `uint16`, and fixed-sqrt `uint16` cost views
+over the same geometry reopen the same fiberlet prefixes, routes, endpoint
+steps, path lengths, and float component costs; cost decoding happens only in
+the replay graph. All scenarios
+read the same canonical anchor cache, and cost-only scenarios also reuse the
+exact baseline fiberlets. Geometry-
+quantized scenarios retain the pre-existing internal `cost_bits=8` cache tag so
+completed experimental caches remain reusable, but that tag is opaque and is
+never passed to anchor extraction or DP. The selected cost precision remains
+the `cost_bits` field in each output row. `geometry_cache_cost_tag_bits` reports
+the internal compatibility tag. Storage chunk side remains part of both the
+physical cache layout and its identity.
+
+Each comparison writes complete baseline and scenario graph-replay JSON files
+under `OUTPUT/quantization-replays/<interval-hash>/`. It also prints one
+`fiberlet_quantization_failure_window` row per failure. That row gives the
+exact segment reset arc, the length through the complete failure-containing
+fiberlet, and the original graph seed key. A single failure can then be rerun
+without tracing the full reference fiber:
+
+```bash
+vc_fiberlets quantization-benchmark FIBER_MANIFEST FIBER_JSON OUTPUT --normal-manifest NORMAL_MANIFEST --radius 768 --threads 32 --scenario position_q1_compact_axis --arc ARC --length LENGTH --seed-key Z,Y,X,V
+```
+
+The same directory contains `route-cost-statistics-<scenario>.json`. Its
+`baseline_all` and `scenario_all` objects summarize only fiberlets actually
+committed by replay, not overlapping beam-lookahead candidates. Each objective
+term and the edge/transition/combined losses are divided by the committed
+edge's prediction-voxel path length before reporting count, sum, minimum, mean,
+median, and maximum. Raw per-fiberlet totals are deliberately omitted because
+route ranking normalizes unequal-length candidates. The artifact retains only
+aggregate total route loss, prediction-voxel path length, and their
+length-weighted whole-route density. `baseline_away_from_failures` and
+`scenario_away_from_failures`
+exclude any committed fiberlet whose covered reference-arc interval is within
+128 base voxels of a baseline failure. The same baseline windows filter both
+runs so their regions are comparable. The interval test is inclusive. Repeated
+commitments are counted as separate route occurrences, and each entry owns its
+edge cost plus only the incoming join from the preceding edge in that replay
+segment. Change the distance with `--route-stats-failure-margin N`.
+
+`--arc` and `--length` are base-volume arc lengths. `--seed-key` is the
+diagnostic anchor identity printed by the full run; it makes a later segment
+exact even though the full replay excludes graph nodes consumed by earlier
+segments. Focused diagnostics reopen the completed full-corridor cache identity
+but disable its schedule prefetch. The graph therefore loads, or generates when
+missing, only chunks reached by seed selection and the completed beam route.
+
+Focused replay JSON includes each decision's retained beam frontier, current
+and next logical checkpoints, whole-fiberlet scoring horizon, expansion thread
+count, and evaluated/retained candidate counts. Every route records its
+committed whole-fiberlet prefix IDs separately from its best lookahead
+continuation, plus route points in base coordinates, edge and transition costs,
+actual path length including final-edge overshoot, total loss, and loss per
+prediction voxel. A sibling
+`decision-comparison-<scenario>.json` reports the first
+selected-route difference, cross-ranks each run's choice in the other run when
+that route exists, and reports the maximum symmetric distance between paired
+selected route geometries. This distinguishes a disproportionate scoring bug
+from a small cost change that flips an already near-tied discrete decision.
+
+The `fiberlet_cached_quantization` row is machine-readable. It reports the
+explicit position/direction/cost settings, failure counts, completed fractions,
+logical-key collision diagnostics, cache residency, timing, and symmetric
+Euclidean, Lasagna-normal, and Lasagna-tangential line-distance distributions.
+Restart segments remain disconnected; both lines are sampled at no more than
+one base voxel spacing and projected onto the other line's actual segments.
+The row is flushed as soon as its comparison finishes. Before a batch context
+is released, speculative fiberlet jobs are cancelled and drained, followed by
+their anchor dependencies and issued persistent writes. This prevents late
+cache generation from racing process-wide worker-pool teardown while leaving
+unrelated cache users running.
+Exact anchor, candidate, point-count, and point-index agreement are not quality
+criteria. Separate
 `baseline_reference_*` and `scenario_reference_*` summaries measure each replay
 toward the annotated reference only. They report count, minimum, mean, median,
 and maximum Euclidean, normal, and tangential distance in base voxels. The
 Lasagna normal is sampled at the matched reference point; invalid normal samples
-remain in the Euclidean summary and are counted separately. Extraction, DP,
-baseline-to-scenario distance, and replay-to-reference distance stages emit
-machine-readable progress and ETA updates.
+remain in the Euclidean summary and are counted separately. Quantized anchor
+geometry uses rounded positions, but stable logical IDs remain the source cell
+coordinate plus its zero-or-one component. This preserves the two-anchor limit
+per cell without merging anchors from adjacent cells that round to the same
+position. Unrepresentable endpoint deltas fail the scenario instead of silently
+changing identity.
+
+Derived endpoint views are chunk scoped. Compact direction changes only the
+fitted axis; canonical prediction/presence/normal scoring remains exact. A
+position quantum additionally resamples every endpoint scoring field at the
+rounded point. Single-flight construction prevents overlapping fiberlet chunks
+from repeating that sampling, and a bounded LRU releases derived chunks after
+use. Replay seed selection, endpoint lookup, route reconstruction, transitions,
+and compact-cost ownership all use the same view as fiberlet DP.

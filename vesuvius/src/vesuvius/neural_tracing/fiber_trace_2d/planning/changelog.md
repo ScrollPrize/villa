@@ -1,3 +1,53 @@
+# 2026-08-22: fixed nonlinear uint16 fiberlet cost view
+
+- Added fixed global square-root encoding of cost per prediction voxel with a
+  ceiling of 256. It reconstructs edge totals with the stored path
+  length without adaptive chunk ranges, cache identity changes, or persisted
+  geometry changes.
+- On the full Paris4 radius-768 replay it matched the compact-float control's
+  two failure arcs and reference-distance distribution while reusing the same
+  unchanged geometry cache.
+
+# 2026-08-22: globally ranked incremental exact fiberlet lookahead
+
+- Replaced one-best-continuation-per-checkpoint-prefix exact replay with one
+  multi-source frontier and globally ranked full-horizon beam population.
+  Winning routes now retain their lookahead suffix across checkpoint advances;
+  multiple winners may share a checkpoint prefix.
+- Added a single raw-loss cutoff shared by all source beams, deterministic
+  fixed-batch parallel expansion and state accounting, and selected-prefix-only
+  reference evaluation.
+
+# 2026-08-22: exact full-width fiberlet replay default
+
+- Restored exact cost-bounded lookahead as the replay default after incremental
+  prefix processing removed the actual long-route slowdown. Finite search
+  widths remain available only as an explicit approximate experiment.
+- On the full Paris4 radius-768 replay, exact search completed in 82.66 seconds
+  with five fiberlet failures versus 58.34 seconds and seven failures for width
+  128, using the same hot cache and unchanged one-million-state cap.
+
+# 2026-08-22: explicit fiber replay phases
+
+- Replaced the misleading weighted replay percentage with independent
+  cache/preprocessing and actual reference-trace progress. Visualization and
+  publication now report as a separate output phase.
+- Compact output now removes completed cache progress, shows elapsed time once,
+  adds a rolling current-speed ETA, and reports the latest bounded lookahead's
+  state-expansion count plus its minimum applied local cutoff loss per
+  prediction voxel.
+
+# 2026-08-21: bounded intermediate fiberlet lookahead
+
+- Added deterministic equal-distance intermediate pruning for graph replay,
+  defaulting to a 128-route working frontier at 48-base-voxel intervals over
+  the existing 192-base-voxel lookahead. Exact A* remains selectable with
+  `--search-width 0` for focused comparisons.
+- Preserved exact logical-front cost semantics: the terminal fiberlet remains
+  whole in graph state while only its in-horizon edge fraction is scored, with
+  its entering join charged once. Replay JSON now records search mode and
+  per-front population/pruning diagnostics.
+
 # 2026-08-20: concise fiberlet replay progress
 
 - Replaced default per-stage, per-chunk, and per-evaluator replay chatter with
@@ -850,3 +900,107 @@
 - Isolated progress observer failures from cache results and made ticker and
   resolution-state shutdown safe for late worker completion. Radius-64 replay
   output remained byte-identical.
+
+# 2026-08-22: incremental fiberlet replay prefixes
+
+- Replaced repeated logical-route vector construction and visited-set copying
+  with exact canonical logical histories and immutable Patricia cycle state.
+- Made selected-route reference matching, normal-threshold evaluation, and
+  diagnostic index assignment process only newly selected history suffixes;
+  complete public route output is assembled once at segment termination.
+- Preserved the canonical hot-cache replay bundle byte-for-byte while reducing
+  its median wall time from 7.57 to 3.87 seconds and peak RSS from 202,872 KiB
+  to 102,424-104,900 KiB.
+
+# 2026-08-20: cache-backed quantization comparison
+
+- Replaced the eager full-population quantization CLI with sequential baseline
+  and selected-scenario replays over persistent, fingerprinted, bounded caches.
+- Applied endpoint position/direction quantization before fresh sampling and DP,
+  projected compact logical IDs for ordering, and decoded per-owner-chunk costs.
+- Added indexed line comparison with Euclidean, normal, and tangential
+  distributions for baseline-to-scenario and both replay-to-reference paths.
+- Kept quantized anchor identity cell-local after a full-corridor run showed
+  that anchors from several adjacent cells can round to one Q4 coordinate.
+- Added explicit exact-baseline cache reuse and collision-resistant atomic
+  temporary writes so long interrupted comparisons resume safely.
+
+# 2026-08-21: geometry-cache reuse across cost experiments
+
+- Split anchor/fiberlet geometry quantization from replay-only cost decoding,
+  allowing float, uint8, and uint16 cost comparisons to share persistent
+  geometry and DP caches.
+- Added `--scenario all`, which runs one baseline and all 17 non-baseline
+  scenarios while creating at most eight geometry cache groups.
+- Retained the historical u8-tagged namespace only as opaque compatibility
+  metadata so the completed radius-768 Q4+axis cache remains reusable.
+- Made anchor extraction canonical across all geometry scenarios. Quantized
+  endpoint views are now derived once per loaded anchor chunk under a bounded
+  single-flight LRU, while only fiberlet geometry remains scenario-specific.
+- Added producer-group cache cancellation and draining for batch replay so
+  completed full-corridor quantization results no longer hang or crash during
+  process worker-pool teardown.
+- Added float-position compact-axis `uint8` and `uint16` cost scenarios. Both
+  are graph-only views over the existing compact-axis geometry cache.
+- Full radius-768 validation confirmed the shared namespace. Because the
+  existing compact-axis cache was only partially populated, its per-owner cost
+  range scan completed missing geometry chunks in place; it did not create a
+  cost-specific cache.
+
+# 2026-08-21: focused quantization failure replay
+
+- Added atomic baseline/scenario replay artifacts and exact failure-window
+  reporting to the cache-backed quantization benchmark.
+- Added base-voxel `--arc`/`--length` focused intervals and an original
+  `--seed-key` override for deterministic replay of later failure segments.
+- Replaced focused corridor pre-generation with demand-only access to the
+  completed full-corridor cache and added ranked beam-frontier/cost/route
+  comparison artifacts.
+- Added full-route committed-fiberlet cost distributions plus configurable
+  base-voxel exclusion around replay failures.
+
+# 2026-08-21: fixed-distance fiberlet lookahead experiment
+
+- Added an initial local base-voxel lookahead experiment with proportional
+  active-cost scoring and clipped final-fiberlet geometry. It was not shipped
+  and has now been replaced by the persistent search below.
+- On the focused Q1 failure section, 192 base voxels approximates the measured
+  three-edge median (189.1 base voxels). A hot-cache float/Q1 comparison
+  completed with zero failures in both runs, no committed first-edge
+  divergence, and 0.443/0.305/3.689 base-voxel mean/median/maximum line
+  separation. Float/Q1 replay wall times were 2.05/2.26 seconds.
+
+# 2026-08-21: rolling whole-fiberlet beam search
+
+- Replaced both unpublished local lookahead implementations with one persistent
+  beam of up to 16 whole-fiberlet histories from each uninterrupted segment
+  seed.
+- Added a shared logical checkpoint, 192-base-voxel lookahead, and default
+  48-base-voxel checkpoint advance. Every retained history expands through all
+  valid branches to the common logical horizon; the final edge remains whole.
+- Added one deterministic global top-16 prune, whole-fiberlet commitment through
+  the next checkpoint, shared immutable parent histories, explicit state bounds,
+  clipped final-output materialization, and decision diagnostics.
+- Parallelized independent retained-beam expansion under the existing
+  `--threads` setting. The focused 600-base-voxel radius-768 hot-cache replay
+  fell from 17.30 to 6.97 seconds while preserving the same failure and distance
+  results.
+- Added bounded equal-distance fronts and deterministic uniform-cost label
+  search. Reconvergent histories now retain only the best logical-incoming-arc
+  and front-offset label, while exact proportional front scoring and the exact
+  A* oracle remain available for comparison.
+- Restored immediate `fiber_replay_failure` output in compact-progress mode;
+  failure lines now interrupt and redraw the progress bar instead of being
+  suppressed unless `--stats` is enabled.
+
+# 2026-08-22: configurable exact replay beam width
+
+- Removed the unpublished fixed maximum of 16 graph-replay beams. `--beam`
+  now accepts any positive width while retaining 16 as its default and the
+  generated-state limit as the exact-search work bound.
+- Changed exact completion retention to ordered insertion so wider experiments
+  do not sort the complete retained set after every discovered route.
+- Changed the graph replay default lookahead from 192 to 384 base voxels while
+  retaining the independent default checkpoint advance of 48 base voxels.
+- Failure-window diagnostics now use the available match search span when a
+  replay reset fails without advancing near the reference end.

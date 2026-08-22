@@ -4,11 +4,15 @@
 #include "vc/fiber_tracer/FiberletStorage.hpp"
 #include "vc/fiber_tracer/FiberletDataset.hpp"
 #include "vc/fiber_tracer/FiberletChunkGraph.hpp"
+#include "vc/fiber_tracer/FiberletQuantization.hpp"
 
 #include <cmath>
 #include <atomic>
+#include <array>
+#include <bit>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <random>
 #include <set>
 
@@ -42,13 +46,20 @@ FiberletStorageCodecConfig compactConfig()
     return config;
 }
 
+FiberletStorageCodecConfig compactDefaultConfig()
+{
+    auto config = floatConfig();
+    config.profile = FiberletStorageProfile::CompactDirectionsFixedCost;
+    config.costBits = 16;
+    return config;
+}
+
 FiberletStorageKey key(std::int64_t z, std::int64_t y, std::int64_t x, std::uint8_t variant = 0)
 {
     return {{z, y, x}, variant};
 }
 
-FiberletChunkDataset::MaterializedChunk materialized(
-    FiberletStorageChunkKind kind, std::vector<std::byte> bytes)
+FiberletChunkDataset::MaterializedChunk materialized(FiberletStorageChunkKind kind, std::vector<std::byte> bytes)
 {
     FiberletChunkDataset::MaterializedChunk result;
     result.payload = decodeFiberletChunkPayload(kind, bytes);
@@ -58,16 +69,142 @@ FiberletChunkDataset::MaterializedChunk materialized(
 
 }  // namespace
 
+TEST_CASE("Fiberlet evaluation quantization uses base positions and shared codecs")
+{
+    FiberPredictionGridInfo grid;
+    grid.predictionToBaseScale = 8.0F;
+    grid.shapeZYX = {16, 16, 16};
+    const auto position = quantizeFiberletPositionForEvaluation({1.2F, 2.3F, 3.6F}, grid, 4);
+    CHECK(position[0] == doctest::Approx(1.0));
+    CHECK(position[1] == doctest::Approx(2.5));
+    CHECK(position[2] == doctest::Approx(3.5));
+
+    const cv::Vec3f inputDirection{0.25F, -0.4F, 0.881759F};
+    const auto direction = quantizeFiberletDirectionForEvaluation(inputDirection);
+    CHECK(cv::norm(direction) == doctest::Approx(1.0).epsilon(1.0e-5));
+    CHECK(std::abs(direction.dot(inputDirection)) > 0.99F);
+
+    const std::array<float, 4> costs{1.0F, 2.0F, 5.0F, 9.0F};
+    const auto decoded = quantizeFiberletCostsForEvaluation(costs, 8);
+    REQUIRE(decoded.size() == costs.size());
+    const std::array<std::uint32_t, 4> expectedBits{
+        0x3f800000U, 0x40004040U, 0x409f7f80U, 0x41100000U};
+    for (size_t index = 0; index < decoded.size(); ++index)
+        CHECK(std::bit_cast<std::uint32_t>(decoded[index]) == expectedBits[index]);
+}
+
+TEST_CASE("Fiberlet sqrt cost-density evaluation uses a fixed global range")
+{
+    const std::array<float, 3> costs{0.5F, 2.0F, 512.0F};
+    const std::array<float, 3> lengths{2.0F, 8.0F, 2.0F};
+    const auto decoded = quantizeFiberletCostsForEvaluation(
+        costs,
+        lengths,
+        16,
+        FiberletCostQuantizationDomain::SqrtPerPredictionVoxel,
+        256.0F);
+    REQUIRE(decoded.size() == costs.size());
+    const float code = 2048.0F;
+    const float decodedDensity = 256.0F *
+        (code / 65535.0F) * (code / 65535.0F);
+    CHECK(decoded[0] == doctest::Approx(decodedDensity * lengths[0]));
+    CHECK(decoded[1] == doctest::Approx(decodedDensity * lengths[1]));
+    CHECK(decoded[2] == doctest::Approx(512.0F));
+
+    const std::array<float, 1> isolatedCost{costs[0]};
+    const std::array<float, 1> isolatedLength{lengths[0]};
+    const auto isolated = quantizeFiberletCostsForEvaluation(
+        isolatedCost, isolatedLength, 16,
+        FiberletCostQuantizationDomain::SqrtPerPredictionVoxel,
+        256.0F);
+    CHECK(std::bit_cast<std::uint32_t>(isolated[0]) ==
+          std::bit_cast<std::uint32_t>(decoded[0]));
+    CHECK_THROWS_AS(
+        fiberletCostQuantizationValueForEvaluation(
+            1.0F, 0.0F,
+            FiberletCostQuantizationDomain::SqrtPerPredictionVoxel,
+            256.0F),
+        std::invalid_argument);
+    CHECK_THROWS_AS(
+        fiberletCostQuantizationValueForEvaluation(
+            1.0F, std::numeric_limits<float>::infinity(),
+            FiberletCostQuantizationDomain::SqrtPerPredictionVoxel,
+            256.0F),
+        std::invalid_argument);
+    CHECK_THROWS_AS(
+        fiberletCostQuantizationValueForEvaluation(
+            1.0F, 1.0F,
+            FiberletCostQuantizationDomain::SqrtPerPredictionVoxel,
+            0.0F),
+        std::invalid_argument);
+}
+
+TEST_CASE("Fiberlet geometry caches ignore replay cost representation")
+{
+    const FiberletEvaluationQuantization baseline{0, false, 0, 512};
+    const FiberletEvaluationQuantization costOnly{0, false, 8, 512};
+    const FiberletEvaluationQuantization q4Float{4, true, 0, 512};
+    const FiberletEvaluationQuantization q4U8{4, true, 8, 512};
+    const FiberletEvaluationQuantization q4U16{4, true, 16, 512};
+    const FiberletEvaluationQuantization compactAxisFloat{0, true, 0, 512};
+    const FiberletEvaluationQuantization compactAxisU8{0, true, 8, 512};
+    const FiberletEvaluationQuantization compactAxisU16{0, true, 16, 512};
+    FiberletEvaluationQuantization compactAxisSqrtU16{0, true, 16, 512};
+    compactAxisSqrtU16.costDomain =
+        FiberletCostQuantizationDomain::SqrtPerPredictionVoxel;
+    compactAxisSqrtU16.costDensityMaximum = 256.0F;
+
+    const FiberletGeometryCacheProfile exact{{0, false}, 0, 512};
+    const FiberletGeometryCacheProfile compactAxis{{0, true}, 8, 512};
+    const FiberletGeometryCacheProfile legacyQ4U8{{4, true}, 8, 512};
+    CHECK(fiberletGeometryCacheProfile(baseline) == exact);
+    CHECK(fiberletGeometryCacheProfile(costOnly) == exact);
+    CHECK(fiberletGeometryCacheProfile(q4Float) == legacyQ4U8);
+    CHECK(fiberletGeometryCacheProfile(q4U8) == legacyQ4U8);
+    CHECK(fiberletGeometryCacheProfile(q4U16) == legacyQ4U8);
+    CHECK(fiberletGeometryCacheProfile(compactAxisFloat) == compactAxis);
+    CHECK(fiberletGeometryCacheProfile(compactAxisU8) == compactAxis);
+    CHECK(fiberletGeometryCacheProfile(compactAxisU16) == compactAxis);
+    CHECK(fiberletGeometryCacheProfile(compactAxisSqrtU16) == compactAxis);
+    CHECK(compactAxisFloat.costBits == 0);
+    CHECK(compactAxisU8.costBits == 8);
+    CHECK(compactAxisU16.costBits == 16);
+    CHECK(compactAxisSqrtU16.costDomain ==
+          FiberletCostQuantizationDomain::SqrtPerPredictionVoxel);
+}
+
+TEST_CASE("Fiberlet standard quantization matrix includes compact-axis cost views")
+{
+    const auto scenarios = standardFiberletQuantizationScenarios();
+    REQUIRE(scenarios.size() == 19);
+    const std::array<std::string, 4> names{
+        "compact_axis", "compact_axis_cost_u8", "compact_axis_cost_u16",
+        "compact_axis_cost_sqrt_u16_max256"};
+    const std::array<int, 4> costBits{0, 8, 16, 16};
+    for (std::size_t index = 0; index < names.size(); ++index) {
+        const auto found = std::find_if(
+            scenarios.begin(), scenarios.end(), [&](const auto& scenario) {
+                return scenario.name == names[index];
+            });
+        REQUIRE(found != scenarios.end());
+        CHECK(found->positionQuantumBaseVoxels == 0);
+        CHECK(found->compactAxes);
+        CHECK(found->costBits == costBits[index]);
+        CHECK(found->costDomain ==
+              (names[index].starts_with("compact_axis_cost_sqrt_u16")
+                   ? FiberletCostQuantizationDomain::SqrtPerPredictionVoxel
+                   : FiberletCostQuantizationDomain::RawTotal));
+        if (names[index].starts_with("compact_axis_cost_sqrt_u16"))
+            CHECK(found->costDensityMaximum == doctest::Approx(256.0F));
+    }
+}
+
 TEST_CASE("Fiberlet storage float anchors round trip exact float bits")
 {
     const auto config = floatConfig();
     const std::vector<FiberletStoredAnchor> anchors{
-        {key(101, 202, 303), {3.25F, 2.5F, 1.75F},
-         {0.0F, 0.6F, 0.8F}, {0.3F, 0.4F, 0.8660254F}, 0.625F,
-         {0.0F, 1.0F, 0.0F}, true, true, true},
-        {key(101, 202, 303, 1), {3.5F, 2.75F, 1.5F},
-         {1.0F, 0.0F, 0.0F}, {0.0F, 0.0F, 0.0F}, 0.125F,
-         {0.0F, 0.0F, 0.0F}, false, true, false},
+        {key(101, 202, 303), {3.25F, 2.5F, 1.75F}, {0.0F, 0.6F, 0.8F}, {0.3F, 0.4F, 0.8660254F}, 0.625F, {0.0F, 1.0F, 0.0F}, true, true, true},
+        {key(101, 202, 303, 1), {3.5F, 2.75F, 1.5F}, {1.0F, 0.0F, 0.0F}, {0.0F, 0.0F, 0.0F}, 0.125F, {0.0F, 0.0F, 0.0F}, false, true, false},
     };
     const auto bytes = serializeFiberletAnchors(config, anchors);
     const auto decoded = deserializeFiberletAnchors(bytes);
@@ -79,8 +216,7 @@ TEST_CASE("Fiberlet storage float anchors round trip exact float bits")
     CHECK(decoded.anchors[0].predictionPresence == anchors[0].predictionPresence);
     CHECK(decoded.anchors[0].normalXYZ == anchors[0].normalXYZ);
     CHECK(decoded.anchors[0].predictionValid == anchors[0].predictionValid);
-    CHECK(decoded.anchors[0].predictionPresenceValid ==
-          anchors[0].predictionPresenceValid);
+    CHECK(decoded.anchors[0].predictionPresenceValid == anchors[0].predictionPresenceValid);
     CHECK(decoded.anchors[0].normalValid == anchors[0].normalValid);
     CHECK_FALSE(decoded.anchors[1].predictionValid);
     CHECK(decoded.anchors[1].predictionPresenceValid);
@@ -103,18 +239,60 @@ TEST_CASE("Fiberlet storage compact anchors use quantized keys and compact axes"
     CHECK(std::abs(decoded.anchors[0].fittedAxisXYZ.dot(anchors[0].fittedAxisXYZ)) > 0.99F);
 }
 
+TEST_CASE("Fiberlet compact default keeps float positions and fixed uint16 costs")
+{
+    const auto config = compactDefaultConfig();
+    const std::vector<FiberletStoredAnchor> anchors{
+        {key(101, 202, 303), {3.25F, 2.5F, 1.75F},
+            {0.25F, -0.4F, 0.881759F}, {0.3F, 0.4F, 0.8660254F},
+            0.625F, {0.0F, 1.0F, 0.0F}, true, true, true},
+    };
+    const auto decodedAnchors =
+        deserializeFiberletAnchors(serializeFiberletAnchors(config, anchors));
+    REQUIRE(decodedAnchors.anchors.size() == 1);
+    CHECK(decodedAnchors.anchors[0].key == anchors[0].key);
+    CHECK(decodedAnchors.anchors[0].positionPredictionXYZ ==
+          anchors[0].positionPredictionXYZ);
+    CHECK(std::abs(decodedAnchors.anchors[0].fittedAxisXYZ.dot(
+              anchors[0].fittedAxisXYZ)) > 0.99F);
+
+    const std::vector<FiberletStoredPrefix> prefixes{
+        {.id = {key(101, 202, 303), key(102, 203, 304)},
+         .interiorPointCount = 4,
+         .entryUV = {-1, 2},
+         .exitUV = {3, -4},
+         .pathLengthPredictionVoxels = 8.0F,
+         .cost = {0.25F, 0.5F, 0.375F, 0.625F, 0.25F},
+         .firstStepBaseXYZ = {1.0F, 0.25F, 0.0F},
+         .lastStepBaseXYZ = {0.75F, -0.25F, 0.0F}},
+    };
+    const auto decodedPrefixes = deserializeFiberletPrefixes(
+        serializeFiberletPrefixes(config, prefixes));
+    REQUIRE(decodedPrefixes.prefixes.size() == 1);
+    const float encoded = std::round(
+        std::sqrt((2.0F / 8.0F) / 256.0F) * 65535.0F);
+    const float expected =
+        256.0F * (encoded / 65535.0F) * (encoded / 65535.0F) * 8.0F;
+    CHECK(decodedPrefixes.prefixes[0].cost.total() ==
+          doctest::Approx(expected));
+}
+
 TEST_CASE("Fiberlet storage prefixes and independently cached routes round trip")
 {
     auto config = floatConfig();
     const std::vector<FiberletStoredPrefix> prefixes{
         {.id = {key(101, 202, 303), key(102, 203, 304)},
-         .interiorPointCount = 4, .entryUV = {-1, 2}, .exitUV = {3, -4},
+         .interiorPointCount = 4,
+         .entryUV = {-1, 2},
+         .exitUV = {3, -4},
          .pathLengthPredictionVoxels = 7.5F,
          .cost = {0.25F, 0.5F, 0.375F, 0.625F, 0.5F},
          .firstStepBaseXYZ = {1.0F, 0.25F, 0.0F},
          .lastStepBaseXYZ = {0.75F, -0.25F, 0.0F}},
         {.id = {key(101, 202, 303), key(104, 204, 305)},
-         .interiorPointCount = 2, .entryUV = {0, 1}, .exitUV = {0, 1},
+         .interiorPointCount = 2,
+         .entryUV = {0, 1},
+         .exitUV = {0, 1},
          .pathLengthPredictionVoxels = 9.0F,
          .cost = {1.0F, 2.0F, 1.5F, 2.5F, 1.5F},
          .firstStepBaseXYZ = {1.0F, 0.0F, 0.25F},
@@ -126,20 +304,13 @@ TEST_CASE("Fiberlet storage prefixes and independently cached routes round trip"
     REQUIRE(decodedPrefixes.prefixes.size() == 2);
     CHECK(decodedPrefixes.prefixes[0].id == prefixes[0].id);
     CHECK(decodedPrefixes.prefixes[0].entryUV == prefixes[0].entryUV);
-    CHECK(decodedPrefixes.prefixes[0].cost.invalidPrediction ==
-          prefixes[0].cost.invalidPrediction);
-    CHECK(decodedPrefixes.prefixes[0].cost.alignment ==
-          prefixes[0].cost.alignment);
-    CHECK(decodedPrefixes.prefixes[0].cost.isotropicSmoothness ==
-          prefixes[0].cost.isotropicSmoothness);
-    CHECK(decodedPrefixes.prefixes[0].cost.tangentSmoothness ==
-          prefixes[0].cost.tangentSmoothness);
-    CHECK(decodedPrefixes.prefixes[0].cost.normalSmoothness ==
-          prefixes[0].cost.normalSmoothness);
-    CHECK(decodedPrefixes.prefixes[0].firstStepBaseXYZ ==
-          prefixes[0].firstStepBaseXYZ);
-    CHECK(decodedPrefixes.prefixes[0].lastStepBaseXYZ ==
-          prefixes[0].lastStepBaseXYZ);
+    CHECK(decodedPrefixes.prefixes[0].cost.invalidPrediction == prefixes[0].cost.invalidPrediction);
+    CHECK(decodedPrefixes.prefixes[0].cost.alignment == prefixes[0].cost.alignment);
+    CHECK(decodedPrefixes.prefixes[0].cost.isotropicSmoothness == prefixes[0].cost.isotropicSmoothness);
+    CHECK(decodedPrefixes.prefixes[0].cost.tangentSmoothness == prefixes[0].cost.tangentSmoothness);
+    CHECK(decodedPrefixes.prefixes[0].cost.normalSmoothness == prefixes[0].cost.normalSmoothness);
+    CHECK(decodedPrefixes.prefixes[0].firstStepBaseXYZ == prefixes[0].firstStepBaseXYZ);
+    CHECK(decodedPrefixes.prefixes[0].lastStepBaseXYZ == prefixes[0].lastStepBaseXYZ);
     REQUIRE(decodedRoutes.routes.size() == 2);
     CHECK(decodedRoutes.routes[0].middleUV == routes[0].middleUV);
     CHECK(decodedRoutes.routes[1].middleUV.empty());
@@ -163,28 +334,16 @@ TEST_CASE("Fiberlet endpoint steps exactly match full route reconstruction")
     config.longitudinalStepPredictionVoxels = 2.0F;
     const cv::Vec3f firstPosition{1.0F, 2.0F, 3.0F};
     const cv::Vec3f axis{1.0F, 0.0F, 0.0F};
-    for (const auto lattice : std::vector<std::vector<std::array<std::int16_t, 2>>>{
-             {}, {{1, -1}}, {{1, -1}, {2, 0}, {-1, 1}}}) {
-        const cv::Vec3f secondPosition =
-            firstPosition + cv::Vec3f{
-                                2.0F * static_cast<float>(lattice.size() + 1),
-                                0.0F, 0.0F};
-        const std::array<std::int16_t, 2> entry =
-            lattice.empty() ? std::array<std::int16_t, 2>{} : lattice.front();
-        const std::array<std::int16_t, 2> exit =
-            lattice.empty() ? std::array<std::int16_t, 2>{} : lattice.back();
-        const auto endpoints = reconstructFiberletRouteEndpointSteps(
-            firstPosition, axis, secondPosition, axis,
-            lattice.size(), entry, exit, config);
-        const auto points = reconstructFiberletRoutePoints(
-            firstPosition, axis, secondPosition, axis,
-            lattice, config);
+    for (const auto lattice : std::vector<std::vector<std::array<std::int16_t, 2>>>{{}, {{1, -1}}, {{1, -1}, {2, 0}, {-1, 1}}}) {
+        const cv::Vec3f secondPosition = firstPosition + cv::Vec3f{2.0F * static_cast<float>(lattice.size() + 1), 0.0F, 0.0F};
+        const std::array<std::int16_t, 2> entry = lattice.empty() ? std::array<std::int16_t, 2>{} : lattice.front();
+        const std::array<std::int16_t, 2> exit = lattice.empty() ? std::array<std::int16_t, 2>{} : lattice.back();
+        const auto endpoints = reconstructFiberletRouteEndpointSteps(firstPosition, axis, secondPosition, axis, lattice.size(), entry, exit, config);
+        const auto points = reconstructFiberletRoutePoints(firstPosition, axis, secondPosition, axis, lattice, config);
         REQUIRE(points.size() >= 2);
         CHECK(endpoints.firstPredictionXYZ == points[1] - points[0]);
-        CHECK(endpoints.lastPredictionXYZ ==
-              points.back() - points[points.size() - 2]);
-        CHECK(-endpoints.lastPredictionXYZ ==
-              points[points.size() - 2] - points.back());
+        CHECK(endpoints.lastPredictionXYZ == points.back() - points[points.size() - 2]);
+        CHECK(-endpoints.lastPredictionXYZ == points[points.size() - 2] - points.back());
         CHECK(-endpoints.firstPredictionXYZ == points[0] - points[1]);
     }
 }
@@ -194,11 +353,15 @@ TEST_CASE("Fiberlet storage compact cost is decoded from the authoritative chunk
     auto config = compactConfig();
     const std::vector<FiberletStoredPrefix> prefixes{
         {.id = {key(101, 202, 303), key(102, 203, 304)},
-         .pathLengthPredictionVoxels = 2.0F, .cost = {0, 10.0F},
-         .firstStepBaseXYZ = {1, 0, 0}, .lastStepBaseXYZ = {1, 0, 0}},
+         .pathLengthPredictionVoxels = 2.0F,
+         .cost = {0, 10.0F},
+         .firstStepBaseXYZ = {1, 0, 0},
+         .lastStepBaseXYZ = {1, 0, 0}},
         {.id = {key(101, 202, 303), key(104, 204, 305)},
-         .pathLengthPredictionVoxels = 3.0F, .cost = {0, 20.0F},
-         .firstStepBaseXYZ = {1, 0, 0}, .lastStepBaseXYZ = {1, 0, 0}},
+         .pathLengthPredictionVoxels = 3.0F,
+         .cost = {0, 20.0F},
+         .firstStepBaseXYZ = {1, 0, 0},
+         .lastStepBaseXYZ = {1, 0, 0}},
     };
     const auto decoded = deserializeFiberletPrefixes(serializeFiberletPrefixes(config, prefixes));
     CHECK(decoded.prefixes[0].cost.total() == doctest::Approx(10.0F));
@@ -240,15 +403,17 @@ TEST_CASE("Fiberlet sparse dataset generates, publishes, and reuses opaque chunk
     auto dataset = FiberletChunkDataset::createOrOpen(root, metadata);
     std::atomic<int> generated{0};
     std::atomic<int> generatedResolutions{0};
-    auto cache =
-        createGeneratedFiberletChunkCache(dataset, [&](FiberletStorageChunkKind kind, const vc::render::ChunkKey&, const FiberletStorageCodecConfig& config) {
+    auto cache = createGeneratedFiberletChunkCache(
+        dataset,
+        [&](FiberletStorageChunkKind kind, const vc::render::ChunkKey&, const FiberletStorageCodecConfig& config) {
             ++generated;
             CHECK(kind == FiberletStorageChunkKind::Anchors);
             const auto origin = config.coordinateOriginZYX;
             const std::vector<FiberletStoredAnchor> anchors{{key(origin[0], origin[1], origin[2]), {1, 2, 3}, {1, 0, 0}}};
             return materialized(kind, serializeFiberletAnchors(config, anchors));
-        }, {}, [&](FiberletStorageChunkKind kind, const vc::render::ChunkKey& key,
-                   vc::render::ChunkFetchStatus status) {
+        },
+        {},
+        [&](FiberletStorageChunkKind kind, const vc::render::ChunkKey& key, vc::render::ChunkFetchStatus status) {
             CHECK(kind == FiberletStorageChunkKind::Anchors);
             CHECK(key.level == 0);
             CHECK(key.iz == 1);
@@ -266,12 +431,14 @@ TEST_CASE("Fiberlet sparse dataset generates, publishes, and reuses opaque chunk
 
     auto reopened = FiberletChunkDataset::createOrOpen(root, metadata);
     std::atomic<int> persistedResolutions{0};
-    auto secondCache =
-        createGeneratedFiberletChunkCache(reopened, [&](FiberletStorageChunkKind, const vc::render::ChunkKey&, const FiberletStorageCodecConfig&) -> FiberletChunkDataset::MaterializedChunk {
+    auto secondCache = createGeneratedFiberletChunkCache(
+        reopened,
+        [&](FiberletStorageChunkKind, const vc::render::ChunkKey&, const FiberletStorageCodecConfig&) -> FiberletChunkDataset::MaterializedChunk {
             ++generated;
             throw std::runtime_error("existing chunk should have been reused");
-        }, {}, [&](FiberletStorageChunkKind kind, const vc::render::ChunkKey& key,
-                   vc::render::ChunkFetchStatus status) {
+        },
+        {},
+        [&](FiberletStorageChunkKind kind, const vc::render::ChunkKey& key, vc::render::ChunkFetchStatus status) {
             CHECK(kind == FiberletStorageChunkKind::Anchors);
             CHECK(key.level == 0);
             CHECK(key.iz == 1);
@@ -290,10 +457,8 @@ TEST_CASE("Fiberlet sparse dataset generates, publishes, and reuses opaque chunk
     REQUIRE(secondPayload);
     REQUIRE(secondPayload->anchors.size() == firstPayload->anchors.size());
     CHECK(secondPayload->anchors.front().key == firstPayload->anchors.front().key);
-    CHECK(secondPayload->anchors.front().positionPredictionXYZ ==
-          firstPayload->anchors.front().positionPredictionXYZ);
-    CHECK(secondPayload->anchors.front().fittedAxisXYZ ==
-          firstPayload->anchors.front().fittedAxisXYZ);
+    CHECK(secondPayload->anchors.front().positionPredictionXYZ == firstPayload->anchors.front().positionPredictionXYZ);
+    CHECK(secondPayload->anchors.front().fittedAxisXYZ == firstPayload->anchors.front().fittedAxisXYZ);
 
     std::ifstream attributesInput(root / ".zattrs");
     auto attributes = nlohmann::json::parse(attributesInput);
@@ -375,6 +540,7 @@ TEST_CASE("Fiberlet chunk graph loads complete cross-chunk adjacency and routes"
     anchorsMetadata.datasetFingerprint[0] = 77;
     auto fiberletsMetadata = anchorsMetadata;
     fiberletsMetadata.kind = FiberletDatasetKind::Fiberlets;
+    fiberletsMetadata.datasetFingerprint[0] = 78;
 
     const auto first = key(7, 15, 15);
     const auto second = key(8, 7, 7);
@@ -407,12 +573,8 @@ TEST_CASE("Fiberlet chunk graph loads complete cross-chunk adjacency and routes"
             const bool owner = chunk.iz == 0 && chunk.iy == 1 && chunk.ix == 1;
             if (kind == FiberletStorageChunkKind::FiberletPrefix) {
                 const std::vector<FiberletStoredPrefix> prefixes =
-                    owner ? std::vector<FiberletStoredPrefix>{{
-                        .id = edgeId,
-                        .pathLengthPredictionVoxels = 1.0F,
-                        .cost = {0.25F, 4.0F, 1.0F, 2.0F, 2.0F},
-                        .firstStepBaseXYZ = {1, 0, 0},
-                        .lastStepBaseXYZ = {1, 0, 0}}}
+                    owner
+                        ? std::vector<FiberletStoredPrefix>{{.id = edgeId, .pathLengthPredictionVoxels = 1.0F, .cost = {0.25F, 4.0F, 1.0F, 2.0F, 2.0F}, .firstStepBaseXYZ = {1, 0, 0}, .lastStepBaseXYZ = {1, 0, 0}}}
                           : std::vector<FiberletStoredPrefix>{};
                 return materialized(kind, serializeFiberletPrefixes(config, prefixes));
             }
@@ -447,6 +609,29 @@ TEST_CASE("Fiberlet chunk graph loads complete cross-chunk adjacency and routes"
     CHECK(route.value.route.middleUV.empty());
     CHECK(route.value.pointsPredictionXYZ.size() == 2);
     CHECK(routeRequests.load() == 1);
+
+    FiberletChunkGraphSource transformedGraph(anchorsDataset, anchorCache, fiberletsDataset, fiberletCache, {}, [](const vc::render::ChunkKey&, std::shared_ptr<const FiberletAnchorChunkPayload> canonical) {
+        auto transformed = std::make_shared<std::vector<FiberletStoredAnchor>>(canonical->anchors);
+        for (auto& anchor : *transformed)
+            anchor.positionPredictionXYZ[0] += 10.0F;
+        return std::shared_ptr<const std::vector<FiberletStoredAnchor>>(std::move(transformed));
+    });
+    const auto transformedAnchor = transformedGraph.anchor(second, true);
+    REQUIRE(transformedAnchor.status == FiberletGraphQueryStatus::Ready);
+    CHECK((transformedAnchor.value.anchor.positionPredictionXYZ == cv::Vec3f{12, 2, 3}));
+    const auto transformedChunk = transformedGraph.anchorsInChunk({0, 1, 0, 0}, true);
+    REQUIRE(transformedChunk.status == FiberletGraphQueryStatus::Ready);
+    REQUIRE(transformedChunk.value.anchors->size() == 1);
+    CHECK((transformedChunk.value.anchors->front().positionPredictionXYZ == cv::Vec3f{12, 2, 3}));
+    const auto transformedEdge = transformedGraph.edge(edgeId, true);
+    REQUIRE(transformedEdge.status == FiberletGraphQueryStatus::Ready);
+    CHECK((transformedEdge.value.firstAnchor.positionPredictionXYZ == cv::Vec3f{11, 2, 3}));
+    CHECK((transformedEdge.value.secondAnchor.positionPredictionXYZ == cv::Vec3f{12, 2, 3}));
+    const auto transformedRoute = transformedGraph.route(edgeId, true);
+    REQUIRE(transformedRoute.status == FiberletGraphQueryStatus::Ready);
+    REQUIRE(transformedRoute.value.pointsPredictionXYZ.size() == 2);
+    CHECK((transformedRoute.value.pointsPredictionXYZ.front() == cv::Vec3f{11, 2, 3}));
+    CHECK((transformedRoute.value.pointsPredictionXYZ.back() == cv::Vec3f{12, 2, 3}));
 
     const vc::render::ChunkKey owner{0, 0, 1, 1};
     const vc::render::ChunkKey distant{0, 3, 3, 3};

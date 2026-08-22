@@ -328,7 +328,9 @@ void finishField(FieldBlock& field, bool compress)
 
 void validateConfig(const FiberletStorageCodecConfig& config)
 {
-    if (config.profile != FiberletStorageProfile::Float32Cache && config.profile != FiberletStorageProfile::CompactQuantized)
+    if (config.profile != FiberletStorageProfile::Float32Cache &&
+        config.profile != FiberletStorageProfile::CompactQuantized &&
+        config.profile != FiberletStorageProfile::CompactDirectionsFixedCost)
         throw std::invalid_argument("unknown fiberlet storage profile");
     (void)unsignedScalar(config.coordinateBits);
     (void)signedScalar(config.deltaBits);
@@ -337,11 +339,15 @@ void validateConfig(const FiberletStorageCodecConfig& config)
     if (config.profile == FiberletStorageProfile::Float32Cache) {
         if (config.costBits != 32 || config.positionQuantumBaseVoxels != 0)
             throw std::invalid_argument("float32 fiberlet profile has invalid physical settings");
-    } else {
+    } else if (config.profile == FiberletStorageProfile::CompactQuantized) {
         if (config.costBits != 8 && config.costBits != 16)
             throw std::invalid_argument("compact fiberlet cost width must be 8 or 16");
         if (config.positionQuantumBaseVoxels == 0 || !(config.predictionToBaseScale > 0.0) || !std::isfinite(config.predictionToBaseScale))
             throw std::invalid_argument("compact fiberlet position scale is invalid");
+    } else if (config.costBits != 16 ||
+               config.positionQuantumBaseVoxels != 0) {
+        throw std::invalid_argument(
+            "compact-direction fiberlet profile requires float positions and uint16 costs");
     }
 }
 
@@ -569,7 +575,11 @@ std::vector<std::byte> serializeFiberletAnchors(
     for (const auto id : {KeyZ, KeyY, KeyX})
         fields.push_back(makeField(id, coordinateScalar, anchors.size()));
     fields.push_back(makeField(Variant, Scalar::U8, anchors.size()));
-    if (config.profile == FiberletStorageProfile::Float32Cache) {
+    const bool compactDirections =
+        config.profile != FiberletStorageProfile::Float32Cache;
+    const bool floatPositions =
+        config.profile != FiberletStorageProfile::CompactQuantized;
+    if (!compactDirections) {
         for (const auto id : {
                  PositionX, PositionY, PositionZ, AxisX, AxisY, AxisZ,
                  PredictionAxisX, PredictionAxisY, PredictionAxisZ,
@@ -577,6 +587,10 @@ std::vector<std::byte> serializeFiberletAnchors(
             fields.push_back(makeField(id, Scalar::F32, anchors.size()));
         }
     } else {
+        if (floatPositions) {
+            for (const auto id : {PositionX, PositionY, PositionZ})
+                fields.push_back(makeField(id, Scalar::F32, anchors.size()));
+        }
         for (const auto id : {
                  AxisX, AxisY, PredictionAxisX, PredictionAxisY,
                  PredictionPresence, NormalX, NormalY}) {
@@ -611,7 +625,7 @@ std::vector<std::byte> serializeFiberletAnchors(
             (anchor.predictionPresenceValid ? std::uint8_t{2} : std::uint8_t{0}) |
             (anchor.normalValid ? std::uint8_t{4} : std::uint8_t{0});
         appendLittle(field(ScoringFlags).decoded, scoringFlags);
-        if (config.profile == FiberletStorageProfile::Float32Cache) {
+        if (!compactDirections) {
             validateFinite(anchor.positionPredictionXYZ, "anchor position");
             for (int axis = 0; axis < 3; ++axis) {
                 appendLittle(field(static_cast<Field>(PositionX + axis)).decoded, anchor.positionPredictionXYZ[axis]);
@@ -621,6 +635,14 @@ std::vector<std::byte> serializeFiberletAnchors(
             }
             appendLittle(field(PredictionPresence).decoded, anchor.predictionPresence);
         } else {
+            if (floatPositions) {
+                validateFinite(anchor.positionPredictionXYZ, "anchor position");
+                for (int axis = 0; axis < 3; ++axis) {
+                    appendLittle(
+                        field(static_cast<Field>(PositionX + axis)).decoded,
+                        anchor.positionPredictionXYZ[axis]);
+                }
+            }
             const auto encoded =
                 vc::lasagna::encodeCompactNormalToRaw(cv::Vec3d(anchor.fittedAxisXYZ[0], anchor.fittedAxisXYZ[1], anchor.fittedAxisXYZ[2]));
             if (!encoded)
@@ -695,7 +717,7 @@ std::vector<std::byte> serializeFiberletPrefixes(
     float costOffset = 0.0F;
     float costScale = 0.0F;
     if (config.profile == FiberletStorageProfile::CompactQuantized &&
-        config.costBits != 32 && !prefixes.empty()) {
+        !prefixes.empty()) {
         auto [minimum, maximum] =
             std::minmax_element(prefixes.begin(), prefixes.end(), [](const auto& a, const auto& b) { return a.cost.total() < b.cost.total(); });
         costOffset = minimum->cost.total();
@@ -755,8 +777,17 @@ std::vector<std::byte> serializeFiberletPrefixes(
                 prefix.cost.tangentSmoothness);
             appendLittle(field(NormalSmoothnessCost).decoded,
                 prefix.cost.normalSmoothness);
-        } else if (config.costBits == 32) {
-            appendLittle(field(TotalCost).decoded, prefix.cost.total());
+        } else if (
+            config.profile ==
+            FiberletStorageProfile::CompactDirectionsFixedCost) {
+            constexpr float densityMaximum = 256.0F;
+            const float density =
+                prefix.cost.total() / prefix.pathLengthPredictionVoxels;
+            const float normalized = std::sqrt(
+                std::clamp(density / densityMaximum, 0.0F, 1.0F));
+            appendUnsigned(field(TotalCost).decoded, costScalar,
+                static_cast<std::uint64_t>(
+                    std::lround(normalized * 65535.0F)));
         } else {
             const std::uint64_t maximumCode = config.costBits == 8 ? 255 : 65535;
             const auto code = costScale == 0.0F ? std::uint64_t{0}
@@ -814,22 +845,25 @@ FiberletDecodedAnchors deserializeFiberletAnchors(std::span<const std::byte> byt
     const auto& y = requireField(payload, KeyY, coordinateScalar, payload.recordCount).second;
     const auto& x = requireField(payload, KeyX, coordinateScalar, payload.recordCount).second;
     const auto& variant = requireField(payload, Variant, Scalar::U8, payload.recordCount).second;
-    const bool compact = payload.config.profile == FiberletStorageProfile::CompactQuantized;
-    const auto& axisX = requireField(payload, AxisX, compact ? Scalar::U8 : Scalar::F32, payload.recordCount).second;
-    const auto& axisY = requireField(payload, AxisY, compact ? Scalar::U8 : Scalar::F32, payload.recordCount).second;
-    const std::vector<std::byte>* axisZ = compact ? nullptr : &requireField(payload, AxisZ, Scalar::F32, payload.recordCount).second;
-    const auto& predictionAxisX = requireField(payload, PredictionAxisX, compact ? Scalar::U8 : Scalar::F32, payload.recordCount).second;
-    const auto& predictionAxisY = requireField(payload, PredictionAxisY, compact ? Scalar::U8 : Scalar::F32, payload.recordCount).second;
-    const std::vector<std::byte>* predictionAxisZ = compact ? nullptr : &requireField(payload, PredictionAxisZ, Scalar::F32, payload.recordCount).second;
-    const auto& predictionPresence = requireField(payload, PredictionPresence, compact ? Scalar::U8 : Scalar::F32, payload.recordCount).second;
-    const auto& normalX = requireField(payload, NormalX, compact ? Scalar::U8 : Scalar::F32, payload.recordCount).second;
-    const auto& normalY = requireField(payload, NormalY, compact ? Scalar::U8 : Scalar::F32, payload.recordCount).second;
-    const std::vector<std::byte>* normalZ = compact ? nullptr : &requireField(payload, NormalZ, Scalar::F32, payload.recordCount).second;
+    const bool compactDirections =
+        payload.config.profile != FiberletStorageProfile::Float32Cache;
+    const bool quantizedPositions =
+        payload.config.profile == FiberletStorageProfile::CompactQuantized;
+    const auto& axisX = requireField(payload, AxisX, compactDirections ? Scalar::U8 : Scalar::F32, payload.recordCount).second;
+    const auto& axisY = requireField(payload, AxisY, compactDirections ? Scalar::U8 : Scalar::F32, payload.recordCount).second;
+    const std::vector<std::byte>* axisZ = compactDirections ? nullptr : &requireField(payload, AxisZ, Scalar::F32, payload.recordCount).second;
+    const auto& predictionAxisX = requireField(payload, PredictionAxisX, compactDirections ? Scalar::U8 : Scalar::F32, payload.recordCount).second;
+    const auto& predictionAxisY = requireField(payload, PredictionAxisY, compactDirections ? Scalar::U8 : Scalar::F32, payload.recordCount).second;
+    const std::vector<std::byte>* predictionAxisZ = compactDirections ? nullptr : &requireField(payload, PredictionAxisZ, Scalar::F32, payload.recordCount).second;
+    const auto& predictionPresence = requireField(payload, PredictionPresence, compactDirections ? Scalar::U8 : Scalar::F32, payload.recordCount).second;
+    const auto& normalX = requireField(payload, NormalX, compactDirections ? Scalar::U8 : Scalar::F32, payload.recordCount).second;
+    const auto& normalY = requireField(payload, NormalY, compactDirections ? Scalar::U8 : Scalar::F32, payload.recordCount).second;
+    const std::vector<std::byte>* normalZ = compactDirections ? nullptr : &requireField(payload, NormalZ, Scalar::F32, payload.recordCount).second;
     const auto& scoringFlags = requireField(payload, ScoringFlags, Scalar::U8, payload.recordCount).second;
-    const std::vector<std::byte>* positionX = compact ? nullptr : &requireField(payload, PositionX, Scalar::F32, payload.recordCount).second;
-    const std::vector<std::byte>* positionY = compact ? nullptr : &requireField(payload, PositionY, Scalar::F32, payload.recordCount).second;
-    const std::vector<std::byte>* positionZ = compact ? nullptr : &requireField(payload, PositionZ, Scalar::F32, payload.recordCount).second;
-    const std::size_t expectedFields = compact ? 12 : 18;
+    const std::vector<std::byte>* positionX = quantizedPositions ? nullptr : &requireField(payload, PositionX, Scalar::F32, payload.recordCount).second;
+    const std::vector<std::byte>* positionY = quantizedPositions ? nullptr : &requireField(payload, PositionY, Scalar::F32, payload.recordCount).second;
+    const std::vector<std::byte>* positionZ = quantizedPositions ? nullptr : &requireField(payload, PositionZ, Scalar::F32, payload.recordCount).second;
+    const std::size_t expectedFields = quantizedPositions ? 12 : compactDirections ? 15 : 18;
     if (payload.fields.size() != expectedFields)
         throw std::invalid_argument("fiberlet anchor payload contains unknown fields");
 
@@ -846,7 +880,7 @@ FiberletDecodedAnchors deserializeFiberletAnchors(std::span<const std::byte> byt
         anchor.predictionValid = (flags & 1U) != 0;
         anchor.predictionPresenceValid = (flags & 2U) != 0;
         anchor.normalValid = (flags & 4U) != 0;
-        if (compact) {
+        if (compactDirections) {
             const auto decoded =
                 vc::lasagna::decodeCompactNormalFromRaw(readLittle<std::uint8_t>(axisX, index), readLittle<std::uint8_t>(axisY, index));
             anchor.fittedAxisXYZ = cv::Vec3f(decoded[0], decoded[1], decoded[2]);
@@ -865,11 +899,18 @@ FiberletDecodedAnchors deserializeFiberletAnchors(std::span<const std::byte> byt
                     readLittle<std::uint8_t>(normalY, index));
             anchor.normalXYZ = cv::Vec3f(
                 normalDecoded[0], normalDecoded[1], normalDecoded[2]);
-            const double scale = static_cast<double>(payload.config.positionQuantumBaseVoxels) / payload.config.predictionToBaseScale;
-            anchor.positionPredictionXYZ = cv::Vec3f(
-                static_cast<float>(anchor.key.coordinateZYX[2] * scale),
-                static_cast<float>(anchor.key.coordinateZYX[1] * scale),
-                static_cast<float>(anchor.key.coordinateZYX[0] * scale));
+            if (quantizedPositions) {
+                const double scale = static_cast<double>(payload.config.positionQuantumBaseVoxels) / payload.config.predictionToBaseScale;
+                anchor.positionPredictionXYZ = cv::Vec3f(
+                    static_cast<float>(anchor.key.coordinateZYX[2] * scale),
+                    static_cast<float>(anchor.key.coordinateZYX[1] * scale),
+                    static_cast<float>(anchor.key.coordinateZYX[0] * scale));
+            } else {
+                anchor.positionPredictionXYZ = cv::Vec3f(
+                    readLittle<float>(*positionX, index * 4),
+                    readLittle<float>(*positionY, index * 4),
+                    readLittle<float>(*positionZ, index * 4));
+            }
         } else {
             anchor.positionPredictionXYZ =
                 cv::Vec3f(readLittle<float>(*positionX, index * 4), readLittle<float>(*positionY, index * 4), readLittle<float>(*positionZ, index * 4));
@@ -999,12 +1040,18 @@ FiberletDecodedPrefixes deserializeFiberletPrefixes(std::span<const std::byte> b
                 readLittle<float>(*tangentSmoothnessCost, index * 4),
                 readLittle<float>(*normalSmoothnessCost, index * 4),
             };
+        } else if (
+            payload.config.profile ==
+            FiberletStorageProfile::CompactDirectionsFixedCost) {
+            constexpr float densityMaximum = 256.0F;
+            const float normalized = static_cast<float>(
+                readUnsigned(*totalCost, costScalar, index)) / 65535.0F;
+            prefix.cost.alignment = densityMaximum * normalized * normalized *
+                prefix.pathLengthPredictionVoxels;
         } else {
-            prefix.cost.alignment = payload.config.costBits == 32
-                ? readLittle<float>(*totalCost, index * 4)
-                : payload.costOffset + payload.costScale *
-                    static_cast<float>(readUnsigned(
-                        *totalCost, costScalar, index));
+            prefix.cost.alignment = payload.costOffset + payload.costScale *
+                static_cast<float>(readUnsigned(
+                    *totalCost, costScalar, index));
         }
         for (int axis = 0; axis < 3; ++axis) {
             prefix.firstStepBaseXYZ[axis] =

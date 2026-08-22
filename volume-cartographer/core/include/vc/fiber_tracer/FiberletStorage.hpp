@@ -15,6 +15,7 @@ namespace vc::fiber_tracer
 enum class FiberletStorageProfile : std::uint8_t {
     Float32Cache = 1,
     CompactQuantized = 2,
+    CompactDirectionsFixedCost = 3,
 };
 
 enum class FiberletStorageChunkKind : std::uint8_t {
@@ -24,8 +25,9 @@ enum class FiberletStorageChunkKind : std::uint8_t {
 };
 
 struct FiberletStorageKey {
-    // Float profile: global anchor-cell Z/Y/X. Compact profile: global
-    // quantized base-coordinate Z/Y/X. The profile gives the interpretation.
+    // Float and compact-direction profiles: global anchor-cell Z/Y/X.
+    // Compact-quantized profile: global quantized base-coordinate Z/Y/X.
+    // The profile gives the interpretation.
     std::array<std::int64_t, 3> coordinateZYX{0, 0, 0};
     std::uint8_t variant = 0;
 

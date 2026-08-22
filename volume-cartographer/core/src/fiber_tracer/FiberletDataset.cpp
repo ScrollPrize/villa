@@ -26,6 +26,8 @@ const char* profileName(FiberletStorageProfile profile)
             return "float32_cache";
         case FiberletStorageProfile::CompactQuantized:
             return "compact_quantized";
+        case FiberletStorageProfile::CompactDirectionsFixedCost:
+            return "compact_directions_fixed_cost";
     }
     throw std::invalid_argument("unknown fiberlet storage profile");
 }
@@ -36,6 +38,8 @@ FiberletStorageProfile parseProfile(const std::string& value)
         return FiberletStorageProfile::Float32Cache;
     if (value == "compact_quantized")
         return FiberletStorageProfile::CompactQuantized;
+    if (value == "compact_directions_fixed_cost")
+        return FiberletStorageProfile::CompactDirectionsFixedCost;
     throw std::invalid_argument("unknown fiberlet storage profile in metadata");
 }
 

@@ -123,6 +123,9 @@ public:
 
     Stats stats() const;
     void invalidate();
+    // Cancel this cache's queued tasks and wait for its in-flight work and
+    // persistent writes without draining unrelated users of the shared pools.
+    void cancelPendingAndWait();
     // Advances fetch priority so newer view renders supersede stale requests.
     // discardPending is only safe for an exclusively-owned interactive cache.
     void beginViewRequest(bool discardPending = false) override;

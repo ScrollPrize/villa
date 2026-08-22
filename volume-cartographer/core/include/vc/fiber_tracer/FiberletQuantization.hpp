@@ -2,20 +2,117 @@
 
 #include "vc/fiber_tracer/FiberGraph.hpp"
 
+#include <array>
+#include <compare>
+#include <cstdint>
 #include <functional>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace vc::fiber_tracer
 {
+
+enum class FiberletCostQuantizationDomain : std::uint8_t {
+    RawTotal,
+    SqrtPerPredictionVoxel,
+};
+
+[[nodiscard]] std::string_view fiberletCostQuantizationDomainName(
+    FiberletCostQuantizationDomain domain);
 
 struct FiberletQuantizationScenario {
     std::string name;
     int positionQuantumBaseVoxels = 0;
     bool compactAxes = false;
     int costBits = 0;
+    FiberletCostQuantizationDomain costDomain =
+        FiberletCostQuantizationDomain::RawTotal;
+    float costDensityMaximum = 0.0F;
 };
+
+struct FiberletEvaluationQuantization {
+    int positionQuantumBaseVoxels = 0;
+    bool compactDirections = false;
+    int costBits = 0;
+    int storageChunkSideBaseVoxels = 512;
+    FiberletCostQuantizationDomain costDomain =
+        FiberletCostQuantizationDomain::RawTotal;
+    float costDensityMaximum = 0.0F;
+
+    auto operator<=>(const FiberletEvaluationQuantization&) const = default;
+
+    [[nodiscard]] bool enabled() const noexcept
+    {
+        return positionQuantumBaseVoxels > 0 || compactDirections ||
+            costBits > 0;
+    }
+};
+
+struct FiberletGeometryQuantization {
+    int positionQuantumBaseVoxels = 0;
+    bool compactDirections = false;
+
+    auto operator<=>(const FiberletGeometryQuantization&) const = default;
+
+    [[nodiscard]] bool enabled() const noexcept
+    {
+        return positionQuantumBaseVoxels > 0 || compactDirections;
+    }
+};
+
+struct FiberletGeometryCacheProfile {
+    FiberletGeometryQuantization geometry;
+    int compatibilityCostTagBits = 0;
+    int storageChunkSideBaseVoxels = 512;
+
+    auto operator<=>(const FiberletGeometryCacheProfile&) const = default;
+
+    [[nodiscard]] bool enabled() const noexcept
+    {
+        return geometry.enabled();
+    }
+};
+
+[[nodiscard]] FiberletGeometryCacheProfile
+fiberletGeometryCacheProfile(
+    FiberletEvaluationQuantization replayQuantization);
+
+[[nodiscard]] cv::Vec3f quantizeFiberletPositionForEvaluation(
+    const cv::Vec3f& positionPredictionXYZ,
+    const FiberPredictionGridInfo& grid,
+    int quantumBaseVoxels);
+
+[[nodiscard]] cv::Vec3f quantizeFiberletDirectionForEvaluation(
+    const cv::Vec3f& directionXYZ);
+
+[[nodiscard]] std::vector<float> quantizeFiberletCostsForEvaluation(
+    std::span<const float> costs,
+    int bits);
+
+[[nodiscard]] float fiberletCostQuantizationValueForEvaluation(
+    float totalCost,
+    float pathLengthPredictionVoxels,
+    FiberletCostQuantizationDomain domain,
+    float costDensityMaximum = 0.0F);
+
+[[nodiscard]] float quantizeFiberletCostForEvaluation(
+    float totalCost,
+    float pathLengthPredictionVoxels,
+    float minimumValue,
+    float maximumValue,
+    int bits,
+    FiberletCostQuantizationDomain domain,
+    float costDensityMaximum = 0.0F);
+
+[[nodiscard]] std::vector<float> quantizeFiberletCostsForEvaluation(
+    std::span<const float> costs,
+    std::span<const float> pathLengthsPredictionVoxels,
+    int bits,
+    FiberletCostQuantizationDomain domain,
+    float costDensityMaximum = 0.0F);
 
 struct FiberletQuantizationSummary {
     size_t count = 0;
@@ -114,6 +211,38 @@ using FiberletQuantizedPathExtractor =
     const FiberletQuantizedPathExtractor& pathExtractor,
     int storageChunkSideBaseVoxels = 512,
     std::optional<std::string> selectedScenario = std::nullopt,
+    const FiberletQuantizationProgressCallback& progress = {});
+
+struct FiberletCachedReplayComparisonReport {
+    FiberletQuantizationScenario scenario;
+    size_t baselineFailures = 0;
+    size_t scenarioFailures = 0;
+    double baselineCompletedFraction = 0.0;
+    double scenarioCompletedFraction = 0.0;
+    bool lineDistanceAvailable = false;
+    size_t lineDistanceSamples = 0;
+    size_t lineDistanceInvalidNormalSamples = 0;
+    FiberletQuantizationSummary lineDistanceBaseVoxels;
+    FiberletQuantizationSummary lineNormalDistanceBaseVoxels;
+    FiberletQuantizationSummary lineTangentialDistanceBaseVoxels;
+    size_t baselineReferenceInvalidNormalSamples = 0;
+    FiberletQuantizationSummary baselineReferenceDistanceBaseVoxels;
+    FiberletQuantizationSummary baselineReferenceNormalDistanceBaseVoxels;
+    FiberletQuantizationSummary baselineReferenceTangentialDistanceBaseVoxels;
+    size_t scenarioReferenceInvalidNormalSamples = 0;
+    FiberletQuantizationSummary scenarioReferenceDistanceBaseVoxels;
+    FiberletQuantizationSummary scenarioReferenceNormalDistanceBaseVoxels;
+    FiberletQuantizationSummary scenarioReferenceTangentialDistanceBaseVoxels;
+};
+
+[[nodiscard]] FiberletCachedReplayComparisonReport compareFiberletCachedReplays(
+    const FiberletQuantizationScenario& scenario,
+    const FiberletGraphReplayResult& baseline,
+    const FiberletGraphReplayResult& measured,
+    const std::vector<cv::Vec3d>& referencePointsBaseXYZ,
+    const vc::lasagna::NormalSampler& normalSampler,
+    double normalWorkingToBaseScale,
+    double normalThresholdBaseVoxels,
     const FiberletQuantizationProgressCallback& progress = {});
 
 }  // namespace vc::fiber_tracer

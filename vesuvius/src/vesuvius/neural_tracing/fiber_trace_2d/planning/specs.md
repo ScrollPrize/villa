@@ -3029,7 +3029,9 @@
   strict VC3D fiber JSON, required regular-normal Lasagna manifest, and output
   directory. All spatial arguments and artifacts use base-volume XYZ/base
   voxels. Defaults are `--fail 20`, `--radius 64`, `--match-refine 1`,
-  `--beam 16`, `--lookahead 3`, and `--batch 65536` native coordinates.
+  `--beam 16`, `--lookahead-distance 384`, and `--batch 65536` native
+  coordinates. The independent beam-front step defaults to 48 base voxels and
+  is overridden by `--beam-step-distance`.
 - The evaluated interval begins at the first control point's dense-line arc and
   ends at the final dense reference point by default. Replay-only `--length N`
   selects at most `N` positive finite base voxels from that point and clamps an
@@ -3080,8 +3082,9 @@
   transition scoring consume those records directly; replay must not resample
   source volumes or reconstruct endpoint scoring geometry.
   Route payloads and full polyline reconstruction are requested only for the
-  edge selected for commitment, not for lookahead candidates. Cache eviction
-  and reload therefore cannot invalidate graph identity or alter tie order.
+  current provisional best history during reference-error evaluation and for
+  final output, never for lookahead alternatives. Cache eviction and reload
+  therefore cannot invalidate graph identity or alter tie order.
   Committed route reconstruction applies the same adjacent-point epsilon
   suppression as eager DP finalization. For the same extracted graph, cold and
   warm float-cache replay artifacts must be byte-identical to eager replay.
@@ -3099,27 +3102,161 @@
   atomically published completion marker binds both payload hashes. Empty
   completed chunks are explicit valid payloads.
 - Greedy replay uses the regular native one-way candidate generation,
-  prediction loss, Lasagna-normal curvature, and validity rules, forcing beam
-  width/lookahead to one. Graph replay uses deterministic receding-horizon beam
-  search over the complete immutable graph with the shared edge/join objective.
+  prediction loss, Lasagna-normal curvature, and validity rules. Graph replay
+  uses a deterministic persistent beam over the complete immutable graph with
+  the shared edge/join objective.
   The greedy evaluator and on-demand graph evaluator run concurrently;
   neither evaluator changes the other one's state.
-- Default replay progress is one command-wide terminal bar. Cached replay uses
-  `cache = (resolvedAnchors + 16*resolvedPrefixes) /
-  (expectedAnchors + 16*expectedPrefixes)` over the deterministic scheduled
-  prefetch keys, then uses
-  `trace = 0.95*cache + 0.05*min(greedy,fiberlet)`. Resolution counts generated
-  and persisted chunks identically and deduplicates reloads. Eager replay uses
-  the evaluator minimum directly. Data-dependent reach-neighborhood prefix and
-  committed-route reads are represented by the reserved evaluator term rather
-  than predicted preprocessing keys. All components and the combined fraction
-  are monotone. Non-finite tracer values are ignored and stale or restart-local
-  callbacks cannot move either tracer fraction backward. A 250-millisecond
-  ticker refreshes elapsed time even without worker callbacks. ETA is a live
-  elapsed/fraction estimate and may increase while fraction is stationary. The
-  bar reserves completion for requested visualization and durable bundle
-  publication, terminates its line before result/error output, and never
-  exposes restart-local step counts as global work.
+- Graph replay has separate finite positive checkpoint-step, lookahead, and
+  intermediate-prune distances in base voxels. It keeps up to the configured
+  positive beam width of complete route
+  histories and a shared logical checkpoint `C` that is no greater than the
+  shortest retained history. Exact cost-bounded lookahead is the default, with
+  a 384-base-voxel lookahead and 48-base-voxel checkpoint step. It expands
+  without an intermediate width approximation, then retains at most the final
+  configured beam width, which defaults to 16 and has no fixed upper policy
+  limit. The existing exact cycle rules and one-million-state per-decision bound
+  remain mandatory. Positive `--search-width N` explicitly selects
+  approximate intermediate pruning at the configured `--prune-distance`,
+  which defaults to 48 base voxels and is ignored in exact mode.
+- Exact search seeds one cost-ordered frontier from every retained live route
+  and maintains one global set of the best configured-beam-width completions at
+  `C+H`. Completion
+  order is raw exact-horizon total loss followed by canonical persistent
+  logical-route order; loss per voxel is diagnostic only. Completions are
+  deduplicated only by seed plus their complete logical route, so any number of
+  winning routes may share the same route through `C+D` and diverge later.
+  Distinct physical expansion states are not merged merely because they have
+  the same logical identity.
+- The exact cutoff does not exist until the configured beam width of distinct
+  full-route completions is available. Thereafter the worst retained raw total
+  is the one shared cutoff
+  for every source route. A pending state is pruned only when its admissible
+  lower bound is strictly greater than the cutoff; equal bounds remain eligible
+  for canonical tie ordering. Fixed-size expansion batches are independent of
+  worker count. All entries admitted under the batch-start cutoff count as
+  expanded, workers publish ordered successor arrays, and the coordinator
+  merges/account them in popped-route and successor order. Only that canonical
+  merge mutates the decision-wide state budget.
+- Exact winners remain live through their complete `C+H` lookahead routes when
+  `C` advances by `D`. At the next decision, a retained terminal fiberlet that
+  already covers the new horizon is immediately rescored with proportional
+  terminal-edge clipping; otherwise expansion resumes only at the retained
+  physical endpoint. The globally best winner's prefix through the complete
+  fiberlet containing `C+D` is the only route reference-evaluated and committed
+  at that decision. Its future suffix is not reference-evaluated early.
+- Bounded search first advances to the next checkpoint `C+D`, then to fronts at
+  most `P` apart until the exact `C+H` horizon. All fronts are clamped at the
+  selected route end; a final nondivisible interval is shorter. The final
+  fiberlet stays whole in graph state and may overshoot a front.
+- Between fronts, search is a deterministic uniform-cost label search. A label
+  state is `(logical incoming directed fiberlet, absolute front-offset bin)`;
+  front-offset bins are 0.5 prediction voxels. When histories reconverge at the
+  same state, only the lowest accumulated-cost history remains, with ordered
+  logical arc IDs breaking exact-cost ties. Its visited-node state becomes the
+  state's cycle state; alternatives with different visited histories are
+  intentionally discarded. Crossing labels use exact proportional terminal-
+  edge scoring. Once `K` exact completions exist, expansion stops only when the
+  next accumulated-cost lower bound is strictly greater than the `K`th exact
+  completion, so equal-cost ties remain eligible. Queue exhaustion returns all
+  available completions when fewer than `K` exist.
+- A route is scored cumulatively from the segment seed to the exact logical
+  front. When the front lies inside the terminal fiberlet, only the traversed
+  fraction of that edge cost contributes, while its entering join contributes
+  fully. When the front is exactly an anchor, the edge ending there and its
+  entering join contribute, but no outgoing edge or join does. The complete
+  terminal geometry and visited-node state remain attached to the candidate.
+- At an intermediate front, identical complete logical routes are deduplicated
+  and ranked by exact-front loss and stable logical IDs. The best continuation
+  for every represented stable prefix is retained first, up to working width;
+  remaining slots are filled by the globally best unselected routes. The
+  stable prefix is the segment seed plus ordered logical arc IDs through
+  `C+D`, never a history pointer. At the final front, only the best
+  continuation for each actual next-checkpoint prefix is eligible for the
+  globally best 16. Pruning a prefix that would become better by `C+H` is the
+  explicit approximation boundary.
+- Each expansion worker retains bounded local global candidates and stable-
+  prefix representatives. Dominated labels and stale queued labels are counted
+  separately from exact front completions and cost-bound pruning. Worker
+  candidate limits are the sufficient local bound: one representative for the
+  worker's stable prefix plus only the number of globally unoccupied fill
+  slots. The first `C+D` front uses the full target width because its stable
+  prefixes do not exist until that front is reached. Worker results merge in
+  canonical input order and are reranked by deterministic
+  logical IDs, so 1-thread and multi-thread executions produce identical
+  output. One generated-state limit covers the complete decision and aborts it
+  without retaining partial worker output.
+- In bounded search, after pruning `C` advances by `D` and each winner is
+  retained through the complete fiberlet containing the new checkpoint.
+  Depending on its existing overshoot, a beam may add no fiberlet, one
+  fiberlet, or several fiberlets in that step. Exact search instead retains the
+  full lookahead route described above. Both preserve
+  `C <= min(retained_history_length)`.
+- Compact-cost replay consumes the decoded authoritative edge and join costs.
+  Logical-front scoring may proportionally clip only the terminal edge cost;
+  final reference-end or failure materialization may additionally clip output
+  geometry without altering persistent graph state. Exceeding the deterministic
+  per-decision one-million-state bound is an explicit error. A route that
+  exhausts before the common horizon is excluded; if all routes do, normal
+  graph exhaustion applies.
+- Persistent histories use shared immutable parent records and retain IDs,
+  cumulative costs, path length, incoming transition, and visited-node state,
+  not duplicate route geometry. A reference failure closes the chosen history,
+  resets the segment origin, and reseeds the full population. The reference
+  never removes graph candidates during ranking.
+- Persistent search bookkeeping must not scale with the already committed
+  prefix. Logical routes use exact canonical parent/arc identity plus exact
+  ancestor/first-divergence ordering; physical candidates remain separate.
+  Exact queue ordering, completion deduplication, and cutoff maintenance use
+  scalar cumulative state and those persistent identities only; they never
+  materialize logical arc or route-point vectors.
+  Cycle membership uses an immutable exact-key Patricia trie and is never
+  compacted by copying the accumulated prefix. Selected-route reference
+  matching resumes from the nearest evaluated physical-history ancestor and
+  evaluates each newly selected suffix once. Diagnostic indices are allocated
+  from that same newly selected suffix in their historical order. Full route
+  vectors, matches, steps, and consumed-node output are assembled once when a
+  segment terminates. Explicit decision diagnostics may additionally build the
+  complete route payloads they serialize. These are implementation constraints
+  only and must not change ranking, costs, failure locations, cache identity,
+  or replay JSON.
+- Beam-step, lookahead, prune distance, and search width are replay-only
+  metadata. They must not affect anchor or fiberlet cache identity, corridor
+  selection, generation settings, chunk payloads, or prefetch scheduling.
+  On-demand traversal may populate a missing chunk, but repeating against a hot
+  cache must not rewrite cache files.
+- Default cached replay progress exposes independent `cache/prep` and `trace`
+  terminal bars while preprocessing and tracing overlap. Cache progress is
+  `(resolvedAnchors + 16*resolvedPrefixes) /
+  (expectedAnchors + 16*expectedPrefixes)` over deterministic scheduled
+  prefetch keys. Trace progress is exactly
+  `min(greedy_reference_fraction, fiberlet_reference_fraction)`, with no
+  weighted combination between the two. Resolution counts generated and
+  persisted chunks identically and deduplicates reloads. Eager replay exposes
+  only trace progress. Cache progress excludes data-dependent neighbor-prefix
+  and committed-route reads, which occur during tracing. All fractions are
+  monotone. Non-finite tracer values are
+  ignored and stale or restart-local callbacks cannot move either tracer
+  fraction backward. A 250-millisecond ticker refreshes elapsed time even
+  without worker callbacks. The compact line contains only one elapsed field;
+  cache and trace retain independent ETAs while overlapping, and completed
+  scheduled cache progress is removed from the line. Trace additionally shows
+  a current-speed ETA over a rolling ten-second fraction window, reporting
+  `n/a` when that window has no positive progress. Requested visualization and durable publication use a separate
+  output phase after tracing, terminate their line before result/error output,
+  and never alter or masquerade as reference progress.
+- Each completed bounded fiberlet decision publishes search diagnostics with
+  its progress callback. The rollout expansion count is the total number of
+  states whose successors were enumerated across all intermediate fronts. For
+  each maximum-lookahead-front input where the existing strict cutoff actually
+  stops expansion, the diagnostic subtracts that input route's loss at the
+  front start from the cumulative cutoff and divides by the front length in
+  prediction voxels; it publishes the minimum such local loss density. This
+  normalization is diagnostic only: search continues to compare the unchanged
+  cumulative raw-loss cutoff against queued lower bounds. The CLI retains the
+  last published values until the next completed fiberlet decision. Exact mode
+  omits both diagnostics, and a bounded decision omits the cutoff if it never
+  binds.
 - `--stats` replaces the concise bar with detailed machine-readable stage,
   chunk, restart, evaluator, cache, visualization, and publication diagnostics.
   It does not change scheduling, generated payloads, tracing, or artifacts.
@@ -3611,40 +3748,94 @@
 
 # Fiberlet storage quantization experiment
 
-- `vc_fiberlets quantization-benchmark` uses one production anchor extraction.
-  It reruns regular candidate generation, dense sampling, and DP exactly once
-  for each distinct endpoint geometry: float baseline; position quanta `1/2/4`
-  base voxels; compact fitted axes; and `q=1/2/4` plus compact axes. These eight
-  geometry results feed a fixed 16-row matrix that also contains isolated
-  per-chunk `uint8/uint16` total costs and six combined cost layouts.
+- `vc_fiberlets quantization-benchmark` runs one float baseline and one selected
+  quantized scenario through persistent, fingerprinted on-demand caches. It
+  never materializes the complete corridor graph.
+  The default scenario is `combined_q4_axis_cost_u8`; the command requires an
+  output directory so interrupted and warm runs reuse complete chunks.
+  The standard matrix has 19 entries: one baseline and 18 non-baseline rows in
+  deterministic order.
+- One canonical float anchor dataset belongs to each exact source, extraction,
+  corridor, grid, and chunk-layout identity. Baseline and every geometry or cost
+  scenario reuse that dataset. Quantization never changes serialized anchors or
+  reruns anchor extraction.
 - Quantized endpoints are globally nearest-rounded before DP. The regular DP
   constructs the resulting Hermite domain and chooses a new interior route; a
   baseline `(u,v)` route must not be transplanted onto changed endpoint planes.
-- Variants `0/1` are assigned by persisted compact-axis bytes and then stable
-  original anchor identity, even when a position-only scenario uses the float
-  fitted axis for DP.
-- More than two variants, duplicate/unresolvable decoded keys, out-of-volume
-  endpoints, endpoint-key collapse, or unsupported local-position/delta widths
-  invalidate the complete scenario. Ordinary candidate rejection or no-path
-  after otherwise valid quantization is a measured result and remains visible
-  in the scenario graph population.
-- Cost offset and scale are float32 per first-endpoint spatial chunk. Encoding
+- Stable anchor IDs remain source cell coordinate plus component `0/1`.
+  Rounded positions are geometry, not identity: anchors from adjacent cells may
+  legitimately round to the same base coordinate and must not be merged.
+- Duplicate/unresolvable source-cell keys, out-of-volume endpoints, or
+  unsupported local-position/delta widths invalidate the complete scenario.
+  Ordinary candidate rejection or no-path after otherwise valid quantization is
+  a measured result and remains visible in the scenario graph population.
+- Raw-total cost offset and scale are float32 per first-endpoint spatial chunk. Encoding
   nearest-rounds onto the complete unsigned range with an exact-maximum case;
-  decoding evaluates float32 `offset + scale * code`. The decoded scalar is the
-  authoritative edge total. The beam denominator is the float32 path length
-  computed by that geometry's DP; cost variants reuse it unchanged.
-- Geometry scenarios use the existing graph builder and replay. Reports include
-  scalar widths, collisions, successful-candidate additions/removals,
-  geometry/cost errors, global and per-chunk cost inversions, top-k agreement,
-  transition changes, comparisons with the global baseline and matching
-  float-cost geometry, baseline/scenario tracing failure counts and signed
-  delta, symmetric maximum Euclidean/normal/tangential line distance, invalid
-  normal samples, and separate cached-geometry DP time. Anchor/candidate and
-  point-index identity are not tracing-quality metrics.
+  decoding evaluates float32 `offset + scale * code`. Raw-total scenarios use
+  the decoded scalar as the authoritative edge total. Fixed nonlinear density
+  scenario instead uses the fixed constant `Cmax=256` and encodes
+  `round(65535 * sqrt(clamp((total / path_length) / 256, 0, 1)))`. Decoding uses
+  `256 * (code / 65535)^2 * path_length`. No chunk contents or observed values
+  influence this mapping. The same geometry's stored positive float32 path
+  length is used throughout. Entering join costs remain unquantized float
+  components and are added exactly once.
+- Each geometry scenario derives a chunk-local endpoint view from canonical
+  anchors and runs fresh candidate generation, Hermite construction, dense
+  sampling, and DP. Compact direction changes only the fitted axis and retains
+  canonical scoring. Position quantization also resamples prediction direction,
+  presence, validity, and Lasagna normal fields at every rounded endpoint.
+  It reuses no float candidate, interior route, endpoint step, path length, or
+  cost. Source cell/component IDs address evaluation-cache data and define
+  canonical graph ordering; quantized positions affect geometry only.
+- Derived anchor chunks use single-flight construction and a bounded LRU. The
+  same derived chunk view supplies candidate DP, replay seeds, individual
+  endpoint lookup, arcs, route reconstruction, transitions, and compact-cost
+  ownership; no consumer may mix canonical and transformed endpoint geometry.
+- Reports include explicit scalar settings, logical-key collisions, failure
+  counts, completed fractions, bounded decoded residency, wall/CPU time,
+  symmetric Euclidean/normal/tangential line-distance distributions, and both
+  replay-to-reference distributions. Anchor/candidate and point-index identity
+  are not tracing-quality metrics.
+- Batch replay teardown cancels and drains only its own speculative cache task
+  groups. Fiberlet work drains before anchor work because an active fiberlet
+  producer may synchronously request anchor dependencies. Issued persistent
+  writes finish before the replay context is released, and each completed
+  machine-readable result row is flushed immediately.
+- Geometry-cache identity separates generated fiberlets from the replay cost
+  view. Its generation settings contain only endpoint position quantum and
+  fitted-direction encoding. Float, raw `uint8`, raw `uint16`, and fixed-sqrt
+  `uint16` cost view for one
+  geometry share the same fiberlet prefixes, routes, path lengths, endpoint
+  steps, and float component costs. All of them share the one canonical anchor
+  cache; cost-only views also reuse baseline fiberlets.
+- `compact_axis`, `compact_axis_cost_u8`, `compact_axis_cost_u16`, and
+  `compact_axis_cost_sqrt_u16_max256` all use float positions and the
+  identical compact-direction geometry cache. Their selected graph costs are
+  respectively float, raw-total `uint8`, raw-total `uint16`, and fixed-sqrt
+  density `uint16`; the
+  geometry namespace's opaque historical u8 compatibility tag does not select
+  graph cost precision and never changes persisted prefixes or routes.
+- Compact costs use one affine range per first-endpoint storage chunk. Building
+  that stable range may complete missing on-demand chunks in the shared
+  geometry cache, but it must not create a cost-specific cache namespace or
+  rewrite existing geometry payloads.
+- Fixed-sqrt density cost has no spatial owner or adaptive range. Its domain and
+  ceiling are replay-view state only: they are absent from geometry
+  fingerprints, cache roots, dataset metadata, and persisted payloads. A warm
+  fixed-sqrt replay reads the existing float total and path length and performs
+  no range scan, anchor extraction, DP/fiberlet generation, or payload rewrite.
+- For compatibility with already completed experiments, every non-float
+  geometry cache uses the historical internal `cost_bits=8` namespace tag.
+  This tag is opaque cache identity data and cannot reach preprocessing. The
+  replay graph alone receives the selected cost precision. Cache chunk side is
+  still shared physical layout metadata and remains part of cache identity.
 - `--scenario NAME` selects one exact matrix scenario plus the baseline. The
   focused `combined_q4_axis_cost_u8` scenario means a 4-base-voxel endpoint
   position quantum, the existing compact two-byte fitted-direction encoding,
   and per-chunk 8-bit total cost. An unknown scenario name is an error.
+- `--scenario all` runs the baseline once, then emits 18 comparison rows for
+  every non-baseline standard scenario in deterministic matrix order. Each
+  geometry group is generated at most once and later cost views reopen it.
 - Maximum line distance treats replay restart segments as disconnected. It
   samples both directions at no more than one base voxel spacing and projects
   onto the other replay's actual segments. Normal/tangential components use the
@@ -3656,3 +3847,34 @@
   median, and maximum in base voxels. Invalid reference normals are counted and
   excluded only from the component summaries. Long extraction, DP, line-to-line,
   and reference-distance stages report initial, periodic, and terminal progress.
+- Every quantization comparison atomically writes its complete baseline and
+  scenario `vc_fiberlet_graph_replay` JSON files and prints a deterministic
+  failure-window row. The window begins at the owning segment's reset-search
+  arc, extends through the complete failure-containing edge, and carries the
+  segment's graph seed key. `--arc` and `--length` select that base-voxel
+  interval; `--seed-key` forces the original first seed so prior consumed-node
+  state cannot change the focused replay. Focused diagnostics retain the full
+  corridor cache identity, disable prefetch, and request only chunks touched by
+  seed selection and beam traversal. They persist every final ranked beam
+  frontier with logical routes, geometry, decomposed edge/join costs, length,
+  and density, plus a comparison artifact containing the first selected-route
+  difference, cross-ranks, and maximum paired-route distance.
+- Every full or focused comparison also records one lightweight cost entry for
+  each actually committed fiberlet; lookahead alternatives are not counted.
+  `route-cost-statistics-<scenario>.json` reports complete-route and
+  failure-excluded min/mean/median/max/sum distributions for combined, edge,
+  transition, and decomposed objective loss per prediction voxel. Every value
+  in these distributions is the committed occurrence's component cost divided
+  by its edge path length; raw per-fiberlet cost distributions are not exposed
+  because replay does not compare them across unequal lengths. Aggregate raw
+  loss and aggregate path length remain only to verify the length-weighted
+  whole-route density. Failure exclusion uses
+  the baseline replay's failure arcs for both baseline and scenario statistics
+  so they describe the same reference neighborhoods. An occurrence is excluded
+  exactly when its matched-reference interval intersects a closed
+  `[failure_arc-margin, failure_arc+margin]` interval.
+  `--route-stats-failure-margin` controls this distance in base voxels and
+  defaults to 128. Repeated commitments of one logical fiberlet remain separate
+  observations. Each observation owns the selected edge's stored component
+  costs and the incoming join from the immediately preceding committed edge in
+  the same segment; the first edge after every reset owns no transition.

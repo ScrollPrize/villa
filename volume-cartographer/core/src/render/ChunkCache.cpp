@@ -545,6 +545,18 @@ void ChunkCache::invalidate()
     state->cv_.notify_all();
 }
 
+void ChunkCache::cancelPendingAndWait()
+{
+    auto state = state_;
+    invalidate();
+    if (state->options_.persistentCachePath) {
+        persistentCacheProbePool().wait_group_idle(state->schedulerGroup_);
+    }
+    chunkWorkerPool(state->options_.maxConcurrentReads, state->options_.schedulerLane)
+        .wait_group_idle(state->schedulerGroup_);
+    waitForPersistentWrites();
+}
+
 void ChunkCache::beginViewRequest(bool discardPending)
 {
     auto state = state_;
