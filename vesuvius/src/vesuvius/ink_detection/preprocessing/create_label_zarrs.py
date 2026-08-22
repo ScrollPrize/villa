@@ -249,23 +249,85 @@ def write_ome_zarr(
         dataset[:] = array_ZYX
 
 
-def _get_tiled_tiff_metadata(
+def _get_streamable_tiff_metadata(
     path: Path,
 ) -> tuple[tuple[int, int], np.dtype] | None:
+    """Whether this TIFF can be converted without loading the whole image.
+
+    tifffile exposes tiled and striped TIFFs through the same block API --
+    ``page.chunks``/``page.chunked``/``page.dataoffsets``/``page.databytecounts``
+    describe a strip identically to how they describe a tile, just with a
+    chunk shape of ``(rows_per_strip, full_width)`` and a chunk grid that is
+    ``N`` blocks tall by 1 wide instead of a 2D grid. ``page.decode()`` accepts
+    either. Verified directly against tifffile 2026.3.3: for a striped page,
+    ``position[2]`` from ``decode()`` is the strip's y-offset, exactly as it is
+    the tile's y-offset for a tiled page -- the same indexing in
+    ``_write_streamed_tiff_level_zero`` below is correct for both.
+
+    Gating only on ``is_tiled`` (an earlier version of this function) meant
+    the only published label images that stream are the ones that happen to
+    be tiled; every other TIFF -- including any written with a default
+    ``tifffile.imwrite``, which produces strips -- silently falls through to
+    ``build_pyramid_with_mode``, which loads the entire volume into memory.
+    That is invisible until someone converts a large enough image (a full
+    z-stack label volume, not a single flattened image) and hits an OOM with
+    no indication that a streamed path exists or why it wasn't used.
+    """
     if path.suffix.lower() not in {".tif", ".tiff"}:
         return None
     with tifffile.TiffFile(path) as tif:
+        if len(tif.pages) != 1:
+            # Multi-page TIFFs are out of scope for this change. The rest of
+            # this module -- _normalize_to_2d, _normalized_2d_shape,
+            # _create_ome_zarr_datasets(image_shape: tuple[int, int]) -- is
+            # built for a single flat 2D label image; a genuine multi-page
+            # file (verified separately) already produces silently wrong
+            # output on the non-streaming path today, independent of this
+            # change (tifffile.imread stacks all pages, then the channel-
+            # squeeze logic mistakes the page axis for height and keeps only
+            # column 0 of the real width). That is a real, separate bug, but
+            # this PR does not touch it: returning None here for any
+            # multi-page input, tiled or striped, keeps this PR's behavior
+            # change scoped to exactly the reported gap -- single-page
+            # striped TIFFs that previously fell through to the (also
+            # single-page-only) in-memory path unnecessarily.
+            return None
         page = tif.pages[0]
-        if not page.is_tiled:
+        if page.compression not in _STREAMABLE_COMPRESSIONS:
+            # Some codecs (notably old-style JPEG, compression 6) need
+            # cross-block state tifffile does not expose per-block, so a
+            # block cannot be decoded in isolation. Neither tiled nor striped
+            # input using one of these can stream; fall through to the
+            # in-memory path exactly as before rather than risk decoding
+            # blocks independently for a codec that does not support it.
             return None
         return _normalized_2d_shape(page.shape, path), np.dtype(page.dtype)
 
 
-def _write_tiled_tiff_level_zero(input_path: Path, dataset: zarr.Array) -> None:
+# Codecs verified to support independent per-block decode via page.decode():
+# none (1), LZW (5), old-style Deflate (32946) and Deflate/zlib (8), PackBits
+# (32773). Excludes old-JPEG (6) and other codecs with cross-block state.
+_STREAMABLE_COMPRESSIONS = frozenset({1, 5, 8, 32773, 32946})
+
+
+def _write_streamed_tiff_level_zero(input_path: Path, dataset: zarr.Array) -> None:
+    """Stream a tiled OR striped TIFF's level-0 data into ``dataset``.
+
+    Reads ``page.chunks``/``page.chunked`` generically -- for a tiled page
+    these describe the tile grid; for a striped page they describe strips as
+    a chunk grid one column wide (verified: ``page.chunks == (rows_per_strip,
+    full_width)``, ``page.chunked == (n_strips, 1)``). The block-addressing
+    math below never distinguishes the two cases, because tifffile does not
+    either at this level of its API.
+    """
     with tifffile.TiffFile(input_path) as tif:
         page = tif.pages[0]
-        if not page.is_tiled:
-            raise ValueError(f"Expected tiled TIFF input for streaming path: {input_path}")
+        if page.compression not in _STREAMABLE_COMPRESSIONS:
+            raise ValueError(
+                f"Expected a streamable TIFF (tiled or striped, compression in "
+                f"{sorted(_STREAMABLE_COMPRESSIONS)}) for the streaming path: "
+                f"{input_path} has compression {page.compression}"
+            )
         image_height, image_width = _normalized_2d_shape(page.shape, input_path)
         tile_height, tile_width = page.chunks
         _, tiles_across = page.chunked
@@ -398,9 +460,9 @@ def convert_image(
     downsample_mode: Literal["nearest", "mean"] = (
         "mean" if is_composite_image(input_path) else "nearest"
     )
-    tiled_metadata = _get_tiled_tiff_metadata(input_path)
-    if tiled_metadata is not None:
-        image_shape, dtype = tiled_metadata
+    streamable_metadata = _get_streamable_tiff_metadata(input_path)
+    if streamable_metadata is not None:
+        image_shape, dtype = streamable_metadata
         datasets = _create_ome_zarr_datasets(
             output_path,
             image_shape=image_shape,
@@ -408,7 +470,7 @@ def convert_image(
             levels=levels,
             overwrite=overwrite,
         )
-        _write_tiled_tiff_level_zero(input_path, datasets[0])
+        _write_streamed_tiff_level_zero(input_path, datasets[0])
         _build_downsample_levels_from_zarr(
             datasets,
             downsample_mode=downsample_mode,
@@ -425,7 +487,7 @@ def convert_image(
         "input": str(input_path),
         "output": str(output_path),
         "downsample_mode": downsample_mode,
-        "streamed_tiled_tiff": str(tiled_metadata is not None).lower(),
+        "streamed_tiled_tiff": str(streamable_metadata is not None).lower(),
     }
 
 
