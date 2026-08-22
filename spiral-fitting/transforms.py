@@ -11,7 +11,7 @@ from torchdiffeq import odeint
 
 import gap_triton
 import sample_spiral
-from flow_fields import CartesianFlowField, CylindricalFlowField
+from flow_fields import CartesianFlowField, CylindricalFlowField, sample_field
 from geom_utils import expm_2x2, interp1d
 from sample_spiral import get_bounding_windings, get_theta_and_radii
 
@@ -348,6 +348,97 @@ class UmbilicusTransform(pyro.distributions.transforms.Transform):
         return self._call(input_zyx, inverse=True)
 
 
+class FrozenDisplacementTransform(pyro.distributions.transforms.Transform):
+
+    # A frozen (non-trainable) diffeomorphism approximated by two trilinear
+    # displacement grids: one for the forward direction (flow-lattice frame ->
+    # scroll space) over the flow bounding box, and one for the inverse
+    # direction over a stated scroll-space bounding box. Gradients flow
+    # through the *input points* only (grid_sample's coordinate gradient);
+    # the grid values are constants, never parameters or registered buffers,
+    # so they stay out of optimisers, state_dicts, and DDP broadcasts - each
+    # rank rebakes them deterministically from the exact CPU history instead.
+
+    domain = pyro.distributions.constraints.real_vector
+    codomain = domain
+
+    def __init__(self, grid_fwd, fwd_min_corner, fwd_max_corner,
+                 grid_inv, inv_min_corner, inv_max_corner,
+                 event_dim=0, cache_size=0):
+        super().__init__(cache_size=cache_size)
+        # Grids are [3, Z, Y, X] displacement fields (zyx components), fp32.
+        assert not grid_fwd.requires_grad and not grid_inv.requires_grad
+        self.grid_fwd = grid_fwd
+        self.grid_inv = grid_inv
+        self.fwd_min_corner = fwd_min_corner.to(torch.float32)
+        self.fwd_max_corner = fwd_max_corner.to(torch.float32)
+        self.inv_min_corner = inv_min_corner.to(torch.float32)
+        self.inv_max_corner = inv_max_corner.to(torch.float32)
+
+    def _sample_displacement(self, input_zyx, grid, min_corner, max_corner):
+        # Border-clamped sampling: points outside the stated box extrapolate
+        # with the boundary displacement, matching the flow fields' padding.
+        normalised = (input_zyx - min_corner) / (max_corner - min_corner)
+        return sample_field(normalised, grid)
+
+    def _call(self, input_zyx):
+        return input_zyx + self._sample_displacement(
+            input_zyx, self.grid_fwd, self.fwd_min_corner, self.fwd_max_corner)
+
+    def _inverse(self, input_zyx):
+        return input_zyx + self._sample_displacement(
+            input_zyx, self.grid_inv, self.inv_min_corner, self.inv_max_corner)
+
+
+def _bake_displacement_grid(fn, min_corner, max_corner, resolution, chunk_size=1 << 20):
+    """Sample ``fn(points) - points`` on an inclusive-corner lattice.
+
+    Returns ``(grid, image_min, image_max)`` where grid is [3, Z, Y, X] and
+    image_min/image_max bound the mapped points (used to derive the inverse
+    grid's scroll-space box). Evaluated slab-by-slab in z under the caller's
+    no_grad, so the transient is one z-slab of points, not the whole lattice.
+    """
+    device = min_corner.device
+    extents = (max_corner - min_corner).to(torch.float32)
+    sizes = [max(2, int(torch.ceil(extents[d] / resolution).item()) + 1) for d in range(3)]
+    axes = [
+        torch.linspace(float(min_corner[d]), float(max_corner[d]), sizes[d], device=device)
+        for d in range(3)
+    ]
+    grid = torch.empty([3, *sizes], dtype=torch.float32, device=device)
+    image_min = torch.full([3], float('inf'), device=device)
+    image_max = torch.full([3], float('-inf'), device=device)
+    yx = torch.stack(torch.meshgrid(axes[1], axes[2], indexing='ij'), dim=-1).view(-1, 2)
+    for z_index in range(sizes[0]):
+        points = torch.cat([
+            axes[0][z_index].expand(yx.shape[0], 1), yx], dim=-1)
+        outputs = torch.cat([fn(chunk) for chunk in points.split(chunk_size)])
+        image_min = torch.minimum(image_min, outputs.amin(dim=0))
+        image_max = torch.maximum(image_max, outputs.amax(dim=0))
+        grid[:, z_index] = (outputs - points).T.view(3, sizes[1], sizes[2])
+    return grid, image_min, image_max
+
+
+def _bake_probe_points(min_corner, max_corner, resolution, stride=8, max_points=200_000):
+    """Deterministic off-lattice probe points: a strided sub-lattice offset by
+    half a grid cell, so the probe measures interpolation error rather than
+    reading back exact lattice values. No RNG is consumed (DDP determinism)."""
+    device = min_corner.device
+    axes = []
+    for d in range(3):
+        extent = float(max_corner[d] - min_corner[d])
+        count = max(2, int(extent / (resolution * stride)))
+        axes.append(
+            torch.linspace(float(min_corner[d]), float(max_corner[d]), count, device=device)
+            + resolution * 0.5)
+    points = torch.stack(
+        torch.meshgrid(*axes, indexing='ij'), dim=-1).view(-1, 3)
+    points = torch.minimum(points, max_corner.to(torch.float32))
+    if points.shape[0] > max_points:
+        points = points[:: points.shape[0] // max_points + 1]
+    return points
+
+
 def ray_gap_enabled():
     # Per-ray specialization of the gap-expander stage for radial-ray sample
     # batches (phase-bundle polylines / registration targets). The generic
@@ -397,12 +488,15 @@ def ray_specialized_spiral_to_scroll(
     flip = None
     if rest and isinstance(rest[0], pyro.distributions.transforms.AffineTransform):
         flip, rest = rest[0], rest[1:]
+    # The trailing stage is the plain umbilicus shear before the first
+    # bake/reset, and the frozen accumulator (which absorbed the umbilicus)
+    # after it; both are generic per-sample calls here.
     if len(rest) != 3 or not (
             isinstance(rest[0], IntegratedFlowDiffeomorphism)
             and isinstance(rest[1], VaryingLinearTransform)
-            and isinstance(rest[2], UmbilicusTransform)):
+            and isinstance(rest[2], (UmbilicusTransform, FrozenDisplacementTransform))):
         return None
-    diffeo, linear, umbilicus = rest
+    diffeo, linear, tail = rest
 
     dr = gap.dr_per_winding
     theta_norm = theta / (2 * torch.pi)
@@ -437,7 +531,7 @@ def ray_specialized_spiral_to_scroll(
     ], dim=-1)
     pts = diffeo._call(pts)
     pts = linear._call(pts)
-    return umbilicus._call(pts)
+    return tail._call(pts)
 
 
 class SpiralAndTransform(nn.Module):
@@ -459,16 +553,6 @@ class SpiralAndTransform(nn.Module):
         self.umbilicus_transform = UmbilicusTransform(umbilicus_zyx)
         self.dr_per_winding_logit = nn.Parameter(torch.tensor(config['model_initial_dr_per_winding'] / self.dr_per_winding_scale, dtype=torch.float32))
 
-        flow_resolution = (flow_max_corner_zyx - flow_min_corner_zyx) // config['model_flow_voxel_resolution']
-        flow_field_cls = CylindricalFlowField if config['model_flow_field_type'] == 'cylindrical' else CartesianFlowField
-
-        def make_flow_field():
-            return flow_field_cls(
-                flow_resolution,
-                num_flow_timesteps=config['model_num_flow_timesteps'],
-                direct_lr=config.get('model_flow_field_direct_lr', False),
-            )
-
         # num_flow_stages: number of independent stationary flow fields whose integrated
         # diffeomorphisms are composed sequentially (phi = exp(v_N) o ... o exp(v_1) in the
         # spiral->slice direction; the inverse applies the stage inverses in reverse order via
@@ -476,8 +560,17 @@ class SpiralAndTransform(nn.Module):
         # behaviour: `flow_field` keeps its name/state_dict keys and `extra_flow_fields` is empty.
         self.num_flow_stages = int(config.get('model_num_flow_stages', 1) or 1)
         assert self.num_flow_stages >= 1
-        self.flow_field = make_flow_field()
-        self.extra_flow_fields = nn.ModuleList([make_flow_field() for _ in range(self.num_flow_stages - 1)])
+        self.flow_field = self._make_flow_field()
+        self.extra_flow_fields = nn.ModuleList([self._make_flow_field() for _ in range(self.num_flow_stages - 1)])
+
+        # Periodic bake/reset state. frozen_epochs holds the exact CPU
+        # snapshots of every previously frozen [flows, linear] epoch (the
+        # source of truth); accum_transform is the frozen displacement-grid
+        # stage rebuilt from them. Neither is a parameter or buffer: the
+        # history rides alongside the checkpoint payload, and the grids are
+        # rebaked deterministically wherever they are needed.
+        self.frozen_epochs = []
+        self.accum_transform = None
 
         self.linear_logits = nn.Parameter(torch.zeros([int(flow_max_corner_zyx[0] - flow_min_corner_zyx[0]) // config['model_linear_z_resolution'], 2, 2], dtype=torch.float32))
 
@@ -489,6 +582,15 @@ class SpiralAndTransform(nn.Module):
             dr_per_winding=config['model_initial_dr_per_winding'],  # this is a nominal (fixed) winding spacing which we only use to calculate the number of logits
         )
 
+    def _make_flow_field(self):
+        flow_resolution = (self.flow_max_corner_zyx - self.flow_min_corner_zyx) // self.cfg['model_flow_voxel_resolution']
+        flow_field_cls = CylindricalFlowField if self.cfg['model_flow_field_type'] == 'cylindrical' else CartesianFlowField
+        return flow_field_cls(
+            flow_resolution,
+            num_flow_timesteps=self.cfg['model_num_flow_timesteps'],
+            direct_lr=self.cfg.get('model_flow_field_direct_lr', False),
+        )
+
     @property
     def device(self):
         return self.linear_logits.device
@@ -497,6 +599,182 @@ class SpiralAndTransform(nn.Module):
     def flow_fields(self):
         # All flow stages, in application order (stage 0 first in the spiral->slice direction).
         return [self.flow_field, *self.extra_flow_fields]
+
+    # ------------------------------------------------------------------
+    # Periodic bake/reset: frozen-epoch history and the accumulator stage
+    # ------------------------------------------------------------------
+
+    def snapshot_live_epoch_(self, iteration=None):
+        """Append an exact CPU snapshot of the live [flows, linear] state."""
+        epoch = {
+            'iteration': None if iteration is None else int(iteration),
+            'flow_state_dicts': [
+                {key: value.detach().to('cpu', copy=True)
+                 for key, value in flow_field.state_dict().items()}
+                for flow_field in self.flow_fields
+            ],
+            'linear_logits': self.linear_logits.detach().to('cpu', copy=True),
+        }
+        self.frozen_epochs.append(epoch)
+        return epoch
+
+    @torch.no_grad()
+    def reset_live_smooth_params_(self):
+        """Zero the live flow and linear parameters in place.
+
+        Gap logits and dr_per_winding_logit are deliberately untouched: they
+        are permanently live and never baked (baking them into a grid would
+        smooth the radial kinks at winding boundaries)."""
+        for flow_field in self.flow_fields:
+            for param in flow_field.parameters():
+                param.zero_()
+        self.linear_logits.zero_()
+
+    def _exact_frozen_parts(self):
+        """The exact frozen chain (forward direction: flow-lattice frame ->
+        scroll space): umbilicus o linear_1 o flows_1 o ... o linear_k o
+        flows_k, most recent epoch innermost (applied first). Built fresh from
+        the CPU snapshots each call; callers hold it only transiently."""
+        device = self.device
+        parts = []
+        for epoch in reversed(self.frozen_epochs):
+            for state_dict in epoch['flow_state_dicts']:
+                flow_field = self._make_flow_field()
+                flow_field.load_state_dict(state_dict)
+                flow_field.to(device)
+                flow_field.requires_grad_(False)
+                parts.append(IntegratedFlowDiffeomorphism(
+                    flow_field, self.flow_min_corner_zyx, self.flow_max_corner_zyx,
+                    num_steps=self.flow_integration_steps,
+                    solver=self.flow_integration_solver))
+            scaled_linear_logits = epoch['linear_logits'].to(device) * self.linear_logits_scale
+            parts.append(VaryingLinearTransform(
+                scaled_linear_logits,
+                self.flow_min_corner_zyx[0], self.flow_max_corner_zyx[0]))
+        parts.append(self.umbilicus_transform)
+        return parts
+
+    def get_exact_frozen_transform(self):
+        return pyro.distributions.transforms.ComposeTransform(self._exact_frozen_parts())
+
+    def rebake_accumulator(self, grid_resolution=None, chunk_size=1 << 20,
+                           inverse_margin_cells=2):
+        """Rebuild the frozen accumulator grids from the exact CPU history.
+
+        Always rebuilt from scratch through the exact composition - never by
+        resampling the previous grid through the new epoch, which would
+        compound interpolation error linearly with resets. Deterministic
+        given the history (no RNG), so DDP ranks rebake independently.
+
+        Returns probe-error statistics (deterministic off-lattice points
+        through the grids vs the exact chain, both directions).
+        """
+        assert self.frozen_epochs, 'rebake_accumulator called with no frozen epochs'
+        if grid_resolution is None:
+            grid_resolution = self.cfg.get(
+                'model_bake_grid_resolution',
+                self.cfg['model_flow_voxel_resolution'])
+        grid_resolution = float(grid_resolution)
+        exact = self.get_exact_frozen_transform()
+        fwd_min = self.flow_min_corner_zyx.to(torch.float32)
+        fwd_max = self.flow_max_corner_zyx.to(torch.float32)
+        with torch.no_grad():
+            grid_fwd, image_min, image_max = _bake_displacement_grid(
+                exact, fwd_min, fwd_max, grid_resolution, chunk_size)
+            # The inverse grid's domain is scroll space, whose bounding box is
+            # not the flow box (the umbilicus shear and frozen warp move it).
+            # The forward image of the flow box bounds every point the frozen
+            # inverse can be asked to map back, plus a small clamp margin.
+            margin = inverse_margin_cells * grid_resolution
+            inv_min = image_min - margin
+            inv_max = image_max + margin
+            grid_inv, _, _ = _bake_displacement_grid(
+                exact.inv, inv_min, inv_max, grid_resolution, chunk_size)
+            accum = FrozenDisplacementTransform(
+                grid_fwd, fwd_min, fwd_max, grid_inv, inv_min, inv_max)
+
+            probes = _bake_probe_points(fwd_min, fwd_max, grid_resolution)
+            exact_fwd = torch.cat([exact(chunk) for chunk in probes.split(chunk_size)])
+            fwd_error = (accum._call(probes) - exact_fwd).norm(dim=-1)
+            # exact_fwd's exact preimage is `probes`, so the inverse probe
+            # needs no second exact-chain evaluation.
+            inv_error = (accum._inverse(exact_fwd) - probes).norm(dim=-1)
+        self.accum_transform = accum
+        return {
+            'bake_probe_fwd_error_mean': float(fwd_error.mean()),
+            'bake_probe_fwd_error_max': float(fwd_error.max()),
+            'bake_probe_inv_error_mean': float(inv_error.mean()),
+            'bake_probe_inv_error_max': float(inv_error.max()),
+            'bake_num_epochs': len(self.frozen_epochs),
+            'bake_grid_resolution': grid_resolution,
+        }
+
+    def serialize_frozen_epochs(self, grid_resolution=None):
+        """Checkpoint payload for the frozen history, or None when empty."""
+        if not self.frozen_epochs:
+            return None
+        return {
+            'grid_resolution': grid_resolution,
+            'epochs': [
+                {
+                    'iteration': epoch['iteration'],
+                    'flow_state_dicts': [
+                        {key: value.detach().to('cpu', copy=True)
+                         for key, value in state_dict.items()}
+                        for state_dict in epoch['flow_state_dicts']
+                    ],
+                    'linear_logits': epoch['linear_logits'].detach().to('cpu', copy=True),
+                }
+                for epoch in self.frozen_epochs
+            ],
+        }
+
+    def frozen_epochs_compatibility(self, payload):
+        """Reasons a serialized frozen history cannot apply to this model."""
+        reasons = []
+        if not isinstance(payload, dict) or not isinstance(payload.get('epochs'), (list, tuple)):
+            return ['frozen_epochs payload is not an epoch-list mapping']
+        live_flow_shapes = [
+            {key: tuple(value.shape) for key, value in flow_field.state_dict().items()}
+            for flow_field in self.flow_fields
+        ]
+        for index, epoch in enumerate(payload['epochs']):
+            state_dicts = epoch.get('flow_state_dicts')
+            if not isinstance(state_dicts, (list, tuple)) or len(state_dicts) != len(live_flow_shapes):
+                reasons.append(
+                    f'frozen epoch {index} has {len(state_dicts or [])} flow '
+                    f'stages, this model has {len(live_flow_shapes)}')
+                continue
+            for stage, (state_dict, live_shapes) in enumerate(zip(state_dicts, live_flow_shapes)):
+                saved_shapes = {key: tuple(getattr(value, 'shape', ()))
+                                for key, value in state_dict.items()}
+                if saved_shapes != live_shapes:
+                    reasons.append(
+                        f'frozen epoch {index} flow stage {stage} tensor '
+                        'geometry differs from the live model')
+            linear = epoch.get('linear_logits')
+            if tuple(getattr(linear, 'shape', ())) != tuple(self.linear_logits.shape):
+                reasons.append(
+                    f'frozen epoch {index} linear logits shape '
+                    f'{tuple(getattr(linear, "shape", ()))} != '
+                    f'{tuple(self.linear_logits.shape)}')
+        return reasons
+
+    def load_frozen_epochs(self, payload, rebake=True):
+        """Restore (or clear) the frozen history from a checkpoint payload.
+
+        With rebake=True the accumulator grids are rebuilt immediately (the
+        training path); rebake=False restores only the exact history, for
+        consumers that use exact_frozen=True chains and never touch the grids.
+        Returns the rebake's probe statistics, or None.
+        """
+        epochs = list(payload.get('epochs') or []) if payload else []
+        self.frozen_epochs = epochs
+        self.accum_transform = None
+        if not epochs or not rebake:
+            return None
+        return self.rebake_accumulator(
+            grid_resolution=payload.get('grid_resolution'))
 
     def _get_transform_parts(self, truncate_at_step=None, shared=None):
         truncate_frac = None if truncate_at_step is None else truncate_at_step / (self.flow_integration_steps - 1)
@@ -522,15 +800,33 @@ class SpiralAndTransform(nn.Module):
             maybe_flip = [pyro.distributions.transforms.AffineTransform(loc=0., scale=torch.tensor([1., 1., -1.], device=self.device))]
         return gap_expander, maybe_flip, diffeomorphisms, truncate_frac
 
-    def get_slice_to_spiral_transform(self, truncate_at_step=None, shared=None):
+    def get_slice_to_spiral_transform(self, truncate_at_step=None, shared=None,
+                                      exact_frozen=False):
         # `shared` optionally supplies the (dr_per_winding, scaled_linear_logits,
         # pinned_scaled_gap_logits) triple from get_shared_transform_tensors(),
         # typically as detached leaves so many separate loss backwards can run
         # through one transform instance without retain_graph.
+        #
+        # The trailing stage is the plain umbilicus before the first
+        # bake/reset, and the frozen accumulator after it. exact_frozen=True
+        # materialises the exact frozen epoch chains instead of the grid
+        # (final export: the true map, differing from the optimised grid by
+        # its interpolation error).
         gap_expander, maybe_flip, diffeomorphisms, truncate_frac = self._get_transform_parts(truncate_at_step, shared)
         scaled_linear_logits = (
             shared[1] if shared is not None
             else self.linear_logits * self.linear_logits_scale)
+        if exact_frozen and self.frozen_epochs:
+            tail_parts = self._exact_frozen_parts()
+        elif self.accum_transform is not None:
+            tail_parts = [self.accum_transform]
+        else:
+            # A restored history without a rebaked grid must not silently
+            # drop the frozen warp from the optimised chain.
+            assert not self.frozen_epochs, (
+                'frozen epochs exist but no accumulator is baked; call '
+                'rebake_accumulator() or request exact_frozen=True')
+            tail_parts = [self.umbilicus_transform]
         return pyro.distributions.transforms.ComposeTransform([
             gap_expander,
             *maybe_flip,
@@ -538,7 +834,7 @@ class SpiralAndTransform(nn.Module):
             # applies the stage inverses in reverse order in the slice->spiral direction.
             *diffeomorphisms,
             VaryingLinearTransform(scaled_linear_logits, self.flow_min_corner_zyx[0], self.flow_max_corner_zyx[0], truncate_frac),
-            self.umbilicus_transform,
+            *tail_parts,
         ]).inv
 
     def get_flowbox_to_spiral_transform(self, include_diffeomorphism=True):

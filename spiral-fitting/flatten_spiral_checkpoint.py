@@ -172,6 +172,9 @@ def _build_model(
             checkpoint.get("spiral_outward_sense") or "CW"),
     ).to(device)
     model.load_state_dict(state)
+    # Restore the frozen bake/reset history (if any). No grid rebake: this
+    # exporter uses the exact frozen chains via exact_frozen=True.
+    model.load_frozen_epochs(checkpoint.get("frozen_epochs"), rebake=False)
     model.eval()
     return model
 
@@ -188,7 +191,7 @@ def _export_source_surface(
     chunk_size: int,
 ) -> Path:
     model = _build_model(checkpoint, config, umbilicus_path, device)
-    transform = model.get_slice_to_spiral_transform()
+    transform = model.get_slice_to_spiral_transform(exact_frozen=True)
     dr_per_winding = model.get_dr_per_winding()
     z_begin = int(checkpoint["z_begin"])
     z_end = int(checkpoint["z_end"])

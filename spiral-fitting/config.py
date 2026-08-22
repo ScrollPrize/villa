@@ -126,6 +126,10 @@ _INPUT_TOGGLE_DESCRIPTIONS = {
 BACKFILLABLE_CONFIG_DEFAULTS = {
     key: True for key in _INPUT_TOGGLE_DESCRIPTIONS
 }
+# Bake/reset joined the schema after durable checkpoints already existed;
+# historical fits never baked, so the missing values are unambiguous.
+BACKFILLABLE_CONFIG_DEFAULTS["model_bake_reset_interval"] = 0
+BACKFILLABLE_CONFIG_DEFAULTS["model_bake_grid_resolution"] = 16
 
 # Configuration keys that shape the model's parameter tensors. A checkpoint
 # whose stored value for any of them differs describes a different model, and
@@ -288,6 +292,17 @@ class Config:
         self.model_gap_expander_lr_scale = 0.3
         self.model_linear_z_resolution = 48
         self.model_initial_dr_per_winding = 16.0
+        # Periodic flow reset with frozen-accumulator baking: every this many
+        # iterations the live [flows, linear] state is snapshotted to the
+        # exact CPU history, the frozen accumulator grids are rebaked from
+        # that history, and the live smooth parameters reset to identity so
+        # optimisation always works on a near-identity problem. 0 disables.
+        self.model_bake_reset_interval = 0
+        # Voxel spacing of the frozen accumulator's displacement-grid lattice.
+        # Grid interpolation error is outside the optimisation and cannot be
+        # compensated by the live model; a probe error is measured and logged
+        # at every bake.
+        self.model_bake_grid_resolution = 16
         # Patch/PCL theta=0 topology is transformed only on this cadence. Patch
         # samples use cached node potentials; generic PCL/track walks gather
         # cached signed crossings.

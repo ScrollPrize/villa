@@ -2950,6 +2950,16 @@ class FitContext:
         """
         if getattr(self, 'profiler', None) is not None:
             self.profiler.stop()
+        # The frozen bake/reset history lives on the model, which is about to
+        # be released; carry the exact CPU snapshots across the rebuild so a
+        # model-stage configuration change does not silently drop the
+        # accumulated warp. A shape-changing rebuild refuses the history
+        # (frozen epochs are meaningful only for the lattice they froze on).
+        model = getattr(self, 'spiral_and_transform', None)
+        frozen_payload = (
+            model.serialize_frozen_epochs(
+                int(self.config['model_bake_grid_resolution']))
+            if model is not None else None)
         for name in self._MODEL_STAGE_ATTRIBUTES:
             setattr(self, name, None)
         # The optimiser state and the flow-field lattices are the session's
@@ -2958,6 +2968,20 @@ class FitContext:
         gc.collect()
         torch.cuda.empty_cache()
         self._build_model_state()
+        if frozen_payload and not self.spiral_and_transform.frozen_epochs:
+            problems = self.spiral_and_transform.frozen_epochs_compatibility(
+                frozen_payload)
+            if problems:
+                raise RuntimeError(
+                    'model-stage rebuild is incompatible with the frozen '
+                    'bake/reset history: ' + '; '.join(problems))
+            self.spiral_and_transform.load_frozen_epochs(frozen_payload)
+            self.slice_to_spiral_transform = \
+                self.spiral_and_transform.get_slice_to_spiral_transform()
+            self.theta_crossing_map.force_refresh(
+                self.slice_to_spiral_transform)
+            self._enforce_theta_liftability()
+            self.dt_target_cache_manager.reset()
 
     # ==========================================================================
     # Checkpoint save/load
@@ -2968,6 +2992,11 @@ class FitContext:
             'schema_version': 2,
             'completed_iterations': int(completed_iterations),
             'spiral_and_transform': self.spiral_and_transform.state_dict(),
+            # Exact CPU history of every frozen [flows, linear] epoch (None
+            # until the first bake/reset). The accumulator grids themselves
+            # are not stored: they are rebaked deterministically on load.
+            'frozen_epochs': self.spiral_and_transform.serialize_frozen_epochs(
+                int(self.config['model_bake_grid_resolution'])),
             'optimiser': self.optimiser.state_dict(),
             'scheduler': self.lr_scheduler.state_dict(),
             'cfg': durable_config(self.config),
@@ -3205,6 +3234,18 @@ class FitContext:
         elif model_state is not None:
             reasons.append('checkpoint model state is not a mapping')
 
+        # --- frozen bake/reset history --------------------------------------
+        frozen_payload = checkpoint.get('frozen_epochs')
+        if frozen_payload is not None:
+            compatibility = getattr(
+                self.spiral_and_transform, 'frozen_epochs_compatibility', None)
+            if compatibility is None:
+                reasons.append(
+                    'checkpoint carries a frozen bake/reset history but the '
+                    'live model does not support one')
+            else:
+                reasons.extend(compatibility(frozen_payload))
+
         # --- optimiser and scheduler compatibility -------------------------
         optimiser_state = checkpoint.get('optimiser')
         if isinstance(optimiser_state, Mapping):
@@ -3299,6 +3340,32 @@ class FitContext:
     def load_checkpoint(self, checkpoint):
         transformed_spiral_state, optimiser_state = checkpoint['spiral_and_transform'], checkpoint['optimiser']
         self.spiral_and_transform.load_state_dict(transformed_spiral_state)
+        # Restore (or clear, for a checkpoint that predates or never used
+        # bake/reset) the frozen epoch history, rebaking the accumulator
+        # grids from it. Deterministic given the history, so DDP ranks stay
+        # consistent without broadcasting the grids. getattr: unit tests
+        # exercise this path with stub models that have no frozen history.
+        load_frozen_epochs = getattr(
+            self.spiral_and_transform, 'load_frozen_epochs', None)
+        bake_stats = (
+            load_frozen_epochs(checkpoint.get('frozen_epochs'))
+            if load_frozen_epochs is not None else None)
+        if bake_stats is not None:
+            print('restored frozen accumulator: '
+                  f'{bake_stats["bake_num_epochs"]} epoch(s), probe error '
+                  f'fwd max {bake_stats["bake_probe_fwd_error_max"]:.4f} / '
+                  f'inv max {bake_stats["bake_probe_inv_error_max"]:.4f}')
+        # An in-session load replaces the accumulator object, so every
+        # derived structure holding the old transform instance is stale.
+        if getattr(self, 'slice_to_spiral_transform', None) is not None:
+            self.slice_to_spiral_transform = \
+                self.spiral_and_transform.get_slice_to_spiral_transform()
+            self.dr_per_winding = self.spiral_and_transform.get_dr_per_winding()
+            if getattr(self, 'theta_crossing_map', None) is not None:
+                self.theta_crossing_map.force_refresh(
+                    self.slice_to_spiral_transform)
+            if getattr(self, 'dt_target_cache_manager', None) is not None:
+                self.dt_target_cache_manager.reset()
         self.optimiser.load_state_dict(optimiser_state)
         # Older checkpoints could have been saved while influence masking had
         # disabled gap weight decay. Influence state is no longer restored, so
@@ -4051,6 +4118,70 @@ class FitContext:
             # resets its cadence without rebuilding immutable topology.
             self.theta_crossing_map.invalidate()
 
+    def _maybe_bake_and_reset(self, completed_iterations):
+        """Run a bake/reset at the configured cadence, between steps.
+
+        Never on the final boundary: the last step's state goes straight to
+        export, where a fresh bake would only add grid error. Called at the
+        same completed-iteration count on every rank, so DDP stays
+        deterministic (params are identical post-allreduce and the rebake
+        consumes no RNG).
+        """
+        interval = int(self.config.get('model_bake_reset_interval') or 0)
+        if (interval <= 0
+                or completed_iterations % interval != 0
+                or completed_iterations >= self.num_training_steps):
+            return None
+        return self.bake_and_reset(completed_iterations)
+
+    def bake_and_reset(self, iteration):
+        """Freeze the live smooth transform into the accumulator and reset.
+
+        The total map is unchanged at the moment of reset (up to accumulator
+        grid interpolation error): the exact live [flows, linear] state is
+        snapshotted to the CPU history, the accumulator grids are rebaked
+        from the full exact history, and the live parameters return to
+        identity so optimisation continues on a near-identity problem.
+        """
+        if self.influence_state is not None and self.influence_state.active:
+            # Influence grad masks are defined on the live flow lattices; a
+            # reset shifts the lattice's material meaning by the frozen warp.
+            raise RuntimeError(
+                'bake_and_reset is not supported while an influence window '
+                'is active')
+        model = self.spiral_and_transform
+        model.snapshot_live_epoch_(iteration)
+        bake_stats = model.rebake_accumulator(
+            grid_resolution=int(self.config['model_bake_grid_resolution']))
+        model.reset_live_smooth_params_()
+        # Clear the optimiser state of every reset parameter: stale Adam
+        # moments would re-deform the freshly-identity stages on the very
+        # next step, destroying the exact-match property. The LR scheduler
+        # keeps running.
+        for flow_field in model.flow_fields:
+            for param in flow_field.parameters():
+                self.optimiser.state.pop(param, None)
+        self.optimiser.state.pop(model.linear_logits, None)
+        # Derived caches hold the pre-bake transform instance (which composed
+        # the live stages with the previous tail); rebuild them against the
+        # post-reset chain.
+        self.slice_to_spiral_transform = model.get_slice_to_spiral_transform()
+        self.dr_per_winding = model.get_dr_per_winding()
+        self.theta_crossing_map.force_refresh(self.slice_to_spiral_transform)
+        self._enforce_theta_liftability()
+        self.dt_target_cache_manager.reset()
+        if self.dist.is_main_process:
+            print(
+                f'bake/reset at iteration {iteration}: '
+                f'{bake_stats["bake_num_epochs"]} frozen epoch(s), probe '
+                f'error fwd mean {bake_stats["bake_probe_fwd_error_mean"]:.4f} '
+                f'max {bake_stats["bake_probe_fwd_error_max"]:.4f}, inv mean '
+                f'{bake_stats["bake_probe_inv_error_mean"]:.4f} max '
+                f'{bake_stats["bake_probe_inv_error_max"]:.4f}')
+            if wandb.run is not None:
+                wandb.log({'bake_reset': float(iteration), **bake_stats})
+        return bake_stats
+
     def step(self, iteration):
         self.step_timer.start('fwd')
         flow_field_high_res_lr_scale = self._apply_high_res_lr_scale(iteration)
@@ -4599,6 +4730,9 @@ class FitContext:
             loss, losses, log_metrics, shell_metrics = self.step(iteration)
             progress.update(iteration - self.start_iteration + 1)
             self.log_step_metrics(iteration, loss, losses, log_metrics, shell_metrics)
+            # Bake before the autosave so a resumed fit restores the
+            # post-bake state and continues deterministically.
+            self._maybe_bake_and_reset(iteration + 1)
             self._maybe_save_headless_checkpoint(iteration + 1)
 
         # ==========================================================================
@@ -4629,10 +4763,17 @@ class FitContext:
                 quad_label_map = None
             progress.begin(
                 'finalizing', 'Computing satisfaction metrics and outputs')
+            # Final outputs use the exact frozen chains rather than the baked
+            # grids: the true map, differing from what was optimised only by
+            # the grid interpolation error reported at each bake.
+            final_transform = self.slice_to_spiral_transform
+            if self.spiral_and_transform.frozen_epochs:
+                final_transform = self.spiral_and_transform \
+                    .get_slice_to_spiral_transform(exact_frozen=True)
             save_overlay_and_print_satisfaction(
                 suffix,
                 spiral_and_transform=self.spiral_and_transform,
-                slice_to_spiral_transform=self.slice_to_spiral_transform,
+                slice_to_spiral_transform=final_transform,
                 dr_per_winding=self.dr_per_winding,
                 patches_list=self.verified_patches_list,
                 patches_dict=self.verified_patches,

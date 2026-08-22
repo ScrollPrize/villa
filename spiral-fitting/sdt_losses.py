@@ -42,17 +42,27 @@ from soft_alignment import soft_align_sequences
 from transforms import ray_gap_enabled, ray_specialized_spiral_to_scroll
 
 
+_warned_generic_radial_fallback = False
+
+
 def _map_radial_samples(
     slice_to_spiral_transform, radii, theta, z, pair_id, sin_t, cos_t,
 ):
     """Spiral->scroll for radial-ray samples; per-ray gap stage when the
     production chain is recognized (see transforms.ray_specialized_spiral_to_
     scroll), generic transform otherwise."""
+    global _warned_generic_radial_fallback
     if ray_gap_enabled():
         out = ray_specialized_spiral_to_scroll(
             slice_to_spiral_transform, radii, theta, z, pair_id, sin_t, cos_t)
         if out is not None:
             return out
+        if not _warned_generic_radial_fallback:
+            _warned_generic_radial_fallback = True
+            print(
+                'WARNING: ray-specialized spiral->scroll rejected the '
+                'transform chain; phase-bundle losses are using the slower '
+                'generic path')
     spiral = torch.stack([
         z[pair_id], sin_t[pair_id] * radii, cos_t[pair_id] * radii], dim=-1)
     return slice_to_spiral_transform.inv(spiral)
