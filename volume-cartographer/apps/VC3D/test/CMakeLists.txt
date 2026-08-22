@@ -155,3 +155,22 @@ vc_register_test_target(test_command_line_tool_runner)
 vc_register_ctest(command_line_tool_runner test_command_line_tool_runner)
 set_tests_properties(command_line_tool_runner PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+add_executable(test_annotation_frame
+    test_annotation_frame.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/AnnotationFrame.hpp)
+
+set_target_properties(test_annotation_frame PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_annotation_frame PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_annotation_frame PRIVATE
+    vc_core
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME annotation_frame COMMAND test_annotation_frame)
+vc_register_test_target(test_annotation_frame)
+vc_register_ctest(annotation_frame test_annotation_frame)

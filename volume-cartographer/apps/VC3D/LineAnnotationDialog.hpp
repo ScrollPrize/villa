@@ -159,6 +159,8 @@ public:
         std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics);
     void setOptimizationBusy(bool busy);
     void setOptimizationStatus(bool optimized);
+    // Empty retracts the notice; see updateUmbilicusNotice().
+    void setUmbilicusNotice(const QString& notice);
     void setFiberDisplayName(const QString& name);
     // "H"/"V" (or empty) shown next to the fiber name in the top-right label.
     void setFiberHvTag(const QString& tag);
@@ -400,6 +402,10 @@ private:
     void updatePauseIndicator();
     // "optimized"/"not optimized" badge in the bottom strip's top-right corner.
     void updateOptimizationStatusIndicator();
+    // Red notice at the bottom strip's top-left when the package's umbilicus
+    // could not be used, so that falling back to the volume centre is visible
+    // rather than only logged.
+    void updateUmbilicusNotice();
     void updateOptimizationOverlayGeometry();
     void updateFiberNameLabel();
     void rebuildDatasetMenus();
@@ -490,6 +496,8 @@ private:
     // control points (LineAnnotationOverviewBar, file-local in the .cpp).
     QPointer<QWidget> _overviewBar;
     QPointer<QLabel> _pauseIndicator;
+    QPointer<QLabel> _umbilicusNoticeLabel;
+    QString _umbilicusNotice;
     GeneratedViews _generatedViews;
     // Sign applied to the displayed line tangent so the current cut's screen
     // left/right and the side cut's vertical do not depend on the arbitrary

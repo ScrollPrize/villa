@@ -87,8 +87,22 @@ struct ChunkRequestScheduler::Impl {
         }
     };
 
+    struct MaintenanceLess {
+        bool operator()(const std::shared_ptr<Item>& lhs,
+                        const std::shared_ptr<Item>& rhs) const noexcept
+        {
+            if (lhs->priority.reserveForegroundSlot !=
+                rhs->priority.reserveForegroundSlot) {
+                return lhs->priority.reserveForegroundSlot <
+                       rhs->priority.reserveForegroundSlot;
+            }
+            return BackgroundLess{}(lhs, rhs);
+        }
+    };
+
     using GuiQueue = std::set<std::shared_ptr<Item>, GuiLess>;
     using BackgroundQueue = std::set<std::shared_ptr<Item>, BackgroundLess>;
+    using MaintenanceQueue = std::set<std::shared_ptr<Item>, MaintenanceLess>;
 
     struct Location {
         enum class Kind {
@@ -100,7 +114,7 @@ struct ChunkRequestScheduler::Impl {
         Kind kind = Kind::Background;
         GuiQueue::iterator gui;
         BackgroundQueue::iterator background;
-        BackgroundQueue::iterator maintenance;
+        MaintenanceQueue::iterator maintenance;
     };
 
     struct TransferSample {
@@ -178,10 +192,12 @@ struct ChunkRequestScheduler::Impl {
                   std::size_t burst,
                   std::shared_ptr<ChunkRequestSelectionGate> gate,
                   std::optional<AdaptiveConcurrency> adaptiveConfig,
-                  std::optional<AdaptiveState> initialAdaptiveState)
+                  std::optional<AdaptiveState> initialAdaptiveState,
+                  std::size_t reservedSlots)
         : selectionGate(std::move(gate))
         , interactiveBurst(std::max<std::size_t>(1, burst))
         , maximumWorkers(std::max<std::size_t>(1, workerCount))
+        , maintenanceReservedSlots(std::min(reservedSlots, maximumWorkers))
     {
         if (!selectionGate)
             selectionGate = std::make_shared<ChunkRequestSelectionGate>();
@@ -322,10 +338,32 @@ struct ChunkRequestScheduler::Impl {
         return item;
     }
 
+    template <bool ReserveMaintenanceCapacity>
     bool canSelectLocked() const
     {
-        return (!gui.empty() || !background.empty() || !maintenance.empty()) &&
-               activeCount.load(std::memory_order_acquire) < admissionLimit;
+        if constexpr (!ReserveMaintenanceCapacity) {
+            // Keep the ordinary scheduler predicate identical to the
+            // pre-Delta3D path. The encoding choice is process-lifetime
+            // state, so workers specialize once at startup instead of paying
+            // a mode check for every selected cache task.
+            return (!gui.empty() || !background.empty() ||
+                    !maintenance.empty()) &&
+                   activeCount.load(std::memory_order_acquire) <
+                       admissionLimit;
+        } else {
+            std::size_t effectiveAdmission = admissionLimit;
+            const bool onlyBulkMaintenance =
+                gui.empty() && background.empty() && !maintenance.empty() &&
+                (*maintenance.begin())->priority.reserveForegroundSlot;
+            if (onlyBulkMaintenance && admissionLimit > 1) {
+                effectiveAdmission = std::max<std::size_t>(
+                    1, admissionLimit - maintenanceReservedSlots);
+            }
+            return (!gui.empty() || !background.empty() ||
+                    !maintenance.empty()) &&
+                   activeCount.load(std::memory_order_acquire) <
+                       effectiveAdmission;
+        }
     }
 
     void configureConcurrencyLocked(
@@ -838,14 +876,16 @@ struct ChunkRequestScheduler::Impl {
             completeEpochLocked(*measurement);
     }
 
-    void workerLoop(std::stop_token stop)
+    template <bool ReserveMaintenanceCapacity>
+    void workerLoopImpl(std::stop_token stop)
     {
         while (!stop.stop_requested()) {
             std::shared_ptr<Item> item;
             {
                 std::unique_lock lock(mutex);
                 cv.wait(lock, [&] {
-                    return stop.stop_requested() || canSelectLocked();
+                    return stop.stop_requested() ||
+                           canSelectLocked<ReserveMaintenanceCapacity>();
                 });
                 if (stop.stop_requested() && gui.empty() && background.empty() &&
                     maintenance.empty())
@@ -859,7 +899,7 @@ struct ChunkRequestScheduler::Impl {
                 if (stop.stop_requested() && gui.empty() && background.empty() &&
                     maintenance.empty())
                     return;
-                if (!canSelectLocked())
+                if (!canSelectLocked<ReserveMaintenanceCapacity>())
                     continue;
                 item = popLocked();
                 if (!item)
@@ -889,12 +929,20 @@ struct ChunkRequestScheduler::Impl {
         }
     }
 
+    void workerLoop(std::stop_token stop)
+    {
+        if (maintenanceReservedSlots == 0)
+            workerLoopImpl<false>(stop);
+        else
+            workerLoopImpl<true>(stop);
+    }
+
     mutable std::mutex mutex;
     std::condition_variable cv;
     std::condition_variable idleCv;
     GuiQueue gui;
     BackgroundQueue background;
-    BackgroundQueue maintenance;
+    MaintenanceQueue maintenance;
     std::unordered_map<TaskId, Location> locations;
     std::unordered_map<TaskGroup, std::uint64_t> minimumGroupEpoch;
     std::shared_ptr<ChunkRequestSelectionGate> selectionGate;
@@ -906,6 +954,7 @@ struct ChunkRequestScheduler::Impl {
     std::size_t consecutiveInteractive = 0;
     const std::size_t interactiveBurst;
     const std::size_t maximumWorkers;
+    const std::size_t maintenanceReservedSlots;
     bool adaptive = false;
     bool hasAdaptiveHistory = false;
     std::optional<std::size_t> retainedAdaptiveSettledAdmissionLimit;
@@ -956,11 +1005,13 @@ ChunkRequestScheduler::ChunkRequestScheduler(std::size_t workers,
                                              std::size_t interactiveBurst,
                                              std::shared_ptr<ChunkRequestSelectionGate> selectionGate,
                                              std::optional<AdaptiveConcurrency> adaptiveConcurrency,
-                                             std::optional<AdaptiveState> initialAdaptiveState)
+                                             std::optional<AdaptiveState> initialAdaptiveState,
+                                             std::size_t maintenanceReservedSlots)
     : impl_(std::make_unique<Impl>(workers, interactiveBurst,
                                   std::move(selectionGate),
                                   std::move(adaptiveConcurrency),
-                                  std::move(initialAdaptiveState)))
+                                  std::move(initialAdaptiveState),
+                                  maintenanceReservedSlots))
 {
 }
 

@@ -1656,6 +1656,10 @@ def write_current_transform(_):
         save_current_transform(state, args.output_transform, args.fixed)
 
 
+def default_modifier_key() -> str:
+    return "control" if sys.platform == "darwin" else "alt"
+
+
 def add_actions_and_keybinds(
     viewer: neuroglancer.Viewer,
     *,
@@ -1665,6 +1669,7 @@ def add_actions_and_keybinds(
     small_translate_voxels: float = 10.0,
     large_translate_voxels: float = 1000.0,
     point_perturb_voxels: float = 1.0,
+    modifier_key: Optional[str] = None,
 ) -> None:
 
     viewer.actions.add("toggle-color", toggle_color)
@@ -1736,45 +1741,47 @@ def add_actions_and_keybinds(
         "perturb-fixed-point-z-minus", _make_point_perturber("z", -point_perturb_voxels)
     )
 
+    modkey = (modifier_key if modifier_key is not None else default_modifier_key()).lower()
+
     with viewer.config_state.txn() as s:
         s.input_event_bindings.viewer["keyc"] = "toggle-color"
         s.input_event_bindings.viewer["keym"] = "toggle-constrained-fit"
         s.input_event_bindings.viewer["keyw"] = "write-transform"
         if enable_fine_align:
             s.input_event_bindings.viewer["keyf"] = "fine-align"
-        s.input_event_bindings.viewer["alt+keyx"] = "delete-nearest-point"
-        s.input_event_bindings.viewer["alt+digit1"] = "add-fixed-point"
-        s.input_event_bindings.viewer["alt+digit2"] = "add-moving-point"
-        s.input_event_bindings.viewer["alt+keya"] = "rot-x-plus-small"
-        s.input_event_bindings.viewer["alt+keyq"] = "rot-x-minus-small"
-        s.input_event_bindings.viewer["alt+keys"] = "rot-y-plus-small"
-        s.input_event_bindings.viewer["alt+keyw"] = "rot-y-minus-small"
-        s.input_event_bindings.viewer["alt+keyd"] = "rot-z-plus-small"
-        s.input_event_bindings.viewer["alt+keye"] = "rot-z-minus-small"
-        s.input_event_bindings.viewer["alt+shift+keya"] = "rot-x-plus-large"
-        s.input_event_bindings.viewer["alt+shift+keyq"] = "rot-x-minus-large"
-        s.input_event_bindings.viewer["alt+shift+keys"] = "rot-y-plus-large"
-        s.input_event_bindings.viewer["alt+shift+keyw"] = "rot-y-minus-large"
-        s.input_event_bindings.viewer["alt+shift+keyd"] = "rot-z-plus-large"
-        s.input_event_bindings.viewer["alt+shift+keye"] = "rot-z-minus-large"
-        s.input_event_bindings.viewer["alt+keyf"] = "flip-x"
-        s.input_event_bindings.viewer["alt+keyg"] = "flip-y"
-        s.input_event_bindings.viewer["alt+keyh"] = "flip-z"
-        s.input_event_bindings.viewer["alt+keyj"] = "trans-x-plus-small"
-        s.input_event_bindings.viewer["alt+keyu"] = "trans-x-minus-small"
-        s.input_event_bindings.viewer["alt+keyk"] = "trans-y-plus-small"
-        s.input_event_bindings.viewer["alt+keyi"] = "trans-y-minus-small"
-        s.input_event_bindings.viewer["alt+keyl"] = "trans-z-plus-small"
-        s.input_event_bindings.viewer["alt+keyo"] = "trans-z-minus-small"
-        s.input_event_bindings.viewer["alt+shift+keyj"] = "trans-x-plus-large"
-        s.input_event_bindings.viewer["alt+shift+keyu"] = "trans-x-minus-large"
-        s.input_event_bindings.viewer["alt+shift+keyk"] = "trans-y-plus-large"
-        s.input_event_bindings.viewer["alt+shift+keyi"] = "trans-y-minus-large"
-        s.input_event_bindings.viewer["alt+shift+keyl"] = "trans-z-plus-large"
-        s.input_event_bindings.viewer["alt+shift+keyo"] = "trans-z-minus-large"
-        s.input_event_bindings.viewer["alt+bracketleft"] = "previous-fixed-point"
-        s.input_event_bindings.viewer["alt+bracketright"] = "next-fixed-point"
-        s.input_event_bindings.viewer["alt+shift+bracketright"] = "goto-worst-landmark"
+        s.input_event_bindings.viewer[f"{modkey}+keyx"] = "delete-nearest-point"
+        s.input_event_bindings.viewer[f"{modkey}+digit1"] = "add-fixed-point"
+        s.input_event_bindings.viewer[f"{modkey}+digit2"] = "add-moving-point"
+        s.input_event_bindings.viewer[f"{modkey}+keya"] = "rot-x-plus-small"
+        s.input_event_bindings.viewer[f"{modkey}+keyq"] = "rot-x-minus-small"
+        s.input_event_bindings.viewer[f"{modkey}+keys"] = "rot-y-plus-small"
+        s.input_event_bindings.viewer[f"{modkey}+keyw"] = "rot-y-minus-small"
+        s.input_event_bindings.viewer[f"{modkey}+keyd"] = "rot-z-plus-small"
+        s.input_event_bindings.viewer[f"{modkey}+keye"] = "rot-z-minus-small"
+        s.input_event_bindings.viewer[f"{modkey}+shift+keya"] = "rot-x-plus-large"
+        s.input_event_bindings.viewer[f"{modkey}+shift+keyq"] = "rot-x-minus-large"
+        s.input_event_bindings.viewer[f"{modkey}+shift+keys"] = "rot-y-plus-large"
+        s.input_event_bindings.viewer[f"{modkey}+shift+keyw"] = "rot-y-minus-large"
+        s.input_event_bindings.viewer[f"{modkey}+shift+keyd"] = "rot-z-plus-large"
+        s.input_event_bindings.viewer[f"{modkey}+shift+keye"] = "rot-z-minus-large"
+        s.input_event_bindings.viewer[f"{modkey}+keyf"] = "flip-x"
+        s.input_event_bindings.viewer[f"{modkey}+keyg"] = "flip-y"
+        s.input_event_bindings.viewer[f"{modkey}+keyh"] = "flip-z"
+        s.input_event_bindings.viewer[f"{modkey}+keyj"] = "trans-x-plus-small"
+        s.input_event_bindings.viewer[f"{modkey}+keyu"] = "trans-x-minus-small"
+        s.input_event_bindings.viewer[f"{modkey}+keyk"] = "trans-y-plus-small"
+        s.input_event_bindings.viewer[f"{modkey}+keyi"] = "trans-y-minus-small"
+        s.input_event_bindings.viewer[f"{modkey}+keyl"] = "trans-z-plus-small"
+        s.input_event_bindings.viewer[f"{modkey}+keyo"] = "trans-z-minus-small"
+        s.input_event_bindings.viewer[f"{modkey}+shift+keyj"] = "trans-x-plus-large"
+        s.input_event_bindings.viewer[f"{modkey}+shift+keyu"] = "trans-x-minus-large"
+        s.input_event_bindings.viewer[f"{modkey}+shift+keyk"] = "trans-y-plus-large"
+        s.input_event_bindings.viewer[f"{modkey}+shift+keyi"] = "trans-y-minus-large"
+        s.input_event_bindings.viewer[f"{modkey}+shift+keyl"] = "trans-z-plus-large"
+        s.input_event_bindings.viewer[f"{modkey}+shift+keyo"] = "trans-z-minus-large"
+        s.input_event_bindings.viewer[f"{modkey}+bracketleft"] = "previous-fixed-point"
+        s.input_event_bindings.viewer[f"{modkey}+bracketright"] = "next-fixed-point"
+        s.input_event_bindings.viewer[f"{modkey}+shift+bracketright"] = "goto-worst-landmark"
         s.input_event_bindings.viewer["shift+keyj"] = "perturb-fixed-point-x-plus"
         s.input_event_bindings.viewer["shift+keyu"] = "perturb-fixed-point-x-minus"
         s.input_event_bindings.viewer["shift+keyk"] = "perturb-fixed-point-y-plus"
@@ -1835,31 +1842,37 @@ if __name__ == "__main__":
         "--small-rotate-deg",
         type=float,
         default=1.0,
-        help="Rotation step in degrees for Alt+<rotation key> (default: 1.0)",
+        help="Rotation step in degrees for <modifier>+<rotation key> (default: 1.0)",
     )
     parser.add_argument(
         "--large-rotate-deg",
         type=float,
         default=90.0,
-        help="Rotation step in degrees for Alt+Shift+<rotation key> (default: 90.0)",
+        help="Rotation step in degrees for <modifier>+Shift+<rotation key> (default: 90.0)",
     )
     parser.add_argument(
         "--small-translate-voxels",
         type=float,
         default=10.0,
-        help="Translation step in voxels for Alt+<translation key> (default: 10.0)",
+        help="Translation step in voxels for <modifier>+<translation key> (default: 10.0)",
     )
     parser.add_argument(
         "--large-translate-voxels",
         type=float,
         default=1000.0,
-        help="Translation step in voxels for Alt+Shift+<translation key> (default: 1000.0)",
+        help="Translation step in voxels for <modifier>+Shift+<translation key> (default: 1000.0)",
     )
     parser.add_argument(
         "--point-perturb-voxels",
         type=float,
         default=1.0,
         help="Fixed-point perturb step in voxels for Shift+<j/u/k/i/l/o> (default: 1.0)",
+    )
+    parser.add_argument(
+        "--modifier-key",
+        type=str,
+        default=default_modifier_key(),
+        help="Modifier key for viewer shortcuts (e.g. alt, control). Defaults to control on macOS and alt elsewhere.",
     )
     parser.add_argument(
         "--mesh-slice-max-segments",
@@ -1959,6 +1972,7 @@ if __name__ == "__main__":
         small_translate_voxels=args.small_translate_voxels,
         large_translate_voxels=args.large_translate_voxels,
         point_perturb_voxels=args.point_perturb_voxels,
+        modifier_key=args.modifier_key,
     )
 
     init_layers(viewer, args.fixed, fixed_dimensions, moving_source, scale_factor)
