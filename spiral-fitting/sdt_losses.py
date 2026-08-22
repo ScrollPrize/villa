@@ -36,6 +36,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+import geom_utils
 from ddp_helpers import get_world_size, is_distributed
 from loss_maps import diagnostics_enabled, record_loss_samples
 from soft_alignment import soft_align_sequences
@@ -80,10 +81,12 @@ def metrics_enabled():
 
     Every float()/.item() in a metrics dict is a device synchronization; at
     probe/DDP shapes those stalls dominate the step. With
-    FIT_SPIRAL_METRICS_EVERY=K (default 1 = every step, the historical
+    FIT_SPIRAL_METRICS_EVERY=K (default 1 = every call, the historical
     behavior) the sync-heavy metrics run on every K-th
     iter_phase_bundle_losses call and the skipped steps yield minimal
-    dicts. Losses and gradients are identical either way.
+    dicts. The training loop overrides this per call through
+    iter_phase_bundle_losses(with_metrics=...) to match its logging
+    cadence. Losses and gradients are identical either way.
     """
     return _metrics_enabled_now
 
@@ -103,7 +106,11 @@ def _sample_windings_by_circumference(
     winding circumference (weight k + 0.5). ``highest`` may be a per-sample
     tensor. Uses the analytic inverse CDF: cum-mass to k is ((k+1)^2 - a^2)/2."""
     a = float(lowest)
-    b = torch.as_tensor(highest, device=device, dtype=torch.float32)
+    if torch.is_tensor(highest):
+        b = highest.to(device=device, dtype=torch.float32)
+    else:
+        # A pageable scalar upload would stall on the whole GPU queue.
+        b = geom_utils.cached_scalar_tensor(highest, device)
     total_mass = ((b + 1.0) ** 2 - a * a) / 2.0
     u = torch.rand(num_samples, device=device, generator=generator)
     k = torch.ceil(torch.sqrt(2.0 * u * total_mass + a * a) - 1.0)
@@ -1872,6 +1879,7 @@ def iter_phase_bundle_losses(
     spiral_and_transform, slice_to_spiral_transform, dr_per_winding,
     sdt_volume, normal_volume, outer_winding_idx, cfg, z_begin, z_end, *,
     attachment_ramp=1.0, generator=None, compute_map_path=False,
+    with_metrics=None,
 ):
     """Yield the active phase-bundle components as (name, loss, metrics).
 
@@ -1887,7 +1895,10 @@ def iter_phase_bundle_losses(
     internal backward grouping.
     """
     global _metrics_enabled_now
-    _metrics_enabled_now = next(_metrics_tick) % _METRICS_EVERY == 0
+    if with_metrics is None:
+        _metrics_enabled_now = next(_metrics_tick) % _METRICS_EVERY == 0
+    else:
+        _metrics_enabled_now = bool(with_metrics)
     weights = phase_bundle_component_weights(cfg, attachment_ramp)
     if outer_winding_idx is not None and sdt_volume is not None:
         if sdt_volume['kind'] != 'sdt':

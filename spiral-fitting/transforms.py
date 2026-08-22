@@ -342,7 +342,12 @@ class UmbilicusTransform(pyro.distributions.transforms.Transform):
 
     def _call(self, input_zyx, inverse=False):
         centre_yx = interp1d(input_zyx[..., 0].contiguous(), self._z, self._yx)
-        return input_zyx + torch.cat([torch.zeros_like(centre_yx[..., :1]), centre_yx], dim=-1) * (-1 if inverse else 1)
+        # Add the centre to the yx columns directly rather than materialising
+        # a zero-padded [..., 3] offset; z passes through untouched (it only
+        # gained an exact +0 before) and the yx additions are identical.
+        yx = (input_zyx[..., 1:] - centre_yx if inverse
+              else input_zyx[..., 1:] + centre_yx)
+        return torch.cat([input_zyx[..., :1], yx], dim=-1)
 
     def _inverse(self, input_zyx):
         return self._call(input_zyx, inverse=True)

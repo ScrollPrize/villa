@@ -4297,6 +4297,10 @@ class FitContext:
                 self.config,
                 self.z_begin,
                 self.z_end,
+                # Metrics are only reported every 200 steps
+                # (log_step_metrics); computing them every step costs one
+                # full GPU-queue drain per .item().
+                with_metrics=iteration % 200 == 0,
             )
             backward_family({
                 'dense_spacing_winding_model_relative': (
@@ -4340,6 +4344,9 @@ class FitContext:
                         self.z_begin,
                         self.z_end,
                         attachment_ramp=attachment_ramp,
+                        # Metrics are only reported every 200 steps; their
+                        # .item() reads each stall on the full GPU queue.
+                        with_metrics=iteration % 200 == 0,
                     ):
                 weighted = (
                     component_loss * component_weights[component_name])
@@ -4424,6 +4431,9 @@ class FitContext:
                 self.dr_per_winding,
                 self.shell_outer_winding_idx,
                 cfg=self.config, z_begin=self.z_begin, z_end=self.z_end,
+                # Metrics are only reported every 200 steps; the block's
+                # valid.any() stalls on the full GPU queue.
+                with_metrics=iteration % 200 == 0,
             )
             backward_family({
                 'shell_outer': shell_outer_loss * self.config['loss_weight_shell_outer'],

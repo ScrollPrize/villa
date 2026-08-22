@@ -811,6 +811,7 @@ def configure_prepared_track_sampling(prepared_tracks, config):
         if weights is None:
             prepared_tracks.pop('sampling_probabilities', None)
             prepared_tracks.pop('sampling_probabilities_cpu', None)
+            prepared_tracks.pop('walk_primary_sampler', None)
             prepared_tracks['length_bin_weights'] = None
         else:
             probabilities = _length_bin_probabilities(
@@ -819,6 +820,7 @@ def configure_prepared_track_sampling(prepared_tracks, config):
             prepared_tracks['sampling_probabilities'] = probabilities
             prepared_tracks['sampling_probabilities_cpu'] = np.asarray(
                 probabilities.detach().cpu(), dtype=np.float64)
+            prepared_tracks.pop('walk_primary_sampler', None)
             prepared_tracks['length_bin_weights'] = weights.tolist()
 
     maximum = policy['max_crossings']
@@ -2558,6 +2560,65 @@ def prepare_main_phase_tracks(
         crossing_csr_override=crossing_csr_override)
 
 
+def _attach_device_resident_points(bundle, device):
+    """Attach device copies of the resampled points when memory allows.
+
+    The per-step point gather then runs on the device instead of a host
+    gather behind two full stream synchronisations (`flat_idx.cpu()` and the
+    pinned staging round-trip). The copies are exact, so sampled batches are
+    bitwise identical either way; this only changes where the gather runs.
+    Disable with VC_DISABLE_TRACK_DEVICE_POINTS=1 (the host path stays the
+    fallback whenever the copies would crowd device memory).
+    """
+    if device.type != 'cuda':
+        return
+    if os.environ.get('VC_DISABLE_TRACK_DEVICE_POINTS') == '1':
+        return
+    coordinates = bundle['flat_zyx_cpu']
+    source_local = bundle['flat_source_local_cpu']
+    needed = (coordinates.numel() * coordinates.element_size()
+              + source_local.numel() * source_local.element_size())
+    free_bytes, _total_bytes = torch.cuda.mem_get_info(device)
+    if needed > 0.2 * free_bytes:
+        return
+    bundle['flat_zyx'] = coordinates.to(device=device)
+    bundle['flat_source_local'] = source_local.to(device=device)
+
+
+def _gather_sampled_track_points(
+        prepared_tracks, resampled, flat_idx, target_flat_idx,
+        num_rows, target_points, device):
+    """Gather sampled coordinates and per-target source indices.
+
+    Uses the device-resident copies when the bundle carries them (see
+    _attach_device_resident_points); otherwise gathers on the host through
+    the cached pinned staging buffer.
+    """
+    flat_zyx = resampled.get('flat_zyx')
+    if flat_zyx is not None:
+        sampled_scroll = flat_zyx[flat_idx]
+        target_source_idx = resampled['flat_source_local'][
+            flat_idx[target_flat_idx.reshape(-1)]].reshape(
+                num_rows, target_points)
+        return sampled_scroll, target_source_idx
+    flat_idx_cpu = flat_idx.cpu()
+    sampled_cpu = resampled['flat_zyx_cpu'][flat_idx_cpu]
+    if device.type == 'cuda':
+        staging = prepared_tracks.get('staging')
+        if staging is None or staging.shape != sampled_cpu.shape:
+            staging = torch.empty(
+                sampled_cpu.shape, dtype=torch.float32, pin_memory=True)
+            prepared_tracks['staging'] = staging
+        staging.copy_(sampled_cpu)
+        sampled_scroll = staging.to(device=device, non_blocking=False)
+    else:
+        sampled_scroll = sampled_cpu.to(device=device)
+    target_source_idx = resampled['flat_source_local_cpu'][
+        flat_idx_cpu[target_flat_idx.reshape(-1).cpu()]].reshape(
+            num_rows, target_points).to(device=device)
+    return sampled_scroll, target_source_idx
+
+
 def _build_resampled_track_bundle(prepared_tracks, min_spacing, max_spacing):
     """Resample complete tracks between mandatory polyline anchors."""
     min_spacing = float(min_spacing)
@@ -2638,6 +2699,7 @@ def _build_resampled_track_bundle(prepared_tracks, min_spacing, max_spacing):
         elif 'crossing_record_sample' in result:
             bundle['crossing_record_sample_cpu'] = torch.from_numpy(
                 np.asarray(result['crossing_record_sample'])).contiguous()
+        _attach_device_resident_points(bundle, device)
         prepared_tracks['resampled_cache'].clear()
         prepared_tracks['resampled_cache'][cache_key] = bundle
         minimum_observed_spacing = float(result['minimum_observed_spacing'])
@@ -2804,6 +2866,7 @@ def _build_resampled_track_bundle(prepared_tracks, min_spacing, max_spacing):
         bundle['crossing_record_sample_cpu'] = torch.from_numpy(
             crossing_record_sample).contiguous()
 
+    _attach_device_resident_points(bundle, device)
     # Run-scoped spacing edits can request a different density. Keep the cache
     # bounded to one whole-dataset resample rather than retaining every setting
     # tried during an interactive session.
@@ -2953,18 +3016,6 @@ def _draw_track_sample(
     local_idx = torch.arange(int(row_starts[-1]), device=device) - row_starts[:-1][row_id]
     flat_idx = resampled['offsets'][track_idx][row_id] + local_idx
 
-    flat_idx_cpu = flat_idx.cpu()
-    sampled_cpu = resampled['flat_zyx_cpu'][flat_idx_cpu]
-    if device.type == 'cuda':
-        staging = prepared_tracks.get('staging')
-        if staging is None or staging.shape != sampled_cpu.shape:
-            staging = torch.empty(sampled_cpu.shape, dtype=torch.float32, pin_memory=True)
-            prepared_tracks['staging'] = staging
-        staging.copy_(sampled_cpu)
-        sampled_scroll = staging.to(device=device, non_blocking=False)
-    else:
-        sampled_scroll = sampled_cpu.to(device=device)
-
     if target_points == 1:
         target_local = torch.zeros(
             [len(track_idx), 1], dtype=torch.int64, device=device)
@@ -2974,10 +3025,9 @@ def _draw_track_sample(
         target_local = torch.round(
             fractions[None, :] * (row_lengths[:, None] - 1)).to(torch.int64)
     target_flat_idx = row_starts[:-1, None] + target_local
-    target_source_idx_cpu = resampled['flat_source_local_cpu'][
-        flat_idx_cpu[target_flat_idx.reshape(-1).cpu()]].reshape(
-            len(track_idx), target_points)
-    target_source_idx = target_source_idx_cpu.to(device=device)
+    sampled_scroll, target_source_idx = _gather_sampled_track_points(
+        prepared_tracks, resampled, flat_idx, target_flat_idx,
+        len(track_idx), target_points, device)
 
     primary_cross_flat = torch.empty(0, dtype=torch.int64, device=device)
     partner_cross_flat = torch.empty(0, dtype=torch.int64, device=device)
@@ -3029,11 +3079,24 @@ def _draw_track_walk_sample(
             probabilities_cpu = np.asarray(
                 probabilities.detach().cpu(), dtype=np.float64)
             prepared_tracks['sampling_probabilities_cpu'] = probabilities_cpu
+    # Validating the weights and building the primary distribution is
+    # O(track count) per call in the native module; cache the prebuilt
+    # sampler beside the probabilities it was built from (both are
+    # invalidated together when the length-bin weights change).
+    primary_sampler = prepared_tracks.get('walk_primary_sampler')
+    if (primary_sampler is None
+            and hasattr(native, 'prepare_walk_primary_sampler')):
+        primary_sampler = native.prepare_walk_primary_sampler(
+            probabilities_cpu)
+        prepared_tracks['walk_primary_sampler'] = primary_sampler
     seed = int(torch.randint(
         0, (1 << 63) - 1, (1,), dtype=torch.int64,
         device=device, generator=generator).item())
     minimum_hops = int(prepared_tracks['track_min_walks_per_track'])
     maximum_hops = int(prepared_tracks['track_max_walks_per_track'])
+    sampler_kwargs = (
+        {'primary_sampler': primary_sampler}
+        if primary_sampler is not None else {})
     result = native.sample_walks_adaptive(
         prepared_tracks['walk_index'], probabilities_cpu, seed=seed,
         groups=k, target_points=target_points,
@@ -3043,6 +3106,7 @@ def _draw_track_walk_sample(
         minimum_candidate_travel=float(
             prepared_tracks['track_walk_minimum_cycle_travel']),
         maximum_attempts=attempts,
+        **sampler_kwargs,
     )
     produced = int(result['produced'])
     if produced != k:
@@ -3057,12 +3121,19 @@ def _draw_track_walk_sample(
             f'{prepared_tracks["track_max_walk_steps_per_track"]}])')
 
     width = maximum_hops + 1
-    track_matrix = torch.from_numpy(
-        np.asarray(result['tracks'], dtype=np.int64)).to(device=device)
-    record_matrix = torch.from_numpy(
-        np.asarray(result['records'], dtype=np.int64)).to(device=device)
-    walk_hops = torch.from_numpy(
-        np.asarray(result['walk_hops'], dtype=np.int64)).to(device=device)
+    walk_hops_np = np.asarray(result['walk_hops'], dtype=np.int64)
+    if walk_hops_np.size and (
+            walk_hops_np.min() < minimum_hops
+            or walk_hops_np.max() > maximum_hops):
+        raise RuntimeError("variable track-walk row layout is incomplete")
+    track_matrix = geom_utils.pinned_to_device(
+        torch.from_numpy(np.asarray(result['tracks'], dtype=np.int64)),
+        device)
+    record_matrix = geom_utils.pinned_to_device(
+        torch.from_numpy(np.asarray(result['records'], dtype=np.int64)),
+        device)
+    walk_hops = geom_utils.pinned_to_device(
+        torch.from_numpy(walk_hops_np), device)
     edge_slots_matrix = torch.arange(
         maximum_hops, device=device, dtype=torch.int64)[None, :].expand(k, -1)
     edge_valid = edge_slots_matrix < walk_hops[:, None]
@@ -3100,18 +3171,6 @@ def _draw_track_walk_sample(
         torch.arange(int(row_starts[-1]), device=device)
         - row_starts[:-1][row_id])
     flat_idx = resampled['offsets'][track_idx][row_id] + local_idx
-    flat_idx_cpu = flat_idx.cpu()
-    sampled_cpu = resampled['flat_zyx_cpu'][flat_idx_cpu]
-    if device.type == 'cuda':
-        staging = prepared_tracks.get('staging')
-        if staging is None or staging.shape != sampled_cpu.shape:
-            staging = torch.empty(
-                sampled_cpu.shape, dtype=torch.float32, pin_memory=True)
-            prepared_tracks['staging'] = staging
-        staging.copy_(sampled_cpu)
-        sampled_scroll = staging.to(device=device, non_blocking=False)
-    else:
-        sampled_scroll = sampled_cpu.to(device=device)
 
     if target_points == 1:
         target_local = torch.zeros(
@@ -3121,14 +3180,16 @@ def _draw_track_walk_sample(
         target_local = torch.round(
             fractions[None, :] * (row_lengths[:, None] - 1)).to(torch.int64)
     target_flat_idx = row_starts[:-1, None] + target_local
-    target_source_idx = resampled['flat_source_local_cpu'][
-        flat_idx_cpu[target_flat_idx.reshape(-1).cpu()]].reshape(
-            len(track_idx), target_points).to(device=device)
+    sampled_scroll, target_source_idx = _gather_sampled_track_points(
+        prepared_tracks, resampled, flat_idx, target_flat_idx,
+        len(track_idx), target_points, device)
 
     source_rows = row_index[:, :-1][edge_valid]
     partner_rows = row_index[:, 1:][edge_valid]
-    if torch.any(source_rows < 0) or torch.any(partner_rows < 0):
-        raise RuntimeError("variable track-walk row layout is incomplete")
+    # Layout completeness is asserted on walk_hops_np above: with every
+    # group's hop count inside [minimum_hops, maximum_hops] the row_index
+    # assignments cover exactly the edge_valid slots, so a device-side
+    # (synchronising) -1 scan of source/partner rows is redundant.
     source_records = record_matrix[:, 0::2][edge_valid]
     partner_records = record_matrix[:, 1::2][edge_valid]
     record_samples = resampled['walk_record_sample']

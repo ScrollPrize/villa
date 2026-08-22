@@ -277,8 +277,15 @@ def get_winding_inference_losses(
     z_end,
     *,
     generator=None,
+    with_metrics=True,
 ):
-    """Sample both inference components and evaluate one shared transform."""
+    """Sample both inference components and evaluate one shared transform.
+
+    with_metrics=False skips the residual summary metrics. Each of their
+    ``.item()`` reads synchronises the CPU on all queued GPU work, so
+    callers that only log every N steps should request metrics on those
+    steps alone.
+    """
     relative_count = (int(cfg["sample_count_winding_model_relative_pairs"])
                       if cfg["loss_weight_dense_spacing"] > 0 else 0)
     density_count = (int(cfg["sample_count_winding_model_density_pairs"])
@@ -318,7 +325,8 @@ def get_winding_inference_losses(
         )
         valid_f = valid.to(per_pair.dtype)
         losses[name] = (per_pair * valid_f).sum() / valid_f.sum().clamp(min=1)
-        metrics.update(_metrics(name, residual, valid))
+        if with_metrics:
+            metrics.update(_metrics(name, residual, valid))
         if count:
             record_loss_samples(
                 name, component_spiral.mean(dim=1), residual.detach().abs(), valid)
