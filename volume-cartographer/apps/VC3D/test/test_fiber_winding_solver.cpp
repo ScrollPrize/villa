@@ -417,6 +417,27 @@ private slots:
             QCOMPARE(b.placements[f].windingLo, a.placements[f].windingLo);
             QCOMPARE(b.placements[f].windingHi, a.placements[f].windingHi);
         }
+
+        // And across the half-turn median boundary, where a rounding that is
+        // not translation-equivariant would slip a whole turn: a fiber whose
+        // median angle sits exactly at half a turn.
+        World boundary;
+        addH(boundary, 0.0, 1.0, 30000.0);
+        addV(boundary, 0.5, 27000.0, 33000.0);
+        World boundaryShifted = boundary;
+        for (double& theta : boundaryShifted.fibers[0].theta) {
+            theta += kTwoPi;
+        }
+        boundaryShifted.trueM[0] -= 1;
+        const SolveResult c =
+            solveWindings(boundary.fibers, boundary.links, SolverParams{});
+        const SolveResult d = solveWindings(boundaryShifted.fibers,
+                                            boundaryShifted.links, SolverParams{});
+        QCOMPARE(d.placements[0].turns, c.placements[0].turns - 1.0);
+        QCOMPARE(d.placements[1].turns, c.placements[1].turns);
+        for (std::size_t f = 0; f < boundary.fibers.size(); ++f) {
+            QCOMPARE(d.placements[f].windingLo, c.placements[f].windingLo);
+        }
     }
 
     // A crossing landing exactly on a V fiber's z apex (the reversed end of
@@ -476,6 +497,36 @@ private slots:
             QCOMPARE(result.placements[f].anchor, ComponentAnchor::Unresolved);
         }
         checkRelativeTurns(result, world, {chain[0], chain[1], chain[2], chain[3]});
+    }
+
+    // With no surviving crossing anywhere, nothing proves a winding: no
+    // component may claim Primary (the dock would say "crossings"), and
+    // nothing radius-anchors against an invented seed.
+    void noCrossingsMeansNoPrimary()
+    {
+        World world;
+        const std::size_t v = addV(world, 0.3, 27000.0, 33000.0);
+        std::vector<std::size_t> chain;
+        for (int i = 0; i < 3; ++i) {
+            chain.push_back(
+                addH(world, 0.05 + 0.5 * i, 0.55 + 0.5 * i, 42000.0));
+        }
+        for (int i = 0; i + 1 < 3; ++i) {
+            world.links.push_back(LinkInput{
+                chain[static_cast<std::size_t>(i)],
+                world.fibers[chain[static_cast<std::size_t>(i)]].theta.size() - 1,
+                chain[static_cast<std::size_t>(i + 1)], 0});
+        }
+        const SolveResult result =
+            solveWindings(world.fibers, world.links, SolverParams{});
+        for (const auto& placement : result.placements) {
+            QCOMPARE(placement.anchor, ComponentAnchor::Unresolved);
+        }
+        QCOMPARE(result.islandCount, 2);
+        QCOMPARE(result.unresolvedCount, 2);
+        // The linked chain still holds together internally.
+        checkRelativeTurns(result, world, {chain[0], chain[1], chain[2]});
+        Q_UNUSED(v);
     }
 
     // A link that never took part must not read as a perfect link.

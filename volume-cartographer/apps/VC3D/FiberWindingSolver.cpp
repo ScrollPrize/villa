@@ -192,6 +192,7 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
         // wraps.
         int turnVotes = 0;
         int covarianceVotes = 0;
+        bool haveTurnEvidence = false;
         for (const FiberTrace& fiber : fibers) {
             const std::size_t n = fiber.theta.size();
             if (n < 2 || fiber.radius.size() != n) {
@@ -224,6 +225,7 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
             }
             if (lagSum != 0.0) {
                 turnVotes += lagSum > 0.0 ? 1 : -1;
+                haveTurnEvidence = true;
                 continue;
             }
             double meanTheta = 0.0;
@@ -243,7 +245,10 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
                 covarianceVotes += covariance > 0.0 ? 1 : -1;
             }
         }
-        const int vote = turnVotes != 0 ? turnVotes : covarianceVotes;
+        // Covariance only decides when no fiber wrapped at all; a TIE among
+        // wrapping fibers resolves to the deterministic default rather than
+        // letting one short crumpled fiber flip the map.
+        const int vote = haveTurnEvidence ? turnVotes : covarianceVotes;
         chirality = vote < 0 ? -1 : 1;
     }
     result.chirality = chirality;
@@ -264,8 +269,11 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
             psi[f][i] = chirality * fibers[f].theta[i];
         }
         if (!psi[f].empty()) {
+            // floor(x + 0.5), not llround: rounding halves away from zero is
+            // not translation-equivariant, so a whole-turn input re-gauge
+            // could change the canonical gauge by two at a half-turn median.
             gauge[f] = static_cast<long long>(
-                std::llround(median(psi[f]) / kTwoPi));
+                std::floor(median(psi[f]) / kTwoPi + 0.5));
             for (double& value : psi[f]) {
                 value -= kTwoPi * static_cast<double>(gauge[f]);
             }
@@ -442,7 +450,6 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
         std::size_t end = index + 1;
         const Crossing& first = raw[order[index]];
         auto key = std::tie(first.hFiber, first.vFiber, first.n);
-        double lastZ = first.zVx;
         std::size_t best = index;
         while (end < order.size()) {
             const Crossing& next = raw[order[end]];
@@ -454,11 +461,10 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
             // branches of a U-shaped fiber can share z, n and kind at wildly
             // different radii).
             if (std::tie(next.hFiber, next.vFiber, next.n) != key ||
-                next.zVx - lastZ > params.zMergeVx ||
+                next.zVx - first.zVx > params.zMergeVx ||
                 std::abs(next.deltaR - first.deltaR) > params.tieBandVx) {
                 break;
             }
-            lastZ = next.zVx;
             if (next.confidence > raw[order[best]].confidence) {
                 best = end;
             }
@@ -675,7 +681,7 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
             rootsWithCrossings.insert(findRoot(constraint.from));
         }
     }
-    std::size_t primaryIndex = 0;
+    std::size_t primaryIndex = components.size();
     for (std::size_t c = 0; c < components.size(); ++c) {
         if (rootsWithCrossings.count(findRoot(components[c].front())) != 0) {
             primaryIndex = c;
@@ -878,8 +884,11 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
     };
 
     // --- Primary component: gauge fixed at innermost winding zero, slack
-    // spent on local ordering against its own members.
-    if (!components.empty()) {
+    // spent on local ordering against its own members. Without any surviving
+    // crossing there is no primary at all - nothing proves a winding - and
+    // every component runs the island path below with nothing anchored,
+    // which reports it unresolved rather than inventing an anchor.
+    if (primaryIndex < components.size()) {
         const std::vector<std::size_t>& primary = components[primaryIndex];
         for (const std::size_t f : primary) {
             active[f] = true;

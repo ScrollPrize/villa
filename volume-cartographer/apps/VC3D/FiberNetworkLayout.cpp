@@ -970,9 +970,24 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         GlobalPlacedFiber placed;
         placed.fiber = makePlacedFiber(*ordered[i], geo);
         // Geometry too degenerate to draw a single run (a one-point trace,
-        // say) is unplaceable, honestly, rather than a placed fiber the map
-        // never shows.
-        if (placed.fiber.runs.empty()) {
+        // say) or containing non-finite coordinates is unplaceable, honestly,
+        // rather than a placed fiber the map never shows. Note the fiber's
+        // trace has already informed the winding solve by this point; that is
+        // deliberate - the annotation geometry is real even when it cannot be
+        // drawn.
+        double fiberLoX = std::numeric_limits<double>::infinity();
+        double fiberHiX = -std::numeric_limits<double>::infinity();
+        double fiberLoY = std::numeric_limits<double>::infinity();
+        double fiberHiY = -std::numeric_limits<double>::infinity();
+        for (const QPointF& point : geo.samples) {
+            fiberLoX = std::min(fiberLoX, point.x());
+            fiberHiX = std::max(fiberHiX, point.x());
+            fiberLoY = std::min(fiberLoY, point.y());
+            fiberHiY = std::max(fiberHiY, point.y());
+        }
+        if (placed.fiber.runs.empty() || !std::isfinite(fiberLoX) ||
+            !std::isfinite(fiberHiX) || !std::isfinite(fiberLoY) ||
+            !std::isfinite(fiberHiY)) {
             result.unplaced.push_back(UnplacedFiber{ordered[i]->id,
                                                     ordered[i]->fileName,
                                                     ordered[i]->label,
@@ -981,12 +996,10 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
             continue;
         }
         drawable[i] = 1;
-        for (const QPointF& point : geo.samples) {
-            loX = std::min(loX, point.x());
-            hiX = std::max(hiX, point.x());
-            loY = std::min(loY, point.y());
-            hiY = std::max(hiY, point.y());
-        }
+        loX = std::min(loX, fiberLoX);
+        hiX = std::max(hiX, fiberHiX);
+        loY = std::min(loY, fiberLoY);
+        hiY = std::max(hiY, fiberHiY);
         placed.meta.linked = placement.linked;
         placed.meta.sheetDriftSuspect = placement.sheetDriftSuspect;
         placed.meta.windingLo = placement.windingLo;
@@ -1009,6 +1022,14 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         geometry.push_back(std::move(geo));
     }
     if (!(loX <= hiX) || !(loY <= hiY)) {
+        // Nothing drew at all; the accounting still owes the caller every
+        // fiber it was about to place.
+        for (const GlobalPlacedFiber& placed : result.fibers) {
+            result.unplaced.push_back(UnplacedFiber{placed.fiber.id,
+                                                    placed.fiber.fileName,
+                                                    placed.fiber.label,
+                                                    placed.fiber.hvTag});
+        }
         result.fibers.clear();
         sortUnplaced();
         return result;

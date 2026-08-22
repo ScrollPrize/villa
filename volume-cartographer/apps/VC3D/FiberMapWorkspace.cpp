@@ -931,9 +931,11 @@ void FiberMapWorkspace::rebuildLayout()
         status += tr(" · %1 dropped crossings").arg(_layout.droppedCrossingCount);
     }
     if (_layout.gatedSegmentCount > 0 || _layout.tangentialCount > 0) {
-        // Geometry the solver refused to learn from; a map can be
-        // underconstrained for reasons the drawn fibers cannot show.
-        status += tr(" · %1 segments unusable")
+        // Gate-hit tallies, not a geometry proportion (one segment can be
+        // counted once per branch and translate it was tried against): a
+        // nonzero value says the map may be underconstrained for reasons the
+        // drawn fibers cannot show.
+        status += tr(" · %1 solver gate hits")
                       .arg(_layout.gatedSegmentCount + _layout.tangentialCount);
     }
     if (!_voxelSizeUm) {
