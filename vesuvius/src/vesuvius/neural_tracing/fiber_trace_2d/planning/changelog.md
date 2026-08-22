@@ -1,9 +1,12 @@
 # 2026-08-22: geometrically weighted fiberlet substep costs
 
-- Added replay-only `--cost-profile-weight` in `[0,1]` to blend each
-  fiberlet's decoded average density with its decoded subsegment densities
-  before geometric weighting. The default remains 1 and cache identity is
-  unchanged.
+- Restored stored whole-fiberlet and join scoring as the default replay cost
+  evaluator. The slower subsegment/grid evaluator is available explicitly as
+  `--cost-mode stepped`; its profile-weight default remains 1. Aggregate mode
+  does not load cost profiles, and cache identity is unchanged.
+- Added replay-only stepped-mode `--cost-profile-weight` in `[0,1]` to blend
+  each fiberlet's decoded average density with its decoded subsegment densities
+  before geometric weighting.
 - On the full Paris4 radius-768 hot-cache corridor, delayed `W=0.99` falloff
   produced 5/5/3/2/2 failures at profile weights 0/0.25/0.5/0.75/1. With
   `W=1`, profile weight zero exactly reproduced the two aggregate-baseline

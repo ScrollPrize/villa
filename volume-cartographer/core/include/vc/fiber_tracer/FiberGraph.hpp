@@ -55,11 +55,17 @@ struct FiberletGraph {
     std::vector<FiberletGraphTransition> transitions;
 };
 
+enum class FiberletGraphReplayCostMode {
+    Fiberlet,
+    Stepped,
+};
+
 struct FiberletGraphReplayConfig {
     size_t beamWidth = 16;
     size_t expansionThreads = 1;
     double beamStepDistanceBaseVoxels = 48.0;
     double lookaheadDistanceBaseVoxels = 384.0;
+    FiberletGraphReplayCostMode costMode = FiberletGraphReplayCostMode::Fiberlet;
     double geometricCostWeightPerBaseVoxel = 1.0;
     double geometricCostDelayBaseVoxels = 0.0;
     double costIntegrationStepBaseVoxels = 16.0;

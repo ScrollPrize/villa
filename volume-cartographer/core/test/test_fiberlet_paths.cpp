@@ -1311,6 +1311,8 @@ TEST_CASE("fiberlet graph replay lookahead avoids the greedy dead-end cost")
     }));
     const auto json = vc::fiber_tracer::fiberletGraphReplayJson(replay, config);
     CHECK(json.at("config").at("lookahead_mode") == "exact_cost_bounded");
+    CHECK(json.at("config").at("cost_mode") == "fiberlet");
+    CHECK_FALSE(json.at("config").contains("cost_profile_weight"));
     CHECK(json.at("config").at("search_width") == 0);
 }
 
@@ -1433,6 +1435,7 @@ TEST_CASE("rolling fiberlet beam clips selected output inside a full search edge
     CHECK(route.pathLengthPredictionVoxels == doctest::Approx(2.0));
     CHECK(route.completePathLengthPredictionVoxels == doctest::Approx(8.0));
     CHECK(route.edgeCost.total() == doctest::Approx(2.0));
+    CHECK(route.totalLoss == doctest::Approx(2.0));
     CHECK(route.committedPathLengthPredictionVoxels == doctest::Approx(8.0));
 }
 
@@ -1459,9 +1462,7 @@ TEST_CASE("exact fiberlet lookahead does not charge a join at its boundary")
     CHECK(route.completePathLengthPredictionVoxels == doctest::Approx(2.0));
     CHECK(route.edgeCost.total() == doctest::Approx(2.0));
     CHECK(route.transitionCost.total() == doctest::Approx(0.0));
-    const double storedDensity = vc::fiber_tracer::decodeFiberletStoredCostDensity(
-        vc::fiber_tracer::encodeFiberletStoredCostDensity(1.0F));
-    CHECK(route.totalLoss == doctest::Approx(2.0 * storedDensity));
+    CHECK(route.totalLoss == doctest::Approx(2.0));
     CHECK(route.weightedEdgeLoss == doctest::Approx(route.totalLoss));
     CHECK(route.weightedTransitionLoss == doctest::Approx(0.0));
 }
@@ -1478,11 +1479,12 @@ TEST_CASE("geometric fiberlet cost weighting favors distant loss over near loss"
     vc::fiber_tracer::FiberletGraphReplayConfig config;
     config.beamStepDistanceBaseVoxels = 2.0;
     config.lookaheadDistanceBaseVoxels = 2.0;
-    config.costIntegrationStepBaseVoxels = 1.0;
     config.errorThresholdBaseVoxels = 100.0;
     config.referenceEndArcBase = 2.0;
     config.initialSeedKey = {{0, 0, 0}, 0};
     config.recordDecisionDiagnostics = true;
+    CHECK(config.costMode == vc::fiber_tracer::FiberletGraphReplayCostMode::Fiberlet);
+    CHECK(config.costProfileWeight == doctest::Approx(1.0));
 
     const auto unweighted = vc::fiber_tracer::traceFiberletGraphReplay(
         graph, {{0, 0, 0}, {2, 0, 0}}, replayYNormals(), 1.0, config);
@@ -1490,6 +1492,8 @@ TEST_CASE("geometric fiberlet cost weighting favors distant loss over near loss"
     REQUIRE_FALSE(unweighted.segments.front().candidateIndices.empty());
     CHECK(unweighted.segments.front().candidateIndices.front() == 1);
 
+    config.costMode = vc::fiber_tracer::FiberletGraphReplayCostMode::Stepped;
+    config.costIntegrationStepBaseVoxels = 1.0;
     config.geometricCostWeightPerBaseVoxel = 0.5;
     const auto weighted = vc::fiber_tracer::traceFiberletGraphReplay(
         graph, {{0, 0, 0}, {2, 0, 0}}, replayYNormals(), 1.0, config);
@@ -1526,6 +1530,66 @@ TEST_CASE("geometric fiberlet cost weighting favors distant loss over near loss"
     CHECK(delayed.segments.front().candidateIndices.front() == 1);
 }
 
+TEST_CASE("aggregate replay does not request cost profiles")
+{
+    auto report = graphPathReport();
+    addGraphPath(report, 0, 1, {{0, 0, 0}, {1, 0, 0}}, 1.0F);
+    addGraphPath(report, 1, 2, {{1, 0, 0}, {2, 0, 0}}, 1.0F);
+    auto graph = vc::fiber_tracer::buildFiberletGraph(report);
+    for (auto& edge : graph.edges) {
+        edge.segmentLengthsPredictionVoxels.clear();
+        edge.segmentCostDensities.clear();
+    }
+
+    for (const size_t searchWidth : {size_t{0}, size_t{1}}) {
+        vc::fiber_tracer::FiberletGraphReplayConfig config;
+        config.beamWidth = 1;
+        config.searchWidth = searchWidth;
+        config.beamStepDistanceBaseVoxels = 1.0;
+        config.lookaheadDistanceBaseVoxels = 2.0;
+        config.errorThresholdBaseVoxels = 100.0;
+        config.referenceEndArcBase = 2.0;
+        CHECK_NOTHROW(vc::fiber_tracer::traceFiberletGraphReplay(
+            graph, {{0, 0, 0}, {2, 0, 0}}, replayYNormals(), 1.0, config));
+
+        config.costMode = vc::fiber_tracer::FiberletGraphReplayCostMode::Stepped;
+        CHECK_THROWS_AS(
+            vc::fiber_tracer::traceFiberletGraphReplay(
+                graph, {{0, 0, 0}, {2, 0, 0}}, replayYNormals(), 1.0, config),
+            std::invalid_argument);
+    }
+}
+
+TEST_CASE("aggregate replay fully charges the join entering a partial horizon edge")
+{
+    auto report = graphPathReport();
+    addGraphPath(report, 0, 1, {{0, 0, 0}, {1, 0, 0}}, 1.0F);
+    addGraphPath(report, 1, 2, {{1, 0, 0}, {3, 0, 0}}, 4.0F);
+    auto graph = vc::fiber_tracer::buildFiberletGraph(report);
+    REQUIRE_FALSE(graph.transitions.empty());
+    for (auto& transition : graph.transitions)
+        transition.cost.alignment = 6.0F;
+
+    vc::fiber_tracer::FiberletGraphReplayConfig config;
+    config.beamWidth = 1;
+    config.beamStepDistanceBaseVoxels = 1.0;
+    config.lookaheadDistanceBaseVoxels = 2.0;
+    config.errorThresholdBaseVoxels = 100.0;
+    config.referenceEndArcBase = 2.0;
+    config.initialSeedKey = {{0, 0, 0}, 0};
+    config.recordDecisionDiagnostics = true;
+    const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(
+        graph, {{0, 0, 0}, {3, 0, 0}}, replayYNormals(), 1.0, config);
+
+    REQUIRE(replay.segments.size() == 1);
+    REQUIRE_FALSE(replay.segments.front().decisions.empty());
+    REQUIRE(replay.segments.front().decisions.front().routes.size() == 1);
+    const auto& route = replay.segments.front().decisions.front().routes.front();
+    CHECK(route.edgeCost.total() == doctest::Approx(3.0));
+    CHECK(route.transitionCost.total() == doctest::Approx(6.0));
+    CHECK(route.totalLoss == doctest::Approx(9.0));
+}
+
 TEST_CASE("weight-one replay uses decoded segment costs without aggregate correction")
 {
     auto report = graphPathReport();
@@ -1539,6 +1603,7 @@ TEST_CASE("weight-one replay uses decoded segment costs without aggregate correc
     const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
 
     vc::fiber_tracer::FiberletGraphReplayConfig config;
+    config.costMode = vc::fiber_tracer::FiberletGraphReplayCostMode::Stepped;
     config.beamStepDistanceBaseVoxels = 2.0;
     config.lookaheadDistanceBaseVoxels = 2.0;
     config.errorThresholdBaseVoxels = 100.0;
@@ -1568,6 +1633,9 @@ TEST_CASE("weight-one replay uses decoded segment costs without aggregate correc
                   doctest::Approx(expectedDecodedProfileCost).epsilon(1.0e-12));
             CHECK(route.totalLoss ==
                   doctest::Approx(expectedDecodedProfileCost).epsilon(1.0e-12));
+            const auto json = vc::fiber_tracer::fiberletGraphReplayJson(replay, config);
+            CHECK(json.at("config").at("cost_mode") == "stepped");
+            CHECK(json.at("config").contains("cost_profile_weight"));
             if (!selectedCandidates.has_value())
                 selectedCandidates = replay.segments.front().candidateIndices;
             else
@@ -1588,6 +1656,7 @@ TEST_CASE("fiberlet profile weight linearly blends a partial edge")
     const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
 
     vc::fiber_tracer::FiberletGraphReplayConfig config;
+    config.costMode = vc::fiber_tracer::FiberletGraphReplayCostMode::Stepped;
     config.beamStepDistanceBaseVoxels = 1.0;
     config.lookaheadDistanceBaseVoxels = 1.0;
     config.costIntegrationStepBaseVoxels = 1.0;
@@ -1720,6 +1789,7 @@ TEST_CASE("geometric fiberlet cost delay splits a non-grid integration cell")
     const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
 
     vc::fiber_tracer::FiberletGraphReplayConfig config;
+    config.costMode = vc::fiber_tracer::FiberletGraphReplayCostMode::Stepped;
     config.beamStepDistanceBaseVoxels = 4.0;
     config.lookaheadDistanceBaseVoxels = 4.0;
     config.geometricCostWeightPerBaseVoxel = 0.5;
@@ -1769,6 +1839,10 @@ TEST_CASE("exact fiberlet lookahead rejects invalid active costs")
     graph.transitions.front().cost.alignment = std::numeric_limits<float>::infinity();
     CHECK_THROWS_AS(vc::fiber_tracer::traceFiberletGraphReplay(graph, {{0, 0, 0}, {2, 0, 0}}, replayYNormals(), 1.0, config), std::invalid_argument);
     graph.transitions.front().cost.alignment = 0.0F;
+    config.geometricCostWeightPerBaseVoxel = 0.5;
+    CHECK_THROWS_AS(vc::fiber_tracer::traceFiberletGraphReplay(graph, {{0, 0, 0}, {2, 0, 0}}, replayYNormals(), 1.0, config), std::invalid_argument);
+    config.geometricCostWeightPerBaseVoxel = 1.0;
+    config.costMode = vc::fiber_tracer::FiberletGraphReplayCostMode::Stepped;
     config.geometricCostDelayBaseVoxels = -1.0;
     CHECK_THROWS_AS(vc::fiber_tracer::traceFiberletGraphReplay(graph, {{0, 0, 0}, {2, 0, 0}}, replayYNormals(), 1.0, config), std::invalid_argument);
     config.geometricCostDelayBaseVoxels = 0.0;
@@ -2314,10 +2388,8 @@ TEST_CASE("fiberlet graph replay can force the original focused seed")
     CHECK(selected.committedEdgeCost.alignment == doctest::Approx(1.0));
     CHECK(selected.committedTransitionCost.total() == doctest::Approx(0.0));
     CHECK(selected.committedPathLengthPredictionVoxels == doctest::Approx(1.0));
-    const double storedDensity = vc::fiber_tracer::decodeFiberletStoredCostDensity(
-        vc::fiber_tracer::encodeFiberletStoredCostDensity(1.0F));
-    CHECK(selected.totalLoss == doctest::Approx(storedDensity));
-    CHECK(selected.lossPerPredictionVoxel == doctest::Approx(storedDensity));
+    CHECK(selected.totalLoss == doctest::Approx(1.0));
+    CHECK(selected.lossPerPredictionVoxel == doctest::Approx(1.0));
     CHECK(selected.routePointsBaseXYZ.size() == 2);
     REQUIRE(replay.segments.front().committedSteps.size() == 1);
     const auto& committed = replay.segments.front().committedSteps.front();

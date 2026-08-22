@@ -1,14 +1,12 @@
-# Status: diagnose persistent wide-radius fiberlet replay failures
+# Status: restore aggregate fiberlet replay as the default
 
-- [x] Capture the user request in `task.md`.
-- [x] Create the detailed experiment and analysis plan.
-- [x] Independently review the plan against task, plan, and specification.
-- [x] Run radius 64, reject it as a correctness reference, and use radius 32
-  only as a constrained reference-following comparison.
-- [x] Run or recover the matched radius-768 diagnostic replay.
-- [x] Add focused common-start replay and analyze both persistent decisions.
-- [x] Assess reusable offline tuning collections and their limitations.
-- [x] Update documentation and task log with commands and measured results.
-- [x] Run relevant validation and review the final diff.
-- [x] Record same-graph threshold-constrained search and bounded rejoin
-  evaluation as deferred options; do not claim the radius-32 route is causal.
+- [x] Correct the task after distinguishing averaged profiles from aggregate
+  fiberlet scoring.
+- [x] Write the revised implementation and validation plan.
+- [x] Review the revised plan independently against task and specifications.
+- [x] Add explicit aggregate and stepped evaluator modes.
+- [x] Make aggregate fiberlet scoring the API and CLI default.
+- [x] Add behavioral and no-profile-read regression coverage.
+- [x] Update specification, documentation, and changelog.
+- [x] Build and run focused tests with `-j32`.
+- [x] Review the final diff and record validation.

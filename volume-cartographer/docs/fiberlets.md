@@ -524,10 +524,6 @@ volume-cartographer/build/bin/vc_fiberlets fiberlet-replay \
   --beam 16 \
   --beam-step-distance 48 \
   --lookahead-distance 384 \
-  --cost-weight 0.99 \
-  --cost-delay 192 \
-  --cost-step 16 \
-  --cost-profile-weight 0.75 \
   --length 4096
 ```
 
@@ -541,6 +537,15 @@ upper policy limit. A positive `K` opts into approximate intermediate
 pruning, must be at least the final beam width, and uses `--prune-distance P`.
 The prune distance is ignored in exact mode.
 
+`--cost-mode fiberlet` is the default. It uses the stored whole-fiberlet and
+join costs directly from the segment seed through the common lookahead horizon.
+Only the horizon-crossing fiberlet is prorated by length; an entering join is
+charged in full. This mode does not load route cost profiles or walk the
+integration grid. `--cost-mode stepped` explicitly enables the experimental
+subsegment integration described below. The stepped-only `--cost-weight`,
+`--cost-delay`, `--cost-step`, and `--cost-profile-weight` options are rejected
+unless that mode is selected.
+
 Every successful fiberlet stores one total-cost density per emitted route
 segment next to its route lattice. Density is selected DP segment cost divided
 by prediction-voxel segment length. It uses the fixed nonlinear `uint16`
@@ -551,7 +556,7 @@ rescaled to make their sum equal the separately stored whole-edge cost.
 Geometry and cost profiles have independent route-payload offsets. Prefixes
 retain the five-component whole-edge cost used by committed-route diagnostics.
 
-`--cost-profile-weight A` linearly blends the density used by replay before
+In stepped mode, `--cost-profile-weight A` linearly blends the density used by replay before
 geometric weighting:
 
 ```text
@@ -566,10 +571,11 @@ normalized to, the separately stored whole-edge cost. Consequently, every
 complete unweighted fiberlet retains the same decoded total at all blend
 values, apart from floating-point accumulation. Blend zero makes density
 constant within each fiberlet while preserving geometric weighting across the
-fiberlet. Blend one preserves the full stored subsegment profile. The option is
-replay-only and does not affect anchor or fiberlet cache identity.
+fiberlet. Blend one preserves the full stored subsegment profile and is the
+stepped-mode default.
+The option is replay-only and does not affect anchor or fiberlet cache identity.
 
-Lookahead ranking adds the authoritative unweighted route cost from the segment
+Stepped lookahead ranking adds the authoritative unweighted route cost from the segment
 seed through the current checkpoint to the decoded-profile cost from the
 checkpoint through the common horizon. `--cost-weight W` is the geometric
 weight per base voxel and

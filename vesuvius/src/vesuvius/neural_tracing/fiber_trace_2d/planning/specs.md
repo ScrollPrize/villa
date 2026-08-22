@@ -3127,7 +3127,14 @@
   repair or compatibility reader. Forward/reverse arcs reverse geometry
   lengths and density samples together. Anchor cache identity is unchanged;
   the route-cost schema is part of fiberlet cache identity.
-- Replay integrates fiberlet cost profiles on one regular distance grid rooted
+- Replay defaults to aggregate `fiberlet` cost mode. It ranks from the segment
+  seed through the common horizon with the stored whole-edge and join costs,
+  prorating only the horizon-crossing edge by length. The checkpoint is a
+  commitment boundary, not a scoring boundary; an entering join is charged in
+  full whenever any of its following edge lies before the horizon. Aggregate
+  mode does not request route cost profiles. Its exact relaxed cost-to-go and
+  intermediate-pruned search use the same aggregate objective.
+- Explicit `stepped` cost mode integrates fiberlet cost profiles on one regular distance grid rooted
   at the current checkpoint. Its finite positive integration spacing is in
   base voxels. Arbitrary edge/grid/horizon boundaries linearly interpolate the
   piecewise-linear cumulative cost implied by piecewise-constant segment
@@ -3138,7 +3145,7 @@
   `sum(decoded_density * segment_length) / fiberlet_length`; it is not derived
   from or normalized to the separately stored whole-edge cost. `A=0` is a
   constant density within each fiberlet, `A=1` is the stored profile, and the
-  default is 1. The blend is replay-only and does not participate in anchor or
+  stepped-mode default is 1. The blend is replay-only and does not participate in anchor or
   fiberlet cache identity. Each interval cost is multiplied by `W^s`, where `0 < W <= 1`
   is the configured per-base-voxel weight and `s` is the interval midpoint's
   base distance from the checkpoint after the configured finite nonnegative
@@ -3149,6 +3156,10 @@
   it is included with weight one, and a join exactly at the horizon is
   excluded. Weighted ranking remains a scalar separate from unweighted
   five-component committed diagnostics.
+- Stepped-only weight, delay, integration-step, and profile-blend options are
+  rejected unless stepped mode is selected. Replay artifacts always store
+  `cost_mode`; aggregate artifacts omit inactive stepped fields. Cost mode and
+  stepped replay controls do not participate in cache identity.
 - Exact search seeds one cost-ordered frontier from every retained live route
   and maintains one global set of the best configured-beam-width completions at
   `C+H`. Completion

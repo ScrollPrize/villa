@@ -31,6 +31,17 @@ constexpr float kFloatEpsilon = 1.0e-6F;
 constexpr double kReplayEpsilon = 1.0e-12;
 constexpr double kPi = 3.141592653589793238462643383279502884;
 
+const char* replayCostModeName(FiberletGraphReplayCostMode mode)
+{
+    switch (mode) {
+    case FiberletGraphReplayCostMode::Fiberlet:
+        return "fiberlet";
+    case FiberletGraphReplayCostMode::Stepped:
+        return "stepped";
+    }
+    throw std::invalid_argument("fiberlet replay cost mode is invalid");
+}
+
 float length(const cv::Vec3f& value)
 {
     return std::sqrt(value.dot(value));
@@ -737,6 +748,7 @@ ExactPersistentRouteScore scorePersistentRouteUnweightedAtHorizon(
 }
 
 struct GeometricReplayCostConfig {
+    FiberletGraphReplayCostMode mode = FiberletGraphReplayCostMode::Fiberlet;
     double predictionToBaseScale = 1.0;
     double weightPerBaseVoxel = 1.0;
     double delayPredictionVoxels = 0.0;
@@ -990,13 +1002,21 @@ void addEdgeToDecisionScore(
     const double forwardEnd =
         std::min(edgeEndPredictionVoxels, horizonPredictionVoxels);
     if (forwardEnd > forwardBegin + kReplayEpsilon) {
-        score.forwardEdgeLoss += profiles.integrate(
-            edge,
-            forwardBegin - edgeBeginPredictionVoxels,
-            forwardEnd - edgeBeginPredictionVoxels,
-            edgeBeginPredictionVoxels - checkpointPredictionVoxels,
-            horizonPredictionVoxels - checkpointPredictionVoxels,
-            config);
+        if (config.mode == FiberletGraphReplayCostMode::Fiberlet) {
+            score.forwardEdgeLoss += edge.cost.total() * std::clamp(
+                (forwardEnd - forwardBegin) /
+                    edge.pathLengthPredictionVoxels,
+                0.0,
+                1.0);
+        } else {
+            score.forwardEdgeLoss += profiles.integrate(
+                edge,
+                forwardBegin - edgeBeginPredictionVoxels,
+                forwardEnd - edgeBeginPredictionVoxels,
+                edgeBeginPredictionVoxels - checkpointPredictionVoxels,
+                horizonPredictionVoxels - checkpointPredictionVoxels,
+                config);
+        }
     }
 
     if (enteringTransition.has_value() &&
@@ -1007,10 +1027,13 @@ void addEdgeToDecisionScore(
         if (edgeBeginPredictionVoxels < checkpointPredictionVoxels - kReplayEpsilon) {
             score.prefixTransitionLoss += enteringTransition->cost.total();
         } else {
-            score.forwardTransitionLoss += enteringTransition->cost.total() *
-                geometricCostWeight(
-                    config,
-                    edgeBeginPredictionVoxels - checkpointPredictionVoxels);
+            const double weight =
+                config.mode == FiberletGraphReplayCostMode::Fiberlet
+                ? 1.0
+                : geometricCostWeight(
+                      config,
+                      edgeBeginPredictionVoxels - checkpointPredictionVoxels);
+            score.forwardTransitionLoss += enteringTransition->cost.total() * weight;
         }
     }
     score.scoredEndPredictionVoxels = std::min(
@@ -1033,16 +1056,7 @@ DecisionPersistentRouteScore scorePersistentRouteForDecision(
         !std::isfinite(horizonPredictionVoxels) ||
         route.pathLength < checkpointPredictionVoxels - kReplayEpsilon ||
         !(config.predictionToBaseScale > 0.0) ||
-        !std::isfinite(config.predictionToBaseScale) ||
-        !(config.weightPerBaseVoxel > 0.0) ||
-        config.weightPerBaseVoxel > 1.0 ||
-        !std::isfinite(config.weightPerBaseVoxel) ||
-        !(config.delayPredictionVoxels >= 0.0) ||
-        !std::isfinite(config.delayPredictionVoxels) ||
-        !(config.integrationStepPredictionVoxels > 0.0) ||
-        !std::isfinite(config.integrationStepPredictionVoxels) ||
-        !(config.profileWeight >= 0.0) || config.profileWeight > 1.0 ||
-        !std::isfinite(config.profileWeight)) {
+        !std::isfinite(config.predictionToBaseScale)) {
         throw std::invalid_argument("persistent weighted route interval is invalid");
     }
     std::vector<const PersistentRouteHistory*> suffix;
@@ -1394,15 +1408,28 @@ private:
             const double includedLength = std::min(
                 targetDistance,
                 static_cast<double>(outgoing.pathLengthPredictionVoxels));
-            double candidate = transition->cost.total() *
-                geometricCostWeight(config_, relativeStart);
-            candidate += profiles_.integrate(
-                outgoing,
-                0.0,
-                includedLength,
-                relativeStart,
-                horizonFromCheckpointPredictionVoxels_,
-                config_);
+            double candidate = 0.0;
+            if (config_.mode == FiberletGraphReplayCostMode::Fiberlet) {
+                candidate = transition->cost.total();
+                validateReplayCost(
+                    outgoing.cost,
+                    "persistent beam edge cost must be finite and nonnegative");
+                candidate += outgoing.cost.total() *
+                    std::clamp(
+                        includedLength / outgoing.pathLengthPredictionVoxels,
+                        0.0,
+                        1.0);
+            } else {
+                candidate = transition->cost.total() *
+                    geometricCostWeight(config_, relativeStart);
+                candidate += profiles_.integrate(
+                    outgoing,
+                    0.0,
+                    includedLength,
+                    relativeStart,
+                    horizonFromCheckpointPredictionVoxels_,
+                    config_);
+            }
             if (outgoing.pathLengthPredictionVoxels <
                 targetDistance - kReplayEpsilon) {
                 const size_t continuationBins = std::min(
@@ -2514,6 +2541,21 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
     const FiberletGraphReplayProgressCallback& progressCallback)
 {
     const double predictionToBaseScale = graph.predictionToBaseScale();
+    const bool validCostMode =
+        config.costMode == FiberletGraphReplayCostMode::Fiberlet ||
+        config.costMode == FiberletGraphReplayCostMode::Stepped;
+    const bool inactiveSteppedSettingsChanged =
+        config.costMode == FiberletGraphReplayCostMode::Fiberlet &&
+        (config.geometricCostWeightPerBaseVoxel != 1.0 ||
+         config.geometricCostDelayBaseVoxels != 0.0 ||
+         config.costIntegrationStepBaseVoxels != 16.0 ||
+         config.costProfileWeight != 1.0);
+    if (!validCostMode)
+        throw std::invalid_argument("fiberlet graph replay cost mode is invalid");
+    if (inactiveSteppedSettingsChanged) {
+        throw std::invalid_argument(
+            "stepped replay cost settings require stepped cost mode");
+    }
     if (!(predictionToBaseScale > 0.0) || !std::isfinite(predictionToBaseScale) || config.beamWidth < 1 ||
         config.expansionThreads < 1 || config.maximumGeneratedStatesPerIteration == 0 || !(config.beamStepDistanceBaseVoxels > 0.0) ||
         !std::isfinite(config.beamStepDistanceBaseVoxels) || !(config.lookaheadDistanceBaseVoxels > 0.0) ||
@@ -2699,6 +2741,7 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
         const double lookaheadPredictionVoxels = config.lookaheadDistanceBaseVoxels / predictionToBaseScale;
         const double pruneDistancePredictionVoxels = config.pruneDistanceBaseVoxels / predictionToBaseScale;
         const GeometricReplayCostConfig geometricCost{
+            config.costMode,
             predictionToBaseScale,
             config.geometricCostWeightPerBaseVoxel,
             config.geometricCostDelayBaseVoxels / predictionToBaseScale,
@@ -3205,6 +3248,38 @@ nlohmann::json fiberletGraphReplayJson(const FiberletGraphReplayResult& replay, 
     nlohmann::json diagnosticWindows = nlohmann::json::array();
     for (const auto& [begin, end] : config.decisionDiagnosticReferenceArcWindowsBase)
         diagnosticWindows.push_back(nlohmann::json::array({begin, end}));
+    nlohmann::json configJson = {
+        {"beam_width", config.beamWidth},
+        {"expansion_threads", config.expansionThreads},
+        {"lookahead_mode", config.searchWidth == 0 ? "exact_cost_bounded" : "intermediate_pruned"},
+        {"search_width", config.searchWidth},
+        {"prune_distance_base_voxels", config.pruneDistanceBaseVoxels},
+        {"prune_distance_prediction_voxels", config.pruneDistanceBaseVoxels / replay.predictionToBaseScale},
+        {"beam_step_distance_base_voxels", config.beamStepDistanceBaseVoxels},
+        {"beam_step_distance_prediction_voxels", config.beamStepDistanceBaseVoxels / replay.predictionToBaseScale},
+        {"lookahead_distance_base_voxels", config.lookaheadDistanceBaseVoxels},
+        {"lookahead_distance_prediction_voxels", config.lookaheadDistanceBaseVoxels / replay.predictionToBaseScale},
+        {"cost_mode", replayCostModeName(config.costMode)},
+        {"maximum_generated_states_per_iteration", config.maximumGeneratedStatesPerIteration},
+        {"threshold", fiberReplayThresholdDescriptorJson(config.errorThresholdBaseVoxels)},
+        {"match_refine_steps", config.matchRefineSteps},
+        {"minimum_reset_advance_base_voxels", config.minimumResetAdvanceBaseVoxels},
+        {"reference_begin_arc_base", config.referenceBeginArcBase},
+        {"reference_end_arc_base", replay.referenceEndArcBase},
+        {"initial_seed_key", config.initialSeedKey.has_value() ? storageKeyJson(*config.initialSeedKey) : nlohmann::json(nullptr)},
+        {"record_decision_diagnostics", config.recordDecisionDiagnostics},
+        {"decision_diagnostic_reference_arc_windows_base", std::move(diagnosticWindows)},
+    };
+    if (config.costMode == FiberletGraphReplayCostMode::Stepped) {
+        configJson.update({
+            {"geometric_cost_weight_per_base_voxel", config.geometricCostWeightPerBaseVoxel},
+            {"geometric_cost_delay_base_voxels", config.geometricCostDelayBaseVoxels},
+            {"geometric_cost_delay_prediction_voxels", config.geometricCostDelayBaseVoxels / replay.predictionToBaseScale},
+            {"cost_integration_step_base_voxels", config.costIntegrationStepBaseVoxels},
+            {"cost_integration_step_prediction_voxels", config.costIntegrationStepBaseVoxels / replay.predictionToBaseScale},
+            {"cost_profile_weight", config.costProfileWeight},
+        });
+    }
     nlohmann::json root = {
         {"format", "vc_fiberlet_graph_replay"},
         {"version", 3},
@@ -3214,34 +3289,7 @@ nlohmann::json fiberletGraphReplayJson(const FiberletGraphReplayResult& replay, 
              {"position_space", "base_volume"},
              {"distance_unit", "base_voxels"},
          }},
-        {"config",
-         {
-             {"beam_width", config.beamWidth},
-             {"expansion_threads", config.expansionThreads},
-             {"lookahead_mode", config.searchWidth == 0 ? "exact_cost_bounded" : "intermediate_pruned"},
-             {"search_width", config.searchWidth},
-             {"prune_distance_base_voxels", config.pruneDistanceBaseVoxels},
-             {"prune_distance_prediction_voxels", config.pruneDistanceBaseVoxels / replay.predictionToBaseScale},
-             {"beam_step_distance_base_voxels", config.beamStepDistanceBaseVoxels},
-             {"beam_step_distance_prediction_voxels", config.beamStepDistanceBaseVoxels / replay.predictionToBaseScale},
-             {"lookahead_distance_base_voxels", config.lookaheadDistanceBaseVoxels},
-             {"lookahead_distance_prediction_voxels", config.lookaheadDistanceBaseVoxels / replay.predictionToBaseScale},
-             {"geometric_cost_weight_per_base_voxel", config.geometricCostWeightPerBaseVoxel},
-             {"geometric_cost_delay_base_voxels", config.geometricCostDelayBaseVoxels},
-             {"geometric_cost_delay_prediction_voxels", config.geometricCostDelayBaseVoxels / replay.predictionToBaseScale},
-             {"cost_integration_step_base_voxels", config.costIntegrationStepBaseVoxels},
-             {"cost_integration_step_prediction_voxels", config.costIntegrationStepBaseVoxels / replay.predictionToBaseScale},
-             {"cost_profile_weight", config.costProfileWeight},
-             {"maximum_generated_states_per_iteration", config.maximumGeneratedStatesPerIteration},
-             {"threshold", fiberReplayThresholdDescriptorJson(config.errorThresholdBaseVoxels)},
-             {"match_refine_steps", config.matchRefineSteps},
-             {"minimum_reset_advance_base_voxels", config.minimumResetAdvanceBaseVoxels},
-             {"reference_begin_arc_base", config.referenceBeginArcBase},
-             {"reference_end_arc_base", replay.referenceEndArcBase},
-             {"initial_seed_key", config.initialSeedKey.has_value() ? storageKeyJson(*config.initialSeedKey) : nlohmann::json(nullptr)},
-             {"record_decision_diagnostics", config.recordDecisionDiagnostics},
-             {"decision_diagnostic_reference_arc_windows_base", std::move(diagnosticWindows)},
-         }},
+        {"config", std::move(configJson)},
         {"reference_begin_arc_base", replay.referenceBeginArcBase},
         {"reference_end_arc_base", replay.referenceEndArcBase},
         {"completed_reference_arc_base", replay.completedReferenceArcBase},

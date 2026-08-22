@@ -104,6 +104,7 @@ struct CliOptions {
     double matchRefineSteps = 1.0;
     vc::fiber_tracer::FiberTraceConfig trace;
     vc::fiber_tracer::FiberletGraphReplayConfig graphReplay;
+    bool steppedReplayCostOptionSpecified = false;
     int storageChunkSideBaseVoxels = 512;
     std::optional<std::string> quantizationScenario;
     std::filesystem::path anchorCacheRoot;
@@ -191,10 +192,11 @@ void usage(const char* executable)
               << "  --route-stats-failure-margin N exclude this base-voxel distance around failures [128]\n"
               << "  --beam-step-distance N        rolling checkpoint step in base voxels [48]\n"
               << "  --lookahead-distance N        persistent beam lookahead in base voxels [384]\n"
-              << "  --cost-weight W               geometric cost weight per base voxel (0,1] [1]\n"
-              << "  --cost-delay N                full-weight distance before decay in base voxels [0]\n"
-              << "  --cost-step N                 cost integration step in base voxels [16]\n"
-              << "  --cost-profile-weight A       subsegment density blend in [0,1] [1]\n"
+              << "  --cost-mode MODE              fiberlet or stepped [fiberlet]\n"
+              << "  --cost-weight W               stepped: geometric weight per base voxel (0,1] [1]\n"
+              << "  --cost-delay N                stepped: full-weight distance before decay [0]\n"
+              << "  --cost-step N                 stepped: integration step in base voxels [16]\n"
+              << "  --cost-profile-weight A       stepped: subsegment density blend in [0,1] [1]\n"
               << "  --decision-window BEGIN,END   retain --stats beam details only in this base-arc window; repeatable\n"
               << "  --search-width N              approximate intermediate width; zero is exact [0]\n"
               << "  --prune-distance N            approximate-mode pruning interval in base voxels [48]\n"
@@ -504,16 +506,29 @@ CliOptions parseArgs(int argc, char** argv)
         } else if (argument == "--lookahead-distance" && usesGraphReplayOptions(options.command)) {
             options.graphReplay.lookaheadDistanceBaseVoxels =
                 parseDouble(valueAfter(index, argc, argv, "lookahead-distance"), "lookahead-distance");
+        } else if (argument == "--cost-mode" && usesGraphReplayOptions(options.command)) {
+            const auto value = valueAfter(index, argc, argv, "cost-mode");
+            if (value == "fiberlet") {
+                options.graphReplay.costMode = vc::fiber_tracer::FiberletGraphReplayCostMode::Fiberlet;
+            } else if (value == "stepped") {
+                options.graphReplay.costMode = vc::fiber_tracer::FiberletGraphReplayCostMode::Stepped;
+            } else {
+                fail("--cost-mode must be fiberlet or stepped");
+            }
         } else if (argument == "--cost-weight" && usesGraphReplayOptions(options.command)) {
+            options.steppedReplayCostOptionSpecified = true;
             options.graphReplay.geometricCostWeightPerBaseVoxel =
                 parseDouble(valueAfter(index, argc, argv, "cost-weight"), "cost-weight");
         } else if (argument == "--cost-delay" && usesGraphReplayOptions(options.command)) {
+            options.steppedReplayCostOptionSpecified = true;
             options.graphReplay.geometricCostDelayBaseVoxels =
                 parseDouble(valueAfter(index, argc, argv, "cost-delay"), "cost-delay");
         } else if (argument == "--cost-step" && usesGraphReplayOptions(options.command)) {
+            options.steppedReplayCostOptionSpecified = true;
             options.graphReplay.costIntegrationStepBaseVoxels =
                 parseDouble(valueAfter(index, argc, argv, "cost-step"), "cost-step");
         } else if (argument == "--cost-profile-weight" && usesGraphReplayOptions(options.command)) {
+            options.steppedReplayCostOptionSpecified = true;
             options.graphReplay.costProfileWeight =
                 parseDouble(valueAfter(index, argc, argv, "cost-profile-weight"), "cost-profile-weight");
         } else if (argument == "--decision-window" && isReplayCommand(options.command)) {
@@ -558,6 +573,10 @@ CliOptions parseArgs(int argc, char** argv)
         vc::fiber_tracer::validateFiberletPathConfig(options.paths);
     }
     if (usesGraphReplayOptions(options.command)) {
+        if (options.steppedReplayCostOptionSpecified &&
+            options.graphReplay.costMode != vc::fiber_tracer::FiberletGraphReplayCostMode::Stepped) {
+            fail("--cost-weight, --cost-delay, --cost-step, and --cost-profile-weight require --cost-mode stepped");
+        }
         if (options.replayBeginArcBaseVoxels.has_value() &&
             !(*options.replayBeginArcBaseVoxels >= 0.0)) {
             fail("--arc must be non-negative");
