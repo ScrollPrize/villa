@@ -36,6 +36,10 @@ from sample_spiral import (
 
 TRACK_CROSSING_CACHE_VERSION = 1
 TRACK_CROSSING_CACHE_SUFFIX = '.crossings.npz'
+TRACK_CROSSING_MMAP_SUFFIX = '.mmap'
+_TRACK_CROSSING_CSR_ARRAYS = (
+    'source_ids', 'offsets', 'partners', 'self_local',
+    'partner_local', 'positions', 'clearances')
 TRACK_STORE_SUFFIX = '.vctracks'
 TRACK_STORE_VERSION = 1
 # Window read at the head, middle and tail of a DBM to fingerprint its contents.
@@ -202,6 +206,11 @@ def normalize_tracks_dbm_path(path):
 def track_crossing_cache_path(path):
     """Return the conventional exact-crossing sidecar path for a tracks DBM."""
     return Path(normalize_tracks_dbm_path(path) + TRACK_CROSSING_CACHE_SUFFIX)
+
+
+def track_crossing_mmap_cache_path(path):
+    """Directory form of the crossing cache whose arrays can stay mmap-backed."""
+    return Path(str(track_crossing_cache_path(path)) + TRACK_CROSSING_MMAP_SUFFIX)
 
 
 def _tracks_db_signature(path):
@@ -1868,6 +1877,46 @@ def write_track_crossing_cache(
     return destination
 
 
+def write_track_crossing_mmap_cache(path, destination=None):
+    """Convert the adjacent NPZ crossing cache to an atomic mmap directory.
+
+    ``np.load`` cannot memory-map an array inside an NPZ, even one ``np.savez``
+    stored uncompressed, so loading the cache makes every byte of it anonymous.
+    A production crossing CSR is about 3 GiB; held beside the ROI coordinates
+    on a 16 GB, swap-free host that is the difference between a fit that runs
+    and one the kernel kills before the first optimisation step.  Separate NPY
+    files preserve the exact dtypes and bytes and let the kernel reclaim the
+    pages as clean cache.
+
+    The metadata file is written last.  It is the sentinel the loader keys on,
+    so a conversion killed part way through leaves a directory nothing will
+    load rather than a short one something might.
+    """
+    source = track_crossing_cache_path(path)
+    destination = (track_crossing_mmap_cache_path(path)
+                   if destination is None else Path(destination))
+    if destination.exists():
+        raise FileExistsError(destination)
+    temporary = destination.with_name(destination.name + f'.tmp-{os.getpid()}')
+    temporary.mkdir(parents=True)
+    try:
+        with np.load(source, allow_pickle=False) as stored:
+            metadata = json.loads(str(stored['metadata'].item()))
+            for name in _TRACK_CROSSING_CSR_ARRAYS:
+                np.save(temporary / f'{name}.npy', stored[name],
+                        allow_pickle=False)
+        with (temporary / 'metadata.json').open('w', encoding='utf-8') as stream:
+            json.dump(metadata, stream, indent=2, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+        temporary = None
+        return destination
+    finally:
+        if temporary is not None and temporary.exists():
+            shutil.rmtree(temporary, ignore_errors=True)
+
+
 def load_track_crossing_cache(path, warn=True, expected_z_range=None):
     """Load a valid adjacent CSR sidecar, or return ``None`` on a safe miss."""
     try:
@@ -1876,39 +1925,46 @@ def load_track_crossing_cache(path, warn=True, expected_z_range=None):
         if warn:
             print(f'WARNING: cannot resolve tracks DBM for crossing cache: {error}')
         return None
-    if not cache_path.is_file():
+    mmap_path = track_crossing_mmap_cache_path(path)
+    if not mmap_path.is_dir() and not cache_path.is_file():
         return None
+    loaded_path = mmap_path if mmap_path.is_dir() else cache_path
     try:
-        with np.load(cache_path, allow_pickle=False) as stored:
-            metadata = json.loads(str(stored['metadata'].item()))
-            if metadata.get('version') != TRACK_CROSSING_CACHE_VERSION:
-                raise ValueError(
-                    f"unsupported version {metadata.get('version')!r}")
-            current, note = _tracks_db_signature_matches(
-                path, metadata, 'db_signature')
-            if not current:
-                raise ValueError('tracks DBM has changed since the cache was built')
-            if note and warn:
-                print(f'NOTE: crossing cache {cache_path}: {note}')
-            if (expected_z_range is not None
-                    and metadata.get('z_range', [None, None])
-                    != list(expected_z_range)):
-                raise ValueError(
-                    'crossing cache was built for a different z range')
+        if mmap_path.is_dir():
+            with (mmap_path / 'metadata.json').open('r', encoding='utf-8') as fh:
+                metadata = json.load(fh)
             csr = {
-                name: stored[name]
-                for name in (
-                    'source_ids', 'offsets', 'partners', 'self_local',
-                    'partner_local', 'positions', 'clearances')
+                name: np.load(mmap_path / f'{name}.npy', mmap_mode='r',
+                              allow_pickle=False)
+                for name in _TRACK_CROSSING_CSR_ARRAYS
             }
+        else:
+            with np.load(cache_path, allow_pickle=False) as stored:
+                metadata = json.loads(str(stored['metadata'].item()))
+                csr = {name: stored[name]
+                       for name in _TRACK_CROSSING_CSR_ARRAYS}
+        if metadata.get('version') != TRACK_CROSSING_CACHE_VERSION:
+            raise ValueError(
+                f"unsupported version {metadata.get('version')!r}")
+        current, note = _tracks_db_signature_matches(
+            path, metadata, 'db_signature')
+        if not current:
+            raise ValueError('tracks DBM has changed since the cache was built')
+        if note and warn:
+            print(f'NOTE: crossing cache {loaded_path}: {note}')
+        if (expected_z_range is not None
+                and metadata.get('z_range', [None, None])
+                != list(expected_z_range)):
+            raise ValueError(
+                'crossing cache was built for a different z range')
         _validate_crossing_partner_csr(csr, require_sorted_source_ids=True)
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         if warn:
             print(f'WARNING: ignoring invalid track crossing cache '
-                  f'{cache_path}: {error}')
+                  f'{loaded_path}: {error}')
         return None
     print(
-        f'loaded track crossing cache {cache_path}: '
+        f'loaded track crossing cache {loaded_path}: '
         f'{len(csr["source_ids"])} tracks, {len(csr["partners"])} directed records'
     )
     return csr
