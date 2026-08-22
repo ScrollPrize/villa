@@ -124,8 +124,13 @@ def _make_chunk_reader(compressor: dict | None, chunk_voxels: int):
     codec = numcodecs.get_codec(compressor)
 
     def read(path: Path) -> np.ndarray:
-        with open(path, 'rb') as f:
-            decoded = codec.decode(f.read())
+        try:
+            with open(path, 'rb') as f:
+                decoded = codec.decode(f.read())
+        except Exception as exc:
+            # Without the path, a codec failure on one chunk out of millions
+            # is a stack trace with nothing to act on.
+            raise RuntimeError(f'{path}: codec decode failed: {exc}') from exc
         decoded = np.frombuffer(decoded, dtype=np.uint8)
         if decoded.size != chunk_voxels:
             raise ValueError(f'{path}: decoded chunk has {decoded.size} bytes, expected {chunk_voxels}')

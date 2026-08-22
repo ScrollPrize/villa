@@ -27,6 +27,7 @@ ratio: 4 bytes per 8 voxels is exactly 2.000x against 1.939x.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -145,7 +146,12 @@ def main() -> int:
     out_meta = dict(meta)
     out_meta['encoding'] = 'min3'
     out_meta['encode_block'] = args.side
-    out_meta['encoded_from'] = str(src)
+    # Which sidecar this came from, not where it happened to sit: the absolute
+    # path identifies the machine, and a sidecar that has been re-encoded since
+    # has the same path and a different table.
+    out_meta['encoded_from'] = src.name
+    out_meta['encoded_from_table_sha256'] = hashlib.sha256(
+        (src / 'table.npy').read_bytes()).hexdigest()
     out_meta['worst_block_span'] = worst_overall
     # meta.json last: it is the completion sentinel every reader keys on, so a
     # conversion killed part way through leaves a directory nothing will load

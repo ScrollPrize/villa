@@ -143,6 +143,29 @@ def _read_sidecar_meta(sidecar):
         return json.load(f)
 
 
+def _open_resident_pool(sidecar, **kwargs):
+    """Construct whichever lossless resident-pool encoding the sidecar names.
+
+    The encoding is a property of the sidecar, not of the run: a fit asked for
+    a volume, and how that volume is packed on the device is the packer's
+    business.  Dispatching here rather than at the call sites keeps the three
+    pools the fitter loads on one code path.
+    """
+    encoding = 'raw'
+    try:
+        with open(os.path.join(str(sidecar), 'meta.json')) as fh:
+            encoding = json.load(fh).get('encoding', 'raw')
+    except OSError:
+        pass
+    from sparse_cuda_cache import ResidentBrickPool
+    if encoding == 'raw':
+        return ResidentBrickPool(sidecar, **kwargs)
+    if encoding == 'min3':
+        from min3_pool import Min3BrickPool
+        return Min3BrickPool(sidecar, **kwargs)
+    raise ValueError(f'{sidecar}: unsupported sidecar encoding {encoding!r}')
+
+
 def prepare_lasagna_volume(
     scroll_zarr,
     *,
@@ -232,7 +255,7 @@ def prepare_lasagna_volume(
             progress.begin(
                 'loading', 'Loading normal volumes onto GPU',
                 step=0, total_steps=0, unit='bricks')
-        normal_cache = ResidentBrickPool(
+        normal_cache = _open_resident_pool(
             normal_sidecar,
             origin_zyx=(z_lo, 0, 0),
             z_roi=(z_lo, z_hi),
@@ -251,7 +274,7 @@ def prepare_lasagna_volume(
             progress.begin(
                 'loading', 'Loading gradient volume onto GPU',
                 step=0, total_steps=0, unit='bricks')
-        grad_cache = ResidentBrickPool(
+        grad_cache = _open_resident_pool(
             grad_sidecar,
             origin_zyx=(z_lo, 0, 0),
             z_roi=(z_lo, z_hi),
@@ -414,7 +437,7 @@ def prepare_surf_sdt_volume(
         progress.begin(
             'loading', 'Loading surface-distance volume onto GPU',
             step=0, total_steps=0, unit='bricks')
-    cache = ResidentBrickPool(
+    cache = _open_resident_pool(
         sidecar,
         origin_zyx=(z_lo, 0, 0),
         z_roi=(z_lo, z_hi),
