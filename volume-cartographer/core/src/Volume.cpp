@@ -1325,10 +1325,12 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     const std::string& url,
     const std::filesystem::path& cacheRoot,
     const vc::HttpAuth& authIn,
-    const utils::Json& metadata)
+    const utils::Json& metadata,
+    bool discoverAwsCredentials)
 {
     vc::render::RemoteZarrOpenOptions openOptions;
     openOptions.auth = authIn;
+    openOptions.discoverAwsCredentials = discoverAwsCredentials;
     auto remoteOpen = vc::render::openRemoteZarrPyramid(url, std::move(openOptions));
     auto opened = std::move(remoteOpen.opened);
     auto auth = std::move(remoteOpen.auth);
@@ -1737,8 +1739,18 @@ std::string Volume::chunkCacheSourceIdentity() const
     if (isRemote_) {
         const auto normalized = vc::core::util::remoteFileCacheSource(
             vc::core::util::normalizeRemoteFileLocation(remoteUrl_));
-        return "remote|" + normalized +
-               "|base=" + std::to_string(baseScaleLevel_);
+        std::string identity = "remote|" + normalized +
+            "|base=" + std::to_string(baseScaleLevel_);
+        auto persistentPath = remotePersistentCachePath();
+        if (!persistentPath.empty()) {
+            std::error_code ec;
+            const auto absolute = std::filesystem::absolute(persistentPath, ec);
+            if (!ec)
+                persistentPath = absolute;
+            identity += "|cache=" +
+                persistentPath.lexically_normal().generic_string();
+        }
+        return identity;
     }
     if (preparedSourceFactory_) {
         return "prepared|" + id() + "|instance=" +

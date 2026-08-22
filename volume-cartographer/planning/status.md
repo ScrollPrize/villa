@@ -1,13 +1,15 @@
-# VC3D control-point collapse rollback status
+# VC3D render attribution and lookup repair status
 
-- [x] Capture the corrective task requirements.
-- [x] Inspect the multi-collapse, local-update, optimizer, and rollback paths.
-- [x] Write the implementation, testing, spec, docs, and changelog plan.
-- [x] Complete independent plan review against task, spec, and broader plan.
-- [x] Incorporate plan-review findings.
-- [x] Unify automatic multi-control collapse with local span reconstruction.
-- [x] Prevent synchronous preparation failure from mutating optimization state.
-- [x] Add focused regression tests.
-- [x] Update specification, documentation, changelog, and task log.
-- [x] Build with 32 cores and run focused tests plus the full VC3D compile.
-- [x] Run `git diff --check` and review the final diff.
+- [x] Capture the attribution-first task and deferred speed requirements.
+- [x] Confirm current cross-run worker-ID attribution behavior.
+- [x] Confirm render-job request lifetime and existing local chunk caching.
+- [x] Record attribution alternatives and a provisional recommendation.
+- [x] Replace rank/tie matching with same-run scheduler evidence.
+- [x] Collect initial repeated artifacts and identify worker/scope mismatch.
+- [x] Validate passive canonical pairing over three full parallel matrices.
+- [x] Implement and test deterministic paired attribution in native C++.
+- [x] Re-evaluate residual variation with three fresh current-binary pairs.
+- [x] Validate the repaired attribution against the existing enabled CI gate.
+- [ ] Profile and implement lookup optimization against the accepted gate.
+- [x] Update specifications, documentation, and changelog.
+- [x] Complete native unit, compatibility, matrix, reference, and repeatability validation.

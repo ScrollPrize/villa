@@ -1,0 +1,16 @@
+**
+!volume-cartographer/
+!volume-cartographer/**
+!spiral-fitting/
+!spiral-fitting/**
+!vesuvius/
+!vesuvius/src/
+!vesuvius/src/vc3d_fiber_format/
+!vesuvius/src/vc3d_fiber_format/**
+
+# Never send generated or local-only content from the included subtrees.
+**/build/
+**/dist/
+**/.cache/
+**/__pycache__/
+**/*.AppImage

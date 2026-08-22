@@ -99,6 +99,46 @@ TEST_CASE("LasagnaDataset wraps manifest and reports missing normal source")
     CHECK_THROWS_AS(dataset.normalSourcePath(), std::runtime_error);
 }
 
+TEST_CASE("LasagnaDatasetManifest finds complete fiber prediction channel sets")
+{
+    const auto manifest = vc::lasagna::LasagnaDatasetManifest::parseText(R"({
+        "version": 2,
+        "groups": {
+            "base": {
+                "zarr": "base.zarr",
+                "channels": ["presence", "nx", "ny"]
+            },
+            "predictions": {
+                "zarr": "predictions.zarr",
+                "channels": [
+                    "ink_presence", "ink_nx", "ink_ny",
+                    "ink_presence", "incomplete_presence", "incomplete_nx"
+                ]
+            }
+        }
+    })");
+
+    const auto prefixes = manifest.fiberPredictionPrefixes();
+    REQUIRE(prefixes.size() == 2);
+    CHECK(prefixes[0].empty());
+    CHECK(prefixes[1] == "ink");
+}
+
+TEST_CASE("LasagnaDatasetManifest rejects incomplete fiber prediction channel sets")
+{
+    const auto manifest = vc::lasagna::LasagnaDatasetManifest::parseText(R"({
+        "version": 2,
+        "groups": {
+            "predictions": {
+                "zarr": "predictions.zarr",
+                "channels": ["fiber_presence", "fiber_nx", "ny"]
+            }
+        }
+    })");
+
+    CHECK(manifest.fiberPredictionPrefixes().empty());
+}
+
 TEST_CASE("LasagnaDataset applies runtime coordinate scale without mutating the manifest file")
 {
     const auto dir = makeTmpDir("working-scale");
@@ -174,6 +214,7 @@ TEST_CASE("LasagnaDataset resolves marker-backed remote relative groups")
         std::ofstream out(dir / vc::lasagna::kLasagnaRemoteMarker);
         out << R"({
           "artifact_url":"s3://bucket/path/artifact/",
+          "anonymous":true,
           "manifest_file":"dataset.lasagna.json"
         })";
     }
@@ -188,6 +229,8 @@ TEST_CASE("LasagnaDataset resolves marker-backed remote relative groups")
     CHECK(group.remoteCacheRoot == dir);
     CHECK(group.sourceLocation ==
           "s3://bucket/path/artifact/pred.zarr");
+    CHECK_FALSE(dataset.manifest().discoverAwsCredentials);
+    CHECK_FALSE(group.discoverAwsCredentials);
 
     fs::remove_all(dir);
 }

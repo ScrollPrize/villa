@@ -55,12 +55,40 @@ bool hasSuffix(std::string_view value, std::string_view suffix)
            value.substr(value.size() - suffix.size()) == suffix;
 }
 
-bool isOptionalMetadataProbe(const std::string& key)
+bool isOptionalMetadataProbe(std::string_view key)
 {
     return key == ".zgroup" || key == ".zarray" || key == ".zattrs" ||
            key == ".zmetadata" || key == "zarr.json" ||
            hasSuffix(key, "/.zgroup") || hasSuffix(key, "/.zarray") ||
            hasSuffix(key, "/.zattrs") || hasSuffix(key, "/zarr.json");
+}
+
+bool hasExplicitAwsCredentialError(std::string_view detail)
+{
+    constexpr std::array<std::string_view, 10> markers{
+        "ExpiredToken",
+        "InvalidAccessKeyId",
+        "InvalidClientTokenId",
+        "InvalidSignatureException",
+        "InvalidToken",
+        "RequestExpired",
+        "RequestTimeTooSkewed",
+        "SignatureDoesNotMatch",
+        "TokenRefreshRequired",
+        "UnrecognizedClientException",
+    };
+    return std::any_of(markers.begin(), markers.end(), [&](const auto marker) {
+        return detail.find(marker) != std::string_view::npos;
+    });
+}
+
+std::string responseErrorDetail(const utils::HttpResponse& response)
+{
+    if (!response.error_message.empty())
+        return response.error_message;
+    constexpr std::size_t kMaxDetailLength = 1024;
+    const auto body = response.body_string();
+    return std::string(body.substr(0, kMaxDetailLength));
 }
 
 bool isZarrMetadataKey(std::string_view key)
@@ -102,9 +130,11 @@ public:
             return true;
         if (response.not_found())
             return false;
-        if (response.status_code == 403 && isOptionalMetadataProbe(key))
+        if (isOptionalRemoteMetadataMiss(
+                response.status_code, key, response.body_string()))
             return false;
-        throw HttpStatusError(response.status_code, key, response.error_message);
+        throw HttpStatusError(
+            response.status_code, key, responseErrorDetail(response));
     }
 
     std::vector<std::byte> get(const std::string& key) const override
@@ -124,9 +154,11 @@ public:
         }
         if (response.not_found())
             return std::nullopt;
-        if (response.status_code == 403 && isOptionalMetadataProbe(key))
+        if (isOptionalRemoteMetadataMiss(
+                response.status_code, key, response.body_string()))
             return std::nullopt;
-        throw HttpStatusError(response.status_code, key, response.error_message);
+        throw HttpStatusError(
+            response.status_code, key, responseErrorDetail(response));
     }
 
     std::optional<std::vector<std::byte>>
@@ -137,7 +169,8 @@ public:
             return std::move(response.body);
         if (response.not_found())
             return std::nullopt;
-        throw HttpStatusError(response.status_code, key, response.error_message);
+        throw HttpStatusError(
+            response.status_code, key, responseErrorDetail(response));
     }
 
     void set(const std::string&, std::span<const std::byte>) override
@@ -218,7 +251,8 @@ public:
         // avoiding a decode+re-encode round trip on the cache writer.
         if (array_->stores_chunks_with_codec("c3d"))
             persistEncodedExtension_ = ".c3d";
-        else if (array_->stores_chunks_with_codec(vc::kVcz1CodecName))
+        else if (array_->stores_chunks_with_codec(vc::kDelta3dCodecName) ||
+                 array_->stores_chunks_with_codec(vc::kVcz1CodecName))
             persistEncodedExtension_ = vc::kCompressedCacheExtension;
     }
 
@@ -788,6 +822,15 @@ void addRemoteLevelFromKey(
 }
 
 } // namespace
+
+bool isOptionalRemoteMetadataMiss(
+    long status,
+    std::string_view key,
+    std::string_view responseBody)
+{
+    return status == 403 && isOptionalMetadataProbe(key) &&
+           !hasExplicitAwsCredentialError(responseBody);
+}
 
 std::vector<std::pair<int, std::string>> remoteLevelKeysFromZattrs(
     const std::shared_ptr<utils::Store>& store,

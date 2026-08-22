@@ -82,14 +82,16 @@ public:
                                        const ZarrCreateOptions& options);
 
     // Create a Volume backed by a remote zarr store over HTTP.
-    // If auth is provided, it is used as-is; otherwise credentials are read
-    // from environment variables. When cacheRoot is non-empty, remote chunks
-    // are persisted under a volume-specific subdirectory of that root.
+    // If auth is provided, it is used as-is. Otherwise credentials are read
+    // from the ambient AWS configuration only when discoverAwsCredentials is
+    // true; false forces an anonymous request. When cacheRoot is non-empty,
+    // remote chunks are persisted under a volume-specific subdirectory.
     static std::shared_ptr<Volume> NewFromUrl(
         const std::string& url,
         const std::filesystem::path& cacheRoot = {},
         const vc::HttpAuth& auth = {},
-        const utils::Json& metadata = {});
+        const utils::Json& metadata = {},
+        bool discoverAwsCredentials = true);
 
     // Construct a normal 3D Volume from a caller-prepared chunk source. The
     // source factory is invoked again when a cache is recreated. It must return
