@@ -242,13 +242,10 @@ Graph::Graph(std::vector<Event> events) : _events(std::move(events))
     }
 }
 
-std::vector<double> Graph::assignCosts(const std::map<std::int64_t, double>& thread_costs, double residual_fraction, const std::string& split_policy) const
+ThreadAttributionWindows Graph::attributionWindows(double residual_fraction) const
 {
     if (!std::isfinite(residual_fraction) || residual_fraction < 0.0 || residual_fraction > 1.0) {
         throw std::runtime_error("residual fraction must be between zero and one");
-    }
-    if (split_policy != "equal" && split_policy != "front" && split_policy != "back") {
-        throw std::runtime_error("unknown split policy " + split_policy);
     }
 
     std::map<std::int64_t, std::vector<std::size_t>> by_thread;
@@ -256,19 +253,9 @@ std::vector<double> Graph::assignCosts(const std::map<std::int64_t, double>& thr
         by_thread[_events[sequence].thread].push_back(sequence);
     }
 
-    std::vector<double> durations(_events.size(), 0.0);
+    ThreadAttributionWindows result;
     for (const auto& [thread, sequences] : by_thread) {
-        const auto cost = thread_costs.find(thread);
-        if (cost == thread_costs.end()) {
-            throw std::runtime_error("trace thread " + std::to_string(thread) + " has no cost");
-        }
-        requireFiniteNonnegative(cost->second, "thread cost");
-
-        struct Window {
-            std::vector<std::size_t> candidates;
-            double units;
-        };
-        std::vector<Window> windows;
+        std::vector<AttributionWindow> windows;
         std::vector<std::size_t> candidates;
         bool blocked = false;
         bool current = false;
@@ -294,53 +281,117 @@ std::vector<double> Graph::assignCosts(const std::map<std::int64_t, double>& thr
             windows.push_back({std::move(candidates), residual_fraction});
         }
 
-        std::vector<Window*> eligible;
+        std::vector<AttributionWindow> eligible;
         double total_units = 0.0;
-        for (auto& window : windows) {
+        for (auto&& window : windows) {
             if (!window.candidates.empty()) {
-                eligible.push_back(&window);
+                eligible.push_back(std::move(window));
                 total_units += window.units;
             }
         }
-        if (eligible.empty()) {
-            if (cost->second != 0.0) {
-                throw std::runtime_error("trace thread " + std::to_string(thread) + " has positive cost but no eligible event");
-            }
-            continue;
-        }
-        if (total_units <= 0.0) {
+        if (!eligible.empty() && total_units <= 0.0) {
             if (eligible.size() != 1) {
                 throw std::runtime_error("trace thread " + std::to_string(thread) + " has no positive attribution weight");
             }
-            eligible.front()->units = 1.0;
-            total_units = 1.0;
+            eligible.front().units = 1.0;
+        }
+        result.emplace(thread, std::move(eligible));
+    }
+    return result;
+}
+
+std::vector<double> Graph::assignWindowCosts(const std::map<std::int64_t, std::vector<double>>& window_costs, double residual_fraction, const std::string& split_policy) const
+{
+    if (split_policy != "equal" && split_policy != "front" && split_policy != "back") {
+        throw std::runtime_error("unknown split policy " + split_policy);
+    }
+    const auto windows = attributionWindows(residual_fraction);
+    if (window_costs.size() != windows.size()) {
+        throw std::runtime_error("window-cost threads do not match trace threads");
+    }
+
+    std::vector<double> durations(_events.size(), 0.0);
+    for (const auto& [thread, eligible] : windows) {
+        const auto costs = window_costs.find(thread);
+        if (costs == window_costs.end()) {
+            throw std::runtime_error("trace thread " + std::to_string(thread) + " has no window costs");
+        }
+        if (costs->second.size() != eligible.size()) {
+            throw std::runtime_error("trace thread " + std::to_string(thread) + " has the wrong number of window costs");
         }
 
-        const double unit_cost = cost->second / total_units;
-        for (const auto* window : eligible) {
-            const double window_cost = unit_cost * window->units;
+        double expected = 0.0;
+        for (std::size_t index = 0; index < eligible.size(); ++index) {
+            const auto& window = eligible[index];
+            const double window_cost = costs->second[index];
+            requireFiniteNonnegative(window_cost, "window cost");
+            expected += window_cost;
+            requireFiniteNonnegative(expected, "thread window-cost total");
             if (split_policy == "equal") {
-                const double share = window_cost / window->candidates.size();
-                for (const auto sequence : window->candidates) {
+                const double share = window_cost / window.candidates.size();
+                for (const auto sequence : window.candidates) {
                     durations[sequence] += share;
                 }
             } else if (split_policy == "front") {
-                durations[window->candidates.front()] += window_cost;
+                durations[window.candidates.front()] += window_cost;
             } else {
-                durations[window->candidates.back()] += window_cost;
+                durations[window.candidates.back()] += window_cost;
             }
         }
 
         double assigned = 0.0;
-        for (const auto sequence : sequences) {
-            assigned += durations[sequence];
+        for (const auto& window : eligible) {
+            for (const auto sequence : window.candidates) {
+                assigned += durations[sequence];
+            }
         }
-        const double tolerance = 1e-12 * std::max(1.0, cost->second);
-        if (std::abs(assigned - cost->second) > tolerance) {
+        const double tolerance = 1e-12 * std::max(1.0, expected);
+        if (std::abs(assigned - expected) > tolerance) {
             throw std::runtime_error("cost attribution did not preserve thread total");
         }
     }
     return durations;
+}
+
+std::vector<double> Graph::assignCosts(const std::map<std::int64_t, double>& thread_costs, double residual_fraction, const std::string& split_policy) const
+{
+    const auto windows = attributionWindows(residual_fraction);
+    if (thread_costs.size() != windows.size()) {
+        throw std::runtime_error("thread costs do not match trace threads");
+    }
+
+    std::map<std::int64_t, std::vector<double>> window_costs;
+    for (const auto& [thread, eligible] : windows) {
+        const auto cost = thread_costs.find(thread);
+        if (cost == thread_costs.end()) {
+            throw std::runtime_error("trace thread " + std::to_string(thread) + " has no cost");
+        }
+        requireFiniteNonnegative(cost->second, "thread cost");
+        if (eligible.empty()) {
+            if (cost->second != 0.0) {
+                throw std::runtime_error("trace thread " + std::to_string(thread) + " has positive cost but no eligible event");
+            }
+            window_costs.emplace(thread, std::vector<double>{});
+            continue;
+        }
+        const double total_units = std::accumulate(eligible.begin(), eligible.end(), 0.0, [](double total, const AttributionWindow& window) {
+            return total + window.units;
+        });
+        if (total_units <= 0.0) {
+            throw std::runtime_error("trace thread " + std::to_string(thread) + " has no positive attribution weight");
+        }
+        std::vector<double> costs;
+        costs.reserve(eligible.size());
+        for (const auto& window : eligible) {
+            costs.push_back(cost->second * window.units / total_units);
+        }
+        if (!costs.empty()) {
+            const double assigned = std::accumulate(costs.begin(), costs.end(), 0.0);
+            costs.back() += cost->second - assigned;
+        }
+        window_costs.emplace(thread, std::move(costs));
+    }
+    return assignWindowCosts(window_costs, residual_fraction, split_policy);
 }
 
 Graph::BasicResult Graph::replay(const std::vector<double>& durations, const ReplayOptions& options) const

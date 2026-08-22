@@ -98,6 +98,8 @@ private slots:
     void attachVolume();
     void attachSegments();
     void attachNormalGrid();
+    void attachUmbilicus();
+    void detachUmbilicus();
     void attachLasagnaManifest();
     void attachRemoteLasagnaManifest();
     void detachEntry();
@@ -129,6 +131,7 @@ signals:
     // wires this to SegmentationCommandHandler::onMergePatch with an
     // empty seed list so the dialog opens with empty combo boxes.
     void mergePatchFromMenuRequested();
+    void growTrackPatchesFromMenuRequested();
     void openDataCatalogVisibilityChanged(bool visible);
 
 private:
@@ -191,6 +194,8 @@ private:
     QAction* _attachVolumeAct{nullptr};
     QAction* _attachSegmentsAct{nullptr};
     QAction* _attachNormalGridAct{nullptr};
+    QAction* _attachUmbilicusAct{nullptr};
+    QAction* _detachUmbilicusAct{nullptr};
     QAction* _attachLasagnaManifestAct{nullptr};
     QAction* _attachRemoteLasagnaManifestAct{nullptr};
     QAction* _detachEntryAct{nullptr};
@@ -214,6 +219,7 @@ private:
     QAction* _rotateSurfaceAct{nullptr};
     QAction* _mergeTifxyzAct{nullptr};
     QAction* _mergePatchAct{nullptr};
+    QAction* _growTrackPatchesAct{nullptr};
     QAction* _materializeOpenDataFolderAct{nullptr};
     QAction* _recalculateFiberScoresAct{nullptr};
 

@@ -1,19 +1,15 @@
-# Direct Zarr mirror disk-cache status
+# VC3D render attribution and lookup repair status
 
-- [x] Capture task requirements.
-- [x] Inspect current remote opener, source keys, legacy cache precedence,
-      maintenance requests, settings, and persistent budget.
-- [x] Write implementation/test/spec/docs plan.
-- [x] Complete independent plan review and incorporate findings.
-- [x] Review sharded storage-object semantics with the user.
-- [x] Implement immutable cache-layout detection.
-- [x] Mirror Zarr metadata and exact source chunk paths.
-- [x] Route ordinary and maintenance persistence through selected layout.
-- [x] Preserve legacy read/write compatibility.
-- [x] Remove remote-cache recompression production and UI/settings.
-- [x] Make redownload, prefill, and budget accounting layout-aware.
-- [x] Add/update regression tests.
-- [x] Update spec, docs, changelog, and task log.
-- [x] Build and run focused tests.
-- [x] Run configured volume-cartographer CTest suite.
-- [x] Run `git diff --check` and review final diff.
+- [x] Capture the attribution-first task and deferred speed requirements.
+- [x] Confirm current cross-run worker-ID attribution behavior.
+- [x] Confirm render-job request lifetime and existing local chunk caching.
+- [x] Record attribution alternatives and a provisional recommendation.
+- [x] Replace rank/tie matching with same-run scheduler evidence.
+- [x] Collect initial repeated artifacts and identify worker/scope mismatch.
+- [x] Validate passive canonical pairing over three full parallel matrices.
+- [x] Implement and test deterministic paired attribution in native C++.
+- [x] Re-evaluate residual variation with three fresh current-binary pairs.
+- [x] Validate the repaired attribution against the existing enabled CI gate.
+- [ ] Profile and implement lookup optimization against the accepted gate.
+- [x] Update specifications, documentation, and changelog.
+- [x] Complete native unit, compatibility, matrix, reference, and repeatability validation.
