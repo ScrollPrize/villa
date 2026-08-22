@@ -3081,10 +3081,11 @@
   length, and exact base-space first/final nonzero steps. Beam ranking and
   transition scoring consume those records directly; replay must not resample
   source volumes or reconstruct endpoint scoring geometry.
-  Route payloads and full polyline reconstruction are requested only for the
-  current provisional best history during reference-error evaluation and for
-  final output, never for lookahead alternatives. Cache eviction and reload
-  therefore cannot invalidate graph identity or alter tie order.
+  Lookahead requests route payloads for decoded segment densities and
+  route-lattice segment lengths, but retains only stable IDs and scalar scores
+  after each query. The current provisional best is additionally reconstructed
+  for reference-error evaluation and final output. Cache eviction and reload
+  cannot invalidate graph identity or alter tie order.
   Committed route reconstruction applies the same adjacent-point epsilon
   suppression as eager DP finalization. For the same extracted graph, cold and
   warm float-cache replay artifacts must be byte-identical to eager replay.
@@ -3119,17 +3120,38 @@
   remain mandatory. Positive `--search-width N` explicitly selects
   approximate intermediate pruning at the configured `--prune-distance`,
   which defaults to 48 base voxels and is ignored in exact mode.
+- Every successful fiberlet route stores one quantized total-cost density per
+  emitted geometry segment. Route geometry and cost samples use independent
+  offsets. Densities are per prediction voxel and use the fixed global
+  `sqrt(density / 256)` uint16 codec; this unpublished route schema has no
+  repair or compatibility reader. Forward/reverse arcs reverse geometry
+  lengths and density samples together. Anchor cache identity is unchanged;
+  the route-cost schema is part of fiberlet cache identity.
+- Replay integrates fiberlet cost profiles on one regular distance grid rooted
+  at the current checkpoint. Its finite positive integration spacing is in
+  base voxels. Arbitrary edge/grid/horizon boundaries linearly interpolate the
+  piecewise-linear cumulative cost implied by piecewise-constant segment
+  densities. Each interval cost is multiplied by `W^s`, where `0 < W <= 1`
+  is the configured per-base-voxel weight and `s` is the interval midpoint's
+  base distance from the checkpoint after the configured finite nonnegative
+  delay `L`: the exponent is `max(0, s-L)`, so weight remains one through the
+  delay. Delay defaults to zero, preserving immediate decay; half the
+  lookahead is the initial opt-in experiment. `W=1` exactly conserves the decoded
+  profile total. Joins before the checkpoint are excluded, a join exactly at
+  it is included with weight one, and a join exactly at the horizon is
+  excluded. Weighted ranking remains a scalar separate from unweighted
+  five-component committed diagnostics.
 - Exact search seeds one cost-ordered frontier from every retained live route
   and maintains one global set of the best configured-beam-width completions at
   `C+H`. Completion
-  order is raw exact-horizon total loss followed by canonical persistent
+  order is checkpoint-relative weighted exact-horizon loss followed by canonical persistent
   logical-route order; loss per voxel is diagnostic only. Completions are
   deduplicated only by seed plus their complete logical route, so any number of
   winning routes may share the same route through `C+D` and diverge later.
   Distinct physical expansion states are not merged merely because they have
   the same logical identity.
 - The exact cutoff does not exist until the configured beam width of distinct
-  full-route completions is available. Thereafter the worst retained raw total
+  full-route completions is available. Thereafter the worst retained weighted total
   is the one shared cutoff
   for every source route. A pending state is pruned only when its admissible
   lower bound is strictly greater than the cutoff; equal bounds remain eligible
@@ -3140,8 +3162,8 @@
   merge mutates the decision-wide state budget.
 - Exact winners remain live through their complete `C+H` lookahead routes when
   `C` advances by `D`. At the next decision, a retained terminal fiberlet that
-  already covers the new horizon is immediately rescored with proportional
-  terminal-edge clipping; otherwise expansion resumes only at the retained
+  already covers the new horizon is immediately rescored by integrating its
+  segment profile through the horizon; otherwise expansion resumes only at the retained
   physical endpoint. The globally best winner's prefix through the complete
   fiberlet containing `C+D` is the only route reference-evaluated and committed
   at that decision. Its future suffix is not reference-evaluated early.
@@ -3155,17 +3177,31 @@
   same state, only the lowest accumulated-cost history remains, with ordered
   logical arc IDs breaking exact-cost ties. Its visited-node state becomes the
   state's cycle state; alternatives with different visited histories are
-  intentionally discarded. Crossing labels use exact proportional terminal-
-  edge scoring. Once `K` exact completions exist, expansion stops only when the
+  intentionally discarded. Crossing labels integrate the exact segment
+  profile through the terminal edge. Once `K` exact completions exist, expansion stops only when the
   next accumulated-cost lower bound is strictly greater than the `K`th exact
   completion, so equal-cost ties remain eligible. Queue exhaustion returns all
   available completions when fewer than `K` exist.
-- A route is scored cumulatively from the segment seed to the exact logical
-  front. When the front lies inside the terminal fiberlet, only the traversed
-  fraction of that edge cost contributes, while its entering join contributes
-  fully. When the front is exactly an anchor, the edge ending there and its
-  entering join contribute, but no outgoing edge or join does. The complete
-  terminal geometry and visited-node state remain attached to the candidate.
+- A route's ranking score is the sum of two terms. The prefix from the segment
+  seed through the current checkpoint uses the authoritative unweighted
+  whole-edge and transition costs. The forward interval from the checkpoint to
+  the exact logical front integrates the decoded segment-density profile with
+  the configured checkpoint-local delay and geometric weights. Decoded profile
+  values are used directly: they are never normalized or rescaled to force
+  agreement with the separately stored whole-edge cost. The same integration
+  algorithm is used at every weight, including `W=1`; changing the integration
+  spacing can therefore retain small interpolation and accumulation-rounding
+  effects.
+- Edge intervals are half open for score ownership. An edge portion before the
+  checkpoint belongs to the authoritative prefix, while the portion beginning
+  at the checkpoint belongs to the weighted forward term. An entering join
+  before the checkpoint belongs to the prefix, a join exactly at the checkpoint
+  belongs to the forward term with weight one, and a join exactly at the horizon
+  is excluded. When the front lies inside the terminal fiberlet, only the
+  traversed profile interval contributes. When the front is exactly an anchor,
+  the edge ending there and its entering join contribute, but no outgoing edge
+  or join does. The complete terminal geometry and visited-node state remain
+  attached to the candidate.
 - At an intermediate front, identical complete logical routes are deduplicated
   and ranked by exact-front loss and stable logical IDs. The best continuation
   for every represented stable prefix is retained first, up to working width;
@@ -3192,8 +3228,9 @@
   fiberlet, or several fiberlets in that step. Exact search instead retains the
   full lookahead route described above. Both preserve
   `C <= min(retained_history_length)`.
-- Compact-cost replay consumes the decoded authoritative edge and join costs.
-  Logical-front scoring may proportionally clip only the terminal edge cost;
+- Compact-cost replay consumes the decoded authoritative segment-density
+  profile and join costs. Logical-front scoring integrates the profile through
+  the terminal edge;
   final reference-end or failure materialization may additionally clip output
   geometry without altering persistent graph state. Exceeding the deterministic
   per-decision one-million-state bound is an explicit error. A route that
@@ -3207,6 +3244,11 @@
 - Persistent search bookkeeping must not scale with the already committed
   prefix. Logical routes use exact canonical parent/arc identity plus exact
   ancestor/first-divergence ordering; physical candidates remain separate.
+  Decision-score initialization starts from cumulative scalar edge and join
+  cost at the history immediately before the checkpoint and visits only the
+  checkpoint-to-horizon suffix. Logical-route interning cleanup advances a
+  bounded stable cursor through the ordered registry; it never performs a
+  whole-registry sweep at every checkpoint.
   Exact queue ordering, completion deduplication, and cutoff maintenance use
   scalar cumulative state and those persistent identities only; they never
   materialize logical arc or route-point vectors.
@@ -3220,7 +3262,20 @@
   complete route payloads they serialize. These are implementation constraints
   only and must not change ranking, costs, failure locations, cache identity,
   or replay JSON.
-- Beam-step, lookahead, prune distance, and search width are replay-only
+- The `fiberlet-replay` CLI runs the classic greedy and graph evaluators at the
+  same time. Its positive `--threads N` setting is one trace-evaluator worker
+  budget split deterministically between those two nested searches, not `N`
+  workers assigned independently to each evaluator. This scheduling rule does
+  not change graph ordering or numerical accumulation.
+- Ordinary graph-arc queries expose connectivity and aggregate edge metadata
+  only. Decoded cost profiles are requested explicitly by the scorer and kept
+  in a bounded decision-local cache, so queue expansion does not reconstruct or
+  copy route payloads on every adjacency lookup. Exact-search relaxed
+  cost-to-go memoization is decision-local, scalar, and conservative; its state
+  count, cache hits, and zero-bound fallbacks are diagnostic output and do not
+  affect ordering.
+- Beam-step, lookahead, prune distance, search width, geometric cost weight,
+  geometric cost delay, and cost integration spacing are replay-only
   metadata. They must not affect anchor or fiberlet cache identity, corridor
   selection, generation settings, chunk payloads, or prefetch scheduling.
   On-demand traversal may populate a missing chunk, but repeating against a hot

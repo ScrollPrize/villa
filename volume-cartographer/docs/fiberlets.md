@@ -524,6 +524,9 @@ volume-cartographer/build/bin/vc_fiberlets fiberlet-replay \
   --beam 16 \
   --beam-step-distance 48 \
   --lookahead-distance 384 \
+  --cost-weight 0.99 \
+  --cost-delay 192 \
+  --cost-step 16 \
   --length 4096
 ```
 
@@ -537,18 +540,71 @@ upper policy limit. A positive `K` opts into approximate intermediate
 pruning, must be at least the final beam width, and uses `--prune-distance P`.
 The prune distance is ignored in exact mode.
 
+Every successful fiberlet stores one total-cost density per emitted route
+segment next to its route lattice. Density is selected DP segment cost divided
+by prediction-voxel segment length. It uses the fixed nonlinear `uint16`
+mapping `round(65535 * sqrt(clamp(density / 256, 0, 1)))`; decoding squares
+the unit-range code value and multiplies by 256. This codec mapping is the only
+normalization involved. Decoded segment costs are used directly and are never
+rescaled to make their sum equal the separately stored whole-edge cost.
+Geometry and cost profiles have independent route-payload offsets. Prefixes
+retain the five-component whole-edge cost used by committed-route diagnostics.
+
+Lookahead ranking adds the authoritative unweighted route cost from the segment
+seed through the current checkpoint to the decoded-profile cost from the
+checkpoint through the common horizon. `--cost-weight W` is the geometric
+weight per base voxel and
+must be in `(0,1]`; it defaults to 1. `--cost-delay L` keeps weight equal to
+one through the first `L` base voxels and then weights cost at checkpoint-local
+base distance `s` by `W^(s-L)`; it must be finite and nonnegative and
+defaults to zero, preserving immediate decay. A delay of 192 is half the
+default 384-base-voxel lookahead and is the initial delayed-falloff experiment.
+`--cost-step N` is the positive regular integration spacing in
+base voxels and defaults to 16. The grid is anchored once at the checkpoint
+and continues across fiberlet boundaries; a non-grid-aligned delay splits its
+containing integration cell exactly. Partial interval cost comes from
+linear interpolation of the piecewise-linear cumulative cost curve, and each
+interval uses the weight at its midpoint. The same integration path is used for
+all weights. At `W=1`, the decoded additive profile therefore reproduces its
+own total apart from codec, interpolation, and floating-point rounding; no
+special compatibility path or corrective scaling is applied. `--cost-step`
+remains active at `W=1`, so small route sensitivity from those numerical effects
+is possible, but material failure-count changes indicate a defect or a genuine
+near tie. An entering join before the checkpoint belongs to the authoritative
+prefix. A join at the checkpoint is included in the forward term with weight
+one, and a join exactly at the horizon is excluded. Ranking's weighted scalar
+is recorded separately from the unchanged unweighted component diagnostics.
+
+On the Paris4 5,000-base-voxel validation interval, the pinned pre-profile
+revision and repaired scorer all completed without a fiberlet failure. Five
+serial hot-cache runs gave these timings; CPU is `user + sys` and p95 is the
+nearest-rank sample:
+
+| Mode | Wall mean/p50/p95 | CPU mean/p50/p95 | Peak RSS |
+| --- | --- | --- | --- |
+| Pinned `64e5341` | 0.558/0.550/0.640 s | 15.684/15.480/18.550 s | 96.4 MiB |
+| Repaired `W=1`, step 16 | 0.666/0.650/0.800 s | 18.992/18.800/23.260 s | 97.6 MiB |
+| `W=0.99`, delay 0, step 16 | 0.642/0.630/0.710 s | 18.584/18.410/20.800 s | 97.1 MiB |
+| `W=0.99`, delay 192, step 16 | 0.616/0.610/0.650 s | 17.076/17.430/17.800 s | 97.4 MiB |
+
+The repaired `W=1` median wall and CPU times are respectively 1.18x and 1.21x
+the pinned baseline. `W=1` step 8 and step 32 selected the same canonical
+55-edge route on this interval. Both `W=0.99` modes also had zero fiberlet
+failures; delayed falloff remains an explicit experiment rather than a default
+quality change.
+
 Exact mode keeps each winning route through the full common lookahead horizon,
 not just through the next checkpoint. The following decision extends those
 retained routes only from their existing endpoints; a whole terminal fiberlet
 that already crosses the new horizon is rescored there without expansion. One
 multi-source priority frontier feeds one global top-`beam` completion set. Routes
-are ranked by raw exact-horizon total loss and canonical persistent logical
+are ranked by checkpoint-relative weighted exact-horizon loss and canonical persistent logical
 identity, and only identical complete logical routes are deduplicated. Several
 retained routes may therefore share the same checkpoint prefix and diverge
 later in the lookahead.
 
 The global cutoff appears only after `beam` distinct complete logical routes
-are known. Its value is the worst retained raw total, shared by all input beams.
+are known. Its value is the worst retained weighted total, shared by all input beams.
 Increasing the beam therefore delays cutoff activation and can substantially
 increase exact-search work; the generated-state limit remains the hard bound.
 Lower bounds equal to the cutoff remain eligible. Expansion uses a fixed-size
@@ -577,18 +633,19 @@ bin. If multiple histories reach that state, only the lowest accumulated-cost
 history survives; ordered logical arc IDs break exact-cost ties. The survivor's
 visited-node set is used for later cycle rejection. This deliberate state merge
 closes reconvergent paths instead of enumerating every history. Exact crossing
-scores still use the proportional terminal fiberlet cost, and equal-bound
+scores integrate the segment profile through the terminal fiberlet, and equal-bound
 labels are processed before a width cutoff. Diagnostics report dominated
 labels separately from cost-bound pruning and exact completed candidates. Once
 stable prefixes exist, a worker searches for one prefix representative plus
 only enough extra candidates to fill globally unoccupied slots; it does not
 try to prove a local top 128 for every prefix.
 
-Costs are cumulative from the segment seed to each exact front. The entering
-join of a front-crossing fiberlet is charged fully and its edge cost is charged
-only in proportion to the distance inside the front. The complete crossing
-fiberlet remains in route geometry and visited state. Stable logical IDs,
-canonical worker merging, and one decision-wide state budget make output
+Front ranking retains the authoritative unweighted prefix through the decision
+checkpoint and adds the decoded weighted profile through each exact front. The
+entering join of a front-crossing fiberlet is charged at its checkpoint-relative
+weight and its edge profile is integrated only through the front. The complete
+crossing fiberlet remains in route geometry and visited state. Stable logical
+IDs, canonical worker merging, and one decision-wide state budget make output
 independent of expansion thread scheduling.
 
 In bounded mode, after pruning the checkpoint advances by `D`. Each retained history is
@@ -615,12 +672,28 @@ remain distinct. Visited anchors live in an immutable exact-key Patricia trie,
 so advancing a checkpoint does not copy the accumulated cycle set. Reference
 matching and Lasagna-normal threshold evaluation resume at the nearest already
 evaluated physical-history ancestor and process only the newly selected suffix.
+Decision scoring initializes the authoritative prefix from cumulative scalar
+cost at the history immediately before the checkpoint, then walks only the
+checkpoint-to-horizon suffix. Expired logical-route interning entries are
+reclaimed through a bounded persistent cursor rather than a whole-registry scan
+at every checkpoint. These bounds keep per-checkpoint bookkeeping independent
+of the distance already committed in the segment.
 The public point, match, step, and consumed-node vectors are assembled once at
 segment termination. Focused replay decision diagnostics are the deliberate
 exception: they request complete route payloads for every recorded decision and
 therefore may materialize those diagnostic histories.
 
-Beam-step, lookahead, prune distance, and search width are replay state only.
+The greedy and fiberlet evaluators run concurrently. `--threads N` is their
+shared evaluator worker budget: replay deterministically divides it between the
+two nested evaluators instead of creating up to `2N` workers. On the full
+46,148-base-voxel Paris4 interval at radius 768, the repaired hot-cache run with
+`--threads 32` crossed 64.7 percent at 11 seconds and completed in 22.34 seconds
+wall time (41.27 seconds user, 4.97 seconds system, 1.19 GiB peak RSS). It
+reported 14 greedy and 5 fiberlet failures; the complexity and scheduling
+changes do not alter failure evaluation.
+
+Beam-step, lookahead, prune distance, search width, geometric cost weight, and
+cost integration spacing are replay state only.
 They are absent from anchor/fiberlet cache fingerprints, extraction settings,
 and serialized chunk payloads. A new horizon can request previously untouched
 on-demand chunks, but a fully hot cache is reopened without rewriting it.
@@ -652,10 +725,12 @@ the deterministic two-endpoint index built once in each decoded prefix chunk.
 The separate anchor and fiberlet `ChunkCache` instances retain typed decoded
 payloads directly and charge their vectors and indices to the shared LRU
 budget; they do not retain another serialized copy or use a graph-private LRU.
-Prefix records and exact endpoint steps are sufficient for beam ranking and
-join scoring. Route blocks are loaded only for the current provisional best
-history during reference-error evaluation and for final output. Evicted chunks
-reload transparently.
+Prefix records and exact endpoint steps remain sufficient for connectivity and
+join scoring. Lookahead loads route blocks to obtain decoded segment densities
+and the route-lattice segment lengths; only selected routes are retained after
+the query. The current provisional best is additionally reconstructed for
+reference-error evaluation and final output. Evicted chunks reload
+transparently.
 For the float cache, anchors own the exact interpolated prediction/presence and
 normal samples used by eager graph construction, while prefixes own all five
 float path-cost components, the authoritative float path length, and the exact

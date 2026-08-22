@@ -418,6 +418,13 @@ FiberletGraphQuery<FiberletRouteLease> FiberletChunkGraphSource::route(const Fib
         result.error = "direct fiberlet route unexpectedly has interior geometry";
         return result;
     }
+    const size_t expectedSegmentCosts =
+        static_cast<size_t>(result.value.prefix.interiorPointCount) + 1;
+    if (result.value.route.segmentCostDensities.size() != expectedSegmentCosts) {
+        result.status = FiberletGraphQueryStatus::Error;
+        result.error = "fiberlet route cost-density count differs from its geometry";
+        return result;
+    }
     result.value.anchorPayloadLeases = {firstAnchor.value.payloadLease, secondAnchor.value.payloadLease};
     result.value.pointsPredictionXYZ = reconstructFiberletRoutePoints(
         firstAnchor.value.anchor.positionPredictionXYZ,
@@ -732,6 +739,35 @@ FiberletReplaySourceArc FiberletCachedReplayGraphSource::arc(const DirectedFiber
         result.targetPositionBaseXYZ = firstPosition;
         result.startStepBaseXYZ = -lastStep;
         result.endStepBaseXYZ = -firstStep;
+    }
+    return result;
+}
+
+FiberletReplaySourceCostProfile FiberletCachedReplayGraphSource::costProfile(
+    const DirectedFiberletStorageId& id) const
+{
+    const auto loaded = chunks_.route(id.fiberlet, true);
+    if (loaded.status != FiberletGraphQueryStatus::Ready)
+        throw std::runtime_error("cached fiberlet cost profile failed: " + loaded.error);
+    FiberletReplaySourceCostProfile result;
+    result.segmentLengthsPredictionVoxels.reserve(
+        loaded.value.pointsPredictionXYZ.size() - 1);
+    for (size_t segment = 1; segment < loaded.value.pointsPredictionXYZ.size(); ++segment) {
+        const float segmentLength = vectorLength(
+            loaded.value.pointsPredictionXYZ[segment] -
+            loaded.value.pointsPredictionXYZ[segment - 1]);
+        if (!(segmentLength > 0.0F) || !std::isfinite(segmentLength))
+            throw std::runtime_error("cached fiberlet route segment length is invalid");
+        result.segmentLengthsPredictionVoxels.push_back(segmentLength);
+    }
+    result.segmentCostDensities = loaded.value.route.segmentCostDensities;
+    if (id.reverse) {
+        std::reverse(
+            result.segmentLengthsPredictionVoxels.begin(),
+            result.segmentLengthsPredictionVoxels.end());
+        std::reverse(
+            result.segmentCostDensities.begin(),
+            result.segmentCostDensities.end());
     }
     return result;
 }

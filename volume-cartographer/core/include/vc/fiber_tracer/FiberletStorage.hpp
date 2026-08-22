@@ -85,7 +85,16 @@ struct FiberletStoredPrefix {
 
 struct FiberletStoredRoute {
     std::vector<std::array<std::int16_t, 2>> middleUV;
+    // Total metric cost per prediction-voxel for every reconstructed geometry
+    // segment, decoded from the fixed sqrt-density uint16 representation.
+    std::vector<float> segmentCostDensities;
 };
+
+inline constexpr float kFiberletStoredCostDensityMaximum = 256.0F;
+
+[[nodiscard]] std::uint16_t encodeFiberletStoredCostDensity(float density);
+
+[[nodiscard]] float decodeFiberletStoredCostDensity(std::uint16_t code);
 
 struct FiberletStorageCodecConfig {
     FiberletStorageProfile profile = FiberletStorageProfile::Float32Cache;

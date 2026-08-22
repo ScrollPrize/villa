@@ -190,6 +190,9 @@ void usage(const char* executable)
               << "  --route-stats-failure-margin N exclude this base-voxel distance around failures [128]\n"
               << "  --beam-step-distance N        rolling checkpoint step in base voxels [48]\n"
               << "  --lookahead-distance N        persistent beam lookahead in base voxels [384]\n"
+              << "  --cost-weight W               geometric cost weight per base voxel (0,1] [1]\n"
+              << "  --cost-delay N                full-weight distance before decay in base voxels [0]\n"
+              << "  --cost-step N                 cost integration step in base voxels [16]\n"
               << "  --search-width N              approximate intermediate width; zero is exact [0]\n"
               << "  --prune-distance N            approximate-mode pruning interval in base voxels [48]\n"
               << "  --vis                         write indexed local failure visualizations\n"
@@ -486,6 +489,15 @@ CliOptions parseArgs(int argc, char** argv)
         } else if (argument == "--lookahead-distance" && usesGraphReplayOptions(options.command)) {
             options.graphReplay.lookaheadDistanceBaseVoxels =
                 parseDouble(valueAfter(index, argc, argv, "lookahead-distance"), "lookahead-distance");
+        } else if (argument == "--cost-weight" && usesGraphReplayOptions(options.command)) {
+            options.graphReplay.geometricCostWeightPerBaseVoxel =
+                parseDouble(valueAfter(index, argc, argv, "cost-weight"), "cost-weight");
+        } else if (argument == "--cost-delay" && usesGraphReplayOptions(options.command)) {
+            options.graphReplay.geometricCostDelayBaseVoxels =
+                parseDouble(valueAfter(index, argc, argv, "cost-delay"), "cost-delay");
+        } else if (argument == "--cost-step" && usesGraphReplayOptions(options.command)) {
+            options.graphReplay.costIntegrationStepBaseVoxels =
+                parseDouble(valueAfter(index, argc, argv, "cost-step"), "cost-step");
         } else if (argument == "--search-width" && usesGraphReplayOptions(options.command)) {
             const int value = parseInt(valueAfter(index, argc, argv, "search-width"), "search-width");
             if (value < 0)
@@ -524,12 +536,26 @@ CliOptions parseArgs(int argc, char** argv)
             fail("paths and replay commands require --normal-manifest");
         vc::fiber_tracer::validateFiberletPathConfig(options.paths);
     }
-    if (usesGraphReplayOptions(options.command) &&
-        (!(options.graphReplay.beamStepDistanceBaseVoxels > 0.0) || !std::isfinite(options.graphReplay.beamStepDistanceBaseVoxels) ||
-         !(options.graphReplay.lookaheadDistanceBaseVoxels > 0.0) || !std::isfinite(options.graphReplay.lookaheadDistanceBaseVoxels) ||
-         (options.graphReplay.searchWidth != 0 && options.graphReplay.searchWidth < options.graphReplay.beamWidth) ||
-         !(options.graphReplay.pruneDistanceBaseVoxels > 0.0) || !std::isfinite(options.graphReplay.pruneDistanceBaseVoxels))) {
-        fail("graph search distances and widths are outside their valid range");
+    if (usesGraphReplayOptions(options.command)) {
+        if (!(options.graphReplay.geometricCostWeightPerBaseVoxel > 0.0) ||
+            options.graphReplay.geometricCostWeightPerBaseVoxel > 1.0 ||
+            !std::isfinite(options.graphReplay.geometricCostWeightPerBaseVoxel)) {
+            fail("--cost-weight must be finite and in (0,1]");
+        }
+        if (!(options.graphReplay.costIntegrationStepBaseVoxels > 0.0) ||
+            !std::isfinite(options.graphReplay.costIntegrationStepBaseVoxels)) {
+            fail("--cost-step must be finite and positive");
+        }
+        if (!(options.graphReplay.geometricCostDelayBaseVoxels >= 0.0) ||
+            !std::isfinite(options.graphReplay.geometricCostDelayBaseVoxels)) {
+            fail("--cost-delay must be finite and non-negative");
+        }
+        if (!(options.graphReplay.beamStepDistanceBaseVoxels > 0.0) || !std::isfinite(options.graphReplay.beamStepDistanceBaseVoxels) ||
+            !(options.graphReplay.lookaheadDistanceBaseVoxels > 0.0) || !std::isfinite(options.graphReplay.lookaheadDistanceBaseVoxels) ||
+            (options.graphReplay.searchWidth != 0 && options.graphReplay.searchWidth < options.graphReplay.beamWidth) ||
+            !(options.graphReplay.pruneDistanceBaseVoxels > 0.0) || !std::isfinite(options.graphReplay.pruneDistanceBaseVoxels)) {
+            fail("graph search distances and widths are outside their valid range");
+        }
     }
     if (isReplayCommand(options.command)) {
         if (!(options.failureThresholdBaseVoxels >= 0.0) || !(options.alongBaseVoxels > 0.0) || !(options.radiusBaseVoxels > 0.0) ||
@@ -681,6 +707,8 @@ vc::fiber_tracer::FiberletDatasetMetadata replayDatasetMetadata(
              << options.paths.smoothnessTangentWeight << ',' << options.paths.smoothnessFreeAngleDegrees << ";storage_schema=float_cache_v2"
              << ";corridor_selector=chunk_local_segment_aabb_v2"
              << ";corridor_radius_base=" << corridorRadiusBaseVoxels << ";corridor_reference=" << corridorReferenceBase.size();
+    if (kind == vc::fiber_tracer::FiberletDatasetKind::Fiberlets)
+        identity << ";route_cost_density_schema=sqrt_u16_max256_v1";
     if (cacheProfile.enabled()) {
         identity << ";evaluation_quantization_v=2"
                  << ";position_quantum_base=" << cacheProfile.geometry.positionQuantumBaseVoxels
@@ -2412,6 +2440,7 @@ int main(int argc, char** argv)
                 vc::fiber_tracer::selectForwardPolylineArcInterval(reference, fiber.controlPointLineIndices.front(), options.replayLengthBaseVoxels);
             const double startArc = interval.beginArc;
             const double endArc = interval.endArc;
+            options.graphReplay.recordDecisionDiagnostics = options.printStats;
             const auto requestedTrace = options.trace;
             auto effectiveTrace = requestedTrace;
             effectiveTrace.beamWidth = 1;
@@ -2649,6 +2678,17 @@ int main(int argc, char** argv)
             options.graphReplay.referenceBeginArcBase = startArc;
             options.graphReplay.referenceEndArcBase = endArc;
 
+            // The replay runs both evaluators concurrently. Treat --threads as
+            // their shared worker budget rather than assigning the full budget
+            // independently to each nested parallel search.
+            const int replayThreadBudget = std::max(1, options.paths.parallelThreads);
+            const int greedyReplayThreads = std::max(1, (replayThreadBudget + 1) / 2);
+            const size_t fiberletReplayThreads = static_cast<size_t>(
+                std::max(1, replayThreadBudget - greedyReplayThreads));
+            replayRequest.config.parallelThreads = greedyReplayThreads;
+            auto effectiveGraphReplay = options.graphReplay;
+            effectiveGraphReplay.expansionThreads = fiberletReplayThreads;
+
             size_t greedyFailureCount = 0;
             size_t fiberletFailureCount = 0;
             const auto failurePrinter = [&](vc::fiber_tracer::FiberReplayTracer tracer) {
@@ -2770,7 +2810,7 @@ int main(int argc, char** argv)
                                                                fiber.linePointsXyzBase,
                                                                *canonicalNormalSampler,
                                                                grid.predictionToBaseScale,
-                                                               options.graphReplay,
+                                                               effectiveGraphReplay,
                                                                failurePrinter(vc::fiber_tracer::FiberReplayTracer::Fiberlet),
                                                                progress)
                                                          : vc::fiber_tracer::traceFiberletGraphReplay(
@@ -2778,7 +2818,7 @@ int main(int argc, char** argv)
                                                                fiber.linePointsXyzBase,
                                                                *canonicalNormalSampler,
                                                                grid.predictionToBaseScale,
-                                                               options.graphReplay,
+                                                               effectiveGraphReplay,
                                                                failurePrinter(vc::fiber_tracer::FiberReplayTracer::Fiberlet),
                                                                progress);
                     overallProgress.updateFiberlet(1.0);
@@ -2849,7 +2889,7 @@ int main(int argc, char** argv)
             bundle.request = replayRequest;
             bundle.greedyReplay = std::move(*greedyReplay);
             bundle.fiberletReplay = std::move(*fiberletReplay);
-            bundle.fiberletReplayConfig = options.graphReplay;
+            bundle.fiberletReplayConfig = effectiveGraphReplay;
             bundle.requestedLengthBaseVoxels = options.replayLengthBaseVoxels;
             bundle.referenceGeometryBase = referenceGeometry;
             bundle.sources = {

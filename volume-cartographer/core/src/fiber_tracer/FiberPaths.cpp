@@ -1962,6 +1962,7 @@ FiberletCandidateResult solveCandidate(
             pathStepCost(nullptr, targetScoring.prediction, candidate.startAxisXYZ, chordLength, direction, chordLength, targetScoring.normal, targetScoring.normalValid, config);
         candidate.cost +=
             pathStepCost(&targetScoring.prediction, targetProxy, direction, chordLength, candidate.targetAxisXYZ, 0.0F, targetScoring.normal, targetScoring.normalValid, config);
+        candidate.segmentCosts = {candidate.cost};
         candidate.pointsPredictionXYZ = {candidate.startPositionPredictionXYZ, candidate.targetPositionPredictionXYZ};
         candidate.scoreValid = true;
         candidate.success = true;
@@ -2271,11 +2272,13 @@ FiberletCandidateResult solveCandidate(
     }
 
     std::vector<cv::Vec3f> reversed;
+    std::vector<size_t> reversedNodes;
     std::vector<std::array<std::int16_t, 2>> reversedLattice;
     size_t node = bestNode;
     size_t state = bestState;
     while (true) {
         reversed.push_back(nodePoint(nodes[node]));
+        reversedNodes.push_back(node);
         const auto local = unpackLocalNodeKey(nodes[node].key, prepared.keyLayout);
         if (local.transverseU < std::numeric_limits<std::int16_t>::min() ||
             local.transverseU > std::numeric_limits<std::int16_t>::max() ||
@@ -2296,6 +2299,7 @@ FiberletCandidateResult solveCandidate(
         state = previousState;
     }
     std::reverse(reversed.begin(), reversed.end());
+    std::reverse(reversedNodes.begin(), reversedNodes.end());
     std::reverse(reversedLattice.begin(), reversedLattice.end());
     candidate.routeLatticeUV = std::move(reversedLattice);
     candidate.pointsPredictionXYZ.push_back(candidate.startPositionPredictionXYZ);
@@ -2308,6 +2312,60 @@ FiberletCandidateResult solveCandidate(
     }
     if (!std::isfinite(bestCost.total()))
         throw std::runtime_error("fiberlet DP produced a non-finite path score");
+    candidate.segmentCosts.reserve(candidate.pointsPredictionXYZ.size() - 1);
+    for (size_t segment = 0; segment + 1 < candidate.pointsPredictionXYZ.size(); ++segment) {
+        const cv::Vec3f delta = candidate.pointsPredictionXYZ[segment + 1] - candidate.pointsPredictionXYZ[segment];
+        const float segmentLength = vectorLength(delta);
+        if (!(segmentLength > kEpsilon))
+            throw std::logic_error("fiberlet selected route contains a zero-length segment");
+        const cv::Vec3f segmentDirection = delta / segmentLength;
+        const cv::Vec3f previousDirection = segment == 0
+            ? candidate.startAxisXYZ
+            : normalized(candidate.pointsPredictionXYZ[segment] - candidate.pointsPredictionXYZ[segment - 1]);
+        const float previousLength = segment == 0
+            ? segmentLength
+            : vectorLength(candidate.pointsPredictionXYZ[segment] - candidate.pointsPredictionXYZ[segment - 1]);
+        const bool terminal = segment == reversedNodes.size();
+        const DpNodeScoring& scoring = dpNodes.at(dpNodes.existing(
+            terminal ? reversedNodes.back() : reversedNodes[segment]));
+        const FiberletPredictionSample* currentPrediction = nullptr;
+        FiberletPredictionSample currentStorage;
+        if (segment > 0) {
+            currentStorage = nodePrediction(dpNodes.at(dpNodes.existing(reversedNodes[segment - 1])));
+            currentPrediction = &currentStorage;
+        }
+        const FiberletPredictionSample nextPrediction = terminal
+            ? targetProxy
+            : nodePrediction(scoring);
+        candidate.segmentCosts.push_back(pathStepCost(
+            currentPrediction,
+            nextPrediction,
+            previousDirection,
+            previousLength,
+            segmentDirection,
+            segmentLength,
+            scoring.metricNormal,
+            (scoring.flags & kNodeNormalValid) != 0,
+            config));
+    }
+    FiberletPathCost decomposed;
+    for (const auto& cost : candidate.segmentCosts)
+        decomposed += cost;
+    const std::array decomposition{
+        std::pair{decomposed.invalidPrediction, bestCost.invalidPrediction},
+        std::pair{decomposed.alignment, bestCost.alignment},
+        std::pair{decomposed.isotropicSmoothness, bestCost.isotropicSmoothness},
+        std::pair{decomposed.tangentSmoothness, bestCost.tangentSmoothness},
+        std::pair{decomposed.normalSmoothness, bestCost.normalSmoothness},
+    };
+    for (const auto [actual, expected] : decomposition) {
+        const float tolerance =
+            1.0e-4F * std::max(1.0F, std::abs(expected));
+        if (std::abs(actual - expected) > tolerance) {
+            throw std::logic_error(
+                "fiberlet selected-route costs do not reproduce the DP objective");
+        }
+    }
     candidate.cost = bestCost;
     candidate.scoreValid = true;
     candidate.success = true;

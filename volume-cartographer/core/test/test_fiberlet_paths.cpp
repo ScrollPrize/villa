@@ -6,6 +6,7 @@
 #include "vc/fiber_tracer/FiberLocalScoring.hpp"
 #include "vc/fiber_tracer/FiberPaths.hpp"
 #include "vc/fiber_tracer/FiberletQuantization.hpp"
+#include "vc/fiber_tracer/FiberletStorage.hpp"
 #include "vc/lasagna/ChannelSampler.hpp"
 
 #include "../src/fiber_tracer/FiberLocalScoringInternal.hpp"
@@ -22,6 +23,7 @@
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <numeric>
 #include <random>
 #include <set>
 #include <string>
@@ -239,7 +241,40 @@ void addGraphPath(vc::fiber_tracer::FiberletPathReport& report, size_t startId, 
     candidate.reason = "success";
     candidate.cost.alignment = loss;
     candidate.pointsPredictionXYZ = std::move(points);
+    double totalLength = 0.0;
+    for (size_t index = 1; index < candidate.pointsPredictionXYZ.size(); ++index)
+        totalLength += cv::norm(candidate.pointsPredictionXYZ[index] - candidate.pointsPredictionXYZ[index - 1]);
+    for (size_t index = 1; index < candidate.pointsPredictionXYZ.size(); ++index) {
+        vc::fiber_tracer::FiberletPathCost segment;
+        segment.alignment = static_cast<float>(
+            loss * cv::norm(candidate.pointsPredictionXYZ[index] - candidate.pointsPredictionXYZ[index - 1]) /
+            totalLength);
+        candidate.segmentCosts.push_back(segment);
+    }
     report.candidates.push_back(std::move(candidate));
+}
+
+void addGraphPathWithSegmentLosses(
+    vc::fiber_tracer::FiberletPathReport& report,
+    size_t startId,
+    size_t targetId,
+    std::vector<cv::Vec3f> points,
+    const std::vector<float>& segmentLosses)
+{
+    REQUIRE(points.size() == segmentLosses.size() + 1);
+    addGraphPath(
+        report,
+        startId,
+        targetId,
+        std::move(points),
+        std::accumulate(segmentLosses.begin(), segmentLosses.end(), 0.0F));
+    auto& candidate = report.candidates.back();
+    candidate.segmentCosts.clear();
+    for (const float loss : segmentLosses) {
+        vc::fiber_tracer::FiberletPathCost segment;
+        segment.alignment = loss;
+        candidate.segmentCosts.push_back(segment);
+    }
 }
 
 std::filesystem::path temporaryPath(const std::string& tag)
@@ -1379,7 +1414,225 @@ TEST_CASE("exact fiberlet lookahead does not charge a join at its boundary")
     CHECK(route.completePathLengthPredictionVoxels == doctest::Approx(2.0));
     CHECK(route.edgeCost.total() == doctest::Approx(2.0));
     CHECK(route.transitionCost.total() == doctest::Approx(0.0));
-    CHECK(route.totalLoss == doctest::Approx(2.0));
+    const double storedDensity = vc::fiber_tracer::decodeFiberletStoredCostDensity(
+        vc::fiber_tracer::encodeFiberletStoredCostDensity(1.0F));
+    CHECK(route.totalLoss == doctest::Approx(2.0 * storedDensity));
+    CHECK(route.weightedEdgeLoss == doctest::Approx(route.totalLoss));
+    CHECK(route.weightedTransitionLoss == doctest::Approx(0.0));
+}
+
+TEST_CASE("geometric fiberlet cost weighting favors distant loss over near loss")
+{
+    auto report = graphPathReport();
+    addGraphPathWithSegmentLosses(
+        report, 0, 2, {{0, 0, 0}, {1, 0, 0}, {2, 0, 0}}, {0.0F, 10.0F});
+    addGraphPathWithSegmentLosses(
+        report, 0, 3, {{0, 0, 0}, {1, 0.1F, 0}, {2, 0.1F, 0}}, {6.0F, 0.0F});
+    const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
+
+    vc::fiber_tracer::FiberletGraphReplayConfig config;
+    config.beamStepDistanceBaseVoxels = 2.0;
+    config.lookaheadDistanceBaseVoxels = 2.0;
+    config.costIntegrationStepBaseVoxels = 1.0;
+    config.errorThresholdBaseVoxels = 100.0;
+    config.referenceEndArcBase = 2.0;
+    config.initialSeedKey = {{0, 0, 0}, 0};
+    config.recordDecisionDiagnostics = true;
+
+    const auto unweighted = vc::fiber_tracer::traceFiberletGraphReplay(
+        graph, {{0, 0, 0}, {2, 0, 0}}, replayYNormals(), 1.0, config);
+    REQUIRE_FALSE(unweighted.segments.empty());
+    REQUIRE_FALSE(unweighted.segments.front().candidateIndices.empty());
+    CHECK(unweighted.segments.front().candidateIndices.front() == 1);
+
+    config.geometricCostWeightPerBaseVoxel = 0.5;
+    const auto weighted = vc::fiber_tracer::traceFiberletGraphReplay(
+        graph, {{0, 0, 0}, {2, 0, 0}}, replayYNormals(), 1.0, config);
+    REQUIRE_FALSE(weighted.segments.empty());
+    REQUIRE_FALSE(weighted.segments.front().candidateIndices.empty());
+    CHECK(weighted.segments.front().candidateIndices.front() == 0);
+    REQUIRE_FALSE(weighted.segments.front().decisions.empty());
+    const auto& decision = weighted.segments.front().decisions.front();
+    REQUIRE(decision.selectedRouteIndex.has_value());
+    const auto& selected = decision.routes[*decision.selectedRouteIndex];
+    CHECK(selected.weightedEdgeLoss < unweighted.segments.front()
+            .decisions.front().routes.front().weightedEdgeLoss);
+
+    config.geometricCostDelayBaseVoxels = 1.0;
+    const auto delayed = vc::fiber_tracer::traceFiberletGraphReplay(
+        graph, {{0, 0, 0}, {2, 0, 0}}, replayYNormals(), 1.0, config);
+    REQUIRE_FALSE(delayed.segments.empty());
+    REQUIRE_FALSE(delayed.segments.front().candidateIndices.empty());
+    CHECK(delayed.segments.front().candidateIndices.front() == 1);
+}
+
+TEST_CASE("weight-one replay uses decoded segment costs without aggregate correction")
+{
+    auto report = graphPathReport();
+    addGraphPathWithSegmentLosses(
+        report,
+        0,
+        1,
+        {{0, 0, 0}, {1, 0, 0}, {2, 0, 0}},
+        {1.0F, 3.0F});
+    report.candidates.back().cost.alignment = 100.0F;
+    const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
+
+    vc::fiber_tracer::FiberletGraphReplayConfig config;
+    config.beamStepDistanceBaseVoxels = 2.0;
+    config.lookaheadDistanceBaseVoxels = 2.0;
+    config.errorThresholdBaseVoxels = 100.0;
+    config.referenceEndArcBase = 2.0;
+    config.initialSeedKey = {{0, 0, 0}, 0};
+    config.recordDecisionDiagnostics = true;
+
+    const double expectedDecodedProfileCost =
+        vc::fiber_tracer::decodeFiberletStoredCostDensity(
+            vc::fiber_tracer::encodeFiberletStoredCostDensity(1.0F)) +
+        vc::fiber_tracer::decodeFiberletStoredCostDensity(
+            vc::fiber_tracer::encodeFiberletStoredCostDensity(3.0F));
+    std::optional<std::vector<size_t>> selectedCandidates;
+    for (const double costStep : {0.25, 0.7, 3.0}) {
+        config.costIntegrationStepBaseVoxels = costStep;
+        const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(
+            graph, {{0, 0, 0}, {2, 0, 0}}, replayYNormals(), 1.0, config);
+        REQUIRE(replay.failures.empty());
+        REQUIRE(replay.segments.size() == 1);
+        REQUIRE(replay.segments.front().decisions.size() == 1);
+        REQUIRE(replay.segments.front().decisions.front().routes.size() == 1);
+        const auto& route = replay.segments.front().decisions.front().routes.front();
+        CHECK(route.edgeCost.total() == doctest::Approx(100.0));
+        CHECK(route.weightedEdgeLoss ==
+              doctest::Approx(expectedDecodedProfileCost).epsilon(1.0e-12));
+        CHECK(route.totalLoss ==
+              doctest::Approx(expectedDecodedProfileCost).epsilon(1.0e-12));
+        if (!selectedCandidates.has_value())
+            selectedCandidates = replay.segments.front().candidateIndices;
+        else
+            CHECK(replay.segments.front().candidateIndices == *selectedCandidates);
+    }
+}
+
+TEST_CASE("persistent replay preserves pre-checkpoint cost for equal futures")
+{
+    auto report = graphPathReport();
+    addGraphPath(report, 0, 1, {{0, 0, 0}, {1, 0, 0}}, 1.0F);
+    addGraphPath(report, 1, 2, {{1, 0, 0}, {2, 0, 0}}, 0.0F);
+    addGraphPath(report, 2, 3, {{2, 0, 0}, {3, 0, 0}}, 0.0F);
+    addGraphPath(report, 0, 10, {{0, 0, 0}, {1, 0, 0}}, 5.0F);
+    addGraphPath(report, 10, 11, {{1, 0, 0}, {2, 0, 0}}, 0.0F);
+    addGraphPath(report, 11, 12, {{2, 0, 0}, {3, 0, 0}}, 0.0F);
+    const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
+
+    vc::fiber_tracer::FiberletGraphReplayConfig config;
+    config.beamWidth = 2;
+    config.beamStepDistanceBaseVoxels = 1.0;
+    config.lookaheadDistanceBaseVoxels = 2.0;
+    config.errorThresholdBaseVoxels = 100.0;
+    config.referenceEndArcBase = 3.0;
+    config.initialSeedKey = {{0, 0, 0}, 0};
+    config.recordDecisionDiagnostics = true;
+    const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(
+        graph, {{0, 0, 0}, {3, 0, 0}}, replayYNormals(), 1.0, config);
+
+    REQUIRE(replay.failures.empty());
+    REQUIRE(replay.segments.size() == 1);
+    REQUIRE(replay.segments.front().decisions.size() >= 2);
+    const auto& second = replay.segments.front().decisions[1];
+    REQUIRE(second.routes.size() == 2);
+    CHECK(second.checkpointPathLengthPredictionVoxels == doctest::Approx(1.0));
+    CHECK(second.routes[0].totalLoss == doctest::Approx(1.0));
+    CHECK(second.routes[1].totalLoss == doctest::Approx(5.0));
+    CHECK(second.routes[0].weightedEdgeLoss == doctest::Approx(0.0));
+    CHECK(second.routes[1].weightedEdgeLoss == doctest::Approx(0.0));
+    const vc::fiber_tracer::FiberletStorageKey cheapTarget{{0, 0, 1}, 0};
+    const vc::fiber_tracer::FiberletStorageKey expensiveTarget{{0, 0, 10}, 0};
+    REQUIRE_FALSE(second.routes[0].prefixLogicalArcs.empty());
+    REQUIRE_FALSE(second.routes[1].prefixLogicalArcs.empty());
+    CHECK(second.routes[0].prefixLogicalArcs.front().fiberlet.second == cheapTarget);
+    CHECK(second.routes[1].prefixLogicalArcs.front().fiberlet.second == expensiveTarget);
+}
+
+TEST_CASE("persistent replay initialization work is independent of committed prefix length")
+{
+    constexpr size_t edgeCount = 96;
+    auto report = graphPathReport();
+    for (size_t edge = 0; edge < edgeCount; ++edge) {
+        const float begin = static_cast<float>(edge);
+        const float end = static_cast<float>(edge + 1);
+        addGraphPath(
+            report,
+            edge,
+            edge + 1,
+            {{begin, 0, 0}, {end, 0, 0}},
+            1.0F);
+    }
+    const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
+
+    vc::fiber_tracer::FiberletGraphReplayConfig config;
+    config.beamWidth = 1;
+    config.beamStepDistanceBaseVoxels = 1.0;
+    config.lookaheadDistanceBaseVoxels = 4.0;
+    config.errorThresholdBaseVoxels = 100.0;
+    config.referenceEndArcBase = static_cast<double>(edgeCount);
+    config.initialSeedKey = {{0, 0, 0}, 0};
+    config.recordDecisionDiagnostics = true;
+    const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(
+        graph,
+        {{0, 0, 0}, {static_cast<double>(edgeCount), 0, 0}},
+        replayYNormals(),
+        1.0,
+        config);
+
+    REQUIRE(replay.failures.empty());
+    REQUIRE(replay.segments.size() == 1);
+    REQUIRE(replay.segments.front().decisions.size() >= edgeCount - 1);
+    for (const auto& decision : replay.segments.front().decisions) {
+        CHECK(decision.initializationHistoryNodeCount <= 5);
+        CHECK(decision.logicalRouteCleanupVisitedCount <= 4096);
+    }
+}
+
+TEST_CASE("geometric fiberlet cost delay splits a non-grid integration cell")
+{
+    auto report = graphPathReport();
+    addGraphPathWithSegmentLosses(
+        report,
+        0,
+        1,
+        {{0, 0, 0}, {1, 0, 0}, {2, 0, 0}, {3, 0, 0}, {4, 0, 0}},
+        {1.0F, 1.0F, 1.0F, 1.0F});
+    const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
+
+    vc::fiber_tracer::FiberletGraphReplayConfig config;
+    config.beamStepDistanceBaseVoxels = 4.0;
+    config.lookaheadDistanceBaseVoxels = 4.0;
+    config.geometricCostWeightPerBaseVoxel = 0.5;
+    config.geometricCostDelayBaseVoxels = 1.5;
+    config.costIntegrationStepBaseVoxels = 3.0;
+    config.errorThresholdBaseVoxels = 100.0;
+    config.referenceEndArcBase = 4.0;
+    config.initialSeedKey = {{0, 0, 0}, 0};
+    config.recordDecisionDiagnostics = true;
+
+    const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(
+        graph, {{0, 0, 0}, {4, 0, 0}}, replayYNormals(), 1.0, config);
+    REQUIRE_FALSE(replay.segments.empty());
+    REQUIRE_FALSE(replay.segments.front().decisions.empty());
+    const auto& route = replay.segments.front().decisions.front().routes.front();
+    const double storedDensity = vc::fiber_tracer::decodeFiberletStoredCostDensity(
+        vc::fiber_tracer::encodeFiberletStoredCostDensity(1.0F));
+    const double expected = storedDensity *
+        (1.5 + 1.5 * std::pow(0.5, 0.75) + std::pow(0.5, 2.0));
+    CHECK(route.weightedEdgeLoss == doctest::Approx(expected));
+
+    config.geometricCostDelayBaseVoxels = 5.0;
+    const auto beyondHorizon = vc::fiber_tracer::traceFiberletGraphReplay(
+        graph, {{0, 0, 0}, {4, 0, 0}}, replayYNormals(), 1.0, config);
+    REQUIRE_FALSE(beyondHorizon.segments.empty());
+    REQUIRE_FALSE(beyondHorizon.segments.front().decisions.empty());
+    CHECK(beyondHorizon.segments.front().decisions.front().routes.front()
+              .weightedEdgeLoss == doctest::Approx(4.0 * storedDensity));
 }
 
 TEST_CASE("exact fiberlet lookahead rejects invalid active costs")
@@ -1399,6 +1652,9 @@ TEST_CASE("exact fiberlet lookahead rejects invalid active costs")
     graph.edges.front().cost.alignment = 1.0F;
     REQUIRE_FALSE(graph.transitions.empty());
     graph.transitions.front().cost.alignment = std::numeric_limits<float>::infinity();
+    CHECK_THROWS_AS(vc::fiber_tracer::traceFiberletGraphReplay(graph, {{0, 0, 0}, {2, 0, 0}}, replayYNormals(), 1.0, config), std::invalid_argument);
+    graph.transitions.front().cost.alignment = 0.0F;
+    config.geometricCostDelayBaseVoxels = -1.0;
     CHECK_THROWS_AS(vc::fiber_tracer::traceFiberletGraphReplay(graph, {{0, 0, 0}, {2, 0, 0}}, replayYNormals(), 1.0, config), std::invalid_argument);
 }
 
@@ -1872,7 +2128,7 @@ TEST_CASE("fiberlet graph replay clips a failure edge then records an uncovered 
     CHECK(replay.failures[1].reason == "no_usable_seed_for_remaining_reference");
     CHECK(replay.completedReferenceArcBase == doctest::Approx(3.0));
     const auto json = vc::fiber_tracer::fiberletGraphReplayJson(replay, config);
-    CHECK(json.at("version") == 2);
+    CHECK(json.at("version") == 3);
     CHECK(json.at("config").at("threshold").at("shape") == "lasagna_normal_ellipsoid");
     CHECK(json.at("config").at("threshold").at("normal_radius_base_voxels") == doctest::Approx(0.5));
     CHECK(json.at("config").at("threshold").at("tangential_radius_base_voxels") == doctest::Approx(2.0));
@@ -1936,8 +2192,10 @@ TEST_CASE("fiberlet graph replay can force the original focused seed")
     CHECK(selected.committedEdgeCost.alignment == doctest::Approx(1.0));
     CHECK(selected.committedTransitionCost.total() == doctest::Approx(0.0));
     CHECK(selected.committedPathLengthPredictionVoxels == doctest::Approx(1.0));
-    CHECK(selected.totalLoss == doctest::Approx(1.0));
-    CHECK(selected.lossPerPredictionVoxel == doctest::Approx(1.0));
+    const double storedDensity = vc::fiber_tracer::decodeFiberletStoredCostDensity(
+        vc::fiber_tracer::encodeFiberletStoredCostDensity(1.0F));
+    CHECK(selected.totalLoss == doctest::Approx(storedDensity));
+    CHECK(selected.lossPerPredictionVoxel == doctest::Approx(storedDensity));
     CHECK(selected.routePointsBaseXYZ.size() == 2);
     REQUIRE(replay.segments.front().committedSteps.size() == 1);
     const auto& committed = replay.segments.front().committedSteps.front();
@@ -2484,6 +2742,33 @@ TEST_CASE("fiberlet DP uses multiplicative presence and unoriented predictions")
     const float quantizedCost = 6.0F * (1.0F - 128.0F / 255.0F);
     CHECK(report.candidates[0].cost.alignment == doctest::Approx(quantizedCost).epsilon(1.0e-5));
     CHECK(report.candidates[0].cost.total() == doctest::Approx(quantizedCost).epsilon(1.0e-5));
+    REQUIRE(report.candidates[0].segmentCosts.size() + 1 ==
+            report.candidates[0].pointsPredictionXYZ.size());
+    const float decomposedCost = std::accumulate(
+        report.candidates[0].segmentCosts.begin(),
+        report.candidates[0].segmentCosts.end(), 0.0F,
+        [](float sum, const auto& cost) { return sum + cost.total(); });
+    CHECK(decomposedCost == doctest::Approx(report.candidates[0].cost.total())
+                                .epsilon(1.0e-5));
+}
+
+TEST_CASE("direct fiberlet DP emits one segment cost sample")
+{
+    const auto anchors = twoAnchorArtifact(
+        {1.0, 0.0, 0.0}, {1.0, 0.0, 0.0},
+        {2.0, 4.0, 4.0}, {4.0, 4.0, 4.0});
+    auto config = pathConfig();
+    config.corridorRadiusPredictionVoxels = 0.01;
+    const ConstantNormalSampler normals;
+    const auto report = vc::fiber_tracer::traceFiberletPaths(
+        anchors, anchors.report.grid, config, constantPredictions(), normals);
+
+    REQUIRE(report.diagnostics.successfulPaths == 1);
+    REQUIRE(report.candidates.size() == 1);
+    REQUIRE(report.candidates[0].pointsPredictionXYZ.size() == 2);
+    REQUIRE(report.candidates[0].segmentCosts.size() == 1);
+    CHECK(report.candidates[0].segmentCosts[0].total() ==
+          doctest::Approx(report.candidates[0].cost.total()));
 }
 
 TEST_CASE("fiberlet multiplicative alignment changes the selected route")

@@ -729,6 +729,18 @@ FiberletChunkDataset::MaterializedChunk FiberletOnDemandPreprocessor::generateFi
         }
         if (candidate.pointsPredictionXYZ.size() < 2)
             throw std::logic_error("successful fiberlet has no endpoint steps");
+        if (candidate.segmentCosts.size() + 1 != candidate.pointsPredictionXYZ.size())
+            throw std::logic_error("successful fiberlet segment costs differ from its geometry");
+        stored.route.segmentCostDensities.reserve(candidate.segmentCosts.size());
+        for (size_t segment = 0; segment < candidate.segmentCosts.size(); ++segment) {
+            const float segmentLength = cv::norm(
+                candidate.pointsPredictionXYZ[segment + 1] -
+                candidate.pointsPredictionXYZ[segment]);
+            if (!(segmentLength > 0.0F) || !std::isfinite(segmentLength))
+                throw std::logic_error("successful fiberlet segment length is invalid");
+            stored.route.segmentCostDensities.push_back(
+                candidate.segmentCosts[segment].total() / segmentLength);
+        }
         stored.prefix.pathLengthPredictionVoxels = fiberletCandidatePathLength(candidate);
         stored.prefix.cost = {
             candidate.cost.invalidPrediction,

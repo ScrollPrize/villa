@@ -356,7 +356,11 @@ TEST_CASE("Fiberlet storage prefixes and independently cached routes round trip"
          .firstStepBaseXYZ = {1.0F, 0.0F, 0.25F},
          .lastStepBaseXYZ = {1.0F, 0.0F, -0.25F}},
     };
-    const std::vector<FiberletStoredRoute> routes{{{{0, 1}, {1, 1}}}, {}};
+    const std::vector<FiberletStoredRoute> routes{
+        {.middleUV = {{0, 1}, {1, 1}},
+         .segmentCostDensities = {0.25F, 0.5F, 0.75F, 1.0F, 1.25F}},
+        {.middleUV = {}, .segmentCostDensities = {2.0F, 3.0F, 4.0F}},
+    };
     const auto decodedPrefixes = deserializeFiberletPrefixes(serializeFiberletPrefixes(config, prefixes));
     const auto decodedRoutes = deserializeFiberletRoutes(serializeFiberletRoutes(config, routes));
     REQUIRE(decodedPrefixes.prefixes.size() == 2);
@@ -372,6 +376,34 @@ TEST_CASE("Fiberlet storage prefixes and independently cached routes round trip"
     REQUIRE(decodedRoutes.routes.size() == 2);
     CHECK(decodedRoutes.routes[0].middleUV == routes[0].middleUV);
     CHECK(decodedRoutes.routes[1].middleUV.empty());
+    REQUIRE(decodedRoutes.routes[0].segmentCostDensities.size() == 5);
+    for (size_t index = 0; index < routes[0].segmentCostDensities.size(); ++index) {
+        CHECK(decodedRoutes.routes[0].segmentCostDensities[index] ==
+              doctest::Approx(routes[0].segmentCostDensities[index]).epsilon(2.0e-4));
+    }
+}
+
+TEST_CASE("Fiberlet stored cost density uses fixed sqrt uint16 quantization")
+{
+    for (const float density : {0.0F, 0.25F, 1.0F, 16.0F, 255.0F, 256.0F}) {
+        const auto code = encodeFiberletStoredCostDensity(density);
+        const float decoded = decodeFiberletStoredCostDensity(code);
+        CHECK(decoded == doctest::Approx(density).epsilon(5.0e-4));
+    }
+    CHECK(encodeFiberletStoredCostDensity(0.0F) == 0);
+    CHECK(encodeFiberletStoredCostDensity(256.0F) ==
+          std::numeric_limits<std::uint16_t>::max());
+    CHECK(encodeFiberletStoredCostDensity(1000.0F) ==
+          std::numeric_limits<std::uint16_t>::max());
+    CHECK(decodeFiberletStoredCostDensity(
+              std::numeric_limits<std::uint16_t>::max()) ==
+          doctest::Approx(256.0F));
+    CHECK_THROWS_AS(
+        encodeFiberletStoredCostDensity(-1.0F), std::invalid_argument);
+    CHECK_THROWS_AS(
+        encodeFiberletStoredCostDensity(
+            std::numeric_limits<float>::infinity()),
+        std::invalid_argument);
 }
 
 TEST_CASE("Fiberlet route reconstruction restores unoriented endpoint axes")
@@ -637,7 +669,11 @@ TEST_CASE("Fiberlet chunk graph loads complete cross-chunk adjacency and routes"
                 return materialized(kind, serializeFiberletPrefixes(config, prefixes));
             }
             ++routeRequests;
-            const std::vector<FiberletStoredRoute> routes = owner ? std::vector<FiberletStoredRoute>{{}} : std::vector<FiberletStoredRoute>{};
+            const std::vector<FiberletStoredRoute> routes =
+                owner ? std::vector<FiberletStoredRoute>{{
+                            .middleUV = {},
+                            .segmentCostDensities = {9.25F}}}
+                      : std::vector<FiberletStoredRoute>{};
             return materialized(kind, serializeFiberletRoutes(config, routes));
         },
         fiberletCacheOptions);

@@ -1,3 +1,38 @@
+# 2026-08-22: geometrically weighted fiberlet substep costs
+
+- Removed two long-route quadratic paths discovered after the 5k validation.
+  Score initialization now reads cumulative prefix scalars and visits only the
+  checkpoint/lookahead suffix, while logical-route cleanup uses a bounded
+  persistent cursor instead of rescanning the complete registry.
+- Made `fiberlet-replay --threads` one shared budget for its concurrently
+  running greedy and fiberlet evaluators. This removes the 32-logical-CPU
+  oversubscription cliff without changing search ordering.
+- A hot-cache full Paris4 radius-768 replay crossed the former 65-percent
+  slowdown point at 12 seconds and completed in 22.34 seconds wall time, with
+  14 greedy and 5 fiberlet failures.
+- Repaired the scorer after the first profile integration changed more than the
+  checkpoint-forward term. Ranking now preserves the authoritative unweighted
+  prefix through the checkpoint and integrates decoded subsegment costs only
+  from the checkpoint through the horizon. Decoded profiles are not rescaled to
+  the separately stored whole-edge cost, and one integrator handles every
+  weight, including `W=1`.
+- Restored conservative relaxed cost-to-go pruning and incremental scalar score
+  state. Ordinary cached arc queries no longer load route payloads; profiles use
+  a bounded decision-local cache. On the Paris4 5k hot-cache benchmark, repaired
+  `W=1` had zero fiberlet failures and median wall/CPU ratios of 1.18x/1.21x
+  versus pinned revision `64e5341`.
+- Added opt-in delayed geometric falloff through replay-only `--cost-delay`;
+  zero preserves immediate decay and 192 base voxels covers half the default
+  lookahead before decay begins.
+- Persisted fixed-sqrt `uint16` cost density for every selected DP route
+  segment and changed exact and bounded graph lookahead to integrate those
+  profiles on a checkpoint-rooted base-distance grid.
+- Added replay-only `--cost-weight` and `--cost-step` controls. Weighted ranking
+  remains separate from the unchanged five-component committed diagnostics.
+- On the Paris4 5,000-base-voxel interval, `W=0.99` at both 16- and
+  32-base-voxel spacing completed with zero fiberlet failures, matching the
+  unweighted stored-profile run.
+
 # 2026-08-22: fractional fiberlet endpoint evaluation
 
 - Replaced the unpublished combined q1/u8 matrix row with a 0.125-base-voxel
