@@ -156,24 +156,41 @@ class Min3BrickPool:
         brick_idx = torch.div(source, self._brick, rounding_mode='floor')
         slots = self.table[brick_idx[:, 0], brick_idx[:, 1],
                            brick_idx[:, 2]].to(torch.long)
-        local = source - brick_idx * self._brick
+        # local = source - brick_idx * brick, through the two tensors that
+        # already exist rather than into a third.  At the batch sizes the
+        # fitter gathers, one more live (n, 3) int64 is 24 bytes per index of
+        # peak, which is six times what the words it decodes cost.
+        brick_idx.mul_(self._brick)
+        source.sub_(brick_idx)
+        del brick_idx
+        lz, ly, lx = source[:, 0], source[:, 1], source[:, 2]
 
         side = self.side
-        bz = torch.div(local[:, 0], side, rounding_mode='floor')
-        by = torch.div(local[:, 1], side, rounding_mode='floor')
-        bx = torch.div(local[:, 2], side, rounding_mode='floor')
-        block = (bz * self._bps + by) * self._bps + bx
-        # Position inside the 2^3 block, in the same (z,y,x) order the packer
-        # laid the codes down.
-        j = (((local[:, 0] - bz * side) * side
-              + (local[:, 1] - by * side)) * side
-             + (local[:, 2] - bx * side))
+        bz = torch.div(lz, side, rounding_mode='floor')
+        by = torch.div(ly, side, rounding_mode='floor')
+        bx = torch.div(lx, side, rounding_mode='floor')
+        # The shift operand, 8 + 3j, built in int32 and in place.  j is the
+        # position inside the 2^3 block, in the same (z,y,x) order the packer
+        # laid the codes down; it never reaches 8, so carrying it as int64 and
+        # then widening it to the shape of the words -- which is what the first
+        # version of this did -- cost more scratch than the codes it decodes.
+        shift = lz.sub(bz * side).to(torch.int32)
+        shift.mul_(side).add_(ly.sub(by * side).to(torch.int32))
+        shift.mul_(side).add_(lx.sub(bx * side).to(torch.int32))
+        shift.mul_(3).add_(8)
+        block = bz.mul_(self._bps).add_(by).mul_(self._bps).add_(bx)
+        del by, bx, lz, ly, lx, source
 
+        # Advanced indexing returns a fresh tensor, so the decode can run in
+        # place without touching the resident words.
         w = self.words[:, slots, block]                     # (channels, n) int32
-        mn = torch.bitwise_and(w, 0xFF)
-        shift = (8 + 3 * j).to(torch.int32).unsqueeze(0).expand_as(w)
-        code = torch.bitwise_and(torch.bitwise_right_shift(w, shift), 7)
-        values = (mn + code).to(torch.uint8).transpose(0, 1)
+        del block, slots
+        code = torch.bitwise_right_shift(w, shift)   # (channels, n) >> (n,)
+        code.bitwise_and_(7)
+        w.bitwise_and_(0xFF)                                # w is now the minima
+        w.add_(code)
+        del code, shift
+        values = w.to(torch.uint8).transpose(0, 1)
 
         elapsed = time.perf_counter() - started
         self._gather_seconds += elapsed
