@@ -64,6 +64,57 @@
 
 // --- Lasagna RPCs + workspace switching ---
 
+QJsonObject AgentBridgeServer::handleLasagnaAttachManifest(
+    const QJsonValue& params)
+{
+    if (!_window || !_window->_state || !_window->_state->hasVpkg())
+        throw AgentBridgeError{-32000, "No volume package loaded", {}};
+    if (!_window->_menuController)
+        throw AgentBridgeError{-32005, "Project attachment controller unavailable", {}};
+
+    const QJsonObject request = params.toObject();
+    const QString location = request.value(QStringLiteral("location")).toString();
+    const bool fiberInference =
+        request.value(QStringLiteral("role")).toString()
+        == QLatin1String("fiber_inference");
+    const bool select = request.value(QStringLiteral("select")).toBool(true);
+    const int token = beginDeferred(120000, "Lasagna manifest attachment");
+
+    QString error;
+    const bool started = _window->_menuController->startLasagnaManifestAttachment(
+        location, fiberInference, select,
+        [this, token, location, fiberInference, select](
+            const QString& error, bool attached,
+            const QStringList& attachedVolumeIds) {
+            if (!error.isEmpty()) {
+                completeDeferredError(
+                    token, -32005, "Lasagna manifest attachment failed",
+                    {{QStringLiteral("detail"), error}});
+                return;
+            }
+            QJsonArray volumeIds;
+            for (const QString& id : attachedVolumeIds)
+                volumeIds.append(id);
+            completeDeferredResult(
+                token,
+                {{QStringLiteral("attached"), attached},
+                 {QStringLiteral("alreadyAttached"), !attached},
+                 {QStringLiteral("manifestLocation"), location},
+                 {QStringLiteral("role"),
+                  fiberInference ? QStringLiteral("fiber_inference")
+                                 : QStringLiteral("regular")},
+                 {QStringLiteral("selected"), select},
+                 {QStringLiteral("volumeIds"), volumeIds}});
+        },
+        &error);
+    if (!started) {
+        completeDeferredError(
+            token, -32005, "Lasagna manifest attachment failed",
+            {{QStringLiteral("detail"), error}});
+    }
+    throw AgentBridgeDeferred{};
+}
+
 QJsonObject AgentBridgeServer::handleLasagnaServiceStatus(const QJsonValue&)
 {
     LasagnaServiceManager& mgr = LasagnaServiceManager::instance();
@@ -407,6 +458,8 @@ QJsonObject AgentBridgeServer::handleWorkspaceSwitch(const QJsonValue& params)
         _window->switchToMainWorkspace();
     } else if (name == QLatin1String("lasagna")) {
         _window->switchToLasagnaWorkspace();
+    } else if (name == QLatin1String("spiral")) {
+        _window->switchToSpiralWorkspace();
     } else {
         _window->switchToFiberSliceWorkspace();
     }

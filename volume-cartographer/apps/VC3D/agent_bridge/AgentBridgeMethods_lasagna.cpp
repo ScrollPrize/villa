@@ -116,6 +116,25 @@ void AgentBridgeServer::registerLasagnaHandlers()
 
     registerMethod(
         {
+            .name = QStringLiteral("lasagna.attach_manifest"),
+            .params = {
+                Params::requiredString(QStringLiteral("location")),
+                Params::requiredStringEnum(
+                    QStringLiteral("role"),
+                    {QStringLiteral("regular"),
+                     QStringLiteral("fiber_inference")}),
+                Params::optionalBoolean(QStringLiteral("select"), true),
+            },
+            .errors = {-32602, -32000, -32005},
+            .mcp = Mcp::snakeCase(
+                QStringLiteral("vc3d_attach_lasagna_manifest")),
+        },
+        [this](const QJsonValue& p) {
+            return handleLasagnaAttachManifest(p);
+        });
+
+    registerMethod(
+        {
             .name = QStringLiteral("workspace.switch"),
             .params = {
                 Params::requiredStringEnum(
@@ -123,6 +142,7 @@ void AgentBridgeServer::registerLasagnaHandlers()
                     {
                         QStringLiteral("main"),
                         QStringLiteral("lasagna"),
+                        QStringLiteral("spiral"),
                         QStringLiteral("fiber_slice"),
                     }),
             },

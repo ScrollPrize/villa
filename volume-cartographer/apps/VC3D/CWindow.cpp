@@ -4317,6 +4317,19 @@ void CWindow::switchToLasagnaWorkspace()
     }
 }
 
+void CWindow::switchToSpiralWorkspace()
+{
+    if (!_workspaceTabs || !_spiralWorkspaceWindow) {
+        return;
+    }
+    const int index = _workspaceTabs->indexOf(_spiralWorkspaceWindow);
+    if (index >= 0) {
+        _workspaceTabs->setCurrentIndex(index);
+        _spiralWorkspaceWindow->raise();
+        _spiralWorkspaceWindow->setFocus(Qt::ShortcutFocusReason);
+    }
+}
+
 void CWindow::switchToMainWorkspace()
 {
     if (!_workspaceTabs || !_segmentWorkspaceWindow) {

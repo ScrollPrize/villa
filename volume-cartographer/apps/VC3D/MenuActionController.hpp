@@ -3,6 +3,7 @@
 #include <QObject>
 #include <QFutureWatcher>
 #include <QPointer>
+#include <QStringList>
 #include <array>
 #include <atomic>
 #include <memory>
@@ -92,6 +93,18 @@ public:
     // True while any sample open is in flight.
     bool openDataSampleOpenInFlight() const;
 
+    // Non-interactive counterpart of File -> Attach (Remote) Lasagna
+    // Manifest. It reuses the same validation, authentication, background
+    // preparation, and transactional project update as the GUI action.
+    bool startLasagnaManifestAttachment(
+        const QString& location,
+        bool fiberInference,
+        bool select,
+        std::function<void(const QString& error,
+                           bool attached,
+                           const QStringList& volumeIds)> onFinished,
+        QString* errorMessage = nullptr);
+
 private slots:
     void newProject();
     void saveProjectAs();
@@ -144,6 +157,15 @@ private:
     void updateRecentRemoteList(const QString& url);
     void attachRemoteZarrUrl(const QString& url);
     void beginLasagnaManifestAttachment(bool remote);
+    bool startLasagnaManifestAttachmentImpl(
+        const QString& location,
+        bool fiberInference,
+        bool select,
+        bool interactive,
+        std::function<void(const QString& error,
+                           bool attached,
+                           const QStringList& volumeIds)> onFinished,
+        QString* errorMessage);
     struct LasagnaAttachTaskResult;
     bool openOpenDataSample(const vc3d::opendata::OpenDataSample& sample,
                             bool interactive = true,

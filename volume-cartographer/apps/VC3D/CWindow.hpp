@@ -245,6 +245,7 @@ private:
     void updateAtlasSearchPreviewRequests();
     void requestAtlasSearchPreviewLine(int sortedResultIndex);
     void switchToLasagnaWorkspace();
+    void switchToSpiralWorkspace();
     void switchToMainWorkspace();
     void switchToFiberSliceWorkspace();
     void openLineAnnotationWorkspace(LineAnnotationDialog* dialog, const QString& title);

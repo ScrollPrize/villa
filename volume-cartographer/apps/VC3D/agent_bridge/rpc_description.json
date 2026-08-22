@@ -1138,6 +1138,39 @@
         "type": "object"
       }
     },
+    "lasagna.attach_manifest": {
+      "errors": [
+        -32602,
+        -32000,
+        -32005
+      ],
+      "mcp": {
+        "tool": "vc3d_attach_lasagna_manifest"
+      },
+      "params": {
+        "properties": {
+          "location": {
+            "type": "string"
+          },
+          "role": {
+            "enum": [
+              "regular",
+              "fiber_inference"
+            ],
+            "type": "string"
+          },
+          "select": {
+            "default": true,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "location",
+          "role"
+        ],
+        "type": "object"
+      }
+    },
     "lasagna.cancel": {
       "errors": [
         -32602,
@@ -3126,6 +3159,347 @@
         "type": "object"
       }
     },
+    "spiral.checkpoint_download": {
+      "errors": [
+        -32602,
+        -32005,
+        -32007
+      ],
+      "mcp": {
+        "paramRenames": {
+          "localPath": "local_path"
+        },
+        "tool": "vc3d_spiral_download_checkpoint"
+      },
+      "params": {
+        "properties": {
+          "localPath": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "localPath"
+        ],
+        "type": "object"
+      }
+    },
+    "spiral.checkpoint_load": {
+      "errors": [
+        -32602,
+        -32005,
+        -32007,
+        -32010
+      ],
+      "mcp": {
+        "paramRenames": {
+          "allowRebuild": "allow_rebuild",
+          "hostPath": "host_path",
+          "localPath": "local_path"
+        },
+        "tool": "vc3d_spiral_load_checkpoint"
+      },
+      "params": {
+        "properties": {
+          "allowRebuild": {
+            "default": false,
+            "type": "boolean"
+          },
+          "hostPath": {
+            "type": "string"
+          },
+          "localPath": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "spiral.checkpoint_save": {
+      "errors": [
+        -32602,
+        -32005
+      ],
+      "mcp": {
+        "tool": "vc3d_spiral_save_checkpoint"
+      },
+      "params": {
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      }
+    },
+    "spiral.connect": {
+      "errors": [
+        -32602,
+        -32005,
+        -32007
+      ],
+      "mcp": {
+        "paramRenames": {
+          "profileId": "profile_id"
+        },
+        "tool": "vc3d_spiral_connect"
+      },
+      "params": {
+        "properties": {
+          "profileId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "profileId"
+        ],
+        "type": "object"
+      }
+    },
+    "spiral.dataset": {
+      "errors": [
+        -32005
+      ],
+      "mcp": {
+        "tool": "vc3d_spiral_get_dataset"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "spiral.disconnect": {
+      "errors": [
+        -32005,
+        -32010
+      ],
+      "mcp": {
+        "tool": "vc3d_spiral_disconnect"
+      },
+      "params": {
+        "properties": {
+          "force": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "spiral.input_remove": {
+      "errors": [
+        -32602,
+        -32005,
+        -32007
+      ],
+      "mcp": {
+        "paramRenames": {
+          "inputId": "input_id"
+        },
+        "tool": "vc3d_spiral_remove_input"
+      },
+      "params": {
+        "properties": {
+          "inputId": {
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "patch",
+              "fiber",
+              "pcl"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "inputId"
+        ],
+        "type": "object"
+      }
+    },
+    "spiral.input_upload": {
+      "errors": [
+        -32602,
+        -32005,
+        -32007
+      ],
+      "mcp": {
+        "paramRenames": {
+          "inputId": "input_id",
+          "localPath": "local_path"
+        },
+        "tool": "vc3d_spiral_upload_input"
+      },
+      "params": {
+        "properties": {
+          "inputId": {
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "patch",
+              "fiber",
+              "pcl"
+            ],
+            "type": "string"
+          },
+          "localPath": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "localPath",
+          "inputId"
+        ],
+        "type": "object"
+      }
+    },
+    "spiral.inputs_commit": {
+      "errors": [
+        -32005
+      ],
+      "mcp": {
+        "tool": "vc3d_spiral_commit_inputs"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "spiral.preview_export": {
+      "errors": [
+        -32004,
+        -32005
+      ],
+      "mcp": {
+        "tool": "vc3d_spiral_export_preview"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "spiral.profiles": {
+      "errors": [],
+      "mcp": {
+        "tool": "vc3d_spiral_list_profiles"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "spiral.rebuild": {
+      "errors": [
+        -32602,
+        -32005
+      ],
+      "mcp": {
+        "tool": "vc3d_spiral_rebuild"
+      },
+      "params": {
+        "properties": {
+          "confirm": {
+            "type": "boolean"
+          },
+          "defaults": {
+            "type": "boolean"
+          },
+          "request": {
+            "properties": {},
+            "type": "object"
+          }
+        },
+        "required": [
+          "confirm"
+        ],
+        "type": "object"
+      }
+    },
+    "spiral.reconnect": {
+      "errors": [
+        -32004,
+        -32005
+      ],
+      "mcp": {
+        "tool": "vc3d_spiral_reconnect"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "spiral.run": {
+      "errors": [
+        -32602,
+        -32005
+      ],
+      "mcp": {
+        "paramRenames": {
+          "influenceConfig": "influence_config",
+          "runConfig": "run_config"
+        },
+        "tool": "vc3d_spiral_run"
+      },
+      "params": {
+        "properties": {
+          "influenceConfig": {
+            "properties": {},
+            "type": "object"
+          },
+          "inputs": {
+            "properties": {},
+            "type": "object"
+          },
+          "iterations": {
+            "maximum": 2147483647,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "runConfig": {
+            "properties": {},
+            "type": "object"
+          }
+        },
+        "required": [
+          "iterations"
+        ],
+        "type": "object"
+      }
+    },
+    "spiral.status": {
+      "errors": [
+        -32005
+      ],
+      "mcp": {
+        "tool": "vc3d_spiral_status"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "spiral.stop": {
+      "errors": [
+        -32004,
+        -32005
+      ],
+      "mcp": {
+        "tool": "vc3d_spiral_stop"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
     "state.get": {
       "errors": [],
       "mcp": {
@@ -3724,6 +4098,7 @@
             "enum": [
               "main",
               "lasagna",
+              "spiral",
               "fiber_slice"
             ],
             "type": "string"
