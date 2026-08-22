@@ -1038,6 +1038,10 @@ def save_overlay_and_print_satisfaction(
             tracks,
             out_path, suffix,
             render_volume_scale=render_volume_scale,
+            # The same transform the satisfaction metrics above used: after
+            # constraint-bake resets it is the composed frozen+live map, which
+            # the model's own chain would silently miss.
+            slice_to_spiral_transform=slice_to_spiral_transform,
         )
     if need_mesh:
         save_mesh(

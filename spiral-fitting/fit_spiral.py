@@ -2912,6 +2912,23 @@ class FitContext:
         if interactive_driver is None:
             self.trusted_geometry_tree = None
 
+        # Fail fast at build time when resets are requested but the enabled
+        # inputs make every bake unbakeable — rather than thousands of steps
+        # later at the first reset boundary (which stays the authoritative
+        # gate, since influence windows only exist at run time).
+        if int(self.config.get('optimizer_reset_interval', 0) or 0) > 0:
+            reasons = constraint_baking.bake_refusal_reasons(
+                interactive=self.interactive_driver is not None,
+                influence_active=False,
+                phase_mode=self.phase_mode,
+                dense_normals_enabled=self.dense_normals_enabled,
+                grad_mag_enabled=self.grad_mag_spacing_enabled,
+            )
+            if reasons:
+                raise RuntimeError(
+                    'optimizer_reset_interval > 0 but constraint bakes would '
+                    'be refused: ' + '; '.join(reasons))
+
         # A resumed baked checkpoint's host inputs loaded from disk in scroll
         # space; replay the frozen bake stack over them before anything below
         # captures coordinates (the theta topology and every later cache).
@@ -3203,13 +3220,18 @@ class FitContext:
                     'accumulates across bakes')
 
         self._stash_pristine_inputs()
-        # Snapshot before any frame mutation: it must capture the exact
-        # transform (including the pre-reset umbilicus) the bake below uses.
-        self.frozen_epochs.append(constraint_baking.snapshot_frozen_epoch(
+        # Snapshot before any frame mutation (it must capture the exact
+        # transform, including the pre-reset umbilicus, the bake below uses),
+        # but append it only after the bake succeeded: a bake failure (e.g.
+        # the z-drift check) must not leave frozen_epochs one epoch ahead of
+        # the inputs and parameters — a later autosave would persist that
+        # half-committed history.
+        snapshot = constraint_baking.snapshot_frozen_epoch(
             self.spiral_and_transform, self.umbilicus_zyx, self.config,
-            probe_error=probe))
+            probe_error=probe)
         self._bake_all_inputs(
             self.spiral_and_transform.get_slice_to_spiral_transform())
+        self.frozen_epochs.append(snapshot)
         self._baked_epoch_count = len(self.frozen_epochs)
         self._apply_canonical_space_state()
 
@@ -3244,6 +3266,16 @@ class FitContext:
         inputs (_baked_epoch_count) are skipped, so a model-stage rebuild
         that kept the host inputs never double-bakes.
         """
+        if self.frozen_epochs and self.interactive_driver is not None:
+            # Baking is refused for interactive sessions, and this is the one
+            # other door through which a session could meet frozen epochs:
+            # resuming a baked checkpoint. Interactive machinery (preview
+            # export, input incorporation, influence masking) assumes scroll
+            # space throughout, so refuse here rather than run it wrong.
+            raise RuntimeError(
+                'this checkpoint carries '
+                f'{len(self.frozen_epochs)} constraint-bake epoch(s); '
+                'baked checkpoints can only be resumed by headless fits')
         pending = self.frozen_epochs[self._baked_epoch_count:]
         for epoch_index, snapshot in enumerate(
                 pending, start=self._baked_epoch_count + 1):
