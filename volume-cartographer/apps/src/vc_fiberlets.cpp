@@ -6,9 +6,12 @@
 #include "vc/fiber_tracer/FiberletChunkGraph.hpp"
 #include "vc/fiber_tracer/FiberletOnDemand.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "vc/lasagna/ChannelSampler.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "FiberTraceCli.hpp"
+
+#include <zstd.h>
 
 #include <algorithm>
 #include <array>
@@ -24,13 +27,16 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace
 {
@@ -103,6 +109,10 @@ struct CliOptions {
     std::filesystem::path anchorCacheRoot;
     std::filesystem::path fiberletCacheRoot;
     bool eagerGraphReplay = false;
+    std::size_t storageCompressionChunks = 0;
+    std::uint64_t storageCompressionSeed = 1;
+    int storageCompressionChunkSideBaseVoxels = 512;
+    int storageCompressionCoordinateUnitsPerBaseVoxel = 1;
     vc::fiber_tracer::cli::SeenOptions seenTraceOptions;
 };
 
@@ -192,6 +202,10 @@ void usage(const char* executable)
               << "  --fiberlet-cache PATH         generated fiberlet cache [output/cache/fiberlets.zarr]\n"
               << "  --eager-graph                 diagnostic corridor-wide graph extraction\n"
               << "  --storage-chunk-side N        storage chunk side in base voxels [512]\n"
+              << "  --storage-compression-chunks N  benchmark compact storage on N complete spatial regions\n"
+              << "  --storage-compression-seed N    deterministic chunk sample seed [1]\n"
+              << "  --storage-compression-chunk-side N  extracted region side in base voxels [512]\n"
+              << "  --storage-compression-coordinate-units N  coordinate units per base voxel [1]\n"
               << "  --scenario NAME               quantization scenario; also runs baseline\n";
 }
 
@@ -349,6 +363,40 @@ CliOptions parseArgs(int argc, char** argv)
             options.fiberletCacheRoot = valueAfter(index, argc, argv, "fiberlet-cache");
         } else if (argument == "--eager-graph" && isReplayCommand(options.command)) {
             options.eagerGraphReplay = true;
+        } else if (argument == "--storage-compression-chunks" &&
+                   isReplayCommand(options.command)) {
+            const int value = parseInt(
+                valueAfter(index, argc, argv, "storage-compression-chunks"),
+                "storage-compression-chunks");
+            if (value <= 0)
+                fail("--storage-compression-chunks must be positive");
+            options.storageCompressionChunks = static_cast<std::size_t>(value);
+        } else if (argument == "--storage-compression-seed" &&
+                   isReplayCommand(options.command)) {
+            const int value = parseInt(
+                valueAfter(index, argc, argv, "storage-compression-seed"),
+                "storage-compression-seed");
+            if (value < 0)
+                fail("--storage-compression-seed must be nonnegative");
+            options.storageCompressionSeed = static_cast<std::uint64_t>(value);
+        } else if (argument == "--storage-compression-chunk-side" &&
+                   isReplayCommand(options.command)) {
+            const int value = parseInt(
+                valueAfter(index, argc, argv,
+                    "storage-compression-chunk-side"),
+                "storage-compression-chunk-side");
+            if (value <= 0)
+                fail("--storage-compression-chunk-side must be positive");
+            options.storageCompressionChunkSideBaseVoxels = value;
+        } else if (argument == "--storage-compression-coordinate-units" &&
+                   isReplayCommand(options.command)) {
+            const int value = parseInt(
+                valueAfter(index, argc, argv,
+                    "storage-compression-coordinate-units"),
+                "storage-compression-coordinate-units");
+            if (value <= 0)
+                fail("--storage-compression-coordinate-units must be positive");
+            options.storageCompressionCoordinateUnitsPerBaseVoxel = value;
         } else if (argument == "--cell-size" && options.command != Command::Paths) {
             options.anchors.cellSizePredictionVoxels = parseInt(valueAfter(index, argc, argv, "cell-size"), "cell-size");
         } else if (argument == "--falloff" && options.command != Command::Paths) {
@@ -489,6 +537,9 @@ CliOptions parseArgs(int argc, char** argv)
         if (!options.writeReplayVisualizations &&
             !options.volumeZarr.empty()) {
             fail("fiber-replay volume strip options are only valid together with --vis");
+        }
+        if (options.eagerGraphReplay && options.storageCompressionChunks > 0) {
+            fail("--storage-compression-chunks requires the on-demand replay cache");
         }
     }
     if (isQuantizationCommand(options.command)) {
@@ -1535,6 +1586,725 @@ TubeExtractionResult extractTubeFiberlets(
     return result;
 }
 
+struct StorageCompressionSample {
+    std::size_t records = 0;
+    std::size_t payloadBytes = 0;
+    std::size_t outerZstdBytes = 0;
+    std::size_t rawFieldBytes = 0;
+    std::size_t wholeZstdBytes = 0;
+    std::size_t fieldRansBytes = 0;
+    std::size_t fieldRansStreams = 0;
+};
+
+std::size_t outerZstdSize(std::span<const std::byte> bytes)
+{
+    std::vector<std::byte> compressed(ZSTD_compressBound(bytes.size()));
+    const std::size_t size = ZSTD_compress(
+        compressed.data(), compressed.size(), bytes.data(), bytes.size(), 3);
+    if (ZSTD_isError(size)) {
+        throw std::runtime_error(
+            std::string("fiberlet outer zstd encode failed: ") +
+            ZSTD_getErrorName(size));
+    }
+    return size;
+}
+
+StorageCompressionSample storageCompressionSample(
+    std::size_t records,
+    std::span<const std::byte> payload,
+    std::span<const std::byte> fieldRansPayload)
+{
+    const auto rawFields = vc::fiber_tracer::materializeFiberletPayload(payload);
+    const auto ransCounts =
+        vc::fiber_tracer::fiberletStorageFieldCodecCounts(fieldRansPayload);
+    return {
+        records,
+        payload.size(),
+        outerZstdSize(payload),
+        rawFields.size(),
+        outerZstdSize(rawFields),
+        fieldRansPayload.size(),
+        ransCounts.rans,
+    };
+}
+
+std::array<int, 3> compactOwnerChunk(
+    const vc::fiber_tracer::FiberletStorageKey& key,
+    std::int64_t unitsPerChunk)
+{
+    std::array<int, 3> result{};
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        if (key.coordinateZYX[axis] < 0)
+            throw std::invalid_argument(
+                "compact storage benchmark encountered a negative anchor coordinate");
+        const auto owner = key.coordinateZYX[axis] / unitsPerChunk;
+        if (owner > std::numeric_limits<int>::max())
+            throw std::overflow_error(
+                "compact storage benchmark chunk coordinate exceeds int");
+        result[axis] = static_cast<int>(owner);
+    }
+    return result;
+}
+
+vc::fiber_tracer::FiberletStorageCodecConfig compactCodec(
+    const vc::fiber_tracer::FiberletDatasetMetadata& metadata,
+    const std::array<int, 3>& owner,
+    int chunkSideBaseVoxels,
+    int coordinateUnitsPerBaseVoxel)
+{
+    const std::int64_t unitsPerChunk =
+        static_cast<std::int64_t>(chunkSideBaseVoxels) *
+        coordinateUnitsPerBaseVoxel;
+    vc::fiber_tracer::FiberletStorageCodecConfig result;
+    result.profile = vc::fiber_tracer::FiberletStorageProfile::CompactQuantized;
+    result.chunkZYX = owner;
+    result.datasetFingerprint = metadata.datasetFingerprint;
+    for (std::size_t axis = 0; axis < 3; ++axis)
+        result.coordinateOriginZYX[axis] =
+            static_cast<std::int64_t>(owner[axis]) * unitsPerChunk;
+    result.coordinateBits =
+        unitsPerChunk <= 256 ? 8 : unitsPerChunk <= 65536 ? 16 : 32;
+    result.deltaBits = 16;
+    result.routeCountBits = 16;
+    result.routeLatticeBits = 16;
+    result.costBits = 8;
+    result.positionQuantumBaseVoxels = 1;
+    result.predictionToBaseScale =
+        metadata.predictionToBaseScale * coordinateUnitsPerBaseVoxel;
+    return result;
+}
+
+void printStorageCompressionSummary(
+    const char* payload,
+    std::vector<StorageCompressionSample> samples,
+    int chunkSideBaseVoxels,
+    int coordinateUnitsPerBaseVoxel)
+{
+    if (samples.empty()) {
+        std::cout << "fiberlet_storage_compression"
+                  << " profile=compact_axis_cost_u8"
+                  << " chunk_side_base=" << chunkSideBaseVoxels
+                  << " coordinate_units_per_base="
+                  << coordinateUnitsPerBaseVoxel
+                  << " internal_codec=field_zstd3"
+                  << " payload=" << payload << " chunks=0\n";
+        return;
+    }
+    std::uint64_t records = 0;
+    std::uint64_t payloadBytes = 0;
+    std::uint64_t outerBytes = 0;
+    std::uint64_t rawFieldBytes = 0;
+    std::uint64_t wholeZstdBytes = 0;
+    std::uint64_t fieldRansBytes = 0;
+    std::uint64_t fieldRansStreams = 0;
+    std::vector<std::size_t> payloadSizes;
+    std::vector<std::size_t> outerSizes;
+    payloadSizes.reserve(samples.size());
+    outerSizes.reserve(samples.size());
+    for (const auto& sample : samples) {
+        records += sample.records;
+        payloadBytes += sample.payloadBytes;
+        outerBytes += sample.outerZstdBytes;
+        rawFieldBytes += sample.rawFieldBytes;
+        wholeZstdBytes += sample.wholeZstdBytes;
+        fieldRansBytes += sample.fieldRansBytes;
+        fieldRansStreams += sample.fieldRansStreams;
+        payloadSizes.push_back(sample.payloadBytes);
+        outerSizes.push_back(sample.outerZstdBytes);
+    }
+    std::sort(payloadSizes.begin(), payloadSizes.end());
+    std::sort(outerSizes.begin(), outerSizes.end());
+    const auto percentile = [](const auto& values, double fraction) {
+        const auto index = static_cast<std::size_t>(std::ceil(
+            fraction * static_cast<double>(values.size()))) - 1;
+        return values[std::min(index, values.size() - 1)];
+    };
+    std::cout << std::setprecision(17)
+              << "fiberlet_storage_compression"
+              << " profile=compact_axis_cost_u8"
+              << " chunk_side_base=" << chunkSideBaseVoxels
+              << " coordinate_units_per_base="
+              << coordinateUnitsPerBaseVoxel
+              << " internal_codec=field_zstd3"
+              << " payload=" << payload
+              << " chunks=" << samples.size()
+              << " records=" << records
+              << " payload_bytes=" << payloadBytes
+              << " outer_zstd_bytes=" << outerBytes
+              << " outer_to_payload_ratio="
+              << static_cast<double>(outerBytes) /
+                     static_cast<double>(payloadBytes)
+              << " raw_field_bytes=" << rawFieldBytes
+              << " whole_zstd_bytes=" << wholeZstdBytes
+              << " whole_zstd_to_payload_ratio="
+              << static_cast<double>(wholeZstdBytes) /
+                     static_cast<double>(payloadBytes)
+              << " field_rans_bytes=" << fieldRansBytes
+              << " field_rans_streams=" << fieldRansStreams
+              << " field_rans_table_bytes=" << fieldRansStreams * 512
+              << " field_rans_without_tables_bytes="
+              << fieldRansBytes - fieldRansStreams * 512
+              << " field_rans_without_tables_to_payload_ratio="
+              << static_cast<double>(fieldRansBytes -
+                     fieldRansStreams * 512) /
+                     static_cast<double>(payloadBytes)
+              << " field_rans_to_payload_ratio="
+              << static_cast<double>(fieldRansBytes) /
+                     static_cast<double>(payloadBytes)
+              << " payload_mean_bytes="
+              << static_cast<double>(payloadBytes) /
+                     static_cast<double>(samples.size())
+              << " payload_p50_bytes=" << percentile(payloadSizes, 0.50)
+              << " payload_p95_bytes=" << percentile(payloadSizes, 0.95)
+              << " payload_max_bytes=" << payloadSizes.back()
+              << " outer_mean_bytes="
+              << static_cast<double>(outerBytes) /
+                     static_cast<double>(samples.size())
+              << " outer_p50_bytes=" << percentile(outerSizes, 0.50)
+              << " outer_p95_bytes=" << percentile(outerSizes, 0.95)
+              << " outer_max_bytes=" << outerSizes.back() << '\n';
+}
+
+void benchmarkReplayStorageCompression(
+    const std::shared_ptr<vc::fiber_tracer::FiberletOnDemandPreprocessor>&
+        preprocessor,
+    std::span<const vc::fiber_tracer::FiberletScheduledChunk> schedule,
+    std::size_t requestedChunks,
+    std::uint64_t seed,
+    int chunkSideBaseVoxels,
+    int coordinateUnitsPerBaseVoxel,
+    const std::set<std::array<int, 3>>& reportOwners = {})
+{
+    using namespace vc::fiber_tracer;
+    if (!preprocessor || requestedChunks == 0)
+        return;
+
+    std::vector<FiberletScheduledChunk> randomized(schedule.begin(), schedule.end());
+    std::mt19937_64 random(seed);
+    std::shuffle(randomized.begin(), randomized.end(), random);
+
+    struct StoredPair {
+        FiberletStoredPrefix prefix;
+        FiberletStoredRoute route;
+        std::array<int, 3> sourceOwner{};
+    };
+    struct FloatStorageSize {
+        std::size_t rawBytes = 0;
+        std::size_t zstdBytes = 0;
+    };
+    std::map<FiberletStorageKey, FiberletStoredAnchor> sourceAnchors;
+    std::vector<StoredPair> sourcePairs;
+    std::map<std::array<int, 3>, FloatStorageSize> floatByOwner;
+    std::size_t sourceChunks = 0;
+    for (const auto& scheduled : randomized) {
+        const std::array<int, 3> sourceOwner{
+            scheduled.key.iz, scheduled.key.iy, scheduled.key.ix};
+        const auto prefixChunk = preprocessor->fiberletCache()->getChunkBlocking(
+            0, scheduled.key.iz, scheduled.key.iy, scheduled.key.ix);
+        const auto prefixPayload = std::dynamic_pointer_cast<
+            const FiberletPrefixChunkPayload>(prefixChunk.payload);
+        if (prefixChunk.status != vc::render::ChunkStatus::Data ||
+            !prefixPayload || prefixPayload->prefixes.empty()) {
+            continue;
+        }
+        const auto routeChunk = preprocessor->fiberletCache()->getChunkBlocking(
+            1, scheduled.key.iz, scheduled.key.iy, scheduled.key.ix);
+        const auto routePayload = std::dynamic_pointer_cast<
+            const FiberletRouteChunkPayload>(routeChunk.payload);
+        if (routeChunk.status != vc::render::ChunkStatus::Data || !routePayload ||
+            routePayload->routes.size() != prefixPayload->prefixes.size()) {
+            throw std::runtime_error(
+                "storage compression benchmark could not load a complete fiberlet chunk");
+        }
+        for (std::size_t index = 0; index < prefixPayload->prefixes.size(); ++index) {
+            sourcePairs.push_back(
+                {prefixPayload->prefixes[index], routePayload->routes[index],
+                    sourceOwner});
+        }
+        for (const auto& dependency :
+             preprocessor->anchorDependencies(scheduled.key)) {
+            const auto anchorChunk = preprocessor->anchorCache()->getChunkBlocking(
+                dependency.level, dependency.iz, dependency.iy, dependency.ix);
+            const auto anchorPayload = std::dynamic_pointer_cast<
+                const FiberletAnchorChunkPayload>(anchorChunk.payload);
+            if (anchorChunk.status != vc::render::ChunkStatus::Data ||
+                !anchorPayload) {
+                throw std::runtime_error(
+                    "storage compression benchmark could not load an anchor dependency");
+            }
+            for (const auto& anchor : anchorPayload->anchors) {
+                const auto [found, inserted] =
+                    sourceAnchors.emplace(anchor.key, anchor);
+                if (!inserted &&
+                    (found->second.positionPredictionXYZ !=
+                         anchor.positionPredictionXYZ ||
+                     found->second.fittedAxisXYZ != anchor.fittedAxisXYZ)) {
+                    throw std::invalid_argument(
+                        "storage compression benchmark found conflicting anchor records");
+                }
+            }
+        }
+        const auto ownedAnchorChunk =
+            preprocessor->anchorCache()->getChunkBlocking(
+                0, scheduled.key.iz, scheduled.key.iy, scheduled.key.ix);
+        const auto ownedAnchorPayload = std::dynamic_pointer_cast<
+            const FiberletAnchorChunkPayload>(ownedAnchorChunk.payload);
+        if (ownedAnchorChunk.status != vc::render::ChunkStatus::Data ||
+            !ownedAnchorPayload) {
+            throw std::runtime_error(
+                "storage compression benchmark could not load the owned anchor chunk");
+        }
+        const auto floatAnchors = serializeFiberletAnchors(
+            ownedAnchorPayload->config, ownedAnchorPayload->anchors);
+        const auto floatPrefixes = serializeFiberletPrefixes(
+            prefixPayload->config, prefixPayload->prefixes);
+        const auto floatRoutes = serializeFiberletRoutes(
+            routePayload->config, routePayload->routes);
+        auto& floatSize = floatByOwner[sourceOwner];
+        floatSize.zstdBytes = floatAnchors.size() + floatPrefixes.size() +
+            floatRoutes.size();
+        floatSize.rawBytes =
+            materializeFiberletPayload(floatAnchors).size() +
+            materializeFiberletPayload(floatPrefixes).size() +
+            materializeFiberletPayload(floatRoutes).size();
+        if (++sourceChunks == requestedChunks)
+            break;
+    }
+    if (sourceChunks == 0)
+        throw std::runtime_error(
+            "storage compression benchmark found no nonempty scheduled chunks");
+
+    struct QuantizedAnchorRecord {
+        FiberletStorageKey oldKey;
+        FiberletStoredAnchor anchor;
+        std::array<std::uint8_t, 2> encodedAxis{};
+        std::array<int, 3> sourceOwner{};
+    };
+    std::vector<QuantizedAnchorRecord> quantizedAnchors;
+    std::map<std::array<std::int64_t, 3>, std::vector<std::size_t>> collisions;
+    const auto& metadata = preprocessor->anchorDataset()->metadata();
+    const double predictionToCoordinate = metadata.predictionToBaseScale;
+    const auto sourceUnitsPerChunk =
+        metadata.coordinateUnitsPerChunkZYX[0];
+    for (const auto& [oldKey, source] : sourceAnchors) {
+        QuantizedAnchorRecord record;
+        record.oldKey = oldKey;
+        record.anchor = source;
+        for (std::size_t axis = 0; axis < 3; ++axis) {
+            record.sourceOwner[axis] = static_cast<int>(
+                oldKey.coordinateZYX[axis] / sourceUnitsPerChunk);
+        }
+        for (std::size_t zyx = 0; zyx < 3; ++zyx) {
+            const std::size_t xyz = 2 - zyx;
+            const double coordinate =
+                static_cast<double>(source.positionPredictionXYZ[xyz]) *
+                predictionToCoordinate * coordinateUnitsPerBaseVoxel;
+            if (!(coordinate >= 0.0) || !std::isfinite(coordinate)) {
+                throw std::invalid_argument(
+                    "storage compression benchmark anchor lies outside the volume");
+            }
+            record.anchor.key.coordinateZYX[zyx] =
+                static_cast<std::int64_t>(std::floor(coordinate + 0.5));
+        }
+        const auto encoded = vc::lasagna::encodeCompactNormalToRaw(
+            cv::Vec3d(source.fittedAxisXYZ[0], source.fittedAxisXYZ[1],
+                source.fittedAxisXYZ[2]));
+        if (!encoded)
+            throw std::invalid_argument(
+                "storage compression benchmark anchor axis is not compact-encodable");
+        record.encodedAxis = *encoded;
+        const auto index = quantizedAnchors.size();
+        collisions[record.anchor.key.coordinateZYX].push_back(index);
+        quantizedAnchors.push_back(std::move(record));
+    }
+
+    std::map<FiberletStorageKey, FiberletStorageKey> quantizedKeyByOldKey;
+    for (auto& [coordinate, indices] : collisions) {
+        (void)coordinate;
+        std::sort(indices.begin(), indices.end(), [&](std::size_t left,
+                                                       std::size_t right) {
+            return std::tie(quantizedAnchors[left].encodedAxis,
+                       quantizedAnchors[left].oldKey) <
+                std::tie(quantizedAnchors[right].encodedAxis,
+                    quantizedAnchors[right].oldKey);
+        });
+        if (indices.size() > 2) {
+            throw std::invalid_argument(
+                "storage compression benchmark q1 position needs more than two variants");
+        }
+        for (std::size_t variant = 0; variant < indices.size(); ++variant) {
+            auto& record = quantizedAnchors[indices[variant]];
+            record.anchor.key.variant = static_cast<std::uint8_t>(variant);
+            quantizedKeyByOldKey.emplace(record.oldKey, record.anchor.key);
+        }
+    }
+
+    const std::int64_t unitsPerChunk =
+        static_cast<std::int64_t>(chunkSideBaseVoxels) *
+        coordinateUnitsPerBaseVoxel;
+    using AnchorGroups = std::map<std::array<int, 3>,
+        std::vector<FiberletStoredAnchor>>;
+    std::map<std::array<int, 3>, AnchorGroups> anchorGroupsBySource;
+    for (auto& record : quantizedAnchors) {
+        if (!reportOwners.contains(record.sourceOwner))
+            continue;
+        anchorGroupsBySource[record.sourceOwner]
+            [compactOwnerChunk(record.anchor.key, unitsPerChunk)]
+            .push_back(std::move(record.anchor));
+    }
+    for (auto& [sourceOwner, groups] : anchorGroupsBySource) {
+        (void)sourceOwner;
+        for (auto& [compactOwner, anchors] : groups) {
+            (void)compactOwner;
+            std::sort(anchors.begin(), anchors.end(), [](const auto& left,
+                                                         const auto& right) {
+                return left.key < right.key;
+            });
+        }
+    }
+
+    using FiberletGroups =
+        std::map<std::array<int, 3>, std::vector<StoredPair>>;
+    std::map<std::array<int, 3>, FiberletGroups> fiberletGroupsBySource;
+    for (auto& pair : sourcePairs) {
+        const auto first = quantizedKeyByOldKey.find(pair.prefix.id.first);
+        const auto second = quantizedKeyByOldKey.find(pair.prefix.id.second);
+        if (first == quantizedKeyByOldKey.end() ||
+            second == quantizedKeyByOldKey.end()) {
+            throw std::logic_error(
+                "storage compression benchmark is missing a fiberlet endpoint");
+        }
+        pair.prefix.id = {first->second, second->second};
+        if (pair.prefix.id.first == pair.prefix.id.second)
+            throw std::invalid_argument(
+                "storage compression benchmark q1 endpoints collapse");
+        if (pair.prefix.id.second < pair.prefix.id.first) {
+            std::swap(pair.prefix.id.first, pair.prefix.id.second);
+            std::swap(pair.prefix.entryUV, pair.prefix.exitUV);
+            std::reverse(pair.route.middleUV.begin(), pair.route.middleUV.end());
+            const cv::Vec3f firstStep = pair.prefix.firstStepBaseXYZ;
+            pair.prefix.firstStepBaseXYZ = -pair.prefix.lastStepBaseXYZ;
+            pair.prefix.lastStepBaseXYZ = -firstStep;
+        }
+        fiberletGroupsBySource[pair.sourceOwner]
+            [compactOwnerChunk(pair.prefix.id.first, unitsPerChunk)]
+            .push_back(std::move(pair));
+    }
+    for (auto& [sourceOwner, groups] : fiberletGroupsBySource) {
+        (void)sourceOwner;
+        for (auto& [compactOwner, pairs] : groups) {
+            (void)compactOwner;
+            std::sort(pairs.begin(), pairs.end(), [](const auto& left,
+                                                     const auto& right) {
+                return left.prefix.id < right.prefix.id;
+            });
+        }
+    }
+
+    std::vector<StorageCompressionSample> anchorSamples;
+    std::map<std::array<int, 3>, StorageCompressionSample> anchorByOwner;
+    for (const auto& sourceOwner : reportOwners) {
+        StorageCompressionSample total;
+        for (const auto& [compactOwner, anchors] :
+             anchorGroupsBySource[sourceOwner]) {
+            const auto codec = compactCodec(metadata, compactOwner,
+                chunkSideBaseVoxels, coordinateUnitsPerBaseVoxel);
+            const auto bytes = serializeFiberletAnchors(codec, anchors);
+            const auto ransBytes = serializeFiberletAnchors(
+                codec, anchors, FiberletStorageFieldCodec::Rans);
+            const auto sample = storageCompressionSample(
+                anchors.size(), bytes, ransBytes);
+            total.records += sample.records;
+            total.payloadBytes += sample.payloadBytes;
+            total.outerZstdBytes += sample.outerZstdBytes;
+            total.rawFieldBytes += sample.rawFieldBytes;
+            total.wholeZstdBytes += sample.wholeZstdBytes;
+            total.fieldRansBytes += sample.fieldRansBytes;
+            total.fieldRansStreams += sample.fieldRansStreams;
+            anchorSamples.push_back(sample);
+        }
+        anchorByOwner.emplace(sourceOwner, total);
+    }
+
+    std::vector<StorageCompressionSample> prefixSamples;
+    std::vector<StorageCompressionSample> routeSamples;
+    std::map<std::array<int, 3>, StorageCompressionSample> prefixByOwner;
+    std::map<std::array<int, 3>, StorageCompressionSample> routeByOwner;
+    for (const auto& sourceOwner : reportOwners) {
+        StorageCompressionSample prefixTotal;
+        StorageCompressionSample routeTotal;
+        for (const auto& [compactOwner, pairs] :
+             fiberletGroupsBySource[sourceOwner]) {
+            std::vector<FiberletStoredPrefix> prefixes;
+            std::vector<FiberletStoredRoute> routes;
+            prefixes.reserve(pairs.size());
+            routes.reserve(pairs.size());
+            for (const auto& pair : pairs) {
+                prefixes.push_back(pair.prefix);
+                routes.push_back(pair.route);
+            }
+            const auto codec = compactCodec(metadata, compactOwner,
+                chunkSideBaseVoxels, coordinateUnitsPerBaseVoxel);
+            const auto prefixBytes = serializeFiberletPrefixes(codec, prefixes);
+            const auto routeBytes = serializeFiberletRoutes(codec, routes);
+            const auto prefixRansBytes = serializeFiberletPrefixes(
+                codec, prefixes, FiberletStorageFieldCodec::Rans);
+            const auto routeRansBytes = serializeFiberletRoutes(
+                codec, routes, FiberletStorageFieldCodec::Rans);
+            const auto prefixSample = storageCompressionSample(
+                prefixes.size(), prefixBytes, prefixRansBytes);
+            const auto routeSample = storageCompressionSample(
+                routes.size(), routeBytes, routeRansBytes);
+            prefixTotal.records += prefixSample.records;
+            prefixTotal.payloadBytes += prefixSample.payloadBytes;
+            prefixTotal.outerZstdBytes += prefixSample.outerZstdBytes;
+            prefixTotal.rawFieldBytes += prefixSample.rawFieldBytes;
+            prefixTotal.wholeZstdBytes += prefixSample.wholeZstdBytes;
+            prefixTotal.fieldRansBytes += prefixSample.fieldRansBytes;
+            prefixTotal.fieldRansStreams += prefixSample.fieldRansStreams;
+            routeTotal.records += routeSample.records;
+            routeTotal.payloadBytes += routeSample.payloadBytes;
+            routeTotal.outerZstdBytes += routeSample.outerZstdBytes;
+            routeTotal.rawFieldBytes += routeSample.rawFieldBytes;
+            routeTotal.wholeZstdBytes += routeSample.wholeZstdBytes;
+            routeTotal.fieldRansBytes += routeSample.fieldRansBytes;
+            routeTotal.fieldRansStreams += routeSample.fieldRansStreams;
+            prefixSamples.push_back(prefixSample);
+            routeSamples.push_back(routeSample);
+        }
+        prefixByOwner.emplace(sourceOwner, prefixTotal);
+        routeByOwner.emplace(sourceOwner, routeTotal);
+    }
+
+    std::cout << "fiberlet_storage_compression_sample"
+              << " profile=compact_axis_cost_u8"
+              << " chunk_side_base=" << chunkSideBaseVoxels
+              << " coordinate_units_per_base="
+              << coordinateUnitsPerBaseVoxel
+              << " seed=" << seed
+              << " scheduled_chunks=" << schedule.size()
+              << " sampled_nonempty_source_chunks=" << sourceChunks
+              << " source_anchors=" << sourceAnchors.size()
+              << " source_fiberlets=" << sourcePairs.size() << '\n';
+    if (!reportOwners.empty()) {
+        for (const auto& owner : reportOwners) {
+            const auto anchor = anchorByOwner.find(owner);
+            const auto prefix = prefixByOwner.find(owner);
+            const auto route = routeByOwner.find(owner);
+            const StorageCompressionSample empty;
+            const auto& anchorSample =
+                anchor == anchorByOwner.end() ? empty : anchor->second;
+            const auto& prefixSample =
+                prefix == prefixByOwner.end() ? empty : prefix->second;
+            const auto& routeSample =
+                route == routeByOwner.end() ? empty : route->second;
+            const std::size_t payloadBytes = anchorSample.payloadBytes +
+                prefixSample.payloadBytes + routeSample.payloadBytes;
+            const std::size_t rawBytes = anchorSample.rawFieldBytes +
+                prefixSample.rawFieldBytes + routeSample.rawFieldBytes;
+            const auto floatFound = floatByOwner.find(owner);
+            const FloatStorageSize emptyFloat;
+            const auto& floatSize = floatFound == floatByOwner.end()
+                ? emptyFloat
+                : floatFound->second;
+            std::cout << "fiberlet_storage_chunk"
+                      << " profile=compact_axis_cost_u8"
+                      << " chunk_side_base=" << chunkSideBaseVoxels
+                      << " coordinate_units_per_base="
+                      << coordinateUnitsPerBaseVoxel
+                      << " owner=" << owner[0] << '/' << owner[1] << '/'
+                      << owner[2]
+                      << " anchors=" << anchorSample.records
+                      << " fiberlets=" << prefixSample.records
+                      << " float_raw_bytes=" << floatSize.rawBytes
+                      << " float_zstd_bytes=" << floatSize.zstdBytes
+                      << " raw_bytes=" << rawBytes
+                      << " zstd_bytes=" << payloadBytes
+                      << " zstd_to_raw_ratio="
+                      << (rawBytes == 0 ? 0.0
+                                        : static_cast<double>(payloadBytes) /
+                                              static_cast<double>(rawBytes))
+                      << '\n';
+        }
+    }
+    std::vector<StorageCompressionSample> allSamples = anchorSamples;
+    allSamples.insert(
+        allSamples.end(), prefixSamples.begin(), prefixSamples.end());
+    allSamples.insert(
+        allSamples.end(), routeSamples.begin(), routeSamples.end());
+    printStorageCompressionSummary("anchors", std::move(anchorSamples),
+        chunkSideBaseVoxels, coordinateUnitsPerBaseVoxel);
+    printStorageCompressionSummary("prefix", std::move(prefixSamples),
+        chunkSideBaseVoxels, coordinateUnitsPerBaseVoxel);
+    printStorageCompressionSummary("routes", std::move(routeSamples),
+        chunkSideBaseVoxels, coordinateUnitsPerBaseVoxel);
+    printStorageCompressionSummary("all", std::move(allSamples),
+        chunkSideBaseVoxels, coordinateUnitsPerBaseVoxel);
+}
+
+void benchmarkFullRegionStorageCompression(
+    const vc::fiber_tracer::FiberPredictionField& field,
+    const std::shared_ptr<const vc::lasagna::NormalSampler>& normalSampler,
+    const vc::fiber_tracer::FiberPredictionGridInfo& grid,
+    const CliOptions& options,
+    const vc::lasagna::LasagnaDataset& fiberDataset,
+    const vc::lasagna::LasagnaDataset& normalDataset,
+    const std::shared_ptr<vc::fiber_tracer::FiberletOnDemandPreprocessor>&
+        replayPreprocessor,
+    std::span<const vc::fiber_tracer::FiberletScheduledChunk> replaySchedule)
+{
+    using namespace vc::fiber_tracer;
+    if (!replayPreprocessor || options.storageCompressionChunks == 0)
+        return;
+
+    const int targetSide = options.storageCompressionChunkSideBaseVoxels;
+    const int sourceSide = static_cast<int>(
+        replayPreprocessor->fiberletDataset()->metadata()
+            .spatialChunkSideBaseVoxels);
+    std::set<std::array<int, 3>> candidateOwners;
+    for (const auto& scheduled : replaySchedule) {
+        std::array<int, 3> owner{};
+        const std::array<int, 3> source{
+            scheduled.key.iz, scheduled.key.iy, scheduled.key.ix};
+        for (std::size_t axis = 0; axis < 3; ++axis) {
+            owner[axis] = static_cast<int>(
+                static_cast<std::int64_t>(source[axis]) * sourceSide /
+                targetSide);
+        }
+        candidateOwners.insert(owner);
+    }
+    std::vector<std::array<int, 3>> randomizedOwners(
+        candidateOwners.begin(), candidateOwners.end());
+    std::mt19937_64 random(options.storageCompressionSeed);
+    std::shuffle(randomizedOwners.begin(), randomizedOwners.end(), random);
+    if (randomizedOwners.size() > options.storageCompressionChunks)
+        randomizedOwners.resize(options.storageCompressionChunks);
+    std::sort(randomizedOwners.begin(), randomizedOwners.end());
+    const std::set<std::array<int, 3>> reportOwners(
+        randomizedOwners.begin(), randomizedOwners.end());
+    if (reportOwners.empty())
+        throw std::runtime_error(
+            "storage compression benchmark found no target regions");
+
+    CliOptions fullOptions = options;
+    fullOptions.storageChunkSideBaseVoxels = targetSide;
+    auto anchorMetadata = replayDatasetMetadata(
+        FiberletDatasetKind::Anchors, grid, fullOptions, fiberDataset,
+        normalDataset, {}, 0.0);
+    auto fiberletMetadata = anchorMetadata;
+    fiberletMetadata.kind = FiberletDatasetKind::Fiberlets;
+
+    const auto cellSide = static_cast<std::size_t>(
+        options.anchors.cellSizePredictionVoxels);
+    const std::array<std::size_t, 3> cellShape{
+        (grid.shapeZYX[0] + cellSide - 1) / cellSide,
+        (grid.shapeZYX[1] + cellSide - 1) / cellSide,
+        (grid.shapeZYX[2] + cellSide - 1) / cellSide};
+    std::array<int, 3> minimumOffset{0, 0, 0};
+    std::array<int, 3> maximumOffset{0, 0, 0};
+    for (const auto& offset : fiberletCellNeighborhoodOffsets(
+             options.paths.cellRadius,
+             options.paths.neighborhoodMarginCells)) {
+        for (std::size_t axis = 0; axis < 3; ++axis) {
+            minimumOffset[axis] =
+                std::min(minimumOffset[axis], offset[axis]);
+            maximumOffset[axis] =
+                std::max(maximumOffset[axis], offset[axis]);
+        }
+    }
+    const auto unitsPerChunk =
+        anchorMetadata.coordinateUnitsPerChunkZYX[0];
+    std::set<std::array<std::size_t, 3>> selectedCells;
+    for (const auto& owner : reportOwners) {
+        std::array<std::int64_t, 3> begin{};
+        std::array<std::int64_t, 3> end{};
+        for (std::size_t axis = 0; axis < 3; ++axis) {
+            begin[axis] = std::max<std::int64_t>(0,
+                static_cast<std::int64_t>(owner[axis]) * unitsPerChunk +
+                    minimumOffset[axis]);
+            end[axis] = std::min<std::int64_t>(cellShape[axis],
+                (static_cast<std::int64_t>(owner[axis]) + 1) *
+                        unitsPerChunk +
+                    maximumOffset[axis]);
+        }
+        for (std::int64_t z = begin[0]; z < end[0]; ++z) {
+            for (std::int64_t y = begin[1]; y < end[1]; ++y) {
+                for (std::int64_t x = begin[2]; x < end[2]; ++x) {
+                    selectedCells.insert({static_cast<std::size_t>(z),
+                        static_cast<std::size_t>(y),
+                        static_cast<std::size_t>(x)});
+                }
+            }
+        }
+    }
+
+    std::ostringstream ownerNamespace;
+    ownerNamespace << "full-region-v1-side-" << targetSide << "-seed-"
+                   << options.storageCompressionSeed;
+    for (const auto& owner : reportOwners)
+        ownerNamespace << '-' << owner[0] << '_' << owner[1] << '_'
+                       << owner[2];
+    const auto cacheRoot = options.outputDirectory /
+        "storage-compression-cache" / ownerNamespace.str();
+    auto budget = std::make_shared<vc::render::DecodedChunkCacheBudget>(
+        options.decodedCacheBytes);
+    vc::render::ChunkCache::Options anchorCacheOptions;
+    anchorCacheOptions.decodedByteCapacity = options.decodedCacheBytes;
+    anchorCacheOptions.decodedByteBudget = budget;
+    anchorCacheOptions.maxConcurrentReads = 1;
+    FiberletOnDemandConfig onDemand;
+    onDemand.anchorRoot = cacheRoot / "anchors.zarr";
+    onDemand.fiberletRoot = cacheRoot / "fiberlets.zarr";
+    onDemand.anchorMetadata = anchorMetadata;
+    onDemand.fiberletMetadata = fiberletMetadata;
+    onDemand.grid = grid;
+    onDemand.anchorConfig = options.anchors;
+    onDemand.pathConfig = options.paths;
+    onDemand.predictionSampler =
+        [&](const auto& indices, int threads, auto& samples) {
+            field.sampleStoredGridBatch(indices, threads, samples);
+        };
+    onDemand.normalSampler = normalSampler;
+    onDemand.selectedAnchorCellsZYX.assign(
+        selectedCells.begin(), selectedCells.end());
+    onDemand.anchorRetainPredicate = [](const FiberAnchor&) {
+        return FiberAnchorRetainEvaluation{true, {}, {}};
+    };
+    onDemand.pointPredicate = [](const cv::Vec3d&) { return true; };
+    onDemand.anchorCacheOptions = anchorCacheOptions;
+    onDemand.fiberletCacheOptions = anchorCacheOptions;
+    onDemand.progress = [](const FiberletOnDemandProgress& progress) {
+        if (progress.status == "completed") {
+            std::cerr << "fiberlet_storage_region"
+                      << " stage=" << progress.stage
+                      << " key=" << progress.key.iz << '/'
+                      << progress.key.iy << '/' << progress.key.ix
+                      << " inputs=" << progress.inputCount
+                      << " outputs=" << progress.outputCount
+                      << " elapsed_seconds=" << progress.elapsedSeconds
+                      << '\n';
+        }
+    };
+    auto fullPreprocessor = FiberletOnDemandPreprocessor::create(
+        std::move(onDemand));
+    std::vector<FiberletScheduledChunk> targetSchedule;
+    targetSchedule.reserve(reportOwners.size());
+    for (const auto& owner : reportOwners) {
+        targetSchedule.push_back({
+            {0, owner[0], owner[1], owner[2]}, 0.0, 0.0});
+    }
+    std::cout << "fiberlet_storage_full_region"
+              << " chunk_side_base=" << targetSide
+              << " coordinate_units_per_base="
+              << options.storageCompressionCoordinateUnitsPerBaseVoxel
+              << " chunks=" << targetSchedule.size()
+              << " selected_cells_with_halo=" << selectedCells.size()
+              << '\n';
+    benchmarkReplayStorageCompression(fullPreprocessor, targetSchedule,
+        targetSchedule.size(), options.storageCompressionSeed, targetSide,
+        options.storageCompressionCoordinateUnitsPerBaseVoxel, reportOwners);
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -1938,6 +2708,7 @@ int main(int argc, char** argv)
             std::optional<vc::fiber_tracer::FiberletGraph> eagerGraph;
             std::shared_ptr<vc::fiber_tracer::FiberletOnDemandPreprocessor>
                 preprocessor;
+            std::vector<vc::fiber_tracer::FiberletScheduledChunk> chunkSchedule;
             std::unique_ptr<vc::fiber_tracer::FiberletCachedReplayGraphSource>
                 cachedGraph;
             struct ReplayChunkProgressLocation {
@@ -2132,10 +2903,9 @@ int main(int argc, char** argv)
                 preprocessor =
                     vc::fiber_tracer::FiberletOnDemandPreprocessor::create(
                         std::move(onDemand));
-                const auto chunkSchedule =
-                    preprocessor->referenceChunkSchedule(
-                        reference, startArc, endArc,
-                        options.radiusBaseVoxels);
+                chunkSchedule = preprocessor->referenceChunkSchedule(
+                    reference, startArc, endArc,
+                    options.radiusBaseVoxels);
                 for (std::size_t index = 0; index < chunkSchedule.size(); ++index) {
                     const auto& scheduled = chunkSchedule[index];
                     const ReplayChunkId fiberletId{scheduled.key.level,
@@ -2543,6 +3313,11 @@ int main(int argc, char** argv)
                           << " elapsed_seconds=" << std::chrono::duration<double>(std::chrono::steady_clock::now() - publishStart).count() << '\n';
             }
             overallProgress.finish();
+            if (options.storageCompressionChunks > 0) {
+                benchmarkFullRegionStorageCompression(field,
+                    canonicalNormalSampler, grid, options, dataset,
+                    canonicalNormalDataset, preprocessor, chunkSchedule);
+            }
             if (resultBundle.contains("overview")) {
                 for (const auto& page : resultBundle.at("overview").at("pages")) {
                     std::cout << "fiber_replay_overview"

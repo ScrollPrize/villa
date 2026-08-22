@@ -534,6 +534,31 @@ pinned until the current graph query releases them. `--storage-chunk-side N`
 selects the spatial chunk side in base voxels and must be an exact multiple of
 the anchor cell side. The roots are local-only in this implementation.
 
+Pass `--storage-compression-chunks N` to select up to `N` spatial regions that
+intersect the replay and run complete anchor and fiberlet extraction for every
+cell in those regions. Extraction also includes the neighboring anchor-cell
+halo needed to evaluate all fiberlets owned by a selected region. The
+diagnostic remaps the extracted records to the compact-axis, `uint8`-cost
+storage profile and reports its field-wise Zstd payload size alongside the
+existing float32-cache size for the same source-region records. Compact records
+whose quantized positions cross a chunk boundary are still attributed to their
+source extraction region for this comparison. The diagnostic also reports the
+size produced by wrapping the complete payload in an additional Zstd level-3
+frame. It materializes the raw field blocks and compares replacing field-wise
+compression with one whole-payload Zstd level-3 frame. It also
+compares Zstd against the existing order-0 rANS codec independently for each
+homogeneous field array; fields that do not shrink remain raw under both codecs.
+Selection is deterministic; change
+`--storage-compression-seed` from its default of `1` to sample a different
+ordering. This diagnostic does not change or publish the authoritative float32
+replay cache.
+
+Use `--storage-compression-chunk-side` to set the extracted spatial-region side
+and compact ownership side in base voxels, and
+`--storage-compression-coordinate-units` to test subvoxel coordinate units.
+For example, coordinate units `8` represent positions at one eighth of a base
+voxel. These two options affect only the diagnostic payloads.
+
 Cache-backed replay schedules exact tube intersections at storage-chunk
 resolution. It does not first materialize the complete anchor-cell population
 for the reference interval. When an anchor chunk is requested, its owned cells

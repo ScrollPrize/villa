@@ -472,6 +472,21 @@ std::vector<std::byte> zstdCompressFrame(std::span<const std::byte> input,
 
 } // namespace
 
+std::vector<std::byte> ransCompressBytes(std::span<const std::byte> input)
+{
+    if (input.empty())
+        return {};
+    return ransCompressFrame(input, 0);
+}
+
+bool ransDecompressBytes(std::span<const std::byte> frame,
+                         std::span<std::byte> output)
+{
+    if (output.empty())
+        return frame.empty();
+    return ransDecompressFrame(frame, output.data(), output.size());
+}
+
 std::vector<std::byte> cacheCompress(std::span<const std::byte> input,
                                      std::array<int, 3> shapeZYX,
                                      std::size_t elemSize,
