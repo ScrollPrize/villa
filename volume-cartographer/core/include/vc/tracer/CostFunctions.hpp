@@ -101,6 +101,8 @@ private:
     CachedChunked3dInterpolator<uint8_t, passTroughComputor> _interp_frac;
 };
 
+struct DistLossAnalytic;
+
 struct DistLoss {
     DistLoss(float dist, float w) : _d(dist), _w(w) {};
     template <typename T>
@@ -141,11 +143,81 @@ struct DistLoss {
     double _d;
     double _w;
 
-    static ceres::CostFunction* Create(float d, float w = 1.0)
-    {
-        return new ceres::AutoDiffCostFunction<DistLoss, 1, 3, 3>(new DistLoss(d, w));
-    }
+    static ceres::CostFunction* Create(float d, float w = 1.0);
 };
+
+struct DistLossAnalytic : public ceres::SizedCostFunction<1, 3, 3> {
+    DistLossAnalytic(double dist, double w) : _d(dist), _w(w) {}
+
+    bool Evaluate(double const* const* parameters, double* residuals, double** jacobians) const override
+    {
+        const double* a = parameters[0];
+        const double* b = parameters[1];
+
+        auto zero_jacobians = [&]() {
+            if (!jacobians) return;
+            if (jacobians[0]) jacobians[0][0] = jacobians[0][1] = jacobians[0][2] = 0.0;
+            if (jacobians[1]) jacobians[1][0] = jacobians[1][1] = jacobians[1][2] = 0.0;
+        };
+
+        if (a[0] == -1 && a[1] == -1 && a[2] == -1) {
+            residuals[0] = 0.0;
+            std::cout << "invalid DistLoss CORNER" << std::endl;
+            zero_jacobians();
+            return true;
+        }
+        if (b[0] == -1 && b[1] == -1 && b[2] == -1) {
+            residuals[0] = 0.0;
+            std::cout << "invalid DistLoss CORNER" << std::endl;
+            zero_jacobians();
+            return true;
+        }
+
+        double d[3] = { a[0] - b[0], a[1] - b[1], a[2] - b[2] };
+        double dist_sq = d[0]*d[0] + d[1]*d[1] + d[2]*d[2];
+        const double d_sq = _d * _d;
+
+        if (dist_sq <= 0.0) {
+            residuals[0] = _w * (dist_sq - 1.0);
+            zero_jacobians();
+            return true;
+        }
+
+        const double dist = std::sqrt(dist_sq);
+        double g;
+        if (dist_sq < d_sq) {
+            residuals[0] = _w * (_d / dist - 1.0);
+            g = -_w * _d / dist_sq;
+        } else {
+            residuals[0] = _w * (dist / _d - 1.0);
+            g = _w / _d;
+        }
+
+        if (jacobians) {
+            const double inv_dist = 1.0 / dist;
+            if (jacobians[0]) {
+                for (int i = 0; i < 3; ++i) jacobians[0][i] = g * d[i] * inv_dist;
+            }
+            if (jacobians[1]) {
+                for (int i = 0; i < 3; ++i) jacobians[1][i] = -g * d[i] * inv_dist;
+            }
+        }
+        return true;
+    }
+
+    double _d;
+    double _w;
+};
+
+inline ceres::CostFunction* CreateDistLossAnalytic(float d, float w = 1.0)
+{
+    return new DistLossAnalytic(d, w);
+}
+
+inline ceres::CostFunction* DistLoss::Create(float d, float w)
+{
+    return new DistLossAnalytic(d, w);
+}
 
 struct DistLoss2D {
     DistLoss2D(float dist, float w) : _d(dist), _w(w) {};
@@ -233,6 +305,10 @@ private:
 
 
 
+struct StraightLossAnalytic;
+struct StraightLoss2Analytic;
+struct StraightLoss2DAnalytic;
+
 struct StraightLoss {
     StraightLoss(float w) : _w(w) {};
     static constexpr double kStraightAngleCosThreshold = 0.86602540378443864676; // cos(30°); deviations beyond 30° incur penalty
@@ -268,10 +344,7 @@ struct StraightLoss {
 
     float _w;
 
-    static ceres::CostFunction* Create(float w = 1.0)
-    {
-        return new ceres::AutoDiffCostFunction<StraightLoss, 1, 3, 3, 3>(new StraightLoss(w));
-    }
+    static ceres::CostFunction* Create(float w = 1.0);
 };
 
 struct StraightLoss2 {
@@ -292,10 +365,7 @@ struct StraightLoss2 {
     
     float _w;
     
-    static ceres::CostFunction* Create(float w = 1.0)
-    {
-        return new ceres::AutoDiffCostFunction<StraightLoss2, 3, 3, 3, 3>(new StraightLoss2(w));
-    }
+    static ceres::CostFunction* Create(float w = 1.0);
 };
 
 struct StraightLoss2D {
@@ -327,11 +397,180 @@ struct StraightLoss2D {
 
     float _w;
 
-    static ceres::CostFunction* Create(float w = 1.0)
-    {
-        return new ceres::AutoDiffCostFunction<StraightLoss2D, 1, 2, 2, 2>(new StraightLoss2D(w));
-    }
+    static ceres::CostFunction* Create(float w = 1.0);
 };
+
+struct StraightLossAnalytic : public ceres::SizedCostFunction<1, 3, 3, 3> {
+    StraightLossAnalytic(double w) : _w(w) {}
+
+    bool Evaluate(double const* const* parameters, double* residuals, double** jacobians) const override
+    {
+        const double* a = parameters[0];
+        const double* b = parameters[1];
+        const double* c = parameters[2];
+
+        double d1[3] = { b[0]-a[0], b[1]-a[1], b[2]-a[2] };
+        double d2[3] = { c[0]-b[0], c[1]-b[1], c[2]-b[2] };
+        double l1_sq = d1[0]*d1[0] + d1[1]*d1[1] + d1[2]*d1[2];
+        double l2_sq = d2[0]*d2[0] + d2[1]*d2[1] + d2[2]*d2[2];
+
+        auto zero_jacobians = [&]() {
+            if (!jacobians) return;
+            for (int k = 0; k < 3; ++k)
+                if (jacobians[k])
+                    for (int i = 0; i < 3; ++i) jacobians[k][i] = 0.0;
+        };
+
+        if (l1_sq <= 1e-24 || l2_sq <= 1e-24) {
+            residuals[0] = 0.0;
+            zero_jacobians();
+            return true;
+        }
+
+        const double l1 = std::sqrt(l1_sq);
+        const double l2 = std::sqrt(l2_sq);
+        const double D  = l1 * l2;
+        const double N  = d1[0]*d2[0] + d1[1]*d2[1] + d1[2]*d2[2];
+        const double dot = N / D;
+
+        double dr_ddot;
+        constexpr double kCos30 = StraightLoss::kStraightAngleCosThreshold;
+        if (dot <= kCos30) {
+            const double penalty = kCos30 - dot;
+            residuals[0] = _w*(1.0 - dot) + (_w*8.0)*penalty*penalty;
+            dr_ddot = -_w + 16.0*_w*(dot - kCos30);
+        } else {
+            residuals[0] = _w * (1.0 - dot);
+            dr_ddot = -_w;
+        }
+
+        if (!jacobians) return true;
+        const double inv_D    = 1.0 / D;
+        const double inv_l1sq = 1.0 / l1_sq;
+        const double inv_l2sq = 1.0 / l2_sq;
+
+        if (jacobians[0]) {
+            for (int i = 0; i < 3; ++i)
+                jacobians[0][i] = dr_ddot * (-d2[i]*inv_D + dot*d1[i]*inv_l1sq);
+        }
+        if (jacobians[1]) {
+            for (int i = 0; i < 3; ++i)
+                jacobians[1][i] = dr_ddot * ((d2[i]-d1[i])*inv_D - dot*d1[i]*inv_l1sq + dot*d2[i]*inv_l2sq);
+        }
+        if (jacobians[2]) {
+            for (int i = 0; i < 3; ++i)
+                jacobians[2][i] = dr_ddot * (d1[i]*inv_D - dot*d2[i]*inv_l2sq);
+        }
+        return true;
+    }
+
+    double _w;
+};
+
+struct StraightLoss2Analytic : public ceres::SizedCostFunction<3, 3, 3, 3> {
+    StraightLoss2Analytic(double w) : _w(w) {}
+
+    bool Evaluate(double const* const* parameters, double* residuals, double** jacobians) const override
+    {
+        const double* a = parameters[0];
+        const double* b = parameters[1];
+        const double* c = parameters[2];
+        residuals[0] = _w * (b[0] - 0.5*(a[0] + c[0]));
+        residuals[1] = _w * (b[1] - 0.5*(a[1] + c[1]));
+        residuals[2] = _w * (b[2] - 0.5*(a[2] + c[2]));
+
+        if (!jacobians) return true;
+        const double half_neg_w = -0.5 * _w;
+        if (jacobians[0]) {
+            for (int i = 0; i < 9; ++i) jacobians[0][i] = 0.0;
+            jacobians[0][0] = half_neg_w;
+            jacobians[0][4] = half_neg_w;
+            jacobians[0][8] = half_neg_w;
+        }
+        if (jacobians[1]) {
+            for (int i = 0; i < 9; ++i) jacobians[1][i] = 0.0;
+            jacobians[1][0] = _w;
+            jacobians[1][4] = _w;
+            jacobians[1][8] = _w;
+        }
+        if (jacobians[2]) {
+            for (int i = 0; i < 9; ++i) jacobians[2][i] = 0.0;
+            jacobians[2][0] = half_neg_w;
+            jacobians[2][4] = half_neg_w;
+            jacobians[2][8] = half_neg_w;
+        }
+        return true;
+    }
+
+    double _w;
+};
+
+struct StraightLoss2DAnalytic : public ceres::SizedCostFunction<1, 2, 2, 2> {
+    StraightLoss2DAnalytic(double w) : _w(w) {}
+
+    bool Evaluate(double const* const* parameters, double* residuals, double** jacobians) const override
+    {
+        const double* a = parameters[0];
+        const double* b = parameters[1];
+        const double* c = parameters[2];
+
+        double d1[2] = { b[0]-a[0], b[1]-a[1] };
+        double d2[2] = { c[0]-b[0], c[1]-b[1] };
+        double l1_sq = d1[0]*d1[0] + d1[1]*d1[1];
+        double l2_sq = d2[0]*d2[0] + d2[1]*d2[1];
+
+        if (l1_sq <= 0.0 || l2_sq <= 0.0) {
+            residuals[0] = _w * (l1_sq * l2_sq - 1.0);
+            std::cout << "uhohh2" << std::endl;
+            if (jacobians) {
+                double dr_dd1[2] = { 2.0*_w*d1[0]*l2_sq, 2.0*_w*d1[1]*l2_sq };
+                double dr_dd2[2] = { 2.0*_w*d2[0]*l1_sq, 2.0*_w*d2[1]*l1_sq };
+                if (jacobians[0]) for (int i = 0; i < 2; ++i) jacobians[0][i] = -dr_dd1[i];
+                if (jacobians[1]) for (int i = 0; i < 2; ++i) jacobians[1][i] = dr_dd1[i] - dr_dd2[i];
+                if (jacobians[2]) for (int i = 0; i < 2; ++i) jacobians[2][i] = dr_dd2[i];
+            }
+            return true;
+        }
+
+        const double l1 = std::sqrt(l1_sq);
+        const double l2 = std::sqrt(l2_sq);
+        const double D  = l1 * l2;
+        const double N  = d1[0]*d2[0] + d1[1]*d2[1];
+        const double dot = N / D;
+        residuals[0] = _w * (1.0 - dot);
+
+        if (!jacobians) return true;
+        const double dr_ddot = -_w;
+        const double inv_D    = 1.0 / D;
+        const double inv_l1sq = 1.0 / l1_sq;
+        const double inv_l2sq = 1.0 / l2_sq;
+
+        if (jacobians[0]) {
+            for (int i = 0; i < 2; ++i)
+                jacobians[0][i] = dr_ddot * (-d2[i]*inv_D + dot*d1[i]*inv_l1sq);
+        }
+        if (jacobians[1]) {
+            for (int i = 0; i < 2; ++i)
+                jacobians[1][i] = dr_ddot * ((d2[i]-d1[i])*inv_D - dot*d1[i]*inv_l1sq + dot*d2[i]*inv_l2sq);
+        }
+        if (jacobians[2]) {
+            for (int i = 0; i < 2; ++i)
+                jacobians[2][i] = dr_ddot * (d1[i]*inv_D - dot*d2[i]*inv_l2sq);
+        }
+        return true;
+    }
+
+    double _w;
+};
+
+inline ceres::CostFunction* CreateStraightLossAnalytic(float w = 1.0)   { return new StraightLossAnalytic(w); }
+inline ceres::CostFunction* CreateStraightLoss2Analytic(float w = 1.0)  { return new StraightLoss2Analytic(w); }
+inline ceres::CostFunction* CreateStraightLoss2DAnalytic(float w = 1.0) { return new StraightLoss2DAnalytic(w); }
+
+inline ceres::CostFunction* StraightLoss::Create(float w)   { return new StraightLossAnalytic(w); }
+inline ceres::CostFunction* StraightLoss2::Create(float w)  { return new StraightLoss2Analytic(w); }
+inline ceres::CostFunction* StraightLoss2D::Create(float w) { return new StraightLoss2DAnalytic(w); }
+
 
 struct ParamMetricLoss2D {
     ParamMetricLoss2D(double unit, double du0, double du1, double dv0, double dv1,

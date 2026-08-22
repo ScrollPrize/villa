@@ -66,6 +66,8 @@ endfunction()
 
 vc_add_test(NAME test_smoke LIBS doctest::doctest)
 
+vc_add_test(NAME test_cost_functions_analytic LIBS doctest::doctest vc_core Ceres::ceres)
+
 vc_add_test(NAME test_tifxyz_identity)
 
 vc_add_test(NAME test_appendmask_render)
