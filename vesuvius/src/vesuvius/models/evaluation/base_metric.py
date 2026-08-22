@@ -36,3 +36,17 @@ class BaseMetric(ABC):
     
     def reset(self):
         self.results = []
+
+
+def binarize_scores(scores):
+    """Turn a single-channel score volume into class ids.
+
+    Single-channel heads emit a score per voxel rather than a class id, so
+    comparing one to the class ids 0/1 is essentially never true. Threshold
+    instead: at 0 for logits (the shipped configs use ``activation: "none"``),
+    at 0.5 once an activation has been applied.
+    """
+    import numpy as np
+
+    cutoff = 0.0 if (scores.min() < 0.0 or scores.max() > 1.0) else 0.5
+    return (scores > cutoff).astype(np.int64)
