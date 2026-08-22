@@ -18,10 +18,13 @@ constexpr double kTwoPi = 2.0 * M_PI;
 // Sample points per fiber for the local radial-ordering cost. Ordinal
 // comparisons need coverage, not density.
 constexpr std::size_t kOrdinalSamples = 48;
-// Coordinate-ascent search window (turns) and pass cap. Six passes of four
-// turns cover any slack a real annotation set leaves.
+// Coordinate-ascent search window (turns) and pass cap. The window keeps each
+// step's candidate evaluation cheap; the pass cap bounds total travel (window
+// times passes), and real data has shown slack chains packed tens of windings
+// from their ordinal optimum, so travel is what the cap must budget for.
+// Convergence exits early, so quiet solves never pay for the headroom.
 constexpr long long kAscentWindow = 4;
-constexpr int kAscentPasses = 6;
+constexpr int kAscentPasses = 40;
 
 double wrappedDelta(double a, double b)
 {
