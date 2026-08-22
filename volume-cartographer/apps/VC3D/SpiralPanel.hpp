@@ -114,9 +114,8 @@ private:
     // Read-only reports of what spiral-scroll.json specifies.
     QLabel* _scrollSummary = nullptr;
     QLabel* _lasagnaSummary = nullptr;
-    // The checkpoint the resident fit was built from: reported, never typed,
-    // and carried back in a rebuild request unless the Checkpoint section
-    // replaces it.
+    // The checkpoint the resident fit was built from, reported by the service
+    // and carried back in later rebuild requests.
     QString _sessionCheckpoint;
     QLabel* _sessionCheckpointLabel = nullptr;
     QComboBox* _checkpointChoice = nullptr;

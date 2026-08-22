@@ -1344,6 +1344,14 @@ void CChunkedVolumeViewer::onSurfaceChangedImpl(const std::string& name, const s
     _surfWeak = surf;
     if (isSameCurrentSurface && isEditUpdate) {
         _genCacheDirty = true;
+        // A plane mutated in place (axis-aligned slice rotation/tilt, line
+        // annotation cut planes) leaves nothing for the render-job identity in
+        // renderJobsSameGeometry() to compare: same object, same camera. Without
+        // a fresh epoch the submit below is discarded as a duplicate of the
+        // displayed frame and the new orientation is never drawn.
+        if (dynamic_cast<PlaneSurface*>(surf.get())) {
+            ++_surfaceGeometryEpoch;
+        }
         // Tools with a known edit region invalidate it before sending this
         // signal. Other same-object edits (brush/reset/etc.) need a conservative
         // full tile invalidation so stale geometry is never sampled.
@@ -6727,6 +6735,10 @@ void CChunkedVolumeViewer::updateStatusLabel()
         if (stats.persistentCacheEnabled && stats.persistentCacheLowSpace) {
             sharedCacheItems << QString("⚠ low disk: %1 free")
                 .arg(formatByteSize(stats.persistentCacheFreeBytes));
+        }
+        if (!stats.persistentCacheWarning.empty()) {
+            sharedCacheItems << QStringLiteral("⚠ disk cache disabled: ") +
+                QString::fromStdString(stats.persistentCacheWarning);
         }
         const QString network = vc3d::formatNetworkDownloadStats(
             stats, _volume && _volume->isRemote());
