@@ -3176,22 +3176,38 @@
   selection, generation settings, chunk payloads, or prefetch scheduling.
   On-demand traversal may populate a missing chunk, but repeating against a hot
   cache must not rewrite cache files.
-- Default replay progress is one command-wide terminal bar. Cached replay uses
-  `cache = (resolvedAnchors + 16*resolvedPrefixes) /
-  (expectedAnchors + 16*expectedPrefixes)` over the deterministic scheduled
-  prefetch keys, then uses
-  `trace = 0.95*cache + 0.05*min(greedy,fiberlet)`. Resolution counts generated
-  and persisted chunks identically and deduplicates reloads. Eager replay uses
-  the evaluator minimum directly. Data-dependent reach-neighborhood prefix and
-  committed-route reads are represented by the reserved evaluator term rather
-  than predicted preprocessing keys. All components and the combined fraction
-  are monotone. Non-finite tracer values are ignored and stale or restart-local
-  callbacks cannot move either tracer fraction backward. A 250-millisecond
-  ticker refreshes elapsed time even without worker callbacks. ETA is a live
-  elapsed/fraction estimate and may increase while fraction is stationary. The
-  bar reserves completion for requested visualization and durable bundle
-  publication, terminates its line before result/error output, and never
-  exposes restart-local step counts as global work.
+- Default cached replay progress exposes independent `cache/prep` and `trace`
+  terminal bars while preprocessing and tracing overlap. Cache progress is
+  `(resolvedAnchors + 16*resolvedPrefixes) /
+  (expectedAnchors + 16*expectedPrefixes)` over deterministic scheduled
+  prefetch keys. Trace progress is exactly
+  `min(greedy_reference_fraction, fiberlet_reference_fraction)`, with no
+  weighted combination between the two. Resolution counts generated and
+  persisted chunks identically and deduplicates reloads. Eager replay exposes
+  only trace progress. Cache progress excludes data-dependent neighbor-prefix
+  and committed-route reads, which occur during tracing. All fractions are
+  monotone. Non-finite tracer values are
+  ignored and stale or restart-local callbacks cannot move either tracer
+  fraction backward. A 250-millisecond ticker refreshes elapsed time even
+  without worker callbacks. The compact line contains only one elapsed field;
+  cache and trace retain independent ETAs while overlapping, and completed
+  scheduled cache progress is removed from the line. Trace additionally shows
+  a current-speed ETA over a rolling ten-second fraction window, reporting
+  `n/a` when that window has no positive progress. Requested visualization and durable publication use a separate
+  output phase after tracing, terminate their line before result/error output,
+  and never alter or masquerade as reference progress.
+- Each completed bounded fiberlet decision publishes search diagnostics with
+  its progress callback. The rollout expansion count is the total number of
+  states whose successors were enumerated across all intermediate fronts. For
+  each maximum-lookahead-front input where the existing strict cutoff actually
+  stops expansion, the diagnostic subtracts that input route's loss at the
+  front start from the cumulative cutoff and divides by the front length in
+  prediction voxels; it publishes the minimum such local loss density. This
+  normalization is diagnostic only: search continues to compare the unchanged
+  cumulative raw-loss cutoff against queued lower bounds. The CLI retains the
+  last published values until the next completed fiberlet decision. Exact mode
+  omits both diagnostics, and a bounded decision omits the cutoff if it never
+  binds.
 - `--stats` replaces the concise bar with detailed machine-readable stage,
   chunk, restart, evaluator, cache, visualization, and publication diagnostics.
   It does not change scheduling, generated payloads, tracing, or artifacts.

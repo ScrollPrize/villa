@@ -1565,6 +1565,7 @@ TEST_CASE("bounded fiberlet lookahead matches exact search across scaled prune f
     addGraphPath(report, 10, 11, {{1, 0.1F, 0}, {2, 0.1F, 0}}, 1.0);
     addGraphPath(report, 11, 12, {{2, 0.1F, 0}, {3, 0.1F, 0}}, 1.0);
     addGraphPath(report, 12, 13, {{3, 0.1F, 0}, {4, 0.1F, 0}}, 1.0);
+    addGraphPath(report, 3, 20, {{3, 0, 0}, {3.5F, 0.05F, 0}}, 100.0);
     const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
 
     vc::fiber_tracer::FiberletGraphReplayConfig config;
@@ -1577,7 +1578,11 @@ TEST_CASE("bounded fiberlet lookahead matches exact search across scaled prune f
     config.referenceEndArcBase = 8.0;
     config.recordDecisionDiagnostics = true;
     config.expansionThreads = 1;
-    const auto serial = vc::fiber_tracer::traceFiberletGraphReplay(graph, {{0, 0, 0}, {8, 0, 0}}, replayYNormals(), 1.0, config);
+    std::vector<vc::fiber_tracer::FiberletGraphReplayProgress> serialProgress;
+    const auto serial =
+        vc::fiber_tracer::traceFiberletGraphReplay(graph, {{0, 0, 0}, {8, 0, 0}}, replayYNormals(), 1.0, config, {}, [&](const auto& progress) {
+            serialProgress.push_back(progress);
+        });
     REQUIRE_FALSE(serial.segments.empty());
     REQUIRE_FALSE(serial.segments.front().decisions.empty());
     const auto& first = serial.segments.front().decisions.front();
@@ -1590,7 +1595,14 @@ TEST_CASE("bounded fiberlet lookahead matches exact search across scaled prune f
     CHECK(first.pruneFronts.front().localCandidateLimit == 4);
     CHECK(first.pruneFronts.back().localCandidateLimit == 1);
     CHECK(first.pruneFronts.back().retainedRouteCount == 2);
+    REQUIRE(first.pruneFronts.back().minimumAppliedLocalCompletionLossCutoffPerPredictionVoxel.has_value());
     CHECK_FALSE(first.selectedPrefixLogicalArcs.empty());
+    const auto firstRunning = std::find_if(serialProgress.begin(), serialProgress.end(), [](const auto& progress) {
+        return progress.state == "running" && progress.rolloutExpandedStateCount.has_value();
+    });
+    REQUIRE(firstRunning != serialProgress.end());
+    CHECK(*firstRunning->rolloutExpandedStateCount == first.expandedStateCount);
+    CHECK(firstRunning->minimumAppliedLocalPruneLossCutoffPerPredictionVoxel == first.pruneFronts.back().minimumAppliedLocalCompletionLossCutoffPerPredictionVoxel);
 
     auto serialJson = vc::fiber_tracer::fiberletGraphReplayJson(serial, config);
     config.expansionThreads = 4;
@@ -1600,12 +1612,19 @@ TEST_CASE("bounded fiberlet lookahead matches exact search across scaled prune f
     CHECK(serialJson == parallelJson);
 
     config.searchWidth = 0;
-    const auto exact = vc::fiber_tracer::traceFiberletGraphReplay(graph, {{0, 0, 0}, {8, 0, 0}}, replayYNormals(), 1.0, config);
+    std::vector<vc::fiber_tracer::FiberletGraphReplayProgress> exactProgress;
+    const auto exact =
+        vc::fiber_tracer::traceFiberletGraphReplay(graph, {{0, 0, 0}, {8, 0, 0}}, replayYNormals(), 1.0, config, {}, [&](const auto& progress) {
+            exactProgress.push_back(progress);
+        });
     REQUIRE(exact.segments.size() == parallel.segments.size());
     CHECK(exact.failures.size() == parallel.failures.size());
     for (size_t index = 0; index < exact.segments.size(); ++index) {
         CHECK(exact.segments[index].candidateIndices == parallel.segments[index].candidateIndices);
     }
+    CHECK(std::none_of(exactProgress.begin(), exactProgress.end(), [](const auto& progress) {
+        return progress.rolloutExpandedStateCount.has_value() || progress.minimumAppliedLocalPruneLossCutoffPerPredictionVoxel.has_value();
+    }));
 }
 
 TEST_CASE("bounded fiberlet lookahead closes reconvergent route labels")

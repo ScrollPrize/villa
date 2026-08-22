@@ -1,3 +1,13 @@
+# 2026-08-22: explicit fiber replay phases
+
+- Replaced the misleading weighted replay percentage with independent
+  cache/preprocessing and actual reference-trace progress. Visualization and
+  publication now report as a separate output phase.
+- Compact output now removes completed cache progress, shows elapsed time once,
+  adds a rolling current-speed ETA, and reports the latest bounded lookahead's
+  state-expansion count plus its minimum applied local cutoff loss per
+  prediction voxel.
+
 # 2026-08-21: bounded intermediate fiberlet lookahead
 
 - Added deterministic equal-distance intermediate pruning for graph replay,

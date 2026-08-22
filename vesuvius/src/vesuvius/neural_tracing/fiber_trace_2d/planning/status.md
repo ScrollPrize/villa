@@ -1,15 +1,11 @@
-# Status: bounded intermediate fiberlet lookahead
+# Status: separate fiber replay progress
 
-- [x] Capture the three search options and select intermediate pruning first.
-- [x] Write the implementation, testing, spec, docs, and benchmark plan.
+- [x] Capture the requested progress split.
+- [x] Write the implementation, documentation, and validation plan.
 - [x] Complete independent plan review and incorporate findings.
-- [x] Add replay configuration, CLI validation, and diagnostics.
-- [x] Implement deterministic intermediate expansion and pruning.
-- [x] Replace exhaustive between-front expansion with bounded distance-label
-  search.
-- [x] Add focused correctness, scaling, and determinism tests.
-- [x] Update specs, documentation, and changelog.
-- [x] Build and run the focused replay test target with `-j32`.
-- [ ] Benchmark widths 64, 128, and 256 on focused hot-cache intervals.
-- [x] Run the selected width on the full radius-768 fiber; result is rejected
-  (about 19m13s and seven fiberlet failures).
+- [x] Implement independent cache/prep and trace progress.
+- [x] Update specification, documentation, and changelog.
+- [x] Build and run focused validation with `-j32`.
+- [x] Remove duplicate elapsed fields and hide completed cache progress.
+- [x] Add recent-speed ETA, bounded rollout expansion count, and local cutoff density.
+- [x] Rebuild and validate compact line shortening and final diagnostics.

@@ -133,6 +133,7 @@ struct FiberletGraphReplayPruneFront {
     size_t retainedRouteCount = 0;
     size_t prunedCandidateCount = 0;
     size_t cumulativeGeneratedStateCount = 0;
+    std::optional<double> minimumAppliedLocalCompletionLossCutoffPerPredictionVoxel;
     bool searchWidthBound = false;
 };
 
@@ -212,6 +213,8 @@ struct FiberletGraphReplayProgress {
     double referenceArcBase = 0.0;
     double referenceArcFraction = 0.0;
     std::string state;
+    std::optional<size_t> rolloutExpandedStateCount;
+    std::optional<double> minimumAppliedLocalPruneLossCutoffPerPredictionVoxel;
 };
 
 using FiberletGraphReplayProgressCallback = std::function<void(const FiberletGraphReplayProgress&)>;

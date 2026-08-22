@@ -867,6 +867,7 @@ struct BoundedPersistentExpansionResult {
     std::vector<BoundedRankedPersistentRoute> prefixRepresentatives;
     std::vector<BoundedRankedPersistentRoute> globalCandidates;
     ExactPersistentSearchStats stats;
+    std::optional<double> appliedLocalCompletionLossCutoffPerPredictionVoxel;
 };
 
 constexpr double kPersistentLabelDistanceBin = 0.5;
@@ -906,6 +907,7 @@ BoundedPersistentExpansionResult expandPersistentRouteToFront(
     const FiberletReplayGraphSource& graph,
     const BoundedPersistentRoute& initial,
     double frontPredictionVoxels,
+    double frontBeginPredictionVoxels,
     double checkpointPredictionVoxels,
     double stablePrefixPredictionVoxels,
     const cv::Vec3d& initialDirection,
@@ -918,6 +920,7 @@ BoundedPersistentExpansionResult expandPersistentRouteToFront(
     std::map<PersistentLabelKey, BoundedRankedPersistentRoute> bestCompletions;
     std::multiset<double> completionLosses;
     std::optional<double> completionCutoff;
+    std::optional<double> appliedLocalCompletionCutoffPerPredictionVoxel;
     size_t sequence = 0;
     const auto routeLowerBound = [](const PersistentRouteCandidate& route) { return persistentRouteLoss(route); };
     const auto enqueue = [&](PersistentRouteCandidate route) {
@@ -945,6 +948,11 @@ BoundedPersistentExpansionResult expandPersistentRouteToFront(
     }
     while (!pending.empty()) {
         if (completionCutoff.has_value() && pending.top().lowerBound > *completionCutoff) {
+            const double frontLength = frontPredictionVoxels - frontBeginPredictionVoxels;
+            if (frontLength > kReplayEpsilon) {
+                const double beginLoss = scorePersistentRouteAtHorizon(graph, initial.route, frontBeginPredictionVoxels).total();
+                appliedLocalCompletionCutoffPerPredictionVoxel = std::max(0.0, (*completionCutoff - beginLoss) / frontLength);
+            }
             result.stats.costPruned += pending.size();
             break;
         }
@@ -1012,6 +1020,7 @@ BoundedPersistentExpansionResult expandPersistentRouteToFront(
     }
     for (const auto& candidate : result.globalCandidates)
         retainLocalBoundedPrefixRepresentative(candidate, searchWidth, result.prefixRepresentatives);
+    result.appliedLocalCompletionLossCutoffPerPredictionVoxel = appliedLocalCompletionCutoffPerPredictionVoxel;
     return result;
 }
 
@@ -1077,6 +1086,7 @@ BoundedPersistentLookaheadResult boundedPersistentRouteLookahead(
     const FiberletReplayGraphSource& graph,
     const std::vector<PersistentRouteCandidate>& initialRoutes,
     double scoringHorizonPredictionVoxels,
+    double rolloutBeginPredictionVoxels,
     double checkpointPredictionVoxels,
     double pruneDistancePredictionVoxels,
     const cv::Vec3d& initialDirection,
@@ -1111,6 +1121,7 @@ BoundedPersistentLookaheadResult boundedPersistentRouteLookahead(
         frontDiagnostics.horizonPathLengthPredictionVoxels = fronts[frontIndex];
         frontDiagnostics.inputRouteCount = active.size();
         const bool finalFront = frontIndex + 1 == fronts.size();
+        const double frontBeginPredictionVoxels = frontIndex == 0 ? rolloutBeginPredictionVoxels : fronts[frontIndex - 1];
         const size_t targetWidth = finalFront ? beamWidth : searchWidth;
         size_t localCandidateLimit = targetWidth;
         if (frontIndex > 0) {
@@ -1147,7 +1158,7 @@ BoundedPersistentLookaheadResult boundedPersistentRouteLookahead(
                     if (inputIndex >= active.size())
                         return;
                     expanded[inputIndex] =
-                        expandPersistentRouteToFront(graph, active[inputIndex], fronts[frontIndex], checkpointPredictionVoxels, firstFront, initialDirection, localCandidateLimit, stateBudget);
+                        expandPersistentRouteToFront(graph, active[inputIndex], fronts[frontIndex], frontBeginPredictionVoxels, checkpointPredictionVoxels, firstFront, initialDirection, localCandidateLimit, stateBudget);
                 }
             }));
         }
@@ -1171,6 +1182,13 @@ BoundedPersistentLookaheadResult boundedPersistentRouteLookahead(
             frontDiagnostics.dominatedStateCount += expansion.stats.dominated;
             frontDiagnostics.costPrunedStateCount += expansion.stats.costPruned;
             frontDiagnostics.completedCandidateCount += expansion.stats.completed;
+            if (expansion.appliedLocalCompletionLossCutoffPerPredictionVoxel.has_value()) {
+                if (!frontDiagnostics.minimumAppliedLocalCompletionLossCutoffPerPredictionVoxel.has_value())
+                    frontDiagnostics.minimumAppliedLocalCompletionLossCutoffPerPredictionVoxel = expansion.appliedLocalCompletionLossCutoffPerPredictionVoxel;
+                else
+                    frontDiagnostics.minimumAppliedLocalCompletionLossCutoffPerPredictionVoxel =
+                        std::min(*frontDiagnostics.minimumAppliedLocalCompletionLossCutoffPerPredictionVoxel, *expansion.appliedLocalCompletionLossCutoffPerPredictionVoxel);
+            }
             candidates.insert(
                 candidates.end(),
                 std::make_move_iterator(expansion.prefixRepresentatives.begin()),
@@ -1616,7 +1634,11 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
         if (failureCallback)
             failureCallback(result.failures.back());
     };
-    const auto emitProgress = [&](size_t segmentIndex, double arcBase, const char* state) {
+    const auto emitProgress = [&](size_t segmentIndex,
+                                  double arcBase,
+                                  const char* state,
+                                  std::optional<size_t> rolloutExpandedStateCount = {},
+                                  std::optional<double> minimumAppliedLocalPruneLossCutoffPerPredictionVoxel = {}) {
         if (!progressCallback)
             return;
         progressCallback({
@@ -1624,6 +1646,8 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
             arcBase,
             std::clamp((arcBase - result.referenceBeginArcBase) / intervalLength, 0.0, 1.0),
             state,
+            rolloutExpandedStateCount,
+            minimumAppliedLocalPruneLossCutoffPerPredictionVoxel,
         });
     };
 
@@ -1820,6 +1844,7 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
                     graph,
                     beams,
                     scoringHorizon,
+                    currentCheckpoint,
                     nextCheckpoint,
                     pruneDistancePredictionVoxels,
                     initialDirection,
@@ -1834,6 +1859,10 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
             }
             if (ranked.empty())
                 break;
+            const std::optional<size_t> rolloutExpandedStateCount =
+                config.searchWidth == 0 ? std::nullopt : std::optional<size_t>{searchStats.expanded};
+            const std::optional<double> minimumAppliedLocalPruneLossCutoffPerPredictionVoxel =
+                config.searchWidth == 0 || pruneFronts.empty() ? std::nullopt : pruneFronts.back().minimumAppliedLocalCompletionLossCutoffPerPredictionVoxel;
             beams.clear();
             beams.reserve(ranked.size());
             for (const auto& entry : ranked) {
@@ -1899,7 +1928,7 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
                 selectedTraversedNodes = std::move(provisionalTraversedNodes);
                 referenceExhausted = true;
             }
-            emitProgress(result.segments.size(), previousReferenceArc, "running");
+            emitProgress(result.segments.size(), previousReferenceArc, "running", rolloutExpandedStateCount, minimumAppliedLocalPruneLossCutoffPerPredictionVoxel);
         }
         if (segment.routePointsBaseXYZ.size() <= 1) {
             auto materialized = materializeSelected(selectedRoute);
@@ -2105,7 +2134,7 @@ nlohmann::json fiberletGraphReplayJson(const FiberletGraphReplayResult& replay, 
                 selectedPrefixLogicalArcs.push_back(arcIdJson(arc));
             nlohmann::json pruneFronts = nlohmann::json::array();
             for (const auto& front : decision.pruneFronts) {
-                pruneFronts.push_back({
+                nlohmann::json frontJson = {
                     {"horizon_path_length_prediction_voxels", front.horizonPathLengthPredictionVoxels},
                     {"input_route_count", front.inputRouteCount},
                     {"local_candidate_limit", front.localCandidateLimit},
@@ -2122,7 +2151,12 @@ nlohmann::json fiberletGraphReplayJson(const FiberletGraphReplayResult& replay, 
                     {"pruned_candidate_count", front.prunedCandidateCount},
                     {"cumulative_generated_state_count", front.cumulativeGeneratedStateCount},
                     {"search_width_bound", front.searchWidthBound},
-                });
+                };
+                if (front.minimumAppliedLocalCompletionLossCutoffPerPredictionVoxel.has_value()) {
+                    frontJson["minimum_applied_local_completion_loss_cutoff_per_prediction_voxel"] =
+                        *front.minimumAppliedLocalCompletionLossCutoffPerPredictionVoxel;
+                }
+                pruneFronts.push_back(std::move(frontJson));
             }
             nlohmann::json routes = nlohmann::json::array();
             for (const auto& route : decision.routes) {

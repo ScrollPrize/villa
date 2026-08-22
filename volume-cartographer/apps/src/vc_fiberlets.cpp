@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -1271,13 +1272,10 @@ private:
 class ReplayOverallProgress
 {
 public:
-    ReplayOverallProgress(bool enabled, bool includesVisualization, std::string label = "fiber replay")
-        : enabled_(enabled), traceWeight_(includesVisualization ? 0.80 : 0.99), label_(std::move(label)), start_(std::chrono::steady_clock::now())
+    explicit ReplayOverallProgress(bool enabled, std::string label = "fiber replay") : enabled_(enabled), label_(std::move(label))
     {
-        if (enabled_) {
-            renderLocked(true, false);
+        if (enabled_)
             ticker_ = std::thread([this] { tickerLoop(); });
-        }
     }
 
     ~ReplayOverallProgress() { endLine(); }
@@ -1285,16 +1283,23 @@ public:
     ReplayOverallProgress(const ReplayOverallProgress&) = delete;
     ReplayOverallProgress& operator=(const ReplayOverallProgress&) = delete;
 
-    void updateGreedy(double fraction) { updateTracer(fraction, greedyFraction_); }
-    void updateFiberlet(double fraction) { updateTracer(fraction, fiberletFraction_); }
+    void updateGreedy(double fraction) { updateTracer(fraction, greedyFraction_, {}, {}); }
+    void updateFiberlet(double fraction, std::optional<std::size_t> rolloutExpandedStateCount = {}, std::optional<double> minimumAppliedLocalPruneLossCutoffPerPredictionVoxel = {})
+    {
+        updateTracer(fraction, fiberletFraction_, rolloutExpandedStateCount, minimumAppliedLocalPruneLossCutoffPerPredictionVoxel);
+    }
+
+    void beginTracing()
+    {
+        std::lock_guard lock(mutex_);
+        startTracingLocked(std::chrono::steady_clock::now());
+        renderLocked(true, false);
+    }
 
     void printEventLine(const std::string& line)
     {
         std::lock_guard lock(mutex_);
-        if (enabled_ && lineOpen_) {
-            std::cerr << '\n';
-            lineOpen_ = false;
-        }
+        closeLineLocked();
         std::cerr << line << '\n';
         renderLocked(true, false);
     }
@@ -1304,23 +1309,46 @@ public:
         const auto snapshot = preprocessing->snapshot();
         std::lock_guard lock(mutex_);
         preprocessing_ = std::move(preprocessing);
+        if (!preprocessingStarted_) {
+            preprocessingStarted_ = true;
+            preprocessingStart_ = std::chrono::steady_clock::now();
+        }
         updatePreprocessingLocked(snapshot);
-        updateTraceFractionLocked(true);
+        renderLocked(true, false);
     }
 
     void tracingComplete()
     {
         std::lock_guard lock(mutex_);
+        if (preprocessing_)
+            updatePreprocessingLocked(preprocessing_->snapshot());
         greedyFraction_ = 1.0;
         fiberletFraction_ = 1.0;
-        preprocessingFraction_ = 1.0;
-        updateTraceFractionLocked(true);
+        startTracingLocked(std::chrono::steady_clock::now());
+        renderLocked(true, true);
+        traceDisplayComplete_ = true;
     }
 
-    void updatePostTrace(double fraction)
+    void setOutputStage(std::string stage, std::optional<std::size_t> completed = {}, std::optional<std::size_t> total = {})
     {
         std::lock_guard lock(mutex_);
-        updateAbsoluteLocked(fraction, true);
+        closeLineLocked();
+        if (!outputStarted_) {
+            outputStarted_ = true;
+        }
+        outputStart_ = std::chrono::steady_clock::now();
+        outputStage_ = std::move(stage);
+        outputCompleted_ = completed;
+        outputTotal_ = total;
+        renderLocked(true, false);
+    }
+
+    void updateOutputStage(std::size_t completed, std::size_t total)
+    {
+        std::lock_guard lock(mutex_);
+        outputCompleted_ = std::max(outputCompleted_.value_or(0), completed);
+        outputTotal_ = total;
+        renderLocked(true, false);
     }
 
     void finish()
@@ -1330,7 +1358,6 @@ public:
         std::lock_guard lock(mutex_);
         if (!enabled_ || finished_)
             return;
-        fraction_ = 1.0;
         renderLocked(true, true);
         finished_ = true;
         lineOpen_ = false;
@@ -1341,27 +1368,33 @@ public:
         disablePreprocessing();
         stopTicker();
         std::lock_guard lock(mutex_);
-        if (enabled_ && lineOpen_) {
-            std::cerr << '\n';
-            lineOpen_ = false;
-        }
+        closeLineLocked();
     }
 
 private:
-    void updateTracer(double fraction, double& current)
+    void updateTracer(double fraction, double& current, std::optional<std::size_t> rolloutExpandedStateCount, std::optional<double> minimumAppliedLocalPruneLossCutoffPerPredictionVoxel)
     {
         if (!std::isfinite(fraction))
             return;
         std::lock_guard lock(mutex_);
+        startTracingLocked(std::chrono::steady_clock::now());
         current = std::max(current, std::clamp(fraction, 0.0, 1.0));
-        updateTraceFractionLocked(false);
+        if (rolloutExpandedStateCount.has_value())
+            rolloutExpandedStateCount_ = rolloutExpandedStateCount;
+        if (minimumAppliedLocalPruneLossCutoffPerPredictionVoxel.has_value()) {
+            minimumAppliedLocalPruneLossCutoffPerPredictionVoxel_ = minimumAppliedLocalPruneLossCutoffPerPredictionVoxel;
+        }
+        renderLocked(false, false);
     }
 
-    void updateTraceFractionLocked(bool force)
+    void startTracingLocked(std::chrono::steady_clock::time_point now)
     {
-        const double tracerFraction = std::min(greedyFraction_, fiberletFraction_);
-        const double traceFraction = preprocessing_ ? 0.95 * preprocessingFraction_ + 0.05 * tracerFraction : tracerFraction;
-        updateAbsoluteLocked(traceWeight_ * traceFraction, force);
+        if (traceStarted_)
+            return;
+        traceStarted_ = true;
+        traceStart_ = now;
+        traceSpeedSamples_.clear();
+        traceSpeedSamples_.emplace_back(now, std::min(greedyFraction_, fiberletFraction_));
     }
 
     void updatePreprocessingLocked(const ReplayPreprocessingSnapshot& snapshot)
@@ -1389,7 +1422,8 @@ private:
                 if (!finished_) {
                     if (snapshot)
                         updatePreprocessingLocked(*snapshot);
-                    updateTraceFractionLocked(true);
+                    sampleTraceSpeedLocked(std::chrono::steady_clock::now());
+                    renderLocked(true, false);
                 }
             }
             waitLock.lock();
@@ -1418,50 +1452,133 @@ private:
             preprocessing->disable();
     }
 
-    void updateAbsoluteLocked(double fraction, bool force)
+    static void appendProgressMetric(
+        std::ostringstream& line,
+        std::string_view name,
+        double fraction,
+        std::chrono::steady_clock::time_point start,
+        std::chrono::steady_clock::time_point now,
+        std::optional<double> currentEta = {})
     {
-        fraction_ = std::max(fraction_, std::clamp(fraction, 0.0, 1.0));
-        renderLocked(force, false);
+        const double elapsed = std::chrono::duration<double>(now - start).count();
+        const double eta = fraction > 0.0 && fraction < 1.0 ? elapsed * (1.0 - fraction) / fraction
+                           : fraction >= 1.0                ? 0.0
+                                                            : std::numeric_limits<double>::infinity();
+        constexpr int width = 12;
+        const int filled = std::clamp(static_cast<int>(std::floor(fraction * width)), 0, width);
+        const double percent = 100.0 * fraction;
+        line << name << " [" << std::string(filled, '#') << std::string(width - filled, '-') << "] " << std::fixed
+             << std::setprecision(percent < 10.0 ? 2 : 1) << percent << '%';
+        line << " eta=" << progressDuration(eta);
+        if (currentEta.has_value())
+            line << " eta_current=" << progressDuration(*currentEta);
+    }
+
+    void sampleTraceSpeedLocked(std::chrono::steady_clock::time_point now)
+    {
+        if (!traceStarted_)
+            return;
+        const double fraction = std::min(greedyFraction_, fiberletFraction_);
+        traceSpeedSamples_.emplace_back(now, fraction);
+        const auto windowBegin = now - std::chrono::seconds(10);
+        while (traceSpeedSamples_.size() > 2 && traceSpeedSamples_[1].first <= windowBegin)
+            traceSpeedSamples_.pop_front();
+    }
+
+    [[nodiscard]] double currentTraceEtaLocked(std::chrono::steady_clock::time_point now) const
+    {
+        if (traceSpeedSamples_.size() < 2)
+            return std::numeric_limits<double>::infinity();
+        const auto& first = traceSpeedSamples_.front();
+        const double seconds = std::chrono::duration<double>(now - first.first).count();
+        const double fraction = std::min(greedyFraction_, fiberletFraction_);
+        const double rate = seconds > 0.0 ? (fraction - first.second) / seconds : 0.0;
+        return rate > 0.0 ? (1.0 - fraction) / rate : std::numeric_limits<double>::infinity();
     }
 
     void renderLocked(bool force, bool final)
     {
-        if (!enabled_)
+        if (!enabled_ || (!preprocessingStarted_ && !traceStarted_ && !outputStarted_) || (traceDisplayComplete_ && !outputStarted_))
             return;
         const auto now = std::chrono::steady_clock::now();
         if (!force && lastRender_.time_since_epoch().count() != 0 && now - lastRender_ < std::chrono::milliseconds(250))
             return;
         lastRender_ = now;
-        const double elapsed = std::chrono::duration<double>(now - start_).count();
-        const double eta = fraction_ > 0.0 && fraction_ < 1.0 ? elapsed * (1.0 - fraction_) / fraction_
-                           : fraction_ >= 1.0                 ? 0.0
-                                                              : std::numeric_limits<double>::infinity();
-        constexpr int width = 24;
-        const int filled = std::clamp(static_cast<int>(std::floor(fraction_ * width)), 0, width);
         std::ostringstream line;
-        const double percent = 100.0 * fraction_;
-        line << label_ << " [" << std::string(filled, '#') << std::string(width - filled, '-') << "] " << std::fixed
-             << std::setprecision(percent < 10.0 ? 2 : 1) << percent << "% elapsed=" << progressDuration(elapsed)
-             << " eta=" << progressDuration(eta);
-        std::cerr << '\r' << line.str() << "   ";
+        line << label_ << ' ';
+        if (outputStarted_) {
+            line << "output stage=" << outputStage_;
+            if (outputCompleted_.has_value() && outputTotal_.has_value()) {
+                const double fraction =
+                    *outputTotal_ == 0 ? 1.0 : std::clamp(static_cast<double>(*outputCompleted_) / static_cast<double>(*outputTotal_), 0.0, 1.0);
+                line << ' ';
+                appendProgressMetric(line, "items", fraction, outputStart_, now);
+                line << " (" << *outputCompleted_ << '/' << *outputTotal_ << ')';
+            } else {
+                line << " eta=n/a";
+            }
+        } else {
+            bool needsSeparator = false;
+            if (preprocessingStarted_ && preprocessingFraction_ < 1.0) {
+                appendProgressMetric(line, "cache/prep", preprocessingFraction_, preprocessingStart_, now);
+                needsSeparator = true;
+            }
+            if (needsSeparator && traceStarted_)
+                line << " | ";
+            if (traceStarted_) {
+                appendProgressMetric(line, "trace", std::min(greedyFraction_, fiberletFraction_), traceStart_, now, currentTraceEtaLocked(now));
+                if (rolloutExpandedStateCount_.has_value())
+                    line << " fiberlet_rollout_expansions=" << *rolloutExpandedStateCount_;
+                if (minimumAppliedLocalPruneLossCutoffPerPredictionVoxel_.has_value()) {
+                    line << " fiberlet_local_cutoff_loss_per_vx_min=" << std::setprecision(6) << *minimumAppliedLocalPruneLossCutoffPerPredictionVoxel_;
+                }
+            }
+        }
+        line << " elapsed=" << progressDuration(std::chrono::duration<double>(now - start_).count());
+        const auto rendered = line.str();
+        std::cerr << '\r' << rendered;
+        if (renderedWidth_ > rendered.size())
+            std::cerr << std::string(renderedWidth_ - rendered.size(), ' ');
         if (final)
             std::cerr << '\n';
         else
             std::cerr << std::flush;
         lineOpen_ = !final;
+        renderedWidth_ = final ? 0 : rendered.size();
+    }
+
+    void closeLineLocked()
+    {
+        if (enabled_ && lineOpen_) {
+            std::cerr << '\n';
+            lineOpen_ = false;
+        }
+        renderedWidth_ = 0;
     }
 
     const bool enabled_;
-    const double traceWeight_;
     const std::string label_;
-    const std::chrono::steady_clock::time_point start_;
+    const std::chrono::steady_clock::time_point start_ = std::chrono::steady_clock::now();
     std::mutex mutex_;
     std::chrono::steady_clock::time_point lastRender_{};
+    std::chrono::steady_clock::time_point preprocessingStart_{};
+    std::chrono::steady_clock::time_point traceStart_{};
+    std::chrono::steady_clock::time_point outputStart_{};
     double greedyFraction_ = 0.0;
     double fiberletFraction_ = 0.0;
     double preprocessingFraction_ = 0.0;
-    double fraction_ = 0.0;
     std::shared_ptr<ReplayPreprocessingProgress> preprocessing_;
+    std::string outputStage_;
+    std::optional<std::size_t> outputCompleted_;
+    std::optional<std::size_t> outputTotal_;
+    std::optional<std::size_t> rolloutExpandedStateCount_;
+    std::optional<double> minimumAppliedLocalPruneLossCutoffPerPredictionVoxel_;
+    std::deque<std::pair<std::chrono::steady_clock::time_point, double>> traceSpeedSamples_;
+    std::size_t renderedWidth_ = 0;
+    bool preprocessingStarted_ = false;
+    bool traceStarted_ = false;
+    bool traceDisplayComplete_ = false;
+    bool outputStarted_ = false;
     bool lineOpen_ = false;
     bool finished_ = false;
     std::mutex tickerMutex_;
@@ -2128,8 +2245,7 @@ int main(int argc, char** argv)
             const auto run = [&](std::string label,
                                  const vc::fiber_tracer::FiberletGeometryCacheProfile& cacheProfile,
                                  const vc::fiber_tracer::FiberletEvaluationQuantization& replayQuantization) {
-                ReplayOverallProgress progress(true, false, label);
-                progress.updateGreedy(1.0);
+                ReplayOverallProgress progress(true, label);
                 const auto start = std::chrono::steady_clock::now();
                 const double cpuStart = processCpuSeconds();
                 auto context = createCachedReplayContext(
@@ -2152,31 +2268,34 @@ int main(int argc, char** argv)
                     options.anchorCacheRoot,
                     cacheProfile.enabled() ? std::filesystem::path{} : options.fiberletCacheRoot,
                     progress);
+                progress.beginTracing();
+                progress.updateGreedy(1.0);
                 const auto failurePrinter = [&](const vc::fiber_tracer::FiberReplayFailure& event) {
-                    std::cerr << std::setprecision(17) << "fiberlet_quantization_failure run=" << std::quoted(label)
-                              << " index=" << event.index << " reference_arc_base=" << event.referenceArcBase
-                              << " reference_arc_fraction=" << event.referenceArcFraction << " reason=" << event.reason;
+                    std::ostringstream line;
+                    line << std::setprecision(17) << "fiberlet_quantization_failure run=" << std::quoted(label) << " index=" << event.index
+                         << " reference_arc_base=" << event.referenceArcBase << " reference_arc_fraction=" << event.referenceArcFraction
+                         << " reason=" << event.reason;
                     if (event.thresholdMeasurement.has_value()) {
                         const auto& measurement = *event.thresholdMeasurement;
-                        std::cerr << " euclidean_error_base_voxels=" << measurement.euclideanErrorBaseVoxels << " normal_error_base_voxels=";
+                        line << " euclidean_error_base_voxels=" << measurement.euclideanErrorBaseVoxels << " normal_error_base_voxels=";
                         if (measurement.normalErrorBaseVoxels.has_value())
-                            std::cerr << *measurement.normalErrorBaseVoxels;
+                            line << *measurement.normalErrorBaseVoxels;
                         else
-                            std::cerr << "n/a";
-                        std::cerr << " tangential_error_base_voxels=";
+                            line << "n/a";
+                        line << " tangential_error_base_voxels=";
                         if (measurement.tangentialErrorBaseVoxels.has_value())
-                            std::cerr << *measurement.tangentialErrorBaseVoxels;
+                            line << *measurement.tangentialErrorBaseVoxels;
                         else
-                            std::cerr << "n/a";
-                        std::cerr << " threshold_error_base_voxels=" << measurement.thresholdErrorBaseVoxels
-                                  << " threshold_error_ratio=" << measurement.thresholdErrorRatio
-                                  << " local_normal_valid=" << (measurement.localNormalValid ? "true" : "false");
+                            line << "n/a";
+                        line << " threshold_error_base_voxels=" << measurement.thresholdErrorBaseVoxels
+                             << " threshold_error_ratio=" << measurement.thresholdErrorRatio
+                             << " local_normal_valid=" << (measurement.localNormalValid ? "true" : "false");
                     }
-                    std::cerr << '\n' << std::flush;
+                    progress.printEventLine(line.str());
                 };
                 auto replay = vc::fiber_tracer::
                     traceFiberletGraphReplay(*context.graph, fiber.linePointsXyzBase, *normalSampler, grid.predictionToBaseScale, options.graphReplay, failurePrinter, [&](const auto& event) {
-                        progress.updateFiberlet(event.referenceArcFraction);
+                        progress.updateFiberlet(event.referenceArcFraction, event.rolloutExpandedStateCount, event.minimumAppliedLocalPruneLossCutoffPerPredictionVoxel);
                     });
                 progress.tracingComplete();
                 const auto anchorStats = context.preprocessor->anchorCache()->stats();
@@ -2260,7 +2379,7 @@ int main(int argc, char** argv)
 
         if (isReplayCommand(options.command)) {
             const auto traceSetupStart = std::chrono::steady_clock::now();
-            ReplayOverallProgress overallProgress(!options.printStats, options.writeReplayVisualizations);
+            ReplayOverallProgress overallProgress(!options.printStats);
             if (options.printStats)
                 std::cerr << "fiber_replay_stage stage=trace_setup status=started\n";
             const auto scales = vc::fiber_tracer::resolveFiberPredictionTraceScales(dataset.manifest(), options.inferenceScaledownPower);
@@ -2546,6 +2665,7 @@ int main(int argc, char** argv)
             };
 
             const auto traceStart = std::chrono::steady_clock::now();
+            overallProgress.beginTracing();
             if (options.printStats)
                 std::cerr << "fiber_replay_stage stage=parallel_trace status=started\n";
             auto greedyFuture = std::async(std::launch::async, [&]() {
@@ -2596,13 +2716,19 @@ int main(int argc, char** argv)
             auto fiberletFuture = std::async(std::launch::async, [&]() {
                 try {
                     const auto progress = [&](const vc::fiber_tracer::FiberletGraphReplayProgress& event) {
-                        overallProgress.updateFiberlet(event.referenceArcFraction);
+                        overallProgress.updateFiberlet(event.referenceArcFraction, event.rolloutExpandedStateCount, event.minimumAppliedLocalPruneLossCutoffPerPredictionVoxel);
                         if (!options.printStats)
                             return;
                         std::lock_guard lock(outputMutex);
                         std::cerr << std::setprecision(17) << "fiber_replay_progress tracer=fiberlet"
                                   << " state=" << event.state << " reference_arc_base=" << event.referenceArcBase
-                                  << " reference_arc_fraction=" << event.referenceArcFraction << " segment=" << event.segmentIndex << '\n';
+                                  << " reference_arc_fraction=" << event.referenceArcFraction << " segment=" << event.segmentIndex;
+                        if (event.rolloutExpandedStateCount.has_value())
+                            std::cerr << " fiberlet_rollout_expansions=" << *event.rolloutExpandedStateCount;
+                        if (event.minimumAppliedLocalPruneLossCutoffPerPredictionVoxel.has_value()) {
+                            std::cerr << " fiberlet_local_cutoff_loss_per_vx_min=" << *event.minimumAppliedLocalPruneLossCutoffPerPredictionVoxel;
+                        }
+                        std::cerr << '\n';
                     };
                     auto result = eagerGraph.has_value() ? vc::fiber_tracer::traceFiberletGraphReplay(
                                                                *eagerGraph,
@@ -2715,6 +2841,7 @@ int main(int argc, char** argv)
 
             if (options.writeReplayVisualizations) {
                 const auto overviewStart = std::chrono::steady_clock::now();
+                overallProgress.setOutputStage("overview");
                 if (options.printStats)
                     std::cerr << "fiber_replay_stage stage=overview status=started\n";
                 bundle.overview = vc::fiber_tracer::renderFiberReplayOverview(
@@ -2738,9 +2865,10 @@ int main(int argc, char** argv)
                               << " fiberlet_side_shape_yx=" << bundle.overview->fiberletSideShapeYX[0] << ','
                               << bundle.overview->fiberletSideShapeYX[1] << " pages=" << bundle.overview->pages.size() << '\n';
                 }
-                overallProgress.updatePostTrace(0.82);
                 const std::size_t visualizationCount = bundle.greedyReplay.failures.size() + bundle.fiberletReplay.failures.size();
                 std::size_t completedVisualizations = 0;
+                if (visualizationCount > 0)
+                    overallProgress.setOutputStage("visualizations", completedVisualizations, visualizationCount);
                 const auto addVisualizations = [&](vc::fiber_tracer::FiberReplayTracer tracer, const auto& failures) {
                     for (const auto& failure : failures) {
                         const auto visualStart = std::chrono::steady_clock::now();
@@ -2784,10 +2912,7 @@ int main(int argc, char** argv)
                         vc::fiber_tracer::renderFiberReplayStripTextures(*visual.strips, *replayCtVolume, replayCtLocator);
                         bundle.visualizations.push_back(std::move(visual));
                         ++completedVisualizations;
-                        if (visualizationCount > 0) {
-                            overallProgress.updatePostTrace(
-                                0.82 + 0.16 * static_cast<double>(completedVisualizations) / static_cast<double>(visualizationCount));
-                        }
+                        overallProgress.updateOutputStage(completedVisualizations, visualizationCount);
                         if (options.printStats) {
                             std::cerr << "fiber_replay_stage stage=visualization status=completed"
                                       << " tracer=" << vc::fiber_tracer::fiberReplayTracerName(tracer) << " index=" << failure.index << " elapsed_seconds="
@@ -2797,11 +2922,10 @@ int main(int argc, char** argv)
                 };
                 addVisualizations(vc::fiber_tracer::FiberReplayTracer::Greedy, bundle.greedyReplay.failures);
                 addVisualizations(vc::fiber_tracer::FiberReplayTracer::Fiberlet, bundle.fiberletReplay.failures);
-                overallProgress.updatePostTrace(0.98);
             }
 
             const auto publishStart = std::chrono::steady_clock::now();
-            overallProgress.updatePostTrace(0.99);
+            overallProgress.setOutputStage("publish");
             if (options.printStats)
                 std::cerr << "fiber_replay_stage stage=publish status=started\n";
             const auto resultBundle = vc::fiber_tracer::writeFiberReplayBundle(options.outputDirectory, bundle);

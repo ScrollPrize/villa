@@ -632,25 +632,47 @@ anchor, prefix, and route chunks; multiple committed edges in one route chunk
 share one decode. `--eager-graph` runs the prior whole-tube graph construction
 for diagnostics.
 
-By default replay prints one terminal progress bar with elapsed time and ETA.
-For cached replay, scheduled preprocessing contributes 95% of tracing work:
-resolved anchor chunks have weight one and resolved fiberlet prefix chunks have
-weight 16. The remaining 5% is the minimum monotone reference-arc fraction of
-the greedy and fiberlet evaluators. This is an estimate calibrated to measured
-roughly one-second anchor and 15-20-second fiberlet chunks; data-dependent
-neighbor-prefix and committed-route reads remain represented by the tracer
-term. Persisted and newly generated chunks both count, while reloads count only
-once. Eager replay continues to use only the evaluator minimum. A private
-250-millisecond ticker repaints elapsed time even while a long chunk emits no
-callback. ETA is recomputed from live elapsed time and may increase while the
-estimated fraction is stationary. Non-finite, stale, and restart-local tracer
-callbacks cannot move progress backward. Completion remains reserved until
-requested visualization and bundle publication finish.
+By default cached replay prints independent `cache/prep` and `trace` terminal
+progress bars while those operations overlap. Cache progress covers the
+deterministic scheduled prefetch keys: resolved anchor chunks have weight one
+and resolved fiberlet prefix chunks have weight 16. Persisted and newly
+generated chunks both count, while reloads count only once. Trace progress is
+the minimum monotone reference-arc fraction of the greedy and fiberlet
+evaluators. It is therefore actual progress through the selected reference
+interval, not a weighted estimate of preprocessing work. Eager replay prints
+only the trace bar. Cache progress covers the scheduled anchor and prefix
+population only; data-dependent neighbor-prefix and committed-route reads are
+not predicted by that denominator and occur as part of tracing.
 
-Pass `--stats` to replace the bar with the detailed machine-readable stage,
+The active compact line shows one overall replay elapsed time. While cache and trace
+overlap, each retains its own ETA; once scheduled cache progress reaches 100%,
+the cache field is removed and the remaining terminal line is cleared to avoid
+stale text. Trace also reports `eta_current`, computed from its progress during
+the latest ten-second window. A stalled window reports `n/a` instead of
+reusing an old rate. A private 250-millisecond ticker repaints the line even
+while a long chunk emits no callback. Non-finite, stale, and restart-local
+tracer callbacks cannot move trace progress backward. After both evaluators
+complete, requested overview, failure visualizations, and durable publication
+use separately named output stages and cannot be mistaken for tracing.
+
+Fiberlet decisions add `fiberlet_rollout_expansions`, the total number of search
+states expanded across all fronts of the latest bounded lookahead decision. An
+expanded state is one whose successors were enumerated, so this value tracks
+the search work that grows during slow decisions. Bounded search also adds
+`fiberlet_local_cutoff_loss_per_vx_min`. For each final-front input where the
+existing strict cutoff actually stops the queue, this subtracts the input
+route's loss at the front start from the cumulative cutoff and divides by the
+front length in prediction voxels; the displayed value is the minimum of those
+local densities. The search itself still compares unchanged cumulative raw
+losses. Both diagnostics are absent in exact mode, and the cutoff is absent
+when it never binds. The most recent values remain visible while the other
+evaluator controls the combined trace fraction.
+
+Pass `--stats` to replace the bars with the detailed machine-readable stage,
 chunk, failure, evaluator, and cache rows. These retain the stable chunk schedule
 indices, internal generation phases, worker and CPU timings, cache residency,
-and restart-local greedy step diagnostics used for profiling.
+restart-local greedy step diagnostics, and the fiberlet rollout expansion and
+local cutoff diagnostics used for profiling.
 
 On-demand anchor fitting publishes completion while holding the same mutex
 used by its ready-cell condition predicate. Cache waits are ordinary blocking
