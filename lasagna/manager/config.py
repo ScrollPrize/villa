@@ -16,6 +16,7 @@ DEFAULT_INFERENCE_PARAMS = (
     "--tile-size", "512", "--border", "32", "--overlap", "96",
     "--devices", "all",
 )
+DEFAULT_LASAGNA_INFERENCE_PARAMS = ("--devices", "all")
 DEFAULT_RCLONE_PARAMS = (
     "--s3-provider", "AWS",
     "--s3-env-auth",
@@ -43,6 +44,7 @@ class ManagerConfig:
     fiberlet_threads: int = DEFAULT_FIBERLET_THREADS
     catalog_max_age_seconds: int = 3600
     params: tuple[str, ...] = DEFAULT_INFERENCE_PARAMS
+    lasagna_params: tuple[str, ...] = DEFAULT_LASAGNA_INFERENCE_PARAMS
     fiberlet_params: tuple[str, ...] = ()
     rclone_params: tuple[str, ...] = DEFAULT_RCLONE_PARAMS
 
@@ -80,7 +82,9 @@ def _validate(raw: dict[str, Any]) -> ManagerConfig:
     unknown = sorted(set(raw) - known)
     if unknown:
         raise ValueError(f"unknown config key(s): {', '.join(unknown)}")
-    for array_name in ("snapshot_dirs", "params", "fiberlet_params", "rclone_params"):
+    for array_name in (
+        "snapshot_dirs", "params", "lasagna_params", "fiberlet_params", "rclone_params",
+    ):
         if array_name not in raw:
             continue
         values = raw[array_name]
@@ -113,6 +117,7 @@ def render_config(config: ManagerConfig = ManagerConfig()) -> str:
     values = asdict(config)
     snapshots = ", ".join(_toml_string(v) for v in values.pop("snapshot_dirs"))
     params = ", ".join(_toml_string(v) for v in values.pop("params"))
+    lasagna_params = ", ".join(_toml_string(v) for v in values.pop("lasagna_params"))
     fiberlet_params = ", ".join(_toml_string(v) for v in values.pop("fiberlet_params"))
     rclone_params = ", ".join(_toml_string(v) for v in values.pop("rclone_params"))
     lines = [
@@ -130,8 +135,10 @@ def render_config(config: ManagerConfig = ManagerConfig()) -> str:
         f"fiberlet_binary = {_toml_string(values['fiberlet_binary'])}",
         f"fiberlet_threads = {values['fiberlet_threads']}",
         f"catalog_max_age_seconds = {values['catalog_max_age_seconds']}",
-        "# Default backend arguments; arguments after `inference run ... --` override these.",
+        "# Default Fiber inference arguments; explicit backend arguments override these.",
         f"params = [{params}]",
+        "# Regular Lasagna uses checkpoint/CLI defaults plus multi-GPU by default.",
+        f"lasagna_params = [{lasagna_params}]",
         "# Additional native Fiberlet arguments; arguments after `fiberlet run ... --` override these.",
         f"fiberlet_params = [{fiberlet_params}]",
         "# Bulk staging-upload arguments passed to `rclone copy`.",

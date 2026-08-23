@@ -1223,3 +1223,16 @@
   runtime paths, with canonical processing/source fingerprints.
 - Added bounded-memory staging and minimal Atlas `fiberlets` copy-first public
   representation support without registering a synthetic model.
+# 2026-08-23: catalogue-backed managed Fiberlet normals
+
+- Made the normal selector optional for managed Fiberlet jobs. The manager now
+  distinguishes published regular Lasagna normals from Fiber Lasagna outputs
+  through exact Atlas model channels, caches the remote manifest with the VC
+  read-through marker, and lazily reuses normal chunks.
+- Added explicit Atlas normal selectors, cache-only completion, stable remote
+  dependency provenance/resume, and one-voxel base-shape compatibility.
+- Reused VC3D's canonical open-data Lasagna cache URL, identity directory, and
+  marker schema; manifest SHA-256 is now integrity metadata only.
+- Invalid public origins, cache markers, coordinate metadata, and remote group
+  descriptors now fail explicitly instead of selecting or constructing an
+  alternate cache dependency.

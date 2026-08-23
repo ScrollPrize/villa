@@ -728,6 +728,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 					OutputChannelSpec("nx", relative_path="nx.ome.zarr"),
 					OutputChannelSpec("ny", relative_path="ny.ome.zarr"),
 				),
+				accumulator_channel_count=7,
 				chunk_size=32,
 				pyramid_policy=PYRAMID_POLICY_CUSTOM,
 			),
@@ -753,6 +754,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			adapter.normal_product.channel_names,
 			("grad_mag", "nx", "ny"),
 		)
+		self.assertEqual(adapter.normal_product.raw_channel_count, 7)
 		self.assertEqual(
 			[product.name for product in adapter.derived_output_products],
 			[LasagnaCosPredict3DAdapter.PRED_DT_PRODUCT],

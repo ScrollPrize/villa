@@ -21,6 +21,9 @@ license = { file = "LICENSE" }
 [project.entry-points."numcodecs.codecs"]
 vcz1 = "vc.compression.vcz1_numcodecs:Vcz1"
 
+[project.scripts]
+vc_fiberlets = "vc.fiberlets_cli:main"
+
 [tool.scikit-build]
 cmake.version = ">=3.22"
 wheel.packages = []
@@ -28,6 +31,7 @@ wheel.packages = []
 [tool.scikit-build.cmake.define]
 VC_BUILD_PYTHON = "ON"
 VC_BUILD_APPS = "OFF"
+VC_BUILD_FIBERLETS = "ON"
 VC_BUILD_UI_TRACER = "OFF"
 VC_BUILD_FLATBOI = "OFF"
 VC_TESTING = "OFF"

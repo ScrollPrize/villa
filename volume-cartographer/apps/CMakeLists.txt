@@ -1,3 +1,21 @@
+if(VC_BUILD_FIBERLETS)
+    add_executable(vc_fiberlets src/vc_fiberlets.cpp)
+    target_link_libraries(vc_fiberlets vc_fiber_tracer vc_lasagna)
+
+    # Python wheels place the private executable under site-packages/vc/bin
+    # and its shared libraries at the site-packages root. Normal application
+    # builds retain the project-wide bin/../lib runtime layout.
+    if(VC_BUILD_PYTHON AND NOT VC_BUILD_APPS)
+        if(APPLE)
+            set_target_properties(vc_fiberlets PROPERTIES
+                INSTALL_RPATH "@loader_path/../..")
+        elseif(NOT WIN32)
+            set_target_properties(vc_fiberlets PROPERTIES
+                INSTALL_RPATH "$ORIGIN/../..")
+        endif()
+    endif()
+endif()
+
 if(NOT VC_BUILD_APPS)
     return()
 endif()
@@ -140,9 +158,6 @@ target_link_libraries(vc_lasagna_line_probe vc_lasagna opencv_imgcodecs opencv_i
 
 add_executable(vc_fiber_trace_metric src/vc_fiber_trace_metric.cpp)
 target_link_libraries(vc_fiber_trace_metric vc_fiber_tracer vc_lasagna)
-
-add_executable(vc_fiberlets src/vc_fiberlets.cpp)
-target_link_libraries(vc_fiberlets vc_fiber_tracer vc_lasagna)
 
 add_executable(vc_lasagna_maxflow_graph src/vc_lasagna_maxflow_graph.cpp)
 target_link_libraries(vc_lasagna_maxflow_graph vc_lasagna)

@@ -1,88 +1,67 @@
-# Task Log: managed Fiberlet preprocessing and publication
+# Task log: catalogue-backed Fiberlet normal inputs
 
-## 2026-08-23
-
-- Planning only; no implementation has been started.
-- The active `fiber-lets3` branch contains the native whole-volume command but
-  currently predates the tracked `lasagna/manager` sources. Current
-  `origin/main` contains the manager implementation. The implementation must
-  integrate main first rather than copying manager code or using untracked
-  bytecode.
-- Existing manager orchestration is reusable but still names its generic
-  process state, completion validation, and upload APIs as inference. The plan
-  extracts one shared managed-job path and keeps inference records compatible.
-- The native final combined Zarr already contains compact anchors, prefixes,
-  and routes. Its separate float anchor Zarr is a durable resume cache and does
-  not need to be uploaded.
-- The native dataset fingerprint currently includes absolute local manifest
-  paths and persists those paths in metadata. That is acceptable for an
-  experimental local cache but not for a portable/open-data artifact. The plan
-  separates runtime locations from stable manifest-hash/source identity before
-  publication support is enabled.
-- Atlas has no existing Fiberlet data type. Existing `lasagna` represents dense
-  neural prediction bundles and requires a trained model ID plus Lasagna
-  manifest/OME-Zarr layout, so a combined sparse Fiberlet graph must not be
-  forced through that contract. The plan adds one minimal derived volume data
-  type and no fake model.
-- Local Fiberlet processing may precede publication of its inputs. Atlas
-  validation/upload will require the referenced Fiber and normal prediction
-  identities to exist so the published dependency graph is resolvable.
-- Existing untracked compiled Python extensions under `lasagna/` were observed
-  and left untouched.
-- Independent review identified missing resume semantics, native completion
-  validation, bounded-memory sparse upload, passthrough ownership checks, and
-  several places where existing manager/Atlas helpers must be extracted rather
-  than copied. The plan now includes those corrections.
-- The portable metadata contract was clarified: it is not merely a settings
-  fingerprint checked against caller configuration. The final Zarr must store
-  every effective setting needed by a reader to construct compatible decoders
-  and interpret coordinates. Canonical global settings and stable source
-  identities feed the fingerprints; runtime filesystem paths do not. Paths
-  remain only in private manager execution records.
-- Created `fiberlets-development-integration` for the broader unmerged
-  Fiberlet work, merged current `origin/main`, and committed the integration as
-  `33e029fd2`.
-- Established a post-merge baseline: 61 manager tests passed and all 25 native
-  Fiberlet storage tests passed.
-- Replaced path-bearing native dataset metadata with schema-v2 structured
-  source and processing contracts. Fingerprints are now canonically derived
-  from scientific settings and stable source identities; the final dataset can
-  be reopened from its own metadata, and whole-volume preprocessing performs a
-  final fresh source-derived completeness check before reporting success.
-- Added path-independence/source-sensitivity and self-describing-open coverage;
-  the focused native suite now passes 26 test cases.
-- Generalized the existing manager reservation, tmux launch, runner lifecycle,
-  completion, reconciliation, listing, and upload paths rather than creating a
-  second Fiberlet supervisor. Legacy inference records still default to the
-  `inference` lifecycle phase.
-- Added `fiberlet run`, `fiberlet resume`, and `fiberlet ls` with strict
-  completed-run role/source/coordinate/crop validation, freshly hashed input
-  manifests, a private resumable anchor cache, stable source context, bounded
-  portable provenance, contextual completion, and manager-owned option guards.
-- Added explicit `fiberlet_threads` configuration (portable default 32) and
-  configured this host for 128 workers. Per-run `--threads` remains an explicit
-  last-wins override.
-- Fiberlet completion now validates the native schema-v2 header, array roots,
-  processing contract, source run/hash identity, and fingerprint before a run
-  can complete. A post-processing provenance failure returns exit status 1
-  rather than leaving a failed record behind a successful runner exit.
-- Generalized the existing marker-protected staging flow by artifact kind.
-  Fiberlet Zarr payloads use rclone's streaming traversal below the distinct
-  `fiberlets/<run_uuid>` namespace; inference retains its fixed inventory and
-  `inference/<run_uuid>` behavior.
-- Extracted shared Atlas portable-bundle/origin/idempotent-ingest helpers and
-  added a minimal `fiberlets` volume entry. It requires already-registered
-  Fiber and normal Lasagna predictions, creates no model, and plans only one
-  canonical and one CC-licensed public copy with no derivation.
-- Validation results: 75 manager/open-data/provenance tests passed; the native
-  `vc_fiberlets`/storage targets built and all 26 focused storage tests passed;
-  the new Atlas Fiberlet test plus all 5 existing inference-bundle tests passed.
-- The wider Atlas `test_data_sync.py` run had 27 passes, 7 skips, and 4 existing
-  expectation failures in unrelated flattened-OBJ and TIFXYZ routing tests.
-  The new `entity.data` parameter source is used only by the Fiberlet rule, so
-  those failures are not caused by the Fiberlet dispatch.
-- No production whole-volume preprocessing/upload was run because it is large
-  and operator-owned. The native, manager, upload, Atlas ingest, idempotency,
-  and exact two-copy planning paths are covered with focused synthetic tests.
-- Existing ignored compiled Python extensions in `lasagna/` and untracked Atlas
-  sync-state files were left untouched.
+- Inspected the current manager: `fiberlet run` requires two completed local
+  manager runs, while catalogue indexing exposes only CT volumes.
+- Inspected native VC Lasagna access: direct remote manifests already support
+  persistent read-through caching via `--remote-cache-dir`; this will be reused
+  rather than duplicated.
+- The cached Paris4 catalogue currently exposes the published Fiber Lasagna
+  entry but no regular Lasagna-normal entry. A real catalogue refresh is still
+  required before final availability reporting.
+- Independent review corrected the normal contract to require
+  `grad_mag`/`nx`/`ny`, preserved differing published Fiber/normal source
+  levels, required the existing one-voxel base-shape tolerance, and identified
+  remote provenance/resume and manager-owned cache-option requirements.
+- Refreshed public catalogue SHA-256
+  `992b52e239f4af7156fd168ab4b5f4411caf99f2a37884490d57843a8db903a2`.
+  It still has no Paris4 normal entry. Direct anonymous S3 listing also found
+  zero objects below `PHercParis4/representations/predictions/lasagna/`; this
+  is missing source data, not a stale manager index.
+- VC3D contains similar open-data Lasagna prefix preparation in a Qt GUI
+  translation unit. Sharing that implementation with Python is not feasible
+  without a cross-language library/CLI extraction beyond this manager fix.
+  The Python manager will reuse the downloader's existing paginated S3 helper
+  rather than copy listing logic within Python; cross-language duplication is
+  recorded as an explicit deviation.
+- Added exact-model Lasagna prediction indexing, role classification, stable
+  `atlas:<model>@L<level>` selectors, cached root-manifest discovery, anonymous
+  HTTPS locators, and the existing `lasagna-remote.json` persistent lazy cache
+  layout.
+- Made the normal input optional, retained explicit local-run overrides, added
+  remote dependency identity and exact-hash resume, and corrected local normal
+  validation to require native-compatible `grad_mag`/`nx`/`ny`.
+- Added one-voxel-per-axis base-shape tolerance while preserving distinct Fiber
+  and normal source levels. Updated cache-only completion, CLI help, manager
+  docs, specs, and changelog.
+- Validation:
+  - `python -m pytest -q lasagna/tests/test_manager.py
+    lasagna/tests/test_manager_open_data.py
+    lasagna/tests/test_inference_provenance.py
+    lasagna/tests/test_bootstrap_venv.py
+    volume-cartographer/python/test_fiberlets_cli.py`: 87 passed.
+  - `python -m pytest -q lasagna/tests/test_download_omezarr.py
+    lasagna/tests/test_download_volume_list.py`: 25 passed.
+  - `volume-cartographer/build/dev-quickbuild-gcc/bin/test_fiberlet_storage`:
+    26 test cases passed.
+  - Real cached completion exposes `atlas:20260419180421@L2` for PHerc0332 and
+    PHerc1299 Fiber runs.
+- Real public PHerc0332 resolution cached and validated manifest SHA-256
+  `201c45c6e54a2ffd77b58fcf541322e4fc5cb031313326dc8d5254d19e5f2521`
+  with `cos/grad_mag/nx/ny`, without launching preprocessing.
+- Corrected the initial manager-only manifest-SHA cache directory after review.
+  Published normals now use VC3D's exact canonical URL conversion,
+  `open_data/lasagna/<sample>/<volume>/<identity>` directory calculation, and
+  full `lasagna-remote.json` fields. Manifest SHA remains integrity/provenance
+  only and does not address the cache or synthesize an Atlas run UUID; the
+  exact remote artifact/manifest URL is the published source locator.
+- Tightened resolution to the first `public-read` catalogue origin and made
+  malformed/mismatched markers, invalid catalogue coordinate identity,
+  outer/inner manifest disagreement, and missing/invalid remote Zarr
+  descriptors hard errors. No alternate prediction or cache layout is used as
+  a fallback.
+- Real PHerc0332 preparation now resolves to
+  `open_data/lasagna/PHerc0332/20251211183505/078820a387cf852f`, validates the
+  manifest and all four group descriptors, and retains manifest SHA-256 only as
+  dependency integrity metadata.
+- Revalidation after the cache correction: 112 focused Python tests and 26
+  native Fiberlet storage cases passed; `git diff --check` passed.

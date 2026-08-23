@@ -1,19 +1,14 @@
-# Status: managed Fiberlet preprocessing and publication
+# Status: catalogue-backed Fiberlet normal inputs
 
-- [x] Capture the user requirements in `task.md`.
-- [x] Inspect the native whole-volume Fiberlet command and storage contract.
-- [x] Inspect `las_manager` run, tmux, completion, provenance, and upload flows.
-- [x] Inspect existing Atlas Lasagna ingestion and data-sync conventions.
-- [x] Draft the implementation, testing, specification, docs, and changelog plan.
-- [x] Independently review the plan against `task.md`, `specs.md`, `plan.md`,
-      current code, and the no-duplication requirement.
-- [x] Obtain user approval for the plan.
-- [x] Bring current main and `las_manager` onto the Fiberlet branch.
-- [x] Generalize managed-job orchestration without inference regressions.
-- [x] Add Fiberlet input resolution, launch, provenance, and completion.
-- [x] Make native Fiberlet source identity portable and location-independent.
-- [x] Add completion, help, listing, and documentation.
-- [x] Reuse staging upload for Fiberlet artifacts.
-- [x] Add minimal Atlas Fiberlet ingestion and copy-first publication.
-- [x] Run manager, native Fiberlet, Atlas, and synthetic integration validation.
-- [x] Update specs, docs, changelog, status, and task log with final results.
+- [x] Capture the user request in `task.md`.
+- [x] Inspect current manager catalogue, Fiberlet launcher, completion, and
+      native remote Lasagna support.
+- [x] Draft implementation, validation, spec, docs, and changelog plan.
+- [x] Independently review the plan against task/spec/implementation.
+- [x] Implement typed published Lasagna prediction discovery.
+- [x] Implement automatic and explicit normal resolution plus native cache use.
+- [x] Update completion, docs, specs, changelog, and task log.
+- [x] Refresh the real catalogue and validate available normal representations.
+- [x] Run focused Python and native tests.
+- [x] Replace the rejected manifest-SHA cache directory with VC3D's exact
+      open-data Lasagna cache identity and revalidate the focused suite.

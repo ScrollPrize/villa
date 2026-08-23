@@ -29,13 +29,16 @@ cache_dir = "/ephemeral/me/las_manager_cache"
 output_dir = "/ephemeral/me/fiber_inferences"
 venv = "/home/me/.venv_las"
 params = ["--tile-size", "512", "--border", "32", "--overlap", "96", "--devices", "all"]
+lasagna_params = ["--devices", "all"]
 fiberlet_binary = "/path/to/vc_fiberlets" # empty resolves it from PATH
 fiberlet_threads = 32
 fiberlet_params = []
 ```
 
-`params` is a TOML array of backend argv tokens applied to every Fiber and
-Lasagna inference. Arguments supplied after `inference run ... --` follow these
+`params` contains Fiber inference defaults. `lasagna_params` is separate so
+regular Lasagna inference retains its checkpoint tile size and native defaults
+for border, overlap, and output scaledowns; it only selects all GPUs by default.
+Arguments supplied after `inference run ... --` follow the applicable backend
 defaults and override repeated options. An explicit `--device` or `--devices`
 also removes the configured mutually exclusive device selector.
 
@@ -222,18 +225,53 @@ than the full run name.
 
 ## Whole-volume Fiberlet jobs
 
-Fiberlets consume two compatible completed manager runs: a Fiber 3D prediction
-with `presence`, `nx`, and `ny`, and a regular Lasagna prediction providing the
-surface-normal `nx` and `ny` channels. Both must be uncropped, refer to the same
-sample and source volume, and declare the same base shape and coordinate frame.
+Fiberlets consume a completed local manager Fiber 3D prediction with
+`presence`, `nx`, and `ny` plus a regular Lasagna prediction providing
+`grad_mag`, `nx`, and `ny` surface normals. By default the manager refreshes or
+reuses the public catalogue under its normal one-hour policy and selects the
+unique published normal representation for the Fiber run's sample and volume:
 
 ```bash
-las_manager fiberlet run <fiber-inference-run> <normal-inference-run>
-las_manager fiberlet run <fiber-inference-run> <normal-inference-run> --threads 128
+las_manager fiberlet run <fiber-inference-run>
+las_manager fiberlet run <fiber-inference-run> --threads 128
 las_manager fiberlet ls
 las_manager tmux attach <fiberlet-run>
 las_manager fiberlet resume <fiberlet-run>
 ```
+
+If more than one published normal representation matches, select one explicitly
+with `atlas:<model-id>@L<source-level>`. A completed local regular Lasagna run
+remains a valid explicit override:
+
+```bash
+las_manager fiberlet run <fiber-run> atlas:20260419180421@L2
+las_manager fiberlet run <fiber-run> <local-normal-inference-run>
+```
+
+The Fiber and normal source levels need not be equal: each retains its own
+Atlas level and persisted prediction spacing. Compatibility instead requires
+the same sample and source volume, uncropped whole-volume coverage, numeric
+source-to-base mappings, and base shapes within one voxel per axis (the public
+catalogue and manifests use differing extent conventions). Fiber direction
+`nx`/`ny` are never accepted as surface normals. A missing published normal is
+reported before a run directory is created.
+
+For a published normal, the manager uses VC3D's existing open-data cache layout:
+`<cache_dir>/open_data/lasagna/<sample>/<volume>/<identity>/`. The identity is
+VC3D's deterministic identity of the canonical remote artifact URL, model,
+Lasagna version, source-to-base mapping, and parent shape; it is not a manifest
+content hash. The manager downloads only the small root manifest and writes the
+standard `lasagna-remote.json` descriptor there. The native reader then fetches
+only required normal Zarr chunks into that same persistent lazy cache and reuses
+them across manager jobs and VC3D; it does not bulk-prefetch the prediction.
+Shell completion reads only the cached catalogue and never performs network I/O.
+Resolution is strict: a missing `public-read` origin, malformed or mismatched
+cache marker, changed manifest hash on resume, incompatible catalogue/manifest
+coordinates, or unavailable/invalid Zarr descriptor aborts before launch. The
+manager does not fall back to another prediction or cache layout.
+Portable dependency identity records the Atlas model/level and exact remote
+artifact and manifest URLs. Manifest SHA-256 is retained only to detect changed
+or corrupt content during resume; it is neither a source locator nor a cache key.
 
 The native command runs through the same tmux runner, log tee, signal handling,
 PID reconciliation, and durable status machinery as inference. Its layout is:
@@ -252,7 +290,7 @@ PID reconciliation, and durable status machinery as inference. Its layout is:
 
 `fiberlet resume` revalidates both upstream manifests and their hashes, then
 reuses the recorded native command, final Zarr, and local anchor cache. The
-manager owns the input, output, normal-manifest, anchor-cache, and source-context
+manager owns the input, output, normal-manifest, remote-cache, anchor-cache, and source-context
 arguments; configured or passthrough arguments cannot replace them.
 
 The final Zarr is self-describing and contains versioned stable source
@@ -331,7 +369,10 @@ Run these commands in order:
 1. Start inference and wait for it to report `completed`:
 
    ```bash
-   las_manager inference run <snapshot> <sample/volume> <scale>
+   las_manager inference run <snapshot> <sample/volume> [scale]
+   las_manager las-inference <snapshot> <sample/volume> [scale]
+   las_manager fiber-inference <snapshot> <sample/volume> [scale]
+   # Group 2 is the default when scale is omitted.
    las_manager inference ls
    ```
 

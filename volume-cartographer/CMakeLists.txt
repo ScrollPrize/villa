@@ -157,6 +157,7 @@ if(VC_ENABLE_COVERAGE)
 else()
     option(VC_BUILD_APPS  "Build app executables (vc_*, VC3D)"           ON)
 endif()
+option(VC_BUILD_FIBERLETS "Build the vc_fiberlets command-line processor" ${VC_BUILD_APPS})
 option(VC_BUILD_UI_TRACER  "Build Qt UI/tracer helper libraries"         ${VC_BUILD_APPS})
 
 # ---- Toolchain --------------------------------------------------------------

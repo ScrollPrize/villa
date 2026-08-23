@@ -400,7 +400,8 @@ def launch_inference(
         )
     elif not prefetch:
         generated_args = ("--download-workers", str(int(download_workers)))
-    backend_args = _inference_args(config.params, (*generated_args, *extra_args))
+    configured_args = config.lasagna_params if snapshot.backend == "lasagna" else config.params
+    backend_args = _inference_args(configured_args, (*generated_args, *extra_args))
     if live_fetch and _has_cli_option(backend_args, "--no-download"):
         raise ValueError("live fetch conflicts with --no-download in manager params/backend arguments")
     if live_fetch and any(

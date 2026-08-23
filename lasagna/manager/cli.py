@@ -71,6 +71,38 @@ def _rewrite_contextual_help(argv: list[str]) -> list[str]:
     return prefix + ["--help"]
 
 
+def _add_inference_launch_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    backend_option: bool = False,
+    legacy_config: bool = False,
+) -> None:
+    parser.add_argument("snapshot")
+    parser.add_argument("volume")
+    parser.add_argument(
+        "scale", type=int, nargs="?", default=2,
+        help="input OME-Zarr group (default: 2)",
+    )
+    if backend_option:
+        parser.add_argument(
+            "--backend", choices=("fiber3d", "lasagna"), default=None,
+            help="Restrict snapshot resolution; normally inferred from the snapshot selector.",
+        )
+    parser.add_argument("--download-workers", type=int, default=64)
+    parser.add_argument("--no-prefetch", action="store_true")
+    parser.add_argument(
+        "--live-fetch", action="store_true",
+        help="Stream the selected scale through a conservative rolling disk cache.",
+    )
+    parser.add_argument("--live-cache-gib", type=float, default=None)
+    parser.add_argument("--live-fetch-ahead-tiles", type=int, default=None)
+    if legacy_config:
+        parser.add_argument(
+            "--legacy-config", default=None,
+            help="Explicit config JSON for a legacy Fiber checkpoint without embedded config.",
+        )
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="las_manager", description="Manage Lasagna and Fiber inference data")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -99,13 +131,17 @@ def _parser() -> argparse.ArgumentParser:
     inference_sub = inference.add_subparsers(dest="inference_command", required=True)
     inference_sub.add_parser("ls", help="list durable inference records")
     inference_run = inference_sub.add_parser("run", help="prefetch and launch inference in tmux")
-    inference_run.add_argument("snapshot")
-    inference_run.add_argument("volume")
-    inference_run.add_argument("scale", type=int)
-    inference_run.add_argument(
-        "--backend", choices=("fiber3d", "lasagna"), default=None,
-        help="Restrict snapshot resolution; normally inferred from the snapshot selector.",
+    _add_inference_launch_arguments(
+        inference_run, backend_option=True, legacy_config=True,
     )
+    las_inference = sub.add_parser(
+        "las-inference", help="launch regular Lasagna inference",
+    )
+    _add_inference_launch_arguments(las_inference)
+    fiber_inference = sub.add_parser(
+        "fiber-inference", help="launch Fiber3D inference",
+    )
+    _add_inference_launch_arguments(fiber_inference, legacy_config=True)
     fiberlet = sub.add_parser("fiberlet")
     fiberlet_sub = fiberlet.add_subparsers(dest="fiberlet_command", required=True)
     fiberlet_sub.add_parser("ls", help="list durable Fiberlet processing jobs")
@@ -113,24 +149,18 @@ def _parser() -> argparse.ArgumentParser:
         "run", help="launch whole-volume Fiberlet preprocessing in tmux",
     )
     fiberlet_run.add_argument("fiber_inference")
-    fiberlet_run.add_argument("normal_inference")
+    fiberlet_run.add_argument(
+        "normal_inference", nargs="?",
+        help=(
+            "optional completed local Lasagna run or atlas:<model>@L<level>; "
+            "omitting it selects the unique compatible published normal bundle"
+        ),
+    )
     fiberlet_run.add_argument("--threads", type=int, default=None)
     fiberlet_resume = fiberlet_sub.add_parser(
         "resume", help="resume a recorded Fiberlet preprocessing job",
     )
     fiberlet_resume.add_argument("run")
-    inference_run.add_argument("--download-workers", type=int, default=64)
-    inference_run.add_argument("--no-prefetch", action="store_true")
-    inference_run.add_argument(
-        "--live-fetch", action="store_true",
-        help="Stream the selected scale through a conservative rolling disk cache.",
-    )
-    inference_run.add_argument("--live-cache-gib", type=float, default=None)
-    inference_run.add_argument("--live-fetch-ahead-tiles", type=int, default=None)
-    inference_run.add_argument(
-        "--legacy-config", default=None,
-        help="Explicit config JSON for a legacy checkpoint without embedded config.",
-    )
     run = sub.add_parser("run")
     run_sub = run.add_subparsers(dest="run_command", required=True)
     run_sub.add_parser("ls", help="list live manager tmux runs")
@@ -373,7 +403,35 @@ def _print_snapshot(index: int, record) -> None:
     metric = "-" if record.metric_value is None else f"{record.metric_value:.6g}"
     patch = "-" if record.patch_shape is None else "x".join(str(v) for v in record.patch_shape)
     atlas = record.atlas_model_id or "unresolved"
-    print(f"{index}\t{record.selector}\tstep={record.step if record.step is not None else '-'}\tmetric={record.metric_name or '-'}:{metric}\tpatch={patch}\tprecision={record.precision_policy or '-'}\tatlas_model={atlas}\tsha256={record.sha256[:12]}")
+    identifier = record.model_identifier or "-"
+    print(f"{index}\t{record.selector}\tstep={record.step if record.step is not None else '-'}\tmetric={record.metric_name or '-'}:{metric}\tpatch={patch}\tprecision={record.precision_policy or '-'}\tatlas_model={atlas}\tmodel_identifier={identifier}\tsha256={record.sha256[:12]}")
+
+
+def _launch_selected_inference(
+    config,
+    args,
+    *,
+    original_argv: Sequence[str],
+    backend_args: Sequence[str],
+    forced_backend: str | None = None,
+) -> Path:
+    cache = get_catalog(config)
+    volume = resolve_volume(index_volumes(cache), args.volume)
+    snapshots = index_snapshots(config)
+    backend = forced_backend or getattr(args, "backend", None)
+    if backend:
+        snapshots = [record for record in snapshots if record.backend == backend]
+    snapshot = resolve_snapshot(snapshots, args.snapshot)
+    return launch_inference(
+        config, snapshot, volume, args.scale,
+        original_argv=original_argv, extra_args=backend_args,
+        legacy_config=getattr(args, "legacy_config", None),
+        prefetch=not args.no_prefetch and not args.live_fetch,
+        download_workers=args.download_workers,
+        live_fetch=bool(args.live_fetch),
+        live_cache_gib=args.live_cache_gib,
+        live_fetch_ahead_tiles=args.live_fetch_ahead_tiles,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -459,23 +517,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     if record.get("job_kind", "inference") == "inference":
                         _print_run(path, record)
             else:
-                cache = get_catalog(config)
-                volume = resolve_volume(index_volumes(cache), args.volume)
-                snapshots = index_snapshots(config)
-                if args.backend:
-                    snapshots = [record for record in snapshots if record.backend == args.backend]
-                snapshot = resolve_snapshot(snapshots, args.snapshot)
-                run_dir = launch_inference(
-                    config, snapshot, volume, args.scale,
-                    original_argv=args_list, extra_args=backend_args,
-                    legacy_config=args.legacy_config,
-                    prefetch=not args.no_prefetch and not args.live_fetch,
-                    download_workers=args.download_workers,
-                    live_fetch=bool(args.live_fetch),
-                    live_cache_gib=args.live_cache_gib,
-                    live_fetch_ahead_tiles=args.live_fetch_ahead_tiles,
-                )
-                print(run_dir)
+                print(_launch_selected_inference(
+                    config, args, original_argv=args_list,
+                    backend_args=backend_args,
+                ))
+        elif args.command in {"las-inference", "fiber-inference"}:
+            backend = "lasagna" if args.command == "las-inference" else "fiber3d"
+            print(_launch_selected_inference(
+                config, args, original_argv=args_list,
+                backend_args=backend_args, forced_backend=backend,
+            ))
         elif args.command == "fiberlet":
             if args.fiberlet_command == "ls":
                 reconcile_runs(config)

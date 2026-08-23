@@ -1,5 +1,26 @@
 # 2D Fiber Trace Initial Loader Specs
 
+## Managed whole-volume Fiberlet inputs
+
+- `las_manager fiberlet run <completed-fiber-run>` resolves the unique regular
+  Lasagna normal representation for the same sample and source volume from the
+  public catalogue. Regular normals require `grad_mag`, `nx`, and `ny` from the
+  exact Atlas model schema; Fiber `presence`/`nx`/`ny` outputs are not normals.
+- Explicit `atlas:<model-id>@L<source-level>` and completed local Lasagna-run
+  overrides remain supported. Fiber and normal source levels may differ. Both
+  must be uncropped, have numeric source-to-base mappings, and identify base
+  shapes differing by at most one voxel per axis.
+- Published normal manifests use the exact VC3D open-data cache contract under
+  `<cache_dir>/open_data/lasagna/<sample>/<volume>/<identity>/`. The VC identity
+  is derived from the canonical remote artifact URL and Atlas coordinate/model
+  metadata, never from the manifest content SHA. Native access is a persistent
+  lazy chunk cache shared with VC3D; manager completion is cache-only and
+  performs no network access. Resume binds the exact manifest URL and SHA-256
+  recorded at initial launch rather than repeating automatic selection.
+- Published dependency identity uses the exact remote artifact/manifest URL,
+  Atlas model, and level. Manifest SHA-256 is an integrity check only; it is not
+  synthesized into a run UUID, source locator, or cache address.
+
 ## Shared 3D Tiled Inference
 
 - `lasagna.tiled_predict3d.run_tiled_inference_3d` is the sole neural tiled

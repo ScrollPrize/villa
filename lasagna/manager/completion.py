@@ -20,6 +20,8 @@ COMMAND_REGISTRY: tuple[tuple[Command, str], ...] = (
     (("volume", "prefetch"), "download one volume scale"),
     (("inference", "ls"), "list durable inference records"),
     (("inference", "run"), "launch inference in tmux"),
+    (("las-inference",), "launch regular Lasagna inference"),
+    (("fiber-inference",), "launch Fiber3D inference"),
     (("fiberlet", "ls"), "list durable Fiberlet processing jobs"),
     (("fiberlet", "run"), "launch whole-volume Fiberlet preprocessing"),
     (("fiberlet", "resume"), "resume Fiberlet preprocessing"),
@@ -43,6 +45,15 @@ _OPTIONS: dict[Command, dict[str, tuple[str, ...] | None]] = {
         "--backend": ("fiber3d", "lasagna"), "--download-workers": (),
         "--no-prefetch": None, "--legacy-config": (), "--live-fetch": None,
         "--live-cache-gib": (), "--live-fetch-ahead-tiles": (),
+    },
+    ("las-inference",): {
+        "--download-workers": (), "--no-prefetch": None, "--live-fetch": None,
+        "--live-cache-gib": (), "--live-fetch-ahead-tiles": (),
+    },
+    ("fiber-inference",): {
+        "--download-workers": (), "--no-prefetch": None, "--legacy-config": (),
+        "--live-fetch": None, "--live-cache-gib": (),
+        "--live-fetch-ahead-tiles": (),
     },
     ("fiberlet", "run"): {"--threads": ()},
     ("open-data", "validate"): {},
@@ -157,6 +168,33 @@ def _managed_run_candidates(
         return []
 
 
+def _published_normal_candidates(config, fiber_selector: str) -> list[tuple[str, str]]:
+    if config is None or not fiber_selector:
+        return []
+    cache = _cached_catalog(config)
+    if cache is None:
+        return []
+    try:
+        from .catalog import index_lasagna_predictions, normal_predictions_for_volume
+        from .fiberlets import _completed_dependency
+
+        fiber = _completed_dependency(
+            config, fiber_selector, expected_kind="fiber3d-prediction",
+        )
+        source = fiber["source"]
+        sample_id = str(source.get("sample_id") or "")
+        volume_id = str(source.get("volume_id") or "")
+        records = normal_predictions_for_volume(
+            index_lasagna_predictions(cache), sample_id=sample_id, volume_id=volume_id,
+        )
+        return [
+            _candidate(record.selector, f"published normals {sample_id}/{volume_id}")
+            for record in records
+        ]
+    except (FileNotFoundError, RuntimeError, ValueError, OSError):
+        return []
+
+
 def contextual_candidates(config, words: Sequence[str]) -> list[tuple[str, str]]:
     """Return completion candidates for argv words excluding the program name."""
     argv = list(words) or [""]
@@ -220,12 +258,18 @@ def contextual_candidates(config, words: Sequence[str]) -> list[tuple[str, str]]
             ]
         elif position == 1:
             candidates = _scale_candidates(config, positionals[0])
-    elif command == ("inference", "run"):
+    elif command in {
+        ("inference", "run"), ("las-inference",), ("fiber-inference",),
+    }:
         if position == 0 and config is not None:
             try:
                 from .snapshots import completion_snapshot_candidates
 
-                candidates = completion_snapshot_candidates(config)
+                backend = {
+                    ("las-inference",): "lasagna",
+                    ("fiber-inference",): "fiber3d",
+                }.get(command)
+                candidates = completion_snapshot_candidates(config, backend=backend)
             except (FileNotFoundError, RuntimeError, ValueError, OSError):
                 candidates = []
         elif position == 1:
@@ -238,7 +282,10 @@ def contextual_candidates(config, words: Sequence[str]) -> list[tuple[str, str]]
                 config, artifact_kind="fiber3d-prediction",
             )
         elif position == 1:
-            candidates = _managed_run_candidates(config, artifact_kind="lasagna")
+            candidates = [
+                *_managed_run_candidates(config, artifact_kind="lasagna"),
+                *_published_normal_candidates(config, positionals[0]),
+            ]
     elif command == ("fiberlet", "resume") and position == 0:
         candidates = _managed_run_candidates(config, job_kind="fiberlet")
     elif command in {("tmux", "attach"), ("open-data", "validate"), ("open-data", "upload")} and position == 0 and config is not None:
