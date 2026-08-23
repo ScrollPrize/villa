@@ -13,7 +13,7 @@ the volume can be fit and evaluated.
 
 | Path | Description |
 | --- | --- |
-| `verified_patches/` | Manually verified surface patches. Each patch is a grid-topology quad mesh sampled on the papyrus surface (84,316 items). |
+| `verified_patches/` | Manually verified surface patches. Each patch is a grid-topology quad mesh sampled on the papyrus surface (~84,000 items and growing). |
 | `unverified_patches/` | Candidate surface patches not yet manually verified. Announced as ~203,900 items; not published at this path yet (it returns 404). |
 | `tracks/` | Line annotations: curves traced across the surface, stored as sequences of `(z, y, x)` points. |
 | `fibers/` | Fiber annotations. Published as a separate dataset, [`fiber-skeletons`](https://dl.ash2txt.org/datasets/fiber-skeletons/); this path returns 404. |
