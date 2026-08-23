@@ -28,6 +28,7 @@ import zarr
 
 try:
 	from omezarr_pyramid import (
+		_limit_zarr_codec_threads,
 		_single_threaded_native_runtime,
 		build_normal_omezarr_pyramid,
 		build_scalar_omezarr_pyramid,
@@ -35,6 +36,7 @@ try:
 	)
 except ImportError:
 	from lasagna.omezarr_pyramid import (
+		_limit_zarr_codec_threads,
 		_single_threaded_native_runtime,
 		build_normal_omezarr_pyramid,
 		build_scalar_omezarr_pyramid,
@@ -58,6 +60,7 @@ DEFAULT_INPUT_CACHE_BYTES = 4 << 30
 DEFAULT_INPUT_IO_THREADS = 16
 DEFAULT_INPUT_COPY_THREADS = 4
 DEFAULT_ACCUMULATOR_WORKERS = min(32, max(1, os.cpu_count() or 1))
+DEFAULT_FLUSH_STALL_TIMEOUT_SECONDS = 300.0
 DEFAULT_OME_COMPRESSOR = "blosc-zstd"
 OME_COMPRESSOR_CHOICES = (DEFAULT_OME_COMPRESSOR, "none")
 _BLOSC_ZSTD_CONFIG = {
@@ -1975,8 +1978,12 @@ def _create_shared_slots(count: int, size: int) -> list[shared_memory.SharedMemo
 
 
 def _limit_native_worker_threads():
-	for name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+	for name in (
+		"OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
+		"NUMEXPR_NUM_THREADS", "BLOSC_NTHREADS",
+	):
 		os.environ[name] = "1"
+	_limit_zarr_codec_threads()
 	try:
 		torch.set_num_threads(1)
 		torch.set_num_interop_threads(1)
@@ -1987,6 +1994,45 @@ def _limit_native_worker_threads():
 		return threadpool_limits(limits=1)
 	except ImportError:
 		return None
+
+
+def _flush_process_limit_text() -> str:
+	try:
+		import resource
+		soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
+		return f"RLIMIT_NPROC soft={soft} hard={hard}"
+	except (ImportError, OSError, ValueError):
+		return "RLIMIT_NPROC unavailable"
+
+
+def _check_flush_stall(
+	pending: Mapping[str, Any],
+	processes: Sequence[Any],
+	*,
+	timeout_seconds: float = DEFAULT_FLUSH_STALL_TIMEOUT_SECONDS,
+	now: float | None = None,
+) -> None:
+	"""Fail instead of waiting forever when a flush batch stops returning work."""
+	if float(timeout_seconds) <= 0.0:
+		return
+	checked_at = time.perf_counter() if now is None else float(now)
+	last_completion_at = float(pending["last_completion_at"])
+	stalled_for = checked_at - last_completion_at
+	if stalled_for < float(timeout_seconds):
+		return
+	worker_states = ", ".join(
+		f"{index}:pid={getattr(process, 'pid', None)} "
+		f"alive={bool(process.is_alive())} exit={getattr(process, 'exitcode', None)}"
+		for index, process in enumerate(processes)
+	)
+	raise RuntimeError(
+		f"parallel flush stalled for {stalled_for:.1f}s without a completed chunk "
+		f"(batch={int(pending['batch_id'])}, queued={len(pending['tasks'])}, "
+		f"inflight={len(pending['inflight'])}, completed={int(pending['completed'])}; "
+		f"{_flush_process_limit_text()}; workers=[{worker_states}]). "
+		"This commonly means the user process/thread limit was exhausted while a "
+		"Zarr worker initialized. Raise the login nproc limit or reduce flush workers."
+	)
 
 
 def _read_mmap_band_chunk(
@@ -2867,7 +2913,8 @@ def run_tiled_inference_3d(
 		flush_processes = started
 		print(
 			f"[predict3d] flush processes={len(flush_processes)} ipc_window={window} "
-			"native_threads_per_worker=1", flush=True,
+			"native_threads_per_worker=1 zarr_threads_per_worker=1 "
+			"blosc_threads_per_worker=1", flush=True,
 		)
 
 	def _check_flush_workers() -> None:
@@ -2910,6 +2957,7 @@ def run_tiled_inference_3d(
 		if message[0] != "result":
 			raise RuntimeError(f"unknown flush worker message: {message}")
 		pending_flush["completed"] += 1
+		pending_flush["last_completion_at"] = time.perf_counter()
 		pending_flush["written_by_sd"][pending_flush["task_sd"][task_id]] += int(message[4])
 		pending_flush["work_s"] += float(message[5])
 
@@ -2943,6 +2991,8 @@ def run_tiled_inference_3d(
 				_check_flush_workers()
 			else:
 				_handle_flush_message(message)
+		if pending_flush["tasks"] or pending_flush["inflight"]:
+			_check_flush_stall(pending_flush, flush_processes)
 		return not pending_flush["tasks"] and not pending_flush["inflight"]
 
 	def _shutdown_flush_workers(*, terminate: bool) -> None:
@@ -3071,6 +3121,7 @@ def run_tiled_inference_3d(
 		pending_flush = {
 			"batch_id": flush_batch_id, "plans": plans, "tasks": tasks,
 			"inflight": set(), "completed": 0, "work_s": 0.0,
+			"last_completion_at": time.perf_counter(),
 			"written_by_sd": {sd: 0 for sd in groups},
 			"task_sd": {task.task_id: task.sd for task in tasks},
 		}
