@@ -38,6 +38,8 @@ from vesuvius.ink_detection.inference.inference_runtime import (
 from vesuvius.ink_detection.models.model import make_model
 from vesuvius.ink_detection.volume_io import (
     ZARR_V3,
+    InputScaleRefused,
+    check_flat_input_scale,
     open_volume,
     open_volume_root,
     select_volume_level,
@@ -964,6 +966,13 @@ def infer_single_zarr(
     """Run one direction over one surface-volume input and replace a TIFF."""
 
     root = open_volume_root(input_zarr)
+    mismatch = check_flat_input_scale(
+        root,
+        source=str(input_zarr),
+        strict=bool(getattr(args, "strict_input_scale", False)),
+    )
+    if mismatch is not None:
+        LOGGER.warning("%s", mismatch)
     resolution = "0" if hasattr(root, "shape") else str(args.resolution)
     volume = select_volume_level(root, resolution, source=str(input_zarr))
     depth_first, depth, height, width, chunk_h, chunk_w = _volume_axes(volume)
@@ -1239,14 +1248,21 @@ def infer_folder(
                 )
                 skipped_count += 1
                 continue
-            infer_single_zarr(
-                args=args,
-                input_zarr=input_zarr,
-                configured_model=configured_model,
-                device=device,
-                output_tiff=prediction_dir / f"{name_prefix}{date}.tif",
-                layer_direction=direction,
-            )
+            try:
+                infer_single_zarr(
+                    args=args,
+                    input_zarr=input_zarr,
+                    configured_model=configured_model,
+                    device=device,
+                    output_tiff=prediction_dir / f"{name_prefix}{date}.tif",
+                    layer_direction=direction,
+                )
+            except InputScaleRefused as exc:
+                # Same convention as the missing-input case above: one bad segment is
+                # skipped and recorded, it does not abort the rest of the folder.
+                LOGGER.warning("Skipping %s: %s", segment_dir, exc)
+                skipped_count += 1
+                continue
             ran_count += 1
     LOGGER.info(
         "Folder run complete. segments_ran=%d segments_skipped=%d",
@@ -1336,6 +1352,14 @@ def parse_args(argv: Sequence[str] | None = None):
         "--amp-dtype",
         choices=("auto", "default", "fp16", "bf16"),
         default="auto",
+    )
+    parser.add_argument(
+        "--strict-input-scale",
+        action="store_true",
+        help=(
+            "refuse to run when a prepared input's scale does not match what its "
+            "recipe trains at, instead of reporting it and continuing"
+        ),
     )
     parser.add_argument("--tta-mirror", action="store_true")
     parser.add_argument("--tta-batch-size", type=int)
