@@ -22,10 +22,12 @@ and portable provenance required for safe publication.
 
 ```toml
 fiberlet_binary = ""                 # empty means resolve vc_fiberlets on PATH
-fiberlet_params = ["--threads", "32"]
+fiberlet_threads = 32                 # portable default; this machine uses 128
+fiberlet_params = []                  # additional native arguments
 ```
 
-An explicit `--threads` or argument after `--` overrides the configured
+The manager always passes `--threads <fiberlet_threads>`. An explicit
+`--threads` or argument after `--` occurs later and overrides the configured
 default. The manager must resolve and record the exact executable path and
 hash; it must not depend on `$SRC` or an interactive shell activation.
 

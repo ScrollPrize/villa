@@ -4292,3 +4292,29 @@
 - `--presence-floor` is an inclusive owned-observation gate. Cells with no
   usable owned observation at or above it return before seed generation and
   refinement. `--minimum-support` remains a post-fit threshold.
+
+## Managed Fiberlet preprocessing and publication
+
+- `las_manager fiberlet run FIBER_RUN NORMAL_RUN` launches native whole-volume
+  processing through the shared managed-job runner. Both inputs must be
+  completed, uncropped runs for the same volume and base coordinate frame;
+  roles and required products are strict.
+- `fiberlet_threads` is a positive global config value (portable default 32)
+  passed as `--threads`. Per-run `--threads` may override it. The manager owns
+  all input/output/context/cache arguments.
+- The durable float anchor cache is stored below the run's private `cache/`.
+  Only `artifacts/fiberlets.json` and the final combined
+  `artifacts/fiberlets.zarr` form the portable bundle.
+- Fiberlet metadata schema version 2 is self-describing and path-independent.
+  Algorithm identity contains all scientific processing/coordinate/layout/
+  storage/codec settings; dataset identity adds stable source/model/level/run
+  identities and manifest hashes. Runtime paths and executable/host audit data
+  do not participate.
+- Fiberlet upload uses the common marker/lifecycle path but streams its sparse
+  tree through rclone under `fiberlets/<run_uuid>` without materializing a full
+  file list.
+- Atlas stores Fiberlets as a `fiberlets` volume data entry depending on
+  existing Fiber and normal Lasagna model/level entries. Publication is copy
+  only: one canonical copy and one CC-licensed public copy under the volume's
+  `representations/fiberlets/` directory; it creates no model and no derive
+  action.

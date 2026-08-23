@@ -1213,3 +1213,13 @@
   and 10 TiB / 10,000-tile defaults without changing the normal prefetch path.
 - Made live progress cadence independent of TTY detection and report unique
   remote-missing chunks per listed Z plane.
+
+## 2026-08-23 — Managed whole-volume Fiberlet artifacts
+
+- Added durable `las_manager fiberlet` processing with shared tmux lifecycle,
+  configurable native thread budget, strict upstream prediction validation,
+  resumable local anchors, and portable final provenance.
+- Made combined Fiberlet Zarr metadata self-describing and independent of
+  runtime paths, with canonical processing/source fingerprints.
+- Added bounded-memory staging and minimal Atlas `fiberlets` copy-first public
+  representation support without registering a synthetic model.
