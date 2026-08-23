@@ -18,6 +18,7 @@
 #include "segmentation/SegmentationModule.hpp"
 #include "ui_VCMain.h"
 #include "Keybinds.hpp"
+#include "FileWatcherService.hpp"
 #include "LineAnnotationController.hpp"
 
 #include "vc/core/types/Volume.hpp"
@@ -25,6 +26,8 @@
 #include "vc/core/Version.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/LoadJson.hpp"
+#include "vc/core/util/ScrollUmbilicus.hpp"
+#include "vc/core/util/Umbilicus.hpp"
 #include "vc/core/util/VolpkgConvert.hpp"
 #include "vc/core/types/Segmentation.hpp"
 #include "vc/fiber_tracer/FiberTrace.hpp"
@@ -135,6 +138,12 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _attachNormalGridAct = new QAction(QObject::tr("Attach &Normal Grid..."), this);
     connect(_attachNormalGridAct, &QAction::triggered, this, &MenuActionController::attachNormalGrid);
 
+    _attachUmbilicusAct = new QAction(QObject::tr("Attach &Umbilicus..."), this);
+    connect(_attachUmbilicusAct, &QAction::triggered, this, &MenuActionController::attachUmbilicus);
+
+    _detachUmbilicusAct = new QAction(QObject::tr("Detach Um&bilicus"), this);
+    connect(_detachUmbilicusAct, &QAction::triggered, this, &MenuActionController::detachUmbilicus);
+
     _attachLasagnaManifestAct = new QAction(QObject::tr("Attach Lasagna Manifest..."), this);
     connect(_attachLasagnaManifestAct, &QAction::triggered, this, &MenuActionController::attachLasagnaManifest);
 
@@ -200,6 +209,10 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     connect(_mergePatchAct, &QAction::triggered,
             this, &MenuActionController::mergePatchFromMenuRequested);
 
+    _growTrackPatchesAct = new QAction(QObject::tr("Grow Track Patches..."), this);
+    connect(_growTrackPatchesAct, &QAction::triggered,
+            this, &MenuActionController::growTrackPatchesFromMenuRequested);
+
     _materializeOpenDataFolderAct = new QAction(
         QObject::tr("Create/Fetch All Segments for Current Folder"), this);
     connect(_materializeOpenDataFolderAct, &QAction::triggered, this,
@@ -214,6 +227,8 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _fileMenu->addAction(_attachVolumeAct);
     _fileMenu->addAction(_attachSegmentsAct);
     _fileMenu->addAction(_attachNormalGridAct);
+    _fileMenu->addAction(_attachUmbilicusAct);
+    _fileMenu->addAction(_detachUmbilicusAct);
     _fileMenu->addAction(_attachLasagnaManifestAct);
     _fileMenu->addAction(_attachRemoteLasagnaManifestAct);
     _fileMenu->addAction(_detachEntryAct);
@@ -249,6 +264,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _actionsMenu->addSeparator();
     _actionsMenu->addAction(_mergeTifxyzAct);
     _actionsMenu->addAction(_mergePatchAct);
+    _actionsMenu->addAction(_growTrackPatchesAct);
     _actionsMenu->addSeparator();
     _transformsMenu = new QMenu(QObject::tr("&Transforms"), _actionsMenu);
     _transformsMenu->addAction(_rotateSurfaceAct);
@@ -667,6 +683,32 @@ void MenuActionController::beginOpenDataSampleOpenTask(
     const bool hasSelection = selection != nullptr;
     const vc3d::opendata::OpenDataResourceSelection selectionCopy =
         selection ? *selection : vc3d::opendata::OpenDataResourceSelection{};
+    // CloseVolume() below is this flow's first destructive step: it emits
+    // vpkgChanged, whose defensive handler tears line sessions down without
+    // saving. Sessions must instead end -- finalized and saved -- while their
+    // package is still the active one, so the gate sits here, before the
+    // close; the completion-time gate stays only as a defense against
+    // sessions opened during the asynchronous fetch.
+    if (_window && _window->_lineAnnotationController &&
+        !_window->_lineAnnotationController->prepareForPackageSwitch()) {
+        if (onFinished) {
+            // Queued: callers were written against "returns immediately,
+            // completion arrives later on the GUI thread", and a synchronous
+            // callback would run before their post-begin bookkeeping.
+            QMetaObject::invokeMethod(
+                this,
+                [onFinished = std::move(onFinished)]() {
+                    OpenDataSampleOpenOutcome outcome;
+                    outcome.success = false;
+                    outcome.error = QObject::tr(
+                        "Open line annotation sessions could not be closed; "
+                        "the project was not switched.");
+                    onFinished(outcome);
+                },
+                Qt::QueuedConnection);
+        }
+        return;
+    }
     cancelOpenDataVolumePrefills();
     _window->CloseVolume();
 
@@ -863,8 +905,37 @@ void MenuActionController::finishOpenDataSampleOpen(OpenDataOpenTaskResult task,
         return;
     }
 
+    // Same gate as CWindow::OpenVolume(): sessions end — finalized and saved —
+    // while their own package is still the active one, or the switch does not
+    // happen.
+    if (_window && _window->_lineAnnotationController &&
+        !_window->_lineAnnotationController->prepareForPackageSwitch()) {
+        const QString msg = QObject::tr(
+            "Open line annotation sessions could not be closed; the project "
+            "was not switched.");
+        if (outcomeOut) {
+            outcomeOut->success = false;
+            outcomeOut->error = msg;
+        }
+        return;
+    }
+
     if (_window && _window->_state) {
+        // The full close, not a bare setVpkg: another project may have been
+        // opened while the sample fetch ran (nothing blocks OpenVolume()
+        // during it), and replacing its package directly would skip the
+        // segmentation-editing teardown CloseVolume() performs and leave its
+        // active surface alive beside this sample's package. With nothing
+        // open — the common case, since this flow closed the volume when it
+        // began — CloseVolume() is a no-op.
+        _window->CloseVolume();
         _window->_state->setVpkg(pkg);
+        // CloseVolume() stopped all file watches; the ordinary open flow
+        // restarts them after its own setVpkg, and the sample flow gets the
+        // same treatment — previously it left the watcher stopped entirely.
+        if (_window->_fileWatcher) {
+            _window->_fileWatcher->startWatching();
+        }
     }
     if (!pkg->path().empty()) {
         updateRecentVolpkgList(QString::fromStdString(pkg->path().string()));
@@ -1193,29 +1264,8 @@ void MenuActionController::showSettingsDialog()
     }
 
     CState* state = _window->_state;
-    const auto cacheDir = state
-        ? vc3d::persistentCacheDirForVolume(state->currentVolume(), state)
-        : std::filesystem::path{};
-
-    // Chunk geometry drives the delta-zyx filter used when compacting the
-    // current volume's disk cache from the dialog.
-    CacheChunkLayout chunkLayout;
-    if (!cacheDir.empty()) {
-        if (auto volume = state->currentVolume()) {
-            if (auto* chunked = volume->chunkedCache()) {
-                chunkLayout.elemSize =
-                    chunked->dtype() == vc::render::ChunkDtype::UInt16 ? 2 : 1;
-                for (int level = 0; level < chunked->numLevels(); ++level)
-                    chunkLayout.levelChunkShapes.push_back(chunked->chunkShape(level));
-            }
-        }
-    }
-
     auto* dialog = new SettingsDialog(
         state ? state->vpkg() : nullptr,
-        state ? state->currentVolume() : nullptr,
-        cacheDir,
-        std::move(chunkLayout),
         _window);
     dialog->exec();
     if (dialog->outputSegmentsChanged()) {
@@ -1255,13 +1305,11 @@ void MenuActionController::showSettingsDialog()
         settings.value(vc3d::settings::viewer::AXIS_OVERLAY_OPACITY,
                        vc3d::settings::viewer::AXIS_OVERLAY_OPACITY_DEFAULT).toInt());
 
-    // The spiral cache budgets live on the manager, not the window, and only the
-    // spiral workspace opts in -- so walk every live manager and let the ones
-    // that opted in re-read them. Byte capacities are adjustable in place, so
-    // this takes effect without reopening the workspace.
+    // Cache budgets are independent per workspace. Re-read them for every live
+    // manager so changes take effect without reopening either workspace.
     for (auto* manager : ViewerManager::allManagers()) {
-        if (manager && manager->surfaceCacheEnabled())
-            manager->applySpiralCacheSettings();
+        if (manager)
+            manager->applyViewerCacheSettings();
     }
 
     dialog->deleteLater();
@@ -1769,6 +1817,91 @@ void MenuActionController::attachNormalGrid()
         return;
     }
     _window->refreshCurrentVolumePackageUi(QString(), true);
+}
+
+void MenuActionController::attachUmbilicus()
+{
+    if (!_window || !_window->_state || !_window->_state->vpkg()) {
+        QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
+        return;
+    }
+    auto pkg = _window->_state->vpkg();
+    const auto file = QFileDialog::getOpenFileName(
+        _window, QObject::tr("Attach Umbilicus"),
+        QString::fromStdString(pkg->getVolpkgDirectory()),
+        QObject::tr("Umbilicus (*.json)"));
+    if (file.isEmpty()) return;
+
+    vc::core::util::UmbilicusFileInfo info;
+    try {
+        info = vc::core::util::Umbilicus::LoadFileInfo(
+            std::filesystem::path(file.toStdString()));
+    } catch (const std::exception& e) {
+        QMessageBox::warning(_window, QObject::tr("Attach failed"),
+            QObject::tr("%1 is not a valid umbilicus file:\n\n%2")
+                .arg(file, QString::fromUtf8(e.what())));
+        return;
+    }
+
+    // Malformed metadata makes the file unusable until it is fixed — the
+    // resolver refuses it — so attaching it would store an attachment nothing
+    // can use and report success beside a warning. Rejected instead, naming
+    // the errors; fix the file and attach again.
+    if (!info.metadataErrors.empty()) {
+        QStringList errors;
+        errors.reserve(static_cast<int>(info.metadataErrors.size()));
+        for (const auto& error : info.metadataErrors) {
+            errors << QString::fromStdString(error);
+        }
+        QMessageBox::warning(_window, QObject::tr("Attach failed"),
+            QObject::tr("%1 declares malformed frame metadata and was not "
+                        "attached:\n\n%2")
+                .arg(QFileInfo(file).fileName(), errors.join(QStringLiteral("\n"))));
+        return;
+    }
+
+    pkg->setUmbilicus(file.toStdString());
+    // Consumers that placed geometry relative to the old umbilicus have no other
+    // way to learn this happened.
+    _window->_state->notifyUmbilicusChanged();
+    if (_window->statusBar()) {
+        _window->showStatusBarMessage(
+            QObject::tr("Attached umbilicus %1").arg(QFileInfo(file).fileName()), 5000);
+    }
+    if (!vc::core::util::umbilicusFrameClaim(info).any()) {
+        // Dimensions alone are a complete statement — the preferred one, in fact,
+        // being exact integer counts — so warning about a missing voxelsize_um
+        // there would call the better-stamped file unstamped.
+        QMessageBox::information(_window, QObject::tr("Attach Umbilicus"),
+            QObject::tr("%1 declares no frame, so consumers may have to guess "
+                        "the grid its coordinates index.").arg(QFileInfo(file).fileName()));
+    }
+}
+
+void MenuActionController::detachUmbilicus()
+{
+    if (!_window || !_window->_state || !_window->_state->vpkg()) {
+        QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
+        return;
+    }
+    auto pkg = _window->_state->vpkg();
+    const auto configured = pkg->umbilicus();
+    if (configured.empty()) {
+        QMessageBox::information(_window, QObject::tr("Detach Umbilicus"),
+            QObject::tr("No umbilicus is attached — the project already resolves one "
+                        "automatically."));
+        return;
+    }
+    // Clearing the field persists the project and restores automatic
+    // resolution; the umbilicus is a single-valued field, so it is not part of
+    // the entry-based Detach dialog.
+    pkg->setUmbilicus({});
+    _window->_state->notifyUmbilicusChanged();
+    if (_window->statusBar()) {
+        _window->showStatusBarMessage(
+            QObject::tr("Detached umbilicus %1; resolution is automatic again")
+                .arg(QString::fromStdString(configured)), 5000);
+    }
 }
 
 void MenuActionController::attachLasagnaManifest()

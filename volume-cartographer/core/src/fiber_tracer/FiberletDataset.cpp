@@ -837,7 +837,7 @@ void FiberletChunkDataset::validateChunk(FiberletStorageChunkKind kind, const vc
 std::shared_ptr<vc::render::ChunkCache> createGeneratedFiberletChunkCache(
     std::shared_ptr<FiberletChunkDataset> dataset,
     FiberletChunkGenerator generator,
-    vc::render::ChunkCache::Options options,
+    FiberletChunkCacheOptions options,
     FiberletChunkResolvedCallback resolved)
 {
     if (!dataset || !generator)
@@ -854,12 +854,15 @@ std::shared_ptr<vc::render::ChunkCache> createGeneratedFiberletChunkCache(
         fetchers.push_back(std::make_shared<GeneratedFetcher>(dataset, FiberletStorageChunkKind::FiberletPrefix, generator, resolved));
         fetchers.push_back(std::make_shared<GeneratedFetcher>(dataset, FiberletStorageChunkKind::FiberletRoutes, generator, resolved));
     }
-    options.detectAllFillChunks = false;
-    options.persistentCachePath.reset();
-    return std::make_shared<vc::render::ChunkCache>(std::move(levels), std::move(fetchers), 0.0, vc::render::ChunkDtype::Opaque, std::move(options));
+    options.cache.detectAllFillChunks = false;
+    options.cache.persistentCachePath.reset();
+    return std::make_shared<vc::render::ChunkCache>(
+        std::move(levels), std::move(fetchers), 0.0,
+        vc::render::ChunkDtype::Opaque, std::move(options.cache),
+        std::move(options.service));
 }
 
-std::shared_ptr<vc::render::ChunkCache> createStoredFiberletAnchorChunkCache(std::shared_ptr<FiberletChunkDataset> dataset, vc::render::ChunkCache::Options options)
+std::shared_ptr<vc::render::ChunkCache> createStoredFiberletAnchorChunkCache(std::shared_ptr<FiberletChunkDataset> dataset, FiberletChunkCacheOptions options)
 {
     if (!dataset || (dataset->metadata().kind != FiberletDatasetKind::Anchors && dataset->metadata().kind != FiberletDatasetKind::Combined)) {
         throw std::invalid_argument("stored fiberlet anchor cache requires anchor payloads");
@@ -867,13 +870,13 @@ std::shared_ptr<vc::render::ChunkCache> createStoredFiberletAnchorChunkCache(std
     if (dataset->metadata().kind == FiberletDatasetKind::Combined && !dataset->datasetComplete())
         throw std::invalid_argument("stored combined fiberlet cache requires a complete dataset");
     const auto shape = dataset->metadata().chunkGridShapeZYX;
-    options.detectAllFillChunks = false;
-    options.persistentCachePath.reset();
+    options.cache.detectAllFillChunks = false;
+    options.cache.persistentCachePath.reset();
     return std::make_shared<
-        vc::render::ChunkCache>(std::vector<vc::render::ChunkCache::LevelInfo>{{shape, {1, 1, 1}, {}}}, std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{std::make_shared<StoredFetcher>(dataset, FiberletStorageChunkKind::Anchors)}, 0.0, vc::render::ChunkDtype::Opaque, std::move(options));
+        vc::render::ChunkCache>(std::vector<vc::render::ChunkCache::LevelInfo>{{shape, {1, 1, 1}, {}}}, std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{std::make_shared<StoredFetcher>(dataset, FiberletStorageChunkKind::Anchors)}, 0.0, vc::render::ChunkDtype::Opaque, std::move(options.cache), std::move(options.service));
 }
 
-std::shared_ptr<vc::render::ChunkCache> createStoredFiberletPathChunkCache(std::shared_ptr<FiberletChunkDataset> dataset, vc::render::ChunkCache::Options options)
+std::shared_ptr<vc::render::ChunkCache> createStoredFiberletPathChunkCache(std::shared_ptr<FiberletChunkDataset> dataset, FiberletChunkCacheOptions options)
 {
     if (!dataset || (dataset->metadata().kind != FiberletDatasetKind::Fiberlets && dataset->metadata().kind != FiberletDatasetKind::Combined)) {
         throw std::invalid_argument("stored fiberlet path cache requires prefix and route payloads");
@@ -881,10 +884,10 @@ std::shared_ptr<vc::render::ChunkCache> createStoredFiberletPathChunkCache(std::
     if (dataset->metadata().kind == FiberletDatasetKind::Combined && !dataset->datasetComplete())
         throw std::invalid_argument("stored combined fiberlet cache requires a complete dataset");
     const auto shape = dataset->metadata().chunkGridShapeZYX;
-    options.detectAllFillChunks = false;
-    options.persistentCachePath.reset();
+    options.cache.detectAllFillChunks = false;
+    options.cache.persistentCachePath.reset();
     return std::make_shared<
-        vc::render::ChunkCache>(std::vector<vc::render::ChunkCache::LevelInfo>{{shape, {1, 1, 1}, {}}, {shape, {1, 1, 1}, {}}}, std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{std::make_shared<StoredFetcher>(dataset, FiberletStorageChunkKind::FiberletPrefix), std::make_shared<StoredFetcher>(dataset, FiberletStorageChunkKind::FiberletRoutes)}, 0.0, vc::render::ChunkDtype::Opaque, std::move(options));
+        vc::render::ChunkCache>(std::vector<vc::render::ChunkCache::LevelInfo>{{shape, {1, 1, 1}, {}}, {shape, {1, 1, 1}, {}}}, std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{std::make_shared<StoredFetcher>(dataset, FiberletStorageChunkKind::FiberletPrefix), std::make_shared<StoredFetcher>(dataset, FiberletStorageChunkKind::FiberletRoutes)}, 0.0, vc::render::ChunkDtype::Opaque, std::move(options.cache), std::move(options.service));
 }
 
 }  // namespace vc::fiber_tracer

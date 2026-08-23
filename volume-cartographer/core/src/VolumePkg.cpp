@@ -19,14 +19,22 @@
 
 #include <cstdlib>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <pwd.h>
 #include <unistd.h>
 #endif
 
 #include "vc/core/types/Segmentation.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/util/AtomicFile.hpp"
+#include "vc/core/render/PersistentZarrCacheBudget.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 #include "vc/core/util/NormalGridVolume.hpp"
@@ -41,6 +49,11 @@ namespace vc::project {
 bool hasEntryTag(const Entry& entry, std::string_view tag)
 {
     return std::find(entry.tags.begin(), entry.tags.end(), tag) != entry.tags.end();
+}
+
+bool usesAnonymousRemoteAuth(const Entry& entry)
+{
+    return hasEntryTag(entry, kAnonymousRemoteAuthTag);
 }
 
 bool isFiberLasagnaEntry(const Entry& entry)
@@ -67,9 +80,60 @@ fs::path resolveLocalPath(const std::string& location, const fs::path& base)
     return base / p;
 }
 
+fs::path remoteVolumeCacheRootForEntry(
+    const fs::path& configuredRoot,
+    const Entry& entry)
+{
+    constexpr std::string_view sampleTagPrefix =
+        "vc-open-data-sample-id:";
+    const auto tag = std::find_if(
+        entry.tags.begin(), entry.tags.end(),
+        [sampleTagPrefix](const std::string& value) {
+            return value.rfind(sampleTagPrefix, 0) == 0;
+        });
+    if (configuredRoot.empty() || tag == entry.tags.end())
+        return configuredRoot;
+
+    std::string sample = tag->substr(sampleTagPrefix.size());
+    for (char& c : sample) {
+        const auto uc = static_cast<unsigned char>(c);
+        if (!std::isalnum(uc) && c != '-' && c != '_' && c != '.')
+            c = '_';
+    }
+    while (!sample.empty() &&
+           (sample.front() == '.' || sample.front() == '_')) {
+        sample.erase(sample.begin());
+    }
+    if (sample.empty())
+        sample = "sample";
+
+    const auto root = configuredRoot.lexically_normal();
+    if (root.filename() == sample &&
+        root.parent_path().filename() == "volumes" &&
+        root.parent_path().parent_path().filename() == "open_data") {
+        return root;
+    }
+    return root / "open_data" / "volumes" / sample;
+}
+
 }
 
 namespace {
+
+void replaceFile(const fs::path& source, const fs::path& destination)
+{
+#if defined(_WIN32)
+    if (!::MoveFileExW(source.c_str(), destination.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        const std::error_code ec(static_cast<int>(::GetLastError()),
+                                 std::system_category());
+        throw fs::filesystem_error(
+            "cannot replace project file", source, destination, ec);
+    }
+#else
+    fs::rename(source, destination);
+#endif
+}
 
 std::string asciiLower(std::string value)
 {
@@ -135,6 +199,67 @@ constexpr const char* kDirectRemoteZarrRequired =
     "remote Zarr volume locations must point directly to a .zarr root; "
     "collection listing is not supported";
 
+std::shared_ptr<Volume> openRemoteVolumeEntry(
+    const vc::project::Entry& entry,
+    const fs::path& configuredCacheRoot,
+    const vc::HttpAuth& auth = {})
+{
+    const auto volumeCacheRoot =
+        vc::project::remoteVolumeCacheRootForEntry(configuredCacheRoot, entry);
+    const bool anonymous = vc::project::usesAnonymousRemoteAuth(entry);
+    auto volume = Volume::NewFromUrl(
+        entry.location, volumeCacheRoot,
+        anonymous ? vc::HttpAuth{} : auth,
+        vc::project::volumeMetadataFromEntryTags(entry.tags),
+        !anonymous);
+
+    const auto legacyRoot = configuredCacheRoot.lexically_normal();
+    if (legacyRoot.empty() || volumeCacheRoot == legacyRoot)
+        return volume;
+
+    const auto legacy = legacyRoot / volume->id();
+    const auto destination = volume->remotePersistentCachePath();
+    std::error_code ec;
+    if (!fs::exists(legacy, ec) || ec)
+        return volume;
+    if (fs::exists(destination, ec)) {
+        if (!ec) {
+            Logger()->info(
+                "Keeping legacy remote volume cache {} because the sample-scoped cache already exists at {}",
+                legacy.string(), destination.string());
+        }
+        return volume;
+    }
+    if (ec)
+        return volume;
+
+    bool moved = false;
+    const auto sourceBudget =
+        vc::render::PersistentZarrCacheBudget::findForPath(legacy);
+    const auto destinationBudget =
+        vc::render::PersistentZarrCacheBudget::findForPath(destination);
+    if (sourceBudget && sourceBudget == destinationBudget) {
+        moved = sourceBudget->moveCacheSubtree(legacy, destination, ec);
+    } else if (!sourceBudget && !destinationBudget) {
+        fs::create_directories(destination.parent_path(), ec);
+        if (!ec) {
+            fs::rename(legacy, destination, ec);
+            moved = !ec;
+        }
+    } else {
+        ec = std::make_error_code(std::errc::cross_device_link);
+    }
+
+    if (moved) {
+        Logger()->info("Migrated remote volume cache {} to {}",
+                       legacy.string(), destination.string());
+    } else {
+        Logger()->warn("Could not migrate remote volume cache {} to {}: {}",
+                       legacy.string(), destination.string(), ec.message());
+    }
+    return volume;
+}
+
 std::string validateRemoteVolumeLocation(
     const std::string& location,
     bool requireDirectZarr)
@@ -166,6 +291,11 @@ std::string tagValueWithPrefix(const std::vector<std::string>& tags, std::string
     return {};
 }
 
+// Note that this deliberately disagrees with sameAttachmentLocation() for
+// remote locators: two selector-free locators are deduped there when they
+// resolve to the same source URL, and kept distinct here unless the strings
+// match. Pre-existing, and left alone, but it means attach/match and
+// persisted-entry dedupe can reach different answers for the same pair.
 bool samePersistedVolumeIdentity(const std::string& a, const std::string& b)
 {
     if (a == b)
@@ -194,6 +324,20 @@ fs::path absoluteLocalPath(
     return path.lexically_normal();
 }
 
+// Do two already-absolute, lexically normalized paths name the same thing?
+// A lexical comparison cannot see through a symlink, and the two sides do not
+// always arrive in the same spelling: load() keeps path_ verbatim and the open
+// dialog does not resolve links. fs::equivalent needs both paths to exist and
+// reports through the error_code, so the lexical answer stays authoritative for
+// locations that have not been created yet.
+bool samePathOnDisk(const fs::path& a, const fs::path& b)
+{
+    if (a == b)
+        return true;
+    std::error_code ec;
+    return fs::equivalent(a, b, ec);
+}
+
 bool sameAttachmentLocation(
     const std::string& a,
     const std::string& b,
@@ -204,8 +348,9 @@ bool sameAttachmentLocation(
     if (aRemote != bRemote)
         return false;
     if (!aRemote) {
-        return absoluteLocalPath(a, projectDirectory) ==
-               absoluteLocalPath(b, projectDirectory);
+        return samePathOnDisk(
+            absoluteLocalPath(a, projectDirectory),
+            absoluteLocalPath(b, projectDirectory));
     }
     try {
         const auto aSpec = vc::parseRemoteVolumeSpec(a);
@@ -236,7 +381,7 @@ bool entryBacksAttachmentLocation(
     try {
         return fs::is_directory(entryPath) &&
                !isSingleZarrVolumeDir(entryPath) &&
-               attachmentPath.parent_path() == entryPath &&
+               samePathOnDisk(attachmentPath.parent_path(), entryPath) &&
                isSingleZarrVolumeDir(attachmentPath);
     } catch (const fs::filesystem_error&) {
         return false;
@@ -258,8 +403,9 @@ bool loadedVolumeMatchesLocation(
     auto loadedPath = volume->path();
     if (loadedPath.is_relative())
         loadedPath = fs::absolute(loadedPath);
-    return loadedPath.lexically_normal() ==
-           absoluteLocalPath(location, projectDirectory);
+    return samePathOnDisk(
+        loadedPath.lexically_normal(),
+        absoluteLocalPath(location, projectDirectory));
 }
 
 std::vector<fs::path> immediateSubdirs(const fs::path& dir)
@@ -385,6 +531,20 @@ fs::path& autosaveRootStorage()
 {
     static fs::path root;
     return root;
+}
+
+void atomicWriteString(const fs::path& target, const std::string& text)
+{
+    fs::create_directories(target.parent_path());
+    auto tmp = target;
+    tmp += ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) throw std::runtime_error("cannot open " + tmp.string() + " for write");
+        out.write(text.data(), static_cast<std::streamsize>(text.size()));
+        if (!out) throw std::runtime_error("write failed for " + tmp.string());
+    }
+    replaceFile(tmp, target);
 }
 
 utils::Json entriesToJson(const std::vector<vc::project::Entry>& entries)
@@ -821,13 +981,12 @@ bool VolumePkg::reconcileVolumeEntryTags(
                 !samePersistedVolumeIdentity(volume->remoteLocator(), entry.location))
                 continue;
             try {
-                auto refreshed = Volume::NewFromUrl(
-                    entry.location,
+                auto refreshed = openRemoteVolumeEntry(
+                    entry,
                     opts_.remoteCacheRoot.empty()
                         ? volume->remoteCacheRoot()
                         : opts_.remoteCacheRoot,
-                    volume->remoteAuth(),
-                    vc::project::volumeMetadataFromEntryTags(entry.tags));
+                    volume->remoteAuth());
                 const auto oldId = it->first;
                 const auto newId = refreshed->id();
                 if (newId != oldId && loadedVolumes_.count(newId) != 0) {
@@ -878,12 +1037,12 @@ bool VolumePkg::mergeVolumeEntryTags(const std::string& location, const std::vec
                 auto metadata = vc::project::volumeMetadataFromEntryTags(e.tags);
                 if (!metadata.empty()) {
                     try {
-                        auto refreshed = Volume::NewFromUrl(
-                            e.location,
+                        auto refreshed = openRemoteVolumeEntry(
+                            e,
                             opts_.remoteCacheRoot.empty()
                                 ? volume->remoteCacheRoot()
                                 : opts_.remoteCacheRoot,
-                            volume->remoteAuth(), metadata);
+                            volume->remoteAuth());
                         const auto refreshedId = refreshed->id();
                         if (refreshedId != id && loadedVolumes_.count(refreshedId) == 0) {
                             loadedVolumes_.erase(it);
@@ -1459,6 +1618,30 @@ fs::path VolumePkg::selectedFiberInferenceDatasetPath() const
     return vc::project::resolveLocalPath(*selectedFiberInferenceDataset_, path_.parent_path());
 }
 
+std::string VolumePkg::umbilicus() const
+{
+    return umbilicus_.value_or(std::string{});
+}
+
+void VolumePkg::setUmbilicus(std::string location)
+{
+    if (location.empty()) {
+        if (!umbilicus_) return;
+        umbilicus_.reset();
+        persistProjectState();
+        return;
+    }
+    umbilicus_ = std::move(location);
+    persistProjectState();
+}
+
+fs::path VolumePkg::umbilicusPath() const
+{
+    if (!umbilicus_) return {};
+    if (vc::project::isLocationRemote(*umbilicus_)) return {};
+    return vc::project::resolveLocalPath(*umbilicus_, path_.parent_path());
+}
+
 bool VolumePkg::hasVolumes() const { return !loadedVolumes_.empty(); }
 bool VolumePkg::hasVolume(const std::string& id) const { return loadedVolumes_.count(id) > 0; }
 std::size_t VolumePkg::numberOfVolumes() const { return loadedVolumes_.size(); }
@@ -1849,10 +2032,7 @@ void VolumePkg::resolveAll()
                     return;
                 }
                 remoteResults[i] = {
-                    Volume::NewFromUrl(
-                        entry.location, remoteCacheRoot, {},
-                        vc::project::volumeMetadataFromEntryTags(entry.tags)),
-                    {}};
+                    openRemoteVolumeEntry(entry, remoteCacheRoot), {}};
             } catch (const std::exception& ex) {
                 remoteResults[i] = {nullptr, ex.what()};
             } catch (...) {
@@ -1958,11 +2138,7 @@ void VolumePkg::resolveVolumeEntry(const vc::project::Entry& e)
                                e.location, kDirectRemoteZarrRequired);
                 return;
             }
-            auto v = Volume::NewFromUrl(
-                e.location,
-                opts_.remoteCacheRoot,
-                {},
-                vc::project::volumeMetadataFromEntryTags(e.tags));
+            auto v = openRemoteVolumeEntry(e, opts_.remoteCacheRoot);
             const auto id = v->id();
             if (loadedVolumes_.count(id) > 0) {
                 Logger()->warn("Duplicate remote volume id '{}' from '{}', skipping", id, e.location);
@@ -2200,6 +2376,7 @@ utils::Json VolumePkg::toJson() const
     if (outputSegments_) j["output_segments"] = *outputSegments_;
     if (selectedLasagnaDataset_) j["selected_lasagna_dataset"] = *selectedLasagnaDataset_;
     if (selectedFiberInferenceDataset_) j["selected_fiber_inference_dataset"] = *selectedFiberInferenceDataset_;
+    if (umbilicus_) j["umbilicus"] = *umbilicus_;
     return j;
 }
 
@@ -2246,11 +2423,15 @@ void VolumePkg::fromJson(const utils::Json& j)
         selectedFiberInferenceDataset_ = j.at("selected_fiber_inference_dataset").get_string();
         if (selectedFiberInferenceDataset_->empty()) selectedFiberInferenceDataset_.reset();
     }
+    if (j.contains("umbilicus")) {
+        umbilicus_ = j.at("umbilicus").get_string();
+        if (umbilicus_->empty()) umbilicus_.reset();
+    }
 }
 
 void VolumePkg::writeJsonTo(const fs::path& target) const
 {
-    vc::core::util::atomicWriteString(target, toJson().dump(2));
+    atomicWriteString(target, toJson().dump(2));
 }
 
 void VolumePkg::readJsonFrom(const fs::path& source)

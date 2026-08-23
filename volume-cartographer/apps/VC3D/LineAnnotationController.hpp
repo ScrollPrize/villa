@@ -6,6 +6,7 @@
 #include <QString>
 #include <QFutureWatcher>
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <deque>
@@ -22,11 +23,14 @@
 #include <nlohmann/json.hpp>
 #include <opencv2/core/mat.hpp>
 
+#include "AnnotationFrame.hpp"
+#include "UmbilicusOrientationFreshness.hpp"
 #include "LineAnnotationFiberClassification.hpp"
 #include "LineAnnotationFiberSegments.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 #include "vc/atlas/FiberIntersections.hpp"
 #include "vc/core/util/Umbilicus.hpp"
+#include "vc/core/util/ScrollUmbilicus.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 
@@ -112,13 +116,9 @@ public:
         int linkedFiberCount = 0;
         // Number of branch links on this fiber still awaiting review approval.
         int pendingLinkCount = 0;
-        // Interpolation provenance of the stored geometry plus the human
-        // review state carried by the interp_unreviewed tag; traceVerified
-        // is derived (traced geometry without the tag has been reviewed).
+        // Interpolation provenance of the stored geometry (see deriveTraceState).
         vc3d::line_annotation::FiberTraceState traceState =
             vc3d::line_annotation::FiberTraceState::Legacy;
-        bool traceNeedsReview = false;
-        bool traceVerified = false;
     };
 
     struct FiberSnapshotWithPath {
@@ -196,13 +196,6 @@ public:
     void exportFibers();
     void setFiberManualHvTag(uint64_t fiberId, const QString& tag);
     void setFiberTag(uint64_t fiberId, const QString& tag, bool enabled);
-    // Marks a traced fiber reviewed (removes interp_unreviewed) or flags
-    // it for review (re-adds it) and saves. Rejects untraced fibers; the
-    // generic tag paths refuse to touch the reserved tag. The batch form
-    // refreshes fiber summaries once instead of per fiber.
-    void setFiberTraceReviewed(uint64_t fiberId, bool verified);
-    void setFibersTraceReviewed(const std::vector<uint64_t>& fiberIds,
-                                bool verified);
     void recalculateFiberHvClassification(uint64_t fiberId);
     void recalculateAllFiberHvClassifications();
     void calculateFiberAlignmentMetrics();
@@ -283,6 +276,21 @@ public:
     // not yet saved). Used by cross-panel actions such as adding a fiber to a
     // running Spiral fit.
     [[nodiscard]] std::filesystem::path fiberFilePath(uint64_t fiberId) const;
+
+    // Bumped whenever the project's umbilicus attachment changes. Cheap to
+    // read, so holders of geometry placed relative to the umbilicus can compare
+    // it lazily instead of being signalled.
+    [[nodiscard]] uint64_t umbilicusGeneration() const
+    {
+        return _umbilicusGeneration;
+    }
+
+    // Ends every session — saving through the normal close path — while the
+    // current package is still the one the work belongs to. The project-open
+    // flows call this before replacing the package, and must not replace it
+    // when this returns false: an optimization is running, or a finalization
+    // failed, and the workspace is left intact for the user to resolve.
+    [[nodiscard]] bool prepareForPackageSwitch();
 
 signals:
     void lineAnnotationWorkspaceRequested(LineAnnotationDialog* dialog, const QString& title);
@@ -549,6 +557,34 @@ private:
                                          bool retraceAll,
                                          std::optional<std::vector<size_t>> dirtySegments = std::nullopt,
                                          bool globalGoalsOnly = false) const;
+    // The frame line points and control points are expressed in: the current
+    // volume's grid carried to the resolution the fibers were annotated at.
+    // Default-constructed (no voxel size, zero extent) when no volume is loaded.
+    [[nodiscard]] vc3d::annotation::AnnotationFrame annotationFrame() const;
+    // Drops the cached scroll umbilicus and everything describing it, so the next
+    // use resolves again.
+    void invalidateScrollUmbilicus();
+    // Rebuilds the generated views of panes whose recorded orientation epoch is
+    // behind the controller's — which is what actually re-applies sheet normals
+    // after the umbilicus or the active volume changed — and the intersection
+    // inspection's strips, which have no generated-view sessions of their own.
+    // Failures are logged per pane and do not stop the others.
+    void refreshStaleGeneratedViews();
+    // Coalesces refreshStaleGeneratedViews() onto the next event-loop turn:
+    // CState emits volumeChanged from inside ViewerManager::switchVolume(),
+    // before focus and navigation are restored, and materialization reads pane
+    // camera state. Also collapses rapid switching into one rebuild.
+    void scheduleStaleViewRefresh();
+    // Cheap fingerprint over everything the resolved umbilicus was read from: a
+    // stat() of every resolver candidate (the attached file when the project
+    // field is set, the discovery candidates otherwise) plus the registration
+    // transform the legacy reading would consult — no JSON parse. Part of the
+    // cached umbilicus's key, so fixing a refused file, editing a transform in
+    // place, or a new candidate appearing all reach the views.
+    [[nodiscard]] QString umbilicusCacheToken() const;
+    void onActiveVolumeChanged();
+    // Pushes _umbilicusNotice to every open pane's dialog.
+    void publishUmbilicusNotice();
     void finishOptimization(const std::string& surfaceName);
     // Per-line-point sampled sheet normals, sign-oriented away from the
     // scroll center (umbilicus when available, volume XY center otherwise);
@@ -570,10 +606,6 @@ private:
     [[nodiscard]] QString fiberHvDirectionTag(uint64_t fiberId) const;
     // Pushes the H/V tag and the clickable tag buttons to the pane's dialog.
     void pushFiberUiState(const PaneRecord& pane) const;
-    // Shared body of setFiberTraceReviewed / setFibersTraceReviewed: tag
-    // change + save + pane sync WITHOUT the summary emission. Returns
-    // whether anything changed.
-    bool applyFiberTraceReview(uint64_t fiberId, bool verified);
     [[nodiscard]] std::optional<std::string> pickDataset(QWidget* parent,
                                                           const std::filesystem::path& startDir) const;
     [[nodiscard]] OptimizationTaskResult runOptimizationTask(std::filesystem::path manifestPath,
@@ -667,6 +699,10 @@ private:
     [[nodiscard]] bool confirmLinkedControlPointEdit(const LineAnnotationSession& session,
                                                      int controlPointIndex,
                                                      const QString& action) const;
+    [[nodiscard]] bool confirmLinkedControlPointEdits(
+        const LineAnnotationSession& session,
+        const std::vector<size_t>& controlPointIndices,
+        const QString& action) const;
     [[nodiscard]] bool controlPointHasBranch(const LineAnnotationSession& session,
                                              int controlPointIndex) const;
     std::vector<uint64_t> syncBranchEndpointPositions(LineAnnotationSession& session);
@@ -808,7 +844,42 @@ private:
     // fallback is used instead).
     std::optional<vc::core::util::Umbilicus> _scrollUmbilicus;
     std::filesystem::path _scrollUmbilicusRoot;
+    // The resolver's dependencies as of the cached load — a stat of every
+    // candidate plus the legacy transform — so any of them changing underneath
+    // VC3D (fixed, replaced, removed, or newly appearing) is noticed.
+    QString _scrollUmbilicusToken;
+    // The annotation frame _scrollUmbilicus was scaled into. Part of the cache
+    // key because the cached value is not the file's contents: its points are
+    // already multiplied by a frame-dependent factor and its per-slice centres
+    // sized to that frame's extent. Keyed on the project directory alone, a
+    // volume switch handed the orientation vote geometry from the previous frame.
+    vc3d::annotation::AnnotationFrame _scrollUmbilicusFrame;
+    // The volume the cached umbilicus was read for. Deliberately conservative:
+    // the volume-centre fallback and the legacy reading depend on the volume's
+    // raw shape and its registration transform, not only on the annotation
+    // frame, so any volume switch re-resolves rather than proving the previous
+    // geometry equivalent. Re-resolution is a few stats and one JSON parse.
+    std::string _scrollUmbilicusVolumeId;
     bool _scrollUmbilicusLoadAttempted = false;
+    // Bumped whenever the orientation inputs change out from under built views
+    // (umbilicus attach/detach, active volume switch). Sessions record the
+    // value their generated views were built at; refreshStaleGeneratedViews()
+    // rebuilds the ones that are behind.
+    int _orientationEpoch = 0;
+    bool _staleViewRefreshQueued = false;
+    // Bumped on attach/detach only. Holders such as the Fiber Map read it to
+    // decide staleness of derived geometry; a volume switch is deliberately not
+    // an attachment change.
+    uint64_t _umbilicusGeneration = 0;
+    // The volumeId of the last volumeChanged this controller acted on, so a
+    // reselection of the current volume is not treated as a switch. Cleared on
+    // package change.
+    std::string _lastVolumeChangedId;
+    // Why the package's umbilicus could not be used, for the strip notice.
+    // Empty when one was applied, and when none exists to complain about.
+    // Orienting off the volume centre instead is exactly the silent degradation
+    // that hid a frame mismatch for a whole scroll, so it is said out loud.
+    QString _umbilicusNotice;
     std::deque<FiberSaveJob> _pendingFiberSaveJobs;
     QPointer<QFutureWatcher<FiberSaveTaskResult>> _fiberSaveWatcher;
     uint64_t _nextFiberSaveSequence = 0;

@@ -7,7 +7,7 @@
 #include "StatusDockPanelHost.hpp"
 
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/render/DecodedChunkCacheBudget.hpp"
+#include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -2520,11 +2520,9 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _cacheSizeBytes = cacheSizeGB * 1024ULL * 1024ULL * 1024ULL;
     std::cout << "chunk cache budget is " << cacheSizeGB << " gigabytes" << std::endl;
 
-    _decodedChunkCacheBudget =
-        std::make_shared<vc::render::DecodedChunkCacheBudget>(_cacheSizeBytes);
-    vc::render::ChunkCache::setDecodedByteBudgetDefault(
-        _decodedChunkCacheBudget);
-    _state = new CState(_cacheSizeBytes, this, _decodedChunkCacheBudget);
+    vc::render::processChunkCacheService()->configureDecodedByteCapacity(
+        _cacheSizeBytes);
+    _state = new CState(this, _benchOptions.debugDownloadQueue);
     connect(_state, &CState::poiChanged, this, &CWindow::onFocusPOIChanged);
     connect(_state, &CState::surfaceWillBeDeleted, this, &CWindow::onSurfaceWillBeDeleted);
     connect(_state, &CState::vpkgChanged, this,
@@ -2572,6 +2570,21 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         _workspaceTabs->insertTab(spiralIndex, _spiralWorkspace, tr("Spiral"));
         if (auto* tabBar = _workspaceTabs->tabBar()) tabBar->setTabButton(spiralIndex, QTabBar::RightSide, nullptr);
         shell->deleteLater();
+        connectVolumeSelector(_spiralWorkspace->volumeSelectionControl());
+        connect(_spiralWorkspace->viewerManager(), &ViewerManager::baseViewerCreated,
+                this, [this](VolumeViewerBase* viewer) {
+                    if (auto* chunked = viewer
+                            ? qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject())
+                            : nullptr)
+                        configureChunkedViewerConnections(chunked);
+                    if (_fiberOverlay && viewer) _fiberOverlay->attachViewer(viewer);
+                });
+        for (auto* viewer : _spiralWorkspace->viewerManager()->baseViewers()) {
+            if (auto* chunked = viewer
+                    ? qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject())
+                    : nullptr)
+                configureChunkedViewerConnections(chunked);
+        }
         // The "Add to current spiral fit" context actions are greyed out
         // unless a Spiral session is active on the connected service.
         connect(_spiralWorkspace, &SpiralWorkspace::spiralSessionActiveChanged, this, [this](bool active) {
@@ -2636,9 +2649,10 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
 
     _sharedCacheStatsLabel = new QLabel(this);
     _sharedCacheStatsLabel->setContentsMargins(8, 0, 8, 0);
-    _sharedCacheStatsLabel->setMinimumWidth(320);
-    _sharedCacheStatsLabel->setText(tr("RAM --  disk --  network --"));
+    _sharedCacheStatsLabel->setToolTip(
+        tr("Z-scroll sensitivity: use Shift+G / Shift+H to adjust"));
     statusBar()->addPermanentWidget(_sharedCacheStatsLabel);
+    updateSharedStatusLabel();
 
     _persistentCacheLowSpaceLabel = new QLabel(this);
     _persistentCacheLowSpaceLabel->setObjectName(QStringLiteral("persistentCacheLowSpaceLabel"));
@@ -2682,19 +2696,15 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _persistentCacheSpaceTimer->start();
     updatePersistentCacheSpace();
 
-    // Z-scroll sensitivity label in status bar
-    _sliceStepLabel = new QLabel(this);
-    _sliceStepLabel->setContentsMargins(4, 0, 4, 0);
-    double initialSensitivity = _viewerManager->zScrollSensitivity();
-    _sliceStepLabel->setText(tr("Z sens: %1").arg(initialSensitivity, 0, 'f', 1));
-    _sliceStepLabel->setToolTip(tr("Z-scroll sensitivity: use Shift+G / Shift+H to adjust"));
-    statusBar()->addPermanentWidget(_sliceStepLabel);
-
     _pointsOverlay = std::make_unique<PointsOverlayController>(_state->pointCollection(), this);
     _viewerManager->setPointsOverlay(_pointsOverlay.get());
 
     _fiberOverlay = std::make_unique<FiberOverlayController>(this);
     _fiberOverlay->bindToViewerManager(_viewerManager.get());
+    if (_spiralWorkspace && _spiralWorkspace->viewerManager()) {
+        _spiralWorkspace->viewerManager()->forEachBaseViewer(
+            [this](VolumeViewerBase* viewer) { _fiberOverlay->attachViewer(viewer); });
+    }
 
     _rawPointsOverlay = std::make_unique<RawPointsOverlayController>(_state, this);
     _viewerManager->setRawPointsOverlay(_rawPointsOverlay.get());
@@ -2729,13 +2739,14 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _axisAlignedSliceController->setViewerManager(_viewerManager.get());
 
     _volumeOverlay = std::make_unique<VolumeOverlayController>(_viewerManager.get(), this);
+    _volumeOverlay->setViewerManagers(
+        {_viewerManager.get(), _spiralWorkspace ? _spiralWorkspace->viewerManager() : nullptr});
     connect(_volumeOverlay.get(), &VolumeOverlayController::requestStatusMessage, this,
             [this](const QString& message, int timeout) {
                 if (statusBar()) {
                     showStatusBarMessage(message, timeout);
                 }
             });
-    _viewerManager->setVolumeOverlay(_volumeOverlay.get());
 
     if (_statusDockPanelHost) {
         if (auto* statusDockBar = _statusDockPanelHost->takeBarWidget()) {
@@ -2786,6 +2797,10 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     connect(_menuController.get(), &MenuActionController::mergePatchFromMenuRequested,
             this, [this]() {
                 _segmentationCommandHandler->onMergePatch(QStringList{});
+            });
+    connect(_menuController.get(), &MenuActionController::growTrackPatchesFromMenuRequested,
+            this, [this]() {
+                _segmentationCommandHandler->onGrowTrackPatches();
             });
     connect(_menuController.get(), &MenuActionController::openDataCatalogVisibilityChanged,
             this, [this](bool) {
@@ -3336,8 +3351,6 @@ void CWindow::populateDockToggleMenu(QMenu* menu) const
     addDock(menu, ui.dockWidgetSegmentation);
     addDock(menu, ui.dockWidgetDistanceTransform);
     addDock(menu, ui.dockWidgetViewerControls);
-    addDock(menu, ui.dockWidgetNormalVis);
-    addDock(menu, ui.dockWidgetView);
     addDock(menu, ui.dockWidgetOverlay);
     addDock(menu, _inkDetectionDock);
     addDock(menu, _transformsDock);
@@ -3410,6 +3423,10 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
     // volume-click policy and active-viewer tracking are wired by
     // ViewerManager::initializeChunkedViewer for every workspace.
     const bool annotationViewer = viewer->property("vc_viewer_role").toString() == QStringLiteral("annotation");
+    const bool mainViewer = _viewerManager &&
+        std::find(_viewerManager->baseViewers().begin(),
+                  _viewerManager->baseViewers().end(), viewer) !=
+            _viewerManager->baseViewers().end();
 
     if (annotationViewer && !viewer->property("vc_annotation_focus_bound").toBool()) {
         const std::string surfaceName = viewer->surfName();
@@ -3556,43 +3573,46 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
 
                         auto* viewerWidget = qobject_cast<QWidget*>(viewer->asQObject());
                         auto* viewerGrid = mainViewerSplitGrid(ui.tabSegment);
-                        const int mainViewerPane = viewerGrid ? viewerGrid->indexOf(viewerWidget) : -1;
-                        if (viewerGrid && mainViewerPane >= 0) {
+                        bool mainGrid = viewerGrid && viewerGrid->indexOf(viewerWidget) >= 0;
+                        if (!mainGrid && _spiralWorkspace && _spiralWorkspace->viewerGrid())
+                            viewerGrid = _spiralWorkspace->viewerGrid();
+                        const int viewerPane = viewerGrid ? viewerGrid->indexOf(viewerWidget) : -1;
+                        if (viewerGrid && viewerPane >= 0) {
                             const bool fullSizeActive = viewerGrid->fullSizeActive();
                             QAction* fullSizeAction = menu.addAction(
-                                viewerGrid->fullSizeActiveForPane(mainViewerPane)
+                                viewerGrid->fullSizeActiveForPane(viewerPane)
                                     ? tr("Exit full size")
                                     : tr("Full size viewer"));
                             connect(fullSizeAction, &QAction::triggered, this,
-                                    [viewerGrid, mainViewerPane]() {
-                                        if (viewerGrid->fullSizeActiveForPane(mainViewerPane)) {
+                                    [viewerGrid, viewerPane]() {
+                                        if (viewerGrid->fullSizeActiveForPane(viewerPane)) {
                                             viewerGrid->exitFullSize();
                                         } else {
-                                            viewerGrid->setFullSizePane(mainViewerPane);
+                                            viewerGrid->setFullSizePane(viewerPane);
                                         }
                                     });
 
                             QAction* closeAction = menu.addAction(tr("Close viewer"));
-                            closeAction->setEnabled(!fullSizeActive && !viewerGrid->paneHidden(mainViewerPane));
-                            connect(closeAction, &QAction::triggered, this, [viewerGrid, mainViewerPane]() {
-                                viewerGrid->setPaneHidden(mainViewerPane, true);
-                                persistMainViewerLayout(viewerGrid);
+                            closeAction->setEnabled(!fullSizeActive && !viewerGrid->paneHidden(viewerPane));
+                            connect(closeAction, &QAction::triggered, this, [viewerGrid, viewerPane, mainGrid]() {
+                                viewerGrid->setPaneHidden(viewerPane, true);
+                                if (mainGrid) persistMainViewerLayout(viewerGrid);
                             });
 
                             auto* moveMenu = menu.addMenu(tr("Move viewer to"));
                             for (int pane = 0; pane < 4; ++pane) {
                                 const QString paneLabel = QObject::tr(kMainViewerPaneLabels[pane]);
                                 QAction* paneAction = moveMenu->addAction(paneLabel);
-                                paneAction->setEnabled(!fullSizeActive && pane != mainViewerPane);
+                                paneAction->setEnabled(!fullSizeActive && pane != viewerPane);
                                 connect(paneAction, &QAction::triggered, this,
-                                        [viewerGrid, mainViewerPane, pane]() {
+                                        [viewerGrid, viewerPane, pane, mainGrid]() {
                                             const bool targetWasHidden = viewerGrid->paneHidden(pane);
-                                            viewerGrid->swapViewers(mainViewerPane, pane);
+                                            viewerGrid->swapViewers(viewerPane, pane);
                                             if (targetWasHidden) {
                                                 viewerGrid->setPaneHidden(pane, false);
-                                                viewerGrid->setPaneHidden(mainViewerPane, true);
+                                                viewerGrid->setPaneHidden(viewerPane, true);
                                             }
-                                            persistMainViewerLayout(viewerGrid);
+                                            if (mainGrid) persistMainViewerLayout(viewerGrid);
                                         });
                             }
 
@@ -3609,11 +3629,11 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                                 QAction* showAction = showMenu->addAction(label);
                                 hasClosedViewer = true;
                                 connect(showAction, &QAction::triggered, this,
-                                        [viewerGrid, mainViewerPane, pane]() {
-                                            viewerGrid->swapViewers(mainViewerPane, pane);
-                                            viewerGrid->setPaneHidden(mainViewerPane, false);
+                                        [viewerGrid, viewerPane, pane, mainGrid]() {
+                                            viewerGrid->swapViewers(viewerPane, pane);
+                                            viewerGrid->setPaneHidden(viewerPane, false);
                                             viewerGrid->setPaneHidden(pane, true);
-                                            persistMainViewerLayout(viewerGrid);
+                                            if (mainGrid) persistMainViewerLayout(viewerGrid);
                                         });
                             }
                             showMenu->setEnabled(!fullSizeActive && hasClosedViewer);
@@ -3759,6 +3779,11 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
     }
 
     if (annotationViewer) {
+        return;
+    }
+    if (!mainViewer) {
+        // The menu and direct viewer input above are shared. Editing widgets
+        // below intentionally remain bound only to Main's state and manager.
         return;
     }
 
@@ -3916,12 +3941,8 @@ void CWindow::updateActiveWorkspaceViewerControls()
     if (_viewerControlsPanel) {
         _viewerControlsPanel->setViewerManager(manager);
     }
-    if (_viewerCompositePanel) {
-        _viewerCompositePanel->setViewerManager(manager);
-    }
-    if (_volumeOverlay) {
-        _volumeOverlay->setViewerManager(manager);
-    }
+    // Composite and volume-overlay controls remain bound to both managers.
+    // Only navigation and other workspace-local controls follow the active tab.
 }
 
 void CWindow::resetSegmentationViews(bool persistLayout)
@@ -4099,19 +4120,19 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
             ? openDataVolumeTransformForSwitch(previousVolumeId, targetVolumeId)
             : std::optional<cv::Matx44d>{};
 
-    // Volume assignment, focus rederivation and viewer-navigation retargeting
-    // are shared workspace policy.
+    // Switch both independent states before revalidating the canonical overlay.
+    // This prevents an incompatible base-volume transition from clearing only
+    // one viewer fleet while the other still reports the previous coordinates.
+    if (_volumeOverlay) _volumeOverlay->beginBaseVolumeUpdate();
     if (_viewerManager) {
         _viewerManager->switchVolume(newvol, navigationTransform);
     } else {
         _state->setCurrentVolume(newvol);
     }
-
-    if (_viewerManager && _viewerManager->overlayVolume()) {
-        _viewerManager->setOverlayVolume(
-            _viewerManager->overlayVolume(),
-            _viewerManager->overlayVolumeId());
+    if (_spiralWorkspace) {
+        _spiralWorkspace->synchronizeVolume(newvol, navigationTransform);
     }
+    if (_volumeOverlay) _volumeOverlay->endBaseVolumeUpdate();
     if (_state->currentVolume() && !_state->currentVolumeId().empty()) {
         rememberCurrentVolumeForPackage(QString::fromStdString(_state->currentVolumeId()));
     }
@@ -7820,15 +7841,6 @@ void CWindow::CreateWidgets(void)
                     _lineAnnotationController.get(),
                     &LineAnnotationController::setFiberTag);
             connect(widget,
-                    &CFiberWidget::fiberTraceReviewChanged,
-                    _lineAnnotationController.get(),
-                    [this](const std::vector<uint64_t>& fiberIds, bool verified) {
-                        if (_lineAnnotationController) {
-                            _lineAnnotationController->setFibersTraceReviewed(
-                                fiberIds, verified);
-                        }
-                    });
-            connect(widget,
                     &CFiberWidget::hvScoreRecalculationRequested,
                     _lineAnnotationController.get(),
                     &LineAnnotationController::recalculateFiberHvClassification);
@@ -7965,6 +7977,8 @@ void CWindow::CreateWidgets(void)
         .planeLayersBehind = ui.spinPlaneLayersBehind,
     };
     _viewerCompositePanel = new ViewerCompositePanel(compositeUi, _viewerManager.get(), ui.dockWidgetComposite);
+    _viewerCompositePanel->setViewerManagers(
+        {_viewerManager.get(), _spiralWorkspace ? _spiralWorkspace->viewerManager() : nullptr});
     attachScrollAreaToDock(ui.dockWidgetComposite,
                            _viewerCompositePanel,
                            QStringLiteral("dockWidgetCompositeContent"));
@@ -8545,19 +8559,35 @@ void CWindow::onSegmentationGrowthStatusChanged(bool running)
 
 void CWindow::onZScrollSensitivityChanged(double sensitivity)
 {
-    // Update status bar label. Persistence + viewer refresh happen in
-    // ViewerManager::setZScrollSensitivity (the single source of truth).
-    if (_sliceStepLabel) {
-        _sliceStepLabel->setText(tr("Z sens: %1").arg(sensitivity, 0, 'f', 1));
-    }
+    Q_UNUSED(sensitivity);
+    updateSharedStatusLabel();
 }
 
 void CWindow::onSharedCacheStatsChanged(const QStringList& items)
 {
-    if (!_sharedCacheStatsLabel || items.isEmpty()) {
+    if (!items.isEmpty())
+        _sharedCacheStatsItems = items;
+    updateSharedStatusLabel();
+}
+
+void CWindow::updateSharedStatusLabel()
+{
+    if (!_sharedCacheStatsLabel)
         return;
+
+    QStringList items = _sharedCacheStatsItems;
+    if (items.isEmpty())
+        items << tr("RAM --  disk -- GiB  net --");
+    if (_viewerManager) {
+        items << tr("Z sens: %1")
+            .arg(_viewerManager->zScrollSensitivity(), 0, 'f', 1);
     }
-    _sharedCacheStatsLabel->setText(items.join(QStringLiteral("  ")));
+    const QString text = items.join(QStringLiteral("  "));
+    _sharedCacheStatsLabel->setText(text);
+    const QMargins margins = _sharedCacheStatsLabel->contentsMargins();
+    _sharedCacheStatsLabel->setMinimumWidth(
+        _sharedCacheStatsLabel->fontMetrics().horizontalAdvance(text) +
+        margins.left() + margins.right());
 }
 
 // Open volume package
@@ -8667,6 +8697,23 @@ bool CWindow::OpenVolume(const QString& path,
         }
     }
 
+    // Line-annotation sessions must end — finalized and saved — while the
+    // package they belong to is still the active one; after the swap, their
+    // close path would save into the new package. A refusal (a running
+    // optimization, a failed finalization) aborts the switch with the
+    // workspace intact.
+    if (_lineAnnotationController &&
+        !_lineAnnotationController->prepareForPackageSwitch()) {
+        if (errorMessage) {
+            *errorMessage = tr("Open line annotation sessions could not be "
+                               "closed; the project was not switched.");
+        }
+        if (openError) {
+            *openError = VolumeOpenError::PackageLoadFailed;
+        }
+        return false;
+    }
+
     CloseVolume();
     _state->setVpkg(std::move(package));
     refreshCurrentVolumePackageUi(preferredVolumeId, true);
@@ -8702,6 +8749,9 @@ std::vector<QComboBox*> CWindow::volumeSelectionControls() const
         if (selector) {
             selectors.push_back(selector.data());
         }
+    }
+    if (_spiralWorkspace && _spiralWorkspace->volumeSelectionControl()) {
+        selectors.push_back(_spiralWorkspace->volumeSelectionControl());
     }
     return selectors;
 }
@@ -9240,6 +9290,9 @@ void CWindow::CloseVolume(void)
 
     // CState::closeAll emits volumeClosing, clears surfaces, vpkg, volume, points
     _state->closeAll();
+    if (_spiralWorkspace) {
+        _spiralWorkspace->synchronizeVolume(nullptr);
+    }
 
     updateNormalGridAvailability();
     if (_segmentationWidget) {
@@ -9261,6 +9314,12 @@ void CWindow::CloseVolume(void)
 
     if (_volumeOverlay) {
         _volumeOverlay->clearVolumePkg();
+    }
+    for (QComboBox* selector : volumeSelectionControls()) {
+        if (!selector) continue;
+        const QSignalBlocker blocker(selector);
+        selector->clear();
+        selector->setEnabled(false);
     }
     if (_viewerManager) {
         _viewerManager->setOverlayVolume(nullptr, {});

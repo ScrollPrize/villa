@@ -5,7 +5,6 @@
 
 #include "vc/lasagna/ChannelSampler.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
-#include "vc/core/render/DecodedChunkCacheBudget.hpp"
 #include <utils/zarr.hpp>
 
 #include <algorithm>
@@ -161,33 +160,6 @@ using TraceClock = std::chrono::steady_clock;
     if (length(ref) > kEpsilon && out.dot(ref) < 0.0)
         out *= -1.0;
     return out;
-}
-
-[[nodiscard]] bool endsWith(std::string_view value, std::string_view suffix)
-{
-    return value.size() >= suffix.size() && value.substr(value.size() - suffix.size()) == suffix;
-}
-
-[[nodiscard]] std::vector<std::string> fiberPredictionPrefixes(const vc::lasagna::LasagnaDatasetManifest& manifest)
-{
-    std::vector<std::string> prefixes;
-    if (manifest.groupForChannel("presence") != nullptr && manifest.groupForChannel("nx") != nullptr && manifest.groupForChannel("ny") != nullptr) {
-        prefixes.push_back({});
-    }
-    for (const auto& group : manifest.groups) {
-        for (const auto& channel : group.channels) {
-            constexpr std::string_view suffix = "_presence";
-            if (!endsWith(channel, suffix))
-                continue;
-            const std::string prefix = channel.substr(0, channel.size() - suffix.size());
-            if (manifest.groupForChannel(prefix + "_nx") != nullptr && manifest.groupForChannel(prefix + "_ny") != nullptr) {
-                prefixes.push_back(prefix);
-            }
-        }
-    }
-    std::sort(prefixes.begin(), prefixes.end());
-    prefixes.erase(std::unique(prefixes.begin(), prefixes.end()), prefixes.end());
-    return prefixes;
 }
 
 [[nodiscard]] std::array<std::string, 3> predictionChannelNames(const std::string& prefix)
@@ -2580,7 +2552,7 @@ FiberPredictionTraceScales resolveFiberPredictionTraceScales(const vc::lasagna::
         throw std::runtime_error("fiber inference manifest source_to_base must be positive and finite");
     }
 
-    const auto prefixes = fiberPredictionPrefixes(manifest);
+    const auto prefixes = manifest.fiberPredictionPrefixes();
     if (prefixes.empty()) {
         throw std::runtime_error("fiber inference dataset must contain presence/nx/ny channels");
     }
@@ -2664,7 +2636,7 @@ public:
     {
         const auto& manifest = dataset.manifest();
         sourceScaleExplicit_ = manifest.raw.empty() || (manifest.raw.contains("source_to_base") && manifest.raw.at("source_to_base").is_number());
-        const auto availablePrefixes = fiberPredictionPrefixes(manifest);
+        const auto availablePrefixes = manifest.fiberPredictionPrefixes();
         const std::vector<std::string> prefixes =
             bindingMode == FiberPredictionFieldBindingMode::CanonicalStoredGrid
                 ? (std::find(availablePrefixes.begin(), availablePrefixes.end(), std::string{}) != availablePrefixes.end()
@@ -2677,7 +2649,6 @@ public:
                     ? "anchor extraction requires canonical presence/nx/ny channels"
                     : "fiber inference dataset must contain presence/nx/ny channels");
 
-        cornerBudget_ = std::make_shared<vc::render::DecodedChunkCacheBudget>(maxCachedBytes);
         options_.reserve(prefixes.size());
         for (const auto& prefix : prefixes) {
             const auto channels = predictionChannelNames(prefix);
@@ -2689,9 +2660,9 @@ public:
             const bool cornerCompatible = vc::lasagna::sameLasagnaSamplingGrid(option.presence, option.nx) &&
                                           vc::lasagna::sameLasagnaSamplingGrid(option.presence, option.ny);
             if (cornerCompatible) {
-                option.presenceCorners = std::make_unique<vc::lasagna::LasagnaChannelCornerSampler>(option.presence, maxCachedBytes, cornerBudget_);
-                option.nxCorners = std::make_unique<vc::lasagna::LasagnaChannelCornerSampler>(option.nx, maxCachedBytes, cornerBudget_);
-                option.nyCorners = std::make_unique<vc::lasagna::LasagnaChannelCornerSampler>(option.ny, maxCachedBytes, cornerBudget_);
+                option.presenceCorners = std::make_unique<vc::lasagna::LasagnaChannelCornerSampler>(option.presence);
+                option.nxCorners = std::make_unique<vc::lasagna::LasagnaChannelCornerSampler>(option.nx);
+                option.nyCorners = std::make_unique<vc::lasagna::LasagnaChannelCornerSampler>(option.ny);
             } else {
                 cornerSamplingAvailable_ = false;
             }
@@ -3634,7 +3605,6 @@ private:
     std::vector<Option> options_;
     std::vector<OptionSamplingGrid> optionGrids_;
     std::shared_ptr<vc::lasagna::LasagnaChannelChunkCache> cache_;
-    std::shared_ptr<vc::render::DecodedChunkCacheBudget> cornerBudget_;
     bool cornerSamplingAvailable_ = true;
     bool sourceScaleExplicit_ = false;
     std::optional<size_t> canonicalOptionIndex_;

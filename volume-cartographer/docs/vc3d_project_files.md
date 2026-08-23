@@ -28,6 +28,8 @@ The VC3D File menu provides `Attach Lasagna Manifest...` and
 `Attach Remote Lasagna Manifest...`. The role chooser defaults to regular
 Lasagna and can mark the entry as fiber inference data. Local locations are
 stored as the selected filesystem path; remote locations remain portable URLs.
+A remote manifest URL can be pasted directly into the browser's path field and
+opened with either Enter or the Open button.
 
 Attachment materializes and validates the manifest, opens the referenced Zarr
 descriptors, prepares the manifest's volumes, then commits the manifest entry,

@@ -21,8 +21,20 @@ configure_file(vc/compression/__init__.py
     "${CMAKE_CURRENT_BINARY_DIR}/vc/compression/__init__.py"
     COPYONLY
 )
+# Removed native target migration: extension modules take precedence over the
+# forwarding .py module, so discard only stale generated vcz1 modules from an
+# existing build tree before copying the compatibility shim.
+file(GLOB VC_STALE_VCZ1_MODULES
+    "${CMAKE_CURRENT_BINARY_DIR}/vc/compression/vcz1*${CMAKE_SHARED_MODULE_SUFFIX}")
+if(VC_STALE_VCZ1_MODULES)
+    file(REMOVE ${VC_STALE_VCZ1_MODULES})
+endif()
 configure_file(vc/compression/vcz1_numcodecs.py
     "${CMAKE_CURRENT_BINARY_DIR}/vc/compression/vcz1_numcodecs.py"
+    COPYONLY
+)
+configure_file(vc/compression/vcz1.py
+    "${CMAKE_CURRENT_BINARY_DIR}/vc/compression/vcz1.py"
     COPYONLY
 )
 
@@ -56,19 +68,6 @@ set_target_properties(vc_volume PROPERTIES
 target_link_libraries(vc_volume PRIVATE vc_core)
 target_compile_features(vc_volume PRIVATE cxx_std_23)
 
-nanobind_add_module(vc_compression_vcz1
-    NOMINSIZE
-    vc/compression/vcz1.cpp
-)
-set_target_properties(vc_compression_vcz1 PROPERTIES
-    OUTPUT_NAME vcz1
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vc/compression"
-    # Module lives in vc/compression; libs install to site-packages root.
-    INSTALL_RPATH "$ORIGIN:$ORIGIN/../.."
-)
-target_link_libraries(vc_compression_vcz1 PRIVATE vc_core)
-target_compile_features(vc_compression_vcz1 PRIVATE cxx_std_23)
-
 nanobind_add_module(vc_surface_index
     vc/surface_index.cpp
 )
@@ -81,44 +80,20 @@ set_target_properties(vc_surface_index PROPERTIES
 target_link_libraries(vc_surface_index PRIVATE vc_core)
 target_compile_features(vc_surface_index PRIVATE cxx_std_23)
 
-nanobind_add_module(vc_track_crossings
+nanobind_add_module(vc_grid_raycast
     NOMINSIZE
-    vc/track_crossings.cpp
+    vc/grid_raycast.cpp
 )
-set_target_properties(vc_track_crossings PROPERTIES
-    OUTPUT_NAME track_crossings
+set_target_properties(vc_grid_raycast PROPERTIES
+    OUTPUT_NAME grid_raycast
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vc"
     INSTALL_RPATH "$ORIGIN:$ORIGIN/.."
 )
-target_link_libraries(vc_track_crossings PRIVATE OpenMP::OpenMP_CXX)
-target_compile_features(vc_track_crossings PRIVATE cxx_std_23)
-target_compile_options(vc_track_crossings PRIVATE
+target_link_libraries(vc_grid_raycast PRIVATE OpenMP::OpenMP_CXX)
+target_compile_features(vc_grid_raycast PRIVATE cxx_std_23)
+target_compile_options(vc_grid_raycast PRIVATE
     $<$<AND:$<CONFIG:RelWithDebInfo>,$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>>:-O3>
 )
-
-nanobind_add_module(vc_track_store
-    NOMINSIZE
-    vc/track_store.cpp
-)
-set_target_properties(vc_track_store PROPERTIES
-    OUTPUT_NAME track_store
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vc"
-    INSTALL_RPATH "$ORIGIN:$ORIGIN/.."
-)
-target_link_libraries(vc_track_store PRIVATE OpenMP::OpenMP_CXX)
-target_compile_features(vc_track_store PRIVATE cxx_std_23)
-
-nanobind_add_module(vc_spiral_sampling
-    NOMINSIZE
-    vc/spiral_sampling.cpp
-)
-set_target_properties(vc_spiral_sampling PROPERTIES
-    OUTPUT_NAME spiral_sampling
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vc"
-    INSTALL_RPATH "$ORIGIN:$ORIGIN/.."
-)
-target_link_libraries(vc_spiral_sampling PRIVATE OpenMP::OpenMP_CXX)
-target_compile_features(vc_spiral_sampling PRIVATE cxx_std_23)
 
 install(TARGETS vc_lasagna_amgx
     LIBRARY DESTINATION .
@@ -131,14 +106,14 @@ install(TARGETS vc_core vc_lasagna utils utils_c3d_codec c3d
     ARCHIVE DESTINATION .
 )
 
-install(TARGETS vc_volume vc_surface_index vc_track_crossings vc_track_store vc_spiral_sampling
+install(TARGETS vc_volume vc_surface_index vc_grid_raycast
     LIBRARY DESTINATION vc
     RUNTIME DESTINATION vc
 )
-install(TARGETS vc_compression_vcz1
-    LIBRARY DESTINATION vc/compression
-    RUNTIME DESTINATION vc/compression
-)
 install(FILES vc/__init__.py DESTINATION vc)
 install(FILES vc/compression/__init__.py DESTINATION vc/compression)
-install(FILES vc/compression/vcz1_numcodecs.py DESTINATION vc/compression)
+install(FILES
+    vc/compression/vcz1.py
+    vc/compression/vcz1_numcodecs.py
+    DESTINATION vc/compression
+)

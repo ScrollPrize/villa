@@ -964,8 +964,8 @@ TEST_CASE("Fiberlet chunk graph loads complete cross-chunk adjacency and routes"
             std::sort(anchors.begin(), anchors.end(), [](const auto& left, const auto& right) { return left.key < right.key; });
             return materialized(kind, serializeFiberletAnchors(config, anchors));
         });
-    vc::render::ChunkCache::Options fiberletCacheOptions;
-    fiberletCacheOptions.decodedByteCapacity = 1024;
+    FiberletChunkCacheOptions fiberletCacheOptions;
+    fiberletCacheOptions.service.decodedByteCapacity = 1024;
     std::atomic<int> routeRequests{0};
     auto fiberletCache = createGeneratedFiberletChunkCache(
         fiberletsDataset,
@@ -995,7 +995,8 @@ TEST_CASE("Fiberlet chunk graph loads complete cross-chunk adjacency and routes"
     CHECK(incident.value.edges.front().id.fiberlet == edgeId);
     CHECK(incident.value.edges.front().id.reverse);
     CHECK_FALSE(incident.value.payloadLeases.empty());
-    CHECK(fiberletCache->stats().decodedBytes > fiberletCacheOptions.decodedByteCapacity);
+    CHECK(fiberletCache->stats().decodedBytes >
+          fiberletCacheOptions.service.decodedByteCapacity);
 
     const auto loadedAnchor = graph.anchor(second, true);
     REQUIRE(loadedAnchor.status == FiberletGraphQueryStatus::Ready);
@@ -1049,7 +1050,8 @@ TEST_CASE("Fiberlet chunk graph loads complete cross-chunk adjacency and routes"
     ownerBeforeRelease.payload.reset();
     const auto distantChunk = fiberletCache->getChunkBlocking(distant.level, distant.iz, distant.iy, distant.ix);
     REQUIRE(distantChunk.status == vc::render::ChunkStatus::Data);
-    CHECK(fiberletCache->stats().decodedBytes <= fiberletCacheOptions.decodedByteCapacity);
+    CHECK(fiberletCache->stats().decodedBytes <=
+          fiberletCacheOptions.service.decodedByteCapacity);
     const auto reloadedIncident = graph.incidentEdges(second, true);
     REQUIRE(reloadedIncident.status == FiberletGraphQueryStatus::Ready);
     REQUIRE(reloadedIncident.value.edges.size() == 1);

@@ -2604,10 +2604,11 @@ void benchmarkFullRegionStorageCompression(
         "storage-compression-cache" / ownerNamespace.str();
     auto budget = std::make_shared<vc::render::DecodedChunkCacheBudget>(
         options.decodedCacheBytes);
-    vc::render::ChunkCache::Options anchorCacheOptions;
-    anchorCacheOptions.decodedByteCapacity = options.decodedCacheBytes;
-    anchorCacheOptions.decodedByteBudget = budget;
-    anchorCacheOptions.maxConcurrentReads = 1;
+    vc::fiber_tracer::FiberletChunkCacheOptions anchorCacheOptions;
+    anchorCacheOptions.service.decodedByteCapacity = options.decodedCacheBytes;
+    anchorCacheOptions.service.decodedByteBudget = budget;
+    anchorCacheOptions.service.fetchConcurrency.workerCapacity = 1;
+    anchorCacheOptions.service.fetchConcurrency.maxConcurrentReads = 1;
     FiberletOnDemandConfig onDemand;
     onDemand.anchorRoot = cacheRoot / "anchors.zarr";
     onDemand.fiberletRoot = cacheRoot / "fiberlets.zarr";
@@ -2960,11 +2961,12 @@ int runWholeVolumePreprocessing(
               << " nonempty_chunks=" << scan.nonemptyChunksZYX.size() << " active_output_chunks=" << activeChunks.size() << '\n';
 
     auto budget = std::make_shared<vc::render::DecodedChunkCacheBudget>(options.decodedCacheBytes);
-    vc::render::ChunkCache::Options cacheOptions;
-    cacheOptions.decodedByteCapacity = options.decodedCacheBytes;
-    cacheOptions.decodedByteBudget = budget;
+    vc::fiber_tracer::FiberletChunkCacheOptions cacheOptions;
+    cacheOptions.service.decodedByteCapacity = options.decodedCacheBytes;
+    cacheOptions.service.decodedByteBudget = budget;
     const auto workerCount = static_cast<std::size_t>(std::max(1, options.anchors.parallelThreads));
-    cacheOptions.maxConcurrentReads = workerCount;
+    cacheOptions.service.fetchConcurrency.workerCapacity = workerCount;
+    cacheOptions.service.fetchConcurrency.maxConcurrentReads = workerCount;
 
     FiberletOnDemandConfig onDemand;
     onDemand.anchorRoot = anchorRoot;
@@ -3197,10 +3199,11 @@ CachedReplayContext createCachedReplayContext(
     const auto decodedChunkCacheBytes = options.decodedCacheBytes > evaluationAnchorCacheBytes ? options.decodedCacheBytes - evaluationAnchorCacheBytes
                                                                                                : options.decodedCacheBytes;
     auto graphBudget = std::make_shared<vc::render::DecodedChunkCacheBudget>(decodedChunkCacheBytes);
-    vc::render::ChunkCache::Options cacheOptions;
-    cacheOptions.decodedByteCapacity = options.decodedCacheBytes;
-    cacheOptions.decodedByteBudget = graphBudget;
-    cacheOptions.maxConcurrentReads = 1;
+    vc::fiber_tracer::FiberletChunkCacheOptions cacheOptions;
+    cacheOptions.service.decodedByteCapacity = options.decodedCacheBytes;
+    cacheOptions.service.decodedByteBudget = graphBudget;
+    cacheOptions.service.fetchConcurrency.workerCapacity = 1;
+    cacheOptions.service.fetchConcurrency.maxConcurrentReads = 1;
 
     CachedReplayContext result;
     result.anchorRoot = anchorRootOverride.empty() ? anchorCacheRoot / "anchors.zarr" : anchorRootOverride;
@@ -3264,9 +3267,14 @@ int main(int argc, char** argv)
         std::string replayCtLocator;
         if (options.writeReplayVisualizations) {
             replayCtLocator = std::filesystem::absolute(options.volumeZarr).lexically_normal().string();
+            auto chunkService = vc::render::processChunkCacheService();
+            chunkService->configureFetchConcurrency(
+                static_cast<std::size_t>(
+                    std::max(1, options.paths.parallelThreads)),
+                false);
+            chunkService->configureDecodedByteCapacity(
+                options.decodedCacheBytes);
             replayCtVolume = Volume::New(options.volumeZarr);
-            replayCtVolume->setIOThreads(options.paths.parallelThreads);
-            replayCtVolume->setCacheBudget(options.decodedCacheBytes);
             (void)vc::fiber_tracer::validateFiberReplayStripCtVolume(*replayCtVolume, replayCtLocator);
         }
         vc::lasagna::LasagnaDatasetOpenOptions openOptions;
@@ -3778,11 +3786,12 @@ int main(int argc, char** argv)
                         "fiberlets.zarr"
                     : options.fiberletCacheRoot;
                 auto graphBudget = std::make_shared<vc::render::DecodedChunkCacheBudget>(options.decodedCacheBytes);
-                vc::render::ChunkCache::Options anchorCacheOptions;
-                anchorCacheOptions.decodedByteCapacity = options.decodedCacheBytes;
-                anchorCacheOptions.decodedByteBudget = graphBudget;
-                anchorCacheOptions.maxConcurrentReads = 1;
-                vc::render::ChunkCache::Options fiberletCacheOptions = anchorCacheOptions;
+                vc::fiber_tracer::FiberletChunkCacheOptions anchorCacheOptions;
+                anchorCacheOptions.service.decodedByteCapacity = options.decodedCacheBytes;
+                anchorCacheOptions.service.decodedByteBudget = graphBudget;
+                anchorCacheOptions.service.fetchConcurrency.workerCapacity = 1;
+                anchorCacheOptions.service.fetchConcurrency.maxConcurrentReads = 1;
+                vc::fiber_tracer::FiberletChunkCacheOptions fiberletCacheOptions = anchorCacheOptions;
                 vc::fiber_tracer::FiberletOnDemandConfig onDemand;
                 onDemand.anchorRoot = anchorRoot;
                 onDemand.fiberletRoot = fiberletRoot;

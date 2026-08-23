@@ -152,17 +152,22 @@ using FiberletChunkGenerator =
 using FiberletChunkResolvedCallback =
     std::function<void(FiberletStorageChunkKind kind, const vc::render::ChunkKey& key, vc::render::ChunkFetchStatus status)>;
 
+struct FiberletChunkCacheOptions {
+    vc::render::ChunkCache::Options cache;
+    vc::render::ChunkCacheService::Options service;
+};
+
 [[nodiscard]] std::shared_ptr<vc::render::ChunkCache> createGeneratedFiberletChunkCache(
     std::shared_ptr<FiberletChunkDataset> dataset,
     FiberletChunkGenerator generator,
-    vc::render::ChunkCache::Options options = {},
+    FiberletChunkCacheOptions options = {},
     FiberletChunkResolvedCallback resolved = {});
 
 [[nodiscard]] std::shared_ptr<vc::render::ChunkCache> createStoredFiberletAnchorChunkCache(
-    std::shared_ptr<FiberletChunkDataset> dataset, vc::render::ChunkCache::Options options = {});
+    std::shared_ptr<FiberletChunkDataset> dataset, FiberletChunkCacheOptions options = {});
 
 [[nodiscard]] std::shared_ptr<vc::render::ChunkCache> createStoredFiberletPathChunkCache(
-    std::shared_ptr<FiberletChunkDataset> dataset, vc::render::ChunkCache::Options options = {});
+    std::shared_ptr<FiberletChunkDataset> dataset, FiberletChunkCacheOptions options = {});
 
 [[nodiscard]] std::shared_ptr<const vc::render::DecodedChunkPayload> decodeFiberletChunkPayload(FiberletStorageChunkKind kind, std::span<const std::byte> bytes);
 

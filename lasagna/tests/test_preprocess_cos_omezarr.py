@@ -357,6 +357,17 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		self.assertEqual(next(events), (0, 4, 4, True, 4))
 		self.assertEqual(next(events), (4, 0, 0, False, 8))
 
+	def test_progress_refresh_is_not_suppressed_for_piped_stdout(self):
+		ticks = iter((0.0, 0.5, 1.1, 61.1))
+		emitter = shared_predict3d._Predict3dProgressEmitter(clock=lambda: next(ticks))
+		with mock.patch.object(sys.stdout, "isatty", return_value=False), mock.patch(
+			"sys.stdout", new_callable=io.StringIO,
+		) as output:
+			emitter.emit("first", done=1, total=4)
+			emitter.emit("second", done=2, total=4)
+			emitter.emit("third", done=3, total=4)
+		self.assertEqual(output.getvalue(), "\rsecond  \rthird\n")
+
 	def test_shared_result_layout_is_packed_without_queue_payloads(self):
 		layouts, total = shared_predict3d._packed_layouts((
 			("product:a", (7, 16, 16, 16), np.float32),
@@ -893,7 +904,8 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		self.assertEqual(kwargs["base_ref"], "base.zarr")
 		self.assertEqual(kwargs["base_scale"], 1)
 		self.assertEqual(kwargs["n_levels"], 3)
-		self.assertEqual(kwargs["ome_chunk"], 64)
+		self.assertEqual(kwargs["ome_chunk"], 32)
+		self.assertEqual(kwargs["ome_compressor"], "blosc-zstd")
 
 	def test_predict3d_cli_forwards_shared_multi_gpu_pipeline_options(self):
 		args = [
@@ -909,6 +921,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			"--profile-pipeline",
 			"--product-accumulator-dtype", "float32",
 			"--download-workers", "123",
+			"--ome-compressor", "none",
 		]
 		with mock.patch("builtins.open", side_effect=PermissionError):
 			with mock.patch("preprocess_cos_omezarr.run_preprocess_3d") as run:
@@ -928,6 +941,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		self.assertTrue(kwargs["profile_pipeline"])
 		self.assertEqual(kwargs["product_accumulator_dtype"], "float32")
 		self.assertEqual(kwargs["download_workers"], 123)
+		self.assertEqual(kwargs["ome_compressor"], "none")
 
 	def test_predict3d_overall_eta_uses_processed_counts_not_skipped_done(self):
 		progress = {
@@ -1924,6 +1938,61 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			self.assertIn("pred_dt", raw["groups"])
 			self.assertEqual(raw["groups"]["pred_dt"]["zarr"], "vol_pred_dt.ome.zarr/0")
 			self.assertEqual(int(np.asarray(dt_arr[0, 0, 0])), 13)
+
+	def test_direct_predict3d_writes_portable_lasagna_provenance(self):
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			input_path = root / "volume.ome.zarr" / "1"
+			input_path.mkdir(parents=True)
+			checkpoint = root / "model.pt"
+			torch.save({"state_dict": {}, "patch_size": 256, "norm_type": "group"}, checkpoint)
+			output = root / "artifacts" / "result.lasagna.json"
+			context = root / "context.json"
+			context.write_text(json.dumps({
+				"run_uuid": "run-lasagna",
+				"source": {"volume_id": "vol", "requested_group": 1},
+				"model": {"atlas_model_id": "20260806123000"},
+			}), encoding="utf-8")
+
+			def fake_run(**kwargs):
+				manifest = Path(kwargs["output_path"])
+				channel = manifest.parent / "result_cos.ome.zarr" / "2"
+				channel.mkdir(parents=True)
+				(channel / ".zarray").write_text(json.dumps({
+					"shape": [2, 2, 2], "chunks": [2, 2, 2], "dtype": "|u1",
+					"compressor": {"id": "blosc", "cname": "zstd", "clevel": 3},
+				}), encoding="utf-8")
+				manifest.write_text(json.dumps({
+					"version": 2, "source_to_base": 1.0,
+					"grad_mag_encode_scale": 1000.0, "grad_mag_factor": 2.0,
+					"base_shape_zyx": [16, 16, 16], "crops": [],
+					"provenance": "inference.json",
+					"groups": {"cos": {
+						"zarr": "result_cos.ome.zarr/2", "scaledown": 2,
+						"channels": ["cos"],
+					}},
+				}), encoding="utf-8")
+
+			with mock.patch.object(preprocess_wrapper, "run_preprocess_3d", side_effect=fake_run), \
+				 mock.patch.object(preprocess_wrapper.zarr, "open", return_value=types.SimpleNamespace(shape=(8, 8, 8))), \
+				 mock.patch.object(preprocess_wrapper, "_resolve_base_shape", return_value=(16, 16, 16)), \
+				 mock.patch.object(preprocess_wrapper, "_predict3d_repository_state", return_value={"revision": "abc", "dirty": False}):
+				result = preprocess_wrapper.main_predict3d([
+					"--input", str(input_path), "--output", str(output),
+					"--unet-checkpoint", str(checkpoint), "--no-download",
+					"--provenance-context", str(context),
+				])
+
+			self.assertEqual(result, 0)
+			provenance = json.loads((output.parent / "inference.json").read_text())
+			self.assertEqual(provenance["artifact_kind"], "lasagna")
+			self.assertEqual(provenance["status"], "completed")
+			self.assertEqual(provenance["source_scale"]["source_to_base_factor"], 2)
+			self.assertEqual(provenance["inference"]["tile_size"], 256)
+			self.assertRegex(provenance["inference"]["code_commit"], r"^[0-9a-f]{40}$")
+			self.assertEqual(provenance["product"]["groups"]["cos"]["scaledown"], 2)
+			self.assertEqual(provenance["atlas_model_identity"]["model_id"], "20260806123000")
+			self.assertEqual(provenance["artifacts"][1]["path"], "result_cos.ome.zarr")
 
 
 if __name__ == "__main__":

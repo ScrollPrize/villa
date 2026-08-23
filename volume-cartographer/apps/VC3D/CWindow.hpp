@@ -31,7 +31,6 @@
 #include "CFiberWidget.hpp"
 #include "CState.hpp"
 
-namespace vc::render { class DecodedChunkCacheBudget; }
 #include "OpenDataManifest.hpp"
 #include "LineAnnotationFiberClassification.hpp"
 #include "segmentation/tools/SegmentationEditManager.hpp"
@@ -75,6 +74,7 @@ struct RenderBenchOptions {
     bool replayTimedProfile = false;
     int replayTimedProfilePeriodMs = 200;
     int replayLimit = 0;
+    bool debugDownloadQueue = false;
 };
 
 struct AtlasSearchFiberSnapshot {
@@ -349,6 +349,7 @@ private slots:
     // unless --record was passed and the recorder isn't already attached).
     void maybeAttachBenchRecorder();
     void onSegmentationGrowthStatusChanged(bool running);
+    void updateSharedStatusLabel();
     void onZScrollSensitivityChanged(double sensitivity);
     void onSharedCacheStatsChanged(const QStringList& items);
     void onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
@@ -400,10 +401,10 @@ private:
     QLabel* _persistentCacheLowSpaceLabel{nullptr};
     QLabel* _persistentCacheWarningText{nullptr};
     QFrame* _persistentCacheWarningBanner{nullptr};
-    QLabel* _sliceStepLabel{nullptr};
     QTimer* _statusMessageTimer{nullptr};
     QTimer* _persistentCacheSpaceTimer{nullptr};
     bool _persistentCacheBannerShownThisSession{false};
+    QStringList _sharedCacheStatsItems;
     QString _segmentationGrowthStatusText;
     QString _lastSegmentTransformWarningVolumeId;
     bool _relayingNativeStatusMessage{false};
@@ -455,7 +456,6 @@ private:
     bool can_change_volume_();
 
     size_t _cacheSizeBytes = 0;
-    std::shared_ptr<vc::render::DecodedChunkCacheBudget> _decodedChunkCacheBudget;
 
     std::unique_ptr<VolumeOverlayController> _volumeOverlay;
     std::unique_ptr<ViewerManager> _viewerManager;

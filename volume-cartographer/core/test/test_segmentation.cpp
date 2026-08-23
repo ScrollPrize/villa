@@ -29,6 +29,15 @@ void writeMeta(const fs::path& dir, const std::string& content)
     f << content;
 }
 
+// canLoadSurface() only checks that the tifxyz payload is present, so stub
+// files are enough; nothing here triggers an actual TIFF read.
+void writeBands(const fs::path& dir)
+{
+    for (const auto* band : {"x.tif", "y.tif", "z.tif"}) {
+        std::ofstream(dir / band) << "stub";
+    }
+}
+
 } // namespace
 
 TEST_CASE("Segmentation: New(path, uuid, name) writes a valid meta.json")
@@ -125,8 +134,65 @@ TEST_CASE("Segmentation: canLoadSurface needs format tifxyz")
 
     TmpSeg t2;
     writeMeta(t2.dir, R"({"type":"seg","uuid":"u","name":"n","format":"tifxyz"})");
+    writeBands(t2.dir);
     Segmentation seg2(t2.dir);
     CHECK(seg2.canLoadSurface());
+}
+
+// A meta.json without the x/y/z.tif payload is what a partial Open Data
+// download or an interrupted save leaves behind. The payload is only read
+// later by QuadSurface::ensureLoaded(), from inside a Qt slot with no handler,
+// so such a directory must not report itself as loadable.
+TEST_CASE("Segmentation: canLoadSurface requires the tifxyz payload")
+{
+    TmpSeg t;
+    writeMeta(t.dir, R"({"type":"seg","uuid":"u","name":"n","format":"tifxyz"})");
+    Segmentation seg(t.dir);
+    CHECK_FALSE(seg.canLoadSurface());
+    CHECK(seg.loadSurface() == nullptr);
+
+    SUBCASE("catalog provenance alone is not a lazy placeholder")
+    {
+        std::ofstream(t.dir / "catalog-origin.json") << "{}";
+        Segmentation catalogSegment(t.dir);
+        CHECK_FALSE(catalogSegment.canLoadSurface());
+        CHECK(catalogSegment.loadSurface() == nullptr);
+    }
+
+    SUBCASE("a partial payload is still not loadable")
+    {
+        std::ofstream(t.dir / "x.tif") << "stub";
+        Segmentation partial(t.dir);
+        CHECK_FALSE(partial.canLoadSurface());
+        CHECK(partial.loadSurface() == nullptr);
+    }
+
+    SUBCASE("the complete payload is loadable")
+    {
+        writeBands(t.dir);
+        Segmentation complete(t.dir);
+        CHECK(complete.canLoadSurface());
+    }
+}
+
+TEST_CASE("Segmentation: canLoadSurface allows open-data lazy placeholders")
+{
+    TmpSeg t;
+    writeMeta(t.dir, R"({
+        "type":"seg",
+        "uuid":"placeholder",
+        "name":"lazy",
+        "format":"tifxyz",
+        "scale":[1.0,1.0],
+        "tiff_dimensions":[16,8],
+        "vc_open_data_lazy_placeholder":true
+    })");
+
+    Segmentation seg(t.dir);
+    CHECK(seg.canLoadSurface());
+    CHECK(seg.loadSurface() != nullptr);
+    CHECK(seg.getSurface() != nullptr);
+    CHECK_FALSE(fs::exists(t.dir / "x.tif"));
 }
 
 TEST_CASE("Segmentation: loadSurface returns nullptr when not tifxyz")

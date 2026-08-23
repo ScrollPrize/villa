@@ -135,9 +135,6 @@ public:
     virtual void setOverlayComposite(const OverlayCompositeSettings& settings) = 0;
     virtual void reloadPerfSettings() = 0;
 
-    // Re-acquire the chunk source from the ViewerManager, e.g. after the
-    // workspace opts into a private bounded pool or its capacity grows.
-    virtual void refreshChunkSource() {}
     // SurfaceCache budgets for the flattened segmentation view (base, overlay).
     // Zero disables that channel; viewers that are not a flattened
     // QuadSurface view ignore both.

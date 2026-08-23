@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -36,6 +37,21 @@ struct ChunkResult {
     std::shared_ptr<const DecodedChunkPayload> payload;
 };
 
+struct ChunkRequestContext {
+    std::uint64_t viewId = 0;
+    std::uint64_t viewVersion = 0;
+
+    [[nodiscard]] bool interactive() const noexcept { return viewId != 0; }
+};
+
+struct ChunkViewportSample {
+    ChunkKey key;
+    std::array<float, 2> viewportPosition{};
+    // Offset from this view's requested level. Larger values are coarser
+    // fallback levels and therefore have higher interactive priority.
+    int relativeLevel = 0;
+};
+
 class IChunkedArray {
 public:
     using ChunkReadyCallbackId = std::uint64_t;
@@ -59,6 +75,12 @@ public:
     // returns immediately; chunk-ready listeners are responsible for scheduling
     // a later repaint on the UI thread.
     virtual ChunkResult tryGetChunk(int level, int iz, int iy, int ix) = 0;
+    virtual ChunkResult tryGetChunk(int level, int iz, int iy, int ix,
+                                    const ChunkRequestContext& request)
+    {
+        (void)request;
+        return tryGetChunk(level, iz, iy, ix);
+    }
 
     // Return a resolved chunk only when it is already in memory. This must not
     // queue a miss or promote a resident entry in the decoded-cache eviction
@@ -80,14 +102,46 @@ public:
     // Viewer rendering paths must not call this on the Qt/main thread.
     virtual ChunkResult getChunkBlocking(int level, int iz, int iy, int ix) = 0;
     virtual void prefetchChunks(const std::vector<ChunkKey>& keys, bool wait, int priorityOffset = 0) = 0;
-    // Starts a newer interactive request. An exclusively-owned backing array
-    // may discard unresolved work from the superseded view; resident chunks
-    // are preserved.
-    virtual void beginViewRequest(bool discardPending = false)
+    virtual void prefetchChunks(const std::vector<ChunkKey>& keys,
+                                bool wait,
+                                int priorityOffset,
+                                const ChunkRequestContext& request)
     {
-        (void)discardPending;
+        (void)request;
+        prefetchChunks(keys, wait, priorityOffset);
     }
 
+    // Atomically replaces one view's located demand for this source. Building
+    // and deduplicating `samples` happens before implementations take their
+    // shared scheduler lock.
+    virtual void replaceViewDemand(const ChunkRequestContext& request,
+                                   const std::array<float, 2>& focus,
+                                   std::vector<ChunkViewportSample> samples)
+    {
+        (void)request;
+        (void)focus;
+        (void)samples;
+    }
+    // Mark the most recently interacted view. This operation must remain O(1):
+    // focus distances are captured and published by accepted render jobs.
+    virtual void markViewActive(std::uint64_t viewId)
+    {
+        (void)viewId;
+    }
+    // Remove this source's demand for one view without closing that view in
+    // other sources sharing the application-wide cache service.
+    virtual void clearSourceViewDemand(std::uint64_t viewId,
+                                       std::uint64_t viewVersion = 0)
+    {
+        (void)viewId;
+        (void)viewVersion;
+    }
+    virtual void clearViewDemand(std::uint64_t viewId,
+                                 std::uint64_t viewVersion = 0)
+    {
+        (void)viewId;
+        (void)viewVersion;
+    }
     virtual ChunkReadyCallbackId addChunkReadyListener(ChunkReadyCallback cb) = 0;
     virtual void removeChunkReadyListener(ChunkReadyCallbackId id) = 0;
 };

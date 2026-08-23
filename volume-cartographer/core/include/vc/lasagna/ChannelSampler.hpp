@@ -184,10 +184,8 @@ using LasagnaCornerPointVisitor = void (*)(
 // blocking requested-level reader for caller-side interpolation.
 class LasagnaChannelCornerSampler {
 public:
-    LasagnaChannelCornerSampler(
-        const LasagnaChannelBinding& binding,
-        size_t maxCachedBytes,
-        std::shared_ptr<vc::render::DecodedChunkCacheBudget> sharedBudget = {});
+    explicit LasagnaChannelCornerSampler(
+        const LasagnaChannelBinding& binding);
     ~LasagnaChannelCornerSampler();
 
     LasagnaChannelCornerSampler(const LasagnaChannelCornerSampler&) = delete;

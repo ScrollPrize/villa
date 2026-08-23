@@ -464,8 +464,6 @@ void FiberletOnDemandPreprocessor::initialize()
     }
     state_->anchorDataset = FiberletChunkDataset::createOrOpen(config.anchorRoot, config.anchorMetadata);
     state_->fiberletDataset = FiberletChunkDataset::createOrOpen(config.fiberletRoot, config.fiberletMetadata);
-    config.anchorCacheOptions.schedulerLane = "fiberlet-anchors";
-    config.fiberletCacheOptions.schedulerLane = "fiberlet-paths";
     const std::weak_ptr<FiberletOnDemandPreprocessor> weak = shared_from_this();
     const auto resolved = [weak](FiberletStorageChunkKind kind, const vc::render::ChunkKey& key, vc::render::ChunkFetchStatus status) {
             const auto self = weak.lock();

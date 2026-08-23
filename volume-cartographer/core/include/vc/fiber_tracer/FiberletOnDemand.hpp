@@ -50,8 +50,8 @@ struct FiberletOnDemandConfig {
     FiberletPointPredicate pointPredicate;
     FiberletGeometryQuantization geometryQuantization;
     std::size_t evaluationAnchorCacheBytes = 256ULL * 1024ULL * 1024ULL;
-    vc::render::ChunkCache::Options anchorCacheOptions;
-    vc::render::ChunkCache::Options fiberletCacheOptions;
+    FiberletChunkCacheOptions anchorCacheOptions;
+    FiberletChunkCacheOptions fiberletCacheOptions;
     FiberletOnDemandProgressCallback progress;
     FiberletChunkResolvedCallback chunkResolved;
 };

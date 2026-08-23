@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <array>
+#include <vector>
 
 class QuadSurface;
 
@@ -19,9 +21,8 @@ namespace vc::render {
 // chunks of ChunkCache. A tile is `kTileSize x kTileSize x wCount` samples in
 // (u, v, w) where:
 //
-//   u, v  nominal surface coordinates -- the same space as the flattened
-//         viewer's surface pointer, one unit ~ one voxel of arclength along
-//         the sheet. Signed.
+//   u, v  declared level-0/base-volume voxel surface coordinates -- the same
+//         space as the flattened viewer's surface pointer. Signed.
 //   w     signed offset in level-0 voxels along the unit surface normal at
 //         (u, v).
 //
@@ -30,10 +31,10 @@ namespace vc::render {
 // memoization of the sampling function the flattened renderer already
 // evaluates per frame -- not a new one.
 //
-// Tile (level, tu, tv) samples volume level `level` and steps 2^level nominal
-// units per sample in u and v, so a tile always covers the same screen area at
-// its matching zoom. `w` steps one level-0 voxel at every level: the band is
-// always physically [wMin, wMin + wCount - 1] and is never widened.
+// Tile `level` is the source Zarr level requested by the renderer. Its
+// parameter-grid stride is a derived cache implementation detail, not another
+// independently selected LOD. `w` steps one level-0 voxel at every level: the
+// band is always physically [wMin, wMin + wCount - 1] and is never widened.
 class SurfaceGeometryTileCache;
 
 class SurfaceCache {
@@ -58,10 +59,6 @@ public:
         // steps. VC_SURFACE_ADMISSION_PAGE_BYTES overrides.
         std::size_t admissionPageBytes = 64ULL << 20;
         vc::Sampling sampling = vc::Sampling::Trilinear;
-        // True only when this cache owns its backing chunk array exclusively.
-        // A changed viewport then discards unresolved dependencies from the
-        // previous view instead of accumulating stale small-chunk fetches.
-        bool supersedeChunkRequests = false;
         // Share one coords/normals tile cache with a second SurfaceCache over
         // the same surface (the overlay channel) so each tile's gen() runs
         // once and fills both. Created privately when null.
@@ -165,8 +162,7 @@ public:
                      double vMin,
                      double scale,
                      int fbW,
-                     int fbH,
-                     std::uint64_t viewGeneration);
+                     int fbH);
 
     TileReadyCallbackId addTileReadyListener(std::function<void()> callback);
     void removeTileReadyListener(TileReadyCallbackId id);
@@ -218,6 +214,17 @@ public:
     // Computes on miss. Concurrent callers for the same key wait for the
     // first one instead of duplicating the gen().
     std::shared_ptr<const Tile> get(int level, int tu, int tv);
+
+    // Resolve sparse framebuffer samples through the same geometry tiles used
+    // by SurfaceCache fills. This may generate missing geometry tiles, which
+    // makes the following fill reuse them rather than invoking gen() again.
+    void sampleView(int level,
+                    double uMin,
+                    double vMin,
+                    double scale,
+                    const std::vector<std::array<float, 2>>& viewportPositions,
+                    std::vector<cv::Vec3f>& coords,
+                    std::vector<cv::Vec3f>* normals = nullptr);
 
     void invalidateAll();
     void invalidateSurfaceRegion(const cv::Rect& gridCells);

@@ -184,6 +184,32 @@
 - Automatic OME-Zarr download uses `--download-workers` independently of
   inference prefetch, GPU slots, and pyramid workers. It defaults to 64 and
   must be positive even when automatic download is disabled.
+- Fiber and Lasagna expose the same opt-in `--live-fetch` selected-level disk
+  cache through the shared runner. It is valid only for full, non-cropped
+  inference on a local numeric OME-Zarr-v2 level backed by S3 `_download`
+  metadata, and conflicts with `--no-download`. The disk target defaults to
+  10240 GiB (10 TiB), the materialization window defaults to 10,000 canonical
+  tile descriptors, and `--download-workers` controls raw chunk transfers.
+  This descriptor window is independent of the smaller TensorStore full-tile
+  read window and must not materialize a global Cartesian job list.
+- Live source support is authoritative per active remote Z-chunk inventory;
+  transient local absence and advisory `.noremote` data cannot suppress valid
+  inference. Completed output work is rejected before remote materialization.
+  Downloads use unique temporary files and atomic replacement, and terminal
+  list/GET/write failure is fatal rather than reclassified as masked fill.
+- Live cache accounting and deletion apply only to valid chunks in the exact
+  selected scale. On each completely committed canonical model Z row, the
+  runner advances a safe input frontier. If actual completed resident bytes
+  exceed the target, it removes oldest whole cached Z-chunk planes whose ends
+  are at or before that frontier, repeating until under target or no safe plane
+  remains. It never evicts by Y/X, LRU, or ahead of inference; insufficient
+  obsolete data permits a reported temporary overshoot.
+- Cooperating ordinary inference readers hold a shared selected-level advisory
+  lock, while live mutation and bulk download hold the exclusive lock. Lock
+  files live below `.dl_cache`; non-cooperating external readers are outside
+  this protection. Live mode initially supports only the primary input source;
+  separately remote Lasagna `pred_dt` is rejected while local `pred_dt` remains
+  supported.
 - `.dl_cache/<level>.noremote.json` is advisory only. Missing, unreadable,
   malformed, or schema-invalid cache data warns and behaves as an empty set;
   it must never abort inference or suppress remote validation. Saves snapshot
@@ -202,6 +228,17 @@
   blur-plus-2x-decimation path for weighted predictions and weights. Fiber has
   no private resampling, blending, or border implementation.
 - Lasagna predict3d and Fiber inference default to 64x64x64 OME-Zarr chunks.
+- `las_manager` Bash and Zsh completion is generated from the same command
+  registry used for prefix dispatch. Dynamic snapshot and catalog candidates
+  use cached indexes only; inference candidates read durable records; live-run
+  candidates may query tmux but never reconcile or mutate records.
+- A manager-launched inference is complete only when the child exits zero and
+  its portable `artifacts/inference.json` reports `completed` with an artifact
+  inventory. A zero exit without that contract is recorded as failed with a
+  diagnostic completion error.
+- Portable artifact inventory paths must be relative, remain inside the bundle,
+  and resolve after the complete `artifacts/` directory is moved. This bounded
+  validation does not recursively enumerate Zarr chunks.
 - Pyramid multiprocessing may use the automatic available-CPU process count,
   but every pyramid worker must run native BLAS/OpenMP libraries with one
   thread. The same constraint applies to serial pyramid execution, and parent
@@ -2471,6 +2508,206 @@
 - Tests use fake/local arrays and monkeypatched readers where possible and must not require network access.
 - `docs/code_structure.md` documents the current implemented module structure, data flow, config shape, runner outputs, and local workflow caveats; `planning/specs.md` remains the normative behavior source.
 - Future changes that affect public config, data flow, sampling, caching, augmentation, runner outputs, tests, or local workflow must update both the relevant specs and code docs.
+# Lasagna inference manager foundations
+
+- The installed `las_manager` CLI owns one backend-neutral configuration,
+  catalog, snapshot, run, provenance, and publication model for Fiber 3D and
+  Lasagna inference. Command and entity tokens use exact match first, then only
+  unambiguous prefixes; ordinals printed by listings are not stable selectors.
+- Global configuration lives at
+  `${XDG_CONFIG_HOME:-~/.config}/las_manager/config.toml`, with
+  `LAS_MANAGER_CONFIG` as an automation override. It contains the catalog URL,
+  public bucket, snapshot directory list, cache/output/venv/Atlas directories,
+  staging S3 origin, and catalog maximum age. It never contains AWS
+  credentials. Relative paths resolve from the config file.
+- Global `params` is a string-token array passed to both inference backends.
+  Initialized configs default to `--tile-size 512 --border 32 --overlap 96
+  --devices all`. Per-run arguments after `--` follow configured tokens and
+  override them; explicit singular/plural device selection removes the
+  configured mutually exclusive device selector. Existing configs without the
+  key receive the default without migration failure.
+- The open-data catalog is cached as validated JSON plus a sidecar containing
+  its source URL, SHA-256, ETag/Last-Modified, fetch/validation times, and last
+  refresh error. `fetch` always revalidates; dependent commands refresh when
+  the cache is missing or at least one hour old. Refresh failure may use a
+  previously valid cache with a warning; invalid new data must not replace it.
+- A volume record preserves the complete catalog identity needed for portable
+  provenance and Atlas ingestion: sample/volume IDs and long ID, shape, voxel
+  size/format/license, the original volume DataEntry, all OME origins/access
+  roots, selected public S3 origin, and catalog hash/fetch metadata. Stable
+  selectors are `sample_id/long_id`, globally unique `long_id`, and globally
+  unique volume ID.
+- Human `volume ls` renders a deterministic, aligned table with one header,
+  groups records by sample/scroll, prints the scroll and first volume together,
+  and puts branches for additional volumes beneath it in the `SCROLL` column.
+  A single-volume scroll has no branch. The redundant `ID`
+  column is omitted because the long volume name begins with that ID. Three-D
+  shapes retain depth/height/width order and use space-padded widths 6/5/5.
+  Its `PREFETCHED` column contains numerically
+  sorted local OME groups only when `.zarray` and at least one non-metadata
+  chunk exist; advertised or metadata-only groups remain absent. UTF-capable
+  output uses `├─`/`└─`, otherwise `|-`/`\-`. Empty results are header-only.
+  `volume ls --json` retains the backend-neutral record schema for machines and
+  is unaffected by human rendering.
+- Snapshot roots may be a run collection, one run, or `snapshots/`. Listing
+  deduplicates canonical paths, reads checkpoints with CPU mapping, mmap and
+  `weights_only=True`, and caches metadata by path/size/mtime. The stable
+  selector is backend/run/checkpoint. Records include hash, step/test metric,
+  patch/architecture/output options, precision, task/process/code revision,
+  and optional Atlas model identity; absent legacy metadata remains explicit.
+- Shell completion is generated by the same command registry and may use only
+  valid local catalog/checkpoint caches. It must not refresh the network, open
+  an uncached checkpoint, download data, or mutate state.
+- `completion install [bash]` atomically installs a canonical loader in the
+  standard XDG user Bash-completion directory plus one digest-isolated provider
+  per canonical console-script executable. At completion time the loader uses
+  the external `las_manager` selected by `PATH`, obtains its canonical provider
+  identity through a config-free command, and dispatches only to that provider.
+  Providers from multiple venvs coexist; missing venvs are inert. Installation
+  support is Bash-only, while `completion bash|zsh` remains available for
+  generated setup.
+- A final literal `help` before any `--` prints argparse help for the longest
+  exact or uniquely abbreviated command prefix. Unrecognized suffixes fall
+  back to the understood parent; an unrecognized first token remains an error.
+  A `help` token after `--` is forwarded to the inference backend unchanged.
+- Bash and Zsh completion delegate full word context to one shared resolver,
+  understand unique command abbreviations, and complete valid flags, static
+  option values, cached selectors, samples, formats, and locally evidenced OME
+  scale indices. Scale discovery reads only local `.zattrs` multiscale dataset
+  paths and numeric groups with `.zarray`; it does not invent unknown remote
+  levels or perform network access.
+- Nullable optional catalog collections are normalized before iteration.
+  Specifically, `properties.shape = null` is indexed and displayed as unknown
+  rather than preventing other volumes from being listed or completed.
+- `volume prefetch <volume> <scale>` calls the existing OME-Zarr downloader for
+  exactly that numbered group and stores the OME root at
+  `<cache_dir>/volumes/<sample_id>/<long_id>`. It preserves downloader metadata
+  and accepts an explicit worker count; no manager-specific transfer path is
+  permitted.
+- A Lasagna install built from the monorepo includes the sibling Vesuvius
+  namespace, Fiber inference packages, their config data, and canonical
+  `lasagna.*` modules. The configured venv must run Fiber inference without an
+  ambient `PYTHONPATH`; both editable installs and monorepo-built wheels obey
+  this contract.
+- `inference run <snapshot> <volume> <scale>` atomically reserves a run,
+  launches a detached manager-prefixed tmux session, prints its path, and
+  returns immediately. By default the tmux runner invokes the shared downloader
+  before inference and passes backend `--no-download`; `--no-prefetch` skips the
+  manager phase and omits backend `--no-download`, retaining normal on-demand
+  crop-aware fetching during the inference lifecycle. On an empty cache the
+  manager initializes only local `_download` source metadata, with no remote
+  scan or chunk transfer. `--download-workers` applies to both modes; explicit
+  backend arguments after `--`, including `--no-download`, retain precedence.
+  The serialized, versioned request
+  preserves source, destination, group, workers, anonymous access, and remote
+  inventory behavior. Additional inference
+  argv is preserved without shell interpolation. The positional scale selects
+  the input OME group and does not alter the backend's output-scaledown default.
+- Every launch has an immutable UUID and atomically reserved output directory
+  containing private `metadata.json`, `command.json`, `run.log`, and a portable
+  `artifacts/` subtree. The backend-neutral record pins the complete source and
+  checkpoint identity and tracks prefetch, inference, staging-upload,
+  Atlas-ingest, and Atlas-publication state independently. New directory labels
+  use `<sample>-<acquisition>-las-sd<group>-<uuid8>`; this is a concise human
+  label, not Atlas canonical identity. Full volume, model, backend, source
+  group, command, time, revision, and UUID identity remains structured metadata.
+- A manager wrapper owns the `created -> running -> completed|failed|interrupted`
+  transition, combined prefetch/inference logging, real child exit status, and
+  signal forwarding. Prefetch tracks pending/running/completed/failed/skipped,
+  timestamps and error; failure/interruption prevents inference from starting.
+  Inference stdout/stderr is teed byte-for-byte to both `run.log` and the tmux
+  pane so attaching shows live carriage-return progress without weakening the
+  durable log or exit-code contract.
+  Stale active records are reconciled against both tmux and PID/start-time
+  identity without deleting artifacts. `inference ls` is the durable view;
+  `run ls` contains only live tmux sessions.
+- `tmux attach` attaches normally outside tmux. Inside tmux it links the run
+  window immediately after the current window and selects it, never nesting a
+  client or renaming the source window. Creation atomically captures tmux's
+  stable `window_id`, tags the window with the immutable run UUID, and validates
+  both before live/attach decisions. Numeric indices are never durable
+  identity. Window names use `inf-<sample>-<uuid4>` and are only short display
+  labels. A surviving orphan inference process is durable-running but not
+  attachable when its wrapper window is gone.
+- Subsequent ordered phases add direct portable provenance,
+  shared Zstd output, Atlas Lasagna-bundle publication, and the Lasagna backend without
+  introducing a second manager workflow or discarding the identities above.
+- Current Fiber checkpoints are self-configuring for inference: their embedded
+  config is authoritative and the CLI positional config is optional. A
+  positional config remains supported only as the explicit fallback for a
+  legacy checkpoint without embedded config; conflicting explicit config does
+  not override a current checkpoint.
+- Fiber inference directly and atomically maintains bundle-relative
+  `inference.json` with schema version, status, source/catalog identity,
+  requested and observed input scale, effective output scale/levels/crop,
+  numerical settings, checkpoint/config identity, repository/runtime identity,
+  and a bounded structural artifact inventory. It records failed/interrupted
+  status after artifact initialization and never recursively inventories Zarr
+  chunks.
+- The shared Fiber/Lasagna inference metadata writer records the checked-out
+  Villa revision as `inference.code_commit`; this applies to direct and managed
+  invocation. Repository dirtiness remains explicit. Packaged deployments may
+  supply the build commit when no Git checkout is present; otherwise the value
+  is null. Git provenance is not copied into Atlas model metadata.
+- The manager passes portable catalog/model/run context through an explicit
+  private context file. Fiber inference, not the manager, authors inference
+  facts. Private absolute paths, command, hostname/user, logs, and tmux identity
+  remain outside `artifacts/`.
+- Lasagna manifests preserve a relative `provenance` reference and unknown
+  forward-compatible top-level fields across load/save.
+- Newly created Fiber and Lasagna inference OME-Zarr arrays use the shared
+  exact Zarr-v2 compressor `{id: blosc, cname: zstd, clevel: 3, shuffle: 1,
+  blocksize: 0}` at every generated level. Both direct CLIs expose the same
+  `--ome-compressor` compatibility override. Resume never rewrites an existing
+  array's codec; requested/actual mismatches are reported, while provenance
+  inventories the codec actually persisted per level.
+
+## Atlas staging and ingestion
+
+- `las_manager open-data validate/upload` accepts completed portable Fiber and
+  Lasagna bundles through one backend-neutral implementation. Both require a
+  CC BY-NC 4.0 source license. Model identity is resolved automatically from a
+  carried ID or a freshly rehashed checkpoint in configured snapshot roots;
+  there is no normal upload-time model-ID argument.
+- Staging uses the immutable run UUID and a fixed local file inventory.
+  `_INCOMPLETE` is the manager-side transaction guard: it is written before
+  rclone starts and removed only after rclone succeeds; failed staging never
+  invokes Atlas ingestion. Retry invokes rclone again and relies on its
+  configured comparison behavior. Completed run UUID/bundle contents are
+  immutable because `rclone copy --size-only` neither detects changed same-size
+  objects nor deletes stale destination objects. No manager upload manifest or
+  per-Zarr-chunk transaction hash is stored remotely.
+- Atlas maps both Fiber and Lasagna output to the existing `lasagna` copy-first
+  artifact. Canonical identity is volume, canonical model ID, and source input
+  level. The data entry contains only its private origin and existing
+  `model_id`/`level` parameters; portable provenance remains in `inference.json`
+  and is not copied into Atlas `creation_info`. The origin path is relative to
+  its access-root URL and Atlas joins them to resolve the full data-sync source.
+- Missing models are registered automatically using an Atlas UTC datetime ID.
+  Fiber uses the minimal Lasagna model record with architecture `fiber3d/unet`,
+  task `lasagna`, process `model_training`, snapshot-root-relative checkpoint
+  path, and snapshot SHA-256. Data entries keep numeric model references.
+  Byte-identical checkpoint aliases are normalized; incompatible hashes,
+  metadata, tasks, or canonical-ID collisions are rejected before staging.
+- Public publication remains an operator-controlled Atlas data-sync action.
+
+## Lasagna manager backend
+
+- Snapshot discovery classifies current Fiber checkpoints by their embedded
+  Fiber model config and Lasagna checkpoints by their Lasagna architecture
+  metadata/state-dict wrapper. It never infers a backend from a filename.
+  Selectors are namespaced as `fiber3d/run/checkpoint` and
+  `lasagna/run/checkpoint`; `--backend` is needed only for an ambiguous legacy
+  shorthand.
+- Lasagna launches use `preprocess_cos_omezarr predict3d` but otherwise share
+  the manager's volume prefetch, immutable run record, tmux runner, completion,
+  lifecycle, portable artifact bundle, staging, and Atlas ingestion paths.
+- Direct and managed Lasagna inference write the shared `inference.json`
+  envelope with `artifact_kind = "lasagna"`. Its product metadata preserves
+  the `.lasagna.json` source-to-base mapping, gradient encoding scale/factor,
+  crops, groups, channels, Zarr paths, and output scaledowns. The manifest
+  points to `inference.json` by a bundle-relative path.
+
 # Process-parallel 3D flush
 
 - Fiber and Lasagna inference use the same shared rolling-mmap flush engine.
