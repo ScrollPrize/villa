@@ -2343,6 +2343,11 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         return !isSupportedStreamingCompositeMethod(ctx.compositeSettings.params.method);
     };
     const bool volumetricMethod = ctx.compositeSettings.params.method == "volumetric";
+    // Selecting the method does not itself enable compositing. In particular,
+    // the flattened SurfaceCache path must return to its ordinary single-slice
+    // sample as soon as the flattened composite checkbox is cleared.
+    const bool flattenedVolumetricActive =
+        volumetricMethod && ctx.compositeSettings.enabled;
 
     // Volumetric mode: composite a sampled layer stack front-to-back along
     // tilted view rays with a transfer function. Output is an already-
@@ -2355,6 +2360,16 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         cam.tiltDeg = ctx.compositeSettings.params.camTiltDeg;
         cam.perspective = ctx.compositeSettings.params.camPerspective;
         return cam;
+    };
+
+    auto flattenedVolumetricMargins = [&](int outW, int outH) {
+        const auto& cs = ctx.compositeSettings;
+        const int front = std::max(0, cs.layersFront);
+        const int behind = std::max(0, cs.layersBehind);
+        const float wScale = std::max(cs.params.wScale, 0.01f);
+        return vc3d::volumetric::computeSlabMargins(
+            volumetricCamera(), front + behind + 1, -behind,
+            ctx.scale * wScale, outW, outH);
     };
 
     auto compositeVolumetricStack = [&](const std::vector<cv::Mat_<uint8_t>>& layerValues,
@@ -2570,9 +2585,16 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
 
     if ((ctx.surfaceCache || ctx.overlaySurfaceCache) && ctx.scale > 0.0f) {
         if (ctx.surfaceCache) {
+            auto margins = vc3d::volumetric::SlabMargins{};
+            if (flattenedVolumetricActive)
+                margins = flattenedVolumetricMargins(ctx.fbW, ctx.fbH);
             ctx.surfaceCache->requestView(
-                ctx.startLevel, prepassUMin, prepassVMin, double(ctx.scale),
-                ctx.fbW, ctx.fbH);
+                ctx.startLevel,
+                prepassUMin - double(margins.left) / double(ctx.scale),
+                prepassVMin - double(margins.top) / double(ctx.scale),
+                double(ctx.scale),
+                ctx.fbW + margins.left + margins.right,
+                ctx.fbH + margins.top + margins.bottom);
         }
         if (overlayActive && ctx.overlaySurfaceCache) {
             ctx.overlaySurfaceCache->requestView(
@@ -2807,10 +2829,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         // exact expanded border the camera needs; the composite output stays
         // screen-sized. (The extra gen only happens when the border is
         // nonzero, i.e. the camera is actually tilted or perspective.)
-        const float wScale = std::max(cs.params.wScale, 0.01f);
-        const auto margins = vc3d::volumetric::computeSlabMargins(
-            volumetricCamera(), numLayers, zStart, ctx.scale * wScale,
-            coords.cols, coords.rows);
+        const auto margins = flattenedVolumetricMargins(coords.cols, coords.rows);
         cv::Mat_<cv::Vec3f> stackCoords = coords;
         cv::Mat_<cv::Vec3f> stackNormals = normals;
         if (margins.any()) {
@@ -2952,12 +2971,49 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         if (needGen)
             std::tie(coords, normals) = generatedSurfaceCoords(needSurfaceNormals);
         if (baseCacheUsable) {
-            // A bilinear resample in (u, v) plus a linear blend across two w
-            // slices. Composite is a reduction over slices that are already
-            // resident, so it costs no extra fetches and no extra tiles.
             if (profilePhases) phaseTimer.restart();
-            ctx.surfaceCache->sampleView(ctx.startLevel, uMin, vMin, double(ctx.scale),
-                                         double(ctx.zOff), cacheComposite, values, coverage);
+            if (flattenedVolumetricActive) {
+                // SurfaceCache stores the raw (u,v,w) slab. Resample each
+                // requested w plane over the camera's expanded input window,
+                // then use the same RGB ray compositor as the direct-volume
+                // path. Camera/TF changes now reuse cached voxels; only an
+                // out-of-band slab falls back to volume chunks below.
+                const auto& cs = ctx.compositeSettings;
+                const int front = std::max(0, cs.layersFront);
+                const int behind = std::max(0, cs.layersBehind);
+                const int numLayers = front + behind + 1;
+                const int zStart = -behind;
+                const double zStep = cs.reverseDirection ? -1.0 : 1.0;
+                const auto margins = flattenedVolumetricMargins(ctx.fbW, ctx.fbH);
+                const int sampleRows = ctx.fbH + margins.top + margins.bottom;
+                const int sampleCols = ctx.fbW + margins.left + margins.right;
+                const double sampleUMin = uMin - double(margins.left) / double(ctx.scale);
+                const double sampleVMin = vMin - double(margins.top) / double(ctx.scale);
+
+                CompositeRenderSettings singleLayer;
+                std::vector<cv::Mat_<uint8_t>> layerValues;
+                std::vector<cv::Mat_<uint8_t>> layerCoverage;
+                layerValues.reserve(numLayers);
+                layerCoverage.reserve(numLayers);
+                for (int i = 0; i < numLayers; ++i) {
+                    layerValues.emplace_back(sampleRows, sampleCols, uint8_t(0));
+                    layerCoverage.emplace_back(sampleRows, sampleCols, uint8_t(0));
+                    const double w = double(ctx.zOff) + double(zStart + i) * zStep;
+                    ctx.surfaceCache->sampleView(
+                        ctx.startLevel, sampleUMin, sampleVMin, double(ctx.scale), w,
+                        singleLayer, layerValues.back(), layerCoverage.back());
+                }
+                compositeVolumetricStack(layerValues, layerCoverage, zStart,
+                                         /*isFlattenedView=*/true, margins,
+                                         colorValues, coverage);
+            } else {
+                // A bilinear resample in (u, v) plus a linear blend across two w
+                // slices. Composite is a reduction over slices that are already
+                // resident, so it costs no extra fetches and no extra tiles.
+                ctx.surfaceCache->sampleView(ctx.startLevel, uMin, vMin, double(ctx.scale),
+                                             double(ctx.zOff), cacheComposite,
+                                             values, coverage);
+            }
             if (profilePhases) phaseSampleMs += phaseTimer.elapsed();
         }
         if (overlayActive && overlayCacheUsable) {
