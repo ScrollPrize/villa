@@ -147,10 +147,7 @@ FiberletChunkGraphSource::FiberletChunkGraphSource(
         anchorDataset_->metadata().maximumEndpointReachCoordinateUnitsZYX != fiberletDataset_->metadata().maximumEndpointReachCoordinateUnitsZYX ||
         anchorDataset_->metadata().spatialChunkSideBaseVoxels != fiberletDataset_->metadata().spatialChunkSideBaseVoxels ||
         anchorDataset_->metadata().predictionToBaseScale != fiberletDataset_->metadata().predictionToBaseScale ||
-        anchorDataset_->metadata().fiberManifest != fiberletDataset_->metadata().fiberManifest ||
-        anchorDataset_->metadata().fiberManifestHash != fiberletDataset_->metadata().fiberManifestHash ||
-        anchorDataset_->metadata().normalManifest != fiberletDataset_->metadata().normalManifest ||
-        anchorDataset_->metadata().normalManifestHash != fiberletDataset_->metadata().normalManifestHash)
+        anchorDataset_->metadata().sources != fiberletDataset_->metadata().sources)
         throw std::invalid_argument("fiberlet chunk graph datasets are incompatible");
     if (!anchorView_) {
         anchorView_ = [](const vc::render::ChunkKey&, std::shared_ptr<const FiberletAnchorChunkPayload> payload) {

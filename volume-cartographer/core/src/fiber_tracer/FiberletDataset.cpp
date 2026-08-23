@@ -111,11 +111,93 @@ std::array<std::uint8_t, 32> parseFingerprint(const std::string& value)
     return result;
 }
 
+std::string stringFingerprint(std::string_view value)
+{
+    std::uint64_t hash = 14695981039346656037ULL;
+    for (const unsigned char byte : value) {
+        hash ^= byte;
+        hash *= 1099511628211ULL;
+    }
+    constexpr char digits[] = "0123456789abcdef";
+    std::string result = "fnv1a64:";
+    for (int shift = 60; shift >= 0; shift -= 4)
+        result.push_back(digits[(hash >> shift) & 0x0f]);
+    return result;
+}
+
+std::array<std::uint8_t, 32> datasetFingerprint(std::string_view value)
+{
+    std::array<std::uint8_t, 32> result{};
+    for (std::size_t lane = 0; lane < 4; ++lane) {
+        std::uint64_t hash = 14695981039346656037ULL ^
+            (0x9e3779b97f4a7c15ULL * static_cast<std::uint64_t>(lane + 1));
+        for (const unsigned char byte : value) {
+            hash ^= byte;
+            hash *= 1099511628211ULL;
+        }
+        for (std::size_t byte = 0; byte < 8; ++byte)
+            result[lane * 8 + byte] =
+                static_cast<std::uint8_t>(hash >> (byte * 8));
+    }
+    return result;
+}
+
+json algorithmIdentityJson(const FiberletDatasetMetadata& metadata)
+{
+    return {
+        {"identity_version", 2},
+        {"dataset_kind", kindName(metadata.kind)},
+        {"encoding_profile", profileName(metadata.profile)},
+        {"chunk_grid_shape_zyx", metadata.chunkGridShapeZYX},
+        {"coordinate_origin_zyx", metadata.coordinateOriginZYX},
+        {"coordinate_units_per_chunk_zyx", metadata.coordinateUnitsPerChunkZYX},
+        {"maximum_endpoint_reach_coordinate_units_zyx", metadata.maximumEndpointReachCoordinateUnitsZYX},
+        {"spatial_chunk_side_base", metadata.spatialChunkSideBaseVoxels},
+        {"coordinate_bits", metadata.coordinateBits},
+        {"delta_bits", metadata.deltaBits},
+        {"route_count_bits", metadata.routeCountBits},
+        {"route_lattice_bits", metadata.routeLatticeBits},
+        {"cost_bits", metadata.costBits},
+        {"position_quantum_base", metadata.positionQuantumBaseVoxels == 0
+             ? json(nullptr)
+             : json(metadata.positionQuantumBaseVoxels)},
+        {"prediction_to_base", metadata.predictionToBaseScale},
+        {"processing", metadata.processing},
+    };
+}
+
+void validateMetadata(const FiberletDatasetMetadata& metadata)
+{
+    if (!metadata.sources.is_object() || !metadata.processing.is_object())
+        throw std::invalid_argument(
+            "fiberlet sources and processing metadata must be JSON objects");
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        if (metadata.chunkGridShapeZYX[axis] <= 0 ||
+            metadata.coordinateUnitsPerChunkZYX[axis] <= 0 ||
+            metadata.maximumEndpointReachCoordinateUnitsZYX[axis] < 0) {
+            throw std::invalid_argument(
+                "fiberlet dataset grid or coordinate chunk size is invalid");
+        }
+    }
+    auto canonical = metadata;
+    canonical.algorithmFingerprint = stringFingerprint(
+        algorithmIdentityJson(canonical).dump());
+    canonical.datasetFingerprint = datasetFingerprint(json{
+        {"algorithm", algorithmIdentityJson(canonical)},
+        {"sources", canonical.sources},
+    }.dump());
+    if (metadata.algorithmFingerprint != canonical.algorithmFingerprint ||
+        metadata.datasetFingerprint != canonical.datasetFingerprint) {
+        throw std::invalid_argument(
+            "fiberlet metadata fingerprints do not match its structured identity");
+    }
+}
+
 json metadataJson(const FiberletDatasetMetadata& metadata)
 {
     return {
         {"vc_format", "fiberlet_dataset"},
-        {"format_version", 1},
+        {"format_version", 2},
         {"dataset_kind", kindName(metadata.kind)},
         {"encoding_profile", profileName(metadata.profile)},
         {"chunk_grid_shape_zyx", metadata.chunkGridShapeZYX},
@@ -132,10 +214,8 @@ json metadataJson(const FiberletDatasetMetadata& metadata)
         {"position_quantum_base", metadata.positionQuantumBaseVoxels == 0 ? json(nullptr) : json(metadata.positionQuantumBaseVoxels)},
         {"prediction_to_base", metadata.predictionToBaseScale},
         {"algorithm_fingerprint", metadata.algorithmFingerprint},
-        {"fiber_manifest", metadata.fiberManifest},
-        {"fiber_manifest_hash", metadata.fiberManifestHash},
-        {"normal_manifest", metadata.normalManifest},
-        {"normal_manifest_hash", metadata.normalManifestHash},
+        {"sources", metadata.sources},
+        {"processing", metadata.processing},
         {"build_state", "partial"},
     };
 }
@@ -161,10 +241,8 @@ FiberletDatasetMetadata parseMetadata(const json& value)
         "position_quantum_base",
         "prediction_to_base",
         "algorithm_fingerprint",
-        "fiber_manifest",
-        "fiber_manifest_hash",
-        "normal_manifest",
-        "normal_manifest_hash",
+        "sources",
+        "processing",
         "build_state"};
     if (!value.is_object() || value.size() != required.size())
         throw std::invalid_argument("fiberlet dataset metadata has unknown or missing fields");
@@ -172,7 +250,9 @@ FiberletDatasetMetadata parseMetadata(const json& value)
         if (!value.contains(name))
             throw std::invalid_argument("fiberlet dataset metadata is missing " + name);
     }
-    if (value.at("vc_format") != "fiberlet_dataset" || value.at("format_version") != 1 || value.at("build_state") != "partial")
+    if (value.at("vc_format") != "fiberlet_dataset" ||
+        value.at("format_version") != 2 ||
+        value.at("build_state") != "partial")
         throw std::invalid_argument("fiberlet dataset metadata header is invalid");
     FiberletDatasetMetadata result;
     result.kind = parseKind(value.at("dataset_kind").get<std::string>());
@@ -191,10 +271,9 @@ FiberletDatasetMetadata parseMetadata(const json& value)
     result.positionQuantumBaseVoxels = value.at("position_quantum_base").is_null() ? 0 : value.at("position_quantum_base").get<std::uint32_t>();
     result.predictionToBaseScale = value.at("prediction_to_base").get<double>();
     result.algorithmFingerprint = value.at("algorithm_fingerprint").get<std::string>();
-    result.fiberManifest = value.at("fiber_manifest").get<std::string>();
-    result.fiberManifestHash = value.at("fiber_manifest_hash").get<std::string>();
-    result.normalManifest = value.at("normal_manifest").get<std::string>();
-    result.normalManifestHash = value.at("normal_manifest_hash").get<std::string>();
+    result.sources = value.at("sources");
+    result.processing = value.at("processing");
+    validateMetadata(result);
     return result;
 }
 
@@ -574,6 +653,19 @@ void requireMatchingFiberletPair(
 
 }  // namespace
 
+void finalizeFiberletDatasetIdentity(FiberletDatasetMetadata& metadata)
+{
+    if (!metadata.sources.is_object() || !metadata.processing.is_object())
+        throw std::invalid_argument(
+            "fiberlet sources and processing metadata must be JSON objects");
+    metadata.algorithmFingerprint = stringFingerprint(
+        algorithmIdentityJson(metadata).dump());
+    metadata.datasetFingerprint = datasetFingerprint(json{
+        {"algorithm", algorithmIdentityJson(metadata)},
+        {"sources", metadata.sources},
+    }.dump());
+}
+
 FiberletChunkDataset::FiberletChunkDataset(std::filesystem::path root, FiberletDatasetMetadata metadata)
     : root_(std::move(root)), metadata_(std::move(metadata))
 {
@@ -581,13 +673,7 @@ FiberletChunkDataset::FiberletChunkDataset(std::filesystem::path root, FiberletD
 
 std::shared_ptr<FiberletChunkDataset> FiberletChunkDataset::createOrOpen(std::filesystem::path root, const FiberletDatasetMetadata& metadata)
 {
-    if (metadata.algorithmFingerprint.empty())
-        throw std::invalid_argument("fiberlet algorithm fingerprint must not be empty");
-    for (std::size_t axis = 0; axis < 3; ++axis) {
-        if (metadata.chunkGridShapeZYX[axis] <= 0 || metadata.coordinateUnitsPerChunkZYX[axis] <= 0 ||
-            metadata.maximumEndpointReachCoordinateUnitsZYX[axis] < 0)
-            throw std::invalid_argument("fiberlet dataset grid or coordinate chunk size is invalid");
-    }
+    validateMetadata(metadata);
     const auto expected = metadataJson(metadata);
     if (std::filesystem::exists(root / ".zattrs")) {
         const auto group = json::parse(readText(root / ".zgroup"));
@@ -615,6 +701,29 @@ std::shared_ptr<FiberletChunkDataset> FiberletChunkDataset::createOrOpen(std::fi
         removeLegacyBookkeeping(root);
     }
     return std::shared_ptr<FiberletChunkDataset>(new FiberletChunkDataset(std::move(root), metadata));
+}
+
+std::shared_ptr<FiberletChunkDataset> FiberletChunkDataset::openExisting(
+    std::filesystem::path root)
+{
+    if (!std::filesystem::is_regular_file(root / ".zattrs") ||
+        !std::filesystem::is_regular_file(root / ".zgroup")) {
+        throw std::invalid_argument(
+            "fiberlet dataset is missing .zgroup or .zattrs metadata");
+    }
+    const auto group = json::parse(readText(root / ".zgroup"));
+    if (group != json{{"zarr_format", 2}})
+        throw std::invalid_argument("fiberlet dataset .zgroup metadata is invalid");
+    auto metadata = parseMetadata(json::parse(readText(root / ".zattrs")));
+    for (const auto kind : datasetKinds(metadata.kind)) {
+        const auto storedArray = json::parse(
+            readText(arrayDirectory(root, kind) / ".zarray"));
+        if (storedArray != arrayMetadata(metadata, kind))
+            throw std::invalid_argument(
+                "fiberlet dataset .zarray metadata is invalid");
+    }
+    return std::shared_ptr<FiberletChunkDataset>(
+        new FiberletChunkDataset(std::move(root), std::move(metadata)));
 }
 
 const std::filesystem::path& FiberletChunkDataset::root() const noexcept

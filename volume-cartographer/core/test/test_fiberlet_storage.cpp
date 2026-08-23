@@ -536,8 +536,7 @@ TEST_CASE("Fiberlet sparse dataset generates, publishes, and reuses opaque chunk
     metadata.routeCountBits = 8;
     metadata.routeLatticeBits = 8;
     metadata.costBits = 32;
-    metadata.algorithmFingerprint = "test-algorithm";
-    metadata.datasetFingerprint[0] = 12;
+    finalizeFiberletDatasetIdentity(metadata);
     auto dataset = FiberletChunkDataset::createOrOpen(root, metadata);
     std::atomic<int> generated{0};
     std::atomic<int> generatedResolutions{0};
@@ -598,6 +597,10 @@ TEST_CASE("Fiberlet sparse dataset generates, publishes, and reuses opaque chunk
     CHECK(secondPayload->anchors.front().positionPredictionXYZ == firstPayload->anchors.front().positionPredictionXYZ);
     CHECK(secondPayload->anchors.front().fittedAxisXYZ == firstPayload->anchors.front().fittedAxisXYZ);
 
+    const auto selfDescribing = FiberletChunkDataset::openExisting(root);
+    CHECK(selfDescribing->metadata().algorithmFingerprint == metadata.algorithmFingerprint);
+    CHECK(selfDescribing->metadata().datasetFingerprint == metadata.datasetFingerprint);
+
     std::ifstream attributesInput(root / ".zattrs");
     auto attributes = nlohmann::json::parse(attributesInput);
     attributesInput.close();
@@ -608,6 +611,37 @@ TEST_CASE("Fiberlet sparse dataset generates, publishes, and reuses opaque chunk
     }
     CHECK_THROWS_AS(FiberletChunkDataset::createOrOpen(root, metadata), std::invalid_argument);
     std::filesystem::remove_all(root);
+}
+
+TEST_CASE("Fiberlet dataset identity is path-independent and source-sensitive")
+{
+    FiberletDatasetMetadata first;
+    first.kind = FiberletDatasetKind::Combined;
+    first.profile = FiberletStorageProfile::CompactDirectionsFixedCost;
+    first.chunkGridShapeZYX = {2, 3, 4};
+    first.coordinateUnitsPerChunkZYX = {8, 8, 8};
+    first.maximumEndpointReachCoordinateUnitsZYX = {4, 4, 4};
+    first.sources = {
+        {"source_volume", {{"sample_id", "PHerc0001"}, {"volume_id", "20260101000000"}}},
+        {"fiber_prediction", {{"run_uuid", "fiber-run"}, {"manifest_sha256", "fiber-sha"}}},
+        {"normal_prediction", {{"run_uuid", "normal-run"}, {"manifest_sha256", "normal-sha"}}},
+    };
+    first.processing = {
+        {"anchors", {{"cell_size_prediction", 8}, {"threshold", 0.5}}},
+        {"storage", {{"chunk_side_base", 512}}},
+    };
+    finalizeFiberletDatasetIdentity(first);
+
+    auto relocated = first;
+    finalizeFiberletDatasetIdentity(relocated);
+    CHECK(relocated.algorithmFingerprint == first.algorithmFingerprint);
+    CHECK(relocated.datasetFingerprint == first.datasetFingerprint);
+
+    auto otherSource = first;
+    otherSource.sources["fiber_prediction"]["run_uuid"] = "other-fiber-run";
+    finalizeFiberletDatasetIdentity(otherSource);
+    CHECK(otherSource.algorithmFingerprint == first.algorithmFingerprint);
+    CHECK(otherSource.datasetFingerprint != first.datasetFingerprint);
 }
 
 TEST_CASE("Fiberlet single-cell tube test agrees with the canonical selector")
@@ -645,7 +679,7 @@ TEST_CASE("Fiberlet prefix and routes become visible only as a complete payload 
     metadata.routeCountBits = 8;
     metadata.routeLatticeBits = 8;
     metadata.costBits = 32;
-    metadata.algorithmFingerprint = "pair-test";
+    finalizeFiberletDatasetIdentity(metadata);
     auto dataset = FiberletChunkDataset::createOrOpen(root, metadata);
     const vc::render::ChunkKey prefixKey{0, 0, 0, 0};
     const vc::render::ChunkKey routeKey{1, 0, 0, 0};
@@ -783,8 +817,7 @@ TEST_CASE("Combined fiberlet dataset exposes complete sparse graph facets")
     metadata.routeCountBits = 8;
     metadata.routeLatticeBits = 8;
     metadata.costBits = 16;
-    metadata.algorithmFingerprint = "combined-test";
-    metadata.datasetFingerprint[0] = 99;
+    finalizeFiberletDatasetIdentity(metadata);
     auto dataset = FiberletChunkDataset::createOrOpen(root, metadata);
     const vc::render::ChunkKey owner{0, 0, 0, 0};
     dataset->configureExpectedChunks(std::span<const vc::render::ChunkKey>(&owner, 1));
@@ -883,7 +916,7 @@ TEST_CASE("Combined fiberlet dataset with no expected chunks is complete from fo
     metadata.routeCountBits = 8;
     metadata.routeLatticeBits = 8;
     metadata.costBits = 16;
-    metadata.algorithmFingerprint = "combined-empty-test";
+    finalizeFiberletDatasetIdentity(metadata);
     auto dataset = FiberletChunkDataset::createOrOpen(root, metadata);
     dataset->configureExpectedChunks(std::span<const vc::render::ChunkKey>{});
     CHECK(dataset->datasetComplete());
@@ -936,11 +969,10 @@ TEST_CASE("Fiberlet chunk graph loads complete cross-chunk adjacency and routes"
     anchorsMetadata.routeCountBits = 8;
     anchorsMetadata.routeLatticeBits = 8;
     anchorsMetadata.costBits = 32;
-    anchorsMetadata.algorithmFingerprint = "graph-test";
-    anchorsMetadata.datasetFingerprint[0] = 77;
+    finalizeFiberletDatasetIdentity(anchorsMetadata);
     auto fiberletsMetadata = anchorsMetadata;
     fiberletsMetadata.kind = FiberletDatasetKind::Fiberlets;
-    fiberletsMetadata.datasetFingerprint[0] = 78;
+    finalizeFiberletDatasetIdentity(fiberletsMetadata);
 
     const auto first = key(7, 15, 15);
     const auto second = key(8, 7, 7);

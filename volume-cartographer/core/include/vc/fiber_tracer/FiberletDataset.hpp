@@ -13,6 +13,8 @@
 #include <string>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 namespace vc::fiber_tracer
 {
 
@@ -89,11 +91,17 @@ struct FiberletDatasetMetadata {
     std::uint32_t positionQuantumBaseVoxels = 0;
     double predictionToBaseScale = 1.0;
     std::string algorithmFingerprint;
-    std::string fiberManifest;
-    std::string fiberManifestHash;
-    std::string normalManifest;
-    std::string normalManifestHash;
+    // Stable producer/data identities and hashes. Runtime filesystem paths are
+    // deliberately excluded from both this object and its fingerprints.
+    nlohmann::json sources = nlohmann::json::object();
+    // Complete effective scientific processing, selection, layout, storage,
+    // and codec settings required to interpret or reproduce this dataset.
+    nlohmann::json processing = nlohmann::json::object();
 };
+
+// Canonically derive the algorithm and dataset fingerprints from the
+// structured metadata. Call this after all effective values are resolved.
+void finalizeFiberletDatasetIdentity(FiberletDatasetMetadata& metadata);
 
 class FiberletChunkDataset
 {
@@ -105,6 +113,10 @@ public:
     };
 
     static std::shared_ptr<FiberletChunkDataset> createOrOpen(std::filesystem::path root, const FiberletDatasetMetadata& metadata);
+    // Open and validate an existing dataset using its authoritative metadata;
+    // callers do not supply a duplicate configuration.
+    static std::shared_ptr<FiberletChunkDataset> openExisting(
+        std::filesystem::path root);
 
     [[nodiscard]] const std::filesystem::path& root() const noexcept;
     [[nodiscard]] const FiberletDatasetMetadata& metadata() const noexcept;

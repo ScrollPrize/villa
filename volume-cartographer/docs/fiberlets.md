@@ -828,8 +828,24 @@ entire stored prediction volume without a reference fiber:
 volume-cartographer/build/bin/vc_fiberlets preprocess-volume \
   /path/to/fiber.lasagna.json /path/to/fiberlets.zarr \
   --normal-manifest /path/to/normals.lasagna.json \
+  --source-context /path/to/stable-source-context.json \
   --threads 32
 ```
+
+`--source-context` supplies portable producer identity (sample/volume, manager
+run UUIDs, model/level identities, and manifest SHA-256 values). It must not
+contain runtime manifest, cache, or output paths. The combined dataset metadata
+schema is version 2: it persists structured `sources` and the complete effective
+processing/coordinate/layout/storage/codec contract. `openExisting()` builds a
+reader from that metadata alone and rejects missing, unknown, or internally
+inconsistent settings.
+
+`algorithm_fingerprint` canonically hashes the complete scientific processing
+contract. `dataset_fingerprint` additionally hashes stable source identities
+and manifest content hashes. Consequently relocating identical manifests does
+not change either identity, while changing source content does. Executable
+paths/hashes and host details remain external audit provenance rather than
+scientific dataset identity.
 
 The command retains two outputs. The default intermediate anchor cache is
 `<output-stem>.anchors.zarr`; override it with `--anchor-cache PATH`. The final

@@ -124,6 +124,7 @@ struct CliOptions {
     std::optional<std::string> quantizationScenario;
     std::filesystem::path anchorCacheRoot;
     std::filesystem::path fiberletCacheRoot;
+    std::filesystem::path sourceContextPath;
     bool eagerGraphReplay = false;
     std::size_t storageCompressionChunks = 0;
     std::uint64_t storageCompressionSeed = 1;
@@ -171,6 +172,7 @@ void usage(const char* executable)
               << "  --threads N                   decode/search workers [hardware]\n"
               << "  --cache-gib N                 decoded chunk cache budget [0.5]\n"
               << "  --remote-cache-dir PATH       required for direct remote manifests\n"
+              << "  --source-context PATH         stable manager/Atlas source identities (preprocess-volume)\n"
               << "  --stats                       print detailed path/replay diagnostics\n"
               << "  --base-voxel-size-um N        optional physical reporting metadata\n\n"
               << "Anchor options:\n"
@@ -415,6 +417,10 @@ CliOptions parseArgs(int argc, char** argv)
             options.decodedCacheBytes = static_cast<size_t>(gib * 1024.0 * 1024.0 * 1024.0);
         } else if (argument == "--remote-cache-dir") {
             options.remoteCacheDirectory = valueAfter(index, argc, argv, "remote-cache-dir");
+        } else if (argument == "--source-context" &&
+                   isWholeVolumeCommand(options.command)) {
+            options.sourceContextPath =
+                valueAfter(index, argc, argv, "source-context");
         } else if (argument == "--base-voxel-size-um") {
             options.baseVoxelSizeUm = parseDouble(valueAfter(index, argc, argv, "base-voxel-size-um"), "base-voxel-size-um");
         } else if (argument == "--normal-manifest" && needsPathExtraction(options.command)) {
@@ -743,19 +749,40 @@ std::string stringHash(const std::string& value)
 
 std::string datasetLocator(const vc::lasagna::LasagnaDataset& dataset);
 
-std::array<std::uint8_t, 32> storageFingerprint(const std::string& value)
+nlohmann::json fiberletSourceIdentity(
+    const CliOptions& options,
+    const vc::lasagna::LasagnaDataset& fiberDataset,
+    const vc::lasagna::LasagnaDataset& normalDataset)
 {
-    std::array<std::uint8_t, 32> result{};
-    for (std::size_t lane = 0; lane < 4; ++lane) {
-        std::uint64_t hash = 14695981039346656037ULL ^ (0x9e3779b97f4a7c15ULL * static_cast<std::uint64_t>(lane + 1));
-        for (const unsigned char byte : value) {
-            hash ^= byte;
-            hash *= 1099511628211ULL;
+    nlohmann::json sources = nlohmann::json::object();
+    if (!options.sourceContextPath.empty()) {
+        std::ifstream input(options.sourceContextPath);
+        if (!input)
+            fail("cannot open --source-context " +
+                 options.sourceContextPath.string());
+        input >> sources;
+        if (!sources.is_object())
+            fail("--source-context must contain one JSON object");
+        for (const auto* field : {
+                 "source_volume", "fiber_prediction", "normal_prediction"}) {
+            if (!sources.contains(field) || !sources.at(field).is_object())
+                fail(std::string("--source-context is missing object '") +
+                     field + "'");
         }
-        for (std::size_t byte = 0; byte < 8; ++byte)
-            result[lane * 8 + byte] = static_cast<std::uint8_t>(hash >> (byte * 8));
+    } else {
+        // Manual native runs remain location-independent even without manager
+        // catalog identities. The content hashes are stable identifiers.
+        sources = {
+            {"source_volume", {{"identity", "manifest_hashes_only"}}},
+            {"fiber_prediction", nlohmann::json::object()},
+            {"normal_prediction", nlohmann::json::object()},
+        };
     }
-    return result;
+    sources["fiber_prediction"]["manifest_content_hash"] =
+        fileHash(fiberDataset.manifest().manifestPath);
+    sources["normal_prediction"]["manifest_content_hash"] =
+        fileHash(normalDataset.manifest().manifestPath);
+    return sources;
 }
 
 vc::fiber_tracer::FiberletDatasetMetadata replayDatasetMetadata(
@@ -793,48 +820,6 @@ vc::fiber_tracer::FiberletDatasetMetadata replayDatasetMetadata(
         for (const auto coordinate : offset)
             maximumReach = std::max(maximumReach, static_cast<std::int64_t>(std::abs(coordinate)));
     }
-    std::ostringstream identity;
-    identity << std::setprecision(17) << "fiber=" << datasetLocator(fiberDataset) << ";fiber_hash=" << fileHash(fiberDataset.manifest().manifestPath)
-             << ";normal=" << datasetLocator(normalDataset) << ";normal_hash=" << fileHash(normalDataset.manifest().manifestPath)
-             << ";grid=" << grid.shapeZYX[0] << ',' << grid.shapeZYX[1] << ',' << grid.shapeZYX[2] << ";scale=" << grid.predictionToBaseScale
-             << ";cell=" << options.anchors.cellSizePredictionVoxels << ";anchor_sigma=" << options.anchors.gaussianSigmaPredictionVoxels
-             << ";peak_sigma=" << options.anchors.peakSigmaPredictionVoxels << ";axial_sigma=" << options.anchors.peakAxialSigmaPredictionVoxels
-             << ";peak_step=" << options.anchors.peakGridStepPredictionVoxels << ";gradient=" << options.anchors.peakGradientWeight
-             << ";window=" << options.anchors.localWindowRadiusPredictionVoxels << ";path_radius=" << options.paths.cellRadius
-             << ";path_margin=" << options.paths.neighborhoodMarginCells << ";long_step=" << options.paths.longitudinalStepPredictionVoxels
-             << ";transverse_step=" << options.paths.transverseStepPredictionVoxels << ";endpoint_angle=" << options.paths.maximumEndpointAngleDegrees
-             << ";prediction_angle=" << options.paths.maximumPredictionDeviationDegrees
-             << ";corridor=" << options.paths.corridorRadiusPredictionVoxels << ";invalid=" << options.paths.invalidPredictionCostPerVoxel
-             << ";smooth=" << options.paths.smoothnessWeight << ',' << options.paths.smoothnessNormalWeight << ','
-             << options.paths.smoothnessTangentWeight << ',' << options.paths.smoothnessFreeAngleDegrees << ";storage_schema=float_cache_v2"
-             << ";selection=" << selectionIdentity << ";corridor_radius_base=" << corridorRadiusBaseVoxels
-             << ";corridor_reference=" << corridorReferenceBase.size();
-    identity << ";anchor_gradient_reliability=" << options.anchors.peakGradientReliabilityScale
-             << ";anchor_gaussian_cutoff=" << options.anchors.gaussianCutoffSigmas
-             << ";anchor_axial_support=" << options.anchors.axialSupportHalfWidthPredictionVoxels
-             << ";anchor_position_tolerance=" << options.anchors.positionConvergenceTolerancePredictionVoxels
-             << ";anchor_nms=" << options.anchors.nmsMaximumAngleDegrees << ',' << options.anchors.nmsTransverseRadiusPredictionVoxels << ','
-             << options.anchors.nmsLongitudinalRadiusPredictionVoxels << ";anchor_presence_floor=" << options.anchors.observationPresenceFloor
-             << ";anchor_minimum_support=" << options.anchors.minimumAlignedSupport
-             << ";anchor_robust=" << options.anchors.robustMaximumTrimMassFraction << ',' << options.anchors.robustMadMultiplier << ','
-             << options.anchors.robustMinimumAngleDegrees << ";anchor_merge=" << options.anchors.mergeMaximumAngleDegrees << ','
-             << options.anchors.mergeMaximumAbsoluteObjectiveLoss << ',' << options.anchors.mergeMaximumRelativeObjectiveLoss
-             << ";anchor_seed_limit=" << options.anchors.maximumSeedCount << ";anchor_iteration_limit=" << options.anchors.maximumIterations
-             << ";anchor_convergence=" << options.anchors.convergenceTolerance;
-    if (storageProfile != vc::fiber_tracer::FiberletStorageProfile::Float32Cache) {
-        identity << ";storage_profile=" << static_cast<int>(storageProfile);
-    }
-    if (kind != vc::fiber_tracer::FiberletDatasetKind::Anchors)
-        identity << ";route_cost_density_schema=sqrt_u16_max256_v1";
-    if (cacheProfile.enabled()) {
-        identity << ";evaluation_quantization_v=2"
-                 << ";position_quantum_base=" << cacheProfile.geometry.positionQuantumBaseVoxels
-                 << ";compact_directions=" << (cacheProfile.geometry.compactDirections ? 1 : 0) << ";cost_bits=" << cacheProfile.compatibilityCostTagBits
-                 << ";compact_owner_chunk_base=" << cacheProfile.storageChunkSideBaseVoxels;
-    }
-    for (const auto& point : corridorReferenceBase)
-        identity << ';' << point[0] << ',' << point[1] << ',' << point[2];
-    const auto identityText = identity.str();
     vc::fiber_tracer::FiberletDatasetMetadata metadata;
     metadata.kind = kind;
     metadata.profile = storageProfile;
@@ -842,17 +827,95 @@ vc::fiber_tracer::FiberletDatasetMetadata replayDatasetMetadata(
     metadata.coordinateOriginZYX = {0, 0, 0};
     metadata.coordinateUnitsPerChunkZYX = {unitsPerChunk, unitsPerChunk, unitsPerChunk};
     metadata.maximumEndpointReachCoordinateUnitsZYX = {maximumReach, maximumReach, maximumReach};
-    metadata.datasetFingerprint = storageFingerprint(identityText);
     metadata.spatialChunkSideBaseVoxels = static_cast<std::uint32_t>(options.storageChunkSideBaseVoxels);
     if (storageProfile == vc::fiber_tracer::FiberletStorageProfile::CompactDirectionsFixedCost) {
         metadata.costBits = 16;
     }
     metadata.predictionToBaseScale = grid.predictionToBaseScale;
-    metadata.algorithmFingerprint = stringHash(identityText);
-    metadata.fiberManifest = datasetLocator(fiberDataset);
-    metadata.fiberManifestHash = fileHash(fiberDataset.manifest().manifestPath);
-    metadata.normalManifest = datasetLocator(normalDataset);
-    metadata.normalManifestHash = fileHash(normalDataset.manifest().manifestPath);
+    metadata.sources = fiberletSourceIdentity(
+        options, fiberDataset, normalDataset);
+    nlohmann::json corridor = nlohmann::json::array();
+    for (const auto& point : corridorReferenceBase)
+        corridor.push_back({point[0], point[1], point[2]});
+    metadata.processing = {
+        {"contract_version", 2},
+        {"grid", {
+            {"shape_zyx", grid.shapeZYX},
+            {"prediction_to_base", grid.predictionToBaseScale},
+            {"coordinate_order", "zyx_storage_xyz_vectors"},
+        }},
+        {"selection", {
+            {"algorithm", selectionIdentity},
+            {"corridor_radius_base", corridorRadiusBaseVoxels},
+            {"corridor_reference_base_xyz", corridor},
+        }},
+        {"anchors", {
+            {"cell_size_prediction", options.anchors.cellSizePredictionVoxels},
+            {"gaussian_sigma_prediction", options.anchors.gaussianSigmaPredictionVoxels},
+            {"peak_sigma_prediction", options.anchors.peakSigmaPredictionVoxels},
+            {"peak_axial_sigma_prediction", options.anchors.peakAxialSigmaPredictionVoxels},
+            {"peak_grid_step_prediction", options.anchors.peakGridStepPredictionVoxels},
+            {"peak_gradient_weight", options.anchors.peakGradientWeight},
+            {"peak_gradient_reliability_scale", options.anchors.peakGradientReliabilityScale},
+            {"gaussian_cutoff_sigmas", options.anchors.gaussianCutoffSigmas},
+            {"local_window_radius_prediction", options.anchors.localWindowRadiusPredictionVoxels},
+            {"axial_support_half_width_prediction", options.anchors.axialSupportHalfWidthPredictionVoxels},
+            {"position_convergence_tolerance_prediction", options.anchors.positionConvergenceTolerancePredictionVoxels},
+            {"nms_maximum_angle_degrees", options.anchors.nmsMaximumAngleDegrees},
+            {"nms_transverse_radius_prediction", options.anchors.nmsTransverseRadiusPredictionVoxels},
+            {"nms_longitudinal_radius_prediction", options.anchors.nmsLongitudinalRadiusPredictionVoxels},
+            {"observation_presence_floor", options.anchors.observationPresenceFloor},
+            {"minimum_aligned_support", options.anchors.minimumAlignedSupport},
+            {"robust_maximum_trim_mass_fraction", options.anchors.robustMaximumTrimMassFraction},
+            {"robust_mad_multiplier", options.anchors.robustMadMultiplier},
+            {"robust_minimum_angle_degrees", options.anchors.robustMinimumAngleDegrees},
+            {"merge_maximum_angle_degrees", options.anchors.mergeMaximumAngleDegrees},
+            {"merge_maximum_absolute_objective_loss", options.anchors.mergeMaximumAbsoluteObjectiveLoss},
+            {"merge_maximum_relative_objective_loss", options.anchors.mergeMaximumRelativeObjectiveLoss},
+            {"maximum_seed_count", options.anchors.maximumSeedCount},
+            {"maximum_iterations", options.anchors.maximumIterations},
+            {"convergence_tolerance", options.anchors.convergenceTolerance},
+        }},
+        {"paths", {
+            {"cell_radius", options.paths.cellRadius},
+            {"neighborhood_margin_cells", options.paths.neighborhoodMarginCells},
+            {"longitudinal_step_prediction", options.paths.longitudinalStepPredictionVoxels},
+            {"transverse_step_prediction", options.paths.transverseStepPredictionVoxels},
+            {"maximum_endpoint_angle_degrees", options.paths.maximumEndpointAngleDegrees},
+            {"maximum_prediction_deviation_degrees", options.paths.maximumPredictionDeviationDegrees},
+            {"corridor_radius_prediction", options.paths.corridorRadiusPredictionVoxels},
+            {"invalid_prediction_cost_per_voxel", options.paths.invalidPredictionCostPerVoxel},
+            {"smoothness_weight", options.paths.smoothnessWeight},
+            {"smoothness_normal_weight", options.paths.smoothnessNormalWeight},
+            {"smoothness_tangent_weight", options.paths.smoothnessTangentWeight},
+            {"smoothness_free_angle_degrees", options.paths.smoothnessFreeAngleDegrees},
+        }},
+        {"layout", {
+            {"sparse", true},
+            {"chunk_grid_shape_zyx", chunkShape},
+            {"coordinate_units_per_chunk_zyx", metadata.coordinateUnitsPerChunkZYX},
+            {"maximum_endpoint_reach_coordinate_units_zyx", metadata.maximumEndpointReachCoordinateUnitsZYX},
+            {"arrays", {"anchors", "prefix", "routes"}},
+        }},
+        {"storage", {
+            {"profile", static_cast<int>(storageProfile)},
+            {"spatial_chunk_side_base", options.storageChunkSideBaseVoxels},
+            {"coordinate_bits", metadata.coordinateBits},
+            {"delta_bits", metadata.deltaBits},
+            {"route_count_bits", metadata.routeCountBits},
+            {"route_lattice_bits", metadata.routeLatticeBits},
+            {"cost_bits", metadata.costBits},
+            {"position_quantum_base", metadata.positionQuantumBaseVoxels == 0
+                 ? nlohmann::json(nullptr)
+                 : nlohmann::json(metadata.positionQuantumBaseVoxels)},
+            {"compact_directions", cacheProfile.geometry.compactDirections},
+            {"route_cost_density_schema", kind == vc::fiber_tracer::FiberletDatasetKind::Anchors
+                 ? nlohmann::json(nullptr)
+                 : nlohmann::json("sqrt_u16_max256_v1")},
+            {"codec_envelope", "vc_fiberlet_chunk_v2"},
+        }},
+    };
+    vc::fiber_tracer::finalizeFiberletDatasetIdentity(metadata);
     return metadata;
 }
 
@@ -3133,6 +3196,12 @@ int runWholeVolumePreprocessing(
     preprocessor->shutdown();
     (void)vc::core::util::cleanupAtomicWriteTemporaryFiles(anchorRoot);
     (void)vc::core::util::cleanupAtomicWriteTemporaryFiles(options.outputDirectory);
+    auto verifiedDataset = FiberletChunkDataset::openExisting(
+        options.outputDirectory);
+    verifiedDataset->configureExpectedChunks(activeChunks);
+    if (!verifiedDataset->datasetComplete())
+        throw std::runtime_error(
+            "whole-volume Fiberlet output failed its final completeness check");
     std::cout << "fiberlet_preprocess_volume status=completed"
               << " active_chunks=" << activeChunks.size() << " anchor_chunks=" << anchorChunks.size()
               << " resumed_chunks=" << completedOutputs.size()
