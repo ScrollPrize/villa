@@ -1098,7 +1098,7 @@ class FitContext:
 
     def __init__(self, config, *, scroll, paths, interactive_driver=None,
                  progress=None, resume_path=None, resume_step=0,
-                 out_base_dir=None, run_tag=None, run_name=None,
+                 out_base_dir=None, run_dir=None, run_tag=None, run_name=None,
                  cache_dir=None, storage_backend='sparse_cuda',
                  render_volume_scale=16, dist_context=None):
         # config is the explicit FitConfig (or any dict-style mapping of
@@ -1122,6 +1122,8 @@ class FitContext:
         #   resume_path / resume_step - checkpoint to restore and its legacy
         #     explicit step (the checkpoint's own completed_iterations wins);
         #   out_base_dir - parent directory for resolve_output_path();
+        #   run_dir - an exact existing output directory to reuse when a
+        #     headless runner resumes an interrupted fit;
         #   run_tag - optional suffix stamped into the output-directory name
         #     and the final overlay outputs;
         #   run_name - optional experiment-tracking run name appended to the
@@ -1141,6 +1143,7 @@ class FitContext:
         self.resume_path = resume_path or None
         self.resume_step = int(resume_step or 0)
         self.out_base_dir = out_base_dir if out_base_dir is not None else './out'
+        self.run_dir = run_dir or None
         self.run_tag = run_tag or None
         self.run_name = run_name
         self.non_liftable_patch_paths = set()
@@ -4524,6 +4527,11 @@ class FitContext:
         patch count). Both drivers call this between load_host_inputs() and
         build_device_state().
         """
+        if self.run_dir is not None:
+            self.out_path = self.run_dir
+            os.makedirs(self.out_path, exist_ok=True)
+            return self.out_path
+
         out_base_dir = self.out_base_dir
         self.out_path = f'{out_base_dir}/{datetime.date.today()}_{self.scroll_name}_slice-{self.z_begin}-{self.z_end}_{self.num_verified_patches}-patch'
         if self.run_name is not None and not self.run_name.startswith('dummy-'):
@@ -4700,7 +4708,8 @@ class FitContext:
 
 
 def main(config, *, scroll, paths, progress=None, resume_path=None,
-         resume_step=0, out_base_dir=None, run_tag=None, run_name=None,
+         resume_step=0, out_base_dir=None, run_dir=None, run_tag=None,
+         run_name=None,
          cache_dir=None, storage_backend='sparse_cuda',
          render_volume_scale=16, dist_context=None):
     """Run one headless fit over a fresh context (library entry point).
@@ -4717,6 +4726,7 @@ def main(config, *, scroll, paths, progress=None, resume_path=None,
         resume_path=resume_path,
         resume_step=resume_step,
         out_base_dir=out_base_dir,
+        run_dir=run_dir,
         run_tag=run_tag,
         run_name=run_name,
         cache_dir=cache_dir,
@@ -4738,12 +4748,30 @@ def _wandb_init_kwargs(config, mode, environment):
         kwargs.update({
             'id': environment['WANDB_RUN_ID'],
             'name': environment['WANDB_NAME'],
-            'resume': 'never',
+            'resume': ('allow'
+                       if environment.get('FIT_SPIRAL_WANDB_RESUME') == '1'
+                       else 'never'),
         })
         group = environment.get('WANDB_RUN_GROUP')
         if group is not None:
             kwargs['group'] = group
     return kwargs
+
+
+def _finish_wandb_run():
+    """Synchronously release a CLI run without making logging a fit failure."""
+    try:
+        if wandb.run is None:
+            return True
+        wandb.finish()
+    except Exception as exc:
+        print(
+            f'WARNING: could not finish W&B run cleanly: '
+            f'{type(exc).__name__}: {exc}',
+            file=sys.stderr,
+            flush=True)
+        return False
+    return True
 
 
 if __name__ == '__main__':
@@ -4833,6 +4861,7 @@ if __name__ == '__main__':
             resume_path=os.environ.get('FIT_SPIRAL_RESUME_PATH'),
             resume_step=int(os.environ.get('FIT_SPIRAL_RESUME_STEP', '0')),
             out_base_dir=os.environ.get('FIT_SPIRAL_OUT_DIR'),
+            run_dir=os.environ.get('FIT_SPIRAL_RUN_DIR'),
             run_tag=os.environ.get('FIT_SPIRAL_RUN_TAG'),
             run_name=wandb.run.name if wandb.run is not None else None,
             cache_dir=(cli_args.cache
@@ -4843,6 +4872,7 @@ if __name__ == '__main__':
             dist_context=dist_context,
         )
     finally:
+        _finish_wandb_run()
         if cli_progress is not None:
             cli_progress.close()
         maybe_destroy_distributed(dist_context)
