@@ -8231,6 +8231,17 @@ void CWindow::CreateWidgets(void)
         chkAxisOverlays->setChecked(showOverlays);
         connect(chkAxisOverlays, &QCheckBox::toggled, this, &CWindow::onAxisOverlayVisibilityToggled);
     }
+    // Deliberately not persisted: the coordinate frame gizmo is on by default
+    // every session, matching the checkbox's designer state.
+    if (auto* chkCoordinateFrames = ui.chkCoordinateFrames) {
+        connect(chkCoordinateFrames, &QCheckBox::toggled, this, [](bool show) {
+            for (auto* manager : ViewerManager::allManagers()) {
+                if (manager) {
+                    manager->setShowCoordinateFrames(show);
+                }
+            }
+        });
+    }
     if (auto* btnResetRot = ui.btnResetAxisRotations) {
         connect(btnResetRot, &QPushButton::clicked, this, &CWindow::onResetAxisAlignedRotations);
     }

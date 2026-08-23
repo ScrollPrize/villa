@@ -41,6 +41,7 @@
 #include <QTimer>
 #include <QTransform>
 #include <QVBoxLayout>
+#include <QVector3D>
 #include <QtConcurrent/QtConcurrentRun>
 
 #include <algorithm>
@@ -1342,6 +1343,9 @@ void CChunkedVolumeViewer::onSurfaceChangedImpl(const std::string& name, const s
     }
 
     _surfWeak = surf;
+    // The edit paths below can return without submitting a render, so they never
+    // reach syncCameraTransform(); refresh the plane's frame here instead.
+    updateCoordinateFrame();
     if (isSameCurrentSurface && isEditUpdate) {
         _genCacheDirty = true;
         // A plane mutated in place (axis-aligned slice rotation/tilt, line
@@ -1686,6 +1690,32 @@ void CChunkedVolumeViewer::updateScalebarScale()
     _view->setVoxelSize(unitsPerScenePx, unitsPerScenePx, physical);
 }
 
+void CChunkedVolumeViewer::setShowCoordinateFrame(bool show)
+{
+    if (_closing || _showCoordinateFrame == show) {
+        return;
+    }
+    _showCoordinateFrame = show;
+    updateCoordinateFrame();
+    requestDirectPaint();
+}
+
+void CChunkedVolumeViewer::updateCoordinateFrame()
+{
+    if (!_view) {
+        return;
+    }
+    // Showing a world coordinates reference frame indicator in a quad surface
+    // view doesn't make sense. We could show a uv coordinates indicator instead.
+    PlaneSurface* plane = dynamic_cast<PlaneSurface*>(currentSurface());
+    if (!_showCoordinateFrame || !plane) {
+        _view->showCoordinateFrame(false);
+        return;
+    }
+
+    _view->setCoordinateFrame(plane);
+}
+
 void CChunkedVolumeViewer::resizeFramebuffer()
 {
     const QSize vpSize = _view->viewport()->size();
@@ -1766,6 +1796,7 @@ void CChunkedVolumeViewer::syncCameraTransform()
     _camSurfX = _surfacePtrX;
     _camSurfY = _surfacePtrY;
     _camScale = _scale;
+    updateCoordinateFrame();
     updateDisplayedFramebufferMapping();
     updateIntersectionPreviewTransform();
     refreshMeasurementOverlay();
