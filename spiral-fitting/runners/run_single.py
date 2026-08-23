@@ -14,8 +14,10 @@ from numbers import Real
 from statistics import fmean, pstdev
 import subprocess
 import sys
+import time
 from typing import Sequence
 import uuid
+import zipfile
 
 
 SPIRAL_DIR = Path(__file__).resolve().parent.parent
@@ -30,6 +32,7 @@ STATE_FILENAME = ".run_single_state.json"
 STATE_VERSION = 1
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _INK_STRIP_SUFFIX = ".jpg"
+_WANDB_IN_USE_RETRY_DELAYS = (2.0, 5.0, 10.0, 20.0, 30.0)
 
 # Executing this file directly puts only runners/ on sys.path.
 if str(SPIRAL_DIR) not in sys.path:
@@ -165,7 +168,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="resume completed stages from a compatible saved run state",
+        help="resume completed stages and interrupted fit checkpoints from a "
+             "compatible saved run state",
     )
     return parser
 
@@ -269,6 +273,8 @@ def fit_environment(
     wandb_group: str | None = None,
     metrics_history: Path | None = None,
     gpu_ids: tuple[int, ...] | None = None,
+    resume_checkpoint: Path | None = None,
+    run_directory: Path | None = None,
 ) -> dict[str, str]:
     env = os.environ.copy()
     _set_gpu_visibility(env, gpu_ids)
@@ -280,6 +286,9 @@ def fit_environment(
     env["WANDB_ENTITY"] = wandb_entity
     env.pop("FIT_SPIRAL_BATCH_RUN", None)
     env.pop("FIT_SPIRAL_METRICS_HISTORY", None)
+    env.pop("FIT_SPIRAL_RESUME_PATH", None)
+    env.pop("FIT_SPIRAL_RUN_DIR", None)
+    env.pop("FIT_SPIRAL_WANDB_RESUME", None)
     if wandb_run_id is not None:
         env["FIT_SPIRAL_BATCH_RUN"] = "1"
         env["WANDB_RUN_ID"] = wandb_run_id
@@ -289,6 +298,14 @@ def fit_environment(
         env["WANDB_RUN_GROUP"] = wandb_group
     if metrics_history is not None:
         env["FIT_SPIRAL_METRICS_HISTORY"] = str(metrics_history)
+    if resume_checkpoint is not None:
+        env["FIT_SPIRAL_RESUME_PATH"] = str(resume_checkpoint)
+    if run_directory is not None:
+        env["FIT_SPIRAL_RUN_DIR"] = str(run_directory)
+    if resume_checkpoint is not None or run_directory is not None:
+        # The run may already exist remotely even when interruption happened
+        # before the first durable checkpoint was written.
+        env["FIT_SPIRAL_WANDB_RESUME"] = "1"
     if overrides:
         env["FIT_SPIRAL_CONFIG_OVERRIDES"] = json.dumps(overrides)
     if num_threads is not None:
@@ -444,43 +461,101 @@ def _wandb_init(*, project: str, entity: str, run_id: str, name: str,
     )
 
 
+def _wandb_init_after_release(**kwargs):
+    """Wait briefly for a just-finished training process to release its run."""
+    run_id = kwargs["run_id"]
+    for attempt in range(len(_WANDB_IN_USE_RETRY_DELAYS) + 1):
+        try:
+            return _wandb_init(**kwargs)
+        except Exception as exc:
+            in_use = "run ID " in str(exc) and " is in use" in str(exc)
+            if not in_use or attempt == len(_WANDB_IN_USE_RETRY_DELAYS):
+                raise
+            delay = _WANDB_IN_USE_RETRY_DELAYS[attempt]
+            print(
+                f"W&B run {run_id} is still closing; retrying final metrics "
+                f"in {delay:g}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(delay)
+
+
 def log_seed_final_metrics(
     summary: dict, *, project: str, entity: str, seed_run_id: str,
     group: str | None = None
-) -> None:
-    run = _wandb_init(
-        project=project, entity=entity, run_id=seed_run_id,
-        name=seed_run_id, group=group, resume="must")
+) -> bool:
     try:
-        run.log({f"final/{key}": value for key, value in summary.items()
-                 if _numeric(value)})
-    finally:
-        run.finish()
+        run = _wandb_init_after_release(
+            project=project, entity=entity, run_id=seed_run_id,
+            name=seed_run_id, group=group, resume="must")
+        try:
+            run.log({f"final/{key}": value for key, value in summary.items()
+                     if _numeric(value)})
+        finally:
+            run.finish()
+    except Exception as exc:
+        # Experiment tracking is an optional sink. The fit, render, and local
+        # metrics are already durable, so an upload failure must not invalidate
+        # the pipeline or prevent later seeds from running.
+        print(
+            f"WARNING: could not upload final W&B metrics for {seed_run_id}: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
+    return True
+
+
+def _log_seed_final_metrics_once(
+    summary: dict, *, metrics_stage: dict, state: dict, state_path: Path,
+    project: str, entity: str, seed_run_id: str, group: str | None = None,
+) -> None:
+    if metrics_stage.get("wandb_final_logged"):
+        return
+    if log_seed_final_metrics(
+        summary, project=project, entity=entity,
+        seed_run_id=seed_run_id, group=group,
+    ):
+        metrics_stage["wandb_final_logged"] = True
+        _atomic_write_json(state_path, state)
 
 
 def log_aggregate_metrics(
     training: list[dict], final: dict[str, dict], *, seed_count: int,
     project: str, entity: str, aggregate_run_id: str, group: str | None = None
-) -> None:
-    run = _wandb_init(
-        project=project, entity=entity, run_id=aggregate_run_id,
-        name=aggregate_run_id, group=group, resume="never")
+) -> bool:
     try:
-        for record in training:
-            complete = {
-                key: stats["mean"] for key, stats in record["metrics"].items()
+        run = _wandb_init_after_release(
+            project=project, entity=entity, run_id=aggregate_run_id,
+            name=aggregate_run_id, group=group, resume="allow")
+        try:
+            for record in training:
+                complete = {
+                    key: stats["mean"]
+                    for key, stats in record["metrics"].items()
+                    if stats["count"] == seed_count
+                }
+                if complete:
+                    run.log(complete, step=record["iteration"])
+            complete_final = {
+                f"final/{key}": stats["mean"] for key, stats in final.items()
                 if stats["count"] == seed_count
             }
-            if complete:
-                run.log(complete, step=record["iteration"])
-        complete_final = {
-            f"final/{key}": stats["mean"] for key, stats in final.items()
-            if stats["count"] == seed_count
-        }
-        if complete_final:
-            run.log(complete_final)
-    finally:
-        run.finish()
+            if complete_final:
+                run.log(complete_final)
+        finally:
+            run.finish()
+    except Exception as exc:
+        print(
+            f"WARNING: could not upload aggregate W&B metrics for "
+            f"{aggregate_run_id}: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
+    return True
 
 
 def run_pipeline(
@@ -667,6 +742,57 @@ def _validate_completed_stages(output: Path, state: dict) -> None:
             _load_final_summary(metrics_path.parent.parent)
 
 
+def _recover_interrupted_fit(output: Path) -> tuple[Path | None, Path | None]:
+    """Locate the one durable checkpoint and its original output directory.
+
+    Headless fits atomically refresh ``checkpoint_fitted.ckpt`` every 1,000
+    completed iterations.  Reusing its parent directory avoids creating a
+    second dated directory when recovery happens after midnight UTC.  A fit
+    interrupted before its first autosave can still restart in its original
+    directory, but no training progress is recoverable in that case.
+    """
+    run_dirs = (
+        sorted(path for path in output.iterdir() if path.is_dir())
+        if output.is_dir()
+        else []
+    )
+    checkpoints = [
+        run_dir / "checkpoint_fitted.ckpt"
+        for run_dir in run_dirs
+        if (run_dir / "checkpoint_fitted.ckpt").is_file()
+    ]
+    if len(checkpoints) > 1:
+        raise RuntimeError(
+            f"cannot choose a fit checkpoint in {output}: found "
+            f"{len(checkpoints)} checkpoint_fitted.ckpt files")
+    if checkpoints:
+        checkpoint = checkpoints[0]
+        if not zipfile.is_zipfile(checkpoint):
+            raise RuntimeError(
+                f"interrupted fit checkpoint is incomplete or corrupt: {checkpoint}")
+        return checkpoint.resolve(), checkpoint.parent.resolve()
+    if len(run_dirs) > 1:
+        raise RuntimeError(
+            f"cannot choose an interrupted fit directory in {output}: found "
+            f"{len(run_dirs)} directories and no durable checkpoint")
+    return None, run_dirs[0].resolve() if run_dirs else None
+
+
+def _gpu_count_only_invocation_change(saved: dict, current: dict) -> bool:
+    """Return whether two invocations differ only by explicit GPU count."""
+    saved_gpu_count = saved.get("gpu_count")
+    current_gpu_count = current.get("gpu_count")
+    if (not isinstance(saved_gpu_count, int)
+            or not isinstance(current_gpu_count, int)
+            or saved_gpu_count == current_gpu_count):
+        return False
+    saved_without_gpus = dict(saved)
+    current_without_gpus = dict(current)
+    saved_without_gpus.pop("gpu_count", None)
+    current_without_gpus.pop("gpu_count", None)
+    return saved_without_gpus == current_without_gpus
+
+
 def _load_or_create_state(output: Path, invocation: dict) -> tuple[dict, Path]:
     state_path = output / STATE_FILENAME
     if state_path.exists():
@@ -676,7 +802,14 @@ def _load_or_create_state(output: Path, invocation: dict) -> tuple[dict, Path]:
             raise RuntimeError(str(exc)) from exc
         if state.get("version") != STATE_VERSION or not isinstance(state.get("runs"), dict):
             raise RuntimeError(f"unsupported or malformed run state: {state_path}")
-        if state.get("invocation") != invocation:
+        saved_invocation = state.get("invocation")
+        if not isinstance(saved_invocation, dict):
+            raise RuntimeError(f"run state has no valid invocation: {state_path}")
+        gpu_count_change = (
+            saved_invocation != invocation
+            and _gpu_count_only_invocation_change(saved_invocation, invocation)
+        )
+        if saved_invocation != invocation and not gpu_count_change:
             raise RuntimeError("saved run state does not match the current invocation")
         seeds = invocation["seeds"]
         expected_labels = {"single"} if seeds is None else {
@@ -703,10 +836,25 @@ def _load_or_create_state(output: Path, invocation: dict) -> tuple[dict, Path]:
                     or (metrics_status != "pending" and render_status != "complete")):
                 raise RuntimeError(
                     f"inconsistent stage dependencies for {label}: {state_path}")
-            if fit_status in {"running", "failed", "interrupted"}:
+            if fit_status == "failed":
                 raise RuntimeError(
                     f"cannot automatically recover {fit_status} fit for {label}")
+            if gpu_count_change and fit_status not in {"pending", "complete"}:
+                raise RuntimeError(
+                    f"cannot change GPU count while fit {label} is {fit_status}; "
+                    "resume it with the saved GPU count")
         _validate_completed_stages(output, state)
+        if gpu_count_change:
+            old_gpu_count = saved_invocation["gpu_count"]
+            new_gpu_count = invocation["gpu_count"]
+            state["invocation"] = invocation
+            state["gpu_count"] = new_gpu_count
+            _atomic_write_json(state_path, state)
+            print(
+                f"Resume resource update: {old_gpu_count} -> {new_gpu_count} "
+                "GPUs per fit",
+                flush=True,
+            )
         return state, state_path
 
     require_empty_output(output)
@@ -748,6 +896,20 @@ def _run_resumable_pipeline(
 
     if stages["fit"]["status"] != "complete":
         output.mkdir(parents=True, exist_ok=True)
+        recovering = stages["fit"]["status"] in {"running", "interrupted"}
+        resume_checkpoint = None
+        run_directory = None
+        if recovering:
+            resume_checkpoint, run_directory = _recover_interrupted_fit(output)
+            if resume_checkpoint is not None:
+                print(
+                    f"RESUME fit {label} from {resume_checkpoint}", flush=True)
+            else:
+                print(
+                    f"RESUME fit {label}: no checkpoint was written; restarting "
+                    "from iteration 0",
+                    flush=True,
+                )
 
         def fit() -> None:
             subprocess.run(
@@ -758,7 +920,9 @@ def _run_resumable_pipeline(
                     wandb_run_id=seed_run_id, wandb_run_name=seed_run_id,
                     wandb_group=wandb_group,
                     metrics_history=history_path,
-                    gpu_ids=gpu_ids))
+                    gpu_ids=gpu_ids,
+                    resume_checkpoint=resume_checkpoint,
+                    run_directory=run_directory))
             _run_dir, fitted = find_fit_outputs(output)
             if seeded:
                 _load_training_history(history_path)
@@ -840,8 +1004,10 @@ def run_resumable(
         histories.append(history)
         summaries.append(summary)
         if not args.no_wandb:
-            log_seed_final_metrics(
-                summary, project=project, entity=entity,
+            _log_seed_final_metrics_once(
+                summary, metrics_stage=state["runs"][str(seed)]["metrics"],
+                state=state, state_path=state_path,
+                project=project, entity=entity,
                 seed_run_id=seed_id, group=wandb_group)
 
     if len(seeds) < 2:
@@ -851,11 +1017,13 @@ def run_resumable(
                  "training": training, "final": final}
     aggregate_path = output / AGGREGATE_METRICS_FILENAME
     _atomic_write_json(aggregate_path, aggregate)
-    if not args.no_wandb:
-        log_aggregate_metrics(
+    if not args.no_wandb and not state.get("wandb_aggregate_logged"):
+        if log_aggregate_metrics(
             training, final, seed_count=len(seeds), project=project,
             entity=entity, aggregate_run_id=f"{batch_id}_aggregate",
-            group=wandb_group)
+            group=wandb_group):
+            state["wandb_aggregate_logged"] = True
+            _atomic_write_json(state_path, state)
 
 
 def run(args: argparse.Namespace) -> None:
