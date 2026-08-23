@@ -3801,6 +3801,20 @@ fs::path initShellDirectoryFromManifest(const vc::lasagna::LasagnaDatasetManifes
     return *manifest.initShellDir;
 }
 
+fs::path resolveInitShellDirectory(
+    const vc::lasagna::LasagnaDatasetManifest& manifest,
+    const std::optional<fs::path>& overrideDir)
+{
+    if (!overrideDir.has_value()) {
+        return initShellDirectoryFromManifest(manifest);
+    }
+    if (!fs::is_directory(*overrideDir)) {
+        throw std::runtime_error("Atlas init shell override does not exist or is not a directory: " +
+                                 overrideDir->string());
+    }
+    return *overrideDir;
+}
+
 std::vector<SurfaceCandidate> loadInitShellCandidates(const fs::path& initShellDir)
 {
     if (!fs::is_directory(initShellDir)) {

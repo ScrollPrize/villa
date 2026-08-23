@@ -3574,14 +3574,16 @@ void LineAnnotationController::createAtlasFromFiber(uint64_t fiberId)
     }
 }
 
-bool LineAnnotationController::createAtlasFromFiberHeadless(uint64_t fiberId,
-                                                            QString* errorMessage,
-                                                            fs::path* atlasDirOut)
+bool LineAnnotationController::createAtlasFromFiberHeadless(
+    uint64_t fiberId,
+    QString* errorMessage,
+    fs::path* atlasDirOut,
+    const std::optional<fs::path>& initShellDirOverride)
 {
     // Do not emit atlasCreated: it is connected to the interactive display
     // path. Direct callers display the returned directory themselves.
     try {
-        const fs::path atlasDir = createAtlasFromFiberCore(fiberId);
+        const fs::path atlasDir = createAtlasFromFiberCore(fiberId, initShellDirOverride);
         if (atlasDirOut) {
             *atlasDirOut = atlasDir;
         }
@@ -3594,7 +3596,9 @@ bool LineAnnotationController::createAtlasFromFiberHeadless(uint64_t fiberId,
     }
 }
 
-fs::path LineAnnotationController::createAtlasFromFiberCore(uint64_t fiberId)
+fs::path LineAnnotationController::createAtlasFromFiberCore(
+    uint64_t fiberId,
+    const std::optional<fs::path>& initShellDirOverride)
 {
     auto vpkg = _state ? _state->vpkg() : nullptr;
     if (!vpkg) {
@@ -3627,8 +3631,8 @@ fs::path LineAnnotationController::createAtlasFromFiberCore(uint64_t fiberId)
     vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(
         manifestPath, {resolvedLasagna->second});
     vc::lasagna::LasagnaNormalSampler sampler(dataset);
-    const fs::path initShellDir =
-        vc::atlas::initShellDirectoryFromManifest(dataset.manifest());
+    const fs::path initShellDir = vc::atlas::resolveInitShellDirectory(
+        dataset.manifest(), initShellDirOverride);
     atlasDebug("selected_manifest=" + manifestPath.string());
     atlasDebug("resolved_init_shell_dir=" + initShellDir.string());
 

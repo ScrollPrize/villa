@@ -140,18 +140,28 @@ async def vc3d_fiber_set_tag(fiber_id: str, tag: str, enabled: bool) -> dict[str
 
 
 @mcp.tool()
-async def vc3d_fiber_create_atlas(fiber_id: str) -> dict[str, Any]:
+async def vc3d_fiber_create_atlas(
+    fiber_id: str,
+    init_shell_dir: Optional[str] = None,
+) -> dict[str, Any]:
     """Create a single-fiber atlas from a saved fiber and display it
     (dialog-free). SYNCHRONOUS and potentially slow (heavy geometry work on
     the app thread) -- allow a generous client timeout. Requires a
     manifest-backed Lasagna dataset resolvable for the currently selected
     volume (a "lasagna"-kind representation, NOT a "normal_grids" store or the
-    vc3d_lasagna_* fit service), AND that dataset's manifest must provide
-    init_shell_dir -- a dataset can resolve for tracing yet still fail atlas
-    creation if that atlas-only field is absent. Returns {"atlasDir",
-    "displayed"} (plus displayDetail when display failed but creation
-    succeeded)."""
-    return await _call("fiber.create_atlas", {"fiberId": fiber_id})
+    vc3d_lasagna_* fit service). init_shell_dir optionally supplies an absolute
+    path on the VC3D host to a directory containing explicitly wrapped
+    shell_*.tifxyz surfaces and overrides the manifest's init_shell_dir; this
+    is required for published catalog manifests that omit the local producer
+    path. The fiber seed must intersect real material on one of those shells.
+    Display does not require pred_dt, but pred-snap features remain unavailable
+    when that channel is absent. Returns
+    {"atlasDir", "displayed"} (plus displayDetail when display failed but
+    creation succeeded)."""
+    return await _call(
+        "fiber.create_atlas",
+        _strip_none({"fiberId": fiber_id, "initShellDir": init_shell_dir}),
+    )
 
 
 @mcp.tool()

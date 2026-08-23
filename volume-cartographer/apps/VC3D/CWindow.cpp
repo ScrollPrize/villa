@@ -222,6 +222,22 @@ resolvedLasagnaForState(const CState* state)
         *state->vpkg(), state->currentVolumeId());
 }
 
+bool stateLasagnaHasPredDt(const CState* state)
+{
+    try {
+        const auto resolved = resolvedLasagnaForState(state);
+        if (!resolved || resolved->manifestPath.empty() ||
+            !std::filesystem::exists(resolved->manifestPath)) {
+            return false;
+        }
+        const auto manifest = vc::lasagna::LasagnaDatasetManifest::parseFile(
+            resolved->manifestPath);
+        return manifest.groupForChannel("pred_dt") != nullptr;
+    } catch (...) {
+        return false;
+    }
+}
+
 enum class SurfaceOverlayItemKind {
     Folder,
     Surface,
@@ -2065,7 +2081,8 @@ QDockWidget* createAtlasOverviewDock(QWidget* parent)
     auto* rankSnap = new QPushButton(QObject::tr("Rank via Fit-Service"), content);
     rankSnap->setObjectName(QStringLiteral("atlasRankSnapButton"));
     rankSnap->setToolTip(QObject::tr(
-        "Run atlas pred-snap ranking through the Lasagna fit-service job queue."));
+        "Run atlas pred-snap ranking through the Lasagna fit-service job queue. "
+        "Requires a selected Lasagna dataset with a pred_dt channel."));
     rankSnap->setEnabled(false);
     actions->addWidget(rankSnap);
 
@@ -2100,6 +2117,8 @@ QDockWidget* createAtlasFiberDock(QWidget* parent)
 
     auto* optimize = new QPushButton(QObject::tr("Optimize snap cands"), content);
     optimize->setObjectName(QStringLiteral("atlasOptimizeSnapCandidatesButton"));
+    optimize->setToolTip(QObject::tr(
+        "Requires a selected Lasagna dataset with a pred_dt channel."));
     optimize->setEnabled(false);
     layout->addWidget(optimize);
 
@@ -4925,19 +4944,9 @@ void CWindow::updateAtlasFiberDocks()
     auto* optimize = _atlasWorkspaceFiberDock->widget()->findChild<QPushButton*>(
         QStringLiteral("atlasOptimizeSnapCandidatesButton"));
     auto updateOptimizeEnabled = [&]() {
-        bool hasManifest = false;
-        if (_state && _state->vpkg()) {
-            try {
-                const auto resolved = resolvedLasagnaForState(_state);
-                hasManifest = resolved && !resolved->manifestPath.empty() &&
-                              std::filesystem::exists(resolved->manifestPath);
-            } catch (...) {
-                hasManifest = false;
-            }
-        }
         if (optimize) {
             optimize->setEnabled(_currentAtlasDir.has_value() &&
-                                 hasManifest &&
+                                 stateLasagnaHasPredDt(_state) &&
                                  LasagnaServiceManager::instance().isRunning());
         }
     };
@@ -5099,6 +5108,7 @@ void CWindow::updateAtlasSearchDocks()
     }
     const bool hasSnapshots = !snapshots.empty();
     const bool atlasUsable = _currentAtlasDir.has_value() && atlasLoadError.isEmpty();
+    const bool predSnapAvailable = stateLasagnaHasPredDt(_state);
     const QString atlasName = _currentAtlasDir
         ? QString::fromStdString(_currentAtlasName.empty()
               ? _currentAtlasDir->filename().string()
@@ -5144,7 +5154,7 @@ void CWindow::updateAtlasSearchDocks()
             continue;
         }
         if (auto* rankSnap = dock->widget()->findChild<QPushButton*>(QStringLiteral("atlasRankSnapButton"))) {
-            rankSnap->setEnabled(atlasUsable);
+            rankSnap->setEnabled(atlasUsable && predSnapAvailable);
         }
         if (auto* remap = dock->widget()->findChild<QPushButton*>(QStringLiteral("atlasRemapButton"))) {
             remap->setEnabled(atlasUsable);
@@ -5312,6 +5322,14 @@ bool CWindow::optimizeAtlasSnapCandidatesHeadless(QString* errorMessage,
     }
     const std::filesystem::path manifestPath = resolvedLasagna->manifestPath;
     const double workingToBaseScale = resolvedLasagna->workingToBaseScale;
+    try {
+        const auto manifest = vc::lasagna::LasagnaDatasetManifest::parseFile(manifestPath);
+        if (manifest.groupForChannel("pred_dt") == nullptr) {
+            return fail(tr("The selected Lasagna dataset has no pred_dt channel."));
+        }
+    } catch (const std::exception& ex) {
+        return fail(QString::fromStdString(ex.what()));
+    }
 
     auto& manager = LasagnaServiceManager::instance();
     if (manager.isExternal()) {
@@ -6716,8 +6734,7 @@ void CWindow::loadAndDisplayAtlas(const std::filesystem::path& atlasDir)
     }
     const auto resolvedLasagna = resolvedLasagnaForState(_state);
     if (!resolvedLasagna || resolvedLasagna->manifestPath.empty()) {
-        throw std::runtime_error(
-            "No Lasagna dataset matches the active volume; atlas pred-snap attachments are required");
+        throw std::runtime_error("No Lasagna dataset matches the active volume");
     }
     const std::filesystem::path manifestPath = resolvedLasagna->manifestPath;
     if (!std::filesystem::exists(manifestPath)) {
@@ -6733,8 +6750,10 @@ void CWindow::loadAndDisplayAtlas(const std::filesystem::path& atlasDir)
             vc::lasagna::LasagnaDatasetOpenOptions{
                 resolvedLasagna->workingToBaseScale});
     vc::lasagna::LasagnaNormalSampler sampler(dataset);
-    (void)vc::atlas::ensureAtlasPredSnapAttachments(atlasDir, volpkgRoot, sampler);
-    atlas = vc::atlas::Atlas::load(atlasDir, volpkgRoot);
+    if (sampler.hasPredDtChannel()) {
+        (void)vc::atlas::ensureAtlasPredSnapAttachments(atlasDir, volpkgRoot, sampler);
+        atlas = vc::atlas::Atlas::load(atlasDir, volpkgRoot);
+    }
     _currentAtlasDir = atlasDir;
     _currentAtlasName = atlas.metadata.name;
     if (_lineAnnotationController) {
@@ -6869,10 +6888,6 @@ void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
                         vc::lasagna::LasagnaDatasetOpenOptions{
                             resolvedLasagna->workingToBaseScale});
                 vc::lasagna::LasagnaNormalSampler sampler(dataset);
-                if (!sampler.hasPredDtChannel()) {
-                    throw std::runtime_error(
-                        "Selected Lasagna dataset has no pred_dt channel; atlas pred-snap attachments are required");
-                }
                 vc::atlas::rebuildAtlasFromSourceFibers(atlasDir, volpkgRoot, sampler);
                 displayAtlasFromDirectory(atlasDir);
             } catch (const std::exception& rebuildEx) {

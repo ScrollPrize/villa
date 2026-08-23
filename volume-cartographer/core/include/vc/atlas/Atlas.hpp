@@ -340,6 +340,9 @@ std::filesystem::path uniqueAtlasDirectory(const std::filesystem::path& volpkgRo
                                            const std::string& baseName);
 std::filesystem::path initShellDirectoryFromManifest(
     const vc::lasagna::LasagnaDatasetManifest& manifest);
+std::filesystem::path resolveInitShellDirectory(
+    const vc::lasagna::LasagnaDatasetManifest& manifest,
+    const std::optional<std::filesystem::path>& overrideDir = std::nullopt);
 std::vector<SurfaceCandidate> loadInitShellCandidates(
     const std::filesystem::path& initShellDir);
 

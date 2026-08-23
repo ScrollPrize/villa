@@ -244,8 +244,11 @@ public:
                               int* importedCount = nullptr, int* skippedCount = nullptr);
     // Creates an atlas without dialogs. It does not emit atlasCreated because
     // that signal is connected to the interactive display path.
-    bool createAtlasFromFiberHeadless(uint64_t fiberId, QString* errorMessage = nullptr,
-                                      std::filesystem::path* atlasDirOut = nullptr);
+    bool createAtlasFromFiberHeadless(
+        uint64_t fiberId,
+        QString* errorMessage = nullptr,
+        std::filesystem::path* atlasDirOut = nullptr,
+        const std::optional<std::filesystem::path>& initShellDirOverride = std::nullopt);
     // Most recently opened live line-annotation workspace, or nullptr.
     [[nodiscard]] LineAnnotationDialog* mostRecentLineAnnotationDialog() const;
     // Short-lived presentation guard for direct operations. Sessions created
@@ -785,7 +788,9 @@ private:
     // Shared core of createAtlasFromFiber / createAtlasFromFiberHeadless.
     // Returns the created atlas directory; throws std::exception on failure.
     // Does not emit atlasCreated (callers decide).
-    std::filesystem::path createAtlasFromFiberCore(uint64_t fiberId);
+    std::filesystem::path createAtlasFromFiberCore(
+        uint64_t fiberId,
+        const std::optional<std::filesystem::path>& initShellDirOverride = std::nullopt);
     // Shared per-pane finalize+save loop of saveOpenFibers /
     // saveOpenFibersHeadless (no waiting).
     void saveOpenFibersCore();

@@ -439,7 +439,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_drag` | `canvas.drag` |
 | `vc3d_enable_editing` | `segmentation.enable_editing` | Turn segmentation editing mode on/off for the active segment. |
 | `vc3d_fetch_segment` | `segments.fetch` | Download ("materialize") an open-data placeholder segment so it can be activated/edited. Sync if already materialized; else a `"catalog"` job (`wait` defaults true). |
-| `vc3d_fiber_create_atlas` | `fiber.create_atlas` |
+| `vc3d_fiber_create_atlas` | `fiber.create_atlas` | Accepts an optional absolute `init_shell_dir` override containing wrapped `shell_*.tifxyz` surfaces; atlases can display without `pred_dt`, while pred-snap operations still require it. |
 | `vc3d_fiber_delete` | `fiber.delete` |
 | `vc3d_fiber_export` | `fiber.export` |
 | `vc3d_fiber_import` | `fiber.import` |

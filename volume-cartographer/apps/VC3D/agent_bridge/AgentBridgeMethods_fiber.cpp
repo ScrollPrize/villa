@@ -139,6 +139,7 @@ void AgentBridgeServer::registerFiberHandlers()
             .name = QStringLiteral("fiber.create_atlas"),
             .params = {
                 fiberId(QStringLiteral("fiberId")),
+                Params::optionalString(QStringLiteral("initShellDir")),
             },
             .errors = {-32602, -32000, -32010, -32007, -32005},
             .mcp = Mcp::snakeCase(QStringLiteral("vc3d_fiber_create_atlas")),

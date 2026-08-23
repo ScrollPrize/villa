@@ -2873,6 +2873,26 @@ TEST_CASE("Atlas manifest init_shell_dir resolves relative to lasagna manifest")
     CHECK(*manifest.initShellDir == fs::absolute(root / "init_shells").lexically_normal());
 }
 
+TEST_CASE("Atlas init shell override takes precedence over the manifest")
+{
+    const fs::path root = tempRoot("vc_atlas_init_shell_override");
+    const fs::path manifestDir = root / "manifest_shells";
+    const fs::path overrideDir = root / "local_shells";
+    fs::create_directories(manifestDir);
+    fs::create_directories(overrideDir);
+    const auto manifest = vc::lasagna::LasagnaDatasetManifest::parseText(
+        R"({"version":1,"init_shell_dir":"manifest_shells"})",
+        root / "dataset.lasagna.json");
+
+    CHECK(vc::atlas::resolveInitShellDirectory(manifest) ==
+          fs::absolute(manifestDir).lexically_normal());
+    CHECK(vc::atlas::resolveInitShellDirectory(manifest, overrideDir) == overrideDir);
+    CHECK_THROWS_WITH_AS(
+        vc::atlas::resolveInitShellDirectory(manifest, root / "missing_shells"),
+        doctest::Contains("Atlas init shell override does not exist or is not a directory"),
+        std::runtime_error);
+}
+
 TEST_CASE("Atlas init shell loading accepts only shell tifxyz directories")
 {
     const fs::path root = tempRoot("vc_atlas_init_shell_candidates");

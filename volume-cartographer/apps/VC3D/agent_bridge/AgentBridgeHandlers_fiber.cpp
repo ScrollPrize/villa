@@ -26,6 +26,7 @@
 #include <cmath>
 #include <filesystem>
 #include <limits>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_set>
@@ -463,12 +464,38 @@ QJsonObject AgentBridgeServer::handleFiberCreateAtlas(const QJsonValue& params)
     const uint64_t fiberId = jsonToFiberId(p.value("fiberId"), "fiberId");
     requireKnownFiber(ctrl, fiberId);
 
+    std::optional<std::filesystem::path> initShellDir;
+    if (p.contains("initShellDir")) {
+        const QString value = p.value("initShellDir").toString();
+        if (value.isEmpty()) {
+            QJsonObject data;
+            data["param"] = "initShellDir";
+            throw AgentBridgeError{-32602, "initShellDir must be a non-empty string", data};
+        }
+        initShellDir = std::filesystem::path(value.toStdString());
+        if (initShellDir->is_relative()) {
+            QJsonObject data;
+            data["param"] = "initShellDir";
+            throw AgentBridgeError{-32602, "initShellDir must be an absolute path", data};
+        }
+        std::error_code ec;
+        if (!std::filesystem::is_directory(*initShellDir, ec)) {
+            QJsonObject data;
+            data["kind"] = "path";
+            data["path"] = value;
+            throw AgentBridgeError{
+                -32007,
+                "Init shell directory does not exist or is not a directory",
+                data};
+        }
+    }
+
     // createAtlasFromFiber is synchronous, but its error and rebuild dialogs are
     // unsafe for remote calls. Run the dialog-free split and display the result
     // through displayAtlasFromDirectoryHeadless.
     QString err;
     std::filesystem::path atlasDir;
-    if (!ctrl->createAtlasFromFiberHeadless(fiberId, &err, &atlasDir)) {
+    if (!ctrl->createAtlasFromFiberHeadless(fiberId, &err, &atlasDir, initShellDir)) {
         QJsonObject data;
         data["detail"] = err;
         throw AgentBridgeError{-32005, "Atlas creation failed", data};

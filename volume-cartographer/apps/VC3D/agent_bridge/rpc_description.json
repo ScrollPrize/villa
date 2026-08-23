@@ -606,7 +606,8 @@
       ],
       "mcp": {
         "paramRenames": {
-          "fiberId": "fiber_id"
+          "fiberId": "fiber_id",
+          "initShellDir": "init_shell_dir"
         },
         "tool": "vc3d_fiber_create_atlas"
       },
@@ -617,6 +618,9 @@
               "string",
               "integer"
             ]
+          },
+          "initShellDir": {
+            "type": "string"
           }
         },
         "required": [
