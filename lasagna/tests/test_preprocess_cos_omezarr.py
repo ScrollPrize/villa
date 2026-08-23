@@ -1598,7 +1598,10 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		with tempfile.TemporaryDirectory() as td:
 			root = Path(td)
 			input_path = root / "input.zarr"
-			arr = zarr.open(str(input_path), mode="w", shape=(8, 4, 4), chunks=(4, 4, 4), dtype="uint8")
+			arr = zarr.open(
+				str(input_path), mode="w", shape=(8, 4, 4), chunks=(4, 4, 4),
+				dtype="uint8", zarr_format=2,
+			)
 			arr[4:8, :, :] = np.full((4, 4, 4), 1, dtype=np.uint8)
 			output_path = root / "vol.lasagna.json"
 			gpu_pause_stub = types.ModuleType("gpu_pause")
@@ -1640,8 +1643,8 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 				self.assertFalse(_omezarr_chunk_exists(path, 0, 0, 0, 0, 4))
 				self.assertTrue(_omezarr_chunk_exists(path, 0, 4, 0, 0, 4))
 			out = stdout.getvalue()
-			self.assertIn("final_z=4/8", out)
-			self.assertIn("final_z=8/8", out)
+			self.assertIn("flush complete sd=1 z=4", out)
+			self.assertIn("flush complete sd=1 z=8", out)
 
 	def test_shared_runner_does_not_clear_or_write_unsupported_xy_chunks(self):
 		product = OutputProductSpec(
