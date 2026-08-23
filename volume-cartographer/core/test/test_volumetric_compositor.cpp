@@ -342,6 +342,62 @@ TEST_CASE("compositeVolumetric oblique tilt shifts higher layers")
     CHECK(int(color(5, 4)[0]) == 0);    // and no longer at its own position
 }
 
+TEST_CASE("compositeVolumetric consumes expanded cache-style layer buffers")
+{
+    constexpr int outRows = 10;
+    constexpr int outCols = 12;
+    constexpr int numLayers = 3;
+    constexpr int zStart = -1;
+    constexpr float outputScale = 1.0f;
+
+    CameraParams cam;
+    cam.tiltDeg = 45.0f;
+    cam.azimuthDeg = 20.0f;
+    const SlabMargins margins = computeSlabMargins(
+        cam, numLayers, zStart, outputScale, outCols, outRows);
+    REQUIRE(margins.any());
+
+    const int rows = outRows + margins.top + margins.bottom;
+    const int cols = outCols + margins.left + margins.right;
+    auto values = uniformLayers(numLayers, rows, cols, 0);
+    auto coverage = uniformLayers(numLayers, rows, cols, 1);
+
+    // Cache-backed layers are sampled over an expanded (u,v) window whose
+    // on-screen origin is (left, top). Put a bright sample where the center
+    // screen ray intersects the nearest layer.
+    const float centerU = float(margins.left) + float(outCols) * 0.5f;
+    const float centerV = float(margins.top) + float(outRows) * 0.5f;
+    const auto projection = slabProjection(
+        cam, numLayers, zStart, outputScale, centerU, centerV);
+    const int nearLayer = numLayers - 1;
+    const float qU = projection.m00 * centerU + projection.m01 * centerV +
+                     projection.layerOffsets[nearLayer][0];
+    const float qV = projection.m10 * centerU + projection.m11 * centerV +
+                     projection.layerOffsets[nearLayer][1];
+    const int qX = int(std::floor(qU));
+    const int qY = int(std::floor(qV));
+    REQUIRE(qX >= 0);
+    REQUIRE(qY >= 0);
+    REQUIRE(qX + 1 < cols);
+    REQUIRE(qY + 1 < rows);
+    for (int y = qY; y <= qY + 1; ++y)
+        for (int x = qX; x <= qX + 1; ++x)
+            values[nearLayer](y, x) = 250;
+
+    cv::Mat_<cv::Vec3b> color;
+    cv::Mat_<uint8_t> cov;
+    compositeVolumetric(values, coverage, cam, zStart, outputScale,
+                        identityColorLut(), constantOpacityLut(1.0f),
+                        color, cov, margins);
+
+    CHECK(color.rows == outRows);
+    CHECK(color.cols == outCols);
+    CHECK(cov.rows == outRows);
+    CHECK(cov.cols == outCols);
+    CHECK(cov(outRows / 2, outCols / 2) == 1);
+    CHECK(int(color(outRows / 2, outCols / 2)[0]) == 250);
+}
+
 TEST_CASE("compositeVolumetric treats uncovered texels as transparent")
 {
     const int rows = 6, cols = 6;
