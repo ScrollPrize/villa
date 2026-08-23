@@ -261,6 +261,10 @@ set(srcs
     elements/COutlinedTextItem.cpp
     volume_viewers/CChunkedVolumeViewer.cpp
     volume_viewers/CChunkedVolumeViewer.hpp
+    volume_viewers/CameraGizmoWidget.cpp
+    volume_viewers/CameraGizmoWidget.hpp
+    volume_viewers/VolumetricCompositor.cpp
+    volume_viewers/VolumetricCompositor.hpp
     agent_bridge/AgentBridgeServer.cpp
     agent_bridge/AgentBridgeServer.hpp
     agent_bridge/AgentBridgeMethod.cpp

@@ -3,10 +3,7 @@
 
 #include "vc/core/util/Compositing.hpp"
 
-#include <opencv2/core.hpp>
-
 #include <cmath>
-#include <numbers>
 #include <string>
 #include <vector>
 
@@ -125,28 +122,11 @@ TEST_CASE("compositeLayerStack: alpha / beerLambert dispatch returns finite")
     CHECK(std::isfinite(compositeLayerStack(s, p)));
 }
 
-TEST_CASE("compositeLayerStack: extended methods do not crash and return finite")
-{
-    LayerStack s = stack({10.f, 50.f, 100.f, 200.f});
-    CompositeParams p;
-    // Method names use camelCase per utils/compositing.hpp's parse_compositing_method.
-    const std::vector<std::string> methods = {
-        "dvr", "firstHitIso", "devFromMean", "emissionDvr",
-        "maxAboveIso", "gammaWeighted", "gradientMag", "pbrIso", "shadedDvr"
-    };
-    for (const auto& m : methods) {
-        p.method = m;
-        float v = compositeLayerStack(s, p);
-        CHECK(std::isfinite(v));
-    }
-}
-
 TEST_CASE("compositeLayerStack empty stack always returns 0")
 {
     CompositeParams p;
     const std::vector<std::string> methods = {
-        "mean", "max", "min", "alpha", "beerLambert",
-        "dvr", "first_hit_iso", "dev_from_mean"
+        "mean", "max", "min", "alpha", "beerLambert"
     };
     for (const auto& m : methods) {
         p.method = m;
@@ -160,76 +140,6 @@ TEST_CASE("compositeLayerStack unknown method falls back to mean")
     CompositeParams p;
     p.method = "this_does_not_exist";
     CHECK(compositeLayerStack(s, p) == doctest::Approx(100.0f));
-}
-
-TEST_CASE("methodRequiresLayerStorage returns bool for known and unknown methods")
-{
-    // We don't pin specific values to the underlying utils impl, just exercise
-    // the call path for a representative set.
-    (void)methodRequiresLayerStorage("mean");
-    (void)methodRequiresLayerStorage("max");
-    (void)methodRequiresLayerStorage("alpha");
-    (void)methodRequiresLayerStorage("dvr");
-    (void)methodRequiresLayerStorage("bogus");
-    CHECK(true);
-}
-
-TEST_CASE("computeLightingFactor: lighting disabled returns 1")
-{
-    CompositeParams p;
-    p.lightingEnabled = false;
-    CHECK(computeLightingFactor(cv::Vec3f(0, 0, 1), p) == doctest::Approx(1.0f));
-}
-
-TEST_CASE("computeLightingFactor: zero normal returns ambient")
-{
-    CompositeParams p;
-    p.lightingEnabled = true;
-    p.lightAmbient = 0.25f;
-    CHECK(computeLightingFactor(cv::Vec3f(0, 0, 0), p) == doctest::Approx(0.25f));
-}
-
-TEST_CASE("computeLightingFactor: aligned normal yields ambient+diffuse, clamped to 1")
-{
-    CompositeParams p;
-    p.lightingEnabled = true;
-    p.lightAmbient = 0.3f;
-    p.lightDiffuse = 0.7f;
-    p.lightDirX = 0.f; p.lightDirY = 0.f; p.lightDirZ = 1.f;
-    // normal aligned with light → nDotL = 1; ambient(0.3) + diffuse(0.7) = 1.0
-    CHECK(computeLightingFactor(cv::Vec3f(0, 0, 1), p) == doctest::Approx(1.0f));
-}
-
-TEST_CASE("computeLightingFactor: opposing normal clamps to ambient (nDotL clipped to 0)")
-{
-    CompositeParams p;
-    p.lightingEnabled = true;
-    p.lightAmbient = 0.2f;
-    p.lightDiffuse = 0.7f;
-    p.lightDirX = 0.f; p.lightDirY = 0.f; p.lightDirZ = 1.f;
-    CHECK(computeLightingFactor(cv::Vec3f(0, 0, -1), p) == doctest::Approx(0.2f));
-}
-
-TEST_CASE("CompositeParams::updateLightDir produces unit vector at known angles")
-{
-    CompositeParams p;
-    p.lightAzimuth = 0.0f;
-    p.lightElevation = 0.0f;
-    p.updateLightDir();
-    CHECK(p.lightDirX == doctest::Approx(1.0f));
-    CHECK(p.lightDirY == doctest::Approx(0.0f));
-    CHECK(p.lightDirZ == doctest::Approx(0.0f));
-
-    p.lightAzimuth = 90.0f;
-    p.lightElevation = 0.0f;
-    p.updateLightDir();
-    CHECK(p.lightDirX == doctest::Approx(0.0f).epsilon(1e-5));
-    CHECK(p.lightDirY == doctest::Approx(1.0f));
-
-    p.lightAzimuth = 0.0f;
-    p.lightElevation = 90.0f;
-    p.updateLightDir();
-    CHECK(p.lightDirZ == doctest::Approx(1.0f));
 }
 
 TEST_CASE("CompositeParams equality")

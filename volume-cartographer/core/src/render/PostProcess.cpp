@@ -11,20 +11,15 @@
 namespace vc {
 
 void buildWindowLevelLut(std::array<uint32_t, 256>& lut,
-                         float windowLow, float windowHigh,
-                         float lightFactor) noexcept
+                         float windowLow, float windowHigh) noexcept
 {
     const int lo = static_cast<int>(std::clamp(windowLow, 0.0f, 255.0f));
     const int hi = static_cast<int>(
         std::clamp(windowHigh, static_cast<float>(lo + 1), 255.0f));
     const float span = std::max(1.0f, static_cast<float>(hi - lo));
-    const bool applyLight = lightFactor < 1.0f;
     for (int i = 0; i < 256; ++i) {
-        float lit = applyLight
-            ? std::clamp(static_cast<float>(i) * lightFactor, 0.0f, 255.0f)
-            : static_cast<float>(i);
         uint8_t v = static_cast<uint8_t>(
-            std::clamp((lit - static_cast<float>(lo))
+            std::clamp((static_cast<float>(i) - static_cast<float>(lo))
                        / span * 255.0f, 0.0f, 255.0f));
         lut[i] = 0xFF000000u | (static_cast<uint32_t>(v) << 16)
                               | (static_cast<uint32_t>(v) << 8)
@@ -34,12 +29,11 @@ void buildWindowLevelLut(std::array<uint32_t, 256>& lut,
 
 void buildWindowLevelColormapLut(std::array<uint32_t, 256>& lut,
                                  float windowLow, float windowHigh,
-                                 const std::string& colormapId,
-                                 float lightFactor)
+                                 const std::string& colormapId)
 {
     // First build the window/level grayscale ramp.
     std::array<uint32_t, 256> wl;
-    buildWindowLevelLut(wl, windowLow, windowHigh, lightFactor);
+    buildWindowLevelLut(wl, windowLow, windowHigh);
 
     if (colormapId.empty()) {
         lut = wl;

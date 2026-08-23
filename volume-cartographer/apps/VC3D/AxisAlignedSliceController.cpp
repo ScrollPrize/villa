@@ -400,11 +400,18 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
                                     float yawDeg = 0.0f,
                                     double tilt = 0.0) {
         auto planeShared = std::dynamic_pointer_cast<PlaneSurface>(_state->surface(planeName));
-        if (!planeShared) {
+        // Preserve the plane's scroll displacement along its normal (set by
+        // shift-scrolling its viewer) so re-orienting (e.g. rotating via the
+        // xy-view handles) doesn't snap the plane back to the focus point.
+        // Lateral drift relative to the focus is still discarded.
+        float scrollOffset = 0.0f;
+        if (planeShared) {
+            const cv::Vec3f oldNormal = normalizeOrZero(planeShared->normal({}, {}));
+            scrollOffset = (planeShared->origin() - origin).dot(oldNormal);
+        } else {
             planeShared = std::make_shared<PlaneSurface>();
         }
 
-        planeShared->setOrigin(origin);
         planeShared->setInPlaneRotation(0.0f);
 
         cv::Vec3f rotatedNormal = baseNormal;
@@ -423,16 +430,20 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
         }
 
         planeShared->setNormal(rotatedNormal);
+        planeShared->setOrigin(origin + rotatedNormal * scrollOffset);
+
+        // Up/right alignment first, then the volumetric-camera azimuth folded
+        // on top (in-plane rotations commute, so one setInPlaneRotation call).
+        const float azimuthDeg = volumetricAzimuthDeg(planeName);
+        _appliedVolumetricAzimuthDeg[planeName] = azimuthDeg;
+        float inPlaneRot = azimuthInPlaneRotation(*planeShared, azimuthDeg);
 
         if (planeName == "xy plane") {
             const cv::Vec3f projectedRight = projectVectorOntoPlane({1.0f, 0.0f, 0.0f}, rotatedNormal);
             const cv::Vec3f desiredRight = normalizeOrZero(projectedRight);
             if (cv::norm(desiredRight) > kEpsilon) {
                 const cv::Vec3f currentRight = planeShared->basisX();
-                const float delta = signedAngleBetween(currentRight, desiredRight, rotatedNormal);
-                if (std::abs(delta) > kEpsilon) {
-                    planeShared->setInPlaneRotation(delta);
-                }
+                inPlaneRot += signedAngleBetween(currentRight, desiredRight, rotatedNormal);
             }
         } else {
             // Adjust in-plane rotation so "up" is aligned with volume Z when possible.
@@ -442,13 +453,11 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
 
             if (cv::norm(desiredUp) > kEpsilon) {
                 const cv::Vec3f currentUp = planeShared->basisY();
-                const float delta = signedAngleBetween(currentUp, desiredUp, rotatedNormal);
-                if (std::abs(delta) > kEpsilon) {
-                    planeShared->setInPlaneRotation(delta);
-                }
-            } else {
-                planeShared->setInPlaneRotation(0.0f);
+                inPlaneRot += signedAngleBetween(currentUp, desiredUp, rotatedNormal);
             }
+        }
+        if (std::abs(inPlaneRot) > kEpsilon) {
+            planeShared->setInPlaneRotation(inPlaneRot);
         }
 
         _state->setSurface(planeName, planeShared, false, true);
@@ -500,8 +509,12 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
 
             segXZShared->setNormal(frame->xNormal);
             segYZShared->setNormal(frame->yNormal);
-            segXZShared->setInPlaneRotation(0.0f);
-            segYZShared->setInPlaneRotation(0.0f);
+            const float azXZ = volumetricAzimuthDeg("seg xz");
+            const float azYZ = volumetricAzimuthDeg("seg yz");
+            _appliedVolumetricAzimuthDeg["seg xz"] = azXZ;
+            _appliedVolumetricAzimuthDeg["seg yz"] = azYZ;
+            segXZShared->setInPlaneRotation(azimuthInPlaneRotation(*segXZShared, azXZ));
+            segYZShared->setInPlaneRotation(azimuthInPlaneRotation(*segYZShared, azYZ));
 
             _state->setSurface("seg xz", segXZShared, false, true);
             _state->setSurface("seg yz", segYZShared, false, true);
@@ -520,6 +533,52 @@ float AxisAlignedSliceController::normalizeDegrees(float degrees)
         return 0.0f;
     }
     return std::remainder(degrees, 360.0f);
+}
+
+float AxisAlignedSliceController::volumetricAzimuthDeg(const std::string& surfaceName) const
+{
+    if (!_viewerManager) {
+        return 0.0f;
+    }
+    for (auto* viewer : _viewerManager->baseViewers()) {
+        if (!viewer || viewer->surfName() != surfaceName) {
+            continue;
+        }
+        const auto& s = viewer->compositeRenderSettings();
+        if (s.planeEnabled && s.params.method == "volumetric") {
+            return s.params.camAzimuthDeg;
+        }
+        return 0.0f;
+    }
+    return 0.0f;
+}
+
+void AxisAlignedSliceController::syncVolumetricAzimuths()
+{
+    static const char* kPlaneNames[] = {"xy plane", "seg xz", "seg yz"};
+    for (const char* name : kPlaneNames) {
+        const float az = volumetricAzimuthDeg(name);
+        const auto it = _appliedVolumetricAzimuthDeg.find(name);
+        const float applied = it != _appliedVolumetricAzimuthDeg.end() ? it->second : 0.0f;
+        if (std::abs(az - applied) > 1e-3f) {
+            scheduleOrientationUpdate();
+            return;
+        }
+    }
+}
+
+float AxisAlignedSliceController::azimuthInPlaneRotation(PlaneSurface& plane, float azimuthDeg)
+{
+    if (std::abs(azimuthDeg) <= kEpsilon) {
+        return 0.0f;
+    }
+    // setInPlaneRotation spins about the normal, but vxy_from_normal
+    // sign-normalizes the basis per axis, so (vx, vy, n) handedness varies by
+    // plane. Correct for it so the screen-space spin direction is the same
+    // everywhere: vx -> cos·vx − sin·vy.
+    const cv::Vec3f n = plane.normal({0, 0, 0});
+    const float h = plane.basisX().cross(plane.basisY()).dot(n) >= 0.0f ? 1.0f : -1.0f;
+    return -h * azimuthDeg * kDegToRad;
 }
 
 float AxisAlignedSliceController::currentRotationDegrees(const std::string& surfaceName) const
