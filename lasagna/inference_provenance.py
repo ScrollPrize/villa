@@ -126,17 +126,22 @@ def structural_inventory(manifest_path: str | Path) -> list[dict[str, Any]]:
     return inventory
 
 
-def validate_portable_bundle(bundle_path: str | Path) -> dict[str, Any]:
+def validate_portable_bundle(
+    bundle_path: str | Path, *, provenance_name: str = "inference.json",
+) -> dict[str, Any]:
     """Validate bounded provenance references without enumerating Zarr chunks."""
     bundle = Path(bundle_path).resolve()
-    value = json.loads((bundle / "inference.json").read_text(encoding="utf-8"))
+    provenance_path = Path(provenance_name)
+    if provenance_path.is_absolute() or ".." in provenance_path.parts:
+        raise ValueError("portable provenance name must be a relative path")
+    value = json.loads((bundle / provenance_path).read_text(encoding="utf-8"))
     if not isinstance(value, dict):
-        raise ValueError("inference.json must contain a JSON object")
+        raise ValueError(f"{provenance_path} must contain a JSON object")
     if value.get("status") != "completed":
         raise ValueError(f"inference status must be 'completed', got {value.get('status')!r}")
     artifacts = value.get("artifacts")
     if not isinstance(artifacts, list) or not artifacts:
-        raise ValueError("inference.json must contain a non-empty artifact inventory")
+        raise ValueError(f"{provenance_path} must contain a non-empty artifact inventory")
     for artifact in artifacts:
         if not isinstance(artifact, dict) or not isinstance(artifact.get("path"), str):
             raise ValueError("each artifact must contain a relative path")

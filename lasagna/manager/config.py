@@ -26,6 +26,7 @@ DEFAULT_RCLONE_PARAMS = (
     "-P",
     "--stats-one-line",
 )
+DEFAULT_FIBERLET_THREADS = 32
 
 
 @dataclass(frozen=True)
@@ -38,12 +39,15 @@ class ManagerConfig:
     venv: str = ""
     atlas_dir: str = ""
     upload_staging_s3: str = ""
+    fiberlet_binary: str = ""
+    fiberlet_threads: int = DEFAULT_FIBERLET_THREADS
     catalog_max_age_seconds: int = 3600
     params: tuple[str, ...] = DEFAULT_INFERENCE_PARAMS
+    fiberlet_params: tuple[str, ...] = ()
     rclone_params: tuple[str, ...] = DEFAULT_RCLONE_PARAMS
 
     def resolved_path(self, name: str, *, required: bool = False) -> Path | None:
-        if name not in {"cache_dir", "output_dir", "venv", "atlas_dir"}:
+        if name not in {"cache_dir", "output_dir", "venv", "atlas_dir", "fiberlet_binary"}:
             raise KeyError(name)
         value = str(getattr(self, name)).strip()
         if not value:
@@ -76,20 +80,24 @@ def _validate(raw: dict[str, Any]) -> ManagerConfig:
     unknown = sorted(set(raw) - known)
     if unknown:
         raise ValueError(f"unknown config key(s): {', '.join(unknown)}")
-    for array_name in ("snapshot_dirs", "params", "rclone_params"):
+    for array_name in ("snapshot_dirs", "params", "fiberlet_params", "rclone_params"):
         if array_name not in raw:
             continue
         values = raw[array_name]
         if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
             raise ValueError(f"{array_name} must be an array of strings")
         raw[array_name] = tuple(values)
-    for name in ("catalog_url", "open_data_bucket", "cache_dir", "output_dir", "venv", "atlas_dir", "upload_staging_s3"):
+    for name in ("catalog_url", "open_data_bucket", "cache_dir", "output_dir", "venv", "atlas_dir", "upload_staging_s3", "fiberlet_binary"):
         if name in raw and not isinstance(raw[name], str):
             raise ValueError(f"{name} must be a string")
     if "catalog_max_age_seconds" in raw:
         age = raw["catalog_max_age_seconds"]
         if not isinstance(age, int) or isinstance(age, bool) or age < 0:
             raise ValueError("catalog_max_age_seconds must be a non-negative integer")
+    if "fiberlet_threads" in raw:
+        threads = raw["fiberlet_threads"]
+        if not isinstance(threads, int) or isinstance(threads, bool) or threads <= 0:
+            raise ValueError("fiberlet_threads must be a positive integer")
     return ManagerConfig(**raw)
 
 
@@ -105,6 +113,7 @@ def render_config(config: ManagerConfig = ManagerConfig()) -> str:
     values = asdict(config)
     snapshots = ", ".join(_toml_string(v) for v in values.pop("snapshot_dirs"))
     params = ", ".join(_toml_string(v) for v in values.pop("params"))
+    fiberlet_params = ", ".join(_toml_string(v) for v in values.pop("fiberlet_params"))
     rclone_params = ", ".join(_toml_string(v) for v in values.pop("rclone_params"))
     lines = [
         "# las_manager global configuration",
@@ -117,9 +126,14 @@ def render_config(config: ManagerConfig = ManagerConfig()) -> str:
         f"venv = {_toml_string(values['venv'])}",
         f"atlas_dir = {_toml_string(values['atlas_dir'])}",
         f"upload_staging_s3 = {_toml_string(values['upload_staging_s3'])}",
+        "# Native whole-volume Fiberlet processor; empty resolves vc_fiberlets from PATH.",
+        f"fiberlet_binary = {_toml_string(values['fiberlet_binary'])}",
+        f"fiberlet_threads = {values['fiberlet_threads']}",
         f"catalog_max_age_seconds = {values['catalog_max_age_seconds']}",
         "# Default backend arguments; arguments after `inference run ... --` override these.",
         f"params = [{params}]",
+        "# Additional native Fiberlet arguments; arguments after `fiberlet run ... --` override these.",
+        f"fiberlet_params = [{fiberlet_params}]",
         "# Bulk staging-upload arguments passed to `rclone copy`.",
         f"rclone_params = [{rclone_params}]",
         "",
@@ -159,7 +173,7 @@ def display_config(config: ManagerConfig) -> dict[str, Any]:
     result = asdict(config)
     result["config_path"] = str(config_path())
     result["snapshot_dirs"] = [str(path) for path in config.resolved_snapshot_dirs()]
-    for name in ("cache_dir", "output_dir", "venv", "atlas_dir"):
+    for name in ("cache_dir", "output_dir", "venv", "atlas_dir", "fiberlet_binary"):
         value = config.resolved_path(name)
         result[name] = str(value) if value is not None else ""
     return result

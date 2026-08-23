@@ -20,6 +20,9 @@ COMMAND_REGISTRY: tuple[tuple[Command, str], ...] = (
     (("volume", "prefetch"), "download one volume scale"),
     (("inference", "ls"), "list durable inference records"),
     (("inference", "run"), "launch inference in tmux"),
+    (("fiberlet", "ls"), "list durable Fiberlet processing jobs"),
+    (("fiberlet", "run"), "launch whole-volume Fiberlet preprocessing"),
+    (("fiberlet", "resume"), "resume Fiberlet preprocessing"),
     (("run", "ls"), "list live manager runs"),
     (("tmux", "attach"), "attach or link a run window"),
     (("open-data", "validate"), "validate an inference bundle for Atlas"),
@@ -41,6 +44,7 @@ _OPTIONS: dict[Command, dict[str, tuple[str, ...] | None]] = {
         "--no-prefetch": None, "--legacy-config": (), "--live-fetch": None,
         "--live-cache-gib": (), "--live-fetch-ahead-tiles": (),
     },
+    ("fiberlet", "run"): {"--threads": ()},
     ("open-data", "validate"): {},
     ("open-data", "upload"): {},
 }
@@ -125,6 +129,34 @@ def _dynamic_values(config, marker: str) -> list[tuple[str, str]]:
     return []
 
 
+def _managed_run_candidates(
+    config, *, artifact_kind: str | None = None, job_kind: str | None = None,
+) -> list[tuple[str, str]]:
+    if config is None:
+        return []
+    try:
+        from .runs import read_runs
+
+        result = []
+        for path, record in read_runs(config):
+            if artifact_kind is not None and record.get("artifact_kind") != artifact_kind:
+                continue
+            if job_kind is not None and record.get("job_kind", "inference") != job_kind:
+                continue
+            if record.get("status") != "completed" and artifact_kind is not None:
+                continue
+            source = record.get("source", {})
+            volume = source.get("volume", source) if isinstance(source, dict) else {}
+            detail = (
+                f"{record.get('status', '-')} "
+                f"{volume.get('sample_id', '-')}/{volume.get('volume_id', '-')}"
+            )
+            result.append(_candidate(record.get("run_name", path.name), detail))
+        return result
+    except (FileNotFoundError, RuntimeError, ValueError, OSError):
+        return []
+
+
 def contextual_candidates(config, words: Sequence[str]) -> list[tuple[str, str]]:
     """Return completion candidates for argv words excluding the program name."""
     argv = list(words) or [""]
@@ -200,6 +232,15 @@ def contextual_candidates(config, words: Sequence[str]) -> list[tuple[str, str]]
             candidates = [_candidate(record.selector, "catalog volume") for record in _volume_records(config)]
         elif position == 2:
             candidates = _scale_candidates(config, positionals[1])
+    elif command == ("fiberlet", "run"):
+        if position == 0:
+            candidates = _managed_run_candidates(
+                config, artifact_kind="fiber3d-prediction",
+            )
+        elif position == 1:
+            candidates = _managed_run_candidates(config, artifact_kind="lasagna")
+    elif command == ("fiberlet", "resume") and position == 0:
+        candidates = _managed_run_candidates(config, job_kind="fiberlet")
     elif command in {("tmux", "attach"), ("open-data", "validate"), ("open-data", "upload")} and position == 0 and config is not None:
         try:
             from .runs import read_runs
