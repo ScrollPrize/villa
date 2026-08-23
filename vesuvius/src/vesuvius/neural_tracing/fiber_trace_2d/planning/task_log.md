@@ -1,89 +1,41 @@
-# Task Log: whole-volume fiberlet preprocessing
+# Task Log: managed Fiberlet preprocessing and publication
 
-## 2026-08-22
+## 2026-08-23
 
-- Confirmed sparse eligibility is based only on canonical presence chunks.
-- Confirmed Z/Y/X priority scheduling is sufficient; parallel completion need
-  not be strictly ordered.
-- Confirmed the intermediate anchor cache is a durable output and remains by
-  default. The final output independently contains anchors and fiberlets.
-- Existing `--presence-floor` defaults to `0.05`; cells with no usable owned
-  observation at or above it return before seed generation and refinement.
-- Existing `--minimum-support` is a separate post-fit acceptance threshold.
-- Existing on-demand preprocessing already owns anchor dependency expansion,
-  extraction, typed generated caches, and paired prefix/route publication; the
-  new command will reuse those paths.
-- Independent review identified that sparse absent chunks and a combined-root
-  graph reader needed explicit contracts. Added a persisted active-chunk index,
-  completion binding, inactive-as-empty reads only after full completion, and
-  read-only anchor/path cache facets for one combined root.
-- Verified the current fitting implementation already gates seed generation on
-  usable owned-cell observations at `--presence-floor`; halo evidence cannot
-  start an otherwise empty cell.
-- Focused `test_fiberlet_storage` and `test_fiber_anchors` runs pass with
-  combined-root graph, sparse mapping, and missing/empty/nonempty presence scan
-  coverage.
-- Follow-up requirement supersedes the persisted activity/completion design:
-  remove `active_chunks.bin`, `dataset.complete`, and per-chunk completion
-  markers. Every invocation must reconstruct expected chunks from input
-  presence and inspect anchor/final payloads directly.
-- Individual payload files remain fsync-and-rename atomic. A final chunk is
-  complete only when anchors, prefixes, and routes all exist and validate as a
-  compatible tuple. Partial tuples are resumable, not complete.
-- Atomic-write helpers remove temporary files on normal failures, but a hard
-  process exit can leave `.tmp.<process-tag>.<counter>` files. Resume and final
-  shutdown cleanup for that exact suffix pattern is part of this follow-up.
-- Independent review required the fresh presence-derived expected set to be
-  configured for every stored combined reader, not only during preprocessing;
-  no standalone reader may infer activity from absent output files.
-- The review also required marker removal from ordinary prefix/route datasets,
-  migration cleanup for legacy marker/index artifacts, validation of every
-  anchor dependency, and safe shared temp cleanup under exclusive root locks.
-- Unexpected final payloads are physically retained but hidden by the current
-  expected set. This avoids unrelated destructive cleanup while preventing
-  stale data from entering the graph. Extra intermediate anchors remain valid
-  reusable cache entries.
-- The focused Clang build exposed an existing aggregate-narrowing error in
-  `FiberletQuantization.cpp`. Added the explicit `int`-to-`double` cast required
-  by Clang; this is a compile-only portability correction with unchanged value.
-- Removed all activity/completion persistence and marker-gated reads. Ordinary
-  fiberlet chunks now require a valid prefix/route pair; combined chunks require
-  a valid anchor/prefix/route tuple. Partial tuples remain invisible and resume
-  through matching immutable payload reuse.
-- `preprocess-volume` now rescans input presence every invocation, configures
-  the expected set in memory, visits every required anchor dependency, and
-  validates each existing or newly published final tuple exactly once.
-- Added shared exact-suffix atomic-temp cleanup and exclusive directory locks.
-  Both roots are cleaned before opening, after workers stop, and via a
-  non-throwing scope guard during exception unwinding.
-- Focused validation:
-  `ctest --test-dir volume-cartographer/build/dev-quickbuild-clang
-  --output-on-failure -R 'test_(fiberlet_storage|fiber_anchors)'` passed 2/2
-  tests (21 storage cases and 86 anchor cases). Both the Clang quick build and
-  regular `volume-cartographer/build/bin/vc_fiberlets` build succeeded.
-- A bounded production `preprocess-volume` smoke run was not performed because
-  the command currently has no bounded-region mode; focused synthetic storage
-  and sparse-selection tests cover the changed resume semantics.
-- Follow-up requirement: slow whole-volume stages need a live one-second
-  progress/ETA/size line plus a persistent newline every minute. Size estimates
-  use the mean payload bytes of all visited expected chunks and therefore become
-  more stable as each stage advances.
-- Implemented one independent progress ticker for each long-running stage so a
-  blocked chunk does not suppress updates. Both generated and resumed chunks
-  contribute their actual compressed payload-file sizes; projected size excludes
-  Zarr metadata.
-- Rebuilt `vc_fiberlets`, `test_fiberlet_storage`, and `test_fiber_anchors` in
-  the quick Clang tree and reran both focused tests successfully. Rebuilt the
-  regular `build/bin/vc_fiberlets` target successfully.
-- The initial implementation incorrectly treated anchor and final Z/Y/X order
-  as two independent phases. Replaced that global barrier with a tested dynamic
-  scheduler: ready fiberlets in the current Z slab have priority, remaining
-  slots generate earliest-needed anchors, and anchor lookahead cannot cause
-  later-Z final output to overtake the active slab.
-- Whole-volume extraction now uses single-threaded chunk kernels behind one
-  `--threads`-sized pool, so ready fiberlets and anchor dependencies share a
-  single extraction-worker budget. Resume-only anchor-cache repairs rank after
-  dependencies that unblock incomplete final outputs.
-- The quick Clang `vc_fiberlets`, `test_fiberlet_storage`, and
-  `test_fiber_anchors` targets rebuilt successfully; both focused tests passed.
-  The regular `build/bin/vc_fiberlets` target also rebuilt successfully.
+- Planning only; no implementation has been started.
+- The active `fiber-lets3` branch contains the native whole-volume command but
+  currently predates the tracked `lasagna/manager` sources. Current
+  `origin/main` contains the manager implementation. The implementation must
+  integrate main first rather than copying manager code or using untracked
+  bytecode.
+- Existing manager orchestration is reusable but still names its generic
+  process state, completion validation, and upload APIs as inference. The plan
+  extracts one shared managed-job path and keeps inference records compatible.
+- The native final combined Zarr already contains compact anchors, prefixes,
+  and routes. Its separate float anchor Zarr is a durable resume cache and does
+  not need to be uploaded.
+- The native dataset fingerprint currently includes absolute local manifest
+  paths and persists those paths in metadata. That is acceptable for an
+  experimental local cache but not for a portable/open-data artifact. The plan
+  separates runtime locations from stable manifest-hash/source identity before
+  publication support is enabled.
+- Atlas has no existing Fiberlet data type. Existing `lasagna` represents dense
+  neural prediction bundles and requires a trained model ID plus Lasagna
+  manifest/OME-Zarr layout, so a combined sparse Fiberlet graph must not be
+  forced through that contract. The plan adds one minimal derived volume data
+  type and no fake model.
+- Local Fiberlet processing may precede publication of its inputs. Atlas
+  validation/upload will require the referenced Fiber and normal prediction
+  identities to exist so the published dependency graph is resolvable.
+- Existing untracked compiled Python extensions under `lasagna/` were observed
+  and left untouched.
+- Independent review identified missing resume semantics, native completion
+  validation, bounded-memory sparse upload, passthrough ownership checks, and
+  several places where existing manager/Atlas helpers must be extracted rather
+  than copied. The plan now includes those corrections.
+- The portable metadata contract was clarified: it is not merely a settings
+  fingerprint checked against caller configuration. The final Zarr must store
+  every effective setting needed by a reader to construct compatible decoders
+  and interpret coordinates. Canonical global settings and stable source
+  identities feed the fingerprints; runtime filesystem paths do not. Paths
+  remain only in private manager execution records.

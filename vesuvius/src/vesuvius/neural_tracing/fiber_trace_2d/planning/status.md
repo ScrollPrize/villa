@@ -1,25 +1,19 @@
-# Status: whole-volume fiberlet preprocessing
+# Status: managed Fiberlet preprocessing and publication
 
 - [x] Capture the user requirements in `task.md`.
-- [x] Write the implementation and validation plan.
-- [x] Independently review the plan against the task and specifications.
-- [x] Implement presence-only sparse eligibility.
-- [x] Implement combined dataset completion and resume semantics.
-- [x] Implement whole-volume orchestration and CLI.
-- [x] Add focused regression tests.
-- [x] Update specification, docs, changelog, and task log.
-- [x] Build and run focused tests.
-- [ ] Run a bounded representative smoke test.
-- [x] Capture marker/index removal and temporary cleanup requirements.
-- [x] Update the implementation plan for scan-only completion.
-- [x] Independently review the revised plan.
-- [x] Remove persisted activity and completion metadata.
-- [x] Implement payload-only completeness scans and partial-tuple recovery.
-- [x] Implement stale atomic temporary cleanup.
-- [x] Update focused tests and documentation.
-- [x] Rebuild and run focused validation.
-- [x] Add one-second progress, ETA, and size reporting.
-- [x] Rebuild and re-run focused validation after progress reporting.
-- [x] Replace the global anchor barrier with dynamic dependency scheduling.
-- [x] Add fiberlet-first and Z-frontier scheduler regression coverage.
-- [x] Rebuild and re-run focused validation after pipeline scheduling.
+- [x] Inspect the native whole-volume Fiberlet command and storage contract.
+- [x] Inspect `las_manager` run, tmux, completion, provenance, and upload flows.
+- [x] Inspect existing Atlas Lasagna ingestion and data-sync conventions.
+- [x] Draft the implementation, testing, specification, docs, and changelog plan.
+- [x] Independently review the plan against `task.md`, `specs.md`, `plan.md`,
+      current code, and the no-duplication requirement.
+- [ ] Obtain user approval for the plan.
+- [ ] Bring current main and `las_manager` onto the Fiberlet branch.
+- [ ] Generalize managed-job orchestration without inference regressions.
+- [ ] Add Fiberlet input resolution, launch, provenance, and completion.
+- [ ] Make native Fiberlet source identity portable and location-independent.
+- [ ] Add completion, help, listing, and documentation.
+- [ ] Reuse staging upload for Fiberlet artifacts.
+- [ ] Add minimal Atlas Fiberlet ingestion and copy-first publication.
+- [ ] Run manager, native Fiberlet, Atlas, and end-to-end validation.
+- [ ] Update specs, docs, changelog, status, and task log with final results.

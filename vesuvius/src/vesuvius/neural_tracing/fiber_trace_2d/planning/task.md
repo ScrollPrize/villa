@@ -1,34 +1,33 @@
-# Task: preprocess a whole fiber volume
+# Task: manage whole-volume Fiberlet preprocessing and publication
 
-Add a `vc_fiberlets` preprocessing command that generates anchors and
-fiberlets for every relevant spatial chunk of a fiber inference volume.
+Integrate the existing native whole-volume command
 
-- Scan only the canonical presence array to determine sparse eligibility.
-- Do not process an output chunk when every overlapping input presence chunk
-  is missing or decodes to all zero.
-- Generate a durable, resumable float anchor-cache Zarr as the dependency
-  source for final chunks; do not impose a whole-volume anchor barrier.
-- Keep that anchor cache after successful completion.
-- Generate a second, final Zarr containing anchors, fiberlet prefixes, and
-  routes together using the compact default representation: float positions,
-  compact directions, and fixed sqrt-density `uint16` costs.
-- Schedule work in Z/Y/X order. Parallel work may complete out of order.
-- Use one global chunk-worker budget. Schedule every ready final fiberlet in the
-  current Z slab first, then spend remaining worker capacity on the earliest
-  missing anchor dependencies. Anchor work may look ahead, but final output
-  work must not cross the current Z-slab frontier.
-- Reuse the existing anchor extraction, fiberlet extraction, dependency,
-  serialization, and generated-cache implementations.
-- Retain `--presence-floor` as the observation threshold. A cell with no
-  usable observation at or above the floor must exit before fitting.
-- Do not persist an active-chunk index or dataset/per-chunk completion markers.
-  Reconstruct expected work from the input presence volume on every run and
-  determine cache/output completeness solely from the payload chunks found.
-- Keep every individual cache/output payload publication atomic. Recover
-  partial final triples by reusing matching files and generate missing files.
-- Remove stale atomic-write temporary files from the anchor cache and final
-  output on resume and after preprocessing finishes.
-- Report anchor and final-output progress on one live terminal line refreshed
-  about once per second, with a persistent newline at least once per minute.
-  Include completed/total chunks, percent, elapsed time, rate, ETA, and
-  current/projected payload size.
+```text
+vc_fiberlets preprocess-volume FIBER_MANIFEST OUTPUT_ZARR \
+  --normal-manifest NORMAL_MANIFEST --threads 32
+```
+
+into `las_manager` on the Fiberlet development branch.
+
+- Add a `fiberlet` command group that launches preprocessing from completed,
+  local manager-produced Fiber 3D and regular Lasagna prediction runs.
+- Run the native process as a durable manager job in tmux with the same run
+  listing, attachment, logging, status reconciliation, and command recording
+  used by inference.
+- Keep the resumable float anchor cache local while making the final combined
+  Fiberlet Zarr a portable artifact.
+- Make the final Zarr self-describing: persist every effective processing,
+  coordinate, layout, storage, and codec setting required to construct a
+  compatible reader, together with stable source/model/scale identities.
+- Derive dataset identity from that canonical structured metadata. Global
+  processing settings belong in the identity; runtime directories, manifest
+  paths, cache paths, and output paths do not.
+- Reuse `las_manager open-data validate` and `open-data upload` for completed
+  Fiberlet jobs.
+- Add the minimal Atlas data type, ingestion, copy-first publication, and
+  public catalogue support needed to publish Fiberlet Zarrs. Fiberlets are a
+  derived representation of an existing volume, not a new trained model.
+- Keep existing Fiber/Lasagna inference and upload behavior compatible.
+
+This task begins with planning only. Do not implement until the plan is
+approved.
