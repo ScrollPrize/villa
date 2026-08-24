@@ -7,6 +7,7 @@ import AtlasRendererProvider, {
 } from "./AtlasRendererProvider";
 import useDarkModeGuard from "./useDarkModeGuard";
 import useAtlasData from "./useAtlasData";
+import { isPrizeEligible } from "./prizeEligibility";
 
 // Native React rebuild of the /data_browser index. Replaces the old component
 // of the same import name (the mdx imports this default export). Mirrors the
@@ -51,6 +52,7 @@ function AtlasBrowserInner() {
     ink: false,
     ink3d: false,
     ct: false,
+    prize: false,
   });
   const toggleFeat = (k) => setFeat((f) => ({ ...f, [k]: !f[k] }));
 
@@ -91,6 +93,7 @@ function AtlasBrowserInner() {
     if (feat.ink && !(s.stages && s.stages.ink)) return false; // ink pipeline stage (matches the card badge + dashboard funnel)
     if (feat.ink3d && !s.hasInk3d) return false;
     if (feat.ct && !(s.mesh || (s.ctVolumes && s.ctVolumes.length))) return false;
+    if (feat.prize && !isPrizeEligible(s.id)) return false;
     if (q) {
       const hay = `${s.id} ${s.label || ""} ${s.display || ""} ${
         (s.content && s.content.work) || ""
@@ -170,6 +173,8 @@ function AtlasBrowserInner() {
           {featChip("ink", "Ink")}
           {featChip("ink3d", "3D ink")}
           {featChip("ct", "CT / 3D")}
+          <span className="chipsep" aria-hidden="true" />
+          {featChip("prize", "🏆 Prize eligible")}
           <span className="hint">
             {view.length} of {scrolls.length} samples
           </span>

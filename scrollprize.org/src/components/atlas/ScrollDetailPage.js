@@ -13,6 +13,7 @@ import ReadingsGallery from "./ReadingsGallery";
 import InkSegmentsGallery from "./InkSegmentsGallery";
 import useDarkModeGuard from "./useDarkModeGuard";
 import { loadAtlasIndex } from "./useAtlasData";
+import { isPrizeEligible } from "./prizeEligibility";
 
 // ScrollDetailPage — the per-scroll detail route for the rebuilt /data_browser.
 // This is a Docusaurus ROUTE component: a plugin injects one merged `scroll`
@@ -206,6 +207,15 @@ export default function ScrollDetailPage(props) {
             >
               {scroll.type || "sample"}
             </span>
+            {isPrizeEligible(scroll.id) ? (
+              <Link
+                className="prize-tag"
+                to="/prizes"
+                title="An open Vesuvius Challenge prize can be won on this scroll — see the prizes page"
+              >
+                🏆 prize eligible
+              </Link>
+            ) : null}
           </h1>
           <div className="repo">📍 {scroll.repository || ""}</div>
 
