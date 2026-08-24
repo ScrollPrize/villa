@@ -1078,6 +1078,599 @@ FiberletChunkRoutePopulation collectFiberletChunkRoutePopulation(
     return result;
 }
 
+double appendFiberletChunkRouteMacroLoss(
+    double prefixLoss,
+    double incomingJoinLoss,
+    const FiberletChunkRouteMacroDirection& direction)
+{
+    if (!direction.live || direction.edgeLosses.empty() ||
+        direction.internalJoinLosses.size() + 1 !=
+            direction.edgeLosses.size()) {
+        throw std::invalid_argument(
+            "fiberlet chunk-route macro loss sequence is invalid");
+    }
+    double result = prefixLoss + incomingJoinLoss +
+        direction.edgeLosses.front();
+    for (std::size_t index = 1; index < direction.edgeLosses.size(); ++index) {
+        result = result + direction.internalJoinLosses[index - 1] +
+            direction.edgeLosses[index];
+    }
+    return result;
+}
+
+bool canAppendFiberletChunkRouteMacro(
+    const FiberletChunkRouteMacroDirection& direction,
+    std::span<const FiberletStorageKey> visitedAnchors)
+{
+    if (!direction.live || direction.anchors.size() < 2)
+        return false;
+    for (std::size_t index = 1; index < direction.anchors.size(); ++index) {
+        if (std::find(
+                visitedAnchors.begin(), visitedAnchors.end(),
+                direction.anchors[index]) != visitedAnchors.end()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+FiberletChunkRouteSimplificationReport simplifyFiberletChunkRoutes(
+    const FiberletChunkGraphSource& graph,
+    const FiberletChunkRouteAnalysisConfig& config,
+    std::span<const FiberletStorageId> retainedPhysicalFiberlets)
+{
+    FiberletChunkRouteSimplificationReport report;
+    report.minimumBaseXYZ = config.minimumBaseXYZ;
+    report.maximumBaseXYZ = config.maximumBaseXYZ;
+    std::vector<FiberletStorageId> selected(
+        retainedPhysicalFiberlets.begin(), retainedPhysicalFiberlets.end());
+    std::sort(selected.begin(), selected.end());
+    if (std::adjacent_find(selected.begin(), selected.end()) != selected.end()) {
+        throw std::invalid_argument(
+            "fiberlet simplification input contains duplicate physical IDs");
+    }
+
+    std::vector<vc::render::ChunkKey> seedChunks;
+    const auto local = materializeChunkRouteGraph(
+        graph, config, seedChunks, true);
+    report.inputAnchors = local.anchors.size();
+    report.inputInsideAnchors = static_cast<std::size_t>(std::count_if(
+        local.anchors.begin(), local.anchors.end(),
+        [](const auto& anchor) { return anchor.inside; }));
+    report.inputPhysicalFiberlets = selected.size();
+    report.inputDirectedStates = selected.size() * 2;
+
+    std::vector<bool> selectedEdge(local.physicalFiberlets.size(), false);
+    for (const auto& id : selected) {
+        const auto found = std::lower_bound(
+            local.physicalFiberlets.begin(), local.physicalFiberlets.end(), id);
+        if (found == local.physicalFiberlets.end() || *found != id) {
+            throw std::invalid_argument(
+                "fiberlet simplification input is outside the analysis graph");
+        }
+        selectedEdge[static_cast<std::size_t>(
+            found - local.physicalFiberlets.begin())] = true;
+    }
+
+    std::vector<bool> active(local.arcs.size(), false);
+    for (std::size_t edge = 0; edge < selectedEdge.size(); ++edge) {
+        if (selectedEdge[edge]) {
+            active[edge * 2] = true;
+            active[edge * 2 + 1] = true;
+        }
+    }
+    std::vector<std::vector<std::size_t>> predecessors(local.arcs.size());
+    for (std::size_t incoming = 0; incoming < local.successors.size();
+         ++incoming) {
+        if (!active[incoming])
+            continue;
+        for (const auto& successor : local.successors[incoming]) {
+            if (active[successor.arc])
+                predecessors[successor.arc].push_back(incoming);
+        }
+    }
+    std::vector<bool> forward(local.arcs.size(), false);
+    std::vector<std::size_t> pending;
+    for (const auto entry : local.entries) {
+        if (active[entry] && !forward[entry]) {
+            forward[entry] = true;
+            pending.push_back(entry);
+        }
+    }
+    for (std::size_t index = 0; index < pending.size(); ++index) {
+        for (const auto& successor : local.successors[pending[index]]) {
+            if (active[successor.arc] && !forward[successor.arc]) {
+                forward[successor.arc] = true;
+                pending.push_back(successor.arc);
+            }
+        }
+    }
+    std::vector<bool> backward(local.arcs.size(), false);
+    pending.clear();
+    for (std::size_t arc = 0; arc < local.arcs.size(); ++arc) {
+        if (active[arc] &&
+            local.anchors[local.arcs[arc].sourceAnchor].inside &&
+            !local.anchors[local.arcs[arc].targetAnchor].inside) {
+            backward[arc] = true;
+            pending.push_back(arc);
+        }
+    }
+    for (std::size_t index = 0; index < pending.size(); ++index) {
+        for (const auto predecessor : predecessors[pending[index]]) {
+            if (!backward[predecessor]) {
+                backward[predecessor] = true;
+                pending.push_back(predecessor);
+            }
+        }
+    }
+    std::vector<bool> live(local.arcs.size(), false);
+    for (std::size_t arc = 0; arc < local.arcs.size(); ++arc)
+        live[arc] = active[arc] && forward[arc] && backward[arc];
+    report.liveDirectedStates = static_cast<std::size_t>(
+        std::count(live.begin(), live.end(), true));
+    report.deadDirectedStatesRemoved =
+        report.inputDirectedStates - report.liveDirectedStates;
+
+    std::vector<bool> liveEdge(local.physicalFiberlets.size(), false);
+    for (std::size_t edge = 0; edge < local.physicalFiberlets.size(); ++edge) {
+        if (!selectedEdge[edge])
+            continue;
+        const std::array<bool, 2> directions{
+            live[edge * 2], live[edge * 2 + 1]};
+        if (directions[0] || directions[1]) {
+            liveEdge[edge] = true;
+            report.livePhysicalFiberletIds.push_back(
+                local.physicalFiberlets[edge]);
+            report.livePhysicalDirections.push_back(directions);
+        }
+    }
+    report.livePhysicalFiberlets = report.livePhysicalFiberletIds.size();
+    report.deadPhysicalFiberletsRemoved =
+        report.inputPhysicalFiberlets - report.livePhysicalFiberlets;
+
+    std::vector<std::vector<std::size_t>> incident(local.anchors.size());
+    std::set<FiberletStorageKey> retainedInside;
+    std::set<FiberletStorageKey> portals;
+    for (std::size_t edge = 0; edge < liveEdge.size(); ++edge) {
+        if (!liveEdge[edge])
+            continue;
+        const auto& physical = local.arcs[edge * 2];
+        incident[physical.sourceAnchor].push_back(edge);
+        incident[physical.targetAnchor].push_back(edge);
+        for (const auto anchorIndex :
+             {physical.sourceAnchor, physical.targetAnchor}) {
+            const auto& anchor = local.anchors[anchorIndex];
+            if (anchor.inside)
+                retainedInside.insert(anchor.key);
+            else
+                portals.insert(anchor.key);
+        }
+    }
+    report.retainedInsideAnchorIds.assign(
+        retainedInside.begin(), retainedInside.end());
+    report.boundaryPortalIds.assign(portals.begin(), portals.end());
+    report.retainedInsideAnchors = report.retainedInsideAnchorIds.size();
+    report.unusedInsideAnchorsRemoved =
+        report.inputInsideAnchors - report.retainedInsideAnchors;
+    report.boundaryPortals = report.boundaryPortalIds.size();
+    report.retainedAnchors =
+        report.retainedInsideAnchors + report.boundaryPortals;
+    report.unusedAnchorsRemoved =
+        report.inputAnchors - report.retainedAnchors;
+    for (auto& edges : incident)
+        std::sort(edges.begin(), edges.end());
+
+    auto arcFrom = [&](std::size_t edge, std::size_t sourceAnchor) {
+        const std::size_t forwardArc = edge * 2;
+        if (local.arcs[forwardArc].sourceAnchor == sourceAnchor)
+            return forwardArc;
+        if (local.arcs[forwardArc + 1].sourceAnchor == sourceAnchor)
+            return forwardArc + 1;
+        throw std::logic_error(
+            "fiberlet simplification edge does not touch its anchor");
+    };
+    auto arcTo = [&](std::size_t edge, std::size_t targetAnchor) {
+        return arcFrom(edge, targetAnchor) ^ 1U;
+    };
+    auto successorLoss = [&](std::size_t incoming,
+                             std::size_t outgoing) -> std::optional<double> {
+        const auto& successors = local.successors[incoming];
+        const auto found = std::find_if(
+            successors.begin(), successors.end(), [&](const auto& value) {
+                return value.arc == outgoing;
+            });
+        if (found == successors.end())
+            return std::nullopt;
+        return found->joinLoss;
+    };
+
+    std::vector<bool> contractible(local.anchors.size(), false);
+    for (std::size_t anchor = 0; anchor < local.anchors.size(); ++anchor) {
+        if (!local.anchors[anchor].inside || incident[anchor].size() != 2)
+            continue;
+        const std::size_t first = incident[anchor][0];
+        const std::size_t second = incident[anchor][1];
+        const std::size_t firstIn = arcTo(first, anchor);
+        const std::size_t firstOut = arcFrom(first, anchor);
+        const std::size_t secondIn = arcTo(second, anchor);
+        const std::size_t secondOut = arcFrom(second, anchor);
+        if (live[firstIn] && live[firstOut] && live[secondIn] &&
+            live[secondOut] && successorLoss(firstIn, secondOut) &&
+            successorLoss(secondIn, firstOut)) {
+            contractible[anchor] = true;
+            ++report.contractibleInsideAnchors;
+        }
+    }
+
+    auto reverseArc = [](std::size_t arc) { return arc ^ 1U; };
+    auto makeDirection = [&](std::span<const std::size_t> arcs) {
+        FiberletChunkRouteMacroDirection direction;
+        if (arcs.empty())
+            return direction;
+        direction.live = std::all_of(
+            arcs.begin(), arcs.end(), [&](std::size_t arc) {
+                return live[arc];
+            });
+        direction.anchors.push_back(
+            local.anchors[local.arcs[arcs.front()].sourceAnchor].key);
+        double loss = 0.0;
+        bool first = true;
+        for (std::size_t index = 0; index < arcs.size(); ++index) {
+            const auto arc = arcs[index];
+            direction.physicalFiberlets.push_back(local.arcs[arc].source.id);
+            direction.anchors.push_back(
+                local.anchors[local.arcs[arc].targetAnchor].key);
+            direction.edgeLosses.push_back(local.arcs[arc].loss);
+            direction.edgeLengthsPredictionVoxels.push_back(
+                local.arcs[arc].lengthPredictionVoxels);
+            direction.diagnosticLengthPredictionVoxels +=
+                local.arcs[arc].lengthPredictionVoxels;
+            if (first) {
+                loss = local.arcs[arc].loss;
+                first = false;
+            } else {
+                const auto join = successorLoss(arcs[index - 1], arc);
+                if (!join) {
+                    direction.live = false;
+                    direction.internalJoinLosses.push_back(0.0);
+                } else {
+                    direction.internalJoinLosses.push_back(*join);
+                    loss = loss + *join + local.arcs[arc].loss;
+                }
+            }
+        }
+        direction.diagnosticLoss = loss;
+        return direction;
+    };
+    auto appendMacro = [&](const std::vector<std::size_t>& forwardArcs) {
+        FiberletChunkRouteMacro macro;
+        macro.index = report.macros.size();
+        macro.directions[0] = makeDirection(forwardArcs);
+        std::vector<std::size_t> reverseArcs;
+        reverseArcs.reserve(forwardArcs.size());
+        for (auto iterator = forwardArcs.rbegin();
+             iterator != forwardArcs.rend(); ++iterator) {
+            reverseArcs.push_back(reverseArc(*iterator));
+        }
+        macro.directions[1] = makeDirection(reverseArcs);
+        const auto& anchors = macro.directions[0].anchors;
+        if (anchors.size() >= 2) {
+            const auto first = std::find_if(
+                local.anchors.begin(), local.anchors.end(),
+                [&](const auto& value) { return value.key == anchors.front(); });
+            const auto second = std::find_if(
+                local.anchors.begin(), local.anchors.end(),
+                [&](const auto& value) { return value.key == anchors.back(); });
+            macro.firstBoundaryPortal =
+                first != local.anchors.end() && !first->inside;
+            macro.secondBoundaryPortal =
+                second != local.anchors.end() && !second->inside;
+        }
+        report.macros.push_back(std::move(macro));
+    };
+
+    std::vector<bool> visitedEdge(local.physicalFiberlets.size(), false);
+    for (std::size_t start = 0; start < local.anchors.size(); ++start) {
+        if (contractible[start])
+            continue;
+        for (const std::size_t firstEdge : incident[start]) {
+            if (visitedEdge[firstEdge])
+                continue;
+            std::vector<std::size_t> arcs;
+            std::vector<std::size_t> edges;
+            std::size_t currentAnchor = start;
+            std::size_t edge = firstEdge;
+            bool cycle = false;
+            while (true) {
+                if (std::find(edges.begin(), edges.end(), edge) != edges.end() ||
+                    visitedEdge[edge]) {
+                    cycle = true;
+                    break;
+                }
+                edges.push_back(edge);
+                const auto arc = arcFrom(edge, currentAnchor);
+                arcs.push_back(arc);
+                const auto target = local.arcs[arc].targetAnchor;
+                if (!contractible[target]) {
+                    if (target == start && edges.size() > 1)
+                        cycle = true;
+                    break;
+                }
+                const auto& next = incident[target];
+                edge = next[0] == edge ? next[1] : next[0];
+                currentAnchor = target;
+            }
+            if (cycle) {
+                for (const auto physical : edges) {
+                    if (!visitedEdge[physical]) {
+                        visitedEdge[physical] = true;
+                        appendMacro({arcFrom(
+                            physical,
+                            local.arcs[physical * 2].sourceAnchor)});
+                    }
+                }
+            } else {
+                for (const auto physical : edges)
+                    visitedEdge[physical] = true;
+                appendMacro(arcs);
+            }
+        }
+    }
+    for (std::size_t edge = 0; edge < liveEdge.size(); ++edge) {
+        if (liveEdge[edge] && !visitedEdge[edge]) {
+            visitedEdge[edge] = true;
+            appendMacro({edge * 2});
+        }
+    }
+    report.physicalMacros = report.macros.size();
+    report.physicalFiberletsMerged =
+        report.livePhysicalFiberlets - report.physicalMacros;
+    std::vector<double> macroSizes;
+    macroSizes.reserve(report.macros.size());
+    for (const auto& macro : report.macros) {
+        macroSizes.push_back(static_cast<double>(
+            macro.directions[0].physicalFiberlets.size()));
+    }
+    report.physicalFiberletsPerMacro =
+        chunkRouteDistribution(std::move(macroSizes));
+
+    std::map<DirectedFiberletStorageId, std::size_t> arcById;
+    for (std::size_t arc = 0; arc < local.arcs.size(); ++arc)
+        arcById.emplace(local.arcs[arc].source.id, arc);
+    const auto directedIndex = [](FiberletChunkRouteDirectedMacroId id) {
+        return id.macro * 2 + static_cast<std::size_t>(id.reverse);
+    };
+    std::vector<std::optional<FiberletChunkRouteDirectedMacroId>>
+        macroByFirstArc(local.arcs.size());
+    std::vector<std::size_t> lastArc(report.macros.size() * 2, 0);
+    for (const auto& macro : report.macros) {
+        for (std::size_t reverse = 0; reverse < 2; ++reverse) {
+            const auto& direction = macro.directions[reverse];
+            if (!direction.live)
+                continue;
+            ++report.liveDirectedMacros;
+            const auto first = arcById.at(direction.physicalFiberlets.front());
+            const auto last = arcById.at(direction.physicalFiberlets.back());
+            const FiberletChunkRouteDirectedMacroId id{
+                macro.index, reverse != 0};
+            if (macroByFirstArc[first]) {
+                throw std::logic_error(
+                    "fiberlet simplification has duplicate macro starts");
+            }
+            macroByFirstArc[first] = id;
+            lastArc[directedIndex(id)] = last;
+        }
+    }
+    std::vector<std::vector<FiberletChunkRouteMacroTransition>> adjacency(
+        report.macros.size() * 2);
+    for (const auto& macro : report.macros) {
+        for (std::size_t reverse = 0; reverse < 2; ++reverse) {
+            const FiberletChunkRouteDirectedMacroId incoming{
+                macro.index, reverse != 0};
+            if (!macro.directions[reverse].live)
+                continue;
+            for (const auto& successor :
+                 local.successors[lastArc[directedIndex(incoming)]]) {
+                if (!live[successor.arc] ||
+                    !macroByFirstArc[successor.arc]) {
+                    continue;
+                }
+                FiberletChunkRouteMacroTransition transition{
+                    incoming, *macroByFirstArc[successor.arc],
+                    successor.joinLoss};
+                adjacency[directedIndex(incoming)].push_back(transition);
+                report.transitions.push_back(transition);
+            }
+            auto& values = adjacency[directedIndex(incoming)];
+            std::sort(values.begin(), values.end(), [](const auto& left,
+                                                       const auto& right) {
+                return left.outgoing < right.outgoing;
+            });
+        }
+    }
+    report.macroTransitions = report.transitions.size();
+    for (const auto& macro : report.macros) {
+        for (std::size_t reverse = 0; reverse < 2; ++reverse) {
+            if (!macro.directions[reverse].live)
+                continue;
+            const auto count = adjacency[macro.index * 2 + reverse].size();
+            if (count == 0)
+                ++report.zeroContinuationStates;
+            else if (count == 1)
+                ++report.forcedContinuationStates;
+            else
+                ++report.branchingStates;
+        }
+    }
+
+    const std::size_t directedCount = report.macros.size() * 2;
+    std::vector<std::size_t> incomingCounts(directedCount, 0);
+    for (const auto& transition : report.transitions)
+        ++incomingCounts[directedIndex(transition.outgoing)];
+    std::vector<std::optional<FiberletChunkRouteMacroTransition>>
+        forcedNext(directedCount);
+    std::vector<std::size_t> forcedPredecessors(directedCount, 0);
+    for (std::size_t state = 0; state < directedCount; ++state) {
+        if (adjacency[state].size() != 1)
+            continue;
+        const auto transition = adjacency[state].front();
+        if (incomingCounts[directedIndex(transition.outgoing)] != 1)
+            continue;
+        const auto current = FiberletChunkRouteDirectedMacroId{
+            state / 2, state % 2 != 0};
+        const auto& currentDirection = report.macros[current.macro]
+            .directions[static_cast<std::size_t>(current.reverse)];
+        const auto& nextDirection = report.macros[transition.outgoing.macro]
+            .directions[static_cast<std::size_t>(
+                transition.outgoing.reverse)];
+        if (!canAppendFiberletChunkRouteMacro(
+                nextDirection, currentDirection.anchors)) {
+            continue;
+        }
+        forcedNext[state] = transition;
+        ++forcedPredecessors[directedIndex(transition.outgoing)];
+    }
+
+    // Functional forced-successor cycles cannot be replaced by a linear
+    // macro without changing their topology. Leave every state in such a
+    // cycle explicit.
+    std::vector<bool> forcedCycle(directedCount, false);
+    std::vector<std::uint8_t> finished(directedCount, 0);
+    std::vector<std::ptrdiff_t> pathPosition(directedCount, -1);
+    for (std::size_t start = 0; start < directedCount; ++start) {
+        if (finished[start] || !forcedNext[start])
+            continue;
+        std::vector<std::size_t> path;
+        std::size_t current = start;
+        while (!finished[current] && pathPosition[current] < 0 &&
+               forcedNext[current]) {
+            pathPosition[current] = static_cast<std::ptrdiff_t>(path.size());
+            path.push_back(current);
+            current = directedIndex(forcedNext[current]->outgoing);
+        }
+        if (pathPosition[current] >= 0) {
+            for (std::size_t index = static_cast<std::size_t>(
+                     pathPosition[current]);
+                 index < path.size(); ++index) {
+                forcedCycle[path[index]] = true;
+            }
+        }
+        for (const auto state : path) {
+            finished[state] = 1;
+            pathPosition[state] = -1;
+        }
+    }
+
+    std::vector<bool> consumed(directedCount, false);
+    auto buildRollout = [&](std::size_t start) {
+        const FiberletChunkRouteDirectedMacroId startId{
+            start / 2, start % 2 != 0};
+        const auto& initial = report.macros[startId.macro]
+            .directions[static_cast<std::size_t>(startId.reverse)];
+        FiberletChunkRouteDeterministicRollout rollout;
+        rollout.start = startId;
+        rollout.macros.push_back(startId);
+        rollout.anchors = initial.anchors;
+        rollout.diagnosticLoss = initial.diagnosticLoss;
+        rollout.diagnosticLengthPredictionVoxels =
+            initial.diagnosticLengthPredictionVoxels;
+        auto current = start;
+        while (forcedNext[current]) {
+            const auto transition = *forcedNext[current];
+            const auto nextIndex = directedIndex(transition.outgoing);
+            if (forcedCycle[nextIndex] || consumed[nextIndex])
+                break;
+            const auto& next = report.macros[transition.outgoing.macro]
+                .directions[static_cast<std::size_t>(
+                    transition.outgoing.reverse)];
+            if (!canAppendFiberletChunkRouteMacro(next, rollout.anchors))
+                break;
+            rollout.diagnosticLoss = appendFiberletChunkRouteMacroLoss(
+                rollout.diagnosticLoss, transition.joinLoss, next);
+            rollout.diagnosticLengthPredictionVoxels +=
+                next.diagnosticLengthPredictionVoxels;
+            rollout.transitionJoinLosses.push_back(transition.joinLoss);
+            rollout.macros.push_back(transition.outgoing);
+            rollout.anchors.insert(
+                rollout.anchors.end(), next.anchors.begin() + 1,
+                next.anchors.end());
+            current = nextIndex;
+        }
+        if (rollout.macros.size() <= 1)
+            return;
+        for (const auto id : rollout.macros)
+            consumed[directedIndex(id)] = true;
+        report.directedMacrosMerged += rollout.macros.size() - 1;
+    };
+    for (std::size_t state = 0; state < directedCount; ++state) {
+        if (!consumed[state] && !forcedCycle[state] && forcedNext[state] &&
+            forcedPredecessors[state] == 0) {
+            buildRollout(state);
+        }
+    }
+    for (std::size_t state = 0; state < directedCount; ++state) {
+        if (!consumed[state] && !forcedCycle[state] && forcedNext[state])
+            buildRollout(state);
+    }
+    report.directedChainMacros =
+        report.liveDirectedMacros - report.directedMacrosMerged;
+
+    // A convergence prevents disjoint graph contraction, but once replay has
+    // reached a directed state with one successor there is still no choice to
+    // make. Precompute the maximal continuation from every such state so an
+    // arbitrary replay prefix can apply it atomically.
+    std::vector<double> rolloutSizes;
+    for (const auto& macro : report.macros) {
+        for (std::size_t reverse = 0; reverse < 2; ++reverse) {
+            const FiberletChunkRouteDirectedMacroId start{
+                macro.index, reverse != 0};
+            const auto& initial = macro.directions[reverse];
+            if (!initial.live || adjacency[directedIndex(start)].size() != 1)
+                continue;
+            FiberletChunkRouteDeterministicRollout rollout;
+            rollout.start = start;
+            rollout.macros.push_back(start);
+            rollout.anchors = initial.anchors;
+            rollout.diagnosticLoss = initial.diagnosticLoss;
+            rollout.diagnosticLengthPredictionVoxels =
+                initial.diagnosticLengthPredictionVoxels;
+            std::set<FiberletChunkRouteDirectedMacroId> seen{start};
+            auto current = start;
+            while (adjacency[directedIndex(current)].size() == 1) {
+                const auto transition =
+                    adjacency[directedIndex(current)].front();
+                if (seen.contains(transition.outgoing))
+                    break;
+                const auto& next = report.macros[transition.outgoing.macro]
+                    .directions[static_cast<std::size_t>(
+                        transition.outgoing.reverse)];
+                if (!canAppendFiberletChunkRouteMacro(next, rollout.anchors))
+                    break;
+                rollout.diagnosticLoss = appendFiberletChunkRouteMacroLoss(
+                    rollout.diagnosticLoss, transition.joinLoss, next);
+                rollout.diagnosticLengthPredictionVoxels +=
+                    next.diagnosticLengthPredictionVoxels;
+                rollout.transitionJoinLosses.push_back(transition.joinLoss);
+                rollout.macros.push_back(transition.outgoing);
+                rollout.anchors.insert(
+                    rollout.anchors.end(), next.anchors.begin() + 1,
+                    next.anchors.end());
+                seen.insert(transition.outgoing);
+                current = transition.outgoing;
+            }
+            if (rollout.macros.size() > 1) {
+                rolloutSizes.push_back(
+                    static_cast<double>(rollout.macros.size()));
+                report.rollouts.push_back(std::move(rollout));
+            }
+        }
+    }
+    report.deterministicRollouts = report.rollouts.size();
+    report.macrosPerDeterministicRollout =
+        chunkRouteDistribution(std::move(rolloutSizes));
+    return report;
+}
+
 FiberletChunkRouteAnalysisReport analyzeFiberletChunkRoutes(
     const FiberletChunkGraphSource& graph,
     const FiberletChunkRouteAnalysisConfig& config)

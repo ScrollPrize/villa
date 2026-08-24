@@ -3714,6 +3714,33 @@
   stage-two retained population in the same offset boxes, with independent all
   and internal-Fiberlet reductions. This is an experimental local-pruning
   diagnostic; box-local optimality is not a proof of global route preservation.
+- Each centered stage-two box additionally produces an exact in-memory
+  simplification report. A directed state is proven dead only when it is absent
+  from either entry-forward or exit-backward reachability. The analysis is
+  conservative under the simple-route no-revisit constraint: an uncertain
+  state may remain, but a valid route must not be removed. A physical Fiberlet
+  remains when either direction is live, and every later adjacency and macro
+  operation must retain the explicit per-direction live mask.
+- Every anchor unreferenced by the live physical graph is removed. Surviving
+  outside endpoints are explicit boundary portals with their original stable
+  anchor identity. Macro application must validate all hidden target anchors
+  against route history atomically before adding any of them.
+- A physical macro may cross only an interior anchor with exactly two live
+  incident physical Fiberlets and admissible mutual joins in both directions.
+  It stores the ordered original directed Fiberlet IDs, full anchor sequence,
+  edge losses, join losses, and lengths. Authoritative scoring replays those
+  scalars in the original order and association. Branches, portals, one-way
+  continuations, and cycles stop physical contraction.
+- Directed one-successor states are reported separately. Disjoint directed
+  contraction additionally requires a unique predecessor; maximal forced
+  continuation descriptors may overlap at convergence so arbitrary reached
+  states can use them without changing graph choices. Cycles remain explicit.
+- A physical Fiberlet ID is already the canonical exact endpoint-key pair.
+  Exact same-endpoint duplicates are invalid input. Distinct endpoint variants
+  must not be removed as cost-dominated because doing so changes the valid route
+  set under path-dependent visited-anchor histories. Macro representations are
+  in-memory references to original Fiberlets and must not be serialized as an
+  ordinary single-Fiberlet lattice route.
 
 - Dense-reference matching is monotone and local. Greedy supplies its nominal
   step and graph replay each actual dense fiberlet edge length. Failure is the

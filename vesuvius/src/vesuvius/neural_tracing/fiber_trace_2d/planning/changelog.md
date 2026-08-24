@@ -9,6 +9,14 @@
 - A hot Paris4 512/256 run reused all eight stage-one chunks, completed stage
   two in 1.4 s, and reduced 13,750 incident Fiberlets to 4,168 (69.69%) and
   5,730 internal Fiberlets to 618 (89.21%).
+- Added conservative directed reachability removal, complete unused-anchor
+  removal, exact bidirectional physical macros, disjoint directed-chain
+  detection, and atomic forced-continuation descriptors for each centered
+  stage-two box. Distinct routes are retained; macros remain in-memory and
+  reference their original ordered Fiberlet geometry and objective scalars.
+- On the same hot crop, post-stage-two simplification removed 51/1,515 anchors,
+  merged 73/4,168 physical Fiberlets into 4,095 macros, and found 1,041
+  one-successor directed states with 2.19-macro mean forced rollout length.
 
 # 2026-08-24: chunk-local optimal Fiberlet-route statistics
 

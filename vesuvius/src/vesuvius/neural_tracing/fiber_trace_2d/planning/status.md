@@ -1,13 +1,14 @@
-# Status: two-stage regional Fiberlet graph reduction
+# Status: lossless post-stage-two Fiberlet graph simplification
 
 - [x] Capture the task in `task.md`.
-- [x] Write the detailed implementation and validation plan.
-- [x] Complete independent plan review against task, plan, and specs.
-- [x] Expose retained physical Fiberlet IDs from exact analysis.
-- [x] Implement reusable per-chunk reduced Fiberlet publication.
-- [x] Add regional aligned and half-offset analysis grids.
-- [x] Add two-stage CLI mode, progress, and comparison tables.
-- [ ] Add focused storage and regional regression tests.
-- [x] Update specs, user documentation, changelog, and task log.
+- [x] Write the detailed task plan.
+- [x] Complete independent plan review.
+- [x] Add core simplification graph and report types.
+- [x] Add reachability pruning and unused-anchor removal.
+- [x] Add physical macro contraction and boundary portals.
+- [x] Add directed deterministic rollouts and precomputed adjacency.
+- [x] Add CLI reporting after stage two.
+- [x] Add focused regression coverage.
+- [x] Update specs, docs, changelog, and task log.
 - [x] Build and run focused tests.
-- [x] Measure the 512/256 Paris4 two-stage region.
+- [x] Measure the hot Paris4 stage-two crop.

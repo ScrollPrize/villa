@@ -1,47 +1,60 @@
-# Task log: two-stage regional Fiberlet graph reduction
+# Task log: lossless post-stage-two Fiberlet graph simplification
 
 ## Initial findings
 
-- The current 256-base sample retains 5,651/9,021 incident Fiberlets (37.36%
-  reduction) but only 562/3,757 internal Fiberlets (85.04% reduction).
-- Boundary-crossing Fiberlets dominate the all-Fiberlet population, so the
-  internal count is the meaningful pruning signal.
-- Stage one must union retained physical IDs across adjacent boxes before
-  writing a derived dataset; independently filtering owner chunks would remove
-  boundary routes required by neighboring boxes.
-- For a 512-base region and 256-base boxes, the half-offset stage-two grid has
-  exactly one centered box.
-- Independent plan review required regional aggregation by canonical unique
-  physical IDs, exact stage-two owner coverage, complete scoring metadata, and
-  explicit handling of incomplete prefix/route pairs. The implementation plan
-  was corrected before storage or CLI implementation continued.
-- Box-local first-exit optimality is not globally compositional. The derived
-  cache remains a diagnostic experiment and is not a default replay graph.
-- The initial plan incorrectly tied derived-dataset coverage and identity to a
-  requested region. User review corrected this: the reduced cache is a global
-  reusable per-chunk dataset, while a target region only selects intersecting
-  chunks and drives missing-chunk generation.
+- A physical Fiberlet ID is the canonical ordered pair of exact anchor keys.
+  The storage graph therefore cannot contain two distinct physical Fiberlets
+  with the same exact endpoints; such input is rejected as a duplicate stable
+  ID. Different anchor variants are different endpoints.
+- Stage-two retained output currently persists only physical Fiberlets. Its
+  anchor view still exposes all source anchors, so unused anchors must be
+  explicitly filtered in the simplified graph.
+- Ordinary stored route geometry uses a curved lattice defined by one endpoint
+  pair. Concatenating multiple routes and serializing them as one ordinary
+  Fiberlet would require resampling and would not be lossless. Macro-Fiberlets
+  will reference ordered original directed Fiberlets instead.
+- Transition validity and cost depend on the incoming and outgoing directions.
+  Physical degree alone is insufficient for contraction; bidirectional
+  contraction requires the regular transition to exist in both directions.
+- Independent review required an explicit live-direction mask, ordered rather
+  than pre-summed authoritative macro costs, atomic hidden-anchor validation,
+  and per-box macro identity. It also identified that arbitrary dominated-route
+  deletion conflicts with preserving the valid route set. The plan was updated
+  before implementation.
+- Forward/reverse reachability is deliberately conservative under the
+  no-revisit rule: it safely removes proven-dead states but may retain a state
+  whose separate reachability witnesses cannot form one simple route.
 
 ## Deviations and validation
 
-- The first end-to-end attempt exposed two integration defects that unit-only
-  verification had missed: the CLI rejected explicit cache overrides, and the
-  reduced 256-base Fiberlet grid was paired directly with the original
-  128-base anchor grid. The parser now accepts both cache roots, and stage two
-  uses an on-demand rechunked anchor view backed by the original cache.
-- The first corrected handoff still allowed the centered graph's conservative
-  halo to generate reduced owners outside the selected eight. That run was
-  stopped. Stage two now uses a bounded, non-publishing view: selected owners
-  read the global reduced cache and all other owners resolve to ephemeral empty
-  chunks.
-- Focused storage validation passes: `test_fiberlet_storage` reports 27 test
-  cases passed, and `git diff --check` is clean.
-- The final hot Paris4 command used the existing 128-base source caches and the
-  global 256-base reduced cache. Source preparation completed in under one
-  second, stage one reported `generated=0 reused=8`, and stage two completed in
-  1.4 seconds. Unique populations were 13,750 original, 7,112 after stage one,
-  and 4,168 after stage two (69.69% total reduction). Internal populations were
-  5,730, 3,436, and 618 respectively (89.21% total reduction and 82.01%
-  incremental stage-two reduction).
-- An automated 2x2x2 CLI-level regional fixture remains to be added. The real
-  Paris4 end-to-end run currently covers the full command integration.
+- The independent review rejected deleting distinct higher-cost parallel
+  routes. Exact same-endpoint physical Fiberlets are structurally impossible
+  because their canonical stable ID is the endpoint-key pair. Different anchor
+  variants are different graph routes and cannot be removed losslessly under
+  path-dependent visited-anchor history.
+- Physical macro contraction is deliberately stricter than one-successor
+  detection: it requires a degree-two interior anchor and both mutual directed
+  transitions. One-successor cases that converge from multiple predecessors
+  remain separate graph states but receive overlapping deterministic rollout
+  descriptors. Disjoint directed contraction additionally requires one
+  predecessor; the measured crop had no such states after physical contraction.
+- Macros are in-memory ordered references to original Fiberlets. They are not
+  persisted into the ordinary route lattice and are not yet consumed by regular
+  replay because encoding concatenated geometry there would require resampling.
+- Build command:
+  `cmake --build volume-cartographer/build/ci-tests-clang-systemdeps --target vc_fiberlets test_fiberlet_storage test_fiberlet_paths -j32`
+- Focused validation passed: `test_fiberlet_storage` (27 cases),
+  `test_fiberlet_paths` (87 cases), and `git diff --check`.
+- The build repeatedly reported a pre-existing truncated Ninja log and rebuilt
+  117 targets; compilation completed successfully. Existing unrelated OpenCV
+  deprecation and ignored-`nodiscard` warnings remain.
+- Hot Paris4 command used the existing 128-base storage caches, a 512-base
+  selected region, eight 256-base stage-one boxes, one centered 256-base
+  stage-two box, and 32 threads. It reused all eight reduced chunks and stage
+  two plus simplification completed in 2.5-2.6 seconds across repeated runs.
+- Measured population: 13,750 original to 7,112 stage one to 4,168 stage two;
+  internal 5,730 to 3,436 to 618. Post-stage-two simplification retained 1,464
+  of 1,515 materialized anchors, represented 4,168 physical Fiberlets as 4,095
+  physical macros (73 merged), and found 1,041 forced-continuation states.
+  Forced rollout descriptors averaged 2.19 macros, median 2, maximum 4. No
+  further disjoint directed chain contraction survived convergence checks.

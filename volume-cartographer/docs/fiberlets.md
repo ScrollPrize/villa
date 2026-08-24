@@ -900,6 +900,36 @@ view of the existing anchor cache, so analysis-sized ownership does not copy or
 regenerate anchor data. The final table reports the original, stage-one, and
 stage-two unique physical-ID populations for all and internal Fiberlets.
 
+After stage two, the command also constructs an exact in-memory simplified
+graph for each centered box. Directed states outside the intersection of
+entry-forward and exit-backward reachability are removed conservatively, then
+every anchor not referenced by a surviving Fiberlet is removed. Reachability
+ignores the path-specific no-revisit history, so it may retain an uncertain
+state but cannot remove a valid simple entry-to-first-exit route. Outside
+endpoints of surviving crossing Fiberlets remain explicit boundary portals.
+
+The simplifier forms maximal physical macro-Fiberlets only across an interior
+anchor with exactly two incident surviving Fiberlets and valid regular joins
+in both directions. A macro references the complete ordered original directed
+Fiberlet and anchor sequence, with the original edge losses, join losses, and
+lengths. It is therefore evaluated with the same scalar order as expansion;
+the printed aggregate is diagnostic only. Cycles, branch anchors, one-way
+joins, and boundary portals stop physical contraction. The report separately
+counts disjoint directed chains and precomputes maximal forced continuations
+from every directed state with exactly one admissible successor. The latter
+may overlap at convergences, but can skip choices during replay after the start
+state is known. Every hidden anchor is checked atomically against route history
+before such a continuation can be applied.
+
+A physical Fiberlet ID is the canonical pair of exact endpoint anchor keys, so
+two distinct same-endpoint physical Fiberlets cannot exist in the stored graph;
+duplicate IDs are rejected during materialization. Different endpoint variants
+are distinct routes and are not deleted merely because one currently costs
+more: visited-anchor history can make either route relevant. Macro graphs are
+not serialized as ordinary Fiberlets and are not yet consumed by regular
+replay. The ordinary route lattice cannot encode concatenated geometry without
+resampling, so persistent macro storage requires a dedicated format.
+
 ## Whole-volume preprocessing
 
 Use `preprocess-volume` to materialize sparse anchors and fiberlets for an

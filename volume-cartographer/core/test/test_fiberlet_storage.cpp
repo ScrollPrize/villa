@@ -1335,6 +1335,127 @@ TEST_CASE("Fiberlet chunk route analysis finds exact simple entry-to-exit optima
         reducedGraph, config);
     CHECK(reducedPopulation.physicalFiberletIds ==
           report.retainedPhysicalFiberlets);
+    const auto simplified = simplifyFiberletChunkRoutes(
+        reducedGraph, config, report.retainedPhysicalFiberlets);
+    CHECK(simplified.inputPhysicalFiberlets ==
+          report.retainedPhysicalFiberlets.size());
+    CHECK(simplified.livePhysicalFiberlets +
+              simplified.deadPhysicalFiberletsRemoved ==
+          simplified.inputPhysicalFiberlets);
+    CHECK(simplified.liveDirectedStates +
+              simplified.deadDirectedStatesRemoved ==
+          simplified.inputDirectedStates);
+    CHECK(simplified.retainedAnchors + simplified.unusedAnchorsRemoved ==
+          simplified.inputAnchors);
+    CHECK(simplified.retainedAnchors ==
+          simplified.retainedInsideAnchors + simplified.boundaryPortals);
+    CHECK(simplified.retainedInsideAnchors +
+              simplified.unusedInsideAnchorsRemoved ==
+          simplified.inputInsideAnchors);
+    CHECK(simplified.physicalMacros +
+              simplified.physicalFiberletsMerged ==
+          simplified.livePhysicalFiberlets);
+    CHECK(simplified.zeroContinuationStates +
+              simplified.forcedContinuationStates +
+              simplified.branchingStates ==
+          simplified.liveDirectedMacros);
+    CHECK(simplified.directedChainMacros +
+              simplified.directedMacrosMerged ==
+          simplified.liveDirectedMacros);
+    CHECK(simplified.deterministicRollouts == simplified.rollouts.size());
+    CHECK(simplified.structuralDuplicateFiberlets == 0);
+    CHECK(std::is_sorted(
+        simplified.livePhysicalFiberletIds.begin(),
+        simplified.livePhysicalFiberletIds.end()));
+    CHECK(std::is_sorted(
+        simplified.retainedInsideAnchorIds.begin(),
+        simplified.retainedInsideAnchorIds.end()));
+    CHECK(std::is_sorted(
+        simplified.boundaryPortalIds.begin(),
+        simplified.boundaryPortalIds.end()));
+
+    std::vector<FiberletStorageId> expandedPhysical;
+    for (const auto& macro : simplified.macros) {
+        const auto& forward = macro.directions[0];
+        const auto& reverse = macro.directions[1];
+        REQUIRE(forward.anchors.size() ==
+                forward.physicalFiberlets.size() + 1);
+        REQUIRE(reverse.anchors.size() ==
+                reverse.physicalFiberlets.size() + 1);
+        CHECK(forward.edgeLosses.size() ==
+              forward.physicalFiberlets.size());
+        CHECK(forward.edgeLengthsPredictionVoxels.size() ==
+              forward.physicalFiberlets.size());
+        CHECK(forward.internalJoinLosses.size() + 1 ==
+              forward.physicalFiberlets.size());
+        CHECK(reverse.edgeLosses.size() ==
+              reverse.physicalFiberlets.size());
+        CHECK(reverse.internalJoinLosses.size() + 1 ==
+              reverse.physicalFiberlets.size());
+        CHECK(std::vector<FiberletStorageKey>(
+                  forward.anchors.rbegin(), forward.anchors.rend()) ==
+              reverse.anchors);
+        for (std::size_t index = 0;
+             index < forward.physicalFiberlets.size(); ++index) {
+            const auto& forwardId = forward.physicalFiberlets[index];
+            const auto& reverseId = reverse.physicalFiberlets[
+                reverse.physicalFiberlets.size() - index - 1];
+            CHECK(forwardId.fiberlet == reverseId.fiberlet);
+            CHECK(forwardId.reverse != reverseId.reverse);
+            expandedPhysical.push_back(forwardId.fiberlet);
+        }
+        if (forward.live) {
+            CHECK(appendFiberletChunkRouteMacroLoss(0.0, 0.0, forward) ==
+                  doctest::Approx(forward.diagnosticLoss));
+            CHECK(canAppendFiberletChunkRouteMacro(forward, {}));
+            std::vector<FiberletStorageKey> blocked{
+                forward.anchors.back()};
+            CHECK_FALSE(canAppendFiberletChunkRouteMacro(forward, blocked));
+        }
+    }
+    std::sort(expandedPhysical.begin(), expandedPhysical.end());
+    CHECK(expandedPhysical == simplified.livePhysicalFiberletIds);
+    CHECK(simplified.physicalFiberletsPerMacro.count ==
+          simplified.physicalMacros);
+    CHECK(simplified.physicalFiberletsMerged > 0);
+    for (const auto& transition : simplified.transitions) {
+        REQUIRE(transition.incoming.macro < simplified.macros.size());
+        REQUIRE(transition.outgoing.macro < simplified.macros.size());
+        CHECK(simplified.macros[transition.incoming.macro]
+                  .directions[static_cast<std::size_t>(
+                      transition.incoming.reverse)]
+                  .live);
+        CHECK(simplified.macros[transition.outgoing.macro]
+                  .directions[static_cast<std::size_t>(
+                      transition.outgoing.reverse)]
+                  .live);
+    }
+    for (const auto& rollout : simplified.rollouts) {
+        REQUIRE(rollout.macros.size() > 1);
+        REQUIRE(rollout.transitionJoinLosses.size() + 1 ==
+                rollout.macros.size());
+        std::set<FiberletStorageKey> uniqueAnchors(
+            rollout.anchors.begin(), rollout.anchors.end());
+        CHECK(uniqueAnchors.size() == rollout.anchors.size());
+        const auto& first = simplified.macros[rollout.macros.front().macro]
+            .directions[static_cast<std::size_t>(
+                rollout.macros.front().reverse)];
+        double expandedLoss = first.diagnosticLoss;
+        double expandedLength = first.diagnosticLengthPredictionVoxels;
+        for (std::size_t index = 1; index < rollout.macros.size(); ++index) {
+            const auto id = rollout.macros[index];
+            const auto& direction = simplified.macros[id.macro]
+                .directions[static_cast<std::size_t>(id.reverse)];
+            expandedLoss = appendFiberletChunkRouteMacroLoss(
+                expandedLoss, rollout.transitionJoinLosses[index - 1],
+                direction);
+            expandedLength += direction.diagnosticLengthPredictionVoxels;
+        }
+        CHECK(expandedLoss == doctest::Approx(rollout.diagnosticLoss));
+        CHECK(expandedLength ==
+              doctest::Approx(
+                  rollout.diagnosticLengthPredictionVoxels));
+    }
     reducedCache->cancelPendingAndWait();
 
     auto repairedMetadata = reducedMetadata;

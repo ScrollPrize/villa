@@ -200,6 +200,105 @@ struct FiberletChunkRoutePopulation {
     std::vector<FiberletStorageId> internalFiberletIds;
 };
 
+struct FiberletChunkRouteDirectedMacroId {
+    std::size_t macro = 0;
+    bool reverse = false;
+
+    auto operator<=>(const FiberletChunkRouteDirectedMacroId&) const = default;
+};
+
+struct FiberletChunkRouteMacroDirection {
+    bool live = false;
+    std::vector<DirectedFiberletStorageId> physicalFiberlets;
+    // Source followed by every physical target, including hidden anchors.
+    std::vector<FiberletStorageKey> anchors;
+    std::vector<double> edgeLosses;
+    std::vector<double> internalJoinLosses;
+    std::vector<double> edgeLengthsPredictionVoxels;
+    double diagnosticLoss = 0.0;
+    double diagnosticLengthPredictionVoxels = 0.0;
+};
+
+struct FiberletChunkRouteMacro {
+    std::size_t index = 0;
+    std::array<FiberletChunkRouteMacroDirection, 2> directions;
+    bool firstBoundaryPortal = false;
+    bool secondBoundaryPortal = false;
+};
+
+struct FiberletChunkRouteMacroTransition {
+    FiberletChunkRouteDirectedMacroId incoming;
+    FiberletChunkRouteDirectedMacroId outgoing;
+    double joinLoss = 0.0;
+};
+
+struct FiberletChunkRouteDeterministicRollout {
+    FiberletChunkRouteDirectedMacroId start;
+    std::vector<FiberletChunkRouteDirectedMacroId> macros;
+    std::vector<FiberletStorageKey> anchors;
+    std::vector<double> transitionJoinLosses;
+    double diagnosticLoss = 0.0;
+    double diagnosticLengthPredictionVoxels = 0.0;
+};
+
+struct FiberletChunkRouteSimplificationReport {
+    cv::Vec3d minimumBaseXYZ{0.0, 0.0, 0.0};
+    cv::Vec3d maximumBaseXYZ{0.0, 0.0, 0.0};
+    std::size_t inputAnchors = 0;
+    std::size_t retainedAnchors = 0;
+    std::size_t unusedAnchorsRemoved = 0;
+    std::size_t inputInsideAnchors = 0;
+    std::size_t retainedInsideAnchors = 0;
+    std::size_t unusedInsideAnchorsRemoved = 0;
+    std::size_t boundaryPortals = 0;
+    std::size_t inputPhysicalFiberlets = 0;
+    std::size_t livePhysicalFiberlets = 0;
+    std::size_t deadPhysicalFiberletsRemoved = 0;
+    std::size_t inputDirectedStates = 0;
+    std::size_t liveDirectedStates = 0;
+    std::size_t deadDirectedStatesRemoved = 0;
+    std::size_t contractibleInsideAnchors = 0;
+    std::size_t physicalMacros = 0;
+    std::size_t physicalFiberletsMerged = 0;
+    std::size_t liveDirectedMacros = 0;
+    std::size_t macroTransitions = 0;
+    std::size_t zeroContinuationStates = 0;
+    std::size_t forcedContinuationStates = 0;
+    std::size_t branchingStates = 0;
+    std::size_t directedChainMacros = 0;
+    std::size_t directedMacrosMerged = 0;
+    std::size_t deterministicRollouts = 0;
+    std::size_t structuralDuplicateFiberlets = 0;
+    FiberletChunkRouteDistribution physicalFiberletsPerMacro;
+    FiberletChunkRouteDistribution macrosPerDeterministicRollout;
+    std::vector<FiberletStorageKey> retainedInsideAnchorIds;
+    std::vector<FiberletStorageKey> boundaryPortalIds;
+    std::vector<FiberletStorageId> livePhysicalFiberletIds;
+    std::vector<std::array<bool, 2>> livePhysicalDirections;
+    std::vector<FiberletChunkRouteMacro> macros;
+    std::vector<FiberletChunkRouteMacroTransition> transitions;
+    std::vector<FiberletChunkRouteDeterministicRollout> rollouts;
+};
+
+// Appends the macro using the same left-associated edge/join sequence as the
+// physical route search. diagnosticLoss is never authoritative for ranking.
+[[nodiscard]] double appendFiberletChunkRouteMacroLoss(
+    double prefixLoss,
+    double incomingJoinLoss,
+    const FiberletChunkRouteMacroDirection& direction);
+
+// The shared source anchor is anchors.front() and is already present in route
+// history. Every hidden/target anchor is checked atomically before append.
+[[nodiscard]] bool canAppendFiberletChunkRouteMacro(
+    const FiberletChunkRouteMacroDirection& direction,
+    std::span<const FiberletStorageKey> visitedAnchors);
+
+[[nodiscard]] FiberletChunkRouteSimplificationReport
+simplifyFiberletChunkRoutes(
+    const FiberletChunkGraphSource& graph,
+    const FiberletChunkRouteAnalysisConfig& config,
+    std::span<const FiberletStorageId> retainedPhysicalFiberlets);
+
 [[nodiscard]] FiberletChunkRoutePopulation collectFiberletChunkRoutePopulation(
     const FiberletChunkGraphSource& graph,
     const FiberletChunkRouteAnalysisConfig& config);

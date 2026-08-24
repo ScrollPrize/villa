@@ -1465,6 +1465,90 @@ std::string percentString(std::size_t before, std::size_t after)
     return result.str();
 }
 
+std::string optionalFixed(const std::optional<double>& value)
+{
+    if (!value)
+        return "n/a";
+    std::ostringstream result;
+    result << std::fixed << std::setprecision(2) << *value;
+    return result.str();
+}
+
+void printChunkRouteSimplification(
+    std::size_t boxIndex,
+    const vc::fiber_tracer::FiberletChunkRouteSimplificationReport& report)
+{
+    std::cout << "fiberlet_chunk_simplification box=" << boxIndex << '\n'
+              << std::left
+              << std::setw(18) << "anchors_before"
+              << std::setw(17) << "anchors_after"
+              << std::setw(17) << "anchors_removed"
+              << std::setw(18) << "anchor_reduction"
+              << "boundary_portals\n"
+              << std::setw(18) << report.inputAnchors
+              << std::setw(17) << report.retainedAnchors
+              << std::setw(17) << report.unusedAnchorsRemoved
+              << std::setw(18) << percentString(
+                     report.inputAnchors, report.retainedAnchors)
+              << report.boundaryPortals << '\n'
+              << std::setw(20) << "fiberlets_before"
+              << std::setw(17) << "fiberlets_live"
+              << std::setw(18) << "macro_fiberlets"
+              << std::setw(18) << "fiberlets_merged"
+              << "macro_reduction\n"
+              << std::setw(20) << report.inputPhysicalFiberlets
+              << std::setw(17) << report.livePhysicalFiberlets
+              << std::setw(18) << report.physicalMacros
+              << std::setw(18) << report.physicalFiberletsMerged
+              << percentString(
+                     report.inputPhysicalFiberlets, report.physicalMacros)
+              << '\n'
+              << std::setw(18) << "directed_before"
+              << std::setw(17) << "directed_live"
+              << std::setw(18) << "directed_macros"
+              << "directed_removed\n"
+              << std::setw(18) << report.inputDirectedStates
+              << std::setw(17) << report.liveDirectedStates
+              << std::setw(18) << report.liveDirectedMacros
+              << report.deadDirectedStatesRemoved << '\n'
+              << std::setw(19) << "zero_continuation"
+              << std::setw(20) << "forced_continuation"
+              << std::setw(17) << "branching"
+              << "forced_rollouts\n"
+              << std::setw(19) << report.zeroContinuationStates
+              << std::setw(20) << report.forcedContinuationStates
+              << std::setw(17) << report.branchingStates
+              << report.deterministicRollouts << '\n'
+              << std::setw(23) << "directed_macros_before"
+              << std::setw(22) << "directed_macros_after"
+              << "directed_macros_merged\n"
+              << std::setw(23) << report.liveDirectedMacros
+              << std::setw(22) << report.directedChainMacros
+              << report.directedMacrosMerged << '\n'
+              << std::setw(28) << "distribution"
+              << std::setw(10) << "count"
+              << std::setw(10) << "mean"
+              << std::setw(10) << "median"
+              << "max\n"
+              << std::setw(28) << "fiberlets_per_macro"
+              << std::setw(10) << report.physicalFiberletsPerMacro.count
+              << std::setw(10) << optionalFixed(
+                     report.physicalFiberletsPerMacro.mean)
+              << std::setw(10) << optionalFixed(
+                     report.physicalFiberletsPerMacro.median)
+              << optionalFixed(report.physicalFiberletsPerMacro.maximum)
+              << '\n'
+              << std::setw(28) << "macros_per_forced_rollout"
+              << std::setw(10) << report.macrosPerDeterministicRollout.count
+              << std::setw(10) << optionalFixed(
+                     report.macrosPerDeterministicRollout.mean)
+              << std::setw(10) << optionalFixed(
+                     report.macrosPerDeterministicRollout.median)
+              << optionalFixed(
+                     report.macrosPerDeterministicRollout.maximum)
+              << '\n';
+}
+
 int runChunkRouteStats(
     CliOptions& options,
     const vc::lasagna::LasagnaDataset& fiberDataset,
@@ -1985,6 +2069,8 @@ int runChunkRouteStats(
     std::vector<std::vector<FiberletStorageId>> stageOneInternalSets;
     std::vector<std::vector<FiberletStorageId>> stageTwoSets;
     std::vector<std::vector<FiberletStorageId>> stageTwoInternalSets;
+    std::vector<FiberletChunkRouteSimplificationReport>
+        simplificationReports;
     const auto stageTwoStarted = std::chrono::steady_clock::now();
     for (std::size_t index = 0; index < stageTwoConfigs.size(); ++index) {
         const auto original = collectFiberletChunkRoutePopulation(
@@ -1998,6 +2084,9 @@ int runChunkRouteStats(
         stageTwoSets.push_back(reduced.retainedPhysicalFiberlets);
         stageTwoInternalSets.push_back(canonicalIntersection(
             reduced.internalFiberletIds,
+            reduced.retainedPhysicalFiberlets));
+        simplificationReports.push_back(simplifyFiberletChunkRoutes(
+            reducedGraph, stageTwoConfigs[index],
             reduced.retainedPhysicalFiberlets));
         printRateProgress(
             "fiberlet chunk reduction", "stage2", "boxes_per_second",
@@ -2039,6 +2128,8 @@ int runChunkRouteStats(
               << percentString(
                      stageOneInternal.size(), stageTwoInternal.size())
               << '\n';
+    for (std::size_t index = 0; index < simplificationReports.size(); ++index)
+        printChunkRouteSimplification(index, simplificationReports[index]);
     reducedCache->cancelPendingAndWait();
     reducedViewCache->cancelPendingAndWait();
     reducedAnchorCache->cancelPendingAndWait();

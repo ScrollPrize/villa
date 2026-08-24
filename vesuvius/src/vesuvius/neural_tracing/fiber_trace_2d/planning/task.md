@@ -1,22 +1,27 @@
-# Task: two-stage regional Fiberlet graph reduction
+# Task: lossless post-stage-two Fiberlet graph simplification
 
-Extend `vc_fiberlets chunk-route-stats` from one analysis box to a cubic
-base-coordinate region containing a regular grid of analysis boxes. With a
-256-base chunk and a 512-base region, stage one analyzes the eight globally
-aligned `256^3` boxes intersecting the region and persists each box's retained
-Fiberlets in a global reusable reduced cache without modifying the original
-graph cache. The requested region selects cache chunks; it must not define a
-region-specific cache identity or fixed coverage manifest.
+After the centered stage-two route reduction, simplify the retained graph
+without changing its valid entry-to-first-exit routes or objective values.
 
-Add an explicit two-stage mode. Stage two reads the stage-one reduced graph and
-analyzes the offset grid of equal-size boxes whose minima are shifted by half a
-chunk on all three axes and which remain fully inside the region. Thus a
-512-base region with 256-base chunks has one centered stage-two box at
-`region_minimum + (128,128,128)`.
+- Remove directed states proven unable to lie on an entry-to-exit route by
+  conservative forward/reverse reachability, while retaining uncertain states.
+- Remove every anchor unused by the remaining graph.
+- Detect zero, one, and multiple admissible continuations using the regular
+  directed join constraints.
+- Merge maximal consecutive physical Fiberlets across interior anchors where
+  the continuation is unambiguous in both directions.
+- Precompute deterministic directed continuations where only one successor is
+  available, including cases that cannot be represented as one undirected
+  physical merge.
+- Preserve stage-two boundary semantics through explicit boundary portals.
+- Validate that exact same-endpoint duplicates are absent. Do not remove
+  distinct higher-cost routes merely as dominated because that would change
+  the valid route set.
+- Report before/after graph populations and contraction distributions for the
+  centered stage-two crop.
 
-Report stage-two retained and removed Fiberlets against the original input
-Fiberlet population in the same stage-two crop. Report internal Fiberlets
-separately so boundary entry/exit edges do not hide the reduction. Reuse the
-existing Fiberlet dataset, serialization, chunk cache, decoded LRU, graph, and
-exact route-analysis infrastructure. Do not introduce compatibility handling
-for this unpublished command or mutate the authoritative source cache.
+Macro-Fiberlets must reference their original directed Fiberlet sequence,
+retain an explicit live-direction mask, and preserve the ordered edge costs,
+join costs, lengths, geometry identity, and visited anchors. Applying a macro
+must atomically validate every hidden anchor. Do not approximate a concatenated
+route by writing it as an ordinary single-Fiberlet lattice route.
