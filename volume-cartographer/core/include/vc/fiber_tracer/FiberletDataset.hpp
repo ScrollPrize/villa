@@ -181,6 +181,42 @@ struct FiberletChunkCacheOptions {
 [[nodiscard]] std::shared_ptr<vc::render::ChunkCache> createStoredFiberletPathChunkCache(
     std::shared_ptr<FiberletChunkDataset> dataset, FiberletChunkCacheOptions options = {});
 
+// Expose a sparse dataset layer over a compatible lower cache. A materialized
+// upper chunk shadows the lower layer, including an explicitly empty chunk;
+// an absent upper chunk falls through without being copied into the layer.
+[[nodiscard]] std::shared_ptr<vc::render::ChunkCache>
+createOverlayFiberletAnchorChunkCache(
+    std::shared_ptr<FiberletChunkDataset> layer,
+    std::shared_ptr<FiberletChunkDataset> lowerDataset,
+    std::shared_ptr<vc::render::ChunkCache> lower,
+    FiberletChunkCacheOptions options = {});
+
+[[nodiscard]] std::shared_ptr<vc::render::ChunkCache>
+createOverlayFiberletPathChunkCache(
+    std::shared_ptr<FiberletChunkDataset> layer,
+    std::shared_ptr<FiberletChunkDataset> lowerDataset,
+    std::shared_ptr<vc::render::ChunkCache> lower,
+    FiberletChunkCacheOptions options = {});
+
+// Reduction overlays are temporary mutable layers. Callers must guarantee
+// exclusive access and discard every decoded view of the replaced coordinate
+// before using the new bytes.
+void replaceFiberletOverlayChunk(
+    const std::shared_ptr<FiberletChunkDataset>& layer,
+    FiberletStorageChunkKind kind,
+    const vc::render::ChunkKey& key,
+    const FiberletChunkDataset::MaterializedChunk& current,
+    const FiberletChunkDataset::MaterializedChunk& chunk);
+
+void replaceFiberletOverlayChunkPair(
+    const std::shared_ptr<FiberletChunkDataset>& layer,
+    const vc::render::ChunkKey& prefixKey,
+    const FiberletChunkDataset::MaterializedChunk& currentPrefix,
+    const FiberletChunkDataset::MaterializedChunk& prefix,
+    const vc::render::ChunkKey& routeKey,
+    const FiberletChunkDataset::MaterializedChunk& currentRoutes,
+    const FiberletChunkDataset::MaterializedChunk& routes);
+
 [[nodiscard]] std::shared_ptr<const vc::render::DecodedChunkPayload> decodeFiberletChunkPayload(FiberletStorageChunkKind kind, std::span<const std::byte> bytes);
 
 }  // namespace vc::fiber_tracer

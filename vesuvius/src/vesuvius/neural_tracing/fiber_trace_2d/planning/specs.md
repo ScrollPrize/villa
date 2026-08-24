@@ -3697,25 +3697,41 @@
   costs, or invalid geometry fail the complete diagnostic. The command never
   rewrites or prunes existing graph payloads and never marks a partial cache
   complete.
-- Regional two-stage mode maps a base-coordinate target region to globally
-  aligned analysis owners. The target region is selection only and is excluded
-  from reduced-dataset identity. Each selected owner publishes a complete
-  retained prefix/route pair in the global fingerprinted reduced cache; hot
-  pairs are reused byte-for-byte.
-- Stage two uses equal-size boxes offset by half the analysis side and fully
-  contained in the selected region. Its graph exposes exactly the selected
-  stage-one reduced owners. Incident-halo requests outside that set return
-  ephemeral empty payloads and may neither generate nor publish reduction
-  chunks. The original anchor cache is presented through a decoded-cache-bound
-  rechunked view matching reduced Fiberlet ownership without copying or
-  regenerating anchors.
-- Regional counts are canonical unique physical IDs. The report compares the
-  original source population, its stage-one reduced population, and the
-  stage-two retained population in the same offset boxes, with independent all
-  and internal-Fiberlet reductions. This is an experimental local-pruning
-  diagnostic; box-local optimality is not a proof of global route preservation.
-- Each centered stage-two box additionally produces an exact in-memory
-  simplification report. A directed state is proven dead only when it is absent
+- Staged regional mode accepts an ordered, repeatable sequence of cubic
+  analysis sides and base-XYZ offsets relative to a selected half-open bbox.
+  Each stage enumerates every complete box on that offset lattice in canonical
+  Z/Y/X order. Analysis boxes need not align with anchor cells or storage
+  chunks. Every derived stage uses separate temporary anchor and Fiberlet
+  overlays with exactly the initial datasets' storage layout and encoding; the
+  initial persistent caches are never rewritten.
+- A missing upper chunk falls through unchanged to the preceding layer. An
+  explicit empty payload shadows lower data through arbitrary layer depth.
+  Fiberlet fallback requires both prefix and route members to be absent;
+  partial pairs, corrupt upper payloads, and incompatible coordinate/layout,
+  storage, quantization, source, or processing contracts are errors.
+- Boxes within a stage execute serially, and an overlapping later box reads
+  earlier writes from that same stage. Only a Fiberlet whose canonical first
+  endpoint position is inside the current box is eligible for removal. Every
+  affected initial-layout owner chunk is rewritten from its effective current
+  payload, including a canonical owner outside the geometrically intersected
+  chunks. Publication must be a strict record subset: retained anchor,
+  prefix, and route fields remain exactly unchanged, and removed IDs can never
+  be restored by a later box or stage. Explicit empty touched chunks are
+  persisted in the temporary layer.
+- An inside anchor is removed only if the effective graph after the proposed
+  Fiberlet update contains no incident surviving Fiberlet. Outside-owned and
+  lower-layer incident Fiberlets therefore retain it. Derived stage layers are
+  invocation-local and removed after final reporting; persistent/completed
+  reduction layers require a later publication protocol.
+- Regional counts are canonical unique IDs over the selected bbox. Each stage
+  reports input/output, per-stage reduction, and cumulative reduction for
+  anchors, all incident Fiberlets, and interior Fiberlets; the joint report
+  compares original and final populations. Interior classification is fixed
+  from initial endpoint geometry. Sequential local pruning is deterministic
+  and monotone but does not prove preservation of a globally optimal replay
+  route for arbitrary later boundaries.
+- Each processed box additionally produces an exact in-memory simplification
+  report. A directed state is proven dead only when it is absent
   from either entry-forward or exit-backward reachability. The analysis is
   conservative under the simple-route no-revisit constraint: an uncertain
   state may remain, but a valid route must not be removed. A physical Fiberlet

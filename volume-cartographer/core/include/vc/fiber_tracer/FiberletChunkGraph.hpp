@@ -319,6 +319,27 @@ struct FiberletReductionWriteReport {
     bool reused = false;
 };
 
+struct FiberletReductionOverlayBoxWriteReport {
+    std::size_t touchedAnchorChunks = 0;
+    std::size_t touchedFiberletChunks = 0;
+    std::size_t inputAnchors = 0;
+    std::size_t retainedAnchors = 0;
+    std::size_t inputFiberlets = 0;
+    std::size_t retainedFiberlets = 0;
+};
+
+// Rewrite every storage chunk intersecting config into a temporary sparse
+// overlay. Only records whose stored base-space owner position is inside the
+// half-open box may be removed; records and routes are otherwise exact copies.
+[[nodiscard]] FiberletReductionOverlayBoxWriteReport
+writeFiberletReductionOverlayBox(
+    const FiberletChunkGraphSource& source,
+    const std::shared_ptr<FiberletChunkDataset>& outputAnchors,
+    const std::shared_ptr<FiberletChunkDataset>& outputFiberlets,
+    const FiberletChunkRouteAnalysisConfig& config,
+    std::span<const FiberletStorageId> inputPhysicalFiberlets,
+    std::span<const FiberletStorageId> retainedPhysicalFiberlets);
+
 [[nodiscard]] FiberletReductionWriteReport writeReducedFiberletChunk(
     const FiberletChunkGraphSource& source,
     const std::shared_ptr<FiberletChunkDataset>& outputDataset,

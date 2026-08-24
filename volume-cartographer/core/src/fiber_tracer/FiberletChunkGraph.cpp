@@ -1830,6 +1830,228 @@ FiberletChunkRouteAnalysisReport analyzeFiberletChunkRoutes(
     return report;
 }
 
+FiberletReductionOverlayBoxWriteReport
+writeFiberletReductionOverlayBox(
+    const FiberletChunkGraphSource& source,
+    const std::shared_ptr<FiberletChunkDataset>& outputAnchors,
+    const std::shared_ptr<FiberletChunkDataset>& outputFiberlets,
+    const FiberletChunkRouteAnalysisConfig& config,
+    std::span<const FiberletStorageId> inputPhysicalFiberlets,
+    std::span<const FiberletStorageId> retainedPhysicalFiberlets)
+{
+    if (!outputAnchors || !outputFiberlets ||
+        outputAnchors->metadata().kind != FiberletDatasetKind::Anchors ||
+        outputFiberlets->metadata().kind != FiberletDatasetKind::Fiberlets) {
+        throw std::invalid_argument(
+            "fiberlet reduction overlay requires anchor and path datasets");
+    }
+    const auto& sourceMetadata = source.metadata();
+    const auto& outputMetadata = outputFiberlets->metadata();
+    if (outputAnchors->metadata().chunkGridShapeZYX !=
+            outputMetadata.chunkGridShapeZYX ||
+        outputAnchors->metadata().coordinateOriginZYX !=
+            outputMetadata.coordinateOriginZYX ||
+        outputAnchors->metadata().coordinateUnitsPerChunkZYX !=
+            outputMetadata.coordinateUnitsPerChunkZYX ||
+        outputMetadata.chunkGridShapeZYX !=
+            sourceMetadata.chunkGridShapeZYX ||
+        outputMetadata.coordinateOriginZYX !=
+            sourceMetadata.coordinateOriginZYX ||
+        outputMetadata.coordinateUnitsPerChunkZYX !=
+            sourceMetadata.coordinateUnitsPerChunkZYX ||
+        outputMetadata.spatialChunkSideBaseVoxels !=
+            sourceMetadata.spatialChunkSideBaseVoxels ||
+        outputMetadata.predictionToBaseScale !=
+            sourceMetadata.predictionToBaseScale) {
+        throw std::invalid_argument(
+            "fiberlet reduction overlay layouts are incompatible");
+    }
+
+    std::vector<FiberletStorageId> input(
+        inputPhysicalFiberlets.begin(), inputPhysicalFiberlets.end());
+    std::vector<FiberletStorageId> retained(
+        retainedPhysicalFiberlets.begin(), retainedPhysicalFiberlets.end());
+    std::sort(input.begin(), input.end());
+    std::sort(retained.begin(), retained.end());
+    if (std::adjacent_find(input.begin(), input.end()) != input.end() ||
+        std::adjacent_find(retained.begin(), retained.end()) !=
+            retained.end()) {
+        throw std::invalid_argument(
+            "fiberlet reduction overlay IDs contain duplicates");
+    }
+    if (!std::includes(
+            input.begin(), input.end(), retained.begin(), retained.end())) {
+        throw std::invalid_argument(
+            "fiberlet reduction overlay restores a physical Fiberlet");
+    }
+
+    const double predictionToBase = sourceMetadata.predictionToBaseScale;
+    std::map<FiberletStorageKey, bool> anchorInside;
+    auto isAnchorInside = [&](const FiberletStorageKey& key) {
+        if (const auto found = anchorInside.find(key);
+            found != anchorInside.end()) {
+            return found->second;
+        }
+        const auto loaded = source.anchor(key, true);
+        if (loaded.status != FiberletGraphQueryStatus::Ready) {
+            throw std::runtime_error(
+                "fiberlet reduction overlay anchor failed: " +
+                loaded.error);
+        }
+        const bool inside = pointInsideChunk(
+            cv::Vec3d(loaded.value.anchor.positionPredictionXYZ) *
+                predictionToBase,
+            config);
+        anchorInside.emplace(key, inside);
+        return inside;
+    };
+    auto survives = [&](const FiberletStorageId& id) {
+        return !isAnchorInside(id.first) ||
+            std::binary_search(retained.begin(), retained.end(), id);
+    };
+
+    FiberletReductionOverlayBoxWriteReport result;
+    result.inputFiberlets = input.size();
+    result.retainedFiberlets = static_cast<std::size_t>(std::count_if(
+        input.begin(), input.end(), survives));
+    const auto anchorOwners = analysisAnchorChunks(outputMetadata, config);
+    std::set<std::tuple<int, int, int>> fiberletOwnerCoordinates;
+    std::vector<vc::render::ChunkKey> fiberletOwners = anchorOwners;
+    for (const auto& owner : fiberletOwners) {
+        fiberletOwnerCoordinates.emplace(owner.iz, owner.iy, owner.ix);
+    }
+    for (const auto& id : input) {
+        if (!isAnchorInside(id.first))
+            continue;
+        const auto owner = fiberletStorageOwnerChunk(
+            outputMetadata, id.first, 0);
+        if (fiberletOwnerCoordinates.emplace(
+                owner.iz, owner.iy, owner.ix).second) {
+            fiberletOwners.push_back(owner);
+        }
+    }
+    std::sort(
+        fiberletOwners.begin(), fiberletOwners.end(),
+        [](const auto& left, const auto& right) {
+            return std::tie(left.iz, left.iy, left.ix) <
+                std::tie(right.iz, right.iy, right.ix);
+        });
+    result.touchedAnchorChunks = anchorOwners.size();
+    result.touchedFiberletChunks = fiberletOwners.size();
+    for (const auto& owner : fiberletOwners) {
+        const auto current = source.prefixesInChunk(owner, true);
+        if (current.status != FiberletGraphQueryStatus::Ready ||
+            !current.value.payloadLease) {
+            throw std::runtime_error(
+                "fiberlet reduction overlay prefix chunk failed: " +
+                current.error);
+        }
+        const auto& currentPrefixes =
+            current.value.payloadLease->prefixes;
+        std::vector<FiberletStoredPrefix> replacementPrefixes;
+        std::vector<FiberletStoredRoute> currentRoutes;
+        std::vector<FiberletStoredRoute> replacementRoutes;
+        currentRoutes.reserve(currentPrefixes.size());
+        replacementPrefixes.reserve(currentPrefixes.size());
+        replacementRoutes.reserve(currentPrefixes.size());
+        for (const auto& prefix : currentPrefixes) {
+            const auto route = source.storedRoute(prefix.id, true);
+            if (route.status != FiberletGraphQueryStatus::Ready) {
+                throw std::runtime_error(
+                    "fiberlet reduction overlay route failed: " +
+                    route.error);
+            }
+            currentRoutes.push_back(route.value.route);
+            if (survives(prefix.id)) {
+                replacementPrefixes.push_back(prefix);
+                replacementRoutes.push_back(route.value.route);
+            }
+        }
+        auto routeOwner = owner;
+        routeOwner.level = 1;
+        const auto prefixCodec = outputFiberlets->codecConfig(
+            FiberletStorageChunkKind::FiberletPrefix, owner);
+        const auto routeCodec = outputFiberlets->codecConfig(
+            FiberletStorageChunkKind::FiberletRoutes, routeOwner);
+        const auto makePrefixChunk = [&](const auto& prefixes) {
+            auto bytes = serializeFiberletPrefixes(prefixCodec, prefixes);
+            return FiberletChunkDataset::MaterializedChunk{
+                bytes,
+                std::make_shared<const FiberletPrefixChunkPayload>(
+                    FiberletDecodedPrefixes{prefixCodec, prefixes}),
+                false};
+        };
+        const auto makeRouteChunk = [&](const auto& routes) {
+            auto bytes = serializeFiberletRoutes(routeCodec, routes);
+            return FiberletChunkDataset::MaterializedChunk{
+                bytes,
+                std::make_shared<const FiberletRouteChunkPayload>(
+                    FiberletDecodedRoutes{routeCodec, routes}),
+                false};
+        };
+        const auto currentPrefix = makePrefixChunk(currentPrefixes);
+        const auto replacementPrefix = makePrefixChunk(replacementPrefixes);
+        const auto currentRoute = makeRouteChunk(currentRoutes);
+        const auto replacementRoute = makeRouteChunk(replacementRoutes);
+        replaceFiberletOverlayChunkPair(
+            outputFiberlets, owner, currentPrefix, replacementPrefix,
+            routeOwner, currentRoute, replacementRoute);
+    }
+
+    for (const auto& owner : anchorOwners) {
+        const auto current = source.anchorsInChunk(owner, true);
+        if (current.status != FiberletGraphQueryStatus::Ready ||
+            !current.value.anchors) {
+            throw std::runtime_error(
+                "fiberlet reduction overlay anchor chunk failed: " +
+                current.error);
+        }
+        std::vector<FiberletStoredAnchor> replacement;
+        replacement.reserve(current.value.anchors->size());
+        for (const auto& anchor : *current.value.anchors) {
+            const bool inside = isAnchorInside(anchor.key);
+            if (inside)
+                ++result.inputAnchors;
+            bool referenced = !inside;
+            if (inside) {
+                const auto incident = source.incidentEdges(anchor.key, true);
+                if (incident.status != FiberletGraphQueryStatus::Ready) {
+                    throw std::runtime_error(
+                        "fiberlet reduction overlay incident query failed: " +
+                        incident.error);
+                }
+                referenced = std::any_of(
+                    incident.value.edges.begin(),
+                    incident.value.edges.end(),
+                    [&](const auto& edge) {
+                        return survives(edge.id.fiberlet);
+                    });
+            }
+            if (referenced) {
+                replacement.push_back(anchor);
+                if (inside)
+                    ++result.retainedAnchors;
+            }
+        }
+        const auto codec = outputAnchors->codecConfig(
+            FiberletStorageChunkKind::Anchors, owner);
+        const auto makeAnchorChunk = [&](const auto& anchors) {
+            auto bytes = serializeFiberletAnchors(codec, anchors);
+            return FiberletChunkDataset::MaterializedChunk{
+                bytes,
+                std::make_shared<const FiberletAnchorChunkPayload>(
+                    FiberletDecodedAnchors{codec, anchors}),
+                false};
+        };
+        const auto currentChunk = makeAnchorChunk(*current.value.anchors);
+        const auto replacementChunk = makeAnchorChunk(replacement);
+        replaceFiberletOverlayChunk(
+            outputAnchors, FiberletStorageChunkKind::Anchors, owner,
+            currentChunk, replacementChunk);
+    }
+    return result;
+}
+
 FiberletReductionWriteReport writeReducedFiberletChunk(
     const FiberletChunkGraphSource& source,
     const std::shared_ptr<FiberletChunkDataset>& outputDataset,

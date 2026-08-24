@@ -4,6 +4,7 @@
 
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <bit>
 #include <fstream>
 #include <limits>
 #include <stdexcept>
@@ -651,6 +652,167 @@ void requireMatchingFiberletPair(
             "fiberlet prefix and route payload record counts differ");
 }
 
+void requireOverlayCompatible(
+    const FiberletDatasetMetadata& layer,
+    const FiberletDatasetMetadata& lower,
+    FiberletDatasetKind expectedKind)
+{
+    if (layer.kind != expectedKind || lower.kind != expectedKind ||
+        layer.profile != lower.profile ||
+        layer.chunkGridShapeZYX != lower.chunkGridShapeZYX ||
+        layer.coordinateOriginZYX != lower.coordinateOriginZYX ||
+        layer.coordinateUnitsPerChunkZYX !=
+            lower.coordinateUnitsPerChunkZYX ||
+        layer.maximumEndpointReachCoordinateUnitsZYX !=
+            lower.maximumEndpointReachCoordinateUnitsZYX ||
+        layer.spatialChunkSideBaseVoxels !=
+            lower.spatialChunkSideBaseVoxels ||
+        layer.coordinateBits != lower.coordinateBits ||
+        layer.deltaBits != lower.deltaBits ||
+        layer.routeCountBits != lower.routeCountBits ||
+        layer.routeLatticeBits != lower.routeLatticeBits ||
+        layer.costBits != lower.costBits ||
+        layer.positionQuantumBaseVoxels !=
+            lower.positionQuantumBaseVoxels ||
+        layer.predictionToBaseScale != lower.predictionToBaseScale ||
+        layer.sources != lower.sources) {
+        throw std::invalid_argument(
+            "fiberlet overlay datasets have incompatible layouts");
+    }
+}
+
+FiberletChunkDataset::MaterializedChunk lowerOverlayChunk(
+    const std::shared_ptr<vc::render::ChunkCache>& lower,
+    FiberletStorageChunkKind kind,
+    const vc::render::ChunkKey& requested)
+{
+    const auto result = lower->getChunkBlocking(
+        requested.level, requested.iz, requested.iy, requested.ix);
+    if (result.status != vc::render::ChunkStatus::Data || !result.payload) {
+        throw std::runtime_error(
+            "lower fiberlet overlay chunk is unavailable");
+    }
+    if (kind == FiberletStorageChunkKind::Anchors &&
+        !std::dynamic_pointer_cast<const FiberletAnchorChunkPayload>(
+            result.payload)) {
+        throw std::runtime_error(
+            "lower fiberlet overlay anchor payload has the wrong type");
+    }
+    if (kind == FiberletStorageChunkKind::FiberletPrefix &&
+        !std::dynamic_pointer_cast<const FiberletPrefixChunkPayload>(
+            result.payload)) {
+        throw std::runtime_error(
+            "lower fiberlet overlay prefix payload has the wrong type");
+    }
+    if (kind == FiberletStorageChunkKind::FiberletRoutes &&
+        !std::dynamic_pointer_cast<const FiberletRouteChunkPayload>(
+            result.payload)) {
+        throw std::runtime_error(
+            "lower fiberlet overlay route payload has the wrong type");
+    }
+    return {{}, result.payload, true};
+}
+
+bool sameFloat(float left, float right)
+{
+    return std::bit_cast<std::uint32_t>(left) ==
+        std::bit_cast<std::uint32_t>(right);
+}
+
+bool sameVec(const cv::Vec3f& left, const cv::Vec3f& right)
+{
+    return sameFloat(left[0], right[0]) &&
+        sameFloat(left[1], right[1]) &&
+        sameFloat(left[2], right[2]);
+}
+
+bool sameAnchor(
+    const FiberletStoredAnchor& left, const FiberletStoredAnchor& right)
+{
+    return left.key == right.key &&
+        sameVec(left.positionPredictionXYZ, right.positionPredictionXYZ) &&
+        sameVec(left.fittedAxisXYZ, right.fittedAxisXYZ) &&
+        sameVec(left.predictionAxisXYZ, right.predictionAxisXYZ) &&
+        sameFloat(left.predictionPresence, right.predictionPresence) &&
+        sameVec(left.normalXYZ, right.normalXYZ) &&
+        left.predictionValid == right.predictionValid &&
+        left.predictionPresenceValid == right.predictionPresenceValid &&
+        left.normalValid == right.normalValid;
+}
+
+bool sameCost(
+    const FiberletStoredPathCost& left,
+    const FiberletStoredPathCost& right)
+{
+    return sameFloat(left.invalidPrediction, right.invalidPrediction) &&
+        sameFloat(left.alignment, right.alignment) &&
+        sameFloat(left.isotropicSmoothness, right.isotropicSmoothness) &&
+        sameFloat(left.tangentSmoothness, right.tangentSmoothness) &&
+        sameFloat(left.normalSmoothness, right.normalSmoothness);
+}
+
+bool samePrefix(
+    const FiberletStoredPrefix& left, const FiberletStoredPrefix& right)
+{
+    return left.id == right.id &&
+        left.interiorPointCount == right.interiorPointCount &&
+        left.entryUV == right.entryUV && left.exitUV == right.exitUV &&
+        sameFloat(left.pathLengthPredictionVoxels,
+                  right.pathLengthPredictionVoxels) &&
+        sameCost(left.cost, right.cost) &&
+        sameVec(left.firstStepBaseXYZ, right.firstStepBaseXYZ) &&
+        sameVec(left.lastStepBaseXYZ, right.lastStepBaseXYZ);
+}
+
+bool sameRoute(
+    const FiberletStoredRoute& left, const FiberletStoredRoute& right)
+{
+    if (left.middleUV != right.middleUV ||
+        left.segmentCostDensities.size() !=
+            right.segmentCostDensities.size()) {
+        return false;
+    }
+    for (std::size_t index = 0;
+         index < left.segmentCostDensities.size(); ++index) {
+        if (!sameFloat(
+                left.segmentCostDensities[index],
+                right.segmentCostDensities[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+template <typename T, typename Id, typename GetId, typename Same>
+void requireMonotoneSubset(
+    std::span<const T> current,
+    std::span<const T> replacement,
+    GetId getId,
+    Same same,
+    std::string_view description)
+{
+    std::size_t currentIndex = 0;
+    for (const auto& value : replacement) {
+        const auto id = getId(value);
+        while (currentIndex < current.size() &&
+               getId(current[currentIndex]) < id) {
+            ++currentIndex;
+        }
+        if (currentIndex == current.size() ||
+            getId(current[currentIndex]) != id) {
+            throw std::invalid_argument(
+                std::string("fiberlet overlay replacement restores a ") +
+                std::string(description));
+        }
+        if (!same(current[currentIndex], value)) {
+            throw std::invalid_argument(
+                std::string("fiberlet overlay replacement mutates a ") +
+                std::string(description));
+        }
+        ++currentIndex;
+    }
+}
+
 }  // namespace
 
 void finalizeFiberletDatasetIdentity(FiberletDatasetMetadata& metadata)
@@ -997,6 +1159,168 @@ std::shared_ptr<vc::render::ChunkCache> createStoredFiberletPathChunkCache(std::
     options.cache.persistentCachePath.reset();
     return std::make_shared<
         vc::render::ChunkCache>(std::vector<vc::render::ChunkCache::LevelInfo>{{shape, {1, 1, 1}, {}}, {shape, {1, 1, 1}, {}}}, std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{std::make_shared<StoredFetcher>(dataset, FiberletStorageChunkKind::FiberletPrefix), std::make_shared<StoredFetcher>(dataset, FiberletStorageChunkKind::FiberletRoutes)}, 0.0, vc::render::ChunkDtype::Opaque, std::move(options.cache), std::move(options.service));
+}
+
+std::shared_ptr<vc::render::ChunkCache>
+createOverlayFiberletAnchorChunkCache(
+    std::shared_ptr<FiberletChunkDataset> layer,
+    std::shared_ptr<FiberletChunkDataset> lowerDataset,
+    std::shared_ptr<vc::render::ChunkCache> lower,
+    FiberletChunkCacheOptions options)
+{
+    if (!layer || !lowerDataset || !lower)
+        throw std::invalid_argument(
+            "fiberlet anchor overlay requires both datasets and lower cache");
+    requireOverlayCompatible(
+        layer->metadata(), lowerDataset->metadata(),
+        FiberletDatasetKind::Anchors);
+    return createGeneratedFiberletChunkCache(
+        layer,
+        [lower = std::move(lower)](
+            FiberletStorageChunkKind kind,
+            const vc::render::ChunkKey& requested,
+            const FiberletStorageCodecConfig&) {
+            return lowerOverlayChunk(lower, kind, requested);
+        },
+        std::move(options));
+}
+
+std::shared_ptr<vc::render::ChunkCache>
+createOverlayFiberletPathChunkCache(
+    std::shared_ptr<FiberletChunkDataset> layer,
+    std::shared_ptr<FiberletChunkDataset> lowerDataset,
+    std::shared_ptr<vc::render::ChunkCache> lower,
+    FiberletChunkCacheOptions options)
+{
+    if (!layer || !lowerDataset || !lower)
+        throw std::invalid_argument(
+            "fiberlet path overlay requires both datasets and lower cache");
+    requireOverlayCompatible(
+        layer->metadata(), lowerDataset->metadata(),
+        FiberletDatasetKind::Fiberlets);
+    return createGeneratedFiberletChunkCache(
+        layer,
+        [layer, lower = std::move(lower)](
+            FiberletStorageChunkKind kind,
+            const vc::render::ChunkKey& requested,
+            const FiberletStorageCodecConfig&) {
+            const vc::render::ChunkKey prefix{
+                0, requested.iz, requested.iy, requested.ix};
+            const vc::render::ChunkKey routes{
+                1, requested.iz, requested.iy, requested.ix};
+            const bool prefixExists = std::filesystem::exists(
+                layer->chunkPath(
+                    FiberletStorageChunkKind::FiberletPrefix, prefix));
+            const bool routeExists = std::filesystem::exists(
+                layer->chunkPath(
+                    FiberletStorageChunkKind::FiberletRoutes, routes));
+            if (prefixExists != routeExists) {
+                throw std::runtime_error(
+                    "fiberlet overlay contains a partial prefix/route pair");
+            }
+            if (prefixExists) {
+                throw std::logic_error(
+                    "materialized fiberlet overlay pair was not loaded");
+            }
+            return lowerOverlayChunk(lower, kind, requested);
+        },
+        std::move(options));
+}
+
+void replaceFiberletOverlayChunk(
+    const std::shared_ptr<FiberletChunkDataset>& layer,
+    FiberletStorageChunkKind kind,
+    const vc::render::ChunkKey& key,
+    const FiberletChunkDataset::MaterializedChunk& current,
+    const FiberletChunkDataset::MaterializedChunk& chunk)
+{
+    if (!layer || !current.payload || !chunk.payload)
+        throw std::invalid_argument(
+            "fiberlet overlay replacement requires a decoded payload");
+    if (kind != FiberletStorageChunkKind::Anchors)
+        throw std::invalid_argument(
+            "single fiberlet overlay replacement requires anchors");
+    requireMatchingCodec(
+        payloadConfig(kind, chunk.payload), layer->codecConfig(kind, key));
+    const auto oldAnchors = std::dynamic_pointer_cast<
+        const FiberletAnchorChunkPayload>(current.payload);
+    const auto newAnchors = std::dynamic_pointer_cast<
+        const FiberletAnchorChunkPayload>(chunk.payload);
+    if (!oldAnchors || !newAnchors)
+        throw std::invalid_argument(
+            "fiberlet overlay anchor replacement payload type is invalid");
+    requireMonotoneSubset<FiberletStoredAnchor, FiberletStorageKey>(
+        oldAnchors->anchors, newAnchors->anchors,
+        [](const auto& value) { return value.key; }, sameAnchor, "anchor");
+    vc::core::util::atomicWriteBytes(layer->chunkPath(kind, key), chunk.bytes);
+}
+
+void replaceFiberletOverlayChunkPair(
+    const std::shared_ptr<FiberletChunkDataset>& layer,
+    const vc::render::ChunkKey& prefixKey,
+    const FiberletChunkDataset::MaterializedChunk& currentPrefix,
+    const FiberletChunkDataset::MaterializedChunk& prefix,
+    const vc::render::ChunkKey& routeKey,
+    const FiberletChunkDataset::MaterializedChunk& currentRoutes,
+    const FiberletChunkDataset::MaterializedChunk& routes)
+{
+    if (!layer || layer->metadata().kind != FiberletDatasetKind::Fiberlets ||
+        !currentPrefix.payload || !currentRoutes.payload || !prefix.payload ||
+        !routes.payload || prefixKey.level != 0 ||
+        routeKey.level != 1 || prefixKey.iz != routeKey.iz ||
+        prefixKey.iy != routeKey.iy || prefixKey.ix != routeKey.ix) {
+        throw std::invalid_argument(
+            "fiberlet overlay pair replacement is invalid");
+    }
+    requireMatchingCodec(
+        payloadConfig(FiberletStorageChunkKind::FiberletPrefix,
+                      prefix.payload),
+        layer->codecConfig(
+            FiberletStorageChunkKind::FiberletPrefix, prefixKey));
+    requireMatchingCodec(
+        payloadConfig(FiberletStorageChunkKind::FiberletRoutes,
+                      routes.payload),
+        layer->codecConfig(
+            FiberletStorageChunkKind::FiberletRoutes, routeKey));
+    requireMatchingFiberletPair(prefix.payload, routes.payload);
+    const auto oldPrefixes = std::dynamic_pointer_cast<
+        const FiberletPrefixChunkPayload>(currentPrefix.payload);
+    const auto oldRoutes = std::dynamic_pointer_cast<
+        const FiberletRouteChunkPayload>(currentRoutes.payload);
+    const auto newPrefixes = std::dynamic_pointer_cast<
+        const FiberletPrefixChunkPayload>(prefix.payload);
+    const auto newRoutes = std::dynamic_pointer_cast<
+        const FiberletRouteChunkPayload>(routes.payload);
+    if (!oldPrefixes || !oldRoutes || !newPrefixes || !newRoutes ||
+        oldPrefixes->prefixes.size() != oldRoutes->routes.size() ||
+        newPrefixes->prefixes.size() != newRoutes->routes.size()) {
+        throw std::invalid_argument(
+            "fiberlet overlay pair replacement payload type is invalid");
+    }
+    requireMonotoneSubset<FiberletStoredPrefix, FiberletStorageId>(
+        oldPrefixes->prefixes, newPrefixes->prefixes,
+        [](const auto& value) { return value.id; }, samePrefix, "fiberlet");
+    std::size_t oldIndex = 0;
+    for (std::size_t newIndex = 0;
+         newIndex < newPrefixes->prefixes.size(); ++newIndex) {
+        const auto& id = newPrefixes->prefixes[newIndex].id;
+        while (oldPrefixes->prefixes[oldIndex].id < id)
+            ++oldIndex;
+        if (!sameRoute(oldRoutes->routes[oldIndex],
+                       newRoutes->routes[newIndex])) {
+            throw std::invalid_argument(
+                "fiberlet overlay replacement mutates a route");
+        }
+        ++oldIndex;
+    }
+    vc::core::util::atomicWriteBytes(
+        layer->chunkPath(
+            FiberletStorageChunkKind::FiberletPrefix, prefixKey),
+        prefix.bytes);
+    vc::core::util::atomicWriteBytes(
+        layer->chunkPath(
+            FiberletStorageChunkKind::FiberletRoutes, routeKey),
+        routes.bytes);
 }
 
 }  // namespace vc::fiber_tracer

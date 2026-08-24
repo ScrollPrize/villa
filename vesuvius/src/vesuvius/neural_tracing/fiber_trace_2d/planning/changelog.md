@@ -1,3 +1,15 @@
+# 2026-08-24: arbitrary staged Fiberlet graph reduction
+
+- Replaced the unpublished fixed two-stage driver with repeatable
+  `--stage SIDE,OFFSET_X,OFFSET_Y,OFFSET_Z` analysis passes over a selected
+  base-coordinate bbox.
+- Added same-layout sparse anchor/Fiberlet overlays with missing-chunk
+  fall-through, explicit empty overrides, strict prefix/route pairing, and
+  record-exact monotone replacement checks.
+- Made overlapping boxes consume earlier removals in deterministic order and
+  report per-stage plus joint anchor/all/interior reductions. Derived layers
+  are temporary; initial on-demand caches remain reusable and unchanged.
+
 # 2026-08-24: two-stage regional Fiberlet reduction diagnostic
 
 - Added globally reusable aligned stage-one reduction chunks and centered

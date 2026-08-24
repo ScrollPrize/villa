@@ -1516,3 +1516,222 @@ TEST_CASE("Fiberlet chunk route analysis finds exact simple entry-to-exit optima
     hotAnchorCache->cancelPendingAndWait();
     std::filesystem::remove_all(root);
 }
+
+TEST_CASE("Fiberlet sparse overlays fall through and enforce monotone records")
+{
+    std::mt19937_64 random(std::random_device{}());
+    const auto root = std::filesystem::temp_directory_path() /
+        ("vc_fiberlet_overlays_" + std::to_string(random()));
+    FiberletDatasetMetadata anchorMetadata;
+    anchorMetadata.kind = FiberletDatasetKind::Anchors;
+    anchorMetadata.profile = FiberletStorageProfile::Float32Cache;
+    anchorMetadata.chunkGridShapeZYX = {1, 1, 2};
+    anchorMetadata.coordinateUnitsPerChunkZYX = {16, 16, 16};
+    anchorMetadata.maximumEndpointReachCoordinateUnitsZYX = {8, 8, 8};
+    anchorMetadata.spatialChunkSideBaseVoxels = 16;
+    anchorMetadata.predictionToBaseScale = 1.0;
+    finalizeFiberletDatasetIdentity(anchorMetadata);
+    auto pathMetadata = anchorMetadata;
+    pathMetadata.kind = FiberletDatasetKind::Fiberlets;
+    finalizeFiberletDatasetIdentity(pathMetadata);
+    const vc::render::ChunkKey owner{0, 0, 0, 0};
+    const vc::render::ChunkKey routeOwner{1, 0, 0, 0};
+    const FiberletStoredAnchor first{
+        key(1, 1, 1), {1, 1, 1}, {1, 0, 0}, {1, 0, 0}, 1.0F,
+        {0, 1, 0}, true, true, true};
+    const FiberletStoredAnchor second{
+        key(1, 1, 2), {2, 1, 1}, {1, 0, 0}, {1, 0, 0}, 1.0F,
+        {0, 1, 0}, true, true, true};
+    FiberletStoredPrefix prefix;
+    prefix.id = {first.key, second.key};
+    prefix.pathLengthPredictionVoxels = 1.0F;
+    prefix.firstStepBaseXYZ = {1, 0, 0};
+    prefix.lastStepBaseXYZ = {1, 0, 0};
+    FiberletStoredRoute route;
+    route.segmentCostDensities = {1.0F};
+
+    auto baseAnchors = FiberletChunkDataset::createOrOpen(
+        root / "base-anchors", anchorMetadata);
+    auto basePaths = FiberletChunkDataset::createOrOpen(
+        root / "base-paths", pathMetadata);
+    baseAnchors->publishChunk(
+        FiberletStorageChunkKind::Anchors, owner,
+        serializeFiberletAnchors(
+            baseAnchors->codecConfig(
+                FiberletStorageChunkKind::Anchors, owner),
+            std::array{first, second}));
+    FiberletChunkDataset::MaterializedChunk basePrefix = materialized(
+        FiberletStorageChunkKind::FiberletPrefix,
+        serializeFiberletPrefixes(
+            basePaths->codecConfig(
+                FiberletStorageChunkKind::FiberletPrefix, owner),
+            std::array{prefix}));
+    FiberletChunkDataset::MaterializedChunk baseRoute = materialized(
+        FiberletStorageChunkKind::FiberletRoutes,
+        serializeFiberletRoutes(
+            basePaths->codecConfig(
+                FiberletStorageChunkKind::FiberletRoutes, routeOwner),
+            std::array{route}));
+    basePaths->publishFiberletChunkPair(
+        owner, basePrefix, routeOwner, baseRoute);
+    auto baseAnchorCache = createStoredFiberletAnchorChunkCache(baseAnchors);
+    auto basePathCache = createStoredFiberletPathChunkCache(basePaths);
+
+    auto layerAnchorMetadata = anchorMetadata;
+    layerAnchorMetadata.processing["reduction"] = "layer1";
+    finalizeFiberletDatasetIdentity(layerAnchorMetadata);
+    auto layerPathMetadata = pathMetadata;
+    layerPathMetadata.processing["reduction"] = "layer1";
+    finalizeFiberletDatasetIdentity(layerPathMetadata);
+    auto layerAnchors = FiberletChunkDataset::createOrOpen(
+        root / "layer1-anchors", layerAnchorMetadata);
+    auto layerPaths = FiberletChunkDataset::createOrOpen(
+        root / "layer1-paths", layerPathMetadata);
+    auto layerAnchorCache = createOverlayFiberletAnchorChunkCache(
+        layerAnchors, baseAnchors, baseAnchorCache);
+    auto layerPathCache = createOverlayFiberletPathChunkCache(
+        layerPaths, basePaths, basePathCache);
+    auto inheritedAnchors = layerAnchorCache->getChunkBlocking(0, 0, 0, 0);
+    auto inheritedPaths = layerPathCache->getChunkBlocking(0, 0, 0, 0);
+    REQUIRE(inheritedAnchors.status == vc::render::ChunkStatus::Data);
+    REQUIRE(inheritedPaths.status == vc::render::ChunkStatus::Data);
+    REQUIRE(std::dynamic_pointer_cast<const FiberletAnchorChunkPayload>(
+                inheritedAnchors.payload)->anchors.size() == 2);
+    REQUIRE(std::dynamic_pointer_cast<const FiberletPrefixChunkPayload>(
+                inheritedPaths.payload)->prefixes.size() == 1);
+    layerAnchorCache->cancelPendingAndWait();
+    layerPathCache->cancelPendingAndWait();
+
+    const auto currentAnchors = materialized(
+        FiberletStorageChunkKind::Anchors,
+        serializeFiberletAnchors(
+            layerAnchors->codecConfig(
+                FiberletStorageChunkKind::Anchors, owner),
+            std::array{first, second}));
+    const auto emptyAnchors = materialized(
+        FiberletStorageChunkKind::Anchors,
+        serializeFiberletAnchors(
+            layerAnchors->codecConfig(
+                FiberletStorageChunkKind::Anchors, owner), {}));
+    replaceFiberletOverlayChunk(
+        layerAnchors, FiberletStorageChunkKind::Anchors, owner,
+        currentAnchors, emptyAnchors);
+    const auto currentPrefix = materialized(
+        FiberletStorageChunkKind::FiberletPrefix,
+        serializeFiberletPrefixes(
+            layerPaths->codecConfig(
+                FiberletStorageChunkKind::FiberletPrefix, owner),
+            std::array{prefix}));
+    const auto currentRoute = materialized(
+        FiberletStorageChunkKind::FiberletRoutes,
+        serializeFiberletRoutes(
+            layerPaths->codecConfig(
+                FiberletStorageChunkKind::FiberletRoutes, routeOwner),
+            std::array{route}));
+    const auto emptyPrefix = materialized(
+        FiberletStorageChunkKind::FiberletPrefix,
+        serializeFiberletPrefixes(
+            layerPaths->codecConfig(
+                FiberletStorageChunkKind::FiberletPrefix, owner), {}));
+    const auto emptyRoute = materialized(
+        FiberletStorageChunkKind::FiberletRoutes,
+        serializeFiberletRoutes(
+            layerPaths->codecConfig(
+                FiberletStorageChunkKind::FiberletRoutes, routeOwner), {}));
+    replaceFiberletOverlayChunkPair(
+        layerPaths, owner, currentPrefix, emptyPrefix, routeOwner,
+        currentRoute, emptyRoute);
+
+    auto layer2AnchorMetadata = layerAnchorMetadata;
+    layer2AnchorMetadata.processing["reduction"] = "layer2";
+    finalizeFiberletDatasetIdentity(layer2AnchorMetadata);
+    auto layer2PathMetadata = layerPathMetadata;
+    layer2PathMetadata.processing["reduction"] = "layer2";
+    finalizeFiberletDatasetIdentity(layer2PathMetadata);
+    auto layer2Anchors = FiberletChunkDataset::createOrOpen(
+        root / "layer2-anchors", layer2AnchorMetadata);
+    auto layer2Paths = FiberletChunkDataset::createOrOpen(
+        root / "layer2-paths", layer2PathMetadata);
+    auto emptyAnchorCache = createOverlayFiberletAnchorChunkCache(
+        layerAnchors, baseAnchors, baseAnchorCache);
+    auto emptyPathCache = createOverlayFiberletPathChunkCache(
+        layerPaths, basePaths, basePathCache);
+    auto layer2AnchorCache = createOverlayFiberletAnchorChunkCache(
+        layer2Anchors, layerAnchors, emptyAnchorCache);
+    auto layer2PathCache = createOverlayFiberletPathChunkCache(
+        layer2Paths, layerPaths, emptyPathCache);
+    const auto shadowedAnchors = layer2AnchorCache->getChunkBlocking(0, 0, 0, 0);
+    const auto shadowedPaths = layer2PathCache->getChunkBlocking(0, 0, 0, 0);
+    REQUIRE(shadowedAnchors.status == vc::render::ChunkStatus::Data);
+    REQUIRE(shadowedPaths.status == vc::render::ChunkStatus::Data);
+    CHECK(std::dynamic_pointer_cast<const FiberletAnchorChunkPayload>(
+              shadowedAnchors.payload)->anchors.empty());
+    CHECK(std::dynamic_pointer_cast<const FiberletPrefixChunkPayload>(
+              shadowedPaths.payload)->prefixes.empty());
+
+    FiberletStoredAnchor mutated = first;
+    mutated.predictionPresence = 0.5F;
+    const auto mutatedAnchors = materialized(
+        FiberletStorageChunkKind::Anchors,
+        serializeFiberletAnchors(
+            layerAnchors->codecConfig(
+                FiberletStorageChunkKind::Anchors, owner),
+            std::array{mutated}));
+    CHECK_THROWS_AS(
+        replaceFiberletOverlayChunk(
+            layerAnchors, FiberletStorageChunkKind::Anchors, owner,
+            currentAnchors, mutatedAnchors),
+        std::invalid_argument);
+    CHECK_THROWS_AS(
+        replaceFiberletOverlayChunk(
+            layerAnchors, FiberletStorageChunkKind::Anchors, owner,
+            emptyAnchors, currentAnchors),
+        std::invalid_argument);
+    auto mutatedRouteValue = route;
+    mutatedRouteValue.segmentCostDensities[0] = 0.5F;
+    const auto mutatedRoute = materialized(
+        FiberletStorageChunkKind::FiberletRoutes,
+        serializeFiberletRoutes(
+            layerPaths->codecConfig(
+                FiberletStorageChunkKind::FiberletRoutes, routeOwner),
+            std::array{mutatedRouteValue}));
+    CHECK_THROWS_AS(
+        replaceFiberletOverlayChunkPair(
+            layerPaths, owner, currentPrefix, currentPrefix, routeOwner,
+            currentRoute, mutatedRoute),
+        std::invalid_argument);
+
+    auto incompatibleMetadata = anchorMetadata;
+    incompatibleMetadata.sources = {{"identity", "different"}};
+    finalizeFiberletDatasetIdentity(incompatibleMetadata);
+    auto incompatible = FiberletChunkDataset::createOrOpen(
+        root / "incompatible", incompatibleMetadata);
+    CHECK_THROWS_AS(
+        createOverlayFiberletAnchorChunkCache(
+            incompatible, baseAnchors, baseAnchorCache),
+        std::invalid_argument);
+
+    auto partialMetadata = pathMetadata;
+    partialMetadata.processing["reduction"] = "partial";
+    finalizeFiberletDatasetIdentity(partialMetadata);
+    auto partial = FiberletChunkDataset::createOrOpen(
+        root / "partial", partialMetadata);
+    partial->publishChunk(
+        FiberletStorageChunkKind::FiberletPrefix, owner,
+        serializeFiberletPrefixes(
+            partial->codecConfig(
+                FiberletStorageChunkKind::FiberletPrefix, owner), {}));
+    auto partialCache = createOverlayFiberletPathChunkCache(
+        partial, basePaths, basePathCache);
+    const auto partialResult = partialCache->getChunkBlocking(0, 0, 0, 0);
+    CHECK(partialResult.status != vc::render::ChunkStatus::Data);
+
+    partialCache->cancelPendingAndWait();
+    layer2AnchorCache->cancelPendingAndWait();
+    layer2PathCache->cancelPendingAndWait();
+    emptyAnchorCache->cancelPendingAndWait();
+    emptyPathCache->cancelPendingAndWait();
+    baseAnchorCache->cancelPendingAndWait();
+    basePathCache->cancelPendingAndWait();
+    std::filesystem::remove_all(root);
+}

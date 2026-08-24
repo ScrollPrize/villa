@@ -869,39 +869,58 @@ The primary table reports before/after counts and reduction percentages for
 anchors and all incident Fiberlets. A second table reports internal Fiberlets
 separately, excluding mandatory boundary-crossing entry and exit edges.
 
-Pass `--region-size N --mode two-stage` to run the reusable regional reduction
-experiment. `--chunk` then names the selected region minimum, while
-`--chunk-size` remains the globally aligned analysis-box side. For a 512-base
-region and 256-base boxes, stage one processes the eight intersecting aligned
-boxes and stores their retained Fiberlets in a fingerprinted global reduced
-cache. Stage two analyzes the single 256-base box shifted by 128 base voxels on
-all axes:
+Pass `--region-size N --mode staged` with one or more repeatable
+`--stage SIDE,OFFSET_X,OFFSET_Y,OFFSET_Z` options to run an ordered reduction
+chain. `--chunk` names the selected region minimum in base XYZ. Each stage
+tiles complete `SIDE`-voxel analysis boxes from its offset relative to that
+minimum. Analysis boxes need not align to anchor cells or storage chunks.
+
+This reproduces the original 512/256 two-pass experiment with eight outer
+boxes followed by one half-offset central box:
 
 ```bash
 volume-cartographer/build/bin/vc_fiberlets chunk-route-stats \
   /path/to/fiber.lasagna.json /path/to/output \
   --normal-manifest /path/to/normals.lasagna.json \
   --chunk 23040,17920,54784 \
-  --chunk-size 256 \
   --region-size 512 \
-  --mode two-stage \
+  --mode staged \
+  --stage 256,0,0,0 \
+  --stage 256,128,128,128 \
   --storage-chunk-side 128 \
   --anchor-cache /path/to/anchors.zarr \
   --fiberlet-cache /path/to/fiberlets.zarr \
   --threads 32
 ```
 
-The selected region is not part of the reduced-cache identity. Compatible
-stage-one chunks are reused across overlapping invocations. Stage two sees
-exactly the selected stage-one owners: graph halo requests outside that set are
-ephemeral empty results and neither generate nor publish additional reduced
-chunks. Original anchors are exposed through a decoded-LRU-bound rechunked
-view of the existing anchor cache, so analysis-sized ownership does not copy or
-regenerate anchor data. The final table reports the original, stage-one, and
-stage-two unique physical-ID populations for all and internal Fiberlets.
+Appending `--stage 512,0,0,0` runs a third whole-region pass. Every stage gets
+separate anchor and Fiberlet overlay datasets with exactly the initial cache's
+storage grid and encoding. A missing upper chunk means unchanged data and
+falls through to the preceding layer; an explicit empty chunk shadows lower
+data. A partial Fiberlet prefix/route pair or corrupt upper payload is an
+error, never a fallback. The initial caches remain persistent and unchanged;
+derived stage directories are temporary for this experiment and are deleted
+after reporting.
 
-After stage two, the command also constructs an exact in-memory simplified
-graph for each centered box. Directed states outside the intersection of
+Boxes execute serially in deterministic Z/Y/X order. Later overlapping boxes
+in one stage read earlier writes from that same stage. Only Fiberlets whose
+canonical first endpoint lies in the current half-open box may be removed.
+The writer rewrites every affected original-layout owner chunk, including a
+canonical owner outside the geometrically intersected storage chunks. It may
+only publish subsets of the effective lower records, and retained anchor,
+prefix, and route fields must remain exactly unchanged. An inside anchor is
+removed only when no surviving incident Fiberlet references it, including
+outside-owned and lower-layer Fiberlets.
+
+The aggregate output has one row per stage with input/output, stage reduction,
+and cumulative reduction for anchors, all incident Fiberlets, and interior
+Fiberlets. The joint table compares the original and final canonical unique
+populations over the selected region. Interior membership is fixed from the
+initial graph so removed anchors cannot change later denominators. `--stats`
+adds per-box simplification and touched-chunk diagnostics.
+
+For each processed box, the command also constructs an exact in-memory
+simplified graph. Directed states outside the intersection of
 entry-forward and exit-backward reachability are removed conservatively, then
 every anchor not referenced by a surviving Fiberlet is removed. Reachability
 ignores the path-specific no-revisit history, so it may retain an uncertain
@@ -929,6 +948,10 @@ more: visited-anchor history can make either route relevant. Macro graphs are
 not serialized as ordinary Fiberlets and are not yet consumed by regular
 replay. The ordinary route lattice cannot encode concatenated geometry without
 resampling, so persistent macro storage requires a dedicated format.
+
+Sequential box-local pruning is deterministic and monotone, but local
+entry-to-first-exit optimality does not prove that a globally optimal replay
+route is preserved for every possible later analysis boundary.
 
 ## Whole-volume preprocessing
 

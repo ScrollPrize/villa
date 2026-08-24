@@ -1,60 +1,58 @@
-# Task log: lossless post-stage-two Fiberlet graph simplification
+# Task log: arbitrary staged Fiberlet graph reduction
 
-## Initial findings
+## Decisions
 
-- A physical Fiberlet ID is the canonical ordered pair of exact anchor keys.
-  The storage graph therefore cannot contain two distinct physical Fiberlets
-  with the same exact endpoints; such input is rejected as a duplicate stable
-  ID. Different anchor variants are different endpoints.
-- Stage-two retained output currently persists only physical Fiberlets. Its
-  anchor view still exposes all source anchors, so unused anchors must be
-  explicitly filtered in the simplified graph.
-- Ordinary stored route geometry uses a curved lattice defined by one endpoint
-  pair. Concatenating multiple routes and serializing them as one ordinary
-  Fiberlet would require resampling and would not be lossless. Macro-Fiberlets
-  will reference ordered original directed Fiberlets instead.
-- Transition validity and cost depend on the incoming and outgoing directions.
-  Physical degree alone is insufficient for contraction; bidirectional
-  contraction requires the regular transition to exist in both directions.
-- Independent review required an explicit live-direction mask, ordered rather
-  than pre-summed authoritative macro costs, atomic hidden-anchor validation,
-  and per-box macro identity. It also identified that arbitrary dominated-route
-  deletion conflicts with preserving the valid route set. The plan was updated
-  before implementation.
-- Forward/reverse reachability is deliberately conservative under the
-  no-revisit rule: it safely removes proven-dead states but may retain a state
-  whose separate reachability witnesses cannot form one simple route.
+- Stage specifications are ordered and repeatable; offsets are relative to the
+  selected bbox minimum in base XYZ coordinates.
+- Every stage uses the initial storage layout. Analysis boxes and storage chunks
+  are independent geometric concepts.
+- Missing upper chunks fall through, while explicit empty upper chunks shadow
+  lower data.
+- Updates are monotone and limited by canonical Fiberlet ownership inside each
+  processed half-open box.
+- Existing macro merging remains an in-memory diagnostic. Persisting macros as
+  ordinary Fiberlets would violate the established route-format contract.
+- The independent review recommended persistent completed layers, but the
+  current user requirement explicitly makes every derived stage cache
+  temporary. Layers therefore use unique invocation roots, are never reopened,
+  and are removed after reporting; no completion protocol is needed yet.
+- Cold canonical source generation remains allowed. Staging never prunes or
+  rewrites the initial cache.
 
-## Deviations and validation
+## Deviations
 
-- The independent review rejected deleting distinct higher-cost parallel
-  routes. Exact same-endpoint physical Fiberlets are structurally impossible
-  because their canonical stable ID is the endpoint-key pair. Different anchor
-  variants are different graph routes and cannot be removed losslessly under
-  path-dependent visited-anchor history.
-- Physical macro contraction is deliberately stricter than one-successor
-  detection: it requires a degree-two interior anchor and both mutual directed
-  transitions. One-successor cases that converge from multiple predecessors
-  remain separate graph states but receive overlapping deterministic rollout
-  descriptors. Disjoint directed contraction additionally requires one
-  predecessor; the measured crop had no such states after physical contraction.
-- Macros are in-memory ordered references to original Fiberlets. They are not
-  persisted into the ordinary route lattice and are not yet consumed by regular
-  replay because encoding concatenated geometry there would require resampling.
-- Build command:
+- Macro-Fiberlet merging remains an in-memory simplification diagnostic. The
+  ordinary Fiberlet route payload cannot encode a concatenated macro without
+  resampling, so temporary overlays persist exact physical removals and unused
+  anchor removal only. This preserves the established storage contract.
+- The staged layers are intentionally deleted after the report. They therefore
+  do not yet have a completion marker or cross-invocation reuse protocol.
+
+## Validation
+
+- The first Paris4 staged run exposed a storage-boundary case: an eligible
+  Fiberlet's first endpoint was geometrically inside the analysis box, but its
+  canonical owner was an adjacent storage chunk. The box writer now unions
+  those canonical owners with geometrically intersected chunks before writing.
+- Built with 32 jobs:
+
   `cmake --build volume-cartographer/build/ci-tests-clang-systemdeps --target vc_fiberlets test_fiberlet_storage test_fiberlet_paths -j32`
-- Focused validation passed: `test_fiberlet_storage` (27 cases),
-  `test_fiberlet_paths` (87 cases), and `git diff --check`.
-- The build repeatedly reported a pre-existing truncated Ninja log and rebuilt
-  117 targets; compilation completed successfully. Existing unrelated OpenCV
-  deprecation and ignored-`nodiscard` warnings remain.
-- Hot Paris4 command used the existing 128-base storage caches, a 512-base
-  selected region, eight 256-base stage-one boxes, one centered 256-base
-  stage-two box, and 32 threads. It reused all eight reduced chunks and stage
-  two plus simplification completed in 2.5-2.6 seconds across repeated runs.
-- Measured population: 13,750 original to 7,112 stage one to 4,168 stage two;
-  internal 5,730 to 3,436 to 618. Post-stage-two simplification retained 1,464
-  of 1,515 materialized anchors, represented 4,168 physical Fiberlets as 4,095
-  physical macros (73 merged), and found 1,041 forced-continuation states.
-  Forced rollout descriptors averaged 2.19 macros, median 2, maximum 4. No
-  further disjoint directed chain contraction survived convergence checks.
+
+- `test_fiberlet_storage`: 28 test cases passed.
+- `test_fiberlet_paths`: 87 test cases passed.
+- `git diff --check`: passed.
+- A hot Paris4 512-base bbox run used stages `256,0,0,0`,
+  `256,128,128,128`, and `512,0,0,0` with the existing 128-base storage
+  chunks and 32 threads. Cache preparation reused 512/512 anchor chunks and
+  216/216 Fiberlet chunks.
+- Stage wall times in the current Clang system-dependency build were 42.7 s,
+  2.9 s, and 25.4 s. Counts were:
+
+  | Scope | Initial | Stage 1 | Stage 2 | Stage 3 | Joint reduction |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | Anchors | 4,383 | 4,184 | 4,143 | 3,368 | 23.16% |
+  | All Fiberlets | 79,301 | 48,992 | 46,026 | 35,028 | 55.83% |
+  | Interior Fiberlets | 48,415 | 18,406 | 15,440 | 4,470 | 90.77% |
+
+- The invocation-local stage directory was absent after normal completion,
+  confirming cleanup while the initial caches remained unchanged.

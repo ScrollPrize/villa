@@ -1,115 +1,136 @@
-# Plan: lossless post-stage-two Fiberlet graph simplification
+# Plan: arbitrary staged Fiberlet graph reduction
 
-## Semantics and representation
+## CLI and stage geometry
 
-1. Materialize the post-stage-two retained physical graph in the same centered
-   half-open box and rebuild its directed transition adjacency with the same
-   join-angle, prediction-validity, normal/tangent scoring, and selected edge
-   cost view used by exact stage-two analysis.
-2. Treat a directed Fiberlet arrival as the graph state. Classify its
-   admissible successors after excluding reversal over the same physical
-   Fiberlet. Report zero, one, and multiple-successor state counts.
-3. Compute conservative forward reachability from directed entries and reverse
-   reachability from directed exits. Remove states outside their intersection.
-   This cannot remove a valid simple route because every such route is present
-   in both reachability sets. It may conservatively retain a state when the two
-   reachability witnesses cannot be concatenated without revisiting an anchor.
-   Retain a physical Fiberlet when either direction remains live and carry an
-   explicit live-direction mask through every later adjacency and macro step;
-   never recreate its removed reverse orientation.
-4. Remove all anchors not referenced by a remaining physical Fiberlet. Outside
-   endpoints of crossing Fiberlets become boundary portals keyed by their
-   original anchor identity, so entry-root revisit semantics remain unchanged.
-5. A physical interior anchor is contractible only when exactly two remaining
-   physical Fiberlets touch it and their mutual transition is admissible in
-   both directions. Boundary portals, entry/exit-only anchors, branch anchors,
-   and one-way continuations stop physical contraction.
-6. Build maximal physical macro-Fiberlets by walking through contractible
-   anchors. Each directed macro stores its ordered original directed Fiberlet
-   IDs, complete ordered anchor sequence, per-edge and per-join losses, and
-   per-edge lengths. Aggregate loss and length are diagnostics only;
-   authoritative evaluation replays the original scalar sequence in the same
-   order and association as physical expansion. Preserve cycles as
-   uncontracted edges; never invent a self-loop macro.
-7. Build macro transition adjacency from the final physical edge at the end of
-   an incoming macro and the first physical edge of an outgoing macro. This is
-   the precomputed regular join relation, not a relaxed connectivity rule.
-8. Build deterministic directed rollout descriptors from macro states with one
-   admissible successor. Stop at exits, branching states, repeated anchors, or
-   cycles. Macro/rollout application exposes an atomic visited-anchor validator
-   which rejects the complete candidate if any hidden target anchor already
-   exists in the route history, then records the full hidden sequence on
-   success.
-9. Validate canonical physical IDs. One stored physical Fiberlet per exact
-   anchor-key pair is already enforced, so exact same-endpoint duplicates are
-   impossible. Do not remove distinct higher-cost physical or macro routes:
-   preserving only the optimum would not preserve the valid route set, and
-   visited-anchor histories can make an apparently dominated geometry useful.
-   Report the structural duplicate count, which must remain zero.
-10. Keep this as an exact in-memory macro graph/report. Do not serialize macros
-    as ordinary Fiberlets: the current route lattice is defined by one endpoint
-    pair and cannot encode concatenated geometry without resampling. Persistent
-    macro serialization is a separate format task.
+1. Replace the fixed `--mode two-stage` geometry with `--mode staged` and a
+   repeatable `--stage SIDE,OFFSET_X,OFFSET_Y,OFFSET_Z` option. Offsets are
+   nonnegative base-voxel offsets relative to `--chunk`. Analysis boxes need
+   not align to anchor cells or storage chunks.
+2. Keep `--chunk X,Y,Z` and `--region-size N` as the half-open selected bbox.
+   For each stage, enumerate all cubic boxes on its offset lattice that are
+   completely contained in that bbox. Use deterministic Z/Y/X execution order;
+   reject a stage that yields no boxes.
+3. Preserve `--mode stats` as the existing read-only single-layout diagnostic.
+   Remove the unpublished `two-stage` CLI mode rather than maintain a backward
+   compatibility alias.
 
-## CLI integration and reporting
+## Sparse cache layers
 
-1. Run simplification on each centered stage-two crop after exact stage-two
-   retention. Input is the stage-two retained physical-ID set, not the larger
-   stage-one graph.
-2. Report each centered box independently. Macro partitions depend on the box
-   boundary and have no global identity across overlapping centered boxes. For
-   the current 512/256 experiment this is one report.
-3. Print a compact simplification table for the common stage-two selection:
-   physical Fiberlets before/after reachability, unused anchors removed,
-   contractible anchors, physical macro count, physical edges represented by
-   macros, and directed macro states.
-4. Print continuation counts and chain distributions: zero/one/branching
-   directed states, deterministic rollout count, mean/median/max physical
-   Fiberlets per macro, and mean/median/max macros per rollout.
-5. Keep detailed per-box lists behind `--stats`; headline counts remain visible
-   by default.
+1. Add reusable core helpers which expose an anchor or Fiberlet dataset as a
+   sparse overlay over a compatible lower cache. A valid upper payload wins;
+   when both upper Fiberlet pair members are absent, reads fall through without
+   publishing a copy. Partial prefix/route pairs are errors. Require identical
+   grid, coordinate, storage profile, quantization, reach, and prediction-scale
+   metadata between layers.
+2. Give every stage separate temporary anchor and Fiberlet datasets under a
+   unique per-invocation root which is never reopened as a completed cache and
+   is removed after final reporting. Derive
+   their identities from the preceding layer plus the ordered stage index,
+   analysis side/offset, exact route-analysis scoring contract, and selected
+   bbox. Keep the initial persistent anchor/Fiberlet caches unchanged.
+3. Use the initial storage chunk grid in every layer. Stage analysis-box size is
+   independent of storage ownership and may cover multiple storage chunks.
+4. Add explicit replacement publication for mutable reduction overlays. It is
+   only used while one stage is executing, after all graph leases for the old
+   view are released. Prefix/routes remain a validated pair. Stage layers are
+   temporary experimental data and are removed after reporting.
+5. Upper decode/I/O errors never fall through. Fiberlet fallback is allowed
+   only when both prefix and route members are absent; a partial pair is fatal.
+   Explicit empty payloads shadow every lower layer through arbitrary overlay
+   depth.
+
+## Monotone box updates
+
+1. Process boxes strictly serially in canonical Z/Y/X order. Before each box,
+   create/read the current stage overlay over the preceding layer so an
+   overlapping box sees every earlier removal in the same stage. Exact search
+   inside one box may continue to use its configured worker count.
+2. Run exact entry-to-first-exit analysis and the existing conservative
+   post-analysis simplifier on the current graph.
+3. Build the box's actual retained physical set as follows: only a Fiberlet
+   whose canonical first endpoint anchor's stored base-space position lies
+   inside the half-open box is eligible for removal; storage ownership remains
+   derived from that endpoint key. All incident Fiberlets owned outside the box stay. For eligible
+   Fiberlets retain only IDs surviving exact route selection and conservative
+   directed reachability. Intersect with current contents so no update can
+   restore an absent ID.
+4. Rewrite each touched Fiberlet owner chunk from its current effective payload,
+   filtering only eligible IDs and copying authoritative stored routes without
+   numerical conversion or reordered accumulation.
+5. Remove an anchor whose stored position is inside the box only after querying
+   its complete effective incident-owner reach cube with the proposed Fiberlet
+   update applied. Retain it if any surviving effective physical Fiberlet
+   references it, including an outside-owned or lower-layer Fiberlet. Rewrite
+   every storage chunk geometrically intersected by the box, including an
+   unchanged or explicitly empty result; preserve outside-box records
+   byte-equivalently at the record level.
+6. Before publication, hard-check that every new prefix-ID and anchor-key set is
+   a subset of the current effective set and that retained record fields and
+   route data are unchanged. Persist empty touched chunks explicitly so empty is distinguishable from
+   missing/fall-through. Recreate the stage overlay cache after a box update so
+   later overlapping boxes cannot observe stale decoded payloads.
+7. Keep macro-Fiberlet merging and deterministic rollouts as exact in-memory
+   diagnostics. The existing spec forbids encoding them as ordinary Fiberlet
+   records, so this task does not persist macros or use them to replace physical
+   IDs.
+
+## Statistics
+
+1. Capture the canonical unique population over the selected bbox from the
+   initial graph, after every stage, and after the final stage. Count `all` as
+   every Fiberlet incident to the bbox and `interior` as both endpoints inside.
+   Use the initial graph's stable endpoint geometry to classify all stages so
+   denominators cannot drift after anchor removal.
+2. Print one compact table with one row per stage: input, output, stage
+   reduction, and cumulative reduction for all and interior populations.
+3. Print the joint original/final totals and reduction for both scopes. Also
+   print per-stage box counts, touched/rewritten storage chunks, anchors before
+   and after, and temporary layer roots under `--stats`.
+4. Retain per-box post-simplification diagnostics behind `--stats`; default
+   output remains readable progress plus aggregate tables.
 
 ## Tests
 
-1. Add a deterministic fixture containing a bidirectional degree-two chain, a
-   branch, a one-way forced continuation, a dead state, an unused anchor, and
-   boundary entry/exit Fiberlets.
-2. Verify forward/reverse reachability, complete unused-anchor removal,
-   boundary portal identity, continuation-degree counts, and exact retained
-   physical IDs.
-3. Verify physical macro ordering, forward/reverse ordered edge/join scalars,
-   lengths, live-direction masks, internal anchor sequence, and that expanding
-   all macros reproduces the original physical sequence without reassociation.
-4. Verify branching and one-way anchors are not physically contracted while a
-   deterministic directed rollout may cross a one-way forced continuation.
-5. Enumerate every simple entry-to-first-exit route in the bounded fixture
-   before and after simplification and compare expanded directed physical
-   sequences and ordered scalar evaluation. Include a hidden-middle-anchor
-   revisit, exit to the entry-root portal, a one-live-direction edge, a cycle,
-   and an exact-cost tie. Verify exact endpoint duplicates are rejected by the
-   existing canonical-ID graph materialization.
-6. Build `vc_fiberlets`, `test_fiberlet_storage`, and
-   `test_fiberlet_paths` with 32 threads; run both tests and `git diff --check`.
-7. Run the hot Paris4 512/256 two-stage command and record simplification
-   counts and elapsed time.
+1. Add a small multi-chunk fixture and reusable overlay tests for upper-hit,
+   lower-fallback, explicit empty override, metadata mismatch, and partial
+   Fiberlet-pair rejection.
+2. Run aligned, half-offset, and whole-bbox stages and verify the equivalent
+   two-stage geometry (`256/0`, then `256/128`) is generated for a 512 bbox.
+3. Verify later stages and later overlapping boxes see earlier removals, never
+   restore IDs, rewrite all affected initial-layout chunks, and preserve records
+   outside each box.
+4. Verify unused inside anchors are removed without deleting an anchor still
+   referenced by an outside-owned or lower-layer surviving Fiberlet.
+5. Verify explicit empty chunks shadow lower nonempty chunks through at least
+   three layers, missing chunks fall through unchanged, corrupt upper data
+   fails, and partial path pairs fail.
+6. Verify per-stage and joint all/interior counts use canonical unions and are
+   monotone.
+7. Add negative replacement tests for attempted restoration, record mutation,
+   and route mutation; test a straddling storage chunk and offset margins.
+8. Confirm cold source generation remains allowed while staged reduction never
+   prunes or rewrites an already materialized initial source chunk.
+9. Build `vc_fiberlets`, `test_fiberlet_storage`, and `test_fiberlet_paths` with
+   32 threads; run focused tests, `git diff --check`, and the hot Paris4
+   512/256/128 staged command.
 
 ## Spec update
 
-Extend the chunk-route diagnostic contract with post-stage-two directed
-reachability pruning, complete unused-anchor removal, boundary portals,
-bidirectionally safe physical macro contraction, deterministic directed
-rollouts, exact cost/length preservation, and the restriction that macros are
-references to original Fiberlets rather than ordinary serialized Fiberlets.
+Replace the fixed two-stage chunk-route experiment with repeatable staged
+analysis boxes, same-layout sparse overlay datasets, explicit empty overrides,
+monotone interior ownership updates, deterministic overlap order, temporary
+layer lifetime, and per-stage plus joint all/interior statistics. State that
+sequential box-local pruning is deterministic but does not prove preservation
+of a globally optimal replay route. Preserve the existing non-persistence rule
+for macro-Fiberlets.
 
-## Docs update
+## Docs updates
 
-Document simplification semantics and the additional post-stage-two tables in
-`volume-cartographer/docs/fiberlets.md`, including why exact same-endpoint
-physical duplicates cannot exist and why macro persistence needs a distinct
-format.
+Update `volume-cartographer/docs/fiberlets.md` with the staged CLI syntax,
+geometry examples, layer fallback semantics, ownership/update rules, cache
+lifetime, and statistics definitions. Remove the fixed two-stage invocation.
 
-## Changelog
+## Changelog update
 
-Record lossless post-stage-two graph simplification and the measured Paris4
-reductions without claiming that macro graphs are yet consumed by replay or
-persisted as ordinary Fiberlet datasets.
+Record arbitrary staged chunk-route reduction with sparse same-layout cache
+overlays and monotone overlapping updates.
