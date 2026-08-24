@@ -129,6 +129,7 @@ class StatusDockPanelHost;
 class ViewerCompositePanel;
 class LineAnnotationDialog;
 class SpiralWorkspace;
+class FiberMapWorkspace;
 
 class CWindow : public QMainWindow
 {
@@ -422,6 +423,7 @@ private:
     QMainWindow* _intersectionsWorkspaceWindow{nullptr};
     QMainWindow* _spiralWorkspaceWindow{nullptr};
     SpiralWorkspace* _spiralWorkspace{nullptr};
+    FiberMapWorkspace* _fiberMapWorkspace{nullptr};
     QDockWidget* _atlasOverviewDock{nullptr};
     QDockWidget* _atlasSearchDock{nullptr};
     QDockWidget* _inkDetectionDock{nullptr};
