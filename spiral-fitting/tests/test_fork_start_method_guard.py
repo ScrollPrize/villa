@@ -69,11 +69,24 @@ def _run_guard(fork_available: bool) -> subprocess.CompletedProcess:
     state, and a test that leaves the start method changed would corrupt every
     later test in the session.
     """
+    # Mutate the existing default context; do not replace it. multiprocessing
+    # binds get_all_start_methods and get_start_method at import time to the
+    # bound methods of the original DefaultContext instance, so rebinding
+    # ctx._default_context leaves those module-level names answering from the
+    # object that was replaced -- the guard is skipped correctly but the readout
+    # still reports the real default. On Windows that is invisible, because
+    # there genuinely is no fork and the emulation is a no-op.
+    #
+    # The get_all_start_methods override is only needed on CPython <= 3.13,
+    # where it does not consult _concrete_contexts. requires-python is >=3.14,
+    # so it is belt and braces for anyone running the suite on an older
+    # interpreter.
     emulate = (
         "import multiprocessing, multiprocessing.context as ctx\n"
         "ctx._concrete_contexts = {'spawn': ctx._concrete_contexts['spawn']}\n"
-        "ctx._default_context = ctx.DefaultContext(ctx._concrete_contexts['spawn'])\n"
-        "multiprocessing.context._default_context = ctx._default_context\n"
+        "ctx._default_context._default_context = ctx._concrete_contexts['spawn']\n"
+        "ctx._default_context._actual_context = None\n"
+        "multiprocessing.get_all_start_methods = lambda: ['spawn']\n"
         if not fork_available
         else ""
     )
