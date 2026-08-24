@@ -27,7 +27,7 @@ function uniqSortedNums(arr) {
   );
 }
 function uniqStrings(arr) {
-  return [...new Set(arr.filter((v) => v !== null && v !== undefined && v !== ""))];
+  return [...new Set(arr.filter((v) => v !== null && v !== undefined && v !== ""))].sort();
 }
 
 // Pull {px, energy, loc, name} out of a single scan record. The public
@@ -50,12 +50,14 @@ function deriveFacts(sample) {
   const volumes = sample.volumes || {};
   const segments = sample.segments || {};
 
-  const scanList = Object.entries(scans).map(([sid, scan]) => {
+  // Sort every metadata-object iteration deterministically so order is stable.
+  const scanList = Object.entries(scans).sort(([a], [b]) => a.localeCompare(b)).map(([sid, scan]) => {
     const f = scanFacts(scan);
     // Link a scan to ALL the volumes reconstructed from it (a scan can have
     // several reconstructions), each with its id and zarr URL (→ Neuroglancer).
     const scanVolumes = Object.entries(volumes)
       .filter(([, v]) => v.scan_id === sid)
+      .sort(([a], [b]) => a.localeCompare(b))
       .map(([vid, v]) => {
         const z = (v.data || []).find((d) => /zarr/i.test(d.type));
         const o = z && (z.origins || [])[0];
@@ -76,7 +78,7 @@ function deriveFacts(sample) {
   const licenses = [];
   const seenLic = new Set();
   const ctVolumes = [];
-  for (const [vid, v] of Object.entries(volumes)) {
+  for (const [vid, v] of Object.entries(volumes).sort(([a], [b]) => a.localeCompare(b))) {
     const lic = v.properties && v.properties.license;
     if (lic && lic.url && !seenLic.has(lic.url)) {
       seenLic.add(lic.url);
@@ -294,7 +296,7 @@ function extractInkSegments(sample, id, s3ToHttp, renderSizes) {
   const segs = (sample && sample.segments) || {};
   const volumes = (sample && sample.volumes) || {};
   const out = [];
-  for (const key of Object.keys(segs)) {
+  for (const key of Object.keys(segs).sort()) {
     const seg = segs[key];
     const data = seg.data || [];
     const sid = seg.suffix || seg.long_id || key;
@@ -395,7 +397,7 @@ function extractPredictions(sample) {
     return o && o.path ? `${((o.access_roots || [])[0] || {}).url || ""}/${o.path}` : null;
   };
   const out = [];
-  for (const [volKey, v] of Object.entries(vols)) {
+  for (const [volKey, v] of Object.entries(vols).sort(([a], [b]) => a.localeCompare(b))) {
     const props = v.properties || {};
     // The raw CT this volume reconstructs (same volume object) — the base layer
     // the prediction is overlaid onto in Neuroglancer.
@@ -430,7 +432,9 @@ function extractPredictions(sample) {
     const pa = a.px ?? 1e9;
     const pb = b.px ?? 1e9;
     if (pa !== pb) return pa - pb;
-    return String(a.model || "").localeCompare(String(b.model || ""));
+    const m = String(a.model || "").localeCompare(String(b.model || ""));
+    if (m !== 0) return m;
+    return String(a.baseVolume || "").localeCompare(String(b.baseVolume || ""));
   });
   // Defensive de-dup on the identifying tuple.
   const seen = new Set();
@@ -642,14 +646,17 @@ function buildIndex(samples, opts) {
     };
   });
 
-  // Sort by furthest pipeline stage (text first), then progress.score desc.
+  // Sort by furthest pipeline stage (text first), then progress.score desc,
+  // then id — the id tiebreak keeps the order (and snapshot diffs) stable
+  // across regenerations regardless of the metadata's object order.
   scrolls.sort((a, b) => {
     const ra = stageRank(a);
     const rb = stageRank(b);
     if (ra !== rb) return rb - ra;
     const sa = (a.progress && typeof a.progress.score === "number" && a.progress.score) || 0;
     const sb = (b.progress && typeof b.progress.score === "number" && b.progress.score) || 0;
-    return sb - sa;
+    if (sa !== sb) return sb - sa;
+    return String(a.id).localeCompare(String(b.id));
   });
 
   return {
