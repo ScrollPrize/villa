@@ -90,7 +90,7 @@ function AtlasBrowserInner() {
     if (feat.pred && !(s.n_predictions > 0)) return false;
     if (feat.ink && !(s.stages && s.stages.ink)) return false; // ink pipeline stage (matches the card badge + dashboard funnel)
     if (feat.ink3d && !s.hasInk3d) return false;
-    if (feat.ct && !(s.mesh || s.volumeZarr)) return false;
+    if (feat.ct && !(s.mesh || (s.ctVolumes && s.ctVolumes.length))) return false;
     if (q) {
       const hay = `${s.id} ${s.label || ""} ${s.display || ""} ${
         (s.content && s.content.work) || ""
