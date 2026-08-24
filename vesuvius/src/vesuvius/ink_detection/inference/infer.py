@@ -1239,14 +1239,7 @@ def infer_folder(
             LOGGER.warning("Skipping %s: %s", segment_dir, exc)
             skipped_count += 1
             continue
-        try:
-            report_input_scale(args, input_zarr)
-        except InputScaleRefused as exc:
-            # Same level and same convention as the missing-input case above: one bad
-            # segment is skipped and recorded, and the rest of the folder still runs.
-            LOGGER.warning("Skipping %s: %s", segment_dir, exc)
-            skipped_count += 1
-            continue
+        scale_reported = False
         for direction in resolve_run_directions(args.direction):
             name_prefix = (
                 f"{prefix}{segment_dir.name}_{checkpoint_stem}_{direction}_"
@@ -1266,6 +1259,19 @@ def infer_folder(
                 )
                 skipped_count += 1
                 continue
+            if not scale_reported:
+                # Once per input rather than once per direction, and only once some
+                # direction is actually going to run: a segment whose predictions all
+                # exist is skipped without opening its store at all. On a refusal the
+                # whole segment is skipped and recorded, which is the level the
+                # missing-input case above uses.
+                try:
+                    report_input_scale(args, input_zarr)
+                except InputScaleRefused as exc:
+                    LOGGER.warning("Skipping %s: %s", segment_dir, exc)
+                    skipped_count += 1
+                    break
+                scale_reported = True
             infer_single_zarr(
                 args=args,
                 input_zarr=input_zarr,
