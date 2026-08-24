@@ -419,10 +419,7 @@ aside {
 .atlas-detail .ppurpose.ink3d { color: #0b0d10; background: var(--accent); }
 .atlas-detail .ppurpose.surface { color: var(--s3); border: 1px solid var(--s3); }
 .atlas-detail .ppurpose.lasagna { color: var(--s2); border: 1px solid var(--s2); }
-.atlas-detail .predtable tr.scanhead td { padding-top: 14px; padding-bottom: 5px; border-top: 0; }
-.atlas-detail .predtable tr.scanhead:first-child td { padding-top: 2px; }
-.atlas-detail .predtable tr.scanvol td { border-top: 1px solid var(--line); }
-.atlas-detail .predtable tr.scanvol td:first-child { padding-left: 18px; }
+.atlas-detail .predtable tr.scancont td { border-top: 0; padding-top: 0; }
 .atlas-detail .predtable .predlinks { display: flex; gap: 13px; white-space: nowrap; }
 .atlas-detail .predtable .predlinks a { color: var(--accent); text-decoration: none; }
 .atlas-detail .predtable .predlinks a:hover { text-decoration: underline; }

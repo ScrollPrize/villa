@@ -52,15 +52,19 @@ function deriveFacts(sample) {
 
   const scanList = Object.entries(scans).map(([sid, scan]) => {
     const f = scanFacts(scan);
-    // Link a scan to the OME-Zarr volume reconstructed from it (→ Neuroglancer).
-    const vol = Object.values(volumes).find((v) => v.scan_id === sid);
-    let volume = null;
-    if (vol) {
-      const z = (vol.data || []).find((d) => /zarr/i.test(d.type));
-      const o = z && (z.origins || [])[0];
-      if (o && o.path) volume = `${((o.access_roots || [])[0] || {}).url || ""}/${o.path}`;
-    }
-    return { ...f, volume };
+    // Link a scan to ALL the volumes reconstructed from it (a scan can have
+    // several reconstructions), each with its id and zarr URL (→ Neuroglancer).
+    const scanVolumes = Object.entries(volumes)
+      .filter(([, v]) => v.scan_id === sid)
+      .map(([vid, v]) => {
+        const z = (v.data || []).find((d) => /zarr/i.test(d.type));
+        const o = z && (z.origins || [])[0];
+        const zarr =
+          o && o.path ? `${((o.access_roots || [])[0] || {}).url || ""}/${o.path}` : null;
+        return { id: vid, zarr };
+      });
+    // `volume` kept for backward compat (first reconstruction's zarr).
+    return { ...f, id: sid, volumes: scanVolumes, volume: (scanVolumes[0] || {}).zarr || null };
   });
   const pxVals = scanList.map((s) => s.px).filter((v) => v !== null && v !== undefined);
 
