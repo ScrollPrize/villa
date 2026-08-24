@@ -131,6 +131,7 @@ BACKFILLABLE_CONFIG_DEFAULTS = {
 BACKFILLABLE_CONFIG_DEFAULTS.update({
     "optimizer_reset_interval": 0,
     "optimizer_reset_probe_warn_voxels": 1.0,
+    "optimizer_reset_lr_warmup_steps": 250,
 })
 
 # Configuration keys that shape the model's parameter tensors. A checkpoint
@@ -291,6 +292,11 @@ class Config:
         # inconsistency, in scroll voxels) exceeds this; the error is
         # committed permanently into the constraints once per bake.
         self.optimizer_reset_probe_warn_voxels = 1.0
+        # Linear LR warm-up applied for this many steps after each reset,
+        # so the freshly zeroed parameters re-estimate their Adam moments
+        # under small steps instead of jumping at full late-schedule LR.
+        # 0 disables the ramp.
+        self.optimizer_reset_lr_warmup_steps = 250
         self.model_num_flow_integration_steps = 3
         self.model_flow_integration_solver = "rk4"
         self.model_num_flow_timesteps = 1

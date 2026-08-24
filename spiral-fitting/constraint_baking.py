@@ -147,15 +147,10 @@ def forward_transform(model):
     return model.get_slice_to_spiral_transform().inv
 
 
-def probe_round_trip_error(model, *, num_z=6, num_theta=8, num_radii=5):
-    """Round-trip error ``|S.inv(S(p)) - p|`` on a fixed, RNG-free probe set.
-
-    The probe points are umbilicus-centred rings spanning the fit's z window
-    and the first tens of windings — plausible constraint locations. The
-    error measures the RK4 forward/inverse inconsistency this epoch would
-    commit permanently into the constraints; callers log it per bake and
-    watch its accumulation across resets.
-    """
+def _probe_points(model, num_z=6, num_theta=8, num_radii=5):
+    """Fixed, RNG-free scroll-space probe set: umbilicus-centred rings
+    spanning the fit's z window and the first tens of windings — plausible
+    constraint locations."""
     device = model.device
     z_lo = float(model.flow_min_corner_zyx[0])
     z_hi = float(model.flow_max_corner_zyx[0])
@@ -174,7 +169,18 @@ def probe_round_trip_error(model, *, num_z=6, num_theta=8, num_radii=5):
         [z, r * torch.sin(t), r * torch.cos(t)], dim=-1).reshape(-1, 3)
     with torch.no_grad():
         # Shift the rings onto the umbilicus so they sit where constraints do.
-        scroll = model.umbilicus_transform._call(rings)
+        return model.umbilicus_transform._call(rings)
+
+
+def probe_round_trip_error(model, *, num_z=6, num_theta=8, num_radii=5):
+    """Round-trip error ``|S.inv(S(p)) - p|`` on the fixed probe set.
+
+    Measures the RK4 forward/inverse inconsistency this epoch would commit
+    permanently into the constraints; callers log it per bake and watch its
+    accumulation across resets.
+    """
+    scroll = _probe_points(model, num_z, num_theta, num_radii)
+    with torch.no_grad():
         slice_to_spiral = model.get_slice_to_spiral_transform()
         spiral = slice_to_spiral(scroll)
         back = slice_to_spiral.inv(spiral)
@@ -184,6 +190,32 @@ def probe_round_trip_error(model, *, num_z=6, num_theta=8, num_radii=5):
         'mean': float(error.mean()),
         'num_points': int(error.numel()),
     }
+
+
+def probe_stretch_factor(model, *, epsilon=2.0,
+                         num_z=6, num_theta=8, num_radii=5):
+    """Median local stretch of this epoch's scroll->spiral map.
+
+    Finite differences along the three axes at every probe point:
+    ``||S(p + eps*e) - S(p)|| / eps``, reduced by the median over all points
+    and directions. Baked residuals are re-expressed in units shrunk (or
+    grown) by exactly this local stretch, so the accumulated product across
+    epochs is the blunt global correction for thresholds that were tuned in
+    pre-bake units. It deliberately ignores anisotropy and spatial variation
+    — that is what makes it blunt.
+    """
+    scroll = _probe_points(model, num_z, num_theta, num_radii)
+    with torch.no_grad():
+        slice_to_spiral = model.get_slice_to_spiral_transform()
+        base = slice_to_spiral(scroll)
+        ratios = []
+        for axis in range(3):
+            offset = torch.zeros(3, device=scroll.device)
+            offset[axis] = float(epsilon)
+            moved = slice_to_spiral(scroll + offset)
+            ratios.append(
+                torch.linalg.norm(moved - base, dim=-1) / float(epsilon))
+        return float(torch.cat(ratios).median())
 
 
 def reset_parameters(model):
@@ -237,6 +269,39 @@ def clear_optimizer_state_(optimiser, parameters):
     """
     for parameter in parameters:
         optimiser.state.pop(parameter, None)
+
+
+def freeze_dr_(model, optimiser=None):
+    """Pin dr_per_winding once constraints have been baked.
+
+    Baked radii encode windings at bake-time dr, so any later dr change
+    moves the canonical target under every baked constraint at once and the
+    gap logits must chase it globally (observed as a monotonic dr drift
+    across epochs). dr's job — setting the global winding scale — is done by
+    the first bake; from then on it is a constant of the canonical frame.
+    Idempotent; also drops its now-useless optimiser moments.
+    """
+    model.dr_per_winding_logit.requires_grad_(False)
+    if optimiser is not None:
+        optimiser.state.pop(model.dr_per_winding_logit, None)
+
+
+def lr_warmup_factor(iteration, warmup_start, warmup_steps):
+    """Post-reset learning-rate warm-up multiplier for ``iteration``.
+
+    Each reset zeroes the live parameters but inherits the tail of the
+    global decay schedule; a short linear ramp (from 1/warmup_steps up to 1
+    over warmup_steps optimisation steps after ``warmup_start``) lets the
+    fresh epoch take small steps while its Adam moments re-estimate, instead
+    of jumping at full late-schedule LR from a cold start. Returns 1.0
+    whenever no warm-up is active.
+    """
+    if warmup_start is None or warmup_steps <= 0:
+        return 1.0
+    steps_since = int(iteration) - int(warmup_start)
+    if steps_since < 0 or steps_since >= int(warmup_steps):
+        return 1.0
+    return (steps_since + 1) / int(warmup_steps)
 
 
 def composed_slice_to_spiral_transform(frozen_models, live_slice_to_spiral):

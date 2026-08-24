@@ -1222,6 +1222,13 @@ class FitContext:
         self._baked_epoch_count = 0
         self._baked_shell_valid_zyxs = None
         self._pristine_inputs_stashed = False
+        # Accumulated median stretch of the frozen stack (product of each
+        # epoch's probe_stretch_factor): the blunt global re-expression of
+        # thresholds tuned in pre-bake units into current baked units.
+        self._baked_unit_scale = 1.0
+        # Completed-iteration count of the most recent reset, driving the
+        # post-reset LR warm-up (None until the first bake).
+        self._bake_lr_warmup_start = None
     # The optimisation z window lives in the fit configuration (its catalog
     # metadata records the full effect list); these properties are the one
     # reading point for the many z-window consumers below.
@@ -3274,20 +3281,29 @@ class FitContext:
         snapshot = constraint_baking.snapshot_frozen_epoch(
             self.spiral_and_transform, self.umbilicus_zyx, self.config,
             probe_error=probe)
+        epoch_stretch = constraint_baking.probe_stretch_factor(
+            self.spiral_and_transform)
         self._bake_all_inputs(
             self.spiral_and_transform.get_slice_to_spiral_transform())
         self.frozen_epochs.append(snapshot)
         self._baked_epoch_count = len(self.frozen_epochs)
+        self._baked_unit_scale *= epoch_stretch
         self._disable_lasagna_losses_for_baked_inputs()
         self._apply_canonical_space_state()
 
         constraint_baking.reset_live_transform_(self.spiral_and_transform)
         # Stale Adam moments on the zeroed parameters would break the exact
         # pre/post-bake residual match one step after the reset. dr keeps its
-        # moments along with its value.
+        # value but is frozen: baked radii encode windings at bake-time dr,
+        # and letting it keep training moves the canonical target under
+        # every baked constraint at once.
         constraint_baking.clear_optimizer_state_(
             self.optimiser,
             constraint_baking.reset_parameters(self.spiral_and_transform))
+        constraint_baking.freeze_dr_(self.spiral_and_transform, self.optimiser)
+        # The fresh epoch re-estimates its Adam moments under a short LR
+        # ramp instead of jumping at full late-schedule LR from a cold start.
+        self._bake_lr_warmup_start = int(completed_iterations)
 
         # Derived caches that captured pre-bake coordinates or the pre-reset
         # transform.
@@ -3300,7 +3316,9 @@ class FitContext:
             print(
                 f'bake {len(self.frozen_epochs)} complete: inputs are in '
                 'canonical space, live transform reset (dr = '
-                f'{float(self.dr_per_winding.detach()):.3f} preserved)')
+                f'{float(self.dr_per_winding.detach()):.3f} frozen); epoch '
+                f'stretch {epoch_stretch:.4f}, accumulated baked-unit scale '
+                f'{self._baked_unit_scale:.4f}')
 
     def _replay_frozen_epochs(self):
         """Deterministically re-bake freshly loaded host inputs on resume.
@@ -3334,12 +3352,18 @@ class FitContext:
             frozen = constraint_baking.materialize_frozen_model(
                 snapshot, self.config, self.device)
             self._bake_all_inputs(frozen.get_slice_to_spiral_transform())
+            # Recomputed rather than persisted: the stretch is a pure
+            # function of the frozen transform being replayed.
+            self._baked_unit_scale *= constraint_baking.probe_stretch_factor(
+                frozen)
             del frozen
             self._baked_epoch_count = epoch_index
         if self.frozen_epochs:
             # The restored live parameters are post-reset values; the frame
-            # they were trained in is the canonical one, and dense lasagna
-            # supervision ended at that fit's first bake.
+            # they were trained in is the canonical one (dr frozen), and
+            # dense lasagna supervision ended at that fit's first bake.
+            constraint_baking.freeze_dr_(
+                self.spiral_and_transform, self.optimiser)
             self._disable_lasagna_losses_for_baked_inputs()
             self._apply_canonical_space_state()
 
@@ -3433,6 +3457,10 @@ class FitContext:
             # persisting the snapshots (rather than baked tensors) keeps the
             # replay exact and the host inputs on their normal load path.
             'frozen_epochs': list(self.frozen_epochs),
+            # The post-reset LR warm-up window survives a resume: an autosave
+            # lands at the bake boundary itself, so without this the resumed
+            # run would skip the whole ramp the continuous run applied.
+            'bake_lr_warmup_start_iteration': self._bake_lr_warmup_start,
         }
 
     def save_checkpoint(self, path, completed_iterations):
@@ -3733,6 +3761,9 @@ class FitContext:
         # exactly this stack (inspect_checkpoint enforces count parity for
         # in-session loads; the startup path replays it over fresh inputs).
         self.frozen_epochs = list(checkpoint.get('frozen_epochs') or ())
+        warmup_start = checkpoint.get('bake_lr_warmup_start_iteration')
+        self._bake_lr_warmup_start = (
+            None if warmup_start is None else int(warmup_start))
         self.load_checkpoint(checkpoint)
         if checkpoint.get('scheduler') is None:
             for _ in range(completed):
@@ -4538,6 +4569,8 @@ class FitContext:
         log_metrics = {
             'flow_field_high_res_lr_scale': flow_field_high_res_lr_scale,
         }
+        if self.frozen_epochs:
+            log_metrics['baked_unit_scale'] = self._baked_unit_scale
 
         def backward_family(weighted_losses):
             """Accumulate one loss family's gradients, then release its graph."""
@@ -4586,12 +4619,12 @@ class FitContext:
             if compute_patch_dt and self.config['loss_weight_patch_dt'] > 0 and self.verified_patches_list:
                 patch_dt_target_cache = self.dt_target_cache_manager.get('patch', iteration, lambda: compute_patch_dt_target_cache(
                     self.slice_to_spiral_transform, self.dr_per_winding,
-                    self.verified_patches_list, self.patch_atlas, self.config['dt_target_floating_threshold'],
+                    self.verified_patches_list, self.patch_atlas, self.config['dt_target_floating_threshold'] * self._baked_unit_scale,
                 ))
             if compute_unverified_patch_dt and self.config['loss_weight_unverified_patch_dt'] > 0 and self.unverified_patch_atlas is not None:
                 unverified_patch_dt_target_cache = self.dt_target_cache_manager.get('unverified_patch', iteration, lambda: compute_patch_dt_target_cache(
                     self.slice_to_spiral_transform, self.dr_per_winding,
-                    self.unverified_patches_list, self.unverified_patch_atlas, self.config['dt_target_floating_threshold'],
+                    self.unverified_patches_list, self.unverified_patch_atlas, self.config['dt_target_floating_threshold'] * self._baked_unit_scale,
                 ))
             if compute_patch_dt and self.config['loss_weight_unattached_pcl_dt'] > 0 and self.unattached_pcl_strips:
                 pcl_flat = get_or_build_unattached_pcl_flat(self.unattached_pcl_strips, torch.device('cuda'))
@@ -4600,7 +4633,7 @@ class FitContext:
                         self.slice_to_spiral_transform, self.dr_per_winding,
                         pcl_flat['zyxs'], pcl_flat['starts'],
                         windings=pcl_flat['windings'],
-                        floating_threshold=self.config['dt_target_floating_threshold'],
+                        floating_threshold=self.config['dt_target_floating_threshold'] * self._baked_unit_scale,
                         num_points_per_strip=self.config['sample_count_dt_target_points_per_strip'],
                         max_stride=self.config['dt_target_max_stride'],
                         max_total_points=20_000_000,
@@ -4610,7 +4643,7 @@ class FitContext:
                     self.slice_to_spiral_transform, self.dr_per_winding,
                     self.prepared_main_tracks['flat_zyx_cpu'], self.prepared_main_tracks['offsets'],
                     windings=None,
-                    floating_threshold=self.config['dt_target_floating_threshold'],
+                    floating_threshold=self.config['dt_target_floating_threshold'] * self._baked_unit_scale,
                     num_points_per_strip=self.config['sample_count_dt_target_points_per_strip'],
                     max_stride=self.config['dt_target_max_stride'],
                     max_total_points=20_000_000,
@@ -4943,7 +4976,22 @@ class FitContext:
             self.influence_state.apply_grad_masks_(self.spiral_and_transform)
 
         self.step_timer.start('opt')
+        # Post-reset LR warm-up: scale the effective LR for this step only,
+        # then restore, so the scheduler's own trajectory is untouched.
+        bake_warmup_factor = constraint_baking.lr_warmup_factor(
+            iteration, self._bake_lr_warmup_start,
+            int(self.config.get('optimizer_reset_lr_warmup_steps', 0) or 0))
+        if bake_warmup_factor < 1.0:
+            log_metrics['bake_lr_warmup_factor'] = bake_warmup_factor
+            saved_group_lrs = [
+                group['lr'] for group in self.optimiser.param_groups]
+            for group in self.optimiser.param_groups:
+                group['lr'] = group['lr'] * bake_warmup_factor
         self.optimiser.step()
+        if bake_warmup_factor < 1.0:
+            for group, saved_lr in zip(
+                    self.optimiser.param_groups, saved_group_lrs):
+                group['lr'] = saved_lr
         self.step_timer.stop('opt')
         if self.influence_state is not None and self.influence_state.active:
             self.influence_state.apply_masked_gap_decay_(self.spiral_and_transform, self.optimiser)
@@ -5062,9 +5110,14 @@ class FitContext:
             # Bake before the autosave so any checkpoint at this boundary
             # already carries the reset it belongs with; a resume then never
             # re-runs (or misses) the bake for its completed-step count.
+            # The final scheduled reset is skipped (a bake fires only when a
+            # full further interval fits before the horizon): each reset
+            # restarts the live parameters into the decaying tail of the LR
+            # schedule, so the last epoch gets at least two intervals to
+            # converge instead of ending on a barely-trained restart.
             if (reset_interval > 0
                     and (iteration + 1) % reset_interval == 0
-                    and iteration + 1 < self.num_training_steps):
+                    and iteration + 1 + reset_interval < self.num_training_steps):
                 self.bake_and_reset(iteration + 1)
             self._maybe_save_headless_checkpoint(iteration + 1)
 

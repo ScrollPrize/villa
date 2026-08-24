@@ -52,6 +52,8 @@ def make_small_spiral_model(seed, *, sense='CW', param_std=0.01):
 
 
 def perturb_parameters(model, std, seed=None):
+    if not std:
+        return
     if seed is not None:
         torch.manual_seed(seed)
     with torch.no_grad():
@@ -256,6 +258,55 @@ class OptimizerResetTests(unittest.TestCase):
             self.assertNotIn(parameter, optimiser.state)
         # dr keeps both its value and its moments across a reset.
         self.assertIn(model.dr_per_winding_logit, optimiser.state)
+
+
+class PostBakePolicyTests(unittest.TestCase):
+
+    def test_freeze_dr_stops_gradients_and_drops_moments(self):
+        model, _, _ = make_small_spiral_model(43)
+        optimiser = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        loss = model.get_dr_per_winding().square()
+        loss.backward()
+        optimiser.step()
+        self.assertIn(model.dr_per_winding_logit, optimiser.state)
+        optimiser.zero_grad(set_to_none=True)
+        constraint_baking.freeze_dr_(model, optimiser)
+        self.assertFalse(model.dr_per_winding_logit.requires_grad)
+        self.assertNotIn(model.dr_per_winding_logit, optimiser.state)
+        # Idempotent, and the frozen value still feeds the transform.
+        constraint_baking.freeze_dr_(model, optimiser)
+        self.assertGreater(float(model.get_dr_per_winding()), 0.0)
+
+    def test_lr_warmup_factor_ramps_linearly_then_ends(self):
+        self.assertEqual(constraint_baking.lr_warmup_factor(10, None, 250), 1.0)
+        self.assertEqual(constraint_baking.lr_warmup_factor(10, 40, 0), 1.0)
+        self.assertEqual(constraint_baking.lr_warmup_factor(39, 40, 4), 1.0)
+        self.assertAlmostEqual(
+            constraint_baking.lr_warmup_factor(40, 40, 4), 0.25)
+        self.assertAlmostEqual(
+            constraint_baking.lr_warmup_factor(42, 40, 4), 0.75)
+        self.assertEqual(constraint_baking.lr_warmup_factor(44, 40, 4), 1.0)
+
+    def test_probe_stretch_factor_is_unity_for_identity_transform(self):
+        model, _, _ = make_small_spiral_model(47, param_std=0.0)
+        constraint_baking.reset_live_transform_(model)
+        stretch = constraint_baking.probe_stretch_factor(model)
+        self.assertAlmostEqual(stretch, 1.0, places=3)
+
+    def test_probe_stretch_factor_tracks_a_uniform_linear_scale(self):
+        model, _, _ = make_small_spiral_model(53, param_std=0.0)
+        constraint_baking.reset_live_transform_(model)
+        # A constant diagonal linear stage scales yx by exp(a * lr_scale) in
+        # the forward direction, so the scroll->spiral map scales by its
+        # inverse; two of three probe directions see it, so the median does.
+        a = 0.005
+        with torch.no_grad():
+            model.linear_logits[:, 0, 0] = a
+            model.linear_logits[:, 1, 1] = a
+        expected = float(torch.exp(torch.tensor(
+            -a * model.linear_logits_scale)))
+        stretch = constraint_baking.probe_stretch_factor(model)
+        self.assertAlmostEqual(stretch, expected, places=3)
 
 
 class RefusalGateTests(unittest.TestCase):
