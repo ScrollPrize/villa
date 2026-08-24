@@ -5,6 +5,7 @@
 #include "vc/fiber_tracer/FiberletOnDemand.hpp"
 #include "vc/fiber_tracer/FiberPaths.hpp"
 
+#include <array>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -69,6 +70,13 @@ struct FiberletRouteLease {
     std::vector<cv::Vec3f> pointsPredictionXYZ;
 };
 
+struct FiberletStoredRouteLease {
+    std::shared_ptr<const FiberletPrefixChunkPayload> prefixPayloadLease;
+    std::shared_ptr<const FiberletRouteChunkPayload> routePayloadLease;
+    FiberletStoredPrefix prefix;
+    FiberletStoredRoute route;
+};
+
 struct FiberletLogicalProjectionStats {
     std::size_t projectedAnchors = 0;
     std::size_t coincidentPositionGroups = 0;
@@ -95,7 +103,17 @@ public:
     [[nodiscard]] FiberletGraphQuery<FiberletAnchorChunkLease> anchorsInChunk(const vc::render::ChunkKey& chunk, bool blocking = false) const;
     [[nodiscard]] FiberletGraphQuery<FiberletPrefixChunkLease> prefixesInChunk(const vc::render::ChunkKey& chunk, bool blocking = false) const;
     [[nodiscard]] FiberletGraphQuery<FiberletEdgeLease> edge(const FiberletStorageId& fiberlet, bool blocking = false) const;
+    [[nodiscard]] FiberletGraphQuery<FiberletStoredRouteLease> storedRoute(
+        const FiberletStorageId& fiberlet, bool blocking = false) const;
     [[nodiscard]] FiberletGraphQuery<FiberletRouteLease> route(const FiberletStorageId& fiberlet, bool blocking = false) const;
+    [[nodiscard]] FiberletGraphQuery<FiberletReplaySourceArc> directedEdge(
+        const DirectedFiberletStorageId& fiberlet, bool blocking = false) const;
+    [[nodiscard]] FiberletGraphQuery<std::optional<FiberletReplaySourceTransition>> transition(
+        const FiberletReplaySourceArc& incoming,
+        const FiberletReplaySourceArc& outgoing,
+        float maximumJoinAngleDegrees,
+        bool blocking = false) const;
+    [[nodiscard]] const FiberletDatasetMetadata& metadata() const noexcept;
 
 private:
     [[nodiscard]] vc::render::ChunkKey ownerChunk(const FiberletStorageKey& anchor, int level) const;
@@ -108,6 +126,106 @@ private:
     FiberletPathConfig pathConfig_;
     FiberletAnchorView anchorView_;
 };
+
+enum class FiberletChunkRouteEdgeCostView {
+    Stored,
+    SqrtUint16Max256,
+};
+
+struct FiberletChunkRouteDistribution {
+    std::size_t count = 0;
+    std::optional<double> minimum;
+    std::optional<double> mean;
+    std::optional<double> median;
+    std::optional<double> maximum;
+};
+
+struct FiberletChunkRouteAnalysisConfig {
+    cv::Vec3d minimumBaseXYZ{0.0, 0.0, 0.0};
+    cv::Vec3d maximumBaseXYZ{0.0, 0.0, 0.0};
+    float maximumJoinAngleDegrees = 45.0F;
+    FiberletChunkRouteEdgeCostView edgeCostView =
+        FiberletChunkRouteEdgeCostView::Stored;
+    std::size_t parallelThreads = 1;
+    std::size_t maximumGeneratedStatesPerEntry = 1'000'000;
+};
+
+struct FiberletChunkRouteAnalysisReport {
+    cv::Vec3d minimumBaseXYZ{0.0, 0.0, 0.0};
+    cv::Vec3d maximumBaseXYZ{0.0, 0.0, 0.0};
+    std::vector<vc::render::ChunkKey> seedAnchorStorageChunks;
+    std::size_t insideAnchors = 0;
+    std::size_t physicalFiberlets = 0;
+    std::size_t internalFiberlets = 0;
+    std::size_t crossingFiberlets = 0;
+    std::vector<FiberletStorageId> physicalFiberletIds;
+    std::vector<FiberletStorageId> internalFiberletIds;
+    std::size_t directedEntries = 0;
+    std::size_t directedExits = 0;
+    std::size_t reachableEntries = 0;
+    std::size_t unreachableEntries = 0;
+    std::size_t tiedOptimalEntries = 0;
+    std::size_t optimalRoutes = 0;
+    std::size_t usedInsideAnchors = 0;
+    std::size_t unusedInsideAnchors = 0;
+    std::size_t usedPhysicalFiberlets = 0;
+    std::size_t unusedPhysicalFiberlets = 0;
+    std::size_t usedInternalFiberlets = 0;
+    std::size_t unusedInternalFiberlets = 0;
+    std::vector<FiberletStorageId> retainedPhysicalFiberlets;
+    std::size_t directedStates = 0;
+    std::size_t admissibleTransitions = 0;
+    std::size_t generatedSearchStates = 0;
+    std::size_t expandedSearchStates = 0;
+    std::size_t rejectedVisitedTargets = 0;
+    FiberletChunkRouteDistribution routeFiberletCounts;
+    FiberletChunkRouteDistribution routeLengthsPredictionVoxels;
+    FiberletChunkRouteDistribution routeLosses;
+    FiberletChunkRouteDistribution routeLossesPerPredictionVoxel;
+    double elapsedSeconds = 0.0;
+    double cpuSeconds = 0.0;
+};
+
+// Conservative prefix-owner set needed by any anchor in the analysis box.
+// Callers may feed these keys to the ordinary on-demand prefetch scheduler;
+// analysis remains correct without prefetching.
+[[nodiscard]] std::vector<vc::render::ChunkKey>
+fiberletChunkRoutePrefetchChunks(
+    const FiberletDatasetMetadata& metadata,
+    const FiberletChunkRouteAnalysisConfig& config);
+
+struct FiberletChunkRoutePopulation {
+    std::size_t insideAnchors = 0;
+    std::vector<FiberletStorageId> physicalFiberletIds;
+    std::vector<FiberletStorageId> internalFiberletIds;
+};
+
+[[nodiscard]] FiberletChunkRoutePopulation collectFiberletChunkRoutePopulation(
+    const FiberletChunkGraphSource& graph,
+    const FiberletChunkRouteAnalysisConfig& config);
+
+[[nodiscard]] FiberletChunkRouteAnalysisReport analyzeFiberletChunkRoutes(
+    const FiberletChunkGraphSource& graph,
+    const FiberletChunkRouteAnalysisConfig& config);
+
+[[nodiscard]] vc::render::ChunkKey fiberletStorageOwnerChunk(
+    const FiberletDatasetMetadata& metadata,
+    const FiberletStorageKey& anchor,
+    int level = 0);
+
+struct FiberletReductionWriteReport {
+    vc::render::ChunkKey owner;
+    std::size_t inputFiberlets = 0;
+    std::size_t retainedFiberlets = 0;
+    bool reused = false;
+};
+
+[[nodiscard]] FiberletReductionWriteReport writeReducedFiberletChunk(
+    const FiberletChunkGraphSource& source,
+    const std::shared_ptr<FiberletChunkDataset>& outputDataset,
+    const vc::render::ChunkKey& owner,
+    std::span<const FiberletStorageId> inputFiberlets,
+    std::span<const FiberletStorageId> retainedFiberlets);
 
 class FiberletCachedReplayGraphSource final : public FiberletReplayGraphSource
 {

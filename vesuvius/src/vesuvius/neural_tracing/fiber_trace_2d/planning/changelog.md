@@ -1,3 +1,29 @@
+# 2026-08-24: two-stage regional Fiberlet reduction diagnostic
+
+- Added globally reusable aligned stage-one reduction chunks and centered
+  half-offset stage-two analysis without changing the authoritative anchor or
+  Fiberlet caches.
+- Bounded stage two to exactly the selected stage-one owners; incident-halo
+  requests outside that set are in-memory empty views and cannot start or
+  publish extra preprocessing.
+- A hot Paris4 512/256 run reused all eight stage-one chunks, completed stage
+  two in 1.4 s, and reduced 13,750 incident Fiberlets to 4,168 (69.69%) and
+  5,730 internal Fiberlets to 618 (89.21%).
+
+# 2026-08-24: chunk-local optimal Fiberlet-route statistics
+
+- Added a shared on-demand cached-graph diagnostic that finds every exact cheapest
+  directed entry-to-first-exit route through a half-open base-coordinate box.
+  It shares regular replay's strict join-angle and normal/tangent-aware join
+  scoring, rejects all revisited anchors, generates missing canonical chunks
+  through the existing preprocessor/cache/LRU path, and reports the retained
+  union and route distributions without pruning graph payloads.
+- In a populated 128-base Paris4 box, exact optima used 55/62 anchors and
+  1,135/1,369 incident fiberlets. Only 45/252 internal Fiberlets survived,
+  giving an 82.14% internal reduction after boundary-crossing edges are
+  excluded. The bounded cold shared-cache fill took 183.71 s and the hot
+  analysis took 0.29 s.
+
 # 2026-08-22: geometrically weighted fiberlet substep costs
 
 - Restored stored whole-fiberlet and join scoring as the default replay cost

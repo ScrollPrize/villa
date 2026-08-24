@@ -1,161 +1,129 @@
-# Plan: explicit Z-band shared inference pipeline
+# Plan: two-stage regional Fiberlet graph reduction
 
-## Invariants and band model
+## Semantics
 
-1. Introduce a coordinator-owned Z-band record covering exactly one canonical
-   model-tile Z position. It records the lazy sequence interval, expected and
-   completed tile events, outstanding reads, assigned GPU work, outstanding
-   accumulator tasks, and owned shared result slots.
-2. Keep the band's Y/X lattice lazy. Materialize and read only the existing
-   bounded windows within the active band; never retain the whole plane or the
-   volume-wide Cartesian tile list. Do not read, assign GPU work, or accumulate
-   a later band until the active band completes.
-3. Complete a band only after every event is skipped or accumulated, every
-   accumulator acknowledgement is received, and every input/result slot owned
-   by the band is returned. Assert these invariants at the transition.
-4. Advance progress and live-cache safe Z only from the completed band
-   transition. Preserve canonical tile order and current numerical accumulation
-   order.
-5. Track input/result slots in an explicit ledger mapping each owned slot to
-   `(band, sequence, stage)`. Reject duplicate or foreign releases, and require
-   every slot to be free at a band transition.
+1. Keep `--chunk X,Y,Z` as the cubic target-region minimum in base XYZ. Add
+   `--region-size N`, defaulting to `--chunk-size`. Derive the globally aligned
+   reduction chunks intersecting that target region; the region does not define
+   a cache namespace or private coverage domain.
+2. Add `--mode stats|two-stage`. `stats` preserves one-pass analysis but runs
+   every aligned chunk contained in the selected region. `two-stage` first
+   runs that aligned grid, persists the union of retained physical Fiberlets,
+   then analyzes the half-chunk-offset grid fully contained in the region.
+3. Each stage-one reduction chunk is independently reusable. It stores only
+   Fiberlets canonically owned by that chunk. Exact analysis of the same box
+   retains every boundary-crossing Fiberlet, while an internal Fiberlet belongs
+   to only one non-overlapping box, so no region-specific retained-ID union is
+   needed to define chunk contents.
+4. A 512/256 region produces eight stage-one boxes and one stage-two box at
+   `minimum + 128` on each axis. Larger regions produce all fully contained
+   half-offset boxes, in canonical XYZ order.
+5. Regional counts are canonical unique physical-ID sets, never sums of
+   per-box counts. For the offset grid, `original_before` is the unique source
+   population, `stage1_after` is its intersection with the reduced dataset,
+   and `stage2_after` is the union of retained IDs from the offset analyses.
+   Internal classification uses the original endpoint geometry. Total and
+   incremental percentages use `original_before` and `stage1_after`
+   respectively.
 
-## Flush lifecycle
+## Core and storage
 
-1. Keep at most one previous frozen flush batch while the current Z band is
-   computed, using the existing single enlarged circular mmap and no band copy.
-2. Represent each chunk-aligned, possibly empty, multi-scale flush interval as
-   an explicit immutable-plan batch with expected task count and disjoint
-   queued, inflight, and completed task IDs.
-   Drain chunk acknowledgements continuously. As soon as the entire batch is
-   complete, normalize its accounting, clear only its dirty rectangles, release
-   the exact circular generations, and advance durable `final_z`.
-3. Before submitting the current band's newly flushable interval, join/finalize
-   the preceding batch if it has not completed. This is the only intended flush
-   backpressure point.
-4. Preserve descriptor-only spawn-process tasks, stable chunk ownership,
-   chunk-sized float32 temporaries, atomic OME-Zarr writes, multi-scale combined
-   batches, resume behavior, and `flush_workers=0` synchronous semantics.
-5. Use one finalize/release/accounting routine for synchronous and process
-   flushes. A failed batch never clears or releases frozen generations, and a
-   zero-task batch finalizes immediately.
+1. Extend the exact route report with canonically ordered retained physical
+   Fiberlet IDs and exact retained internal counts. Preserve current search,
+   tie, cycle, first-exit, and cost semantics.
+2. Add a reusable per-chunk reduction writer beside `FiberletChunkDataset`.
+   Given one globally aligned analysis box, it writes only prefix/route records
+   whose canonical first anchor is owned by the matching reduced-cache chunk.
+   It loads authoritative records through ordinary graph/cache APIs and uses
+   the existing serializers and pair publication.
+3. Give the global reduced dataset strict metadata derived from the source
+   dataset plus a reduction descriptor containing reduction chunk size, pass,
+   source dataset identity, coordinate/grid contract, edge-cost view, maximum
+   join angle, effective local/path scoring configuration, and a canonical
+   algorithm contract. Write it below the command output root in a deterministic
+   fingerprinted namespace independent of the requested target region. Never
+   rewrite the source cache.
+4. Keep reduced storage chunks aligned to the analysis grid. Present the
+   original anchor cache through a cache-backed rechunked view with the same
+   ownership grid; the view aggregates already evaluated source-anchor chunks
+   and never regenerates or publishes duplicate anchors. Stage two therefore
+   changes only the available Fiberlet graph, not anchor geometry or scoring.
+5. Generate only missing reduced chunks selected by the target region and
+   reuse already valid chunks byte-for-byte. Stage two reads a bounded view of
+   exactly those stage-one owners. Conservative graph requests outside that
+   set resolve to ephemeral empty chunks which are never published; they must
+   not trigger additional reduction work. A selected generated chunk with no
+   retained records is stored as an explicit empty prefix/route pair.
+6. Keep decoded data cache-bound. Do not materialize the entire regional graph
+   at once beyond the retained-ID set and per-output-chunk records.
+7. Reserialize authoritative stored prefix costs and routes with the derived
+   dataset codec/fingerprint while preserving pair index alignment. The
+   selected sqrt-u16 analysis view is applied only during route analysis and
+   never mutates stored records.
+8. Validate both members of every requested pair. A hot complete chunk is
+   immutable; an incomplete pair is safely regenerated before that chunk can
+   be read by stage two.
+9. Collect the original offset-grid population IDs independently from the
+   immutable source graph. Do not infer the original denominator from the
+   already reduced graph or rerun an exact search merely to obtain population
+   membership when shared population materialization can expose it.
 
-## Pipeline failure and diagnostics
+## CLI and progress
 
-1. Replace the generic no-progress wait on the GPU result queue with
-   stage-aware pumping of GPU, accumulator, reader, and flush completions.
-   Submit accumulator tasks incrementally and nonblocking: preserve stable-owner
-   FIFO while a full owner queue yields to the other stages.
-2. Treat a quiescent coordinator as an invariant failure when unresolved work
-   exists but no read, worker task, accumulator task, or flush task can produce
-   progress. Report the band bounds, event-status histogram, sequence
-   frontiers, free/owned slots, outstanding reads, accumulator tasks, flush
-   batch counts, queue depths where supported, and worker liveness.
-3. Worker exceptions and hard exits remain immediate failures. Diagnostics must
-   identify the actual stalled stage and must not claim process-limit exhaustion
-   without a caught process/thread creation error.
-4. Remove the workaround flush timer and its unsupported process-limit claim.
-   Retain one native BLAS/OpenMP/NumExpr/Blosc thread and the bounded Zarr
-   executor per process.
+1. Reuse the existing replay cache/preparation progress coordinator for source
+   cache generation. Add a regional analysis progress phase with completed/
+   total boxes, elapsed time, and ETA.
+2. Print a compact stage-one table and a stage-two table. The stage-two table
+   contains original-before, stage-one-after, stage-two-after, total reduction,
+   and incremental reduction columns for all and internal Fiberlets.
+3. Keep `--stats` as optional detailed completed-chunk/search output. Normal
+   progress and headline tables must not require it.
+4. Require even integral `--chunk-size` for half-offset mode,
+   `--region-size >= 2 * --chunk-size`, bounds without integer overflow, and
+   centered boxes fully contained by both the selected target region and the
+   dataset base-coordinate extent. Region/chunk alignment is not required.
 
-## Live-fetch scheduler regression follow-up
+## Tests
 
-1. Keep the established bounded `multiprocessing.Queue` worker transport. The
-   process dumps show empty parent feeder buffers and do not support replacing
-   the transport as the cause or cure.
-2. Restore the pre-live-fetch normal-input lifecycle: discovering a supported
-   local tile and submitting its bounded read happen atomically in one
-   coordinator pass. The optional live cache is only an upstream bounded
-   materialization ledger; after materialization it enters the same reader,
-   GPU, accumulator, flush, and canonical-commit stages as a local tile.
-3. Keep explicit per-worker sequence/task ownership and exact input/result slot
-   ownership while using the existing queues. Validate ownership and worker
-   liveness on every coordinator pass, and reject duplicate, foreign, or
-   mismatched acknowledgements immediately.
-4. Retain stage-aware quiescence handling. Never wait only on the GPU queue
-   when the producer that can advance the head event is a live-cache future,
-   input read, accumulator task, or flush task.
-5. Keep Z-band ordering, TensorStore, stable accumulator ownership, asynchronous
-   flush overlap, mmap layout, and numeric behavior unchanged.
-
-## Canonical-frontier capacity invariant
-
-1. Preserve canonical accumulator dispatch and its existing floating-point
-   accumulation order. Do not process later GPU results out of order merely to
-   release their shared result slots.
-2. Compute the effective accumulation frontier by advancing past the contiguous
-   `done_skip` prefix beginning at `next_accum_dispatch`. When that effective
-   frontier still needs GPU processing (`fetching`, `awaiting_read`, `reading`,
-   or `ready`), reserve one free input slot and one free result slot for it. A
-   later ready event may be admitted only when the reservation remains
-   available. Once the effective frontier is assigned, its owned pair satisfies
-   the reservation and all other free pairs may be used.
-3. Express the reservation decision in a small coordinator helper so its
-   behavior is directly testable. The reservation consumes no additional RAM,
-   mmap space, workers, or queues and reduces peak later-tile occupancy by at
-   most one slot only while the frontier read is outstanding.
-4. At every no-progress pass, reject the proven circular-wait state immediately:
-   an effective frontier that still needs GPU work, no free result slot, and
-   every result-slot owner belonging to a later GPU-stage event. A slot owned by
-   the current/earlier accumulator is legitimate backpressure and must not
-   trigger the assertion. Report the raw/effective frontier, skipped prefix,
-   status, free-pool counts, producer counts, and complete slot ledger. Do not
-   label that state an accumulator hang.
-5. Keep work/completion delivery fire-and-forget. A successfully queued task has
-   one terminal result; do not add acknowledgement/retry state or make optional
-   input-release notices part of a retry protocol.
-
-## Tests and validation
-
-1. Add deterministic scheduler tests with delayed/out-of-order fake GPU work,
-   process-parallel accumulation, sparse skips, multiple products/scales, and a
-   delayed real Zarr-v2 flush. Use enough events to cross several bounded
-   windows and Z-band transitions.
-2. Assert that parallel output matches the synchronous runner, every shared
-   slot is returned once, a completed flush releases immediately, only one
-   flush overlaps compute, and no Cartesian tile list is materialized.
-   Cover initial no-op prefixes, circular wrap/reuse, a band that does not
-   advance a chunk frontier, divergent multi-scale frontiers, and a dense real
-   Zarr-v2 flush whose tasks queue in waves.
-3. Add a forced quiescent-state test that validates the stage-rich diagnostic,
-   plus existing worker exception/hard-exit coverage.
-4. Run the focused Lasagna tiled-inference, Zarr thread, live-cache, Lasagna
-   predict3d, and Fiber 3D inference suites. Run a bounded representative smoke
-   using TensorStore plus process accumulation/flush if available; record its
-   command, input, wall time, and throughput before/after. Report if the full
-   Paris4 GPU workload is left for user validation.
-5. Exercise both local and live-cache modes beyond each bounded read/slot
-   window, force out-of-order GPU and accumulator completion, and assert exact
-   serial equivalence plus one acknowledgement, slot release, and canonical
-   commit per descriptor. Retain hard-exit coverage for both worker stages.
-6. Add a focused capacity regression in which the canonical frontier read is
-   delayed while at least one full result-slot window of later reads completes.
-   Assert that later admission leaves one pair reserved, the frontier is then
-   admitted, canonical accumulation advances, and all slots are ultimately
-   released without retries. Cover a contiguous `done_skip` prefix before the
-   delayed frontier, one total slot, and a current/earlier accumulating owner
-   that must be treated as recoverable backpressure.
+1. Extend the deterministic graph fixture to expose retained IDs and verify
+   their canonical ordering and internal classification.
+2. Add a small 2x2x2 regional fixture where stage-one unions overlap, writes a
+   reduced dataset, reopens it through stored caches, and the centered stage-two
+   analysis removes an additional interior branch.
+3. Assert unique regional ID aggregation and exact original/stage-one/stage-two
+   set relationships, including internal classification and percentage
+   denominators.
+4. Assert source payload bytes and mtimes are unchanged, reduced prefix/route
+   tuples remain aligned and are re-encoded under the derived fingerprint,
+   empty processed owners are explicit, and a hot reopen preserves derived
+   bytes and mtimes without generation.
+5. Test missing and partial requested pairs, safe per-chunk regeneration,
+   reuse of the same reduced chunk from two overlapping target regions, and CLI
+   rejection of odd chunk sizes, undersized regions, overflow, and
+   out-of-bounds centered boxes.
+6. Build `vc_fiberlets`, `test_fiberlet_storage`, and `test_fiberlet_paths` with
+   32 threads; run both suites and `git diff --check`.
+7. Run a 512/256 two-stage Paris4 region around the current reference location
+   and record exact commands, cold/hot timings, counts, and reduction rates.
 
 ## Spec update
 
-Replace the conflicting shared-runner, ordered-event, and process-flush bullets
-in `specs.md` with an
-explicit one-Z-band coordinator contract: canonical completion barrier, exact
-slot ownership, one previous asynchronous flush, immediate completed-flush
-release, canonical-frontier slot reservation, and stage-aware quiescence
-failure. Clarify that the coordinator owns scheduling/frontiers while flush
-processes only execute distinct chunk writes.
-Retain all existing memory,
-numeric, lazy-generation, sparse/resume, shared Fiber/Lasagna, and live-cache
-requirements.
+Extend the chunk-route diagnostic contract with regional aligned and
+half-offset grids, union retention, immutable derived Fiberlet datasets,
+lazy reusable reduced chunks, stage-two original-baseline comparison, and exact
+internal/all-Fiberlet reporting. State that box-local optimum pruning is not
+globally compositional: the two-stage result is an experimental local-pruning
+diagnostic, not proof of global replay-route preservation. Preserve all
+existing route semantics.
 
 ## Docs update
 
-Update the shared 3D tiled-runner section in `docs/code_structure.md` to explain
-the explicit Z-band lifecycle, read-ahead boundary, slot ownership, asynchronous
-flush overlap, and diagnostic behavior.
+Document `--region-size`, `--mode`, stage-one reduced-cache layout, centered
+stage-two behavior, tables, progress, cache reuse, and a 512/256 invocation in
+`volume-cartographer/docs/fiberlets.md`.
 
 ## Changelog
 
-Record the replacement of the cross-stage event/flush scheduler with a bounded
-explicit Z-band pipeline and removal of the incorrect timeout diagnosis.
+Record the two-stage regional reduction pipeline and its measured Paris4
+stage-one/stage-two reductions. Do not claim that the reduced cache is yet the
+default replay graph.

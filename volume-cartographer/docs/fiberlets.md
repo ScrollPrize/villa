@@ -819,6 +819,87 @@ pinned until the current graph query releases them. `--storage-chunk-side N`
 selects the spatial chunk side in base voxels and must be an exact multiple of
 the anchor cell side. The roots are local-only in this implementation.
 
+## Chunk-local optimal-route statistics
+
+`chunk-route-stats` measures how much of the regular cached graph participates
+in an optimal route through one geometric box. It uses the same on-demand
+preprocessor, anchor/fiberlet cache participants, dependency halo, serializers,
+and shared decoded-byte LRU as tracing. A cold run generates and persists
+missing canonical chunks; compatible hot chunks are reused without rewriting:
+
+```bash
+volume-cartographer/build/bin/vc_fiberlets chunk-route-stats \
+  /path/to/fiber.lasagna.json /path/to/output \
+  --normal-manifest /path/to/normals.lasagna.json \
+  --chunk 23040,17920,54784 --chunk-size 256 --threads 32
+```
+
+`--chunk` is the box minimum in base-volume XYZ. The selected box is half open
+and its side defaults to 256 base voxels. There is no lookahead option or route
+length guard: every candidate continues until its first exit, even if its route
+is longer than the box side or normal replay horizon.
+
+Cache preparation uses the normal replay progress display and reports
+resolved/expected anchor and fiberlet chunks, elapsed time, and ETA. `--stats`
+adds serialized per-chunk completion records; it is not required for progress.
+
+For every directed fiberlet entering from an outside anchor, the command finds
+the exact cheapest route until it first reaches an outside anchor again. A
+route may curve back and leave through any box face, but it cannot revisit an
+anchor or fiberlet. Every join uses the regular strict maximum-angle test,
+prediction-validity check, and normal/tangent-aware join cost. Thus spatial
+turn-back is not permission for cycles or arbitrary turns. Entry and exit edges
+are included once in both loss and length.
+
+The default `--cost-profile sqrt-u16` applies the production fixed square-root
+`uint16` cost-density view with ceiling 256; `--cost-profile stored` uses the
+stored float component totals. Joins remain float. Cache roots default to
+fingerprinted namespaces below `<output>/cache`; `--anchor-cache` and
+`--fiberlet-cache` select the same explicit roots accepted by replay. Cache
+metadata is strict and incompatible datasets are rejected.
+
+The population row counts inside anchors, incident physical fiberlets, directed
+entries/exits, and admissible transitions. The optimum row reports the union of
+anchors and physical fiberlets used by at least one exactly tied cheapest
+entry-to-first-exit route. Unused counts are candidate pruning opportunities,
+not a pruning operation or proof that a globally different analysis boundary
+would retain the same graph. `--max-states` bounds generated exact-search states
+per entry; reaching it fails without returning partial used/unused results.
+The primary table reports before/after counts and reduction percentages for
+anchors and all incident Fiberlets. A second table reports internal Fiberlets
+separately, excluding mandatory boundary-crossing entry and exit edges.
+
+Pass `--region-size N --mode two-stage` to run the reusable regional reduction
+experiment. `--chunk` then names the selected region minimum, while
+`--chunk-size` remains the globally aligned analysis-box side. For a 512-base
+region and 256-base boxes, stage one processes the eight intersecting aligned
+boxes and stores their retained Fiberlets in a fingerprinted global reduced
+cache. Stage two analyzes the single 256-base box shifted by 128 base voxels on
+all axes:
+
+```bash
+volume-cartographer/build/bin/vc_fiberlets chunk-route-stats \
+  /path/to/fiber.lasagna.json /path/to/output \
+  --normal-manifest /path/to/normals.lasagna.json \
+  --chunk 23040,17920,54784 \
+  --chunk-size 256 \
+  --region-size 512 \
+  --mode two-stage \
+  --storage-chunk-side 128 \
+  --anchor-cache /path/to/anchors.zarr \
+  --fiberlet-cache /path/to/fiberlets.zarr \
+  --threads 32
+```
+
+The selected region is not part of the reduced-cache identity. Compatible
+stage-one chunks are reused across overlapping invocations. Stage two sees
+exactly the selected stage-one owners: graph halo requests outside that set are
+ephemeral empty results and neither generate nor publish additional reduced
+chunks. Original anchors are exposed through a decoded-LRU-bound rechunked
+view of the existing anchor cache, so analysis-sized ownership does not copy or
+regenerate anchor data. The final table reports the original, stage-one, and
+stage-two unique physical-ID populations for all and internal Fiberlets.
+
 ## Whole-volume preprocessing
 
 Use `preprocess-volume` to materialize sparse anchors and fiberlets for an

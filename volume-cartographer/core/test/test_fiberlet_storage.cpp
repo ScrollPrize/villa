@@ -1090,3 +1090,308 @@ TEST_CASE("Fiberlet chunk graph loads complete cross-chunk adjacency and routes"
     CHECK(reloadedIncident.value.edges.front().id.fiberlet == edgeId);
     std::filesystem::remove_all(root);
 }
+
+TEST_CASE("Fiberlet chunk route analysis finds exact simple entry-to-exit optima")
+{
+    std::mt19937_64 random(std::random_device{}());
+    const auto root = std::filesystem::temp_directory_path() /
+        ("vc_fiberlet_chunk_routes_" + std::to_string(random()));
+    FiberletDatasetMetadata metadata;
+    metadata.kind = FiberletDatasetKind::Anchors;
+    metadata.profile = FiberletStorageProfile::Float32Cache;
+    metadata.chunkGridShapeZYX = {1, 1, 1};
+    metadata.coordinateUnitsPerChunkZYX = {64, 64, 64};
+    metadata.maximumEndpointReachCoordinateUnitsZYX = {32, 32, 32};
+    metadata.spatialChunkSideBaseVoxels = 64;
+    metadata.predictionToBaseScale = 1.0;
+    finalizeFiberletDatasetIdentity(metadata);
+    auto fiberletMetadata = metadata;
+    fiberletMetadata.kind = FiberletDatasetKind::Fiberlets;
+    finalizeFiberletDatasetIdentity(fiberletMetadata);
+    auto anchorDataset = FiberletChunkDataset::createOrOpen(
+        root / "anchors", metadata);
+    auto fiberletDataset = FiberletChunkDataset::createOrOpen(
+        root / "fiberlets", fiberletMetadata);
+    const vc::render::ChunkKey owner{0, 0, 0, 0};
+    const vc::render::ChunkKey routeOwner{1, 0, 0, 0};
+
+    const auto outsideLeft = key(12, 12, 8);
+    const auto a = key(12, 12, 11);
+    const auto loopFirst = key(12, 12, 12);
+    const auto b = key(12, 12, 13);
+    const auto loopSecond = key(12, 12, 14);
+    const auto c = key(12, 12, 15);
+    const auto d = key(12, 12, 17);
+    const auto dead = key(12, 12, 18, 1);
+    const auto outsideB = key(12, 12, 21);
+    const auto outsideC = key(12, 12, 22);
+    const auto outsideD = key(12, 12, 23);
+    const auto makeAnchor = [](FiberletStorageKey id) {
+        FiberletStoredAnchor anchor;
+        anchor.key = id;
+        anchor.positionPredictionXYZ = {
+            static_cast<float>(id.coordinateZYX[2]),
+            static_cast<float>(id.coordinateZYX[1]),
+            static_cast<float>(id.coordinateZYX[0])};
+        anchor.fittedAxisXYZ = {1.0F, 0.0F, 0.0F};
+        anchor.predictionAxisXYZ = {1.0F, 0.0F, 0.0F};
+        anchor.predictionPresence = 1.0F;
+        anchor.normalXYZ = {0.0F, 0.0F, 1.0F};
+        anchor.predictionValid = true;
+        anchor.predictionPresenceValid = true;
+        anchor.normalValid = true;
+        return anchor;
+    };
+    std::vector<FiberletStoredAnchor> anchors;
+    for (const auto& id : {outsideLeft, a, loopFirst, b, loopSecond, c, d,
+                           dead, outsideB, outsideC, outsideD}) {
+        anchors.push_back(makeAnchor(id));
+    }
+    std::sort(anchors.begin(), anchors.end(),
+              [](const auto& left, const auto& right) {
+                  return left.key < right.key;
+              });
+
+    const auto makePrefix = [](FiberletStorageKey first,
+                               FiberletStorageKey second, float loss) {
+        FiberletStoredPrefix prefix;
+        prefix.id = {std::min(first, second), std::max(first, second)};
+        prefix.pathLengthPredictionVoxels = 1.0F;
+        prefix.cost = {loss, 0.0F, 0.0F, 0.0F, 0.0F};
+        prefix.firstStepBaseXYZ = {1.0F, 0.0F, 0.0F};
+        prefix.lastStepBaseXYZ = {1.0F, 0.0F, 0.0F};
+        return prefix;
+    };
+    std::vector<FiberletStoredPrefix> prefixes{
+        makePrefix(outsideLeft, a, 1.0F),
+        makePrefix(a, b, 1.0F),
+        makePrefix(b, outsideB, 10.0F),
+        makePrefix(a, c, 2.0F),
+        makePrefix(c, outsideC, 2.0F),
+        makePrefix(a, d, 2.0F),
+        makePrefix(d, outsideD, 2.0F),
+        makePrefix(a, dead, 0.01F),
+        makePrefix(b, c, 100.0F),
+        makePrefix(a, loopFirst, 0.1F),
+        makePrefix(loopFirst, loopSecond, 0.1F),
+        makePrefix(a, loopSecond, 0.1F),
+    };
+    prefixes.back().firstStepBaseXYZ = {-1.0F, 0.0F, 0.0F};
+    prefixes.back().lastStepBaseXYZ = {-1.0F, 0.0F, 0.0F};
+    std::sort(prefixes.begin(), prefixes.end(),
+              [](const auto& left, const auto& right) {
+                  return left.id < right.id;
+              });
+    std::vector<FiberletStoredRoute> routes(
+        prefixes.size(), FiberletStoredRoute{{}, {1.0F}});
+    std::atomic<int> generatedAnchors{0};
+    std::atomic<int> generatedPrefixes{0};
+    std::atomic<int> generatedRoutes{0};
+    const auto makeGeneratedAnchorCache = [&](bool generationAllowed) {
+        return createGeneratedFiberletChunkCache(
+            anchorDataset,
+            [&, generationAllowed](FiberletStorageChunkKind kind,
+                                    const vc::render::ChunkKey& chunk,
+                                    const FiberletStorageCodecConfig& codec) {
+                if (!generationAllowed)
+                    throw std::runtime_error(
+                        "hot chunk-route analysis must not regenerate data");
+                ++generatedAnchors;
+                CHECK(kind == FiberletStorageChunkKind::Anchors);
+                CHECK(chunk == owner);
+                return materialized(
+                    kind, serializeFiberletAnchors(codec, anchors));
+            });
+    };
+    const auto makeGeneratedFiberletCache = [&](bool generationAllowed) {
+        return createGeneratedFiberletChunkCache(
+            fiberletDataset,
+            [&, generationAllowed](FiberletStorageChunkKind kind,
+                                    const vc::render::ChunkKey& chunk,
+                                    const FiberletStorageCodecConfig& codec) {
+                if (!generationAllowed)
+                    throw std::runtime_error(
+                        "hot chunk-route analysis must not regenerate data");
+                if (kind == FiberletStorageChunkKind::FiberletPrefix) {
+                    ++generatedPrefixes;
+                    CHECK(chunk == owner);
+                    return materialized(
+                        kind, serializeFiberletPrefixes(codec, prefixes));
+                }
+                ++generatedRoutes;
+                CHECK(chunk == routeOwner);
+                return materialized(
+                    kind, serializeFiberletRoutes(codec, routes));
+            });
+    };
+
+    auto generatedAnchorCache = makeGeneratedAnchorCache(true);
+    auto generatedFiberletCache = makeGeneratedFiberletCache(true);
+    FiberletPathConfig paths;
+    paths.smoothnessWeight = 0.0F;
+    paths.smoothnessNormalWeight = 0.0F;
+    paths.smoothnessTangentWeight = 0.0F;
+    FiberletChunkGraphSource graph(
+        anchorDataset, generatedAnchorCache,
+        fiberletDataset, generatedFiberletCache, paths);
+    FiberletChunkRouteAnalysisConfig config;
+    config.minimumBaseXYZ = {10.0, 10.0, 10.0};
+    config.maximumBaseXYZ = {20.0, 20.0, 20.0};
+    config.maximumJoinAngleDegrees = 45.0F;
+    config.parallelThreads = 4;
+    const auto report = analyzeFiberletChunkRoutes(graph, config);
+    CHECK(report.insideAnchors == 7);
+    CHECK(report.physicalFiberlets == prefixes.size());
+    CHECK(report.physicalFiberletIds.size() == report.physicalFiberlets);
+    CHECK(std::is_sorted(
+        report.physicalFiberletIds.begin(),
+        report.physicalFiberletIds.end()));
+    CHECK(report.internalFiberlets == 8);
+    CHECK(report.internalFiberletIds.size() == report.internalFiberlets);
+    CHECK(std::is_sorted(
+        report.internalFiberletIds.begin(),
+        report.internalFiberletIds.end()));
+    CHECK(report.crossingFiberlets == 4);
+    CHECK(report.directedEntries == 4);
+    CHECK(report.directedExits == 4);
+    CHECK(report.reachableEntries == 4);
+    CHECK(report.unreachableEntries == 0);
+    CHECK(report.tiedOptimalEntries >= 1);
+    CHECK(report.usedInsideAnchors < report.insideAnchors);
+    CHECK(report.usedPhysicalFiberlets < report.physicalFiberlets);
+    CHECK(report.retainedPhysicalFiberlets.size() ==
+          report.usedPhysicalFiberlets);
+    CHECK(std::is_sorted(
+        report.retainedPhysicalFiberlets.begin(),
+        report.retainedPhysicalFiberlets.end()));
+    CHECK(report.usedInternalFiberlets < report.internalFiberlets);
+    CHECK(report.usedInternalFiberlets + report.unusedInternalFiberlets ==
+          report.internalFiberlets);
+    CHECK(report.rejectedVisitedTargets > 0);
+    CHECK(report.routeLosses.count == report.optimalRoutes);
+    CHECK(report.routeLengthsPredictionVoxels.count == report.optimalRoutes);
+    const auto generatedRoute = generatedFiberletCache->getChunkBlocking(
+        routeOwner.level, routeOwner.iz, routeOwner.iy, routeOwner.ix);
+    REQUIRE(generatedRoute.status == vc::render::ChunkStatus::Data);
+    CHECK(generatedAnchors.load() == 1);
+    CHECK(generatedPrefixes.load() == 1);
+    CHECK(generatedRoutes.load() == 1);
+    const auto anchorPath = anchorDataset->chunkPath(
+        FiberletStorageChunkKind::Anchors, owner);
+    const auto prefixPath = fiberletDataset->chunkPath(
+        FiberletStorageChunkKind::FiberletPrefix, owner);
+    const auto routePath = fiberletDataset->chunkPath(
+        FiberletStorageChunkKind::FiberletRoutes, routeOwner);
+    const auto anchorTime = std::filesystem::last_write_time(anchorPath);
+    const auto prefixTime = std::filesystem::last_write_time(prefixPath);
+    const auto routeTime = std::filesystem::last_write_time(routePath);
+    CHECK(std::filesystem::last_write_time(anchorPath) == anchorTime);
+    CHECK(std::filesystem::last_write_time(prefixPath) == prefixTime);
+
+    const auto population = collectFiberletChunkRoutePopulation(graph, config);
+    CHECK(population.insideAnchors == report.insideAnchors);
+    CHECK(population.physicalFiberletIds == report.physicalFiberletIds);
+    CHECK(population.internalFiberletIds == report.internalFiberletIds);
+
+    auto reducedMetadata = fiberletMetadata;
+    reducedMetadata.processing["reduction"] = {
+        {"contract", "test_exact_entry_to_exit_reduction"},
+        {"chunk_size_base_voxels", 64},
+    };
+    finalizeFiberletDatasetIdentity(reducedMetadata);
+    auto reducedDataset = FiberletChunkDataset::createOrOpen(
+        root / "reduced", reducedMetadata);
+    const auto reducedWrite = writeReducedFiberletChunk(
+        graph, reducedDataset, owner, report.physicalFiberletIds,
+        report.retainedPhysicalFiberlets);
+    CHECK(reducedWrite.owner == owner);
+    CHECK(reducedWrite.inputFiberlets == report.physicalFiberlets);
+    CHECK(reducedWrite.retainedFiberlets == report.usedPhysicalFiberlets);
+    CHECK_FALSE(reducedWrite.reused);
+    const auto reducedPrefixPath = reducedDataset->chunkPath(
+        FiberletStorageChunkKind::FiberletPrefix, owner);
+    const auto reducedRoutePath = reducedDataset->chunkPath(
+        FiberletStorageChunkKind::FiberletRoutes, routeOwner);
+    const auto reducedPrefixTime =
+        std::filesystem::last_write_time(reducedPrefixPath);
+    const auto reducedRouteTime =
+        std::filesystem::last_write_time(reducedRoutePath);
+    const auto reducedHotWrite = writeReducedFiberletChunk(
+        graph, reducedDataset, owner, report.physicalFiberletIds,
+        report.retainedPhysicalFiberlets);
+    CHECK(reducedHotWrite.reused);
+    CHECK(std::filesystem::last_write_time(reducedPrefixPath) ==
+          reducedPrefixTime);
+    CHECK(std::filesystem::last_write_time(reducedRoutePath) ==
+          reducedRouteTime);
+    CHECK(std::filesystem::last_write_time(prefixPath) == prefixTime);
+    CHECK(std::filesystem::last_write_time(routePath) == routeTime);
+
+    auto reducedCache = createStoredFiberletPathChunkCache(reducedDataset);
+    FiberletChunkGraphSource reducedGraph(
+        anchorDataset, generatedAnchorCache,
+        reducedDataset, reducedCache, paths);
+    const auto reducedPopulation = collectFiberletChunkRoutePopulation(
+        reducedGraph, config);
+    CHECK(reducedPopulation.physicalFiberletIds ==
+          report.retainedPhysicalFiberlets);
+    reducedCache->cancelPendingAndWait();
+
+    auto repairedMetadata = reducedMetadata;
+    repairedMetadata.processing["reduction"]["contract"] =
+        "test_partial_pair_repair";
+    finalizeFiberletDatasetIdentity(repairedMetadata);
+    auto repairedDataset = FiberletChunkDataset::createOrOpen(
+        root / "repaired", repairedMetadata);
+    repairedDataset->publishChunk(
+        FiberletStorageChunkKind::FiberletPrefix, owner,
+        serializeFiberletPrefixes(
+            repairedDataset->codecConfig(
+                FiberletStorageChunkKind::FiberletPrefix, owner),
+            {}));
+    CHECK_FALSE(std::filesystem::exists(repairedDataset->chunkPath(
+        FiberletStorageChunkKind::FiberletRoutes, routeOwner)));
+    const auto repaired = writeReducedFiberletChunk(
+        graph, repairedDataset, owner, report.physicalFiberletIds,
+        report.retainedPhysicalFiberlets);
+    CHECK_FALSE(repaired.reused);
+    REQUIRE(repairedDataset->readMaterializedChunk(
+        FiberletStorageChunkKind::FiberletPrefix, owner));
+    REQUIRE(repairedDataset->readMaterializedChunk(
+        FiberletStorageChunkKind::FiberletRoutes, routeOwner));
+
+    config.maximumGeneratedStatesPerEntry = 1;
+    CHECK_THROWS_AS(analyzeFiberletChunkRoutes(graph, config),
+                    std::runtime_error);
+    config.maximumGeneratedStatesPerEntry = 1'000'000;
+    config.maximumJoinAngleDegrees = 0.0F;
+    const auto strictAngle = analyzeFiberletChunkRoutes(graph, config);
+    CHECK(strictAngle.reachableEntries == 0);
+    CHECK(strictAngle.unreachableEntries == strictAngle.directedEntries);
+    generatedFiberletCache->cancelPendingAndWait();
+    generatedAnchorCache->cancelPendingAndWait();
+
+    anchorDataset = FiberletChunkDataset::openExisting(root / "anchors");
+    fiberletDataset = FiberletChunkDataset::openExisting(root / "fiberlets");
+    auto hotAnchorCache = makeGeneratedAnchorCache(false);
+    auto hotFiberletCache = makeGeneratedFiberletCache(false);
+    FiberletChunkGraphSource hotGraph(
+        anchorDataset, hotAnchorCache,
+        fiberletDataset, hotFiberletCache, paths);
+    config.maximumJoinAngleDegrees = 45.0F;
+    const auto hotReport = analyzeFiberletChunkRoutes(hotGraph, config);
+    CHECK(hotReport.insideAnchors == report.insideAnchors);
+    CHECK(hotReport.physicalFiberlets == report.physicalFiberlets);
+    CHECK(hotReport.usedInsideAnchors == report.usedInsideAnchors);
+    CHECK(hotReport.usedPhysicalFiberlets == report.usedPhysicalFiberlets);
+    CHECK(hotReport.usedInternalFiberlets == report.usedInternalFiberlets);
+    CHECK(generatedAnchors.load() == 1);
+    CHECK(generatedPrefixes.load() == 1);
+    CHECK(generatedRoutes.load() == 1);
+    CHECK(std::filesystem::last_write_time(anchorPath) == anchorTime);
+    CHECK(std::filesystem::last_write_time(prefixPath) == prefixTime);
+    CHECK(std::filesystem::last_write_time(routePath) == routeTime);
+    hotFiberletCache->cancelPendingAndWait();
+    hotAnchorCache->cancelPendingAndWait();
+    std::filesystem::remove_all(root);
+}

@@ -55,6 +55,12 @@ enum class Command {
     Paths,
     FiberletReplay,
     PreprocessVolume,
+    ChunkRouteStats,
+};
+
+enum class ChunkRouteMode {
+    Stats,
+    TwoStage,
 };
 
 bool isReplayCommand(Command command)
@@ -65,6 +71,11 @@ bool isReplayCommand(Command command)
 bool isWholeVolumeCommand(Command command)
 {
     return command == Command::PreprocessVolume;
+}
+
+bool isChunkRouteStatsCommand(Command command)
+{
+    return command == Command::ChunkRouteStats;
 }
 
 bool isQuantizationCommand(Command command)
@@ -80,7 +91,7 @@ bool usesGraphReplayOptions(Command command)
 bool needsPathExtraction(Command command)
 {
     return command == Command::Paths || command == Command::Benchmark || isReplayCommand(command) || isQuantizationCommand(command) ||
-           isWholeVolumeCommand(command);
+           isWholeVolumeCommand(command) || isChunkRouteStatsCommand(command);
 }
 
 struct CliOptions {
@@ -130,6 +141,15 @@ struct CliOptions {
     std::uint64_t storageCompressionSeed = 1;
     int storageCompressionChunkSideBaseVoxels = 512;
     vc::fiber_tracer::cli::SeenOptions seenTraceOptions;
+    std::array<int, 3> analysisChunkMinimumBaseXYZ{0, 0, 0};
+    bool analysisChunkSpecified = false;
+    int analysisChunkSizeBaseVoxels = 256;
+    int analysisRegionSizeBaseVoxels = 0;
+    ChunkRouteMode analysisMode = ChunkRouteMode::Stats;
+    float analysisMaximumJoinAngleDegrees = 45.0F;
+    std::optional<vc::fiber_tracer::FiberletChunkRouteEdgeCostView>
+        analysisEdgeCostView;
+    std::size_t analysisMaximumStatesPerEntry = 1'000'000;
 };
 
 [[noreturn]] void fail(const std::string& message)
@@ -168,6 +188,9 @@ void usage(const char* executable)
               << "  " << executable
               << " preprocess-volume <fiber.lasagna.json-or-url> <output.zarr>"
                  " --normal-manifest <lasagna.json-or-url> [options]\n\n"
+              << "  " << executable
+              << " chunk-route-stats <fiber.lasagna.json-or-url> <output-dir>"
+                 " --normal-manifest <lasagna.json-or-url> --chunk X,Y,Z [options]\n\n"
               << "Common options:\n"
               << "  --threads N                   decode/search workers [hardware]\n"
               << "  --cache-gib N                 decoded chunk cache budget [0.5]\n"
@@ -175,6 +198,14 @@ void usage(const char* executable)
               << "  --source-context PATH         stable manager/Atlas source identities (preprocess-volume)\n"
               << "  --stats                       print detailed path/replay diagnostics\n"
               << "  --base-voxel-size-um N        optional physical reporting metadata\n\n"
+              << "Chunk-route options:\n"
+              << "  --chunk X,Y,Z                region minimum in base voxels\n"
+              << "  --chunk-size N               cubic analysis-box side [256]\n"
+              << "  --region-size N              cubic region side [chunk-size]\n"
+              << "  --mode stats|two-stage       reduction mode [stats]\n"
+              << "  --join-angle N               maximum anchor join angle [45]\n"
+              << "  --cost-profile stored|sqrt-u16 analysis cost view [sqrt-u16]\n"
+              << "  --max-states N               search-state limit per entry [1000000]\n\n"
               << "Anchor options:\n"
               << "  --cell-size N                 prediction-grid cell side, 2..8 [4]\n"
               << "  --falloff N                   normal-plane sigma in base voxels [cell-side/2]\n"
@@ -238,6 +269,12 @@ void usage(const char* executable)
               << "  --storage-compression-seed N    deterministic chunk sample seed [1]\n"
               << "  --storage-compression-chunk-side N  extracted region side in base voxels [512]\n"
               << "  --scenario NAME|all           quantization scenario(s); baseline runs once\n";
+    std::cerr << "\nChunk-route statistics options:\n"
+              << "  --chunk X,Y,Z                 analysis-box minimum in base voxels\n"
+              << "  --chunk-size N                analysis chunk side in base voxels [256]\n"
+              << "  --join-angle N                regular strict maximum join angle\n"
+              << "  --cost-profile PROFILE        stored or fixed sqrt uint16 [sqrt-u16]\n"
+              << "  --max-states N                exact generated-state limit per entry [1000000]\n";
 }
 
 std::string valueAfter(int& index, int argc, char** argv, const char* name)
@@ -276,6 +313,22 @@ int parseInt(const std::string& text, const char* name)
         fail(std::string("--") + name + " requires an integer");
     }
     return static_cast<int>(value);
+}
+
+std::array<int, 3> parseIntTriple(
+    const std::string& text, const char* name)
+{
+    std::array<int, 3> result{};
+    std::stringstream input(text);
+    std::string token;
+    for (std::size_t axis = 0; axis < result.size(); ++axis) {
+        if (!std::getline(input, token, ',') || token.empty())
+            fail(std::string("--") + name + " requires X,Y,Z");
+        result[axis] = parseInt(token, name);
+    }
+    if (std::getline(input, token, ','))
+        fail(std::string("--") + name + " requires exactly three integers");
+    return result;
 }
 
 vc::fiber_tracer::FiberletStorageKey parseStorageKey(const std::string& text)
@@ -390,6 +443,13 @@ CliOptions parseArgs(int argc, char** argv)
         options.manifestLocation = argv[2];
         options.outputDirectory = argv[3];
         firstOption = 4;
+    } else if (command == "chunk-route-stats") {
+        options.command = Command::ChunkRouteStats;
+        options.manifestLocation = argv[2];
+        options.outputDirectory = argv[3];
+        options.analysisEdgeCostView = vc::fiber_tracer::
+            FiberletChunkRouteEdgeCostView::SqrtUint16Max256;
+        firstOption = 4;
     } else {
         usage(argv[0]);
         std::exit(2);
@@ -417,6 +477,53 @@ CliOptions parseArgs(int argc, char** argv)
             options.decodedCacheBytes = static_cast<size_t>(gib * 1024.0 * 1024.0 * 1024.0);
         } else if (argument == "--remote-cache-dir") {
             options.remoteCacheDirectory = valueAfter(index, argc, argv, "remote-cache-dir");
+        } else if (argument == "--chunk" &&
+                   isChunkRouteStatsCommand(options.command)) {
+            options.analysisChunkMinimumBaseXYZ = parseIntTriple(
+                valueAfter(index, argc, argv, "chunk"), "chunk");
+            options.analysisChunkSpecified = true;
+        } else if (argument == "--chunk-size" &&
+                   isChunkRouteStatsCommand(options.command)) {
+            options.analysisChunkSizeBaseVoxels = parseInt(
+                valueAfter(index, argc, argv, "chunk-size"), "chunk-size");
+        } else if (argument == "--region-size" &&
+                   isChunkRouteStatsCommand(options.command)) {
+            options.analysisRegionSizeBaseVoxels = parseInt(
+                valueAfter(index, argc, argv, "region-size"), "region-size");
+        } else if (argument == "--mode" &&
+                   isChunkRouteStatsCommand(options.command)) {
+            const auto value = valueAfter(index, argc, argv, "mode");
+            if (value == "stats")
+                options.analysisMode = ChunkRouteMode::Stats;
+            else if (value == "two-stage")
+                options.analysisMode = ChunkRouteMode::TwoStage;
+            else
+                fail("--mode must be stats or two-stage");
+        } else if (argument == "--join-angle" &&
+                   isChunkRouteStatsCommand(options.command)) {
+            options.analysisMaximumJoinAngleDegrees = static_cast<float>(
+                parseDouble(valueAfter(index, argc, argv, "join-angle"),
+                            "join-angle"));
+        } else if (argument == "--cost-profile" &&
+                   isChunkRouteStatsCommand(options.command)) {
+            const auto value = valueAfter(index, argc, argv, "cost-profile");
+            if (value == "stored") {
+                options.analysisEdgeCostView =
+                    vc::fiber_tracer::FiberletChunkRouteEdgeCostView::Stored;
+            } else if (value == "sqrt-u16") {
+                options.analysisEdgeCostView = vc::fiber_tracer::
+                    FiberletChunkRouteEdgeCostView::SqrtUint16Max256;
+            } else {
+                fail("--cost-profile must be stored or sqrt-u16");
+            }
+        } else if (argument == "--max-states" &&
+                   isChunkRouteStatsCommand(options.command)) {
+            const int value = parseInt(
+                valueAfter(index, argc, argv, "max-states"), "max-states");
+            if (value <= 0)
+                fail("--max-states must be positive");
+            options.analysisMaximumStatesPerEntry =
+                static_cast<std::size_t>(value);
         } else if (argument == "--source-context" &&
                    isWholeVolumeCommand(options.command)) {
             options.sourceContextPath =
@@ -450,9 +557,14 @@ CliOptions parseArgs(int argc, char** argv)
         } else if (argument == "--inference-scaledown-power" && isReplayCommand(options.command)) {
             options.inferenceScaledownPower =
                 parseInt(valueAfter(index, argc, argv, "inference-scaledown-power"), "inference-scaledown-power");
-        } else if (argument == "--anchor-cache" && (usesGraphReplayOptions(options.command) || isWholeVolumeCommand(options.command))) {
+        } else if (
+            argument == "--anchor-cache" &&
+            (usesGraphReplayOptions(options.command) || isWholeVolumeCommand(options.command) ||
+             isChunkRouteStatsCommand(options.command))) {
             options.anchorCacheRoot = valueAfter(index, argc, argv, "anchor-cache");
-        } else if (argument == "--fiberlet-cache" && usesGraphReplayOptions(options.command)) {
+        } else if (
+            argument == "--fiberlet-cache" &&
+            (usesGraphReplayOptions(options.command) || isChunkRouteStatsCommand(options.command))) {
             options.fiberletCacheRoot = valueAfter(index, argc, argv, "fiberlet-cache");
         } else if (argument == "--eager-graph" && isReplayCommand(options.command)) {
             options.eagerGraphReplay = true;
@@ -526,22 +638,33 @@ CliOptions parseArgs(int argc, char** argv)
             if (!(*options.corridorRadiusBaseVoxels > 0.0))
                 fail("--corridor-radius must be positive");
         } else if (
-            argument == "--stats" && (options.command == Command::Paths || isReplayCommand(options.command) || isWholeVolumeCommand(options.command))) {
+            argument == "--stats" && (options.command == Command::Paths || isReplayCommand(options.command) || isWholeVolumeCommand(options.command) ||
+                                         isChunkRouteStatsCommand(options.command))) {
             options.printStats = true;
         } else if (argument == "--no-slices" && options.command == Command::Paths) {
             options.writePresenceSlices = false;
-        } else if (argument == "--invalid-prediction-cost" && needsPathExtraction(options.command)) {
+        } else if (argument == "--invalid-prediction-cost" &&
+                   (needsPathExtraction(options.command) ||
+                    isChunkRouteStatsCommand(options.command))) {
             options.paths.invalidPredictionCostPerVoxel =
                 parseDouble(valueAfter(index, argc, argv, "invalid-prediction-cost"), "invalid-prediction-cost");
-        } else if (argument == "--smoothness-weight" && needsPathExtraction(options.command)) {
+        } else if (argument == "--smoothness-weight" &&
+                   (needsPathExtraction(options.command) ||
+                    isChunkRouteStatsCommand(options.command))) {
             options.paths.smoothnessWeight = parseDouble(valueAfter(index, argc, argv, "smoothness-weight"), "smoothness-weight");
-        } else if (argument == "--smoothness-normal-weight" && needsPathExtraction(options.command)) {
+        } else if (argument == "--smoothness-normal-weight" &&
+                   (needsPathExtraction(options.command) ||
+                    isChunkRouteStatsCommand(options.command))) {
             options.paths.smoothnessNormalWeight =
                 parseDouble(valueAfter(index, argc, argv, "smoothness-normal-weight"), "smoothness-normal-weight");
-        } else if (argument == "--smoothness-tangent-weight" && needsPathExtraction(options.command)) {
+        } else if (argument == "--smoothness-tangent-weight" &&
+                   (needsPathExtraction(options.command) ||
+                    isChunkRouteStatsCommand(options.command))) {
             options.paths.smoothnessTangentWeight =
                 parseDouble(valueAfter(index, argc, argv, "smoothness-tangent-weight"), "smoothness-tangent-weight");
-        } else if (argument == "--smoothness-free-angle" && needsPathExtraction(options.command)) {
+        } else if (argument == "--smoothness-free-angle" &&
+                   (needsPathExtraction(options.command) ||
+                    isChunkRouteStatsCommand(options.command))) {
             options.paths.smoothnessFreeAngleDegrees =
                 parseDouble(valueAfter(index, argc, argv, "smoothness-free-angle"), "smoothness-free-angle");
         } else if (argument == "--batch" && needsPathExtraction(options.command)) {
@@ -594,7 +717,8 @@ CliOptions parseArgs(int argc, char** argv)
             options.graphReplay.pruneDistanceBaseVoxels = parseDouble(valueAfter(index, argc, argv, "prune-distance"), "prune-distance");
         } else if (
             argument == "--storage-chunk-side" &&
-            (isQuantizationCommand(options.command) || isReplayCommand(options.command) || isWholeVolumeCommand(options.command))) {
+            (isQuantizationCommand(options.command) || isReplayCommand(options.command) || isWholeVolumeCommand(options.command) ||
+             isChunkRouteStatsCommand(options.command))) {
             options.storageChunkSideBaseVoxels = parseInt(valueAfter(index, argc, argv, "storage-chunk-side"), "storage-chunk-side");
         } else if (argument == "--scenario" && isQuantizationCommand(options.command)) {
             options.quantizationScenario = valueAfter(index, argc, argv, "scenario");
@@ -622,11 +746,43 @@ CliOptions parseArgs(int argc, char** argv)
     }
     if (needsPathExtraction(options.command)) {
         if (options.normalManifestLocation.empty())
-            fail("path and whole-volume commands require --normal-manifest");
+            fail("this command requires --normal-manifest");
         vc::fiber_tracer::validateFiberletPathConfig(options.paths);
     }
-    if (isWholeVolumeCommand(options.command) && options.storageChunkSideBaseVoxels <= 0)
-        fail("preprocess-volume --storage-chunk-side must be positive");
+    if ((isWholeVolumeCommand(options.command) ||
+         isChunkRouteStatsCommand(options.command)) &&
+        options.storageChunkSideBaseVoxels <= 0) {
+        fail("--storage-chunk-side must be positive");
+    }
+    if (isChunkRouteStatsCommand(options.command)) {
+        if (!options.analysisChunkSpecified)
+            fail("chunk-route-stats requires --chunk X,Y,Z");
+        if (std::any_of(options.analysisChunkMinimumBaseXYZ.begin(),
+                        options.analysisChunkMinimumBaseXYZ.end(),
+                        [](int value) { return value < 0; })) {
+            fail("--chunk base coordinates must be non-negative");
+        }
+        if (options.analysisChunkSizeBaseVoxels <= 0)
+            fail("chunk-route-stats requires a positive --chunk-size");
+        if (options.analysisRegionSizeBaseVoxels == 0) {
+            options.analysisRegionSizeBaseVoxels =
+                options.analysisChunkSizeBaseVoxels;
+        }
+        if (options.analysisRegionSizeBaseVoxels <= 0)
+            fail("chunk-route-stats requires a positive --region-size");
+        if (options.analysisMode == ChunkRouteMode::TwoStage) {
+            if (options.analysisChunkSizeBaseVoxels % 2 != 0)
+                fail("two-stage --chunk-size must be even");
+            if (options.analysisRegionSizeBaseVoxels / 2 <
+                options.analysisChunkSizeBaseVoxels) {
+                fail("two-stage --region-size must be at least two chunk sizes");
+            }
+        }
+        if (!(options.analysisMaximumJoinAngleDegrees >= 0.0F) ||
+            !(options.analysisMaximumJoinAngleDegrees <= 180.0F)) {
+            fail("chunk-route-stats requires --join-angle in [0,180]");
+        }
+    }
     if (usesGraphReplayOptions(options.command)) {
         if (options.steppedReplayCostOptionSpecified &&
             options.graphReplay.costMode != vc::fiber_tracer::FiberletGraphReplayCostMode::Stepped) {
@@ -706,12 +862,35 @@ CliOptions parseArgs(int argc, char** argv)
     if (options.command == Command::Benchmark && ((options.alongSpecified && !(options.alongBaseVoxels > 0.0)) || !(options.radiusBaseVoxels > 0.0)))
         fail("benchmark --along and --radius must be positive");
     const bool needsNormals = needsPathExtraction(options.command);
-    const bool remote = vc::lasagna::isRemoteLasagnaLocation(options.manifestLocation) ||
-                        (needsNormals && vc::lasagna::isRemoteLasagnaLocation(options.normalManifestLocation));
+    const bool remote =
+        vc::lasagna::isRemoteLasagnaLocation(options.manifestLocation) ||
+        (needsNormals && vc::lasagna::isRemoteLasagnaLocation(
+             options.normalManifestLocation));
     if (remote && options.remoteCacheDirectory.empty())
         fail("direct remote manifests require --remote-cache-dir");
     return options;
 }
+
+void printChunkRouteDistribution(
+    const char* name,
+    const vc::fiber_tracer::FiberletChunkRouteDistribution& values)
+{
+    std::cout << "fiberlet_chunk_route_distribution name=" << name
+              << " count=" << values.count;
+    if (values.count == 0) {
+        std::cout << " min=n/a mean=n/a median=n/a max=n/a\n";
+        return;
+    }
+    std::cout << " min=" << *values.minimum << " mean=" << *values.mean
+              << " median=" << *values.median << " max=" << *values.maximum
+              << '\n';
+}
+
+int runChunkRouteStats(
+    CliOptions& options,
+    const vc::lasagna::LasagnaDataset& fiberDataset,
+    const vc::fiber_tracer::FiberPredictionField& field,
+    const vc::fiber_tracer::FiberPredictionGridInfo& grid);
 
 std::string fileHash(const std::filesystem::path& path)
 {
@@ -953,6 +1132,917 @@ double resolveAnchorConfig(CliOptions& options, const vc::fiber_tracer::FiberPre
     options.anchors.axialSupportHalfWidthPredictionVoxels = 1.5 * options.anchors.cellSizePredictionVoxels;
     vc::fiber_tracer::validateFiberAnchorConfig(options.anchors);
     return cellSideBase;
+}
+
+class ChunkRouteReplayProgress
+{
+public:
+    explicit ChunkRouteReplayProgress(bool verbose);
+    ~ChunkRouteReplayProgress();
+
+    ChunkRouteReplayProgress(const ChunkRouteReplayProgress&) = delete;
+    ChunkRouteReplayProgress& operator=(const ChunkRouteReplayProgress&) = delete;
+
+    void configure(
+        std::span<const vc::render::ChunkKey> anchorChunks,
+        std::span<const vc::render::ChunkKey> fiberletChunks);
+    void resolve(
+        vc::fiber_tracer::FiberletStorageChunkKind kind,
+        const vc::render::ChunkKey& key,
+        vc::render::ChunkFetchStatus status);
+    void event(const vc::fiber_tracer::FiberletOnDemandProgress& event);
+    void finish();
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+std::string fingerprintHex(const std::array<std::uint8_t, 32>& value);
+void printRateProgress(
+    const char* prefix,
+    const std::string& phase,
+    const char* rateName,
+    size_t completed,
+    size_t total,
+    double elapsedSeconds);
+
+struct ChunkRouteBox {
+    vc::render::ChunkKey owner;
+    vc::fiber_tracer::FiberletChunkRouteAnalysisConfig config;
+};
+
+vc::fiber_tracer::FiberletChunkRouteAnalysisConfig chunkRouteConfig(
+    const CliOptions& options,
+    const cv::Vec3d& minimum,
+    double side)
+{
+    vc::fiber_tracer::FiberletChunkRouteAnalysisConfig config;
+    config.minimumBaseXYZ = minimum;
+    config.maximumBaseXYZ = minimum + cv::Vec3d{side, side, side};
+    config.maximumJoinAngleDegrees = options.analysisMaximumJoinAngleDegrees;
+    config.edgeCostView = *options.analysisEdgeCostView;
+    config.parallelThreads = static_cast<std::size_t>(
+        std::max(1, options.paths.parallelThreads));
+    config.maximumGeneratedStatesPerEntry =
+        options.analysisMaximumStatesPerEntry;
+    return config;
+}
+
+int chunkRouteOwnerAxis(const vc::render::ChunkKey& owner, std::size_t zyx)
+{
+    if (zyx == 0)
+        return owner.iz;
+    if (zyx == 1)
+        return owner.iy;
+    return owner.ix;
+}
+
+cv::Vec3d chunkRouteOwnerMinimumExact(
+    const vc::fiber_tracer::FiberletDatasetMetadata& metadata,
+    const vc::render::ChunkKey& owner)
+{
+    cv::Vec3d result;
+    for (std::size_t zyx = 0; zyx < 3; ++zyx) {
+        const std::size_t xyz = 2 - zyx;
+        const double cellSide =
+            static_cast<double>(metadata.spatialChunkSideBaseVoxels) /
+            static_cast<double>(metadata.coordinateUnitsPerChunkZYX[zyx]);
+        result[static_cast<int>(xyz)] =
+            (static_cast<double>(metadata.coordinateOriginZYX[zyx]) +
+             static_cast<double>(chunkRouteOwnerAxis(owner, zyx)) *
+                 static_cast<double>(metadata.coordinateUnitsPerChunkZYX[zyx])) *
+            cellSide;
+    }
+    return result;
+}
+
+std::vector<ChunkRouteBox> chunkRouteIntersectingBoxes(
+    const CliOptions& options,
+    const vc::fiber_tracer::FiberletDatasetMetadata& metadata)
+{
+    const cv::Vec3d regionMinimum{
+        static_cast<double>(options.analysisChunkMinimumBaseXYZ[0]),
+        static_cast<double>(options.analysisChunkMinimumBaseXYZ[1]),
+        static_cast<double>(options.analysisChunkMinimumBaseXYZ[2])};
+    const double regionSide =
+        static_cast<double>(options.analysisRegionSizeBaseVoxels);
+    const cv::Vec3d regionMaximum =
+        regionMinimum + cv::Vec3d{regionSide, regionSide, regionSide};
+    std::array<int, 3> begin{};
+    std::array<int, 3> end{};
+    for (std::size_t zyx = 0; zyx < 3; ++zyx) {
+        const std::size_t xyz = 2 - zyx;
+        const double side =
+            static_cast<double>(metadata.spatialChunkSideBaseVoxels);
+        const double origin =
+            static_cast<double>(metadata.coordinateOriginZYX[zyx]) * side /
+            static_cast<double>(metadata.coordinateUnitsPerChunkZYX[zyx]);
+        begin[zyx] = static_cast<int>(std::floor(
+            (regionMinimum[static_cast<int>(xyz)] - origin) / side));
+        end[zyx] = static_cast<int>(std::floor(
+            (std::nextafter(regionMaximum[static_cast<int>(xyz)],
+                            -std::numeric_limits<double>::infinity()) -
+             origin) /
+            side));
+        begin[zyx] = std::max(0, begin[zyx]);
+        end[zyx] = std::min(
+            metadata.chunkGridShapeZYX[zyx] - 1, end[zyx]);
+    }
+    std::vector<ChunkRouteBox> result;
+    const double side =
+        static_cast<double>(metadata.spatialChunkSideBaseVoxels);
+    for (int z = begin[0]; z <= end[0]; ++z) {
+        for (int y = begin[1]; y <= end[1]; ++y) {
+            for (int x = begin[2]; x <= end[2]; ++x) {
+                const vc::render::ChunkKey owner{0, z, y, x};
+                result.push_back({
+                    owner,
+                    chunkRouteConfig(
+                        options,
+                        chunkRouteOwnerMinimumExact(metadata, owner), side)});
+            }
+        }
+    }
+    return result;
+}
+
+std::vector<vc::fiber_tracer::FiberletChunkRouteAnalysisConfig>
+chunkRouteCenteredBoxes(
+    const CliOptions& options,
+    const vc::fiber_tracer::FiberletDatasetMetadata& metadata,
+    std::span<const ChunkRouteBox> intersecting)
+{
+    if (intersecting.empty())
+        return {};
+    std::array<int, 3> begin{
+        intersecting.front().owner.iz,
+        intersecting.front().owner.iy,
+        intersecting.front().owner.ix};
+    std::array<int, 3> end = begin;
+    for (const auto& box : intersecting) {
+        begin[0] = std::min(begin[0], box.owner.iz);
+        begin[1] = std::min(begin[1], box.owner.iy);
+        begin[2] = std::min(begin[2], box.owner.ix);
+        end[0] = std::max(end[0], box.owner.iz);
+        end[1] = std::max(end[1], box.owner.iy);
+        end[2] = std::max(end[2], box.owner.ix);
+    }
+    const cv::Vec3d regionMinimum{
+        static_cast<double>(options.analysisChunkMinimumBaseXYZ[0]),
+        static_cast<double>(options.analysisChunkMinimumBaseXYZ[1]),
+        static_cast<double>(options.analysisChunkMinimumBaseXYZ[2])};
+    const double regionSide =
+        static_cast<double>(options.analysisRegionSizeBaseVoxels);
+    const cv::Vec3d regionMaximum =
+        regionMinimum + cv::Vec3d{regionSide, regionSide, regionSide};
+    const double side =
+        static_cast<double>(metadata.spatialChunkSideBaseVoxels);
+    std::vector<vc::fiber_tracer::FiberletChunkRouteAnalysisConfig> result;
+    for (int z = begin[0]; z < end[0]; ++z) {
+        for (int y = begin[1]; y < end[1]; ++y) {
+            for (int x = begin[2]; x < end[2]; ++x) {
+                const vc::render::ChunkKey owner{0, z, y, x};
+                const auto minimum =
+                    chunkRouteOwnerMinimumExact(metadata, owner) +
+                    cv::Vec3d{side * 0.5, side * 0.5, side * 0.5};
+                const auto maximum =
+                    minimum + cv::Vec3d{side, side, side};
+                bool contained = true;
+                for (int axis = 0; axis < 3; ++axis) {
+                    contained = contained &&
+                        minimum[axis] >= regionMinimum[axis] &&
+                        maximum[axis] <= regionMaximum[axis];
+                }
+                if (contained)
+                    result.push_back(chunkRouteConfig(options, minimum, side));
+            }
+        }
+    }
+    return result;
+}
+
+vc::fiber_tracer::FiberletDatasetMetadata chunkRouteReducedMetadata(
+    const CliOptions& options,
+    const vc::fiber_tracer::FiberletDatasetMetadata& source)
+{
+    vc::fiber_tracer::FiberletDatasetMetadata result = source;
+    const std::int64_t newSide = options.analysisChunkSizeBaseVoxels;
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        const std::int64_t oldSide = source.spatialChunkSideBaseVoxels;
+        const std::int64_t numerator =
+            newSide * source.coordinateUnitsPerChunkZYX[axis];
+        if (numerator % oldSide != 0)
+            fail("--chunk-size is not aligned to the anchor-cell grid");
+        const std::int64_t units = numerator / oldSide;
+        if (units <= 0)
+            fail("--chunk-size is smaller than one anchor cell");
+        const std::int64_t totalUnits =
+            static_cast<std::int64_t>(source.chunkGridShapeZYX[axis]) *
+            source.coordinateUnitsPerChunkZYX[axis];
+        const std::int64_t chunks = (totalUnits + units - 1) / units;
+        if (chunks > std::numeric_limits<std::int32_t>::max())
+            fail("reduced Fiberlet chunk grid is too large");
+        result.coordinateUnitsPerChunkZYX[axis] = units;
+        result.chunkGridShapeZYX[axis] = static_cast<std::int32_t>(chunks);
+    }
+    result.spatialChunkSideBaseVoxels =
+        static_cast<std::uint32_t>(newSide);
+    result.processing["layout"]["chunk_grid_shape_zyx"] =
+        result.chunkGridShapeZYX;
+    result.processing["layout"]["coordinate_units_per_chunk_zyx"] =
+        result.coordinateUnitsPerChunkZYX;
+    result.processing["storage"]["spatial_chunk_side_base"] = newSide;
+    result.processing["reduction"] = {
+        {"contract", "exact_entry_to_first_exit_chunk_reduction_v1"},
+        {"source_dataset_fingerprint",
+         fingerprintHex(source.datasetFingerprint)},
+        {"chunk_size_base_voxels", newSide},
+        {"maximum_join_angle_degrees",
+         options.analysisMaximumJoinAngleDegrees},
+        {"edge_cost_view",
+         *options.analysisEdgeCostView ==
+                 vc::fiber_tracer::FiberletChunkRouteEdgeCostView::Stored
+             ? "stored"
+             : "sqrt_u16_max256"},
+        {"maximum_generated_states_per_entry",
+         options.analysisMaximumStatesPerEntry},
+    };
+    vc::fiber_tracer::finalizeFiberletDatasetIdentity(result);
+    return result;
+}
+
+std::vector<vc::render::ChunkKey> chunkRouteSourceAnchorChunks(
+    const vc::fiber_tracer::FiberletDatasetMetadata& source,
+    const vc::fiber_tracer::FiberletDatasetMetadata& reduced,
+    const vc::render::ChunkKey& reducedOwner)
+{
+    std::array<int, 3> begin{};
+    std::array<int, 3> end{};
+    const std::array<int, 3> owner{
+        reducedOwner.iz, reducedOwner.iy, reducedOwner.ix};
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        const std::int64_t firstCoordinate =
+            reduced.coordinateOriginZYX[axis] +
+            static_cast<std::int64_t>(owner[axis]) *
+                reduced.coordinateUnitsPerChunkZYX[axis];
+        const std::int64_t reducedEnd = firstCoordinate +
+            reduced.coordinateUnitsPerChunkZYX[axis];
+        const std::int64_t sourceEnd = source.coordinateOriginZYX[axis] +
+            static_cast<std::int64_t>(source.chunkGridShapeZYX[axis]) *
+                source.coordinateUnitsPerChunkZYX[axis];
+        const std::int64_t lastCoordinate =
+            std::min(reducedEnd, sourceEnd) - 1;
+        if (firstCoordinate < source.coordinateOriginZYX[axis] ||
+            lastCoordinate < firstCoordinate) {
+            return {};
+        }
+        begin[axis] = static_cast<int>(
+            (firstCoordinate - source.coordinateOriginZYX[axis]) /
+            source.coordinateUnitsPerChunkZYX[axis]);
+        end[axis] = static_cast<int>(
+            (lastCoordinate - source.coordinateOriginZYX[axis]) /
+            source.coordinateUnitsPerChunkZYX[axis]);
+        begin[axis] = std::clamp(
+            begin[axis], 0, source.chunkGridShapeZYX[axis] - 1);
+        end[axis] = std::clamp(
+            end[axis], 0, source.chunkGridShapeZYX[axis] - 1);
+    }
+    std::vector<vc::render::ChunkKey> result;
+    for (int z = begin[0]; z <= end[0]; ++z) {
+        for (int y = begin[1]; y <= end[1]; ++y) {
+            for (int x = begin[2]; x <= end[2]; ++x)
+                result.push_back({0, z, y, x});
+        }
+    }
+    return result;
+}
+
+template <typename T>
+std::vector<T> canonicalUnion(const std::vector<std::vector<T>>& sets)
+{
+    std::vector<T> result;
+    for (const auto& values : sets)
+        result.insert(result.end(), values.begin(), values.end());
+    std::sort(result.begin(), result.end());
+    result.erase(std::unique(result.begin(), result.end()), result.end());
+    return result;
+}
+
+template <typename T>
+std::vector<T> canonicalIntersection(
+    const std::vector<T>& left, const std::vector<T>& right)
+{
+    std::vector<T> result;
+    std::set_intersection(
+        left.begin(), left.end(), right.begin(), right.end(),
+        std::back_inserter(result));
+    return result;
+}
+
+std::string fingerprintHex(const std::array<std::uint8_t, 32>& value)
+{
+    std::ostringstream result;
+    result << std::hex << std::setfill('0');
+    for (const auto byte : value)
+        result << std::setw(2) << static_cast<unsigned>(byte);
+    return result.str();
+}
+
+double reductionPercent(std::size_t before, std::size_t after)
+{
+    return before == 0
+        ? 0.0
+        : 100.0 * static_cast<double>(before - after) /
+              static_cast<double>(before);
+}
+
+std::string percentString(std::size_t before, std::size_t after)
+{
+    std::ostringstream result;
+    result << std::fixed << std::setprecision(2)
+           << reductionPercent(before, after) << '%';
+    return result.str();
+}
+
+int runChunkRouteStats(
+    CliOptions& options,
+    const vc::lasagna::LasagnaDataset& fiberDataset,
+    const vc::fiber_tracer::FiberPredictionField& field,
+    const vc::fiber_tracer::FiberPredictionGridInfo& grid)
+{
+    using namespace vc::fiber_tracer;
+    resolveAnchorConfig(options, grid);
+    validateFiberletPathConfig(options.paths);
+
+    vc::lasagna::LasagnaDatasetOpenOptions normalOptions;
+    normalOptions.workingToBaseScale = grid.predictionToBaseScale;
+    normalOptions.remoteCacheRoot = options.remoteCacheDirectory;
+    const auto normalDataset = vc::lasagna::LasagnaDataset::openLocation(
+        options.normalManifestLocation, normalOptions);
+    auto normalSampler = std::make_shared<vc::lasagna::LasagnaNormalSampler>(
+        normalDataset,
+        vc::lasagna::LasagnaNormalSamplerOptions{
+            options.decodedCacheBytes});
+
+    const auto evaluation = defaultFiberletReplayQuantization(
+        options.storageChunkSideBaseVoxels);
+    const auto cacheProfile = fiberletGeometryCacheProfile(evaluation);
+    auto anchorMetadata = replayDatasetMetadata(
+        FiberletDatasetKind::Anchors, grid, options, fiberDataset,
+        normalDataset, {}, 0.0, {}, FiberletStorageProfile::Float32Cache,
+        "whole_volume_presence_chunks_v1");
+    auto fiberletMetadata = replayDatasetMetadata(
+        FiberletDatasetKind::Fiberlets, grid, options, fiberDataset,
+        normalDataset, {}, 0.0, cacheProfile,
+        FiberletStorageProfile::Float32Cache,
+        "whole_volume_presence_chunks_v1");
+    auto reducedMetadata = chunkRouteReducedMetadata(options, fiberletMetadata);
+    const auto stageOneBoxes =
+        chunkRouteIntersectingBoxes(options, reducedMetadata);
+    if (stageOneBoxes.empty())
+        fail("selected chunk-route region does not intersect the dataset");
+    const auto stageTwoConfigs = options.analysisMode == ChunkRouteMode::TwoStage
+        ? chunkRouteCenteredBoxes(options, reducedMetadata, stageOneBoxes)
+        : std::vector<FiberletChunkRouteAnalysisConfig>{};
+    if (options.analysisMode == ChunkRouteMode::TwoStage &&
+        stageTwoConfigs.empty()) {
+        fail("selected region contains no complete half-offset analysis box");
+    }
+    const cv::Vec3d selectedMinimum{
+        static_cast<double>(options.analysisChunkMinimumBaseXYZ[0]),
+        static_cast<double>(options.analysisChunkMinimumBaseXYZ[1]),
+        static_cast<double>(options.analysisChunkMinimumBaseXYZ[2])};
+    const double selectedSide =
+        static_cast<double>(options.analysisRegionSizeBaseVoxels);
+    const auto selectedMaximum =
+        selectedMinimum + cv::Vec3d{selectedSide, selectedSide, selectedSide};
+    for (std::size_t zyx = 0; zyx < 3; ++zyx) {
+        const std::size_t xyz = 2 - zyx;
+        const double cellSide =
+            static_cast<double>(reducedMetadata.spatialChunkSideBaseVoxels) /
+            static_cast<double>(
+                reducedMetadata.coordinateUnitsPerChunkZYX[zyx]);
+        const double datasetMinimum =
+            static_cast<double>(reducedMetadata.coordinateOriginZYX[zyx]) *
+            cellSide;
+        const double datasetMaximum = datasetMinimum +
+            static_cast<double>(reducedMetadata.chunkGridShapeZYX[zyx]) *
+                static_cast<double>(
+                    reducedMetadata.spatialChunkSideBaseVoxels);
+        if (selectedMinimum[static_cast<int>(xyz)] < datasetMinimum ||
+            selectedMaximum[static_cast<int>(xyz)] > datasetMaximum) {
+            fail("selected chunk-route region lies outside the dataset grid");
+        }
+    }
+    auto anchorNamespace = anchorMetadata.algorithmFingerprint;
+    auto fiberletNamespace = fiberletMetadata.algorithmFingerprint;
+    std::replace(anchorNamespace.begin(), anchorNamespace.end(), ':', '-');
+    std::replace(fiberletNamespace.begin(), fiberletNamespace.end(), ':', '-');
+    const auto cacheBase = options.outputDirectory / "cache";
+    const auto anchorRoot = options.anchorCacheRoot.empty()
+        ? cacheBase / anchorNamespace / "anchors.zarr"
+        : options.anchorCacheRoot;
+    const auto fiberletRoot = options.fiberletCacheRoot.empty()
+        ? cacheBase / fiberletNamespace / "fiberlets.zarr"
+        : options.fiberletCacheRoot;
+    auto reducedNamespace = reducedMetadata.algorithmFingerprint;
+    std::replace(
+        reducedNamespace.begin(), reducedNamespace.end(), ':', '-');
+    const auto reducedRoot = cacheBase / reducedNamespace /
+        "reduced-fiberlets.zarr";
+
+    const auto evaluationAnchorBytes =
+        std::max<std::size_t>(1, options.decodedCacheBytes / 8);
+    const auto decodedBytes = options.decodedCacheBytes > evaluationAnchorBytes
+        ? options.decodedCacheBytes - evaluationAnchorBytes
+        : options.decodedCacheBytes;
+    auto budget = std::make_shared<vc::render::DecodedChunkCacheBudget>(
+        decodedBytes);
+    FiberletChunkCacheOptions cacheOptions;
+    cacheOptions.service.decodedByteCapacity = options.decodedCacheBytes;
+    cacheOptions.service.decodedByteBudget = budget;
+    cacheOptions.service.fetchConcurrency.workerCapacity =
+        stageOneBoxes.front().config.parallelThreads;
+    cacheOptions.service.fetchConcurrency.maxConcurrentReads =
+        stageOneBoxes.front().config.parallelThreads;
+
+    FiberletOnDemandConfig onDemand;
+    onDemand.anchorRoot = anchorRoot;
+    onDemand.fiberletRoot = fiberletRoot;
+    onDemand.anchorMetadata = std::move(anchorMetadata);
+    onDemand.fiberletMetadata = std::move(fiberletMetadata);
+    onDemand.grid = grid;
+    onDemand.anchorConfig = options.anchors;
+    onDemand.pathConfig = options.paths;
+    // The existing scheduler parallelizes complete storage chunks. Each chunk
+    // keeps its deterministic cell/source ordering and uses one inner worker.
+    onDemand.anchorConfig.parallelThreads = 1;
+    onDemand.pathConfig.parallelThreads = 1;
+    onDemand.geometryQuantization = cacheProfile.geometry;
+    onDemand.evaluationAnchorCacheBytes = evaluationAnchorBytes;
+    onDemand.predictionSampler = [&field](
+        const auto& indices, int threads, auto& samples) {
+        field.sampleStoredGridBatch(indices, threads, samples);
+    };
+    onDemand.normalSampler = normalSampler;
+    onDemand.anchorCellPredicate = [](const std::array<std::size_t, 3>&) {
+        return true;
+    };
+    onDemand.anchorRetainPredicate = [](const FiberAnchor&) {
+        return FiberAnchorRetainEvaluation{true, {}, {}};
+    };
+    onDemand.pointPredicate = [](const cv::Vec3d&) { return true; };
+    onDemand.anchorCacheOptions = cacheOptions;
+    onDemand.fiberletCacheOptions = cacheOptions;
+    auto progress = std::make_shared<ChunkRouteReplayProgress>(
+        options.printStats);
+    onDemand.progress = [progress](const FiberletOnDemandProgress& event) {
+        progress->event(event);
+    };
+    onDemand.chunkResolved =
+        [progress](FiberletStorageChunkKind kind,
+                   const vc::render::ChunkKey& key,
+                   vc::render::ChunkFetchStatus status) {
+            progress->resolve(kind, key, status);
+        };
+    auto preprocessor = FiberletOnDemandPreprocessor::create(
+        std::move(onDemand));
+    struct ShutdownGuard {
+        std::shared_ptr<FiberletOnDemandPreprocessor> value;
+        ~ShutdownGuard()
+        {
+            if (value)
+                value->shutdown();
+        }
+    } shutdown{preprocessor};
+
+    std::map<std::tuple<int, int, int>, vc::render::ChunkKey> sourceOwners;
+    auto addSourcePrefetch = [&](const auto& config) {
+        for (const auto& key : fiberletChunkRoutePrefetchChunks(
+                 preprocessor->fiberletDataset()->metadata(), config)) {
+            sourceOwners.try_emplace(
+                std::tuple{key.iz, key.iy, key.ix}, key);
+        }
+    };
+    if (options.analysisMode == ChunkRouteMode::Stats) {
+        for (const auto& box : stageOneBoxes)
+            addSourcePrefetch(box.config);
+    } else {
+        for (const auto& box : stageOneBoxes)
+            addSourcePrefetch(box.config);
+        for (const auto& config : stageTwoConfigs)
+            addSourcePrefetch(config);
+    }
+    std::vector<FiberletScheduledChunk> prefetch;
+    std::vector<vc::render::ChunkKey> anchorChunks;
+    std::vector<vc::render::ChunkKey> fiberletChunks;
+    for (const auto& [coordinate, key] : sourceOwners) {
+        (void)coordinate;
+        prefetch.push_back({key, 0.0, 0.0});
+        fiberletChunks.push_back(key);
+        const auto dependencies = preprocessor->anchorDependencies(key);
+        anchorChunks.insert(
+            anchorChunks.end(), dependencies.begin(), dependencies.end());
+    }
+    progress->configure(anchorChunks, fiberletChunks);
+    preprocessor->prefetchScheduled(
+        prefetch, 0, prefetch.size(), true);
+    progress->finish();
+
+    FiberletChunkGraphSource graph(
+        preprocessor->anchorDataset(), preprocessor->anchorCache(),
+        preprocessor->fiberletDataset(), preprocessor->fiberletCache(),
+        options.paths,
+        [preprocessor](const vc::render::ChunkKey& key,
+                       std::shared_ptr<const FiberletAnchorChunkPayload> chunk) {
+            return preprocessor->evaluationAnchorChunk(key, std::move(chunk));
+        });
+    std::cout << std::setprecision(17)
+              << "fiberlet_chunk_route_config region_minimum_base_xyz="
+              << options.analysisChunkMinimumBaseXYZ[0] << ','
+              << options.analysisChunkMinimumBaseXYZ[1] << ','
+              << options.analysisChunkMinimumBaseXYZ[2]
+              << " region_size_base_voxels="
+              << options.analysisRegionSizeBaseVoxels
+              << " chunk_size_base_voxels="
+              << options.analysisChunkSizeBaseVoxels
+              << " mode="
+              << (options.analysisMode == ChunkRouteMode::Stats
+                      ? "stats"
+                      : "two_stage")
+              << " stage_one_chunks=" << stageOneBoxes.size()
+              << " stage_two_boxes=" << stageTwoConfigs.size()
+              << " source_cache=" << std::quoted(fiberletRoot.string())
+              << " reduced_cache=" << std::quoted(reducedRoot.string())
+              << '\n';
+
+    if (options.analysisMode == ChunkRouteMode::Stats) {
+        std::vector<std::vector<FiberletStorageId>> originalSets;
+        std::vector<std::vector<FiberletStorageId>> retainedSets;
+        std::vector<std::vector<FiberletStorageId>> originalInternalSets;
+        std::vector<std::vector<FiberletStorageId>> retainedInternalSets;
+        const auto started = std::chrono::steady_clock::now();
+        for (std::size_t index = 0; index < stageOneBoxes.size(); ++index) {
+            const auto report = analyzeFiberletChunkRoutes(
+                graph, stageOneBoxes[index].config);
+            originalSets.push_back(report.physicalFiberletIds);
+            retainedSets.push_back(report.retainedPhysicalFiberlets);
+            originalInternalSets.push_back(report.internalFiberletIds);
+            retainedInternalSets.push_back(canonicalIntersection(
+                report.internalFiberletIds,
+                report.retainedPhysicalFiberlets));
+            printRateProgress(
+                "fiberlet chunk analysis", "stats", "boxes_per_second",
+                index + 1, stageOneBoxes.size(),
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - started).count());
+            if (options.printStats) {
+                std::cout << "fiberlet_chunk_route_box index=" << index
+                          << " fiberlets_before="
+                          << report.physicalFiberlets
+                          << " fiberlets_after="
+                          << report.usedPhysicalFiberlets
+                          << " internal_before="
+                          << report.internalFiberlets
+                          << " internal_after="
+                          << report.usedInternalFiberlets
+                          << " elapsed_seconds=" << report.elapsedSeconds
+                          << '\n';
+            }
+        }
+        const auto original = canonicalUnion(originalSets);
+        const auto retained = canonicalUnion(retainedSets);
+        const auto originalInternal = canonicalUnion(originalInternalSets);
+        const auto retainedInternal = canonicalUnion(retainedInternalSets);
+        std::cout << std::left
+                  << std::setw(12) << "scope"
+                  << std::setw(19) << "fiberlets_before"
+                  << std::setw(18) << "fiberlets_after"
+                  << "fiberlets_reduction\n"
+                  << std::setw(12) << "all"
+                  << std::setw(19) << original.size()
+                  << std::setw(18) << retained.size()
+                  << percentString(original.size(), retained.size()) << '\n'
+                  << std::setw(12) << "interior"
+                  << std::setw(19) << originalInternal.size()
+                  << std::setw(18) << retainedInternal.size()
+                  << percentString(
+                         originalInternal.size(), retainedInternal.size())
+                  << '\n';
+        return 0;
+    }
+
+    auto reducedDataset = FiberletChunkDataset::createOrOpen(
+        reducedRoot, reducedMetadata);
+    const auto reducedViewRoot = reducedRoot.parent_path() /
+        "selected-view.zarr";
+    auto reducedViewDataset = FiberletChunkDataset::createOrOpen(
+        reducedViewRoot, reducedMetadata);
+    std::set<std::tuple<int, int, int>> selectedReducedOwners;
+    for (const auto& box : stageOneBoxes) {
+        selectedReducedOwners.emplace(
+            box.owner.iz, box.owner.iy, box.owner.ix);
+    }
+    auto reducedAnchorMetadata = reducedMetadata;
+    reducedAnchorMetadata.kind = FiberletDatasetKind::Anchors;
+    reducedAnchorMetadata.processing["reduction"]["anchor_view"] =
+        "source_cache_rechunk_v1";
+    finalizeFiberletDatasetIdentity(reducedAnchorMetadata);
+    const auto reducedAnchorRoot = reducedRoot.parent_path() /
+        "anchor-view.zarr";
+    auto reducedAnchorDataset = FiberletChunkDataset::createOrOpen(
+        reducedAnchorRoot, reducedAnchorMetadata);
+    struct ReducedGenerationEntry {
+        std::mutex mutex;
+        bool counted = false;
+    };
+    struct ReducedGenerationState {
+        std::mutex mutex;
+        std::map<std::tuple<int, int, int>,
+                 std::shared_ptr<ReducedGenerationEntry>> entries;
+        std::atomic_size_t generated{0};
+        std::atomic_size_t reused{0};
+    };
+    auto reductionState = std::make_shared<ReducedGenerationState>();
+    auto reducedCache = createGeneratedFiberletChunkCache(
+        reducedDataset,
+        [&, reducedDataset, reductionState](
+            FiberletStorageChunkKind kind,
+            const vc::render::ChunkKey& requested,
+            const FiberletStorageCodecConfig&) {
+            vc::render::ChunkKey owner{
+                0, requested.iz, requested.iy, requested.ix};
+            std::shared_ptr<ReducedGenerationEntry> entry;
+            {
+                std::lock_guard lock(reductionState->mutex);
+                auto& value = reductionState->entries[
+                    std::tuple{owner.iz, owner.iy, owner.ix}];
+                if (!value)
+                    value = std::make_shared<ReducedGenerationEntry>();
+                entry = value;
+            }
+            std::lock_guard entryLock(entry->mutex);
+            auto routeOwner = owner;
+            routeOwner.level = 1;
+            const bool prefixExists = std::filesystem::exists(
+                reducedDataset->chunkPath(
+                    FiberletStorageChunkKind::FiberletPrefix, owner));
+            const bool routeExists = std::filesystem::exists(
+                reducedDataset->chunkPath(
+                    FiberletStorageChunkKind::FiberletRoutes, routeOwner));
+            if (!(prefixExists && routeExists)) {
+                auto config = chunkRouteConfig(
+                    options,
+                    chunkRouteOwnerMinimumExact(reducedMetadata, owner),
+                    static_cast<double>(
+                        reducedMetadata.spatialChunkSideBaseVoxels));
+                config.parallelThreads = 1;
+                const auto report = analyzeFiberletChunkRoutes(graph, config);
+                const auto written = writeReducedFiberletChunk(
+                    graph, reducedDataset, owner,
+                    report.physicalFiberletIds,
+                    report.retainedPhysicalFiberlets);
+                if (!entry->counted) {
+                    if (written.reused)
+                        reductionState->reused.fetch_add(
+                            1, std::memory_order_relaxed);
+                    else
+                        reductionState->generated.fetch_add(
+                            1, std::memory_order_relaxed);
+                    entry->counted = true;
+                }
+            } else if (!entry->counted) {
+                reductionState->reused.fetch_add(
+                    1, std::memory_order_relaxed);
+                entry->counted = true;
+            }
+            auto loaded = reducedDataset->readMaterializedChunk(
+                kind, requested);
+            if (!loaded) {
+                throw std::runtime_error(
+                    "reduced Fiberlet chunk pair is absent after generation");
+            }
+            return std::move(*loaded);
+        },
+        cacheOptions);
+    auto reducedViewCache = createGeneratedFiberletChunkCache(
+        reducedViewDataset,
+        [reducedCache, selectedReducedOwners](
+            FiberletStorageChunkKind kind,
+            const vc::render::ChunkKey& requested,
+            const FiberletStorageCodecConfig& codec) {
+            const auto owner = std::tuple{
+                requested.iz, requested.iy, requested.ix};
+            if (selectedReducedOwners.contains(owner)) {
+                const auto source = reducedCache->getChunkBlocking(
+                    requested.level, requested.iz, requested.iy,
+                    requested.ix);
+                if (source.status != vc::render::ChunkStatus::Data ||
+                    !source.payload) {
+                    throw std::runtime_error(
+                        "selected reduced Fiberlet chunk is unavailable");
+                }
+                return FiberletChunkDataset::MaterializedChunk{
+                    {}, std::move(source.payload), true};
+            }
+            if (kind == FiberletStorageChunkKind::FiberletPrefix) {
+                FiberletDecodedPrefixes decoded{codec, {}};
+                auto bytes = serializeFiberletPrefixes(
+                    decoded.config, decoded.prefixes);
+                auto payload =
+                    std::make_shared<const FiberletPrefixChunkPayload>(
+                        std::move(decoded));
+                return FiberletChunkDataset::MaterializedChunk{
+                    std::move(bytes), std::move(payload), true};
+            }
+            FiberletDecodedRoutes decoded{codec, {}};
+            auto bytes = serializeFiberletRoutes(
+                decoded.config, decoded.routes);
+            auto payload =
+                std::make_shared<const FiberletRouteChunkPayload>(
+                    std::move(decoded));
+            return FiberletChunkDataset::MaterializedChunk{
+                std::move(bytes), std::move(payload), true};
+        },
+        cacheOptions);
+    auto reducedAnchorCache = createGeneratedFiberletChunkCache(
+        reducedAnchorDataset,
+        [preprocessor, reducedMetadata](
+            FiberletStorageChunkKind kind,
+            const vc::render::ChunkKey& requested,
+            const FiberletStorageCodecConfig& codec) {
+            if (kind != FiberletStorageChunkKind::Anchors) {
+                throw std::invalid_argument(
+                    "reduced anchor view received a non-anchor request");
+            }
+            const auto& sourceMetadata =
+                preprocessor->anchorDataset()->metadata();
+            std::vector<FiberletStoredAnchor> anchors;
+            for (const auto& sourceKey : chunkRouteSourceAnchorChunks(
+                     sourceMetadata, reducedMetadata, requested)) {
+                const auto sourceChunk =
+                    preprocessor->anchorCache()->getChunkBlocking(
+                        sourceKey.level, sourceKey.iz, sourceKey.iy,
+                        sourceKey.ix);
+                const auto sourcePayload = std::dynamic_pointer_cast<
+                    const FiberletAnchorChunkPayload>(sourceChunk.payload);
+                if (sourceChunk.status != vc::render::ChunkStatus::Data ||
+                    !sourcePayload) {
+                    throw std::runtime_error(
+                        "reduced anchor view could not load a source chunk");
+                }
+                const auto evaluated =
+                    preprocessor->evaluationAnchorChunk(
+                        sourceKey, sourcePayload);
+                for (const auto& anchor : *evaluated) {
+                    const auto owner = fiberletStorageOwnerChunk(
+                        reducedMetadata, anchor.key, 0);
+                    if (owner.iz == requested.iz &&
+                        owner.iy == requested.iy &&
+                        owner.ix == requested.ix) {
+                        anchors.push_back(anchor);
+                    }
+                }
+            }
+            std::sort(
+                anchors.begin(), anchors.end(), [](const auto& left,
+                                                    const auto& right) {
+                    return left.key < right.key;
+                });
+            if (std::adjacent_find(
+                    anchors.begin(), anchors.end(), [](const auto& left,
+                                                       const auto& right) {
+                        return left.key == right.key;
+                    }) != anchors.end()) {
+                throw std::runtime_error(
+                    "reduced anchor view found duplicate anchor keys");
+            }
+            FiberletDecodedAnchors decoded{codec, std::move(anchors)};
+            auto bytes = serializeFiberletAnchors(
+                decoded.config, decoded.anchors);
+            auto payload =
+                std::make_shared<const FiberletAnchorChunkPayload>(
+                    std::move(decoded));
+            return FiberletChunkDataset::MaterializedChunk{
+                std::move(bytes), std::move(payload), true};
+        },
+        cacheOptions);
+    const auto reductionStarted = std::chrono::steady_clock::now();
+    std::vector<vc::render::ChunkKey> stageOneRequests;
+    for (const auto& box : stageOneBoxes) {
+        stageOneRequests.push_back(box.owner);
+        auto routes = box.owner;
+        routes.level = 1;
+        stageOneRequests.push_back(routes);
+        const bool prefixExists = std::filesystem::exists(
+            reducedDataset->chunkPath(
+                FiberletStorageChunkKind::FiberletPrefix, box.owner));
+        const bool routeExists = std::filesystem::exists(
+            reducedDataset->chunkPath(
+                FiberletStorageChunkKind::FiberletRoutes, routes));
+        if (prefixExists && routeExists) {
+            std::lock_guard lock(reductionState->mutex);
+            auto& entry = reductionState->entries[
+                std::tuple{box.owner.iz, box.owner.iy, box.owner.ix}];
+            if (!entry)
+                entry = std::make_shared<ReducedGenerationEntry>();
+            if (!entry->counted) {
+                entry->counted = true;
+                reductionState->reused.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+        }
+    }
+    reducedCache->prefetchChunks(stageOneRequests, false);
+    for (std::size_t index = 0; index < stageOneBoxes.size(); ++index) {
+        const auto& owner = stageOneBoxes[index].owner;
+        auto prefix = reducedCache->getChunkBlocking(
+            owner.level, owner.iz, owner.iy, owner.ix);
+        auto routeOwner = owner;
+        routeOwner.level = 1;
+        auto routes = reducedCache->getChunkBlocking(
+            routeOwner.level, routeOwner.iz, routeOwner.iy, routeOwner.ix);
+        if (prefix.status != vc::render::ChunkStatus::Data ||
+            routes.status != vc::render::ChunkStatus::Data) {
+            throw std::runtime_error(
+                "stage-one reduced Fiberlet chunk generation failed");
+        }
+        printRateProgress(
+            "fiberlet chunk reduction", "stage1", "chunks_per_second",
+            index + 1, stageOneBoxes.size(),
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - reductionStarted).count());
+    }
+    FiberletChunkGraphSource reducedGraph(
+        reducedAnchorDataset, reducedAnchorCache,
+        reducedViewDataset, reducedViewCache, options.paths,
+        {});
+
+    std::vector<std::vector<FiberletStorageId>> originalSets;
+    std::vector<std::vector<FiberletStorageId>> originalInternalSets;
+    std::vector<std::vector<FiberletStorageId>> stageOneSets;
+    std::vector<std::vector<FiberletStorageId>> stageOneInternalSets;
+    std::vector<std::vector<FiberletStorageId>> stageTwoSets;
+    std::vector<std::vector<FiberletStorageId>> stageTwoInternalSets;
+    const auto stageTwoStarted = std::chrono::steady_clock::now();
+    for (std::size_t index = 0; index < stageTwoConfigs.size(); ++index) {
+        const auto original = collectFiberletChunkRoutePopulation(
+            graph, stageTwoConfigs[index]);
+        const auto reduced = analyzeFiberletChunkRoutes(
+            reducedGraph, stageTwoConfigs[index]);
+        originalSets.push_back(original.physicalFiberletIds);
+        originalInternalSets.push_back(original.internalFiberletIds);
+        stageOneSets.push_back(reduced.physicalFiberletIds);
+        stageOneInternalSets.push_back(reduced.internalFiberletIds);
+        stageTwoSets.push_back(reduced.retainedPhysicalFiberlets);
+        stageTwoInternalSets.push_back(canonicalIntersection(
+            reduced.internalFiberletIds,
+            reduced.retainedPhysicalFiberlets));
+        printRateProgress(
+            "fiberlet chunk reduction", "stage2", "boxes_per_second",
+            index + 1, stageTwoConfigs.size(),
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - stageTwoStarted).count());
+    }
+    const auto original = canonicalUnion(originalSets);
+    const auto originalInternal = canonicalUnion(originalInternalSets);
+    const auto stageOne = canonicalUnion(stageOneSets);
+    const auto stageOneInternal = canonicalUnion(stageOneInternalSets);
+    const auto stageTwo = canonicalUnion(stageTwoSets);
+    const auto stageTwoInternal = canonicalUnion(stageTwoInternalSets);
+    std::cout << "fiberlet_chunk_reduction_cache generated="
+              << reductionState->generated.load(std::memory_order_relaxed)
+              << " reused="
+              << reductionState->reused.load(std::memory_order_relaxed)
+              << " root=" << std::quoted(reducedRoot.string()) << '\n';
+    std::cout << std::left
+              << std::setw(12) << "scope"
+              << std::setw(19) << "original_before"
+              << std::setw(18) << "stage1_after"
+              << std::setw(18) << "stage2_after"
+              << std::setw(18) << "total_reduction"
+              << "stage2_reduction\n"
+              << std::setw(12) << "all"
+              << std::setw(19) << original.size()
+              << std::setw(18) << stageOne.size()
+              << std::setw(18) << stageTwo.size()
+              << std::setw(18) << percentString(
+                     original.size(), stageTwo.size())
+              << percentString(stageOne.size(), stageTwo.size()) << '\n'
+              << std::setw(12) << "interior"
+              << std::setw(19) << originalInternal.size()
+              << std::setw(18) << stageOneInternal.size()
+              << std::setw(18) << stageTwoInternal.size()
+              << std::setw(18) << percentString(
+                     originalInternal.size(), stageTwoInternal.size())
+              << percentString(
+                     stageOneInternal.size(), stageTwoInternal.size())
+              << '\n';
+    reducedCache->cancelPendingAndWait();
+    reducedViewCache->cancelPendingAndWait();
+    reducedAnchorCache->cancelPendingAndWait();
+    return 0;
 }
 
 vc::fiber_tracer::ForwardPolylineArcInterval resolveReplayInterval(
@@ -1562,11 +2652,19 @@ public:
 
     void finish()
     {
+        std::optional<ReplayPreprocessingSnapshot> finalPreprocessing;
+        {
+            std::lock_guard lock(mutex_);
+            if (preprocessing_)
+                finalPreprocessing = preprocessing_->snapshot();
+        }
         disablePreprocessing();
         stopTicker();
         std::lock_guard lock(mutex_);
         if (!enabled_ || finished_)
             return;
+        if (finalPreprocessing)
+            updatePreprocessingLocked(*finalPreprocessing);
         renderLocked(true, true);
         finished_ = true;
         lineOpen_ = false;
@@ -1613,6 +2711,7 @@ private:
         const double resolved = static_cast<double>(snapshot.resolvedAnchors) + prefixWeight * static_cast<double>(snapshot.resolvedPrefixes);
         const double fraction = expected > 0.0 ? std::clamp(resolved / expected, 0.0, 1.0) : 1.0;
         preprocessingFraction_ = std::max(preprocessingFraction_, fraction);
+        preprocessingSnapshot_ = snapshot;
     }
 
     void tickerLoop()
@@ -1728,8 +2827,14 @@ private:
             }
         } else {
             bool needsSeparator = false;
-            if (preprocessingStarted_ && preprocessingFraction_ < 1.0) {
+            if (preprocessingStarted_ &&
+                (preprocessingFraction_ < 1.0 || !traceStarted_)) {
                 appendProgressMetric(line, "cache/prep", preprocessingFraction_, preprocessingStart_, now);
+                line << " anchors=" << preprocessingSnapshot_.resolvedAnchors
+                     << '/' << preprocessingSnapshot_.expectedAnchors
+                     << " fiberlets="
+                     << preprocessingSnapshot_.resolvedPrefixes << '/'
+                     << preprocessingSnapshot_.expectedPrefixes;
                 needsSeparator = true;
             }
             if (needsSeparator && traceStarted_)
@@ -1776,6 +2881,7 @@ private:
     double greedyFraction_ = 0.0;
     double fiberletFraction_ = 0.0;
     double preprocessingFraction_ = 0.0;
+    ReplayPreprocessingSnapshot preprocessingSnapshot_;
     std::shared_ptr<ReplayPreprocessingProgress> preprocessing_;
     std::string outputStage_;
     std::optional<std::size_t> outputCompleted_;
@@ -1795,6 +2901,73 @@ private:
     bool tickerStop_ = false;
     std::thread ticker_;
 };
+
+struct ChunkRouteReplayProgress::Impl {
+    explicit Impl(bool verboseOutput)
+        : preprocessing(std::make_shared<ReplayPreprocessingProgress>()),
+          overall(true, "fiberlet chunk stats"),
+          verbose(verboseOutput)
+    {
+    }
+
+    std::shared_ptr<ReplayPreprocessingProgress> preprocessing;
+    ReplayOverallProgress overall;
+    bool verbose = false;
+    bool finished = false;
+};
+
+ChunkRouteReplayProgress::ChunkRouteReplayProgress(bool verbose)
+    : impl_(std::make_unique<Impl>(verbose))
+{
+}
+
+ChunkRouteReplayProgress::~ChunkRouteReplayProgress() = default;
+
+void ChunkRouteReplayProgress::configure(
+    std::span<const vc::render::ChunkKey> anchorChunks,
+    std::span<const vc::render::ChunkKey> fiberletChunks)
+{
+    std::set<ReplayChunkId> anchors;
+    std::set<ReplayChunkId> fiberlets;
+    for (const auto& key : anchorChunks)
+        anchors.insert({key.level, key.iz, key.iy, key.ix});
+    for (const auto& key : fiberletChunks)
+        fiberlets.insert({key.level, key.iz, key.iy, key.ix});
+    impl_->preprocessing->configure(
+        std::move(anchors), std::move(fiberlets));
+    impl_->overall.attachPreprocessing(impl_->preprocessing);
+}
+
+void ChunkRouteReplayProgress::resolve(
+    vc::fiber_tracer::FiberletStorageChunkKind kind,
+    const vc::render::ChunkKey& key,
+    vc::render::ChunkFetchStatus status)
+{
+    impl_->preprocessing->resolve(kind, key, status);
+}
+
+void ChunkRouteReplayProgress::event(
+    const vc::fiber_tracer::FiberletOnDemandProgress& event)
+{
+    if (!impl_->verbose || event.status != "completed")
+        return;
+    std::ostringstream line;
+    line << "fiberlet_chunk_route_cache stage=" << event.stage
+         << " status=" << event.status << " key=" << event.key.iz << ','
+         << event.key.iy << ',' << event.key.ix
+         << " inputs=" << event.inputCount
+         << " outputs=" << event.outputCount
+         << " elapsed_seconds=" << event.elapsedSeconds;
+    impl_->overall.printEventLine(line.str());
+}
+
+void ChunkRouteReplayProgress::finish()
+{
+    if (impl_->finished)
+        return;
+    impl_->overall.finish();
+    impl_->finished = true;
+}
 
 void printRateProgress(const char* prefix, const std::string& phase, const char* rateName, size_t completed, size_t total, double elapsedSeconds)
 {
@@ -3351,6 +4524,9 @@ int main(int argc, char** argv)
         const auto dataset = vc::lasagna::LasagnaDataset::openLocation(options.manifestLocation, openOptions);
         const vc::fiber_tracer::FiberPredictionField field(dataset, options.decodedCacheBytes, vc::fiber_tracer::FiberPredictionFieldBindingMode::CanonicalStoredGrid);
         const auto grid = field.storedGridInfo();
+
+        if (isChunkRouteStatsCommand(options.command))
+            return runChunkRouteStats(options, dataset, field, grid);
 
         if (isWholeVolumeCommand(options.command))
             return runWholeVolumePreprocessing(options, dataset, field, grid);

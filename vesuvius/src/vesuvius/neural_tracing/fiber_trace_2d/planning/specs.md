@@ -3653,6 +3653,68 @@
   geometry may be released by its owning search worker. Neither operation may
   change candidate order, per-candidate arithmetic, graph identity, or encoded
   payload bytes.
+
+## Chunk-local optimal Fiberlet-route diagnostic
+
+- `vc_fiberlets chunk-route-stats` is a read-only graph diagnostic using the
+  regular on-demand anchor and fiberlet cache infrastructure. Its analysis
+  chunk is an axis-aligned, half-open base-coordinate box `[minimum, maximum)`
+  selected by a base-XYZ minimum and a base-voxel side. The analysis box is
+  independent of persistent cache chunk ownership and replay lookahead; route
+  traversal continues until first exit even when it exceeds either side or the
+  regular replay horizon.
+- An anchor belongs to the analysis chunk according to its stored base-space
+  position. The analyzed physical-fiberlet population contains every fiberlet
+  with at least one endpoint inside. A directed outside-to-inside arc is an
+  entry and an inside-to-outside arc is an exit. A route starts with its entry
+  arc and terminates at its first exit; an outside/outside fiberlet is not an
+  internal graph decision and is excluded.
+- Routes are simple. Entry initialization marks both the outside source and
+  inside target visited, and every later target is rejected when that anchor
+  already occurs in the route. Consequently neither an anchor nor a physical
+  fiberlet can be revisited. A route may curve back spatially and leave through
+  any face only through a sequence of ordinary valid joins; this never permits
+  a cycle or an unconstrained turn.
+- Every transition uses the same strict maximum anchor-join angle, prediction
+  validity check, and normal/tangent-aware local join objective as regular
+  cached replay. Entry, internal, and first-exit edge costs and intervening
+  joins are each charged exactly once. The selected stored-float or fixed
+  sqrt-`uint16` edge-cost view is explicit; join costs remain float.
+- Each entry is solved independently by exact nonnegative additive-cost search.
+  All exactly equal minimum-loss completions contribute to the retained union.
+  The diagnostic reports reachable entries, tied optima, route length/loss
+  distributions, and the union of inside anchors and physical fiberlets used
+  by any optimum. Internal-Fiberlet before/after counts and reduction are
+  reported independently of boundary-crossing entry/exit Fiberlets. Exceeding
+  the per-entry state bound fails the complete diagnostic rather than
+  publishing partial pruning statistics.
+- Missing anchor or fiberlet chunks are generated and persisted through the
+  same `FiberletOnDemandPreprocessor`, separate cache participants, dependency
+  halo, serialization, and shared decoded-byte LRU used by tracing. Generated
+  payloads are canonical full storage chunks whose identity does not depend on
+  the analysis box. Existing compatible chunks are reused; a hot pass does not
+  rewrite them. Incompatible metadata, generation/decode failure, invalid
+  costs, or invalid geometry fail the complete diagnostic. The command never
+  rewrites or prunes existing graph payloads and never marks a partial cache
+  complete.
+- Regional two-stage mode maps a base-coordinate target region to globally
+  aligned analysis owners. The target region is selection only and is excluded
+  from reduced-dataset identity. Each selected owner publishes a complete
+  retained prefix/route pair in the global fingerprinted reduced cache; hot
+  pairs are reused byte-for-byte.
+- Stage two uses equal-size boxes offset by half the analysis side and fully
+  contained in the selected region. Its graph exposes exactly the selected
+  stage-one reduced owners. Incident-halo requests outside that set return
+  ephemeral empty payloads and may neither generate nor publish reduction
+  chunks. The original anchor cache is presented through a decoded-cache-bound
+  rechunked view matching reduced Fiberlet ownership without copying or
+  regenerating anchors.
+- Regional counts are canonical unique physical IDs. The report compares the
+  original source population, its stage-one reduced population, and the
+  stage-two retained population in the same offset boxes, with independent all
+  and internal-Fiberlet reductions. This is an experimental local-pruning
+  diagnostic; box-local optimality is not a proof of global route preservation.
+
 - Dense-reference matching is monotone and local. Greedy supplies its nominal
   step and graph replay each actual dense fiberlet edge length. Failure is the
   first Lasagna-oriented threshold error strictly above `--fail T`; equality is
