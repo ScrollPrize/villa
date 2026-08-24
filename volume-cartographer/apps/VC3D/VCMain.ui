@@ -485,13 +485,6 @@
        <number>2</number>
       </property>
      <item>
-      <widget class="QCheckBox" name="chkCompositeEnabled">
-       <property name="text">
-        <string>Enable Composite View (C)</string>
-       </property>
-      </widget>
-     </item>
-     <item>
       <layout class="QFormLayout" name="formLayout_3">
        <item row="0" column="0">
         <widget class="QLabel" name="lblCompositeMode">
@@ -534,46 +527,6 @@
        <property name="verticalSpacing">
         <number>2</number>
        </property>
-       <item row="0" column="0">
-        <widget class="QLabel" name="lblLayersInFront">
-         <property name="text">
-          <string>Layers In Front</string>
-         </property>
-        </widget>
-       </item>
-       <item row="0" column="1">
-        <widget class="QSpinBox" name="spinLayersInFront">
-         <property name="minimum">
-          <number>0</number>
-         </property>
-         <property name="maximum">
-          <number>64</number>
-         </property>
-         <property name="value">
-          <number>8</number>
-         </property>
-        </widget>
-       </item>
-       <item row="0" column="2">
-        <widget class="QLabel" name="lblLayersBehind">
-         <property name="text">
-          <string>Layers Behind</string>
-         </property>
-        </widget>
-       </item>
-       <item row="0" column="3">
-        <widget class="QSpinBox" name="spinLayersBehind">
-         <property name="minimum">
-          <number>0</number>
-         </property>
-         <property name="maximum">
-          <number>64</number>
-         </property>
-         <property name="value">
-          <number>0</number>
-         </property>
-        </widget>
-       </item>
        <item row="1" column="0">
         <widget class="QLabel" name="lblAlphaMin">
          <property name="text">
@@ -593,7 +546,7 @@
           <number>10</number>
          </property>
          <property name="value">
-          <number>170</number>
+          <number>0</number>
          </property>
         </widget>
        </item>
@@ -663,7 +616,83 @@
          </property>
         </widget>
        </item>
-       <item row="3" column="0" colspan="2">
+      </layout>
+     </item>
+     <item>
+      <widget class="Line" name="lineFlattenedComposite">
+       <property name="orientation">
+        <enum>Qt::Horizontal</enum>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QLabel" name="lblFlattenedCompositeHeader">
+       <property name="text">
+        <string>Flattened View</string>
+       </property>
+       <property name="font">
+        <font>
+         <bold>true</bold>
+        </font>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QCheckBox" name="chkCompositeEnabled">
+       <property name="text">
+        <string>Enable Composite View (C)</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <layout class="QGridLayout" name="flattenedCompositeGrid">
+       <property name="horizontalSpacing">
+        <number>4</number>
+       </property>
+       <property name="verticalSpacing">
+        <number>2</number>
+       </property>
+       <item row="0" column="0">
+        <widget class="QLabel" name="lblLayersInFront">
+         <property name="text">
+          <string>Layers In Front</string>
+         </property>
+        </widget>
+       </item>
+       <item row="0" column="1">
+        <widget class="QSpinBox" name="spinLayersInFront">
+         <property name="minimum">
+          <number>0</number>
+         </property>
+         <property name="maximum">
+          <number>64</number>
+         </property>
+         <property name="value">
+          <number>8</number>
+         </property>
+        </widget>
+       </item>
+       <item row="0" column="2">
+        <widget class="QLabel" name="lblLayersBehind">
+         <property name="text">
+          <string>Layers Behind</string>
+         </property>
+        </widget>
+       </item>
+       <item row="0" column="3">
+        <widget class="QSpinBox" name="spinLayersBehind">
+         <property name="minimum">
+          <number>0</number>
+         </property>
+         <property name="maximum">
+          <number>64</number>
+         </property>
+         <property name="value">
+          <number>0</number>
+         </property>
+        </widget>
+       </item>
+       <item row="1" column="0" colspan="2">
         <widget class="QCheckBox" name="chkReverseDirection">
          <property name="text">
           <string>Reverse Direction</string>
@@ -682,7 +711,7 @@
      <item>
       <widget class="QLabel" name="lblPlaneCompositeHeader">
        <property name="text">
-        <string>Plane View Composite (XY/XZ/YZ)</string>
+        <string>Plane View (XY/XZ/YZ)</string>
        </property>
        <property name="font">
         <font>
@@ -770,6 +799,13 @@
          </property>
          <property name="toolTip">
           <string>Number of layers behind the plane</string>
+         </property>
+        </widget>
+       </item>
+       <item row="1" column="0" colspan="2">
+        <widget class="QCheckBox" name="chkPlaneReverseDirection">
+         <property name="text">
+          <string>Reverse Direction</string>
          </property>
         </widget>
        </item>

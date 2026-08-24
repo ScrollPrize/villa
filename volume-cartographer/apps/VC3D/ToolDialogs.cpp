@@ -3155,11 +3155,10 @@ QString GrowTrackPatchesDialog::scriptPath() const
 {
     const QString appDir = QCoreApplication::applicationDirPath();
     const QStringList candidates = {
-        QDir(appDir).filePath("../scripts/spiral/grow_track_graph.py"),
-        QDir(appDir).filePath("../../scripts/spiral/grow_track_graph.py"),
-        QDir(appDir).filePath("scripts/spiral/grow_track_graph.py"),
-        QDir(QDir::currentPath()).filePath("scripts/spiral/grow_track_graph.py"),
-        QDir(QDir::currentPath()).filePath("volume-cartographer/scripts/spiral/grow_track_graph.py"),
+        QDir(appDir).filePath("../../../spiral-fitting/grow_track_graph.py"),
+        QDir(appDir).filePath("../../../../spiral-fitting/grow_track_graph.py"),
+        QDir(QDir::currentPath()).filePath("spiral-fitting/grow_track_graph.py"),
+        QDir(QDir::currentPath()).filePath("../spiral-fitting/grow_track_graph.py"),
         QDir(appDir).filePath("../share/volume-cartographer/spiral/grow_track_graph.py"),
     };
     for (const auto& c : candidates) {
@@ -3293,7 +3292,7 @@ void GrowTrackPatchesDialog::accept()
 
     const QString script = scriptPath();
     if (!QFileInfo(script).isFile()) {
-        QMessageBox::warning(this, tr("Grow Track Patches"), tr("grow_track_graph.py not found at %1\n\nExpected at /home/sean/villa/volume-cartographer/scripts/spiral/grow_track_graph.py or relative to the application.").arg(script));
+        QMessageBox::warning(this, tr("Grow Track Patches"), tr("grow_track_graph.py not found at %1\n\nExpected under the repository's spiral-fitting directory or relative to the application.").arg(script));
         return;
     }
 

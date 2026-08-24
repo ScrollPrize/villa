@@ -81,6 +81,11 @@ vc_add_test(NAME test_segmentation_autosave_state
 vc_add_test(NAME test_surface_display_name
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
+vc_add_test(NAME test_volumetric_compositor
+    SOURCES test_volumetric_compositor.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/VolumetricCompositor.cpp
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
 vc_add_test(NAME test_segmentation_intersection_invalidation
     LIBS Qt6::Core Qt6::Gui Qt6::Test vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
@@ -326,6 +331,10 @@ endif()
 add_executable(bench_chunked_plane_sampler bench_chunked_plane_sampler.cpp)
 target_link_libraries(bench_chunked_plane_sampler PRIVATE doctest::doctest vc_core)
 vc_register_test_target(bench_chunked_plane_sampler)
+
+add_executable(bench_chunk_cache_source_mirror bench_chunk_cache_source_mirror.cpp)
+target_link_libraries(bench_chunk_cache_source_mirror PRIVATE vc_core)
+vc_register_test_target(bench_chunk_cache_source_mirror)
 # Perf guard for the slice sampler hot path. Like bench_volume_sample it
 # carries only a loose wall-clock assertion, so it stays out of default
 # ctest unless the user opts in via VC_RUN_BENCHES; the target is always
@@ -943,8 +952,6 @@ vc_add_test(NAME test_vcdataset_compressors)
 vc_add_test(NAME test_volume_static_read)
 
 vc_add_test(NAME test_volume_pyramid)
-
-vc_add_test(NAME test_cache_compression)
 
 vc_add_test(NAME test_chunk_cache_persist)
 

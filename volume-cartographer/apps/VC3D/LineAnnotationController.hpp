@@ -121,6 +121,76 @@ public:
             vc3d::line_annotation::FiberTraceState::Legacy;
     };
 
+    // Read-only network snapshot for the Fiber Map workspace: every loaded
+    // fiber's unrolling inputs plus the scroll umbilicus, in one pass.
+    struct FiberMapLink {
+        int controlPointIndex = -1;
+        uint64_t branchFiberId = 0;
+        int branchControlPointIndex = -1;
+        // Mirrors FiberBranchRef::pending: the link still awaits reviewer
+        // approval, and the map colours it like the annotation views do.
+        bool pending = false;
+    };
+
+    struct FiberMapFiber {
+        // Runtime id, valid only for the generation this snapshot was taken in.
+        uint64_t id = 0;
+        // Stable identity across loads; the runtime id is reassigned per load,
+        // so anything acted on later must be resolved from this.
+        std::string fileName;
+        // "<file prefix>-<sequence>", e.g. "kb-604".
+        QString label;
+        char hvTag = '?';
+        std::vector<cv::Vec3d> controlPoints;
+        std::vector<cv::Vec3d> linePoints;
+        // Per control-point span; size max(0, controlPoints.size() - 1).
+        std::vector<bool> tracedSegments;
+        // Branch links resolving to a loaded fiber, pending included.
+        std::vector<FiberMapLink> links;
+    };
+
+    struct FiberMapSnapshot {
+        std::vector<FiberMapFiber> fibers;
+        // The frame this snapshot's geometry was derived in. Reported rather than
+        // left for a holder to re-derive: a second call to annotationFrame()
+        // reads live volume state and so could answer differently, which would
+        // tag a layout with a frame it was not built in.
+        vc3d::annotation::AnnotationFrame frame;
+        // fiberDataGeneration() when this snapshot was taken; a holder compares
+        // it to know whether what it built from this is still current.
+        uint64_t generation = 0;
+        // Umbilicus control points scaled into the fibers' frame, sorted by z;
+        // empty when no plausible umbilicus was found.
+        std::vector<cv::Vec3f> umbilicusCenters;
+        // Physical size of one voxel of the frame the fibers are annotated in,
+        // in µm. Unset when the package cannot say: no coordinate identity to
+        // read it from and no volume to fall back on. There is no default on
+        // purpose — a guessed voxel size turns every derived physical figure
+        // (cm, reference radii, scroll height) silently wrong, so consumers
+        // must handle the unset case and show voxels instead.
+        std::optional<double> voxelSizeUm;
+        // Scroll z extent in the fibers' frame, i.e. the current volume's slice
+        // count scaled back to the annotation (level 0) resolution; 0 when the
+        // volume is unknown.
+        int annotationZSlices = 0;
+        QString umbilicusMessage;           // resolver error / ambiguity text; empty on success
+        // Ready-to-display description of the frame the scale maps from, for
+        // workspace status bars: the stamped volume and its level offset when
+        // the ratio is a power of two, the stamped grid size otherwise, or the
+        // bare guessed factor. Carries the stamp-mismatch and registered-volume
+        // notes when either check fires. Empty when no umbilicus was applied.
+        QString umbilicusLabel;
+    };
+
+    // One-line umbilicus availability summary for workspace status bars:
+    // "<fileName>" on success (with " (unstamped)" suffix when the file
+    // declares no voxelsize_um), empty when no package is loaded, and a
+    // shortened form of the resolver's error otherwise.
+    struct UmbilicusStatus {
+        bool available = false;
+        QString text;
+    };
+
     struct FiberSnapshotWithPath {
         std::filesystem::path fiberPath;
         vc::atlas::FiberPolyline fiber;
@@ -222,7 +292,43 @@ public:
                                               const QPointF& scenePoint,
                                               const QPoint& globalPos);
     [[nodiscard]] std::vector<FiberSummary> fiberSummaries() const;
+    [[nodiscard]] FiberMapSnapshot fiberMapSnapshot() const;
+    // Resolves the package's umbilicus for a status line only; nothing is
+    // cached, so call it on user-visible state changes rather than per frame.
+    [[nodiscard]] UmbilicusStatus umbilicusStatus() const;
+    // The frame line points and control points are expressed in: the current
+    // volume's grid carried to the resolution the fibers were annotated at.
+    // Default-constructed (no voxel size, zero extent) when no volume is loaded.
+    // Holders of derived geometry compare it to know whether what they built is
+    // still in a frame that means anything.
+    [[nodiscard]] vc3d::annotation::AnnotationFrame annotationFrame() const;
+    // Cheap token over everything resolveScrollUmbilicus() depends on: the
+    // project's field plus a stat() of each path the resolver's own scan reports,
+    // and no JSON parse. Size and mtime, so it is a metadata token rather than a
+    // guarantee -- a same-size rewrite inside one timestamp tick is invisible to
+    // it. It covers the file changing underneath VC3D, which no counter reports;
+    // for attach and detach it overlaps umbilicusGeneration(), which holders
+    // still compare as the reviewer-prescribed mechanism for in-app changes.
+    [[nodiscard]] QString umbilicusFingerprint() const;
     [[nodiscard]] std::vector<FiberLinkOverlayInfo> fiberLinkOverlayInfos() const;
+    // Bumped whenever the loaded fiber set changes (load, save, delete, and the
+    // edits that refresh the fiber summaries). Holders of derived data compare
+    // it to decide whether what they built is still current; runtime fiber ids
+    // are only meaningful within one generation. Deliberately an
+    // over-approximation: edits that a given holder's snapshot never reads
+    // (generic tag changes, say) still bump, because a needless rebuild prompt
+    // is bounded while a missed one shows a wrong picture.
+    [[nodiscard]] uint64_t fiberDataGeneration() const { return _fiberDataGeneration; }
+    // Bumped when the project is replaced. A counter rather than a signal so that
+    // a derived view which may never be opened costs nothing to keep informed:
+    // bumping is an integer store, and the holder decides when to look. Kept apart
+    // from umbilicusGeneration() because they mean different things to a holder —
+    // a new project invalidates its data outright, while a new umbilicus only
+    // moves where that data lands.
+    [[nodiscard]] uint64_t packageGeneration() const { return _packageGeneration; }
+    // Runtime id of the loaded fiber with this file name, or 0 when the package
+    // no longer holds it. The stable way to act on a fiber recorded earlier.
+    [[nodiscard]] uint64_t fiberIdForFileName(const std::string& fileName) const;
     // Display name as shown in the fiber panel (file stem, "unnamed" fallback).
     [[nodiscard]] QString fiberDisplayName(uint64_t fiberId) const;
     [[nodiscard]] std::vector<std::string> knownFiberTags() const;
@@ -557,10 +663,6 @@ private:
                                          bool retraceAll,
                                          std::optional<std::vector<size_t>> dirtySegments = std::nullopt,
                                          bool globalGoalsOnly = false) const;
-    // The frame line points and control points are expressed in: the current
-    // volume's grid carried to the resolution the fibers were annotated at.
-    // Default-constructed (no voxel size, zero extent) when no volume is loaded.
-    [[nodiscard]] vc3d::annotation::AnnotationFrame annotationFrame() const;
     // Drops the cached scroll umbilicus and everything describing it, so the next
     // use resolves again.
     void invalidateScrollUmbilicus();
@@ -582,10 +684,25 @@ private:
     // cached umbilicus's key, so fixing a refused file, editing a transform in
     // place, or a new candidate appearing all reach the views.
     [[nodiscard]] QString umbilicusCacheToken() const;
+    // The umbilicus half of fiberMapSnapshot(): the resolver's answer brought
+    // into the fibers' frame through the shared derivation, or the message
+    // saying why it could not be. Empty centers with an empty message mean the
+    // resolved file had no points, or no package is loaded.
+    struct SnapshotUmbilicus {
+        std::vector<cv::Vec3f> centers;  // scaled into the fibers' frame, z-sorted
+        QString label;                   // frame description; empty when refused
+        QString message;                 // resolver/frame error; empty on success
+    };
+    [[nodiscard]] SnapshotUmbilicus umbilicusForSnapshot(
+        const vc3d::annotation::AnnotationFrame& frame) const;
     void onActiveVolumeChanged();
     // Pushes _umbilicusNotice to every open pane's dialog.
     void publishUmbilicusNotice();
     void finishOptimization(const std::string& surfaceName);
+    // Loads the volpkg's scroll umbilicus into the session frame on first use
+    // and caches the (possibly empty) result; re-attempted when the volpkg
+    // root changes.
+    const std::optional<vc::core::util::Umbilicus>& ensureScrollUmbilicusLoaded();
     // Per-line-point sampled sheet normals, sign-oriented away from the
     // scroll center (umbilicus when available, volume XY center otherwise);
     // NaN entries mark invalid samples.
@@ -880,6 +997,13 @@ private:
     // Orienting off the volume centre instead is exactly the silent degradation
     // that hid a frame mismatch for a whole scroll, so it is said out loud.
     QString _umbilicusNotice;
+    // See fiberDataGeneration(). Starts at 1 so a holder's default 0 always
+    // reads as stale. (_umbilicusGeneration above starts at 0 instead; holders
+    // gate every comparison behind having built something, so only these two
+    // rely on the never-matches-a-default property.)
+    uint64_t _fiberDataGeneration = 1;
+    // See packageGeneration(); starts at 1 for the same reason.
+    uint64_t _packageGeneration = 1;
     std::deque<FiberSaveJob> _pendingFiberSaveJobs;
     QPointer<QFutureWatcher<FiberSaveTaskResult>> _fiberSaveWatcher;
     uint64_t _nextFiberSaveSequence = 0;
