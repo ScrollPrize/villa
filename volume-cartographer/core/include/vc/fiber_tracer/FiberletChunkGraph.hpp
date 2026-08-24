@@ -53,6 +53,10 @@ struct FiberletPrefixChunkLease {
     std::shared_ptr<const FiberletPrefixChunkPayload> payloadLease;
 };
 
+struct FiberletRouteChunkLease {
+    std::shared_ptr<const FiberletRouteChunkPayload> payloadLease;
+};
+
 struct FiberletEdgeLease {
     std::shared_ptr<const FiberletPrefixChunkPayload> prefixPayloadLease;
     std::array<std::shared_ptr<const FiberletAnchorChunkPayload>, 2> anchorPayloadLeases;
@@ -102,6 +106,9 @@ public:
     [[nodiscard]] FiberletGraphQuery<FiberletAnchorLease> anchor(const FiberletStorageKey& anchor, bool blocking = false) const;
     [[nodiscard]] FiberletGraphQuery<FiberletAnchorChunkLease> anchorsInChunk(const vc::render::ChunkKey& chunk, bool blocking = false) const;
     [[nodiscard]] FiberletGraphQuery<FiberletPrefixChunkLease> prefixesInChunk(const vc::render::ChunkKey& chunk, bool blocking = false) const;
+    [[nodiscard]] FiberletGraphQuery<FiberletRouteChunkLease> routesInChunk(const vc::render::ChunkKey& chunk, bool blocking = false) const;
+    [[nodiscard]] std::vector<vc::render::ChunkKey> incidentPrefixChunks(
+        std::span<const FiberletStorageKey> anchors) const;
     [[nodiscard]] FiberletGraphQuery<FiberletEdgeLease> edge(const FiberletStorageId& fiberlet, bool blocking = false) const;
     [[nodiscard]] FiberletGraphQuery<FiberletStoredRouteLease> storedRoute(
         const FiberletStorageId& fiberlet, bool blocking = false) const;
@@ -113,6 +120,11 @@ public:
         const FiberletReplaySourceArc& outgoing,
         float maximumJoinAngleDegrees,
         bool blocking = false) const;
+    [[nodiscard]] FiberletGraphQuery<std::optional<FiberletReplaySourceTransition>> transitionAtAnchor(
+        const FiberletReplaySourceArc& incoming,
+        const FiberletReplaySourceArc& outgoing,
+        const FiberletStoredAnchor& sharedAnchor,
+        float maximumJoinAngleDegrees) const;
     [[nodiscard]] const FiberletDatasetMetadata& metadata() const noexcept;
 
 private:
@@ -304,6 +316,24 @@ simplifyFiberletChunkRoutes(
     const FiberletChunkRouteAnalysisConfig& config);
 
 [[nodiscard]] FiberletChunkRouteAnalysisReport analyzeFiberletChunkRoutes(
+    const FiberletChunkGraphSource& graph,
+    const FiberletChunkRouteAnalysisConfig& config);
+
+struct FiberletChunkRouteReductionReport {
+    FiberletChunkRouteAnalysisReport analysis;
+    FiberletChunkRouteSimplificationReport simplification;
+    double materializationSeconds = 0.0;
+    double materializationCpuSeconds = 0.0;
+    double analysisSeconds = 0.0;
+    double analysisCpuSeconds = 0.0;
+    double simplificationSeconds = 0.0;
+    double simplificationCpuSeconds = 0.0;
+};
+
+// Materialize one immutable local graph and use it for both exact route
+// analysis and lossless simplification.
+[[nodiscard]] FiberletChunkRouteReductionReport
+analyzeAndSimplifyFiberletChunkRoutes(
     const FiberletChunkGraphSource& graph,
     const FiberletChunkRouteAnalysisConfig& config);
 

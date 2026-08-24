@@ -1233,13 +1233,105 @@ TEST_CASE("Fiberlet chunk route analysis finds exact simple entry-to-exit optima
     paths.smoothnessTangentWeight = 0.0F;
     FiberletChunkGraphSource graph(
         anchorDataset, generatedAnchorCache,
-        fiberletDataset, generatedFiberletCache, paths);
+        fiberletDataset, generatedFiberletCache, paths,
+        [](const vc::render::ChunkKey&,
+           std::shared_ptr<const FiberletAnchorChunkPayload> payload) {
+            auto transformed =
+                std::make_shared<std::vector<FiberletStoredAnchor>>(
+                    payload->anchors);
+            for (auto& anchor : *transformed)
+                anchor.positionPredictionXYZ[1] += 0.25F;
+            return transformed;
+        });
+    const auto routeChunk = graph.routesInChunk(owner, true);
+    REQUIRE(routeChunk.status == FiberletGraphQueryStatus::Ready);
+    REQUIRE(routeChunk.value.payloadLease);
+    REQUIRE(routeChunk.value.payloadLease->routes.size() == routes.size());
+    for (std::size_t index = 0; index < routes.size(); ++index) {
+        const auto pointRoute = graph.storedRoute(prefixes[index].id, true);
+        REQUIRE(pointRoute.status == FiberletGraphQueryStatus::Ready);
+        CHECK(routeChunk.value.payloadLease->routes[index].middleUV ==
+              pointRoute.value.route.middleUV);
+        CHECK(routeChunk.value.payloadLease->routes[index]
+                  .segmentCostDensities ==
+              pointRoute.value.route.segmentCostDensities);
+    }
     FiberletChunkRouteAnalysisConfig config;
     config.minimumBaseXYZ = {10.0, 10.0, 10.0};
     config.maximumBaseXYZ = {20.0, 20.0, 20.0};
     config.maximumJoinAngleDegrees = 45.0F;
     config.parallelThreads = 4;
     const auto report = analyzeFiberletChunkRoutes(graph, config);
+    auto leftConfig = config;
+    leftConfig.minimumBaseXYZ[0] = 10.0;
+    leftConfig.maximumBaseXYZ[0] = 15.0;
+    auto rightConfig = config;
+    rightConfig.minimumBaseXYZ[0] = 15.0;
+    rightConfig.maximumBaseXYZ[0] = 20.0;
+    const auto leftPopulation = collectFiberletChunkRoutePopulation(
+        graph, leftConfig);
+    const auto rightPopulation = collectFiberletChunkRoutePopulation(
+        graph, rightConfig);
+    std::set<FiberletStorageId> stageAll;
+    stageAll.insert(
+        leftPopulation.physicalFiberletIds.begin(),
+        leftPopulation.physicalFiberletIds.end());
+    stageAll.insert(
+        rightPopulation.physicalFiberletIds.begin(),
+        rightPopulation.physicalFiberletIds.end());
+    std::set<FiberletStorageId> stageInterior;
+    stageInterior.insert(
+        leftPopulation.internalFiberletIds.begin(),
+        leftPopulation.internalFiberletIds.end());
+    stageInterior.insert(
+        rightPopulation.internalFiberletIds.begin(),
+        rightPopulation.internalFiberletIds.end());
+    const FiberletStorageId betweenBoxes{
+        std::min(a, c), std::max(a, c)};
+    CHECK(stageAll.contains(betweenBoxes));
+    CHECK_FALSE(stageInterior.contains(betweenBoxes));
+    CHECK(stageAll.size() > stageInterior.size());
+    auto serialConfig = config;
+    serialConfig.parallelThreads = 1;
+    const auto serialReduction = analyzeAndSimplifyFiberletChunkRoutes(
+        graph, serialConfig);
+    const auto parallelReduction = analyzeAndSimplifyFiberletChunkRoutes(
+        graph, config);
+    CHECK(serialReduction.analysis.physicalFiberletIds ==
+          parallelReduction.analysis.physicalFiberletIds);
+    CHECK(serialReduction.analysis.internalFiberletIds ==
+          parallelReduction.analysis.internalFiberletIds);
+    CHECK(serialReduction.analysis.retainedPhysicalFiberlets ==
+          parallelReduction.analysis.retainedPhysicalFiberlets);
+    CHECK(serialReduction.analysis.generatedSearchStates ==
+          parallelReduction.analysis.generatedSearchStates);
+    CHECK(serialReduction.analysis.expandedSearchStates ==
+          parallelReduction.analysis.expandedSearchStates);
+    CHECK(serialReduction.simplification.livePhysicalFiberletIds ==
+          parallelReduction.simplification.livePhysicalFiberletIds);
+    CHECK(serialReduction.simplification.livePhysicalDirections ==
+          parallelReduction.simplification.livePhysicalDirections);
+    CHECK(serialReduction.simplification.retainedInsideAnchorIds ==
+          parallelReduction.simplification.retainedInsideAnchorIds);
+    CHECK(serialReduction.simplification.boundaryPortalIds ==
+          parallelReduction.simplification.boundaryPortalIds);
+    REQUIRE(serialReduction.simplification.macros.size() ==
+            parallelReduction.simplification.macros.size());
+    for (std::size_t index = 0;
+         index < serialReduction.simplification.macros.size(); ++index) {
+        for (std::size_t reverse = 0; reverse < 2; ++reverse) {
+            const auto& serial = serialReduction.simplification.macros[index]
+                .directions[reverse];
+            const auto& parallel =
+                parallelReduction.simplification.macros[index]
+                    .directions[reverse];
+            CHECK(serial.live == parallel.live);
+            CHECK(serial.physicalFiberlets == parallel.physicalFiberlets);
+            CHECK(serial.anchors == parallel.anchors);
+            CHECK(serial.edgeLosses == parallel.edgeLosses);
+            CHECK(serial.internalJoinLosses == parallel.internalJoinLosses);
+        }
+    }
     CHECK(report.insideAnchors == 7);
     CHECK(report.physicalFiberlets == prefixes.size());
     CHECK(report.physicalFiberletIds.size() == report.physicalFiberlets);

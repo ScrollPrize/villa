@@ -3723,13 +3723,30 @@
   lower-layer incident Fiberlets therefore retain it. Derived stage layers are
   invocation-local and removed after final reporting; persistent/completed
   reduction layers require a later publication protocol.
-- Regional counts are canonical unique IDs over the selected bbox. Each stage
-  reports input/output, per-stage reduction, and cumulative reduction for
-  anchors, all incident Fiberlets, and interior Fiberlets; the joint report
-  compares original and final populations. Interior classification is fixed
-  from initial endpoint geometry. Sequential local pruning is deterministic
-  and monotone but does not prove preservation of a globally optimal replay
-  route for arbitrary later boundaries.
+- Each stage reports only geometry in the union of its complete analysis
+  boxes: inside anchors, the canonical union of all incident Fiberlets, and the
+  canonical union of Fiberlets with both endpoints inside one complete stage
+  box. A Fiberlet crossing between adjacent stage boxes is therefore `all`,
+  not `interior`. Original, inherited input, and output populations use that
+  identical stage-local domain, so offset stages never count untouched
+  selected-bbox geometry. The joint report separately compares original and
+  final anchors, all incident Fiberlets, and interior Fiberlets over the
+  complete selected bbox. Sequential local pruning is deterministic and
+  monotone but does not prove preservation of a globally optimal replay route
+  for arbitrary later boundaries.
+- Exact analysis and simplification consume the same immutable materialized
+  local graph for a box. Materialization loads every required anchor, prefix,
+  and route owner once, applies the configured anchor view once, and constructs
+  arcs and transitions without point cache queries. Transition construction,
+  entry searches, serialization, and independent owner-chunk writes may
+  execute through reusable worker pools and canonical index slots, with
+  deterministic lowest-index failure selection. Exact entry-search workers
+  read the immutable local graph through fixed, disjoint index partitions and
+  own all queue, ancestry, metric, and terminal scratch; their hot search loops
+  perform no scheduling or synchronization. Every replacement is prepared from
+  the old graph before Fiberlet prefix/route pairs are published; anchor chunks
+  publish only after all Fiberlet pairs. Box and stage order remains serial and
+  canonical.
 - Each processed box additionally produces an exact in-memory simplification
   report. A directed state is proven dead only when it is absent
   from either entry-forward or exit-backward reachability. The analysis is

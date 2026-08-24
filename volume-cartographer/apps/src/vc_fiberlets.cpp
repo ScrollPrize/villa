@@ -971,6 +971,70 @@ std::string stringHash(const std::string& value)
     return output.str();
 }
 
+std::string directoryHash(const std::filesystem::path& root)
+{
+    std::vector<std::filesystem::path> files;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
+        if (entry.is_regular_file())
+            files.push_back(entry.path());
+    }
+    std::sort(files.begin(), files.end(), [&](const auto& left, const auto& right) {
+        return std::filesystem::relative(left, root).generic_string() <
+            std::filesystem::relative(right, root).generic_string();
+    });
+    std::uint64_t hash = 14695981039346656037ULL;
+    const auto append = [&](std::span<const char> bytes) {
+        for (const unsigned char byte : bytes) {
+            hash ^= byte;
+            hash *= 1099511628211ULL;
+        }
+    };
+    std::array<char, 64 * 1024> buffer{};
+    for (const auto& path : files) {
+        const auto relative = std::filesystem::relative(path, root).generic_string();
+        append(std::span{relative.data(), relative.size()});
+        const char separator = '\0';
+        append(std::span{&separator, std::size_t{1}});
+        std::ifstream input(path, std::ios::binary);
+        if (!input)
+            throw std::runtime_error("cannot hash file: " + path.string());
+        while (input) {
+            input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+            append(std::span{buffer.data(), static_cast<std::size_t>(input.gcount())});
+        }
+        if (!input.eof())
+            throw std::runtime_error("failed while hashing file: " + path.string());
+    }
+    std::ostringstream output;
+    output << "fnv1a64:" << std::hex << std::setfill('0') << std::setw(16)
+           << hash;
+    return output.str();
+}
+
+std::string fiberletIdHash(
+    std::span<const vc::fiber_tracer::FiberletStorageId> ids)
+{
+    std::uint64_t hash = 14695981039346656037ULL;
+    const auto append = [&](std::uint64_t value) {
+        for (std::size_t byte = 0; byte < sizeof(value); ++byte) {
+            hash ^= static_cast<std::uint8_t>(value & 0xffU);
+            hash *= 1099511628211ULL;
+            value >>= 8;
+        }
+    };
+    for (const auto& id : ids) {
+        for (const auto& endpoint : {id.first, id.second}) {
+            for (const auto coordinate : endpoint.coordinateZYX)
+                append(static_cast<std::uint64_t>(coordinate));
+            append(endpoint.variant);
+        }
+    }
+    std::ostringstream output;
+    output << "fnv1a64:" << std::hex << std::setfill('0') << std::setw(16)
+           << hash;
+    return output.str();
+}
+
 std::string datasetLocator(const vc::lasagna::LasagnaDataset& dataset);
 
 nlohmann::json fiberletSourceIdentity(
@@ -1527,9 +1591,30 @@ void printChunkRouteSimplification(
 
 struct ChunkRouteStagePopulation {
     std::size_t anchors = 0;
-    std::size_t fullFiberlets = 0;
+    std::size_t allFiberlets = 0;
     std::size_t interiorFiberlets = 0;
 };
+
+ChunkRouteStagePopulation collectChunkRouteStagePopulation(
+    const vc::fiber_tracer::FiberletChunkGraphSource& graph,
+    const std::vector<vc::fiber_tracer::FiberletChunkRouteAnalysisConfig>& boxes)
+{
+    using namespace vc::fiber_tracer;
+    ChunkRouteStagePopulation result;
+    std::vector<std::vector<FiberletStorageId>> allSets;
+    std::vector<std::vector<FiberletStorageId>> internalSets;
+    allSets.reserve(boxes.size());
+    internalSets.reserve(boxes.size());
+    for (const auto& box : boxes) {
+        auto population = collectFiberletChunkRoutePopulation(graph, box);
+        result.anchors += population.insideAnchors;
+        allSets.push_back(std::move(population.physicalFiberletIds));
+        internalSets.push_back(std::move(population.internalFiberletIds));
+    }
+    result.allFiberlets = canonicalUnion(allSets).size();
+    result.interiorFiberlets = canonicalUnion(internalSets).size();
+    return result;
+}
 
 int runStagedChunkRouteReduction(
     const CliOptions& options,
@@ -1610,18 +1695,27 @@ int runStagedChunkRouteReduction(
         static_cast<double>(options.analysisRegionSizeBaseVoxels));
     const auto initialPopulation = collectFiberletChunkRoutePopulation(
         initialGraph, selectedConfig);
-    const auto initialInterior = initialPopulation.internalFiberletIds;
-    std::vector<ChunkRouteStagePopulation> populations;
-    populations.push_back({
-        initialPopulation.insideAnchors,
-        initialPopulation.physicalFiberletIds.size(),
-        initialPopulation.internalFiberletIds.size()});
     struct StageActivity {
+        struct Phase {
+            double wallSeconds = 0.0;
+            double cpuSeconds = 0.0;
+        };
         std::size_t boxes = 0;
         std::size_t anchorChunkWrites = 0;
         std::size_t fiberletChunkWrites = 0;
+        Phase materialization;
+        Phase analysis;
+        Phase simplification;
+        Phase write;
+        Phase population;
+        std::string idDigest;
+        std::string payloadDigest;
+        ChunkRouteStagePopulation original;
+        ChunkRouteStagePopulation input;
+        ChunkRouteStagePopulation output;
     };
     std::vector<StageActivity> activities;
+    std::optional<FiberletChunkRoutePopulation> finalSelectedPopulation;
 
     for (std::size_t stageIndex = 0;
          stageIndex < options.analysisStages.size(); ++stageIndex) {
@@ -1629,6 +1723,21 @@ int runStagedChunkRouteReduction(
         const auto boxes = chunkRouteStageBoxes(options, specification);
         if (boxes.empty())
             fail("staged chunk-route reduction produced an empty stage");
+        FiberletChunkGraphSource inputGraph(
+            current.anchors, current.anchorCache, current.fiberlets,
+            current.fiberletCache, options.paths);
+        StageActivity activity;
+        activity.boxes = boxes.size();
+        const auto populationWallStarted = std::chrono::steady_clock::now();
+        const double populationCpuStarted = processCpuSeconds();
+        activity.original = collectChunkRouteStagePopulation(
+            initialGraph, boxes);
+        activity.input = collectChunkRouteStagePopulation(
+            inputGraph, boxes);
+        activity.population.wallSeconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - populationWallStarted).count();
+        activity.population.cpuSeconds +=
+            processCpuSeconds() - populationCpuStarted;
         auto anchorMetadata = current.anchors->metadata();
         auto fiberletMetadata = current.fiberlets->metadata();
         const auto reduction = nlohmann::json{
@@ -1665,8 +1774,6 @@ int runStagedChunkRouteReduction(
             stageRoot / "anchors.zarr", anchorMetadata);
         auto stageFiberlets = FiberletChunkDataset::createOrOpen(
             stageRoot / "fiberlets.zarr", fiberletMetadata);
-        StageActivity activity;
-        activity.boxes = boxes.size();
         const auto started = std::chrono::steady_clock::now();
         std::vector<FiberletChunkRouteSimplificationReport>
             simplifications;
@@ -1681,15 +1788,31 @@ int runStagedChunkRouteReduction(
                 FiberletChunkGraphSource graph(
                     stageAnchors, stageAnchorCache, stageFiberlets,
                     stageFiberletCache, options.paths);
-                const auto analyzed = analyzeFiberletChunkRoutes(
+                const auto reduced = analyzeAndSimplifyFiberletChunkRoutes(
                     graph, boxes[boxIndex]);
-                const auto simplified = simplifyFiberletChunkRoutes(
-                    graph, boxes[boxIndex],
-                    analyzed.retainedPhysicalFiberlets);
+                const auto& analyzed = reduced.analysis;
+                const auto& simplified = reduced.simplification;
+                activity.materialization.wallSeconds +=
+                    reduced.materializationSeconds;
+                activity.materialization.cpuSeconds +=
+                    reduced.materializationCpuSeconds;
+                activity.analysis.wallSeconds += reduced.analysisSeconds;
+                activity.analysis.cpuSeconds += reduced.analysisCpuSeconds;
+                activity.simplification.wallSeconds +=
+                    reduced.simplificationSeconds;
+                activity.simplification.cpuSeconds +=
+                    reduced.simplificationCpuSeconds;
+                const auto writeWallStarted =
+                    std::chrono::steady_clock::now();
+                const double writeCpuStarted = processCpuSeconds();
                 const auto written = writeFiberletReductionOverlayBox(
                     graph, stageAnchors, stageFiberlets, boxes[boxIndex],
                     analyzed.physicalFiberletIds,
                     simplified.livePhysicalFiberletIds);
+                activity.write.wallSeconds += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - writeWallStarted).count();
+                activity.write.cpuSeconds +=
+                    processCpuSeconds() - writeCpuStarted;
                 activity.anchorChunkWrites += written.touchedAnchorChunks;
                 activity.fiberletChunkWrites +=
                     written.touchedFiberletChunks;
@@ -1716,8 +1839,18 @@ int runStagedChunkRouteReduction(
         FiberletChunkGraphSource stageGraph(
             current.anchors, current.anchorCache, current.fiberlets,
             current.fiberletCache, options.paths);
+        const auto outputPopulationWallStarted =
+            std::chrono::steady_clock::now();
+        const double outputPopulationCpuStarted = processCpuSeconds();
         const auto population = collectFiberletChunkRoutePopulation(
             stageGraph, selectedConfig);
+        finalSelectedPopulation = population;
+        activity.output = collectChunkRouteStagePopulation(
+            stageGraph, boxes);
+        activity.population.wallSeconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - outputPopulationWallStarted).count();
+        activity.population.cpuSeconds +=
+            processCpuSeconds() - outputPopulationCpuStarted;
         if (!std::includes(
                 initialPopulation.physicalFiberletIds.begin(),
                 initialPopulation.physicalFiberletIds.end(),
@@ -1726,11 +1859,10 @@ int runStagedChunkRouteReduction(
             throw std::runtime_error(
                 "staged reduction restored a physical Fiberlet");
         }
-        const auto interior = canonicalIntersection(
-            initialInterior, population.physicalFiberletIds);
-        populations.push_back({
-            population.insideAnchors,
-            population.physicalFiberletIds.size(), interior.size()});
+        if (options.printStats) {
+            activity.idDigest = fiberletIdHash(population.physicalFiberletIds);
+            activity.payloadDigest = directoryHash(stageRoot);
+        }
         activities.push_back(activity);
         if (options.printStats) {
             std::cout << "fiberlet_stage_cache stage=" << stageIndex + 1
@@ -1738,7 +1870,25 @@ int runStagedChunkRouteReduction(
                       << " anchor_chunk_writes="
                       << activity.anchorChunkWrites
                       << " fiberlet_chunk_writes="
-                      << activity.fiberletChunkWrites << '\n';
+                      << activity.fiberletChunkWrites
+                      << " id_digest=" << activity.idDigest
+                      << " payload_digest=" << activity.payloadDigest
+                      << '\n';
+            const auto printPhase = [&](const char* name,
+                                        const StageActivity::Phase& phase) {
+                std::cout << "fiberlet_stage_phase stage=" << stageIndex + 1
+                          << " phase=" << name
+                          << " wall_seconds=" << phase.wallSeconds
+                          << " cpu_seconds=" << phase.cpuSeconds
+                          << " effective_cores=" << effectiveCores(
+                                 phase.cpuSeconds, phase.wallSeconds)
+                          << '\n';
+            };
+            printPhase("materialization", activity.materialization);
+            printPhase("analysis", activity.analysis);
+            printPhase("simplification", activity.simplification);
+            printPhase("write", activity.write);
+            printPhase("population", activity.population);
             for (std::size_t index = 0;
                  index < simplifications.size(); ++index) {
                 printChunkRouteSimplification(index, simplifications[index]);
@@ -1749,35 +1899,40 @@ int runStagedChunkRouteReduction(
     std::cout << std::left
               << std::setw(8) << "stage"
               << std::setw(12) << "scope"
-              << std::setw(14) << "before"
-              << std::setw(14) << "after"
+              << std::setw(14) << "original"
+              << std::setw(14) << "input"
+              << std::setw(14) << "output"
               << std::setw(18) << "stage_reduction"
               << std::setw(22) << "cumulative_reduction"
               << "boxes\n";
     const auto printStageRow = [&](std::size_t stage, const char* scope,
-                                   std::size_t before, std::size_t after,
-                                   std::size_t original) {
+                                   std::size_t original, std::size_t input,
+                                   std::size_t output) {
         std::cout << std::setw(8) << stage
                   << std::setw(12) << scope
-                  << std::setw(14) << before
-                  << std::setw(14) << after
-                  << std::setw(18) << percentString(before, after)
-                  << std::setw(22) << percentString(original, after)
+                  << std::setw(14) << original
+                  << std::setw(14) << input
+                  << std::setw(14) << output
+                  << std::setw(18) << percentString(input, output)
+                  << std::setw(22) << percentString(original, output)
                   << activities[stage - 1].boxes << '\n';
     };
-    for (std::size_t stage = 1; stage < populations.size(); ++stage) {
+    for (std::size_t stage = 1; stage <= activities.size(); ++stage) {
+        const auto& activity = activities[stage - 1];
         printStageRow(
-            stage, "anchors", populations[stage - 1].anchors,
-            populations[stage].anchors, populations.front().anchors);
+            stage, "anchors", activity.original.anchors,
+            activity.input.anchors, activity.output.anchors);
         printStageRow(
-            stage, "full", populations[stage - 1].fullFiberlets,
-            populations[stage].fullFiberlets,
-            populations.front().fullFiberlets);
+            stage, "all", activity.original.allFiberlets,
+            activity.input.allFiberlets, activity.output.allFiberlets);
         printStageRow(
-            stage, "interior", populations[stage - 1].interiorFiberlets,
-            populations[stage].interiorFiberlets,
-            populations.front().interiorFiberlets);
+            stage, "interior", activity.original.interiorFiberlets,
+            activity.input.interiorFiberlets,
+            activity.output.interiorFiberlets);
     }
+    if (!finalSelectedPopulation)
+        throw std::logic_error("staged reduction has no final population");
+    const auto& finalPopulation = *finalSelectedPopulation;
     std::cout << "\njoint reduction\n"
               << std::setw(12) << "scope"
               << std::setw(14) << "original"
@@ -1791,14 +1946,14 @@ int runStagedChunkRouteReduction(
                   << percentString(original, final) << '\n';
     };
     printJoint(
-        "anchors", populations.front().anchors,
-        populations.back().anchors);
+        "anchors", initialPopulation.insideAnchors,
+        finalPopulation.insideAnchors);
     printJoint(
-        "full", populations.front().fullFiberlets,
-        populations.back().fullFiberlets);
+        "full", initialPopulation.physicalFiberletIds.size(),
+        finalPopulation.physicalFiberletIds.size());
     printJoint(
-        "interior", populations.front().interiorFiberlets,
-        populations.back().interiorFiberlets);
+        "interior", initialPopulation.internalFiberletIds.size(),
+        finalPopulation.internalFiberletIds.size());
     current.anchorCache->cancelPendingAndWait();
     current.fiberletCache->cancelPendingAndWait();
     viewCache->cancelPendingAndWait();

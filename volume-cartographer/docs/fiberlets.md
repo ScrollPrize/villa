@@ -912,12 +912,44 @@ prefix, and route fields must remain exactly unchanged. An inside anchor is
 removed only when no surviving incident Fiberlet references it, including
 outside-owned and lower-layer Fiberlets.
 
-The aggregate output has one row per stage with input/output, stage reduction,
-and cumulative reduction for anchors, all incident Fiberlets, and interior
-Fiberlets. The joint table compares the original and final canonical unique
-populations over the selected region. Interior membership is fixed from the
-initial graph so removed anchors cannot change later denominators. `--stats`
-adds per-box simplification and touched-chunk diagnostics.
+Each stage table is scoped only to that stage's complete analysis boxes. It
+reports original/input/output counts for inside anchors, all incident
+Fiberlets, and Fiberlets interior to at least one complete stage box, plus
+reduction from the inherited input and from the same stage-local original
+geometry. A Fiberlet crossing between adjacent stage boxes is `all`, not
+`interior`. An offset stage therefore does not count untouched parts of the
+selected region. The joint table separately compares original and final
+canonical populations over the complete selected region.
+
+Analysis and simplification share one immutable materialized graph per box.
+Materialization loads each required anchor, prefix, and route owner once, then
+constructs directed arcs and transitions from those immutable chunk payloads.
+Exact entry searches, transition construction, serialization, and independent
+overlay owner writes use deterministic index-addressed work on reusable thread
+pools; boxes and stages retain canonical serial order. Fiberlet prefix/route
+pairs publish together before anchor chunks, and all replacement payloads are
+prepared before publication. `--stats` adds materialization, exact-search,
+simplification, write, and population wall/CPU timings, effective-core
+diagnostics, semantic ID hashes, payload hashes, and the existing per-box
+simplification details.
+
+Use the ordinary optimized build for performance measurements:
+
+```bash
+cmake -S volume-cartographer -B volume-cartographer/build \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build volume-cartographer/build --target vc_fiberlets -j 32
+```
+
+On the hot Paris4 example above, three Release `-O3 -DNDEBUG` runs measured
+2.44/2.46/2.49 s wall (min/median/max), down from 7.97/8.09/9.32 s. The final
+runs used 3.82-3.88 s user and 1.54-1.62 s system CPU time (217-221% process
+CPU). All runs reproduced the pre-change retained-ID and complete
+overlay-payload hashes exactly. A controlled one-versus-32-thread run reduced
+stage-one exact route analysis from 0.852 s to 0.108 s. Search workers read one
+immutable local graph through fixed strided index partitions and keep their
+heap and ancestry scratch thread-local, so the per-entry trace loop performs no
+scheduling or synchronization.
 
 For each processed box, the command also constructs an exact in-memory
 simplified graph. Directed states outside the intersection of

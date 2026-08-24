@@ -1,9 +1,9 @@
 #include "vc/fiber_tracer/FiberletChunkGraph.hpp"
 
 #include "vc/fiber_tracer/FiberLocalScoring.hpp"
+#include "utils/thread_pool.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <ctime>
@@ -15,12 +15,57 @@
 #include <queue>
 #include <set>
 #include <stdexcept>
-#include <thread>
+#include <unordered_map>
 
 namespace vc::fiber_tracer
 {
 namespace
 {
+
+template <typename Function>
+void indexedParallelFor(
+    std::size_t count, std::size_t requestedThreads, Function&& function)
+{
+    if (count == 0)
+        return;
+    const std::size_t workerCount = std::min(
+        count, std::max<std::size_t>(1, requestedThreads));
+    if (workerCount == 1) {
+        for (std::size_t index = 0; index < count; ++index)
+            function(index);
+        return;
+    }
+
+    const auto poolFor = [](std::size_t threads) -> utils::ThreadPool& {
+        static std::mutex poolsMutex;
+        static std::unordered_map<
+            std::size_t, std::unique_ptr<utils::ThreadPool>> pools;
+        std::lock_guard lock(poolsMutex);
+        auto& pool = pools[threads];
+        if (!pool)
+            pool = std::make_unique<utils::ThreadPool>(threads);
+        return *pool;
+    };
+
+    std::vector<std::exception_ptr> failures(count);
+    poolFor(std::max<std::size_t>(1, requestedThreads))
+        .run_indexed_batch(workerCount, [&](std::size_t worker) {
+            // Each worker owns a fixed strided partition. The hot loop has no
+            // shared scheduler or synchronization.
+            for (std::size_t index = worker; index < count;
+                 index += workerCount) {
+                try {
+                    function(index);
+                } catch (...) {
+                    failures[index] = std::current_exception();
+                }
+            }
+        });
+    for (const auto& failure : failures) {
+        if (failure)
+            std::rethrow_exception(failure);
+    }
+}
 
 std::int64_t floorDiv(std::int64_t numerator, std::int64_t denominator)
 {
@@ -405,6 +450,45 @@ FiberletGraphQuery<FiberletPrefixChunkLease> FiberletChunkGraphSource::prefixesI
     return result;
 }
 
+FiberletGraphQuery<FiberletRouteChunkLease>
+FiberletChunkGraphSource::routesInChunk(
+    const vc::render::ChunkKey& requested, bool blocking) const
+{
+    auto key = requested;
+    if (key.level == 0)
+        key.level = 1;
+    if (key.level != 1) {
+        FiberletGraphQuery<FiberletRouteChunkLease> result;
+        result.status = FiberletGraphQueryStatus::Error;
+        result.error = "fiberlet route chunk query requires level one";
+        return result;
+    }
+    auto chunk = fetchChunk(fiberletCache_, key, blocking);
+    FiberletGraphQuery<FiberletRouteChunkLease> result;
+    auto payload = chunkPayload<FiberletRouteChunkPayload>(chunk, result);
+    if (!payload)
+        return result;
+    result.status = FiberletGraphQueryStatus::Ready;
+    result.value.payloadLease = std::move(payload);
+    return result;
+}
+
+std::vector<vc::render::ChunkKey>
+FiberletChunkGraphSource::incidentPrefixChunks(
+    std::span<const FiberletStorageKey> anchors) const
+{
+    std::set<std::tuple<int, int, int>> coordinates;
+    for (const auto& anchor : anchors) {
+        for (const auto& chunk : incidentOwnerChunks(anchor))
+            coordinates.emplace(chunk.iz, chunk.iy, chunk.ix);
+    }
+    std::vector<vc::render::ChunkKey> result;
+    result.reserve(coordinates.size());
+    for (const auto& [z, y, x] : coordinates)
+        result.push_back({0, z, y, x});
+    return result;
+}
+
 FiberletGraphQuery<FiberletEdgeLease> FiberletChunkGraphSource::edge(const FiberletStorageId& fiberlet, bool blocking) const
 {
     const auto prefixKey = ownerChunk(fiberlet.first, 0);
@@ -592,9 +676,28 @@ FiberletChunkGraphSource::transition(
         result.error = shared.error;
         return result;
     }
+    return transitionAtAnchor(
+        incoming, outgoing, shared.value.anchor, maximumJoinAngleDegrees);
+}
+
+FiberletGraphQuery<std::optional<FiberletReplaySourceTransition>>
+FiberletChunkGraphSource::transitionAtAnchor(
+    const FiberletReplaySourceArc& incoming,
+    const FiberletReplaySourceArc& outgoing,
+    const FiberletStoredAnchor& sharedAnchor,
+    float maximumJoinAngleDegrees) const
+{
+    FiberletGraphQuery<std::optional<FiberletReplaySourceTransition>> result;
+    if (!(maximumJoinAngleDegrees >= 0.0F) ||
+        !(maximumJoinAngleDegrees <= 180.0F) ||
+        !std::isfinite(maximumJoinAngleDegrees)) {
+        result.status = FiberletGraphQueryStatus::Error;
+        result.error = "fiberlet transition maximum join angle is invalid";
+        return result;
+    }
     result.status = FiberletGraphQueryStatus::Ready;
     result.value = storedTransition(
-        incoming, outgoing, shared.value.anchor,
+        incoming, outgoing, sharedAnchor,
         static_cast<float>(fiberletDataset_->metadata().predictionToBaseScale),
         pathConfig_, maximumJoinAngleDegrees);
     return result;
@@ -610,6 +713,7 @@ namespace
 
 struct ChunkRouteAnchor {
     FiberletStorageKey key;
+    FiberletStoredAnchor stored;
     cv::Vec3d positionBaseXYZ{0.0, 0.0, 0.0};
     bool inside = false;
 };
@@ -787,32 +891,77 @@ ChunkRouteLocalGraph materializeChunkRouteGraph(
         }
     }
 
-    std::set<FiberletStorageId> physicalIds;
-    std::vector<FiberletStorageKey> pending;
-    pending.reserve(insideAnchors.size());
+    std::vector<FiberletStorageKey> insideKeys;
+    insideKeys.reserve(insideAnchors.size());
     for (const auto& [key, anchor] : insideAnchors) {
         (void)anchor;
-        pending.push_back(key);
+        insideKeys.push_back(key);
     }
-    for (std::size_t index = 0; index < pending.size(); ++index) {
-        const auto loaded = graph.incidentEdges(pending[index], true);
+
+    std::map<FiberletStorageId, FiberletStoredPrefix> physicalPrefixes;
+    for (const auto& chunk : graph.incidentPrefixChunks(insideKeys)) {
+        const auto loaded = graph.prefixesInChunk(chunk, true);
         if (loaded.status != FiberletGraphQueryStatus::Ready) {
             throw std::runtime_error(
-                "fiberlet chunk-route incident halo failed: " + loaded.error);
+                "fiberlet chunk-route prefix halo failed: " + loaded.error);
         }
-        for (const auto& incident : loaded.value.edges)
-            physicalIds.insert(incident.id.fiberlet);
+        for (const auto& prefix : loaded.value.payloadLease->prefixes) {
+            if (!insideAnchors.contains(prefix.id.first) &&
+                !insideAnchors.contains(prefix.id.second)) {
+                continue;
+            }
+            if (!physicalPrefixes.emplace(prefix.id, prefix).second) {
+                throw std::runtime_error(
+                    "fiberlet graph contains a duplicate incident edge");
+            }
+        }
+    }
+
+    std::set<FiberletStorageKey> requiredAnchorKeys;
+    for (const auto& [id, prefix] : physicalPrefixes) {
+        (void)prefix;
+        requiredAnchorKeys.insert(id.first);
+        requiredAnchorKeys.insert(id.second);
+    }
+    std::set<std::tuple<int, int, int>> requiredAnchorOwners;
+    for (const auto& key : requiredAnchorKeys) {
+        const auto owner = fiberletStorageOwnerChunk(
+            graph.metadata(), key, 0);
+        requiredAnchorOwners.emplace(owner.iz, owner.iy, owner.ix);
+    }
+    std::map<FiberletStorageKey, FiberletStoredAnchor> endpointAnchors;
+    for (const auto& [z, y, x] : requiredAnchorOwners) {
+        const auto loaded = graph.anchorsInChunk({0, z, y, x}, true);
+        if (loaded.status != FiberletGraphQueryStatus::Ready) {
+            throw std::runtime_error(
+                "fiberlet chunk-route endpoint anchor chunk failed: " +
+                loaded.error);
+        }
+        for (const auto& anchor : *loaded.value.anchors) {
+            if (!requiredAnchorKeys.contains(anchor.key))
+                continue;
+            if (!endpointAnchors.emplace(anchor.key, anchor).second) {
+                throw std::runtime_error(
+                    "fiberlet graph contains a duplicate endpoint anchor");
+            }
+        }
+    }
+    if (endpointAnchors.size() != requiredAnchorKeys.size()) {
+        throw std::runtime_error(
+            "fiberlet graph endpoint anchor is absent from its owner chunk");
     }
 
     ChunkRouteLocalGraph result;
     std::map<FiberletStorageKey, std::size_t> anchorIndices;
-    auto ensureAnchor = [&](const FiberletStorageKey& key,
-                            const cv::Vec3d& position) {
+    auto ensureAnchor = [&](const FiberletStoredAnchor& anchor) {
+        const cv::Vec3d position(
+            anchor.positionPredictionXYZ * predictionToBaseScale);
         const auto [found, inserted] =
-            anchorIndices.emplace(key, result.anchors.size());
+            anchorIndices.emplace(anchor.key, result.anchors.size());
         if (inserted) {
             result.anchors.push_back(
-                {key, position, pointInsideChunk(position, config)});
+                {anchor.key, anchor, position,
+                 pointInsideChunk(position, config)});
         } else if (cv::norm(result.anchors[found->second].positionBaseXYZ -
                             position) > 1.0e-5) {
             throw std::runtime_error(
@@ -821,23 +970,33 @@ ChunkRouteLocalGraph materializeChunkRouteGraph(
         return found->second;
     };
 
-    result.physicalFiberlets.assign(physicalIds.begin(), physicalIds.end());
+    result.physicalFiberlets.reserve(physicalPrefixes.size());
+    for (const auto& [id, prefix] : physicalPrefixes) {
+        (void)prefix;
+        result.physicalFiberlets.push_back(id);
+    }
     result.arcs.reserve(result.physicalFiberlets.size() * 2);
     for (const auto& id : result.physicalFiberlets) {
+        const auto prefix = physicalPrefixes.find(id);
+        const auto firstAnchor = endpointAnchors.find(id.first);
+        const auto secondAnchor = endpointAnchors.find(id.second);
+        if (prefix == physicalPrefixes.end() ||
+            firstAnchor == endpointAnchors.end() ||
+            secondAnchor == endpointAnchors.end()) {
+            throw std::logic_error(
+                "fiberlet chunk-route bulk materialization lost a record");
+        }
+        FiberletEdgeLease loaded;
+        loaded.prefix = prefix->second;
+        loaded.firstAnchor = firstAnchor->second;
+        loaded.secondAnchor = secondAnchor->second;
         std::array<FiberletReplaySourceArc, 2> directed;
         for (std::size_t reverse = 0; reverse < 2; ++reverse) {
-            const auto loaded = graph.directedEdge(
-                {id, reverse != 0}, true);
-            if (loaded.status != FiberletGraphQueryStatus::Ready) {
-                throw std::runtime_error(
-                    "fiberlet chunk-route edge failed: " + loaded.error);
-            }
-            directed[reverse] = loaded.value;
+            directed[reverse] = directedStoredArc(
+                loaded, {id, reverse != 0}, predictionToBaseScale);
         }
-        const std::size_t first = ensureAnchor(
-            directed[0].source, directed[0].sourcePositionBaseXYZ);
-        const std::size_t second = ensureAnchor(
-            directed[0].target, directed[0].targetPositionBaseXYZ);
+        const std::size_t first = ensureAnchor(firstAnchor->second);
+        const std::size_t second = ensureAnchor(secondAnchor->second);
         for (std::size_t reverse = 0; reverse < 2; ++reverse) {
             auto arc = directed[reverse];
             arc.cost = chunkRouteEdgeCost(
@@ -866,32 +1025,37 @@ ChunkRouteLocalGraph materializeChunkRouteGraph(
     if (!buildTransitions)
         return result;
     result.successors.resize(result.arcs.size());
-    for (std::size_t incoming = 0; incoming < result.arcs.size(); ++incoming) {
-        const auto& incomingArc = result.arcs[incoming];
-        if (!result.anchors[incomingArc.targetAnchor].inside)
-            continue;
-        for (const std::size_t outgoing :
-             result.outgoing[incomingArc.targetAnchor]) {
-            const auto transition = graph.transition(
-                incomingArc.source, result.arcs[outgoing].source,
-                config.maximumJoinAngleDegrees, true);
-            if (transition.status != FiberletGraphQueryStatus::Ready) {
-                throw std::runtime_error(
-                    "fiberlet chunk-route transition failed: " +
-                    transition.error);
+    indexedParallelFor(
+        result.arcs.size(), config.parallelThreads,
+        [&](std::size_t incoming) {
+            const auto& incomingArc = result.arcs[incoming];
+            if (!result.anchors[incomingArc.targetAnchor].inside)
+                return;
+            auto& successors = result.successors[incoming];
+            for (const std::size_t outgoing :
+                 result.outgoing[incomingArc.targetAnchor]) {
+                const auto transition = graph.transitionAtAnchor(
+                    incomingArc.source, result.arcs[outgoing].source,
+                    result.anchors[incomingArc.targetAnchor].stored,
+                    config.maximumJoinAngleDegrees);
+                if (transition.status != FiberletGraphQueryStatus::Ready) {
+                    throw std::runtime_error(
+                        "fiberlet chunk-route transition failed: " +
+                        transition.error);
+                }
+                if (!transition.value.has_value())
+                    continue;
+                const double joinLoss =
+                    static_cast<double>(transition.value->cost.total());
+                if (!(joinLoss >= 0.0) || !std::isfinite(joinLoss)) {
+                    throw std::runtime_error(
+                        "fiberlet chunk-route join objective is invalid");
+                }
+                successors.push_back({outgoing, joinLoss});
             }
-            if (!transition.value.has_value())
-                continue;
-            const double joinLoss =
-                static_cast<double>(transition.value->cost.total());
-            if (!(joinLoss >= 0.0) || !std::isfinite(joinLoss)) {
-                throw std::runtime_error(
-                    "fiberlet chunk-route join objective is invalid");
-            }
-            result.successors[incoming].push_back({outgoing, joinLoss});
-            ++result.admissibleTransitions;
-        }
-    }
+        });
+    for (const auto& successors : result.successors)
+        result.admissibleTransitions += successors.size();
 
     for (std::size_t arc = 0; arc < result.arcs.size(); ++arc) {
         const bool sourceInside =
@@ -921,19 +1085,16 @@ std::vector<FiberletStorageId> internalChunkRouteFiberlets(
 }
 
 struct ChunkRouteSearchHistory {
-    std::size_t arc = 0;
-    std::size_t parent = std::numeric_limits<std::size_t>::max();
-    double loss = 0.0;
-    double lengthPredictionVoxels = 0.0;
-    std::size_t fiberletCount = 0;
+    std::uint32_t arc = 0;
+    std::uint32_t parent = std::numeric_limits<std::uint32_t>::max();
 };
 
 struct ChunkRouteTerminal {
-    std::size_t parent = 0;
-    std::size_t exitArc = 0;
+    std::uint32_t parent = 0;
+    std::uint32_t exitArc = 0;
     double loss = 0.0;
     double lengthPredictionVoxels = 0.0;
-    std::size_t fiberletCount = 0;
+    std::uint32_t fiberletCount = 0;
 };
 
 struct ChunkRouteEntryResult {
@@ -946,16 +1107,29 @@ struct ChunkRouteEntryResult {
     std::size_t rejectedVisitedTargets = 0;
 };
 
+struct ChunkRouteQueueItem {
+    double loss = 0.0;
+    std::uint32_t node = 0;
+};
+
+struct ChunkRouteSearchScratch {
+    std::vector<ChunkRouteQueueItem> queue;
+    std::vector<ChunkRouteSearchHistory> history;
+    std::vector<double> lengths;
+    std::vector<std::uint32_t> fiberletCounts;
+    std::vector<ChunkRouteTerminal> terminals;
+};
+
 bool chunkRouteContainsAnchor(
     const ChunkRouteLocalGraph& graph,
     const std::vector<ChunkRouteSearchHistory>& history,
-    std::size_t node,
+    std::uint32_t node,
     std::size_t rootSourceAnchor,
     std::size_t candidate)
 {
     if (candidate == rootSourceAnchor)
         return true;
-    while (node != std::numeric_limits<std::size_t>::max()) {
+    while (node != std::numeric_limits<std::uint32_t>::max()) {
         if (graph.arcs[history[node].arc].targetAnchor == candidate)
             return true;
         node = history[node].parent;
@@ -968,32 +1142,41 @@ ChunkRouteEntryResult searchChunkRouteEntry(
     std::size_t entryArc,
     std::size_t maximumGeneratedStates)
 {
-    struct QueueItem {
-        double loss = 0.0;
-        std::size_t node = 0;
-    };
-    const auto greater = [](const QueueItem& left, const QueueItem& right) {
+    const auto greater = [](const ChunkRouteQueueItem& left,
+                            const ChunkRouteQueueItem& right) {
         if (left.loss != right.loss)
             return left.loss > right.loss;
         return left.node > right.node;
     };
-    std::priority_queue<QueueItem, std::vector<QueueItem>, decltype(greater)>
-        queue(greater);
-    std::vector<ChunkRouteSearchHistory> history;
+    thread_local ChunkRouteSearchScratch scratch;
+    auto& queue = scratch.queue;
+    auto& history = scratch.history;
+    auto& lengths = scratch.lengths;
+    auto& fiberletCounts = scratch.fiberletCounts;
+    auto& terminals = scratch.terminals;
+    queue.clear();
+    history.clear();
+    lengths.clear();
+    fiberletCounts.clear();
+    terminals.clear();
+    if (entryArc > std::numeric_limits<std::uint32_t>::max())
+        throw std::overflow_error("fiberlet chunk-route arc index is too large");
     const auto& entry = graph.arcs[entryArc];
     history.push_back({
-        entryArc, std::numeric_limits<std::size_t>::max(), entry.loss,
-        entry.lengthPredictionVoxels, 1});
-    queue.push({entry.loss, 0});
+        static_cast<std::uint32_t>(entryArc),
+        std::numeric_limits<std::uint32_t>::max()});
+    lengths.push_back(entry.lengthPredictionVoxels);
+    fiberletCounts.push_back(1);
+    queue.push_back({entry.loss, 0});
     ChunkRouteEntryResult result;
     result.generatedStates = 1;
     std::optional<double> bestLoss;
-    std::vector<ChunkRouteTerminal> terminals;
     while (!queue.empty()) {
-        const QueueItem item = queue.top();
+        const ChunkRouteQueueItem item = queue.front();
         if (bestLoss.has_value() && item.loss > *bestLoss)
             break;
-        queue.pop();
+        std::pop_heap(queue.begin(), queue.end(), greater);
+        queue.pop_back();
         ++result.expandedStates;
         const auto state = history[item.node];
         for (const auto& successor : graph.successors[state.arc]) {
@@ -1009,31 +1192,42 @@ ChunkRouteEntryResult searchChunkRouteEntry(
                     "fiberlet chunk-route entry exceeded the exact state limit");
             }
             const double loss =
-                state.loss + successor.joinLoss + outgoing.loss;
-            const double length = state.lengthPredictionVoxels +
+                item.loss + successor.joinLoss + outgoing.loss;
+            const double length = lengths[item.node] +
                 outgoing.lengthPredictionVoxels;
-            const std::size_t count = state.fiberletCount + 1;
+            const std::uint32_t count = fiberletCounts[item.node] + 1;
             if (!graph.anchors[outgoing.targetAnchor].inside) {
                 if (!bestLoss.has_value() || loss < *bestLoss) {
                     bestLoss = loss;
                     terminals.clear();
                 }
                 if (loss == *bestLoss)
-                    terminals.push_back(
-                        {item.node, successor.arc, loss, length, count});
+                    terminals.push_back({
+                        item.node, static_cast<std::uint32_t>(successor.arc),
+                        loss, length, count});
                 continue;
             }
-            const std::size_t next = history.size();
-            history.push_back(
-                {successor.arc, item.node, loss, length, count});
-            queue.push({loss, next});
+            if (history.size() >=
+                    static_cast<std::size_t>(
+                        std::numeric_limits<std::uint32_t>::max()) ||
+                successor.arc > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::overflow_error(
+                    "fiberlet chunk-route search history is too large");
+            }
+            const auto next = static_cast<std::uint32_t>(history.size());
+            history.push_back({
+                static_cast<std::uint32_t>(successor.arc), item.node});
+            lengths.push_back(length);
+            fiberletCounts.push_back(count);
+            queue.push_back({loss, next});
+            std::push_heap(queue.begin(), queue.end(), greater);
         }
     }
 
     for (const auto& terminal : terminals) {
         std::vector<std::size_t> route{terminal.exitArc};
-        std::size_t node = terminal.parent;
-        while (node != std::numeric_limits<std::size_t>::max()) {
+        std::uint32_t node = terminal.parent;
+        while (node != std::numeric_limits<std::uint32_t>::max()) {
             route.push_back(history[node].arc);
             node = history[node].parent;
         }
@@ -1114,8 +1308,8 @@ bool canAppendFiberletChunkRouteMacro(
     return true;
 }
 
-FiberletChunkRouteSimplificationReport simplifyFiberletChunkRoutes(
-    const FiberletChunkGraphSource& graph,
+static FiberletChunkRouteSimplificationReport simplifyMaterializedChunkRoutes(
+    const ChunkRouteLocalGraph& local,
     const FiberletChunkRouteAnalysisConfig& config,
     std::span<const FiberletStorageId> retainedPhysicalFiberlets)
 {
@@ -1130,9 +1324,6 @@ FiberletChunkRouteSimplificationReport simplifyFiberletChunkRoutes(
             "fiberlet simplification input contains duplicate physical IDs");
     }
 
-    std::vector<vc::render::ChunkKey> seedChunks;
-    const auto local = materializeChunkRouteGraph(
-        graph, config, seedChunks, true);
     report.inputAnchors = local.anchors.size();
     report.inputInsideAnchors = static_cast<std::size_t>(std::count_if(
         local.anchors.begin(), local.anchors.end(),
@@ -1671,33 +1862,17 @@ FiberletChunkRouteSimplificationReport simplifyFiberletChunkRoutes(
     return report;
 }
 
-FiberletChunkRouteAnalysisReport analyzeFiberletChunkRoutes(
-    const FiberletChunkGraphSource& graph,
-    const FiberletChunkRouteAnalysisConfig& config)
+static FiberletChunkRouteAnalysisReport analyzeMaterializedChunkRoutes(
+    const ChunkRouteLocalGraph& local,
+    const FiberletChunkRouteAnalysisConfig& config,
+    std::span<const vc::render::ChunkKey> seedChunks)
 {
-    for (int axis = 0; axis < 3; ++axis) {
-        if (!std::isfinite(config.minimumBaseXYZ[axis]) ||
-            !std::isfinite(config.maximumBaseXYZ[axis]) ||
-            !(config.maximumBaseXYZ[axis] > config.minimumBaseXYZ[axis])) {
-            throw std::invalid_argument(
-                "fiberlet chunk-route bounds are invalid");
-        }
-    }
-    if (!(config.maximumJoinAngleDegrees >= 0.0F) ||
-        !(config.maximumJoinAngleDegrees <= 180.0F) ||
-        !std::isfinite(config.maximumJoinAngleDegrees) ||
-        config.parallelThreads == 0 ||
-        config.maximumGeneratedStatesPerEntry == 0) {
-        throw std::invalid_argument(
-            "fiberlet chunk-route configuration is invalid");
-    }
     const auto started = std::chrono::steady_clock::now();
     const std::clock_t cpuStarted = std::clock();
     FiberletChunkRouteAnalysisReport report;
     report.minimumBaseXYZ = config.minimumBaseXYZ;
     report.maximumBaseXYZ = config.maximumBaseXYZ;
-    auto local = materializeChunkRouteGraph(
-        graph, config, report.seedAnchorStorageChunks, true);
+    report.seedAnchorStorageChunks.assign(seedChunks.begin(), seedChunks.end());
     report.insideAnchors = static_cast<std::size_t>(std::count_if(
         local.anchors.begin(), local.anchors.end(),
         [](const auto& anchor) { return anchor.inside; }));
@@ -1721,42 +1896,13 @@ FiberletChunkRouteAnalysisReport analyzeFiberletChunkRoutes(
         }));
 
     std::vector<ChunkRouteEntryResult> entries(local.entries.size());
-    std::atomic_size_t nextEntry{0};
-    std::atomic_bool stop{false};
-    std::exception_ptr failure;
-    std::mutex failureMutex;
-    const std::size_t workerCount = std::min(
-        config.parallelThreads,
-        std::max<std::size_t>(1, local.entries.size()));
-    std::vector<std::thread> workers;
-    workers.reserve(workerCount);
-    for (std::size_t worker = 0; worker < workerCount; ++worker) {
-        workers.emplace_back([&] {
-            while (!stop.load(std::memory_order_relaxed)) {
-                const std::size_t index =
-                    nextEntry.fetch_add(1, std::memory_order_relaxed);
-                if (index >= local.entries.size())
-                    return;
-                try {
-                    entries[index] = searchChunkRouteEntry(
-                        local, local.entries[index],
-                        config.maximumGeneratedStatesPerEntry);
-                } catch (...) {
-                    {
-                        std::lock_guard lock(failureMutex);
-                        if (!failure)
-                            failure = std::current_exception();
-                    }
-                    stop.store(true, std::memory_order_relaxed);
-                    return;
-                }
-            }
+    indexedParallelFor(
+        local.entries.size(), config.parallelThreads,
+        [&](std::size_t index) {
+            entries[index] = searchChunkRouteEntry(
+                local, local.entries[index],
+                config.maximumGeneratedStatesPerEntry);
         });
-    }
-    for (auto& worker : workers)
-        worker.join();
-    if (failure)
-        std::rethrow_exception(failure);
 
     std::set<std::size_t> usedAnchors;
     std::set<std::size_t> usedPhysicalFiberlets;
@@ -1830,6 +1976,103 @@ FiberletChunkRouteAnalysisReport analyzeFiberletChunkRoutes(
     return report;
 }
 
+static void validateChunkRouteAnalysisConfig(
+    const FiberletChunkRouteAnalysisConfig& config)
+{
+    for (int axis = 0; axis < 3; ++axis) {
+        if (!std::isfinite(config.minimumBaseXYZ[axis]) ||
+            !std::isfinite(config.maximumBaseXYZ[axis]) ||
+            !(config.maximumBaseXYZ[axis] > config.minimumBaseXYZ[axis])) {
+            throw std::invalid_argument(
+                "fiberlet chunk-route bounds are invalid");
+        }
+    }
+    if (!(config.maximumJoinAngleDegrees >= 0.0F) ||
+        !(config.maximumJoinAngleDegrees <= 180.0F) ||
+        !std::isfinite(config.maximumJoinAngleDegrees) ||
+        config.parallelThreads == 0 ||
+        config.maximumGeneratedStatesPerEntry == 0) {
+        throw std::invalid_argument(
+            "fiberlet chunk-route configuration is invalid");
+    }
+}
+
+static double clockSecondsSince(std::clock_t started)
+{
+    if (started == static_cast<std::clock_t>(-1))
+        return 0.0;
+    const auto ended = std::clock();
+    if (ended == static_cast<std::clock_t>(-1))
+        return 0.0;
+    return static_cast<double>(ended - started) /
+        static_cast<double>(CLOCKS_PER_SEC);
+}
+
+FiberletChunkRouteSimplificationReport simplifyFiberletChunkRoutes(
+    const FiberletChunkGraphSource& graph,
+    const FiberletChunkRouteAnalysisConfig& config,
+    std::span<const FiberletStorageId> retainedPhysicalFiberlets)
+{
+    validateChunkRouteAnalysisConfig(config);
+    std::vector<vc::render::ChunkKey> seedChunks;
+    const auto local = materializeChunkRouteGraph(
+        graph, config, seedChunks, true);
+    return simplifyMaterializedChunkRoutes(
+        local, config, retainedPhysicalFiberlets);
+}
+
+FiberletChunkRouteAnalysisReport analyzeFiberletChunkRoutes(
+    const FiberletChunkGraphSource& graph,
+    const FiberletChunkRouteAnalysisConfig& config)
+{
+    validateChunkRouteAnalysisConfig(config);
+    const auto started = std::chrono::steady_clock::now();
+    const auto cpuStarted = std::clock();
+    std::vector<vc::render::ChunkKey> seedChunks;
+    const auto local = materializeChunkRouteGraph(
+        graph, config, seedChunks, true);
+    auto report = analyzeMaterializedChunkRoutes(
+        local, config, seedChunks);
+    report.elapsedSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    report.cpuSeconds = clockSecondsSince(cpuStarted);
+    return report;
+}
+
+FiberletChunkRouteReductionReport analyzeAndSimplifyFiberletChunkRoutes(
+    const FiberletChunkGraphSource& graph,
+    const FiberletChunkRouteAnalysisConfig& config)
+{
+    validateChunkRouteAnalysisConfig(config);
+    FiberletChunkRouteReductionReport result;
+    std::vector<vc::render::ChunkKey> seedChunks;
+
+    auto wallStarted = std::chrono::steady_clock::now();
+    auto cpuStarted = std::clock();
+    const auto local = materializeChunkRouteGraph(
+        graph, config, seedChunks, true);
+    result.materializationSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - wallStarted).count();
+    result.materializationCpuSeconds = clockSecondsSince(cpuStarted);
+
+    wallStarted = std::chrono::steady_clock::now();
+    cpuStarted = std::clock();
+    result.analysis = analyzeMaterializedChunkRoutes(
+        local, config, seedChunks);
+    result.analysisSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - wallStarted).count();
+    result.analysisCpuSeconds = clockSecondsSince(cpuStarted);
+
+    wallStarted = std::chrono::steady_clock::now();
+    cpuStarted = std::clock();
+    result.simplification = simplifyMaterializedChunkRoutes(
+        local, config, result.analysis.retainedPhysicalFiberlets);
+    result.simplificationSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - wallStarted).count();
+    result.simplificationCpuSeconds = clockSecondsSince(cpuStarted);
+    return result;
+}
+
 FiberletReductionOverlayBoxWriteReport
 writeFiberletReductionOverlayBox(
     const FiberletChunkGraphSource& source,
@@ -1886,24 +2129,47 @@ writeFiberletReductionOverlayBox(
     }
 
     const double predictionToBase = sourceMetadata.predictionToBaseScale;
+    std::set<FiberletStorageKey> inputAnchorKeys;
+    std::set<std::tuple<int, int, int>> inputAnchorOwners;
+    for (const auto& id : input) {
+        inputAnchorKeys.insert(id.first);
+        inputAnchorKeys.insert(id.second);
+    }
+    for (const auto& key : inputAnchorKeys) {
+        const auto owner = fiberletStorageOwnerChunk(
+            sourceMetadata, key, 0);
+        inputAnchorOwners.emplace(owner.iz, owner.iy, owner.ix);
+    }
     std::map<FiberletStorageKey, bool> anchorInside;
-    auto isAnchorInside = [&](const FiberletStorageKey& key) {
-        if (const auto found = anchorInside.find(key);
-            found != anchorInside.end()) {
-            return found->second;
-        }
-        const auto loaded = source.anchor(key, true);
+    for (const auto& [z, y, x] : inputAnchorOwners) {
+        const auto loaded = source.anchorsInChunk({0, z, y, x}, true);
         if (loaded.status != FiberletGraphQueryStatus::Ready) {
             throw std::runtime_error(
-                "fiberlet reduction overlay anchor failed: " +
+                "fiberlet reduction overlay anchor chunk failed: " +
                 loaded.error);
         }
-        const bool inside = pointInsideChunk(
-            cv::Vec3d(loaded.value.anchor.positionPredictionXYZ) *
-                predictionToBase,
-            config);
-        anchorInside.emplace(key, inside);
-        return inside;
+        for (const auto& anchor : *loaded.value.anchors) {
+            if (!inputAnchorKeys.contains(anchor.key))
+                continue;
+            const bool inside = pointInsideChunk(
+                cv::Vec3d(anchor.positionPredictionXYZ) * predictionToBase,
+                config);
+            if (!anchorInside.emplace(anchor.key, inside).second) {
+                throw std::runtime_error(
+                    "fiberlet graph contains a duplicate endpoint anchor");
+            }
+        }
+    }
+    if (anchorInside.size() != inputAnchorKeys.size()) {
+        throw std::runtime_error(
+            "fiberlet graph endpoint anchor is absent from its owner chunk");
+    }
+    auto isAnchorInside = [&](const FiberletStorageKey& key) {
+        const auto found = anchorInside.find(key);
+        if (found == anchorInside.end())
+            throw std::logic_error(
+                "fiberlet reduction overlay lost an endpoint anchor");
+        return found->second;
     };
     auto survives = [&](const FiberletStorageId& id) {
         return !isAnchorInside(id.first) ||
@@ -1914,6 +2180,13 @@ writeFiberletReductionOverlayBox(
     result.inputFiberlets = input.size();
     result.retainedFiberlets = static_cast<std::size_t>(std::count_if(
         input.begin(), input.end(), survives));
+    std::set<FiberletStorageKey> referencedAnchors;
+    for (const auto& id : input) {
+        if (survives(id)) {
+            referencedAnchors.insert(id.first);
+            referencedAnchors.insert(id.second);
+        }
+    }
     const auto anchorOwners = analysisAnchorChunks(outputMetadata, config);
     std::set<std::tuple<int, int, int>> fiberletOwnerCoordinates;
     std::vector<vc::render::ChunkKey> fiberletOwners = anchorOwners;
@@ -1938,6 +2211,22 @@ writeFiberletReductionOverlayBox(
         });
     result.touchedAnchorChunks = anchorOwners.size();
     result.touchedFiberletChunks = fiberletOwners.size();
+
+    struct PreparedFiberletPair {
+        vc::render::ChunkKey owner;
+        vc::render::ChunkKey routeOwner;
+        FiberletChunkDataset::MaterializedChunk currentPrefix;
+        FiberletChunkDataset::MaterializedChunk replacementPrefix;
+        FiberletChunkDataset::MaterializedChunk currentRoute;
+        FiberletChunkDataset::MaterializedChunk replacementRoute;
+    };
+    struct CurrentFiberletPair {
+        vc::render::ChunkKey owner;
+        std::shared_ptr<const FiberletPrefixChunkPayload> prefixes;
+        std::shared_ptr<const FiberletRouteChunkPayload> routes;
+    };
+    std::vector<CurrentFiberletPair> currentFiberlets;
+    currentFiberlets.reserve(fiberletOwners.size());
     for (const auto& owner : fiberletOwners) {
         const auto current = source.prefixesInChunk(owner, true);
         if (current.status != FiberletGraphQueryStatus::Ready ||
@@ -1946,25 +2235,77 @@ writeFiberletReductionOverlayBox(
                 "fiberlet reduction overlay prefix chunk failed: " +
                 current.error);
         }
-        const auto& currentPrefixes =
-            current.value.payloadLease->prefixes;
+        const auto routes = source.routesInChunk(owner, true);
+        if (routes.status != FiberletGraphQueryStatus::Ready ||
+            !routes.value.payloadLease) {
+            throw std::runtime_error(
+                "fiberlet reduction overlay route chunk failed: " +
+                routes.error);
+        }
+        if (current.value.payloadLease->prefixes.size() !=
+            routes.value.payloadLease->routes.size()) {
+            throw std::runtime_error(
+                "fiberlet prefix and route chunk record counts differ");
+        }
+        currentFiberlets.push_back({
+            owner, current.value.payloadLease, routes.value.payloadLease});
+    }
+    std::set<FiberletStorageKey> additionalAnchorKeys;
+    for (const auto& current : currentFiberlets) {
+        for (const auto& prefix : current.prefixes->prefixes) {
+            if (!anchorInside.contains(prefix.id.first))
+                additionalAnchorKeys.insert(prefix.id.first);
+            if (!anchorInside.contains(prefix.id.second))
+                additionalAnchorKeys.insert(prefix.id.second);
+        }
+    }
+    std::set<std::tuple<int, int, int>> additionalAnchorOwners;
+    for (const auto& key : additionalAnchorKeys) {
+        const auto owner = fiberletStorageOwnerChunk(
+            sourceMetadata, key, 0);
+        additionalAnchorOwners.emplace(owner.iz, owner.iy, owner.ix);
+    }
+    for (const auto& [z, y, x] : additionalAnchorOwners) {
+        const auto loaded = source.anchorsInChunk({0, z, y, x}, true);
+        if (loaded.status != FiberletGraphQueryStatus::Ready) {
+            throw std::runtime_error(
+                "fiberlet reduction overlay anchor chunk failed: " +
+                loaded.error);
+        }
+        for (const auto& anchor : *loaded.value.anchors) {
+            if (!additionalAnchorKeys.contains(anchor.key))
+                continue;
+            anchorInside.emplace(
+                anchor.key,
+                pointInsideChunk(
+                    cv::Vec3d(anchor.positionPredictionXYZ) * predictionToBase,
+                    config));
+        }
+    }
+    if (std::any_of(
+            additionalAnchorKeys.begin(), additionalAnchorKeys.end(),
+            [&](const auto& key) { return !anchorInside.contains(key); })) {
+        throw std::runtime_error(
+            "fiberlet graph endpoint anchor is absent from its owner chunk");
+    }
+    std::vector<PreparedFiberletPair> preparedFiberlets(
+        currentFiberlets.size());
+    indexedParallelFor(
+        currentFiberlets.size(), config.parallelThreads,
+        [&](std::size_t index) {
+        const auto& current = currentFiberlets[index];
+        const auto& owner = current.owner;
+        const auto& currentPrefixes = current.prefixes->prefixes;
+        const auto& currentRoutes = current.routes->routes;
         std::vector<FiberletStoredPrefix> replacementPrefixes;
-        std::vector<FiberletStoredRoute> currentRoutes;
         std::vector<FiberletStoredRoute> replacementRoutes;
-        currentRoutes.reserve(currentPrefixes.size());
         replacementPrefixes.reserve(currentPrefixes.size());
         replacementRoutes.reserve(currentPrefixes.size());
-        for (const auto& prefix : currentPrefixes) {
-            const auto route = source.storedRoute(prefix.id, true);
-            if (route.status != FiberletGraphQueryStatus::Ready) {
-                throw std::runtime_error(
-                    "fiberlet reduction overlay route failed: " +
-                    route.error);
-            }
-            currentRoutes.push_back(route.value.route);
+        for (std::size_t route = 0; route < currentPrefixes.size(); ++route) {
+            const auto& prefix = currentPrefixes[route];
             if (survives(prefix.id)) {
                 replacementPrefixes.push_back(prefix);
-                replacementRoutes.push_back(route.value.route);
+                replacementRoutes.push_back(currentRoutes[route]);
             }
         }
         auto routeOwner = owner;
@@ -1989,15 +2330,25 @@ writeFiberletReductionOverlayBox(
                     FiberletDecodedRoutes{routeCodec, routes}),
                 false};
         };
-        const auto currentPrefix = makePrefixChunk(currentPrefixes);
-        const auto replacementPrefix = makePrefixChunk(replacementPrefixes);
-        const auto currentRoute = makeRouteChunk(currentRoutes);
-        const auto replacementRoute = makeRouteChunk(replacementRoutes);
-        replaceFiberletOverlayChunkPair(
-            outputFiberlets, owner, currentPrefix, replacementPrefix,
-            routeOwner, currentRoute, replacementRoute);
-    }
+        preparedFiberlets[index] = {
+            owner, routeOwner, makePrefixChunk(currentPrefixes),
+            makePrefixChunk(replacementPrefixes), makeRouteChunk(currentRoutes),
+            makeRouteChunk(replacementRoutes)};
+        });
 
+    struct PreparedAnchorChunk {
+        vc::render::ChunkKey owner;
+        FiberletChunkDataset::MaterializedChunk current;
+        FiberletChunkDataset::MaterializedChunk replacement;
+        std::size_t inputAnchors = 0;
+        std::size_t retainedAnchors = 0;
+    };
+    struct CurrentAnchorChunk {
+        vc::render::ChunkKey owner;
+        std::shared_ptr<const std::vector<FiberletStoredAnchor>> anchors;
+    };
+    std::vector<CurrentAnchorChunk> currentAnchors;
+    currentAnchors.reserve(anchorOwners.size());
     for (const auto& owner : anchorOwners) {
         const auto current = source.anchorsInChunk(owner, true);
         if (current.status != FiberletGraphQueryStatus::Ready ||
@@ -2006,31 +2357,30 @@ writeFiberletReductionOverlayBox(
                 "fiberlet reduction overlay anchor chunk failed: " +
                 current.error);
         }
+        currentAnchors.push_back({owner, current.value.anchors});
+    }
+    std::vector<PreparedAnchorChunk> preparedAnchors(currentAnchors.size());
+    indexedParallelFor(
+        currentAnchors.size(), config.parallelThreads,
+        [&](std::size_t index) {
+        const auto& current = currentAnchors[index];
+        const auto& owner = current.owner;
         std::vector<FiberletStoredAnchor> replacement;
-        replacement.reserve(current.value.anchors->size());
-        for (const auto& anchor : *current.value.anchors) {
-            const bool inside = isAnchorInside(anchor.key);
+        replacement.reserve(current.anchors->size());
+        std::size_t inputAnchors = 0;
+        std::size_t retainedInsideAnchors = 0;
+        for (const auto& anchor : *current.anchors) {
+            const bool inside = pointInsideChunk(
+                cv::Vec3d(anchor.positionPredictionXYZ) * predictionToBase,
+                config);
             if (inside)
-                ++result.inputAnchors;
-            bool referenced = !inside;
-            if (inside) {
-                const auto incident = source.incidentEdges(anchor.key, true);
-                if (incident.status != FiberletGraphQueryStatus::Ready) {
-                    throw std::runtime_error(
-                        "fiberlet reduction overlay incident query failed: " +
-                        incident.error);
-                }
-                referenced = std::any_of(
-                    incident.value.edges.begin(),
-                    incident.value.edges.end(),
-                    [&](const auto& edge) {
-                        return survives(edge.id.fiberlet);
-                    });
-            }
+                ++inputAnchors;
+            const bool referenced =
+                !inside || referencedAnchors.contains(anchor.key);
             if (referenced) {
                 replacement.push_back(anchor);
                 if (inside)
-                    ++result.retainedAnchors;
+                    ++retainedInsideAnchors;
             }
         }
         const auto codec = outputAnchors->codecConfig(
@@ -2043,12 +2393,33 @@ writeFiberletReductionOverlayBox(
                     FiberletDecodedAnchors{codec, anchors}),
                 false};
         };
-        const auto currentChunk = makeAnchorChunk(*current.value.anchors);
-        const auto replacementChunk = makeAnchorChunk(replacement);
-        replaceFiberletOverlayChunk(
-            outputAnchors, FiberletStorageChunkKind::Anchors, owner,
-            currentChunk, replacementChunk);
+        preparedAnchors[index] = {
+            owner, makeAnchorChunk(*current.anchors),
+            makeAnchorChunk(replacement), inputAnchors,
+            retainedInsideAnchors};
+        });
+    for (const auto& prepared : preparedAnchors) {
+        result.inputAnchors += prepared.inputAnchors;
+        result.retainedAnchors += prepared.retainedAnchors;
     }
+
+    indexedParallelFor(
+        preparedFiberlets.size(), config.parallelThreads,
+        [&](std::size_t index) {
+            const auto& prepared = preparedFiberlets[index];
+            replaceFiberletOverlayChunkPair(
+                outputFiberlets, prepared.owner, prepared.currentPrefix,
+                prepared.replacementPrefix, prepared.routeOwner,
+                prepared.currentRoute, prepared.replacementRoute);
+        });
+    indexedParallelFor(
+        preparedAnchors.size(), config.parallelThreads,
+        [&](std::size_t index) {
+            const auto& prepared = preparedAnchors[index];
+            replaceFiberletOverlayChunk(
+                outputAnchors, FiberletStorageChunkKind::Anchors,
+                prepared.owner, prepared.current, prepared.replacement);
+        });
     return result;
 }
 

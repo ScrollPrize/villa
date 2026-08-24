@@ -1,28 +1,18 @@
-# Task: arbitrary staged Fiberlet graph reduction
+# Task: finish staged Fiberlet reduction performance and reporting
 
-Replace the fixed aligned-stage-one/half-offset-stage-two experiment with an
-ordered sequence of arbitrary reduction stages inside one selected base-space
-bbox.
+Fix the staged `vc_fiberlets chunk-route-stats` implementation so the normal
+local workflow is fast and its reports remain complete.
 
-- A stage is defined by a cubic analysis-box side and an XYZ offset relative to
-  the selected bbox minimum. Repeated stage specifications define order.
-- Each stage tiles every complete analysis box on that offset lattice which is
-  contained in the selected bbox. Boxes execute in deterministic XYZ order.
-- Every stage owns separate sparse anchor and Fiberlet cache layers with the
-  same spatial chunk layout and record format as the initial caches.
-- A missing stage-layer chunk means "unchanged from the previous layer".
-- A processed analysis box rewrites every intersected storage chunk in its
-  current stage layer. It may only remove anchors and physical Fiberlets owned
-  by the analysis-box interior; records outside the box remain unchanged.
-- Later overlapping boxes in the same stage read prior updates from that stage
-  and may remove more records, but may never restore a record removed by an
-  earlier box or stage.
-- Preserve the existing exact entry-to-first-exit route analysis, regular join
-  constraints, and post-reduction simplification semantics.
-- Report each stage independently and report the joint original-to-final effect
-  over the whole selected bbox, separately for all incident Fiberlets and
-  Fiberlets with both endpoints in the bbox.
-
-The existing two-stage experiment is represented by stages `256,0,0,0` and
-`256,128,128,128` over a 512-cubed selected bbox. A later whole-bbox pass can be
-appended as `512,0,0,0`.
+- Actually remove the serial hot path in cache-backed local graph
+  materialization. Use chunk-granular reads and parallel cache-free graph work,
+  while preserving exact numerical order, retained IDs, and serialized output.
+- Remove redundant reporting materializations from the reduction path.
+- Per-stage reporting must cover the union of that stage's processed boxes and
+  show all three scopes: inside anchors, all incident Fiberlets, and interior
+  Fiberlets. Offset stages must not count untouched selected-region geometry.
+- Keep the joint whole-selected-region report with the same three scopes.
+- Configure and rebuild the ordinary `volume-cartographer/build/` directory as
+  an optimized Release build so the documented command does not accidentally
+  benchmark a Debug CI binary.
+- Measure the exact hot Paris4 workload before and after, including actual CPU
+  use and deterministic result hashes.

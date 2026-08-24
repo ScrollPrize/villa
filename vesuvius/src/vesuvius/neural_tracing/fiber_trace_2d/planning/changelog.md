@@ -1,5 +1,17 @@
 # 2026-08-24: arbitrary staged Fiberlet graph reduction
 
+- Replaced point-query graph construction with chunk-granular anchor,
+  prefix, and route loading, cache-free parallel transition construction, and
+  reusable worker pools. On the hot Paris4 512-base two-stage workload,
+  Release wall time fell from an 8.09 s median to 2.46 s while retained-ID and
+  complete overlay-payload hashes remained exact.
+- Exact entry searches use fixed worker-owned partitions and reusable
+  thread-local scratch, with no synchronization in the per-trace loop. The
+  stage-one search alone improved from 0.852 s at one thread to 0.108 s at 32.
+- Corrected stage tables to report inside anchors, all incident Fiberlets, and
+  per-box interior Fiberlets in that stage's complete box union, with separate
+  original, inherited input, and output counts. The joint table remains scoped
+  to the full selected bbox.
 - Replaced the unpublished fixed two-stage driver with repeatable
   `--stage SIDE,OFFSET_X,OFFSET_Y,OFFSET_Z` analysis passes over a selected
   base-coordinate bbox.
