@@ -18,6 +18,8 @@ import { neuroglancerOverlayUrl, browseUrl } from "./dataAccess";
 const PURPOSE = {
   "ink-detection-3d": { label: "3D ink", cls: "ink3d" },
   "surface-prediction": { label: "surface", cls: "surface" },
+  // Lasagna volumes aren't Neuroglancer-overlayable zarrs — Files link only.
+  lasagna: { label: "lasagna", cls: "lasagna" },
 };
 
 function fmt(v) {
@@ -35,8 +37,9 @@ export default function PredictionsPanel({ predictions }) {
       </h2>
       <p className="txt" style={{ marginBottom: "12px" }}>
         Volume-level machine-learning predictions over this scroll&apos;s CT
-        data — surface geometry and, where available, 3D ink detection. Each row
-        opens the prediction volume in Neuroglancer or links its raw files.
+        data — surface geometry, lasagna, and, where available, 3D ink
+        detection. Each row opens the prediction volume in Neuroglancer or
+        links its raw files.
       </p>
       <div className="tablewrap">
         <table className="predtable">
@@ -54,24 +57,22 @@ export default function PredictionsPanel({ predictions }) {
           <tbody>
             {predictions.map((p, i) => {
               const meta = PURPOSE[p.purpose] || { label: p.purpose, cls: "" };
-              const res =
-                p.px != null
-                  ? `${p.px} µm${p.energy != null ? ` · ${p.energy} keV` : ""}`
-                  : "—";
-              const ng = p.zarr
-                ? neuroglancerOverlayUrl(
-                    p.baseZarr,
-                    p.zarr,
-                    {
-                      base: p.baseVolume ? `${p.baseVolume} CT` : "CT volume",
-                      pred: `${meta.label} prediction`,
-                    },
-                    // The prediction ran on OME-Zarr `level` of the base CT, so
-                    // its voxels are 2^level larger — pass both so the overlay
-                    // scales the prediction to align with the CT (see dataAccess).
-                    { baseVoxelUm: p.px, level: p.level ?? 0 }
-                  )
-                : null;
+              const res = p.px != null ? `${p.px} µm` : "—";
+              const ng =
+                p.zarr && p.purpose !== "lasagna"
+                  ? neuroglancerOverlayUrl(
+                      p.baseZarr,
+                      p.zarr,
+                      {
+                        base: p.baseVolume ? `${p.baseVolume} CT` : "CT volume",
+                        pred: `${meta.label} prediction`,
+                      },
+                      // The prediction ran on OME-Zarr `level` of the base CT, so
+                      // its voxels are 2^level larger — pass both so the overlay
+                      // scales the prediction to align with the CT (see dataAccess).
+                      { baseVoxelUm: p.px, level: p.level ?? 0 }
+                    )
+                  : null;
               const files = p.zarr ? browseUrl(p.zarr) : null;
               return (
                 <tr key={`${p.purpose}-${p.baseVolume}-${i}`}>
