@@ -1236,3 +1236,21 @@
 - Invalid public origins, cache markers, coordinate metadata, and remote group
   descriptors now fail explicitly instead of selecting or constructing an
   alternate cache dependency.
+
+## 2026-08-23 — Explicit shared inference Z-band lifecycle
+
+- Replaced the cross-band multi-device event state machine with a lazy explicit
+  Z-band barrier and exact shared-slot ownership for both Fiber and Lasagna.
+- Made accumulator queue submission nonblocking and flush batches finalize and
+  release their circular generations immediately after full acknowledgement.
+- Replaced the flush timeout/process-limit guess with stage-aware quiescence
+  diagnostics, while retaining bounded per-process Zarr and native/Blosc
+  thread limits.
+- Restored atomic read submission for ordinary local inputs after live-fetch
+  integration had routed even its disabled path through the new staged state.
+  Live materialization now remains a bounded upstream ledger feeding the same
+  queue-based inference stages, with checked per-worker task and slot ownership.
+- Fixed a proven canonical-frontier capacity inversion: one input/result pair
+  is now reserved for the first non-skipped accumulation-frontier tile, so
+  later out-of-order GPU results cannot occupy every result slot and deadlock
+  canonical accumulation. Queue delivery remains fire-and-forget.

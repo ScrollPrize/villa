@@ -357,6 +357,52 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		self.assertEqual(next(events), (0, 4, 4, True, 4))
 		self.assertEqual(next(events), (4, 0, 0, False, 8))
 
+	def test_accumulation_frontier_reserves_capacity_from_later_results(self):
+		events = {
+			10: {"status": "done_skip"},
+			11: {"status": "reading"},
+			**{sequence: {"status": "ready"} for sequence in range(12, 28)},
+		}
+		self.assertEqual(shared_predict3d._frontier_slot_reservation(events, 10), 1)
+		free_inputs = free_results = 16
+		for sequence in range(12, 27):
+			self.assertTrue(shared_predict3d._shared_slot_pair_available(
+				events=events, frontier_sequence=10, sequence=sequence,
+				free_input_count=free_inputs, free_result_count=free_results,
+			))
+			free_inputs -= 1
+			free_results -= 1
+		self.assertEqual((free_inputs, free_results), (1, 1))
+		self.assertFalse(shared_predict3d._shared_slot_pair_available(
+			events=events, frontier_sequence=10, sequence=27,
+			free_input_count=free_inputs, free_result_count=free_results,
+		))
+		events[11]["status"] = "ready"
+		self.assertTrue(shared_predict3d._shared_slot_pair_available(
+			events=events, frontier_sequence=10, sequence=11,
+			free_input_count=1, free_result_count=1,
+		))
+		events[11]["status"] = "assigned"
+		self.assertEqual(shared_predict3d._frontier_slot_reservation(events, 10), 0)
+		events[11]["status"] = "ready"
+		message = shared_predict3d._frontier_capacity_deadlock(
+			events=events, frontier_sequence=10, free_inputs=(0,), free_results=(),
+			slot_owners={
+				("result", 0): (0, 12, "gpu-result"),
+				("result", 1): (0, 13, "gpu"),
+			},
+		)
+		self.assertIn("raw_frontier=10 effective_frontier=11", message)
+		self.assertIn("skipped_prefix=[10] status=ready", message)
+		self.assertIsNone(shared_predict3d._frontier_capacity_deadlock(
+			events=events, frontier_sequence=10, free_inputs=(0,), free_results=(2,),
+			slot_owners={("result", 0): (0, 12, "gpu-result")},
+		))
+		self.assertIsNone(shared_predict3d._frontier_capacity_deadlock(
+			events=events, frontier_sequence=10, free_inputs=(), free_results=(),
+			slot_owners={("result", 0): (0, 10, "accumulating")},
+		))
+
 	def test_progress_refresh_is_not_suppressed_for_piped_stdout(self):
 		ticks = iter((0.0, 0.5, 1.1, 61.1))
 		emitter = shared_predict3d._Predict3dProgressEmitter(clock=lambda: next(ticks))
@@ -466,16 +512,60 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			def write_product_chunk(self, product, *, chunk_origin_zyx, data):
 				self.chunks[chunk_origin_zyx] = np.array(data["value"], copy=True)
 
-		volume = (np.arange(8 * 4 * 4, dtype=np.uint16) * np.uint16(257)).reshape(8, 4, 4)
+		# Four Z bands and four tiles per band exceed both the two shared slots
+		# and the bounded read window, while the delayed first tile forces
+		# out-of-order GPU completion.
+		volume = (np.arange(16 * 8 * 8, dtype=np.uint16) * np.uint16(257)).reshape(16, 8, 8)
 		serial_output = Output()
-		parallel_output = Output()
+
+		class DelayedCacheTask:
+			def __init__(self, polls):
+				self.polls = int(polls)
+
+			def done(self):
+				if self.polls > 0:
+					self.polls -= 1
+					return False
+				return True
+
+			def result(self):
+				if self.polls > 0:
+					raise RuntimeError("live-cache result collected before completion")
+				return None
+
+			def cancel(self):
+				return False
+
+		class LiveCache:
+			lookahead_tiles = 10
+
+			def __init__(self, level_path):
+				self.requests = []
+				self.safe_boundaries = []
+				self.source = type("Source", (), {"level_path": Path(level_path)})()
+
+			def request_region(self, bounds):
+				self.requests.append(bounds)
+				return DelayedCacheTask(1 + len(self.requests) % 3)
+
+			def region_has_remote_chunks(self, bounds):
+				return True
+
+			def advance_safe_boundary(self, z):
+				self.safe_boundaries.append(int(z))
+
+			def snapshot(self):
+				return {}
+
 		common = dict(
-			crop_slices=(0, 8, 0, 4, 0, 4), device=torch.device("cpu"),
-			products=(product,), output_regions_zyx={"identity": (0, 0, 0, 8, 4, 4)},
-			full_output_shapes_zyx={"identity": (8, 4, 4)}, tile_size=4,
+			crop_slices=(0, 16, 0, 8, 0, 8), device=torch.device("cpu"),
+			products=(product,), output_regions_zyx={"identity": (0, 0, 0, 16, 8, 8)},
+			full_output_shapes_zyx={"identity": (16, 8, 8)}, tile_size=4,
 			overlap=0, border=0, product_accumulator_dtype="float16",
 		)
 		with tempfile.TemporaryDirectory() as td:
+			live_input_path = Path(td) / "live-input.zarr"
+			live_cache = LiveCache(live_input_path)
 			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
 				serial_adapter = _IdentityProductAdapter(product)
 				run_tiled_inference_3d(
@@ -483,16 +573,27 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 					model_adapter=serial_adapter, output_adapter=serial_output,
 					tmp_dir=td, **common,
 				)
-				parallel_adapter = SpawnIdentityAdapter(product, delay_zero_origin=True)
-				run_tiled_inference_3d(
-					None, volume, model_adapter=parallel_adapter,
-					output_adapter=parallel_output, tmp_dir=td,
-					devices=(torch.device("cpu"), torch.device("cpu")),
-					slots_per_gpu=1, prefetch_workers=2, accumulator_workers=2, **common,
-				)
-		self.assertEqual(set(serial_output.chunks), set(parallel_output.chunks))
-		for origin in serial_output.chunks:
-			np.testing.assert_array_equal(serial_output.chunks[origin], parallel_output.chunks[origin])
+				for label, selected_live_cache in (("local", None), ("live", live_cache)):
+					parallel_root = Path(td) / f"parallel-output-{label}"
+					parallel_output = SpawnFileOutputAdapter(str(parallel_root), delay_s=0.01)
+					parallel_adapter = SpawnIdentityAdapter(product, delay_zero_origin=True)
+					run_tiled_inference_3d(
+						None, volume, model_adapter=parallel_adapter,
+						output_adapter=parallel_output, tmp_dir=td,
+						devices=(torch.device("cpu"), torch.device("cpu")),
+						slots_per_gpu=1, prefetch_workers=2, prefetch_tiles_per_gpu=1,
+						accumulator_workers=2, flush_workers=2,
+						live_cache=selected_live_cache, **common,
+						input_zarr_path=str(live_input_path),
+					)
+					self.assertEqual(
+						len(list(parallel_root.glob("chunk_*.npy"))), len(serial_output.chunks),
+					)
+					for origin, expected in serial_output.chunks.items():
+						path = parallel_root / ("chunk_" + "_".join(str(v) for v in origin) + ".npy")
+						np.testing.assert_array_equal(expected, np.load(path))
+		self.assertEqual(len(live_cache.requests), 16)
+		self.assertEqual(live_cache.safe_boundaries, [4, 8, 12, 16])
 
 	def test_shared_parallel_tensorstore_pipeline_matches_python_zarr_exactly(self):
 		product = OutputProductSpec(

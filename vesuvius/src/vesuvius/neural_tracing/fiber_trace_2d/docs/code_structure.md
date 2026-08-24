@@ -139,18 +139,21 @@ scale relative to the selected input array for runner geometry only; it is not
 serialized into `.lasagna.json`. `scaledown` remains the persisted
 base-relative manifest scale.
 
-For multi-GPU execution, the runner lazily advances the same nested Z/Y/X
-lattice and never creates its Cartesian job list. By default one shared
+For multi-GPU execution, the runner owns one explicit Z band at a time and
+lazily advances that band's Y/X lattice through bounded windows; it never
+creates a Cartesian job list or retains a whole band. By default one shared
 TensorStore Zarr driver asynchronously reads bounding boxes into an independent
 bounded prefetch window. A ready tile is copied into reusable shared memory only
 when an input slot, result slot, and GPU queue are available. One persistent
 spawned process per GPU performs normalization, model inference, weighting, and
 filtered scaledown. Weighted results use separate fixed shared-memory slots;
-process queues carry descriptors only. Results may complete out of order, but the
-coordinator commits them in canonical order and flushes a Z row only after all
-of that row's inference and skip events commit. Consequently the coordinator
-remains the sole owner of the circular rings, resume checks, progress, and Zarr
-write scheduling. `--slots-per-gpu` controls GPU shared-memory depth;
+process queues carry descriptors only. Results may complete out of order, but
+accumulator submission and commit remain canonical. Every input/result slot has
+one explicit band/sequence/stage owner, and the band advances only when every
+event and accumulator acknowledgement has completed and every slot is free.
+Reads, GPU assignment, and accumulation do not cross that barrier. Consequently
+the coordinator remains the sole owner of the circular rings, resume checks,
+progress, and Zarr write scheduling. `--slots-per-gpu` controls GPU shared-memory depth;
 `--prefetch-tiles-per-gpu` independently controls outstanding/ready reads.
 TensorStore cache/file-I/O/copy concurrency are explicit. The `python-zarr`
 fallback uses `--prefetch-workers`. Single-device inference submits the same
@@ -213,14 +216,17 @@ A logical Z plane maps to
 plane from being overwritten. Ring depth is planned from actual canonical tile
 positions and chunk-aligned flush frontiers. Planning mirrors runtime order:
 each Z row writes before its post-row flush. One runner-wide flush batch handled
-by persistent spawn-process workers may retain the preceding finalized
+by persistent spawn-process workers may retain the preceding frozen
 interval while the next row accumulates.
 The planner simulates that exact write, join/release, submit, next-write order,
 so the enlarged ring has disjoint physical slots without copying live overlap
-or finalized bands. At the following advancing frontier the coordinator waits
-if necessary, then clears/releases the completed interval before submitting
-another; storage slowdown creates bounded backpressure rather than additional
-queued bands. Workers receive only mmap-path/chunk descriptors, reopen mappings
+or finalized bands. The coordinator continuously drains flush acknowledgements
+and clears/releases the interval immediately when the whole combined batch
+succeeds. At the following advancing frontier it waits only if that batch is
+still active before submitting another; storage slowdown creates bounded
+backpressure rather than additional queued bands. Zero-task and synchronous
+batches use the same finalization path. Workers receive only mmap-path/chunk
+descriptors, reopen mappings
 read-only, and allocate one chunk of temporary arrays each. The CLI default is
 the available CPU count capped at 64 workers; zero is the synchronous
 immediate-release baseline. Backing size is
@@ -240,6 +246,29 @@ does not advance `final_z`; completion does. Jobs contain immutable chunk
 descriptors rather than decoded arrays, and shutdown waits for an active mmap
 reader before closing scratch files.
 
+The coordinator pumps reader, GPU, accumulator, and flush completions on every
+cycle. Accumulator queue submission is incremental, so a full stable-owner FIFO
+cannot block the other stages. If unresolved state has no tracked producer it
+fails immediately with Z-band, event-frontier, slot-owner, read, accumulator,
+flush, and worker diagnostics; it does not infer a process-limit failure from an
+elapsed timeout.
+
+For an ordinary local selected level, source-support discovery and bounded read
+submission are one atomic coordinator transition, matching the scheduler used
+before rolling live fetch was added. With `--live-fetch`, only remote
+materialization is additional: a bounded descriptor ledger completes first and
+then hands the tile to that same reader/GPU/accumulator/flush pipeline. Worker
+queues remain descriptor-only; explicit per-worker sequence/task ownership and
+shared-slot ownership are checked throughout the band.
+
+Reads and GPU results may complete out of order, while accumulation stays in
+canonical order. The coordinator therefore skips the canonical sparse/no-op
+prefix to find the effective accumulation frontier and reserves one shared
+input/result pair until that tile enters GPU processing. Later ready tiles can
+use every other pair but cannot occupy the capacity needed to advance the
+frontier. This is an admission invariant, not completion retry logic; worker
+tasks and terminal results remain single fire-and-forget queue messages.
+
 While a flush runs, output completeness checks can inspect future disjoint
 chunks and model inference can overlap product finalization. The shipped
 adapters keep these operations stateless or filesystem-disjoint; custom shared
@@ -252,10 +281,11 @@ Pyramid levels use multiprocessing across output chunks. With the default
 `--pyramid-workers 0`, the existing automatic CPU-count process selection is
 retained. Each process is constrained to one BLAS/OpenMP thread, including
 OpenBLAS, MKL, BLIS, Apple vecLib, and NumExpr runtimes, so native libraries do
-not multiply the process count by another CPU-count-sized thread pool. Parent
-environment and native thread limits are restored when a level finishes or a
-worker fails. `--pyramid-workers` remains available to tune I/O and memory
-bandwidth performance.
+not multiply the process count by another CPU-count-sized thread pool. Its Zarr
+executor and Blosc codec are likewise capped at one thread. Parent environment
+and native thread limits are restored when a level finishes or a worker fails.
+`--pyramid-workers` remains available to tune I/O and memory bandwidth
+performance.
 
 Lasagna's optional `pred_dt` is an external-source stage after neural
 inference. It is independently resumable and never schedules model tiles.
@@ -2488,7 +2518,7 @@ The tests are expected to use fake/local data and not require network access.
 
 ## Shared 3D accumulator pipeline
 
-`lasagna/tiled_predict3d.py` owns accumulation for both Lasagna and Fiber 3D
+`lasagna/tiled_predict3d.py` owns accumulation scheduling for both Lasagna and Fiber 3D
 inference. Multi-device runs send chunk-bounded descriptors to persistent
 spawned processes; result tensors stay in the existing shared-memory slots and
 accumulators stay in the rolling mmap. No tile-sized arrays are serialized
@@ -2496,7 +2526,9 @@ through multiprocessing queues.
 
 `--accumulator-workers` controls process count (default `min(CPU count, 32)`;
 zero selects the synchronous diagnostic baseline). Each spatial output chunk
-has a deterministic worker owner and FIFO ordering. Startup and completion
+has a deterministic worker owner and FIFO ordering. Submission is canonical,
+bounded, and nonblocking so the coordinator can continue draining all stages.
+Startup and completion
 logs report backend, task rate, summed work, queue wait, and wall time.
 
 Product accumulators default to float16 and weights remain float32. The

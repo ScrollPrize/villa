@@ -1,67 +1,93 @@
-# Task log: catalogue-backed Fiberlet normal inputs
+# Task log: explicit Z-band shared inference pipeline
 
-- Inspected the current manager: `fiberlet run` requires two completed local
-  manager runs, while catalogue indexing exposes only CT volumes.
-- Inspected native VC Lasagna access: direct remote manifests already support
-  persistent read-through caching via `--remote-cache-dir`; this will be reused
-  rather than duplicated.
-- The cached Paris4 catalogue currently exposes the published Fiber Lasagna
-  entry but no regular Lasagna-normal entry. A real catalogue refresh is still
-  required before final availability reporting.
-- Independent review corrected the normal contract to require
-  `grad_mag`/`nx`/`ny`, preserved differing published Fiber/normal source
-  levels, required the existing one-voxel base-shape tolerance, and identified
-  remote provenance/resume and manager-owned cache-option requirements.
-- Refreshed public catalogue SHA-256
-  `992b52e239f4af7156fd168ab4b5f4411caf99f2a37884490d57843a8db903a2`.
-  It still has no Paris4 normal entry. Direct anonymous S3 listing also found
-  zero objects below `PHercParis4/representations/predictions/lasagna/`; this
-  is missing source data, not a stale manager index.
-- VC3D contains similar open-data Lasagna prefix preparation in a Qt GUI
-  translation unit. Sharing that implementation with Python is not feasible
-  without a cross-language library/CLI extraction beyond this manager fix.
-  The Python manager will reuse the downloader's existing paginated S3 helper
-  rather than copy listing logic within Python; cross-language duplication is
-  recorded as an explicit deviation.
-- Added exact-model Lasagna prediction indexing, role classification, stable
-  `atlas:<model>@L<level>` selectors, cached root-manifest discovery, anonymous
-  HTTPS locators, and the existing `lasagna-remote.json` persistent lazy cache
-  layout.
-- Made the normal input optional, retained explicit local-run overrides, added
-  remote dependency identity and exact-hash resume, and corrected local normal
-  validation to require native-compatible `grad_mag`/`nx`/`ny`.
-- Added one-voxel-per-axis base-shape tolerance while preserving distinct Fiber
-  and normal source levels. Updated cache-only completion, CLI help, manager
-  docs, specs, and changelog.
+- Live Paris4 evidence showed that its already-started GPU, accumulator, and
+  flush workers were alive and idle while all three result queues were empty;
+  the coordinator continued its generic 50 ms GPU-result poll. This identifies
+  scheduler quiescence, independently of the host's current thread pressure.
+- The problematic flush payloads had all reached disk (305 current cosine
+  chunks and 89 chunks for each normal channel), so the observed terminal state
+  is coordinator bookkeeping/quiescence rather than compression or output I/O.
+- Static inspection found that a fully acknowledged flush remains frozen until
+  a later canonical Z-row calls `_advance_flushes()`. This couples ring release
+  to a different event-state transition and leaves the generic idle poll unable
+  to identify the actual unresolved owner.
+- The task will replace that coupling with an explicit current-Z-band barrier
+  and one previous flush lifecycle. No full-band copy, extra mmap, global tile
+  list, numerical reorder, or Fiber/Lasagna implementation split is permitted.
+- Independent review required active-band-only model reads/GPU/accumulation,
+  a separate bounded live-cache descriptor ledger, explicit slot and flush
+  ownership, nonblocking accumulator submission, and exact rollback of only
+  the faulty elapsed-time watchdog/process-limit diagnosis.
+- The shared runner now lazily schedules one Z band at a time. Its live-cache
+  descriptor ledger may retain the configured 10,000 cheap future requests,
+  while active full-tile reads and events remain bounded by the existing
+  slot/read window and cannot cross the band barrier.
+- Input/result slots now have checked `(band, sequence, stage)` ownership.
+  Accumulator descriptors enter stable-owner queues incrementally; full queues
+  yield to reader, GPU, accumulator-result, and flush-result pumping.
+- Combined multi-scale flush batches now track immutable plans and disjoint
+  queued/inflight/completed task IDs. Fully acknowledged and zero-task batches
+  use the same immediate finalization routine as synchronous flush; failures do
+  not clear/release frozen ring generations.
+- Removed the elapsed flush watchdog and RLIMIT guess. The existing per-worker
+  Zarr executor and BLAS/OpenMP/NumExpr/Blosc limits remain in place.
 - Validation:
-  - `python -m pytest -q lasagna/tests/test_manager.py
-    lasagna/tests/test_manager_open_data.py
-    lasagna/tests/test_inference_provenance.py
-    lasagna/tests/test_bootstrap_venv.py
-    volume-cartographer/python/test_fiberlets_cli.py`: 87 passed.
-  - `python -m pytest -q lasagna/tests/test_download_omezarr.py
-    lasagna/tests/test_download_volume_list.py`: 25 passed.
-  - `volume-cartographer/build/dev-quickbuild-gcc/bin/test_fiberlet_storage`:
-    26 test cases passed.
-  - Real cached completion exposes `atlas:20260419180421@L2` for PHerc0332 and
-    PHerc1299 Fiber runs.
-- Real public PHerc0332 resolution cached and validated manifest SHA-256
-  `201c45c6e54a2ffd77b58fcf541322e4fc5cb031313326dc8d5254d19e5f2521`
-  with `cos/grad_mag/nx/ny`, without launching preprocessing.
-- Corrected the initial manager-only manifest-SHA cache directory after review.
-  Published normals now use VC3D's exact canonical URL conversion,
-  `open_data/lasagna/<sample>/<volume>/<identity>` directory calculation, and
-  full `lasagna-remote.json` fields. Manifest SHA remains integrity/provenance
-  only and does not address the cache or synthesize an Atlas run UUID; the
-  exact remote artifact/manifest URL is the published source locator.
-- Tightened resolution to the first `public-read` catalogue origin and made
-  malformed/mismatched markers, invalid catalogue coordinate identity,
-  outer/inner manifest disagreement, and missing/invalid remote Zarr
-  descriptors hard errors. No alternate prediction or cache layout is used as
-  a fallback.
-- Real PHerc0332 preparation now resolves to
-  `open_data/lasagna/PHerc0332/20251211183505/078820a387cf852f`, validates the
-  manifest and all four group descriptors, and retains manifest SHA-256 only as
-  dependency integrity metadata.
-- Revalidation after the cache correction: 112 focused Python tests and 26
-  native Fiberlet storage cases passed; `git diff --check` passed.
+  - The focused shared-runner/ownership selection passed: 4 tests, 65
+    deselected, in 21.26s.
+  - The complete native/Zarr worker-limit file passed: 8 tests in 1.52s.
+  - The live materialization/cache suites passed: 9 tests in 1.68s.
+  - The main regression spans four Z bands and 16 dense tiles (> two slots and
+    > the two-tile read window), forces out-of-order GPU completion, keeps a
+    ten-descriptor live-download lookahead across band boundaries, uses two
+    accumulator and two flush processes, and exactly matches serial output. It
+    passed by itself with delayed live-cache completions in 12.53s.
+  - Four Fiber 3D live-cache/prefetch/slot CLI tests passed, with 202
+    deselected, in 2.41s, proving the Fiber caller still reaches the shared
+    interface correctly.
+  - `py_compile` and `git diff --check` passed.
+- A wider Zarr-writing test run could not be used as final evidence because the
+  shared host currently has about 18,222 threads, above the observed 16,384
+  user task limit; more than 10,000 belong to a separate active training job.
+  Even an isolated fresh `zarr.open_group` stalled in that host state.
+- The production baseline supplied by the user did not complete: Paris4 became
+  quiescent at 23,700/606,208 tiles with all workers alive and idle. Full
+  Paris4 multi-GPU completion and throughput remain user-side validation because
+  this sandbox does not expose the GPUs or the running dataset namespace.
+- The first production rerun reached 27,747/606,208, then remained unchanged
+  for more than an hour in the middle of a 4,096-event Z band. The coordinator
+  main thread repeatedly polled a process connection with a 50 ms timeout.
+  All eight GPU workers and all 32 accumulator workers were alive and blocked
+  in `pipe_read` waiting for new input; all eight inference CUDA contexts were
+  resident but showed no GPU work. Flush workers were idle and no flush was
+  active at the terminal log frontier.
+- The coordinator dump's parent `QueueFeederThread` instances all had empty
+  buffers and were asleep. That refutes the proposed queue-to-pipe replacement;
+  the evidence does not show a feeder losing a submitted descriptor.
+- The failed run explicitly had `live_fetch.enabled=false`. Nevertheless,
+  live-fetch commit `7a2a84d36` had changed the disabled path from atomic
+  discovery/read submission to the new `awaiting_read` lifecycle. The repair
+  restores the pre-live normal path and confines live materialization to an
+  upstream bounded ledger feeding the same worker pipeline.
+- TensorStore completed the exact first uncommitted tile and a 200-tile
+  neighborhood in under 0.53 seconds, ruling out a persistent source/read
+  defect at that coordinate. Stage-aware waits, per-worker task ownership,
+  slot ownership, and liveness checks now make unresolved scheduler state an
+  explicit invariant failure rather than an endless generic GPU-result poll.
+- A Python-aware stack/locals capture of the next production freeze identified
+  the actual cycle. `next_commit` and `next_accum_dispatch` were both 160589;
+  the active events were 14 `ready`, 16 later `done_result`, and two
+  `done_skip`, with no reads or assigned GPU work. All 16 result slots were
+  therefore held by later results which canonical accumulation could not
+  consume before ready sequence 160589, while that sequence could not enter a
+  GPU without a result slot. No accumulator task or completion was missing.
+- Rejected and removed an unproven acknowledged-completion retry experiment.
+  Worker task/result queues retain their single fire-and-forget messages.
+- GPU admission now reserves one input/result pair for the effective canonical
+  frontier after a contiguous sparse-skip prefix. A direct full-16-slot
+  reservation test, shared worker descriptor test, delayed/out-of-order exact
+  shared-pipeline test, and TensorStore/Python-Zarr equivalence test passed (4
+  tests, 58 deselected, 19.13s). Both live-cache suites passed (9 tests, 1.55s).
+- The full combined Lasagna files are not green independently of this repair:
+  the first isolated failure is an existing stale test patch target
+  (`preprocess_cos_omezarr._auto_download` moved to the shared module), and a
+  later pytest failure-rendering path segfaulted in NumPy array formatting.

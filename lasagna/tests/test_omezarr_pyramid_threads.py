@@ -34,8 +34,8 @@ class OmezarrPyramidThreadTests(unittest.TestCase):
 		):
 			limiter = tiled_predict3d._limit_native_worker_threads()
 			self.assertEqual(os.environ["BLOSC_NTHREADS"], "1")
-		zarr_set.assert_called_once_with({"async.concurrency": 1, "threading.max_workers": 1})
-		blosc_set.assert_called_once_with(1)
+			zarr_set.assert_called_once_with({"async.concurrency": 1, "threading.max_workers": 1})
+			blosc_set.assert_called_once_with(1)
 		del limiter
 
 	def test_pyramid_worker_limiter_caps_zarr_and_blosc(self):
@@ -44,45 +44,32 @@ class OmezarrPyramidThreadTests(unittest.TestCase):
 			mock.patch("omezarr_pyramid.numcodecs.blosc.set_nthreads") as blosc_set,
 		):
 			_limit_zarr_codec_threads()
-		zarr_set.assert_called_once_with({"async.concurrency": 1, "threading.max_workers": 1})
-		blosc_set.assert_called_once_with(1)
+			zarr_set.assert_called_once_with({"async.concurrency": 1, "threading.max_workers": 1})
+			blosc_set.assert_called_once_with(1)
 
-	def test_parallel_flush_stall_fails_with_actionable_state(self):
-		class FakeProcess:
-			pid = 42
-			exitcode = None
+	def test_shared_slot_ledger_rejects_duplicate_and_foreign_release(self):
+		ledger = tiled_predict3d._SlotLedger(2)
+		ledger.acquire("result", 0, band=4, sequence=7, stage="gpu")
+		with self.assertRaisesRegex(RuntimeError, "already owned"):
+			ledger.acquire("result", 0, band=4, sequence=8, stage="gpu")
+		with self.assertRaisesRegex(RuntimeError, "conflicts"):
+			ledger.release("result", 0, band=4, sequence=8)
+		ledger.transition("result", 0, band=4, sequence=7, stage="accumulating")
+		ledger.release("result", 0, band=4, sequence=7)
+		ledger.validate_all_free()
 
-			@staticmethod
-			def is_alive():
-				return True
-
-		pending = {
-			"batch_id": 7,
-			"tasks": [object(), object()],
-			"inflight": {3},
-			"completed": 11,
-			"last_completion_at": 10.0,
-		}
-		with mock.patch.object(
-			tiled_predict3d, "_flush_process_limit_text", return_value="RLIMIT_NPROC soft=16 hard=16",
-		):
-			with self.assertRaisesRegex(
-				RuntimeError,
-				r"stalled for 5\.0s.*batch=7.*queued=2.*inflight=1.*completed=11.*RLIMIT_NPROC",
-			):
-				tiled_predict3d._check_flush_stall(
-					pending, [FakeProcess()], timeout_seconds=4.0, now=15.0,
-				)
-
-	def test_parallel_flush_stall_allows_recent_completion(self):
-		tiled_predict3d._check_flush_stall(
-			{
-				"batch_id": 1, "tasks": [], "inflight": {0},
-				"completed": 0, "last_completion_at": 10.0,
-			},
-			[],
-			timeout_seconds=4.0,
-			now=13.9,
+	def test_quiescent_state_without_a_producer_fails_immediately(self):
+		with self.assertRaisesRegex(RuntimeError, "unresolved work and no producer"):
+			tiled_predict3d._coordinator_wait_stage(
+				statuses={"awaiting_read": 1}, reads=0, accumulator_tasks=0,
+				slot_owners={},
+			)
+		self.assertEqual(
+			tiled_predict3d._coordinator_wait_stage(
+				statuses={"assigned": 1}, reads=0, accumulator_tasks=0,
+				slot_owners={("input", 0): (4, 7, "gpu")},
+			),
+			"gpu",
 		)
 
 	def test_parent_native_thread_environment_restored_after_error(self):

@@ -60,10 +60,12 @@
   including across inference scales. No live overlap, finalized band, or full
   mmap region is copied to another mmap or a band-sized RAM buffer.
 - Submitted/frozen, completed/written, and released/origin frontiers are
-  distinct. At the next advancing frontier the coordinator waits for the
-  previous combined flush, clears its exact dirty rectangles, releases its
-  generations, and only then submits the next combined interval. User-visible
-  finalized Z advances only after successful output writes.
+  distinct. A combined chunk-aligned, possibly empty, multi-scale flush batch
+  has immutable plans and disjoint queued, inflight, and completed task IDs.
+  The coordinator drains acknowledgements continuously and, immediately after
+  the complete batch succeeds, clears its exact dirty rectangles, releases its
+  generations, and advances user-visible finalized Z. Before submitting the
+  next combined interval it waits only if the preceding batch is still active.
 - The flush worker receives immutable chunk descriptors and reads frozen mmap
   regions one output chunk at a time. Temporary denominator, stacked raw, and
   finalized channel arrays remain bounded by one output chunk. A failed flush
@@ -157,8 +159,10 @@
   persistent spawn-context model worker per selected CUDA device, without DDP
   or GPU collectives.
 - The canonical tile stream materializes only independent Z/Y/X axis lattices
-  (O(Z+Y+X)), never their Cartesian product. Filtering, CPU/Zarr prefetch, GPU
-  execution, result completion, and ordered commit use fixed bounded windows.
+  (O(Z+Y+X)), never their Cartesian product. Multi-device execution owns one
+  explicit Z band at a time and lazily generates that band's Y/X traversal into
+  fixed bounded descriptor/read windows; it never retains a whole band. Reads,
+  GPU execution, and accumulation do not cross the band completion barrier.
 - Input reads happen outside GPU workers. The default local Zarr-v2 backend is
   one asynchronously polled TensorStore driver/context created only after all
   spawned GPU/flush workers start. `python-zarr` is an explicit fallback.
@@ -186,10 +190,25 @@
   service from wall span, and directly reports reader throughput and effective
   outstanding-request concurrency, queue delays, CPU conversion,
   CUDA/transfer/model/output, and commit stages.
-- GPU results may finish out of order, but accumulation remains in canonical
-  tile order. A Z row flushes only after all preceding canonical events,
-  including skips, commit. The coordinator solely owns circular accumulators,
-  resume state, progress, and output writes.
+- GPU results may finish out of order, but accumulator task submission remains
+  in canonical tile order and is nonblocking under worker-queue pressure. Each
+  shared input/result slot has exactly one `(band, sequence, stage)` owner and
+  must be returned before the Z-band transition. A band completes only after
+  all of its lazy events, including skips, commit and all reader/GPU/accumulator
+  work is acknowledged. The coordinator solely owns scheduling, circular-ring
+  frontiers, resume state, and progress; flush workers execute distinct
+  coordinator-planned output chunk writes.
+- GPU admission computes the effective accumulation frontier after its
+  contiguous `done_skip` prefix. While that frontier still needs GPU work, one
+  input/result slot pair is reserved for it; later ready tiles may consume only
+  the remaining pairs. This prevents later out-of-order GPU results from owning
+  every result slot and blocking the canonical tile required to release them,
+  without changing canonical accumulator submission or numerical order.
+- After draining every completion source, unresolved state with no tracked live
+  reader, GPU, accumulator, or flush producer is an immediate invariant error
+  with band/event/slot diagnostics. Legitimate tracked work is waited on at its
+  actual stage; no generic GPU poll or elapsed-time watchdog diagnoses it as a
+  process-limit failure.
 - Output adapters must permit completeness checks for future, disjoint chunks
   while the flush worker writes a frozen chunk. Model adapters must permit
   inference to overlap their stateless raw-product finalization callback.
@@ -213,6 +232,14 @@
   tile descriptors, and `--download-workers` controls raw chunk transfers.
   This descriptor window is independent of the smaller TensorStore full-tile
   read window and must not materialize a global Cartesian job list.
+- When live fetch is disabled, supported-tile discovery and bounded input-read
+  submission are one atomic scheduler transition. Live fetch adds only the
+  upstream materialization state; completed live descriptors enter the same
+  bounded reader/GPU/accumulator/flush stages and canonical commit order.
+- GPU and accumulator descriptor queues remain bounded. The coordinator tracks
+  the exact sequence/task owner for every queued worker item and the exact
+  owner/stage of every shared input/result slot; mismatched, foreign, duplicate,
+  or dead-worker ownership is a fatal invariant error.
 - Live source support is authoritative per active remote Z-chunk inventory;
   transient local absence and advisory `.noremote` data cannot suppress valid
   inference. Completed output work is rejected before remote materialization.
@@ -2735,10 +2762,14 @@
 - Positive `flush_workers` use persistent spawn processes with bounded
   descriptor-only queues. Workers read frozen mmap regions directly and own
   distinct scale/chunk writes; ndarray payloads never cross IPC.
-- Exactly one frozen batch may overlap the following inference band. Ring reuse
-  and `final_z` advancement require successful completion of the entire batch.
-- Each worker limits native CPU libraries to one thread and allocates at most
-  one chunk's denominator/raw/finalized arrays.
+- Exactly one immutable combined flush batch may overlap the following
+  inference band. Zero-task and fully acknowledged batches finalize immediately
+  through the same release/accounting routine as synchronous flush. Ring reuse
+  and `final_z` advancement require successful completion of the entire batch;
+  failed batches never clear or release frozen generations.
+- Each worker limits native CPU libraries and its Zarr executor to one thread
+  and allocates at most one chunk's denominator/raw/finalized arrays. This
+  prevents the process pool from multiplying into CPU-count-sized nested teams.
 - `flush_workers=0` is the synchronous baseline and uses immediate ring release;
   both inference CLIs default to the available CPU count capped at 64 process
   workers.
