@@ -377,7 +377,8 @@ function extractInkSegments(sample, id, s3ToHttp, renderSizes) {
   return out;
 }
 
-// Volume-level model predictions for a sample (surface-prediction / 3D-ink) —
+// Volume-level model predictions for a sample (surface-prediction / 3D-ink /
+// lasagna) —
 // the "Predictions" table the old atlas exposed. A prediction lives in the same
 // volume object as the base CT ome-zarr, so the volume's properties give the
 // base resolution/energy and the volume map key IS the base-volume id. The raw
@@ -396,11 +397,15 @@ function extractPredictions(sample) {
     // the prediction is overlaid onto in Neuroglancer.
     const baseZarr = oneUrl((v.data || []).find((d) => d.type === "ome-zarr"));
     for (const d of v.data || []) {
-      if (d.type !== "surface-prediction-zarr" && d.type !== "ink-detection-3d-zarr")
+      if (
+        d.type !== "surface-prediction-zarr" &&
+        d.type !== "ink-detection-3d-zarr" &&
+        d.type !== "lasagna"
+      )
         continue;
       const p = d.parameters || {};
       out.push({
-        purpose: d.type.replace(/-zarr$/, ""), // surface-prediction | ink-detection-3d
+        purpose: d.type.replace(/-zarr$/, ""), // surface-prediction | ink-detection-3d | lasagna
         baseVolume: volKey,
         px: props.pixel_size_um ?? null,
         energy: props.energy_keV ?? null,
@@ -412,9 +417,10 @@ function extractPredictions(sample) {
       });
     }
   }
-  // 3D-ink first (the showcase), then surface predictions by finest pixel size,
-  // then model id — a stable, meaningful order for the table.
-  const rank = (x) => (x.purpose === "ink-detection-3d" ? 0 : 1);
+  // 3D-ink first (the showcase), then surface predictions, then lasagna, each
+  // by finest pixel size then model id — a stable, meaningful table order.
+  const rank = (x) =>
+    x.purpose === "ink-detection-3d" ? 0 : x.purpose === "lasagna" ? 2 : 1;
   out.sort((a, b) => {
     if (rank(a) !== rank(b)) return rank(a) - rank(b);
     const pa = a.px ?? 1e9;
