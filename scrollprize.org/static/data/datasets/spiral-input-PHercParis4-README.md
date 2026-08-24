@@ -32,7 +32,9 @@ the volume can be fit and evaluated.
   JSON point collections**. `same_windings.json`, `relative_windings.json` and
   `abs_winding.json` store `(x, y, z)` in the voxel grid of **level 2** of the scan
   (18946 x 8174 x 8174), which is the grid the surface prediction is computed on.
-  Read as `(z, y, x)` at full resolution, their points fall outside the papyrus.
+  Read as `(z, y, x)` at full resolution the points stay inside the volume, so a
+  bounds check will not catch the mistake — they simply land in empty space instead
+  of on the papyrus.
 - `umbilicus.json` names its axes per point (`x`, `y`, `z`) and is in that same
   level-2 grid.
 
