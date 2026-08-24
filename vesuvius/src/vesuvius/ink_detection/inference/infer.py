@@ -966,13 +966,6 @@ def infer_single_zarr(
     """Run one direction over one surface-volume input and replace a TIFF."""
 
     root = open_volume_root(input_zarr)
-    mismatch = check_flat_input_scale(
-        root,
-        source=str(input_zarr),
-        strict=bool(getattr(args, "strict_input_scale", False)),
-    )
-    if mismatch is not None:
-        LOGGER.warning("%s", mismatch)
     resolution = "0" if hasattr(root, "shape") else str(args.resolution)
     volume = select_volume_level(root, resolution, source=str(input_zarr))
     depth_first, depth, height, width, chunk_h, chunk_w = _volume_axes(volume)
@@ -1156,6 +1149,23 @@ def resolve_run_directions(direction: str) -> tuple[str, ...]:
     return ("forward", "reverse") if direction == "both" else (direction,)
 
 
+def report_input_scale(args, input_zarr) -> None:
+    """Compare a prepared input's recorded scale with its recipe's, once per input.
+
+    Called before the direction loop rather than inside `infer_single_zarr`, which runs
+    once per direction: the finding describes the input, not the traversal, and
+    `--direction both` would otherwise report it twice.
+    """
+
+    mismatch = check_flat_input_scale(
+        open_volume_root(input_zarr),
+        source=str(input_zarr),
+        strict=bool(getattr(args, "strict_input_scale", False)),
+    )
+    if mismatch is not None:
+        LOGGER.warning("%s", mismatch)
+
+
 def resolve_single_output_path(
     output_tiff: Path,
     *,
@@ -1229,6 +1239,14 @@ def infer_folder(
             LOGGER.warning("Skipping %s: %s", segment_dir, exc)
             skipped_count += 1
             continue
+        try:
+            report_input_scale(args, input_zarr)
+        except InputScaleRefused as exc:
+            # Same level and same convention as the missing-input case above: one bad
+            # segment is skipped and recorded, and the rest of the folder still runs.
+            LOGGER.warning("Skipping %s: %s", segment_dir, exc)
+            skipped_count += 1
+            continue
         for direction in resolve_run_directions(args.direction):
             name_prefix = (
                 f"{prefix}{segment_dir.name}_{checkpoint_stem}_{direction}_"
@@ -1248,21 +1266,14 @@ def infer_folder(
                 )
                 skipped_count += 1
                 continue
-            try:
-                infer_single_zarr(
-                    args=args,
-                    input_zarr=input_zarr,
-                    configured_model=configured_model,
-                    device=device,
-                    output_tiff=prediction_dir / f"{name_prefix}{date}.tif",
-                    layer_direction=direction,
-                )
-            except InputScaleRefused as exc:
-                # Same convention as the missing-input case above: one bad segment is
-                # skipped and recorded, it does not abort the rest of the folder.
-                LOGGER.warning("Skipping %s: %s", segment_dir, exc)
-                skipped_count += 1
-                continue
+            infer_single_zarr(
+                args=args,
+                input_zarr=input_zarr,
+                configured_model=configured_model,
+                device=device,
+                output_tiff=prediction_dir / f"{name_prefix}{date}.tif",
+                layer_direction=direction,
+            )
             ran_count += 1
     LOGGER.info(
         "Folder run complete. segments_ran=%d segments_skipped=%d",
@@ -1404,6 +1415,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.folder is not None:
         infer_folder(args, configured, device=device)
     else:
+        try:
+            report_input_scale(args, args.input_zarr)
+        except InputScaleRefused as exc:
+            LOGGER.error("%s", exc)
+            return 1
         for direction in resolve_run_directions(args.direction):
             infer_single_zarr(
                 args=args,
