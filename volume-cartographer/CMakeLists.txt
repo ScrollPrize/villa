@@ -680,6 +680,22 @@ if(VC_BUILD_PYTHON)
     find_package(nanobind CONFIG REQUIRED)
 endif()
 
+# VC-Delta3D is maintained as a standalone first-party codec. Prefer an
+# installed package (useful for distro builds and local development), then
+# fetch the reviewed 0.1.0 release for ordinary builds.
+find_package(vc_delta3d CONFIG QUIET)
+if(NOT TARGET vc_delta3d::vc_delta3d)
+    include(FetchContent)
+    set(VC_DELTA3D_BUILD_PYTHON OFF)
+    set(VC_DELTA3D_BUILD_TESTS OFF)
+    set(VC_DELTA3D_INSTALL_CPP OFF)
+    FetchContent_Declare(vc_delta3d
+        GIT_REPOSITORY https://github.com/ScrollPrize/vc-delta3d.git
+        GIT_TAG v0.1.0
+    )
+    FetchContent_MakeAvailable(vc_delta3d)
+endif()
+
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR MSVC)
     # Clang and MSVC both use the no-op OpenMP shim: -fopenmp / -openmp is never
     # enabled, so every `#pragma omp` is ignored and the omp_*() runtime calls

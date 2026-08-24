@@ -400,7 +400,7 @@ Each of these sources of information provides a hard (verified) or soft (unverif
   caption="The spiral prior, illustrated: an idealized rolled scroll (left) is related to the damaged, deformed scroll observed in the scan (right) by a smooth spatial deformation — the transformation the spiral fit estimates."
 />
 
-One way to represent the deformation is through a **stationary velocity field**. In simple terms, this is a smooth 3D field that tells points how to move from the ideal spiral toward the observed scroll. If the transformation is smooth and does not tear or fold the coordinate system onto itself, it preserves the global structure of the spiral while still adapting to damage. The fitting process itself is implemented in [fit\_spiral.py](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/scripts/spiral/fit_spiral.py), and there is a [full tutorial](tutorial_spiral) on running it.
+One way to represent the deformation is through a **stationary velocity field**. In simple terms, this is a smooth 3D field that tells points how to move from the ideal spiral toward the observed scroll. If the transformation is smooth and does not tear or fold the coordinate system onto itself, it preserves the global structure of the spiral while still adapting to damage. The fitting process itself is implemented in [fit\_spiral.py](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/fit_spiral.py), and there is a [full tutorial](tutorial_spiral) on running it.
 
 A global prior can organize and regularize geometry, allowing a single consistent result to be produced from disconnected annotations, bridging small gaps and interpolating windings. But where annotations are sparse or the volume is highly ambiguous, spiral fitting is still under-constrained, and won't necessarily follow the true sheet surfaces.
 
@@ -740,7 +740,7 @@ High effective resolution matters here too: some ink information may live at ver
 * villa monorepository (VC3D / Volume Cartographer, lasagna, neural tracing): [https://github.com/ScrollPrize/villa](https://github.com/ScrollPrize/villa)
 * VC3D / Volume Cartographer app code: [https://github.com/ScrollPrize/villa/tree/main/volume-cartographer/apps/src](https://github.com/ScrollPrize/villa/tree/main/volume-cartographer/apps/src)
 * lasagna code: [https://github.com/ScrollPrize/villa/tree/main/lasagna](https://github.com/ScrollPrize/villa/tree/main/lasagna) · lasagna fiber tracer: [atlas.py](https://github.com/ScrollPrize/villa/blob/main/lasagna/atlas.py)
-* Spiral fit code: [fit_spiral.py](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/scripts/spiral/fit_spiral.py)
+* Spiral fit code: [fit_spiral.py](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/fit_spiral.py)
 * Ink detection inference code: [ink-detection/optimized_inference](https://github.com/ScrollPrize/villa/tree/main/ink-detection/optimized_inference)
 * Neural tracing inference service (heatmap / dense-displacement / copy modes): [trace_service.py](https://github.com/ScrollPrize/villa/blob/main/vesuvius/src/vesuvius/neural_tracing/trace_service.py)
 * Neural mesh autoregression (MVP): [neural_tracing/autoreg_mesh](https://github.com/ScrollPrize/villa/tree/main/vesuvius/src/vesuvius/neural_tracing/autoreg_mesh)

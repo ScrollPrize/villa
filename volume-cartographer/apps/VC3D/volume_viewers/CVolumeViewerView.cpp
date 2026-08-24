@@ -249,7 +249,15 @@ void CVolumeViewerView::wheelEvent(QWheelEvent *event)
         return;
     }
 
-    _wheelAccum += event->angleDelta().y();
+    // macOS turns Shift+scroll into a horizontal scroll gesture at the system
+    // level, so the delta arrives on the x axis with y left at zero.
+    const QPoint angleDelta = event->angleDelta();
+    int delta = angleDelta.y();
+    if (delta == 0 && event->modifiers().testFlag(Qt::ShiftModifier)) {
+        delta = angleDelta.x();
+    }
+
+    _wheelAccum += delta;
     constexpr int kStepThreshold = 120;  // one notch = one step
     int steps = _wheelAccum / kStepThreshold;
     if (steps == 0) {
