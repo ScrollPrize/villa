@@ -65,20 +65,29 @@ function deriveFacts(sample) {
   const pxVals = scanList.map((s) => s.px).filter((v) => v !== null && v !== undefined);
 
   // Distinct data licenses across the item's volumes (varies: EduceLab vs
-  // CC BY-NC), plus the first OME-Zarr CT volume for a Neuroglancer link.
+  // CC BY-NC), plus the raw-CT OME-Zarr volumes for Neuroglancer links:
+  // `ctVolumes` lists every volume carrying a strict `ome-zarr` (the raw CT —
+  // NOT prediction/layers zarrs) with its id + resolution/energy, feeding the
+  // Data & access "CT in Neuroglancer" picker.
   const licenses = [];
   const seenLic = new Set();
-  let volumeZarr = null;
-  for (const v of Object.values(volumes)) {
+  const ctVolumes = [];
+  for (const [vid, v] of Object.entries(volumes)) {
     const lic = v.properties && v.properties.license;
     if (lic && lic.url && !seenLic.has(lic.url)) {
       seenLic.add(lic.url);
       licenses.push({ name: lic.name || "License", url: lic.url });
     }
-    if (!volumeZarr) {
-      const z = (v.data || []).find((d) => /zarr/i.test(d.type));
-      const o = z && (z.origins || [])[0];
-      if (o && o.path) volumeZarr = `${((o.access_roots || [])[0] || {}).url || ""}/${o.path}`;
+    const ct = (v.data || []).find((d) => d.type === "ome-zarr");
+    const co = ct && (ct.origins || [])[0];
+    if (co && co.path) {
+      const props = v.properties || {};
+      ctVolumes.push({
+        id: vid,
+        px: props.pixel_size_um ?? null,
+        energy: props.energy_keV ?? null,
+        zarr: `${((co.access_roots || [])[0] || {}).url || ""}/${co.path}`,
+      });
     }
   }
 
@@ -95,7 +104,7 @@ function deriveFacts(sample) {
     locations: uniqStrings(scanList.map((s) => s.loc)),
     scans: scanList,
     licenses,
-    volumeZarr,
+    ctVolumes,
   };
 }
 
@@ -606,7 +615,7 @@ function buildIndex(samples, opts) {
       scans: facts ? facts.scans : [],
       hasS3: !!facts,
       licenses: facts ? facts.licenses : [],
-      volumeZarr: facts ? facts.volumeZarr : null,
+      ctVolumes: facts ? facts.ctVolumes : [],
       // curated (overlay)
       ...curated,
       // assets
