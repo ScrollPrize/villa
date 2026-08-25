@@ -73,88 +73,16 @@ FiberletChunkDataset::MaterializedChunk materialized(FiberletStorageChunkKind ki
 
 }  // namespace
 
-TEST_CASE("Fiberlet endpoint reconstruction accepts only finite float roundoff")
-{
-    FiberletStoredAnchor cached;
-    cached.predictionAxisXYZ = {0.25F, 0.5F, 0.75F};
-    cached.predictionPresence = 0.625F;
-    cached.normalXYZ = {0.282699347F, 0.807072759F, 0.518376827F};
-    cached.predictionValid = true;
-    cached.predictionPresenceValid = true;
-    cached.normalValid = true;
-
-    FiberletEndpointScoring reconstructed{
-        {cached.predictionAxisXYZ, cached.predictionPresence, true, true},
-        {0.282699376F, 0.807072759F, 0.518376887F},
-        true};
-    CHECK(fiberletEndpointScoringEquivalent(cached, reconstructed));
-
-    reconstructed.normalXYZ = cached.normalXYZ;
-    reconstructed.normalXYZ[0] =
-        cached.normalXYZ[0] + 8.0F *
-            std::numeric_limits<float>::epsilon();
-    CHECK(fiberletEndpointScoringEquivalent(cached, reconstructed));
-    reconstructed.normalXYZ[0] =
-        cached.normalXYZ[0] + 9.0F *
-            std::numeric_limits<float>::epsilon();
-    CHECK_FALSE(fiberletEndpointScoringEquivalent(cached, reconstructed));
-
-    reconstructed.normalXYZ = cached.normalXYZ;
-    reconstructed.normalXYZ[1] -=
-        8.0F * std::numeric_limits<float>::epsilon();
-    CHECK(fiberletEndpointScoringEquivalent(cached, reconstructed));
-    reconstructed.normalXYZ[1] =
-        cached.normalXYZ[1] - 9.0F *
-            std::numeric_limits<float>::epsilon();
-    CHECK_FALSE(fiberletEndpointScoringEquivalent(cached, reconstructed));
-
-    reconstructed.normalXYZ = -cached.normalXYZ;
-    CHECK_FALSE(fiberletEndpointScoringEquivalent(cached, reconstructed));
-
-    reconstructed.normalXYZ = cached.normalXYZ;
-    reconstructed.normalValid = false;
-    CHECK_FALSE(fiberletEndpointScoringEquivalent(cached, reconstructed));
-
-    reconstructed.normalValid = true;
-    reconstructed.prediction.presence = -0.0F;
-    cached.predictionPresence = 0.0F;
-    CHECK(fiberletEndpointScoringEquivalent(cached, reconstructed));
-    reconstructed.prediction.presence =
-        8.0F * std::numeric_limits<float>::epsilon();
-    CHECK(fiberletEndpointScoringEquivalent(cached, reconstructed));
-    reconstructed.prediction.presence =
-        9.0F * std::numeric_limits<float>::epsilon();
-    CHECK_FALSE(fiberletEndpointScoringEquivalent(cached, reconstructed));
-
-    cached.predictionPresence = 2.0F;
-    reconstructed.prediction.presence =
-        2.0F + 16.0F * std::numeric_limits<float>::epsilon();
-    CHECK(fiberletEndpointScoringEquivalent(cached, reconstructed));
-    reconstructed.prediction.presence =
-        2.0F + 18.0F * std::numeric_limits<float>::epsilon();
-    CHECK_FALSE(fiberletEndpointScoringEquivalent(cached, reconstructed));
-
-    reconstructed.prediction.presence =
-        std::numeric_limits<float>::infinity();
-    CHECK_FALSE(fiberletEndpointScoringEquivalent(cached, reconstructed));
-    cached.predictionPresence = reconstructed.prediction.presence;
-    CHECK_FALSE(fiberletEndpointScoringEquivalent(cached, reconstructed));
-    reconstructed.prediction.presence =
-        std::numeric_limits<float>::quiet_NaN();
-    cached.predictionPresence = reconstructed.prediction.presence;
-    CHECK_FALSE(fiberletEndpointScoringEquivalent(cached, reconstructed));
-}
-
 TEST_CASE("Fiberlet scheduled resolution errors preserve key status and cause")
 {
     const vc::render::ChunkKey key{0, 427, 139, 187};
     vc::render::ChunkResult resolved;
     resolved.status = vc::render::ChunkStatus::Error;
-    resolved.error = "endpoint scoring mismatch";
+    resolved.error = "synthetic generation failure";
     CHECK(
         fiberletScheduledResolutionError(key, resolved) ==
         "scheduled fiberlet chunk 0/427/139/187 resolved as error: "
-        "endpoint scoring mismatch");
+        "synthetic generation failure");
 
     resolved.status = vc::render::ChunkStatus::Missing;
     resolved.error.clear();

@@ -3664,15 +3664,14 @@
   toolchain-specific namespace after comparing the remaining structured
   identity. Version-2 directories are not migrated, repaired, or read through;
   explicitly selecting any scientifically incompatible root is an error.
-- Endpoint scoring reconstructed during Fiberlet generation must match the
-  cached canonical anchor evidence. Validity flags and axis orientation are
-  exact. Finite float32 presence and vector components may differ by at most
-  eight float32 epsilons times `max(1, abs(a), abs(b))` to cover redundant
-  reconstruction across supported compilers; nonfinite or larger differences
-  remain hard errors. This tolerance never changes scoring, paths, costs, or
-  serialized values and cannot bridge producer contracts. No retry or
-  mixed-producer repair is permitted. A scheduled failure preserves the owner
-  key, terminal cache status, and original nested generator message.
+- Cached anchor prediction, presence, and Lasagna-normal fields are not a
+  generation consistency boundary. Fiberlet generation uses freshly sampled
+  endpoint and interior evidence for every metric and decision and does not
+  compare it with those cached fields. Replay transition scoring likewise uses
+  a single-flight derived anchor view which resamples that evidence at each
+  effective anchor position. Cached stable IDs, fitted geometry, and positions
+  remain authoritative. A scheduled failure preserves the owner key, terminal
+  cache status, and original nested generator message.
 
 ## Staged Fiberlet replay filtering
 

@@ -8,10 +8,11 @@
   excluded them from cache compatibility. GCC/Clang generated 2,526 versus
   2,528 focused Fiberlets in one unresolved comparison; the caches remain
   interchangeable while the exact divergent decisions are investigated.
-- Preserved strict endpoint-evidence validation while allowing only bounded
-  finite float32 reconstruction roundoff across GCC/Clang; scoring and stored
-  payloads are unchanged. Scheduled failures now report the owner key,
-  terminal cache status, and nested generator cause.
+- Made fresh prediction and Lasagna-normal samples authoritative for Fiberlet
+  generation and replay transition scoring. Cached endpoint evidence no longer
+  aborts generation when a compatible producer reconstructs slightly different
+  floats. Scheduled failures retain owner key, terminal cache status, and nested
+  generator cause.
 - Raised the exact chunk-route per-entry state guard from one million to five
   million, the smallest tested bound that completes the 1024-base staged
   Paris4 workload without partial results.

@@ -858,13 +858,13 @@ incompatible rather than migrated, repaired, or overwritten. Compiler family,
 compiler version, and build configuration are recorded as producer diagnostics
 but excluded from cache identity and compatibility. When the neutral default
 namespace is absent, default cache discovery can reuse a compatible version-3
-directory created with the earlier toolchain-specific identity. During generation,
-endpoint scoring remains a strict consistency check between the canonical
-anchor cache and the Fiberlet producer. Validity and axis orientation are exact;
-finite reconstructed float32 components allow only an eight-epsilon compiler-
-roundoff bound. This comparison does not alter generated scoring or payloads.
-A scheduled failure reports its owner key, terminal cache status, and original
-generator error.
+directory created with the earlier toolchain-specific identity. Cached anchor
+prediction and normal fields are not a consistency boundary. Fiberlet generation
+uses its freshly sampled endpoint and interior evidence, while the replay anchor
+view resamples prediction and Lasagna normal evidence at each effective anchor
+position before transition scoring. Cached anchor geometry and stable IDs remain
+authoritative. A scheduled failure reports its owner key, terminal cache status,
+and original generator error.
 
 ### Cache portability follow-up
 
@@ -2013,10 +2013,10 @@ per cell without merging anchors from adjacent cells that round to the same
 position. Unrepresentable endpoint deltas fail the scenario instead of silently
 changing identity.
 
-Derived endpoint views are chunk scoped. Compact direction changes only the
-fitted axis; canonical prediction/presence/normal scoring remains exact. A
-position quantum additionally resamples every endpoint scoring field at the
-rounded point. Single-flight construction prevents overlapping fiberlet chunks
-from repeating that sampling, and a bounded LRU releases derived chunks after
-use. Replay seed selection, endpoint lookup, route reconstruction, transitions,
-and compact-cost ownership all use the same view as fiberlet DP.
+Derived endpoint views are chunk scoped. Compact direction changes the fitted
+axis, and prediction/presence/normal fields are always resampled at the effective
+anchor position. A position quantum first rounds that position. Single-flight
+construction prevents overlapping fiberlet chunks from repeating that sampling,
+and a bounded LRU releases derived chunks after use. Replay seed selection,
+endpoint lookup, route reconstruction, transitions, and compact-cost ownership
+all use the same view as fiberlet DP.
