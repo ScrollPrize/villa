@@ -962,6 +962,51 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
                                GlobalLayoutCache* cache)
 {
     GlobalResult result;
+    // Cache bookkeeping runs for every exit path: stats reset up front (so a
+    // duplicate-disabled or early-return build never shows the previous
+    // build's counts), the duplicate check over the whole input (fileName is
+    // the slot identity), and a scope guard that sweeps slots for fileNames
+    // absent from the current snapshot on every return.
+    if (cache != nullptr) {
+        cache->_stats = GlobalLayoutCache::Stats{};
+        std::set<std::string> names;
+        for (const InputFiber& fiber : fibers) {
+            if (!names.insert(fiber.fileName).second) {
+                qWarning() << "fiber map: duplicate fiber fileName"
+                           << QString::fromStdString(fiber.fileName)
+                           << "- layout cache disabled for this build";
+                cache = nullptr;
+                break;
+            }
+        }
+    }
+    struct CacheSweepGuard {
+        GlobalLayoutCache* cache;
+        const std::vector<InputFiber>& fibers;
+        ~CacheSweepGuard()
+        {
+            if (cache == nullptr) {
+                return;
+            }
+            std::set<std::string> names;
+            for (const InputFiber& fiber : fibers) {
+                names.insert(fiber.fileName);
+            }
+            for (auto it = cache->_prep.begin(); it != cache->_prep.end();) {
+                it = names.count(it->first) != 0 ? std::next(it)
+                                                 : cache->_prep.erase(it);
+            }
+            for (auto it = cache->_pairs.begin(); it != cache->_pairs.end();) {
+                it = names.count(it->first.first) != 0 &&
+                             names.count(it->first.second) != 0
+                         ? std::next(it)
+                         : cache->_pairs.erase(it);
+            }
+        }
+    } sweepGuard{cache, fibers};
+    if (cache != nullptr) {
+        cache->_stats.used = true;
+    }
     const auto sortUnplaced = [&result]() {
         std::sort(result.unplaced.begin(), result.unplaced.end(),
                   [](const UnplacedFiber& a, const UnplacedFiber& b) {
@@ -1001,25 +1046,6 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         indexById.emplace(ordered[i]->id, i);
     }
 
-    // The cache's slot identity is the fileName; duplicates would collide,
-    // so they disable the cache for this build. Stats reset first, so a
-    // disabled build reads used = false.
-    if (cache != nullptr) {
-        cache->_stats = GlobalLayoutCache::Stats{};
-        std::set<std::string> names;
-        for (std::size_t i = 0; i < fiberCount; ++i) {
-            if (!names.insert(ordered[i]->fileName).second) {
-                qWarning() << "fiber map: duplicate fiber fileName"
-                           << QString::fromStdString(ordered[i]->fileName)
-                           << "- layout cache disabled for this build";
-                cache = nullptr;
-                break;
-            }
-        }
-    }
-    if (cache != nullptr) {
-        cache->_stats.used = true;
-    }
     const ContentDigest umbDigest = umbilicusDigest(umbilicus);
     std::vector<ContentDigest> prepKeys(fiberCount);
 
@@ -1044,10 +1070,14 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
             ++cache->_stats.fibersReused;
         } else {
             prepared.push_back(prepareFiber(*ordered[i], umbilicus));
-            slot.key = prepKeys[i];
-            slot.thetaLine = prepared.back().thetaLine;
-            slot.radius = prepared.back().radius;
-            slot.controlLineIndex = prepared.back().controlLineIndex;
+            // Value complete before the key is published: a throw during the
+            // copies must never leave a matching key over stale data.
+            GlobalLayoutCache::PrepSlot fresh;
+            fresh.thetaLine = prepared.back().thetaLine;
+            fresh.radius = prepared.back().radius;
+            fresh.controlLineIndex = prepared.back().controlLineIndex;
+            fresh.key = prepKeys[i];
+            slot = std::move(fresh);
             ++cache->_stats.fibersRecomputed;
         }
     }
@@ -1221,25 +1251,6 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
                                detections);
     solve.detectMs += detectLoopMs;
 
-    // One replaceable slot per current fiber and pair: slots for fileNames no
-    // longer in the snapshot are swept, so memory is bounded by the current
-    // fiber set.
-    if (cache != nullptr) {
-        std::set<std::string> names;
-        for (std::size_t i = 0; i < fiberCount; ++i) {
-            names.insert(ordered[i]->fileName);
-        }
-        for (auto it = cache->_prep.begin(); it != cache->_prep.end();) {
-            it = names.count(it->first) != 0 ? std::next(it)
-                                             : cache->_prep.erase(it);
-        }
-        for (auto it = cache->_pairs.begin(); it != cache->_pairs.end();) {
-            it = names.count(it->first.first) != 0 &&
-                         names.count(it->first.second) != 0
-                     ? std::next(it)
-                     : cache->_pairs.erase(it);
-        }
-    }
     result.chirality = solve.chirality;
     result.islandCount = solve.islandCount;
     result.unresolvedCount = solve.unresolvedCount;
@@ -1443,6 +1454,10 @@ ContentDigest digestGlobalInputs(const std::vector<InputFiber>& fibers,
         const ContentDigest content = fiberContentDigest(fiber);
         hashU64(digest, content.a);
         hashU64(digest, content.b);
+        // Runtime ids belong here (they resolve links and appear in outputs)
+        // but deliberately NOT in the cache keys - ids are reassigned per
+        // package load and this digest only ever compares within a session.
+        hashU64(digest, fiber.id);
         hashU64(digest, fiber.label.size());
         hashBytes(digest, fiber.label.constData(),
                   static_cast<std::size_t>(fiber.label.size()) * sizeof(QChar));
@@ -1482,6 +1497,10 @@ ContentDigest digestGlobalInputs(const std::vector<InputFiber>& fibers,
 
 ContentDigest digestGlobalResult(const GlobalResult& result)
 {
+    // Every stable semantic field of the result, so a memoization bug cannot
+    // produce a differing GlobalResult that digests equal. The phase timings
+    // are the one deliberate exclusion: they are telemetry, and warm and
+    // fresh builds necessarily differ there.
     ContentDigest digest = seededDigest(0x0D16);
     hashDouble(digest, result.rRefVx);
     hashDouble(digest, result.x0Vx);
@@ -1489,14 +1508,34 @@ ContentDigest digestGlobalResult(const GlobalResult& result)
     hashDouble(digest, result.yMinVx);
     hashDouble(digest, result.yMaxVx);
     hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(result.chirality)));
+    hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(result.islandCount)));
+    hashU64(digest,
+            static_cast<uint64_t>(static_cast<int64_t>(result.unresolvedCount)));
+    hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(result.tieCount)));
+    hashU64(digest,
+            static_cast<uint64_t>(static_cast<int64_t>(result.suspectLinkCount)));
+    hashU64(digest, static_cast<uint64_t>(
+                        static_cast<int64_t>(result.droppedCrossingCount)));
+    hashU64(digest, static_cast<uint64_t>(
+                        static_cast<int64_t>(result.gatedSegmentCount)));
+    hashU64(digest,
+            static_cast<uint64_t>(static_cast<int64_t>(result.tangentialCount)));
     hashU64(digest, result.fibers.size());
     for (const GlobalPlacedFiber& fiber : result.fibers) {
+        hashU64(digest, fiber.fiber.id);
         hashString(digest, fiber.fiber.fileName);
+        hashU64(digest, static_cast<uint64_t>(fiber.fiber.label.size()));
+        hashBytes(digest, fiber.fiber.label.constData(),
+                  static_cast<std::size_t>(fiber.fiber.label.size()) *
+                      sizeof(QChar));
+        hashU64(digest, static_cast<uint64_t>(fiber.fiber.hvTag));
         hashU64(digest, static_cast<uint64_t>(fiber.meta.anchor));
         hashU64(digest, fiber.meta.linked ? 1 : 0);
         hashU64(digest, fiber.meta.sheetDriftSuspect ? 1 : 0);
         hashU64(digest, static_cast<uint64_t>(
                             static_cast<int64_t>(fiber.meta.networkId)));
+        hashU64(digest, static_cast<uint64_t>(
+                            static_cast<int64_t>(fiber.meta.networkSize)));
         hashDouble(digest, fiber.meta.windingLo);
         hashDouble(digest, fiber.meta.windingHi);
         hashU64(digest, fiber.fiber.runs.size());
@@ -1508,6 +1547,7 @@ ContentDigest digestGlobalResult(const GlobalResult& result)
                 hashDouble(digest, point.y());
             }
         }
+        hashU64(digest, fiber.fiber.controlPoints.size());
         for (const QPointF& point : fiber.fiber.controlPoints) {
             hashDouble(digest, point.x());
             hashDouble(digest, point.y());
@@ -1515,12 +1555,17 @@ ContentDigest digestGlobalResult(const GlobalResult& result)
     }
     hashU64(digest, result.links.size());
     for (const PlacedLink& link : result.links) {
+        hashU64(digest, link.fiberA);
+        hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(link.cpA)));
+        hashU64(digest, link.fiberB);
+        hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(link.cpB)));
         hashDouble(digest, link.a.x());
         hashDouble(digest, link.a.y());
         hashDouble(digest, link.b.x());
         hashDouble(digest, link.b.y());
         hashDouble(digest, link.turnErr);
         hashU64(digest, link.suspect ? 1 : 0);
+        hashU64(digest, link.pending ? 1 : 0);
     }
     hashU64(digest, result.windings.size());
     for (const WindingMark& mark : result.windings) {
@@ -1534,7 +1579,12 @@ ContentDigest digestGlobalResult(const GlobalResult& result)
     }
     hashU64(digest, result.unplaced.size());
     for (const UnplacedFiber& fiber : result.unplaced) {
+        hashU64(digest, fiber.id);
         hashString(digest, fiber.fileName);
+        hashU64(digest, static_cast<uint64_t>(fiber.label.size()));
+        hashBytes(digest, fiber.label.constData(),
+                  static_cast<std::size_t>(fiber.label.size()) * sizeof(QChar));
+        hashU64(digest, static_cast<uint64_t>(fiber.hvTag));
     }
     return digest;
 }

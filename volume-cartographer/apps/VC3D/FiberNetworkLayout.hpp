@@ -214,7 +214,9 @@ struct UnplacedFiber {
 };
 
 struct GlobalResult {
-    // Ordered by (label, id), every placeable fiber of the input.
+    // Ordered by (label, fileName, id), every placeable fiber of the input;
+    // fileName before the runtime id so the order survives id reassignment
+    // across package loads.
     std::vector<GlobalPlacedFiber> fibers;
     std::vector<PlacedLink> links;
     // One mark per integer winding across the padded extent.
@@ -276,10 +278,11 @@ struct ContentDigest {
 // are pure key -> value memoizations, so a build that throws mid-way leaves
 // only valid entries behind.
 //
-// The cached build is bit-identical to an uncached one BY CONSTRUCTION: the
-// fresh path runs the same per-pair detection function and the same shard
-// assembly, so a cache hit substitutes an equal value into an identical
-// computation.
+// The cached build is identical to an uncached one in every SEMANTIC field
+// BY CONSTRUCTION: the fresh path runs the same per-pair detection function
+// and the same shard assembly, so a cache hit substitutes an equal value
+// into an identical computation. The phase timing fields are telemetry and
+// necessarily differ; digestGlobalResult() defines the semantic field set.
 class GlobalLayoutCache;
 
 [[nodiscard]] GlobalResult buildGlobalLayout(

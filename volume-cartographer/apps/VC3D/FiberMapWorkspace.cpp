@@ -861,24 +861,15 @@ void FiberMapWorkspace::rebuildLayout(bool fullRebuild)
     // beyond it — leaves the recorded token disagreeing with the disk, and the
     // refresh at the end of this function raises the banner. Recording a
     // post-read token instead would tag geometry of indeterminate vintage as
-    // current even in the cases the token can see.
-    _layoutUmbilicusFingerprint = _controller->umbilicusFingerprint();
+    // current even in the cases the token can see. Held in a local: every
+    // dependency watermark is committed together AFTER the build succeeds, so
+    // a failed build cannot leave the old scene marked current against new
+    // dependencies.
+    const QString preReadUmbilicusFingerprint = _controller->umbilicusFingerprint();
     LineAnnotationController::FiberMapSnapshot snapshot = _controller->fiberMapSnapshot();
     const qint64 snapshotMs = phaseTimer.restart();
-    _layoutGeneration = snapshot.generation;
-    // Everything the snapshot was derived from, so a later check compares against
-    // what this build actually used rather than against whatever is current. The
-    // frame comes from the snapshot rather than a second derivation for that
-    // reason; only the umbilicus token has to be read separately.
-    _layoutFrame = snapshot.frame;
-    _layoutPackageGeneration = _controller->packageGeneration();
-    _layoutUmbilicusGeneration = _controller->umbilicusGeneration();
-    // Set before the build so an empty result still counts as built: it was
-    // derived from these dependencies and goes out of date with them.
-    _layoutBuilt = true;
-    _staleReason.clear();
-    _latchedReason.clear();
-    _restingReason.clear();
+    const uint64_t builtPackageGeneration = _controller->packageGeneration();
+    const uint64_t builtUmbilicusGeneration = _controller->umbilicusGeneration();
 
     // The snapshot's geometry is handed straight to the layout; every fiber of
     // the package is in it, so a second copy is worth avoiding.
@@ -903,16 +894,14 @@ void FiberMapWorkspace::rebuildLayout(bool fullRebuild)
         inputs.push_back(std::move(input));
     }
 
-    _voxelSizeUm = snapshot.voxelSizeUm;
-
     vc3d::fiber_map::GlobalLayoutParams params;
     // The layout and solver are unit-free, so the physical intents behind
     // their tuning lengths are converted here — once the voxel size is known,
     // exactly as documented on GlobalLayoutParams and SolverParams. Left
     // alone when it is not, so the defaults (the same intents at 2.4 µm)
     // stand in and the map still lays out sensibly.
-    if (_voxelSizeUm) {
-        const double vxPerCm = sceneVxPerCm();
+    if (snapshot.voxelSizeUm) {
+        const double vxPerCm = kUmPerCm / *snapshot.voxelSizeUm;
         params.smoothVx = 0.12 * vxPerCm;         // 1.2 mm arclength sigma
         params.resampleStepVx = 0.025 * vxPerCm;  // 0.025 cm resample step
         params.minPadXVx = 2.2 * vxPerCm;         // 2.2 cm label pad across
@@ -927,6 +916,19 @@ void FiberMapWorkspace::rebuildLayout(bool fullRebuild)
     _layout = vc3d::fiber_map::buildGlobalLayout(inputs, snapshot.umbilicusCenters,
                                                  params, &_layoutCache);
     const qint64 layoutMs = phaseTimer.restart();
+    // The build succeeded: commit every dependency watermark together.
+    // (_layoutBuilt covers empty results too - an empty result is still a
+    // result, derived from dependencies that go out of date.)
+    _layoutUmbilicusFingerprint = preReadUmbilicusFingerprint;
+    _layoutGeneration = snapshot.generation;
+    _layoutFrame = snapshot.frame;
+    _layoutPackageGeneration = builtPackageGeneration;
+    _layoutUmbilicusGeneration = builtUmbilicusGeneration;
+    _layoutBuilt = true;
+    _staleReason.clear();
+    _latchedReason.clear();
+    _restingReason.clear();
+    _voxelSizeUm = snapshot.voxelSizeUm;
 
     // Full rebuild doubles as the memoization check: when nothing the layout
     // consumes changed since the last Update, the from-scratch output must
@@ -938,21 +940,37 @@ void FiberMapWorkspace::rebuildLayout(bool fullRebuild)
     const vc3d::fiber_map::ContentDigest outputDigest =
         vc3d::fiber_map::digestGlobalResult(_layout);
     QString verificationNote;
-    if (fullRebuild && _haveLastDigests && inputsDigest == _lastInputsDigest) {
-        if (outputDigest == _lastOutputDigest) {
-            verificationNote = tr(" · cache verified");
+    if (fullRebuild) {
+        // The reference is the last memoized Update that actually reused
+        // something; verifying a cold build against a cold build would claim
+        // "verified" without any cached value having been tested. The
+        // reference is consumed either way - after a Full rebuild, the next
+        // Update records afresh.
+        if (_haveLastDigests && inputsDigest == _lastInputsDigest) {
+            if (outputDigest == _lastOutputDigest) {
+                verificationNote = tr(" · cache verified");
+            } else {
+                verificationNote = tr(" · CACHE MISMATCH — memoization disabled");
+                _memoizationDisabled = true;
+                _layoutCache.clear();
+                Logger()->error(
+                    "Fiber map: full rebuild output differs from the memoized "
+                    "build on identical inputs; memoization disabled");
+            }
+        }
+        _haveLastDigests = false;
+    } else {
+        const auto& stats = _layoutCache.lastStats();
+        const bool reusedSomething =
+            stats.used && (stats.fibersReused > 0 || stats.pairsReused > 0);
+        if (reusedSomething && !_memoizationDisabled) {
+            _lastInputsDigest = inputsDigest;
+            _lastOutputDigest = outputDigest;
+            _haveLastDigests = true;
         } else {
-            verificationNote = tr(" · CACHE MISMATCH — memoization disabled");
-            _memoizationDisabled = true;
-            _layoutCache.clear();
-            Logger()->error(
-                "Fiber map: full rebuild output differs from the memoized "
-                "build on identical inputs; memoization disabled");
+            _haveLastDigests = false;
         }
     }
-    _lastInputsDigest = inputsDigest;
-    _lastOutputDigest = outputDigest;
-    _haveLastDigests = true;
     // Scene space is voxels and the slice count already is one, so the scroll
     // extent needs no voxel size at all.
     _scrollZMaxVx = snapshot.annotationZSlices > 0

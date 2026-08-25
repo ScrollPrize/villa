@@ -18,6 +18,7 @@ using vc3d::fiber_map::GlobalLayoutParams;
 using vc3d::fiber_map::GlobalPlacedFiber;
 using vc3d::fiber_map::GlobalResult;
 using vc3d::fiber_map::InputFiber;
+using vc3d::fiber_map::InputLink;
 using vc3d::fiber_map::PlacedLink;
 
 namespace
@@ -523,29 +524,97 @@ private slots:
         QVERIFY(!cache.lastStats().used);
     }
 
-    // A conflict whose repair victim is decided by constraint order: the
-    // U-shaped V fiber crosses the H fiber twice with opposite verdicts and
-    // symmetric margins, so the constraint index is the tie-break. The cached
-    // replay must pick the same victim.
+    // A genuine multi-pair conflict, where WHICH edge each detected cycle
+    // sacrifices depends on constraint order: the H fiber passes both V
+    // fibers outside on its first turn, then regresses inward and passes
+    // them inside on its second - an inward regression per pair, cycles
+    // spanning both pairs. The cached replay must reproduce the same drops.
     void cacheReplayPreservesRepairTieBreaks()
     {
         const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
         std::vector<InputFiber> fibers;
+        std::vector<cv::Vec3d> regress;
+        const double z = 30000.0;
+        for (double theta = 0.05 * kTwoPi; theta <= 2.3 * kTwoPi; theta += kStep) {
+            const double r = theta < 1.15 * kTwoPi ? 3400.0 : 2400.0;
+            regress.push_back(cv::Vec3d(r * std::cos(theta), r * std::sin(theta), z));
+        }
+        const int lastIndex = static_cast<int>(regress.size()) - 1;
+        fibers.push_back(makeFiber(1, QStringLiteral("h-regress"), 'H',
+                                   std::move(regress), {10, lastIndex - 10}));
+        // Two growing spirals pin the inferred chirality at +1: the
+        // regressing fiber's radius drop otherwise wins the turn-lag vote
+        // and mirrors the map, absorbing the very conflict this fixture
+        // exists to create.
+        fibers.push_back(makeFiber(4, QStringLiteral("a-anchor"), 'H',
+                                   arcPoints(z + 300.0, 5000.0, 400.0, 0.0,
+                                             3.0 * kTwoPi),
+                                   {100, 3000}));
+        fibers.push_back(makeFiber(5, QStringLiteral("b-anchor"), 'H',
+                                   arcPoints(z - 300.0, 5200.0, 400.0, 0.0,
+                                             3.0 * kTwoPi),
+                                   {100, 3000}));
         fibers.push_back(makeFiber(
-            1, QStringLiteral("h-mid"), 'H',
-            arcPoints(30000.0, 3000.0, 0.0, 0.0, 0.6 * kTwoPi), {50, 900}));
-        std::vector<cv::Vec3d> uShape;
-        for (double z = 29000.0; z <= 31000.0; z += 10.0) {
-            uShape.push_back(cv::Vec3d(2000.0 * std::cos(0.3 * kTwoPi),
-                                       2000.0 * std::sin(0.3 * kTwoPi), z));
+            2, QStringLiteral("v-a"), 'V',
+            verticalPoints(0.3 * kTwoPi, 3000.0, z - 500.0, z + 500.0, 4.0),
+            {0, 125, 250}));
+        fibers.push_back(makeFiber(
+            3, QStringLiteral("v-b"), 'V',
+            verticalPoints(0.4 * kTwoPi, 3000.0, z - 500.0, z + 500.0, 4.0),
+            {0, 125, 250}));
+        const GlobalLayoutParams params = defaultParams();
+        const GlobalResult fresh =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params);
+        QCOMPARE(fresh.chirality, 1);
+        // The fixture must actually conflict: the two inward-regression
+        // drops are declared on the map.
+        QCOMPARE(fresh.droppedCrossingCount, 2);
+        vc3d::fiber_map::GlobalLayoutCache cache;
+        (void)vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &cache);
+        const GlobalResult warm =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &cache);
+        QCOMPARE(cache.lastStats().pairsReused, 6);
+        QCOMPARE(cache.lastStats().pairsRecomputed, 0);
+        QVERIFY(vc3d::fiber_map::digestGlobalResult(warm) ==
+                vc3d::fiber_map::digestGlobalResult(fresh));
+    }
+
+    // A chirality flip (every fiber mirrored) invalidates every pair shard,
+    // and the cached result still equals a fresh build of the mirrored input.
+    void cacheInvalidatesOnChiralityFlip()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        std::vector<InputFiber> fibers = cacheFixture();
+        const GlobalLayoutParams params = defaultParams();
+        vc3d::fiber_map::GlobalLayoutCache cache;
+        (void)vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &cache);
+        for (InputFiber& fiber : fibers) {
+            for (cv::Vec3d& point : fiber.linePoints) {
+                point[1] = -point[1];
+            }
+            for (cv::Vec3d& point : fiber.controlPoints) {
+                point[1] = -point[1];
+            }
         }
-        for (double z = 31000.0 - 10.0; z >= 29500.0; z -= 10.0) {
-            uShape.push_back(cv::Vec3d(4000.0 * std::cos(0.3 * kTwoPi),
-                                       4000.0 * std::sin(0.3 * kTwoPi), z));
-        }
-        const int last = static_cast<int>(uShape.size()) - 1;
-        fibers.push_back(makeFiber(2, QStringLiteral("v-u"), 'V',
-                                   std::move(uShape), {0, last / 2, last}));
+        const GlobalResult fresh =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params);
+        QCOMPARE(fresh.chirality, -1);
+        const GlobalResult warm =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &cache);
+        QCOMPARE(cache.lastStats().pairsReused, 0);
+        QVERIFY(vc3d::fiber_map::digestGlobalResult(warm) ==
+                vc3d::fiber_map::digestGlobalResult(fresh));
+    }
+
+    // Pairs with no crossings at all (disjoint z spans) cache and replay as
+    // empty shards.
+    void cacheReplaysEmptyShards()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        std::vector<InputFiber> fibers = cacheFixture();
+        fibers.push_back(makeFiber(900, QStringLiteral("z-far"), 'H',
+                                   arcPoints(38000.0, 4000.0, 300.0, 0.0, 0.8 * kTwoPi),
+                                   {100, 800}));
         const GlobalLayoutParams params = defaultParams();
         const GlobalResult fresh =
             vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params);
@@ -553,10 +622,90 @@ private slots:
         (void)vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &cache);
         const GlobalResult warm =
             vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, params, &cache);
-        QCOMPARE(cache.lastStats().pairsReused, 1);
-        QVERIFY(fresh.droppedCrossingCount + (int)fresh.suspectCrossings.size() >= 0);
+        // The far fiber's pairs are all empty shards - reused like any other.
+        QCOMPARE(cache.lastStats().pairsRecomputed, 0);
         QVERIFY(vc3d::fiber_map::digestGlobalResult(warm) ==
-                 vc3d::fiber_map::digestGlobalResult(fresh));
+                vc3d::fiber_map::digestGlobalResult(fresh));
+    }
+
+    // The verification digest is sensitive to every semantic field class it
+    // exists to guard - a mutation that dodges it would let a cache bug hide.
+    void resultDigestIsSensitive()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        const std::vector<InputFiber> fibers = cacheFixture();
+        const GlobalResult base =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+        const ContentDigest baseline = vc3d::fiber_map::digestGlobalResult(base);
+        {
+            GlobalResult tweaked = base;
+            tweaked.droppedCrossingCount += 1;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = base;
+            tweaked.gatedSegmentCount += 1;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = base;
+            QVERIFY(!tweaked.links.empty());
+            tweaked.links[0].pending = !tweaked.links[0].pending;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = base;
+            tweaked.fibers[0].meta.networkSize += 1;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = base;
+            tweaked.fibers[0].fiber.label += QStringLiteral("x");
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        {
+            GlobalResult tweaked = base;
+            tweaked.fibers[0].fiber.id += 1;
+            QVERIFY(!(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline));
+        }
+        // Timings are the one deliberate exclusion: telemetry, not semantics.
+        {
+            GlobalResult tweaked = base;
+            tweaked.solveMs += 100.0;
+            QVERIFY(vc3d::fiber_map::digestGlobalResult(tweaked) == baseline);
+        }
+    }
+
+    // Equal labels tie-break by fileName, never by the runtime id: swapping
+    // ids between builds must not move anything.
+    void equalLabelOrderSurvivesIdSwap()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        std::vector<InputFiber> fibers = cacheFixture();
+        fibers[0].label = fibers[1].label;
+        std::vector<InputFiber> swapped = fibers;
+        std::swap(swapped[0].id, swapped[1].id);
+        // Links reference ids; the swap must follow them to keep the same
+        // physical links.
+        for (InputFiber& fiber : swapped) {
+            for (InputLink& link : fiber.links) {
+                if (link.branchFiberId == fibers[0].id) {
+                    link.branchFiberId = fibers[1].id;
+                } else if (link.branchFiberId == fibers[1].id) {
+                    link.branchFiberId = fibers[0].id;
+                }
+            }
+        }
+        const GlobalResult a =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+        const GlobalResult b =
+            vc3d::fiber_map::buildGlobalLayout(swapped, umbilicus, defaultParams());
+        QCOMPARE(a.fibers.size(), b.fibers.size());
+        for (std::size_t i = 0; i < a.fibers.size(); ++i) {
+            QCOMPARE(b.fibers[i].fiber.fileName, a.fibers[i].fiber.fileName);
+            QCOMPARE(b.fibers[i].meta.windingLo, a.fibers[i].meta.windingLo);
+            QCOMPARE(b.fibers[i].meta.windingHi, a.fibers[i].meta.windingHi);
+        }
     }
 
     // No umbilicus: nothing can be unrolled, and EVERY fiber - not just the

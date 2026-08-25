@@ -566,6 +566,12 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
     std::vector<const PairDetection*> ordered_detections;
     ordered_detections.reserve(detections.size());
     for (const PairDetection& detection : detections) {
+        // Defensive: a null shard or an out-of-range endpoint would corrupt
+        // the solve silently; such a shard is a caller bug and is skipped.
+        if (detection.detection == nullptr || detection.hFiber >= count ||
+            detection.vFiber >= count) {
+            continue;
+        }
         ordered_detections.push_back(&detection);
     }
     std::stable_sort(ordered_detections.begin(), ordered_detections.end(),
