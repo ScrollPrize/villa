@@ -82,9 +82,19 @@ Seed graph traversal over the materialized graph is read-only and concurrent.
 The canonical seed set is unchanged; additional endpoint anchors needed to
 close crop traversal do not become new starts. Results are integrated
 serially in the same strongest-first order, including all counters and
-anisotropic coverage updates. If an earlier integrated line covers the seed of
-another trace that was computed in the same group, that speculative result is
-discarded and does not consume an attempt.
+anisotropic coverage updates. Workers are fed continuously through dense seed
+tickets; a bounded queue holds completed work until every preceding ticket is
+ready. If an earlier integrated line covers a speculative seed, that result is
+discarded and does not consume an attempt. Attempt/fiber limits and failures
+are also applied at the ordered frontier, so work beyond the equivalent serial
+stop point cannot affect output.
+
+The materialized graph uses sorted contiguous records and flat directed
+adjacency. Lookahead reads adjacency and forward/reverse route geometry through
+stable views and allocates clipped geometry only for a selected continuation.
+Immutable views borrow graph storage without reference counting. The common
+view interface also supports one shared owner for a complete cache-derived
+result; ownership is per query, never per point, edge, or search state.
 
 ## Principal direction groups
 

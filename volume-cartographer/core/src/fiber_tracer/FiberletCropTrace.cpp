@@ -8,12 +8,14 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <ctime>
 #include <exception>
 #include <iomanip>
 #include <limits>
 #include <locale>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <set>
@@ -99,17 +101,18 @@ bool inside(const cv::Vec3d& point, const FiberletCropTraceConfig& config)
 }
 
 struct ClippedRoute {
-    std::vector<cv::Vec3d> points;
     double retainedFraction = 1.0;
     bool exited = false;
 };
 
-ClippedRoute clipAtFirstExit(const std::vector<cv::Vec3d>& route, const FiberletCropTraceConfig& config)
+ClippedRoute clipAtFirstExit(
+    const FiberletReplayRoutePointView& route,
+    const FiberletCropTraceConfig& config,
+    std::vector<cv::Vec3d>* appendedPoints = nullptr)
 {
     if (route.size() < 2 || !inside(route.front(), config))
         throw std::invalid_argument("Fiberlet crop route must start inside the crop");
     ClippedRoute result;
-    result.points.push_back(route.front());
     double totalLength = 0.0;
     double retainedLength = 0.0;
     for (std::size_t index = 1; index < route.size(); ++index)
@@ -125,7 +128,8 @@ ClippedRoute clipAtFirstExit(const std::vector<cv::Vec3d>& route, const Fiberlet
         if (!(segmentLength > kEpsilon))
             continue;
         if (inside(finish, config)) {
-            result.points.push_back(finish);
+            if (appendedPoints)
+                appendedPoints->push_back(finish);
             retainedLength += segmentLength;
             continue;
         }
@@ -138,7 +142,8 @@ ClippedRoute clipAtFirstExit(const std::vector<cv::Vec3d>& route, const Fiberlet
             }
         }
         t = std::clamp(t, 0.0, 1.0);
-        result.points.push_back(start + delta * t);
+        if (appendedPoints)
+            appendedPoints->push_back(start + delta * t);
         retainedLength += segmentLength * t;
         result.exited = true;
         break;
@@ -191,13 +196,14 @@ std::optional<DirectedFiberletStorageId> selectLookaheadFirstArc(
         std::vector<LookaheadState> next;
         for (auto& state : frontier) {
             bool expanded = false;
-            auto outgoing = graph.outgoing(state.anchor);
-            std::sort(outgoing.begin(), outgoing.end());
-            for (const auto& id : outgoing) {
+            const auto outgoing = graph.outgoingArcs(state.anchor);
+            for (std::size_t outgoingIndex = 0;
+                 outgoingIndex < outgoing.size(); ++outgoingIndex) {
+                const auto& edge = outgoing[outgoingIndex];
+                const auto& id = edge.id;
                 if (state.arcs.empty() && forcedFirst.has_value() && id != *forcedFirst) {
                     continue;
                 }
-                const auto edge = graph.arc(id);
                 if (state.visited.contains(edge.target))
                     continue;
                 std::optional<FiberletReplaySourceTransition> join;
@@ -211,7 +217,8 @@ std::optional<DirectedFiberletStorageId> selectLookaheadFirstArc(
                         continue;
                     }
                 }
-                const auto clipped = clipAtFirstExit(graph.routePoints(id), config);
+                const auto clipped = clipAtFirstExit(
+                    graph.routePointView(id), config);
                 const double edgeLength = edge.pathLengthPredictionVoxels;
                 if (!(edgeLength > kEpsilon))
                     continue;
@@ -300,8 +307,8 @@ SideTrace traceSide(
             return result;
         }
         const auto edge = graph.arc(*selected);
-        const auto clipped = clipAtFirstExit(graph.routePoints(*selected), config);
-        result.points.insert(result.points.end(), std::next(clipped.points.begin()), clipped.points.end());
+        const auto clipped = clipAtFirstExit(
+            graph.routePointView(*selected), config, &result.points);
         ++result.fiberlets;
         if (clipped.exited) {
             result.termination = "crop_boundary";
@@ -337,8 +344,9 @@ InitialPair selectInitialPair(const FiberletReplayGraphSource& graph, const Fibe
     const double minimumDot = std::cos(graph.maximumJoinAngleDegrees() * kPi / 180.0);
     std::vector<FiberletReplaySourceArc> negative;
     std::vector<FiberletReplaySourceArc> positive;
-    for (const auto& id : graph.outgoing(seed.key)) {
-        const auto edge = graph.arc(id);
+    const auto outgoing = graph.outgoingArcs(seed.key);
+    for (std::size_t index = 0; index < outgoing.size(); ++index) {
+        const auto& edge = outgoing[index];
         const cv::Vec3d direction = normalized(edge.startStepBaseXYZ);
         if (direction.dot(axis) > minimumDot)
             positive.push_back(edge);
@@ -564,106 +572,162 @@ FiberletCropTraceResult traceFiberletCrop(
     const std::size_t workerCount = graph.supportsConcurrentQueries()
         ? std::min(requestedThreads, std::max<std::size_t>(1, anchors.size()))
         : 1;
+    struct Completion {
+        std::size_t anchorIndex = 0;
+        TraceCandidate candidate;
+        std::exception_ptr failure;
+        double taskSeconds = 0.0;
+    };
+    struct CompletionQueue {
+        std::mutex mutex;
+        std::condition_variable ready;
+        std::map<std::size_t, Completion> byTicket;
+        std::size_t completed = 0;
+        double taskSeconds = 0.0;
+        double maximumTaskSeconds = 0.0;
+    } completions;
+
     std::optional<utils::ThreadPool> pool;
     if (workerCount > 1)
         pool.emplace(workerCount);
-
+    const std::size_t speculationWindow = workerCount == 1
+        ? 1
+        : workerCount + std::max<std::size_t>(1, workerCount / 8);
     std::size_t scan = 0;
-    bool finished = false;
-    while (!finished && scan < anchors.size()) {
-        if ((config.maximumAttempts != 0 && result.attemptedAnchors >= config.maximumAttempts) ||
-            (config.maximumFibers != 0 && result.lines.size() >= config.maximumFibers)) {
-            break;
-        }
-        std::size_t batchCapacity = workerCount;
-        if (config.maximumAttempts != 0) {
-            batchCapacity = std::min(
-                batchCapacity,
-                config.maximumAttempts - result.attemptedAnchors);
-        }
-        std::vector<std::size_t> batch;
-        batch.reserve(batchCapacity);
-        while (scan < anchors.size() && batch.size() < batchCapacity) {
-            if (active[scan])
-                batch.push_back(scan);
-            ++scan;
-        }
-        if (batch.empty())
-            continue;
+    std::size_t nextTicket = 0;
+    std::size_t commitTicket = 0;
+    bool stopped = false;
+    std::exception_ptr orderedFailure;
+    const auto schedulerStarted = std::chrono::steady_clock::now();
+    const auto schedulerCpuStarted = std::clock();
 
-        std::vector<TraceCandidate> candidates(batch.size());
-        std::vector<std::exception_ptr> failures(batch.size());
-        std::vector<double> taskSeconds(batch.size());
-        const auto compute = [&](std::size_t batchIndex) {
+    const auto limitsReached = [&] {
+        return (config.maximumAttempts != 0 &&
+                result.attemptedAnchors >= config.maximumAttempts) ||
+            (config.maximumFibers != 0 &&
+             result.lines.size() >= config.maximumFibers);
+    };
+    const auto submit = [&](std::size_t ticket, std::size_t anchorIndex) {
+        const auto compute = [&, ticket, anchorIndex] {
+            Completion completion;
+            completion.anchorIndex = anchorIndex;
             const auto started = std::chrono::steady_clock::now();
             try {
-                candidates[batchIndex] = traceCandidate(
-                    graph, anchors[batch[batchIndex]], config);
+                completion.candidate = traceCandidate(
+                    graph, anchors[anchorIndex], config);
             } catch (...) {
-                failures[batchIndex] = std::current_exception();
+                completion.failure = std::current_exception();
             }
-            taskSeconds[batchIndex] = std::chrono::duration<double>(
+            completion.taskSeconds = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - started).count();
+            {
+                std::lock_guard lock(completions.mutex);
+                ++completions.completed;
+                completions.taskSeconds += completion.taskSeconds;
+                completions.maximumTaskSeconds = std::max(
+                    completions.maximumTaskSeconds,
+                    completion.taskSeconds);
+                completions.byTicket.emplace(
+                    ticket, std::move(completion));
+            }
+            completions.ready.notify_one();
         };
-        const auto batchStarted = std::chrono::steady_clock::now();
-        const auto batchCpuStarted = std::clock();
-        if (pool) {
-            pool->run_indexed_batch(batch.size(), compute);
-        } else {
-            for (std::size_t batchIndex = 0; batchIndex < batch.size(); ++batchIndex)
-                compute(batchIndex);
+        if (pool)
+            pool->enqueue(compute);
+        else
+            compute();
+    };
+    const auto fillWindow = [&] {
+        while (!stopped && !limitsReached() &&
+               nextTicket - commitTicket < speculationWindow) {
+            if (config.maximumAttempts != 0) {
+                const std::size_t outstanding = nextTicket - commitTicket;
+                const std::size_t remaining =
+                    config.maximumAttempts - result.attemptedAnchors;
+                if (outstanding >= remaining)
+                    break;
+            }
+            while (scan < anchors.size() && !active[scan])
+                ++scan;
+            if (scan == anchors.size())
+                break;
+            submit(nextTicket++, scan++);
         }
-        result.candidateBatchSeconds += std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - batchStarted).count();
-        result.candidateBatchCpuSeconds += static_cast<double>(
-            std::clock() - batchCpuStarted) / CLOCKS_PER_SEC;
-        result.candidateTaskSeconds += std::accumulate(
-            taskSeconds.begin(), taskSeconds.end(), 0.0);
-        result.maximumCandidateTaskSeconds = std::max(
-            result.maximumCandidateTaskSeconds,
-            *std::max_element(taskSeconds.begin(), taskSeconds.end()));
-        result.computedCandidates += batch.size();
-        for (const auto& failure : failures) {
-            if (failure)
-                std::rethrow_exception(failure);
+    };
+
+    while (!stopped) {
+        fillWindow();
+        if (commitTicket == nextTicket) {
+            if (scan == anchors.size() || limitsReached())
+                break;
+            continue;
+        }
+
+        Completion completion;
+        {
+            std::unique_lock lock(completions.mutex);
+            completions.ready.wait(lock, [&] {
+                return completions.byTicket.contains(commitTicket);
+            });
+            auto found = completions.byTicket.find(commitTicket);
+            completion = std::move(found->second);
+            completions.byTicket.erase(found);
+        }
+        ++commitTicket;
+        if (completion.failure) {
+            orderedFailure = completion.failure;
+            stopped = true;
+            break;
         }
 
         const auto integrationStarted = std::chrono::steady_clock::now();
-        for (std::size_t batchIndex = 0; batchIndex < batch.size(); ++batchIndex) {
-            const std::size_t index = batch[batchIndex];
-            if (!active[index]) {
-                ++result.discardedCandidates;
-                continue;
-            }
-            if ((config.maximumAttempts != 0 && result.attemptedAnchors >= config.maximumAttempts) ||
-                (config.maximumFibers != 0 && result.lines.size() >= config.maximumFibers)) {
-                finished = true;
-                break;
-            }
+        const std::size_t index = completion.anchorIndex;
+        if (!active[index]) {
+            ++result.discardedCandidates;
+        } else if (!limitsReached()) {
             active[index] = false;
             ++result.attemptedAnchors;
-            auto& candidate = candidates[batchIndex];
-            if (!candidate.hasUsableEdge || candidate.line.pointsBaseXYZ.size() < 2) {
+            auto& candidate = completion.candidate;
+            if (!candidate.hasUsableEdge ||
+                candidate.line.pointsBaseXYZ.size() < 2) {
                 ++result.noEdgeAnchors;
-                continue;
-            }
-            if (candidate.bidirectional)
-                ++result.bidirectionalLines;
-            else
-                ++result.oneSidedLines;
-            result.coveredAnchors += suppressCoveredAnchors(
-                candidate.line.pointsBaseXYZ, anchors, active, spatialIndex,
-                normalSampler, normalWorkingToBaseScale, graph, config);
-            result.lines.push_back(std::move(candidate.line));
-            if (progress) {
-                const auto remaining = static_cast<std::size_t>(
-                    std::count(active.begin(), active.end(), true));
-                progress(result, remaining);
+            } else {
+                if (candidate.bidirectional)
+                    ++result.bidirectionalLines;
+                else
+                    ++result.oneSidedLines;
+                result.coveredAnchors += suppressCoveredAnchors(
+                    candidate.line.pointsBaseXYZ, anchors, active,
+                    spatialIndex, normalSampler, normalWorkingToBaseScale,
+                    graph, config);
+                result.lines.push_back(std::move(candidate.line));
+                if (progress) {
+                    const auto remaining = static_cast<std::size_t>(
+                        std::count(active.begin(), active.end(), true));
+                    progress(result, remaining);
+                }
             }
         }
         result.integrationSeconds += std::chrono::duration<double>(
             std::chrono::steady_clock::now() - integrationStarted).count();
+        if (limitsReached())
+            stopped = true;
     }
+    if (pool)
+        pool->wait_idle();
+    {
+        std::lock_guard lock(completions.mutex);
+        result.computedCandidates = completions.completed;
+        result.candidateTaskSeconds = completions.taskSeconds;
+        result.maximumCandidateTaskSeconds =
+            completions.maximumTaskSeconds;
+    }
+    result.candidateBatchSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - schedulerStarted).count();
+    result.candidateBatchCpuSeconds = static_cast<double>(
+        std::clock() - schedulerCpuStarted) / CLOCKS_PER_SEC;
+    if (orderedFailure)
+        std::rethrow_exception(orderedFailure);
     return result;
 }
 

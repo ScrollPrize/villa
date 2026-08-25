@@ -4571,12 +4571,23 @@
   half-open crop; additional inside endpoints close traversal adjacency but do
   not become new seeds.
 - Seed workers query only the immutable materialized graph. They perform no
-  cache I/O, waits, or shared graph mutation. Crop tracing evaluates bounded
-  groups of active seeds concurrently, then drains and integrates each group
-  serially in canonical seed order. Integration rechecks seed activity; a
-  speculative result whose seed was covered by an earlier accepted line is
-  discarded and consumes no attempt. Counters, output order, geometry, and the
-  first propagated error are identical to one-thread execution.
+  cache I/O, waits, or shared graph mutation. Crop tracing assigns dense
+  strongest-first tickets continuously and commits completed candidates only
+  at the ordered ticket frontier. The submitted-but-uncommitted window is
+  bounded to the worker count plus one eighth (at least one) as queue headroom.
+  Integration rechecks seed activity; a speculative result whose seed was
+  covered by an earlier accepted line is discarded and consumes no attempt.
+  Attempt/fiber limits and errors take effect only when their canonical ticket
+  reaches the frontier, so later speculative results and failures are ignored
+  after the equivalent serial stop point. Counters, output order, geometry,
+  and the first propagated error are identical to one-thread execution.
+- The immutable graph stores sorted contiguous anchors, physical edges, joins,
+  and flat directed adjacency. Crop traversal consumes forward/reverse views of
+  adjacency and route geometry and materializes clipped points only for the
+  selected edge. Immutable views borrow stable storage without ownership
+  traffic. Other graph sources may return one shared owner per complete query
+  result; compact cached routes use one reconstructed owned buffer rather than
+  reference-counting individual elements or retaining leases in search state.
 - `--threads` defaults to the host CPU count and controls both batched graph
   preparation and immutable seed tracing. There is no separate low trace-worker
   cap.

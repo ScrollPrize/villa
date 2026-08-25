@@ -78,6 +78,10 @@ public:
             }
             const TestGraph& owner_;
         } activeQuery(*this);
+        if (const auto delay = queryDelay.find(anchor); delay != queryDelay.end())
+            std::this_thread::sleep_for(delay->second);
+        if (const auto failure = queryFailure.find(anchor); failure != queryFailure.end())
+            throw std::runtime_error(failure->second);
         auto found = adjacency.find(anchor);
         if (found == adjacency.end())
             return {};
@@ -117,6 +121,8 @@ public:
 
     std::map<FiberletStorageKey, cv::Vec3d> positions;
     std::map<FiberletStorageKey, std::vector<DirectedFiberletStorageId>> adjacency;
+    std::map<FiberletStorageKey, std::chrono::milliseconds> queryDelay;
+    std::map<FiberletStorageKey, std::string> queryFailure;
     bool concurrentQueries = false;
     bool observeConcurrency = false;
     mutable std::atomic<int> activeQueries{0};
@@ -321,6 +327,7 @@ TEST_CASE("Fiberlet crop tracing computes concurrently and integrates canonicall
 
     graph.concurrentQueries = true;
     graph.observeConcurrency = true;
+    graph.queryDelay[seed] = std::chrono::milliseconds(40);
     FiberletCropTraceConfig parallelConfig = serialConfig;
     parallelConfig.parallelThreads = 4;
     const auto parallel = traceFiberletCrop(
@@ -359,6 +366,82 @@ TEST_CASE("Fiberlet crop tracing computes concurrently and integrates canonicall
         graph, anchors, normals, 1.0, parallelConfig);
     CHECK(unsupportedSource.attemptedAnchors == 2);
     CHECK(graph.maximumConcurrentQueries.load() == 1);
+}
+
+TEST_CASE("Fiberlet crop tracing reports speculative failures in canonical order")
+{
+    TestGraph graph;
+    const auto first = key(10);
+    const auto second = key(20);
+    graph.addAnchor(first, {0, 0, 0});
+    graph.addAnchor(second, {200, 0, 0});
+    graph.concurrentQueries = true;
+    graph.queryDelay[first] = std::chrono::milliseconds(30);
+    graph.queryFailure[first] = "first canonical failure";
+    graph.queryFailure[second] = "later speculative failure";
+
+    FiberletCropTraceConfig config;
+    config.minimumBaseXYZ = {-100, -100, -100};
+    config.maximumBaseXYZ = {1'000, 100, 100};
+    config.parallelThreads = 2;
+    ZNormalSampler normals;
+    CHECK_THROWS_WITH_AS(
+        traceFiberletCrop(
+            graph,
+            {anchor(first, {0, 0, 0}, {1, 0, 0}, 1.0F),
+             anchor(second, {200, 0, 0}, {1, 0, 0}, 0.9F)},
+            normals, 1.0, config),
+        doctest::Contains("first canonical failure"), std::runtime_error);
+}
+
+TEST_CASE("Fiberlet crop tracing ignores failures beyond a serial fiber limit")
+{
+    TestGraph graph;
+    const auto first = key(10);
+    const auto firstTarget = key(11);
+    const auto later = key(20);
+    graph.addAnchor(first, {0, 0, 0});
+    graph.addAnchor(firstTarget, {10, 0, 0});
+    graph.addAnchor(later, {200, 0, 0});
+    graph.connect(first, firstTarget);
+    graph.concurrentQueries = true;
+    graph.queryDelay[first] = std::chrono::milliseconds(30);
+    graph.queryFailure[later] = "uncommitted speculative failure";
+
+    FiberletCropTraceConfig config;
+    config.minimumBaseXYZ = {-100, -100, -100};
+    config.maximumBaseXYZ = {1'000, 100, 100};
+    config.parallelThreads = 2;
+    config.maximumFibers = 1;
+    ZNormalSampler normals;
+    const auto result = traceFiberletCrop(
+        graph,
+        {anchor(first, {0, 0, 0}, {1, 0, 0}, 1.0F),
+         anchor(later, {200, 0, 0}, {1, 0, 0}, 0.9F)},
+        normals, 1.0, config);
+    CHECK(result.lines.size() == 1);
+    CHECK(result.lines.front().seed == first);
+    CHECK(result.attemptedAnchors == 1);
+    CHECK(result.computedCandidates == 2);
+}
+
+TEST_CASE("Owned Fiberlet replay views retain data after the source buffer dies")
+{
+    const auto points = FiberletReplayRoutePointView::owned(
+        {{1, 2, 3}, {4, 5, 6}}, true);
+    REQUIRE(points.leased());
+    REQUIRE(points.size() == 2);
+    CHECK(points.front() == cv::Vec3d{4, 5, 6});
+    CHECK(points.back() == cv::Vec3d{1, 2, 3});
+
+    FiberletReplaySourceCostProfile profile;
+    profile.segmentLengthsPredictionVoxels = {2.0F, 3.0F};
+    profile.segmentCostDensities = {0.25F, 0.5F};
+    const auto costs = FiberletReplayCostProfileView::owned(
+        std::move(profile), true);
+    REQUIRE(costs.leased());
+    CHECK(costs.segmentLengthsPredictionVoxels[0] == 3.0F);
+    CHECK(costs.segmentCostDensities[1] == 0.25F);
 }
 
 TEST_CASE("Fiberlet crop attempts follow strongest-first deterministic ordering")

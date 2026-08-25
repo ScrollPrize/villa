@@ -10,6 +10,11 @@
 - Removed the four-worker cache-contention workaround. Host-CPU tracing reduced
   the 16-seed trace phase from 17.57 s to about 3-4 s on the Paris4 1024-base
   crop while preserving the original OBJ byte-for-byte.
+- Replaced synchronized seed batches with bounded continuous computation and
+  ordered ticket commits. Converted the materialized graph to contiguous
+  records with borrowed directional adjacency/route views, eliminating route
+  copies during rejected lookahead. The 500-attempt Paris4 crop remains
+  byte-identical and drops from 86.80 s to 79.66 s wall time.
 
 # 2026-08-25: Fiberlet producer cache contract v3
 

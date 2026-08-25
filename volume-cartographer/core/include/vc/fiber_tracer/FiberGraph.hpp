@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -274,6 +275,139 @@ struct FiberletReplaySourceTransition {
     std::optional<size_t> diagnosticTransitionIndex;
 };
 
+template <typename T>
+class FiberletReplayPinnedView
+{
+public:
+    FiberletReplayPinnedView() = default;
+    FiberletReplayPinnedView(
+        std::span<const T> values,
+        std::shared_ptr<const void> lease = {},
+        bool reverse = false)
+        : lease_(std::move(lease))
+        , values_(values)
+        , reverse_(reverse)
+    {
+    }
+
+    [[nodiscard]] std::size_t size() const noexcept { return values_.size(); }
+    [[nodiscard]] bool empty() const noexcept { return values_.empty(); }
+    [[nodiscard]] const T& operator[](std::size_t index) const
+    {
+        return values_[reverse_ ? values_.size() - 1 - index : index];
+    }
+    [[nodiscard]] const T& front() const { return (*this)[0]; }
+    [[nodiscard]] const T& back() const { return (*this)[size() - 1]; }
+    [[nodiscard]] bool reversed() const noexcept { return reverse_; }
+    [[nodiscard]] bool leased() const noexcept
+    {
+        return static_cast<bool>(lease_);
+    }
+
+    static FiberletReplayPinnedView owned(
+        std::vector<T> values, bool reverse = false)
+    {
+        auto owner = std::make_shared<const std::vector<T>>(
+            std::move(values));
+        return {*owner, owner, reverse};
+    }
+
+private:
+    std::shared_ptr<const void> lease_;
+    std::span<const T> values_;
+    bool reverse_ = false;
+};
+
+using FiberletReplayOutgoingArcView =
+    FiberletReplayPinnedView<FiberletReplaySourceArc>;
+
+class FiberletReplayRoutePointView
+{
+public:
+    FiberletReplayRoutePointView() = default;
+    FiberletReplayRoutePointView(
+        std::span<const cv::Vec3d> pointsBaseXYZ,
+        std::shared_ptr<const void> lease = {},
+        bool reverse = false)
+        : lease_(std::move(lease))
+        , pointsBaseXYZ_(pointsBaseXYZ)
+        , reverse_(reverse)
+    {
+    }
+
+    [[nodiscard]] std::size_t size() const noexcept
+    {
+        return pointsBaseXYZ_.size();
+    }
+    [[nodiscard]] bool empty() const noexcept
+    {
+        return pointsBaseXYZ_.empty();
+    }
+    [[nodiscard]] cv::Vec3d operator[](std::size_t index) const
+    {
+        return pointsBaseXYZ_[
+            reverse_ ? pointsBaseXYZ_.size() - 1 - index : index];
+    }
+    [[nodiscard]] cv::Vec3d front() const { return (*this)[0]; }
+    [[nodiscard]] cv::Vec3d back() const { return (*this)[size() - 1]; }
+    [[nodiscard]] bool reversed() const noexcept { return reverse_; }
+    [[nodiscard]] bool leased() const noexcept
+    {
+        return static_cast<bool>(lease_);
+    }
+
+    static FiberletReplayRoutePointView owned(
+        std::vector<cv::Vec3d> pointsBaseXYZ,
+        bool reverse = false)
+    {
+        auto owner = std::make_shared<const std::vector<cv::Vec3d>>(
+            std::move(pointsBaseXYZ));
+        return {*owner, owner, reverse};
+    }
+
+private:
+    std::shared_ptr<const void> lease_;
+    std::span<const cv::Vec3d> pointsBaseXYZ_;
+    bool reverse_ = false;
+};
+
+class FiberletReplayCostProfileView
+{
+private:
+    std::shared_ptr<const void> lease_;
+
+public:
+    FiberletReplayCostProfileView() = default;
+    FiberletReplayCostProfileView(
+        std::span<const float> segmentLengths,
+        std::span<const float> segmentCosts,
+        std::shared_ptr<const void> lease = {},
+        bool reverse = false)
+        : lease_(std::move(lease))
+        , segmentLengthsPredictionVoxels(segmentLengths, {}, reverse)
+        , segmentCostDensities(segmentCosts, {}, reverse)
+    {
+    }
+
+    FiberletReplayPinnedView<float> segmentLengthsPredictionVoxels;
+    FiberletReplayPinnedView<float> segmentCostDensities;
+
+    [[nodiscard]] bool leased() const noexcept
+    {
+        return static_cast<bool>(lease_);
+    }
+
+    static FiberletReplayCostProfileView owned(
+        FiberletReplaySourceCostProfile profile, bool reverse = false)
+    {
+        auto owner = std::make_shared<const FiberletReplaySourceCostProfile>(
+            std::move(profile));
+        return {owner->segmentLengthsPredictionVoxels,
+                owner->segmentCostDensities, owner, reverse};
+    }
+
+};
+
 class FiberletReplayGraphSource
 {
 public:
@@ -291,6 +425,12 @@ public:
     [[nodiscard]] virtual FiberletReplaySourceArc arc(const DirectedFiberletStorageId& id) const = 0;
     [[nodiscard]] virtual FiberletReplaySourceCostProfile costProfile(const DirectedFiberletStorageId& id) const = 0;
     [[nodiscard]] virtual std::vector<cv::Vec3d> routePoints(const DirectedFiberletStorageId& id) const = 0;
+    [[nodiscard]] virtual FiberletReplayOutgoingArcView outgoingArcs(
+        const FiberletStorageKey& anchor) const;
+    [[nodiscard]] virtual FiberletReplayCostProfileView costProfileView(
+        const DirectedFiberletStorageId& id) const;
+    [[nodiscard]] virtual FiberletReplayRoutePointView routePointView(
+        const DirectedFiberletStorageId& id) const;
     [[nodiscard]] virtual std::optional<FiberletReplaySourceTransition> transition(
         const FiberletReplaySourceArc& incoming, const FiberletReplaySourceArc& outgoing) const = 0;
 };
@@ -348,6 +488,12 @@ public:
     [[nodiscard]] FiberletReplaySourceCostProfile costProfile(
         const DirectedFiberletStorageId& id) const override;
     [[nodiscard]] std::vector<cv::Vec3d> routePoints(
+        const DirectedFiberletStorageId& id) const override;
+    [[nodiscard]] FiberletReplayOutgoingArcView outgoingArcs(
+        const FiberletStorageKey& anchor) const override;
+    [[nodiscard]] FiberletReplayCostProfileView costProfileView(
+        const DirectedFiberletStorageId& id) const override;
+    [[nodiscard]] FiberletReplayRoutePointView routePointView(
         const DirectedFiberletStorageId& id) const override;
     [[nodiscard]] std::optional<FiberletReplaySourceTransition> transition(
         const FiberletReplaySourceArc& incoming,

@@ -2241,7 +2241,36 @@ bool sameAxis(const cv::Vec3f& left, const cv::Vec3f& right)
 
 }  // namespace
 
+FiberletReplayOutgoingArcView FiberletReplayGraphSource::outgoingArcs(
+    const FiberletStorageKey& anchor) const
+{
+    const auto ids = outgoing(anchor);
+    std::vector<FiberletReplaySourceArc> arcs;
+    arcs.reserve(ids.size());
+    for (const auto& id : ids)
+        arcs.push_back(arc(id));
+    return FiberletReplayOutgoingArcView::owned(std::move(arcs));
+}
+
+FiberletReplayCostProfileView FiberletReplayGraphSource::costProfileView(
+    const DirectedFiberletStorageId& id) const
+{
+    return FiberletReplayCostProfileView::owned(costProfile(id));
+}
+
+FiberletReplayRoutePointView FiberletReplayGraphSource::routePointView(
+    const DirectedFiberletStorageId& id) const
+{
+    return FiberletReplayRoutePointView::owned(routePoints(id));
+}
+
 struct FiberletImmutableReplayGraphSource::Impl {
+    struct AnchorData {
+        FiberletReplaySourceAnchor anchor;
+        std::size_t outgoingBegin = 0;
+        std::size_t outgoingCount = 0;
+    };
+
     struct EdgeData {
         FiberletReplaySourceArc arc;
         FiberletReplaySourceCostProfile profile;
@@ -2251,12 +2280,36 @@ struct FiberletImmutableReplayGraphSource::Impl {
     float predictionToBaseScale = 1.0F;
     int anchorCellSizePredictionVoxels = 0;
     float maximumJoinAngleDegrees = 45.0F;
-    std::map<FiberletStorageKey, FiberletReplaySourceAnchor> anchors;
-    std::map<FiberletStorageKey, std::vector<DirectedFiberletStorageId>> outgoing;
-    std::map<FiberletStorageId, EdgeData> edges;
-    std::map<std::pair<DirectedFiberletStorageId, DirectedFiberletStorageId>,
-             FiberletReplaySourceTransition>
-        transitions;
+    std::vector<AnchorData> anchors;
+    std::vector<FiberletReplaySourceArc> outgoing;
+    std::vector<EdgeData> edges;
+    std::vector<FiberletReplaySourceTransition> transitions;
+
+    [[nodiscard]] const AnchorData* findAnchor(
+        const FiberletStorageKey& id) const
+    {
+        const auto found = std::lower_bound(
+            anchors.begin(), anchors.end(), id,
+            [](const AnchorData& value, const FiberletStorageKey& key) {
+                return value.anchor.id < key;
+            });
+        return found != anchors.end() && found->anchor.id == id
+            ? &*found
+            : nullptr;
+    }
+
+    [[nodiscard]] const EdgeData* findEdge(
+        const FiberletStorageId& id) const
+    {
+        const auto found = std::lower_bound(
+            edges.begin(), edges.end(), id,
+            [](const EdgeData& value, const FiberletStorageId& key) {
+                return value.arc.id.fiberlet < key;
+            });
+        return found != edges.end() && found->arc.id.fiberlet == id
+            ? &*found
+            : nullptr;
+    }
 };
 
 FiberletImmutableReplayGraphSource::FiberletImmutableReplayGraphSource(
@@ -2280,11 +2333,24 @@ FiberletImmutableReplayGraphSource::FiberletImmutableReplayGraphSource(
     impl_->predictionToBaseScale = predictionToBaseScale;
     impl_->anchorCellSizePredictionVoxels = anchorCellSizePredictionVoxels;
     impl_->maximumJoinAngleDegrees = maximumJoinAngleDegrees;
+    std::sort(anchors.begin(), anchors.end(), [](const auto& left, const auto& right) {
+        return left.id < right.id;
+    });
+    impl_->anchors.reserve(anchors.size());
     for (auto& anchor : anchors) {
-        if (!impl_->anchors.emplace(anchor.id, anchor).second)
+        if (!impl_->anchors.empty() &&
+            impl_->anchors.back().anchor.id == anchor.id) {
             throw std::invalid_argument(
                 "immutable Fiberlet replay graph contains duplicate anchors");
+        }
+        impl_->anchors.push_back({std::move(anchor), 0, 0});
     }
+    std::sort(edges.begin(), edges.end(), [](const auto& left, const auto& right) {
+        return left.arc.id.fiberlet < right.arc.id.fiberlet;
+    });
+    impl_->edges.reserve(edges.size());
+    std::vector<std::vector<FiberletReplaySourceArc>> outgoingByAnchor(
+        impl_->anchors.size());
     for (auto& edge : edges) {
         const auto id = edge.arc.id.fiberlet;
         if (edge.arc.id.reverse || edge.arc.source != id.first ||
@@ -2295,31 +2361,72 @@ FiberletImmutableReplayGraphSource::FiberletImmutableReplayGraphSource(
             throw std::invalid_argument(
                 "immutable Fiberlet replay edge is not canonical");
         }
-        if (!impl_->anchors.contains(id.first) ||
-            !impl_->anchors.contains(id.second)) {
+        const auto first = std::lower_bound(
+            impl_->anchors.begin(), impl_->anchors.end(), id.first,
+            [](const Impl::AnchorData& value, const FiberletStorageKey& key) {
+                return value.anchor.id < key;
+            });
+        const auto second = std::lower_bound(
+            impl_->anchors.begin(), impl_->anchors.end(), id.second,
+            [](const Impl::AnchorData& value, const FiberletStorageKey& key) {
+                return value.anchor.id < key;
+            });
+        if (first == impl_->anchors.end() || first->anchor.id != id.first ||
+            second == impl_->anchors.end() || second->anchor.id != id.second) {
             throw std::invalid_argument(
                 "immutable Fiberlet replay edge endpoint is absent");
+        }
+        if (!impl_->edges.empty() &&
+            impl_->edges.back().arc.id.fiberlet == id) {
+            throw std::invalid_argument(
+                "immutable Fiberlet replay graph contains duplicate edges");
         }
         Impl::EdgeData data{
             std::move(edge.arc), std::move(edge.costProfile),
             std::move(edge.routePointsBaseXYZ)};
-        if (!impl_->edges.emplace(id, std::move(data)).second)
-            throw std::invalid_argument(
-                "immutable Fiberlet replay graph contains duplicate edges");
-        impl_->outgoing[id.first].push_back({id, false});
-        impl_->outgoing[id.second].push_back({id, true});
+        auto forward = data.arc;
+        auto reverse = data.arc;
+        reverse.id.reverse = true;
+        std::swap(reverse.source, reverse.target);
+        std::swap(
+            reverse.sourcePositionBaseXYZ,
+            reverse.targetPositionBaseXYZ);
+        const auto start = reverse.startStepBaseXYZ;
+        reverse.startStepBaseXYZ = -reverse.endStepBaseXYZ;
+        reverse.endStepBaseXYZ = -start;
+        outgoingByAnchor[static_cast<std::size_t>(
+            first - impl_->anchors.begin())].push_back(std::move(forward));
+        outgoingByAnchor[static_cast<std::size_t>(
+            second - impl_->anchors.begin())].push_back(std::move(reverse));
+        impl_->edges.push_back(std::move(data));
     }
-    for (auto& [anchor, outgoing] : impl_->outgoing) {
-        (void)anchor;
-        std::sort(outgoing.begin(), outgoing.end());
+    for (std::size_t index = 0; index < impl_->anchors.size(); ++index) {
+        auto& outgoing = outgoingByAnchor[index];
+        std::sort(outgoing.begin(), outgoing.end(), [](const auto& left, const auto& right) {
+            return left.id < right.id;
+        });
+        impl_->anchors[index].outgoingBegin = impl_->outgoing.size();
+        impl_->anchors[index].outgoingCount = outgoing.size();
+        impl_->outgoing.insert(
+            impl_->outgoing.end(),
+            std::make_move_iterator(outgoing.begin()),
+            std::make_move_iterator(outgoing.end()));
     }
+    std::sort(transitions.begin(), transitions.end(), [](const auto& left, const auto& right) {
+        return std::pair{left.incoming, left.outgoing} <
+            std::pair{right.incoming, right.outgoing};
+    });
+    impl_->transitions.reserve(transitions.size());
     for (auto& transition : transitions) {
         const auto key = std::pair{
             transition.incoming, transition.outgoing};
-        if (!impl_->transitions.emplace(key, std::move(transition)).second) {
+        if (!impl_->transitions.empty() &&
+            std::pair{impl_->transitions.back().incoming,
+                      impl_->transitions.back().outgoing} == key) {
             throw std::invalid_argument(
                 "immutable Fiberlet replay graph contains duplicate transitions");
         }
+        impl_->transitions.push_back(std::move(transition));
     }
 }
 
@@ -2427,8 +2534,8 @@ FiberletImmutableReplayGraphSource::anchorsNearReference(
     double broadPhaseRadiusBaseVoxels) const
 {
     std::vector<FiberletReplaySourceAnchor> result;
-    for (const auto& [id, anchor] : impl_->anchors) {
-        (void)id;
+    for (const auto& stored : impl_->anchors) {
+        const auto& anchor = stored.anchor;
         const auto projection = projectPointToPolylineArc(
             reference, anchor.positionBaseXYZ, beginArcBase, endArcBase);
         if (projection.arc + kReplayEpsilon < beginArcBase ||
@@ -2445,21 +2552,32 @@ std::vector<DirectedFiberletStorageId>
 FiberletImmutableReplayGraphSource::outgoing(
     const FiberletStorageKey& anchor) const
 {
-    if (!impl_->anchors.contains(anchor))
+    const auto view = outgoingArcs(anchor);
+    std::vector<DirectedFiberletStorageId> result;
+    result.reserve(view.size());
+    for (std::size_t index = 0; index < view.size(); ++index)
+        result.push_back(view[index].id);
+    return result;
+}
+
+FiberletReplayOutgoingArcView
+FiberletImmutableReplayGraphSource::outgoingArcs(
+    const FiberletStorageKey& anchor) const
+{
+    const auto* found = impl_->findAnchor(anchor);
+    if (!found)
         throw std::out_of_range("fiberlet replay anchor is absent");
-    const auto found = impl_->outgoing.find(anchor);
-    return found == impl_->outgoing.end()
-        ? std::vector<DirectedFiberletStorageId>{}
-        : found->second;
+    return {std::span<const FiberletReplaySourceArc>(impl_->outgoing)
+                .subspan(found->outgoingBegin, found->outgoingCount)};
 }
 
 FiberletReplaySourceArc FiberletImmutableReplayGraphSource::arc(
     const DirectedFiberletStorageId& id) const
 {
-    const auto found = impl_->edges.find(id.fiberlet);
-    if (found == impl_->edges.end())
+    const auto* found = impl_->findEdge(id.fiberlet);
+    if (!found)
         throw std::out_of_range("fiberlet replay arc is absent");
-    auto result = found->second.arc;
+    auto result = found->arc;
     result.id = id;
     if (id.reverse) {
         std::swap(result.source, result.target);
@@ -2476,31 +2594,54 @@ FiberletReplaySourceCostProfile
 FiberletImmutableReplayGraphSource::costProfile(
     const DirectedFiberletStorageId& id) const
 {
-    const auto found = impl_->edges.find(id.fiberlet);
-    if (found == impl_->edges.end())
-        throw std::out_of_range("fiberlet replay cost-profile arc is absent");
-    auto result = found->second.profile;
-    if (id.reverse) {
-        std::reverse(
-            result.segmentLengthsPredictionVoxels.begin(),
-            result.segmentLengthsPredictionVoxels.end());
-        std::reverse(
-            result.segmentCostDensities.begin(),
-            result.segmentCostDensities.end());
+    const auto view = costProfileView(id);
+    FiberletReplaySourceCostProfile result;
+    result.segmentLengthsPredictionVoxels.reserve(
+        view.segmentLengthsPredictionVoxels.size());
+    result.segmentCostDensities.reserve(
+        view.segmentCostDensities.size());
+    for (std::size_t index = 0;
+         index < view.segmentLengthsPredictionVoxels.size(); ++index) {
+        result.segmentLengthsPredictionVoxels.push_back(
+            view.segmentLengthsPredictionVoxels[index]);
+        result.segmentCostDensities.push_back(
+            view.segmentCostDensities[index]);
     }
     return result;
+}
+
+FiberletReplayCostProfileView
+FiberletImmutableReplayGraphSource::costProfileView(
+    const DirectedFiberletStorageId& id) const
+{
+    const auto* found = impl_->findEdge(id.fiberlet);
+    if (!found) {
+        throw std::out_of_range(
+            "fiberlet replay cost-profile arc is absent");
+    }
+    return {found->profile.segmentLengthsPredictionVoxels,
+            found->profile.segmentCostDensities, {}, id.reverse};
 }
 
 std::vector<cv::Vec3d> FiberletImmutableReplayGraphSource::routePoints(
     const DirectedFiberletStorageId& id) const
 {
-    const auto found = impl_->edges.find(id.fiberlet);
-    if (found == impl_->edges.end())
-        throw std::out_of_range("fiberlet replay route is absent");
-    auto result = found->second.points;
-    if (id.reverse)
-        std::reverse(result.begin(), result.end());
+    const auto view = routePointView(id);
+    std::vector<cv::Vec3d> result;
+    result.reserve(view.size());
+    for (std::size_t index = 0; index < view.size(); ++index)
+        result.push_back(view[index]);
     return result;
+}
+
+FiberletReplayRoutePointView
+FiberletImmutableReplayGraphSource::routePointView(
+    const DirectedFiberletStorageId& id) const
+{
+    const auto* found = impl_->findEdge(id.fiberlet);
+    if (!found)
+        throw std::out_of_range("fiberlet replay route is absent");
+    return {found->points, {}, id.reverse};
 }
 
 std::optional<FiberletReplaySourceTransition>
@@ -2508,11 +2649,17 @@ FiberletImmutableReplayGraphSource::transition(
     const FiberletReplaySourceArc& incoming,
     const FiberletReplaySourceArc& outgoing) const
 {
-    const auto found = impl_->transitions.find(
-        {incoming.id, outgoing.id});
-    return found == impl_->transitions.end()
+    const auto key = std::pair{incoming.id, outgoing.id};
+    const auto found = std::lower_bound(
+        impl_->transitions.begin(), impl_->transitions.end(), key,
+        [](const FiberletReplaySourceTransition& value,
+           const auto& expected) {
+            return std::pair{value.incoming, value.outgoing} < expected;
+        });
+    return found == impl_->transitions.end() ||
+            std::pair{found->incoming, found->outgoing} != key
         ? std::nullopt
-        : std::optional<FiberletReplaySourceTransition>{found->second};
+        : std::optional<FiberletReplaySourceTransition>{*found};
 }
 
 FiberletGraph buildFiberletGraph(const FiberletPathReport& paths, float maximumJoinAngleDegrees)

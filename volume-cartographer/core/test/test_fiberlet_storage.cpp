@@ -1147,6 +1147,10 @@ TEST_CASE("Combined fiberlet dataset exposes complete sparse graph facets")
         const auto actualOutgoing = materializedGraph.graph->outgoing(second);
         REQUIRE(actualOutgoing == expectedOutgoing);
         REQUIRE(actualOutgoing.size() == 2);
+        const auto outgoingView =
+            materializedGraph.graph->outgoingArcs(second);
+        REQUIRE(outgoingView.size() == actualOutgoing.size());
+        CHECK_FALSE(outgoingView.leased());
         for (const auto& id : actualOutgoing) {
             const auto expectedArc = stored.arc(id);
             const auto actualArc = materializedGraph.graph->arc(id);
@@ -1164,7 +1168,27 @@ TEST_CASE("Combined fiberlet dataset exposes complete sparse graph facets")
                   expectedProfile.segmentCostDensities);
             CHECK(materializedGraph.graph->routePoints(id) ==
                   stored.routePoints(id));
+            const auto profileView =
+                materializedGraph.graph->costProfileView(id);
+            REQUIRE(profileView.segmentLengthsPredictionVoxels.size() ==
+                    expectedProfile.segmentLengthsPredictionVoxels.size());
+            for (std::size_t index = 0;
+                 index < expectedProfile.segmentLengthsPredictionVoxels.size();
+                 ++index) {
+                CHECK(profileView.segmentLengthsPredictionVoxels[index] ==
+                      expectedProfile.segmentLengthsPredictionVoxels[index]);
+                CHECK(profileView.segmentCostDensities[index] ==
+                      expectedProfile.segmentCostDensities[index]);
+            }
+            const auto routeView = materializedGraph.graph->routePointView(id);
+            const auto expectedRoute = stored.routePoints(id);
+            REQUIRE(routeView.size() == expectedRoute.size());
+            CHECK_FALSE(routeView.leased());
+            for (std::size_t index = 0; index < expectedRoute.size(); ++index)
+                CHECK(routeView[index] == expectedRoute[index]);
         }
+        for (std::size_t index = 0; index < actualOutgoing.size(); ++index)
+            CHECK(outgoingView[index].id == actualOutgoing[index]);
         const auto incoming = stored.arc({{first, second}, false});
         const auto outgoing = stored.arc({{second, third}, false});
         const auto expectedTransition = stored.transition(incoming, outgoing);
