@@ -6,12 +6,14 @@ import BrowserOnly from "@docusaurus/BrowserOnly";
 import JsonLd from "@site/src/components/JsonLd";
 import ScrollViewer from "./ScrollViewer";
 import DataCatalog from "./DataCatalog";
+import ScansPanel from "./ScansPanel";
 import PredictionsPanel from "./PredictionsPanel";
-import { photoThumb, neuroglancerUrl } from "./dataAccess";
+import { photoThumb } from "./dataAccess";
 import ReadingsGallery from "./ReadingsGallery";
 import InkSegmentsGallery from "./InkSegmentsGallery";
 import useDarkModeGuard from "./useDarkModeGuard";
 import { loadAtlasIndex } from "./useAtlasData";
+import { isPrizeEligible } from "./prizeEligibility";
 
 // ScrollDetailPage — the per-scroll detail route for the rebuilt /data_browser.
 // This is a Docusaurus ROUTE component: a plugin injects one merged `scroll`
@@ -205,6 +207,15 @@ export default function ScrollDetailPage(props) {
             >
               {scroll.type || "sample"}
             </span>
+            {isPrizeEligible(scroll.id) ? (
+              <Link
+                className="prize-tag"
+                to="/prizes"
+                title="An open Vesuvius Challenge prize can be won on this scroll — see the prizes page"
+              >
+                🏆 prize eligible
+              </Link>
+            ) : null}
           </h1>
           <div className="repo">📍 {scroll.repository || ""}</div>
 
@@ -344,39 +355,6 @@ export default function ScrollDetailPage(props) {
               <div className="plab2">
                 Reached: <b style={{ color: "var(--ink)" }}>{furthest}</b>
               </div>
-
-              {/* Scans list */}
-              <div className="scans">
-                <b style={{ color: "var(--dim)", fontSize: "12px" }}>SCANS</b>
-                {scans.length ? (
-                  scans.map((sc, i) => {
-                    const label =
-                      sc.name ||
-                      `${sc.px ? `${sc.px}µm ` : ""}${
-                        sc.energy ? `${sc.energy}keV ` : ""
-                      }${sc.loc || ""}`.trim();
-                    return (
-                      <div className="scan" key={i}>
-                        {sc.volume ? (
-                          <a
-                            href={neuroglancerUrl(sc.volume, label)}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                          >
-                            {label || "—"} ↗
-                          </a>
-                        ) : (
-                          <span>{label || "—"}</span>
-                        )}
-                      </div>
-                    );
-                  })
-                ) : (
-                  <div className="scan">
-                    <span>—</span>
-                  </div>
-                )}
-              </div>
             </div>
 
             {/* About panel */}
@@ -394,6 +372,9 @@ export default function ScrollDetailPage(props) {
 
             {/* Data & access */}
             <DataCatalog scroll={scroll} />
+
+            {/* Per-scan table (resolution / energy / beamline / Neuroglancer) */}
+            <ScansPanel scans={scans} />
 
             {/* Model predictions (volume-level surface + 3D-ink) */}
             <PredictionsPanel predictions={scroll.predictions} />
