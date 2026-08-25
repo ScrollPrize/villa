@@ -28,6 +28,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -2328,42 +2329,80 @@ FiberletCandidateResult solveCandidate(
         const bool terminal = segment == reversedNodes.size();
         const DpNodeScoring& scoring = dpNodes.at(dpNodes.existing(
             terminal ? reversedNodes.back() : reversedNodes[segment]));
-        const FiberletPredictionSample* currentPrediction = nullptr;
-        FiberletPredictionSample currentStorage;
-        if (segment > 0) {
-            currentStorage = nodePrediction(dpNodes.at(dpNodes.existing(reversedNodes[segment - 1])));
-            currentPrediction = &currentStorage;
+        if (segment == 0 || terminal) {
+            const FiberletPredictionSample* currentPrediction = nullptr;
+            FiberletPredictionSample currentStorage;
+            if (segment > 0) {
+                currentStorage = nodePrediction(dpNodes.at(
+                    dpNodes.existing(reversedNodes[segment - 1])));
+                currentPrediction = &currentStorage;
+            }
+            const FiberletPredictionSample nextPrediction = terminal
+                ? targetProxy
+                : nodePrediction(scoring);
+            candidate.segmentCosts.push_back(pathStepCost(
+                currentPrediction,
+                nextPrediction,
+                previousDirection,
+                previousLength,
+                segmentDirection,
+                segmentLength,
+                scoring.metricNormal,
+                (scoring.flags & kNodeNormalValid) != 0,
+                config));
+            continue;
         }
-        const FiberletPredictionSample nextPrediction = terminal
-            ? targetProxy
-            : nodePrediction(scoring);
-        candidate.segmentCosts.push_back(pathStepCost(
-            currentPrediction,
-            nextPrediction,
-            previousDirection,
-            previousLength,
-            segmentDirection,
-            segmentLength,
-            scoring.metricNormal,
-            (scoring.flags & kNodeNormalValid) != 0,
-            config));
+
+        const auto& currentScoring = dpNodes.at(
+            dpNodes.existing(reversedNodes[segment - 1]));
+        const auto incoming = detail::prepareFiberLocalIncomingAlignmentInline(
+            &currentScoring.metricPrediction,
+            prepareFiberLocalUnitDirection(previousDirection));
+        const auto candidateMetric =
+            detail::prepareFiberLocalCandidateMetricInline(
+                scoring.metricPrediction,
+                prepareFiberLocalUnitDirection(segmentDirection),
+                scoring.metricNormal,
+                (scoring.flags & kNodeNormalValid) != 0);
+        candidate.segmentCosts.push_back(fiberletPathCost(
+            detail::fiberLocalMetricCostFullyPreparedInline(
+                incoming,
+                previousLength,
+                segmentLength,
+                candidateMetric,
+                metricConfig)));
     }
     FiberletPathCost decomposed;
     for (const auto& cost : candidate.segmentCosts)
         decomposed += cost;
     const std::array decomposition{
-        std::pair{decomposed.invalidPrediction, bestCost.invalidPrediction},
-        std::pair{decomposed.alignment, bestCost.alignment},
-        std::pair{decomposed.isotropicSmoothness, bestCost.isotropicSmoothness},
-        std::pair{decomposed.tangentSmoothness, bestCost.tangentSmoothness},
-        std::pair{decomposed.normalSmoothness, bestCost.normalSmoothness},
+        std::tuple{"invalid_prediction", decomposed.invalidPrediction, bestCost.invalidPrediction},
+        std::tuple{"alignment", decomposed.alignment, bestCost.alignment},
+        std::tuple{"isotropic_smoothness", decomposed.isotropicSmoothness, bestCost.isotropicSmoothness},
+        std::tuple{"tangent_smoothness", decomposed.tangentSmoothness, bestCost.tangentSmoothness},
+        std::tuple{"normal_smoothness", decomposed.normalSmoothness, bestCost.normalSmoothness},
     };
-    for (const auto [actual, expected] : decomposition) {
+    for (const auto [component, actual, expected] : decomposition) {
         const float tolerance =
             1.0e-4F * std::max(1.0F, std::abs(expected));
         if (std::abs(actual - expected) > tolerance) {
-            throw std::logic_error(
-                "fiberlet selected-route costs do not reproduce the DP objective");
+            std::ostringstream message;
+            message << "fiberlet selected-route costs do not reproduce the DP objective"
+                    << ": component=" << component
+                    << " actual=" << actual
+                    << " expected=" << expected
+                    << " tolerance=" << tolerance
+                    << " route_nodes=" << reversedNodes.size()
+                    << " route_segments=" << candidate.segmentCosts.size()
+                    << " start=" << candidate.start.cellZYX[0] << '/'
+                    << candidate.start.cellZYX[1] << '/'
+                    << candidate.start.cellZYX[2] << '/'
+                    << candidate.start.componentIndex
+                    << " target=" << candidate.target.cellZYX[0] << '/'
+                    << candidate.target.cellZYX[1] << '/'
+                    << candidate.target.cellZYX[2] << '/'
+                    << candidate.target.componentIndex;
+            throw std::logic_error(message.str());
         }
     }
     candidate.cost = bestCost;

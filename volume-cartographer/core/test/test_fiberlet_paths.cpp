@@ -2992,6 +2992,22 @@ TEST_CASE("fiberlet multiplicative alignment changes the selected route")
     CHECK(std::any_of(wide.candidates[0].pointsPredictionXYZ.begin(), wide.candidates[0].pointsPredictionXYZ.end(), [](const cv::Vec3f& point) {
         return point[1] > 4.25;
     }));
+    const auto& selected = wide.candidates[0];
+    REQUIRE(selected.segmentCosts.size() + 1 ==
+            selected.pointsPredictionXYZ.size());
+    vc::fiber_tracer::FiberletPathCost decomposed;
+    for (const auto& segment : selected.segmentCosts)
+        decomposed += segment;
+    CHECK(decomposed.invalidPrediction ==
+          doctest::Approx(selected.cost.invalidPrediction).epsilon(1.0e-6));
+    CHECK(decomposed.alignment ==
+          doctest::Approx(selected.cost.alignment).epsilon(1.0e-6));
+    CHECK(decomposed.isotropicSmoothness ==
+          doctest::Approx(selected.cost.isotropicSmoothness).epsilon(1.0e-6));
+    CHECK(decomposed.tangentSmoothness ==
+          doctest::Approx(selected.cost.tangentSmoothness).epsilon(1.0e-6));
+    CHECK(decomposed.normalSmoothness ==
+          doctest::Approx(selected.cost.normalSmoothness).epsilon(1.0e-6));
 }
 
 TEST_CASE("fiberlet local grid follows a narrow subvoxel corridor")
