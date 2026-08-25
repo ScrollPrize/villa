@@ -96,6 +96,20 @@ Immutable views borrow graph storage without reference counting. The common
 view interface also supports one shared owner for a complete cache-derived
 result; ownership is per query, never per point, edge, or search state.
 
+Each lookahead keeps the already committed visited anchors as one read-only
+set. Speculative branches add compact parent-linked route nodes instead of
+copying that set and their complete arc prefix. Local cycle checks walk the
+short rollout ancestry. Full arc lists are reconstructed only when the
+intermediate beam cap requires lexicographic ranking; terminal candidates are
+compared directly through their parent links. The cost accumulation, density
+ordering, lexicographic tie break, generated-state limit, and chosen route are
+unchanged.
+
+The final timing line reports `lookahead_route_nodes_max` and
+`lookahead_route_bytes_max`, the largest retained parent arena and its allocated
+capacity observed in any computed seed candidate. These are diagnostic
+high-water marks, not cumulative memory totals across workers.
+
 ## Principal direction groups
 
 After tracing, the tool analyzes every nonzero consecutive step of every

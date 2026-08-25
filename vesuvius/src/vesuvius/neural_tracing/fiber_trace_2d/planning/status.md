@@ -1,16 +1,12 @@
-# Status: continuous deterministic crop tracing and zero-copy graph access
+# Status: compact Fiberlet crop lookahead state
 
 - [x] Record the active task.
-- [x] Inspect scheduler, graph interfaces, cache leases, and hot query paths.
-- [x] Establish the current 500-attempt crop baseline.
+- [x] Inspect the current copied lookahead state and exact ranking semantics.
 - [x] Write the implementation and validation plan.
-- [x] Complete independent plan review and incorporate requested scheduler,
-  indexed-handle, and lease-lifetime clarifications.
-- [x] Add directional borrowed graph views and contiguous immutable storage.
-- [x] Make cache-backed compatibility queries return one owned aggregate view.
-- [x] Port crop lookahead to allocation-free view traversal.
-- [x] Implement bounded continuous computation with ordered finalization.
-- [x] Add exact-output and lifetime regressions.
-- [x] Build and test with GCC and Clang.
-- [x] Benchmark the same 500-attempt crop and compare exact outputs.
-- [x] Finalize specifications, documentation, changelog, and task log.
+- [x] Complete independent plan review and incorporate findings.
+- [x] Implement parent-linked lookahead state.
+- [x] Add exact cycle/ranking regression coverage.
+- [x] Build and run focused GCC and Clang tests.
+- [x] Benchmark the canonical 500-attempt Release workload.
+- [x] Compare generated artifacts exactly.
+- [x] Update specifications, documentation, changelog, and task log.

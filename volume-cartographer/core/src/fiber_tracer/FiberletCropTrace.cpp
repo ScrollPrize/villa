@@ -152,29 +152,97 @@ ClippedRoute clipAtFirstExit(
     return result;
 }
 
-struct LookaheadState {
+constexpr std::size_t kNoLookaheadRouteNode =
+    std::numeric_limits<std::size_t>::max();
+
+struct LookaheadRouteNode {
     FiberletStorageKey anchor;
+    DirectedFiberletStorageId arcFromParent;
+    std::size_t parent = kNoLookaheadRouteNode;
+};
+
+struct LookaheadState {
+    std::size_t routeNode = kNoLookaheadRouteNode;
     std::optional<FiberletReplaySourceArc> incoming;
-    std::set<FiberletStorageKey> visited;
-    std::vector<DirectedFiberletStorageId> arcs;
+    DirectedFiberletStorageId first;
+    std::size_t depth = 0;
     double loss = 0.0;
     double lengthPrediction = 0.0;
 };
 
 struct LookaheadCompletion {
     DirectedFiberletStorageId first;
-    std::vector<DirectedFiberletStorageId> arcs;
+    std::size_t routeNode = kNoLookaheadRouteNode;
+    std::size_t depth = 0;
     double loss = 0.0;
     double lengthPrediction = 0.0;
 };
 
-bool completionLess(const LookaheadCompletion& left, const LookaheadCompletion& right)
+struct LookaheadStatistics {
+    std::size_t maximumRouteNodes = 0;
+    std::size_t maximumRouteBytes = 0;
+};
+
+bool rolloutContains(
+    const std::vector<LookaheadRouteNode>& routes,
+    std::size_t routeNode,
+    const FiberletStorageKey& anchor)
+{
+    while (routeNode != kNoLookaheadRouteNode) {
+        const auto& node = routes[routeNode];
+        if (node.anchor == anchor)
+            return true;
+        routeNode = node.parent;
+    }
+    return false;
+}
+
+std::vector<DirectedFiberletStorageId> lookaheadArcs(
+    const std::vector<LookaheadRouteNode>& routes,
+    std::size_t routeNode,
+    std::size_t depth)
+{
+    std::vector<DirectedFiberletStorageId> arcs;
+    arcs.reserve(depth);
+    while (routeNode != kNoLookaheadRouteNode &&
+           routes[routeNode].parent != kNoLookaheadRouteNode) {
+        arcs.push_back(routes[routeNode].arcFromParent);
+        routeNode = routes[routeNode].parent;
+    }
+    std::reverse(arcs.begin(), arcs.end());
+    return arcs;
+}
+
+const DirectedFiberletStorageId& lookaheadArcAt(
+    const std::vector<LookaheadRouteNode>& routes,
+    std::size_t routeNode,
+    std::size_t depth,
+    std::size_t index)
+{
+    for (std::size_t remaining = depth - index - 1; remaining > 0; --remaining)
+        routeNode = routes[routeNode].parent;
+    return routes[routeNode].arcFromParent;
+}
+
+bool completionLess(
+    const std::vector<LookaheadRouteNode>& routes,
+    const LookaheadCompletion& left,
+    const LookaheadCompletion& right)
 {
     const double leftDensity = left.loss / left.lengthPrediction;
     const double rightDensity = right.loss / right.lengthPrediction;
     if (leftDensity != rightDensity)
         return leftDensity < rightDensity;
-    return left.arcs < right.arcs;
+    const std::size_t commonDepth = std::min(left.depth, right.depth);
+    for (std::size_t index = 0; index < commonDepth; ++index) {
+        const auto& leftArc = lookaheadArcAt(
+            routes, left.routeNode, left.depth, index);
+        const auto& rightArc = lookaheadArcAt(
+            routes, right.routeNode, right.depth, index);
+        if (leftArc != rightArc)
+            return leftArc < rightArc;
+    }
+    return left.depth < right.depth;
 }
 
 std::optional<DirectedFiberletStorageId> selectLookaheadFirstArc(
@@ -184,28 +252,33 @@ std::optional<DirectedFiberletStorageId> selectLookaheadFirstArc(
     const std::set<FiberletStorageKey>& alreadyVisited,
     const std::optional<cv::Vec3d>& initialDirection,
     const std::optional<DirectedFiberletStorageId>& forcedFirst,
-    const FiberletCropTraceConfig& config)
+    const FiberletCropTraceConfig& config,
+    LookaheadStatistics& statistics)
 {
     const double horizonPrediction = config.lookaheadDistanceBaseVoxels / graph.predictionToBaseScale();
-    std::vector<LookaheadState> frontier{{source, incoming, alreadyVisited, {}, 0.0, 0.0}};
+    std::vector<LookaheadRouteNode> routes{{source, {}, kNoLookaheadRouteNode}};
+    std::vector<LookaheadState> frontier{{0, incoming, {}, 0, 0.0, 0.0}};
     std::vector<LookaheadCompletion> completed;
     std::size_t generated = 0;
     const double minimumInitialDot = std::cos(graph.maximumJoinAngleDegrees() * kPi / 180.0);
 
     while (!frontier.empty() && generated < config.maximumGeneratedStatesPerStep) {
         std::vector<LookaheadState> next;
-        for (auto& state : frontier) {
+        for (const auto& state : frontier) {
             bool expanded = false;
-            const auto outgoing = graph.outgoingArcs(state.anchor);
+            const auto stateAnchor = routes[state.routeNode].anchor;
+            const auto outgoing = graph.outgoingArcs(stateAnchor);
             for (std::size_t outgoingIndex = 0;
                  outgoingIndex < outgoing.size(); ++outgoingIndex) {
                 const auto& edge = outgoing[outgoingIndex];
                 const auto& id = edge.id;
-                if (state.arcs.empty() && forcedFirst.has_value() && id != *forcedFirst) {
+                if (state.depth == 0 && forcedFirst.has_value() && id != *forcedFirst) {
                     continue;
                 }
-                if (state.visited.contains(edge.target))
+                if (alreadyVisited.contains(edge.target) ||
+                    rolloutContains(routes, state.routeNode, edge.target)) {
                     continue;
+                }
                 std::optional<FiberletReplaySourceTransition> join;
                 if (state.incoming.has_value()) {
                     join = graph.transition(*state.incoming, edge);
@@ -228,11 +301,16 @@ std::optional<DirectedFiberletStorageId> selectLookaheadFirstArc(
                 if (!(includedLength > kEpsilon))
                     continue;
                 const double includedFraction = includedLength / edgeLength;
-                LookaheadState candidate = state;
-                candidate.anchor = edge.target;
-                candidate.incoming = edge;
-                candidate.visited.insert(edge.target);
-                candidate.arcs.push_back(id);
+                const std::size_t candidateRouteNode = routes.size();
+                routes.push_back({edge.target, id, state.routeNode});
+                LookaheadState candidate{
+                    candidateRouteNode,
+                    edge,
+                    state.depth == 0 ? id : state.first,
+                    state.depth + 1,
+                    state.loss,
+                    state.lengthPrediction,
+                };
                 candidate.loss += edge.cost.total() * includedFraction;
                 if (join.has_value())
                     candidate.loss += join->cost.total();
@@ -242,42 +320,63 @@ std::optional<DirectedFiberletStorageId> selectLookaheadFirstArc(
 
                 const bool terminal = clipped.exited || candidate.lengthPrediction >= horizonPrediction - kEpsilon;
                 if (terminal) {
-                    completed.push_back({candidate.arcs.front(), candidate.arcs, candidate.loss, candidate.lengthPrediction});
+                    completed.push_back({candidate.first, candidate.routeNode, candidate.depth, candidate.loss, candidate.lengthPrediction});
                 } else {
                     next.push_back(std::move(candidate));
                 }
                 if (generated >= config.maximumGeneratedStatesPerStep)
                     break;
             }
-            if (!expanded && !state.arcs.empty()) {
-                completed.push_back({state.arcs.front(), state.arcs, state.loss, state.lengthPrediction});
+            if (!expanded && state.depth > 0) {
+                completed.push_back({state.first, state.routeNode, state.depth, state.loss, state.lengthPrediction});
             }
             if (generated >= config.maximumGeneratedStatesPerStep)
                 break;
         }
         if (next.size() > config.beamWidth * 64) {
-            std::sort(next.begin(), next.end(), [](const auto& left, const auto& right) {
-                const double leftDensity = left.loss / left.lengthPrediction;
-                const double rightDensity = right.loss / right.lengthPrediction;
+            struct RankedState {
+                LookaheadState state;
+                std::vector<DirectedFiberletStorageId> arcs;
+            };
+            std::vector<RankedState> ranked;
+            ranked.reserve(next.size());
+            for (auto& state : next) {
+                auto arcs = lookaheadArcs(
+                    routes, state.routeNode, state.depth);
+                ranked.push_back({std::move(state), std::move(arcs)});
+            }
+            std::sort(ranked.begin(), ranked.end(), [](const auto& left, const auto& right) {
+                const double leftDensity = left.state.loss / left.state.lengthPrediction;
+                const double rightDensity = right.state.loss / right.state.lengthPrediction;
                 if (leftDensity != rightDensity)
                     return leftDensity < rightDensity;
                 return left.arcs < right.arcs;
             });
-            next.resize(config.beamWidth * 64);
+            next.clear();
+            next.reserve(config.beamWidth * 64);
+            for (std::size_t index = 0; index < config.beamWidth * 64; ++index)
+                next.push_back(std::move(ranked[index].state));
         }
         frontier = std::move(next);
     }
     for (const auto& state : frontier) {
-        if (!state.arcs.empty()) {
-            completed.push_back({state.arcs.front(), state.arcs, state.loss, state.lengthPrediction});
+        if (state.depth > 0) {
+            completed.push_back({state.first, state.routeNode, state.depth, state.loss, state.lengthPrediction});
         }
     }
+    statistics.maximumRouteNodes = std::max(
+        statistics.maximumRouteNodes, routes.size());
+    statistics.maximumRouteBytes = std::max(
+        statistics.maximumRouteBytes,
+        routes.capacity() * sizeof(LookaheadRouteNode));
     if (completed.empty())
         return std::nullopt;
-    std::sort(completed.begin(), completed.end(), completionLess);
-    if (completed.size() > config.beamWidth)
-        completed.resize(config.beamWidth);
-    return completed.front().first;
+    const auto best = std::min_element(
+        completed.begin(), completed.end(),
+        [&routes](const auto& left, const auto& right) {
+            return completionLess(routes, left, right);
+        });
+    return best->first;
 }
 
 struct SideTrace {
@@ -291,7 +390,8 @@ SideTrace traceSide(
     const FiberletStoredAnchor& seed,
     const cv::Vec3d& direction,
     const std::optional<DirectedFiberletStorageId>& forcedFirst,
-    const FiberletCropTraceConfig& config)
+    const FiberletCropTraceConfig& config,
+    LookaheadStatistics& statistics)
 {
     SideTrace result;
     const cv::Vec3d seedPoint(seed.positionPredictionXYZ * graph.predictionToBaseScale());
@@ -301,7 +401,7 @@ SideTrace traceSide(
     std::set<FiberletStorageKey> visited{seed.key};
     for (std::size_t step = 0; step < config.maximumFiberletsPerSide; ++step) {
         const auto selected =
-            selectLookaheadFirstArc(graph, current, incoming, visited, incoming.has_value() ? std::nullopt : std::make_optional(direction), incoming.has_value() ? std::nullopt : forcedFirst, config);
+            selectLookaheadFirstArc(graph, current, incoming, visited, incoming.has_value() ? std::nullopt : std::make_optional(direction), incoming.has_value() ? std::nullopt : forcedFirst, config, statistics);
         if (!selected.has_value()) {
             result.termination = result.fiberlets == 0 ? "no_usable_edge" : "graph_exhausted";
             return result;
@@ -332,6 +432,7 @@ struct InitialPair {
 
 struct TraceCandidate {
     FiberletCropTraceLine line;
+    LookaheadStatistics lookahead;
     bool hasUsableEdge = false;
     bool bidirectional = false;
 };
@@ -423,13 +524,15 @@ TraceCandidate traceCandidate(
     SideTrace negative;
     SideTrace positive;
     if (initial.negative.has_value()) {
-        negative = traceSide(graph, seed, -axis, initial.negative, config);
+        negative = traceSide(
+            graph, seed, -axis, initial.negative, config, result.lookahead);
     } else {
         negative.points = {cv::Vec3d(seed.positionPredictionXYZ * graph.predictionToBaseScale())};
         negative.termination = "no_usable_edge";
     }
     if (initial.positive.has_value()) {
-        positive = traceSide(graph, seed, axis, initial.positive, config);
+        positive = traceSide(
+            graph, seed, axis, initial.positive, config, result.lookahead);
     } else {
         positive.points = {cv::Vec3d(seed.positionPredictionXYZ * graph.predictionToBaseScale())};
         positive.termination = "no_usable_edge";
@@ -585,6 +688,8 @@ FiberletCropTraceResult traceFiberletCrop(
         std::size_t completed = 0;
         double taskSeconds = 0.0;
         double maximumTaskSeconds = 0.0;
+        std::size_t maximumLookaheadRouteNodes = 0;
+        std::size_t maximumLookaheadRouteBytes = 0;
     } completions;
 
     std::optional<utils::ThreadPool> pool;
@@ -627,6 +732,12 @@ FiberletCropTraceResult traceFiberletCrop(
                 completions.maximumTaskSeconds = std::max(
                     completions.maximumTaskSeconds,
                     completion.taskSeconds);
+                completions.maximumLookaheadRouteNodes = std::max(
+                    completions.maximumLookaheadRouteNodes,
+                    completion.candidate.lookahead.maximumRouteNodes);
+                completions.maximumLookaheadRouteBytes = std::max(
+                    completions.maximumLookaheadRouteBytes,
+                    completion.candidate.lookahead.maximumRouteBytes);
                 completions.byTicket.emplace(
                     ticket, std::move(completion));
             }
@@ -721,6 +832,10 @@ FiberletCropTraceResult traceFiberletCrop(
         result.candidateTaskSeconds = completions.taskSeconds;
         result.maximumCandidateTaskSeconds =
             completions.maximumTaskSeconds;
+        result.maximumLookaheadRouteNodes =
+            completions.maximumLookaheadRouteNodes;
+        result.maximumLookaheadRouteBytes =
+            completions.maximumLookaheadRouteBytes;
     }
     result.candidateBatchSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - schedulerStarted).count();

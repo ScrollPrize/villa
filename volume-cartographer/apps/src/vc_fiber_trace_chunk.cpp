@@ -261,6 +261,8 @@ int main(int argc, char** argv)
                   << " candidate_batch_cpu_seconds=" << result.candidateBatchCpuSeconds
                   << " candidate_task_seconds=" << result.candidateTaskSeconds
                   << " candidate_task_max_seconds=" << result.maximumCandidateTaskSeconds
+                  << " lookahead_route_nodes_max=" << result.maximumLookaheadRouteNodes
+                  << " lookahead_route_bytes_max=" << result.maximumLookaheadRouteBytes
                   << " integration_seconds=" << result.integrationSeconds << '\n';
         return 0;
     } catch (const std::exception& error) {

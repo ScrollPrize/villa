@@ -15,6 +15,11 @@
   records with borrowed directional adjacency/route views, eliminating route
   copies during rejected lookahead. The 500-attempt Paris4 crop remains
   byte-identical and drops from 86.80 s to 79.66 s wall time.
+- Replaced per-branch committed-set and route-vector copies with compact
+  parent-linked lookahead ancestry. Terminal candidates retain indices and use
+  exact linear minimum selection instead of materializing and sorting every
+  route. The same 500-attempt crop remains byte-identical; three Release runs
+  take 46.81-47.01 s wall with 34.24-34.54 s tracing.
 
 # 2026-08-25: Fiberlet producer cache contract v3
 

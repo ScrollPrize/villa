@@ -4588,6 +4588,15 @@
   traffic. Other graph sources may return one shared owner per complete query
   result; compact cached routes use one reconstructed owned buffer rather than
   reference-counting individual elements or retaining leases in search state.
+- Crop lookahead keeps the committed trace's visited-anchor set immutable and
+  represents only rollout-local ancestry as parent-linked route nodes. Cycle
+  rejection checks both sets and includes the current rollout node. Complete
+  arc sequences are materialized only at the existing intermediate
+  lexicographic-pruning boundary. Terminal candidates retain route-node
+  indices; the selected minimum uses the same cost-density and full
+  lexicographic route ordering as the former sorted completion vectors. This
+  representation must not change arithmetic, generated-state cutoff behavior,
+  traversal order, or selected Fiberlets.
 - `--threads` defaults to the host CPU count and controls both batched graph
   preparation and immutable seed tracing. There is no separate low trace-worker
   cap.

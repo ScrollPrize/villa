@@ -54,6 +54,8 @@ struct FiberletCropTraceResult {
     double candidateTaskSeconds = 0.0;
     double maximumCandidateTaskSeconds = 0.0;
     double integrationSeconds = 0.0;
+    std::size_t maximumLookaheadRouteNodes = 0;
+    std::size_t maximumLookaheadRouteBytes = 0;
 };
 
 enum class FiberDirectionGroup {

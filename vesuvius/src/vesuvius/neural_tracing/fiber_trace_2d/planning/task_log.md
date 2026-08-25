@@ -1,90 +1,108 @@
-# Task log: continuous deterministic crop tracing and zero-copy graph access
+# Task log: compact Fiberlet crop lookahead state
 
 ## Baseline
 
-- Build: existing GCC optimized `volume-cartographer/build`.
+- Build: GCC Release `volume-cartographer/build`, confirmed `-O3 -DNDEBUG`.
 - Dataset: Paris4 combined `fiberlets.zarr`, crop base XYZ
   `[10240,22016,6144)` to `[11264,23040,7168)`, 500 attempts.
-- Result: 500 accepted, 27,715 covered anchors, 622 computed candidates,
-  122 discarded candidates.
-- Timing: 86.80 s wall, 1,313.17 s user, 32.27 s system; graph preparation
-  12.07 s wall / 60.56 s CPU and tracing 73.37 s wall / 1,283.52 s CPU.
+- Current result: 500 accepted, 27,715 covered anchors, 724 computed
+  candidates, 224 discarded candidates.
+- Current timing: 79.66 s wall, 1,381.65 s user, 33.44 s system; graph
+  preparation 11.64 s wall / 62.83 s CPU and tracing 67.39 s wall /
+  1,351.61 s CPU.
 
 ## Findings
 
-- Fixed batches impose a barrier after at most one candidate per worker.
-- Ordered ticket finalization can preserve strongest-first coverage while a
-  bounded speculative window keeps workers active beyond a slow candidate.
-- A shared payload lease costs one atomic increment/decrement per view. It is
-  suitable at query granularity but not per element or persistent search state.
-- The immutable graph can return unleased stable views. Direct cached route
-  geometry is reconstructed from compact lattice data, so its view must own one
-  derived buffer unless that geometry receives a separate memoization layer.
-- Crop lookahead currently creates and clips a complete route vector for every
-  considered edge even though it needs only exit/fraction information.
-- Independent review required dense ticket semantics, explicit limit/error
-  behavior, fixed backpressure, callbacks outside scheduler locks, outgoing
-  arcs rather than ID-only views, and explicit owner lifetime tests. The
-  implementation plan was updated before coding.
+- Every accepted lookahead branch currently copies both the complete committed
+  `std::set<FiberletStorageKey>` and the complete rollout arc vector.
+- The committed set grows with trace length, making branch construction depend
+  on the full prefix despite cycle checks needing only a read-only prefix query
+  plus the short current rollout ancestry.
+- Full route sequences are semantically required only for existing
+  lexicographic ranking and completion records.
+- Independent review identified exact parity coverage needed for committed and
+  rollout-local cycles, the generated-state cutoff, dead-end/terminal
+  completion, and the `beamWidth * 64` intermediate pruning boundary.
+- To bound retained history better, generated route ancestry will store only a
+  compact parent link, endpoint anchor, and directed arc ID. Full incoming arcs
+  remain only in active frontier states, not the historical arena.
+- Performance validation must include repeated Release timing, a practical
+  hotspot profile, and measured peak arena population rather than a single
+  canonical run.
+
+## Initial result and profile
+
+- Three GCC Release runs after the route-node arena measured 69.84, 69.87, and
+  71.80 seconds wall; trace time was 57.38, 57.63, and 59.51 seconds. The
+  previous single canonical run was 79.66 seconds wall / 67.39 seconds trace.
+- All eight OBJ artifacts from the first run are byte-identical to the previous
+  implementation. Candidate, coverage, acceptance, and direction counters are
+  also identical.
+- A `gprofng` 100-attempt profile still attributes 45.25% exclusive CPU to
+  `selectLookaheadFirstArc`, including 7.29% in reconstructing completed arc
+  vectors and 3.22% in sorting completions. Since only the minimum completion
+  is observed, the plan now includes index-backed completions and exact linear
+  minimum selection.
 
 ## Implementation
 
-- Replaced immutable replay maps with sorted contiguous anchor, physical-edge,
-  transition, and flat directed-adjacency arrays.
-- Added directional views for full outgoing arcs, route points, segment
-  lengths, and cost densities. Immutable views borrow stable arrays. The
-  compatibility fallback owns one complete derived vector/profile through one
-  shared owner, which also covers compact cache-derived results without
-  retaining element-level references.
-- Crop lookahead now scans route views directly and constructs clipped route
-  points only for the selected committed edge.
-- Replaced synchronized worker batches with dense tickets, a continuous pool,
-  and ordered coordinator commits. The measured speculation window is
-  `workers + max(1, workers / 8)`; a `2 * workers` trial performed too much
-  invalidated work.
-- Limits and exceptions are resolved at the ordered commit frontier. Work past
-  the equivalent serial stop is joined but ignored.
+- Replaced each branch's copied committed `std::set` and arc vector with a
+  compact route-node arena. Nodes contain only the endpoint anchor, parent
+  index, and directed arc ID; active frontier states retain accumulated values
+  and the incoming arc.
+- Cycle checks query the immutable committed-prefix set and then walk the
+  current rollout ancestry, including the current node.
+- Intermediate `beamWidth * 64` pruning reconstructs one route per ranked
+  state and keeps the exact previous density/lexicographic comparator.
+- Terminal and dead-end completions retain arena indices. A linear minimum
+  scan uses the same density order and compares parent-linked routes
+  lexicographically only on exact density ties. Sorting, truncating, and
+  returning the first completion had no other observable effect.
+- Added CLI high-water diagnostics for route-arena nodes and allocated bytes.
 
-## Performance
+## Final performance
 
-| Implementation | Wall | User | System | Computed | Discarded |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Synchronized batches | 86.80 s | 1,313.17 s | 32.27 s | 622 | 122 |
-| Continuous, `2 * workers` window | 107.17 s | 1,722.32 s | 327.35 s | 860 | 360 |
-| Continuous, 12.5% queue headroom | 79.66 s | 1,381.65 s | 33.44 s | 724 | 224 |
+The final-code Release measurements used three iterations of the canonical
+500-attempt command.
 
-- The accepted result is unchanged: 500 lines and 27,715 covered anchors.
-- Every complete/directional/anchor OBJ in `/tmp/fiber-crop-parallel-smallq`
-  is byte-identical to the baseline in `/tmp/fiber-crop-debug`.
-- The selected implementation reduces total wall time by 7.14 s (8.2%) and
-  trace wall time from 73.37 s to 67.39 s (8.1%). CPU time increases by 5.3%
-  because continuous refill intentionally computes 102 additional candidates.
-- `perf` is not installed in this environment. Existing stage/task timing
-  identifies candidate traversal as the sustained hotspot; graph preparation
-  remains about 12 s and is unchanged for this crop.
+| Metric | Previous | Final min | Final median | Final max |
+| --- | ---: | ---: | ---: | ---: |
+| Wall | 79.66 s | 46.81 s | 46.97 s | 47.00 s |
+| Graph preparation | 11.64 s | 11.83 s | 11.92 s | 11.92 s |
+| Tracing | 67.39 s | 34.26 s | 34.40 s | 34.52 s |
+| User CPU | 1,381.65 s | 742.69 s | 754.73 s | 767.10 s |
+| System CPU | 33.44 s | 42.99 s | 48.40 s | 48.55 s |
 
-## Deviations
+- Median wall time improves by 41.0%; median tracing time improves by 49.0%.
+- Every run retained 500 accepted lines, 27,715 covered anchors, 724 computed
+  candidates, and 224 discarded candidates.
+- The largest observed per-candidate route arena contained 224,096 nodes and
+  had 29,360,128 bytes of allocated capacity. Process peak RSS was
+  11,389,868-11,455,404 KiB, still dominated by the materialized graph.
+- Every generated line, direction group, and anchor OBJ is byte-identical to
+  the pre-change `/tmp/fiber-crop-parallel-smallq` artifacts.
 
-- The plan-review wording proposed pinning decoded cache chunks for views.
-  Current stored/cached route geometry is necessarily reconstructed from its
-  compact lattice representation. The implementation instead gives the view
-  one owned derived buffer, which is valid after LRU eviction and does not
-  delay eviction. This preserves the requested one-owner cost and is safer for
-  the cache memory budget.
+## Profile
+
+- `gprofng` sampled the same crop with 100 attempts in GCC Release.
+- After the optimization, inlined lookahead/`traceSide` accounts for 47.1%
+  exclusive CPU, immutable transition lookup 18.2%, route-view lookup 6.7%,
+  and the remaining intermediate-prune sorting about 2.5%.
+- Completion route reconstruction and completion sorting no longer appear as
+  separate hotspots. The next meaningful exact optimization target is graph
+  transition/route lookup rather than search-prefix ownership.
 
 ## Validation
 
-- GCC Release build: `vc_fiber_trace_chunk`, `test_fiberlet_crop_trace`,
-  `test_fiberlet_storage`, and `test_fiberlet_paths` all compile with `-j 32`.
-- `test_fiberlet_crop_trace`: 11 cases pass, including skewed completion,
-  canonical failures, post-limit failure suppression, view ownership, and
-  serial/parallel equality. Twenty consecutive GCC Release runs pass.
-- `test_fiberlet_storage`: 37 cases pass; materialized forward/reverse view
-  parity is covered.
-- Clang Debug builds and passes all 11 crop, 37 storage, and 87 Fiberlet path
-  cases. Its only build warning is an existing ignored `nodiscard` result in
-  `FiberReplay.cpp:1659`.
-- The full GCC Release `test_fiberlet_paths` executable has 295 bitwise
-  local-metric failures at line 414 in untouched metric code; the same suite
-  passes under the configured Clang Debug build.
-- `git diff --check` passes after removing the task-file trailing blank line.
+- GCC Release `test_fiberlet_crop_trace`: 12 cases pass, repeated 20 times.
+- GCC Release `test_fiberlet_storage`: 37 cases pass.
+- Clang Debug `test_fiberlet_crop_trace`: 12 cases pass.
+- The new 65-way equal-density test crosses the intermediate pruning boundary,
+  verifies the lexicographic winner, exercises committed/rollout back edges,
+  and repeats under a one-generated-state cap.
+- `git diff --check` passes.
+
+## Deviations
+
+- None. The arithmetic, traversal order, cutoff semantics, counters, geometry,
+  and output ordering are unchanged.

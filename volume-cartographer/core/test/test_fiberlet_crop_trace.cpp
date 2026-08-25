@@ -289,6 +289,48 @@ TEST_CASE("Fiberlet crop tracing is bidirectional and uses anisotropic direction
     CHECK(limited.noEdgeAnchors == 1);
 }
 
+TEST_CASE("Fiberlet crop lookahead preserves lexicographic pruning and state-cap ordering")
+{
+    TestGraph graph;
+    const auto seed = key(0);
+    const auto branch = key(10);
+    graph.addAnchor(seed, {0, 0, 0});
+    graph.addAnchor(branch, {10, 0, 0});
+    graph.connect(seed, branch);
+    for (std::int64_t index = 0; index < 65; ++index) {
+        const auto target = key(100 + index);
+        graph.addAnchor(target, {20, static_cast<double>(index) * 0.01, 0});
+        graph.connect(branch, target);
+    }
+
+    ZNormalSampler normals;
+    FiberletCropTraceConfig config;
+    config.minimumBaseXYZ = {-100, -100, -100};
+    config.maximumBaseXYZ = {1'000, 100, 100};
+    config.beamWidth = 1;
+    config.lookaheadDistanceBaseVoxels = 100;
+    config.maximumAttempts = 1;
+
+    const auto pruned = traceFiberletCrop(
+        graph,
+        {anchor(seed, {0, 0, 0}, {1, 0, 0}, 1.0F)},
+        normals, 1.0, config);
+    REQUIRE(pruned.lines.size() == 1);
+    REQUIRE(pruned.lines.front().pointsBaseXYZ.size() == 3);
+    CHECK(pruned.lines.front().pointsBaseXYZ.back() == cv::Vec3d{20, 0, 0});
+    CHECK(pruned.lines.front().positiveTermination == "graph_exhausted");
+
+    config.maximumGeneratedStatesPerStep = 1;
+    const auto capped = traceFiberletCrop(
+        graph,
+        {anchor(seed, {0, 0, 0}, {1, 0, 0}, 1.0F)},
+        normals, 1.0, config);
+    REQUIRE(capped.lines.size() == 1);
+    CHECK(capped.lines.front().pointsBaseXYZ ==
+          pruned.lines.front().pointsBaseXYZ);
+    CHECK(capped.lines.front().positiveTermination == "graph_exhausted");
+}
+
 TEST_CASE("Fiberlet crop tracing computes concurrently and integrates canonically")
 {
     TestGraph graph;

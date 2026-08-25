@@ -1,82 +1,72 @@
-# Plan: continuous deterministic crop tracing and zero-copy graph access
+# Plan: compact Fiberlet crop lookahead state
 
 ## Contract
 
-- Preserve anchor ordering, candidate geometry, coverage suppression, accepted
-  line order, termination reasons, and numerical objectives exactly.
-- Parallel completion order must not affect the committed result.
-- Keep memory bounded when an early slow candidate delays the commit frontier.
-- Cache-backed views pin their payload or derived buffer for the view lifetime;
-  search states retain IDs and values, not cache leases.
-- Missing/corrupt sparse chunk behavior remains unchanged.
+- This is a search-state representation optimization only. It must not change
+  floating-point operations, graph traversal order, pruning boundaries,
+  lexicographic tie-breaking, generated-state limits, or selected Fiberlets.
+- The committed trace prefix remains one immutable visited-anchor set owned by
+  `traceSide`; no branch may copy it.
+- A rollout cycle is rejected when its target is in either the committed prefix
+  or the current state's parent chain, matching the existing copied set.
 
 ## Implementation
 
-1. Add move-friendly directional borrowed-view types for outgoing arcs, route
-   points, segment lengths, and segment costs. Each view has indexed
-   forward/reverse access and at most one opaque shared lease. Preserve the
-   existing owned query methods as compatibility materializers. An immutable
-   outgoing item carries a stable edge handle plus public ID/arc data, avoiding
-   another ID lookup; persistent search state still retains only public IDs.
-2. Implement immutable views over stable storage without leases. Replace the
-   immutable graph's pointer-heavy maps with sorted contiguous anchor, edge,
-   and transition arrays plus flat outgoing adjacency. Resolve public storage
-   IDs at the API boundary and use stable indices internally.
-3. Make cache-backed queries use the same view boundary with one aggregate
-   owned result per query. Multi-chunk filtered adjacency and compact route
-   reconstruction each produce one derived buffer; the view owns that buffer,
-   remains valid across cache eviction, and does not pin unrelated chunks.
-   Never reference-count individual elements or retain owners in search state.
-4. Update crop lookahead and committed tracing to consume directional views.
-   Compute crop-exit fraction without constructing a clipped point vector;
-   materialize clipped geometry only for the selected committed fiberlet.
-5. Replace fixed `workerCount` batches with a continuous coordinator/worker
-   scheduler. Assign dense monotonically increasing tickets in strongest-first
-   seed scan order, skipping only anchors already inactive when claimed.
-   Maintain at most `workerCount + max(1, workerCount / 8)`
-   submitted-but-uncommitted tickets. This measured headroom avoids a batch
-   barrier without allowing a slow frontier candidate to generate a complete
-   second batch of usually invalidated work.
-   Workers compute outside locks and publish completions; the coordinator
-   drains every consecutive ready ticket, invokes progress callbacks without a
-   scheduler mutex held, and refills the window. Claimed seeds invalidated by
-   an earlier commit remain tickets and are discarded only at ordered commit.
-6. Stop claiming when attempt/fiber limits are reached, join outstanding work,
-   and ignore results or exceptions strictly beyond that serial stop point.
-   A failure at the ordered frontier propagates after all earlier tickets have
-   committed, matching one-thread semantics. Retain timing counters with
-   documented continuous-scheduler semantics.
+1. Replace `LookaheadState::visited` and `LookaheadState::arcs` with a compact
+   route-node arena containing only anchor, parent index, and arc from parent.
+   Active frontier state keeps its route-node index, incoming arc, first arc,
+   depth, accumulated loss, and accumulated prediction-space length. This
+   avoids retaining a full arc payload for every historical generated state.
+2. Keep frontier vectors as compact states whose ancestry uses arena indices.
+   Append each accepted route node once and retain parent links for the arena
+   lifetime. Avoid references into the arena across appends so vector
+   reallocation is harmless; do not reserve the one-million-state hard cap.
+3. Check rollout-local cycles by walking the short parent chain after checking
+   the immutable committed-prefix set.
+4. Reconstruct the full arc sequence only when creating a completion or when
+   the existing intermediate density/lexicographic pruning boundary is reached.
+   Build one `{state, reconstructed_arcs}` record per state at that boundary,
+   sort by the exact existing `loss / length` followed by the full arc vector,
+   and rebuild the frontier in that order. Do not introduce hashes or new keys.
+5. Retain completion route-node/depth indices instead of materialized route
+   vectors. Select the single required minimum by the exact existing density
+   ordering. For exact-density ties, compare parent-linked arcs in forward
+   lexicographic order without allocation. This is equivalent to sorting,
+   truncating, and returning the first completion. Keep all arithmetic
+   expressions and their order unchanged.
 
 ## Tests
 
-- Verify immutable forward/reverse views and owned compatibility queries return
-  identical IDs, points, lengths, and costs.
-- Verify cache-backed views retain valid data for their complete lifetime.
-- Destroy the source buffers after constructing an owned view and verify its
-  forward/reverse route/profile data remains valid. Cover immutable
-  forward/reverse adjacency, route, and cost-profile parity against the owned
-  compatibility API.
-- Compare serial, ordinary parallel, and deliberately skewed parallel crop
-  results exactly, including accepted lines/order, coverage, limits, and
-  termination metadata. Allow only speculative computation counters to differ.
-- Verify attempt/fiber limits ignore later speculative failures while an error
-  at the ordered frontier propagates after the same committed prefix as serial.
-- Build and run focused GCC Release and Clang test targets.
-- Benchmark the same Paris4 1024-base-voxel crop with 500 attempts before and
-  after; report wall/CPU times and exact result equality.
-- Run `git diff --check`.
+- Add focused regressions for committed-prefix cycle rejection, current-node
+  and ancestor rollout-cycle rejection, dead-end completion, horizon/crop-exit
+  completion, and deterministic completion tie-breaking.
+- Exercise intermediate pruning with more than `beamWidth * 64` equal-density
+  states, and exercise the exact generated-state cap semantics with a low-cap
+  branching graph.
+- Run GCC Release `test_fiberlet_crop_trace` repeatedly and the relevant
+  storage/path suites; run the Clang crop test when available.
+- Profile a smaller representative crop with an available local profiler or
+  focused internal timings. Benchmark the same Paris4 1024-base-voxel crop with
+  500 attempts repeatedly in the existing Release build. Report iteration
+  count, min/median/max wall and tracing time, user/system time,
+  graph-preparation time, and computed/discarded candidates.
+- Record peak route-arena population and estimated bytes on the canonical
+  workload to confirm bounded practical memory despite the generated-state cap.
+- Compare every generated OBJ against the committed pre-change baseline with
+  `cmp`, and run `git diff --check`.
 
 ## Spec update
 
-Specify ordered continuous candidate finalization, bounded speculation, stable
-directional graph views, and lease lifetime rules. State that these are exact
-execution/data-layout changes, not numerical changes.
+Specify that crop lookahead keeps the committed prefix immutable and uses
+parent-linked rollout ancestry, materializing routes only for canonical
+ranking/completion while preserving exact search semantics.
 
 ## Documentation updates
 
-Document crop scheduler determinism, speculative discard behavior, timing
-counters, immutable views, and cache pinning lifetime.
+Document the allocation behavior and explain why the arena has no numerical or
+search-result effect.
 
 ## Changelog
 
-Add a crop-tracing performance entry after implementation and validation.
+Add the measured lookahead-state optimization and exact-output validation to
+the current crop-tracing performance entry.

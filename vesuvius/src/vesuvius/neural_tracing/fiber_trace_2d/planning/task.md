@@ -1,14 +1,13 @@
-# Task: continuous deterministic crop tracing and zero-copy graph access
+# Task: compact Fiberlet crop lookahead state
 
-Accelerate `vc_fiber_trace_chunk` without changing its numerical tracing or
-strongest-first coverage result.
+Accelerate the sustained `vc_fiber_trace_chunk` tracing phase without changing
+its numerical work or deterministic output.
 
-- Replace synchronized candidate batches with continuously fed workers.
-- Candidate computation may run speculatively, but completed candidates must
-  finalize strictly in seed order so coverage and accepted output remain
-  deterministic.
-- Replace repeated immutable-graph map traversal and vector copies with stable
-  indexed storage and borrowed directional views.
-- Make the view ownership model usable by cache-backed graph sources through a
-  single lease per returned view, never reference tracking per element or
-  search state.
+- Stop copying the complete committed visited-anchor set and complete rollout
+  arc vector for every accepted lookahead branch.
+- Represent rollout states in an indexed parent arena.
+- Preserve expansion order, cycle rejection, limits, loss accumulation,
+  density ordering, lexicographic route tie-breaking, and selected routes
+  exactly.
+- Measure the same Paris4 1024-base-voxel crop and compare all generated OBJ
+  files byte-for-byte with the current Release result.
