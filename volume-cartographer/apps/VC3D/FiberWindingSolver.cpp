@@ -1049,6 +1049,39 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
             (psi[link.fiberB][link.pointB] / kTwoPi + static_cast<double>(k[link.fiberB])));
     }
     std::sort(result.droppedLinks.begin(), result.droppedLinks.end());
+    // Violation of each crossing against the final map, in the canonical
+    // gauge (before psiH is restored below): the H side reads directly off
+    // the crossing, the V side off the V trace's nearest z sample.
+    for (Crossing& crossing : merged) {
+        const std::vector<double>& vz = fibers[crossing.vFiber].z;
+        if (vz.empty()) {
+            continue;
+        }
+        std::size_t nearest = 0;
+        double bestDz = std::numeric_limits<double>::infinity();
+        for (std::size_t i = 0; i < vz.size(); ++i) {
+            const double dz = std::abs(vz[i] - crossing.zVx);
+            if (dz < bestDz) {
+                bestDz = dz;
+                nearest = i;
+            }
+        }
+        const double wH = crossing.psiH / kTwoPi +
+                          static_cast<double>(k[crossing.hFiber]);
+        const double wV = psi[crossing.vFiber][nearest] / kTwoPi +
+                          static_cast<double>(k[crossing.vFiber]);
+        switch (crossing.kind) {
+        case CrossingKind::Inside:   // demanded W_h <= W_v
+            crossing.violationTurns = std::max(0.0, wH - wV);
+            break;
+        case CrossingKind::Outside:  // demanded W_h >= W_v + 1
+            crossing.violationTurns = std::max(0.0, wV + 1.0 - wH);
+            break;
+        case CrossingKind::Tie:      // demanded W_h == W_v
+            crossing.violationTurns = std::abs(wH - wV);
+            break;
+        }
+    }
     // Sheet drift: rule 1 constrains "that section" of an H fiber; one k per
     // fiber assumes the annotation stays on one sheet. Repeated drops against
     // DISTINCT evidence on one H fiber - different V fibers or different
@@ -1056,9 +1089,12 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
     // than solved; two drops of one contested traversal are not.
     std::map<std::size_t, std::set<std::pair<std::size_t, long long>>> dropsPerFiber;
     for (const Crossing& crossing : merged) {
-        // Only declarable drops are drift evidence: a contradiction against
-        // (or from) interpolated geometry says nothing about the H fiber.
-        if (crossing.status == CrossingStatus::Dropped && crossing.declarable) {
+        // Only declarable, actually-violated drops are drift evidence: a
+        // contradiction against (or from) interpolated geometry says nothing
+        // about the H fiber, and a drop the final map satisfies anyway is
+        // repair debris, not evidence of anything.
+        if (crossing.status == CrossingStatus::Dropped && crossing.declarable &&
+            crossing.violationTurns >= params.declarationViolationTurns) {
             dropsPerFiber[crossing.hFiber].emplace(crossing.vFiber, crossing.n);
         }
     }

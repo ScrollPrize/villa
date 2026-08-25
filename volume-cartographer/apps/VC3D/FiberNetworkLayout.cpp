@@ -1078,9 +1078,12 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
 
     for (const winding::Crossing& crossing : solve.crossings) {
         // Declared errors only: a drop involving an untrusted fiber is the
-        // interpolation's fault, not an annotation mistake to ring in red.
+        // interpolation's fault, and a drop the final map SATISFIES anyway is
+        // greedy-repair debris (the real culprit fell in a later cycle) -
+        // neither is an annotation mistake to ring in red.
         if (crossing.status != winding::CrossingStatus::Dropped ||
-            !crossing.declarable) {
+            !crossing.declarable ||
+            crossing.violationTurns < solverParams.declarationViolationTurns) {
             continue;
         }
         ++result.droppedCrossingCount;

@@ -119,6 +119,10 @@ struct SolverParams {
     // Confidence multiplier for evidence (crossings and links) touching an
     // untrusted fiber, so trusted geometry wins repair conflicts.
     double untrustedConfidenceFactor = 0.5;
+    // A dropped crossing is only a declared winding error when the final map
+    // violates it by at least this many windings. Measured violations are
+    // bimodal at 0 and 1, so anything between the modes works.
+    double declarationViolationTurns = 0.5;
     // 0 = infer from the data; +1 / -1 force the winding direction.
     int chiralityOverride = 0;
 };
@@ -132,6 +136,12 @@ struct Crossing {
     // Both fibers trusted: only such a crossing may be declared a winding
     // error when dropped (an untrusted fiber's contradictions are expected).
     bool declarable = true;
+    // How far the FINAL map sits from what this crossing demanded, in
+    // windings (0 when satisfied). Greedy cycle repair routinely drops
+    // constraints the eventual placement satisfies anyway - the true culprit
+    // falls in a later cycle - and such a drop is repair debris, not evidence
+    // of a winding error at this spot. Declarations gate on this.
+    double violationTurns = 0.0;
     // Position of the traversal, for markers: z and the H fiber's own-gauge
     // psi (= s * theta) at the intersection.
     double zVx = 0.0;

@@ -394,6 +394,54 @@ private slots:
         QVERIFY(!result.placements[h].sheetDriftSuspect);
     }
 
+    // Greedy repair can drop an innocent constraint before the real culprit
+    // falls in a later cycle, leaving a drop the final map satisfies anyway.
+    // Such repair debris carries violationTurns ~0 and is not declared; the
+    // culprit's drop is violated by a full winding. Fixture: H ties A on two
+    // successive turns (mutually contradictory - the second pass rides a
+    // flattened tail), while a linked helper H2 independently ties A at the
+    // first turn. Whichever innocent first-turn tie the repair sacrifices
+    // first, the reinforced first-turn relation survives through the other
+    // path, the second-turn culprit falls next, and the sacrificed tie ends
+    // up satisfied by the very map that dropped it.
+    void satisfiedDropsAreRepairDebrisNotErrors()
+    {
+        World world;
+        const auto flattening = [](double w, double z) {
+            return w < 1.0 ? sheetR(w, z) - kSheetStep
+                           : sheetR(0.3, z) + 100.0;
+        };
+        const std::size_t h = addH(world, 0.05, 1.7, 30000.0, flattening);
+        const std::size_t h2 = addH(world, 0.05, 0.55, 31000.0);
+        const std::size_t a = addV(world, 0.3, 27000.0, 33000.0, 20.0);
+        // Same angle, same start: sample 13 of both is the same ray.
+        world.links.push_back(LinkInput{h, 13, h2, 13});
+        SolverParams params;
+        params.chiralityOverride = 1;  // the flattened tail defeats inference
+        const SolveResult result = solveWindings(world.fibers, world.links, params);
+        // Everything settles on the first-turn relation.
+        QCOMPARE(result.placements[h2].turns, result.placements[h].turns);
+        QCOMPARE(result.placements[a].turns, result.placements[h].turns);
+        QVERIFY(result.droppedLinks.empty());
+        int satisfiedDrops = 0;
+        int violatedDrops = 0;
+        for (const Crossing& crossing : result.crossings) {
+            if (crossing.status != CrossingStatus::Dropped) {
+                continue;
+            }
+            if (crossing.violationTurns >= 0.5) {
+                ++violatedDrops;
+            } else {
+                ++satisfiedDrops;
+                QVERIFY(crossing.violationTurns < 0.1);
+            }
+        }
+        QCOMPARE(satisfiedDrops, 1);
+        QCOMPARE(violatedDrops, 1);
+        // One violated drop is one piece of distinct evidence: no drift tag.
+        QVERIFY(!result.placements[h].sheetDriftSuspect);
+    }
+
     // The drift declaration itself requires trusted geometry: the same
     // contradictions raised by an untrusted H fiber are expected
     // interpolation noise, not a tag.
