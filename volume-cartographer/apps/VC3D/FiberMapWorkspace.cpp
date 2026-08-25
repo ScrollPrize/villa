@@ -168,10 +168,10 @@ constexpr qreal kSuspectRingBoundsCm = 0.6;
 // margin, so it only decides maps narrower than 12 cm.
 constexpr qreal kMinSceneMarginCm = 3.0;
 // Label chips hide once a whole winding maps to fewer screen pixels than
-// this: chips are ~40 px wide and ignore the view transform, so below about
-// two chip widths per winding the labels collide across windings and bury
-// the geometry instead of annotating it.
-constexpr double kMinChipPixelsPerWinding = 90.0;
+// this: chips are ~40 px wide and ignore the view transform, so as windings
+// compress the labels collide across them and bury the geometry instead of
+// annotating it.
+constexpr double kMinChipPixelsPerWinding = 180.0;
 constexpr double kFiberHitTolerancePx = 14.0;
 constexpr double kControlDotTolerancePx = 10.0;
 constexpr int kClickSlopPx = 4;
