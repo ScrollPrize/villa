@@ -58,6 +58,16 @@ namespace vc3d::fiber_map::winding
 
 struct FiberTrace {
     char hvTag = '?';
+    // At least one span of this fiber was traced by the fiber model. A fiber
+    // with none is pure control-point interpolation: its line geometry - and
+    // with it the unwrapped angle, which accumulates along that geometry -
+    // can be off by whole turns between controls. Untrusted fibers still
+    // take part in the solve (their crossings are the only evidence placing
+    // them), but their evidence is attenuated so it loses conflicts against
+    // model-traced geometry, and no winding error is ever declared over it:
+    // a contradiction involving an untrusted fiber is expected interpolation
+    // noise, not an annotation mistake worth flagging.
+    bool trusted = true;
     // Parallel arrays over the fiber's visible (control-point-bounded) domain.
     std::vector<double> theta;
     std::vector<double> radius;
@@ -106,6 +116,9 @@ struct SolverParams {
     // Link residual (turns) at and beyond which a link's confidence is zero;
     // also the layout's suspect threshold.
     double linkSuspectTurns = 0.25;
+    // Confidence multiplier for evidence (crossings and links) touching an
+    // untrusted fiber, so trusted geometry wins repair conflicts.
+    double untrustedConfidenceFactor = 0.5;
     // 0 = infer from the data; +1 / -1 force the winding direction.
     int chiralityOverride = 0;
 };
@@ -116,6 +129,9 @@ enum class CrossingStatus { Used, Dropped };
 struct Crossing {
     std::size_t hFiber = 0;
     std::size_t vFiber = 0;
+    // Both fibers trusted: only such a crossing may be declared a winding
+    // error when dropped (an untrusted fiber's contradictions are expected).
+    bool declarable = true;
     // Position of the traversal, for markers: z and the H fiber's own-gauge
     // psi (= s * theta) at the intersection.
     double zVx = 0.0;

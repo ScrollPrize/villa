@@ -902,6 +902,14 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         domainBegin[i] = begin;
         winding::FiberTrace& trace = traces[i];
         trace.hvTag = ordered[i]->hvTag;
+        // One model-traced span trusts the whole fiber; a fiber with none is
+        // control-point interpolation and must never be declared a winding
+        // error. Empty flags get the benefit of the doubt, exactly as the
+        // drawing renders them (a single traced run).
+        const std::vector<bool>& tracedFlags = ordered[i]->tracedSegments;
+        trace.trusted = tracedFlags.empty() ||
+                        std::any_of(tracedFlags.begin(), tracedFlags.end(),
+                                    [](bool traced) { return traced; });
         trace.theta.assign(entry.thetaLine.begin() + static_cast<std::ptrdiff_t>(begin),
                            entry.thetaLine.begin() + static_cast<std::ptrdiff_t>(end) + 1);
         trace.radius.assign(entry.radius.begin() + static_cast<std::ptrdiff_t>(begin),
@@ -936,7 +944,6 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     result.islandCount = solve.islandCount;
     result.unresolvedCount = solve.unresolvedCount;
     result.tieCount = solve.tieCount;
-    result.droppedCrossingCount = solve.droppedCrossingCount;
     result.gatedSegmentCount = solve.gatedSegmentCount;
     result.tangentialCount = solve.tangentialCount;
 
@@ -1057,9 +1064,12 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         // A link the repair had to drop is winding-suspect whatever its
         // residual now reads: the map placed its endpoints against it. The
         // boundary is inclusive because a residual AT the threshold already
-        // solves with zero confidence.
-        placedLink.suspect = placedLink.turnErr >= params.suspectTurns ||
-                             droppedLinks.count(l) != 0;
+        // solves with zero confidence. Suspicion requires model-traced
+        // geometry on both ends - the residual of a link into an
+        // interpolated fiber is as suspect as the unwrap it rode on.
+        placedLink.suspect = (traces[link.a].trusted && traces[link.b].trusted) &&
+                             (placedLink.turnErr >= params.suspectTurns ||
+                              droppedLinks.count(l) != 0);
         if (placedLink.suspect) {
             ++result.suspectLinkCount;
         }
@@ -1067,8 +1077,14 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     }
 
     for (const winding::Crossing& crossing : solve.crossings) {
+        // Declared errors only: a drop involving an untrusted fiber is the
+        // interpolation's fault, not an annotation mistake to ring in red.
         if (crossing.status != winding::CrossingStatus::Dropped ||
-            !drawable[crossing.hFiber]) {
+            !crossing.declarable) {
+            continue;
+        }
+        ++result.droppedCrossingCount;
+        if (!drawable[crossing.hFiber]) {
             continue;
         }
         const double x =

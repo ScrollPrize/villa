@@ -403,6 +403,8 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
                             Crossing crossing;
                             crossing.hFiber = h;
                             crossing.vFiber = v;
+                            crossing.declarable =
+                                fibers[h].trusted && fibers[v].trusted;
                             crossing.zVx = hZ[i] + t * rz;
                             crossing.psiH = hPsi[i] + t * (hPsi[i + 1] - hPsi[i]);
                             // The translate integer IS the turn gap, exactly;
@@ -423,6 +425,10 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
                                 crossing.confidence = transversality *
                                     std::min(1.0, (magnitude - params.tieBandVx) /
                                                       (3.0 * params.tieBandVx));
+                            }
+                            if (!crossing.declarable) {
+                                crossing.confidence *=
+                                    params.untrustedConfidenceFactor;
                             }
                             raw.push_back(crossing);
                         }
@@ -537,8 +543,13 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
         // ranks below everything. The repair loop's seen-count discount is
         // what keeps even a clean-looking wrong link from consuming several
         // correct crossings.
-        const double confidence = 1.5 *
+        double confidence = 1.5 *
             std::max(0.0, 1.0 - residual / std::max(params.linkSuspectTurns, 1e-9));
+        if (!fibers[link.fiberA].trusted || !fibers[link.fiberB].trusted) {
+            // The residual itself rides on interpolated unwrapping, so it is
+            // as suspect as the geometry it was measured over.
+            confidence *= params.untrustedConfidenceFactor;
+        }
         // W_A(pA) == W_B(pB) is k_A - k_B == a; addPair encodes to - from.
         addPair(link.fiberA, link.fiberB, -a, confidence,
                 -(static_cast<long long>(l) + 1));
@@ -1045,7 +1056,9 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
     // than solved; two drops of one contested traversal are not.
     std::map<std::size_t, std::set<std::pair<std::size_t, long long>>> dropsPerFiber;
     for (const Crossing& crossing : merged) {
-        if (crossing.status == CrossingStatus::Dropped) {
+        // Only declarable drops are drift evidence: a contradiction against
+        // (or from) interpolated geometry says nothing about the H fiber.
+        if (crossing.status == CrossingStatus::Dropped && crossing.declarable) {
             dropsPerFiber[crossing.hFiber].emplace(crossing.vFiber, crossing.n);
         }
     }

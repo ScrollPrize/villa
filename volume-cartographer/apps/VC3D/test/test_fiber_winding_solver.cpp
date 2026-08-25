@@ -359,6 +359,65 @@ private slots:
         }
     }
 
+    // An untrusted fiber (no model-traced span) must lose a repair conflict
+    // it would win on raw confidence, and its dropped crossing is not
+    // declarable. Cycle: H ties trusted V1 (conf ~0.9), passes far outside
+    // untrusted V2 (raw conf ~1.0, attenuated ~0.5), link V1=V2 (~0.75).
+    // Unattenuated, the tie would drop; attenuated, the untrusted crossing
+    // does, and V2 lands on the shared winding.
+    void untrustedEvidenceLosesConflicts()
+    {
+        World world;
+        const std::size_t h = addH(world, 0.05, 0.55, 30000.0);
+        const std::size_t v1 = addV(world, 0.3, 27000.0, 33000.0);
+        // Same angle as V1, drawn far inside the sheet: H reads as passing
+        // well outside it.
+        const std::size_t v2 = addV(world, 0.3, 27000.0, 33000.0, -600.0);
+        world.fibers[v2].trusted = false;
+        world.links.push_back(LinkInput{v1, 0, v2, 0});
+        const SolveResult result =
+            solveWindings(world.fibers, world.links, SolverParams{});
+        QCOMPARE(countDroppedCrossings(result), 1);
+        QVERIFY(result.droppedLinks.empty());
+        bool sawDroppedUndeclarable = false;
+        for (const Crossing& crossing : result.crossings) {
+            if (crossing.status == CrossingStatus::Dropped) {
+                QVERIFY(!crossing.declarable);
+                sawDroppedUndeclarable = true;
+            }
+        }
+        QVERIFY(sawDroppedUndeclarable);
+        // The surviving tie and link put all three on one winding.
+        QCOMPARE(result.placements[v1].turns - result.placements[h].turns, 0.0);
+        QCOMPARE(result.placements[v2].turns - result.placements[v1].turns, 0.0);
+        // And no drift declaration: the only drop involved untrusted geometry.
+        QVERIFY(!result.placements[h].sheetDriftSuspect);
+    }
+
+    // The drift declaration itself requires trusted geometry: the same
+    // contradictions raised by an untrusted H fiber are expected
+    // interpolation noise, not a tag.
+    void untrustedFibersAreNeverDriftSuspects()
+    {
+        World world;
+        const auto drifting = [](double w, double z) {
+            return (w < 1.8 ? sheetR(w, z) : sheetR(w - 1.0, z)) - kSheetStep;
+        };
+        const std::size_t h = addH(world, 1.2, 2.4, 30000.0, drifting);
+        world.fibers[h].trusted = false;
+        addV(world, 1.3, 27000.0, 33000.0);
+        addV(world, 1.35, 27000.0, 33000.0);
+        SolverParams params;
+        params.chiralityOverride = 1;
+        const SolveResult result =
+            solveWindings(world.fibers, world.links, params);
+        QVERIFY(countDroppedCrossings(result) > 0);
+        QVERIFY(!result.placements[h].sheetDriftSuspect);
+        for (const Crossing& crossing : result.crossings) {
+            QVERIFY(!crossing.declarable);
+        }
+    }
+
     // The common-lift translate search: gauges five turns apart still meet.
     void seamAndGaugeTranslatesAreSearched()
     {

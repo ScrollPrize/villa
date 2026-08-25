@@ -299,6 +299,39 @@ private slots:
         QVERIFY(minW < 1.0);
     }
 
+    // A fiber with no model-traced span never declares winding errors: the
+    // same wrong-winding link that is suspect between two traced fibers is
+    // silent when one end is pure control-point interpolation, and any
+    // dropped crossings it causes draw no red rings.
+    void interpolatedFibersDeclareNoWindingErrors()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        std::vector<InputFiber> fibers =
+            makeWeave(100, QStringLiteral("a-"), 30000.0, 4000.0, 300.0,
+                      -0.4, kTwoPi + 0.4, {100, 100 + kStepsPerTurn});
+        // The deliberately wrong link: the H fiber's second crossing also
+        // claims the first V fiber, one whole turn away.
+        addLink(fibers[0], 1, fibers[1], 1);
+
+        const GlobalResult trusted =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+        QVERIFY(trusted.suspectLinkCount > 0);
+
+        // Same geometry, same wrong link - but the H fiber is pure
+        // interpolation, so nothing about it is declarable.
+        std::vector<InputFiber> untrusted = fibers;
+        untrusted[0].tracedSegments.assign(
+            untrusted[0].controlPoints.size() - 1, false);
+        const GlobalResult silent = vc3d::fiber_map::buildGlobalLayout(
+            untrusted, umbilicus, defaultParams());
+        QCOMPARE(silent.suspectLinkCount, 0);
+        QCOMPARE(silent.droppedCrossingCount, 0);
+        QVERIFY(silent.suspectCrossings.empty());
+        // The fibers are still placed - exclusion is about declarations, not
+        // participation.
+        QCOMPARE(silent.fibers.size(), trusted.fibers.size());
+    }
+
     // No umbilicus: nothing can be unrolled, and EVERY fiber - not just the
     // geometryless one - is reported unplaceable rather than silently absent.
     void noUmbilicusReportsEveryFiberUnplaceable()

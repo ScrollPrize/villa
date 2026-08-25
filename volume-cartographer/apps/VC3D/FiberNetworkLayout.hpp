@@ -223,6 +223,9 @@ struct GlobalResult {
     int unresolvedCount = 0;
     int tieCount = 0;
     int suspectLinkCount = 0;
+    // Declared winding errors only: drops involving a fiber with no
+    // model-traced span are expected interpolation noise and are neither
+    // counted here nor marked on the map.
     int droppedCrossingCount = 0;
     // Geometry the solver refused to learn from: angularly ill-conditioned
     // or wild segments, and tangential contacts. Nonzero values say the map
