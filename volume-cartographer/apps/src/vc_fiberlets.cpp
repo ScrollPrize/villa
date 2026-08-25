@@ -155,7 +155,7 @@ struct CliOptions {
     float analysisMaximumJoinAngleDegrees = 45.0F;
     std::optional<vc::fiber_tracer::FiberletChunkRouteEdgeCostView>
         analysisEdgeCostView;
-    std::size_t analysisMaximumStatesPerEntry = 1'000'000;
+    std::size_t analysisMaximumStatesPerEntry = 5'000'000;
 };
 
 [[noreturn]] void fail(const std::string& message)
@@ -212,7 +212,7 @@ void usage(const char* executable)
               << "  --stage N,OX,OY,OZ           repeatable stage side/XYZ offset\n"
               << "  --join-angle N               maximum anchor join angle [45]\n"
               << "  --cost-profile stored|sqrt-u16 analysis cost view [sqrt-u16]\n"
-              << "  --max-states N               search-state limit per entry [1000000]\n\n"
+              << "  --max-states N               search-state limit per entry [5000000]\n\n"
               << "Anchor options:\n"
               << "  --cell-size N                 prediction-grid cell side, 2..8 [4]\n"
               << "  --falloff N                   normal-plane sigma in base voxels [cell-side/2]\n"
@@ -284,7 +284,7 @@ void usage(const char* executable)
               << "  --stage N,OX,OY,OZ            repeatable stage side/XYZ offset\n"
               << "  --join-angle N                regular strict maximum join angle\n"
               << "  --cost-profile PROFILE        stored or fixed sqrt uint16 [sqrt-u16]\n"
-              << "  --max-states N                exact generated-state limit per entry [1000000]\n";
+              << "  --max-states N                exact generated-state limit per entry [5000000]\n";
 }
 
 std::string valueAfter(int& index, int argc, char** argv, const char* name)
@@ -1144,7 +1144,13 @@ vc::fiber_tracer::FiberletDatasetMetadata replayDatasetMetadata(
     for (const auto& point : corridorReferenceBase)
         corridor.push_back({point[0], point[1], point[2]});
     metadata.processing = {
-        {"contract_version", 2},
+        {"contract_version",
+         vc::fiber_tracer::kFiberletGenerationContractVersion},
+        {"producer_toolchain", {
+            {"compiler_id", VC_FIBERLET_COMPILER_ID},
+            {"compiler_version", VC_FIBERLET_COMPILER_VERSION},
+            {"build_config", VC_FIBERLET_BUILD_CONFIG},
+        }},
         {"grid", {
             {"shape_zyx", grid.shapeZYX},
             {"prediction_to_base", grid.predictionToBaseScale},

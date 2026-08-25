@@ -1,3 +1,20 @@
+# 2026-08-25: Fiberlet producer cache contract v3
+
+- Moved anchor and Fiberlet generation to one new producer-contract namespace
+  after detecting different stale/current records under the unpublished v2
+  identity. Default runs regenerate into v3 directories; explicit incompatible
+  roots remain strict errors and old directories are not modified.
+- Added compiler identity/version and build configuration to the producer
+  fingerprint after GCC/Clang generated 2,526 versus 2,528 focused Fiberlets at
+  hard thresholds. Mixed-toolchain chunks can no longer share a dataset.
+- Preserved strict endpoint-evidence validation while allowing only bounded
+  finite float32 reconstruction roundoff across GCC/Clang; scoring and stored
+  payloads are unchanged. Scheduled failures now report the owner key,
+  terminal cache status, and nested generator cause.
+- Raised the exact chunk-route per-entry state guard from one million to five
+  million, the smallest tested bound that completes the 1024-base staged
+  Paris4 workload without partial results.
+
 # 2026-08-24: memory-first staged Fiberlet overlays
 
 - Added a shared bounded write-back LRU for invocation-local reduction layers.

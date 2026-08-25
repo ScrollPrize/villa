@@ -18,6 +18,10 @@
 namespace vc::fiber_tracer
 {
 
+// Bump whenever current anchor or Fiberlet generation can produce different
+// authoritative payloads for otherwise identical effective inputs.
+inline constexpr std::uint32_t kFiberletGenerationContractVersion = 3;
+
 class FiberletChunkWriteBackCache;
 
 struct FiberletIncidentPrefix {

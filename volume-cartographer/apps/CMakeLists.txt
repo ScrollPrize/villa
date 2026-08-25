@@ -1,6 +1,10 @@
 if(VC_BUILD_FIBERLETS)
     add_executable(vc_fiberlets src/vc_fiberlets.cpp)
     target_link_libraries(vc_fiberlets vc_fiber_tracer vc_lasagna)
+    target_compile_definitions(vc_fiberlets PRIVATE
+        VC_FIBERLET_COMPILER_ID="${CMAKE_CXX_COMPILER_ID}"
+        VC_FIBERLET_COMPILER_VERSION="${CMAKE_CXX_COMPILER_VERSION}"
+        VC_FIBERLET_BUILD_CONFIG="$<CONFIG>")
 
     # Python wheels place the private executable under site-packages/vc/bin
     # and its shared libraries at the site-packages root. Normal application

@@ -1,10 +1,15 @@
-# Status: write-back memory cache for temporary Fiberlet reduction layers
+# Status: fix large staged Fiberlet cache preparation
 
-- [x] Capture the task and implementation plan.
-- [x] Complete independent plan review against task/spec/plan.
-- [x] Implement the shared bounded write-back store.
-- [x] Integrate temporary staged overlays and logical hashing.
-- [x] Add focused persistence, eviction, pairing, and determinism tests.
-- [x] Build and run focused Clang Debug and GCC Release validation.
-- [x] Benchmark the four-stage Paris4 workload and verify exact outputs.
-- [x] Update specification, documentation, changelog, and task log.
+- [x] Reproduce the 1024-region failure
+- [x] Write focused task and implementation plan
+- [x] Complete independent plan review
+- [x] Identify the precise failed status and incompatible cache producer
+- [x] Compare stale and fresh anchor/Fiberlet artifacts
+- [x] Implement the minimal correctness fix
+- [x] Add regression coverage
+- [x] Run GCC Release and Clang Debug unit validation
+- [x] Complete GCC-to-Clang persisted-cache validation
+- [x] Run 1024-region cold/hot end-to-end validation
+- [x] Recheck 512-region output and performance
+- [x] Update specifications, docs, and changelog
+- [x] Finalize task log and diff review

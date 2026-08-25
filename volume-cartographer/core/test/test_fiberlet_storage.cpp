@@ -73,6 +73,96 @@ FiberletChunkDataset::MaterializedChunk materialized(FiberletStorageChunkKind ki
 
 }  // namespace
 
+TEST_CASE("Fiberlet endpoint reconstruction accepts only finite float roundoff")
+{
+    FiberletStoredAnchor cached;
+    cached.predictionAxisXYZ = {0.25F, 0.5F, 0.75F};
+    cached.predictionPresence = 0.625F;
+    cached.normalXYZ = {0.282699347F, 0.807072759F, 0.518376827F};
+    cached.predictionValid = true;
+    cached.predictionPresenceValid = true;
+    cached.normalValid = true;
+
+    FiberletEndpointScoring reconstructed{
+        {cached.predictionAxisXYZ, cached.predictionPresence, true, true},
+        {0.282699376F, 0.807072759F, 0.518376887F},
+        true};
+    CHECK(fiberletEndpointScoringEquivalent(cached, reconstructed));
+
+    reconstructed.normalXYZ = cached.normalXYZ;
+    reconstructed.normalXYZ[0] =
+        cached.normalXYZ[0] + 8.0F *
+            std::numeric_limits<float>::epsilon();
+    CHECK(fiberletEndpointScoringEquivalent(cached, reconstructed));
+    reconstructed.normalXYZ[0] =
+        cached.normalXYZ[0] + 9.0F *
+            std::numeric_limits<float>::epsilon();
+    CHECK_FALSE(fiberletEndpointScoringEquivalent(cached, reconstructed));
+
+    reconstructed.normalXYZ = cached.normalXYZ;
+    reconstructed.normalXYZ[1] -=
+        8.0F * std::numeric_limits<float>::epsilon();
+    CHECK(fiberletEndpointScoringEquivalent(cached, reconstructed));
+    reconstructed.normalXYZ[1] =
+        cached.normalXYZ[1] - 9.0F *
+            std::numeric_limits<float>::epsilon();
+    CHECK_FALSE(fiberletEndpointScoringEquivalent(cached, reconstructed));
+
+    reconstructed.normalXYZ = -cached.normalXYZ;
+    CHECK_FALSE(fiberletEndpointScoringEquivalent(cached, reconstructed));
+
+    reconstructed.normalXYZ = cached.normalXYZ;
+    reconstructed.normalValid = false;
+    CHECK_FALSE(fiberletEndpointScoringEquivalent(cached, reconstructed));
+
+    reconstructed.normalValid = true;
+    reconstructed.prediction.presence = -0.0F;
+    cached.predictionPresence = 0.0F;
+    CHECK(fiberletEndpointScoringEquivalent(cached, reconstructed));
+    reconstructed.prediction.presence =
+        8.0F * std::numeric_limits<float>::epsilon();
+    CHECK(fiberletEndpointScoringEquivalent(cached, reconstructed));
+    reconstructed.prediction.presence =
+        9.0F * std::numeric_limits<float>::epsilon();
+    CHECK_FALSE(fiberletEndpointScoringEquivalent(cached, reconstructed));
+
+    cached.predictionPresence = 2.0F;
+    reconstructed.prediction.presence =
+        2.0F + 16.0F * std::numeric_limits<float>::epsilon();
+    CHECK(fiberletEndpointScoringEquivalent(cached, reconstructed));
+    reconstructed.prediction.presence =
+        2.0F + 18.0F * std::numeric_limits<float>::epsilon();
+    CHECK_FALSE(fiberletEndpointScoringEquivalent(cached, reconstructed));
+
+    reconstructed.prediction.presence =
+        std::numeric_limits<float>::infinity();
+    CHECK_FALSE(fiberletEndpointScoringEquivalent(cached, reconstructed));
+    cached.predictionPresence = reconstructed.prediction.presence;
+    CHECK_FALSE(fiberletEndpointScoringEquivalent(cached, reconstructed));
+    reconstructed.prediction.presence =
+        std::numeric_limits<float>::quiet_NaN();
+    cached.predictionPresence = reconstructed.prediction.presence;
+    CHECK_FALSE(fiberletEndpointScoringEquivalent(cached, reconstructed));
+}
+
+TEST_CASE("Fiberlet scheduled resolution errors preserve key status and cause")
+{
+    const vc::render::ChunkKey key{0, 427, 139, 187};
+    vc::render::ChunkResult resolved;
+    resolved.status = vc::render::ChunkStatus::Error;
+    resolved.error = "endpoint scoring mismatch";
+    CHECK(
+        fiberletScheduledResolutionError(key, resolved) ==
+        "scheduled fiberlet chunk 0/427/139/187 resolved as error: "
+        "endpoint scoring mismatch");
+
+    resolved.status = vc::render::ChunkStatus::Missing;
+    resolved.error.clear();
+    CHECK(
+        fiberletScheduledResolutionError(key, resolved) ==
+        "scheduled fiberlet chunk 0/427/139/187 resolved as missing");
+}
+
 TEST_CASE("Fiberlet evaluation quantization uses base positions and shared codecs")
 {
     FiberPredictionGridInfo grid;
@@ -644,6 +734,75 @@ TEST_CASE("Fiberlet dataset identity is path-independent and source-sensitive")
     finalizeFiberletDatasetIdentity(otherSource);
     CHECK(otherSource.algorithmFingerprint == first.algorithmFingerprint);
     CHECK(otherSource.datasetFingerprint != first.datasetFingerprint);
+}
+
+TEST_CASE("Fiberlet generation contract changes invalidate persisted chunks")
+{
+    CHECK(kFiberletGenerationContractVersion == 3);
+    for (const auto kind : {FiberletDatasetKind::Anchors,
+                            FiberletDatasetKind::Fiberlets,
+                            FiberletDatasetKind::Combined}) {
+        FiberletDatasetMetadata previous;
+        previous.kind = kind;
+        previous.profile = FiberletStorageProfile::Float32Cache;
+        previous.chunkGridShapeZYX = {2, 3, 4};
+        previous.coordinateUnitsPerChunkZYX = {4, 4, 4};
+        previous.maximumEndpointReachCoordinateUnitsZYX = {4, 4, 4};
+        previous.sources = {
+            {"fiber_prediction", {{"manifest_hash", "same"}}}};
+        previous.processing = {{"contract_version", 2}};
+        finalizeFiberletDatasetIdentity(previous);
+
+        auto current = previous;
+        current.processing["contract_version"] =
+            kFiberletGenerationContractVersion;
+        finalizeFiberletDatasetIdentity(current);
+
+        CHECK(current.algorithmFingerprint != previous.algorithmFingerprint);
+        CHECK(current.datasetFingerprint != previous.datasetFingerprint);
+
+        current.processing["producer_toolchain"] = {
+            {"compiler_id", "GNU"},
+            {"compiler_version", "16.0"},
+            {"build_config", "Release"}};
+        finalizeFiberletDatasetIdentity(current);
+        auto otherToolchain = current;
+        otherToolchain.processing["producer_toolchain"]["compiler_id"] =
+            "Clang";
+        finalizeFiberletDatasetIdentity(otherToolchain);
+        CHECK(otherToolchain.algorithmFingerprint !=
+              current.algorithmFingerprint);
+        CHECK(otherToolchain.datasetFingerprint !=
+              current.datasetFingerprint);
+    }
+
+    const auto root = std::filesystem::temp_directory_path() /
+        ("vc_fiberlet_contract_" +
+         std::to_string(std::mt19937_64{std::random_device{}()}()));
+    FiberletDatasetMetadata previous;
+    previous.kind = FiberletDatasetKind::Anchors;
+    previous.profile = FiberletStorageProfile::Float32Cache;
+    previous.chunkGridShapeZYX = {1, 1, 1};
+    previous.coordinateUnitsPerChunkZYX = {4, 4, 4};
+    previous.maximumEndpointReachCoordinateUnitsZYX = {4, 4, 4};
+    previous.processing = {{"contract_version", 2}};
+    finalizeFiberletDatasetIdentity(previous);
+    auto oldDataset = FiberletChunkDataset::createOrOpen(root, previous);
+    oldDataset.reset();
+    const auto marker = root / "old-v2-marker";
+    std::ofstream(marker) << "untouched";
+
+    auto current = previous;
+    current.processing["contract_version"] =
+        kFiberletGenerationContractVersion;
+    finalizeFiberletDatasetIdentity(current);
+    CHECK_THROWS_AS(
+        FiberletChunkDataset::createOrOpen(root, current),
+        std::invalid_argument);
+    CHECK(std::filesystem::exists(marker));
+    CHECK(FiberletChunkDataset::openExisting(root)->metadata()
+              .algorithmFingerprint == previous.algorithmFingerprint);
+    std::filesystem::remove_all(root);
 }
 
 TEST_CASE("Fiberlet single-cell tube test agrees with the canonical selector")

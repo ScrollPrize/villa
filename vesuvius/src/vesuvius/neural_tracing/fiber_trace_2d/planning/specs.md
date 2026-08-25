@@ -3653,6 +3653,25 @@
   geometry may be released by its owning search worker. Neither operation may
   change candidate order, per-candidate arithmetic, graph identity, or encoded
   payload bytes.
+- Anchor and Fiberlet metadata include one shared producer-generation contract
+  in their algorithm identity. Any implementation change that can alter an
+  authoritative anchor, prefix, or route record for otherwise identical
+  effective inputs must increment that contract before writing payloads. The
+  current unpublished contract is version 3. Compiler identity/version and
+  build configuration are also producer identity because supported toolchains
+  can place candidates differently at hard float thresholds. Old or different-
+  toolchain directories are not migrated, repaired, or read through; default
+  fingerprinted roots select a new namespace, while explicitly selecting an
+  incompatible root is an error.
+- Endpoint scoring reconstructed during Fiberlet generation must match the
+  cached canonical anchor evidence. Validity flags and axis orientation are
+  exact. Finite float32 presence and vector components may differ by at most
+  eight float32 epsilons times `max(1, abs(a), abs(b))` to cover redundant
+  reconstruction across supported compilers; nonfinite or larger differences
+  remain hard errors. This tolerance never changes scoring, paths, costs, or
+  serialized values and cannot bridge producer contracts. No retry or
+  mixed-producer repair is permitted. A scheduled failure preserves the owner
+  key, terminal cache status, and original nested generator message.
 
 ## Chunk-local optimal Fiberlet-route diagnostic
 
@@ -3686,8 +3705,9 @@
   distributions, and the union of inside anchors and physical fiberlets used
   by any optimum. Internal-Fiberlet before/after counts and reduction are
   reported independently of boundary-crossing entry/exit Fiberlets. Exceeding
-  the per-entry state bound fails the complete diagnostic rather than
-  publishing partial pruning statistics.
+  the per-entry state bound, which defaults to 5,000,000 generated states,
+  fails the complete diagnostic rather than publishing partial pruning
+  statistics.
 - Missing anchor or fiberlet chunks are generated and persisted through the
   same `FiberletOnDemandPreprocessor`, separate cache participants, dependency
   halo, serialization, and shared decoded-byte LRU used by tracing. Generated

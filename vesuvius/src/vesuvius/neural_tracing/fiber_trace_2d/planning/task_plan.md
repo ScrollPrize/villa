@@ -1,90 +1,73 @@
-# Plan: write-back memory cache for temporary Fiberlet reduction layers
+# Plan: fix large staged Fiberlet cache preparation
 
-## Baseline and invariants
+## Diagnosis and invariant
 
-1. Use the committed Release binary and the established four-stage Paris4
-   workload as the baseline: 4.37 s wall from the user run and 4.18 s locally.
-2. Preserve canonical stage counts, retained-ID digests, serialized payload
-   bytes, prefix/route pairing, monotone removal, and deterministic errors.
+1. Reproduce the user command with its existing cache and capture the exact
+   failing owner key, resolved status, and fetcher error instead of discarding
+   them behind the generic message.
+2. Trace the failed key through `prefetchScheduled`, `ChunkCache`, and the
+   generated anchor/Fiberlet fetchers. The reproduced terminal cause is an
+   endpoint-scoring mismatch between a previously persisted float anchor and a
+   current canonical re-interpolation.
+3. Compare the stale and fresh cache artifacts rather than treating the first
+   near-equal normal as sufficient evidence. The anchor payloads, generated
+   Fiberlet prefix/route payloads, and resulting Fiberlet population differ
+   under the same declared algorithm namespace. Therefore the old and current
+   producers are not cache-compatible.
+4. Preserve the invariant that every valid scheduled Fiberlet owner is either
+   generated/read successfully or fails with its original deterministic cause.
+   Eviction must not turn a successful scheduled fetch into a false failure.
 
-## Shared write-back store
+## Implementation
 
-1. Add a reusable temporary Fiberlet write-back store in the existing
-   `FiberletDataset` module. Do not duplicate serializers, validators, atomic
-   publication, or overlay fallback behavior in the CLI.
-2. Key entries by a stable registered layer ordinal plus owner chunk. Store
-   only canonical serialized bytes: either one anchor buffer or one atomic
-   prefix/route pair. Decoded payload ownership and accounting remain exclusive
-   to `ChunkCache`, avoiding duplicate residency and double accounting.
-3. Use a per-owner generation and explicit `ResidentDirty -> Queued/Writing ->
-   SpilledClean` state. A rewrite serializes behind an older pending generation;
-   an old completion can never erase or shadow newer bytes. Reads use resident
-   or still-owned pending bytes, otherwise wait only for that key before disk.
-4. Maintain deterministic LRU victim choice by access epoch with stable
-   layer/kind/ZYX tie-breaking. Logical output determinism is independent of
-   concurrent touch order; writer completion order never selects errors or
-   content.
-5. Share one store across all temporary stages. Charge resident dirty buffers,
-   queued/writing buffers until actual release, and conservative entry overhead.
-   Reduce the existing graph `DecodedChunkCacheBudget` ceiling by exactly that
-   live amount, preserving the existing evaluation-cache reservation. If live
-   write-back bytes exceed the shared ceiling, queue oldest resident entries
-   and apply bounded backpressure until pending buffers are actually released.
-   One active return-value copy may transiently exceed the ceiling.
-6. Use a bounded asynchronous writer queue. Prefix and route buffers share one
-   job and remain logically visible as a pair until both files succeed. On
-   failure remove partial new output, retain the deterministic lowest logical
-   key error, and fail explicitly. Runtime visibility is pair-atomic; the
-   existing two-file disk layout is not made crash-transactional.
-7. `finish()` waits for already-started spills, surfaces errors, discards
-   never-evicted dirty entries, restores the decoded-cache allowance, and runs
-   before invocation-local tree cleanup. Destruction is nonthrowing and only a
-   defensive drain.
-
-## Staged reduction integration
-
-1. Attach the shared write-back store only to invocation-local stage anchor and
-   Fiberlet datasets. Authoritative on-demand anchor/Fiberlet caches retain
-   their existing durable behavior.
-2. Add distinct mutable `replaceAnchor` and `replacePair` backend operations
-   after the existing strict subset/pair validation. Authoritative immutable
-   publication keeps its existing conflict behavior.
-3. Keep generated overlay cache reads unchanged at the call sites: dataset
-   reads transparently resolve memory, pending spill, disk, then lower-layer
-   fallback.
-4. Compute detailed payload diagnostics over the canonical relative-path union
-   of metadata files, spilled chunks, and the latest resident/pending logical
-   chunks. Memory shadows stale disk, temporary writer files and lower fallback
-   are excluded, and prefix/route pairs are snapshotted together. Hashing pins
-   or streams entries without flushing them and must match a forced durable
-   directory hash byte-for-byte.
+1. Increment the unpublished Fiberlet-generation contract in the structured
+   algorithm identity. Current code must use a fresh anchor and Fiberlet cache
+   namespace instead of mixing payloads produced by an incompatible binary.
+   Include compiler identity/version and build configuration because candidate
+   populations at hard thresholds are not record-identical across tested GCC
+   Release and Clang Debug producers.
+2. Retain strict endpoint-scoring validation across supported compilers.
+   Validity and axis orientation remain exact; only finite componentwise
+   float32 reconstruction differences within eight epsilons are accepted.
+   Contract v3 prevents this narrow arithmetic allowance from mixing the known
+   semantically different v2 producer. Do not change scoring, DP, path costs,
+   or current serialization.
+3. Keep preprocessing parallel and deterministic. Avoid retaining the full
+   1024-region decoded population solely to make the wait loop succeed.
+4. Include owner key, status, and underlying message in any remaining
+   resolution failure so future failures are actionable.
 
 ## Tests and validation
 
-1. Add focused tests for memory hits, deterministic LRU order,
-   budget-triggered asynchronous spill, pending read, stale-generation rewrite,
-   a budget smaller than one pair, shared-budget pressure/restoration, explicit
-   empty fallback through multiple stages, pair visibility, teardown without
-   unnecessary writes, and injected anchor/prefix/route write failures.
-2. Re-run one-versus-multiple-thread staged equivalence and the focused
-   Fiberlet storage/path tests.
-3. Preserve at least three warm pre-change Release measurements, then build the
-   ordinary Release binary and run the identical four-stage workload at least
-   three times. Report min/median/max wall time, CPU use, peak RSS, write-back
-   hit/spill/peak-live-byte statistics, and exact stage IDs/payloads.
+1. Add focused regression coverage proving that the previous and current
+   processing contracts produce different algorithm/dataset fingerprints for
+   anchor, Fiberlet, and combined datasets.
+   Verify that opening an explicit v2 root as v3 is rejected without deleting,
+   repairing, or modifying the v2 dataset.
+   Retain the exact scheduled owner/status/source-error formatter test without
+   duplicating preprocessing infrastructure.
+2. Run the relevant focused unit tests with GCC Release and Clang Debug.
+   Verify the narrow endpoint comparator against the observed GCC/Clang
+   reconstruction pair, and verify that explicitly mixing GCC and Clang cache
+   roots is rejected by producer metadata before generation.
+3. Run the exact user 1024-region command to completion and hot-reopen it.
+   Confirm that it selects the new namespace, never reads the stale owner, and
+   completes. Then hot-reopen it and rerun the established 512-region workload,
+   verifying stable decoded populations/identities with no more than 10% warm-
+   wall regression. Raw v2/v3 payload bytes are not compared because their
+   fingerprint-bearing headers intentionally differ.
 
 ## Spec update
 
-Specify the invocation-local write-back LRU, shared memory accounting,
-prefix/route atomicity, eviction/spill/read ordering, and teardown semantics.
+Clarify that generation-contract changes which can alter anchor or Fiberlet
+payloads require a cache identity revision; mixed-producer endpoint evidence
+remains a hard error. Require precise terminal error propagation.
 
 ## Docs updates
 
-Document that staged temporary layers are memory-first, how `--cache-gib`
-governs them, when asynchronous spill occurs, and the measured four-stage
-performance.
+Document no new user-facing workflow unless the fix changes an observable
+cache/progress contract. Record the actionable error format if retained.
 
 ## Changelog update
 
-Record the asynchronous write-back overlay cache and its exact-output
-performance improvement.
+Record the large-region staged preprocessing correctness fix.
