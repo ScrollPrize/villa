@@ -6,7 +6,9 @@
 #include <opencv2/core/matx.hpp>
 
 #include <cstdint>
+#include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "FiberWindingSolver.hpp"
@@ -245,9 +247,93 @@ struct GlobalResult {
     double geometryMs = 0.0;
 };
 
+// 128-bit content digest (two independent FNV-1a lanes over raw bytes).
+// Collisions are the design's one stated deviation from literal exactness:
+// ~2^-64 per comparison, with Full rebuild as the recovery path.
+struct ContentDigest {
+    uint64_t a = 0;
+    uint64_t b = 0;
+    bool operator==(const ContentDigest& other) const
+    {
+        return a == other.a && b == other.b;
+    }
+    bool operator!=(const ContentDigest& other) const { return !(*this == other); }
+};
+
+// Memoization for buildGlobalLayout, keyed on content digests of exactly what
+// each cached artifact consumes - never on anyone's generation counters:
+//
+//   prep slot  (per fileName):  H(fiber geometry fields, umbilicus)
+//   pair slot  (per H,V pair):  H(prepKey_H, prepKey_V, chirality,
+//                                 detection params)
+//
+// Fiber identity across builds is the stored fileName; runtime ids are
+// reassigned per load. Links are deliberately NOT part of the fiber digest:
+// no cached artifact consumes them (they are re-collected fresh each build),
+// so a link edit invalidates nothing here. One replaceable slot per key;
+// slots for fileNames absent from the current snapshot are swept after every
+// successful build, so memory is bounded by the current fiber set. Entries
+// are pure key -> value memoizations, so a build that throws mid-way leaves
+// only valid entries behind.
+//
+// The cached build is bit-identical to an uncached one BY CONSTRUCTION: the
+// fresh path runs the same per-pair detection function and the same shard
+// assembly, so a cache hit substitutes an equal value into an identical
+// computation.
+class GlobalLayoutCache;
+
 [[nodiscard]] GlobalResult buildGlobalLayout(
     const std::vector<InputFiber>& fibers,
     const std::vector<cv::Vec3f>& umbilicusCenters,
+    const GlobalLayoutParams& params,
+    GlobalLayoutCache* cache = nullptr);
+
+class GlobalLayoutCache {
+public:
+    void clear();
+
+    struct Stats {
+        bool used = false;
+        int fibersReused = 0;
+        int fibersRecomputed = 0;
+        int pairsReused = 0;
+        int pairsRecomputed = 0;
+    };
+    [[nodiscard]] const Stats& lastStats() const { return _stats; }
+
+private:
+    friend GlobalResult buildGlobalLayout(const std::vector<InputFiber>&,
+                                          const std::vector<cv::Vec3f>&,
+                                          const GlobalLayoutParams&,
+                                          GlobalLayoutCache*);
+    struct PrepSlot {
+        ContentDigest key;
+        std::vector<double> thetaLine;
+        std::vector<double> radius;
+        std::vector<std::size_t> controlLineIndex;
+    };
+    struct PairSlot {
+        ContentDigest key;
+        winding::PairCrossings detection;
+    };
+    std::map<std::string, PrepSlot> _prep;
+    std::map<std::pair<std::string, std::string>, PairSlot> _pairs;
+    Stats _stats;
+};
+
+// (buildGlobalLayout is declared above the cache class: cache may be nullptr
+// for today's uncached behavior, and duplicate fileNames in the input disable
+// the cache for that build, logged - fileName is the slot identity and must
+// be unique.)
+
+// Digest of everything a layout was built from (fiber contents, umbilicus,
+// params) and of everything it produced. Full rebuild compares the output
+// digest against the last Update's when the inputs digest matches - a
+// memoization bug cannot hide.
+[[nodiscard]] ContentDigest digestGlobalInputs(
+    const std::vector<InputFiber>& fibers,
+    const std::vector<cv::Vec3f>& umbilicusCenters,
     const GlobalLayoutParams& params);
+[[nodiscard]] ContentDigest digestGlobalResult(const GlobalResult& result);
 
 } // namespace vc3d::fiber_map

@@ -532,11 +532,19 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
     auto* toolBar = addToolBar(tr("Fiber Map"));
     toolBar->setObjectName(QStringLiteral("fiberMapToolBar"));
     toolBar->setMovable(false);
-    auto* rebuildButton = new QPushButton(tr("Rebuild layout"), toolBar);
-    toolBar->addWidget(rebuildButton);
+    auto* updateButton = new QPushButton(tr("Update"), toolBar);
+    updateButton->setToolTip(
+        tr("Rebuild the map, reusing cached work for unchanged fibers.\n"
+           "Identical result to Full rebuild, much faster."));
+    toolBar->addWidget(updateButton);
+    auto* fullRebuildButton = new QPushButton(tr("Full rebuild"), toolBar);
+    fullRebuildButton->setToolTip(
+        tr("Recompute everything from scratch, then verify the cached\n"
+           "result. Use if the map ever looks wrong."));
+    toolBar->addWidget(fullRebuildButton);
     toolBar->addSeparator();
     _statusLabel =
-        new QLabel(tr("press Rebuild layout"), toolBar);
+        new QLabel(tr("press Update"), toolBar);
     toolBar->addWidget(_statusLabel);
 
     _tree = new QTreeWidget(this);
@@ -574,7 +582,10 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
         connect(_fiberDock, &QDockWidget::dockLocationChanged, this, releaseStaleMouseGrab);
     }
 
-    connect(rebuildButton, &QPushButton::clicked, this, &FiberMapWorkspace::rebuildLayout);
+    connect(updateButton, &QPushButton::clicked, this,
+            [this]() { rebuildLayout(false); });
+    connect(fullRebuildButton, &QPushButton::clicked, this,
+            [this]() { rebuildLayout(true); });
     connect(_view, &FiberMapView::clicked, this, &FiberMapWorkspace::handleSceneClick);
     connect(_view, &FiberMapView::zoomed, this,
             &FiberMapWorkspace::updateLabelChipVisibility);
@@ -629,7 +640,7 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
     // detection — a tab already visible when the volume or umbilicus changes keeps
     // its picture until the user does something — which is the accepted trade.
 
-    rebuildScene(tr("press Rebuild layout"));
+    rebuildScene(tr("press Update"));
 }
 
 double FiberMapWorkspace::sceneVxPerCm() const
@@ -694,6 +705,8 @@ void FiberMapWorkspace::clearLayout(const QString& reason)
     _layoutPackageGeneration = 0;
     _layoutUmbilicusGeneration = 0;
     _layoutBuilt = false;
+    _layoutCache.clear();
+    _haveLastDigests = false;
     _voxelSizeUm.reset();
     _scrollZMaxVx = 0.0;
     // A fresh fit belongs to the next layout, which is not this one's frame.
@@ -812,18 +825,36 @@ void FiberMapWorkspace::showEvent(QShowEvent* event)
         // changed since (nothing is built, so no dependency comparison will
         // ever say so). The cache re-resolves when the fingerprint moved.
         _statusLabel->setText(withCachedUmbilicusStatus(
-            _restingReason.isEmpty() ? tr("press Rebuild layout")
+            _restingReason.isEmpty() ? tr("press Update")
                                      : _restingReason));
     }
 }
 
-void FiberMapWorkspace::rebuildLayout()
+void FiberMapWorkspace::rebuildLayout(bool fullRebuild)
 {
     if (!_controller) {
         return;
     }
     QElapsedTimer phaseTimer;
     phaseTimer.start();
+    QElapsedTimer totalTimer;
+    totalTimer.start();
+    // A package or coordinate-grid switch makes every cached artifact
+    // meaningless, and this must be caught BEFORE the recorded dependencies
+    // are overwritten below - a visible workspace can reach this build
+    // without clearLayout() ever having run for the switch.
+    if (_layoutBuilt) {
+        const StaleVerdict verdict = vc3d::fiber_map::staleVerdictFor(
+            layoutDependencies(), currentDependencies(),
+            /*layoutBuilt=*/true, QString());
+        if (verdict.action == StaleVerdict::Action::ClearLayout) {
+            _layoutCache.clear();
+            _haveLastDigests = false;
+        }
+    }
+    if (fullRebuild || _memoizationDisabled) {
+        _layoutCache.clear();
+    }
     // Read before the snapshot: fiberMapSnapshot() parses the umbilicus, so a
     // rewrite during that parse that moves the file's size or mtime — the
     // token's contract; a same-size rewrite inside one timestamp tick is
@@ -894,8 +925,34 @@ void FiberMapWorkspace::rebuildLayout()
     }
     const qint64 convertMs = phaseTimer.restart();
     _layout = vc3d::fiber_map::buildGlobalLayout(inputs, snapshot.umbilicusCenters,
-                                                 params);
+                                                 params, &_layoutCache);
     const qint64 layoutMs = phaseTimer.restart();
+
+    // Full rebuild doubles as the memoization check: when nothing the layout
+    // consumes changed since the last Update, the from-scratch output must
+    // digest identically. A mismatch means a cache bug - report it and bench
+    // memoization for the session (every later build then starts cold).
+    const vc3d::fiber_map::ContentDigest inputsDigest =
+        vc3d::fiber_map::digestGlobalInputs(inputs, snapshot.umbilicusCenters,
+                                            params);
+    const vc3d::fiber_map::ContentDigest outputDigest =
+        vc3d::fiber_map::digestGlobalResult(_layout);
+    QString verificationNote;
+    if (fullRebuild && _haveLastDigests && inputsDigest == _lastInputsDigest) {
+        if (outputDigest == _lastOutputDigest) {
+            verificationNote = tr(" · cache verified");
+        } else {
+            verificationNote = tr(" · CACHE MISMATCH — memoization disabled");
+            _memoizationDisabled = true;
+            _layoutCache.clear();
+            Logger()->error(
+                "Fiber map: full rebuild output differs from the memoized "
+                "build on identical inputs; memoization disabled");
+        }
+    }
+    _lastInputsDigest = inputsDigest;
+    _lastOutputDigest = outputDigest;
+    _haveLastDigests = true;
     // Scene space is voxels and the slice count already is one, so the scroll
     // extent needs no voxel size at all.
     _scrollZMaxVx = snapshot.annotationZSlices > 0
@@ -956,6 +1013,18 @@ void FiberMapWorkspace::rebuildLayout()
     }
     if (_layout.droppedCrossingCount > 0) {
         status += tr(" · %1 dropped crossings").arg(_layout.droppedCrossingCount);
+    }
+    {
+        const auto& stats = _layoutCache.lastStats();
+        if (stats.used && !fullRebuild) {
+            status += tr(" · %1 ms, %2/%3 pairs reused")
+                          .arg(totalTimer.elapsed())
+                          .arg(stats.pairsReused)
+                          .arg(stats.pairsReused + stats.pairsRecomputed);
+        } else {
+            status += tr(" · %1 ms").arg(totalTimer.elapsed());
+        }
+        status += verificationNote;
     }
     if (_layout.gatedSegmentCount > 0 || _layout.tangentialCount > 0) {
         // Gate-hit tallies, not a geometry proportion (one segment can be
@@ -1669,7 +1738,7 @@ void FiberMapWorkspace::handleControlPointMenu(const QPointF& scenePos, const QP
                 // it is rebuilt — the one staleness that latches.
                 const uint64_t target = _controller->fiberIdForFileName(fileName);
                 if (target == 0) {
-                    markStale(tr("Fibers changed — press Rebuild layout"));
+                    markStale(tr("Fibers changed — press Update"));
                     Logger()->warn("Fiber map: {} is no longer loaded; not navigating",
                                    fileName);
                     return;

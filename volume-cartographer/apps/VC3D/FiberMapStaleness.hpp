@@ -83,13 +83,13 @@ inline StaleVerdict staleVerdictFor(const FiberMapDependencies& built,
     // Before the grid, because two projects can share one.
     if (current.packageGeneration != built.packageGeneration) {
         verdict.action = StaleVerdict::Action::ClearLayout;
-        verdict.reason = QObject::tr("project changed — press Rebuild layout");
+        verdict.reason = QObject::tr("project changed — press Update");
         return verdict;
     }
 
     if (!vc3d::annotation::sameAnnotationGrid(current.frame, built.frame)) {
         verdict.action = StaleVerdict::Action::ClearLayout;
-        verdict.reason = QObject::tr("coordinate frame changed — press Rebuild layout");
+        verdict.reason = QObject::tr("coordinate frame changed — press Update");
         return verdict;
     }
 
@@ -100,7 +100,7 @@ inline StaleVerdict staleVerdictFor(const FiberMapDependencies& built,
     // was converted through that figure.
     if (!vc3d::annotation::sameAnnotationFrame(current.frame, built.frame)) {
         verdict.action = StaleVerdict::Action::MarkStale;
-        verdict.reason = QObject::tr("voxel size changed — press Rebuild layout");
+        verdict.reason = QObject::tr("voxel size changed — press Update");
         return verdict;
     }
 
@@ -112,7 +112,7 @@ inline StaleVerdict staleVerdictFor(const FiberMapDependencies& built,
 
     if (current.fiberGeneration != built.fiberGeneration) {
         verdict.action = StaleVerdict::Action::MarkStale;
-        verdict.reason = QObject::tr("Fibers changed — press Rebuild layout");
+        verdict.reason = QObject::tr("Fibers changed — press Update");
         return verdict;
     }
 
@@ -121,7 +121,7 @@ inline StaleVerdict staleVerdictFor(const FiberMapDependencies& built,
     if (current.umbilicusGeneration != built.umbilicusGeneration ||
         current.umbilicusFingerprint != built.umbilicusFingerprint) {
         verdict.action = StaleVerdict::Action::MarkStale;
-        verdict.reason = QObject::tr("Umbilicus changed — press Rebuild layout");
+        verdict.reason = QObject::tr("Umbilicus changed — press Update");
         return verdict;
     }
 

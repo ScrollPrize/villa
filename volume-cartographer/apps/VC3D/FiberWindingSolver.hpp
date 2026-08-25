@@ -219,4 +219,67 @@ struct SolveResult {
                                         const std::vector<LinkInput>& links,
                                         const SolverParams& params);
 
+// ---------------------------------------------------------------------------
+// The detection stage, exposed piecewise so a caller can memoize it per
+// (H, V) fiber pair: detection is pair-local by construction - no global
+// state enters a pair's result - which is what makes the shards cacheable
+// and the cached build structurally identical to the fresh one.
+
+// The winding-direction vote, from radii one whole turn apart along each
+// fiber (crumpling cancels over a full turn), covariance as the fallback
+// when nothing wraps. 0 override = infer.
+[[nodiscard]] int inferChirality(const std::vector<FiberTrace>& fibers,
+                                 int chiralityOverride);
+
+// A fiber's trace in the solve's canonical frame: psi = chirality * theta -
+// 2*pi*gauge, the gauge chosen from the fiber's own median angle. V fibers
+// carry their z-monotone branches precomputed. Empty psi = unusable trace.
+struct CanonicalTrace {
+    char hvTag = '?';
+    bool trusted = true;
+    long long gauge = 0;
+    std::vector<double> psi;
+    std::vector<double> radius;
+    std::vector<double> z;
+    struct Branch {
+        std::vector<double> psi;
+        std::vector<double> z;
+        std::vector<double> r;
+        double psiMin = 0.0;
+        double psiMax = 0.0;
+    };
+    std::vector<Branch> branches;
+};
+[[nodiscard]] CanonicalTrace canonicalizeTrace(const FiberTrace& fiber,
+                                               int chirality);
+
+// One (H, V) pair's merged crossings (hFiber/vFiber left unset - the pair is
+// implicit) plus the pair's gate tallies. Deterministic pure function of the
+// two canonical traces and the detection parameters.
+struct PairCrossings {
+    std::vector<Crossing> crossings;
+    int gatedSegmentCount = 0;
+    int tangentialCount = 0;
+};
+[[nodiscard]] PairCrossings detectPairCrossings(const CanonicalTrace& h,
+                                                const CanonicalTrace& v,
+                                                const SolverParams& params);
+
+// A detection shard bound to the current build's fiber indices.
+struct PairDetection {
+    std::size_t hFiber = 0;
+    std::size_t vFiber = 0;
+    const PairCrossings* detection = nullptr;
+};
+
+// The solve over externally supplied detection shards (cached or fresh).
+// Shards may arrive in any order; they are assembled in canonical
+// (hFiber, vFiber) order, which reproduces the plain overload's constraint
+// order exactly.
+[[nodiscard]] SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
+                                        const std::vector<LinkInput>& links,
+                                        const SolverParams& params,
+                                        int chirality,
+                                        const std::vector<PairDetection>& detections);
+
 } // namespace vc3d::fiber_map::winding

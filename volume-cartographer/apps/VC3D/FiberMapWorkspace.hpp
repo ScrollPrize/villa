@@ -103,7 +103,11 @@ private:
         QGraphicsPathItem* glowItem = nullptr;
     };
 
-    void rebuildLayout();
+    // full = drop every cache and recompute from scratch; the escape hatch
+    // for cache bugs, and when the inputs match the last Update it verifies
+    // the memoized output digest (a mismatch disables memoization for the
+    // session).
+    void rebuildLayout(bool fullRebuild = false);
     void rebuildScene(const QString& emptyMessage);
     void rebuildTree();
     // Puts a stale reason on the status line and records it, without latching:
@@ -181,6 +185,14 @@ private:
     QDockWidget* _fiberDock = nullptr;
     QLabel* _statusLabel = nullptr;
     vc3d::fiber_map::GlobalResult _layout;
+    // Memoized rebuild state: the cache, whether a verification failure
+    // benched it, and the last build's input/output digests for Full
+    // rebuild's check.
+    vc3d::fiber_map::GlobalLayoutCache _layoutCache;
+    bool _memoizationDisabled = false;
+    bool _haveLastDigests = false;
+    vc3d::fiber_map::ContentDigest _lastInputsDigest;
+    vc3d::fiber_map::ContentDigest _lastOutputDigest;
     QHash<uint64_t, FiberEntry> _entries;
     std::vector<QGraphicsItem*> _controlPointDots;
     // Every fiber label chip of the current scene, for the zoom-threshold

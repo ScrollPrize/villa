@@ -5,6 +5,7 @@
 #include <limits>
 #include <chrono>
 #include <cstdlib>
+#include <deque>
 #include <map>
 #include <set>
 #include <tuple>
@@ -63,14 +64,7 @@ struct RawCrossing {
 // A V fiber split into z-monotone branches, each re-ordered to ascending z so
 // overlap queries can binary-search. Reordering the points does not change the
 // segment set, only the direction each segment is walked in.
-struct Branch {
-    std::vector<double> psi;
-    std::vector<double> z;
-    std::vector<double> r;
-    double psiMin = 0.0;
-    double psiMax = 0.0;
-    double rScale = 0.0;
-};
+using Branch = CanonicalTrace::Branch;
 
 double median(std::vector<double> values)
 {
@@ -83,6 +77,17 @@ double median(std::vector<double> values)
         return values[middle];
     }
     return 0.5 * (values[middle - 1] + values[middle]);
+}
+
+// floor(x + 0.5), not llround: rounding halves away from zero is not
+// translation-equivariant, so a whole-turn input re-gauge could change the
+// canonical gauge by two at a half-turn median.
+long long canonicalGauge(std::vector<double> psi)
+{
+    if (psi.empty()) {
+        return 0;
+    }
+    return static_cast<long long>(std::floor(median(std::move(psi)) / kTwoPi + 0.5));
 }
 
 std::vector<Branch> splitBranches(const std::vector<double>& psi,
@@ -113,7 +118,6 @@ std::vector<Branch> splitBranches(const std::vector<double>& psi,
         }
         branch.psiMin = *std::min_element(branch.psi.begin(), branch.psi.end());
         branch.psiMax = *std::max_element(branch.psi.begin(), branch.psi.end());
-        branch.rScale = median(branch.r);
         branches.push_back(std::move(branch));
     };
     for (std::size_t i = 1; i < z.size(); ++i) {
@@ -165,23 +169,9 @@ struct OrdinalPoint {
 
 } // namespace
 
-SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
-                          const std::vector<LinkInput>& links,
-                          const SolverParams& params)
+int inferChirality(const std::vector<FiberTrace>& fibers, int chiralityOverride)
 {
-    SolveResult result;
-    const std::size_t count = fibers.size();
-    result.placements.assign(count, Placement{});
-    result.linkTurnErrors.assign(links.size(),
-                                 std::numeric_limits<double>::infinity());
-    if (count == 0) {
-        return result;
-    }
-
-    // --- Chirality: the winding coordinate must grow outward. Inferred from
-    // the theta-radius covariance summed over every fiber; multi-turn H fibers
-    // dominate by construction because covariance scales with angular span.
-    int chirality = params.chiralityOverride;
+    int chirality = chiralityOverride;
     if (chirality == 0) {
         // Radius one whole turn along the same fiber is the same ray one
         // winding out: crumpling in angle cancels exactly and only the
@@ -252,6 +242,287 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
         const int vote = haveTurnEvidence ? turnVotes : covarianceVotes;
         chirality = vote < 0 ? -1 : 1;
     }
+    return chirality;
+}
+
+CanonicalTrace canonicalizeTrace(const FiberTrace& fiber, int chirality)
+{
+    CanonicalTrace trace;
+    trace.hvTag = fiber.hvTag;
+    trace.trusted = fiber.trusted;
+    const bool usable = fiber.theta.size() >= 2 &&
+                        fiber.radius.size() == fiber.theta.size() &&
+                        fiber.z.size() == fiber.theta.size();
+    if (!usable) {
+        return trace;
+    }
+    trace.psi.resize(fiber.theta.size());
+    for (std::size_t i = 0; i < fiber.theta.size(); ++i) {
+        trace.psi[i] = chirality * fiber.theta[i];
+    }
+    trace.gauge = canonicalGauge(trace.psi);
+    for (double& value : trace.psi) {
+        value -= kTwoPi * static_cast<double>(trace.gauge);
+    }
+    trace.radius = fiber.radius;
+    trace.z = fiber.z;
+    if (trace.hvTag == 'V') {
+        trace.branches = splitBranches(trace.psi, trace.z, trace.radius);
+    }
+    return trace;
+}
+
+// The detection loop for one (H, V) pair, over the V trace's precomputed
+// z-monotone branches. Everything here is pair-local: the produced crossings
+// carry no indices, no global ids, and no dependence on any other pair.
+PairCrossings detectPairCrossings(const CanonicalTrace& hTrace,
+                                  const CanonicalTrace& vTrace,
+                                  const SolverParams& params)
+{
+    PairCrossings result;
+    if (hTrace.psi.empty() || vTrace.psi.empty()) {
+        return result;
+    }
+    const bool declarable = hTrace.trusted && vTrace.trusted;
+    std::vector<Crossing> raw;
+    const double maxStep = params.maxStepTurns * kTwoPi;
+    const std::vector<double>& hPsi = hTrace.psi;
+    const std::vector<double>& hZ = hTrace.z;
+    const std::vector<double>& hR = hTrace.radius;
+    for (const Branch& branch : vTrace.branches) {
+        const double branchZLo = branch.z.front();
+        const double branchZHi = branch.z.back();
+        for (std::size_t i = 0; i + 1 < hPsi.size(); ++i) {
+            const double zLo = std::min(hZ[i], hZ[i + 1]);
+            const double zHi = std::max(hZ[i], hZ[i + 1]);
+            if (zHi < branchZLo || zLo > branchZHi) {
+                continue;
+            }
+            if (std::min(hR[i], hR[i + 1]) < params.minUmbilicusRadiusVx ||
+                std::abs(hPsi[i + 1] - hPsi[i]) > maxStep) {
+                ++result.gatedSegmentCount;
+                continue;
+            }
+            // Candidate 2*pi translates of this H segment into the branch's
+            // lift window.
+            const double segPsiLo = std::min(hPsi[i], hPsi[i + 1]);
+            const double segPsiHi = std::max(hPsi[i], hPsi[i + 1]);
+            const long long mLo = static_cast<long long>(
+                std::floor((branch.psiMin - segPsiHi) / kTwoPi));
+            const long long mHi = static_cast<long long>(
+                std::ceil((branch.psiMax - segPsiLo) / kTwoPi));
+            // V segments overlapping the H segment's z range, found by
+            // binary search on the branch's ascending z.
+            const auto zBegin = std::lower_bound(branch.z.begin(),
+                                                 branch.z.end(), zLo);
+            std::size_t j0 = static_cast<std::size_t>(zBegin - branch.z.begin());
+            j0 = j0 > 0 ? j0 - 1 : 0;
+            for (long long m = mLo; m <= mHi; ++m) {
+                const double x0 = hPsi[i] + kTwoPi * static_cast<double>(m);
+                const double x1 = hPsi[i + 1] + kTwoPi * static_cast<double>(m);
+                if (std::max(x0, x1) < branch.psiMin ||
+                    std::min(x0, x1) > branch.psiMax) {
+                    continue;
+                }
+                for (std::size_t j = j0;
+                     j + 1 < branch.z.size() && branch.z[j] <= zHi; ++j) {
+                    if (branch.z[j + 1] < zLo) {
+                        continue;
+                    }
+                    if (std::min(branch.r[j], branch.r[j + 1]) <
+                            params.minUmbilicusRadiusVx ||
+                        std::abs(branch.psi[j + 1] - branch.psi[j]) > maxStep) {
+                        ++result.gatedSegmentCount;
+                        continue;
+                    }
+                    const double rx = x1 - x0;
+                    const double rz = hZ[i + 1] - hZ[i];
+                    const double sx = branch.psi[j + 1] - branch.psi[j];
+                    const double sz = branch.z[j + 1] - branch.z[j];
+                    const double denom = rx * sz - rz * sx;
+                    const double qpx = branch.psi[j] - x0;
+                    const double qpz = branch.z[j] - hZ[i];
+                    if (denom == 0.0) {
+                        continue;
+                    }
+                    const double t = (qpx * sz - qpz * sx) / denom;
+                    const double u = (qpx * rz - qpz * rx) / denom;
+                    // Half-open on both segments so a crossing at a shared
+                    // interior vertex is counted once - except that each
+                    // polyline's FINAL segment closes at its end, so a
+                    // crossing at a terminal vertex (or at a branch apex,
+                    // which is the reversed end of both branches) is owned
+                    // rather than lost. The apex's double detection is
+                    // exactly what the dedup clustering exists to merge.
+                    const bool tEnd = i + 2 == hPsi.size();
+                    const bool uEnd = j + 2 == branch.z.size();
+                    if (t < 0.0 || u < 0.0 ||
+                        (tEnd ? t > 1.0 : t >= 1.0) ||
+                        (uEnd ? u > 1.0 : u >= 1.0)) {
+                        continue;
+                    }
+                    const double rH = hR[i] + t * (hR[i + 1] - hR[i]);
+                    const double rV =
+                        branch.r[j] + u * (branch.r[j + 1] - branch.r[j]);
+                    // Transversality in arc-length-scaled coordinates: psi is
+                    // radians, z voxels, so psi is scaled by the crossing's
+                    // own radius - a branch-wide scale would let geometry far
+                    // along the branch decide whether THIS pass counts as
+                    // transversal.
+                    const double rScale = 0.5 * (rH + rV);
+                    const double hx = rx * rScale;
+                    const double vx = sx * rScale;
+                    const double hNorm = std::hypot(hx, rz);
+                    const double vNorm = std::hypot(vx, sz);
+                    if (hNorm == 0.0 || vNorm == 0.0) {
+                        continue;
+                    }
+                    const double transversality =
+                        std::abs(hx * sz - rz * vx) / (hNorm * vNorm);
+                    if (transversality < params.minTransversality) {
+                        ++result.tangentialCount;
+                        continue;
+                    }
+                    Crossing crossing;
+                    crossing.declarable = declarable;
+                    crossing.zVx = hZ[i] + t * rz;
+                    crossing.psiH = hPsi[i] + t * (hPsi[i + 1] - hPsi[i]);
+                    // The translate integer IS the turn gap, exactly;
+                    // reconstructing it from large-angle subtraction would
+                    // only reintroduce floating point.
+                    crossing.n = m;
+                    crossing.deltaR = rH - rV;
+                    // No tie band: the sign of deltaR is the whole
+                    // classification. A same-winding contact reads inside
+                    // (H on the sheet front), which the weak constraint
+                    // absorbs at equality; a contact whose noise flips the
+                    // sign becomes a strict outside, accepted as the price of
+                    // not inventing an equality from a sub-band radial
+                    // measurement. Confidence is asymmetric to match what
+                    // each claim risks: the weak inside ("same or further
+                    // in") is only false when the H fiber is truly a full
+                    // winding outside - a wrap-scale radial error - so it is
+                    // high at any margin; the strict outside asserts a whole
+                    // winding of separation off the radial sign alone, so it
+                    // earns confidence with radial margin and a sign-of-noise
+                    // contact loses repair conflicts.
+                    crossing.kind = crossing.deltaR <= 0.0
+                        ? CrossingKind::Inside
+                        : CrossingKind::Outside;
+                    crossing.confidence =
+                        crossing.kind == CrossingKind::Inside
+                            ? 0.9 * transversality
+                            : transversality *
+                                  std::min(1.0,
+                                           crossing.deltaR /
+                                               (3.0 * std::max(params.tieBandVx,
+                                                               1e-9)));
+                    if (!crossing.declarable) {
+                        crossing.confidence *= params.untrustedConfidenceFactor;
+                    }
+                    raw.push_back(crossing);
+                }
+            }
+        }
+    }
+
+    // Pair-local sort and merge: one physical traversal seen by several
+    // segment pairs (or twice across a branch split) is one piece of
+    // evidence. Stable, so equal-key crossings keep deterministic encounter
+    // order - the constraint index downstream breaks repair ties.
+    std::vector<std::size_t> order(raw.size());
+    for (std::size_t i = 0; i < order.size(); ++i) {
+        order[i] = i;
+    }
+    std::stable_sort(order.begin(), order.end(),
+                     [&raw](std::size_t a, std::size_t b) {
+                         const Crossing& ca = raw[a];
+                         const Crossing& cb = raw[b];
+                         return std::tie(ca.n, ca.zVx, ca.deltaR) <
+                                std::tie(cb.n, cb.zVx, cb.deltaR);
+                     });
+    std::size_t index = 0;
+    while (index < order.size()) {
+        std::size_t end = index + 1;
+        const Crossing& first = raw[order[index]];
+        std::size_t best = index;
+        while (end < order.size()) {
+            const Crossing& next = raw[order[end]];
+            // One physical traversal seen twice has nearly the same z AND
+            // nearly the same radial separation. The kind is deliberately
+            // not part of the identity - duplicate detections straddling
+            // the (confidence-scale) band must merge, not turn into a
+            // manufactured conflict - while the deltaR gate keeps genuinely
+            // distinct traversals apart (two branches of a U-shaped fiber
+            // can share z, n and kind at wildly different radii).
+            if (next.n != first.n ||
+                next.zVx - first.zVx > params.zMergeVx ||
+                std::abs(next.deltaR - first.deltaR) > params.tieBandVx) {
+                break;
+            }
+            if (next.confidence > raw[order[best]].confidence) {
+                best = end;
+            }
+            ++end;
+        }
+        Crossing representative = raw[order[best]];
+        representative.mergedCount = static_cast<int>(end - index);
+        representative.confidence = std::min(
+            2.0, representative.confidence *
+                     (1.0 + 0.25 * static_cast<double>(representative.mergedCount - 1)));
+        result.crossings.push_back(representative);
+        index = end;
+    }
+    return result;
+}
+
+SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
+                          const std::vector<LinkInput>& links,
+                          const SolverParams& params)
+{
+    const int chirality = inferChirality(fibers, params.chiralityOverride);
+    const auto detectBegin = std::chrono::steady_clock::now();
+    std::vector<CanonicalTrace> canonical(fibers.size());
+    for (std::size_t f = 0; f < fibers.size(); ++f) {
+        canonical[f] = canonicalizeTrace(fibers[f], chirality);
+    }
+    std::deque<PairCrossings> shards;
+    std::vector<PairDetection> detections;
+    for (std::size_t h = 0; h < fibers.size(); ++h) {
+        if (canonical[h].hvTag != 'H' || canonical[h].psi.empty()) {
+            continue;
+        }
+        for (std::size_t v = 0; v < fibers.size(); ++v) {
+            if (canonical[v].hvTag != 'V' || canonical[v].psi.empty()) {
+                continue;
+            }
+            shards.push_back(
+                detectPairCrossings(canonical[h], canonical[v], params));
+            detections.push_back(PairDetection{h, v, &shards.back()});
+        }
+    }
+    const double detectMs = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - detectBegin)
+                                .count();
+    SolveResult result = solveWindings(fibers, links, params, chirality, detections);
+    result.detectMs += detectMs;
+    return result;
+}
+
+SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
+                          const std::vector<LinkInput>& links,
+                          const SolverParams& params,
+                          const int chirality,
+                          const std::vector<PairDetection>& detections)
+{
+    SolveResult result;
+    const std::size_t count = fibers.size();
+    result.placements.assign(count, Placement{});
+    result.linkTurnErrors.assign(links.size(),
+                                 std::numeric_limits<double>::infinity());
+    if (count == 0) {
+        return result;
+    }
     result.chirality = chirality;
 
     // psi = s * theta - 2*pi*gauge: everything below works in a frame where
@@ -287,226 +558,31 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
     };
 
     const auto detectBegin = std::chrono::steady_clock::now();
-    // --- Crossing detection: transversal intersections of H polylines with V
-    // polylines in (psi, z), over every 2*pi translate that can meet the V
-    // branch's lift. The integer gap n is exact at an intersection because
-    // both curves pass through the same lifted point.
-    std::vector<Crossing> raw;
-    const double maxStep = params.maxStepTurns * kTwoPi;
-    for (std::size_t v = 0; v < count; ++v) {
-        if (fibers[v].hvTag != 'V' || !usable(v)) {
-            continue;
-        }
-        const std::vector<Branch> branches =
-            splitBranches(psi[v], fibers[v].z, fibers[v].radius);
-        for (const Branch& branch : branches) {
-            const double branchZLo = branch.z.front();
-            const double branchZHi = branch.z.back();
-            for (std::size_t h = 0; h < count; ++h) {
-                if (fibers[h].hvTag != 'H' || !usable(h)) {
-                    continue;
-                }
-                const std::vector<double>& hPsi = psi[h];
-                const std::vector<double>& hZ = fibers[h].z;
-                const std::vector<double>& hR = fibers[h].radius;
-                for (std::size_t i = 0; i + 1 < hPsi.size(); ++i) {
-                    const double zLo = std::min(hZ[i], hZ[i + 1]);
-                    const double zHi = std::max(hZ[i], hZ[i + 1]);
-                    if (zHi < branchZLo || zLo > branchZHi) {
-                        continue;
-                    }
-                    if (std::min(hR[i], hR[i + 1]) < params.minUmbilicusRadiusVx ||
-                        std::abs(hPsi[i + 1] - hPsi[i]) > maxStep) {
-                        ++result.gatedSegmentCount;
-                        continue;
-                    }
-                    // Candidate 2*pi translates of this H segment into the
-                    // branch's lift window.
-                    const double segPsiLo = std::min(hPsi[i], hPsi[i + 1]);
-                    const double segPsiHi = std::max(hPsi[i], hPsi[i + 1]);
-                    const long long mLo = static_cast<long long>(
-                        std::floor((branch.psiMin - segPsiHi) / kTwoPi));
-                    const long long mHi = static_cast<long long>(
-                        std::ceil((branch.psiMax - segPsiLo) / kTwoPi));
-                    // V segments overlapping the H segment's z range, found by
-                    // binary search on the branch's ascending z.
-                    const auto zBegin = std::lower_bound(branch.z.begin(),
-                                                         branch.z.end(), zLo);
-                    std::size_t j0 = static_cast<std::size_t>(
-                        zBegin - branch.z.begin());
-                    j0 = j0 > 0 ? j0 - 1 : 0;
-                    for (long long m = mLo; m <= mHi; ++m) {
-                        const double x0 = hPsi[i] + kTwoPi * static_cast<double>(m);
-                        const double x1 = hPsi[i + 1] + kTwoPi * static_cast<double>(m);
-                        if (std::max(x0, x1) < branch.psiMin ||
-                            std::min(x0, x1) > branch.psiMax) {
-                            continue;
-                        }
-                        for (std::size_t j = j0;
-                             j + 1 < branch.z.size() && branch.z[j] <= zHi; ++j) {
-                            if (branch.z[j + 1] < zLo) {
-                                continue;
-                            }
-                            if (std::min(branch.r[j], branch.r[j + 1]) <
-                                    params.minUmbilicusRadiusVx ||
-                                std::abs(branch.psi[j + 1] - branch.psi[j]) > maxStep) {
-                                ++result.gatedSegmentCount;
-                                continue;
-                            }
-                            const double rx = x1 - x0;
-                            const double rz = hZ[i + 1] - hZ[i];
-                            const double sx = branch.psi[j + 1] - branch.psi[j];
-                            const double sz = branch.z[j + 1] - branch.z[j];
-                            const double denom = rx * sz - rz * sx;
-                            const double qpx = branch.psi[j] - x0;
-                            const double qpz = branch.z[j] - hZ[i];
-                            if (denom == 0.0) {
-                                continue;
-                            }
-                            const double t = (qpx * sz - qpz * sx) / denom;
-                            const double u = (qpx * rz - qpz * rx) / denom;
-                            // Half-open on both segments so a crossing at a
-                            // shared interior vertex is counted once - except
-                            // that each polyline's FINAL segment closes at its
-                            // end, so a crossing at a terminal vertex (or at a
-                            // branch apex, which is the reversed end of both
-                            // branches) is owned rather than lost. The apex's
-                            // double detection is exactly what the dedup
-                            // clustering exists to merge.
-                            const bool tEnd = i + 2 == hPsi.size();
-                            const bool uEnd = j + 2 == branch.z.size();
-                            if (t < 0.0 || u < 0.0 ||
-                                (tEnd ? t > 1.0 : t >= 1.0) ||
-                                (uEnd ? u > 1.0 : u >= 1.0)) {
-                                continue;
-                            }
-                            const double rH = hR[i] + t * (hR[i + 1] - hR[i]);
-                            const double rV =
-                                branch.r[j] + u * (branch.r[j + 1] - branch.r[j]);
-                            // Transversality in arc-length-scaled coordinates:
-                            // psi is radians, z voxels, so psi is scaled by the
-                            // crossing's own radius - a branch-wide scale would
-                            // let geometry far along the branch decide whether
-                            // THIS pass counts as transversal.
-                            const double rScale = 0.5 * (rH + rV);
-                            const double hx = rx * rScale;
-                            const double vx = sx * rScale;
-                            const double hNorm = std::hypot(hx, rz);
-                            const double vNorm = std::hypot(vx, sz);
-                            if (hNorm == 0.0 || vNorm == 0.0) {
-                                continue;
-                            }
-                            const double transversality =
-                                std::abs(hx * sz - rz * vx) / (hNorm * vNorm);
-                            if (transversality < params.minTransversality) {
-                                ++result.tangentialCount;
-                                continue;
-                            }
-                            Crossing crossing;
-                            crossing.hFiber = h;
-                            crossing.vFiber = v;
-                            crossing.declarable =
-                                fibers[h].trusted && fibers[v].trusted;
-                            crossing.zVx = hZ[i] + t * rz;
-                            crossing.psiH = hPsi[i] + t * (hPsi[i + 1] - hPsi[i]);
-                            // The translate integer IS the turn gap, exactly;
-                            // reconstructing it from large-angle subtraction
-                            // would only reintroduce floating point.
-                            crossing.n = m;
-                            crossing.deltaR = rH - rV;
-                            // No tie band: the sign of deltaR is the whole
-                            // classification. A same-winding contact reads
-                            // inside (H on the sheet front), which the weak
-                            // constraint absorbs at equality; a contact whose
-                            // noise flips the sign becomes a strict outside,
-                            // accepted as the price of not inventing an
-                            // equality from a sub-band radial measurement.
-                            // Confidence is asymmetric to match what each
-                            // claim risks: the weak inside ("same or further
-                            // in") is only false when the H fiber is truly a
-                            // full winding outside - a wrap-scale radial
-                            // error - so it is high at any margin; the strict
-                            // outside asserts a whole winding of separation
-                            // off the radial sign alone, so it earns
-                            // confidence with radial margin and a
-                            // sign-of-noise contact loses repair conflicts.
-                            crossing.kind = crossing.deltaR <= 0.0
-                                ? CrossingKind::Inside
-                                : CrossingKind::Outside;
-                            crossing.confidence =
-                                crossing.kind == CrossingKind::Inside
-                                    ? 0.9 * transversality
-                                    : transversality *
-                                          std::min(1.0,
-                                                   crossing.deltaR /
-                                                       (3.0 *
-                                                        std::max(params.tieBandVx,
-                                                                 1e-9)));
-                            if (!crossing.declarable) {
-                                crossing.confidence *=
-                                    params.untrustedConfidenceFactor;
-                            }
-                            raw.push_back(crossing);
-                        }
-                    }
-                }
-            }
-        }
+    // --- Assemble the detection shards in canonical (hFiber, vFiber) order:
+    // each shard is internally merged and (n, z, deltaR)-sorted, and the
+    // pair indices lead the global sort key, so the concatenation IS the
+    // globally sorted merged crossing list - constraint order is therefore
+    // identical however the shards were produced (fresh or cached).
+    std::vector<const PairDetection*> ordered_detections;
+    ordered_detections.reserve(detections.size());
+    for (const PairDetection& detection : detections) {
+        ordered_detections.push_back(&detection);
     }
-
-    // --- Merge duplicate detections: one physical traversal seen by several
-    // segment pairs (or twice across a branch split) is one piece of evidence.
-    std::vector<std::size_t> order(raw.size());
-    for (std::size_t i = 0; i < order.size(); ++i) {
-        order[i] = i;
-    }
-    // Stable, so two crossings equal in every key keep their deterministic
-    // encounter order - the constraint index downstream breaks repair ties,
-    // and an unstable sort would make that index depend on the sort's whims.
-    std::stable_sort(order.begin(), order.end(),
-                     [&raw](std::size_t a, std::size_t b) {
-                         const Crossing& ca = raw[a];
-                         const Crossing& cb = raw[b];
-                         return std::tie(ca.hFiber, ca.vFiber, ca.n, ca.zVx,
-                                         ca.deltaR) <
-                                std::tie(cb.hFiber, cb.vFiber, cb.n, cb.zVx,
-                                         cb.deltaR);
+    std::stable_sort(ordered_detections.begin(), ordered_detections.end(),
+                     [](const PairDetection* a, const PairDetection* b) {
+                         return std::tie(a->hFiber, a->vFiber) <
+                                std::tie(b->hFiber, b->vFiber);
                      });
     std::vector<Crossing> merged;
-    std::size_t index = 0;
-    while (index < order.size()) {
-        std::size_t end = index + 1;
-        const Crossing& first = raw[order[index]];
-        auto key = std::tie(first.hFiber, first.vFiber, first.n);
-        std::size_t best = index;
-        while (end < order.size()) {
-            const Crossing& next = raw[order[end]];
-            // One physical traversal seen twice has nearly the same z AND
-            // nearly the same radial separation. The kind is deliberately not
-            // part of the identity - duplicate detections straddling the tie
-            // band must merge, not turn into a manufactured conflict - while
-            // the deltaR gate keeps genuinely distinct traversals apart (two
-            // branches of a U-shaped fiber can share z, n and kind at wildly
-            // different radii).
-            if (std::tie(next.hFiber, next.vFiber, next.n) != key ||
-                next.zVx - first.zVx > params.zMergeVx ||
-                std::abs(next.deltaR - first.deltaR) > params.tieBandVx) {
-                break;
-            }
-            if (next.confidence > raw[order[best]].confidence) {
-                best = end;
-            }
-            ++end;
+    for (const PairDetection* detection : ordered_detections) {
+        result.gatedSegmentCount += detection->detection->gatedSegmentCount;
+        result.tangentialCount += detection->detection->tangentialCount;
+        for (Crossing crossing : detection->detection->crossings) {
+            crossing.hFiber = detection->hFiber;
+            crossing.vFiber = detection->vFiber;
+            merged.push_back(crossing);
         }
-        Crossing representative = raw[order[best]];
-        representative.mergedCount = static_cast<int>(end - index);
-        representative.confidence = std::min(
-            2.0, representative.confidence *
-                     (1.0 + 0.25 * static_cast<double>(representative.mergedCount - 1)));
-        merged.push_back(representative);
-        index = end;
     }
-
     const auto detectEnd = std::chrono::steady_clock::now();
     result.detectMs =
         std::chrono::duration<double, std::milli>(detectEnd - detectBegin).count();

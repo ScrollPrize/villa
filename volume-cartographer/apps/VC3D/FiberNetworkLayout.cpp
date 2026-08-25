@@ -3,6 +3,8 @@
 #include <QDebug>
 
 #include <chrono>
+#include <deque>
+#include <initializer_list>
 
 #include <algorithm>
 #include <cmath>
@@ -588,7 +590,119 @@ PlacedFiber makePlacedFiber(const InputFiber& fiber, const FiberGeometry& geo)
     return placedFiber;
 }
 
+// --- Content hashing: two independent FNV-1a lanes over raw bytes (IEEE-754
+// doubles hashed by bit pattern, strings length-prefixed, field order fixed).
+void hashBytes(ContentDigest& digest, const void* data, std::size_t size)
+{
+    const auto* bytes = static_cast<const unsigned char*>(data);
+    constexpr uint64_t kPrimeA = 1099511628211ULL;
+    constexpr uint64_t kPrimeB = 0x100000001b3ULL ^ 0x9e3779b97f4a7c15ULL;
+    uint64_t a = digest.a;
+    uint64_t b = digest.b;
+    for (std::size_t i = 0; i < size; ++i) {
+        a = (a ^ bytes[i]) * kPrimeA;
+        b = (b ^ bytes[i]) * (kPrimeB | 1ULL);
+    }
+    digest.a = a;
+    digest.b = b;
+}
+
+void hashU64(ContentDigest& digest, uint64_t value)
+{
+    hashBytes(digest, &value, sizeof(value));
+}
+
+void hashDouble(ContentDigest& digest, double value)
+{
+    hashBytes(digest, &value, sizeof(value));
+}
+
+void hashString(ContentDigest& digest, const std::string& value)
+{
+    hashU64(digest, value.size());
+    hashBytes(digest, value.data(), value.size());
+}
+
+void hashVec3(ContentDigest& digest, const cv::Vec3d& value)
+{
+    hashDouble(digest, value[0]);
+    hashDouble(digest, value[1]);
+    hashDouble(digest, value[2]);
+}
+
+ContentDigest seededDigest(uint64_t seed)
+{
+    ContentDigest digest{14695981039346656037ULL, 0xcbf29ce484222325ULL};
+    hashU64(digest, seed);
+    return digest;
+}
+
+// The geometry-relevant fiber content: what prep and detection consume.
+// Links are deliberately excluded - no cached artifact reads them.
+ContentDigest fiberContentDigest(const InputFiber& fiber)
+{
+    ContentDigest digest = seededDigest(0xF1BE1);
+    hashString(digest, fiber.fileName);
+    hashU64(digest, static_cast<uint64_t>(fiber.hvTag));
+    hashU64(digest, fiber.controlPoints.size());
+    for (const cv::Vec3d& point : fiber.controlPoints) {
+        hashVec3(digest, point);
+    }
+    hashU64(digest, fiber.linePoints.size());
+    for (const cv::Vec3d& point : fiber.linePoints) {
+        hashVec3(digest, point);
+    }
+    hashU64(digest, fiber.tracedSegments.size());
+    for (const bool traced : fiber.tracedSegments) {
+        hashU64(digest, traced ? 1 : 0);
+    }
+    return digest;
+}
+
+ContentDigest umbilicusDigest(const UmbilicusInterp& umbilicus)
+{
+    ContentDigest digest = seededDigest(0x0B111);
+    hashU64(digest, umbilicus.z.size());
+    for (std::size_t i = 0; i < umbilicus.z.size(); ++i) {
+        hashDouble(digest, umbilicus.z[i]);
+        hashDouble(digest, umbilicus.x[i]);
+        hashDouble(digest, umbilicus.y[i]);
+    }
+    return digest;
+}
+
+// Every solver parameter detection consumes, as the effective values.
+ContentDigest detectionParamsDigest(const winding::SolverParams& params)
+{
+    ContentDigest digest = seededDigest(0xDE7EC);
+    hashDouble(digest, params.tieBandVx);
+    hashDouble(digest, params.minUmbilicusRadiusVx);
+    hashDouble(digest, params.maxStepTurns);
+    hashDouble(digest, params.minTransversality);
+    hashDouble(digest, params.zMergeVx);
+    hashDouble(digest, params.untrustedConfidenceFactor);
+    return digest;
+}
+
+ContentDigest combineDigests(uint64_t seed,
+                             std::initializer_list<ContentDigest> parts)
+{
+    ContentDigest digest = seededDigest(seed);
+    for (const ContentDigest& part : parts) {
+        hashU64(digest, part.a);
+        hashU64(digest, part.b);
+    }
+    return digest;
+}
+
 } // namespace
+
+void GlobalLayoutCache::clear()
+{
+    _prep.clear();
+    _pairs.clear();
+    _stats = Stats{};
+}
 
 Result buildLayout(const std::vector<InputFiber>& fibers,
                    const std::vector<cv::Vec3f>& umbilicusCenters,
@@ -844,7 +958,8 @@ Result buildLayout(const std::vector<InputFiber>& fibers,
 
 GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
                                const std::vector<cv::Vec3f>& umbilicusCenters,
-                               const GlobalLayoutParams& params)
+                               const GlobalLayoutParams& params,
+                               GlobalLayoutCache* cache)
 {
     GlobalResult result;
     const auto sortUnplaced = [&result]() {
@@ -886,11 +1001,55 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         indexById.emplace(ordered[i]->id, i);
     }
 
+    // The cache's slot identity is the fileName; duplicates would collide,
+    // so they disable the cache for this build. Stats reset first, so a
+    // disabled build reads used = false.
+    if (cache != nullptr) {
+        cache->_stats = GlobalLayoutCache::Stats{};
+        std::set<std::string> names;
+        for (std::size_t i = 0; i < fiberCount; ++i) {
+            if (!names.insert(ordered[i]->fileName).second) {
+                qWarning() << "fiber map: duplicate fiber fileName"
+                           << QString::fromStdString(ordered[i]->fileName)
+                           << "- layout cache disabled for this build";
+                cache = nullptr;
+                break;
+            }
+        }
+    }
+    if (cache != nullptr) {
+        cache->_stats.used = true;
+    }
+    const ContentDigest umbDigest = umbilicusDigest(umbilicus);
+    std::vector<ContentDigest> prepKeys(fiberCount);
+
     const auto prepBegin = std::chrono::steady_clock::now();
     std::vector<PreparedFiber> prepared;
     prepared.reserve(fiberCount);
     for (std::size_t i = 0; i < fiberCount; ++i) {
-        prepared.push_back(prepareFiber(*ordered[i], umbilicus));
+        if (cache == nullptr) {
+            prepared.push_back(prepareFiber(*ordered[i], umbilicus));
+            continue;
+        }
+        prepKeys[i] = combineDigests(
+            0x50E5, {fiberContentDigest(*ordered[i]), umbDigest});
+        GlobalLayoutCache::PrepSlot& slot = cache->_prep[ordered[i]->fileName];
+        if (slot.key == prepKeys[i]) {
+            PreparedFiber entry;
+            entry.input = ordered[i];
+            entry.thetaLine = slot.thetaLine;
+            entry.radius = slot.radius;
+            entry.controlLineIndex = slot.controlLineIndex;
+            prepared.push_back(std::move(entry));
+            ++cache->_stats.fibersReused;
+        } else {
+            prepared.push_back(prepareFiber(*ordered[i], umbilicus));
+            slot.key = prepKeys[i];
+            slot.thetaLine = prepared.back().thetaLine;
+            slot.radius = prepared.back().radius;
+            slot.controlLineIndex = prepared.back().controlLineIndex;
+            ++cache->_stats.fibersRecomputed;
+        }
     }
     result.prepMs = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - prepBegin)
@@ -1004,8 +1163,83 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     // One suspicion threshold: the confidence a link solves with and the
     // suspicion it is reported with must never disagree.
     solverParams.linkSuspectTurns = params.suspectTurns;
-    const winding::SolveResult solve =
-        winding::solveWindings(traces, linkInputs, solverParams);
+
+    // Detection, per (H, V) pair, memoized when a cache is supplied. The
+    // fresh path runs the identical per-pair function in the identical pair
+    // order, so a hit substitutes an equal value into an identical
+    // computation.
+    const auto detectBegin = std::chrono::steady_clock::now();
+    const int chirality =
+        winding::inferChirality(traces, solverParams.chiralityOverride);
+    std::vector<winding::CanonicalTrace> canonical(fiberCount);
+    for (std::size_t i = 0; i < fiberCount; ++i) {
+        canonical[i] = winding::canonicalizeTrace(traces[i], chirality);
+    }
+    const ContentDigest detectParams = detectionParamsDigest(solverParams);
+    const ContentDigest chiralityDigest = [&]() {
+        ContentDigest digest = seededDigest(0xC819);
+        hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(chirality)));
+        return digest;
+    }();
+    std::deque<winding::PairCrossings> freshShards;
+    std::vector<winding::PairDetection> detections;
+    for (std::size_t h = 0; h < fiberCount; ++h) {
+        if (canonical[h].hvTag != 'H' || canonical[h].psi.empty()) {
+            continue;
+        }
+        for (std::size_t v = 0; v < fiberCount; ++v) {
+            if (canonical[v].hvTag != 'V' || canonical[v].psi.empty()) {
+                continue;
+            }
+            if (cache == nullptr) {
+                freshShards.push_back(winding::detectPairCrossings(
+                    canonical[h], canonical[v], solverParams));
+                detections.push_back(
+                    winding::PairDetection{h, v, &freshShards.back()});
+                continue;
+            }
+            const ContentDigest pairKey = combineDigests(
+                0x9A18, {prepKeys[h], prepKeys[v], chiralityDigest, detectParams});
+            GlobalLayoutCache::PairSlot& slot = cache->_pairs[std::make_pair(
+                ordered[h]->fileName, ordered[v]->fileName)];
+            if (slot.key == pairKey) {
+                ++cache->_stats.pairsReused;
+            } else {
+                slot.detection = winding::detectPairCrossings(
+                    canonical[h], canonical[v], solverParams);
+                slot.key = pairKey;
+                ++cache->_stats.pairsRecomputed;
+            }
+            detections.push_back(winding::PairDetection{h, v, &slot.detection});
+        }
+    }
+    const double detectLoopMs = std::chrono::duration<double, std::milli>(
+                                    std::chrono::steady_clock::now() - detectBegin)
+                                    .count();
+    winding::SolveResult solve =
+        winding::solveWindings(traces, linkInputs, solverParams, chirality,
+                               detections);
+    solve.detectMs += detectLoopMs;
+
+    // One replaceable slot per current fiber and pair: slots for fileNames no
+    // longer in the snapshot are swept, so memory is bounded by the current
+    // fiber set.
+    if (cache != nullptr) {
+        std::set<std::string> names;
+        for (std::size_t i = 0; i < fiberCount; ++i) {
+            names.insert(ordered[i]->fileName);
+        }
+        for (auto it = cache->_prep.begin(); it != cache->_prep.end();) {
+            it = names.count(it->first) != 0 ? std::next(it)
+                                             : cache->_prep.erase(it);
+        }
+        for (auto it = cache->_pairs.begin(); it != cache->_pairs.end();) {
+            it = names.count(it->first.first) != 0 &&
+                         names.count(it->first.second) != 0
+                     ? std::next(it)
+                     : cache->_pairs.erase(it);
+        }
+    }
     result.chirality = solve.chirality;
     result.islandCount = solve.islandCount;
     result.unresolvedCount = solve.unresolvedCount;
@@ -1190,6 +1424,119 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     }
     sortUnplaced();
     return result;
+}
+
+ContentDigest digestGlobalInputs(const std::vector<InputFiber>& fibers,
+                                 const std::vector<cv::Vec3f>& umbilicusCenters,
+                                 const GlobalLayoutParams& params)
+{
+    ContentDigest digest = seededDigest(0x1B9);
+    const UmbilicusInterp umbilicus = interpolateUmbilicus(umbilicusCenters);
+    const ContentDigest umb = umbilicusDigest(umbilicus);
+    hashU64(digest, umb.a);
+    hashU64(digest, umb.b);
+    // Snapshot order is content-derived, so hashing fibers in input order is
+    // stable; links are inputs too here (unlike the cache keys, this digest
+    // answers "did ANYTHING the layout consumes change").
+    hashU64(digest, fibers.size());
+    for (const InputFiber& fiber : fibers) {
+        const ContentDigest content = fiberContentDigest(fiber);
+        hashU64(digest, content.a);
+        hashU64(digest, content.b);
+        hashU64(digest, fiber.label.size());
+        hashBytes(digest, fiber.label.constData(),
+                  static_cast<std::size_t>(fiber.label.size()) * sizeof(QChar));
+        hashU64(digest, fiber.links.size());
+        for (const InputLink& link : fiber.links) {
+            hashU64(digest, static_cast<uint64_t>(
+                                static_cast<int64_t>(link.controlPointIndex)));
+            hashU64(digest, link.branchFiberId);
+            hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(
+                                link.branchControlPointIndex)));
+            hashU64(digest, link.pending ? 1 : 0);
+        }
+    }
+    hashDouble(digest, params.suspectTurns);
+    hashDouble(digest, params.smoothVx);
+    hashDouble(digest, params.resampleStepVx);
+    hashDouble(digest, params.minPadXVx);
+    hashDouble(digest, params.minPadYVx);
+    const winding::SolverParams& solver = params.solver;
+    hashDouble(digest, solver.tieBandVx);
+    hashDouble(digest, solver.minUmbilicusRadiusVx);
+    hashDouble(digest, solver.maxStepTurns);
+    hashDouble(digest, solver.minTransversality);
+    hashDouble(digest, solver.zMergeVx);
+    hashDouble(digest, solver.neighborhoodZVx);
+    hashDouble(digest, solver.neighborhoodArcVx);
+    hashDouble(digest, solver.radialSlopePerZVx);
+    hashDouble(digest, solver.radialSlopePerArcVx);
+    hashDouble(digest, solver.anchorAmbiguityMargin);
+    hashDouble(digest, solver.linkSuspectTurns);
+    hashDouble(digest, solver.untrustedConfidenceFactor);
+    hashDouble(digest, solver.declarationViolationTurns);
+    hashU64(digest, static_cast<uint64_t>(
+                        static_cast<int64_t>(solver.chiralityOverride)));
+    return digest;
+}
+
+ContentDigest digestGlobalResult(const GlobalResult& result)
+{
+    ContentDigest digest = seededDigest(0x0D16);
+    hashDouble(digest, result.rRefVx);
+    hashDouble(digest, result.x0Vx);
+    hashDouble(digest, result.x1Vx);
+    hashDouble(digest, result.yMinVx);
+    hashDouble(digest, result.yMaxVx);
+    hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(result.chirality)));
+    hashU64(digest, result.fibers.size());
+    for (const GlobalPlacedFiber& fiber : result.fibers) {
+        hashString(digest, fiber.fiber.fileName);
+        hashU64(digest, static_cast<uint64_t>(fiber.meta.anchor));
+        hashU64(digest, fiber.meta.linked ? 1 : 0);
+        hashU64(digest, fiber.meta.sheetDriftSuspect ? 1 : 0);
+        hashU64(digest, static_cast<uint64_t>(
+                            static_cast<int64_t>(fiber.meta.networkId)));
+        hashDouble(digest, fiber.meta.windingLo);
+        hashDouble(digest, fiber.meta.windingHi);
+        hashU64(digest, fiber.fiber.runs.size());
+        for (const Run& run : fiber.fiber.runs) {
+            hashU64(digest, run.traced ? 1 : 0);
+            hashU64(digest, run.points.size());
+            for (const QPointF& point : run.points) {
+                hashDouble(digest, point.x());
+                hashDouble(digest, point.y());
+            }
+        }
+        for (const QPointF& point : fiber.fiber.controlPoints) {
+            hashDouble(digest, point.x());
+            hashDouble(digest, point.y());
+        }
+    }
+    hashU64(digest, result.links.size());
+    for (const PlacedLink& link : result.links) {
+        hashDouble(digest, link.a.x());
+        hashDouble(digest, link.a.y());
+        hashDouble(digest, link.b.x());
+        hashDouble(digest, link.b.y());
+        hashDouble(digest, link.turnErr);
+        hashU64(digest, link.suspect ? 1 : 0);
+    }
+    hashU64(digest, result.windings.size());
+    for (const WindingMark& mark : result.windings) {
+        hashDouble(digest, mark.xVx);
+        hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(mark.number)));
+    }
+    hashU64(digest, result.suspectCrossings.size());
+    for (const CrossingMark& mark : result.suspectCrossings) {
+        hashDouble(digest, mark.posVx.x());
+        hashDouble(digest, mark.posVx.y());
+    }
+    hashU64(digest, result.unplaced.size());
+    for (const UnplacedFiber& fiber : result.unplaced) {
+        hashString(digest, fiber.fileName);
+    }
+    return digest;
 }
 
 } // namespace vc3d::fiber_map
