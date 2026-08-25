@@ -334,6 +334,7 @@ def build_chunk_occupancy(
     verbose: bool = False,
     use_cache: bool = True,
     anon: bool = False,
+    workers: Optional[int] = None,
 ) -> Optional[np.ndarray]:
     """
     Build a boolean bitmap over the spatial chunk grid of a zarr v2 array.
@@ -348,6 +349,10 @@ def build_chunk_occupancy(
         anon: Use unsigned S3 requests when reading the input array. The
             override cache URL (``VESUVIUS_CHUNK_OCCUPANCY_URL``) is always
             accessed with default credentials and never inherits this flag.
+        workers: Maximum number of concurrent listing workers. Defaults to
+            ``VESUVIUS_CHUNK_INDEX_WORKERS`` (32 when unset). Flat local
+            stores are scanned once because parallel prefix scans would repeat
+            the same directory traversal.
 
     Returns:
         A boolean numpy array over the *spatial* chunk grid (leading channel
@@ -357,6 +362,10 @@ def build_chunk_occupancy(
     if len(chunks) != len(shape):
         warnings.warn(f"chunks/shape rank mismatch for {array_url}: {chunks} vs {shape}")
         return None
+
+    max_workers = _LIST_MAX_WORKERS if workers is None else int(workers)
+    if max_workers < 1:
+        raise ValueError(f"workers must be positive, got {max_workers}")
 
     # Identify the spatial axes: drop a leading channel axis for 4D inputs.
     rank = len(shape)
@@ -448,8 +457,9 @@ def build_chunk_occupancy(
             occupancy[spatial_idx] = True
             parsed += 1
 
+    listing_units = 1 if not array_url.startswith("s3://") and sep == "." else len(sub_prefixes)
     pbar_kwargs = {
-        "total": len(sub_prefixes),
+        "total": listing_units,
         "desc": "  Listing chunks",
         "unit": "row",
         "leave": False,
@@ -459,17 +469,25 @@ def build_chunk_occupancy(
     pbar = tqdm(**pbar_kwargs)
     try:
         if array_url.startswith("s3://"):
-            with ThreadPoolExecutor(max_workers=min(_LIST_MAX_WORKERS, max(1, len(sub_prefixes)))) as ex:
+            with ThreadPoolExecutor(max_workers=min(max_workers, max(1, len(sub_prefixes)))) as ex:
                 futures = [ex.submit(_list_chunks_s3, array_url, sp, anon=anon) for sp in sub_prefixes]
                 for fut in as_completed(futures):
                     _consume(fut.result())
                     pbar.update(1)
                     pbar.set_postfix_str(f"found={parsed}")
+        elif sep == ".":
+            # Dot-separated chunks share one flat directory. Scanning once is
+            # O(files); scanning independently for every Z prefix is O(rows * files).
+            _consume(_list_chunks_local(array_url, "", sep))
+            pbar.update(1)
+            pbar.set_postfix_str(f"found={parsed}")
         else:
-            for sp in sub_prefixes:
-                _consume(_list_chunks_local(array_url, sp, sep))
-                pbar.update(1)
-                pbar.set_postfix_str(f"found={parsed}")
+            with ThreadPoolExecutor(max_workers=min(max_workers, max(1, len(sub_prefixes)))) as ex:
+                futures = [ex.submit(_list_chunks_local, array_url, sp, sep) for sp in sub_prefixes]
+                for fut in as_completed(futures):
+                    _consume(fut.result())
+                    pbar.update(1)
+                    pbar.set_postfix_str(f"found={parsed}")
     finally:
         pbar.close()
 

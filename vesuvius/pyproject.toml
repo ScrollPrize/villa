@@ -221,6 +221,7 @@ Homepage = "https://github.com/ScrollPrize/villa"
 "vesuvius.zarr_tasks" = "vesuvius.image_proc.run.zarr_tasks.__main__:main"
 "vesuvius.find_patches" = "vesuvius.models.preprocessing.patches.cli:main"
 "vesuvius.view_fiber_presence" = "vesuvius.scripts.view_fiber_presence:main"
+"vesuvius.find_largest_zarr_cube" = "vesuvius.scripts.find_largest_zarr_cube:main"
 
 [tool.setuptools]
 include-package-data = true
