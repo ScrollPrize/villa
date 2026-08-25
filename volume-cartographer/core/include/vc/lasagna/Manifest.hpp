@@ -92,6 +92,14 @@ struct LasagnaDatasetManifest {
         const std::filesystem::path& manifestPath = {});
 };
 
+// Lasagna arrays may be padded beyond their logical base-coordinate extent by
+// at most one storage chunk on each axis.
+[[nodiscard]] bool lasagnaChannelShapeCompatible(
+    const std::array<std::size_t, 3>& baseShapeZYX,
+    double baseSpacing,
+    const std::array<std::size_t, 3>& shapeZYX,
+    const std::array<std::size_t, 3>& chunksZYX) noexcept;
+
 [[nodiscard]] std::string toString(NormalSourceKind kind);
 
 } // namespace vc::lasagna

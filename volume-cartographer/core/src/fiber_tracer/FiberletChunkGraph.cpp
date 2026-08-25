@@ -708,6 +708,290 @@ const FiberletDatasetMetadata& FiberletChunkGraphSource::metadata() const noexce
     return fiberletDataset_->metadata();
 }
 
+FiberletPathConfig fiberletPathConfigFromDatasetMetadata(
+    const FiberletDatasetMetadata& metadata,
+    int parallelThreads)
+{
+    if (parallelThreads < 1)
+        throw std::invalid_argument(
+            "fiberlet stored path parallel thread count must be positive");
+    const auto& paths = metadata.processing.at("paths");
+    if (!paths.is_object())
+        throw std::invalid_argument(
+            "fiberlet dataset processing.paths must be an object");
+    FiberletPathConfig result;
+    result.cellRadius = paths.at("cell_radius").get<int>();
+    result.neighborhoodMarginCells =
+        paths.at("neighborhood_margin_cells").get<float>();
+    result.longitudinalStepPredictionVoxels =
+        paths.at("longitudinal_step_prediction").get<float>();
+    result.transverseStepPredictionVoxels =
+        paths.at("transverse_step_prediction").get<float>();
+    result.maximumEndpointAngleDegrees =
+        paths.at("maximum_endpoint_angle_degrees").get<float>();
+    result.maximumPredictionDeviationDegrees =
+        paths.at("maximum_prediction_deviation_degrees").get<float>();
+    result.corridorRadiusPredictionVoxels =
+        paths.at("corridor_radius_prediction").get<float>();
+    result.invalidPredictionCostPerVoxel =
+        paths.at("invalid_prediction_cost_per_voxel").get<float>();
+    result.smoothnessWeight = paths.at("smoothness_weight").get<float>();
+    result.smoothnessNormalWeight =
+        paths.at("smoothness_normal_weight").get<float>();
+    result.smoothnessTangentWeight =
+        paths.at("smoothness_tangent_weight").get<float>();
+    result.smoothnessFreeAngleDegrees =
+        paths.at("smoothness_free_angle_degrees").get<float>();
+    result.parallelThreads = parallelThreads;
+    validateFiberletPathConfig(result);
+    return result;
+}
+
+FiberletStoredReplayGraphSource::FiberletStoredReplayGraphSource(
+    std::shared_ptr<FiberletChunkDataset> dataset,
+    FiberletChunkCacheOptions cacheOptions,
+    float maximumJoinAngleDegrees)
+    : dataset_(std::move(dataset))
+    , anchorCache_(createStoredFiberletAnchorChunkCache(dataset_, cacheOptions))
+    , pathCache_(createStoredFiberletPathChunkCache(dataset_, cacheOptions))
+    , pathConfig_(fiberletPathConfigFromDatasetMetadata(
+          dataset_->metadata(),
+          static_cast<int>(std::max<std::size_t>(
+              1, cacheOptions.service.fetchConcurrency.workerCapacity))))
+    , chunks_(dataset_, anchorCache_, dataset_, pathCache_, pathConfig_)
+    , maximumJoinAngleDegrees_(maximumJoinAngleDegrees)
+{
+    if (dataset_->metadata().kind != FiberletDatasetKind::Combined)
+        throw std::invalid_argument(
+            "stored replay graph requires a combined Fiberlet dataset");
+    if (!(maximumJoinAngleDegrees_ >= 0.0F) ||
+        !(maximumJoinAngleDegrees_ <= 180.0F) ||
+        !std::isfinite(maximumJoinAngleDegrees_)) {
+        throw std::invalid_argument(
+            "stored replay graph maximum join angle is invalid");
+    }
+}
+
+float FiberletStoredReplayGraphSource::predictionToBaseScale() const noexcept
+{
+    return static_cast<float>(dataset_->metadata().predictionToBaseScale);
+}
+
+int FiberletStoredReplayGraphSource::anchorCellSizePredictionVoxels() const noexcept
+{
+    const auto& metadata = dataset_->metadata();
+    const double cellBase =
+        static_cast<double>(metadata.spatialChunkSideBaseVoxels) /
+        static_cast<double>(metadata.coordinateUnitsPerChunkZYX[0]);
+    return static_cast<int>(
+        std::llround(cellBase / metadata.predictionToBaseScale));
+}
+
+float FiberletStoredReplayGraphSource::maximumJoinAngleDegrees() const noexcept
+{
+    return maximumJoinAngleDegrees_;
+}
+
+std::vector<FiberletStoredAnchor>
+FiberletStoredReplayGraphSource::anchorsInBaseBox(
+    const cv::Vec3d& minimumBaseXYZ,
+    const cv::Vec3d& maximumBaseXYZ) const
+{
+    for (int axis = 0; axis < 3; ++axis) {
+        if (!std::isfinite(minimumBaseXYZ[axis]) ||
+            !std::isfinite(maximumBaseXYZ[axis]) ||
+            !(maximumBaseXYZ[axis] > minimumBaseXYZ[axis])) {
+            throw std::invalid_argument(
+                "fiberlet anchor query box must be finite and nonempty");
+        }
+    }
+    const auto& metadata = dataset_->metadata();
+    std::array<int, 3> begin{};
+    std::array<int, 3> end{};
+    for (std::size_t zyx = 0; zyx < 3; ++zyx) {
+        const std::size_t xyz = 2 - zyx;
+        const double chunkSide =
+            static_cast<double>(metadata.spatialChunkSideBaseVoxels);
+        const double cellSide = chunkSide /
+            static_cast<double>(metadata.coordinateUnitsPerChunkZYX[zyx]);
+        const double origin =
+            static_cast<double>(metadata.coordinateOriginZYX[zyx]) * cellSide;
+        begin[zyx] = static_cast<int>(std::floor(
+            (minimumBaseXYZ[static_cast<int>(xyz)] - origin) / chunkSide));
+        end[zyx] = static_cast<int>(std::floor(
+            (std::nextafter(
+                 maximumBaseXYZ[static_cast<int>(xyz)],
+                 -std::numeric_limits<double>::infinity()) - origin) /
+            chunkSide));
+        begin[zyx] = std::max(begin[zyx], 0);
+        end[zyx] = std::min(
+            end[zyx], metadata.chunkGridShapeZYX[zyx] - 1);
+    }
+
+    std::vector<FiberletStoredAnchor> result;
+    if (begin[0] > end[0] || begin[1] > end[1] || begin[2] > end[2])
+        return result;
+    const float scale = predictionToBaseScale();
+    for (int z = begin[0]; z <= end[0]; ++z) {
+        for (int y = begin[1]; y <= end[1]; ++y) {
+            for (int x = begin[2]; x <= end[2]; ++x) {
+                const auto loaded = chunks_.anchorsInChunk({0, z, y, x}, true);
+                if (loaded.status != FiberletGraphQueryStatus::Ready) {
+                    throw std::runtime_error(
+                        "stored Fiberlet anchor chunk failed: " + loaded.error);
+                }
+                for (const auto& anchor : *loaded.value.anchors) {
+                    const cv::Vec3d point(anchor.positionPredictionXYZ * scale);
+                    bool inside = true;
+                    for (int axis = 0; axis < 3; ++axis) {
+                        inside = inside &&
+                            point[axis] >= minimumBaseXYZ[axis] &&
+                            point[axis] < maximumBaseXYZ[axis];
+                    }
+                    if (inside)
+                        result.push_back(anchor);
+                }
+            }
+        }
+    }
+    std::sort(result.begin(), result.end(), [](const auto& left, const auto& right) {
+        if (left.predictionPresence != right.predictionPresence)
+            return left.predictionPresence > right.predictionPresence;
+        return left.key < right.key;
+    });
+    return result;
+}
+
+std::vector<FiberletReplaySourceAnchor>
+FiberletStoredReplayGraphSource::anchorsNearReference(
+    const PolylineArcGeometry& reference,
+    double beginArcBase,
+    double endArcBase,
+    double broadPhaseRadiusBaseVoxels) const
+{
+    if (reference.points.empty())
+        return {};
+    cv::Vec3d minimum = reference.points.front();
+    cv::Vec3d maximum = reference.points.front();
+    for (const auto& point : reference.points) {
+        for (int axis = 0; axis < 3; ++axis) {
+            minimum[axis] = std::min(minimum[axis], point[axis]);
+            maximum[axis] = std::max(maximum[axis], point[axis]);
+        }
+    }
+    minimum -= cv::Vec3d::all(broadPhaseRadiusBaseVoxels);
+    maximum += cv::Vec3d::all(broadPhaseRadiusBaseVoxels);
+    for (int axis = 0; axis < 3; ++axis)
+        maximum[axis] = std::nextafter(
+            maximum[axis], std::numeric_limits<double>::infinity());
+    std::vector<FiberletReplaySourceAnchor> result;
+    for (const auto& anchor : anchorsInBaseBox(minimum, maximum)) {
+        const cv::Vec3d point(anchor.positionPredictionXYZ * predictionToBaseScale());
+        const auto projection = projectPointToPolylineArc(
+            reference, point, beginArcBase, endArcBase);
+        if (projection.distance <= broadPhaseRadiusBaseVoxels)
+            result.push_back({anchor.key, point});
+    }
+    std::sort(result.begin(), result.end(), [](const auto& left, const auto& right) {
+        return left.id < right.id;
+    });
+    return result;
+}
+
+std::vector<DirectedFiberletStorageId>
+FiberletStoredReplayGraphSource::outgoing(
+    const FiberletStorageKey& anchor) const
+{
+    const auto loaded = chunks_.incidentEdges(anchor, true);
+    if (loaded.status != FiberletGraphQueryStatus::Ready)
+        throw std::runtime_error(
+            "stored Fiberlet adjacency failed: " + loaded.error);
+    std::vector<DirectedFiberletStorageId> result;
+    result.reserve(loaded.value.edges.size());
+    for (const auto& edge : loaded.value.edges)
+        result.push_back(edge.id);
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
+FiberletReplaySourceArc FiberletStoredReplayGraphSource::arc(
+    const DirectedFiberletStorageId& id) const
+{
+    const auto loaded = chunks_.directedEdge(id, true);
+    if (loaded.status != FiberletGraphQueryStatus::Ready)
+        throw std::runtime_error(
+            "stored Fiberlet edge failed: " + loaded.error);
+    return loaded.value;
+}
+
+FiberletReplaySourceCostProfile
+FiberletStoredReplayGraphSource::costProfile(
+    const DirectedFiberletStorageId& id) const
+{
+    const auto loaded = chunks_.route(id.fiberlet, true);
+    if (loaded.status != FiberletGraphQueryStatus::Ready)
+        throw std::runtime_error(
+            "stored Fiberlet cost profile failed: " + loaded.error);
+    FiberletReplaySourceCostProfile result;
+    result.segmentLengthsPredictionVoxels.reserve(
+        loaded.value.pointsPredictionXYZ.size() - 1);
+    for (std::size_t index = 1;
+         index < loaded.value.pointsPredictionXYZ.size(); ++index) {
+        const float length = vectorLength(
+            loaded.value.pointsPredictionXYZ[index] -
+            loaded.value.pointsPredictionXYZ[index - 1]);
+        if (!(length > 0.0F) || !std::isfinite(length))
+            throw std::runtime_error(
+                "stored Fiberlet route segment length is invalid");
+        result.segmentLengthsPredictionVoxels.push_back(length);
+    }
+    result.segmentCostDensities = loaded.value.route.segmentCostDensities;
+    if (id.reverse) {
+        std::reverse(
+            result.segmentLengthsPredictionVoxels.begin(),
+            result.segmentLengthsPredictionVoxels.end());
+        std::reverse(
+            result.segmentCostDensities.begin(),
+            result.segmentCostDensities.end());
+    }
+    return result;
+}
+
+std::vector<cv::Vec3d> FiberletStoredReplayGraphSource::routePoints(
+    const DirectedFiberletStorageId& id) const
+{
+    const auto loaded = chunks_.route(id.fiberlet, true);
+    if (loaded.status != FiberletGraphQueryStatus::Ready)
+        throw std::runtime_error(
+            "stored Fiberlet route failed: " + loaded.error);
+    std::vector<cv::Vec3d> result;
+    result.reserve(loaded.value.pointsPredictionXYZ.size());
+    for (const auto& point : loaded.value.pointsPredictionXYZ)
+        result.emplace_back(point * predictionToBaseScale());
+    if (id.reverse)
+        std::reverse(result.begin(), result.end());
+    return result;
+}
+
+std::optional<FiberletReplaySourceTransition>
+FiberletStoredReplayGraphSource::transition(
+    const FiberletReplaySourceArc& incoming,
+    const FiberletReplaySourceArc& outgoing) const
+{
+    const auto loaded = chunks_.transition(
+        incoming, outgoing, maximumJoinAngleDegrees_, true);
+    if (loaded.status != FiberletGraphQueryStatus::Ready)
+        throw std::runtime_error(
+            "stored Fiberlet transition failed: " + loaded.error);
+    return loaded.value;
+}
+
+const FiberletDatasetMetadata&
+FiberletStoredReplayGraphSource::metadata() const noexcept
+{
+    return dataset_->metadata();
+}
+
 namespace
 {
 

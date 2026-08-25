@@ -1324,6 +1324,29 @@
   descriptors now fail explicitly instead of selecting or constructing an
   alternate cache dependency.
 
+## 2026-08-25 - Anchor-seeded Fiberlet crop tracing
+
+- Added standalone bidirectional crop filling from combined Fiberlet datasets,
+  with deterministic anchor seeds, first-exit clipping, cycle rejection, and
+  ordinary stored edge/join costs.
+- Added replay-compatible 20/80-base-voxel anisotropic anchor coverage with
+  direction discrimination, while intentionally deferring output-fiber
+  deduplication.
+- Added combined sparse-dataset consumption without a source Fiber manifest:
+  absent tuples decode as empty and partial tuples fail.
+- Kept whole-volume production sparse as well: missing/all-zero presence input
+  chunks are not scheduled, and generated empty anchor or Fiberlet chunks are
+  not written.
+- Added line OBJ and optional six-face CT texture visualization through the
+  existing VC3D fine-to-coarse sampler.
+
+## 2026-08-25 - Structural Fiberlet normal compatibility
+
+- Replaced the crop tracer's exact Lasagna manifest byte-hash requirement with
+  base-frame, shape, scale, and normal-channel compatibility validation.
+- Reused the established Lasagna one-chunk padding rule and retained manifest
+  hashes only as provenance.
+
 ## 2026-08-23 — Explicit shared inference Z-band lifecycle
 
 - Replaced the cross-band multi-device event state machine with a lazy explicit

@@ -705,6 +705,49 @@ TEST_CASE("Fiberlet sparse dataset generates, publishes, and reuses opaque chunk
     std::filesystem::remove_all(root);
 }
 
+TEST_CASE("Generated sparse empty chunks remain absent on disk")
+{
+    std::mt19937_64 random(std::random_device{}());
+    const auto root = std::filesystem::temp_directory_path() /
+        ("vc_fiberlet_generated_sparse_empty_" + std::to_string(random()));
+    FiberletDatasetMetadata metadata;
+    metadata.kind = FiberletDatasetKind::Anchors;
+    metadata.profile = FiberletStorageProfile::Float32Cache;
+    metadata.chunkGridShapeZYX = {2, 2, 2};
+    metadata.coordinateUnitsPerChunkZYX = {8, 8, 8};
+    metadata.maximumEndpointReachCoordinateUnitsZYX = {4, 4, 4};
+    metadata.coordinateBits = 8;
+    metadata.deltaBits = 8;
+    metadata.routeCountBits = 8;
+    metadata.routeLatticeBits = 8;
+    metadata.costBits = 32;
+    finalizeFiberletDatasetIdentity(metadata);
+    auto dataset = FiberletChunkDataset::createOrOpen(root, metadata);
+    const vc::render::ChunkKey key{0, 1, 0, 1};
+    auto cache = createGeneratedFiberletChunkCache(
+        dataset,
+        [](FiberletStorageChunkKind kind, const vc::render::ChunkKey&,
+           const FiberletStorageCodecConfig& config) {
+            auto chunk = materialized(
+                kind, serializeFiberletAnchors(config, {}));
+            chunk.alreadyPublished = true;
+            return chunk;
+        });
+
+    const auto fetched = cache->getChunkBlocking(
+        key.level, key.iz, key.iy, key.ix);
+    REQUIRE(fetched.status == vc::render::ChunkStatus::Data);
+    const auto payload = std::dynamic_pointer_cast<
+        const FiberletAnchorChunkPayload>(fetched.payload);
+    REQUIRE(payload);
+    CHECK(payload->anchors.empty());
+    CHECK_FALSE(std::filesystem::exists(
+        dataset->chunkPath(FiberletStorageChunkKind::Anchors, key)));
+
+    cache->cancelPendingAndWait();
+    std::filesystem::remove_all(root);
+}
+
 TEST_CASE("Fiberlet dataset identity is path-independent and source-sensitive")
 {
     FiberletDatasetMetadata first;
@@ -982,8 +1025,10 @@ TEST_CASE("Combined fiberlet dataset exposes complete sparse graph facets")
     auto dataset = FiberletChunkDataset::createOrOpen(root, metadata);
     const vc::render::ChunkKey owner{0, 0, 0, 0};
     dataset->configureExpectedChunks(std::span<const vc::render::ChunkKey>(&owner, 1));
-    CHECK_THROWS_AS(createStoredFiberletAnchorChunkCache(dataset), std::invalid_argument);
-    CHECK_THROWS_AS(createStoredFiberletPathChunkCache(dataset), std::invalid_argument);
+    auto incompleteAnchorCache = createStoredFiberletAnchorChunkCache(dataset);
+    auto incompletePathCache = createStoredFiberletPathChunkCache(dataset);
+    incompletePathCache->cancelPendingAndWait();
+    incompleteAnchorCache->cancelPendingAndWait();
 
     const auto first = key(6, 7, 7);
     const auto second = key(7, 7, 7);
@@ -1083,6 +1128,51 @@ TEST_CASE("Combined fiberlet dataset with no expected chunks is complete from fo
     CHECK(dataset->datasetComplete());
     auto anchorCache = createStoredFiberletAnchorChunkCache(dataset);
     auto pathCache = createStoredFiberletPathChunkCache(dataset);
+    pathCache->cancelPendingAndWait();
+    anchorCache->cancelPendingAndWait();
+    std::filesystem::remove_all(root);
+}
+
+TEST_CASE("Stored combined fiberlet caches interpret absent sparse chunks as empty")
+{
+    std::mt19937_64 random(std::random_device{}());
+    const auto root = std::filesystem::temp_directory_path() /
+        ("vc_fiberlet_combined_sparse_" + std::to_string(random()));
+    FiberletDatasetMetadata metadata;
+    metadata.kind = FiberletDatasetKind::Combined;
+    metadata.profile = FiberletStorageProfile::CompactDirectionsFixedCost;
+    metadata.chunkGridShapeZYX = {2, 2, 2};
+    metadata.coordinateUnitsPerChunkZYX = {8, 8, 8};
+    metadata.maximumEndpointReachCoordinateUnitsZYX = {4, 4, 4};
+    metadata.coordinateBits = 8;
+    metadata.deltaBits = 8;
+    metadata.routeCountBits = 8;
+    metadata.routeLatticeBits = 8;
+    metadata.costBits = 16;
+    finalizeFiberletDatasetIdentity(metadata);
+    auto dataset = FiberletChunkDataset::createOrOpen(root, metadata);
+
+    auto anchorCache = createStoredFiberletAnchorChunkCache(dataset);
+    auto pathCache = createStoredFiberletPathChunkCache(dataset);
+    const auto anchors = anchorCache->getChunkBlocking(0, 1, 0, 1);
+    const auto prefixes = pathCache->getChunkBlocking(0, 1, 0, 1);
+    const auto routes = pathCache->getChunkBlocking(1, 1, 0, 1);
+    REQUIRE(anchors.status == vc::render::ChunkStatus::Data);
+    REQUIRE(prefixes.status == vc::render::ChunkStatus::Data);
+    REQUIRE(routes.status == vc::render::ChunkStatus::Data);
+    const auto anchorPayload = std::dynamic_pointer_cast<
+        const FiberletAnchorChunkPayload>(anchors.payload);
+    const auto prefixPayload = std::dynamic_pointer_cast<
+        const FiberletPrefixChunkPayload>(prefixes.payload);
+    const auto routePayload = std::dynamic_pointer_cast<
+        const FiberletRouteChunkPayload>(routes.payload);
+    REQUIRE(anchorPayload);
+    REQUIRE(prefixPayload);
+    REQUIRE(routePayload);
+    CHECK(anchorPayload->anchors.empty());
+    CHECK(prefixPayload->prefixes.empty());
+    CHECK(routePayload->routes.empty());
+
     pathCache->cancelPendingAndWait();
     anchorCache->cancelPendingAndWait();
     std::filesystem::remove_all(root);

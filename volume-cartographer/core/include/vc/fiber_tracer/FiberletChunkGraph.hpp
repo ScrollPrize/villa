@@ -139,6 +139,56 @@ private:
     FiberletAnchorView anchorView_;
 };
 
+// Recover the path metric needed to reconstruct routes and join costs from a
+// stored dataset's authoritative processing metadata.
+[[nodiscard]] FiberletPathConfig fiberletPathConfigFromDatasetMetadata(
+    const FiberletDatasetMetadata& metadata,
+    int parallelThreads = 1);
+
+// Blocking stored-graph adapter. Missing sparse chunks are empty; all edge,
+// route, and transition interpretation remains owned by FiberletChunkGraphSource.
+class FiberletStoredReplayGraphSource final : public FiberletReplayGraphSource
+{
+public:
+    FiberletStoredReplayGraphSource(
+        std::shared_ptr<FiberletChunkDataset> dataset,
+        FiberletChunkCacheOptions cacheOptions = {},
+        float maximumJoinAngleDegrees = 45.0F);
+
+    [[nodiscard]] float predictionToBaseScale() const noexcept override;
+    [[nodiscard]] int anchorCellSizePredictionVoxels() const noexcept override;
+    [[nodiscard]] float maximumJoinAngleDegrees() const noexcept override;
+    [[nodiscard]] std::vector<FiberletReplaySourceAnchor> anchorsNearReference(
+        const PolylineArcGeometry& reference,
+        double beginArcBase,
+        double endArcBase,
+        double broadPhaseRadiusBaseVoxels) const override;
+    [[nodiscard]] std::vector<DirectedFiberletStorageId> outgoing(
+        const FiberletStorageKey& anchor) const override;
+    [[nodiscard]] FiberletReplaySourceArc arc(
+        const DirectedFiberletStorageId& id) const override;
+    [[nodiscard]] FiberletReplaySourceCostProfile costProfile(
+        const DirectedFiberletStorageId& id) const override;
+    [[nodiscard]] std::vector<cv::Vec3d> routePoints(
+        const DirectedFiberletStorageId& id) const override;
+    [[nodiscard]] std::optional<FiberletReplaySourceTransition> transition(
+        const FiberletReplaySourceArc& incoming,
+        const FiberletReplaySourceArc& outgoing) const override;
+
+    [[nodiscard]] std::vector<FiberletStoredAnchor> anchorsInBaseBox(
+        const cv::Vec3d& minimumBaseXYZ,
+        const cv::Vec3d& maximumBaseXYZ) const;
+    [[nodiscard]] const FiberletDatasetMetadata& metadata() const noexcept;
+
+private:
+    std::shared_ptr<FiberletChunkDataset> dataset_;
+    std::shared_ptr<vc::render::ChunkCache> anchorCache_;
+    std::shared_ptr<vc::render::ChunkCache> pathCache_;
+    FiberletPathConfig pathConfig_;
+    FiberletChunkGraphSource chunks_;
+    float maximumJoinAngleDegrees_ = 45.0F;
+};
+
 enum class FiberletChunkRouteEdgeCostView {
     Stored,
     SqrtUint16Max256,

@@ -2,6 +2,7 @@ configure_file(src/Version.cpp.in Version.cpp)
 
 add_library(vc_core
         src/AtomicFile.cpp
+        src/PolylineObj.cpp
         src/TexturedMesh.cpp
         src/SurfaceTexture.cpp
         src/GridStore.cpp
@@ -210,6 +211,8 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberletQuantization.cpp
     src/fiber_tracer/FiberletDataset.cpp
     src/fiber_tracer/FiberletChunkGraph.cpp
+    src/fiber_tracer/FiberletCropTrace.cpp
+    src/fiber_tracer/FiberletCropVisualization.cpp
     src/fiber_tracer/FiberletOnDemand.cpp
     src/fiber_tracer/FiberletStorage.cpp
 )

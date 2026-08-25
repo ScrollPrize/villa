@@ -13,6 +13,8 @@
 #include <string>
 #include <vector>
 
+namespace vc::lasagna { class LasagnaDataset; }
+
 #include <nlohmann/json.hpp>
 
 namespace vc::fiber_tracer
@@ -108,6 +110,13 @@ struct FiberletDatasetMetadata {
 // Canonically derive the algorithm and dataset fingerprints from the
 // structured metadata. Call this after all effective values are resolved.
 void finalizeFiberletDatasetIdentity(FiberletDatasetMetadata& metadata);
+
+[[nodiscard]] std::string fiberletContentHash(
+    const std::filesystem::path& path);
+
+void validateFiberletNormalDatasetCompatibility(
+    const FiberletDatasetMetadata& metadata,
+    const vc::lasagna::LasagnaDataset& normals);
 
 class FiberletChunkDataset
 {

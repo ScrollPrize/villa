@@ -1,6 +1,8 @@
 #include "vc/fiber_tracer/FiberletDataset.hpp"
 
 #include "vc/core/util/AtomicFile.hpp"
+#include "vc/lasagna/ChannelSampler.hpp"
+#include "vc/lasagna/Dataset.hpp"
 #include "utils/thread_pool.hpp"
 
 #include <nlohmann/json.hpp>
@@ -8,10 +10,12 @@
 #include <bit>
 #include <condition_variable>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <map>
 #include <mutex>
 #include <stdexcept>
+#include <sstream>
 #include <string_view>
 #include <tuple>
 #include <type_traits>
@@ -23,6 +27,81 @@ namespace
 {
 
 using json = nlohmann::json;
+
+bool nearlyEqual(double left, double right)
+{
+    return std::abs(left - right) <=
+           1e-12 * std::max({1.0, std::abs(left), std::abs(right)});
+}
+
+std::array<std::size_t, 3> fiberletPredictionShape(
+    const FiberletDatasetMetadata& metadata)
+{
+    try {
+        const auto& grid = metadata.processing.at("grid");
+        if (!grid.is_object() ||
+            grid.at("coordinate_order") != "zyx_storage_xyz_vectors") {
+            throw std::invalid_argument(
+                "fiberlet grid coordinate frame is incompatible with Lasagna base coordinates");
+        }
+        const double structuredScale = grid.at("prediction_to_base").get<double>();
+        if (!(structuredScale > 0.0) || !std::isfinite(structuredScale) ||
+            !nearlyEqual(structuredScale, metadata.predictionToBaseScale)) {
+            throw std::invalid_argument(
+                "fiberlet prediction-to-base scale metadata is inconsistent");
+        }
+        const auto& shape = grid.at("shape_zyx");
+        if (!shape.is_array() || shape.size() != 3)
+            throw std::invalid_argument("fiberlet prediction grid shape is invalid");
+        std::array<std::size_t, 3> result{};
+        for (std::size_t axis = 0; axis < result.size(); ++axis) {
+            if (!shape.at(axis).is_number_unsigned())
+                throw std::invalid_argument("fiberlet prediction grid shape is invalid");
+            result[axis] = shape.at(axis).get<std::size_t>();
+            if (result[axis] == 0)
+                throw std::invalid_argument("fiberlet prediction grid shape is invalid");
+        }
+        return result;
+    } catch (const nlohmann::json::exception&) {
+        throw std::invalid_argument(
+            "fiberlet dataset is missing valid structured grid metadata");
+    }
+}
+
+double requiredPositiveManifestNumber(
+    const vc::lasagna::LasagnaDatasetManifest& manifest,
+    const char* name)
+{
+    const auto found = manifest.raw.find(name);
+    if (found == manifest.raw.end() || !found->is_number())
+        throw std::invalid_argument(
+            std::string("normal manifest is missing numeric field '") + name + "'");
+    const double value = found->get<double>();
+    if (!(value > 0.0) || !std::isfinite(value))
+        throw std::invalid_argument(
+            std::string("normal manifest field '") + name + "' must be positive and finite");
+    return value;
+}
+
+void validateNormalBinding(
+    const vc::lasagna::LasagnaDatasetManifest& manifest,
+    const vc::lasagna::LasagnaChannelBinding& binding,
+    std::string_view channel)
+{
+    if (binding.group == nullptr || binding.group->channels.size() != 1)
+        throw std::invalid_argument(
+            "normal channel '" + std::string(channel) +
+            "' must use its own 3D Lasagna group");
+    const double baseSpacing = static_cast<double>(binding.group->scaleFactor()) *
+                               manifest.sourceToBase;
+    if (!vc::lasagna::lasagnaChannelShapeCompatible(
+            *manifest.baseShapeZYX, baseSpacing,
+            binding.shapeZYX, binding.chunksZYX)) {
+        throw std::invalid_argument(
+            "normal channel '" + std::string(channel) +
+            "' shape is incompatible with base_shape_zyx and scale");
+    }
+}
 
 const char* profileName(FiberletStorageProfile profile)
 {
@@ -410,7 +489,39 @@ public:
         try {
             const auto chunk = dataset_->readMaterializedChunk(kind_, key);
             if (!chunk) {
-                result.status = vc::render::ChunkFetchStatus::Missing;
+                if (dataset_->metadata().kind != FiberletDatasetKind::Anchors) {
+                    const vc::render::ChunkKey owner{
+                        0, key.iz, key.iy, key.ix};
+                    const vc::render::ChunkKey route{
+                        1, key.iz, key.iy, key.ix};
+                    std::size_t present = 0;
+                    std::size_t required = 2;
+                    present += std::filesystem::exists(dataset_->chunkPath(
+                        FiberletStorageChunkKind::FiberletPrefix, owner));
+                    present += std::filesystem::exists(dataset_->chunkPath(
+                        FiberletStorageChunkKind::FiberletRoutes, route));
+                    if (dataset_->metadata().kind == FiberletDatasetKind::Combined) {
+                        ++required;
+                        present += std::filesystem::exists(dataset_->chunkPath(
+                            FiberletStorageChunkKind::Anchors, owner));
+                    }
+                    if (present != 0 && present != required) {
+                        result.status = vc::render::ChunkFetchStatus::DecodeError;
+                        result.message =
+                            "fiberlet sparse chunk tuple is only partially present";
+                        return result;
+                    }
+                }
+                const auto codec = dataset_->codecConfig(kind_, key);
+                std::vector<std::byte> bytes;
+                if (kind_ == FiberletStorageChunkKind::Anchors)
+                    bytes = serializeFiberletAnchors(codec, {});
+                else if (kind_ == FiberletStorageChunkKind::FiberletPrefix)
+                    bytes = serializeFiberletPrefixes(codec, {});
+                else
+                    bytes = serializeFiberletRoutes(codec, {});
+                result.status = vc::render::ChunkFetchStatus::Found;
+                result.payload = decodeFiberletChunkPayload(kind_, bytes);
             } else {
                 result.status = vc::render::ChunkFetchStatus::Found;
                 result.payload = chunk->payload;
@@ -1344,6 +1455,81 @@ void finalizeFiberletDatasetIdentity(FiberletDatasetMetadata& metadata)
     }.dump());
 }
 
+std::string fiberletContentHash(const std::filesystem::path& path)
+{
+    std::ifstream input(path, std::ios::binary);
+    if (!input)
+        throw std::runtime_error("cannot hash file: " + path.string());
+    std::uint64_t hash = 14695981039346656037ULL;
+    std::array<char, 64 * 1024> buffer{};
+    while (input) {
+        input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const auto count = input.gcount();
+        for (std::streamsize index = 0; index < count; ++index) {
+            hash ^= static_cast<unsigned char>(
+                buffer[static_cast<std::size_t>(index)]);
+            hash *= 1099511628211ULL;
+        }
+    }
+    if (!input.eof())
+        throw std::runtime_error(
+            "failed while hashing file: " + path.string());
+    std::ostringstream output;
+    output << "fnv1a64:" << std::hex << std::setfill('0') << std::setw(16)
+           << hash;
+    return output.str();
+}
+
+void validateFiberletNormalDatasetCompatibility(
+    const FiberletDatasetMetadata& metadata,
+    const vc::lasagna::LasagnaDataset& normals)
+{
+    if (!(metadata.predictionToBaseScale > 0.0) ||
+        !std::isfinite(metadata.predictionToBaseScale)) {
+        throw std::invalid_argument(
+            "fiberlet prediction-to-base scale must be positive and finite");
+    }
+    if (metadata.coordinateOriginZYX != std::array<std::int64_t, 3>{0, 0, 0}) {
+        throw std::invalid_argument(
+            "fiberlet dataset does not use the whole-volume base coordinate frame");
+    }
+    const auto predictionShape = fiberletPredictionShape(metadata);
+    const auto& manifest = normals.manifest();
+    if (!manifest.baseShapeZYX.has_value())
+        throw std::invalid_argument(
+            "normal manifest must declare base_shape_zyx");
+    if (!nearlyEqual(manifest.workingToBaseScale,
+                     metadata.predictionToBaseScale)) {
+        throw std::invalid_argument(
+            "normal dataset working scale does not match the Fiberlet prediction scale");
+    }
+    for (std::size_t axis = 0; axis < predictionShape.size(); ++axis) {
+        const auto expected = static_cast<std::size_t>(std::ceil(
+            static_cast<double>((*manifest.baseShapeZYX)[axis]) /
+            metadata.predictionToBaseScale));
+        if (predictionShape[axis] != expected) {
+            throw std::invalid_argument(
+                "normal manifest base_shape_zyx is incompatible with the Fiberlet prediction grid");
+        }
+    }
+
+    requiredPositiveManifestNumber(manifest, "grad_mag_encode_scale");
+    requiredPositiveManifestNumber(manifest, "grad_mag_factor");
+    const auto nx = vc::lasagna::bindLasagnaChannel(manifest, "nx");
+    const auto ny = vc::lasagna::bindLasagnaChannel(manifest, "ny");
+    const auto gradMag = vc::lasagna::bindLasagnaChannel(manifest, "grad_mag");
+    validateNormalBinding(manifest, nx, "nx");
+    validateNormalBinding(manifest, ny, "ny");
+    validateNormalBinding(manifest, gradMag, "grad_mag");
+    const double nxBaseSpacing = nx.spacing * manifest.workingToBaseScale;
+    const double nyBaseSpacing = ny.spacing * manifest.workingToBaseScale;
+    if (nx.shapeZYX != ny.shapeZYX ||
+        !nearlyEqual(nxBaseSpacing, nyBaseSpacing)) {
+        throw std::invalid_argument(
+            "normal nx and ny channels must have matching shape and base scale");
+    }
+}
+
 FiberletChunkDataset::FiberletChunkDataset(
     std::filesystem::path root,
     FiberletDatasetMetadata metadata,
@@ -1571,7 +1757,8 @@ std::optional<FiberletChunkDataset::MaterializedChunk> FiberletChunkDataset::rea
     std::optional<std::vector<std::byte>> anchorBytes;
     if (metadata_.kind == FiberletDatasetKind::Combined)
         anchorBytes = readBytes(chunkPath(FiberletStorageChunkKind::Anchors, ownerKey));
-    if (!prefixBytes || !routeBytes || (metadata_.kind == FiberletDatasetKind::Combined && !anchorBytes))
+    if (!prefixBytes || !routeBytes ||
+        (metadata_.kind == FiberletDatasetKind::Combined && !anchorBytes))
         return std::nullopt;
 
     auto prefixPayload = decodeFiberletChunkPayload(FiberletStorageChunkKind::FiberletPrefix, *prefixBytes);
@@ -1760,8 +1947,6 @@ std::shared_ptr<vc::render::ChunkCache> createStoredFiberletAnchorChunkCache(std
     if (!dataset || (dataset->metadata().kind != FiberletDatasetKind::Anchors && dataset->metadata().kind != FiberletDatasetKind::Combined)) {
         throw std::invalid_argument("stored fiberlet anchor cache requires anchor payloads");
     }
-    if (dataset->metadata().kind == FiberletDatasetKind::Combined && !dataset->datasetComplete())
-        throw std::invalid_argument("stored combined fiberlet cache requires a complete dataset");
     const auto shape = dataset->metadata().chunkGridShapeZYX;
     options.cache.detectAllFillChunks = false;
     options.cache.persistentCachePath.reset();
@@ -1774,8 +1959,6 @@ std::shared_ptr<vc::render::ChunkCache> createStoredFiberletPathChunkCache(std::
     if (!dataset || (dataset->metadata().kind != FiberletDatasetKind::Fiberlets && dataset->metadata().kind != FiberletDatasetKind::Combined)) {
         throw std::invalid_argument("stored fiberlet path cache requires prefix and route payloads");
     }
-    if (dataset->metadata().kind == FiberletDatasetKind::Combined && !dataset->datasetComplete())
-        throw std::invalid_argument("stored combined fiberlet cache requires a complete dataset");
     const auto shape = dataset->metadata().chunkGridShapeZYX;
     options.cache.detectAllFillChunks = false;
     options.cache.persistentCachePath.reset();

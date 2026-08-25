@@ -4458,19 +4458,25 @@
   and decoded-all-zero chunks are inactive; every final output chunk that
   overlaps a decoded-nonzero presence chunk is active. Direction channels never
   participate in sparse eligibility.
-- The sorted expected output-chunk set is reconstructed from a fresh canonical
-  presence scan on every invocation and kept only in memory. No active index,
-  per-chunk marker, or whole-dataset completion marker is persisted.
-- A combined chunk is found only when its anchor, prefix, and route files all
-  exist, decode against their expected codecs/fingerprint, and have a matching
-  prefix/route record count. Completeness is the direct check that every
-  source-derived expected chunk has such a valid triple. Missing members make
-  a tuple incomplete and resumable; corrupt or conflicting members fail.
-- Source-derived inactive chunks resolve as canonical empty anchor/prefix/route
-  payloads after the current expected set is configured. Every standalone
-  combined graph reader must rescan the source presence and configure this set
-  before constructing stored graph facets. Unexpected old final payloads are
-  inaccessible unless the current scan expects them.
+- The sorted candidate output-chunk set is reconstructed from a fresh canonical
+  presence scan on every preprocessing invocation and kept only in memory. It
+  schedules work and resume checks; it is not part of the stored data contract.
+  No active index, per-chunk marker, or whole-dataset completion marker is
+  persisted.
+- A present combined chunk is valid only when its anchor, prefix, and route
+  files all exist, decode against their expected codecs/fingerprint, and have a
+  matching prefix/route record count. A wholly absent tuple is an empty sparse
+  chunk under ordinary Zarr semantics; corrupt, partial, or conflicting
+  present tuples fail validation.
+- Stored graph readers consume the combined dataset directly. They synthesize
+  canonical empty anchor/prefix/route payloads for absent tuples and never
+  require the original Fiber prediction manifest or a reconstructed expected
+  set.
+- Preprocessing does not publish intermediate anchor chunks with no retained
+  anchors or final combined tuples with no generated Fiberlets. Missing and
+  decoded-all-zero input presence chunks are never scheduled in the first
+  place. Canonical decoded empty results remain available to the current
+  process, while both durable Zarr datasets stay sparse.
 - Intermediate anchors include the exact dependency halo required by each
   active fiberlet owner. Halo-only chunks remain in the intermediate cache and
   are absent from the final active set.
@@ -4526,3 +4532,36 @@
   only: one canonical copy and one CC-licensed public copy under the volume's
   `representations/fiberlets/` directory; it creates no model and no derive
   action.
+
+## Anchor-seeded Fiberlet crop tracing
+
+- `vc_fiber_trace_chunk` consumes one combined Fiberlet Zarr and a structurally
+  compatible regular Lasagna normal manifest. Manifest path and byte identity
+  are provenance only. Compatibility requires the Fiberlet whole-volume base
+  frame, ceil-downsampled base shape, consistent prediction-to-base scale,
+  valid `nx`, `ny`, and `grad_mag` channels, matching normal-component shape
+  and base spacing, and base-shape coverage with at most the established
+  one-chunk array padding. It does not require or read the original dense Fiber
+  prediction manifest. Missing sparse tuples are empty; partially present
+  tuples are invalid.
+- The public crop is a half-open base-volume XYZ box. Every stored anchor
+  variant in intersecting cells is a deterministic seed candidate, ordered by
+  descending prediction presence and then storage key.
+- Each uncovered seed traces both signs of its fitted axial direction. The
+  initial pair must use distinct physical Fiberlets and pass the ordinary join
+  constraint at the seed. Later joins use the stored Fiberlet transition
+  metric, cycles are rejected, and the first crop exit clips and terminates a
+  side.
+- Seed attempts may be capped independently from accepted output fibers.
+  Covered seeds do not consume attempts; selecting an active seed does,
+  including when it has no usable initial edge. Zero means unlimited for both
+  limits, and neither limit changes descending-presence/storage-key ordering.
+- Accepted lines suppress only later anchor seeds. Coverage uses the shared
+  replay threshold measurement with a default 20-base-voxel normal radius and
+  four-times-wider Lasagna tangent-plane radius. The threshold comparison is
+  strict, and invalid normals use the existing Euclidean fallback.
+- Coverage additionally requires inclusive unoriented fitted-axis agreement
+  with the projected line tangent within 25 degrees. Crossing directions are
+  retained. This version performs no line-to-line Fiber deduplication.
+- Line visualization is OBJ. Optional crop faces use one concrete uint8 CT
+  OME-Zarr group and the existing VC3D fine-to-coarse coordinate renderer.

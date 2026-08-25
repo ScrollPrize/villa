@@ -1,5 +1,8 @@
 # Fiberlet anchor extraction
 
+Crop filling from a completed combined Fiberlet dataset is documented in
+[`fiber_chunk_tracing.md`](fiber_chunk_tracing.md).
+
 `vc_fiberlets anchors` is the first stage of anchor-seeded fiberlet
 over-segmentation. It turns the canonical `presence/nx/ny` channels of a Fiber
 Lasagna manifest into zero, one, or two local unoriented line anchors per
@@ -1037,8 +1040,7 @@ entire stored prediction volume without a reference fiber:
 volume-cartographer/build/bin/vc_fiberlets preprocess-volume \
   /path/to/fiber.lasagna.json /path/to/fiberlets.zarr \
   --normal-manifest /path/to/normals.lasagna.json \
-  --source-context /path/to/stable-source-context.json \
-  --threads 32
+  --source-context /path/to/stable-source-context.json
 ```
 
 `--source-context` supplies portable producer identity (sample/volume, manager
@@ -1066,10 +1068,12 @@ or completion-marker files.
 Sparse eligibility depends only on canonical stored presence chunks. A final
 spatial chunk is active when it overlaps a present, decoded-nonzero presence
 chunk. Direction channels do not affect this first-stage decision. Missing and
-decoded-all-zero presence chunks do not activate output. The intermediate
-anchor cache additionally materializes the exact neighboring dependency halo
-needed to evaluate active fiberlet chunks; those halo-only chunks are not added
-to the final sparse index.
+decoded-all-zero presence chunks do not activate output. Generated anchor
+chunks with no retained anchors and final chunks with no Fiberlets also remain
+absent; their decoded empty payloads exist only in the live process cache. The
+intermediate anchor cache additionally materializes the exact neighboring
+dependency halo needed to evaluate active fiberlet chunks; nonempty halo-only
+chunks are not added to the final sparse index.
 
 Every invocation rescans canonical input presence to reconstruct the expected
 final chunks, then checks the required intermediate anchors and final output

@@ -1,0 +1,449 @@
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <doctest/doctest.h>
+
+#include "vc/core/io/PolylineObj.hpp"
+#include "vc/fiber_tracer/FiberletCropTrace.hpp"
+#include "vc/fiber_tracer/FiberletDataset.hpp"
+#include "vc/lasagna/Dataset.hpp"
+
+#include "utils/zarr.hpp"
+
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <nlohmann/json.hpp>
+#include <random>
+#include <sstream>
+
+namespace
+{
+
+using namespace vc::fiber_tracer;
+
+FiberletStorageKey key(std::int64_t x, std::uint8_t variant = 0)
+{
+    return {{0, 0, x}, variant};
+}
+
+class ZNormalSampler final : public vc::lasagna::NormalSampler
+{
+public:
+    [[nodiscard]] vc::lasagna::NormalSample sampleNormal(const cv::Vec3d&) const override { return {{0, 0, 1}, true, {}}; }
+};
+
+class TestGraph final : public FiberletReplayGraphSource
+{
+public:
+    void addAnchor(FiberletStorageKey id, cv::Vec3d point) { positions[id] = point; }
+
+    void connect(FiberletStorageKey first, FiberletStorageKey second)
+    {
+        FiberletStorageId physical{std::min(first, second), std::max(first, second)};
+        const bool reverse = first != physical.first;
+        DirectedFiberletStorageId directed{physical, reverse};
+        adjacency[first].push_back(directed);
+        directed.reverse = !directed.reverse;
+        adjacency[second].push_back(directed);
+    }
+
+    [[nodiscard]] float predictionToBaseScale() const noexcept override { return 1.0F; }
+    [[nodiscard]] int anchorCellSizePredictionVoxels() const noexcept override { return 4; }
+    [[nodiscard]] float maximumJoinAngleDegrees() const noexcept override { return 45.0F; }
+    [[nodiscard]] std::vector<FiberletReplaySourceAnchor> anchorsNearReference(const PolylineArcGeometry&, double, double, double) const override
+    {
+        return {};
+    }
+    [[nodiscard]] std::vector<DirectedFiberletStorageId> outgoing(const FiberletStorageKey& anchor) const override
+    {
+        auto found = adjacency.find(anchor);
+        if (found == adjacency.end())
+            return {};
+        auto result = found->second;
+        std::sort(result.begin(), result.end());
+        return result;
+    }
+    [[nodiscard]] FiberletReplaySourceArc arc(const DirectedFiberletStorageId& id) const override
+    {
+        const auto source = id.reverse ? id.fiberlet.second : id.fiberlet.first;
+        const auto target = id.reverse ? id.fiberlet.first : id.fiberlet.second;
+        const cv::Vec3d delta = positions.at(target) - positions.at(source);
+        const float edgeLength = static_cast<float>(cv::norm(delta));
+        return {id, source, target, positions.at(source), positions.at(target), cv::Vec3f(delta), cv::Vec3f(delta), edgeLength, {0, edgeLength, 0, 0, 0}, std::nullopt, std::nullopt};
+    }
+    [[nodiscard]] FiberletReplaySourceCostProfile costProfile(const DirectedFiberletStorageId& id) const override
+    {
+        const auto edge = arc(id);
+        return {{edge.pathLengthPredictionVoxels}, {1.0F}};
+    }
+    [[nodiscard]] std::vector<cv::Vec3d> routePoints(const DirectedFiberletStorageId& id) const override
+    {
+        const auto edge = arc(id);
+        return {edge.sourcePositionBaseXYZ, edge.targetPositionBaseXYZ};
+    }
+    [[nodiscard]] std::optional<FiberletReplaySourceTransition> transition(const FiberletReplaySourceArc& incoming, const FiberletReplaySourceArc& outgoing) const override
+    {
+        if (incoming.target != outgoing.source || incoming.id.fiberlet == outgoing.id.fiberlet) {
+            return std::nullopt;
+        }
+        const cv::Vec3d left = incoming.endStepBaseXYZ / cv::norm(incoming.endStepBaseXYZ);
+        const cv::Vec3d right = outgoing.startStepBaseXYZ / cv::norm(outgoing.startStepBaseXYZ);
+        if (!(left.dot(right) > std::cos(45.0 * 3.14159265358979323846 / 180.0)))
+            return std::nullopt;
+        return FiberletReplaySourceTransition{incoming.id, outgoing.id, {}, std::nullopt};
+    }
+
+    std::map<FiberletStorageKey, cv::Vec3d> positions;
+    std::map<FiberletStorageKey, std::vector<DirectedFiberletStorageId>> adjacency;
+};
+
+FiberletStoredAnchor anchor(FiberletStorageKey id, cv::Vec3f point, cv::Vec3f axis, float presence)
+{
+    FiberletStoredAnchor result;
+    result.key = id;
+    result.positionPredictionXYZ = point;
+    result.fittedAxisXYZ = axis;
+    result.predictionPresence = presence;
+    result.predictionValid = true;
+    result.predictionPresenceValid = true;
+    return result;
+}
+
+struct TemporaryDirectory {
+    explicit TemporaryDirectory(std::string_view tag)
+    {
+        std::mt19937_64 random(std::random_device{}());
+        path = std::filesystem::temp_directory_path() /
+               ("vc_fiberlet_normal_compat_" + std::string(tag) + "_" +
+                std::to_string(random()));
+        std::filesystem::create_directories(path);
+    }
+    ~TemporaryDirectory() { std::filesystem::remove_all(path); }
+    std::filesystem::path path;
+};
+
+void createU8Zarr(
+    const std::filesystem::path& path,
+    const std::array<std::size_t, 3>& shape,
+    const std::array<std::size_t, 3>& chunks)
+{
+    utils::ZarrMetadata metadata;
+    metadata.version = utils::ZarrVersion::v2;
+    metadata.shape = {shape[0], shape[1], shape[2]};
+    metadata.chunks = {chunks[0], chunks[1], chunks[2]};
+    metadata.dtype = utils::ZarrDtype::uint8;
+    metadata.compressor_id.clear();
+    metadata.fill_value = 0.0;
+    (void)utils::ZarrArray::create(path, metadata);
+}
+
+FiberletDatasetMetadata normalCompatibilityMetadata(
+    const std::array<std::size_t, 3>& predictionShapeZYX,
+    double predictionToBase)
+{
+    FiberletDatasetMetadata metadata;
+    metadata.predictionToBaseScale = predictionToBase;
+    metadata.coordinateOriginZYX = {0, 0, 0};
+    metadata.processing = {
+        {"grid",
+         {{"coordinate_order", "zyx_storage_xyz_vectors"},
+          {"prediction_to_base", predictionToBase},
+          {"shape_zyx", predictionShapeZYX}}},
+    };
+    metadata.sources = {
+        {"normal_prediction",
+         {{"manifest_content_hash", "deliberately-not-the-current-manifest"}}},
+    };
+    return metadata;
+}
+
+std::filesystem::path createNormalManifest(
+    const TemporaryDirectory& directory,
+    const std::array<std::size_t, 3>& baseShapeZYX,
+    const std::array<std::size_t, 3>& nxShapeZYX,
+    const std::array<std::size_t, 3>& nxChunksZYX,
+    const std::array<std::size_t, 3>& nyShapeZYX,
+    const std::array<std::size_t, 3>& nyChunksZYX,
+    int nxScaledown = 1,
+    int nyScaledown = 1,
+    bool includeNy = true,
+    double gradMagFactor = 1.0)
+{
+    createU8Zarr(directory.path / "nx.zarr", nxShapeZYX, nxChunksZYX);
+    if (includeNy)
+        createU8Zarr(directory.path / "ny.zarr", nyShapeZYX, nyChunksZYX);
+    createU8Zarr(directory.path / "grad_mag.zarr", nxShapeZYX, nxChunksZYX);
+    nlohmann::json groups{
+        {"nx", {{"zarr", "nx.zarr"}, {"scaledown", nxScaledown}, {"channels", {"nx"}}}},
+        {"grad_mag", {{"zarr", "grad_mag.zarr"}, {"scaledown", nxScaledown}, {"channels", {"grad_mag"}}}},
+    };
+    if (includeNy) {
+        groups["ny"] = {
+            {"zarr", "ny.zarr"},
+            {"scaledown", nyScaledown},
+            {"channels", {"ny"}},
+        };
+    }
+    const nlohmann::json manifest{
+        {"version", 2},
+        {"source_to_base", 1.0},
+        {"base_shape_zyx", baseShapeZYX},
+        {"grad_mag_encode_scale", 255.0},
+        {"grad_mag_factor", gradMagFactor},
+        {"groups", std::move(groups)},
+    };
+    const auto path = directory.path / "dataset.lasagna.json";
+    std::ofstream output(path);
+    output << manifest.dump(2) << '\n';
+    return path;
+}
+
+}  // namespace
+
+TEST_CASE("Fiberlet crop tracing is bidirectional and uses anisotropic directional coverage")
+{
+    TestGraph graph;
+    const auto outsideLeft = key(-10);
+    const auto left = key(20);
+    const auto seed = key(50);
+    const auto right = key(80);
+    const auto outsideRight = key(110);
+    graph.addAnchor(outsideLeft, {-10, 0, 0});
+    graph.addAnchor(left, {20, 0, 0});
+    graph.addAnchor(seed, {50, 0, 0});
+    graph.addAnchor(right, {80, 0, 0});
+    graph.addAnchor(outsideRight, {110, 0, 0});
+    graph.connect(outsideLeft, left);
+    graph.connect(left, seed);
+    graph.connect(seed, right);
+    graph.connect(right, outsideRight);
+
+    const auto parallel = key(51);
+    const auto crossing = key(52);
+    const auto normalFar = key(53);
+    std::vector<FiberletStoredAnchor> anchors{
+        anchor(seed, {50, 0, 0}, {1, 0, 0}, 1.0F),
+        anchor(parallel, {50, 50, 0}, {1, 0, 0}, 0.8F),
+        anchor(crossing, {50, 0, 0}, {0, 1, 0}, 0.7F),
+        anchor(normalFar, {50, 0, 21}, {1, 0, 0}, 0.6F),
+    };
+    ZNormalSampler normals;
+    FiberletCropTraceConfig config;
+    config.minimumBaseXYZ = {0, -100, -100};
+    config.maximumBaseXYZ = {100, 100, 100};
+    config.lookaheadDistanceBaseVoxels = 48;
+    const auto result = traceFiberletCrop(graph, anchors, normals, 1.0, config);
+
+    REQUIRE(result.lines.size() == 1);
+    CHECK(result.bidirectionalLines == 1);
+    CHECK(result.oneSidedLines == 0);
+    CHECK(result.coveredAnchors == 1);
+    CHECK(result.attemptedAnchors == 3);
+    CHECK(result.noEdgeAnchors == 2);
+    CHECK(result.lines.front().negativeTermination == "crop_boundary");
+    CHECK(result.lines.front().positiveTermination == "crop_boundary");
+    REQUIRE(result.lines.front().pointsBaseXYZ.size() >= 5);
+    CHECK(result.lines.front().pointsBaseXYZ.front()[0] == doctest::Approx(0));
+    CHECK(result.lines.front().pointsBaseXYZ.back()[0] == doctest::Approx(100));
+
+    auto limitedConfig = config;
+    limitedConfig.maximumAttempts = 2;
+    const auto limited = traceFiberletCrop(
+        graph, anchors, normals, 1.0, limitedConfig);
+    CHECK(limited.attemptedAnchors == 2);
+    CHECK(limited.coveredAnchors == 1);
+    CHECK(limited.lines.size() == 1);
+    CHECK(limited.noEdgeAnchors == 1);
+}
+
+TEST_CASE("Fiberlet crop attempts follow strongest-first deterministic ordering")
+{
+    TestGraph graph;
+    const auto first = key(10);
+    const auto second = key(20);
+    const auto third = key(30);
+    graph.addAnchor(first, {0, 0, 0});
+    graph.addAnchor(key(11), {10, 0, 0});
+    graph.addAnchor(second, {200, 0, 0});
+    graph.addAnchor(key(21), {210, 0, 0});
+    graph.addAnchor(third, {400, 0, 0});
+    graph.addAnchor(key(31), {410, 0, 0});
+    graph.connect(first, key(11));
+    graph.connect(second, key(21));
+    graph.connect(third, key(31));
+    const std::vector<FiberletStoredAnchor> anchors{
+        anchor(third, {400, 0, 0}, {1, 0, 0}, 0.5F),
+        anchor(second, {200, 0, 0}, {1, 0, 0}, 0.9F),
+        anchor(first, {0, 0, 0}, {1, 0, 0}, 0.9F),
+    };
+    ZNormalSampler normals;
+    FiberletCropTraceConfig config;
+    config.minimumBaseXYZ = {-100, -100, -100};
+    config.maximumBaseXYZ = {1'000, 100, 100};
+    config.maximumAttempts = 2;
+
+    const auto result = traceFiberletCrop(graph, anchors, normals, 1.0, config);
+    REQUIRE(result.lines.size() == 2);
+    CHECK(result.attemptedAnchors == 2);
+    CHECK(result.lines[0].seed == first);
+    CHECK(result.lines[1].seed == second);
+
+    config.maximumAttempts = 10;
+    config.maximumFibers = 1;
+    const auto acceptedLimited =
+        traceFiberletCrop(graph, anchors, normals, 1.0, config);
+    CHECK(acceptedLimited.attemptedAnchors == 1);
+    CHECK(acceptedLimited.lines.size() == 1);
+
+    TestGraph failureGraph;
+    failureGraph.addAnchor(first, {0, 0, 0});
+    failureGraph.addAnchor(second, {200, 0, 0});
+    failureGraph.addAnchor(key(21), {210, 0, 0});
+    failureGraph.connect(second, key(21));
+    config.maximumAttempts = 1;
+    config.maximumFibers = 0;
+    const auto failureLimited = traceFiberletCrop(
+        failureGraph,
+        {anchor(second, {200, 0, 0}, {1, 0, 0}, 0.5F),
+         anchor(first, {0, 0, 0}, {1, 0, 0}, 0.9F)},
+        normals, 1.0, config);
+    CHECK(failureLimited.attemptedAnchors == 1);
+    CHECK(failureLimited.noEdgeAnchors == 1);
+    CHECK(failureLimited.lines.empty());
+}
+
+TEST_CASE("Polyline OBJ output uses explicit consecutive line indices")
+{
+    std::mt19937_64 random(std::random_device{}());
+    const auto path = std::filesystem::temp_directory_path() / ("vc_fiberlet_crop_" + std::to_string(random()) + ".obj");
+    vc::core::io::writePolylinesObj({{{"a"}, {{0, 0, 0}, {1, 0, 0}, {2, 0, 0}}}, {{"b"}, {{0, 1, 0}, {1, 1, 0}}}}, path);
+    std::ifstream input(path);
+    std::ostringstream text;
+    text << input.rdbuf();
+    CHECK(text.str().find("l 1 2\nl 2 3\n") != std::string::npos);
+    CHECK(text.str().find("l 4 5\n") != std::string::npos);
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("Fiberlet normal compatibility accepts structural identity and legal padding")
+{
+    TemporaryDirectory directory("compatible");
+    const std::array<std::size_t, 3> baseShape{17, 18, 19};
+    const std::array<std::size_t, 3> paddedNormalShape{11, 11, 12};
+    const auto manifestPath = createNormalManifest(
+        directory, baseShape, paddedNormalShape, {4, 4, 4},
+        paddedNormalShape, {3, 3, 3});
+    const auto normals = vc::lasagna::LasagnaDataset::open(
+        manifestPath, vc::lasagna::LasagnaDatasetOpenOptions{4.0});
+    const auto metadata = normalCompatibilityMetadata({5, 5, 5}, 4.0);
+
+    CHECK_NOTHROW(validateFiberletNormalDatasetCompatibility(metadata, normals));
+}
+
+TEST_CASE("Fiberlet normal compatibility rejects incompatible frame shape and channels")
+{
+    const std::array<std::size_t, 3> baseShape{17, 18, 19};
+    const auto metadata = normalCompatibilityMetadata({5, 5, 5}, 4.0);
+
+    SUBCASE("excessive channel padding") {
+        TemporaryDirectory directory("padding");
+        const auto manifestPath = createNormalManifest(
+            directory, baseShape, {14, 9, 10}, {4, 4, 4},
+            {14, 9, 10}, {4, 4, 4});
+        const auto normals = vc::lasagna::LasagnaDataset::open(
+            manifestPath, vc::lasagna::LasagnaDatasetOpenOptions{4.0});
+        CHECK_THROWS_WITH_AS(
+            validateFiberletNormalDatasetCompatibility(metadata, normals),
+            doctest::Contains("shape is incompatible"), std::exception);
+    }
+
+    SUBCASE("missing normal component") {
+        TemporaryDirectory directory("missing_ny");
+        const auto manifestPath = createNormalManifest(
+            directory, baseShape, {9, 9, 10}, {4, 4, 4},
+            {9, 9, 10}, {4, 4, 4}, 1, 1, false);
+        const auto normals = vc::lasagna::LasagnaDataset::open(
+            manifestPath, vc::lasagna::LasagnaDatasetOpenOptions{4.0});
+        CHECK_THROWS_WITH_AS(
+            validateFiberletNormalDatasetCompatibility(metadata, normals),
+            doctest::Contains("missing required channel 'ny'"), std::exception);
+    }
+
+    SUBCASE("component scale mismatch") {
+        TemporaryDirectory directory("scale");
+        const auto manifestPath = createNormalManifest(
+            directory, baseShape, {9, 9, 10}, {4, 4, 4},
+            {5, 5, 5}, {4, 4, 4}, 1, 2);
+        const auto normals = vc::lasagna::LasagnaDataset::open(
+            manifestPath, vc::lasagna::LasagnaDatasetOpenOptions{4.0});
+        CHECK_THROWS_WITH_AS(
+            validateFiberletNormalDatasetCompatibility(metadata, normals),
+            doctest::Contains("matching shape and base scale"), std::exception);
+    }
+
+    SUBCASE("Fiberlet grid shape mismatch") {
+        TemporaryDirectory directory("grid");
+        const auto manifestPath = createNormalManifest(
+            directory, baseShape, {9, 9, 10}, {4, 4, 4},
+            {9, 9, 10}, {4, 4, 4});
+        const auto normals = vc::lasagna::LasagnaDataset::open(
+            manifestPath, vc::lasagna::LasagnaDatasetOpenOptions{4.0});
+        auto wrongMetadata = metadata;
+        wrongMetadata.processing["grid"]["shape_zyx"] = {6, 5, 5};
+        CHECK_THROWS_AS(
+            validateFiberletNormalDatasetCompatibility(wrongMetadata, normals),
+            std::invalid_argument);
+    }
+
+    SUBCASE("Fiberlet coordinate order mismatch") {
+        TemporaryDirectory directory("coordinate_order");
+        const auto manifestPath = createNormalManifest(
+            directory, baseShape, {9, 9, 10}, {4, 4, 4},
+            {9, 9, 10}, {4, 4, 4});
+        const auto normals = vc::lasagna::LasagnaDataset::open(
+            manifestPath, vc::lasagna::LasagnaDatasetOpenOptions{4.0});
+        auto wrongMetadata = metadata;
+        wrongMetadata.processing["grid"]["coordinate_order"] = "xyz";
+        CHECK_THROWS_WITH_AS(
+            validateFiberletNormalDatasetCompatibility(wrongMetadata, normals),
+            doctest::Contains("coordinate frame"), std::exception);
+    }
+
+    SUBCASE("Fiberlet duplicated scale mismatch") {
+        TemporaryDirectory directory("structured_scale");
+        const auto manifestPath = createNormalManifest(
+            directory, baseShape, {9, 9, 10}, {4, 4, 4},
+            {9, 9, 10}, {4, 4, 4});
+        const auto normals = vc::lasagna::LasagnaDataset::open(
+            manifestPath, vc::lasagna::LasagnaDatasetOpenOptions{4.0});
+        auto wrongMetadata = metadata;
+        wrongMetadata.processing["grid"]["prediction_to_base"] = 8.0;
+        CHECK_THROWS_WITH_AS(
+            validateFiberletNormalDatasetCompatibility(wrongMetadata, normals),
+            doctest::Contains("scale metadata is inconsistent"),
+            std::exception);
+    }
+
+    SUBCASE("normal working scale mismatch") {
+        TemporaryDirectory directory("working_scale");
+        const auto manifestPath = createNormalManifest(
+            directory, baseShape, {9, 9, 10}, {4, 4, 4},
+            {9, 9, 10}, {4, 4, 4});
+        const auto normals = vc::lasagna::LasagnaDataset::open(
+            manifestPath, vc::lasagna::LasagnaDatasetOpenOptions{2.0});
+        CHECK_THROWS_WITH_AS(
+            validateFiberletNormalDatasetCompatibility(metadata, normals),
+            doctest::Contains("working scale"), std::exception);
+    }
+
+    SUBCASE("invalid gradient decode metadata") {
+        TemporaryDirectory directory("gradient");
+        const auto manifestPath = createNormalManifest(
+            directory, baseShape, {9, 9, 10}, {4, 4, 4},
+            {9, 9, 10}, {4, 4, 4}, 1, 1, true, 0.0);
+        const auto normals = vc::lasagna::LasagnaDataset::open(
+            manifestPath, vc::lasagna::LasagnaDatasetOpenOptions{4.0});
+        CHECK_THROWS_WITH_AS(
+            validateFiberletNormalDatasetCompatibility(metadata, normals),
+            doctest::Contains("grad_mag_factor"), std::exception);
+    }
+}

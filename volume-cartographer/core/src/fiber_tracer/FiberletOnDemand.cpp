@@ -708,7 +708,9 @@ FiberletChunkDataset::MaterializedChunk FiberletOnDemandPreprocessor::generateAn
         if (config.progress)
             config.progress(FiberletOnDemandProgress{.stage = "anchors", .status = "completed", .key = key, .unfilteredInputCount = unfilteredInputCount});
         FiberletDecodedAnchors decoded{codec, {}};
-        return {serializeFiberletAnchors(codec, {}), std::make_shared<const FiberletAnchorChunkPayload>(std::move(decoded)), false};
+        // Empty sparse chunks remain absent. The generated cache still receives
+        // a canonical decoded empty payload for this process.
+        return {serializeFiberletAnchors(codec, {}), std::make_shared<const FiberletAnchorChunkPayload>(std::move(decoded)), true};
     }
     auto extracted =
         extractFiberAnchorsForCells(config.grid, config.anchorConfig, config.predictionSampler, cells, config.anchorRetainPredicate, {}, false);
@@ -753,7 +755,11 @@ FiberletChunkDataset::MaterializedChunk FiberletOnDemandPreprocessor::generateAn
     }
     auto bytes = serializeFiberletAnchors(codec, stored);
     FiberletDecodedAnchors decoded{codec, std::move(stored)};
-    return {std::move(bytes), std::make_shared<const FiberletAnchorChunkPayload>(std::move(decoded)), false};
+    const bool sparseEmpty = decoded.anchors.empty();
+    return {
+        std::move(bytes),
+        std::make_shared<const FiberletAnchorChunkPayload>(std::move(decoded)),
+        sparseEmpty};
 }
 
 std::vector<vc::render::ChunkKey> FiberletOnDemandPreprocessor::anchorDependencies(const vc::render::ChunkKey& fiberletChunk) const
@@ -1101,6 +1107,7 @@ FiberletChunkDataset::MaterializedChunk FiberletOnDemandPreprocessor::generateFi
         prefixes.push_back(std::move(pair.prefix));
         routes.push_back(std::move(pair.route));
     }
+    const bool sparseEmpty = prefixes.empty();
     const auto prefixCodec = state_->fiberletDataset->codecConfig(FiberletStorageChunkKind::FiberletPrefix, prefixKey);
     const auto routeCodec = state_->fiberletDataset->codecConfig(FiberletStorageChunkKind::FiberletRoutes, routeKey);
     auto prefixBytes = serializeFiberletPrefixes(prefixCodec, prefixes);
@@ -1109,7 +1116,8 @@ FiberletChunkDataset::MaterializedChunk FiberletOnDemandPreprocessor::generateFi
         prefixChunk{std::move(prefixBytes), std::make_shared<const FiberletPrefixChunkPayload>(FiberletDecodedPrefixes{prefixCodec, std::move(prefixes)}), true};
     FiberletChunkDataset::MaterializedChunk
         routeChunk{std::move(routeBytes), std::make_shared<const FiberletRouteChunkPayload>(FiberletDecodedRoutes{routeCodec, std::move(routes)}), true};
-    state_->fiberletDataset->publishFiberletChunkPair(prefixKey, prefixChunk, routeKey, routeChunk);
+    if (!sparseEmpty)
+        state_->fiberletDataset->publishFiberletChunkPair(prefixKey, prefixChunk, routeKey, routeChunk);
     if (config.progress) {
         config.progress(
             FiberletOnDemandProgress{
