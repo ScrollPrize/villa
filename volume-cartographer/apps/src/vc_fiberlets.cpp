@@ -63,10 +63,7 @@ enum class ChunkRouteMode {
     Staged,
 };
 
-struct ChunkRouteStageSpec {
-    int sideBaseVoxels = 0;
-    std::array<int, 3> offsetBaseXYZ{0, 0, 0};
-};
+using ChunkRouteStageSpec = vc::fiber_tracer::FiberletFilterStageSpec;
 
 bool isReplayCommand(Command command)
 {
@@ -204,12 +201,12 @@ void usage(const char* executable)
               << "  --source-context PATH         stable manager/Atlas source identities (preprocess-volume)\n"
               << "  --stats                       print detailed path/replay diagnostics\n"
               << "  --base-voxel-size-um N        optional physical reporting metadata\n\n"
-              << "Chunk-route options:\n"
+              << "Chunk-route and replay-filter options:\n"
               << "  --chunk X,Y,Z                region minimum in base voxels\n"
               << "  --chunk-size N               cubic analysis-box side [256]\n"
               << "  --region-size N              cubic region side [chunk-size]\n"
               << "  --mode stats|staged          reduction mode [stats]\n"
-              << "  --stage N,OX,OY,OZ           repeatable stage side/XYZ offset\n"
+              << "  --stage N,OX,OY,OZ           repeatable global filter side/XYZ offset\n"
               << "  --join-angle N               maximum anchor join angle [45]\n"
               << "  --cost-profile stored|sqrt-u16 analysis cost view [sqrt-u16]\n"
               << "  --max-states N               search-state limit per entry [5000000]\n\n"
@@ -281,7 +278,7 @@ void usage(const char* executable)
               << "  --chunk-size N                analysis chunk side in base voxels [256]\n"
               << "  --region-size N               selected staged bbox side\n"
               << "  --mode stats|staged           reduction mode [stats]\n"
-              << "  --stage N,OX,OY,OZ            repeatable stage side/XYZ offset\n"
+              << "  --stage N,OX,OY,OZ            repeatable global stage side/XYZ offset\n"
               << "  --join-angle N                regular strict maximum join angle\n"
               << "  --cost-profile PROFILE        stored or fixed sqrt uint16 [sqrt-u16]\n"
               << "  --max-states N                exact generated-state limit per entry [5000000]\n";
@@ -460,6 +457,8 @@ CliOptions parseArgs(int argc, char** argv)
             std::exit(2);
         }
         options.command = Command::FiberletReplay;
+        options.analysisEdgeCostView = vc::fiber_tracer::
+            FiberletChunkRouteEdgeCostView::SqrtUint16Max256;
         options.manifestLocation = argv[2];
         options.fiberJson = argv[3];
         options.outputDirectory = argv[4];
@@ -526,16 +525,19 @@ CliOptions parseArgs(int argc, char** argv)
             else
                 fail("--mode must be stats or staged");
         } else if (argument == "--stage" &&
-                   isChunkRouteStatsCommand(options.command)) {
+                   (isChunkRouteStatsCommand(options.command) ||
+                    isReplayCommand(options.command))) {
             options.analysisStages.push_back(parseChunkRouteStage(
                 valueAfter(index, argc, argv, "stage")));
         } else if (argument == "--join-angle" &&
-                   isChunkRouteStatsCommand(options.command)) {
+                   (isChunkRouteStatsCommand(options.command) ||
+                    isReplayCommand(options.command))) {
             options.analysisMaximumJoinAngleDegrees = static_cast<float>(
                 parseDouble(valueAfter(index, argc, argv, "join-angle"),
                             "join-angle"));
         } else if (argument == "--cost-profile" &&
-                   isChunkRouteStatsCommand(options.command)) {
+                   (isChunkRouteStatsCommand(options.command) ||
+                    isReplayCommand(options.command))) {
             const auto value = valueAfter(index, argc, argv, "cost-profile");
             if (value == "stored") {
                 options.analysisEdgeCostView =
@@ -547,7 +549,8 @@ CliOptions parseArgs(int argc, char** argv)
                 fail("--cost-profile must be stored or sqrt-u16");
             }
         } else if (argument == "--max-states" &&
-                   isChunkRouteStatsCommand(options.command)) {
+                   (isChunkRouteStatsCommand(options.command) ||
+                    isReplayCommand(options.command))) {
             const int value = parseInt(
                 valueAfter(index, argc, argv, "max-states"), "max-states");
             if (value <= 0)
@@ -760,6 +763,15 @@ CliOptions parseArgs(int argc, char** argv)
             fail("unknown option for selected command: " + argument);
         }
     }
+    for (auto& stage : options.analysisStages) {
+        if (stage.sideBaseVoxels <= 0)
+            fail("--stage side must be positive");
+        for (auto& offset : stage.offsetBaseXYZ) {
+            offset %= stage.sideBaseVoxels;
+            if (offset < 0)
+                offset += stage.sideBaseVoxels;
+        }
+    }
     if (options.baseVoxelSizeUm.has_value() && !(*options.baseVoxelSizeUm > 0.0))
         fail("--base-voxel-size-um must be positive");
     if (options.command != Command::Paths) {
@@ -803,23 +815,6 @@ CliOptions parseArgs(int argc, char** argv)
         if (options.analysisMode == ChunkRouteMode::Staged) {
             if (options.analysisStages.empty())
                 fail("staged chunk-route analysis requires --stage");
-            for (const auto& stage : options.analysisStages) {
-                if (stage.sideBaseVoxels <= 0)
-                    fail("--stage side must be positive");
-                if (std::any_of(
-                        stage.offsetBaseXYZ.begin(),
-                        stage.offsetBaseXYZ.end(),
-                        [](int value) { return value < 0; })) {
-                    fail("--stage offsets must be non-negative");
-                }
-                for (int axis = 0; axis < 3; ++axis) {
-                    if (stage.offsetBaseXYZ[axis] +
-                            stage.sideBaseVoxels >
-                        options.analysisRegionSizeBaseVoxels) {
-                        fail("--stage contains no complete box in the selected region");
-                    }
-                }
-            }
         } else if (!options.analysisStages.empty()) {
             fail("--stage requires --mode staged");
         }
@@ -881,6 +876,12 @@ CliOptions parseArgs(int argc, char** argv)
         }
         if (options.eagerGraphReplay && options.storageCompressionChunks > 0) {
             fail("--storage-compression-chunks requires the on-demand replay cache");
+        }
+        if (options.eagerGraphReplay && !options.analysisStages.empty())
+            fail("fiberlet replay filtering requires the on-demand replay cache");
+        if (!(options.analysisMaximumJoinAngleDegrees >= 0.0F) ||
+            !(options.analysisMaximumJoinAngleDegrees <= 180.0F)) {
+            fail("fiberlet replay filtering requires --join-angle in [0,180]");
         }
         if (!options.graphReplay.decisionDiagnosticReferenceArcWindowsBase.empty() && !options.printStats)
             fail("fiber-replay --decision-window requires --stats");
@@ -1405,27 +1406,44 @@ chunkRouteStageBoxes(
     const CliOptions& options,
     const ChunkRouteStageSpec& stage)
 {
-    const cv::Vec3d selectedMinimum{
-        static_cast<double>(options.analysisChunkMinimumBaseXYZ[0]),
-        static_cast<double>(options.analysisChunkMinimumBaseXYZ[1]),
-        static_cast<double>(options.analysisChunkMinimumBaseXYZ[2])};
-    const int regionSide = options.analysisRegionSizeBaseVoxels;
+    const std::int64_t side = stage.sideBaseVoxels;
+    const std::int64_t regionSide = options.analysisRegionSizeBaseVoxels;
+    const auto floorDiv = [](std::int64_t numerator,
+                             std::int64_t denominator) {
+        std::int64_t quotient = numerator / denominator;
+        const std::int64_t remainder = numerator % denominator;
+        if (remainder < 0)
+            --quotient;
+        return quotient;
+    };
+    const auto ceilDiv = [&](std::int64_t numerator,
+                             std::int64_t denominator) {
+        return -floorDiv(-numerator, denominator);
+    };
+    std::array<std::int64_t, 3> offset{};
+    std::array<std::int64_t, 3> begin{};
+    std::array<std::int64_t, 3> end{};
+    for (int xyz = 0; xyz < 3; ++xyz) {
+        offset[xyz] = stage.offsetBaseXYZ[xyz] % side;
+        if (offset[xyz] < 0)
+            offset[xyz] += side;
+        const std::int64_t minimum =
+            options.analysisChunkMinimumBaseXYZ[xyz];
+        const std::int64_t maximum = minimum + regionSide;
+        begin[xyz] = ceilDiv(minimum - offset[xyz], side);
+        end[xyz] = floorDiv(maximum - side - offset[xyz], side);
+    }
     std::vector<vc::fiber_tracer::FiberletChunkRouteAnalysisConfig> result;
-    for (int z = stage.offsetBaseXYZ[2];
-         z + stage.sideBaseVoxels <= regionSide;
-         z += stage.sideBaseVoxels) {
-        for (int y = stage.offsetBaseXYZ[1];
-             y + stage.sideBaseVoxels <= regionSide;
-             y += stage.sideBaseVoxels) {
-            for (int x = stage.offsetBaseXYZ[0];
-                 x + stage.sideBaseVoxels <= regionSide;
-                 x += stage.sideBaseVoxels) {
+    for (std::int64_t z = begin[2]; z <= end[2]; ++z) {
+        for (std::int64_t y = begin[1]; y <= end[1]; ++y) {
+            for (std::int64_t x = begin[0]; x <= end[0]; ++x) {
                 result.push_back(chunkRouteConfig(
                     options,
-                    selectedMinimum + cv::Vec3d{
-                        static_cast<double>(x), static_cast<double>(y),
-                        static_cast<double>(z)},
-                    static_cast<double>(stage.sideBaseVoxels)));
+                    cv::Vec3d{
+                        static_cast<double>(offset[0] + x * side),
+                        static_cast<double>(offset[1] + y * side),
+                        static_cast<double>(offset[2] + z * side)},
+                    static_cast<double>(side)));
             }
         }
     }
@@ -1511,6 +1529,48 @@ std::string fingerprintHex(const std::array<std::uint8_t, 32>& value)
     for (const auto byte : value)
         result << std::setw(2) << static_cast<unsigned>(byte);
     return result.str();
+}
+
+std::filesystem::path compatibleDefaultCacheRoot(
+    const std::filesystem::path& cacheBase,
+    std::string algorithmNamespace,
+    const std::filesystem::path& datasetLeaf,
+    const vc::fiber_tracer::FiberletDatasetMetadata& expected)
+{
+    std::replace(
+        algorithmNamespace.begin(), algorithmNamespace.end(), ':', '-');
+    const auto desired = cacheBase / algorithmNamespace / datasetLeaf;
+    if (std::filesystem::is_regular_file(desired / ".zattrs") ||
+        !std::filesystem::is_directory(cacheBase)) {
+        return desired;
+    }
+
+    std::vector<std::filesystem::path> candidates;
+    for (const auto& entry : std::filesystem::directory_iterator(cacheBase)) {
+        if (entry.is_directory())
+            candidates.push_back(entry.path() / datasetLeaf);
+    }
+    std::sort(candidates.begin(), candidates.end());
+    for (const auto& candidate : candidates) {
+        if (candidate == desired ||
+            !std::filesystem::is_regular_file(candidate / ".zattrs")) {
+            continue;
+        }
+        try {
+            const auto existing = vc::fiber_tracer::FiberletChunkDataset::
+                openExisting(candidate);
+            if (vc::fiber_tracer::fiberletDatasetMetadataCompatible(
+                    existing->metadata(), expected)) {
+                std::cerr << "Reusing compatible Fiberlet cache "
+                          << candidate << '\n';
+                return candidate;
+            }
+        } catch (const std::exception&) {
+            // An unrelated or damaged cache remains the responsibility of the
+            // command that explicitly selects it.
+        }
+    }
+    return desired;
 }
 
 double reductionPercent(std::size_t before, std::size_t after)
@@ -1640,6 +1700,128 @@ ChunkRouteStagePopulation collectChunkRouteStagePopulation(
     return result;
 }
 
+struct TransientFiberletLayer {
+    std::shared_ptr<vc::fiber_tracer::FiberletChunkDataset> anchors;
+    std::shared_ptr<vc::render::ChunkCache> anchorCache;
+    std::shared_ptr<vc::fiber_tracer::FiberletChunkDataset> fiberlets;
+    std::shared_ptr<vc::render::ChunkCache> fiberletCache;
+};
+
+TransientFiberletLayer createTransientEvaluatedAnchorLayer(
+    const std::filesystem::path& root,
+    const std::shared_ptr<vc::fiber_tracer::FiberletOnDemandPreprocessor>&
+        preprocessor,
+    const vc::fiber_tracer::FiberletChunkCacheOptions& cacheOptions)
+{
+    using namespace vc::fiber_tracer;
+    auto metadata = preprocessor->anchorDataset()->metadata();
+    metadata.processing["reduction_view"] = {
+        {"contract", "evaluated_anchor_view_v1"},
+        {"source_dataset_fingerprint",
+         fingerprintHex(metadata.datasetFingerprint)},
+    };
+    finalizeFiberletDatasetIdentity(metadata);
+    auto dataset = FiberletChunkDataset::createOrOpen(
+        root / "initial-anchor-view.zarr", metadata);
+    auto cache = createGeneratedFiberletChunkCache(
+        dataset,
+        [preprocessor](
+            FiberletStorageChunkKind kind,
+            const vc::render::ChunkKey& requested,
+            const FiberletStorageCodecConfig& codec) {
+            if (kind != FiberletStorageChunkKind::Anchors) {
+                throw std::invalid_argument(
+                    "evaluated anchor view received a path request");
+            }
+            const auto loaded = preprocessor->anchorCache()->getChunkBlocking(
+                requested.level, requested.iz, requested.iy, requested.ix);
+            const auto payload = std::dynamic_pointer_cast<
+                const FiberletAnchorChunkPayload>(loaded.payload);
+            if (loaded.status != vc::render::ChunkStatus::Data || !payload) {
+                throw std::runtime_error(
+                    "evaluated anchor view could not load its source chunk");
+            }
+            const auto evaluated = preprocessor->evaluationAnchorChunk(
+                requested, payload);
+            return FiberletChunkDataset::MaterializedChunk{
+                {},
+                std::make_shared<const FiberletAnchorChunkPayload>(
+                    FiberletDecodedAnchors{codec, *evaluated}),
+                true};
+        },
+        cacheOptions);
+    return {
+        std::move(dataset), std::move(cache), preprocessor->fiberletDataset(),
+        preprocessor->fiberletCache()};
+}
+
+template <typename BoxCompleted>
+TransientFiberletLayer applyTransientFiberletReductionStage(
+    const TransientFiberletLayer& previous,
+    const std::filesystem::path& stageRoot,
+    nlohmann::json reduction,
+    std::span<const vc::fiber_tracer::FiberletChunkRouteAnalysisConfig> boxes,
+    const vc::fiber_tracer::FiberletPathConfig& paths,
+    const vc::fiber_tracer::FiberletChunkCacheOptions& cacheOptions,
+    const std::shared_ptr<vc::fiber_tracer::FiberletChunkWriteBackCache>&
+        writeBack,
+    BoxCompleted&& boxCompleted)
+{
+    using namespace vc::fiber_tracer;
+    if (boxes.empty())
+        throw std::invalid_argument("transient Fiberlet stage is empty");
+    auto anchorMetadata = previous.anchors->metadata();
+    auto fiberletMetadata = previous.fiberlets->metadata();
+    anchorMetadata.processing["reduction"] = reduction;
+    anchorMetadata.processing["reduction"]["source_dataset_fingerprint"] =
+        fingerprintHex(previous.anchors->metadata().datasetFingerprint);
+    fiberletMetadata.processing["reduction"] = std::move(reduction);
+    fiberletMetadata.processing["reduction"]["source_dataset_fingerprint"] =
+        fingerprintHex(previous.fiberlets->metadata().datasetFingerprint);
+    finalizeFiberletDatasetIdentity(anchorMetadata);
+    finalizeFiberletDatasetIdentity(fiberletMetadata);
+    auto stageAnchors = FiberletChunkDataset::createOrOpen(
+        stageRoot / "anchors.zarr", anchorMetadata, writeBack);
+    auto stageFiberlets = FiberletChunkDataset::createOrOpen(
+        stageRoot / "fiberlets.zarr", fiberletMetadata, writeBack);
+
+    for (std::size_t boxIndex = 0; boxIndex < boxes.size(); ++boxIndex) {
+        auto stageAnchorCache = createOverlayFiberletAnchorChunkCache(
+            stageAnchors, previous.anchors, previous.anchorCache,
+            cacheOptions);
+        auto stageFiberletCache = createOverlayFiberletPathChunkCache(
+            stageFiberlets, previous.fiberlets, previous.fiberletCache,
+            cacheOptions);
+        FiberletChunkGraphSource graph(
+            stageAnchors, stageAnchorCache, stageFiberlets,
+            stageFiberletCache, paths);
+        const auto reduced = analyzeAndSimplifyFiberletChunkRoutes(
+            graph, boxes[boxIndex]);
+        const auto writeStarted = std::chrono::steady_clock::now();
+        const double writeCpuStarted = processCpuSeconds();
+        const auto written = writeFiberletReductionOverlayBox(
+            graph, stageAnchors, stageFiberlets, boxes[boxIndex],
+            reduced.analysis.physicalFiberletIds,
+            reduced.simplification.livePhysicalFiberletIds);
+        const double writeWallSeconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - writeStarted).count();
+        const double writeCpuSeconds = processCpuSeconds() - writeCpuStarted;
+        boxCompleted(
+            boxIndex, reduced, written, writeWallSeconds, writeCpuSeconds);
+        stageAnchorCache->cancelPendingAndWait();
+        stageFiberletCache->cancelPendingAndWait();
+    }
+    return {
+        stageAnchors,
+        createOverlayFiberletAnchorChunkCache(
+            stageAnchors, previous.anchors, previous.anchorCache,
+            cacheOptions),
+        stageFiberlets,
+        createOverlayFiberletPathChunkCache(
+            stageFiberlets, previous.fiberlets, previous.fiberletCache,
+            cacheOptions)};
+}
+
 int runStagedChunkRouteReduction(
     const CliOptions& options,
     const std::shared_ptr<vc::fiber_tracer::FiberletOnDemandPreprocessor>&
@@ -1675,52 +1857,9 @@ int runStagedChunkRouteReduction(
         {},
     });
 
-    auto viewMetadata = preprocessor->anchorDataset()->metadata();
-    viewMetadata.processing["reduction_view"] = {
-        {"contract", "evaluated_anchor_view_v1"},
-        {"source_dataset_fingerprint",
-         fingerprintHex(viewMetadata.datasetFingerprint)},
-    };
-    finalizeFiberletDatasetIdentity(viewMetadata);
-    auto viewDataset = FiberletChunkDataset::createOrOpen(
-        temporary.root / "initial-anchor-view.zarr", viewMetadata);
-    auto viewCache = createGeneratedFiberletChunkCache(
-        viewDataset,
-        [preprocessor](
-            FiberletStorageChunkKind kind,
-            const vc::render::ChunkKey& requested,
-            const FiberletStorageCodecConfig& codec) {
-            if (kind != FiberletStorageChunkKind::Anchors)
-                throw std::invalid_argument(
-                    "evaluated anchor view received a path request");
-            const auto loaded = preprocessor->anchorCache()->getChunkBlocking(
-                requested.level, requested.iz, requested.iy, requested.ix);
-            const auto payload = std::dynamic_pointer_cast<
-                const FiberletAnchorChunkPayload>(loaded.payload);
-            if (loaded.status != vc::render::ChunkStatus::Data || !payload) {
-                throw std::runtime_error(
-                    "evaluated anchor view could not load its source chunk");
-            }
-            const auto evaluated = preprocessor->evaluationAnchorChunk(
-                requested, payload);
-            FiberletDecodedAnchors decoded{codec, *evaluated};
-            return FiberletChunkDataset::MaterializedChunk{
-                {},
-                std::make_shared<const FiberletAnchorChunkPayload>(
-                    std::move(decoded)),
-                true};
-        },
-        cacheOptions);
-
-    struct Layer {
-        std::shared_ptr<FiberletChunkDataset> anchors;
-        std::shared_ptr<vc::render::ChunkCache> anchorCache;
-        std::shared_ptr<FiberletChunkDataset> fiberlets;
-        std::shared_ptr<vc::render::ChunkCache> fiberletCache;
-    };
-    Layer current{
-        viewDataset, viewCache, preprocessor->fiberletDataset(),
-        preprocessor->fiberletCache()};
+    auto current = createTransientEvaluatedAnchorLayer(
+        temporary.root, preprocessor, cacheOptions);
+    auto viewCache = current.anchorCache;
     const cv::Vec3d selectedMinimum{
         static_cast<double>(options.analysisChunkMinimumBaseXYZ[0]),
         static_cast<double>(options.analysisChunkMinimumBaseXYZ[1]),
@@ -1773,9 +1912,7 @@ int runStagedChunkRouteReduction(
             std::chrono::steady_clock::now() - populationWallStarted).count();
         activity.population.cpuSeconds +=
             processCpuSeconds() - populationCpuStarted;
-        auto anchorMetadata = current.anchors->metadata();
-        auto fiberletMetadata = current.fiberlets->metadata();
-        const auto reduction = nlohmann::json{
+        auto reduction = nlohmann::json{
             {"contract", "monotone_sparse_box_overlay_v1"},
             {"stage_index", stageIndex},
             {"side_base_voxels", specification.sideBaseVoxels},
@@ -1794,37 +1931,17 @@ int runStagedChunkRouteReduction(
             {"maximum_generated_states_per_entry",
              options.analysisMaximumStatesPerEntry},
         };
-        anchorMetadata.processing["reduction"] = reduction;
-        anchorMetadata.processing["reduction"]["source_dataset_fingerprint"] =
-            fingerprintHex(current.anchors->metadata().datasetFingerprint);
-        fiberletMetadata.processing["reduction"] = reduction;
-        fiberletMetadata.processing["reduction"]
-            ["source_dataset_fingerprint"] = fingerprintHex(
-                current.fiberlets->metadata().datasetFingerprint);
-        finalizeFiberletDatasetIdentity(anchorMetadata);
-        finalizeFiberletDatasetIdentity(fiberletMetadata);
         const auto stageRoot = temporary.root /
             ("stage-" + std::to_string(stageIndex + 1));
-        auto stageAnchors = FiberletChunkDataset::createOrOpen(
-            stageRoot / "anchors.zarr", anchorMetadata, writeBack);
-        auto stageFiberlets = FiberletChunkDataset::createOrOpen(
-            stageRoot / "fiberlets.zarr", fiberletMetadata, writeBack);
         const auto started = std::chrono::steady_clock::now();
         std::vector<FiberletChunkRouteSimplificationReport>
             simplifications;
-        for (std::size_t boxIndex = 0; boxIndex < boxes.size(); ++boxIndex) {
-            auto stageAnchorCache = createOverlayFiberletAnchorChunkCache(
-                stageAnchors, current.anchors, current.anchorCache,
-                cacheOptions);
-            auto stageFiberletCache = createOverlayFiberletPathChunkCache(
-                stageFiberlets, current.fiberlets, current.fiberletCache,
-                cacheOptions);
-            {
-                FiberletChunkGraphSource graph(
-                    stageAnchors, stageAnchorCache, stageFiberlets,
-                    stageFiberletCache, options.paths);
-                const auto reduced = analyzeAndSimplifyFiberletChunkRoutes(
-                    graph, boxes[boxIndex]);
+        current = applyTransientFiberletReductionStage(
+            current, stageRoot, std::move(reduction), boxes, options.paths,
+            cacheOptions, writeBack,
+            [&](std::size_t boxIndex, const auto& reduced,
+                const auto& written, double writeWallSeconds,
+                double writeCpuSeconds) {
                 const auto& analyzed = reduced.analysis;
                 const auto& simplified = reduced.simplification;
                 activity.materialization.wallSeconds +=
@@ -1837,40 +1954,20 @@ int runStagedChunkRouteReduction(
                     reduced.simplificationSeconds;
                 activity.simplification.cpuSeconds +=
                     reduced.simplificationCpuSeconds;
-                const auto writeWallStarted =
-                    std::chrono::steady_clock::now();
-                const double writeCpuStarted = processCpuSeconds();
-                const auto written = writeFiberletReductionOverlayBox(
-                    graph, stageAnchors, stageFiberlets, boxes[boxIndex],
-                    analyzed.physicalFiberletIds,
-                    simplified.livePhysicalFiberletIds);
-                activity.write.wallSeconds += std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - writeWallStarted).count();
-                activity.write.cpuSeconds +=
-                    processCpuSeconds() - writeCpuStarted;
+                activity.write.wallSeconds += writeWallSeconds;
+                activity.write.cpuSeconds += writeCpuSeconds;
                 activity.anchorChunkWrites += written.touchedAnchorChunks;
                 activity.fiberletChunkWrites +=
                     written.touchedFiberletChunks;
                 if (options.printStats)
                     simplifications.push_back(simplified);
-            }
-            stageAnchorCache->cancelPendingAndWait();
-            stageFiberletCache->cancelPendingAndWait();
-            printRateProgress(
-                "fiberlet staged reduction",
-                "stage" + std::to_string(stageIndex + 1),
-                "boxes_per_second", boxIndex + 1, boxes.size(),
-                std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - started).count());
-        }
-        auto finalAnchorCache = createOverlayFiberletAnchorChunkCache(
-            stageAnchors, current.anchors, current.anchorCache, cacheOptions);
-        auto finalFiberletCache = createOverlayFiberletPathChunkCache(
-            stageFiberlets, current.fiberlets, current.fiberletCache,
-            cacheOptions);
-        current = {
-            stageAnchors, finalAnchorCache, stageFiberlets,
-            finalFiberletCache};
+                printRateProgress(
+                    "fiberlet staged reduction",
+                    "stage" + std::to_string(stageIndex + 1),
+                    "boxes_per_second", boxIndex + 1, boxes.size(),
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - started).count());
+            });
         FiberletChunkGraphSource stageGraph(
             current.anchors, current.anchorCache, current.fiberlets,
             current.fiberletCache, options.paths);
@@ -2008,6 +2105,189 @@ int runStagedChunkRouteReduction(
     return 0;
 }
 
+bool pointInsideFilterSupport(
+    const vc::fiber_tracer::FiberletFilterPlan& plan,
+    const cv::Vec3d& pointBaseXYZ)
+{
+    return std::any_of(
+        plan.sourceSupportBoxes.begin(), plan.sourceSupportBoxes.end(),
+        [&](const auto& box) {
+            for (int axis = 0; axis < 3; ++axis) {
+                if (pointBaseXYZ[axis] < box.minimumBaseXYZ[axis] ||
+                    pointBaseXYZ[axis] >= box.maximumBaseXYZ[axis]) {
+                    return false;
+                }
+            }
+            return true;
+        });
+}
+
+bool cellIntersectsFilterSupport(
+    const vc::fiber_tracer::FiberletFilterPlan& plan,
+    const std::array<std::size_t, 3>& cellZYX,
+    double cellSideBaseVoxels)
+{
+    cv::Vec3d minimum;
+    cv::Vec3d maximum;
+    for (int xyz = 0; xyz < 3; ++xyz) {
+        const std::size_t zyx = static_cast<std::size_t>(2 - xyz);
+        minimum[xyz] = static_cast<double>(cellZYX[zyx]) * cellSideBaseVoxels;
+        maximum[xyz] = minimum[xyz] + cellSideBaseVoxels;
+    }
+    return std::any_of(
+        plan.sourceSupportBoxes.begin(), plan.sourceSupportBoxes.end(),
+        [&](const auto& box) {
+            for (int axis = 0; axis < 3; ++axis) {
+                if (maximum[axis] <= box.minimumBaseXYZ[axis] ||
+                    minimum[axis] >= box.maximumBaseXYZ[axis]) {
+                    return false;
+                }
+            }
+            return true;
+        });
+}
+
+std::vector<vc::fiber_tracer::FiberletScheduledChunk>
+filterSourceChunkSchedule(
+    const vc::fiber_tracer::FiberletFilterPlan& plan,
+    const vc::fiber_tracer::FiberletDatasetMetadata& metadata,
+    const vc::fiber_tracer::PolylineArcGeometry& reference,
+    double beginArcBase,
+    double endArcBase)
+{
+    std::set<std::array<int, 4>> unique;
+    for (const auto& stage : plan.stageBoxes) {
+        for (const auto& box : stage) {
+            for (const auto& key :
+                 vc::fiber_tracer::fiberletChunkRoutePrefetchChunks(
+                     metadata, box)) {
+                unique.insert({key.level, key.iz, key.iy, key.ix});
+            }
+        }
+    }
+    std::vector<vc::fiber_tracer::FiberletScheduledChunk> result;
+    result.reserve(unique.size());
+    for (const auto& id : unique) {
+        const vc::render::ChunkKey key{id[0], id[1], id[2], id[3]};
+        const cv::Vec3d center = chunkRouteOwnerMinimumExact(metadata, key) +
+            cv::Vec3d{1.0, 1.0, 1.0} *
+                (0.5 * static_cast<double>(
+                           metadata.spatialChunkSideBaseVoxels));
+        const auto projection = vc::fiber_tracer::projectPointToPolylineArc(
+            reference, center, beginArcBase, endArcBase);
+        result.push_back(
+            {key, projection.arc, projection.distance});
+    }
+    std::sort(result.begin(), result.end(), [](const auto& left, const auto& right) {
+        return std::tuple{
+                   left.nearestReferenceArcBase,
+                   left.nearestReferenceDistanceBase,
+                   left.key.level, left.key.iz, left.key.iy, left.key.ix} <
+            std::tuple{
+                   right.nearestReferenceArcBase,
+                   right.nearestReferenceDistanceBase,
+                   right.key.level, right.key.iz, right.key.iy,
+                   right.key.ix};
+    });
+    return result;
+}
+
+struct TransientReplayFilter final {
+    std::filesystem::path root;
+    std::shared_ptr<vc::fiber_tracer::FiberletChunkWriteBackCache> writeBack;
+    std::vector<TransientFiberletLayer> layers;
+
+    ~TransientReplayFilter()
+    {
+        for (auto iterator = layers.rbegin(); iterator != layers.rend(); ++iterator) {
+            if (iterator->anchorCache)
+                iterator->anchorCache->cancelPendingAndWait();
+            if (iterator->fiberletCache)
+                iterator->fiberletCache->cancelPendingAndWait();
+        }
+        if (writeBack) {
+            try {
+                writeBack->finish();
+            } catch (...) {
+            }
+        }
+        std::error_code error;
+        std::filesystem::remove_all(root, error);
+    }
+
+    [[nodiscard]] const TransientFiberletLayer& finalLayer() const
+    {
+        if (layers.empty())
+            throw std::logic_error("transient replay filter has no layers");
+        return layers.back();
+    }
+};
+
+std::shared_ptr<TransientReplayFilter> buildTransientReplayFilter(
+    const CliOptions& options,
+    const vc::fiber_tracer::FiberletFilterPlan& plan,
+    const std::shared_ptr<vc::fiber_tracer::FiberletOnDemandPreprocessor>&
+        preprocessor,
+    const vc::fiber_tracer::FiberletChunkCacheOptions& cacheOptions)
+{
+    using namespace vc::fiber_tracer;
+    if (!preprocessor || plan.stageBoxes.size() != options.analysisStages.size() ||
+        plan.stageBoxes.empty()) {
+        throw std::invalid_argument("transient replay filter plan is invalid");
+    }
+
+    auto result = std::make_shared<TransientReplayFilter>();
+    std::filesystem::create_directories(options.outputDirectory);
+    std::mt19937_64 random(std::random_device{}());
+    do {
+        result->root = options.outputDirectory /
+            (".fiberlet-replay-filter-" + std::to_string(random()));
+    } while (std::filesystem::exists(result->root));
+    std::filesystem::create_directories(result->root);
+
+    const auto decodedBudget = cacheOptions.service.decodedByteBudget;
+    const std::size_t writeBackBytes = decodedBudget
+        ? decodedBudget->maximumBytes()
+        : cacheOptions.service.decodedByteCapacity;
+    result->writeBack = FiberletChunkWriteBackCache::create({
+        writeBackBytes, 1, decodedBudget, {}});
+
+    result->layers.push_back(createTransientEvaluatedAnchorLayer(
+        result->root, preprocessor, cacheOptions));
+
+    for (std::size_t stageIndex = 0; stageIndex < plan.stageBoxes.size();
+         ++stageIndex) {
+        const auto& boxes = plan.stageBoxes[stageIndex];
+        if (boxes.empty())
+            throw std::invalid_argument("transient replay filter stage is empty");
+        const auto& previous = result->layers.back();
+        auto reduction = nlohmann::json{
+            {"contract", "global_transient_replay_filter_v1"},
+            {"stage_index", stageIndex},
+            {"side_base_voxels",
+             options.analysisStages[stageIndex].sideBaseVoxels},
+            {"offset_base_xyz",
+             options.analysisStages[stageIndex].offsetBaseXYZ},
+            {"maximum_join_angle_degrees",
+             options.analysisMaximumJoinAngleDegrees},
+            {"edge_cost_view",
+             *options.analysisEdgeCostView ==
+                     FiberletChunkRouteEdgeCostView::Stored
+                 ? "stored"
+                 : "sqrt_u16_max256"},
+            {"maximum_generated_states_per_entry",
+             options.analysisMaximumStatesPerEntry},
+        };
+        const auto stageRoot = result->root /
+            ("stage-" + std::to_string(stageIndex + 1));
+        result->layers.push_back(applyTransientFiberletReductionStage(
+            previous, stageRoot, std::move(reduction), boxes, options.paths,
+            cacheOptions, result->writeBack,
+            [](std::size_t, const auto&, const auto&, double, double) {}));
+    }
+    return result;
+}
+
 int runChunkRouteStats(
     CliOptions& options,
     const vc::lasagna::LasagnaDataset& fiberDataset,
@@ -2074,16 +2354,16 @@ int runChunkRouteStats(
             fail("selected chunk-route region lies outside the dataset grid");
         }
     }
-    auto anchorNamespace = anchorMetadata.algorithmFingerprint;
-    auto fiberletNamespace = fiberletMetadata.algorithmFingerprint;
-    std::replace(anchorNamespace.begin(), anchorNamespace.end(), ':', '-');
-    std::replace(fiberletNamespace.begin(), fiberletNamespace.end(), ':', '-');
     const auto cacheBase = options.outputDirectory / "cache";
     const auto anchorRoot = options.anchorCacheRoot.empty()
-        ? cacheBase / anchorNamespace / "anchors.zarr"
+        ? compatibleDefaultCacheRoot(
+              cacheBase, anchorMetadata.algorithmFingerprint,
+              "anchors.zarr", anchorMetadata)
         : options.anchorCacheRoot;
     const auto fiberletRoot = options.fiberletCacheRoot.empty()
-        ? cacheBase / fiberletNamespace / "fiberlets.zarr"
+        ? compatibleDefaultCacheRoot(
+              cacheBase, fiberletMetadata.algorithmFingerprint,
+              "fiberlets.zarr", fiberletMetadata)
         : options.fiberletCacheRoot;
     const auto evaluationAnchorBytes =
         std::max<std::size_t>(1, options.decodedCacheBytes / 8);
@@ -4658,13 +4938,6 @@ CachedReplayContext createCachedReplayContext(
         processingTube.referenceIntervalBase,
         processingTube.radiusBaseVoxels,
         cacheProfile);
-    auto anchorNamespace = anchorMetadata.algorithmFingerprint;
-    auto fiberletNamespace = fiberletMetadata.algorithmFingerprint;
-    std::replace(anchorNamespace.begin(), anchorNamespace.end(), ':', '-');
-    std::replace(fiberletNamespace.begin(), fiberletNamespace.end(), ':', '-');
-    const auto anchorCacheRoot = cacheBaseRoot / anchorNamespace;
-    const auto fiberletCacheRoot = cacheBaseRoot / fiberletNamespace;
-
     const auto evaluationAnchorCacheBytes = std::max<std::size_t>(1, options.decodedCacheBytes / 8);
     const auto decodedChunkCacheBytes = options.decodedCacheBytes > evaluationAnchorCacheBytes ? options.decodedCacheBytes - evaluationAnchorCacheBytes
                                                                                                : options.decodedCacheBytes;
@@ -4676,8 +4949,16 @@ CachedReplayContext createCachedReplayContext(
     cacheOptions.service.fetchConcurrency.maxConcurrentReads = 1;
 
     CachedReplayContext result;
-    result.anchorRoot = anchorRootOverride.empty() ? anchorCacheRoot / "anchors.zarr" : anchorRootOverride;
-    result.fiberletRoot = fiberletRootOverride.empty() ? fiberletCacheRoot / "fiberlets.zarr" : fiberletRootOverride;
+    result.anchorRoot = anchorRootOverride.empty()
+        ? compatibleDefaultCacheRoot(
+              cacheBaseRoot, anchorMetadata.algorithmFingerprint,
+              "anchors.zarr", anchorMetadata)
+        : anchorRootOverride;
+    result.fiberletRoot = fiberletRootOverride.empty()
+        ? compatibleDefaultCacheRoot(
+              cacheBaseRoot, fiberletMetadata.algorithmFingerprint,
+              "fiberlets.zarr", fiberletMetadata)
+        : fiberletRootOverride;
     result.preprocessingProgress = std::make_shared<ReplayPreprocessingProgress>();
     vc::fiber_tracer::FiberletOnDemandConfig onDemand;
     onDemand.anchorRoot = result.anchorRoot;
@@ -5179,6 +5460,7 @@ int main(int argc, char** argv)
             std::vector<vc::fiber_tracer::FiberletScheduledChunk> chunkSchedule;
             std::unique_ptr<vc::fiber_tracer::FiberletCachedReplayGraphSource>
                 cachedGraph;
+            std::shared_ptr<TransientReplayFilter> replayFilter;
             struct ReplayChunkProgressLocation {
                 std::size_t scheduleIndex = 0;
                 double referenceArcBase = 0.0;
@@ -5246,17 +5528,68 @@ int main(int argc, char** argv)
                     processingTube.referenceIntervalBase,
                     processingTube.radiusBaseVoxels,
                     fiberletCacheProfile);
-                auto anchorNamespace = anchorMetadata.algorithmFingerprint;
-                auto fiberletNamespace = fiberletMetadata.algorithmFingerprint;
-                std::replace(anchorNamespace.begin(), anchorNamespace.end(), ':', '-');
-                std::replace(fiberletNamespace.begin(), fiberletNamespace.end(), ':', '-');
+                std::optional<vc::fiber_tracer::FiberletFilterPlan> filterPlan;
+                if (!options.analysisStages.empty()) {
+                    const double cellSideBase =
+                        static_cast<double>(anchorMetadata.spatialChunkSideBaseVoxels) /
+                        static_cast<double>(anchorMetadata.coordinateUnitsPerChunkZYX[0]);
+                    cv::Vec3d maximumEndpointReachBaseXYZ;
+                    cv::Vec3d volumeMaximumBaseXYZ;
+                    for (int xyz = 0; xyz < 3; ++xyz) {
+                        const int zyx = 2 - xyz;
+                        maximumEndpointReachBaseXYZ[xyz] =
+                            static_cast<double>(anchorMetadata.maximumEndpointReachCoordinateUnitsZYX[zyx]) *
+                            cellSideBase;
+                        volumeMaximumBaseXYZ[xyz] =
+                            static_cast<double>(grid.shapeZYX[zyx]) *
+                            grid.predictionToBaseScale;
+                    }
+                    vc::fiber_tracer::FiberletChunkRouteAnalysisConfig
+                        analysisTemplate;
+                    analysisTemplate.maximumJoinAngleDegrees =
+                        options.analysisMaximumJoinAngleDegrees;
+                    analysisTemplate.edgeCostView =
+                        *options.analysisEdgeCostView;
+                    analysisTemplate.parallelThreads = static_cast<std::size_t>(
+                        std::max(1, options.paths.parallelThreads));
+                    analysisTemplate.maximumGeneratedStatesPerEntry =
+                        options.analysisMaximumStatesPerEntry;
+                    filterPlan = vc::fiber_tracer::planFiberletFilterStages(
+                        options.analysisStages,
+                        processingTube.referenceIntervalBase,
+                        processingTube.radiusBaseVoxels,
+                        volumeMaximumBaseXYZ,
+                        maximumEndpointReachBaseXYZ,
+                        analysisTemplate);
+                    nlohmann::json stages = nlohmann::json::array();
+                    for (const auto& stage : options.analysisStages) {
+                        stages.push_back({
+                            {"side_base_voxels", stage.sideBaseVoxels},
+                            {"offset_base_xyz", stage.offsetBaseXYZ},
+                        });
+                    }
+                    const auto updateSelection = [&](auto& metadata) {
+                        metadata.processing["selection"]["algorithm"] =
+                            "global_filter_support_v1";
+                        metadata.processing["selection"]["filter_stages"] =
+                            stages;
+                        metadata.processing["selection"]
+                            ["endpoint_reach_closed"] = true;
+                        finalizeFiberletDatasetIdentity(metadata);
+                    };
+                    updateSelection(anchorMetadata);
+                    updateSelection(fiberletMetadata);
+                }
+                const auto cacheBase = options.outputDirectory / "cache";
                 const auto anchorRoot = options.anchorCacheRoot.empty()
-                    ? options.outputDirectory / "cache" / anchorNamespace /
-                        "anchors.zarr"
+                    ? compatibleDefaultCacheRoot(
+                          cacheBase, anchorMetadata.algorithmFingerprint,
+                          "anchors.zarr", anchorMetadata)
                     : options.anchorCacheRoot;
                 const auto fiberletRoot = options.fiberletCacheRoot.empty()
-                    ? options.outputDirectory / "cache" / fiberletNamespace /
-                        "fiberlets.zarr"
+                    ? compatibleDefaultCacheRoot(
+                          cacheBase, fiberletMetadata.algorithmFingerprint,
+                          "fiberlets.zarr", fiberletMetadata)
                     : options.fiberletCacheRoot;
                 auto graphBudget = std::make_shared<vc::render::DecodedChunkCacheBudget>(options.decodedCacheBytes);
                 vc::fiber_tracer::FiberletChunkCacheOptions anchorCacheOptions;
@@ -5278,18 +5611,46 @@ int main(int argc, char** argv)
                     field.sampleStoredGridBatch(indices, threads, samples);
                 };
                 onDemand.normalSampler = canonicalNormalSampler;
-                onDemand.anchorCellPredicate =
-                    [containmentQuery, grid, cellSize = options.anchors.cellSizePredictionVoxels](const std::array<size_t, 3>& cell) {
-                        return containmentQuery.intersectsPredictionCell(cell, grid, cellSize);
+                if (filterPlan.has_value()) {
+                    const auto sharedPlan =
+                        std::make_shared<const vc::fiber_tracer::FiberletFilterPlan>(
+                            *filterPlan);
+                    const double cellSideBase =
+                        static_cast<double>(options.anchors.cellSizePredictionVoxels) *
+                        grid.predictionToBaseScale;
+                    onDemand.anchorCellPredicate =
+                        [sharedPlan, cellSideBase](const std::array<size_t, 3>& cell) {
+                            return cellIntersectsFilterSupport(
+                                *sharedPlan, cell, cellSideBase);
+                        };
+                    onDemand.anchorRetainPredicate =
+                        [sharedPlan, scale = grid.predictionToBaseScale](
+                            const vc::fiber_tracer::FiberAnchor& anchor) {
+                            return vc::fiber_tracer::FiberAnchorRetainEvaluation{
+                                .retained = pointInsideFilterSupport(
+                                    *sharedPlan,
+                                    cv::Vec3d(anchor.positionPredictionXYZ) * scale)};
+                        };
+                    onDemand.pointPredicate =
+                        [sharedPlan, scale = grid.predictionToBaseScale](
+                            const cv::Vec3d& pointPrediction) {
+                            return pointInsideFilterSupport(
+                                *sharedPlan, pointPrediction * scale);
+                        };
+                } else {
+                    onDemand.anchorCellPredicate =
+                        [containmentQuery, grid, cellSize = options.anchors.cellSizePredictionVoxels](const std::array<size_t, 3>& cell) {
+                            return containmentQuery.intersectsPredictionCell(cell, grid, cellSize);
+                        };
+                    onDemand.anchorRetainPredicate = [containmentQuery](const vc::fiber_tracer::FiberAnchor& anchor) {
+                        return containmentQuery.evaluatePredictionAnchor(anchor);
                     };
-                onDemand.anchorRetainPredicate = [containmentQuery](const vc::fiber_tracer::FiberAnchor& anchor) {
-                    return containmentQuery.evaluatePredictionAnchor(anchor);
-                };
-                onDemand.pointPredicate = [containmentQuery](const cv::Vec3d& pointPrediction) {
-                    return containmentQuery.containsPredictionPoint(pointPrediction);
-                };
-                onDemand.anchorCacheOptions = std::move(anchorCacheOptions);
-                onDemand.fiberletCacheOptions = std::move(fiberletCacheOptions);
+                    onDemand.pointPredicate = [containmentQuery](const cv::Vec3d& pointPrediction) {
+                        return containmentQuery.containsPredictionPoint(pointPrediction);
+                    };
+                }
+                onDemand.anchorCacheOptions = anchorCacheOptions;
+                onDemand.fiberletCacheOptions = fiberletCacheOptions;
                 onDemand.chunkResolved =
                     [preprocessingProgress](vc::fiber_tracer::FiberletStorageChunkKind kind, const vc::render::ChunkKey& key, vc::render::ChunkFetchStatus status) {
                         preprocessingProgress->resolve(kind, key, status);
@@ -5338,9 +5699,13 @@ int main(int argc, char** argv)
                 preprocessor =
                     vc::fiber_tracer::FiberletOnDemandPreprocessor::create(
                         std::move(onDemand));
-                chunkSchedule = preprocessor->referenceChunkSchedule(
-                    reference, startArc, endArc,
-                    options.radiusBaseVoxels);
+                chunkSchedule = filterPlan.has_value()
+                    ? filterSourceChunkSchedule(
+                          *filterPlan, fiberletMetadata, reference, startArc,
+                          endArc)
+                    : preprocessor->referenceChunkSchedule(
+                          reference, startArc, endArc,
+                          options.radiusBaseVoxels);
                 for (std::size_t index = 0; index < chunkSchedule.size(); ++index) {
                     const auto& scheduled = chunkSchedule[index];
                     const ReplayChunkId fiberletId{scheduled.key.level, scheduled.key.iz, scheduled.key.iy, scheduled.key.ix};
@@ -5366,11 +5731,32 @@ int main(int argc, char** argv)
                 }
                 preprocessingProgress->configure(std::move(expectedAnchors), std::move(expectedPrefixes));
                 overallProgress.attachPreprocessing(preprocessingProgress);
-                cachedGraph = std::make_unique<
-                    vc::fiber_tracer::FiberletCachedReplayGraphSource>(
-                    preprocessor, options.paths,
-                    fiberletEvaluationQuantization);
-                preprocessor->prefetchScheduled(chunkSchedule, 0, chunkSchedule.size(), false);
+                preprocessor->prefetchScheduled(
+                    chunkSchedule, 0, chunkSchedule.size(),
+                    filterPlan.has_value());
+                if (filterPlan.has_value()) {
+                    replayFilter = buildTransientReplayFilter(
+                        options, *filterPlan, preprocessor,
+                        fiberletCacheOptions);
+                    const auto& final = replayFilter->finalLayer();
+                    vc::fiber_tracer::FiberletAnchorCellPredicate
+                        traversalPredicate =
+                            [containmentQuery, grid, cellSize = options.anchors.cellSizePredictionVoxels](const std::array<size_t, 3>& cell) {
+                                return containmentQuery.intersectsPredictionCell(
+                                    cell, grid, cellSize);
+                            };
+                    cachedGraph = std::make_unique<
+                        vc::fiber_tracer::FiberletCachedReplayGraphSource>(
+                        preprocessor, final.anchors, final.anchorCache,
+                        final.fiberlets, final.fiberletCache,
+                        std::move(traversalPredicate), options.paths,
+                        fiberletEvaluationQuantization);
+                } else {
+                    cachedGraph = std::make_unique<
+                        vc::fiber_tracer::FiberletCachedReplayGraphSource>(
+                        preprocessor, options.paths,
+                        fiberletEvaluationQuantization);
+                }
                 if (options.printStats)
                     std::cerr << "fiber_replay_stage stage=cache_open status=completed\n";
             }
@@ -5631,6 +6017,30 @@ int main(int argc, char** argv)
                  fiberletEvaluationQuantization.storageChunkSideBaseVoxels},
                 {"persistent_payload_profile", "float32_cache"},
             };
+            if (!options.analysisStages.empty()) {
+                nlohmann::json stages = nlohmann::json::array();
+                for (const auto& stage : options.analysisStages) {
+                    stages.push_back({
+                        {"side_base_voxels", stage.sideBaseVoxels},
+                        {"offset_base_xyz", stage.offsetBaseXYZ},
+                    });
+                }
+                bundle.fiberletEvaluationProfile["transient_filter"] = {
+                    {"contract", "global_transient_replay_filter_v1"},
+                    {"stages", std::move(stages)},
+                    {"maximum_join_angle_degrees",
+                     options.analysisMaximumJoinAngleDegrees},
+                    {"edge_cost_view",
+                     *options.analysisEdgeCostView ==
+                             vc::fiber_tracer::
+                                 FiberletChunkRouteEdgeCostView::Stored
+                         ? "stored"
+                         : "sqrt_u16_max256"},
+                    {"maximum_generated_states_per_entry",
+                     options.analysisMaximumStatesPerEntry},
+                    {"persistent", false},
+                };
+            }
             bundle.requestedTraceConfig = vc::fiber_tracer::cli::traceConfigJson(requestedTrace);
             bundle.effectiveTraceConfig = vc::fiber_tracer::cli::traceConfigJson(effectiveTrace);
 

@@ -1,15 +1,12 @@
-# Status: fix large staged Fiberlet cache preparation
+# Status: apply staged Fiberlet filtering before replay
 
-- [x] Reproduce the 1024-region failure
-- [x] Write focused task and implementation plan
-- [x] Complete independent plan review
-- [x] Identify the precise failed status and incompatible cache producer
-- [x] Compare stale and fresh anchor/Fiberlet artifacts
-- [x] Implement the minimal correctness fix
-- [x] Add regression coverage
-- [x] Run GCC Release and Clang Debug unit validation
-- [x] Complete GCC-to-Clang persisted-cache validation
-- [x] Run 1024-region cold/hot end-to-end validation
-- [x] Recheck 512-region output and performance
-- [x] Update specifications, docs, and changelog
-- [x] Finalize task log and diff review
+- [x] Read the staged reduction and cached replay implementations
+- [x] Resolve global anchoring and transient-cache semantics with the user
+- [x] Write the task and implementation plan
+- [x] Review the plan against current Fiberlet specifications and APIs
+- [x] Implement reusable global stage coverage planning
+- [x] Implement transient staged overlay materialization
+- [x] Integrate filter arguments and expanded cache preparation into replay
+- [x] Add focused regression tests
+- [x] Update specifications, docs, changelog, and task log
+- [x] Build and run focused validation

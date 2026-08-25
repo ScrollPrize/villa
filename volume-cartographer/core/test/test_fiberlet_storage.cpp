@@ -770,10 +770,11 @@ TEST_CASE("Fiberlet generation contract changes invalidate persisted chunks")
         otherToolchain.processing["producer_toolchain"]["compiler_id"] =
             "Clang";
         finalizeFiberletDatasetIdentity(otherToolchain);
-        CHECK(otherToolchain.algorithmFingerprint !=
+        CHECK(otherToolchain.algorithmFingerprint ==
               current.algorithmFingerprint);
-        CHECK(otherToolchain.datasetFingerprint !=
+        CHECK(otherToolchain.datasetFingerprint ==
               current.datasetFingerprint);
+        CHECK(fiberletDatasetMetadataCompatible(current, otherToolchain));
     }
 
     const auto root = std::filesystem::temp_directory_path() /
@@ -802,6 +803,44 @@ TEST_CASE("Fiberlet generation contract changes invalidate persisted chunks")
     CHECK(std::filesystem::exists(marker));
     CHECK(FiberletChunkDataset::openExisting(root)->metadata()
               .algorithmFingerprint == previous.algorithmFingerprint);
+    std::filesystem::remove_all(root);
+}
+
+TEST_CASE("Fiberlet caches are compatible across producer toolchains")
+{
+    FiberletDatasetMetadata first;
+    first.kind = FiberletDatasetKind::Anchors;
+    first.profile = FiberletStorageProfile::Float32Cache;
+    first.chunkGridShapeZYX = {1, 1, 1};
+    first.coordinateUnitsPerChunkZYX = {4, 4, 4};
+    first.maximumEndpointReachCoordinateUnitsZYX = {4, 4, 4};
+    first.processing = {
+        {"contract_version", kFiberletGenerationContractVersion},
+        {"producer_toolchain", {
+            {"compiler_id", "GNU"},
+            {"compiler_version", "16.0"},
+            {"build_config", "QuickBuild"},
+        }},
+    };
+    finalizeFiberletDatasetIdentity(first);
+
+    auto second = first;
+    second.processing["producer_toolchain"] = {
+        {"compiler_id", "Clang"},
+        {"compiler_version", "22.0"},
+        {"build_config", "Release"},
+    };
+    finalizeFiberletDatasetIdentity(second);
+    REQUIRE(fiberletDatasetMetadataCompatible(first, second));
+
+    const auto root = std::filesystem::temp_directory_path() /
+        ("vc_fiberlet_toolchain_" +
+         std::to_string(std::mt19937_64{std::random_device{}()}()));
+    auto created = FiberletChunkDataset::createOrOpen(root, first);
+    created.reset();
+    const auto reopened = FiberletChunkDataset::createOrOpen(root, second);
+    CHECK(reopened->metadata().processing.at("producer_toolchain")
+              .at("compiler_id") == "GNU");
     std::filesystem::remove_all(root);
 }
 
@@ -1250,6 +1289,92 @@ TEST_CASE("Fiberlet chunk graph loads complete cross-chunk adjacency and routes"
     REQUIRE(reloadedIncident.value.edges.size() == 1);
     CHECK(reloadedIncident.value.edges.front().id.fiberlet == edgeId);
     std::filesystem::remove_all(root);
+}
+
+TEST_CASE("Fiberlet replay filter boxes use globally anchored stage lattices")
+{
+    const std::vector<FiberletFilterStageSpec> stages{
+        {128, {0, 0, 0}},
+        {256, {-64, 32, 16}},
+    };
+    const std::vector<cv::Vec3d> reference{{500.0, 350.0, 340.0}};
+    FiberletChunkRouteAnalysisConfig analysis;
+    analysis.maximumJoinAngleDegrees = 37.0F;
+    analysis.edgeCostView = FiberletChunkRouteEdgeCostView::SqrtUint16Max256;
+    analysis.parallelThreads = 7;
+    analysis.maximumGeneratedStatesPerEntry = 1234;
+
+    const auto plan = planFiberletFilterStages(
+        stages, reference, 8.0, {1024.0, 1024.0, 1024.0},
+        {64.0, 64.0, 64.0}, analysis);
+    REQUIRE(plan.stageBoxes.size() == 2);
+    REQUIRE(plan.stageBoxes[1].size() == 1);
+    const auto& final = plan.stageBoxes[1].front();
+    CHECK((final.minimumBaseXYZ == cv::Vec3d{448.0, 288.0, 272.0}));
+    CHECK((final.maximumBaseXYZ == cv::Vec3d{704.0, 544.0, 528.0}));
+    CHECK(final.maximumJoinAngleDegrees == analysis.maximumJoinAngleDegrees);
+    CHECK(final.edgeCostView == analysis.edgeCostView);
+    CHECK(final.parallelThreads == analysis.parallelThreads);
+    CHECK(final.maximumGeneratedStatesPerEntry ==
+          analysis.maximumGeneratedStatesPerEntry);
+
+    REQUIRE(plan.stageBoxes[0].size() == 48);
+    std::optional<std::array<double, 3>> previousMinimumZYX;
+    for (const auto& box : plan.stageBoxes[0]) {
+        for (int axis = 0; axis < 3; ++axis) {
+            CHECK(std::fmod(box.minimumBaseXYZ[axis], 128.0) == 0.0);
+            CHECK(box.minimumBaseXYZ[axis] >= 0.0);
+            CHECK(box.maximumBaseXYZ[axis] <= 1024.0);
+        }
+        const std::array<double, 3> minimumZYX{
+            box.minimumBaseXYZ[2], box.minimumBaseXYZ[1],
+            box.minimumBaseXYZ[0]};
+        if (previousMinimumZYX)
+            CHECK(*previousMinimumZYX < minimumZYX);
+        previousMinimumZYX = minimumZYX;
+    }
+    REQUIRE(plan.sourceSupportBoxes.size() == 49);
+    CHECK(std::any_of(
+        plan.sourceSupportBoxes.begin(), plan.sourceSupportBoxes.end(),
+        [](const auto& box) {
+            return box.minimumBaseXYZ == cv::Vec3d{384.0, 224.0, 208.0} &&
+                box.maximumBaseXYZ == cv::Vec3d{768.0, 608.0, 592.0};
+        }));
+
+    CHECK_THROWS_AS(
+        planFiberletFilterStages(
+            std::span<const FiberletFilterStageSpec>{stages}.subspan(1),
+            std::vector<cv::Vec3d>{{1.0, 1.0, 1.0}}, 4.0,
+            {1024.0, 1024.0, 1024.0}, {64.0, 64.0, 64.0}, analysis),
+        std::invalid_argument);
+}
+
+TEST_CASE("Fiberlet replay filter coverage is independent of storage chunks")
+{
+    const std::vector<FiberletFilterStageSpec> stages{{300, {0, 0, 0}}};
+    const std::vector<cv::Vec3d> reference{{450.0, 450.0, 450.0}};
+    FiberletChunkRouteAnalysisConfig analysis;
+    const auto plan = planFiberletFilterStages(
+        stages, reference, 4.0, {2048.0, 2048.0, 2048.0},
+        {128.0, 128.0, 128.0}, analysis);
+    REQUIRE(plan.stageBoxes.size() == 1);
+    REQUIRE(plan.stageBoxes.front().size() == 1);
+    const auto& box = plan.stageBoxes.front().front();
+    CHECK((box.minimumBaseXYZ == cv::Vec3d{300.0, 300.0, 300.0}));
+    CHECK((box.maximumBaseXYZ == cv::Vec3d{600.0, 600.0, 600.0}));
+
+    FiberletDatasetMetadata metadata;
+    metadata.kind = FiberletDatasetKind::Fiberlets;
+    metadata.profile = FiberletStorageProfile::Float32Cache;
+    metadata.chunkGridShapeZYX = {16, 16, 16};
+    metadata.coordinateUnitsPerChunkZYX = {128, 128, 128};
+    metadata.maximumEndpointReachCoordinateUnitsZYX = {128, 128, 128};
+    metadata.spatialChunkSideBaseVoxels = 128;
+    metadata.predictionToBaseScale = 1.0;
+    const auto owners = fiberletChunkRoutePrefetchChunks(metadata, box);
+    CHECK(owners.size() == 125);
+    CHECK(std::find(owners.begin(), owners.end(), vc::render::ChunkKey{0, 1, 1, 1}) != owners.end());
+    CHECK(std::find(owners.begin(), owners.end(), vc::render::ChunkKey{0, 5, 5, 5}) != owners.end());
 }
 
 TEST_CASE("Fiberlet chunk route analysis finds exact simple entry-to-exit optima")

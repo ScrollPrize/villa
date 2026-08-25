@@ -1,14 +1,16 @@
-# Task: fix large staged Fiberlet cache preparation
+# Task: apply staged Fiberlet filtering before replay
 
-`vc_fiberlets chunk-route-stats` succeeds for the established 512-base-voxel
-region but fails while preparing a 1024-base-voxel staged region with:
+Allow `vc_fiberlets fiberlet-replay` to optionally apply the existing ordered
+overlapping-box Fiberlet reduction stages before graph tracing.
 
-```text
-vc_fiberlets: scheduled fiberlet chunk did not resolve to data
-```
-
-Fix the cache identity/resolution bug without weakening validation or changing
-the current generated anchor/Fiberlet data. An anchor cache written by an older
-producer must never share a namespace with current Fiberlet generation when the
-producer outputs differ. Preserve bounded memory, parallel preprocessing,
-durable authoritative caches, and exact staged-reduction output.
+- Accept the staged-filter CLI arguments on `fiberlet-replay`.
+- Anchor every filter box lattice globally in base-volume coordinates.
+- Select complete final-stage boxes intersecting the requested replay-radius
+  corridor, then expand required input coverage backward through all preceding
+  stages so offsets and graph endpoint reach cannot leave a final box partial.
+- Materialize every required source chunk before tracing starts.
+- Keep generated/storage chunk grids independent from filter analysis-box
+  sizes and offsets; map them by base-space extents.
+- Keep the filtered overlays transient for now. Persistent canonical anchor and
+  Fiberlet generation caches remain reusable and globally anchored.
+- Preserve current unfiltered replay when no stages are supplied.

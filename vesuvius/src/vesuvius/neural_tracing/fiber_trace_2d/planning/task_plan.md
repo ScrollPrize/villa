@@ -1,73 +1,91 @@
-# Plan: fix large staged Fiberlet cache preparation
+# Plan: apply staged Fiberlet filtering before replay
 
-## Diagnosis and invariant
+## Semantics and coverage
 
-1. Reproduce the user command with its existing cache and capture the exact
-   failing owner key, resolved status, and fetcher error instead of discarding
-   them behind the generic message.
-2. Trace the failed key through `prefetchScheduled`, `ChunkCache`, and the
-   generated anchor/Fiberlet fetchers. The reproduced terminal cause is an
-   endpoint-scoring mismatch between a previously persisted float anchor and a
-   current canonical re-interpolation.
-3. Compare the stale and fresh cache artifacts rather than treating the first
-   near-equal normal as sufficient evidence. The anchor payloads, generated
-   Fiberlet prefix/route payloads, and resulting Fiberlet population differ
-   under the same declared algorithm namespace. Therefore the old and current
-   producers are not cache-compatible.
-4. Preserve the invariant that every valid scheduled Fiberlet owner is either
-   generated/read successfully or fails with its original deterministic cause.
-   Eviction must not turn a successful scheduled fetch into a false failure.
+1. Represent a filter stage independently of CLI and storage layout as a
+   positive cubic side plus a globally anchored XYZ offset normalized modulo
+   that side.
+2. Build complete final-stage analysis boxes whose half-open base-space extents
+   intersect the requested replay tube. Clip candidate indices to boxes wholly
+   inside the prediction volume; do not create partial boundary boxes.
+3. Walk stages backward. For each required later-stage box, expand its read
+   extent by the dataset's maximum endpoint reach and select every complete
+   preceding-stage box whose write extent intersects that read extent. Union
+   and sort boxes deterministically in Z/Y/X order.
+4. Use the union of required stage boxes plus endpoint reach as the generation
+   support. Keep this support separate from the original replay corridor: the
+   former controls source chunk generation, while the latter continues to
+   constrain graph seeds and traversal.
 
-## Implementation
+## Shared implementation
 
-1. Increment the unpublished Fiberlet-generation contract in the structured
-   algorithm identity. Current code must use a fresh anchor and Fiberlet cache
-   namespace instead of mixing payloads produced by an incompatible binary.
-   Include compiler identity/version and build configuration because candidate
-   populations at hard thresholds are not record-identical across tested GCC
-   Release and Clang Debug producers.
-2. Retain strict endpoint-scoring validation across supported compilers.
-   Validity and axis orientation remain exact; only finite componentwise
-   float32 reconstruction differences within eight epsilons are accepted.
-   Contract v3 prevents this narrow arithmetic allowance from mixing the known
-   semantically different v2 producer. Do not change scoring, DP, path costs,
-   or current serialization.
-3. Keep preprocessing parallel and deterministic. Avoid retaining the full
-   1024-region decoded population solely to make the wait loop succeed.
-4. Include owner key, status, and underlying message in any remaining
-   resolution failure so future failures are actionable.
+1. Add reusable core planning helpers for global stage-box selection and
+   backward coverage closure. Express all crossings in base coordinates so
+   storage chunk side, generation chunk side, and stage side may differ.
+2. Add reusable transient staged-overlay orchestration which applies the existing
+   `analyzeAndSimplifyFiberletChunkRoutes()` and
+   `writeFiberletReductionOverlayBox()` path in stage/box order and exposes the
+   final anchor/Fiberlet datasets and caches for replay.
+3. Keep `chunk-route-stats` on the same reduction primitives. Do not fork its
+   simplification or overlay-write behavior.
+4. Extend the cached replay graph source with an explicit traversal-cell
+   predicate. Default it to the preprocessor selector for compatibility;
+   filtered replay supplies the original tube predicate.
+
+## CLI and replay integration
+
+1. Permit repeatable `--stage SIDE,OFFSET_X,OFFSET_Y,OFFSET_Z`, `--join-angle`,
+   `--cost-profile`, and `--max-states` for `fiberlet-replay`. Stages are
+   optional and their presence enables filtering; `--mode` remains a
+   `chunk-route-stats` diagnostic option.
+2. Before constructing the on-demand preprocessor, plan all required boxes and
+   replace its generation selectors with the expanded support predicate. Add
+   the support contract and ordered stages to source-cache metadata.
+3. Enumerate every storage owner intersecting the generation support, schedule
+   all anchor dependencies and Fiberlet pairs, and wait for successful
+   completion before the first reduction stage.
+4. Build transient stage overlays under an invocation-owned directory below
+   the replay output, retain them through tracing, and remove them on every
+   normal or exceptional exit. Do not persist or reopen filtered overlays.
+5. Construct replay over the final overlay while retaining the original tube
+   as its traversal predicate. Record the effective filter stages in the replay
+   bundle and diagnostics.
 
 ## Tests and validation
 
-1. Add focused regression coverage proving that the previous and current
-   processing contracts produce different algorithm/dataset fingerprints for
-   anchor, Fiberlet, and combined datasets.
-   Verify that opening an explicit v2 root as v3 is rejected without deleting,
-   repairing, or modifying the v2 dataset.
-   Retain the exact scheduled owner/status/source-error formatter test without
-   duplicating preprocessing infrastructure.
-2. Run the relevant focused unit tests with GCC Release and Clang Debug.
-   Verify the narrow endpoint comparator against the observed GCC/Clang
-   reconstruction pair, and verify that explicitly mixing GCC and Clang cache
-   roots is rejected by producer metadata before generation.
-3. Run the exact user 1024-region command to completion and hot-reopen it.
-   Confirm that it selects the new namespace, never reads the stale owner, and
-   completes. Then hot-reopen it and rerun the established 512-region workload,
-   verifying stable decoded populations/identities with no more than 10% warm-
-   wall regression. Raw v2/v3 payload bytes are not compared because their
-   fingerprint-bearing headers intentionally differ.
+1. Unit-test global lattice anchoring, negative/large offset normalization,
+   half-open intersection, volume-edge exclusion, deterministic ordering, and
+   backward expansion across multiple offset stages.
+2. Test mismatched storage and stage sides, including one stage box spanning
+   several storage chunks and several stage boxes sharing one storage chunk.
+3. Test that every final-stage box is complete, all required lower-stage boxes
+   and source owners are present, and removing one planned dependency is
+   detected before tracing.
+4. Test that the replay traversal predicate remains the original tube while
+   generation uses expanded support, and that no stages preserves the existing
+   graph/source path.
+5. Build `vc_fiberlets`, run focused Fiberlet storage/path/replay tests, and run
+   `git diff --check`.
 
 ## Spec update
 
-Clarify that generation-contract changes which can alter anchor or Fiberlet
-payloads require a cache identity revision; mixed-producer endpoint evidence
-remains a hard error. Require precise terminal error propagation.
+Add globally anchored staged replay filtering, complete final-box coverage,
+backward endpoint-reach closure, separate generation/traversal predicates,
+independent storage/filter grids, transient overlay lifetime, and unchanged
+unfiltered defaults to `planning/specs.md`.
 
 ## Docs updates
 
-Document no new user-facing workflow unless the fix changes an observable
-cache/progress contract. Record the actionable error format if retained.
+Update `volume-cartographer/docs/fiberlets.md` with replay CLI examples,
+global-offset semantics, coverage expansion, transient cache behavior, and the
+distinction between storage chunks and filter analysis boxes.
 
 ## Changelog update
 
-Record the large-region staged preprocessing correctness fix.
+Add a dated entry for optional staged Fiberlet filtering in cached replay.
+
+## Independent review
+
+Review the implementation against the existing staged-reduction monotonicity,
+complete-box, owner-write, cache-identity, and replay-corridor invariants before
+final validation.

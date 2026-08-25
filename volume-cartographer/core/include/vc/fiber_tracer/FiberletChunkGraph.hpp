@@ -6,6 +6,7 @@
 #include "vc/fiber_tracer/FiberPaths.hpp"
 
 #include <array>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -161,6 +162,30 @@ struct FiberletChunkRouteAnalysisConfig {
     std::size_t parallelThreads = 1;
     std::size_t maximumGeneratedStatesPerEntry = 1'000'000;
 };
+
+struct FiberletFilterStageSpec {
+    std::int64_t sideBaseVoxels = 0;
+    std::array<std::int64_t, 3> offsetBaseXYZ{0, 0, 0};
+};
+
+struct FiberletFilterPlan {
+    // Ordered like the input stages. Every box is complete, globally anchored,
+    // and sorted in deterministic Z/Y/X order.
+    std::vector<std::vector<FiberletChunkRouteAnalysisConfig>> stageBoxes;
+    // Base-generation support after endpoint-reach expansion and volume clip.
+    std::vector<FiberletChunkRouteAnalysisConfig> sourceSupportBoxes;
+};
+
+// Plan the complete globally anchored stage boxes needed to filter a tube.
+// Stage grids, persistent storage chunks, and generation chunks are unrelated
+// layouts; this function crosses between them only through base-space extents.
+[[nodiscard]] FiberletFilterPlan planFiberletFilterStages(
+    std::span<const FiberletFilterStageSpec> stages,
+    std::span<const cv::Vec3d> referenceBaseXYZ,
+    double corridorRadiusBaseVoxels,
+    const cv::Vec3d& volumeMaximumBaseXYZ,
+    const cv::Vec3d& maximumEndpointReachBaseXYZ,
+    const FiberletChunkRouteAnalysisConfig& analysisTemplate);
 
 struct FiberletChunkRouteAnalysisReport {
     cv::Vec3d minimumBaseXYZ{0.0, 0.0, 0.0};
@@ -386,6 +411,17 @@ public:
         FiberletEvaluationQuantization evaluationQuantization =
             defaultFiberletReplayQuantization(),
         float maximumJoinAngleDegrees = 45.0F);
+    FiberletCachedReplayGraphSource(
+        std::shared_ptr<FiberletOnDemandPreprocessor> preprocessor,
+        std::shared_ptr<FiberletChunkDataset> evaluatedAnchorDataset,
+        std::shared_ptr<vc::render::ChunkCache> evaluatedAnchorCache,
+        std::shared_ptr<FiberletChunkDataset> fiberletDataset,
+        std::shared_ptr<vc::render::ChunkCache> fiberletCache,
+        FiberletAnchorCellPredicate traversalCellPredicate,
+        FiberletPathConfig pathConfig,
+        FiberletEvaluationQuantization evaluationQuantization =
+            defaultFiberletReplayQuantization(),
+        float maximumJoinAngleDegrees = 45.0F);
 
     [[nodiscard]] float predictionToBaseScale() const noexcept override;
     [[nodiscard]] int anchorCellSizePredictionVoxels() const noexcept override;
@@ -414,6 +450,7 @@ private:
     std::shared_ptr<FiberletOnDemandPreprocessor> preprocessor_;
     FiberletChunkGraphSource chunks_;
     FiberletPathConfig pathConfig_;
+    FiberletAnchorCellPredicate traversalCellPredicate_;
     FiberletEvaluationQuantization evaluationQuantization_;
     float maximumJoinAngleDegrees_ = 45.0F;
     struct QuantizationState;

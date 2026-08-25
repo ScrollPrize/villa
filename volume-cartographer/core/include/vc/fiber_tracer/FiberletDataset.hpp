@@ -109,6 +109,13 @@ struct FiberletDatasetMetadata {
 // structured metadata. Call this after all effective values are resolved.
 void finalizeFiberletDatasetIdentity(FiberletDatasetMetadata& metadata);
 
+// Producer diagnostics do not affect cache compatibility. This also permits
+// reopening version-3 caches written before producer toolchains were removed
+// from the scientific identity.
+[[nodiscard]] bool fiberletDatasetMetadataCompatible(
+    const FiberletDatasetMetadata& left,
+    const FiberletDatasetMetadata& right);
+
 class FiberletChunkDataset
 {
 public:

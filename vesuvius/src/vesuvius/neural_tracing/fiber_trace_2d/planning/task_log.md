@@ -1,98 +1,53 @@
-# Task log: fix large staged Fiberlet cache preparation
+# Task log: apply staged Fiberlet filtering before replay
 
-## Reproduction
+## Discovery
 
-- The exact 1024-region staged command fails during cache preparation before
-  staged reduction begins.
-- Observed schedule: 1,728 anchor chunks and 1,000 Fiberlet chunks.
-- Reproduced failure after 15.2 seconds on a partially warm cache, at 918
-  resolved anchors and 179 resolved Fiberlet prefixes.
-- Current `prefetchScheduled(..., wait=true)` replaces the original terminal
-  status and message with `scheduled fiberlet chunk did not resolve to data`.
-- Precise diagnostics identify owner `0/427/139/187`, endpoint
-  `1708/556/748:0`, and a normal-direction comparison. Stored and resampled
-  normals print identically to six decimals and have absolute dot product 1.
-- A fresh cache covering that owner completes successfully. The existing
-  persisted anchor chunk and fresh anchor chunk share the same metadata
-  namespace but have different serialized hashes/sizes.
-- The mismatch is not limited to harmless compressed representation: the
-  current producer generates 2,526 Fiberlets for the focused region while the
-  stale anchor population generates 2,517, and both prefix and route payloads
-  differ. Accepting a float tolerance would therefore combine incompatible
-  producer outputs and hide an invalid cache identity.
-- The stale chunk predates the staged-analysis implementation. The cache
-  processing contract remained at version 2, allowing an older built producer
-  and current generation to use the same namespace despite different output.
-
-## Independent review
-
-- The reviewer correctly required precise key/status/source-error propagation
-  and warned against retrying or pinning an entire prefetch schedule.
-- The reviewer hypothesized a decoded-cache handoff race. The actionable
-  diagnostic disproved that for this failure: `ChunkCache` returned a stable
-  terminal generator error whose source was the endpoint scoring check.
-- Generic blocking-handoff changes and their broader tests are therefore out
-  of scope for this focused fix; no retry or memory-pinning behavior will be
-  added.
-
-## Plan correction
-
-- The initial tolerance proposal is rejected after byte and population
-  comparison. Strict endpoint evidence validation remains in place.
-- The corrected fix revises the unpublished generation contract so the current
-  producer cannot reuse stale anchor or Fiberlet payloads, while preserving
-  precise terminal error propagation.
-
-## Implementation
-
-- Added shared generation contract version 3 to anchor, Fiberlet, and combined
-  algorithm identity and switched `vc_fiberlets` metadata generation to it.
-- Kept endpoint scoring validation strict. Stale/current payload comparison
-  showed that tolerance alone was invalid, so contract v3 separates those
-  producers. A subsequent Clang-Debug consumer of GCC-Release v3 anchors proved
-  that redundant Lasagna normal reconstruction varies by one to two float32
-  ULPs across supported compilers. A finite componentwise eight-epsilon bound
-  now covers only that arithmetic roundoff; validity, orientation, scoring,
-  paths, costs, and serialized values are unchanged.
-- The Clang-from-GCC-anchor focused generation passed with that validation
-  bound but produced 2,528 incident Fiberlets versus GCC's 2,526 (both reduced
-  to 2,275). Therefore compiler identity/version and build configuration are
-  now part of v3 producer metadata. Mixed-toolchain cache roots are rejected
-  instead of combining numerically different candidate populations.
-- Scheduled resolution failures now retain the exact owner key, terminal cache
-  status, and nested generator message. Direction mismatch diagnostics print
-  all float32 digits rather than rounding both values to the same six-decimal
-  text.
-- Raised the chunk-route exact-search default guard from 1,000,000 to
-  5,000,000 states per entry. The original guard was the next independent
-  failure exposed after cold v3 preparation completed; five million was the
-  smallest tested bound for the requested 1024 workload.
-
-## Validation
-
-- GCC Release focused storage tests: 34/34 passed.
-- Clang Debug focused storage tests: 34/34 passed.
-- A Clang Debug process explicitly opening the final GCC Release v3 anchor
-  cache rejects it at metadata validation before generation, confirming that
-  compiler/build-specific producers cannot mix persisted records.
-- The requested 1024-region command cold-generated 1,728 anchor and 1,000
-  Fiberlet chunks in the v3 namespace without the stale endpoint error. With
-  the old one-million guard it then failed separately during stage-one exact
-  analysis; the five-million guard completed all five stages.
-- The unchanged requested command completed from a cold final
-  toolchain-specific namespace with final populations of 19,963 anchors,
-  165,561 incident Fiberlets, and 24,817 interior Fiberlets. A second hot run
-  was not repeated because the managed workspace sandbox makes the external
-  dataset cache read-only; the earlier contract-v3 hot validation completed
-  with the same populations before toolchain identity was added.
-- Three hot 512-region runs measured 2.724/2.748/2.786 seconds wall and each
-  produced 3,373 anchors, 35,039 incident Fiberlets, and 4,477 interior
-  Fiberlets. The previous documented median was 2.90 seconds.
+- Existing staged reduction is currently wired only to `chunk-route-stats`.
+  Its analysis, simplification, and sparse overlay writes already live in
+  reusable core functions, while orchestration and temporary-layer lifetime
+  remain in `vc_fiberlets.cpp`.
+- Current stage offsets are relative to the selected diagnostic region. Replay
+  requires a globally anchored lattice so focused intervals and repeated runs
+  address the same boxes.
+- The on-demand preprocessor currently uses one tube selector for source
+  generation and cached replay traversal. Filtering requires source data beyond
+  the original tube, so those responsibilities must be separated.
+- Chunk-route materialization reads incident Fiberlets and endpoint anchors
+  outside each box. Backward stage closure must therefore include the metadata
+  maximum endpoint reach, not only geometric overlap caused by stage offsets.
+- Persistent source caches already use globally anchored storage keys. The
+  transient overlays may retain that exact storage grid while filter boxes use
+  unrelated globally anchored sizes.
 
 ## Deviations
 
-- Final toolchain-specific hot timing was not repeated because the managed
-  workspace sandbox cannot update cache bookkeeping in the external dataset
-  directory without a new approval. Correctness was validated by the complete
-  cold run, prior v3 hot run, focused cache reopen tests, and explicit
-  cross-toolchain rejection.
+- The focused `test_fiber_replay` executable retains an unrelated existing
+  line-strip dimension failure. The touched planner/storage tests and
+  `test_fiberlet_paths` pass; no replay-strip implementation or expectation is
+  changed by this task.
+
+## Implementation
+
+- Added a pure core planner for globally anchored complete filter boxes,
+  backward endpoint-reach closure, and source-generation support.
+- Made both replay and the regional staged diagnostic normalize stage offsets
+  modulo their side and use global base-volume anchoring.
+- Extracted evaluated-anchor view creation and transient stage application into
+  shared orchestration used by both diagnostic and replay callers.
+- Extended cached replay with an explicit traversal predicate so expanded
+  source generation does not expand seed or traversal eligibility.
+- Added optional replay filter CLI wiring, eager-graph rejection, transient
+  overlay lifetime management, and replay-bundle provenance.
+
+## Validation
+
+- Built `vc_fiberlets`, `test_fiberlet_storage`, `test_fiberlet_paths`, and
+  `test_fiber_replay` in the regular build tree using repository-local compiler
+  temporary storage.
+- `test_fiberlet_storage`: passed, including global anchoring, normalized
+  negative offsets, deterministic ordering, complete-boundary exclusion,
+  backward expansion, and storage/filter-size independence.
+- `test_fiberlet_paths`: passed.
+- `test_fiber_replay`: existing strip geometry assertions fail in untouched
+  replay visualization code (`replay strip component dimensions are invalid`
+  and stale overview dimensions).
