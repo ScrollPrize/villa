@@ -137,7 +137,7 @@ constexpr qreal kInterpolatedHighlightWidth = 2.4;
 // The selected fiber's linked network: a gentle semi-transparent glow behind
 // each member's unchanged lines - visible next to the crowd, clearly
 // subordinate to the selection itself.
-constexpr qreal kNetworkGlowWidthPx = 9.0;
+constexpr qreal kNetworkGlowWidthPx = 20.0;
 constexpr int kNetworkGlowAlpha = 70;
 constexpr qreal kPanelZ = -3.0;
 constexpr qreal kNetworkGlowZ = 1.5;
