@@ -412,20 +412,34 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
                             // would only reintroduce floating point.
                             crossing.n = m;
                             crossing.deltaR = rH - rV;
-                            const double magnitude = std::abs(crossing.deltaR);
-                            if (magnitude <= params.tieBandVx) {
-                                crossing.kind = CrossingKind::Tie;
-                                crossing.confidence = 0.9 * transversality *
-                                    (1.0 - 0.2 * magnitude /
-                                               std::max(params.tieBandVx, 1e-9));
-                            } else {
-                                crossing.kind = crossing.deltaR < 0.0
-                                    ? CrossingKind::Inside
-                                    : CrossingKind::Outside;
-                                crossing.confidence = transversality *
-                                    std::min(1.0, (magnitude - params.tieBandVx) /
-                                                      (3.0 * params.tieBandVx));
-                            }
+                            // No tie band: the sign of deltaR is the whole
+                            // classification. A same-winding contact reads
+                            // inside (H on the sheet front), which the weak
+                            // constraint absorbs at equality; a contact whose
+                            // noise flips the sign becomes a strict outside,
+                            // accepted as the price of not inventing an
+                            // equality from a sub-band radial measurement.
+                            // Confidence is asymmetric to match what each
+                            // claim risks: the weak inside ("same or further
+                            // in") is only false when the H fiber is truly a
+                            // full winding outside - a wrap-scale radial
+                            // error - so it is high at any margin; the strict
+                            // outside asserts a whole winding of separation
+                            // off the radial sign alone, so it earns
+                            // confidence with radial margin and a
+                            // sign-of-noise contact loses repair conflicts.
+                            crossing.kind = crossing.deltaR <= 0.0
+                                ? CrossingKind::Inside
+                                : CrossingKind::Outside;
+                            crossing.confidence =
+                                crossing.kind == CrossingKind::Inside
+                                    ? 0.9 * transversality
+                                    : transversality *
+                                          std::min(1.0,
+                                                   crossing.deltaR /
+                                                       (3.0 *
+                                                        std::max(params.tieBandVx,
+                                                                 1e-9)));
                             if (!crossing.declarable) {
                                 crossing.confidence *=
                                     params.untrustedConfidenceFactor;

@@ -17,15 +17,15 @@
 //  - Papyrus structure: horizontal fibers lie on the front of the sheet,
 //    verticals behind, so an H fiber on the SAME winding as a V fiber passes
 //    between that V fiber and the umbilicus. An H fiber crossing a V fiber's
-//    angular position *inside* it (smaller radius) is therefore on the same
-//    winding or further inward (W_h <= W_v, weak); crossing *outside* means
-//    strictly outward (W_h >= W_v + 1). A crossing whose radial separation is
-//    within the sheet-thickness tie band is same-winding evidence (equality):
-//    adjacent windings sit a wrap apart, same-winding H/V pairs a sheet
-//    thickness apart, and sheet thickness is the one radial scale that stays
-//    roughly uniform on a crumpled scroll. No pitch model exists anywhere in
-//    this solver: the scroll is too non-uniform for one, so radius is only
-//    ever used locally and ordinally.
+//    angular position *inside* it (dr <= 0) is therefore on the same winding
+//    or further inward (W_h <= W_v, weak); crossing *outside* (dr > 0) means
+//    strictly outward (W_h >= W_v + 1). The sign of dr is the whole
+//    classification - there is no same-winding tie equality, because on a
+//    tightly wound scroll the wrap spacing is only a few sheet thicknesses,
+//    and a dr-band equality manufactures constraints out of sub-band radial
+//    noise. The weak inside form absorbs same-winding contacts at equality;
+//    a contact whose noise flips the sign costs a winding of separation,
+//    accepted rather than guessed away.
 //  - Links: annotated same-crossing ties between two fibers' control points,
 //    an integer equality on k with confidence from the angular residual.
 //  - Local radial ordering: along any ray from the umbilicus the windings stay
@@ -86,8 +86,12 @@ struct LinkInput {
 // physical intents at 2.4 um/voxel; callers that know the voxel size convert
 // the intents themselves.
 struct SolverParams {
-    // Same-winding tie band on |r_h - r_v| at a crossing. Intent: ~0.03 cm,
-    // a few papyrus sheet thicknesses. Never pitch-relative.
+    // Sheet-thickness radial scale. Intent: ~0.03 cm, a few papyrus sheet
+    // thicknesses; never pitch-relative. Crossings classify purely by the
+    // SIGN of deltaR (<= 0 inside, > 0 outside) - there is no tie
+    // classification - and this scale only sets the crossing confidence ramp
+    // (full confidence at 3x this), the dedup clustering distance, and the
+    // ordinal same-winding band for slack and island placement.
     double tieBandVx = 125.0;
     // Samples closer to the umbilicus than this are angularly ill-conditioned
     // and take part in no crossing. Intent: 0.1 cm.
@@ -127,6 +131,8 @@ struct SolverParams {
     int chiralityOverride = 0;
 };
 
+// Tie is retained for the constraint/violation switch exhaustiveness but no
+// longer produced: classification is by the sign of deltaR alone.
 enum class CrossingKind { Inside, Outside, Tie };
 enum class CrossingStatus { Used, Dropped };
 

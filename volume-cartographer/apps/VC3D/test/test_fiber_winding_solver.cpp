@@ -178,8 +178,10 @@ private slots:
             QCOMPARE(placement.anchor, ComponentAnchor::Primary);
             QVERIFY(!placement.sheetDriftSuspect);
         }
-        // One tie per V fiber (its own winding's pass), no repairs.
-        QCOMPARE(result.tieCount, 3);
+        // No tie classification exists: same-winding contacts arrive as weak
+        // inside constraints and the densest solve collapses them to
+        // equality. No repairs.
+        QCOMPARE(result.tieCount, 0);
         QCOMPARE(result.droppedCrossingCount, 0);
         QVERIFY(result.droppedLinks.empty());
         // Gauge: the primary component's innermost winding is zero.
@@ -201,11 +203,11 @@ private slots:
             solveWindings(world.fibers, world.links, SolverParams{});
         QCOMPARE(result.chirality, -1);
         checkRelativeTurns(result, world, {0, 1, 2, 3});
-        QCOMPARE(result.tieCount, 3);
+        QCOMPARE(result.tieCount, 0);
         QCOMPARE(result.droppedCrossingCount, 0);
     }
 
-    void sameWindingPairReadsAsTieNotSeparation()
+    void sameWindingPairCollapsesToEquality()
     {
         World world;
         const std::size_t h = addH(world, 0.05, 0.55, 30000.0);
@@ -213,7 +215,9 @@ private slots:
         const SolveResult result =
             solveWindings(world.fibers, world.links, SolverParams{});
         QCOMPARE(result.crossings.size(), std::size_t{1});
-        QCOMPARE(result.crossings.front().kind, CrossingKind::Tie);
+        // The sheet contact reads as a weak inside; the densest solve
+        // collapses the weak constraint to equality.
+        QCOMPARE(result.crossings.front().kind, CrossingKind::Inside);
         const double wh =
             solvedW(result, world, h, hSampleAt(world, h, 0.05, 0.3));
         const double wv = solvedW(result, world, v, 0);
@@ -221,10 +225,10 @@ private slots:
                  qPrintable(QStringLiteral("wh %1 wv %2").arg(wh).arg(wv)));
     }
 
-    // A measured-outside pass inside the sheet-thickness band is still
-    // same-winding evidence: a true adjacent winding sits a wrap away, not a
-    // sub-band |dr| away.
-    void outsideMeasurementInsideTheBandIsATie()
+    // The accepted cost of having no tie band: a same-winding contact whose
+    // radial noise flips the sign of deltaR reads as a strict outside and
+    // separates the pair by one winding. Documented behavior, not a bug.
+    void signFlippedContactSeparatesOneWinding()
     {
         World world;
         const std::size_t h = addH(world, 0.05, 0.55, 30000.0);
@@ -235,10 +239,11 @@ private slots:
             solveWindings(world.fibers, world.links, SolverParams{});
         QCOMPARE(result.crossings.size(), std::size_t{1});
         QVERIFY(result.crossings.front().deltaR > 0.0);
-        QCOMPARE(result.crossings.front().kind, CrossingKind::Tie);
+        QCOMPARE(result.crossings.front().kind, CrossingKind::Outside);
+        QCOMPARE(result.droppedCrossingCount, 0);
         const double wh =
             solvedW(result, world, h, hSampleAt(world, h, 0.05, 0.3));
-        QVERIFY(std::abs(wh - solvedW(result, world, v, 0)) < 0.01);
+        QVERIFY(std::abs(wh - (solvedW(result, world, v, 0) + 1.0)) < 0.01);
     }
 
     // Inside-then-outside on successive turns pins the V fiber to the last
@@ -332,15 +337,18 @@ private slots:
     void sheetDriftIsDetectedAndReported()
     {
         World world;
-        // Follows its sheet for half a turn, then drifts one sheet inward:
-        // the second passes of both V fibers contradict the first passes.
-        const auto drifting = [](double w, double z) {
-            return (w < 1.8 ? sheetR(w, z) : sheetR(w - 1.0, z)) - kSheetStep;
+        // Passes both V fibers OUTSIDE on its first turn, then regresses two
+        // sheets inward and passes them INSIDE on the second: inward
+        // regression, the one self-contradiction the one-sided constraint
+        // forms cannot absorb. (Outward drift is absorbable by design: the
+        // weak inside and at-least-one outside both leave outward room.)
+        const auto regressing = [](double w, double z) {
+            return w < 1.8 ? sheetR(w, z) + 200.0 : sheetR(w - 2.0, z) - 200.0;
         };
-        const std::size_t h = addH(world, 1.2, 2.4, 30000.0, drifting);
+        const std::size_t h = addH(world, 1.2, 2.4, 30000.0, regressing);
         addV(world, 1.3, 27000.0, 33000.0);
         addV(world, 1.35, 27000.0, 33000.0);
-        // The drifting fiber defeats data-driven chirality on purpose.
+        // The regressing fiber defeats data-driven chirality on purpose.
         SolverParams params;
         params.chiralityOverride = 1;
         const SolveResult first =
@@ -359,19 +367,20 @@ private slots:
         }
     }
 
-    // An untrusted fiber (no model-traced span) must lose a repair conflict
-    // it would win on raw confidence, and its dropped crossing is not
-    // declarable. Cycle: H ties trusted V1 (conf ~0.9), passes far outside
-    // untrusted V2 (raw conf ~1.0, attenuated ~0.5), link V1=V2 (~0.75).
-    // Unattenuated, the tie would drop; attenuated, the untrusted crossing
-    // does, and V2 lands on the shared winding.
+    // An untrusted fiber (no model-traced span) must lose a repair conflict,
+    // and its dropped crossing is not declarable: H sits well inside trusted
+    // V1 (weak inside, conf 0.9) and well outside untrusted V2 (strict, raw
+    // conf 1.0 attenuated to 0.5); the V1=V2 link closes the cycle and the
+    // attenuated outside is the deterministic victim.
     void untrustedEvidenceLosesConflicts()
     {
         World world;
         const std::size_t h = addH(world, 0.05, 0.55, 30000.0);
-        const std::size_t v1 = addV(world, 0.3, 27000.0, 33000.0);
-        // Same angle as V1, drawn far inside the sheet: H reads as passing
-        // well outside it.
+        // Well outside H: a strong (high-margin) inside constraint.
+        const std::size_t v1 = addV(world, 0.3, 27000.0, 33000.0, 400.0);
+        // Untrusted, drawn far inside the sheet: a strong outside claim that
+        // contradicts the link below - and would beat the inside constraint
+        // on raw confidence if not for the attenuation.
         const std::size_t v2 = addV(world, 0.3, 27000.0, 33000.0, -600.0);
         world.fibers[v2].trusted = false;
         world.links.push_back(LinkInput{v1, 0, v2, 0});
@@ -379,15 +388,13 @@ private slots:
             solveWindings(world.fibers, world.links, SolverParams{});
         QCOMPARE(countDroppedCrossings(result), 1);
         QVERIFY(result.droppedLinks.empty());
-        bool sawDroppedUndeclarable = false;
         for (const Crossing& crossing : result.crossings) {
             if (crossing.status == CrossingStatus::Dropped) {
+                QCOMPARE(crossing.kind, CrossingKind::Outside);
                 QVERIFY(!crossing.declarable);
-                sawDroppedUndeclarable = true;
             }
         }
-        QVERIFY(sawDroppedUndeclarable);
-        // The surviving tie and link put all three on one winding.
+        // The surviving inside and the link keep all three together.
         QCOMPARE(result.placements[v1].turns - result.placements[h].turns, 0.0);
         QCOMPARE(result.placements[v2].turns - result.placements[v1].turns, 0.0);
         // And no drift declaration: the only drop involved untrusted geometry.
@@ -397,31 +404,34 @@ private slots:
     // Greedy repair can drop an innocent constraint before the real culprit
     // falls in a later cycle, leaving a drop the final map satisfies anyway.
     // Such repair debris carries violationTurns ~0 and is not declared; the
-    // culprit's drop is violated by a full winding. Fixture: H ties A on two
-    // successive turns (mutually contradictory - the second pass rides a
-    // flattened tail), while a linked helper H2 independently ties A at the
-    // first turn. Whichever innocent first-turn tie the repair sacrifices
-    // first, the reinforced first-turn relation survives through the other
-    // path, the second-turn culprit falls next, and the sacrificed tie ends
-    // up satisfied by the very map that dropped it.
+    // culprit's drop is violated by a winding or more. Fixture: H passes A
+    // outside on its first turn (thin margin - the innocent) and inside on
+    // its second (strong margin - the culprit: inward regression), while a
+    // linked helper H2 independently passes A outside with a strong margin.
+    // The thin outside falls first as the {out, in} cycle's weakest edge;
+    // the culprit falls to the {in, link, out2} cycle; the sacrificed
+    // outside ends up satisfied by the very map that dropped it.
     void satisfiedDropsAreRepairDebrisNotErrors()
     {
         World world;
-        const auto flattening = [](double w, double z) {
-            return w < 1.0 ? sheetR(w, z) - kSheetStep
-                           : sheetR(0.3, z) + 100.0;
+        const auto regressing = [](double w, double z) {
+            return w < 1.0 ? sheetR(0.3, z) + 200.0
+                           : sheetR(0.3, z) - 300.0;
         };
-        const std::size_t h = addH(world, 0.05, 1.7, 30000.0, flattening);
-        const std::size_t h2 = addH(world, 0.05, 0.55, 31000.0);
-        const std::size_t a = addV(world, 0.3, 27000.0, 33000.0, 20.0);
+        const std::size_t h = addH(world, 0.05, 1.7, 30000.0, regressing);
+        const auto wellOutside = [](double w, double z) {
+            return sheetR(0.3, z) + 600.0;
+        };
+        const std::size_t h2 = addH(world, 0.05, 0.55, 31000.0, wellOutside);
+        const std::size_t a = addV(world, 0.3, 27000.0, 33000.0);
         // Same angle, same start: sample 13 of both is the same ray.
         world.links.push_back(LinkInput{h, 13, h2, 13});
         SolverParams params;
-        params.chiralityOverride = 1;  // the flattened tail defeats inference
+        params.chiralityOverride = 1;  // the flat radii defeat inference
         const SolveResult result = solveWindings(world.fibers, world.links, params);
-        // Everything settles on the first-turn relation.
+        // Everything settles on the first-turn relation: A one winding
+        // inside the linked H pair.
         QCOMPARE(result.placements[h2].turns, result.placements[h].turns);
-        QCOMPARE(result.placements[a].turns, result.placements[h].turns);
         QVERIFY(result.droppedLinks.empty());
         int satisfiedDrops = 0;
         int violatedDrops = 0;
@@ -448,10 +458,10 @@ private slots:
     void untrustedFibersAreNeverDriftSuspects()
     {
         World world;
-        const auto drifting = [](double w, double z) {
-            return (w < 1.8 ? sheetR(w, z) : sheetR(w - 1.0, z)) - kSheetStep;
+        const auto regressing = [](double w, double z) {
+            return w < 1.8 ? sheetR(w, z) + 200.0 : sheetR(w - 2.0, z) - 200.0;
         };
-        const std::size_t h = addH(world, 1.2, 2.4, 30000.0, drifting);
+        const std::size_t h = addH(world, 1.2, 2.4, 30000.0, regressing);
         world.fibers[h].trusted = false;
         addV(world, 1.3, 27000.0, 33000.0);
         addV(world, 1.35, 27000.0, 33000.0);
@@ -487,7 +497,7 @@ private slots:
         const SolveResult result = solveWindings(gaugeShifted.fibers,
                                                  gaugeShifted.links, params);
         QCOMPARE(result.crossings.size(), std::size_t{1});
-        QCOMPARE(result.crossings.front().kind, CrossingKind::Tie);
+        QCOMPARE(result.crossings.front().kind, CrossingKind::Inside);
         // The canonical gauge absorbs the five-turn input gauge before
         // detection, so the recorded gap is small; the output turn offsets
         // compensate, which checkRelativeTurns verifies.
@@ -571,7 +581,7 @@ private slots:
         const SolveResult result =
             solveWindings(world.fibers, world.links, SolverParams{});
         QCOMPARE(result.crossings.size(), std::size_t{1});
-        QCOMPARE(result.crossings.front().kind, CrossingKind::Tie);
+        QCOMPARE(result.crossings.front().kind, CrossingKind::Inside);
         QCOMPARE(result.crossings.front().mergedCount, 2);
         checkRelativeTurns(result, world, {h, world.fibers.size() - 1});
     }
