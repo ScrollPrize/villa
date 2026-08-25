@@ -1,12 +1,16 @@
 #include "vc/fiber_tracer/FiberletDataset.hpp"
 
 #include "vc/core/util/AtomicFile.hpp"
+#include "utils/thread_pool.hpp"
 
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <bit>
+#include <condition_variable>
 #include <fstream>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <stdexcept>
 #include <string_view>
 #include <tuple>
@@ -815,6 +819,518 @@ void requireMonotoneSubset(
 
 }  // namespace
 
+struct FiberletChunkWriteBackCache::Impl {
+    struct OwnerKey {
+        std::uint64_t layer = 0;
+        int z = 0;
+        int y = 0;
+        int x = 0;
+
+        auto operator<=>(const OwnerKey&) const = default;
+    };
+
+    struct Layer {
+        std::filesystem::path root;
+        FiberletDatasetKind kind = FiberletDatasetKind::Anchors;
+    };
+
+    struct Buffers {
+        std::shared_ptr<const std::vector<std::byte>> anchors;
+        std::shared_ptr<const std::vector<std::byte>> prefixes;
+        std::shared_ptr<const std::vector<std::byte>> routes;
+    };
+
+    struct Resident {
+        std::uint64_t generation = 0;
+        std::uint64_t touch = 0;
+        std::size_t chargedBytes = 0;
+        Buffers buffers;
+    };
+
+    struct Pending {
+        OwnerKey key;
+        std::uint64_t generation = 0;
+        std::size_t chargedBytes = 0;
+        Buffers buffers;
+        std::filesystem::path anchorPath;
+        std::filesystem::path prefixPath;
+        std::filesystem::path routePath;
+        mutable std::mutex mutex;
+        std::condition_variable ready;
+        bool done = false;
+        std::exception_ptr error;
+    };
+
+    static constexpr std::size_t kEntryOverheadBytes = 256;
+
+    explicit Impl(FiberletChunkWriteBackCache::Options input)
+        : options(std::move(input))
+        , maximumBytes(options.maximumBytes)
+        , decodedBudget(options.decodedBudget)
+        , decodedBudgetMaximum(
+              decodedBudget ? decodedBudget->maximumBytes() : 0)
+        , writers(std::max<std::size_t>(1, options.writerThreads))
+    {
+        if (maximumBytes == 0)
+            throw std::invalid_argument(
+                "fiberlet write-back cache capacity must be positive");
+        if (!options.writeBytes) {
+            options.writeBytes = [](const std::filesystem::path& path,
+                                    std::span<const std::byte> bytes) {
+                vc::core::util::atomicWriteBytes(path, bytes);
+            };
+        }
+    }
+
+    ~Impl() = default;
+
+    static OwnerKey ownerKey(
+        std::uint64_t layer, const vc::render::ChunkKey& key)
+    {
+        return {layer, key.iz, key.iy, key.ix};
+    }
+
+    static std::size_t bufferBytes(const Buffers& buffers)
+    {
+        std::size_t result = kEntryOverheadBytes;
+        for (const auto* value :
+             {&buffers.anchors, &buffers.prefixes, &buffers.routes}) {
+            if (*value)
+                result += (*value)->capacity();
+        }
+        return result;
+    }
+
+    const Layer& layer(std::uint64_t id) const
+    {
+        if (id == 0 || id > layers.size())
+            throw std::invalid_argument("fiberlet write-back layer is invalid");
+        return layers[id - 1];
+    }
+
+    std::filesystem::path path(
+        const OwnerKey& key, FiberletStorageChunkKind kind) const
+    {
+        const auto& selected = layer(key.layer);
+        return arrayDirectory(selected.root, kind) /
+            (std::to_string(key.z) + "." + std::to_string(key.y) + "." +
+             std::to_string(key.x));
+    }
+
+    void adjustDecodedBudgetLocked()
+    {
+        if (!decodedBudget)
+            return;
+        const std::size_t allowance = liveBytes < decodedBudgetMaximum
+            ? decodedBudgetMaximum - liveBytes
+            : 0;
+        decodedBudget->setMaximumBytes(allowance);
+    }
+
+    void throwFirstFailureLocked() const
+    {
+        if (!failures.empty())
+            std::rethrow_exception(failures.begin()->second);
+    }
+
+    std::shared_ptr<Pending> oldestPendingLocked() const
+    {
+        if (pending.empty())
+            return {};
+        return pending.begin()->second;
+    }
+
+    std::map<OwnerKey, Resident>::iterator oldestResidentLocked()
+    {
+        auto oldest = residents.end();
+        for (auto iterator = residents.begin(); iterator != residents.end();
+             ++iterator) {
+            if (oldest == residents.end() ||
+                std::tie(iterator->second.touch, iterator->first) <
+                    std::tie(oldest->second.touch, oldest->first)) {
+                oldest = iterator;
+            }
+        }
+        return oldest;
+    }
+
+    void complete(
+        const std::shared_ptr<Pending>& state, std::exception_ptr error)
+    {
+        {
+            std::lock_guard lock(mutex);
+            const auto found = pending.find(state->key);
+            if (found != pending.end() && found->second == state)
+                pending.erase(found);
+            if (error)
+                failures.try_emplace(state->key, error);
+            liveBytes = liveBytes > state->chargedBytes
+                ? liveBytes - state->chargedBytes
+                : 0;
+            adjustDecodedBudgetLocked();
+        }
+        {
+            std::lock_guard lock(state->mutex);
+            state->error = error;
+            state->done = true;
+        }
+        state->ready.notify_all();
+    }
+
+    std::shared_ptr<Pending> spillLocked(
+        std::map<OwnerKey, Resident>::iterator selected)
+    {
+        auto state = std::make_shared<Pending>();
+        state->key = selected->first;
+        state->generation = selected->second.generation;
+        state->chargedBytes = selected->second.chargedBytes;
+        state->buffers = std::move(selected->second.buffers);
+        if (state->buffers.anchors) {
+            state->anchorPath = path(
+                state->key, FiberletStorageChunkKind::Anchors);
+        } else {
+            state->prefixPath = path(
+                state->key, FiberletStorageChunkKind::FiberletPrefix);
+            state->routePath = path(
+                state->key, FiberletStorageChunkKind::FiberletRoutes);
+        }
+        pending.emplace(state->key, state);
+        residents.erase(selected);
+        ++statistics.spills;
+        statistics.spilledBytes += state->chargedBytes;
+        writers.enqueue([this, state] {
+            std::exception_ptr error;
+            try {
+                if (state->buffers.anchors) {
+                    options.writeBytes(
+                        state->anchorPath, *state->buffers.anchors);
+                } else {
+                    try {
+                        options.writeBytes(
+                            state->prefixPath, *state->buffers.prefixes);
+                        options.writeBytes(
+                            state->routePath, *state->buffers.routes);
+                    } catch (...) {
+                        std::error_code ignored;
+                        std::filesystem::remove(state->prefixPath, ignored);
+                        std::filesystem::remove(state->routePath, ignored);
+                        throw;
+                    }
+                }
+            } catch (...) {
+                error = std::current_exception();
+            }
+            complete(state, error);
+        });
+        return state;
+    }
+
+    static void wait(const std::shared_ptr<Pending>& state)
+    {
+        std::unique_lock lock(state->mutex);
+        state->ready.wait(lock, [&] { return state->done; });
+        if (state->error)
+            std::rethrow_exception(state->error);
+    }
+
+    void waitUntilReplaceable(const OwnerKey& key)
+    {
+        while (true) {
+            std::shared_ptr<Pending> state;
+            {
+                std::lock_guard lock(mutex);
+                throwFirstFailureLocked();
+                const auto found = pending.find(key);
+                if (found == pending.end())
+                    return;
+                state = found->second;
+            }
+            wait(state);
+        }
+    }
+
+    void enforceBudget()
+    {
+        std::unique_lock pressure(pressureMutex);
+        while (true) {
+            std::shared_ptr<Pending> waitFor;
+            {
+                std::lock_guard lock(mutex);
+                throwFirstFailureLocked();
+                if (liveBytes <= maximumBytes)
+                    return;
+
+                // Once pressure starts, queue a deterministic batch rather
+                // than synchronously spilling only the minimum victim. The
+                // queued buffers remain charged, so the producer still waits
+                // for actual releases before exceeding the hard bound, while
+                // the remaining writes can overlap subsequent computation.
+                std::size_t residentBytes = 0;
+                for (const auto& [key, resident] : residents) {
+                    (void)key;
+                    residentBytes += resident.chargedBytes;
+                }
+                const std::size_t lowWater = maximumBytes * 3 / 4;
+                while (residentBytes > lowWater && !residents.empty()) {
+                    auto selected = oldestResidentLocked();
+                    residentBytes -= selected->second.chargedBytes;
+                    spillLocked(selected);
+                }
+                waitFor = oldestPendingLocked();
+            }
+            if (!waitFor)
+                throw std::runtime_error(
+                    "fiberlet write-back cache cannot satisfy its byte budget");
+            wait(waitFor);
+        }
+    }
+
+    void replace(const OwnerKey& key, Buffers buffers)
+    {
+        waitUntilReplaceable(key);
+        const std::size_t charged = bufferBytes(buffers);
+        {
+            std::lock_guard lock(mutex);
+            if (finished)
+                throw std::logic_error("fiberlet write-back cache is finished");
+            throwFirstFailureLocked();
+            if (const auto found = residents.find(key);
+                found != residents.end()) {
+                liveBytes -= found->second.chargedBytes;
+                residents.erase(found);
+            }
+            const std::uint64_t generation = ++generations[key];
+            residents.emplace(
+                key, Resident{generation, ++nextTouch, charged,
+                              std::move(buffers)});
+            liveBytes += charged;
+            statistics.peakLiveBytes =
+                std::max(statistics.peakLiveBytes, liveBytes);
+            adjustDecodedBudgetLocked();
+        }
+        enforceBudget();
+    }
+
+    mutable std::mutex mutex;
+    std::mutex pressureMutex;
+    FiberletChunkWriteBackCache::Options options;
+    std::size_t maximumBytes = 0;
+    std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedBudget;
+    std::size_t decodedBudgetMaximum = 0;
+    utils::ThreadPool writers;
+    std::vector<Layer> layers;
+    std::map<OwnerKey, Resident> residents;
+    std::map<OwnerKey, std::shared_ptr<Pending>> pending;
+    std::map<OwnerKey, std::uint64_t> generations;
+    std::map<OwnerKey, std::exception_ptr> failures;
+    std::uint64_t nextTouch = 0;
+    std::size_t liveBytes = 0;
+    FiberletChunkWriteBackCache::Stats statistics;
+    bool finished = false;
+};
+
+std::shared_ptr<FiberletChunkWriteBackCache>
+FiberletChunkWriteBackCache::create(Options options)
+{
+    return std::shared_ptr<FiberletChunkWriteBackCache>(
+        new FiberletChunkWriteBackCache(std::move(options)));
+}
+
+FiberletChunkWriteBackCache::FiberletChunkWriteBackCache(Options options)
+    : impl_(std::make_unique<Impl>(std::move(options)))
+{
+}
+
+FiberletChunkWriteBackCache::~FiberletChunkWriteBackCache()
+{
+    try {
+        finish();
+    } catch (...) {
+    }
+}
+
+std::uint64_t FiberletChunkWriteBackCache::registerLayer(
+    const std::filesystem::path& root, FiberletDatasetKind kind)
+{
+    if (kind == FiberletDatasetKind::Combined)
+        throw std::invalid_argument(
+            "fiberlet write-back layers cannot be combined datasets");
+    std::lock_guard lock(impl_->mutex);
+    if (impl_->finished)
+        throw std::logic_error("fiberlet write-back cache is finished");
+    impl_->layers.push_back({root.lexically_normal(), kind});
+    return impl_->layers.size();
+}
+
+std::optional<std::shared_ptr<const std::vector<std::byte>>>
+FiberletChunkWriteBackCache::read(
+    std::uint64_t layer,
+    FiberletStorageChunkKind kind,
+    const vc::render::ChunkKey& key) const
+{
+    const auto owner = Impl::ownerKey(layer, key);
+    std::lock_guard lock(impl_->mutex);
+    impl_->throwFirstFailureLocked();
+    const auto select = [&](const Impl::Buffers& buffers) {
+        if (kind == FiberletStorageChunkKind::Anchors)
+            return buffers.anchors;
+        if (kind == FiberletStorageChunkKind::FiberletPrefix)
+            return buffers.prefixes;
+        return buffers.routes;
+    };
+    if (auto found = impl_->residents.find(owner);
+        found != impl_->residents.end()) {
+        found->second.touch = ++impl_->nextTouch;
+        ++impl_->statistics.memoryHits;
+        return select(found->second.buffers);
+    }
+    if (const auto found = impl_->pending.find(owner);
+        found != impl_->pending.end()) {
+        ++impl_->statistics.memoryHits;
+        return select(found->second->buffers);
+    }
+    return std::nullopt;
+}
+
+void FiberletChunkWriteBackCache::replaceAnchor(
+    std::uint64_t layer,
+    const vc::render::ChunkKey& key,
+    std::span<const std::byte> bytes)
+{
+    if (impl_->layer(layer).kind != FiberletDatasetKind::Anchors)
+        throw std::invalid_argument(
+            "fiberlet write-back anchor layer has the wrong kind");
+    Impl::Buffers buffers;
+    buffers.anchors =
+        std::make_shared<const std::vector<std::byte>>(bytes.begin(), bytes.end());
+    impl_->replace(Impl::ownerKey(layer, key), std::move(buffers));
+}
+
+void FiberletChunkWriteBackCache::replacePair(
+    std::uint64_t layer,
+    const vc::render::ChunkKey& prefixKey,
+    std::span<const std::byte> prefix,
+    const vc::render::ChunkKey& routeKey,
+    std::span<const std::byte> routes)
+{
+    if (impl_->layer(layer).kind != FiberletDatasetKind::Fiberlets ||
+        prefixKey.level != 0 || routeKey.level != 1 ||
+        prefixKey.iz != routeKey.iz || prefixKey.iy != routeKey.iy ||
+        prefixKey.ix != routeKey.ix) {
+        throw std::invalid_argument(
+            "fiberlet write-back pair layer or keys are invalid");
+    }
+    Impl::Buffers buffers;
+    buffers.prefixes = std::make_shared<const std::vector<std::byte>>(
+        prefix.begin(), prefix.end());
+    buffers.routes = std::make_shared<const std::vector<std::byte>>(
+        routes.begin(), routes.end());
+    impl_->replace(Impl::ownerKey(layer, prefixKey), std::move(buffers));
+}
+
+FiberletChunkDataset::PairPresence FiberletChunkWriteBackCache::pairPresence(
+    std::uint64_t layer, const vc::render::ChunkKey& owner) const
+{
+    const auto key = Impl::ownerKey(layer, owner);
+    std::lock_guard lock(impl_->mutex);
+    impl_->throwFirstFailureLocked();
+    if (const auto found = impl_->residents.find(key);
+        found != impl_->residents.end()) {
+        return found->second.buffers.prefixes && found->second.buffers.routes
+            ? FiberletChunkDataset::PairPresence::Complete
+            : FiberletChunkDataset::PairPresence::Partial;
+    }
+    if (const auto found = impl_->pending.find(key);
+        found != impl_->pending.end()) {
+        return found->second->buffers.prefixes && found->second->buffers.routes
+            ? FiberletChunkDataset::PairPresence::Complete
+            : FiberletChunkDataset::PairPresence::Partial;
+    }
+    return FiberletChunkDataset::PairPresence::Absent;
+}
+
+FiberletChunkWriteBackCache::Stats FiberletChunkWriteBackCache::stats() const
+{
+    std::lock_guard lock(impl_->mutex);
+    auto result = impl_->statistics;
+    result.residentEntries = impl_->residents.size();
+    result.pendingEntries = impl_->pending.size();
+    result.liveBytes = impl_->liveBytes;
+    return result;
+}
+
+void FiberletChunkWriteBackCache::waitForSpills()
+{
+    impl_->writers.wait_idle();
+    std::lock_guard lock(impl_->mutex);
+    impl_->throwFirstFailureLocked();
+}
+
+void FiberletChunkWriteBackCache::finish()
+{
+    if (!impl_)
+        return;
+    std::exception_ptr failure;
+    try {
+        waitForSpills();
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    {
+        std::lock_guard lock(impl_->mutex);
+        if (!impl_->finished) {
+            impl_->finished = true;
+            impl_->residents.clear();
+            impl_->pending.clear();
+            impl_->liveBytes = 0;
+            if (impl_->decodedBudget) {
+                impl_->decodedBudget->setMaximumBytes(
+                    impl_->decodedBudgetMaximum);
+            }
+        }
+    }
+    if (failure)
+        std::rethrow_exception(failure);
+}
+
+std::vector<FiberletChunkWriteBackCache::LogicalFile>
+FiberletChunkWriteBackCache::logicalFiles(
+    const std::filesystem::path& root) const
+{
+    const auto normalized = root.lexically_normal();
+    const auto inside = [&](const std::filesystem::path& candidate) {
+        const auto relative = candidate.lexically_normal().lexically_relative(
+            normalized);
+        return !relative.empty() && *relative.begin() != "..";
+    };
+    std::vector<LogicalFile> result;
+    std::lock_guard lock(impl_->mutex);
+    impl_->throwFirstFailureLocked();
+    const auto append = [&](const Impl::OwnerKey& key,
+                            const Impl::Buffers& buffers) {
+        const auto add = [&](FiberletStorageChunkKind kind,
+                             const auto& bytes) {
+            if (!bytes)
+                return;
+            auto selected = impl_->path(key, kind);
+            if (inside(selected))
+                result.push_back({std::move(selected), bytes});
+        };
+        add(FiberletStorageChunkKind::Anchors, buffers.anchors);
+        add(FiberletStorageChunkKind::FiberletPrefix, buffers.prefixes);
+        add(FiberletStorageChunkKind::FiberletRoutes, buffers.routes);
+    };
+    for (const auto& [key, entry] : impl_->residents)
+        append(key, entry.buffers);
+    for (const auto& [key, entry] : impl_->pending)
+        append(key, entry->buffers);
+    std::sort(result.begin(), result.end(), [](const auto& left,
+                                               const auto& right) {
+        return left.path.generic_string() < right.path.generic_string();
+    });
+    return result;
+}
+
 void finalizeFiberletDatasetIdentity(FiberletDatasetMetadata& metadata)
 {
     if (!metadata.sources.is_object() || !metadata.processing.is_object())
@@ -828,12 +1344,22 @@ void finalizeFiberletDatasetIdentity(FiberletDatasetMetadata& metadata)
     }.dump());
 }
 
-FiberletChunkDataset::FiberletChunkDataset(std::filesystem::path root, FiberletDatasetMetadata metadata)
-    : root_(std::move(root)), metadata_(std::move(metadata))
+FiberletChunkDataset::FiberletChunkDataset(
+    std::filesystem::path root,
+    FiberletDatasetMetadata metadata,
+    std::shared_ptr<FiberletChunkWriteBackCache> writeBack)
+    : root_(std::move(root))
+    , metadata_(std::move(metadata))
+    , writeBack_(std::move(writeBack))
 {
+    if (writeBack_)
+        writeBackLayer_ = writeBack_->registerLayer(root_, metadata_.kind);
 }
 
-std::shared_ptr<FiberletChunkDataset> FiberletChunkDataset::createOrOpen(std::filesystem::path root, const FiberletDatasetMetadata& metadata)
+std::shared_ptr<FiberletChunkDataset> FiberletChunkDataset::createOrOpen(
+    std::filesystem::path root,
+    const FiberletDatasetMetadata& metadata,
+    std::shared_ptr<FiberletChunkWriteBackCache> writeBack)
 {
     validateMetadata(metadata);
     const auto expected = metadataJson(metadata);
@@ -862,7 +1388,8 @@ std::shared_ptr<FiberletChunkDataset> FiberletChunkDataset::createOrOpen(std::fi
         }
         removeLegacyBookkeeping(root);
     }
-    return std::shared_ptr<FiberletChunkDataset>(new FiberletChunkDataset(std::move(root), metadata));
+    return std::shared_ptr<FiberletChunkDataset>(new FiberletChunkDataset(
+        std::move(root), metadata, std::move(writeBack)));
 }
 
 std::shared_ptr<FiberletChunkDataset> FiberletChunkDataset::openExisting(
@@ -1013,6 +1540,20 @@ std::optional<FiberletChunkDataset::MaterializedChunk> FiberletChunkDataset::rea
         return MaterializedChunk{bytes, decodeFiberletChunkPayload(kind, bytes), true};
     }
 
+    if (writeBack_) {
+        if (const auto memory = writeBack_->read(
+                writeBackLayer_, kind, key)) {
+            auto bytes = **memory;
+            auto payload = decodeFiberletChunkPayload(kind, bytes);
+            requireMatchingCodec(
+                payloadConfig(kind, payload), codecConfig(kind, key));
+            materializationDecodes_[static_cast<std::size_t>(kind) - 1]
+                .fetch_add(1, std::memory_order_relaxed);
+            return MaterializedChunk{
+                std::move(bytes), std::move(payload), true};
+        }
+    }
+
     if (metadata_.kind == FiberletDatasetKind::Anchors) {
         auto bytes = readBytes(chunkPath(kind, key));
         if (!bytes)
@@ -1097,6 +1638,87 @@ void FiberletChunkDataset::publishFiberletChunkPair(
     }
     publishBytes(chunkPath(FiberletStorageChunkKind::FiberletPrefix, prefixKey), prefix.bytes);
     publishBytes(chunkPath(FiberletStorageChunkKind::FiberletRoutes, routeKey), routes.bytes);
+}
+
+void FiberletChunkDataset::replaceOverlayChunk(
+    FiberletStorageChunkKind kind,
+    const vc::render::ChunkKey& key,
+    const MaterializedChunk& chunk) const
+{
+    if (metadata_.kind != FiberletDatasetKind::Anchors ||
+        kind != FiberletStorageChunkKind::Anchors) {
+        throw std::invalid_argument(
+            "single fiberlet overlay replacement requires anchors");
+    }
+    if (!chunk.payload)
+        throw std::invalid_argument(
+            "fiberlet overlay replacement has no decoded payload");
+    requireMatchingCodec(
+        payloadConfig(kind, chunk.payload), codecConfig(kind, key));
+    if (writeBack_) {
+        writeBack_->replaceAnchor(writeBackLayer_, key, chunk.bytes);
+    } else {
+        vc::core::util::atomicWriteBytes(chunkPath(kind, key), chunk.bytes);
+    }
+}
+
+void FiberletChunkDataset::replaceOverlayChunkPair(
+    const vc::render::ChunkKey& prefixKey,
+    const MaterializedChunk& prefix,
+    const vc::render::ChunkKey& routeKey,
+    const MaterializedChunk& routes) const
+{
+    if (metadata_.kind != FiberletDatasetKind::Fiberlets ||
+        prefixKey.level != 0 || routeKey.level != 1 ||
+        prefixKey.iz != routeKey.iz || prefixKey.iy != routeKey.iy ||
+        prefixKey.ix != routeKey.ix || !prefix.payload || !routes.payload) {
+        throw std::invalid_argument(
+            "fiberlet overlay replacement pair is invalid");
+    }
+    requireMatchingCodec(
+        payloadConfig(
+            FiberletStorageChunkKind::FiberletPrefix, prefix.payload),
+        codecConfig(FiberletStorageChunkKind::FiberletPrefix, prefixKey));
+    requireMatchingCodec(
+        payloadConfig(
+            FiberletStorageChunkKind::FiberletRoutes, routes.payload),
+        codecConfig(FiberletStorageChunkKind::FiberletRoutes, routeKey));
+    requireMatchingFiberletPair(prefix.payload, routes.payload);
+    if (writeBack_) {
+        writeBack_->replacePair(
+            writeBackLayer_, prefixKey, prefix.bytes, routeKey, routes.bytes);
+    } else {
+        vc::core::util::atomicWriteBytes(
+            chunkPath(FiberletStorageChunkKind::FiberletPrefix, prefixKey),
+            prefix.bytes);
+        vc::core::util::atomicWriteBytes(
+            chunkPath(FiberletStorageChunkKind::FiberletRoutes, routeKey),
+            routes.bytes);
+    }
+}
+
+FiberletChunkDataset::PairPresence FiberletChunkDataset::pairPresence(
+    const vc::render::ChunkKey& owner) const
+{
+    if (metadata_.kind == FiberletDatasetKind::Anchors)
+        throw std::invalid_argument(
+            "fiberlet pair presence requires a path dataset");
+    if (writeBack_) {
+        const auto memory = writeBack_->pairPresence(writeBackLayer_, owner);
+        if (memory != PairPresence::Absent)
+            return memory;
+    }
+    const vc::render::ChunkKey prefix{0, owner.iz, owner.iy, owner.ix};
+    const vc::render::ChunkKey routes{1, owner.iz, owner.iy, owner.ix};
+    const bool prefixExists = std::filesystem::exists(chunkPath(
+        FiberletStorageChunkKind::FiberletPrefix, prefix));
+    const bool routeExists = std::filesystem::exists(chunkPath(
+        FiberletStorageChunkKind::FiberletRoutes, routes));
+    if (prefixExists && routeExists)
+        return PairPresence::Complete;
+    if (prefixExists || routeExists)
+        return PairPresence::Partial;
+    return PairPresence::Absent;
 }
 
 void FiberletChunkDataset::validateChunk(FiberletStorageChunkKind kind, const vc::render::ChunkKey& key, std::span<const std::byte> bytes) const
@@ -1204,21 +1826,12 @@ createOverlayFiberletPathChunkCache(
             FiberletStorageChunkKind kind,
             const vc::render::ChunkKey& requested,
             const FiberletStorageCodecConfig&) {
-            const vc::render::ChunkKey prefix{
-                0, requested.iz, requested.iy, requested.ix};
-            const vc::render::ChunkKey routes{
-                1, requested.iz, requested.iy, requested.ix};
-            const bool prefixExists = std::filesystem::exists(
-                layer->chunkPath(
-                    FiberletStorageChunkKind::FiberletPrefix, prefix));
-            const bool routeExists = std::filesystem::exists(
-                layer->chunkPath(
-                    FiberletStorageChunkKind::FiberletRoutes, routes));
-            if (prefixExists != routeExists) {
+            const auto presence = layer->pairPresence(requested);
+            if (presence == FiberletChunkDataset::PairPresence::Partial) {
                 throw std::runtime_error(
                     "fiberlet overlay contains a partial prefix/route pair");
             }
-            if (prefixExists) {
+            if (presence == FiberletChunkDataset::PairPresence::Complete) {
                 throw std::logic_error(
                     "materialized fiberlet overlay pair was not loaded");
             }
@@ -1252,7 +1865,7 @@ void replaceFiberletOverlayChunk(
     requireMonotoneSubset<FiberletStoredAnchor, FiberletStorageKey>(
         oldAnchors->anchors, newAnchors->anchors,
         [](const auto& value) { return value.key; }, sameAnchor, "anchor");
-    vc::core::util::atomicWriteBytes(layer->chunkPath(kind, key), chunk.bytes);
+    layer->replaceOverlayChunk(kind, key, chunk);
 }
 
 void replaceFiberletOverlayChunkPair(
@@ -1313,14 +1926,7 @@ void replaceFiberletOverlayChunkPair(
         }
         ++oldIndex;
     }
-    vc::core::util::atomicWriteBytes(
-        layer->chunkPath(
-            FiberletStorageChunkKind::FiberletPrefix, prefixKey),
-        prefix.bytes);
-    vc::core::util::atomicWriteBytes(
-        layer->chunkPath(
-            FiberletStorageChunkKind::FiberletRoutes, routeKey),
-        routes.bytes);
+    layer->replaceOverlayChunkPair(prefixKey, prefix, routeKey, routes);
 }
 
 }  // namespace vc::fiber_tracer

@@ -14,7 +14,9 @@
 #include <bit>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <limits>
+#include <mutex>
 #include <random>
 #include <set>
 
@@ -1825,5 +1827,247 @@ TEST_CASE("Fiberlet sparse overlays fall through and enforce monotone records")
     emptyPathCache->cancelPendingAndWait();
     baseAnchorCache->cancelPendingAndWait();
     basePathCache->cancelPendingAndWait();
+    std::filesystem::remove_all(root);
+}
+
+TEST_CASE("Fiberlet overlay write-back cache retains and spills serialized chunks")
+{
+    std::mt19937_64 random(std::random_device{}());
+    const auto root = std::filesystem::temp_directory_path() /
+        ("vc_fiberlet_write_back_" + std::to_string(random()));
+
+    FiberletDatasetMetadata anchorMetadata;
+    anchorMetadata.kind = FiberletDatasetKind::Anchors;
+    anchorMetadata.profile = FiberletStorageProfile::Float32Cache;
+    anchorMetadata.chunkGridShapeZYX = {1, 1, 1};
+    anchorMetadata.coordinateUnitsPerChunkZYX = {16, 16, 16};
+    anchorMetadata.maximumEndpointReachCoordinateUnitsZYX = {8, 8, 8};
+    anchorMetadata.spatialChunkSideBaseVoxels = 16;
+    anchorMetadata.predictionToBaseScale = 1.0;
+    finalizeFiberletDatasetIdentity(anchorMetadata);
+    auto pathMetadata = anchorMetadata;
+    pathMetadata.kind = FiberletDatasetKind::Fiberlets;
+    finalizeFiberletDatasetIdentity(pathMetadata);
+
+    const vc::render::ChunkKey owner{0, 0, 0, 0};
+    const vc::render::ChunkKey routeOwner{1, 0, 0, 0};
+    const auto budget =
+        std::make_shared<vc::render::DecodedChunkCacheBudget>(1U << 20);
+    const auto retained = FiberletChunkWriteBackCache::create({
+        1U << 20, 2, budget, {}});
+    auto anchors = FiberletChunkDataset::createOrOpen(
+        root / "retained-anchors", anchorMetadata, retained);
+    auto paths = FiberletChunkDataset::createOrOpen(
+        root / "retained-paths", pathMetadata, retained);
+    const auto anchor = materialized(
+        FiberletStorageChunkKind::Anchors,
+        serializeFiberletAnchors(
+            anchors->codecConfig(FiberletStorageChunkKind::Anchors, owner),
+            {}));
+    const auto prefix = materialized(
+        FiberletStorageChunkKind::FiberletPrefix,
+        serializeFiberletPrefixes(
+            paths->codecConfig(
+                FiberletStorageChunkKind::FiberletPrefix, owner),
+            {}));
+    const auto routes = materialized(
+        FiberletStorageChunkKind::FiberletRoutes,
+        serializeFiberletRoutes(
+            paths->codecConfig(
+                FiberletStorageChunkKind::FiberletRoutes, routeOwner),
+            {}));
+
+    anchors->replaceOverlayChunk(
+        FiberletStorageChunkKind::Anchors, owner, anchor);
+    paths->replaceOverlayChunkPair(owner, prefix, routeOwner, routes);
+    CHECK_FALSE(std::filesystem::exists(anchors->chunkPath(
+        FiberletStorageChunkKind::Anchors, owner)));
+    CHECK_FALSE(std::filesystem::exists(paths->chunkPath(
+        FiberletStorageChunkKind::FiberletPrefix, owner)));
+    CHECK_FALSE(std::filesystem::exists(paths->chunkPath(
+        FiberletStorageChunkKind::FiberletRoutes, routeOwner)));
+    REQUIRE(anchors->readMaterializedChunk(
+        FiberletStorageChunkKind::Anchors, owner));
+    REQUIRE(paths->readMaterializedChunk(
+        FiberletStorageChunkKind::FiberletPrefix, owner));
+    REQUIRE(paths->readMaterializedChunk(
+        FiberletStorageChunkKind::FiberletRoutes, routeOwner));
+    CHECK(paths->pairPresence(owner) ==
+          FiberletChunkDataset::PairPresence::Complete);
+    const auto retainedStats = retained->stats();
+    CHECK(retainedStats.residentEntries == 2);
+    CHECK(retainedStats.spills == 0);
+    CHECK(retainedStats.memoryHits == 3);
+    CHECK(retained->logicalFiles(root).size() == 3);
+    CHECK(budget->maximumBytes() < (1U << 20));
+    retained->finish();
+    CHECK(budget->maximumBytes() == (1U << 20));
+
+    const auto spilled = FiberletChunkWriteBackCache::create({1, 2, {}, {}});
+    auto spilledAnchors = FiberletChunkDataset::createOrOpen(
+        root / "spilled-anchors", anchorMetadata, spilled);
+    auto spilledPaths = FiberletChunkDataset::createOrOpen(
+        root / "spilled-paths", pathMetadata, spilled);
+    spilledAnchors->replaceOverlayChunk(
+        FiberletStorageChunkKind::Anchors, owner, anchor);
+    spilledPaths->replaceOverlayChunkPair(owner, prefix, routeOwner, routes);
+    spilled->waitForSpills();
+    CHECK(std::filesystem::exists(spilledAnchors->chunkPath(
+        FiberletStorageChunkKind::Anchors, owner)));
+    CHECK(std::filesystem::exists(spilledPaths->chunkPath(
+        FiberletStorageChunkKind::FiberletPrefix, owner)));
+    CHECK(std::filesystem::exists(spilledPaths->chunkPath(
+        FiberletStorageChunkKind::FiberletRoutes, routeOwner)));
+    CHECK(spilledPaths->pairPresence(owner) ==
+          FiberletChunkDataset::PairPresence::Complete);
+    CHECK(spilled->stats().spills == 2);
+    REQUIRE(spilledAnchors->readMaterializedChunk(
+        FiberletStorageChunkKind::Anchors, owner));
+    REQUIRE(spilledPaths->readMaterializedChunk(
+        FiberletStorageChunkKind::FiberletPrefix, owner));
+    REQUIRE(spilledPaths->readMaterializedChunk(
+        FiberletStorageChunkKind::FiberletRoutes, routeOwner));
+    spilled->finish();
+
+    std::filesystem::remove_all(root);
+}
+
+TEST_CASE("Fiberlet overlay write-back cache never exposes a partial pair")
+{
+    std::mt19937_64 random(std::random_device{}());
+    const auto root = std::filesystem::temp_directory_path() /
+        ("vc_fiberlet_write_back_failure_" + std::to_string(random()));
+    FiberletDatasetMetadata metadata;
+    metadata.kind = FiberletDatasetKind::Fiberlets;
+    metadata.profile = FiberletStorageProfile::Float32Cache;
+    metadata.chunkGridShapeZYX = {1, 1, 1};
+    metadata.coordinateUnitsPerChunkZYX = {16, 16, 16};
+    metadata.maximumEndpointReachCoordinateUnitsZYX = {8, 8, 8};
+    metadata.spatialChunkSideBaseVoxels = 16;
+    metadata.predictionToBaseScale = 1.0;
+    finalizeFiberletDatasetIdentity(metadata);
+
+    const vc::render::ChunkKey owner{0, 0, 0, 0};
+    const vc::render::ChunkKey routeOwner{1, 0, 0, 0};
+    auto write = [](const std::filesystem::path& path,
+                    std::span<const std::byte> bytes) {
+        if (path.parent_path().filename() == "routes")
+            throw std::runtime_error("injected route write failure");
+        vc::core::util::atomicWriteBytes(path, bytes);
+    };
+    const auto store = FiberletChunkWriteBackCache::create({1, 1, {}, write});
+    auto paths = FiberletChunkDataset::createOrOpen(root, metadata, store);
+    const auto prefix = materialized(
+        FiberletStorageChunkKind::FiberletPrefix,
+        serializeFiberletPrefixes(
+            paths->codecConfig(
+                FiberletStorageChunkKind::FiberletPrefix, owner),
+            {}));
+    const auto routes = materialized(
+        FiberletStorageChunkKind::FiberletRoutes,
+        serializeFiberletRoutes(
+            paths->codecConfig(
+                FiberletStorageChunkKind::FiberletRoutes, routeOwner),
+            {}));
+    CHECK_THROWS_WITH_AS(
+        paths->replaceOverlayChunkPair(owner, prefix, routeOwner, routes),
+        doctest::Contains("injected route write failure"),
+        std::runtime_error);
+    CHECK_FALSE(std::filesystem::exists(paths->chunkPath(
+        FiberletStorageChunkKind::FiberletPrefix, owner)));
+    CHECK_FALSE(std::filesystem::exists(paths->chunkPath(
+        FiberletStorageChunkKind::FiberletRoutes, routeOwner)));
+    CHECK_THROWS_WITH_AS(
+        store->finish(), doctest::Contains("injected route write failure"),
+        std::runtime_error);
+    std::filesystem::remove_all(root);
+}
+
+TEST_CASE("Fiberlet overlay write-back LRU remains readable during async spill")
+{
+    std::mt19937_64 random(std::random_device{}());
+    const auto root = std::filesystem::temp_directory_path() /
+        ("vc_fiberlet_write_back_lru_" + std::to_string(random()));
+    FiberletDatasetMetadata metadata;
+    metadata.kind = FiberletDatasetKind::Anchors;
+    metadata.profile = FiberletStorageProfile::Float32Cache;
+    metadata.chunkGridShapeZYX = {1, 1, 3};
+    metadata.coordinateUnitsPerChunkZYX = {16, 16, 16};
+    metadata.maximumEndpointReachCoordinateUnitsZYX = {8, 8, 8};
+    metadata.spatialChunkSideBaseVoxels = 16;
+    metadata.predictionToBaseScale = 1.0;
+    finalizeFiberletDatasetIdentity(metadata);
+    const auto probe = FiberletChunkDataset::createOrOpen(
+        root / "probe", metadata);
+    const std::array<vc::render::ChunkKey, 3> keys{
+        vc::render::ChunkKey{0, 0, 0, 0},
+        vc::render::ChunkKey{0, 0, 0, 1},
+        vc::render::ChunkKey{0, 0, 0, 2}};
+    std::array<FiberletChunkDataset::MaterializedChunk, 3> chunks;
+    for (std::size_t index = 0; index < keys.size(); ++index) {
+        chunks[index] = materialized(
+            FiberletStorageChunkKind::Anchors,
+            serializeFiberletAnchors(
+                probe->codecConfig(
+                    FiberletStorageChunkKind::Anchors, keys[index]),
+                {}));
+    }
+
+    std::promise<void> writerEntered;
+    std::promise<void> releaseWriter;
+    const auto release = releaseWriter.get_future().share();
+    std::atomic_bool firstWrite{true};
+    std::mutex writesMutex;
+    std::vector<std::filesystem::path> writes;
+    auto write = [&](const std::filesystem::path& path,
+                     std::span<const std::byte> bytes) {
+        {
+            std::lock_guard lock(writesMutex);
+            writes.push_back(path);
+        }
+        if (firstWrite.exchange(false)) {
+            writerEntered.set_value();
+            release.wait();
+        }
+        vc::core::util::atomicWriteBytes(path, bytes);
+    };
+    constexpr std::size_t entryOverhead = 256;
+    const std::size_t entryBytes = chunks[0].bytes.size() + entryOverhead;
+    const auto store = FiberletChunkWriteBackCache::create(
+        {entryBytes * 2, 1, {}, write});
+    auto dataset = FiberletChunkDataset::createOrOpen(
+        root / "cached", metadata, store);
+    dataset->replaceOverlayChunk(
+        FiberletStorageChunkKind::Anchors, keys[0], chunks[0]);
+    dataset->replaceOverlayChunk(
+        FiberletStorageChunkKind::Anchors, keys[1], chunks[1]);
+    REQUIRE(dataset->readMaterializedChunk(
+        FiberletStorageChunkKind::Anchors, keys[0]));
+
+    auto pressure = std::async(std::launch::async, [&] {
+        dataset->replaceOverlayChunk(
+            FiberletStorageChunkKind::Anchors, keys[2], chunks[2]);
+    });
+    writerEntered.get_future().wait();
+    REQUIRE(dataset->readMaterializedChunk(
+        FiberletStorageChunkKind::Anchors, keys[1]));
+    releaseWriter.set_value();
+    pressure.get();
+    store->waitForSpills();
+
+    {
+        std::lock_guard lock(writesMutex);
+        REQUIRE(writes.size() == 2);
+        CHECK(writes[0].filename() == "0.0.1");
+        CHECK(writes[1].filename() == "0.0.0");
+    }
+    CHECK(store->stats().spills == 2);
+    CHECK(std::filesystem::exists(dataset->chunkPath(
+        FiberletStorageChunkKind::Anchors, keys[0])));
+    CHECK(std::filesystem::exists(dataset->chunkPath(
+        FiberletStorageChunkKind::Anchors, keys[1])));
+    CHECK_FALSE(std::filesystem::exists(dataset->chunkPath(
+        FiberletStorageChunkKind::Anchors, keys[2])));
+    store->finish();
     std::filesystem::remove_all(root);
 }

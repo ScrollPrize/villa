@@ -18,6 +18,8 @@
 namespace vc::fiber_tracer
 {
 
+class FiberletChunkWriteBackCache;
+
 struct FiberletIncidentPrefix {
     DirectedFiberletStorageId id;
     FiberletStoredPrefix prefix;
@@ -112,7 +114,10 @@ public:
         std::size_t routeDecodes = 0;
     };
 
-    static std::shared_ptr<FiberletChunkDataset> createOrOpen(std::filesystem::path root, const FiberletDatasetMetadata& metadata);
+    static std::shared_ptr<FiberletChunkDataset> createOrOpen(
+        std::filesystem::path root,
+        const FiberletDatasetMetadata& metadata,
+        std::shared_ptr<FiberletChunkWriteBackCache> writeBack = {});
     // Open and validate an existing dataset using its authoritative metadata;
     // callers do not supply a duplicate configuration.
     static std::shared_ptr<FiberletChunkDataset> openExisting(
@@ -146,16 +151,107 @@ public:
         const MaterializedChunk& prefix,
         const vc::render::ChunkKey& routeKey,
         const MaterializedChunk& routes) const;
+    void replaceOverlayChunk(
+        FiberletStorageChunkKind kind,
+        const vc::render::ChunkKey& key,
+        const MaterializedChunk& chunk) const;
+    void replaceOverlayChunkPair(
+        const vc::render::ChunkKey& prefixKey,
+        const MaterializedChunk& prefix,
+        const vc::render::ChunkKey& routeKey,
+        const MaterializedChunk& routes) const;
+    enum class PairPresence {
+        Absent,
+        Complete,
+        Partial,
+    };
+    [[nodiscard]] PairPresence pairPresence(
+        const vc::render::ChunkKey& owner) const;
     void validateChunk(FiberletStorageChunkKind kind, const vc::render::ChunkKey& key, std::span<const std::byte> bytes) const;
 
 private:
-    FiberletChunkDataset(std::filesystem::path root, FiberletDatasetMetadata metadata);
+    FiberletChunkDataset(
+        std::filesystem::path root,
+        FiberletDatasetMetadata metadata,
+        std::shared_ptr<FiberletChunkWriteBackCache> writeBack = {});
 
     std::filesystem::path root_;
     FiberletDatasetMetadata metadata_;
     std::vector<vc::render::ChunkKey> expectedChunks_;
     bool expectedChunksConfigured_ = false;
     mutable std::array<std::atomic_size_t, 3> materializationDecodes_{};
+    std::shared_ptr<FiberletChunkWriteBackCache> writeBack_;
+    std::uint64_t writeBackLayer_ = 0;
+};
+
+class FiberletChunkWriteBackCache final
+{
+public:
+    struct Options {
+        std::size_t maximumBytes = 0;
+        std::size_t writerThreads = 1;
+        std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedBudget;
+        std::function<void(
+            const std::filesystem::path&, std::span<const std::byte>)>
+            writeBytes;
+    };
+
+    struct Stats {
+        std::size_t residentEntries = 0;
+        std::size_t pendingEntries = 0;
+        std::size_t liveBytes = 0;
+        std::size_t peakLiveBytes = 0;
+        std::size_t memoryHits = 0;
+        std::size_t spills = 0;
+        std::size_t spilledBytes = 0;
+    };
+
+    struct LogicalFile {
+        std::filesystem::path path;
+        std::shared_ptr<const std::vector<std::byte>> bytes;
+    };
+
+    static std::shared_ptr<FiberletChunkWriteBackCache> create(
+        Options options);
+    ~FiberletChunkWriteBackCache();
+
+    FiberletChunkWriteBackCache(const FiberletChunkWriteBackCache&) = delete;
+    FiberletChunkWriteBackCache& operator=(
+        const FiberletChunkWriteBackCache&) = delete;
+
+    [[nodiscard]] Stats stats() const;
+    void waitForSpills();
+    void finish();
+    [[nodiscard]] std::vector<LogicalFile> logicalFiles(
+        const std::filesystem::path& root) const;
+
+private:
+    friend class FiberletChunkDataset;
+    struct Impl;
+
+    explicit FiberletChunkWriteBackCache(Options options);
+    [[nodiscard]] std::uint64_t registerLayer(
+        const std::filesystem::path& root, FiberletDatasetKind kind);
+    [[nodiscard]] std::optional<std::shared_ptr<const std::vector<std::byte>>>
+    read(
+        std::uint64_t layer,
+        FiberletStorageChunkKind kind,
+        const vc::render::ChunkKey& key) const;
+    void replaceAnchor(
+        std::uint64_t layer,
+        const vc::render::ChunkKey& key,
+        std::span<const std::byte> bytes);
+    void replacePair(
+        std::uint64_t layer,
+        const vc::render::ChunkKey& prefixKey,
+        std::span<const std::byte> prefix,
+        const vc::render::ChunkKey& routeKey,
+        std::span<const std::byte> routes);
+    [[nodiscard]] FiberletChunkDataset::PairPresence pairPresence(
+        std::uint64_t layer,
+        const vc::render::ChunkKey& owner) const;
+
+    std::unique_ptr<Impl> impl_;
 };
 
 using FiberletChunkGenerator =

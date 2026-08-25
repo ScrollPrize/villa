@@ -902,6 +902,24 @@ error, never a fallback. The initial caches remain persistent and unchanged;
 derived stage directories are temporary for this experiment and are deleted
 after reporting.
 
+Temporary stage payloads are memory-first. One write-back LRU retains their
+canonical serialized bytes under the existing `--cache-gib` allowance, so a
+later box or stage reads the current overlay directly without an intermediate
+file write and reread. Only memory pressure evicts entries. Evicted entries are
+written atomically by a bounded background writer while route work continues;
+queued buffers remain charged until the write releases them. Anchor chunks are
+single entries, while each Fiberlet prefix/routes owner is one paired entry and
+can never fall through or fail as a partial pair. The write-back allocation is
+subtracted from the shared decoded-chunk budget rather than creating an
+additional unbounded cache.
+
+`--stats` reports `fiberlet_write_back_cache` residency, memory hits, spills,
+spilled bytes, and peak charged bytes. Payload diagnostics hash the logical
+memory-plus-disk layer without forcing clean memory entries to disk. At command
+teardown, already queued writes drain, unspilled temporary entries are dropped,
+the decoded-cache allowance is restored, and the invocation-local tree is
+removed.
+
 Boxes execute serially in deterministic Z/Y/X order. Later overlapping boxes
 in one stage read earlier writes from that same stage. Only Fiberlets whose
 canonical first endpoint lies in the current half-open box may be removed.
@@ -950,6 +968,14 @@ stage-one exact route analysis from 0.852 s to 0.108 s. Search workers read one
 immutable local graph through fixed strided index partitions and keep their
 heap and ancestry scratch thread-local, so the per-entry trace loop performs no
 scheduling or synchronization.
+
+After adding the memory-first write-back layer, the established four-stage
+Paris4 workload measured 2.89/2.90/2.90 s wall (min/median/max) versus the
+immediately preceding 3.93 s median on the same checkout and workload. The
+321 temporary logical entries occupied 5,556,963 bytes, stayed below the shared
+budget, and caused zero spills. All four retained-ID hashes, all four logical
+payload hashes, and the final 3,368-anchor/35,027-Fiberlet/4,469-interior
+population remained exact.
 
 For each processed box, the command also constructs an exact in-memory
 simplified graph. Directed states outside the intersection of

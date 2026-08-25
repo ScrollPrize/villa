@@ -1,12 +1,10 @@
-# Status: staged Fiberlet reduction performance and reporting
+# Status: write-back memory cache for temporary Fiberlet reduction layers
 
-- [x] Capture the corrected task and detailed plan.
+- [x] Capture the task and implementation plan.
 - [x] Complete independent plan review against task/spec/plan.
-- [x] Establish the optimized current-tree baseline and exact hashes.
-- [x] Implement chunk-granular local graph materialization.
-- [x] Parallelize cache-free transition construction.
-- [x] Restore stage-local `all` statistics and remove redundant population work.
-- [x] Add focused deterministic regression coverage.
+- [x] Implement the shared bounded write-back store.
+- [x] Integrate temporary staged overlays and logical hashing.
+- [x] Add focused persistence, eviction, pairing, and determinism tests.
+- [x] Build and run focused Clang Debug and GCC Release validation.
+- [x] Benchmark the four-stage Paris4 workload and verify exact outputs.
 - [x] Update specification, documentation, changelog, and task log.
-- [x] Build and run focused Debug and Release validation.
-- [x] Repeat the exact benchmark and verify semantic/payload hashes.

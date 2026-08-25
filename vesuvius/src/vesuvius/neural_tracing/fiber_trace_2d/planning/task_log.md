@@ -1,128 +1,93 @@
-# Task log: staged Fiberlet reduction performance and reporting
+# Task log: write-back memory cache for temporary Fiberlet reduction layers
 
-## Starting state
+## Baseline
 
-- The previous implementation improved the established Release workload from a
-  median 8.09 s to 4.55 s, but did not meet the requested order-of-magnitude
-  improvement.
-- A run through the Debug CI binary regressed from the earlier 52.03 s baseline
-  to 66.67 s wall, 139.37 s user, and 6.00 s system.
-- Built-in phase timing shows local graph materialization and simplification
-  remain mostly serial. The current stage report additionally materializes the
-  original, input, and output graph populations separately.
-- The stage-local population structure accidentally dropped all incident
-  Fiberlets and retained only interior Fiberlets.
-- Earlier parallel point-query cache reads were measured and reverted because
-  they caused lock contention. This task instead uses chunk-granular reads and
-  parallelizes only cache-free work.
+- Committed predecessor: `9230f63d7`.
+- User four-stage Release run: 4.369 s wall, 7.766 s user, 2.646 s system.
+- Local four-stage Release run: 4.18 s wall, 8.16 s user, 2.73 s system,
+  540,220 KiB peak RSS.
+- Local detailed phases totaled approximately 0.34 s materialization, 0.26 s
+  exact analysis, 0.48 s simplification, 1.28 s overlay writes, and 0.73 s
+  population scans. Temporary dataset setup, metadata, reporting, and cleanup
+  account for the remaining time.
+- `/tmp` is tmpfs on this host while the benchmark output is compressed Btrfs.
+  The implementation will nevertheless use a bounded memory-first abstraction,
+  not rely on a host-specific temporary filesystem optimization.
 
 ## Invariants
 
-- Existing stage retained-ID and serialized payload digests must remain:
-  - stage 1 IDs `fnv1a64:7f6182d7e61b00da`, payload
-    `fnv1a64:93f875a8fd522366`
-  - stage 2 IDs `fnv1a64:fa6a9290546392be`, payload
-    `fnv1a64:4eed9c714ad148ec`
-- No numerical, ordering, or acceptance change is permitted.
+- No numerical, acceptance, canonical-order, retained-ID, or serialized-byte
+  change.
+- Prefix and route chunks are one atomic logical owner entry.
+- Authoritative input caches remain durable and unchanged.
 
 ## Independent plan review
 
-- The review required the inherited stage-input population to remain a real
-  pre-write snapshot; sequential per-box analyses cannot replace it.
-- The existing specification defines stage `interior` per complete stage box,
-  not over the geometric union. The plan now states this explicitly and tests
-  a Fiberlet crossing between adjacent boxes as `all` but not `interior`.
-- The bulk path must preserve evaluated anchor views, exact owner reach,
-  canonical error/order behavior, both edge-cost views, and deterministic
-  lowest-index worker failure selection.
-- A same-input hotspot profile was added to the required measurements.
+- The store must retain serialized buffers only; decoded payloads remain owned
+  and accounted by `ChunkCache`.
+- Pending writer buffers remain charged until release. The store dynamically
+  reduces/restores the existing shared decoded budget and uses backpressure
+  when dirty plus pending memory exhausts it.
+- Owner generations, pair-level states, deterministic error selection, an
+  explicit `finish()`, and logical memory-plus-disk hashing are required.
+- Mutable stage replacement remains separate from immutable authoritative
+  publication. Runtime prefix/route visibility is atomic, while the unchanged
+  two-file layout is explicitly not crash-transactional.
+- Tests must cover forced spill, failures, rewrites, pair visibility, budget
+  restoration, no-spill teardown, and one-versus-many-thread equivalence.
 
 ## Implementation
 
-- Added chunk-level route access and exact incident-prefix owner enumeration to
-  the shared graph source.
-- Reworked local graph materialization to read every required anchor, prefix,
-  and route chunk once. Directed arcs retain their existing canonical order;
-  transitions still call the shared normal/tangent-aware scorer.
-- Parallelized cache-free transition construction, per-entry exact searches,
-  Fiberlet/anchor serialization, and independent overlay publication through
-  reusable thread pools. Indexed outputs and ordered exception scans preserve
-  deterministic results.
-- Assigned exact entry searches to fixed strided worker partitions. Each
-  worker reads the immutable materialized graph and owns reusable thread-local
-  heap, ancestry, length, count, and terminal buffers; there is no scheduler,
-  lock, or atomic operation in the per-entry search loop.
-- Compacted exact-search ancestry to a 32-bit arc and 32-bit parent while
-  retaining length and Fiberlet count in worker-local side arrays. This reduces
-  allocation and memory traffic without changing queue order or loss math.
-- Reworked overlay writing to operate on bulk payloads instead of repeated
-  endpoint, incident-edge, and route point queries.
-- Restored stage-local `all` Fiberlet populations alongside `anchors` and
-  per-box `interior`, and retained the complete selected-region joint report.
-- Confirmed the canonical `volume-cartographer/build` tree is Release with
-  `CMAKE_CXX_FLAGS_RELEASE=-O3 -DNDEBUG` and rebuilt its ordinary binary.
+- Added one shared `FiberletChunkWriteBackCache` for all invocation-local
+  reduction stages. It retains only canonical serialized buffers; decoded
+  payloads remain owned by the ordinary `ChunkCache` LRU.
+- Anchor owners are individual LRU entries. Fiberlet prefix/routes owners are
+  one paired entry for replacement, pending visibility, eviction, write, and
+  failure handling.
+- Dirty and queued entries reduce the existing shared decoded-cache ceiling.
+  Deterministic LRU pressure queues a batch to a 75% resident low-water mark,
+  then applies backpressure only until actual completed writes return total
+  charged memory below the hard limit.
+- Reads resolve latest resident/pending bytes before spilled disk bytes. Stage
+  hashes overlay those same logical bytes on metadata and spilled files without
+  flushing the cache.
+- `finish()` drains queued writes, restores the decoded budget, discards cleanly
+  unspilled invocation-local data, and precedes temporary-tree cleanup.
 
 ## Validation
 
-- Release and Clang Debug `test_fiberlet_storage`: 28 cases passed.
-- Clang Debug `test_fiberlet_paths`: 87 cases passed.
-- Release `test_fiberlet_paths` retains its pre-existing 295 bit-exact
-  optimized-float failures at `test_fiberlet_paths.cpp:414`; this change does
-  not alter that arithmetic.
-- Added one-versus-four-thread analysis/simplification equivalence checks, bulk
-  versus point route decode checks, a non-identity anchor view, and adjacent
-  stage-box `all` versus `interior` coverage.
-- `git diff --check` passes.
+- Release build:
+  `TMPDIR=volume-cartographer/build/tmp cmake --build volume-cartographer/build --target vc_fiberlets test_fiberlet_storage -j 32`
+- Focused Release suite:
+  `TMPDIR=volume-cartographer/build/tmp volume-cartographer/build/bin/test_fiberlet_storage`
+  passed all 31 test cases.
+- The Clang Debug `vc_fiberlets` and `test_fiberlet_storage` targets built, and
+  the same focused suite passed all 31 cases there as well.
+- New tests cover no-spill memory reads and teardown, forced spill with a
+  sub-entry budget, decoded-budget restoration, prefix/route pair visibility
+  and injected write failure cleanup, deterministic LRU order, and reading a
+  pending entry while its asynchronous writer is deliberately blocked.
+- The detailed 32-thread Paris4 run reproduced exact stage ID/payload hashes:
+  `7f6182d7e61b00da/93f875a8fd522366`,
+  `fa6a9290546392be/4eed9c714ad148ec`,
+  `7149465030b4c810/ffce8c90f177a00b`, and
+  `3179a829e68eee48/b4a201a335778b17`.
+- A detailed one-thread run reproduced those same four ID/payload pairs and all
+  stage/joint counts exactly.
+- Final counts remained 3,368 anchors, 35,027 all Fiberlets, and 4,469 interior
+  Fiberlets. The cache reported 321 resident entries, 5,556,963 peak/live
+  bytes, 636 memory hits, and zero spills.
+- Three warm Release runs measured 2.90, 2.89, and 2.90 s wall; 7.85, 7.94,
+  and 7.82 s user; 1.81, 1.65, and 1.70 s system; and 537,360, 538,844, and
+  537,928 KiB peak RSS. Wall min/median/max is 2.89/2.90/2.90 s versus the
+  3.93 s preceding median, a 26.2% reduction.
 
-## Release benchmark
+## Environment note
 
-Command and input:
-
-```bash
-/usr/bin/time -f 'TIME real=%e user=%U sys=%S cpu=%P rss_kb=%M' volume-cartographer/build/bin/vc_fiberlets chunk-route-stats /home/hendrik/business/aiconsulting/vesuviuschallenge/data/s1/PHercParis4.volpkg/volumes/fiber_s1_002.lasagna.json /home/hendrik/business/aiconsulting/vesuviuschallenge/data/workdir3/fiberlet-replay-full --normal-manifest /home/hendrik/business/aiconsulting/vesuviuschallenge/data/lasagna3d_inf/las008_s1_full/las_008.lasagna.json --chunk 23040,17920,54784 --region-size 512 --mode staged --stage 256,0,0,0 --stage 256,128,128,128 --storage-chunk-side 128 --anchor-cache /home/hendrik/business/aiconsulting/vesuviuschallenge/data/workdir3/fiberlet-replay-full/cache/fnv1a64-065534383aa4f342/anchors.zarr --fiberlet-cache /home/hendrik/business/aiconsulting/vesuviuschallenge/data/workdir3/fiberlet-replay-full/cache/fnv1a64-c534c99591e9caf1/fiberlets.zarr --threads 32 --stats
-```
-
-- Original Release: 7.97/8.09/9.32 s wall, min/median/max.
-- Final hot Release: 2.44/2.46/2.49 s wall, min/median/max.
-- Final process CPU: 217-221%; user 3.82-3.88 s, system 1.54-1.62 s.
-- Speedup: 3.29x by median.
-- A controlled hot run measured stage-one exact analysis at 0.852 s with one
-  thread and 0.108 s with 32 threads, a 7.9x wall-time speedup. The 32-thread
-  analysis consumed 1.466 CPU seconds, or 13.5 effective cores; its short,
-  uneven searches and shared memory bandwidth limit scaling below 32x.
-- Stage 1 ID/payload hashes remained
-  `fnv1a64:7f6182d7e61b00da` / `fnv1a64:93f875a8fd522366`.
-- Stage 2 ID/payload hashes remained
-  `fnv1a64:fa6a9290546392be` / `fnv1a64:4eed9c714ad148ec`.
-
-The final stage-local table reports:
-
-```text
-stage scope    original input output stage_reduction cumulative_reduction
-1     anchors  4371     4371  4002   8.44%           8.44%
-1     all      78462    78462 48393  38.32%          38.32%
-1     interior 34287    34287 5281   84.60%          84.60%
-2     anchors  631      612   543    11.27%          13.95%
-2     all      13750    6638  3801   42.74%          72.36%
-2     interior 5730     3397  563    83.43%          90.17%
-```
-
-## Hotspot profile
-
-Callgrind ran the same Release input with `--threads 1` because Callgrind
-aborted after accumulating roughly 500 thread records in the 32-thread run.
-It collected 24.72 billion instructions. Exact per-entry route search was the
-largest resolved exclusive function at 4.47 billion instructions (18.10%).
-Release phase timing at 32 threads shows stage-one materialization at about
-0.25 s and 4.1 effective cores, exact analysis at about 0.11 s and 13.5 cores,
-and simplification at about 0.17 s and one core. Publication and filesystem
-work remain the largest wall-time component and are bounded by record-exact
-temporary overlay writes rather than graph cache point queries.
-
-## Limitation
-
-- The measured Release median speedup is 3.29x, not the requested 10x.
-  Deterministic overlapping-box semantics keep boxes serial, while record-exact
-  temporary overlay publication and single-threaded simplification now account
-  for most remaining wall time. The Debug-to-Release difference is deliberately
-  excluded from the algorithmic speedup.
+- `/tmp` reached its per-user tmpfs quota during validation even though `df`
+  reported nominal free capacity. Builds and tests therefore used the existing
+  build tree as `TMPDIR`; this does not affect the implementation or results.
+- Focused tests consolidate related cases rather than injecting every possible
+  anchor/prefix failure separately. The pair route-write failure exercises the
+  shared pair cleanup/error path; the default atomic writer remains covered by
+  both ordinary dataset tests and forced successful spill.

@@ -1,3 +1,15 @@
+# 2026-08-24: memory-first staged Fiberlet overlays
+
+- Added a shared bounded write-back LRU for invocation-local reduction layers.
+  Later boxes and stages read serialized anchor and paired prefix/route chunks
+  directly from memory; asynchronous atomic writes occur only under shared
+  cache pressure, with pending buffers still charged to the budget.
+- Logical stage hashing now combines metadata, spilled chunks, and latest
+  in-memory chunks without forcing a flush. Exact stage ID/payload hashes and
+  final populations remain unchanged.
+- The hot four-stage Paris4 Release workload improved from a 3.93 s median to
+  2.90 s; its 5.56 MB of temporary payloads required no disk spills.
+
 # 2026-08-24: arbitrary staged Fiberlet graph reduction
 
 - Replaced point-query graph construction with chunk-granular anchor,

@@ -971,17 +971,30 @@ std::string stringHash(const std::string& value)
     return output.str();
 }
 
-std::string directoryHash(const std::filesystem::path& root)
+std::string directoryHash(
+    const std::filesystem::path& root,
+    const std::shared_ptr<
+        vc::fiber_tracer::FiberletChunkWriteBackCache>& writeBack = {})
 {
-    std::vector<std::filesystem::path> files;
+    std::map<std::string, std::filesystem::path> files;
     for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
-        if (entry.is_regular_file())
-            files.push_back(entry.path());
+        if (!entry.is_regular_file())
+            continue;
+        const auto relative =
+            std::filesystem::relative(entry.path(), root).generic_string();
+        files.emplace(relative, entry.path());
     }
-    std::sort(files.begin(), files.end(), [&](const auto& left, const auto& right) {
-        return std::filesystem::relative(left, root).generic_string() <
-            std::filesystem::relative(right, root).generic_string();
-    });
+    std::map<std::string, std::shared_ptr<const std::vector<std::byte>>>
+        memory;
+    if (writeBack) {
+        writeBack->waitForSpills();
+        for (const auto& file : writeBack->logicalFiles(root)) {
+            const auto relative =
+                std::filesystem::relative(file.path, root).generic_string();
+            files.try_emplace(relative, file.path);
+            memory.insert_or_assign(relative, file.bytes);
+        }
+    }
     std::uint64_t hash = 14695981039346656037ULL;
     const auto append = [&](std::span<const char> bytes) {
         for (const unsigned char byte : bytes) {
@@ -990,11 +1003,16 @@ std::string directoryHash(const std::filesystem::path& root)
         }
     };
     std::array<char, 64 * 1024> buffer{};
-    for (const auto& path : files) {
-        const auto relative = std::filesystem::relative(path, root).generic_string();
+    for (const auto& [relative, path] : files) {
         append(std::span{relative.data(), relative.size()});
         const char separator = '\0';
         append(std::span{&separator, std::size_t{1}});
+        if (const auto found = memory.find(relative); found != memory.end()) {
+            append(std::span{
+                reinterpret_cast<const char*>(found->second->data()),
+                found->second->size()});
+            continue;
+        }
         std::ifstream input(path, std::ios::binary);
         if (!input)
             throw std::runtime_error("cannot hash file: " + path.string());
@@ -1640,6 +1658,17 @@ int runStagedChunkRouteReduction(
     } while (std::filesystem::exists(temporary.root));
     std::filesystem::create_directories(temporary.root);
 
+    const auto decodedBudget = cacheOptions.service.decodedByteBudget;
+    const std::size_t writeBackBytes = decodedBudget
+        ? decodedBudget->maximumBytes()
+        : cacheOptions.service.decodedByteCapacity;
+    auto writeBack = FiberletChunkWriteBackCache::create({
+        writeBackBytes,
+        1,
+        decodedBudget,
+        {},
+    });
+
     auto viewMetadata = preprocessor->anchorDataset()->metadata();
     viewMetadata.processing["reduction_view"] = {
         {"contract", "evaluated_anchor_view_v1"},
@@ -1771,9 +1800,9 @@ int runStagedChunkRouteReduction(
         const auto stageRoot = temporary.root /
             ("stage-" + std::to_string(stageIndex + 1));
         auto stageAnchors = FiberletChunkDataset::createOrOpen(
-            stageRoot / "anchors.zarr", anchorMetadata);
+            stageRoot / "anchors.zarr", anchorMetadata, writeBack);
         auto stageFiberlets = FiberletChunkDataset::createOrOpen(
-            stageRoot / "fiberlets.zarr", fiberletMetadata);
+            stageRoot / "fiberlets.zarr", fiberletMetadata, writeBack);
         const auto started = std::chrono::steady_clock::now();
         std::vector<FiberletChunkRouteSimplificationReport>
             simplifications;
@@ -1861,7 +1890,7 @@ int runStagedChunkRouteReduction(
         }
         if (options.printStats) {
             activity.idDigest = fiberletIdHash(population.physicalFiberletIds);
-            activity.payloadDigest = directoryHash(stageRoot);
+            activity.payloadDigest = directoryHash(stageRoot, writeBack);
         }
         activities.push_back(activity);
         if (options.printStats) {
@@ -1957,6 +1986,19 @@ int runStagedChunkRouteReduction(
     current.anchorCache->cancelPendingAndWait();
     current.fiberletCache->cancelPendingAndWait();
     viewCache->cancelPendingAndWait();
+    writeBack->waitForSpills();
+    if (options.printStats) {
+        const auto stats = writeBack->stats();
+        std::cout << "fiberlet_write_back_cache"
+                  << " resident_entries=" << stats.residentEntries
+                  << " pending_entries=" << stats.pendingEntries
+                  << " live_bytes=" << stats.liveBytes
+                  << " peak_live_bytes=" << stats.peakLiveBytes
+                  << " memory_hits=" << stats.memoryHits
+                  << " spills=" << stats.spills
+                  << " spilled_bytes=" << stats.spilledBytes << '\n';
+    }
+    writeBack->finish();
     return 0;
 }
 

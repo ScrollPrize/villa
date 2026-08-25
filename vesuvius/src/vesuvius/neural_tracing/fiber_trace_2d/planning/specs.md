@@ -3704,6 +3704,20 @@
   chunks. Every derived stage uses separate temporary anchor and Fiberlet
   overlays with exactly the initial datasets' storage layout and encoding; the
   initial persistent caches are never rewritten.
+- Invocation-local stage overlays use one shared, bounded write-back LRU of
+  canonical serialized chunk bytes. Dirty anchor chunks and atomic
+  prefix/route owner pairs remain in memory and are read there by later boxes
+  and stages. They are not written merely to move between stages. When the
+  shared `--cache-gib` allowance is exhausted, deterministic LRU victims spill
+  through bounded asynchronous atomic writes; resident and queued/writing
+  bytes remain charged until their storage is released, and the ordinary
+  decoded-chunk allowance is reduced by the same amount. A prefix/route pair is
+  one eviction, visibility, and failure unit. Unspilled temporary bytes are
+  discarded only after all caches stop and outstanding spills drain.
+- Detailed stage payload hashes cover the logical union of metadata, spilled
+  files, and current memory/pending chunks without forcing a flush. Newer
+  in-memory bytes shadow an older spilled file at the same relative path. This
+  logical hash must equal the hash of fully durable identical payloads.
 - A missing upper chunk falls through unchanged to the preceding layer. An
   explicit empty payload shadows lower data through arbitrary layer depth.
   Fiberlet fallback requires both prefix and route members to be absent;

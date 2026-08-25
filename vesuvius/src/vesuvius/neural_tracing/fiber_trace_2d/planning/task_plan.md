@@ -1,94 +1,90 @@
-# Plan: finish staged Fiberlet reduction performance and reporting
+# Plan: write-back memory cache for temporary Fiberlet reduction layers
 
 ## Baseline and invariants
 
-1. Build the current tree in the ordinary `volume-cartographer/build/`
-   directory as Release and run the established hot Paris4 two-stage workload.
-   Record repeated wall/user/system time, actual effective cores, stage phase
-   timings, retained-ID digests, payload digests, and all output counts.
-2. Treat the existing canonical ordering, floating-point operations, retained
-   ID sets, and serialized overlay bytes as invariants. No numerical or
-   acceptance change is allowed.
+1. Use the committed Release binary and the established four-stage Paris4
+   workload as the baseline: 4.37 s wall from the user run and 4.18 s locally.
+2. Preserve canonical stage counts, retained-ID digests, serialized payload
+   bytes, prefix/route pairing, monotone removal, and deterministic errors.
 
-## Chunk-granular graph materialization
+## Shared write-back store
 
-1. Replace per-anchor `incidentEdges`, per-direction `directedEdge`, and
-   per-transition cache queries in `materializeChunkRouteGraph` with a shared
-   bulk path:
-   - load each seed anchor chunk once;
-   - union the exact per-inside-anchor owner-reach cubes, load each resulting
-     prefix-owner chunk once, and select prefixes incident to the transformed
-     canonical inside-anchor-key set;
-   - load each required endpoint-anchor chunk once through the same anchor view;
-   - construct the same sorted physical Fiberlet and directed-arc arrays from
-     those immutable payloads.
-2. Build transitions from already materialized arcs and shared anchors, using
-   the existing `storedTransition` implementation. Parallelize this cache-free
-   per-incoming-arc work with indexed result slots and merge counts in canonical
-   order, including deterministic lowest-index exception selection.
-3. Keep one shared materialized graph for analysis and simplification. Do not
-   duplicate scoring or transition logic in the CLI.
+1. Add a reusable temporary Fiberlet write-back store in the existing
+   `FiberletDataset` module. Do not duplicate serializers, validators, atomic
+   publication, or overlay fallback behavior in the CLI.
+2. Key entries by a stable registered layer ordinal plus owner chunk. Store
+   only canonical serialized bytes: either one anchor buffer or one atomic
+   prefix/route pair. Decoded payload ownership and accounting remain exclusive
+   to `ChunkCache`, avoiding duplicate residency and double accounting.
+3. Use a per-owner generation and explicit `ResidentDirty -> Queued/Writing ->
+   SpilledClean` state. A rewrite serializes behind an older pending generation;
+   an old completion can never erase or shadow newer bytes. Reads use resident
+   or still-owned pending bytes, otherwise wait only for that key before disk.
+4. Maintain deterministic LRU victim choice by access epoch with stable
+   layer/kind/ZYX tie-breaking. Logical output determinism is independent of
+   concurrent touch order; writer completion order never selects errors or
+   content.
+5. Share one store across all temporary stages. Charge resident dirty buffers,
+   queued/writing buffers until actual release, and conservative entry overhead.
+   Reduce the existing graph `DecodedChunkCacheBudget` ceiling by exactly that
+   live amount, preserving the existing evaluation-cache reservation. If live
+   write-back bytes exceed the shared ceiling, queue oldest resident entries
+   and apply bounded backpressure until pending buffers are actually released.
+   One active return-value copy may transiently exceed the ceiling.
+6. Use a bounded asynchronous writer queue. Prefix and route buffers share one
+   job and remain logically visible as a pair until both files succeed. On
+   failure remove partial new output, retain the deterministic lowest logical
+   key error, and fail explicitly. Runtime visibility is pair-atomic; the
+   existing two-file disk layout is not made crash-transactional.
+7. `finish()` waits for already-started spills, surfaces errors, discards
+   never-evicted dirty entries, restores the decoded-cache allowance, and runs
+   before invocation-local tree cleanup. Destruction is nonthrowing and only a
+   defensive drain.
 
-## Reporting without redundant full graphs
+## Staged reduction integration
 
-1. Extend stage populations to retain both the canonical union of all incident
-   Fiberlet IDs and the canonical union of Fiberlets interior to at least one
-   complete stage box. This retains the existing per-box interior definition;
-   a Fiberlet crossing between adjacent boxes is `all`, not `interior`.
-2. Keep stage domains equal to the union of that stage's complete boxes. Report
-   `anchors`, `all`, and `interior` for original/input/output and both stage and
-   cumulative reductions.
-3. Snapshot the original and inherited input populations before any box in the
-   stage writes, then snapshot output after all writes. All three use the bulk
-   no-transition path; sequential box analysis cannot substitute for the input
-   snapshot because later boxes observe earlier writes. Reuse the final
-   selected-region population instead of collecting it twice.
-
-## Optimized default build
-
-1. Confirm `volume-cartographer/build/CMakeCache.txt` uses `Release` and
-   `-O3 -DNDEBUG`; explicitly reconfigure that build directory as Release if
-   needed.
-2. Build and document `volume-cartographer/build/bin/vc_fiberlets` as the
-   canonical performance binary. Debug CI directories remain test-only and are
-   not silently changed.
+1. Attach the shared write-back store only to invocation-local stage anchor and
+   Fiberlet datasets. Authoritative on-demand anchor/Fiberlet caches retain
+   their existing durable behavior.
+2. Add distinct mutable `replaceAnchor` and `replacePair` backend operations
+   after the existing strict subset/pair validation. Authoritative immutable
+   publication keeps its existing conflict behavior.
+3. Keep generated overlay cache reads unchanged at the call sites: dataset
+   reads transparently resolve memory, pending spill, disk, then lower-layer
+   fallback.
+4. Compute detailed payload diagnostics over the canonical relative-path union
+   of metadata files, spilled chunks, and the latest resident/pending logical
+   chunks. Memory shadows stale disk, temporary writer files and lower fallback
+   are excluded, and prefix/route pairs are snapshotted together. Hashing pins
+   or streams entries without flushing them and must match a forced durable
+   directory hash byte-for-byte.
 
 ## Tests and validation
 
-1. Add a regression comparing bulk results at one and multiple threads against
-   the existing public point-query behavior on a multi-owner fixture with a
-   non-identity anchor view. Cover both edge-cost views, anchors,
-   all/interior Fiberlet IDs, arc cost fields, successor order and join fields,
-   entries/exits, route distributions, retained sets, and simplification
-   structures; timing fields are excluded.
-2. Add stage-domain reporting coverage for an offset stage with incident
-   Fiberlets crossing its boundary and between adjacent stage boxes, proving
-   `all` differs from per-box `interior`, IDs are counted once, and untouched
-   geometry is excluded.
-3. Build `vc_fiberlets`, `test_fiberlet_storage`, and
-   `test_fiberlet_paths` with 32 jobs. Run the focused tests in Debug and the
-   storage suite in Release.
-4. Run the exact hot Paris4 command at least three times after warm-up. Report
-   min/median/max and actual CPU use. Verify retained-ID and payload digests are
-   unchanged from the recorded baseline.
-5. Capture a same-input Release hotspot profile with an available local
-   profiler. If sampled `perf` remains unavailable, use an instrumented
-   profiler build and record that limitation explicitly. Keep hashing and
-   reporting timings separate from graph materialization, search, and writes.
+1. Add focused tests for memory hits, deterministic LRU order,
+   budget-triggered asynchronous spill, pending read, stale-generation rewrite,
+   a budget smaller than one pair, shared-budget pressure/restoration, explicit
+   empty fallback through multiple stages, pair visibility, teardown without
+   unnecessary writes, and injected anchor/prefix/route write failures.
+2. Re-run one-versus-multiple-thread staged equivalence and the focused
+   Fiberlet storage/path tests.
+3. Preserve at least three warm pre-change Release measurements, then build the
+   ordinary Release binary and run the identical four-stage workload at least
+   three times. Report min/median/max wall time, CPU use, peak RSS, write-back
+   hit/spill/peak-live-byte statistics, and exact stage IDs/payloads.
 
 ## Spec update
 
-Specify chunk-granular local graph materialization, cache-free parallel
-transition construction, complete stage-local `anchors`/`all`/`interior`
-reporting, and reuse of already materialized populations.
+Specify the invocation-local write-back LRU, shared memory accounting,
+prefix/route atomicity, eviction/spill/read ordering, and teardown semantics.
 
 ## Docs updates
 
-Document the three stage scopes, the optimized default build command, the
-chunk-granular implementation, and exact before/after performance results in
-`volume-cartographer/docs/fiberlets.md`.
+Document that staged temporary layers are memory-first, how `--cache-gib`
+governs them, when asynchronous spill occurs, and the measured four-stage
+performance.
 
 ## Changelog update
 
-Record the completed staged-reduction speedup and restoration of stage-local
-all-incident Fiberlet statistics.
+Record the asynchronous write-back overlay cache and its exact-output
+performance improvement.
