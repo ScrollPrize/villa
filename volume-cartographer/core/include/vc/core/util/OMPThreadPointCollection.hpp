@@ -1,6 +1,7 @@
 #pragma once
 #include <vector>
 #include <opencv2/core/matx.hpp>
+#include <opencv2/core/types.hpp>
 
 #include "omp.h"
 

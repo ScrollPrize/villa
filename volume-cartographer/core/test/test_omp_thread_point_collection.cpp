@@ -25,7 +25,11 @@ long long squared_distance(const cv::Vec2i& lhs, const cv::Vec2i& rhs)
 
 }  // namespace
 
-TEST_CASE("OmpThreadPointCol publishes worker points under synchronization")
+// This is a production-class concurrency contract/stress test. It exercises
+// OmpThreadPointCol directly, but is not expected to fail reliably on the
+// unfixed implementation; the race is schedule-dependent and is demonstrated
+// separately by the paired sanitizer reproducer documented in the PR.
+TEST_CASE("OmpThreadPointCol concurrent retrieval preserves the point contract")
 {
     constexpr int workerCount = 4;
     constexpr int side = 64;
