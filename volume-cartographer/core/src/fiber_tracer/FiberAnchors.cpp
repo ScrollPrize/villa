@@ -635,35 +635,12 @@ template <typename Observation>
     return tensor;
 }
 
-[[nodiscard]] std::vector<uint8_t> assignObservations(
-    const std::vector<WeightedObservation>& observations,
-    const std::array<cv::Vec3f, 2>& axes)
+[[nodiscard]] float projectiveUpdate(
+    const cv::Vec3f& before,
+    const cv::Vec3f& after)
 {
-    std::vector<uint8_t> assignments(observations.size(), 0);
-    for (size_t index = 0; index < observations.size(); ++index) {
-        const float dot0 = observations[index].direction.dot(axes[0]);
-        const float dot1 = observations[index].direction.dot(axes[1]);
-        assignments[index] = dot0 * dot0 >= dot1 * dot1 ? 0 : 1;
-    }
-    return assignments;
-}
-
-[[nodiscard]] float objectiveNumerator(
-    const std::vector<WeightedObservation>& observations,
-    const std::array<cv::Vec3f, 2>& axes)
-{
-    FloatSum result;
-    for (const auto& observation : observations) {
-        const float dot0 = observation.direction.dot(axes[0]);
-        const float dot1 = observation.direction.dot(axes[1]);
-        result.add(observation.weight * std::max(dot0 * dot0, dot1 * dot1));
-    }
-    return result.sum;
-}
-
-[[nodiscard]] float projectiveUpdate(const cv::Vec3f& before, const cv::Vec3f& after)
-{
-    return 1.0F - std::clamp(std::abs(before.dot(after)), 0.0F, 1.0F);
+    return 1.0F - std::clamp(
+        std::abs(before.dot(after)), 0.0F, 1.0F);
 }
 
 [[nodiscard]] cv::Vec3f projectToConstraintPlane(
@@ -1976,54 +1953,26 @@ template <typename ObservationRange>
 {
     if (profile != nullptr)
         ++profile->seedPairs;
-    FitState best;
-    best.objectiveNumerator = -1.0F;
-    std::vector<uint8_t> previousAssignments;
-    std::vector<uint8_t> twoBackAssignments;
-    for (int iteration = 0; iteration < config.maximumIterations; ++iteration) {
-        if (profile != nullptr) {
-            ++profile->seedPairIterations;
-            profile->seedAssignmentObservationVisits += observations.size();
-            profile->seedTensorObservationVisits += 2 * observations.size();
-            profile->seedObjectiveObservationVisits += observations.size();
-        }
-        auto assignments = assignObservations(observations, axes);
-        std::array<cv::Vec3f, 2> updated = axes;
-        for (uint8_t component = 0; component < 2; ++component) {
-            const auto principal = principalFiberAxisF(
-                weightedTensor(observations, &assignments, component));
-            if (principal.unique)
-                updated[component] = principal.axis;
-        }
-        FitState state{
-            updated,
-            assignments,
-            objectiveNumerator(observations, updated),
-            static_cast<size_t>(iteration),
-        };
-        if (best.objectiveNumerator < 0.0F || betterState(state, best))
-            best = state;
-
-        const float update = std::max(
-            projectiveUpdate(axes[0], updated[0]),
-            projectiveUpdate(axes[1], updated[1]));
-        const bool unchanged = !previousAssignments.empty() &&
-            assignments == previousAssignments;
-        const bool twoCycle = !twoBackAssignments.empty() &&
-            assignments == twoBackAssignments;
-        axes = updated;
-        if ((unchanged && update <= config.convergenceTolerance) || twoCycle)
-            break;
-        twoBackAssignments = std::move(previousAssignments);
-        previousAssignments = std::move(assignments);
-    }
+    auto fit = refineFiberAxisPair<float>(
+        observations.size(), axes, config.maximumIterations,
+        config.convergenceTolerance,
+        [&](size_t index) { return observations[index].direction; },
+        [&](size_t index) { return observations[index].weight; });
     if (profile != nullptr) {
-        profile->seedAssignmentObservationVisits += observations.size();
-        profile->seedObjectiveObservationVisits += observations.size();
+        profile->seedPairIterations += fit.iterations;
+        profile->seedAssignmentObservationVisits +=
+            (fit.iterations + 1) * observations.size();
+        profile->seedTensorObservationVisits +=
+            2 * fit.iterations * observations.size();
+        profile->seedObjectiveObservationVisits +=
+            (fit.iterations + 1) * observations.size();
     }
-    best.assignments = assignObservations(observations, best.axes);
-    best.objectiveNumerator = objectiveNumerator(observations, best.axes);
-    return best;
+    return {
+        fit.axes,
+        std::move(fit.assignments),
+        fit.objective,
+        fit.bestIteration,
+    };
 }
 
 [[nodiscard]] bool componentLess(

@@ -4472,6 +4472,11 @@
   canonical empty anchor/prefix/route payloads for absent tuples and never
   require the original Fiber prediction manifest or a reconstructed expected
   set.
+- Crop graph materialization may inspect the complete prefix/route owner halo,
+  but it must restrict that population to fiberlets with at least one actual
+  in-crop endpoint before requesting endpoint anchor chunks. Partial tuples
+  needed by a retained fiberlet remain errors; unrelated partial tuples beyond
+  the crop cannot invalidate an otherwise materializable crop.
 - Preprocessing does not publish intermediate anchor chunks with no retained
   anchors or final combined tuples with no generated Fiberlets. Missing and
   decoded-all-zero input presence chunks are never scheduled in the first
@@ -4584,3 +4589,20 @@
   retained. This version performs no line-to-line Fiber deduplication.
 - Line visualization is OBJ. Optional crop faces use one concrete uint8 CT
   OME-Zarr group and the existing VC3D fine-to-coarse coordinate renderer.
+- After tracing, every nonzero consecutive accepted-line step contributes its
+  normalized unoriented axis and base-voxel length to a deterministic
+  two-direction fit. The axial PCA tensor is initialization only. The fitted
+  directions independently maximize
+  `sum(length*max((step dot d1)^2,(step dot d2)^2))` and are not constrained to
+  be orthogonal. Seed pairs, equal-alignment assignment, fit ties, axis signs,
+  and final direction labels have fixed canonical ordering.
+- Each local step is assigned by larger absolute direction dot product. A line
+  is direction-1- or direction-2-dominant when at least 75% of its valid arc
+  length is assigned to that direction; otherwise it is mixed. A line without
+  a nonzero step is mixed. Only accepted lines contribute, and analysis uses a
+  fixed serial reduction order.
+- The requested line OBJ remains the complete accepted set. Sibling `_dir1`,
+  `_dir2`, and `_mixed` OBJs partition those polylines without changing names,
+  geometry, or order. Matching `_anchors`, `_dir1_anchors`, `_dir2_anchors`,
+  and `_mixed_anchors` OBJs contain one point primitive at each trace's actual
+  seed anchor. Empty groups still produce valid OBJ artifacts.

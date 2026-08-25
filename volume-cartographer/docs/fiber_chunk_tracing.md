@@ -32,6 +32,12 @@ wholly absent sparse chunks are empty. A present anchor/prefix/route tuple must
 be complete and valid. The original Fiber manifest and an expected-chunk index
 are not inputs.
 
+Crop materialization reads prefix and route owner chunks from the bounded
+dependency halo, filters those records to fiberlets incident to an actual
+in-crop anchor, and only then loads their endpoint anchor chunks. An incomplete
+tuple required by a retained fiberlet is an error; incomplete tuples referenced
+only by unrelated halo fiberlets are outside the crop graph and are not read.
+
 The normal manifest need not be the same file used during Fiberlet generation.
 Its path and exact JSON bytes are not compared. It must describe the same base
 coordinate domain: `base_shape_zyx` must ceil-downsample to the stored Fiberlet
@@ -79,3 +85,36 @@ serially in the same strongest-first order, including all counters and
 anisotropic coverage updates. If an earlier integrated line covers the seed of
 another trace that was computed in the same group, that speculative result is
 discarded and does not consume an attempt.
+
+## Principal direction groups
+
+After tracing, the tool analyzes every nonzero consecutive step of every
+accepted polyline. Each normalized step is an unoriented axial observation
+weighted by its base-voxel length. A deterministic multi-seed two-line fit
+maximizes
+`sum(length * max((step dot direction1)^2, (step dot direction2)^2))`.
+The two fitted directions are independent and therefore need not be
+orthogonal; the global axial PCA tensor is used only to seed this fit.
+
+Each step is assigned to the fitted direction with the larger absolute dot
+product. A complete fiber is direction-1- or direction-2-dominant when at
+least 75% of its valid arc length is assigned to that direction. Other fibers,
+including a degenerate fiber with no nonzero step, are mixed. Direction labels
+are deterministic: greater total assigned length is direction 1, with
+canonical axis order breaking an exact tie. The command reports both fitted
+axes, analyzed step count and length, and all three fiber counts.
+
+The requested `crop_fibers.obj` remains the complete, unchanged line set. The
+same directory also receives independently displayable subsets and actual
+seed-anchor point objects:
+
+| Contents | Lines | Seed anchors |
+| --- | --- | --- |
+| All accepted fibers | `crop_fibers.obj` | `crop_fibers_anchors.obj` |
+| Direction 1 dominant | `crop_fibers_dir1.obj` | `crop_fibers_dir1_anchors.obj` |
+| Direction 2 dominant | `crop_fibers_dir2.obj` | `crop_fibers_dir2_anchors.obj` |
+| Mixed | `crop_fibers_mixed.obj` | `crop_fibers_mixed_anchors.obj` |
+
+The anchor artifacts use OBJ point (`p`) elements at the stored trace seed,
+not a polyline endpoint. Empty groups still produce valid empty OBJ files.
+This classification is output-only and cannot change tracing or coverage.

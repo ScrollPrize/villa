@@ -1,13 +1,17 @@
-# Status: lock-free parallel Fiberlet crop tracing
+# Status: classify crop traces by principal fiber direction
 
 - [x] Record the active task.
-- [x] Identify and measure the shared-cache contention in the first attempt.
-- [x] Replace the implementation plan with bulk immutable graph preparation.
-- [x] Complete independent review of the corrected plan.
-- [x] Extract the shared immutable replay graph adapter.
-- [x] Implement bulk stored crop-graph materialization.
-- [x] Switch the crop CLI to lock-free host-CPU tracing.
-- [x] Add exact materialization and concurrency regressions.
+- [x] Inspect the crop trace and OBJ export boundaries.
+- [x] Write the implementation, test, specification, and documentation plan.
+- [x] Complete independent review of the task plan.
+- [x] Implement reusable local-step principal-direction classification.
+- [x] Write the three classified OBJ groups and console summary.
+- [x] Write complete and grouped seed-anchor point OBJ artifacts.
+- [x] Add focused classification regressions.
 - [x] Build and run focused tests.
-- [x] Benchmark Release scaling, CPU use, memory, and exact output.
 - [x] Finalize specifications, documentation, changelog, and task log.
+- [x] Independently review the irrelevant partial-halo fix.
+- [x] Filter irrelevant halo fiberlets before endpoint loading.
+- [x] Preserve strict validation of required partial tuples.
+- [x] Add and run a focused stored-dataset regression.
+- [x] Reproduce the reported 500-attempt crop successfully.

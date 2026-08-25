@@ -268,6 +268,7 @@ TEST_CASE("Fiberlet crop tracing is bidirectional and uses anisotropic direction
     CHECK(result.noEdgeAnchors == 2);
     CHECK(result.lines.front().negativeTermination == "crop_boundary");
     CHECK(result.lines.front().positiveTermination == "crop_boundary");
+    CHECK(result.lines.front().seedBaseXYZ == cv::Vec3d{50, 0, 0});
     REQUIRE(result.lines.front().pointsBaseXYZ.size() >= 5);
     CHECK(result.lines.front().pointsBaseXYZ.front()[0] == doctest::Approx(0));
     CHECK(result.lines.front().pointsBaseXYZ.back()[0] == doctest::Approx(100));
@@ -334,6 +335,7 @@ TEST_CASE("Fiberlet crop tracing computes concurrently and integrates canonicall
     REQUIRE(parallel.lines.size() == serial.lines.size());
     for (std::size_t line = 0; line < serial.lines.size(); ++line) {
         CHECK(parallel.lines[line].seed == serial.lines[line].seed);
+        CHECK(parallel.lines[line].seedBaseXYZ == serial.lines[line].seedBaseXYZ);
         CHECK(parallel.lines[line].seedPresence == serial.lines[line].seedPresence);
         CHECK(parallel.lines[line].negativeTermination == serial.lines[line].negativeTermination);
         CHECK(parallel.lines[line].positiveTermination == serial.lines[line].positiveTermination);
@@ -426,6 +428,111 @@ TEST_CASE("Polyline OBJ output uses explicit consecutive line indices")
     CHECK(text.str().find("l 1 2\nl 2 3\n") != std::string::npos);
     CHECK(text.str().find("l 4 5\n") != std::string::npos);
     std::filesystem::remove(path);
+}
+
+TEST_CASE("Crop trace directions fit non-orthogonal local step modes")
+{
+    const double inverseRootTwo = 1.0 / std::sqrt(2.0);
+    const cv::Vec3d diagonal{inverseRootTwo, inverseRootTwo, 0.0};
+    const auto line = [](std::vector<cv::Vec3d> points) {
+        FiberletCropTraceLine result;
+        result.pointsBaseXYZ = std::move(points);
+        return result;
+    };
+    std::vector<FiberletCropTraceLine> lines{
+        line({{0, 0, 0}, {10, 0, 0}}),
+        line({{10, 1, 0}, {0, 1, 0}}),
+        line({{0, 2, 0}, cv::Vec3d{0, 2, 0} + diagonal * 10.0}),
+        line({{0, 3, 0}, {1, 3, 0}, {2, 3, 0}, {3, 3, 0}, {4, 3, 0},
+              cv::Vec3d{4, 3, 0} + diagonal * 4.0}),
+        line({{0, 4, 0}, {3, 4, 0}, cv::Vec3d{3, 4, 0} + diagonal}),
+        line({{5, 5, 5}}),
+    };
+
+    const auto classified = classifyFiberletCropDirections(lines);
+    CHECK(std::abs(classified.direction1BaseXYZ.dot(cv::Vec3d{1, 0, 0})) ==
+          doctest::Approx(1.0));
+    CHECK(std::abs(classified.direction2BaseXYZ.dot(diagonal)) ==
+          doctest::Approx(1.0));
+    REQUIRE(classified.lines.size() == lines.size());
+    CHECK(classified.lines[0].group == FiberDirectionGroup::Direction1);
+    CHECK(classified.lines[1].group == FiberDirectionGroup::Direction1);
+    CHECK(classified.lines[2].group == FiberDirectionGroup::Direction2);
+    CHECK(classified.lines[3].group == FiberDirectionGroup::Mixed);
+    CHECK(classified.lines[4].group == FiberDirectionGroup::Direction1);
+    CHECK(classified.lines[4].direction1LengthBaseVoxels ==
+          doctest::Approx(3.0));
+    CHECK(classified.lines[4].direction2LengthBaseVoxels ==
+          doctest::Approx(1.0));
+    CHECK(classified.lines[5].group == FiberDirectionGroup::Mixed);
+    CHECK(classified.groupCounts == std::array<std::size_t, 3>{3, 1, 2});
+    CHECK(classified.analyzedSteps == 10);
+    CHECK(classified.analyzedLengthBaseVoxels == doctest::Approx(42.0));
+}
+
+TEST_CASE("Crop direction OBJ artifacts preserve line and seed partitions")
+{
+    std::mt19937_64 random(std::random_device{}());
+    const auto directory = std::filesystem::temp_directory_path() /
+        ("vc_fiberlet_direction_objs_" + std::to_string(random()));
+    std::filesystem::create_directories(directory);
+    const auto output = directory / "crop.lines.obj";
+    std::vector<FiberletCropTraceLine> lines(3);
+    for (std::size_t index = 0; index < lines.size(); ++index) {
+        lines[index].seedPresence = static_cast<float>(0.9 - index * 0.1);
+        lines[index].seedBaseXYZ = {
+            static_cast<double>(index + 10),
+            static_cast<double>(index + 20),
+            static_cast<double>(index + 30),
+        };
+        lines[index].pointsBaseXYZ = {
+            {static_cast<double>(index), 0, 0},
+            {static_cast<double>(index), 1, 0},
+        };
+    }
+    FiberDirectionClassification classification;
+    classification.lines.resize(3);
+    classification.lines[0].group = FiberDirectionGroup::Direction1;
+    classification.lines[1].group = FiberDirectionGroup::Direction2;
+    classification.lines[2].group = FiberDirectionGroup::Mixed;
+    writeFiberletCropDirectionObjs(lines, classification, output);
+
+    const auto paths = fiberDirectionObjPaths(output);
+    const auto read = [](const std::filesystem::path& path) {
+        std::ifstream input(path);
+        std::ostringstream text;
+        text << input.rdbuf();
+        return text.str();
+    };
+    const std::string all = read(paths.all);
+    const std::string direction1 = read(paths.direction1);
+    const std::string direction2 = read(paths.direction2);
+    const std::string mixed = read(paths.mixed);
+    CHECK(all.find("o fiber_000000_presence_0_9000") != std::string::npos);
+    CHECK(all.find("o fiber_000001_presence_0_8000") != std::string::npos);
+    CHECK(all.find("o fiber_000002_presence_0_7000") != std::string::npos);
+    CHECK(direction1.find("fiber_000000") != std::string::npos);
+    CHECK(direction1.find("fiber_000001") == std::string::npos);
+    CHECK(direction2.find("fiber_000001") != std::string::npos);
+    CHECK(mixed.find("fiber_000002") != std::string::npos);
+    CHECK(read(paths.allAnchors).find("v 10 20 30\np 1\n") !=
+          std::string::npos);
+    CHECK(read(paths.direction1Anchors).find("v 10 20 30\np 1\n") !=
+          std::string::npos);
+    CHECK(read(paths.direction2Anchors).find("v 11 21 31\np 1\n") !=
+          std::string::npos);
+    CHECK(read(paths.mixedAnchors).find("v 12 22 32\np 1\n") !=
+          std::string::npos);
+
+    FiberDirectionClassification oneGroup;
+    oneGroup.lines.resize(1);
+    oneGroup.lines.front().group = FiberDirectionGroup::Direction1;
+    const auto emptyOutput = directory / "empty-groups.obj";
+    writeFiberletCropDirectionObjs({lines.front()}, oneGroup, emptyOutput);
+    const auto emptyPaths = fiberDirectionObjPaths(emptyOutput);
+    CHECK(read(emptyPaths.direction2).find("\nv ") == std::string::npos);
+    CHECK(read(emptyPaths.mixedAnchors).find("\nv ") == std::string::npos);
+    std::filesystem::remove_all(directory);
 }
 
 TEST_CASE("Fiberlet normal compatibility accepts structural identity and legal padding")

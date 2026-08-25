@@ -1360,6 +1360,13 @@
 - Reused the established Lasagna one-chunk padding rule and retained manifest
   hashes only as provenance.
 
+## 2026-08-25 - Fiberlet crop principal-direction visualization
+
+- Added deterministic non-orthogonal two-direction fitting over accepted
+  traces' local axial steps and 75% arc-length dominant/mixed classification.
+- Preserved the complete line OBJ while adding direction-1, direction-2, and
+  mixed line subsets plus matching actual seed-anchor point OBJs.
+
 ## 2026-08-23 — Explicit shared inference Z-band lifecycle
 
 - Replaced the cross-band multi-device event state machine with a lazy explicit

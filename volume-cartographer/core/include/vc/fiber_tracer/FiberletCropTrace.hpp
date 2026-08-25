@@ -2,7 +2,9 @@
 
 #include "vc/fiber_tracer/FiberGraph.hpp"
 
+#include <array>
 #include <cstddef>
+#include <filesystem>
 #include <functional>
 #include <string>
 #include <vector>
@@ -28,6 +30,7 @@ struct FiberletCropTraceConfig {
 
 struct FiberletCropTraceLine {
     FiberletStorageKey seed;
+    cv::Vec3d seedBaseXYZ{0.0, 0.0, 0.0};
     float seedPresence = 0.0F;
     std::vector<cv::Vec3d> pointsBaseXYZ;
     std::string negativeTermination;
@@ -53,6 +56,40 @@ struct FiberletCropTraceResult {
     double integrationSeconds = 0.0;
 };
 
+enum class FiberDirectionGroup {
+    Direction1,
+    Direction2,
+    Mixed,
+};
+
+inline constexpr double kFiberDirectionDominanceFraction = 0.75;
+
+struct FiberDirectionLineClassification {
+    FiberDirectionGroup group = FiberDirectionGroup::Mixed;
+    double direction1LengthBaseVoxels = 0.0;
+    double direction2LengthBaseVoxels = 0.0;
+};
+
+struct FiberDirectionClassification {
+    cv::Vec3d direction1BaseXYZ{1.0, 0.0, 0.0};
+    cv::Vec3d direction2BaseXYZ{0.0, 1.0, 0.0};
+    std::vector<FiberDirectionLineClassification> lines;
+    std::array<std::size_t, 3> groupCounts{0, 0, 0};
+    std::size_t analyzedSteps = 0;
+    double analyzedLengthBaseVoxels = 0.0;
+};
+
+struct FiberDirectionObjPaths {
+    std::filesystem::path all;
+    std::filesystem::path direction1;
+    std::filesystem::path direction2;
+    std::filesystem::path mixed;
+    std::filesystem::path allAnchors;
+    std::filesystem::path direction1Anchors;
+    std::filesystem::path direction2Anchors;
+    std::filesystem::path mixedAnchors;
+};
+
 using FiberletCropTraceProgress = std::function<void(const FiberletCropTraceResult& result, std::size_t remainingAnchors)>;
 
 [[nodiscard]] FiberletCropTraceResult traceFiberletCrop(
@@ -62,5 +99,17 @@ using FiberletCropTraceProgress = std::function<void(const FiberletCropTraceResu
     double normalWorkingToBaseScale,
     const FiberletCropTraceConfig& config,
     const FiberletCropTraceProgress& progress = {});
+
+[[nodiscard]] FiberDirectionClassification classifyFiberletCropDirections(
+    const std::vector<FiberletCropTraceLine>& lines,
+    double dominanceFraction = kFiberDirectionDominanceFraction);
+
+[[nodiscard]] FiberDirectionObjPaths fiberDirectionObjPaths(
+    const std::filesystem::path& allOutputPath);
+
+void writeFiberletCropDirectionObjs(
+    const std::vector<FiberletCropTraceLine>& lines,
+    const FiberDirectionClassification& classification,
+    const std::filesystem::path& allOutputPath);
 
 }  // namespace vc::fiber_tracer

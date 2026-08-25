@@ -494,21 +494,31 @@ public:
                         0, key.iz, key.iy, key.ix};
                     const vc::render::ChunkKey route{
                         1, key.iz, key.iy, key.ix};
-                    std::size_t present = 0;
+                    const bool prefixPresent = std::filesystem::exists(
+                        dataset_->chunkPath(
+                            FiberletStorageChunkKind::FiberletPrefix, owner));
+                    const bool routePresent = std::filesystem::exists(
+                        dataset_->chunkPath(
+                            FiberletStorageChunkKind::FiberletRoutes, route));
+                    bool anchorPresent = false;
+                    std::size_t present = prefixPresent + routePresent;
                     std::size_t required = 2;
-                    present += std::filesystem::exists(dataset_->chunkPath(
-                        FiberletStorageChunkKind::FiberletPrefix, owner));
-                    present += std::filesystem::exists(dataset_->chunkPath(
-                        FiberletStorageChunkKind::FiberletRoutes, route));
                     if (dataset_->metadata().kind == FiberletDatasetKind::Combined) {
                         ++required;
-                        present += std::filesystem::exists(dataset_->chunkPath(
-                            FiberletStorageChunkKind::Anchors, owner));
+                        anchorPresent = std::filesystem::exists(
+                            dataset_->chunkPath(
+                                FiberletStorageChunkKind::Anchors, owner));
+                        present += anchorPresent;
                     }
                     if (present != 0 && present != required) {
                         result.status = vc::render::ChunkFetchStatus::DecodeError;
-                        result.message =
-                            "fiberlet sparse chunk tuple is only partially present";
+                        std::ostringstream message;
+                        message << "fiberlet sparse chunk tuple "
+                                << key.iz << ',' << key.iy << ',' << key.ix
+                                << " is only partially present (anchors="
+                                << anchorPresent << ", prefix=" << prefixPresent
+                                << ", routes=" << routePresent << ')';
+                        result.message = message.str();
                         return result;
                     }
                 }

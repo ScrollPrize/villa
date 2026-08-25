@@ -1,5 +1,7 @@
 #include "vc/fiber_tracer/FiberletCropTrace.hpp"
 
+#include "vc/core/io/PolylineObj.hpp"
+#include "vc/fiber_tracer/FiberAxisTensor.hpp"
 #include "vc/fiber_tracer/FiberReplayMetric.hpp"
 #include "utils/thread_pool.hpp"
 
@@ -8,11 +10,14 @@
 #include <cmath>
 #include <ctime>
 #include <exception>
+#include <iomanip>
 #include <limits>
+#include <locale>
 #include <map>
 #include <numeric>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <tuple>
 #include <thread>
@@ -24,6 +29,9 @@ namespace
 
 constexpr double kEpsilon = 1.0e-9;
 constexpr double kPi = 3.14159265358979323846;
+constexpr std::size_t kDirectionSeedCount = 8;
+constexpr int kDirectionFitIterations = 32;
+constexpr double kDirectionFitTolerance = 1.0e-12;
 
 double length(const cv::Vec3d& value)
 {
@@ -34,6 +42,50 @@ cv::Vec3d normalized(const cv::Vec3d& value)
 {
     const double magnitude = length(value);
     return magnitude > kEpsilon ? value / magnitude : cv::Vec3d{};
+}
+
+bool finite(const cv::Vec3d& value)
+{
+    return std::isfinite(value[0]) && std::isfinite(value[1]) &&
+        std::isfinite(value[2]);
+}
+
+struct DirectionStep {
+    std::size_t line = 0;
+    cv::Vec3d axis{0.0, 0.0, 0.0};
+    double length = 0.0;
+};
+
+bool axisLess(const cv::Vec3d& left, const cv::Vec3d& right)
+{
+    for (int coordinate = 0; coordinate < 3; ++coordinate) {
+        if (left[coordinate] != right[coordinate])
+            return left[coordinate] < right[coordinate];
+    }
+    return false;
+}
+
+std::size_t groupIndex(FiberDirectionGroup group)
+{
+    switch (group) {
+    case FiberDirectionGroup::Direction1:
+        return 0;
+    case FiberDirectionGroup::Direction2:
+        return 1;
+    case FiberDirectionGroup::Mixed:
+        return 2;
+    }
+    throw std::logic_error("invalid Fiber direction group");
+}
+
+std::string fiberName(const FiberletCropTraceLine& line, std::size_t index)
+{
+    std::ostringstream name;
+    name.imbue(std::locale::classic());
+    name << "fiber_" << std::setw(6) << std::setfill('0') << index
+         << "_presence_" << std::fixed << std::setprecision(4)
+         << line.seedPresence;
+    return name.str();
 }
 
 bool inside(const cv::Vec3d& point, const FiberletCropTraceConfig& config)
@@ -351,6 +403,8 @@ TraceCandidate traceCandidate(
 {
     TraceCandidate result;
     result.line.seed = seed.key;
+    result.line.seedBaseXYZ = cv::Vec3d(
+        seed.positionPredictionXYZ * graph.predictionToBaseScale());
     result.line.seedPresence = seed.predictionPresence;
     const auto initial = selectInitialPair(graph, seed);
     if (!initial.negative.has_value() && !initial.positive.has_value())
@@ -611,6 +665,211 @@ FiberletCropTraceResult traceFiberletCrop(
             std::chrono::steady_clock::now() - integrationStarted).count();
     }
     return result;
+}
+
+FiberDirectionClassification classifyFiberletCropDirections(
+    const std::vector<FiberletCropTraceLine>& lines,
+    double dominanceFraction)
+{
+    if (!(dominanceFraction > 0.5 && dominanceFraction <= 1.0) ||
+        !std::isfinite(dominanceFraction)) {
+        throw std::invalid_argument(
+            "Fiber direction dominance fraction must be finite and in (0.5, 1]");
+    }
+
+    FiberDirectionClassification result;
+    result.lines.resize(lines.size());
+    std::vector<DirectionStep> steps;
+    for (std::size_t lineIndex = 0; lineIndex < lines.size(); ++lineIndex) {
+        const auto& points = lines[lineIndex].pointsBaseXYZ;
+        for (const auto& point : points) {
+            if (!finite(point)) {
+                throw std::invalid_argument(
+                    "Fiber direction classification requires finite points");
+            }
+        }
+        for (std::size_t pointIndex = 1; pointIndex < points.size(); ++pointIndex) {
+            const cv::Vec3d delta = points[pointIndex] - points[pointIndex - 1];
+            const double stepLength = length(delta);
+            if (!(stepLength > kEpsilon))
+                continue;
+            steps.push_back({lineIndex, delta / stepLength, stepLength});
+            ++result.analyzedSteps;
+            result.analyzedLengthBaseVoxels += stepLength;
+        }
+    }
+    if (steps.empty()) {
+        result.groupCounts[groupIndex(FiberDirectionGroup::Mixed)] = lines.size();
+        return result;
+    }
+
+    cv::Matx33d globalTensor = cv::Matx33d::zeros();
+    for (const auto& step : steps)
+        globalTensor += fiberAxisTensor(step.axis, step.length);
+    const auto global = principalFiberAxis(globalTensor);
+
+    std::vector<cv::Vec3d> seeds;
+    seeds.reserve(std::min(kDirectionSeedCount, steps.size()));
+    if (global.unique) {
+        seeds.push_back(global.axis);
+    } else {
+        std::size_t strongest = 0;
+        for (std::size_t index = 1; index < steps.size(); ++index) {
+            if (steps[index].length > steps[strongest].length)
+                strongest = index;
+        }
+        seeds.push_back(canonicalFiberAxis(steps[strongest].axis));
+    }
+    while (seeds.size() < std::min(kDirectionSeedCount, steps.size())) {
+        std::size_t best = steps.size();
+        double bestScore = 0.0;
+        for (std::size_t index = 0; index < steps.size(); ++index) {
+            double dissimilarity = 1.0;
+            for (const auto& seed : seeds) {
+                const double dot = steps[index].axis.dot(seed);
+                dissimilarity = std::min(
+                    dissimilarity,
+                    std::max(0.0, 1.0 - dot * dot));
+            }
+            const double score = steps[index].length * dissimilarity;
+            if (score > bestScore) {
+                best = index;
+                bestScore = score;
+            }
+        }
+        if (best == steps.size() || !(bestScore > 0.0))
+            break;
+        seeds.push_back(canonicalFiberAxis(steps[best].axis));
+    }
+
+    FiberAxisPairFit<double> bestFit;
+    const auto refine = [&](const std::array<cv::Vec3d, 2>& initial) {
+        return refineFiberAxisPair<double>(
+            steps.size(), initial, kDirectionFitIterations,
+            kDirectionFitTolerance,
+            [&](std::size_t index) { return steps[index].axis; },
+            [&](std::size_t index) { return steps[index].length; });
+    };
+    if (seeds.size() == 1) {
+        bestFit = refine({seeds.front(), seeds.front()});
+    } else {
+        for (std::size_t first = 0; first + 1 < seeds.size(); ++first) {
+            for (std::size_t second = first + 1; second < seeds.size(); ++second) {
+                auto fit = refine({seeds[first], seeds[second]});
+                if (bestFit.objective < 0.0 || fit.objective > bestFit.objective)
+                    bestFit = std::move(fit);
+            }
+        }
+    }
+
+    bestFit.axes[0] = canonicalFiberAxis(bestFit.axes[0]);
+    bestFit.axes[1] = canonicalFiberAxis(bestFit.axes[1]);
+    std::array<double, 2> assignedLengths{0.0, 0.0};
+    for (std::size_t index = 0; index < steps.size(); ++index)
+        assignedLengths[bestFit.assignments[index]] += steps[index].length;
+    const bool swapDirections =
+        assignedLengths[1] > assignedLengths[0] ||
+        (assignedLengths[1] == assignedLengths[0] &&
+         axisLess(bestFit.axes[1], bestFit.axes[0]));
+    if (swapDirections) {
+        std::swap(bestFit.axes[0], bestFit.axes[1]);
+        for (auto& assignment : bestFit.assignments)
+            assignment = static_cast<std::uint8_t>(1 - assignment);
+    }
+    result.direction1BaseXYZ = bestFit.axes[0];
+    result.direction2BaseXYZ = bestFit.axes[1];
+
+    for (std::size_t index = 0; index < steps.size(); ++index) {
+        auto& line = result.lines[steps[index].line];
+        if (bestFit.assignments[index] == 0)
+            line.direction1LengthBaseVoxels += steps[index].length;
+        else
+            line.direction2LengthBaseVoxels += steps[index].length;
+    }
+    for (auto& line : result.lines) {
+        const double total = line.direction1LengthBaseVoxels +
+            line.direction2LengthBaseVoxels;
+        if (total > kEpsilon) {
+            if (line.direction1LengthBaseVoxels / total >= dominanceFraction)
+                line.group = FiberDirectionGroup::Direction1;
+            else if (line.direction2LengthBaseVoxels / total >= dominanceFraction)
+                line.group = FiberDirectionGroup::Direction2;
+        }
+        ++result.groupCounts[groupIndex(line.group)];
+    }
+    return result;
+}
+
+FiberDirectionObjPaths fiberDirectionObjPaths(
+    const std::filesystem::path& allOutputPath)
+{
+    const auto sibling = [&](const std::string& suffix) {
+        return allOutputPath.parent_path() /
+            (allOutputPath.stem().string() + suffix +
+             allOutputPath.extension().string());
+    };
+    return {
+        allOutputPath,
+        sibling("_dir1"),
+        sibling("_dir2"),
+        sibling("_mixed"),
+        sibling("_anchors"),
+        sibling("_dir1_anchors"),
+        sibling("_dir2_anchors"),
+        sibling("_mixed_anchors"),
+    };
+}
+
+void writeFiberletCropDirectionObjs(
+    const std::vector<FiberletCropTraceLine>& lines,
+    const FiberDirectionClassification& classification,
+    const std::filesystem::path& allOutputPath)
+{
+    if (classification.lines.size() != lines.size()) {
+        throw std::invalid_argument(
+            "Fiber direction classification does not match crop lines");
+    }
+    std::vector<vc::core::io::NamedPolyline> all;
+    std::array<std::vector<vc::core::io::NamedPolyline>, 3> grouped;
+    std::vector<vc::core::io::NamedPolyline> allAnchors;
+    std::array<std::vector<vc::core::io::NamedPolyline>, 3> groupedAnchors;
+    all.reserve(lines.size());
+    allAnchors.reserve(lines.size());
+    for (std::size_t index = 0; index < lines.size(); ++index) {
+        const std::string name = fiberName(lines[index], index);
+        vc::core::io::NamedPolyline line{
+            name, lines[index].pointsBaseXYZ};
+        vc::core::io::NamedPolyline anchor{
+            name + "_anchor", {lines[index].seedBaseXYZ}};
+        all.push_back(line);
+        allAnchors.push_back(anchor);
+        grouped[groupIndex(classification.lines[index].group)].push_back(
+            std::move(line));
+        groupedAnchors[groupIndex(classification.lines[index].group)].push_back(
+            std::move(anchor));
+    }
+    const auto paths = fiberDirectionObjPaths(allOutputPath);
+    vc::core::io::writePolylinesObj(all, paths.all, "VC3D Fiberlet crop traces");
+    vc::core::io::writePolylinesObj(
+        grouped[0], paths.direction1,
+        "VC3D Fiberlet crop traces: direction 1 dominant");
+    vc::core::io::writePolylinesObj(
+        grouped[1], paths.direction2,
+        "VC3D Fiberlet crop traces: direction 2 dominant");
+    vc::core::io::writePolylinesObj(
+        grouped[2], paths.mixed,
+        "VC3D Fiberlet crop traces: mixed directions");
+    vc::core::io::writePolylinesObj(
+        allAnchors, paths.allAnchors, "VC3D Fiberlet crop trace seed anchors");
+    vc::core::io::writePolylinesObj(
+        groupedAnchors[0], paths.direction1Anchors,
+        "VC3D Fiberlet crop trace seed anchors: direction 1 dominant");
+    vc::core::io::writePolylinesObj(
+        groupedAnchors[1], paths.direction2Anchors,
+        "VC3D Fiberlet crop trace seed anchors: direction 2 dominant");
+    vc::core::io::writePolylinesObj(
+        groupedAnchors[2], paths.mixedAnchors,
+        "VC3D Fiberlet crop trace seed anchors: mixed directions");
 }
 
 }  // namespace vc::fiber_tracer

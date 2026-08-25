@@ -1,4 +1,3 @@
-#include "vc/core/io/PolylineObj.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/fiber_tracer/FiberletChunkGraph.hpp"
 #include "vc/fiber_tracer/FiberletCropTrace.hpp"
@@ -12,10 +11,8 @@
 #include <ctime>
 #include <cstdlib>
 #include <filesystem>
-#include <iomanip>
 #include <iostream>
 #include <memory>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -210,15 +207,12 @@ int main(int argc, char** argv)
             std::clock() - traceCpuStarted) / CLOCKS_PER_SEC;
 
         std::filesystem::create_directories(options.output.parent_path().empty() ? std::filesystem::path{"."} : options.output.parent_path());
-        std::vector<vc::core::io::NamedPolyline> lines;
-        lines.reserve(result.lines.size());
-        for (std::size_t index = 0; index < result.lines.size(); ++index) {
-            std::ostringstream name;
-            name << "fiber_" << std::setw(6) << std::setfill('0') << index << "_presence_" << std::fixed << std::setprecision(4)
-                 << result.lines[index].seedPresence;
-            lines.push_back({name.str(), result.lines[index].pointsBaseXYZ});
-        }
-        vc::core::io::writePolylinesObj(lines, options.output, "VC3D Fiberlet crop traces");
+        const auto directionClassification =
+            vc::fiber_tracer::classifyFiberletCropDirections(result.lines);
+        vc::fiber_tracer::writeFiberletCropDirectionObjs(
+            result.lines, directionClassification, options.output);
+        const auto directionPaths =
+            vc::fiber_tracer::fiberDirectionObjPaths(options.output);
 
         if (!options.volume.empty()) {
             const std::string locator = std::filesystem::absolute(options.volume).lexically_normal().string();
@@ -237,6 +231,27 @@ int main(int argc, char** argv)
                   << " computed=" << result.computedCandidates << " discarded=" << result.discardedCandidates
                   << " accepted=" << result.lines.size() << " no_edge=" << result.noEdgeAnchors << " one_sided=" << result.oneSidedLines
                   << " bidirectional=" << result.bidirectionalLines << " output=" << options.output << '\n';
+        std::cout << "fiberlet crop directions"
+                  << " dir1_xyz=" << directionClassification.direction1BaseXYZ[0] << ','
+                  << directionClassification.direction1BaseXYZ[1] << ','
+                  << directionClassification.direction1BaseXYZ[2]
+                  << " dir2_xyz=" << directionClassification.direction2BaseXYZ[0] << ','
+                  << directionClassification.direction2BaseXYZ[1] << ','
+                  << directionClassification.direction2BaseXYZ[2]
+                  << " analyzed_steps=" << directionClassification.analyzedSteps
+                  << " analyzed_length_base=" << directionClassification.analyzedLengthBaseVoxels
+                  << " dir1_fibers=" << directionClassification.groupCounts[0]
+                  << " dir2_fibers=" << directionClassification.groupCounts[1]
+                  << " mixed_fibers=" << directionClassification.groupCounts[2]
+                  << " dominance_fraction=" << vc::fiber_tracer::kFiberDirectionDominanceFraction
+                  << " dir1_output=" << directionPaths.direction1
+                  << " dir2_output=" << directionPaths.direction2
+                  << " mixed_output=" << directionPaths.mixed
+                  << " anchors_output=" << directionPaths.allAnchors
+                  << " dir1_anchors_output=" << directionPaths.direction1Anchors
+                  << " dir2_anchors_output=" << directionPaths.direction2Anchors
+                  << " mixed_anchors_output=" << directionPaths.mixedAnchors
+                  << '\n';
         std::cout << "fiberlet crop timing"
                   << " graph_seconds=" << graphSeconds
                   << " graph_cpu_seconds=" << graphCpuSeconds

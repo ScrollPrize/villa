@@ -1221,6 +1221,150 @@ TEST_CASE("Combined fiberlet dataset with no expected chunks is complete from fo
     std::filesystem::remove_all(root);
 }
 
+TEST_CASE("Fiberlet crop materialization ignores partial tuples reached only by irrelevant halo edges")
+{
+    std::mt19937_64 random(std::random_device{}());
+    const auto root = std::filesystem::temp_directory_path() /
+        ("vc_fiberlet_crop_partial_halo_" + std::to_string(random()));
+    FiberletDatasetMetadata metadata;
+    metadata.kind = FiberletDatasetKind::Combined;
+    metadata.profile = FiberletStorageProfile::CompactDirectionsFixedCost;
+    metadata.chunkGridShapeZYX = {1, 1, 4};
+    metadata.coordinateUnitsPerChunkZYX = {8, 8, 8};
+    metadata.maximumEndpointReachCoordinateUnitsZYX = {8, 8, 8};
+    metadata.spatialChunkSideBaseVoxels = 8;
+    metadata.predictionToBaseScale = 1.0;
+    metadata.coordinateBits = 8;
+    metadata.deltaBits = 8;
+    metadata.routeCountBits = 8;
+    metadata.routeLatticeBits = 8;
+    metadata.costBits = 16;
+    metadata.processing["paths"] = {
+        {"cell_radius", 4},
+        {"neighborhood_margin_cells", 0.5F},
+        {"longitudinal_step_prediction", 2.0F},
+        {"transverse_step_prediction", 0.5F},
+        {"maximum_endpoint_angle_degrees", 45.0F},
+        {"maximum_prediction_deviation_degrees", 25.0F},
+        {"corridor_radius_prediction", 0.0F},
+        {"invalid_prediction_cost_per_voxel", 4.0F},
+        {"smoothness_weight", 2.0F},
+        {"smoothness_normal_weight", 0.1F},
+        {"smoothness_tangent_weight", 10.0F},
+        {"smoothness_free_angle_degrees", 0.0F},
+    };
+    finalizeFiberletDatasetIdentity(metadata);
+    auto dataset = FiberletChunkDataset::createOrOpen(root, metadata);
+
+    const auto inside = key(4, 4, 12);
+    const auto relevantOutside = key(4, 4, 17);
+    const auto irrelevantFirst = key(4, 4, 20);
+    const auto irrelevantSecond = key(4, 4, 25);
+    const auto makeAnchor = [](FiberletStorageKey id, float x) {
+        FiberletStoredAnchor anchor;
+        anchor.key = id;
+        anchor.positionPredictionXYZ = {
+            x,
+            static_cast<float>(id.coordinateZYX[1]),
+            static_cast<float>(id.coordinateZYX[0])};
+        anchor.fittedAxisXYZ = {1.0F, 0.0F, 0.0F};
+        anchor.predictionAxisXYZ = {1.0F, 0.0F, 0.0F};
+        anchor.predictionPresence = 1.0F;
+        anchor.normalXYZ = {0.0F, 1.0F, 0.0F};
+        anchor.predictionValid = true;
+        anchor.predictionPresenceValid = true;
+        anchor.normalValid = true;
+        return anchor;
+    };
+    const auto makePrefix = [](FiberletStorageKey first,
+                               FiberletStorageKey second) {
+        FiberletStoredPrefix prefix;
+        prefix.id = {first, second};
+        prefix.pathLengthPredictionVoxels = 1.0F;
+        prefix.cost = {0.0F, 1.0F, 0.0F, 0.0F, 0.0F};
+        prefix.firstStepBaseXYZ = {1.0F, 0.0F, 0.0F};
+        prefix.lastStepBaseXYZ = {1.0F, 0.0F, 0.0F};
+        return prefix;
+    };
+    const auto publishComplete = [&dataset](
+                                     const vc::render::ChunkKey& owner,
+                                     const std::vector<FiberletStoredAnchor>& anchors,
+                                     const std::vector<FiberletStoredPrefix>& prefixes) {
+        const vc::render::ChunkKey routeOwner{
+            1, owner.iz, owner.iy, owner.ix};
+        dataset->publishChunk(
+            FiberletStorageChunkKind::Anchors, owner,
+            serializeFiberletAnchors(
+                dataset->codecConfig(
+                    FiberletStorageChunkKind::Anchors, owner),
+                anchors));
+        const auto prefixBytes = serializeFiberletPrefixes(
+            dataset->codecConfig(
+                FiberletStorageChunkKind::FiberletPrefix, owner),
+            prefixes);
+        std::vector<FiberletStoredRoute> routes(
+            prefixes.size(), FiberletStoredRoute{{}, {1.0F}});
+        dataset->publishFiberletChunkPair(
+            owner,
+            materialized(FiberletStorageChunkKind::FiberletPrefix,
+                         prefixBytes),
+            routeOwner,
+            materialized(
+                FiberletStorageChunkKind::FiberletRoutes,
+                serializeFiberletRoutes(
+                    dataset->codecConfig(
+                        FiberletStorageChunkKind::FiberletRoutes,
+                        routeOwner),
+                    routes)));
+    };
+
+    const vc::render::ChunkKey insideOwner{0, 0, 0, 1};
+    const vc::render::ChunkKey haloOwner{0, 0, 0, 2};
+    const vc::render::ChunkKey partialOwner{0, 0, 0, 3};
+    publishComplete(
+        insideOwner, {makeAnchor(inside, 15.0F)},
+        {makePrefix(inside, relevantOutside)});
+    publishComplete(
+        haloOwner,
+        {makeAnchor(relevantOutside, 16.0F),
+         makeAnchor(irrelevantFirst, 20.0F)},
+        {makePrefix(irrelevantFirst, irrelevantSecond)});
+    const std::array partialAnchors{makeAnchor(irrelevantSecond, 21.0F)};
+    dataset->publishChunk(
+        FiberletStorageChunkKind::Anchors, partialOwner,
+        serializeFiberletAnchors(
+            dataset->codecConfig(
+                FiberletStorageChunkKind::Anchors, partialOwner),
+            partialAnchors));
+    dataset->publishChunk(
+        FiberletStorageChunkKind::FiberletPrefix, partialOwner,
+        serializeFiberletPrefixes(
+            dataset->codecConfig(
+                FiberletStorageChunkKind::FiberletPrefix, partialOwner),
+            {}));
+
+    FiberletStoredReplayGraphSource stored(dataset);
+    const auto crop = stored.materializeBaseBox(
+        {8.0, 0.0, 0.0}, {16.0, 8.0, 8.0}, 4);
+    REQUIRE(crop.graph);
+    REQUIRE(crop.insideAnchors.size() == 1);
+    CHECK(crop.insideAnchors.front().key == inside);
+    const auto outgoing = crop.graph->outgoing(inside);
+    REQUIRE(outgoing.size() == 1);
+    CHECK(outgoing.front().fiberlet ==
+          FiberletStorageId{inside, relevantOutside});
+    CHECK_THROWS_AS(
+        crop.graph->arc(
+            {{irrelevantFirst, irrelevantSecond}, false}),
+        std::out_of_range);
+
+    CHECK_THROWS_AS(
+        stored.materializeBaseBox(
+            {24.0, 0.0, 0.0}, {32.0, 8.0, 8.0}, 4),
+        std::runtime_error);
+    std::filesystem::remove_all(root);
+}
+
 TEST_CASE("Stored combined fiberlet caches interpret absent sparse chunks as empty")
 {
     std::mt19937_64 random(std::random_device{}());

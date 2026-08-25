@@ -1267,8 +1267,7 @@ ChunkRouteLocalGraph materializeChunkRouteGraph(
         for (std::size_t index = 0;
              index < loaded.value.payloadLease->prefixes.size(); ++index) {
             const auto& prefix = loaded.value.payloadLease->prefixes[index];
-            if (!buildReplayGeometry &&
-                !insideAnchors.contains(prefix.id.first) &&
+            if (!insideAnchors.contains(prefix.id.first) &&
                 !insideAnchors.contains(prefix.id.second)) {
                 continue;
             }
