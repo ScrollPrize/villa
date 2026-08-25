@@ -61,23 +61,9 @@ class LegacyNumpyRandom:
     # identical to the historical behaviour).
 
     random = staticmethod(np.random.random)
+    randint = staticmethod(lambda *a, **k: np.random.randint(*a, dtype=np.int64, **k))
     uniform = staticmethod(np.random.uniform)
     choice = staticmethod(np.random.choice)
-
-    @staticmethod
-    def randint(low, high=None, size=None):
-        # RandomState.randint defaults to the C long, which is 32-bit on Windows. Callers
-        # asking for a 64-bit seed -- losses.py:_sample_patch_points does
-        #     seed = int(rng.randint(0, np.iinfo(np.int64).max))
-        # -- therefore raise "ValueError: high is out of bounds for int32" at the first
-        # optimizer iteration. The C long is 64-bit on Linux, which is why this is invisible
-        # there. int64 is requested only when the bound does not fit in int32, so every
-        # existing small-range call keeps the exact historical bit stream, which is the
-        # stated purpose of this class.
-        bound = low if high is None else high
-        if bound is not None and int(bound) > np.iinfo(np.int32).max:
-            return np.random.randint(low, high, size=size, dtype=np.int64)
-        return np.random.randint(low, high, size=size)
 
 
 def _iter_tensors(value):
@@ -115,8 +101,6 @@ class StepPrefetcher:
         if rng is None:
             # Seeded once from the global stream: deterministic given the
             # deterministic first-use order, then independent of it.
-            # Same 32-bit C long pitfall as in LegacyNumpyRandom.randint above:
-            # without an explicit dtype this raises on Windows.
             seed = int(np.random.randint(0, 2 ** 63 - 1, dtype=np.int64))
             rng = _GeneratorShim(np.random.Generator(np.random.PCG64(seed)))
             self._np_rngs[key] = rng
