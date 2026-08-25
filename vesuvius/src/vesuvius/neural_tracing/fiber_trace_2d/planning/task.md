@@ -1,5 +1,10 @@
-# Task: limit Fiberlet crop trace attempts
+# Task: parallel Fiberlet crop seed tracing
 
-Add a `vc_fiber_trace_chunk` argument that limits the number of anchor seed
-attempts independently of the accepted-fiber limit. Preserve strongest-first
-seed ordering by descending prediction presence.
+Parallelize independent anchor-seeded Fiberlet crop traces. Trace candidates
+concurrently, but serialize result integration and anchor coverage. If an
+earlier accepted trace covers the seed of an already-computed concurrent
+candidate, discard that candidate during serial integration.
+
+Keep the existing deterministic strongest-first semantics, limits, geometry,
+and numerical behavior. Use the host CPU count by default and measure the
+optimized Release implementation before and after the change.

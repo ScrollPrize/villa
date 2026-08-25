@@ -107,6 +107,12 @@ public:
     [[nodiscard]] FiberletGraphQuery<FiberletAnchorChunkLease> anchorsInChunk(const vc::render::ChunkKey& chunk, bool blocking = false) const;
     [[nodiscard]] FiberletGraphQuery<FiberletPrefixChunkLease> prefixesInChunk(const vc::render::ChunkKey& chunk, bool blocking = false) const;
     [[nodiscard]] FiberletGraphQuery<FiberletRouteChunkLease> routesInChunk(const vc::render::ChunkKey& chunk, bool blocking = false) const;
+    void prefetchAnchorChunks(
+        std::span<const vc::render::ChunkKey> chunks,
+        bool blocking = false) const;
+    void prefetchFiberletChunks(
+        std::span<const vc::render::ChunkKey> chunks,
+        bool blocking = false) const;
     [[nodiscard]] std::vector<vc::render::ChunkKey> incidentPrefixChunks(
         std::span<const FiberletStorageKey> anchors) const;
     [[nodiscard]] FiberletGraphQuery<FiberletEdgeLease> edge(const FiberletStorageId& fiberlet, bool blocking = false) const;
@@ -126,6 +132,7 @@ public:
         const FiberletStoredAnchor& sharedAnchor,
         float maximumJoinAngleDegrees) const;
     [[nodiscard]] const FiberletDatasetMetadata& metadata() const noexcept;
+    [[nodiscard]] const FiberletPathConfig& pathConfig() const noexcept;
 
 private:
     [[nodiscard]] vc::render::ChunkKey ownerChunk(const FiberletStorageKey& anchor, int level) const;
@@ -145,6 +152,11 @@ private:
     const FiberletDatasetMetadata& metadata,
     int parallelThreads = 1);
 
+struct FiberletMaterializedReplayGraph {
+    std::shared_ptr<FiberletImmutableReplayGraphSource> graph;
+    std::vector<FiberletStoredAnchor> insideAnchors;
+};
+
 // Blocking stored-graph adapter. Missing sparse chunks are empty; all edge,
 // route, and transition interpretation remains owned by FiberletChunkGraphSource.
 class FiberletStoredReplayGraphSource final : public FiberletReplayGraphSource
@@ -155,6 +167,7 @@ public:
         FiberletChunkCacheOptions cacheOptions = {},
         float maximumJoinAngleDegrees = 45.0F);
 
+    [[nodiscard]] bool supportsConcurrentQueries() const noexcept override { return false; }
     [[nodiscard]] float predictionToBaseScale() const noexcept override;
     [[nodiscard]] int anchorCellSizePredictionVoxels() const noexcept override;
     [[nodiscard]] float maximumJoinAngleDegrees() const noexcept override;
@@ -178,6 +191,10 @@ public:
     [[nodiscard]] std::vector<FiberletStoredAnchor> anchorsInBaseBox(
         const cv::Vec3d& minimumBaseXYZ,
         const cv::Vec3d& maximumBaseXYZ) const;
+    [[nodiscard]] FiberletMaterializedReplayGraph materializeBaseBox(
+        const cv::Vec3d& minimumBaseXYZ,
+        const cv::Vec3d& maximumBaseXYZ,
+        std::size_t parallelThreads) const;
     [[nodiscard]] const FiberletDatasetMetadata& metadata() const noexcept;
 
 private:
@@ -437,6 +454,7 @@ public:
             defaultFiberletReplayQuantization(),
         float maximumJoinAngleDegrees = 45.0F);
 
+    [[nodiscard]] bool supportsConcurrentQueries() const noexcept override { return false; }
     [[nodiscard]] float predictionToBaseScale() const noexcept override;
     [[nodiscard]] int anchorCellSizePredictionVoxels() const noexcept override;
     [[nodiscard]] float maximumJoinAngleDegrees() const noexcept override;

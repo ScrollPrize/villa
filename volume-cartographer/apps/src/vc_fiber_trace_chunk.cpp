@@ -7,7 +7,9 @@
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <ctime>
 #include <cstdlib>
 #include <filesystem>
 #include <iomanip>
@@ -47,7 +49,7 @@ void usage(const char* executable)
               << " --output lines.obj [options]\n\n"
               << "  --volume PATH              concrete uint8 CT Zarr group\n"
               << "  --remote-cache-dir PATH    cache for a remote normal manifest\n"
-              << "  --threads N                graph cache workers [host CPUs]\n"
+              << "  --threads N                graph preparation and trace workers [host CPUs]\n"
               << "  --cache-gib N              decoded graph/normal cache [8]\n"
               << "  --beam N                   retained lookahead candidates [16]\n"
               << "  --lookahead N              lookahead in base voxels [384]\n"
@@ -149,6 +151,7 @@ Options parse(int argc, char** argv)
         fail("--threads must be positive");
     if (options.maximumTextureDimension < 2)
         fail("--texture-max must be at least two");
+    options.trace.parallelThreads = static_cast<std::size_t>(options.threads);
     if (vc::lasagna::isRemoteLasagnaLocation(options.normalManifest) && options.remoteCacheDirectory.empty()) {
         fail("a remote normal manifest requires --remote-cache-dir");
     }
@@ -180,13 +183,31 @@ int main(int argc, char** argv)
             dataset->metadata(), normalDataset);
         const vc::lasagna::LasagnaNormalSampler normals(normalDataset, vc::lasagna::LasagnaNormalSamplerOptions{options.cacheBytes});
 
-        const auto anchors = graph.anchorsInBaseBox(options.trace.minimumBaseXYZ, options.trace.maximumBaseXYZ);
-        std::cout << "fiberlet crop anchors=" << anchors.size() << " prediction_to_base=" << dataset->metadata().predictionToBaseScale << '\n';
+        const auto graphStarted = std::chrono::steady_clock::now();
+        const auto graphCpuStarted = std::clock();
+        auto materialized = graph.materializeBaseBox(
+            options.trace.minimumBaseXYZ, options.trace.maximumBaseXYZ,
+            static_cast<std::size_t>(options.threads));
+        const double graphSeconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - graphStarted).count();
+        const double graphCpuSeconds = static_cast<double>(
+            std::clock() - graphCpuStarted) / CLOCKS_PER_SEC;
+        std::cout << "fiberlet crop graph prepared"
+                  << " anchors=" << materialized.insideAnchors.size()
+                  << " prediction_to_base=" << dataset->metadata().predictionToBaseScale
+                  << " elapsed_seconds=" << graphSeconds
+                  << " cpu_seconds=" << graphCpuSeconds << '\n';
+        const auto traceStarted = std::chrono::steady_clock::now();
+        const auto traceCpuStarted = std::clock();
         const auto result =
-            vc::fiber_tracer::traceFiberletCrop(graph, anchors, normals, dataset->metadata().predictionToBaseScale, options.trace, [](const auto& current, std::size_t remaining) {
+            vc::fiber_tracer::traceFiberletCrop(*materialized.graph, std::move(materialized.insideAnchors), normals, dataset->metadata().predictionToBaseScale, options.trace, [](const auto& current, std::size_t remaining) {
                 std::cout << "fiberlet crop attempted=" << current.attemptedAnchors << " accepted=" << current.lines.size()
                           << " covered=" << current.coveredAnchors << " remaining=" << remaining << '\n';
             });
+        const double traceSeconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - traceStarted).count();
+        const double traceCpuSeconds = static_cast<double>(
+            std::clock() - traceCpuStarted) / CLOCKS_PER_SEC;
 
         std::filesystem::create_directories(options.output.parent_path().empty() ? std::filesystem::path{"."} : options.output.parent_path());
         std::vector<vc::core::io::NamedPolyline> lines;
@@ -213,8 +234,19 @@ int main(int argc, char** argv)
 
         std::cout << "fiberlet crop completed"
                   << " candidates=" << result.candidateAnchors << " attempted=" << result.attemptedAnchors << " covered=" << result.coveredAnchors
+                  << " computed=" << result.computedCandidates << " discarded=" << result.discardedCandidates
                   << " accepted=" << result.lines.size() << " no_edge=" << result.noEdgeAnchors << " one_sided=" << result.oneSidedLines
                   << " bidirectional=" << result.bidirectionalLines << " output=" << options.output << '\n';
+        std::cout << "fiberlet crop timing"
+                  << " graph_seconds=" << graphSeconds
+                  << " graph_cpu_seconds=" << graphCpuSeconds
+                  << " trace_seconds=" << traceSeconds
+                  << " trace_cpu_seconds=" << traceCpuSeconds
+                  << " candidate_batch_seconds=" << result.candidateBatchSeconds
+                  << " candidate_batch_cpu_seconds=" << result.candidateBatchCpuSeconds
+                  << " candidate_task_seconds=" << result.candidateTaskSeconds
+                  << " candidate_task_max_seconds=" << result.maximumCandidateTaskSeconds
+                  << " integration_seconds=" << result.integrationSeconds << '\n';
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "vc_fiber_trace_chunk: " << error.what() << '\n';

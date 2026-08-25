@@ -1,15 +1,21 @@
 #include "vc/fiber_tracer/FiberletCropTrace.hpp"
 
 #include "vc/fiber_tracer/FiberReplayMetric.hpp"
+#include "utils/thread_pool.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <ctime>
+#include <exception>
 #include <limits>
 #include <map>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <stdexcept>
 #include <tuple>
+#include <thread>
 
 namespace vc::fiber_tracer
 {
@@ -265,6 +271,12 @@ struct InitialPair {
     std::optional<DirectedFiberletStorageId> positive;
 };
 
+struct TraceCandidate {
+    FiberletCropTraceLine line;
+    bool hasUsableEdge = false;
+    bool bidirectional = false;
+};
+
 InitialPair selectInitialPair(const FiberletReplayGraphSource& graph, const FiberletStoredAnchor& seed)
 {
     const cv::Vec3d axis = normalized(seed.fittedAxisXYZ);
@@ -329,6 +341,47 @@ InitialPair selectInitialPair(const FiberletReplayGraphSource& graph, const Fibe
             result.negative.reset();
         }
     }
+    return result;
+}
+
+TraceCandidate traceCandidate(
+    const FiberletReplayGraphSource& graph,
+    const FiberletStoredAnchor& seed,
+    const FiberletCropTraceConfig& config)
+{
+    TraceCandidate result;
+    result.line.seed = seed.key;
+    result.line.seedPresence = seed.predictionPresence;
+    const auto initial = selectInitialPair(graph, seed);
+    if (!initial.negative.has_value() && !initial.positive.has_value())
+        return result;
+    result.hasUsableEdge = true;
+
+    const cv::Vec3d axis = normalized(seed.fittedAxisXYZ);
+    SideTrace negative;
+    SideTrace positive;
+    if (initial.negative.has_value()) {
+        negative = traceSide(graph, seed, -axis, initial.negative, config);
+    } else {
+        negative.points = {cv::Vec3d(seed.positionPredictionXYZ * graph.predictionToBaseScale())};
+        negative.termination = "no_usable_edge";
+    }
+    if (initial.positive.has_value()) {
+        positive = traceSide(graph, seed, axis, initial.positive, config);
+    } else {
+        positive.points = {cv::Vec3d(seed.positionPredictionXYZ * graph.predictionToBaseScale())};
+        positive.termination = "no_usable_edge";
+    }
+
+    result.line.negativeTermination = negative.termination;
+    result.line.positiveTermination = positive.termination;
+    result.line.negativeFiberlets = negative.fiberlets;
+    result.line.positiveFiberlets = positive.fiberlets;
+    result.line.pointsBaseXYZ.assign(negative.points.rbegin(), negative.points.rend());
+    result.line.pointsBaseXYZ.insert(
+        result.line.pointsBaseXYZ.end(),
+        std::next(positive.points.begin()), positive.points.end());
+    result.bidirectional = negative.fiberlets > 0 && positive.fiberlets > 0;
     return result;
 }
 
@@ -451,62 +504,111 @@ FiberletCropTraceResult traceFiberletCrop(
         spatialIndex[bucketFor(point, bucketSide)].push_back(index);
     }
 
-    for (std::size_t index = 0; index < anchors.size(); ++index) {
-        if (!active[index])
-            continue;
-        if ((config.maximumAttempts != 0 &&
-             result.attemptedAnchors >= config.maximumAttempts) ||
-            (config.maximumFibers != 0 &&
-             result.lines.size() >= config.maximumFibers)) {
+    const std::size_t requestedThreads = config.parallelThreads == 0
+        ? std::max<std::size_t>(1, std::thread::hardware_concurrency())
+        : config.parallelThreads;
+    const std::size_t workerCount = graph.supportsConcurrentQueries()
+        ? std::min(requestedThreads, std::max<std::size_t>(1, anchors.size()))
+        : 1;
+    std::optional<utils::ThreadPool> pool;
+    if (workerCount > 1)
+        pool.emplace(workerCount);
+
+    std::size_t scan = 0;
+    bool finished = false;
+    while (!finished && scan < anchors.size()) {
+        if ((config.maximumAttempts != 0 && result.attemptedAnchors >= config.maximumAttempts) ||
+            (config.maximumFibers != 0 && result.lines.size() >= config.maximumFibers)) {
             break;
         }
-        active[index] = false;
-        ++result.attemptedAnchors;
-        const auto initial = selectInitialPair(graph, anchors[index]);
-        if (!initial.negative.has_value() && !initial.positive.has_value()) {
-            ++result.noEdgeAnchors;
+        std::size_t batchCapacity = workerCount;
+        if (config.maximumAttempts != 0) {
+            batchCapacity = std::min(
+                batchCapacity,
+                config.maximumAttempts - result.attemptedAnchors);
+        }
+        std::vector<std::size_t> batch;
+        batch.reserve(batchCapacity);
+        while (scan < anchors.size() && batch.size() < batchCapacity) {
+            if (active[scan])
+                batch.push_back(scan);
+            ++scan;
+        }
+        if (batch.empty())
             continue;
-        }
-        const cv::Vec3d axis = normalized(anchors[index].fittedAxisXYZ);
-        SideTrace negative;
-        SideTrace positive;
-        if (initial.negative.has_value()) {
-            negative = traceSide(graph, anchors[index], -axis, initial.negative, config);
+
+        std::vector<TraceCandidate> candidates(batch.size());
+        std::vector<std::exception_ptr> failures(batch.size());
+        std::vector<double> taskSeconds(batch.size());
+        const auto compute = [&](std::size_t batchIndex) {
+            const auto started = std::chrono::steady_clock::now();
+            try {
+                candidates[batchIndex] = traceCandidate(
+                    graph, anchors[batch[batchIndex]], config);
+            } catch (...) {
+                failures[batchIndex] = std::current_exception();
+            }
+            taskSeconds[batchIndex] = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - started).count();
+        };
+        const auto batchStarted = std::chrono::steady_clock::now();
+        const auto batchCpuStarted = std::clock();
+        if (pool) {
+            pool->run_indexed_batch(batch.size(), compute);
         } else {
-            negative.points = {cv::Vec3d(anchors[index].positionPredictionXYZ * graph.predictionToBaseScale())};
-            negative.termination = "no_usable_edge";
+            for (std::size_t batchIndex = 0; batchIndex < batch.size(); ++batchIndex)
+                compute(batchIndex);
         }
-        if (initial.positive.has_value()) {
-            positive = traceSide(graph, anchors[index], axis, initial.positive, config);
-        } else {
-            positive.points = {cv::Vec3d(anchors[index].positionPredictionXYZ * graph.predictionToBaseScale())};
-            positive.termination = "no_usable_edge";
+        result.candidateBatchSeconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - batchStarted).count();
+        result.candidateBatchCpuSeconds += static_cast<double>(
+            std::clock() - batchCpuStarted) / CLOCKS_PER_SEC;
+        result.candidateTaskSeconds += std::accumulate(
+            taskSeconds.begin(), taskSeconds.end(), 0.0);
+        result.maximumCandidateTaskSeconds = std::max(
+            result.maximumCandidateTaskSeconds,
+            *std::max_element(taskSeconds.begin(), taskSeconds.end()));
+        result.computedCandidates += batch.size();
+        for (const auto& failure : failures) {
+            if (failure)
+                std::rethrow_exception(failure);
         }
 
-        FiberletCropTraceLine line;
-        line.seed = anchors[index].key;
-        line.seedPresence = anchors[index].predictionPresence;
-        line.negativeTermination = negative.termination;
-        line.positiveTermination = positive.termination;
-        line.negativeFiberlets = negative.fiberlets;
-        line.positiveFiberlets = positive.fiberlets;
-        line.pointsBaseXYZ.assign(negative.points.rbegin(), negative.points.rend());
-        line.pointsBaseXYZ.insert(line.pointsBaseXYZ.end(), std::next(positive.points.begin()), positive.points.end());
-        if (line.pointsBaseXYZ.size() < 2) {
-            ++result.noEdgeAnchors;
-            continue;
+        const auto integrationStarted = std::chrono::steady_clock::now();
+        for (std::size_t batchIndex = 0; batchIndex < batch.size(); ++batchIndex) {
+            const std::size_t index = batch[batchIndex];
+            if (!active[index]) {
+                ++result.discardedCandidates;
+                continue;
+            }
+            if ((config.maximumAttempts != 0 && result.attemptedAnchors >= config.maximumAttempts) ||
+                (config.maximumFibers != 0 && result.lines.size() >= config.maximumFibers)) {
+                finished = true;
+                break;
+            }
+            active[index] = false;
+            ++result.attemptedAnchors;
+            auto& candidate = candidates[batchIndex];
+            if (!candidate.hasUsableEdge || candidate.line.pointsBaseXYZ.size() < 2) {
+                ++result.noEdgeAnchors;
+                continue;
+            }
+            if (candidate.bidirectional)
+                ++result.bidirectionalLines;
+            else
+                ++result.oneSidedLines;
+            result.coveredAnchors += suppressCoveredAnchors(
+                candidate.line.pointsBaseXYZ, anchors, active, spatialIndex,
+                normalSampler, normalWorkingToBaseScale, graph, config);
+            result.lines.push_back(std::move(candidate.line));
+            if (progress) {
+                const auto remaining = static_cast<std::size_t>(
+                    std::count(active.begin(), active.end(), true));
+                progress(result, remaining);
+            }
         }
-        if (negative.fiberlets > 0 && positive.fiberlets > 0)
-            ++result.bidirectionalLines;
-        else
-            ++result.oneSidedLines;
-        result.coveredAnchors +=
-            suppressCoveredAnchors(line.pointsBaseXYZ, anchors, active, spatialIndex, normalSampler, normalWorkingToBaseScale, graph, config);
-        result.lines.push_back(std::move(line));
-        if (progress) {
-            const auto remaining = static_cast<std::size_t>(std::count(active.begin(), active.end(), true));
-            progress(result, remaining);
-        }
+        result.integrationSeconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - integrationStarted).count();
     }
     return result;
 }

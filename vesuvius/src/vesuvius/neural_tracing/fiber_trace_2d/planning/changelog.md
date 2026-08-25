@@ -1,3 +1,16 @@
+# 2026-08-25: deterministic parallel Fiberlet crop tracing
+
+- Parallelized independent anchor-seed graph traversal while retaining serial
+  strongest-first result integration, coverage suppression, counters, and OBJ
+  order. Speculative traces covered by an earlier result are discarded.
+- Extracted a reusable immutable, storage-key-based replay source and extended
+  the existing chunk-route bulk materializer with complete route geometry,
+  cost profiles, and stored joins. Chunk reads are prefetched in batches;
+  tracing performs no cache queries.
+- Removed the four-worker cache-contention workaround. Host-CPU tracing reduced
+  the 16-seed trace phase from 17.57 s to about 3-4 s on the Paris4 1024-base
+  crop while preserving the original OBJ byte-for-byte.
+
 # 2026-08-25: Fiberlet producer cache contract v3
 
 - Moved anchor and Fiberlet generation to one new producer-contract namespace

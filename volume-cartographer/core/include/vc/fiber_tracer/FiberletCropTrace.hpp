@@ -21,6 +21,7 @@ struct FiberletCropTraceConfig {
     std::size_t maximumFiberletsPerSide = 100'000;
     double coverageNormalRadiusBaseVoxels = 20.0;
     double coverageDirectionDegrees = 25.0;
+    std::size_t parallelThreads = 0;
     std::size_t maximumAttempts = 0;
     std::size_t maximumFibers = 0;
 };
@@ -38,11 +39,18 @@ struct FiberletCropTraceLine {
 struct FiberletCropTraceResult {
     std::vector<FiberletCropTraceLine> lines;
     std::size_t candidateAnchors = 0;
+    std::size_t computedCandidates = 0;
+    std::size_t discardedCandidates = 0;
     std::size_t attemptedAnchors = 0;
     std::size_t coveredAnchors = 0;
     std::size_t noEdgeAnchors = 0;
     std::size_t oneSidedLines = 0;
     std::size_t bidirectionalLines = 0;
+    double candidateBatchSeconds = 0.0;
+    double candidateBatchCpuSeconds = 0.0;
+    double candidateTaskSeconds = 0.0;
+    double maximumCandidateTaskSeconds = 0.0;
+    double integrationSeconds = 0.0;
 };
 
 using FiberletCropTraceProgress = std::function<void(const FiberletCropTraceResult& result, std::size_t remainingAnchors)>;

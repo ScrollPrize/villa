@@ -61,8 +61,21 @@ MTL beside the line OBJ. `--texture-max` limits either texture dimension.
 
 Useful controls are `--lookahead`, `--beam`, `--coverage`,
 `--coverage-angle`, `--cache-gib`, `--max-attempts`, and `--max-fibers`.
-`--threads` defaults to the host CPU count. Both limits use zero for unlimited:
+`--threads` controls bulk graph preparation and independent seed tracing, and
+defaults to the host CPU count. Before tracing, the tool loads the crop's
+incident Fiberlets, route geometry, endpoint anchors, and joins once into an
+immutable in-memory graph. Trace workers do not query the chunk cache. The tool
+reports graph-preparation and trace times separately. Both limits use zero for
+unlimited:
 `--max-attempts` counts uncovered seed attempts, including failed/no-edge
 attempts, while `--max-fibers` counts accepted lines. Seeds are attempted from
 highest prediction presence to lowest, with storage key as the deterministic
 tie break.
+
+Seed graph traversal over the materialized graph is read-only and concurrent.
+The canonical seed set is unchanged; additional endpoint anchors needed to
+close crop traversal do not become new starts. Results are integrated
+serially in the same strongest-first order, including all counters and
+anisotropic coverage updates. If an earlier integrated line covers the seed of
+another trace that was computed in the same group, that speculative result is
+discarded and does not consume an attempt.

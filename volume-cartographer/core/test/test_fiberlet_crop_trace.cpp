@@ -10,10 +10,13 @@
 
 #include <filesystem>
 #include <fstream>
+#include <atomic>
+#include <chrono>
 #include <map>
 #include <nlohmann/json.hpp>
 #include <random>
 #include <sstream>
+#include <thread>
 
 namespace
 {
@@ -46,6 +49,7 @@ public:
         adjacency[second].push_back(directed);
     }
 
+    [[nodiscard]] bool supportsConcurrentQueries() const noexcept override { return concurrentQueries; }
     [[nodiscard]] float predictionToBaseScale() const noexcept override { return 1.0F; }
     [[nodiscard]] int anchorCellSizePredictionVoxels() const noexcept override { return 4; }
     [[nodiscard]] float maximumJoinAngleDegrees() const noexcept override { return 45.0F; }
@@ -55,6 +59,25 @@ public:
     }
     [[nodiscard]] std::vector<DirectedFiberletStorageId> outgoing(const FiberletStorageKey& anchor) const override
     {
+        struct ActiveQuery {
+            explicit ActiveQuery(const TestGraph& owner) : owner_(owner)
+            {
+                if (!owner_.observeConcurrency)
+                    return;
+                const int active = owner_.activeQueries.fetch_add(1) + 1;
+                int maximum = owner_.maximumConcurrentQueries.load();
+                while (active > maximum &&
+                       !owner_.maximumConcurrentQueries.compare_exchange_weak(maximum, active)) {
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            ~ActiveQuery()
+            {
+                if (owner_.observeConcurrency)
+                    owner_.activeQueries.fetch_sub(1);
+            }
+            const TestGraph& owner_;
+        } activeQuery(*this);
         auto found = adjacency.find(anchor);
         if (found == adjacency.end())
             return {};
@@ -94,6 +117,10 @@ public:
 
     std::map<FiberletStorageKey, cv::Vec3d> positions;
     std::map<FiberletStorageKey, std::vector<DirectedFiberletStorageId>> adjacency;
+    bool concurrentQueries = false;
+    bool observeConcurrency = false;
+    mutable std::atomic<int> activeQueries{0};
+    mutable std::atomic<int> maximumConcurrentQueries{0};
 };
 
 FiberletStoredAnchor anchor(FiberletStorageKey id, cv::Vec3f point, cv::Vec3f axis, float presence)
@@ -253,6 +280,83 @@ TEST_CASE("Fiberlet crop tracing is bidirectional and uses anisotropic direction
     CHECK(limited.coveredAnchors == 1);
     CHECK(limited.lines.size() == 1);
     CHECK(limited.noEdgeAnchors == 1);
+}
+
+TEST_CASE("Fiberlet crop tracing computes concurrently and integrates canonically")
+{
+    TestGraph graph;
+    const auto outsideLeft = key(-10);
+    const auto left = key(20);
+    const auto seed = key(50);
+    const auto right = key(80);
+    const auto outsideRight = key(110);
+    graph.addAnchor(outsideLeft, {-10, 0, 0});
+    graph.addAnchor(left, {20, 0, 0});
+    graph.addAnchor(seed, {50, 0, 0});
+    graph.addAnchor(right, {80, 0, 0});
+    graph.addAnchor(outsideRight, {110, 0, 0});
+    graph.connect(outsideLeft, left);
+    graph.connect(left, seed);
+    graph.connect(seed, right);
+    graph.connect(right, outsideRight);
+
+    const auto covered = key(51);
+    const auto crossing = key(52);
+    const auto normalFar = key(53);
+    const std::vector<FiberletStoredAnchor> anchors{
+        anchor(seed, {50, 0, 0}, {1, 0, 0}, 1.0F),
+        anchor(covered, {50, 50, 0}, {1, 0, 0}, 0.8F),
+        anchor(crossing, {50, 0, 0}, {0, 1, 0}, 0.7F),
+        anchor(normalFar, {50, 0, 21}, {1, 0, 0}, 0.6F),
+    };
+    ZNormalSampler normals;
+    FiberletCropTraceConfig serialConfig;
+    serialConfig.minimumBaseXYZ = {0, -100, -100};
+    serialConfig.maximumBaseXYZ = {100, 100, 100};
+    serialConfig.lookaheadDistanceBaseVoxels = 48;
+    serialConfig.parallelThreads = 1;
+    const auto serial = traceFiberletCrop(
+        graph, anchors, normals, 1.0, serialConfig);
+
+    graph.concurrentQueries = true;
+    graph.observeConcurrency = true;
+    FiberletCropTraceConfig parallelConfig = serialConfig;
+    parallelConfig.parallelThreads = 4;
+    const auto parallel = traceFiberletCrop(
+        graph, anchors, normals, 1.0, parallelConfig);
+    CHECK(graph.maximumConcurrentQueries.load() >= 2);
+    CHECK(parallel.candidateAnchors == serial.candidateAnchors);
+    CHECK(parallel.attemptedAnchors == serial.attemptedAnchors);
+    CHECK(parallel.coveredAnchors == serial.coveredAnchors);
+    CHECK(parallel.noEdgeAnchors == serial.noEdgeAnchors);
+    CHECK(parallel.oneSidedLines == serial.oneSidedLines);
+    CHECK(parallel.bidirectionalLines == serial.bidirectionalLines);
+    REQUIRE(parallel.lines.size() == serial.lines.size());
+    for (std::size_t line = 0; line < serial.lines.size(); ++line) {
+        CHECK(parallel.lines[line].seed == serial.lines[line].seed);
+        CHECK(parallel.lines[line].seedPresence == serial.lines[line].seedPresence);
+        CHECK(parallel.lines[line].negativeTermination == serial.lines[line].negativeTermination);
+        CHECK(parallel.lines[line].positiveTermination == serial.lines[line].positiveTermination);
+        CHECK(parallel.lines[line].negativeFiberlets == serial.lines[line].negativeFiberlets);
+        CHECK(parallel.lines[line].positiveFiberlets == serial.lines[line].positiveFiberlets);
+        CHECK(parallel.lines[line].pointsBaseXYZ == serial.lines[line].pointsBaseXYZ);
+    }
+
+    graph.maximumConcurrentQueries = 0;
+    parallelConfig.parallelThreads = 0;
+    parallelConfig.maximumAttempts = 2;
+    const auto defaultWorkers = traceFiberletCrop(
+        graph, anchors, normals, 1.0, parallelConfig);
+    CHECK(defaultWorkers.attemptedAnchors == 2);
+    CHECK(defaultWorkers.lines.size() == 1);
+
+    graph.concurrentQueries = false;
+    graph.maximumConcurrentQueries = 0;
+    parallelConfig.parallelThreads = 4;
+    const auto unsupportedSource = traceFiberletCrop(
+        graph, anchors, normals, 1.0, parallelConfig);
+    CHECK(unsupportedSource.attemptedAnchors == 2);
+    CHECK(graph.maximumConcurrentQueries.load() == 1);
 }
 
 TEST_CASE("Fiberlet crop attempts follow strongest-first deterministic ordering")

@@ -1021,6 +1021,20 @@ TEST_CASE("Combined fiberlet dataset exposes complete sparse graph facets")
     metadata.routeCountBits = 8;
     metadata.routeLatticeBits = 8;
     metadata.costBits = 16;
+    metadata.processing["paths"] = {
+        {"cell_radius", 4},
+        {"neighborhood_margin_cells", 0.5F},
+        {"longitudinal_step_prediction", 2.0F},
+        {"transverse_step_prediction", 0.5F},
+        {"maximum_endpoint_angle_degrees", 45.0F},
+        {"maximum_prediction_deviation_degrees", 25.0F},
+        {"corridor_radius_prediction", 0.0F},
+        {"invalid_prediction_cost_per_voxel", 4.0F},
+        {"smoothness_weight", 2.0F},
+        {"smoothness_normal_weight", 0.1F},
+        {"smoothness_tangent_weight", 10.0F},
+        {"smoothness_free_angle_degrees", 0.0F},
+    };
     finalizeFiberletDatasetIdentity(metadata);
     auto dataset = FiberletChunkDataset::createOrOpen(root, metadata);
     const vc::render::ChunkKey owner{0, 0, 0, 0};
@@ -1032,7 +1046,18 @@ TEST_CASE("Combined fiberlet dataset exposes complete sparse graph facets")
 
     const auto first = key(6, 7, 7);
     const auto second = key(7, 7, 7);
-    const std::vector<FiberletStoredAnchor> anchors{{first, {1, 2, 3}, {1, 0, 0}}, {second, {2, 2, 3}, {1, 0, 0}}};
+    auto third = second;
+    third.variant = 1;
+    const auto orphan = key(5, 7, 7);
+    const std::vector<FiberletStoredAnchor> anchors{
+        {orphan, {0, 2, 3}, {1, 0, 0}, {1, 0, 0}, 0.5F,
+         {0, 1, 0}, true, true, true},
+        {first, {1, 2, 3}, {1, 0, 0}, {1, 0, 0}, 1.0F,
+         {0, 1, 0}, true, true, true},
+        {second, {2, 2, 3}, {1, 0, 0}, {1, 0, 0}, 1.0F,
+         {0, 1, 0}, true, true, true},
+        {third, {3, 2, 3}, {1, 0, 0}, {1, 0, 0}, 1.0F,
+         {0, 1, 0}, true, true, true}};
     dataset->publishChunk(FiberletStorageChunkKind::Anchors, owner, serializeFiberletAnchors(dataset->codecConfig(FiberletStorageChunkKind::Anchors, owner), anchors));
     CHECK_FALSE(dataset->datasetComplete());
     const std::vector<FiberletStoredPrefix> prefixes{
@@ -1040,11 +1065,15 @@ TEST_CASE("Combined fiberlet dataset exposes complete sparse graph facets")
          .pathLengthPredictionVoxels = 1.0F,
          .cost = {0.0F, 1.0F, 0.0F, 0.0F, 0.0F},
          .firstStepBaseXYZ = {1, 0, 0},
+         .lastStepBaseXYZ = {1, 0, 0}},
+        {.id = {second, third},
+         .pathLengthPredictionVoxels = 1.0F,
+         .cost = {0.0F, 1.0F, 0.0F, 0.0F, 0.0F},
+         .firstStepBaseXYZ = {1, 0, 0},
          .lastStepBaseXYZ = {1, 0, 0}}};
-    const std::vector<FiberletStoredRoute> routes{{
-        .middleUV = {},
-        .segmentCostDensities = {1.0F},
-    }};
+    const std::vector<FiberletStoredRoute> routes{
+        {.middleUV = {}, .segmentCostDensities = {1.0F}},
+        {.middleUV = {}, .segmentCostDensities = {1.0F}}};
     const vc::render::ChunkKey routeKey{1, 0, 0, 0};
     const auto prefixBytes = serializeFiberletPrefixes(dataset->codecConfig(FiberletStorageChunkKind::FiberletPrefix, owner), prefixes);
     dataset->publishChunk(FiberletStorageChunkKind::FiberletPrefix, owner, prefixBytes);
@@ -1096,11 +1125,70 @@ TEST_CASE("Combined fiberlet dataset exposes complete sparse graph facets")
     FiberletChunkGraphSource graph(reopened, anchorCache, reopened, pathCache);
     const auto incident = graph.incidentEdges(second, true);
     REQUIRE(incident.status == FiberletGraphQueryStatus::Ready);
-    REQUIRE(incident.value.edges.size() == 1);
+    REQUIRE(incident.value.edges.size() == 2);
     CHECK(incident.value.edges.front().id.fiberlet == FiberletStorageId{first, second});
     const auto loaded = graph.anchor(second, true);
     REQUIRE(loaded.status == FiberletGraphQueryStatus::Ready);
     CHECK(loaded.value.anchor.key == second);
+
+    {
+        FiberletChunkCacheOptions options;
+        options.service.fetchConcurrency.workerCapacity = 4;
+        options.service.fetchConcurrency.maxConcurrentReads = 4;
+        FiberletStoredReplayGraphSource stored(reopened, options);
+        CHECK_FALSE(stored.supportsConcurrentQueries());
+        auto materializedGraph = stored.materializeBaseBox(
+            {0.0, 0.0, 0.0}, {10.0, 10.0, 10.0}, 4);
+        REQUIRE(materializedGraph.graph);
+        REQUIRE(materializedGraph.insideAnchors.size() == 4);
+        CHECK(materializedGraph.graph->supportsConcurrentQueries());
+        CHECK(materializedGraph.graph->outgoing(orphan).empty());
+        const auto expectedOutgoing = stored.outgoing(second);
+        const auto actualOutgoing = materializedGraph.graph->outgoing(second);
+        REQUIRE(actualOutgoing == expectedOutgoing);
+        REQUIRE(actualOutgoing.size() == 2);
+        for (const auto& id : actualOutgoing) {
+            const auto expectedArc = stored.arc(id);
+            const auto actualArc = materializedGraph.graph->arc(id);
+            CHECK(actualArc.id == expectedArc.id);
+            CHECK(actualArc.source == expectedArc.source);
+            CHECK(actualArc.target == expectedArc.target);
+            CHECK(actualArc.pathLengthPredictionVoxels ==
+                  expectedArc.pathLengthPredictionVoxels);
+            CHECK(actualArc.cost.total() == expectedArc.cost.total());
+            const auto expectedProfile = stored.costProfile(id);
+            const auto actualProfile = materializedGraph.graph->costProfile(id);
+            CHECK(actualProfile.segmentLengthsPredictionVoxels ==
+                  expectedProfile.segmentLengthsPredictionVoxels);
+            CHECK(actualProfile.segmentCostDensities ==
+                  expectedProfile.segmentCostDensities);
+            CHECK(materializedGraph.graph->routePoints(id) ==
+                  stored.routePoints(id));
+        }
+        const auto incoming = stored.arc({{first, second}, false});
+        const auto outgoing = stored.arc({{second, third}, false});
+        const auto expectedTransition = stored.transition(incoming, outgoing);
+        const auto actualTransition =
+            materializedGraph.graph->transition(incoming, outgoing);
+        REQUIRE(expectedTransition.has_value());
+        REQUIRE(actualTransition.has_value());
+        CHECK(actualTransition->incoming == expectedTransition->incoming);
+        CHECK(actualTransition->outgoing == expectedTransition->outgoing);
+        CHECK(actualTransition->cost.total() == expectedTransition->cost.total());
+        std::vector<std::future<std::vector<cv::Vec3d>>> queries;
+        for (int query = 0; query < 16; ++query) {
+            queries.push_back(std::async(std::launch::async, [&materializedGraph, second] {
+                const auto outgoing = materializedGraph.graph->outgoing(second);
+                if (outgoing.size() != 2)
+                    throw std::runtime_error("unexpected concurrent adjacency");
+                return materializedGraph.graph->routePoints(outgoing.front());
+            }));
+        }
+        for (auto& query : queries) {
+            const auto points = query.get();
+            REQUIRE(points.size() == 2);
+        }
+    }
 
     pathCache->cancelPendingAndWait();
     anchorCache->cancelPendingAndWait();

@@ -4556,6 +4556,25 @@
   Covered seeds do not consume attempts; selecting an active seed does,
   including when it has no usable initial edge. Zero means unlimited for both
   limits, and neither limit changes descending-presence/storage-key ordering.
+- Before crop tracing, the stored chunk graph is bulk-materialized into an
+  immutable crop-local replay graph. The preparation loads crop seed anchors,
+  all physical Fiberlets incident to the geometric crop, complete route and
+  cost-profile data, outside endpoints needed by crossing routes, and ordinary
+  stored join transitions. Chunk requests are batched through the existing
+  cache workers, and each retained route is reconstructed once. Canonical
+  starting seeds remain the anchors owned by storage chunks intersecting the
+  half-open crop; additional inside endpoints close traversal adjacency but do
+  not become new seeds.
+- Seed workers query only the immutable materialized graph. They perform no
+  cache I/O, waits, or shared graph mutation. Crop tracing evaluates bounded
+  groups of active seeds concurrently, then drains and integrates each group
+  serially in canonical seed order. Integration rechecks seed activity; a
+  speculative result whose seed was covered by an earlier accepted line is
+  discarded and consumes no attempt. Counters, output order, geometry, and the
+  first propagated error are identical to one-thread execution.
+- `--threads` defaults to the host CPU count and controls both batched graph
+  preparation and immutable seed tracing. There is no separate low trace-worker
+  cap.
 - Accepted lines suppress only later anchor seeds. Coverage uses the shared
   replay threshold measurement with a default 20-base-voxel normal radius and
   four-times-wider Lasagna tangent-plane radius. The threshold comparison is

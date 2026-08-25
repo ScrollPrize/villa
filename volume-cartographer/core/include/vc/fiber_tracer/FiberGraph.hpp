@@ -6,6 +6,7 @@
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
 
 #include <cstddef>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -277,6 +278,8 @@ class FiberletReplayGraphSource
 {
 public:
     virtual ~FiberletReplayGraphSource() = default;
+    // True only when all const graph-query methods may be called concurrently.
+    [[nodiscard]] virtual bool supportsConcurrentQueries() const noexcept { return false; }
     [[nodiscard]] virtual float predictionToBaseScale() const noexcept = 0;
     [[nodiscard]] virtual int anchorCellSizePredictionVoxels() const noexcept = 0;
     [[nodiscard]] virtual float maximumJoinAngleDegrees() const noexcept = 0;
@@ -290,6 +293,69 @@ public:
     [[nodiscard]] virtual std::vector<cv::Vec3d> routePoints(const DirectedFiberletStorageId& id) const = 0;
     [[nodiscard]] virtual std::optional<FiberletReplaySourceTransition> transition(
         const FiberletReplaySourceArc& incoming, const FiberletReplaySourceArc& outgoing) const = 0;
+};
+
+struct FiberletImmutableReplayEdge {
+    // Canonical direction: id.reverse is false, from id.fiberlet.first to
+    // id.fiberlet.second.
+    FiberletReplaySourceArc arc;
+    FiberletReplaySourceCostProfile costProfile;
+    std::vector<cv::Vec3d> routePointsBaseXYZ;
+};
+
+// Fully materialized replay graph. All queries are immutable and lock-free;
+// this is the graph boundary used by parallel tracing.
+class FiberletImmutableReplayGraphSource final
+    : public FiberletReplayGraphSource
+{
+public:
+    FiberletImmutableReplayGraphSource(
+        float predictionToBaseScale,
+        int anchorCellSizePredictionVoxels,
+        float maximumJoinAngleDegrees,
+        std::vector<FiberletReplaySourceAnchor> anchors,
+        std::vector<FiberletImmutableReplayEdge> edges,
+        std::vector<FiberletReplaySourceTransition> transitions);
+    explicit FiberletImmutableReplayGraphSource(const FiberletGraph& graph);
+    ~FiberletImmutableReplayGraphSource() override;
+
+    FiberletImmutableReplayGraphSource(
+        FiberletImmutableReplayGraphSource&&) noexcept;
+    FiberletImmutableReplayGraphSource& operator=(
+        FiberletImmutableReplayGraphSource&&) noexcept;
+    FiberletImmutableReplayGraphSource(
+        const FiberletImmutableReplayGraphSource&) = delete;
+    FiberletImmutableReplayGraphSource& operator=(
+        const FiberletImmutableReplayGraphSource&) = delete;
+
+    [[nodiscard]] bool supportsConcurrentQueries() const noexcept override
+    {
+        return true;
+    }
+    [[nodiscard]] float predictionToBaseScale() const noexcept override;
+    [[nodiscard]] int anchorCellSizePredictionVoxels() const noexcept override;
+    [[nodiscard]] float maximumJoinAngleDegrees() const noexcept override;
+    [[nodiscard]] std::vector<FiberletReplaySourceAnchor>
+    anchorsNearReference(
+        const PolylineArcGeometry& reference,
+        double beginArcBase,
+        double endArcBase,
+        double broadPhaseRadiusBaseVoxels) const override;
+    [[nodiscard]] std::vector<DirectedFiberletStorageId> outgoing(
+        const FiberletStorageKey& anchor) const override;
+    [[nodiscard]] FiberletReplaySourceArc arc(
+        const DirectedFiberletStorageId& id) const override;
+    [[nodiscard]] FiberletReplaySourceCostProfile costProfile(
+        const DirectedFiberletStorageId& id) const override;
+    [[nodiscard]] std::vector<cv::Vec3d> routePoints(
+        const DirectedFiberletStorageId& id) const override;
+    [[nodiscard]] std::optional<FiberletReplaySourceTransition> transition(
+        const FiberletReplaySourceArc& incoming,
+        const FiberletReplaySourceArc& outgoing) const override;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 [[nodiscard]] FiberletGraph buildFiberletGraph(const FiberletPathReport& paths, float maximumJoinAngleDegrees = 45.0F);
