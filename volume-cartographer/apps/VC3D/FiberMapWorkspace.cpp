@@ -134,13 +134,14 @@ constexpr qreal kTracedWidth = 2.2;
 constexpr qreal kInterpolatedWidth = 1.4;
 constexpr qreal kTracedHighlightWidth = 3.6;
 constexpr qreal kInterpolatedHighlightWidth = 2.4;
-// The selected fiber's linked network: visibly emphasized next to the crowd,
-// clearly subordinate to the selection itself.
-constexpr qreal kTracedNetworkWidth = 3.0;
-constexpr qreal kInterpolatedNetworkWidth = 1.9;
+// The selected fiber's linked network: a gentle semi-transparent glow behind
+// each member's unchanged lines - visible next to the crowd, clearly
+// subordinate to the selection itself.
+constexpr qreal kNetworkGlowWidthPx = 9.0;
+constexpr int kNetworkGlowAlpha = 70;
 constexpr qreal kPanelZ = -3.0;
+constexpr qreal kNetworkGlowZ = 1.5;
 constexpr qreal kFiberZ = 2.0;
-constexpr qreal kNetworkZ = 4.5;
 constexpr qreal kHighlightZ = 7.0;
 // Dots (control points, link crossings, suspect-link rings) are drawn in scene
 // units, so they grow with the zoom, but never smaller than their kMin*Px on
@@ -1448,36 +1449,48 @@ void FiberMapWorkspace::clearControlPointDots()
     _controlPointDots.clear();
 }
 
-void FiberMapWorkspace::paintFiberEmphasis(const FiberEntry& entry,
+void FiberMapWorkspace::paintFiberEmphasis(FiberEntry& entry,
                                            FiberEmphasis emphasis)
 {
     const FiberMapPalette& theme = activePalette();
     const QColor color = fiberColor(entry.fiber.hvTag, theme);
-    qreal tracedWidth = kTracedWidth;
-    qreal interpolatedWidth = kInterpolatedWidth;
-    qreal z = kFiberZ;
-    switch (emphasis) {
-    case FiberEmphasis::Plain:
-        break;
-    case FiberEmphasis::Network:
-        tracedWidth = kTracedNetworkWidth;
-        interpolatedWidth = kInterpolatedNetworkWidth;
-        z = kNetworkZ;
-        break;
-    case FiberEmphasis::Selected:
-        tracedWidth = kTracedHighlightWidth;
-        interpolatedWidth = kInterpolatedHighlightWidth;
-        z = kHighlightZ;
-        break;
-    }
+    const bool selected = emphasis == FiberEmphasis::Selected;
     if (entry.tracedItem) {
-        entry.tracedItem->setPen(cosmeticPen(color, tracedWidth));
-        entry.tracedItem->setZValue(z);
+        entry.tracedItem->setPen(cosmeticPen(
+            color, selected ? kTracedHighlightWidth : kTracedWidth));
+        entry.tracedItem->setZValue(selected ? kHighlightZ : kFiberZ);
     }
     if (entry.interpolatedItem) {
         entry.interpolatedItem->setPen(interpolatedPen(
-            tint(color, theme.surface, 0.45), interpolatedWidth));
-        entry.interpolatedItem->setZValue(z);
+            tint(color, theme.surface, 0.45),
+            selected ? kInterpolatedHighlightWidth : kInterpolatedWidth));
+        entry.interpolatedItem->setZValue(selected ? kHighlightZ : kFiberZ);
+    }
+    // The network role adds a halo behind the unchanged lines; every other
+    // role removes it. The halo strokes the fiber's whole geometry (traced
+    // and interpolated runs alike) in one soft ribbon.
+    if (emphasis == FiberEmphasis::Network) {
+        if (entry.glowItem == nullptr) {
+            QPainterPath path;
+            for (const vc3d::fiber_map::Run& run : entry.fiber.runs) {
+                if (run.points.size() < 2) {
+                    continue;
+                }
+                path.moveTo(run.points.front());
+                for (std::size_t i = 1; i < run.points.size(); ++i) {
+                    path.lineTo(run.points[i]);
+                }
+            }
+            QColor glow = color;
+            glow.setAlpha(kNetworkGlowAlpha);
+            entry.glowItem =
+                _scene->addPath(path, cosmeticPen(glow, kNetworkGlowWidthPx));
+            entry.glowItem->setZValue(kNetworkGlowZ);
+        }
+    } else if (entry.glowItem != nullptr) {
+        _scene->removeItem(entry.glowItem);
+        delete entry.glowItem;
+        entry.glowItem = nullptr;
     }
 }
 
@@ -1486,14 +1499,13 @@ void FiberMapWorkspace::setHighlightedFiber(uint64_t fiberId)
     if (_highlightedFiber == fiberId) {
         return;
     }
-    // Restore the previous selection and its network's subtle emphasis.
-    if (const auto previous = _entries.constFind(_highlightedFiber);
-        previous != _entries.constEnd()) {
+    // Restore the previous selection and its network's glow.
+    if (const auto previous = _entries.find(_highlightedFiber);
+        previous != _entries.end()) {
         paintFiberEmphasis(*previous, FiberEmphasis::Plain);
     }
     for (const uint64_t member : _networkEmphasized) {
-        if (const auto entry = _entries.constFind(member);
-            entry != _entries.constEnd()) {
+        if (const auto entry = _entries.find(member); entry != _entries.end()) {
             paintFiberEmphasis(*entry, FiberEmphasis::Plain);
         }
     }
@@ -1501,15 +1513,14 @@ void FiberMapWorkspace::setHighlightedFiber(uint64_t fiberId)
     clearControlPointDots();
     _highlightedFiber = fiberId;
 
-    const auto entry = _entries.constFind(fiberId);
-    if (entry == _entries.constEnd()) {
+    const auto entry = _entries.find(fiberId);
+    if (entry == _entries.end()) {
         return;
     }
-    // The selection's linked network first, subtly, so the selected fiber's
-    // own treatment paints over the shared geometry last.
+    // The whole linked network glows; the selected fiber itself gets the
+    // full treatment instead.
     if (entry->networkId >= 0) {
-        for (auto other = _entries.constBegin(); other != _entries.constEnd();
-             ++other) {
+        for (auto other = _entries.begin(); other != _entries.end(); ++other) {
             if (other->networkId == entry->networkId &&
                 other.key() != fiberId) {
                 paintFiberEmphasis(*other, FiberEmphasis::Network);

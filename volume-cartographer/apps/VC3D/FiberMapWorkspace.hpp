@@ -94,6 +94,10 @@ private:
         int networkId = -1;
         QGraphicsPathItem* tracedItem = nullptr;
         QGraphicsPathItem* interpolatedItem = nullptr;
+        // The network emphasis: a soft semi-transparent halo behind the
+        // fiber's whole geometry, created only while its network is
+        // selected.
+        QGraphicsPathItem* glowItem = nullptr;
     };
 
     void rebuildLayout();
@@ -149,10 +153,11 @@ private:
     // true when the package cannot say how big a voxel is.
     [[nodiscard]] QString formatMapLength(double valueVx) const;
     void setHighlightedFiber(uint64_t fiberId);
-    // (Re)paints one fiber's path items for its current role: the selected
-    // fiber, a subtly-emphasized member of its linked network, or plain.
+    // (Re)paints one fiber's items for its current role: the selected fiber
+    // (thicker lines, raised), a member of its linked network (a gentle glow
+    // behind unchanged lines), or plain.
     enum class FiberEmphasis { Plain, Network, Selected };
-    void paintFiberEmphasis(const FiberEntry& entry, FiberEmphasis emphasis);
+    void paintFiberEmphasis(FiberEntry& entry, FiberEmphasis emphasis);
     void clearControlPointDots();
     void handleSceneClick(const QPointF& scenePos);
     void handleControlPointMenu(const QPointF& scenePos, const QPoint& globalPos);
