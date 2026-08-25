@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <chrono>
 #include <cstdlib>
 #include <map>
 #include <set>
@@ -285,6 +286,7 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
                fibers[f].z.size() == fibers[f].theta.size();
     };
 
+    const auto detectBegin = std::chrono::steady_clock::now();
     // --- Crossing detection: transversal intersections of H polylines with V
     // polylines in (psi, z), over every 2*pi translate that can meet the V
     // branch's lift. The integer gap n is exact at an intersection because
@@ -458,12 +460,18 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
     for (std::size_t i = 0; i < order.size(); ++i) {
         order[i] = i;
     }
-    std::sort(order.begin(), order.end(), [&raw](std::size_t a, std::size_t b) {
-        const Crossing& ca = raw[a];
-        const Crossing& cb = raw[b];
-        return std::tie(ca.hFiber, ca.vFiber, ca.n, ca.zVx, ca.deltaR) <
-               std::tie(cb.hFiber, cb.vFiber, cb.n, cb.zVx, cb.deltaR);
-    });
+    // Stable, so two crossings equal in every key keep their deterministic
+    // encounter order - the constraint index downstream breaks repair ties,
+    // and an unstable sort would make that index depend on the sort's whims.
+    std::stable_sort(order.begin(), order.end(),
+                     [&raw](std::size_t a, std::size_t b) {
+                         const Crossing& ca = raw[a];
+                         const Crossing& cb = raw[b];
+                         return std::tie(ca.hFiber, ca.vFiber, ca.n, ca.zVx,
+                                         ca.deltaR) <
+                                std::tie(cb.hFiber, cb.vFiber, cb.n, cb.zVx,
+                                         cb.deltaR);
+                     });
     std::vector<Crossing> merged;
     std::size_t index = 0;
     while (index < order.size()) {
@@ -498,6 +506,10 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
         merged.push_back(representative);
         index = end;
     }
+
+    const auto detectEnd = std::chrono::steady_clock::now();
+    result.detectMs =
+        std::chrono::duration<double, std::milli>(detectEnd - detectBegin).count();
 
     // --- Constraint graph.
     std::vector<Constraint> constraints;
@@ -826,6 +838,14 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
     // ordering, one equality block at a time; constraints internal to the
     // moving block cancel, and everything else is clamped against the
     // neighbours' current values, so feasibility is invariant.
+    //
+    // Everything k-independent is hoisted out of the pass loop: each block's
+    // boundary constraints (bounds are integer max/min, so subsetting cannot
+    // change them) and each member's ordinal pair list - the neighbourhood
+    // test uses only z and arc, never k, so the pair set, its order, and
+    // each pair's tie/strict classification are fixed for the whole ascent.
+    // The per-candidate cost then evaluates the identical expressions over
+    // the identical pairs in the identical order as the unhoisted form.
     const auto ascend = [&](const std::vector<std::size_t>& members) {
         std::map<std::size_t, std::vector<std::size_t>> blocks;
         for (const std::size_t f : members) {
@@ -833,28 +853,107 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
                 blocks[blockOf[f]].push_back(f);
             }
         }
+        // Boundary constraints per block, in constraint order.
+        std::map<std::size_t, std::vector<const Constraint*>> boundary;
+        for (const Constraint& constraint : constraints) {
+            if (!constraint.active) {
+                continue;
+            }
+            const std::size_t fromBlock = blockOf[constraint.from];
+            const std::size_t toBlock = blockOf[constraint.to];
+            if (fromBlock == toBlock) {
+                continue;
+            }
+            if (blocks.count(fromBlock) != 0) {
+                boundary[fromBlock].push_back(&constraint);
+            }
+            if (blocks.count(toBlock) != 0) {
+                boundary[toBlock].push_back(&constraint);
+            }
+        }
+        // Ordinal pairs per member, in ordinalCost's own iteration order.
+        struct OrdinalPair {
+            std::size_t fiber = 0;
+            double wpBase = 0.0;
+            double wqBase = 0.0;
+            bool tie = false;
+            bool outward = false;  // dr > 0 for strict pairs
+        };
+        std::map<std::size_t, std::vector<OrdinalPair>> pairsOf;
+        for (const auto& [block, blockMembers] : blocks) {
+            for (const std::size_t f : blockMembers) {
+                std::vector<OrdinalPair>& list = pairsOf[f];
+                for (const std::size_t i : sampleIndices(psi[f].size())) {
+                    const double z = fibers[f].z[i];
+                    const double p = psi[f][i];
+                    const double r = fibers[f].radius[i];
+                    const auto lo = std::lower_bound(pointZ.begin(), pointZ.end(),
+                                                     z - params.neighborhoodZVx);
+                    const auto hi = std::upper_bound(pointZ.begin(), pointZ.end(),
+                                                     z + params.neighborhoodZVx);
+                    for (auto it = lo; it != hi; ++it) {
+                        const OrdinalPoint& q = points[static_cast<std::size_t>(
+                            it - pointZ.begin())];
+                        if (q.fiber == f || !active[q.fiber] ||
+                            blockOf[q.fiber] == block) {
+                            continue;
+                        }
+                        const double arc =
+                            std::abs(wrappedDelta(p, q.psi)) * 0.5 * (r + q.r);
+                        if (arc > params.neighborhoodArcVx) {
+                            continue;
+                        }
+                        const double dr = r - q.r;
+                        const double strictFloor = params.tieBandVx +
+                            params.radialSlopePerZVx * std::abs(z - q.z) +
+                            params.radialSlopePerArcVx * arc;
+                        if (std::abs(dr) <= params.tieBandVx) {
+                            list.push_back(OrdinalPair{q.fiber, p / kTwoPi,
+                                                       q.psi / kTwoPi, true,
+                                                       false});
+                        } else if (std::abs(dr) > strictFloor) {
+                            list.push_back(OrdinalPair{q.fiber, p / kTwoPi,
+                                                       q.psi / kTwoPi, false,
+                                                       dr > 0.0});
+                        }
+                    }
+                }
+            }
+        }
+        const auto pairCost = [&](const std::vector<OrdinalPair>& list,
+                                  long long kf) {
+            double cost = 0.0;
+            for (const OrdinalPair& pair : list) {
+                const double wp = pair.wpBase + static_cast<double>(kf);
+                const double wq = pair.wqBase +
+                                  static_cast<double>(k[pair.fiber]);
+                const long long dw = std::llround(wp - wq);
+                if (pair.tie) {
+                    cost += 0.5 * static_cast<double>(std::min<long long>(
+                                      std::llabs(dw), 2));
+                } else if (dw == 0 || (dw > 0) != pair.outward) {
+                    cost += 1.0;
+                }
+            }
+            return cost;
+        };
         for (int pass = 0; pass < kAscentPasses; ++pass) {
             bool changed = false;
             for (const auto& [block, blockMembers] : blocks) {
                 long long deltaLo = -kAscentWindow;
                 long long deltaHi = kAscentWindow;
-                for (const Constraint& constraint : constraints) {
-                    if (!constraint.active) {
-                        continue;
-                    }
-                    const bool fromIn = blockOf[constraint.from] == block;
-                    const bool toIn = blockOf[constraint.to] == block;
-                    if (fromIn == toIn) {
-                        continue;
-                    }
-                    if (toIn) {
-                        deltaLo = std::max(deltaLo, k[constraint.from] +
-                                                        constraint.weight -
-                                                        k[constraint.to]);
-                    } else {
-                        deltaHi = std::min(deltaHi, k[constraint.to] -
-                                                        constraint.weight -
-                                                        k[constraint.from]);
+                const auto boundaryIt = boundary.find(block);
+                if (boundaryIt != boundary.end()) {
+                    for (const Constraint* constraint : boundaryIt->second) {
+                        if (blockOf[constraint->to] == block) {
+                            deltaLo = std::max(deltaLo, k[constraint->from] +
+                                                            constraint->weight -
+                                                            k[constraint->to]);
+                        } else {
+                            deltaHi = std::min(deltaHi, k[constraint->to] -
+                                                            constraint->weight -
+                                                            k[constraint->from]);
+                        }
                     }
                 }
                 if (deltaLo > 0 || deltaHi < 0 || deltaLo == deltaHi) {
@@ -863,7 +962,7 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
                 const auto costAt = [&](long long delta) {
                     double cost = 0.0;
                     for (const std::size_t f : blockMembers) {
-                        cost += ordinalCost(f, k[f] + delta, block, nullptr);
+                        cost += pairCost(pairsOf[f], k[f] + delta);
                     }
                     return cost;
                 };
@@ -1123,6 +1222,9 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
             kTwoPi * static_cast<double>(gauge[crossing.hFiber]);
     }
     result.crossings = std::move(merged);
+    result.solveMs = std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - detectEnd)
+                         .count();
     return result;
 }
 

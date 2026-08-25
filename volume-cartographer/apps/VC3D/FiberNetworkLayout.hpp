@@ -238,6 +238,11 @@ struct GlobalResult {
     // may be underconstrained for a reason the fibers themselves can't show.
     int gatedSegmentCount = 0;
     int tangentialCount = 0;
+    // Phase timings (milliseconds), for the rebuild's one-line profile.
+    double prepMs = 0.0;
+    double detectMs = 0.0;
+    double solveMs = 0.0;
+    double geometryMs = 0.0;
 };
 
 [[nodiscard]] GlobalResult buildGlobalLayout(

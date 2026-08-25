@@ -7,6 +7,7 @@
 #include <QAction>
 #include <QColor>
 #include <QDockWidget>
+#include <QElapsedTimer>
 #include <QEvent>
 #include <QFont>
 #include <QFontMetricsF>
@@ -821,6 +822,8 @@ void FiberMapWorkspace::rebuildLayout()
     if (!_controller) {
         return;
     }
+    QElapsedTimer phaseTimer;
+    phaseTimer.start();
     // Read before the snapshot: fiberMapSnapshot() parses the umbilicus, so a
     // rewrite during that parse that moves the file's size or mtime — the
     // token's contract; a same-size rewrite inside one timestamp tick is
@@ -830,6 +833,7 @@ void FiberMapWorkspace::rebuildLayout()
     // current even in the cases the token can see.
     _layoutUmbilicusFingerprint = _controller->umbilicusFingerprint();
     LineAnnotationController::FiberMapSnapshot snapshot = _controller->fiberMapSnapshot();
+    const qint64 snapshotMs = phaseTimer.restart();
     _layoutGeneration = snapshot.generation;
     // Everything the snapshot was derived from, so a later check compares against
     // what this build actually used rather than against whatever is current. The
@@ -888,8 +892,10 @@ void FiberMapWorkspace::rebuildLayout()
         params.solver.neighborhoodZVx = 0.5 * vxPerCm;        // ordinal window
         params.solver.neighborhoodArcVx = 0.5 * vxPerCm;
     }
+    const qint64 convertMs = phaseTimer.restart();
     _layout = vc3d::fiber_map::buildGlobalLayout(inputs, snapshot.umbilicusCenters,
                                                  params);
+    const qint64 layoutMs = phaseTimer.restart();
     // Scene space is voxels and the slice count already is one, so the scroll
     // extent needs no voxel size at all.
     _scrollZMaxVx = snapshot.annotationZSlices > 0
@@ -912,7 +918,15 @@ void FiberMapWorkspace::rebuildLayout()
         emptyMessage = tr("no placeable fibers");
     }
     rebuildScene(emptyMessage);
+    const qint64 sceneMs = phaseTimer.restart();
     rebuildTree();
+    const qint64 treeMs = phaseTimer.restart();
+    Logger()->info(
+        "fiber map rebuild: snapshot {} ms · convert {} ms · layout {} ms "
+        "(prep {:.0f}, detect {:.0f}, solve {:.0f}, geometry {:.0f}) · "
+        "scene {} ms · tree {} ms",
+        snapshotMs, convertMs, layoutMs, _layout.prepMs, _layout.detectMs,
+        _layout.solveMs, _layout.geometryMs, sceneMs, treeMs);
 
     // Default the dock to a width that shows every column of the first real
     // tree; afterwards the width is the user's to manage.

@@ -2,6 +2,8 @@
 
 #include <QDebug>
 
+#include <chrono>
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -337,10 +339,17 @@ std::vector<const InputFiber*> orderPlaceableFibers(const std::vector<InputFiber
             ordered.push_back(&fiber);
         }
     }
+    // fileName before runtime id: ids are reassigned on every package load,
+    // so with equal labels they are not a stable tie-break, and the fiber
+    // order feeds constraint ordering and therefore repair tie-breaking.
+    // fileName makes the order a pure function of the stored content.
     std::sort(ordered.begin(), ordered.end(),
               [](const InputFiber* a, const InputFiber* b) {
                   if (a->label != b->label) {
                       return a->label < b->label;
+                  }
+                  if (a->fileName != b->fileName) {
+                      return a->fileName < b->fileName;
                   }
                   return a->id < b->id;
               });
@@ -877,11 +886,15 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         indexById.emplace(ordered[i]->id, i);
     }
 
+    const auto prepBegin = std::chrono::steady_clock::now();
     std::vector<PreparedFiber> prepared;
     prepared.reserve(fiberCount);
     for (std::size_t i = 0; i < fiberCount; ++i) {
         prepared.push_back(prepareFiber(*ordered[i], umbilicus));
     }
+    result.prepMs = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - prepBegin)
+                        .count();
 
     // The solver sees only the control-point-bounded domain of every fiber:
     // the undrawn line-point tails must not constrain the solve any more than
@@ -999,6 +1012,8 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     result.tieCount = solve.tieCount;
     result.gatedSegmentCount = solve.gatedSegmentCount;
     result.tangentialCount = solve.tangentialCount;
+    result.detectMs = solve.detectMs;
+    result.solveMs = solve.solveMs;
 
     // One reference radius for the whole map. It is a display scale, never
     // evidence, so the median over everything is enough.
@@ -1014,6 +1029,7 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         : GlobalLayoutParams{}.resampleStepVx;
     const double thetaScale = static_cast<double>(solve.chirality);
 
+    const auto geometryBegin = std::chrono::steady_clock::now();
     double loX = std::numeric_limits<double>::infinity();
     double hiX = -std::numeric_limits<double>::infinity();
     double loY = std::numeric_limits<double>::infinity();
@@ -1097,6 +1113,9 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         return result;
     }
 
+    result.geometryMs = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - geometryBegin)
+                            .count();
     std::set<std::size_t> droppedLinks(solve.droppedLinks.begin(),
                                        solve.droppedLinks.end());
     result.links.reserve(allLinks.size());

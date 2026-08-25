@@ -209,6 +209,10 @@ struct SolveResult {
     // Segment-level gate tallies, for the build summary.
     int gatedSegmentCount = 0;
     int tangentialCount = 0;
+    // Phase timings (milliseconds): crossing detection + merge, and
+    // everything after (constraints, repair, packing, ascent, islands).
+    double detectMs = 0.0;
+    double solveMs = 0.0;
 };
 
 [[nodiscard]] SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
