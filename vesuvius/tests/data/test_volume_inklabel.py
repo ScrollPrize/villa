@@ -48,7 +48,7 @@ class TestInkLabelPlaceholderIsReported:
         _fail_with(monkeypatch, _tls_failure())
         v.download_inklabel()
         out = capsys.readouterr().out
-        assert "could not load ink label" in out.lower()
+        assert "could not fetch the ink label" in out.lower()
         assert "does NOT contain real data" in out
 
     def test_reports_the_underlying_cause_not_just_the_url(self, monkeypatch, capsys):
@@ -79,3 +79,26 @@ class TestInkLabelPlaceholderIsReported:
         v.url = None
         v.download_inklabel()
         assert "URL is not set" in capsys.readouterr().out
+
+
+class TestMissingIsDistinguishedFromFailed:
+    """Most segments publish no ink label at all. That is normal and must not be
+    reported in the same words as a request that failed."""
+
+    def test_absent_label_is_reported_as_a_note(self, monkeypatch, capsys):
+        v = _bare_segment(verbose=False)
+        _fail_with(monkeypatch, FileNotFoundError(LABEL_URL))  # no chained cause = a real 404
+        v.download_inklabel()
+        out = capsys.readouterr().out
+        assert "no ink label is published" in out
+        assert "not real data" in out
+        assert "Warning" not in out, "an absent label is not a failure"
+
+    def test_failed_request_is_reported_as_a_warning(self, monkeypatch, capsys):
+        v = _bare_segment(verbose=False)
+        _fail_with(monkeypatch, _tls_failure())  # chained cause = the request failed
+        v.download_inklabel()
+        out = capsys.readouterr().out
+        assert "Warning" in out
+        assert "the label may exist" in out
+        assert "CERTIFICATE_VERIFY_FAILED" in out

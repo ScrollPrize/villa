@@ -827,13 +827,25 @@ class Volume:
             else:
                 self.inklabel = np.zeros((1, 1), dtype=np.uint8)  # Fallback if data not loaded
 
-            # Substituting a placeholder for real data is never silent: this warning is not
-            # gated on self.verbose, which defaults to False.
-            print(
-                f"Warning: could not load ink label from {inklabel_url}. "
-                f"self.inklabel has been set to a blank {self.inklabel.shape} placeholder "
-                f"and does NOT contain real data. {detail}"
-            )
+            # Substituting a placeholder for real data is never silent: these messages are
+            # not gated on self.verbose, which defaults to False.
+            #
+            # Most published segments have no ink label at all, so "not published" is the
+            # normal case and is reported as information. A chained cause means the request
+            # itself failed (connection, TLS, permissions) and the label may well exist, so
+            # that is reported as a warning. fsspec raises FileNotFoundError for both.
+            if cause is None:
+                print(
+                    f"Note: no ink label is published at {inklabel_url}. "
+                    f"self.inklabel is a blank {self.inklabel.shape} placeholder, "
+                    f"not real data. ({detail})"
+                )
+            else:
+                print(
+                    f"Warning: could not fetch the ink label at {inklabel_url} - the request "
+                    f"failed, so the label may exist. self.inklabel has been set to a blank "
+                    f"{self.inklabel.shape} placeholder and does NOT contain real data. {detail}"
+                )
 
     def _read_with_retry(self, store, coord_idx):
         """Read a slice from a store, retrying transient remote failures.
