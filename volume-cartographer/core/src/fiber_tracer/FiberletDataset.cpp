@@ -112,6 +112,8 @@ const char* profileName(FiberletStorageProfile profile)
             return "compact_quantized";
         case FiberletStorageProfile::CompactDirectionsFixedCost:
             return "compact_directions_fixed_cost";
+  case FiberletStorageProfile::Float64Traces:
+    return "float64_traces";
     }
     throw std::invalid_argument("unknown fiberlet storage profile");
 }
@@ -124,6 +126,8 @@ FiberletStorageProfile parseProfile(const std::string& value)
         return FiberletStorageProfile::CompactQuantized;
     if (value == "compact_directions_fixed_cost")
         return FiberletStorageProfile::CompactDirectionsFixedCost;
+  if (value == "float64_traces")
+    return FiberletStorageProfile::Float64Traces;
     throw std::invalid_argument("unknown fiberlet storage profile in metadata");
 }
 
@@ -136,6 +140,8 @@ const char* kindName(FiberletDatasetKind kind)
             return "fiberlets";
         case FiberletDatasetKind::Combined:
             return "combined";
+  case FiberletDatasetKind::Traces:
+    return "traces";
     }
     throw std::invalid_argument("unknown fiberlet dataset kind");
 }
@@ -148,6 +154,8 @@ FiberletDatasetKind parseKind(const std::string& value)
         return FiberletDatasetKind::Fiberlets;
     if (value == "combined")
         return FiberletDatasetKind::Combined;
+  if (value == "traces")
+    return FiberletDatasetKind::Traces;
     throw std::invalid_argument("unknown fiberlet dataset kind in metadata");
 }
 
@@ -158,12 +166,22 @@ std::vector<FiberletStorageChunkKind> datasetKinds(FiberletDatasetKind kind)
     if (kind == FiberletDatasetKind::Fiberlets) {
         return {FiberletStorageChunkKind::FiberletPrefix, FiberletStorageChunkKind::FiberletRoutes};
     }
+  if (kind == FiberletDatasetKind::Traces)
+    return {FiberletStorageChunkKind::FiberTraces};
     return {FiberletStorageChunkKind::Anchors, FiberletStorageChunkKind::FiberletPrefix, FiberletStorageChunkKind::FiberletRoutes};
 }
 
 bool datasetContains(FiberletDatasetKind dataset, FiberletStorageChunkKind chunk)
 {
-    return dataset == FiberletDatasetKind::Combined || (dataset == FiberletDatasetKind::Anchors) == (chunk == FiberletStorageChunkKind::Anchors);
+    if (dataset == FiberletDatasetKind::Anchors)
+        return chunk == FiberletStorageChunkKind::Anchors;
+    if (dataset == FiberletDatasetKind::Fiberlets) {
+        return chunk == FiberletStorageChunkKind::FiberletPrefix ||
+               chunk == FiberletStorageChunkKind::FiberletRoutes;
+    }
+    if (dataset == FiberletDatasetKind::Combined)
+        return chunk != FiberletStorageChunkKind::FiberTraces;
+    return chunk == FiberletStorageChunkKind::FiberTraces;
 }
 
 std::string hexFingerprint(const std::array<std::uint8_t, 32>& fingerprint)
@@ -263,6 +281,27 @@ void validateMetadata(const FiberletDatasetMetadata& metadata)
                 "fiberlet dataset grid or coordinate chunk size is invalid");
         }
     }
+  if (metadata.kind == FiberletDatasetKind::Traces) {
+    if (metadata.profile != FiberletStorageProfile::Float64Traces ||
+        metadata.maximumEndpointReachCoordinateUnitsZYX !=
+            std::array<std::int64_t, 3>{0, 0, 0} ||
+        metadata.coordinateBits != 32 || metadata.deltaBits != 32 ||
+        metadata.routeCountBits != 32 || metadata.routeLatticeBits != 32 ||
+        metadata.costBits != 64 || metadata.positionQuantumBaseVoxels != 0 ||
+        metadata.spatialChunkSideBaseVoxels == 0) {
+      throw std::invalid_argument(
+          "Fiber trace dataset metadata is not canonical");
+    }
+    for (const auto units : metadata.coordinateUnitsPerChunkZYX) {
+      if (units != metadata.spatialChunkSideBaseVoxels) {
+        throw std::invalid_argument(
+            "Fiber trace chunks must use base-coordinate ownership");
+      }
+    }
+  } else if (metadata.profile == FiberletStorageProfile::Float64Traces) {
+    throw std::invalid_argument(
+        "float64 trace profile requires a Fiber trace dataset");
+  }
     auto canonical = metadata;
     canonical.algorithmFingerprint = stringFingerprint(
         algorithmIdentityJson(canonical).dump());
@@ -365,8 +404,11 @@ json arrayMetadata(const FiberletDatasetMetadata& metadata, FiberletStorageChunk
 {
     const char* sampleFormat = kind == FiberletStorageChunkKind::Anchors          ? "fiberlet-anchor-v2"
                                : kind == FiberletStorageChunkKind::FiberletPrefix ? "fiberlet-edge-prefix-v2"
-                                                                                  : "fiberlet-route-v3";
-    const int codecVersion = kind == FiberletStorageChunkKind::FiberletRoutes ? 3 : 2;
+                               : kind == FiberletStorageChunkKind::FiberletRoutes ? "fiberlet-route-v3"
+                                                                                  : "fiber-trace-v1";
+    const int codecVersion = kind == FiberletStorageChunkKind::FiberletRoutes ? 3
+                             : kind == FiberletStorageChunkKind::FiberTraces ? 1
+                                                                             : 2;
     return {
         {"zarr_format", 2},
         {"shape", metadata.chunkGridShapeZYX},
@@ -409,7 +451,9 @@ std::filesystem::path arrayDirectory(const std::filesystem::path& root, Fiberlet
         return root / "anchors";
     if (kind == FiberletStorageChunkKind::FiberletPrefix)
         return root / "prefix";
+  if (kind == FiberletStorageChunkKind::FiberletRoutes)
     return root / "routes";
+  return root / "traces";
 }
 
 void removeLegacyBookkeeping(const std::filesystem::path& root)
@@ -678,6 +722,22 @@ std::size_t FiberletRouteChunkPayload::residentBytes() const noexcept
     return result;
 }
 
+FiberletTraceChunkPayload::FiberletTraceChunkPayload(
+    FiberletDecodedTraces decoded)
+    : config(std::move(decoded.config)), traces(std::move(decoded.traces)) {}
+
+std::size_t FiberletTraceChunkPayload::residentBytes() const noexcept {
+  std::size_t result =
+      sizeof(*this) + traces.capacity() * sizeof(FiberletStoredTrace);
+  for (const auto &trace : traces) {
+    const auto bytes = trace.pointsBaseXYZ.capacity() * sizeof(cv::Vec3d);
+    if (bytes > std::numeric_limits<std::size_t>::max() - result)
+      return std::numeric_limits<std::size_t>::max();
+    result += bytes;
+  }
+  return result;
+}
+
 std::shared_ptr<const vc::render::DecodedChunkPayload>
 decodeFiberletChunkPayload(
     FiberletStorageChunkKind kind,
@@ -695,6 +755,10 @@ decodeFiberletChunkPayload(
         return std::make_shared<const FiberletRouteChunkPayload>(
             deserializeFiberletRoutes(bytes));
     }
+  if (kind == FiberletStorageChunkKind::FiberTraces) {
+    return std::make_shared<const FiberletTraceChunkPayload>(
+        deserializeFiberletTraces(bytes));
+  }
     throw std::invalid_argument("unknown fiberlet storage chunk kind");
 }
 
@@ -719,10 +783,17 @@ const FiberletStorageCodecConfig& payloadConfig(
             throw std::invalid_argument("fiberlet prefix chunk payload type is invalid");
         return typed->config;
     }
+    if (kind == FiberletStorageChunkKind::FiberletRoutes) {
+        const auto typed = std::dynamic_pointer_cast<
+            const FiberletRouteChunkPayload>(payload);
+        if (!typed)
+            throw std::invalid_argument("fiberlet route chunk payload type is invalid");
+        return typed->config;
+    }
     const auto typed = std::dynamic_pointer_cast<
-        const FiberletRouteChunkPayload>(payload);
+        const FiberletTraceChunkPayload>(payload);
     if (!typed)
-        throw std::invalid_argument("fiberlet route chunk payload type is invalid");
+        throw std::invalid_argument("Fiber trace chunk payload type is invalid");
     return typed->config;
 }
 
@@ -1548,6 +1619,9 @@ FiberletChunkDataset::FiberletChunkDataset(
     , metadata_(std::move(metadata))
     , writeBack_(std::move(writeBack))
 {
+    if (writeBack_ && metadata_.kind == FiberletDatasetKind::Traces)
+        throw std::invalid_argument(
+            "Fiber trace datasets do not use the preprocessing write-back cache");
     if (writeBack_)
         writeBackLayer_ = writeBack_->registerLayer(root_, metadata_.kind);
 }
@@ -1675,7 +1749,8 @@ FiberletChunkDataset::MaterializationStats FiberletChunkDataset::materialization
     return {
         materializationDecodes_[0].load(std::memory_order_relaxed),
         materializationDecodes_[1].load(std::memory_order_relaxed),
-        materializationDecodes_[2].load(std::memory_order_relaxed)};
+          materializationDecodes_[2].load(std::memory_order_relaxed),
+          materializationDecodes_[3].load(std::memory_order_relaxed)};
 }
 
 FiberletStorageCodecConfig FiberletChunkDataset::codecConfig(FiberletStorageChunkKind kind, const vc::render::ChunkKey& key) const
@@ -1731,8 +1806,10 @@ std::optional<FiberletChunkDataset::MaterializedChunk> FiberletChunkDataset::rea
             bytes = serializeFiberletAnchors(codec, {});
         else if (kind == FiberletStorageChunkKind::FiberletPrefix)
             bytes = serializeFiberletPrefixes(codec, {});
-        else
+    else if (kind == FiberletStorageChunkKind::FiberletRoutes)
             bytes = serializeFiberletRoutes(codec, {});
+    else
+      bytes = serializeFiberletTraces(codec, {});
         return MaterializedChunk{bytes, decodeFiberletChunkPayload(kind, bytes), true};
     }
 
@@ -1750,7 +1827,8 @@ std::optional<FiberletChunkDataset::MaterializedChunk> FiberletChunkDataset::rea
         }
     }
 
-    if (metadata_.kind == FiberletDatasetKind::Anchors) {
+  if (metadata_.kind == FiberletDatasetKind::Anchors ||
+      metadata_.kind == FiberletDatasetKind::Traces) {
         auto bytes = readBytes(chunkPath(kind, key));
         if (!bytes)
             return std::nullopt;
@@ -1818,7 +1896,8 @@ void FiberletChunkDataset::publishMaterializedChunk(FiberletStorageChunkKind kin
 void FiberletChunkDataset::publishFiberletChunkPair(
     const vc::render::ChunkKey& prefixKey, const MaterializedChunk& prefix, const vc::render::ChunkKey& routeKey, const MaterializedChunk& routes) const
 {
-    if (metadata_.kind == FiberletDatasetKind::Anchors)
+  if (metadata_.kind == FiberletDatasetKind::Anchors ||
+      metadata_.kind == FiberletDatasetKind::Traces)
         throw std::invalid_argument("fiberlet pair publication requires a fiberlet dataset");
     if (prefixKey.iz != routeKey.iz || prefixKey.iy != routeKey.iy || prefixKey.ix != routeKey.ix)
         throw std::invalid_argument("fiberlet prefix and route chunks have different coordinates");
@@ -1897,7 +1976,8 @@ void FiberletChunkDataset::replaceOverlayChunkPair(
 FiberletChunkDataset::PairPresence FiberletChunkDataset::pairPresence(
     const vc::render::ChunkKey& owner) const
 {
-    if (metadata_.kind == FiberletDatasetKind::Anchors)
+  if (metadata_.kind == FiberletDatasetKind::Anchors ||
+      metadata_.kind == FiberletDatasetKind::Traces)
         throw std::invalid_argument(
             "fiberlet pair presence requires a path dataset");
     if (writeBack_) {
@@ -1938,6 +2018,10 @@ std::shared_ptr<vc::render::ChunkCache> createGeneratedFiberletChunkCache(
     if (dataset->metadata().kind == FiberletDatasetKind::Anchors) {
         levels.push_back({shape, {1, 1, 1}, {}});
         fetchers.push_back(std::make_shared<GeneratedFetcher>(dataset, FiberletStorageChunkKind::Anchors, generator, resolved));
+    } else if (dataset->metadata().kind == FiberletDatasetKind::Traces) {
+        levels.push_back({shape, {1, 1, 1}, {}});
+        fetchers.push_back(std::make_shared<GeneratedFetcher>(
+            dataset, FiberletStorageChunkKind::FiberTraces, generator, resolved));
     } else {
         levels.push_back({shape, {1, 1, 1}, {}});
         levels.push_back({shape, {1, 1, 1}, {}});

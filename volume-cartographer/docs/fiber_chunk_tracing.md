@@ -2,14 +2,17 @@
 
 `vc_fiber_trace_chunk` fills a base-coordinate crop with traces from a
 preprocessed combined Fiberlet dataset. It does not read or regenerate the
-original dense Fiber prediction.
+original dense Fiber prediction. The authoritative output is a sparse Fiberlet
+Zarr trace dataset; OBJ files are derived visualization artifacts.
 
 ```bash
 volume-cartographer/build/bin/vc_fiber_trace_chunk \
+  trace \
   /path/to/fiberlets.zarr \
   --normal-manifest /path/to/normals.lasagna.json \
   --bbox X0 Y0 Z0 X1 Y1 Z1 \
-  --output crop_fibers.obj
+  --output crop_traces.zarr \
+  --obj crop_fibers.obj
 ```
 
 The crop is half-open and ordered base-volume XYZ. Stored anchor variants in
@@ -47,16 +50,60 @@ scales. `nx` and `ny` must have equal shapes and effective base spacing, though
 their storage chunk shapes may differ. Ordinary Lasagna array padding of up to
 one chunk is accepted.
 
+## Stored trace dataset
+
+`crop_traces.zarr` uses the existing Fiberlet Zarr v2 envelope with dataset
+kind `traces`, encoding profile `float64_traces`, and one opaque `traces`
+array. Sparse chunks are aligned to the source Fiberlet spatial chunk side and
+owned by the trace seed position. A missing chunk is empty; the root metadata
+inventories every populated chunk and the total record count, so a missing or
+unexpected file is rejected rather than silently treated as complete.
+
+Each stored trace contains its deterministic result ordinal, float64 base-XYZ
+seed position, float32 seed presence, float64 total metric cost, float64 traced
+length in prediction voxels, and complete float64 base-XYZ polyline. These are
+complete crop traces, not the short endpoint/lattice Fiberlets used by the
+preprocessed graph. Trace chunks retain the shared field-wise Zstd and checksum
+format but do not quantize trace geometry.
+
+Total metric cost is the sum of selected edge and join costs. An edge clipped
+at the crop boundary contributes the same retained fraction used for its
+stored traced length. A bidirectional trace includes the central join once when
+the graph defines that transition. Speculative lookahead cost is not stored.
+The comparable visualization quality is
+`total_metric_cost / path_length_prediction_voxels`; lower is better.
+
+Publication is all-or-nothing: the command writes and fully reopens a unique
+sibling temporary dataset, validates its inventory, ownership, ordinals, and
+record count, then renames it to the requested path. The output path must not
+already exist. Trace mode generates line artifacts only from that reopened
+dataset, never from its in-memory tracing result.
+
+To regenerate line visualization later without source Fiberlets, normals, or a
+CT volume, run:
+
+```bash
+volume-cartographer/build/bin/vc_fiber_trace_chunk \
+  visualize \
+  crop_traces.zarr \
+  --output crop_fibers.obj
+```
+
+If `--obj` is omitted in trace mode, the line OBJ defaults beside the trace
+dataset with the `.zarr` suffix replaced by `.obj`.
+
 ## CT box visualization
 
 Pass one concrete uint8 CT OME-Zarr array/group with `--volume`:
 
 ```bash
 volume-cartographer/build/bin/vc_fiber_trace_chunk \
+  trace \
   /path/to/fiberlets.zarr \
   --normal-manifest /path/to/normals.lasagna.json \
   --bbox X0 Y0 Z0 X1 Y1 Z1 \
-  --output crop_fibers.obj \
+  --output crop_traces.zarr \
+  --obj crop_fibers.obj \
   --volume /path/to/ct.ome.zarr/2
 ```
 
@@ -128,8 +175,8 @@ are deterministic: greater total assigned length is direction 1, with
 canonical axis order breaking an exact tie. The command reports both fitted
 axes, analyzed step count and length, and all three fiber counts.
 
-The requested `crop_fibers.obj` remains the complete, unchanged line set. The
-same directory also receives independently displayable subsets and actual
+The requested `crop_fibers.obj` contains the complete line set. The same
+directory also receives independently displayable subsets and actual
 seed-anchor point objects:
 
 | Contents | Lines | Seed anchors |
@@ -142,3 +189,22 @@ seed-anchor point objects:
 The anchor artifacts use OBJ point (`p`) elements at the stored trace seed,
 not a polyline endpoint. Empty groups still produce valid empty OBJ files.
 This classification is output-only and cannot change tracing or coverage.
+
+## Quality groups
+
+Visualization stably sorts traces by ascending cost density and then stored
+ordinal. It partitions sorted rank `r` among `N` traces with
+`min(9, floor(10*r/N))`, producing ten independently displayable files:
+
+```text
+crop_fibers_quality_00_10.obj
+crop_fibers_quality_10_20.obj
+...
+crop_fibers_quality_90_100.obj
+```
+
+Every trace occurs exactly once. For fewer than ten traces some rank bins are
+empty; their OBJ files are still valid and present. The sibling
+`crop_fibers_quality_histogram.csv` and console table report each bin's count
+and min/mean/max total cost and cost density. Blank numeric CSV fields denote
+an empty bin.

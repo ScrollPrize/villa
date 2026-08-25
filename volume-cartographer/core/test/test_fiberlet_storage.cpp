@@ -58,6 +58,22 @@ FiberletStorageCodecConfig compactDefaultConfig()
     return config;
 }
 
+FiberletStorageCodecConfig traceConfig()
+{
+    FiberletStorageCodecConfig config;
+    config.profile = FiberletStorageProfile::Float64Traces;
+    config.chunkZYX = {1, 2, 3};
+    config.coordinateOriginZYX = {512, 1024, 1536};
+    config.coordinateBits = 32;
+    config.deltaBits = 32;
+    config.routeCountBits = 32;
+    config.routeLatticeBits = 32;
+    config.costBits = 64;
+    config.predictionToBaseScale = 8.0;
+    config.datasetFingerprint[0] = 73;
+    return config;
+}
+
 FiberletStorageKey key(std::int64_t z, std::int64_t y, std::int64_t x, std::uint8_t variant = 0)
 {
     return {{z, y, x}, variant};
@@ -72,6 +88,52 @@ FiberletChunkDataset::MaterializedChunk materialized(FiberletStorageChunkKind ki
 }
 
 }  // namespace
+
+TEST_CASE("Fiber trace payload round-trips float64 geometry and global costs exactly")
+{
+    const auto config = traceConfig();
+    const std::vector<FiberletStoredTrace> traces{
+        {7,
+         {1024.25, 2048.5, 4096.75},
+         0.625F,
+         123.125,
+         45.5,
+         {{900.125, 1900.25, 3900.5},
+          {1024.25, 2048.5, 4096.75},
+          {1100.875, 2150.125, 4200.25}}},
+        {9,
+         {-1.5, 2.25, 3.75},
+         0.25F,
+         0.0,
+         1.25,
+         {{-1.5, 2.25, 3.75}, {-0.25, 2.5, 4.0}}},
+    };
+    const auto bytes = serializeFiberletTraces(config, traces);
+    const auto decoded = deserializeFiberletTraces(bytes);
+    CHECK(decoded.config.profile == FiberletStorageProfile::Float64Traces);
+    CHECK(decoded.config.chunkZYX == config.chunkZYX);
+    REQUIRE(decoded.traces.size() == traces.size());
+    for (std::size_t index = 0; index < traces.size(); ++index) {
+        CHECK(decoded.traces[index].ordinal == traces[index].ordinal);
+        CHECK(decoded.traces[index].seedBaseXYZ == traces[index].seedBaseXYZ);
+        CHECK(decoded.traces[index].seedPresence == traces[index].seedPresence);
+        CHECK(decoded.traces[index].totalMetricCost == traces[index].totalMetricCost);
+        CHECK(decoded.traces[index].pathLengthPredictionVoxels ==
+              traces[index].pathLengthPredictionVoxels);
+        CHECK(decoded.traces[index].pointsBaseXYZ == traces[index].pointsBaseXYZ);
+    }
+    CHECK_THROWS_AS(serializeFiberletAnchors(config, {}), std::invalid_argument);
+    auto invalid = traces.front();
+    invalid.pointsBaseXYZ = {{0, 0, 0}, {1, 0, 0}};
+    CHECK_THROWS_AS(
+        serializeFiberletTraces(config, std::span{&invalid, 1}),
+        std::invalid_argument);
+    invalid = traces.front();
+    invalid.totalMetricCost = std::numeric_limits<double>::quiet_NaN();
+    CHECK_THROWS_AS(
+        serializeFiberletTraces(config, std::span{&invalid, 1}),
+        std::invalid_argument);
+}
 
 TEST_CASE("Fiberlet endpoint reconstruction accepts only finite float roundoff")
 {

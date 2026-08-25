@@ -16,12 +16,14 @@ enum class FiberletStorageProfile : std::uint8_t {
     Float32Cache = 1,
     CompactQuantized = 2,
     CompactDirectionsFixedCost = 3,
+  Float64Traces = 4,
 };
 
 enum class FiberletStorageChunkKind : std::uint8_t {
     Anchors = 1,
     FiberletPrefix = 2,
     FiberletRoutes = 3,
+  FiberTraces = 4,
 };
 
 struct FiberletStorageKey {
@@ -92,6 +94,15 @@ struct FiberletStoredRoute {
     std::vector<float> segmentCostDensities;
 };
 
+struct FiberletStoredTrace {
+  std::uint64_t ordinal = 0;
+  cv::Vec3d seedBaseXYZ{0.0, 0.0, 0.0};
+  float seedPresence = 0.0F;
+  double totalMetricCost = 0.0;
+  double pathLengthPredictionVoxels = 0.0;
+  std::vector<cv::Vec3d> pointsBaseXYZ;
+};
+
 inline constexpr float kFiberletStoredCostDensityMaximum = 256.0F;
 
 [[nodiscard]] std::uint16_t encodeFiberletStoredCostDensity(float density);
@@ -127,6 +138,11 @@ struct FiberletDecodedRoutes {
     std::vector<FiberletStoredRoute> routes;
 };
 
+struct FiberletDecodedTraces {
+  FiberletStorageCodecConfig config;
+  std::vector<FiberletStoredTrace> traces;
+};
+
 [[nodiscard]] std::vector<std::byte> serializeFiberletAnchors(
     const FiberletStorageCodecConfig& config,
     std::span<const FiberletStoredAnchor> anchors);
@@ -139,11 +155,18 @@ struct FiberletDecodedRoutes {
     const FiberletStorageCodecConfig& config,
     std::span<const FiberletStoredRoute> routes);
 
+[[nodiscard]] std::vector<std::byte>
+serializeFiberletTraces(const FiberletStorageCodecConfig &config,
+                        std::span<const FiberletStoredTrace> traces);
+
 [[nodiscard]] FiberletDecodedAnchors deserializeFiberletAnchors(std::span<const std::byte> bytes);
 
 [[nodiscard]] FiberletDecodedPrefixes deserializeFiberletPrefixes(std::span<const std::byte> bytes);
 
 [[nodiscard]] FiberletDecodedRoutes deserializeFiberletRoutes(std::span<const std::byte> bytes);
+
+[[nodiscard]] FiberletDecodedTraces
+deserializeFiberletTraces(std::span<const std::byte> bytes);
 
 // Decode field compression while retaining the same strict payload envelope.
 // Generated ChunkCache instances keep this byte form in their decoded LRU and

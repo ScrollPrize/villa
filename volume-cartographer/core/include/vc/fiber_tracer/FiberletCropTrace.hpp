@@ -32,6 +32,8 @@ struct FiberletCropTraceLine {
     FiberletStorageKey seed;
     cv::Vec3d seedBaseXYZ{0.0, 0.0, 0.0};
     float seedPresence = 0.0F;
+  double totalMetricCost = 0.0;
+  double pathLengthPredictionVoxels = 0.0;
     std::vector<cv::Vec3d> pointsBaseXYZ;
     std::string negativeTermination;
     std::string positiveTermination;
@@ -92,6 +94,25 @@ struct FiberDirectionObjPaths {
     std::filesystem::path mixedAnchors;
 };
 
+struct FiberQualityHistogramBin {
+  std::vector<std::size_t> lineIndices;
+  double minimumTotalMetricCost = 0.0;
+  double meanTotalMetricCost = 0.0;
+  double maximumTotalMetricCost = 0.0;
+  double minimumCostDensity = 0.0;
+  double meanCostDensity = 0.0;
+  double maximumCostDensity = 0.0;
+};
+
+struct FiberQualityHistogram {
+  std::array<FiberQualityHistogramBin, 10> bins;
+};
+
+struct FiberQualityObjPaths {
+  std::array<std::filesystem::path, 10> deciles;
+  std::filesystem::path histogramCsv;
+};
+
 using FiberletCropTraceProgress = std::function<void(const FiberletCropTraceResult& result, std::size_t remainingAnchors)>;
 
 [[nodiscard]] FiberletCropTraceResult traceFiberletCrop(
@@ -113,5 +134,16 @@ void writeFiberletCropDirectionObjs(
     const std::vector<FiberletCropTraceLine>& lines,
     const FiberDirectionClassification& classification,
     const std::filesystem::path& allOutputPath);
+
+[[nodiscard]] FiberQualityHistogram
+classifyFiberletCropQuality(const std::vector<FiberletCropTraceLine> &lines);
+
+[[nodiscard]] FiberQualityObjPaths
+fiberQualityObjPaths(const std::filesystem::path &allOutputPath);
+
+void writeFiberletCropQualityArtifacts(
+    const std::vector<FiberletCropTraceLine> &lines,
+    const FiberQualityHistogram &histogram,
+    const std::filesystem::path &allOutputPath);
 
 }  // namespace vc::fiber_tracer

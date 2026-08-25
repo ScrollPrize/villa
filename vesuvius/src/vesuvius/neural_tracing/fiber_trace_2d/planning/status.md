@@ -1,12 +1,14 @@
-# Status: compact Fiberlet crop lookahead state
+# Status: durable Fiberlet crop trace artifacts
 
 - [x] Record the active task.
-- [x] Inspect the current copied lookahead state and exact ranking semantics.
+- [x] Inspect the existing Fiberlet codec/dataset and crop OBJ path.
 - [x] Write the implementation and validation plan.
 - [x] Complete independent plan review and incorporate findings.
-- [x] Implement parent-linked lookahead state.
-- [x] Add exact cycle/ranking regression coverage.
-- [x] Build and run focused GCC and Clang tests.
-- [x] Benchmark the canonical 500-attempt Release workload.
-- [x] Compare generated artifacts exactly.
+- [x] Extend shared storage and dataset handling for trace records.
+- [x] Accumulate and persist complete trace costs.
+- [x] Refactor trace and visualization CLI paths.
+- [x] Add cost histogram and rank-decile OBJ output.
+- [x] Add storage, tracing, and visualization regression tests.
+- [x] Build and run GCC Release and Clang validation.
+- [x] Run a representative crop round trip and compare artifacts.
 - [x] Update specifications, documentation, changelog, and task log.

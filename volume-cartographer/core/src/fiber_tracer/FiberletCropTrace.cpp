@@ -1,6 +1,7 @@
 #include "vc/fiber_tracer/FiberletCropTrace.hpp"
 
 #include "vc/core/io/PolylineObj.hpp"
+#include "vc/core/util/AtomicFile.hpp"
 #include "vc/fiber_tracer/FiberAxisTensor.hpp"
 #include "vc/fiber_tracer/FiberReplayMetric.hpp"
 #include "utils/thread_pool.hpp"
@@ -383,6 +384,8 @@ struct SideTrace {
     std::vector<cv::Vec3d> points;
     std::string termination = "graph_exhausted";
     std::size_t fiberlets = 0;
+  double totalMetricCost = 0.0;
+  double pathLengthPredictionVoxels = 0.0;
 };
 
 SideTrace traceSide(
@@ -407,8 +410,20 @@ SideTrace traceSide(
             return result;
         }
         const auto edge = graph.arc(*selected);
+        if (incoming.has_value()) {
+            const auto join = graph.transition(*incoming, edge);
+            if (!join.has_value()) {
+                throw std::logic_error(
+                    "selected Fiberlet crop edge has no committed join");
+            }
+            result.totalMetricCost += join->cost.total();
+        }
         const auto clipped = clipAtFirstExit(
             graph.routePointView(*selected), config, &result.points);
+        result.totalMetricCost +=
+            edge.cost.total() * clipped.retainedFraction;
+        result.pathLengthPredictionVoxels +=
+            edge.pathLengthPredictionVoxels * clipped.retainedFraction;
         ++result.fiberlets;
         if (clipped.exited) {
             result.termination = "crop_boundary";
@@ -542,6 +557,19 @@ TraceCandidate traceCandidate(
     result.line.positiveTermination = positive.termination;
     result.line.negativeFiberlets = negative.fiberlets;
     result.line.positiveFiberlets = positive.fiberlets;
+    result.line.totalMetricCost =
+        negative.totalMetricCost + positive.totalMetricCost;
+    result.line.pathLengthPredictionVoxels =
+        negative.pathLengthPredictionVoxels +
+        positive.pathLengthPredictionVoxels;
+    if (negative.fiberlets > 0 && positive.fiberlets > 0) {
+        auto incomingId = *initial.negative;
+        incomingId.reverse = !incomingId.reverse;
+        const auto central = graph.transition(
+            graph.arc(incomingId), graph.arc(*initial.positive));
+        if (central.has_value())
+            result.line.totalMetricCost += central->cost.total();
+    }
     result.line.pointsBaseXYZ.assign(negative.points.rbegin(), negative.points.rend());
     result.line.pointsBaseXYZ.insert(
         result.line.pointsBaseXYZ.end(),
@@ -1049,6 +1077,125 @@ void writeFiberletCropDirectionObjs(
     vc::core::io::writePolylinesObj(
         groupedAnchors[2], paths.mixedAnchors,
         "VC3D Fiberlet crop trace seed anchors: mixed directions");
+}
+
+FiberQualityHistogram
+classifyFiberletCropQuality(const std::vector<FiberletCropTraceLine> &lines) {
+  struct RankedLine {
+    std::size_t index = 0;
+    double density = 0.0;
+  };
+  std::vector<RankedLine> ranked;
+  ranked.reserve(lines.size());
+  for (std::size_t index = 0; index < lines.size(); ++index) {
+    const auto &line = lines[index];
+    if (!(line.totalMetricCost >= 0.0) ||
+        !std::isfinite(line.totalMetricCost) ||
+        !(line.pathLengthPredictionVoxels > 0.0) ||
+        !std::isfinite(line.pathLengthPredictionVoxels)) {
+      throw std::invalid_argument(
+          "Fiber quality requires finite nonnegative cost and positive length");
+    }
+    ranked.push_back({
+        index,
+        line.totalMetricCost / line.pathLengthPredictionVoxels,
+    });
+  }
+  std::sort(ranked.begin(), ranked.end(),
+            [](const auto &left, const auto &right) {
+              return std::tie(left.density, left.index) <
+                     std::tie(right.density, right.index);
+            });
+
+  FiberQualityHistogram result;
+  for (std::size_t rank = 0; rank < ranked.size(); ++rank) {
+    const std::size_t bin = std::min<std::size_t>(9, rank * 10 / ranked.size());
+    result.bins[bin].lineIndices.push_back(ranked[rank].index);
+  }
+  for (auto &bin : result.bins) {
+    if (bin.lineIndices.empty())
+      continue;
+    bin.minimumTotalMetricCost = std::numeric_limits<double>::infinity();
+    bin.maximumTotalMetricCost = -std::numeric_limits<double>::infinity();
+    bin.minimumCostDensity = std::numeric_limits<double>::infinity();
+    bin.maximumCostDensity = -std::numeric_limits<double>::infinity();
+    double totalCost = 0.0;
+    double totalDensity = 0.0;
+    for (const auto index : bin.lineIndices) {
+      const auto &line = lines[index];
+      const double density =
+          line.totalMetricCost / line.pathLengthPredictionVoxels;
+      bin.minimumTotalMetricCost =
+          std::min(bin.minimumTotalMetricCost, line.totalMetricCost);
+      bin.maximumTotalMetricCost =
+          std::max(bin.maximumTotalMetricCost, line.totalMetricCost);
+      bin.minimumCostDensity = std::min(bin.minimumCostDensity, density);
+      bin.maximumCostDensity = std::max(bin.maximumCostDensity, density);
+      totalCost += line.totalMetricCost;
+      totalDensity += density;
+    }
+    const double count = static_cast<double>(bin.lineIndices.size());
+    bin.meanTotalMetricCost = totalCost / count;
+    bin.meanCostDensity = totalDensity / count;
+  }
+  return result;
+}
+
+FiberQualityObjPaths
+fiberQualityObjPaths(const std::filesystem::path &allOutputPath) {
+  FiberQualityObjPaths result;
+  for (std::size_t bin = 0; bin < result.deciles.size(); ++bin) {
+    std::ostringstream suffix;
+    suffix << "_quality_" << std::setw(2) << std::setfill('0') << bin * 10
+           << '_' << std::setw(2) << (bin + 1) * 10;
+    result.deciles[bin] = allOutputPath.parent_path() /
+                          (allOutputPath.stem().string() + suffix.str() +
+                           allOutputPath.extension().string());
+  }
+  result.histogramCsv =
+      allOutputPath.parent_path() /
+      (allOutputPath.stem().string() + "_quality_histogram.csv");
+  return result;
+}
+
+void writeFiberletCropQualityArtifacts(
+    const std::vector<FiberletCropTraceLine> &lines,
+    const FiberQualityHistogram &histogram,
+    const std::filesystem::path &allOutputPath) {
+  const auto paths = fiberQualityObjPaths(allOutputPath);
+  std::ostringstream csv;
+  csv.imbue(std::locale::classic());
+  csv << std::setprecision(17)
+      << "percentile_start,percentile_end,count,total_cost_min,total_cost_mean,"
+         "total_cost_max,cost_density_min,cost_density_mean,cost_density_max\n";
+  for (std::size_t binIndex = 0; binIndex < histogram.bins.size(); ++binIndex) {
+    const auto &bin = histogram.bins[binIndex];
+    std::vector<vc::core::io::NamedPolyline> polylines;
+    polylines.reserve(bin.lineIndices.size());
+    for (const auto lineIndex : bin.lineIndices) {
+      if (lineIndex >= lines.size())
+        throw std::invalid_argument(
+            "Fiber quality histogram contains an invalid line index");
+      polylines.push_back({
+          fiberName(lines[lineIndex], lineIndex),
+          lines[lineIndex].pointsBaseXYZ,
+      });
+    }
+    vc::core::io::writePolylinesObj(
+        polylines, paths.deciles[binIndex],
+        "VC3D Fiberlet crop traces: quality rank decile");
+    csv << binIndex * 10 << ',' << (binIndex + 1) * 10 << ','
+        << bin.lineIndices.size();
+    if (bin.lineIndices.empty()) {
+      csv << ",,,,,,\n";
+    } else {
+      csv << ',' << bin.minimumTotalMetricCost << ',' << bin.meanTotalMetricCost
+          << ',' << bin.maximumTotalMetricCost << ',' << bin.minimumCostDensity
+          << ',' << bin.meanCostDensity << ',' << bin.maximumCostDensity
+          << '\n';
+    }
+  }
+  vc::core::util::atomicWriteString(paths.histogramCsv, csv.str());
 }
 
 }  // namespace vc::fiber_tracer

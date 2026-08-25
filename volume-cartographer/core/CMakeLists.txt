@@ -212,6 +212,7 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberletDataset.cpp
     src/fiber_tracer/FiberletChunkGraph.cpp
     src/fiber_tracer/FiberletCropTrace.cpp
+    src/fiber_tracer/FiberletCropTraceArtifact.cpp
     src/fiber_tracer/FiberletCropVisualization.cpp
     src/fiber_tracer/FiberletOnDemand.cpp
     src/fiber_tracer/FiberletStorage.cpp

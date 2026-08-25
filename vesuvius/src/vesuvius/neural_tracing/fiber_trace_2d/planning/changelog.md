@@ -1,3 +1,15 @@
+# 2026-08-25: durable Fiberlet crop trace artifacts
+
+- Made a sparse Fiberlet Zarr `traces` dataset the authoritative crop-tracing
+  output. It losslessly stores complete float64 base-coordinate paths, seed
+  data, global selected-route cost, and traced length, with strict inventory,
+  ownership, ordinal, and atomic-publication validation.
+- Split `vc_fiber_trace_chunk` into explicit `trace` and `visualize` commands.
+  Trace mode reopens the published artifact before generating line outputs;
+  visualization-only mode needs no source Fiberlets or normal volume.
+- Added deterministic cost-density histograms and ten rank-decile OBJ subsets
+  while retaining byte-identical all/direction/anchor OBJ geometry.
+
 # 2026-08-25: deterministic parallel Fiberlet crop tracing
 
 - Parallelized independent anchor-seed graph traversal while retaining serial

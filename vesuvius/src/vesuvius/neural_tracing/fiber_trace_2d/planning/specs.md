@@ -4607,8 +4607,28 @@
 - Coverage additionally requires inclusive unoriented fitted-axis agreement
   with the projected line tangent within 25 degrees. Crossing directions are
   retained. This version performs no line-to-line Fiber deduplication.
-- Line visualization is OBJ. Optional crop faces use one concrete uint8 CT
-  OME-Zarr group and the existing VC3D fine-to-coarse coordinate renderer.
+- The authoritative crop output is a sparse Fiberlet Zarr dataset of kind
+  `traces`, not an OBJ. It uses a trace-only `float64_traces` profile and
+  crop-local base-coordinate chunks aligned to the source Fiberlet spatial
+  chunk side. Each accepted line is owned by its seed chunk and stores its
+  deterministic result ordinal, seed base position and presence, total metric
+  cost, prediction-space traced length, and exact float64 base-XYZ polyline.
+  Complete crop traces are not encoded as short transverse-lattice Fiberlets.
+- Stored total metric cost includes every committed selected edge and internal
+  join once. A crop-clipped edge's cost and prediction length use its retained
+  fraction. A bidirectional line includes the central join once when that
+  transition exists; the existing independent-side fallback has no central
+  transition to add. Speculative lookahead cost is never stored.
+- Trace publication writes and strictly reopens a unique sibling temporary
+  root before atomically renaming it to a previously absent output path.
+  Metadata inventories every populated chunk and the global record count.
+  Loading rejects missing or unexpected chunks, wrong seed ownership,
+  malformed records, and duplicate or incomplete ordinals.
+- Line visualization is derived only from a reopened trace dataset. `trace`
+  mode writes the dataset and may also write line OBJ artifacts; `visualize`
+  mode regenerates them without source Fiberlets, normals, or CT data.
+  Optional crop faces remain trace-time artifacts and use one concrete uint8
+  CT OME-Zarr group with the existing VC3D fine-to-coarse coordinate renderer.
 - After tracing, every nonzero consecutive accepted-line step contributes its
   normalized unoriented axis and base-voxel length to a deterministic
   two-direction fit. The axial PCA tensor is initialization only. The fitted
@@ -4626,3 +4646,10 @@
   geometry, or order. Matching `_anchors`, `_dir1_anchors`, `_dir2_anchors`,
   and `_mixed_anchors` OBJs contain one point primitive at each trace's actual
   seed anchor. Empty groups still produce valid OBJ artifacts.
+- Trace quality is total metric cost divided by prediction-space traced length;
+  lower is better. Visualization stably orders by quality then stored ordinal
+  and partitions rank `r` among `N` with `min(9,floor(10*r/N))`. Ten sibling
+  `_quality_00_10` through `_quality_90_100` OBJs partition every trace exactly
+  once. A `_quality_histogram.csv` and console table report count and
+  min/mean/max total cost and cost density per bin; empty bins retain valid
+  empty OBJ files and blank numeric CSV fields.

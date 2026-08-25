@@ -1,6 +1,7 @@
 #include "vc/core/types/Volume.hpp"
 #include "vc/fiber_tracer/FiberletChunkGraph.hpp"
 #include "vc/fiber_tracer/FiberletCropTrace.hpp"
+#include "vc/fiber_tracer/FiberletCropTraceArtifact.hpp"
 #include "vc/fiber_tracer/FiberletCropVisualization.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
@@ -11,6 +12,7 @@
 #include <ctime>
 #include <cstdlib>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -20,11 +22,15 @@
 namespace
 {
 
+enum class Mode { Trace, Visualize };
+
 struct Options {
-    std::filesystem::path fiberlets;
+    Mode mode = Mode::Trace;
+    std::filesystem::path input;
     std::string normalManifest;
     std::filesystem::path remoteCacheDirectory;
     std::filesystem::path output;
+    std::filesystem::path obj;
     std::filesystem::path volume;
     int maximumTextureDimension = 4096;
     int threads = static_cast<int>(std::max(1U, std::thread::hardware_concurrency()));
@@ -40,10 +46,13 @@ struct Options {
 
 void usage(const char* executable)
 {
-    std::cerr << "Usage: " << executable << " <fiberlets.zarr>"
-              << " --normal-manifest PATH"
-              << " --bbox X0 Y0 Z0 X1 Y1 Z1"
-              << " --output lines.obj [options]\n\n"
+    std::cerr << "Usage:\n"
+              << "  " << executable
+              << " trace <fiberlets.zarr> --normal-manifest PATH"
+                 " --bbox X0 Y0 Z0 X1 Y1 Z1 --output traces.zarr [options]\n"
+              << "  " << executable << " visualize <traces.zarr> --output lines.obj\n\n"
+              << "Trace options:\n"
+              << "  --obj PATH                 line OBJ; defaults beside trace Zarr\n"
               << "  --volume PATH              concrete uint8 CT Zarr group\n"
               << "  --remote-cache-dir PATH    cache for a remote normal manifest\n"
               << "  --threads N                graph preparation and trace workers [host CPUs]\n"
@@ -92,16 +101,28 @@ Options parse(int argc, char** argv)
         usage(argv[0]);
         std::exit(argc < 2 ? 2 : 0);
     }
+    if (argc < 3)
+        fail("a mode and input dataset are required");
     Options options;
-    options.fiberlets = argv[1];
-    for (int index = 2; index < argc; ++index) {
+    const std::string mode = argv[1];
+    if (mode == "trace")
+        options.mode = Mode::Trace;
+    else if (mode == "visualize")
+        options.mode = Mode::Visualize;
+    else
+        fail("mode must be 'trace' or 'visualize'");
+    options.input = argv[2];
+
+    for (int index = 3; index < argc; ++index) {
         const std::string argument = argv[index];
-        if (argument == "--normal-manifest") {
+        if (argument == "--output") {
+            options.output = value(index, argc, argv, "--output");
+        } else if (argument == "--obj") {
+            options.obj = value(index, argc, argv, "--obj");
+        } else if (argument == "--normal-manifest") {
             options.normalManifest = value(index, argc, argv, "--normal-manifest");
         } else if (argument == "--remote-cache-dir") {
             options.remoteCacheDirectory = value(index, argc, argv, "--remote-cache-dir");
-        } else if (argument == "--output") {
-            options.output = value(index, argc, argv, "--output");
         } else if (argument == "--volume") {
             options.volume = value(index, argc, argv, "--volume");
         } else if (argument == "--bbox") {
@@ -138,12 +159,23 @@ Options parse(int argc, char** argv)
             fail("unknown option: " + argument);
         }
     }
+    if (options.output.empty())
+        fail("--output is required");
+    if (options.mode == Mode::Visualize) {
+        if (!options.obj.empty() || !options.normalManifest.empty() || !options.remoteCacheDirectory.empty() || !options.volume.empty() ||
+            options.hasBounds) {
+            fail("visualize accepts only a trace dataset and --output OBJ");
+        }
+        return options;
+    }
     if (options.normalManifest.empty())
         fail("--normal-manifest is required");
     if (!options.hasBounds)
         fail("--bbox is required");
-    if (options.output.empty())
-        fail("--output is required");
+    if (options.obj.empty()) {
+        options.obj = options.output;
+        options.obj.replace_extension(".obj");
+    }
     if (options.threads < 1)
         fail("--threads must be positive");
     if (options.maximumTextureDimension < 2)
@@ -155,13 +187,65 @@ Options parse(int argc, char** argv)
     return options;
 }
 
+struct VisualizationReport {
+    vc::fiber_tracer::FiberDirectionClassification directions;
+    vc::fiber_tracer::FiberQualityHistogram quality;
+};
+
+VisualizationReport visualize(const std::vector<vc::fiber_tracer::FiberletCropTraceLine>& lines, const std::filesystem::path& output)
+{
+    std::filesystem::create_directories(output.parent_path().empty() ? std::filesystem::path{"."} : output.parent_path());
+    VisualizationReport report;
+    report.directions = vc::fiber_tracer::classifyFiberletCropDirections(lines);
+    vc::fiber_tracer::writeFiberletCropDirectionObjs(lines, report.directions, output);
+    report.quality = vc::fiber_tracer::classifyFiberletCropQuality(lines);
+    vc::fiber_tracer::writeFiberletCropQualityArtifacts(lines, report.quality, output);
+
+    std::cout << "fiberlet crop quality histogram\n"
+              << "decile  count  total_min  total_mean  total_max"
+                 "  density_min  density_mean  density_max\n";
+    std::cout << std::setprecision(8);
+    for (std::size_t index = 0; index < report.quality.bins.size(); ++index) {
+        const auto& bin = report.quality.bins[index];
+        std::cout << std::setw(2) << index * 10 << '-' << std::setw(3) << (index + 1) * 10 << "  " << std::setw(5) << bin.lineIndices.size();
+        if (bin.lineIndices.empty()) {
+            std::cout << "\n";
+        } else {
+            std::cout << "  " << bin.minimumTotalMetricCost << "  " << bin.meanTotalMetricCost << "  " << bin.maximumTotalMetricCost << "  "
+                      << bin.minimumCostDensity << "  " << bin.meanCostDensity << "  " << bin.maximumCostDensity << '\n';
+        }
+    }
+    return report;
+}
+
+void printDirectionReport(const vc::fiber_tracer::FiberDirectionClassification& classification, const std::filesystem::path& output)
+{
+    const auto paths = vc::fiber_tracer::fiberDirectionObjPaths(output);
+    std::cout << "fiberlet crop directions"
+              << " dir1_xyz=" << classification.direction1BaseXYZ[0] << ',' << classification.direction1BaseXYZ[1] << ','
+              << classification.direction1BaseXYZ[2] << " dir2_xyz=" << classification.direction2BaseXYZ[0] << ','
+              << classification.direction2BaseXYZ[1] << ',' << classification.direction2BaseXYZ[2] << " analyzed_steps=" << classification.analyzedSteps
+              << " analyzed_length_base=" << classification.analyzedLengthBaseVoxels << " dir1_fibers=" << classification.groupCounts[0]
+              << " dir2_fibers=" << classification.groupCounts[1] << " mixed_fibers=" << classification.groupCounts[2]
+              << " dominance_fraction=" << vc::fiber_tracer::kFiberDirectionDominanceFraction << " output=" << paths.all << '\n';
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
 {
     try {
         const auto options = parse(argc, argv);
-        auto dataset = vc::fiber_tracer::FiberletChunkDataset::openExisting(options.fiberlets);
+        if (options.mode == Mode::Visualize) {
+            const auto artifact = vc::fiber_tracer::readFiberletCropTraceArtifact(options.input);
+            const auto report = visualize(artifact.lines, options.output);
+            printDirectionReport(report.directions, options.output);
+            std::cout << "fiberlet crop visualization completed"
+                      << " traces=" << artifact.lines.size() << " input=" << options.input << " output=" << options.output << '\n';
+            return 0;
+        }
+
+        auto dataset = vc::fiber_tracer::FiberletChunkDataset::openExisting(options.input);
         if (dataset->metadata().kind != vc::fiber_tracer::FiberletDatasetKind::Combined) {
             fail("input must be a combined Fiberlet dataset");
         }
@@ -176,43 +260,38 @@ int main(int argc, char** argv)
         normalOptions.workingToBaseScale = dataset->metadata().predictionToBaseScale;
         normalOptions.remoteCacheRoot = options.remoteCacheDirectory;
         const auto normalDataset = vc::lasagna::LasagnaDataset::openLocation(options.normalManifest, normalOptions);
-        vc::fiber_tracer::validateFiberletNormalDatasetCompatibility(
-            dataset->metadata(), normalDataset);
+        vc::fiber_tracer::validateFiberletNormalDatasetCompatibility(dataset->metadata(), normalDataset);
         const vc::lasagna::LasagnaNormalSampler normals(normalDataset, vc::lasagna::LasagnaNormalSamplerOptions{options.cacheBytes});
 
         const auto graphStarted = std::chrono::steady_clock::now();
         const auto graphCpuStarted = std::clock();
-        auto materialized = graph.materializeBaseBox(
-            options.trace.minimumBaseXYZ, options.trace.maximumBaseXYZ,
-            static_cast<std::size_t>(options.threads));
-        const double graphSeconds = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - graphStarted).count();
-        const double graphCpuSeconds = static_cast<double>(
-            std::clock() - graphCpuStarted) / CLOCKS_PER_SEC;
+        auto materialized =
+            graph.materializeBaseBox(options.trace.minimumBaseXYZ, options.trace.maximumBaseXYZ, static_cast<std::size_t>(options.threads));
+        const double graphSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - graphStarted).count();
+        const double graphCpuSeconds = static_cast<double>(std::clock() - graphCpuStarted) / CLOCKS_PER_SEC;
         std::cout << "fiberlet crop graph prepared"
-                  << " anchors=" << materialized.insideAnchors.size()
-                  << " prediction_to_base=" << dataset->metadata().predictionToBaseScale
-                  << " elapsed_seconds=" << graphSeconds
-                  << " cpu_seconds=" << graphCpuSeconds << '\n';
+                  << " anchors=" << materialized.insideAnchors.size() << " prediction_to_base=" << dataset->metadata().predictionToBaseScale
+                  << " elapsed_seconds=" << graphSeconds << " cpu_seconds=" << graphCpuSeconds << '\n';
+
         const auto traceStarted = std::chrono::steady_clock::now();
         const auto traceCpuStarted = std::clock();
-        const auto result =
-            vc::fiber_tracer::traceFiberletCrop(*materialized.graph, std::move(materialized.insideAnchors), normals, dataset->metadata().predictionToBaseScale, options.trace, [](const auto& current, std::size_t remaining) {
+        const auto result = vc::fiber_tracer::traceFiberletCrop(
+            *materialized.graph,
+            std::move(materialized.insideAnchors),
+            normals,
+            dataset->metadata().predictionToBaseScale,
+            options.trace,
+            [](const auto& current, std::size_t remaining) {
                 std::cout << "fiberlet crop attempted=" << current.attemptedAnchors << " accepted=" << current.lines.size()
                           << " covered=" << current.coveredAnchors << " remaining=" << remaining << '\n';
             });
-        const double traceSeconds = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - traceStarted).count();
-        const double traceCpuSeconds = static_cast<double>(
-            std::clock() - traceCpuStarted) / CLOCKS_PER_SEC;
+        const double traceSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - traceStarted).count();
+        const double traceCpuSeconds = static_cast<double>(std::clock() - traceCpuStarted) / CLOCKS_PER_SEC;
 
-        std::filesystem::create_directories(options.output.parent_path().empty() ? std::filesystem::path{"."} : options.output.parent_path());
-        const auto directionClassification =
-            vc::fiber_tracer::classifyFiberletCropDirections(result.lines);
-        vc::fiber_tracer::writeFiberletCropDirectionObjs(
-            result.lines, directionClassification, options.output);
-        const auto directionPaths =
-            vc::fiber_tracer::fiberDirectionObjPaths(options.output);
+        vc::fiber_tracer::
+            writeFiberletCropTraceArtifact(options.output, dataset->metadata(), normalDataset.manifest().raw, options.trace, result.lines);
+        const auto artifact = vc::fiber_tracer::readFiberletCropTraceArtifact(options.output);
+        const auto visualization = visualize(artifact.lines, options.obj);
 
         if (!options.volume.empty()) {
             const std::string locator = std::filesystem::absolute(options.volume).lexically_normal().string();
@@ -222,47 +301,22 @@ int main(int argc, char** argv)
                 locator,
                 options.trace.minimumBaseXYZ,
                 options.trace.maximumBaseXYZ,
-                options.output.parent_path() / (options.output.stem().string() + "_volume_slices.obj"),
+                options.obj.parent_path() / (options.obj.stem().string() + "_volume_slices.obj"),
                 options.maximumTextureDimension);
         }
 
         std::cout << "fiberlet crop completed"
                   << " candidates=" << result.candidateAnchors << " attempted=" << result.attemptedAnchors << " covered=" << result.coveredAnchors
                   << " computed=" << result.computedCandidates << " discarded=" << result.discardedCandidates
-                  << " accepted=" << result.lines.size() << " no_edge=" << result.noEdgeAnchors << " one_sided=" << result.oneSidedLines
-                  << " bidirectional=" << result.bidirectionalLines << " output=" << options.output << '\n';
-        std::cout << "fiberlet crop directions"
-                  << " dir1_xyz=" << directionClassification.direction1BaseXYZ[0] << ','
-                  << directionClassification.direction1BaseXYZ[1] << ','
-                  << directionClassification.direction1BaseXYZ[2]
-                  << " dir2_xyz=" << directionClassification.direction2BaseXYZ[0] << ','
-                  << directionClassification.direction2BaseXYZ[1] << ','
-                  << directionClassification.direction2BaseXYZ[2]
-                  << " analyzed_steps=" << directionClassification.analyzedSteps
-                  << " analyzed_length_base=" << directionClassification.analyzedLengthBaseVoxels
-                  << " dir1_fibers=" << directionClassification.groupCounts[0]
-                  << " dir2_fibers=" << directionClassification.groupCounts[1]
-                  << " mixed_fibers=" << directionClassification.groupCounts[2]
-                  << " dominance_fraction=" << vc::fiber_tracer::kFiberDirectionDominanceFraction
-                  << " dir1_output=" << directionPaths.direction1
-                  << " dir2_output=" << directionPaths.direction2
-                  << " mixed_output=" << directionPaths.mixed
-                  << " anchors_output=" << directionPaths.allAnchors
-                  << " dir1_anchors_output=" << directionPaths.direction1Anchors
-                  << " dir2_anchors_output=" << directionPaths.direction2Anchors
-                  << " mixed_anchors_output=" << directionPaths.mixedAnchors
-                  << '\n';
+                  << " accepted=" << artifact.lines.size() << " no_edge=" << result.noEdgeAnchors << " one_sided=" << result.oneSidedLines
+                  << " bidirectional=" << result.bidirectionalLines << " trace_output=" << options.output << " obj_output=" << options.obj << '\n';
+        printDirectionReport(visualization.directions, options.obj);
         std::cout << "fiberlet crop timing"
-                  << " graph_seconds=" << graphSeconds
-                  << " graph_cpu_seconds=" << graphCpuSeconds
-                  << " trace_seconds=" << traceSeconds
-                  << " trace_cpu_seconds=" << traceCpuSeconds
-                  << " candidate_batch_seconds=" << result.candidateBatchSeconds
-                  << " candidate_batch_cpu_seconds=" << result.candidateBatchCpuSeconds
-                  << " candidate_task_seconds=" << result.candidateTaskSeconds
+                  << " graph_seconds=" << graphSeconds << " graph_cpu_seconds=" << graphCpuSeconds << " trace_seconds=" << traceSeconds
+                  << " trace_cpu_seconds=" << traceCpuSeconds << " candidate_batch_seconds=" << result.candidateBatchSeconds
+                  << " candidate_batch_cpu_seconds=" << result.candidateBatchCpuSeconds << " candidate_task_seconds=" << result.candidateTaskSeconds
                   << " candidate_task_max_seconds=" << result.maximumCandidateTaskSeconds
-                  << " lookahead_route_nodes_max=" << result.maximumLookaheadRouteNodes
-                  << " lookahead_route_bytes_max=" << result.maximumLookaheadRouteBytes
+                  << " lookahead_route_nodes_max=" << result.maximumLookaheadRouteNodes << " lookahead_route_bytes_max=" << result.maximumLookaheadRouteBytes
                   << " integration_seconds=" << result.integrationSeconds << '\n';
         return 0;
     } catch (const std::exception& error) {

@@ -1,13 +1,15 @@
-# Task: compact Fiberlet crop lookahead state
+# Task: durable Fiberlet crop trace artifacts
 
-Accelerate the sustained `vc_fiber_trace_chunk` tracing phase without changing
-its numerical work or deterministic output.
+Make crop tracing produce a durable, reusable Fiberlet Zarr artifact before
+any visualization or downstream processing.
 
-- Stop copying the complete committed visited-anchor set and complete rollout
-  arc vector for every accepted lookahead branch.
-- Represent rollout states in an indexed parent arena.
-- Preserve expansion order, cycle rejection, limits, loss accumulation,
-  density ordering, lexicographic route tie-breaking, and selected routes
-  exactly.
-- Measure the same Paris4 1024-base-voxel crop and compare all generated OBJ
-  files byte-for-byte with the current Release result.
+- Store accepted traced paths and their global metric cost in the existing
+  Fiberlet sparse-Zarr envelope rather than treating OBJ as authoritative.
+- Preserve traced geometry exactly in base-volume XYZ; do not force complete
+  crop traces through the short Fiberlet transverse-lattice route codec.
+- Generate all line, seed-anchor, direction-group, and quality OBJ artifacts
+  by reopening the stored trace dataset.
+- Report a cost-density histogram and write each rank decile as a separate OBJ
+  so low- and high-quality trace populations can be inspected independently.
+- Provide an explicit visualization-only CLI path for regenerating OBJ output
+  from an existing trace dataset.

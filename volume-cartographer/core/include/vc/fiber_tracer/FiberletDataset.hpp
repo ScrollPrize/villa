@@ -76,10 +76,21 @@ public:
     std::vector<FiberletStoredRoute> routes;
 };
 
+class FiberletTraceChunkPayload final : public vc::render::DecodedChunkPayload {
+public:
+  explicit FiberletTraceChunkPayload(FiberletDecodedTraces decoded);
+
+  [[nodiscard]] std::size_t residentBytes() const noexcept override;
+
+  FiberletStorageCodecConfig config;
+  std::vector<FiberletStoredTrace> traces;
+};
+
 enum class FiberletDatasetKind {
     Anchors,
     Fiberlets,
     Combined,
+  Traces,
 };
 
 struct FiberletDatasetMetadata {
@@ -125,6 +136,7 @@ public:
         std::size_t anchorDecodes = 0;
         std::size_t prefixDecodes = 0;
         std::size_t routeDecodes = 0;
+    std::size_t traceDecodes = 0;
     };
 
     static std::shared_ptr<FiberletChunkDataset> createOrOpen(
@@ -192,7 +204,7 @@ private:
     FiberletDatasetMetadata metadata_;
     std::vector<vc::render::ChunkKey> expectedChunks_;
     bool expectedChunksConfigured_ = false;
-    mutable std::array<std::atomic_size_t, 3> materializationDecodes_{};
+  mutable std::array<std::atomic_size_t, 4> materializationDecodes_{};
     std::shared_ptr<FiberletChunkWriteBackCache> writeBack_;
     std::uint64_t writeBackLayer_ = 0;
 };
