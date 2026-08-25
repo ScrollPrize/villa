@@ -134,8 +134,13 @@ constexpr qreal kTracedWidth = 2.2;
 constexpr qreal kInterpolatedWidth = 1.4;
 constexpr qreal kTracedHighlightWidth = 3.6;
 constexpr qreal kInterpolatedHighlightWidth = 2.4;
+// The selected fiber's linked network: visibly emphasized next to the crowd,
+// clearly subordinate to the selection itself.
+constexpr qreal kTracedNetworkWidth = 3.0;
+constexpr qreal kInterpolatedNetworkWidth = 1.9;
 constexpr qreal kPanelZ = -3.0;
 constexpr qreal kFiberZ = 2.0;
+constexpr qreal kNetworkZ = 4.5;
 constexpr qreal kHighlightZ = 7.0;
 // Dots (control points, link crossings, suspect-link rings) are drawn in scene
 // units, so they grow with the zoom, but never smaller than their kMin*Px on
@@ -531,7 +536,6 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
     _tree->setHeaderLabels(
         {tr("Fiber"), tr("H/V"), tr("Winding"), tr("Anchor"), tr("Annotation")});
     _tree->setUniformRowHeights(true);
-    _tree->setRootIsDecorated(false);
     _tree->setSelectionMode(QAbstractItemView::SingleSelection);
     // Everything but the annotation name takes only what it needs; the
     // annotation name gets the rest of the dock.
@@ -970,6 +974,7 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
     _entries.clear();
     clearControlPointDots();
     _highlightedFiber = 0;
+    _networkEmphasized.clear();
     _scene->clear();
 
     // Kept so a theme change can rebuild the scene as it stands, without asking
@@ -1043,6 +1048,7 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
     for (const vc3d::fiber_map::GlobalPlacedFiber& placed : _layout.fibers) {
         FiberEntry entry;
         entry.fiber = placed.fiber;
+        entry.networkId = placed.meta.networkId;
         for (vc3d::fiber_map::Run& run : entry.fiber.runs) {
             for (QPointF& point : run.points) {
                 point.setY(-point.y());
@@ -1198,24 +1204,32 @@ void FiberMapWorkspace::rebuildTree()
     // everything else about the tree is the widget palette's business.
     const FiberMapPalette& theme = activePalette();
 
-    // Inner -> outer by winding, then by label; every placed fiber is a row,
-    // and the fibers that could not be placed at all close the list.
-    std::vector<const vc3d::fiber_map::GlobalPlacedFiber*> rows;
-    rows.reserve(_layout.fibers.size());
+    // Grouped by linked network, largest first (the layout numbers network
+    // ids by size), then every unlinked fiber flat; inner -> outer within
+    // each group.
+    std::map<int, std::vector<const vc3d::fiber_map::GlobalPlacedFiber*>> networks;
+    std::vector<const vc3d::fiber_map::GlobalPlacedFiber*> individual;
     for (const vc3d::fiber_map::GlobalPlacedFiber& fiber : _layout.fibers) {
-        rows.push_back(&fiber);
+        if (fiber.meta.networkId >= 0) {
+            networks[fiber.meta.networkId].push_back(&fiber);
+        } else {
+            individual.push_back(&fiber);
+        }
     }
-    std::sort(rows.begin(), rows.end(),
-              [](const vc3d::fiber_map::GlobalPlacedFiber* a,
-                 const vc3d::fiber_map::GlobalPlacedFiber* b) {
-                  if (a->meta.windingLo != b->meta.windingLo) {
-                      return a->meta.windingLo < b->meta.windingLo;
-                  }
-                  if (a->fiber.label != b->fiber.label) {
-                      return a->fiber.label < b->fiber.label;
-                  }
-                  return a->fiber.id < b->fiber.id;
-              });
+    const auto innerToOuter = [](const vc3d::fiber_map::GlobalPlacedFiber* a,
+                                 const vc3d::fiber_map::GlobalPlacedFiber* b) {
+        if (a->meta.windingLo != b->meta.windingLo) {
+            return a->meta.windingLo < b->meta.windingLo;
+        }
+        if (a->fiber.label != b->fiber.label) {
+            return a->fiber.label < b->fiber.label;
+        }
+        return a->fiber.id < b->fiber.id;
+    };
+    for (auto& [id, members] : networks) {
+        std::sort(members.begin(), members.end(), innerToOuter);
+    }
+    std::sort(individual.begin(), individual.end(), innerToOuter);
 
     // A multi-turn H fiber has no single winding, so the column shows the
     // range it spans.
@@ -1250,19 +1264,42 @@ void FiberMapWorkspace::rebuildTree()
         }
         return text;
     };
-
-    for (const vc3d::fiber_map::GlobalPlacedFiber* row : rows) {
+    const auto addFiberRow = [&](QTreeWidgetItem* parent,
+                                 const vc3d::fiber_map::GlobalPlacedFiber* row) {
         const QString annotationName =
             _controller ? _controller->fiberDisplayName(row->fiber.id) : QString();
-        auto* item = new QTreeWidgetItem(
-            _tree, {row->fiber.label, QString(QLatin1Char(row->fiber.hvTag)),
-                    windingText(row->meta), anchorText(row->meta), annotationName});
+        auto* item = parent != nullptr
+            ? new QTreeWidgetItem(
+                  parent, {row->fiber.label, QString(QLatin1Char(row->fiber.hvTag)),
+                           windingText(row->meta), anchorText(row->meta),
+                           annotationName})
+            : new QTreeWidgetItem(
+                  _tree, {row->fiber.label, QString(QLatin1Char(row->fiber.hvTag)),
+                          windingText(row->meta), anchorText(row->meta),
+                          annotationName});
         item->setData(0, Qt::UserRole, QVariant::fromValue<qulonglong>(row->fiber.id));
         const QColor color = fiberColor(row->fiber.hvTag, theme);
         for (int column = 0; column < _tree->columnCount(); ++column) {
             item->setForeground(column, color);
         }
         item->setForeground(3, theme.inkSoft);
+    };
+
+    for (const auto& [id, members] : networks) {
+        auto* networkItem = new QTreeWidgetItem(
+            _tree, {tr("Network %1 — %2 fibers")
+                        .arg(id + 1)
+                        .arg(members.size())});
+        networkItem->setForeground(0, theme.inkSoft);
+        // A header across the whole row, so the columns stay narrow.
+        networkItem->setFirstColumnSpanned(true);
+        for (const vc3d::fiber_map::GlobalPlacedFiber* row : members) {
+            addFiberRow(networkItem, row);
+        }
+        networkItem->setExpanded(true);
+    }
+    for (const vc3d::fiber_map::GlobalPlacedFiber* row : individual) {
+        addFiberRow(nullptr, row);
     }
     for (const vc3d::fiber_map::UnplacedFiber& unplaced : _layout.unplaced) {
         const QString annotationName =
@@ -1382,13 +1419,21 @@ void FiberMapWorkspace::selectFiberRow(uint64_t fiberId)
 {
     const bool guard = _syncingSelection;
     _syncingSelection = true;
+    const auto matches = [fiberId](QTreeWidgetItem* item) {
+        return item->data(0, Qt::UserRole).toULongLong() == fiberId;
+    };
     for (int row = 0; row < _tree->topLevelItemCount(); ++row) {
-        QTreeWidgetItem* fiberItem = _tree->topLevelItem(row);
-        if (fiberItem->data(0, Qt::UserRole).toULongLong() == fiberId) {
-            _tree->setCurrentItem(fiberItem);
-            _tree->scrollToItem(fiberItem);
-            _syncingSelection = guard;
-            return;
+        QTreeWidgetItem* item = _tree->topLevelItem(row);
+        QTreeWidgetItem* hit = matches(item) ? item : nullptr;
+        for (int child = 0; hit == nullptr && child < item->childCount(); ++child) {
+            if (matches(item->child(child))) {
+                hit = item->child(child);
+            }
+        }
+        if (hit != nullptr) {
+            _tree->setCurrentItem(hit);
+            _tree->scrollToItem(hit);
+            break;
         }
     }
     _syncingSelection = guard;
@@ -1403,25 +1448,56 @@ void FiberMapWorkspace::clearControlPointDots()
     _controlPointDots.clear();
 }
 
+void FiberMapWorkspace::paintFiberEmphasis(const FiberEntry& entry,
+                                           FiberEmphasis emphasis)
+{
+    const FiberMapPalette& theme = activePalette();
+    const QColor color = fiberColor(entry.fiber.hvTag, theme);
+    qreal tracedWidth = kTracedWidth;
+    qreal interpolatedWidth = kInterpolatedWidth;
+    qreal z = kFiberZ;
+    switch (emphasis) {
+    case FiberEmphasis::Plain:
+        break;
+    case FiberEmphasis::Network:
+        tracedWidth = kTracedNetworkWidth;
+        interpolatedWidth = kInterpolatedNetworkWidth;
+        z = kNetworkZ;
+        break;
+    case FiberEmphasis::Selected:
+        tracedWidth = kTracedHighlightWidth;
+        interpolatedWidth = kInterpolatedHighlightWidth;
+        z = kHighlightZ;
+        break;
+    }
+    if (entry.tracedItem) {
+        entry.tracedItem->setPen(cosmeticPen(color, tracedWidth));
+        entry.tracedItem->setZValue(z);
+    }
+    if (entry.interpolatedItem) {
+        entry.interpolatedItem->setPen(interpolatedPen(
+            tint(color, theme.surface, 0.45), interpolatedWidth));
+        entry.interpolatedItem->setZValue(z);
+    }
+}
+
 void FiberMapWorkspace::setHighlightedFiber(uint64_t fiberId)
 {
     if (_highlightedFiber == fiberId) {
         return;
     }
-    const FiberMapPalette& theme = activePalette();
+    // Restore the previous selection and its network's subtle emphasis.
     if (const auto previous = _entries.constFind(_highlightedFiber);
         previous != _entries.constEnd()) {
-        const QColor color = fiberColor(previous->fiber.hvTag, theme);
-        if (previous->tracedItem) {
-            previous->tracedItem->setPen(cosmeticPen(color, kTracedWidth));
-            previous->tracedItem->setZValue(kFiberZ);
-        }
-        if (previous->interpolatedItem) {
-            previous->interpolatedItem->setPen(
-                interpolatedPen(tint(color, theme.surface, 0.45), kInterpolatedWidth));
-            previous->interpolatedItem->setZValue(kFiberZ);
+        paintFiberEmphasis(*previous, FiberEmphasis::Plain);
+    }
+    for (const uint64_t member : _networkEmphasized) {
+        if (const auto entry = _entries.constFind(member);
+            entry != _entries.constEnd()) {
+            paintFiberEmphasis(*entry, FiberEmphasis::Plain);
         }
     }
+    _networkEmphasized.clear();
     clearControlPointDots();
     _highlightedFiber = fiberId;
 
@@ -1429,16 +1505,21 @@ void FiberMapWorkspace::setHighlightedFiber(uint64_t fiberId)
     if (entry == _entries.constEnd()) {
         return;
     }
+    // The selection's linked network first, subtly, so the selected fiber's
+    // own treatment paints over the shared geometry last.
+    if (entry->networkId >= 0) {
+        for (auto other = _entries.constBegin(); other != _entries.constEnd();
+             ++other) {
+            if (other->networkId == entry->networkId &&
+                other.key() != fiberId) {
+                paintFiberEmphasis(*other, FiberEmphasis::Network);
+                _networkEmphasized.push_back(other.key());
+            }
+        }
+    }
+    paintFiberEmphasis(*entry, FiberEmphasis::Selected);
+    const FiberMapPalette& theme = activePalette();
     const QColor color = fiberColor(entry->fiber.hvTag, theme);
-    if (entry->tracedItem) {
-        entry->tracedItem->setPen(cosmeticPen(color, kTracedHighlightWidth));
-        entry->tracedItem->setZValue(kHighlightZ);
-    }
-    if (entry->interpolatedItem) {
-        entry->interpolatedItem->setPen(
-            interpolatedPen(tint(color, theme.surface, 0.45), kInterpolatedHighlightWidth));
-        entry->interpolatedItem->setZValue(kHighlightZ);
-    }
     const double vxPerCm = sceneVxPerCm();
     for (std::size_t i = 0; i < entry->fiber.controlPoints.size(); ++i) {
         auto* dot = new ScaledDot(QBrush(color), cosmeticPen(theme.chipInk, 1.0),

@@ -89,6 +89,9 @@ private:
     // upward) alongside the two path items carrying its geometry.
     struct FiberEntry {
         vc3d::fiber_map::PlacedFiber fiber;
+        // Linked-network id from the layout (-1: unlinked), for the dock
+        // grouping and the selection's network co-highlight.
+        int networkId = -1;
         QGraphicsPathItem* tracedItem = nullptr;
         QGraphicsPathItem* interpolatedItem = nullptr;
     };
@@ -146,6 +149,10 @@ private:
     // true when the package cannot say how big a voxel is.
     [[nodiscard]] QString formatMapLength(double valueVx) const;
     void setHighlightedFiber(uint64_t fiberId);
+    // (Re)paints one fiber's path items for its current role: the selected
+    // fiber, a subtly-emphasized member of its linked network, or plain.
+    enum class FiberEmphasis { Plain, Network, Selected };
+    void paintFiberEmphasis(const FiberEntry& entry, FiberEmphasis emphasis);
     void clearControlPointDots();
     void handleSceneClick(const QPointF& scenePos);
     void handleControlPointMenu(const QPointF& scenePos, const QPoint& globalPos);
@@ -178,6 +185,9 @@ private:
     // it stands rather than take a fresh snapshot to work out the message again.
     QString _emptyMessage;
     uint64_t _highlightedFiber = 0;
+    // Fibers currently carrying the subtle network emphasis, so the next
+    // selection change can restore exactly them.
+    std::vector<uint64_t> _networkEmphasized;
     bool _syncingSelection = false;
     bool _viewFitted = false;
     bool _fiberDockSized = false;

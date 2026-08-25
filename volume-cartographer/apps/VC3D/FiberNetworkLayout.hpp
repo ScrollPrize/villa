@@ -182,6 +182,12 @@ struct GlobalFiberMeta {
     // W range over the fiber; a multi-turn H fiber has no single winding.
     double windingLo = 0.0;
     double windingHi = 0.0;
+    // Linked-network membership: fibers connected through manual links share
+    // an id, numbered by network size descending (0 = largest, ties by first
+    // fiber label). -1 for fibers with no valid links.
+    int networkId = -1;
+    // Fibers in this fiber's network (1 for unlinked fibers).
+    int networkSize = 1;
 };
 
 struct GlobalPlacedFiber {

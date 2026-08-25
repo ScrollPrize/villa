@@ -332,6 +332,42 @@ private slots:
         QCOMPARE(silent.fibers.size(), trusted.fibers.size());
     }
 
+    // Linked-network ids drive the dock grouping and the selection's network
+    // co-highlight: components of the manual link graph, numbered by size
+    // descending, -1 for unlinked fibers.
+    void networkIdsNumberBySizeLargestFirst()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        // Two networks: 4 fibers (1 H + 3 V) and 3 fibers (1 H + 2 V), plus
+        // one unlinked fiber.
+        std::vector<InputFiber> fibers =
+            makeWeave(100, QStringLiteral("a-"), 30000.0, 4000.0, 300.0,
+                      0.0, 1.5 * kTwoPi, {200, 900, 1600});
+        std::vector<InputFiber> small =
+            makeWeave(200, QStringLiteral("b-"), 30000.0, 1500.0, 100.0,
+                      0.0, 1.2 * kTwoPi, {150, 1100});
+        fibers.insert(fibers.end(), small.begin(), small.end());
+        fibers.push_back(makeFiber(900, QStringLiteral("c-h-9"), 'H',
+                                   arcPoints(30500.0, 5000.0, 100.0, 0.0, 0.8 * kTwoPi),
+                                   {100, 800}));
+        const GlobalResult result =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, defaultParams());
+        QCOMPARE(result.fibers.size(), std::size_t{8});
+        for (const GlobalPlacedFiber& fiber : result.fibers) {
+            const uint64_t id = fiber.fiber.id;
+            if (id == 900) {
+                QCOMPARE(fiber.meta.networkId, -1);
+                QCOMPARE(fiber.meta.networkSize, 1);
+            } else if (id >= 200) {
+                QCOMPARE(fiber.meta.networkId, 1);
+                QCOMPARE(fiber.meta.networkSize, 3);
+            } else {
+                QCOMPARE(fiber.meta.networkId, 0);
+                QCOMPARE(fiber.meta.networkSize, 4);
+            }
+        }
+    }
+
     // No umbilicus: nothing can be unrolled, and EVERY fiber - not just the
     // geometryless one - is reported unplaceable rather than silently absent.
     void noUmbilicusReportsEveryFiberUnplaceable()

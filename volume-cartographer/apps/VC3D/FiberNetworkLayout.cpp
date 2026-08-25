@@ -922,6 +922,59 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     }
 
     const std::vector<LinkRecord> allLinks = collectValidLinks(ordered, indexById);
+
+    // Linked-network membership, for the dock's grouping and the map's
+    // network co-highlight: components of the manual link graph, numbered by
+    // size descending. Singletons keep -1.
+    std::vector<int> networkIdOf(fiberCount, -1);
+    std::vector<int> networkSizeOf(fiberCount, 1);
+    {
+        std::vector<std::size_t> parent(fiberCount);
+        for (std::size_t i = 0; i < fiberCount; ++i) {
+            parent[i] = i;
+        }
+        const auto findRoot = [&parent](std::size_t index) {
+            while (parent[index] != index) {
+                parent[index] = parent[parent[index]];
+                index = parent[index];
+            }
+            return index;
+        };
+        for (const LinkRecord& link : allLinks) {
+            const std::size_t a = findRoot(link.a);
+            const std::size_t b = findRoot(link.b);
+            if (a != b) {
+                parent[a] = b;
+            }
+        }
+        std::map<std::size_t, std::vector<std::size_t>> byRoot;
+        for (std::size_t i = 0; i < fiberCount; ++i) {
+            byRoot[findRoot(i)].push_back(i);
+        }
+        std::vector<std::vector<std::size_t>> networks;
+        for (auto& entry : byRoot) {
+            if (entry.second.size() > 1) {
+                networks.push_back(std::move(entry.second));
+            }
+        }
+        // ordered[] is already (label, id)-sorted, so front() is each
+        // network's first fiber by label.
+        std::sort(networks.begin(), networks.end(),
+                  [](const std::vector<std::size_t>& a,
+                     const std::vector<std::size_t>& b) {
+                      if (a.size() != b.size()) {
+                          return a.size() > b.size();
+                      }
+                      return a.front() < b.front();
+                  });
+        for (std::size_t n = 0; n < networks.size(); ++n) {
+            for (const std::size_t member : networks[n]) {
+                networkIdOf[member] = static_cast<int>(n);
+                networkSizeOf[member] = static_cast<int>(networks[n].size());
+            }
+        }
+    }
+
     std::vector<winding::LinkInput> linkInputs;
     linkInputs.reserve(allLinks.size());
     for (const LinkRecord& link : allLinks) {
@@ -1008,6 +1061,8 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         loY = std::min(loY, fiberLoY);
         hiY = std::max(hiY, fiberHiY);
         placed.meta.linked = placement.linked;
+        placed.meta.networkId = networkIdOf[i];
+        placed.meta.networkSize = networkSizeOf[i];
         placed.meta.sheetDriftSuspect = placement.sheetDriftSuspect;
         placed.meta.windingLo = placement.windingLo;
         placed.meta.windingHi = placement.windingHi;
