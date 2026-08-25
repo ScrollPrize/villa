@@ -167,6 +167,11 @@ constexpr qreal kSuspectRingBoundsCm = 0.6;
 // panels away from the edge, in cm; it is the floor under the quarter-of-the-width
 // margin, so it only decides maps narrower than 12 cm.
 constexpr qreal kMinSceneMarginCm = 3.0;
+// Label chips hide once a whole winding maps to fewer screen pixels than
+// this: chips are ~40 px wide and ignore the view transform, so below about
+// two chip widths per winding the labels collide across windings and bury
+// the geometry instead of annotating it.
+constexpr double kMinChipPixelsPerWinding = 90.0;
 constexpr double kFiberHitTolerancePx = 14.0;
 constexpr double kControlDotTolerancePx = 10.0;
 constexpr int kClickSlopPx = 4;
@@ -446,6 +451,7 @@ void FiberMapView::wheelEvent(QWheelEvent* event)
     }
     const double factor = std::pow(1.15, steps);
     scale(factor, factor);
+    emit zoomed();
     event->accept();
 }
 
@@ -569,6 +575,8 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
 
     connect(rebuildButton, &QPushButton::clicked, this, &FiberMapWorkspace::rebuildLayout);
     connect(_view, &FiberMapView::clicked, this, &FiberMapWorkspace::handleSceneClick);
+    connect(_view, &FiberMapView::zoomed, this,
+            &FiberMapWorkspace::updateLabelChipVisibility);
     connect(_view, &FiberMapView::controlPointMenuRequested,
             this, &FiberMapWorkspace::handleControlPointMenu);
     connect(_tree, &QTreeWidget::currentItemChanged, this,
@@ -961,6 +969,8 @@ void FiberMapWorkspace::rebuildLayout()
         _view->fitInView(_contentRect, Qt::KeepAspectRatio);
         _viewFitted = true;
     }
+    // fitInView changes the scale without a wheel event.
+    updateLabelChipVisibility();
 
     // The one moment every dependency is re-examined against what this build
     // just recorded. An umbilicus file rewritten while the snapshot was being
@@ -976,6 +986,8 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
     clearControlPointDots();
     _highlightedFiber = 0;
     _networkEmphasized.clear();
+    _labelChips.clear();
+    _chipHideScale = 0.0;
     _scene->clear();
 
     // Kept so a theme change can rebuild the scene as it stands, without asking
@@ -1125,6 +1137,7 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
             chip->setTransform(QTransform::fromTranslate(
                 anchorRight ? offsetX - chip->width() : offsetX, offsetY));
             _scene->addItem(chip);
+            _labelChips.push_back(chip);
         }
 
         const uint64_t fiberId = entry.fiber.id;
@@ -1194,6 +1207,24 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
     // instead of being pinned to it.
     const double xMargin = std::max(0.25 * sceneWidth, kMinSceneMarginCm * vxPerCm);
     _scene->setSceneRect(_contentRect.adjusted(-xMargin, 0.0, xMargin, 0.0));
+
+    if (_layout.rRefVx > 0.0) {
+        _chipHideScale =
+            kMinChipPixelsPerWinding / (2.0 * M_PI * _layout.rRefVx);
+    }
+    updateLabelChipVisibility();
+}
+
+void FiberMapWorkspace::updateLabelChipVisibility()
+{
+    if (!_view || _labelChips.empty()) {
+        return;
+    }
+    const bool visible =
+        std::abs(_view->transform().m11()) >= _chipHideScale;
+    for (QGraphicsItem* chip : _labelChips) {
+        chip->setVisible(visible);
+    }
 }
 
 void FiberMapWorkspace::rebuildTree()
@@ -1367,7 +1398,7 @@ uint64_t FiberMapWorkspace::fiberAt(const QPointF& scenePos) const
     const QList<QGraphicsItem*> under = _scene->items(
         scenePos, Qt::IntersectsItemShape, Qt::DescendingOrder, _view->transform());
     for (const QGraphicsItem* item : under) {
-        if (item->type() != kChipItemType) {
+        if (item->type() != kChipItemType || !item->isVisible()) {
             continue;
         }
         const uint64_t fiberId = item->data(0).toULongLong();

@@ -44,6 +44,9 @@ public:
 signals:
     void clicked(QPointF scenePos);
     void controlPointMenuRequested(QPointF scenePos, QPoint globalPos);
+    // The view scale changed (wheel zoom); fitInView callers refresh
+    // scale-dependent state themselves.
+    void zoomed();
 
 protected:
     void wheelEvent(QWheelEvent* event) override;
@@ -153,6 +156,10 @@ private:
     // true when the package cannot say how big a voxel is.
     [[nodiscard]] QString formatMapLength(double valueVx) const;
     void setHighlightedFiber(uint64_t fiberId);
+    // Label chips are fixed pixel size, so zoomed far enough out they bury
+    // the geometry; below the scale where one winding spans fewer screen
+    // pixels than a couple of chips, they all hide.
+    void updateLabelChipVisibility();
     // (Re)paints one fiber's items for its current role: the selected fiber
     // (thicker lines, raised), a member of its linked network (a gentle glow
     // behind unchanged lines), or plain.
@@ -176,6 +183,10 @@ private:
     vc3d::fiber_map::GlobalResult _layout;
     QHash<uint64_t, FiberEntry> _entries;
     std::vector<QGraphicsItem*> _controlPointDots;
+    // Every fiber label chip of the current scene, for the zoom-threshold
+    // visibility toggle; the scale below which they hide (0: never hide).
+    std::vector<QGraphicsItem*> _labelChips;
+    double _chipHideScale = 0.0;
     // Annotation voxel size of the snapshot the current layout came from, in µm;
     // unset when the package could not say, in which case nothing physical is
     // displayed.
