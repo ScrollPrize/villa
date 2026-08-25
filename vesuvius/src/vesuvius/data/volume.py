@@ -805,9 +805,14 @@ class Volume:
                 print(f"Successfully loaded ink label with shape: {self.inklabel.shape}, dtype: {self.inklabel.dtype}")
 
         except Exception as e:
-            if self.verbose:
-                print(f"Warning: Could not load ink label from {inklabel_url}: {e}")
-            
+            # fsspec reports network and TLS failures as FileNotFoundError carrying only the
+            # URL, so `e` on its own reads as "the file is not published" even when the file
+            # is there and the connection failed. Surface the underlying cause too.
+            detail = f"{type(e).__name__}: {e}"
+            cause = e.__cause__ or e.__context__
+            if cause is not None:
+                detail += f" (caused by {type(cause).__name__}: {cause})"
+
             # Create an empty/dummy ink label array based on data shape if possible
             if hasattr(self, 'data') and self.data:
                 try:
@@ -815,14 +820,20 @@ class Volume:
                     # Assume inklabel matches YX dimensions of the 3D volume
                     if len(base_shape) >= 3:
                         self.inklabel = np.zeros(base_shape[-2:], dtype=np.uint8)  # (Y, X)
-                        if self.verbose:
-                            print(f"Created empty placeholder ink label with shape: {self.inklabel.shape}")
                     else:
                         self.inklabel = np.zeros((1, 1), dtype=np.uint8)  # Fallback
                 except Exception:
                     self.inklabel = np.zeros((1, 1), dtype=np.uint8)  # Final fallback
             else:
                 self.inklabel = np.zeros((1, 1), dtype=np.uint8)  # Fallback if data not loaded
+
+            # Substituting a placeholder for real data is never silent: this warning is not
+            # gated on self.verbose, which defaults to False.
+            print(
+                f"Warning: could not load ink label from {inklabel_url}. "
+                f"self.inklabel has been set to a blank {self.inklabel.shape} placeholder "
+                f"and does NOT contain real data. {detail}"
+            )
 
     def _read_with_retry(self, store, coord_idx):
         """Read a slice from a store, retrying transient remote failures.
