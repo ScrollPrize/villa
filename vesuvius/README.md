@@ -21,19 +21,22 @@ _this package is in active development_
 
 ### Entrypoints: 
 
-| Name                          | Script                             | Description                                                                                                                                                                                               |
-| ----------------------------- | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `vesuvius.predict`            | `models.run.inference`             | outputs logits from a pretrained nnUNet-v2 model or one trained within the Vesuvius training framework; currently only works on Zarr data and can be fully distributed with `--num_parts` and `--part_id` |
-| `vesuvius.blend_logits`       | `models.run.blending`              | blends the logits from `vesuvius.predict` using Gaussian blending                                                                                                                                         |
-| `vesuvius.finalize_outputs`   | `models.run.finalize_outputs`      | performs softmax / argmax / none on the blended array and writes a final `uint8` volume                                                                                                                   |
-| `vesuvius.compute_st`         | `structure_tensor.run_create_st`   | computes structure tensors on input data and derives eigen-values/vectors                                                                                                                                 |
-| `vesuvius.napari_trainer`     | `napari_trainer.main_window`       | launches a Napari window for interactive training and inference                                                                                                                                           |
-| `vesuvius.proofreader`        | `utils.vc_proofreader.main`        | opens a Napari window that loads local / remote image-label arrays and extracts training patches                                                                                                          |
-| `vesuvius.voxelize_obj`       | `scripts.voxelize_objs`            | converts input `.obj` meshes to voxel grids and outputs `.tif` stacks                                                                                                                                     |
-| `vesuvius.refine_labels`      | `scripts.edt_frangi_label`         | refines surface or fibre labels with a custom Frangi-based filter                                                                                                                                         |
-| `vesuvius.render_obj`         | `rendering.mesh_to_surface`        | renders `.obj` meshes and outputs their surface-volume layers                                                                                                                                             |
-| `vesuvius.flatten_obj`        | `rendering.slim_uv`                | flattens an `.obj` mesh using `slim_uv`                                                                                                                                                                   |
-| `vesuvius.train`              | `models.run.train`                 | main entry point for training models                                                                                                                                                                      |
+| Name                            | Script                               | Description                                                                                                                                                                                               |
+| ------------------------------- | ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `vesuvius.accept_terms`         | `install.accept_terms`               | accepts the data usage terms and conditions (required once before accessing the data)                                                                                                                     |
+| `vesuvius.predict`              | `models.run.inference`               | outputs logits from a pretrained nnUNet-v2 model or one trained within the Vesuvius training framework; currently only works on Zarr data and can be fully distributed with `--num_parts` and `--part_id` |
+| `vesuvius.blend_logits`         | `models.run.blending`                | blends the logits from `vesuvius.predict` using Gaussian blending                                                                                                                                         |
+| `vesuvius.blend_and_finalize`   | `models.run.blending`                | blends partial inference outputs and finalizes (softmax + `uint8`) in a single pass                                                                                                                       |
+| `vesuvius.finalize_outputs`     | `models.run.finalize_outputs`        | performs softmax / argmax / none on the blended array and writes a final `uint8` volume                                                                                                                   |
+| `vesuvius.compute_st`           | `structure_tensor.run_create_st`     | computes structure tensors on input data and derives eigen-values/vectors                                                                                                                                 |
+| `vesuvius.napari_trainer`       | `napari_trainer.main_window`         | launches a Napari window for interactive training and inference                                                                                                                                           |
+| `vesuvius.voxelize_obj`         | `image_proc.run.voxelize_objs`       | converts input `.obj` meshes to voxel grids and outputs `.tif` stacks                                                                                                                                     |
+| `vesuvius.refine_labels`        | `image_proc.run.edt_frangi_label`    | refines surface or fibre labels with a custom Frangi-based filter                                                                                                                                         |
+| `vesuvius.train`                | `models.training.train`              | main entry point for training models                                                                                                                                                                      |
+| `vesuvius.zarr_tasks`           | `image_proc.run.zarr_tasks`          | operates on zarr arrays with various tasks                                                                                                                                                                |
+| `vesuvius.find_patches`         | `models.preprocessing.patches.cli`   | generates per-volume patch caches for a dataset                                                                                                                                                           |
+
+> **Note:** the previously documented `vesuvius.render_obj` and `vesuvius.flatten_obj` entrypoints no longer exist — that code was retired with ThaumatoAnakalyptor (now under `deprecated/`). To render a segment into a surface volume, use `vc_render_tifxyz` from [volume-cartographer](../volume-cartographer). The proofreader still exists but is no longer part of this package: it lives at [`segmentation/vc_proofreader`](../segmentation/vc_proofreader) (see [Proofreading labels](#proofreading-labels) below).
 
 
 
@@ -96,8 +99,10 @@ ___
 
 ### Proofreading labels
 
-1. Update the config in `/utils/vc_proofreader/config.py` with the proper paths
-2. Run `vesuvius.proofreader`
+The proofreader lives in [`segmentation/vc_proofreader`](../segmentation/vc_proofreader) (it is not part of the `vesuvius` package).
+
+1. Write a config file (JSON, or a Python script defining a `config` dict) with the proper paths
+2. Run `python segmentation/vc_proofreader/main.py --config <your config>` from the repo root
 3. Select your desired patch size and min labeled percentage 
 4. Click `run` 
 5. Approve patches with `a` or by checking the box
