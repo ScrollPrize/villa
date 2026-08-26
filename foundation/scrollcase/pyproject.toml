@@ -1,7 +1,7 @@
 [project]
 dependencies = [
-    "build123d @ git+https://github.com/gumyr/build123d",
-    "bd_warehouse @ git+https://github.com/gumyr/bd_warehouse",
+    "build123d @ git+https://github.com/gumyr/build123d@30bbe96cfe0410e3c9cd3f1418ba9e227a546bce",
+    "bd_warehouse @ git+https://github.com/gumyr/bd_warehouse@97112a02d9538d57740a005a7802dd149d797568",
     "numpy",
     "trimesh",
     "ocp-vscode",
