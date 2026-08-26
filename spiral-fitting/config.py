@@ -126,6 +126,13 @@ _INPUT_TOGGLE_DESCRIPTIONS = {
 BACKFILLABLE_CONFIG_DEFAULTS = {
     key: True for key in _INPUT_TOGGLE_DESCRIPTIONS
 }
+# Constraint-bake reset settings postdate durable checkpoints too; a missing
+# value unambiguously means the historical behaviour (no resets).
+BACKFILLABLE_CONFIG_DEFAULTS.update({
+    "optimizer_reset_interval": 0,
+    "optimizer_reset_probe_warn_voxels": 1.0,
+    "optimizer_reset_lr_warmup_steps": 250,
+})
 
 # Configuration keys that shape the model's parameter tensors. A checkpoint
 # whose stored value for any of them differs describes a different model, and
@@ -270,6 +277,26 @@ class Config:
         self.optimizer_exp_lr_schedule = True
         self.optimizer_lr_final_factor = 0.3
         self.optimizer_num_training_steps = 30000
+        # Constraint-bake resets ("plan B", see
+        # plans/reset_plan_b_constraint_baking.md): every this-many completed
+        # steps the live transform is frozen to a CPU snapshot, every point
+        # input is baked through its inverse into (near-)canonical spiral
+        # space, and the live parameters restart from the identity (dr
+        # preserved). 0 disables resets. Headless fits only; refused while
+        # SDT phase losses or influence windows are enabled. Dense lasagna
+        # losses (normals/grad-mag) run until the first reset and are then
+        # disabled: their volume stores describe true scroll space, which
+        # the baked inputs leave at that point.
+        self.optimizer_reset_interval = 0
+        # Warn when a bake's round-trip probe error (RK4 forward/inverse
+        # inconsistency, in scroll voxels) exceeds this; the error is
+        # committed permanently into the constraints once per bake.
+        self.optimizer_reset_probe_warn_voxels = 1.0
+        # Linear LR warm-up applied for this many steps after each reset,
+        # so the freshly zeroed parameters re-estimate their Adam moments
+        # under small steps instead of jumping at full late-schedule LR.
+        # 0 disables the ramp.
+        self.optimizer_reset_lr_warmup_steps = 250
         self.model_num_flow_integration_steps = 3
         self.model_flow_integration_solver = "rk4"
         self.model_num_flow_timesteps = 1

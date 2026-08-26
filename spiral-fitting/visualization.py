@@ -158,10 +158,16 @@ def save_overlay(
     tracks,
     out_path, suffix,
     render_volume_scale=1,
+    slice_to_spiral_transform=None,
 ):
 
     device = slice_yx.device
-    slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
+    if slice_to_spiral_transform is None:
+        # Callers whose inputs live in a different space than the model's own
+        # output space (constraint-bake resets compose frozen epochs with the
+        # live transform) must pass the transform explicitly; the model's own
+        # chain is only correct when no such composition exists.
+        slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
 
     # TODO: maybe use the smoothed umbilicus here, to avoid weird swirls appearing
     flow_corners_zyx = slice_to_spiral_transform.inv(torch.stack([flow_min_corner_spiral_zyx, flow_max_corner_spiral_zyx], dim=0).to(torch.float32)).to(torch.int64)

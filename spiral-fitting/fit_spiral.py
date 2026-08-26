@@ -15,6 +15,7 @@ import multiprocessing
 import json
 import glob
 import re
+import types
 try:
     import resource
 except ImportError:  # pragma: no cover - unavailable on Windows
@@ -144,6 +145,7 @@ from satisfaction_metrics import (
     save_overlay_and_print_satisfaction,
 )
 from visualization import overlay_patches_on_slices
+import constraint_baking
 from transforms import SpiralAndTransform
 from theta_crossing_map import ThetaCrossingMap
 from winding_supervision import (
@@ -1210,6 +1212,26 @@ class FitContext:
 
         self._lasagna_store = None
         self._scalar_stores = []
+
+        # Constraint-bake reset state ("plan B",
+        # plans/reset_plan_b_constraint_baking.md). frozen_epochs holds one
+        # CPU snapshot per completed reset, earliest (nearest true scroll
+        # space) first; _baked_epoch_count says how many of them the resident
+        # host inputs have already been baked through, so a checkpoint-resume
+        # replay and a model-stage rebuild never double-bake. The baked shell
+        # cloud and the pristine-input stash support post-bake shell rebuilds
+        # and the final scroll-space export respectively.
+        self.frozen_epochs = []
+        self._baked_epoch_count = 0
+        self._baked_shell_valid_zyxs = None
+        self._pristine_inputs_stashed = False
+        # Accumulated median stretch of the frozen stack (product of each
+        # epoch's probe_stretch_factor): the blunt global re-expression of
+        # thresholds tuned in pre-bake units into current baked units.
+        self._baked_unit_scale = 1.0
+        # Completed-iteration count of the most recent reset, driving the
+        # post-reset LR warm-up (None until the first bake).
+        self._bake_lr_warmup_start = None
     # The optimisation z window lives in the fit configuration (its catalog
     # metadata records the full effect list); these properties are the one
     # reading point for the many z-window consumers below.
@@ -2186,16 +2208,50 @@ class FitContext:
                       f'{self.dense_spacing_mode!r}; this component runs only as '
                       "part of the 'phase' bundle and is INACTIVE.")
 
-    def _subsample_shell_radius_pool(self, patch):
+    @staticmethod
+    def _zero_umbilicus_z_to_yx(zs):
+        # In the canonical (post-bake) frame the umbilicus is the z-axis.
+        return np.zeros((np.shape(np.asarray(zs))[0], 2), dtype=np.float32)
+
+    def _current_shell_frame(self):
+        """The shell cloud and umbilicus function of the current input frame.
+
+        Before any constraint bake these are the pristine shell patch and the
+        annotated umbilicus; after a bake the shell cloud has been rewritten
+        into baked space and the polar frame is origin-centred, so rebuilding
+        any shell structure from the pristine pair would silently mix spaces.
+        """
+        if self._baked_shell_valid_zyxs is not None:
+            return (types.SimpleNamespace(
+                valid_zyxs=self._baked_shell_valid_zyxs),
+                self._zero_umbilicus_z_to_yx)
+        return self.shell_patch, self.umbilicus
+
+    def _make_shell_polar_map(self):
+        shell_source, umbilicus_fn = self._current_shell_frame()
+        return ShellPolarMap(
+            shell_source,
+            umbilicus_fn,
+            z_min=self.z_begin - self.config['model_flow_bounds_z_margin'],
+            z_max=self.z_end + self.config['model_flow_bounds_z_margin'],
+            num_theta_bins=self.config['shell_num_theta_bins'],
+            device=self.device,
+            config=self.config,
+        )
+
+    def _subsample_shell_radius_pool(self):
         # The shell-patch radius loss draws sample_count_shell_samples random
         # shell points per step; keep a pool of exactly that size resident on
         # the GPU instead of the full shell cloud. A dedicated generator makes
         # the pool deterministic (identical across DDP ranks) without
-        # perturbing the training RNG streams.
+        # perturbing the training RNG streams. Drawn from the current input
+        # frame (pristine, or baked after a reset): the fixed seed picks the
+        # same rows either way, so re-subsampling stays coherent with bakes.
         pool_generator = torch.Generator()
         pool_generator.manual_seed(int(self.config['optimizer_random_seed']))
+        shell_source, _ = self._current_shell_frame()
         return subsample_rows(
-            patch.valid_zyxs, int(self.config['sample_count_shell_samples']), pool_generator,
+            shell_source.valid_zyxs, int(self.config['sample_count_shell_samples']), pool_generator,
         ).to(device=self.device, dtype=torch.float32)
 
     def _infer_outer_winding_idx_for_this_run(self):
@@ -2703,19 +2759,11 @@ class FitContext:
         shell_active = self.shell_patch is not None and self.shell_losses_enabled()
         if shell_active:
             if self.config['loss_weight_shell_patch_radius'] > 0:
-                self.shell_valid_zyxs_gpu = self._subsample_shell_radius_pool(self.shell_patch)
+                self.shell_valid_zyxs_gpu = self._subsample_shell_radius_pool()
         if (self.shell_patch is not None
                 and (self.config['loss_weight_shell_outer'] > 0
                      or self.winding_model_mode)):
-            self.shell_map = ShellPolarMap(
-                self.shell_patch,
-                self.umbilicus,
-                z_min=self.z_begin - self.config['model_flow_bounds_z_margin'],
-                z_max=self.z_end + self.config['model_flow_bounds_z_margin'],
-                num_theta_bins=self.config['shell_num_theta_bins'],
-                device=self.device,
-                config=self.config,
-            )
+            self.shell_map = self._make_shell_polar_map()
 
         # Dense losses sample out to this index even when shell losses are off.
         self.shell_outer_winding_idx, outer_winding_notes = resolve_outer_winding_idx_and_notes(
@@ -2874,6 +2922,32 @@ class FitContext:
         if interactive_driver is None:
             self.trusted_geometry_tree = None
 
+        # Fail fast at build time when resets are requested but the enabled
+        # inputs make every bake unbakeable — rather than thousands of steps
+        # later at the first reset boundary (which stays the authoritative
+        # gate, since influence windows only exist at run time).
+        if int(self.config.get('optimizer_reset_interval', 0) or 0) > 0:
+            reasons = constraint_baking.bake_refusal_reasons(
+                interactive=self.interactive_driver is not None,
+                influence_active=False,
+                phase_mode=self.phase_mode,
+            )
+            if reasons:
+                raise RuntimeError(
+                    'optimizer_reset_interval > 0 but constraint bakes would '
+                    'be refused: ' + '; '.join(reasons))
+            if self.dist.is_main_process and (
+                    self.dense_normals_enabled
+                    or self.grad_mag_spacing_enabled):
+                print('note: dense lasagna losses (normals/grad-mag) run '
+                      'only until the first constraint-bake reset, then are '
+                      'disabled (their stores describe true scroll space)')
+
+        # A resumed baked checkpoint's host inputs loaded from disk in scroll
+        # space; replay the frozen bake stack over them before anything below
+        # captures coordinates (the theta topology and every later cache).
+        self._replay_frozen_epochs()
+
         self.slice_to_spiral_transform = self.spiral_and_transform.get_slice_to_spiral_transform()
         self.dr_per_winding = self.spiral_and_transform.get_dr_per_winding()
         self._build_theta_crossing_map()
@@ -2963,6 +3037,391 @@ class FitContext:
         self._build_model_state()
 
     # ==========================================================================
+    # Constraint-bake resets (plan B)
+    # ==========================================================================
+
+    # Every holder of scroll-space constraint coordinates a bake rewrites,
+    # written out in _MODEL_STAGE_ATTRIBUTES' style so a missed holder is a
+    # visible omission rather than a silent space mix (losses would just get
+    # quietly wrong). _bake_all_inputs applies these in this order.
+    _BAKED_INPUT_HOLDERS = (
+        'verified patch grids (Patch.zyxs, CPU) + rebuilt resident atlas',
+        'unverified patch grids (Patch.zyxs, CPU) + rebuilt resident atlas',
+        'unattached_pcl_strips zyxs (+ dropped flat GPU bundle)',
+        'cross_patch_pcls point zyx (points_by_patch aliases the same dicts)',
+        'prepared_main_tracks flat_zyx_cpu (+ cleared resampled_cache)',
+        'shell cloud (_baked_shell_valid_zyxs) + shell_valid_zyxs_gpu pool',
+        'winding_inference crossing points',
+        'umbilicus_zyx -> z-axis (handled by _apply_canonical_space_state)',
+    )
+
+    def _stash_pristine_inputs(self):
+        """Keep scroll-space originals on CPU before the first bake.
+
+        Visualisation, satisfaction thresholds and the tifxyz export are
+        defined in true scroll voxels, so the final outputs restore these
+        originals and evaluate them under the composed frozen+live transform
+        (_restore_scroll_space_inputs_for_export). Patch geometry is the
+        GB-scale item; the copies live in host RAM only.
+        """
+        if self._pristine_inputs_stashed:
+            return
+        for patch in (*self.verified_patches_list,
+                      *self.unverified_patches_list):
+            patch._pristine_zyxs = patch.zyxs.clone()
+        for strip in self.unattached_pcl_strips:
+            strip['_pristine_zyxs'] = np.array(strip['zyxs'], copy=True)
+        for point in self._cross_patch_points():
+            point['_pristine_zyx'] = np.array(point['zyx'], copy=True)
+        if self.prepared_main_tracks is not None:
+            self._pristine_track_flat = \
+                self.prepared_main_tracks['flat_zyx_cpu'].clone()
+        self._pristine_umbilicus_zyx = self.umbilicus_zyx.clone()
+        self._pristine_inputs_stashed = True
+
+    def _cross_patch_points(self):
+        """Unique point dicts across cross-patch pcls (components share them)."""
+        seen = set()
+        points = []
+        for pcl in self.cross_patch_pcls:
+            for point in pcl['points'].values():
+                if id(point) not in seen:
+                    seen.add(id(point))
+                    points.append(point)
+        return points
+
+    def _rebuild_patch_atlas_geometry(self, atlas):
+        """Re-copy an atlas's resident geometry from its (rewritten) patches."""
+        if atlas is None:
+            return
+        materialized = atlas.zyxs_flat is not None
+        atlas.zyxs_flat = None
+        atlas._geometry_chunks = []
+        if materialized:
+            atlas.materialize(self.device)
+        # Satisfaction atlases capture per-vertex z values; stale after any
+        # coordinate rewrite.
+        atlas._satisfaction_atlases.clear()
+
+    def _bake_all_inputs(self, slice_to_spiral_transform):
+        """Rewrite every constraint holder through one frozen inverse.
+
+        Chunked, no_grad, RNG-free and identically ordered on every DDP rank
+        (see constraint_baking.bake_points). The 3-D flow can drift z; a
+        point baked out of the flow lattice's z domain samples the border of
+        the field afterwards. Points near the domain edge (the z-margin band
+        beyond the fit window, where patch vertices and the shell cloud
+        legitimately live) crossing it by a few voxels is benign — they were
+        border-region points already — so those are only counted and
+        reported. What is refused is a point from inside the fit window
+        itself leaving the domain: that means the frozen flow displaced it
+        past the whole z margin, which no healthy fit does.
+        """
+        flow_z_min = float(self.flow_min_corner_spiral_zyx[0])
+        flow_z_max = float(self.flow_max_corner_spiral_zyx[0])
+        margin_crossings = [0]
+        window_escapes = [0]
+
+        def bake(points):
+            source = torch.as_tensor(points)
+            baked = constraint_baking.bake_points(
+                slice_to_spiral_transform, source, device=self.device)
+            source_z = source.reshape(-1, 3)[:, 0].to(torch.float32)
+            baked_z = baked.reshape(-1, 3)[:, 0].to(torch.float32)
+            if baked_z.numel():
+                now_outside = (baked_z < flow_z_min) | (baked_z > flow_z_max)
+                was_in_domain = (
+                    (source_z >= flow_z_min) & (source_z <= flow_z_max))
+                was_in_window = (
+                    (source_z >= float(self.z_begin))
+                    & (source_z < float(self.z_end)))
+                margin_crossings[0] += int(
+                    (was_in_domain & ~was_in_window & now_outside).sum())
+                window_escapes[0] += int((was_in_window & now_outside).sum())
+            return baked
+
+        def bake_np(array):
+            return bake(torch.from_numpy(
+                np.ascontiguousarray(array, dtype=np.float32))).numpy()
+
+        for patch in (*self.verified_patches_list,
+                      *self.unverified_patches_list):
+            valid = patch.valid_vertex_mask
+            patch.zyxs[valid] = bake(
+                patch.zyxs[valid].to(torch.float32)).to(patch.zyxs.dtype)
+            patch.release_derived_caches()
+        self._rebuild_patch_atlas_geometry(self.patch_atlas)
+        self._rebuild_patch_atlas_geometry(self.unverified_patch_atlas)
+
+        for strip in self.unattached_pcl_strips:
+            strip['zyxs'] = bake_np(strip['zyxs'])
+        # The flat GPU bundle is derived from the strip arrays; drop it so the
+        # next consumer rebuilds it from the baked strips.
+        self.unattached_pcl_strips.flat = None
+
+        points = self._cross_patch_points()
+        if points:
+            baked = bake_np(np.stack([point['zyx'] for point in points]))
+            for point, row in zip(points, baked):
+                point['zyx'] = row
+
+        if self.prepared_main_tracks is not None:
+            flat = self.prepared_main_tracks['flat_zyx_cpu']
+            # In place, so preview_extent_tracks' alias stays coherent.
+            flat.copy_(bake(flat))
+            self.prepared_main_tracks['resampled_cache'].clear()
+
+        if self.shell_patch is not None:
+            if self._baked_shell_valid_zyxs is None:
+                self._baked_shell_valid_zyxs = \
+                    self.shell_patch.valid_zyxs.to(torch.float32).clone()
+            self._baked_shell_valid_zyxs = bake(self._baked_shell_valid_zyxs)
+        if self.shell_valid_zyxs_gpu is not None:
+            self.shell_valid_zyxs_gpu.copy_(bake(self.shell_valid_zyxs_gpu))
+
+        if self.winding_inference is not None:
+            self.winding_inference.bake_crossing_points_(bake)
+
+        if margin_crossings[0] and self.dist.is_main_process:
+            print(f'bake: {margin_crossings[0]} margin-band point(s) crossed '
+                  f'the flow z domain edge [{flow_z_min:.1f}, '
+                  f'{flow_z_max:.1f}] (benign: they were border-region '
+                  'points already)')
+        if window_escapes[0]:
+            raise RuntimeError(
+                f'{window_escapes[0]} baked constraint point(s) from inside '
+                f'the fit window [{self.z_begin}, {self.z_end}) drifted out '
+                f'of the flow lattice z domain [{flow_z_min:.1f}, '
+                f'{flow_z_max:.1f}]; the frozen flow displaced them past the '
+                'whole z margin, so this fit cannot be reset safely')
+
+    def _apply_canonical_space_state(self):
+        """Session-side frame change after the inputs are baked.
+
+        The baked inputs are z-axis-centred and sense-normalised, so the
+        umbilicus table collapses onto the axis (in place — the umbilicus
+        loss then measures the live transform's own drift only), the model's
+        umbilicus stage becomes the identity with no sense flip, and every
+        shell structure is rebuilt in the baked, origin-centred polar frame.
+        """
+        with torch.no_grad():
+            self.umbilicus_zyx[:, 1:] = 0
+        constraint_baking.set_canonical_frame_(self.spiral_and_transform)
+        if self.shell_map is not None:
+            self.shell_map = self._make_shell_polar_map()
+
+    def _disable_lasagna_losses_for_baked_inputs(self):
+        """End dense lasagna supervision at the first bake.
+
+        The normal/grad-mag stores are volumes describing true scroll space
+        and cannot be baked (the direction channels would need per-voxel
+        Jacobian rotation over on-disk stores), but their losses stay valid
+        for as long as the inputs are still in that space. So they run until
+        the first reset; from the first bake onwards the resident inputs no
+        longer live in the space the stores describe, the losses are
+        structurally disabled, and the resident brick pools are released.
+        """
+        if not (self.dense_normals_enabled or self.grad_mag_spacing_enabled):
+            return
+        self.dense_normals_enabled = False
+        self.grad_mag_spacing_enabled = False
+        volume, self.lasagna_volume = self.lasagna_volume, None
+        self._lasagna_store = None
+        if volume is not None:
+            store = volume.get('store')
+            if store is not None:
+                store.close()
+        if self.dist.is_main_process:
+            print('dense lasagna losses (normals/grad-mag) disabled: their '
+                  'stores describe true scroll space, which the baked inputs '
+                  'have left; released the resident brick pools')
+
+    def bake_and_reset(self, completed_iterations):
+        """Freeze the live transform, bake every input through it, reset.
+
+        Runs identically on every DDP rank at the same completed-iteration
+        boundary (parameters are identical post-allreduce; baking consumes no
+        RNG). Refused whenever an input in play cannot be baked
+        proportionately — the caller should surface the error rather than
+        skip silently. Dense lasagna losses are not a refusal: they run
+        until this first bake and are disabled here.
+        """
+        reasons = constraint_baking.bake_refusal_reasons(
+            interactive=self.interactive_driver is not None,
+            influence_active=(
+                self.influence_state is not None
+                and self.influence_state.active),
+            phase_mode=self.phase_mode,
+        )
+        if reasons:
+            raise RuntimeError(
+                'constraint bake refused: ' + '; '.join(reasons))
+
+        probe = constraint_baking.probe_round_trip_error(
+            self.spiral_and_transform)
+        warn_voxels = float(
+            self.config.get('optimizer_reset_probe_warn_voxels', 1.0))
+        if self.dist.is_main_process:
+            print(
+                f'bake {len(self.frozen_epochs) + 1} at step '
+                f'{completed_iterations}: round-trip probe error '
+                f"max {probe['max']:.4f} / mean {probe['mean']:.4f} voxels "
+                f"over {probe['num_points']} points")
+            if probe['max'] > warn_voxels:
+                print(
+                    f"WARNING: bake round-trip error {probe['max']:.4f} "
+                    f'exceeds {warn_voxels:g} voxels; this inversion error '
+                    'is committed permanently into the constraints and '
+                    'accumulates across bakes')
+
+        self._stash_pristine_inputs()
+        # Snapshot before any frame mutation (it must capture the exact
+        # transform, including the pre-reset umbilicus, the bake below uses),
+        # but append it only after the bake succeeded: a bake failure (e.g.
+        # the z-drift check) must not leave frozen_epochs one epoch ahead of
+        # the inputs and parameters — a later autosave would persist that
+        # half-committed history.
+        snapshot = constraint_baking.snapshot_frozen_epoch(
+            self.spiral_and_transform, self.umbilicus_zyx, self.config,
+            probe_error=probe)
+        epoch_stretch = constraint_baking.probe_stretch_factor(
+            self.spiral_and_transform)
+        self._bake_all_inputs(
+            self.spiral_and_transform.get_slice_to_spiral_transform())
+        self.frozen_epochs.append(snapshot)
+        self._baked_epoch_count = len(self.frozen_epochs)
+        self._baked_unit_scale *= epoch_stretch
+        self._disable_lasagna_losses_for_baked_inputs()
+        self._apply_canonical_space_state()
+
+        constraint_baking.reset_live_transform_(self.spiral_and_transform)
+        # Stale Adam moments on the zeroed parameters would break the exact
+        # pre/post-bake residual match one step after the reset. dr keeps its
+        # value but is frozen: baked radii encode windings at bake-time dr,
+        # and letting it keep training moves the canonical target under
+        # every baked constraint at once.
+        constraint_baking.clear_optimizer_state_(
+            self.optimiser,
+            constraint_baking.reset_parameters(self.spiral_and_transform))
+        constraint_baking.freeze_dr_(self.spiral_and_transform, self.optimiser)
+        # The fresh epoch re-estimates its Adam moments under a short LR
+        # ramp instead of jumping at full late-schedule LR from a cold start.
+        self._bake_lr_warmup_start = int(completed_iterations)
+
+        # Derived caches that captured pre-bake coordinates or the pre-reset
+        # transform.
+        self.dt_target_cache_manager.reset()
+        self.slice_to_spiral_transform = \
+            self.spiral_and_transform.get_slice_to_spiral_transform()
+        self.dr_per_winding = self.spiral_and_transform.get_dr_per_winding()
+        self._build_theta_crossing_map()
+        if self.dist.is_main_process:
+            print(
+                f'bake {len(self.frozen_epochs)} complete: inputs are in '
+                'canonical space, live transform reset (dr = '
+                f'{float(self.dr_per_winding.detach()):.3f} frozen); epoch '
+                f'stretch {epoch_stretch:.4f}, accumulated baked-unit scale '
+                f'{self._baked_unit_scale:.4f}')
+
+    def _replay_frozen_epochs(self):
+        """Deterministically re-bake freshly loaded host inputs on resume.
+
+        Host inputs always load from disk in scroll space, so a resumed
+        baked checkpoint replays its frozen stack over them, one epoch at a
+        time (each epoch's inverse applies to the previous epoch's output —
+        point composition is exact). Epochs already applied to the resident
+        inputs (_baked_epoch_count) are skipped, so a model-stage rebuild
+        that kept the host inputs never double-bakes.
+        """
+        if self.frozen_epochs and self.interactive_driver is not None:
+            # Baking is refused for interactive sessions, and this is the one
+            # other door through which a session could meet frozen epochs:
+            # resuming a baked checkpoint. Interactive machinery (preview
+            # export, input incorporation, influence masking) assumes scroll
+            # space throughout, so refuse here rather than run it wrong.
+            raise RuntimeError(
+                'this checkpoint carries '
+                f'{len(self.frozen_epochs)} constraint-bake epoch(s); '
+                'baked checkpoints can only be resumed by headless fits')
+        pending = self.frozen_epochs[self._baked_epoch_count:]
+        for epoch_index, snapshot in enumerate(
+                pending, start=self._baked_epoch_count + 1):
+            print(f'replaying constraint bake {epoch_index}/'
+                  f'{len(self.frozen_epochs)} over reloaded host inputs')
+            # The pristine stash must capture the inputs while they are still
+            # in scroll space, i.e. strictly before the first bake of this
+            # process; _stash_pristine_inputs is idempotent afterwards.
+            self._stash_pristine_inputs()
+            frozen = constraint_baking.materialize_frozen_model(
+                snapshot, self.config, self.device)
+            self._bake_all_inputs(frozen.get_slice_to_spiral_transform())
+            # Recomputed rather than persisted: the stretch is a pure
+            # function of the frozen transform being replayed.
+            self._baked_unit_scale *= constraint_baking.probe_stretch_factor(
+                frozen)
+            del frozen
+            self._baked_epoch_count = epoch_index
+        if self.frozen_epochs:
+            # The restored live parameters are post-reset values; the frame
+            # they were trained in is the canonical one (dr frozen), and
+            # dense lasagna supervision ended at that fit's first bake.
+            constraint_baking.freeze_dr_(
+                self.spiral_and_transform, self.optimiser)
+            self._disable_lasagna_losses_for_baked_inputs()
+            self._apply_canonical_space_state()
+
+    def composed_slice_to_spiral_transform(self):
+        """True-scroll -> canonical map: frozen epochs then the live chain.
+
+        Materialises every frozen epoch on the device (export-time only; the
+        returned transform keeps them alive through its parts).
+        """
+        live = self.spiral_and_transform.get_slice_to_spiral_transform()
+        if not self.frozen_epochs:
+            return live
+        frozen_models = [
+            constraint_baking.materialize_frozen_model(
+                snapshot, self.config, self.device)
+            for snapshot in self.frozen_epochs
+        ]
+        return constraint_baking.composed_slice_to_spiral_transform(
+            frozen_models, live)
+
+    def _restore_scroll_space_inputs_for_export(self):
+        """Swap pristine scroll-space inputs back for the final outputs.
+
+        One-way, at the end of a headless fit: satisfaction thresholds,
+        preview extents and the tifxyz export are defined in scroll voxels,
+        so they are evaluated against the originals under the composed
+        frozen+live transform rather than in baked space.
+        """
+        if not self.frozen_epochs:
+            return
+        assert self._pristine_inputs_stashed
+        for patch in (*self.verified_patches_list,
+                      *self.unverified_patches_list):
+            patch.zyxs.copy_(patch._pristine_zyxs)
+            patch.release_derived_caches()
+        self._rebuild_patch_atlas_geometry(self.patch_atlas)
+        self._rebuild_patch_atlas_geometry(self.unverified_patch_atlas)
+        for strip in self.unattached_pcl_strips:
+            strip['zyxs'] = strip['_pristine_zyxs']
+        self.unattached_pcl_strips.flat = None
+        for point in self._cross_patch_points():
+            point['zyx'] = point['_pristine_zyx']
+        if (self.prepared_main_tracks is not None
+                and getattr(self, '_pristine_track_flat', None) is not None):
+            self.prepared_main_tracks['flat_zyx_cpu'].copy_(
+                self._pristine_track_flat)
+            self.prepared_main_tracks['resampled_cache'].clear()
+        self.umbilicus_zyx.copy_(self._pristine_umbilicus_zyx)
+        self.slice_to_spiral_transform = \
+            self.composed_slice_to_spiral_transform()
+        print(f'export: restored scroll-space inputs and composed '
+              f'{len(self.frozen_epochs)} frozen epoch(s) with the live '
+              'transform')
+
+    # ==========================================================================
     # Checkpoint save/load
     # ==========================================================================
 
@@ -2995,6 +3454,16 @@ class FitContext:
             'torch_cuda_rng_states': torch.cuda.get_rng_state_all(),
             'input_manifest': dict(getattr(self.interactive_driver, 'input_manifest', {})),
             'preview_first_winding': 10,
+            # One CPU snapshot per completed constraint-bake reset, earliest
+            # first. Host inputs always load from disk in scroll space, so a
+            # resume replays this stack over them (_replay_frozen_epochs);
+            # persisting the snapshots (rather than baked tensors) keeps the
+            # replay exact and the host inputs on their normal load path.
+            'frozen_epochs': list(self.frozen_epochs),
+            # The post-reset LR warm-up window survives a resume: an autosave
+            # lands at the bake boundary itself, so without this the resumed
+            # run would skip the whole ramp the continuous run applied.
+            'bake_lr_warmup_start_iteration': self._bake_lr_warmup_start,
         }
 
     def save_checkpoint(self, path, completed_iterations):
@@ -3250,6 +3719,23 @@ class FitContext:
                             f'checkpoint scheduler tracks {len(saved_base)} '
                             f'parameter groups, this fit has {len(live_base)}')
 
+        # --- constraint-bake history -----------------------------------------
+        # An in-session load cannot change the bake history: the resident host
+        # inputs are already baked through the live stack, and re-baking them
+        # through a different one has no in-place path. The startup/CLI
+        # restore (allow_legacy_schema) is exempt because it replays the
+        # checkpoint's stack over freshly loaded inputs.
+        if not allow_legacy_schema:
+            checkpoint_epochs = len(checkpoint.get('frozen_epochs') or ())
+            live_epochs = len(getattr(self, 'frozen_epochs', ()) or ())
+            if checkpoint_epochs != live_epochs:
+                reasons.append(
+                    f'checkpoint has {checkpoint_epochs} constraint-bake '
+                    f'epoch(s) but this session has {live_epochs}; the '
+                    'resident inputs are baked through the live stack, so '
+                    'rebuild the fit to load a checkpoint with a different '
+                    'bake history')
+
         completed = checkpoint.get('completed_iterations')
         return CheckpointVerdict(
             not reasons, tuple(reasons),
@@ -3273,6 +3759,14 @@ class FitContext:
         embedded = checkpoint.get('completed_iterations')
         completed = int(fallback_iteration if embedded is None else embedded)
         self.start_iteration = completed
+        # The bake history travels with the model parameters: the restored
+        # live parameters are only meaningful over inputs baked through
+        # exactly this stack (inspect_checkpoint enforces count parity for
+        # in-session loads; the startup path replays it over fresh inputs).
+        self.frozen_epochs = list(checkpoint.get('frozen_epochs') or ())
+        warmup_start = checkpoint.get('bake_lr_warmup_start_iteration')
+        self._bake_lr_warmup_start = (
+            None if warmup_start is None else int(warmup_start))
         self.load_checkpoint(checkpoint)
         if checkpoint.get('scheduler') is None:
             for _ in range(completed):
@@ -3980,19 +4474,14 @@ class FitContext:
             # settings themselves require a full prepared-input rebuild.
             if 'loss_weight_shell_outer' in changed:
                 rebuilt_shell_map = (
-                    ShellPolarMap(
-                        self.shell_patch, self.umbilicus,
-                        z_min=self.z_begin - self.config['model_flow_bounds_z_margin'],
-                        z_max=self.z_end + self.config['model_flow_bounds_z_margin'],
-                        num_theta_bins=self.config['shell_num_theta_bins'],
-                        device=self.device, config=self.config)
+                    self._make_shell_polar_map()
                     if (self.shell_patch is not None
                         and (self.config['loss_weight_shell_outer'] > 0
                              or self.winding_model_mode)) else None
                 )
             if 'loss_weight_shell_patch_radius' in changed:
                 rebuilt_shell_valid = (
-                    self._subsample_shell_radius_pool(self.shell_patch)
+                    self._subsample_shell_radius_pool()
                     if (self.shell_patch is not None
                         and self.config['loss_weight_shell_patch_radius'] > 0)
                     else None
@@ -4087,6 +4576,8 @@ class FitContext:
         log_metrics = {
             'flow_field_high_res_lr_scale': flow_field_high_res_lr_scale,
         }
+        if self.frozen_epochs:
+            log_metrics['baked_unit_scale'] = self._baked_unit_scale
 
         def backward_family(weighted_losses):
             """Accumulate one loss family's gradients, then release its graph."""
@@ -4135,12 +4626,12 @@ class FitContext:
             if compute_patch_dt and self.config['loss_weight_patch_dt'] > 0 and self.verified_patches_list:
                 patch_dt_target_cache = self.dt_target_cache_manager.get('patch', iteration, lambda: compute_patch_dt_target_cache(
                     self.slice_to_spiral_transform, self.dr_per_winding,
-                    self.verified_patches_list, self.patch_atlas, self.config['dt_target_floating_threshold'],
+                    self.verified_patches_list, self.patch_atlas, self.config['dt_target_floating_threshold'] * self._baked_unit_scale,
                 ))
             if compute_unverified_patch_dt and self.config['loss_weight_unverified_patch_dt'] > 0 and self.unverified_patch_atlas is not None:
                 unverified_patch_dt_target_cache = self.dt_target_cache_manager.get('unverified_patch', iteration, lambda: compute_patch_dt_target_cache(
                     self.slice_to_spiral_transform, self.dr_per_winding,
-                    self.unverified_patches_list, self.unverified_patch_atlas, self.config['dt_target_floating_threshold'],
+                    self.unverified_patches_list, self.unverified_patch_atlas, self.config['dt_target_floating_threshold'] * self._baked_unit_scale,
                 ))
             if compute_patch_dt and self.config['loss_weight_unattached_pcl_dt'] > 0 and self.unattached_pcl_strips:
                 pcl_flat = get_or_build_unattached_pcl_flat(self.unattached_pcl_strips, torch.device('cuda'))
@@ -4149,7 +4640,7 @@ class FitContext:
                         self.slice_to_spiral_transform, self.dr_per_winding,
                         pcl_flat['zyxs'], pcl_flat['starts'],
                         windings=pcl_flat['windings'],
-                        floating_threshold=self.config['dt_target_floating_threshold'],
+                        floating_threshold=self.config['dt_target_floating_threshold'] * self._baked_unit_scale,
                         num_points_per_strip=self.config['sample_count_dt_target_points_per_strip'],
                         max_stride=self.config['dt_target_max_stride'],
                         max_total_points=20_000_000,
@@ -4159,7 +4650,7 @@ class FitContext:
                     self.slice_to_spiral_transform, self.dr_per_winding,
                     self.prepared_main_tracks['flat_zyx_cpu'], self.prepared_main_tracks['offsets'],
                     windings=None,
-                    floating_threshold=self.config['dt_target_floating_threshold'],
+                    floating_threshold=self.config['dt_target_floating_threshold'] * self._baked_unit_scale,
                     num_points_per_strip=self.config['sample_count_dt_target_points_per_strip'],
                     max_stride=self.config['dt_target_max_stride'],
                     max_total_points=20_000_000,
@@ -4507,7 +4998,22 @@ class FitContext:
         # complete an optimizer update.
         self.theta_crossing_map.assert_no_pending_potential_errors()
         self.step_timer.start('opt')
+        # Post-reset LR warm-up: scale the effective LR for this step only,
+        # then restore, so the scheduler's own trajectory is untouched.
+        bake_warmup_factor = constraint_baking.lr_warmup_factor(
+            iteration, self._bake_lr_warmup_start,
+            int(self.config.get('optimizer_reset_lr_warmup_steps', 0) or 0))
+        if bake_warmup_factor < 1.0:
+            log_metrics['bake_lr_warmup_factor'] = bake_warmup_factor
+            saved_group_lrs = [
+                group['lr'] for group in self.optimiser.param_groups]
+            for group in self.optimiser.param_groups:
+                group['lr'] = group['lr'] * bake_warmup_factor
         self.optimiser.step()
+        if bake_warmup_factor < 1.0:
+            for group, saved_lr in zip(
+                    self.optimiser.param_groups, saved_group_lrs):
+                group['lr'] = saved_lr
         self.step_timer.stop('opt')
         if self.influence_state is not None and self.influence_state.active:
             self.influence_state.apply_masked_gap_decay_(self.spiral_and_transform, self.optimiser)
@@ -4620,12 +5126,26 @@ class FitContext:
             'optimizing', 'Optimizing',
             step=0, total_steps=max(0, self.num_training_steps - self.start_iteration),
             unit='iterations')
+        reset_interval = int(
+            self.config.get('optimizer_reset_interval', 0) or 0)
         for iteration in tqdm(
                 range(self.start_iteration, self.num_training_steps),
                 disable=not self.dist.is_main_process or has_progress):
             loss, losses, log_metrics, shell_metrics = self.step(iteration)
             progress.update(iteration - self.start_iteration + 1)
             self.log_step_metrics(iteration, loss, losses, log_metrics, shell_metrics)
+            # Bake before the autosave so any checkpoint at this boundary
+            # already carries the reset it belongs with; a resume then never
+            # re-runs (or misses) the bake for its completed-step count.
+            # The final scheduled reset is skipped (a bake fires only when a
+            # full further interval fits before the horizon): each reset
+            # restarts the live parameters into the decaying tail of the LR
+            # schedule, so the last epoch gets at least two intervals to
+            # converge instead of ending on a barely-trained restart.
+            if (reset_interval > 0
+                    and (iteration + 1) % reset_interval == 0
+                    and iteration + 1 + reset_interval < self.num_training_steps):
+                self.bake_and_reset(iteration + 1)
             self._maybe_save_headless_checkpoint(iteration + 1)
 
         # ==========================================================================
@@ -4638,6 +5158,11 @@ class FitContext:
                 'saving_checkpoint', 'Saving final checkpoint',
                 detail=f'checkpoint_{suffix}.ckpt')
             self._save_model(suffix, self.num_training_steps)
+            # After any bake the resident inputs live in canonical space;
+            # the final metrics/exports are defined over true scroll voxels,
+            # so restore the pristine inputs and evaluate them under the
+            # composed frozen+live transform.
+            self._restore_scroll_space_inputs_for_export()
             if self.config.get('output_save_png_visualizations', False):
                 progress.begin(
                     'finalizing', 'Preparing final visualizations')

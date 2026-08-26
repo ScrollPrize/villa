@@ -148,6 +148,12 @@ class WindingInferenceStore:
             (self.length >= 2) & self._z_eligible,
             as_tuple=False).squeeze(-1)
         self._relative_rays = {}
+        # Materialised (and possibly baked) crossing coordinates. While None,
+        # _materialize reconstructs points from the straight-ray
+        # parametrisation (origin + t*step); once a constraint bake rewrites
+        # the coordinates the ray form no longer holds and this dense
+        # [num_crossings, 3] table is the source of truth instead.
+        self.crossing_zyx = None
         self.manifest = manifest
         self.fingerprint = {
             "artifact_type": ARTIFACT_TYPE,
@@ -209,6 +215,30 @@ class WindingInferenceStore:
         ) * (length - separation).to(torch.float32)).to(torch.int64)
         return self._materialize(ray, start, start + separation)
 
+    def materialized_crossing_zyx(self):
+        """All crossing points as one dense [num_crossings, 3] table."""
+        if self.crossing_zyx is None:
+            ray_idx = torch.repeat_interleave(
+                torch.arange(len(self.length), device=self.device),
+                self.length)
+            self.crossing_zyx = (
+                self.origin[ray_idx]
+                + self.crossing_t[:, None] * self.step[ray_idx])
+        return self.crossing_zyx
+
+    def bake_crossing_points_(self, bake_points):
+        """Rewrite every crossing coordinate through ``bake_points``.
+
+        Winding-difference targets are dimensionless and bake-invariant, so
+        only the coordinates move. The z-eligibility pruning
+        (``_z_eligible`` / ``density_rays`` / ``_relative_rays``) is
+        index-based and was computed from the original scroll-space rays
+        (where z is linear in t) — it is deliberately kept as-is; the loss's
+        z-slab validity mask then filters on baked z, the same metric drift
+        as every other scroll-voxel threshold under baking.
+        """
+        self.crossing_zyx = bake_points(self.materialized_crossing_zyx())
+
     def _empty_samples(self):
         return {
             "points": self.origin.new_empty((0, 2, 3)),
@@ -219,8 +249,13 @@ class WindingInferenceStore:
         first_flat = self.offset[ray] + first
         second_flat = self.offset[ray] + second
         flat = torch.stack([first_flat, second_flat], dim=-1)
-        t = self.crossing_t[flat]
-        points = self.origin[ray, None, :] + t[..., None] * self.step[ray, None, :]
+        if self.crossing_zyx is not None:
+            # Baked coordinates: the straight-ray form no longer holds, so
+            # gather from the materialised table instead of reconstructing.
+            points = self.crossing_zyx[flat]
+        else:
+            t = self.crossing_t[flat]
+            points = self.origin[ray, None, :] + t[..., None] * self.step[ray, None, :]
         levels = self.crossing_level[flat]
         return {
             "points": points,
