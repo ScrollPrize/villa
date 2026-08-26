@@ -262,7 +262,7 @@ class Config:
         # The optimisation z window (see _Z_RANGE_DESCRIPTIONS for the full
         # effect list). Defaults match the historical fit_spiral module
         # globals for the production PHercParis4 dataset.
-        self.z_begin = 4000
+        self.z_begin = 8500
         self.z_end = 17000
         self.optimizer_random_seed = 1
         self.optimizer_distributed_split_batch = True
