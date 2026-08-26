@@ -115,12 +115,17 @@ def save_tifxyz(pts, out_winding_dir, uuid, step_size, voxel_um, source):
         & valid_vertex[:-1, 1:] & valid_vertex[1:, 1:]
     )
     area_vx2 = int(vq.sum()) * step_size ** 2
-    # bbox over all cells incl. -1 sentinel, in [z,y,x]-low/high order (matches save_tifxyz)
-    lo = pts.min(axis=(0, 1))[::-1].tolist()
-    hi = pts.max(axis=(0, 1))[::-1].tolist()
+    # bbox over valid vertices only, in [x,y,z]-low/high order
+    # (matches spiral-fitting/tifxyz.py:save_tifxyz)
+    valid_pts = pts[valid_vertex]
+    bbox = (
+        [valid_pts.min(axis=0).tolist(), valid_pts.max(axis=0).tolist()]
+        if valid_vertex.any()
+        else [[-1.0, -1.0, -1.0], [-1.0, -1.0, -1.0]]
+    )
     meta = {
         "scale": [1.0 / step_size, 1.0 / step_size],
-        "bbox": [lo, hi],
+        "bbox": bbox,
         "area_vx2": area_vx2,
         "area_cm2": area_vx2 * voxel_um ** 2 / 1.0e8 if voxel_um else None,
         "format": "tifxyz",
