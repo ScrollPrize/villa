@@ -124,12 +124,42 @@ private slots:
         QCOMPARE(result.action, StaleVerdict::Action::ClearLayout);
     }
 
-    void differentVoxelCountsClear()
+    // A different grid is usually the user LOOKING at another volume (the
+    // annotation frame follows the current volume), which reverts when they
+    // switch back - so it marks stale like every other derived dependency
+    // instead of destroying a layout that becomes correct again on return.
+    void differentVoxelCountsMarkStaleAndRevert()
     {
         auto current = baseline();
         current.frame = otherGrid();
         const auto result = verdict(baseline(), current);
-        QCOMPARE(result.action, StaleVerdict::Action::ClearLayout);
+        QCOMPARE(result.action, StaleVerdict::Action::MarkStale);
+        QCOMPARE(result.cause, StaleVerdict::Cause::Grid);
+        // ...and switching back reads as current again with no rebuild.
+        current.frame = baseline().frame;
+        QCOMPARE(verdict(baseline(), current).action, StaleVerdict::Action::Fresh);
+    }
+
+    // The causes drive the auto-update decision: a rebuild genuinely fixes
+    // fiber and umbilicus staleness, and only those.
+    void causesSeparateAutoUpdatableStaleness()
+    {
+        auto fibers = baseline();
+        fibers.fiberGeneration += 1;
+        QCOMPARE(verdict(baseline(), fibers).cause, StaleVerdict::Cause::Fibers);
+
+        auto umbilicus = baseline();
+        umbilicus.umbilicusFingerprint = QStringLiteral("umb|2|2");
+        QCOMPARE(verdict(baseline(), umbilicus).cause,
+                 StaleVerdict::Cause::Umbilicus);
+
+        auto voxel = baseline();
+        voxel.frame = frameAt(9.362);
+        QCOMPARE(verdict(baseline(), voxel).cause, StaleVerdict::Cause::VoxelSize);
+
+        const auto deps = baseline();
+        QCOMPARE(verdict(deps, deps, true, /*latched=*/true).cause,
+                 StaleVerdict::Cause::Latched);
     }
 
     // Same voxels, 2.5% different micrometre label. Not meaningless -- the counts
@@ -198,14 +228,25 @@ private slots:
         QCOMPARE(verdict(baseline(), current).action, StaleVerdict::Action::MarkStale);
     }
 
-    // A clear outranks an existing stale mark: the geometry is not merely out of
-    // date, it is about another grid.
+    // A clear outranks an existing stale mark: a different package has
+    // different fibers entirely.
     void clearingOutranksAnExistingStaleMark()
+    {
+        auto current = baseline();
+        current.packageGeneration += 1;
+        const auto result = verdict(baseline(), current, true, /*latched=*/true);
+        QCOMPARE(result.action, StaleVerdict::Action::ClearLayout);
+    }
+
+    // A grid mismatch still outranks the latch for display: the frame reason
+    // shows while it holds, and the latch resurfaces when it reverts.
+    void gridMismatchDisplaysOverALatch()
     {
         auto current = baseline();
         current.frame = otherGrid();
         const auto result = verdict(baseline(), current, true, /*latched=*/true);
-        QCOMPARE(result.action, StaleVerdict::Action::ClearLayout);
+        QCOMPARE(result.action, StaleVerdict::Action::MarkStale);
+        QCOMPARE(result.cause, StaleVerdict::Cause::Grid);
     }
 };
 

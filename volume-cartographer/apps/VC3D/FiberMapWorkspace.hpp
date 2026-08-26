@@ -143,6 +143,12 @@ private:
     // map is current (restoring the resting status if a derived stale reason
     // just reverted).
     bool applyStaleVerdict(const StaleVerdict& verdict);
+    // Update is cheap (memoized), so staleness a rebuild genuinely fixes -
+    // changed fibers or a changed umbilicus - triggers one automatically:
+    // queued and debounced, only while the workspace is visible, never
+    // re-entrantly. Frame/voxel-size/latched staleness never auto-rebuilds
+    // (commonly a transiently displayed volume; see FiberMapStaleness.hpp).
+    void scheduleAutoUpdate();
     // The two together, for callers that can absorb a scene rebuild inline.
     bool refreshStaleState();
     // Appends the package's umbilicus state to a status line, resolving it at
@@ -218,6 +224,8 @@ private:
     std::vector<uint64_t> _networkEmphasized;
     bool _syncingSelection = false;
     bool _viewFitted = false;
+    bool _autoUpdateScheduled = false;
+    bool _rebuildInProgress = false;
     bool _fiberDockSized = false;
     bool _retheming = false;
     // What the current layout was built from, and whether a change has been seen

@@ -13789,6 +13789,31 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
                         fiber.fileName);
                     return;
                 }
+                // Not a no-op: name the first differing field, so a session
+                // that SHOULD have been a no-op (opened and closed untouched)
+                // but keeps re-saving is diagnosable from the log.
+                std::string differing = "<structure>";
+                for (const auto& [key, value] : before.items()) {
+                    if (!after.contains(key)) {
+                        differing = key + " (removed)";
+                        break;
+                    }
+                    if (after.at(key) != value) {
+                        differing = key;
+                        break;
+                    }
+                }
+                if (differing == "<structure>") {
+                    for (const auto& [key, value] : after.items()) {
+                        if (!before.contains(key)) {
+                            differing = key + " (added)";
+                            break;
+                        }
+                    }
+                }
+                Logger()->info(
+                    "line annotation: session for {} differs at '{}'; saving",
+                    fiber.fileName, differing);
             }
         }
         session.fiberId = fiber.id;

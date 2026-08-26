@@ -27,6 +27,7 @@
 #include <QPalette>
 #include <QPen>
 #include <QPushButton>
+#include <QScopeGuard>
 #include <QScrollBar>
 #include <QStyleOptionGraphicsItem>
 #include <QTimer>
@@ -781,6 +782,10 @@ bool FiberMapWorkspace::applyStaleVerdict(const StaleVerdict& verdict)
         // unchanged higher-priority reason must still refresh what that suffix
         // names. showStale() is idempotent when nothing moved.
         showStale(verdict.reason);
+        if (verdict.cause == StaleVerdict::Cause::Fibers ||
+            verdict.cause == StaleVerdict::Cause::Umbilicus) {
+            scheduleAutoUpdate();
+        }
         return true;
     case StaleVerdict::Action::Fresh:
         // Derived staleness whose cause reverted — a setting moved back, one
@@ -801,6 +806,31 @@ bool FiberMapWorkspace::applyStaleVerdict(const StaleVerdict& verdict)
 bool FiberMapWorkspace::refreshStaleState()
 {
     return applyStaleVerdict(evaluateDependencies());
+}
+
+void FiberMapWorkspace::scheduleAutoUpdate()
+{
+    // Queued rather than inline: the gates run inside click and selection
+    // handlers whose scene items a rebuild would delete, and rebuildLayout
+    // itself ends in a stale refresh that must not recurse into another
+    // rebuild. The verdict is re-evaluated when the shot fires - anything can
+    // change in between, including the staleness resolving itself.
+    if (_autoUpdateScheduled || _rebuildInProgress || !isVisible()) {
+        return;
+    }
+    _autoUpdateScheduled = true;
+    QTimer::singleShot(150, this, [this]() {
+        _autoUpdateScheduled = false;
+        if (_rebuildInProgress || !isVisible() || !_layoutBuilt) {
+            return;
+        }
+        const StaleVerdict verdict = evaluateDependencies();
+        if (verdict.action == StaleVerdict::Action::MarkStale &&
+            (verdict.cause == StaleVerdict::Cause::Fibers ||
+             verdict.cause == StaleVerdict::Cause::Umbilicus)) {
+            rebuildLayout(false);
+        }
+    });
 }
 
 
@@ -832,9 +862,11 @@ void FiberMapWorkspace::showEvent(QShowEvent* event)
 
 void FiberMapWorkspace::rebuildLayout(bool fullRebuild)
 {
-    if (!_controller) {
+    if (!_controller || _rebuildInProgress) {
         return;
     }
+    _rebuildInProgress = true;
+    const auto rebuildGuard = qScopeGuard([this]() { _rebuildInProgress = false; });
     QElapsedTimer phaseTimer;
     phaseTimer.start();
     QElapsedTimer totalTimer;

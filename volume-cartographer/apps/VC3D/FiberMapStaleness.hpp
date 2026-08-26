@@ -35,7 +35,23 @@ struct StaleVerdict {
         MarkStale,
         ClearLayout,
     };
+    // WHY, separately from the wording: the holder decides per cause whether
+    // an automatic rebuild is appropriate. Fibers and Umbilicus are the two
+    // causes a rebuild genuinely fixes; Grid and VoxelSize commonly mean the
+    // user is merely looking at a different volume right now, and rebuilding
+    // into that transient frame would replace the map with one for a grid
+    // the fibers are not annotated in.
+    enum class Cause {
+        None,
+        Package,
+        Grid,
+        VoxelSize,
+        Latched,
+        Fibers,
+        Umbilicus,
+    };
     Action action = Action::Fresh;
+    Cause cause = Cause::None;
     // Names what actually changed, for the status line.
     QString reason;
 };
@@ -44,9 +60,15 @@ struct StaleVerdict {
 //
 // Three outcomes rather than two, because the changes are not equally severe:
 //
-//  - A different package, or a different *grid*, leaves the layout meaningless:
-//    geometry unrolled over one set of voxels says nothing about another set.
-//    Clearing is right.
+//  - A different package leaves the layout meaningless: different fibers
+//    entirely. Clearing is right.
+//  - A different *grid* means the map is showing geometry for another set of
+//    voxels - but the cause is usually the user LOOKING at a different
+//    volume (the annotation frame follows the current volume), and that
+//    reverts when they switch back. So it marks stale like every other
+//    derived dependency rather than destroying a layout that becomes
+//    correct again the moment the volume returns; the gates refuse
+//    interaction while it differs, which is all clearing bought.
 //  - Changed fibers, a changed umbilicus, or a changed voxel size leave it
 //    out of date. The banner says so and the map refuses to act,
 //    but the geometry survives for the rebuild. The voxel size belongs here
@@ -83,13 +105,16 @@ inline StaleVerdict staleVerdictFor(const FiberMapDependencies& built,
     // Before the grid, because two projects can share one.
     if (current.packageGeneration != built.packageGeneration) {
         verdict.action = StaleVerdict::Action::ClearLayout;
+        verdict.cause = StaleVerdict::Cause::Package;
         verdict.reason = QObject::tr("project changed — press Update");
         return verdict;
     }
 
     if (!vc3d::annotation::sameAnnotationGrid(current.frame, built.frame)) {
-        verdict.action = StaleVerdict::Action::ClearLayout;
-        verdict.reason = QObject::tr("coordinate frame changed — press Update");
+        verdict.action = StaleVerdict::Action::MarkStale;
+        verdict.cause = StaleVerdict::Cause::Grid;
+        verdict.reason = QObject::tr(
+            "viewing another volume's grid — switch back, or press Update");
         return verdict;
     }
 
@@ -100,18 +125,21 @@ inline StaleVerdict staleVerdictFor(const FiberMapDependencies& built,
     // was converted through that figure.
     if (!vc3d::annotation::sameAnnotationFrame(current.frame, built.frame)) {
         verdict.action = StaleVerdict::Action::MarkStale;
+        verdict.cause = StaleVerdict::Cause::VoxelSize;
         verdict.reason = QObject::tr("voxel size changed — press Update");
         return verdict;
     }
 
     if (!latchedReason.isEmpty()) {
         verdict.action = StaleVerdict::Action::MarkStale;
+        verdict.cause = StaleVerdict::Cause::Latched;
         verdict.reason = latchedReason;
         return verdict;
     }
 
     if (current.fiberGeneration != built.fiberGeneration) {
         verdict.action = StaleVerdict::Action::MarkStale;
+        verdict.cause = StaleVerdict::Cause::Fibers;
         verdict.reason = QObject::tr("Fibers changed — press Update");
         return verdict;
     }
@@ -121,6 +149,7 @@ inline StaleVerdict staleVerdictFor(const FiberMapDependencies& built,
     if (current.umbilicusGeneration != built.umbilicusGeneration ||
         current.umbilicusFingerprint != built.umbilicusFingerprint) {
         verdict.action = StaleVerdict::Action::MarkStale;
+        verdict.cause = StaleVerdict::Cause::Umbilicus;
         verdict.reason = QObject::tr("Umbilicus changed — press Update");
         return verdict;
     }
