@@ -94,6 +94,7 @@ required_formulae=(
   pkgconf
   qt
   ceres-solver
+  highs
   eigen
   opencv
   cgal

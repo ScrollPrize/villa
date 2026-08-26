@@ -1,14 +1,18 @@
-# Task: parallel constraint scoring and OBJ diagnostics
+# Task: mixed-integer crop-fiber labeling
 
-Accelerate stored crop-trace constraint scoring without changing its numerical
-definition, then write three connector-line OBJ diagnostics:
+Discard measured crop-trace constraints whose normal-modulated winding
+distance is greater than or equal to `1.5`, then solve a HiGHS MILP assigning
+each fiber piece exactly one of five states:
 
-- perpendicular constraints with normalized perpendicular score greater than
-  `0.5` and normal-modulated winding distance greater than `0.3`;
-- parallel constraints with normalized parallel score greater than `0.5` and
-  winding distance less than `0.5` (same winding);
-- parallel constraints with normalized parallel score greater than `0.5` and
-  winding distance greater than or equal to `0.5` (separate winding).
+- H/even;
+- H/odd;
+- V/even;
+- V/odd;
+- broken.
 
-Only measured inter-trace links belong in these views. Hard same-trace
-continuity links have no spatial connector and must be excluded.
+For an active pair, H/V mismatch costs `parallel_score` and H/V agreement
+costs `1 - parallel_score`. Parity agreement costs `winding_distance`, while
+parity mismatch costs `abs(1 - winding_distance)`. A broken piece disables all
+incident pair terms and costs `0.5` times its incident constraint count.
+
+Write the five resulting piece classes as separate OBJ polyline files.

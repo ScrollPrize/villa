@@ -1,66 +1,61 @@
-# Task log: parallel constraint scoring and OBJ diagnostics
+# Task log: mixed-integer crop-fiber labeling
 
-## Baseline
+## Initial decisions
 
-- Baseline commit: `d4db87721` (`Extract constraints from stored crop traces`).
-- The scoring loop already uses deterministic OpenMP slots and averaged about
-  28 effective cores, but its 55,170 independent calls discover and acquire
-  Lasagna channel chunks at fine granularity. The representative run spent
-  11.2827 s in scoring, with 49.27 s user and 271.08 s system CPU time overall.
-- The spatial R-tree phase took only 0.1478 s and is not the target.
+- The user requested five mutually exclusive states but described three binary
+  labels. The MILP uses active, H/V, and parity binaries with H/V and parity
+  forced to zero while inactive, giving exactly one canonical broken state.
+- Winding cutoff is exclusive: measured links with distance `>= 1.5` are
+  discarded. Same-trace continuity links remain at distance zero.
+- `0.5 * degree` is the default broken penalty, directly following the user's
+  proposed constraint-count scaling. Degree includes every retained incident
+  link, including same-trace continuity.
+- Orientation and parity terms are added with equal weight. No additional
+  distance weighting is introduced because it was not requested.
+- Existing three constraint diagnostic OBJs remain; five label OBJs are added
+  from the same command and basename.
 
-## Decisions
+## Environment
 
-- The user explicitly confirmed that double-coordinate normal sampling is not
-  required. The implementation will reuse the existing float-coordinate grouped
-  corner sampler and will measure its difference from scalar-double winding.
-- OBJ lines connect the two closest sampled base-coordinate points. Hard
-  continuity links are excluded because their endpoints coincide.
-- Winding `0.5` belongs to the separate-winding view, leaving the parallel
-  classes disjoint. Perpendicular winding uses the requested strict `>0.3`.
+- HiGHS `1.15.1` is installed as `/usr/lib/libhighs.so` with CMake target
+  `highs::highs` and C++ headers under `/usr/include/highs`.
 
-## Independent plan review
+## Real-graph formulation finding
 
-- Review correctly rejected the initial prefetch-only design because it would
-  retain fine-grained scalar samples and would not pin a whole working set.
-  After user clarification, the plan now uses the actual grouped corner sampler.
-- Review required exact output-basename behavior and stable OBJ identities.
-  The plan now strips a supplied final extension, defines the `.zarr` default,
-  and names objects from ascending global piece IDs.
-
-## Deviations and deferred work
-
-- The reviewed exact-double grouped API was replaced before implementation after
-  the user explicitly stated double precision was unnecessary. Batched winding
-  uses the established float-coordinate grouped corner infrastructure; tangent
-  scoring and stored closest-point geometry remain double precision.
-- Constraint records remain report-only in memory. The three OBJ files are
-  diagnostics, not the future discrete-optimization interchange format.
+- Declaring the three link-local auxiliaries integer created about 169,000
+  integer columns on the 55k-link representative graph. The exact run was
+  stopped after 189.66 s at 1,233,844 KiB peak RSS. The auxiliaries are now
+  continuous because their AND/XOR envelopes force integral values from binary
+  endpoints; only 3,894 piece columns remain integer.
+- Even the reduced formulation did not prove zero gap within 146.76 s and used
+  1,353,360 KiB peak RSS. The default now uses standard practical MIP
+  tolerances (`1e-4` relative, `1e-6` absolute), reports the achieved gap, and
+  exposes `--mip-gap 0` for explicit exact solves.
+- Rewriting each pair energy as a nonnegative minimum base cost plus an
+  indicator for only the more expensive agreement/difference relation reduced
+  the exact hull from 13 to at most 7 rows per link. The requested active-label
+  objective is algebraically identical. The representative default-radius
+  solve still did not finish within 183.66 s (893,380 KiB peak RSS), so dense
+  graph solve time remains an explicit limitation of this initial MILP.
 
 ## Validation
 
-- GCC build:
-  `cmake --build volume-cartographer/build --target vc_fiber_trace_chunk test_fiberlet_crop_trace test_lasagna_normal_sampler -j32`.
-- Clang build:
-  `cmake --build volume-cartographer/build/ci-tests-clang-systemdeps --target vc_fiber_trace_chunk test_fiberlet_crop_trace test_lasagna_normal_sampler -j32`.
-- Both compilers passed `test_fiberlet_crop_trace` (20 cases) and
-  `test_lasagna_normal_sampler` (12 cases). Tests cover strict OBJ thresholds,
-  hard-link exclusion, extension-independent filenames, stable object names,
-  scalar/batch integration, varying-field float tolerance, and exact one- versus
-  four-thread batch parity.
-- Representative command:
-  `volume-cartographer/build/bin/vc_fiber_trace_chunk constraints /home/hendrik/business/aiconsulting/vesuviuschallenge/data/workdir3/crop_traces.zarr --normal-manifest /home/hendrik/business/aiconsulting/vesuviuschallenge/data/lasagna3d_inf/las008_s1_full/las_008.lasagna.json --output /tmp/constraint_batched.obj`.
-- Dataset/build: the same 500-trace artifact and Release build as baseline;
-  55,170 measured links and 798 hard links, three iterations.
-- External wall seconds: `0.50, 0.48, 0.48`; mean `0.487`, median `0.48`,
-  min/max `0.48/0.50`. Internal total wall seconds: `0.360, 0.338, 0.343`;
-  mean `0.347`, median `0.343`, min/max `0.338/0.360`.
-- Batched winding seconds: `0.0839, 0.0706, 0.0778`; median `0.0778`, versus
-  baseline scalar winding/scoring `11.2827` seconds. Median winding speedup is
-  about `145x`; internal total speedup versus baseline `11.4466` seconds is
-  about `33x`.
-- Peak RSS was 127.7-128.4 MiB. Outputs were stable at 33,808 perpendicular,
-  5,667 parallel same-winding, and 15,000 parallel separate-winding lines.
-- Batch-versus-scalar representative deciles differed only in the final few
-  decimal places; focused varying-field tests enforce relative tolerance
-  `2e-5`. `git diff --check` passed.
+- GCC Release build and focused test command:
+  `cmake --build volume-cartographer/build --target vc_fiber_trace_chunk test_fiberlet_crop_trace -j32 && volume-cartographer/build/bin/test_fiberlet_crop_trace`.
+- Focused tests cover the exclusive winding cutoff, separate invalid/cutoff
+  counts, exact orientation/parity costs, broken-link disabling, isolated-piece
+  canonicalization, invalid solver coefficients, and five OBJ classes.
+- Clang validation and a completed representative default-radius solve were not
+  run before the user requested wrap-up.
+
+## Independent plan review
+
+- Added per-component H/even canonicalization for the two unavoidable global
+  binary symmetries and canonical broken labels for isolated pieces. HiGHS will
+  also run with deterministic settings. A fully lexicographic choice among all
+  mathematically equivalent broken/active cuts would require a potentially
+  prohibitive sequence of MILP solves and is not part of this diagnostic.
+- Added a dedicated winding-cutoff rejection counter instead of conflating it
+  with invalid/non-finite winding samples.
+- Expanded the plan to provision and link HiGHS on Ubuntu, macOS, and Windows,
+  validate the broken coefficient, and exercise user-visible output behavior.

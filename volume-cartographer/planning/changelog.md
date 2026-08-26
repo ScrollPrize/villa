@@ -9,6 +9,9 @@
 - Batched constraint winding through grouped Lasagna corner sampling and added
   perpendicular, parallel same-winding, and parallel separate-winding connector
   OBJ diagnostics.
+- Added a strict 1.5-winding constraint cutoff and HiGHS mixed-integer labeling
+  of crop-trace pieces into H/V, even/odd, and broken states, with five OBJ
+  class views and explicit objective diagnostics.
 
 ## 2026-08-17
 

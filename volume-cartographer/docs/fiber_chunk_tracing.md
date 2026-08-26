@@ -90,7 +90,10 @@ volume-cartographer/build/bin/vc_fiber_trace_chunk \
 `--output` is an OBJ basename; its final extension is removed. The command
 writes `crop_constraints_perpendicular.obj`,
 `crop_constraints_parallel_same_winding.obj`, and
-`crop_constraints_parallel_separate_winding.obj`. If omitted for
+`crop_constraints_parallel_separate_winding.obj`. It also solves the piece
+labels and writes `crop_constraints_h_even.obj`,
+`crop_constraints_h_odd.obj`, `crop_constraints_v_even.obj`,
+`crop_constraints_v_odd.obj`, and `crop_constraints_broken.obj`. If omitted for
 `crop_traces.zarr`, the basename defaults to `crop_traces_constraints` beside
 the trace dataset. Each OBJ line joins a measured constraint's two closest
 sampled points and is named `constraint_piece_A_B` from stable ascending global
@@ -101,6 +104,26 @@ aligned winding distance `> 0.3`. Both parallel views require normalized
 parallel score `> 0.5`; winding `< 0.5` is classified as same-winding and
 winding `>= 0.5` as separate-winding. Threshold comparisons are exact, so a
 score of `0.5` is absent and winding `0.5` belongs to separate-winding.
+Measured links with aligned winding distance greater than or equal to `1.5`
+are discarded before diagnostics and labeling. This is an exclusive cutoff;
+same-trace continuity remains at winding zero.
+
+The five labels are H/V crossed with even/odd plus broken. For a retained link
+with parallel score `p` and winding distance `d`, two active pieces pay
+`1-p` when their H/V labels agree and `p` when they differ. Equal parity costs
+`d`; different parity costs `abs(1-d)`. The two terms have equal weight.
+Breaking a piece disables every incident link term and costs `0.5` times the
+piece's retained incident-link count by default. Set another finite,
+nonnegative coefficient with `--broken-cost-per-link`. HiGHS uses relative MIP
+gap `1e-4` and absolute gap `1e-6` by default; `--mip-gap 0` requests an exact
+relative-gap proof, and the achieved gap is reported. Within each active connected component, the equivalent
+global H/V and parity flips are canonicalized so its lowest piece ID is
+H/even. Isolated pieces with no evidence are broken.
+
+Only the three piece columns are integer. Pair-active and gated difference
+columns are continuous in `[0,1]`; their exact AND/XOR linear envelopes force
+binary values for binary endpoints, avoiding three unnecessary integer columns
+per link without changing the feasible labels or objective.
 
 All distances are in base voxels. By default, traces are resampled every 32
 voxels and divided into evenly sized overlapping pieces with a maximum target
@@ -144,6 +167,10 @@ distance, normalized parallel/perpendicular evidence, and aligned winding.
 Parsed normal-manifest equality with trace provenance is reported only as a
 diagnostic. Compatibility requires valid normal channels in base coordinates
 whose declared base shape covers the stored trace crop.
+
+HiGHS is a required C++ build dependency for `vc_fiber_tracer`: Ubuntu uses
+`libhighs-dev`, macOS uses the Homebrew `highs` formula, and Windows uses the
+vcpkg `highs` port. CMake consumes the package target `highs::highs`.
 
 Publication is all-or-nothing: the command writes and fully reopens a unique
 sibling temporary dataset, validates its inventory, ownership, ordinals, and

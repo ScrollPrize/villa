@@ -23,6 +23,7 @@ struct FiberTraceConstraintConfig {
     double phaseRefinementStepFraction = 0.05;
     double phaseRefinementLimitFraction = 0.05;
     double windingIntegrationStepBaseVoxels = 8.0;
+    double maximumWindingDistance = 1.5;
     std::size_t parallelThreads = 0;
 };
 
@@ -59,6 +60,7 @@ struct FiberTraceConstraintReport {
     std::size_t measuredCandidates = 0;
     std::size_t rejectedTangents = 0;
     std::size_t rejectedWinding = 0;
+    std::size_t rejectedWindingCutoff = 0;
     std::size_t hardConstraints = 0;
     double prepareSeconds = 0.0;
     double searchSeconds = 0.0;

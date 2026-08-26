@@ -530,6 +530,7 @@ endif()
 find_package(Ceres REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(OpenCV REQUIRED)
+find_package(highs CONFIG REQUIRED)
 # OpenCV 5 split calib3d into geometry/calib/stereo/ptcloud. VC uses
 # Rodrigues (calib) and estimateAffine3D (geometry), so select both new
 # modules there while retaining the OpenCV 4 module name elsewhere.

@@ -4658,8 +4658,9 @@
 
 - `vc_fiber_trace_chunk constraints TRACE.zarr --normal-manifest MANIFEST`
   operates on durable `float64_traces` crop output and emits statistics plus
-  diagnostic connector OBJs. Structured constraint persistence and discrete
-  H/V or winding-index optimization are outside this first stage.
+  diagnostic connector OBJs, solves five-state piece labels, and emits one OBJ
+  for each label. Structured constraint persistence remains outside this
+  stage.
 - Every distance and arc value is in base voxels. Defaults are a 32-vx common
   sample pitch, 512-vx target piece length, 128-vx overlap, 128-vx neighbor
   radius, 32-vx centered tangent window, and 8-vx winding integration step.
@@ -4687,6 +4688,10 @@
   `abs(dot(unit connector, decoded unit normal))`. Missing required normal or
   density samples reject the measured link. The ordinary winding API retains
   its previous unmodulated behavior.
+- A finite measured aligned winding distance must be strictly less than `1.5`.
+  Values greater than or equal to `1.5` are discarded and counted separately
+  from invalid/non-finite winding samples. Hard same-trace continuity links
+  remain at zero and do not pass through measured-link rejection.
 - The normal dataset is opened in base-coordinate working space, must have the
   valid 3D `nx`, `ny`, and `grad_mag` structure used by Fiberlets, and its
   declared base shape must cover the complete trace crop. Manifest path, bytes,
@@ -4715,3 +4720,26 @@
   `>0.3`. Parallel requires score `>0.5`; winding `<0.5` selects same-winding
   and winding `>=0.5` selects separate-winding. Thus parallel outputs are
   disjoint and exact threshold values have defined ownership.
+- Every piece receives exactly one state: H/even, H/odd, V/even, V/odd, or
+  broken. The HiGHS MILP uses active, H/V, and parity binaries per piece, with
+  H/V and parity constrained to zero while inactive, and pair-active plus gated
+  H/V-XOR and parity-XOR bounded auxiliaries per retained link. Their linear
+  envelopes force binary values from binary endpoints without declaring the
+  link-local columns integer.
+- For parallel score `p`, an active link costs `1-p` for matching H/V and `p`
+  for differing H/V. For winding `d`, matching parity costs `d` and differing
+  parity costs `abs(1-d)`. The terms are additive. A broken endpoint disables
+  both terms. Each broken piece costs `broken_cost_per_link * degree`, where
+  the default coefficient is `0.5`, degree includes hard and measured retained
+  links, and the coefficient must be finite and nonnegative.
+- HiGHS must return an optimal MIP solution before label artifacts are written.
+  Default relative and absolute gaps are `1e-4` and `1e-6`; `--mip-gap` changes
+  the finite nonnegative relative tolerance, including zero for an exact proof,
+  and reports the achieved gap. The solver seed and model ordering are fixed. Each active connected
+  component is canonicalized through objective-preserving global flips so its
+  lowest piece ID is H/even; zero-degree pieces are canonically broken.
+- Label OBJ suffixes are `_h_even.obj`, `_h_odd.obj`, `_v_even.obj`,
+  `_v_odd.obj`, and `_broken.obj`. Each object is the sampled piece polyline and
+  carries stable piece, source-trace, and trace-local piece IDs. Reports include
+  objective, orientation/winding/broken decomposition, model dimensions, MIP
+  nodes and gap, solve time, and all five label counts.

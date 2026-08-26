@@ -63,7 +63,7 @@ struct PairCandidate {
     double distance = std::numeric_limits<double>::infinity();
 };
 
-enum class RejectReason { None, Tangent, Winding };
+enum class RejectReason { None, Tangent, Winding, WindingCutoff };
 
 struct ScoredCandidate {
     std::optional<FiberTraceConstraint> constraint;
@@ -114,7 +114,9 @@ void validateConfig(const FiberTraceConstraintConfig& config)
         config.phaseRefinementLimitFraction >=
             config.phaseRefinementStepFraction &&
         std::isfinite(config.windingIntegrationStepBaseVoxels) &&
-        config.windingIntegrationStepBaseVoxels > 0.0;
+        config.windingIntegrationStepBaseVoxels > 0.0 &&
+        std::isfinite(config.maximumWindingDistance) &&
+        config.maximumWindingDistance > 0.0;
     if (!valid)
         throw std::invalid_argument("Fiber trace constraint configuration is invalid");
 }
@@ -578,11 +580,15 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
     }
     for (std::size_t index = 0; index < acceptedIndices.size(); ++index) {
         auto& result = scored[acceptedIndices[index]];
-        if (std::isfinite(windings[index]))
+        if (std::isfinite(windings[index]) &&
+            windings[index] < config.maximumWindingDistance) {
             result.constraint->windingDistance = windings[index];
-        else {
+        } else if (!std::isfinite(windings[index])) {
             result.constraint.reset();
             result.rejection = RejectReason::Winding;
+        } else {
+            result.constraint.reset();
+            result.rejection = RejectReason::WindingCutoff;
         }
     }
     report.windingScoreSeconds = std::chrono::duration<double>(
@@ -595,6 +601,8 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
             ++report.rejectedTangents;
         else if (result.rejection == RejectReason::Winding)
             ++report.rejectedWinding;
+        else if (result.rejection == RejectReason::WindingCutoff)
+            ++report.rejectedWindingCutoff;
     }
     std::sort(report.constraints.begin(), report.constraints.end(),
         [](const auto& left, const auto& right) {

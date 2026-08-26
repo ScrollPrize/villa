@@ -7,6 +7,7 @@
 #include "vc/fiber_tracer/FiberletCropTraceArtifact.hpp"
 #include "vc/fiber_tracer/FiberletDataset.hpp"
 #include "vc/fiber_tracer/FiberTraceConstraints.hpp"
+#include "vc/fiber_tracer/FiberTraceLabeling.hpp"
 #include "vc/lasagna/Dataset.hpp"
 
 #include "utils/zarr.hpp"
@@ -1118,4 +1119,139 @@ TEST_CASE("Trace constraint OBJ views apply strict disjoint thresholds")
         directory.path / "crop_traces_constraints");
     CHECK(defaultPaths.perpendicular.filename() ==
           "crop_traces_constraints_perpendicular.obj");
+}
+
+TEST_CASE("Trace constraints discard winding distances at the exclusive cutoff")
+{
+    FiberletCropTraceLine first;
+    first.pointsBaseXYZ = {{0, 0, 0}, {64, 0, 0}};
+    FiberletCropTraceLine second;
+    second.pointsBaseXYZ = {{0, 4, 0}, {64, 4, 0}};
+    FiberTraceConstraintConfig config;
+    config.maximumDistanceBaseVoxels = 8.0;
+    config.parallelThreads = 1;
+    const auto extract = [&](double winding) {
+        return extractFiberTraceConstraints(
+            {first, second},
+            config,
+            [winding](const cv::Vec3d&, const cv::Vec3d&, double) {
+                return winding;
+            });
+    };
+
+    const auto retained = extract(std::nextafter(1.5, 0.0));
+    REQUIRE(retained.constraints.size() == 1);
+    CHECK(retained.rejectedWinding == 0);
+    CHECK(retained.rejectedWindingCutoff == 0);
+
+    const auto cutoff = extract(1.5);
+    CHECK(cutoff.constraints.empty());
+    CHECK(cutoff.rejectedWinding == 0);
+    CHECK(cutoff.rejectedWindingCutoff == 1);
+
+    const auto invalid = extract(std::numeric_limits<double>::quiet_NaN());
+    CHECK(invalid.constraints.empty());
+    CHECK(invalid.rejectedWinding == 1);
+    CHECK(invalid.rejectedWindingCutoff == 0);
+}
+
+TEST_CASE("Trace labeling minimizes orientation winding and broken costs")
+{
+    const auto makeReport = [](double parallel, double winding) {
+        FiberTraceConstraintReport report;
+        report.pieces.resize(2);
+        report.constraints.push_back({
+            0,
+            1,
+            0.0,
+            0.0,
+            {0.0, 0.0, 0.0},
+            {1.0, 0.0, 0.0},
+            1.0,
+            parallel,
+            1.0 - parallel,
+            winding,
+            false,
+        });
+        return report;
+    };
+    FiberTraceLabelingConfig config;
+    config.parallelThreads = 1;
+
+    const auto parallel = solveFiberTraceLabels(makeReport(0.9, 0.0), config);
+    REQUIRE(parallel.labels.size() == 2);
+    CHECK(parallel.labels[0] == FiberTracePieceLabel::HEven);
+    CHECK(parallel.labels[1] == FiberTracePieceLabel::HEven);
+    CHECK(parallel.orientationCost == doctest::Approx(0.1));
+    CHECK(parallel.windingCost == doctest::Approx(0.0));
+    CHECK(parallel.brokenCost == doctest::Approx(0.0));
+    CHECK(parallel.objective == doctest::Approx(0.1));
+
+    const auto crossing = solveFiberTraceLabels(makeReport(0.1, 0.9), config);
+    REQUIRE(crossing.labels.size() == 2);
+    CHECK(crossing.labels[0] == FiberTracePieceLabel::HEven);
+    CHECK(crossing.labels[1] == FiberTracePieceLabel::VOdd);
+    CHECK(crossing.orientationCost == doctest::Approx(0.1));
+    CHECK(crossing.windingCost == doctest::Approx(0.1));
+    CHECK(crossing.objective == doctest::Approx(0.2));
+
+    const auto broken = solveFiberTraceLabels(makeReport(0.5, 0.5), config);
+    REQUIRE(broken.labels.size() == 2);
+    CHECK((broken.labels[0] == FiberTracePieceLabel::Broken) !=
+          (broken.labels[1] == FiberTracePieceLabel::Broken));
+    CHECK(broken.brokenCost == doctest::Approx(0.5));
+    CHECK(broken.orientationCost == doctest::Approx(0.0));
+    CHECK(broken.windingCost == doctest::Approx(0.0));
+    CHECK(broken.objective == doctest::Approx(0.5));
+    CHECK(broken.variables == 9);
+    CHECK(broken.integerVariables == 6);
+    CHECK(broken.rows == 7);
+
+    auto isolated = makeReport(0.9, 0.0);
+    isolated.pieces.emplace_back();
+    const auto canonical = solveFiberTraceLabels(isolated, config);
+    CHECK(canonical.labels[2] == FiberTracePieceLabel::Broken);
+    CHECK(canonical.labels[0] == FiberTracePieceLabel::HEven);
+
+    config.brokenCostPerConstraint = -0.01;
+    CHECK_THROWS_AS(solveFiberTraceLabels(isolated, config), std::invalid_argument);
+    config.brokenCostPerConstraint = 0.5;
+    config.relativeMipGap = std::numeric_limits<double>::infinity();
+    CHECK_THROWS_AS(solveFiberTraceLabels(isolated, config), std::invalid_argument);
+}
+
+TEST_CASE("Trace labeling writes five stable piece OBJ classes")
+{
+    const TemporaryDirectory directory("trace_label_objs");
+    FiberTraceConstraintReport constraints;
+    constraints.pieces.resize(5);
+    for (std::size_t index = 0; index < constraints.pieces.size(); ++index) {
+        constraints.pieces[index].traceIndex = 10 + index;
+        constraints.pieces[index].pieceIndex = index;
+        constraints.pieces[index].samplePointsBaseXYZ = {
+            {static_cast<double>(index), 0.0, 0.0},
+            {static_cast<double>(index), 1.0, 0.0},
+        };
+    }
+    FiberTraceLabelingReport labeling;
+    labeling.labels = {
+        FiberTracePieceLabel::HEven,
+        FiberTracePieceLabel::HOdd,
+        FiberTracePieceLabel::VEven,
+        FiberTracePieceLabel::VOdd,
+        FiberTracePieceLabel::Broken,
+    };
+    const auto result = writeFiberTraceLabelObjs(
+        constraints, labeling, directory.path / "crop.labels");
+    CHECK(result.paths.hEven == directory.path / "crop_h_even.obj");
+    CHECK(result.paths.hOdd == directory.path / "crop_h_odd.obj");
+    CHECK(result.paths.vEven == directory.path / "crop_v_even.obj");
+    CHECK(result.paths.vOdd == directory.path / "crop_v_odd.obj");
+    CHECK(result.paths.broken == directory.path / "crop_broken.obj");
+    for (const auto count : result.pieceCounts)
+        CHECK(count == 1);
+    std::ifstream input(result.paths.vOdd);
+    std::ostringstream text;
+    text << input.rdbuf();
+    CHECK(text.str().find("o piece_3_trace_13_part_3\n") != std::string::npos);
 }

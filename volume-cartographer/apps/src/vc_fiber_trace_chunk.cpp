@@ -4,10 +4,12 @@
 #include "vc/fiber_tracer/FiberletCropTraceArtifact.hpp"
 #include "vc/fiber_tracer/FiberletCropVisualization.hpp"
 #include "vc/fiber_tracer/FiberTraceConstraints.hpp"
+#include "vc/fiber_tracer/FiberTraceLabeling.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <ctime>
@@ -40,6 +42,7 @@ struct Options {
     std::size_t cacheBytes = 8ULL * 1024ULL * 1024ULL * 1024ULL;
     vc::fiber_tracer::FiberletCropTraceConfig trace;
     vc::fiber_tracer::FiberTraceConstraintConfig constraints;
+    vc::fiber_tracer::FiberTraceLabelingConfig labeling;
     bool hasBounds = false;
     bool hasTraceOnlyOption = false;
     bool hasConstraintOnlyOption = false;
@@ -60,7 +63,8 @@ void usage(const char* executable)
               << "  " << executable << " visualize <traces.zarr> --output lines.obj\n\n"
               << "  " << executable
               << " constraints <traces.zarr> --normal-manifest PATH"
-                 " [--output BASENAME] [options]\n\n"
+                 " [--output BASENAME] [--broken-cost-per-link COST]"
+                 " [--mip-gap FRACTION] [options]\n\n"
               << "Trace options:\n"
               << "  --obj PATH                 line OBJ; defaults beside trace Zarr\n"
               << "  --volume PATH              concrete uint8 CT Zarr group\n"
@@ -204,6 +208,17 @@ Options parse(int argc, char** argv)
         } else if (argument == "--winding-step") {
             options.constraints.windingIntegrationStepBaseVoxels = number(index, argc, argv, "--winding-step");
             options.hasConstraintOnlyOption = true;
+        } else if (argument == "--broken-cost-per-link") {
+            options.labeling.brokenCostPerConstraint =
+                number(index, argc, argv, "--broken-cost-per-link");
+            if (options.labeling.brokenCostPerConstraint < 0.0)
+                fail("--broken-cost-per-link must be nonnegative");
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--mip-gap") {
+            options.labeling.relativeMipGap = number(index, argc, argv, "--mip-gap");
+            if (options.labeling.relativeMipGap < 0.0)
+                fail("--mip-gap must be nonnegative");
+            options.hasConstraintOnlyOption = true;
         } else if (argument == "--help" || argument == "-h") {
             usage(argv[0]);
             std::exit(0);
@@ -238,6 +253,7 @@ Options parse(int argc, char** argv)
                 (stem + "_constraints");
         }
         options.constraints.parallelThreads = static_cast<std::size_t>(options.threads);
+        options.labeling.parallelThreads = static_cast<std::size_t>(options.threads);
         return options;
     }
     if (options.output.empty())
@@ -289,21 +305,23 @@ void printConstraintReport(
     }
     std::cout << std::setprecision(8)
               << "fiber trace constraint config\n"
-              << "sample_step  piece_length  piece_overlap  max_distance  tangent_window  winding_step  threads\n"
+              << "sample_step  piece_length  piece_overlap  max_distance  tangent_window  winding_step  winding_cutoff  threads\n"
               << config.resampleSpacingBaseVoxels << "  "
               << config.targetPieceLengthBaseVoxels << "  "
               << config.pieceOverlapBaseVoxels << "  "
               << config.maximumDistanceBaseVoxels << "  "
               << config.tangentWindowBaseVoxels << "  "
               << config.windingIntegrationStepBaseVoxels << "  "
+              << config.maximumWindingDistance << "  "
               << config.parallelThreads << '\n'
               << "fiber trace constraint counts\n"
-              << "traces  degenerate  pieces  samples  spatial_hits  candidates  measured  hard  tangent_rejected  winding_rejected  manifest_matches_trace\n"
+              << "traces  degenerate  pieces  samples  spatial_hits  candidates  measured  hard  tangent_rejected  winding_invalid  winding_cutoff  manifest_matches_trace\n"
               << report.inputTraces << "  " << report.skippedDegenerateTraces << "  "
               << report.pieces.size() << "  " << report.resampledPoints << "  "
               << report.spatialHits << "  " << report.measuredCandidates << "  "
               << distances.size() << "  " << report.hardConstraints << "  "
               << report.rejectedTangents << "  " << report.rejectedWinding << "  "
+              << report.rejectedWindingCutoff << "  "
               << std::boolalpha << manifestMatches << std::noboolalpha << '\n'
               << "fiber trace constraint quantiles (measured links only)\n"
               << "quantile  closest_distance  parallel_score  perpendicular_score  aligned_winding\n";
@@ -320,6 +338,39 @@ void printConstraintReport(
               << report.orientationScoreSeconds << "  "
               << report.windingScoreSeconds << "  "
               << report.scoreSeconds << "  " << wallSeconds << "  " << cpuSeconds << '\n';
+}
+
+void printLabelingReport(
+    const vc::fiber_tracer::FiberTraceLabelingReport& report,
+    const vc::fiber_tracer::FiberTraceLabelingConfig& config,
+    const vc::fiber_tracer::FiberTraceLabelObjReport& objects)
+{
+    const std::array<const char*, 5> names{
+        "h_even", "h_odd", "v_even", "v_odd", "broken"};
+    const std::array<std::filesystem::path, 5> paths{
+        objects.paths.hEven,
+        objects.paths.hOdd,
+        objects.paths.vEven,
+        objects.paths.vOdd,
+        objects.paths.broken,
+    };
+    std::cout << std::setprecision(8)
+              << "fiber trace labeling optimization\n"
+              << "status  objective  orientation_cost  winding_cost  broken_cost  broken_cost_per_link  requested_mip_gap  variables  integer_variables  rows  mip_nodes  mip_gap  solve_seconds\n"
+              << report.modelStatus << "  " << report.objective << "  "
+              << report.orientationCost << "  " << report.windingCost << "  "
+              << report.brokenCost << "  " << config.brokenCostPerConstraint
+              << "  " << config.relativeMipGap << "  " << report.variables
+              << "  " << report.integerVariables
+              << "  " << report.rows << "  "
+              << report.mipNodes << "  " << report.mipGap << "  "
+              << report.solveSeconds << '\n'
+              << "fiber trace label OBJ outputs\n"
+              << "label  pieces  path\n";
+    for (std::size_t index = 0; index < names.size(); ++index) {
+        std::cout << names[index] << "  " << objects.pieceCounts[index]
+                  << "  " << paths[index] << '\n';
+    }
 }
 
 void printConstraintObjReport(
@@ -421,6 +472,11 @@ int main(int argc, char** argv)
             const auto objReport =
                 vc::fiber_tracer::writeFiberTraceConstraintObjs(
                     report, options.output);
+            const auto labeling = vc::fiber_tracer::solveFiberTraceLabels(
+                report, options.labeling);
+            const auto labelObjReport =
+                vc::fiber_tracer::writeFiberTraceLabelObjs(
+                    report, labeling, options.output);
             const double wallSeconds = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - started).count();
             const double cpuSeconds = static_cast<double>(
@@ -432,6 +488,7 @@ int main(int argc, char** argv)
                 wallSeconds,
                 cpuSeconds);
             printConstraintObjReport(objReport);
+            printLabelingReport(labeling, options.labeling, labelObjReport);
             return 0;
         }
         if (options.mode == Mode::Visualize) {
