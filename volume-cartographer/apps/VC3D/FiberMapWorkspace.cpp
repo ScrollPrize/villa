@@ -540,8 +540,9 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
     toolBar->addWidget(_updateButton);
     _fullRebuildButton = new QPushButton(tr("Full rebuild"), toolBar);
     _fullRebuildButton->setToolTip(
-        tr("Recompute everything from scratch, then verify the cached\n"
-           "result. Use if the map ever looks wrong."));
+        tr("Recompute everything from scratch. When an Update preceded it\n"
+           "on unchanged inputs, also verify the memoized result.\n"
+           "Use if the map ever looks wrong."));
     toolBar->addWidget(_fullRebuildButton);
     toolBar->addSeparator();
     _statusLabel =
@@ -636,10 +637,19 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
     // would have to either do the work or defer it anyway.
     //
     // Instead the controller keeps counters that are cheap to bump, and this
-    // compares them at the moments it matters: on show, on rebuild, and before
-    // acting on a click or a fiber-list selection. The cost of that is deferred
-    // detection — a tab already visible when the volume or umbilicus changes keeps
-    // its picture until the user does something — which is the accepted trade.
+    // compares them at the moments it matters: on show, on rebuild, before
+    // acting on a click or a fiber-list selection — and, while the tab is
+    // visible, on a light poll, so the automatic update notices changes even
+    // when the user is not touching the map. A hidden tab costs nothing: the
+    // poll stops with hideEvent and showEvent's refresh covers the gap.
+    _stalePollTimer = new QTimer(this);
+    _stalePollTimer->setInterval(1000);
+    connect(_stalePollTimer, &QTimer::timeout, this, [this]() {
+        if (_rebuildInProgress || !_layoutBuilt) {
+            return;
+        }
+        refreshStaleState();
+    });
 
     rebuildScene(tr("press Update"));
 }
@@ -781,10 +791,17 @@ bool FiberMapWorkspace::applyStaleVerdict(const StaleVerdict& verdict)
         // carries the cached umbilicus suffix, and a fingerprint change under an
         // unchanged higher-priority reason must still refresh what that suffix
         // names. showStale() is idempotent when nothing moved.
-        showStale(verdict.reason);
-        if (verdict.cause == StaleVerdict::Cause::Fibers ||
-            verdict.cause == StaleVerdict::Cause::Umbilicus) {
+        if ((verdict.cause == StaleVerdict::Cause::Fibers ||
+             verdict.cause == StaleVerdict::Cause::Umbilicus) &&
+            isVisible()) {
             scheduleAutoUpdate();
+            // The banner reflects that no user action is needed: the update
+            // is already on its way.
+            QString reason = verdict.reason;
+            reason.replace(tr("press Update"), tr("updating…"));
+            showStale(reason);
+        } else {
+            showStale(verdict.reason);
         }
         return true;
     case StaleVerdict::Action::Fresh:
@@ -863,7 +880,11 @@ void FiberMapWorkspace::scheduleAutoUpdate()
     // itself ends in a stale refresh that must not recurse into another
     // rebuild. The verdict is re-evaluated when the shot fires - anything can
     // change in between, including the staleness resolving itself.
-    if (_autoUpdateScheduled || _rebuildInProgress || !isVisible()) {
+    // Arming during a rebuild is deliberate: rebuildLayout's own final stale
+    // refresh is the one place the mid-build umbilicus race surfaces, and the
+    // single-shot cannot fire until the synchronous rebuild has returned and
+    // released the guard - the firing callback re-checks everything.
+    if (_autoUpdateScheduled || !isVisible()) {
         return;
     }
     _autoUpdateScheduled = true;
@@ -882,9 +903,20 @@ void FiberMapWorkspace::scheduleAutoUpdate()
 }
 
 
+void FiberMapWorkspace::hideEvent(QHideEvent* event)
+{
+    QMainWindow::hideEvent(event);
+    if (_stalePollTimer) {
+        _stalePollTimer->stop();
+    }
+}
+
 void FiberMapWorkspace::showEvent(QShowEvent* event)
 {
     QMainWindow::showEvent(event);
+    if (_stalePollTimer) {
+        _stalePollTimer->start();
+    }
     // Becoming visible is the first of the three moments a stale layout has to
     // be caught; the others are a rebuild and any attempt to act on the map.
     if (refreshStaleState()) {
@@ -935,11 +967,17 @@ void FiberMapWorkspace::rebuildLayout(bool fullRebuild)
         if (verdict.action == StaleVerdict::Action::ClearLayout) {
             _layoutCache.clear();
             _haveLastDigests = false;
+            // The rest of the package-scoped state clearLayout() would have
+            // reset: the new package's map deserves its own first fit, and
+            // the cached umbilicus suffix described the old package.
+            _viewFitted = false;
+            _umbilicusStatusValid = false;
         }
     }
     if (fullRebuild || _memoizationDisabled) {
         _layoutCache.clear();
     }
+    try {
     // Read before the snapshot: fiberMapSnapshot() parses the umbilicus, so a
     // rewrite during that parse that moves the file's size or mtime — the
     // token's contract; a same-size rewrite inside one timestamp tick is
@@ -1169,6 +1207,15 @@ void FiberMapWorkspace::rebuildLayout(bool fullRebuild)
     // up here — after the summary assignment, which must never be what a stale
     // map is left saying.
     refreshStaleState();
+    } catch (const std::exception& ex) {
+        // A throw from the snapshot leaves the old state fully intact; one
+        // from later stages can leave the scene and watermarks disagreeing.
+        // Either way the latch refuses interaction until a rebuild succeeds,
+        // and nothing escapes into the Qt event loop. Cache entries written
+        // before the throw are pure key->value memoizations and stay valid.
+        Logger()->error("Fiber map: rebuild failed: {}", ex.what());
+        markStale(tr("rebuild failed — press Update"));
+    }
 }
 
 void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
@@ -1833,6 +1880,15 @@ void FiberMapWorkspace::handleControlPointMenu(const QPointF& scenePos, const QP
                     /*layoutBuilt=*/true, QString());
                 if (verdict.action != StaleVerdict::Action::Fresh) {
                     showStale(verdict.reason);
+                    // The destructive half (a clear, or scheduling the
+                    // automatic update) runs on the next event-loop turn,
+                    // after menu.exec()'s nested loop has unwound - exactly
+                    // like the tree handler's deferral, and for the same
+                    // reason: applying a verdict here can tear down scene
+                    // items mid-delivery.
+                    QMetaObject::invokeMethod(
+                        this, [this]() { refreshStaleState(); },
+                        Qt::QueuedConnection);
                     Logger()->warn(
                         "Fiber map: dependencies changed while the menu was open; "
                         "not navigating to control point {} in {}",

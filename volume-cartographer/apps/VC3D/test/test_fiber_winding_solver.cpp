@@ -17,6 +17,7 @@
 #include <QtTest/QtTest>
 
 #include <cmath>
+#include <limits>
 #include <vector>
 
 #include "FiberWindingSolver.hpp"
@@ -644,6 +645,26 @@ private slots:
         // The linked chain still holds together internally.
         checkRelativeTurns(result, world, {chain[0], chain[1], chain[2]});
         Q_UNUSED(v);
+    }
+
+    // Non-finite coordinates never reach the solve's sorts and integer
+    // casts: a trace carrying any is unusable, the rest of the map is
+    // unaffected, and nothing crashes.
+    void nonFiniteTracesAreUnusable()
+    {
+        World world = threeWindingWorld();
+        const std::size_t poisoned = addV(world, 1.7, 27000.0, 33000.0);
+        world.fibers[poisoned].radius[3] =
+            std::numeric_limits<double>::quiet_NaN();
+        world.fibers[poisoned].theta[5] =
+            std::numeric_limits<double>::infinity();
+        const SolveResult result =
+            solveWindings(world.fibers, world.links, SolverParams{});
+        QCOMPARE(result.placements[poisoned].anchor,
+                 ComponentAnchor::Unresolved);
+        // The clean fibers still recover exactly.
+        checkRelativeTurns(result, world, {0, 1, 2, 3});
+        QCOMPARE(result.droppedCrossingCount, 0);
     }
 
     // A link that never took part must not read as a perfect link.

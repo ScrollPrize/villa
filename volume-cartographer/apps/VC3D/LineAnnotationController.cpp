@@ -13752,41 +13752,44 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
             session.stripReviewedTagOnSave = false;
         }
         ensureSessionFiberIdentity(session);
-        const BranchMetadataSyncResult branchSync =
-            syncLinkedBranchMetadataAfterFiberModification(session);
-        StoredFiber fiber = makeStoredFiberSessionSnapshot(session).fiber;
         // A session opened and closed without a material change must not
         // save: an unedited pane otherwise rewrites its file, queues a save
         // job, and bumps _fiberDataGeneration - which reads as "Fibers
         // changed" to every derived view (the Fiber Map's stale gates above
-        // all) on nothing more than opening a fiber. Equality is judged on
-        // the serializer's own output, so every persisted field participates
-        // by construction; only the generation counter, which the snapshot
-        // bumps unconditionally, is excluded. Peer metadata moved by the
-        // branch sync still saves through the ordinary path.
-        if (branchSync.affectedFiberIds.empty()) {
+        // all) on nothing more than opening a fiber. The decision runs
+        // BEFORE the branch-metadata sync mutates anything: a session that
+        // serializes identically to its stored fiber - which was itself
+        // synced when it was last saved - has nothing for the sync to
+        // propagate either, so skipping the whole tail is safe and the
+        // comparison can never be confused by the sync's side effects.
+        // Equality is judged on the serializer's own output, so every
+        // persisted field participates by construction; only the generation
+        // counter, which the snapshot bumps unconditionally, is excluded.
+        {
+            const StoredFiber candidate =
+                makeStoredFiberSessionSnapshot(session).fiber;
             auto storedIt = std::find_if(
                 _fibers.begin(), _fibers.end(),
-                [&fiber](const StoredFiber& existing) {
-                    return !fiber.fileName.empty() &&
-                           existing.fileName == fiber.fileName;
+                [&candidate](const StoredFiber& existing) {
+                    return !candidate.fileName.empty() &&
+                           existing.fileName == candidate.fileName;
                 });
             if (storedIt == _fibers.end()) {
                 storedIt = std::find_if(
                     _fibers.begin(), _fibers.end(),
-                    [&fiber](const StoredFiber& existing) {
-                        return existing.id == fiber.id;
+                    [&candidate](const StoredFiber& existing) {
+                        return existing.id == candidate.id;
                     });
             }
             if (storedIt != _fibers.end()) {
                 nlohmann::json before = fiberToJson(*storedIt);
-                nlohmann::json after = fiberToJson(fiber);
+                nlohmann::json after = fiberToJson(candidate);
                 before.erase("generation");
                 after.erase("generation");
                 if (before == after) {
                     Logger()->info(
                         "line annotation: unchanged session for {}; skipping save",
-                        fiber.fileName);
+                        candidate.fileName);
                     return;
                 }
                 // Not a no-op: name the first differing field, so a session
@@ -13813,9 +13816,12 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
                 }
                 Logger()->info(
                     "line annotation: session for {} differs at '{}'; saving",
-                    fiber.fileName, differing);
+                    candidate.fileName, differing);
             }
         }
+        const BranchMetadataSyncResult branchSync =
+            syncLinkedBranchMetadataAfterFiberModification(session);
+        StoredFiber fiber = makeStoredFiberSessionSnapshot(session).fiber;
         session.fiberId = fiber.id;
         session.fiberUsername = fiber.username;
         session.fiberStartedAt = fiber.startedAt;

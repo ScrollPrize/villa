@@ -79,6 +79,18 @@ double median(std::vector<double> values)
     return 0.5 * (values[middle - 1] + values[middle]);
 }
 
+// Non-finite coordinates would reach sorts (strict-weak-ordering violation)
+// and float-to-integer casts (UB); a trace carrying any is unusable.
+bool traceValuesFinite(const FiberTrace& fiber)
+{
+    const auto allFinite = [](const std::vector<double>& values) {
+        return std::all_of(values.begin(), values.end(),
+                           [](double value) { return std::isfinite(value); });
+    };
+    return allFinite(fiber.theta) && allFinite(fiber.radius) &&
+           allFinite(fiber.z);
+}
+
 // floor(x + 0.5), not llround: rounding halves away from zero is not
 // translation-equivariant, so a whole-turn input re-gauge could change the
 // canonical gauge by two at a half-turn median.
@@ -186,13 +198,22 @@ int inferChirality(const std::vector<FiberTrace>& fibers, int chiralityOverride)
         bool haveTurnEvidence = false;
         for (const FiberTrace& fiber : fibers) {
             const std::size_t n = fiber.theta.size();
-            if (n < 2 || fiber.radius.size() != n) {
+            if (n < 2 || fiber.radius.size() != n || !traceValuesFinite(fiber)) {
                 continue;
             }
             const bool ascending = fiber.theta.back() >= fiber.theta.front();
+            // The one-turn-lag sweep walks a single monotone cursor, so a
+            // fiber whose theta locally reverses would pair samples from
+            // unrelated sections and cast a garbage turn vote; such a fiber
+            // votes through its covariance instead.
+            bool monotone = true;
+            for (std::size_t i = 1; i < n && monotone; ++i) {
+                const double step = fiber.theta[i] - fiber.theta[i - 1];
+                monotone = ascending ? step >= 0.0 : step <= 0.0;
+            }
             double lagSum = 0.0;
             std::size_t j = 0;
-            for (std::size_t i = 0; i < n; ++i) {
+            for (std::size_t i = 0; monotone && i < n; ++i) {
                 const double target = ascending ? fiber.theta[i] + kTwoPi
                                                 : fiber.theta[i] - kTwoPi;
                 while (j < n && (ascending ? fiber.theta[j] < target
@@ -252,7 +273,8 @@ CanonicalTrace canonicalizeTrace(const FiberTrace& fiber, int chirality)
     trace.trusted = fiber.trusted;
     const bool usable = fiber.theta.size() >= 2 &&
                         fiber.radius.size() == fiber.theta.size() &&
-                        fiber.z.size() == fiber.theta.size();
+                        fiber.z.size() == fiber.theta.size() &&
+                        traceValuesFinite(fiber);
     if (!usable) {
         return trace;
     }
@@ -441,37 +463,45 @@ PairCrossings detectPairCrossings(const CanonicalTrace& hTrace,
                          return std::tie(ca.n, ca.zVx, ca.deltaR) <
                                 std::tie(cb.n, cb.zVx, cb.deltaR);
                      });
-    std::size_t index = 0;
-    while (index < order.size()) {
-        std::size_t end = index + 1;
+    // One physical traversal seen twice has nearly the same z AND nearly the
+    // same radial separation. The kind is deliberately not part of the
+    // identity - duplicate detections straddling the (confidence-scale) band
+    // must merge, not turn into a manufactured conflict - while the deltaR
+    // gate keeps genuinely distinct traversals apart (two branches of a
+    // U-shaped fiber can share z, n and kind at wildly different radii). A
+    // radially distinct traversal interleaved in z must not split a cluster,
+    // so mismatches within the z window are skipped over, not treated as the
+    // cluster's end.
+    std::vector<char> consumed(order.size(), 0);
+    for (std::size_t index = 0; index < order.size(); ++index) {
+        if (consumed[index]) {
+            continue;
+        }
         const Crossing& first = raw[order[index]];
         std::size_t best = index;
-        while (end < order.size()) {
-            const Crossing& next = raw[order[end]];
-            // One physical traversal seen twice has nearly the same z AND
-            // nearly the same radial separation. The kind is deliberately
-            // not part of the identity - duplicate detections straddling
-            // the (confidence-scale) band must merge, not turn into a
-            // manufactured conflict - while the deltaR gate keeps genuinely
-            // distinct traversals apart (two branches of a U-shaped fiber
-            // can share z, n and kind at wildly different radii).
-            if (next.n != first.n ||
-                next.zVx - first.zVx > params.zMergeVx ||
-                std::abs(next.deltaR - first.deltaR) > params.tieBandVx) {
+        int count = 1;
+        consumed[index] = 1;
+        for (std::size_t scan = index + 1; scan < order.size(); ++scan) {
+            const Crossing& next = raw[order[scan]];
+            if (next.n != first.n || next.zVx - first.zVx > params.zMergeVx) {
                 break;
             }
-            if (next.confidence > raw[order[best]].confidence) {
-                best = end;
+            if (consumed[scan] ||
+                std::abs(next.deltaR - first.deltaR) > params.tieBandVx) {
+                continue;
             }
-            ++end;
+            consumed[scan] = 1;
+            ++count;
+            if (next.confidence > raw[order[best]].confidence) {
+                best = scan;
+            }
         }
         Crossing representative = raw[order[best]];
-        representative.mergedCount = static_cast<int>(end - index);
+        representative.mergedCount = count;
         representative.confidence = std::min(
             2.0, representative.confidence *
                      (1.0 + 0.25 * static_cast<double>(representative.mergedCount - 1)));
         result.crossings.push_back(representative);
-        index = end;
     }
     return result;
 }
@@ -533,6 +563,10 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
     // identical inputs whose gauges differ produce different maps. The
     // caller-facing turn offsets compensate on output, so W = s*theta/2pi +
     // turns holds in the caller's own gauge.
+    std::vector<char> finite(count, 0);
+    for (std::size_t f = 0; f < count; ++f) {
+        finite[f] = traceValuesFinite(fibers[f]) ? 1 : 0;
+    }
     std::vector<std::vector<double>> psi(count);
     std::vector<long long> gauge(count, 0);
     for (std::size_t f = 0; f < count; ++f) {
@@ -540,7 +574,7 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
         for (std::size_t i = 0; i < fibers[f].theta.size(); ++i) {
             psi[f][i] = chirality * fibers[f].theta[i];
         }
-        if (!psi[f].empty()) {
+        if (!psi[f].empty() && finite[f] != 0) {
             // floor(x + 0.5), not llround: rounding halves away from zero is
             // not translation-equivariant, so a whole-turn input re-gauge
             // could change the canonical gauge by two at a half-turn median.
@@ -554,7 +588,7 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
     const auto usable = [&](std::size_t f) {
         return fibers[f].theta.size() >= 2 &&
                fibers[f].radius.size() == fibers[f].theta.size() &&
-               fibers[f].z.size() == fibers[f].theta.size();
+               fibers[f].z.size() == fibers[f].theta.size() && finite[f] != 0;
     };
 
     const auto detectBegin = std::chrono::steady_clock::now();
@@ -792,8 +826,9 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
               });
 
     // The primary component must actually carry a crossing constraint: a
-    // link-only network, however large, proves no winding. Fall back to the
-    // largest component only when no crossings survived anywhere.
+    // link-only network, however large, proves no winding. When no crossing
+    // survived anywhere there is no primary at all, and every component runs
+    // the island path against an empty anchored set - honestly unresolved.
     std::set<std::size_t> rootsWithCrossings;
     for (const Constraint& constraint : constraints) {
         if (constraint.active && constraint.source >= 0) {
@@ -1244,36 +1279,24 @@ SolveResult solveWindings(const std::vector<FiberTrace>& fibers,
             (psi[link.fiberB][link.pointB] / kTwoPi + static_cast<double>(k[link.fiberB])));
     }
     std::sort(result.droppedLinks.begin(), result.droppedLinks.end());
-    // Violation of each crossing against the final map, in the canonical
-    // gauge (before psiH is restored below): the H side reads directly off
-    // the crossing, the V side off the V trace's nearest z sample.
+    // Violation of each crossing against the final map, exactly: at the
+    // crossing both fibers pass through the same lifted point, so
+    // W_v(c) - W_h(c) = n + k_v - k_h with n the crossing's exact translate
+    // integer - no geometry, no nearest-sample approximation.
     for (Crossing& crossing : merged) {
-        const std::vector<double>& vz = fibers[crossing.vFiber].z;
-        if (vz.empty()) {
-            continue;
-        }
-        std::size_t nearest = 0;
-        double bestDz = std::numeric_limits<double>::infinity();
-        for (std::size_t i = 0; i < vz.size(); ++i) {
-            const double dz = std::abs(vz[i] - crossing.zVx);
-            if (dz < bestDz) {
-                bestDz = dz;
-                nearest = i;
-            }
-        }
-        const double wH = crossing.psiH / kTwoPi +
-                          static_cast<double>(k[crossing.hFiber]);
-        const double wV = psi[crossing.vFiber][nearest] / kTwoPi +
-                          static_cast<double>(k[crossing.vFiber]);
+        const long long gap =
+            crossing.n + k[crossing.vFiber] - k[crossing.hFiber];
         switch (crossing.kind) {
-        case CrossingKind::Inside:   // demanded W_h <= W_v
-            crossing.violationTurns = std::max(0.0, wH - wV);
+        case CrossingKind::Inside:   // demanded W_h <= W_v, i.e. gap >= 0
+            crossing.violationTurns =
+                static_cast<double>(std::max<long long>(0, -gap));
             break;
-        case CrossingKind::Outside:  // demanded W_h >= W_v + 1
-            crossing.violationTurns = std::max(0.0, wV + 1.0 - wH);
+        case CrossingKind::Outside:  // demanded W_h >= W_v + 1, i.e. gap <= -1
+            crossing.violationTurns =
+                static_cast<double>(std::max<long long>(0, gap + 1));
             break;
         case CrossingKind::Tie:      // demanded W_h == W_v
-            crossing.violationTurns = std::abs(wH - wV);
+            crossing.violationTurns = static_cast<double>(std::llabs(gap));
             break;
         }
     }

@@ -27,8 +27,10 @@ class QGraphicsPathItem;
 class QGraphicsScene;
 class QLabel;
 class QMouseEvent;
+class QHideEvent;
 class QPushButton;
 class QShowEvent;
+class QTimer;
 class QTreeWidget;
 class QWheelEvent;
 
@@ -67,9 +69,13 @@ private:
 };
 
 // Interactive 2D map of every fiber, unrolled about the scroll umbilicus onto
-// one plane at the winding the solver inferred for it. The layout is only
-// ever rebuilt on explicit request; fiber changes just mark the current one
-// stale.
+// one plane at the winding the solver inferred for it. The layout rebuilds on
+// request, and - being cheap through the memoized Update path - automatically
+// for staleness a rebuild genuinely fixes (fiber or umbilicus changes) while
+// the workspace is visible; a light visible-only poll notices such changes
+// even when the user is not interacting with the map. Frame and voxel-size
+// staleness never rebuilds automatically: it is commonly a transiently
+// displayed volume, and it heals itself when the volume switches back.
 class FiberMapWorkspace : public QMainWindow
 {
     Q_OBJECT
@@ -85,8 +91,10 @@ protected:
     // The map's colours follow the application theme, and a switch is only
     // announced by a palette change.
     void changeEvent(QEvent* event) override;
-    // Catches a layout built from fiber data that has since changed.
+    // Catches a layout built from fiber data that has since changed, and
+    // starts/stops the visible-only staleness poll.
     void showEvent(QShowEvent* event) override;
+    void hideEvent(QHideEvent* event) override;
 
 private:
     // Scene-space copy of the placed fiber (y negated once, so scroll z reads
@@ -121,11 +129,11 @@ private:
     // describes is rebuilt or cleared. The reason names what actually changed
     // either way.
     void markStale(const QString& reason);
-    // Drops the layout entirely, for the changes that leave it not merely out of
-    // date but meaningless: geometry unrolled over one set of voxels says nothing
-    // about another set, and a different package has different fibers. A differing
-    // physical voxel size over the same voxel counts is *not* one of those — see
-    // evaluateDependencies().
+    // Drops the layout entirely, for the one change that leaves it not merely
+    // out of date but meaningless: a different package has different fibers.
+    // Grid and voxel-size differences are derived staleness instead — they
+    // commonly mean a transiently displayed volume and heal on revert — see
+    // FiberMapStaleness.hpp.
     void clearLayout(const QString& reason);
     // The decision itself lives in FiberMapStaleness.hpp as a function of two
     // dependency sets, so every arm of it is testable without a widget. Splitting
@@ -235,6 +243,11 @@ private:
     bool _viewFitted = false;
     bool _autoUpdateScheduled = false;
     bool _rebuildInProgress = false;
+    // Visible-only staleness poll: integer compares, one frame derivation and
+    // one umbilicus-file stat per tick — the workspace still costs annotation
+    // work nothing (no controller signal connections), and a hidden tab costs
+    // literally nothing.
+    QTimer* _stalePollTimer = nullptr;
     bool _fiberDockSized = false;
     bool _retheming = false;
     // What the current layout was built from, and whether a change has been seen
