@@ -262,3 +262,36 @@ class TestTargetNameValidation:
             assert mgr.allow_unlabeled_data is False
         finally:
             Path(temp_path).unlink()
+
+
+class TestConfigEncoding:
+    """Config files must load as UTF-8 regardless of the machine's locale codec (#1524)."""
+
+    def _load_bytes(self, raw: bytes):
+        with tempfile.NamedTemporaryFile(suffix='.yaml', delete=False) as f:
+            f.write(raw)
+            temp_path = f.name
+        try:
+            mgr = ConfigManager(verbose=False)
+            mgr.load_config(temp_path)
+            return mgr
+        finally:
+            Path(temp_path).unlink()
+
+    def test_utf8_bom_first_line_key_is_not_dropped(self):
+        """A UTF-8 BOM (as written by PowerShell / many Windows editors) must not
+        be glued onto the first key, which silently dropped that whole section."""
+        raw = b'\xef\xbb\xbf' + b'tr_setup:\n  model_name: bom_model\n'
+        mgr = self._load_bytes(raw)
+        assert mgr.tr_info.get('model_name') == 'bom_model'
+
+    def test_utf8_bom_before_comment_loads(self):
+        raw = b'\xef\xbb\xbf' + b'# comment\ntr_setup:\n  model_name: bom_model2\n'
+        mgr = self._load_bytes(raw)
+        assert mgr.tr_info.get('model_name') == 'bom_model2'
+
+    def test_non_ascii_comment_loads_intact(self):
+        """Bytes undefined in cp1252 (e.g. a smart quote) must not raise on load."""
+        raw = '# segment “w013” — région test\ntr_setup:\n  model_name: unicode_model\n'.encode('utf-8')
+        mgr = self._load_bytes(raw)
+        assert mgr.tr_info.get('model_name') == 'unicode_model'
