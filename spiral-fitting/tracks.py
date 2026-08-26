@@ -193,6 +193,13 @@ def normalize_tracks_dbm_path(path):
         return text
     if text.endswith('.db') and dbm.whichdb(text[:-3]):
         return text[:-3]
+    # A packed sibling store serves every read without opening the DBM, so
+    # accept the logical path on its evidence alone: whichdb cannot identify
+    # a Berkeley DBM where the stdlib lacks dbm.gnu/dbm.ndbm (e.g. Windows).
+    if os.path.isdir(text + TRACK_STORE_SUFFIX):
+        return text
+    if text.endswith('.db') and os.path.isdir(text[:-3] + TRACK_STORE_SUFFIX):
+        return text[:-3]
     raise FileNotFoundError(f'not a readable DBM logical path: {path}')
 
 
