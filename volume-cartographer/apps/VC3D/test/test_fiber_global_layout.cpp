@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "FiberNetworkLayout.hpp"
@@ -82,6 +84,15 @@ InputFiber makeFiber(uint64_t id, const QString& label, char hvTag,
     fiber.hvTag = hvTag;
     fiber.linePoints = std::move(linePoints);
     for (int index : controlIndices) {
+        // Loud in every build type: a bad fixture index must abort the test,
+        // not read past the vector in release.
+        if (index < 0 ||
+            static_cast<std::size_t>(index) >= fiber.linePoints.size()) {
+            throw std::out_of_range(
+                "makeFiber: control index " + std::to_string(index) +
+                " out of range for " + std::to_string(fiber.linePoints.size()) +
+                " line points");
+        }
         fiber.controlPoints.push_back(fiber.linePoints[static_cast<std::size_t>(index)]);
     }
     if (fiber.controlPoints.size() > 1) {
@@ -708,6 +719,22 @@ private slots:
         }
     }
 
+    // The fixture helper itself fails loudly on a bad control index, in
+    // every build type - a broken fixture must never silently read past its
+    // line points (the bug this guards against shipped once).
+    void fixtureHelperRejectsBadControlIndices()
+    {
+        bool threw = false;
+        try {
+            (void)makeFiber(999, QStringLiteral("bad"), 'H',
+                            arcPoints(30000.0, 4000.0, 300.0, 0.0, 2.0),
+                            {100, 400});
+        } catch (const std::out_of_range&) {
+            threw = true;
+        }
+        QVERIFY(threw);
+    }
+
     // No umbilicus: nothing can be unrolled, and EVERY fiber - not just the
     // geometryless one - is reported unplaceable rather than silently absent.
     void noUmbilicusReportsEveryFiberUnplaceable()
@@ -718,7 +745,7 @@ private slots:
         empty.label = QStringLiteral("broken");
         InputFiber whole = makeFiber(902, QStringLiteral("whole"), 'H',
                                      arcPoints(30000.0, 4000.0, 300.0, 0.0, 2.0),
-                                     {100, 400});
+                                     {100, 399});
         const GlobalResult result = vc3d::fiber_map::buildGlobalLayout(
             {empty, whole}, {}, defaultParams());
         QVERIFY(result.fibers.empty());
