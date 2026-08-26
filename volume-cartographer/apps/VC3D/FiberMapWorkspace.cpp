@@ -665,7 +665,22 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
         new QFutureWatcher<std::shared_ptr<RebuildJobResult>>(this);
     connect(_rebuildWatcher,
             &QFutureWatcher<std::shared_ptr<RebuildJobResult>>::finished, this,
-            [this]() { applyRebuild(_rebuildWatcher->result()); });
+            [this]() {
+                // result() rethrows an exception the future stored if one
+                // escaped the callable itself (runRebuildJob() catches
+                // everything, so this is the transport layer only). Letting
+                // it escape a slot is unsupported and would strand the queue
+                // in Running with the buttons disabled.
+                try {
+                    applyRebuild(_rebuildWatcher->result());
+                } catch (...) {
+                    Logger()->error(
+                        "Fiber map: rebuild result transport failed");
+                    markStale(tr("rebuild failed — press Update"));
+                    _rebuildQueue.beginApply();
+                    finishRebuild();
+                }
+            });
     _progressMarquee = new QTimer(this);
     _progressMarquee->setInterval(30);
     connect(_progressMarquee, &QTimer::timeout, this,
@@ -678,7 +693,10 @@ FiberMapWorkspace::~FiberMapWorkspace()
 {
     // No new starts, pending dropped, and any in-flight publication refused
     // by the epoch; the wait is only for the private pool's clean teardown -
-    // the worker owns its own data.
+    // the worker owns its own data. The wait is bounded by one solve (a few
+    // seconds at worst): buildGlobalLayout() has no cancellation point, and
+    // the alternative - detaching the pool - would trade a bounded pause on
+    // close for an unowned thread outliving the application's teardown.
     _rebuildQueue.shutdown();
     if (_stalePollTimer) {
         _stalePollTimer->stop();
@@ -1057,6 +1075,12 @@ void FiberMapWorkspace::hideEvent(QHideEvent* event)
     if (_stalePollTimer) {
         _stalePollTimer->stop();
     }
+    // The marquee is a paint effect on a hidden button: 33 wakeups a second
+    // for nobody. The build itself keeps running; showEvent() resumes the
+    // animation if it is still in flight.
+    if (_progressMarquee) {
+        _progressMarquee->stop();
+    }
 }
 
 void FiberMapWorkspace::showEvent(QShowEvent* event)
@@ -1064,6 +1088,13 @@ void FiberMapWorkspace::showEvent(QShowEvent* event)
     QMainWindow::showEvent(event);
     if (_stalePollTimer) {
         _stalePollTimer->start();
+    }
+    // A build still in flight: resume the marquee hideEvent() paused
+    // (_progressButton is non-null exactly while progress UI is active).
+    if (_progressMarquee && _progressButton &&
+        _rebuildQueue.state() !=
+            vc3d::fiber_map::FiberMapRebuildQueue::State::Idle) {
+        _progressMarquee->start();
     }
     // Becoming visible is the first of the three moments a stale layout has to
     // be caught; the others are a rebuild and any attempt to act on the map.
@@ -1127,12 +1158,20 @@ void FiberMapWorkspace::startRebuild(bool fullRebuild)
         _layoutCache.clear();
     }
 
-    auto job = std::make_shared<RebuildJobResult>();
-    job->fullRebuild = fullRebuild;
-    // Captured after the pre-check: a clear above advanced the epoch, and
-    // this job publishes into the world as it stands now.
-    job->epoch = _rebuildQueue.epoch();
+    // One rollback for the whole launch: the queue is already Running, so
+    // any throw between here and a successfully created future must run the
+    // epilogue itself or every later request would merely coalesce forever.
+    // The future creation stays inside the guarded region; once it exists,
+    // the watcher's finished path owns cleanup.
+    std::shared_ptr<RebuildJobResult> job;
+    bool cacheMoved = false;
+    QFuture<std::shared_ptr<RebuildJobResult>> future;
     try {
+        job = std::make_shared<RebuildJobResult>();
+        job->fullRebuild = fullRebuild;
+        // Captured after the pre-check: a clear above advanced the epoch, and
+        // this job publishes into the world as it stands now.
+        job->epoch = _rebuildQueue.epoch();
         // Read before the snapshot: fiberMapSnapshot() parses the umbilicus,
         // so a rewrite during that parse that moves the file's size or mtime
         // — the token's contract; a same-size rewrite inside one timestamp
@@ -1147,48 +1186,67 @@ void FiberMapWorkspace::startRebuild(bool fullRebuild)
         job->builtUmbilicusGeneration = _controller->umbilicusGeneration();
         job->hadFibers = !job->snapshot.fibers.empty();
         job->hadUmbilicus = !job->snapshot.umbilicusCenters.empty();
+
+        // The layout and solver are unit-free, so the physical intents behind
+        // their tuning lengths are converted here — once the voxel size is
+        // known, exactly as documented on GlobalLayoutParams and SolverParams.
+        // Left alone when it is not, so the defaults (the same intents at
+        // 2.4 µm) stand in and the map still lays out sensibly.
+        if (job->snapshot.voxelSizeUm) {
+            const double vxPerCm = kUmPerCm / *job->snapshot.voxelSizeUm;
+            job->params.smoothVx = 0.12 * vxPerCm;         // 1.2 mm arclength sigma
+            job->params.resampleStepVx = 0.025 * vxPerCm;  // 0.025 cm resample step
+            job->params.minPadXVx = 2.2 * vxPerCm;         // 2.2 cm label pad across
+            job->params.minPadYVx = 1.6 * vxPerCm;         // 1.6 cm label pad up
+            job->params.solver.tieBandVx = 0.03 * vxPerCm;           // sheet-thickness scale
+            job->params.solver.minUmbilicusRadiusVx = 0.1 * vxPerCm; // angular conditioning
+            job->params.solver.zMergeVx = 0.2 * vxPerCm;             // crossing dedup span
+            job->params.solver.neighborhoodZVx = 0.5 * vxPerCm;      // ordinal window
+            job->params.solver.neighborhoodArcVx = 0.5 * vxPerCm;
+        }
+
+        // The cache travels WITH the job: the worker is its only toucher
+        // while the build is in flight, by construction rather than by
+        // discipline. Any GUI path that "clears the cache" mid-flight clears
+        // this empty stand-in, and the epoch such paths also bump refuses
+        // the job's publication.
+        job->cache = std::move(_layoutCache);
+        _layoutCache = vc3d::fiber_map::GlobalLayoutCache{};
+        cacheMoved = true;
+
+        _updateButton->setEnabled(false);
+        _fullRebuildButton->setEnabled(false);
+        startRebuildProgress(fullRebuild ? _fullRebuildButton : _updateButton);
+
+        future = QtConcurrent::run(&_rebuildPool, [job]() {
+            runRebuildJob(job);
+            return job;
+        });
     } catch (const std::exception& ex) {
-        Logger()->error("Fiber map: snapshot failed: {}", ex.what());
+        Logger()->error("Fiber map: rebuild start failed: {}", ex.what());
+        if (job && cacheMoved) {
+            // The worker never launched (the future is created last), so the
+            // cache is safe to take back.
+            _layoutCache = std::move(job->cache);
+        }
+        markStale(tr("rebuild failed — press Update"));
+        _rebuildQueue.beginApply();
+        finishRebuild();
+        return;
+    } catch (...) {
+        Logger()->error("Fiber map: rebuild start failed (unknown)");
+        if (job && cacheMoved) {
+            _layoutCache = std::move(job->cache);
+        }
         markStale(tr("rebuild failed — press Update"));
         _rebuildQueue.beginApply();
         finishRebuild();
         return;
     }
-
-    // The layout and solver are unit-free, so the physical intents behind
-    // their tuning lengths are converted here — once the voxel size is
-    // known, exactly as documented on GlobalLayoutParams and SolverParams.
-    // Left alone when it is not, so the defaults (the same intents at
-    // 2.4 µm) stand in and the map still lays out sensibly.
-    if (job->snapshot.voxelSizeUm) {
-        const double vxPerCm = kUmPerCm / *job->snapshot.voxelSizeUm;
-        job->params.smoothVx = 0.12 * vxPerCm;         // 1.2 mm arclength sigma
-        job->params.resampleStepVx = 0.025 * vxPerCm;  // 0.025 cm resample step
-        job->params.minPadXVx = 2.2 * vxPerCm;         // 2.2 cm label pad across
-        job->params.minPadYVx = 1.6 * vxPerCm;         // 1.6 cm label pad up
-        job->params.solver.tieBandVx = 0.03 * vxPerCm;           // sheet-thickness scale
-        job->params.solver.minUmbilicusRadiusVx = 0.1 * vxPerCm; // angular conditioning
-        job->params.solver.zMergeVx = 0.2 * vxPerCm;             // crossing dedup span
-        job->params.solver.neighborhoodZVx = 0.5 * vxPerCm;      // ordinal window
-        job->params.solver.neighborhoodArcVx = 0.5 * vxPerCm;
-    }
-
-    // The cache travels WITH the job: the worker is its only toucher while
-    // the build is in flight, by construction rather than by discipline. Any
-    // GUI path that "clears the cache" mid-flight clears this empty stand-in,
-    // and the epoch such paths also bump refuses the job's publication.
-    job->cache = std::move(_layoutCache);
-    _layoutCache = vc3d::fiber_map::GlobalLayoutCache{};
-
-    _updateButton->setEnabled(false);
-    _fullRebuildButton->setEnabled(false);
-    startRebuildProgress(fullRebuild ? _fullRebuildButton : _updateButton);
-
-    _rebuildWatcher->setFuture(QtConcurrent::run(
-        &_rebuildPool, [job]() {
-            runRebuildJob(job);
-            return job;
-        }));
+    // Effectively non-throwing: stores the future and wires signals. Kept
+    // outside the rollback because once run() has returned the worker may
+    // already be touching job->cache — taking it back would race.
+    _rebuildWatcher->setFuture(future);
 }
 
 void FiberMapWorkspace::applyRebuild(const std::shared_ptr<RebuildJobResult>& job)
@@ -1199,6 +1257,18 @@ void FiberMapWorkspace::applyRebuild(const std::shared_ptr<RebuildJobResult>& jo
     const bool expected = job != nullptr && _rebuildQueue.mayPublish(job->epoch);
     _rebuildQueue.beginApply();
     const auto epilogue = qScopeGuard([this]() { finishRebuild(); });
+    // Declared after the epilogue so it runs first (guards unwind in reverse):
+    // the watcher's future keeps the job's shared_ptr alive until the next
+    // setFuture(), so "drop" on a discard or error means clearing the job's
+    // heavy members here - otherwise a rejected 452-fiber layout, its
+    // snapshot, and its cache would stay resident in an idle workspace.
+    const auto release = qScopeGuard([&job]() {
+        if (job) {
+            job->snapshot = {};
+            job->layout = {};
+            job->cache = {};
+        }
+    });
 
     if (!expected || !_controller) {
         // A package switch, explicit clear, memoization-policy change, or
@@ -1214,14 +1284,33 @@ void FiberMapWorkspace::applyRebuild(const std::shared_ptr<RebuildJobResult>& jo
         markStale(tr("rebuild failed — press Update"));
         return;
     }
-    // A package or grid switch no gate happened to observe mid-flight: the
-    // epoch could not catch it, so it is validated directly. The result (and
-    // its cache, built from the old package's content) is discarded; the
-    // ordinary gates take over.
-    if (_controller->packageGeneration() != job->builtPackageGeneration ||
-        !vc3d::annotation::sameAnnotationGrid(_controller->annotationFrame(),
-                                              job->snapshot.frame)) {
-        refreshStaleState();
+    // A package switch no gate happened to observe mid-flight: the epoch
+    // could not catch it, so it is validated directly. The result and its
+    // cache, built from the old package's content, are discarded. With a
+    // layout built, the verdict machinery produces the proper ClearLayout;
+    // before a first build it has nothing to compare (verdict Fresh), yet
+    // the status still names the old package's umbilicus - so the clear
+    // that recomposes it runs directly.
+    if (_controller->packageGeneration() != job->builtPackageGeneration) {
+        if (!refreshStaleState()) {
+            clearLayout(tr("project changed — press Update"));
+        }
+        return;
+    }
+    // The full frame, not just the grid: parameters were converted through
+    // the snapshot's voxel size, so a same-grid volume with a different
+    // recorded voxel size (the reversible VoxelSize stale cause) would make
+    // this result stale on arrival - publishing it would destroy a layout
+    // that is still valid for the volume the user switched back to. The
+    // cache IS kept: its slots are content-keyed (params included), so
+    // switching back to the built frame re-warms.
+    if (!vc3d::annotation::sameAnnotationFrame(_controller->annotationFrame(),
+                                               job->snapshot.frame)) {
+        _layoutCache = std::move(job->cache);
+        if (!refreshStaleState()) {
+            showStale(tr(
+                "viewing another volume's grid — switch back, or press Update"));
+        }
         return;
     }
     // Fibers or the umbilicus changed mid-flight: publishing a result
@@ -1233,8 +1322,15 @@ void FiberMapWorkspace::applyRebuild(const std::shared_ptr<RebuildJobResult>& jo
         _controller->umbilicusGeneration() != job->builtUmbilicusGeneration ||
         _controller->umbilicusFingerprint() != job->preReadUmbilicusFingerprint) {
         _layoutCache = std::move(job->cache);
-        (void)_rebuildQueue.request(job->fullRebuild);
-        showStale(tr("changed during update — updating…"));
+        if (isVisible()) {
+            (void)_rebuildQueue.request(job->fullRebuild);
+            showStale(tr("changed during update — updating…"));
+        } else {
+            // The visible-only contract: edits made while the workspace is
+            // hidden must not chain background rebuilds. The gates re-arm
+            // the automatic update on the next show.
+            showStale(tr("changed during update — press Update"));
+        }
         return;
     }
 
@@ -1245,6 +1341,9 @@ void FiberMapWorkspace::applyRebuild(const std::shared_ptr<RebuildJobResult>& jo
         // watermarks disagreeing; the latch refuses interaction until a
         // rebuild succeeds.
         Logger()->error("Fiber map: rebuild publication failed: {}", ex.what());
+        markStale(tr("rebuild failed — press Update"));
+    } catch (...) {
+        Logger()->error("Fiber map: rebuild publication failed (unknown)");
         markStale(tr("rebuild failed — press Update"));
     }
 }
@@ -1421,10 +1520,23 @@ void FiberMapWorkspace::finishRebuild()
         _fullRebuildButton->setEnabled(true);
     }
     const auto pending = _rebuildQueue.finishApply();
-    if (pending != vc3d::fiber_map::FiberMapRebuildQueue::Pending::None) {
-        requestRebuild(pending ==
-                       vc3d::fiber_map::FiberMapRebuildQueue::Pending::Full);
+    if (pending == vc3d::fiber_map::FiberMapRebuildQueue::Pending::None) {
+        return;
     }
+    const bool full =
+        pending == vc3d::fiber_map::FiberMapRebuildQueue::Pending::Full;
+    // A pending Update was armed by a gate that compared against the OLD
+    // build's watermarks mid-flight; when the build that just published
+    // already covers the change, the verdict here is Fresh and the update
+    // would recompute a digest-identical map. A latched failure or genuine
+    // staleness still dispatches, and a pending Full always does - it is
+    // the user's explicit escape hatch.
+    if (!full && _layoutBuilt &&
+        evaluateDependencies().action ==
+            vc3d::fiber_map::StaleVerdict::Action::Fresh) {
+        return;
+    }
+    requestRebuild(full);
 }
 
 void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
