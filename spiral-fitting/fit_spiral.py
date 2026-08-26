@@ -2926,7 +2926,8 @@ class FitContext:
         # inputs make every bake unbakeable — rather than thousands of steps
         # later at the first reset boundary (which stays the authoritative
         # gate, since influence windows only exist at run time).
-        if int(self.config.get('optimizer_reset_interval', 0) or 0) > 0:
+        if constraint_baking.reset_schedule(
+                self.config, self.num_training_steps):
             reasons = constraint_baking.bake_refusal_reasons(
                 interactive=self.interactive_driver is not None,
                 influence_active=False,
@@ -2934,7 +2935,7 @@ class FitContext:
             )
             if reasons:
                 raise RuntimeError(
-                    'optimizer_reset_interval > 0 but constraint bakes would '
+                    'resets are scheduled but constraint bakes would '
                     'be refused: ' + '; '.join(reasons))
             if self.dist.is_main_process and (
                     self.dense_normals_enabled
@@ -5126,8 +5127,8 @@ class FitContext:
             'optimizing', 'Optimizing',
             step=0, total_steps=max(0, self.num_training_steps - self.start_iteration),
             unit='iterations')
-        reset_interval = int(
-            self.config.get('optimizer_reset_interval', 0) or 0)
+        reset_steps = frozenset(constraint_baking.reset_schedule(
+            self.config, self.num_training_steps))
         for iteration in tqdm(
                 range(self.start_iteration, self.num_training_steps),
                 disable=not self.dist.is_main_process or has_progress):
@@ -5137,14 +5138,8 @@ class FitContext:
             # Bake before the autosave so any checkpoint at this boundary
             # already carries the reset it belongs with; a resume then never
             # re-runs (or misses) the bake for its completed-step count.
-            # The final scheduled reset is skipped (a bake fires only when a
-            # full further interval fits before the horizon): each reset
-            # restarts the live parameters into the decaying tail of the LR
-            # schedule, so the last epoch gets at least two intervals to
-            # converge instead of ending on a barely-trained restart.
-            if (reset_interval > 0
-                    and (iteration + 1) % reset_interval == 0
-                    and iteration + 1 + reset_interval < self.num_training_steps):
+            # constraint_baking.reset_schedule owns which boundaries fire.
+            if iteration + 1 in reset_steps:
                 self.bake_and_reset(iteration + 1)
             self._maybe_save_headless_checkpoint(iteration + 1)
 

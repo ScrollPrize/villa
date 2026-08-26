@@ -380,5 +380,76 @@ class WindingStoreBakeTests(unittest.TestCase):
         torch.testing.assert_close(samples['target'], torch.tensor([2.]))
 
 
+class ResetScheduleTests(unittest.TestCase):
+    """The one rule both the build-time check and the training loop read."""
+
+    def schedule(self, horizon=30000, **overrides):
+        return constraint_baking.reset_schedule(
+            Config(overrides).as_dict(), horizon)
+
+    def test_a_zero_interval_disables_resets(self):
+        self.assertEqual(self.schedule(), ())
+        self.assertEqual(self.schedule(optimizer_reset_interval=0), ())
+
+    def test_the_horizon_rule_drops_the_final_scheduled_reset(self):
+        # A bake fires only when a full further interval fits before the
+        # horizon, so 25000 is dropped (25000 + 5000 == 30000).
+        self.assertEqual(
+            self.schedule(optimizer_reset_interval=5000),
+            (5000, 10000, 15000, 20000))
+        # At 10000 the horizon rule alone already leaves a single reset.
+        self.assertEqual(self.schedule(optimizer_reset_interval=10000), (10000,))
+        # An interval too coarse to leave room bakes not at all.
+        self.assertEqual(self.schedule(optimizer_reset_interval=20000), ())
+
+    def test_an_explicit_list_replaces_the_interval_and_its_horizon_rule(self):
+        # The point of the list: a lone reset the interval grid cannot place.
+        # interval=15000 or 25000 schedules nothing at all, and a coarser
+        # interval only ever starts at its own first multiple.
+        self.assertEqual(self.schedule(optimizer_reset_interval=15000), ())
+        self.assertEqual(self.schedule(optimizer_reset_interval=25000), ())
+        for step in (5000, 10000, 15000, 25000):
+            self.assertEqual(
+                self.schedule(optimizer_reset_steps=[step]), (step,))
+        self.assertEqual(
+            self.schedule(optimizer_reset_steps=[20000, 5000, 5000]),
+            (5000, 20000))
+        # Set, it wins outright rather than intersecting the interval grid.
+        self.assertEqual(
+            self.schedule(optimizer_reset_interval=5000,
+                          optimizer_reset_steps=[25000]),
+            (25000,))
+
+    def test_explicit_steps_outside_the_fit_are_dropped(self):
+        self.assertEqual(self.schedule(optimizer_reset_steps=[30000]), ())
+        self.assertEqual(self.schedule(optimizer_reset_steps=[0]), ())
+        self.assertEqual(
+            self.schedule(optimizer_reset_steps=[29999, 30001]), (29999,))
+        # An empty list is not a schedule; it falls back to the interval.
+        self.assertEqual(self.schedule(optimizer_reset_steps=[]), ())
+        self.assertEqual(
+            self.schedule(optimizer_reset_interval=10000,
+                          optimizer_reset_steps=[]),
+            (10000,))
+
+    def test_the_step_list_is_backfillable_and_variable_length(self):
+        from config import BACKFILLABLE_CONFIG_DEFAULTS
+        self.assertIsNone(
+            BACKFILLABLE_CONFIG_DEFAULTS['optimizer_reset_steps'])
+        self.assertIsNone(Config().as_dict()['optimizer_reset_steps'])
+        spec = Config.catalog()['schema']['fields']['optimizer_reset_steps']
+        self.assertEqual(spec['type'], 'vector')
+        self.assertTrue(spec['nullable'])
+        # Length is part of the value, unlike every other vector field.
+        self.assertIsNone(spec['length'])
+        self.assertEqual(
+            Config.catalog()['schema']['fields']
+            ['track_length_bin_weights']['length'], 3)
+        for accepted in ([5000], [5000, 10000, 15000, 20000, 25000]):
+            Config({'optimizer_reset_steps': accepted})
+        with self.assertRaises(ValueError):
+            Config({'optimizer_reset_steps': ['5000']})
+
+
 if __name__ == '__main__':
     unittest.main()

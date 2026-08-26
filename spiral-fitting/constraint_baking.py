@@ -352,3 +352,35 @@ def bake_refusal_reasons(*, interactive, influence_active, phase_mode,
             'transform warm-up truncation is active: constraints must be '
             'baked through the untruncated transform')
     return reasons
+
+
+def reset_schedule(config, num_training_steps):
+    """The completed-step counts at which constraint bakes fire.
+
+    One rule, read by both the build-time refusal check and the training
+    loop, so a config can never be validated against a schedule the loop
+    would not run.
+
+    ``optimizer_reset_steps`` names the boundaries outright and wins when
+    set; only steps strictly inside the fit are kept, and duplicates and
+    ordering are normalised. Otherwise ``optimizer_reset_interval`` sets the
+    spacing (0 disables resets entirely) and the final scheduled reset is
+    dropped unless a full further interval fits before the horizon: each
+    reset restarts the live parameters into the decaying tail of the LR
+    schedule, so the last epoch gets at least two intervals to converge
+    instead of ending on a barely trained restart. That horizon rule is why
+    an explicit list exists — the interval alone cannot place a lone reset
+    late in the fit.
+    """
+    horizon = int(num_training_steps)
+    explicit = config.get('optimizer_reset_steps') or ()
+    if explicit:
+        return tuple(sorted({
+            int(step) for step in explicit if 0 < int(step) < horizon}))
+    interval = int(config.get('optimizer_reset_interval', 0) or 0)
+    if interval <= 0:
+        return ()
+    return tuple(
+        step for step in range(interval, horizon + 1, interval)
+        if step + interval < horizon
+    )

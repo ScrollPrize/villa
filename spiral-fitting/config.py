@@ -25,6 +25,14 @@ _NULL_TYPES = {
     "loss_start_track_dt": "integer",
     "loss_start_unverified_patch_dt": "number",
     "patch_uuid_filter_regex": "string",
+    "optimizer_reset_steps": "vector",
+}
+
+# Vector fields whose length is part of the value rather than fixed by the
+# schema. Their spec carries length None, and validation checks the item
+# types without constraining how many there are.
+_VARIABLE_LENGTH_VECTORS = {
+    "optimizer_reset_steps",
 }
 
 _PREPARED_INPUT_FIELDS = {
@@ -130,6 +138,7 @@ BACKFILLABLE_CONFIG_DEFAULTS = {
 # value unambiguously means the historical behaviour (no resets).
 BACKFILLABLE_CONFIG_DEFAULTS.update({
     "optimizer_reset_interval": 0,
+    "optimizer_reset_steps": None,
     "optimizer_reset_probe_warn_voxels": 1.0,
     "optimizer_reset_lr_warmup_steps": 250,
 })
@@ -250,7 +259,10 @@ def _field_spec(key, default):
     elif kind == "enum":
         spec["values"] = _ENUMS[key]
     elif kind == "vector":
-        spec["length"] = 3 if key == "track_length_bin_weights" else len(default)
+        spec["length"] = (
+            None if key in _VARIABLE_LENGTH_VECTORS
+            else 3 if key == "track_length_bin_weights"
+            else len(default))
     if key in _SCALE_WITH_Z_FIELDS:
         spec["scale_with_z"] = True
     if key in _Z_RANGE_DESCRIPTIONS:
@@ -288,6 +300,13 @@ class Config:
         # disabled: their volume stores describe true scroll space, which
         # the baked inputs leave at that point.
         self.optimizer_reset_interval = 0
+        # An explicit list of completed-step counts to bake at, which
+        # replaces the interval schedule (and its horizon rule) outright when
+        # set. This is what makes a one-shot bake at an arbitrary step
+        # expressible: the interval alone can only place resets on its own
+        # grid, and only where a full further interval still fits. None or []
+        # leaves the interval in charge.
+        self.optimizer_reset_steps = None
         # Warn when a bake's round-trip probe error (RK4 forward/inverse
         # inconsistency, in scroll voxels) exceeds this; the error is
         # committed permanently into the constraints once per bake.
@@ -561,7 +580,8 @@ class Config:
             if spec["type"] in ("integer", "number") and not (
                     spec["minimum"] <= value <= spec["maximum"]):
                 raise ValueError(f"Out-of-range value for {key}")
-            if spec["type"] == "vector" and len(value) != spec["length"]:
+            if (spec["type"] == "vector" and spec["length"] is not None
+                    and len(value) != spec["length"]):
                 raise ValueError(f"Invalid vector length for {key}")
             if spec["type"] == "vector" and any(
                     type(item) not in (int, float) for item in value):
