@@ -533,16 +533,16 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
     auto* toolBar = addToolBar(tr("Fiber Map"));
     toolBar->setObjectName(QStringLiteral("fiberMapToolBar"));
     toolBar->setMovable(false);
-    auto* updateButton = new QPushButton(tr("Update"), toolBar);
-    updateButton->setToolTip(
+    _updateButton = new QPushButton(tr("Update"), toolBar);
+    _updateButton->setToolTip(
         tr("Rebuild the map, reusing cached work for unchanged fibers.\n"
            "Identical result to Full rebuild, much faster."));
-    toolBar->addWidget(updateButton);
-    auto* fullRebuildButton = new QPushButton(tr("Full rebuild"), toolBar);
-    fullRebuildButton->setToolTip(
+    toolBar->addWidget(_updateButton);
+    _fullRebuildButton = new QPushButton(tr("Full rebuild"), toolBar);
+    _fullRebuildButton->setToolTip(
         tr("Recompute everything from scratch, then verify the cached\n"
            "result. Use if the map ever looks wrong."));
-    toolBar->addWidget(fullRebuildButton);
+    toolBar->addWidget(_fullRebuildButton);
     toolBar->addSeparator();
     _statusLabel =
         new QLabel(tr("press Update"), toolBar);
@@ -583,9 +583,9 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
         connect(_fiberDock, &QDockWidget::dockLocationChanged, this, releaseStaleMouseGrab);
     }
 
-    connect(updateButton, &QPushButton::clicked, this,
+    connect(_updateButton, &QPushButton::clicked, this,
             [this]() { rebuildLayout(false); });
-    connect(fullRebuildButton, &QPushButton::clicked, this,
+    connect(_fullRebuildButton, &QPushButton::clicked, this,
             [this]() { rebuildLayout(true); });
     connect(_view, &FiberMapView::clicked, this, &FiberMapWorkspace::handleSceneClick);
     connect(_view, &FiberMapView::zoomed, this,
@@ -808,6 +808,54 @@ bool FiberMapWorkspace::refreshStaleState()
     return applyStaleVerdict(evaluateDependencies());
 }
 
+namespace
+{
+constexpr const char* kRebuildProgressOverlayName = "fiberMapRebuildProgress";
+} // namespace
+
+void FiberMapWorkspace::setRebuildProgress(QPushButton* button, double fraction)
+{
+    if (button == nullptr) {
+        return;
+    }
+    auto* overlay =
+        button->findChild<QWidget*>(QLatin1String(kRebuildProgressOverlayName),
+                                    Qt::FindDirectChildrenOnly);
+    if (overlay == nullptr) {
+        overlay = new QWidget(button);
+        overlay->setObjectName(QLatin1String(kRebuildProgressOverlayName));
+        // Purely decorative: never intercept the click it reports on.
+        overlay->setAttribute(Qt::WA_TransparentForMouseEvents, true);
+        overlay->setStyleSheet(QStringLiteral(
+            "background-color: rgba(80, 150, 255, 110); border-radius: 2px;"));
+    }
+    const double clamped = std::clamp(fraction, 0.0, 1.0);
+    overlay->setGeometry(
+        0, 0, static_cast<int>(std::lround(button->width() * clamped)),
+        button->height());
+    overlay->show();
+    overlay->raise();
+    // The rebuild blocks the event loop, so the sweep must paint NOW: repaint
+    // is a synchronous paint of exactly these widgets, no event loop needed.
+    overlay->repaint();
+    button->repaint();
+}
+
+void FiberMapWorkspace::clearRebuildProgress()
+{
+    for (QPushButton* button : {_updateButton, _fullRebuildButton}) {
+        if (button == nullptr) {
+            continue;
+        }
+        if (auto* overlay = button->findChild<QWidget*>(
+                QLatin1String(kRebuildProgressOverlayName),
+                Qt::FindDirectChildrenOnly)) {
+            overlay->hide();
+        }
+        button->update();
+    }
+}
+
 void FiberMapWorkspace::scheduleAutoUpdate()
 {
     // Queued rather than inline: the gates run inside click and selection
@@ -866,7 +914,12 @@ void FiberMapWorkspace::rebuildLayout(bool fullRebuild)
         return;
     }
     _rebuildInProgress = true;
-    const auto rebuildGuard = qScopeGuard([this]() { _rebuildInProgress = false; });
+    QPushButton* progressButton = fullRebuild ? _fullRebuildButton : _updateButton;
+    const auto rebuildGuard = qScopeGuard([this]() {
+        clearRebuildProgress();
+        _rebuildInProgress = false;
+    });
+    setRebuildProgress(progressButton, 0.06);
     QElapsedTimer phaseTimer;
     phaseTimer.start();
     QElapsedTimer totalTimer;
@@ -900,6 +953,7 @@ void FiberMapWorkspace::rebuildLayout(bool fullRebuild)
     const QString preReadUmbilicusFingerprint = _controller->umbilicusFingerprint();
     LineAnnotationController::FiberMapSnapshot snapshot = _controller->fiberMapSnapshot();
     const qint64 snapshotMs = phaseTimer.restart();
+    setRebuildProgress(progressButton, 0.25);
     const uint64_t builtPackageGeneration = _controller->packageGeneration();
     const uint64_t builtUmbilicusGeneration = _controller->umbilicusGeneration();
 
@@ -945,9 +999,11 @@ void FiberMapWorkspace::rebuildLayout(bool fullRebuild)
         params.solver.neighborhoodArcVx = 0.5 * vxPerCm;
     }
     const qint64 convertMs = phaseTimer.restart();
+    setRebuildProgress(progressButton, 0.32);
     _layout = vc3d::fiber_map::buildGlobalLayout(inputs, snapshot.umbilicusCenters,
                                                  params, &_layoutCache);
     const qint64 layoutMs = phaseTimer.restart();
+    setRebuildProgress(progressButton, 0.78);
     // The build succeeded: commit every dependency watermark together.
     // (_layoutBuilt covers empty results too - an empty result is still a
     // result, derived from dependencies that go out of date.)
@@ -1026,8 +1082,10 @@ void FiberMapWorkspace::rebuildLayout(bool fullRebuild)
     }
     rebuildScene(emptyMessage);
     const qint64 sceneMs = phaseTimer.restart();
+    setRebuildProgress(progressButton, 0.93);
     rebuildTree();
     const qint64 treeMs = phaseTimer.restart();
+    setRebuildProgress(progressButton, 1.0);
     Logger()->info(
         "fiber map rebuild: snapshot {} ms · convert {} ms · layout {} ms "
         "(prep {:.0f}, detect {:.0f}, solve {:.0f}, geometry {:.0f}) · "

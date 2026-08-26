@@ -27,6 +27,7 @@ class QGraphicsPathItem;
 class QGraphicsScene;
 class QLabel;
 class QMouseEvent;
+class QPushButton;
 class QShowEvent;
 class QTreeWidget;
 class QWheelEvent;
@@ -149,6 +150,12 @@ private:
     // re-entrantly. Frame/voxel-size/latched staleness never auto-rebuilds
     // (commonly a transiently displayed volume; see FiberMapStaleness.hpp).
     void scheduleAutoUpdate();
+    // A translucent blue bar sweeping across the triggering button as the
+    // rebuild's phases complete. The rebuild blocks the event loop, so the
+    // sweep advances by forced synchronous repaints at phase boundaries
+    // rather than by animation.
+    void setRebuildProgress(QPushButton* button, double fraction);
+    void clearRebuildProgress();
     // The two together, for callers that can absorb a scene rebuild inline.
     bool refreshStaleState();
     // Appends the package's umbilicus state to a status line, resolving it at
@@ -189,6 +196,8 @@ private:
     QGraphicsScene* _scene = nullptr;
     QTreeWidget* _tree = nullptr;
     QDockWidget* _fiberDock = nullptr;
+    QPushButton* _updateButton = nullptr;
+    QPushButton* _fullRebuildButton = nullptr;
     QLabel* _statusLabel = nullptr;
     vc3d::fiber_map::GlobalResult _layout;
     // Memoized rebuild state: the cache, whether a verification failure
