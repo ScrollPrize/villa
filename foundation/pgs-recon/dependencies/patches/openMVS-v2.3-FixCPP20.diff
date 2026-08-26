@@ -1,0 +1,13 @@
+diff --git a/libs/Common/FastDelegateCPP11.h b/libs/Common/FastDelegateCPP11.h
+index 26a565b..5543bee 100644
+--- a/libs/Common/FastDelegateCPP11.h
++++ b/libs/Common/FastDelegateCPP11.h
+@@ -152,7 +152,7 @@ public:
+     {
+         using functor_type = typename ::std::decay<T>::type;
+ 
+-        if ((sizeof(functor_type) > store_size_) || !store_.unique())
++        if ((sizeof(functor_type) > store_size_) || store_.use_count() != 1)
+         {
+             store_.reset(operator new(sizeof(functor_type)), functor_deleter<functor_type>);
+             store_size_ = sizeof(functor_type);
