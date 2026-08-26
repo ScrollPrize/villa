@@ -1,0 +1,29 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index ff8c4c5f..4d7a9c7e 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -130,6 +130,9 @@ set(CMAKE_MODULE_PATH
+ include(OptimizeForArchitecture)
+ OptimizeForArchitecture()
+ 
++# Helper utility for overriding cached variables
++include(UpdateCacheVariable)
++
+ if (UNIX AND NOT OpenMVG_BUILD_COVERAGE)
+   set(CMAKE_C_FLAGS_RELEASE "-O3")
+   set(CMAKE_CXX_FLAGS_RELEASE "-O3")
+@@ -178,12 +181,9 @@ if (OpenMVG_USE_OPENMP)
+       endif()
+     endif()
+     list(APPEND OPENMVG_LIBRARY_DEPENDENCIES OpenMP::OpenMP_CXX)
++  else (OPENMP_FOUND)
++      UPDATE_CACHE_VARIABLE(OpenMVG_USE_OPENMP OFF)
+   endif (OPENMP_FOUND)
+-else (OpenMVG_USE_OPENMP)
+-    option(OpenMVG_USE_OPENMP "Use OpenMP for parallelization" OFF)
+-    include(UpdateCacheVariable)
+-    UPDATE_CACHE_VARIABLE(OpenMVG_USE_OPENMP OFF)
+-    remove_definitions(-DOPENMVG_USE_OPENMP)
+ endif (OpenMVG_USE_OPENMP)
+ 
+ # ==============================================================================
