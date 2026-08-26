@@ -5,7 +5,6 @@ From [Vesuvius Challenge](https://scrollprize.org), a Python library for :
 - Training 2d or 3d models on regression tasks
 - Inferring with models trained with the trainers provided in the package or with pretrained nnUNetv2 models
   - Inference can be performed on remote data (http, s3) stored as Zarr arrays
-- Rendering .obj segments with local or remote data
 - Voxelizing large .obj segmentations for use as 3d labels
 - Preprocessing labels of fiber-like structures
 - Interactive labeling and model training through a Napari based trainer
@@ -79,7 +78,7 @@ Additionally, the augmentations provided within this package are from another of
 
 Copying the modules directly into `vesuvius` was a choice of end-user friendliness, as we were using highly modified branches of both libraries, which created conflicts if an end user were to attempt to run any of our models.
 
-_**Detailed documentation for training and inference are located in [the docs folder](docs/docs)**_
+_**Detailed documentation for training and inference are located in [the docs folder](docs)**_
 ___
 
 
@@ -93,7 +92,7 @@ ___
 6. Infer on the same layer, or another by importing an image, selecting it in the inference widget, and hitting `Run Inference`
 
 
-![alt text](docs/docs/images/napari_trainer.png)
+![alt text](docs/images/napari_trainer.png)
 
 ___
 
@@ -109,7 +108,7 @@ The proofreader lives in [`segmentation/vc_proofreader`](../segmentation/vc_proo
 6. Skip patches or continue with `spacebar` or `next pair`
 7. Patches are saved in the output dir, and their locations in the .json progress file
 
-![alt text](docs/docs/images/proofreader.png)
+![alt text](docs/images/proofreader.png)
 
 ### Training with `vesuvius.train`
 
@@ -159,4 +158,4 @@ By default, the last 10 checkpoints are saved. This is not a smart way to do it,
 Training will run for 1,000 epochs by default, with 200 batches/epoch. This can be modified through the configuration file, which can be optionally provided to `vesuvius.train`, and some examples are provided in the [models folder](src/vesuvius/models/configuration/)
 
 ### Rendering and Flattening objs
-Documentation is provided in [the rendering folder](src/vesuvius/rendering/README.md)
+This code was retired with ThaumatoAnakalyptor (now under [`deprecated/`](../deprecated/thaumato-anakalyptor)). To render a segment into a surface volume, use `vc_render_tifxyz` from [volume-cartographer](../volume-cartographer).
