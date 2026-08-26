@@ -112,7 +112,9 @@ std::vector<Branch> splitBranches(const std::vector<double>& psi,
     }
     std::size_t start = 0;
     int direction = 0;
-    const auto emit = [&](std::size_t begin, std::size_t end) {
+    // Named to survive Qt's `emit` macro: with the project PCH, Qt headers
+    // reach even this Qt-free TU, and a lambda named `emit` fails to parse.
+    const auto emitBranch = [&](std::size_t begin, std::size_t end) {
         if (end - begin < 1) {
             return;
         }
@@ -141,12 +143,12 @@ std::vector<Branch> splitBranches(const std::vector<double>& psi,
         if (direction == 0) {
             direction = sign;
         } else if (sign != direction) {
-            emit(start, i - 1);
+            emitBranch(start, i - 1);
             start = i - 1;
             direction = sign;
         }
     }
-    emit(start, z.size() - 1);
+    emitBranch(start, z.size() - 1);
     return branches;
 }
 
