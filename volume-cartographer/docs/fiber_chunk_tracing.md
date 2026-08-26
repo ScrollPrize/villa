@@ -100,6 +100,31 @@ the trace dataset. Each OBJ line joins a measured constraint's two closest
 sampled points and is named `constraint_piece_A_B` from stable ascending global
 piece IDs. Hard same-trace continuity links are excluded.
 
+Pass `--constraints-per-fiber K` to apply opt-in strength pruning before the
+constraint OBJ files and either labeling path. A cross-fiber link with parallel
+score `p`, closest distance `d`, and extraction radius `D` is ranked by
+`abs(2*p-1) * max(0, 1-d/D)`. This rewards decisive parallel/perpendicular
+evidence and nearby fibers. Zero-strength links are discarded. Each endpoint
+fiber nominates its strongest `K` individual piece-pair links, and only mutual
+nominations form the initial sparse graph. Multiple piece links to the same
+neighboring source fiber consume multiple slots. The reducer then adds the
+minimum number of strongest discarded positive-strength bridges needed to
+restore the input graph's connected components. It first prefers bridges that
+keep both endpoint degrees within `K`, then uses a deterministic least-overflow
+fallback. Consequently `K` is a target, not an unconditional final cap. Hard
+same-trace continuity links remain unchanged and consume no slots.
+
+The command prints extraction and pruning separately. The pruning table reports
+input, mutual, and recovered cross-link degree and connectivity over
+nondegenerate source fibers; isolated fibers count as components. It also
+reports exact expected/accepted bridge counts, cap-respecting bridges, fallback
+overflow bridges, and fibers ending above `K`. Fallback overflow describes this
+greedy result and does not prove that a different degree-bounded forest is
+impossible. `--exclude-parallel-separate-winding` is still a later
+labeling-only filter, and the labeling report gives the final HiGHS edge count
+after both stages. Omitting `--constraints-per-fiber` preserves the current
+graph exactly.
+
 The perpendicular view requires normalized perpendicular score `> 0.5` and
 aligned winding distance `> 0.3`. Both parallel views require normalized
 parallel score `> 0.5`; winding `< 0.5` is classified as same-winding and
@@ -415,13 +440,39 @@ maximizes
 The two fitted directions are independent and therefore need not be
 orthogonal; the global axial PCA tensor is used only to seed this fit.
 
-Each step is assigned to the fitted direction with the larger absolute dot
-product. A complete fiber is direction-1- or direction-2-dominant when at
-least 75% of its valid arc length is assigned to that direction. Other fibers,
-including a degenerate fiber with no nonzero step, are mixed. Direction labels
-are deterministic: greater total assigned length is direction 1, with
-canonical axis order breaking an exact tie. The command reports both fitted
-axes, analyzed step count and length, and all three fiber counts.
+The line grouping retains gradual angular information instead of converting
+each step to a binary vote. Let `q=(direction1 dot direction2)^2`. A unit step
+axis `u` has calibrated support
+`clamp(((u dot direction)^2-q)/(1-q),0,1)` for each direction. Support is
+multiplied by step length and accumulated over the fiber. An exact fitted-axis
+step therefore has support one for that direction and zero for the other even
+when the fitted axes are non-orthogonal. Off-axis and bend segments contribute
+less. The two supports are independent affinities and can sum to more than one;
+they are never renormalized against one another.
+
+A complete fiber is direction-1- or direction-2-dominant when its larger
+accumulated support divided by its actual valid arc length reaches the selected
+fraction. The default is 0.75; pass `--direction-dominance F`, with finite `F`
+in `(0.5, 1]`, to `trace` or `visualize` for a stricter or looser split. The
+comparison is inclusive and an exact support tie prefers direction 1. Other
+fibers, including a degenerate fiber with no nonzero step, are mixed. Nearly
+identical fitted axes use direction 1's ordinary squared alignment and zero
+direction-2 support rather than dividing by an unstable axis separation.
+
+Direction identities remain deterministic: the fit's hard nearest-axis
+assignments are used only to order the axes by total assigned length, with
+canonical axis order breaking an exact tie. They do not classify fibers. The
+command reports both fitted axes, analyzed step count and length, selected
+fraction, and all three counts.
+
+For example, reclassify an existing stored crop without retracing:
+
+```bash
+volume-cartographer/build/bin/vc_fiber_trace_chunk visualize \
+  crop_traces.zarr \
+  --output crop_fibers.obj \
+  --direction-dominance 0.9
+```
 
 The requested `crop_fibers.obj` contains the complete line set. The same
 directory also receives independently displayable subsets and actual
@@ -436,7 +487,41 @@ seed-anchor point objects:
 
 The anchor artifacts use OBJ point (`p`) elements at the stored trace seed,
 not a polyline endpoint. Empty groups still produce valid empty OBJ files.
-This classification is output-only and cannot change tracing or coverage.
+This classification is output-only and cannot change tracing, coverage, the
+stored trace artifact, fitted axes, per-direction supports, or quality ranks.
+`visualize` still rewrites the complete all/direction/anchor/quality artifact
+family beneath the selected output base.
+
+## Direction-label MILP diagnostic
+
+Use `direction-diagnostic` to treat the gradual direction split as a diagnostic
+reference for the constraint-based H/V labeling:
+
+```bash
+volume-cartographer/build/bin/vc_fiber_trace_chunk direction-diagnostic \
+  crop_traces.zarr \
+  --normal-manifest normals.lasagna.json \
+  --output crop_direction_diagnostic \
+  --direction-dominance 0.9
+```
+
+The command first writes the complete, unfiltered direction visualization as
+`crop_direction_diagnostic_initial.obj` and its `_dir1`, `_dir2`, `_mixed`, and
+anchor siblings. It then removes mixed fibers before piece splitting,
+constraint extraction, optional `--constraints-per-fiber` pruning, and the
+ordinary discrete H/V-plus-broken MILP. Parity is disabled because the initial
+direction split supplies only H/V reference labels. The existing constraint
+connector and H/V/broken piece OBJ files use `crop_direction_diagnostic` as
+their basename.
+
+Raw H/V labels are not directly comparable across disconnected graph
+components because each component has an arbitrary binary orientation gauge.
+For reporting, the command independently flips each active component only when
+that reduces disagreement with the initial direction split. It prints the raw
+solver counts, a gauge-aligned confusion table, separate orientation and broken
+errors, piece and represented-fiber error rates, and one row for each erroneous
+piece with its original fiber ID and arc interval. An all-mixed input remains a
+successful empty diagnostic and still writes every expected output family.
 
 ## Quality groups
 

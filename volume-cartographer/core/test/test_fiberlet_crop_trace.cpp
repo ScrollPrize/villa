@@ -545,6 +545,7 @@ TEST_CASE("Crop trace directions fit non-orthogonal local step modes")
     };
 
     const auto classified = classifyFiberletCropDirections(lines);
+    CHECK(classified.dominanceFraction == doctest::Approx(0.75));
     CHECK(std::abs(classified.direction1BaseXYZ.dot(cv::Vec3d{1, 0, 0})) == doctest::Approx(1.0));
     CHECK(std::abs(classified.direction2BaseXYZ.dot(diagonal)) == doctest::Approx(1.0));
     REQUIRE(classified.lines.size() == lines.size());
@@ -553,12 +554,193 @@ TEST_CASE("Crop trace directions fit non-orthogonal local step modes")
     CHECK(classified.lines[2].group == FiberDirectionGroup::Direction2);
     CHECK(classified.lines[3].group == FiberDirectionGroup::Mixed);
     CHECK(classified.lines[4].group == FiberDirectionGroup::Direction1);
-    CHECK(classified.lines[4].direction1LengthBaseVoxels == doctest::Approx(3.0));
-    CHECK(classified.lines[4].direction2LengthBaseVoxels == doctest::Approx(1.0));
+    CHECK(classified.lines[4].direction1SupportBaseVoxels == doctest::Approx(3.0));
+    CHECK(classified.lines[4].direction2SupportBaseVoxels == doctest::Approx(1.0));
+    CHECK(classified.lines[4].totalLengthBaseVoxels == doctest::Approx(4.0));
     CHECK(classified.lines[5].group == FiberDirectionGroup::Mixed);
     CHECK(classified.groupCounts == std::array<std::size_t, 3>{3, 1, 2});
     CHECK(classified.analyzedSteps == 10);
     CHECK(classified.analyzedLengthBaseVoxels == doctest::Approx(42.0));
+
+    const auto stricter = classifyFiberletCropDirections(lines, 0.9);
+    CHECK(stricter.dominanceFraction == doctest::Approx(0.9));
+    CHECK(std::abs(stricter.direction1BaseXYZ.dot(
+                       classified.direction1BaseXYZ)) == doctest::Approx(1.0));
+    CHECK(std::abs(stricter.direction2BaseXYZ.dot(
+                       classified.direction2BaseXYZ)) == doctest::Approx(1.0));
+    CHECK(stricter.lines[4].group == FiberDirectionGroup::Mixed);
+    CHECK(stricter.lines[4].direction1SupportBaseVoxels == doctest::Approx(3.0));
+    CHECK(stricter.lines[4].direction2SupportBaseVoxels == doctest::Approx(1.0));
+    CHECK(stricter.groupCounts == std::array<std::size_t, 3>{2, 1, 3});
+
+    auto reversedLines = lines;
+    for (auto& reversed : reversedLines)
+        std::reverse(reversed.pointsBaseXYZ.begin(), reversed.pointsBaseXYZ.end());
+    const auto reversed = classifyFiberletCropDirections(reversedLines);
+    CHECK(reversed.groupCounts == classified.groupCounts);
+    CHECK(std::abs(reversed.direction1BaseXYZ.dot(
+                       classified.direction1BaseXYZ)) == doctest::Approx(1.0));
+    CHECK(std::abs(reversed.direction2BaseXYZ.dot(
+                       classified.direction2BaseXYZ)) == doctest::Approx(1.0));
+    REQUIRE(reversed.lines.size() == classified.lines.size());
+    for (std::size_t index = 0; index < classified.lines.size(); ++index) {
+        CHECK(reversed.lines[index].group == classified.lines[index].group);
+        CHECK(reversed.lines[index].direction1SupportBaseVoxels ==
+              doctest::Approx(
+                  classified.lines[index].direction1SupportBaseVoxels));
+        CHECK(reversed.lines[index].direction2SupportBaseVoxels ==
+              doctest::Approx(
+                  classified.lines[index].direction2SupportBaseVoxels));
+        CHECK(reversed.lines[index].totalLengthBaseVoxels ==
+              doctest::Approx(classified.lines[index].totalLengthBaseVoxels));
+    }
+
+    CHECK_NOTHROW(classifyFiberletCropDirections(lines, 0.500001));
+    CHECK_NOTHROW(classifyFiberletCropDirections(lines, 1.0));
+    CHECK_THROWS_WITH_AS(
+        classifyFiberletCropDirections(lines, 0.5),
+        doctest::Contains("in (0.5, 1]"),
+        std::invalid_argument);
+    CHECK_THROWS_WITH_AS(
+        classifyFiberletCropDirections(lines, 1.000001),
+        doctest::Contains("in (0.5, 1]"),
+        std::invalid_argument);
+    CHECK_THROWS_WITH_AS(
+        classifyFiberletCropDirections(
+            lines, std::numeric_limits<double>::quiet_NaN()),
+        doctest::Contains("in (0.5, 1]"),
+        std::invalid_argument);
+}
+
+TEST_CASE("Crop trace direction groups use gradual segment support")
+{
+    const auto line = [](std::vector<cv::Vec3d> points) {
+        FiberletCropTraceLine result;
+        result.pointsBaseXYZ = std::move(points);
+        return result;
+    };
+    const double x = std::sqrt(0.6);
+    const double y = std::sqrt(0.4);
+    std::vector<FiberletCropTraceLine> lines{
+        line({{0, 0, 0}, {100, 0, 0}}),
+        line({{100, 1, 0}, {0, 1, 0}}),
+        line({{0, 2, 0}, {0, 102, 0}}),
+        line({{0, 103, 0}, {0, 3, 0}}),
+        line({{0, 4, 0}, {5 * x, 4 + 5 * y, 0}, {10 * x, 4, 0}}),
+    };
+
+    const auto classified = classifyFiberletCropDirections(lines);
+    CHECK(classified.direction1BaseXYZ[0] == doctest::Approx(1.0));
+    CHECK(classified.direction1BaseXYZ[1] == doctest::Approx(0.0).epsilon(1e-12));
+    CHECK(classified.direction2BaseXYZ[0] == doctest::Approx(0.0).epsilon(1e-12));
+    CHECK(classified.direction2BaseXYZ[1] == doctest::Approx(1.0));
+    CHECK(classified.lines[4].direction1SupportBaseVoxels == doctest::Approx(6.0));
+    CHECK(classified.lines[4].direction2SupportBaseVoxels == doctest::Approx(4.0));
+    CHECK(classified.lines[4].totalLengthBaseVoxels == doctest::Approx(10.0));
+    CHECK(classified.lines[4].group == FiberDirectionGroup::Mixed);
+
+    const auto permissive = classifyFiberletCropDirections(lines, 0.59);
+    CHECK(permissive.lines[4].group == FiberDirectionGroup::Direction1);
+}
+
+TEST_CASE("Crop trace non-orthogonal direction supports are independent")
+{
+    const auto line = [](cv::Vec3d direction, double length, double y) {
+        FiberletCropTraceLine result;
+        result.pointsBaseXYZ = {
+            {0, y, 0},
+            cv::Vec3d{0, y, 0} + direction * length,
+        };
+        return result;
+    };
+    const double rootThreeOverTwo = std::sqrt(3.0) / 2.0;
+    const cv::Vec3d direction1{1, 0, 0};
+    const cv::Vec3d direction2{0.5, rootThreeOverTwo, 0};
+    const cv::Vec3d bisector{rootThreeOverTwo, 0.5, 0};
+    const cv::Vec3d mirror{rootThreeOverTwo, -0.5, 0};
+    const std::vector<FiberletCropTraceLine> lines{
+        line(direction1, 100, 0),
+        line(-direction1, 100, 1),
+        line(direction2, 100, 2),
+        line(-direction2, 100, 3),
+        line(bisector, 10, 4),
+        line(mirror, 10, 5),
+    };
+
+    const auto classified = classifyFiberletCropDirections(lines);
+    const double cross = classified.direction1BaseXYZ.dot(
+        classified.direction2BaseXYZ);
+    const double q = cross * cross;
+    const auto expectedSupport = [&](const cv::Vec3d& direction) {
+        const double alignment = bisector.dot(direction);
+        return 10.0 * std::clamp(
+            (alignment * alignment - q) / (1.0 - q), 0.0, 1.0);
+    };
+    CHECK(std::abs(cross) == doctest::Approx(0.5));
+    CHECK(classified.lines[4].direction1SupportBaseVoxels ==
+          doctest::Approx(expectedSupport(classified.direction1BaseXYZ)));
+    CHECK(classified.lines[4].direction2SupportBaseVoxels ==
+          doctest::Approx(expectedSupport(classified.direction2BaseXYZ)));
+    CHECK(classified.lines[4].totalLengthBaseVoxels == doctest::Approx(10.0));
+    CHECK(classified.lines[4].direction1SupportBaseVoxels +
+              classified.lines[4].direction2SupportBaseVoxels >
+          classified.lines[4].totalLengthBaseVoxels);
+    CHECK(classified.lines[4].group == FiberDirectionGroup::Mixed);
+}
+
+TEST_CASE("Crop trace direction support handles collapsed fitted axes")
+{
+    FiberletCropTraceLine forward;
+    forward.pointsBaseXYZ = {{0, 0, 0}, {8, 0, 0}};
+    FiberletCropTraceLine reverse;
+    reverse.pointsBaseXYZ = {{8, 1, 0}, {0, 1, 0}};
+
+    const auto classified =
+        classifyFiberletCropDirections({forward, reverse}, 1.0);
+    CHECK(classified.direction1BaseXYZ[0] == doctest::Approx(1.0));
+    CHECK(classified.direction2BaseXYZ[0] == doctest::Approx(1.0));
+    REQUIRE(classified.lines.size() == 2);
+    for (const auto& line : classified.lines) {
+        CHECK(line.direction1SupportBaseVoxels == doctest::Approx(8.0));
+        CHECK(line.direction2SupportBaseVoxels == doctest::Approx(0.0));
+        CHECK(line.totalLengthBaseVoxels == doctest::Approx(8.0));
+        CHECK(line.group == FiberDirectionGroup::Direction1);
+    }
+    CHECK(classified.groupCounts == std::array<std::size_t, 3>{2, 0, 0});
+}
+
+TEST_CASE("Crop trace direction support guards nearly collapsed fitted axes")
+{
+    const auto classifySeparation = [](double angle) {
+        FiberletCropTraceLine first;
+        first.pointsBaseXYZ = {{0, 0, 0}, {10, 0, 0}};
+        FiberletCropTraceLine second;
+        second.pointsBaseXYZ = {
+            {0, 1, 0},
+            {10 * std::cos(angle), 1 + 10 * std::sin(angle), 0},
+        };
+        return classifyFiberletCropDirections({first, second}, 0.9);
+    };
+
+    const auto collapsed = classifySeparation(5.0e-5);
+    const double collapsedCross = collapsed.direction1BaseXYZ.dot(
+        collapsed.direction2BaseXYZ);
+    CHECK(1.0 - collapsedCross * collapsedCross < 1.0e-8);
+    CHECK(collapsed.groupCounts == std::array<std::size_t, 3>{2, 0, 0});
+    for (const auto& line : collapsed.lines) {
+        CHECK(std::isfinite(line.direction1SupportBaseVoxels));
+        CHECK(line.direction2SupportBaseVoxels == doctest::Approx(0.0));
+    }
+
+    const auto separated = classifySeparation(5.0e-4);
+    const double separatedCross = separated.direction1BaseXYZ.dot(
+        separated.direction2BaseXYZ);
+    CHECK(1.0 - separatedCross * separatedCross > 1.0e-8);
+    CHECK(separated.groupCounts == std::array<std::size_t, 3>{1, 1, 0});
+    for (const auto& line : separated.lines) {
+        CHECK(std::isfinite(line.direction1SupportBaseVoxels));
+        CHECK(std::isfinite(line.direction2SupportBaseVoxels));
+    }
 }
 
 TEST_CASE("Crop direction OBJ artifacts preserve line and seed partitions")
@@ -1128,6 +1310,208 @@ TEST_CASE("Trace constraint OBJ views apply strict disjoint thresholds")
           "crop_traces_constraints_perpendicular_same_winding.obj");
 }
 
+TEST_CASE("Trace constraint strength pruning is mutual and deterministic")
+{
+    FiberTraceConstraintReport input;
+    input.inputTraces = 5;
+    for (const std::size_t trace : {0UL, 0UL, 1UL, 2UL, 3UL, 4UL}) {
+        FiberTraceConstraintPiece piece;
+        piece.traceIndex = trace;
+        piece.pieceIndex = input.pieces.size();
+        input.pieces.push_back(std::move(piece));
+    }
+    const auto add = [&](std::size_t a,
+                         std::size_t b,
+                         double distance,
+                         double parallel,
+                         bool hard = false) {
+        FiberTraceConstraint constraint;
+        constraint.pieceA = a;
+        constraint.pieceB = b;
+        constraint.closestDistanceBaseVoxels = distance;
+        constraint.parallelScore = parallel;
+        constraint.perpendicularScore = 1.0 - parallel;
+        constraint.hardContinuity = hard;
+        input.constraints.push_back(constraint);
+    };
+    add(0, 1, 0.0, 1.0, true);
+    add(0, 2, 10.0, 1.0);
+    add(2, 3, 1.0, 1.0);
+    add(3, 4, 10.0, 0.0);
+    add(0, 4, 50.0, 0.75);
+    add(0, 5, 100.0, 1.0);
+    input.hardConstraints = 1;
+
+    const auto pruned = pruneFiberTraceConstraintsByStrength(input, 100.0, 1);
+    REQUIRE(pruned.constraints.size() == 4);
+    CHECK(pruned.constraints[0].hardContinuity);
+    CHECK(pruned.constraints[0].pieceA == 0);
+    CHECK(pruned.constraints[0].pieceB == 1);
+    CHECK_FALSE(pruned.constraints[1].hardContinuity);
+    CHECK(pruned.constraints[1].pieceA == 0);
+    CHECK(pruned.constraints[1].pieceB == 2);
+    CHECK(pruned.constraints[2].pieceA == 0);
+    CHECK(pruned.constraints[2].pieceB == 4);
+    CHECK(pruned.constraints[3].pieceA == 2);
+    CHECK(pruned.constraints[3].pieceB == 3);
+    CHECK(pruned.report.inputTotalConstraints == 6);
+    CHECK(pruned.report.retainedTotalConstraints == 4);
+    CHECK(pruned.report.hardConstraints == 1);
+    CHECK(pruned.report.rejectedZeroStrength == 1);
+    CHECK(pruned.report.rejectedNotMutual == 1);
+    CHECK(pruned.report.recoveryCandidates == 3);
+    CHECK(pruned.report.expectedRecoveryBridges == 2);
+    CHECK(pruned.report.recoveryBridges == 2);
+    CHECK(pruned.report.capRespectingRecoveryBridges == 1);
+    CHECK(pruned.report.fallbackOverflowBridges == 1);
+    CHECK(pruned.report.tracesAboveTargetDegree == 2);
+    CHECK(pruned.report.before.traces == 5);
+    CHECK(pruned.report.before.crossTraceConstraints == 4);
+    CHECK(pruned.report.before.meanDegree == doctest::Approx(1.6));
+    CHECK(pruned.report.before.isolatedTraces == 1);
+    CHECK(pruned.report.before.connectedComponents == 2);
+    CHECK(pruned.report.mutual.crossTraceConstraints == 1);
+    CHECK(pruned.report.mutual.connectedComponents == 4);
+    CHECK(pruned.report.after.crossTraceConstraints == 3);
+    CHECK(pruned.report.after.minimumDegree == 0);
+    CHECK(pruned.report.after.meanDegree == doctest::Approx(1.2));
+    CHECK(pruned.report.after.medianDegree == doctest::Approx(1.0));
+    CHECK(pruned.report.after.maximumDegree == 2);
+    CHECK(pruned.report.after.isolatedTraces == 1);
+    CHECK(pruned.report.after.connectedComponents == 2);
+
+    auto reordered = input;
+    std::reverse(reordered.constraints.begin(), reordered.constraints.end());
+    const auto reorderedPruned =
+        pruneFiberTraceConstraintsByStrength(reordered, 100.0, 1);
+    REQUIRE(reorderedPruned.constraints.size() == pruned.constraints.size());
+    for (std::size_t index = 0; index < pruned.constraints.size(); ++index) {
+        CHECK(reorderedPruned.constraints[index].pieceA ==
+              pruned.constraints[index].pieceA);
+        CHECK(reorderedPruned.constraints[index].pieceB ==
+              pruned.constraints[index].pieceB);
+        CHECK(reorderedPruned.constraints[index].hardContinuity ==
+              pruned.constraints[index].hardContinuity);
+    }
+
+    const auto capTwo =
+        pruneFiberTraceConstraintsByStrength(input, 100.0, 2);
+    CHECK(capTwo.report.after.maximumDegree == 2);
+    CHECK(capTwo.report.after.crossTraceConstraints == 4);
+    CHECK(capTwo.report.rejectedZeroStrength == 1);
+    CHECK(capTwo.report.recoveryBridges == 0);
+
+    auto ambiguous = input;
+    ambiguous.constraints.back().closestDistanceBaseVoxels = 1.0;
+    ambiguous.constraints.back().parallelScore = 0.5;
+    ambiguous.constraints.back().perpendicularScore = 0.5;
+    const auto ambiguousPruned =
+        pruneFiberTraceConstraintsByStrength(ambiguous, 100.0, 1);
+    CHECK(ambiguousPruned.report.rejectedZeroStrength == 1);
+    CHECK(ambiguousPruned.report.after.connectedComponents == 2);
+
+    auto solverInput = input;
+    solverInput.constraints = pruned.constraints;
+    FiberTraceLabelingConfig labelingConfig;
+    labelingConfig.hvOnly = true;
+    labelingConfig.relaxIntegrality = true;
+    labelingConfig.parallelThreads = 1;
+    labelingConfig.brokenCostPerConstraint = 100.0;
+    const auto labeling = solveFiberTraceLabels(solverInput, labelingConfig);
+    CHECK(labeling.retainedConstraints == pruned.constraints.size());
+    std::vector<FiberletCropTraceLine> traces(input.inputTraces);
+    for (std::size_t trace = 0; trace < traces.size(); ++trace) {
+        traces[trace].pointsBaseXYZ = {
+            {0.0, static_cast<double>(trace), 0.0},
+            {10.0, static_cast<double>(trace), 0.0},
+        };
+    }
+    FiberTraceConsensusConfig consensusConfig;
+    consensusConfig.cropMinimumBaseXYZ = {0.0, 0.0, 0.0};
+    consensusConfig.cropMaximumBaseXYZ = {10.0, 10.0, 10.0};
+    const auto consensus =
+        growFiberTraceConsensus(traces, solverInput, consensusConfig);
+    CHECK(consensus.retainedCrossTraceConstraints ==
+          pruned.report.after.crossTraceConstraints);
+
+    auto duplicate = input;
+    duplicate.constraints.push_back(input.constraints[1]);
+    CHECK_THROWS_WITH_AS(
+        pruneFiberTraceConstraintsByStrength(duplicate, 100.0, 1),
+        doctest::Contains("duplicate piece pair"),
+        std::invalid_argument);
+    auto crossTraceHard = input;
+    crossTraceHard.constraints[0].pieceB = 2;
+    CHECK_THROWS_WITH_AS(
+        pruneFiberTraceConstraintsByStrength(crossTraceHard, 100.0, 1),
+        doctest::Contains("hard link crosses"),
+        std::invalid_argument);
+    CHECK_THROWS_WITH_AS(
+        pruneFiberTraceConstraintsByStrength(input, 0.0, 1),
+        doctest::Contains("maximum distance"),
+        std::invalid_argument);
+    CHECK_THROWS_WITH_AS(
+        pruneFiberTraceConstraintsByStrength(input, 100.0, 0),
+        doctest::Contains("limit must be positive"),
+        std::invalid_argument);
+}
+
+TEST_CASE("Trace constraint strength pruning counts piece links per source fiber")
+{
+    FiberTraceConstraintReport input;
+    input.inputTraces = 2;
+    for (const std::size_t trace : {0UL, 0UL, 1UL}) {
+        FiberTraceConstraintPiece piece;
+        piece.traceIndex = trace;
+        input.pieces.push_back(std::move(piece));
+    }
+    input.constraints = {
+        {0, 2, 0.0, 0.0, {}, {}, 1.0, 1.0, 0.0, 0.0, false},
+        {1, 2, 0.0, 0.0, {}, {}, 2.0, 1.0, 0.0, 0.0, false},
+    };
+    const auto one = pruneFiberTraceConstraintsByStrength(input, 100.0, 1);
+    REQUIRE(one.constraints.size() == 1);
+    CHECK(one.constraints.front().pieceA == 0);
+    CHECK(one.constraints.front().pieceB == 2);
+    CHECK(one.report.after.maximumDegree == 1);
+}
+
+TEST_CASE("Trace constraint recovery overflow is not an infeasibility proof")
+{
+    FiberTraceConstraintReport input;
+    input.inputTraces = 4;
+    for (std::size_t trace = 0; trace < input.inputTraces; ++trace) {
+        FiberTraceConstraintPiece piece;
+        piece.traceIndex = trace;
+        input.pieces.push_back(std::move(piece));
+    }
+    const auto link = [](std::size_t a, std::size_t b, double distance) {
+        FiberTraceConstraint constraint;
+        constraint.pieceA = a;
+        constraint.pieceB = b;
+        constraint.closestDistanceBaseVoxels = distance;
+        constraint.parallelScore = 1.0;
+        return constraint;
+    };
+    input.constraints = {
+        link(0, 1, 1.0),
+        link(0, 2, 2.0),
+        link(0, 3, 3.0),
+        link(1, 2, 4.0),
+    };
+
+    const auto pruned = pruneFiberTraceConstraintsByStrength(input, 100.0, 2);
+    CHECK(pruned.report.mutual.crossTraceConstraints == 3);
+    CHECK(pruned.report.expectedRecoveryBridges == 1);
+    CHECK(pruned.report.fallbackOverflowBridges == 1);
+    CHECK(pruned.report.tracesAboveTargetDegree == 1);
+    CHECK(pruned.report.after.maximumDegree == 3);
+    CHECK(pruned.report.after.connectedComponents == 1);
+    // AB, BC, and AD would connect the same input graph with maximum degree two.
+    // The observed overflow is therefore a property of greedy mutual selection,
+    // not a proof that a degree-bounded spanning subgraph is impossible.
+}
+
 TEST_CASE("Trace constraints discard winding distances at the exclusive cutoff")
 {
     FiberletCropTraceLine first;
@@ -1421,6 +1805,120 @@ TEST_CASE("Trace labeling rejects LP backend controls outside relaxation mode")
     CHECK_THROWS_WITH_AS(
         solveFiberTraceLabels(constraints, config),
         doctest::Contains("LP solver must be choose, simplex, hipo, or ipm"),
+        std::invalid_argument);
+}
+
+TEST_CASE("Direction label comparison aligns components and reports errors")
+{
+    FiberTraceConstraintReport constraints;
+    constraints.inputTraces = 4;
+    for (const auto [trace, local] :
+         std::array<std::pair<std::size_t, std::size_t>, 6>{
+             {{0, 0}, {0, 1}, {0, 2}, {1, 0}, {2, 0}, {3, 0}}}) {
+        FiberTraceConstraintPiece piece;
+        piece.traceIndex = trace;
+        piece.pieceIndex = local;
+        piece.beginArcBaseVoxels = static_cast<double>(local * 10);
+        piece.endArcBaseVoxels = piece.beginArcBaseVoxels + 10.0;
+        constraints.pieces.push_back(std::move(piece));
+    }
+    const auto link = [](std::size_t a, std::size_t b, bool hard = false) {
+        FiberTraceConstraint result;
+        result.pieceA = a;
+        result.pieceB = b;
+        result.hardContinuity = hard;
+        return result;
+    };
+    constraints.constraints = {
+        link(0, 1, true),
+        link(1, 2, true),
+        link(3, 4),
+        link(4, 5),
+    };
+    const std::array directions{
+        FiberDirectionGroup::Direction1,
+        FiberDirectionGroup::Direction2,
+        FiberDirectionGroup::Direction1,
+        FiberDirectionGroup::Direction2,
+    };
+    FiberTraceLabelingReport labeling;
+    labeling.labels = {
+        FiberTracePieceLabel::HEven,
+        FiberTracePieceLabel::Broken,
+        FiberTracePieceLabel::VEven,
+        FiberTracePieceLabel::HEven,
+        FiberTracePieceLabel::VEven,
+        FiberTracePieceLabel::VEven,
+    };
+
+    const auto comparison =
+        compareFiberDirectionLabels(constraints, directions, labeling);
+    CHECK(comparison.rawH == 2);
+    CHECK(comparison.rawV == 3);
+    CHECK(comparison.rawBroken == 1);
+    CHECK(comparison.activeComponents == 3);
+    CHECK(comparison.flippedComponents == 2);
+    CHECK(comparison.representedTraces == 4);
+    CHECK(comparison.errorTraces == 2);
+    CHECK(comparison.orientationErrors == 1);
+    CHECK(comparison.brokenErrors == 1);
+    CHECK(comparison.confusion[0].pieces == 4);
+    CHECK(comparison.confusion[0].alignedDirection1 == 3);
+    CHECK(comparison.confusion[0].alignedDirection2 == 0);
+    CHECK(comparison.confusion[0].broken == 1);
+    CHECK(comparison.confusion[0].errors == 1);
+    CHECK(comparison.confusion[1].pieces == 2);
+    CHECK(comparison.confusion[1].alignedDirection1 == 1);
+    CHECK(comparison.confusion[1].alignedDirection2 == 1);
+    CHECK(comparison.confusion[1].broken == 0);
+    CHECK(comparison.confusion[1].errors == 1);
+    REQUIRE(comparison.errors.size() == 2);
+    CHECK(comparison.errors[0].pieceIndex == 1);
+    CHECK(comparison.errors[0].filteredTraceIndex == 0);
+    CHECK(comparison.errors[0].tracePieceIndex == 1);
+    CHECK(comparison.errors[0].kind ==
+          FiberDirectionLabelErrorKind::Broken);
+    CHECK(comparison.errors[1].pieceIndex == 5);
+    CHECK(comparison.errors[1].filteredTraceIndex == 3);
+    CHECK(comparison.errors[1].componentFlipped);
+    CHECK(comparison.errors[1].alignedDirection ==
+          FiberDirectionGroup::Direction1);
+    CHECK(comparison.errors[1].kind ==
+          FiberDirectionLabelErrorKind::Orientation);
+}
+
+TEST_CASE("Direction label comparison validates discrete retained directions")
+{
+    FiberTraceConstraintReport constraints;
+    constraints.inputTraces = 1;
+    FiberTraceConstraintPiece piece;
+    piece.traceIndex = 0;
+    constraints.pieces.push_back(piece);
+    FiberTraceLabelingReport labeling;
+    labeling.labels = {FiberTracePieceLabel::Broken};
+    const std::array retained{FiberDirectionGroup::Direction1};
+
+    const auto comparison =
+        compareFiberDirectionLabels(constraints, retained, labeling);
+    CHECK(comparison.rawBroken == 1);
+    CHECK(comparison.representedTraces == 1);
+    CHECK(comparison.errorTraces == 1);
+    CHECK(comparison.brokenErrors == 1);
+
+    const std::array mixed{FiberDirectionGroup::Mixed};
+    CHECK_THROWS_WITH_AS(
+        compareFiberDirectionLabels(constraints, mixed, labeling),
+        doctest::Contains("does not accept mixed"),
+        std::invalid_argument);
+    labeling.continuousPieceValues = true;
+    CHECK_THROWS_WITH_AS(
+        compareFiberDirectionLabels(constraints, retained, labeling),
+        doctest::Contains("discrete label"),
+        std::invalid_argument);
+    labeling.continuousPieceValues = false;
+    CHECK_THROWS_WITH_AS(
+        compareFiberDirectionLabels(constraints, std::span<const FiberDirectionGroup>{}, labeling),
+        doctest::Contains("trace count"),
         std::invalid_argument);
 }
 

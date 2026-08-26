@@ -1424,3 +1424,16 @@
 - Restricted the primary consensus seed to long crop-spanning candidates and
   ranked equal-straightness candidates by true distance to the crop center.
 - Added final and milestone broken-fiber OBJ layers alongside consensus H/V.
+- Added opt-in deterministic mutual top-K constraint-strength pruning shared by
+  constraint visualization, HiGHS labeling, and iterative consensus, with
+  source-fiber degree and connectivity diagnostics plus minimum-link recovery
+  of the original positive-strength component partition.
+- Exposed the existing crop-direction dominance fraction to trace and stored
+  visualization commands while preserving the 0.75 default.
+- Replaced binary nearest-axis votes in crop direction grouping with calibrated
+  per-segment angular support, so off-axis and bend length gradually moves a
+  fiber into the mixed visualization group without changing the fitted axes.
+- Added `vc_fiber_trace_chunk direction-diagnostic`, which removes mixed
+  direction groups before canonical constraint extraction and discrete
+  H/V-only MILP solving, then reports component-gauge-aligned orientation and
+  broken-label errors against the initial direction assignment.

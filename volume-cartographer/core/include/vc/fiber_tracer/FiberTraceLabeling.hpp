@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -78,9 +79,56 @@ struct FiberTraceRelaxationObjReport {
     double activeThreshold = 0.0;
 };
 
+enum class FiberDirectionLabelErrorKind : unsigned char {
+    Orientation,
+    Broken,
+};
+
+struct FiberDirectionLabelError {
+    std::size_t pieceIndex = 0;
+    std::size_t filteredTraceIndex = 0;
+    std::size_t tracePieceIndex = 0;
+    double beginArcBaseVoxels = 0.0;
+    double endArcBaseVoxels = 0.0;
+    FiberDirectionGroup initialDirection = FiberDirectionGroup::Mixed;
+    FiberTracePieceLabel rawLabel = FiberTracePieceLabel::Broken;
+    FiberDirectionGroup alignedDirection = FiberDirectionGroup::Mixed;
+    std::size_t componentIndex = 0;
+    bool componentFlipped = false;
+    FiberDirectionLabelErrorKind kind =
+        FiberDirectionLabelErrorKind::Orientation;
+};
+
+struct FiberDirectionLabelConfusionRow {
+    std::size_t pieces = 0;
+    std::size_t alignedDirection1 = 0;
+    std::size_t alignedDirection2 = 0;
+    std::size_t broken = 0;
+    std::size_t errors = 0;
+};
+
+struct FiberDirectionLabelComparisonReport {
+    std::array<FiberDirectionLabelConfusionRow, 2> confusion{};
+    std::size_t rawH = 0;
+    std::size_t rawV = 0;
+    std::size_t rawBroken = 0;
+    std::size_t activeComponents = 0;
+    std::size_t flippedComponents = 0;
+    std::size_t representedTraces = 0;
+    std::size_t errorTraces = 0;
+    std::size_t orientationErrors = 0;
+    std::size_t brokenErrors = 0;
+    std::vector<FiberDirectionLabelError> errors;
+};
+
 [[nodiscard]] FiberTraceLabelingReport solveFiberTraceLabels(
     const FiberTraceConstraintReport& constraints,
     const FiberTraceLabelingConfig& config = {});
+
+[[nodiscard]] FiberDirectionLabelComparisonReport compareFiberDirectionLabels(
+    const FiberTraceConstraintReport& constraints,
+    std::span<const FiberDirectionGroup> traceDirections,
+    const FiberTraceLabelingReport& labeling);
 
 [[nodiscard]] FiberTraceLabelObjPaths fiberTraceLabelObjPaths(
     const std::filesystem::path& outputBase);

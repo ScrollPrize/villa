@@ -21,6 +21,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -29,7 +30,13 @@
 namespace
 {
 
-enum class Mode { Trace, Visualize, Constraints, Consensus };
+enum class Mode {
+    Trace,
+    Visualize,
+    Constraints,
+    Consensus,
+    DirectionDiagnostic,
+};
 
 struct Options {
     Mode mode = Mode::Trace;
@@ -40,16 +47,21 @@ struct Options {
     std::filesystem::path obj;
     std::filesystem::path volume;
     int maximumTextureDimension = 4096;
+    double directionDominance =
+        vc::fiber_tracer::kFiberDirectionDominanceFraction;
     int threads = static_cast<int>(std::max(1U, std::thread::hardware_concurrency()));
     std::size_t cacheBytes = 8ULL * 1024ULL * 1024ULL * 1024ULL;
     vc::fiber_tracer::FiberletCropTraceConfig trace;
     vc::fiber_tracer::FiberTraceConstraintConfig constraints;
     vc::fiber_tracer::FiberTraceLabelingConfig labeling;
+    std::optional<std::size_t> maximumConstraintsPerFiber;
     bool hasBounds = false;
     bool hasTraceOnlyOption = false;
     bool hasConstraintOnlyOption = false;
     bool hasSolverOnlyOption = false;
     bool hasSharedRuntimeOption = false;
+    bool hasDirectionVisualizationOption = false;
+    bool hasHvOnlyOption = false;
 };
 
 [[noreturn]] void fail(const std::string& message)
@@ -74,6 +86,9 @@ void usage(const char* executable)
               << "  " << executable
               << " consensus <traces.zarr> --normal-manifest PATH"
                  " [--output BASENAME] [--broken-cost-per-link COST] [options]\n\n"
+              << "  " << executable
+              << " direction-diagnostic <traces.zarr> --normal-manifest PATH"
+                 " [--output BASENAME] [--direction-dominance F] [options]\n\n"
               << "Trace options:\n"
               << "  --obj PATH                 line OBJ; defaults beside trace Zarr\n"
               << "  --volume PATH              concrete uint8 CT Zarr group\n"
@@ -87,6 +102,7 @@ void usage(const char* executable)
               << "  --max-attempts N           anchor attempt limit; zero is unlimited [0]\n"
               << "  --max-fibers N             accepted line limit; zero is unlimited [0]\n"
               << "  --texture-max N            maximum bbox texture dimension [4096]\n\n"
+              << "  --direction-dominance F   direction support/arc fraction in (0.5,1] [0.75]\n\n"
               << "Constraint options (all distances are base voxels):\n"
               << "  --output PATH              OBJ basename; defaults beside trace dataset\n"
               << "  --sample-step N            common trace resampling step [32]\n"
@@ -97,6 +113,7 @@ void usage(const char* executable)
               << "  --winding-step N           Lasagna connector integration step [8]\n"
               << "  --winding-cutoff N         exclusive finite winding cutoff [1.5]\n"
               << "  --no-winding-cutoff        retain every finite winding measurement\n"
+              << "  --constraints-per-fiber N mutual strongest-link cap per source fiber\n"
               << "  --lp-relaxation            solve continuous [0,1] label relaxation\n"
               << "  --lp-parallel              request HiGHS parallel LP execution\n"
               << "  --lp-solver NAME           choose, simplex, hipo, or ipm [choose]\n"
@@ -155,8 +172,10 @@ Options parse(int argc, char** argv)
         options.mode = Mode::Constraints;
     else if (mode == "consensus")
         options.mode = Mode::Consensus;
+    else if (mode == "direction-diagnostic")
+        options.mode = Mode::DirectionDiagnostic;
     else
-        fail("mode must be 'trace', 'visualize', 'constraints', or 'consensus'");
+        fail("mode must be 'trace', 'visualize', 'constraints', 'consensus', or 'direction-diagnostic'");
     options.input = argv[2];
 
     for (int index = 3; index < argc; ++index) {
@@ -210,6 +229,14 @@ Options parse(int argc, char** argv)
         } else if (argument == "--texture-max") {
             options.maximumTextureDimension = static_cast<int>(count(index, argc, argv, "--texture-max"));
             options.hasTraceOnlyOption = true;
+        } else if (argument == "--direction-dominance") {
+            options.directionDominance =
+                number(index, argc, argv, "--direction-dominance");
+            if (!(options.directionDominance > 0.5 &&
+                  options.directionDominance <= 1.0)) {
+                fail("--direction-dominance must be in (0.5, 1]");
+            }
+            options.hasDirectionVisualizationOption = true;
         } else if (argument == "--sample-step") {
             options.constraints.resampleSpacingBaseVoxels = number(index, argc, argv, "--sample-step");
             options.hasConstraintOnlyOption = true;
@@ -237,6 +264,13 @@ Options parse(int argc, char** argv)
             options.hasConstraintOnlyOption = true;
         } else if (argument == "--no-winding-cutoff") {
             options.constraints.enforceMaximumWindingDistance = false;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--constraints-per-fiber") {
+            const std::size_t limit =
+                count(index, argc, argv, "--constraints-per-fiber");
+            if (limit == 0)
+                fail("--constraints-per-fiber must be positive");
+            options.maximumConstraintsPerFiber = limit;
             options.hasConstraintOnlyOption = true;
         } else if (argument == "--broken-cost-per-link") {
             options.labeling.brokenCostPerConstraint =
@@ -274,6 +308,7 @@ Options parse(int argc, char** argv)
             options.hasSolverOnlyOption = true;
         } else if (argument == "--hv-only") {
             options.labeling.hvOnly = true;
+            options.hasHvOnlyOption = true;
             options.hasConstraintOnlyOption = true;
             options.hasSolverOnlyOption = true;
         } else if (argument == "--exact-perpendicular-milp") {
@@ -303,11 +338,29 @@ Options parse(int argc, char** argv)
     if (vc::lasagna::isRemoteLasagnaLocation(options.normalManifest) && options.remoteCacheDirectory.empty()) {
         fail("a remote normal manifest requires --remote-cache-dir");
     }
-    if (options.mode == Mode::Constraints || options.mode == Mode::Consensus) {
+    if (options.mode == Mode::Constraints ||
+        options.mode == Mode::Consensus ||
+        options.mode == Mode::DirectionDiagnostic) {
         if (options.hasTraceOnlyOption)
             fail("constraint processing does not accept trace-only options");
+        if (options.hasDirectionVisualizationOption &&
+            options.mode != Mode::DirectionDiagnostic) {
+            fail("constraint processing does not accept visualization options");
+        }
         if (options.mode == Mode::Consensus && options.hasSolverOnlyOption)
             fail("consensus does not accept HiGHS labeling options");
+        if (options.mode == Mode::DirectionDiagnostic) {
+            if (options.hasHvOnlyOption)
+                fail("direction-diagnostic implies H/V-only labeling; omit --hv-only");
+            if (options.labeling.relaxIntegrality ||
+                options.labeling.lpParallel ||
+                options.labeling.lpSolver != "choose" ||
+                options.labeling.exactPerpendicularMilp ||
+                options.labeling.excludeParallelSeparateWinding) {
+                fail("direction-diagnostic requires the ordinary discrete H/V-only MILP");
+            }
+            options.labeling.hvOnly = true;
+        }
         if (!options.constraints.enforceMaximumWindingDistance &&
             options.mode == Mode::Constraints && !options.labeling.hvOnly) {
             fail("--no-winding-cutoff currently requires --hv-only");
@@ -331,7 +384,9 @@ Options parse(int argc, char** argv)
             options.output = options.input.parent_path() /
                 (stem + (options.mode == Mode::Consensus
                              ? "_consensus"
-                             : "_constraints"));
+                             : options.mode == Mode::DirectionDiagnostic
+                                 ? "_direction_diagnostic"
+                                 : "_constraints"));
         }
         options.constraints.parallelThreads = static_cast<std::size_t>(options.threads);
         options.labeling.parallelThreads = static_cast<std::size_t>(options.threads);
@@ -367,6 +422,7 @@ double quantile(std::vector<double> values, double fraction)
 
 void printConstraintReport(
     const vc::fiber_tracer::FiberTraceConstraintReport& report,
+    const std::vector<vc::fiber_tracer::FiberTraceConstraint>& extractedConstraints,
     const vc::fiber_tracer::FiberTraceConstraintConfig& config,
     bool manifestMatches,
     double wallSeconds,
@@ -376,7 +432,7 @@ void printConstraintReport(
     std::vector<double> parallel;
     std::vector<double> perpendicular;
     std::vector<double> winding;
-    for (const auto& constraint : report.constraints) {
+    for (const auto& constraint : extractedConstraints) {
         if (constraint.hardContinuity)
             continue;
         distances.push_back(constraint.closestDistanceBaseVoxels);
@@ -423,6 +479,43 @@ void printConstraintReport(
               << report.scoreSeconds << "  " << wallSeconds << "  " << cpuSeconds << '\n';
 }
 
+void printConstraintPruningReport(
+    const vc::fiber_tracer::FiberTraceConstraintPruningReport& report)
+{
+    const auto row = [](const char* scope,
+                        const vc::fiber_tracer::FiberTraceConstraintGraphStats& stats) {
+        std::cout << std::left << std::setw(9) << scope << std::right
+                  << std::setw(8) << stats.traces
+                  << std::setw(9) << stats.crossTraceConstraints
+                  << std::setw(8) << stats.minimumDegree
+                  << std::setw(10) << std::fixed << std::setprecision(3)
+                  << stats.meanDegree
+                  << std::setw(9) << stats.medianDegree
+                  << std::setw(8) << stats.maximumDegree
+                  << std::setw(10) << stats.isolatedTraces
+                  << std::setw(12) << stats.connectedComponents << '\n';
+    };
+    std::cout << "fiber trace constraint strength pruning\n"
+              << "limit  input_total  retained_total  hard  zero_rejected  discarded  recovery_candidates  expected_bridges  recovery_bridges  cap_bridges  overflow_bridges  fibers_over_limit\n"
+              << report.maximumConstraintsPerTrace << "  "
+              << report.inputTotalConstraints << "  "
+              << report.retainedTotalConstraints << "  "
+              << report.hardConstraints << "  "
+              << report.rejectedZeroStrength << "  "
+              << report.rejectedNotMutual << "  "
+              << report.recoveryCandidates << "  "
+              << report.expectedRecoveryBridges << "  "
+              << report.recoveryBridges << "  "
+              << report.capRespectingRecoveryBridges << "  "
+              << report.fallbackOverflowBridges << "  "
+              << report.tracesAboveTargetDegree << '\n'
+              << "scope      fibers    links  min_deg  mean_deg  median  max_deg  isolated  components\n";
+    row("before", report.before);
+    row("mutual", report.mutual);
+    row("after", report.after);
+    std::cout << std::defaultfloat;
+}
+
 void printLabelingReport(
     const vc::fiber_tracer::FiberTraceLabelingReport& report,
     const vc::fiber_tracer::FiberTraceLabelingConfig& config,
@@ -457,6 +550,118 @@ void printLabelingReport(
         std::cout << names[index] << "  " << objects.pieceCounts[index]
                   << "  " << paths[index] << '\n';
     }
+}
+
+const char* pieceLabelName(vc::fiber_tracer::FiberTracePieceLabel label)
+{
+    using Label = vc::fiber_tracer::FiberTracePieceLabel;
+    switch (label) {
+    case Label::HEven:
+        return "h_even";
+    case Label::HOdd:
+        return "h_odd";
+    case Label::VEven:
+        return "v_even";
+    case Label::VOdd:
+        return "v_odd";
+    case Label::Broken:
+        return "broken";
+    }
+    return "invalid";
+}
+
+const char* directionGroupName(vc::fiber_tracer::FiberDirectionGroup group)
+{
+    using Group = vc::fiber_tracer::FiberDirectionGroup;
+    switch (group) {
+    case Group::Direction1:
+        return "dir1";
+    case Group::Direction2:
+        return "dir2";
+    case Group::Mixed:
+        return "mixed";
+    }
+    return "invalid";
+}
+
+void printDirectionDiagnosticReport(
+    const vc::fiber_tracer::FiberDirectionClassification& directions,
+    std::span<const std::size_t> originalTraceIndices,
+    const vc::fiber_tracer::FiberDirectionLabelComparisonReport& comparison)
+{
+    const std::size_t pieces = comparison.rawH + comparison.rawV +
+        comparison.rawBroken;
+    const std::size_t errors = comparison.orientationErrors +
+        comparison.brokenErrors;
+    const double pieceErrorRate = pieces == 0
+        ? 0.0
+        : static_cast<double>(errors) / static_cast<double>(pieces);
+    const double traceErrorRate = comparison.representedTraces == 0
+        ? 0.0
+        : static_cast<double>(comparison.errorTraces) /
+            static_cast<double>(comparison.representedTraces);
+
+    std::cout << "fiber direction MILP diagnostic population\n"
+              << "input_fibers  dir1_retained  dir2_retained  mixed_removed  retained_fibers  represented_fibers  pieces\n"
+              << directions.lines.size() << "  "
+              << directions.groupCounts[0] << "  "
+              << directions.groupCounts[1] << "  "
+              << directions.groupCounts[2] << "  "
+              << originalTraceIndices.size() << "  "
+              << comparison.representedTraces << "  " << pieces << '\n'
+              << "fiber direction MILP raw labels\n"
+              << "h  v  broken  active_components  flipped_components\n"
+              << comparison.rawH << "  " << comparison.rawV << "  "
+              << comparison.rawBroken << "  "
+              << comparison.activeComponents << "  "
+              << comparison.flippedComponents << '\n'
+              << "fiber direction MILP gauge-aligned confusion\n"
+              << "initial  pieces  aligned_dir1  aligned_dir2  broken  errors  error_rate\n";
+    for (std::size_t rowIndex = 0; rowIndex < comparison.confusion.size(); ++rowIndex) {
+        const auto& row = comparison.confusion[rowIndex];
+        const double rate = row.pieces == 0
+            ? 0.0
+            : static_cast<double>(row.errors) /
+                static_cast<double>(row.pieces);
+        std::cout << (rowIndex == 0 ? "dir1" : "dir2") << "  "
+                  << row.pieces << "  " << row.alignedDirection1 << "  "
+                  << row.alignedDirection2 << "  " << row.broken << "  "
+                  << row.errors << "  " << std::fixed << std::setprecision(4)
+                  << rate << '\n';
+    }
+    std::cout << "fiber direction MILP errors\n"
+              << "orientation_errors  broken_errors  total_errors  piece_error_rate  error_fibers  represented_fibers  fiber_error_rate\n"
+              << comparison.orientationErrors << "  "
+              << comparison.brokenErrors << "  " << errors << "  "
+              << std::fixed << std::setprecision(4) << pieceErrorRate << "  "
+              << comparison.errorTraces << "  "
+              << comparison.representedTraces << "  " << traceErrorRate << '\n'
+              << "fiber direction MILP error details\n"
+              << "piece  filtered_trace  original_trace  trace_piece  begin_arc  end_arc  initial  raw_label  component  flipped  aligned  kind\n";
+    for (const auto& error : comparison.errors) {
+        if (error.filteredTraceIndex >= originalTraceIndices.size()) {
+            throw std::logic_error(
+                "direction diagnostic error has invalid filtered trace index");
+        }
+        std::cout << error.pieceIndex << "  " << error.filteredTraceIndex
+                  << "  " << originalTraceIndices[error.filteredTraceIndex]
+                  << "  " << error.tracePieceIndex << "  "
+                  << std::fixed << std::setprecision(3)
+                  << error.beginArcBaseVoxels << "  "
+                  << error.endArcBaseVoxels << "  "
+                  << directionGroupName(error.initialDirection) << "  "
+                  << pieceLabelName(error.rawLabel) << "  ";
+        if (error.kind ==
+            vc::fiber_tracer::FiberDirectionLabelErrorKind::Broken) {
+            std::cout << "-  -  -  broken\n";
+        } else {
+            std::cout << error.componentIndex << "  "
+                      << (error.componentFlipped ? "yes" : "no") << "  "
+                      << directionGroupName(error.alignedDirection)
+                      << "  orientation\n";
+        }
+    }
+    std::cout << std::defaultfloat;
 }
 
 void printRelaxedLabelingReport(
@@ -654,11 +859,15 @@ struct VisualizationReport {
     vc::fiber_tracer::FiberQualityHistogram quality;
 };
 
-VisualizationReport visualize(const std::vector<vc::fiber_tracer::FiberletCropTraceLine>& lines, const std::filesystem::path& output)
+VisualizationReport visualize(
+    const std::vector<vc::fiber_tracer::FiberletCropTraceLine>& lines,
+    const std::filesystem::path& output,
+    double directionDominance)
 {
     std::filesystem::create_directories(output.parent_path().empty() ? std::filesystem::path{"."} : output.parent_path());
     VisualizationReport report;
-    report.directions = vc::fiber_tracer::classifyFiberletCropDirections(lines);
+    report.directions = vc::fiber_tracer::classifyFiberletCropDirections(
+        lines, directionDominance);
     vc::fiber_tracer::writeFiberletCropDirectionObjs(lines, report.directions, output);
     report.quality = vc::fiber_tracer::classifyFiberletCropQuality(lines);
     vc::fiber_tracer::writeFiberletCropQualityArtifacts(lines, report.quality, output);
@@ -689,7 +898,8 @@ void printDirectionReport(const vc::fiber_tracer::FiberDirectionClassification& 
               << classification.direction2BaseXYZ[1] << ',' << classification.direction2BaseXYZ[2] << " analyzed_steps=" << classification.analyzedSteps
               << " analyzed_length_base=" << classification.analyzedLengthBaseVoxels << " dir1_fibers=" << classification.groupCounts[0]
               << " dir2_fibers=" << classification.groupCounts[1] << " mixed_fibers=" << classification.groupCounts[2]
-              << " dominance_fraction=" << vc::fiber_tracer::kFiberDirectionDominanceFraction << " output=" << paths.all << '\n';
+              << " dominance_fraction=" << classification.dominanceFraction
+              << " output=" << paths.all << '\n';
 }
 
 }  // namespace
@@ -699,7 +909,8 @@ int main(int argc, char** argv)
     try {
         const auto options = parse(argc, argv);
         if (options.mode == Mode::Constraints ||
-            options.mode == Mode::Consensus) {
+            options.mode == Mode::Consensus ||
+            options.mode == Mode::DirectionDiagnostic) {
             const auto started = std::chrono::steady_clock::now();
             const auto cpuStarted = std::clock();
             const auto artifact =
@@ -717,8 +928,47 @@ int main(int argc, char** argv)
             const vc::lasagna::LasagnaNormalSampler normals(
                 normalDataset,
                 vc::lasagna::LasagnaNormalSamplerOptions{options.cacheBytes});
-            const auto report = vc::fiber_tracer::extractFiberTraceConstraints(
-                artifact.lines,
+
+            std::vector<vc::fiber_tracer::FiberletCropTraceLine>
+                diagnosticLines;
+            std::vector<std::size_t> diagnosticOriginalTraceIndices;
+            std::vector<vc::fiber_tracer::FiberDirectionGroup>
+                diagnosticDirections;
+            std::optional<vc::fiber_tracer::FiberDirectionClassification>
+                diagnosticClassification;
+            const std::vector<vc::fiber_tracer::FiberletCropTraceLine>*
+                constraintLines = &artifact.lines;
+            if (options.mode == Mode::DirectionDiagnostic) {
+                diagnosticClassification =
+                    vc::fiber_tracer::classifyFiberletCropDirections(
+                        artifact.lines, options.directionDominance);
+                const auto outputDirectory = options.output.parent_path().empty()
+                    ? std::filesystem::path{"."}
+                    : options.output.parent_path();
+                std::filesystem::create_directories(outputDirectory);
+                const std::filesystem::path initialOutput = outputDirectory /
+                    (options.output.stem().string() + "_initial.obj");
+                vc::fiber_tracer::writeFiberletCropDirectionObjs(
+                    artifact.lines, *diagnosticClassification, initialOutput);
+                printDirectionReport(*diagnosticClassification, initialOutput);
+                diagnosticLines.reserve(artifact.lines.size());
+                diagnosticOriginalTraceIndices.reserve(artifact.lines.size());
+                diagnosticDirections.reserve(artifact.lines.size());
+                for (std::size_t trace = 0;
+                     trace < artifact.lines.size();
+                     ++trace) {
+                    const auto group =
+                        diagnosticClassification->lines[trace].group;
+                    if (group == vc::fiber_tracer::FiberDirectionGroup::Mixed)
+                        continue;
+                    diagnosticLines.push_back(artifact.lines[trace]);
+                    diagnosticOriginalTraceIndices.push_back(trace);
+                    diagnosticDirections.push_back(group);
+                }
+                constraintLines = &diagnosticLines;
+            }
+            auto report = vc::fiber_tracer::extractFiberTraceConstraints(
+                *constraintLines,
                 options.constraints,
                 [&normals](const cv::Vec3d& a,
                            const cv::Vec3d& b,
@@ -732,6 +982,23 @@ int main(int argc, char** argv)
                     return normals.normalAlignedWindingDistancesBatch(
                         connectors, step, threads);
                 });
+            std::vector<vc::fiber_tracer::FiberTraceConstraint>
+                extractedConstraints;
+            std::optional<vc::fiber_tracer::FiberTraceConstraintPruningReport>
+                pruningReport;
+            if (options.maximumConstraintsPerFiber) {
+                extractedConstraints = report.constraints;
+                auto pruning =
+                    vc::fiber_tracer::pruneFiberTraceConstraintsByStrength(
+                        report,
+                        options.constraints.maximumDistanceBaseVoxels,
+                        *options.maximumConstraintsPerFiber);
+                report.constraints = std::move(pruning.constraints);
+                pruningReport = std::move(pruning.report);
+            }
+            const auto& extractionConstraints = extractedConstraints.empty()
+                ? report.constraints
+                : extractedConstraints;
             if (options.mode == Mode::Consensus) {
                 vc::fiber_tracer::FiberTraceConsensusConfig consensusConfig;
                 consensusConfig.brokenCostPerConstraint =
@@ -749,10 +1016,13 @@ int main(int argc, char** argv)
                     std::clock() - cpuStarted) / CLOCKS_PER_SEC;
                 printConstraintReport(
                     report,
+                    extractionConstraints,
                     options.constraints,
                     manifestMatches,
                     wallSeconds,
                     cpuSeconds);
+                if (pruningReport)
+                    printConstraintPruningReport(*pruningReport);
                 printConsensusReport(
                     consensus, consensusConfig, consensusObjects);
                 return 0;
@@ -782,10 +1052,13 @@ int main(int argc, char** argv)
                 std::clock() - cpuStarted) / CLOCKS_PER_SEC;
             printConstraintReport(
                 report,
+                extractionConstraints,
                 options.constraints,
                 manifestMatches,
                 wallSeconds,
                 cpuSeconds);
+            if (pruningReport)
+                printConstraintPruningReport(*pruningReport);
             printConstraintObjReport(objReport);
             if (relaxationCsv) {
                 printRelaxedLabelingReport(
@@ -797,11 +1070,21 @@ int main(int argc, char** argv)
                 printLabelingReport(
                     labeling, options.labeling, *labelObjReport);
             }
+            if (options.mode == Mode::DirectionDiagnostic) {
+                const auto comparison =
+                    vc::fiber_tracer::compareFiberDirectionLabels(
+                        report, diagnosticDirections, labeling);
+                printDirectionDiagnosticReport(
+                    *diagnosticClassification,
+                    diagnosticOriginalTraceIndices,
+                    comparison);
+            }
             return 0;
         }
         if (options.mode == Mode::Visualize) {
             const auto artifact = vc::fiber_tracer::readFiberletCropTraceArtifact(options.input);
-            const auto report = visualize(artifact.lines, options.output);
+            const auto report = visualize(
+                artifact.lines, options.output, options.directionDominance);
             printDirectionReport(report.directions, options.output);
             std::cout << "fiberlet crop visualization completed"
                       << " traces=" << artifact.lines.size() << " input=" << options.input << " output=" << options.output << '\n';
@@ -854,7 +1137,8 @@ int main(int argc, char** argv)
         vc::fiber_tracer::
             writeFiberletCropTraceArtifact(options.output, dataset->metadata(), normalDataset.manifest().raw, options.trace, result.lines);
         const auto artifact = vc::fiber_tracer::readFiberletCropTraceArtifact(options.output);
-        const auto visualization = visualize(artifact.lines, options.obj);
+        const auto visualization = visualize(
+            artifact.lines, options.obj, options.directionDominance);
 
         if (!options.volume.empty()) {
             const std::string locator = std::filesystem::absolute(options.volume).lexically_normal().string();

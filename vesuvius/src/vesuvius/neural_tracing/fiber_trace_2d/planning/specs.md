@@ -4636,11 +4636,27 @@
   `sum(length*max((step dot d1)^2,(step dot d2)^2))` and are not constrained to
   be orthogonal. Seed pairs, equal-alignment assignment, fit ties, axis signs,
   and final direction labels have fixed canonical ordering.
-- Each local step is assigned by larger absolute direction dot product. A line
-  is direction-1- or direction-2-dominant when at least 75% of its valid arc
-  length is assigned to that direction; otherwise it is mixed. A line without
-  a nonzero step is mixed. Only accepted lines contribute, and analysis uses a
-  fixed serial reduction order.
+- For line grouping, let `q=(d1 dot d2)^2`. Each unit local step `u` contributes
+  `step_length*clamp(((u dot di)^2-q)/(1-q),0,1)` support to direction `i`.
+  These are independent affinities and must not be normalized by their sum;
+  with non-orthogonal axes their sum can exceed the step length. Axis dots are
+  clamped before squaring. When `1-q <= 1e-8`, direction 1 instead receives
+  ordinary squared-alignment support and direction 2 receives zero.
+- A line is direction-1- or direction-2-dominant when the larger accumulated
+  support divided by the line's actual valid arc length reaches the selected
+  dominance fraction; an exact support tie prefers direction 1. Otherwise it
+  is mixed. Hard fit assignments remain only for the existing deterministic
+  axis ordering and do not classify lines. The default is 0.75.
+  `--direction-dominance F` is accepted only by `trace`, `visualize`, and
+  `direction-diagnostic`, must be finite in `(0.5,1]`, and is inclusive at
+  `F`; constraint and consensus modes reject it. A line without a nonzero step
+  is mixed. Only accepted lines
+  contribute, and analysis uses a fixed serial reduction order. The selected
+  fraction is reported with the classification.
+- Direction dominance changes only the direction-group line and anchor
+  partition. It cannot change tracing, coverage, stored trace data, fitted
+  axes, per-direction supports, or quality classification. `visualize` rewrites
+  the complete all/direction/anchor/quality family for its output basename.
 - The requested line OBJ remains the complete accepted set. Sibling `_dir1`,
   `_dir2`, and `_mixed` OBJs partition those polylines without changing names,
   geometry, or order. Matching `_anchors`, `_dir1_anchors`, `_dir2_anchors`,
@@ -4661,6 +4677,34 @@
   diagnostic connector OBJs, solves five-state piece labels, and emits one OBJ
   for each label. Structured constraint persistence remains outside this
   stage.
+- `vc_fiber_trace_chunk direction-diagnostic TRACE.zarr --normal-manifest
+  MANIFEST` first applies the same gradual direction grouping as stored-trace
+  visualization to every source trace. It writes the unfiltered direction
+  family beneath `<base>_initial.obj`, then removes all mixed traces before
+  piece splitting, spatial constraint extraction, optional strength pruning,
+  and optimization. Retained traces preserve an explicit mapping to their
+  original stored-trace indices.
+- Direction diagnostics always use the ordinary discrete H/V-plus-broken
+  HiGHS MILP with parity disabled. They reject explicit `--hv-only`, LP
+  relaxation/backend controls, exact-perpendicular MILP, and labeling-only
+  link exclusion. Extraction settings, finite winding cutoff or
+  `--no-winding-cutoff`, `--constraints-per-fiber`, broken cost, MIP gap,
+  threads, and cache size retain their canonical meanings.
+- Optimized H/V labels are compared to initial direction groups only after
+  resolving the arbitrary H/V gauge independently in every connected
+  component of active pieces. Components use the exact post-pruning constraint
+  graph passed to the solver, including hard same-trace continuity, with edges
+  incident to a final Broken piece omitted. Each component is flipped only
+  when that strictly reduces disagreement; a tie keeps direction 1 mapped to
+  H. Broken pieces are errors independently of orientation.
+- The diagnostic prints raw H/V/broken totals, the number of active and flipped
+  components, a gauge-aligned confusion table, orientation and broken errors,
+  piece and represented-source-trace error rates, and a stable per-error table
+  carrying filtered and original trace IDs plus the trace-local arc interval.
+  The piece denominator is every retained extracted piece. The trace
+  denominator is every retained source trace represented by at least one
+  piece. An all-mixed input succeeds and writes valid empty constraint and
+  label families in addition to the complete initial direction family.
 - Every distance and arc value is in base voxels. Defaults are a 32-vx common
   sample pitch, 512-vx target piece length, 128-vx overlap, 128-vx neighbor
   radius, 32-vx centered tangent window, and 8-vx winding integration step.
@@ -4822,6 +4866,53 @@
   groups pieces by original trace index, discards same-trace links, and counts
   each retained cross-trace piece-pair constraint once. Accumulation order is
   stable by neighbor trace and piece IDs.
+- `--constraints-per-fiber K` is an opt-in shared constraint-pruning stage for
+  `constraints` and `consensus`; omission preserves the extracted graph
+  exactly. It runs after canonical extraction and winding-cutoff rejection but
+  before constraint OBJ output, consensus, or HiGHS labeling. The later
+  labeling-only `--exclude-parallel-separate-winding` ablation, when requested,
+  therefore runs after strength pruning and reports its additional exclusions
+  separately.
+- Every non-hard cross-trace piece-pair link has strength
+  `abs(2*p-1) * max(0, 1-d/D)`, where `p` is normalized parallel score, `d` is
+  closest distance in base voxels, and `D` is the exact positive extraction
+  maximum distance. Zero-strength links are excluded. Each source trace ranks
+  its incident positive-strength links by descending strength, ascending
+  distance, then normalized ascending piece IDs. A link survives only if both
+  endpoint traces rank that individual piece-pair link in their top `K`.
+  Multiple piece-pair links to the same neighboring source trace consume
+  multiple slots. This mutual graph is only the initial sparse proposal.
+- Connectivity recovery considers every discarded link with exact positive
+  strength and adds only links whose endpoint source traces occupy different
+  current components. A strength-ordered first pass accepts bridges only while
+  both post-add degrees remain at most `K`. A fallback dynamically minimizes
+  post-add overflow
+  `max(0,degree_a+1-K)+max(0,degree_b+1-K)`, then prefers greater strength,
+  smaller distance, and normalized piece IDs. Zero-strength links never bridge.
+  Canonical DSU roots use the minimum source-trace index, and final constraint
+  order is canonical and independent of input order.
+- For each original positive-strength component containing `c` mutual
+  components, recovery adds exactly `c-1` links and no cycle edge. Globally,
+  accepted recovery links equal mutual components minus original positive-
+  graph components, and the final partition exactly matches the original.
+  Therefore `K` is a target rather than a guaranteed cap. Reported fallback
+  overflow is a result of the greedy policy, not proof that another
+  degree-bounded spanning forest cannot exist.
+- Hard continuity links must connect pieces of the same source trace, remain
+  unchanged, and do not consume top-K slots or contribute to cross-trace graph
+  degree. Soft same-trace links, hard cross-trace links, duplicate canonical
+  piece pairs, invalid references, non-finite/out-of-range evidence, and a
+  nonpositive `D` or `K` fail explicitly.
+- Pruning diagnostics are separate from extraction diagnostics. Input/mutual/final
+  graph statistics count source traces represented by at least one extracted
+  piece, individual retained cross-trace constraints as degree, and connected
+  components in the cross-trace graph; every isolated valid trace is one
+  component. They report total/cross-link counts, min/mean/median/max degree,
+  isolates, and components, with mean degree equal to `2E/V`. They also report
+  recovery candidates, expected/actual bridges, cap-respecting versus fallback
+  bridges, and final traces above `K`. Constraint OBJ, consensus, and HiGHS
+  receive the same recovered constraint report. A later labeling-only ablation
+  may independently fragment the HiGHS model and is outside this guarantee.
 - Crop bounds for consensus are the stored trace-artifact bounds and must be
   finite with positive XYZ extents. The nominal crop side is
   `min(maximum_base_xyz - minimum_base_xyz)` and its center is the arithmetic

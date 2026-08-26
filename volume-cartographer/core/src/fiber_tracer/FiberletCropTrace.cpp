@@ -35,6 +35,7 @@ constexpr double kPi = 3.14159265358979323846;
 constexpr std::size_t kDirectionSeedCount = 8;
 constexpr int kDirectionFitIterations = 32;
 constexpr double kDirectionFitTolerance = 1.0e-12;
+constexpr double kDirectionAxisSeparationEpsilon = 1.0e-8;
 
 double length(const cv::Vec3d& value)
 {
@@ -66,6 +67,31 @@ bool axisLess(const cv::Vec3d& left, const cv::Vec3d& right)
             return left[coordinate] < right[coordinate];
     }
     return false;
+}
+
+std::array<double, 2> directionStepSupport(
+    const cv::Vec3d& stepAxis,
+    const cv::Vec3d& direction1,
+    const cv::Vec3d& direction2)
+{
+    const double crossDot = std::clamp(direction1.dot(direction2), -1.0, 1.0);
+    const double crossAlignment = crossDot * crossDot;
+    const double separation = 1.0 - crossAlignment;
+    const auto squaredAlignment = [&](const cv::Vec3d& direction) {
+        const double dot = std::clamp(stepAxis.dot(direction), -1.0, 1.0);
+        return dot * dot;
+    };
+    const double direction1Alignment = squaredAlignment(direction1);
+    if (separation <= kDirectionAxisSeparationEpsilon)
+        return {direction1Alignment, 0.0};
+    const auto calibrated = [&](double alignment) {
+        return std::clamp(
+            (alignment - crossAlignment) / separation, 0.0, 1.0);
+    };
+    return {
+        calibrated(direction1Alignment),
+        calibrated(squaredAlignment(direction2)),
+    };
 }
 
 std::size_t groupIndex(FiberDirectionGroup group)
@@ -885,6 +911,7 @@ FiberDirectionClassification classifyFiberletCropDirections(
     }
 
     FiberDirectionClassification result;
+    result.dominanceFraction = dominanceFraction;
     result.lines.resize(lines.size());
     std::vector<DirectionStep> steps;
     for (std::size_t lineIndex = 0; lineIndex < lines.size(); ++lineIndex) {
@@ -988,19 +1015,25 @@ FiberDirectionClassification classifyFiberletCropDirections(
 
     for (std::size_t index = 0; index < steps.size(); ++index) {
         auto& line = result.lines[steps[index].line];
-        if (bestFit.assignments[index] == 0)
-            line.direction1LengthBaseVoxels += steps[index].length;
-        else
-            line.direction2LengthBaseVoxels += steps[index].length;
+        const auto support = directionStepSupport(
+            steps[index].axis, bestFit.axes[0], bestFit.axes[1]);
+        line.direction1SupportBaseVoxels += support[0] * steps[index].length;
+        line.direction2SupportBaseVoxels += support[1] * steps[index].length;
+        line.totalLengthBaseVoxels += steps[index].length;
     }
     for (auto& line : result.lines) {
-        const double total = line.direction1LengthBaseVoxels +
-            line.direction2LengthBaseVoxels;
-        if (total > kEpsilon) {
-            if (line.direction1LengthBaseVoxels / total >= dominanceFraction)
+        if (line.totalLengthBaseVoxels > kEpsilon) {
+            const double direction1Fraction =
+                line.direction1SupportBaseVoxels / line.totalLengthBaseVoxels;
+            const double direction2Fraction =
+                line.direction2SupportBaseVoxels / line.totalLengthBaseVoxels;
+            if (direction1Fraction >= direction2Fraction &&
+                direction1Fraction >= dominanceFraction) {
                 line.group = FiberDirectionGroup::Direction1;
-            else if (line.direction2LengthBaseVoxels / total >= dominanceFraction)
+            } else if (direction2Fraction > direction1Fraction &&
+                       direction2Fraction >= dominanceFraction) {
                 line.group = FiberDirectionGroup::Direction2;
+            }
         }
         ++result.groupCounts[groupIndex(line.group)];
     }

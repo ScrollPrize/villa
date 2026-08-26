@@ -615,6 +615,356 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
     return report;
 }
 
+FiberTraceConstraintPruningResult pruneFiberTraceConstraintsByStrength(
+    const FiberTraceConstraintReport& constraints,
+    double maximumDistanceBaseVoxels,
+    std::size_t maximumConstraintsPerTrace)
+{
+    if (!std::isfinite(maximumDistanceBaseVoxels) ||
+        !(maximumDistanceBaseVoxels > 0.0)) {
+        throw std::invalid_argument(
+            "Constraint pruning maximum distance must be finite and positive");
+    }
+    if (maximumConstraintsPerTrace == 0) {
+        throw std::invalid_argument(
+            "Constraint pruning limit must be positive");
+    }
+
+    struct RankedConstraint {
+        std::size_t index = 0;
+        std::size_t pieceA = 0;
+        std::size_t pieceB = 0;
+        std::size_t traceA = 0;
+        std::size_t traceB = 0;
+        double strength = 0.0;
+        double distance = 0.0;
+    };
+
+    if (constraints.inputTraces == 0 && !constraints.pieces.empty()) {
+        throw std::invalid_argument(
+            "Constraint pruning report has pieces but no input traces");
+    }
+    std::vector<bool> validTrace(constraints.inputTraces, false);
+    for (const auto& piece : constraints.pieces) {
+        if (piece.traceIndex >= constraints.inputTraces) {
+            throw std::invalid_argument(
+                "Constraint pruning piece references an invalid trace");
+        }
+        validTrace[piece.traceIndex] = true;
+    }
+
+    std::vector<RankedConstraint> ranked;
+    ranked.reserve(constraints.constraints.size());
+    std::vector<std::size_t> hardIndices;
+    hardIndices.reserve(constraints.hardConstraints);
+    std::map<PiecePair, std::size_t> uniquePairs;
+    for (std::size_t index = 0; index < constraints.constraints.size(); ++index) {
+        const auto& constraint = constraints.constraints[index];
+        if (constraint.pieceA >= constraints.pieces.size() ||
+            constraint.pieceB >= constraints.pieces.size() ||
+            constraint.pieceA == constraint.pieceB) {
+            throw std::invalid_argument(
+                "Constraint pruning link references an invalid piece pair");
+        }
+        const PiecePair pair{
+            std::min(constraint.pieceA, constraint.pieceB),
+            std::max(constraint.pieceA, constraint.pieceB)};
+        if (!uniquePairs.emplace(pair, index).second) {
+            throw std::invalid_argument(
+                "Constraint pruning report contains a duplicate piece pair");
+        }
+        const std::size_t traceA =
+            constraints.pieces[constraint.pieceA].traceIndex;
+        const std::size_t traceB =
+            constraints.pieces[constraint.pieceB].traceIndex;
+        if (constraint.hardContinuity) {
+            if (traceA != traceB) {
+                throw std::invalid_argument(
+                    "Constraint pruning hard link crosses source traces");
+            }
+            hardIndices.push_back(index);
+            continue;
+        }
+        if (traceA == traceB) {
+            throw std::invalid_argument(
+                "Constraint pruning soft link stays within one source trace");
+        }
+        if (!std::isfinite(constraint.closestDistanceBaseVoxels) ||
+            constraint.closestDistanceBaseVoxels < 0.0 ||
+            constraint.closestDistanceBaseVoxels >
+                maximumDistanceBaseVoxels + kEpsilon ||
+            !std::isfinite(constraint.parallelScore) ||
+            constraint.parallelScore < 0.0 ||
+            constraint.parallelScore > 1.0) {
+            throw std::invalid_argument(
+                "Constraint pruning link has invalid strength evidence");
+        }
+        const double certainty =
+            std::abs(2.0 * constraint.parallelScore - 1.0);
+        const double proximity = std::max(
+            0.0,
+            1.0 - constraint.closestDistanceBaseVoxels /
+                maximumDistanceBaseVoxels);
+        ranked.push_back({
+            index,
+            pair.a,
+            pair.b,
+            traceA,
+            traceB,
+            certainty * proximity,
+            constraint.closestDistanceBaseVoxels,
+        });
+    }
+
+    auto graphStats = [&](const std::vector<std::size_t>& indices) {
+        FiberTraceConstraintGraphStats stats;
+        std::vector<std::size_t> activeTraces;
+        activeTraces.reserve(validTrace.size());
+        std::vector<std::size_t> activeIndex(validTrace.size(),
+                                             std::numeric_limits<std::size_t>::max());
+        for (std::size_t trace = 0; trace < validTrace.size(); ++trace) {
+            if (!validTrace[trace])
+                continue;
+            activeIndex[trace] = activeTraces.size();
+            activeTraces.push_back(trace);
+        }
+        stats.traces = activeTraces.size();
+        std::vector<std::size_t> degree(stats.traces, 0);
+        std::vector<std::size_t> parent(stats.traces);
+        for (std::size_t index = 0; index < parent.size(); ++index)
+            parent[index] = index;
+        const auto findRoot = [&](std::size_t node) {
+            while (parent[node] != node) {
+                parent[node] = parent[parent[node]];
+                node = parent[node];
+            }
+            return node;
+        };
+        for (const std::size_t index : indices) {
+            const auto& constraint = constraints.constraints[index];
+            if (constraint.hardContinuity)
+                continue;
+            const std::size_t traceA =
+                constraints.pieces[constraint.pieceA].traceIndex;
+            const std::size_t traceB =
+                constraints.pieces[constraint.pieceB].traceIndex;
+            const std::size_t a = activeIndex[traceA];
+            const std::size_t b = activeIndex[traceB];
+            ++degree[a];
+            ++degree[b];
+            ++stats.crossTraceConstraints;
+            const std::size_t rootA = findRoot(a);
+            const std::size_t rootB = findRoot(b);
+            if (rootA != rootB)
+                parent[rootB] = rootA;
+        }
+        if (degree.empty())
+            return stats;
+        std::sort(degree.begin(), degree.end());
+        stats.minimumDegree = degree.front();
+        stats.maximumDegree = degree.back();
+        stats.meanDegree =
+            2.0 * static_cast<double>(stats.crossTraceConstraints) /
+            static_cast<double>(stats.traces);
+        const std::size_t middle = degree.size() / 2;
+        stats.medianDegree = degree.size() % 2 == 0
+            ? 0.5 * static_cast<double>(degree[middle - 1] + degree[middle])
+            : static_cast<double>(degree[middle]);
+        stats.isolatedTraces = static_cast<std::size_t>(
+            std::count(degree.begin(), degree.end(), 0));
+        for (std::size_t index = 0; index < parent.size(); ++index) {
+            if (findRoot(index) == index)
+                ++stats.connectedComponents;
+        }
+        return stats;
+    };
+
+    FiberTraceConstraintPruningResult result;
+    auto& report = result.report;
+    report.maximumConstraintsPerTrace = maximumConstraintsPerTrace;
+    report.inputTotalConstraints = constraints.constraints.size();
+    report.hardConstraints = hardIndices.size();
+
+    std::vector<std::vector<std::size_t>> incident(constraints.inputTraces);
+    std::vector<const RankedConstraint*> byIndex(constraints.constraints.size(), nullptr);
+    std::vector<std::size_t> positiveIndices;
+    positiveIndices.reserve(ranked.size());
+    for (const auto& entry : ranked) {
+        byIndex[entry.index] = &entry;
+        if (!(entry.strength > 0.0)) {
+            ++report.rejectedZeroStrength;
+            continue;
+        }
+        positiveIndices.push_back(entry.index);
+        incident[entry.traceA].push_back(entry.index);
+        incident[entry.traceB].push_back(entry.index);
+    }
+    report.before = graphStats(positiveIndices);
+    const auto better = [&](std::size_t leftIndex, std::size_t rightIndex) {
+        const auto& left = *byIndex[leftIndex];
+        const auto& right = *byIndex[rightIndex];
+        if (left.strength != right.strength)
+            return left.strength > right.strength;
+        if (left.distance != right.distance)
+            return left.distance < right.distance;
+        return std::tie(left.pieceA, left.pieceB) <
+            std::tie(right.pieceA, right.pieceB);
+    };
+    std::vector<unsigned char> nominations(constraints.constraints.size(), 0);
+    for (auto& traceIncident : incident) {
+        std::sort(traceIncident.begin(), traceIncident.end(), better);
+        const std::size_t count =
+            std::min(maximumConstraintsPerTrace, traceIncident.size());
+        for (std::size_t rank = 0; rank < count; ++rank)
+            ++nominations[traceIncident[rank]];
+    }
+
+    std::vector<bool> retained(constraints.constraints.size(), false);
+    for (const std::size_t index : hardIndices)
+        retained[index] = true;
+    for (const auto& entry : ranked) {
+        if (entry.strength > 0.0 && nominations[entry.index] == 2)
+            retained[entry.index] = true;
+    }
+
+    std::vector<std::size_t> mutualIndices;
+    mutualIndices.reserve(positiveIndices.size());
+    std::vector<std::size_t> degree(constraints.inputTraces, 0);
+    std::vector<std::size_t> parent(constraints.inputTraces);
+    for (std::size_t trace = 0; trace < parent.size(); ++trace)
+        parent[trace] = trace;
+    const auto findRoot = [&](std::size_t trace) {
+        while (parent[trace] != trace) {
+            parent[trace] = parent[parent[trace]];
+            trace = parent[trace];
+        }
+        return trace;
+    };
+    const auto unite = [&](std::size_t traceA, std::size_t traceB) {
+        const std::size_t rootA = findRoot(traceA);
+        const std::size_t rootB = findRoot(traceB);
+        if (rootA == rootB)
+            return false;
+        parent[std::max(rootA, rootB)] = std::min(rootA, rootB);
+        return true;
+    };
+    for (const std::size_t index : positiveIndices) {
+        if (!retained[index])
+            continue;
+        mutualIndices.push_back(index);
+        const auto& entry = *byIndex[index];
+        ++degree[entry.traceA];
+        ++degree[entry.traceB];
+        unite(entry.traceA, entry.traceB);
+    }
+    report.mutual = graphStats(mutualIndices);
+    if (report.mutual.connectedComponents < report.before.connectedComponents) {
+        throw std::runtime_error(
+            "Constraint pruning mutual graph has invalid connectivity");
+    }
+    report.expectedRecoveryBridges =
+        report.mutual.connectedComponents - report.before.connectedComponents;
+
+    std::vector<std::size_t> recoveryCandidates;
+    recoveryCandidates.reserve(positiveIndices.size());
+    for (const std::size_t index : positiveIndices) {
+        if (!retained[index])
+            recoveryCandidates.push_back(index);
+    }
+    std::sort(recoveryCandidates.begin(), recoveryCandidates.end(), better);
+    report.recoveryCandidates = recoveryCandidates.size();
+    const auto acceptRecovery = [&](std::size_t index) {
+        const auto& entry = *byIndex[index];
+        if (!unite(entry.traceA, entry.traceB))
+            return false;
+        retained[index] = true;
+        ++degree[entry.traceA];
+        ++degree[entry.traceB];
+        ++report.recoveryBridges;
+        return true;
+    };
+
+    for (const std::size_t index : recoveryCandidates) {
+        const auto& entry = *byIndex[index];
+        if (findRoot(entry.traceA) == findRoot(entry.traceB) ||
+            degree[entry.traceA] >= maximumConstraintsPerTrace ||
+            degree[entry.traceB] >= maximumConstraintsPerTrace) {
+            continue;
+        }
+        if (acceptRecovery(index))
+            ++report.capRespectingRecoveryBridges;
+    }
+
+    while (report.recoveryBridges < report.expectedRecoveryBridges) {
+        std::optional<std::size_t> selected;
+        std::size_t selectedOverflow = std::numeric_limits<std::size_t>::max();
+        for (const std::size_t index : recoveryCandidates) {
+            if (retained[index])
+                continue;
+            const auto& entry = *byIndex[index];
+            if (findRoot(entry.traceA) == findRoot(entry.traceB))
+                continue;
+            const std::size_t overflow =
+                (degree[entry.traceA] + 1 > maximumConstraintsPerTrace
+                     ? degree[entry.traceA] + 1 - maximumConstraintsPerTrace
+                     : 0) +
+                (degree[entry.traceB] + 1 > maximumConstraintsPerTrace
+                     ? degree[entry.traceB] + 1 - maximumConstraintsPerTrace
+                     : 0);
+            if (!selected || overflow < selectedOverflow ||
+                (overflow == selectedOverflow && better(index, *selected))) {
+                selected = index;
+                selectedOverflow = overflow;
+            }
+        }
+        if (!selected || !acceptRecovery(*selected)) {
+            throw std::runtime_error(
+                "Constraint pruning could not recover source graph connectivity");
+        }
+        if (selectedOverflow > 0)
+            ++report.fallbackOverflowBridges;
+        else
+            ++report.capRespectingRecoveryBridges;
+    }
+
+    for (std::size_t trace = 0; trace < degree.size(); ++trace) {
+        if (validTrace[trace] && degree[trace] > maximumConstraintsPerTrace)
+            ++report.tracesAboveTargetDegree;
+    }
+    for (const std::size_t index : positiveIndices) {
+        if (!retained[index])
+            ++report.rejectedNotMutual;
+    }
+    std::vector<std::size_t> retainedIndices;
+    retainedIndices.reserve(constraints.constraints.size());
+    result.constraints.reserve(constraints.constraints.size());
+    for (std::size_t index = 0; index < constraints.constraints.size(); ++index) {
+        if (!retained[index])
+            continue;
+        retainedIndices.push_back(index);
+        result.constraints.push_back(constraints.constraints[index]);
+    }
+    std::sort(result.constraints.begin(), result.constraints.end(),
+        [](const auto& left, const auto& right) {
+            const PiecePair leftPair{
+                std::min(left.pieceA, left.pieceB),
+                std::max(left.pieceA, left.pieceB)};
+            const PiecePair rightPair{
+                std::min(right.pieceA, right.pieceB),
+                std::max(right.pieceA, right.pieceB)};
+            return std::tie(leftPair.a, leftPair.b, left.hardContinuity) <
+                std::tie(rightPair.a, rightPair.b, right.hardContinuity);
+        });
+    report.retainedTotalConstraints = result.constraints.size();
+    report.after = graphStats(retainedIndices);
+    if (report.recoveryBridges != report.expectedRecoveryBridges ||
+        report.after.connectedComponents != report.before.connectedComponents) {
+        throw std::runtime_error(
+            "Constraint pruning connectivity recovery invariant failed");
+    }
+    return result;
+}
+
 FiberTraceConstraintObjPaths fiberTraceConstraintObjPaths(
     const std::filesystem::path& outputBase)
 {

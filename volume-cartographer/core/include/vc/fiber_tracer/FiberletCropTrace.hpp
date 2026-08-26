@@ -70,13 +70,15 @@ inline constexpr double kFiberDirectionDominanceFraction = 0.75;
 
 struct FiberDirectionLineClassification {
     FiberDirectionGroup group = FiberDirectionGroup::Mixed;
-    double direction1LengthBaseVoxels = 0.0;
-    double direction2LengthBaseVoxels = 0.0;
+    double direction1SupportBaseVoxels = 0.0;
+    double direction2SupportBaseVoxels = 0.0;
+    double totalLengthBaseVoxels = 0.0;
 };
 
 struct FiberDirectionClassification {
     cv::Vec3d direction1BaseXYZ{1.0, 0.0, 0.0};
     cv::Vec3d direction2BaseXYZ{0.0, 1.0, 0.0};
+    double dominanceFraction = kFiberDirectionDominanceFraction;
     std::vector<FiberDirectionLineClassification> lines;
     std::array<std::size_t, 3> groupCounts{0, 0, 0};
     std::size_t analyzedSteps = 0;

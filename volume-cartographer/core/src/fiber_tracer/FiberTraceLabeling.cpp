@@ -701,6 +701,169 @@ FiberTraceLabelingReport solveFiberTraceLabels(
     return report;
 }
 
+FiberDirectionLabelComparisonReport compareFiberDirectionLabels(
+    const FiberTraceConstraintReport& constraints,
+    std::span<const FiberDirectionGroup> traceDirections,
+    const FiberTraceLabelingReport& labeling)
+{
+    const std::size_t pieceCount = constraints.pieces.size();
+    if (labeling.continuousPieceValues || labeling.labels.size() != pieceCount) {
+        throw std::invalid_argument(
+            "Fiber direction comparison requires one discrete label per piece");
+    }
+    if (traceDirections.size() != constraints.inputTraces) {
+        throw std::invalid_argument(
+            "Fiber direction comparison trace count does not match constraints");
+    }
+    for (const auto direction : traceDirections) {
+        if (direction == FiberDirectionGroup::Mixed) {
+            throw std::invalid_argument(
+                "Fiber direction comparison does not accept mixed traces");
+        }
+    }
+
+    FiberDirectionLabelComparisonReport result;
+    std::vector<unsigned char> represented(traceDirections.size(), 0);
+    std::vector<unsigned char> active(pieceCount, 0);
+    std::vector<std::vector<std::size_t>> adjacency(pieceCount);
+    for (std::size_t piece = 0; piece < pieceCount; ++piece) {
+        if (labelIndex(labeling.labels[piece]) >= 5) {
+            throw std::invalid_argument(
+                "Fiber direction comparison received an invalid piece label");
+        }
+        const auto& descriptor = constraints.pieces[piece];
+        if (descriptor.traceIndex >= traceDirections.size()) {
+            throw std::invalid_argument(
+                "Fiber direction comparison piece references an invalid trace");
+        }
+        represented[descriptor.traceIndex] = 1;
+        active[piece] = isBroken(labeling.labels[piece]) ? 0 : 1;
+        if (active[piece]) {
+            if (isVertical(labeling.labels[piece]))
+                ++result.rawV;
+            else
+                ++result.rawH;
+        } else {
+            ++result.rawBroken;
+        }
+    }
+    result.representedTraces = static_cast<std::size_t>(std::count(
+        represented.begin(), represented.end(), static_cast<unsigned char>(1)));
+
+    for (const auto& constraint : constraints.constraints) {
+        if (constraint.pieceA >= pieceCount ||
+            constraint.pieceB >= pieceCount ||
+            constraint.pieceA == constraint.pieceB) {
+            throw std::invalid_argument(
+                "Fiber direction comparison constraint has invalid endpoints");
+        }
+        if (!active[constraint.pieceA] || !active[constraint.pieceB])
+            continue;
+        adjacency[constraint.pieceA].push_back(constraint.pieceB);
+        adjacency[constraint.pieceB].push_back(constraint.pieceA);
+    }
+    for (auto& neighbors : adjacency)
+        std::sort(neighbors.begin(), neighbors.end());
+
+    constexpr std::size_t noComponent =
+        std::numeric_limits<std::size_t>::max();
+    std::vector<std::size_t> component(pieceCount, noComponent);
+    std::vector<std::vector<std::size_t>> componentPieces;
+    std::queue<std::size_t> pending;
+    for (std::size_t seed = 0; seed < pieceCount; ++seed) {
+        if (!active[seed] || component[seed] != noComponent)
+            continue;
+        const std::size_t componentIndex = componentPieces.size();
+        componentPieces.emplace_back();
+        component[seed] = componentIndex;
+        pending.push(seed);
+        while (!pending.empty()) {
+            const std::size_t piece = pending.front();
+            pending.pop();
+            componentPieces.back().push_back(piece);
+            for (const std::size_t neighbor : adjacency[piece]) {
+                if (component[neighbor] == noComponent) {
+                    component[neighbor] = componentIndex;
+                    pending.push(neighbor);
+                }
+            }
+        }
+    }
+    result.activeComponents = componentPieces.size();
+
+    std::vector<unsigned char> flipped(componentPieces.size(), 0);
+    for (std::size_t componentIndex = 0;
+         componentIndex < componentPieces.size();
+         ++componentIndex) {
+        std::size_t identityErrors = 0;
+        std::size_t flippedErrors = 0;
+        for (const std::size_t piece : componentPieces[componentIndex]) {
+            const auto initial =
+                traceDirections[constraints.pieces[piece].traceIndex];
+            const bool rawVertical = isVertical(labeling.labels[piece]);
+            const bool initialVertical =
+                initial == FiberDirectionGroup::Direction2;
+            identityErrors += rawVertical != initialVertical ? 1 : 0;
+            flippedErrors += rawVertical == initialVertical ? 1 : 0;
+        }
+        if (flippedErrors < identityErrors) {
+            flipped[componentIndex] = 1;
+            ++result.flippedComponents;
+        }
+    }
+
+    std::vector<unsigned char> erroneousTrace(traceDirections.size(), 0);
+    for (std::size_t piece = 0; piece < pieceCount; ++piece) {
+        const auto& descriptor = constraints.pieces[piece];
+        const auto initial = traceDirections[descriptor.traceIndex];
+        const std::size_t rowIndex =
+            initial == FiberDirectionGroup::Direction1 ? 0 : 1;
+        auto& row = result.confusion[rowIndex];
+        ++row.pieces;
+
+        FiberDirectionLabelError error;
+        error.pieceIndex = piece;
+        error.filteredTraceIndex = descriptor.traceIndex;
+        error.tracePieceIndex = descriptor.pieceIndex;
+        error.beginArcBaseVoxels = descriptor.beginArcBaseVoxels;
+        error.endArcBaseVoxels = descriptor.endArcBaseVoxels;
+        error.initialDirection = initial;
+        error.rawLabel = labeling.labels[piece];
+        if (!active[piece]) {
+            ++row.broken;
+            ++row.errors;
+            ++result.brokenErrors;
+            erroneousTrace[descriptor.traceIndex] = 1;
+            error.kind = FiberDirectionLabelErrorKind::Broken;
+            result.errors.push_back(error);
+            continue;
+        }
+
+        error.componentIndex = component[piece];
+        error.componentFlipped = flipped[component[piece]] != 0;
+        const bool alignedVertical =
+            isVertical(labeling.labels[piece]) != error.componentFlipped;
+        error.alignedDirection = alignedVertical
+            ? FiberDirectionGroup::Direction2
+            : FiberDirectionGroup::Direction1;
+        if (alignedVertical)
+            ++row.alignedDirection2;
+        else
+            ++row.alignedDirection1;
+        if (error.alignedDirection != initial) {
+            ++row.errors;
+            ++result.orientationErrors;
+            erroneousTrace[descriptor.traceIndex] = 1;
+            error.kind = FiberDirectionLabelErrorKind::Orientation;
+            result.errors.push_back(error);
+        }
+    }
+    result.errorTraces = static_cast<std::size_t>(std::count(
+        erroneousTrace.begin(), erroneousTrace.end(),
+        static_cast<unsigned char>(1)));
+    return result;
+}
+
 FiberTraceLabelObjPaths fiberTraceLabelObjPaths(
     const std::filesystem::path& outputBase)
 {

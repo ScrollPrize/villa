@@ -1,89 +1,97 @@
-# Plan: Iterative H/V consensus growing
+# Plan: Direction-label MILP diagnostic
 
-1. Add a separate `consensus` command to `vc_fiber_trace_chunk`. Reuse the
-   existing trace-artifact loading, Lasagna compatibility validation, batched
-   constraint extraction, winding cutoff, distance, resampling, and thread
-   controls. Do not invoke or alter the HiGHS labeling modes.
-2. Operate on original stored fibers, not extracted pieces. Map every piece
-   constraint to its source trace, discard same-trace links, and count every
-   retained piece-pair constraint once as evidence even when a source-trace
-   pair has several constraints. Sort each trace adjacency by neighbor and
-   stable piece IDs before accumulation so extraction thread count cannot alter
-   floating summation or ties. Missing graph links are ordinary absence;
-   cross-trace hard links, if presented, count like any other evidence.
-3. For every stored line with at least two distinct points, compute arc length,
-   endpoint chord, straightness `chord/arc`, and the exact point-to-polyline
-   distance from the crop center. Define the nominal crop side as the smallest
-   extent of the stored crop. The primary seed must have arc length strictly
-   greater than half that side; rank eligible fibers by greatest straightness,
-   smallest center distance, greatest arc length, then lowest trace index, and
-   assign the winner H. Reject an input with no eligible primary seed rather
-   than silently weakening this rule. Degenerate lines are immediately broken
-   and are neither seeded nor counted as growth steps. When no unassigned fiber
-   has active assigned evidence, start the next disconnected component with
-   the same ranking but without the primary length cutoff, so every valid
-   disconnected fiber remains labelable.
-4. For each unassigned fiber, collect constraints to already assigned H/V
-   fibers. Its growth priority is `constraint_count / mean_closest_distance`
-   (in base voxels), with infinite priority for zero mean distance. Select the
-   maximum priority, then greater constraint count, smaller mean distance, and
-   lower trace index. All distances must be finite and nonnegative. Zero mean
-   distance has infinite priority, with the remaining ties unchanged.
-   Constraints to broken fibers provide no orientation evidence and do not
-   enter priority. This deliberately measures spatial/count connectivity, not
-   parallel confidence, perpendicular confidence, or winding.
-5. Evaluate the selected fiber as H and V using the existing orientation term:
-   equal labels cost `1-parallel_score`, differing labels cost
-   `parallel_score`, summed once per retained piece-pair constraint to active
-   assigned fibers. Broken costs
-   `broken_cost_per_link * current_active_evidence_count`. Choose minimum total
-   cost with deterministic tie preference H, then V, then broken. This is an
-   irreversible incremental objective: constraints to an already broken fiber
-   stay disabled and are never charged later, and the report totals the costs
-   selected at each step rather than rescoring the final graph. Winding values
-   remain extraction diagnostics only. A valid fiber adjacent only to broken
-   assignments is treated as a new active-evidence component and reseeded H.
-6. Write final `<base>_h.obj`, `<base>_v.obj`, and `<base>_broken.obj` files
-   containing complete original trace polylines. Write snapshots after 10, 20,
-   ..., 100 additions and then 200, 300, ... additions as matching
-   `<base>_step_N_{h,v,broken}.obj` triplets. Always write final outputs,
-   including when the final count is also a snapshot. `N` counts all valid
-   assignments, including the first seed, later component seeds, and broken
-   choices; degenerate lines do not count. Normalize the basename by removing
-   its extension, name OBJ elements `trace_N`, and write a valid empty file for
-   any absent class. Degenerate input lines are not assignments and therefore
-   are not included in the broken snapshots or final broken layer.
-7. Report seed/component events including seed straightness, center distance,
-   and arc length, detailed choice rows for the first 100 assignments, and
-   final H/V/broken counts and objective components at the end of output,
-   and each snapshot path. Add deterministic unit tests for source-trace
-   aggregation, priority, assignment, disconnected reseeding, tie ordering,
-   and exact snapshot milestones. Cover the primary length cutoff, center
-   distance tie-break, multi-piece evidence multiplicity,
-   broken-before-unassigned behavior, degenerate/no-evidence inputs, stable
-   H/V/broken output contents, and identical results after a deterministic permutation of
-   the input constraint vector. CLI validation must reject HiGHS-only flags in
-   consensus mode.
-8. Update specs, documentation, changelog, status, and task log. Build with
-   `-j32`, run `test_fiberlet_crop_trace`, then exercise the centered-384 input
-   with the default exclusive `1.5` winding cutoff.
+## Contract
 
-## Spec update
+- Add a separate `direction-diagnostic` command to
+  `vc_fiber_trace_chunk`. It reads an existing crop-trace artifact and a
+  compatible Lasagna normal manifest; it does not retrace fibers.
+- Run the unchanged gradual two-direction classifier over every stored trace at
+  the selected `--direction-dominance` value. Preserve original trace indices.
+- Remove mixed traces before piece construction, spatial search, constraint
+  scoring, optional strength pruning, and optimization. Write the complete
+  initial direction OBJ family from the unfiltered stored traces with an
+  `_initial` basename so the removed set remains inspectable. Then create the
+  retained-line vector and explicit filtered-to-original trace-index map; hard
+  continuity is built only from that retained vector.
+- Reuse the canonical constraint extractor, batched winding sampler, optional
+  `--constraints-per-fiber`, constraint OBJ writer, HiGHS solver, and label OBJ
+  writer. The diagnostic uses the ordinary discrete H/V-plus-broken MILP with
+  parity disabled because the reference contains only H/V information.
+- Reject LP relaxation, exact-continuous H/V, parity-dependent, and
+  solver-only edge-filter ablations in this diagnostic rather than comparing
+  unlike models. Broken cost, MIP gap, extraction geometry, winding cutoff,
+  pruning, threads, and cache controls remain configurable. The diagnostic
+  forces `hvOnly=true`; redundant explicit `--hv-only` is rejected.
+  `--mip-gap` is an allowed diagnostic solver option and
+  `--no-winding-cutoff` is allowed because parity is disabled.
+- Compare each optimized piece with its retained source trace's initial
+  direction. H/V has an arbitrary binary gauge in every active connected
+  component, so choose the component flip that minimizes active-piece
+  disagreement; ties keep direction 1 mapped to H. Build components from the
+  exact post-pruning constraint vector passed to the solver, including hard
+  continuity, after removing edges incident to final decoded Broken pieces.
+  This matches the solver's discrete canonicalization graph, including its
+  conversion of zero-degree pieces to Broken.
+- Count an active piece whose gauge-aligned H/V differs from its initial
+  direction as an orientation error. Count every optimized broken piece as a
+  broken error. Report both piece and unique-source-trace error totals.
+- Print a compact gauge-aligned confusion table by initial direction, separate
+  raw solver-canonical H/V/broken totals, active-component and flipped-component
+  counts, aggregate error rates, and one stable row for every erroneous piece
+  with original trace ID, trace-local piece ID, arc interval, initial direction,
+  raw optimized label, component flip, aligned label, and error kind. Piece
+  rate divides by retained extracted pieces; trace rate divides by retained
+  source traces represented by at least one piece, with each erroneous source
+  trace counted once across both error kinds.
+- If every trace is mixed, still write the complete initial family plus valid
+  empty constraint and label families and report an empty optimal diagnostic;
+  do not silently skip outputs or treat mixed traces as solver pieces.
+- For output base `<base>`, write the existing full-trace direction family as
+  `<base>_initial.obj`, `<base>_initial_dir1.obj`,
+  `<base>_initial_dir2.obj`, `<base>_initial_mixed.obj`, and matching anchors.
+  Existing constraint connector suffixes and piece-label suffixes continue to
+  use `<base>` and cannot collide. Initial artifacts contain full traces; MILP
+  artifacts contain extracted pieces. The default base is sibling
+  `<trace-stem>_direction_diagnostic`.
 
-Document the separate deterministic consensus command, trace-level aggregation,
-priority and assignment formulas, disconnected-component behavior, and all
-three output-class filenames/milestones.
+## Implementation
 
-## Documentation update
+1. Add reusable core comparison types and a deterministic comparison function
+   beside the existing HiGHS labeling API.
+2. Extend CLI parsing and mode validation for `direction-diagnostic`, sharing
+   existing extraction and solve paths rather than copying their behavior.
+3. Filter mixed traces with an explicit filtered-to-original index map, emit
+   the initial direction artifacts, run extraction/pruning/H/V MILP, then print
+   the comparison.
+4. Add focused tests for mixed removal mapping, component gauge flips including
+   a broken middle piece, gauge ties, zero-degree Broken behavior, broken and
+   opposite-label errors, disconnected components, multi-piece source traces,
+   stable error ordering, unique-trace union/denominators, invalid/non-discrete
+   inputs, exact output names, all-mixed outputs, and CLI option acceptance and
+   rejection.
+5. Build with `-j32`, run `test_fiberlet_crop_trace`, and exercise the
+   centered-384 stored trace artifact at dominance 0.90.
 
-Add a runnable command and describe inputs, default cutoff, reported statistics,
-final H/V/broken layers, and matching snapshots.
+## Spec Update
+
+Document the diagnostic pipeline, mixed-trace exclusion point, H/V-only model,
+component-gauge comparison, error definitions, stable report fields, and
+supported/rejected options in `planning/specs.md`.
+
+## Docs Updates
+
+Add a runnable centered-crop example and explain the initial direction layers,
+MILP layers, and comparison table in
+`volume-cartographer/docs/fiber_chunk_tracing.md`.
 
 ## Testing
 
-Use small synthetic trace/constraint graphs with known selection and labels;
-verify deterministic snapshots and unchanged existing solver tests.
+- Build `vc_fiber_trace_chunk` and `test_fiberlet_crop_trace` with `-j32`.
+- Run the full focused crop-trace test binary.
+- Run the centered-384 diagnostic with the existing normal manifest and report
+  retained/mixed fibers, constraints, solve result, and labeling errors.
+- Run `git diff --check`.
 
 ## Changelog
 
-Record the iterative trace-level H/V consensus diagnostic.
+Record the new direction-reference MILP diagnostic command.

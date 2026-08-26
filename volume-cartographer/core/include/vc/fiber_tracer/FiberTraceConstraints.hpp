@@ -70,6 +70,40 @@ struct FiberTraceConstraintReport {
     double scoreSeconds = 0.0;
 };
 
+struct FiberTraceConstraintGraphStats {
+    std::size_t traces = 0;
+    std::size_t crossTraceConstraints = 0;
+    std::size_t isolatedTraces = 0;
+    std::size_t connectedComponents = 0;
+    std::size_t minimumDegree = 0;
+    double meanDegree = 0.0;
+    double medianDegree = 0.0;
+    std::size_t maximumDegree = 0;
+};
+
+struct FiberTraceConstraintPruningReport {
+    std::size_t maximumConstraintsPerTrace = 0;
+    std::size_t inputTotalConstraints = 0;
+    std::size_t retainedTotalConstraints = 0;
+    std::size_t hardConstraints = 0;
+    std::size_t rejectedZeroStrength = 0;
+    std::size_t rejectedNotMutual = 0;
+    std::size_t recoveryCandidates = 0;
+    std::size_t expectedRecoveryBridges = 0;
+    std::size_t recoveryBridges = 0;
+    std::size_t capRespectingRecoveryBridges = 0;
+    std::size_t fallbackOverflowBridges = 0;
+    std::size_t tracesAboveTargetDegree = 0;
+    FiberTraceConstraintGraphStats before;
+    FiberTraceConstraintGraphStats mutual;
+    FiberTraceConstraintGraphStats after;
+};
+
+struct FiberTraceConstraintPruningResult {
+    std::vector<FiberTraceConstraint> constraints;
+    FiberTraceConstraintPruningReport report;
+};
+
 using FiberTraceWindingDistance = std::function<double(
     const cv::Vec3d& aBaseXYZ,
     const cv::Vec3d& bBaseXYZ,
@@ -100,6 +134,12 @@ struct FiberTraceConstraintObjReport {
     const FiberTraceConstraintConfig& config,
     const FiberTraceWindingDistance& windingDistance,
     const FiberTraceWindingDistanceBatch& windingDistanceBatch = {});
+
+[[nodiscard]] FiberTraceConstraintPruningResult
+pruneFiberTraceConstraintsByStrength(
+    const FiberTraceConstraintReport& constraints,
+    double maximumDistanceBaseVoxels,
+    std::size_t maximumConstraintsPerTrace);
 
 [[nodiscard]] FiberTraceConstraintObjPaths fiberTraceConstraintObjPaths(
     const std::filesystem::path& outputBase);

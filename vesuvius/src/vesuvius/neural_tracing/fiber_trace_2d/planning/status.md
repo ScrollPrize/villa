@@ -1,16 +1,12 @@
-# Status: Iterative H/V consensus growing
+# Status: Direction-label MILP diagnostic
 
 - [x] Capture the requested task.
-- [x] Write the implementation plan.
-- [x] Complete independent plan review.
-- [x] Implement trace-level consensus growth and snapshots.
-- [x] Add the separate CLI mode and reports.
-- [x] Add regression tests.
-- [x] Update specification, docs, changelog, and task log.
+- [x] Write the implementation and validation plan.
+- [x] Complete independent plan review and incorporate its CLI, mapping,
+      gauge, denominator, naming, and empty-input corrections.
+- [x] Add deterministic core direction/MILP comparison.
+- [x] Add and integrate the diagnostic CLI mode.
+- [x] Add focused regression tests.
+- [x] Update specification, docs, and changelog.
 - [x] Build with `-j32` and run focused tests.
-- [x] Exercise the centered-384 input.
-- [x] Select the primary seed by crop-relative minimum length, straightness,
-      and distance to the crop center.
-- [x] Add seed-selection regression tests and rerun the centered-384 input.
-- [x] Print the first 100 choices and finish with the full consensus summary.
-- [x] Write final and milestone broken-fiber OBJ layers alongside H and V.
+- [x] Run and report the centered-384 diagnostic.

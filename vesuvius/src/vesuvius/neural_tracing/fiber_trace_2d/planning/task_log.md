@@ -1,62 +1,32 @@
-# Task Log: Iterative H/V consensus growing
+# Task Log: Direction-label MILP diagnostic
 
-- The exact-perpendicular HiGHS experiment was stopped after 490.78 seconds at
-  effectively one core and 509,964 KiB peak RSS without reaching a solution.
-  Its implementation remains in the worktree as a separate opt-in diagnostic.
-- The requested consensus path is separate from HiGHS and reuses the canonical
-  constraint extractor.
-- The phrase "maximum constraint score" together with distance/count evidence
-  is implemented as maximum `constraint_count / mean_distance`, so more and
-  closer links have stronger priority. This interpretation is explicit in the
-  plan and documentation.
-- Independent review clarified that the seed must measure straightness rather
-  than chord alone, source-pair multiplicity and summation order must be exact,
-  and greedy broken cost is order-sensitive. The plan now specifies
-  straightness-first seeding, stable per-piece evidence, irreversible
-  current-active broken costs, degenerate handling, and exact milestone rules.
-- Added the consensus core API, separate CLI mode, full-trace H/V OBJ writer,
-  and scheduled snapshot writer. HiGHS-only flags are rejected by consensus.
-- Validation: `cmake --build volume-cartographer/build --target
-  vc_fiber_trace_chunk test_fiberlet_crop_trace -j32` succeeded and
-  `volume-cartographer/build/bin/test_fiberlet_crop_trace` passed 32 cases.
-  A CLI smoke check confirmed that consensus rejects `--hv-only` as a
-  HiGHS-only option before opening input data.
-- Centered-384 diagnostic used `/tmp/crop_traces_central_384.zarr`, the
-  `las008_s1_full/las_008.lasagna.json` normal manifest, unsplit fibers,
-  maximum distance 256, default exclusive winding cutoff 1.5, broken cost
-  0.25, and host-default 32 threads. Extraction retained 3,776 of 11,840
-  measured candidates for 179 traces. Consensus produced H=52, V=25,
-  broken=102, orientation cost 90.292411, broken cost 200, and objective
-  290.29241. Total command time was 0.12 s wall / 0.68 s CPU with 87,072 KiB
-  peak RSS. Final and milestone OBJ files were written below
-  `$VES/data/workdir3/384/`.
-- Added a console table for the first ten consensus choices with trace,
-  component, seed status, label, evidence, distance/priority, H/V/broken costs,
-  and selected incremental cost.
-- Formatted that table into fixed-width columns and limited floating values to
-  three decimal places for terminal readability.
-- Follow-up seed refinement: the primary seed will be restricted to traces
-  longer than half the smallest stored crop extent, then ranked by
-  straightness, exact distance from the crop center to the polyline, arc
-  length, and trace index. Later disconnected-component seeds deliberately
-  relax only the length cutoff so labeling remains complete.
-- Independent review confirmed that crop center and nominal side must come
-  from the artifact bounds, the half-side threshold must remain strict, and
-  distance must be the minimum over full 3D polyline segments rather than
-  vertices. The implementation and regression tests use those definitions.
-- The centered-384 rerun selected trace 7 as the primary seed with arc length
-  237.196 base voxels (strict cutoff 192), straightness 0.997479, and exact
-  crop-center distance 175.157 base voxels. It produced H=67, V=70, and
-  broken=42 in 0.13 s wall / 0.57 s CPU with 86,524 KiB peak RSS. The previous
-  short perfectly straight seed is no longer eligible.
-- Expanded the detailed console choice table from 10 to 100 assignments and
-  moved the complete consensus count/cost summary to the final output block.
-- Replaced the overly wide final summary with an aligned two-column metric and
-  value table; floating costs use three decimal places.
-- Added broken-fiber OBJ output beside H and V for both final labels and every
-  existing milestone. Valid empty files are always emitted; degenerate
-  non-assignment inputs remain excluded from all three class layers.
-- Validation: the focused suite still passes 32 cases. The centered-384 output
-  was regenerated in 0.14 s wall time and now contains 42 complete broken
-  fibers in `384_broken.obj`, with matching broken milestone files through
-  `384_step_100_broken.obj`.
+- The direction reference is per stored trace, while the existing solver labels
+  extracted pieces. Every retained piece will inherit its source trace's
+  direction reference; reports will include piece and unique-trace errors.
+- Disconnected MILP components have independent H/V gauge symmetry. Directly
+  comparing canonical H/V to global direction 1/2 would count arbitrary flips,
+  so comparison will minimize disagreement independently per active component.
+- Mixed traces must be removed before extraction rather than merely ignored in
+  the comparison, so they cannot influence neighbors, scores, degree penalties,
+  broken decisions, or the optimized graph.
+- Independent review fixed the CLI matrix and report denominators. The new mode
+  will force ordinary discrete H/V-only labeling, reject explicit `--hv-only`
+  and incompatible solver ablations, but allow MIP-gap and no-winding-cutoff.
+  It will translate every filtered-local piece index back to the original trace
+  in user-facing errors and emit valid empty outputs for an all-mixed input.
+- Implemented the reusable comparison beside the HiGHS labeling API. It builds
+  components from the exact retained active-piece graph, resolves each binary
+  gauge deterministically, and reports orientation and Broken errors in stable
+  piece order.
+- Added `direction-diagnostic`, which writes the unfiltered `_initial` direction
+  artifact family, removes mixed traces before extraction, reuses canonical
+  constraint/pruning/OBJ/MILP paths, and prints the filtered-to-original trace
+  mapping for every error.
+- Built `vc_fiber_trace_chunk` and `test_fiberlet_crop_trace` with `-j32`; all 41
+  focused test cases passed.
+- Centered-384 validation at dominance 0.90 classified 179 source fibers as 50
+  direction 1, 45 direction 2, and 84 mixed. The retained 95 fibers produced 95
+  pieces and 755 constraints. The discrete H/V-only MILP was optimal with no
+  Broken pieces. Its one active component required a gauge flip and then
+  matched all initial labels: zero orientation errors and zero erroneous source
+  fibers.
