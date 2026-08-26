@@ -1,4 +1,5 @@
 #include "vc/fiber_tracer/FiberletCropTraceArtifact.hpp"
+#include "vc/lasagna/LasagnaNormalSampler.hpp"
 
 #include <algorithm>
 #include <array>
@@ -191,6 +192,35 @@ void validateEqual(const std::vector<FiberletCropTraceLine>& expected, const std
 }
 
 }  // namespace
+
+void validateFiberletCropTraceNormalDatasetCompatibility(
+    const FiberletCropTraceArtifact& artifact,
+    const vc::lasagna::LasagnaDataset& normals)
+{
+    if (!(artifact.metadata.predictionToBaseScale > 0.0) ||
+        !std::isfinite(artifact.metadata.predictionToBaseScale)) {
+        throw std::invalid_argument(
+            "Fiber trace prediction-to-base scale must be positive and finite");
+    }
+    const auto& manifest = normals.manifest();
+    if (std::abs(manifest.workingToBaseScale - 1.0) > 1.0e-12) {
+        throw std::invalid_argument(
+            "Fiber trace constraints require normals opened in base coordinates");
+    }
+    vc::lasagna::validateLasagnaNormalDatasetStructure(normals);
+    if (!manifest.baseShapeZYX.has_value())
+        throw std::invalid_argument("normal manifest must declare base_shape_zyx");
+    for (std::size_t xyz = 0; xyz < 3; ++xyz) {
+        const std::size_t zyx = 2 - xyz;
+        const double begin = artifact.minimumBaseXYZ[static_cast<int>(xyz)];
+        const double end = artifact.maximumBaseXYZ[static_cast<int>(xyz)];
+        if (!(begin >= 0.0) ||
+            !(end <= static_cast<double>((*manifest.baseShapeZYX)[zyx]))) {
+            throw std::invalid_argument(
+                "Fiber trace crop is outside the normal manifest base_shape_zyx");
+        }
+    }
+}
 
 void writeFiberletCropTraceArtifact(
     const std::filesystem::path& output,

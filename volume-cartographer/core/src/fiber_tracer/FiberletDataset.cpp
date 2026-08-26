@@ -3,6 +3,7 @@
 #include "vc/core/util/AtomicFile.hpp"
 #include "vc/lasagna/ChannelSampler.hpp"
 #include "vc/lasagna/Dataset.hpp"
+#include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "utils/thread_pool.hpp"
 
 #include <nlohmann/json.hpp>
@@ -65,41 +66,6 @@ std::array<std::size_t, 3> fiberletPredictionShape(
     } catch (const nlohmann::json::exception&) {
         throw std::invalid_argument(
             "fiberlet dataset is missing valid structured grid metadata");
-    }
-}
-
-double requiredPositiveManifestNumber(
-    const vc::lasagna::LasagnaDatasetManifest& manifest,
-    const char* name)
-{
-    const auto found = manifest.raw.find(name);
-    if (found == manifest.raw.end() || !found->is_number())
-        throw std::invalid_argument(
-            std::string("normal manifest is missing numeric field '") + name + "'");
-    const double value = found->get<double>();
-    if (!(value > 0.0) || !std::isfinite(value))
-        throw std::invalid_argument(
-            std::string("normal manifest field '") + name + "' must be positive and finite");
-    return value;
-}
-
-void validateNormalBinding(
-    const vc::lasagna::LasagnaDatasetManifest& manifest,
-    const vc::lasagna::LasagnaChannelBinding& binding,
-    std::string_view channel)
-{
-    if (binding.group == nullptr || binding.group->channels.size() != 1)
-        throw std::invalid_argument(
-            "normal channel '" + std::string(channel) +
-            "' must use its own 3D Lasagna group");
-    const double baseSpacing = static_cast<double>(binding.group->scaleFactor()) *
-                               manifest.sourceToBase;
-    if (!vc::lasagna::lasagnaChannelShapeCompatible(
-            *manifest.baseShapeZYX, baseSpacing,
-            binding.shapeZYX, binding.chunksZYX)) {
-        throw std::invalid_argument(
-            "normal channel '" + std::string(channel) +
-            "' shape is incompatible with base_shape_zyx and scale");
     }
 }
 
@@ -1594,21 +1560,7 @@ void validateFiberletNormalDatasetCompatibility(
         }
     }
 
-    requiredPositiveManifestNumber(manifest, "grad_mag_encode_scale");
-    requiredPositiveManifestNumber(manifest, "grad_mag_factor");
-    const auto nx = vc::lasagna::bindLasagnaChannel(manifest, "nx");
-    const auto ny = vc::lasagna::bindLasagnaChannel(manifest, "ny");
-    const auto gradMag = vc::lasagna::bindLasagnaChannel(manifest, "grad_mag");
-    validateNormalBinding(manifest, nx, "nx");
-    validateNormalBinding(manifest, ny, "ny");
-    validateNormalBinding(manifest, gradMag, "grad_mag");
-    const double nxBaseSpacing = nx.spacing * manifest.workingToBaseScale;
-    const double nyBaseSpacing = ny.spacing * manifest.workingToBaseScale;
-    if (nx.shapeZYX != ny.shapeZYX ||
-        !nearlyEqual(nxBaseSpacing, nyBaseSpacing)) {
-        throw std::invalid_argument(
-            "normal nx and ny channels must have matching shape and base scale");
-    }
+    vc::lasagna::validateLasagnaNormalDatasetStructure(normals);
 }
 
 FiberletChunkDataset::FiberletChunkDataset(

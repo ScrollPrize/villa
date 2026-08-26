@@ -20,6 +20,10 @@ struct FiberletCropTraceArtifact {
     std::vector<FiberletCropTraceLine> lines;
 };
 
+void validateFiberletCropTraceNormalDatasetCompatibility(
+    const FiberletCropTraceArtifact& artifact,
+    const vc::lasagna::LasagnaDataset& normals);
+
 void writeFiberletCropTraceArtifact(
     const std::filesystem::path& output,
     const FiberletDatasetMetadata& sourceMetadata,

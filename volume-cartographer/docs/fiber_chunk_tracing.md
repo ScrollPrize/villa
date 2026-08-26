@@ -73,6 +73,53 @@ the graph defines that transition. Speculative lookahead cost is not stored.
 The comparable visualization quality is
 `total_metric_cost / path_length_prediction_voxels`; lower is better.
 
+## H/V constraint diagnostics
+
+The `constraints` mode derives candidate H/V and winding links directly from a
+stored crop-trace dataset. It does not need the source Fiberlet graph and does
+not write a constraint artifact yet:
+
+```bash
+volume-cartographer/build/bin/vc_fiber_trace_chunk \
+  constraints \
+  crop_traces.zarr \
+  --normal-manifest /path/to/normals.lasagna.json
+```
+
+All distances are in base voxels. By default, traces are resampled every 32
+voxels and divided into evenly sized overlapping pieces with a maximum target
+length of 512 and overlap 128. Distinct traces are searched within 128 voxels.
+The point R-tree is only a broad phase: reported neighbors pass an exact
+Euclidean-distance test, and only the closest sampled pair for each unordered
+piece pair is scored. Pieces from the same trace are excluded from that search;
+each consecutive pair instead receives a hard parallel-continuity link with
+parallel score 1 and winding distance 0.
+
+For a measured pair, centered 32-voxel secants determine the initial tangent
+orientation. Both pieces are walked in both directions at the sample spacing.
+At each step a bounded counter-shift of one twentieth of the spacing may be
+retained when it decreases point distance, allowing a combined relative phase
+adjustment of one tenth of the spacing. The mean consistently oriented tangent
+dot is clamped to `[0,1]` as raw parallel evidence. Raw perpendicular evidence
+is `1 - abs(initial tangent dot)`; the two values are divided by their sum, so
+the reported normalized scores add to one.
+
+Winding distance uses the ordinary Lasagna straight-connector integral, but
+each endpoint density sample is multiplied by the absolute alignment between
+the connector and the decoded local Lasagna normal before trapezoidal
+integration. This suppresses winding evidence where the connector lies in the
+local tangent plane. Missing required density or normal samples reject that
+candidate.
+
+Use `--sample-step`, `--piece-length`, `--piece-overlap`, `--max-distance`,
+`--tangent-window`, and `--winding-step` to change the defaults. `--threads`
+defaults to the host CPU count. The console report contains input and rejection
+counts, phase timings, and `q0` through `q100` deciles for measured closest
+distance, normalized parallel/perpendicular evidence, and aligned winding.
+Parsed normal-manifest equality with trace provenance is reported only as a
+diagnostic. Compatibility requires valid normal channels in base coordinates
+whose declared base shape covers the stored trace crop.
+
 Publication is all-or-nothing: the command writes and fully reopens a unique
 sibling temporary dataset, validates its inventory, ownership, ordinals, and
 record count, then renames it to the requested path. The output path must not

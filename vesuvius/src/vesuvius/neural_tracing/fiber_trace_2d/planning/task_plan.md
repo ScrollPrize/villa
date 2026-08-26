@@ -1,127 +1,110 @@
-# Plan: durable Fiberlet crop trace artifacts
+# Plan: H/V constraints from stored crop traces
 
-## Contract
+## Contract and data model
 
-- The authoritative crop output is a `traces` dataset kind in the existing
-  Fiberlet Zarr v2 envelope. It uses the same strict metadata fingerprint,
-  opaque sparse chunks, checksummed field blocks, and field-wise Zstd codec as
-  preprocessing/cache datasets.
-- A whole accepted crop trace is not a short preprocessing Fiberlet. Store its
-  arbitrary float64 base-XYZ polyline directly in a trace payload; re-encoding
-  it through the curved transverse-lattice codec would change geometry.
-- Store the original deterministic result ordinal, seed base position and
-  presence, total accumulated edge/join metric cost, prediction-space traced
-  length, and all polyline points. Do not store transient scheduler counters or
-  termination debug strings.
-- Use a trace-only `float64_traces` storage profile with canonical otherwise
-  unused codec fields. Trace metadata owns a crop-local ZYX chunk grid aligned
-  to the source spatial chunk side in integer base coordinates. A trace is
-  owned only by `floor((seed_base_zyx-origin_zyx)/chunk_side)`; a seed exactly
-  on a boundary belongs to the upper chunk.
-- Accumulate cost from the exact selected edges and joins. Crop-clipped edge
-  cost and prediction length use the same retained fraction already used by
-  lookahead. A bidirectional line includes its central join cost once when the
-  graph defines one; the existing independent-side fallback has no central
-  transition cost.
-- Visualization must reopen and strictly decode the published dataset. It may
-  not consume the in-memory trace result directly.
-- Quality is `total_metric_cost / path_length_prediction_voxels`; lower is
-  better. Stable ordering is quality then stored ordinal. Ten rank-decile OBJ
-  files partition all lines exactly once, and a CSV plus console table records
-  count and min/mean/max density for each bin.
-- Only committed route cost is stored: complete selected edges contribute
-  their full cost, only a crop-exit edge is prorated by the existing retained
-  fraction, and internal joins contribute once. A bidirectional trace's
-  reversed-negative-to-positive central join contributes once when defined.
-  Speculative
-  lookahead/horizon costs never enter the artifact.
-- Publication is all-or-nothing. Write and fully validate a unique sibling
-  temporary Zarr root, then rename it atomically to an output path that must not
-  already exist. A visible output is therefore never a partial trace artifact.
+1. Add a `FiberTraceConstraintConfig` expressed entirely in base voxels. Initial
+   defaults are: resample spacing `32`, target piece length `512`, overlap `128`,
+   closest-pair threshold `128`, tangent secant window `32`, phase-refinement
+   per-fiber increment/limit `spacing/20` (a combined relative shift of
+   `spacing/10`), and Lasagna
+   winding integration step `8`.
+2. Represent every piece by original trace ordinal, piece ordinal, original-line
+   arc interval, uniformly sampled points/arcs, and exact endpoint samples.
+   Choose the minimum number of pieces whose equal arc span is at most the target
+   length after accounting for fixed overlap; short traces remain one piece.
+   Existing zero-length consecutive edges are ignored by arc sampling. A trace
+   with no nonzero edge is skipped and counted rather than aborting extraction.
+3. Represent every constraint by stable piece identities, closest points/arcs,
+   closest Euclidean distance, normalized parallel/perpendicular scores, the
+   normal-modulated winding distance, and whether it is a hard same-trace link.
+4. Keep this report-only format in memory. Constraint persistence and discrete
+   optimization are explicitly outside this task.
 
-## Storage implementation
+## Spatial candidates and scoring
 
-1. Extend the shared Fiberlet payload codec with float64 fields and a strict
-   trace-record payload containing structure-of-arrays metadata plus flattened
-   XYZ point arrays. Validate finite/nonnegative costs and lengths, finite
-   points, at least two points, valid offsets, unique ordinals, and a seed that
-   belongs to the stored path. Add the trace-only storage profile and reject it
-   for anchor/prefix/route payloads (and reject other profiles for traces).
-2. Add `Traces` as a Fiberlet dataset kind and `FiberTraces` as a payload kind.
-   Extend the common dataset metadata, Zarr array descriptor, chunk path,
-   publish/read/decode path, and decoded-payload accounting without changing
-   anchor/prefix/route behavior. Canonical trace metadata sets endpoint reach
-   to zero and fixes unused bit-width fields rather than inheriting misleading
-   preprocessing settings.
-3. Add shared crop-artifact helpers that derive trace metadata from the source
-   Fiberlet metadata, crop box, normal-manifest content, and effective tracing
-   parameters. Include a trace contract version, every output-affecting trace
-   parameter, source dataset fingerprint, and normalized Lasagna manifest
-   content; exclude paths and thread count. Spatially own each line by its seed
-   in crop-local chunks and write only nonempty chunks.
-4. Store the exact populated chunk inventory and record count in trace metadata.
-   Reopening enumerates the trace directory and rejects missing/unexpected or
-   malformed chunk names, duplicate/missing global ordinals, records in the
-   wrong owner chunk, and a count mismatch before restoring ordinal order.
+5. Build one Boost.Geometry point R-tree over resampled piece points. Query every
+   point with the configured distance cube, reject same-original-trace pairs,
+   apply an exact Euclidean `distance <= max_distance` test to every hit, and
+   retain only the minimum-distance point pair for each unordered piece pair.
+   Resolve equal distances by stable point ordinals so results are deterministic.
+6. Do not insert same-trace pair candidates. Emit one hard continuity constraint
+   between each consecutive pair of pieces using the midpoint of their overlap,
+   parallel score `1`, perpendicular score `0`, winding distance `0`, and
+   Euclidean distance `0`.
+7. At a measured closest pair, use centered secant tangents and the sign of their
+   dot product to orient both piece walks consistently. Walk in both arc
+   directions at the resample spacing. At every step, compare the current phase
+   with plus/minus `spacing/20` counter-shifts, retain only a strictly closer
+   phase, and cap each fiber's persistent phase at `spacing/20`.
+8. Average signed, consistently oriented tangent dots across all usable walk
+   samples, then clamp the mean into `[0,1]` for raw parallel evidence. Use
+   `1 - abs(initial tangent dot)` for raw
+   perpendicular evidence. Normalize the two raw values by their sum; reject a
+   pair only when tangents/evidence are unusable.
+9. Extract the existing Lasagna normal-manifest structural validation into a
+   shared Lasagna helper used by both Fiberlet preprocessing compatibility and
+   this stage. The trace-specific validator additionally requires base-coordinate
+   working scale `1`, positive preserved prediction scale, and a declared base
+   shape covering the complete stored crop. It does not require manifest path,
+   byte, or parsed-JSON identity; it reports whether parsed content matches the
+   trace provenance for diagnostics only.
+10. Refactor Lasagna winding integration through one shared internal integrator.
+   Preserve the existing `windingDistance` behavior exactly and expose a second
+   `normalAlignedWindingDistance` operation that multiplies winding density at
+   each trapezoid endpoint by the absolute connector/normal alignment. Missing
+   density or required normal samples yield a non-finite result.
+11. Score independent measured candidates in deterministic index slots using
+    the configured thread count; zero means host CPU count. Sort final measured
+    and hard constraints by stable piece identities.
 
-## Tracing and CLI
+## CLI and reporting
 
-5. Extend crop side tracing to accumulate authoritative selected edge and join
-   costs and retained prediction length. Combine both sides plus any defined
-   central join into each accepted line without changing selection, geometry, coverage,
-   or scheduling.
-6. Refactor `vc_fiber_trace_chunk` into explicit modes. The exact forms are
-   `vc_fiber_trace_chunk trace INPUT_FIBERLETS ... --output TRACES.zarr
-   [--obj LINES.obj]` and `vc_fiber_trace_chunk visualize TRACES.zarr --output
-   LINES.obj`. Trace mode always reloads and visualizes; absent `--obj`, it uses
-   the trace root with `.zarr` removed and `.obj` appended. The old mode-less
-   invocation is intentionally removed. `visualize` accepts only an existing
-   trace Zarr and regenerates OBJ/CSV
-   artifacts without source Fiberlets, normals, or CT input. CT crop-face output
-   remains a trace-time optional artifact because it depends on an external CT
-   volume, but line visualization never bypasses stored traces.
-7. Keep the existing all/direction/anchor OBJ naming and add ten quality files
-   named `_quality_00_10` through `_quality_90_100` plus
-   `_quality_histogram.csv`. For sorted rank `r` among `N`, bin is
-   `min(9, floor(10*r/N))`; this also defines occupied bins for `N<10`. Empty
-   bins produce valid empty OBJ files and blank numeric CSV cells. CSV and the
-   console table report count and min/mean/max for both total cost and cost
-   density.
+12. Extend `vc_fiber_trace_chunk` with:
+    `constraints TRACE.zarr --normal-manifest PATH [options]`. The mode reopens
+    the trace artifact, opens normals in base-coordinate working space, and
+    structurally validates their frame and crop coverage.
+13. Expose `--sample-step`, `--piece-length`, `--piece-overlap`,
+    `--max-distance`, `--tangent-window`, and `--winding-step`; retain the
+    existing host-CPU and cache defaults. Reject trace/visualization-only flags.
+14. Print configuration, input trace/piece/sample counts, candidate/accepted/
+    rejected/hard counts, phase timings, and total CPU/wall time. Print a compact
+    `q0..q100` decile table for closest distance, normalized parallel score,
+    perpendicular score, and aligned winding distance.
 
 ## Tests
 
-- Round-trip trace payloads with multiple records/point counts and reject
-  corrupt offsets, nonfinite values, invalid costs/lengths, and wrong payload
-  kinds.
-- Create/reopen a sparse trace dataset and verify absent chunks are empty,
-  present chunks are strict, records restore ordinal order, and stored float64
-  point/cost bits round-trip exactly.
-- Reject interrupted/partial roots, unexpected chunk files, duplicate/gapped
-  cross-chunk ordinals, wrong seed ownership, and count/inventory mismatches.
-  Cover zero traces, boundary seeds, and paths crossing owner chunks.
-- Add crop tests proving one-sided and bidirectional global cost accumulation,
-  including internal joins, the central join, and a crop-clipped edge.
-- Add visualization tests for deterministic classification, histogram/decile
-  partitioning, stable ties, fewer than ten lines, and OBJ generation from a
-  reopened dataset.
-- Add CLI parse/smoke coverage for trace publication, overwrite rejection,
-  visualization-only regeneration, and an empty trace dataset.
-- Build GCC Release and Clang, run focused crop/storage suites, run the canonical
-  crop command, then compare the old and reloaded all/direction/anchor OBJ bytes
-  where names are unchanged. Run `git diff --check`.
+15. Unit-test even overlapping splitting for short, exact, and remainder
+    lengths; verify endpoint inclusion, duplicate-point handling, wholly
+    degenerate trace skipping, and adjacent hard constraints.
+16. Unit-test nearest-point candidate deduplication, exact spherical rejection
+    of R-tree cube-corner hits, same-trace exclusion,
+    deterministic ties, parallel lines, perpendicular lines, reversed line
+    orientation, bounded phase refinement, and multi-thread parity.
+17. Extend Lasagna sampler tests with constant synthetic density/normals to prove
+    the aligned integral equals the ordinary integral for aligned connectors and
+    approaches zero for perpendicular connectors while the ordinary method is
+    unchanged.
+18. Test trace-specific normal compatibility for wrong working scale, a crop
+    outside `base_shape_zyx`, malformed channel layouts, and a structurally
+    compatible manifest whose parsed provenance differs.
+19. Build GCC Release and Clang targets, run the focused crop and Lasagna sampler
+    suites, run `git diff --check`, then time the command on a representative
+    stored crop artifact and record its exact command/data/result.
 
 ## Spec update
 
-Replace OBJ-authoritative crop output with the durable trace-dataset contract,
-exact stored fields/cost definition, reopen-before-visualize requirement, and
-quality-density decile artifacts.
+Add the stored-trace constraint extraction contract: base-coordinate defaults,
+piece splitting, nearest-point broad phase, hard same-trace continuity links,
+parallel/perpendicular scoring, aligned Lasagna winding definition,
+deterministic parallel evaluation, and report-only first-stage scope.
 
 ## Documentation updates
 
-Document the `trace` and `visualize` commands, trace Zarr layout and provenance,
-quality definition, histogram CSV, decile filenames, and the distinction
-between complete crop traces and short preprocessing Fiberlets.
+Extend `volume-cartographer/docs/fiber_chunk_tracing.md` with the constraint
+command, parameter units/defaults, piece/link semantics, score definitions,
+normal-manifest identity requirement, and console report schema.
 
 ## Changelog
 
-Add durable crop trace Zarr output and stored-data-driven quality visualization.
+Add one entry for extracting H/V and winding constraints from durable crop-trace
+artifacts after implementation and validation.

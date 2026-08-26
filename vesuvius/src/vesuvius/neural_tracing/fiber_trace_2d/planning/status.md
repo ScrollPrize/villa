@@ -1,14 +1,13 @@
-# Status: durable Fiberlet crop trace artifacts
+# Status: H/V constraints from stored crop traces
 
-- [x] Record the active task.
-- [x] Inspect the existing Fiberlet codec/dataset and crop OBJ path.
-- [x] Write the implementation and validation plan.
-- [x] Complete independent plan review and incorporate findings.
-- [x] Extend shared storage and dataset handling for trace records.
-- [x] Accumulate and persist complete trace costs.
-- [x] Refactor trace and visualization CLI paths.
-- [x] Add cost histogram and rank-decile OBJ output.
-- [x] Add storage, tracing, and visualization regression tests.
-- [x] Build and run GCC Release and Clang validation.
-- [x] Run a representative crop round trip and compare artifacts.
-- [x] Update specifications, documentation, changelog, and task log.
+- [x] Capture the current task in `task.md`.
+- [x] Inspect crop-trace storage and existing Atlas/Lasagna winding code.
+- [x] Write the implementation, validation, docs, spec, and changelog plan.
+- [x] Complete an independent plan review and incorporate findings.
+- [x] Implement shared normal-aligned Lasagna winding integration.
+- [x] Implement trace splitting, spatial candidate search, and scoring.
+- [x] Add the constraint CLI and statistical report.
+- [x] Add focused regression tests.
+- [x] Update specs, docs, changelog, status, and task log.
+- [x] Build and test GCC Release and Clang.
+- [x] Run and time a representative stored crop artifact.

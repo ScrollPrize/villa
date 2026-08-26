@@ -53,8 +53,6 @@ struct PreparedNormalPoint {
     LasagnaCubeRequest ny;
 };
 
-} // namespace
-
 double requiredPositiveManifestDouble(
     const LasagnaDatasetManifest& manifest,
     const char* key)
@@ -70,6 +68,53 @@ double requiredPositiveManifestDouble(
             std::string("Lasagna manifest field '") + key + "' must be positive and finite");
     }
     return value;
+}
+
+} // namespace
+
+void validateLasagnaNormalDatasetStructure(const LasagnaDataset& dataset)
+{
+    const auto& manifest = dataset.manifest();
+    if (!manifest.baseShapeZYX.has_value())
+        throw std::invalid_argument("normal manifest must declare base_shape_zyx");
+    requiredPositiveManifestDouble(manifest, "grad_mag_encode_scale");
+    requiredPositiveManifestDouble(manifest, "grad_mag_factor");
+
+    const auto nx = bindLasagnaChannel(manifest, "nx");
+    const auto ny = bindLasagnaChannel(manifest, "ny");
+    const auto gradMag = bindLasagnaChannel(manifest, "grad_mag");
+    const auto validate = [&](const LasagnaChannelBinding& binding,
+                              std::string_view channel) {
+        if (binding.group == nullptr || binding.group->channels.size() != 1) {
+            throw std::invalid_argument(
+                "normal channel '" + std::string(channel) +
+                "' must use its own 3D Lasagna group");
+        }
+        const double baseSpacing =
+            static_cast<double>(binding.group->scaleFactor()) *
+            manifest.sourceToBase;
+        if (!lasagnaChannelShapeCompatible(
+                *manifest.baseShapeZYX,
+                baseSpacing,
+                binding.shapeZYX,
+                binding.chunksZYX)) {
+            throw std::invalid_argument(
+                "normal channel '" + std::string(channel) +
+                "' shape is incompatible with base_shape_zyx and scale");
+        }
+    };
+    validate(nx, "nx");
+    validate(ny, "ny");
+    validate(gradMag, "grad_mag");
+    const double nxBaseSpacing = nx.spacing * manifest.workingToBaseScale;
+    const double nyBaseSpacing = ny.spacing * manifest.workingToBaseScale;
+    if (nx.shapeZYX != ny.shapeZYX ||
+        std::abs(nxBaseSpacing - nyBaseSpacing) >
+            1.0e-12 * std::max({1.0, std::abs(nxBaseSpacing),
+                                std::abs(nyBaseSpacing)})) {
+        throw std::invalid_argument(
+            "normal nx and ny channels must have matching shape and base scale");
+    }
 }
 
 class LasagnaNormalSampler::Impl {
@@ -142,7 +187,8 @@ public:
 
     [[nodiscard]] double windingDistance(const cv::Vec3d& a,
                                          const cv::Vec3d& b,
-                                         double stepVx) const
+                                         double stepVx,
+                                         bool alignWithNormal) const
     {
         const cv::Vec3d delta = b - a;
         const double distanceVx = length(delta);
@@ -157,10 +203,23 @@ public:
             const double t1 = static_cast<double>(i + 1) / static_cast<double>(intervals);
             const cv::Vec3d p0 = a * (1.0 - t0) + b * t0;
             const cv::Vec3d p1 = a * (1.0 - t1) + b * t1;
-            const auto d0 = sampleWindingDensity(p0);
-            const auto d1 = sampleWindingDensity(p1);
+            auto d0 = sampleWindingDensity(p0);
+            auto d1 = sampleWindingDensity(p1);
             if (!d0.has_value() || !d1.has_value()) {
                 return std::numeric_limits<double>::infinity();
+            }
+            if (alignWithNormal) {
+                const cv::Vec3d direction = delta * (1.0 / distanceVx);
+                const auto n0 = sampleLasagnaCompactAxisTensor(
+                    nx_, ny_, *cache_, p0);
+                const auto n1 = sampleLasagnaCompactAxisTensor(
+                    nx_, ny_, *cache_, p1);
+                if (!n0.has_value() || !n1.has_value() ||
+                    length(*n0) <= kEpsilon || length(*n1) <= kEpsilon) {
+                    return std::numeric_limits<double>::infinity();
+                }
+                *d0 *= std::abs(direction.dot(*n0) / length(*n0));
+                *d1 *= std::abs(direction.dot(*n1) / length(*n1));
             }
             integral += 0.5 * (*d0 + *d1) * (distanceVx / static_cast<double>(intervals));
         }
@@ -785,7 +844,15 @@ double LasagnaNormalSampler::windingDistance(const cv::Vec3d& a,
                                              const cv::Vec3d& b,
                                              double stepVx) const
 {
-    return impl_->windingDistance(a, b, stepVx);
+    return impl_->windingDistance(a, b, stepVx, false);
+}
+
+double LasagnaNormalSampler::normalAlignedWindingDistance(
+    const cv::Vec3d& a,
+    const cv::Vec3d& b,
+    double stepVx) const
+{
+    return impl_->windingDistance(a, b, stepVx, true);
 }
 
 NormalSampleWithDerivative LasagnaNormalSampler::sampleNormalWithDerivative(

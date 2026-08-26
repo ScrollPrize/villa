@@ -4653,3 +4653,47 @@
   once. A `_quality_histogram.csv` and console table report count and
   min/mean/max total cost and cost density per bin; empty bins retain valid
   empty OBJ files and blank numeric CSV fields.
+
+## Stored crop-trace H/V constraint diagnostics
+
+- `vc_fiber_trace_chunk constraints TRACE.zarr --normal-manifest MANIFEST`
+  operates on durable `float64_traces` crop output and emits statistics only.
+  Constraint persistence and discrete H/V or winding-index optimization are
+  outside this first stage.
+- Every distance and arc value is in base voxels. Defaults are a 32-vx common
+  sample pitch, 512-vx target piece length, 128-vx overlap, 128-vx neighbor
+  radius, 32-vx centered tangent window, and 8-vx winding integration step.
+- A nondegenerate trace is divided into the minimum number of equal overlapping
+  arc intervals whose span is no greater than the target. Each interval stores
+  exact endpoints in addition to regular samples. Wholly degenerate traces are
+  skipped and counted; zero-length internal steps do not contribute arclength.
+- A point R-tree supplies a cubic broad phase for distinct-trace piece pairs.
+  Candidates must also pass the exact Euclidean radius. Only the minimum pair
+  of sampled points for each unordered piece pair is measured, with stable
+  sample-order tie breaking. Same-trace pieces never enter this search.
+- Consecutive pieces of one trace receive a hard link at their overlap midpoint
+  with parallel score 1, perpendicular score 0, winding distance 0, and closest
+  distance 0. Nonconsecutive pieces receive no implicit same-trace link.
+- A measured pair is oriented by the signed dot of centered secants at its
+  closest samples. Both pieces are walked forward and backward at the common
+  pitch. Each step may retain a strictly closer counter-shift of one twentieth
+  pitch per piece, bounded to that magnitude, for at most one tenth pitch
+  relative adjustment. The raw parallel score is the clamped `[0,1]` mean of
+  consistently oriented tangent dots. Raw perpendicular score is
+  `1 - abs(initial tangent dot)`. Division by their sum produces complementary
+  normalized scores.
+- Normal-aligned winding uses the existing Lasagna connector integral and
+  trapezoidal sampling. Each endpoint winding-density sample is multiplied by
+  `abs(dot(unit connector, decoded unit normal))`. Missing required normal or
+  density samples reject the measured link. The ordinary winding API retains
+  its previous unmodulated behavior.
+- The normal dataset is opened in base-coordinate working space, must have the
+  valid 3D `nx`, `ny`, and `grad_mag` structure used by Fiberlets, and its
+  declared base shape must cover the complete trace crop. Manifest path, bytes,
+  and parsed identity are not compatibility gates; parsed equality with stored
+  provenance is diagnostic only.
+- Candidate scoring may run in parallel, defaulting to host CPU count, but uses
+  deterministic candidate slots and stable final ordering. The report includes
+  configuration, population and rejection counts, phase timing, and deciles
+  for closest distance, both normalized orientation scores, and aligned
+  winding distance.

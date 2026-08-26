@@ -14,6 +14,8 @@
 namespace vc::lasagna
 {
 
+void validateLasagnaNormalDatasetStructure(const LasagnaDataset& dataset);
+
 struct LasagnaNormalSamplerOptions {
     size_t maxCachedBytes = 512ULL * 1024ULL * 1024ULL;
 };
@@ -41,6 +43,10 @@ public:
     [[nodiscard]] bool hasPredDtChannel() const;
     [[nodiscard]] std::optional<double> predDtSpacing() const;
     [[nodiscard]] double windingDistance(const cv::Vec3d& a, const cv::Vec3d& b, double stepVx = 8.0) const;
+    [[nodiscard]] double normalAlignedWindingDistance(
+        const cv::Vec3d& a,
+        const cv::Vec3d& b,
+        double stepVx = 8.0) const;
     [[nodiscard]] NormalSampleWithDerivative sampleNormalWithDerivative(const cv::Vec3d& volumePoint) const override;
     [[nodiscard]] NormalPrefetchReport prefetchNormalSamples(const std::vector<cv::Vec3d>& volumePoints, bool withDerivative) const override;
     [[nodiscard]] NormalBatchReport sampleNormalBatch(

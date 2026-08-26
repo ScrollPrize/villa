@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-08-26
+
+- Added report-only H/V constraint extraction from durable Fiberlet crop-trace
+  artifacts, including deterministic overlapping trace pieces, exact-radius
+  neighbor search, parallel/perpendicular evidence, hard continuity links, and
+  Lasagna-normal-aligned winding statistics.
+
 ## 2026-08-17
 
 - Anchored multi-control collapse through the ordinary local span update before

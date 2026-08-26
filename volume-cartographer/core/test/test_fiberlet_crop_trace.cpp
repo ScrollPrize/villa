@@ -6,6 +6,7 @@
 #include "vc/fiber_tracer/FiberletCropTrace.hpp"
 #include "vc/fiber_tracer/FiberletCropTraceArtifact.hpp"
 #include "vc/fiber_tracer/FiberletDataset.hpp"
+#include "vc/fiber_tracer/FiberTraceConstraints.hpp"
 #include "vc/lasagna/Dataset.hpp"
 
 #include "utils/zarr.hpp"
@@ -785,6 +786,45 @@ TEST_CASE("Fiberlet normal compatibility accepts structural identity and legal p
     CHECK_NOTHROW(validateFiberletNormalDatasetCompatibility(metadata, normals));
 }
 
+TEST_CASE("Fiber trace normal compatibility uses base crop geometry rather than provenance identity")
+{
+    TemporaryDirectory directory("trace_compatible");
+    const std::array<std::size_t, 3> baseShape{17, 18, 19};
+    const auto manifestPath = createNormalManifest(
+        directory,
+        baseShape,
+        {9, 9, 10},
+        {4, 4, 4},
+        {9, 9, 10},
+        {4, 4, 4});
+    FiberletCropTraceArtifact artifact;
+    artifact.metadata.kind = FiberletDatasetKind::Traces;
+    artifact.metadata.predictionToBaseScale = 4.0;
+    artifact.metadata.sources = {{"normal_manifest", {{"different", true}}}};
+    artifact.minimumBaseXYZ = {0, 0, 0};
+    artifact.maximumBaseXYZ = {19, 18, 17};
+
+    const auto normals = vc::lasagna::LasagnaDataset::open(
+        manifestPath, vc::lasagna::LasagnaDatasetOpenOptions{1.0});
+    CHECK_NOTHROW(validateFiberletCropTraceNormalDatasetCompatibility(
+        artifact, normals));
+
+    const auto wrongScale = vc::lasagna::LasagnaDataset::open(
+        manifestPath, vc::lasagna::LasagnaDatasetOpenOptions{2.0});
+    CHECK_THROWS_WITH_AS(
+        validateFiberletCropTraceNormalDatasetCompatibility(
+            artifact, wrongScale),
+        doctest::Contains("base coordinates"),
+        std::invalid_argument);
+
+    artifact.maximumBaseXYZ[0] = 20.0;
+    CHECK_THROWS_WITH_AS(
+        validateFiberletCropTraceNormalDatasetCompatibility(
+            artifact, normals),
+        doctest::Contains("outside"),
+        std::invalid_argument);
+}
+
 TEST_CASE("Fiberlet normal compatibility rejects incompatible frame shape and channels")
 {
     const std::array<std::size_t, 3> baseShape{17, 18, 19};
@@ -859,4 +899,145 @@ TEST_CASE("Fiberlet normal compatibility rejects incompatible frame shape and ch
         const auto normals = vc::lasagna::LasagnaDataset::open(manifestPath, vc::lasagna::LasagnaDatasetOpenOptions{4.0});
         CHECK_THROWS_WITH_AS(validateFiberletNormalDatasetCompatibility(metadata, normals), doctest::Contains("grad_mag_factor"), std::exception);
     }
+}
+
+TEST_CASE("Trace constraints split evenly and hard-link consecutive pieces")
+{
+    FiberletCropTraceLine line;
+    line.pointsBaseXYZ = {
+        {0, 0, 0},
+        {100, 0, 0},
+        {100, 0, 0},
+        {1000, 0, 0},
+    };
+    FiberletCropTraceLine degenerate;
+    degenerate.pointsBaseXYZ = {{1, 2, 3}, {1, 2, 3}};
+    FiberTraceConstraintConfig config;
+    config.maximumDistanceBaseVoxels = 0.0;
+    config.parallelThreads = 1;
+    const auto report = extractFiberTraceConstraints(
+        {line, degenerate},
+        config,
+        [](const cv::Vec3d&, const cv::Vec3d&, double) { return 0.0; });
+
+    CHECK(report.inputTraces == 2);
+    CHECK(report.skippedDegenerateTraces == 1);
+    REQUIRE(report.pieces.size() == 3);
+    const double expectedSpan = (1000.0 + 2.0 * 128.0) / 3.0;
+    for (const auto& piece : report.pieces) {
+        CHECK(piece.endArcBaseVoxels - piece.beginArcBaseVoxels ==
+              doctest::Approx(expectedSpan));
+        CHECK(piece.sampleArcsBaseVoxels.front() ==
+              doctest::Approx(piece.beginArcBaseVoxels));
+        CHECK(piece.sampleArcsBaseVoxels.back() ==
+              doctest::Approx(piece.endArcBaseVoxels));
+    }
+    CHECK(report.pieces[0].endArcBaseVoxels -
+              report.pieces[1].beginArcBaseVoxels == doctest::Approx(128.0));
+    CHECK(report.pieces[1].endArcBaseVoxels -
+              report.pieces[2].beginArcBaseVoxels == doctest::Approx(128.0));
+    CHECK(report.hardConstraints == 2);
+    REQUIRE(report.constraints.size() == 2);
+    for (const auto& constraint : report.constraints) {
+        CHECK(constraint.hardContinuity);
+        CHECK(constraint.parallelScore == doctest::Approx(1.0));
+        CHECK(constraint.perpendicularScore == doctest::Approx(0.0));
+        CHECK(constraint.windingDistance == doctest::Approx(0.0));
+        CHECK(constraint.pointABaseXYZ == constraint.pointBBaseXYZ);
+    }
+}
+
+TEST_CASE("Trace constraint pieces retain short and exact target lengths")
+{
+    FiberTraceConstraintConfig config;
+    config.maximumDistanceBaseVoxels = 0.0;
+    config.parallelThreads = 1;
+    const auto extract = [&](double length) {
+        FiberletCropTraceLine line;
+        line.pointsBaseXYZ = {{0, 0, 0}, {length, 0, 0}};
+        return extractFiberTraceConstraints(
+            {line},
+            config,
+            [](const cv::Vec3d&, const cv::Vec3d&, double) { return 0.0; });
+    };
+
+    const auto shortReport = extract(300.0);
+    REQUIRE(shortReport.pieces.size() == 1);
+    CHECK(shortReport.pieces.front().beginArcBaseVoxels == doctest::Approx(0.0));
+    CHECK(shortReport.pieces.front().endArcBaseVoxels == doctest::Approx(300.0));
+    CHECK(shortReport.hardConstraints == 0);
+
+    const auto exactReport = extract(512.0);
+    REQUIRE(exactReport.pieces.size() == 1);
+    CHECK(exactReport.pieces.front().beginArcBaseVoxels == doctest::Approx(0.0));
+    CHECK(exactReport.pieces.front().endArcBaseVoxels == doctest::Approx(512.0));
+    CHECK(exactReport.hardConstraints == 0);
+}
+
+TEST_CASE("Trace constraints distinguish parallel and perpendicular neighbors deterministically")
+{
+    FiberletCropTraceLine first;
+    first.pointsBaseXYZ = {{0, 0, 0}, {256, 0, 0}};
+    FiberletCropTraceLine reversedParallel;
+    reversedParallel.pointsBaseXYZ = {{256, 10, 0}, {0, 10, 0}};
+    FiberletCropTraceLine perpendicular;
+    perpendicular.pointsBaseXYZ = {{128, -128, 0}, {128, 128, 0}};
+    FiberTraceConstraintConfig config;
+    config.maximumDistanceBaseVoxels = 16.0;
+    config.parallelThreads = 1;
+    const auto winding = [](const cv::Vec3d& a, const cv::Vec3d& b, double) {
+        return cv::norm(a - b) * 0.01;
+    };
+    const auto serial = extractFiberTraceConstraints(
+        {first, reversedParallel, perpendicular}, config, winding);
+    config.parallelThreads = 4;
+    const auto parallel = extractFiberTraceConstraints(
+        {first, reversedParallel, perpendicular}, config, winding);
+
+    REQUIRE(serial.constraints.size() == 3);
+    REQUIRE(parallel.constraints.size() == serial.constraints.size());
+    const auto findPair = [&](std::size_t traceA, std::size_t traceB) -> const FiberTraceConstraint& {
+        for (const auto& constraint : serial.constraints) {
+            const auto a = serial.pieces[constraint.pieceA].traceIndex;
+            const auto b = serial.pieces[constraint.pieceB].traceIndex;
+            if (a == traceA && b == traceB)
+                return constraint;
+        }
+        throw std::runtime_error("missing test constraint");
+    };
+    const auto& aligned = findPair(0, 1);
+    CHECK(aligned.parallelScore == doctest::Approx(1.0));
+    CHECK(aligned.perpendicularScore == doctest::Approx(0.0));
+    const auto& crossing = findPair(0, 2);
+    CHECK(crossing.parallelScore == doctest::Approx(0.0).epsilon(1.0e-9));
+    CHECK(crossing.perpendicularScore == doctest::Approx(1.0).epsilon(1.0e-9));
+    for (std::size_t index = 0; index < serial.constraints.size(); ++index) {
+        const auto& left = serial.constraints[index];
+        const auto& right = parallel.constraints[index];
+        CHECK(left.pieceA == right.pieceA);
+        CHECK(left.pieceB == right.pieceB);
+        CHECK(left.arcABaseVoxels == right.arcABaseVoxels);
+        CHECK(left.arcBBaseVoxels == right.arcBBaseVoxels);
+        CHECK(left.parallelScore == right.parallelScore);
+        CHECK(left.perpendicularScore == right.perpendicularScore);
+        CHECK(left.windingDistance == right.windingDistance);
+    }
+}
+
+TEST_CASE("Trace constraint R-tree cube hits still require Euclidean radius")
+{
+    FiberletCropTraceLine first;
+    first.pointsBaseXYZ = {{0, 0, 0}, {64, 0, 0}};
+    FiberletCropTraceLine diagonal;
+    diagonal.pointsBaseXYZ = {{0, 8, 8}, {64, 8, 8}};
+    FiberTraceConstraintConfig config;
+    config.resampleSpacingBaseVoxels = 32.0;
+    config.maximumDistanceBaseVoxels = 10.0;
+    config.parallelThreads = 1;
+    const auto report = extractFiberTraceConstraints(
+        {first, diagonal},
+        config,
+        [](const cv::Vec3d&, const cv::Vec3d&, double) { return 0.0; });
+    CHECK(report.measuredCandidates == 0);
+    CHECK(report.constraints.empty());
 }

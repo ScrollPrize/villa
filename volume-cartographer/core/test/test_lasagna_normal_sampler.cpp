@@ -206,7 +206,7 @@ TEST_CASE("LasagnaNormalSampler integrates decoded grad_mag as winding distance"
 {
     const auto dir = tmpDir("winding_distance");
     std::vector<uint8_t> gradMag(2 * 2 * 2, 100);
-    std::vector<uint8_t> nx(2 * 2 * 2, 128);
+    std::vector<uint8_t> nx(2 * 2 * 2, 255);
     std::vector<uint8_t> ny(2 * 2 * 2, 128);
     createU8Zarr(dir / "grad_mag.zarr", {2, 2, 2}, {2, 2, 2}, &gradMag);
     createU8Zarr(dir / "nx.zarr", {2, 2, 2}, {2, 2, 2}, &nx);
@@ -231,6 +231,15 @@ TEST_CASE("LasagnaNormalSampler integrates decoded grad_mag as winding distance"
     CHECK(*density == doctest::Approx(1.0));
     CHECK(sampler.windingDistance({0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0.25) ==
           doctest::Approx(1.0));
+    CHECK(sampler.normalAlignedWindingDistance(
+              {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0.25) ==
+          doctest::Approx(1.0));
+    CHECK(sampler.windingDistance(
+              {0.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, 0.25) ==
+          doctest::Approx(1.0));
+    CHECK(sampler.normalAlignedWindingDistance(
+              {0.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, 0.25) ==
+          doctest::Approx(0.0).epsilon(1.0e-9));
     fs::remove_all(dir);
 }
 
