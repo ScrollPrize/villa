@@ -1406,3 +1406,21 @@
   is now reserved for the first non-skipped accumulation-frontier tile, so
   later out-of-order GPU results cannot occupy every result slot and deadlock
   canonical accumulation. Queue delivery remains fire-and-forget.
+
+## 2026-08-26 - H/V-only fiber-piece labeling diagnostic
+
+- Added an opt-in reduced HiGHS model that solves active/broken and H/V labels
+  without parity variables, constraints, or winding costs.
+- Preserved the existing CSV and five OBJ interface by reporting fixed-even
+  parity, leaving the two odd visualization layers empty.
+- Added an explicit diagnostic switch to retain all finite winding-distance
+  constraints without changing the default 1.5-winding cutoff.
+- Added an exact-perpendicular mixed H/V model with binary broken decisions,
+  continuous piece orientation, true absolute-difference edge losses, and no
+  triangle surrogate.
+- Added deterministic iterative H/V consensus growth over original crop
+  fibers, with spatial/count priority, incremental broken decisions, final
+  H/V/broken OBJ layers, and scheduled growth snapshots.
+- Restricted the primary consensus seed to long crop-spanning candidates and
+  ranked equal-straightness candidates by true distance to the crop center.
+- Added final and milestone broken-fiber OBJ layers alongside consensus H/V.

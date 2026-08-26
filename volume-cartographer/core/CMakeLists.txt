@@ -214,6 +214,7 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberletCropTrace.cpp
     src/fiber_tracer/FiberletCropTraceArtifact.cpp
     src/fiber_tracer/FiberTraceConstraints.cpp
+    src/fiber_tracer/FiberTraceConsensus.cpp
     src/fiber_tracer/FiberTraceLabeling.cpp
     src/fiber_tracer/FiberletCropVisualization.cpp
     src/fiber_tracer/FiberletOnDemand.cpp

@@ -4692,6 +4692,12 @@
   Values greater than or equal to `1.5` are discarded and counted separately
   from invalid/non-finite winding samples. Hard same-trace continuity links
   remain at zero and do not pass through measured-link rejection.
+  `--winding-cutoff N` selects another finite positive exclusive cutoff.
+- `--no-winding-cutoff` disables only that finite `1.5` rejection for
+  H/V-only constraint diagnostics. Every finite winding measurement is
+  retained; invalid and non-finite measurements remain rejected. The flag
+  requires `--hv-only`; joint parity labeling retains the finite `<1.5`
+  invariant. Default cutoff behavior is unchanged.
 - The normal dataset is opened in base-coordinate working space, must have the
   valid 3D `nx`, `ny`, and `grad_mag` structure used by Fiberlets, and its
   declared base shape must cover the complete trace crop. Manifest path, bytes,
@@ -4781,3 +4787,74 @@
   scores, the complete extracted report remains the input to constraint OBJ
   visualization, and retained/excluded counts are reported. Default-off model
   behavior is unchanged.
+- `--hv-only` is an independent opt-in labeling ablation. It retains the same
+  filtered graph, degrees, broken penalties, active variables, H/V variables,
+  pair-active variables, H/V gated-XOR variables, H/V gauges, and H/V triangle
+  cuts, while constructing no parity variables, parity gated-XOR variables,
+  parity gauges, parity triangle cuts, or winding objective terms. With `N`
+  pieces, `E` retained links, and `T` relaxation triangles, the model has
+  exactly `2N + 2E` columns, `N + 8E + 4T` rows, `2N` MILP integer columns, and
+  `4T` reported triangle rows. Winding cost is exactly zero.
+- H/V-only LP and MILP reports must contain exactly `N` parity values equal to
+  zero. Active MILP pieces decode only to H/even or V/even. The stable values
+  CSV and five label OBJ paths do not change; H/odd and V/odd are valid empty
+  OBJ files. Solver-objective validation uses only broken plus orientation
+  cost in this mode. The default joint model and its output are unchanged.
+- `--exact-perpendicular-milp` is an H/V-only diagnostic and is mutually
+  exclusive with `--lp-relaxation` and LP backend controls. Piece activity is
+  binary, piece H/V is continuous on `[0,1]`, and parity is absent/fixed zero.
+  Pair activity and H/V difference remain bounded continuous auxiliaries.
+- For parallel score `p`, every active edge pays
+  `(1-p) + (2*p-1)*abs(h_a-h_b)`. Edges with `p <= 0.5` receive one binary
+  endpoint-order variable and pair-gated big-M-2 upper bounds so their
+  difference equals the actual absolute endpoint difference. Edges with
+  `p > 0.5` obtain the same equality through the positive difference objective
+  coefficient and the existing lower envelope. Inactive edges have zero
+  difference and must not constrain the active endpoint.
+- Exact-perpendicular mode must not enumerate or add triangle cuts: all edge
+  relations derive from shared scalar piece values. With `N` pieces, `E`
+  retained links, and `P` links having `p <= 0.5`, it has exactly
+  `2N + 2E + P` columns, `N + P` integer columns, `N + 8E + 2P` rows, and zero
+  triangle rows. It emits continuous-value CSV and threshold OBJ diagnostics,
+  with binary activity and continuous H/V, rather than discrete label OBJs.
+- `vc_fiber_trace_chunk consensus` is a separate non-HiGHS H/V diagnostic that
+  reuses canonical constraint extraction and its exclusive winding cutoff. It
+  groups pieces by original trace index, discards same-trace links, and counts
+  each retained cross-trace piece-pair constraint once. Accumulation order is
+  stable by neighbor trace and piece IDs.
+- Crop bounds for consensus are the stored trace-artifact bounds and must be
+  finite with positive XYZ extents. The nominal crop side is
+  `min(maximum_base_xyz - minimum_base_xyz)` and its center is the arithmetic
+  XYZ midpoint. The primary H seed must have finite positive arc length
+  strictly greater than half the nominal side. Eligible traces are ranked by
+  descending endpoint-chord/arc-length straightness, ascending exact minimum
+  3D Euclidean crop-center-to-polyline-segment distance in base voxels,
+  descending arc length, then ascending trace index. These comparisons use no
+  tolerance. If no valid trace passes the strict primary cutoff, consensus
+  fails explicitly. Lines without two distinct points are immediately broken
+  and do not count as assignments.
+  When active assigned evidence exists, the next trace maximizes
+  `constraint_count / mean_closest_distance_base_voxels`; zero distance is
+  infinite, then ties prefer greater count, smaller mean distance, and lower
+  trace index. Links to broken traces do not provide evidence. Exhausting
+  active evidence starts another H seed using the same geometric ranking but
+  without the primary length cutoff.
+- A candidate H/V assignment sums `1-p` on equal labels and `p` on differing
+  labels for every current active evidence link with parallel score `p`.
+  Broken costs `broken_cost_per_link * current_active_evidence_count`. Strict
+  minimum wins with H, V, broken tie order. Costs are irreversible incremental
+  choices: later links to a broken trace remain disabled and do not
+  retroactively alter its cost. Winding and orientation confidence do not
+  affect candidate priority.
+- Consensus output contains final full-trace `_h.obj`, `_v.obj`, and
+  `_broken.obj` layers plus `_step_N_h.obj`, `_step_N_v.obj`, and
+  `_step_N_broken.obj` snapshots for every ten total valid assignments through
+  100 and every 100 thereafter. A snapshot includes the decision at assignment
+  `N`. Seeds and broken choices count toward `N`; degenerate traces do not and
+  occur in none of the layers. Each triplet partitions the assigned valid
+  traces, so its counts sum to `N`; every file is written even when empty.
+  Final paths never alias milestone paths, and an explicit output basename
+  owns and overwrites all of these consensus layers. HiGHS-only flags are
+  invalid in consensus mode. Console output
+  includes detailed rows for the first 100 assignments and ends with the full
+  assignment, label-count, and objective summary.

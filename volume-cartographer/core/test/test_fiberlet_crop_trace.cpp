@@ -7,6 +7,7 @@
 #include "vc/fiber_tracer/FiberletCropTraceArtifact.hpp"
 #include "vc/fiber_tracer/FiberletDataset.hpp"
 #include "vc/fiber_tracer/FiberTraceConstraints.hpp"
+#include "vc/fiber_tracer/FiberTraceConsensus.hpp"
 #include "vc/fiber_tracer/FiberTraceLabeling.hpp"
 #include "vc/lasagna/Dataset.hpp"
 
@@ -1155,6 +1156,13 @@ TEST_CASE("Trace constraints discard winding distances at the exclusive cutoff")
     CHECK(cutoff.rejectedWinding == 0);
     CHECK(cutoff.rejectedWindingCutoff == 1);
 
+    config.enforceMaximumWindingDistance = false;
+    const auto unbounded = extract(42.0);
+    REQUIRE(unbounded.constraints.size() == 1);
+    CHECK(unbounded.constraints.front().windingDistance == doctest::Approx(42.0));
+    CHECK(unbounded.rejectedWinding == 0);
+    CHECK(unbounded.rejectedWindingCutoff == 0);
+
     const auto invalid = extract(std::numeric_limits<double>::quiet_NaN());
     CHECK(invalid.constraints.empty());
     CHECK(invalid.rejectedWinding == 1);
@@ -1200,6 +1208,29 @@ TEST_CASE("Trace labeling minimizes orientation winding and broken costs")
     CHECK(crossing.orientationCost == doctest::Approx(0.1));
     CHECK(crossing.windingCost == doctest::Approx(0.1));
     CHECK(crossing.objective == doctest::Approx(0.2));
+
+    config.hvOnly = true;
+    const auto hvOnly = solveFiberTraceLabels(makeReport(0.1, 0.9), config);
+    REQUIRE(hvOnly.labels.size() == 2);
+    CHECK(hvOnly.hvOnly);
+    CHECK(hvOnly.labels[0] == FiberTracePieceLabel::HEven);
+    CHECK(hvOnly.labels[1] == FiberTracePieceLabel::VEven);
+    CHECK(hvOnly.orientationCost == doctest::Approx(0.1));
+    CHECK(hvOnly.windingCost == doctest::Approx(0.0));
+    CHECK(hvOnly.objective == doctest::Approx(0.1));
+    CHECK(hvOnly.variables == 6);
+    CHECK(hvOnly.integerVariables == 4);
+    CHECK(hvOnly.rows == 10);
+    for (const double odd : hvOnly.oddValues)
+        CHECK(odd == 0.0);
+    const auto unboundedWinding = solveFiberTraceLabels(
+        makeReport(0.1, 42.0), config);
+    CHECK(unboundedWinding.objective == doctest::Approx(0.1));
+    CHECK(unboundedWinding.windingCost == doctest::Approx(0.0));
+    config.hvOnly = false;
+    CHECK_THROWS_AS(
+        solveFiberTraceLabels(makeReport(0.1, 42.0), config),
+        std::invalid_argument);
 
     const auto broken = solveFiberTraceLabels(makeReport(0.5, 0.5), config);
     REQUIRE(broken.labels.size() == 2);
@@ -1268,6 +1299,10 @@ TEST_CASE("Trace labeling exposes a continuous LP relaxation")
     constraints.pieces.resize(2);
     constraints.pieces[0].traceIndex = 4;
     constraints.pieces[1].traceIndex = 9;
+    constraints.pieces[0].samplePointsBaseXYZ = {
+        {0.0, 0.0, 0.0}, {0.0, 1.0, 0.0}};
+    constraints.pieces[1].samplePointsBaseXYZ = {
+        {1.0, 0.0, 0.0}, {1.0, 1.0, 0.0}};
     constraints.constraints.push_back({
         0, 1, 0.0, 0.0, {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0},
         1.0, 0.7, 0.3, 0.2, false});
@@ -1320,6 +1355,28 @@ TEST_CASE("Trace labeling exposes a continuous LP relaxation")
     CHECK(csv.find("piece_id,trace_index,piece_index,active,vertical,odd\n") == 0);
     CHECK(csv.find("0,4,0,") != std::string::npos);
     CHECK(csv.find("1,9,0,") != std::string::npos);
+
+    config.hvOnly = true;
+    const auto hvOnly = solveFiberTraceLabels(constraints, config);
+    CHECK(hvOnly.hvOnly);
+    CHECK(hvOnly.variables == 6);
+    CHECK(hvOnly.rows == 10);
+    CHECK(hvOnly.windingCost == doctest::Approx(0.0));
+    for (const double odd : hvOnly.oddValues)
+        CHECK(odd == 0.0);
+    const auto hvVisual = writeFiberTraceLabelRelaxationObjs(
+        constraints, hvOnly, directory.path / "crop.hv_only");
+    CHECK(hvVisual.objects.pieceCounts[1] == 0);
+    CHECK(hvVisual.objects.pieceCounts[3] == 0);
+    for (const auto& path : {
+             hvVisual.objects.paths.hOdd,
+             hvVisual.objects.paths.vOdd}) {
+        CHECK(std::filesystem::is_regular_file(path));
+        std::ifstream oddInput(path);
+        std::ostringstream oddText;
+        oddText << oddInput.rdbuf();
+        CHECK(oddText.str().find("\no ") == std::string::npos);
+    }
 
     FiberTraceConstraintReport visualConstraints;
     visualConstraints.pieces.resize(5);
@@ -1427,10 +1484,12 @@ TEST_CASE("Trace labeling LP enforces triangle-consistent differences")
     config.relaxIntegrality = true;
     config.brokenCostPerConstraint = 100.0;
     const auto labeling = solveFiberTraceLabels(constraints, config);
+    CHECK_FALSE(labeling.hvOnly);
     CHECK(labeling.integerVariables == 0);
     CHECK(labeling.gaugeRoots == 1);
     CHECK(labeling.triangles == 1);
     CHECK(labeling.triangleRows == 8);
+    CHECK(labeling.variables == 18);
     CHECK(labeling.rows == 53);
     CHECK(labeling.objective == doctest::Approx(2.0));
     CHECK(labeling.orientationCost == doctest::Approx(1.0));
@@ -1449,4 +1508,360 @@ TEST_CASE("Trace labeling LP enforces triangle-consistent differences")
     CHECK(withBrokenVertex.activeValues[2] == doctest::Approx(1.0));
     CHECK(withBrokenVertex.verticalValues[0] == doctest::Approx(0.0));
     CHECK(withBrokenVertex.oddValues[0] == doctest::Approx(0.0));
+
+    config.hvOnly = true;
+    const auto hvOnly = solveFiberTraceLabels(constraints, config);
+    CHECK(hvOnly.hvOnly);
+    CHECK(hvOnly.integerVariables == 0);
+    CHECK(hvOnly.gaugeRoots == 1);
+    CHECK(hvOnly.triangles == 1);
+    CHECK(hvOnly.triangleRows == 4);
+    CHECK(hvOnly.variables == 12);
+    CHECK(hvOnly.rows == 31);
+    CHECK(hvOnly.windingCost == doctest::Approx(0.0));
+    for (const double odd : hvOnly.oddValues)
+        CHECK(odd == 0.0);
+}
+
+TEST_CASE("Trace labeling H V only mode uses the retained triangle graph")
+{
+    FiberTraceConstraintReport constraints;
+    constraints.pieces.resize(4);
+    const auto add = [&](std::size_t a,
+                         std::size_t b,
+                         double parallel,
+                         double winding) {
+        constraints.constraints.push_back({
+            a, b, 0.0, 0.0,
+            {static_cast<double>(a), 0.0, 0.0},
+            {static_cast<double>(b), 0.0, 0.0},
+            1.0, parallel, 1.0 - parallel, winding, false});
+    };
+    add(0, 1, 0.1, 1.0);
+    add(0, 2, 0.1, 1.0);
+    add(1, 2, 0.1, 1.0);
+    add(2, 3, 0.9, 1.0);
+
+    FiberTraceLabelingConfig config;
+    config.parallelThreads = 1;
+    config.relaxIntegrality = true;
+    config.brokenCostPerConstraint = 100.0;
+    config.excludeParallelSeparateWinding = true;
+    config.hvOnly = true;
+    const auto labeling = solveFiberTraceLabels(constraints, config);
+    CHECK(labeling.retainedConstraints == 3);
+    CHECK(labeling.excludedParallelSeparateWinding == 1);
+    CHECK(labeling.gaugeRoots == 2);
+    CHECK(labeling.triangles == 1);
+    CHECK(labeling.variables == 14);
+    CHECK(labeling.rows == 32);
+    CHECK(labeling.triangleRows == 4);
+}
+
+TEST_CASE("Trace labeling exact perpendicular MILP derives loss from continuous H V values")
+{
+    const auto triangle = [](double brokenCost) {
+        FiberTraceConstraintReport constraints;
+        constraints.pieces.resize(3);
+        const auto addPerpendicular = [&](std::size_t a, std::size_t b) {
+            constraints.constraints.push_back({
+                a, b, 0.0, 0.0,
+                {static_cast<double>(a), 0.0, 0.0},
+                {static_cast<double>(b), 0.0, 0.0},
+                1.0, 0.0, 1.0, 1.0, false});
+        };
+        addPerpendicular(0, 1);
+        addPerpendicular(0, 2);
+        addPerpendicular(1, 2);
+
+        FiberTraceLabelingConfig config;
+        config.parallelThreads = 1;
+        config.brokenCostPerConstraint = brokenCost;
+        config.hvOnly = true;
+        config.exactPerpendicularMilp = true;
+        return solveFiberTraceLabels(constraints, config);
+    };
+
+    const auto allActive = triangle(100.0);
+    CHECK(allActive.exactPerpendicularMilp);
+    CHECK(allActive.continuousPieceValues);
+    CHECK(allActive.labels.empty());
+    CHECK(allActive.variables == 15);
+    CHECK(allActive.integerVariables == 6);
+    CHECK(allActive.perpendicularBranchVariables == 3);
+    CHECK(allActive.rows == 33);
+    CHECK(allActive.triangles == 0);
+    CHECK(allActive.triangleRows == 0);
+    CHECK(allActive.orientationCost == doctest::Approx(1.0));
+    CHECK(allActive.brokenCost == doctest::Approx(0.0));
+    for (const double active : allActive.activeValues)
+        CHECK(active == doctest::Approx(1.0));
+    for (const double odd : allActive.oddValues)
+        CHECK(odd == doctest::Approx(0.0));
+
+    const auto oneBroken = triangle(0.1);
+    CHECK(oneBroken.objective == doctest::Approx(0.2));
+    CHECK(oneBroken.orientationCost == doctest::Approx(0.0));
+    CHECK(oneBroken.brokenCost == doctest::Approx(0.2));
+    CHECK(std::count(
+              oneBroken.activeValues.begin(),
+              oneBroken.activeValues.end(),
+              0.0) == 1);
+    CHECK(std::count(
+              oneBroken.activeValues.begin(),
+              oneBroken.activeValues.end(),
+              1.0) == 2);
+    bool brokenTouchesExtremeActive = false;
+    for (std::size_t broken = 0; broken < 3; ++broken) {
+        if (oneBroken.activeValues[broken] != 0.0)
+            continue;
+        for (std::size_t active = 0; active < 3; ++active) {
+            if (oneBroken.activeValues[active] == 1.0 &&
+                oneBroken.verticalValues[active] == doctest::Approx(1.0)) {
+                brokenTouchesExtremeActive = true;
+            }
+        }
+    }
+    CHECK(brokenTouchesExtremeActive);
+
+    FiberTraceConstraintReport boundary;
+    boundary.pieces.resize(2);
+    boundary.constraints.push_back({
+        0, 1, 0.0, 0.0, {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0},
+        1.0, 0.5, 0.5, 0.0, false});
+    FiberTraceLabelingConfig boundaryConfig;
+    boundaryConfig.parallelThreads = 1;
+    boundaryConfig.brokenCostPerConstraint = 100.0;
+    boundaryConfig.hvOnly = true;
+    boundaryConfig.exactPerpendicularMilp = true;
+    const auto neutral = solveFiberTraceLabels(boundary, boundaryConfig);
+    CHECK(neutral.variables == 7);
+    CHECK(neutral.integerVariables == 3);
+    CHECK(neutral.perpendicularBranchVariables == 1);
+    CHECK(neutral.rows == 12);
+    CHECK(neutral.orientationCost == doctest::Approx(0.5));
+
+    boundary.constraints.front().parallelScore = 1.0;
+    boundary.constraints.front().perpendicularScore = 0.0;
+    const auto parallel = solveFiberTraceLabels(boundary, boundaryConfig);
+    CHECK(parallel.variables == 6);
+    CHECK(parallel.integerVariables == 2);
+    CHECK(parallel.perpendicularBranchVariables == 0);
+    CHECK(parallel.rows == 10);
+    CHECK(parallel.orientationCost == doctest::Approx(0.0));
+
+    boundaryConfig.hvOnly = false;
+    CHECK_THROWS_WITH_AS(
+        solveFiberTraceLabels(boundary, boundaryConfig),
+        doctest::Contains("requires H/V-only"),
+        std::invalid_argument);
+    boundaryConfig.hvOnly = true;
+    boundaryConfig.relaxIntegrality = true;
+    CHECK_THROWS_WITH_AS(
+        solveFiberTraceLabels(boundary, boundaryConfig),
+        doctest::Contains("mutually exclusive"),
+        std::invalid_argument);
+}
+
+TEST_CASE("Trace consensus grows original fibers by stable active evidence")
+{
+    std::vector<FiberletCropTraceLine> traces(5);
+    const std::array<double, 5> lengths{10.0, 8.0, 6.0, 5.0, 4.0};
+    for (std::size_t trace = 0; trace < traces.size(); ++trace) {
+        traces[trace].pointsBaseXYZ = {
+            {0.0, static_cast<double>(trace), 0.0},
+            {lengths[trace], static_cast<double>(trace), 0.0},
+        };
+    }
+
+    FiberTraceConstraintReport constraints;
+    for (const std::size_t trace : {0UL, 0UL, 1UL, 1UL, 2UL, 3UL, 4UL}) {
+        FiberTraceConstraintPiece piece;
+        piece.traceIndex = trace;
+        piece.pieceIndex = constraints.pieces.size();
+        constraints.pieces.push_back(std::move(piece));
+    }
+    const auto add = [&](std::size_t a,
+                         std::size_t b,
+                         double distance,
+                         double parallel) {
+        FiberTraceConstraint constraint;
+        constraint.pieceA = a;
+        constraint.pieceB = b;
+        constraint.closestDistanceBaseVoxels = distance;
+        constraint.parallelScore = parallel;
+        constraint.perpendicularScore = 1.0 - parallel;
+        constraints.constraints.push_back(constraint);
+    };
+    add(0, 2, 2.0, 1.0);
+    add(1, 3, 2.0, 1.0);
+    add(0, 4, 1.0, 0.0);
+    add(4, 5, 1.0, 0.5);
+    add(5, 6, 1.0, 1.0);
+
+    FiberTraceConsensusConfig config;
+    config.brokenCostPerConstraint = 0.1;
+    config.cropMinimumBaseXYZ = {-5.0, -5.0, -5.0};
+    config.cropMaximumBaseXYZ = {15.0, 5.0, 5.0};
+    const auto consensus = growFiberTraceConsensus(traces, constraints, config);
+    REQUIRE(consensus.steps.size() == 5);
+    CHECK(consensus.steps[0].traceIndex == 0);
+    CHECK(consensus.steps[0].componentSeed);
+    CHECK(consensus.steps[0].label == FiberTraceConsensusLabel::H);
+    CHECK(consensus.steps[1].traceIndex == 1);
+    CHECK(consensus.steps[1].evidenceCount == 2);
+    CHECK(consensus.steps[1].label == FiberTraceConsensusLabel::H);
+    CHECK(consensus.steps[2].traceIndex == 2);
+    CHECK(consensus.steps[2].label == FiberTraceConsensusLabel::V);
+    CHECK(consensus.steps[3].traceIndex == 3);
+    CHECK(consensus.steps[3].label == FiberTraceConsensusLabel::Broken);
+    CHECK(consensus.steps[3].selectedCost == doctest::Approx(0.1));
+    CHECK(consensus.steps[4].traceIndex == 4);
+    CHECK(consensus.steps[4].componentSeed);
+    CHECK(consensus.steps[4].label == FiberTraceConsensusLabel::H);
+    CHECK(consensus.components == 2);
+    CHECK(consensus.retainedCrossTraceConstraints == 5);
+    CHECK(consensus.orientationCost == doctest::Approx(0.0));
+    CHECK(consensus.brokenCost == doctest::Approx(0.1));
+    CHECK(consensus.objective == doctest::Approx(0.1));
+
+    std::reverse(
+        constraints.constraints.begin(), constraints.constraints.end());
+    const auto reordered = growFiberTraceConsensus(traces, constraints, config);
+    REQUIRE(reordered.steps.size() == consensus.steps.size());
+    for (std::size_t index = 0; index < consensus.steps.size(); ++index) {
+        CHECK(reordered.steps[index].traceIndex ==
+              consensus.steps[index].traceIndex);
+        CHECK(reordered.steps[index].label == consensus.steps[index].label);
+        CHECK(reordered.steps[index].selectedCost ==
+              doctest::Approx(consensus.steps[index].selectedCost));
+    }
+
+    traces.push_back({});
+    const auto withDegenerate =
+        growFiberTraceConsensus(traces, constraints, config);
+    CHECK(withDegenerate.degenerateTraces == 1);
+    CHECK(withDegenerate.steps.size() == 5);
+    CHECK(withDegenerate.labels.back() == FiberTraceConsensusLabel::Broken);
+}
+
+TEST_CASE("Trace consensus primary seed uses crop length and center")
+{
+    std::vector<FiberletCropTraceLine> traces(5);
+    traces[0].pointsBaseXYZ = {{-2.5, 0.0, 0.0}, {2.5, 0.0, 0.0}};
+    traces[1].pointsBaseXYZ = {{-3.0, 3.0, 0.0}, {3.0, 3.0, 0.0}};
+    traces[2].pointsBaseXYZ = {{-3.0, 1.0, 0.0}, {3.0, 1.0, 0.0}};
+    traces[3].pointsBaseXYZ = {{-2.0, 0.5, 0.0}, {2.0, 0.5, 0.0}};
+    traces[4].pointsBaseXYZ = {
+        {-3.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, {3.0, 0.0, 0.0}};
+
+    FiberTraceConsensusConfig config;
+    config.cropMinimumBaseXYZ = {-5.0, -10.0, -20.0};
+    config.cropMaximumBaseXYZ = {5.0, 10.0, 20.0};
+    const auto consensus = growFiberTraceConsensus(
+        traces, FiberTraceConstraintReport{}, config);
+    REQUIRE(consensus.steps.size() == traces.size());
+    CHECK(consensus.steps[0].traceIndex == 2);
+    CHECK(consensus.steps[0].componentSeed);
+    CHECK(consensus.steps[0].seedStraightness == doctest::Approx(1.0));
+    CHECK(consensus.steps[0].seedCenterDistanceBaseVoxels ==
+          doctest::Approx(1.0));
+    CHECK(consensus.steps[0].seedArcLengthBaseVoxels ==
+          doctest::Approx(6.0));
+    CHECK(consensus.steps[1].traceIndex == 0);
+    CHECK(consensus.steps[1].componentSeed);
+    CHECK(consensus.steps[3].traceIndex == 1);
+    CHECK(consensus.steps.back().traceIndex == 4);
+
+    traces.resize(2);
+    traces[1].pointsBaseXYZ = {{-2.0, 1.0, 0.0}, {2.0, 1.0, 0.0}};
+    CHECK_THROWS_WITH_AS(
+        growFiberTraceConsensus(
+            traces, FiberTraceConstraintReport{}, config),
+        doctest::Contains("longer than half"),
+        std::invalid_argument);
+}
+
+TEST_CASE("Trace consensus writes requested assignment milestones")
+{
+    std::vector<FiberletCropTraceLine> traces(205);
+    for (std::size_t trace = 0; trace < traces.size(); ++trace) {
+        const double length = static_cast<double>(trace + 1);
+        traces[trace].pointsBaseXYZ = {{0.0, 0.0, 0.0}, {length, 0.0, 0.0}};
+    }
+    FiberTraceConstraintReport constraints;
+    FiberTraceConsensusConfig config;
+    config.cropMinimumBaseXYZ = {-100.0, -100.0, -100.0};
+    config.cropMaximumBaseXYZ = {100.0, 100.0, 100.0};
+    const auto consensus = growFiberTraceConsensus(
+        traces, constraints, config);
+    const std::vector<std::size_t> expected{
+        10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 200};
+    CHECK(consensus.snapshotAddedCounts == expected);
+    REQUIRE(consensus.steps.size() == traces.size());
+    CHECK(consensus.steps.front().traceIndex == 204);
+    CHECK(consensus.steps.back().traceIndex == 0);
+
+    const TemporaryDirectory directory("trace_consensus_objs");
+    const auto written = writeFiberTraceConsensusObjs(
+        traces, consensus, directory.path / "crop.result");
+    CHECK(written.finalPaths.h == directory.path / "crop_h.obj");
+    CHECK(written.finalPaths.v == directory.path / "crop_v.obj");
+    CHECK(written.finalPaths.broken == directory.path / "crop_broken.obj");
+    CHECK(written.hCount == 205);
+    CHECK(written.vCount == 0);
+    CHECK(written.brokenCount == 0);
+    CHECK(written.hCount + written.vCount + written.brokenCount == 205);
+    REQUIRE(written.snapshots.size() == expected.size());
+    for (const auto& snapshot : written.snapshots) {
+        CHECK(snapshot.hCount + snapshot.vCount + snapshot.brokenCount ==
+              snapshot.addedCount);
+    }
+    CHECK(written.snapshots.front().paths.h ==
+          directory.path / "crop_step_10_h.obj");
+    CHECK(written.snapshots.front().hCount == 10);
+    CHECK(written.snapshots.front().brokenCount == 0);
+    CHECK(written.snapshots.back().paths.v ==
+          directory.path / "crop_step_200_v.obj");
+    CHECK(written.snapshots.back().hCount == 200);
+    CHECK(written.snapshots.back().paths.broken ==
+          directory.path / "crop_step_200_broken.obj");
+
+    const auto read = [](const std::filesystem::path& path) {
+        std::ifstream input(path);
+        std::ostringstream text;
+        text << input.rdbuf();
+        return text.str();
+    };
+    CHECK(read(written.finalPaths.h).find("o trace_204\n") !=
+          std::string::npos);
+    CHECK(read(written.finalPaths.v).find("\no ") == std::string::npos);
+    CHECK(read(written.finalPaths.broken).find("\no ") == std::string::npos);
+
+    auto withBroken = consensus;
+    withBroken.labels[204] = FiberTraceConsensusLabel::Broken;
+    withBroken.steps.front().label = FiberTraceConsensusLabel::Broken;
+    const auto brokenWritten = writeFiberTraceConsensusObjs(
+        traces, withBroken, directory.path / "with_broken.result");
+    CHECK(brokenWritten.hCount == 204);
+    CHECK(brokenWritten.vCount == 0);
+    CHECK(brokenWritten.brokenCount == 1);
+    CHECK(read(brokenWritten.finalPaths.broken).find("o trace_204\n") !=
+          std::string::npos);
+    CHECK(read(brokenWritten.finalPaths.h).find("o trace_204\n") ==
+          std::string::npos);
+    REQUIRE(!brokenWritten.snapshots.empty());
+    CHECK(brokenWritten.snapshots.front().hCount == 9);
+    CHECK(brokenWritten.snapshots.front().brokenCount == 1);
+    CHECK(read(brokenWritten.snapshots.front().paths.broken)
+              .find("o trace_204\n") != std::string::npos);
+
+    auto tracesWithDegenerate = traces;
+    tracesWithDegenerate.push_back({});
+    withBroken.labels.push_back(FiberTraceConsensusLabel::Broken);
+    const auto withoutDegenerate = writeFiberTraceConsensusObjs(
+        tracesWithDegenerate,
+        withBroken,
+        directory.path / "with_degenerate.result");
+    CHECK(withoutDegenerate.brokenCount == 1);
 }

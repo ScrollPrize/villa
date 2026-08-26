@@ -4,6 +4,7 @@
 #include "vc/fiber_tracer/FiberletCropTraceArtifact.hpp"
 #include "vc/fiber_tracer/FiberletCropVisualization.hpp"
 #include "vc/fiber_tracer/FiberTraceConstraints.hpp"
+#include "vc/fiber_tracer/FiberTraceConsensus.hpp"
 #include "vc/fiber_tracer/FiberTraceLabeling.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
@@ -28,7 +29,7 @@
 namespace
 {
 
-enum class Mode { Trace, Visualize, Constraints };
+enum class Mode { Trace, Visualize, Constraints, Consensus };
 
 struct Options {
     Mode mode = Mode::Trace;
@@ -47,6 +48,7 @@ struct Options {
     bool hasBounds = false;
     bool hasTraceOnlyOption = false;
     bool hasConstraintOnlyOption = false;
+    bool hasSolverOnlyOption = false;
     bool hasSharedRuntimeOption = false;
 };
 
@@ -67,7 +69,11 @@ void usage(const char* executable)
                  " [--output BASENAME] [--broken-cost-per-link COST]"
                  " [--mip-gap FRACTION] [--lp-relaxation]"
                  " [--lp-parallel] [--lp-solver NAME]"
+                 " [--hv-only] [--exact-perpendicular-milp]"
                  " [--exclude-parallel-separate-winding] [options]\n\n"
+              << "  " << executable
+              << " consensus <traces.zarr> --normal-manifest PATH"
+                 " [--output BASENAME] [--broken-cost-per-link COST] [options]\n\n"
               << "Trace options:\n"
               << "  --obj PATH                 line OBJ; defaults beside trace Zarr\n"
               << "  --volume PATH              concrete uint8 CT Zarr group\n"
@@ -89,9 +95,13 @@ void usage(const char* executable)
               << "  --max-distance N           closest-pair threshold [128]\n"
               << "  --tangent-window N         centered tangent secant length [32]\n"
               << "  --winding-step N           Lasagna connector integration step [8]\n"
+              << "  --winding-cutoff N         exclusive finite winding cutoff [1.5]\n"
+              << "  --no-winding-cutoff        retain every finite winding measurement\n"
               << "  --lp-relaxation            solve continuous [0,1] label relaxation\n"
               << "  --lp-parallel              request HiGHS parallel LP execution\n"
               << "  --lp-solver NAME           choose, simplex, hipo, or ipm [choose]\n"
+              << "  --hv-only                  solve active/broken and H/V only\n"
+              << "  --exact-perpendicular-milp exact continuous H/V loss with binary activity\n"
               << "  --exclude-parallel-separate-winding\n"
               << "                              omit that measured class from labeling only\n"
               << "  --threads N                scoring workers [host CPUs]\n"
@@ -143,8 +153,10 @@ Options parse(int argc, char** argv)
         options.mode = Mode::Visualize;
     else if (mode == "constraints")
         options.mode = Mode::Constraints;
+    else if (mode == "consensus")
+        options.mode = Mode::Consensus;
     else
-        fail("mode must be 'trace', 'visualize', or 'constraints'");
+        fail("mode must be 'trace', 'visualize', 'constraints', or 'consensus'");
     options.input = argv[2];
 
     for (int index = 3; index < argc; ++index) {
@@ -216,6 +228,16 @@ Options parse(int argc, char** argv)
         } else if (argument == "--winding-step") {
             options.constraints.windingIntegrationStepBaseVoxels = number(index, argc, argv, "--winding-step");
             options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-cutoff") {
+            options.constraints.maximumWindingDistance =
+                number(index, argc, argv, "--winding-cutoff");
+            if (!(options.constraints.maximumWindingDistance > 0.0))
+                fail("--winding-cutoff must be positive");
+            options.constraints.enforceMaximumWindingDistance = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--no-winding-cutoff") {
+            options.constraints.enforceMaximumWindingDistance = false;
+            options.hasConstraintOnlyOption = true;
         } else if (argument == "--broken-cost-per-link") {
             options.labeling.brokenCostPerConstraint =
                 number(index, argc, argv, "--broken-cost-per-link");
@@ -227,12 +249,15 @@ Options parse(int argc, char** argv)
             if (options.labeling.relativeMipGap < 0.0)
                 fail("--mip-gap must be nonnegative");
             options.hasConstraintOnlyOption = true;
+            options.hasSolverOnlyOption = true;
         } else if (argument == "--lp-relaxation") {
             options.labeling.relaxIntegrality = true;
             options.hasConstraintOnlyOption = true;
+            options.hasSolverOnlyOption = true;
         } else if (argument == "--lp-parallel") {
             options.labeling.lpParallel = true;
             options.hasConstraintOnlyOption = true;
+            options.hasSolverOnlyOption = true;
         } else if (argument == "--lp-solver") {
             options.labeling.lpSolver = value(index, argc, argv, "--lp-solver");
             if (options.labeling.lpSolver != "choose" &&
@@ -242,9 +267,19 @@ Options parse(int argc, char** argv)
                 fail("--lp-solver must be choose, simplex, hipo, or ipm");
             }
             options.hasConstraintOnlyOption = true;
+            options.hasSolverOnlyOption = true;
         } else if (argument == "--exclude-parallel-separate-winding") {
             options.labeling.excludeParallelSeparateWinding = true;
             options.hasConstraintOnlyOption = true;
+            options.hasSolverOnlyOption = true;
+        } else if (argument == "--hv-only") {
+            options.labeling.hvOnly = true;
+            options.hasConstraintOnlyOption = true;
+            options.hasSolverOnlyOption = true;
+        } else if (argument == "--exact-perpendicular-milp") {
+            options.labeling.exactPerpendicularMilp = true;
+            options.hasConstraintOnlyOption = true;
+            options.hasSolverOnlyOption = true;
         } else if (argument == "--help" || argument == "-h") {
             usage(argv[0]);
             std::exit(0);
@@ -268,19 +303,35 @@ Options parse(int argc, char** argv)
     if (vc::lasagna::isRemoteLasagnaLocation(options.normalManifest) && options.remoteCacheDirectory.empty()) {
         fail("a remote normal manifest requires --remote-cache-dir");
     }
-    if (options.mode == Mode::Constraints) {
+    if (options.mode == Mode::Constraints || options.mode == Mode::Consensus) {
         if (options.hasTraceOnlyOption)
-            fail("constraints does not accept trace-only options");
+            fail("constraint processing does not accept trace-only options");
+        if (options.mode == Mode::Consensus && options.hasSolverOnlyOption)
+            fail("consensus does not accept HiGHS labeling options");
+        if (!options.constraints.enforceMaximumWindingDistance &&
+            options.mode == Mode::Constraints && !options.labeling.hvOnly) {
+            fail("--no-winding-cutoff currently requires --hv-only");
+        }
         if (!options.labeling.relaxIntegrality &&
             (options.labeling.lpParallel || options.labeling.lpSolver != "choose")) {
             fail("--lp-parallel and --lp-solver require --lp-relaxation");
+        }
+        if (options.labeling.exactPerpendicularMilp &&
+            !options.labeling.hvOnly) {
+            fail("--exact-perpendicular-milp requires --hv-only");
+        }
+        if (options.labeling.exactPerpendicularMilp &&
+            options.labeling.relaxIntegrality) {
+            fail("--exact-perpendicular-milp conflicts with --lp-relaxation");
         }
         if (options.output.empty()) {
             const std::string stem = options.input.has_extension()
                 ? options.input.stem().string()
                 : options.input.filename().string();
             options.output = options.input.parent_path() /
-                (stem + "_constraints");
+                (stem + (options.mode == Mode::Consensus
+                             ? "_consensus"
+                             : "_constraints"));
         }
         options.constraints.parallelThreads = static_cast<std::size_t>(options.threads);
         options.labeling.parallelThreads = static_cast<std::size_t>(options.threads);
@@ -342,7 +393,9 @@ void printConstraintReport(
               << config.maximumDistanceBaseVoxels << "  "
               << config.tangentWindowBaseVoxels << "  "
               << config.windingIntegrationStepBaseVoxels << "  "
-              << config.maximumWindingDistance << "  "
+              << (config.enforceMaximumWindingDistance
+                      ? std::to_string(config.maximumWindingDistance)
+                      : "off") << "  "
               << config.parallelThreads << '\n'
               << "fiber trace constraint counts\n"
               << "traces  degenerate  pieces  samples  spatial_hits  candidates  measured  hard  tangent_rejected  winding_invalid  winding_cutoff  manifest_matches_trace\n"
@@ -386,8 +439,9 @@ void printLabelingReport(
     };
     std::cout << std::setprecision(8)
               << "fiber trace labeling optimization\n"
-              << "status  objective  orientation_cost  winding_cost  broken_cost  broken_cost_per_link  retained_links  excluded_parallel_separate_winding  requested_mip_gap  variables  integer_variables  rows  mip_nodes  mip_gap  solve_seconds\n"
-              << report.modelStatus << "  " << report.objective << "  "
+              << "status  hv_only  objective  orientation_cost  winding_cost  broken_cost  broken_cost_per_link  retained_links  excluded_parallel_separate_winding  requested_mip_gap  variables  integer_variables  rows  mip_nodes  mip_gap  solve_seconds\n"
+              << report.modelStatus << "  " << (report.hvOnly ? "true" : "false")
+              << "  " << report.objective << "  "
               << report.orientationCost << "  " << report.windingCost << "  "
               << report.brokenCost << "  " << config.brokenCostPerConstraint
               << "  " << report.retainedConstraints << "  "
@@ -412,20 +466,28 @@ void printRelaxedLabelingReport(
     const vc::fiber_tracer::FiberTraceRelaxationObjReport& visualization)
 {
     std::cout << std::setprecision(8)
-              << "fiber trace labeling LP relaxation\n"
-              << "status  requested_solver  requested_parallel  threads  objective  orientation_cost  winding_cost  broken_cost  broken_cost_per_link  retained_links  excluded_parallel_separate_winding  variables  rows  gauge_roots  triangles  triangle_rows  solve_seconds  csv\n"
-              << report.modelStatus << "  " << config.lpSolver << "  "
+              << "fiber trace labeling continuous values\n"
+              << "status  mode  hv_only  requested_solver  requested_parallel  threads  objective  orientation_cost  winding_cost  broken_cost  broken_cost_per_link  retained_links  excluded_parallel_separate_winding  variables  integer_variables  perpendicular_branch_variables  rows  gauge_roots  triangles  triangle_rows  mip_nodes  mip_gap  solve_seconds  csv\n"
+              << report.modelStatus << "  "
+              << (report.exactPerpendicularMilp
+                      ? "exact_perpendicular_milp"
+                      : "lp_relaxation")
+              << "  " << (report.hvOnly ? "true" : "false")
+              << "  " << config.lpSolver << "  "
               << (config.lpParallel ? "on" : "choose") << "  "
               << config.parallelThreads << "  " << report.objective << "  "
               << report.orientationCost << "  " << report.windingCost << "  "
               << report.brokenCost << "  " << config.brokenCostPerConstraint
               << "  " << report.retainedConstraints << "  "
               << report.excludedParallelSeparateWinding << "  "
-              << report.variables << "  " << report.rows << "  "
+              << report.variables << "  " << report.integerVariables << "  "
+              << report.perpendicularBranchVariables << "  "
+              << report.rows << "  "
               << report.gaugeRoots << "  " << report.triangles << "  "
               << report.triangleRows << "  "
+              << report.mipNodes << "  " << report.mipGap << "  "
               << report.solveSeconds << "  " << csv << '\n'
-              << "fiber trace labeling LP variable quantiles\n"
+              << "fiber trace labeling continuous variable quantiles\n"
               << "quantile  active  vertical  odd\n";
     for (int percentile = 0; percentile <= 100; percentile += 10) {
         const double fraction = static_cast<double>(percentile) / 100.0;
@@ -443,7 +505,7 @@ void printRelaxedLabelingReport(
         visualization.objects.paths.vOdd,
         visualization.objects.paths.broken,
     };
-    std::cout << "fiber trace labeling LP threshold visualization\n"
+    std::cout << "fiber trace labeling continuous threshold visualization\n"
               << "active_threshold  vertical_threshold  odd_threshold\n"
               << visualization.activeThreshold << "  0.5  0.5\n"
               << "label  pieces  path\n";
@@ -470,6 +532,121 @@ void printConstraintObjReport(
               << "parallel_separate_winding  "
               << report.parallelSeparateWinding << "  "
               << report.paths.parallelSeparateWinding << '\n';
+}
+
+const char* consensusLabelName(
+    vc::fiber_tracer::FiberTraceConsensusLabel label)
+{
+    using Label = vc::fiber_tracer::FiberTraceConsensusLabel;
+    switch (label) {
+    case Label::H:
+        return "h";
+    case Label::V:
+        return "v";
+    case Label::Broken:
+        return "broken";
+    case Label::Unassigned:
+        return "unassigned";
+    }
+    return "invalid";
+}
+
+void printConsensusReport(
+    const vc::fiber_tracer::FiberTraceConsensusReport& report,
+    const vc::fiber_tracer::FiberTraceConsensusConfig& config,
+    const vc::fiber_tracer::FiberTraceConsensusObjReport& objects)
+{
+    using Label = vc::fiber_tracer::FiberTraceConsensusLabel;
+    std::cout << std::setprecision(8)
+              << "fiber trace iterative consensus final OBJ outputs\n"
+              << "label  fibers  path\n"
+              << "h  " << objects.hCount << "  " << objects.finalPaths.h << '\n'
+              << "v  " << objects.vCount << "  " << objects.finalPaths.v << '\n'
+              << "broken  " << objects.brokenCount << "  "
+              << objects.finalPaths.broken << '\n';
+    if (!objects.snapshots.empty()) {
+        std::cout << "fiber trace iterative consensus snapshot OBJ outputs\n"
+                  << "assignments  h_fibers  v_fibers  broken_fibers  h_path  v_path  broken_path\n";
+        for (const auto& snapshot : objects.snapshots) {
+            std::cout << snapshot.addedCount << "  " << snapshot.hCount
+                      << "  " << snapshot.vCount << "  "
+                      << snapshot.brokenCount << "  " << snapshot.paths.h
+                      << "  " << snapshot.paths.v << "  "
+                      << snapshot.paths.broken << '\n';
+        }
+    }
+    std::cout << "fiber trace iterative consensus component seeds\n"
+              << "assignments  component  trace  label  straightness  center_distance_base  arc_length_base\n";
+    for (const auto& step : report.steps) {
+        if (step.componentSeed) {
+            std::cout << step.addedCount << "  " << step.componentIndex
+                      << "  " << step.traceIndex << "  "
+                      << consensusLabelName(step.label) << "  "
+                      << step.seedStraightness << "  "
+                      << step.seedCenterDistanceBaseVoxels << "  "
+                      << step.seedArcLengthBaseVoxels << '\n';
+        }
+    }
+    std::cout << "fiber trace iterative consensus first choices\n"
+              << std::right
+              << std::setw(7) << "step"
+              << std::setw(7) << "trace"
+              << std::setw(7) << "comp"
+              << std::setw(7) << "seed"
+              << std::setw(9) << "label"
+              << std::setw(10) << "evidence"
+              << std::setw(12) << "mean_dist"
+              << std::setw(12) << "score"
+              << std::setw(10) << "h_cost"
+              << std::setw(10) << "v_cost"
+              << std::setw(10) << "broken"
+              << std::setw(10) << "selected" << '\n'
+              << std::fixed << std::setprecision(3);
+    const std::size_t choiceCount = std::min<std::size_t>(100, report.steps.size());
+    for (std::size_t index = 0; index < choiceCount; ++index) {
+        const auto& step = report.steps[index];
+        std::cout << std::setw(7) << step.addedCount
+                  << std::setw(7) << step.traceIndex
+                  << std::setw(7) << step.componentIndex
+                  << std::setw(7) << (step.componentSeed ? "yes" : "no")
+                  << std::setw(9) << consensusLabelName(step.label)
+                  << std::setw(10) << step.evidenceCount
+                  << std::setw(12) << step.meanDistanceBaseVoxels
+                  << std::setw(12) << step.connectivityScore
+                  << std::setw(10) << step.hCost
+                  << std::setw(10) << step.vCost
+                  << std::setw(10) << step.brokenCost
+                  << std::setw(10) << step.selectedCost << '\n';
+    }
+    const auto countStat = [](const char* name, std::size_t value) {
+        std::cout << std::left << std::setw(42) << name << std::right
+                  << std::setw(14) << value << '\n';
+    };
+    const auto valueStat = [](const char* name, double value) {
+        std::cout << std::left << std::setw(42) << name << std::right
+                  << std::setw(14) << std::fixed << std::setprecision(3)
+                  << value << '\n';
+    };
+    std::cout << std::defaultfloat
+              << "fiber trace iterative consensus final stats\n"
+              << std::left << std::setw(42) << "metric" << std::right
+              << std::setw(14) << "value" << '\n';
+    countStat("assignments", report.steps.size());
+    countStat("components", report.components);
+    countStat("degenerate", report.degenerateTraces);
+    countStat(
+        "retained cross-trace constraints",
+        report.retainedCrossTraceConstraints);
+    countStat("H", report.labelCounts[static_cast<std::size_t>(Label::H)]);
+    countStat("V", report.labelCounts[static_cast<std::size_t>(Label::V)]);
+    countStat(
+        "broken",
+        report.labelCounts[static_cast<std::size_t>(Label::Broken)]);
+    valueStat("orientation cost", report.orientationCost);
+    valueStat("broken cost", report.brokenCost);
+    valueStat("objective", report.objective);
+    valueStat("broken cost per link", config.brokenCostPerConstraint);
+    std::cout << std::defaultfloat;
 }
 
 struct VisualizationReport {
@@ -521,7 +698,8 @@ int main(int argc, char** argv)
 {
     try {
         const auto options = parse(argc, argv);
-        if (options.mode == Mode::Constraints) {
+        if (options.mode == Mode::Constraints ||
+            options.mode == Mode::Consensus) {
             const auto started = std::chrono::steady_clock::now();
             const auto cpuStarted = std::clock();
             const auto artifact =
@@ -554,6 +732,31 @@ int main(int argc, char** argv)
                     return normals.normalAlignedWindingDistancesBatch(
                         connectors, step, threads);
                 });
+            if (options.mode == Mode::Consensus) {
+                vc::fiber_tracer::FiberTraceConsensusConfig consensusConfig;
+                consensusConfig.brokenCostPerConstraint =
+                    options.labeling.brokenCostPerConstraint;
+                consensusConfig.cropMinimumBaseXYZ = artifact.minimumBaseXYZ;
+                consensusConfig.cropMaximumBaseXYZ = artifact.maximumBaseXYZ;
+                const auto consensus = vc::fiber_tracer::growFiberTraceConsensus(
+                    artifact.lines, report, consensusConfig);
+                const auto consensusObjects =
+                    vc::fiber_tracer::writeFiberTraceConsensusObjs(
+                        artifact.lines, consensus, options.output);
+                const double wallSeconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - started).count();
+                const double cpuSeconds = static_cast<double>(
+                    std::clock() - cpuStarted) / CLOCKS_PER_SEC;
+                printConstraintReport(
+                    report,
+                    options.constraints,
+                    manifestMatches,
+                    wallSeconds,
+                    cpuSeconds);
+                printConsensusReport(
+                    consensus, consensusConfig, consensusObjects);
+                return 0;
+            }
             const auto objReport =
                 vc::fiber_tracer::writeFiberTraceConstraintObjs(
                     report, options.output);
@@ -563,7 +766,7 @@ int main(int argc, char** argv)
             std::optional<std::filesystem::path> relaxationCsv;
             std::optional<vc::fiber_tracer::FiberTraceRelaxationObjReport>
                 relaxationVisualization;
-            if (options.labeling.relaxIntegrality) {
+            if (labeling.continuousPieceValues) {
                 relaxationCsv = vc::fiber_tracer::writeFiberTraceLabelRelaxationCsv(
                     report, labeling, options.output);
                 relaxationVisualization =

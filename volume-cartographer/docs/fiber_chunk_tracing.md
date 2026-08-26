@@ -108,6 +108,10 @@ score of `0.5` is absent and winding `0.5` belongs to separate-winding.
 Measured links with aligned winding distance greater than or equal to `1.5`
 are discarded before diagnostics and labeling. This is an exclusive cutoff;
 same-trace continuity remains at winding zero.
+Use `--winding-cutoff N` to select another positive exclusive cutoff.
+Pass `--no-winding-cutoff` with `--hv-only` to retain every finite measured
+winding distance for diagnostics. Invalid and non-finite samples remain
+rejected. Joint parity labeling retains the finite `<1.5` invariant.
 
 The five labels are H/V crossed with even/odd plus broken. For a retained link
 with parallel score `p` and winding distance `d`, two active pieces pay
@@ -156,6 +160,100 @@ cuts, and objective terms. Exact `parallel_score == 0.5` remains included, and
 hard continuity links are never removed. The four constraint OBJ files still
 represent the complete extracted constraint set. Labeling output reports both
 retained and excluded link counts.
+
+Pass `--hv-only` to omit parity from the labeling problem completely. This
+keeps active/broken penalties, retained-link filtering, H/V costs, H/V gauges,
+and H/V triangle cuts unchanged, but creates no parity piece columns, parity
+XOR columns, winding objective terms, parity gauges, or parity triangle cuts.
+For `N` pieces, `E` retained links, and `T` LP triangles, the reduced model has
+`2N + 2E` columns and `N + 8E + 4T` rows; an integer solve has `2N` integer
+columns. Reported winding cost is exactly zero. For output compatibility, raw
+`odd` values are exact zero and every active discrete or thresholded piece is
+classified as even. The existing CSV and five OBJ paths are therefore
+unchanged, with valid but empty H/odd and V/odd OBJ files. This is opt-in; the
+default joint H/V-plus-parity model is unchanged.
+
+Pass `--exact-perpendicular-milp` together with `--hv-only` for a mixed
+diagnostic with binary active/broken decisions and continuous `[0,1]` H/V
+values. It conflicts with `--lp-relaxation` and LP-backend controls. For an
+active retained link with parallel score `p`, its orientation loss is
+`(1-p) + (2*p-1)*abs(h_a-h_b)`. Thus a fully parallel link pays the actual H/V
+difference and a fully perpendicular link pays one minus that difference. A
+perpendicular link incident to values `0.9` and `0.0` retains loss `0.1`; the
+model cannot erase it with an independent edge-XOR value.
+
+The exact mode keeps pair activity and difference columns continuous. Piece
+activity is binary. Links with `p <= 0.5` receive a binary endpoint-order
+column and two pair-gated big-M rows, while links with `p > 0.5` obtain exact
+absolute differences from their positive objective coefficient. Consequently
+all active-edge differences derive from shared piece values and no graph
+triangles are enumerated or cut. For `N` pieces, `E` retained links, and `P`
+links with `p <= 0.5`, the model has `2N + 2E + P` columns, `N + P` integer
+columns, `N + 8E + 2P` rows, and zero triangle rows. It writes the continuous
+values CSV and threshold OBJ layers used by LP diagnostics; activity values
+are exact zero or one, parity remains zero, and H/V values remain continuous.
+
+## Iterative H/V consensus
+
+The separate `consensus` command reuses the same stored-trace loading, Lasagna
+normal validation, piece extraction, spatial search, orientation scoring, and
+exclusive winding cutoff as `constraints`, but does not construct a HiGHS
+model. It operates on original stored traces: every retained cross-trace
+piece-pair constraint contributes one item of evidence, while same-trace hard
+continuity links are ignored. Multiple piece-pair constraints between the same
+two source traces remain multiple evidence items.
+
+The first trace is assigned H. The crop's nominal side is its smallest stored
+XYZ extent, and the primary seed must have arc length strictly greater than
+half that side. Eligible traces are ranked by endpoint-chord/arc-length
+straightness, then by the smallest 3D Euclidean distance from the crop center
+to the complete polyline, then by arc length and trace index. Comparisons use
+the computed values directly without a tolerance. Later disconnected-component
+seeds use the same ranking without the primary length cutoff, so short fibers
+remain labelable. Subsequent candidates are ranked by
+`constraint_count / mean_closest_distance_base_voxels` over links to already
+assigned H/V traces. Zero mean distance has infinite priority. Remaining ties
+prefer greater evidence count, smaller mean distance, and lower trace index.
+Parallel confidence and winding do not affect this growth priority.
+
+For the chosen trace, an H/V match across a link costs `1-parallel_score` and
+an H/V mismatch costs `parallel_score`. These costs are summed over currently
+active evidence. Broken costs `broken_cost_per_link * evidence_count` and wins
+only on a strict improvement; exact ties prefer H, then V, then broken. This is
+an irreversible greedy objective, not a rescore of the final graph. Once a
+trace is broken, its links are disabled for later decisions and never charged
+retroactively. A valid trace connected only to broken assignments starts a new
+active-evidence component as H. Degenerate stored lines are broken immediately
+and do not count as growth steps.
+
+Final complete-trace layers are `<base>_h.obj`, `<base>_v.obj`, and
+`<base>_broken.obj`. Snapshot triplets `<base>_step_N_h.obj`,
+`<base>_step_N_v.obj`, and `<base>_step_N_broken.obj` are written after 10, 20,
+..., 100 assignments and then every 100 assignments. A snapshot contains the
+labels immediately after assignment `N`, including a broken choice made at
+that step. `N` includes component seeds and broken decisions but not degenerate
+input lines. Degenerate non-assignments occur in none of the three layers.
+All three files are created even when a class is empty, and final files remain
+separate when the final count is also a snapshot milestone. A user-supplied
+`--output` basename owns and overwrites all three final and milestone layers.
+
+```bash
+volume-cartographer/build/bin/vc_fiber_trace_chunk consensus \
+  /tmp/crop_traces_central_384.zarr \
+  --normal-manifest /path/to/normals.lasagna.json \
+  --output ./384 \
+  --piece-length 1000000000 \
+  --max-distance 256 \
+  --broken-cost-per-link 0.25
+```
+
+Constraint extraction options and `--broken-cost-per-link` are accepted.
+HiGHS-only options such as `--lp-relaxation`, `--hv-only`, and
+`--exact-perpendicular-milp` are rejected. Console output includes each seed's
+straightness, crop-center distance, and arc length, plus a detailed table for
+the first 100 assignment choices with connectivity evidence and all three
+candidate costs. The complete assignment, label-count, and objective summary
+is printed after that table as the final output block.
 
 HiGHS' LP backend can be selected explicitly for this diagnostic. Add
 `--lp-parallel` to request parallel execution, and use `--lp-solver choose`,

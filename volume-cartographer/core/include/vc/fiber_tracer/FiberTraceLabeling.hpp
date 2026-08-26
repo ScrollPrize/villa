@@ -28,6 +28,8 @@ struct FiberTraceLabelingConfig {
     bool lpParallel = false;
     std::string lpSolver = "choose";
     bool excludeParallelSeparateWinding = false;
+    bool hvOnly = false;
+    bool exactPerpendicularMilp = false;
 };
 
 struct FiberTraceLabelingReport {
@@ -44,6 +46,10 @@ struct FiberTraceLabelingReport {
     std::size_t triangleRows = 0;
     std::size_t retainedConstraints = 0;
     std::size_t excludedParallelSeparateWinding = 0;
+    std::size_t perpendicularBranchVariables = 0;
+    bool hvOnly = false;
+    bool exactPerpendicularMilp = false;
+    bool continuousPieceValues = false;
     std::int64_t mipNodes = 0;
     double objective = 0.0;
     double orientationCost = 0.0;

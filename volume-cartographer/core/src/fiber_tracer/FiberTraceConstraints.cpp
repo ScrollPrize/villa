@@ -581,7 +581,8 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
     for (std::size_t index = 0; index < acceptedIndices.size(); ++index) {
         auto& result = scored[acceptedIndices[index]];
         if (std::isfinite(windings[index]) &&
-            windings[index] < config.maximumWindingDistance) {
+            (!config.enforceMaximumWindingDistance ||
+             windings[index] < config.maximumWindingDistance)) {
             result.constraint->windingDistance = windings[index];
         } else if (!std::isfinite(windings[index])) {
             result.constraint.reset();

@@ -24,6 +24,7 @@ struct FiberTraceConstraintConfig {
     double phaseRefinementLimitFraction = 0.05;
     double windingIntegrationStepBaseVoxels = 8.0;
     double maximumWindingDistance = 1.5;
+    bool enforceMaximumWindingDistance = true;
     std::size_t parallelThreads = 0;
 };
 
