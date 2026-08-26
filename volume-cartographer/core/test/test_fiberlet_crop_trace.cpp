@@ -1205,7 +1205,7 @@ TEST_CASE("Trace labeling minimizes orientation winding and broken costs")
     CHECK(broken.objective == doctest::Approx(0.5));
     CHECK(broken.variables == 9);
     CHECK(broken.integerVariables == 6);
-    CHECK(broken.rows == 7);
+    CHECK(broken.rows == 17);
 
     auto isolated = makeReport(0.9, 0.0);
     isolated.pieces.emplace_back();
@@ -1254,4 +1254,153 @@ TEST_CASE("Trace labeling writes five stable piece OBJ classes")
     std::ostringstream text;
     text << input.rdbuf();
     CHECK(text.str().find("o piece_3_trace_13_part_3\n") != std::string::npos);
+}
+
+TEST_CASE("Trace labeling exposes a continuous LP relaxation")
+{
+    FiberTraceConstraintReport constraints;
+    constraints.pieces.resize(2);
+    constraints.pieces[0].traceIndex = 4;
+    constraints.pieces[1].traceIndex = 9;
+    constraints.constraints.push_back({
+        0, 1, 0.0, 0.0, {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0},
+        1.0, 0.7, 0.3, 0.2, false});
+
+    FiberTraceLabelingConfig config;
+    config.parallelThreads = 1;
+    config.relaxIntegrality = true;
+    config.brokenCostPerConstraint = 10.0;
+    const auto labeling = solveFiberTraceLabels(constraints, config);
+    CHECK(labeling.labels.empty());
+    CHECK(labeling.integerVariables == 0);
+    REQUIRE(labeling.activeValues.size() == 2);
+    REQUIRE(labeling.verticalValues.size() == 2);
+    REQUIRE(labeling.oddValues.size() == 2);
+    for (const auto* values : {
+             &labeling.activeValues,
+             &labeling.verticalValues,
+             &labeling.oddValues}) {
+        for (const double value : *values) {
+            CHECK(value >= 0.0);
+            CHECK(value <= 1.0);
+        }
+    }
+
+    config.lpParallel = true;
+    config.lpSolver = "simplex";
+    const auto parallelSimplex = solveFiberTraceLabels(constraints, config);
+    CHECK(parallelSimplex.modelStatus == "Optimal");
+    CHECK(parallelSimplex.objective == doctest::Approx(labeling.objective));
+    CHECK(parallelSimplex.rows == labeling.rows);
+    CHECK(parallelSimplex.variables == labeling.variables);
+    REQUIRE(parallelSimplex.activeValues.size() == labeling.activeValues.size());
+    for (std::size_t piece = 0; piece < labeling.activeValues.size(); ++piece) {
+        CHECK(parallelSimplex.activeValues[piece] ==
+              doctest::Approx(labeling.activeValues[piece]));
+        CHECK(parallelSimplex.verticalValues[piece] ==
+              doctest::Approx(labeling.verticalValues[piece]));
+        CHECK(parallelSimplex.oddValues[piece] ==
+              doctest::Approx(labeling.oddValues[piece]));
+    }
+
+    const TemporaryDirectory directory("trace_label_relaxation");
+    const auto path = writeFiberTraceLabelRelaxationCsv(
+        constraints, labeling, directory.path / "crop.labels");
+    CHECK(path.filename() == "crop_relaxation.csv");
+    std::ifstream input(path);
+    std::ostringstream text;
+    text << input.rdbuf();
+    const std::string csv = text.str();
+    CHECK(csv.find("piece_id,trace_index,piece_index,active,vertical,odd\n") == 0);
+    CHECK(csv.find("0,4,0,") != std::string::npos);
+    CHECK(csv.find("1,9,0,") != std::string::npos);
+
+    FiberTraceConstraintReport visualConstraints;
+    visualConstraints.pieces.resize(5);
+    for (std::size_t index = 0; index < 5; ++index) {
+        visualConstraints.pieces[index].traceIndex = index;
+        visualConstraints.pieces[index].samplePointsBaseXYZ = {
+            {static_cast<double>(index), 0.0, 0.0},
+            {static_cast<double>(index), 1.0, 0.0},
+        };
+    }
+    FiberTraceLabelingReport visualLabels;
+    visualLabels.activeValues = {0.9, 0.7, 0.8, 0.4, 0.6};
+    visualLabels.verticalValues = {0.4, 0.5, 0.49, 1.0, 1.0};
+    visualLabels.oddValues = {0.4, 0.49, 0.5, 1.0, 1.0};
+    const auto visual = writeFiberTraceLabelRelaxationObjs(
+        visualConstraints, visualLabels, directory.path / "crop.labels");
+    CHECK(visual.activeThreshold == doctest::Approx(0.68));
+    CHECK(visual.objects.paths.hEven.filename() ==
+          "crop_relaxation_h_even.obj");
+    CHECK(visual.objects.paths.broken.filename() ==
+          "crop_relaxation_broken.obj");
+    CHECK(visual.objects.pieceCounts[0] == 1);
+    CHECK(visual.objects.pieceCounts[1] == 1);
+    CHECK(visual.objects.pieceCounts[2] == 1);
+    CHECK(visual.objects.pieceCounts[3] == 0);
+    CHECK(visual.objects.pieceCounts[4] == 2);
+}
+
+TEST_CASE("Trace labeling rejects LP backend controls outside relaxation mode")
+{
+    FiberTraceConstraintReport constraints;
+    FiberTraceLabelingConfig config;
+    config.lpParallel = true;
+    CHECK_THROWS_WITH_AS(
+        solveFiberTraceLabels(constraints, config),
+        doctest::Contains("LP solver options require relaxation mode"),
+        std::invalid_argument);
+
+    config.lpParallel = false;
+    config.relaxIntegrality = true;
+    config.lpSolver = "invalid";
+    CHECK_THROWS_WITH_AS(
+        solveFiberTraceLabels(constraints, config),
+        doctest::Contains("LP solver must be choose, simplex, hipo, or ipm"),
+        std::invalid_argument);
+}
+
+TEST_CASE("Trace labeling LP enforces triangle-consistent differences")
+{
+    FiberTraceConstraintReport constraints;
+    constraints.pieces.resize(3);
+    const auto addDifferentPreferred = [&](std::size_t a, std::size_t b) {
+        constraints.constraints.push_back({
+            a, b, 0.0, 0.0,
+            {static_cast<double>(a), 0.0, 0.0},
+            {static_cast<double>(b), 0.0, 0.0},
+            1.0, 0.0, 1.0, 1.0, false});
+    };
+    addDifferentPreferred(0, 1);
+    addDifferentPreferred(0, 2);
+    addDifferentPreferred(1, 2);
+
+    FiberTraceLabelingConfig config;
+    config.parallelThreads = 1;
+    config.relaxIntegrality = true;
+    config.brokenCostPerConstraint = 100.0;
+    const auto labeling = solveFiberTraceLabels(constraints, config);
+    CHECK(labeling.integerVariables == 0);
+    CHECK(labeling.gaugeRoots == 1);
+    CHECK(labeling.triangles == 1);
+    CHECK(labeling.triangleRows == 8);
+    CHECK(labeling.rows == 53);
+    CHECK(labeling.objective == doctest::Approx(2.0));
+    CHECK(labeling.orientationCost == doctest::Approx(1.0));
+    CHECK(labeling.windingCost == doctest::Approx(1.0));
+    CHECK(labeling.brokenCost == doctest::Approx(0.0));
+    CHECK(labeling.verticalValues[0] == doctest::Approx(0.0));
+    CHECK(labeling.oddValues[0] == doctest::Approx(0.0));
+    for (const double active : labeling.activeValues)
+        CHECK(active == doctest::Approx(1.0));
+
+    config.brokenCostPerConstraint = 0.1;
+    const auto withBrokenVertex = solveFiberTraceLabels(constraints, config);
+    CHECK(withBrokenVertex.objective == doctest::Approx(0.1));
+    CHECK(withBrokenVertex.activeValues[0] == doctest::Approx(0.5));
+    CHECK(withBrokenVertex.activeValues[1] == doctest::Approx(1.0));
+    CHECK(withBrokenVertex.activeValues[2] == doctest::Approx(1.0));
+    CHECK(withBrokenVertex.verticalValues[0] == doctest::Approx(0.0));
+    CHECK(withBrokenVertex.oddValues[0] == doctest::Approx(0.0));
 }

@@ -1,5 +1,13 @@
 # Changelog
 
+- Added an explicit crop-fiber LP-relaxation diagnostic with raw continuous
+  active, H/V, and parity values in CSV, stable gated XOR edge variables,
+  component gauges, triangle consistency cuts, console quantiles, and five
+  explicitly thresholded relaxation OBJ layers.
+- Added explicit HiGHS parallel-mode and solver selection for the crop-fiber LP
+  diagnostic so automatic, simplex, HiPO, and IPM behavior can be benchmarked
+  without changing the model or MILP defaults.
+
 ## 2026-08-26
 
 - Added report-only H/V constraint extraction from durable Fiberlet crop-trace

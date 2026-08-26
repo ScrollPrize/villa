@@ -4743,3 +4743,33 @@
   carries stable piece, source-trace, and trace-local piece IDs. Reports include
   objective, orientation/winding/broken decomposition, model dimensions, MIP
   nodes and gap, solve time, and all five label counts.
+- `--lp-relaxation` makes the three piece columns continuous on `[0,1]` and
+  writes raw active, H/V, and parity values to
+  `<output-stem>_relaxation.csv`; it must not threshold, repair, or emit the
+  five MILP label OBJs. It additionally emits diagnostic threshold layers with
+  `_relaxation_` before the five label suffixes: V and odd own exact `0.5`, and
+  active owns values at or above the mean activity. Values below the mean are
+  shown as broken. These layers must be identified as visualization rather
+  than an integer solution. Every link-local H/V and parity difference has one
+  stable meaning: zero for an inactive link, otherwise zero for matching
+  endpoint labels and one for differing endpoint labels. Its full gated XOR
+  hull remains exact whenever piece values are binary, including signed direct
+  objective coefficients.
+- The lowest piece in each input graph component has only its H/V and parity
+  upper bounds fixed to zero; its active value remains free. This removes the
+  global flip when the root is active without changing solutions in which it
+  is broken. LP mode enumerates every graph triangle and adds four gated
+  cut-polytope inequalities separately for H/V and parity. All-active triangles
+  obey ordinary XOR consistency; with a broken vertex, the opposite active
+  edge remains free to differ. Reports include gauge-root, triangle, and
+  triangle-row counts. Materializing every triangle is a diagnostic and may
+  become impractical on dense crops; no silent subset or cap is permitted.
+- LP backend selection is explicit and diagnostic-only. `--lp-parallel`
+  requests HiGHS parallel LP execution and `--lp-solver` accepts `choose`,
+  `simplex`, `hipo`, or `ipm`; both require `--lp-relaxation`. The default
+  remains HiGHS automatic solver and parallel selection (`choose`). Reports
+  identify the requested solver, requested parallel mode, and thread count,
+  not the backend HiGHS ultimately selected. These options do not alter the
+  integer labeling path or the LP formulation.
+  A requested backend that is unavailable in the linked HiGHS build must fail
+  explicitly; it must not silently substitute a different solver.

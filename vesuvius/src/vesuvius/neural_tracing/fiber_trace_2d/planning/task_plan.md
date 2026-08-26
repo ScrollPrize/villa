@@ -78,3 +78,60 @@ interpretation of broken pieces.
 
 Add crop-trace MILP labeling and five-way OBJ visualization to the 2026-08-26
 entry in `volume-cartographer/planning/changelog.md`.
+
+## LP-relaxation tightening follow-up
+
+14. Replace each edge-dependent expensive-relation auxiliary with a stable
+    gated H/V or parity XOR variable: zero means equal active endpoint labels,
+    one means different active endpoint labels, and a broken endpoint gates the
+    value to zero. Use the direct signed objective coefficient; binary feasible
+    assignments and costs must remain identical.
+15. Build deterministic piece adjacency and bound the H/V and parity columns of
+    the lowest piece in each input connected component to zero without fixing
+    its active column. This is objective preserving; if that root is broken it
+    deliberately does not remove the remaining split-component symmetry. For
+    LP relaxation only, enumerate graph triangles once and add the four
+    cut-polytope triangle inequalities independently for H/V and parity. Gate
+    each edge inequality with the sum of the three active values, so one broken
+    vertex still permits the opposite active edge to differ.
+16. Report the number of gauge components, triangles, and triangle rows. Keep
+    raw continuous piece values in CSV without thresholding or repair.
+17. Add exact small-graph tests proving unchanged binary costs, gated broken
+    behavior, rejection of the impossible three-differences triangle, and
+    deterministic gauge fixing. Run GCC focused tests and compare 256 and 1024
+    crop LP distributions, objectives, row counts, wall time, and memory.
+18. Reuse the five-way piece OBJ writer for an explicitly diagnostic relaxed
+    classification: active values at or above their mean survive, V and odd
+    own exact `0.5`, and all lower-activity pieces are shown as broken. Prefix
+    the five suffixes with `_relaxation_`, report the mean, and test exact
+    threshold ownership and class counts.
+19. Add relaxation-only CLI/config controls for HiGHS parallel execution and
+    solver choice (`choose`, `simplex`, `hipo`, or `ipm`). Reject their use on
+    the MILP path, report the requested backend, and retain HiGHS automatic LP
+    selection as the default.
+20. Build and run focused tests, then benchmark the same centered 384-base-
+    voxel artifact sequentially with parallel automatic selection and parallel
+    HiPO. Record wall/CPU time, peak RSS, objective, status, and visualization
+    artifacts without changing the LP formulation.
+
+The gated difference hull is explicit: `difference <= pair_active`, the two
+signed endpoint lower bounds receive `pair_active - 1`, and the two XOR upper
+bounds are `difference <= x_a + x_b` and
+`difference <= 2 - x_a - x_b`. The direct coefficient is
+`different_cost - same_cost`, so both positive and negative cost signs retain
+the exact binary objective.
+
+### Follow-up spec update
+
+Document the stable gated-difference semantics, component gauge, LP-only
+triangle cycle inequalities, their broken-piece gating, and new diagnostics.
+
+### Follow-up documentation update
+
+Explain why the local XOR envelope admitted the all-half solution, what the
+triangle inequalities guarantee, and that longer-cycle cuts remain a possible
+next tightening step if triangles are insufficient.
+
+Document the explicit LP backend controls, their diagnostic-only scope, and
+the fact that HiGHS may still choose a serial algorithm unless parallel mode or
+HiPO is requested.

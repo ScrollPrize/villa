@@ -19,6 +19,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -64,7 +65,8 @@ void usage(const char* executable)
               << "  " << executable
               << " constraints <traces.zarr> --normal-manifest PATH"
                  " [--output BASENAME] [--broken-cost-per-link COST]"
-                 " [--mip-gap FRACTION] [options]\n\n"
+                 " [--mip-gap FRACTION] [--lp-relaxation]"
+                 " [--lp-parallel] [--lp-solver NAME] [options]\n\n"
               << "Trace options:\n"
               << "  --obj PATH                 line OBJ; defaults beside trace Zarr\n"
               << "  --volume PATH              concrete uint8 CT Zarr group\n"
@@ -86,6 +88,9 @@ void usage(const char* executable)
               << "  --max-distance N           closest-pair threshold [128]\n"
               << "  --tangent-window N         centered tangent secant length [32]\n"
               << "  --winding-step N           Lasagna connector integration step [8]\n"
+              << "  --lp-relaxation            solve continuous [0,1] label relaxation\n"
+              << "  --lp-parallel              request HiGHS parallel LP execution\n"
+              << "  --lp-solver NAME           choose, simplex, hipo, or ipm [choose]\n"
               << "  --threads N                scoring workers [host CPUs]\n"
               << "  --cache-gib N              decoded normal cache [8]\n";
 }
@@ -219,6 +224,21 @@ Options parse(int argc, char** argv)
             if (options.labeling.relativeMipGap < 0.0)
                 fail("--mip-gap must be nonnegative");
             options.hasConstraintOnlyOption = true;
+        } else if (argument == "--lp-relaxation") {
+            options.labeling.relaxIntegrality = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--lp-parallel") {
+            options.labeling.lpParallel = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--lp-solver") {
+            options.labeling.lpSolver = value(index, argc, argv, "--lp-solver");
+            if (options.labeling.lpSolver != "choose" &&
+                options.labeling.lpSolver != "simplex" &&
+                options.labeling.lpSolver != "hipo" &&
+                options.labeling.lpSolver != "ipm") {
+                fail("--lp-solver must be choose, simplex, hipo, or ipm");
+            }
+            options.hasConstraintOnlyOption = true;
         } else if (argument == "--help" || argument == "-h") {
             usage(argv[0]);
             std::exit(0);
@@ -245,6 +265,10 @@ Options parse(int argc, char** argv)
     if (options.mode == Mode::Constraints) {
         if (options.hasTraceOnlyOption)
             fail("constraints does not accept trace-only options");
+        if (!options.labeling.relaxIntegrality &&
+            (options.labeling.lpParallel || options.labeling.lpSolver != "choose")) {
+            fail("--lp-parallel and --lp-solver require --lp-relaxation");
+        }
         if (options.output.empty()) {
             const std::string stem = options.input.has_extension()
                 ? options.input.stem().string()
@@ -373,6 +397,53 @@ void printLabelingReport(
     }
 }
 
+void printRelaxedLabelingReport(
+    const vc::fiber_tracer::FiberTraceLabelingReport& report,
+    const vc::fiber_tracer::FiberTraceLabelingConfig& config,
+    const std::filesystem::path& csv,
+    const vc::fiber_tracer::FiberTraceRelaxationObjReport& visualization)
+{
+    std::cout << std::setprecision(8)
+              << "fiber trace labeling LP relaxation\n"
+              << "status  requested_solver  requested_parallel  threads  objective  orientation_cost  winding_cost  broken_cost  broken_cost_per_link  variables  rows  gauge_roots  triangles  triangle_rows  solve_seconds  csv\n"
+              << report.modelStatus << "  " << config.lpSolver << "  "
+              << (config.lpParallel ? "on" : "choose") << "  "
+              << config.parallelThreads << "  " << report.objective << "  "
+              << report.orientationCost << "  " << report.windingCost << "  "
+              << report.brokenCost << "  " << config.brokenCostPerConstraint
+              << "  " << report.variables << "  " << report.rows << "  "
+              << report.gaugeRoots << "  " << report.triangles << "  "
+              << report.triangleRows << "  "
+              << report.solveSeconds << "  " << csv << '\n'
+              << "fiber trace labeling LP variable quantiles\n"
+              << "quantile  active  vertical  odd\n";
+    for (int percentile = 0; percentile <= 100; percentile += 10) {
+        const double fraction = static_cast<double>(percentile) / 100.0;
+        std::cout << percentile << "  "
+                  << quantile(report.activeValues, fraction) << "  "
+                  << quantile(report.verticalValues, fraction) << "  "
+                  << quantile(report.oddValues, fraction) << '\n';
+    }
+    const std::array<const char*, 5> names{
+        "h_even", "h_odd", "v_even", "v_odd", "broken"};
+    const std::array<std::filesystem::path, 5> paths{
+        visualization.objects.paths.hEven,
+        visualization.objects.paths.hOdd,
+        visualization.objects.paths.vEven,
+        visualization.objects.paths.vOdd,
+        visualization.objects.paths.broken,
+    };
+    std::cout << "fiber trace labeling LP threshold visualization\n"
+              << "active_threshold  vertical_threshold  odd_threshold\n"
+              << visualization.activeThreshold << "  0.5  0.5\n"
+              << "label  pieces  path\n";
+    for (std::size_t index = 0; index < names.size(); ++index) {
+        std::cout << names[index] << "  "
+                  << visualization.objects.pieceCounts[index] << "  "
+                  << paths[index] << '\n';
+    }
+}
+
 void printConstraintObjReport(
     const vc::fiber_tracer::FiberTraceConstraintObjReport& report)
 {
@@ -474,9 +545,20 @@ int main(int argc, char** argv)
                     report, options.output);
             const auto labeling = vc::fiber_tracer::solveFiberTraceLabels(
                 report, options.labeling);
-            const auto labelObjReport =
-                vc::fiber_tracer::writeFiberTraceLabelObjs(
+            std::optional<vc::fiber_tracer::FiberTraceLabelObjReport> labelObjReport;
+            std::optional<std::filesystem::path> relaxationCsv;
+            std::optional<vc::fiber_tracer::FiberTraceRelaxationObjReport>
+                relaxationVisualization;
+            if (options.labeling.relaxIntegrality) {
+                relaxationCsv = vc::fiber_tracer::writeFiberTraceLabelRelaxationCsv(
                     report, labeling, options.output);
+                relaxationVisualization =
+                    vc::fiber_tracer::writeFiberTraceLabelRelaxationObjs(
+                        report, labeling, options.output);
+            } else {
+                labelObjReport = vc::fiber_tracer::writeFiberTraceLabelObjs(
+                    report, labeling, options.output);
+            }
             const double wallSeconds = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - started).count();
             const double cpuSeconds = static_cast<double>(
@@ -488,7 +570,16 @@ int main(int argc, char** argv)
                 wallSeconds,
                 cpuSeconds);
             printConstraintObjReport(objReport);
-            printLabelingReport(labeling, options.labeling, labelObjReport);
+            if (relaxationCsv) {
+                printRelaxedLabelingReport(
+                    labeling,
+                    options.labeling,
+                    *relaxationCsv,
+                    *relaxationVisualization);
+            } else {
+                printLabelingReport(
+                    labeling, options.labeling, *labelObjReport);
+            }
             return 0;
         }
         if (options.mode == Mode::Visualize) {

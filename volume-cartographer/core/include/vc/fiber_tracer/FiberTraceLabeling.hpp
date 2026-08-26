@@ -24,14 +24,23 @@ struct FiberTraceLabelingConfig {
     double brokenCostPerConstraint = 0.5;
     double relativeMipGap = 1.0e-4;
     std::size_t parallelThreads = 0;
+    bool relaxIntegrality = false;
+    bool lpParallel = false;
+    std::string lpSolver = "choose";
 };
 
 struct FiberTraceLabelingReport {
     std::vector<FiberTracePieceLabel> labels;
+    std::vector<double> activeValues;
+    std::vector<double> verticalValues;
+    std::vector<double> oddValues;
     std::array<std::size_t, 5> labelCounts{};
     std::size_t variables = 0;
     std::size_t integerVariables = 0;
     std::size_t rows = 0;
+    std::size_t gaugeRoots = 0;
+    std::size_t triangles = 0;
+    std::size_t triangleRows = 0;
     std::int64_t mipNodes = 0;
     double objective = 0.0;
     double orientationCost = 0.0;
@@ -55,6 +64,11 @@ struct FiberTraceLabelObjReport {
     std::array<std::size_t, 5> pieceCounts{};
 };
 
+struct FiberTraceRelaxationObjReport {
+    FiberTraceLabelObjReport objects;
+    double activeThreshold = 0.0;
+};
+
 [[nodiscard]] FiberTraceLabelingReport solveFiberTraceLabels(
     const FiberTraceConstraintReport& constraints,
     const FiberTraceLabelingConfig& config = {});
@@ -63,6 +77,19 @@ struct FiberTraceLabelObjReport {
     const std::filesystem::path& outputBase);
 
 [[nodiscard]] FiberTraceLabelObjReport writeFiberTraceLabelObjs(
+    const FiberTraceConstraintReport& constraints,
+    const FiberTraceLabelingReport& labeling,
+    const std::filesystem::path& outputBase);
+
+[[nodiscard]] std::filesystem::path fiberTraceLabelRelaxationCsvPath(
+    const std::filesystem::path& outputBase);
+
+[[nodiscard]] std::filesystem::path writeFiberTraceLabelRelaxationCsv(
+    const FiberTraceConstraintReport& constraints,
+    const FiberTraceLabelingReport& labeling,
+    const std::filesystem::path& outputBase);
+
+[[nodiscard]] FiberTraceRelaxationObjReport writeFiberTraceLabelRelaxationObjs(
     const FiberTraceConstraintReport& constraints,
     const FiberTraceLabelingReport& labeling,
     const std::filesystem::path& outputBase);

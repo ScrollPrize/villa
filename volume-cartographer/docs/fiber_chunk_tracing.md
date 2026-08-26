@@ -120,6 +120,49 @@ relative-gap proof, and the achieved gap is reported. Within each active connect
 global H/V and parity flips are canonicalized so its lowest piece ID is
 H/even. Isolated pieces with no evidence are broken.
 
+Pass `--lp-relaxation` to replace the three binary piece variables by
+continuous `[0,1]` variables while retaining the same linear objective and
+constraint envelopes. The command does not threshold or canonicalize that
+solution and does not write the five discrete label OBJs. Instead it writes
+`<output-stem>_relaxation.csv` with stable piece, trace, and within-trace piece
+IDs followed by the raw `active`, `vertical`, and `odd` values. Console output
+reports deciles for each variable. This mode is a diagnostic of relaxation
+strength, not a discrete labeling.
+
+For direct inspection, LP mode also thresholds the raw values into five OBJ
+layers. `vertical >= 0.5` selects V, `odd >= 0.5` selects odd, and
+`active >= mean(active)` selects an active label; lower activity is broken.
+The literal suffixes are `_relaxation_h_even.obj`,
+`_relaxation_h_odd.obj`, `_relaxation_v_even.obj`,
+`_relaxation_v_odd.obj`, and `_relaxation_broken.obj`. The report prints the
+actual mean activity threshold and every class count. These layers are only a
+threshold visualization and are not presented as an optimized integer result.
+
+LP edges use a stable gated XOR value for each label family: it is zero when
+either endpoint is broken, otherwise zero means equal labels and one means
+different labels. The lowest piece in each input connected component has H/V
+and parity fixed to zero, but remains free to become broken. Every graph
+triangle receives the four cut-polytope inequalities for H/V and again for
+parity. These prohibit three mutually different binary relations around a
+triangle while allowing the remaining active edge to differ if the third
+piece is broken. Reports include gauge-root, triangle, and triangle-row counts.
+All triangles are materialized deterministically; this diagnostic can consume
+substantial time and memory on dense crops and does not silently omit cuts.
+
+HiGHS' LP backend can be selected explicitly for this diagnostic. Add
+`--lp-parallel` to request parallel execution, and use `--lp-solver choose`,
+`simplex`, `hipo`, or `ipm` to select the LP algorithm. These flags require
+`--lp-relaxation`; they do not apply to the MILP. The default remains HiGHS
+automatic solver and parallel selection (`choose`), which may choose serial
+simplex even when `--threads` is greater than one. The relaxation report prints
+the requested solver, requested parallel mode, and thread count; CPU-versus-wall
+measurements are needed to determine whether the selected algorithm ran in
+parallel.
+Backend availability depends on how HiGHS was built. In particular, a HiGHS
+CLI may advertise `hipo` even when its linked build lacks the linear-algebra
+backends required to select it; that condition is reported as an error rather
+than silently falling back to another solver.
+
 Only the three piece columns are integer. Pair-active and gated difference
 columns are continuous in `[0,1]`; their exact AND/XOR linear envelopes force
 binary values for binary endpoints, avoiding three unnecessary integer columns

@@ -13,3 +13,16 @@
 - [ ] Build and test Clang (not run before the requested wrap-up).
 - [ ] Complete the representative default-radius Release solve (stopped after
   183.66 seconds; dense MILP scalability remains unresolved).
+- [x] Measure the untightened LP on centered 256 and 1024 crops.
+- [x] Update task and task plan for stable XOR variables and triangle cuts.
+- [x] Complete independent review of the LP-tightening plan.
+- [x] Implement stable gated differences, component gauges, and triangle cuts.
+- [x] Add focused triangle/gauge regression tests.
+- [x] Update specs, documentation, changelog, status, and task log.
+- [x] Build and run focused GCC tests.
+- [x] Benchmark tightened LP on centered 256/384 and attempt 512/1024 crops.
+- [x] Add and document thresholded five-layer LP OBJ visualization.
+- [x] Add explicit relaxation-only HiGHS parallel and solver controls.
+- [x] Benchmark parallel automatic LP selection on the centered 384 crop.
+- [x] Attempt parallel HiPO on the centered 384 crop and record the linked
+  build's missing-backend failure.

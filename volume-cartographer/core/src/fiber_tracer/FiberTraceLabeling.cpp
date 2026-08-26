@@ -7,7 +7,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <fstream>
+#include <iomanip>
 #include <limits>
+#include <numeric>
 #include <queue>
 #include <stdexcept>
 #include <thread>
@@ -95,6 +98,108 @@ struct RowBuilder {
     }
 };
 
+struct NeighborEdge {
+    std::size_t neighbor = 0;
+    std::size_t edge = 0;
+};
+
+struct ConstraintTriangle {
+    std::array<std::size_t, 3> pieces{};
+    std::array<std::size_t, 3> edges{};
+};
+
+std::vector<std::vector<NeighborEdge>> buildAdjacency(
+    const FiberTraceConstraintReport& constraints)
+{
+    std::vector<std::vector<NeighborEdge>> adjacency(constraints.pieces.size());
+    for (std::size_t edge = 0; edge < constraints.constraints.size(); ++edge) {
+        const auto& constraint = constraints.constraints[edge];
+        adjacency[constraint.pieceA].push_back({constraint.pieceB, edge});
+        adjacency[constraint.pieceB].push_back({constraint.pieceA, edge});
+    }
+    for (auto& neighbors : adjacency) {
+        std::sort(
+            neighbors.begin(), neighbors.end(),
+            [](const NeighborEdge& left, const NeighborEdge& right) {
+                return std::tie(left.neighbor, left.edge) <
+                    std::tie(right.neighbor, right.edge);
+            });
+        for (std::size_t index = 1; index < neighbors.size(); ++index) {
+            if (neighbors[index - 1].neighbor == neighbors[index].neighbor) {
+                throw std::invalid_argument(
+                    "Fiber trace labeling graph contains duplicate piece pairs");
+            }
+        }
+    }
+    return adjacency;
+}
+
+std::vector<std::size_t> componentRoots(
+    const std::vector<std::vector<NeighborEdge>>& adjacency)
+{
+    std::vector<std::size_t> roots;
+    std::vector<unsigned char> visited(adjacency.size(), 0);
+    std::queue<std::size_t> pending;
+    for (std::size_t seed = 0; seed < adjacency.size(); ++seed) {
+        if (visited[seed])
+            continue;
+        roots.push_back(seed);
+        visited[seed] = 1;
+        pending.push(seed);
+        while (!pending.empty()) {
+            const std::size_t piece = pending.front();
+            pending.pop();
+            for (const auto& neighbor : adjacency[piece]) {
+                if (!visited[neighbor.neighbor]) {
+                    visited[neighbor.neighbor] = 1;
+                    pending.push(neighbor.neighbor);
+                }
+            }
+        }
+    }
+    return roots;
+}
+
+std::vector<ConstraintTriangle> enumerateTriangles(
+    const std::vector<std::vector<NeighborEdge>>& adjacency)
+{
+    std::vector<ConstraintTriangle> triangles;
+    for (std::size_t a = 0; a < adjacency.size(); ++a) {
+        const auto& neighborsA = adjacency[a];
+        for (const auto& ab : neighborsA) {
+            const std::size_t b = ab.neighbor;
+            if (b <= a)
+                continue;
+            const auto& neighborsB = adjacency[b];
+            auto ac = std::upper_bound(
+                neighborsA.begin(), neighborsA.end(), b,
+                [](std::size_t value, const NeighborEdge& entry) {
+                    return value < entry.neighbor;
+                });
+            auto bc = std::upper_bound(
+                neighborsB.begin(), neighborsB.end(), b,
+                [](std::size_t value, const NeighborEdge& entry) {
+                    return value < entry.neighbor;
+                });
+            while (ac != neighborsA.end() && bc != neighborsB.end()) {
+                if (ac->neighbor < bc->neighbor) {
+                    ++ac;
+                } else if (bc->neighbor < ac->neighbor) {
+                    ++bc;
+                } else {
+                    triangles.push_back({
+                        {a, b, ac->neighbor},
+                        {ab.edge, ac->edge, bc->edge},
+                    });
+                    ++ac;
+                    ++bc;
+                }
+            }
+        }
+    }
+    return triangles;
+}
+
 void canonicalizeLabels(
     std::vector<FiberTracePieceLabel>& labels,
     const FiberTraceConstraintReport& constraints,
@@ -168,11 +273,22 @@ FiberTraceLabelingReport solveFiberTraceLabels(
         throw std::invalid_argument(
             "Fiber trace labeling relative MIP gap must be finite and nonnegative");
     }
+    if (config.lpSolver != "choose" && config.lpSolver != "simplex" &&
+        config.lpSolver != "hipo" && config.lpSolver != "ipm") {
+        throw std::invalid_argument(
+            "Fiber trace LP solver must be choose, simplex, hipo, or ipm");
+    }
+    if (!config.relaxIntegrality &&
+        (config.lpParallel || config.lpSolver != "choose")) {
+        throw std::invalid_argument(
+            "Fiber trace LP solver options require relaxation mode");
+    }
 
     const std::size_t pieceCount = constraints.pieces.size();
     const std::size_t edgeCount = constraints.constraints.size();
     FiberTraceLabelingReport report;
-    report.labels.assign(pieceCount, FiberTracePieceLabel::Broken);
+    if (!config.relaxIntegrality)
+        report.labels.assign(pieceCount, FiberTracePieceLabel::Broken);
     if (pieceCount == 0) {
         report.modelStatus = "Empty";
         return report;
@@ -196,6 +312,11 @@ FiberTraceLabelingReport solveFiberTraceLabels(
         ++degree[constraint.pieceA];
         ++degree[constraint.pieceB];
     }
+    const auto adjacency = buildAdjacency(constraints);
+    const auto gaugeRoots = componentRoots(adjacency);
+    const auto triangles = config.relaxIntegrality
+        ? enumerateTriangles(adjacency)
+        : std::vector<ConstraintTriangle>{};
 
     const std::size_t activeBase = 0;
     const std::size_t verticalBase = pieceCount;
@@ -212,17 +333,27 @@ FiberTraceLabelingReport solveFiberTraceLabels(
     lp.col_lower_.assign(variableCount, 0.0);
     lp.col_upper_.assign(variableCount, 1.0);
     lp.integrality_.assign(variableCount, HighsVarType::kContinuous);
-    std::fill_n(
-        lp.integrality_.begin(), 3 * pieceCount, HighsVarType::kInteger);
+    if (!config.relaxIntegrality) {
+        std::fill_n(
+            lp.integrality_.begin(), 3 * pieceCount, HighsVarType::kInteger);
+    }
     lp.offset_ = 0.0;
     lp.sense_ = ObjSense::kMinimize;
+    for (const std::size_t root : gaugeRoots) {
+        lp.col_upper_[verticalBase + root] = 0.0;
+        lp.col_upper_[oddBase + root] = 0.0;
+    }
 
     RowBuilder rows;
-    rows.lower.reserve(2 * pieceCount + 7 * edgeCount);
-    rows.upper.reserve(2 * pieceCount + 7 * edgeCount);
-    rows.starts.reserve(2 * pieceCount + 7 * edgeCount + 1);
-    rows.indices.reserve(4 * pieceCount + 28 * edgeCount);
-    rows.values.reserve(4 * pieceCount + 28 * edgeCount);
+    const std::size_t expectedRows =
+        2 * pieceCount + 13 * edgeCount + 8 * triangles.size();
+    rows.lower.reserve(expectedRows);
+    rows.upper.reserve(expectedRows);
+    rows.starts.reserve(expectedRows + 1);
+    rows.indices.reserve(
+        4 * pieceCount + 46 * edgeCount + 48 * triangles.size());
+    rows.values.reserve(
+        4 * pieceCount + 46 * edgeCount + 48 * triangles.size());
 
     for (std::size_t piece = 0; piece < pieceCount; ++piece) {
         const double penalty = config.brokenCostPerConstraint *
@@ -248,9 +379,7 @@ FiberTraceLabelingReport solveFiberTraceLabels(
         const double windingSame = constraint.windingDistance;
         const double windingDifferent =
             std::abs(1.0 - constraint.windingDistance);
-        lp.col_cost_[pair] =
-            std::min(orientationSame, orientationDifferent) +
-            std::min(windingSame, windingDifferent);
+        lp.col_cost_[pair] = orientationSame + windingSame;
 
         rows.add(-kHighsInf, 0.0,
             {{pair, 1.0}, {activeBase + a, -1.0}});
@@ -259,39 +388,64 @@ FiberTraceLabelingReport solveFiberTraceLabels(
         rows.add(-1.0, kHighsInf,
             {{pair, 1.0}, {activeBase + a, -1.0}, {activeBase + b, -1.0}});
 
-        const auto addGatedRelation = [&](std::size_t relation,
-                                           std::size_t valueBase,
-                                           double sameCost,
-                                           double differentCost) {
-            lp.col_cost_[relation] = std::abs(differentCost - sameCost);
-            if (differentCost == sameCost) {
-                lp.col_upper_[relation] = 0.0;
-            } else if (differentCost > sameCost) {
-                rows.add(-1.0, kHighsInf, {
-                    {relation, 1.0}, {valueBase + a, -1.0},
-                    {valueBase + b, 1.0}, {pair, -1.0}});
-                rows.add(-1.0, kHighsInf, {
-                    {relation, 1.0}, {valueBase + a, 1.0},
-                    {valueBase + b, -1.0}, {pair, -1.0}});
-            } else {
-                rows.add(0.0, kHighsInf, {
-                    {relation, 1.0}, {valueBase + a, 1.0},
-                    {valueBase + b, 1.0}, {pair, -1.0}});
-                rows.add(-2.0, kHighsInf, {
-                    {relation, 1.0}, {valueBase + a, -1.0},
-                    {valueBase + b, -1.0}, {pair, -1.0}});
-            }
+        const auto addGatedDifference = [&](std::size_t difference,
+                                             std::size_t valueBase,
+                                             double sameCost,
+                                             double differentCost) {
+            lp.col_cost_[difference] = differentCost - sameCost;
+            rows.add(-kHighsInf, 0.0, {
+                {difference, 1.0}, {pair, -1.0}});
+            rows.add(-1.0, kHighsInf, {
+                {difference, 1.0}, {valueBase + a, -1.0},
+                {valueBase + b, 1.0}, {pair, -1.0}});
+            rows.add(-1.0, kHighsInf, {
+                {difference, 1.0}, {valueBase + a, 1.0},
+                {valueBase + b, -1.0}, {pair, -1.0}});
+            rows.add(-kHighsInf, 0.0, {
+                {difference, 1.0}, {valueBase + a, -1.0},
+                {valueBase + b, -1.0}});
+            rows.add(-kHighsInf, 2.0, {
+                {difference, 1.0}, {valueBase + a, 1.0},
+                {valueBase + b, 1.0}});
         };
-        addGatedRelation(
+        addGatedDifference(
             verticalDifference,
             verticalBase,
             orientationSame,
             orientationDifferent);
-        addGatedRelation(
+        addGatedDifference(
             oddDifference,
             oddBase,
             windingSame,
             windingDifferent);
+    }
+
+    const auto addTriangleCuts = [&](const ConstraintTriangle& triangle,
+                                      std::size_t differenceBase) {
+        const std::array<std::size_t, 3> differences{
+            differenceBase + triangle.edges[0],
+            differenceBase + triangle.edges[1],
+            differenceBase + triangle.edges[2],
+        };
+        for (std::size_t edge = 0; edge < 3; ++edge) {
+            rows.add(-kHighsInf, 3.0, {
+                {differences[edge], 1.0},
+                {differences[(edge + 1) % 3], -1.0},
+                {differences[(edge + 2) % 3], -1.0},
+                {activeBase + triangle.pieces[0], 1.0},
+                {activeBase + triangle.pieces[1], 1.0},
+                {activeBase + triangle.pieces[2], 1.0},
+            });
+        }
+        rows.add(-kHighsInf, 2.0, {
+            {differences[0], 1.0},
+            {differences[1], 1.0},
+            {differences[2], 1.0},
+        });
+    };
+    for (const auto& triangle : triangles) {
+        addTriangleCuts(triangle, verticalDifferenceBase);
+        addTriangleCuts(triangle, oddDifferenceBase);
     }
 
     lp.num_row_ = checkedHighsInt(rows.lower.size(), "MILP row count");
@@ -306,7 +460,6 @@ FiberTraceLabelingReport solveFiberTraceLabels(
     const std::size_t rowCount = static_cast<std::size_t>(lp.num_row_);
 
     Highs highs;
-    requireOk(highs.setOptionValue("output_flag", false), "disable solver output");
     requireOk(highs.setOptionValue("random_seed", HighsInt{0}), "set random seed");
     requireOk(
         highs.setOptionValue("mip_rel_gap", config.relativeMipGap),
@@ -318,6 +471,15 @@ FiberTraceLabelingReport solveFiberTraceLabels(
     requireOk(
         highs.setOptionValue("threads", checkedHighsInt(requestedThreads, "thread count")),
         "set solver thread count");
+    if (config.relaxIntegrality) {
+        requireOk(
+            highs.setOptionValue("parallel", config.lpParallel ? "on" : "choose"),
+            "set LP parallel mode");
+        requireOk(
+            highs.setOptionValue("solver", config.lpSolver),
+            "set LP solver");
+    }
+    requireOk(highs.setOptionValue("output_flag", false), "disable solver output");
     requireOk(highs.passModel(std::move(model)), "load labeling model");
     const auto solveStarted = std::chrono::steady_clock::now();
     requireOk(highs.run(), "solve labeling model");
@@ -332,7 +494,24 @@ FiberTraceLabelingReport solveFiberTraceLabels(
     }
 
     const auto& solution = highs.getSolution().col_value;
+    report.activeValues.resize(pieceCount);
+    report.verticalValues.resize(pieceCount);
+    report.oddValues.resize(pieceCount);
     for (std::size_t piece = 0; piece < pieceCount; ++piece) {
+        const auto readRelaxed = [&](std::size_t index) {
+            if (index >= solution.size() || !std::isfinite(solution[index]) ||
+                solution[index] < -kBinaryTolerance ||
+                solution[index] > 1.0 + kBinaryTolerance) {
+                throw std::runtime_error(
+                    "HiGHS returned an invalid relaxed labeling solution");
+            }
+            return std::clamp(solution[index], 0.0, 1.0);
+        };
+        report.activeValues[piece] = readRelaxed(activeBase + piece);
+        report.verticalValues[piece] = readRelaxed(verticalBase + piece);
+        report.oddValues[piece] = readRelaxed(oddBase + piece);
+        if (config.relaxIntegrality)
+            continue;
         const bool active = binaryValue(solution, activeBase + piece);
         const bool vertical = binaryValue(solution, verticalBase + piece);
         const bool odd = binaryValue(solution, oddBase + piece);
@@ -342,27 +521,51 @@ FiberTraceLabelingReport solveFiberTraceLabels(
             ? makeLabel(vertical, odd)
             : FiberTracePieceLabel::Broken;
     }
-    canonicalizeLabels(report.labels, constraints, degree);
+    if (!config.relaxIntegrality)
+        canonicalizeLabels(report.labels, constraints, degree);
 
-    for (std::size_t piece = 0; piece < pieceCount; ++piece) {
-        const auto label = report.labels[piece];
-        ++report.labelCounts[labelIndex(label)];
-        if (isBroken(label)) {
+    if (config.relaxIntegrality) {
+        for (std::size_t piece = 0; piece < pieceCount; ++piece) {
             report.brokenCost += config.brokenCostPerConstraint *
-                static_cast<double>(degree[piece]);
+                static_cast<double>(degree[piece]) *
+                (1.0 - report.activeValues[piece]);
         }
-    }
-    for (const auto& constraint : constraints.constraints) {
-        const auto a = report.labels[constraint.pieceA];
-        const auto b = report.labels[constraint.pieceB];
-        if (isBroken(a) || isBroken(b))
-            continue;
-        report.orientationCost += isVertical(a) == isVertical(b)
-            ? 1.0 - constraint.parallelScore
-            : constraint.parallelScore;
-        report.windingCost += isOdd(a) == isOdd(b)
-            ? constraint.windingDistance
-            : std::abs(1.0 - constraint.windingDistance);
+        for (std::size_t edge = 0; edge < edgeCount; ++edge) {
+            const auto& constraint = constraints.constraints[edge];
+            const double pair = solution[pairBase + edge];
+            const double orientationSame = 1.0 - constraint.parallelScore;
+            const double orientationDifferent = constraint.parallelScore;
+            const double windingSame = constraint.windingDistance;
+            const double windingDifferent =
+                std::abs(1.0 - constraint.windingDistance);
+            report.orientationCost += orientationSame * pair +
+                (orientationDifferent - orientationSame) *
+                    solution[verticalDifferenceBase + edge];
+            report.windingCost += windingSame * pair +
+                (windingDifferent - windingSame) *
+                    solution[oddDifferenceBase + edge];
+        }
+    } else {
+        for (std::size_t piece = 0; piece < pieceCount; ++piece) {
+            const auto label = report.labels[piece];
+            ++report.labelCounts[labelIndex(label)];
+            if (isBroken(label)) {
+                report.brokenCost += config.brokenCostPerConstraint *
+                    static_cast<double>(degree[piece]);
+            }
+        }
+        for (const auto& constraint : constraints.constraints) {
+            const auto a = report.labels[constraint.pieceA];
+            const auto b = report.labels[constraint.pieceB];
+            if (isBroken(a) || isBroken(b))
+                continue;
+            report.orientationCost += isVertical(a) == isVertical(b)
+                ? 1.0 - constraint.parallelScore
+                : constraint.parallelScore;
+            report.windingCost += isOdd(a) == isOdd(b)
+                ? constraint.windingDistance
+                : std::abs(1.0 - constraint.windingDistance);
+        }
     }
     report.objective =
         report.brokenCost + report.orientationCost + report.windingCost;
@@ -376,8 +579,11 @@ FiberTraceLabelingReport solveFiberTraceLabels(
     }
 
     report.variables = variableCount;
-    report.integerVariables = 3 * pieceCount;
+    report.integerVariables = config.relaxIntegrality ? 0 : 3 * pieceCount;
     report.rows = rowCount;
+    report.gaugeRoots = gaugeRoots.size();
+    report.triangles = triangles.size();
+    report.triangleRows = 8 * triangles.size();
     report.mipNodes = highs.getInfo().mip_node_count;
     report.mipGap = highs.getInfo().mip_gap;
     return report;
@@ -440,6 +646,80 @@ FiberTraceLabelObjReport writeFiberTraceLabelObjs(
         vc::core::io::writePolylinesObj(lines[group], paths[group], comments[group]);
         result.pieceCounts[group] = lines[group].size();
     }
+    return result;
+}
+
+std::filesystem::path fiberTraceLabelRelaxationCsvPath(
+    const std::filesystem::path& outputBase)
+{
+    const auto directory = outputBase.parent_path();
+    return directory / (outputStem(outputBase) + "_relaxation.csv");
+}
+
+std::filesystem::path writeFiberTraceLabelRelaxationCsv(
+    const FiberTraceConstraintReport& constraints,
+    const FiberTraceLabelingReport& labeling,
+    const std::filesystem::path& outputBase)
+{
+    const std::size_t count = constraints.pieces.size();
+    if (labeling.activeValues.size() != count ||
+        labeling.verticalValues.size() != count ||
+        labeling.oddValues.size() != count) {
+        throw std::invalid_argument(
+            "Fiber trace relaxed label count does not match pieces");
+    }
+    const auto path = fiberTraceLabelRelaxationCsvPath(outputBase);
+    if (!path.parent_path().empty())
+        std::filesystem::create_directories(path.parent_path());
+    std::ofstream output(path);
+    if (!output)
+        throw std::runtime_error("Could not open relaxed labeling CSV: " + path.string());
+    output << "piece_id,trace_index,piece_index,active,vertical,odd\n"
+           << std::setprecision(17);
+    for (std::size_t index = 0; index < count; ++index) {
+        const auto& piece = constraints.pieces[index];
+        output << index << ',' << piece.traceIndex << ',' << piece.pieceIndex
+               << ',' << labeling.activeValues[index]
+               << ',' << labeling.verticalValues[index]
+               << ',' << labeling.oddValues[index] << '\n';
+    }
+    if (!output)
+        throw std::runtime_error("Could not write relaxed labeling CSV: " + path.string());
+    return path;
+}
+
+FiberTraceRelaxationObjReport writeFiberTraceLabelRelaxationObjs(
+    const FiberTraceConstraintReport& constraints,
+    const FiberTraceLabelingReport& labeling,
+    const std::filesystem::path& outputBase)
+{
+    const std::size_t count = constraints.pieces.size();
+    if (count == 0 || labeling.activeValues.size() != count ||
+        labeling.verticalValues.size() != count ||
+        labeling.oddValues.size() != count) {
+        throw std::invalid_argument(
+            "Fiber trace relaxed label count does not match nonempty pieces");
+    }
+    FiberTraceRelaxationObjReport result;
+    result.activeThreshold = std::accumulate(
+        labeling.activeValues.begin(), labeling.activeValues.end(), 0.0) /
+        static_cast<double>(count);
+    FiberTraceLabelingReport classified;
+    classified.labels.reserve(count);
+    for (std::size_t piece = 0; piece < count; ++piece) {
+        if (labeling.activeValues[piece] < result.activeThreshold) {
+            classified.labels.push_back(FiberTracePieceLabel::Broken);
+        } else {
+            classified.labels.push_back(makeLabel(
+                labeling.verticalValues[piece] >= 0.5,
+                labeling.oddValues[piece] >= 0.5));
+        }
+    }
+    const auto directory = outputBase.parent_path();
+    result.objects = writeFiberTraceLabelObjs(
+        constraints,
+        classified,
+        directory / (outputStem(outputBase) + "_relaxation"));
     return result;
 }
 
