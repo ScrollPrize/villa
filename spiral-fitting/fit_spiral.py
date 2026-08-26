@@ -1516,7 +1516,14 @@ class FitContext:
         # Patch loading and ROI filtering
         # ==========================================================================
 
-        filter_tracks_by_shell = bool(self.tracks_dbm_path) and bool(self.shell_path)
+        # The conventional layout resolves an outer_shell path without probing
+        # for it, so a dataset that ships tracks but no outer_shell/ still gets
+        # a shell path here. Only filter tracks by a shell that actually exists;
+        # a shell the losses genuinely require is still loaded (and still fails
+        # loudly) through outer_shell_required().
+        filter_tracks_by_shell = (
+            bool(self.tracks_dbm_path) and bool(self.shell_path)
+            and os.path.isdir(self.shell_path))
         shell_patch = None
         if self.outer_shell_required() or filter_tracks_by_shell:
             if not self.shell_path:
