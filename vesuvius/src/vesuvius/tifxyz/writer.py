@@ -156,6 +156,8 @@ class TifxyzWriter:
         self,
         surface: Tifxyz,
         bbox: Optional[tuple] = None,
+        *,
+        recompute_bbox: bool = True,
     ) -> None:
         """Write meta.json.
 
@@ -164,7 +166,13 @@ class TifxyzWriter:
         surface : Tifxyz
             Surface to get metadata from.
         bbox : Optional[tuple]
-            Override bounding box. If None, uses surface.bbox.
+            Override bounding box. If None, the bbox is derived from the
+            surface's valid vertices, or taken verbatim from surface.bbox
+            when recompute_bbox is False.
+        recompute_bbox : bool
+            If True (default) and no bbox override is given, recompute the
+            bbox from the current coordinate arrays, so edits made after
+            loading are reflected. If False, carry surface.bbox as-is.
         """
         # Build metadata dict in C++ format
         meta_dict = {
@@ -177,7 +185,14 @@ class TifxyzWriter:
         }
 
         # Add bbox
-        use_bbox = bbox if bbox is not None else surface.bbox
+        if bbox is not None:
+            use_bbox = bbox
+        elif recompute_bbox:
+            use_bbox = compute_grid_bounds(
+                surface._x, surface._y, surface._z, surface._valid_mask
+            )
+        else:
+            use_bbox = surface.bbox
         if use_bbox is not None:
             # bbox format: [[min_x, min_y, min_z], [max_x, max_y, max_z]]
             meta_dict["bbox"] = [
