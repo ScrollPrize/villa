@@ -4657,9 +4657,9 @@
 ## Stored crop-trace H/V constraint diagnostics
 
 - `vc_fiber_trace_chunk constraints TRACE.zarr --normal-manifest MANIFEST`
-  operates on durable `float64_traces` crop output and emits statistics only.
-  Constraint persistence and discrete H/V or winding-index optimization are
-  outside this first stage.
+  operates on durable `float64_traces` crop output and emits statistics plus
+  diagnostic connector OBJs. Structured constraint persistence and discrete
+  H/V or winding-index optimization are outside this first stage.
 - Every distance and arc value is in base voxels. Defaults are a 32-vx common
   sample pitch, 512-vx target piece length, 128-vx overlap, 128-vx neighbor
   radius, 32-vx centered tangent window, and 8-vx winding integration step.
@@ -4697,3 +4697,21 @@
   configuration, population and rejection counts, phase timing, and deciles
   for closest distance, both normalized orientation scores, and aligned
   winding distance.
+- Accepted measured connectors use bounded float-coordinate grouped corner
+  sampling for aligned winding. Each batch lays out and fetches `grad_mag`,
+  `nx`, and `ny` dependencies collectively, materializes samples in parallel,
+  and integrates connectors independently; it performs no per-point channel
+  cache queries. A distinct compatible density grid is sampled separately from
+  the jointly sampled `nx`/`ny` grid. Orientation, winding, and total score
+  timing are reported separately.
+- Constraints mode writes three connector-line OBJ diagnostics. `--output PATH`
+  is a basename whose final extension is removed; when omitted for `TRACE.zarr`,
+  the basename is sibling `TRACE_constraints`. Literal suffixes are
+  `_perpendicular.obj`, `_parallel_same_winding.obj`, and
+  `_parallel_separate_winding.obj`.
+- An OBJ connector joins the measured closest points and is named
+  `constraint_piece_A_B` from ascending global piece IDs. Hard continuity
+  links are excluded. Perpendicular requires score `>0.5` and aligned winding
+  `>0.3`. Parallel requires score `>0.5`; winding `<0.5` selects same-winding
+  and winding `>=0.5` selects separate-winding. Thus parallel outputs are
+  disjoint and exact threshold values have defined ownership.

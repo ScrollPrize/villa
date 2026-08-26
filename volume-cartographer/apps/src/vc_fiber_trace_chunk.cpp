@@ -59,7 +59,8 @@ void usage(const char* executable)
                  " --bbox X0 Y0 Z0 X1 Y1 Z1 --output traces.zarr [options]\n"
               << "  " << executable << " visualize <traces.zarr> --output lines.obj\n\n"
               << "  " << executable
-              << " constraints <traces.zarr> --normal-manifest PATH [options]\n\n"
+              << " constraints <traces.zarr> --normal-manifest PATH"
+                 " [--output BASENAME] [options]\n\n"
               << "Trace options:\n"
               << "  --obj PATH                 line OBJ; defaults beside trace Zarr\n"
               << "  --volume PATH              concrete uint8 CT Zarr group\n"
@@ -74,6 +75,7 @@ void usage(const char* executable)
               << "  --max-fibers N             accepted line limit; zero is unlimited [0]\n"
               << "  --texture-max N            maximum bbox texture dimension [4096]\n\n"
               << "Constraint options (all distances are base voxels):\n"
+              << "  --output PATH              OBJ basename; defaults beside trace dataset\n"
               << "  --sample-step N            common trace resampling step [32]\n"
               << "  --piece-length N           target overlapping piece length [512]\n"
               << "  --piece-overlap N          neighboring piece overlap [128]\n"
@@ -226,8 +228,15 @@ Options parse(int argc, char** argv)
         fail("a remote normal manifest requires --remote-cache-dir");
     }
     if (options.mode == Mode::Constraints) {
-        if (!options.output.empty() || options.hasTraceOnlyOption)
-            fail("constraints does not accept trace or visualization output options");
+        if (options.hasTraceOnlyOption)
+            fail("constraints does not accept trace-only options");
+        if (options.output.empty()) {
+            const std::string stem = options.input.has_extension()
+                ? options.input.stem().string()
+                : options.input.filename().string();
+            options.output = options.input.parent_path() /
+                (stem + "_constraints");
+        }
         options.constraints.parallelThreads = static_cast<std::size_t>(options.threads);
         return options;
     }
@@ -306,9 +315,25 @@ void printConstraintReport(
                   << quantile(winding, fraction) << '\n';
     }
     std::cout << "fiber trace constraint timing\n"
-              << "prepare_seconds  search_seconds  score_seconds  total_wall_seconds  total_cpu_seconds\n"
+              << "prepare_seconds  search_seconds  orientation_seconds  winding_seconds  score_seconds  total_wall_seconds  total_cpu_seconds\n"
               << report.prepareSeconds << "  " << report.searchSeconds << "  "
+              << report.orientationScoreSeconds << "  "
+              << report.windingScoreSeconds << "  "
               << report.scoreSeconds << "  " << wallSeconds << "  " << cpuSeconds << '\n';
+}
+
+void printConstraintObjReport(
+    const vc::fiber_tracer::FiberTraceConstraintObjReport& report)
+{
+    std::cout << "fiber trace constraint OBJ outputs\n"
+              << "class  lines  path\n"
+              << "perpendicular  " << report.perpendicular << "  "
+              << report.paths.perpendicular << '\n'
+              << "parallel_same_winding  " << report.parallelSameWinding << "  "
+              << report.paths.parallelSameWinding << '\n'
+              << "parallel_separate_winding  "
+              << report.parallelSeparateWinding << "  "
+              << report.paths.parallelSeparateWinding << '\n';
 }
 
 struct VisualizationReport {
@@ -385,7 +410,17 @@ int main(int argc, char** argv)
                            const cv::Vec3d& b,
                            double step) {
                     return normals.normalAlignedWindingDistance(a, b, step);
+                },
+                [&normals](
+                    const std::vector<std::pair<cv::Vec3d, cv::Vec3d>>& connectors,
+                    double step,
+                    int threads) {
+                    return normals.normalAlignedWindingDistancesBatch(
+                        connectors, step, threads);
                 });
+            const auto objReport =
+                vc::fiber_tracer::writeFiberTraceConstraintObjs(
+                    report, options.output);
             const double wallSeconds = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - started).count();
             const double cpuSeconds = static_cast<double>(
@@ -396,6 +431,7 @@ int main(int argc, char** argv)
                 manifestMatches,
                 wallSeconds,
                 cpuSeconds);
+            printConstraintObjReport(objReport);
             return 0;
         }
         if (options.mode == Mode::Visualize) {

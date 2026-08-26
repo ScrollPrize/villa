@@ -993,9 +993,24 @@ TEST_CASE("Trace constraints distinguish parallel and perpendicular neighbors de
     config.parallelThreads = 4;
     const auto parallel = extractFiberTraceConstraints(
         {first, reversedParallel, perpendicular}, config, winding);
+    const auto batched = extractFiberTraceConstraints(
+        {first, reversedParallel, perpendicular},
+        config,
+        winding,
+        [&winding](
+            const std::vector<std::pair<cv::Vec3d, cv::Vec3d>>& connectors,
+            double step,
+            int) {
+            std::vector<double> result;
+            result.reserve(connectors.size());
+            for (const auto& connector : connectors)
+                result.push_back(winding(connector.first, connector.second, step));
+            return result;
+        });
 
     REQUIRE(serial.constraints.size() == 3);
     REQUIRE(parallel.constraints.size() == serial.constraints.size());
+    REQUIRE(batched.constraints.size() == serial.constraints.size());
     const auto findPair = [&](std::size_t traceA, std::size_t traceB) -> const FiberTraceConstraint& {
         for (const auto& constraint : serial.constraints) {
             const auto a = serial.pieces[constraint.pieceA].traceIndex;
@@ -1021,6 +1036,7 @@ TEST_CASE("Trace constraints distinguish parallel and perpendicular neighbors de
         CHECK(left.parallelScore == right.parallelScore);
         CHECK(left.perpendicularScore == right.perpendicularScore);
         CHECK(left.windingDistance == right.windingDistance);
+        CHECK(left.windingDistance == batched.constraints[index].windingDistance);
     }
 }
 
@@ -1040,4 +1056,66 @@ TEST_CASE("Trace constraint R-tree cube hits still require Euclidean radius")
         [](const cv::Vec3d&, const cv::Vec3d&, double) { return 0.0; });
     CHECK(report.measuredCandidates == 0);
     CHECK(report.constraints.empty());
+}
+
+TEST_CASE("Trace constraint OBJ views apply strict disjoint thresholds")
+{
+    const TemporaryDirectory directory("constraint_objs");
+    FiberTraceConstraintReport report;
+    const auto constraint = [](
+        std::size_t a,
+        std::size_t b,
+        double parallel,
+        double perpendicular,
+        double winding,
+        bool hard = false) {
+        FiberTraceConstraint result;
+        result.pieceA = a;
+        result.pieceB = b;
+        result.pointABaseXYZ = {static_cast<double>(a), 0.0, 0.0};
+        result.pointBBaseXYZ = {static_cast<double>(b), 1.0, 0.0};
+        result.parallelScore = parallel;
+        result.perpendicularScore = perpendicular;
+        result.windingDistance = winding;
+        result.hardContinuity = hard;
+        return result;
+    };
+    report.constraints = {
+        constraint(1, 2, 0.4, 0.6, 0.31),
+        constraint(3, 4, 0.6, 0.4, 0.49),
+        constraint(5, 6, 0.6, 0.4, 0.5),
+        constraint(7, 8, 0.5, 0.5, 1.0),
+        constraint(9, 10, 1.0, 0.0, 0.0, true),
+    };
+
+    const auto output = directory.path / "links.diagnostic";
+    const auto written = writeFiberTraceConstraintObjs(report, output);
+    CHECK(written.paths.perpendicular ==
+          directory.path / "links_perpendicular.obj");
+    CHECK(written.paths.parallelSameWinding ==
+          directory.path / "links_parallel_same_winding.obj");
+    CHECK(written.paths.parallelSeparateWinding ==
+          directory.path / "links_parallel_separate_winding.obj");
+    CHECK(written.perpendicular == 1);
+    CHECK(written.parallelSameWinding == 1);
+    CHECK(written.parallelSeparateWinding == 1);
+    const auto read = [](const std::filesystem::path& path) {
+        std::ifstream input(path);
+        std::ostringstream text;
+        text << input.rdbuf();
+        return text.str();
+    };
+    CHECK(read(written.paths.perpendicular).find(
+              "o constraint_piece_1_2\n") != std::string::npos);
+    CHECK(read(written.paths.parallelSameWinding).find(
+              "o constraint_piece_3_4\n") != std::string::npos);
+    CHECK(read(written.paths.parallelSeparateWinding).find(
+              "o constraint_piece_5_6\n") != std::string::npos);
+    CHECK(read(written.paths.parallelSameWinding).find(
+              "constraint_piece_9_10") == std::string::npos);
+
+    const auto defaultPaths = fiberTraceConstraintObjPaths(
+        directory.path / "crop_traces_constraints");
+    CHECK(defaultPaths.perpendicular.filename() ==
+          "crop_traces_constraints_perpendicular.obj");
 }

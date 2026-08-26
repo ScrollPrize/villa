@@ -3,7 +3,10 @@
 #include "vc/fiber_tracer/FiberletCropTrace.hpp"
 
 #include <cstddef>
+#include <filesystem>
 #include <functional>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include <opencv2/core/types.hpp>
@@ -59,6 +62,8 @@ struct FiberTraceConstraintReport {
     std::size_t hardConstraints = 0;
     double prepareSeconds = 0.0;
     double searchSeconds = 0.0;
+    double orientationScoreSeconds = 0.0;
+    double windingScoreSeconds = 0.0;
     double scoreSeconds = 0.0;
 };
 
@@ -67,9 +72,35 @@ using FiberTraceWindingDistance = std::function<double(
     const cv::Vec3d& bBaseXYZ,
     double stepBaseVoxels)>;
 
+using FiberTraceWindingDistanceBatch = std::function<std::vector<double>(
+    const std::vector<std::pair<cv::Vec3d, cv::Vec3d>>& connectorsBaseXYZ,
+    double stepBaseVoxels,
+    int parallelThreads)>;
+
+struct FiberTraceConstraintObjPaths {
+    std::filesystem::path perpendicular;
+    std::filesystem::path parallelSameWinding;
+    std::filesystem::path parallelSeparateWinding;
+};
+
+struct FiberTraceConstraintObjReport {
+    FiberTraceConstraintObjPaths paths;
+    std::size_t perpendicular = 0;
+    std::size_t parallelSameWinding = 0;
+    std::size_t parallelSeparateWinding = 0;
+};
+
 [[nodiscard]] FiberTraceConstraintReport extractFiberTraceConstraints(
     const std::vector<FiberletCropTraceLine>& lines,
     const FiberTraceConstraintConfig& config,
-    const FiberTraceWindingDistance& windingDistance);
+    const FiberTraceWindingDistance& windingDistance,
+    const FiberTraceWindingDistanceBatch& windingDistanceBatch = {});
+
+[[nodiscard]] FiberTraceConstraintObjPaths fiberTraceConstraintObjPaths(
+    const std::filesystem::path& outputBase);
+
+[[nodiscard]] FiberTraceConstraintObjReport writeFiberTraceConstraintObjs(
+    const FiberTraceConstraintReport& report,
+    const std::filesystem::path& outputBase);
 
 }  // namespace vc::fiber_tracer

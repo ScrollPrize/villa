@@ -1,5 +1,6 @@
 #include "vc/fiber_tracer/FiberTraceConstraints.hpp"
 
+#include "vc/core/io/PolylineObj.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
 
 #include <algorithm>
@@ -252,8 +253,7 @@ ScoredCandidate scoreCandidate(
     const PairCandidate& candidate,
     const std::vector<FiberTraceConstraintPiece>& pieces,
     const std::vector<std::optional<PolylineArcGeometry>>& geometries,
-    const FiberTraceConstraintConfig& config,
-    const FiberTraceWindingDistance& windingDistance)
+    const FiberTraceConstraintConfig& config)
 {
     const auto& pieceA = pieces[candidate.pieces.a];
     const auto& pieceB = pieces[candidate.pieces.b];
@@ -332,13 +332,6 @@ ScoredCandidate scoreCandidate(
 
     const cv::Vec3d pointA = pieceA.samplePointsBaseXYZ[candidate.sampleA];
     const cv::Vec3d pointB = pieceB.samplePointsBaseXYZ[candidate.sampleB];
-    const double winding = windingDistance(
-        pointA,
-        pointB,
-        config.windingIntegrationStepBaseVoxels);
-    if (!std::isfinite(winding))
-        return {{}, RejectReason::Winding};
-
     FiberTraceConstraint constraint;
     constraint.pieceA = candidate.pieces.a;
     constraint.pieceB = candidate.pieces.b;
@@ -349,7 +342,7 @@ ScoredCandidate scoreCandidate(
     constraint.closestDistanceBaseVoxels = candidate.distance;
     constraint.parallelScore = rawParallel / evidence;
     constraint.perpendicularScore = rawPerpendicular / evidence;
-    constraint.windingDistance = winding;
+    constraint.windingDistance = 0.0;
     return {std::move(constraint), RejectReason::None};
 }
 
@@ -358,7 +351,8 @@ ScoredCandidate scoreCandidate(
 FiberTraceConstraintReport extractFiberTraceConstraints(
     const std::vector<FiberletCropTraceLine>& lines,
     const FiberTraceConstraintConfig& config,
-    const FiberTraceWindingDistance& windingDistance)
+    const FiberTraceWindingDistance& windingDistance,
+    const FiberTraceWindingDistanceBatch& windingDistanceBatch)
 {
     validateConfig(config);
     FiberTraceConstraintReport report;
@@ -501,7 +495,7 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
     report.searchSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - searchStarted).count();
 
-    if (!candidates.empty() && !windingDistance)
+    if (!candidates.empty() && !windingDistance && !windingDistanceBatch)
         throw std::invalid_argument("Fiber trace constraint winding sampler is missing");
     const auto scoreStarted = std::chrono::steady_clock::now();
     const std::size_t requestedThreads = config.parallelThreads == 0
@@ -513,7 +507,7 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
     std::vector<ScoredCandidate> scored(candidates.size());
     std::vector<std::exception_ptr> failures(candidates.size());
 #ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic, 1) num_threads(workers)
+#pragma omp parallel for schedule(guided, 16) num_threads(workers)
 #endif
     for (std::ptrdiff_t index = 0;
          index < static_cast<std::ptrdiff_t>(candidates.size());
@@ -523,8 +517,7 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
                 candidates[static_cast<std::size_t>(index)],
                 report.pieces,
                 geometries,
-                config,
-                windingDistance);
+                config);
         } catch (...) {
             failures[static_cast<std::size_t>(index)] = std::current_exception();
         }
@@ -533,6 +526,68 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
         if (failure)
             std::rethrow_exception(failure);
     }
+    report.orientationScoreSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - scoreStarted).count();
+
+    const auto windingStarted = std::chrono::steady_clock::now();
+    std::vector<std::size_t> acceptedIndices;
+    std::vector<std::pair<cv::Vec3d, cv::Vec3d>> connectors;
+    acceptedIndices.reserve(scored.size());
+    connectors.reserve(scored.size());
+    for (std::size_t index = 0; index < scored.size(); ++index) {
+        if (!scored[index].constraint.has_value())
+            continue;
+        acceptedIndices.push_back(index);
+        connectors.emplace_back(
+            scored[index].constraint->pointABaseXYZ,
+            scored[index].constraint->pointBBaseXYZ);
+    }
+    std::vector<double> windings(connectors.size());
+    if (!connectors.empty() && windingDistanceBatch) {
+        windings = windingDistanceBatch(
+            connectors,
+            config.windingIntegrationStepBaseVoxels,
+            workers);
+        if (windings.size() != connectors.size()) {
+            throw std::runtime_error(
+                "Fiber trace constraint winding batch returned the wrong result count");
+        }
+    } else if (!connectors.empty()) {
+        std::vector<std::exception_ptr> windingFailures(connectors.size());
+#ifdef _OPENMP
+#pragma omp parallel for schedule(guided, 16) num_threads(workers)
+#endif
+        for (std::ptrdiff_t index = 0;
+             index < static_cast<std::ptrdiff_t>(connectors.size());
+             ++index) {
+            try {
+                const auto& connector = connectors[static_cast<std::size_t>(index)];
+                windings[static_cast<std::size_t>(index)] = windingDistance(
+                    connector.first,
+                    connector.second,
+                    config.windingIntegrationStepBaseVoxels);
+            } catch (...) {
+                windingFailures[static_cast<std::size_t>(index)] =
+                    std::current_exception();
+            }
+        }
+        for (const auto& failure : windingFailures) {
+            if (failure)
+                std::rethrow_exception(failure);
+        }
+    }
+    for (std::size_t index = 0; index < acceptedIndices.size(); ++index) {
+        auto& result = scored[acceptedIndices[index]];
+        if (std::isfinite(windings[index]))
+            result.constraint->windingDistance = windings[index];
+        else {
+            result.constraint.reset();
+            result.rejection = RejectReason::Winding;
+        }
+    }
+    report.windingScoreSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - windingStarted).count();
+
     for (auto& result : scored) {
         if (result.constraint.has_value())
             report.constraints.push_back(std::move(*result.constraint));
@@ -549,6 +604,68 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
     report.scoreSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - scoreStarted).count();
     return report;
+}
+
+FiberTraceConstraintObjPaths fiberTraceConstraintObjPaths(
+    const std::filesystem::path& outputBase)
+{
+    const auto directory = outputBase.parent_path();
+    const std::string stem = outputBase.has_extension()
+        ? outputBase.stem().string()
+        : outputBase.filename().string();
+    if (stem.empty())
+        throw std::invalid_argument("constraint OBJ output basename is empty");
+    return {
+        directory / (stem + "_perpendicular.obj"),
+        directory / (stem + "_parallel_same_winding.obj"),
+        directory / (stem + "_parallel_separate_winding.obj"),
+    };
+}
+
+FiberTraceConstraintObjReport writeFiberTraceConstraintObjs(
+    const FiberTraceConstraintReport& report,
+    const std::filesystem::path& outputBase)
+{
+    FiberTraceConstraintObjReport result;
+    result.paths = fiberTraceConstraintObjPaths(outputBase);
+    std::vector<vc::core::io::NamedPolyline> perpendicular;
+    std::vector<vc::core::io::NamedPolyline> parallelSame;
+    std::vector<vc::core::io::NamedPolyline> parallelSeparate;
+    for (const auto& constraint : report.constraints) {
+        if (constraint.hardContinuity)
+            continue;
+        vc::core::io::NamedPolyline line{
+            "constraint_piece_" + std::to_string(constraint.pieceA) + "_" +
+                std::to_string(constraint.pieceB),
+            {constraint.pointABaseXYZ, constraint.pointBBaseXYZ},
+        };
+        if (constraint.perpendicularScore > 0.5 &&
+            constraint.windingDistance > 0.3) {
+            perpendicular.push_back(line);
+        }
+        if (constraint.parallelScore > 0.5) {
+            if (constraint.windingDistance < 0.5)
+                parallelSame.push_back(std::move(line));
+            else
+                parallelSeparate.push_back(std::move(line));
+        }
+    }
+    const auto directory = result.paths.perpendicular.parent_path();
+    if (!directory.empty())
+        std::filesystem::create_directories(directory);
+    vc::core::io::writePolylinesObj(
+        perpendicular, result.paths.perpendicular,
+        "VC3D perpendicular crop-trace constraints");
+    vc::core::io::writePolylinesObj(
+        parallelSame, result.paths.parallelSameWinding,
+        "VC3D parallel same-winding crop-trace constraints");
+    vc::core::io::writePolylinesObj(
+        parallelSeparate, result.paths.parallelSeparateWinding,
+        "VC3D parallel separate-winding crop-trace constraints");
+    result.perpendicular = perpendicular.size();
+    result.parallelSameWinding = parallelSame.size();
+    result.parallelSeparateWinding = parallelSeparate.size();
+    return result;
 }
 
 }  // namespace vc::fiber_tracer

@@ -77,14 +77,30 @@ The comparable visualization quality is
 
 The `constraints` mode derives candidate H/V and winding links directly from a
 stored crop-trace dataset. It does not need the source Fiberlet graph and does
-not write a constraint artifact yet:
+not write a constraint data artifact yet:
 
 ```bash
 volume-cartographer/build/bin/vc_fiber_trace_chunk \
   constraints \
   crop_traces.zarr \
-  --normal-manifest /path/to/normals.lasagna.json
+  --normal-manifest /path/to/normals.lasagna.json \
+  --output crop_constraints.obj
 ```
+
+`--output` is an OBJ basename; its final extension is removed. The command
+writes `crop_constraints_perpendicular.obj`,
+`crop_constraints_parallel_same_winding.obj`, and
+`crop_constraints_parallel_separate_winding.obj`. If omitted for
+`crop_traces.zarr`, the basename defaults to `crop_traces_constraints` beside
+the trace dataset. Each OBJ line joins a measured constraint's two closest
+sampled points and is named `constraint_piece_A_B` from stable ascending global
+piece IDs. Hard same-trace continuity links are excluded.
+
+The perpendicular view requires normalized perpendicular score `> 0.5` and
+aligned winding distance `> 0.3`. Both parallel views require normalized
+parallel score `> 0.5`; winding `< 0.5` is classified as same-winding and
+winding `>= 0.5` as separate-winding. Threshold comparisons are exact, so a
+score of `0.5` is absent and winding `0.5` belongs to separate-winding.
 
 All distances are in base voxels. By default, traces are resampled every 32
 voxels and divided into evenly sized overlapping pieces with a maximum target
@@ -110,6 +126,15 @@ the connector and the decoded local Lasagna normal before trapezoidal
 integration. This suppresses winding evidence where the connector lies in the
 local tangent plane. Missing required density or normal samples reject that
 candidate.
+
+Constraint orientation scores are computed in deterministic parallel slots.
+Accepted connectors are then sampled through the shared grouped Lasagna corner
+path in bounded float-coordinate batches: `grad_mag`, `nx`, and `ny` chunk
+dependencies are laid out once per batch, values are materialized in parallel,
+and winding integrals are reduced independently. When density and normals use
+different compatible grids, density is one batch and the paired normal channels
+are another. There are no per-point channel-cache lookups. Console timing
+separates orientation and winding work.
 
 Use `--sample-step`, `--piece-length`, `--piece-overlap`, `--max-distance`,
 `--tangent-window`, and `--winding-step` to change the defaults. `--threads`

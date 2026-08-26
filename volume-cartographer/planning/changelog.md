@@ -6,6 +6,9 @@
   artifacts, including deterministic overlapping trace pieces, exact-radius
   neighbor search, parallel/perpendicular evidence, hard continuity links, and
   Lasagna-normal-aligned winding statistics.
+- Batched constraint winding through grouped Lasagna corner sampling and added
+  perpendicular, parallel same-winding, and parallel separate-winding connector
+  OBJ diagnostics.
 
 ## 2026-08-17
 

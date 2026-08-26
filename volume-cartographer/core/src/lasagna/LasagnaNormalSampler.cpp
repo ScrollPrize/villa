@@ -226,6 +226,192 @@ public:
         return integral;
     }
 
+    [[nodiscard]] std::vector<double> normalAlignedWindingDistancesBatch(
+        const std::vector<std::pair<cv::Vec3d, cv::Vec3d>>& connectors,
+        double stepVx,
+        int parallelThreads) const
+    {
+        if (!(stepVx > 0.0) || !std::isfinite(stepVx))
+            throw std::invalid_argument("winding integration step must be positive and finite");
+        std::vector<double> result(
+            connectors.size(), std::numeric_limits<double>::infinity());
+        if (connectors.empty())
+            return result;
+        const bool sharedGrid =
+            gradMagCorners_ != nullptr && nxCorners_ != nullptr &&
+            nyCorners_ != nullptr;
+        std::unique_ptr<LasagnaChannelCornerSampler> separateGradMag;
+        std::unique_ptr<LasagnaChannelCornerSampler> separateNx;
+        std::unique_ptr<LasagnaChannelCornerSampler> separateNy;
+        const LasagnaChannelCornerSampler* gradMagCorners = gradMagCorners_.get();
+        const LasagnaChannelCornerSampler* nxCorners = nxCorners_.get();
+        const LasagnaChannelCornerSampler* nyCorners = nyCorners_.get();
+        if (!sharedGrid) {
+            separateGradMag =
+                std::make_unique<LasagnaChannelCornerSampler>(gradMag_);
+            separateNx = std::make_unique<LasagnaChannelCornerSampler>(nx_);
+            separateNy = std::make_unique<LasagnaChannelCornerSampler>(ny_);
+            gradMagCorners = separateGradMag.get();
+            nxCorners = separateNx.get();
+            nyCorners = separateNy.get();
+        }
+
+        struct Layout {
+            size_t firstPoint = 0;
+            size_t intervals = 0;
+            double intervalLength = 0.0;
+            cv::Vec3d direction{0.0, 0.0, 0.0};
+        };
+        std::vector<Layout> layouts(connectors.size());
+        size_t totalPoints = 0;
+        for (size_t index = 0; index < connectors.size(); ++index) {
+            const cv::Vec3d delta = connectors[index].second - connectors[index].first;
+            const double distance = length(delta);
+            if (!std::isfinite(distance))
+                continue;
+            if (distance <= kEpsilon) {
+                result[index] = 0.0;
+                continue;
+            }
+            const size_t intervals = std::max<size_t>(
+                1, static_cast<size_t>(std::ceil(distance / stepVx)));
+            if (totalPoints > std::numeric_limits<size_t>::max() - intervals - 1)
+                throw std::overflow_error("batched winding sample count exceeds size_t");
+            layouts[index] = {
+                totalPoints,
+                intervals,
+                distance / static_cast<double>(intervals),
+                delta * (1.0 / distance),
+            };
+            totalPoints += intervals + 1;
+        }
+
+        std::vector<cv::Vec3f> points;
+        std::vector<size_t> pointConnectors;
+        points.reserve(totalPoints);
+        pointConnectors.reserve(totalPoints);
+        for (size_t connector = 0; connector < connectors.size(); ++connector) {
+            const auto& layout = layouts[connector];
+            if (layout.intervals == 0)
+                continue;
+            for (size_t sample = 0; sample <= layout.intervals; ++sample) {
+                const double t = static_cast<double>(sample) /
+                    static_cast<double>(layout.intervals);
+                const cv::Vec3d point = connectors[connector].first * (1.0 - t) +
+                    connectors[connector].second * t;
+                points.push_back({
+                    static_cast<float>(point[0]),
+                    static_cast<float>(point[1]),
+                    static_cast<float>(point[2]),
+                });
+                pointConnectors.push_back(connector);
+            }
+        }
+
+        const int workers = static_cast<int>(normalBatchWorkerCount(
+            points.size(), parallelThreads, lasagnaReadWorkersPerChannel()));
+        std::vector<double> alignedDensity(points.size(), 0.0);
+        std::vector<uint8_t> valid(points.size(), uint8_t{0});
+        constexpr size_t kBatchPoints = 262144;
+        for (size_t begin = 0; begin < points.size(); begin += kBatchPoints) {
+            const size_t end = std::min(points.size(), begin + kBatchPoints);
+            std::vector<cv::Vec3f> batchPoints(
+                points.begin() + static_cast<std::ptrdiff_t>(begin),
+                points.begin() + static_cast<std::ptrdiff_t>(end));
+            LasagnaCornerBatch groupedCorners;
+            LasagnaCornerBatch densityCorners;
+            LasagnaCornerBatch normalCorners;
+            if (sharedGrid) {
+                (void)sampleLasagnaChannelCornerBatch(
+                    {gradMagCorners, nxCorners, nyCorners},
+                    batchPoints,
+                    groupedCorners,
+                    workers);
+            } else {
+                (void)sampleLasagnaChannelCornerBatch(
+                    {gradMagCorners}, batchPoints, densityCorners, workers);
+                (void)sampleLasagnaChannelCornerBatch(
+                    {nxCorners, nyCorners}, batchPoints, normalCorners, workers);
+            }
+            const auto materialize = [&](size_t local) {
+                const auto& densityBatch = sharedGrid
+                    ? groupedCorners
+                    : densityCorners;
+                const auto& normalBatch = sharedGrid
+                    ? groupedCorners
+                    : normalCorners;
+                if (densityBatch.valid[local] == 0 ||
+                    normalBatch.valid[local] == 0)
+                    return;
+                const auto densityWeights = lasagnaCornerWeights(
+                    densityBatch.fractionsXYZ[local]);
+                const auto normalWeights = lasagnaCornerWeights(
+                    normalBatch.fractionsXYZ[local]);
+                const double encodedDensity = interpolateLasagnaCorners(
+                    densityBatch.values[0][local], densityWeights);
+                if (!(encodedDensity >= 0.0))
+                    return;
+                const size_t normalOffset = sharedGrid ? 1 : 0;
+                const cv::Vec3f normal = interpolateLasagnaCompactAxisCorners(
+                    normalBatch.values[normalOffset][local],
+                    normalBatch.values[normalOffset + 1][local],
+                    normalWeights);
+                const double magnitude = std::sqrt(
+                    static_cast<double>(normal.dot(normal)));
+                if (!(magnitude > kEpsilon))
+                    return;
+                const cv::Vec3d normalDouble{normal[0], normal[1], normal[2]};
+                const cv::Vec3d& direction =
+                    layouts[pointConnectors[begin + local]].direction;
+                alignedDensity[begin + local] =
+                    encodedDensity / gradMagDecodeScale_ *
+                    std::abs(direction.dot(normalDouble) / magnitude);
+                valid[begin + local] = uint8_t{1};
+            };
+#ifdef _OPENMP
+            if (workers > 1) {
+                const auto count = static_cast<std::ptrdiff_t>(end - begin);
+#pragma omp parallel for schedule(static) num_threads(workers)
+                for (std::ptrdiff_t local = 0; local < count; ++local)
+                    materialize(static_cast<size_t>(local));
+            } else
+#endif
+            {
+                for (size_t local = 0; local < end - begin; ++local)
+                    materialize(local);
+            }
+        }
+
+        const auto integrate = [&](size_t connector) {
+            const auto& layout = layouts[connector];
+            if (layout.intervals == 0)
+                return;
+            double integral = 0.0;
+            for (size_t sample = 0; sample < layout.intervals; ++sample) {
+                const size_t first = layout.firstPoint + sample;
+                if (valid[first] == 0 || valid[first + 1] == 0)
+                    return;
+                integral += 0.5 *
+                    (alignedDensity[first] + alignedDensity[first + 1]) *
+                    layout.intervalLength;
+            }
+            result[connector] = integral;
+        };
+#ifdef _OPENMP
+        if (workers > 1) {
+            const auto count = static_cast<std::ptrdiff_t>(connectors.size());
+#pragma omp parallel for schedule(static) num_threads(workers)
+            for (std::ptrdiff_t connector = 0; connector < count; ++connector)
+                integrate(static_cast<size_t>(connector));
+        } else
+#endif
+        {
+            for (size_t connector = 0; connector < connectors.size(); ++connector)
+                integrate(connector);
+        }
+        return result;
+    }
+
     [[nodiscard]] NormalSample sampleNormal(const cv::Vec3d& volumePoint) const
     {
         const auto gradMag = sampleLasagnaChannel(gradMag_, *cache_, volumePoint);
@@ -853,6 +1039,15 @@ double LasagnaNormalSampler::normalAlignedWindingDistance(
     double stepVx) const
 {
     return impl_->windingDistance(a, b, stepVx, true);
+}
+
+std::vector<double> LasagnaNormalSampler::normalAlignedWindingDistancesBatch(
+    const std::vector<std::pair<cv::Vec3d, cv::Vec3d>>& connectors,
+    double stepVx,
+    int parallelThreads) const
+{
+    return impl_->normalAlignedWindingDistancesBatch(
+        connectors, stepVx, parallelThreads);
 }
 
 NormalSampleWithDerivative LasagnaNormalSampler::sampleNormalWithDerivative(

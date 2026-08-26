@@ -240,6 +240,22 @@ TEST_CASE("LasagnaNormalSampler integrates decoded grad_mag as winding distance"
     CHECK(sampler.normalAlignedWindingDistance(
               {0.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, 0.25) ==
           doctest::Approx(0.0).epsilon(1.0e-9));
+    const std::vector<std::pair<cv::Vec3d, cv::Vec3d>> connectors{
+        {{0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}},
+        {{0.0, 0.0, 0.0}, {0.0, 1.0, 0.0}},
+        {{0.5, 0.5, 0.5}, {0.5, 0.5, 0.5}},
+    };
+    const auto batchOne = sampler.normalAlignedWindingDistancesBatch(
+        connectors, 0.25, 1);
+    const auto batchFour = sampler.normalAlignedWindingDistancesBatch(
+        connectors, 0.25, 4);
+    REQUIRE(batchOne.size() == connectors.size());
+    REQUIRE(batchFour.size() == batchOne.size());
+    CHECK(batchOne[0] == doctest::Approx(1.0).epsilon(1.0e-6));
+    CHECK(batchOne[1] == doctest::Approx(0.0).epsilon(1.0e-6));
+    CHECK(batchOne[2] == doctest::Approx(0.0));
+    for (std::size_t index = 0; index < batchOne.size(); ++index)
+        CHECK(batchFour[index] == batchOne[index]);
     fs::remove_all(dir);
 }
 
@@ -278,6 +294,54 @@ TEST_CASE("LasagnaNormalSampler interpolates unoriented normal tensors")
     CHECK(std::abs(sample.normal[0]) == doctest::Approx(1.0).epsilon(1.0e-9));
     CHECK(sample.normal[1] == doctest::Approx(0.0).epsilon(1.0e-9));
     CHECK(sample.normal[2] == doctest::Approx(0.0).epsilon(1.0e-9));
+    fs::remove_all(dir);
+}
+
+TEST_CASE("Batched aligned winding tracks scalar sampling on varying fields")
+{
+    const auto dir = tmpDir("winding_batch_varying");
+    std::vector<uint8_t> gradMag(4 * 4 * 4);
+    std::vector<uint8_t> nx(4 * 4 * 4);
+    std::vector<uint8_t> ny(4 * 4 * 4);
+    for (size_t index = 0; index < gradMag.size(); ++index) {
+        gradMag[index] = static_cast<uint8_t>(40 + index * 3 % 180);
+        nx[index] = static_cast<uint8_t>(80 + index * 5 % 150);
+        ny[index] = static_cast<uint8_t>(50 + index * 7 % 180);
+    }
+    createU8Zarr(dir / "grad_mag.zarr", {4, 4, 4}, {4, 4, 4}, &gradMag);
+    createU8Zarr(dir / "nx.zarr", {4, 4, 4}, {4, 4, 4}, &nx);
+    createU8Zarr(dir / "ny.zarr", {4, 4, 4}, {4, 4, 4}, &ny);
+    const auto manifestPath = dir / "dataset.lasagna.json";
+    writeText(manifestPath, R"({
+        "version": 2,
+        "grad_mag_encode_scale": 100.0,
+        "grad_mag_factor": 1.0,
+        "groups": {
+            "grad_mag_group": {"zarr": "grad_mag.zarr", "scaledown": 0, "channels": ["grad_mag"]},
+            "nx_group": {"zarr": "nx.zarr", "scaledown": 0, "channels": ["nx"]},
+            "ny_group": {"zarr": "ny.zarr", "scaledown": 0, "channels": ["ny"]}
+        }
+    })");
+
+    const auto dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
+    vc::lasagna::LasagnaNormalSampler sampler(dataset);
+    const std::vector<std::pair<cv::Vec3d, cv::Vec3d>> connectors{
+        {{0.17, 0.31, 0.44}, {2.73, 1.82, 2.19}},
+        {{2.61, 0.23, 1.11}, {0.29, 2.54, 2.77}},
+        {{0.41, 2.49, 0.38}, {2.45, 0.52, 2.63}},
+    };
+    const auto batchOne = sampler.normalAlignedWindingDistancesBatch(
+        connectors, 0.37, 1);
+    const auto batchFour = sampler.normalAlignedWindingDistancesBatch(
+        connectors, 0.37, 4);
+    REQUIRE(batchOne.size() == connectors.size());
+    REQUIRE(batchFour.size() == connectors.size());
+    for (size_t index = 0; index < connectors.size(); ++index) {
+        const double scalar = sampler.normalAlignedWindingDistance(
+            connectors[index].first, connectors[index].second, 0.37);
+        CHECK(batchOne[index] == doctest::Approx(scalar).epsilon(2.0e-5));
+        CHECK(batchFour[index] == batchOne[index]);
+    }
     fs::remove_all(dir);
 }
 
