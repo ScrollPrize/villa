@@ -1,0 +1,181 @@
+name: Publish VC3D runtime image (ghcr.io)
+
+# Keep the documented :main and :edge C++ runtime images aligned with the
+# source users get from the default branch. The builder-image workflow remains
+# separate so source-only changes do not republish the CI dependency image.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'volume-cartographer/**'
+      - '.github/workflows/vc3d-publish-runtime.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY_IMAGE: ghcr.io/${{ github.repository_owner }}/villa/volume-cartographer
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    name: Prepare image name
+    runs-on: ubuntu-24.04
+    outputs:
+      registry_image: ${{ steps.image.outputs.registry_image }}
+    steps:
+      - name: Require the default branch
+        if: github.ref != 'refs/heads/main'
+        shell: bash
+        run: |
+          echo "Runtime tags may only be published from main; got $GITHUB_REF" >&2
+          exit 1
+      - name: Normalize registry image name
+        id: image
+        shell: bash
+        run: echo "registry_image=${REGISTRY_IMAGE,,}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build runtime (${{ matrix.platform }})
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            artifact: linux-amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            artifact: linux-arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Generate image labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ needs.prepare.outputs.registry_image }}
+      - name: Build and push runtime by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./volume-cartographer
+          file: ./volume-cartographer/Dockerfile
+          target: runtime
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=vc3d-runtime-${{ matrix.artifact }}
+          cache-to: type=gha,mode=max,scope=vc3d-runtime-${{ matrix.artifact }}
+          provenance: true
+          outputs: type=image,name=${{ needs.prepare.outputs.registry_image }},push-by-digest=true,name-canonical=true,push=true
+      - name: Smoke-test published digest
+        env:
+          REGISTRY_IMAGE: ${{ needs.prepare.outputs.registry_image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull "$REGISTRY_IMAGE@$DIGEST"
+          docker run --rm --entrypoint /bin/bash "$REGISTRY_IMAGE@$DIGEST" -lc '
+            set -euo pipefail
+            echo "architecture=$(uname -m)"
+            for binary in VC3D vc3d vc_render_tifxyz vc_grow_seg_from_seed \
+              vc_gen_normalgrids flatboi; do
+              test -x "/usr/local/bin/$binary"
+              echo "executable=$binary"
+            done
+
+            ldd_checked=0
+            while IFS= read -r -d "" binary; do
+              missing="$(ldd "$binary" 2>&1 | grep "not found" || true)"
+              if [[ -n "$missing" ]]; then
+                echo "missing shared libraries for $binary:" >&2
+                printf "%s\n" "$missing" >&2
+                exit 1
+              fi
+              ldd_checked=$((ldd_checked + 1))
+            done < <(find -L /usr/local/bin -maxdepth 1 -type f -perm /111 -print0)
+            echo "ldd_checked=$ldd_checked"
+
+            for binary in vc_render_tifxyz vc_grow_seg_from_seed \
+              vc_gen_normalgrids flatboi; do
+              "$binary" --help >/dev/null
+            done
+
+            set +e
+            QT_QPA_PLATFORM=offscreen HOME=/tmp timeout 8 VC3D \
+              >/tmp/vc3d-smoke.log 2>&1
+            rc=$?
+            set -e
+            tail -n 20 /tmp/vc3d-smoke.log
+            if [[ "$rc" -ne 124 ]]; then
+              echo "VC3D exited unexpectedly during the offscreen startup smoke (rc=$rc)" >&2
+              exit 1
+            fi
+            echo "runtime_smoke=ok"
+          '
+      - name: Export digest
+        shell: bash
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.artifact }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish multi-platform runtime tags
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+      - name: Generate runtime tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ needs.prepare.outputs.registry_image }}
+          tags: |
+            type=raw,value=main
+            type=raw,value=edge
+            type=raw,value=sha-${{ github.sha }}
+      - name: Create and inspect manifest list
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          REGISTRY_IMAGE: ${{ needs.prepare.outputs.registry_image }}
+        shell: bash
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "$REGISTRY_IMAGE@sha256:%s " *)
+          docker buildx imagetools inspect "$REGISTRY_IMAGE:edge"
