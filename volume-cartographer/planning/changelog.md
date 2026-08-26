@@ -1,5 +1,7 @@
 # Changelog
 
+- Added an explicit solver-only parallel/separate-winding constraint ablation,
+  retained/excluded link reporting, and direct concise LP artifact names.
 - Added an explicit crop-fiber LP-relaxation diagnostic with raw continuous
   active, H/V, and parity values in CSV, stable gated XOR edge variables,
   component gauges, triangle consistency cuts, console quantiles, and five

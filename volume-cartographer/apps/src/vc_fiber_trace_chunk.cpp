@@ -66,7 +66,8 @@ void usage(const char* executable)
               << " constraints <traces.zarr> --normal-manifest PATH"
                  " [--output BASENAME] [--broken-cost-per-link COST]"
                  " [--mip-gap FRACTION] [--lp-relaxation]"
-                 " [--lp-parallel] [--lp-solver NAME] [options]\n\n"
+                 " [--lp-parallel] [--lp-solver NAME]"
+                 " [--exclude-parallel-separate-winding] [options]\n\n"
               << "Trace options:\n"
               << "  --obj PATH                 line OBJ; defaults beside trace Zarr\n"
               << "  --volume PATH              concrete uint8 CT Zarr group\n"
@@ -91,6 +92,8 @@ void usage(const char* executable)
               << "  --lp-relaxation            solve continuous [0,1] label relaxation\n"
               << "  --lp-parallel              request HiGHS parallel LP execution\n"
               << "  --lp-solver NAME           choose, simplex, hipo, or ipm [choose]\n"
+              << "  --exclude-parallel-separate-winding\n"
+              << "                              omit that measured class from labeling only\n"
               << "  --threads N                scoring workers [host CPUs]\n"
               << "  --cache-gib N              decoded normal cache [8]\n";
 }
@@ -239,6 +242,9 @@ Options parse(int argc, char** argv)
                 fail("--lp-solver must be choose, simplex, hipo, or ipm");
             }
             options.hasConstraintOnlyOption = true;
+        } else if (argument == "--exclude-parallel-separate-winding") {
+            options.labeling.excludeParallelSeparateWinding = true;
+            options.hasConstraintOnlyOption = true;
         } else if (argument == "--help" || argument == "-h") {
             usage(argv[0]);
             std::exit(0);
@@ -380,11 +386,13 @@ void printLabelingReport(
     };
     std::cout << std::setprecision(8)
               << "fiber trace labeling optimization\n"
-              << "status  objective  orientation_cost  winding_cost  broken_cost  broken_cost_per_link  requested_mip_gap  variables  integer_variables  rows  mip_nodes  mip_gap  solve_seconds\n"
+              << "status  objective  orientation_cost  winding_cost  broken_cost  broken_cost_per_link  retained_links  excluded_parallel_separate_winding  requested_mip_gap  variables  integer_variables  rows  mip_nodes  mip_gap  solve_seconds\n"
               << report.modelStatus << "  " << report.objective << "  "
               << report.orientationCost << "  " << report.windingCost << "  "
               << report.brokenCost << "  " << config.brokenCostPerConstraint
-              << "  " << config.relativeMipGap << "  " << report.variables
+              << "  " << report.retainedConstraints << "  "
+              << report.excludedParallelSeparateWinding << "  "
+              << config.relativeMipGap << "  " << report.variables
               << "  " << report.integerVariables
               << "  " << report.rows << "  "
               << report.mipNodes << "  " << report.mipGap << "  "
@@ -405,13 +413,15 @@ void printRelaxedLabelingReport(
 {
     std::cout << std::setprecision(8)
               << "fiber trace labeling LP relaxation\n"
-              << "status  requested_solver  requested_parallel  threads  objective  orientation_cost  winding_cost  broken_cost  broken_cost_per_link  variables  rows  gauge_roots  triangles  triangle_rows  solve_seconds  csv\n"
+              << "status  requested_solver  requested_parallel  threads  objective  orientation_cost  winding_cost  broken_cost  broken_cost_per_link  retained_links  excluded_parallel_separate_winding  variables  rows  gauge_roots  triangles  triangle_rows  solve_seconds  csv\n"
               << report.modelStatus << "  " << config.lpSolver << "  "
               << (config.lpParallel ? "on" : "choose") << "  "
               << config.parallelThreads << "  " << report.objective << "  "
               << report.orientationCost << "  " << report.windingCost << "  "
               << report.brokenCost << "  " << config.brokenCostPerConstraint
-              << "  " << report.variables << "  " << report.rows << "  "
+              << "  " << report.retainedConstraints << "  "
+              << report.excludedParallelSeparateWinding << "  "
+              << report.variables << "  " << report.rows << "  "
               << report.gaugeRoots << "  " << report.triangles << "  "
               << report.triangleRows << "  "
               << report.solveSeconds << "  " << csv << '\n'
@@ -449,8 +459,12 @@ void printConstraintObjReport(
 {
     std::cout << "fiber trace constraint OBJ outputs\n"
               << "class  lines  path\n"
-              << "perpendicular  " << report.perpendicular << "  "
-              << report.paths.perpendicular << '\n'
+              << "perpendicular_same_winding  "
+              << report.perpendicularSameWinding << "  "
+              << report.paths.perpendicularSameWinding << '\n'
+              << "perpendicular_separate_winding  "
+              << report.perpendicularSeparateWinding << "  "
+              << report.paths.perpendicularSeparateWinding << '\n'
               << "parallel_same_winding  " << report.parallelSameWinding << "  "
               << report.paths.parallelSameWinding << '\n'
               << "parallel_separate_winding  "

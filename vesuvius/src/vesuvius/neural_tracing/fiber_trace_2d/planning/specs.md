@@ -4709,16 +4709,17 @@
   cache queries. A distinct compatible density grid is sampled separately from
   the jointly sampled `nx`/`ny` grid. Orientation, winding, and total score
   timing are reported separately.
-- Constraints mode writes three connector-line OBJ diagnostics. `--output PATH`
+- Constraints mode writes four connector-line OBJ diagnostics. `--output PATH`
   is a basename whose final extension is removed; when omitted for `TRACE.zarr`,
   the basename is sibling `TRACE_constraints`. Literal suffixes are
-  `_perpendicular.obj`, `_parallel_same_winding.obj`, and
+  `_perpendicular_same_winding.obj`,
+  `_perpendicular_separate_winding.obj`, `_parallel_same_winding.obj`, and
   `_parallel_separate_winding.obj`.
 - An OBJ connector joins the measured closest points and is named
   `constraint_piece_A_B` from ascending global piece IDs. Hard continuity
-  links are excluded. Perpendicular requires score `>0.5` and aligned winding
-  `>0.3`. Parallel requires score `>0.5`; winding `<0.5` selects same-winding
-  and winding `>=0.5` selects separate-winding. Thus parallel outputs are
+  links are excluded. Perpendicular requires score `>0.5`; winding `<0.5`
+  selects same-winding and winding `>=0.5` selects separate-winding. Parallel
+  uses the same split after requiring score `>0.5`. All four outputs are
   disjoint and exact threshold values have defined ownership.
 - Every piece receives exactly one state: H/even, H/odd, V/even, V/odd, or
   broken. The HiGHS MILP uses active, H/V, and parity binaries per piece, with
@@ -4745,9 +4746,9 @@
   nodes and gap, solve time, and all five label counts.
 - `--lp-relaxation` makes the three piece columns continuous on `[0,1]` and
   writes raw active, H/V, and parity values to
-  `<output-stem>_relaxation.csv`; it must not threshold, repair, or emit the
+  `<output-stem>_values.csv`; it must not threshold, repair, or emit the
   five MILP label OBJs. It additionally emits diagnostic threshold layers with
-  `_relaxation_` before the five label suffixes: V and odd own exact `0.5`, and
+  five ordinary label suffixes: V and odd own exact `0.5`, and
   active owns values at or above the mean activity. Values below the mean are
   shown as broken. These layers must be identified as visualization rather
   than an integer solution. Every link-local H/V and parity difference has one
@@ -4773,3 +4774,10 @@
   integer labeling path or the LP formulation.
   A requested backend that is unavailable in the linked HiGHS build must fail
   explicitly; it must not silently substitute a different solver.
+- `--exclude-parallel-separate-winding` is an opt-in labeling-only ablation.
+  It removes exactly non-hard links with `parallel_score > 0.5` and
+  `winding_distance >= 0.5` before degree, adjacency, gauge, triangle, row, and
+  objective construction. Hard continuity links are retained regardless of
+  scores, the complete extracted report remains the input to constraint OBJ
+  visualization, and retained/excluded counts are reported. Default-off model
+  behavior is unchanged.

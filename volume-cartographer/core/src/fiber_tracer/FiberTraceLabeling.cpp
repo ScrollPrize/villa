@@ -12,6 +12,7 @@
 #include <limits>
 #include <numeric>
 #include <queue>
+#include <span>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -109,11 +110,12 @@ struct ConstraintTriangle {
 };
 
 std::vector<std::vector<NeighborEdge>> buildAdjacency(
-    const FiberTraceConstraintReport& constraints)
+    std::size_t pieceCount,
+    std::span<const FiberTraceConstraint> constraints)
 {
-    std::vector<std::vector<NeighborEdge>> adjacency(constraints.pieces.size());
-    for (std::size_t edge = 0; edge < constraints.constraints.size(); ++edge) {
-        const auto& constraint = constraints.constraints[edge];
+    std::vector<std::vector<NeighborEdge>> adjacency(pieceCount);
+    for (std::size_t edge = 0; edge < constraints.size(); ++edge) {
+        const auto& constraint = constraints[edge];
         adjacency[constraint.pieceA].push_back({constraint.pieceB, edge});
         adjacency[constraint.pieceB].push_back({constraint.pieceA, edge});
     }
@@ -202,12 +204,12 @@ std::vector<ConstraintTriangle> enumerateTriangles(
 
 void canonicalizeLabels(
     std::vector<FiberTracePieceLabel>& labels,
-    const FiberTraceConstraintReport& constraints,
+    std::span<const FiberTraceConstraint> constraints,
     const std::vector<std::size_t>& degree)
 {
     const std::size_t count = labels.size();
     std::vector<std::vector<std::size_t>> adjacency(count);
-    for (const auto& constraint : constraints.constraints) {
+    for (const auto& constraint : constraints) {
         if (isBroken(labels[constraint.pieceA]) ||
             isBroken(labels[constraint.pieceB])) {
             continue;
@@ -285,7 +287,6 @@ FiberTraceLabelingReport solveFiberTraceLabels(
     }
 
     const std::size_t pieceCount = constraints.pieces.size();
-    const std::size_t edgeCount = constraints.constraints.size();
     FiberTraceLabelingReport report;
     if (!config.relaxIntegrality)
         report.labels.assign(pieceCount, FiberTracePieceLabel::Broken);
@@ -294,7 +295,6 @@ FiberTraceLabelingReport solveFiberTraceLabels(
         return report;
     }
 
-    std::vector<std::size_t> degree(pieceCount, 0);
     for (const auto& constraint : constraints.constraints) {
         if (constraint.pieceA >= pieceCount || constraint.pieceB >= pieceCount ||
             constraint.pieceA == constraint.pieceB) {
@@ -309,10 +309,33 @@ FiberTraceLabelingReport solveFiberTraceLabels(
             throw std::invalid_argument(
                 "Fiber trace constraint contains invalid optimization scores");
         }
+    }
+
+    std::vector<FiberTraceConstraint> filteredConstraints;
+    std::span<const FiberTraceConstraint> labelingConstraints =
+        constraints.constraints;
+    if (config.excludeParallelSeparateWinding) {
+        filteredConstraints.reserve(constraints.constraints.size());
+        for (const auto& constraint : constraints.constraints) {
+            const bool exclude = !constraint.hardContinuity &&
+                constraint.parallelScore > 0.5 &&
+                constraint.windingDistance >= 0.5;
+            if (exclude) {
+                ++report.excludedParallelSeparateWinding;
+            } else {
+                filteredConstraints.push_back(constraint);
+            }
+        }
+        labelingConstraints = filteredConstraints;
+    }
+    const std::size_t edgeCount = labelingConstraints.size();
+    report.retainedConstraints = edgeCount;
+    std::vector<std::size_t> degree(pieceCount, 0);
+    for (const auto& constraint : labelingConstraints) {
         ++degree[constraint.pieceA];
         ++degree[constraint.pieceB];
     }
-    const auto adjacency = buildAdjacency(constraints);
+    const auto adjacency = buildAdjacency(pieceCount, labelingConstraints);
     const auto gaugeRoots = componentRoots(adjacency);
     const auto triangles = config.relaxIntegrality
         ? enumerateTriangles(adjacency)
@@ -367,7 +390,7 @@ FiberTraceLabelingReport solveFiberTraceLabels(
     }
 
     for (std::size_t edge = 0; edge < edgeCount; ++edge) {
-        const auto& constraint = constraints.constraints[edge];
+        const auto& constraint = labelingConstraints[edge];
         const std::size_t a = constraint.pieceA;
         const std::size_t b = constraint.pieceB;
         const std::size_t pair = pairBase + edge;
@@ -522,7 +545,7 @@ FiberTraceLabelingReport solveFiberTraceLabels(
             : FiberTracePieceLabel::Broken;
     }
     if (!config.relaxIntegrality)
-        canonicalizeLabels(report.labels, constraints, degree);
+        canonicalizeLabels(report.labels, labelingConstraints, degree);
 
     if (config.relaxIntegrality) {
         for (std::size_t piece = 0; piece < pieceCount; ++piece) {
@@ -531,7 +554,7 @@ FiberTraceLabelingReport solveFiberTraceLabels(
                 (1.0 - report.activeValues[piece]);
         }
         for (std::size_t edge = 0; edge < edgeCount; ++edge) {
-            const auto& constraint = constraints.constraints[edge];
+            const auto& constraint = labelingConstraints[edge];
             const double pair = solution[pairBase + edge];
             const double orientationSame = 1.0 - constraint.parallelScore;
             const double orientationDifferent = constraint.parallelScore;
@@ -554,7 +577,7 @@ FiberTraceLabelingReport solveFiberTraceLabels(
                     static_cast<double>(degree[piece]);
             }
         }
-        for (const auto& constraint : constraints.constraints) {
+        for (const auto& constraint : labelingConstraints) {
             const auto a = report.labels[constraint.pieceA];
             const auto b = report.labels[constraint.pieceB];
             if (isBroken(a) || isBroken(b))
@@ -653,7 +676,7 @@ std::filesystem::path fiberTraceLabelRelaxationCsvPath(
     const std::filesystem::path& outputBase)
 {
     const auto directory = outputBase.parent_path();
-    return directory / (outputStem(outputBase) + "_relaxation.csv");
+    return directory / (outputStem(outputBase) + "_values.csv");
 }
 
 std::filesystem::path writeFiberTraceLabelRelaxationCsv(
@@ -715,11 +738,10 @@ FiberTraceRelaxationObjReport writeFiberTraceLabelRelaxationObjs(
                 labeling.oddValues[piece] >= 0.5));
         }
     }
-    const auto directory = outputBase.parent_path();
     result.objects = writeFiberTraceLabelObjs(
         constraints,
         classified,
-        directory / (outputStem(outputBase) + "_relaxation"));
+        outputBase);
     return result;
 }
 

@@ -80,14 +80,16 @@ using FiberTraceWindingDistanceBatch = std::function<std::vector<double>(
     int parallelThreads)>;
 
 struct FiberTraceConstraintObjPaths {
-    std::filesystem::path perpendicular;
+    std::filesystem::path perpendicularSameWinding;
+    std::filesystem::path perpendicularSeparateWinding;
     std::filesystem::path parallelSameWinding;
     std::filesystem::path parallelSeparateWinding;
 };
 
 struct FiberTraceConstraintObjReport {
     FiberTraceConstraintObjPaths paths;
-    std::size_t perpendicular = 0;
+    std::size_t perpendicularSameWinding = 0;
+    std::size_t perpendicularSeparateWinding = 0;
     std::size_t parallelSameWinding = 0;
     std::size_t parallelSeparateWinding = 0;
 };

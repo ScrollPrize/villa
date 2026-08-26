@@ -624,7 +624,8 @@ FiberTraceConstraintObjPaths fiberTraceConstraintObjPaths(
     if (stem.empty())
         throw std::invalid_argument("constraint OBJ output basename is empty");
     return {
-        directory / (stem + "_perpendicular.obj"),
+        directory / (stem + "_perpendicular_same_winding.obj"),
+        directory / (stem + "_perpendicular_separate_winding.obj"),
         directory / (stem + "_parallel_same_winding.obj"),
         directory / (stem + "_parallel_separate_winding.obj"),
     };
@@ -636,7 +637,8 @@ FiberTraceConstraintObjReport writeFiberTraceConstraintObjs(
 {
     FiberTraceConstraintObjReport result;
     result.paths = fiberTraceConstraintObjPaths(outputBase);
-    std::vector<vc::core::io::NamedPolyline> perpendicular;
+    std::vector<vc::core::io::NamedPolyline> perpendicularSame;
+    std::vector<vc::core::io::NamedPolyline> perpendicularSeparate;
     std::vector<vc::core::io::NamedPolyline> parallelSame;
     std::vector<vc::core::io::NamedPolyline> parallelSeparate;
     for (const auto& constraint : report.constraints) {
@@ -647,30 +649,35 @@ FiberTraceConstraintObjReport writeFiberTraceConstraintObjs(
                 std::to_string(constraint.pieceB),
             {constraint.pointABaseXYZ, constraint.pointBBaseXYZ},
         };
-        if (constraint.perpendicularScore > 0.5 &&
-            constraint.windingDistance > 0.3) {
-            perpendicular.push_back(line);
-        }
-        if (constraint.parallelScore > 0.5) {
+        if (constraint.perpendicularScore > 0.5) {
+            if (constraint.windingDistance < 0.5)
+                perpendicularSame.push_back(std::move(line));
+            else
+                perpendicularSeparate.push_back(std::move(line));
+        } else if (constraint.parallelScore > 0.5) {
             if (constraint.windingDistance < 0.5)
                 parallelSame.push_back(std::move(line));
             else
                 parallelSeparate.push_back(std::move(line));
         }
     }
-    const auto directory = result.paths.perpendicular.parent_path();
+    const auto directory = result.paths.perpendicularSameWinding.parent_path();
     if (!directory.empty())
         std::filesystem::create_directories(directory);
     vc::core::io::writePolylinesObj(
-        perpendicular, result.paths.perpendicular,
-        "VC3D perpendicular crop-trace constraints");
+        perpendicularSame, result.paths.perpendicularSameWinding,
+        "VC3D perpendicular same-winding crop-trace constraints");
+    vc::core::io::writePolylinesObj(
+        perpendicularSeparate, result.paths.perpendicularSeparateWinding,
+        "VC3D perpendicular separate-winding crop-trace constraints");
     vc::core::io::writePolylinesObj(
         parallelSame, result.paths.parallelSameWinding,
         "VC3D parallel same-winding crop-trace constraints");
     vc::core::io::writePolylinesObj(
         parallelSeparate, result.paths.parallelSeparateWinding,
         "VC3D parallel separate-winding crop-trace constraints");
-    result.perpendicular = perpendicular.size();
+    result.perpendicularSameWinding = perpendicularSame.size();
+    result.perpendicularSeparateWinding = perpendicularSeparate.size();
     result.parallelSameWinding = parallelSame.size();
     result.parallelSeparateWinding = parallelSeparate.size();
     return result;

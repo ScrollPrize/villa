@@ -1082,7 +1082,8 @@ TEST_CASE("Trace constraint OBJ views apply strict disjoint thresholds")
         return result;
     };
     report.constraints = {
-        constraint(1, 2, 0.4, 0.6, 0.31),
+        constraint(1, 2, 0.4, 0.6, 0.49),
+        constraint(11, 12, 0.4, 0.6, 0.5),
         constraint(3, 4, 0.6, 0.4, 0.49),
         constraint(5, 6, 0.6, 0.4, 0.5),
         constraint(7, 8, 0.5, 0.5, 1.0),
@@ -1091,13 +1092,16 @@ TEST_CASE("Trace constraint OBJ views apply strict disjoint thresholds")
 
     const auto output = directory.path / "links.diagnostic";
     const auto written = writeFiberTraceConstraintObjs(report, output);
-    CHECK(written.paths.perpendicular ==
-          directory.path / "links_perpendicular.obj");
+    CHECK(written.paths.perpendicularSameWinding ==
+          directory.path / "links_perpendicular_same_winding.obj");
+    CHECK(written.paths.perpendicularSeparateWinding ==
+          directory.path / "links_perpendicular_separate_winding.obj");
     CHECK(written.paths.parallelSameWinding ==
           directory.path / "links_parallel_same_winding.obj");
     CHECK(written.paths.parallelSeparateWinding ==
           directory.path / "links_parallel_separate_winding.obj");
-    CHECK(written.perpendicular == 1);
+    CHECK(written.perpendicularSameWinding == 1);
+    CHECK(written.perpendicularSeparateWinding == 1);
     CHECK(written.parallelSameWinding == 1);
     CHECK(written.parallelSeparateWinding == 1);
     const auto read = [](const std::filesystem::path& path) {
@@ -1106,8 +1110,10 @@ TEST_CASE("Trace constraint OBJ views apply strict disjoint thresholds")
         text << input.rdbuf();
         return text.str();
     };
-    CHECK(read(written.paths.perpendicular).find(
+    CHECK(read(written.paths.perpendicularSameWinding).find(
               "o constraint_piece_1_2\n") != std::string::npos);
+    CHECK(read(written.paths.perpendicularSeparateWinding).find(
+              "o constraint_piece_11_12\n") != std::string::npos);
     CHECK(read(written.paths.parallelSameWinding).find(
               "o constraint_piece_3_4\n") != std::string::npos);
     CHECK(read(written.paths.parallelSeparateWinding).find(
@@ -1117,8 +1123,8 @@ TEST_CASE("Trace constraint OBJ views apply strict disjoint thresholds")
 
     const auto defaultPaths = fiberTraceConstraintObjPaths(
         directory.path / "crop_traces_constraints");
-    CHECK(defaultPaths.perpendicular.filename() ==
-          "crop_traces_constraints_perpendicular.obj");
+    CHECK(defaultPaths.perpendicularSameWinding.filename() ==
+          "crop_traces_constraints_perpendicular_same_winding.obj");
 }
 
 TEST_CASE("Trace constraints discard winding distances at the exclusive cutoff")
@@ -1306,7 +1312,7 @@ TEST_CASE("Trace labeling exposes a continuous LP relaxation")
     const TemporaryDirectory directory("trace_label_relaxation");
     const auto path = writeFiberTraceLabelRelaxationCsv(
         constraints, labeling, directory.path / "crop.labels");
-    CHECK(path.filename() == "crop_relaxation.csv");
+    CHECK(path.filename() == "crop_values.csv");
     std::ifstream input(path);
     std::ostringstream text;
     text << input.rdbuf();
@@ -1332,9 +1338,9 @@ TEST_CASE("Trace labeling exposes a continuous LP relaxation")
         visualConstraints, visualLabels, directory.path / "crop.labels");
     CHECK(visual.activeThreshold == doctest::Approx(0.68));
     CHECK(visual.objects.paths.hEven.filename() ==
-          "crop_relaxation_h_even.obj");
+          "crop_h_even.obj");
     CHECK(visual.objects.paths.broken.filename() ==
-          "crop_relaxation_broken.obj");
+          "crop_broken.obj");
     CHECK(visual.objects.pieceCounts[0] == 1);
     CHECK(visual.objects.pieceCounts[1] == 1);
     CHECK(visual.objects.pieceCounts[2] == 1);
@@ -1359,6 +1365,46 @@ TEST_CASE("Trace labeling rejects LP backend controls outside relaxation mode")
         solveFiberTraceLabels(constraints, config),
         doctest::Contains("LP solver must be choose, simplex, hipo, or ipm"),
         std::invalid_argument);
+}
+
+TEST_CASE("Trace labeling can exclude measured parallel separate winding links")
+{
+    FiberTraceConstraintReport constraints;
+    constraints.pieces.resize(4);
+    const auto add = [&](std::size_t a,
+                         std::size_t b,
+                         double parallel,
+                         double winding,
+                         bool hard) {
+        constraints.constraints.push_back({
+            a, b, 0.0, 0.0,
+            {static_cast<double>(a), 0.0, 0.0},
+            {static_cast<double>(b), 0.0, 0.0},
+            1.0, parallel, 1.0 - parallel, winding, hard});
+    };
+    add(0, 1, 0.5, 0.5, false);
+    add(1, 2, 0.5001, 0.5, false);
+    add(2, 3, 0.9, 1.0, true);
+    add(0, 3, 0.9, 0.4999, false);
+
+    FiberTraceLabelingConfig config;
+    config.parallelThreads = 1;
+    config.relaxIntegrality = true;
+    config.brokenCostPerConstraint = 10.0;
+    const auto complete = solveFiberTraceLabels(constraints, config);
+    CHECK(complete.retainedConstraints == 4);
+    CHECK(complete.excludedParallelSeparateWinding == 0);
+    CHECK(complete.variables == 24);
+    CHECK(complete.rows == 60);
+
+    config.excludeParallelSeparateWinding = true;
+    const auto filtered = solveFiberTraceLabels(constraints, config);
+    CHECK(filtered.retainedConstraints == 3);
+    CHECK(filtered.excludedParallelSeparateWinding == 1);
+    CHECK(filtered.variables == 21);
+    CHECK(filtered.rows == 47);
+    CHECK(filtered.gaugeRoots == 1);
+    CHECK(filtered.triangles == 0);
 }
 
 TEST_CASE("Trace labeling LP enforces triangle-consistent differences")

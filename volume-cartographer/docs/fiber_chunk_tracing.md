@@ -88,7 +88,8 @@ volume-cartographer/build/bin/vc_fiber_trace_chunk \
 ```
 
 `--output` is an OBJ basename; its final extension is removed. The command
-writes `crop_constraints_perpendicular.obj`,
+writes `crop_constraints_perpendicular_same_winding.obj`,
+`crop_constraints_perpendicular_separate_winding.obj`,
 `crop_constraints_parallel_same_winding.obj`, and
 `crop_constraints_parallel_separate_winding.obj`. It also solves the piece
 labels and writes `crop_constraints_h_even.obj`,
@@ -124,7 +125,7 @@ Pass `--lp-relaxation` to replace the three binary piece variables by
 continuous `[0,1]` variables while retaining the same linear objective and
 constraint envelopes. The command does not threshold or canonicalize that
 solution and does not write the five discrete label OBJs. Instead it writes
-`<output-stem>_relaxation.csv` with stable piece, trace, and within-trace piece
+`<output-stem>_values.csv` with stable piece, trace, and within-trace piece
 IDs followed by the raw `active`, `vertical`, and `odd` values. Console output
 reports deciles for each variable. This mode is a diagnostic of relaxation
 strength, not a discrete labeling.
@@ -132,9 +133,8 @@ strength, not a discrete labeling.
 For direct inspection, LP mode also thresholds the raw values into five OBJ
 layers. `vertical >= 0.5` selects V, `odd >= 0.5` selects odd, and
 `active >= mean(active)` selects an active label; lower activity is broken.
-The literal suffixes are `_relaxation_h_even.obj`,
-`_relaxation_h_odd.obj`, `_relaxation_v_even.obj`,
-`_relaxation_v_odd.obj`, and `_relaxation_broken.obj`. The report prints the
+The literal suffixes are `_h_even.obj`, `_h_odd.obj`, `_v_even.obj`,
+`_v_odd.obj`, and `_broken.obj`. The report prints the
 actual mean activity threshold and every class count. These layers are only a
 threshold visualization and are not presented as an optimized integer result.
 
@@ -148,6 +148,14 @@ triangle while allowing the remaining active edge to differ if the third
 piece is broken. Reports include gauge-root, triangle, and triangle-row counts.
 All triangles are materialized deterministically; this diagnostic can consume
 substantial time and memory on dense crops and does not silently omit cuts.
+
+Pass `--exclude-parallel-separate-winding` for a solver-only ablation. It omits
+non-hard measured links with `parallel_score > 0.5` and
+`winding_distance >= 0.5` from degree penalties, adjacency, gauges, triangle
+cuts, and objective terms. Exact `parallel_score == 0.5` remains included, and
+hard continuity links are never removed. The four constraint OBJ files still
+represent the complete extracted constraint set. Labeling output reports both
+retained and excluded link counts.
 
 HiGHS' LP backend can be selected explicitly for this diagnostic. Add
 `--lp-parallel` to request parallel execution, and use `--lp-solver choose`,
