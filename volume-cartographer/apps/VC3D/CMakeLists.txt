@@ -35,6 +35,8 @@ set(srcs
     FiberMapWorkspace.hpp
     FiberNetworkLayout.cpp
     FiberNetworkLayout.hpp
+    FiberWindingSolver.cpp
+    FiberWindingSolver.hpp
     FiberSliceGeometry.cpp
     FiberSliceGeometry.hpp
     AnnotationFrame.hpp

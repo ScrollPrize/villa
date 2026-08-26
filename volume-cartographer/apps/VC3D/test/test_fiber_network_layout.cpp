@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "FiberNetworkLayout.hpp"
@@ -87,6 +89,15 @@ InputFiber makeFiber(uint64_t id, const QString& label, char hvTag,
     fiber.hvTag = hvTag;
     fiber.linePoints = std::move(linePoints);
     for (int index : controlIndices) {
+        // Loud in every build type: a bad fixture index must abort the test,
+        // not read past the vector in release.
+        if (index < 0 ||
+            static_cast<std::size_t>(index) >= fiber.linePoints.size()) {
+            throw std::out_of_range(
+                "makeFiber: control index " + std::to_string(index) +
+                " out of range for " + std::to_string(fiber.linePoints.size()) +
+                " line points");
+        }
         fiber.controlPoints.push_back(fiber.linePoints[static_cast<std::size_t>(index)]);
     }
     if (fiber.controlPoints.size() > 1) {
