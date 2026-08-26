@@ -29,6 +29,7 @@
 #include <QPushButton>
 #include <QScopeGuard>
 #include <QScrollBar>
+#include <QtConcurrent/QtConcurrent>
 #include <QStyleOptionGraphicsItem>
 #include <QTimer>
 #include <QToolBar>
@@ -40,7 +41,9 @@
 #include <QWindow>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <memory>
 #include <limits>
 #include <utility>
 
@@ -585,9 +588,9 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
     }
 
     connect(_updateButton, &QPushButton::clicked, this,
-            [this]() { rebuildLayout(false); });
+            [this]() { requestRebuild(false); });
     connect(_fullRebuildButton, &QPushButton::clicked, this,
-            [this]() { rebuildLayout(true); });
+            [this]() { requestRebuild(true); });
     connect(_view, &FiberMapView::clicked, this, &FiberMapWorkspace::handleSceneClick);
     connect(_view, &FiberMapView::zoomed, this,
             &FiberMapWorkspace::updateLabelChipVisibility);
@@ -645,13 +648,48 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
     _stalePollTimer = new QTimer(this);
     _stalePollTimer->setInterval(1000);
     connect(_stalePollTimer, &QTimer::timeout, this, [this]() {
-        if (_rebuildInProgress || !_layoutBuilt) {
+        if (_rebuildQueue.state() !=
+                vc3d::fiber_map::FiberMapRebuildQueue::State::Idle ||
+            !_layoutBuilt) {
             return;
         }
         refreshStaleState();
     });
 
+    // The rebuild worker: a private one-thread pool (no starvation from the
+    // global pool's other users, bounded teardown) and a watcher that hands
+    // the finished job back on the GUI thread. The watcher is parented, so
+    // its connection dies with the workspace.
+    _rebuildPool.setMaxThreadCount(1);
+    _rebuildWatcher =
+        new QFutureWatcher<std::shared_ptr<RebuildJobResult>>(this);
+    connect(_rebuildWatcher,
+            &QFutureWatcher<std::shared_ptr<RebuildJobResult>>::finished, this,
+            [this]() { applyRebuild(_rebuildWatcher->result()); });
+    _progressMarquee = new QTimer(this);
+    _progressMarquee->setInterval(30);
+    connect(_progressMarquee, &QTimer::timeout, this,
+            [this]() { tickRebuildProgress(); });
+
     rebuildScene(tr("press Update"));
+}
+
+FiberMapWorkspace::~FiberMapWorkspace()
+{
+    // No new starts, pending dropped, and any in-flight publication refused
+    // by the epoch; the wait is only for the private pool's clean teardown -
+    // the worker owns its own data.
+    _rebuildQueue.shutdown();
+    if (_stalePollTimer) {
+        _stalePollTimer->stop();
+    }
+    if (_progressMarquee) {
+        _progressMarquee->stop();
+    }
+    if (_rebuildWatcher) {
+        _rebuildWatcher->disconnect(this);
+    }
+    _rebuildPool.waitForDone();
 }
 
 double FiberMapWorkspace::sceneVxPerCm() const
@@ -718,6 +756,9 @@ void FiberMapWorkspace::clearLayout(const QString& reason)
     _layoutBuilt = false;
     _layoutCache.clear();
     _haveLastDigests = false;
+    // An in-flight build started in a world this clear just removed; the
+    // epoch bump refuses its publication.
+    _rebuildQueue.invalidate();
     _voxelSizeUm.reset();
     _scrollZMaxVx = 0.0;
     // A fresh fit belongs to the next layout, which is not this one's frame.
@@ -830,8 +871,19 @@ namespace
 constexpr const char* kRebuildProgressOverlayName = "fiberMapRebuildProgress";
 } // namespace
 
-void FiberMapWorkspace::setRebuildProgress(QPushButton* button, double fraction)
+void FiberMapWorkspace::startRebuildProgress(QPushButton* button)
 {
+    _progressButton = button;
+    _progressPhase = 0;
+    if (_progressMarquee) {
+        _progressMarquee->start();
+    }
+    tickRebuildProgress();
+}
+
+void FiberMapWorkspace::tickRebuildProgress()
+{
+    QPushButton* button = _progressButton;
     if (button == nullptr) {
         return;
     }
@@ -846,20 +898,27 @@ void FiberMapWorkspace::setRebuildProgress(QPushButton* button, double fraction)
         overlay->setStyleSheet(QStringLiteral(
             "background-color: rgba(80, 150, 255, 110); border-radius: 2px;"));
     }
-    const double clamped = std::clamp(fraction, 0.0, 1.0);
-    overlay->setGeometry(
-        0, 0, static_cast<int>(std::lround(button->width() * clamped)),
-        button->height());
+    // A marquee: a bar one third of the button wide, sweeping left to right
+    // and wrapping. The event loop is live while the worker runs, so this is
+    // a real animation - no forced synchronous paints needed any more.
+    constexpr qint64 kSweepMs = 1100;
+    const double phase =
+        static_cast<double>(_progressPhase % kSweepMs) / kSweepMs;
+    _progressPhase += _progressMarquee ? _progressMarquee->interval() : 30;
+    const int barWidth = std::max(8, button->width() / 3);
+    const int travel = button->width() + barWidth;
+    const int x = static_cast<int>(std::lround(phase * travel)) - barWidth;
+    overlay->setGeometry(x, 0, barWidth, button->height());
     overlay->show();
     overlay->raise();
-    // The rebuild blocks the event loop, so the sweep must paint NOW: repaint
-    // is a synchronous paint of exactly these widgets, no event loop needed.
-    overlay->repaint();
-    button->repaint();
 }
 
 void FiberMapWorkspace::clearRebuildProgress()
 {
+    if (_progressMarquee) {
+        _progressMarquee->stop();
+    }
+    _progressButton = nullptr;
     for (QPushButton* button : {_updateButton, _fullRebuildButton}) {
         if (button == nullptr) {
             continue;
@@ -875,33 +934,122 @@ void FiberMapWorkspace::clearRebuildProgress()
 
 void FiberMapWorkspace::scheduleAutoUpdate()
 {
-    // Queued rather than inline: the gates run inside click and selection
-    // handlers whose scene items a rebuild would delete, and rebuildLayout
-    // itself ends in a stale refresh that must not recurse into another
-    // rebuild. The verdict is re-evaluated when the shot fires - anything can
-    // change in between, including the staleness resolving itself.
-    // Arming during a rebuild is deliberate: rebuildLayout's own final stale
-    // refresh is the one place the mid-build umbilicus race surfaces, and the
-    // single-shot cannot fire until the synchronous rebuild has returned and
-    // released the guard - the firing callback re-checks everything.
-    if (_autoUpdateScheduled || !isVisible()) {
+    if (!isVisible()) {
+        return;
+    }
+    // A build in flight: fold the request into the pending slot directly -
+    // the running build's epilogue dispatches it, and a timer here could
+    // only race that dispatch.
+    if (_rebuildQueue.state() !=
+        vc3d::fiber_map::FiberMapRebuildQueue::State::Idle) {
+        (void)_rebuildQueue.request(false);
+        return;
+    }
+    if (_autoUpdateScheduled) {
         return;
     }
     _autoUpdateScheduled = true;
+    // Queued and debounced: the gates run inside click and selection
+    // handlers whose scene items a publication would replace, and the
+    // verdict is re-evaluated when the shot fires - anything can change in
+    // between, including the staleness resolving itself.
     QTimer::singleShot(150, this, [this]() {
         _autoUpdateScheduled = false;
-        if (_rebuildInProgress || !isVisible() || !_layoutBuilt) {
+        if (!isVisible() || !_layoutBuilt) {
             return;
         }
         const StaleVerdict verdict = evaluateDependencies();
         if (verdict.action == StaleVerdict::Action::MarkStale &&
             (verdict.cause == StaleVerdict::Cause::Fibers ||
              verdict.cause == StaleVerdict::Cause::Umbilicus)) {
-            rebuildLayout(false);
+            // requestRebuild coalesces if a build started in the meantime.
+            requestRebuild(false);
         }
     });
 }
 
+// Everything a rebuild consumes and produces, owned by the job so the two
+// threads share no mutable state: the worker gets the snapshot, params, and
+// the memoization cache (moved out of the workspace for the flight); the
+// apply step takes the products back only after validating that the world
+// the job started in still exists.
+struct FiberMapWorkspace::RebuildJobResult {
+    bool fullRebuild = false;
+    uint64_t epoch = 0;
+    // The world as of the start, for apply-time validation.
+    QString preReadUmbilicusFingerprint;
+    uint64_t builtPackageGeneration = 0;
+    uint64_t builtUmbilicusGeneration = 0;
+    // Inputs (snapshot fibers are consumed by the worker's conversion).
+    LineAnnotationController::FiberMapSnapshot snapshot;
+    vc3d::fiber_map::GlobalLayoutParams params;
+    bool hadFibers = false;
+    bool hadUmbilicus = false;
+    // The workspace's memoization cache, exclusive to the job in flight.
+    vc3d::fiber_map::GlobalLayoutCache cache;
+    // Products.
+    vc3d::fiber_map::GlobalResult layout;
+    vc3d::fiber_map::ContentDigest inputsDigest;
+    vc3d::fiber_map::ContentDigest outputDigest;
+    vc3d::fiber_map::GlobalLayoutCache::Stats stats;
+    QString error;
+    qint64 snapshotMs = 0;
+    qint64 convertMs = 0;
+    qint64 layoutMs = 0;
+};
+
+namespace
+{
+
+// The worker: conversion, input digest, layout, output digest - everything
+// that does not need the GUI thread. Exceptions become the job's error;
+// nothing escapes into Qt.
+void runRebuildJob(const std::shared_ptr<FiberMapWorkspace::RebuildJobResult>& job)
+{
+    try {
+        const auto convertBegin = std::chrono::steady_clock::now();
+        std::vector<vc3d::fiber_map::InputFiber> inputs;
+        inputs.reserve(job->snapshot.fibers.size());
+        for (auto& fiber : job->snapshot.fibers) {
+            vc3d::fiber_map::InputFiber input;
+            input.id = fiber.id;
+            input.fileName = fiber.fileName;
+            input.label = fiber.label;
+            input.hvTag = fiber.hvTag;
+            input.controlPoints = std::move(fiber.controlPoints);
+            input.linePoints = std::move(fiber.linePoints);
+            input.tracedSegments = std::move(fiber.tracedSegments);
+            input.links.reserve(fiber.links.size());
+            for (const auto& link : fiber.links) {
+                input.links.push_back(
+                    vc3d::fiber_map::InputLink{link.controlPointIndex,
+                                               link.branchFiberId,
+                                               link.branchControlPointIndex,
+                                               link.pending});
+            }
+            inputs.push_back(std::move(input));
+        }
+        job->inputsDigest = vc3d::fiber_map::digestGlobalInputs(
+            inputs, job->snapshot.umbilicusCenters, job->params);
+        const auto layoutBegin = std::chrono::steady_clock::now();
+        job->convertMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             layoutBegin - convertBegin)
+                             .count();
+        job->layout = vc3d::fiber_map::buildGlobalLayout(
+            inputs, job->snapshot.umbilicusCenters, job->params, &job->cache);
+        job->layoutMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - layoutBegin)
+                            .count();
+        job->outputDigest = vc3d::fiber_map::digestGlobalResult(job->layout);
+        job->stats = job->cache.lastStats();
+    } catch (const std::exception& ex) {
+        job->error = QString::fromUtf8(ex.what());
+    } catch (...) {
+        job->error = QStringLiteral("unknown rebuild error");
+    }
+}
+
+} // namespace
 
 void FiberMapWorkspace::hideEvent(QHideEvent* event)
 {
@@ -940,145 +1088,201 @@ void FiberMapWorkspace::showEvent(QShowEvent* event)
     }
 }
 
-void FiberMapWorkspace::rebuildLayout(bool fullRebuild)
+void FiberMapWorkspace::requestRebuild(bool fullRebuild)
 {
-    if (!_controller || _rebuildInProgress) {
+    if (!_controller) {
         return;
     }
-    _rebuildInProgress = true;
-    QPushButton* progressButton = fullRebuild ? _fullRebuildButton : _updateButton;
-    const auto rebuildGuard = qScopeGuard([this]() {
-        clearRebuildProgress();
-        _rebuildInProgress = false;
-    });
-    setRebuildProgress(progressButton, 0.06);
-    QElapsedTimer phaseTimer;
-    phaseTimer.start();
-    QElapsedTimer totalTimer;
-    totalTimer.start();
-    // A package or coordinate-grid switch makes every cached artifact
-    // meaningless, and this must be caught BEFORE the recorded dependencies
-    // are overwritten below - a visible workspace can reach this build
-    // without clearLayout() ever having run for the switch.
+    switch (_rebuildQueue.request(fullRebuild)) {
+    case vc3d::fiber_map::FiberMapRebuildQueue::Request::Refused:
+        return;
+    case vc3d::fiber_map::FiberMapRebuildQueue::Request::Coalesced:
+        // Folded into the pending slot; the running build's epilogue
+        // dispatches it.
+        return;
+    case vc3d::fiber_map::FiberMapRebuildQueue::Request::Start:
+        startRebuild(fullRebuild);
+        return;
+    }
+}
+
+void FiberMapWorkspace::startRebuild(bool fullRebuild)
+{
+    // The queue granted a Start: every exit either launches the worker or
+    // runs the epilogue so the queue returns to Idle.
+    // A package switch makes every cached artifact and the displayed scene
+    // meaningless, and asynchrony exposes the interval - so it gets the FULL
+    // clear (scene, tree, watermarks, cache, epoch), not the cache-only
+    // reset that sufficed while rebuilds were synchronous. Grid changes stay
+    // reversible MarkStale and never clear.
     if (_layoutBuilt) {
         const StaleVerdict verdict = vc3d::fiber_map::staleVerdictFor(
             layoutDependencies(), currentDependencies(),
             /*layoutBuilt=*/true, QString());
         if (verdict.action == StaleVerdict::Action::ClearLayout) {
-            _layoutCache.clear();
-            _haveLastDigests = false;
-            // The rest of the package-scoped state clearLayout() would have
-            // reset: the new package's map deserves its own first fit, and
-            // the cached umbilicus suffix described the old package.
-            _viewFitted = false;
-            _umbilicusStatusValid = false;
+            clearLayout(verdict.reason);
         }
     }
     if (fullRebuild || _memoizationDisabled) {
         _layoutCache.clear();
     }
+
+    auto job = std::make_shared<RebuildJobResult>();
+    job->fullRebuild = fullRebuild;
+    // Captured after the pre-check: a clear above advanced the epoch, and
+    // this job publishes into the world as it stands now.
+    job->epoch = _rebuildQueue.epoch();
     try {
-    // Read before the snapshot: fiberMapSnapshot() parses the umbilicus, so a
-    // rewrite during that parse that moves the file's size or mtime — the
-    // token's contract; a same-size rewrite inside one timestamp tick is
-    // beyond it — leaves the recorded token disagreeing with the disk, and the
-    // refresh at the end of this function raises the banner. Recording a
-    // post-read token instead would tag geometry of indeterminate vintage as
-    // current even in the cases the token can see. Held in a local: every
-    // dependency watermark is committed together AFTER the build succeeds, so
-    // a failed build cannot leave the old scene marked current against new
-    // dependencies.
-    const QString preReadUmbilicusFingerprint = _controller->umbilicusFingerprint();
-    LineAnnotationController::FiberMapSnapshot snapshot = _controller->fiberMapSnapshot();
-    const qint64 snapshotMs = phaseTimer.restart();
-    setRebuildProgress(progressButton, 0.25);
-    const uint64_t builtPackageGeneration = _controller->packageGeneration();
-    const uint64_t builtUmbilicusGeneration = _controller->umbilicusGeneration();
-
-    // The snapshot's geometry is handed straight to the layout; every fiber of
-    // the package is in it, so a second copy is worth avoiding.
-    std::vector<vc3d::fiber_map::InputFiber> inputs;
-    inputs.reserve(snapshot.fibers.size());
-    for (auto& fiber : snapshot.fibers) {
-        vc3d::fiber_map::InputFiber input;
-        input.id = fiber.id;
-        input.fileName = fiber.fileName;
-        input.label = fiber.label;
-        input.hvTag = fiber.hvTag;
-        input.controlPoints = std::move(fiber.controlPoints);
-        input.linePoints = std::move(fiber.linePoints);
-        input.tracedSegments = std::move(fiber.tracedSegments);
-        input.links.reserve(fiber.links.size());
-        for (const auto& link : fiber.links) {
-            input.links.push_back(vc3d::fiber_map::InputLink{link.controlPointIndex,
-                                                             link.branchFiberId,
-                                                             link.branchControlPointIndex,
-                                                             link.pending});
-        }
-        inputs.push_back(std::move(input));
+        // Read before the snapshot: fiberMapSnapshot() parses the umbilicus,
+        // so a rewrite during that parse that moves the file's size or mtime
+        // — the token's contract; a same-size rewrite inside one timestamp
+        // tick is beyond it — leaves the recorded token disagreeing with the
+        // disk, and the publish-time refresh raises the banner.
+        job->preReadUmbilicusFingerprint = _controller->umbilicusFingerprint();
+        QElapsedTimer snapshotTimer;
+        snapshotTimer.start();
+        job->snapshot = _controller->fiberMapSnapshot();
+        job->snapshotMs = snapshotTimer.elapsed();
+        job->builtPackageGeneration = _controller->packageGeneration();
+        job->builtUmbilicusGeneration = _controller->umbilicusGeneration();
+        job->hadFibers = !job->snapshot.fibers.empty();
+        job->hadUmbilicus = !job->snapshot.umbilicusCenters.empty();
+    } catch (const std::exception& ex) {
+        Logger()->error("Fiber map: snapshot failed: {}", ex.what());
+        markStale(tr("rebuild failed — press Update"));
+        _rebuildQueue.beginApply();
+        finishRebuild();
+        return;
     }
 
-    vc3d::fiber_map::GlobalLayoutParams params;
     // The layout and solver are unit-free, so the physical intents behind
-    // their tuning lengths are converted here — once the voxel size is known,
-    // exactly as documented on GlobalLayoutParams and SolverParams. Left
-    // alone when it is not, so the defaults (the same intents at 2.4 µm)
-    // stand in and the map still lays out sensibly.
-    if (snapshot.voxelSizeUm) {
-        const double vxPerCm = kUmPerCm / *snapshot.voxelSizeUm;
-        params.smoothVx = 0.12 * vxPerCm;         // 1.2 mm arclength sigma
-        params.resampleStepVx = 0.025 * vxPerCm;  // 0.025 cm resample step
-        params.minPadXVx = 2.2 * vxPerCm;         // 2.2 cm label pad across
-        params.minPadYVx = 1.6 * vxPerCm;         // 1.6 cm label pad up
-        params.solver.tieBandVx = 0.03 * vxPerCm;            // sheet-thickness tie band
-        params.solver.minUmbilicusRadiusVx = 0.1 * vxPerCm;   // angular conditioning
-        params.solver.zMergeVx = 0.2 * vxPerCm;               // crossing dedup span
-        params.solver.neighborhoodZVx = 0.5 * vxPerCm;        // ordinal window
-        params.solver.neighborhoodArcVx = 0.5 * vxPerCm;
+    // their tuning lengths are converted here — once the voxel size is
+    // known, exactly as documented on GlobalLayoutParams and SolverParams.
+    // Left alone when it is not, so the defaults (the same intents at
+    // 2.4 µm) stand in and the map still lays out sensibly.
+    if (job->snapshot.voxelSizeUm) {
+        const double vxPerCm = kUmPerCm / *job->snapshot.voxelSizeUm;
+        job->params.smoothVx = 0.12 * vxPerCm;         // 1.2 mm arclength sigma
+        job->params.resampleStepVx = 0.025 * vxPerCm;  // 0.025 cm resample step
+        job->params.minPadXVx = 2.2 * vxPerCm;         // 2.2 cm label pad across
+        job->params.minPadYVx = 1.6 * vxPerCm;         // 1.6 cm label pad up
+        job->params.solver.tieBandVx = 0.03 * vxPerCm;           // sheet-thickness scale
+        job->params.solver.minUmbilicusRadiusVx = 0.1 * vxPerCm; // angular conditioning
+        job->params.solver.zMergeVx = 0.2 * vxPerCm;             // crossing dedup span
+        job->params.solver.neighborhoodZVx = 0.5 * vxPerCm;      // ordinal window
+        job->params.solver.neighborhoodArcVx = 0.5 * vxPerCm;
     }
-    const qint64 convertMs = phaseTimer.restart();
-    setRebuildProgress(progressButton, 0.32);
-    _layout = vc3d::fiber_map::buildGlobalLayout(inputs, snapshot.umbilicusCenters,
-                                                 params, &_layoutCache);
-    const qint64 layoutMs = phaseTimer.restart();
-    setRebuildProgress(progressButton, 0.78);
-    // The build succeeded: commit every dependency watermark together.
-    // (_layoutBuilt covers empty results too - an empty result is still a
-    // result, derived from dependencies that go out of date.)
-    _layoutUmbilicusFingerprint = preReadUmbilicusFingerprint;
-    _layoutGeneration = snapshot.generation;
-    _layoutFrame = snapshot.frame;
-    _layoutPackageGeneration = builtPackageGeneration;
-    _layoutUmbilicusGeneration = builtUmbilicusGeneration;
+
+    // The cache travels WITH the job: the worker is its only toucher while
+    // the build is in flight, by construction rather than by discipline. Any
+    // GUI path that "clears the cache" mid-flight clears this empty stand-in,
+    // and the epoch such paths also bump refuses the job's publication.
+    job->cache = std::move(_layoutCache);
+    _layoutCache = vc3d::fiber_map::GlobalLayoutCache{};
+
+    _updateButton->setEnabled(false);
+    _fullRebuildButton->setEnabled(false);
+    startRebuildProgress(fullRebuild ? _fullRebuildButton : _updateButton);
+
+    _rebuildWatcher->setFuture(QtConcurrent::run(
+        &_rebuildPool, [job]() {
+            runRebuildJob(job);
+            return job;
+        }));
+}
+
+void FiberMapWorkspace::applyRebuild(const std::shared_ptr<RebuildJobResult>& job)
+{
+    // Publication is allowed only into the epoch the job started in, while
+    // the queue still expects this build; checked before beginApply flips
+    // the state.
+    const bool expected = job != nullptr && _rebuildQueue.mayPublish(job->epoch);
+    _rebuildQueue.beginApply();
+    const auto epilogue = qScopeGuard([this]() { finishRebuild(); });
+
+    if (!expected || !_controller) {
+        // A package switch, explicit clear, memoization-policy change, or
+        // shutdown happened mid-flight: the job's world is gone. Its cache
+        // is dropped with it - the events that bump the epoch are exactly
+        // the ones that invalidate content - and the gates already show the
+        // right state.
+        return;
+    }
+    if (!job->error.isEmpty()) {
+        Logger()->error("Fiber map: rebuild failed: {}",
+                        job->error.toStdString());
+        markStale(tr("rebuild failed — press Update"));
+        return;
+    }
+    // A package or grid switch no gate happened to observe mid-flight: the
+    // epoch could not catch it, so it is validated directly. The result (and
+    // its cache, built from the old package's content) is discarded; the
+    // ordinary gates take over.
+    if (_controller->packageGeneration() != job->builtPackageGeneration ||
+        !vc3d::annotation::sameAnnotationGrid(_controller->annotationFrame(),
+                                              job->snapshot.frame)) {
+        refreshStaleState();
+        return;
+    }
+    // Fibers or the umbilicus changed mid-flight: publishing a result
+    // already known stale would put a wrong picture on screen, so the
+    // reviewer's rule is followed literally - discard and re-run. The job's
+    // cache IS kept: its slots are content-keyed digests, exact across
+    // edits, so the immediate re-run stays warm and cheap.
+    if (_controller->fiberDataGeneration() != job->snapshot.generation ||
+        _controller->umbilicusGeneration() != job->builtUmbilicusGeneration ||
+        _controller->umbilicusFingerprint() != job->preReadUmbilicusFingerprint) {
+        _layoutCache = std::move(job->cache);
+        (void)_rebuildQueue.request(job->fullRebuild);
+        showStale(tr("changed during update — updating…"));
+        return;
+    }
+
+    try {
+        publishRebuild(*job);
+    } catch (const std::exception& ex) {
+        // A throw from scene or tree construction can leave the scene and
+        // watermarks disagreeing; the latch refuses interaction until a
+        // rebuild succeeds.
+        Logger()->error("Fiber map: rebuild publication failed: {}", ex.what());
+        markStale(tr("rebuild failed — press Update"));
+    }
+}
+
+void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
+{
+    QElapsedTimer publishTimer;
+    publishTimer.start();
+    // The job's cache and layout become the workspace's, and every
+    // dependency watermark commits together.
+    _layoutCache = std::move(job.cache);
+    _layout = std::move(job.layout);
+    _layoutUmbilicusFingerprint = job.preReadUmbilicusFingerprint;
+    _layoutGeneration = job.snapshot.generation;
+    _layoutFrame = job.snapshot.frame;
+    _layoutPackageGeneration = job.builtPackageGeneration;
+    _layoutUmbilicusGeneration = job.builtUmbilicusGeneration;
     _layoutBuilt = true;
     _staleReason.clear();
     _latchedReason.clear();
     _restingReason.clear();
-    _voxelSizeUm = snapshot.voxelSizeUm;
+    _voxelSizeUm = job.snapshot.voxelSizeUm;
 
     // Full rebuild doubles as the memoization check: when nothing the layout
-    // consumes changed since the last Update, the from-scratch output must
-    // digest identically. A mismatch means a cache bug - report it and bench
-    // memoization for the session (every later build then starts cold).
-    const vc3d::fiber_map::ContentDigest inputsDigest =
-        vc3d::fiber_map::digestGlobalInputs(inputs, snapshot.umbilicusCenters,
-                                            params);
-    const vc3d::fiber_map::ContentDigest outputDigest =
-        vc3d::fiber_map::digestGlobalResult(_layout);
+    // consumes changed since the last memoized Update, the from-scratch
+    // output must digest identically. Digest bookkeeping happens ONLY here,
+    // inside a successful publication - discarded and failed builds leave it
+    // untouched.
     QString verificationNote;
-    if (fullRebuild) {
-        // The reference is the last memoized Update that actually reused
-        // something; verifying a cold build against a cold build would claim
-        // "verified" without any cached value having been tested. The
-        // reference is consumed either way - after a Full rebuild, the next
-        // Update records afresh.
-        if (_haveLastDigests && inputsDigest == _lastInputsDigest) {
-            if (outputDigest == _lastOutputDigest) {
+    if (job.fullRebuild) {
+        if (_haveLastDigests && job.inputsDigest == _lastInputsDigest) {
+            if (job.outputDigest == _lastOutputDigest) {
                 verificationNote = tr(" · cache verified");
             } else {
                 verificationNote = tr(" · CACHE MISMATCH — memoization disabled");
                 _memoizationDisabled = true;
                 _layoutCache.clear();
+                _rebuildQueue.invalidate();
                 Logger()->error(
                     "Fiber map: full rebuild output differs from the memoized "
                     "build on identical inputs; memoization disabled");
@@ -1086,32 +1290,33 @@ void FiberMapWorkspace::rebuildLayout(bool fullRebuild)
         }
         _haveLastDigests = false;
     } else {
-        const auto& stats = _layoutCache.lastStats();
         const bool reusedSomething =
-            stats.used && (stats.fibersReused > 0 || stats.pairsReused > 0);
+            job.stats.used &&
+            (job.stats.fibersReused > 0 || job.stats.pairsReused > 0);
         if (reusedSomething && !_memoizationDisabled) {
-            _lastInputsDigest = inputsDigest;
-            _lastOutputDigest = outputDigest;
+            _lastInputsDigest = job.inputsDigest;
+            _lastOutputDigest = job.outputDigest;
             _haveLastDigests = true;
         } else {
             _haveLastDigests = false;
         }
     }
-    // Scene space is voxels and the slice count already is one, so the scroll
-    // extent needs no voxel size at all.
-    _scrollZMaxVx = snapshot.annotationZSlices > 0
-        ? static_cast<double>(snapshot.annotationZSlices)
+
+    // Scene space is voxels and the slice count already is one, so the
+    // scroll extent needs no voxel size at all.
+    _scrollZMaxVx = job.snapshot.annotationZSlices > 0
+        ? static_cast<double>(job.snapshot.annotationZSlices)
         : 0.0;
 
     QString emptyMessage;
-    if (snapshot.fibers.empty()) {
+    if (!job.hadFibers) {
         emptyMessage = tr("no fibers");
-    } else if (snapshot.umbilicusCenters.empty()) {
+    } else if (!job.hadUmbilicus) {
         // The resolver's own words when it has any; they name the file it
         // rejected or the candidates it could not choose between.
-        emptyMessage = snapshot.umbilicusMessage.isEmpty()
+        emptyMessage = job.snapshot.umbilicusMessage.isEmpty()
             ? tr("no umbilicus found — cannot unroll")
-            : snapshot.umbilicusMessage;
+            : job.snapshot.umbilicusMessage;
         // Whatever the resolver's complaint was, the way out is the same.
         emptyMessage += QLatin1Char('\n');
         emptyMessage += tr("Attach one via File > Attach Umbilicus…");
@@ -1119,17 +1324,14 @@ void FiberMapWorkspace::rebuildLayout(bool fullRebuild)
         emptyMessage = tr("no placeable fibers");
     }
     rebuildScene(emptyMessage);
-    const qint64 sceneMs = phaseTimer.restart();
-    setRebuildProgress(progressButton, 0.93);
     rebuildTree();
-    const qint64 treeMs = phaseTimer.restart();
-    setRebuildProgress(progressButton, 1.0);
+    const qint64 publishMs = publishTimer.elapsed();
     Logger()->info(
-        "fiber map rebuild: snapshot {} ms · convert {} ms · layout {} ms "
-        "(prep {:.0f}, detect {:.0f}, solve {:.0f}, geometry {:.0f}) · "
-        "scene {} ms · tree {} ms",
-        snapshotMs, convertMs, layoutMs, _layout.prepMs, _layout.detectMs,
-        _layout.solveMs, _layout.geometryMs, sceneMs, treeMs);
+        "fiber map rebuild: GUI stalls snapshot {} ms + publish {} ms · "
+        "worker convert {} ms · layout {} ms (prep {:.0f}, detect {:.0f}, "
+        "solve {:.0f}, geometry {:.0f})",
+        job.snapshotMs, publishMs, job.convertMs, job.layoutMs,
+        _layout.prepMs, _layout.detectMs, _layout.solveMs, _layout.geometryMs);
 
     // Default the dock to a width that shows every column of the first real
     // tree; afterwards the width is the user's to manage.
@@ -1160,18 +1362,17 @@ void FiberMapWorkspace::rebuildLayout(bool fullRebuild)
     if (_layout.droppedCrossingCount > 0) {
         status += tr(" · %1 dropped crossings").arg(_layout.droppedCrossingCount);
     }
-    {
-        const auto& stats = _layoutCache.lastStats();
-        if (stats.used && !fullRebuild) {
-            status += tr(" · %1 ms, %2/%3 pairs reused")
-                          .arg(totalTimer.elapsed())
-                          .arg(stats.pairsReused)
-                          .arg(stats.pairsReused + stats.pairsRecomputed);
-        } else {
-            status += tr(" · %1 ms").arg(totalTimer.elapsed());
-        }
-        status += verificationNote;
+    const qint64 totalMs =
+        job.snapshotMs + job.convertMs + job.layoutMs + publishMs;
+    if (job.stats.used && !job.fullRebuild) {
+        status += tr(" · %1 ms, %2/%3 pairs reused")
+                      .arg(totalMs)
+                      .arg(job.stats.pairsReused)
+                      .arg(job.stats.pairsReused + job.stats.pairsRecomputed);
+    } else {
+        status += tr(" · %1 ms").arg(totalMs);
     }
+    status += verificationNote;
     if (_layout.gatedSegmentCount > 0 || _layout.tangentialCount > 0) {
         // Gate-hit tallies, not a geometry proportion (one segment can be
         // counted once per branch and translate it was tried against): a
@@ -1181,15 +1382,15 @@ void FiberMapWorkspace::rebuildLayout(bool fullRebuild)
                       .arg(_layout.gatedSegmentCount + _layout.tangentialCount);
     }
     if (!_voxelSizeUm) {
-        // No physical figure on the map means anything, so say why once rather
-        // than leave the voxel counts looking like an odd choice of unit.
+        // No physical figure on the map means anything, so say why once
+        // rather than leave the voxel counts looking like an odd unit.
         status += tr(" · voxel size unknown — lengths in vx");
     }
-    if (!snapshot.umbilicusCenters.empty() && !snapshot.umbilicusLabel.isEmpty()) {
+    if (job.hadUmbilicus && !job.snapshot.umbilicusLabel.isEmpty()) {
         // The controller composes this: which grid the umbilicus indexes,
         // whether that came from the file's own metadata or from the z-span
         // guess, and any frame inconsistency it noticed on the way.
-        status += QStringLiteral(" · ") + snapshot.umbilicusLabel;
+        status += QStringLiteral(" · ") + job.snapshot.umbilicusLabel;
     }
     _freshStatus = status;
     _statusLabel->setText(status);
@@ -1202,19 +1403,27 @@ void FiberMapWorkspace::rebuildLayout(bool fullRebuild)
     updateLabelChipVisibility();
 
     // The one moment every dependency is re-examined against what this build
-    // just recorded. An umbilicus file rewritten while the snapshot was being
-    // read differs from the pre-read token recorded above, so the banner goes
-    // up here — after the summary assignment, which must never be what a stale
-    // map is left saying.
+    // just recorded. An umbilicus file rewritten while the snapshot was
+    // being read differs from the pre-read token recorded above, so the
+    // banner goes up here — after the summary assignment, which must never
+    // be what a stale map is left saying. If it schedules an automatic
+    // update, that coalesces into the pending slot the epilogue dispatches.
     refreshStaleState();
-    } catch (const std::exception& ex) {
-        // A throw from the snapshot leaves the old state fully intact; one
-        // from later stages can leave the scene and watermarks disagreeing.
-        // Either way the latch refuses interaction until a rebuild succeeds,
-        // and nothing escapes into the Qt event loop. Cache entries written
-        // before the throw are pure key->value memoizations and stay valid.
-        Logger()->error("Fiber map: rebuild failed: {}", ex.what());
-        markStale(tr("rebuild failed — press Update"));
+}
+
+void FiberMapWorkspace::finishRebuild()
+{
+    clearRebuildProgress();
+    if (_updateButton) {
+        _updateButton->setEnabled(true);
+    }
+    if (_fullRebuildButton) {
+        _fullRebuildButton->setEnabled(true);
+    }
+    const auto pending = _rebuildQueue.finishApply();
+    if (pending != vc3d::fiber_map::FiberMapRebuildQueue::Pending::None) {
+        requestRebuild(pending ==
+                       vc3d::fiber_map::FiberMapRebuildQueue::Pending::Full);
     }
 }
 

@@ -1,8 +1,10 @@
 #pragma once
 
+#include <QFutureWatcher>
 #include <QGraphicsView>
 #include <QHash>
 #include <QMainWindow>
+#include <QThreadPool>
 #include <QPointer>
 #include <QPoint>
 #include <QPointF>
@@ -10,12 +12,14 @@
 #include <QString>
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <vector>
 
 #include "vc/core/util/ScrollUmbilicus.hpp"
 
 #include "AnnotationFrame.hpp"
+#include "FiberMapRebuildQueue.hpp"
 #include "FiberMapStaleness.hpp"
 #include "FiberNetworkLayout.hpp"
 
@@ -83,9 +87,20 @@ class FiberMapWorkspace : public QMainWindow
 public:
     explicit FiberMapWorkspace(LineAnnotationController* controller,
                                QWidget* parent = nullptr);
+    // Shuts the rebuild queue down (pending dropped, in-flight publication
+    // refused) and waits out the private worker pool; the worker owns its
+    // own data, so the wait is for clean pool teardown, not for safety of
+    // any shared state.
+    ~FiberMapWorkspace() override;
 
 signals:
     void openFiberAtControlPointRequested(uint64_t fiberId, int controlPointIndex);
+
+public:
+    // Everything the rebuild worker consumes and produces, owned BY the job
+    // so the two threads share no mutable state (public so the worker's free
+    // function can see it; construction and use stay private to this class).
+    struct RebuildJobResult;
 
 protected:
     // The map's colours follow the application theme, and a switch is only
@@ -112,11 +127,17 @@ private:
         QGraphicsPathItem* glowItem = nullptr;
     };
 
-    // full = drop every cache and recompute from scratch; the escape hatch
-    // for cache bugs, and when the inputs match the last Update it verifies
-    // the memoized output digest (a mismatch disables memoization for the
-    // session).
-    void rebuildLayout(bool fullRebuild = false);
+    // The sole rebuild entry point, for the buttons, the automatic update,
+    // and pending-request dispatch alike. full = drop every cache and
+    // recompute from scratch (the escape hatch for cache bugs; when the
+    // inputs match the last memoized Update it verifies the output digest,
+    // and a mismatch disables memoization for the session). The build runs
+    // asynchronously: the snapshot is taken on the GUI thread (the
+    // controller is GUI-only), everything from input conversion through the
+    // solve runs on a dedicated worker, and the result is validated against
+    // the world it was started in before it may publish. Requests while a
+    // build is in flight coalesce through FiberMapRebuildQueue.
+    void requestRebuild(bool fullRebuild = false);
     void rebuildScene(const QString& emptyMessage);
     void rebuildTree();
     // Puts a stale reason on the status line and records it, without latching:
@@ -162,7 +183,24 @@ private:
     // rebuild's phases complete. The rebuild blocks the event loop, so the
     // sweep advances by forced synchronous repaints at phase boundaries
     // rather than by animation.
-    void setRebuildProgress(QPushButton* button, double fraction);
+    // Launches the worker for an already-granted queue Start. The job (see
+    // RebuildJobResult above) carries the snapshot, params, and the
+    // memoization cache - moved out of the workspace at start, moved back
+    // only on a validated publish.
+    void startRebuild(bool fullRebuild);
+    // Watcher-delivered completion: validate against the current world,
+    // publish or discard, then run the one epilogue.
+    void applyRebuild(const std::shared_ptr<RebuildJobResult>& job);
+    // The validated-success half of applyRebuild: watermarks, digests,
+    // scene, tree, status.
+    void publishRebuild(RebuildJobResult& job);
+    // The single terminal path: progress cleared, buttons restored, queue
+    // returned to Idle, pending request dispatched.
+    void finishRebuild();
+    // A translucent blue marquee sweeping the triggering button while the
+    // build runs (the event loop is live now, so it really animates).
+    void startRebuildProgress(QPushButton* button);
+    void tickRebuildProgress();
     void clearRebuildProgress();
     // The two together, for callers that can absorb a scene rebuild inline.
     bool refreshStaleState();
@@ -242,7 +280,16 @@ private:
     bool _syncingSelection = false;
     bool _viewFitted = false;
     bool _autoUpdateScheduled = false;
-    bool _rebuildInProgress = false;
+    // The rebuild lifecycle decision object (single-flight, coalescing,
+    // publication epochs); the Qt glue delegates every transition to it.
+    vc3d::fiber_map::FiberMapRebuildQueue _rebuildQueue;
+    // Dedicated one-thread pool: no starvation from the global pool's other
+    // users, and a bounded, private teardown in the destructor.
+    QThreadPool _rebuildPool;
+    QFutureWatcher<std::shared_ptr<RebuildJobResult>>* _rebuildWatcher = nullptr;
+    QTimer* _progressMarquee = nullptr;
+    QPushButton* _progressButton = nullptr;
+    qint64 _progressPhase = 0;
     // Visible-only staleness poll: integer compares, one frame derivation and
     // one umbilicus-file stat per tick — the workspace still costs annotation
     // work nothing (no controller signal connections), and a hidden tab costs

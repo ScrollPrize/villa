@@ -257,3 +257,21 @@ target_link_libraries(test_fiber_global_layout PRIVATE
 add_test(NAME fiber_global_layout COMMAND test_fiber_global_layout)
 vc_register_test_target(test_fiber_global_layout)
 vc_register_ctest(fiber_global_layout test_fiber_global_layout)
+
+add_executable(test_fiber_map_rebuild_queue
+    test_fiber_map_rebuild_queue.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapRebuildQueue.hpp)
+
+set_target_properties(test_fiber_map_rebuild_queue PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_fiber_map_rebuild_queue PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_fiber_map_rebuild_queue PRIVATE
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME fiber_map_rebuild_queue COMMAND test_fiber_map_rebuild_queue)
+vc_register_test_target(test_fiber_map_rebuild_queue)
+vc_register_ctest(fiber_map_rebuild_queue test_fiber_map_rebuild_queue)
