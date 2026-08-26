@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <atomic>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -216,6 +217,11 @@ struct FiberModeOptimizationRequest {
     bool retraceAll = false;
     std::function<void(const FiberExtrapolationFallbackDiagnostic&)>
         extrapolationFallbackCallback;
+    // Cooperative cancellation (see LineOptimizationConfig::cancelFlag):
+    // when set and it becomes true, optimizeFiberWithNativeFallback throws
+    // vc::lasagna::LineOptimizationCancelled at the next checkpoint instead
+    // of demoting spans or completing. The pointee must outlive the call.
+    const std::atomic<bool>* cancelFlag = nullptr;
 };
 
 struct FiberModeOptimizationResult {

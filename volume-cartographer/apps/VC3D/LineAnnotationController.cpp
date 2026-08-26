@@ -10045,18 +10045,23 @@ void LineAnnotationController::startFiberModeOptimization(
 
     auto request = makeFiberModeOptimizationRequest(
         session, retraceAll, std::move(dirtySegments), globalGoalsOnly);
+    request.cancelFlag = session.runningSolveCancel.get();
 
     const fs::path manifestPath = session.selectedManifestPath;
     auto predictionField = session.fiberPredictionField;
     auto normalSampler = session.normalSampler;
     auto traceNormalSampler = session.traceNormalSampler;
+    // cancelToken keeps the flag the request points at alive for the whole
+    // solve, even after the session replaces runningSolveCancel for a
+    // successor solve.
     watcher->setFuture(QtConcurrent::run(
         &_lineSolvePool,
         [request = std::move(request),
          manifestPath,
          predictionField,
          normalSampler,
-         traceNormalSampler]() mutable {
+         traceNormalSampler,
+         cancelToken = session.runningSolveCancel]() mutable {
             OptimizationTaskResult task;
             task.manifestPath = manifestPath;
             task.eventName = "native_fiber_trace3d_fiber_mode";
@@ -10064,6 +10069,7 @@ void LineAnnotationController::startFiberModeOptimization(
                 (void)predictionField;
                 (void)normalSampler;
                 (void)traceNormalSampler;
+                (void)cancelToken;
                 auto optimized =
                     vc3d::line_annotation::optimizeFiberWithNativeFallback(
                         std::move(request));

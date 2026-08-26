@@ -424,6 +424,10 @@ void replaceOpenTailsWithNative(
             throw std::runtime_error(
                 "Lasagna fallback did not provide both endpoint directions");
         }
+        if (request.cancelFlag &&
+            request.cancelFlag->load(std::memory_order_relaxed)) {
+            throw vc::lasagna::LineOptimizationCancelled();
+        }
         const double extrapolationTrace = coordinates.baseDistanceToTrace(
             request.extrapolationDistanceBaseVoxels);
         const auto traceTail = [&](int endpoint, int inner) {
@@ -533,6 +537,16 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
             "extrapolation distance must be finite and non-negative");
     }
 
+    if (request.cancelFlag) {
+        request.lasagnaConfig.cancelFlag = request.cancelFlag;
+    }
+    const auto throwIfCancelled = [&request] {
+        if (request.cancelFlag &&
+            request.cancelFlag->load(std::memory_order_relaxed)) {
+            throw vc::lasagna::LineOptimizationCancelled();
+        }
+    };
+
     std::stable_sort(request.controlPoints.begin(), request.controlPoints.end(),
                      [](const LineControlPoint& lhs, const LineControlPoint& rhs) {
                          return lhs.linePosition < rhs.linePosition;
@@ -634,6 +648,7 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
     }
     std::vector<bool> fixedSpan(spans.size(), false);
     for (size_t spanIndex = 0; spanIndex < spans.size(); ++spanIndex) {
+        throwIfCancelled();
         auto& owner = request.controlPoints[spanIndex];
         const size_t first = originalControlIndices[spanIndex];
         const size_t last = originalControlIndices[spanIndex + 1];
@@ -817,6 +832,7 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
     vc::lasagna::LineReinitializationOptimizationResult reinitialized;
     std::vector<int> controlIndices;
     while (true) {
+        throwIfCancelled();
         generateSplineRuns();
         auto [stitched, indices] = stitch();
         controlIndices = std::move(indices);
@@ -858,6 +874,10 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
             std::move(hardDirections));
         if (!reinitialized.failed)
             break;
+        // A cancelled solve reports failure through the candidate machinery;
+        // demoting a span for it would misattribute the cancellation as a
+        // structural Lasagna failure. Surface the cancellation instead.
+        throwIfCancelled();
         const int failed = reinitialized.failedSegmentIndex;
         if (failed < 0 || static_cast<size_t>(failed) >= modes.size() ||
             modes[static_cast<size_t>(failed)] != SegmentInterpolationMode::Lasagna) {

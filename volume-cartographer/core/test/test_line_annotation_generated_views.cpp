@@ -994,6 +994,30 @@ TEST_CASE("line annotation one-control tangent follows authoritative line positi
     CHECK(std::abs(optimizedDirection[0]) > std::abs(optimizedDirection[1]));
 }
 
+TEST_CASE("line annotation fiber-mode optimization surfaces cancellation")
+{
+    const std::vector<cv::Vec3d> linePoints{
+        {0.0, 0.0, 0.0},
+        {10.0, 0.0, 0.0},
+        {20.0, 0.0, 0.0},
+    };
+    FiberModeNormalSampler sampler;
+    std::atomic<bool> cancel{true};
+    vc3d::line_annotation::FiberModeOptimizationRequest request;
+    request.controlPoints = {
+        {0.0, linePoints[0], true, 0},
+        {2.0, linePoints[2], false, 2},
+    };
+    request.linePointsBase = linePoints;
+    request.baseNormalSampler = &sampler;
+    request.globalMode = vc3d::line_annotation::FiberOptimizationMode::Lasagna;
+    request.cancelFlag = &cancel;
+
+    CHECK_THROWS_AS(
+        vc3d::line_annotation::optimizeFiberWithNativeFallback(std::move(request)),
+        vc::lasagna::LineOptimizationCancelled);
+}
+
 TEST_CASE("line annotation all-control collapse prepares one clicked control")
 {
     const std::vector<cv::Vec3d> linePoints{

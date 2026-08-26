@@ -74,6 +74,19 @@ constexpr double kReinitSeedMaxNormalAlignmentAbs = 0.17364817766693033; // sin(
     return deterministicTangentFromNormalVector(sample.normal);
 }
 
+[[nodiscard]] bool cancellationRequested(const LineOptimizationConfig& config)
+{
+    return config.cancelFlag &&
+           config.cancelFlag->load(std::memory_order_relaxed);
+}
+
+void throwIfCancelled(const LineOptimizationConfig& config)
+{
+    if (cancellationRequested(config)) {
+        throw LineOptimizationCancelled();
+    }
+}
+
 [[nodiscard]] LineOptimizationConfig sanitizedConfig(LineOptimizationConfig config)
 {
     config.segmentsPerSide = std::max(1, config.segmentsPerSide);
@@ -2630,6 +2643,12 @@ public:
 
     ceres::CallbackReturnType operator()(const ceres::IterationSummary& /*summary*/) override
     {
+        // Cooperative cancellation: a superseded solve stops within one
+        // iteration instead of running out its iteration budget. The aborted
+        // summary reports the solution unusable; callers discard it.
+        if (cancellationRequested(config_)) {
+            return ceres::SOLVER_ABORT;
+        }
         fillPrefetchedNormalSamples(points_,
                                     sampler_,
                                     config_,
@@ -2874,6 +2893,7 @@ void applyHardSpanDirections(
     std::optional<cv::Vec3d> hardLeftDirection = std::nullopt,
     std::optional<cv::Vec3d> hardRightDirection = std::nullopt)
 {
+    throwIfCancelled(config);
     if (length(rightPoint - leftPoint) <= kEpsilon) {
         throw std::invalid_argument("Adjacent reinitialization control points are coincident");
     }
@@ -3950,6 +3970,7 @@ LineOptimizationResult LineOptimizer::optimizeExistingLine(
     std::vector<std::pair<int, int>> protectedPointRanges) const
 {
     const LineOptimizationConfig config = sanitizedConfig(rawConfig);
+    throwIfCancelled(config);
     if (linePoints.size() < 2) {
         throw std::invalid_argument("Existing line optimization requires at least two samples");
     }
@@ -4131,6 +4152,7 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
     std::vector<LineControlPointHardDirectionConstraint> hardDirectionConstraints) const
 {
     const LineOptimizationConfig config = sanitizedConfig(rawConfig);
+    throwIfCancelled(config);
     if (linePoints.size() < 2) {
         throw std::invalid_argument("Existing line reinitialization requires at least two samples");
     }

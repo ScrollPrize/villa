@@ -3,10 +3,23 @@
 #include "vc/lasagna/LineModel.hpp"
 
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace vc::lasagna {
+
+// Thrown from solve entry points when LineOptimizationConfig::cancelFlag is
+// set: the caller superseded (or is tearing down) the solve, so no result is
+// wanted. Deliberately a distinct type so coordinators can tell cancellation
+// from a genuine failure and skip failure handling (fallback demotion,
+// rollback, error dialogs).
+struct LineOptimizationCancelled : std::runtime_error {
+    LineOptimizationCancelled()
+        : std::runtime_error("line optimization cancelled")
+    {
+    }
+};
 
 struct LineOptimizationLossReport {
     std::string name;
