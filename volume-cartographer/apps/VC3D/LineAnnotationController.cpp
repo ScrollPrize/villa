@@ -156,6 +156,10 @@ struct LineAnnotationController::LineAnnotationSession {
     std::string generatedLineSideSliceName;
     std::string error;
     QPointer<QFutureWatcher<OptimizationTaskResult>> watcher;
+    // Cooperative cancellation flag of the solve currently in flight (shared
+    // with the worker); replaced per launch. Set when a newer edit supersedes
+    // the solve or the controller tears down.
+    std::shared_ptr<std::atomic<bool>> runningSolveCancel;
     bool deferShowUntilGenerated = false;
     uint64_t fiberId = 0;
     std::string fiberUsername;
@@ -1913,6 +1917,7 @@ LineAnnotationController::LineAnnotationController(CState* state,
         return pickDataset(parent, startDir);
     })
 {
+    _lineSolvePool.setMaxThreadCount(2);
     if (_state) {
         connect(_state,
                 &CState::surfaceChanged,
@@ -1964,6 +1969,17 @@ LineAnnotationController::LineAnnotationController(CState* state,
 LineAnnotationController::~LineAnnotationController()
 {
     waitForFiberSaves();
+    // Bounded teardown of in-flight line solves: request cooperative
+    // cancellation on every session, then drain the private pool. The Ceres
+    // iteration callback honors the flag within one iteration; the native
+    // tracer has no cancellation point, so this can still block for one
+    // trace segment at worst.
+    for (auto& pane : _panes) {
+        if (pane.session && pane.session->runningSolveCancel) {
+            pane.session->runningSolveCancel->store(true);
+        }
+    }
+    _lineSolvePool.waitForDone();
 }
 
 void LineAnnotationController::setDatasetPickerForTesting(DatasetPicker picker)
@@ -9397,6 +9413,10 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
         return false;
     }
     auto* pane = paneForSurface(session.surfaceName);
+    const cv::Vec3d previousSeedPoint = session.seedPoint;
+    const fs::path previousManifestPath = session.selectedManifestPath;
+    const bool previousLineWasOptimized = session.lineWasOptimized;
+    vc::lasagna::LineModel previousLine = session.optimizedLine;
     session.taskState = LineAnnotationSession::TaskState::Succeeded;
     session.lineWasOptimized = true;
     session.seedPoint = task.seedPoint;
@@ -9438,6 +9458,30 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
         }
         if (control.isSeed) {
             session.seedPoint = control.volumePoint;
+        }
+    }
+
+    // The nearest-point remap above can in principle land two controls on the
+    // same line index or out of order when the solved line moved far from the
+    // controls. Every consumer of control indices (span metadata, split/merge,
+    // the loader's ordered-subset contract) assumes strict ordering, so a
+    // violation must fail the task instead of being applied silently.
+    for (size_t index = 1; index < session.controlPoints.size(); ++index) {
+        if (session.controlPoints[index].optimizedIndex <=
+            session.controlPoints[index - 1].optimizedIndex) {
+            session.controlPoints = branchRemapControls;
+            session.branches = branchRemapBranches;
+            session.optimizedLine = std::move(previousLine);
+            session.seedPoint = previousSeedPoint;
+            session.selectedManifestPath = previousManifestPath;
+            session.lineWasOptimized = previousLineWasOptimized;
+            session.taskState = LineAnnotationSession::TaskState::Failed;
+            session.error =
+                "optimized line remapped control points out of order";
+            showError(tr("Line optimization failed: control points no longer "
+                         "resolve in line order."),
+                      session.suppressErrorDialogs);
+            return false;
         }
     }
 
@@ -9490,12 +9534,16 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
 
     const double prefetchPrepMs = session.optimizationReport.normalChunkPrefetchMs +
                                   session.optimizationReport.normalMaterializeMs;
-    Logger()->info("Line annotation Lasagna stage timing: event={} prefetch_prep_ms={:.3f} ceres_solve_ms={:.3f} overall_ms={:.3f} points={}",
+    Logger()->info("Line annotation Lasagna stage timing: event={} prefetch_prep_ms={:.3f} ceres_solve_ms={:.3f} overall_ms={:.3f} points={} iterations={} residuals={} converged={} prefetch_calls={}",
                    resultEvent,
                    prefetchPrepMs,
                    session.optimizationReport.ceresSolveMs,
                    session.optimizationReport.totalMs,
-                   session.optimizedLine.points.size());
+                   session.optimizedLine.points.size(),
+                   session.optimizationReport.iterations,
+                   session.optimizationReport.residuals,
+                   session.optimizationReport.converged,
+                   session.optimizationReport.normalPrefetchCalls);
     if (allowFiberSave && pane && !session.suppressFiberSave &&
         session.taskState == LineAnnotationSession::TaskState::Succeeded &&
         !session.optimizedLine.points.empty() &&
@@ -9690,7 +9738,8 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
                : vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX_DEFAULT);
     auto dataset = session.dataset;
     auto normalSampler = session.normalSampler;
-    watcher->setFuture(QtConcurrent::run([factory,
+    watcher->setFuture(QtConcurrent::run(&_lineSolvePool,
+                                          [factory,
                                            manifestPath,
                                            controlPoints,
                                            initialLinePoints,
@@ -9866,6 +9915,7 @@ void LineAnnotationController::startFiberModeOptimization(
     auto normalSampler = session.normalSampler;
     auto traceNormalSampler = session.traceNormalSampler;
     watcher->setFuture(QtConcurrent::run(
+        &_lineSolvePool,
         [request = std::move(request),
          manifestPath,
          predictionField,
@@ -14198,6 +14248,27 @@ void LineAnnotationController::canonicalizeFiberSaveSnapshots(
 void LineAnnotationController::validateFiberSaveSnapshots(
     const std::vector<FiberSaveSnapshot>& snapshots) const
 {
+    // Geometry guard for every snapshot, linked or not: the v3 loader (and
+    // split/merge planning) requires control points to be an exact ordered
+    // subset of line_points. A violation here means a session was serialized
+    // before its geometry was finalized by a solve; writing it would produce
+    // a fiber that fails to load. Refuse the save instead.
+    for (const auto& snapshot : snapshots) {
+        if (snapshot.fiber.controlPoints.empty() ||
+            snapshot.fiber.linePoints.empty()) {
+            continue;
+        }
+        if (!vc3d::line_annotation::orderedControlPointLineIndices(
+                vc3d::line_annotation::storedControlPointPositions(
+                    snapshot.fiber.controlPoints),
+                snapshot.fiber.linePoints)) {
+            throw std::runtime_error(
+                fiberErrorName(snapshot.fiber.fileName) +
+                ": control points are not an ordered exact subset of "
+                "line_points; the fiber was not finalized before saving");
+        }
+    }
+
     if (snapshots.size() < 2) {
         return;
     }

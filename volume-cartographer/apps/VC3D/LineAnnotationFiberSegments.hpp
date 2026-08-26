@@ -237,6 +237,15 @@ struct FiberModeOptimizationResult {
 
 void validateStoredControlPoints(const std::vector<StoredControlPoint>& controls);
 
+// The loader's exact-membership scan (kControlPointMatchEpsilon in
+// core/src/Atlas.cpp): every control must be an exact member (1e-8) of
+// linePoints, in strictly increasing line order. Returns each control's line
+// index, or nullopt on the first violation. Split/merge planning and the
+// save-path geometry guard share this single implementation.
+[[nodiscard]] std::optional<std::vector<size_t>> orderedControlPointLineIndices(
+    const std::vector<cv::Vec3d>& controlPoints,
+    const std::vector<cv::Vec3d>& linePoints);
+
 [[nodiscard]] std::vector<cv::Vec3d> storedControlPointPositions(const std::vector<StoredControlPoint>& controls);
 [[nodiscard]] std::vector<vc::lasagna::LineControlPoint> optimizerControlPoints(const std::vector<LineControlPoint>& controls);
 [[nodiscard]] std::vector<LineControlPoint> mergeOptimizerControlPoints(

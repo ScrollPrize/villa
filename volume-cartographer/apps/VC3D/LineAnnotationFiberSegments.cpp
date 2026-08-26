@@ -1363,13 +1363,10 @@ void invalidateSegmentsAdjacentToControl(std::vector<LineControlPoint>& controls
     (void)found;
 }
 
-namespace
-{
-
 // The loader's exact-membership scan (kControlPointMatchEpsilon in
 // core/src/Atlas.cpp): controls must be an ordered subset of the dense
 // line, so geometry sliced at these indices reloads cleanly.
-std::optional<std::vector<size_t>> orderedControlLineIndices(
+std::optional<std::vector<size_t>> orderedControlPointLineIndices(
     const std::vector<cv::Vec3d>& controlPoints,
     const std::vector<cv::Vec3d>& linePoints)
 {
@@ -1396,8 +1393,6 @@ std::optional<std::vector<size_t>> orderedControlLineIndices(
     return lineIndices;
 }
 
-}  // namespace
-
 std::optional<FiberSplitPlan> computeFiberSplitPlan(
     const std::vector<cv::Vec3d>& controlPoints,
     const std::vector<cv::Vec3d>& linePoints,
@@ -1408,7 +1403,7 @@ std::optional<FiberSplitPlan> computeFiberSplitPlan(
         splitAfterControlIndex + 3 > controlPoints.size()) {
         return std::nullopt;
     }
-    const auto scannedIndices = orderedControlLineIndices(controlPoints, linePoints);
+    const auto scannedIndices = orderedControlPointLineIndices(controlPoints, linePoints);
     if (!scannedIndices) {
         return std::nullopt;
     }
@@ -1467,9 +1462,9 @@ std::optional<FiberMergeGeometry> computeFiberMergeGeometry(
         return std::nullopt;
     }
     const auto aIndices =
-        orderedControlLineIndices(storedControlPointPositions(aControls), aLine);
+        orderedControlPointLineIndices(storedControlPointPositions(aControls), aLine);
     const auto bIndices =
-        orderedControlLineIndices(storedControlPointPositions(bControls), bLine);
+        orderedControlPointLineIndices(storedControlPointPositions(bControls), bLine);
     if (!aIndices || !bIndices) {
         return std::nullopt;
     }

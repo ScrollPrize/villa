@@ -5,6 +5,7 @@
 #include <QPointer>
 #include <QString>
 #include <QFutureWatcher>
+#include <QThreadPool>
 
 #include <array>
 #include <atomic>
@@ -1053,4 +1054,13 @@ private:
     };
     std::optional<LinkCandidate> _linkCandidate;
     std::optional<LinkCandidate> _splitCandidate;
+
+    // Private pool for line-optimization solves. Its own pool rather than the
+    // global one so teardown is bounded by waitForDone() in the destructor
+    // (after requesting cooperative cancellation) and so long solves cannot
+    // starve the global pool's other users. Two threads: one live editing
+    // session plus one intersection-inspection or merged-fiber reopt session
+    // can solve concurrently; solves within one session are serialized by the
+    // per-session coalescing queue.
+    QThreadPool _lineSolvePool;
 };
