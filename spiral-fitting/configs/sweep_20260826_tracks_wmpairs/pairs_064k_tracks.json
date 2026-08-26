@@ -1,0 +1,5 @@
+{
+    "input_use_tracks": true,
+    "sample_count_winding_model_relative_pairs": 64000,
+    "sample_count_winding_model_density_pairs": 64000
+}

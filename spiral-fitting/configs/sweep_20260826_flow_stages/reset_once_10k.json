@@ -1,0 +1,3 @@
+{
+    "optimizer_reset_steps": [10000]
+}
