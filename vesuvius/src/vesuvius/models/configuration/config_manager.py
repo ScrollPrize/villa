@@ -28,8 +28,14 @@ class ConfigManager:
         # utf-8-sig: config files must not depend on the machine's locale
         # codec, and Windows editors often emit a UTF-8 BOM that would
         # otherwise be glued onto the first key, silently dropping it.
-        with open(config_path, "r", encoding="utf-8-sig") as f:
-            config = yaml.safe_load(f)
+        try:
+            with open(config_path, "r", encoding="utf-8-sig") as f:
+                config = yaml.safe_load(f)
+        except UnicodeDecodeError as e:
+            raise ValueError(
+                f"Config file {config_path} is not valid UTF-8. "
+                "Config files must be UTF-8 encoded; re-save the file as UTF-8."
+            ) from e
 
         self.tr_info = config.get("tr_setup", {})
         self.tr_configs = config.get("tr_config", {})

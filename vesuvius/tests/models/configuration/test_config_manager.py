@@ -1,7 +1,10 @@
 """Tests for ConfigManager target name validation."""
 
-from pathlib import Path
+import builtins
 import tempfile
+from pathlib import Path
+from unittest import mock
+
 import pytest
 import yaml
 
@@ -265,15 +268,38 @@ class TestTargetNameValidation:
 
 
 class TestConfigEncoding:
-    """Config files must load as UTF-8 regardless of the machine's locale codec (#1524)."""
+    """Config files must load as UTF-8 regardless of the machine's locale codec (#1524).
 
-    def _load_bytes(self, raw: bytes):
-        with tempfile.NamedTemporaryFile(suffix='.yaml', delete=False) as f:
+    The loads run with encoding-less text opens forced to cp1252 (the Windows
+    locale codec measured in #1524), so these tests fail on unpatched code on
+    every platform — on a UTF-8 runner PyYAML absorbs a lone leading U+FEFF,
+    which would otherwise mask the bug.
+    """
+
+    @staticmethod
+    def _as_locale_codec(codec):
+        """Make encoding-less text opens behave like a box whose locale codec
+        is `codec`, so the test measures the same thing on every platform."""
+        real_open = builtins.open
+        def fake_open(file, mode="r", buffering=-1, encoding=None, *a, **kw):
+            if encoding is None and "b" not in mode:
+                encoding = codec
+            return real_open(file, mode, buffering, encoding, *a, **kw)
+        return mock.patch.object(builtins, "open", fake_open)
+
+    @staticmethod
+    def _write_bytes(raw: bytes) -> str:
+        # written outside the locale patch: tempfile paths only, binary mode
+        with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False) as f:
             f.write(raw)
-            temp_path = f.name
+            return f.name
+
+    def _load_on_cp1252_box(self, raw: bytes):
+        temp_path = self._write_bytes(raw)
         try:
             mgr = ConfigManager(verbose=False)
-            mgr.load_config(temp_path)
+            with self._as_locale_codec("cp1252"):
+                mgr.load_config(temp_path)
             return mgr
         finally:
             Path(temp_path).unlink()
@@ -281,17 +307,30 @@ class TestConfigEncoding:
     def test_utf8_bom_first_line_key_is_not_dropped(self):
         """A UTF-8 BOM (as written by PowerShell / many Windows editors) must not
         be glued onto the first key, which silently dropped that whole section."""
-        raw = b'\xef\xbb\xbf' + b'tr_setup:\n  model_name: bom_model\n'
-        mgr = self._load_bytes(raw)
-        assert mgr.tr_info.get('model_name') == 'bom_model'
+        raw = b"\xef\xbb\xbf" + b"tr_setup:\n  model_name: bom_model\n"
+        mgr = self._load_on_cp1252_box(raw)
+        assert mgr.tr_info.get("model_name") == "bom_model"
 
     def test_utf8_bom_before_comment_loads(self):
-        raw = b'\xef\xbb\xbf' + b'# comment\ntr_setup:\n  model_name: bom_model2\n'
-        mgr = self._load_bytes(raw)
-        assert mgr.tr_info.get('model_name') == 'bom_model2'
+        raw = b"\xef\xbb\xbf" + b"# comment\ntr_setup:\n  model_name: bom_model2\n"
+        mgr = self._load_on_cp1252_box(raw)
+        assert mgr.tr_info.get("model_name") == "bom_model2"
 
     def test_non_ascii_comment_loads_intact(self):
-        """Bytes undefined in cp1252 (e.g. a smart quote) must not raise on load."""
-        raw = '# segment “w013” — région test\ntr_setup:\n  model_name: unicode_model\n'.encode('utf-8')
-        mgr = self._load_bytes(raw)
-        assert mgr.tr_info.get('model_name') == 'unicode_model'
+        """UTF-8 bytes undefined in cp1252 (e.g. a smart quote) must not raise."""
+        raw = '# segment \u201cw013\u201d \u2014 r\u00e9gion test\ntr_setup:\n  model_name: unicode_model\n'.encode("utf-8")
+        mgr = self._load_on_cp1252_box(raw)
+        assert mgr.tr_info.get("model_name") == "unicode_model"
+
+    def test_non_utf8_config_fails_loudly(self):
+        """A config genuinely saved in a legacy codec now fails with a clear
+        message instead of loading mojibake (or, before this fix, loading only
+        on the machine that happens to share its codec)."""
+        raw = "tr_setup:\n  model_name: caf\u00e9\n".encode("cp1252")
+        temp_path = self._write_bytes(raw)
+        try:
+            mgr = ConfigManager(verbose=False)
+            with pytest.raises(ValueError, match="UTF-8"):
+                mgr.load_config(temp_path)
+        finally:
+            Path(temp_path).unlink()
