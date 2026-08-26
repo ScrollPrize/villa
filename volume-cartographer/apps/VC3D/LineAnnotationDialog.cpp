@@ -1131,7 +1131,7 @@ void LineAnnotationDialog::setGeneratedSpanAlignmentMetrics(
     updateGeneratedDynamicOverlaysFast(false, true);
 }
 
-void LineAnnotationDialog::setOptimizationBusy(bool busy)
+void LineAnnotationDialog::setOptimizationBusy(bool busy, bool blockInput)
 {
     _optimizationBusy = busy;
     if (_fiberOptimizationCombo) {
@@ -1161,10 +1161,31 @@ void LineAnnotationDialog::setOptimizationBusy(bool busy)
         overlay->hide();
         _optimizationOverlay = overlay;
     }
+    if (!_optimizationBadge) {
+        // Passive counterpart of the overlay: a top-center pill that never
+        // takes input, for solves the user may keep editing through.
+        auto* badge = new QLabel(tr("Optimizing…"), content);
+        badge->setObjectName(QStringLiteral("lineAnnotationOptimizationBadge"));
+        badge->setAttribute(Qt::WA_TransparentForMouseEvents, true);
+        badge->setAttribute(Qt::WA_StyledBackground, true);
+        badge->setAlignment(Qt::AlignCenter);
+        badge->setStyleSheet(QStringLiteral(
+            "#lineAnnotationOptimizationBadge {"
+            " background-color: rgba(32, 32, 32, 190); color: white;"
+            " font-weight: 600; border-radius: 4px; padding: 3px 12px; }"));
+        badge->hide();
+        _optimizationBadge = badge;
+    }
     updateOptimizationOverlayGeometry();
-    _optimizationOverlay->setVisible(busy);
-    if (busy) {
+    const bool showOverlay = busy && blockInput;
+    const bool showBadge = busy && !blockInput;
+    _optimizationOverlay->setVisible(showOverlay);
+    _optimizationBadge->setVisible(showBadge);
+    if (showOverlay) {
         _optimizationOverlay->raise();
+    }
+    if (showBadge) {
+        _optimizationBadge->raise();
     }
 }
 
@@ -4858,12 +4879,26 @@ void LineAnnotationDialog::syncLinkedStripCamera(CChunkedVolumeViewer* source)
 
 void LineAnnotationDialog::updateOptimizationOverlayGeometry()
 {
-    if (!_optimizationOverlay || !centralWidget()) {
+    if (!centralWidget()) {
         return;
     }
-    _optimizationOverlay->setGeometry(centralWidget()->rect());
-    if (_optimizationOverlay->isVisible()) {
-        _optimizationOverlay->raise();
+    if (_optimizationOverlay) {
+        _optimizationOverlay->setGeometry(centralWidget()->rect());
+        if (_optimizationOverlay->isVisible()) {
+            _optimizationOverlay->raise();
+        }
+    }
+    if (_optimizationBadge) {
+        const QSize badgeSize = _optimizationBadge->sizeHint();
+        const QRect content = centralWidget()->rect();
+        _optimizationBadge->setGeometry(
+            content.center().x() - badgeSize.width() / 2,
+            content.top() + 8,
+            badgeSize.width(),
+            badgeSize.height());
+        if (_optimizationBadge->isVisible()) {
+            _optimizationBadge->raise();
+        }
     }
 }
 

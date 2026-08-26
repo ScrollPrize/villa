@@ -659,6 +659,12 @@ private:
                                     bool retraceAll,
                                     std::optional<std::vector<size_t>> dirtySegments = std::nullopt,
                                     bool globalGoalsOnly = false);
+    // Debounced launch of the session's coalesced pending solve: control-point
+    // edits record dirty spans in the session's queue and call this; one solve
+    // over the union starts after a short quiet window (or, while a solve is
+    // in flight, from finishOptimization's epilogue).
+    void scheduleSolveDispatch(LineAnnotationSession& session);
+    void dispatchPendingSolve(const std::string& surfaceName);
     [[nodiscard]] vc3d::line_annotation::FiberModeOptimizationRequest
         makeFiberModeOptimizationRequest(const LineAnnotationSession& session,
                                          bool retraceAll,

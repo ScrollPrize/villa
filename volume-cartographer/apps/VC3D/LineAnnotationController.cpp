@@ -102,6 +102,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "LineAnnotationOptimizationQueue.hpp"
+
 namespace fs = std::filesystem;
 
 struct LineAnnotationController::LineAnnotationSession {
@@ -160,6 +162,18 @@ struct LineAnnotationController::LineAnnotationSession {
     // with the worker); replaced per launch. Set when a newer edit supersedes
     // the solve or the controller tears down.
     std::shared_ptr<std::atomic<bool>> runningSolveCancel;
+    // Solve lifecycle: single-flight, epoch-refused publication after a
+    // session mutation, coalesced pending dirty spans. Pure decision object;
+    // the controller drives it at edit, launch, and finish.
+    vc3d::line_annotation::OptimizationCoalescingQueue solveQueue;
+    // The queue epoch the in-flight solve was started in.
+    uint64_t runningSolveEpoch = 0;
+    // The in-flight solve covers the whole line (retrace-all or no dirty
+    // set). A superseded whole-line solve must be re-requested as whole-line,
+    // or a mode switch's retrace would silently shrink to the edit's spans.
+    bool runningSolveFullLine = false;
+    // A debounced dispatch of the queue's pending solve is scheduled.
+    bool solveDispatchScheduled = false;
     bool deferShowUntilGenerated = false;
     uint64_t fiberId = 0;
     std::string fiberUsername;
@@ -339,6 +353,9 @@ void copyCoordinateIdentityToJson(
 
 constexpr double kEpsilon = 1.0e-12;
 constexpr double kLineSegmentLength = 32.0;
+// Quiet window between a control-point edit and the solve it dispatches;
+// rapid placement coalesces into one solve over the union of dirty spans.
+constexpr int kSolveDispatchDebounceMs = 150;
 constexpr double kControlPointLabelLinePositionTolerance = 1.0e-3;
 
 // Applied by the sync tool's three-way merge (scripts/fiber_merge.py,
@@ -1975,7 +1992,11 @@ LineAnnotationController::~LineAnnotationController()
     // tracer has no cancellation point, so this can still block for one
     // trace segment at worst.
     for (auto& pane : _panes) {
-        if (pane.session && pane.session->runningSolveCancel) {
+        if (!pane.session) {
+            continue;
+        }
+        pane.session->solveQueue.shutdown();
+        if (pane.session->runningSolveCancel) {
             pane.session->runningSolveCancel->store(true);
         }
     }
@@ -7022,11 +7043,11 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     }
 
     auto& session = *pane->session;
-    if (session.taskState == LineAnnotationSession::TaskState::Running) {
-        showError(tr("Line optimization is already running."),
-                  session.suppressErrorDialogs);
-        return;
-    }
+    // Control-point edits deliberately do NOT refuse while a solve is in
+    // flight: the session is mutated immediately, the in-flight solve is
+    // superseded (epoch bump + cooperative cancel), and one solve over the
+    // coalesced dirty spans follows. Only a seed solve still excludes edits,
+    // via the empty-line check below.
     if (session.optimizedLine.points.empty() || session.controlPoints.empty()) {
         return;
     }
@@ -7108,6 +7129,18 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
             invalidateFiberAlignmentMetrics(session.fiberId, true);
         }
         setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
+        // The session no longer matches any in-flight solve: refuse its
+        // publication and ask it to stop. No pending solve is recorded (the
+        // user chose manual reoptimization), but an already-queued pending
+        // set is carried into the new control numbering.
+        session.solveQueue.noteSessionMutated();
+        if (session.runningSolveCancel) {
+            session.runningSolveCancel->store(true);
+        }
+        session.solveQueue.remapPendingDirty(
+            collapse.oldToNewIndices,
+            session.controlPoints.size() > 1 ? session.controlPoints.size() - 1
+                                             : 0);
         const std::string noReoptEventName = collapsedControlCount > 1
             ? "control_collapse_no_reopt"
             : (editedExistingControl ? "control_edit_no_reopt"
@@ -7220,25 +7253,20 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     writeLineDebugJson(updateEventName,
                        session.controlPoints,
                        linePointsToJson(session.optimizedLine));
-    startFiberModeOptimization(
-        session, false, std::move(prepared.dirtySegmentIndices));
-    if (collapsedControlCount > 1 &&
-        session.taskState != LineAnnotationSession::TaskState::Running) {
-        auto rollback = std::move(*session.controlPointCollapseRollback);
-        session.controlPointCollapseRollback.reset();
-        session.controlPoints = std::move(rollback.controlPoints);
-        session.optimizedLine = std::move(rollback.optimizedLine);
-        session.optimizationReport = std::move(rollback.optimizationReport);
-        session.branches = std::move(rollback.branches);
-        session.selectedManifestPath = std::move(rollback.selectedManifestPath);
-        session.seedPoint = rollback.seedPoint;
-        session.focusedLinePosition = rollback.focusedLinePosition;
-        session.focusedControlPoint = std::move(rollback.focusedControlPoint);
-        session.lineWasOptimized = rollback.lineWasOptimized;
-        session.fiberMetricsMatchStoredFiber =
-            rollback.fiberMetricsMatchStoredFiber;
-        setSessionOptimizationState(session, rollback.optimizationState);
+    // The session no longer matches any in-flight solve: refuse its
+    // publication, ask it to stop, carry any queued dirty spans into the new
+    // control numbering, add this edit's spans, and dispatch one coalesced
+    // solve after a short quiet window.
+    session.solveQueue.noteSessionMutated();
+    if (session.runningSolveCancel) {
+        session.runningSolveCancel->store(true);
     }
+    session.solveQueue.remapPendingDirty(
+        prepared.oldToNewIndices,
+        session.controlPoints.size() > 1 ? session.controlPoints.size() - 1
+                                         : 0);
+    session.solveQueue.addPending(prepared.dirtySegmentIndices, false);
+    scheduleSolveDispatch(session);
 }
 
 void LineAnnotationController::handleGeneratedControlPointBranch(const std::string& surfaceName,
@@ -9608,12 +9636,18 @@ bool LineAnnotationController::finalizeSessionOptimizationSynchronously(
         } catch (...) {
             task.error = "Unknown fiber-mode finalization error.";
         }
-        return applyOptimizationTaskResult(session,
-                                           std::move(task),
-                                           false,
-                                           SessionOptimizationState::Optimized,
-                                           "segment_interpolation_final_full_line_opt",
-                                           fireSuccessCallback);
+        const bool applied = applyOptimizationTaskResult(
+            session,
+            std::move(task),
+            false,
+            SessionOptimizationState::Optimized,
+            "segment_interpolation_final_full_line_opt",
+            fireSuccessCallback);
+        if (applied) {
+            // This synchronous whole-line solve subsumes any queued request.
+            (void)session.solveQueue.takePending();
+        }
+        return applied;
     }
 
     std::vector<cv::Vec3d> initialLinePoints;
@@ -9635,12 +9669,17 @@ bool LineAnnotationController::finalizeSessionOptimizationSynchronously(
                                                           -1,
                                                           -1,
                                                           *session.normalSampler);
-    return applyOptimizationTaskResult(session,
-                                       std::move(task),
-                                       false,
-                                       SessionOptimizationState::Optimized,
-                                       "final_full_line_opt",
-                                       fireSuccessCallback);
+    const bool applied = applyOptimizationTaskResult(session,
+                                                     std::move(task),
+                                                     false,
+                                                     SessionOptimizationState::Optimized,
+                                                     "final_full_line_opt",
+                                                     fireSuccessCallback);
+    if (applied) {
+        // This synchronous whole-line solve subsumes any queued request.
+        (void)session.solveQueue.takePending();
+    }
+    return applied;
 }
 
 void LineAnnotationController::requestFinalizedClose(const std::string& surfaceName)
@@ -9685,6 +9724,15 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
         session.fiberMetricsMatchStoredFiber = false;
         invalidateFiberAlignmentMetrics(session.fiberId, true);
     }
+    uint64_t solveEpoch = 0;
+    if (!session.solveQueue.beginSolve(solveEpoch)) {
+        showError(tr("Line optimization is already running."),
+                  session.suppressErrorDialogs);
+        return;
+    }
+    session.runningSolveEpoch = solveEpoch;
+    session.runningSolveFullLine = true;
+    session.runningSolveCancel = std::make_shared<std::atomic<bool>>(false);
     session.optimizationStateBeforeTask = session.optimizationState;
     session.taskState = LineAnnotationSession::TaskState::Running;
     session.error.clear();
@@ -9857,6 +9905,69 @@ LineAnnotationController::makeFiberModeOptimizationRequest(
     return request;
 }
 
+void LineAnnotationController::scheduleSolveDispatch(LineAnnotationSession& session)
+{
+    using Queue = vc3d::line_annotation::OptimizationCoalescingQueue;
+    if (session.solveQueue.state() != Queue::State::Idle) {
+        // A solve is in flight (or shutdown): finishOptimization's epilogue
+        // dispatches the pending request.
+        return;
+    }
+    if (session.solveDispatchScheduled) {
+        return;
+    }
+    session.solveDispatchScheduled = true;
+    const std::string surfaceName = session.surfaceName;
+    QTimer::singleShot(kSolveDispatchDebounceMs, this, [this, surfaceName]() {
+        dispatchPendingSolve(surfaceName);
+    });
+}
+
+void LineAnnotationController::dispatchPendingSolve(const std::string& surfaceName)
+{
+    using Queue = vc3d::line_annotation::OptimizationCoalescingQueue;
+    auto* pane = paneForSurface(surfaceName);
+    if (!pane || !pane->session) {
+        return;
+    }
+    auto& session = *pane->session;
+    session.solveDispatchScheduled = false;
+    if (session.solveQueue.state() != Queue::State::Idle ||
+        !session.solveQueue.hasPending()) {
+        // Another path started a solve meanwhile (its epilogue will dispatch
+        // what is pending), or the pending request was consumed by a
+        // synchronous finalize.
+        return;
+    }
+    auto pending = session.solveQueue.takePending();
+    startFiberModeOptimization(session,
+                               false,
+                               pending.fullLine
+                                   ? std::nullopt
+                                   : std::optional<std::vector<size_t>>(
+                                         std::move(pending.dirtySegments)));
+    if (session.taskState != LineAnnotationSession::TaskState::Running &&
+        session.controlPointCollapseRollback) {
+        // The solve did not start (dataset or trace prerequisites vanished):
+        // restore the multi-control collapse the way the synchronous path
+        // used to when its start failed.
+        auto rollback = std::move(*session.controlPointCollapseRollback);
+        session.controlPointCollapseRollback.reset();
+        session.controlPoints = std::move(rollback.controlPoints);
+        session.optimizedLine = std::move(rollback.optimizedLine);
+        session.optimizationReport = std::move(rollback.optimizationReport);
+        session.branches = std::move(rollback.branches);
+        session.selectedManifestPath = std::move(rollback.selectedManifestPath);
+        session.seedPoint = rollback.seedPoint;
+        session.focusedLinePosition = rollback.focusedLinePosition;
+        session.focusedControlPoint = std::move(rollback.focusedControlPoint);
+        session.lineWasOptimized = rollback.lineWasOptimized;
+        session.fiberMetricsMatchStoredFiber =
+            rollback.fiberMetricsMatchStoredFiber;
+        setSessionOptimizationState(session, rollback.optimizationState);
+    }
+}
+
 void LineAnnotationController::startFiberModeOptimization(
     LineAnnotationSession& session,
     bool retraceAll,
@@ -9888,6 +9999,29 @@ void LineAnnotationController::startFiberModeOptimization(
         invalidateFiberAlignmentMetrics(session.fiberId, true);
     }
 
+    uint64_t solveEpoch = 0;
+    if (!session.solveQueue.beginSolve(solveEpoch)) {
+        // A solve is already in flight (a caller slipped past its own gate)
+        // or the session is shutting down. Coalesce instead of double-
+        // starting; the numbering behind an in-flight caller's dirty set
+        // cannot be trusted, so escalate to a whole-line pass.
+        session.solveQueue.addPending({}, true);
+        return;
+    }
+    session.runningSolveEpoch = solveEpoch;
+    session.runningSolveFullLine = retraceAll || !dirtySegments;
+    session.runningSolveCancel = std::make_shared<std::atomic<bool>>(false);
+    if (!dirtySegments) {
+        // A whole-line solve subsumes whatever partial request was pending.
+        (void)session.solveQueue.takePending();
+    } else if (session.solveQueue.hasPending()) {
+        // A pending request recorded before this caller's own session
+        // mutation may reference stale control numbering; re-solve the whole
+        // line afterwards rather than trust it.
+        (void)session.solveQueue.takePending();
+        session.solveQueue.addPending({}, true);
+    }
+
     session.optimizationStateBeforeTask = session.optimizationState;
     session.taskState = LineAnnotationSession::TaskState::Running;
     session.error.clear();
@@ -9897,7 +10031,9 @@ void LineAnnotationController::startFiberModeOptimization(
     const std::string surfaceName = session.surfaceName;
     auto* pane = paneForSurface(surfaceName);
     if (pane && pane->dialog) {
-        pane->dialog->setOptimizationBusy(true);
+        // Passive badge, not the input-swallowing overlay: control points
+        // can keep being placed while this solve runs; edits coalesce.
+        pane->dialog->setOptimizationBusy(true, false);
     }
     connect(watcher,
             &QFutureWatcher<OptimizationTaskResult>::finished,
@@ -9965,6 +10101,49 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
 
     OptimizationTaskResult task = watcher->result();
     session.watcher = nullptr;
+    session.runningSolveCancel.reset();
+
+    if (!session.solveQueue.mayPublish(session.runningSolveEpoch)) {
+        // The session was mutated (or began shutdown) while this solve ran:
+        // its result describes a line that no longer exists. Discard it
+        // wholesale - no apply, no rollback - and dispatch one solve over
+        // the coalesced pending spans instead. A superseded whole-line solve
+        // re-requests the whole line so a retrace is never silently shrunk
+        // to the superseding edit's spans.
+        Logger()->info(
+            "Line annotation solve superseded: event={} ok={} solve_epoch={} "
+            "current_epoch={}; discarding result",
+            task.eventName,
+            task.ok,
+            session.runningSolveEpoch,
+            session.solveQueue.epoch());
+        if (session.runningSolveFullLine) {
+            session.solveQueue.addPending({}, true);
+        }
+        session.nativeSeedTracePending = false;
+        session.taskState = LineAnnotationSession::TaskState::Idle;
+        auto pending = session.solveQueue.finishSolve();
+        if (pending.requested) {
+            startFiberModeOptimization(
+                session,
+                false,
+                pending.fullLine ? std::nullopt
+                                 : std::optional<std::vector<size_t>>(
+                                       std::move(pending.dirtySegments)));
+        }
+        if (pane->dialog) {
+            pane->dialog->setOptimizationBusy(
+                session.taskState == LineAnnotationSession::TaskState::Running,
+                false);
+        }
+        return;
+    }
+    // Publishable: return the queue to Idle before applying, so an apply
+    // epilogue that starts a follow-up solve (native seed chaining, a
+    // pending request from a caller that coalesced without mutating) can
+    // begin a new solve cleanly.
+    auto pendingAfterPublish = session.solveQueue.finishSolve();
+
     const bool chainNativeSeedTrace = session.nativeSeedTracePending &&
         task.eventName == "seed" && task.ok;
     // Captured before the move below: a failed apply despite an ok task
@@ -9979,9 +10158,6 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
                                                {},
                                                !chainNativeSeedTrace,
                                                !chainNativeSeedTrace);
-    if (pane->dialog) {
-        pane->dialog->setOptimizationBusy(false);
-    }
     if (!ok) {
         setSessionOptimizationState(session, session.optimizationStateBeforeTask);
         if (session.controlPointCollapseRollback) {
@@ -10046,6 +10222,23 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
                           session.suppressErrorDialogs);
             }
         }
+    }
+    if (pendingAfterPublish.requested &&
+        session.taskState != LineAnnotationSession::TaskState::Running) {
+        // A request coalesced without a session mutation (a gated caller
+        // slipped past its own gate mid-flight); honor it now.
+        startFiberModeOptimization(
+            session,
+            false,
+            pendingAfterPublish.fullLine
+                ? std::nullopt
+                : std::optional<std::vector<size_t>>(
+                      std::move(pendingAfterPublish.dirtySegments)));
+    }
+    if (pane->dialog) {
+        pane->dialog->setOptimizationBusy(
+            session.taskState == LineAnnotationSession::TaskState::Running,
+            false);
     }
 }
 

@@ -275,3 +275,23 @@ target_link_libraries(test_fiber_map_rebuild_queue PRIVATE
 add_test(NAME fiber_map_rebuild_queue COMMAND test_fiber_map_rebuild_queue)
 vc_register_test_target(test_fiber_map_rebuild_queue)
 vc_register_ctest(fiber_map_rebuild_queue test_fiber_map_rebuild_queue)
+
+add_executable(test_line_annotation_optimization_queue
+    test_line_annotation_optimization_queue.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationOptimizationQueue.hpp)
+
+set_target_properties(test_line_annotation_optimization_queue PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_line_annotation_optimization_queue PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_line_annotation_optimization_queue PRIVATE
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME line_annotation_optimization_queue
+    COMMAND test_line_annotation_optimization_queue)
+vc_register_test_target(test_line_annotation_optimization_queue)
+vc_register_ctest(line_annotation_optimization_queue
+    test_line_annotation_optimization_queue)

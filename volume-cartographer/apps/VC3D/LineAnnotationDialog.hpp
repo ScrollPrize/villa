@@ -157,7 +157,12 @@ public:
     void setGeneratedPredSnapPoints(std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints);
     void setGeneratedSpanAlignmentMetrics(
         std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics);
-    void setOptimizationBusy(bool busy);
+    // blockInput=true covers the panes with the input-swallowing overlay
+    // (initial seed solves: there is no line to edit yet). blockInput=false
+    // shows a passive top-center badge instead and leaves the panes
+    // interactive, so control points can keep being placed while a
+    // re-optimization runs (edits coalesce in the controller).
+    void setOptimizationBusy(bool busy, bool blockInput = true);
     void setOptimizationStatus(bool optimized);
     // Empty retracts the notice; see updateUmbilicusNotice().
     void setUmbilicusNotice(const QString& notice);
@@ -446,6 +451,7 @@ private:
     QAction* _mirrorCursorAction = nullptr;
     QAction* _resetViewsAction = nullptr;
     QPointer<QWidget> _optimizationOverlay;
+    QPointer<QWidget> _optimizationBadge;
     QMdiArea* _mdiArea = nullptr;
     std::vector<Pane> _panes;
     bool _suppressPaneClosed = false;
