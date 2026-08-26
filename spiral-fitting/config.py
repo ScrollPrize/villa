@@ -524,7 +524,7 @@ class Config:
         self.optimizer_weight_decay_gap_expander = 0.01
         self.optimizer_weight_decay_flow_field = 0.0
         self.loss_start_patch_dt = 25000
-        self.loss_start_track_dt = 10000
+        self.loss_start_track_dt = 25000
         self.loss_start_unverified_patch_dt = None
         self.dt_progressive_windings = False
         self.dt_progressive_inner_winding = 20
