@@ -319,8 +319,8 @@ class Config:
         self.sample_count_dense_spacing_count_extra_pairs = 0
         self.sample_count_dense_spacing_density_extra_pairs = 24000
         self.sample_count_dense_spacing_density_chunk_pairs = 24000
-        self.sample_count_winding_model_relative_pairs = 12000
-        self.sample_count_winding_model_density_pairs = 12000
+        self.sample_count_winding_model_relative_pairs = 128000
+        self.sample_count_winding_model_density_pairs = 128000
         self.sample_count_minimum_spacing_independent_samples = 2000
         self.sample_count_dense_attachment_points = 20000
         self.sample_count_patch_dt_target_points = 256
@@ -347,7 +347,7 @@ class Config:
         self.input_use_pcl_same_winding = True
         self.input_use_pcl_drawn_control_points = True
         self.input_use_normals = True
-        self.input_use_surf_sdt = True
+        self.input_use_surf_sdt = False
         self.input_use_gradient_magnitude = True
         self.input_use_winding_inference = True
         self.input_use_outer_shell = True
@@ -400,7 +400,7 @@ class Config:
         self.dense_grad_mag_encode_scale = 1000.0
         self.dense_grad_mag_factor = 0.25
         self.dense_spacing_integration_steps = 8
-        self.dense_spacing_mode = "phase"
+        self.dense_spacing_mode = "winding_model"
         self.winding_model_relative_pair_delta = [3, 15]
         self.winding_model_huber_delta = 0.5
         self.dense_spacing_pair_m_short = [
