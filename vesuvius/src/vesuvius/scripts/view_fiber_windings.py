@@ -160,6 +160,14 @@ def winding_layer_color(key: WindingLayerKey) -> tuple[float, float, float, floa
     return red, green, blue, 1.0
 
 
+def winding_layer_colors(key: WindingLayerKey, count: int) -> np.ndarray:
+    """Return Napari's explicit per-shape RGBA color array."""
+    if count < 0:
+        raise ValueError("winding layer color count must be nonnegative")
+    color = np.asarray(winding_layer_color(key), dtype=np.float32)
+    return np.broadcast_to(color, (count, 4)).copy()
+
+
 def winding_layer_name(key: WindingLayerKey) -> str:
     """Return a compact stable Napari layer name."""
     return f"w{key.winding} {_STATE_NAMES[key.state]}"
@@ -303,6 +311,32 @@ def add_winding_controls(
     viewer.window.add_dock_widget(widget, area="right", name="Winding visibility")
 
 
+def add_winding_layers(
+    viewer,
+    geometry: Sequence[WindingGeometry],
+    edge_width: float,
+) -> tuple[dict[WindingLayerKey, object], int]:
+    """Add nonempty winding artifacts using explicit per-path colors."""
+    layers: dict[WindingLayerKey, object] = {}
+    fiber_count = 0
+    for item in geometry:
+        if not item.paths_zyx:
+            continue
+        key = item.artifact.key
+        layers[key] = viewer.add_shapes(
+            list(item.paths_zyx),
+            ndim=3,
+            shape_type="path",
+            name=winding_layer_name(key),
+            edge_color=winding_layer_colors(key, len(item.paths_zyx)),
+            edge_width=edge_width,
+            face_color="transparent",
+            visible=False,
+        )
+        fiber_count += len(item.paths_zyx)
+    return layers, fiber_count
+
+
 def launch_viewer(path: str | Path, edge_width: float = 2.0) -> None:
     """Load winding geometry and launch the interactive 3D viewer."""
     if not np.isfinite(edge_width) or edge_width <= 0:
@@ -317,23 +351,7 @@ def launch_viewer(path: str | Path, edge_width: float = 2.0) -> None:
     base = normalize_winding_output_base(path)
     geometry = load_winding_geometry(base)
     viewer = napari.Viewer(ndisplay=3, title=f"Fiber windings: {base.name}")
-    layers: dict[WindingLayerKey, object] = {}
-    fiber_count = 0
-    for item in geometry:
-        if not item.paths_zyx:
-            continue
-        key = item.artifact.key
-        layers[key] = viewer.add_shapes(
-            list(item.paths_zyx),
-            ndim=3,
-            shape_type="path",
-            name=winding_layer_name(key),
-            edge_color=winding_layer_color(key),
-            edge_width=edge_width,
-            face_color="transparent",
-            visible=False,
-        )
-        fiber_count += len(item.paths_zyx)
+    layers, fiber_count = add_winding_layers(viewer, geometry, edge_width)
     if not layers:
         raise ValueError(f"all winding state OBJ artifacts are empty for base {base}")
     add_winding_controls(viewer, layers)
@@ -372,4 +390,3 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

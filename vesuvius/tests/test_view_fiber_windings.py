@@ -8,6 +8,7 @@ from vesuvius.scripts.view_fiber_windings import (
     WindingArtifact,
     WindingGeometry,
     WindingLayerKey,
+    add_winding_layers,
     advance_winding,
     build_parser,
     discover_winding_artifacts,
@@ -16,6 +17,7 @@ from vesuvius.scripts.view_fiber_windings import (
     read_winding_artifact,
     visible_winding_layers,
     winding_layer_color,
+    winding_layer_colors,
 )
 
 HEADERS = {
@@ -188,6 +190,47 @@ def test_winding_colors_are_stable_distinct_bright_and_opaque():
     assert winding_layer_color(WindingLayerKey(7, "h")) == winding_layer_color(
         WindingLayerKey(7, "h")
     )
+
+
+def test_winding_layer_colors_are_explicit_per_shape_rgba_arrays():
+    key = WindingLayerKey(7, "h")
+    colors = winding_layer_colors(key, 3)
+    assert colors.shape == (3, 4)
+    assert colors.dtype == np.float32
+    np.testing.assert_array_equal(colors[0], colors[1])
+    np.testing.assert_allclose(colors[0], winding_layer_color(key))
+
+
+def test_add_winding_layers_passes_napari_per_shape_color_array(tmp_path):
+    class FakeViewer:
+        def __init__(self):
+            self.calls = []
+
+        def add_shapes(self, data, **kwargs):
+            self.calls.append((data, kwargs))
+            return object()
+
+    key = WindingLayerKey(2, "v")
+    paths = (
+        np.zeros((2, 3), dtype=np.float32),
+        np.ones((3, 3), dtype=np.float32),
+    )
+    geometry = (
+        WindingGeometry(WindingArtifact(key, tmp_path / "v.obj"), paths),
+        WindingGeometry(
+            WindingArtifact(WindingLayerKey(2, "h"), tmp_path / "h.obj"), ()
+        ),
+    )
+    viewer = FakeViewer()
+    layers, fiber_count = add_winding_layers(viewer, geometry, 3.0)
+    assert tuple(layers) == (key,)
+    assert fiber_count == 2
+    assert len(viewer.calls) == 1
+    data, kwargs = viewer.calls[0]
+    assert len(data) == 2
+    assert kwargs["edge_color"].shape == (2, 4)
+    assert kwargs["edge_color"].dtype == np.float32
+    assert kwargs["edge_width"] == 3.0
 
 
 def test_visibility_presets_and_winding_navigation_group_ties_as_broken():
