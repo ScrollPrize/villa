@@ -1,52 +1,39 @@
-# Task Log: Binary sum-product fiber belief propagation
+# Task Log: Explicit Mixed-state fiber belief propagation
 
 ## 2026-08-27
 
-- Started from committed binary min-sum and consistency diagnostics at
-  `fd7aa3c2e`.
-- Chose a separate sum-product entry point over the same merged factor graph so
-  existing min-sum numerics and the comparison cohort remain unchanged.
-- The first experiment has no population-balance field. Sum-product will fail
-  explicitly if combined with the current min-sum-only balance draft.
-- Independent plan review fixed the directed log-ratio sign convention,
-  required post-damping residuals and explicit final-iterate `message_limit`
-  semantics, and separated factor temperature from min-sum's post-hoc display
-  temperature. It also required exact-tree, sign, damping, low-temperature,
-  nonconvergence, seed-only, and deterministic-loop tests.
-- Extracted shared graph preparation and report initialization so min-sum and
-  sum-product consume exactly the same merged perpendicular factor graph and
-  central straight seed without duplicating either implementation.
-- Implemented synchronous log-space sum-product with stable two-term
-  log-sum-exp updates, common factor-potential offsets, exact hard-H seed
-  messages, and distinct output artifacts. Sum-product balance fields are not
-  reported as meaningful values.
-- Focused build and test after implementation:
-  `cmake --build volume-cartographer/build --target vc_fiber_trace_chunk test_fiberlet_crop_trace -j32`
-  and `volume-cartographer/build/bin/test_fiberlet_crop_trace` passed all 61
-  test cases.
-- Centered-384 full-Mixed cohort used the existing 179-fiber, 1324-factor
-  no-split perpendicular graph. At `T=0.25`, sum-product converged in 45
-  iterations and 0.003079 s. Soft same-label AUROC was `0.646966`, effectively
-  unchanged from committed min-sum `0.646835`; hard mismatch AUROC remained
-  `0.633989`.
-- Deterministic temperature sweep soft same-label AUROC:
-  `T=0.1: 0.637838`, `0.5: 0.665353`, `1.0: 0.685317`,
-  `1.5: 0.690833`, `2.0: 0.693853`, `2.5: 0.694641`,
-  `3.0: 0.691883`, `4.0: 0.679669`, `8.0: 0.598503`,
-  `16.0: 0.575650`, and `32.0: 0.569609`. All runs converged in 22-95
-  iterations and 0.0025-0.0079 s solver time. This is a single-crop diagnostic,
-  so the existing default `T=0.25` was not silently retuned.
-- Sum-product at high temperature leaves most fibers unresolved under the
-  fixed 0.25/0.75 hard thresholds; those hard-mismatch AUROCs therefore use a
-  changing cohort and are not directly comparable across the entire sweep.
-- At the best tested `T=2.5`, all 94 constrained trusted fibers lie on the
-  correct side of the `P(H)=0.5` majority boundary: all 50 Direction1/V fibers
-  are below it and 44 of 45 Direction2/H fibers are above it. The remaining
-  Direction2 fiber is exactly `0.5` because it has degree zero; there are no
-  majority H/V reversals. Under the stricter confidence bands, 45/50 V fibers
-  are below `0.25`, 38/45 H fibers are above `0.75`, 11 supported fibers are
-  weakly but correctly classified, and the one unsupported fiber remains
-  uncertain. Median `P(H)` is `0.018161` for Direction1/V and `0.980703` for
-  Direction2/H. The 84 Mixed references remain distributed across both
-  orientations and the uncertainty interval rather than being forced into a
-  separate state.
+- Started from committed binary sum-product BP at `54b24dbb8`.
+- Chose a separate ternary inference mode so the binary min-sum and
+  sum-product experiments remain exactly reproducible.
+- Model Mixed as the established defect/Broken meaning: it disables the H/V
+  orientation factor and pays a configurable penalty per incident merged link.
+  It is not a third physical direction.
+- Independent review required the Mixed penalty to scale by the raw
+  measurement count represented by a merged factor, explicit normalized
+  message gauges, direct `P(Mixed)` diagnostics, separate tie handling, and
+  tests for unseeded gauge symmetry and duplicate measurements. The plan and
+  implementation were corrected before validation.
+- Implemented normalized three-entry log messages, exact hard-H seeding,
+  normalized V/Mixed/H node marginals, explicit orientation projection, direct
+  Mixed AUROC/confusion summaries, probability summaries, and separate Mixed
+  probability OBJ bands. Existing binary inference output remains unchanged.
+- Focused build and validation:
+  `cmake --build volume-cartographer/build --target vc_fiber_trace_chunk test_fiberlet_crop_trace -j32`,
+  `volume-cartographer/build/bin/test_fiberlet_crop_trace`, and
+  `git diff --check` passed. The suite now has 64 passing cases.
+- Centered-384 evaluation used 179 fibers (50 Direction1, 45 Direction2, 84
+  Mixed), 1324 perpendicular factors, `T=2.5`, and the full admitted Mixed
+  cohort. Mixed-cost sweep results for direct `P(Mixed)` AUROC were:
+  `0.0: 0.398434`, `0.1: 0.416855`, `0.2: 0.695802`, `0.25: 0.744173`,
+  `0.275: 0.742419`, `0.3: 0.747807`, `0.325: 0.754073`,
+  `0.35: 0.746429`, `0.375: 0.730514`, `0.4: 0.720363`,
+  `0.5: 0.693672`, `0.75: 0.662719`, and `1.0: 0.647431`.
+- The best tested cost `0.325` improves Mixed ranking over the committed best
+  binary consistency proxy (`0.694641` AUROC). Mean/median `P(Mixed)` were
+  `0.223164/0.236099` for Direction1, `0.226372/0.234011` for Direction2, and
+  `0.299017/0.333333` for Mixed. Argmax is conservative: 9/84 Mixed fibers
+  select Mixed, no trusted fiber selects Mixed, and four exact ties include
+  one unsupported trusted fiber plus three unsupported Mixed fibers.
+- Kept the experimental default Mixed cost at `0.5`: selecting `0.325` from a
+  single crop would overfit the diagnostic. The measured command can pass
+  `--bp-mixed-cost 0.325` explicitly.

@@ -87,6 +87,7 @@ struct Options {
     bool hasBpTuningOption = false;
     bool hasBpInferenceOption = false;
     bool hasBpBalanceTuningOption = false;
+    bool hasBpMixedCostOption = false;
 };
 
 [[noreturn]] void fail(const std::string& message)
@@ -142,7 +143,8 @@ void usage(const char* executable)
               << "  --post-influence F        neighbor confidence support width in (0,1] [1]\n\n"
               << "Belief-propagation options (direction-ablation only):\n"
               << "  --bp-only                 run only final-cohort BP; skip HiGHS\n"
-              << "  --bp-inference MODE       min-sum or sum-product [min-sum]\n"
+              << "  --bp-inference MODE       min-sum, sum-product, or sum-product-mixed [min-sum]\n"
+              << "  --bp-mixed-cost F         Mixed-state cost per incident link [0.5]\n"
               << "  --bp-balance MODE         soft, tight, or both [disabled]\n"
               << "  --bp-target F             arc-weighted H fraction [0.5]\n"
               << "  --bp-soft-strength F      quadratic balance strength [1]\n"
@@ -329,10 +331,22 @@ Options parse(int argc, char** argv)
             } else if (inference == "sum-product") {
                 options.bpInference = vc::fiber_tracer::
                     FiberTraceBeliefInference::SumProduct;
+            } else if (inference == "sum-product-mixed") {
+                options.bpInference = vc::fiber_tracer::
+                    FiberTraceBeliefInference::SumProductMixed;
             } else {
-                fail("--bp-inference must be min-sum or sum-product");
+                fail("--bp-inference must be min-sum, sum-product, or sum-product-mixed");
             }
             options.hasBpInferenceOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--bp-mixed-cost") {
+            options.bp.mixedCostPerConstraint =
+                number(index, argc, argv, "--bp-mixed-cost");
+            if (options.bp.mixedCostPerConstraint < 0.0)
+                fail("--bp-mixed-cost must be nonnegative");
+            options.hasBpMixedCostOption = true;
+            options.hasBpTuningOption = true;
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
         } else if (argument == "--bp-balance") {
@@ -587,15 +601,20 @@ Options parse(int argc, char** argv)
         }
         if (options.hasBpInferenceOption && !options.bpOnly)
             fail("--bp-inference requires --bp-only");
-        if (options.bpInference ==
-                vc::fiber_tracer::FiberTraceBeliefInference::SumProduct &&
+        if (options.bpInference !=
+                vc::fiber_tracer::FiberTraceBeliefInference::MinSum &&
             options.bpBalance != BpBalanceSelection::None) {
             fail("sum-product BP does not support --bp-balance");
         }
-        if (options.bpInference ==
-                vc::fiber_tracer::FiberTraceBeliefInference::SumProduct &&
+        if (options.bpInference !=
+                vc::fiber_tracer::FiberTraceBeliefInference::MinSum &&
             options.hasBpBalanceTuningOption) {
             fail("sum-product BP does not accept balance tuning controls");
+        }
+        if (options.hasBpMixedCostOption &&
+            options.bpInference != vc::fiber_tracer::
+                FiberTraceBeliefInference::SumProductMixed) {
+            fail("--bp-mixed-cost requires --bp-inference sum-product-mixed");
         }
         if ((options.bpOnly ||
              options.bpBalance != BpBalanceSelection::None) &&
@@ -1105,18 +1124,25 @@ void writeAndPrintBpReport(
     std::span<const vc::fiber_tracer::FiberDirectionGroup> directions,
     const std::filesystem::path& output)
 {
+    const bool sumProduct = report.inference !=
+        vc::fiber_tracer::FiberTraceBeliefInference::MinSum;
+    const bool mixedState = report.inference ==
+        vc::fiber_tracer::FiberTraceBeliefInference::SumProductMixed;
     if (report.horizontalness.size() != lines.size() ||
         directions.size() != lines.size() ||
         originalTraceIndices.size() != lines.size() ||
-        report.seedTraceIndex >= lines.size()) {
+        report.seedTraceIndex >= lines.size() ||
+        (mixedState &&
+         (report.verticalProbability.size() != lines.size() ||
+          report.mixedProbability.size() != lines.size() ||
+          report.horizontalProbability.size() != lines.size()))) {
         throw std::logic_error("BP report does not match represented fibers");
     }
     const std::string modeName =
         vc::fiber_tracer::fiberTraceBalanceModeName(mode);
     const std::string inferenceName =
         vc::fiber_tracer::fiberTraceBeliefInferenceName(report.inference);
-    const std::string artifactName = report.inference ==
-            vc::fiber_tracer::FiberTraceBeliefInference::SumProduct
+    const std::string artifactName = sumProduct
         ? inferenceName
         : modeName;
     const auto outputBase = output.parent_path() /
@@ -1125,6 +1151,16 @@ void writeAndPrintBpReport(
         vc::fiber_tracer::classifyFiberValues(report.horizontalness);
     const auto paths = vc::fiber_tracer::writeFiberletCropValueBandObjs(
         lines, bands, outputBase);
+    std::optional<vc::fiber_tracer::FiberValueBandObjPaths>
+        mixedPaths;
+    if (mixedState) {
+        const auto mixedBands = vc::fiber_tracer::classifyFiberValues(
+            report.mixedProbability);
+        mixedPaths = vc::fiber_tracer::writeFiberletCropValueBandObjs(
+            lines, mixedBands,
+            output.parent_path() /
+                (output.stem().string() + "_bp_" + artifactName + "_mixed"));
+    }
     const auto [minimum, maximum] = std::minmax_element(
         report.horizontalness.begin(), report.horizontalness.end());
     const double mean = std::accumulate(
@@ -1152,13 +1188,16 @@ void writeAndPrintBpReport(
     if (!csvOutput)
         throw std::runtime_error("failed to open BP consistency CSV: " + csv.string());
     csvOutput << "trace,original_trace,reference,";
-    if (report.inference ==
-        vc::fiber_tracer::FiberTraceBeliefInference::SumProduct) {
+    if (sumProduct) {
         csvOutput << "bp_inference,bp_temperature,";
     }
+    if (mixedState)
+        csvOutput << "bp_mixed_cost,p_v,p_mixed,p_h,";
     csvOutput
         << "bp_status,vertical_threshold,"
-           "horizontal_threshold,horizontalness,degree,incident_measurements,"
+           "horizontal_threshold,"
+        << (mixedState ? "orientation_projection" : "horizontalness")
+        << ",degree,incident_measurements,"
            "total_strength,"
            "resolved_degree,resolved_strength,unresolved_degree,"
            "unresolved_strength,hard_mismatches,hard_mismatch_rate,"
@@ -1175,10 +1214,15 @@ void writeAndPrintBpReport(
         const auto& current = consistency.traces[trace];
         csvOutput << trace << ',' << originalTraceIndices[trace] << ','
                   << directionName(directions[trace]) << ',';
-        if (report.inference ==
-            vc::fiber_tracer::FiberTraceBeliefInference::SumProduct) {
+        if (sumProduct) {
             csvOutput << inferenceName << ',' << report.inferenceTemperature
                       << ',';
+        }
+        if (mixedState) {
+            csvOutput << report.mixedCostPerConstraint << ','
+                      << report.verticalProbability[trace] << ','
+                      << report.mixedProbability[trace] << ','
+                      << report.horizontalProbability[trace] << ',';
         }
         csvOutput << report.status << ',' << consistency.verticalThreshold << ','
                   << consistency.horizontalThreshold << ','
@@ -1203,8 +1247,25 @@ void writeAndPrintBpReport(
     if (!csvOutput)
         throw std::runtime_error("failed to write BP consistency CSV: " + csv.string());
     std::cout << std::fixed << std::setprecision(6);
-    if (report.inference ==
-        vc::fiber_tracer::FiberTraceBeliefInference::SumProduct) {
+    if (mixedState) {
+        std::cout
+            << "fiber direction Mixed-state sum-product BP\n"
+            << "inference  temperature  mixed_cost  status  fibers  factors  measurements"
+               "  components  isolated  seed  seed_ref  message_iterations"
+               "  message_residual  achieved_orientation  min_orientation"
+               "  mean_orientation  max_orientation  seconds\n"
+            << inferenceName << "  " << report.inferenceTemperature << "  "
+            << report.mixedCostPerConstraint << "  "
+            << report.status << "  " << lines.size() << "  " << report.factors
+            << "  " << report.mergedMeasurements << "  "
+            << report.connectedComponents << "  " << report.isolatedTraces
+            << "  " << report.seedTraceIndex << "  "
+            << directionName(directions[report.seedTraceIndex]) << "  "
+            << report.messageIterations << "  " << report.messageResidual
+            << "  " << report.achievedHorizontalFraction << "  " << *minimum
+            << "  " << mean << "  " << *maximum << "  "
+            << report.solveSeconds << '\n';
+    } else if (sumProduct) {
         std::cout
             << "fiber direction sum-product BP\n"
             << "inference  temperature  status  fibers  factors  measurements"
@@ -1253,6 +1314,92 @@ void writeAndPrintBpReport(
                   << current.maximumValue << "  " << paths.bands[band]
                   << '\n';
     }
+    if (mixedState) {
+        std::array<std::array<std::size_t, 4>, 3> confusion{};
+        std::vector<double> mixedReferences;
+        std::vector<double> trustedReferences;
+        for (std::size_t trace = 0; trace < lines.size(); ++trace) {
+            const std::array probabilities{
+                report.verticalProbability[trace],
+                report.mixedProbability[trace],
+                report.horizontalProbability[trace],
+            };
+            const double maximum = *std::max_element(
+                probabilities.begin(), probabilities.end());
+            const std::size_t ties = static_cast<std::size_t>(std::count(
+                probabilities.begin(), probabilities.end(), maximum));
+            const std::size_t prediction = ties == 1
+                ? static_cast<std::size_t>(std::distance(
+                      probabilities.begin(),
+                      std::find(probabilities.begin(), probabilities.end(), maximum)))
+                : 3;
+            ++confusion[static_cast<std::size_t>(directions[trace])][prediction];
+            if (directions[trace] ==
+                vc::fiber_tracer::FiberDirectionGroup::Mixed) {
+                mixedReferences.push_back(report.mixedProbability[trace]);
+            } else {
+                trustedReferences.push_back(report.mixedProbability[trace]);
+            }
+        }
+        double favorable = 0.0;
+        for (const double positive : mixedReferences) {
+            for (const double negative : trustedReferences) {
+                favorable += positive > negative
+                    ? 1.0
+                    : positive == negative ? 0.5 : 0.0;
+            }
+        }
+        std::cout << "fiber direction explicit Mixed marginal\n"
+                  << "reference  predicted_v  predicted_mixed  predicted_h  tie\n";
+        for (std::size_t reference = 0; reference < confusion.size(); ++reference) {
+            std::cout << directionName(
+                             static_cast<vc::fiber_tracer::FiberDirectionGroup>(reference))
+                      << "  " << confusion[reference][0]
+                      << "  " << confusion[reference][1]
+                      << "  " << confusion[reference][2]
+                      << "  " << confusion[reference][3] << '\n';
+        }
+        std::cout << "metric  direction  mixed  trusted  auroc\n"
+                  << "p_mixed  higher  " << mixedReferences.size() << "  "
+                  << trustedReferences.size() << "  ";
+        if (mixedReferences.empty() || trustedReferences.empty())
+            std::cout << "NA\n";
+        else
+            std::cout << favorable / static_cast<double>(
+                mixedReferences.size() * trustedReferences.size()) << '\n';
+        std::cout << "fiber direction explicit state marginal summaries\n"
+                  << "reference  state  count  min  mean  median  p90  max\n";
+        const std::array<std::span<const double>, 3> stateValues{
+            report.verticalProbability,
+            report.mixedProbability,
+            report.horizontalProbability,
+        };
+        constexpr std::array<const char*, 3> stateNames{"p_v", "p_mixed", "p_h"};
+        for (std::size_t reference = 0; reference < 3; ++reference) {
+            for (std::size_t state = 0; state < 3; ++state) {
+                std::vector<double> values;
+                for (std::size_t trace = 0; trace < lines.size(); ++trace) {
+                    if (static_cast<std::size_t>(directions[trace]) == reference)
+                        values.push_back(stateValues[state][trace]);
+                }
+                const double valueMean = std::accumulate(
+                    values.begin(), values.end(), 0.0) /
+                    static_cast<double>(values.size());
+                std::cout << directionName(
+                                 static_cast<vc::fiber_tracer::FiberDirectionGroup>(reference))
+                          << "  " << stateNames[state] << "  " << values.size()
+                          << "  " << quantile(values, 0.0)
+                          << "  " << valueMean
+                          << "  " << quantile(values, 0.5)
+                          << "  " << quantile(values, 0.9)
+                          << "  " << quantile(values, 1.0) << '\n';
+            }
+        }
+        std::cout << "fiber direction explicit Mixed probability bands base="
+                  << mixedPaths->bands.front().parent_path() /
+                        (output.stem().string() + "_bp_" + artifactName + "_mixed")
+                  << '\n';
+    }
     const auto printConsistencyMetric = [&] (
                                             const char* reference,
                                             const char* metric,
@@ -1272,7 +1419,9 @@ void writeAndPrintBpReport(
                   << "  " << quantile(values, 0.9)
                   << "  " << quantile(values, 1.0) << '\n';
     };
-    std::cout << "fiber direction BP constraint consistency\n"
+    std::cout << (mixedState
+                      ? "fiber direction BP orientation-projection heuristic consistency\n"
+                      : "fiber direction BP constraint consistency\n")
               << "reference  metric  valid_fibers  min  mean  median  p90  max\n";
     constexpr std::array<const char*, 9> names{
         "degree",
@@ -1599,16 +1748,30 @@ int main(int argc, char** argv)
                             config.balanceMode = mode;
                             config.cropMinimumBaseXYZ = artifact.minimumBaseXYZ;
                             config.cropMaximumBaseXYZ = artifact.maximumBaseXYZ;
-                            const auto report = options.bpInference ==
-                                    vc::fiber_tracer::
-                                        FiberTraceBeliefInference::SumProduct
-                                ? vc::fiber_tracer::solveFiberTraceSumProduct(
-                                      diagnosticLines, bpConstraints, config)
-                                : vc::fiber_tracer::
-                                      solveFiberTraceBeliefPropagation(
-                                          diagnosticLines,
-                                          bpConstraints,
-                                          config);
+                            vc::fiber_tracer::
+                                FiberTraceBeliefPropagationReport report;
+                            switch (options.bpInference) {
+                            case vc::fiber_tracer::
+                                FiberTraceBeliefInference::MinSum:
+                                report = vc::fiber_tracer::
+                                    solveFiberTraceBeliefPropagation(
+                                        diagnosticLines,
+                                        bpConstraints,
+                                        config);
+                                break;
+                            case vc::fiber_tracer::
+                                FiberTraceBeliefInference::SumProduct:
+                                report = vc::fiber_tracer::
+                                    solveFiberTraceSumProduct(
+                                        diagnosticLines, bpConstraints, config);
+                                break;
+                            case vc::fiber_tracer::
+                                FiberTraceBeliefInference::SumProductMixed:
+                                report = vc::fiber_tracer::
+                                    solveFiberTraceMixedSumProduct(
+                                        diagnosticLines, bpConstraints, config);
+                                break;
+                            }
                             writeAndPrintBpReport(
                                 report,
                                 mode,

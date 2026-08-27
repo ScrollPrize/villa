@@ -5079,3 +5079,28 @@
   `_p9.obj` and `<base>_bp_sum_product_consistency.csv`, which records its
   inference name, temperature, and status. The existing soft same-label value
   remains an endpoint-independence proxy rather than a pairwise marginal.
+- `--bp-inference sum-product-mixed` is a separate experimental categorical
+  V/Mixed/H solver over the same merged perpendicular graph. Mixed denotes an
+  orientation defect, not a third direction. For a factor containing `K` raw
+  measurements, oriented pairs retain `E_same`/`E_diff`; one Mixed endpoint
+  costs `K*bp_mixed_cost`, and two Mixed endpoints cost
+  `2*K*bp_mixed_cost`. `--bp-mixed-cost` must be finite and nonnegative and is
+  invalid outside this inference mode.
+- Ternary directed messages contain V/Mixed/H log values. Raw and post-damping
+  messages subtract their log-sum-exp gauge, and convergence uses the maximum
+  normalized post-damping change. The 3x3 update is
+  `m_i->j(t)=logsumexp_s(cavity_i(s)-E(s,t)/T)` followed by normalization.
+  The common factor offset, when used, applies to all nine energies.
+- The central seed is exactly H. An isolated unseeded node has uniform
+  `(1/3,1/3,1/3)` marginals. Any unseeded connected component retains exact
+  V/H gauge symmetry but can have nonuniform Mixed probability. Exact argmax
+  ties are reported separately rather than assigned to Mixed.
+- Ternary reports normalized `p_v,p_mixed,p_h`. Its legacy scalar orientation
+  projection is `p_h+0.5*p_mixed`; it may drive orientation bands and
+  explicitly named heuristic consistency output but must not be called `P(H)`
+  or treated as a calibrated binary marginal. Mixed discrimination uses the
+  gauge-invariant `p_mixed` directly.
+- Ternary owns `<base>_bp_sum_product_mixed_p0..p9.obj` projection bands,
+  `<base>_bp_sum_product_mixed_mixed_p0..p9.obj` Mixed-probability bands, and
+  `<base>_bp_sum_product_mixed_consistency.csv` containing the three
+  probabilities, projection, inference temperature, Mixed cost, and status.

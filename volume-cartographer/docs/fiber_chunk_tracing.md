@@ -662,6 +662,36 @@ The CSV records its inference name, temperature, and convergence status. The
 soft same-label diagnostic remains an endpoint-independence proxy; it is not a
 sum-product pairwise marginal.
 
+Add `--bp-inference sum-product-mixed` to test an explicit categorical
+V/Mixed/H variable. Mixed means an orientation defect, not a third physical
+direction. If a merged factor represents `K` measurements, its energies are:
+
+```text
+E(V,V) = E(H,H) = E_same
+E(V,H) = E(H,V) = E_diff
+E(Mixed,V/H) = E(V/H,Mixed) = K * mixed_cost_per_link
+E(Mixed,Mixed) = 2 * K * mixed_cost_per_link
+```
+
+Set the cost with `--bp-mixed-cost F`; its experimental default is `0.5`.
+The hard seed remains H. Every directed message contains three normalized
+log-values, and the reported `p_v`, `p_mixed`, and `p_h` are normalized node
+marginals. An isolated unseeded fiber is uniform over the three states. An
+unseeded connected component retains exact V/H gauge symmetry, although its
+Mixed marginal can differ from one third.
+
+The scalar `orientation_projection = p_h + 0.5*p_mixed` exists only for the
+legacy H/V band visualization and explicitly labeled heuristic consistency
+output. It is not `P(H)` and is not a calibrated binary marginal. Direct Mixed
+diagnostics report a tie-aware `p_mixed` AUROC, state-marginal summaries, and
+an argmax V/Mixed/H confusion table with exact ties in a separate column.
+
+This mode owns `<base>_bp_sum_product_mixed_p0.obj` through `_p9.obj` for the
+orientation projection, `<base>_bp_sum_product_mixed_mixed_p0.obj` through
+`_p9.obj` for `P(Mixed)`, and
+`<base>_bp_sum_product_mixed_consistency.csv` with all three probabilities.
+Like binary sum-product, it rejects population-balance controls.
+
 ## Quality groups
 
 Visualization stably sorts traces by ascending cost density and then stored

@@ -1465,3 +1465,9 @@
 - Added exact-tree, damping, sign, gauge-symmetry, low-temperature,
   nonconvergence, and deterministic-loop validation plus separate OBJ and CSV
   artifacts with inference and temperature provenance.
+
+## 2026-08-27 - Explicit Mixed-state BP experiment
+
+- Added categorical V/Mixed/H sum-product inference with measurement-scaled
+  defect costs, normalized state marginals, direct Mixed diagnostics, and
+  separate orientation-projection and Mixed-probability OBJ bands.

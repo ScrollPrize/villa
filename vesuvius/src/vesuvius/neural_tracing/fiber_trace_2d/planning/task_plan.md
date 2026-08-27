@@ -1,92 +1,76 @@
-# Plan: Binary sum-product fiber belief propagation
+# Plan: Explicit Mixed-state fiber belief propagation
 
 ## Contract
 
-- Reuse the exact validated and merged binary factor graph used by min-sum BP.
-  Fiber states remain V/H; sum-product changes inference and interpretation,
-  not the graph objective or diagnostic cohort.
-- For factor costs `E_same` and `E_different` and positive temperature `T`, use
-  log potentials `-E_same/T` and `-E_different/T`. Store one normalized H-vs-V
-  log-message per directed factor edge. Perform deterministic synchronous
-  updates in log space with the existing damping, message-iteration limit, and
-  residual tolerance. Use stable two-term log-sum-exp operations.
-- Define each directed message as
-  `ell_i->j = log m_i->j(H_j) - log m_i->j(V_j)`. For source cavity log odds
-  `r`, update it as
-  `logsumexp(-E_diff/T, r-E_same/T) -`
-  `logsumexp(-E_same/T, r-E_diff/T)`. A hard-H seed emits
-  `(E_diff-E_same)/T`. Subtract the common minimum factor cost before scaling;
-  this changes neither ratio nor marginal and keeps the exponentials bounded.
-- Initialize all directed log ratios to zero and use synchronous updates.
-  Apply damping as `old + damping * (raw-old)` to every message, including
-  seed messages, and measure the residual after damping. If the iteration
-  limit is reached, expose the final finite iterate with status
-  `message_limit`; do not describe it as a converged marginal.
-- Clamp only the established central straight seed exactly to H. Other nodes
-  have no unary evidence in this first experiment. Unsupported components
-  therefore retain their global H/V symmetry and report `P(H)=0.5`.
-- Decode each nonseed fiber directly as the normalized sum-product marginal
-  `P(H)=sigmoid(log_odds)`. This is an approximate marginal on loopy graphs,
-  unlike the existing min-sum horizontalness, and must be named accordingly.
-  It is exact on trees and a loopy-BP/Bethe approximation after convergence on
-  graphs with cycles. The existing soft same-label consistency diagnostic
-  remains an endpoint-independence proxy, not a pairwise BP marginal.
-- Add `--bp-inference min-sum|sum-product` for BP-only direction-ablation.
-  Omission preserves min-sum. Sum-product is initially incompatible with the
-  drafted `--bp-balance` modes; reject that combination explicitly rather than
-  approximating a global prior.
-- Treat temperature differently and explicitly: min-sum applies it only when
-  converting a min-marginal advantage to horizontalness, whereas sum-product
-  divides every pair-factor energy by it during inference. Shared message
-  iteration, damping, residual, and temperature controls remain available;
-  reject min-sum-only target, strength, balance-iteration, and balance-
-  tolerance controls for sum-product.
-- Keep artifact families separate: min-sum retains `<base>_bp_none_*`, while
-  sum-product owns `<base>_bp_sum_product_p0..p9.obj` and
-  `<base>_bp_sum_product_consistency.csv`. Include inference name and
-  temperature in console provenance and CSV rows.
-- Run the centered-384 full-Mixed cohort at the existing `T=0.25`, then a small
-  deterministic temperature sweep if runtime remains negligible. Compare
-  convergence, value distributions, mismatch diagnostics, and tie-aware AUROC
-  against the committed min-sum baseline.
+- Add an experimental `sum-product-mixed` inference mode without changing the
+  existing binary min-sum or binary sum-product paths.
+- Reuse the validated merged perpendicular factor graph, factor costs, and
+  central straight hard-H seed.
+- Give each variable three categorical states: V, Mixed, and H. When both
+  endpoints are oriented, use the existing same/different factor energy. An
+  endpoint in Mixed disables the orientation term and pays a fixed
+  `mixed_cost_per_link` for every raw measurement represented by that merged
+  factor; two Mixed endpoints therefore pay twice per measurement. This
+  matches the established per-link Broken penalty while making the state
+  probabilistic.
+- Run deterministic synchronous log-space sum-product over normalized
+  three-entry messages. Apply the existing damping, post-damping residual,
+  iteration limit, and temperature semantics. The seed is exactly H.
+- Report normalized `P(V)`, `P(Mixed)`, and `P(H)`. Retain a scalar orientation
+  value `P(H) + 0.5*P(Mixed)` only for the established H/V band visualization
+  and explicitly labeled heuristic consistency diagnostics; do not describe it
+  as `P(H)` or a calibrated binary marginal.
+- Add `--bp-mixed-cost F`, valid only for `sum-product-mixed`, and keep a
+  conservative default matching the established broken cost per link. Reject
+  balance modes and other min-sum-only controls as for binary sum-product.
+- Own separate `_bp_sum_product_mixed_p0..p9.obj` orientation-projection bands,
+  `_bp_sum_product_mixed_mixed_p0..p9.obj` `P(Mixed)` bands, and a consistency
+  CSV with all three probabilities and the projection. Print an argmax
+  V/Mixed/H confusion table with exact ties separate and a tie-aware
+  `P(Mixed)` AUROC against the existing direction diagnostic. H/V confusion is
+  descriptive and reference-oriented; Mixed classification and AUROC are
+  gauge-invariant.
+- Run a small mixed-cost sweep on the centered-384 full-Mixed cohort at the
+  best previously observed temperature `T=2.5`, while retaining the general
+  CLI defaults unless the single-crop evidence is sufficient to justify a
+  documented experimental default change.
 
 ## Implementation
 
-1. Refactor only the shared report initialization needed by both algorithms;
-   leave the existing min-sum update path numerically unchanged.
-2. Add stable scalar log-space sum-product message updates and a public solver
-   entry point using the existing graph builder, seed helper, and validation.
-3. Add CLI selection, provenance, distinct artifacts, and BP-only dispatch.
-4. Run the full-Mixed comparison and record exact results.
+1. Extend inference/config/report types with the ternary mode, Mixed cost, and
+   explicit state probabilities.
+2. Add a shared stable log-sum-exp helper for three-state categorical message
+   updates, leaving binary solver arithmetic unchanged.
+3. Extend BP-only parsing, validation, reporting, CSV, and OBJ ownership.
+4. Add exact-tree, symmetry, seed, penalty, damping, nonconvergence, and
+   determinism regression tests.
+5. Run the centered-384 experiment and log the measured confusion/AUROC.
 
 ## Spec Update
 
-Add sum-product factor potentials, log-message normalization, seed and
-symmetry behavior, approximate-marginal semantics, CLI compatibility, and
-artifact ownership to `specs.md`.
+Specify ternary factor energies, message normalization, seed/symmetry
+semantics, scalar orientation projection, CLI validation, and artifact fields.
 
 ## Docs Updates
 
-Document `--bp-inference sum-product`, temperature meaning, approximate
-marginal interpretation, and output names in
+Document the experimental `sum-product-mixed` invocation, Mixed per-link cost,
+three-state marginal interpretation, and outputs in
 `volume-cartographer/docs/fiber_chunk_tracing.md`.
 
 ## Testing
 
-- Compare sum-product marginals against brute-force exact marginals on a small
-  seeded tree at multiple factor strengths and temperatures, with damping one
-  and below one.
-- Test the exact seed, symmetric disconnected component at `0.5`, duplicate
-  factor merging, reversed input order, finite low-temperature behavior, and
-  explicit rejection of nonpositive temperature and unsupported balance use.
-- Add a two-node sign oracle, a forced `message_limit` final-iterate case, a
-  seed-only graph, and deterministic repeated loopy-graph inference.
-- Preserve all existing min-sum test values unchanged.
+- Compare ternary BP marginals with brute-force exact marginals on seeded trees.
+- Verify a cheap Mixed state attracts mass and an expensive one approaches the
+  binary result; test duplicate-measurement scaling, two-Mixed endpoint energy,
+  unseeded-component H/V symmetry, isolated uniformity, damping, low
+  temperature, message limits, input ordering, and invalid options.
+- Preserve all existing binary BP tests and outputs.
 - Build `vc_fiber_trace_chunk` and `test_fiberlet_crop_trace` with `-j32`, run
   the focused suite, and run `git diff --check`.
-- Run the centered-384 BP-only comparison without invoking HiGHS.
+- Run centered-384 BP-only mixed-cost experiments using the existing cached
+  trace dataset and normal manifest.
 
 ## Changelog
 
-Record the experimental log-space sum-product BP mode and normalized marginal
-diagnostics.
+Record the explicit three-state sum-product BP experiment and its normalized
+V/Mixed/H diagnostics.

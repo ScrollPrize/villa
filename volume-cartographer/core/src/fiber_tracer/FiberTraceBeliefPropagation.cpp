@@ -3,6 +3,7 @@
 #include "vc/fiber_tracer/FiberTraceSeed.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <limits>
@@ -66,6 +67,11 @@ void validateConfig(const FiberTraceBeliefPropagationConfig& config)
         !(config.horizontalnessTemperature > 0.0)) {
         throw std::invalid_argument(
             "BP horizontalness temperature must be finite and positive");
+    }
+    if (!finite(config.mixedCostPerConstraint) ||
+        config.mixedCostPerConstraint < 0.0) {
+        throw std::invalid_argument(
+            "BP Mixed cost per constraint must be finite and nonnegative");
     }
     if (!finite(config.messageDamping) || !(config.messageDamping > 0.0) ||
         config.messageDamping > 1.0) {
@@ -269,6 +275,26 @@ double logAddExp(double a, double b)
     return maximum + std::log1p(std::exp(std::min(a, b) - maximum));
 }
 
+using TernaryLogMessage = std::array<double, 3>;
+
+double logSumExp(const TernaryLogMessage& values)
+{
+    const double maximum = *std::max_element(values.begin(), values.end());
+    if (!std::isfinite(maximum))
+        return maximum;
+    double sum = 0.0;
+    for (const double value : values)
+        sum += std::exp(value - maximum);
+    return maximum + std::log(sum);
+}
+
+void normalizeLogMessage(TernaryLogMessage& values)
+{
+    const double normalization = logSumExp(values);
+    for (double& value : values)
+        value -= normalization;
+}
+
 double updateSumProductMessage(
     double cavityLogOdds,
     double logSamePotential,
@@ -426,6 +452,8 @@ const char* fiberTraceBeliefInferenceName(
         return "min_sum";
     case FiberTraceBeliefInference::SumProduct:
         return "sum_product";
+    case FiberTraceBeliefInference::SumProductMixed:
+        return "sum_product_mixed";
     }
     return "invalid";
 }
@@ -699,6 +727,186 @@ FiberTraceBeliefPropagationReport solveFiberTraceSumProduct(
         totalWeight += problem.normalizedArcWeights[node];
     }
     report.achievedHorizontalFraction = weightedHorizontal / totalWeight;
+    report.status = report.messageConverged
+        ? "converged"
+        : "message_limit";
+    report.solveSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    return report;
+}
+
+FiberTraceBeliefPropagationReport solveFiberTraceMixedSumProduct(
+    const std::vector<FiberletCropTraceLine>& traces,
+    const FiberTraceConstraintReport& constraints,
+    const FiberTraceBeliefPropagationConfig& config)
+{
+    const auto started = std::chrono::steady_clock::now();
+    validateConfig(config);
+    if (config.balanceMode != FiberTraceBalanceMode::None) {
+        throw std::invalid_argument(
+            "Mixed-state sum-product BP does not support population balance modes");
+    }
+    const auto problem = prepareProblem(traces, constraints, config);
+    const auto& graph = problem.graph;
+    const std::size_t nodeCount = graph.adjacency.size();
+    const double temperature = config.horizontalnessTemperature;
+
+    using Potential = std::array<TernaryLogMessage, 3>;
+    std::vector<Potential> logPotential(graph.factors.size());
+    for (std::size_t index = 0; index < graph.factors.size(); ++index) {
+        const auto& factor = graph.factors[index];
+        std::array<std::array<double, 3>, 3> energies{};
+        double minimum = std::numeric_limits<double>::infinity();
+        for (std::size_t source = 0; source < 3; ++source) {
+            for (std::size_t target = 0; target < 3; ++target) {
+                double energy = 0.0;
+                if (source == 1 || target == 1) {
+                    energy = config.mixedCostPerConstraint *
+                        static_cast<double>(factor.measurements) *
+                        static_cast<double>((source == 1) + (target == 1));
+                } else {
+                    energy = source == target
+                        ? factor.sameCost
+                        : factor.differentCost;
+                }
+                energies[source][target] = energy;
+                minimum = std::min(minimum, energy);
+            }
+        }
+        for (std::size_t source = 0; source < 3; ++source) {
+            for (std::size_t target = 0; target < 3; ++target) {
+                logPotential[index][source][target] =
+                    -(energies[source][target] - minimum) / temperature;
+                if (!std::isfinite(logPotential[index][source][target])) {
+                    throw std::invalid_argument(
+                        "Mixed-state sum-product BP temperature is too small for factor costs");
+                }
+            }
+        }
+    }
+
+    const TernaryLogMessage zeroMessage{
+        -std::log(3.0), -std::log(3.0), -std::log(3.0)};
+    std::vector<TernaryLogMessage> aToB(
+        graph.factors.size(), zeroMessage);
+    std::vector<TernaryLogMessage> bToA(
+        graph.factors.size(), zeroMessage);
+    std::vector<TernaryLogMessage> nextAToB(
+        graph.factors.size(), zeroMessage);
+    std::vector<TernaryLogMessage> nextBToA(
+        graph.factors.size(), zeroMessage);
+    std::vector<TernaryLogMessage> totals(
+        nodeCount, TernaryLogMessage{0.0, 0.0, 0.0});
+
+    const auto rawMessage = [&] (
+                                const TernaryLogMessage& cavity,
+                                const Potential& potential,
+                                bool fixedHorizontal) {
+        TernaryLogMessage raw{};
+        for (std::size_t target = 0; target < 3; ++target) {
+            if (fixedHorizontal) {
+                raw[target] = potential[2][target];
+            } else {
+                TernaryLogMessage terms{};
+                for (std::size_t source = 0; source < 3; ++source)
+                    terms[source] = cavity[source] + potential[source][target];
+                raw[target] = logSumExp(terms);
+            }
+        }
+        normalizeLogMessage(raw);
+        return raw;
+    };
+
+    auto report = initializeReport(
+        problem, config, FiberTraceBeliefInference::SumProductMixed);
+    report.mixedCostPerConstraint = config.mixedCostPerConstraint;
+    for (std::size_t iteration = 0;
+         iteration < config.maximumMessageIterations;
+         ++iteration) {
+        std::fill(
+            totals.begin(), totals.end(), TernaryLogMessage{0.0, 0.0, 0.0});
+        for (std::size_t index = 0; index < graph.factors.size(); ++index) {
+            for (std::size_t state = 0; state < 3; ++state) {
+                totals[graph.factors[index].a][state] += bToA[index][state];
+                totals[graph.factors[index].b][state] += aToB[index][state];
+            }
+        }
+
+        double residual = 0.0;
+        for (std::size_t index = 0; index < graph.factors.size(); ++index) {
+            const auto& factor = graph.factors[index];
+            TernaryLogMessage cavityA{};
+            TernaryLogMessage cavityB{};
+            for (std::size_t state = 0; state < 3; ++state) {
+                cavityA[state] = totals[factor.a][state] - bToA[index][state];
+                cavityB[state] = totals[factor.b][state] - aToB[index][state];
+            }
+            const auto rawAToB = rawMessage(
+                cavityA, logPotential[index], factor.a == problem.seed);
+            const auto rawBToA = rawMessage(
+                cavityB, logPotential[index], factor.b == problem.seed);
+            for (std::size_t state = 0; state < 3; ++state) {
+                nextAToB[index][state] = aToB[index][state] +
+                    config.messageDamping *
+                    (rawAToB[state] - aToB[index][state]);
+                nextBToA[index][state] = bToA[index][state] +
+                    config.messageDamping *
+                    (rawBToA[state] - bToA[index][state]);
+            }
+            normalizeLogMessage(nextAToB[index]);
+            normalizeLogMessage(nextBToA[index]);
+            for (std::size_t state = 0; state < 3; ++state) {
+                residual = std::max({
+                    residual,
+                    std::abs(nextAToB[index][state] - aToB[index][state]),
+                    std::abs(nextBToA[index][state] - bToA[index][state]),
+                });
+            }
+        }
+        aToB.swap(nextAToB);
+        bToA.swap(nextBToA);
+        report.messageIterations = iteration + 1;
+        report.messageResidual = residual;
+        if (residual <= config.messageResidualTolerance) {
+            report.messageConverged = true;
+            break;
+        }
+    }
+
+    std::fill(
+        totals.begin(), totals.end(), TernaryLogMessage{0.0, 0.0, 0.0});
+    for (std::size_t index = 0; index < graph.factors.size(); ++index) {
+        for (std::size_t state = 0; state < 3; ++state) {
+            totals[graph.factors[index].a][state] += bToA[index][state];
+            totals[graph.factors[index].b][state] += aToB[index][state];
+        }
+    }
+    report.verticalProbability.resize(nodeCount);
+    report.mixedProbability.resize(nodeCount);
+    report.horizontalProbability.resize(nodeCount);
+    report.horizontalness.resize(nodeCount);
+    double weightedHorizontalness = 0.0;
+    double totalWeight = 0.0;
+    for (std::size_t node = 0; node < nodeCount; ++node) {
+        TernaryLogMessage marginal = totals[node];
+        if (node == problem.seed) {
+            marginal = {
+                -std::numeric_limits<double>::infinity(),
+                -std::numeric_limits<double>::infinity(),
+                0.0};
+        } else {
+            normalizeLogMessage(marginal);
+        }
+        report.verticalProbability[node] = std::exp(marginal[0]);
+        report.mixedProbability[node] = std::exp(marginal[1]);
+        report.horizontalProbability[node] = std::exp(marginal[2]);
+        report.horizontalness[node] = report.horizontalProbability[node] +
+            0.5 * report.mixedProbability[node];
+        weightedHorizontalness += problem.normalizedArcWeights[node] *
+            report.horizontalness[node];
+        totalWeight += problem.normalizedArcWeights[node];
+    }
+    report.achievedHorizontalFraction = weightedHorizontalness / totalWeight;
     report.status = report.messageConverged
         ? "converged"
         : "message_limit";
