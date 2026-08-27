@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 from sample_spiral import (
+    get_theta,
     get_theta_and_radii,
     get_theta_crossing_step_adjustments,
     radius_from_unwrapped_shifted,
@@ -98,6 +99,207 @@ class PatchSatisfactionEvaluation:
                 output[selected_ij[:, 0], selected_ij[:, 1]] = packed[begin:end]
             outputs.append(output)
         return outputs
+
+
+def report_absolute_winding_diagnostic(
+        slice_to_spiral_transform, patch_ids, evaluation, cross_patch_pcls):
+    """Compare native patch targets with attached absolute-winding annotations.
+
+    Patch satisfaction deliberately derives its target from the evaluated patch.
+    That makes it useful for geometric residuals, but means it cannot by itself
+    distinguish a patch on the intended winding from the same patch translated by
+    a whole winding.  Absolute-winding point collections provide an external target
+    that can also be consumed by ``get_patch_abs_winding_loss``.  This helper
+    keeps the two signals separate and reports their disagreement; it never changes a
+    satisfaction count, a mesh selection, or a loss.
+
+    Only direct absolute anchors are used here.  Relative/fiber collections are
+    intentionally ignored: propagating them requires the valid-quad graph and
+    seam-aware BFS implemented by ``find_inconsistent_windings.py``.  Reporting a
+    direct anchor is still valuable, and avoids treating a relative annotation as
+    an absolute one when the full graph is unavailable in the final-output path.
+
+    An anchor is evaluated at the same clamped quad cell used by
+    ``losses._valid_patch_annotation``.  A missing/out-of-ROI/disconnected native
+    target, a non-finite annotation, or a non-integral absolute annotation is
+    reported as skipped rather than guessed.  This is deliberately conservative:
+    a missing comparison must not become a false sheet-switch warning.
+    """
+    patch_ids = list(patch_ids)
+    patch_index_by_id = {patch_id: index for index, patch_id in enumerate(patch_ids)}
+    skipped = {
+        'not_absolute': 0,
+        'missing_attachment': 0,
+        'unknown_patch': 0,
+        'nonfinite_annotation': 0,
+        'nonintegral_annotation': 0,
+        'missing_anchor_position': 0,
+        'outside_target_grid': 0,
+        'missing_native_target': 0,
+    }
+    candidates = []
+    absolute_anchor_candidates = 0
+
+    for pcl_position, pcl in enumerate(cross_patch_pcls or ()):
+        if not pcl.get('metadata', {}).get('winding_is_absolute', False):
+            # Count actual attached points, not a collection with no patch evidence.
+            skipped['not_absolute'] += sum(
+                len(points) for points in pcl.get('points_by_patch', {}).values())
+            continue
+        for attached_patch_id, points in pcl.get('points_by_patch', {}).items():
+            for point_position, point in enumerate(points):
+                absolute_anchor_candidates += 1
+                on_patch = point.get('on_patch')
+                if not on_patch:
+                    skipped['missing_attachment'] += 1
+                    continue
+                patch_id = on_patch.get('id', attached_patch_id)
+                patch_index = patch_index_by_id.get(patch_id)
+                if patch_index is None:
+                    skipped['unknown_patch'] += 1
+                    continue
+                try:
+                    annotation = float(point['winding_annotation'])
+                except (KeyError, TypeError, ValueError):
+                    skipped['nonfinite_annotation'] += 1
+                    continue
+                if not np.isfinite(annotation):
+                    skipped['nonfinite_annotation'] += 1
+                    continue
+                expected_winding = int(round(annotation))
+                if not np.isclose(annotation, expected_winding, rtol=0.0, atol=1e-3):
+                    skipped['nonintegral_annotation'] += 1
+                    continue
+                try:
+                    anchor_zyx = np.asarray(point['zyx'], dtype=np.float32)
+                except (KeyError, TypeError, ValueError):
+                    skipped['missing_anchor_position'] += 1
+                    continue
+                if anchor_zyx.shape != (3,) or not np.isfinite(anchor_zyx).all():
+                    skipped['missing_anchor_position'] += 1
+                    continue
+                try:
+                    ij = on_patch['ij']
+                    i_q, j_q = int(ij[0]), int(ij[1])
+                except (KeyError, TypeError, ValueError, IndexError):
+                    skipped['missing_attachment'] += 1
+                    continue
+                begin = int(evaluation.patch_offsets[patch_index].item())
+                end = int(evaluation.patch_offsets[patch_index + 1].item())
+                target_shape = tuple(evaluation.quad_shapes[patch_index].tolist())
+                if not target_shape or target_shape[0] <= 0 or target_shape[1] <= 0:
+                    skipped['outside_target_grid'] += 1
+                    continue
+                # This matches _valid_patch_annotation: annotations are attached to
+                # a retained quad cell, with grid-boundary positions clamped in.
+                i_q = min(max(i_q, 0), target_shape[0] - 1)
+                j_q = min(max(j_q, 0), target_shape[1] - 1)
+                local_ijs = evaluation.quad_ijs[begin:end].numpy()
+                match = np.flatnonzero(
+                    (local_ijs[:, 0] == i_q) & (local_ijs[:, 1] == j_q))
+                if match.size != 1:
+                    skipped['missing_native_target'] += 1
+                    continue
+                candidates.append({
+                    'patch_id': patch_id,
+                    'patch_index': patch_index,
+                    'quad_ij': [i_q, j_q],
+                    'packed_index': begin + int(match[0]),
+                    'annotation_winding_at_anchor': expected_winding,
+                    'anchor_zyx': anchor_zyx,
+                    'pcl_id': pcl.get('id', pcl_position),
+                    'pcl_name': pcl.get('name'),
+                    'source_file': pcl.get('source_file'),
+                    'point_id': point.get('id', point_position),
+                })
+
+    # Pull only anchor cells off the device.  Final reports can hold far more
+    # packed quads than annotations, so materialising dense target/satisfaction
+    # grids just for this diagnostic would make the report itself expensive.
+    if candidates:
+        packed_positions = [entry['packed_index'] for entry in candidates]
+        packed_indices = torch.as_tensor(
+            packed_positions, dtype=torch.int64,
+            device=evaluation.target_winding_indices.device)
+        native_targets = evaluation.target_winding_indices.index_select(
+            0, packed_indices).cpu().tolist()
+        theta_indices = torch.as_tensor(
+            packed_positions, dtype=torch.int64,
+            device=evaluation.center_theta.device)
+        cell_thetas = evaluation.center_theta.index_select(0, theta_indices)
+        anchor_zyxs = torch.as_tensor(
+            np.stack([entry['anchor_zyx'] for entry in candidates]),
+            dtype=torch.float32, device=cell_thetas.device)
+        with torch.no_grad():
+            anchor_spiral = slice_to_spiral_transform(anchor_zyxs)
+            anchor_thetas, _ = get_theta(anchor_spiral[..., 1:])
+        reference_delta = cell_thetas - anchor_thetas
+        reference_steps = (
+            (reference_delta > np.pi).to(torch.int32)
+            - (reference_delta < -np.pi).to(torch.int32)
+        ).cpu().tolist()
+        strict_profile = evaluation.profiles['strict']
+        quad_indices = torch.as_tensor(
+            packed_positions, dtype=torch.int64,
+            device=strict_profile.packed_satisfied_quads.device)
+        native_quad_satisfied = strict_profile.packed_satisfied_quads.index_select(
+            0, quad_indices).cpu().tolist()
+        patch_indices = torch.as_tensor(
+            [entry['patch_index'] for entry in candidates], dtype=torch.int64,
+            device=strict_profile.satisfied_patches.device)
+        native_patch_satisfied = strict_profile.satisfied_patches.index_select(
+            0, patch_indices).tolist()
+    else:
+        native_targets = []
+        reference_steps = []
+        native_quad_satisfied = []
+        native_patch_satisfied = []
+
+    comparisons = []
+    for entry, native_winding, reference_step, quad_satisfied, patch_satisfied in zip(
+            candidates, native_targets, reference_steps,
+            native_quad_satisfied, native_patch_satisfied):
+        native_winding = int(native_winding)
+        if native_winding < 0:
+            skipped['missing_native_target'] += 1
+            continue
+        annotation_winding = entry.pop('annotation_winding_at_anchor')
+        entry.pop('anchor_zyx')
+        # Match ThetaCrossingMap.adjustments_from_potentials for an annotation
+        # reference node and its attached patch cell.  A direct comparison to
+        # wind_a would create a false +/-1 warning across theta=0.
+        expected_at_cell = annotation_winding - int(reference_step)
+        comparisons.append({
+            **entry,
+            'annotation_winding_at_anchor': annotation_winding,
+            'anchor_to_cell_theta_reference_step': int(reference_step),
+            'annotation_derived_expected_winding_at_cell': expected_at_cell,
+            'native_self_derived_winding': native_winding,
+            'difference_windings': native_winding - expected_at_cell,
+            'native_anchor_quad_strict_satisfied': bool(quad_satisfied),
+            'native_patch_strict_satisfied': bool(patch_satisfied),
+        })
+
+    comparisons.sort(key=lambda entry: (
+        str(entry['patch_id']), str(entry['pcl_id']), str(entry['point_id'])))
+    disagreements = [entry for entry in comparisons if entry['difference_windings'] != 0]
+    return {
+        'kind': 'report_only_direct_absolute_winding_comparison',
+        'scope': (
+            'Direct anchors from metadata.winding_is_absolute only; relative and '
+            'fiber collections are intentionally not promoted to absolute evidence.'),
+        'effect_on_satisfaction': 'none',
+        'summary': {
+            'absolute_anchor_candidates': absolute_anchor_candidates,
+            'anchors_compared': len(comparisons),
+            'anchors_agreeing': len(comparisons) - len(disagreements),
+            'anchors_disagreeing': len(disagreements),
+            'disagreeing_and_native_patch_strict_satisfied': sum(
+                entry['native_patch_strict_satisfied'] for entry in disagreements),
+            'skipped': skipped,
+        },
+        'comparisons': comparisons,
+    }
 
 
 class _ListPatchAtlas:
@@ -831,6 +1033,7 @@ def save_overlay_and_print_satisfaction(
     run_tag=None,
     save_png_visualizations=False,
     progress=None,
+    cross_patch_pcls=(),
 ):
     if progress is not None:
         progress.begin(
@@ -876,6 +1079,16 @@ def save_overlay_and_print_satisfaction(
         'total_area': total_area,
         'satisfied_area_fraction': satisfied_area_ratio,
     }
+    absolute_winding_diagnostic = report_absolute_winding_diagnostic(
+        slice_to_spiral_transform, patches_dict.keys(),
+        patch_evaluation, cross_patch_pcls)
+    absolute_summary = absolute_winding_diagnostic['summary']
+    print(
+        'absolute_winding_diagnostic = '
+        f"{absolute_summary['anchors_disagreeing']}/"
+        f"{absolute_summary['anchors_compared']} direct anchors disagree "
+        f"({absolute_summary['disagreeing_and_native_patch_strict_satisfied']} "
+        'also native-patch-strict-satisfied)')
     unattached_pcl_per_point_satisfied = []
     unattached_pcl_fully_satisfied = torch.zeros(len(unattached_pcl_strips), dtype=torch.bool)
     if unattached_pcl_strips:
@@ -917,8 +1130,7 @@ def save_overlay_and_print_satisfaction(
                     'finalizing', 'Evaluating tracks',
                     detail=f'{len(tracks):,} tracks')
             track_satisfied_counts, track_total_counts = get_track_satisfied_counts_in_chunks(
-                slice_to_spiral_transform, dr_per_winding, tracks, metrics_config,
-            )
+                slice_to_spiral_transform, dr_per_winding, tracks, metrics_config)
             track_fully_satisfied = (track_satisfied_counts == track_total_counts)
             fully_satisfied_tracks = int(track_fully_satisfied.sum().item())
             num_valid_tracks = int(track_total_counts.numel())
@@ -1012,6 +1224,8 @@ def save_overlay_and_print_satisfaction(
         }, f, indent=2)
     with open(f'{out_path}/satisfaction_metrics_{suffix}.json', 'w') as f:
         json.dump({'summary': satisfaction_summary}, f, indent=2)
+    with open(f'{out_path}/absolute_winding_diagnostic_{suffix}.json', 'w') as f:
+        json.dump(absolute_winding_diagnostic, f, indent=2)
     need_overlay = (save_png_visualizations
                     and os.environ.get('FIT_SPIRAL_SKIP_SAVE_OVERLAY') != '1')
     need_mesh = os.environ.get('FIT_SPIRAL_SKIP_SAVE_MESH') != '1'

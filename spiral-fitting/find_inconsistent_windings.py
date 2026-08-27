@@ -180,14 +180,31 @@ def build_fit_inputs(checkpoint, patches_dir, pcl_paths, filter_z_begin, filter_
     Returns (fit_config, scroll, paths, model_z_begin, model_z_end); the model
     z-range shapes the transform's flow field independently of the filtering
     z-range."""
-    from fit_session import PclInputSpec, ScrollSpec, SpiralInputPaths
+    from fit_session import (
+        PclInputSpec,
+        ScrollSpec,
+        SpiralInputPaths,
+        effective_pcl_role,
+    )
 
     cfg = fs.Config().as_dict()
     cfg.update(checkpoint['cfg'])
+    pcl_specs = tuple(PclInputSpec(path=str(path), role=None)
+                      for path in pcl_paths)
     # This tool IS the patch graph — a checkpoint trained supervision-free
     # (disable_patches, e.g. the 2026-07-17 normals-only baseline) must not
     # stop the loaders from reading the patches it wants to analyse.
     cfg['input_disable_patches'] = False
+    cfg['input_use_verified_patches'] = True
+    # --pcl and --fibers are explicit diagnostic inputs rather than requests
+    # to reproduce a checkpoint's training-input ablation. Enable only the
+    # supplied roles, leaving every unrelated checkpoint input unchanged.
+    # Role-less paths retain the historical basename convention.
+    for spec in pcl_specs:
+        role = effective_pcl_role(spec.role, spec.path)
+        cfg[f'input_use_pcl_{role.value}'] = True
+    if fibers_path:
+        cfg['input_use_fibers'] = True
     # We compute no shell losses; zero their weights so the context's
     # shell_losses_enabled() gate stops load_host_inputs() from loading the
     # shell (replacing the old fs.shell_losses_enabled = lambda: False
@@ -214,8 +231,7 @@ def build_fit_inputs(checkpoint, patches_dir, pcl_paths, filter_z_begin, filter_
     # unless a fibers dir is passed.
     paths = SpiralInputPaths(
         umbilicus=umbilicus_path,
-        pcls=tuple(PclInputSpec(path=str(path), role=None)
-                   for path in pcl_paths),
+        pcls=pcl_specs,
         fibers=fibers_path or '',
         verified_patches=patches_dir,
     )

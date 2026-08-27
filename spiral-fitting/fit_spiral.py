@@ -4665,6 +4665,7 @@ class FitContext:
                 patches_dict=self.verified_patches,
                 patch_atlas=self.patch_atlas,
                 unattached_pcl_strips=self.unattached_pcl_strips,
+                cross_patch_pcls=self.cross_patch_pcls,
                 tracks=self.tracks,
                 unverified_patches_list=self.unverified_patches_list,
                 unverified_patches_dict=self.unverified_patches,
