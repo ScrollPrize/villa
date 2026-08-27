@@ -29,12 +29,14 @@ struct FiberTraceLabelingConfig {
     bool lpParallel = false;
     std::string lpSolver = "choose";
     bool excludeParallelSeparateWinding = false;
+    bool perpendicularOnly = false;
     bool hvOnly = false;
     bool exactPerpendicularMilp = false;
 };
 
 struct FiberTraceLabelingReport {
     std::vector<FiberTracePieceLabel> labels;
+    std::vector<std::size_t> retainedConstraintIndices;
     std::vector<double> activeValues;
     std::vector<double> verticalValues;
     std::vector<double> oddValues;
@@ -47,6 +49,7 @@ struct FiberTraceLabelingReport {
     std::size_t triangleRows = 0;
     std::size_t retainedConstraints = 0;
     std::size_t excludedParallelSeparateWinding = 0;
+    std::size_t excludedNonPerpendicular = 0;
     std::size_t perpendicularBranchVariables = 0;
     bool hvOnly = false;
     bool exactPerpendicularMilp = false;
@@ -77,6 +80,11 @@ struct FiberTraceLabelObjReport {
 struct FiberTraceRelaxationObjReport {
     FiberTraceLabelObjReport objects;
     double activeThreshold = 0.0;
+};
+
+struct FiberTracePostFilterConfig {
+    std::size_t iterations = 0;
+    double influence = 1.0;
 };
 
 enum class FiberDirectionLabelErrorKind : unsigned char {
@@ -147,6 +155,16 @@ struct FiberDirectionLabelComparisonReport {
     const FiberTraceLabelingReport& continuous,
     double activeThreshold = 0.5,
     double verticalThreshold = 0.5);
+
+[[nodiscard]] double fiberTracePostFilterConfidence(
+    double value,
+    double influence);
+
+[[nodiscard]] std::vector<double> postFilterPerpendicularFiberTraceLabels(
+    const FiberTraceConstraintReport& constraints,
+    const FiberTraceLabelingReport& labeling,
+    std::size_t traceCount,
+    const FiberTracePostFilterConfig& config);
 
 [[nodiscard]] FiberDirectionLabelComparisonReport compareFiberDirectionLabels(
     const FiberTraceConstraintReport& constraints,

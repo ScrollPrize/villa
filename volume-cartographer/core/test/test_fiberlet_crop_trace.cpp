@@ -2054,6 +2054,8 @@ TEST_CASE("Trace labeling can exclude measured parallel separate winding links")
     config.brokenCostPerConstraint = 10.0;
     const auto complete = solveFiberTraceLabels(constraints, config);
     CHECK(complete.retainedConstraints == 4);
+    CHECK(complete.retainedConstraintIndices ==
+          std::vector<std::size_t>{0, 1, 2, 3});
     CHECK(complete.excludedParallelSeparateWinding == 0);
     CHECK(complete.variables == 24);
     CHECK(complete.rows == 60);
@@ -2061,11 +2063,177 @@ TEST_CASE("Trace labeling can exclude measured parallel separate winding links")
     config.excludeParallelSeparateWinding = true;
     const auto filtered = solveFiberTraceLabels(constraints, config);
     CHECK(filtered.retainedConstraints == 3);
+    CHECK(filtered.retainedConstraintIndices ==
+          std::vector<std::size_t>{0, 2, 3});
     CHECK(filtered.excludedParallelSeparateWinding == 1);
     CHECK(filtered.variables == 21);
     CHECK(filtered.rows == 47);
     CHECK(filtered.gaugeRoots == 1);
     CHECK(filtered.triangles == 0);
+}
+
+TEST_CASE("Trace labeling can retain only measured perpendicular links")
+{
+    FiberTraceConstraintReport constraints;
+    constraints.pieces.resize(5);
+    const auto add = [&](std::size_t a,
+                         std::size_t b,
+                         double parallel,
+                         bool hard) {
+        constraints.constraints.push_back({
+            a, b, 0.0, 0.0,
+            {static_cast<double>(a), 0.0, 0.0},
+            {static_cast<double>(b), 0.0, 0.0},
+            1.0, parallel, 1.0 - parallel, 0.0, hard});
+    };
+    add(0, 1, 0.1, false);
+    add(1, 2, 0.5, false);
+    add(2, 3, 0.9, false);
+    add(3, 4, 1.0, true);
+
+    FiberTraceLabelingConfig config;
+    config.parallelThreads = 1;
+    config.relaxIntegrality = true;
+    config.hvOnly = true;
+    config.perpendicularOnly = true;
+    config.brokenCostPerConstraint = 10.0;
+    const auto labeling = solveFiberTraceLabels(constraints, config);
+    CHECK(labeling.retainedConstraints == 2);
+    CHECK(labeling.retainedConstraintIndices ==
+          std::vector<std::size_t>{0, 3});
+    CHECK(labeling.excludedNonPerpendicular == 2);
+    CHECK(labeling.excludedParallelSeparateWinding == 0);
+    CHECK(labeling.gaugeRoots == 3);
+    CHECK(labeling.triangles == 0);
+
+    config.excludeParallelSeparateWinding = true;
+    CHECK_THROWS_WITH_AS(
+        solveFiberTraceLabels(constraints, config),
+        doctest::Contains("redundant"),
+        std::invalid_argument);
+}
+
+TEST_CASE("Trace post-filter confidence uses the configured support width")
+{
+    CHECK(fiberTracePostFilterConfidence(0.5, 1.0) ==
+          doctest::Approx(0.0));
+    CHECK(fiberTracePostFilterConfidence(0.75, 1.0) ==
+          doctest::Approx(0.5));
+    CHECK(fiberTracePostFilterConfidence(1.0, 1.0) ==
+          doctest::Approx(1.0));
+    CHECK(fiberTracePostFilterConfidence(0.75, 0.5) ==
+          doctest::Approx(0.0));
+    CHECK(fiberTracePostFilterConfidence(0.875, 0.5) ==
+          doctest::Approx(0.5));
+    CHECK(fiberTracePostFilterConfidence(0.0, 0.5) ==
+          doctest::Approx(1.0));
+    CHECK_THROWS_AS(
+        fiberTracePostFilterConfidence(0.5, 0.0),
+        std::invalid_argument);
+}
+
+TEST_CASE("Trace post-filter averages unique inverted perpendicular neighbors")
+{
+    FiberTraceConstraintReport constraints;
+    constraints.pieces.resize(3);
+    for (std::size_t trace = 0; trace < 3; ++trace)
+        constraints.pieces[trace].traceIndex = trace;
+    const auto add = [&](std::size_t a, std::size_t b) {
+        constraints.constraints.push_back({
+            a, b, 0.0, 0.0,
+            {static_cast<double>(a), 0.0, 0.0},
+            {static_cast<double>(b), 0.0, 0.0},
+            1.0, 0.0, 1.0, 0.0, false});
+    };
+    add(0, 1);
+    add(0, 1);
+    add(0, 2);
+
+    FiberTraceLabelingReport labeling;
+    labeling.labels = {
+        FiberTracePieceLabel::Broken,
+        FiberTracePieceLabel::VEven,
+        FiberTracePieceLabel::HEven,
+    };
+    labeling.retainedConstraintIndices = {0, 1, 2};
+    const auto once = postFilterPerpendicularFiberTraceLabels(
+        constraints, labeling, 3, {1, 1.0});
+    REQUIRE(once.size() == 3);
+    CHECK(once[0] == doctest::Approx(0.5));
+    CHECK(once[1] == doctest::Approx(0.0));
+    CHECK(once[2] == doctest::Approx(1.0));
+
+    FiberTraceConstraintReport propagation;
+    propagation.pieces.resize(2);
+    propagation.pieces[0].traceIndex = 0;
+    propagation.pieces[1].traceIndex = 1;
+    propagation.constraints.push_back({
+        0, 1, 0.0, 0.0, {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0},
+        1.0, 0.0, 1.0, 0.0, false});
+    FiberTraceLabelingReport propagationLabels;
+    propagationLabels.labels = {
+        FiberTracePieceLabel::HEven,
+        FiberTracePieceLabel::Broken,
+    };
+    propagationLabels.retainedConstraintIndices = {0};
+    const auto twice = postFilterPerpendicularFiberTraceLabels(
+        propagation, propagationLabels, 2, {2, 1.0});
+    CHECK(twice[0] == doctest::Approx(1.0));
+    CHECK(twice[1] == doctest::Approx(0.0));
+}
+
+TEST_CASE("Trace post-filter rejects split or missing represented fibers")
+{
+    FiberTraceConstraintReport constraints;
+    constraints.pieces.resize(2);
+    constraints.pieces[0].traceIndex = 0;
+    constraints.pieces[1].traceIndex = 0;
+    FiberTraceLabelingReport labeling;
+    labeling.labels = {
+        FiberTracePieceLabel::HEven,
+        FiberTracePieceLabel::HEven,
+    };
+    CHECK_THROWS_WITH_AS(
+        postFilterPerpendicularFiberTraceLabels(
+            constraints, labeling, 2, {1, 1.0}),
+        doctest::Contains("unique contiguous"),
+        std::invalid_argument);
+    CHECK_THROWS_WITH_AS(
+        postFilterPerpendicularFiberTraceLabels(
+            constraints, labeling, 3, {1, 1.0}),
+        doctest::Contains("one piece"),
+        std::invalid_argument);
+}
+
+TEST_CASE("Fiber value bands use fixed boundaries and short OBJ names")
+{
+    const std::vector<double> values{0.0, 0.099, 0.1, 0.5, 0.9, 1.0};
+    const auto bands = classifyFiberValues(values);
+    CHECK(bands.bands[0].lineIndices ==
+          std::vector<std::size_t>{0, 1});
+    CHECK(bands.bands[1].lineIndices ==
+          std::vector<std::size_t>{2});
+    CHECK(bands.bands[5].lineIndices ==
+          std::vector<std::size_t>{3});
+    CHECK(bands.bands[9].lineIndices ==
+          std::vector<std::size_t>{4, 5});
+
+    std::vector<FiberletCropTraceLine> lines(values.size());
+    for (std::size_t index = 0; index < lines.size(); ++index) {
+        lines[index].pointsBaseXYZ = {
+            {static_cast<double>(index), 0.0, 0.0},
+            {static_cast<double>(index), 1.0, 0.0},
+        };
+    }
+    const TemporaryDirectory directory("trace_post_filter");
+    const auto paths = writeFiberletCropValueBandObjs(
+        lines, bands, directory.path / "384");
+    for (std::size_t band = 0; band < paths.bands.size(); ++band) {
+        CHECK(paths.bands[band] ==
+              directory.path /
+                  ("384_p" + std::to_string(band) + ".obj"));
+        CHECK(std::filesystem::exists(paths.bands[band]));
+    }
 }
 
 TEST_CASE("Trace labeling LP enforces triangle-consistent differences")

@@ -186,6 +186,15 @@ hard continuity links are never removed. The four constraint OBJ files still
 represent the complete extracted constraint set. Labeling output reports both
 retained and excluded link counts.
 
+Pass `--perpendicular-only` to retain only measured links whose normalized
+perpendicular score is strictly greater than `0.5`. Exact `0.5` evidence is
+ambiguous and excluded. Hard same-trace continuity links remain as the same
+strong objective evidence used by the default model; this option does not turn
+them into equality constraints. The filter applies identically to MILP and LP
+before degrees, components, cuts, and costs are built. Constraint OBJ files
+still show the complete extracted set. The option conflicts with the redundant
+`--exclude-parallel-separate-winding` filter.
+
 Pass `--hv-only` to omit parity from the labeling problem completely. This
 keeps active/broken penalties, retained-link filtering, H/V costs, H/V gauges,
 and H/V triangle cuts unchanged, but creates no parity piece columns, parity
@@ -554,6 +563,42 @@ The initial direction OBJ family is written once beneath
 `crop_direction_ablation_initial`. Only the final admitted checkpoint
 writes constraint and H/V/broken OBJ layers; intermediate checkpoints are
 statistics-only.
+
+For a no-split checkpoint-40 comparison using only perpendicular measured
+links, set an effectively infinite piece length explicitly:
+
+```bash
+volume-cartographer/build/bin/vc_fiber_trace_chunk direction-ablation crop_traces.zarr --normal-manifest normals.lasagna.json --output crop_direction_ablation_perpendicular_40 --direction-dominance 0.9 --broken-cost-per-link 0.2035 --ablation-step 40 --ablation-limit 40 --piece-length 1000000000 --perpendicular-only
+```
+
+Remove only `--perpendicular-only` and change the output basename to obtain the
+directly comparable all-constraint no-split baseline.
+
+Add `--post-iterations N --post-influence I` to a perpendicular-only,
+no-split direction ablation to derive continuous post-solve H values. H starts
+at `1`, V at `0`, and Broken at `0.5`. A perpendicular neighbor contributes
+`1-v`, weighted by:
+
+```text
+clamp((abs(v - 0.5) - 0.5 * (1 - I)) / (0.5 * I), 0, 1)
+```
+
+Updates are synchronous. With `I=1`, confidence rises linearly from zero at
+`0.5` to one at either extreme. With `I=0.5`, values in `[0.25,0.75]` have no
+influence. A fiber with no positively weighted neighbor keeps its prior value.
+This diagnostic requires exactly one solved piece per represented fiber and
+does not add non-admitted fibers or alter the MILP result.
+
+The output files are `<base>_p0.obj` through `<base>_p9.obj`, covering fixed
+H-value bands `[0,0.1)` through `[0.9,1]`. Exact boundaries use the higher
+band, so equal values remain together. Each file contains complete source
+fibers and is written even when empty.
+
+The band table also reports the original H, V, and Mixed populations and the
+existing gauge-aligned labeling errors in each band. H and V errors are
+trusted-direction mismatches; Mixed errors are admitted diagnostic defects
+that the labeling left active. The table only stratifies the existing
+comparison and does not introduce a post-filter error threshold.
 
 ## Quality groups
 

@@ -1,12 +1,11 @@
-# Status: Mixed-fiber direction-label ablation
+# Status: Post-solve perpendicular consensus
 
-- [x] Capture the requested task.
-- [x] Write the implementation and validation plan.
-- [x] Complete independent plan review and incorporate findings.
-- [x] Add trusted-cohort comparison and deterministic mixed ranking.
-- [x] Add and integrate the cumulative ablation command.
+- [x] Capture the requested update and confidence semantics.
+- [x] Write implementation, specification, documentation, and test plan.
+- [x] Complete independent plan review.
+- [x] Implement reusable post-filter and percentile writer.
+- [x] Add CLI validation and final-checkpoint integration.
 - [x] Add focused regression tests.
-- [x] Update specification, docs, and changelog.
-- [x] Build with `-j32` and run focused tests.
-- [x] Sweep a fixed Mixed prefix and select broken cost 0.2035.
-- [x] Run and report the centered-384 full ablation at broken cost 0.2035.
+- [x] Update specifications, docs, changelog, and task log.
+- [x] Build and run focused validation.
+- [x] Rerun the stable centered-384 experiment and verify artifacts.

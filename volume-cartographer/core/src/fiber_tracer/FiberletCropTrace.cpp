@@ -1270,4 +1270,80 @@ void writeFiberletCropQualityArtifacts(
   vc::core::util::atomicWriteString(paths.histogramCsv, csv.str());
 }
 
+FiberValueBands classifyFiberValues(std::span<const double> values)
+{
+    FiberValueBands result;
+    std::array<double, 10> sums{};
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        const double value = values[index];
+        if (!std::isfinite(value) || value < 0.0 || value > 1.0) {
+            throw std::invalid_argument(
+                "Fiber value bands require finite values in [0, 1]");
+        }
+        const std::size_t band = std::min<std::size_t>(
+            9, static_cast<std::size_t>(std::floor(value * 10.0)));
+        auto& current = result.bands[band];
+        if (current.lineIndices.empty()) {
+            current.minimumValue = value;
+            current.maximumValue = value;
+        } else {
+            current.minimumValue = std::min(current.minimumValue, value);
+            current.maximumValue = std::max(current.maximumValue, value);
+        }
+        current.lineIndices.push_back(index);
+        sums[band] += value;
+    }
+    for (std::size_t band = 0; band < result.bands.size(); ++band) {
+        auto& current = result.bands[band];
+        if (!current.lineIndices.empty()) {
+            current.meanValue = sums[band] /
+                static_cast<double>(current.lineIndices.size());
+        }
+    }
+    return result;
+}
+
+FiberValueBandObjPaths fiberValueBandObjPaths(
+    const std::filesystem::path& outputBase)
+{
+    FiberValueBandObjPaths result;
+    for (std::size_t band = 0; band < result.bands.size(); ++band) {
+        result.bands[band] = outputBase.parent_path() /
+            (outputBase.stem().string() + "_p" + std::to_string(band) +
+             ".obj");
+    }
+    return result;
+}
+
+FiberValueBandObjPaths writeFiberletCropValueBandObjs(
+    const std::vector<FiberletCropTraceLine>& lines,
+    const FiberValueBands& bands,
+    const std::filesystem::path& outputBase)
+{
+    const auto paths = fiberValueBandObjPaths(outputBase);
+    std::vector<unsigned char> written(lines.size(), 0);
+    for (std::size_t band = 0; band < bands.bands.size(); ++band) {
+        std::vector<vc::core::io::NamedPolyline> polylines;
+        polylines.reserve(bands.bands[band].lineIndices.size());
+        for (const std::size_t index : bands.bands[band].lineIndices) {
+            if (index >= lines.size() || written[index] != 0) {
+                throw std::invalid_argument(
+                    "Fiber value bands do not partition crop traces");
+            }
+            written[index] = 1;
+            polylines.push_back({
+                fiberName(lines[index], index), lines[index].pointsBaseXYZ});
+        }
+        vc::core::io::writePolylinesObj(
+            polylines,
+            paths.bands[band],
+            "VC3D Fiberlet crop traces: post-filter H-value band");
+    }
+    if (std::find(written.begin(), written.end(), 0) != written.end()) {
+        throw std::invalid_argument(
+            "Fiber value bands do not partition crop traces");
+    }
+    return paths;
+}
+
 }  // namespace vc::fiber_tracer

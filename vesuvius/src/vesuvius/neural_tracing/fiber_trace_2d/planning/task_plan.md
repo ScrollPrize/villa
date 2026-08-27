@@ -1,122 +1,76 @@
-# Plan: Mixed-fiber direction-label ablation
+# Plan: Post-solve perpendicular consensus
 
 ## Contract
 
-- Add a separate `direction-ablation` command beside `direction-diagnostic`.
-  It reads the same stored trace artifact and compatible normal manifest and
-  accepts the same direction, constraint, pruning, broken-cost, MIP-gap,
-  thread, and cache controls. It forces the same ordinary discrete H/V-only
-  MILP and rejects the same incompatible solver options.
-- Classify the full stored population once. Preserve the initially confident
-  direction-1 and direction-2 traces as the trusted cohort.
-- Rank mixed traces deterministically by descending
-  `max(direction1_support,direction2_support)/valid_arc_length`, then ascending
-  original trace index. Ranking controls admission order only. Every mixed
-  trace has the reference state Defect and is expected to optimize to Broken;
-  it never receives a tentative H/V reference. Degenerate zero-length traces
-  rank last.
-- Ranking controls membership only. At every checkpoint, construct retained
-  input by scanning the original stored traces in ordinal order and selecting
-  confident traces plus the admitted mixed membership. Without an admission
-  limit, the final all-admitted checkpoint must therefore be
-  ordinal-for-ordinal equivalent to the full source population. Preserve
-  filtered-to-original trace IDs separately.
-- Run checkpoint zero with no mixed fibers, then cumulatively admit
-  `--ablation-step N` ranked mixed fibers per checkpoint; the default is 5 and
-  the final remainder is always included. `--ablation-limit N` restricts the
-  ranked prefix for diagnostic parameter sweeps without changing its order;
-  omission admits the complete mixed cohort. Every checkpoint
-  rebuilds pieces and spatial constraints, applies the configured pruning, and
-  solves the same MILP from canonical inputs. No previous solution is used as
-  a warm-start or changes a later checkpoint.
-- Solve both the discrete MILP and its H/V-only LP relaxation from the same
-  checkpoint constraints. Threshold LP active and H/V values independently at
-  0.5, map inactive pieces to Broken, and feed the resulting discrete labels to
-  the identical comparison. Report both models and their solve times
-  separately. Final MILP and thresholded-LP label OBJ families are distinct.
-- Pass the original direction-1/direction-2/mixed classification and a
-  same-length trusted mask for every filtered trace to comparison. Trusted
-  references must be direction 1/2 and admitted references must be mixed
-  defects. Resolve each active connected component's H/V gauge using
-  only trusted confident pieces. Components are built from the exact
-  post-pruning graph supplied to the solver, including hard links, after edges
-  incident to final Broken pieces are omitted. A component without a trusted
-  active piece retains the identity gauge, and an exact trusted-error tie also
-  retains identity. Use that one fixed gauge to evaluate trusted, admitted, and
-  combined cohorts. A confident reference optimized to Broken is an error; a
-  mixed defect optimized to any active H/V label is an error, while Broken is
-  correct. Legacy comparison without a mask remains unchanged and rejects
-  Mixed references.
-- Print one compact, stably ordered row per checkpoint containing admitted mixed count, latest
-  admitted confidence, retained fibers, pieces, constraints,
-  solver status/gap, objective, raw H/V/broken pieces, active components, and
-  separate H/V, mixed-defect, and combined errors for both MILP and thresholded
-  LP. Every active confident mismatch after gauge alignment is
-  an orientation error, every Broken confident piece is a broken error, and
-  every active mixed-defect piece is a defect-active error. Piece
-  denominators are cohort pieces; trace denominators are represented source
-  traces in that cohort; trace errors are the union of both error kinds across
-  that trace's pieces. Combined counts are recomputed unions, not sums of
-  rates. Checkpoint zero prints `-` for latest confidence/reference.
-- Write the initial full direction family once and write the existing
-  constraint and H/V/broken OBJ families only for the final selected
-  checkpoint. Intermediate checkpoints are statistics-only to avoid producing
-  hundreds of ambiguous artifact families.
-- Empty confident or mixed cohorts are valid. No mixed fibers means one
-  checkpoint equivalent to `direction-diagnostic`; all-mixed data uses identity
-  gauge until admitted references populate otherwise unanchored components.
-  Checkpoint zero on all-mixed data is a valid empty solve/comparison. If every
-  trusted piece is Broken, active untrusted components remain unanchored.
-- Classify and rank once. Checkpoints and memberships are stable, solver status
-  and gap are reported, and changing the worker count must not change retained
-  order or reference assignment. A non-optimal but usable solver status remains
-  visible rather than being silently compared as if optimal.
-- The default output base is sibling `<trace-stem>_direction_ablation` and the
-  initial family is exactly `<base>_initial.obj` plus existing direction and
-  anchor suffixes. The command requires normal-manifest/remote-cache handling,
-  allows MIP gap and H/V-valid no-winding-cutoff, and rejects explicit
-  `--hv-only`, LP controls, exact-perpendicular mode, and link exclusion.
+- Add opt-in direction-ablation controls `--post-iterations N` and
+  `--post-influence I`. Zero iterations remains the default and writes no post
+  artifacts. Influence must be finite in `(0,1]` and defaults to `1` when post
+  filtering is requested.
+- Require the final selected checkpoint to have exactly one MILP piece for
+  every represented input fiber, with trace indices forming a complete unique
+  `[0,N)` set. Initialize H=`1`, V=`0`, and Broken=`0.5`. Split, missing, or
+  duplicate source-fiber pieces fail explicitly; non-admitted source fibers are
+  absent from the checkpoint and never enter post-filter output.
+- Build unique source-fiber adjacency from the exact retained solver links.
+  This post-filter is accepted only with `--perpendicular-only`; hard
+  same-source links are ignored. Every neighbor therefore contributes
+  `1-neighbor_value`, reflecting perpendicular H/V opposition.
+- For influence `I`, define neighbor confidence
+  `clamp((abs(v-0.5)-0.5*(1-I))/(0.5*I), 0, 1)`. Thus `I=1` rises linearly from
+  zero at `0.5` to one at the extrema, while `I=0.5` is zero through
+  `[0.25,0.75]` and rises linearly over the remaining quarter intervals.
+- Every iteration is a synchronous Jacobi update. A fiber becomes the weighted
+  mean of transformed neighbor values. A fiber with no positive total weight
+  keeps its previous value. Stable trace-index and neighbor ordering make the
+  result independent of thread scheduling.
+- Divide whole source fibers into ten fixed H-value bands and write
+  `<base>_p0.obj` through `<base>_p9.obj`: `p0=[0,0.1)`, ..., `p8=[0.8,0.9)`,
+  and `p9=[0.9,1]`. Exact internal boundaries belong to the higher band, and
+  equal values remain together. Every file is written even when empty. Print
+  count and min/mean/max value for every group. Also stratify the existing
+  gauge-aligned comparison by band, reporting H, V, and Mixed populations and
+  errors without defining a new post-filter error threshold.
+- Post-filtering does not modify the MILP labels, error statistics, existing
+  label/constraint/initial OBJ outputs, solver objective, or selected broken
+  cost. It is a diagnostic transformation only.
 
 ## Implementation
 
-1. Extend reusable label comparison with an optional same-length trusted-trace
-   mask, explicit direction-versus-defect validation, and
-   trusted/admitted/combined summaries while preserving the current diagnostic
-   behavior when no mask is supplied.
-2. Extract the existing classify/filter/extract/prune/solve operation into a
-   shared local command helper used by both direction commands.
-3. Add deterministic mixed ranking, cumulative checkpoint execution, compact
-   tabular reporting, and final-only artifact emission.
-4. Add focused tests for ranking ties/degenerates and near ties, stride/final
-   remainder membership, LP threshold boundaries, mixed-as-defect acceptance
-   and active-defect errors, trusted-only
-   gauge choice/ties, untrusted-only and trusted-all-Broken components,
-   Broken-induced component splits, cohort denominators and trace unions,
-   interleaved filtered/original mapping, final original-order equivalence,
-   checkpoint-zero sentinels, empty cohorts, final-only artifact names/no
-   intermediate writes, legacy comparison behavior, repeatable rows, and CLI
-   option/default-basename validation.
+1. Add a reusable core post-filter helper operating on no-split constraint
+   pieces, retained constraint indices, and MILP labels, returning one value
+   per represented trace.
+2. Add reusable fixed-band classification and a writer for the ten whole-fiber
+   OBJ layers with short stable suffixes.
+3. Parse and validate the CLI controls, run the helper only for the final
+   selected direction-ablation checkpoint, and print its fixed-band summary.
+4. Extend the stable runner with explicit post-filter arguments and rerun the
+   selected no-split, perpendicular-only, 40-mixed, cost-0.2435 experiment.
 
 ## Spec Update
 
-Document mixed confidence/ranking, mixed-as-defect references, trusted-only
-gauge selection, checkpoint semantics, cohort error denominators, and
-final-only artifacts in `planning/specs.md`.
+Document no-split/represented-fiber scope, initialization, perpendicular
+inversion, confidence weighting, synchronous iteration, no-evidence behavior,
+and value-band output ownership in `planning/specs.md`.
 
 ## Docs Updates
 
-Add a runnable `direction-ablation` example and explain the checkpoint table in
+Document the CLI controls, formula, and `_p0` through `_p9` output layers in
 `volume-cartographer/docs/fiber_chunk_tracing.md`.
 
 ## Testing
 
-- Build `vc_fiber_trace_chunk` and `test_fiberlet_crop_trace` with `-j32`.
-- Run the focused crop-trace tests and `git diff --check`.
-- Run the centered-384 artifact at dominance 0.90 through five-fiber cumulative
-  checkpoints and report MILP versus thresholded-LP H/V and mixed-defect errors
-  plus solve time against admitted count. First sweep broken costs on a fixed
-  ten-mixed-fiber prefix, then use a selected value for the complete ablation.
+- Unit-test initialization, rejection of split/missing/duplicate fibers,
+  unique-neighbor deduplication, perpendicular inversion, both influence
+  examples, synchronous multi-iteration behavior, no-weight retention, exact
+  value-band boundaries/ties, and ten output names including empty groups.
+- Build `vc_fiber_trace_chunk` and `test_fiberlet_crop_trace` with `-j32`, run
+  the focused suite, and run `git diff --check`.
+- Rerun the stable centered-384 experiment with three post iterations and
+  influence 1.0; confirm the MILP statistics remain identical, exactly 135
+  fibers are partitioned, and all ten short-named OBJ layers are written.
+- Repeat with 100 iterations to measure long-run consensus behavior and report
+  the complete per-band H, V, and Mixed error table for both iteration counts.
 
 ## Changelog
 
-Record the deterministic cumulative mixed-fiber ablation command.
+Record the opt-in post-solve perpendicular consensus diagnostic.

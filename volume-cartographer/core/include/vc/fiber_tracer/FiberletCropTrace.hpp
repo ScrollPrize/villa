@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <functional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -123,6 +124,21 @@ struct FiberQualityObjPaths {
   std::filesystem::path histogramCsv;
 };
 
+struct FiberValueBand {
+    std::vector<std::size_t> lineIndices;
+    double minimumValue = 0.0;
+    double meanValue = 0.0;
+    double maximumValue = 0.0;
+};
+
+struct FiberValueBands {
+    std::array<FiberValueBand, 10> bands;
+};
+
+struct FiberValueBandObjPaths {
+    std::array<std::filesystem::path, 10> bands;
+};
+
 using FiberletCropTraceProgress = std::function<void(const FiberletCropTraceResult& result, std::size_t remainingAnchors)>;
 
 [[nodiscard]] FiberletCropTraceResult traceFiberletCrop(
@@ -155,5 +171,16 @@ void writeFiberletCropQualityArtifacts(
     const std::vector<FiberletCropTraceLine> &lines,
     const FiberQualityHistogram &histogram,
     const std::filesystem::path &allOutputPath);
+
+[[nodiscard]] FiberValueBands classifyFiberValues(
+    std::span<const double> values);
+
+[[nodiscard]] FiberValueBandObjPaths fiberValueBandObjPaths(
+    const std::filesystem::path& outputBase);
+
+[[nodiscard]] FiberValueBandObjPaths writeFiberletCropValueBandObjs(
+    const std::vector<FiberletCropTraceLine>& lines,
+    const FiberValueBands& bands,
+    const std::filesystem::path& outputBase);
 
 }  // namespace vc::fiber_tracer

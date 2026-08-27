@@ -4741,6 +4741,35 @@
   checkpoint. Intermediate checkpoints emit statistics only. The default base
   is sibling `<trace-stem>_direction_ablation`. With no Mixed traces,
   checkpoint zero is final; all-Mixed checkpoint zero is a valid empty solve.
+- `--perpendicular-only` is an opt-in labeling filter accepted by constraints,
+  direction diagnostic, and direction ablation. It retains measured links only
+  when `perpendicular_score > 0.5`; the exact ambiguous boundary is excluded.
+  Hard same-trace continuity links remain unchanged as their existing strong
+  evidence but do not become equality constraints. Filtering precedes degree,
+  adjacency, gauge, triangle, row, and objective construction and applies
+  identically to MILP and LP. The extracted constraint OBJ family remains
+  complete, while solver reports include retained and excluded counts. The
+  option conflicts with the redundant parallel-separate-winding exclusion.
+- Direction ablation optionally accepts `--post-iterations N` with
+  `--post-influence I`, where `N>0` requires `--perpendicular-only` and
+  finite `I` lies in `(0,1]`. The final selected checkpoint must contain
+  exactly one MILP piece for each represented trace, with unique contiguous
+  trace indices; split, missing, duplicate, and non-represented traces are not
+  repaired or synthesized. H initializes to 1, V to 0, and Broken to 0.5.
+- Post-filter adjacency is the unique source-trace graph induced by the exact
+  retained solver-link indices. Hard same-source links are ignored and every
+  cross-source link must have `perpendicular_score > 0.5`; a neighbor therefore
+  contributes `1-v`. Its confidence weight is
+  `clamp((abs(v-0.5)-0.5*(1-I))/(0.5*I),0,1)`. Each iteration synchronously
+  replaces a value by the weighted neighbor mean; zero total weight preserves
+  the previous value. This never changes MILP labels, costs, or errors.
+- Final values own ten complete-trace OBJ layers `<base>_p0.obj` through
+  `<base>_p9.obj`. Bands are fixed value intervals `[0,0.1)`, ..., `[0.8,0.9)`,
+  `[0.9,1]`; exact internal boundaries use the higher band and equal values
+  remain together. Only represented checkpoint traces occur, every trace
+  occurs exactly once, and empty bands are valid files. The accompanying table
+  stratifies the existing gauge-aligned comparison errors into trusted H,
+  trusted V, and admitted Mixed cohorts; it defines no new error threshold.
 - Every distance and arc value is in base voxels. Defaults are a 32-vx common
   sample pitch, 512-vx target piece length, 128-vx overlap, 128-vx neighbor
   radius, 32-vx centered tangent window, and 8-vx winding integration step.
@@ -4867,6 +4896,11 @@
   scores, the complete extracted report remains the input to constraint OBJ
   visualization, and retained/excluded counts are reported. Default-off model
   behavior is unchanged.
+- `--perpendicular-only` removes every non-hard measured link with
+  `perpendicular_score <= 0.5` before the same model construction stages.
+  Hard continuity remains retained with its existing objective semantics.
+  It conflicts with `--exclude-parallel-separate-winding`, reports its own
+  exclusion count, and leaves default-off behavior unchanged.
 - `--hv-only` is an independent opt-in labeling ablation. It retains the same
   filtered graph, degrees, broken penalties, active variables, H/V variables,
   pair-active variables, H/V gated-XOR variables, H/V gauges, and H/V triangle

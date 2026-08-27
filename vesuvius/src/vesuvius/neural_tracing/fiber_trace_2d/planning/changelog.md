@@ -1443,3 +1443,8 @@
   thresholded LP relaxation under a trusted-only component gauge.
 - Added a ranked-prefix admission limit for fast, repeatable broken-cost
   ablation sweeps.
+- Added an opt-in perpendicular-only labeling filter for constraint and
+  direction-ablation experiments, retaining existing same-trace continuity
+  evidence and reporting excluded measured links.
+- Added an opt-in no-split post-solve perpendicular consensus diagnostic with
+  confidence-weighted synchronous updates and short fixed-value OBJ layers.

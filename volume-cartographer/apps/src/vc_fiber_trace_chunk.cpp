@@ -58,6 +58,8 @@ struct Options {
     std::optional<std::size_t> maximumConstraintsPerFiber;
     std::size_t ablationStep = 5;
     std::optional<std::size_t> ablationLimit;
+    std::size_t postIterations = 0;
+    double postInfluence = 1.0;
     bool hasBounds = false;
     bool hasTraceOnlyOption = false;
     bool hasConstraintOnlyOption = false;
@@ -66,6 +68,7 @@ struct Options {
     bool hasDirectionVisualizationOption = false;
     bool hasHvOnlyOption = false;
     bool hasAblationOnlyOption = false;
+    bool hasPostInfluenceOption = false;
 };
 
 [[noreturn]] void fail(const std::string& message)
@@ -86,6 +89,7 @@ void usage(const char* executable)
                  " [--mip-gap FRACTION] [--lp-relaxation]"
                  " [--lp-parallel] [--lp-solver NAME]"
                  " [--hv-only] [--exact-perpendicular-milp]"
+                 " [--perpendicular-only]"
                  " [--exclude-parallel-separate-winding] [options]\n\n"
               << "  " << executable
               << " consensus <traces.zarr> --normal-manifest PATH"
@@ -96,7 +100,9 @@ void usage(const char* executable)
               << "  " << executable
               << " direction-ablation <traces.zarr> --normal-manifest PATH"
                  " [--output BASENAME] [--direction-dominance F]"
-                 " [--ablation-step N] [--ablation-limit N] [options]\n\n"
+                 " [--ablation-step N] [--ablation-limit N]"
+                 " [--perpendicular-only] [--post-iterations N]"
+                 " [--post-influence F] [options]\n\n"
               << "Trace options:\n"
               << "  --obj PATH                 line OBJ; defaults beside trace Zarr\n"
               << "  --volume PATH              concrete uint8 CT Zarr group\n"
@@ -113,6 +119,8 @@ void usage(const char* executable)
               << "  --direction-dominance F   direction support/arc fraction in (0.5,1] [0.75]\n\n"
               << "  --ablation-step N         mixed fibers admitted per checkpoint [5]\n\n"
               << "  --ablation-limit N        stop after admitting N mixed fibers [all]\n\n"
+              << "  --post-iterations N       perpendicular H/V consensus iterations [0]\n"
+              << "  --post-influence F        neighbor confidence support width in (0,1] [1]\n\n"
               << "Constraint options (all distances are base voxels):\n"
               << "  --output PATH              OBJ basename; defaults beside trace dataset\n"
               << "  --sample-step N            common trace resampling step [32]\n"
@@ -129,6 +137,7 @@ void usage(const char* executable)
               << "  --lp-solver NAME           choose, simplex, hipo, or ipm [choose]\n"
               << "  --hv-only                  solve active/broken and H/V only\n"
               << "  --exact-perpendicular-milp exact continuous H/V loss with binary activity\n"
+              << "  --perpendicular-only      label from perpendicular measured links only\n"
               << "  --exclude-parallel-separate-winding\n"
               << "                              omit that measured class from labeling only\n"
               << "  --threads N                scoring workers [host CPUs]\n"
@@ -261,6 +270,21 @@ Options parse(int argc, char** argv)
                 index, argc, argv, "--ablation-limit");
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
+        } else if (argument == "--post-iterations") {
+            options.postIterations = count(
+                index, argc, argv, "--post-iterations");
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--post-influence") {
+            options.postInfluence = number(
+                index, argc, argv, "--post-influence");
+            if (!(options.postInfluence > 0.0 &&
+                  options.postInfluence <= 1.0)) {
+                fail("--post-influence must be in (0, 1]");
+            }
+            options.hasPostInfluenceOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
         } else if (argument == "--sample-step") {
             options.constraints.resampleSpacingBaseVoxels = number(index, argc, argv, "--sample-step");
             options.hasConstraintOnlyOption = true;
@@ -328,6 +352,10 @@ Options parse(int argc, char** argv)
             options.hasSolverOnlyOption = true;
         } else if (argument == "--exclude-parallel-separate-winding") {
             options.labeling.excludeParallelSeparateWinding = true;
+            options.hasConstraintOnlyOption = true;
+            options.hasSolverOnlyOption = true;
+        } else if (argument == "--perpendicular-only") {
+            options.labeling.perpendicularOnly = true;
             options.hasConstraintOnlyOption = true;
             options.hasSolverOnlyOption = true;
         } else if (argument == "--hv-only") {
@@ -407,6 +435,17 @@ Options parse(int argc, char** argv)
         if (options.labeling.exactPerpendicularMilp &&
             options.labeling.relaxIntegrality) {
             fail("--exact-perpendicular-milp conflicts with --lp-relaxation");
+        }
+        if (options.labeling.perpendicularOnly &&
+            options.labeling.excludeParallelSeparateWinding) {
+            fail("--perpendicular-only conflicts with --exclude-parallel-separate-winding");
+        }
+        if (options.postIterations > 0 &&
+            !options.labeling.perpendicularOnly) {
+            fail("--post-iterations requires --perpendicular-only");
+        }
+        if (options.hasPostInfluenceOption && options.postIterations == 0) {
+            fail("--post-influence requires positive --post-iterations");
         }
         if (options.output.empty()) {
             const std::string stem = options.input.has_extension()
@@ -565,12 +604,14 @@ void printLabelingReport(
     };
     std::cout << std::setprecision(8)
               << "fiber trace labeling optimization\n"
-              << "status  hv_only  objective  orientation_cost  winding_cost  broken_cost  broken_cost_per_link  retained_links  excluded_parallel_separate_winding  requested_mip_gap  variables  integer_variables  rows  mip_nodes  mip_gap  solve_seconds\n"
+              << "status  hv_only  perpendicular_only  objective  orientation_cost  winding_cost  broken_cost  broken_cost_per_link  retained_links  excluded_non_perpendicular  excluded_parallel_separate_winding  requested_mip_gap  variables  integer_variables  rows  mip_nodes  mip_gap  solve_seconds\n"
               << report.modelStatus << "  " << (report.hvOnly ? "true" : "false")
+              << "  " << (config.perpendicularOnly ? "true" : "false")
               << "  " << report.objective << "  "
               << report.orientationCost << "  " << report.windingCost << "  "
               << report.brokenCost << "  " << config.brokenCostPerConstraint
               << "  " << report.retainedConstraints << "  "
+              << report.excludedNonPerpendicular << "  "
               << report.excludedParallelSeparateWinding << "  "
               << config.relativeMipGap << "  " << report.variables
               << "  " << report.integerVariables
@@ -711,18 +752,20 @@ void printRelaxedLabelingReport(
 {
     std::cout << std::setprecision(8)
               << "fiber trace labeling continuous values\n"
-              << "status  mode  hv_only  requested_solver  requested_parallel  threads  objective  orientation_cost  winding_cost  broken_cost  broken_cost_per_link  retained_links  excluded_parallel_separate_winding  variables  integer_variables  perpendicular_branch_variables  rows  gauge_roots  triangles  triangle_rows  mip_nodes  mip_gap  solve_seconds  csv\n"
+              << "status  mode  hv_only  perpendicular_only  requested_solver  requested_parallel  threads  objective  orientation_cost  winding_cost  broken_cost  broken_cost_per_link  retained_links  excluded_non_perpendicular  excluded_parallel_separate_winding  variables  integer_variables  perpendicular_branch_variables  rows  gauge_roots  triangles  triangle_rows  mip_nodes  mip_gap  solve_seconds  csv\n"
               << report.modelStatus << "  "
               << (report.exactPerpendicularMilp
                       ? "exact_perpendicular_milp"
                       : "lp_relaxation")
               << "  " << (report.hvOnly ? "true" : "false")
+              << "  " << (config.perpendicularOnly ? "true" : "false")
               << "  " << config.lpSolver << "  "
               << (config.lpParallel ? "on" : "choose") << "  "
               << config.parallelThreads << "  " << report.objective << "  "
               << report.orientationCost << "  " << report.windingCost << "  "
               << report.brokenCost << "  " << config.brokenCostPerConstraint
               << "  " << report.retainedConstraints << "  "
+              << report.excludedNonPerpendicular << "  "
               << report.excludedParallelSeparateWinding << "  "
               << report.variables << "  " << report.integerVariables << "  "
               << report.perpendicularBranchVariables << "  "
@@ -1093,15 +1136,24 @@ int main(int argc, char** argv)
                     const auto checkpointLpThresholded =
                         vc::fiber_tracer::thresholdFiberTraceLabeling(
                             checkpointLp);
+                    auto comparisonReport = checkpointReport;
+                    comparisonReport.constraints.clear();
+                    comparisonReport.constraints.reserve(
+                        checkpointLabeling.retainedConstraintIndices.size());
+                    for (const std::size_t index :
+                         checkpointLabeling.retainedConstraintIndices) {
+                        comparisonReport.constraints.push_back(
+                            checkpointReport.constraints.at(index));
+                    }
                     const auto comparison =
                         vc::fiber_tracer::compareFiberDirectionLabels(
-                            checkpointReport,
+                            comparisonReport,
                             diagnosticDirections,
                             checkpointLabeling,
                             trustedMask);
                     const auto lpComparison =
                         vc::fiber_tracer::compareFiberDirectionLabels(
-                            checkpointReport,
+                            comparisonReport,
                             diagnosticDirections,
                             checkpointLpThresholded,
                             trustedMask);
@@ -1128,8 +1180,12 @@ int main(int argc, char** argv)
                     }
                     std::cout << " fibers=" << diagnosticLines.size()
                               << " pieces=" << checkpointReport.pieces.size()
-                              << " constraints="
+                              << " constraints_extracted="
                               << checkpointReport.constraints.size()
+                              << " constraints_retained="
+                              << checkpointLabeling.retainedConstraints
+                              << " excluded_non_perpendicular="
+                              << checkpointLabeling.excludedNonPerpendicular
                               << " milp_status="
                               << checkpointLabeling.modelStatus
                               << " milp_gap=" << std::setprecision(6)
@@ -1206,6 +1262,89 @@ int main(int argc, char** argv)
                                 checkpointReport,
                                 checkpointLpThresholded,
                                 lpOutput);
+                        if (options.postIterations > 0) {
+                            const auto values = vc::fiber_tracer::
+                                postFilterPerpendicularFiberTraceLabels(
+                                    checkpointReport,
+                                    checkpointLabeling,
+                                    diagnosticLines.size(),
+                                    {options.postIterations,
+                                     options.postInfluence});
+                            const auto bands =
+                                vc::fiber_tracer::classifyFiberValues(values);
+                            const auto paths = vc::fiber_tracer::
+                                writeFiberletCropValueBandObjs(
+                                    diagnosticLines, bands, options.output);
+                            std::vector<unsigned char> hErrors(values.size(), 0);
+                            std::vector<unsigned char> vErrors(values.size(), 0);
+                            std::vector<unsigned char> mixedErrors(
+                                values.size(), 0);
+                            for (const auto& error : comparison.errors) {
+                                if (error.filteredTraceIndex >= values.size()) {
+                                    throw std::logic_error(
+                                        "post-filter error references an invalid fiber");
+                                }
+                                if (!error.trustedReference) {
+                                    mixedErrors[error.filteredTraceIndex] = 1;
+                                } else if (
+                                    error.initialDirection ==
+                                    vc::fiber_tracer::FiberDirectionGroup::Direction1) {
+                                    hErrors[error.filteredTraceIndex] = 1;
+                                } else {
+                                    vErrors[error.filteredTraceIndex] = 1;
+                                }
+                            }
+                            std::cout
+                                << "fiber direction post-filter"
+                                << " iterations=" << options.postIterations
+                                << " influence=" << options.postInfluence
+                                << " fibers=" << values.size() << '\n'
+                                << "band  count  h_ref  v_ref  mixed_ref"
+                                   "  h_errors  v_errors  mixed_errors"
+                                   "  total_errors  min  mean  max  path\n"
+                                << std::fixed << std::setprecision(6);
+                            for (std::size_t band = 0;
+                                 band < bands.bands.size();
+                                 ++band) {
+                                const auto& current = bands.bands[band];
+                                std::size_t hReferences = 0;
+                                std::size_t vReferences = 0;
+                                std::size_t mixedReferences = 0;
+                                std::size_t hErrorCount = 0;
+                                std::size_t vErrorCount = 0;
+                                std::size_t mixedErrorCount = 0;
+                                for (const std::size_t trace :
+                                     current.lineIndices) {
+                                    const auto direction =
+                                        diagnosticDirections.at(trace);
+                                    hReferences += direction ==
+                                        vc::fiber_tracer::FiberDirectionGroup::Direction1;
+                                    vReferences += direction ==
+                                        vc::fiber_tracer::FiberDirectionGroup::Direction2;
+                                    mixedReferences += direction ==
+                                        vc::fiber_tracer::FiberDirectionGroup::Mixed;
+                                    hErrorCount += hErrors[trace];
+                                    vErrorCount += vErrors[trace];
+                                    mixedErrorCount += mixedErrors[trace];
+                                }
+                                std::cout << 'p' << band << "  "
+                                          << current.lineIndices.size()
+                                          << "  " << hReferences
+                                          << "  " << vReferences
+                                          << "  " << mixedReferences
+                                          << "  " << hErrorCount
+                                          << "  " << vErrorCount
+                                          << "  " << mixedErrorCount
+                                          << "  " << hErrorCount +
+                                                vErrorCount + mixedErrorCount
+                                          << "  " << current.minimumValue
+                                          << "  " << current.meanValue
+                                          << "  " << current.maximumValue
+                                          << "  " << paths.bands[band]
+                                          << '\n';
+                            }
+                            std::cout << std::defaultfloat;
+                        }
                         printConstraintObjReport(objReport);
                         printLabelingReport(
                             checkpointLabeling,

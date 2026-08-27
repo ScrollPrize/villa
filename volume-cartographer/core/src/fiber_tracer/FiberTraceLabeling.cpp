@@ -293,6 +293,11 @@ FiberTraceLabelingReport solveFiberTraceLabels(
         throw std::invalid_argument(
             "Exact perpendicular MILP and LP relaxation are mutually exclusive");
     }
+    if (config.perpendicularOnly &&
+        config.excludeParallelSeparateWinding) {
+        throw std::invalid_argument(
+            "Perpendicular-only labeling and parallel separate-winding exclusion are redundant");
+    }
 
     const std::size_t pieceCount = constraints.pieces.size();
     FiberTraceLabelingReport report;
@@ -326,19 +331,38 @@ FiberTraceLabelingReport solveFiberTraceLabels(
     std::vector<FiberTraceConstraint> filteredConstraints;
     std::span<const FiberTraceConstraint> labelingConstraints =
         constraints.constraints;
-    if (config.excludeParallelSeparateWinding) {
+    report.retainedConstraintIndices.reserve(constraints.constraints.size());
+    if (config.excludeParallelSeparateWinding || config.perpendicularOnly) {
         filteredConstraints.reserve(constraints.constraints.size());
-        for (const auto& constraint : constraints.constraints) {
-            const bool exclude = !constraint.hardContinuity &&
+        for (std::size_t index = 0;
+             index < constraints.constraints.size();
+             ++index) {
+            const auto& constraint = constraints.constraints[index];
+            const bool excludeNonPerpendicular = config.perpendicularOnly &&
+                !constraint.hardContinuity &&
+                constraint.perpendicularScore <= 0.5;
+            const bool excludeParallelSeparate =
+                config.excludeParallelSeparateWinding &&
+                !constraint.hardContinuity &&
                 constraint.parallelScore > 0.5 &&
                 constraint.windingDistance >= 0.5;
-            if (exclude) {
+            if (excludeNonPerpendicular) {
+                ++report.excludedNonPerpendicular;
+            } else if (excludeParallelSeparate) {
                 ++report.excludedParallelSeparateWinding;
             } else {
                 filteredConstraints.push_back(constraint);
+                report.retainedConstraintIndices.push_back(index);
             }
         }
         labelingConstraints = filteredConstraints;
+    } else {
+        report.retainedConstraintIndices.resize(
+            constraints.constraints.size());
+        std::iota(
+            report.retainedConstraintIndices.begin(),
+            report.retainedConstraintIndices.end(),
+            std::size_t{0});
     }
     const std::size_t edgeCount = labelingConstraints.size();
     report.retainedConstraints = edgeCount;
@@ -731,6 +755,116 @@ FiberTraceLabelingReport thresholdFiberTraceLabeling(
         ++result.labelCounts[labelIndex(label)];
     }
     return result;
+}
+
+double fiberTracePostFilterConfidence(double value, double influence)
+{
+    if (!std::isfinite(value) || value < 0.0 || value > 1.0 ||
+        !std::isfinite(influence) || influence <= 0.0 || influence > 1.0) {
+        throw std::invalid_argument(
+            "Fiber trace post-filter value or influence is invalid");
+    }
+    const double distance = std::abs(value - 0.5);
+    const double threshold = 0.5 * (1.0 - influence);
+    return std::clamp(
+        (distance - threshold) / (0.5 * influence), 0.0, 1.0);
+}
+
+std::vector<double> postFilterPerpendicularFiberTraceLabels(
+    const FiberTraceConstraintReport& constraints,
+    const FiberTraceLabelingReport& labeling,
+    std::size_t traceCount,
+    const FiberTracePostFilterConfig& config)
+{
+    if (!std::isfinite(config.influence) || config.influence <= 0.0 ||
+        config.influence > 1.0) {
+        throw std::invalid_argument(
+            "Fiber trace post-filter influence must be in (0, 1]");
+    }
+    if (labeling.labels.size() != constraints.pieces.size()) {
+        throw std::invalid_argument(
+            "Fiber trace post-filter label count does not match pieces");
+    }
+    if (constraints.pieces.size() != traceCount) {
+        throw std::invalid_argument(
+            "Fiber trace post-filter requires one piece per represented fiber");
+    }
+
+    std::vector<double> values(traceCount, 0.5);
+    std::vector<unsigned char> represented(traceCount, 0);
+    for (std::size_t piece = 0; piece < constraints.pieces.size(); ++piece) {
+        const std::size_t trace = constraints.pieces[piece].traceIndex;
+        if (trace >= traceCount || represented[trace] != 0) {
+            throw std::invalid_argument(
+                "Fiber trace post-filter requires unique contiguous represented fibers");
+        }
+        represented[trace] = 1;
+        if (isBroken(labeling.labels[piece])) {
+            values[trace] = 0.5;
+        } else {
+            values[trace] = isVertical(labeling.labels[piece]) ? 0.0 : 1.0;
+        }
+    }
+    if (std::find(represented.begin(), represented.end(), 0) !=
+        represented.end()) {
+        throw std::invalid_argument(
+            "Fiber trace post-filter requires unique contiguous represented fibers");
+    }
+
+    std::vector<std::vector<std::size_t>> adjacency(traceCount);
+    for (const std::size_t constraintIndex :
+         labeling.retainedConstraintIndices) {
+        if (constraintIndex >= constraints.constraints.size()) {
+            throw std::invalid_argument(
+                "Fiber trace post-filter retained constraint index is invalid");
+        }
+        const auto& constraint = constraints.constraints[constraintIndex];
+        if (constraint.pieceA >= constraints.pieces.size() ||
+            constraint.pieceB >= constraints.pieces.size()) {
+            throw std::invalid_argument(
+                "Fiber trace post-filter constraint endpoint is invalid");
+        }
+        const std::size_t a = constraints.pieces[constraint.pieceA].traceIndex;
+        const std::size_t b = constraints.pieces[constraint.pieceB].traceIndex;
+        if (a == b) {
+            if (!constraint.hardContinuity) {
+                throw std::invalid_argument(
+                    "Fiber trace post-filter received a soft same-fiber link");
+            }
+            continue;
+        }
+        if (constraint.hardContinuity ||
+            constraint.perpendicularScore <= 0.5) {
+            throw std::invalid_argument(
+                "Fiber trace post-filter requires perpendicular cross-fiber links");
+        }
+        adjacency[a].push_back(b);
+        adjacency[b].push_back(a);
+    }
+    for (auto& neighbors : adjacency) {
+        std::sort(neighbors.begin(), neighbors.end());
+        neighbors.erase(
+            std::unique(neighbors.begin(), neighbors.end()), neighbors.end());
+    }
+
+    std::vector<double> updated(traceCount, 0.5);
+    for (std::size_t iteration = 0; iteration < config.iterations; ++iteration) {
+        for (std::size_t trace = 0; trace < traceCount; ++trace) {
+            double weighted = 0.0;
+            double totalWeight = 0.0;
+            for (const std::size_t neighbor : adjacency[trace]) {
+                const double weight = fiberTracePostFilterConfidence(
+                    values[neighbor], config.influence);
+                weighted += weight * (1.0 - values[neighbor]);
+                totalWeight += weight;
+            }
+            updated[trace] = totalWeight > 0.0
+                ? std::clamp(weighted / totalWeight, 0.0, 1.0)
+                : values[trace];
+        }
+        values.swap(updated);
+    }
+    return values;
 }
 
 FiberDirectionLabelComparisonReport compareFiberDirectionLabels(
