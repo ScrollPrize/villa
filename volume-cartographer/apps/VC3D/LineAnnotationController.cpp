@@ -11271,6 +11271,9 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
             viewConfig.controlPointLinePositions.push_back(control.linePosition);
         }
         viewConfig.orientedPointNormals = orientedNormals;
+        // Only lineUpVectors is consumed below; skip the per-line-point
+        // PlaneSurface allocations.
+        viewConfig.buildLineZSlices = false;
         views = vc::lasagna::buildLineViewSurfaces(session.optimizedLine, viewConfig);
     } catch (const std::exception& ex) {
         session.error = ex.what();
@@ -11431,7 +11434,7 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
         camera.zOffsetWorldDir = {0, 0, 0};
     }
 
-    if (!pane->dialog->setGeneratedLineViews(generatedViews, camera)) {
+    if (!pane->dialog->setGeneratedLineViews(std::move(generatedViews), camera)) {
         // Restore what was on screen: drop the rejected replacements, then
         // re-register the retained surfaces under their old names and hand the
         // session its previous metadata back. The epoch is deliberately not

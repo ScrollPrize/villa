@@ -1630,7 +1630,7 @@ void LineAnnotationDialog::setGeneratedOverlay(const std::string& surfaceName,
 }
 
 bool LineAnnotationDialog::setGeneratedLineViews(
-    const GeneratedViews& views,
+    GeneratedViews views,
     const CChunkedVolumeViewer::CameraState& camera)
 {
     if (!_viewerManager || !_layout || views.linePoints.empty() ||
@@ -1668,7 +1668,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         const float previousDisplayTangentSign = _displayTangentSign;
         const std::optional<cv::Vec3f> previousPendingPlacementFocus =
             _pendingPlacementFocus;
-        _generatedViews = views;
+        _generatedViews = std::move(views);
         _displayTangentSign = vc3d::line_annotation::generatedDisplayTangentSign(
             _generatedViews.linePoints,
             _generatedViews.lineNormals);

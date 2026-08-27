@@ -113,7 +113,10 @@ public:
         const std::vector<std::vector<std::pair<std::string, QString>>>& rows,
         const CChunkedVolumeViewer::CameraState& camera,
         const std::map<std::string, GeneratedOverlay>& overlays = {});
-    bool setGeneratedLineViews(const GeneratedViews& views,
+    // Takes the views by value: the caller hands its (large - all line
+    // points, normals, branch polylines, strip map) struct over instead of
+    // this dialog copying it a second time.
+    bool setGeneratedLineViews(GeneratedViews views,
                                const CChunkedVolumeViewer::CameraState& camera);
     GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
         const std::string& surfaceName,
