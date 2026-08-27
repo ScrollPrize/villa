@@ -1113,6 +1113,7 @@ void ChunkCache::registerStateBudget(const std::shared_ptr<State>& state)
                 auto locked = weakState.lock();
                 return locked ? evictOldestDecoded(locked) : 0;
             },
+            state->options_.decodedEvictionPreferSelf,
         });
 }
 
@@ -1645,10 +1646,28 @@ ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix)
     if (!isValidKey(*state, key))
         return ChunkResult{ChunkStatus::AllFill, state->dtype_, {}, {}, {}};
 
+    // A caller of this method is parked until the chunk resolves, so its
+    // request must order ahead of the speculative prefetch backlog in the
+    // background queue (smaller backgroundPriority runs first; prefetches
+    // sit at >= 0). Without this, a blocking read issued while a solve
+    // streams chunks waits FIFO behind every chunk the solve enqueued -
+    // on remote sources that parked the caller (GUI thread included) for
+    // the whole backlog's round trips.
+    constexpr int kBlockingFetchPriorityOffset = -1024;
     auto [it, inserted] = state->entries_.emplace(key, Entry{});
     it->second.backgroundDemand = true;
-    const bool notifyRemoteStart = inserted && queueFetchLocked(
-        state, key, state->generation_, 0);
+    bool notifyRemoteStart = false;
+    if (inserted) {
+        notifyRemoteStart = queueFetchLocked(
+            state, key, state->generation_, kBlockingFetchPriorityOffset);
+    } else if (it->second.status == EntryStatus::InFlight) {
+        const int boosted =
+            fetchBasePriority(*state, key, kBlockingFetchPriorityOffset);
+        if (boosted < it->second.basePriority) {
+            it->second.basePriority = boosted;
+            reprioritizeEntryLocked(*state, key, it->second);
+        }
+    }
     if (notifyRemoteStart) {
         lock.unlock();
         notifyRemoteFetchListeners(state, key, true);

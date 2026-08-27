@@ -41,6 +41,11 @@ private:
     struct Participant {
         std::function<std::optional<std::uint64_t>()> oldestDecodedTouch;
         std::function<std::size_t()> evictOldestDecoded;
+        // Preferred eviction victim (see
+        // ChunkCacheOptions::decodedEvictionPreferSelf): while any flagged
+        // participant still holds decoded data, enforcement evicts among the
+        // flagged ones only.
+        bool evictFirst = false;
     };
 
     std::uint64_t registerCache(Participant participant);

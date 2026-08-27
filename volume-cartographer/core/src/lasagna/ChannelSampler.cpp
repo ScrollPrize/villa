@@ -517,10 +517,16 @@ public:
             sourcePath = std::filesystem::absolute(binding.path, ec);
         if (ec)
             sourcePath = binding.path;
+        vc::render::ChunkCacheOptions cacheOptions;
+        // A line solve streams whole-line chunk batches per iteration; those
+        // must never displace the viewer tiles the user is panning over in
+        // the shared decoded budget.
+        cacheOptions.decodedEvictionPreferSelf = true;
         cache_ = vc::render::acquireProcessChunkCache(
             "lasagna-channel|" + sourcePath.lexically_normal().string() +
                 "|channel=" + std::to_string(binding.channelIndex),
-            binding.array);
+            binding.array,
+            std::move(cacheOptions));
     }
 
     [[nodiscard]] NormalPrefetchReport sampleBatch(

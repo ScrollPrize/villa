@@ -70,6 +70,13 @@ struct ChunkCacheOptions {
     bool compressPersistentCache = false;
     // Near-lossless persistent-cache quantization width; one is lossless.
     int cacheQuantBinWidth = 1;
+    // When the shared decoded-byte budget must evict, sources flagged here
+    // are preferred victims: they may not displace other participants'
+    // decoded data unless no flagged participant has anything left to give.
+    // Set by bulk background consumers (lasagna channel sampling for line
+    // solves) so their chunk streams cannot evict the viewer tiles the user
+    // is panning over.
+    bool decodedEvictionPreferSelf = false;
 };
 
 // Application-owned decoded chunk-cache service. Source identity strings are
