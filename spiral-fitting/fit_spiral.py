@@ -46,6 +46,8 @@ from ddp_helpers import (
 )
 from config import (BACKFILLABLE_CONFIG_DEFAULTS, CHECKPOINT_MODEL_SHAPE_KEYS,
                     Config, FitConfig, durable_config)
+from checkpoint_migrations import (expand_gap_checkpoint_capacity,
+                                   migrate_legacy_gap_parameterization)
 from fit_session import (fit_input, input_source_enabled, pcl_input_enabled,
                          phase_bundle_enabled, shell_losses_enabled,
                          winding_inference_enabled)
@@ -2969,6 +2971,7 @@ class FitContext:
     def _checkpoint_payload(self, completed_iterations):
         return {
             'schema_version': 2,
+            'gap_parameterization_version': 2,
             'completed_iterations': int(completed_iterations),
             'spiral_and_transform': self.spiral_and_transform.state_dict(),
             'optimiser': self.optimiser.state_dict(),
@@ -3064,6 +3067,15 @@ class FitContext:
         if not isinstance(checkpoint, dict):
             return CheckpointVerdict(
                 False, ('checkpoint is not a state dictionary',), source=source)
+        try:
+            # Capacity growth is prefix-preserving: inspect the expanded copy
+            # without mutating the caller's checkpoint. load_checkpoint()
+            # performs the same migration only after this verdict succeeds.
+            checkpoint = expand_gap_checkpoint_capacity(
+                migrate_legacy_gap_parameterization(checkpoint),
+                self.config['model_gap_expander_capacity_windings'])
+        except ValueError as exc:
+            reasons.append(str(exc))
 
         # --- schema -------------------------------------------------------
         schema_version = int(checkpoint.get('schema_version', 1) or 1)
@@ -3300,6 +3312,9 @@ class FitContext:
                 torch.cuda.set_rng_state(state, device_index)
 
     def load_checkpoint(self, checkpoint):
+        checkpoint = expand_gap_checkpoint_capacity(
+            migrate_legacy_gap_parameterization(checkpoint),
+            self.config['model_gap_expander_capacity_windings'])
         transformed_spiral_state, optimiser_state = checkpoint['spiral_and_transform'], checkpoint['optimiser']
         self.spiral_and_transform.load_state_dict(transformed_spiral_state)
         self.optimiser.load_state_dict(optimiser_state)

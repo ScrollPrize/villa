@@ -3,10 +3,11 @@
 GapExpandingTransform._call/_inverse need, per query point, only the two
 winding radii bracketing the point -- but the eager path materialises the full
 [N, num_windings] pipeline in global memory (winding coords, grid_sample'd
-logits, exp, cumsum, gathers, plus searchsorted for the inverse), and its
+logits, lower-bounded softplus, cumsum, gathers, plus searchsorted for the inverse), and its
 backward again. Here one kernel walks the windings in registers per point:
 each winding's logit is bilinearly sampled from the (pinned, scaled) logit
-lattice, exponentiated, and accumulated into the running radius; only the two
+lattice, mapped through the stable lower-bounded softplus, and accumulated;
+only the two
 bracketing radii are kept. The backward re-walks the windings, scattering the
 logit-lattice gradient with atomics and accumulating theta/z/dr gradients in
 registers.
@@ -83,11 +84,28 @@ if _HAS_TRITON:
         return uy_raw, uy, y0, wy0, wy1, y0_ok, y1_ok
 
     @triton.jit
+    def _softplus(value):
+        # max(x, 0) + log(1 + exp(-abs(x))) is stable in both tails.
+        return tl.maximum(value, 0.0) + tl.log(1.0 + tl.exp(-tl.abs(value)))
+
+    @triton.jit
+    def _sigmoid(value):
+        # Avoid exp(-value) overflow in the negative tail.
+        exp_negative_abs = tl.exp(-tl.abs(value))
+        return tl.where(
+            value >= 0.0,
+            1.0 / (1.0 + exp_negative_abs),
+            exp_negative_abs / (1.0 + exp_negative_abs),
+        )
+
+    @triton.jit
     def _gap_fwd_kernel(theta_ptr, z_ptr, iw_ptr, target_ptr,
                         r_in_ptr, r_out_ptr,
                         logits_ptr, idx_ptr, dr_ptr,
                         N, W, T, NZ, tm1f, nzm1f,
                         two_pi, idx_total, min_z, zrange, tf,
+                        min_gap, softplus_bias, softplus_denominator,
+                        softplus_scale,
                         SEARCH: tl.constexpr, HAS_TF: tl.constexpr,
                         BLOCK: tl.constexpr):
         pid = tl.program_id(0)
@@ -123,9 +141,11 @@ if _HAS_TRITON:
             ux_raw = ((xg + 1.0) / 2.0) * tm1f
             logit, _, _, _, _, _, _, _, _ = _sample_logit(
                 logits_ptr, ux_raw, y0, wy0, wy1, y0_ok, y1_ok, T, tm1f, m)
-            s = tl.exp(logit * 2.0e2)
+            argument = softplus_bias + softplus_scale * logit
+            ratio = _softplus(argument) / softplus_denominator
+            gap = min_gap + (dr - min_gap) * ratio
             if HAS_TF:
-                s = 1.0 + tf * (s - 1.0)
+                gap = dr + tf * (gap - dr)
             radii_w = wz + running
             if SEARCH:
                 newly = (~found) & (radii_w >= target)
@@ -147,7 +167,7 @@ if _HAS_TRITON:
             else:
                 r_in = tl.where(w == iw, radii_w, r_in)
                 r_out = tl.where(w == iw + 1, radii_w, r_out)
-            running = running + dr * s
+            running = running + gap
         tl.store(r_in_ptr + i, r_in, mask=m)
         tl.store(r_out_ptr + i, r_out, mask=m)
         if SEARCH:
@@ -159,6 +179,8 @@ if _HAS_TRITON:
                         logits_ptr, idx_ptr, dr_ptr,
                         N, W, T, NZ, tm1f, nzm1f,
                         two_pi, idx_total, min_z, zrange, tf,
+                        min_gap, softplus_bias, softplus_denominator,
+                        softplus_scale,
                         HAS_TF: tl.constexpr, BLOCK: tl.constexpr):
         pid = tl.program_id(0)
         i = pid * BLOCK + tl.arange(0, BLOCK)
@@ -182,7 +204,7 @@ if _HAS_TRITON:
         # needs to walk to its largest iw + 1.
         w_stop = tl.minimum(tl.max(tl.where(m, iw, 0), 0) + 1, W)
         for w in range(w_stop):
-            # d_w = dr*scale_w feeds radii_v for every v > w (exclusive cumsum)
+            # gap_w feeds radii_v for every v > w (exclusive cumsum)
             g_d = tl.where(w < iw, g_io, tl.where(w < iw + 1, g_out, 0.0))
             live = m & (g_d != 0.0)
             idx_w = tl.load(idx_ptr + w)
@@ -192,15 +214,21 @@ if _HAS_TRITON:
             ux_raw = ((xg + 1.0) / 2.0) * tm1f
             logit, x0, wx0, wx1, x1_ok, v_nw, v_ne, v_sw, v_se = _sample_logit(
                 logits_ptr, ux_raw, y0, wy0, wy1, y0_ok, y1_ok, T, tm1f, live)
-            s_raw = tl.exp(logit * 2.0e2)
+            argument = softplus_bias + softplus_scale * logit
+            ratio = _softplus(argument) / softplus_denominator
+            sigmoid = _sigmoid(argument)
             if HAS_TF:
-                s_used = 1.0 + tf * (s_raw - 1.0)
-                g_s_raw = g_d * dr * tf
+                dr_derivative = 1.0 + tf * (ratio - 1.0)
+                gap_logit_derivative = (
+                    tf * (dr - min_gap) * sigmoid
+                    * softplus_scale / softplus_denominator)
             else:
-                s_used = s_raw
-                g_s_raw = g_d * dr
-            g_dr += g_d * s_used
-            g_logit = g_s_raw * s_raw * 2.0e2
+                dr_derivative = ratio
+                gap_logit_derivative = (
+                    (dr - min_gap) * sigmoid
+                    * softplus_scale / softplus_denominator)
+            g_dr += g_d * dr_derivative
+            g_logit = g_d * gap_logit_derivative
             # scatter dL/dlogits into the 4 bilinear corners
             base0 = y0.to(tl.int64) * T
             base1 = base0 + T
@@ -231,7 +259,8 @@ class _GapRadii(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, theta, z, logits2d, idx, idx_total, dr, iw, target,
-                truncate_frac, min_z, max_z):
+                truncate_frac, min_z, max_z, min_gap, softplus_bias,
+                softplus_denominator, softplus_scale):
         n = theta.shape[0]
         W = idx.shape[0] - 1
         NZ, T = logits2d.shape
@@ -248,6 +277,8 @@ class _GapRadii(torch.autograd.Function):
                 _TWO_PI, float(idx_total),
                 float(min_z), float(max_z) - float(min_z),
                 0.0 if truncate_frac is None else float(truncate_frac),
+                float(min_gap), float(softplus_bias),
+                float(softplus_denominator), float(softplus_scale),
                 SEARCH=search, HAS_TF=truncate_frac is not None,
                 BLOCK=_BLOCK,
             )
@@ -256,6 +287,10 @@ class _GapRadii(torch.autograd.Function):
         ctx.idx_total = float(idx_total)
         ctx.min_z = float(min_z)
         ctx.max_z = float(max_z)
+        ctx.min_gap = float(min_gap)
+        ctx.softplus_bias = float(softplus_bias)
+        ctx.softplus_denominator = float(softplus_denominator)
+        ctx.softplus_scale = float(softplus_scale)
         ctx.mark_non_differentiable(iw)
         return r_in, r_out, iw
 
@@ -282,26 +317,34 @@ class _GapRadii(torch.autograd.Function):
                 _TWO_PI, ctx.idx_total,
                 ctx.min_z, ctx.max_z - ctx.min_z,
                 0.0 if ctx.truncate_frac is None else float(ctx.truncate_frac),
+                ctx.min_gap, ctx.softplus_bias, ctx.softplus_denominator,
+                ctx.softplus_scale,
                 HAS_TF=ctx.truncate_frac is not None, BLOCK=_BLOCK,
             )
         g_dr = g_dr_partial.sum().reshape(dr.shape)
-        return g_theta, g_z, g_logits, None, None, g_dr, None, None, None, None, None
+        return (g_theta, g_z, g_logits, None, None, g_dr, None, None,
+                None, None, None, None, None, None, None)
 
 
 def gap_bracketing_radii(theta, z, pinned_scaled_logits, idx, idx_total, dr,
-                         inner_winding_clipped, truncate_frac, min_z, max_z):
+                         inner_winding_clipped, truncate_frac, min_z, max_z,
+                         min_gap, softplus_bias, softplus_denominator,
+                         softplus_scale):
     # _call path: the bracketing winding index is already known.
     shape = theta.shape
     r_in, r_out, _ = _GapRadii.apply(
         theta.reshape(-1).contiguous(), z.reshape(-1).contiguous(),
         pinned_scaled_logits.reshape(pinned_scaled_logits.shape[-2:]),
         idx, idx_total, dr, inner_winding_clipped.reshape(-1).contiguous(), None,
-        truncate_frac, min_z, max_z)
+        truncate_frac, min_z, max_z, min_gap, softplus_bias,
+        softplus_denominator, softplus_scale)
     return r_in.view(shape), r_out.view(shape)
 
 
 def gap_search_radii(theta, z, pinned_scaled_logits, idx, idx_total, dr,
-                     transformed_radius, truncate_frac, min_z, max_z):
+                     transformed_radius, truncate_frac, min_z, max_z,
+                     min_gap, softplus_bias, softplus_denominator,
+                     softplus_scale):
     # _inverse path: searchsorted over the (increasing) transformed radii is
     # folded into the winding walk.
     shape = theta.shape
@@ -309,5 +352,6 @@ def gap_search_radii(theta, z, pinned_scaled_logits, idx, idx_total, dr,
         theta.reshape(-1).contiguous(), z.reshape(-1).contiguous(),
         pinned_scaled_logits.reshape(pinned_scaled_logits.shape[-2:]),
         idx, idx_total, dr, None, transformed_radius.reshape(-1).contiguous(),
-        truncate_frac, min_z, max_z)
+        truncate_frac, min_z, max_z, min_gap, softplus_bias,
+        softplus_denominator, softplus_scale)
     return r_in.view(shape), r_out.view(shape), iw.view(shape)
