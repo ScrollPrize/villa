@@ -8985,6 +8985,12 @@ void LineAnnotationController::handleGeneratedControlPointDelete(const std::stri
     vc3d::line_annotation::invalidateSegmentsAdjacentToControl(
         session.controlPoints, static_cast<size_t>(deletedControlIndex));
     session.controlPoints.erase(selected);
+    // The session's geometry changed (no solve is in flight - this handler
+    // refuses while one runs): bump the epoch so the side-strip fingerprint
+    // and the session snapshot cache see the deletion immediately instead of
+    // serving the pre-delete control points until the follow-up solve lands
+    // (or indefinitely in no-reoptimize mode).
+    session.solveQueue.noteSessionMutated();
     const BranchMetadataSyncResult branchSync =
         syncLinkedBranchMetadataAfterFiberModification(
             session,
@@ -9587,7 +9593,10 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
                                                  control.optimizedIndex)]
                     .position -
                 control.volumePoint;
-            return delta.dot(delta) <= 1.0e-12;
+            // Same tolerance as the loader's exact-membership scan
+            // (kControlPointMatchEpsilon = 1e-8, squared here): an index may
+            // only be trusted if the fiber it produces would reload.
+            return delta.dot(delta) <= 1.0e-16;
         };
     const bool solverIndicesTrusted =
         std::all_of(session.controlPoints.begin(),
@@ -10111,12 +10120,24 @@ void LineAnnotationController::dispatchPendingSolve(const std::string& surfaceNa
         return;
     }
     auto pending = session.solveQueue.takePending();
+    const std::vector<size_t> pendingSpansForRetry = pending.dirtySegments;
+    const bool pendingWasFullLine = pending.fullLine;
     startFiberModeOptimization(session,
                                false,
                                pending.fullLine
                                    ? std::nullopt
                                    : std::optional<std::vector<size_t>>(
                                          std::move(pending.dirtySegments)));
+    if (session.taskState != LineAnnotationSession::TaskState::Running &&
+        !session.controlPointCollapseRollback) {
+        // The solve did not start (dataset or trace prerequisites vanished)
+        // and there is no rollback to restore: keep the request pending so
+        // the next dispatch (or the close/save finalize, which solves the
+        // whole line regardless) picks it up instead of silently dropping
+        // the provisional spans. Deliberately not rescheduled here - a
+        // permanently missing prerequisite must not become a retry storm.
+        session.solveQueue.addPending(pendingSpansForRetry, pendingWasFullLine);
+    }
     if (session.taskState != LineAnnotationSession::TaskState::Running &&
         session.controlPointCollapseRollback) {
         // The solve did not start (dataset or trace prerequisites vanished):
@@ -10327,12 +10348,20 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
         session.taskState = LineAnnotationSession::TaskState::Idle;
         auto pending = session.solveQueue.finishSolve();
         if (pending.requested) {
+            const std::vector<size_t> pendingSpansForRetry =
+                pending.dirtySegments;
             startFiberModeOptimization(
                 session,
                 false,
                 pending.fullLine ? std::nullopt
                                  : std::optional<std::vector<size_t>>(
                                        std::move(pending.dirtySegments)));
+            if (session.taskState !=
+                LineAnnotationSession::TaskState::Running) {
+                // See dispatchPendingSolve: never silently drop the spans.
+                session.solveQueue.addPending(pendingSpansForRetry,
+                                              pending.fullLine);
+            }
         }
         if (pane->dialog) {
             pane->dialog->setOptimizationBusy(
@@ -10433,6 +10462,8 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
         session.taskState != LineAnnotationSession::TaskState::Running) {
         // A request coalesced without a session mutation (a gated caller
         // slipped past its own gate mid-flight); honor it now.
+        const std::vector<size_t> pendingSpansForRetry =
+            pendingAfterPublish.dirtySegments;
         startFiberModeOptimization(
             session,
             false,
@@ -10440,6 +10471,11 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
                 ? std::nullopt
                 : std::optional<std::vector<size_t>>(
                       std::move(pendingAfterPublish.dirtySegments)));
+        if (session.taskState != LineAnnotationSession::TaskState::Running) {
+            // See dispatchPendingSolve: never silently drop the spans.
+            session.solveQueue.addPending(pendingSpansForRetry,
+                                          pendingAfterPublish.fullLine);
+        }
     }
     if (pane->dialog) {
         pane->dialog->setOptimizationBusy(
@@ -12597,9 +12633,12 @@ LineAnnotationController::fiberSnapshotsForSideStripQuery() const
 {
     // Per-fiber memoization: a snapshot (and its geometry hash) is rebuilt
     // only when the fiber's geometry actually changed - the stored copy by
-    // its save generation, an open session by its line revision and edit
-    // epoch. Unchanged fibers cost two integer compares per query instead of
-    // a full polyline deep copy plus per-point hashing.
+    // its save generation (plus the package generation, since runtime ids
+    // are reassigned per load), an open session by its line revision and
+    // edit epoch. Unchanged fibers cost two integer compares per query
+    // instead of a full polyline deep copy plus per-point hashing. The
+    // caches are GUI-thread-only (like all controller state); workers only
+    // ever hold the immutable shared snapshots.
     std::map<uint64_t, SideStripFiberSnapshot> byId;
 
     const auto makePolyline = [](uint64_t id,
@@ -12628,9 +12667,11 @@ LineAnnotationController::fiberSnapshotsForSideStripQuery() const
         liveStoredIds.insert(fiber.id);
         auto cached = _sideStripStoredSnapshotCache.find(fiber.id);
         if (cached == _sideStripStoredSnapshotCache.end() ||
-            cached->second.validityA != fiber.generation) {
+            cached->second.validityA != fiber.generation ||
+            cached->second.validityB != _packageGeneration) {
             SideStripSnapshotCacheEntry entry;
             entry.validityA = fiber.generation;
+            entry.validityB = _packageGeneration;
             entry.snapshot = makePolyline(
                 fiber.id,
                 fiber.generation,

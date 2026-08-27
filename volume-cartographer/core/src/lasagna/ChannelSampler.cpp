@@ -520,7 +520,12 @@ public:
         vc::render::ChunkCacheOptions cacheOptions;
         // A line solve streams whole-line chunk batches per iteration; those
         // must never displace the viewer tiles the user is panning over in
-        // the shared decoded budget.
+        // the shared decoded budget. Trade-off: while lasagna data occupies
+        // budget, lasagna is also the preferred victim - if a solve's
+        // working set ever exceeded the whole budget it would re-fetch its
+        // own evictions each iteration. A line's per-iteration footprint is
+        // orders of magnitude below typical budgets, so protecting the
+        // interactive tiles wins.
         cacheOptions.decodedEvictionPreferSelf = true;
         cache_ = vc::render::acquireProcessChunkCache(
             "lasagna-channel|" + sourcePath.lexically_normal().string() +
