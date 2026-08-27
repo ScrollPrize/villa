@@ -13014,6 +13014,11 @@ void LineAnnotationController::dispatchSideStripIntersectionQuery(
     const QString fingerprint =
         sideStripQueryFingerprint(surfaceName, stripPointsPtr);
     if (_sideStripIntersectionRunning &&
+        // Token currentness too: an invalidated (superseded-token) worker may
+        // still be draining, and its fingerprint must not swallow a fresh
+        // dispatch -- its completion will only clear the busy state, never
+        // deliver markers.
+        _runningSideStripIntersectionToken == _latestSideStripIntersectionToken &&
         _runningSideStripIntersectionSurfaceName == surfaceName &&
         !_runningSideStripFingerprint.isEmpty() &&
         fingerprint == _runningSideStripFingerprint) {
@@ -13465,8 +13470,12 @@ void LineAnnotationController::startSideStripIntersectionQuery(
                     }
                     const std::string surfaceName = requestPtr->surfaceName;
                     const uint64_t token = requestPtr->token;
+                    // Queued on the application object: the GUI thread can
+                    // destroy the controller between the QPointer check above
+                    // and invokeMethod consuming a raw receiver. The lambda
+                    // re-checks `self` on the GUI thread.
                     QMetaObject::invokeMethod(
-                        self.data(),
+                        QCoreApplication::instance(),
                         [self, token, surfaceName, stage, completed, total]() {
                             if (self) {
                                 self->updateSideStripIntersectionProgress(token,
@@ -13485,8 +13494,9 @@ void LineAnnotationController::startSideStripIntersectionQuery(
                     }
                     const std::string surfaceName = requestPtr->surfaceName;
                     const uint64_t token = requestPtr->token;
+                    // Same application-object queuing as the progress path.
                     QMetaObject::invokeMethod(
-                        self.data(),
+                        QCoreApplication::instance(),
                         [self, token, surfaceName, markers = std::move(markers)]() mutable {
                             if (self) {
                                 self->applyPartialSideStripIntersectionMarkers(
@@ -13509,8 +13519,9 @@ void LineAnnotationController::startSideStripIntersectionQuery(
             if (!self) {
                 return;
             }
+            // Same application-object queuing as the progress path.
             QMetaObject::invokeMethod(
-                self.data(),
+                QCoreApplication::instance(),
                 [self, resultPtr]() mutable {
                     if (self) {
                         self->finishSideStripIntersectionQuery(std::move(*resultPtr));
