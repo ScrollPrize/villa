@@ -626,8 +626,9 @@ summed same-label and different-label costs.
 
 Hard mismatch rates include only links whose endpoints are both resolved.
 Undefined ratios are serialized as `NA` and excluded from group summaries.
-`soft_same_label_proxy` is the strength-weighted independence proxy
-`h_i*h_j + (1-h_i)*(1-h_j)`; it is not a calibrated BP edge probability.
+`soft_mismatch_proxy` is the strength-weighted independent-endpoint
+probability of violating each factor's preferred same/different relation; it
+is not a calibrated BP edge marginal.
 `neighbor_support_balance` measures how evenly neighbors support H and V and
 can be high when neighbors themselves are uncertain, so
 `neighbor_certainty` is reported alongside it. Console summaries give
@@ -635,10 +636,12 @@ equal-per-fiber min/mean/median/p90/max values by initial reference group and
 tie-aware AUROC values for Mixed versus trusted fibers.
 
 Add `--bp-inference sum-product` to run binary sum-product BP over the same
-merged perpendicular factor graph and the same hard-H central straight seed:
+merged orientation factor graph and the same hard-H central straight seed.
+Omit `--perpendicular-only` to retain both parallel- and
+perpendicular-preferring measurements:
 
 ```bash
-volume-cartographer/build/bin/vc_fiber_trace_chunk direction-ablation crop_traces.zarr --normal-manifest normals.lasagna.json --output crop_bp --direction-dominance 0.9 --piece-length 1000000000 --perpendicular-only --bp-only --bp-inference sum-product
+volume-cartographer/build/bin/vc_fiber_trace_chunk direction-ablation crop_traces.zarr --normal-manifest normals.lasagna.json --output crop_bp --direction-dominance 0.9 --piece-length 1000000000 --bp-only --bp-inference sum-product
 ```
 
 For same-label and different-label factor costs `E_same` and `E_diff`, this
@@ -648,6 +651,16 @@ horizontalness is `P(H)`, obtained directly from the node log odds. These are
 exact marginals on trees and loopy-BP approximations after convergence on
 cyclic graphs. A `message_limit` status exposes the final finite iterate but
 does not claim convergence.
+
+For every raw measurement with parallel score `p`, same-label cost receives
+`1-p` and different-label cost receives `p`. Measurements for the same fiber
+pair are summed, then the smaller merged cost is subtracted from both. The
+remaining nonzero gap `abs(E_same-E_diff)` is the constraint's decisiveness:
+scores near `0.5` are weak, while scores near `0` or `1` are strong. Exactly
+canceled merged factors are omitted from inference, degree, components, and
+mismatch statistics and are reported separately as neutral factors and
+measurements. `--perpendicular-only` remains available to reproduce the
+restricted graph.
 
 Temperature has different semantics in the two modes. Sum-product applies it
 to factor energies during inference; min-sum applies it only when mapping a
@@ -659,18 +672,24 @@ tolerance controls.
 Sum-product writes `<base>_bp_sum_product_p0.obj` through `_p9.obj` and
 `<base>_bp_sum_product_consistency.csv`, separately from min-sum artifacts.
 The CSV records its inference name, temperature, and convergence status. The
-soft same-label diagnostic remains an endpoint-independence proxy; it is not a
+soft mismatch diagnostic remains an endpoint-independence proxy; it is not a
 sum-product pairwise marginal.
 
 Add `--bp-inference sum-product-mixed` to test an explicit categorical
 V/Mixed/H variable. Mixed means an orientation defect, not a third physical
-direction. Its pairwise energies are:
+direction. After the same merged-factor normalization, its pairwise energies
+are:
 
 ```text
-E(V,V) = E(H,H) = E_same
-E(V,H) = E(H,V) = E_diff
+E(V,V) = E(H,H) = normalized_E_same
+E(V,H) = E(H,V) = normalized_E_diff
 E(Mixed,*) = E(*,Mixed) = 0
 ```
+
+At least one normalized oriented energy is therefore zero. An indecisive or
+exactly canceled factor has both energies zero and is omitted, so it cannot
+spuriously favor Mixed merely because the unnormalized oriented costs shared a
+positive constant offset.
 
 Every non-seed fiber assigned Mixed instead pays one node-local unary energy
 `U(Mixed)=mixed_unary_cost`, with `U(V)=U(H)=0`. Set it with
@@ -695,6 +714,9 @@ legacy H/V band visualization and explicitly labeled heuristic consistency
 output. It is not `P(H)` and is not a calibrated binary marginal. Direct Mixed
 diagnostics report a tie-aware `p_mixed` AUROC, state-marginal summaries, and
 an argmax V/Mixed/H confusion table with exact ties in a separate column.
+Mixed-state soft mismatch and neighbor-support diagnostics use the explicit
+V/Mixed/H probabilities instead: Mixed endpoint mass contributes no orientation
+violation or neighbor support.
 
 This mode owns `<base>_bp_sum_product_mixed_p0.obj` through `_p9.obj` for the
 orientation projection, `<base>_bp_sum_product_mixed_mixed_p0.obj` through

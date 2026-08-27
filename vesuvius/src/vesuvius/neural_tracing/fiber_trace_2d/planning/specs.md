@@ -5022,26 +5022,35 @@
 
 ### Binary BP constraint-consistency diagnostic
 
-- `direction-ablation --bp-only --perpendicular-only` processes only the final
-  admitted cohort and must not call the HiGHS MILP or LP solvers. It requires
-  exactly one constraint piece per represented fiber. Optional strength
-  pruning precedes the shared labeling constraint selector; BP receives the
-  selector's retained constraints in their original order. Hard continuity or
-  non-complementary/non-perpendicular evidence then fails explicitly.
+- `direction-ablation --bp-only` processes only the final admitted cohort and
+  must not call the HiGHS MILP or LP solvers. It requires exactly one constraint
+  piece per represented fiber. Optional strength pruning precedes the shared
+  labeling constraint selector; BP receives the selector's retained constraints
+  in their original order. `--perpendicular-only` optionally restricts the
+  graph; without it, complementary parallel and perpendicular evidence in
+  `[0,1]` is accepted. Hard continuity or non-complementary evidence fails.
 - BP merges measurements by unordered represented-fiber pair. A merged
   factor's same cost is `sum(1-p_k)`, different cost is `sum(p_k)`, strength is
-  `abs(same-different)`, and every accepted factor must prefer different
-  labels. Degree counts unique factors while incident-measurement count retains
-  the number of merged measurements.
+  `abs(same-different)`, and the lower-cost relation may be same or different.
+  Before inference, subtract `min(same,different)` from both oriented costs, so
+  only decisiveness remains. An exact tie is omitted from the effective graph,
+  degree, components, and mismatch accounting; neutral merged-factor and raw-
+  measurement counts are reported separately. Near-ties retain their exact
+  sign and nonzero strength without an epsilon. Degree counts effective unique
+  factors while incident-measurement count retains effective raw measurements.
 - Consistency diagnostics resolve `h<=0.25` as V and `h>=0.75` as H, inclusively.
-  Hard mismatch count is the number of resolved incident factors whose labels
-  are equal. Its unweighted denominator is resolved degree and its weighted
-  denominator is resolved strength. Incident factors with either endpoint
-  unresolved contribute instead to unresolved degree and strength. Zero
-  denominators are undefined, written as `NA`, and excluded from summaries.
-- The soft same-label proxy is the strength-weighted mean of
-  `h_i*h_j+(1-h_i)*(1-h_j)`. It assumes independent endpoint values and is not
-  a calibrated pair marginal. Neighbor support balance is
+  Hard mismatch count is the number of resolved incident factors whose observed
+  equal/different relation disagrees with the factor's lower-cost relation. Its
+  unweighted denominator is resolved degree and its weighted denominator is
+  resolved strength. Incident factors with either endpoint unresolved
+  contribute instead to unresolved degree and strength. Zero denominators are
+  undefined, written as `NA`, and excluded from summaries.
+- The binary soft mismatch proxy is the strength-weighted independent-endpoint
+  probability of violating the preferred relation: `1-q_same` for a
+  same-preferring factor and `q_same` for a different-preferring factor, where
+  `q_same=h_i*h_j+(1-h_i)*(1-h_j)`. It is not a calibrated pair marginal.
+  Neighbor support maps the neighbor H/V evidence through the preferred same
+  or different relation. Neighbor support balance is
   `2*min(sum(w*(1-h_j)),sum(w*h_j))/sum(w)` and must be interpreted with the
   separately reported mean neighbor certainty
   `sum(w*abs(2*h_j-1))/sum(w)`.
@@ -5077,13 +5086,15 @@
   energies in sum-product; it remains only a post-hoc min-marginal display
   scale in min-sum. Sum-product owns `<base>_bp_sum_product_p0.obj` through
   `_p9.obj` and `<base>_bp_sum_product_consistency.csv`, which records its
-  inference name, temperature, and status. The existing soft same-label value
-  remains an endpoint-independence proxy rather than a pairwise marginal.
+  inference name, temperature, and status. The soft mismatch value remains an
+  endpoint-independence proxy rather than a pairwise marginal.
 - `--bp-inference sum-product-mixed` is a separate experimental categorical
-  V/Mixed/H solver over the same merged perpendicular graph. Mixed denotes an
-  orientation defect, not a third direction. Oriented pairs retain
+  V/Mixed/H solver over the same merged orientation graph. Mixed denotes an
+  orientation defect, not a third direction. Oriented pairs use the normalized
   `E_same`/`E_diff`; every pairwise energy with at least one Mixed endpoint is
-  zero. Each non-seed node instead has unary energies `U(V)=U(H)=0` and
+  zero. Normalization ensures at least one oriented relation also has zero
+  energy, so a common raw factor offset cannot favor Mixed. Each non-seed node
+  instead has unary energies `U(V)=U(H)=0` and
   `U(Mixed)=bp_mixed_cost`. The unary is charged exactly once per node,
   independent of degree or merged measurement count. `--bp-mixed-cost` must
   be finite and nonnegative and is invalid outside this inference mode.
@@ -5094,7 +5105,8 @@
   -E(s,t)/T)` followed by normalization. The final marginal uses the same
   unary plus all incoming messages. A cavity clamped to Mixed sends a uniform
   factor message; a soft cavity may still transmit evidence from its residual
-  V/H mass. The common factor offset, when used, applies to all nine energies.
+  V/H mass. Merged oriented energies subtract their common minimum before the
+  3x3 potential is formed; Mixed entries remain zero.
 - The central seed is exactly H. An isolated unseeded node has uniform
   marginals only when `bp_mixed_cost=0`; otherwise its V/Mixed/H probabilities
   are proportional to `(1,exp(-bp_mixed_cost/T),1)`. Any unseeded connected
@@ -5106,6 +5118,11 @@
   explicitly named heuristic consistency output but must not be called `P(H)`
   or treated as a calibrated binary marginal. Mixed discrimination uses the
   gauge-invariant `p_mixed` directly.
+- Ternary soft mismatch uses explicit state marginals. For a same-preferring
+  factor its violation probability is `pV_i*pH_j+pH_i*pV_j`; for a different-
+  preferring factor it is `pV_i*pV_j+pH_i*pH_j`. Terms involving Mixed are zero.
+  Neighbor support similarly maps only explicit neighbor V/H mass through the
+  preferred relation, and ternary neighbor certainty is `abs(pH-pV)`.
 - Ternary owns `<base>_bp_sum_product_mixed_p0..p9.obj` projection bands,
   `<base>_bp_sum_product_mixed_mixed_p0..p9.obj` Mixed-probability bands, and
   `<base>_bp_sum_product_mixed_consistency.csv` containing the three

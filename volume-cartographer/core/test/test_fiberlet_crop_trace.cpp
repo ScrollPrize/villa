@@ -2700,6 +2700,24 @@ std::vector<std::array<double, 3>> bruteForceMixedBpMarginals(
     double temperature,
     double mixedCost)
 {
+    struct PairCost {
+        double same = 0.0;
+        double different = 0.0;
+    };
+    std::map<std::pair<std::size_t, std::size_t>, PairCost> merged;
+    for (const auto& constraint : constraints.constraints) {
+        const auto key = std::minmax(
+            constraint.pieceA, constraint.pieceB);
+        auto& cost = merged[{key.first, key.second}];
+        cost.same += 1.0 - constraint.parallelScore;
+        cost.different += constraint.parallelScore;
+    }
+    for (auto& [key, cost] : merged) {
+        (void)key;
+        const double common = std::min(cost.same, cost.different);
+        cost.same -= common;
+        cost.different -= common;
+    }
     std::vector<std::array<double, 3>> stateWeights(count);
     double partition = 0.0;
     std::size_t assignments = 1;
@@ -2719,13 +2737,13 @@ std::vector<std::array<double, 3>> bruteForceMixedBpMarginals(
             if (state == 1)
                 energy += mixedCost;
         }
-        for (const auto& constraint : constraints.constraints) {
-            const std::size_t a = states[constraint.pieceA];
-            const std::size_t b = states[constraint.pieceB];
+        for (const auto& [key, cost] : merged) {
+            const std::size_t a = states[key.first];
+            const std::size_t b = states[key.second];
             if (a != 1 && b != 1) {
                 energy += a == b
-                    ? 1.0 - constraint.parallelScore
-                    : constraint.parallelScore;
+                    ? cost.same
+                    : cost.different;
             }
         }
         const double weight = std::exp(-energy / temperature);
@@ -2855,7 +2873,7 @@ TEST_CASE("Binary min-sum BP balance modes move weighted H fraction")
     CHECK_FALSE(infeasible.balanceConverged);
 }
 
-TEST_CASE("Binary min-sum BP rejects split and non-perpendicular inputs")
+TEST_CASE("Binary min-sum BP accepts full orientation evidence")
 {
     const auto lines = bpLines(2);
     auto constraints = bpConstraints(lines.size());
@@ -2867,16 +2885,30 @@ TEST_CASE("Binary min-sum BP rejects split and non-perpendicular inputs")
 
     constraints = bpConstraints(lines.size());
     addBpConstraint(constraints, 0, 1, 0.75);
-    CHECK_THROWS_WITH_AS(
-        solveFiberTraceBeliefPropagation(lines, constraints, bpConfig()),
-        doctest::Contains("perpendicular"),
-        std::invalid_argument);
+    const auto parallel = solveFiberTraceBeliefPropagation(
+        lines, constraints, bpConfig());
+    CHECK(parallel.horizontalness[0] == doctest::Approx(1.0));
+    CHECK(parallel.horizontalness[1] > 0.99);
     constraints.constraints.front().parallelScore = 0.0;
     constraints.constraints.front().perpendicularScore = 1.0;
     constraints.constraints.front().hardContinuity = true;
     CHECK_THROWS_WITH_AS(
         solveFiberTraceBeliefPropagation(lines, constraints, bpConfig()),
         doctest::Contains("continuity"),
+        std::invalid_argument);
+
+    constraints.constraints.front().hardContinuity = false;
+    constraints.constraints.front().parallelScore = -0.1;
+    constraints.constraints.front().perpendicularScore = 1.1;
+    CHECK_THROWS_WITH_AS(
+        solveFiberTraceBeliefPropagation(lines, constraints, bpConfig()),
+        doctest::Contains("orientation scores"),
+        std::invalid_argument);
+    constraints.constraints.front().parallelScore = 0.25;
+    constraints.constraints.front().perpendicularScore = 0.5;
+    CHECK_THROWS_WITH_AS(
+        solveFiberTraceBeliefPropagation(lines, constraints, bpConfig()),
+        doctest::Contains("orientation scores"),
         std::invalid_argument);
 }
 
@@ -2886,7 +2918,7 @@ TEST_CASE("Binary sum-product BP matches exact seeded tree marginals")
     auto constraints = bpConstraints(lines.size());
     addBpConstraint(constraints, 0, 1, 0.1);
     addBpConstraint(constraints, 1, 2, 0.2);
-    addBpConstraint(constraints, 1, 3, 0.35);
+    addBpConstraint(constraints, 1, 3, 0.8);
     addBpConstraint(constraints, 0, 1, 0.25);
 
     for (const double temperature : {0.25, 1.0}) {
@@ -2943,6 +2975,49 @@ TEST_CASE("Binary sum-product BP uses the expected perpendicular sign")
     CHECK(report.horizontalness[1] ==
           doctest::Approx(expected).epsilon(1.0e-10));
     CHECK(report.logOdds[1] == doctest::Approx(-2.0).epsilon(1.0e-10));
+}
+
+TEST_CASE("BP drops exactly neutral merged orientation factors")
+{
+    const auto lines = bpLines(3);
+    auto constraints = bpConstraints(lines.size());
+    addBpConstraint(constraints, 0, 1, 0.5);
+    addBpConstraint(constraints, 1, 2, 0.0);
+    addBpConstraint(constraints, 1, 2, 1.0);
+
+    auto config = bpConfig();
+    config.horizontalnessTemperature = 0.5;
+    config.mixedUnaryCost = 0.7;
+    const auto binary = solveFiberTraceSumProduct(
+        lines, constraints, config);
+    const auto mixed = solveFiberTraceMixedSumProduct(
+        lines, constraints, config);
+    for (const auto* report : {&binary, &mixed}) {
+        CHECK(report->factors == 0);
+        CHECK(report->mergedMeasurements == 0);
+        CHECK(report->neutralFactors == 2);
+        CHECK(report->neutralMeasurements == 3);
+        CHECK(report->connectedComponents == 3);
+        CHECK(report->isolatedTraces == 3);
+    }
+
+    const double mixedWeight = std::exp(
+        -config.mixedUnaryCost / config.horizontalnessTemperature);
+    const double normalization = 2.0 + mixedWeight;
+    CHECK(mixed.verticalProbability[1] ==
+          doctest::Approx(1.0 / normalization));
+    CHECK(mixed.mixedProbability[1] ==
+          doctest::Approx(mixedWeight / normalization));
+    CHECK(mixed.horizontalProbability[1] ==
+          doctest::Approx(1.0 / normalization));
+
+    constraints = bpConstraints(lines.size());
+    addBpConstraint(constraints, 0, 1, 0.500001);
+    const auto nearTie = solveFiberTraceSumProduct(
+        lines, constraints, config);
+    CHECK(nearTie.factors == 1);
+    CHECK(nearTie.neutralFactors == 0);
+    CHECK(nearTie.connectedComponents == 2);
 }
 
 TEST_CASE("Binary sum-product BP preserves unsupported gauge uncertainty")
@@ -3035,7 +3110,7 @@ TEST_CASE("Mixed-state sum-product BP matches exact seeded tree marginals")
     addBpConstraint(constraints, 0, 1, 0.1);
     addBpConstraint(constraints, 0, 1, 0.25);
     addBpConstraint(constraints, 1, 2, 0.2);
-    addBpConstraint(constraints, 1, 3, 0.35);
+    addBpConstraint(constraints, 1, 3, 0.8);
 
     for (const double temperature : {0.25, 1.0}) {
         auto config = bpConfig();
@@ -3264,26 +3339,26 @@ TEST_CASE("BP consistency separates resolved mismatches and uncertainty")
     CHECK(center.hardMismatches == 1);
     REQUIRE(center.hardMismatchRate);
     REQUIRE(center.weightedHardMismatchRate);
-    REQUIRE(center.softSameLabelProxy);
+    REQUIRE(center.softMismatchProxy);
     REQUIRE(center.neighborSupportBalance);
     REQUIRE(center.neighborCertainty);
     CHECK(*center.hardMismatchRate == doctest::Approx(0.5));
     CHECK(*center.weightedHardMismatchRate == doctest::Approx(0.5));
-    CHECK(*center.softSameLabelProxy == doctest::Approx(0.5));
+    CHECK(*center.softMismatchProxy == doctest::Approx(0.5));
     CHECK(*center.neighborSupportBalance == doctest::Approx(1.0));
     CHECK(*center.neighborCertainty == doctest::Approx(2.0 / 3.0));
     CHECK(center.incidentMeasurements == 4);
 
     CHECK(report.traces[1].hardMismatches == 0);
-    CHECK(*report.traces[1].softSameLabelProxy == doctest::Approx(0.0));
+    CHECK(*report.traces[1].softMismatchProxy == doctest::Approx(0.0));
     CHECK(*report.traces[2].hardMismatchRate == doctest::Approx(1.0));
     CHECK(report.traces[3].unresolvedDegree == 1);
-    CHECK(*report.traces[3].softSameLabelProxy == doctest::Approx(0.5));
+    CHECK(*report.traces[3].softMismatchProxy == doctest::Approx(0.5));
     CHECK(report.traces[4].degree == 0);
     CHECK(report.traces[4].totalStrength == doctest::Approx(0.0));
     CHECK_FALSE(report.traces[4].hardMismatchRate);
     CHECK_FALSE(report.traces[4].weightedHardMismatchRate);
-    CHECK_FALSE(report.traces[4].softSameLabelProxy);
+    CHECK_FALSE(report.traces[4].softMismatchProxy);
     CHECK_FALSE(report.traces[4].neighborSupportBalance);
     CHECK_FALSE(report.traces[4].neighborCertainty);
 
@@ -3310,7 +3385,7 @@ TEST_CASE("BP consistency separates resolved mismatches and uncertainty")
             CHECK(actual->hardMismatchRate == expected.hardMismatchRate);
             CHECK(actual->weightedHardMismatchRate ==
                   expected.weightedHardMismatchRate);
-            CHECK(actual->softSameLabelProxy == expected.softSameLabelProxy);
+            CHECK(actual->softMismatchProxy == expected.softMismatchProxy);
             CHECK(actual->neighborSupportBalance ==
                   expected.neighborSupportBalance);
             CHECK(actual->neighborCertainty == expected.neighborCertainty);
@@ -3332,6 +3407,45 @@ TEST_CASE("BP consistency separates resolved mismatches and uncertainty")
         analyzeFiberTraceConstraintConsistency(invalid, horizontalness),
         doctest::Contains("complementary"),
         std::invalid_argument);
+}
+
+TEST_CASE("BP consistency respects parallel and perpendicular relations")
+{
+    auto constraints = bpConstraints(3);
+    addBpConstraint(constraints, 0, 1, 1.0);
+    addBpConstraint(constraints, 0, 2, 0.0);
+    const std::vector<double> horizontalness{1.0, 1.0, 0.0};
+    const auto report = analyzeFiberTraceConstraintConsistency(
+        constraints, horizontalness);
+    const auto& center = report.traces[0];
+    CHECK(center.degree == 2);
+    CHECK(center.hardMismatches == 0);
+    CHECK(center.hardMismatchRate == doctest::Approx(0.0));
+    CHECK(center.weightedHardMismatchRate == doctest::Approx(0.0));
+    CHECK(center.softMismatchProxy == doctest::Approx(0.0));
+    CHECK(center.neighborSupportBalance == doctest::Approx(0.0));
+    CHECK(center.neighborCertainty == doctest::Approx(1.0));
+
+    const std::vector<double> wrong{1.0, 0.0, 1.0};
+    const auto mismatched = analyzeFiberTraceConstraintConsistency(
+        constraints, wrong);
+    CHECK(mismatched.traces[0].hardMismatches == 2);
+    CHECK(mismatched.traces[0].hardMismatchRate == doctest::Approx(1.0));
+    CHECK(mismatched.traces[0].softMismatchProxy == doctest::Approx(1.0));
+
+    const std::vector<double> vertical{0.0, 0.0, 0.0};
+    const std::vector<double> mixed{0.0, 1.0, 0.0};
+    const std::vector<double> horizontal{1.0, 0.0, 1.0};
+    auto parallelOnly = bpConstraints(2);
+    addBpConstraint(parallelOnly, 0, 1, 1.0);
+    const auto ternary = analyzeMixedFiberTraceConstraintConsistency(
+        parallelOnly,
+        std::span<const double>{vertical.data(), 2},
+        std::span<const double>{mixed.data(), 2},
+        std::span<const double>{horizontal.data(), 2});
+    CHECK(ternary.traces[0].softMismatchProxy == doctest::Approx(0.0));
+    CHECK_FALSE(ternary.traces[0].neighborSupportBalance);
+    CHECK(ternary.traces[0].neighborCertainty == doctest::Approx(0.0));
 }
 
 TEST_CASE("Label constraint selection is shared and preserves hard links")

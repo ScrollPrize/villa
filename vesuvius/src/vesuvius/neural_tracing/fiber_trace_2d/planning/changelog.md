@@ -1474,3 +1474,7 @@
 - Replaced measurement-scaled defect factors with a node-local Mixed unary and
   conditionally neutral Mixed factor rows/columns, preventing Mixed labels from
   propagating transitively through otherwise orientation-only constraints.
+- Enabled combined parallel/perpendicular BP evidence, normalized merged
+  factors to their decisiveness gap, omitted exact neutral cancellations, and
+  generalized binary and ternary consistency diagnostics to each factor's
+  preferred same/different relation.

@@ -618,11 +618,6 @@ Options parse(int argc, char** argv)
                 FiberTraceBeliefInference::SumProductMixed) {
             fail("--bp-mixed-cost requires --bp-inference sum-product-mixed");
         }
-        if ((options.bpOnly ||
-             options.bpBalance != BpBalanceSelection::None) &&
-            !options.labeling.perpendicularOnly) {
-            fail("BP requires --perpendicular-only");
-        }
         if ((options.bpBalance == BpBalanceSelection::Tight ||
              options.bpBalance == BpBalanceSelection::Both) &&
             options.bp.maximumBalanceIterations < 2) {
@@ -1180,9 +1175,14 @@ void writeAndPrintBpReport(
         }
         return "invalid";
     };
-    const auto consistency =
-        vc::fiber_tracer::analyzeFiberTraceConstraintConsistency(
-            constraints, report.horizontalness);
+    const auto consistency = mixedState
+        ? vc::fiber_tracer::analyzeMixedFiberTraceConstraintConsistency(
+              constraints,
+              report.verticalProbability,
+              report.mixedProbability,
+              report.horizontalProbability)
+        : vc::fiber_tracer::analyzeFiberTraceConstraintConsistency(
+              constraints, report.horizontalness);
     const auto csv = output.parent_path() /
         (output.stem().string() + "_bp_" + artifactName +
          "_consistency.csv");
@@ -1203,7 +1203,7 @@ void writeAndPrintBpReport(
            "total_strength,"
            "resolved_degree,resolved_strength,unresolved_degree,"
            "unresolved_strength,hard_mismatches,hard_mismatch_rate,"
-           "weighted_hard_mismatch_rate,soft_same_label_proxy,"
+           "weighted_hard_mismatch_rate,soft_mismatch_proxy,"
            "neighbor_support_balance,neighbor_certainty\n"
         << std::setprecision(17);
     const auto csvOptional = [&csvOutput](const std::optional<double>& value) {
@@ -1239,7 +1239,7 @@ void writeAndPrintBpReport(
         csvOutput << ',';
         csvOptional(current.weightedHardMismatchRate);
         csvOutput << ',';
-        csvOptional(current.softSameLabelProxy);
+        csvOptional(current.softMismatchProxy);
         csvOutput << ',';
         csvOptional(current.neighborSupportBalance);
         csvOutput << ',';
@@ -1253,6 +1253,7 @@ void writeAndPrintBpReport(
         std::cout
             << "fiber direction Mixed-state sum-product BP\n"
             << "inference  temperature  mixed_unary_cost  status  fibers  factors  measurements"
+               "  neutral_factors  neutral_measurements"
                "  components  isolated  seed  seed_ref  message_iterations"
                "  message_residual  achieved_orientation  min_orientation"
                "  mean_orientation  max_orientation  seconds\n"
@@ -1260,6 +1261,7 @@ void writeAndPrintBpReport(
             << report.mixedUnaryCost << "  "
             << report.status << "  " << lines.size() << "  " << report.factors
             << "  " << report.mergedMeasurements << "  "
+            << report.neutralFactors << "  " << report.neutralMeasurements << "  "
             << report.connectedComponents << "  " << report.isolatedTraces
             << "  " << report.seedTraceIndex << "  "
             << directionName(directions[report.seedTraceIndex]) << "  "
@@ -1271,11 +1273,13 @@ void writeAndPrintBpReport(
         std::cout
             << "fiber direction sum-product BP\n"
             << "inference  temperature  status  fibers  factors  measurements"
+               "  neutral_factors  neutral_measurements"
                "  components  isolated  seed  seed_ref  message_iterations"
                "  message_residual  achieved_h  min_h  mean_h  max_h  seconds\n"
             << inferenceName << "  " << report.inferenceTemperature << "  "
             << report.status << "  " << lines.size() << "  " << report.factors
             << "  " << report.mergedMeasurements << "  "
+            << report.neutralFactors << "  " << report.neutralMeasurements << "  "
             << report.connectedComponents << "  " << report.isolatedTraces
             << "  " << report.seedTraceIndex << "  "
             << directionName(directions[report.seedTraceIndex]) << "  "
@@ -1286,12 +1290,15 @@ void writeAndPrintBpReport(
     } else {
         std::cout
             << "fiber direction min-sum BP\n"
-            << "mode  status  fibers  factors  measurements  components"
+            << "mode  status  fibers  factors  measurements  neutral_factors"
+               "  neutral_measurements  components"
                "  isolated  seed  seed_ref  message_iterations"
                "  balance_iterations  message_residual  field  target_h"
                "  achieved_h  min_h  mean_h  max_h  seconds\n"
             << modeName << "  " << report.status << "  " << lines.size()
             << "  " << report.factors << "  " << report.mergedMeasurements
+            << "  " << report.neutralFactors << "  "
+            << report.neutralMeasurements
             << "  " << report.connectedComponents << "  "
             << report.isolatedTraces << "  " << report.seedTraceIndex << "  "
             << directionName(directions[report.seedTraceIndex]) << "  "
@@ -1438,9 +1445,7 @@ void writeAndPrintBpReport(
                   << "  " << quantile(values, 0.9)
                   << "  " << quantile(values, 1.0) << '\n';
     };
-    std::cout << (mixedState
-                      ? "fiber direction BP orientation-projection heuristic consistency\n"
-                      : "fiber direction BP constraint consistency\n")
+    std::cout << "fiber direction BP constraint consistency\n"
               << "reference  metric  valid_fibers  min  mean  median  p90  max\n";
     constexpr std::array<const char*, 9> names{
         "degree",
@@ -1449,7 +1454,7 @@ void writeAndPrintBpReport(
         "unresolved_rate",
         "hard_mismatch_rate",
         "weighted_hard_mismatch_rate",
-        "soft_same_label_proxy",
+        "soft_mismatch_proxy",
         "neighbor_support_balance",
         "neighbor_certainty",
     };
@@ -1474,7 +1479,7 @@ void writeAndPrintBpReport(
         case 5:
             return current.weightedHardMismatchRate;
         case 6:
-            return current.softSameLabelProxy;
+            return current.softMismatchProxy;
         case 7:
             return current.neighborSupportBalance;
         case 8:
@@ -1758,7 +1763,7 @@ int main(int argc, char** argv)
                             << " admitted=" << admittedCount
                             << " fibers=" << diagnosticLines.size()
                             << " pieces=" << bpConstraints.pieces.size()
-                            << " perpendicular_constraints="
+                            << " selected_constraints="
                             << bpConstraints.constraints.size() << '\n';
                         const auto runBp = [&] (
                                                vc::fiber_tracer::

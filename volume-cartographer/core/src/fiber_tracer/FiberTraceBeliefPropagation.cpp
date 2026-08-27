@@ -30,6 +30,8 @@ struct Graph {
     std::vector<Factor> factors;
     std::vector<std::vector<std::size_t>> adjacency;
     std::size_t measurements = 0;
+    std::size_t neutralFactors = 0;
+    std::size_t neutralMeasurements = 0;
     std::size_t components = 0;
     std::size_t isolated = 0;
 };
@@ -125,13 +127,13 @@ Graph buildGraph(
             !std::isfinite(constraint.perpendicularScore) ||
             constraint.parallelScore < 0.0 ||
             constraint.parallelScore > 1.0 ||
+            constraint.perpendicularScore < 0.0 ||
+            constraint.perpendicularScore > 1.0 ||
             std::abs(
                 constraint.parallelScore + constraint.perpendicularScore -
-                1.0) > 1.0e-9 ||
-            !(constraint.parallelScore < 0.5) ||
-            !(constraint.perpendicularScore > 0.5)) {
+                1.0) > 1.0e-9) {
             throw std::invalid_argument(
-                "BP requires complementary measured perpendicular scores");
+                "BP requires complementary measured orientation scores");
         }
         const std::size_t traceA = traceByPiece[constraint.pieceA];
         const std::size_t traceB = traceByPiece[constraint.pieceB];
@@ -157,11 +159,21 @@ Graph buildGraph(
     graph.factors.reserve(merged.size());
     for (const auto& [key, factor] : merged) {
         (void)key;
+        if (factor.sameCost == factor.differentCost) {
+            ++graph.neutralFactors;
+            graph.neutralMeasurements += factor.measurements;
+            continue;
+        }
+        auto normalized = factor;
+        const double commonCost = std::min(
+            normalized.sameCost, normalized.differentCost);
+        normalized.sameCost -= commonCost;
+        normalized.differentCost -= commonCost;
         const std::size_t index = graph.factors.size();
-        graph.factors.push_back(factor);
-        graph.adjacency[factor.a].push_back(index);
-        graph.adjacency[factor.b].push_back(index);
-        graph.measurements += factor.measurements;
+        graph.factors.push_back(normalized);
+        graph.adjacency[normalized.a].push_back(index);
+        graph.adjacency[normalized.b].push_back(index);
+        graph.measurements += normalized.measurements;
     }
 
     std::vector<unsigned char> visited(traceCount, 0);
@@ -237,6 +249,8 @@ FiberTraceBeliefPropagationReport initializeReport(
     report.seedTraceIndex = problem.seed;
     report.factors = problem.graph.factors.size();
     report.mergedMeasurements = problem.graph.measurements;
+    report.neutralFactors = problem.graph.neutralFactors;
+    report.neutralMeasurements = problem.graph.neutralMeasurements;
     report.connectedComponents = problem.graph.components;
     report.isolatedTraces = problem.graph.isolated;
     report.targetHorizontalFraction = config.targetHorizontalFraction;
@@ -921,10 +935,15 @@ FiberTraceBeliefPropagationReport solveFiberTraceMixedSumProduct(
     return report;
 }
 
-FiberTraceConstraintConsistencyReport
-analyzeFiberTraceConstraintConsistency(
+namespace
+{
+
+FiberTraceConstraintConsistencyReport analyzeConstraintConsistency(
     const FiberTraceConstraintReport& constraints,
     std::span<const double> horizontalnessValues,
+    std::span<const double> verticalProbabilities,
+    std::span<const double> mixedProbabilities,
+    std::span<const double> horizontalProbabilities,
     double verticalThreshold,
     double horizontalThreshold)
 {
@@ -943,6 +962,32 @@ analyzeFiberTraceConstraintConsistency(
         if (!std::isfinite(value) || value < 0.0 || value > 1.0) {
             throw std::invalid_argument(
                 "BP consistency horizontalness must be finite in [0, 1]");
+        }
+    }
+    const bool ternary = !verticalProbabilities.empty() ||
+        !mixedProbabilities.empty() || !horizontalProbabilities.empty();
+    if (ternary &&
+        (verticalProbabilities.size() != horizontalnessValues.size() ||
+         mixedProbabilities.size() != horizontalnessValues.size() ||
+         horizontalProbabilities.size() != horizontalnessValues.size())) {
+        throw std::invalid_argument(
+            "BP consistency ternary probabilities must match represented fibers");
+    }
+    if (ternary) {
+        for (std::size_t trace = 0;
+             trace < horizontalnessValues.size();
+             ++trace) {
+            const double vertical = verticalProbabilities[trace];
+            const double mixed = mixedProbabilities[trace];
+            const double horizontal = horizontalProbabilities[trace];
+            if (!std::isfinite(vertical) || !std::isfinite(mixed) ||
+                !std::isfinite(horizontal) || vertical < 0.0 ||
+                mixed < 0.0 || horizontal < 0.0 || vertical > 1.0 ||
+                mixed > 1.0 || horizontal > 1.0 ||
+                std::abs(vertical + mixed + horizontal - 1.0) > 1.0e-9) {
+                throw std::invalid_argument(
+                    "BP consistency ternary probabilities must be normalized in [0, 1]");
+            }
         }
     }
 
@@ -972,19 +1017,38 @@ analyzeFiberTraceConstraintConsistency(
             factor.sameCost - factor.differentCost);
         const double aValue = horizontalnessValues[factor.a];
         const double bValue = horizontalnessValues[factor.b];
+        const bool prefersSame = factor.sameCost < factor.differentCost;
+        const double aHorizontal = ternary
+            ? horizontalProbabilities[factor.a]
+            : aValue;
+        const double aVertical = ternary
+            ? verticalProbabilities[factor.a]
+            : 1.0 - aValue;
+        const double bHorizontal = ternary
+            ? horizontalProbabilities[factor.b]
+            : bValue;
+        const double bVertical = ternary
+            ? verticalProbabilities[factor.b]
+            : 1.0 - bValue;
         const double sameProbability =
-            aValue * bValue + (1.0 - aValue) * (1.0 - bValue);
+            aHorizontal * bHorizontal + aVertical * bVertical;
+        const double differentProbability =
+            aHorizontal * bVertical + aVertical * bHorizontal;
+        const double violationProbability = prefersSame
+            ? differentProbability
+            : sameProbability;
         const int aLabel = resolvedLabel(factor.a);
         const int bLabel = resolvedLabel(factor.b);
         const bool resolved = aLabel >= 0 && bLabel >= 0;
-        const bool mismatch = resolved && aLabel == bLabel;
+        const bool labelsSame = aLabel == bLabel;
+        const bool mismatch = resolved && labelsSame != prefersSame;
 
         for (const std::size_t trace : {factor.a, factor.b}) {
             auto& current = report.traces[trace];
             ++current.degree;
             current.incidentMeasurements += factor.measurements;
             current.totalStrength += strength;
-            weightedSoftMismatch[trace] += strength * sameProbability;
+            weightedSoftMismatch[trace] += strength * violationProbability;
             if (resolved) {
                 ++current.resolvedDegree;
                 current.resolvedStrength += strength;
@@ -997,12 +1061,18 @@ analyzeFiberTraceConstraintConsistency(
                 current.unresolvedStrength += strength;
             }
         }
-        horizontalSupport[factor.a] += strength * (1.0 - bValue);
-        verticalSupport[factor.a] += strength * bValue;
-        horizontalSupport[factor.b] += strength * (1.0 - aValue);
-        verticalSupport[factor.b] += strength * aValue;
-        neighborCertainty[factor.a] += strength * std::abs(2.0 * bValue - 1.0);
-        neighborCertainty[factor.b] += strength * std::abs(2.0 * aValue - 1.0);
+        horizontalSupport[factor.a] += strength *
+            (prefersSame ? bHorizontal : bVertical);
+        verticalSupport[factor.a] += strength *
+            (prefersSame ? bVertical : bHorizontal);
+        horizontalSupport[factor.b] += strength *
+            (prefersSame ? aHorizontal : aVertical);
+        verticalSupport[factor.b] += strength *
+            (prefersSame ? aVertical : aHorizontal);
+        neighborCertainty[factor.a] += strength *
+            std::abs(bHorizontal - bVertical);
+        neighborCertainty[factor.b] += strength *
+            std::abs(aHorizontal - aVertical);
     }
 
     for (std::size_t trace = 0; trace < report.traces.size(); ++trace) {
@@ -1017,7 +1087,7 @@ analyzeFiberTraceConstraintConsistency(
                 weightedHardMismatch[trace] / current.resolvedStrength;
         }
         if (current.totalStrength > 0.0) {
-            current.softSameLabelProxy =
+            current.softMismatchProxy =
                 weightedSoftMismatch[trace] / current.totalStrength;
             current.neighborCertainty =
                 neighborCertainty[trace] / current.totalStrength;
@@ -1030,6 +1100,54 @@ analyzeFiberTraceConstraintConsistency(
         }
     }
     return report;
+}
+
+}  // namespace
+
+FiberTraceConstraintConsistencyReport
+analyzeFiberTraceConstraintConsistency(
+    const FiberTraceConstraintReport& constraints,
+    std::span<const double> horizontalnessValues,
+    double verticalThreshold,
+    double horizontalThreshold)
+{
+    return analyzeConstraintConsistency(
+        constraints,
+        horizontalnessValues,
+        {},
+        {},
+        {},
+        verticalThreshold,
+        horizontalThreshold);
+}
+
+FiberTraceConstraintConsistencyReport
+analyzeMixedFiberTraceConstraintConsistency(
+    const FiberTraceConstraintReport& constraints,
+    std::span<const double> verticalProbabilities,
+    std::span<const double> mixedProbabilities,
+    std::span<const double> horizontalProbabilities,
+    double verticalThreshold,
+    double horizontalThreshold)
+{
+    if (verticalProbabilities.size() != mixedProbabilities.size() ||
+        verticalProbabilities.size() != horizontalProbabilities.size()) {
+        throw std::invalid_argument(
+            "BP consistency ternary probabilities must have equal sizes");
+    }
+    std::vector<double> horizontalnessValues(verticalProbabilities.size());
+    for (std::size_t trace = 0; trace < horizontalnessValues.size(); ++trace) {
+        horizontalnessValues[trace] = horizontalProbabilities[trace] +
+            0.5 * mixedProbabilities[trace];
+    }
+    return analyzeConstraintConsistency(
+        constraints,
+        horizontalnessValues,
+        verticalProbabilities,
+        mixedProbabilities,
+        horizontalProbabilities,
+        verticalThreshold,
+        horizontalThreshold);
 }
 
 }  // namespace vc::fiber_tracer

@@ -49,6 +49,8 @@ struct FiberTraceBeliefPropagationReport {
     std::size_t seedTraceIndex = 0;
     std::size_t factors = 0;
     std::size_t mergedMeasurements = 0;
+    std::size_t neutralFactors = 0;
+    std::size_t neutralMeasurements = 0;
     std::size_t connectedComponents = 0;
     std::size_t isolatedTraces = 0;
     std::size_t messageIterations = 0;
@@ -78,7 +80,7 @@ struct FiberTraceConstraintConsistency {
     double unresolvedStrength = 0.0;
     std::optional<double> hardMismatchRate;
     std::optional<double> weightedHardMismatchRate;
-    std::optional<double> softSameLabelProxy;
+    std::optional<double> softMismatchProxy;
     std::optional<double> neighborSupportBalance;
     std::optional<double> neighborCertainty;
 };
@@ -117,6 +119,15 @@ solveFiberTraceMixedSumProduct(
 analyzeFiberTraceConstraintConsistency(
     const FiberTraceConstraintReport& constraints,
     std::span<const double> horizontalness,
+    double verticalThreshold = 0.25,
+    double horizontalThreshold = 0.75);
+
+[[nodiscard]] FiberTraceConstraintConsistencyReport
+analyzeMixedFiberTraceConstraintConsistency(
+    const FiberTraceConstraintReport& constraints,
+    std::span<const double> verticalProbability,
+    std::span<const double> mixedProbability,
+    std::span<const double> horizontalProbability,
     double verticalThreshold = 0.25,
     double horizontalThreshold = 0.75);
 
