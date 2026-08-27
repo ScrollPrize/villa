@@ -2235,6 +2235,32 @@ TEST_CASE("Fiber value bands use fixed boundaries and short OBJ names")
                   ("384_p" + std::to_string(band) + ".obj"));
         CHECK(std::filesystem::exists(paths.bands[band]));
     }
+
+    const std::vector states{
+        FiberTernaryState::Vertical,
+        FiberTernaryState::Mixed,
+        FiberTernaryState::Horizontal,
+        FiberTernaryState::Tie,
+        FiberTernaryState::Vertical,
+        FiberTernaryState::Mixed,
+    };
+    const auto statePaths = writeFiberletCropTernaryStateObjs(
+        lines, states, directory.path / "fibers_bp");
+    CHECK(statePaths.vertical == directory.path / "fibers_bp_v.obj");
+    CHECK(statePaths.mixed == directory.path / "fibers_bp_mixed.obj");
+    CHECK(statePaths.horizontal == directory.path / "fibers_bp_h.obj");
+    CHECK(statePaths.tie == directory.path / "fibers_bp_tie.obj");
+    const auto read = [](const std::filesystem::path& path) {
+        std::ifstream input(path);
+        std::ostringstream text;
+        text << input.rdbuf();
+        return text.str();
+    };
+    CHECK(read(statePaths.vertical).find("fiber_000000") != std::string::npos);
+    CHECK(read(statePaths.vertical).find("fiber_000004") != std::string::npos);
+    CHECK(read(statePaths.mixed).find("fiber_000001") != std::string::npos);
+    CHECK(read(statePaths.horizontal).find("fiber_000002") != std::string::npos);
+    CHECK(read(statePaths.tie).find("fiber_000003") != std::string::npos);
 }
 
 TEST_CASE("Trace labeling LP enforces triangle-consistent differences")

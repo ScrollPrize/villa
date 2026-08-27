@@ -135,6 +135,20 @@ struct FiberValueBands {
     std::array<FiberValueBand, 10> bands;
 };
 
+enum class FiberTernaryState : unsigned char {
+    Vertical,
+    Mixed,
+    Horizontal,
+    Tie,
+};
+
+struct FiberTernaryStateObjPaths {
+    std::filesystem::path vertical;
+    std::filesystem::path mixed;
+    std::filesystem::path horizontal;
+    std::filesystem::path tie;
+};
+
 struct FiberValueBandObjPaths {
     std::array<std::filesystem::path, 10> bands;
 };
@@ -181,6 +195,11 @@ void writeFiberletCropQualityArtifacts(
 [[nodiscard]] FiberValueBandObjPaths writeFiberletCropValueBandObjs(
     const std::vector<FiberletCropTraceLine>& lines,
     const FiberValueBands& bands,
+    const std::filesystem::path& outputBase);
+
+[[nodiscard]] FiberTernaryStateObjPaths writeFiberletCropTernaryStateObjs(
+    const std::vector<FiberletCropTraceLine>& lines,
+    std::span<const FiberTernaryState> states,
     const std::filesystem::path& outputBase);
 
 }  // namespace vc::fiber_tracer

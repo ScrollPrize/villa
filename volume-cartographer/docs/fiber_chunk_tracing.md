@@ -690,7 +690,9 @@ This mode owns `<base>_bp_sum_product_mixed_p0.obj` through `_p9.obj` for the
 orientation projection, `<base>_bp_sum_product_mixed_mixed_p0.obj` through
 `_p9.obj` for `P(Mixed)`, and
 `<base>_bp_sum_product_mixed_consistency.csv` with all three probabilities.
-Like binary sum-product, it rejects population-balance controls.
+It also writes the direct argmax partition as `<base>_bp_v.obj`,
+`<base>_bp_mixed.obj`, `<base>_bp_h.obj`, and `<base>_bp_tie.obj`. Like binary
+sum-product, it rejects population-balance controls.
 
 ## Quality groups
 

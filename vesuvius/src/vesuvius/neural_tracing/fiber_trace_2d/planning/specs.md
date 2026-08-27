@@ -5104,3 +5104,7 @@
   `<base>_bp_sum_product_mixed_mixed_p0..p9.obj` Mixed-probability bands, and
   `<base>_bp_sum_product_mixed_consistency.csv` containing the three
   probabilities, projection, inference temperature, Mixed cost, and status.
+  It additionally owns the mutually exclusive argmax layers `<base>_bp_v.obj`,
+  `<base>_bp_mixed.obj`, `<base>_bp_h.obj`, and `<base>_bp_tie.obj`; every
+  represented fiber occurs in exactly one layer and exact ties are never
+  silently assigned to Mixed.

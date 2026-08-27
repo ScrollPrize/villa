@@ -62,3 +62,8 @@
   `data/workdir3/fiber-crop-1024/` as `fibers_initial_*`,
   `fibers_bp_sum_product_mixed_*`, and the consistency CSV. The superseded
   `bp-mixed/` subdirectory and temporary sweep outputs were removed.
+- Added direct mutually exclusive BP argmax OBJ layers with short main-directory
+  names: `fibers_bp_h.obj`, `fibers_bp_v.obj`, `fibers_bp_mixed.obj`, and
+  `fibers_bp_tie.obj`. The probability-band files remain available for
+  threshold inspection, while the new layers show the exact confusion-table
+  assignment without reconstructing it from deciles.

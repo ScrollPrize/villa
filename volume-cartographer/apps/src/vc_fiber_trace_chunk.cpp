@@ -1316,6 +1316,8 @@ void writeAndPrintBpReport(
     }
     if (mixedState) {
         std::array<std::array<std::size_t, 4>, 3> confusion{};
+        std::vector<vc::fiber_tracer::FiberTernaryState> predictions(
+            lines.size(), vc::fiber_tracer::FiberTernaryState::Tie);
         std::vector<double> mixedReferences;
         std::vector<double> trustedReferences;
         for (std::size_t trace = 0; trace < lines.size(); ++trace) {
@@ -1333,6 +1335,10 @@ void writeAndPrintBpReport(
                       probabilities.begin(),
                       std::find(probabilities.begin(), probabilities.end(), maximum)))
                 : 3;
+            if (prediction < 3) {
+                predictions[trace] = static_cast<
+                    vc::fiber_tracer::FiberTernaryState>(prediction);
+            }
             ++confusion[static_cast<std::size_t>(directions[trace])][prediction];
             if (directions[trace] ==
                 vc::fiber_tracer::FiberDirectionGroup::Mixed) {
@@ -1399,6 +1405,17 @@ void writeAndPrintBpReport(
                   << mixedPaths->bands.front().parent_path() /
                         (output.stem().string() + "_bp_" + artifactName + "_mixed")
                   << '\n';
+        const auto statePaths = vc::fiber_tracer::
+            writeFiberletCropTernaryStateObjs(
+                lines,
+                predictions,
+                output.parent_path() / (output.stem().string() + "_bp"));
+        std::cout << "fiber direction explicit state OBJ layers\n"
+                  << "state  path\n"
+                  << "v  " << statePaths.vertical << '\n'
+                  << "mixed  " << statePaths.mixed << '\n'
+                  << "h  " << statePaths.horizontal << '\n'
+                  << "tie  " << statePaths.tie << '\n';
     }
     const auto printConsistencyMetric = [&] (
                                             const char* reference,

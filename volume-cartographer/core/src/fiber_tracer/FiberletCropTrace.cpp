@@ -1346,4 +1346,43 @@ FiberValueBandObjPaths writeFiberletCropValueBandObjs(
     return paths;
 }
 
+FiberTernaryStateObjPaths writeFiberletCropTernaryStateObjs(
+    const std::vector<FiberletCropTraceLine>& lines,
+    std::span<const FiberTernaryState> states,
+    const std::filesystem::path& outputBase)
+{
+    if (states.size() != lines.size()) {
+        throw std::invalid_argument(
+            "Fiber ternary states do not match crop traces");
+    }
+    const auto sibling = [&] (const char* suffix) {
+        return outputBase.parent_path() /
+            (outputBase.stem().string() + suffix + ".obj");
+    };
+    const FiberTernaryStateObjPaths paths{
+        sibling("_v"),
+        sibling("_mixed"),
+        sibling("_h"),
+        sibling("_tie"),
+    };
+    std::array<std::vector<vc::core::io::NamedPolyline>, 4> grouped;
+    for (std::size_t index = 0; index < lines.size(); ++index) {
+        grouped[static_cast<std::size_t>(states[index])].push_back({
+            fiberName(lines[index], index), lines[index].pointsBaseXYZ});
+    }
+    constexpr std::array<const char*, 4> comments{
+        "VC3D Fiberlet crop traces: BP vertical argmax",
+        "VC3D Fiberlet crop traces: BP Mixed argmax",
+        "VC3D Fiberlet crop traces: BP horizontal argmax",
+        "VC3D Fiberlet crop traces: BP exact argmax tie",
+    };
+    const std::array outputPaths{
+        paths.vertical, paths.mixed, paths.horizontal, paths.tie};
+    for (std::size_t group = 0; group < grouped.size(); ++group) {
+        vc::core::io::writePolylinesObj(
+            grouped[group], outputPaths[group], comments[group]);
+    }
+    return paths;
+}
+
 }  // namespace vc::fiber_tracer
