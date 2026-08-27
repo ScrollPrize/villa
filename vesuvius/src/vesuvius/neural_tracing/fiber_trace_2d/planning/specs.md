@@ -5105,7 +5105,7 @@
   `2*min(sum(w*(1-h_j)),sum(w*h_j))/sum(w)` and must be interpreted with the
   separately reported mean neighbor certainty
   `sum(w*abs(2*h_j-1))/sum(w)`.
-- `<base>_bp_none_consistency.csv` has stable global piece, original source
+- `<base>_consistency.csv` has stable global piece, original source
   trace, source-local piece, and begin/end base-arc identities, initial
   reference group, BP status and thresholds, horizontalness,
   degree/measurement/strength partitions, hard mismatch fields, and the three
@@ -5136,10 +5136,10 @@
 - Sum-product rejects all population-balance modes and balance-only target,
   strength, iteration, and tolerance controls. Temperature scales factor
   energies in sum-product; it remains only a post-hoc min-marginal display
-  scale in min-sum. Sum-product owns `<base>_bp_sum_product_p0.obj` through
-  `_p9.obj` and `<base>_bp_sum_product_consistency.csv`, which records its
-  inference name, temperature, and status. The soft mismatch value remains an
-  endpoint-independence proxy rather than a pairwise marginal.
+  scale in min-sum. BP owns `<base>_orientation_p0.obj` through `_p9.obj` and
+  `<base>_consistency.csv`, which records its inference name, temperature, and
+  status. A later run replaces the current-result artifacts. The soft mismatch
+  value remains an endpoint-independence proxy rather than a pairwise marginal.
 - `--bp-inference sum-product-mixed` is a separate experimental categorical
   V/Mixed/H solver over the same merged orientation graph. Mixed denotes an
   orientation defect, not a third direction. Oriented pairs use the normalized
@@ -5176,13 +5176,13 @@
   preferring factor it is `pV_i*pV_j+pH_i*pH_j`. Terms involving Mixed are zero.
   Neighbor support similarly maps only explicit neighbor V/H mass through the
   preferred relation, and ternary neighbor certainty is `abs(pH-pV)`.
-- Ternary owns `<base>_bp_sum_product_mixed_p0..p9.obj` projection bands,
-  `<base>_bp_sum_product_mixed_mixed_p0..p9.obj` Mixed-probability bands, and
-  `<base>_bp_sum_product_mixed_consistency.csv` containing the three
+- Ternary owns `<base>_orientation_p0..p9.obj` projection bands,
+  `<base>_error_probability_p0..p9.obj` Mixed/error-probability bands, and
+  `<base>_consistency.csv` containing the three
   probabilities, projection, inference temperature, Mixed unary cost, and
   status.
-  It additionally owns the mutually exclusive argmax layers `<base>_bp_v.obj`,
-  `<base>_bp_mixed.obj`, `<base>_bp_h.obj`, and `<base>_bp_tie.obj`; every
+  It additionally owns the mutually exclusive argmax layers `<base>_v.obj`,
+  `<base>_err.obj`, `<base>_h.obj`, and `<base>_tie.obj`; every
   represented fiber occurs in exactly one layer and exact ties are never
   silently assigned to Mixed.
 
@@ -5228,3 +5228,38 @@
   factors, synchronous Jacobi semantics, convergence, probabilities, or log
   odds. GCC uses OpenMP while the supported Clang/MSVC configurations fall
   back to one worker through the project shim.
+
+## Signed crop winding BP
+
+- Crop BP must construct one globally anchored aligned-normal lattice over the
+  half-open crop plus one effective normal-channel spacing on every available
+  side. Sampling uses the already open manifest sampler/cache. A nearest
+  aligned lookup is usable only when A, midpoint, and B are present within
+  `sqrt(3)/2 * spacing` and share one normal-alignment component.
+- The persisted/legacy `windingDistance` remains finite and nonnegative.
+  BP owns a separate optional signed target. For ordered pieces `A -> B`, its
+  sign is `sign(dot(B-A, aligned_normal_midpoint))` and its meaning is exactly
+  `winding(B)-winding(A)`. Canonical endpoint reversal negates this target.
+  Missing or cross-component normal evidence removes only the perpendicular
+  winding term, not the H/V factor.
+- H/V/Mixed and winding inference are factorized and consume the same strictly
+  validated piece topology. Every split piece remains a separate winding
+  variable; same-trace continuity is a parallel-score-1, zero-difference
+  factor rather than variable collapse or exact equality.
+  Repeated soft measurements sum their complete costs. A winding component may
+  consume signed evidence from only one aligned-normal component.
+- Continuous initialization minimizes, per measurement,
+  `p*delta^2 + q*(delta-d)^2`, omitting the second term when signed `d` is
+  unavailable. Each connected component fixes its geometrically
+  crop-central piece to winding zero, independently of the H/V seed.
+- Integer inference uses synchronous damped sum-product BP with factor cost
+  `p*abs(delta) + q*abs(delta-d)`. Non-gauge candidates begin at rounded
+  continuous value plus/minus one; gauges contain only zero. MAP at a boundary
+  or combined boundary probability above one percent expands the implicated
+  side and cold-restarts deterministic BP. Expansion continues until resolved
+  or the explicit total-state guard throws; truncated marginals are forbidden.
+- Reports expose continuous value, integer MAP, posterior mean, MAP
+  probability, entropy, candidate bounds, component, signed/skipped incident
+  counts, convergence, expansion rounds, and timings. CSV/OBJ naming follows
+  the crop tracing documentation. Finite iteration-limit marginals remain
+  usable but must be labeled nonconverged.

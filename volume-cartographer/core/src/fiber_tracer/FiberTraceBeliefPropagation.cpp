@@ -96,63 +96,11 @@ void validateConfig(const FiberTraceBeliefPropagationConfig& config)
 }
 
 Graph buildGraph(
-    std::size_t sourceTraceCount,
+    std::size_t pieceCount,
     const FiberTraceConstraintReport& constraints)
 {
-    if (constraints.inputTraces != sourceTraceCount) {
-        throw std::invalid_argument(
-            "BP constraint source count does not match represented fibers");
-    }
-    const std::size_t pieceCount = constraints.pieces.size();
-    if (pieceCount == 0)
-        throw std::invalid_argument("BP requires at least one constraint piece");
-
-    std::vector<std::vector<std::size_t>> piecesByTrace(sourceTraceCount);
-    for (std::size_t piece = 0; piece < pieceCount; ++piece) {
-        const auto& descriptor = constraints.pieces[piece];
-        if (descriptor.traceIndex >= sourceTraceCount ||
-            !std::isfinite(descriptor.beginArcBaseVoxels) ||
-            !std::isfinite(descriptor.endArcBaseVoxels) ||
-            !(descriptor.endArcBaseVoxels > descriptor.beginArcBaseVoxels)) {
-            throw std::invalid_argument(
-                "BP constraint piece has invalid source ownership or arc interval");
-        }
-        piecesByTrace[descriptor.traceIndex].push_back(piece);
-    }
-    std::set<std::pair<std::size_t, std::size_t>> expectedContinuity;
-    for (std::size_t trace = 0; trace < piecesByTrace.size(); ++trace) {
-        auto& pieces = piecesByTrace[trace];
-        if (pieces.empty()) {
-            throw std::invalid_argument(
-                "BP represented fiber has no constraint piece");
-        }
-        std::sort(pieces.begin(), pieces.end(), [&](std::size_t a, std::size_t b) {
-            return constraints.pieces[a].pieceIndex <
-                constraints.pieces[b].pieceIndex;
-        });
-        for (std::size_t local = 0; local < pieces.size(); ++local) {
-            const auto& current = constraints.pieces[pieces[local]];
-            if (current.pieceIndex != local) {
-                throw std::invalid_argument(
-                    "BP source-local constraint pieces must be contiguous");
-            }
-            if (local == 0)
-                continue;
-            const auto& previous = constraints.pieces[pieces[local - 1]];
-            if (current.beginArcBaseVoxels < previous.beginArcBaseVoxels ||
-                current.endArcBaseVoxels < previous.endArcBaseVoxels ||
-                current.beginArcBaseVoxels >
-                    previous.endArcBaseVoxels + 1.0e-9) {
-                throw std::invalid_argument(
-                    "BP consecutive constraint piece intervals are invalid");
-            }
-            expectedContinuity.emplace(
-                std::minmax(pieces[local - 1], pieces[local]));
-        }
-    }
-
-    std::set<std::pair<std::size_t, std::size_t>> hardPairs;
-    std::set<std::pair<std::size_t, std::size_t>> softPairs;
+    if (pieceCount != constraints.pieces.size())
+        throw std::logic_error("BP graph size does not match constraints");
     std::map<std::pair<std::size_t, std::size_t>, Factor> merged;
     for (const auto& constraint : constraints.constraints) {
         if (constraint.pieceA >= pieceCount ||
@@ -167,55 +115,13 @@ Graph buildGraph(
             constraint.parallelScore > 1.0 ||
             constraint.perpendicularScore < 0.0 ||
             constraint.perpendicularScore > 1.0 ||
-            std::abs(
-                constraint.parallelScore + constraint.perpendicularScore -
-                1.0) > 1.0e-9) {
+            std::abs(constraint.parallelScore +
+                         constraint.perpendicularScore - 1.0) > 1.0e-9) {
             throw std::invalid_argument(
                 "BP requires complementary measured orientation scores");
         }
-        const auto& pieceA = constraints.pieces[constraint.pieceA];
-        const auto& pieceB = constraints.pieces[constraint.pieceB];
         const auto pair = std::minmax(constraint.pieceA, constraint.pieceB);
         const std::pair<std::size_t, std::size_t> key{pair.first, pair.second};
-        if (constraint.hardContinuity) {
-            if (pieceA.traceIndex != pieceB.traceIndex ||
-                expectedContinuity.count(key) == 0 ||
-                constraint.parallelScore != 1.0 ||
-                constraint.perpendicularScore != 0.0 ||
-                !std::isfinite(constraint.windingDistance) ||
-                constraint.windingDistance != 0.0 ||
-                !std::isfinite(constraint.arcABaseVoxels) ||
-                !std::isfinite(constraint.arcBBaseVoxels) ||
-                constraint.arcABaseVoxels != constraint.arcBBaseVoxels ||
-                !std::isfinite(constraint.closestDistanceBaseVoxels) ||
-                constraint.closestDistanceBaseVoxels != 0.0 ||
-                cv::norm(constraint.pointABaseXYZ -
-                         constraint.pointBBaseXYZ) != 0.0) {
-                throw std::invalid_argument(
-                    "BP continuity constraint is not canonical");
-            }
-            const auto& left = pieceA.pieceIndex < pieceB.pieceIndex
-                ? pieceA
-                : pieceB;
-            const auto& right = pieceA.pieceIndex < pieceB.pieceIndex
-                ? pieceB
-                : pieceA;
-            const double expectedArc =
-                0.5 * (left.endArcBaseVoxels + right.beginArcBaseVoxels);
-            if (constraint.arcABaseVoxels != expectedArc ||
-                !hardPairs.insert(key).second || softPairs.count(key) != 0) {
-                throw std::invalid_argument(
-                    "BP continuity topology is duplicate or inconsistent");
-            }
-        } else {
-            if (pieceA.traceIndex == pieceB.traceIndex) {
-                throw std::invalid_argument(
-                    "BP soft constraint stays within one source fiber");
-            }
-            if (hardPairs.count(key) != 0)
-                throw std::invalid_argument("BP hard and soft constraints collide");
-            softPairs.insert(key);
-        }
         auto [found, inserted] = merged.try_emplace(
             key);
         auto& factor = found->second;
@@ -226,10 +132,6 @@ Graph buildGraph(
         factor.sameCost += 1.0 - constraint.parallelScore;
         factor.differentCost += constraint.parallelScore;
         ++factor.measurements;
-    }
-    if (hardPairs != expectedContinuity) {
-        throw std::invalid_argument(
-            "BP constraint report is missing canonical continuity links");
     }
 
     Graph graph;
@@ -286,77 +188,16 @@ PreparedProblem prepareProblem(
     const FiberTraceConstraintReport& constraints,
     const FiberTraceBeliefPropagationConfig& config)
 {
-    if (traces.empty())
-        throw std::invalid_argument("BP requires at least one represented fiber");
-    const auto geometry = measureFiberTraceSeedGeometry(
-        traces, config.cropMinimumBaseXYZ, config.cropMaximumBaseXYZ);
-    const auto seed = selectCentralStraightFiberTrace(geometry);
-    if (!seed) {
-        throw std::invalid_argument(
-            "BP has no primary seed longer than half the nominal crop size");
-    }
-    for (const auto& trace : geometry.traces) {
-        if (!trace.valid) {
-            throw std::invalid_argument(
-                "BP requires finite nondegenerate represented fibers");
-        }
-    }
-
-    const auto pieceLines = makeFiberTraceConstraintPieceLines(
-        traces, constraints);
-    const auto pieceGeometry = measureFiberTraceSeedGeometry(
-        pieceLines, config.cropMinimumBaseXYZ, config.cropMaximumBaseXYZ);
-    std::optional<std::size_t> seedPiece;
-    for (std::size_t piece = 0; piece < constraints.pieces.size(); ++piece) {
-        if (constraints.pieces[piece].traceIndex != *seed ||
-            !pieceGeometry.traces[piece].valid) {
-            continue;
-        }
-        if (!seedPiece ||
-            pieceGeometry.traces[piece].centerDistanceBaseVoxels <
-                pieceGeometry.traces[*seedPiece].centerDistanceBaseVoxels ||
-            (pieceGeometry.traces[piece].centerDistanceBaseVoxels ==
-                 pieceGeometry.traces[*seedPiece].centerDistanceBaseVoxels &&
-             piece < *seedPiece)) {
-            seedPiece = piece;
-        }
-    }
-    if (!seedPiece) {
-        throw std::invalid_argument(
-            "BP central source fiber has no valid constraint piece");
-    }
-
-    std::vector<PolylineArcGeometry> sourceGeometry;
-    sourceGeometry.reserve(traces.size());
-    for (const auto& trace : traces)
-        sourceGeometry.push_back(makePolylineArcGeometry(trace.pointsBaseXYZ));
-    for (const auto& constraint : constraints.constraints) {
-        if (!constraint.hardContinuity)
-            continue;
-        const auto& piece = constraints.pieces[constraint.pieceA];
-        const cv::Vec3d expected = samplePolylineArc(
-            sourceGeometry[piece.traceIndex],
-            constraint.arcABaseVoxels).point;
-        if (cv::norm(expected - constraint.pointABaseXYZ) > 1.0e-9 ||
-            cv::norm(expected - constraint.pointBBaseXYZ) > 1.0e-9) {
-            throw std::invalid_argument(
-                "BP continuity point does not match source geometry");
-        }
-    }
+    const auto topology = prepareFiberTraceBeliefTopology(
+        traces,
+        constraints,
+        config.cropMinimumBaseXYZ,
+        config.cropMaximumBaseXYZ);
 
     PreparedProblem problem;
-    problem.seed = *seedPiece;
-    problem.graph = buildGraph(traces.size(), constraints);
-    problem.normalizedArcWeights.reserve(constraints.pieces.size());
-    double totalArc = 0.0;
-    for (const auto& piece : constraints.pieces)
-        totalArc += piece.endArcBaseVoxels - piece.beginArcBaseVoxels;
-    const double meanArc = totalArc /
-        static_cast<double>(constraints.pieces.size());
-    for (const auto& piece : constraints.pieces) {
-        problem.normalizedArcWeights.push_back(
-            (piece.endArcBaseVoxels - piece.beginArcBaseVoxels) / meanArc);
-    }
+    problem.seed = topology.centralSeedPiece;
+    problem.graph = buildGraph(topology.pieceLines.size(), constraints);
+    problem.normalizedArcWeights = topology.normalizedArcWeights;
     return problem;
 }
 
@@ -544,6 +385,210 @@ void assignFieldSolution(
 }
 
 }  // namespace
+
+FiberTraceBeliefTopology prepareFiberTraceBeliefTopology(
+    const std::vector<FiberletCropTraceLine>& traces,
+    const FiberTraceConstraintReport& constraints,
+    const cv::Vec3d& cropMinimumBaseXYZ,
+    const cv::Vec3d& cropMaximumBaseXYZ)
+{
+    if (traces.empty())
+        throw std::invalid_argument("BP requires at least one represented fiber");
+    if (constraints.inputTraces != traces.size()) {
+        throw std::invalid_argument(
+            "BP constraint source count does not match represented fibers");
+    }
+    if (constraints.pieces.empty())
+        throw std::invalid_argument("BP requires at least one constraint piece");
+
+    FiberTraceBeliefTopology topology;
+    topology.piecesByTrace.resize(traces.size());
+    for (std::size_t piece = 0; piece < constraints.pieces.size(); ++piece) {
+        const auto& descriptor = constraints.pieces[piece];
+        if (descriptor.traceIndex >= traces.size() ||
+            !std::isfinite(descriptor.beginArcBaseVoxels) ||
+            !std::isfinite(descriptor.endArcBaseVoxels) ||
+            !(descriptor.endArcBaseVoxels > descriptor.beginArcBaseVoxels)) {
+            throw std::invalid_argument(
+                "BP constraint piece has invalid source ownership or arc interval");
+        }
+        topology.piecesByTrace[descriptor.traceIndex].push_back(piece);
+    }
+
+    std::set<std::pair<std::size_t, std::size_t>> expectedContinuity;
+    for (auto& pieces : topology.piecesByTrace) {
+        if (pieces.empty())
+            throw std::invalid_argument("BP represented fiber has no constraint piece");
+        std::sort(pieces.begin(), pieces.end(), [&](std::size_t a, std::size_t b) {
+            return constraints.pieces[a].pieceIndex <
+                constraints.pieces[b].pieceIndex;
+        });
+        for (std::size_t local = 0; local < pieces.size(); ++local) {
+            const auto& current = constraints.pieces[pieces[local]];
+            if (current.pieceIndex != local) {
+                throw std::invalid_argument(
+                    "BP source-local constraint pieces must be contiguous");
+            }
+            if (local == 0)
+                continue;
+            const auto& previous = constraints.pieces[pieces[local - 1]];
+            if (current.beginArcBaseVoxels < previous.beginArcBaseVoxels ||
+                current.endArcBaseVoxels < previous.endArcBaseVoxels ||
+                current.beginArcBaseVoxels >
+                    previous.endArcBaseVoxels + 1.0e-9) {
+                throw std::invalid_argument(
+                    "BP consecutive constraint piece intervals are invalid");
+            }
+            expectedContinuity.emplace(
+                std::minmax(pieces[local - 1], pieces[local]));
+        }
+    }
+
+    std::set<std::pair<std::size_t, std::size_t>> hardPairs;
+    std::set<std::pair<std::size_t, std::size_t>> softPairs;
+    for (std::size_t index = 0; index < constraints.constraints.size(); ++index) {
+        const auto& constraint = constraints.constraints[index];
+        if (constraint.pieceA >= constraints.pieces.size() ||
+            constraint.pieceB >= constraints.pieces.size() ||
+            constraint.pieceA == constraint.pieceB) {
+            throw std::invalid_argument(
+                "BP constraint references an invalid piece pair");
+        }
+        if (!std::isfinite(constraint.parallelScore) ||
+            !std::isfinite(constraint.perpendicularScore) ||
+            constraint.parallelScore < 0.0 ||
+            constraint.parallelScore > 1.0 ||
+            constraint.perpendicularScore < 0.0 ||
+            constraint.perpendicularScore > 1.0 ||
+            std::abs(constraint.parallelScore +
+                         constraint.perpendicularScore - 1.0) > 1.0e-9) {
+            throw std::invalid_argument(
+                "BP requires complementary measured orientation scores");
+        }
+        const auto& pieceA = constraints.pieces[constraint.pieceA];
+        const auto& pieceB = constraints.pieces[constraint.pieceB];
+        const auto pair = std::minmax(constraint.pieceA, constraint.pieceB);
+        const std::pair<std::size_t, std::size_t> key{pair.first, pair.second};
+        if (constraint.hardContinuity) {
+            if (pieceA.traceIndex != pieceB.traceIndex ||
+                expectedContinuity.count(key) == 0 ||
+                constraint.parallelScore != 1.0 ||
+                constraint.perpendicularScore != 0.0 ||
+                !std::isfinite(constraint.windingDistance) ||
+                constraint.windingDistance != 0.0 ||
+                (constraint.signedWindingDelta &&
+                 *constraint.signedWindingDelta != 0.0) ||
+                !std::isfinite(constraint.arcABaseVoxels) ||
+                !std::isfinite(constraint.arcBBaseVoxels) ||
+                constraint.arcABaseVoxels != constraint.arcBBaseVoxels ||
+                !std::isfinite(constraint.closestDistanceBaseVoxels) ||
+                constraint.closestDistanceBaseVoxels != 0.0 ||
+                cv::norm(constraint.pointABaseXYZ -
+                         constraint.pointBBaseXYZ) != 0.0) {
+                throw std::invalid_argument(
+                    "BP continuity constraint is not canonical");
+            }
+            if (!hardPairs.insert(key).second || softPairs.count(key) != 0) {
+                throw std::invalid_argument(
+                    "BP continuity topology is duplicate or inconsistent");
+            }
+            topology.hardConstraintIndices.push_back(index);
+        } else {
+            if (pieceA.traceIndex == pieceB.traceIndex)
+                throw std::invalid_argument("BP soft constraint stays within one source fiber");
+            if (hardPairs.count(key) != 0)
+                throw std::invalid_argument("BP hard and soft constraints collide");
+            softPairs.insert(key);
+            if (constraint.signedWindingDelta &&
+                !std::isfinite(*constraint.signedWindingDelta)) {
+                throw std::invalid_argument("BP signed winding delta is non-finite");
+            }
+            topology.softConstraintIndices.push_back(index);
+        }
+    }
+    if (hardPairs != expectedContinuity) {
+        throw std::invalid_argument(
+            "BP constraint report is missing canonical continuity links");
+    }
+
+    std::vector<PolylineArcGeometry> sourceGeometry;
+    sourceGeometry.reserve(traces.size());
+    for (const auto& trace : traces)
+        sourceGeometry.push_back(makePolylineArcGeometry(trace.pointsBaseXYZ));
+    for (const std::size_t index : topology.hardConstraintIndices) {
+        const auto& constraint = constraints.constraints[index];
+        const auto& piece = constraints.pieces[constraint.pieceA];
+        const cv::Vec3d expected = samplePolylineArc(
+            sourceGeometry[piece.traceIndex], constraint.arcABaseVoxels).point;
+        if (cv::norm(expected - constraint.pointABaseXYZ) > 1.0e-9 ||
+            cv::norm(expected - constraint.pointBBaseXYZ) > 1.0e-9) {
+            throw std::invalid_argument(
+                "BP continuity point does not match source geometry");
+        }
+        const auto& pieceB = constraints.pieces[constraint.pieceB];
+        const auto& left = piece.pieceIndex < pieceB.pieceIndex
+            ? piece
+            : pieceB;
+        const auto& right = piece.pieceIndex < pieceB.pieceIndex
+            ? pieceB
+            : piece;
+        const double expectedArc =
+            0.5 * (left.endArcBaseVoxels + right.beginArcBaseVoxels);
+        if (constraint.arcABaseVoxels != expectedArc) {
+            throw std::invalid_argument(
+                "BP continuity topology is duplicate or inconsistent");
+        }
+    }
+
+    const auto sourceSeedGeometry = measureFiberTraceSeedGeometry(
+        traces, cropMinimumBaseXYZ, cropMaximumBaseXYZ);
+    const auto sourceSeed = selectCentralStraightFiberTrace(sourceSeedGeometry);
+    if (!sourceSeed) {
+        throw std::invalid_argument(
+            "BP has no primary seed longer than half the nominal crop size");
+    }
+    for (const auto& trace : sourceSeedGeometry.traces) {
+        if (!trace.valid)
+            throw std::invalid_argument("BP requires finite nondegenerate represented fibers");
+    }
+
+    topology.pieceLines = makeFiberTraceConstraintPieceLines(traces, constraints);
+    const auto pieceGeometry = measureFiberTraceSeedGeometry(
+        topology.pieceLines, cropMinimumBaseXYZ, cropMaximumBaseXYZ);
+    topology.pieceCenterDistanceBaseVoxels.resize(constraints.pieces.size());
+    std::optional<std::size_t> seedPiece;
+    for (std::size_t piece = 0; piece < constraints.pieces.size(); ++piece) {
+        if (!pieceGeometry.traces[piece].valid)
+            throw std::invalid_argument("BP constraint piece geometry is invalid");
+        topology.pieceCenterDistanceBaseVoxels[piece] =
+            pieceGeometry.traces[piece].centerDistanceBaseVoxels;
+        if (constraints.pieces[piece].traceIndex != *sourceSeed)
+            continue;
+        if (!seedPiece ||
+            topology.pieceCenterDistanceBaseVoxels[piece] <
+                topology.pieceCenterDistanceBaseVoxels[*seedPiece] ||
+            (topology.pieceCenterDistanceBaseVoxels[piece] ==
+                 topology.pieceCenterDistanceBaseVoxels[*seedPiece] &&
+             piece < *seedPiece)) {
+            seedPiece = piece;
+        }
+    }
+    if (!seedPiece)
+        throw std::invalid_argument("BP central source fiber has no valid constraint piece");
+    topology.centralSeedPiece = *seedPiece;
+
+    double totalArc = 0.0;
+    for (const auto& piece : constraints.pieces)
+        totalArc += piece.endArcBaseVoxels - piece.beginArcBaseVoxels;
+    const double meanArc = totalArc /
+        static_cast<double>(constraints.pieces.size());
+    topology.normalizedArcWeights.reserve(constraints.pieces.size());
+    for (const auto& piece : constraints.pieces) {
+        topology.normalizedArcWeights.push_back(
+            (piece.endArcBaseVoxels - piece.beginArcBaseVoxels) / meanArc);
+    }
+    return topology;
+}
 
 const char* fiberTraceBalanceModeName(FiberTraceBalanceMode mode) noexcept
 {
@@ -1036,7 +1081,7 @@ FiberTraceConstraintConsistencyReport analyzeConstraintConsistency(
         throw std::invalid_argument(
             "BP consistency values must match constraint pieces");
     }
-    const Graph graph = buildGraph(constraints.inputTraces, constraints);
+    const Graph graph = buildGraph(constraints.pieces.size(), constraints);
     FiberTraceConstraintConsistencyReport report;
     report.verticalThreshold = verticalThreshold;
     report.horizontalThreshold = horizontalThreshold;

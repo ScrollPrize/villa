@@ -23,6 +23,16 @@ enum class FiberTraceBeliefInference : unsigned char {
     SumProductMixed,
 };
 
+struct FiberTraceBeliefTopology {
+    std::vector<std::vector<std::size_t>> piecesByTrace;
+    std::vector<std::size_t> hardConstraintIndices;
+    std::vector<std::size_t> softConstraintIndices;
+    std::vector<FiberletCropTraceLine> pieceLines;
+    std::vector<double> pieceCenterDistanceBaseVoxels;
+    std::vector<double> normalizedArcWeights;
+    std::size_t centralSeedPiece = 0;
+};
+
 struct FiberTraceBeliefPropagationConfig {
     FiberTraceBalanceMode balanceMode = FiberTraceBalanceMode::None;
     double targetHorizontalFraction = 0.5;
@@ -96,6 +106,12 @@ struct FiberTraceConstraintConsistencyReport {
 
 [[nodiscard]] const char* fiberTraceBeliefInferenceName(
     FiberTraceBeliefInference inference) noexcept;
+
+[[nodiscard]] FiberTraceBeliefTopology prepareFiberTraceBeliefTopology(
+    const std::vector<FiberletCropTraceLine>& traces,
+    const FiberTraceConstraintReport& constraints,
+    const cv::Vec3d& cropMinimumBaseXYZ,
+    const cv::Vec3d& cropMaximumBaseXYZ);
 
 [[nodiscard]] FiberTraceBeliefPropagationReport
 solveFiberTraceBeliefPropagation(

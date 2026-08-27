@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vc/fiber_tracer/BinaryBeliefPropagation.hpp"
+#include "vc/lasagna/LasagnaNormalSampler.hpp"
 
 #include <array>
 #include <cstddef>
@@ -35,16 +36,46 @@ struct LasagnaNormalAlignmentReport {
     std::vector<cv::Vec3f> alignedNormals;
     std::vector<double> flipProbability;
     std::vector<BinaryBeliefState> fixedStates;
+    std::vector<std::size_t> componentByNode;
     std::size_t connectedComponents = 0;
     std::size_t isolatedSamples = 0;
     std::size_t flippedSamples = 0;
     BinaryBeliefPropagationReport beliefPropagation;
 };
 
+struct AlignedLasagnaNormalSample {
+    cv::Vec3f normal{0.0F, 0.0F, 0.0F};
+    std::size_t component = 0;
+    std::size_t node = 0;
+};
+
+struct LasagnaNormalAlignmentField {
+    LasagnaNormalLattice lattice;
+    std::vector<std::size_t> nodeByLatticeSample;
+    std::vector<cv::Vec3f> positionsBaseXYZ;
+    std::vector<cv::Vec3f> rawNormals;
+    LasagnaNormalAlignmentReport alignment;
+    std::size_t candidateSamples = 0;
+    double prefetchMilliseconds = 0.0;
+    double materializeMilliseconds = 0.0;
+
+    [[nodiscard]] std::optional<AlignedLasagnaNormalSample> nearest(
+        const cv::Vec3d& pointBaseXYZ) const;
+};
+
 [[nodiscard]] std::optional<BinaryPairwiseFactor> makeLasagnaNormalAlignmentFactor(std::size_t a, std::size_t b, const cv::Vec3f& normalA, const cv::Vec3f& normalB);
 
 [[nodiscard]] LasagnaNormalAlignmentReport alignLasagnaNormalSamples(
     std::span<const cv::Vec3f> normals, std::span<const BinaryPairwiseFactor> neighborhoodFactors, const LasagnaNormalAlignmentConfig& config = {});
+
+[[nodiscard]] LasagnaNormalAlignmentField sampleAndAlignLasagnaNormalLattice(
+    const vc::lasagna::LasagnaNormalSampler& sampler,
+    const cv::Vec3d& minimumBaseXYZ,
+    const cv::Vec3d& maximumBaseXYZ,
+    double spacingBaseVoxels,
+    int neighborRadius,
+    int parallelThreads,
+    const LasagnaNormalAlignmentConfig& config = {});
 
 struct NormalGlyphObjConfig {
     double baseRadius = 1.0;

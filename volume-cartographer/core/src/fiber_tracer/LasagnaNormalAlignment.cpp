@@ -164,17 +164,20 @@ LasagnaNormalAlignmentReport alignLasagnaNormalSamples(
 
     LasagnaNormalAlignmentReport report;
     report.fixedStates.assign(normals.size(), BinaryBeliefState::Free);
+    report.componentByNode.assign(normals.size(), 0);
     std::vector<unsigned char> visited(normals.size(), 0);
     for (std::size_t start = 0; start < normals.size(); ++start) {
         if (visited[start] != 0)
             continue;
         ++report.connectedComponents;
+        const std::size_t component = report.connectedComponents - 1;
         if (adjacency[start].empty())
             ++report.isolatedSamples;
         report.fixedStates[start] = BinaryBeliefState::Zero;
         std::queue<std::size_t> pending;
         pending.push(start);
         visited[start] = 1;
+        report.componentByNode[start] = component;
         while (!pending.empty()) {
             const std::size_t node = pending.front();
             pending.pop();
@@ -183,6 +186,7 @@ LasagnaNormalAlignmentReport alignLasagnaNormalSamples(
                 const std::size_t neighbor = factor.a == node ? factor.b : factor.a;
                 if (visited[neighbor] == 0) {
                     visited[neighbor] = 1;
+                    report.componentByNode[neighbor] = component;
                     pending.push(neighbor);
                 }
             }
@@ -199,6 +203,100 @@ LasagnaNormalAlignmentReport alignLasagnaNormalSamples(
         }
     }
     return report;
+}
+
+std::optional<AlignedLasagnaNormalSample> LasagnaNormalAlignmentField::nearest(
+    const cv::Vec3d& pointBaseXYZ) const
+{
+    if (!(lattice.spacingBaseVoxels > 0.0) ||
+        nodeByLatticeSample.empty() ||
+        alignment.alignedNormals.size() != positionsBaseXYZ.size() ||
+        alignment.componentByNode.size() != positionsBaseXYZ.size()) {
+        return std::nullopt;
+    }
+    std::array<std::size_t, 3> local{};
+    cv::Vec3d latticePoint;
+    for (int axis = 0; axis < 3; ++axis) {
+        if (!std::isfinite(pointBaseXYZ[axis]))
+            return std::nullopt;
+        const auto global = static_cast<std::int64_t>(
+            std::llround(pointBaseXYZ[axis] / lattice.spacingBaseVoxels));
+        const auto offset = global - lattice.beginXYZ[axis];
+        if (offset < 0 ||
+            offset >= static_cast<std::int64_t>(lattice.shapeXYZ[axis])) {
+            return std::nullopt;
+        }
+        local[axis] = static_cast<std::size_t>(offset);
+        latticePoint[axis] = static_cast<double>(global) *
+            lattice.spacingBaseVoxels;
+    }
+    const double maximumDistance =
+        std::sqrt(3.0) * 0.5 * lattice.spacingBaseVoxels +
+        1.0e-9 * std::max(1.0, lattice.spacingBaseVoxels);
+    if (cv::norm(pointBaseXYZ - latticePoint) > maximumDistance)
+        return std::nullopt;
+    const std::size_t linear =
+        (local[2] * lattice.shapeXYZ[1] + local[1]) *
+            lattice.shapeXYZ[0] +
+        local[0];
+    if (linear >= nodeByLatticeSample.size())
+        return std::nullopt;
+    const std::size_t node = nodeByLatticeSample[linear];
+    if (node == std::numeric_limits<std::size_t>::max() ||
+        node >= alignment.alignedNormals.size()) {
+        return std::nullopt;
+    }
+    return AlignedLasagnaNormalSample{
+        alignment.alignedNormals[node],
+        alignment.componentByNode[node],
+        node,
+    };
+}
+
+LasagnaNormalAlignmentField sampleAndAlignLasagnaNormalLattice(
+    const vc::lasagna::LasagnaNormalSampler& sampler,
+    const cv::Vec3d& minimumBaseXYZ,
+    const cv::Vec3d& maximumBaseXYZ,
+    double spacingBaseVoxels,
+    int neighborRadius,
+    int parallelThreads,
+    const LasagnaNormalAlignmentConfig& config)
+{
+    if (parallelThreads < 1)
+        throw std::invalid_argument("Normal alignment worker count must be positive");
+    LasagnaNormalAlignmentField field;
+    field.lattice = makeLasagnaNormalLattice(
+        minimumBaseXYZ, maximumBaseXYZ, spacingBaseVoxels);
+    field.candidateSamples = field.lattice.positionsBaseXYZ.size();
+    std::vector<vc::lasagna::LasagnaNormalSampler::FloatNormalSample> sampled;
+    const auto sampling = sampler.sampleNormalBatch(
+        field.lattice.positionsBaseXYZ, parallelThreads, sampled);
+    field.prefetchMilliseconds = sampling.prefetchMs;
+    field.materializeMilliseconds = sampling.materializeMs;
+    field.nodeByLatticeSample.assign(
+        field.candidateSamples, std::numeric_limits<std::size_t>::max());
+    field.positionsBaseXYZ.reserve(field.candidateSamples);
+    field.rawNormals.reserve(field.candidateSamples);
+    for (std::size_t candidate = 0; candidate < sampled.size(); ++candidate) {
+        if (!sampled[candidate].valid)
+            continue;
+        field.nodeByLatticeSample[candidate] = field.positionsBaseXYZ.size();
+        field.positionsBaseXYZ.push_back(field.lattice.positionsBaseXYZ[candidate]);
+        field.rawNormals.push_back(sampled[candidate].normal);
+    }
+    if (field.positionsBaseXYZ.empty())
+        throw std::invalid_argument("Lasagna normal alignment crop contains no valid samples");
+    const auto factors = makeLasagnaNormalLatticeFactors(
+        field.lattice,
+        field.nodeByLatticeSample,
+        field.rawNormals,
+        neighborRadius);
+    auto solveConfig = config;
+    solveConfig.beliefPropagation.parallelWorkers =
+        static_cast<std::size_t>(parallelThreads);
+    field.alignment = alignLasagnaNormalSamples(
+        field.rawNormals, factors, solveConfig);
+    return field;
 }
 
 void writeNormalGlyphObj(const std::filesystem::path& path, std::span<const cv::Vec3f> positionsBaseXYZ, std::span<const cv::Vec3f> normals, const NormalGlyphObjConfig& config)

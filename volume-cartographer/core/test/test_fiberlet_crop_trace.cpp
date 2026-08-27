@@ -2359,7 +2359,7 @@ TEST_CASE("Fiber value bands use fixed boundaries and short OBJ names")
     const auto statePaths = writeFiberletCropTernaryStateObjs(
         lines, states, directory.path / "fibers_bp");
     CHECK(statePaths.vertical == directory.path / "fibers_bp_v.obj");
-    CHECK(statePaths.mixed == directory.path / "fibers_bp_mixed.obj");
+    CHECK(statePaths.mixed == directory.path / "fibers_bp_err.obj");
     CHECK(statePaths.horizontal == directory.path / "fibers_bp_h.obj");
     CHECK(statePaths.tie == directory.path / "fibers_bp_tie.obj");
     const auto read = [](const std::filesystem::path& path) {

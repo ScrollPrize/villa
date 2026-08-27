@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <functional>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -13,6 +14,8 @@
 
 namespace vc::fiber_tracer
 {
+
+struct LasagnaNormalAlignmentField;
 
 struct FiberTraceConstraintConfig {
     double resampleSpacingBaseVoxels = 32.0;
@@ -49,6 +52,8 @@ struct FiberTraceConstraint {
     double perpendicularScore = 0.0;
     double windingDistance = 0.0;
     bool hardContinuity = false;
+    std::optional<double> signedWindingDelta;
+    std::optional<std::size_t> windingNormalComponent;
 };
 
 struct FiberTraceConstraintReport {
@@ -63,12 +68,18 @@ struct FiberTraceConstraintReport {
     std::size_t rejectedWinding = 0;
     std::size_t rejectedWindingCutoff = 0;
     std::size_t hardConstraints = 0;
+    std::size_t signedWindingConstraints = 0;
+    std::size_t skippedSignedWindingConstraints = 0;
     double prepareSeconds = 0.0;
     double searchSeconds = 0.0;
     double orientationScoreSeconds = 0.0;
     double windingScoreSeconds = 0.0;
     double scoreSeconds = 0.0;
 };
+
+void orientFiberTraceConstraintWindings(
+    FiberTraceConstraintReport& report,
+    const LasagnaNormalAlignmentField& alignedNormals);
 
 struct FiberTraceConstraintGraphStats {
     std::size_t traces = 0;

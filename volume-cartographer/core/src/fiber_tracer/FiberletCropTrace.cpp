@@ -1404,7 +1404,7 @@ FiberTernaryStateObjPaths writeFiberletCropTernaryStateObjs(
     };
     const FiberTernaryStateObjPaths paths{
         sibling("_v"),
-        sibling("_mixed"),
+        sibling("_err"),
         sibling("_h"),
         sibling("_tie"),
     };
@@ -1415,7 +1415,7 @@ FiberTernaryStateObjPaths writeFiberletCropTernaryStateObjs(
     }
     constexpr std::array<const char*, 4> comments{
         "VC3D Fiberlet crop traces: BP vertical argmax",
-        "VC3D Fiberlet crop traces: BP Mixed argmax",
+        "VC3D Fiberlet crop traces: BP error/Mixed argmax",
         "VC3D Fiberlet crop traces: BP horizontal argmax",
         "VC3D Fiberlet crop traces: BP exact argmax tie",
     };

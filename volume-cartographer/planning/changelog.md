@@ -1,5 +1,8 @@
 # Changelog
 
+- Added crop-wide aligned-normal signing and factorized two-stage continuous
+  plus adaptive integer BP for trace-piece winding labels, with strict gauge
+  handling, CSV diagnostics, and integer winding OBJ layers.
 - Added an explicit solver-only parallel/separate-winding constraint ablation,
   retained/excluded link reporting, and direct concise LP artifact names.
 - Added an explicit crop-fiber LP-relaxation diagnostic with raw continuous

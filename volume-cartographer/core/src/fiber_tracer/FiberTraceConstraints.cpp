@@ -1,5 +1,7 @@
 #include "vc/fiber_tracer/FiberTraceConstraints.hpp"
 
+#include "vc/fiber_tracer/LasagnaNormalAlignment.hpp"
+
 #include "vc/core/io/PolylineObj.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
 
@@ -613,6 +615,58 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
     report.scoreSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - scoreStarted).count();
     return report;
+}
+
+void orientFiberTraceConstraintWindings(
+    FiberTraceConstraintReport& report,
+    const LasagnaNormalAlignmentField& alignedNormals)
+{
+    report.signedWindingConstraints = 0;
+    report.skippedSignedWindingConstraints = 0;
+    for (auto& constraint : report.constraints) {
+        constraint.signedWindingDelta.reset();
+        constraint.windingNormalComponent.reset();
+        if (constraint.hardContinuity) {
+            constraint.signedWindingDelta = 0.0;
+            ++report.signedWindingConstraints;
+            continue;
+        }
+        if (!(constraint.perpendicularScore > 0.0))
+            continue;
+        const cv::Vec3d connector =
+            constraint.pointBBaseXYZ - constraint.pointABaseXYZ;
+        const double connectorLength = cv::norm(connector);
+        if (!(connectorLength > kEpsilon) || !std::isfinite(connectorLength)) {
+            ++report.skippedSignedWindingConstraints;
+            continue;
+        }
+        const cv::Vec3d midpoint =
+            0.5 * (constraint.pointABaseXYZ + constraint.pointBBaseXYZ);
+        const auto atA = alignedNormals.nearest(constraint.pointABaseXYZ);
+        const auto atMidpoint = alignedNormals.nearest(midpoint);
+        const auto atB = alignedNormals.nearest(constraint.pointBBaseXYZ);
+        if (!atA || !atMidpoint || !atB ||
+            atA->component != atMidpoint->component ||
+            atB->component != atMidpoint->component) {
+            ++report.skippedSignedWindingConstraints;
+            continue;
+        }
+        const double signedAlignment =
+            (connector / connectorLength).dot(cv::Vec3d{
+                atMidpoint->normal[0],
+                atMidpoint->normal[1],
+                atMidpoint->normal[2],
+            });
+        if (!std::isfinite(signedAlignment) ||
+            std::abs(signedAlignment) <= kEpsilon) {
+            ++report.skippedSignedWindingConstraints;
+            continue;
+        }
+        constraint.signedWindingDelta = std::copysign(
+            constraint.windingDistance, signedAlignment);
+        constraint.windingNormalComponent = atMidpoint->component;
+        ++report.signedWindingConstraints;
+    }
 }
 
 std::vector<FiberletCropTraceLine> makeFiberTraceConstraintPieceLines(

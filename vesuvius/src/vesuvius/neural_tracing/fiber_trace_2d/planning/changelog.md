@@ -1,3 +1,14 @@
+# 2026-08-27: signed crop winding belief propagation
+
+- Reused crop-wide BP-aligned Lasagna normals to give perpendicular trace
+  constraints a component-safe signed winding difference while preserving the
+  existing unsigned magnitude.
+- Added a gauge-fixed continuous difference solve followed by adaptive local
+  integer sum-product BP, with winding marginals, CSV diagnostics, and one OBJ
+  layer per integer MAP winding.
+- Extracted strict piece/continuity topology preparation for both H/V and
+  winding inference and retained the existing H/V/Mixed results unchanged.
+
 # 2026-08-27: BP-aligned Lasagna normal samples
 
 - Extracted the binary pairwise sum-product engine shared by fiber BP and

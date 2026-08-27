@@ -1,13 +1,21 @@
-# Task: Align Lasagna normals with belief propagation
+# Task: Infer signed integer winding labels in crop BP
 
-Use the current fiber BP message-passing scheme to resolve the sign ambiguity
-of normals sampled from a regular Lasagna `grad_mag`/`nx`/`ny` manifest.
+Extend the crop H/V belief-propagation path with winding-number inference.
+Before constraint inference, align regular Lasagna normal axes over the trace
+crop using the shared BP normal-alignment implementation. Use those aligned
+normals to orient every usable perpendicular constraint: for ordered pieces
+`A -> B`, positive signed winding means `winding(B) - winding(A) > 0`.
 
-- Keep the alignment as reusable core functionality for later H/V BP work.
-- Also expose it as a standalone command over an explicit base-voxel bbox.
-- Visualize the same sampled normals before and after alignment as separate OBJ
-  files. Each normal glyph has a short crossed base and one directed stroke.
-- Do not use or modify the legacy NormalGridVolume alignment path.
-- Parallelize the standalone alignment BP so large normal lattices can approach
-  sub-second solve time on a many-core GCC/OpenMP build, without changing BP
-  factors, iteration semantics, convergence, or results.
+Infer winding in two stages:
+
+1. solve a gauge-fixed continuous weighted difference relaxation;
+2. center small integer candidate sets on that solution and run categorical
+   sum-product BP, expanding candidates adaptively when posterior mass or the
+   MAP label reaches a candidate boundary.
+
+Parallel evidence favors equal winding labels. Perpendicular evidence favors
+the measured signed winding difference. Same-trace continuity is exact zero
+difference. Fix one deterministic crop-central piece per connected component to
+winding zero. Report integer MAP labels, posterior means and confidence, while
+retaining the continuous solution as a diagnostic. H/V and winding inference
+share topology and output but remain mathematically factorized.

@@ -191,33 +191,23 @@ int main(int argc, char** argv)
             }
         }
 
-        const auto lattice = vc::fiber_tracer::makeLasagnaNormalLattice(options.minimumBaseXYZ, options.maximumBaseXYZ, spacing);
-        const auto& candidatePositions = lattice.positionsBaseXYZ;
-        const std::size_t candidateCount = candidatePositions.size();
-
         const vc::lasagna::LasagnaNormalSampler sampler(dataset, vc::lasagna::LasagnaNormalSamplerOptions{options.cacheBytes});
-        std::vector<vc::lasagna::LasagnaNormalSampler::FloatNormalSample> sampled;
-        const auto sampling = sampler.sampleNormalBatch(candidatePositions, options.threads, sampled);
-        std::vector<cv::Vec3f> positions;
-        std::vector<cv::Vec3f> normals;
-        positions.reserve(candidateCount);
-        normals.reserve(candidateCount);
-        std::vector<std::size_t> nodeByCandidate(candidateCount, std::numeric_limits<std::size_t>::max());
-        for (std::size_t candidate = 0; candidate < candidateCount; ++candidate) {
-            if (!sampled[candidate].valid)
-                continue;
-            nodeByCandidate[candidate] = positions.size();
-            positions.push_back(candidatePositions[candidate]);
-            normals.push_back(sampled[candidate].normal);
-        }
-        if (positions.empty())
-            fail("Lasagna normal bbox contains no valid samples");
-
-        const auto factors = vc::fiber_tracer::makeLasagnaNormalLatticeFactors(lattice, nodeByCandidate, normals, options.neighborRadius);
-
-        auto alignmentConfig = options.alignment;
-        alignmentConfig.beliefPropagation.parallelWorkers = static_cast<std::size_t>(options.threads);
-        const auto alignment = vc::fiber_tracer::alignLasagnaNormalSamples(normals, factors, alignmentConfig);
+        const auto field = vc::fiber_tracer::sampleAndAlignLasagnaNormalLattice(
+            sampler,
+            options.minimumBaseXYZ,
+            options.maximumBaseXYZ,
+            spacing,
+            options.neighborRadius,
+            options.threads,
+            options.alignment);
+        const auto factors = vc::fiber_tracer::makeLasagnaNormalLatticeFactors(
+            field.lattice,
+            field.nodeByLatticeSample,
+            field.rawNormals,
+            options.neighborRadius);
+        const auto& positions = field.positionsBaseXYZ;
+        const auto& normals = field.rawNormals;
+        const auto& alignment = field.alignment;
         std::size_t negativeBefore = 0;
         std::size_t negativeAfter = 0;
         double dotBeforeSum = 0.0;
@@ -241,8 +231,8 @@ int main(int argc, char** argv)
         vc::fiber_tracer::writeNormalGlyphObj(alignedObj, positions, alignment.alignedNormals, glyph);
 
         std::cout << "Lasagna normal BP alignment\n"
-                  << "spacing_base=" << spacing << " candidates=" << candidateCount << " valid=" << normals.size()
-                  << " invalid=" << candidateCount - normals.size() << " factors=" << factors.size() << " components=" << alignment.connectedComponents
+                  << "spacing_base=" << spacing << " candidates=" << field.candidateSamples << " valid=" << normals.size()
+                  << " invalid=" << field.candidateSamples - normals.size() << " factors=" << factors.size() << " components=" << alignment.connectedComponents
                   << " isolated=" << alignment.isolatedSamples << " flipped=" << alignment.flippedSamples
                   << " negative_links_before=" << negativeBefore << " negative_links_after=" << negativeAfter
                   << " mean_neighbor_dot_before=" << (factors.empty() ? 0.0 : dotBeforeSum / factors.size())
@@ -253,7 +243,7 @@ int main(int argc, char** argv)
                   << " bp_setup_ms=" << alignment.beliefPropagation.setupMilliseconds << " bp_totals_ms=" << alignment.beliefPropagation.nodeTotalMilliseconds
                   << " bp_updates_ms=" << alignment.beliefPropagation.messageUpdateMilliseconds
                   << " bp_solve_ms=" << alignment.beliefPropagation.solveMilliseconds << " bp_ms=" << alignment.beliefPropagation.elapsedMilliseconds
-                  << " prefetch_ms=" << sampling.prefetchMs << " materialize_ms=" << sampling.materializeMs << '\n'
+                  << " prefetch_ms=" << field.prefetchMilliseconds << " materialize_ms=" << field.materializeMilliseconds << '\n'
                   << "unaligned_obj=" << unalignedObj << '\n'
                   << "aligned_obj=" << alignedObj << '\n';
         return 0;

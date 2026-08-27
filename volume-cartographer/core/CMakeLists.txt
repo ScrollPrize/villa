@@ -216,6 +216,7 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberletCropTraceArtifact.cpp
     src/fiber_tracer/FiberTraceConstraints.cpp
     src/fiber_tracer/FiberTraceBeliefPropagation.cpp
+    src/fiber_tracer/FiberTraceWindingBeliefPropagation.cpp
     src/fiber_tracer/FiberTraceConsensus.cpp
     src/fiber_tracer/FiberTraceLabeling.cpp
     src/fiber_tracer/FiberTraceSeed.cpp
@@ -224,7 +225,7 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberletStorage.cpp
     src/fiber_tracer/LasagnaNormalAlignment.cpp
 )
-target_link_libraries(vc_fiber_tracer PUBLIC vc_core vc_lasagna PRIVATE highs::highs)
+target_link_libraries(vc_fiber_tracer PUBLIC vc_core vc_lasagna PRIVATE highs::highs Eigen3::Eigen)
 if(VC_TESTING)
     target_compile_definitions(vc_fiber_tracer PRIVATE VC_TESTING)
 endif()

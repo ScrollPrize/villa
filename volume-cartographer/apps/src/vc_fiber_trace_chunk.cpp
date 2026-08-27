@@ -1,12 +1,16 @@
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/io/PolylineObj.hpp"
 #include "vc/fiber_tracer/FiberletChunkGraph.hpp"
 #include "vc/fiber_tracer/FiberletCropTrace.hpp"
 #include "vc/fiber_tracer/FiberletCropTraceArtifact.hpp"
 #include "vc/fiber_tracer/FiberletCropVisualization.hpp"
 #include "vc/fiber_tracer/FiberTraceBeliefPropagation.hpp"
+#include "vc/fiber_tracer/FiberTraceWindingBeliefPropagation.hpp"
 #include "vc/fiber_tracer/FiberTraceConstraints.hpp"
 #include "vc/fiber_tracer/FiberTraceConsensus.hpp"
 #include "vc/fiber_tracer/FiberTraceLabeling.hpp"
+#include "vc/fiber_tracer/LasagnaNormalAlignment.hpp"
+#include "vc/lasagna/ChannelSampler.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 
@@ -21,6 +25,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -1114,6 +1119,7 @@ void printConsensusReport(
 
 void writeAndPrintBpReport(
     const vc::fiber_tracer::FiberTraceBeliefPropagationReport& report,
+    const vc::fiber_tracer::FiberTraceWindingBeliefPropagationReport& winding,
     vc::fiber_tracer::FiberTraceBalanceMode mode,
     const std::vector<vc::fiber_tracer::FiberletCropTraceLine>& lines,
     const vc::fiber_tracer::FiberTraceConstraintReport& constraints,
@@ -1130,6 +1136,16 @@ void writeAndPrintBpReport(
         directions.size() != lines.size() ||
         originalTraceIndices.size() != lines.size() ||
         report.seedPieceIndex >= lines.size() ||
+        winding.continuousWinding.size() != lines.size() ||
+        winding.mapWinding.size() != lines.size() ||
+        winding.posteriorMeanWinding.size() != lines.size() ||
+        winding.mapProbability.size() != lines.size() ||
+        winding.entropy.size() != lines.size() ||
+        winding.candidateMinimum.size() != lines.size() ||
+        winding.candidateMaximum.size() != lines.size() ||
+        winding.componentByPiece.size() != lines.size() ||
+        winding.incidentSignedConstraints.size() != lines.size() ||
+        winding.incidentSkippedConstraints.size() != lines.size() ||
         (mixedState &&
          (report.verticalProbability.size() != lines.size() ||
           report.mixedProbability.size() != lines.size() ||
@@ -1140,15 +1156,129 @@ void writeAndPrintBpReport(
         vc::fiber_tracer::fiberTraceBalanceModeName(mode);
     const std::string inferenceName =
         vc::fiber_tracer::fiberTraceBeliefInferenceName(report.inference);
-    const std::string artifactName = sumProduct
-        ? inferenceName
-        : modeName;
-    const auto outputBase = output.parent_path() /
-        (output.stem().string() + "_bp_" + artifactName);
+    const auto outputBase = output.parent_path() / output.stem();
+
+    std::vector<vc::fiber_tracer::FiberTernaryState> predictions(
+        lines.size(), vc::fiber_tracer::FiberTernaryState::Tie);
+    for (std::size_t piece = 0; piece < lines.size(); ++piece) {
+        if (mixedState) {
+            const std::array probabilities{
+                report.verticalProbability[piece],
+                report.mixedProbability[piece],
+                report.horizontalProbability[piece],
+            };
+            const double maximum = *std::max_element(
+                probabilities.begin(), probabilities.end());
+            if (std::count(
+                    probabilities.begin(), probabilities.end(), maximum) == 1) {
+                predictions[piece] = static_cast<
+                    vc::fiber_tracer::FiberTernaryState>(std::distance(
+                        probabilities.begin(),
+                        std::find(
+                            probabilities.begin(),
+                            probabilities.end(),
+                            maximum)));
+            }
+        } else if (report.horizontalness[piece] <= 0.25) {
+            predictions[piece] =
+                vc::fiber_tracer::FiberTernaryState::Vertical;
+        } else if (report.horizontalness[piece] >= 0.75) {
+            predictions[piece] =
+                vc::fiber_tracer::FiberTernaryState::Horizontal;
+        } else {
+            predictions[piece] = vc::fiber_tracer::FiberTernaryState::Mixed;
+        }
+    }
+
+    const auto [relativeWindingMinimum, relativeWindingMaximum] =
+        std::minmax_element(
+            winding.mapWinding.begin(), winding.mapWinding.end());
+    const int windingOutputOffset = -*relativeWindingMinimum;
+    std::map<int, std::vector<vc::core::io::NamedPolyline>> windingLines;
+    std::map<int, std::vector<std::size_t>> windingPieceIndices;
+    for (std::size_t piece = 0; piece < lines.size(); ++piece) {
+        const int outputWinding =
+            winding.mapWinding[piece] + windingOutputOffset;
+        windingLines[outputWinding].push_back({
+            "piece_" + std::to_string(piece),
+            lines[piece].pointsBaseXYZ,
+        });
+        windingPieceIndices[outputWinding].push_back(piece);
+    }
+    std::vector<std::filesystem::path> windingPaths;
+    windingPaths.reserve(windingLines.size());
+    for (const auto& [label, polylines] : windingLines) {
+        const std::string suffix = std::to_string(label);
+        const auto path = outputBase.parent_path() /
+            (outputBase.stem().string() + "_w_" + suffix + ".obj");
+        const int relativeLabel = label - windingOutputOffset;
+        vc::core::io::writePolylinesObj(
+            polylines,
+            path,
+            "VC3D winding output " + std::to_string(label) +
+                " (relative MAP " + std::to_string(relativeLabel) + ")");
+        std::vector<vc::fiber_tracer::FiberletCropTraceLine> stateLines;
+        std::vector<vc::fiber_tracer::FiberTernaryState> stateValues;
+        stateLines.reserve(windingPieceIndices.at(label).size());
+        stateValues.reserve(windingPieceIndices.at(label).size());
+        for (const std::size_t piece : windingPieceIndices.at(label)) {
+            stateLines.push_back(lines[piece]);
+            stateValues.push_back(predictions[piece]);
+        }
+        (void)vc::fiber_tracer::writeFiberletCropTernaryStateObjs(
+            stateLines,
+            stateValues,
+            outputBase.parent_path() /
+                (outputBase.stem().string() + "_w_" + suffix));
+        windingPaths.push_back(path);
+    }
+
+    const auto factorCsv = outputBase.parent_path() /
+        (outputBase.stem().string() + "_winding_factors.csv");
+    std::ofstream factorOutput(factorCsv);
+    if (!factorOutput)
+        throw std::runtime_error(
+            "failed to open winding factor CSV: " + factorCsv.string());
+    factorOutput
+        << "constraint,piece_a,piece_b,node_a,node_b,parallel,perpendicular,"
+           "original_signed_delta,canonical_signed_delta,normal_component,self_edge\n"
+        << std::setprecision(17);
+    const auto writeOptionalDouble = [](std::ostream& stream,
+                                        const std::optional<double>& value) {
+        if (value)
+            stream << *value;
+        else
+            stream << "NA";
+    };
+    const auto writeOptionalSize = [](std::ostream& stream,
+                                      const std::optional<std::size_t>& value) {
+        if (value)
+            stream << *value;
+        else
+            stream << "NA";
+    };
+    for (const auto& factor : winding.factorDiagnostics) {
+        factorOutput << factor.constraintIndex << ',' << factor.pieceA << ','
+                     << factor.pieceB << ',' << factor.canonicalNodeA << ','
+                     << factor.canonicalNodeB << ',' << factor.parallelScore
+                     << ',' << factor.perpendicularScore << ',';
+        writeOptionalDouble(factorOutput, factor.originalSignedDelta);
+        factorOutput << ',';
+        writeOptionalDouble(factorOutput, factor.canonicalSignedDelta);
+        factorOutput << ',';
+        writeOptionalSize(factorOutput, factor.normalComponent);
+        factorOutput << ',' << (factor.selfEdge ? 1 : 0) << '\n';
+    }
+    if (!factorOutput)
+        throw std::runtime_error(
+            "failed to write winding factor CSV: " + factorCsv.string());
     const auto bands =
         vc::fiber_tracer::classifyFiberValues(report.horizontalness);
     const auto paths = vc::fiber_tracer::writeFiberletCropValueBandObjs(
-        lines, bands, outputBase);
+        lines,
+        bands,
+        outputBase.parent_path() /
+            (outputBase.stem().string() + "_orientation"));
     std::optional<vc::fiber_tracer::FiberValueBandObjPaths>
         mixedPaths;
     if (mixedState) {
@@ -1157,7 +1287,7 @@ void writeAndPrintBpReport(
         mixedPaths = vc::fiber_tracer::writeFiberletCropValueBandObjs(
             lines, mixedBands,
             output.parent_path() /
-                (output.stem().string() + "_bp_" + artifactName + "_mixed"));
+                (output.stem().string() + "_error_probability"));
     }
     const auto [minimum, maximum] = std::minmax_element(
         report.horizontalness.begin(), report.horizontalness.end());
@@ -1185,9 +1315,8 @@ void writeAndPrintBpReport(
         : vc::fiber_tracer::analyzeFiberTraceConstraintConsistency(
               constraints, report.horizontalness);
     std::optional<std::array<std::size_t, 4>> finalStateCounts;
-    const auto csv = output.parent_path() /
-        (output.stem().string() + "_bp_" + artifactName +
-         "_consistency.csv");
+    const auto csv = outputBase.parent_path() /
+        (outputBase.stem().string() + "_consistency.csv");
     std::ofstream csvOutput(csv);
     if (!csvOutput)
         throw std::runtime_error("failed to open BP consistency CSV: " + csv.string());
@@ -1201,7 +1330,12 @@ void writeAndPrintBpReport(
         << "bp_status,vertical_threshold,"
            "horizontal_threshold,"
         << (mixedState ? "orientation_projection" : "horizontalness")
-        << ",degree,incident_measurements,"
+        << ",winding_component,winding_continuous,winding_relative_map,"
+           "winding_output,"
+           "winding_posterior_mean,winding_map_probability,winding_entropy,"
+           "winding_candidate_min,winding_candidate_max,"
+           "winding_signed_incident,winding_skipped_incident,"
+           "degree,incident_measurements,"
            "total_strength,"
            "resolved_degree,resolved_strength,unresolved_degree,"
            "unresolved_strength,hard_mismatches,hard_mismatch_rate,"
@@ -1234,7 +1368,19 @@ void writeAndPrintBpReport(
         }
         csvOutput << report.status << ',' << consistency.verticalThreshold << ','
                   << consistency.horizontalThreshold << ','
-                  << report.horizontalness[piece] << ',' << current.degree
+                  << report.horizontalness[piece] << ','
+                  << winding.componentByPiece[piece] << ','
+                  << winding.continuousWinding[piece] << ','
+                  << winding.mapWinding[piece] << ','
+                  << winding.mapWinding[piece] + windingOutputOffset << ','
+                  << winding.posteriorMeanWinding[piece] << ','
+                  << winding.mapProbability[piece] << ','
+                  << winding.entropy[piece] << ','
+                  << winding.candidateMinimum[piece] << ','
+                  << winding.candidateMaximum[piece] << ','
+                  << winding.incidentSignedConstraints[piece] << ','
+                  << winding.incidentSkippedConstraints[piece] << ','
+                  << current.degree
                   << ',' << current.incidentMeasurements << ','
                   << current.totalStrength << ','
                   << current.resolvedDegree << ',' << current.resolvedStrength
@@ -1254,6 +1400,32 @@ void writeAndPrintBpReport(
     }
     if (!csvOutput)
         throw std::runtime_error("failed to write BP consistency CSV: " + csv.string());
+    const double meanWindingConfidence = std::accumulate(
+        winding.mapProbability.begin(), winding.mapProbability.end(), 0.0) /
+        static_cast<double>(winding.mapProbability.size());
+    std::cout << std::fixed << std::setprecision(6)
+              << "fiber winding two-stage BP\n"
+              << "status  pieces  variables  factors  components"
+                 "  continuous_rms  continuous_s  expansion_rounds"
+                 "  message_iterations  message_residual  workers  candidate_states"
+                 "  relative_min_w  relative_max_w  output_min_w  output_max_w"
+                 "  mean_map_probability  discrete_s\n"
+              << winding.status << "  " << lines.size() << "  "
+              << winding.variables << "  " << winding.factors << "  "
+              << winding.connectedComponents << "  "
+              << winding.continuousRootMeanSquareResidual << "  "
+              << winding.continuousSolveSeconds << "  "
+              << winding.expansionRounds << "  "
+              << winding.messageIterations << "  " << winding.messageResidual
+              << "  " << winding.effectiveWorkers << "  "
+              << winding.totalCandidateStates << "  "
+              << *relativeWindingMinimum << "  " << *relativeWindingMaximum
+              << "  0  "
+              << *relativeWindingMaximum + windingOutputOffset << "  "
+              << meanWindingConfidence << "  " << winding.discreteSolveSeconds
+              << '\n'
+              << "winding_factor_csv=" << factorCsv
+              << " winding_obj_layers=" << windingPaths.size() << '\n';
     std::cout << std::fixed << std::setprecision(6);
     if (mixedState) {
         std::cout
@@ -1340,29 +1512,11 @@ void writeAndPrintBpReport(
     }
     if (mixedState) {
         std::array<std::array<std::size_t, 4>, 3> confusion{};
-        std::vector<vc::fiber_tracer::FiberTernaryState> predictions(
-            lines.size(), vc::fiber_tracer::FiberTernaryState::Tie);
         std::vector<double> mixedReferences;
         std::vector<double> trustedReferences;
         for (std::size_t trace = 0; trace < lines.size(); ++trace) {
-            const std::array probabilities{
-                report.verticalProbability[trace],
-                report.mixedProbability[trace],
-                report.horizontalProbability[trace],
-            };
-            const double maximum = *std::max_element(
-                probabilities.begin(), probabilities.end());
-            const std::size_t ties = static_cast<std::size_t>(std::count(
-                probabilities.begin(), probabilities.end(), maximum));
-            const std::size_t prediction = ties == 1
-                ? static_cast<std::size_t>(std::distance(
-                      probabilities.begin(),
-                      std::find(probabilities.begin(), probabilities.end(), maximum)))
-                : 3;
-            if (prediction < 3) {
-                predictions[trace] = static_cast<
-                    vc::fiber_tracer::FiberTernaryState>(prediction);
-            }
+            const std::size_t prediction =
+                static_cast<std::size_t>(predictions[trace]);
             ++confusion[static_cast<std::size_t>(directions[trace])][prediction];
             if (directions[trace] ==
                 vc::fiber_tracer::FiberDirectionGroup::Mixed) {
@@ -1433,17 +1587,17 @@ void writeAndPrintBpReport(
         }
         std::cout << "fiber direction explicit Mixed probability bands base="
                   << mixedPaths->bands.front().parent_path() /
-                        (output.stem().string() + "_bp_" + artifactName + "_mixed")
+                        (output.stem().string() + "_error_probability")
                   << '\n';
         const auto statePaths = vc::fiber_tracer::
             writeFiberletCropTernaryStateObjs(
                 lines,
                 predictions,
-                output.parent_path() / (output.stem().string() + "_bp"));
+                outputBase);
         std::cout << "fiber direction explicit state OBJ layers\n"
                   << "state  path\n"
                   << "v  " << statePaths.vertical << '\n'
-                  << "mixed  " << statePaths.mixed << '\n'
+                  << "err  " << statePaths.mixed << '\n'
                   << "h  " << statePaths.horizontal << '\n'
                   << "tie  " << statePaths.tie << '\n';
     }
@@ -1663,6 +1817,65 @@ int main(int argc, char** argv)
             const vc::lasagna::LasagnaNormalSampler normals(
                 normalDataset,
                 vc::lasagna::LasagnaNormalSamplerOptions{options.cacheBytes});
+            std::optional<vc::fiber_tracer::LasagnaNormalAlignmentField>
+                alignedNormalField;
+            if (options.mode == Mode::DirectionAblation &&
+                (options.bpOnly ||
+                 options.bpBalance != BpBalanceSelection::None)) {
+                const auto nx = vc::lasagna::bindLasagnaChannel(
+                    normalDataset.manifest(), "nx");
+                const auto& shapeZYX = *normalDataset.manifest().baseShapeZYX;
+                const cv::Vec3d volumeMaximumBaseXYZ{
+                    static_cast<double>(shapeZYX[2]),
+                    static_cast<double>(shapeZYX[1]),
+                    static_cast<double>(shapeZYX[0]),
+                };
+                cv::Vec3d alignmentMinimum = artifact.minimumBaseXYZ;
+                cv::Vec3d alignmentMaximum = artifact.maximumBaseXYZ;
+                for (int axis = 0; axis < 3; ++axis) {
+                    alignmentMinimum[axis] = std::max(
+                        0.0, alignmentMinimum[axis] - nx.spacing);
+                    alignmentMaximum[axis] = std::min(
+                        volumeMaximumBaseXYZ[axis],
+                        alignmentMaximum[axis] + nx.spacing);
+                }
+                vc::fiber_tracer::LasagnaNormalAlignmentConfig alignmentConfig;
+                alignmentConfig.beliefPropagation.temperature =
+                    options.bp.horizontalnessTemperature;
+                alignmentConfig.beliefPropagation.messageDamping =
+                    options.bp.messageDamping;
+                alignmentConfig.beliefPropagation.messageResidualTolerance =
+                    options.bp.messageResidualTolerance;
+                alignmentConfig.beliefPropagation.maximumMessageIterations =
+                    options.bp.maximumMessageIterations;
+                alignmentConfig.beliefPropagation.parallelWorkers =
+                    static_cast<std::size_t>(options.threads);
+                alignedNormalField.emplace(
+                    vc::fiber_tracer::sampleAndAlignLasagnaNormalLattice(
+                        normals,
+                        alignmentMinimum,
+                        alignmentMaximum,
+                        nx.spacing,
+                        1,
+                        options.threads,
+                        alignmentConfig));
+                std::cout
+                    << "fiber winding normal alignment"
+                    << " spacing_base=" << nx.spacing
+                    << " candidates=" << alignedNormalField->candidateSamples
+                    << " valid=" << alignedNormalField->rawNormals.size()
+                    << " components="
+                    << alignedNormalField->alignment.connectedComponents
+                    << " message_iterations="
+                    << alignedNormalField->alignment.beliefPropagation.messageIterations
+                    << " message_residual="
+                    << alignedNormalField->alignment.beliefPropagation.messageResidual
+                    << " converged="
+                    << (alignedNormalField->alignment.beliefPropagation.messageConverged
+                            ? "true"
+                            : "false")
+                    << '\n';
+            }
 
             std::vector<vc::fiber_tracer::FiberletCropTraceLine>
                 diagnosticLines;
@@ -1770,6 +1983,10 @@ int main(int argc, char** argv)
                                 return normals.normalAlignedWindingDistancesBatch(
                                     connectors, step, threads);
                             });
+                    if (alignedNormalField) {
+                        vc::fiber_tracer::orientFiberTraceConstraintWindings(
+                            checkpointReport, *alignedNormalField);
+                    }
                     const auto extractedConstraints =
                         checkpointReport.constraints;
                     std::optional<
@@ -1807,6 +2024,26 @@ int main(int argc, char** argv)
                         const auto bpPieceLines = vc::fiber_tracer::
                             makeFiberTraceConstraintPieceLines(
                                 diagnosticLines, bpConstraints);
+                        const auto bpTopology = vc::fiber_tracer::
+                            prepareFiberTraceBeliefTopology(
+                                diagnosticLines,
+                                bpConstraints,
+                                artifact.minimumBaseXYZ,
+                                artifact.maximumBaseXYZ);
+                        vc::fiber_tracer::FiberTraceWindingBeliefPropagationConfig
+                            windingConfig;
+                        windingConfig.temperature =
+                            options.bp.horizontalnessTemperature;
+                        windingConfig.messageDamping = options.bp.messageDamping;
+                        windingConfig.messageResidualTolerance =
+                            options.bp.messageResidualTolerance;
+                        windingConfig.maximumMessageIterations =
+                            options.bp.maximumMessageIterations;
+                        windingConfig.parallelWorkers =
+                            static_cast<std::size_t>(options.threads);
+                        const auto winding = vc::fiber_tracer::
+                            solveFiberTraceWindingBeliefPropagation(
+                                bpConstraints, bpTopology, windingConfig);
                         std::vector<std::size_t> bpOriginalTraceIndices;
                         std::vector<vc::fiber_tracer::FiberDirectionGroup>
                             bpDirections;
@@ -1855,6 +2092,7 @@ int main(int argc, char** argv)
                             }
                             writeAndPrintBpReport(
                                 report,
+                                winding,
                                 mode,
                                 bpPieceLines,
                                 bpConstraints,
@@ -2034,6 +2272,30 @@ int main(int argc, char** argv)
                                 bpDirections.push_back(
                                     diagnosticDirections.at(piece.traceIndex));
                             }
+                            const auto bpTopology = vc::fiber_tracer::
+                                prepareFiberTraceBeliefTopology(
+                                    diagnosticLines,
+                                    comparisonReport,
+                                    artifact.minimumBaseXYZ,
+                                    artifact.maximumBaseXYZ);
+                            vc::fiber_tracer::
+                                FiberTraceWindingBeliefPropagationConfig
+                                    windingConfig;
+                            windingConfig.temperature =
+                                options.bp.horizontalnessTemperature;
+                            windingConfig.messageDamping =
+                                options.bp.messageDamping;
+                            windingConfig.messageResidualTolerance =
+                                options.bp.messageResidualTolerance;
+                            windingConfig.maximumMessageIterations =
+                                options.bp.maximumMessageIterations;
+                            windingConfig.parallelWorkers =
+                                static_cast<std::size_t>(options.threads);
+                            const auto winding = vc::fiber_tracer::
+                                solveFiberTraceWindingBeliefPropagation(
+                                    comparisonReport,
+                                    bpTopology,
+                                    windingConfig);
                             const auto runBp = [&](
                                                    vc::fiber_tracer::
                                                        FiberTraceBalanceMode mode) {
@@ -2050,6 +2312,7 @@ int main(int argc, char** argv)
                                         config);
                                 writeAndPrintBpReport(
                                     report,
+                                    winding,
                                     mode,
                                     bpPieceLines,
                                     comparisonReport,

@@ -634,10 +634,10 @@ piece.
 
 `--ablation-limit N` selects a ranked prefix; omission admits every Mixed
 fiber. Natural BP fixes the established central straight seed to H and emits
-`<base>_bp_none_p0.obj` through `_p9.obj`. A nonconverged status remains in the
-report and in every CSV row; it is not silently treated as converged.
+`<base>_orientation_p0.obj` through `_p9.obj`. A nonconverged status remains in
+the report and in every CSV row; it is not silently treated as converged.
 
-`<base>_bp_none_consistency.csv` records global piece ID, original stored source
+`<base>_consistency.csv` records global piece ID, original stored source
 trace ID, source-local piece ID, and begin/end base-voxel arcs alongside the
 initial `dir1`, `dir2`, or `mixed` source diagnostic reference. Band, state,
 confusion, consistency, and AUROC outputs are piece-weighted. Their OBJs contain
@@ -696,9 +696,10 @@ message-iteration, damping, and residual controls but rejects `--bp-balance`
 and the min-sum-only target, balance-strength, balance-iteration, and balance-
 tolerance controls.
 
-Sum-product writes `<base>_bp_sum_product_p0.obj` through `_p9.obj` and
-`<base>_bp_sum_product_consistency.csv`, separately from min-sum artifacts.
-The CSV records its inference name, temperature, and convergence status. The
+Sum-product writes `<base>_orientation_p0.obj` through `_p9.obj` and
+`<base>_consistency.csv`. A later run intentionally replaces these current-result
+artifacts instead of encoding the selected solver in every filename. The CSV
+records its inference name, temperature, and convergence status. The
 soft mismatch diagnostic remains an endpoint-independence proxy; it is not a
 sum-product pairwise marginal.
 
@@ -745,13 +746,12 @@ Mixed-state soft mismatch and neighbor-support diagnostics use the explicit
 V/Mixed/H probabilities instead: Mixed endpoint mass contributes no orientation
 violation or neighbor support.
 
-This mode owns `<base>_bp_sum_product_mixed_p0.obj` through `_p9.obj` for the
-orientation projection, `<base>_bp_sum_product_mixed_mixed_p0.obj` through
-`_p9.obj` for `P(Mixed)`, and
-`<base>_bp_sum_product_mixed_consistency.csv` with all three probabilities.
-It also writes the direct argmax partition as `<base>_bp_v.obj`,
-`<base>_bp_mixed.obj`, `<base>_bp_h.obj`, and `<base>_bp_tie.obj`. Like binary
-sum-product, it rejects population-balance controls.
+This mode writes `<base>_orientation_p0.obj` through `_p9.obj` for the
+orientation projection, `<base>_error_probability_p0.obj` through `_p9.obj`
+for `P(Mixed)`, and `<base>_consistency.csv` with all three probabilities. It
+also writes the direct argmax partition as `<base>_v.obj`, `<base>_err.obj`,
+`<base>_h.obj`, and `<base>_tie.obj`. Like binary sum-product, it rejects
+population-balance controls.
 
 ### Standalone Lasagna normal sign alignment
 
@@ -804,10 +804,44 @@ so worker count does not change inference results. `--damping 1` can converge
 faster for well-behaved graphs, but the more conservative default remains
 `0.5` because undamped loopy BP is less robust in general.
 
-The regular spatial lattice is a standalone diagnostic topology. It can join
-nearby parallel sheets and currently treats every positive `grad_mag` as
-valid. Later H/V integration should supply its own sample graph/evidence to
-`alignLasagnaNormalSamples()` while reusing the same binary BP core.
+The regular spatial lattice is also used to orient winding evidence during
+crop BP. The crop path samples the stored crop plus a one-normal-spacing halo,
+clipped to `base_shape_zyx`, through the already open normal sampler and cache.
+It does not reopen or rewrite the manifest.
+
+### Signed winding inference
+
+`direction-ablation` BP aligns the crop normals once before extracting its
+first constraint cohort. For an ordered measured constraint `A -> B`, the
+existing `winding_distance` remains a nonnegative normal-modulated magnitude.
+An additional BP-only target is signed by
+`dot(point_B-point_A, aligned_normal_at_midpoint)`, so it denotes
+`winding(B)-winding(A)`. The nearest globally anchored normal samples at A,
+the midpoint, and B must all exist and belong to the same normal-alignment
+component. Otherwise the H/V constraint remains valid but contributes no
+perpendicular winding evidence. A connected winding graph that would combine
+signed evidence from independently gauged normal components is rejected.
+
+Winding inference is factorized from H/V and uses the exact same retained
+piece graph. Every split piece remains a distinct winding variable. Same-trace
+continuity contributes its existing parallel-score-1, zero-difference factor,
+so other evidence can override it at the corresponding cost. A continuous
+weighted least-squares difference solve fixes the crop-central variable
+of every connected component to zero. Integer sum-product BP then starts with
+the three labels centered on each continuous result and uses
+`parallel*abs(delta) + perpendicular*abs(delta-signed_target)`. Candidate
+support expands and BP cold-restarts whenever MAP or posterior mass reaches a
+boundary; the only limit is an explicit total-state resource guard.
+
+The ordinary BP consistency CSV includes continuous winding, integer MAP,
+posterior mean, MAP probability, entropy, candidate bounds, component, and
+incident signed/skipped counts. `<base>_winding_factors.csv` records
+canonicalized factors and signed targets. The solver's arbitrary zero-centered
+relative MAP labels are shifted by the global minimum for publication, so the
+OBJ groups are consecutively numbered `<base>_w_0.obj`, `_w_1.obj`, and so on.
+The consistency CSV records both `winding_relative_map` and `winding_output`.
+Every published winding group is additionally partitioned by orientation state
+as `<base>_w_<number>_h.obj`, `_v.obj`, `_err.obj`, and `_tie.obj`.
 
 ## Quality groups
 

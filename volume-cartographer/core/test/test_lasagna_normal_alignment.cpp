@@ -2,6 +2,7 @@
 #include <doctest/doctest.h>
 
 #include "vc/fiber_tracer/BinaryBeliefPropagation.hpp"
+#include "vc/fiber_tracer/FiberTraceConstraints.hpp"
 #include "vc/fiber_tracer/LasagnaNormalAlignment.hpp"
 
 #include <cmath>
@@ -9,6 +10,7 @@
 #include <fstream>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace
@@ -141,6 +143,7 @@ TEST_CASE("Lasagna normal alignment resolves alternating signs per component")
     const auto report = alignLasagnaNormalSamples(normals, factors, config);
 
     CHECK(report.connectedComponents == 2);
+    CHECK(report.componentByNode == std::vector<std::size_t>{0, 0, 0, 1});
     CHECK(report.isolatedSamples == 1);
     CHECK(report.fixedStates[0] == BinaryBeliefState::Zero);
     CHECK(report.fixedStates[3] == BinaryBeliefState::Zero);
@@ -150,6 +153,51 @@ TEST_CASE("Lasagna normal alignment resolves alternating signs per component")
         CHECK(report.alignedNormals[index][1] == doctest::Approx(0.0));
     }
     CHECK(report.alignedNormals[3][1] == doctest::Approx(1.0));
+}
+
+TEST_CASE("Aligned normal field orients winding without changing its magnitude")
+{
+    LasagnaNormalAlignmentField field;
+    field.lattice = makeLasagnaNormalLattice(
+        {-1.0, -1.0, -1.0}, {2.0, 2.0, 2.0}, 1.0);
+    field.nodeByLatticeSample.resize(field.lattice.positionsBaseXYZ.size());
+    for (std::size_t node = 0; node < field.nodeByLatticeSample.size(); ++node)
+        field.nodeByLatticeSample[node] = node;
+    field.positionsBaseXYZ = field.lattice.positionsBaseXYZ;
+    field.alignment.alignedNormals.assign(
+        field.nodeByLatticeSample.size(), cv::Vec3f{1.0F, 0.0F, 0.0F});
+    field.alignment.componentByNode.assign(
+        field.nodeByLatticeSample.size(), 0);
+
+    FiberTraceConstraintReport report;
+    FiberTraceConstraint forward;
+    forward.pieceA = 0;
+    forward.pieceB = 1;
+    forward.pointABaseXYZ = {0.0, 0.0, 0.0};
+    forward.pointBBaseXYZ = {1.0, 0.0, 0.0};
+    forward.parallelScore = 0.0;
+    forward.perpendicularScore = 1.0;
+    forward.windingDistance = 0.75;
+    report.constraints.push_back(forward);
+    auto reverse = forward;
+    std::swap(reverse.pointABaseXYZ, reverse.pointBBaseXYZ);
+    report.constraints.push_back(reverse);
+
+    orientFiberTraceConstraintWindings(report, field);
+    CHECK(report.constraints[0].windingDistance == doctest::Approx(0.75));
+    CHECK(report.constraints[0].signedWindingDelta == doctest::Approx(0.75));
+    CHECK(report.constraints[1].windingDistance == doctest::Approx(0.75));
+    CHECK(report.constraints[1].signedWindingDelta == doctest::Approx(-0.75));
+    CHECK(report.signedWindingConstraints == 2);
+    CHECK(report.skippedSignedWindingConstraints == 0);
+
+    const auto endpoint = field.nearest({1.0, 0.0, 0.0});
+    REQUIRE(endpoint.has_value());
+    field.alignment.componentByNode[endpoint->node] = 1;
+    orientFiberTraceConstraintWindings(report, field);
+    CHECK_FALSE(report.constraints[0].signedWindingDelta.has_value());
+    CHECK_FALSE(report.constraints[1].signedWindingDelta.has_value());
+    CHECK(report.skippedSignedWindingConstraints == 2);
 }
 
 TEST_CASE("Normal glyph OBJ writes crossed bases and directed strokes")

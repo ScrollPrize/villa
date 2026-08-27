@@ -250,6 +250,8 @@ vc_add_test(NAME test_fiberlet_storage
     LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiberlet_crop_trace
     LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_trace_winding_bp
+    LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_replay
     LIBS doctest::doctest vc_fiber_tracer
     DEFS VC_TESTING)
