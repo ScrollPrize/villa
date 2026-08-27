@@ -415,7 +415,10 @@ endif()
 # LTO stays off on Windows: GCC LTO across DLLs interacts badly with PE
 # auto-import/export-all, and link times on the CI runners balloon.
 if(NOT _san AND NOT WIN32 AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug" AND NOT CMAKE_BUILD_TYPE STREQUAL "QuickBuild")
-    add_compile_options(${_lto})
+    foreach(_lto_compile_option IN LISTS _lto)
+        add_compile_options(
+            "$<$<COMPILE_LANGUAGE:C,CXX>:${_lto_compile_option}>")
+    endforeach()
     add_link_options(${_lto})
 endif()
 

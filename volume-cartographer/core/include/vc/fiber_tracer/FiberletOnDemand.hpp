@@ -62,19 +62,6 @@ struct FiberletScheduledChunk {
     double nearestReferenceDistanceBase = 0.0;
 };
 
-struct FiberletEndpointScoring {
-    FiberletPredictionSample prediction;
-    cv::Vec3f normalXYZ{0.0F, 0.0F, 0.0F};
-    bool normalValid = false;
-};
-
-// This compares a persisted float32 endpoint sample with a redundant
-// reconstruction of the same evidence. It permits only bounded finite
-// compiler-roundoff; validity and axis orientation remain exact.
-[[nodiscard]] bool fiberletEndpointScoringEquivalent(
-    const FiberletStoredAnchor& cached,
-    const FiberletEndpointScoring& reconstructed) noexcept;
-
 [[nodiscard]] std::string fiberletScheduledResolutionError(
     const vc::render::ChunkKey& key,
     const vc::render::ChunkResult& resolved);

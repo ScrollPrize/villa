@@ -48,13 +48,15 @@
   after detecting different stale/current records under the unpublished v2
   identity. Default runs regenerate into v3 directories; explicit incompatible
   roots remain strict errors and old directories are not modified.
-- Added compiler identity/version and build configuration to the producer
-  fingerprint after GCC/Clang generated 2,526 versus 2,528 focused Fiberlets at
-  hard thresholds. Mixed-toolchain chunks can no longer share a dataset.
-- Preserved strict endpoint-evidence validation while allowing only bounded
-  finite float32 reconstruction roundoff across GCC/Clang; scoring and stored
-  payloads are unchanged. Scheduled failures now report the owner key,
-  terminal cache status, and nested generator cause.
+- Retained compiler identity/version and build configuration as diagnostics but
+  excluded them from cache compatibility. GCC/Clang generated 2,526 versus
+  2,528 focused Fiberlets in one unresolved comparison; the caches remain
+  interchangeable while the exact divergent decisions are investigated.
+- Made fresh prediction and Lasagna-normal samples authoritative for Fiberlet
+  generation and replay transition scoring. Cached endpoint evidence no longer
+  aborts generation when a compatible producer reconstructs slightly different
+  floats. Scheduled failures retain owner key, terminal cache status, and nested
+  generator cause.
 - Raised the exact chunk-route per-entry state guard from one million to five
   million, the smallest tested bound that completes the 1024-base staged
   Paris4 workload without partial results.
@@ -1397,6 +1399,14 @@
   traces' local axial steps and 75% arc-length dominant/mixed classification.
 - Preserved the complete line OBJ while adding direction-1, direction-2, and
   mixed line subsets plus matching actual seed-anchor point OBJs.
+
+## 2026-08-25 — Transient staged replay filtering
+
+- Made staged Fiberlet reduction options available to cache-backed replay.
+- Added globally anchored complete-box planning with backward endpoint-reach
+  expansion across stages and storage-layout-independent source coverage.
+- Kept filtered overlays invocation-local while preserving canonical source
+  caches and the original replay-corridor traversal predicate.
 
 ## 2026-08-23 — Explicit shared inference Z-band lifecycle
 

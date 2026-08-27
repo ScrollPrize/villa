@@ -292,6 +292,219 @@ struct FiberletCachedReplayGraphSource::QuantizationState {
     std::size_t maximumVariants = 0;
 };
 
+FiberletFilterPlan planFiberletFilterStages(
+    std::span<const FiberletFilterStageSpec> stages,
+    std::span<const cv::Vec3d> referenceBaseXYZ,
+    double corridorRadiusBaseVoxels,
+    const cv::Vec3d& volumeMaximumBaseXYZ,
+    const cv::Vec3d& maximumEndpointReachBaseXYZ,
+    const FiberletChunkRouteAnalysisConfig& analysisTemplate)
+{
+    if (stages.empty())
+        return {};
+    if (referenceBaseXYZ.empty() || !(corridorRadiusBaseVoxels > 0.0) ||
+        !std::isfinite(corridorRadiusBaseVoxels)) {
+        throw std::invalid_argument("fiberlet filter corridor is invalid");
+    }
+    for (int axis = 0; axis < 3; ++axis) {
+        if (!(volumeMaximumBaseXYZ[axis] > 0.0) ||
+            !std::isfinite(volumeMaximumBaseXYZ[axis]) ||
+            !(maximumEndpointReachBaseXYZ[axis] >= 0.0) ||
+            !std::isfinite(maximumEndpointReachBaseXYZ[axis])) {
+            throw std::invalid_argument("fiberlet filter volume geometry is invalid");
+        }
+    }
+    for (const auto& point : referenceBaseXYZ) {
+        if (!std::isfinite(point[0]) || !std::isfinite(point[1]) ||
+            !std::isfinite(point[2])) {
+            throw std::invalid_argument("fiberlet filter reference is invalid");
+        }
+    }
+
+    struct StageGrid {
+        std::int64_t side = 0;
+        std::array<std::int64_t, 3> offset{};
+    };
+    std::vector<StageGrid> grids;
+    grids.reserve(stages.size());
+    for (const auto& stage : stages) {
+        if (stage.sideBaseVoxels <= 0)
+            throw std::invalid_argument("fiberlet filter stage side must be positive");
+        StageGrid grid;
+        grid.side = stage.sideBaseVoxels;
+        for (int axis = 0; axis < 3; ++axis) {
+            grid.offset[axis] = stage.offsetBaseXYZ[axis] % grid.side;
+            if (grid.offset[axis] < 0)
+                grid.offset[axis] += grid.side;
+        }
+        grids.push_back(grid);
+    }
+
+    using BoxKey = std::array<std::int64_t, 3>;  // Z/Y/X lattice index
+    const auto boxConfig = [&](const StageGrid& grid, const BoxKey& key) {
+        FiberletChunkRouteAnalysisConfig result = analysisTemplate;
+        for (int xyz = 0; xyz < 3; ++xyz) {
+            const int zyx = 2 - xyz;
+            result.minimumBaseXYZ[xyz] = static_cast<double>(
+                grid.offset[xyz] + key[zyx] * grid.side);
+            result.maximumBaseXYZ[xyz] =
+                result.minimumBaseXYZ[xyz] + static_cast<double>(grid.side);
+        }
+        return result;
+    };
+    const auto complete = [&](const FiberletChunkRouteAnalysisConfig& box) {
+        for (int axis = 0; axis < 3; ++axis) {
+            if (box.minimumBaseXYZ[axis] < 0.0 ||
+                box.maximumBaseXYZ[axis] > volumeMaximumBaseXYZ[axis]) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const auto segmentIntersectsBox = [](
+                                          const cv::Vec3d& first,
+                                          const cv::Vec3d& second,
+                                          const cv::Vec3d& minimum,
+                                          const cv::Vec3d& maximum) {
+        double low = 0.0;
+        double high = 1.0;
+        const cv::Vec3d delta = second - first;
+        for (int axis = 0; axis < 3; ++axis) {
+            if (std::abs(delta[axis]) <=
+                std::numeric_limits<double>::epsilon()) {
+                if (first[axis] < minimum[axis] || first[axis] > maximum[axis])
+                    return false;
+                continue;
+            }
+            double enter = (minimum[axis] - first[axis]) / delta[axis];
+            double leave = (maximum[axis] - first[axis]) / delta[axis];
+            if (enter > leave)
+                std::swap(enter, leave);
+            low = std::max(low, enter);
+            high = std::min(high, leave);
+            if (low > high)
+                return false;
+        }
+        return true;
+    };
+    const auto insertIntersecting = [&](
+                                        const StageGrid& grid,
+                                        const cv::Vec3d& queryMinimum,
+                                        const cv::Vec3d& queryMaximum,
+                                        std::set<BoxKey>& output,
+                                        const auto& accept) {
+        std::array<std::int64_t, 3> begin{};
+        std::array<std::int64_t, 3> end{};
+        for (int xyz = 0; xyz < 3; ++xyz) {
+            const int zyx = 2 - xyz;
+            const double side = static_cast<double>(grid.side);
+            begin[zyx] = static_cast<std::int64_t>(std::floor(
+                (queryMinimum[xyz] - static_cast<double>(grid.offset[xyz])) /
+                side));
+            end[zyx] = static_cast<std::int64_t>(std::ceil(
+                (queryMaximum[xyz] - static_cast<double>(grid.offset[xyz])) /
+                side)) - 1;
+        }
+        for (std::int64_t z = begin[0]; z <= end[0]; ++z) {
+            for (std::int64_t y = begin[1]; y <= end[1]; ++y) {
+                for (std::int64_t x = begin[2]; x <= end[2]; ++x) {
+                    const BoxKey key{z, y, x};
+                    const auto box = boxConfig(grid, key);
+                    if (complete(box) && accept(box))
+                        output.insert(key);
+                }
+            }
+        }
+    };
+
+    std::vector<std::set<BoxKey>> selected(stages.size());
+    const auto& finalGrid = grids.back();
+    const auto considerSegment = [&](const cv::Vec3d& first,
+                                     const cv::Vec3d& second) {
+        cv::Vec3d queryMinimum;
+        cv::Vec3d queryMaximum;
+        for (int axis = 0; axis < 3; ++axis) {
+            queryMinimum[axis] =
+                std::min(first[axis], second[axis]) - corridorRadiusBaseVoxels;
+            queryMaximum[axis] =
+                std::max(first[axis], second[axis]) + corridorRadiusBaseVoxels;
+        }
+        insertIntersecting(
+            finalGrid, queryMinimum, queryMaximum, selected.back(),
+            [&](const FiberletChunkRouteAnalysisConfig& box) {
+                return segmentIntersectsBox(
+                    first, second,
+                    box.minimumBaseXYZ - cv::Vec3d{
+                        corridorRadiusBaseVoxels,
+                        corridorRadiusBaseVoxels,
+                        corridorRadiusBaseVoxels},
+                    box.maximumBaseXYZ + cv::Vec3d{
+                        corridorRadiusBaseVoxels,
+                        corridorRadiusBaseVoxels,
+                        corridorRadiusBaseVoxels});
+            });
+    };
+    if (referenceBaseXYZ.size() == 1) {
+        considerSegment(referenceBaseXYZ.front(), referenceBaseXYZ.front());
+    } else {
+        for (std::size_t index = 1; index < referenceBaseXYZ.size(); ++index)
+            considerSegment(referenceBaseXYZ[index - 1], referenceBaseXYZ[index]);
+    }
+    if (selected.back().empty()) {
+        throw std::invalid_argument(
+            "fiberlet filter corridor intersects no complete final-stage box");
+    }
+
+    for (std::size_t stage = stages.size() - 1; stage > 0; --stage) {
+        const auto& laterGrid = grids[stage];
+        const auto& earlierGrid = grids[stage - 1];
+        for (const auto& key : selected[stage]) {
+            const auto later = boxConfig(laterGrid, key);
+            const cv::Vec3d queryMinimum =
+                later.minimumBaseXYZ - maximumEndpointReachBaseXYZ;
+            const cv::Vec3d queryMaximum =
+                later.maximumBaseXYZ + maximumEndpointReachBaseXYZ;
+            insertIntersecting(
+                earlierGrid, queryMinimum, queryMaximum, selected[stage - 1],
+                [&](const FiberletChunkRouteAnalysisConfig&) { return true; });
+        }
+        if (selected[stage - 1].empty()) {
+            throw std::invalid_argument(
+                "fiberlet filter stage dependency intersects no complete preceding box");
+        }
+    }
+
+    FiberletFilterPlan result;
+    result.stageBoxes.resize(stages.size());
+    for (std::size_t stage = 0; stage < stages.size(); ++stage) {
+        auto& boxes = result.stageBoxes[stage];
+        boxes.reserve(selected[stage].size());
+        for (const auto& key : selected[stage])
+            boxes.push_back(boxConfig(grids[stage], key));
+    }
+    std::set<std::array<double, 6>> support;
+    for (const auto& boxes : result.stageBoxes) {
+        for (const auto& box : boxes) {
+            FiberletChunkRouteAnalysisConfig expanded = analysisTemplate;
+            for (int axis = 0; axis < 3; ++axis) {
+                expanded.minimumBaseXYZ[axis] = std::max(
+                    0.0, box.minimumBaseXYZ[axis] -
+                             maximumEndpointReachBaseXYZ[axis]);
+                expanded.maximumBaseXYZ[axis] = std::min(
+                    volumeMaximumBaseXYZ[axis], box.maximumBaseXYZ[axis] +
+                                                    maximumEndpointReachBaseXYZ[axis]);
+            }
+            const std::array<double, 6> key{
+                expanded.minimumBaseXYZ[0], expanded.minimumBaseXYZ[1],
+                expanded.minimumBaseXYZ[2], expanded.maximumBaseXYZ[0],
+                expanded.maximumBaseXYZ[1], expanded.maximumBaseXYZ[2]};
+            if (support.insert(key).second)
+                result.sourceSupportBoxes.push_back(std::move(expanded));
+        }
+    }
+    return result;
+}
+
 FiberletChunkGraphSource::FiberletChunkGraphSource(
     std::shared_ptr<FiberletChunkDataset> anchorDataset,
     std::shared_ptr<vc::render::ChunkCache> anchorCache,
@@ -3032,6 +3245,13 @@ FiberletCachedReplayGraphSource::FiberletCachedReplayGraphSource(
               return preprocessor->evaluationAnchorChunk(key, std::move(anchors));
           })
     , pathConfig_(std::move(pathConfig))
+    , traversalCellPredicate_([preprocessor = preprocessor_](
+                                  const std::array<std::size_t, 3>& cell) {
+          FiberletStorageKey key;
+          for (std::size_t axis = 0; axis < 3; ++axis)
+              key.coordinateZYX[axis] = static_cast<std::int64_t>(cell[axis]);
+          return preprocessor->isSelectedAnchorCell(key);
+      })
     , evaluationQuantization_(std::move(evaluationQuantization))
     , maximumJoinAngleDegrees_(maximumJoinAngleDegrees)
     , quantizationState_(std::make_shared<QuantizationState>())
@@ -3047,6 +3267,53 @@ FiberletCachedReplayGraphSource::FiberletCachedReplayGraphSource(
           !std::isfinite(evaluationQuantization_.costDensityMaximum))) ||
         evaluationQuantization_.storageChunkSideBaseVoxels <= 0) {
         throw std::invalid_argument("cached fiberlet logical quantization is invalid");
+    }
+    (void)fiberletPositionBinCountForEvaluation(
+        evaluationQuantization_.storageChunkSideBaseVoxels,
+        evaluationQuantization_.positionQuantumBaseVoxels);
+}
+
+FiberletCachedReplayGraphSource::FiberletCachedReplayGraphSource(
+    std::shared_ptr<FiberletOnDemandPreprocessor> preprocessor,
+    std::shared_ptr<FiberletChunkDataset> evaluatedAnchorDataset,
+    std::shared_ptr<vc::render::ChunkCache> evaluatedAnchorCache,
+    std::shared_ptr<FiberletChunkDataset> fiberletDataset,
+    std::shared_ptr<vc::render::ChunkCache> fiberletCache,
+    FiberletAnchorCellPredicate traversalCellPredicate,
+    FiberletPathConfig pathConfig,
+    FiberletEvaluationQuantization evaluationQuantization,
+    float maximumJoinAngleDegrees)
+    : preprocessor_(std::move(preprocessor))
+    , chunks_(
+          std::move(evaluatedAnchorDataset), std::move(evaluatedAnchorCache),
+          std::move(fiberletDataset), std::move(fiberletCache), pathConfig)
+    , pathConfig_(std::move(pathConfig))
+    , traversalCellPredicate_(std::move(traversalCellPredicate))
+    , evaluationQuantization_(std::move(evaluationQuantization))
+    , maximumJoinAngleDegrees_(maximumJoinAngleDegrees)
+    , quantizationState_(std::make_shared<QuantizationState>())
+{
+    if (!preprocessor_ || !traversalCellPredicate_ ||
+        !(maximumJoinAngleDegrees_ >= 0.0F) ||
+        !(maximumJoinAngleDegrees_ <= 180.0F) ||
+        !std::isfinite(maximumJoinAngleDegrees_)) {
+        throw std::invalid_argument(
+            "filtered cached fiberlet replay graph configuration is invalid");
+    }
+    if ((evaluationQuantization_.costBits != 0 &&
+         evaluationQuantization_.costBits != 8 &&
+         evaluationQuantization_.costBits != 16) ||
+        (evaluationQuantization_.costDomain !=
+             FiberletCostQuantizationDomain::RawTotal &&
+         evaluationQuantization_.costDomain !=
+             FiberletCostQuantizationDomain::SqrtPerPredictionVoxel) ||
+        (evaluationQuantization_.costDomain ==
+             FiberletCostQuantizationDomain::SqrtPerPredictionVoxel &&
+         (!(evaluationQuantization_.costDensityMaximum > 0.0F) ||
+          !std::isfinite(evaluationQuantization_.costDensityMaximum))) ||
+        evaluationQuantization_.storageChunkSideBaseVoxels <= 0) {
+        throw std::invalid_argument(
+            "filtered cached fiberlet logical quantization is invalid");
     }
     (void)fiberletPositionBinCountForEvaluation(
         evaluationQuantization_.storageChunkSideBaseVoxels,
@@ -3082,7 +3349,16 @@ DirectedFiberletStorageId FiberletCachedReplayGraphSource::logicalArcId(const Di
 
 bool FiberletCachedReplayGraphSource::anchorCellInCorridor(const FiberletStorageKey& anchorKey) const
 {
-    return preprocessor_->isSelectedAnchorCell(anchorKey);
+    std::array<std::size_t, 3> cell{};
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        if (anchorKey.coordinateZYX[axis] < 0 ||
+            static_cast<std::uint64_t>(anchorKey.coordinateZYX[axis]) >
+                std::numeric_limits<std::size_t>::max()) {
+            return false;
+        }
+        cell[axis] = static_cast<std::size_t>(anchorKey.coordinateZYX[axis]);
+    }
+    return traversalCellPredicate_(cell);
 }
 
 FiberletStorageKey FiberletCachedReplayGraphSource::logicalAnchorKey(const FiberletStorageKey& physical) const

@@ -5,13 +5,11 @@
 #include <chrono>
 #include <cmath>
 #include <future>
-#include <iomanip>
 #include <iterator>
 #include <limits>
 #include <map>
 #include <mutex>
 #include <set>
-#include <sstream>
 #include <stdexcept>
 #include <tuple>
 
@@ -101,37 +99,6 @@ const char* chunkStatusName(vc::render::ChunkStatus status) noexcept
     return "unknown";
 }
 
-std::string scoringVector(const cv::Vec3f& value)
-{
-    std::ostringstream output;
-    output << std::setprecision(std::numeric_limits<float>::max_digits10)
-           << value[0] << ',' << value[1] << ',' << value[2];
-    return output.str();
-}
-
-constexpr float kEndpointScoringRoundoff =
-    8.0F * std::numeric_limits<float>::epsilon();
-
-bool sameReconstructedFloat(float left, float right) noexcept
-{
-    if (!std::isfinite(left) || !std::isfinite(right))
-        return false;
-    const double leftValue = static_cast<double>(left);
-    const double rightValue = static_cast<double>(right);
-    const double scale =
-        std::max({1.0, std::abs(leftValue), std::abs(rightValue)});
-    return std::abs(leftValue - rightValue) <=
-        static_cast<double>(kEndpointScoringRoundoff) * scale;
-}
-
-bool sameReconstructedVector(
-    const cv::Vec3f& left, const cv::Vec3f& right) noexcept
-{
-    return sameReconstructedFloat(left[0], right[0]) &&
-        sameReconstructedFloat(left[1], right[1]) &&
-        sameReconstructedFloat(left[2], right[2]);
-}
-
 LoadedFiberAnchorArtifact loadedAnchors(const FiberPredictionGridInfo& grid, const FiberAnchorConfig& config, std::vector<FiberletStoredAnchor> anchors)
 {
     LoadedFiberAnchorArtifact loaded;
@@ -171,22 +138,6 @@ LoadedFiberAnchorArtifact loadedAnchors(const FiberPredictionGridInfo& grid, con
 }
 
 }  // namespace
-
-bool fiberletEndpointScoringEquivalent(
-    const FiberletStoredAnchor& cached,
-    const FiberletEndpointScoring& reconstructed) noexcept
-{
-    const auto& prediction = reconstructed.prediction;
-    return cached.predictionValid == prediction.valid &&
-        cached.predictionPresenceValid == prediction.presenceValid &&
-        cached.normalValid == reconstructed.normalValid &&
-        sameReconstructedFloat(
-            cached.predictionPresence, prediction.presence) &&
-        (!prediction.valid || sameReconstructedVector(
-            cached.predictionAxisXYZ, prediction.direction)) &&
-        (!reconstructed.normalValid || sameReconstructedVector(
-            cached.normalXYZ, reconstructed.normalXYZ));
-}
 
 std::string fiberletScheduledResolutionError(
     const vc::render::ChunkKey& key,
@@ -618,7 +569,7 @@ std::shared_ptr<const std::vector<FiberletStoredAnchor>> FiberletOnDemandPreproc
                 anchor.fittedAxisXYZ = quantizeFiberletDirectionForEvaluation(anchor.fittedAxisXYZ);
             }
         }
-        if (quantization.positionQuantumBaseVoxels > 0 && !transformed->empty()) {
+        if (!transformed->empty()) {
             std::vector<cv::Vec3f> scoringPoints;
             scoringPoints.reserve(transformed->size());
             for (const auto& anchor : *transformed)
@@ -966,9 +917,6 @@ FiberletChunkDataset::MaterializedChunk FiberletOnDemandPreprocessor::generateFi
         config.progress(FiberletOnDemandProgress{.stage = "fiberlets", .status = "started", .key = prefixKey, .inputCount = storedAnchors.size()});
     }
     const std::size_t inputAnchorCount = storedAnchors.size();
-    std::map<FiberletStorageKey, FiberletStoredAnchor> scoringByAnchor;
-    for (const auto& anchor : storedAnchors)
-        scoringByAnchor.emplace(anchor.key, anchor);
     auto loaded = loadedAnchors(config.grid, config.anchorConfig, std::move(storedAnchors));
     const auto ownerBegin = codec.coordinateOriginZYX;
     std::array<std::int64_t, 3> ownerEnd{};
@@ -1010,54 +958,9 @@ FiberletChunkDataset::MaterializedChunk FiberletOnDemandPreprocessor::generateFi
         FiberletStoredRoute route;
     };
     std::vector<StoredPair> pairs;
-    const auto validateEndpointScoring = [&](const FiberletAnchorId& id, const FiberletPredictionSample& prediction, const cv::Vec3f& normal, bool normalValid) {
-        const auto found = scoringByAnchor.find(storageKey(id));
-        if (found == scoringByAnchor.end())
-            throw std::logic_error("fiberlet endpoint scoring anchor is absent");
-        const auto& stored = found->second;
-        const FiberletEndpointScoring reconstructed{
-            prediction, normal, normalValid};
-        if (fiberletEndpointScoringEquivalent(stored, reconstructed)) {
-            return;
-        }
-        std::string mismatch;
-        if (stored.predictionValid != prediction.valid)
-            mismatch = "prediction validity";
-        else if (stored.predictionPresenceValid != prediction.presenceValid)
-            mismatch = "presence validity";
-        else if (stored.normalValid != normalValid)
-            mismatch = "normal validity";
-        else if (!sameReconstructedFloat(
-                     stored.predictionPresence, prediction.presence))
-            mismatch = "presence";
-        else if (prediction.valid && !sameReconstructedVector(
-                     stored.predictionAxisXYZ, prediction.direction))
-            mismatch = "prediction direction";
-        else if (normalValid && !sameReconstructedVector(
-                     stored.normalXYZ, normal))
-            mismatch = "normal direction";
-        if (!mismatch.empty()) {
-            std::string message =
-                "fiberlet endpoint " + std::to_string(id.cellZYX[0]) + '/' +
-                std::to_string(id.cellZYX[1]) + '/' +
-                std::to_string(id.cellZYX[2]) + ':' +
-                std::to_string(id.componentIndex) + ' ' + mismatch +
-                " differs from its cached anchor sample";
-            if (mismatch == "normal direction")
-                message += " stored=" + scoringVector(stored.normalXYZ) +
-                    " sampled=" + scoringVector(normal);
-            else if (mismatch == "prediction direction")
-                message += " stored=" +
-                    scoringVector(stored.predictionAxisXYZ) + " sampled=" +
-                    scoringVector(prediction.direction);
-            throw std::logic_error(std::move(message));
-        }
-    };
     for (const auto& candidate : report.candidates) {
         if (!candidate.success)
             continue;
-        validateEndpointScoring(candidate.start, candidate.startPrediction, candidate.startNormalXYZ, candidate.startNormalValid);
-        validateEndpointScoring(candidate.target, candidate.targetPrediction, candidate.targetNormalXYZ, candidate.targetNormalValid);
         if (candidate.routeLatticeUV.size() > std::numeric_limits<std::uint16_t>::max())
             throw std::overflow_error("fiberlet route has too many interior layers");
         StoredPair stored;

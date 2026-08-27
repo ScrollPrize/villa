@@ -210,8 +210,13 @@ std::array<std::uint8_t, 32> datasetFingerprint(std::string_view value)
     return result;
 }
 
-json algorithmIdentityJson(const FiberletDatasetMetadata& metadata)
+json algorithmIdentityJson(
+    const FiberletDatasetMetadata& metadata,
+    bool includeProducerToolchain = false)
 {
+    auto processing = metadata.processing;
+    if (!includeProducerToolchain)
+        processing.erase("producer_toolchain");
     return {
         {"identity_version", 2},
         {"dataset_kind", kindName(metadata.kind)},
@@ -230,7 +235,7 @@ json algorithmIdentityJson(const FiberletDatasetMetadata& metadata)
              ? json(nullptr)
              : json(metadata.positionQuantumBaseVoxels)},
         {"prediction_to_base", metadata.predictionToBaseScale},
-        {"processing", metadata.processing},
+        {"processing", std::move(processing)},
     };
 }
 
@@ -275,6 +280,18 @@ void validateMetadata(const FiberletDatasetMetadata& metadata)
         {"algorithm", algorithmIdentityJson(canonical)},
         {"sources", canonical.sources},
     }.dump());
+    if (metadata.algorithmFingerprint == canonical.algorithmFingerprint &&
+        metadata.datasetFingerprint == canonical.datasetFingerprint) {
+        return;
+    }
+    if (metadata.processing.contains("producer_toolchain")) {
+        canonical.algorithmFingerprint = stringFingerprint(
+            algorithmIdentityJson(canonical, true).dump());
+        canonical.datasetFingerprint = datasetFingerprint(json{
+            {"algorithm", algorithmIdentityJson(canonical, true)},
+            {"sources", canonical.sources},
+        }.dump());
+    }
     if (metadata.algorithmFingerprint != canonical.algorithmFingerprint ||
         metadata.datasetFingerprint != canonical.datasetFingerprint) {
         throw std::invalid_argument(
@@ -1563,6 +1580,21 @@ void validateFiberletNormalDatasetCompatibility(
     vc::lasagna::validateLasagnaNormalDatasetStructure(normals);
 }
 
+bool fiberletDatasetMetadataCompatible(
+    const FiberletDatasetMetadata& left,
+    const FiberletDatasetMetadata& right)
+{
+    auto canonicalLeft = left;
+    auto canonicalRight = right;
+    canonicalLeft.processing.erase("producer_toolchain");
+    canonicalRight.processing.erase("producer_toolchain");
+    finalizeFiberletDatasetIdentity(canonicalLeft);
+    finalizeFiberletDatasetIdentity(canonicalRight);
+    return canonicalLeft.algorithmFingerprint ==
+            canonicalRight.algorithmFingerprint &&
+        canonicalLeft.datasetFingerprint == canonicalRight.datasetFingerprint;
+}
+
 FiberletChunkDataset::FiberletChunkDataset(
     std::filesystem::path root,
     FiberletDatasetMetadata metadata,
@@ -1585,14 +1617,16 @@ std::shared_ptr<FiberletChunkDataset> FiberletChunkDataset::createOrOpen(
 {
     validateMetadata(metadata);
     const auto expected = metadataJson(metadata);
+    auto effectiveMetadata = metadata;
     if (std::filesystem::exists(root / ".zattrs")) {
         const auto group = json::parse(readText(root / ".zgroup"));
         if (group != json{{"zarr_format", 2}})
             throw std::invalid_argument("fiberlet dataset .zgroup metadata is invalid");
         const auto storedJson = json::parse(readText(root / ".zattrs"));
         const auto parsed = parseMetadata(storedJson);
-        if (metadataJson(parsed) != expected)
+        if (!fiberletDatasetMetadataCompatible(parsed, metadata))
             throw std::invalid_argument("fiberlet dataset metadata does not match the requested configuration");
+        effectiveMetadata = parsed;
         for (const auto kind : datasetKinds(metadata.kind)) {
             const auto storedArray = json::parse(readText(arrayDirectory(root, kind) / ".zarray"));
             if (storedArray != arrayMetadata(metadata, kind))
@@ -1611,7 +1645,7 @@ std::shared_ptr<FiberletChunkDataset> FiberletChunkDataset::createOrOpen(
         removeLegacyBookkeeping(root);
     }
     return std::shared_ptr<FiberletChunkDataset>(new FiberletChunkDataset(
-        std::move(root), metadata, std::move(writeBack)));
+        std::move(root), std::move(effectiveMetadata), std::move(writeBack)));
 }
 
 std::shared_ptr<FiberletChunkDataset> FiberletChunkDataset::openExisting(

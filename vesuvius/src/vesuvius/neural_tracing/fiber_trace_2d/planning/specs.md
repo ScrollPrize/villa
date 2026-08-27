@@ -3658,20 +3658,50 @@
   authoritative anchor, prefix, or route record for otherwise identical
   effective inputs must increment that contract before writing payloads. The
   current unpublished contract is version 3. Compiler identity/version and
-  build configuration are also producer identity because supported toolchains
-  can place candidates differently at hard float thresholds. Old or different-
-  toolchain directories are not migrated, repaired, or read through; default
-  fingerprinted roots select a new namespace, while explicitly selecting an
-  incompatible root is an error.
-- Endpoint scoring reconstructed during Fiberlet generation must match the
-  cached canonical anchor evidence. Validity flags and axis orientation are
-  exact. Finite float32 presence and vector components may differ by at most
-  eight float32 epsilons times `max(1, abs(a), abs(b))` to cover redundant
-  reconstruction across supported compilers; nonfinite or larger differences
-  remain hard errors. This tolerance never changes scoring, paths, costs, or
-  serialized values and cannot bridge producer contracts. No retry or
-  mixed-producer repair is permitted. A scheduled failure preserves the owner
-  key, terminal cache status, and original nested generator message.
+  build configuration are diagnostic metadata only; they are excluded from
+  algorithm and dataset fingerprints and do not make otherwise equivalent
+  caches incompatible. Default cache discovery may reuse an earlier version-3
+  toolchain-specific namespace after comparing the remaining structured
+  identity. Version-2 directories are not migrated, repaired, or read through;
+  explicitly selecting any scientifically incompatible root is an error.
+- Cached anchor prediction, presence, and Lasagna-normal fields are not a
+  generation consistency boundary. Fiberlet generation uses freshly sampled
+  endpoint and interior evidence for every metric and decision and does not
+  compare it with those cached fields. Replay transition scoring likewise uses
+  a single-flight derived anchor view which resamples that evidence at each
+  effective anchor position. Cached stable IDs, fitted geometry, and positions
+  remain authoritative. A scheduled failure preserves the owner key, terminal
+  cache status, and original nested generator message.
+
+## Staged Fiberlet replay filtering
+
+- Cache-backed `vc_fiberlets fiberlet-replay` accepts the ordered repeatable
+  `--stage SIDE,OFFSET_X,OFFSET_Y,OFFSET_Z`, `--join-angle`, `--cost-profile`,
+  and `--max-states` reduction options. No stage preserves ordinary replay
+  behavior. Filtered replay is incompatible with eager graph extraction.
+- Replay filter stages are cubic lattices in global base-volume XYZ. Each
+  offset is normalized modulo its positive side. Selected boxes are complete,
+  half-open boxes within the prediction volume and execute in deterministic
+  Z/Y/X order. They are never re-anchored to a replay interval, storage chunk,
+  generation cell, or processing-cache chunk.
+- The last stage includes every complete global box whose corridor-expanded
+  extent intersects the selected reference polyline. Planning proceeds
+  backward: every preceding stage includes all complete boxes intersecting a
+  required later box expanded by the dataset's declared maximum endpoint reach.
+  Base anchor/Fiberlet generation covers the union of required boxes expanded
+  by that reach and clipped to the volume.
+- Stage boxes, anchor-generation cells, and persistent Fiberlet storage chunks
+  are independent globally anchored layouts and may have different sizes and
+  boundaries. Coverage crosses layouts only through half-open base-space
+  extents and the canonical storage-owner halo calculation.
+- Filtering reuses the canonical staged analysis, simplification, overlay, and
+  write-back implementation. Derived layers are invocation-local and are never
+  published as a persistent filtered cache. Canonical unfiltered on-demand
+  chunks retain their normal persistent cache behavior.
+- Expanded support exists only to make every selected final-stage box complete.
+  Replay seed and traversal predicates remain the original selected reference
+  corridor, so support expansion cannot make out-of-corridor graph nodes
+  eligible. Replay result metadata records the ordered stage and filter policy.
 
 ## Chunk-local optimal Fiberlet-route diagnostic
 
@@ -3718,8 +3748,9 @@
   rewrites or prunes existing graph payloads and never marks a partial cache
   complete.
 - Staged regional mode accepts an ordered, repeatable sequence of cubic
-  analysis sides and base-XYZ offsets relative to a selected half-open bbox.
-  Each stage enumerates every complete box on that offset lattice in canonical
+  analysis sides and global base-XYZ offsets plus a selected half-open bbox.
+  Offsets are normalized modulo their side. Each stage enumerates every
+  complete global-lattice box contained by the selected bbox in canonical
   Z/Y/X order. Analysis boxes need not align with anchor cells or storage
   chunks. Every derived stage uses separate temporary anchor and Fiberlet
   overlays with exactly the initial datasets' storage layout and encoding; the

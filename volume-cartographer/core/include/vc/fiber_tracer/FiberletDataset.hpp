@@ -129,6 +129,13 @@ void validateFiberletNormalDatasetCompatibility(
     const FiberletDatasetMetadata& metadata,
     const vc::lasagna::LasagnaDataset& normals);
 
+// Producer diagnostics do not affect cache compatibility. This also permits
+// reopening version-3 caches written before producer toolchains were removed
+// from the scientific identity.
+[[nodiscard]] bool fiberletDatasetMetadataCompatible(
+    const FiberletDatasetMetadata& left,
+    const FiberletDatasetMetadata& right);
+
 class FiberletChunkDataset
 {
 public:
