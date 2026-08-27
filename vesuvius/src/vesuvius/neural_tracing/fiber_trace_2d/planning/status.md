@@ -1,10 +1,10 @@
-# Status: Full orientation constraints in fiber BP
+# Status: Split-piece fiber BP
 
-- [x] Capture the full-constraint BP requirement.
+- [x] Capture the split-piece BP requirement.
 - [x] Write implementation, spec, docs, and test plan.
 - [x] Complete independent plan review.
-- [x] Enable parallel factors in BP graph construction and CLI.
-- [x] Generalize consistency diagnostics.
+- [x] Add shared piece geometry and piece-node graph handling.
+- [x] Update CLI reporting and diagnostics for pieces.
 - [x] Add focused regression tests.
 - [x] Update specs, docs, changelog, and task log.
 - [x] Build and run focused validation.

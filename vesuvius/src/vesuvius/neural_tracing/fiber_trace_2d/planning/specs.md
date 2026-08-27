@@ -5023,13 +5023,23 @@
 ### Binary BP constraint-consistency diagnostic
 
 - `direction-ablation --bp-only` processes only the final admitted cohort and
-  must not call the HiGHS MILP or LP solvers. It requires exactly one constraint
-  piece per represented fiber. Optional strength pruning precedes the shared
+  must not call the HiGHS MILP or LP solvers. Every extracted constraint piece
+  is one BP node. Optional strength pruning precedes the shared
   labeling constraint selector; BP receives the selector's retained constraints
   in their original order. `--perpendicular-only` optionally restricts the
   graph; without it, complementary parallel and perpendicular evidence in
-  `[0,1]` is accepted. Hard continuity or non-complementary evidence fails.
-- BP merges measurements by unordered represented-fiber pair. A merged
+  `[0,1]` is accepted. Canonical same-source continuity remains finite
+  parallel-score-1 same-label evidence, not equality. Missing, duplicate,
+  nonconsecutive, malformed, or cross-source hard continuity; soft same-source
+  links; hard/soft piece-pair collisions; invalid ownership; and
+  non-complementary evidence fail.
+- Admitted dense source traces remain the input to the established
+  central-straight seed selection. The selected source's exact dense clipped
+  piece with minimum Euclidean crop-center distance becomes the sole hard-H
+  seed; exact ties use ascending global piece ID. A selected source without a
+  valid piece fails. Optional balance weights are piece arc spans, including
+  overlap once for every piece.
+- BP merges soft measurements by unordered represented-piece pair. A merged
   factor's same cost is `sum(1-p_k)`, different cost is `sum(p_k)`, strength is
   `abs(same-different)`, and the lower-cost relation may be same or different.
   Before inference, subtract `min(same,different)` from both oriented costs, so
@@ -5054,11 +5064,12 @@
   `2*min(sum(w*(1-h_j)),sum(w*h_j))/sum(w)` and must be interpreted with the
   separately reported mean neighbor certainty
   `sum(w*abs(2*h_j-1))/sum(w)`.
-- `<base>_bp_none_consistency.csv` has stable cohort-local and original trace
-  identities, initial reference group, BP status and thresholds, horizontalness,
+- `<base>_bp_none_consistency.csv` has stable global piece, original source
+  trace, source-local piece, and begin/end base-arc identities, initial
+  reference group, BP status and thresholds, horizontalness,
   degree/measurement/strength partitions, hard mismatch fields, and the three
   smooth diagnostics. It is replaced on each successful run. Console summaries
-  are equal-per-fiber count/min/mean/median/p90/max by Direction1, Direction2,
+  are equal-per-piece count/min/mean/median/p90/max by Direction1, Direction2,
   and Mixed, excluding undefined values. Tie-aware AUROC compares Mixed against
   both trusted groups, with the printed direction defining whether higher or
   lower values predict Mixed.
@@ -5095,7 +5106,8 @@
   zero. Normalization ensures at least one oriented relation also has zero
   energy, so a common raw factor offset cannot favor Mixed. Each non-seed node
   instead has unary energies `U(V)=U(H)=0` and
-  `U(Mixed)=bp_mixed_cost`. The unary is charged exactly once per node,
+  `U(Mixed)=bp_mixed_cost`. Every piece is one node, so the unary is charged
+  exactly once per piece,
   independent of degree or merged measurement count. `--bp-mixed-cost` must
   be finite and nonnegative and is invalid outside this inference mode.
 - Ternary directed messages contain V/Mixed/H log values. Raw and post-damping

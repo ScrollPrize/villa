@@ -1,28 +1,24 @@
-# Task Log: Full orientation constraints in fiber BP
+# Task Log: Split-piece fiber BP
 
 ## Findings
 
-- The solver already accumulates `sameCost += 1-p` and
-  `differentCost += p`; therefore decisiveness is the energy gap
-  `abs(1-2p)` per unmerged measurement and requires no new weight.
-- The current graph validator and CLI explicitly require perpendicular-only
-  evidence.
-- Current hard mismatch and neighbor-support diagnostics assume every factor
-  prefers different labels, so merely relaxing validation would produce wrong
-  reports for parallel factors.
-- Independent review found that raw common factor costs are irrelevant to
-  binary BP but currently bias ternary BP toward zero-energy Mixed. The solver
-  must normalize merged oriented costs to their minimum so only decisiveness
-  remains. Exact canceled factors then carry no information and must not dilute
-  diagnostics or connect components.
-- Ternary soft diagnostics must use explicit V/Mixed/H marginals rather than
-  treating Mixed as half V and half H through the orientation projection.
+- Constraint extraction already produces piece-local geometry and canonical
+  same-source continuity links before spatial constraint search.
+- BP currently maps every piece back to a unique source trace and therefore
+  rejects both multiple pieces and continuity links.
+- The CLI currently passes full source fibers to BP visualization and assumes
+  each report vector has source-fiber cardinality; graph construction alone is
+  therefore insufficient.
+- Existing labeling semantics retain continuity as strong parallel evidence,
+  not a mathematical equality. BP must preserve that behavior.
 
 ## Plan Review
 
-- Independent review conditionally approved full-relation BP after requiring
-  explicit ternary factor normalization, neutral-factor handling, and
-  ternary-native consistency diagnostics. The plan now includes these fixes.
+- Independent review approved piece-node BP after requiring exact dense
+  source-geometry clipping, full continuity-topology validation, explicit
+  source-versus-piece cardinality, deterministic exact seed mapping, per-piece
+  unary/balance semantics, complete CSV/OBJ identity, and stronger no-split
+  equivalence coverage. The plan now includes those corrections.
 
 ## Deviations
 
@@ -32,16 +28,16 @@
 
 - Built `vc_fiber_trace_chunk` and `test_fiberlet_crop_trace` from the existing
   `volume-cartographer/build` configuration with `-j32`.
-- `volume-cartographer/build/bin/test_fiberlet_crop_trace`: 68 test cases
-  passed.
-- The 1024 full-constraint run used 7,174 effective factors, converged in
-  0.345 seconds, and produced no neutral factors on this crop. At temperature
-  2.5 and Mixed unary cost 1.0, the direction-confusion counts were:
-  `dir1 -> V/Mixed/H/tie = 1/54/153/1`,
-  `dir2 -> V/Mixed/H/tie = 115/42/0/0`, and
-  `mixed -> V/Mixed/H/tie = 24/95/15/0`.
-- A matching `--perpendicular-only` smoke run still converged and selected the
-  expected smaller 4,941-factor graph.
-- Rewrote the established 1024 visualization basename at
-  `$VES/data/workdir3/fiber-crop-1024/fibers` with that full-constraint result.
+- `volume-cartographer/build/bin/test_fiberlet_crop_trace`: 72 test cases
+  passed after adding split exactness, topology rejection, dense clipping,
+  finite-continuity, unary, and no-split coverage.
+- The Paris4 1024 crop with ordinary `--piece-length 512` produced 1,298 BP
+  pieces from 500 source fibers and selected 26,402 full-orientation factors.
+  Mixed-state sum-product converged in 0.745 seconds.
+- The matching split `--perpendicular-only` smoke selected 15,017 factors and
+  converged; a `--constraints-per-fiber 5` smoke selected 1,747 factors and
+  converged, confirming both selector paths retain continuity.
+- The split CSV contains one header plus 1,298 piece rows with global/source/
+  local/arc identity. The ten orientation-band OBJs and four direct-state OBJs
+  each partition all 1,298 pieces.
 - `git diff --check` passed.

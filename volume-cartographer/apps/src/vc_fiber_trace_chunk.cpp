@@ -144,7 +144,7 @@ void usage(const char* executable)
               << "Belief-propagation options (direction-ablation only):\n"
               << "  --bp-only                 run only final-cohort BP; skip HiGHS\n"
               << "  --bp-inference MODE       min-sum, sum-product, or sum-product-mixed [min-sum]\n"
-              << "  --bp-mixed-cost F         Mixed-state unary cost per fiber [0.5]\n"
+              << "  --bp-mixed-cost F         Mixed-state unary cost per piece [0.5]\n"
               << "  --bp-balance MODE         soft, tight, or both [disabled]\n"
               << "  --bp-target F             arc-weighted H fraction [0.5]\n"
               << "  --bp-soft-strength F      quadratic balance strength [1]\n"
@@ -1126,14 +1126,15 @@ void writeAndPrintBpReport(
     const bool mixedState = report.inference ==
         vc::fiber_tracer::FiberTraceBeliefInference::SumProductMixed;
     if (report.horizontalness.size() != lines.size() ||
+        constraints.pieces.size() != lines.size() ||
         directions.size() != lines.size() ||
         originalTraceIndices.size() != lines.size() ||
-        report.seedTraceIndex >= lines.size() ||
+        report.seedPieceIndex >= lines.size() ||
         (mixedState &&
          (report.verticalProbability.size() != lines.size() ||
           report.mixedProbability.size() != lines.size() ||
           report.horizontalProbability.size() != lines.size()))) {
-        throw std::logic_error("BP report does not match represented fibers");
+        throw std::logic_error("BP report does not match represented pieces");
     }
     const std::string modeName =
         vc::fiber_tracer::fiberTraceBalanceModeName(mode);
@@ -1189,7 +1190,7 @@ void writeAndPrintBpReport(
     std::ofstream csvOutput(csv);
     if (!csvOutput)
         throw std::runtime_error("failed to open BP consistency CSV: " + csv.string());
-    csvOutput << "trace,original_trace,reference,";
+    csvOutput << "piece,original_trace,source_piece,begin_arc_base,end_arc_base,reference,";
     if (sumProduct) {
         csvOutput << "bp_inference,bp_temperature,";
     }
@@ -1212,23 +1213,27 @@ void writeAndPrintBpReport(
         else
             csvOutput << "NA";
     };
-    for (std::size_t trace = 0; trace < consistency.traces.size(); ++trace) {
-        const auto& current = consistency.traces[trace];
-        csvOutput << trace << ',' << originalTraceIndices[trace] << ','
-                  << directionName(directions[trace]) << ',';
+    for (std::size_t piece = 0; piece < consistency.pieces.size(); ++piece) {
+        const auto& current = consistency.pieces[piece];
+        const auto& descriptor = constraints.pieces[piece];
+        csvOutput << piece << ',' << originalTraceIndices[piece] << ','
+                  << descriptor.pieceIndex << ','
+                  << descriptor.beginArcBaseVoxels << ','
+                  << descriptor.endArcBaseVoxels << ','
+                  << directionName(directions[piece]) << ',';
         if (sumProduct) {
             csvOutput << inferenceName << ',' << report.inferenceTemperature
                       << ',';
         }
         if (mixedState) {
             csvOutput << report.mixedUnaryCost << ','
-                      << report.verticalProbability[trace] << ','
-                      << report.mixedProbability[trace] << ','
-                      << report.horizontalProbability[trace] << ',';
+                      << report.verticalProbability[piece] << ','
+                      << report.mixedProbability[piece] << ','
+                      << report.horizontalProbability[piece] << ',';
         }
         csvOutput << report.status << ',' << consistency.verticalThreshold << ','
                   << consistency.horizontalThreshold << ','
-                  << report.horizontalness[trace] << ',' << current.degree
+                  << report.horizontalness[piece] << ',' << current.degree
                   << ',' << current.incidentMeasurements << ','
                   << current.totalStrength << ','
                   << current.resolvedDegree << ',' << current.resolvedStrength
@@ -1252,9 +1257,10 @@ void writeAndPrintBpReport(
     if (mixedState) {
         std::cout
             << "fiber direction Mixed-state sum-product BP\n"
-            << "inference  temperature  mixed_unary_cost  status  fibers  factors  measurements"
+            << "inference  temperature  mixed_unary_cost  status  pieces  factors  measurements"
                "  neutral_factors  neutral_measurements"
-               "  components  isolated  seed  seed_ref  message_iterations"
+               "  components  isolated_pieces  seed_piece  seed_original_trace"
+               "  seed_source_piece  seed_ref  message_iterations"
                "  message_residual  achieved_orientation  min_orientation"
                "  mean_orientation  max_orientation  seconds\n"
             << inferenceName << "  " << report.inferenceTemperature << "  "
@@ -1262,9 +1268,11 @@ void writeAndPrintBpReport(
             << report.status << "  " << lines.size() << "  " << report.factors
             << "  " << report.mergedMeasurements << "  "
             << report.neutralFactors << "  " << report.neutralMeasurements << "  "
-            << report.connectedComponents << "  " << report.isolatedTraces
-            << "  " << report.seedTraceIndex << "  "
-            << directionName(directions[report.seedTraceIndex]) << "  "
+            << report.connectedComponents << "  " << report.isolatedPieces
+            << "  " << report.seedPieceIndex << "  "
+            << originalTraceIndices[report.seedPieceIndex] << "  "
+            << constraints.pieces[report.seedPieceIndex].pieceIndex << "  "
+            << directionName(directions[report.seedPieceIndex]) << "  "
             << report.messageIterations << "  " << report.messageResidual
             << "  " << report.achievedHorizontalFraction << "  " << *minimum
             << "  " << mean << "  " << *maximum << "  "
@@ -1272,17 +1280,20 @@ void writeAndPrintBpReport(
     } else if (sumProduct) {
         std::cout
             << "fiber direction sum-product BP\n"
-            << "inference  temperature  status  fibers  factors  measurements"
+            << "inference  temperature  status  pieces  factors  measurements"
                "  neutral_factors  neutral_measurements"
-               "  components  isolated  seed  seed_ref  message_iterations"
+               "  components  isolated_pieces  seed_piece  seed_original_trace"
+               "  seed_source_piece  seed_ref  message_iterations"
                "  message_residual  achieved_h  min_h  mean_h  max_h  seconds\n"
             << inferenceName << "  " << report.inferenceTemperature << "  "
             << report.status << "  " << lines.size() << "  " << report.factors
             << "  " << report.mergedMeasurements << "  "
             << report.neutralFactors << "  " << report.neutralMeasurements << "  "
-            << report.connectedComponents << "  " << report.isolatedTraces
-            << "  " << report.seedTraceIndex << "  "
-            << directionName(directions[report.seedTraceIndex]) << "  "
+            << report.connectedComponents << "  " << report.isolatedPieces
+            << "  " << report.seedPieceIndex << "  "
+            << originalTraceIndices[report.seedPieceIndex] << "  "
+            << constraints.pieces[report.seedPieceIndex].pieceIndex << "  "
+            << directionName(directions[report.seedPieceIndex]) << "  "
             << report.messageIterations << "  " << report.messageResidual
             << "  " << report.achievedHorizontalFraction << "  " << *minimum
             << "  " << mean << "  " << *maximum << "  "
@@ -1290,9 +1301,10 @@ void writeAndPrintBpReport(
     } else {
         std::cout
             << "fiber direction min-sum BP\n"
-            << "mode  status  fibers  factors  measurements  neutral_factors"
+            << "mode  status  pieces  factors  measurements  neutral_factors"
                "  neutral_measurements  components"
-               "  isolated  seed  seed_ref  message_iterations"
+               "  isolated_pieces  seed_piece  seed_original_trace  seed_source_piece"
+               "  seed_ref  message_iterations"
                "  balance_iterations  message_residual  field  target_h"
                "  achieved_h  min_h  mean_h  max_h  seconds\n"
             << modeName << "  " << report.status << "  " << lines.size()
@@ -1300,8 +1312,10 @@ void writeAndPrintBpReport(
             << "  " << report.neutralFactors << "  "
             << report.neutralMeasurements
             << "  " << report.connectedComponents << "  "
-            << report.isolatedTraces << "  " << report.seedTraceIndex << "  "
-            << directionName(directions[report.seedTraceIndex]) << "  "
+            << report.isolatedPieces << "  " << report.seedPieceIndex << "  "
+            << originalTraceIndices[report.seedPieceIndex] << "  "
+            << constraints.pieces[report.seedPieceIndex].pieceIndex << "  "
+            << directionName(directions[report.seedPieceIndex]) << "  "
             << report.messageIterations << "  " << report.balanceIterations
             << "  " << report.messageResidual << "  " << report.balanceField
             << "  " << report.targetHorizontalFraction << "  "
@@ -1446,7 +1460,7 @@ void writeAndPrintBpReport(
                   << "  " << quantile(values, 1.0) << '\n';
     };
     std::cout << "fiber direction BP constraint consistency\n"
-              << "reference  metric  valid_fibers  min  mean  median  p90  max\n";
+              << "reference  metric  valid_pieces  min  mean  median  p90  max\n";
     constexpr std::array<const char*, 9> names{
         "degree",
         "measurements",
@@ -1490,10 +1504,10 @@ void writeAndPrintBpReport(
     };
     for (std::size_t group = 0; group < 3; ++group) {
         std::array<std::vector<double>, names.size()> metrics;
-        for (std::size_t trace = 0; trace < consistency.traces.size(); ++trace) {
+        for (std::size_t trace = 0; trace < consistency.pieces.size(); ++trace) {
             if (static_cast<std::size_t>(directions[trace]) != group)
                 continue;
-            const auto& current = consistency.traces[trace];
+            const auto& current = consistency.pieces[trace];
             for (std::size_t metric = 0; metric < metrics.size(); ++metric) {
                 if (const auto value = metricValue(current, metric))
                     metrics[metric].push_back(*value);
@@ -1509,8 +1523,8 @@ void writeAndPrintBpReport(
     for (std::size_t metric = 0; metric < names.size(); ++metric) {
         std::vector<double> mixed;
         std::vector<double> trusted;
-        for (std::size_t trace = 0; trace < consistency.traces.size(); ++trace) {
-            const auto value = metricValue(consistency.traces[trace], metric);
+        for (std::size_t trace = 0; trace < consistency.pieces.size(); ++trace) {
+            const auto value = metricValue(consistency.pieces[trace], metric);
             if (!value)
                 continue;
             if (directions[trace] ==
@@ -1765,6 +1779,24 @@ int main(int argc, char** argv)
                             << " pieces=" << bpConstraints.pieces.size()
                             << " selected_constraints="
                             << bpConstraints.constraints.size() << '\n';
+                        const auto bpPieceLines = vc::fiber_tracer::
+                            makeFiberTraceConstraintPieceLines(
+                                diagnosticLines, bpConstraints);
+                        std::vector<std::size_t> bpOriginalTraceIndices;
+                        std::vector<vc::fiber_tracer::FiberDirectionGroup>
+                            bpDirections;
+                        bpOriginalTraceIndices.reserve(bpConstraints.pieces.size());
+                        bpDirections.reserve(bpConstraints.pieces.size());
+                        for (const auto& piece : bpConstraints.pieces) {
+                            if (piece.traceIndex >= diagnosticLines.size()) {
+                                throw std::logic_error(
+                                    "BP piece references an invalid cohort source fiber");
+                            }
+                            bpOriginalTraceIndices.push_back(
+                                diagnosticOriginalTraceIndices[piece.traceIndex]);
+                            bpDirections.push_back(
+                                diagnosticDirections[piece.traceIndex]);
+                        }
                         const auto runBp = [&] (
                                                vc::fiber_tracer::
                                                    FiberTraceBalanceMode mode) {
@@ -1799,10 +1831,10 @@ int main(int argc, char** argv)
                             writeAndPrintBpReport(
                                 report,
                                 mode,
-                                diagnosticLines,
+                                bpPieceLines,
                                 bpConstraints,
-                                diagnosticOriginalTraceIndices,
-                                diagnosticDirections,
+                                bpOriginalTraceIndices,
+                                bpDirections,
                                 options.output);
                         };
                         if (options.bpBalance == BpBalanceSelection::None) {
@@ -1961,6 +1993,22 @@ int main(int argc, char** argv)
                                 checkpointLpThresholded,
                                 lpOutput);
                         if (options.bpBalance != BpBalanceSelection::None) {
+                            const auto bpPieceLines = vc::fiber_tracer::
+                                makeFiberTraceConstraintPieceLines(
+                                    diagnosticLines, comparisonReport);
+                            std::vector<std::size_t> bpOriginalTraceIndices;
+                            std::vector<vc::fiber_tracer::FiberDirectionGroup>
+                                bpDirections;
+                            bpOriginalTraceIndices.reserve(
+                                comparisonReport.pieces.size());
+                            bpDirections.reserve(comparisonReport.pieces.size());
+                            for (const auto& piece : comparisonReport.pieces) {
+                                bpOriginalTraceIndices.push_back(
+                                    diagnosticOriginalTraceIndices.at(
+                                        piece.traceIndex));
+                                bpDirections.push_back(
+                                    diagnosticDirections.at(piece.traceIndex));
+                            }
                             const auto runBp = [&](
                                                    vc::fiber_tracer::
                                                        FiberTraceBalanceMode mode) {
@@ -1978,10 +2026,10 @@ int main(int argc, char** argv)
                                 writeAndPrintBpReport(
                                     report,
                                     mode,
-                                    diagnosticLines,
+                                    bpPieceLines,
                                     comparisonReport,
-                                    diagnosticOriginalTraceIndices,
-                                    diagnosticDirections,
+                                    bpOriginalTraceIndices,
+                                    bpDirections,
                                     options.output);
                             };
                             if (options.bpBalance == BpBalanceSelection::Soft ||

@@ -615,6 +615,42 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
     return report;
 }
 
+std::vector<FiberletCropTraceLine> makeFiberTraceConstraintPieceLines(
+    const std::vector<FiberletCropTraceLine>& sourceLines,
+    const FiberTraceConstraintReport& constraints)
+{
+    if (constraints.inputTraces != sourceLines.size()) {
+        throw std::invalid_argument(
+            "Constraint piece source count does not match input traces");
+    }
+    std::vector<PolylineArcGeometry> geometries;
+    geometries.reserve(sourceLines.size());
+    for (const auto& line : sourceLines)
+        geometries.push_back(makePolylineArcGeometry(line.pointsBaseXYZ));
+
+    std::vector<FiberletCropTraceLine> result;
+    result.reserve(constraints.pieces.size());
+    for (const auto& piece : constraints.pieces) {
+        if (piece.traceIndex >= geometries.size() ||
+            !std::isfinite(piece.beginArcBaseVoxels) ||
+            !std::isfinite(piece.endArcBaseVoxels) ||
+            !(piece.endArcBaseVoxels > piece.beginArcBaseVoxels) ||
+            piece.beginArcBaseVoxels < -kEpsilon ||
+            piece.endArcBaseVoxels >
+                geometries[piece.traceIndex].length() + kEpsilon) {
+            throw std::invalid_argument(
+                "Constraint piece has invalid source geometry interval");
+        }
+        FiberletCropTraceLine line;
+        line.pointsBaseXYZ = slicePolylineArc(
+            geometries[piece.traceIndex],
+            piece.beginArcBaseVoxels,
+            piece.endArcBaseVoxels);
+        result.push_back(std::move(line));
+    }
+    return result;
+}
+
 FiberTraceConstraintPruningResult pruneFiberTraceConstraintsByStrength(
     const FiberTraceConstraintReport& constraints,
     double maximumDistanceBaseVoxels,

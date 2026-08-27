@@ -1,3 +1,12 @@
+# 2026-08-27: split-piece fiber BP
+
+- Made finite `--piece-length` constraint pieces the BP nodes, retained
+  canonical same-source continuity evidence, and preserved source-first gauge
+  selection with deterministic exact piece mapping.
+- Added exact dense piece clipping plus piece-level OBJ, CSV, reference, and
+  consistency diagnostics while preserving full source geometry in no-split
+  runs.
+
 # 2026-08-25: durable Fiberlet crop trace artifacts
 
 - Made a sparse Fiberlet Zarr `traces` dataset the authoritative crop-tracing

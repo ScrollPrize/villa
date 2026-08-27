@@ -46,13 +46,13 @@ struct FiberTraceBeliefPropagationReport {
     std::vector<double> mixedProbability;
     std::vector<double> horizontalProbability;
     std::vector<double> normalizedArcWeights;
-    std::size_t seedTraceIndex = 0;
+    std::size_t seedPieceIndex = 0;
     std::size_t factors = 0;
     std::size_t mergedMeasurements = 0;
     std::size_t neutralFactors = 0;
     std::size_t neutralMeasurements = 0;
     std::size_t connectedComponents = 0;
-    std::size_t isolatedTraces = 0;
+    std::size_t isolatedPieces = 0;
     std::size_t messageIterations = 0;
     std::size_t balanceIterations = 0;
     double messageResidual = 0.0;
@@ -69,7 +69,7 @@ struct FiberTraceBeliefPropagationReport {
 };
 
 struct FiberTraceConstraintConsistency {
-    std::size_t traceIndex = 0;
+    std::size_t pieceIndex = 0;
     std::size_t degree = 0;
     std::size_t incidentMeasurements = 0;
     std::size_t resolvedDegree = 0;
@@ -86,7 +86,7 @@ struct FiberTraceConstraintConsistency {
 };
 
 struct FiberTraceConstraintConsistencyReport {
-    std::vector<FiberTraceConstraintConsistency> traces;
+    std::vector<FiberTraceConstraintConsistency> pieces;
     double verticalThreshold = 0.25;
     double horizontalThreshold = 0.75;
 };

@@ -607,20 +607,32 @@ the final admitted cohort, extract and optionally prune its constraints, and
 run natural binary min-sum BP without constructing either HiGHS model:
 
 ```bash
-volume-cartographer/build/bin/vc_fiber_trace_chunk direction-ablation crop_traces.zarr --normal-manifest normals.lasagna.json --output crop_bp --direction-dominance 0.9 --piece-length 1000000000 --perpendicular-only --bp-only
+volume-cartographer/build/bin/vc_fiber_trace_chunk direction-ablation crop_traces.zarr --normal-manifest normals.lasagna.json --output crop_bp --direction-dominance 0.9 --piece-length 512 --perpendicular-only --bp-only
 ```
 
-The input must produce exactly one constraint piece per represented fiber.
+Every extracted piece is one BP node. Consecutive overlapping pieces from one
+source fiber retain their canonical parallel-score-1 continuity link as finite
+strong same-label evidence; it is not an equality constraint. The established
+central-straight rule still selects a source fiber, then the exact clipped piece
+of that source closest to the crop center is fixed to H. Optional balance uses
+piece arc lengths, including overlap, and Mixed unary cost is charged once per
+piece.
+
 `--ablation-limit N` selects a ranked prefix; omission admits every Mixed
 fiber. Natural BP fixes the established central straight seed to H and emits
 `<base>_bp_none_p0.obj` through `_p9.obj`. A nonconverged status remains in the
 report and in every CSV row; it is not silently treated as converged.
 
-`<base>_bp_none_consistency.csv` maps cohort-local and original stored trace
-indices to the initial `dir1`, `dir2`, or `mixed` diagnostic reference. It uses
+`<base>_bp_none_consistency.csv` records global piece ID, original stored source
+trace ID, source-local piece ID, and begin/end base-voxel arcs alongside the
+initial `dir1`, `dir2`, or `mixed` source diagnostic reference. Band, state,
+confusion, consistency, and AUROC outputs are piece-weighted. Their OBJs contain
+the exact dense source polyline clipped to the piece interval; overlapping
+geometry therefore appears twice intentionally. A full-range one-piece input
+retains the original source polyline exactly. The diagnostic uses
 V values at or below `0.25`, H values at or above `0.75`, and treats values
 between them as unresolved. Duplicate measurements between the same two
-fibers form one factor: degree counts that factor once, `incident_measurements`
+pieces form one factor: degree counts that factor once, `incident_measurements`
 retains its measurement count, and strength is the absolute difference of its
 summed same-label and different-label costs.
 
@@ -632,7 +644,7 @@ is not a calibrated BP edge marginal.
 `neighbor_support_balance` measures how evenly neighbors support H and V and
 can be high when neighbors themselves are uncertain, so
 `neighbor_certainty` is reported alongside it. Console summaries give
-equal-per-fiber min/mean/median/p90/max values by initial reference group and
+equal-per-piece min/mean/median/p90/max values by initial reference group and
 tie-aware AUROC values for Mixed versus trusted fibers.
 
 Add `--bp-inference sum-product` to run binary sum-product BP over the same
@@ -641,7 +653,7 @@ Omit `--perpendicular-only` to retain both parallel- and
 perpendicular-preferring measurements:
 
 ```bash
-volume-cartographer/build/bin/vc_fiber_trace_chunk direction-ablation crop_traces.zarr --normal-manifest normals.lasagna.json --output crop_bp --direction-dominance 0.9 --piece-length 1000000000 --bp-only --bp-inference sum-product
+volume-cartographer/build/bin/vc_fiber_trace_chunk direction-ablation crop_traces.zarr --normal-manifest normals.lasagna.json --output crop_bp --direction-dominance 0.9 --piece-length 512 --bp-only --bp-inference sum-product
 ```
 
 For same-label and different-label factor costs `E_same` and `E_diff`, this
@@ -652,7 +664,8 @@ exact marginals on trees and loopy-BP approximations after convergence on
 cyclic graphs. A `message_limit` status exposes the final finite iterate but
 does not claim convergence.
 
-For every raw measurement with parallel score `p`, same-label cost receives
+For every raw measurement or continuity link with parallel score `p`,
+same-label cost receives
 `1-p` and different-label cost receives `p`. Measurements for the same fiber
 pair are summed, then the smaller merged cost is subtracted from both. The
 remaining nonzero gap `abs(E_same-E_diff)` is the constraint's decisiveness:
@@ -691,13 +704,13 @@ exactly canceled factor has both energies zero and is omitted, so it cannot
 spuriously favor Mixed merely because the unnormalized oriented costs shared a
 positive constant offset.
 
-Every non-seed fiber assigned Mixed instead pays one node-local unary energy
+Every non-seed piece assigned Mixed instead pays one node-local unary energy
 `U(Mixed)=mixed_unary_cost`, with `U(V)=U(H)=0`. Set it with
 `--bp-mixed-cost F`; its experimental default is `0.5`. The cost is paid once
-per fiber, independent of its degree and the number of raw measurements merged
+per piece, independent of its degree and the number of raw measurements merged
 into its factors. Mixed therefore conditionally disables incident orientation
 terms: a source known to be Mixed sends a uniform factor message, rather than
-encouraging its neighbor to become Mixed. A soft source with residual V/H
+encouraging its neighbor to become Mixed. A soft piece with residual V/H
 probability can still transmit that residual orientation evidence.
 
 The hard seed remains exactly H and replaces the unary at that node. Every

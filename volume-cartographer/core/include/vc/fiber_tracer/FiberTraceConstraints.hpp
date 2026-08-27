@@ -135,6 +135,11 @@ struct FiberTraceConstraintObjReport {
     const FiberTraceWindingDistance& windingDistance,
     const FiberTraceWindingDistanceBatch& windingDistanceBatch = {});
 
+[[nodiscard]] std::vector<FiberletCropTraceLine>
+makeFiberTraceConstraintPieceLines(
+    const std::vector<FiberletCropTraceLine>& sourceLines,
+    const FiberTraceConstraintReport& constraints);
+
 [[nodiscard]] FiberTraceConstraintPruningResult
 pruneFiberTraceConstraintsByStrength(
     const FiberTraceConstraintReport& constraints,
