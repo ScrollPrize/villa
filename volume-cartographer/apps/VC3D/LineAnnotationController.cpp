@@ -7247,9 +7247,9 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
         // not be applied over this edit.
         session.controlPointCollapseRollback.reset();
         // The session no longer matches any in-flight solve: refuse its
-        // publication and ask it to stop. No pending solve is recorded (the
-        // user chose manual reoptimization), but an already-queued pending
-        // set is carried into the new control numbering.
+        // publication and ask it to stop. Nothing dispatches in manual mode,
+        // but an already-queued pending set is carried into the new control
+        // numbering.
         session.solveQueue.noteSessionMutated();
         if (session.runningSolveCancel) {
             session.runningSolveCancel->store(true);
@@ -7266,6 +7266,26 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
                                     spanCount)) {
                 session.runningSolveFullLine = true;
                 session.runningSolveDirtySegments.clear();
+            }
+            // Record this edit's own spans as pending WITHOUT dispatching:
+            // every dispatch path is mode-gated, but if the user returns to
+            // auto mode while the superseded solve is still running, its
+            // finish epilogue dispatches the coalesced pending set — which
+            // must include this edit, or a partial pass over the older
+            // request could mark the session Optimized around it.
+            if (collapsedControlCount > 1) {
+                session.solveQueue.addPending({}, true);
+            } else {
+                std::vector<size_t> editedSpans;
+                if (changedControlIndex > 0) {
+                    editedSpans.push_back(changedControlIndex - 1);
+                }
+                if (changedControlIndex < spanCount) {
+                    editedSpans.push_back(changedControlIndex);
+                }
+                if (!editedSpans.empty()) {
+                    session.solveQueue.addPending(editedSpans, false);
+                }
             }
         }
         const std::string noReoptEventName = collapsedControlCount > 1
