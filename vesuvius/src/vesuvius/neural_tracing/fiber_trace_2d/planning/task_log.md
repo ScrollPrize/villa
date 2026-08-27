@@ -48,3 +48,17 @@
   had 154 V, two H, and one tie. The generated initial-direction, orientation-
   projection, and Mixed-probability OBJ layers are under
   `data/workdir3/fiber-crop-1024/bp-mixed/`.
+- The first 1024 run optimized Mixed ranking rather than three-way argmax and
+  was rejected as the final classifier because only 26/134 Mixed references
+  selected Mixed. A coarse and refined deterministic sweep then optimized both
+  mean per-class recall and minimum per-class recall. The best mean-recall
+  point was `T=1.0,cost=0.14` (H 199/209, V 150/157, Mixed 72/134), while the
+  selected max-min point was `T=2.4,cost=0.125` (H 157/209, V 111/157, Mixed
+  94/134). The selected recalls are 75.1%, 70.7%, and 70.1%, respectively;
+  `P(Mixed)` AUROC is `0.812943`, and there are no H/V reversals. The trusted
+  errors are 49 H-to-Mixed, 45 V-to-Mixed, and four exact ties; Mixed errors
+  are 22 Mixed-to-V and 18 Mixed-to-H.
+- Final 1024 artifacts overwrite the main visualization basename under
+  `data/workdir3/fiber-crop-1024/` as `fibers_initial_*`,
+  `fibers_bp_sum_product_mixed_*`, and the consistency CSV. The superseded
+  `bp-mixed/` subdirectory and temporary sweep outputs were removed.
