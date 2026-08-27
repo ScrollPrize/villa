@@ -85,6 +85,18 @@ the graph defines that transition. Speculative lookahead cost is not stored.
 The comparable visualization quality is
 `total_metric_cost / path_length_prediction_voxels`; lower is better.
 
+Every command that consumes a stored trace artifact accepts
+`--quality-fraction F`. It keeps the best `ceil(F*N)` traces by this exact cost
+density (stored ordinal breaks ties), restores their original order, and only
+then performs visualization, direction fitting, splitting, constraint
+extraction, consensus, or BP. For example, add `--quality-fraction 0.25` to
+process the best quarter. The command prints the original and retained counts,
+effective fraction, and worst retained density. Equal-density ties may be split
+by ordinal, so the printed cutoff is diagnostic rather than a complete filter
+predicate. The complete artifact is still read and validated; this reduces
+downstream computation, not Zarr input I/O. Crop bounds and provenance remain
+unchanged, and diagnostics retain the original stored trace IDs.
+
 ## H/V constraint diagnostics
 
 The `constraints` mode derives candidate H/V and winding links directly from a
@@ -822,21 +834,66 @@ component. Otherwise the H/V constraint remains valid but contributes no
 perpendicular winding evidence. A connected winding graph that would combine
 signed evidence from independently gauged normal components is rejected.
 
-Winding inference is factorized from H/V and uses the exact same retained
-piece graph. Every split piece remains a distinct winding variable. Same-trace
-continuity contributes its existing parallel-score-1, zero-difference factor,
-so other evidence can override it at the corresponding cost. A continuous
-weighted least-squares difference solve fixes the crop-central variable
-of every connected component to zero. Integer sum-product BP then starts with
-the three labels centered on each continuous result and uses
-`parallel*abs(delta) + perpendicular*abs(delta-signed_target)`. Candidate
-support expands and BP cold-restarts whenever MAP or posterior mass reaches a
-boundary; the only limit is an explicit total-state resource guard.
+For `sum-product-mixed`, the established V/Mixed/H solver runs first and its
+normalized piece marginals become soft priors for winding inference. Winding
+then refines the joint state `(class,k)` without charging the orientation
+factors or Mixed unary a second time. Every split piece remains a distinct
+variable. Same-trace continuity contributes its existing parallel-score-1,
+zero-difference factor, so other evidence can override it at the corresponding
+cost. The orientation stage uses `--bp-temperature`; the winding stage reports
+and uses its separate default temperature `0.25`.
+
+The two oriented classes occupy interleaved integer lattices. Local class A is
+at `k`; local class B is at `k + sign*phase`, where `k` is integer, phase is in
+`[0,0.5]`, and each disconnected component has a deterministic sign/class
+gauge. Physical H/V names and absolute integer offsets between disconnected
+components are not observable. A Mixed endpoint marginalizes the four latent
+A/B endpoint substitutions with a normalized average, retaining winding
+connectivity without transmitting a visible orientation preference.
+
+For latent difference `delta`, a measurement contributes:
+
+```text
+parallel * abs(delta)
+    + perpendicular * abs(delta / measurement_scale - signed_target)
+```
+
+The perpendicular residual stays in the raw Lasagna-integral units. This is
+important: multiplying the observed target by scale would also scale its noise
+and spuriously favor the minimum scale. Alternating calibration fits inverse
+scale `g=1/scale` and `h=g*phase` from oriented pair beliefs, solves the exact
+bounded `(g,h)` wedge, and accepts updates only when expected L1 energy does
+not increase. Rank-deficient evidence retains the previous parameters.
+Deterministic phase/scale starts are ranked by the complete decoded assignment
+score.
+
+The command prints live progress while this nested solve runs. It first marks
+the orientation BP stage, then reports the interleaved initialization out of
+four, calibration round, adaptive-support round, current message iteration,
+accumulated message iterations, candidate-state count, residual, phase/scale,
+and elapsed time. Repeated message updates are limited to roughly one line per
+second; calibration, initialization completion, and final completion are
+always printed. There is intentionally no percentage: message convergence can
+stop early, candidate support can expand and restart BP, and iteration cost
+changes with state count. After the first calibration, `eta_est` extrapolates
+mean calibration duration across the maximum remaining slots and reports
+`eta_basis=calibration_max`. After the first complete initialization, it
+switches to mean initialization duration and reports
+`eta_basis=initialization`. Both are empirical estimates, not upper bounds.
+Library callers can pass the optional progress callback to receive every event
+synchronously; callback exceptions propagate to the caller.
+
+A continuous weighted least-squares solve initializes integer support and fixes
+the crop-central variable of every connected component to zero. Integer
+sum-product BP expands support and cold-restarts whenever MAP or posterior mass
+reaches a boundary; the only limit is an explicit total-state resource guard.
 
 The ordinary BP consistency CSV includes continuous winding, integer MAP,
 posterior mean, MAP probability, entropy, candidate bounds, component, and
 incident signed/skipped counts. `<base>_winding_factors.csv` records
-canonicalized factors and signed targets. The solver's arbitrary zero-centered
+canonicalized factors, raw signed targets, and selected scale-calibrated latent
+targets. The consistency CSV additionally records posterior latent coordinate,
+phase, scale, and component phase sign. The solver's arbitrary zero-centered
 relative MAP labels are shifted by the global minimum for publication, so the
 OBJ groups are consecutively numbered `<base>_w_0.obj`, `_w_1.obj`, and so on.
 The consistency CSV records both `winding_relative_map` and `winding_output`.

@@ -3,6 +3,7 @@
 #include "vc/fiber_tracer/FiberTraceBeliefPropagation.hpp"
 
 #include <cstddef>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -19,6 +20,42 @@ struct FiberTraceWindingBeliefPropagationConfig {
     std::size_t maximumTotalCandidateStates = 4'000'000;
     std::size_t parallelWorkers = 1;
 };
+
+struct FiberTraceInterleavedWindingConfig : FiberTraceWindingBeliefPropagationConfig {
+    double minimumMeasurementScale = 0.5;
+    double maximumMeasurementScale = 2.0;
+    double calibrationTolerance = 1.0e-4;
+    std::size_t maximumCalibrationIterations = 8;
+};
+
+enum class FiberTraceInterleavedWindingProgressPhase {
+    Preparing,
+    MessagePassing,
+    Calibration,
+    InitializationComplete,
+    Complete,
+};
+
+struct FiberTraceInterleavedWindingProgress {
+    FiberTraceInterleavedWindingProgressPhase phase =
+        FiberTraceInterleavedWindingProgressPhase::Preparing;
+    std::size_t initialization = 0;
+    std::size_t initializationCount = 0;
+    std::size_t calibrationIteration = 0;
+    std::size_t maximumCalibrationIterations = 0;
+    std::size_t adaptiveSupportRound = 0;
+    std::size_t messageIteration = 0;
+    std::size_t maximumMessageIterations = 0;
+    std::size_t accumulatedMessageIterations = 0;
+    std::size_t candidateStates = 0;
+    double messageResidual = 0.0;
+    double phaseMagnitude = 0.0;
+    double measurementScale = 1.0;
+    double elapsedSeconds = 0.0;
+};
+
+using FiberTraceInterleavedWindingProgressCallback =
+    std::function<void(const FiberTraceInterleavedWindingProgress&)>;
 
 struct FiberTraceWindingFactorDiagnostic {
     std::size_t constraintIndex = 0;
@@ -55,6 +92,7 @@ struct FiberTraceWindingBeliefPropagationReport {
     std::size_t totalCandidateStates = 0;
     std::size_t effectiveWorkers = 1;
     double continuousRootMeanSquareResidual = 0.0;
+    double temperature = 0.0;
     double messageResidual = 0.0;
     double continuousSolveSeconds = 0.0;
     double discreteSolveSeconds = 0.0;
@@ -62,10 +100,33 @@ struct FiberTraceWindingBeliefPropagationReport {
     std::string status;
 };
 
+struct FiberTraceInterleavedWindingReport : FiberTraceWindingBeliefPropagationReport {
+    std::vector<double> classAProbability;
+    std::vector<double> mixedProbability;
+    std::vector<double> classBProbability;
+    std::vector<double> posteriorMeanLatentCoordinate;
+    std::vector<int> componentPhaseSign;
+    double phaseMagnitude = 0.0;
+    double measurementScale = 1.0;
+    double decodedEnergy = 0.0;
+    std::size_t calibrationIterations = 0;
+    std::size_t selectedInitialization = 0;
+    std::size_t rankDeficientUpdates = 0;
+    bool calibrationConverged = false;
+};
+
 [[nodiscard]] FiberTraceWindingBeliefPropagationReport
 solveFiberTraceWindingBeliefPropagation(
     const FiberTraceConstraintReport& constraints,
     const FiberTraceBeliefTopology& topology,
     const FiberTraceWindingBeliefPropagationConfig& config = {});
+
+[[nodiscard]] FiberTraceInterleavedWindingReport
+solveFiberTraceInterleavedWindingBeliefPropagation(
+    const FiberTraceConstraintReport& constraints,
+    const FiberTraceBeliefTopology& topology,
+    const FiberTraceBeliefPropagationReport& orientationBeliefs,
+    const FiberTraceInterleavedWindingConfig& config = {},
+    const FiberTraceInterleavedWindingProgressCallback& progress = {});
 
 }  // namespace vc::fiber_tracer

@@ -16,6 +16,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -939,6 +940,31 @@ TEST_CASE("Crop quality deciles are stable and write every rank once")
     CHECK(histogram.bins[0].minimumCostDensity == doctest::Approx(1.0));
     CHECK(histogram.bins[3].meanCostDensity == doctest::Approx(2.0));
     CHECK(histogram.bins[6].maximumCostDensity == doctest::Approx(3.0));
+
+    const auto selected = selectFiberletCropQuality(lines, 0.34);
+    CHECK(selected.inputLines == 3);
+    CHECK(selected.lineIndices == std::vector<std::size_t>{1, 2});
+    CHECK(selected.effectiveFraction == doctest::Approx(2.0 / 3.0));
+    REQUIRE(selected.maximumRetainedCostDensity.has_value());
+    CHECK(*selected.maximumRetainedCostDensity == doctest::Approx(2.0));
+    CHECK(selectFiberletCropQuality(lines, 1.0).lineIndices ==
+        std::vector<std::size_t>{0, 1, 2});
+
+    auto tied = lines;
+    for (auto& line : tied)
+        line.totalMetricCost = line.pathLengthPredictionVoxels;
+    CHECK(selectFiberletCropQuality(tied, 0.34).lineIndices ==
+        std::vector<std::size_t>{0, 1});
+    const auto empty = selectFiberletCropQuality({}, 0.5);
+    CHECK(empty.lineIndices.empty());
+    CHECK(empty.effectiveFraction == 0.0);
+    CHECK_FALSE(empty.maximumRetainedCostDensity.has_value());
+    CHECK_THROWS_AS(selectFiberletCropQuality(lines, 0.0), std::invalid_argument);
+    CHECK_THROWS_AS(selectFiberletCropQuality(lines, 1.1), std::invalid_argument);
+    CHECK_THROWS_AS(
+        selectFiberletCropQuality(
+            lines, std::numeric_limits<double>::quiet_NaN()),
+        std::invalid_argument);
 
     const auto output = directory / "crop.obj";
     writeFiberletCropQualityArtifacts(lines, histogram, output);

@@ -1,5 +1,9 @@
 # Changelog
 
+- Added synchronous interleaved-winding solver progress events and throttled
+  `vc_fiber_trace_chunk` stage output for long crop BP runs.
+- Added `--quality-fraction` to stored crop-trace consumers, reusing quality
+  visualization ranking while retaining original trace ordinals.
 - Added crop-wide aligned-normal signing and factorized two-stage continuous
   plus adaptive integer BP for trace-piece winding labels, with strict gauge
   handling, CSV diagnostics, and integer winding OBJ layers.
@@ -159,3 +163,8 @@
 
 - Added a synthetic Valgrind rendering benchmark with native replay scoring and
   a one-sided performance-only CI regression gate.
+## 2026-08-27
+
+- Added two-stage interleaved-lattice crop winding BP with aligned signed
+  Lasagna evidence, soft V/Mixed/H priors, bounded phase/scale calibration,
+  and per-winding OBJ/CSV diagnostics.

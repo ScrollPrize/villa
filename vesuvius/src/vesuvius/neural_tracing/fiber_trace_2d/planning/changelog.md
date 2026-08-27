@@ -1,5 +1,10 @@
 # 2026-08-27: signed crop winding belief propagation
 
+- Added live nested progress for interleaved winding initialization,
+  calibration, adaptive support, and message passing without changing solver
+  numerics.
+- Added stored-trace quality-fraction filtering with canonical cost-density
+  ranking and preserved original trace provenance.
 - Reused crop-wide BP-aligned Lasagna normals to give perpendicular trace
   constraints a component-safe signed winding difference while preserving the
   existing unsigned magnitude.
@@ -1526,3 +1531,11 @@
   factors to their decisiveness gap, omitted exact neutral cancellations, and
   generalized binary and ternary consistency diagnostics to each factor's
   preferred same/different relation.
+
+## 2026-08-27 - Interleaved winding BP
+
+- Added soft-prior two-stage inference over interleaved A/B integer winding
+  lattices, with aligned signed constraints and bounded global phase/scale
+  calibration in raw Lasagna-integral units.
+- Added joint class/winding CSV diagnostics and consecutive per-winding OBJ
+  layers while retaining independent winding inference for other BP modes.

@@ -1194,13 +1194,16 @@ void writeFiberletCropDirectionObjs(
         "VC3D Fiberlet crop trace seed anchors: mixed directions");
 }
 
-FiberQualityHistogram
-classifyFiberletCropQuality(const std::vector<FiberletCropTraceLine> &lines) {
-  struct RankedLine {
+namespace {
+
+struct RankedQualityLine {
     std::size_t index = 0;
     double density = 0.0;
-  };
-  std::vector<RankedLine> ranked;
+};
+
+std::vector<RankedQualityLine>
+rankFiberletCropQuality(const std::vector<FiberletCropTraceLine>& lines) {
+  std::vector<RankedQualityLine> ranked;
   ranked.reserve(lines.size());
   for (std::size_t index = 0; index < lines.size(); ++index) {
     const auto &line = lines[index];
@@ -1221,6 +1224,14 @@ classifyFiberletCropQuality(const std::vector<FiberletCropTraceLine> &lines) {
               return std::tie(left.density, left.index) <
                      std::tie(right.density, right.index);
             });
+  return ranked;
+}
+
+}  // namespace
+
+FiberQualityHistogram
+classifyFiberletCropQuality(const std::vector<FiberletCropTraceLine> &lines) {
+  const auto ranked = rankFiberletCropQuality(lines);
 
   FiberQualityHistogram result;
   for (std::size_t rank = 0; rank < ranked.size(); ++rank) {
@@ -1253,6 +1264,38 @@ classifyFiberletCropQuality(const std::vector<FiberletCropTraceLine> &lines) {
     bin.meanTotalMetricCost = totalCost / count;
     bin.meanCostDensity = totalDensity / count;
   }
+  return result;
+}
+
+FiberQualitySelection
+selectFiberletCropQuality(
+    const std::vector<FiberletCropTraceLine>& lines,
+    double fraction) {
+  if (!std::isfinite(fraction) || !(fraction > 0.0) || fraction > 1.0) {
+    throw std::invalid_argument(
+        "Fiber quality fraction must be finite and in (0, 1]");
+  }
+  FiberQualitySelection result;
+  result.inputLines = lines.size();
+  result.requestedFraction = fraction;
+  if (lines.empty()) {
+    result.effectiveFraction = 0.0;
+    return result;
+  }
+  const auto ranked = rankFiberletCropQuality(lines);
+  const std::size_t retained = std::min(
+      lines.size(),
+      std::max<std::size_t>(
+          1,
+          static_cast<std::size_t>(std::ceil(
+              fraction * static_cast<double>(lines.size())))));
+  result.lineIndices.reserve(retained);
+  for (std::size_t rank = 0; rank < retained; ++rank)
+    result.lineIndices.push_back(ranked[rank].index);
+  result.maximumRetainedCostDensity = ranked[retained - 1].density;
+  std::sort(result.lineIndices.begin(), result.lineIndices.end());
+  result.effectiveFraction = static_cast<double>(retained) /
+      static_cast<double>(lines.size());
   return result;
 }
 

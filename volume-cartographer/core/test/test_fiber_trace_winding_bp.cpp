@@ -75,6 +75,18 @@ FiberTraceWindingBeliefPropagationConfig config()
     return result;
 }
 
+FiberTraceBeliefPropagationReport orientationBeliefs(
+    std::initializer_list<std::array<double, 3>> probabilities)
+{
+    FiberTraceBeliefPropagationReport result;
+    for (const auto& probability : probabilities) {
+        result.horizontalProbability.push_back(probability[0]);
+        result.mixedProbability.push_back(probability[1]);
+        result.verticalProbability.push_back(probability[2]);
+    }
+    return result;
+}
+
 TEST_CASE("Two-stage winding BP recovers signed chains and canonical reversal")
 {
     const auto source = lines(3);
@@ -179,6 +191,196 @@ TEST_CASE("Parallel winding BP preserves serial marginals")
     CHECK(parallel.mapWinding == serial.mapWinding);
     CHECK(parallel.posteriorMeanWinding == serial.posteriorMeanWinding);
     CHECK(parallel.mapProbability == serial.mapProbability);
+#ifdef _OPENMP
+    CHECK(parallel.effectiveWorkers == 4);
+#else
+    CHECK(parallel.effectiveWorkers == 1);
+#endif
+}
+
+TEST_CASE("Interleaved winding calibrates complementary fractional crossings")
+{
+    const auto source = lines(3);
+    auto report = pieces(source.size());
+    addMeasured(report, 0, 1, 0.0, 0.32);
+    addMeasured(report, 1, 2, 0.0, 0.48);
+
+    FiberTraceInterleavedWindingConfig joint;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(joint) = config();
+    joint.temperature = 0.05;
+    joint.maximumCalibrationIterations = 12;
+    std::vector<FiberTraceInterleavedWindingProgress> progress;
+    const auto prepared = topology(source, report);
+    const auto solved = solveFiberTraceInterleavedWindingBeliefPropagation(
+        report,
+        prepared,
+        orientationBeliefs({
+            {0.999, 0.0005, 0.0005},
+            {0.0005, 0.0005, 0.999},
+            {0.999, 0.0005, 0.0005},
+        }),
+        joint,
+        [&](const FiberTraceInterleavedWindingProgress& event) {
+            progress.push_back(event);
+        });
+
+    CHECK(solved.status == "converged");
+    CHECK(solved.mapWinding == std::vector<int>{0, 0, 1});
+    CHECK(solved.classAProbability[0] > 0.99);
+    CHECK(solved.classBProbability[1] > 0.9);
+    CHECK(solved.classAProbability[2] > 0.9);
+    CHECK(solved.phaseMagnitude == doctest::Approx(0.4).epsilon(0.08));
+    CHECK(solved.measurementScale == doctest::Approx(1.25).epsilon(0.08));
+
+    REQUIRE_FALSE(progress.empty());
+    CHECK(progress.front().phase ==
+        FiberTraceInterleavedWindingProgressPhase::Preparing);
+    CHECK(progress.back().phase ==
+        FiberTraceInterleavedWindingProgressPhase::Complete);
+    CHECK(std::count_if(
+        progress.begin(),
+        progress.end(),
+        [](const auto& event) {
+            return event.phase ==
+                FiberTraceInterleavedWindingProgressPhase::Complete;
+        }) == 1);
+    CHECK(std::count_if(
+        progress.begin(),
+        progress.end(),
+        [](const auto& event) {
+            return event.phase == FiberTraceInterleavedWindingProgressPhase::
+                InitializationComplete;
+        }) == 4);
+    for (const auto& event : progress) {
+        CHECK(event.initializationCount == 4);
+        CHECK(event.maximumCalibrationIterations ==
+            joint.maximumCalibrationIterations);
+        CHECK(event.maximumMessageIterations == joint.maximumMessageIterations);
+        CHECK(event.elapsedSeconds >= 0.0);
+        if (event.phase ==
+            FiberTraceInterleavedWindingProgressPhase::MessagePassing) {
+            CHECK(event.initialization >= 1);
+            CHECK(event.initialization <= event.initializationCount);
+            CHECK(event.calibrationIteration >= 1);
+            CHECK(event.adaptiveSupportRound >= 1);
+            CHECK(event.messageIteration >= 1);
+            CHECK(event.messageIteration <= event.maximumMessageIterations);
+            CHECK(event.candidateStates > 0);
+        }
+    }
+
+    const auto withoutProgress =
+        solveFiberTraceInterleavedWindingBeliefPropagation(
+            report,
+            prepared,
+            orientationBeliefs({
+                {0.999, 0.0005, 0.0005},
+                {0.0005, 0.0005, 0.999},
+                {0.999, 0.0005, 0.0005},
+            }),
+            joint);
+    CHECK(withoutProgress.mapWinding == solved.mapWinding);
+    CHECK(withoutProgress.classAProbability == solved.classAProbability);
+    CHECK(withoutProgress.mixedProbability == solved.mixedProbability);
+    CHECK(withoutProgress.classBProbability == solved.classBProbability);
+    CHECK(withoutProgress.phaseMagnitude == solved.phaseMagnitude);
+    CHECK(withoutProgress.measurementScale == solved.measurementScale);
+}
+
+TEST_CASE("Interleaved winding retains calibration when signed evidence is absent")
+{
+    const auto source = lines(1);
+    FiberTraceConstraintReport report;
+    report.inputTraces = 1;
+    report.pieces = {
+        {0, 0, 0.0, 4.0},
+        {0, 1, 2.0, 6.0},
+    };
+    FiberTraceConstraint continuity;
+    continuity.pieceA = 0;
+    continuity.pieceB = 1;
+    continuity.arcABaseVoxels = 3.0;
+    continuity.arcBBaseVoxels = 3.0;
+    continuity.pointABaseXYZ = {0.0, 0.0, 0.0};
+    continuity.pointBBaseXYZ = continuity.pointABaseXYZ;
+    continuity.parallelScore = 1.0;
+    continuity.hardContinuity = true;
+    continuity.signedWindingDelta = 0.0;
+    report.constraints.push_back(continuity);
+
+    FiberTraceInterleavedWindingConfig joint;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(joint) = config();
+    const auto solved = solveFiberTraceInterleavedWindingBeliefPropagation(
+        report,
+        topology(source, report),
+        orientationBeliefs({
+            {0.9, 0.05, 0.05},
+            {0.9, 0.05, 0.05},
+        }),
+        joint);
+
+    CHECK(solved.status == "converged");
+    CHECK(solved.mapWinding == std::vector<int>{0, 0});
+    CHECK(solved.classAProbability[0] == doctest::Approx(1.0));
+    CHECK(solved.classAProbability[1] > 0.8);
+    CHECK(solved.measurementScale == doctest::Approx(1.0));
+    CHECK(solved.rankDeficientUpdates > 0);
+}
+
+TEST_CASE("Interleaved winding rejects malformed orientation beliefs")
+{
+    const auto source = lines(2);
+    auto report = pieces(source.size());
+    addMeasured(report, 0, 1, 0.0, 0.5);
+    FiberTraceInterleavedWindingConfig joint;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(joint) = config();
+
+    CHECK_THROWS_WITH_AS(
+        solveFiberTraceInterleavedWindingBeliefPropagation(
+            report,
+            topology(source, report),
+            orientationBeliefs({
+                {1.0, 0.0, 0.0},
+                {-0.1, 0.5, 0.6},
+            }),
+            joint),
+        doctest::Contains("orientation beliefs are invalid"),
+        std::invalid_argument);
+}
+
+TEST_CASE("Interleaved winding preserves serial and parallel marginals")
+{
+    constexpr std::size_t edgeCount = 260;
+    const auto source = lines(2 * edgeCount);
+    auto report = pieces(source.size());
+    FiberTraceBeliefPropagationReport beliefs;
+    for (std::size_t edge = 0; edge < edgeCount; ++edge) {
+        addMeasured(report, 2 * edge, 2 * edge + 1, 0.0, 0.4, edge);
+        for (const auto& probability : {
+                 std::array{0.999, 0.0005, 0.0005},
+                 std::array{0.0005, 0.0005, 0.999}}) {
+            beliefs.horizontalProbability.push_back(probability[0]);
+            beliefs.mixedProbability.push_back(probability[1]);
+            beliefs.verticalProbability.push_back(probability[2]);
+        }
+    }
+    const auto prepared = topology(source, report);
+    FiberTraceInterleavedWindingConfig serialConfig;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(serialConfig) = config();
+    serialConfig.temperature = 0.1;
+    const auto serial = solveFiberTraceInterleavedWindingBeliefPropagation(
+        report, prepared, beliefs, serialConfig);
+    auto parallelConfig = serialConfig;
+    parallelConfig.parallelWorkers = 4;
+    const auto parallel = solveFiberTraceInterleavedWindingBeliefPropagation(
+        report, prepared, beliefs, parallelConfig);
+
+    CHECK(parallel.mapWinding == serial.mapWinding);
+    CHECK(parallel.classAProbability == serial.classAProbability);
+    CHECK(parallel.mixedProbability == serial.mixedProbability);
+    CHECK(parallel.classBProbability == serial.classBProbability);
+    CHECK(parallel.phaseMagnitude == serial.phaseMagnitude);
+    CHECK(parallel.measurementScale == serial.measurementScale);
 #ifdef _OPENMP
     CHECK(parallel.effectiveWorkers == 4);
 #else

@@ -1,21 +1,34 @@
-# Task: Infer signed integer winding labels in crop BP
+# Task: Interleaved-lattice winding inference
 
-Extend the crop H/V belief-propagation path with winding-number inference.
-Before constraint inference, align regular Lasagna normal axes over the trace
-crop using the shared BP normal-alignment implementation. Use those aligned
-normals to orient every usable perpendicular constraint: for ordered pieces
-`A -> B`, positive signed winding means `winding(B) - winding(A) > 0`.
+Replace independent integer winding inference with a joint orientation and
+winding model for crop `direction-ablation --bp-only` processing.
 
-Infer winding in two stages:
+- Every split piece remains an independent variable.
+- The two physical fiber orientations occupy separate integer lattices:
+  class A has coordinate `k`, class B has coordinate `k + phase`, with integer
+  `k` and one shared fractional `phase`.
+- Physical H/V naming is unobservable. Keep the existing crop-central class-A
+  seed as a deterministic gauge; a global class swap is equivalent.
+- Retain an explicit Mixed/error state. It must disable orientation propagation
+  rather than encourage neighboring pieces to become Mixed.
+- Fit a positive global winding-measurement scale so systematically
+  under-calibrated integrals, such as `0.8` per full winding, can map to one
+  latent winding unit.
+- Solve the discrete piece states and global continuous phase/scale by
+  deterministic alternating inference. Use soft BP beliefs when refitting the
+  global parameters and deterministic multiple initializations.
+- Preserve short output names and publish consecutive nonnegative winding
+  indices, with solver-relative values and fitted calibration in CSV reports.
+- Validate on synthetic two-lattice chains and the existing 384-base crop.
 
-1. solve a gauge-fixed continuous weighted difference relaxation;
-2. center small integer candidate sets on that solution and run categorical
-   sum-product BP, expanding candidates adaptively when posterior mass or the
-   MAP label reaches a candidate boundary.
+## Progress-reporting follow-up
 
-Parallel evidence favors equal winding labels. Perpendicular evidence favors
-the measured signed winding difference. Same-trace continuity is exact zero
-difference. Fix one deterministic crop-central piece per connected component to
-winding zero. Report integer MAP labels, posterior means and confidence, while
-retaining the continuous solution as a diagnostic. H/V and winding inference
-share topology and output but remain mathematically factorized.
+Add visible progress output for the interleaved winding solve. The output must
+identify the multi-start initialization, calibration round, adaptive-support
+round, and inner BP message iteration, without changing numerical behavior.
+
+## Input-quality filtering follow-up
+
+Add a CLI flag that retains only the best-quality stored crop traces before
+direction classification, splitting, constraint extraction, BP, and
+visualization. Reuse the established cost-density ordering.

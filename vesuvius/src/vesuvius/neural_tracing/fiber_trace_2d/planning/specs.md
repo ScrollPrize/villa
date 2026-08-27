@@ -4711,6 +4711,17 @@
   once. A `_quality_histogram.csv` and console table report count and
   min/mean/max total cost and cost density per bin; empty bins retain valid
   empty OBJ files and blank numeric CSV fields.
+- Stored-artifact consumers accept `--quality-fraction F` for finite
+  `0 < F <= 1`. Rank by the exact visualization quality and stored ordinal,
+  retain `ceil(F*N)` entries (at least one for nonempty input), then restore
+  stored-ordinal order before visualization, direction fitting, splitting,
+  constraints, consensus, or BP. The full artifact is still read and strictly
+  validated; the option reduces downstream work, not artifact I/O. Crop bounds
+  and metadata remain unchanged, and diagnostic original-trace IDs must compose
+  through the retained ordinal map. Report input/retained counts, effective
+  fraction, and the worst retained density. The cutoff is diagnostic because
+  ordinal tie-breaking may split equal-density traces. Trace generation rejects
+  this artifact-input option.
 
 ## Stored crop-trace H/V constraint diagnostics
 
@@ -5229,7 +5240,7 @@
   odds. GCC uses OpenMP while the supported Clang/MSVC configurations fall
   back to one worker through the project shim.
 
-## Signed crop winding BP
+## Interleaved-lattice signed crop winding BP
 
 - Crop BP must construct one globally anchored aligned-normal lattice over the
   half-open crop plus one effective normal-channel spacing on every available
@@ -5242,24 +5253,67 @@
   `winding(B)-winding(A)`. Canonical endpoint reversal negates this target.
   Missing or cross-component normal evidence removes only the perpendicular
   winding term, not the H/V factor.
-- H/V/Mixed and winding inference are factorized and consume the same strictly
-  validated piece topology. Every split piece remains a separate winding
-  variable; same-trace continuity is a parallel-score-1, zero-difference
-  factor rather than variable collapse or exact equality.
-  Repeated soft measurements sum their complete costs. A winding component may
-  consume signed evidence from only one aligned-normal component.
-- Continuous initialization minimizes, per measurement,
-  `p*delta^2 + q*(delta-d)^2`, omitting the second term when signed `d` is
-  unavailable. Each connected component fixes its geometrically
-  crop-central piece to winding zero, independently of the H/V seed.
-- Integer inference uses synchronous damped sum-product BP with factor cost
-  `p*abs(delta) + q*abs(delta-d)`. Non-gauge candidates begin at rounded
-  continuous value plus/minus one; gauges contain only zero. MAP at a boundary
-  or combined boundary probability above one percent expands the implicated
-  side and cold-restarts deterministic BP. Expansion continues until resolved
-  or the explicit total-state guard throws; truncated marginals are forbidden.
-- Reports expose continuous value, integer MAP, posterior mean, MAP
-  probability, entropy, candidate bounds, component, signed/skipped incident
-  counts, convergence, expansion rounds, and timings. CSV/OBJ naming follows
-  the crop tracing documentation. Finite iteration-limit marginals remain
-  usable but must be labeled nonconverged.
+- In `sum-product-mixed`, orientation and winding are one joint state per split
+  piece. Every piece remains a distinct variable. Same-trace continuity is its
+  parallel-score-1, zero-distance factor, not equality or variable collapse.
+  Other BP modes retain the independent integer-winding diagnostic.
+- Each connected component has a local class A/B gauge and integer gauge. Its
+  crop-central piece is fixed to `(A,0)`. A has latent coordinate `k`; B has
+  `k+sign_c*phase`, where `k` is integer, shared phase magnitude is in
+  `[0,0.5]`, and deterministic component sign `sign_c` accounts for otherwise
+  incomparable class swaps. Absolute `k` values across components are not
+  physically comparable.
+- The established Mixed-state orientation BP runs first. Its normalized
+  A/Mixed/B posterior is the joint winding solver's soft node prior. The
+  winding stage must not repeat the same/different factor or the Mixed unary.
+- For latent coordinate difference `delta`, every measurement contributes
+  `p*abs(delta)` and, when signed target `d` is available,
+  `q*abs(delta/scale-d)`. `p` and `q` are its parallel and perpendicular scores.
+  The residual is expressed in the observed Lasagna-integral units, so fitting
+  scale cannot reduce residual noise merely by shrinking scale. Repeated
+  endpoint pairs sum complete measurement energies. A component may consume
+  signed evidence from only one aligned-normal component.
+- Mixed remains a piece-local error state with one unary cost. If either
+  endpoint is Mixed, omit orientation energy and define the winding potential
+  by the normalized average over all four latent A/B substitutions at the two
+  endpoints. This potential depends on integer coordinates but is invariant to
+  the other endpoint's visible class, so Mixed cannot propagate orientation or
+  gain multiplicity entropy.
+- For fixed phase and positive scale, run stable synchronous damped sum-product
+  over `(A,k)`, `(Mixed,k)`, and `(B,k)`. Sum boundary probability over classes
+  before adaptive integer support expansion. Gauges contain only `(A,0)`.
+  Expansion continues until resolved or the explicit total-state guard throws.
+- Alternating calibration computes full pair beliefs. Oriented pair mass forms
+  an expected squared-residual proposal in inverse-scale coordinates
+  `g=1/scale` and `h=g*phase`. The bounded fit uses the exact wedge induced by
+  phase `[0,0.5]` and scale `[0.5,2]`; a rank-deficient normal matrix retains the
+  previous unidentifiable values. Backtracking accepts the proposal only when
+  the authoritative fixed-belief expected L1 winding energy does not increase.
+  Mixed pair mass does not calibrate phase or scale.
+- Use deterministic phase/scale initializations. Rank converged starts before
+  nonconverged starts, then select the lowest complete energy of the per-node
+  joint-marginal argmax assignment; this is a decoded loopy-BP assignment, not
+  an exact MAP claim. Stable ties use initialization order. A message-limit
+  result stops that start's calibration and remains a labeled finite candidate.
+- Reports expose joint A/Mixed/B marginals, integer MAP and posterior values,
+  latent coordinate, phase, scale, component sign, calibration rank/status,
+  initialization, decoded energy, support, convergence, and timings. Published
+  `w_N` layers group integer `k` after a nonnegative display offset. The CSV
+  retains relative `k` and component identity. Finite iteration-limit results
+  remain usable but must be labeled nonconverged.
+- The reusable interleaved solver exposes an optional synchronous progress
+  callback. Events identify preparation, the one-based multi-start
+  initialization, calibration iteration, adaptive-support round, BP message
+  iteration and residual, candidate-state count, current phase/scale, elapsed
+  time, and terminal completion. Events are emitted only after synchronized
+  message updates and are observational: enabling them must not change solver
+  ordering, arithmetic, convergence, or results. The CLI throttles repeated
+  message events but forces stage transitions. It must not print a global
+  percentage because convergence, support expansion, and per-state work leave
+  no valid fixed denominator. After one calibration completes, the CLI may
+  report `eta_est` using mean calibration duration and all remaining maximum
+  calibration slots, labeled `eta_basis=calibration_max`. After one full
+  initialization completes it switches to mean initialization duration,
+  labeled `eta_basis=initialization`. Both estimates subtract elapsed work in
+  the active unit, are empirical rather than conservative, and are recomputed
+  after each matching completion.

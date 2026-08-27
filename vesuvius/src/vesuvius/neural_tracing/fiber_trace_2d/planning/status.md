@@ -1,12 +1,21 @@
-# Status: Signed winding belief propagation
+# Status: Interleaved-lattice winding inference
 
-- [x] Capture the signed winding and two-stage inference requirements.
-- [x] Inspect normal alignment, constraint extraction, H/V BP, and output paths.
-- [x] Write the implementation plan and required spec/docs/test updates.
-- [x] Complete independent plan review and incorporate findings.
-- [x] Extract reusable aligned-normal crop sampling and signed constraints.
-- [x] Implement continuous initialization and adaptive categorical BP.
-- [x] Integrate winding inference and artifacts into crop BP.
-- [x] Add focused regression coverage.
-- [x] Update specs, docs, changelog, and task log.
-- [x] Build and run focused validation.
+- [x] Record the user task in `task.md`.
+- [x] Write the detailed implementation, spec, docs, and validation plan.
+- [x] Complete independent plan review against task and existing specs.
+- [x] Update the specification with the reviewed model.
+- [x] Implement joint interleaved-lattice BP and global calibration.
+- [x] Integrate joint marginals and diagnostics into crop output.
+- [x] Add focused regression tests.
+- [x] Run Release tests and the 384-base crop validation.
+- [x] Update docs, changelog, task log, and final status.
+- [x] Plan typed interleaved-winding progress reporting.
+- [x] Complete independent review of the progress design.
+- [x] Implement core progress events and throttled CLI output.
+- [x] Add callback regression coverage and rerun focused tests.
+- [x] Update docs and record progress-validation results.
+- [x] Plan initial stored-trace quality filtering.
+- [x] Complete independent review of the quality-filter design.
+- [x] Implement shared ranking and `--quality-fraction` filtering.
+- [x] Add regressions and rerun focused tests.
+- [x] Update specifications, docs, log, and changelog.

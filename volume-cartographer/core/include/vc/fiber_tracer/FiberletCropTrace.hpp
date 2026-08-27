@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <functional>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -127,6 +128,14 @@ struct FiberQualityHistogram {
   std::array<FiberQualityHistogramBin, 10> bins;
 };
 
+struct FiberQualitySelection {
+  std::vector<std::size_t> lineIndices;
+  std::size_t inputLines = 0;
+  double requestedFraction = 1.0;
+  double effectiveFraction = 1.0;
+  std::optional<double> maximumRetainedCostDensity;
+};
+
 struct FiberQualityObjPaths {
   std::array<std::filesystem::path, 10> deciles;
   std::filesystem::path histogramCsv;
@@ -185,6 +194,11 @@ void writeFiberletCropDirectionObjs(
 
 [[nodiscard]] FiberQualityHistogram
 classifyFiberletCropQuality(const std::vector<FiberletCropTraceLine> &lines);
+
+[[nodiscard]] FiberQualitySelection
+selectFiberletCropQuality(
+    const std::vector<FiberletCropTraceLine>& lines,
+    double fraction);
 
 [[nodiscard]] FiberQualityObjPaths
 fiberQualityObjPaths(const std::filesystem::path &allOutputPath);
