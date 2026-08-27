@@ -2,7 +2,6 @@ configure_file(src/Version.cpp.in Version.cpp)
 
 add_library(vc_core
         src/AtomicFile.cpp
-        src/ObjMaterial.cpp
         src/PolylineObj.cpp
         src/TexturedMesh.cpp
         src/SurfaceTexture.cpp

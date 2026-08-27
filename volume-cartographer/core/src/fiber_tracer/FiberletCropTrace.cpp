@@ -1376,20 +1376,17 @@ FiberTernaryStateObjPaths writeFiberletCropTernaryStateObjs(
         "VC3D Fiberlet crop traces: BP horizontal argmax",
         "VC3D Fiberlet crop traces: BP exact argmax tie",
     };
-    const std::array<cv::Vec3d, 4> colors{{
-        {0.00, 1.00, 1.00},
-        {1.00, 0.00, 1.00},
-        {1.00, 0.45, 0.00},
-        {0.55, 1.00, 0.00},
+    constexpr std::array<vc::core::io::ObjVertexColor, 4> colors{{
+        {0.05, 0.80, 1.00},
+        {1.00, 0.10, 0.75},
+        {1.00, 0.35, 0.05},
+        {0.60, 1.00, 0.10},
     }};
     const std::array outputPaths{
         paths.vertical, paths.mixed, paths.horizontal, paths.tie};
     for (std::size_t group = 0; group < grouped.size(); ++group) {
-        vc::core::io::ObjMaterial material;
-        material.ambient = colors[group];
-        material.diffuse = colors[group];
-        static_cast<void>(vc::core::io::writePolylinesObjWithMaterial(
-            grouped[group], outputPaths[group], comments[group], material));
+        vc::core::io::writePolylinesObj(
+            grouped[group], outputPaths[group], comments[group], colors[group]);
     }
     return paths;
 }

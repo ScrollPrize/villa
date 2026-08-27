@@ -7,12 +7,23 @@
 
 namespace vc::core::util
 {
+namespace
+{
+
+void requireToken(std::string_view value, const char* label)
+{
+    if (value.empty() || value.find_first_of(" \t\r\n") != std::string_view::npos)
+        throw std::invalid_argument(std::string(label) + " must be a non-empty OBJ token");
+}
+
+}  // namespace
+
 std::string texturedMeshObj(const TexturedMesh& mesh, std::string_view comment, std::string_view materialLibrary, std::string_view materialName, std::string_view objectName)
 {
-    vc::core::io::requireObjToken(materialLibrary, "textured mesh material library");
-    vc::core::io::requireObjToken(materialName, "textured mesh material name");
+    requireToken(materialLibrary, "textured mesh material library");
+    requireToken(materialName, "textured mesh material name");
     if (!objectName.empty())
-        vc::core::io::requireObjToken(objectName, "textured mesh object name");
+        requireToken(objectName, "textured mesh object name");
     if (mesh.vertices.empty() || mesh.textureCoordinates.empty())
         throw std::invalid_argument("textured mesh must contain vertices and texture coordinates");
 
@@ -20,10 +31,10 @@ std::string texturedMeshObj(const TexturedMesh& mesh, std::string_view comment, 
     output.imbue(std::locale::classic());
     if (!comment.empty())
         output << "# " << comment << '\n';
-    output << vc::core::io::objMaterialLibraryReference(materialLibrary);
+    output << "mtllib " << materialLibrary << '\n';
     if (!objectName.empty())
         output << "o " << objectName << '\n';
-    output << vc::core::io::objUseMaterial(materialName);
+    output << "usemtl " << materialName << '\n';
     for (const auto& vertex : mesh.vertices) {
         if (!std::isfinite(vertex[0]) || !std::isfinite(vertex[1]) || !std::isfinite(vertex[2]))
             throw std::invalid_argument("textured mesh vertex must be finite");
@@ -49,8 +60,18 @@ std::string texturedMeshObj(const TexturedMesh& mesh, std::string_view comment, 
 
 std::string textureMaterialMtl(std::string_view materialName, std::string_view textureFile)
 {
-    return vc::core::io::objMaterialMtl(
-        materialName, {}, textureFile);
+    requireToken(materialName, "texture material name");
+    requireToken(textureFile, "texture material file");
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << "newmtl " << materialName << '\n'
+           << "Ka 1 1 1\n"
+           << "Kd 1 1 1\n"
+           << "Ks 0 0 0\n"
+           << "d 1\n"
+           << "illum 1\n"
+           << "map_Kd " << textureFile << '\n';
+    return output.str();
 }
 
 }  // namespace vc::core::util

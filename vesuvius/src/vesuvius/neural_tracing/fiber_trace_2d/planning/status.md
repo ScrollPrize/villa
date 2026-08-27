@@ -1,11 +1,10 @@
-# Status: Bright material colors for BP state lines
+# Status: Color direct BP state OBJ layers
 
-- [x] Capture the MeshLab line-color correction.
+- [x] Capture the visualization requirement.
 - [x] Write implementation, specification, documentation, and test plan.
-- [x] Complete independent plan review and incorporate shared-helper,
-  publication, empty-layer, opacity, and visual-verification requirements.
-- [x] Replace vertex RGB with the shared material-backed writer.
-- [x] Apply stable bright materials to direct BP state layers.
+- [x] Complete independent plan review and incorporate its palette, API, and
+  test-strengthening findings.
+- [x] Implement optional shared OBJ vertex colors.
+- [x] Apply stable colors to direct BP state layers.
 - [x] Update specifications, docs, and task log.
-- [x] Build, run focused tests, regenerate, and inspect the 1024 artifacts.
-- [ ] Confirm the four line materials visually in MeshLab.
+- [x] Build and run focused validation.

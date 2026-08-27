@@ -1,60 +1,42 @@
-# Plan: Bright material colors for BP state lines
+# Plan: Color direct BP state OBJ layers
 
 ## Contract
 
-- Remove the optional per-vertex RGB API introduced for direct BP state files.
-- Extract the existing private OBJ token validation and MTL serialization from
-  the textured-mesh implementation into a shared OBJ-material helper. Make the
-  existing texture material writer and the new material-backed polyline writer
-  use that helper; do not add a second MTL implementation.
-- Emit coordinate-only `v x y z` records, `mtllib` and `usemtl` records in the
-  OBJ, and a sibling MTL defining the material used by every `l` or `p`
-  primitive in that file.
-- Use saturated normalized material colors: H orange `(1.00,0.45,0.00)`, V
-  cyan `(0.00,1.00,1.00)`, Mixed magenta `(1.00,0.00,1.00)`, and exact ties
-  lime `(0.55,1.00,0.00)`. Set ambient and diffuse to the full color, specular
-  to zero, opacity `d 1`, and illumination model 1 so MeshLab does not reduce
-  these to near-black vertex attributes.
-- Preserve the existing unmaterialed polyline writer and every existing caller.
-- Reject invalid colors and material tokens in the shared API.
-- Name the sidecar `<obj-stem>.mtl`, reference only its local filename, and
-  return both paths from the shared writer. Atomically publish the MTL first and
-  the OBJ last so the OBJ is the bundle publication marker.
+- Add optional uniform per-vertex RGB output to the shared polyline OBJ writer.
+- Use MeshLab-compatible `v x y z r g b` records without companion MTL files.
+- Color only the four direct BP argmax layers with normalized RGB values:
+  H `(1.00, 0.35, 0.05)`, V `(0.05, 0.80, 1.00)`, Mixed
+  `(1.00, 0.10, 0.75)`, and exact ties `(0.60, 1.00, 0.10)`.
+- Preserve coordinate, object, point, and line records and leave every existing
+  caller uncolored unless it explicitly supplies a color.
+- Preserve the existing writer call contract by adding a colored overload whose
+  color follows the existing comment argument. Reject non-finite or out-of-range
+  normalized color components.
 
 ## Implementation
 
-1. Extract shared OBJ token/reference and MTL serialization from the existing
-   textured-mesh helper without changing existing texture artifacts.
-2. Replace the colored-vertex overload with a clearly named shared
-   material-backed writer that emits OBJ and MTL siblings.
-3. Use it for the four mutually exclusive direct BP state layers.
-4. Regenerate the centered-1024 output in its existing main directory.
+1. Add a small RGB value type and optional color argument to the shared writer.
+2. Assign the four state colors in the ternary-state artifact writer.
+3. Verify colored state files and legacy uncolored output in focused tests.
 
 ## Spec Update
 
-Replace the vertex-RGB statement with material-backed line colors, exact
-palette, and sibling artifact semantics.
+Specify the exact normalized palette and MeshLab-compatible vertex RGB
+representation for the four direct BP state layers.
 
 ## Docs Updates
 
-Document that each direct state OBJ requires and automatically references its
-sibling MTL file.
+Document the colors and that MeshLab loads them from OBJ vertex records without
+an MTL sidecar.
 
 ## Testing
 
-- Verify colored OBJs retain exactly XYZ vertex fields and unchanged line/point
-  indices, reference the expected MTL, and select its material before geometry.
-- Verify MTL material name, ambient/diffuse/specular values, and illumination.
-- Verify the legacy writer creates no material records or sidecar.
-- Cover empty state groups, local-basename references, MTL-before-geometry
-  ordering, atomic bundle paths, and rejection of malformed output tokens.
-- Build `vc_fiber_trace_chunk` and `test_fiberlet_crop_trace` with `-j32`, run
-  the focused test suite, inspect regenerated artifacts, and run
-  `git diff --check`.
-- Ask the user to confirm the regenerated lines render with the four material
-  colors in MeshLab; record that visual check separately from automated tests.
+- Build `vc_fiber_trace_chunk` and `test_fiberlet_crop_trace` with `-j32`.
+- Run `test_fiberlet_crop_trace`.
+- Parse vertex token counts: colored records contain exactly XYZRGB and default
+  records exactly XYZ; preserve object, line, point, and index records.
+- Run `git diff --check`.
 
 ## Changelog
 
-Record the correction in the current task log; no durable changelog entry is
-needed for this unshipped visualization iteration.
+This is a small visualization tweak; record it in the current task log only.

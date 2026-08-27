@@ -1,5 +1,4 @@
-# Task: Bright material colors for BP state lines
+# Task: Color direct BP state OBJ layers
 
-Replace the direct BP state OBJ vertex colors with bright materials that
-MeshLab applies to the line primitives themselves. Do not retain the incorrect
-vertex-color scheme.
+Give the direct H, V, Mixed, and tie BP result OBJ files distinct bright colors
+that MeshLab reads automatically. Preserve all existing uncolored OBJ outputs.
