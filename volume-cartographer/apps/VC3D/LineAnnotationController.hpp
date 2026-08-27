@@ -549,6 +549,12 @@ private:
         std::string surfaceName;
         std::vector<vc3d::line_annotation::GeneratedOverlay::FiberIntersectionMarker> markers;
         std::string error;
+        // The run painted partial (branch-link) markers before it finished;
+        // a FAILED run with this set corrupted the display, so the finish
+        // restores the surface's last known good set. Without it a failure
+        // keeps whatever was displayed (by-definition-fresher than any cache
+        // entry for a different fingerprint).
+        bool publishedPartial = false;
     };
 
     struct PaneRecord {

@@ -13269,6 +13269,9 @@ void LineAnnotationController::dispatchSideStripIntersectionQuery(
             invalidateSideStripQueries();
         }
         _pendingSideStripIntersectionRequests.erase(surfaceName);
+        // The reuse entry must die with the clear: a later failed query
+        // would otherwise restore markers this clear intentionally removed.
+        _sideStripReuseCache.erase(surfaceName);
         refreshLatestSideStripIntersectionToken();
     };
 
@@ -13401,12 +13404,14 @@ void LineAnnotationController::dispatchSideStripIntersectionQuery(
     }
 
     if (const auto reuseIt = _sideStripReuseCache.find(request.surfaceName);
-        !_sideStripIntersectionRunning &&
+        (!_sideStripIntersectionRunning ||
+         _runningSideStripIntersectionSurfaceName != request.surfaceName) &&
         reuseIt != _sideStripReuseCache.end() &&
         reuseIt->second.cacheKey != 0 &&
         request.cacheKey == reuseIt->second.cacheKey) {
-        // Defensive only: pending entries exist only while a query runs, so
-        // this idle gate cannot normally have one to retire.
+        // Another surface's running query must not force this surface into a
+        // redundant full solve when its exact result is cached; retire any
+        // queued older intent along the way.
         _pendingSideStripIntersectionRequests.erase(request.surfaceName);
         refreshLatestSideStripIntersectionToken();
         pane->dialog->setGeneratedSideStripIntersectionBusy(false);
@@ -13610,6 +13615,7 @@ LineAnnotationController::runSideStripIntersectionQuery(
                                   branchMarkers.begin(),
                                   branchMarkers.end());
             if (partialResultCallback && !branchMarkers.empty()) {
+                result.publishedPartial = true;
                 partialResultCallback(std::move(branchMarkers));
             }
             publishAggregateProgress("branch links", triangleIndexOffset);
@@ -13842,13 +13848,16 @@ void LineAnnotationController::finishSideStripIntersectionQuery(
                     pane->dialog->setGeneratedSideStripIntersectionResult(markerCount);
                 }
             } else {
-                // A failed refresh must not blank a valid display — but the
-                // failed run may have painted PARTIAL markers (branch links
-                // publish before the fiber sweep): restore the last known
-                // good set for this surface when the reuse cache has one,
-                // else keep what is shown. The error state still shows.
+                // A failed refresh must not blank a valid display — and it
+                // must not REPAINT either, unless the failed run itself
+                // corrupted the display with its partial branch-link markers:
+                // the reuse entry is by definition from an older fingerprint,
+                // so restoring it unconditionally would render stale
+                // intersections over newer strip geometry. The error state
+                // still shows either way.
                 if (const auto reuseIt =
                         _sideStripReuseCache.find(result.surfaceName);
+                    result.publishedPartial &&
                     reuseIt != _sideStripReuseCache.end() &&
                     reuseIt->second.cacheKey != 0) {
                     pane->dialog->setGeneratedFiberIntersectionMarkers(

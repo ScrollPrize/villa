@@ -1617,7 +1617,8 @@ vc::lasagna::LineModel spliceLineModelWithInterpolatedNormals(
                 // proportional pick is unusable, take the nearest USABLE
                 // sample within the old range instead of carrying an invalid
                 // normal past a valid one (a degenerate line could otherwise
-                // lose its only anchor and reject the click).
+                // lose its only anchor and reject the click). Equal-offset
+                // ties deterministically prefer the LOWER old index.
                 if (!usable(previous.points[static_cast<size_t>(
                                                 replacedStart + localOld)]
                                 .sampledNormal)) {
@@ -1655,19 +1656,23 @@ vc::lasagna::LineModel spliceLineModelWithInterpolatedNormals(
                 bool valid = false;
                 if (leftBoundary >= 0 && rightBoundary >= 0) {
                     // Geometric weights, not index weights: inserted points
-                    // can be spaced arbitrarily between the boundaries.
+                    // can be spaced arbitrarily. Signed projection onto the
+                    // boundary segment, clamped — a point beyond an endpoint
+                    // saturates to that endpoint's normal (a distance ratio
+                    // would drift back toward the midpoint instead).
                     const cv::Vec3d leftPosition =
                         previous.points[static_cast<size_t>(leftBoundary)]
                             .position;
                     const cv::Vec3d rightPosition =
                         previous.points[static_cast<size_t>(rightBoundary)]
                             .position;
-                    const double toLeft = cv::norm(position - leftPosition);
-                    const double toRight = cv::norm(position - rightPosition);
-                    const double total = toLeft + toRight;
-                    const double t =
-                        total > 1.0e-12 ? std::clamp(toLeft / total, 0.0, 1.0)
-                                        : 0.5;
+                    const cv::Vec3d segment = rightPosition - leftPosition;
+                    const double segmentLengthSq = segment.dot(segment);
+                    const double t = segmentLengthSq > 1.0e-24
+                        ? std::clamp((position - leftPosition).dot(segment) /
+                                         segmentLengthSq,
+                                     0.0, 1.0)
+                        : 0.5;
                     normal = (1.0 - t) * leftNormal + t * rightNormal;
                     if (cv::norm(normal) <= 1.0e-6) {
                         normal = t < 0.5 ? leftNormal : rightNormal;
@@ -1702,14 +1707,23 @@ vc::lasagna::LineModel spliceLineModelWithInterpolatedNormals(
     // local tangent (the display frame's own requirement -- a parallel anchor
     // makes buildLineViewSurfaces throw).
     const auto localTangent = [&](size_t index) {
+        // Central difference first; a fold-back (p[i-1] == p[i+1]) makes it
+        // degenerate even though the line has a perfectly good direction, so
+        // fall back to the one-sided differences before giving up.
         const size_t lower = index > 0 ? index - 1 : index;
         const size_t upper =
             index + 1 < model.points.size() ? index + 1 : index;
-        cv::Vec3d tangent =
-            model.points[upper].position - model.points[lower].position;
-        const double length = cv::norm(tangent);
-        return length > 1.0e-9 ? cv::Vec3d(tangent / length)
-                               : cv::Vec3d(0, 0, 0);
+        const std::array<cv::Vec3d, 3> candidates{
+            model.points[upper].position - model.points[lower].position,
+            model.points[upper].position - model.points[index].position,
+            model.points[index].position - model.points[lower].position};
+        for (const auto& candidate : candidates) {
+            const double length = cv::norm(candidate);
+            if (length > 1.0e-9) {
+                return cv::Vec3d(candidate / length);
+            }
+        }
+        return cv::Vec3d(0, 0, 0);
     };
     int bestAnchor = -1;
     double bestAnchorDistance = std::numeric_limits<double>::infinity();
@@ -1723,13 +1737,25 @@ vc::lasagna::LineModel spliceLineModelWithInterpolatedNormals(
             // parallel to the LOCAL tangent: positions moved, so a normal
             // that was fine on the old geometry can be tangent-parallel on
             // the new one, and the display frame builder throws on such an
-            // anchor.
+            // anchor. The normal is normalized first (a non-unit normal
+            // would pass on magnitude alone), the tangent handles fold-backs
+            // (see localTangent), a degenerate tangent rejects the
+            // candidate, and 1e-6 leaves a wide margin over the builder's
+            // own epsilon without falsely rejecting displayable anchors.
             {
                 const cv::Vec3d tangent = localTangent(i);
-                const cv::Vec3d normal = model.points[i].sampledNormal.normal;
+                if (cv::norm(tangent) <= 1.0e-9) {
+                    continue;
+                }
+                cv::Vec3d normal = model.points[i].sampledNormal.normal;
+                const double normalLength = cv::norm(normal);
+                if (normalLength <= 1.0e-9) {
+                    continue;
+                }
+                normal /= normalLength;
                 const cv::Vec3d perpendicular =
                     normal - normal.dot(tangent) * tangent;
-                if (cv::norm(perpendicular) <= 1.0e-3) {
+                if (cv::norm(perpendicular) <= 1.0e-6) {
                     continue;
                 }
             }
@@ -1933,21 +1959,43 @@ MergedSupersededSolve mergeSupersededSolveResult(
         if (!out.line.points[k].valid) {
             continue;
         }
+        if (!out.line.points[k].sampledNormal.valid) {
+            continue;
+        }
         {
+            // Same anchor eligibility as the interpolated splice: fold-back
+            // tolerant tangent, normalized normal, degenerate tangent
+            // rejects, 1e-6 margin over the builder's epsilon.
             const size_t lower = k > 0 ? k - 1 : k;
             const size_t upper =
                 k + 1 < out.line.points.size() ? k + 1 : k;
-            cv::Vec3d tangent = out.line.points[upper].position -
-                                out.line.points[lower].position;
-            const double length = cv::norm(tangent);
-            if (length > 1.0e-9) {
-                tangent /= length;
-                const cv::Vec3d normal = out.line.points[k].sampledNormal.normal;
-                const cv::Vec3d perpendicular =
-                    normal - normal.dot(tangent) * tangent;
-                if (cv::norm(perpendicular) <= 1.0e-3) {
-                    continue;
+            const std::array<cv::Vec3d, 3> candidates{
+                out.line.points[upper].position -
+                    out.line.points[lower].position,
+                out.line.points[upper].position - out.line.points[k].position,
+                out.line.points[k].position -
+                    out.line.points[lower].position};
+            cv::Vec3d tangent{0, 0, 0};
+            for (const auto& candidate : candidates) {
+                const double length = cv::norm(candidate);
+                if (length > 1.0e-9) {
+                    tangent = candidate / length;
+                    break;
                 }
+            }
+            if (cv::norm(tangent) <= 1.0e-9) {
+                continue;
+            }
+            cv::Vec3d normal = out.line.points[k].sampledNormal.normal;
+            const double normalLength = cv::norm(normal);
+            if (normalLength <= 1.0e-9 || !std::isfinite(normalLength)) {
+                continue;
+            }
+            normal /= normalLength;
+            const cv::Vec3d perpendicular =
+                normal - normal.dot(tangent) * tangent;
+            if (cv::norm(perpendicular) <= 1.0e-6) {
+                continue;
             }
         }
         const double distance = std::abs(static_cast<double>(k) - center);
