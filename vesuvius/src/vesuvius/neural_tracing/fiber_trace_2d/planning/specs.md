@@ -4593,14 +4593,24 @@
   including when it has no usable initial edge. Zero means unlimited for both
   limits, and neither limit changes descending-presence/storage-key ordering.
 - Before crop tracing, the stored chunk graph is bulk-materialized into an
-  immutable crop-local replay graph. The preparation loads crop seed anchors,
-  all physical Fiberlets incident to the geometric crop, complete route and
-  cost-profile data, outside endpoints needed by crossing routes, and ordinary
-  stored join transitions. Chunk requests are batched through the existing
-  cache workers, and each retained route is reconstructed once. Canonical
-  starting seeds remain the anchors owned by storage chunks intersecting the
-  half-open crop; additional inside endpoints close traversal adjacency but do
-  not become new seeds.
+  immutable replay graph over an internal search box. That box expands every
+  face of the requested crop by exactly the configured base-voxel lookahead
+  distance. The preparation loads anchors, physical Fiberlets, complete route
+  and cost-profile data, outside endpoints needed by crossing routes, and
+  ordinary stored join transitions for that expanded box. One lookahead
+  distance is sufficient: every physical Fiberlet incident to an anchor in the
+  search box is retained in full, including a final horizon-crossing edge whose
+  endpoint lies outside the box. No additional maximum-Fiberlet-length padding
+  is used. Chunk requests are batched through the existing cache workers, and
+  each retained route is reconstructed once.
+- Canonical starting seeds remain only the anchors in the requested half-open
+  crop. Speculative lookahead clips and terminates at the expanded search-box
+  boundary; committed trace geometry still clips and terminates at the
+  requested crop boundary. The requested crop remains authoritative for seed
+  ownership, anisotropic coverage, stored artifact bounds, CT faces, and all
+  downstream output. The halo may change a near-boundary route choice by
+  exposing its full lookahead evidence, but it must not create halo starts or
+  emit halo geometry.
 - Seed workers query only the immutable materialized graph. They perform no
   cache I/O, waits, or shared graph mutation. Crop tracing assigns dense
   strongest-first tickets continuously and commits completed candidates only

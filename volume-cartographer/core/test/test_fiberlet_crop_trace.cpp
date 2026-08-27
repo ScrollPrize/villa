@@ -56,6 +56,15 @@ public:
         adjacency[second].push_back(directed);
     }
 
+    void setCostDensity(
+        FiberletStorageKey first,
+        FiberletStorageKey second,
+        float density)
+    {
+        edgeCostDensity[{std::min(first, second), std::max(first, second)}] =
+            density;
+    }
+
     [[nodiscard]] bool supportsConcurrentQueries() const noexcept override { return concurrentQueries; }
     [[nodiscard]] float predictionToBaseScale() const noexcept override { return 1.0F; }
     [[nodiscard]] int anchorCellSizePredictionVoxels() const noexcept override { return 4; }
@@ -101,12 +110,17 @@ public:
         const auto target = id.reverse ? id.fiberlet.first : id.fiberlet.second;
         const cv::Vec3d delta = positions.at(target) - positions.at(source);
         const float edgeLength = static_cast<float>(cv::norm(delta));
-        return {id, source, target, positions.at(source), positions.at(target), cv::Vec3f(delta), cv::Vec3f(delta), edgeLength, {0, edgeLength, 0, 0, 0}, std::nullopt, std::nullopt};
+        const auto found = edgeCostDensity.find(id.fiberlet);
+        const float density = found == edgeCostDensity.end()
+            ? 1.0F
+            : found->second;
+        return {id, source, target, positions.at(source), positions.at(target), cv::Vec3f(delta), cv::Vec3f(delta), edgeLength, {0, edgeLength * density, 0, 0, 0}, std::nullopt, std::nullopt};
     }
     [[nodiscard]] FiberletReplaySourceCostProfile costProfile(const DirectedFiberletStorageId& id) const override
     {
         const auto edge = arc(id);
-        return {{edge.pathLengthPredictionVoxels}, {1.0F}};
+        return {{edge.pathLengthPredictionVoxels},
+                {edge.cost.total() / edge.pathLengthPredictionVoxels}};
     }
     [[nodiscard]] std::vector<cv::Vec3d> routePoints(const DirectedFiberletStorageId& id) const override
     {
@@ -129,6 +143,7 @@ public:
     std::map<FiberletStorageKey, std::vector<DirectedFiberletStorageId>> adjacency;
     std::map<FiberletStorageKey, std::chrono::milliseconds> queryDelay;
     std::map<FiberletStorageKey, std::string> queryFailure;
+    std::map<FiberletStorageId, float> edgeCostDensity;
     bool concurrentQueries = false;
     bool observeConcurrency = false;
     mutable std::atomic<int> activeQueries{0};
@@ -228,6 +243,25 @@ std::filesystem::path createNormalManifest(
 
 }  // namespace
 
+TEST_CASE("Fiberlet crop search box expands every face by exact lookahead")
+{
+    FiberletCropTraceConfig config;
+    config.minimumBaseXYZ = {10.0, 20.0, 30.0};
+    config.maximumBaseXYZ = {110.0, 220.0, 330.0};
+    config.lookaheadDistanceBaseVoxels = 48.0;
+    const auto search = fiberletCropTraceSearchBox(config);
+    CHECK(search.minimumBaseXYZ == cv::Vec3d{-38.0, -28.0, -18.0});
+    CHECK(search.maximumBaseXYZ == cv::Vec3d{158.0, 268.0, 378.0});
+
+    config.lookaheadDistanceBaseVoxels = 0.0;
+    CHECK_THROWS_AS(
+        fiberletCropTraceSearchBox(config), std::invalid_argument);
+    config.lookaheadDistanceBaseVoxels = 48.0;
+    config.maximumBaseXYZ[1] = config.minimumBaseXYZ[1];
+    CHECK_THROWS_AS(
+        fiberletCropTraceSearchBox(config), std::invalid_argument);
+}
+
 TEST_CASE("Fiberlet crop tracing is bidirectional and uses anisotropic directional coverage")
 {
     TestGraph graph;
@@ -285,6 +319,54 @@ TEST_CASE("Fiberlet crop tracing is bidirectional and uses anisotropic direction
     CHECK(limited.coveredAnchors == 1);
     CHECK(limited.lines.size() == 1);
     CHECK(limited.noEdgeAnchors == 1);
+}
+
+TEST_CASE("Fiberlet crop lookahead ranks beyond output boundary but clips output")
+{
+    TestGraph graph;
+    const auto seed = key(50);
+    const auto branch = key(90);
+    const auto cheapFirst = key(110);
+    const auto goodFirst = key(110, 1);
+    const auto expensiveFuture = key(160);
+    const auto goodFuture = key(160, 1);
+    graph.addAnchor(seed, {50, 0, 0});
+    graph.addAnchor(branch, {90, 0, 0});
+    graph.addAnchor(cheapFirst, {110, 0, 0});
+    graph.addAnchor(goodFirst, {110, 10, 0});
+    graph.addAnchor(expensiveFuture, {160, 0, 0});
+    graph.addAnchor(goodFuture, {160, 10, 0});
+    graph.connect(seed, branch);
+    graph.connect(branch, cheapFirst);
+    graph.connect(branch, goodFirst);
+    graph.connect(cheapFirst, expensiveFuture);
+    graph.connect(goodFirst, goodFuture);
+    graph.setCostDensity(branch, cheapFirst, 0.1F);
+    graph.setCostDensity(cheapFirst, expensiveFuture, 10.0F);
+    graph.setCostDensity(branch, goodFirst, 0.2F);
+    graph.setCostDensity(goodFirst, goodFuture, 0.01F);
+
+    FiberletCropTraceConfig config;
+    config.minimumBaseXYZ = {0, -100, -100};
+    config.maximumBaseXYZ = {100, 100, 100};
+    config.lookaheadDistanceBaseVoxels = 40.0;
+    config.maximumAttempts = 1;
+    ZNormalSampler normals;
+    const auto result = traceFiberletCrop(
+        graph,
+        {anchor(seed, {50, 0, 0}, {1, 0, 0}, 1.0F)},
+        normals,
+        1.0,
+        config);
+
+    REQUIRE(result.lines.size() == 1);
+    const auto& line = result.lines.front();
+    CHECK(line.positiveTermination == "crop_boundary");
+    REQUIRE(line.pointsBaseXYZ.size() == 3);
+    CHECK(line.pointsBaseXYZ[0] == cv::Vec3d{50, 0, 0});
+    CHECK(line.pointsBaseXYZ[1] == cv::Vec3d{90, 0, 0});
+    CHECK(line.pointsBaseXYZ[2][0] == doctest::Approx(100.0));
+    CHECK(line.pointsBaseXYZ[2][1] == doctest::Approx(5.0));
 }
 
 TEST_CASE("Fiberlet crop lookahead preserves lexicographic pruning and state-cap ordering")

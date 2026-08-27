@@ -86,6 +86,13 @@
 - [ ] beamsearch
 - [ ] short brute-force lookahead
 - [ ] substep evaluation
+- [ ] use staged Fiberlet filtering before crop tracing
+    - materialize the transient filtered overlay through the existing staged
+      cache path, without changing the authoritative combined Fiberlet dataset
+    - benchmark graph preparation and tracing separately against the unfiltered
+      crop graph
+    - compare accepted trace count, cost/quality distribution, and resulting
+      geometry before selecting default filtering stages
 - [ ] store sub-fiberlet cost segments so fixed-distance lookahead can score a
       final partial fiberlet from local evidence instead of proportional
       average cost

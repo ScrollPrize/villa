@@ -1,43 +1,60 @@
-# Task Log: Split-piece fiber BP
+# Task Log: Fiberlet crop lookahead graph halo
 
 ## Findings
 
-- Constraint extraction already produces piece-local geometry and canonical
-  same-source continuity links before spatial constraint search.
-- BP currently maps every piece back to a unique source trace and therefore
-  rejects both multiple pieces and continuity links.
-- The CLI currently passes full source fibers to BP visualization and assumes
-  each report vector has source-fiber cardinality; graph construction alone is
-  therefore insufficient.
-- Existing labeling semantics retain continuity as strong parallel evidence,
-  not a mathematical equality. BP must preserve that behavior.
+- The crop command currently materializes only the requested crop's incident
+  graph. A seed near a crop face can therefore rank lookahead routes against
+  graph exhaustion caused solely by the requested output boundary.
+- Trace first-exit clipping is already separate and must remain tied to the
+  requested crop.
+- One lookahead-distance halo is sufficient because bulk materialization
+  retains the complete final Fiberlet incident to every in-search-box anchor,
+  including its outside endpoint.
+- Staged Fiberlet filtering is recorded in `planning/todo.md` as a separate
+  follow-up and is intentionally not part of this implementation.
 
 ## Plan Review
 
-- Independent review approved piece-node BP after requiring exact dense
-  source-geometry clipping, full continuity-topology validation, explicit
-  source-versus-piece cardinality, deterministic exact seed mapping, per-piece
-  unary/balance semantics, complete CSV/OBJ identity, and stronger no-split
-  equivalence coverage. The plan now includes those corrections.
+- Independent review found that graph expansion alone was insufficient:
+  speculative lookahead also clipped at the requested crop. The plan now gives
+  rollout clipping the expanded search box while retaining requested-crop
+  clipping for committed geometry.
+- Review confirmed exact lookahead padding is sufficient because a complete
+  final incident Fiberlet is retained even when its endpoint lies beyond the
+  search box. It requested explicit long-final-edge and boundary-choice tests.
+- Review also required distinct graph/seed use throughout materialization and
+  complete sparse halo coverage. These are now explicit in the plan.
 
 ## Deviations
 
 - None.
 
+## Implementation
+
+- Added one validated exact-lookahead search box shared by crop tracing and the
+  command's graph preparation.
+- Split bulk graph and seed bounds: the expanded box owns immutable graph
+  content while only requested-crop anchors become seed candidates.
+- Speculative rollout now clips at the expanded search boundary. Committed
+  geometry still clips at the requested crop boundary.
+- Added graph-preparation diagnostics for requested bounds, search bounds, and
+  padding.
+- Added the staged-filtering experiment to `planning/todo.md`; it is not active
+  in crop tracing.
+
 ## Validation
 
-- Built `vc_fiber_trace_chunk` and `test_fiberlet_crop_trace` from the existing
-  `volume-cartographer/build` configuration with `-j32`.
-- `volume-cartographer/build/bin/test_fiberlet_crop_trace`: 72 test cases
-  passed after adding split exactness, topology rejection, dense clipping,
-  finite-continuity, unary, and no-split coverage.
-- The Paris4 1024 crop with ordinary `--piece-length 512` produced 1,298 BP
-  pieces from 500 source fibers and selected 26,402 full-orientation factors.
-  Mixed-state sum-product converged in 0.745 seconds.
-- The matching split `--perpendicular-only` smoke selected 15,017 factors and
-  converged; a `--constraints-per-fiber 5` smoke selected 1,747 factors and
-  converged, confirming both selector paths retain continuity.
-- The split CSV contains one header plus 1,298 piece rows with global/source/
-  local/arc identity. The ten orientation-band OBJs and four direct-state OBJs
-  each partition all 1,298 pieces.
-- `git diff --check` passed.
+- Built `vc_fiber_trace_chunk`, `vc_fiberlets`, `test_fiberlet_storage`, and
+  `test_fiberlet_crop_trace` from `volume-cartographer/build` with `-j32`.
+- `volume-cartographer/build/bin/test_fiberlet_storage`: 40 cases passed.
+- `volume-cartographer/build/bin/test_fiberlet_crop_trace`: 74 cases passed.
+- The new route-choice test proves evidence beyond the requested crop changes
+  the selected continuation while emitted geometry remains clipped to the
+  requested crop. The storage suite covers separate graph/seed boxes and
+  required partial sparse tuples in the expanded halo.
+- A Release smoke trace on the Paris4 combined Fiberlet dataset used a
+  128-base-voxel crop, the default 384-base-voxel lookahead, and one attempt.
+  It reported crop `[10240,22016,6144)..[10368,22144,6272)` and expanded search
+  `[9856,21632,5760)..[10752,22528,6656)`, then accepted and published one
+  bidirectional crop-clipped trace. Graph preparation took 9.44 s and tracing
+  took 0.063 s; the temporary artifact was removed.

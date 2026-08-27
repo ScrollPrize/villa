@@ -29,6 +29,14 @@ struct FiberletCropTraceConfig {
     std::size_t maximumFibers = 0;
 };
 
+struct FiberletCropTraceSearchBox {
+    cv::Vec3d minimumBaseXYZ{0.0, 0.0, 0.0};
+    cv::Vec3d maximumBaseXYZ{0.0, 0.0, 0.0};
+};
+
+[[nodiscard]] FiberletCropTraceSearchBox fiberletCropTraceSearchBox(
+    const FiberletCropTraceConfig& config);
+
 struct FiberletCropTraceLine {
     FiberletStorageKey seed;
     cv::Vec3d seedBaseXYZ{0.0, 0.0, 0.0};

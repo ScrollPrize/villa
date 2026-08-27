@@ -117,10 +117,14 @@ std::string fiberName(const FiberletCropTraceLine& line, std::size_t index)
     return name.str();
 }
 
-bool inside(const cv::Vec3d& point, const FiberletCropTraceConfig& config)
+bool inside(
+    const cv::Vec3d& point,
+    const cv::Vec3d& minimumBaseXYZ,
+    const cv::Vec3d& maximumBaseXYZ)
 {
     for (int axis = 0; axis < 3; ++axis) {
-        if (!(point[axis] >= config.minimumBaseXYZ[axis] && point[axis] < config.maximumBaseXYZ[axis])) {
+        if (!(point[axis] >= minimumBaseXYZ[axis] &&
+              point[axis] < maximumBaseXYZ[axis])) {
             return false;
         }
     }
@@ -134,11 +138,14 @@ struct ClippedRoute {
 
 ClippedRoute clipAtFirstExit(
     const FiberletReplayRoutePointView& route,
-    const FiberletCropTraceConfig& config,
+    const cv::Vec3d& minimumBaseXYZ,
+    const cv::Vec3d& maximumBaseXYZ,
     std::vector<cv::Vec3d>* appendedPoints = nullptr)
 {
-    if (route.size() < 2 || !inside(route.front(), config))
+    if (route.size() < 2 ||
+        !inside(route.front(), minimumBaseXYZ, maximumBaseXYZ)) {
         throw std::invalid_argument("Fiberlet crop route must start inside the crop");
+    }
     ClippedRoute result;
     double totalLength = 0.0;
     double retainedLength = 0.0;
@@ -154,7 +161,7 @@ ClippedRoute clipAtFirstExit(
         const double segmentLength = length(delta);
         if (!(segmentLength > kEpsilon))
             continue;
-        if (inside(finish, config)) {
+        if (inside(finish, minimumBaseXYZ, maximumBaseXYZ)) {
             if (appendedPoints)
                 appendedPoints->push_back(finish);
             retainedLength += segmentLength;
@@ -162,10 +169,10 @@ ClippedRoute clipAtFirstExit(
         }
         double t = 1.0;
         for (int axis = 0; axis < 3; ++axis) {
-            if (finish[axis] < config.minimumBaseXYZ[axis]) {
-                t = std::min(t, (config.minimumBaseXYZ[axis] - start[axis]) / delta[axis]);
-            } else if (finish[axis] >= config.maximumBaseXYZ[axis]) {
-                t = std::min(t, (config.maximumBaseXYZ[axis] - start[axis]) / delta[axis]);
+            if (finish[axis] < minimumBaseXYZ[axis]) {
+                t = std::min(t, (minimumBaseXYZ[axis] - start[axis]) / delta[axis]);
+            } else if (finish[axis] >= maximumBaseXYZ[axis]) {
+                t = std::min(t, (maximumBaseXYZ[axis] - start[axis]) / delta[axis]);
             }
         }
         t = std::clamp(t, 0.0, 1.0);
@@ -280,6 +287,7 @@ std::optional<DirectedFiberletStorageId> selectLookaheadFirstArc(
     const std::optional<cv::Vec3d>& initialDirection,
     const std::optional<DirectedFiberletStorageId>& forcedFirst,
     const FiberletCropTraceConfig& config,
+    const FiberletCropTraceSearchBox& searchBox,
     LookaheadStatistics& statistics)
 {
     const double horizonPrediction = config.lookaheadDistanceBaseVoxels / graph.predictionToBaseScale();
@@ -318,7 +326,9 @@ std::optional<DirectedFiberletStorageId> selectLookaheadFirstArc(
                     }
                 }
                 const auto clipped = clipAtFirstExit(
-                    graph.routePointView(id), config);
+                    graph.routePointView(id),
+                    searchBox.minimumBaseXYZ,
+                    searchBox.maximumBaseXYZ);
                 const double edgeLength = edge.pathLengthPredictionVoxels;
                 if (!(edgeLength > kEpsilon))
                     continue;
@@ -420,6 +430,7 @@ SideTrace traceSide(
     const cv::Vec3d& direction,
     const std::optional<DirectedFiberletStorageId>& forcedFirst,
     const FiberletCropTraceConfig& config,
+    const FiberletCropTraceSearchBox& searchBox,
     LookaheadStatistics& statistics)
 {
     SideTrace result;
@@ -430,7 +441,7 @@ SideTrace traceSide(
     std::set<FiberletStorageKey> visited{seed.key};
     for (std::size_t step = 0; step < config.maximumFiberletsPerSide; ++step) {
         const auto selected =
-            selectLookaheadFirstArc(graph, current, incoming, visited, incoming.has_value() ? std::nullopt : std::make_optional(direction), incoming.has_value() ? std::nullopt : forcedFirst, config, statistics);
+            selectLookaheadFirstArc(graph, current, incoming, visited, incoming.has_value() ? std::nullopt : std::make_optional(direction), incoming.has_value() ? std::nullopt : forcedFirst, config, searchBox, statistics);
         if (!selected.has_value()) {
             result.termination = result.fiberlets == 0 ? "no_usable_edge" : "graph_exhausted";
             return result;
@@ -445,7 +456,10 @@ SideTrace traceSide(
             result.totalMetricCost += join->cost.total();
         }
         const auto clipped = clipAtFirstExit(
-            graph.routePointView(*selected), config, &result.points);
+            graph.routePointView(*selected),
+            config.minimumBaseXYZ,
+            config.maximumBaseXYZ,
+            &result.points);
         result.totalMetricCost +=
             edge.cost.total() * clipped.retainedFraction;
         result.pathLengthPredictionVoxels +=
@@ -549,7 +563,8 @@ InitialPair selectInitialPair(const FiberletReplayGraphSource& graph, const Fibe
 TraceCandidate traceCandidate(
     const FiberletReplayGraphSource& graph,
     const FiberletStoredAnchor& seed,
-    const FiberletCropTraceConfig& config)
+    const FiberletCropTraceConfig& config,
+    const FiberletCropTraceSearchBox& searchBox)
 {
     TraceCandidate result;
     result.line.seed = seed.key;
@@ -566,14 +581,16 @@ TraceCandidate traceCandidate(
     SideTrace positive;
     if (initial.negative.has_value()) {
         negative = traceSide(
-            graph, seed, -axis, initial.negative, config, result.lookahead);
+            graph, seed, -axis, initial.negative, config, searchBox,
+            result.lookahead);
     } else {
         negative.points = {cv::Vec3d(seed.positionPredictionXYZ * graph.predictionToBaseScale())};
         negative.termination = "no_usable_edge";
     }
     if (initial.positive.has_value()) {
         positive = traceSide(
-            graph, seed, axis, initial.positive, config, result.lookahead);
+            graph, seed, axis, initial.positive, config, searchBox,
+            result.lookahead);
     } else {
         positive.points = {cv::Vec3d(seed.positionPredictionXYZ * graph.predictionToBaseScale())};
         positive.termination = "no_usable_edge";
@@ -688,6 +705,37 @@ std::size_t suppressCoveredAnchors(
 
 }  // namespace
 
+FiberletCropTraceSearchBox fiberletCropTraceSearchBox(
+    const FiberletCropTraceConfig& config)
+{
+    if (!(config.lookaheadDistanceBaseVoxels > 0.0) ||
+        !std::isfinite(config.lookaheadDistanceBaseVoxels)) {
+        throw std::invalid_argument(
+            "Fiberlet crop lookahead distance must be positive and finite");
+    }
+    FiberletCropTraceSearchBox result;
+    for (int axis = 0; axis < 3; ++axis) {
+        if (!std::isfinite(config.minimumBaseXYZ[axis]) ||
+            !std::isfinite(config.maximumBaseXYZ[axis]) ||
+            !(config.maximumBaseXYZ[axis] > config.minimumBaseXYZ[axis])) {
+            throw std::invalid_argument(
+                "Fiberlet crop bounds must be finite and nonempty");
+        }
+        result.minimumBaseXYZ[axis] =
+            config.minimumBaseXYZ[axis] -
+            config.lookaheadDistanceBaseVoxels;
+        result.maximumBaseXYZ[axis] =
+            config.maximumBaseXYZ[axis] +
+            config.lookaheadDistanceBaseVoxels;
+        if (!std::isfinite(result.minimumBaseXYZ[axis]) ||
+            !std::isfinite(result.maximumBaseXYZ[axis])) {
+            throw std::invalid_argument(
+                "Fiberlet crop search bounds are not finite");
+        }
+    }
+    return result;
+}
+
 FiberletCropTraceResult traceFiberletCrop(
     const FiberletReplayGraphSource& graph,
     std::vector<FiberletStoredAnchor> anchors,
@@ -696,13 +744,8 @@ FiberletCropTraceResult traceFiberletCrop(
     const FiberletCropTraceConfig& config,
     const FiberletCropTraceProgress& progress)
 {
-    for (int axis = 0; axis < 3; ++axis) {
-        if (!std::isfinite(config.minimumBaseXYZ[axis]) || !std::isfinite(config.maximumBaseXYZ[axis]) ||
-            !(config.maximumBaseXYZ[axis] > config.minimumBaseXYZ[axis])) {
-            throw std::invalid_argument("Fiberlet crop bounds must be finite and nonempty");
-        }
-    }
-    if (!(config.lookaheadDistanceBaseVoxels > 0.0) || config.beamWidth == 0 || config.maximumGeneratedStatesPerStep == 0 ||
+    const auto searchBox = fiberletCropTraceSearchBox(config);
+    if (config.beamWidth == 0 || config.maximumGeneratedStatesPerStep == 0 ||
         config.maximumFiberletsPerSide == 0 || !(config.coverageNormalRadiusBaseVoxels > 0.0) ||
         !(config.coverageDirectionDegrees >= 0.0) || !(config.coverageDirectionDegrees <= 90.0) || !(normalWorkingToBaseScale > 0.0)) {
         throw std::invalid_argument("Fiberlet crop trace configuration is invalid");
@@ -773,7 +816,7 @@ FiberletCropTraceResult traceFiberletCrop(
             const auto started = std::chrono::steady_clock::now();
             try {
                 completion.candidate = traceCandidate(
-                    graph, anchors[anchorIndex], config);
+                    graph, anchors[anchorIndex], config, searchBox);
             } catch (...) {
                 completion.failure = std::current_exception();
             }

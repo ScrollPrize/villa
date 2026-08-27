@@ -1,101 +1,73 @@
-# Plan: Split-piece fiber BP
+# Plan: Fiberlet crop lookahead graph halo
 
 ## Contract
 
-- Use every extracted constraint piece as one BP node. Preserve its source
-  trace index and trace-local arc interval for diagnostics.
-- Keep admitted dense source traces as a separate solver input: source traces
-  select the established central-straight gauge fiber, while every report
-  probability, marginal, weight, and diagnostic has piece cardinality. Require
-  `constraints.inputTraces == sourceTraces.size()` and complete valid piece
-  ownership for every admitted source trace.
-- Accept extracted hard-continuity links only when they connect different
-  pieces of the same source trace and carry the canonical parallel score 1,
-  perpendicular score 0, and winding distance 0. Retain their established
-  semantics as strong same-label evidence, not an equality constraint.
-- Reject soft same-source links and hard cross-source links.
-- Fully validate extracted continuity topology: every source-local consecutive
-  piece pair has exactly one canonical link; it joins distinct consecutive
-  piece IDs with ordered overlapping or abutting arc intervals, uses the
-  overlap midpoint on both arcs, has zero distance and coincident finite points,
-  and no missing, duplicate, nonconsecutive, hard/soft-colliding, or cross-source
-  hard link is accepted.
-- Merge repeated soft cross-source evidence only by unordered piece pair. Hard
-  duplicates and hard/soft pair collisions fail. Do not collapse pieces back
-  to their source trace.
-- Select the primary source trace with the existing central-straight rule,
-  then seed the piece of that trace with the smallest exact Euclidean
-  crop-center-to-clipped-piece-polyline distance. Tie by global piece index;
-  fail if the selected source has no piece. Clamp only that piece to H. This
-  preserves the existing source-fiber gauge choice while making its piece
-  mapping deterministic.
-- Weight optional balance calculations by extracted piece arc length. The
-  overlap is intentionally represented because each overlapping piece is an
-  independent BP node.
-- Charge the Mixed unary once per piece, independent of factor degree. Adjacent
-  pieces may independently be Mixed; overlap and Mixed cost therefore both
-  scale with the number of extracted pieces by design.
-- Emit BP value bands, Mixed bands, CSV rows, consistency summaries, and
-  reference confusion per piece. CSV rows retain global piece index, original
-  source-trace index, trace-local piece index, and begin/end base-voxel arcs.
-  OBJ layers use exact clipped dense source geometry, intentionally duplicate
-  overlapping intervals, and partition all pieces. Every piece inherits its
-  source trace's direction reference, so confusion and AUROC are piece-weighted.
-- Keep the no-split case behavior unchanged: one piece per source trace yields
-  the same graph, seed, weights, values, and exact original dense output
-  geometry as before.
+- Keep `--bbox` as the only public crop: it defines canonical seed ownership,
+  anisotropic coverage candidates, first-exit clipping, trace artifact
+  metadata, CT faces, and all downstream output.
+- Derive an internal graph search box by expanding every requested-crop face
+  by exactly `lookaheadDistanceBaseVoxels`.
+- Materialize graph anchors, complete routes, costs, and transitions against
+  the expanded search box, but return seed anchors only from the requested
+  half-open crop.
+- Do not add maximum Fiberlet length to the padding. The materializer includes
+  every complete Fiberlet incident to an anchor inside the search box, so the
+  final horizon-crossing edge and its outside endpoint are already available.
+- Preserve sparse-dataset semantics: missing tuples are empty and required
+  partial tuples fail.
+- Use the expanded search box for speculative lookahead route clipping and
+  graph-exhaustion decisions. Keep committed `traceSide` clipping at the
+  requested crop.
+- Preserve arithmetic, deterministic ordering, output clipping, seed and
+  coverage semantics. Near-boundary selected routes may intentionally change;
+  routes whose lookahead does not reach the old crop boundary must not change.
+- Do not enable staged filtering. Record it as a follow-up experiment.
 
 ## Implementation
 
-1. Add a shared constraint-piece-to-polyline helper used by both BP seed
-   preparation and the CLI output path. Clip the original dense source
-   polyline to each `[beginArc,endArc]`, retaining exact interpolated endpoints
-   and original interior vertices; a full-range piece reproduces the source
-   points exactly.
-2. Change BP graph construction from source-trace nodes to piece nodes and
-   validate continuity-link ownership and canonical values.
-3. Map the selected central source trace to its closest piece, and construct
-   per-piece arc weights.
-4. Build the CLI's output geometry, original trace IDs, and diagnostic
-   direction references from constraint pieces before solving/reporting.
-5. Update public report and console terminology from trace to piece for node
-   indices/counts, and report the seed's global piece, original source trace,
-   and trace-local piece IDs.
+1. Add a shared crop-search-box helper that validates the crop/lookahead and
+   returns the exact lookahead-expanded base-XYZ box. Refactor route clipping
+   to accept explicit bounds.
+2. Extend stored graph bulk materialization to accept separate graph and seed
+   boxes. Require a finite nonempty seed box contained in the graph box; keep
+   the existing overload as equal graph/seed bounds for other callers.
+3. Make speculative lookahead use the expanded search box, while committed
+   tracing, artifact writing, and visualization retain the requested crop.
+4. Make `vc_fiber_trace_chunk trace` materialize the expanded graph with the
+   requested crop as its seed box.
+5. Report requested and search bounds plus padding in graph-preparation output.
 
 ## Spec Update
 
-Replace the one-piece BP restriction with piece-node semantics, continuity
-validation, deterministic seed mapping, piece weighting, and per-piece output
-requirements.
+Update anchor-seeded crop tracing so immutable graph materialization and
+speculative rollout use a lookahead halo while committed seed/output semantics
+remain tied to the public crop.
 
 ## Docs Updates
 
-Document finite `--piece-length` BP use, continuity evidence, and per-piece
-OBJ/CSV interpretation in `volume-cartographer/docs/fiber_chunk_tracing.md`.
+Document the distinct requested crop and internal search graph, explain why
+one lookahead distance is sufficient, and state the graph-preparation cost.
 
 ## Testing
 
-- Add exact tree tests containing two pieces from one source trace, a canonical
-  continuity link, and cross-source orientation evidence for min-sum, binary
-  sum-product, and Mixed-state sum-product.
-- Verify invalid ownership; missing, duplicate, nonconsecutive, or malformed
-  continuity; hard cross-source; soft same-source; and hard/soft pair collisions
-  fail. Verify repeated soft cross-source measurements still merge.
-- Verify the selected seed belongs to the existing central source trace and is
-  its exact crop-center-nearest piece, including deterministic overlap ties.
-- Verify continuity is finite strong evidence rather than equality, Mixed
-  unary is once per piece rather than per factor, and overlapping arc weights
-  are counted once for each piece.
-- Verify pruning and `--perpendicular-only` retain canonical continuity into
-  BP.
-- Verify per-piece CSV identity/arc fields and OBJ partitions use exact clipped
-  geometry, and no-split output preserves source points and cardinality.
-- Verify no-split exact graph, seed, weights, probabilities, and min-marginals
-  remain unchanged.
-- Build `vc_fiber_trace_chunk` and `test_fiberlet_crop_trace` with `-j32`, run
-  the focused suite, run a finite-piece 1024 BP command, and run
+- Unit-test exact search-box expansion and invalid configurations.
+- Extend stored graph tests to prove an expanded graph can expose continuation
+  edges while returning only requested-crop seeds, and reject a seed box not
+  contained by the graph box.
+- Add a horizon-crossing edge longer than the remaining halo to prove exact
+  lookahead padding is sufficient.
+- Add an end-to-end boundary choice where evidence beyond the requested crop
+  changes the winning first edge, while committed output remains clipped at
+  the requested crop.
+- Cover sparse halo behavior: absent tuples are empty, required partial tuples
+  fail, unrelated partial owner-halo tuples remain ignored, and tuples outside
+  the search box do not affect the crop.
+- Retain crop-tracing tests proving first-exit clipping at the requested crop
+  and unchanged results away from its boundary.
+- Build `vc_fiber_trace_chunk`, `vc_fiberlets`, `test_fiberlet_storage`, and
+  `test_fiberlet_crop_trace` with `-j32`; run both focused suites and
   `git diff --check`.
 
 ## Changelog
 
-Record split-piece BP support and piece-level diagnostics.
+Record lookahead-expanded crop graph materialization.

@@ -196,6 +196,12 @@ public:
         const cv::Vec3d& minimumBaseXYZ,
         const cv::Vec3d& maximumBaseXYZ,
         std::size_t parallelThreads) const;
+    [[nodiscard]] FiberletMaterializedReplayGraph materializeBaseBoxForSeeds(
+        const cv::Vec3d& graphMinimumBaseXYZ,
+        const cv::Vec3d& graphMaximumBaseXYZ,
+        const cv::Vec3d& seedMinimumBaseXYZ,
+        const cv::Vec3d& seedMaximumBaseXYZ,
+        std::size_t parallelThreads) const;
     [[nodiscard]] const FiberletDatasetMetadata& metadata() const noexcept;
 
 private:

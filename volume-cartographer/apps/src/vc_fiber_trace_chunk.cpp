@@ -1184,6 +1184,7 @@ void writeAndPrintBpReport(
               report.horizontalProbability)
         : vc::fiber_tracer::analyzeFiberTraceConstraintConsistency(
               constraints, report.horizontalness);
+    std::optional<std::array<std::size_t, 4>> finalStateCounts;
     const auto csv = output.parent_path() /
         (output.stem().string() + "_bp_" + artifactName +
          "_consistency.csv");
@@ -1370,6 +1371,12 @@ void writeAndPrintBpReport(
                 trustedReferences.push_back(report.mixedProbability[trace]);
             }
         }
+        std::array<std::size_t, 4> counts{};
+        for (const auto& row : confusion) {
+            for (std::size_t state = 0; state < counts.size(); ++state)
+                counts[state] += row[state];
+        }
+        finalStateCounts = counts;
         double favorable = 0.0;
         for (const double positive : mixedReferences) {
             for (const double negative : trustedReferences) {
@@ -1560,6 +1567,24 @@ void writeAndPrintBpReport(
                       << '\n';
     }
     std::cout << "fiber direction BP constraint consistency csv=" << csv << '\n';
+    if (finalStateCounts) {
+        const double denominator = static_cast<double>(lines.size());
+        const auto printState = [&] (const char* state, std::size_t count) {
+            std::cout << std::left << std::setw(8) << state << std::right
+                      << std::setw(10) << count
+                      << std::setw(12) << std::fixed << std::setprecision(4)
+                      << static_cast<double>(count) / denominator << '\n';
+        };
+        std::cout << "fiber direction final states"
+                  << " pieces=" << lines.size()
+                  << " ties=" << (*finalStateCounts)[3] << '\n'
+                  << std::left << std::setw(8) << "state" << std::right
+                  << std::setw(10) << "count"
+                  << std::setw(12) << "fraction" << '\n';
+        printState("H", (*finalStateCounts)[2]);
+        printState("V", (*finalStateCounts)[0]);
+        printState("Mix", (*finalStateCounts)[1]);
+    }
     std::cout << std::defaultfloat;
 }
 
@@ -2306,12 +2331,24 @@ int main(int argc, char** argv)
 
         const auto graphStarted = std::chrono::steady_clock::now();
         const auto graphCpuStarted = std::clock();
+        const auto searchBox =
+            vc::fiber_tracer::fiberletCropTraceSearchBox(options.trace);
         auto materialized =
-            graph.materializeBaseBox(options.trace.minimumBaseXYZ, options.trace.maximumBaseXYZ, static_cast<std::size_t>(options.threads));
+            graph.materializeBaseBoxForSeeds(
+                searchBox.minimumBaseXYZ,
+                searchBox.maximumBaseXYZ,
+                options.trace.minimumBaseXYZ,
+                options.trace.maximumBaseXYZ,
+                static_cast<std::size_t>(options.threads));
         const double graphSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - graphStarted).count();
         const double graphCpuSeconds = static_cast<double>(std::clock() - graphCpuStarted) / CLOCKS_PER_SEC;
         std::cout << "fiberlet crop graph prepared"
                   << " anchors=" << materialized.insideAnchors.size() << " prediction_to_base=" << dataset->metadata().predictionToBaseScale
+                  << " crop_min_xyz=" << options.trace.minimumBaseXYZ[0] << ',' << options.trace.minimumBaseXYZ[1] << ',' << options.trace.minimumBaseXYZ[2]
+                  << " crop_max_xyz=" << options.trace.maximumBaseXYZ[0] << ',' << options.trace.maximumBaseXYZ[1] << ',' << options.trace.maximumBaseXYZ[2]
+                  << " search_min_xyz=" << searchBox.minimumBaseXYZ[0] << ',' << searchBox.minimumBaseXYZ[1] << ',' << searchBox.minimumBaseXYZ[2]
+                  << " search_max_xyz=" << searchBox.maximumBaseXYZ[0] << ',' << searchBox.maximumBaseXYZ[1] << ',' << searchBox.maximumBaseXYZ[2]
+                  << " search_padding_base=" << options.trace.lookaheadDistanceBaseVoxels
                   << " elapsed_seconds=" << graphSeconds << " cpu_seconds=" << graphCpuSeconds << '\n';
 
         const auto traceStarted = std::chrono::steady_clock::now();

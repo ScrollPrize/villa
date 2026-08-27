@@ -1241,6 +1241,23 @@ TEST_CASE("Combined fiberlet dataset exposes complete sparse graph facets")
             const auto points = query.get();
             REQUIRE(points.size() == 2);
         }
+        auto seedSubset = stored.materializeBaseBoxForSeeds(
+            {0.0, 0.0, 0.0},
+            {10.0, 10.0, 10.0},
+            {1.5, 0.0, 0.0},
+            {2.5, 10.0, 10.0},
+            4);
+        REQUIRE(seedSubset.insideAnchors.size() == 1);
+        CHECK(seedSubset.insideAnchors.front().key == second);
+        CHECK(seedSubset.graph->outgoing(second) == actualOutgoing);
+        CHECK_THROWS_AS(
+            stored.materializeBaseBoxForSeeds(
+                {0.0, 0.0, 0.0},
+                {10.0, 10.0, 10.0},
+                {-1.0, 0.0, 0.0},
+                {2.5, 10.0, 10.0},
+                4),
+            std::invalid_argument);
     }
 
     pathCache->cancelPendingAndWait();
@@ -1411,6 +1428,14 @@ TEST_CASE("Fiberlet crop materialization ignores partial tuples reached only by 
             {{irrelevantFirst, irrelevantSecond}, false}),
         std::out_of_range);
 
+    CHECK_THROWS_AS(
+        stored.materializeBaseBoxForSeeds(
+            {8.0, 0.0, 0.0},
+            {24.0, 8.0, 8.0},
+            {8.0, 0.0, 0.0},
+            {16.0, 8.0, 8.0},
+            4),
+        std::runtime_error);
     CHECK_THROWS_AS(
         stored.materializeBaseBox(
             {24.0, 0.0, 0.0}, {32.0, 8.0, 8.0}, 4),

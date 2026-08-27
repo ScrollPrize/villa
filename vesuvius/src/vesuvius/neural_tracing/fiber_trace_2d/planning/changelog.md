@@ -1,3 +1,12 @@
+# 2026-08-27: crop tracing lookahead context
+
+- Expanded Fiberlet crop graph materialization and speculative rollout by the
+  configured lookahead distance while retaining requested-crop seed ownership,
+  coverage, first-exit clipping, artifacts, and visualization.
+- Separated graph and seed boxes in bulk materialization, retained complete
+  horizon-crossing Fiberlets without an extra maximum-length pad, and added
+  boundary-choice plus sparse-halo regressions.
+
 # 2026-08-27: split-piece fiber BP
 
 - Made finite `--piece-length` constraint pieces the BP nodes, retained

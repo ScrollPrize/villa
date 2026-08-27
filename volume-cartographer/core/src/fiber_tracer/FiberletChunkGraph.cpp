@@ -1923,12 +1923,47 @@ FiberletStoredReplayGraphSource::materializeBaseBox(
     const cv::Vec3d& maximumBaseXYZ,
     std::size_t parallelThreads) const
 {
+    return materializeBaseBoxForSeeds(
+        minimumBaseXYZ,
+        maximumBaseXYZ,
+        minimumBaseXYZ,
+        maximumBaseXYZ,
+        parallelThreads);
+}
+
+FiberletMaterializedReplayGraph
+FiberletStoredReplayGraphSource::materializeBaseBoxForSeeds(
+    const cv::Vec3d& graphMinimumBaseXYZ,
+    const cv::Vec3d& graphMaximumBaseXYZ,
+    const cv::Vec3d& seedMinimumBaseXYZ,
+    const cv::Vec3d& seedMaximumBaseXYZ,
+    std::size_t parallelThreads) const
+{
     if (parallelThreads == 0)
         throw std::invalid_argument(
             "fiberlet crop graph thread count must be positive");
+    for (int axis = 0; axis < 3; ++axis) {
+        if (!std::isfinite(graphMinimumBaseXYZ[axis]) ||
+            !std::isfinite(graphMaximumBaseXYZ[axis]) ||
+            !(graphMaximumBaseXYZ[axis] > graphMinimumBaseXYZ[axis])) {
+            throw std::invalid_argument(
+                "fiberlet crop graph bounds must be finite and nonempty");
+        }
+        if (!std::isfinite(seedMinimumBaseXYZ[axis]) ||
+            !std::isfinite(seedMaximumBaseXYZ[axis]) ||
+            !(seedMaximumBaseXYZ[axis] > seedMinimumBaseXYZ[axis])) {
+            throw std::invalid_argument(
+                "fiberlet crop seed bounds must be finite and nonempty");
+        }
+        if (seedMinimumBaseXYZ[axis] < graphMinimumBaseXYZ[axis] ||
+            seedMaximumBaseXYZ[axis] > graphMaximumBaseXYZ[axis]) {
+            throw std::invalid_argument(
+                "fiberlet crop seed bounds must be contained by graph bounds");
+        }
+    }
     FiberletChunkRouteAnalysisConfig config;
-    config.minimumBaseXYZ = minimumBaseXYZ;
-    config.maximumBaseXYZ = maximumBaseXYZ;
+    config.minimumBaseXYZ = graphMinimumBaseXYZ;
+    config.maximumBaseXYZ = graphMaximumBaseXYZ;
     config.maximumJoinAngleDegrees = maximumJoinAngleDegrees_;
     config.parallelThreads = parallelThreads;
     std::vector<vc::render::ChunkKey> seeds;
@@ -1938,7 +1973,16 @@ FiberletStoredReplayGraphSource::materializeBaseBox(
     std::vector<FiberletReplaySourceAnchor> replayAnchors;
     replayAnchors.reserve(local.anchors.size());
     FiberletMaterializedReplayGraph result;
-    result.insideAnchors = std::move(local.seedAnchors);
+    result.insideAnchors.reserve(local.seedAnchors.size());
+    FiberletChunkRouteAnalysisConfig seedConfig;
+    seedConfig.minimumBaseXYZ = seedMinimumBaseXYZ;
+    seedConfig.maximumBaseXYZ = seedMaximumBaseXYZ;
+    for (auto& anchor : local.seedAnchors) {
+        const cv::Vec3d position(
+            anchor.positionPredictionXYZ * predictionToBaseScale());
+        if (pointInsideChunk(position, seedConfig))
+            result.insideAnchors.push_back(std::move(anchor));
+    }
     for (const auto& anchor : local.anchors) {
         replayAnchors.push_back({anchor.key, anchor.positionBaseXYZ});
     }

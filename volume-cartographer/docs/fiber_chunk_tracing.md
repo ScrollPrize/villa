@@ -23,6 +23,16 @@ the stored join-angle constraint, revisiting an anchor is forbidden, and a
 side stops at its first crop-boundary crossing or when the graph has no usable
 continuation. The boundary segment is clipped to the crop.
 
+Route selection is not limited to that output boundary. The tool expands the
+internal graph and speculative-lookahead box on every face by `--lookahead`
+base voxels. Seeds, coverage, stored paths, and visualization remain limited to
+`--bbox`, but a seed near a crop face ranks candidates using the same lookahead
+context as an interior seed. No extra maximum-Fiberlet-length padding is
+needed: graph materialization retains each complete Fiberlet incident to an
+anchor in the search box, including the final edge that crosses its boundary.
+The graph-preparation cost therefore follows the expanded box rather than only
+the requested crop.
+
 Coverage suppression uses the same anisotropic measurement as Fiber replay.
 The default radius is 20 base voxels along the local Lasagna normal and 80 base
 voxels in its tangent plane. An anchor is suppressed only when its unoriented
@@ -36,10 +46,12 @@ be complete and valid. The original Fiber manifest and an expected-chunk index
 are not inputs.
 
 Crop materialization reads prefix and route owner chunks from the bounded
-dependency halo, filters those records to fiberlets incident to an actual
-in-crop anchor, and only then loads their endpoint anchor chunks. An incomplete
-tuple required by a retained fiberlet is an error; incomplete tuples referenced
-only by unrelated halo fiberlets are outside the crop graph and are not read.
+dependency halo around the lookahead-expanded search box, filters those records
+to Fiberlets incident to an actual search-box anchor, and only then loads their
+endpoint anchor chunks. It separately returns only requested-crop anchors as
+seed candidates. An incomplete tuple required by a retained Fiberlet is an
+error; incomplete tuples referenced only by unrelated owner-halo Fiberlets are
+outside the search graph and are not read.
 
 The normal manifest need not be the same file used during Fiberlet generation.
 Its path and exact JSON bytes are not compared. It must describe the same base
@@ -397,10 +409,12 @@ MTL beside the line OBJ. `--texture-max` limits either texture dimension.
 Useful controls are `--lookahead`, `--beam`, `--coverage`,
 `--coverage-angle`, `--cache-gib`, `--max-attempts`, and `--max-fibers`.
 `--threads` controls bulk graph preparation and independent seed tracing, and
-defaults to the host CPU count. Before tracing, the tool loads the crop's
-incident Fiberlets, route geometry, endpoint anchors, and joins once into an
-immutable in-memory graph. Trace workers do not query the chunk cache. The tool
-reports graph-preparation and trace times separately. Both limits use zero for
+defaults to the host CPU count. Before tracing, the tool loads the search
+box's incident Fiberlets, route geometry, endpoint anchors, and joins once into
+an immutable in-memory graph. Trace workers do not query the chunk cache. The
+graph-preparation line reports the requested crop, expanded search bounds, and
+padding; timing output reports graph preparation and tracing separately. Both
+limits use zero for
 unlimited:
 `--max-attempts` counts uncovered seed attempts, including failed/no-edge
 attempts, while `--max-fibers` counts accepted lines. Seeds are attempted from

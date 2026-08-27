@@ -1,7 +1,10 @@
-# Task: Support split constraint pieces in fiber BP
+# Task: Give Fiberlet crop lookahead full boundary context
 
-Allow `direction-ablation --bp-only` to use ordinary finite `--piece-length`
-settings. Constraint extraction already splits each source fiber before spatial
-search and creates same-source continuity links between consecutive pieces; BP
-must operate on those pieces and consume those links instead of requiring one
-piece per source fiber.
+Crop tracing must not rank lookahead routes against a graph truncated at the
+requested output crop. Materialize a search graph expanded from the requested
+half-open crop by the configured lookahead distance on every face, while
+retaining only requested-crop anchors as seeds and clipping accepted output at
+the original requested crop.
+
+Record staged Fiberlet filtering as the next, separate speed/quality
+experiment; do not enable filtering in this task.
