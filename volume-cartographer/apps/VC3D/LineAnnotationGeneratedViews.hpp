@@ -1089,29 +1089,6 @@ inline std::optional<double> generatedArrowPanStopTarget(
     return best;
 }
 
-inline std::optional<size_t> nearestGeneratedControlPointIndex(
-    const std::vector<GeneratedOverlay::ControlPointMarker>& controlPoints,
-    const cv::Vec3f& point)
-{
-    if (!finiteGeneratedPoint(point)) {
-        return std::nullopt;
-    }
-    std::optional<size_t> best;
-    double bestDistanceSq = std::numeric_limits<double>::infinity();
-    for (size_t i = 0; i < controlPoints.size(); ++i) {
-        if (!finiteGeneratedPoint(controlPoints[i].point)) {
-            continue;
-        }
-        const cv::Vec3f delta = controlPoints[i].point - point;
-        const double distanceSq = static_cast<double>(delta.dot(delta));
-        if (distanceSq < bestDistanceSq) {
-            best = i;
-            bestDistanceSq = distanceSq;
-        }
-    }
-    return best;
-}
-
 inline bool generatedLineSegmentIsTail(
     double startPosition,
     double endPosition,

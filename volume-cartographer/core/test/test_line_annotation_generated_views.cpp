@@ -1617,22 +1617,6 @@ TEST_CASE("line annotation generated overlays include pred-snap connector endpoi
     CHECK(overlay.predSnapPoints[0].snapPoint[2] == doctest::Approx(1.0f));
 }
 
-TEST_CASE("line annotation nearest generated control point supports shift pred-snap updates")
-{
-    using vc3d::line_annotation::GeneratedOverlay;
-    const std::vector<GeneratedOverlay::ControlPointMarker> controls{
-        {{0.0f, 0.0f, 0.0f}, 0.0, false},
-        {{5.0f, 0.0f, 0.0f}, 5.0, false},
-    };
-
-    const auto nearest = vc3d::line_annotation::nearestGeneratedControlPointIndex(
-        controls,
-        {4.5f, 0.0f, 0.0f});
-
-    REQUIRE(nearest.has_value());
-    CHECK(*nearest == 1);
-}
-
 TEST_CASE("line annotation generated strip static and dynamic overlays split ownership")
 {
     vc3d::line_annotation::GeneratedViews views;
