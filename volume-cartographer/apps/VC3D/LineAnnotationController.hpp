@@ -517,6 +517,9 @@ private:
         bool suppressErrorDialogs = false;
         uint64_t token = 0;
         uint64_t cacheKey = 0;
+        // Cheap pre-snapshot staleness proxy (see sideStripQueryFingerprint);
+        // the hash-based cacheKey stays the precise layer underneath it.
+        QString fingerprint;
         std::string surfaceName;
         uint64_t sourceFiberId = 0;
         std::vector<uint64_t> excludedFiberIds;
@@ -530,6 +533,7 @@ private:
         bool suppressErrorDialogs = false;
         uint64_t token = 0;
         uint64_t cacheKey = 0;
+        QString fingerprint;
         std::string surfaceName;
         std::vector<vc3d::line_annotation::GeneratedOverlay::FiberIntersectionMarker> markers;
         std::string error;
@@ -575,7 +579,20 @@ private:
                                            cv::Vec3f requestedLinkDirection);
     void handleGeneratedPredSnapPoint(const std::string& surfaceName,
                                       cv::Vec3f volumePoint);
+    // Debouncing entry point (signal-connected): one placement triggers
+    // several overlay rebuilds, each re-requesting intersections; they
+    // coalesce into one dispatch per quiet window so the all-fiber snapshot
+    // is paid once, not per trigger.
     void handleGeneratedSideStripIntersectionQuery(const std::string& surfaceName);
+    void dispatchSideStripIntersectionQuery(const std::string& surfaceName);
+    // Cheap staleness proxy over everything the side-strip query reads (strip
+    // surface identity, fiber data generation, each pane session's line
+    // identity/epoch and branch count), computable without the all-fiber deep
+    // copy the precise hash needs. A false match only leaves cosmetic stale
+    // markers until the next trigger; a mismatch falls through to the hash.
+    [[nodiscard]] QString sideStripQueryFingerprint(
+        const std::string& surfaceName,
+        const cv::Mat_<cv::Vec3f>* stripPoints) const;
     void handleGeneratedSegmentInterpolationGoal(const std::string& surfaceName,
                                                  size_t firstControlPointIndex,
                                                  size_t secondControlPointIndex,
@@ -1043,8 +1060,12 @@ private:
     uint64_t _lastSideStripIntersectionKey = 0;
     std::string _lastSideStripIntersectionSurfaceName;
     std::vector<SideStripMarker> _lastSideStripIntersectionMarkers;
+    QString _lastSideStripFingerprint;
+    QString _runningSideStripFingerprint;
     bool _sideStripIntersectionRunning = false;
     std::optional<SideStripIntersectionRequest> _pendingSideStripIntersectionRequest;
+    // Surfaces with a debounced side-strip dispatch scheduled.
+    std::unordered_set<std::string> _pendingSideStripQuerySurfaces;
     std::optional<std::filesystem::path> _currentAtlasDir;
     DatasetPicker _datasetPicker;
     OptimizationTaskFactory _optimizationTaskFactory;

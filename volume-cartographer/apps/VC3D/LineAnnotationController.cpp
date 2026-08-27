@@ -356,6 +356,13 @@ constexpr double kLineSegmentLength = 32.0;
 // Quiet window between a control-point edit and the solve it dispatches;
 // rapid placement coalesces into one solve over the union of dirty spans.
 constexpr int kSolveDispatchDebounceMs = 150;
+// Quiet window coalescing the several overlay-rebuild-triggered side-strip
+// intersection requests of one placement into a single dispatch.
+constexpr int kSideStripQueryDebounceMs = 150;
+// Idle window between a solve landing and the session autosave it schedules;
+// consecutive landings coalesce into one save (with its no-op probe, fiber
+// summary rebuild, and linked-fiber sync) instead of paying it per landing.
+constexpr int kSessionAutoSaveDebounceMs = 1500;
 constexpr double kControlPointLabelLinePositionTolerance = 1.0e-3;
 
 // Applied by the sync tool's three-way merge (scripts/fiber_merge.py,
@@ -12544,6 +12551,43 @@ LineAnnotationController::fiberSnapshotsForSideStripQuery() const
 void LineAnnotationController::handleGeneratedSideStripIntersectionQuery(
     const std::string& surfaceName)
 {
+    if (!_pendingSideStripQuerySurfaces.insert(surfaceName).second) {
+        return;
+    }
+    QTimer::singleShot(kSideStripQueryDebounceMs, this, [this, surfaceName]() {
+        _pendingSideStripQuerySurfaces.erase(surfaceName);
+        dispatchSideStripIntersectionQuery(surfaceName);
+    });
+}
+
+QString LineAnnotationController::sideStripQueryFingerprint(
+    const std::string& surfaceName,
+    const cv::Mat_<cv::Vec3f>* stripPoints) const
+{
+    std::ostringstream out;
+    out.imbue(std::locale::classic());
+    out << surfaceName << '|'
+        << reinterpret_cast<std::uintptr_t>(stripPoints) << '|'
+        << (stripPoints ? stripPoints->rows : 0) << 'x'
+        << (stripPoints ? stripPoints->cols : 0) << '|'
+        << _fiberDataGeneration;
+    for (const auto& pane : _panes) {
+        if (!pane.session) {
+            continue;
+        }
+        const auto& session = *pane.session;
+        out << '|' << session.fiberId << ':'
+            << session.solveQueue.epoch() << ':'
+            << session.optimizedLine.points.size() << ':'
+            << reinterpret_cast<std::uintptr_t>(session.optimizedLine.points.data())
+            << ':' << session.branches.size();
+    }
+    return QString::fromStdString(out.str());
+}
+
+void LineAnnotationController::dispatchSideStripIntersectionQuery(
+    const std::string& surfaceName)
+{
     auto* pane = paneForSurface(surfaceName);
     if (!pane || !pane->session || !pane->dialog) {
         return;
@@ -12559,7 +12603,44 @@ void LineAnnotationController::handleGeneratedSideStripIntersectionQuery(
         return;
     }
 
+    // Cheap pre-snapshot staleness gate: the precise cache checks below need
+    // the request's hash, and the hash needs a deep copy of every loaded
+    // fiber's polyline - the single most expensive step of this handler. Skip
+    // both when nothing the query reads can have changed.
+    const QString fingerprint =
+        sideStripQueryFingerprint(surfaceName, stripPointsPtr);
+    if (_sideStripIntersectionRunning &&
+        _runningSideStripIntersectionSurfaceName == surfaceName &&
+        !_runningSideStripFingerprint.isEmpty() &&
+        fingerprint == _runningSideStripFingerprint) {
+        pane->dialog->setGeneratedSideStripIntersectionBusy(true);
+        pane->dialog->setGeneratedSideStripIntersectionProgress(tr("already running"), 0, 0);
+        return;
+    }
+    if (_pendingSideStripIntersectionRequest &&
+        _pendingSideStripIntersectionRequest->surfaceName == surfaceName &&
+        !_pendingSideStripIntersectionRequest->fingerprint.isEmpty() &&
+        fingerprint == _pendingSideStripIntersectionRequest->fingerprint) {
+        pane->dialog->setGeneratedSideStripIntersectionBusy(true);
+        pane->dialog->setGeneratedSideStripIntersectionProgress(tr("already queued"), 0, 0);
+        return;
+    }
+    if (!_sideStripIntersectionRunning &&
+        _lastSideStripIntersectionKey != 0 &&
+        _lastSideStripIntersectionSurfaceName == surfaceName &&
+        !_lastSideStripFingerprint.isEmpty() &&
+        fingerprint == _lastSideStripFingerprint) {
+        pane->dialog->setGeneratedFiberIntersectionMarkers(
+            markLinkCandidateFiberIntersections(_lastSideStripIntersectionMarkers,
+                                                pane->session->branches));
+        pane->dialog->setGeneratedSideStripIntersectionResult(
+            _lastSideStripIntersectionMarkers.size());
+        return;
+    }
+
+    const auto requestBuildStart = Clock::now();
     SideStripIntersectionRequest request;
+    request.fingerprint = fingerprint;
     request.suppressErrorDialogs =
         pane->session->suppressErrorDialogs || _errorDialogsSuppressed;
     request.surfaceName = surfaceName;
@@ -12592,6 +12673,11 @@ void LineAnnotationController::handleGeneratedSideStripIntersectionQuery(
                                                request.fibers,
                                                request.excludedFiberIds,
                                                request.branchLinks);
+    Logger()->info(
+        "Line annotation GUI stage: event=side_strip_request "
+        "snapshot_hash_ms={:.3f} fibers={}",
+        elapsedMs(requestBuildStart, Clock::now()),
+        request.fibers.size());
 
     if (request.fibers.empty() && request.branchLinks.empty()) {
         pane->dialog->setGeneratedSideStripIntersectionResult(0);
@@ -12640,28 +12726,54 @@ void LineAnnotationController::handleGeneratedSideStripIntersectionQuery(
     pane->dialog->setGeneratedFiberIntersectionMarkers({});
 
     if (!request.branchLinks.empty()) {
-        vc::atlas::FiberSpatialIndex previewIndex;
+        // The branch-link preview used to run inline here, joining its
+        // worker threads on the GUI thread - the one remaining hard freeze
+        // of a click on a linked fiber. Compute it off-thread and deliver
+        // by token so a superseded preview is dropped.
         vc::atlas::FiberSideStripQueryOptions previewOptions;
         previewOptions.stripPoints = request.stripPoints;
         previewOptions.deduplicateStripDistance = 1.0e-3;
         previewOptions.aabbPadding = 1.0e-6;
         previewOptions.maxResults = 0;
-        const unsigned previewStdThreads = std::thread::hardware_concurrency();
-        const int previewQtThreads = QThread::idealThreadCount();
-        const size_t previewHardwareThreads =
-            std::max(static_cast<size_t>(previewStdThreads),
-                     previewQtThreads > 0 ? static_cast<size_t>(previewQtThreads)
-                                          : size_t{0});
-        previewOptions.workerThreads =
-            std::max<size_t>(
-                1,
-                previewHardwareThreads > 1 ? (previewHardwareThreads + 1) / 2 : 1);
+        previewOptions.workerThreads = 4;
         previewOptions.branchLinks = request.branchLinks;
-        auto previewMarkers = sideStripMarkersFromIntersections(
-            previewIndex.sideStripIntersections(previewOptions));
-        pane->dialog->setGeneratedFiberIntersectionMarkers(
-            markLinkCandidateFiberIntersections(std::move(previewMarkers),
-                                                pane->session->branches));
+        const uint64_t previewToken = request.token;
+        const std::string previewSurfaceName = request.surfaceName;
+        auto branches = pane->session->branches;
+        const auto latestToken = _latestSideStripIntersectionTokenAtomic;
+        QPointer<LineAnnotationController> self(this);
+        QThreadPool::globalInstance()->start(
+            [self, previewOptions = std::move(previewOptions), previewToken,
+             previewSurfaceName, branches = std::move(branches), latestToken]() mutable {
+                if (latestToken &&
+                    latestToken->load(std::memory_order_relaxed) != previewToken) {
+                    return;
+                }
+                vc::atlas::FiberSpatialIndex previewIndex;
+                auto previewMarkers = sideStripMarkersFromIntersections(
+                    previewIndex.sideStripIntersections(previewOptions));
+                if (!self) {
+                    return;
+                }
+                QMetaObject::invokeMethod(
+                    self.data(),
+                    [self, previewToken, previewSurfaceName,
+                     previewMarkers = std::move(previewMarkers),
+                     branches = std::move(branches)]() mutable {
+                        if (!self ||
+                            self->_latestSideStripIntersectionToken != previewToken) {
+                            return;
+                        }
+                        auto* previewPane = self->paneForSurface(previewSurfaceName);
+                        if (!previewPane || !previewPane->dialog) {
+                            return;
+                        }
+                        previewPane->dialog->setGeneratedFiberIntersectionMarkers(
+                            self->markLinkCandidateFiberIntersections(
+                                std::move(previewMarkers), branches));
+                    },
+                    Qt::QueuedConnection);
+            });
     }
 
     if (_sideStripIntersectionRunning) {
@@ -12682,6 +12794,7 @@ LineAnnotationController::runSideStripIntersectionQuery(
     result.suppressErrorDialogs = request.suppressErrorDialogs;
     result.token = request.token;
     result.cacheKey = request.cacheKey;
+    result.fingerprint = request.fingerprint;
     result.surfaceName = request.surfaceName;
     try {
         const size_t stripTriangleBudget =
@@ -12894,6 +13007,7 @@ void LineAnnotationController::startSideStripIntersectionQuery(
     _runningSideStripIntersectionToken = request.token;
     _runningSideStripIntersectionKey = request.cacheKey;
     _runningSideStripIntersectionSurfaceName = request.surfaceName;
+    _runningSideStripFingerprint = request.fingerprint;
     if (auto* pane = paneForSurface(request.surfaceName); pane && pane->dialog) {
         pane->dialog->setGeneratedSideStripIntersectionBusy(true);
         pane->dialog->setGeneratedSideStripIntersectionProgress(tr("starting"), 0, 0);
@@ -13030,6 +13144,7 @@ void LineAnnotationController::finishSideStripIntersectionQuery(
     _runningSideStripIntersectionToken = 0;
     _runningSideStripIntersectionKey = 0;
     _runningSideStripIntersectionSurfaceName.clear();
+    _runningSideStripFingerprint.clear();
     const bool hasPendingRequest = _pendingSideStripIntersectionRequest.has_value();
     if (result.token == _latestSideStripIntersectionToken) {
         if (auto* pane = paneForSurface(result.surfaceName); pane && pane->dialog) {
@@ -13039,6 +13154,7 @@ void LineAnnotationController::finishSideStripIntersectionQuery(
                 _lastSideStripIntersectionKey = result.cacheKey;
                 _lastSideStripIntersectionSurfaceName = result.surfaceName;
                 _lastSideStripIntersectionMarkers = result.markers;
+                _lastSideStripFingerprint = result.fingerprint;
                 pane->dialog->setGeneratedFiberIntersectionMarkers(
                     markLinkCandidateFiberIntersections(
                         std::move(result.markers),
