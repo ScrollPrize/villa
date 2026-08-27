@@ -69,28 +69,24 @@ public:
         normalizePendingDirty();
     }
 
-    // An edit renumbered control points: carry the pending dirty spans into
-    // the new numbering. Span s (owned by old control s, ending at old
-    // control s+1) maps onto the new spans owned by controls
-    // [oldToNew[s], oldToNew[s+1]) - one span normally, several when a
-    // control was inserted inside it, none when its endpoints collapsed
-    // into one control (the collapsing edit dirties the replacement's own
-    // spans itself).
-    void remapPendingDirty(const std::vector<std::size_t>& oldToNewControlIndices,
-                           std::size_t newSpanCount)
+    // Carry a set of dirty span indices across a control-point renumbering.
+    // Span s (owned by old control s, ending at old control s+1) maps onto
+    // the new spans owned by controls [oldToNew[s], oldToNew[s+1]) - one
+    // span normally, several when a control was inserted inside it, none
+    // when its endpoints collapsed into one control (the collapsing edit
+    // dirties the replacement's own spans itself). Returns false when a
+    // span's right endpoint is not covered by the map - dirty tracking for
+    // it is lost and the caller must fall back to a whole-line pass.
+    [[nodiscard]] static bool remapDirtySpans(
+        std::vector<std::size_t>& dirtySegments,
+        const std::vector<std::size_t>& oldToNewControlIndices,
+        std::size_t newSpanCount)
     {
-        if (!_pending.requested || _pending.fullLine) {
-            return;
-        }
         std::vector<std::size_t> remapped;
-        remapped.reserve(_pending.dirtySegments.size());
-        for (const std::size_t segment : _pending.dirtySegments) {
+        remapped.reserve(dirtySegments.size());
+        for (const std::size_t segment : dirtySegments) {
             if (segment + 1 >= oldToNewControlIndices.size()) {
-                // The span's right endpoint no longer exists in the map;
-                // dirty tracking for it is lost - fall back to a full pass.
-                _pending.fullLine = true;
-                _pending.dirtySegments.clear();
-                return;
+                return false;
             }
             const std::size_t newBegin = oldToNewControlIndices[segment];
             const std::size_t newEnd = oldToNewControlIndices[segment + 1];
@@ -100,8 +96,28 @@ public:
                 }
             }
         }
-        _pending.dirtySegments = std::move(remapped);
-        normalizePendingDirty();
+        std::sort(remapped.begin(), remapped.end());
+        remapped.erase(std::unique(remapped.begin(), remapped.end()),
+                       remapped.end());
+        dirtySegments = std::move(remapped);
+        return true;
+    }
+
+    // An edit renumbered control points: carry the pending dirty spans into
+    // the new numbering (see remapDirtySpans).
+    void remapPendingDirty(const std::vector<std::size_t>& oldToNewControlIndices,
+                           std::size_t newSpanCount)
+    {
+        if (!_pending.requested || _pending.fullLine) {
+            return;
+        }
+        if (!remapDirtySpans(_pending.dirtySegments,
+                             oldToNewControlIndices,
+                             newSpanCount)) {
+            _pending.fullLine = true;
+            _pending.dirtySegments.clear();
+            return;
+        }
         if (_pending.dirtySegments.empty()) {
             _pending.requested = false;
         }

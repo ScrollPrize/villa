@@ -133,6 +133,30 @@ private slots:
         QVERIFY(!queue.finishSolve().requested);
     }
 
+    void remapDirtySpansHelperMirrorsPendingSemantics()
+    {
+        // The static helper is what the controller uses to carry the
+        // IN-FLIGHT solve's dirty set across a renumbering, so a superseded
+        // solve can fold its spans back into the pending union on discard.
+        std::vector<std::size_t> spans{2};
+        QVERIFY(OptimizationCoalescingQueue::remapDirtySpans(
+            spans, {0, 2, 3, 4}, 4));
+        QCOMPARE(spans, (std::vector<std::size_t>{3}));
+
+        spans = {0};
+        QVERIFY(OptimizationCoalescingQueue::remapDirtySpans(spans, {0, 2}, 2));
+        QCOMPARE(spans, (std::vector<std::size_t>{0, 1}));
+
+        spans = {1};
+        QVERIFY(OptimizationCoalescingQueue::remapDirtySpans(
+            spans, {0, 1, 1, 2}, 2));
+        QVERIFY(spans.empty());
+
+        spans = {3};
+        QVERIFY(!OptimizationCoalescingQueue::remapDirtySpans(
+            spans, {0, 1, 2, 3}, 3));
+    }
+
     void shutdownRefusesEverything()
     {
         OptimizationCoalescingQueue queue;

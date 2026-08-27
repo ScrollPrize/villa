@@ -172,6 +172,13 @@ struct LineAnnotationController::LineAnnotationSession {
     // set). A superseded whole-line solve must be re-requested as whole-line,
     // or a mode switch's retrace would silently shrink to the edit's spans.
     bool runningSolveFullLine = false;
+    // The dirty spans the in-flight solve was launched over, kept in the
+    // CURRENT control numbering (edits that renumber controls remap this
+    // alongside the queue's pending set). A superseded solve re-adds them to
+    // the pending union - discarding a solve must never silently drop the
+    // spans it was going to fix, or their provisional geometry survives
+    // until a save forces a full pass.
+    std::vector<size_t> runningSolveDirtySegments;
     // A debounced dispatch of the queue's pending solve is scheduled.
     bool solveDispatchScheduled = false;
     // A debounced session autosave is scheduled (see scheduleSessionAutoSave).
@@ -7160,10 +7167,20 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
         if (session.runningSolveCancel) {
             session.runningSolveCancel->store(true);
         }
-        session.solveQueue.remapPendingDirty(
-            collapse.oldToNewIndices,
-            session.controlPoints.size() > 1 ? session.controlPoints.size() - 1
-                                             : 0);
+        {
+            const size_t spanCount = session.controlPoints.size() > 1
+                ? session.controlPoints.size() - 1
+                : 0;
+            session.solveQueue.remapPendingDirty(collapse.oldToNewIndices,
+                                                 spanCount);
+            if (!vc3d::line_annotation::OptimizationCoalescingQueue::
+                    remapDirtySpans(session.runningSolveDirtySegments,
+                                    collapse.oldToNewIndices,
+                                    spanCount)) {
+                session.runningSolveFullLine = true;
+                session.runningSolveDirtySegments.clear();
+            }
+        }
         const std::string noReoptEventName = collapsedControlCount > 1
             ? "control_collapse_no_reopt"
             : (editedExistingControl ? "control_edit_no_reopt"
@@ -7313,10 +7330,20 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     if (session.runningSolveCancel) {
         session.runningSolveCancel->store(true);
     }
-    session.solveQueue.remapPendingDirty(
-        prepared.oldToNewIndices,
-        session.controlPoints.size() > 1 ? session.controlPoints.size() - 1
-                                         : 0);
+    {
+        const size_t spanCount = session.controlPoints.size() > 1
+            ? session.controlPoints.size() - 1
+            : 0;
+        session.solveQueue.remapPendingDirty(prepared.oldToNewIndices,
+                                             spanCount);
+        if (!vc3d::line_annotation::OptimizationCoalescingQueue::remapDirtySpans(
+                session.runningSolveDirtySegments,
+                prepared.oldToNewIndices,
+                spanCount)) {
+            session.runningSolveFullLine = true;
+            session.runningSolveDirtySegments.clear();
+        }
+    }
     session.solveQueue.addPending(prepared.dirtySegmentIndices, false);
     scheduleSolveDispatch(session);
 }
@@ -9820,6 +9847,7 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
     }
     session.runningSolveEpoch = solveEpoch;
     session.runningSolveFullLine = true;
+    session.runningSolveDirtySegments.clear();
     // Seed solves carry no cancellation flag: there is no line yet, so no
     // edit can supersede them (handleGeneratedControlPoint requires a
     // non-empty line), and optimizeLineWithSampler has no flag plumbing.
@@ -10118,6 +10146,8 @@ void LineAnnotationController::startFiberModeOptimization(
     }
     session.runningSolveEpoch = solveEpoch;
     session.runningSolveFullLine = retraceAll || !dirtySegments;
+    session.runningSolveDirtySegments =
+        dirtySegments ? *dirtySegments : std::vector<size_t>{};
     session.runningSolveCancel = std::make_shared<std::atomic<bool>>(false);
     if (!dirtySegments) {
         // A whole-line solve subsumes whatever partial request was pending.
@@ -10249,7 +10279,14 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
             session.solveQueue.epoch());
         if (session.runningSolveFullLine) {
             session.solveQueue.addPending({}, true);
+        } else {
+            // The superseded solve never fixed its spans; fold them back
+            // into the pending union or their provisional geometry would
+            // silently survive until a save forces a full pass.
+            session.solveQueue.addPending(session.runningSolveDirtySegments,
+                                          false);
         }
+        session.runningSolveDirtySegments.clear();
         session.nativeSeedTracePending = false;
         session.taskState = LineAnnotationSession::TaskState::Idle;
         auto pending = session.solveQueue.finishSolve();
@@ -10273,6 +10310,7 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
     // pending request from a caller that coalesced without mutating) can
     // begin a new solve cleanly.
     auto pendingAfterPublish = session.solveQueue.finishSolve();
+    session.runningSolveDirtySegments.clear();
 
     const bool chainNativeSeedTrace = session.nativeSeedTracePending &&
         task.eventName == "seed" && task.ok;
