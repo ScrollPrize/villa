@@ -3480,6 +3480,8 @@ LineControlPointUpdateResult updateExistingLineControlPoint(
         unchanged.changedControlIndex = changedSortedIndex;
         unchanged.activeStart = 0;
         unchanged.activeEnd = static_cast<int>(unchanged.linePoints.size()) - 1;
+        unchanged.replacedStart = 0;
+        unchanged.replacedCount = 0;
         return unchanged;
     }
 
@@ -3540,6 +3542,8 @@ LineControlPointUpdateResult updateExistingLineControlPoint(
     result.linePoints = std::move(updatedLine);
     result.controlPoints = std::move(controlPoints);
     result.changedControlIndex = changedSortedIndex;
+    result.replacedStart = eraseStart;
+    result.replacedCount = static_cast<int>(replacement.size());
     const auto activeRange = activeRangeAroundControlSpans(result.controlPoints,
                                                           result.changedControlIndex,
                                                           static_cast<int>(result.linePoints.size()),
@@ -3602,6 +3606,8 @@ LineControlPointUpdateResult updateExistingLineControlPoint(
         unchanged.changedControlIndex = changedSortedIndex;
         unchanged.activeStart = 0;
         unchanged.activeEnd = static_cast<int>(unchanged.linePoints.size()) - 1;
+        unchanged.replacedStart = 0;
+        unchanged.replacedCount = 0;
         return unchanged;
     }
 

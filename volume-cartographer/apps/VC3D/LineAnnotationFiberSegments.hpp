@@ -144,6 +144,11 @@ struct PreparedControlPointEdit {
     std::vector<size_t> dirtySegmentIndices;
     size_t replacementIndex = std::numeric_limits<size_t>::max();
     bool lineReconstructed = false;
+    // See LineControlPointUpdateResult::replacedStart/replacedCount: the
+    // half-open linePoints range this edit rebuilt (-1/0 when unknown -
+    // treat the whole line as new). Only the geometric prepare fills it.
+    int replacedStart = -1;
+    int replacedCount = 0;
 };
 
 [[nodiscard]] PreparedControlPointEdit prepareAutomaticControlPointEdit(
@@ -154,6 +159,20 @@ struct PreparedControlPointEdit {
     const cv::Vec3d& clickedPoint,
     const vc::lasagna::NormalSampler& sampler,
     const vc::lasagna::LineOptimizationConfig& config);
+
+// The interactive counterpart of prepareAutomaticControlPointEdit: identical
+// collapse/metadata bookkeeping, but the clicked spans are rebuilt by the
+// purely geometric line update (delta-blended resample through the control
+// points, no solver, no volume access), so it runs in microseconds on the
+// GUI thread. The result is provisional display geometry; the asynchronous
+// fiber-mode re-optimization that follows replaces it with solved spans.
+[[nodiscard]] PreparedControlPointEdit prepareGeometricControlPointEdit(
+    const std::vector<cv::Vec3d>& linePoints,
+    const std::vector<LineControlPoint>& controls,
+    std::vector<size_t> collapsedIndices,
+    double clickedLinePosition,
+    const cv::Vec3d& clickedPoint,
+    double segmentLength);
 
 [[nodiscard]] cv::Vec3d lineTangentAtPosition(
     const std::vector<cv::Vec3d>& linePoints,

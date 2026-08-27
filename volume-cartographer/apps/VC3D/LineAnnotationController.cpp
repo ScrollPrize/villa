@@ -7169,23 +7169,29 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     vc3d::line_annotation::PreparedControlPointEdit prepared;
     vc::lasagna::LineModel preparedLine;
     try {
-        vc::lasagna::LineOptimizationConfig updateConfig;
+        // Purely geometric prepare: provisional display geometry only, in
+        // microseconds and without solver or volume access - the freeze this
+        // used to cause was up to four synchronous Ceres solves. The
+        // asynchronous fiber-mode re-optimization dispatched below rebuilds
+        // the dirty spans properly (per-span rollouts, native traces) and
+        // replaces this geometry when it lands.
         const int initialCenterlineLengthVx = pane->dialog
             ? std::max(2, pane->dialog->extrapolationDistanceVx() * 2)
             : vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX_DEFAULT * 2;
         const auto discretization = initialLineDiscretization(initialCenterlineLengthVx);
-        updateConfig.segmentsPerSide = discretization.segmentsPerSide;
-        updateConfig.segmentLength = discretization.segmentLength;
-        prepared = vc3d::line_annotation::prepareAutomaticControlPointEdit(
+        prepared = vc3d::line_annotation::prepareGeometricControlPointEdit(
             currentLinePoints,
             session.controlPoints,
             nearbyControlIndices,
             linePosition,
             clicked,
-            *session.normalSampler,
-            updateConfig);
+            discretization.segmentLength);
         preparedLine = prepared.lineReconstructed
-            ? lineModelFromPoints(prepared.linePoints, session.normalSampler.get())
+            ? lineModelFromPointsSplicing(session.optimizedLine,
+                                          prepared.linePoints,
+                                          prepared.replacedStart,
+                                          prepared.replacedCount,
+                                          session.normalSampler.get())
             : session.optimizedLine;
     } catch (const std::exception& ex) {
         showError(tr("Could not update line control point: %1")
@@ -7241,12 +7247,25 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
         scheduleBranchMetadataSaves(branchSync.affectedFiberIds, session.fiberId);
     }
 
+    // Immediate feedback: the new control point appears in the overlays now;
+    // the strip geometry itself follows when the asynchronous solve lands.
+    if (pane->dialog) {
+        pane->dialog->setGeneratedBranchOverlayData(
+            controlMarkersForSession(session),
+            generatedBranchLinePointsForSession(session),
+            generatedBranchLinkMarkers(session.branches),
+            true,
+            generatedSpanAlignmentMetricsForSession(session));
+        pane->dialog->setGeneratedPredSnapPoints(
+            generatedPredSnapMarkers(session.controlPoints, session.predSnapSet));
+    }
+
     const std::string updateEventName = collapsedControlCount > 1
         ? "control_collapse_span_update"
         : (editedExistingControl ? "control_edit_span_update"
                                  : "control_add_span_update");
     const double updateMs = elapsedMs(updateStart, Clock::now());
-    Logger()->info("Line annotation Lasagna stage timing: event={} overall_ms={:.3f} points={}",
+    Logger()->info("Line annotation Lasagna stage timing: event={} prepare=geometric overall_ms={:.3f} points={}",
                    updateEventName,
                    updateMs,
                    session.optimizedLine.points.size());
@@ -13669,6 +13688,83 @@ vc::lasagna::LineModel LineAnnotationController::lineModelFromPoints(
             if (distance < bestAnchorDistance) {
                 bestAnchorDistance = distance;
                 bestAnchor = static_cast<int>(i);
+            }
+        }
+        model.points.push_back(std::move(linePoint));
+    }
+    if (bestAnchor < 0) {
+        throw std::runtime_error("Fiber line points have no valid sampled normals");
+    }
+    model.displayFrameAnchorIndex = bestAnchor;
+    return model;
+}
+
+vc::lasagna::LineModel LineAnnotationController::lineModelFromPointsSplicing(
+    const vc::lasagna::LineModel& previous,
+    const std::vector<cv::Vec3d>& points,
+    int replacedStart,
+    int replacedCount,
+    const vc::lasagna::NormalSampler* normalSampler)
+{
+    const int newSize = static_cast<int>(points.size());
+    const int oldSize = static_cast<int>(previous.points.size());
+    const int delta = newSize - oldSize;
+    const int suffixStart = replacedStart + replacedCount;
+    const bool spliceable = replacedStart >= 0 && replacedCount >= 0 &&
+                            suffixStart <= newSize && replacedStart <= oldSize &&
+                            suffixStart - delta >= replacedStart &&
+                            suffixStart - delta <= oldSize;
+    if (!spliceable) {
+        return lineModelFromPoints(points, normalSampler);
+    }
+    if (points.empty()) {
+        throw std::runtime_error("Fiber has no line points");
+    }
+    if (!normalSampler) {
+        throw std::runtime_error("No Lasagna normal sampler is available for this fiber");
+    }
+
+    std::vector<vc::lasagna::NormalSampleWithDerivative> samples;
+    if (replacedCount > 0) {
+        const std::vector<cv::Vec3d> replacedPoints(
+            points.begin() + replacedStart, points.begin() + suffixStart);
+        const vc::lasagna::NormalBatchReport batchReport =
+            normalSampler->sampleNormalBatch(replacedPoints, false, samples);
+        (void)batchReport;
+        if (samples.size() != replacedPoints.size()) {
+            throw std::runtime_error("Normal sampler returned the wrong number of samples");
+        }
+    }
+
+    vc::lasagna::LineModel model;
+    model.points.reserve(points.size());
+    int bestAnchor = -1;
+    double bestAnchorDistance = std::numeric_limits<double>::infinity();
+    const double center = static_cast<double>(points.size() - 1) * 0.5;
+    for (int i = 0; i < newSize; ++i) {
+        vc::lasagna::LinePoint linePoint;
+        linePoint.position = points[static_cast<size_t>(i)];
+        if (i < replacedStart) {
+            linePoint.sampledNormal = previous.points[static_cast<size_t>(i)].sampledNormal;
+            linePoint.valid = previous.points[static_cast<size_t>(i)].valid;
+        } else if (i >= suffixStart) {
+            const auto& carried = previous.points[static_cast<size_t>(i - delta)];
+            linePoint.sampledNormal = carried.sampledNormal;
+            linePoint.valid = carried.valid;
+        } else {
+            linePoint.sampledNormal = samples[static_cast<size_t>(i - replacedStart)].sample;
+            linePoint.sampledNormal.normal =
+                normalizedOrZero(linePoint.sampledNormal.normal);
+            linePoint.sampledNormal.valid =
+                linePoint.sampledNormal.valid &&
+                finiteDirection(linePoint.sampledNormal.normal);
+            linePoint.valid = linePoint.sampledNormal.valid;
+        }
+        if (linePoint.valid) {
+            const double distance = std::abs(static_cast<double>(i) - center);
+            if (distance < bestAnchorDistance) {
+                bestAnchorDistance = distance;
+                bestAnchor = i;
             }
         }
         model.points.push_back(std::move(linePoint));

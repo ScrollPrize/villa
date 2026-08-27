@@ -1286,14 +1286,19 @@ ControlPointCollapseResult collapseControlPointsAtClick(
     return result;
 }
 
-PreparedControlPointEdit prepareAutomaticControlPointEdit(
+namespace
+{
+
+// Shared collapse/merge/dirty bookkeeping of the two control-point prepares;
+// only the line-update step differs (solving vs geometric).
+template <typename UpdateLine>
+PreparedControlPointEdit prepareControlPointEditWith(
     const std::vector<cv::Vec3d>& linePoints,
     const std::vector<LineControlPoint>& controls,
     std::vector<size_t> collapsedIndices,
     double clickedLinePosition,
     const cv::Vec3d& clickedPoint,
-    const vc::lasagna::NormalSampler& sampler,
-    const vc::lasagna::LineOptimizationConfig& config)
+    const UpdateLine& updateLine)
 {
     if (linePoints.size() < 2) {
         throw std::invalid_argument(
@@ -1318,17 +1323,17 @@ PreparedControlPointEdit prepareAutomaticControlPointEdit(
         return prepared;
     }
 
-    auto update = vc::lasagna::updateExistingLineControlPoint(
+    vc::lasagna::LineControlPointUpdateResult update = updateLine(
         prepared.linePoints,
         optimizerControlPoints(prepared.controlPointsBeforeLineUpdate),
-        prepared.replacementIndex,
-        sampler,
-        config);
+        prepared.replacementIndex);
     prepared.linePoints = std::move(update.linePoints);
     prepared.controlPoints = mergeOptimizerControlPoints(
         std::move(update.controlPoints), prepared.controlPointsBeforeLineUpdate);
     prepared.replacementIndex = static_cast<size_t>(update.changedControlIndex);
     prepared.lineReconstructed = true;
+    prepared.replacedStart = update.replacedStart;
+    prepared.replacedCount = update.replacedCount;
     if (update.changedControlIndex > 0) {
         prepared.dirtySegmentIndices.push_back(
             static_cast<size_t>(update.changedControlIndex - 1));
@@ -1340,6 +1345,53 @@ PreparedControlPointEdit prepareAutomaticControlPointEdit(
             static_cast<size_t>(update.changedControlIndex));
     }
     return prepared;
+}
+
+}  // namespace
+
+PreparedControlPointEdit prepareAutomaticControlPointEdit(
+    const std::vector<cv::Vec3d>& linePoints,
+    const std::vector<LineControlPoint>& controls,
+    std::vector<size_t> collapsedIndices,
+    double clickedLinePosition,
+    const cv::Vec3d& clickedPoint,
+    const vc::lasagna::NormalSampler& sampler,
+    const vc::lasagna::LineOptimizationConfig& config)
+{
+    return prepareControlPointEditWith(
+        linePoints,
+        controls,
+        std::move(collapsedIndices),
+        clickedLinePosition,
+        clickedPoint,
+        [&sampler, &config](const std::vector<cv::Vec3d>& line,
+                            std::vector<vc::lasagna::LineControlPoint> optimizerControls,
+                            size_t changedIndex) {
+            return vc::lasagna::updateExistingLineControlPoint(
+                line, std::move(optimizerControls), changedIndex, sampler, config);
+        });
+}
+
+PreparedControlPointEdit prepareGeometricControlPointEdit(
+    const std::vector<cv::Vec3d>& linePoints,
+    const std::vector<LineControlPoint>& controls,
+    std::vector<size_t> collapsedIndices,
+    double clickedLinePosition,
+    const cv::Vec3d& clickedPoint,
+    double segmentLength)
+{
+    return prepareControlPointEditWith(
+        linePoints,
+        controls,
+        std::move(collapsedIndices),
+        clickedLinePosition,
+        clickedPoint,
+        [segmentLength](const std::vector<cv::Vec3d>& line,
+                        std::vector<vc::lasagna::LineControlPoint> optimizerControls,
+                        size_t changedIndex) {
+            return vc::lasagna::updateExistingLineControlPoint(
+                line, std::move(optimizerControls), changedIndex, segmentLength);
+        });
 }
 
 cv::Vec3d lineTangentAtPosition(

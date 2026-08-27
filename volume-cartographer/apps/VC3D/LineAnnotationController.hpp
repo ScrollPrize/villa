@@ -835,6 +835,19 @@ private:
     [[nodiscard]] static vc::lasagna::LineModel lineModelFromPoints(
         const std::vector<cv::Vec3d>& points,
         const vc::lasagna::NormalSampler* normalSampler);
+    // lineModelFromPoints for a line that differs from `previous` only in
+    // the half-open range [replacedStart, replacedStart + replacedCount):
+    // normals are sampled for that range only and carried over from
+    // `previous` elsewhere (suffix shifted by the size delta). Falls back to
+    // a full resample when the range is unknown (-1) or inconsistent with
+    // the two sizes. Keeps the GUI-thread geometric control-point prepare
+    // free of whole-line volume sampling.
+    [[nodiscard]] static vc::lasagna::LineModel lineModelFromPointsSplicing(
+        const vc::lasagna::LineModel& previous,
+        const std::vector<cv::Vec3d>& points,
+        int replacedStart,
+        int replacedCount,
+        const vc::lasagna::NormalSampler* normalSampler);
     [[nodiscard]] static vc::lasagna::LineModel syntheticLineModelFromPoints(
         const std::vector<cv::Vec3d>& points);
     [[nodiscard]] static cv::Vec3d seedTraceSourceNormalForStoredFiber(

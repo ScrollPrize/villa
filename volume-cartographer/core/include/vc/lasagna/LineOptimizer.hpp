@@ -165,6 +165,15 @@ struct LineControlPointUpdateResult {
     int changedControlIndex = -1;
     int activeStart = -1;
     int activeEnd = -1;
+    // Half-open range [replacedStart, replacedStart + replacedCount) of
+    // linePoints this update rebuilt; every point outside it is carried over
+    // from the input line unchanged (the suffix shifted by the size delta).
+    // -1/0 when the whole line must be treated as new (single control, or an
+    // update that regrew a tail). Lets callers resample derived per-point
+    // data only where geometry actually changed. Set by the geometric
+    // overload; the solving overload leaves it unset.
+    int replacedStart = -1;
+    int replacedCount = 0;
 };
 
 [[nodiscard]] LineControlPointUpdateResult updateExistingLineControlPoint(

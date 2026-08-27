@@ -927,6 +927,68 @@ TEST_CASE("line annotation automatic multi-control edit reconstructs the clicked
     CHECK(replacementLineIndex < prepared.controlPoints[2].optimizedIndex);
 }
 
+TEST_CASE("line annotation geometric edit prepares the clicked span without a solver")
+{
+    // Same fixture as the automatic multi-control edit above, but through
+    // the purely geometric prepare: identical collapse bookkeeping and dirty
+    // spans, no sampler, and a replaced linePoints range the caller can use
+    // to splice per-point derived data instead of recomputing all of it.
+    const std::vector<cv::Vec3d> linePoints{
+        {0.0, 0.0, 0.0},
+        {10.0, 0.0, 0.0},
+        {20.0, 0.0, 0.0},
+        {30.0, 0.0, 0.0},
+        {40.0, 0.0, 0.0},
+        {40.0, 1.0, 0.0},
+        {30.0, 1.0, 0.0},
+        {20.0, 1.0, 0.0},
+        {10.0, 1.0, 0.0},
+        {0.0, 1.0, 0.0},
+    };
+    std::vector<vc3d::line_annotation::LineControlPoint> controls{
+        {1.0, linePoints[1], true, 1},
+        {3.0, linePoints[3], false, 3},
+        {4.0, linePoints[4], false, 4},
+        {8.0, linePoints[8], false, 8},
+    };
+    const cv::Vec3d clicked{30.0, 1.1, 0.0};
+
+    const auto prepared = vc3d::line_annotation::prepareGeometricControlPointEdit(
+        linePoints, controls, {1, 2}, 3.5, clicked, 4.0);
+
+    REQUIRE(prepared.controlPoints.size() == 3);
+    REQUIRE(prepared.replacementIndex == 1);
+    CHECK(prepared.lineReconstructed);
+    CHECK(prepared.collapsedOldIndices == std::vector<size_t>{1, 2});
+    CHECK(prepared.oldToNewIndices == std::vector<size_t>{0, 1, 1, 2});
+    CHECK(prepared.dirtySegmentIndices == std::vector<size_t>{0, 1});
+    CHECK(prepared.controlPoints[prepared.replacementIndex].volumePoint == clicked);
+    const int replacementLineIndex =
+        prepared.controlPoints[prepared.replacementIndex].optimizedIndex;
+    REQUIRE(replacementLineIndex > 0);
+    REQUIRE(replacementLineIndex < static_cast<int>(prepared.linePoints.size()) - 1);
+    CHECK(prepared.linePoints[static_cast<size_t>(replacementLineIndex)] == clicked);
+    CHECK(prepared.controlPoints[0].optimizedIndex < replacementLineIndex);
+    CHECK(replacementLineIndex < prepared.controlPoints[2].optimizedIndex);
+
+    // The replaced range is consistent: everything outside it is the input
+    // line carried over (the suffix shifted by the size delta).
+    REQUIRE(prepared.replacedStart >= 0);
+    REQUIRE(prepared.replacedCount > 0);
+    const int suffixStart = prepared.replacedStart + prepared.replacedCount;
+    const int delta = static_cast<int>(prepared.linePoints.size()) -
+                      static_cast<int>(linePoints.size());
+    REQUIRE(suffixStart <= static_cast<int>(prepared.linePoints.size()));
+    for (int i = 0; i < prepared.replacedStart; ++i) {
+        CHECK(prepared.linePoints[static_cast<size_t>(i)] ==
+              linePoints[static_cast<size_t>(i)]);
+    }
+    for (int i = suffixStart; i < static_cast<int>(prepared.linePoints.size()); ++i) {
+        CHECK(prepared.linePoints[static_cast<size_t>(i)] ==
+              linePoints[static_cast<size_t>(i - delta)]);
+    }
+}
+
 TEST_CASE("line annotation automatic edit preparation leaves inputs unchanged on failure")
 {
     const std::vector<cv::Vec3d> linePoints{
