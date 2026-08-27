@@ -325,7 +325,8 @@ def _point_id_for_orig_index(pcl, orig_index):
     return int(np.argmin(np.abs(np.asarray(kept) - orig_index)))
 
 
-def resolve_fiber_links(point_collections, include_pending=False):
+def resolve_fiber_links(point_collections, include_pending=False,
+                        assume_unannotated=False):
     """Resolve stored branch metadata into concrete point-to-point links.
 
     Fibers/PCLs carry raw 'branches' (see load_fiber_point_collection), each
@@ -336,6 +337,10 @@ def resolve_fiber_links(point_collections, include_pending=False):
 
     Returns a list of dicts:
         {'a_coll', 'a_point', 'b_coll', 'b_point', 'pending'}
+
+    ``assume_unannotated`` is for the canonical fiber catalog: its shared
+    point dictionaries are zero-normalized after their first materialization,
+    but source fiber documents are intrinsically unannotated.
     """
     by_basename = {}
     for cid, pcl in point_collections.items():
@@ -348,7 +353,7 @@ def resolve_fiber_links(point_collections, include_pending=False):
     # decomposition, so every consumer of the link graph (the cross-patch merge,
     # the unattached walk sampling) agrees on membership. Must run before
     # normalise_pcl_winding_annotations 0-fills unannotated pcls.
-    annotated_cids = {
+    annotated_cids = set() if assume_unannotated else {
         cid for cid, pcl in point_collections.items()
         if any(np.isfinite(p['winding_annotation']) for p in pcl['points'].values())
     }

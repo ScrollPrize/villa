@@ -2,16 +2,24 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 from PIL import Image
+import torch
 
+from config import Config, FitConfig
 from spiral_helpers import (
     _DENSE_WEIGHT_KEYS_NEEDING_OUTER_WINDING_IDX,
     _resolve_shell_outer_winding_idx,
     _structurally_disabled_dense_weight_keys,
     load_fiber_point_collection,
     resolve_outer_winding_idx_and_notes,
+)
+from fit_spiral import (
+    FitContext,
+    _UnattachedPclStripList,
+    materialize_fiber_fit_inputs,
 )
 from tifxyz import load_tifxyz
 
@@ -68,6 +76,205 @@ class FiberPointCollectionTests(unittest.TestCase):
             collection = load_fiber_point_collection(path, collection_id=7)
 
             self.assertIsNone(collection)
+
+    @staticmethod
+    def _linked_member(collection_id, logical_id, targets, x_offset,
+                       attached=True):
+        points = {
+            point_id: {
+                "id": point_id,
+                "collectionId": collection_id,
+                "p": [x_offset + point_id, 0.0, 0.0],
+                "zyx": np.asarray([0.0, 0.0, x_offset + point_id],
+                              dtype=np.float32),
+                "winding_annotation": float("nan"),
+                **({"on_patch": {"id": f"patch-{logical_id}"}}
+                   if attached else {}),
+            }
+            for point_id in range(2)
+        }
+        return {
+            "id": collection_id,
+            "file_basename": f"{logical_id}.json",
+            "sampling_group": "fibers",
+            "metadata": {
+                "logical_input_id": logical_id,
+                "logical_input_kind": "fiber",
+                "winding_is_absolute": False,
+            },
+            "points": points,
+            "kept_orig_indices": np.asarray([0, 1]),
+            "control_line_indices": np.asarray([0, 1]),
+            "branches": [
+                {
+                    "local_index": local_index,
+                    "branch_file": f"{target_id}.json",
+                    "branch_index": target_index,
+                    "pending": False,
+                }
+                for local_index, target_id, target_index in targets
+            ],
+        }
+
+    def _materialize(self, catalog, spacing=0):
+        patches = {
+            f"patch-{logical_id}": object() for logical_id in catalog
+        }
+        return materialize_fiber_fit_inputs(
+            catalog, patches, z_begin=-10, z_end=10, z_margin=0,
+            min_point_spacing=spacing)
+
+    def test_catalog_materializes_branching_and_loop_closing_graphs(self):
+        catalog = {
+            "a": self._linked_member(
+                10, "a", [(0, "b", 0), (1, "c", 0)], 0),
+            "b": self._linked_member(
+                11, "b", [(0, "a", 0), (1, "c", 1)], 10),
+            "c": self._linked_member(
+                12, "c", [(0, "a", 1), (1, "b", 1)], 20),
+        }
+
+        cross, strips, groups, links, components = self._materialize(catalog)
+
+        self.assertEqual(len(cross), 1)
+        self.assertEqual(cross[0]["metadata"]["logical_input_ids"],
+                         ["a", "b", "c"])
+        self.assertEqual(len(links), 3)
+        self.assertEqual(len(components), 1)
+        self.assertEqual(len(strips), 3)
+        self.assertEqual(groups, ["fibers"] * 3)
+        self.assertEqual(len(cross[0]["chain"].extra_edges), 1)
+
+    def test_revision_replaces_one_catalog_value_and_rebuilds_all_views(self):
+        a = self._linked_member(10, "a", [(0, "b", 0)], 0)
+        b = self._linked_member(
+            11, "b", [(0, "a", 0), (1, "c", 0)], 10)
+        c = self._linked_member(12, "c", [(0, "b", 1)], 20)
+        catalog = {"a": a, "b": b, "c": c}
+        self._materialize(catalog)
+
+        revised_a = self._linked_member(10, "a", [], 100)
+        candidate = dict(catalog)
+        candidate["a"] = revised_a
+        cross, strips, _, links, _ = self._materialize(candidate, spacing=1000)
+
+        self.assertEqual(revised_a["id"], a["id"])
+        self.assertEqual(list(candidate), ["a", "b", "c"])
+        self.assertEqual(len(cross), 1)
+        self.assertEqual(cross[0]["metadata"]["logical_input_ids"],
+                         ["a", "b", "c"])
+        merged_points = list(cross[0]["points"].values())
+        self.assertTrue(any(point is revised_a["points"][0]
+                            for point in merged_points))
+        self.assertFalse(any(point is a["points"][0]
+                             for point in merged_points))
+        self.assertTrue(any(point is b["points"][0]
+                            for point in merged_points))
+        self.assertTrue(any(point is c["points"][0]
+                            for point in merged_points))
+        # B's authoritative reciprocal record keeps A-B active, and junction
+        # points survive even though the strip spacing exceeds its full length.
+        self.assertEqual(len(links), 2)
+        strips_by_id = {strip["id"]: strip for strip in strips}
+        self.assertIn(0, strips_by_id[10]["link_points"])
+        self.assertIn(0, strips_by_id[11]["link_points"])
+        self.assertEqual(sum(
+            strip["logical_input_id"] == "a" for strip in strips), 1)
+
+    def test_batched_reciprocal_removal_separates_component(self):
+        catalog = {
+            "a": self._linked_member(10, "a", [], 0),
+            "b": self._linked_member(11, "b", [], 10),
+        }
+
+        cross, strips, _, links, components = self._materialize(catalog)
+
+        self.assertEqual(links, [])
+        self.assertEqual(components, [])
+        self.assertEqual(len(cross), 2)
+        self.assertEqual(strips, [])
+
+    def test_new_fiber_links_to_resident_and_materialization_is_deterministic(self):
+        resident = self._linked_member(10, "a", [], 0)
+        added = self._linked_member(11, "b", [(0, "a", 0)], 10)
+        catalog = {"a": resident, "b": added}
+
+        first = self._materialize(catalog)
+        second = self._materialize(catalog)
+
+        self.assertEqual(len(first[3]), 1)
+        self.assertEqual(first[3], second[3])
+        self.assertEqual(first[4], second[4])
+        self.assertEqual(
+            [pcl["metadata"] for pcl in first[0]],
+            [pcl["metadata"] for pcl in second[0]])
+        for left, right in zip(first[1], second[1]):
+            self.assertEqual(left["id"], right["id"])
+            self.assertEqual(left["link_points"], right["link_points"])
+            np.testing.assert_array_equal(left["zyxs"], right["zyxs"])
+
+    def test_live_revision_keeps_regular_pcl_views_and_stable_id(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            revised_path = Path(temporary) / "staged-content-hash.json"
+            revised_path.write_text(json.dumps({
+                "control_points": [[400, 0, 0], [404, 0, 0]],
+                "line_points": [[400, 0, 0], [404, 0, 0]],
+            }))
+            resident = self._linked_member(20, "a", [], 0, attached=False)
+            regular_cross = {
+                "id": 1, "metadata": {"input_role": "same_winding"},
+                "points": {}, "sampling_group": "regular",
+            }
+            regular_strip = {
+                "id": 2, "logical_input_kind": None,
+                "zyxs": np.zeros((2, 3), dtype=np.float32),
+                "windings": np.zeros(2, dtype=np.float32),
+            }
+
+            context = FitContext.__new__(FitContext)
+            context.config = FitConfig(Config({
+                "z_begin": 0, "z_end": 200,
+            }).as_dict())
+            context.fiber_catalog = {"a": resident}
+            context.next_id = 21
+            context.verified_patches = {}
+            context.verified_patches_list = []
+            context.cross_patch_pcls = [regular_cross]
+            context.unattached_pcl_strips = _UnattachedPclStripList(
+                [regular_strip])
+            context.unattached_strip_sampling_groups = ["regular"]
+            context.resolved_links = []
+            context.link_components = []
+            context.link_distance_tolerance = 2.5
+            context.dt_target_cache_manager = mock.Mock()
+            context._rebuild_pcl_sampling_strata = mock.Mock()
+            context._build_theta_crossing_map = mock.Mock(return_value=[])
+            context._trusted_geometry_from_active_inputs = mock.Mock(
+                return_value=torch.empty((0, 3)))
+            context.interactive_dt_resume_iteration = None
+
+            with mock.patch.object(torch.cuda, "get_rng_state_all", return_value=[]), \
+                    mock.patch.object(torch.cuda, "set_rng_state_all"):
+                context._incorporate_prevalidated_interactive_inputs(
+                    [{
+                        "kind": "fiber", "id": "a",
+                        "path": str(revised_path), "revision": "r2",
+                        "operation": "replace",
+                    }],
+                    {"influence_enabled": False},
+                    current_iteration=10, target_iteration=20)
+
+            self.assertIs(context.cross_patch_pcls[0], regular_cross)
+            self.assertIs(context.unattached_pcl_strips[0], regular_strip)
+            self.assertEqual(context.unattached_strip_sampling_groups[0],
+                             "regular")
+            self.assertEqual(context.next_id, 21)
+            self.assertEqual(context.fiber_catalog["a"]["id"], 20)
+            self.assertEqual(context.fiber_catalog["a"]["file_basename"],
+                             "a.json")
+            self.assertEqual(
+                context.fiber_catalog["a"]["points"][0]["p"],
+                [100.0, 0.0, 0.0])
 
 
 class TifxyzMetadataTests(unittest.TestCase):
