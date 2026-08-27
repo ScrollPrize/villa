@@ -393,7 +393,11 @@ void reportExtrapolationFallback(
     request.extrapolationFallbackCallback(diagnostic);
 }
 
-void replaceOpenTailsWithNative(
+// Returns the index shift the tail replacement applied to every point in
+// [firstControl, lastControl]: newIndex = oldIndex + shift. Callers must
+// shift their control-point indices by it so the indices keep naming the
+// controls' exact line vertices.
+int replaceOpenTailsWithNative(
     const FiberModeOptimizationRequest& request,
     const vc::fiber_tracer::FiberTraceCoordinateAdapter& coordinates,
     int firstControl,
@@ -512,6 +516,7 @@ void replaceOpenTailsWithNative(
         linePoint.sampledNormal = request.baseNormalSampler->sampleNormal(point);
         output.optimization.line.points.push_back(std::move(linePoint));
     }
+    return static_cast<int>(leftTail.size()) - 1 - firstControl;
 }
 
 }  // namespace
@@ -589,8 +594,11 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
         request.controlPoints.front().linePosition =
             static_cast<double>(controlIndex);
         if (request.globalMode == FiberOptimizationMode::NativeFiberTrace3d) {
-            replaceOpenTailsWithNative(
+            const int shift = replaceOpenTailsWithNative(
                 request, coordinates, controlIndex, controlIndex, output);
+            request.controlPoints.front().optimizedIndex += shift;
+            request.controlPoints.front().linePosition +=
+                static_cast<double>(shift);
         }
         appendFiberModeReport(output);
         output.controlPoints = std::move(request.controlPoints);
@@ -926,9 +934,23 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
     const int firstControl = reinitialized.fixedPointIndices.front();
     const int lastControl = reinitialized.fixedPointIndices.back();
     output.optimization = std::move(reinitialized.optimization);
+    // Make the control indices authoritative for the solved line: the
+    // stitch-time indices are stale once reinit regrew the tails. The reinit
+    // reports each control's exact final line index; a native tail
+    // replacement then shifts every retained point by a fixed offset.
+    for (size_t index = 0; index < request.controlPoints.size(); ++index) {
+        request.controlPoints[index].optimizedIndex =
+            reinitialized.fixedPointIndices[index];
+        request.controlPoints[index].linePosition =
+            static_cast<double>(reinitialized.fixedPointIndices[index]);
+    }
     if (request.globalMode == FiberOptimizationMode::NativeFiberTrace3d) {
-        replaceOpenTailsWithNative(
+        const int shift = replaceOpenTailsWithNative(
             request, coordinates, firstControl, lastControl, output);
+        for (auto& control : request.controlPoints) {
+            control.optimizedIndex += shift;
+            control.linePosition += static_cast<double>(shift);
+        }
     }
     appendFiberModeReport(output);
     output.controlPoints = std::move(request.controlPoints);

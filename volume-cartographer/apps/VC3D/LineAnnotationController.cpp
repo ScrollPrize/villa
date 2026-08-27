@@ -9561,15 +9561,42 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
     // other sessions and _fibers, which the rollback cannot restore.
     remapBranchControlPointIndices(
         branchRemapControls, session.controlPoints, session.branches);
+    // The solver reports each control's exact line index; trust it when the
+    // named vertex really is the control's position (it always should be -
+    // spans are pinned through the control points). Only a mismatch falls
+    // back to the old O(controls x linePoints) nearest-point scan, which on
+    // long fibers was a measurable slice of every landing.
+    const auto solverIndexTrusted =
+        [&session](const vc3d::line_annotation::LineControlPoint& control) {
+            if (control.optimizedIndex < 0 ||
+                control.optimizedIndex >=
+                    static_cast<int>(session.optimizedLine.points.size())) {
+                return false;
+            }
+            const cv::Vec3d delta =
+                session.optimizedLine.points[static_cast<size_t>(
+                                                 control.optimizedIndex)]
+                    .position -
+                control.volumePoint;
+            return delta.dot(delta) <= 1.0e-12;
+        };
+    const bool solverIndicesTrusted =
+        std::all_of(session.controlPoints.begin(),
+                    session.controlPoints.end(),
+                    solverIndexTrusted);
     for (auto& control : session.controlPoints) {
         double bestDistance = std::numeric_limits<double>::infinity();
         int bestIndex = -1;
-        for (size_t i = 0; i < session.optimizedLine.points.size(); ++i) {
-            const cv::Vec3d delta = session.optimizedLine.points[i].position - control.volumePoint;
-            const double distance = std::sqrt(delta.dot(delta));
-            if (distance < bestDistance) {
-                bestDistance = distance;
-                bestIndex = static_cast<int>(i);
+        if (solverIndicesTrusted) {
+            bestIndex = control.optimizedIndex;
+        } else {
+            for (size_t i = 0; i < session.optimizedLine.points.size(); ++i) {
+                const cv::Vec3d delta = session.optimizedLine.points[i].position - control.volumePoint;
+                const double distance = std::sqrt(delta.dot(delta));
+                if (distance < bestDistance) {
+                    bestDistance = distance;
+                    bestIndex = static_cast<int>(i);
+                }
             }
         }
         if (bestIndex >= 0) {
