@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 from collections import OrderedDict, deque
 from collections.abc import Mapping
+from contextlib import nullcontext
 import copy
 import dataclasses
 import errno
@@ -176,6 +177,19 @@ def bind_service_paths(resolution, output_directory, cache_directory):
 
 class FileLockUnavailable(RuntimeError):
     pass
+
+
+@dataclasses.dataclass(frozen=True)
+class _CommitInputSnapshot:
+    """Immutable source facts for one explicit dataset commit."""
+
+    record: object = dataclasses.field(compare=False, repr=False)
+    id: str
+    kind: str
+    role: str | None
+    path: str
+    revision: str | None
+    incorporated: bool
 
 
 class ExclusiveFileLock:
@@ -547,6 +561,11 @@ class ServiceState:
         self._live_incorporation_queue = []
         self._live_incorporation_active = False
         self._active_run_influence = None
+        # Explicit commits copy without holding the service lock. These sets
+        # fence removal and obsolete-revision cleanup around their immutable
+        # source snapshots.
+        self._committing_inputs = set()
+        self._committing_fiber_revisions = set()
         # One record for the whole of preview publication (see
         # LasagnaPublisher's PreviewPublication), guarded by self.lock.
         self._preview = PreviewPublication()
@@ -1402,28 +1421,9 @@ class ServiceState:
 
             def mark_incorporated(records, error=None, outcomes=None,
                                   no_future_step=False):
-                automatic = []
-                with self.lock:
-                    resolved = self.ephemeral_records.resolve(records)
-                    if no_future_step:
-                        self.ephemeral_records.return_pending(resolved)
-                    elif outcomes is not None:
-                        self.ephemeral_records.mark_outcomes(outcomes)
-                    else:
-                        self.ephemeral_records.mark_incorporated(
-                            resolved, error=error)
-                    automatic = [
-                        record for record in resolved
-                        if record.kind == "fiber" and record.auto_commit
-                        and record.incorporated_revision == record.revision
-                        and record.committed_revision != record.revision
-                    ]
-                    self.status_generation += 1
-                for record in automatic:
-                    self._auto_commit_fiber(record)
-                for record in resolved:
-                    if record.kind == "fiber":
-                        self._cleanup_fiber_revision_files(record)
+                self._finish_incorporation(
+                    records, error=error, outcomes=outcomes,
+                    no_future_step=no_future_step)
 
             self._active_run_influence = dict(influence_config)
 
@@ -2016,6 +2016,15 @@ class ServiceState:
         return {**self._base(), "received": received, "accepted": True}
 
     def finalize_upload(self, upload_id):
+        # Fiber publication and logical revision installation are one service
+        # critical section. Cleanup uses the same lock, so it can never erase
+        # content that a concurrent finalizer has published but not installed.
+        upload_kind = self.uploads_manager.get(upload_id).kind
+        scope = self.lock if upload_kind == "fiber" else nullcontext()
+        with scope:
+            return self._finalize_upload(upload_id)
+
+    def _finalize_upload(self, upload_id):
         finalized = self.uploads_manager.finalize(upload_id)
         ledger_record = None
         if finalized.kind == "fiber":
@@ -2031,8 +2040,14 @@ class ServiceState:
                 else:
                     base = finalized.record.get("base_revision")
                     if base != current:
-                        path = Path(finalized.record["path"])
-                        path.unlink(missing_ok=True)
+                        # Finalize may have reused an existing content-addressed
+                        # file. Clean through the ledger's protected-revision
+                        # policy instead of assuming this upload published it.
+                        if existing is not None:
+                            self._cleanup_fiber_revision_files(existing)
+                        else:
+                            Path(finalized.record["path"]).unlink(
+                                missing_ok=True)
                         raise ApiError(
                             HTTPStatus.CONFLICT,
                             f"Fiber {finalized.record.get('id')!r} changed "
@@ -2051,6 +2066,10 @@ class ServiceState:
                         self._live_incorporation_queue.append(record)
                     self._start_live_incorporation_dispatch_locked()
                 self.status_generation += 1
+                if current != revision and self.session is not None \
+                        and self.session.status().get("state") \
+                        == SessionState.Idle:
+                    self._cleanup_fiber_revision_files(record)
         elif not finalized.replayed:
             with self.lock:
                 if finalized.kind != "checkpoint":
@@ -2082,6 +2101,53 @@ class ServiceState:
             target=self._dispatch_live_incorporation,
             args=(generation,), name="spiral-live-inputs", daemon=True,
         ).start()
+
+    def _finish_incorporation(self, records, *, error=None, outcomes=None,
+                              no_future_step=False):
+        """Apply a runtime outcome; persistence remains non-fatal."""
+        with self.lock:
+            resolved = self.ephemeral_records.resolve(records)
+            if no_future_step:
+                self.ephemeral_records.return_pending(resolved)
+            elif outcomes is not None:
+                self.ephemeral_records.mark_outcomes(outcomes)
+            else:
+                self.ephemeral_records.mark_incorporated(
+                    resolved, error=error)
+            automatic = [
+                (record, record.revision) for record in resolved
+                if record.kind == "fiber" and record.auto_commit
+                and record.incorporated_revision == record.revision
+                and record.committed_revision != record.revision
+            ]
+            self.status_generation += 1
+
+        for record, revision in automatic:
+            try:
+                self._auto_commit_fiber(record)
+            except Exception as exc:
+                with self.lock:
+                    current = self.ephemeral_records.find(
+                        "fiber", record.id)
+                    if current is record and record.revision == revision:
+                        record.error = (
+                            "Automatic commit failed: "
+                            f"{type(exc).__name__}: {exc}")
+                        record.error_revision = revision
+                        self.status_generation += 1
+            else:
+                with self.lock:
+                    if (record.committed_revision == revision
+                            and record.error_revision == revision
+                            and str(record.error or "").startswith(
+                                "Automatic commit failed:")):
+                        record.error = None
+                        record.error_revision = None
+                        self.status_generation += 1
+
+        for record in resolved:
+            if record.kind == "fiber":
+                self._cleanup_fiber_revision_files(record)
 
     def _dispatch_live_incorporation(self, generation):
         """Coalesce finalized records and hand each batch to the runtime."""
@@ -2115,38 +2181,15 @@ class ServiceState:
                 # Runtime failures after mutation begins are fail-stop. Its
                 # state/error is authoritative; keep the records diagnosable.
                 error = f"{type(exc).__name__}: {exc}"
-                with self.lock:
-                    self.ephemeral_records.mark_incorporated(batch, error=error)
-                    self.status_generation += 1
+                self._finish_incorporation(payloads, error=error)
                 continue
-            with self.lock:
-                if result.get("no_future_step"):
-                    self.ephemeral_records.return_pending(batch)
-                else:
-                    self.ephemeral_records.mark_outcomes(
-                        result.get("outcomes", []))
-                self.status_generation += 1
-                auto_commit = [
-                    record for record in batch
-                    if record.kind == "fiber" and record.auto_commit
-                    and record.incorporated_revision == record.revision
-                    and record.committed_revision != record.revision
-                ]
-            for record in auto_commit:
-                try:
-                    self._auto_commit_fiber(record)
-                except Exception as exc:
-                    with self.lock:
-                        record.error = ("Automatic commit failed: "
-                                        f"{type(exc).__name__}: {exc}")
-                        record.error_revision = record.revision
-                        self.status_generation += 1
-            for record in batch:
-                if record.kind == "fiber":
-                    self._cleanup_fiber_revision_files(record)
+            self._finish_incorporation(
+                payloads, outcomes=result.get("outcomes", []),
+                no_future_step=result.get("no_future_step", False))
 
     def _cleanup_fiber_revision_files(self, record):
         """Drop superseded staged content after runtime references are gone."""
+        failures = []
         with self.lock:
             if record.kind != "fiber":
                 return
@@ -2159,12 +2202,33 @@ class ServiceState:
                     record.committed_revision)
                 if value
             }
+            protected.update(
+                revision for input_id, revision
+                in self._committing_fiber_revisions
+                if input_id == record.id)
             directory = Path(record.path).parent
-        if not directory.is_dir():
-            return
-        for path in directory.glob("*.json"):
-            if path.stem not in protected:
-                path.unlink(missing_ok=True)
+            if not directory.is_dir():
+                return
+            # Fiber publication is serialized by this same lock. Keep it
+            # held through deletion so a digest cannot be reused between the
+            # protected-set check and unlinking the path.
+            try:
+                candidates = list(directory.glob("*.json"))
+            except OSError as exc:
+                failures.append((directory, exc))
+                candidates = []
+            for path in candidates:
+                if path.stem in protected:
+                    continue
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as exc:
+                    failures.append((path, exc))
+        for path, exc in failures:
+            self.events.append(
+                "log", f"Could not remove obsolete fiber revision "
+                f"{path}: {type(exc).__name__}: {exc}",
+                severity="warning", source="service")
 
     def _auto_commit_fiber(self, record):
         """Persist one incorporated tracked revision without touching drafts."""
@@ -2212,6 +2276,7 @@ class ServiceState:
             raise ApiError(
                 HTTPStatus.CONFLICT,
                 "Dataset commit is busy in another Spiral session; try again") from exc
+        snapshots = []
         try:
             # Re-check after acquiring the process-wide lock: another request
             # may have completed while this one was waiting.
@@ -2227,42 +2292,62 @@ class ServiceState:
                         HTTPStatus.CONFLICT, f"Commit is unavailable: {reason}")
                 records = self.ephemeral_records.uncommitted()
                 paths = self.session_paths
-            patches_dir = Path(paths.verified_patches) if paths.verified_patches \
-                else dataset_root / "verified_patches"
-            fibers_dir = Path(paths.fibers) if paths.fibers else dataset_root / "fibers"
+                patches_dir = (Path(paths.verified_patches)
+                               if paths.verified_patches
+                               else dataset_root / "verified_patches")
+                fibers_dir = (Path(paths.fibers) if paths.fibers
+                              else dataset_root / "fibers")
+                snapshots = [
+                    _CommitInputSnapshot(
+                        record=record, id=record.id, kind=record.kind,
+                        role=record.role, path=record.path,
+                        revision=record.revision,
+                        incorporated=record.incorporated)
+                    for record in records
+                ]
+                self._committing_inputs.update(
+                    (snapshot.kind, snapshot.id) for snapshot in snapshots)
+                self._committing_fiber_revisions.update(
+                    (snapshot.id, snapshot.revision)
+                    for snapshot in snapshots
+                    if snapshot.kind == "fiber" and snapshot.revision)
 
             # Validation happens entirely under the dataset lock, before any
             # record is published: collision checks cannot race a cooperating
             # service process, and a record whose staged copy went missing
             # fails the whole commit instead of leaving it half applied.
-            for record in records:
-                if not Path(record.path).exists():
+            for snapshot in snapshots:
+                if not Path(snapshot.path).exists():
                     raise ApiError(
                         HTTPStatus.CONFLICT,
-                        f"The staged copy of {record.kind} {record.id!r} is gone; "
+                        f"The staged copy of {snapshot.kind} "
+                        f"{snapshot.id!r} is gone; "
                         "it can no longer be committed")
-                if record.kind == "patch" and (patches_dir / record.id).exists():
+                if snapshot.kind == "patch" \
+                        and (patches_dir / snapshot.id).exists():
                     raise ApiError(
                         HTTPStatus.CONFLICT,
-                        f"A patch named {record.id!r} already exists in the dataset")
+                        f"A patch named {snapshot.id!r} already exists in the dataset")
                 # A tracked fiber commonly originates at this exact dataset
                 # path. Explicit commit adopts/updates it atomically and makes
                 # auto-commit sticky for later revisions.
 
             committed = []
-            for record in records:
-                source = Path(record.path)
+            for snapshot in snapshots:
+                source = Path(snapshot.path)
                 # A still-pending record keeps its staged copy: it remains the
                 # incorporation source for the next run, so committing never
                 # removes an input from the live session's queue.
-                keep_source = not record.incorporated
-                if record.kind == "patch":
-                    _copy_publish(source, patches_dir / record.id, keep_source)
-                elif record.kind == "fiber":
-                    _copy_publish(source, fibers_dir / f"{record.id}.json",
+                keep_source = not snapshot.incorporated
+                if snapshot.kind == "patch":
+                    _copy_publish(
+                        source, patches_dir / snapshot.id, keep_source)
+                elif snapshot.kind == "fiber":
+                    _copy_publish(source,
+                                  fibers_dir / f"{snapshot.id}.json",
                                   keep_source=True)
                 else:
-                    target = dataset_root / PCL_ROLE_FILES[record.role]
+                    target = dataset_root / PCL_ROLE_FILES[snapshot.role]
                     with source.open("r", encoding="utf-8") as stream:
                         incoming = json.load(stream)
                     if target.exists():
@@ -2282,11 +2367,17 @@ class ServiceState:
                     os.replace(temp, target)
                     if not keep_source:
                         source.unlink(missing_ok=True)
-                committed.append(record.id)
+                committed.append(snapshot.id)
             with self.lock:
                 # Committed records that already joined the resident fit are
                 # done; the rest stay queued for the next run.
-                self.ephemeral_records.mark_committed(records)
+                self.ephemeral_records.mark_committed(
+                    [snapshot.record for snapshot in snapshots],
+                    fiber_revisions={
+                        (snapshot.kind, snapshot.id): snapshot.revision
+                        for snapshot in snapshots
+                        if snapshot.kind == "fiber"
+                    })
                 if self.dataset_resolution is not None:
                     # Re-advertise the dataset with the committed inputs, but
                     # keep the startup-bound output/cache roots: deployment
@@ -2297,9 +2388,27 @@ class ServiceState:
                         previous.get("output_directory", ""),
                         previous.get("cache_directory", ""))
                 self.status_generation += 1
-            return {**self.status(), "committed": committed, "accepted": True}
+            response = {
+                **self.status(), "committed": committed, "accepted": True}
         finally:
+            if snapshots:
+                with self.lock:
+                    self._committing_inputs.difference_update(
+                        (snapshot.kind, snapshot.id)
+                        for snapshot in snapshots)
+                    self._committing_fiber_revisions.difference_update(
+                        (snapshot.id, snapshot.revision)
+                        for snapshot in snapshots
+                        if snapshot.kind == "fiber" and snapshot.revision)
+                    fiber_records = {
+                        snapshot.id: snapshot.record
+                        for snapshot in snapshots
+                        if snapshot.kind == "fiber"
+                    }
+                    for record in fiber_records.values():
+                        self._cleanup_fiber_revision_files(record)
             commit_lock.release()
+        return response
 
     def remove_input(self, kind, input_id):
         with self.lock:
@@ -2308,6 +2417,10 @@ class ServiceState:
             if record is None:
                 raise ApiError(HTTPStatus.NOT_FOUND,
                                f"No ephemeral {kind or 'input'} named {input_id!r} exists")
+            if (record.kind, record.id) in self._committing_inputs:
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    "This input is being committed and cannot be removed")
             if record.incorporation == "queued":
                 raise ApiError(
                     HTTPStatus.CONFLICT,

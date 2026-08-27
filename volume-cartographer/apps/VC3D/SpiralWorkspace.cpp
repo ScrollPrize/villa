@@ -246,6 +246,8 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 for (auto it = _trackedFibers.begin(); it != _trackedFibers.end(); ++it) {
                     if (it->inputId != inputId) continue;
                     it->uploadInFlight = false;
+                    const uint64_t uploadedGeneration = it->inFlightGeneration;
+                    it->inFlightGeneration = 0;
                     if (!it->snapshotPath.isEmpty()) QFile::remove(it->snapshotPath);
                     it->snapshotPath.clear();
                     if (!error.isEmpty()) {
@@ -255,6 +257,8 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                         if (!it->added) _trackedFibers.erase(it);
                         return;
                     }
+                    it->sentGeneration = std::max(
+                        it->sentGeneration, uploadedGeneration);
                     it->revision = revision;
                     it->added = true;
                     _residentFiberRevisions[inputId] = revision;
@@ -671,6 +675,13 @@ void SpiralWorkspace::updatePendingPatchIds(const QJsonObject& status)
     QSet<QString> pendingPatches;
     QSet<QString> uncommittedDrawnPointCollections;
     _residentFiberRevisions.clear();
+    // Revisions are scoped to the current service session. Rebuild tracked
+    // state from its ledger so a replacement session cannot retain CAS bases.
+    for (auto tracked = _trackedFibers.begin();
+         tracked != _trackedFibers.end(); ++tracked) {
+        tracked->revision.clear();
+        tracked->added = false;
+    }
     for (const QJsonValue& value : status.value(QStringLiteral("ephemeral_inputs")).toArray()) {
         const QJsonObject input = value.toObject();
         if (input.value(QStringLiteral("kind")).toString() == QStringLiteral("fiber")) {
@@ -813,7 +824,7 @@ void SpiralWorkspace::noteTrackedFiberSaved(
         if (revision.isEmpty()) return;
         found = _trackedFibers.insert(
             fiberId, TrackedFiber{inputId, fiberJsonPath, revision, {},
-                                  generation, 0, true, false});
+                                  generation, 0, 0, true, false});
     }
     found->path = fiberJsonPath;
     found->latestGeneration = std::max(found->latestGeneration, generation);
@@ -841,7 +852,7 @@ void SpiralWorkspace::uploadNewestFiberRevision(uint64_t fiberId)
         return;
     }
     found->snapshotPath = snapshot;
-    found->sentGeneration = found->latestGeneration;
+    found->inFlightGeneration = found->latestGeneration;
     found->uploadInFlight = true;
     _service->uploadJsonInput(QStringLiteral("fiber"), snapshot,
                               found->inputId, {}, found->revision);

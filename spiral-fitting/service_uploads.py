@@ -497,13 +497,21 @@ class EphemeralLedger:
                     record.error_revision = None
             self._drop_settled()
 
-    def mark_committed(self, records):
+    def mark_committed(self, records, fiber_revisions=None):
+        fiber_revisions = dict(fiber_revisions or {})
         with self._lock:
             for record in records:
                 record.persistence = "committed"
                 if record.kind == "fiber":
-                    record.committed_revision = record.revision
+                    committed_revision = fiber_revisions.get(
+                        (record.kind, record.id), record.revision)
+                    record.committed_revision = committed_revision
                     record.auto_commit = True
+                    if (record.error_revision == committed_revision
+                            and str(record.error or "").startswith(
+                                "Automatic commit failed:")):
+                        record.error = None
+                        record.error_revision = None
             self._drop_settled()
 
     def _drop_settled(self):

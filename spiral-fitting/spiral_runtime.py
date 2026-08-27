@@ -1729,7 +1729,59 @@ class InteractiveFitSession:
             self._commands.append(command)
             self._condition.notify_all()
         if not command.wait(timeout):
-            raise TimeoutError(f"{command.kind} command timed out")
+            reason = f"{command.kind} command timed out after {timeout:g}s"
+            publish_failure = False
+            abandoned = []
+            with self._condition:
+                # Completion may race Event.wait()'s timeout. Once the
+                # condition is held, the command is either complete, still
+                # cancellable in the queue, or already owned by the fitter.
+                timed_out = not command.done.is_set()
+                if timed_out:
+                    if command in self._commands:
+                        self._commands.remove(command)
+                        command.cancel(reason)
+                        if isinstance(
+                                command,
+                                (IncorporateCommand,
+                                 PrevalidateIncorporationCommand)) \
+                                and self._live_reservation_epoch \
+                                == command.reservation_epoch:
+                            self._live_reservation_iteration = None
+                        self._condition.notify_all()
+                    elif isinstance(command,
+                                    PrevalidateIncorporationCommand):
+                        # Prevalidation is read-only. It may finish after its
+                        # caller gives up, but releasing the held optimizer
+                        # boundary cannot expose a partial model mutation.
+                        if self._live_reservation_epoch \
+                                == command.reservation_epoch:
+                            self._live_reservation_iteration = None
+                        command.cancel(reason)
+                        self._condition.notify_all()
+                    elif isinstance(command, IncorporateCommand):
+                        # The fitter has crossed the last cancellable point.
+                        # Incorporation may already be mutating resident
+                        # tensors, so this session must never take another
+                        # optimizer step even if the command later returns.
+                        self._error = reason
+                        self._warnings.append(reason)
+                        self._pending = 0
+                        self._target = self._completed
+                        self._live_reservation_iteration = None
+                        abandoned, self._commands = self._commands, []
+                        self._transition_locked(
+                            SessionState.Error, "Error",
+                            reason=f"timed-out {command.kind} command")
+                        publish_failure = True
+            for queued in abandoned:
+                queued.cancel(
+                    f"cancelled after {command.kind} command "
+                    f"{command.command_id} timed out")
+            if publish_failure:
+                self._publish_status()
+            if timed_out:
+                raise TimeoutError(reason)
         if command.error is not None:
             raise RuntimeError(command.error)
         return dict(command.result)
@@ -1878,8 +1930,11 @@ def _distributed_session_worker(context, gpu_id, rendezvous, paths, run,
                 if name == "run":
                     mark_incorporated = None
                     if rank == 0 and arguments.get("pending_inputs"):
-                        def mark_incorporated(records, error=None, cid=command_id):
-                            events.put(("incorporated", cid, error))
+                        def mark_incorporated(
+                                records, error=None, outcomes=None,
+                                no_future_step=False, cid=command_id):
+                            events.put(("incorporated", cid, error, outcomes,
+                                        no_future_step))
                     result = session.run(
                         arguments["count"],
                         pending_inputs=arguments.get("pending_inputs"),
@@ -2284,12 +2339,19 @@ class DistributedInteractiveFitSession:
                     self._acks.setdefault(command_id, {})[rank] = (ok, result)
                     self._condition.notify_all()
             elif kind == "incorporated":
-                _, command_id, error = event
+                _, command_id, error, outcomes, no_future_step = event
                 with self._condition:
                     pending_callback = self._incorporation_callbacks.pop(command_id, None)
                 if pending_callback is not None:
                     callback, records = pending_callback
-                    callback(records, error=error) if error else callback(records)
+                    if error:
+                        callback(records, error=error)
+                    elif outcomes is not None:
+                        callback(records, outcomes=outcomes)
+                    elif no_future_step:
+                        callback(records, no_future_step=True)
+                    else:
+                        callback(records)
                 continue
             elif kind == "worker_error":
                 _, rank, error, trace = event
@@ -2415,10 +2477,24 @@ class DistributedInteractiveFitSession:
             "reservation_epoch": reservation_epoch,
             "timeout": COMMAND_ACK_TIMEOUT_S,
         }
-        preflights = self._call(
-            "prevalidate_incorporation", preflight_arguments,
-            collective=False, return_all=True,
-            timeout=COMMAND_ACK_TIMEOUT_S + COMMAND_ACK_GRACE_S)
+        try:
+            preflights = self._call(
+                "prevalidate_incorporation", preflight_arguments,
+                collective=False, return_all=True,
+                timeout=COMMAND_ACK_TIMEOUT_S + COMMAND_ACK_GRACE_S)
+        except BaseException:
+            # A rank whose read-only prevalidation timed out releases its own
+            # reservation. Release the siblings as well; successful ranks
+            # otherwise remain parked at a boundary the coordinator has
+            # abandoned.
+            try:
+                self._call(
+                    "cancel_incorporation",
+                    {"reservation_epoch": reservation_epoch},
+                    collective=False)
+            except BaseException:
+                pass
+            raise
         canonical_preflight = preflights[min(preflights)]
         preflight_outcomes = canonical_preflight.get("outcomes", [])
         if (canonical_preflight.get("no_future_step")

@@ -567,7 +567,8 @@ class InSessionCheckpointLoadTests(unittest.TestCase):
         self.assertEqual(session._command_epoch, 0)
         self.assertEqual(session._commands, [])
 
-        # A matching barrier queues the command in the coordinator's epoch.
+        # A matching barrier advances the coordinator's epoch, then removes
+        # and cancels the queued command when its caller times out.
         def queue_and_wait():
             try:
                 session.preflight_checkpoint(
@@ -579,8 +580,7 @@ class InSessionCheckpointLoadTests(unittest.TestCase):
         thread.start()
         thread.join(2.0)
         self.assertEqual(session._command_epoch, 1)
-        self.assertEqual(len(session._commands), 1)
-        self.assertEqual(session._commands[0].epoch, 1)
+        self.assertEqual(session._commands, [])
 
     def test_a_rank_with_iterations_pending_refuses_the_load_barrier(self):
         session = _idle_session()

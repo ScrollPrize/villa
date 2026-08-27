@@ -2032,6 +2032,50 @@ class UploadTests(unittest.TestCase):
         self.assertTrue(status[0]["auto_commit"])
         self.assertEqual(status[0]["committed_revision"], second["revision"])
 
+    def test_idle_fiber_saves_remove_unprotected_superseded_revisions(self):
+        self._session()
+        first = self.state.finalize_upload(_upload_input(
+            self.state, "fiber", "fiber-1", FIBER_FILES))["input"]
+        first_path = Path(first["path"])
+
+        document = json.loads(FIBER_FILES["fiber.json"])
+        document["generation"] = 2
+        revised = {"fiber.json": json.dumps(document).encode()}
+        second = self.state.finalize_upload(_upload_input(
+            self.state, "fiber", "fiber-1", revised,
+            base_revision=first["revision"]))["input"]
+
+        self.assertFalse(first_path.exists())
+        self.assertEqual(
+            list(Path(second["path"]).parent.glob("*.json")),
+            [Path(second["path"])])
+
+    def test_idle_cleanup_preserves_incorporated_revision_until_replaced(self):
+        self._session()
+        first = self.state.finalize_upload(_upload_input(
+            self.state, "fiber", "fiber-1", FIBER_FILES))["input"]
+        record = self.state.ephemeral_records.find("fiber", "fiber-1")
+        self.state.ephemeral_records.mark_incorporated([record])
+
+        document = json.loads(FIBER_FILES["fiber.json"])
+        document["generation"] = 2
+        revised = {"fiber.json": json.dumps(document).encode()}
+        second = self.state.finalize_upload(_upload_input(
+            self.state, "fiber", "fiber-1", revised,
+            base_revision=first["revision"]))["input"]
+        self.assertTrue(Path(first["path"]).exists())
+
+        self.state._finish_incorporation([{
+            "id": "fiber-1", "kind": "fiber",
+            "revision": second["revision"],
+        }], outcomes=[{
+            "id": "fiber-1", "kind": "fiber",
+            "revision": second["revision"], "state": "incorporated",
+        }])
+
+        self.assertFalse(Path(first["path"]).exists())
+        self.assertTrue(Path(second["path"]).exists())
+
     def test_concurrent_fiber_finalizations_cas_at_publication(self):
         self._session()
         first = self.state.finalize_upload(_upload_input(
@@ -2050,6 +2094,34 @@ class UploadTests(unittest.TestCase):
         self.assertEqual(stale.exception.status, 409)
         self.assertEqual(stale.exception.payload["current_revision"],
                          accepted["revision"])
+
+    def test_stale_finalize_preserves_reused_incorporated_revision(self):
+        self._session()
+        first = self.state.finalize_upload(_upload_input(
+            self.state, "fiber", "fiber-1", FIBER_FILES))["input"]
+        record = self.state.ephemeral_records.find("fiber", "fiber-1")
+        self.state.ephemeral_records.mark_incorporated([record])
+
+        # Both transfers are admitted against revision A. The retry contains
+        # A itself, so finalize reuses A's already-published file.
+        retry = _upload_input(
+            self.state, "fiber", "fiber-1", FIBER_FILES,
+            base_revision=first["revision"])
+        document = json.loads(FIBER_FILES["fiber.json"])
+        document["generation"] = 2
+        revised = {"fiber.json": json.dumps(document).encode()}
+        replacement = _upload_input(
+            self.state, "fiber", "fiber-1", revised,
+            base_revision=first["revision"])
+
+        second = self.state.finalize_upload(replacement)["input"]
+        with self.assertRaises(ApiError) as stale:
+            self.state.finalize_upload(retry)
+
+        self.assertEqual(stale.exception.status, 409)
+        self.assertEqual(stale.exception.payload["current_revision"],
+                         second["revision"])
+        self.assertTrue(Path(first["path"]).exists())
 
     def test_finalize_rejects_missing_files_and_digest_mismatch(self):
         self._session()
@@ -2702,6 +2774,88 @@ class CommitTests(unittest.TestCase):
         self.assertEqual(
             (self.dataset / "fibers" / "fiber-9.json").read_bytes(),
             revised["fiber.json"])
+
+    def test_run_incorporation_contains_automatic_commit_failure(self):
+        first = self._finalize("fiber", "fiber-9", FIBER_FILES)
+        record = self.state.ephemeral_records.find("fiber", "fiber-9")
+        self.state.ephemeral_records.mark_incorporated([record])
+        self.state.commit_inputs()
+
+        document = json.loads(FIBER_FILES["fiber.json"])
+        document["generation"] = 2
+        revised = {"fiber.json": json.dumps(document).encode()}
+        second = self.state.finalize_upload(_upload_input(
+            self.state, "fiber", "fiber-9", revised,
+            base_revision=first["revision"]))["input"]
+        _planned_run(self.state, {"iterations": 1})
+        _, pending, mark, _, _ = self.session.run_calls[-1]
+
+        with mock.patch.object(
+                self.state, "_auto_commit_fiber",
+                side_effect=FileLockUnavailable("busy")):
+            mark(pending)
+
+        self.assertEqual(record.incorporation, "incorporated")
+        self.assertEqual(record.incorporated_revision, second["revision"])
+        self.assertEqual(record.committed_revision, first["revision"])
+        self.assertEqual(record.error_revision, second["revision"])
+        self.assertIn("Automatic commit failed", record.error)
+
+        # An explicit retry persists the same revision and clears the stale
+        # persistence error without revisiting incorporation.
+        self.state.commit_inputs()
+        self.assertEqual(record.committed_revision, second["revision"])
+        self.assertIsNone(record.error)
+        self.assertIsNone(record.error_revision)
+
+    def test_fiber_commit_uses_immutable_revision_snapshot(self):
+        first = self._finalize("fiber", "fiber-9", FIBER_FILES)
+        first_path = Path(first["path"])
+        record = self.state.ephemeral_records.find("fiber", "fiber-9")
+        document = json.loads(FIBER_FILES["fiber.json"])
+        document["generation"] = 2
+        revised = {"fiber.json": json.dumps(document).encode()}
+        entered = threading.Event()
+        release = threading.Event()
+        errors = []
+        original_copy = spiral_service._copy_publish
+
+        def blocked_copy(source, destination, keep_source=False):
+            if Path(destination).name == "fiber-9.json":
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError("timed out waiting for revised fiber")
+            return original_copy(source, destination, keep_source)
+
+        def commit():
+            try:
+                self.state.commit_inputs()
+            except BaseException as exc:
+                errors.append(exc)
+
+        with mock.patch.object(
+                spiral_service, "_copy_publish", side_effect=blocked_copy):
+            thread = threading.Thread(target=commit)
+            thread.start()
+            self.assertTrue(entered.wait(2))
+            second = self.state.finalize_upload(_upload_input(
+                self.state, "fiber", "fiber-9", revised,
+                base_revision=first["revision"]))["input"]
+            # Idle cleanup must retain the source captured by the in-flight
+            # commit even though it is no longer the logical current path.
+            self.assertTrue(first_path.exists())
+            release.set()
+            thread.join(5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            (self.dataset / "fibers" / "fiber-9.json").read_bytes(),
+            FIBER_FILES["fiber.json"])
+        self.assertEqual(record.revision, second["revision"])
+        self.assertEqual(record.committed_revision, first["revision"])
+        self.assertTrue(record.auto_commit)
+        self.assertFalse(record.committed)
 
     def test_commit_refuses_a_record_whose_staged_copy_is_gone(self):
         record = self._finalize("patch", "patch-9", PATCH_FILES)

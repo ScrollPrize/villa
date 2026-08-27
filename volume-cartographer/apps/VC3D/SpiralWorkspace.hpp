@@ -234,6 +234,7 @@ private:
         QString snapshotPath;
         uint64_t latestGeneration = 0;
         uint64_t sentGeneration = 0;
+        uint64_t inFlightGeneration = 0;
         bool added = false;
         bool uploadInFlight = false;
     };
