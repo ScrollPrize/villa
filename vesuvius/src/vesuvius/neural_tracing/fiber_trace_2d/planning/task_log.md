@@ -37,3 +37,14 @@
 - Kept the experimental default Mixed cost at `0.5`: selecting `0.325` from a
   single crop would overfit the diagnostic. The measured command can pass
   `--bp-mixed-cost 0.325` explicitly.
+- Follow-up evaluation on the existing 1024-cube, 500-trace artifact used
+  `T=2.5`, Mixed cost `0.325`, 4941 perpendicular factors, and the noisier
+  0.9-dominance direction reference (209 Direction1, 157 Direction2, 134
+  Mixed). It converged in 164 iterations and 0.173 solver seconds.
+  `P(Mixed)` AUROC was `0.803727`. Ternary argmax assigned 26/134 Mixed
+  references and only 1/366 trusted references to Mixed. With the seed making
+  Direction1 H, trusted argmax contained two H/V reversals, both among
+  Direction2; Direction1 had 205 H, one Mixed, and three ties, while Direction2
+  had 154 V, two H, and one tie. The generated initial-direction, orientation-
+  projection, and Mixed-probability OBJ layers are under
+  `data/workdir3/fiber-crop-1024/bp-mixed/`.
