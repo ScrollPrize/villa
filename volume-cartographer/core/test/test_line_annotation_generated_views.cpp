@@ -1019,6 +1019,173 @@ TEST_CASE("line annotation automatic multi-control edit reconstructs the clicked
     CHECK(replacementLineIndex < prepared.controlPoints[2].optimizedIndex);
 }
 
+namespace {
+
+vc::lasagna::LineModel makeMergeTestLine(const std::vector<cv::Vec3d>& points)
+{
+    vc::lasagna::LineModel line;
+    line.points.reserve(points.size());
+    for (const auto& position : points) {
+        vc::lasagna::LinePoint point;
+        point.position = position;
+        point.sampledNormal.normal = {0.0, 0.0, 1.0};
+        point.sampledNormal.valid = true;
+        point.valid = true;
+        line.points.push_back(point);
+    }
+    line.displayFrameAnchorIndex = static_cast<int>(points.size() / 2);
+    return line;
+}
+
+vc3d::line_annotation::LineControlPoint makeMergeTestControl(
+    const cv::Vec3d& position,
+    double metricMarker)
+{
+    vc3d::line_annotation::LineControlPoint control;
+    control.volumePoint = position;
+    vc3d::line_annotation::FiberTraceSegmentMetadata metadata;
+    metadata.metric = metricMarker;
+    control.segmentToNext = metadata;
+    return control;
+}
+
+}  // namespace
+
+TEST_CASE("superseded solve merge adopts unedited spans and keeps edited ones")
+{
+    using vc3d::line_annotation::mergeSupersededSolveResult;
+    // Solve-start controls A,B,C,D. The solved line marks its interior
+    // points with y=1; the current (edited) line marks its untouched spans
+    // y=4 and the provisional edited spans y=2. Control vertices are shared
+    // exactly.
+    const cv::Vec3d A{1, 0, 0}, B{4, 0, 0}, C{7, 0, 0}, D{10, 0, 0};
+    const cv::Vec3d E{5.5, 0, 0};  // control inserted into span B-C mid-solve
+    const auto solvedLine = makeMergeTestLine({{0, 1, 0}, A, {2, 1, 0}, {3, 1, 0},
+                                               B, {5, 1, 0}, {6, 1, 0},
+                                               C, {8, 1, 0}, {9, 1, 0},
+                                               D, {11, 1, 0}, {12, 1, 0}});
+    const auto currentLine = makeMergeTestLine({{0, 4, 0}, A, {2, 4, 0}, {3, 4, 0},
+                                                B, {4.5, 2, 0}, E, {6.5, 2, 0},
+                                                C, {8, 4, 0}, {9, 4, 0},
+                                                D, {11, 4, 0}, {12, 4, 0}});
+    const std::vector<vc3d::line_annotation::LineControlPoint> solvedControls{
+        makeMergeTestControl(A, 100.0), makeMergeTestControl(B, 101.0),
+        makeMergeTestControl(C, 102.0), makeMergeTestControl(D, 103.0)};
+    const std::vector<vc3d::line_annotation::LineControlPoint> currentControls{
+        makeMergeTestControl(A, 0.0), makeMergeTestControl(B, 1.0),
+        makeMergeTestControl(E, 2.0), makeMergeTestControl(C, 3.0),
+        makeMergeTestControl(D, 4.0)};
+    const std::vector<size_t> controlMap{0, 1, 3, 4};
+    const std::vector<size_t> editedSpans{1, 2};
+
+    const auto merged = mergeSupersededSolveResult(
+        currentLine, currentControls, solvedLine, solvedControls,
+        controlMap, editedSpans, false);
+
+    REQUIRE(merged.mergeable);
+    CHECK(merged.adoptedSpans == std::vector<size_t>{0, 3});
+    CHECK(merged.rejectedSolvedSpans.empty());
+    // Piece provenance by y marker: head + spans A-B, C-D + tail from the
+    // solve (y=1 interiors), the edited spans B-E-C from the current line
+    // (y=2 interiors).
+    REQUIRE(merged.line.points.size() == 14);
+    CHECK(merged.line.points[0].position[1] == doctest::Approx(1.0));   // head
+    CHECK(merged.line.points[2].position[1] == doctest::Approx(1.0));   // A-B
+    CHECK(merged.line.points[5].position[1] == doctest::Approx(2.0));   // B-E
+    CHECK(merged.line.points[7].position[1] == doctest::Approx(2.0));   // E-C
+    CHECK(merged.line.points[9].position[1] == doctest::Approx(1.0));   // C-D
+    CHECK(merged.line.points.back().position[1] == doctest::Approx(1.0));  // tail
+    // Controls keep the CURRENT identity; adopted spans take the solved
+    // span metadata, edited spans keep their current metadata.
+    REQUIRE(merged.controls.size() == 5);
+    CHECK(*merged.controls[0].segmentToNext->metric == doctest::Approx(100.0));
+    CHECK(*merged.controls[1].segmentToNext->metric == doctest::Approx(1.0));
+    CHECK(*merged.controls[2].segmentToNext->metric == doctest::Approx(2.0));
+    CHECK(*merged.controls[3].segmentToNext->metric == doctest::Approx(102.0));
+    // Merged control indices are exact vertices in strictly increasing order.
+    CHECK(merged.controls[0].optimizedIndex == 1);
+    CHECK(merged.controls[1].optimizedIndex == 4);
+    CHECK(merged.controls[2].optimizedIndex == 6);
+    CHECK(merged.controls[3].optimizedIndex == 8);
+    CHECK(merged.controls[4].optimizedIndex == 11);
+
+    SUBCASE("a mid-solve config change keeps the current tails")
+    {
+        const auto guarded = mergeSupersededSolveResult(
+            currentLine, currentControls, solvedLine, solvedControls,
+            controlMap, editedSpans, true);
+        REQUIRE(guarded.mergeable);
+        CHECK(guarded.line.points.front().position[1] == doctest::Approx(4.0));
+        CHECK(guarded.line.points.back().position[1] == doctest::Approx(4.0));
+        CHECK(guarded.adoptedSpans == std::vector<size_t>{0, 3});
+    }
+
+    SUBCASE("a moved endpoint control rejects its spans")
+    {
+        auto movedControls = currentControls;
+        movedControls[4].volumePoint = {10, 0.5, 0};
+        auto movedLine = currentLine;
+        movedLine.points[11].position = {10, 0.5, 0};
+        const auto rejected = mergeSupersededSolveResult(
+            movedLine, movedControls, solvedLine, solvedControls,
+            controlMap, editedSpans, false);
+        REQUIRE(rejected.mergeable);
+        CHECK(rejected.adoptedSpans == std::vector<size_t>{0});
+        CHECK(rejected.rejectedSolvedSpans == std::vector<size_t>{3});
+        // The moved outer control also blocks the tail adoption.
+        CHECK(rejected.line.points.back().position[1] == doctest::Approx(4.0));
+    }
+}
+
+TEST_CASE("superseded solve merge handles collapses and malformed inputs")
+{
+    using vc3d::line_annotation::mergeSupersededSolveResult;
+    const cv::Vec3d A{1, 0, 0}, B{4, 0, 0}, C{7, 0, 0}, D{10, 0, 0};
+    const cv::Vec3d X{5.5, 0, 0};  // B and C collapsed into X mid-solve
+    const auto solvedLine = makeMergeTestLine({A, {2, 1, 0}, B, {5, 1, 0},
+                                               C, {8, 1, 0}, D});
+    const auto currentLine = makeMergeTestLine({A, {3, 2, 0}, X, {8, 2, 0}, D});
+    const std::vector<vc3d::line_annotation::LineControlPoint> solvedControls{
+        makeMergeTestControl(A, 100.0), makeMergeTestControl(B, 101.0),
+        makeMergeTestControl(C, 102.0), makeMergeTestControl(D, 103.0)};
+    const std::vector<vc3d::line_annotation::LineControlPoint> currentControls{
+        makeMergeTestControl(A, 0.0), makeMergeTestControl(X, 1.0),
+        makeMergeTestControl(D, 2.0)};
+    const std::vector<size_t> collapseMap{0, 1, 1, 2};
+
+    SUBCASE("collapse map adopts nothing and reports rejected coverage")
+    {
+        const auto merged = mergeSupersededSolveResult(
+            currentLine, currentControls, solvedLine, solvedControls,
+            collapseMap, {0, 1}, false);
+        REQUIRE(merged.mergeable);
+        CHECK(merged.adoptedSpans.empty());
+        CHECK(merged.rejectedSolvedSpans == std::vector<size_t>{0, 1});
+    }
+
+    SUBCASE("non-monotone or out-of-bounds maps are not mergeable")
+    {
+        CHECK_FALSE(mergeSupersededSolveResult(
+            currentLine, currentControls, solvedLine, solvedControls,
+            {0, 2, 1, 2}, {}, false).mergeable);
+        CHECK_FALSE(mergeSupersededSolveResult(
+            currentLine, currentControls, solvedLine, solvedControls,
+            {0, 1, 1, 9}, {}, false).mergeable);
+        CHECK_FALSE(mergeSupersededSolveResult(
+            currentLine, currentControls, solvedLine, solvedControls,
+            {0, 1, 1}, {}, false).mergeable);
+    }
+
+    SUBCASE("a current line violating the subset contract is not mergeable")
+    {
+        auto offLineControls = currentControls;
+        offLineControls[1].volumePoint = {5.5, 0.25, 0};  // no matching vertex
+        CHECK_FALSE(mergeSupersededSolveResult(
+            currentLine, offLineControls, solvedLine, solvedControls,
+            collapseMap, {0, 1}, false).mergeable);
+    }
+}
+
 TEST_CASE("line annotation geometric edit prepares the clicked span without a solver")
 {
     // Same fixture as the automatic multi-control edit above, but through

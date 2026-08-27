@@ -597,6 +597,9 @@ private:
     // is paid once, not per trigger.
     void handleGeneratedSideStripIntersectionQuery(const std::string& surfaceName);
     void dispatchSideStripIntersectionQuery(const std::string& surfaceName);
+    // Invalidate every side-strip query stamped so far (see the token-domain
+    // comment at the member declarations).
+    void invalidateSideStripQueries();
     // Cheap staleness proxy over everything the side-strip query reads (strip
     // surface identity, fiber data generation, each pane session's line
     // identity/epoch and branch count), computable without the all-fiber deep
@@ -1080,14 +1083,23 @@ private:
     // retirement) on the flushed saves having actually succeeded.
     uint64_t _fiberSaveFailureCount = 0;
     mutable std::shared_ptr<FiberSaveBatchTracker> _activeFiberSaveBatch;
+    // Side-strip query scheduling follows the render-job model: one active
+    // query (never cancelled by newer requests), one latest pending request,
+    // and results published even when superseded — they are fresher than
+    // what is displayed. All tokens are drawn from one monotonic sequence so
+    // they share a comparison domain:
+    // - _latestSideStripIntersectionToken: the newest scheduling intent
+    //   (dedupe of running/pending work).
+    // - _sideStripInvalidationWatermark: requests stamped BEFORE it are
+    //   invalid (pane closed, package switched, intentional clear) — the
+    //   only thing that cancels a running query or drops its result. The
+    //   shared atomic mirrors it for the worker's cancel callback.
+    // - _lastPublishedSideStripToken: monotonic publish guard.
     uint64_t _nextSideStripIntersectionToken = 0;
     uint64_t _latestSideStripIntersectionToken = 0;
-    // Token of the most recent full query that delivered its markers; the
-    // async branch-link preview shares its request's token and must not
-    // overwrite the complete result set with its branch-only subset when the
-    // full query wins the race.
-    uint64_t _completedSideStripIntersectionToken = 0;
-    std::shared_ptr<std::atomic<uint64_t>> _latestSideStripIntersectionTokenAtomic =
+    uint64_t _sideStripInvalidationWatermark = 0;
+    uint64_t _lastPublishedSideStripToken = 0;
+    std::shared_ptr<std::atomic<uint64_t>> _sideStripInvalidationWatermarkAtomic =
         std::make_shared<std::atomic<uint64_t>>(0);
     uint64_t _runningSideStripIntersectionToken = 0;
     uint64_t _runningSideStripIntersectionKey = 0;

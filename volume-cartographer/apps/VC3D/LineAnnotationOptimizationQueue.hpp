@@ -13,11 +13,12 @@ namespace vc3d::line_annotation {
 // without a session or a widget.
 //
 // One solve runs per session at a time. Control-point edits arriving while
-// one is in flight do not refuse: the handler applies its cheap geometric
-// update to the session immediately, records the union of dirty spans here,
-// and the running solve - now describing a session that no longer exists -
-// is refused publication through the epoch and superseded by one solve over
-// the union when it finishes.
+// one is in flight do not refuse AND do not cancel it: the handler applies
+// its cheap geometric update to the session immediately and records the
+// union of dirty spans here. When the running solve finishes, the epoch
+// mismatch refuses wholesale publication; the controller span-merges the
+// result instead (adopting every span the edits did not touch) and then
+// dispatches one solve over the pending union.
 //
 // The epoch is the publication token: it advances on every session-geometry
 // mutation (noteSessionMutated), and a solve may only publish into the epoch

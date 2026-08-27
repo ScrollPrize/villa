@@ -1494,6 +1494,199 @@ std::optional<std::vector<size_t>> orderedControlPointLineIndices(
     return lineIndices;
 }
 
+MergedSupersededSolve mergeSupersededSolveResult(
+    const vc::lasagna::LineModel& currentLine,
+    const std::vector<LineControlPoint>& currentControls,
+    const vc::lasagna::LineModel& solvedLine,
+    const std::vector<LineControlPoint>& solvedControls,
+    const std::vector<size_t>& controlMap,
+    const std::vector<size_t>& editedSpans,
+    bool configChanged)
+{
+    MergedSupersededSolve out;
+    if (currentControls.empty() || solvedControls.empty() ||
+        controlMap.size() != solvedControls.size()) {
+        return out;
+    }
+    // The map must land inside the current controls and be monotone
+    // non-decreasing (edits only insert or collapse; they never reorder).
+    for (size_t j = 0; j < controlMap.size(); ++j) {
+        if (controlMap[j] >= currentControls.size() ||
+            (j > 0 && controlMap[j] < controlMap[j - 1])) {
+            return out;
+        }
+    }
+    const auto positionsOf = [](const std::vector<LineControlPoint>& controls) {
+        std::vector<cv::Vec3d> positions;
+        positions.reserve(controls.size());
+        for (const auto& control : controls) {
+            positions.push_back(control.volumePoint);
+        }
+        return positions;
+    };
+    const auto linePositionsOf = [](const vc::lasagna::LineModel& line) {
+        std::vector<cv::Vec3d> positions;
+        positions.reserve(line.points.size());
+        for (const auto& point : line.points) {
+            positions.push_back(point.position);
+        }
+        return positions;
+    };
+    // Both inputs must already satisfy the exact-ordered-subset contract; a
+    // session mutated by a path that does not maintain it (legacy states)
+    // simply is not mergeable.
+    const std::vector<cv::Vec3d> currentPoints = linePositionsOf(currentLine);
+    const std::vector<cv::Vec3d> solvedPoints = linePositionsOf(solvedLine);
+    const auto currentIndices =
+        orderedControlPointLineIndices(positionsOf(currentControls), currentPoints);
+    const auto solvedIndices =
+        orderedControlPointLineIndices(positionsOf(solvedControls), solvedPoints);
+    if (!currentIndices || !solvedIndices) {
+        return out;
+    }
+    const std::vector<size_t>& cIdx = *currentIndices;
+    const std::vector<size_t>& sIdx = *solvedIndices;
+
+    const size_t currentSpanCount = currentControls.size() - 1;
+    // Unique (by monotonicity) solved span for each current span, where one
+    // exists: solved span j covers current span controlMap[j] only when no
+    // control was inserted into or collapsed out of it.
+    std::vector<int> solvedSpanForCurrentSpan(currentSpanCount, -1);
+    for (size_t j = 0; j + 1 < controlMap.size(); ++j) {
+        if (controlMap[j] + 1 == controlMap[j + 1]) {
+            solvedSpanForCurrentSpan[controlMap[j]] = static_cast<int>(j);
+        }
+    }
+    constexpr double kMatchEpsilon = 1.0e-8;
+    constexpr double kMaxDistanceSq = kMatchEpsilon * kMatchEpsilon;
+    const auto endpointsMatch = [&](size_t solvedControl, size_t currentControl) {
+        const cv::Vec3d delta = solvedControls[solvedControl].volumePoint -
+                                currentControls[currentControl].volumePoint;
+        return delta.dot(delta) <= kMaxDistanceSq;
+    };
+    const auto spanEdited = [&](size_t span) {
+        return std::binary_search(editedSpans.begin(), editedSpans.end(), span);
+    };
+
+    std::vector<bool> adopt(currentSpanCount, false);
+    for (size_t i = 0; i < currentSpanCount; ++i) {
+        const int j = solvedSpanForCurrentSpan[i];
+        adopt[i] = j >= 0 && !spanEdited(i) &&
+                   endpointsMatch(static_cast<size_t>(j), i) &&
+                   endpointsMatch(static_cast<size_t>(j) + 1, i + 1);
+    }
+    // The extrapolated tails belong to no span: adopt them only when the
+    // outer control is unchanged and no solver-input configuration (the
+    // extrapolation distance) changed while the solve ran.
+    const bool adoptHead =
+        !configChanged && controlMap.front() == 0 && endpointsMatch(0, 0);
+    const bool adoptTail = !configChanged &&
+        controlMap.back() == currentControls.size() - 1 &&
+        endpointsMatch(solvedControls.size() - 1, currentControls.size() - 1);
+
+    // Left-to-right assembly from half-open pieces: every control vertex is
+    // the first point of the piece to its right (the last control's vertex
+    // opens the tail piece), so shared vertices are emitted exactly once and
+    // each control's merged index is the size of the output at its piece
+    // boundary. LinePoints are copied whole — normals travel with their
+    // geometry, from whichever line the piece came from.
+    out.line.points.clear();
+    const auto appendPiece = [&out](const vc::lasagna::LineModel& source,
+                                    size_t begin,
+                                    size_t end) {
+        for (size_t k = begin; k < end && k < source.points.size(); ++k) {
+            out.line.points.push_back(source.points[k]);
+        }
+    };
+    std::vector<size_t> mergedControlIndices(currentControls.size(), 0);
+    if (adoptHead) {
+        appendPiece(solvedLine, 0, sIdx.front());
+    } else {
+        appendPiece(currentLine, 0, cIdx.front());
+    }
+    for (size_t i = 0; i < currentSpanCount; ++i) {
+        mergedControlIndices[i] = out.line.points.size();
+        if (adopt[i]) {
+            const auto j = static_cast<size_t>(solvedSpanForCurrentSpan[i]);
+            appendPiece(solvedLine, sIdx[j], sIdx[j + 1]);
+        } else {
+            appendPiece(currentLine, cIdx[i], cIdx[i + 1]);
+        }
+    }
+    mergedControlIndices.back() = out.line.points.size();
+    if (adoptTail) {
+        appendPiece(solvedLine, sIdx.back(), solvedLine.points.size());
+    } else {
+        appendPiece(currentLine, cIdx.back(), currentLine.points.size());
+    }
+
+    out.controls = currentControls;
+    for (size_t i = 0; i < currentSpanCount; ++i) {
+        if (adopt[i]) {
+            const auto j = static_cast<size_t>(solvedSpanForCurrentSpan[i]);
+            out.controls[i].segmentToNext = solvedControls[j].segmentToNext;
+        }
+    }
+    for (size_t k = 0; k < out.controls.size(); ++k) {
+        out.controls[k].optimizedIndex =
+            static_cast<int>(mergedControlIndices[k]);
+        out.controls[k].linePosition =
+            static_cast<double>(mergedControlIndices[k]);
+    }
+
+    // Output contract check, mirroring the publication guard: the merged
+    // controls must be an exact ordered subset of the merged line at exactly
+    // the indices computed above, strictly increasing.
+    const auto verify = orderedControlPointLineIndices(positionsOf(out.controls),
+                                                       linePositionsOf(out.line));
+    if (!verify || *verify != mergedControlIndices) {
+        return out;
+    }
+    for (size_t k = 1; k < mergedControlIndices.size(); ++k) {
+        if (mergedControlIndices[k] <= mergedControlIndices[k - 1]) {
+            return out;
+        }
+    }
+
+    // displayFrameAnchorIndex: nearest valid-normal vertex to the center,
+    // the same rule the splice path uses.
+    int bestAnchor = -1;
+    double bestAnchorDistance = std::numeric_limits<double>::infinity();
+    const double center =
+        static_cast<double>(out.line.points.size() - 1) * 0.5;
+    for (size_t k = 0; k < out.line.points.size(); ++k) {
+        if (!out.line.points[k].valid) {
+            continue;
+        }
+        const double distance = std::abs(static_cast<double>(k) - center);
+        if (distance < bestAnchorDistance) {
+            bestAnchorDistance = distance;
+            bestAnchor = static_cast<int>(k);
+        }
+    }
+    if (bestAnchor < 0) {
+        return out;
+    }
+    out.line.displayFrameAnchorIndex = bestAnchor;
+
+    for (size_t j = 0; j + 1 < controlMap.size(); ++j) {
+        const bool adjacent = controlMap[j] + 1 == controlMap[j + 1];
+        if (adjacent && adopt[controlMap[j]]) {
+            out.adoptedSpans.push_back(controlMap[j]);
+        } else if (adjacent) {
+            out.rejectedSolvedSpans.push_back(controlMap[j]);
+        } else if (controlMap[j] != controlMap[j + 1]) {
+            // The solved span straddles inserted controls: its coverage maps
+            // onto several current spans; re-solving those exactly is what
+            // the edits' own pending spans request, so nothing extra is
+            // needed. A collapsed span (equal map entries) has no current
+            // counterpart at all — its geometry was replaced by the edit.
+        }
+    }
+    out.mergeable = true;
+    return out;
+}
+
 std::optional<FiberSplitPlan> computeFiberSplitPlan(
     const std::vector<cv::Vec3d>& controlPoints,
     const std::vector<cv::Vec3d>& linePoints,

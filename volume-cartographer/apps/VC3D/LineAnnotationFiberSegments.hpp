@@ -271,6 +271,44 @@ void validateStoredControlPoints(const std::vector<StoredControlPoint>& controls
     const std::vector<cv::Vec3d>& controlPoints,
     const std::vector<cv::Vec3d>& linePoints);
 
+// Publish a superseded solve by span merge (render-job model: edits no
+// longer cancel the in-flight solve, and its landing must not be discarded
+// wholesale). The merged line keeps the CURRENT session's controls — their
+// identity, branches, and goals are authoritative — and adopts the solved
+// geometry for every span the edits did not touch: span i adopts solved
+// span j iff controlMap[j] == i && controlMap[j+1] == i+1 (no control was
+// inserted or collapsed inside), i is not in editedSpans, and the solved
+// span's endpoint controls sit exactly (1e-8, the loader tolerance) on the
+// current controls. The head/tail extrapolations are adopted only when the
+// outer controls are unchanged and no solver-input config changed mid-solve.
+// Pieces are copied as whole LinePoints — positions AND normals — from
+// either line; the helper is pure (no sampler, no I/O, deterministic).
+// Inputs and output are validated against the exact-ordered-subset contract;
+// a violation anywhere returns mergeable == false and the caller falls back
+// to the discard-and-redispatch path.
+struct MergedSupersededSolve {
+    bool mergeable = false;
+    vc::lasagna::LineModel line;
+    std::vector<LineControlPoint> controls;
+    // Current-numbering spans whose geometry was adopted from the solve.
+    std::vector<size_t> adoptedSpans;
+    // Solved spans NOT adopted but expressible in the current numbering —
+    // the caller folds them back into the pending union so their coverage
+    // is not silently dropped. Spans that straddle inserted controls or
+    // collapsed away need nothing here: the edits that reshaped them already
+    // recorded their own pending spans.
+    std::vector<size_t> rejectedSolvedSpans;
+};
+
+[[nodiscard]] MergedSupersededSolve mergeSupersededSolveResult(
+    const vc::lasagna::LineModel& currentLine,
+    const std::vector<LineControlPoint>& currentControls,
+    const vc::lasagna::LineModel& solvedLine,
+    const std::vector<LineControlPoint>& solvedControls,
+    const std::vector<size_t>& controlMap,
+    const std::vector<size_t>& editedSpans,
+    bool configChanged);
+
 [[nodiscard]] std::vector<cv::Vec3d> storedControlPointPositions(const std::vector<StoredControlPoint>& controls);
 [[nodiscard]] std::vector<vc::lasagna::LineControlPoint> optimizerControlPoints(const std::vector<LineControlPoint>& controls);
 [[nodiscard]] std::vector<LineControlPoint> mergeOptimizerControlPoints(

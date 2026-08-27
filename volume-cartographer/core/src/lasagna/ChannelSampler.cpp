@@ -904,25 +904,18 @@ std::shared_ptr<const LasagnaCachedChunk> LasagnaChannelChunkCache::load(
     }
 
     if (!ownsRequest) {
-        // Bounded wait: a hung remote read must never park this caller
-        // forever (the GUI thread can land here when it samples a chunk a
-        // worker is already fetching). Past the budget, read the chunk
-        // independently - a duplicate fetch, but correct data and a bounded
-        // stall - instead of inheriting the stuck loader's fate.
-        constexpr auto kInFlightWaitBudget = std::chrono::seconds(10);
+        // Wait on the shared in-flight load without a deadline: a timed-out
+        // duplicate read fans out extra source fetches without actually
+        // bounding anything (the duplicate itself has no timeout). The
+        // owner's read carries the source layer's own deadlines, and its
+        // error is stored and rethrown here, so followers share its fate
+        // exactly once.
         std::unique_lock<std::mutex> lock(request->mutex);
-        const bool finished = request->finished.wait_for(
-            lock, kInFlightWaitBudget, [&]() { return request->done; });
-        if (finished) {
-            if (request->error) {
-                std::rethrow_exception(request->error);
-            }
-            return request->bytes;
+        request->finished.wait(lock, [&]() { return request->done; });
+        if (request->error) {
+            std::rethrow_exception(request->error);
         }
-        lock.unlock();
-        auto bytes = readSourceChunk(binding, array, key);
-        store(key, bytes);
-        return bytes;
+        return request->bytes;
     }
 
     std::shared_ptr<const LasagnaCachedChunk> bytes;

@@ -28,6 +28,9 @@ private slots:
         QVERIFY(!queue.beginSolve(second));
     }
 
+    // A mutation refuses WHOLESALE publication: the controller routes an
+    // epoch-mismatched landing through the span-merge path (or the discard
+    // fallback) instead of installing the result directly.
     void mutationRefusesInFlightPublication()
     {
         OptimizationCoalescingQueue queue;
