@@ -1137,6 +1137,166 @@ TEST_CASE("superseded solve merge adopts unedited spans and keeps edited ones")
     }
 }
 
+TEST_CASE("interpolated splice re-indexes the old range's normals without sampling")
+{
+    using vc3d::line_annotation::spliceLineModelWithInterpolatedNormals;
+    // Previous line: 8 points along x, normals tagged by y so provenance is
+    // checkable ((0, tag, 1) normalized is fine for the checks below).
+    std::vector<cv::Vec3d> previousPoints;
+    vc::lasagna::LineModel previous;
+    for (int i = 0; i < 8; ++i) {
+        vc::lasagna::LinePoint point;
+        point.position = {static_cast<double>(i), 0.0, 0.0};
+        point.sampledNormal.normal = {0.0, 0.1 * i, 1.0};
+        point.sampledNormal.valid = true;
+        point.valid = true;
+        previous.points.push_back(point);
+    }
+    previous.displayFrameAnchorIndex = 4;
+
+    SUBCASE("grow: replaced range [2,5) becomes 5 points, endpoints map exactly")
+    {
+        std::vector<cv::Vec3d> points;
+        for (int i = 0; i < 2; ++i) points.push_back({static_cast<double>(i), 0, 0});
+        for (int k = 0; k < 5; ++k) points.push_back({2.0 + 0.5 * k, 0.1, 0});
+        for (int i = 5; i < 8; ++i) points.push_back({static_cast<double>(i), 0, 0});
+        const auto model =
+            spliceLineModelWithInterpolatedNormals(previous, points, 2, 5);
+        REQUIRE(model.points.size() == 10);
+        // Prefix and suffix carry.
+        CHECK(model.points[1].sampledNormal.normal[1] == doctest::Approx(0.1));
+        CHECK(model.points[9].sampledNormal.normal[1] == doctest::Approx(0.7));
+        // Replaced-range endpoints map exactly to old indices 2 and 4.
+        CHECK(model.points[2].sampledNormal.normal[1] == doctest::Approx(0.2));
+        CHECK(model.points[6].sampledNormal.normal[1] == doctest::Approx(0.4));
+        // Interior takes proportionally re-indexed authoritative samples.
+        CHECK(model.points[4].sampledNormal.normal[1] == doctest::Approx(0.3));
+        CHECK(model.points[4].valid);
+    }
+
+    SUBCASE("full-range replacement still has normals and an anchor")
+    {
+        std::vector<cv::Vec3d> points;
+        for (int k = 0; k < 12; ++k) points.push_back({k * 7.0 / 11.0, 0.2, 0});
+        const auto model =
+            spliceLineModelWithInterpolatedNormals(previous, points, 0, 12);
+        REQUIRE(model.points.size() == 12);
+        CHECK(model.points.front().valid);
+        CHECK(model.points.back().sampledNormal.normal[1] ==
+              doctest::Approx(0.7));
+        CHECK(model.displayFrameAnchorIndex >= 0);
+    }
+
+    SUBCASE("pure insertion blends hemisphere-aligned boundary normals")
+    {
+        auto flipped = previous;
+        // Right neighbourhood stored with opposite sign: physically the same
+        // axis; the blend must hemisphere-align, not cancel.
+        for (int i = 4; i < 8; ++i) {
+            flipped.points[static_cast<size_t>(i)].sampledNormal.normal =
+                -flipped.points[static_cast<size_t>(i)].sampledNormal.normal;
+        }
+        std::vector<cv::Vec3d> points;
+        for (int i = 0; i < 4; ++i) points.push_back({static_cast<double>(i), 0, 0});
+        points.push_back({3.5, 0.05, 0});  // inserted, no old counterpart
+        for (int i = 4; i < 8; ++i) points.push_back({static_cast<double>(i), 0, 0});
+        const auto model =
+            spliceLineModelWithInterpolatedNormals(flipped, points, 4, 1);
+        REQUIRE(model.points.size() == 9);
+        const auto& inserted = model.points[4].sampledNormal;
+        REQUIRE(inserted.valid);
+        // Aligned blend of (0,.3,1) and +(0,.4,1): z stays positive and
+        // large; a raw blend with the stored -(0,.4,1) would nearly cancel.
+        CHECK(inserted.normal[2] > 0.9);
+        CHECK(cv::norm(inserted.normal) == doctest::Approx(1.0));
+    }
+
+    SUBCASE("unknown range falls back to 3D-nearest transfer")
+    {
+        std::vector<cv::Vec3d> points;
+        points.push_back({0.0, 0, 0});
+        points.push_back({0.25, 0, 0});  // near old index 0
+        points.push_back({6.9, 0, 0});   // near old index 7
+        const auto model =
+            spliceLineModelWithInterpolatedNormals(previous, points, -1, 0);
+        REQUIRE(model.points.size() == 3);
+        CHECK(model.points[1].sampledNormal.normal[1] == doctest::Approx(0.0));
+        CHECK(model.points[2].sampledNormal.normal[1] == doctest::Approx(0.7));
+    }
+
+    SUBCASE("empty previous model throws")
+    {
+        const vc::lasagna::LineModel empty;
+        CHECK_THROWS(spliceLineModelWithInterpolatedNormals(
+            empty, {{0, 0, 0}}, 0, 1));
+    }
+
+    SUBCASE("the interpolated model builds line view surfaces")
+    {
+        std::vector<cv::Vec3d> points;
+        for (int i = 0; i < 2; ++i) points.push_back({static_cast<double>(i), 0, 0});
+        for (int k = 0; k < 5; ++k) points.push_back({2.0 + 0.5 * k, 0.1, 0});
+        for (int i = 5; i < 8; ++i) points.push_back({static_cast<double>(i), 0, 0});
+        const auto model =
+            spliceLineModelWithInterpolatedNormals(previous, points, 2, 5);
+        vc::lasagna::LineViewConfig config;
+        config.buildLineZSlices = false;
+        const auto views = vc::lasagna::buildLineViewSurfaces(model, config);
+        CHECK(views.lineSurface != nullptr);
+        CHECK(views.lineUpVectors.size() == model.points.size());
+    }
+}
+
+TEST_CASE("superseded solve merge joins spans of different normal provenance")
+{
+    using vc3d::line_annotation::mergeSupersededSolveResult;
+    // A protected (edited, provisional-normal) span joined to an adopted
+    // (solved, fresh-normal) span: the seam discontinuity is an accepted
+    // transient until the follow-up solve lands, but it must assemble
+    // cleanly — each side keeps its own provenance, one shared vertex, and
+    // the merged model still builds.
+    const cv::Vec3d A{1, 0, 0}, B{4, 0, 0}, C{7, 0, 0};
+    auto tag = [](vc::lasagna::LineModel& line, size_t from, size_t to,
+                  double yTag) {
+        for (size_t i = from; i < to && i < line.points.size(); ++i) {
+            line.points[i].sampledNormal.normal = {0.0, yTag, 1.0};
+        }
+    };
+    auto solvedLine = makeMergeTestLine({{0, 0, 0}, A, {2, 0, 0}, {3, 0, 0},
+                                         B, {5, 0, 0}, {6, 0, 0}, C, {8, 0, 0}});
+    tag(solvedLine, 0, solvedLine.points.size(), 0.9);  // fresh normals
+    auto currentLine = makeMergeTestLine({{0, 0, 0}, A, {2, 0, 0}, {3, 0, 0},
+                                          B, {5, 0.2, 0}, {6, 0.2, 0}, C,
+                                          {8, 0, 0}});
+    tag(currentLine, 0, currentLine.points.size(), 0.1);  // provisional
+    const std::vector<vc3d::line_annotation::LineControlPoint> solvedControls{
+        makeMergeTestControl(A, 0), makeMergeTestControl(B, 1),
+        makeMergeTestControl(C, 2)};
+    const std::vector<vc3d::line_annotation::LineControlPoint> currentControls{
+        makeMergeTestControl(A, 0), makeMergeTestControl(B, 1),
+        makeMergeTestControl(C, 2)};
+
+    const auto merged = mergeSupersededSolveResult(
+        currentLine, currentControls, solvedLine, solvedControls,
+        {0, 1, 2}, {1}, false);
+
+    REQUIRE(merged.mergeable);
+    CHECK(merged.adoptedSpans == std::vector<size_t>{0});
+    // Span A-B interior carries solved normals, span B-C interior carries
+    // provisional normals; exactly one B vertex.
+    CHECK(merged.line.points[2].sampledNormal.normal[1] == doctest::Approx(0.9));
+    CHECK(merged.line.points[5].sampledNormal.normal[1] == doctest::Approx(0.1));
+    size_t bCount = 0;
+    for (const auto& point : merged.line.points) {
+        if (cv::norm(point.position - B) < 1e-12) ++bCount;
+    }
+    CHECK(bCount == 1);
+    vc::lasagna::LineViewConfig config;
+    config.buildLineZSlices = false;
+    CHECK(vc::lasagna::buildLineViewSurfaces(merged.line, config).lineSurface !=
+          nullptr);
+}
+
 TEST_CASE("superseded solve merge protects tails when the adjacent outer span was edited")
 {
     using vc3d::line_annotation::mergeSupersededSolveResult;

@@ -7309,10 +7309,13 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     vc::lasagna::LineModel preparedLine;
     try {
         // Purely geometric prepare: provisional display geometry only, in
-        // microseconds and without solver or volume access - the freeze this
-        // used to cause was up to four synchronous Ceres solves. The
-        // asynchronous fiber-mode re-optimization dispatched below rebuilds
-        // the dirty spans properly (per-span rollouts, native traces) and
+        // microseconds and with NO GUI-thread chunk sampling - the freeze
+        // this used to cause was up to four synchronous Ceres solves, and a
+        // residual one was the splice resampling normals through the chunk
+        // cache. Provisional normals are re-indexed/interpolated from the
+        // previous model instead; the asynchronous fiber-mode
+        // re-optimization dispatched below rebuilds the dirty spans properly
+        // (per-span rollouts, native traces, authoritative normals) and
         // replaces this geometry when it lands.
         const int initialCenterlineLengthVx = pane->dialog
             ? std::max(2, pane->dialog->extrapolationDistanceVx() * 2)
@@ -7326,11 +7329,11 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
             clicked,
             discretization.segmentLength);
         preparedLine = prepared.lineReconstructed
-            ? lineModelFromPointsSplicing(session.optimizedLine,
-                                          prepared.linePoints,
-                                          prepared.replacedStart,
-                                          prepared.replacedCount,
-                                          session.normalSampler.get())
+            ? vc3d::line_annotation::spliceLineModelWithInterpolatedNormals(
+                  session.optimizedLine,
+                  prepared.linePoints,
+                  prepared.replacedStart,
+                  prepared.replacedCount)
             : session.optimizedLine;
     } catch (const std::exception& ex) {
         showError(tr("Could not update line control point: %1")
@@ -13316,6 +13319,14 @@ void LineAnnotationController::dispatchSideStripIntersectionQuery(
         _lastSideStripIntersectionSurfaceName == surfaceName &&
         !_lastSideStripFingerprint.isEmpty() &&
         fingerprint == _lastSideStripFingerprint) {
+        // The cache satisfies this surface's LATEST intent: a queued older
+        // request would otherwise still run, publish obsolete work, and only
+        // then be caught up (visible A -> B -> pending -> A oscillation).
+        _pendingSideStripIntersectionRequests.erase(surfaceName);
+        refreshLatestSideStripIntersectionToken();
+        pane->dialog->setGeneratedSideStripIntersectionBusy(
+            _sideStripIntersectionRunning &&
+            _runningSideStripIntersectionSurfaceName == surfaceName);
         pane->dialog->setGeneratedFiberIntersectionMarkers(
             markLinkCandidateFiberIntersections(_lastSideStripIntersectionMarkers,
                                                 pane->session->branches));
@@ -13390,6 +13401,11 @@ void LineAnnotationController::dispatchSideStripIntersectionQuery(
         _lastSideStripIntersectionKey != 0 &&
         request.cacheKey == _lastSideStripIntersectionKey &&
         request.surfaceName == _lastSideStripIntersectionSurfaceName) {
+        // Defensive only: pending entries exist only while a query runs, so
+        // this idle gate cannot normally have one to retire.
+        _pendingSideStripIntersectionRequests.erase(request.surfaceName);
+        refreshLatestSideStripIntersectionToken();
+        pane->dialog->setGeneratedSideStripIntersectionBusy(false);
         pane->dialog->setGeneratedFiberIntersectionMarkers(
             markLinkCandidateFiberIntersections(_lastSideStripIntersectionMarkers,
                                                 pane->session->branches));
@@ -13822,7 +13838,9 @@ void LineAnnotationController::finishSideStripIntersectionQuery(
                     pane->dialog->setGeneratedSideStripIntersectionResult(markerCount);
                 }
             } else {
-                pane->dialog->setGeneratedFiberIntersectionMarkers({});
+                // Deliberately keep whatever markers are displayed (possibly
+                // a cache-served set): a failed refresh must not blank a
+                // valid display; the error state still shows.
                 if (!samePanePending) {
                     pane->dialog->setGeneratedSideStripIntersectionError();
                 }
@@ -13859,14 +13877,17 @@ void LineAnnotationController::finishSideStripIntersectionQuery(
         pending.token = ++_nextSideStripIntersectionToken;
         _latestSideStripIntersectionToken = pending.token;
         startSideStripIntersectionQuery(std::move(pending));
-    } else if (!invalidated && result.ok && !result.surfaceName.empty()) {
+    }
+    if (!invalidated && result.ok && !result.surfaceName.empty()) {
         // The render scheduler's post-adoption catch-up: the displayed state
         // may still lag the latest inputs (A -> B -> A orderings dedupe the
-        // third request against the active first). Re-run the standard
-        // debounced query; its fingerprint and reuse-cache gates make it a
-        // no-op whenever the published result already matches. Failed or
-        // invalidated results deliberately do NOT catch up: a persistent
-        // failure would otherwise re-run (and re-show its error) forever.
+        // third request against the active first). Unconditional on every
+        // successful publish — starting a queued OTHER surface above must
+        // not suppress this surface's convergence. The debounced re-dispatch
+        // is a fingerprint/reuse-gated no-op whenever the published result
+        // already matches. Failed or invalidated results deliberately do NOT
+        // catch up: a persistent failure would otherwise re-run (and re-show
+        // its error) forever.
         handleGeneratedSideStripIntersectionQuery(result.surfaceName);
     }
     if (!deferredError.isEmpty()) {
@@ -14574,82 +14595,6 @@ vc::lasagna::LineModel LineAnnotationController::lineModelFromPoints(
     return model;
 }
 
-vc::lasagna::LineModel LineAnnotationController::lineModelFromPointsSplicing(
-    const vc::lasagna::LineModel& previous,
-    const std::vector<cv::Vec3d>& points,
-    int replacedStart,
-    int replacedCount,
-    const vc::lasagna::NormalSampler* normalSampler)
-{
-    const int newSize = static_cast<int>(points.size());
-    const int oldSize = static_cast<int>(previous.points.size());
-    const int delta = newSize - oldSize;
-    const int suffixStart = replacedStart + replacedCount;
-    const bool spliceable = replacedStart >= 0 && replacedCount >= 0 &&
-                            suffixStart <= newSize && replacedStart <= oldSize &&
-                            suffixStart - delta >= replacedStart &&
-                            suffixStart - delta <= oldSize;
-    if (!spliceable) {
-        return lineModelFromPoints(points, normalSampler);
-    }
-    if (points.empty()) {
-        throw std::runtime_error("Fiber has no line points");
-    }
-    if (!normalSampler) {
-        throw std::runtime_error("No Lasagna normal sampler is available for this fiber");
-    }
-
-    std::vector<vc::lasagna::NormalSampleWithDerivative> samples;
-    if (replacedCount > 0) {
-        const std::vector<cv::Vec3d> replacedPoints(
-            points.begin() + replacedStart, points.begin() + suffixStart);
-        const vc::lasagna::NormalBatchReport batchReport =
-            normalSampler->sampleNormalBatch(replacedPoints, false, samples);
-        (void)batchReport;
-        if (samples.size() != replacedPoints.size()) {
-            throw std::runtime_error("Normal sampler returned the wrong number of samples");
-        }
-    }
-
-    vc::lasagna::LineModel model;
-    model.points.reserve(points.size());
-    int bestAnchor = -1;
-    double bestAnchorDistance = std::numeric_limits<double>::infinity();
-    const double center = static_cast<double>(points.size() - 1) * 0.5;
-    for (int i = 0; i < newSize; ++i) {
-        vc::lasagna::LinePoint linePoint;
-        linePoint.position = points[static_cast<size_t>(i)];
-        if (i < replacedStart) {
-            linePoint.sampledNormal = previous.points[static_cast<size_t>(i)].sampledNormal;
-            linePoint.valid = previous.points[static_cast<size_t>(i)].valid;
-        } else if (i >= suffixStart) {
-            const auto& carried = previous.points[static_cast<size_t>(i - delta)];
-            linePoint.sampledNormal = carried.sampledNormal;
-            linePoint.valid = carried.valid;
-        } else {
-            linePoint.sampledNormal = samples[static_cast<size_t>(i - replacedStart)].sample;
-            linePoint.sampledNormal.normal =
-                normalizedOrZero(linePoint.sampledNormal.normal);
-            linePoint.sampledNormal.valid =
-                linePoint.sampledNormal.valid &&
-                finiteDirection(linePoint.sampledNormal.normal);
-            linePoint.valid = linePoint.sampledNormal.valid;
-        }
-        if (linePoint.valid) {
-            const double distance = std::abs(static_cast<double>(i) - center);
-            if (distance < bestAnchorDistance) {
-                bestAnchorDistance = distance;
-                bestAnchor = i;
-            }
-        }
-        model.points.push_back(std::move(linePoint));
-    }
-    if (bestAnchor < 0) {
-        throw std::runtime_error("Fiber line points have no valid sampled normals");
-    }
-    model.displayFrameAnchorIndex = bestAnchor;
-    return model;
-}
 
 vc::lasagna::LineModel LineAnnotationController::syntheticLineModelFromPoints(
     const std::vector<cv::Vec3d>& points)

@@ -300,6 +300,25 @@ struct MergedSupersededSolve {
     std::vector<size_t> rejectedSolvedSpans;
 };
 
+// The click path's provisional splice: replaces the dense line's
+// [replacedStart, replacedStart + replacedCount) range with the given points,
+// deriving the range's normals WITHOUT any volume access (the review-directed
+// contract: provisional geometry reuses/interpolates normals; authoritative
+// resampling belongs to the background solve). Prefix/suffix points carry the
+// previous model's LinePoints positionally. The replaced range re-indexes the
+// OLD replaced range's authoritative normals proportionally; a pure insertion
+// (no old points in the range) blends the nearest valid boundary normals,
+// hemisphere-aligned first (the LineViewBuilder display-interpolation
+// convention). Non-spliceable ranges fall back to 3D-nearest normal transfer.
+// The display anchor prefers carried/re-indexed normals over blended ones,
+// and a blended anchor must not be parallel to the local tangent. Throws when
+// `previous` is empty (nothing to interpolate from) or no anchor exists.
+[[nodiscard]] vc::lasagna::LineModel spliceLineModelWithInterpolatedNormals(
+    const vc::lasagna::LineModel& previous,
+    const std::vector<cv::Vec3d>& points,
+    int replacedStart,
+    int replacedCount);
+
 [[nodiscard]] MergedSupersededSolve mergeSupersededSolveResult(
     const vc::lasagna::LineModel& currentLine,
     const std::vector<LineControlPoint>& currentControls,
