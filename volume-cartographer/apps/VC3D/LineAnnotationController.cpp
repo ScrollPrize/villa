@@ -3362,6 +3362,11 @@ bool LineAnnotationController::importFibersFromPath(const fs::path& importPath,
 
 void LineAnnotationController::exportFibers()
 {
+    // Flush before the empty check, not just inside exportFibersToPath: a
+    // newly created fiber lives only in its session until the debounced
+    // autosave fires, and exporting right after the first landing would
+    // otherwise report "no fibers".
+    flushAllPendingSessionAutoSaves();
     if (_fibers.empty()) {
         showError(tr("There are no fibers to export."));
         return;
@@ -7069,6 +7074,10 @@ void LineAnnotationController::onVolumePackageChanged(std::shared_ptr<VolumePkg>
     _lastSideStripIntersectionKey = 0;
     _lastSideStripIntersectionSurfaceName.clear();
     _lastSideStripIntersectionMarkers.clear();
+    // Session-cache entries are keyed by runtime fiber ids, which are
+    // assigned per package: an entry surviving the switch could collide with
+    // a different fiber in the new package.
+    _sideStripSessionSnapshotCache.clear();
     if (_state) {
         for (const auto& pane : panes) {
             _state->setSurface(pane.surfaceName, nullptr);
@@ -7164,6 +7173,13 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     // via the empty-line check below.
     if (session.optimizedLine.points.empty() || session.controlPoints.empty()) {
         return;
+    }
+    // A debounced autosave still holds the LAST landing's geometry; once
+    // this edit mutates the session it can never be saved (the flush refuses
+    // unoptimized sessions), so persist it first, like the synchronous
+    // per-landing save used to.
+    if (session.autoSaveScheduled) {
+        flushSessionAutoSave(session.surfaceName);
     }
     if (!ensureDatasetForSession(session)) {
         return;
@@ -9022,6 +9038,11 @@ void LineAnnotationController::handleGeneratedControlPointDelete(const std::stri
     }
     if (session.optimizedLine.points.empty() || session.controlPoints.size() <= 1) {
         return;
+    }
+    // See handleGeneratedControlPoint: persist the last landing before this
+    // mutation makes its debounced autosave unsaveable.
+    if (session.autoSaveScheduled) {
+        flushSessionAutoSave(session.surfaceName);
     }
     if (!ensureDatasetForSession(session)) {
         return;
@@ -11839,6 +11860,11 @@ void LineAnnotationController::cleanupSurfaceName(const std::string& surfaceName
         }
         if (pane.surfaceName == surfaceName && pane.session) {
             generatedSurfaceNames = pane.session->generatedSurfaceNames;
+            // Session-cache entries are keyed by fiberId and validated by
+            // (lineRevision, epoch), both of which restart when the fiber is
+            // reopened in a fresh session -- a surviving entry could then
+            // pass validation while holding the previous session's geometry.
+            _sideStripSessionSnapshotCache.erase(pane.session->fiberId);
             if (!pane.session->suppressFiberSave &&
                 pane.session->taskState == LineAnnotationSession::TaskState::Succeeded &&
                 !pane.session->optimizedLine.points.empty() &&

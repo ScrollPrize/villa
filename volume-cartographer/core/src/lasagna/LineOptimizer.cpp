@@ -2301,6 +2301,10 @@ void optimizeControlSpanInitialization(
     }
 
     for (size_t controlIndex = 0; controlIndex + 1 < controls.size(); ++controlIndex) {
+        // Each span initialization can run its own Ceres solve (plus normal
+        // sampling); without a check here a cancelled solve would still pay
+        // for every remaining span before the iteration callback could act.
+        throwIfCancelled(config);
         if (!shouldOptimizeControlSpanInitialization(controls, config, controlIndex)) {
             continue;
         }
@@ -3816,6 +3820,7 @@ LineOptimizationResult LineOptimizer::optimizeFromSeed(
     const LineOptimizationConfig& rawConfig) const
 {
     const LineOptimizationConfig config = sanitizedConfig(rawConfig);
+    throwIfCancelled(config);
     (void)normalSampler_.prefetchNormalSamples({seedPoint}, false);
     const NormalSample seedNormal = normalSampler_.sampleNormal(seedPoint);
     const cv::Vec3d tangent = initialTangentFromConfig(seedNormal, config);
@@ -3824,6 +3829,9 @@ LineOptimizationResult LineOptimizer::optimizeFromSeed(
 
     const auto directNormalStart = Clock::now();
     auto directNormalInit = directNormalConstructedPoints(seedPoint, tangent, normalSampler_, config);
+    // The seed construction walk above samples normals step by step and can
+    // dominate a cancelled teardown; stop before the solves below.
+    throwIfCancelled(config);
     auto spacingConstraints = fixedStepConstraints(directNormalInit.size() - 1);
     if (!config.runGlobalOptimization) {
         int finalValidSamples = 0;
