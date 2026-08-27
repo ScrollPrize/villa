@@ -7129,6 +7129,9 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
             invalidateFiberAlignmentMetrics(session.fiberId, true);
         }
         setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
+        // See the auto-reoptimize branch: an earlier edit's rollback must
+        // not be applied over this edit.
+        session.controlPointCollapseRollback.reset();
         // The session no longer matches any in-flight solve: refuse its
         // publication and ask it to stop. No pending solve is recorded (the
         // user chose manual reoptimization), but an already-queued pending
@@ -7204,6 +7207,10 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     const size_t collapsedControlCount = prepared.collapsedOldIndices.size();
     const std::vector<vc3d::line_annotation::LineControlPoint> branchRemapControls =
         prepared.controlPointsBeforeLineUpdate;
+    // A rollback captured by an earlier edit restores a state this edit is
+    // about to build on top of; applying it to a later solve failure would
+    // silently discard this edit too. Each edit owns at most its own.
+    session.controlPointCollapseRollback.reset();
     if (collapsedControlCount > 1) {
         session.controlPointCollapseRollback =
             LineAnnotationSession::ControlPointCollapseRollback{
