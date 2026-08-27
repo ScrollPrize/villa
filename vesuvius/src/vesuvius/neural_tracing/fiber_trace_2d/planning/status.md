@@ -1,10 +1,9 @@
-# Status: Non-transitive Mixed-state fiber BP
+# Status: 1024 node-unary Mixed BP evaluation
 
-- [x] Capture the formulation correction.
-- [x] Write implementation, specification, documentation, and test plan.
+- [x] Capture the evaluation objective and ranking rule.
+- [x] Write the evaluation plan.
 - [x] Complete independent plan review.
-- [x] Implement neutral Mixed pairwise terms and node unary cost.
-- [x] Update CLI/report terminology and documentation.
-- [x] Add focused regression tests.
-- [x] Build and run focused validation.
-- [x] Update task log, changelog, and status.
+- [x] Run the unary-cost sweep.
+- [x] Select the H/V-first tradeoff.
+- [x] Regenerate the main 1024 artifacts.
+- [x] Record results and verification.

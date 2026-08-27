@@ -1,69 +1,48 @@
-# Plan: Non-transitive Mixed-state fiber BP
+# Plan: Evaluate node-unary Mixed BP on the 1024 crop
 
 ## Contract
 
-- Preserve the existing V/H pairwise energies for oriented endpoint pairs.
-- Set every pairwise energy involving Mixed to zero, including Mixed/Mixed.
-  This is conditional neutrality: a cavity clamped to Mixed sends a uniform
-  factor message, while residual V/H probability may still transmit evidence.
-- Charge `bp_mixed_cost` once per node assigned Mixed as a unary energy,
-  independent of degree and merged measurement count. Keep the central seed
-  exactly H with no Mixed alternative.
-- For every non-seed node use `u(V)=u(H)=0`, `u(Mixed)=bp_mixed_cost`, so its
-  log unary is `(0,-bp_mixed_cost/T,0)`. Include it exactly once in each
-  outgoing cavity and exactly once in the final marginal, using the existing
-  temperature, damping, normalization, convergence, and deterministic update
-  rules. The seed replaces this unary with an exact delta at H.
-- Keep the CLI spelling `--bp-mixed-cost`, but rename internal/report/CSV
-  terminology from per-constraint cost to unary cost. This experimental format
-  is not shipped, so retain no compatibility alias for the old field name or
-  CSV column.
-- Leave binary min-sum and binary sum-product inference unchanged.
-
-## Implementation
-
-1. Rename the mixed cost configuration and report fields to `mixedUnaryCost`.
-2. Build ternary factor potentials with zero energy whenever either endpoint is
-   Mixed, and add the Mixed unary log-potential to non-seed cavities and node
-   marginals.
-3. Update CLI help, validation messages, diagnostic tables, and CSV schema to
-   describe the unary cost.
-4. Update the exact enumerator and focused tests for the new energy model.
-5. Keep ternary final marginal accumulation at exactly one incoming directed
-   message per incident factor while adding the node unary.
+- Reuse the existing 500-fiber 1024 trace dataset, 0.9 direction-dominance
+  reference, no-split fibers, and perpendicular-only constraint graph.
+- Fix `T=2.5` and sweep unary costs `2,4,6,8,10,12,16`; do not alter the solver
+  during this experiment. Also run binary sum-product on the same graph and
+  temperature as an H/V-only baseline.
+- Treat Direction1/Direction2 confusion as a diagnostic only because the
+  initial geometric split contains known errors. Prefer settings which produce
+  a stable definite H/V partition with low resolved perpendicular-constraint
+  mismatch and few exact ties; use agreement with the initial grouping and
+  Mixed recall as secondary diagnostics.
+- Define a confidently oriented fiber as `max(P(V),P(H)) >= 0.75` with V or H
+  the unique top state. For the existing 0.25/0.75 resolved orientation bands,
+  report resolved factor-count and factor-strength coverage together with hard
+  mismatch rates; never interpret unresolved factors as successful matches.
+- Report argmax label churn between neighboring unary costs. Prefer the Pareto
+  frontier, then maximize confident H/V coverage subject to low weighted hard
+  mismatch, using lower churn and fewer non-gauge ties as tie breakers.
+- Report connected components and isolates. Treat exact V/H ties outside the
+  seeded component as gauge ambiguity rather than instability.
+- Write the selected result to the existing main 1024 basename so its short
+  H/V/Mixed/tie OBJ layers are immediately inspectable.
 
 ## Spec Update
 
-Replace the measurement-scaled Mixed factor energy with neutral Mixed factors
-and one per-fiber unary energy. Specify message/marginal inclusion of the unary,
-seed behavior, degree independence, and non-transitivity.
+None; this is evaluation of the committed formulation.
 
 ## Docs Updates
 
-Update `volume-cartographer/docs/fiber_chunk_tracing.md` to explain that Mixed
-disables incident orientation terms and pays one node-local cost.
+Record the command, sweep, selected setting, confusion counts, AUROC, and output
+location in the current task log. No user documentation change is required.
 
 ## Testing
 
-- Compare seeded-tree marginals to brute-force enumeration of the new model.
-- Verify a factor touching a forced/strongly favored Mixed node sends no state
-  preference to its neighbor when the source cavity is exactly Mixed.
-- Verify multiple consistent oriented neighbors accumulate enough evidence to
-  select the corresponding H/V state.
-- Verify conflicting oriented evidence can select Mixed at the conflicted node.
-- Verify duplicating incident measurements changes oriented evidence but does
-  not duplicate the Mixed unary prior.
-- Verify an unseeded isolate has probabilities proportional to
-  `(1,exp(-cost/T),1)`, the seed remains exactly H, and unary cost is independent
-  of node degree/measurement multiplicity.
-- Verify gauge symmetry, deterministic ordering, damping, message limits,
-  negative/nonfinite unary rejection, and wrong-mode CLI rejection.
-- Build `vc_fiber_trace_chunk` and `test_fiberlet_crop_trace` with `-j32`, run
-  the focused test binary, and run `git diff --check`.
-- Run the centered-384 full-Mixed cohort at `T=2.5` with a small unary-cost
-  sweep, comparing Mixed AUROC and trusted H/V errors with recorded binary and
-  prior ternary results.
+- Confirm every run uses 500 fibers and 4,941 perpendicular factors.
+- Record convergence and the full Direction1/Direction2/Mixed argmax table.
+- Record confident H/V counts, resolved constraint coverage and mismatch,
+  neighboring-cost label churn, components/isolates, and the same-temperature
+  binary baseline.
+- Confirm the selected run overwrites the main 1024 OBJ and CSV artifacts.
+- Confirm the four short state OBJs partition exactly all 500 fibers.
 
 ## Changelog
 
-Record the corrected node-local, non-transitive Mixed-state BP formulation.
+No changelog entry unless the selected setting changes a committed default.
