@@ -55,7 +55,9 @@ public:
     bool hasActiveSpiralSession() const;
     void addPatchToCurrentFit(const QString& tifxyzDirectory,
                               const std::shared_ptr<QuadSurface>& surface = {});
-    void addFiberToCurrentFit(const QString& fiberJsonPath);
+    void addFiberToCurrentFit(uint64_t fiberId, const QString& fiberJsonPath);
+    void noteTrackedFiberSaved(uint64_t fiberId, uint64_t generation,
+                               const QString& fiberJsonPath);
     void requestSessionExit(std::function<void()> continuation);
     bool hasPendingBrushWork() const;
 
@@ -147,11 +149,13 @@ private:
                                      const std::shared_ptr<QuadSurface>& surface,
                                      const std::optional<QColor>& color = std::nullopt);
     void finalizeBrushPaint();
+    void submitReadyDrafts(bool commitAfterAdd);
     void maybeCommitForPendingExit();
     QString provisionalBrushRoot() const;
     void discardBrushWork();
     void setSurfaceCategoryVisible(const QString& category, bool visible);
     void updatePendingPatchIds(const QJsonObject& status);
+    void uploadNewestFiberRevision(uint64_t fiberId);
     void updateSurfaceIntersections();
     void ensureInitialFocus();
     void initializePreviewFocus();
@@ -223,4 +227,16 @@ private:
     QSet<QString> _uncommittedPointCollectionIds;
     std::function<void()> _pendingExitAction;
     bool _commitAfterBrushUploads = false;
+    struct TrackedFiber {
+        QString inputId;
+        QString path;
+        QString revision;
+        QString snapshotPath;
+        uint64_t latestGeneration = 0;
+        uint64_t sentGeneration = 0;
+        bool added = false;
+        bool uploadInFlight = false;
+    };
+    QHash<uint64_t, TrackedFiber> _trackedFibers;
+    QHash<QString, QString> _residentFiberRevisions;
 };

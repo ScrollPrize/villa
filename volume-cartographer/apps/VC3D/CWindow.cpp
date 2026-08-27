@@ -2610,9 +2610,16 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     connect(_lineAnnotationController.get(),
             &LineAnnotationController::fiberSaved,
             this,
-            [this](uint64_t fiberId, uint64_t) {
+            [this](uint64_t fiberId, uint64_t generation) {
                 _fiberIntersectionCache.pruneFiber(fiberId);
                 updateAtlasSearchDocks();
+                if (_spiralWorkspace && _lineAnnotationController) {
+                    const auto path = _lineAnnotationController->fiberFilePath(fiberId);
+                    if (!path.empty())
+                        _spiralWorkspace->noteTrackedFiberSaved(
+                            fiberId, generation,
+                            QString::fromStdString(path.string()));
+                }
             });
     connect(_lineAnnotationController.get(),
             &LineAnnotationController::fibersDeleted,
@@ -7901,7 +7908,8 @@ void CWindow::CreateWidgets(void)
                                 showStatusBarMessage(tr("Fiber %1 has no saved JSON file yet").arg(fiberId), 5000);
                                 continue;
                             }
-                            _spiralWorkspace->addFiberToCurrentFit(QString::fromStdString(path.string()));
+                            _spiralWorkspace->addFiberToCurrentFit(
+                                fiberId, QString::fromStdString(path.string()));
                         }
                     });
             connect(widget,

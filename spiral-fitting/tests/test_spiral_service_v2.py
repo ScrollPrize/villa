@@ -97,6 +97,7 @@ class FakeSession:
         self.path_change_calls = []
         self.model_rebuilds = []
         self.progress = None
+        self.live_calls = []
 
     def status(self):
         applied = ({"applied_config": dict(self.applied_config)}
@@ -123,6 +124,18 @@ class FakeSession:
         self.autosave_calls.append(autosave_on_pause)
         self.run_config.update(run_config or {})
         return 5 + count
+
+    def incorporate_live(self, records, influence_config=None):
+        records = list(records)
+        self.live_calls.append((records, dict(influence_config or {})))
+        return {
+            "no_future_step": False,
+            "outcomes": [
+                {"id": record["id"], "kind": record["kind"],
+                 "state": "incorporated"}
+                for record in records
+            ],
+        }
 
     def save_checkpoint(self, path):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -276,7 +289,7 @@ def _digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def _upload_input(state, kind, input_id, files, role=None):
+def _upload_input(state, kind, input_id, files, role=None, base_revision=None):
     request = {
         "kind": kind, "id": input_id,
         "files": [{"name": name, "size": len(data), "sha256": _digest(data)}
@@ -284,6 +297,8 @@ def _upload_input(state, kind, input_id, files, role=None):
     }
     if role:
         request["role"] = role
+    if base_revision is not None:
+        request["base_revision"] = base_revision
     upload_id = state.begin_upload(request)["upload_id"]
     for name, data in files.items():
         state.receive_upload_file(upload_id, name, io.BytesIO(data), len(data))
@@ -1908,6 +1923,24 @@ class UploadTests(unittest.TestCase):
         self.assertEqual(self.state.finalize_upload(upload_id)["input"]["id"],
                          "patch-1")
 
+    def test_finalizing_while_running_dispatches_live_incorporation(self):
+        session = self._session()
+        session.state = SessionState.Running
+        self.state._active_run_influence = {"influence_enabled": True}
+        upload_id = _upload_input(self.state, "patch", "live-patch", PATCH_FILES)
+        response = self.state.finalize_upload(upload_id)
+        self.assertIn(response["input"]["state"], {"queued", "incorporated"})
+        deadline = time.monotonic() + 2
+        while not session.live_calls and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(session.live_calls), 1)
+        records, influence = session.live_calls[0]
+        self.assertEqual([record["id"] for record in records], ["live-patch"])
+        self.assertEqual(influence, {"influence_enabled": True})
+        self.assertEqual(
+            self.state.status()["ephemeral_inputs"][0]["state"],
+            "incorporated")
+
     def test_upload_put_retries_are_content_addressed(self):
         self._session()
         data = PATCH_FILES["meta.json"]
@@ -1960,6 +1993,63 @@ class UploadTests(unittest.TestCase):
                 upload_id, "fiber.json",
                 io.BytesIO(FIBER_FILES["fiber.json"]),
                 len(FIBER_FILES["fiber.json"]))
+
+    def test_fiber_revision_cas_and_settled_retention(self):
+        self._session()
+        first_upload = _upload_input(
+            self.state, "fiber", "fiber-1", FIBER_FILES)
+        first = self.state.finalize_upload(first_upload)["input"]
+        self.assertEqual(first["revision"], _digest(FIBER_FILES["fiber.json"]))
+        record = self.state.ephemeral_records.find("fiber", "fiber-1")
+        self.state.ephemeral_records.mark_incorporated([record])
+        self.assertEqual(record.incorporated_revision, first["revision"])
+
+        document = json.loads(FIBER_FILES["fiber.json"])
+        document["generation"] = 2
+        revised_files = {"fiber.json": json.dumps(document).encode()}
+        second_upload = _upload_input(
+            self.state, "fiber", "fiber-1", revised_files,
+            base_revision=first["revision"])
+        second = self.state.finalize_upload(second_upload)["input"]
+        self.assertNotEqual(second["revision"], first["revision"])
+        self.assertEqual(second["incorporated_revision"], first["revision"])
+        self.assertEqual(second["state"], "pending")
+
+        with self.assertRaises(ApiError) as stale:
+            _upload_input(self.state, "fiber", "fiber-1", FIBER_FILES,
+                          base_revision=first["revision"])
+        self.assertEqual(stale.exception.status, 409)
+        self.assertEqual(stale.exception.payload["current_revision"],
+                         second["revision"])
+
+        self.state.ephemeral_records.mark_incorporated([record])
+        record.persistence = "committed"
+        record.committed_revision = record.revision
+        record.auto_commit = True
+        self.state.ephemeral_records._drop_settled()
+        status = self.state.status()["ephemeral_inputs"]
+        self.assertEqual(len(status), 1)
+        self.assertTrue(status[0]["auto_commit"])
+        self.assertEqual(status[0]["committed_revision"], second["revision"])
+
+    def test_concurrent_fiber_finalizations_cas_at_publication(self):
+        self._session()
+        first = self.state.finalize_upload(_upload_input(
+            self.state, "fiber", "fiber-1", FIBER_FILES))["input"]
+        revisions = []
+        for generation in (2, 3):
+            document = json.loads(FIBER_FILES["fiber.json"])
+            document["generation"] = generation
+            files = {"fiber.json": json.dumps(document).encode()}
+            revisions.append(_upload_input(
+                self.state, "fiber", "fiber-1", files,
+                base_revision=first["revision"]))
+        accepted = self.state.finalize_upload(revisions[0])["input"]
+        with self.assertRaises(ApiError) as stale:
+            self.state.finalize_upload(revisions[1])
+        self.assertEqual(stale.exception.status, 409)
+        self.assertEqual(stale.exception.payload["current_revision"],
+                         accepted["revision"])
 
     def test_finalize_rejects_missing_files_and_digest_mismatch(self):
         self._session()
@@ -2457,6 +2547,15 @@ class EphemeralLedgerTests(unittest.TestCase):
         ledger.mark_incorporated([record])
         self.assertEqual(ledger.records, [])
 
+    def test_claimed_inputs_are_queued_and_can_return_to_pending(self):
+        ledger = self._ledger()
+        record = ledger.find("patch", "patch-1")
+        self.assertEqual(ledger.claim_pending(), [record])
+        self.assertEqual(record.status_entry()["state"], "queued")
+        self.assertEqual(ledger.uncommitted(), [record])
+        ledger.return_pending([record])
+        self.assertEqual(record.status_entry()["state"], "pending")
+
     def test_incorporation_can_precede_persistence(self):
         ledger = self._ledger()
         record = ledger.find("patch", "patch-1")
@@ -2478,6 +2577,7 @@ class EphemeralLedgerTests(unittest.TestCase):
         self.assertEqual(ledger.pending(), [])
         self.assertEqual(ledger.uncommitted(), [])
         self.assertEqual(record.status_entry()["state"], "error")
+        self.assertEqual(record.status_entry()["error"], "RuntimeError: boom")
 
     def test_fitter_payloads_resolve_back_to_their_records(self):
         ledger = self._ledger()
@@ -2574,7 +2674,34 @@ class CommitTests(unittest.TestCase):
         mark(pending)
         status = self.state.status()
         self.assertEqual(status["committed_not_incorporated"], [])
-        self.assertEqual(status["ephemeral_inputs"], [])
+        self.assertEqual(len(status["ephemeral_inputs"]), 1)
+        self.assertEqual(status["ephemeral_inputs"][0]["kind"], "fiber")
+        self.assertTrue(status["ephemeral_inputs"][0]["auto_commit"])
+
+    def test_committed_fiber_revision_auto_commits_after_incorporation(self):
+        first = self._finalize("fiber", "fiber-9", FIBER_FILES)
+        record = self.state.ephemeral_records.find("fiber", "fiber-9")
+        self.state.ephemeral_records.mark_incorporated([record])
+        self.state.commit_inputs()
+        self.assertTrue(record.auto_commit)
+
+        document = json.loads(FIBER_FILES["fiber.json"])
+        document["generation"] = 2
+        revised = {"fiber.json": json.dumps(document).encode()}
+        upload_id = _upload_input(
+            self.state, "fiber", "fiber-9", revised,
+            base_revision=first["revision"])
+        second = self.state.finalize_upload(upload_id)["input"]
+        self.state.ephemeral_records.mark_outcomes([{
+            "id": "fiber-9", "kind": "fiber",
+            "revision": second["revision"], "state": "incorporated",
+        }])
+        self.state._auto_commit_fiber(record)
+
+        self.assertEqual(record.committed_revision, second["revision"])
+        self.assertEqual(
+            (self.dataset / "fibers" / "fiber-9.json").read_bytes(),
+            revised["fiber.json"])
 
     def test_commit_refuses_a_record_whose_staged_copy_is_gone(self):
         record = self._finalize("patch", "patch-9", PATCH_FILES)

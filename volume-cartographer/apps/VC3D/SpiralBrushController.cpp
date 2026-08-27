@@ -174,6 +174,30 @@ bool SpiralBrushController::hasUnfinalizedPolylines() const
     });
 }
 
+bool SpiralBrushController::hasReadyDrafts() const
+{
+    return std::any_of(_gestures.begin(), _gestures.end(), [](const Gesture& gesture) {
+        return gesture.state == GestureState::Ready && !gesture.shape.isEmpty();
+    }) || std::any_of(_polylines.begin(), _polylines.end(), [](const PolylineGesture& line) {
+        return line.state == GestureState::Ready && line.volumePoints.size() >= 2;
+    });
+}
+
+void SpiralBrushController::markDraftsReady()
+{
+    if (_dragMode != DragMode::None) return;
+    for (auto& gesture : _gestures) {
+        if (gesture.state == GestureState::Painted && !gesture.shape.isEmpty())
+            gesture.state = GestureState::Ready;
+    }
+    for (auto& line : _polylines) {
+        if (line.state == GestureState::Painted && line.volumePoints.size() >= 2)
+            line.state = GestureState::Ready;
+    }
+    refreshAll();
+    emit paintStateChanged();
+}
+
 void SpiralBrushController::setVisiblePointCollectionIds(const QSet<QString>& ids)
 {
     if (_visiblePointCollectionIds == ids) return;
@@ -664,7 +688,9 @@ void SpiralBrushController::eraseWith(const QPainterPath& deviceShape)
     Surface* current = _viewer ? _viewer->currentSurface() : nullptr;
     const QPainterPath surfaceShape = deviceToSurface(deviceShape);
     for (auto& gesture : _gestures) {
-        if (gesture.state != GestureState::Painted || gesture.source.get() != current) continue;
+        if ((gesture.state != GestureState::Painted
+             && gesture.state != GestureState::Ready)
+            || gesture.source.get() != current) continue;
         gesture.shape = gesture.shape.subtracted(surfaceShape);
     }
 
@@ -672,7 +698,9 @@ void SpiralBrushController::eraseWith(const QPainterPath& deviceShape)
     bool pointChainsChanged = false;
     if (view) {
         for (auto line = _polylines.begin(); line != _polylines.end();) {
-            if (line->state != GestureState::Painted || line->anchors.empty()) {
+            if ((line->state != GestureState::Painted
+                 && line->state != GestureState::Ready)
+                || line->anchors.empty()) {
                 ++line;
                 continue;
             }
@@ -1181,7 +1209,7 @@ SpiralBrushController::preparePatches(QStringList& warnings)
         return patches;
     }
     for (auto& gesture : _gestures) {
-        if (gesture.state != GestureState::Painted || gesture.shape.isEmpty()) continue;
+        if (gesture.state != GestureState::Ready || gesture.shape.isEmpty()) continue;
         PreparedPatch patch = makePatch(gesture);
         if (!patch.surface) {
             warnings.push_back(tr("A painted area was too small to contain a complete quad"));
@@ -1213,7 +1241,7 @@ SpiralBrushController::preparePointCollections(QStringList& warnings)
         QJsonObject collections;
         int collectionId = 0;
         for (auto& line : _polylines) {
-            if (!includesKind(line.kind) || line.state != GestureState::Painted
+            if (!includesKind(line.kind) || line.state != GestureState::Ready
                 || line.volumePoints.size() < 2)
                 continue;
             QJsonObject points;
@@ -1249,7 +1277,7 @@ SpiralBrushController::preparePointCollections(QStringList& warnings)
             {QStringLiteral("collections"), collections},
         });
         for (auto& line : _polylines) {
-            if (includesKind(line.kind) && line.state == GestureState::Painted
+            if (includesKind(line.kind) && line.state == GestureState::Ready
                 && line.volumePoints.size() >= 2) {
                 line.id = result.id;
                 line.state = GestureState::Finalizing;
@@ -1285,13 +1313,13 @@ void SpiralBrushController::finalizationFailed(const QString& id)
     for (auto& gesture : _gestures) {
         if (gesture.id == id) {
             gesture.id.clear();
-            gesture.state = GestureState::Painted;
+            gesture.state = GestureState::Ready;
         }
     }
     for (auto& line : _polylines) {
         if (line.id == id && line.state == GestureState::Finalizing) {
             line.id.clear();
-            line.state = GestureState::Painted;
+            line.state = GestureState::Ready;
         }
     }
     refreshAll();

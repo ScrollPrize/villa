@@ -137,6 +137,10 @@ class InteractiveInfluenceState:
         self.device = device
         self.masks = {}  # 'flow_lr'/'flow_hr' [Z,Y,X] fp16, 'gap' [num_z,total] fp16
         self.footprints = []  # per input: {'input_id', 'kind', 'zst' cpu fp32} (diagnostics)
+        # Authoritative contribution by logical input. Revisions replace this
+        # entry; masks are rebuilt from the map so old geometry is not unioned
+        # forever.
+        self.contributions = {}
         self.anchor_scroll = None  # [A,3] fp32
         self.anchor_target = None  # [A,3] fp32, spiral-space
         self.anchor_w = None  # [A] fp32, accumulated influence weight
@@ -167,7 +171,7 @@ class InteractiveInfluenceState:
         for input_id, pcl in new_collections.items():
             zyx = torch.from_numpy(np.stack(
                 [point['zyx'] for point in pcl['points'].values()], axis=0)).to(torch.float32)
-            per_input.append((str(input_id), 'pcl', zyx))
+            per_input.append((input_id, 'pcl', zyx))
         footprint_parts = []
         for input_id, kind, zyx in per_input:
             # copy=True: the subsample may alias the input's own tensor, and the
@@ -176,8 +180,21 @@ class InteractiveInfluenceState:
             zyx[:, 0] = zyx[:, 0].clamp(float(z_begin), float(z_end - 1))
             zst = spiral_zst(_apply_transform_chunked(slice_to_spiral_transform, zyx),
                              dr_per_winding).to(torch.float32)
-            self.footprints.append({'input_id': input_id, 'kind': kind, 'zst': zst.cpu()})
+            logical_kind = kind
+            logical_id = input_id
+            revision = None
+            if kind == 'pcl' and input_id in new_collections:
+                metadata = new_collections[input_id].get('metadata', {})
+                logical_kind = metadata.get('logical_input_kind') or kind
+                logical_id = metadata.get('logical_input_id') or str(input_id)
+                revision = metadata.get('logical_input_revision')
+            contribution = {
+                'input_id': str(logical_id), 'kind': logical_kind,
+                'revision': revision, 'zst': zst.cpu(),
+            }
+            self.contributions[(logical_kind, str(logical_id))] = contribution
             footprint_parts.append(zst)
+        self.footprints = list(self.contributions.values())
         return torch.cat(footprint_parts, dim=0) if footprint_parts else \
             torch.empty([0, 3], dtype=torch.float32, device=self.device)
 
@@ -346,17 +363,27 @@ class InteractiveInfluenceState:
         if footprint_zst.shape[0] == 0:
             raise RuntimeError('influence footprint is empty for the incorporated inputs')
 
-        self._update_gap_mask(spiral_and_transform, footprint_zst)
-        self._update_flow_mask(spiral_and_transform, 'flow_lr', footprint_zst, dr_per_winding)
-        self._update_flow_mask(spiral_and_transform, 'flow_hr', footprint_zst, dr_per_winding)
+        # Recompute the union from authoritative per-input contributions. This
+        # is the key difference between adding another input and revising one.
+        for mask in self.masks.values():
+            mask.zero_()
+        authoritative = torch.cat(
+            [entry['zst'].to(self.device) for entry in self.contributions.values()],
+            dim=0)
+        self._update_gap_mask(spiral_and_transform, authoritative)
+        self._update_flow_mask(
+            spiral_and_transform, 'flow_lr', authoritative, dr_per_winding)
+        self._update_flow_mask(
+            spiral_and_transform, 'flow_hr', authoritative, dr_per_winding)
 
         # Refresh anchor targets to the current state and union the new
         # region's weight at each anchor.
         anchor_spiral = _apply_transform_chunked(slice_to_spiral_transform, self.anchor_scroll)
-        self.anchor_target = anchor_spiral.to(torch.float32)
+        if self.anchor_target is None:
+            self.anchor_target = anchor_spiral.to(torch.float32)
         anchor_zst = spiral_zst(anchor_spiral, dr_per_winding).to(torch.float32)
-        w_new = influence_weight(anchor_zst, footprint_zst, self.limits, self.sigma)
-        self.anchor_w = torch.maximum(self.anchor_w, w_new)
+        self.anchor_w = influence_weight(
+            anchor_zst, authoritative, self.limits, self.sigma)
         self.anchor_loss_weight = (1. - self.anchor_w).clamp(0., 1.) ** self.ramp_power
 
         self._apply_optimizer_surgery(spiral_and_transform, optimiser)

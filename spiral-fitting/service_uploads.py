@@ -58,10 +58,10 @@ def _utc_stamp():
 class Upload:
     __slots__ = ("upload_id", "session_id", "kind", "role", "input_id",
                  "manifest", "staging_dir", "received", "record", "created",
-                 "lock")
+                 "lock", "base_revision", "revision")
 
     def __init__(self, upload_id, session_id, kind, role, input_id, manifest,
-                 staging_dir):
+                 staging_dir, base_revision=None, revision=None):
         self.upload_id = upload_id
         self.session_id = session_id
         self.kind = kind
@@ -73,6 +73,8 @@ class Upload:
         self.record = None
         self.created = time.time()
         self.lock = threading.Lock()
+        self.base_revision = base_revision
+        self.revision = revision
 
     def declared_bytes(self):
         return sum(entry["size"] for entry in self.manifest.values())
@@ -223,7 +225,7 @@ def _copy_publish(source, destination, keep_source=False):
 # ----------------------------------------------------------------------
 
 #: Has the resident fit taken this input yet?
-INCORPORATION_STATES = ("pending", "incorporated", "error")
+INCORPORATION_STATES = ("pending", "queued", "incorporated", "error")
 #: Does the dataset hold a copy of it yet?
 PERSISTENCE_STATES = ("ephemeral", "committed")
 
@@ -247,16 +249,29 @@ class EphemeralInput:
     incorporation: str = "pending"
     persistence: str = "ephemeral"
     error: Optional[str] = None
+    # Fibers are stable logical inputs. ``revision`` is the newest accepted
+    # content, while the incorporated/committed fields describe the resident
+    # runtime and dataset independently.
+    revision: Optional[str] = None
+    incorporated_revision: Optional[str] = None
+    committed_revision: Optional[str] = None
+    auto_commit: bool = False
+    error_revision: Optional[str] = None
+    revision_errors: dict = field(default_factory=dict)
 
     @classmethod
     def from_record(cls, record):
         return cls(
             id=record["id"], kind=record["kind"], role=record.get("role"),
             path=record["path"], bytes=record["bytes"],
-            upload_id=record.get("upload_id"))
+            upload_id=record.get("upload_id"),
+            revision=record.get("revision"))
 
     @property
     def committed(self):
+        if self.kind == "fiber":
+            return (self.revision is not None
+                    and self.committed_revision == self.revision)
         return self.persistence == "committed"
 
     @property
@@ -266,7 +281,9 @@ class EphemeralInput:
     @property
     def settled(self):
         """Committed and incorporated: nothing is left to do with it."""
-        return self.committed and self.incorporated
+        # Ordinary inputs can leave the ledger. Fibers remain as reconnectable
+        # revision cursors even after their current content settles.
+        return self.kind != "fiber" and self.committed and self.incorporated
 
     def payload(self):
         """The plain record the fitter (and its DDP children) receive."""
@@ -277,12 +294,35 @@ class EphemeralInput:
         }
         if self.upload_id is not None:
             record["upload_id"] = self.upload_id
+        if self.kind == "fiber":
+            record.update({
+                "revision": self.revision,
+                "incorporated_revision": self.incorporated_revision,
+                "committed_revision": self.committed_revision,
+                "auto_commit": self.auto_commit,
+                "operation": ("replace" if self.incorporated_revision
+                              else "add"),
+            })
         return record
 
     def status_entry(self):
-        return {"id": self.id, "kind": self.kind, "role": self.role,
-                "state": self.incorporation, "bytes": self.bytes,
-                "committed": self.committed}
+        result = {"id": self.id, "kind": self.kind, "role": self.role,
+                  "state": self.incorporation, "bytes": self.bytes,
+                  "committed": self.committed}
+        if self.error:
+            result["error"] = self.error
+        if self.kind == "fiber":
+            result.update({
+                "revision": self.revision,
+                "incorporated_revision": self.incorporated_revision,
+                "committed_revision": self.committed_revision,
+                "auto_commit": self.auto_commit,
+            })
+            if self.error_revision:
+                result["error_revision"] = self.error_revision
+            if self.revision_errors:
+                result["revision_errors"] = dict(self.revision_errors)
+        return result
 
 
 class EphemeralLedger:
@@ -326,6 +366,21 @@ class EphemeralLedger:
             self._records.append(entry)
         return entry
 
+    def revise_fiber(self, record):
+        """Install a CAS-validated newest fiber revision on its logical row."""
+        with self._lock:
+            entry = self.find("fiber", record["id"])
+            if entry is None:
+                return self.add(record)
+            entry.path = record["path"]
+            entry.bytes = record["bytes"]
+            entry.upload_id = record.get("upload_id")
+            entry.revision = record.get("revision")
+            entry.incorporation = "pending"
+            entry.error = None
+            entry.error_revision = None
+            return entry
+
     def find(self, kind, input_id):
         with self._lock:
             return next((record for record in self._records
@@ -352,12 +407,31 @@ class EphemeralLedger:
             return [record for record in self._records
                     if record.incorporation == "pending"]
 
+    def claim_pending(self):
+        """Atomically reserve pending inputs in deterministic ledger order."""
+        with self._lock:
+            records = [record for record in self._records
+                       if record.incorporation == "pending"]
+            for record in records:
+                record.incorporation = "queued"
+                record.error = None
+            return records
+
+    def return_pending(self, records):
+        """Return still-queued claims to the next-Run pool."""
+        with self._lock:
+            for record in records:
+                if record in self._records and record.incorporation == "queued":
+                    record.incorporation = "pending"
+                    record.error = None
+
     def uncommitted(self):
         """Inputs the dataset has no copy of yet."""
         with self._lock:
             return [record for record in self._records
                     if not record.committed
-                    and record.incorporation in ("pending", "incorporated")]
+                    and record.incorporation in
+                    ("pending", "queued", "incorporated")]
 
     def committed_not_incorporated(self):
         """Committed inputs the resident fit has not taken yet."""
@@ -379,13 +453,57 @@ class EphemeralLedger:
             for record in records:
                 record.incorporation = "error" if error else "incorporated"
                 record.error = error
+                if record.kind == "fiber":
+                    if error:
+                        record.error_revision = record.revision
+                        record.revision_errors[record.revision] = error
+                    else:
+                        record.incorporated_revision = record.revision
+                        record.error_revision = None
+                        record.revision_errors.pop(record.revision, None)
             if error is None:
                 self._drop_settled()
+
+    def mark_outcomes(self, outcomes):
+        """Apply per-record runtime outcomes keyed by (kind, id)."""
+        by_identity = {
+            (outcome.get("kind"), outcome.get("id")): outcome
+            for outcome in outcomes
+        }
+        with self._lock:
+            for record in self._records:
+                outcome = by_identity.get((record.kind, record.id))
+                if outcome is None:
+                    continue
+                state = outcome.get("state")
+                if state not in ("incorporated", "error"):
+                    continue
+                if record.kind == "fiber":
+                    outcome_revision = outcome.get("revision", record.revision)
+                    if state == "incorporated":
+                        record.incorporated_revision = outcome_revision
+                        record.revision_errors.pop(outcome_revision, None)
+                    else:
+                        record.error_revision = outcome_revision
+                        record.revision_errors[outcome_revision] = outcome.get("error")
+                    # A newer save may have arrived while this revision was in
+                    # flight. Its pending/queued state must not be overwritten
+                    # by the older outcome.
+                    if outcome_revision != record.revision:
+                        continue
+                record.incorporation = state
+                record.error = outcome.get("error") if state == "error" else None
+                if record.kind == "fiber" and state == "incorporated":
+                    record.error_revision = None
+            self._drop_settled()
 
     def mark_committed(self, records):
         with self._lock:
             for record in records:
                 record.persistence = "committed"
+                if record.kind == "fiber":
+                    record.committed_revision = record.revision
+                    record.auto_commit = True
             self._drop_settled()
 
     def _drop_settled(self):
@@ -420,10 +538,10 @@ class UploadEnvironment:
     require_session: Callable[[], None]
     #: Checkpoint the loaded session resumed from; protected from retention.
     active_checkpoint: Callable[[], str] = lambda: ""
-    #: Raise ApiError when a new ephemeral input may not be accepted
-    #: (duplicate id, exhausted quota). Called with (kind, id, declared).
-    reserve_ephemeral: Callable[[str, str, int], None] = \
-        lambda kind, input_id, declared: None
+    #: Raise ApiError when an input/revision may not be accepted. Called with
+    #: (kind, id, declared bytes, base revision, content revision).
+    reserve_ephemeral: Callable[[str, str, int, Optional[str], Optional[str]], None] = \
+        lambda kind, input_id, declared, base_revision, revision: None
 
 
 @dataclass
@@ -545,6 +663,17 @@ class UploadManager:
                            "The input id must be a single safe path component")
         manifest = _validate_upload_manifest(request)
         declared = sum(entry["size"] for entry in manifest.values())
+        base_revision = request.get("base_revision")
+        if base_revision is not None and not isinstance(base_revision, str):
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "base_revision must be a string or null")
+        if kind != "fiber" and base_revision is not None:
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "base_revision is only valid for fiber uploads")
+        # Fibers contain exactly one JSON file, so its manifest digest is an
+        # opaque, deterministic content revision without another file pass.
+        revision = (next(iter(manifest.values()))["sha256"]
+                    if kind == "fiber" and len(manifest) == 1 else None)
         if kind == "checkpoint":
             with self._lock:
                 # Resume checkpoints are needed before a session exists, so
@@ -596,11 +725,13 @@ class UploadManager:
                     }
             else:
                 self.environment.require_session()
-                self.environment.reserve_ephemeral(kind, input_id, declared)
+                self.environment.reserve_ephemeral(
+                    kind, input_id, declared, base_revision, revision)
             upload_id = secrets.token_hex(16)
             staging = self.staging_root() / upload_id
             upload = Upload(upload_id, self.environment.session_id(), kind,
-                            role, input_id, manifest, staging)
+                            role, input_id, manifest, staging,
+                            base_revision=base_revision, revision=revision)
             self.uploads[upload_id] = upload
         staging.mkdir(parents=True, exist_ok=True)
         return {"upload_id": upload_id, "accepted": True}
@@ -692,15 +823,26 @@ class UploadManager:
             kind_dir.mkdir(parents=True, exist_ok=True)
             if upload.kind == "patch":
                 published = kind_dir / upload.input_id
+            elif upload.kind == "fiber":
+                revision_dir = kind_dir / upload.input_id
+                revision_dir.mkdir(parents=True, exist_ok=True)
+                published = revision_dir / f"{upload.revision}.json"
+                single = next(p for p in upload.staging_dir.rglob("*") if p.is_file())
             else:
                 published = kind_dir / f"{upload.input_id}.json"
                 single = next(p for p in upload.staging_dir.rglob("*") if p.is_file())
             if published.exists():
-                raise ApiError(HTTPStatus.CONFLICT,
-                               "An ephemeral input with this id already exists")
+                if upload.kind == "fiber":
+                    # A duplicate-content retry through a fresh upload ID is
+                    # harmless. Leave publication to the service CAS check.
+                    single.unlink(missing_ok=True)
+                    shutil.rmtree(upload.staging_dir, ignore_errors=True)
+                else:
+                    raise ApiError(HTTPStatus.CONFLICT,
+                                   "An ephemeral input with this id already exists")
             if upload.kind == "patch":
                 os.replace(upload.staging_dir, published)
-            else:
+            elif not published.exists():
                 os.replace(single, published)
                 shutil.rmtree(upload.staging_dir, ignore_errors=True)
             record = {
@@ -712,6 +854,9 @@ class UploadManager:
                 "state": "pending",
                 "upload_id": upload.upload_id,
             }
+            if upload.kind == "fiber":
+                record["base_revision"] = upload.base_revision
+                record["revision"] = upload.revision
             upload.record = record
         return FinalizedUpload(upload.kind, dict(record))
 

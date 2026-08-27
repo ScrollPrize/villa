@@ -714,6 +714,11 @@ def merge_linked_point_collections(point_collections, link_components,
             continue
         merged_id = f'fibercomp:{num_merged}'
         rep = members[0][1]
+        logical_members = [
+            pcl.get('metadata', {}).get('logical_input_id')
+            for _, pcl in members
+            if pcl.get('metadata', {}).get('logical_input_id') is not None
+        ]
         if extra_edges:
             print(f'fiber-link component {merged_id} '
                   f'({[cid for cid, _ in members]}): {len(extra_edges)} '
@@ -723,7 +728,8 @@ def merge_linked_point_collections(point_collections, link_components,
             'name': merged_id,
             'sampling_group': rep.get('sampling_group', 'fibers'),
             'metadata': {'winding_is_absolute': False,
-                         'input_role': 'fiber_link_component'},
+                         'input_role': 'fiber_link_component',
+                         'logical_input_ids': logical_members},
             'points': merged_points,
             'link_member_cids': [cid for cid, _ in members],
             'chain': ComponentChain(member_sorted, pos_of, tree_parent, extra_edges),

@@ -749,13 +749,16 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _commitInputs = new QPushButton(tr("Commit current inputs"), runContents);
     _commitInputs->setEnabled(false);
     _commitInputs->setToolTip(tr("Copy the session's added inputs into their dataset locations"));
+    _addInputs = new QPushButton(tr("Add to current fit"), runContents);
+    _addInputs->setToolTip(tr("Snapshot and upload all ready local drawing drafts"));
     _removeInput = new QPushButton(tr("Remove"), runContents);
     _removeInput->setEnabled(false);
-    _removeInput->setToolTip(tr("Remove the selected input before it joins the fit; "
-                                "inputs that already joined need a session reload"));
+    _removeInput->setToolTip(tr("Remove a pending input before it is queued; queued "
+                                "or incorporated inputs cannot be removed"));
     _commitHint = new QLabel(runContents);
     _commitHint->setWordWrap(true);
     auto* commitRow = new QHBoxLayout;
+    commitRow->addWidget(_addInputs);
     commitRow->addWidget(_commitInputs);
     commitRow->addWidget(_removeInput);
     commitRow->addStretch(1);
@@ -1256,7 +1259,10 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                                      "lines go to drawn_control_points.json; "
                                      "same-winding point collections go to same_windings.json)."))
             != QMessageBox::Yes) return;
-        _service->commitInputs();
+        emit addDraftsRequested(true);
+    });
+    connect(_addInputs, &QPushButton::clicked, this, [this]() {
+        emit addDraftsRequested(false);
     });
     connect(_ephemeralList, &QListWidget::itemSelectionChanged, this, [this]() {
         const QListWidgetItem* item = _ephemeralList->currentItem();
@@ -1579,6 +1585,15 @@ void SpiralPanel::setLossMapOptions(const QStringList& names)
 void SpiralPanel::setLossMapLegend(const QString& text)
 {
     if (_lossMapLegend) _lossMapLegend->setText(text);
+}
+
+void SpiralPanel::setLocalDraftsReady(bool ready)
+{
+    _localDraftsReady = ready;
+    if (_addInputs) _addInputs->setEnabled(_connected && _hasSession && ready);
+    if (_commitInputs)
+        _commitInputs->setEnabled(_connected && _hasSession
+                                  && (ready || _uncommittedCount > 0));
 }
 
 void SpiralPanel::applyResolution(const QJsonObject& resolution, bool force)
@@ -2103,11 +2118,14 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     const QJsonArray ephemeral = status.value(QStringLiteral("ephemeral_inputs")).toArray();
     _ephemeralCount = ephemeral.size();
     int pendingCount = 0;
+    int queuedCount = 0;
     _uncommittedCount = 0;
     for (const QJsonValue& value : ephemeral) {
         const QJsonObject input = value.toObject();
         if (input.value(QStringLiteral("state")).toString() == QStringLiteral("pending"))
             ++pendingCount;
+        if (input.value(QStringLiteral("state")).toString() == QStringLiteral("queued"))
+            ++queuedCount;
         if (!input.value(QStringLiteral("committed")).toBool())
             ++_uncommittedCount;
     }
@@ -2125,8 +2143,14 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
             const QJsonObject input = value.toObject();
             const QString kind = input.value(QStringLiteral("kind")).toString();
             const QString id = input.value(QStringLiteral("id")).toString();
-            QString label = tr("%1 %2 — %3")
-                .arg(kind, id, input.value(QStringLiteral("state")).toString());
+            const QString inputState =
+                input.value(QStringLiteral("state")).toString();
+            QString stateLabel = inputState;
+            if (inputState == QStringLiteral("queued"))
+                stateLabel = tr("queued for next optimizer step");
+            else if (inputState == QStringLiteral("pending"))
+                stateLabel = tr("pending for next Run");
+            QString label = tr("%1 %2 — %3").arg(kind, id, stateLabel);
             if (input.value(QStringLiteral("committed")).toBool())
                 label += tr(", committed");
             const QString role = input.value(QStringLiteral("role")).toString();
@@ -2134,19 +2158,32 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
             auto* item = new QListWidgetItem(label, _ephemeralList);
             item->setData(Qt::UserRole, kind);
             item->setData(Qt::UserRole + 1, id);
-            item->setData(Qt::UserRole + 2, input.value(QStringLiteral("state")).toString());
+            item->setData(Qt::UserRole + 2, inputState);
+            const QString incorporationError =
+                input.value(QStringLiteral("error")).toString();
+            if (!incorporationError.isEmpty()) {
+                item->setToolTip(tr("Input incorporation failed: %1")
+                                     .arg(incorporationError));
+                label += tr(": %1").arg(incorporationError);
+                item->setText(label);
+            }
             if (kind == selectedKind && id == selectedId) _ephemeralList->setCurrentItem(item);
         }
     }
     const bool commitAvailable = status.value(QStringLiteral("commit_available")).toBool();
-    _commitInputs->setEnabled(commitAvailable);
+    _commitInputs->setEnabled(commitAvailable || _localDraftsReady);
+    _addInputs->setEnabled(_connected && _hasSession && _localDraftsReady);
     if (_ephemeralCount > 0 && !commitAvailable && _uncommittedCount > 0)
         _commitHint->setText(tr("Commit unavailable: %1")
                                  .arg(status.value(QStringLiteral("commit_unavailable_reason")).toString()));
+    else if (queuedCount > 0 && pendingCount > 0)
+        _commitHint->setText(
+            tr("Queued inputs join before the next optimizer step; pending inputs "
+               "wait for the next Run"));
+    else if (queuedCount > 0)
+        _commitHint->setText(tr("Queued inputs join before the next optimizer step"));
     else if (pendingCount > 0)
-        _commitHint->setText(state == QStringLiteral("Running")
-            ? tr("Pending inputs join the fit when this run pauses and the next run starts")
-            : tr("Pending inputs join the fit on the next run"));
+        _commitHint->setText(tr("Pending inputs join the fit on the next Run"));
     else
         _commitHint->clear();
 }

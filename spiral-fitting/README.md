@@ -269,21 +269,43 @@ disables its dependent supervision: phase spacing needs normals and surface
 SDT, while winding inference needs the outer shell.
 
 While a session is active you can right-click a patch in the Surface panel or
-a fiber in the Fibers panel and pick *Add to current spiral fit*. Added inputs
-are uploaded into a session-scoped ephemeral folder, used from the next run
-onward, and can be moved into the shared dataset with *Commit current inputs*.
-Commits from multiple service processes are serialized; distinct inputs and
-point collections are preserved, while an existing patch or fiber identifier
-is reported as a conflict and is never overwritten.
+a fiber in the Fibers panel and pick *Add to current spiral fit*. Shift+E in
+the Spiral workspace only marks drawn patches and point collections as local,
+editable drafts; **Add to current fit** snapshots and uploads every ready
+draft. **Commit current inputs** performs that Add first, waits for every
+upload, and only then moves the added inputs into the shared dataset. If an
+upload fails, commit stops and the failed draft remains editable. If a
+multi-step Run is active,
+successful finalization automatically queues the input for incorporation
+immediately before the next optimizer iteration; it does not add iterations or
+move the Run's requested target. An input finalized after the final iteration
+has begun remains pending for the next Run.
+Commits from multiple service processes are serialized. Drawn patches and
+point collections become immutable after Add. Explicitly added ordinary fibers
+stay tracked by stable fiber ID: later successful saves upload a content
+revision using the last known revision as a compare-and-swap base. Stale bases
+receive the current revision. Once explicitly committed, later incorporated
+revisions auto-commit; deleting the VC3D fiber does not remove its last resident
+revision.
 
-Interactive influence settings are scoped to each **Run** request. The fitter
-builds a fresh influence region from only the inputs pending for that run,
-uses it for the requested iteration window, and discards it before autosaving.
+Interactive influence settings are captured when each **Run** request starts.
+The fitter builds an influence region from the inputs pending at Run start;
+inputs added live use the same captured settings and extend the region's union.
+They also extend (never shorten) the DT-disabled deadline within the remaining
+Run window. The region is cleared only when the Run pauses, before autosaving.
 Influence masks, limits, and controls are not checkpoint state. All
 `interactive_influence_*` advanced settings can therefore change between runs
 without reloading the resident session. The **Disable DT** percentage controls
 how much of that run suppresses directional DT losses after incorporating its
 pending inputs.
+
+Input-local validation failures (for example, an empty fiber or a patch outside
+the fitted z range) are reported on that input and do not stop optimization;
+other valid records in the same batch still join. A failure after resident
+mutation begins is fatal because continuing could diverge GPU ranks or leave a
+partially updated resident fit. In multi-GPU sessions all ranks reserve one
+future iteration and agree on validation before application; a boundary any
+rank has already passed is cancelled and retried later.
 
 **Checkpoints** are one panel section, and loading one is one button. It lists
 what the service advertises (checkpoints at the dataset root, and those under

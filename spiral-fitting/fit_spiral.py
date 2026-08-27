@@ -11,6 +11,7 @@ os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 import copy
 import concurrent.futures
 import gc
+import hashlib
 import multiprocessing
 import json
 import glob
@@ -1606,6 +1607,18 @@ class FitContext:
         # sampling group, rather than one group per source file like the regular pcls.
         for pcl in fiber_point_collections.values():
             pcl['sampling_group'] = 'fibers'
+            source = pcl.get('source_file', '')
+            logical_id = os.path.splitext(os.path.basename(source))[0]
+            try:
+                with open(source, 'rb') as stream:
+                    revision = hashlib.sha256(stream.read()).hexdigest()
+            except OSError:
+                revision = None
+            pcl.setdefault('metadata', {}).update({
+                'logical_input_kind': 'fiber',
+                'logical_input_id': logical_id,
+                'logical_input_revision': revision,
+            })
         point_collections.update(fiber_point_collections)
 
         for pcl in point_collections.values():
@@ -1841,6 +1854,12 @@ class FitContext:
                 'zyxs': zyxs,
                 'windings': windings,
                 'link_points': link_points,
+                'logical_input_kind': pcl.get('metadata', {}).get(
+                    'logical_input_kind'),
+                'logical_input_id': pcl.get('metadata', {}).get(
+                    'logical_input_id'),
+                'logical_input_revision': pcl.get('metadata', {}).get(
+                    'logical_input_revision'),
             })
             unattached_strip_sampling_groups.append(pcl['sampling_group'])
 
@@ -3637,8 +3656,110 @@ class FitContext:
             f'{reserved_after / gib:.2f} GiB still reserved)',
             flush=True)
 
+    def _prevalidate_interactive_input(self, record):
+        """Load and validate one record without touching resident structures."""
+        kind = record.get('kind')
+        path = record.get('path')
+        input_id = record.get('id')
+        if kind == 'patch':
+            if not input_source_enabled(self.config, 'verified_patches'):
+                raise ValueError('verified-patch inputs are disabled for this session')
+            if input_id in self.verified_patches:
+                raise ValueError(f'Patch {input_id!r} is already part of this session')
+            patch = load_tifxyz(path)
+            cells = patch.erosion_cells(self.config['patch_erode_patches'])
+            if cells > 0 and not erode_patch_valid_region(patch, cells):
+                raise ValueError(f'Patch {input_id!r} has no valid quads after erosion')
+            if not patch_intersects_z_roi(patch, self.z_begin, self.z_end):
+                raise ValueError(
+                    f'Patch {input_id!r} does not intersect the fitted z range '
+                    f'[{self.z_begin}, {self.z_end})')
+            return
+        if kind == 'fiber':
+            if not input_source_enabled(self.config, 'fibers'):
+                raise ValueError('fiber inputs are disabled for this session')
+            pcl = load_fiber_point_collection(
+                path, self.next_id,
+                min_point_spacing=self.config['pcl_fiber_min_point_spacing'])
+            if pcl is None:
+                raise ValueError(f'Fiber {input_id!r} has no usable control points')
+            groups = ['fibers']
+        elif kind == 'pcl':
+            role = record.get('role')
+            if not pcl_input_enabled(self.config, role, path):
+                raise ValueError(
+                    f'{role or "legacy"} PCL inputs are disabled for this session')
+            loaded = load_point_collection(path) or {}
+            if not loaded:
+                raise ValueError(
+                    f'PCL document {input_id!r} contains no collections')
+            if role == 'absolute':
+                for pcl in loaded.values():
+                    for point in pcl.get('points', {}).values():
+                        value = point.get('winding_annotation')
+                        if value is not None and (not np.isfinite(value) or value <= 0):
+                            raise ValueError(
+                                f'Absolute-winding pcl {pcl.get("name")!r} must '
+                                'use positive winding annotations')
+            groups = [path] * len(loaded)
+        else:
+            raise ValueError(f'Unknown ephemeral input kind {kind!r}')
+        if self.config['pcl_sampling_weights'] is not None:
+            build_pcl_sampling_strata(groups, self.config)
+
     def incorporate_interactive_inputs(self, records, influence_config=None, *,
                                        current_iteration, target_iteration):
+        """Prevalidate independently, then atomically apply all valid records."""
+        outcomes = self.prevalidate_interactive_inputs(records)
+        valid_identities = {
+            (outcome['kind'], outcome['id'], outcome.get('revision'))
+            for outcome in outcomes
+            if outcome['state'] == 'incorporated'
+        }
+        valid = [record for record in records
+                 if (record.get('kind'), record.get('id'),
+                     record.get('revision')) in valid_identities]
+        warnings = []
+        if valid:
+            warnings = self._incorporate_prevalidated_interactive_inputs(
+                valid, influence_config,
+                current_iteration=current_iteration,
+                target_iteration=target_iteration)
+        return {'outcomes': outcomes, 'warnings': list(warnings or ())}
+
+    def prevalidate_interactive_inputs(self, records):
+        """Return deterministic per-record verdicts without resident mutation."""
+        numpy_state = np.random.get_state()
+        torch_state = torch.random.get_rng_state()
+        cuda_states = torch.cuda.get_rng_state_all()
+        try:
+            outcomes = []
+            for record in records:
+                try:
+                    self._prevalidate_interactive_input(record)
+                except (OSError, ValueError, KeyError, TypeError,
+                        RuntimeError) as exc:
+                    outcomes.append({
+                        'id': record.get('id'), 'kind': record.get('kind'),
+                        'revision': record.get('revision'),
+                        'state': 'error',
+                        'error': f'{type(exc).__name__}: {exc}',
+                    })
+                else:
+                    outcomes.append({
+                        'id': record.get('id'), 'kind': record.get('kind'),
+                        'revision': record.get('revision'),
+                        'state': 'incorporated',
+                    })
+            return outcomes
+        finally:
+            np.random.set_state(numpy_state)
+            torch.random.set_rng_state(torch_state)
+            torch.cuda.set_rng_state_all(cuda_states)
+
+    def _incorporate_prevalidated_interactive_inputs(
+            self, records, influence_config=None, *, current_iteration,
+            target_iteration):
         """Append uploaded ephemeral inputs to the resident fit structures.
 
         current_iteration/target_iteration describe the Run request queued
@@ -3664,9 +3785,6 @@ class FitContext:
         torch_state = torch.random.get_rng_state()
         cuda_states = torch.cuda.get_rng_state_all()
         try:
-            # Be defensive about a previously interrupted boundary: a new
-            # batch must never union with an earlier Run request's masks.
-            self.clear_interactive_influence()
             run_cfg = dict(self.config)
             run_cfg.update(dict(influence_config or {}))
             new_patches = {}
@@ -3708,6 +3826,10 @@ class FitContext:
                     pcl['source_file'] = path
                     pcl.setdefault('metadata', {})['winding_is_absolute'] = False
                     pcl['metadata']['input_role'] = 'fiber'
+                    pcl['metadata']['logical_input_kind'] = 'fiber'
+                    pcl['metadata']['logical_input_id'] = input_id
+                    pcl['metadata']['logical_input_revision'] = record.get(
+                        'revision')
                     pcl['sampling_group'] = 'fibers'
                     new_fibers.append((input_id, pcl))
                     new_collections[self.next_id] = pcl
@@ -3738,6 +3860,48 @@ class FitContext:
                 build_pcl_sampling_strata(
                     (pcl['sampling_group'] for pcl in new_collections.values()),
                     self.config)
+
+            # A fiber revision replaces its logical predecessor. Candidate
+            # loading and all input-local validation above completed before
+            # this first resident mutation. From here on, an unexpected error
+            # is deliberately fatal rather than exposing a half-swapped fit.
+            resident_fiber_ids = {
+                str(strip.get('logical_input_id'))
+                for strip in self.unattached_pcl_strips
+                if strip.get('logical_input_id') is not None
+            }
+            for pcl in self.cross_patch_pcls:
+                metadata = pcl.get('metadata', {})
+                if metadata.get('logical_input_id') is not None:
+                    resident_fiber_ids.add(str(metadata['logical_input_id']))
+                resident_fiber_ids.update(
+                    str(value) for value in metadata.get(
+                        'logical_input_ids', ()))
+            replacement_ids = {
+                str(record.get('id')) for record in records
+                if record.get('kind') == 'fiber'
+                and (record.get('operation') == 'replace'
+                     or str(record.get('id')) in resident_fiber_ids)
+            }
+            if replacement_ids:
+                self.cross_patch_pcls[:] = [
+                    pcl for pcl in self.cross_patch_pcls
+                    if str(pcl.get('metadata', {}).get('logical_input_id'))
+                    not in replacement_ids
+                    and not replacement_ids.intersection(
+                        str(value) for value in pcl.get('metadata', {}).get(
+                            'logical_input_ids', ()))
+                ]
+                retained = [
+                    (strip, group) for strip, group in zip(
+                        self.unattached_pcl_strips,
+                        self.unattached_strip_sampling_groups)
+                    if str(strip.get('logical_input_id')) not in replacement_ids
+                ]
+                self.unattached_pcl_strips[:] = [item[0] for item in retained]
+                self.unattached_strip_sampling_groups[:] = [
+                    item[1] for item in retained]
+                self.unattached_pcl_strips.flat = None
 
             # ---- Patches: sampling caches, probabilities, atlas append ----
             if new_patches:
@@ -3851,6 +4015,12 @@ class FitContext:
                         'source_file': pcl.get('source_file'),
                         'zyxs': zyxs,
                         'windings': windings,
+                        'logical_input_kind': pcl.get('metadata', {}).get(
+                            'logical_input_kind'),
+                        'logical_input_id': pcl.get('metadata', {}).get(
+                            'logical_input_id'),
+                        'logical_input_revision': pcl.get('metadata', {}).get(
+                            'logical_input_revision'),
                     })
                     self.unattached_strip_sampling_groups.append(pcl.get('sampling_group'))
                 # No 'link_points' on these strips: an uploaded fiber's
@@ -3867,6 +4037,12 @@ class FitContext:
                 # Whole-object DT target caches index the (now longer) object
                 # pools; force recomputation on next use.
                 self.dt_target_cache_manager.reset()
+                if replacement_ids:
+                    trusted = self._trusted_geometry_from_active_inputs()
+                    trusted_np = np.ascontiguousarray(
+                        trusted.cpu().numpy(), dtype=np.float32)
+                    self.trusted_geometry_tree = (
+                        cKDTree(trusted_np) if len(trusted_np) else None)
                 theta_warnings = self._build_theta_crossing_map()
                 # The gate may have rejected one of this incorporation's
                 # patches; downstream influence setup must see only survivors.
@@ -3876,7 +4052,9 @@ class FitContext:
                 }
 
             if run_cfg['influence_enabled'] and (new_patches or new_collections):
-                self.influence_state = make_influence_state(run_cfg, torch.device('cuda'))
+                if self.influence_state is None:
+                    self.influence_state = make_influence_state(
+                        run_cfg, torch.device('cuda'))
                 self.influence_state.activate_or_extend_(
                     new_patches=new_patches,
                     new_collections=new_collections,
@@ -3900,7 +4078,12 @@ class FitContext:
                 target_iteration,
                 run_cfg['influence_disable_dt_frac'],
             )
-            self.interactive_dt_resume_iteration = dt_resume_iteration
+            if self.interactive_dt_resume_iteration is None:
+                self.interactive_dt_resume_iteration = dt_resume_iteration
+            else:
+                self.interactive_dt_resume_iteration = max(
+                    self.interactive_dt_resume_iteration,
+                    dt_resume_iteration)
 
             print(f'incorporated {len(new_patches)} patches and '
                   f'{len(new_collections)} point collections into the resident session; '

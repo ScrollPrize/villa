@@ -97,7 +97,10 @@ from config import Config
 # Version 30 makes session creation explicit.  A service starts in
 # Uninitialized and does not import the fitting runtime, initialize CUDA, read
 # fit inputs, or select an autosave until POST /session/initialize.
-API_VERSION = 30
+# Version 32 separates client-local drafts from submitted inputs and adds
+# compare-and-swap revisions for tracked fibers.  A settled fiber remains in
+# status so reconnecting clients can resume from its opaque content revision.
+API_VERSION = 32
 
 
 class SessionState(str, Enum):

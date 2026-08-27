@@ -541,6 +541,12 @@ class ServiceState:
         self.artifacts = ArtifactRegistry()
         self.uploads_manager = UploadManager(self._upload_environment())
         self.ephemeral_records = EphemeralLedger(self.lock)
+        # Finalization may happen on several HTTP threads. They feed one
+        # deterministic ledger-ordered dispatcher so the runtime sees at most
+        # one live-incorporation request at a time.
+        self._live_incorporation_queue = []
+        self._live_incorporation_active = False
+        self._active_run_influence = None
         # One record for the whole of preview publication (see
         # LasagnaPublisher's PreviewPublication), guarded by self.lock.
         self._preview = PreviewPublication()
@@ -1391,14 +1397,35 @@ class ServiceState:
             # The fitter (and, under DDP, its child ranks) receives plain
             # records; the ledger maps them back to its own entries when the
             # incorporation outcome arrives.
-            pending = [record.payload()
-                       for record in self.ephemeral_records.pending()]
+            claimed = self.ephemeral_records.claim_pending()
+            pending = [record.payload() for record in claimed]
 
-            def mark_incorporated(records, error=None):
+            def mark_incorporated(records, error=None, outcomes=None,
+                                  no_future_step=False):
+                automatic = []
                 with self.lock:
-                    self.ephemeral_records.mark_incorporated(
-                        self.ephemeral_records.resolve(records), error=error)
+                    resolved = self.ephemeral_records.resolve(records)
+                    if no_future_step:
+                        self.ephemeral_records.return_pending(resolved)
+                    elif outcomes is not None:
+                        self.ephemeral_records.mark_outcomes(outcomes)
+                    else:
+                        self.ephemeral_records.mark_incorporated(
+                            resolved, error=error)
+                    automatic = [
+                        record for record in resolved
+                        if record.kind == "fiber" and record.auto_commit
+                        and record.incorporated_revision == record.revision
+                        and record.committed_revision != record.revision
+                    ]
                     self.status_generation += 1
+                for record in automatic:
+                    self._auto_commit_fiber(record)
+                for record in resolved:
+                    if record.kind == "fiber":
+                        self._cleanup_fiber_revision_files(record)
+
+            self._active_run_influence = dict(influence_config)
 
         run_arguments = {
                 "pending_inputs": pending,
@@ -1410,7 +1437,13 @@ class ServiceState:
                 # nothing about the model, so it needs no planning round.
                 "autosave_on_pause": autosave_on_pause,
         }
-        target = session.run(iterations, **run_arguments)
+        try:
+            target = session.run(iterations, **run_arguments)
+        except BaseException:
+            with self.lock:
+                self.ephemeral_records.return_pending(claimed)
+                self._active_run_influence = None
+            raise
         with self.lock:
             self.status_generation += 1
         return {**self.status(), "accepted": True, "target_iteration": target}
@@ -1947,14 +1980,23 @@ class ServiceState:
         with self.lock:
             return self.session_paths.checkpoint if self.session_paths else ""
 
-    def _reserve_ephemeral(self, kind, input_id, declared):
+    def _reserve_ephemeral(self, kind, input_id, declared,
+                           base_revision=None, revision=None):
         """Admit one new ephemeral input, or refuse it.
 
         Duplicate identities and the ephemeral quota are ledger questions,
         not transfer questions, so the upload manager delegates them here.
         """
         with self.lock:
-            if self.ephemeral_records.contains(kind, input_id):
+            existing = self.ephemeral_records.find(kind, input_id)
+            if kind == "fiber":
+                current = existing.revision if existing is not None else None
+                if base_revision != current:
+                    raise ApiError(
+                        HTTPStatus.CONFLICT,
+                        f"Fiber {input_id!r} changed since this client last saw it",
+                        payload={"current_revision": current})
+            elif existing is not None:
                 raise ApiError(HTTPStatus.CONFLICT,
                                f"An ephemeral {kind} named {input_id!r} already exists")
             if self._ephemeral_bytes_in_use() + declared > EPHEMERAL_QUOTA_BYTES:
@@ -1975,13 +2017,182 @@ class ServiceState:
 
     def finalize_upload(self, upload_id):
         finalized = self.uploads_manager.finalize(upload_id)
-        if not finalized.replayed:
+        ledger_record = None
+        if finalized.kind == "fiber":
+            with self.lock:
+                existing = self.ephemeral_records.find(
+                    "fiber", finalized.record.get("id"))
+                current = existing.revision if existing is not None else None
+                revision = finalized.record.get("revision")
+                if current == revision:
+                    # Replay of a finalized upload ID, or a fresh upload of
+                    # identical bytes, converges on the existing logical row.
+                    record = existing
+                else:
+                    base = finalized.record.get("base_revision")
+                    if base != current:
+                        path = Path(finalized.record["path"])
+                        path.unlink(missing_ok=True)
+                        raise ApiError(
+                            HTTPStatus.CONFLICT,
+                            f"Fiber {finalized.record.get('id')!r} changed "
+                            "while this revision was uploading",
+                            payload={"current_revision": current})
+                    record = self.ephemeral_records.revise_fiber(
+                        finalized.record)
+                ledger_record = record
+                if (record is not None and current != revision
+                        and self.session is not None
+                        and self.session.status().get("state")
+                        == SessionState.Running
+                        and self._active_run_influence is not None):
+                    record.incorporation = "queued"
+                    if record not in self._live_incorporation_queue:
+                        self._live_incorporation_queue.append(record)
+                    self._start_live_incorporation_dispatch_locked()
+                self.status_generation += 1
+        elif not finalized.replayed:
             with self.lock:
                 if finalized.kind != "checkpoint":
-                    self.ephemeral_records.add(finalized.record)
+                    ledger_record = self.ephemeral_records.add(finalized.record)
+                    if (self.session is not None
+                            and self.session.status().get("state")
+                            == SessionState.Running
+                            and self._active_run_influence is not None):
+                        ledger_record.incorporation = "queued"
+                        self._live_incorporation_queue.append(ledger_record)
+                        self._start_live_incorporation_dispatch_locked()
                 self.status_generation += 1
-        return {**self.status(), "input": dict(finalized.record),
+        input_record = dict(finalized.record)
+        if ledger_record is None and finalized.kind != "checkpoint":
+            ledger_record = self.ephemeral_records.find(
+                finalized.record.get("kind"), finalized.record.get("id"))
+        if ledger_record is not None:
+            input_record.update(ledger_record.status_entry())
+        return {**self.status(), "input": input_record,
                 "accepted": True}
+
+    def _start_live_incorporation_dispatch_locked(self):
+        """Start the one service dispatcher; caller holds ``self.lock``."""
+        if self._live_incorporation_active:
+            return
+        self._live_incorporation_active = True
+        generation = self.session_generation
+        threading.Thread(
+            target=self._dispatch_live_incorporation,
+            args=(generation,), name="spiral-live-inputs", daemon=True,
+        ).start()
+
+    def _dispatch_live_incorporation(self, generation):
+        """Coalesce finalized records and hand each batch to the runtime."""
+        while True:
+            with self.lock:
+                if generation != self.session_generation:
+                    abandoned = list(self._live_incorporation_queue)
+                    self._live_incorporation_queue.clear()
+                    self.ephemeral_records.return_pending(abandoned)
+                    self._live_incorporation_active = False
+                    return
+                if not self._live_incorporation_queue:
+                    self._live_incorporation_active = False
+                    return
+                batch = list(self._live_incorporation_queue)
+                self._live_incorporation_queue.clear()
+                session = self.session
+                influence = dict(self._active_run_influence or {})
+                running = (session is not None
+                           and session.status().get("state")
+                           == SessionState.Running)
+            if not running or not hasattr(session, "incorporate_live"):
+                with self.lock:
+                    self.ephemeral_records.return_pending(batch)
+                    self.status_generation += 1
+                continue
+            payloads = [record.payload() for record in batch]
+            try:
+                result = session.incorporate_live(payloads, influence)
+            except Exception as exc:
+                # Runtime failures after mutation begins are fail-stop. Its
+                # state/error is authoritative; keep the records diagnosable.
+                error = f"{type(exc).__name__}: {exc}"
+                with self.lock:
+                    self.ephemeral_records.mark_incorporated(batch, error=error)
+                    self.status_generation += 1
+                continue
+            with self.lock:
+                if result.get("no_future_step"):
+                    self.ephemeral_records.return_pending(batch)
+                else:
+                    self.ephemeral_records.mark_outcomes(
+                        result.get("outcomes", []))
+                self.status_generation += 1
+                auto_commit = [
+                    record for record in batch
+                    if record.kind == "fiber" and record.auto_commit
+                    and record.incorporated_revision == record.revision
+                    and record.committed_revision != record.revision
+                ]
+            for record in auto_commit:
+                try:
+                    self._auto_commit_fiber(record)
+                except Exception as exc:
+                    with self.lock:
+                        record.error = ("Automatic commit failed: "
+                                        f"{type(exc).__name__}: {exc}")
+                        record.error_revision = record.revision
+                        self.status_generation += 1
+            for record in batch:
+                if record.kind == "fiber":
+                    self._cleanup_fiber_revision_files(record)
+
+    def _cleanup_fiber_revision_files(self, record):
+        """Drop superseded staged content after runtime references are gone."""
+        with self.lock:
+            if record.kind != "fiber":
+                return
+            current = self.ephemeral_records.find("fiber", record.id)
+            if current is not record:
+                return
+            protected = {
+                value for value in (
+                    record.revision, record.incorporated_revision,
+                    record.committed_revision)
+                if value
+            }
+            directory = Path(record.path).parent
+        if not directory.is_dir():
+            return
+        for path in directory.glob("*.json"):
+            if path.stem not in protected:
+                path.unlink(missing_ok=True)
+
+    def _auto_commit_fiber(self, record):
+        """Persist one incorporated tracked revision without touching drafts."""
+        with self.lock:
+            if (self.session_paths is None or not record.auto_commit
+                    or record.incorporated_revision != record.revision
+                    or record.committed_revision == record.revision):
+                return
+            dataset_root = Path(self.session_paths.dataset_root)
+            fibers_dir = (Path(self.session_paths.fibers)
+                          if self.session_paths.fibers
+                          else dataset_root / "fibers")
+        commit_lock = ExclusiveFileLock(dataset_root / ".spiral-commit.lock")
+        commit_lock.acquire(DATASET_COMMIT_LOCK_TIMEOUT_SECONDS)
+        try:
+            with self.lock:
+                if (record not in self.ephemeral_records.records
+                        or record.incorporated_revision != record.revision
+                        or record.committed_revision == record.revision):
+                    return
+                _copy_publish(Path(record.path),
+                              fibers_dir / f"{record.id}.json",
+                              keep_source=True)
+                record.persistence = "committed"
+                record.committed_revision = record.revision
+                self.status_generation += 1
+        finally:
+            commit_lock.release()
 
     def gc_uploads(self):
         self.uploads_manager.collect_garbage()
@@ -2034,11 +2245,9 @@ class ServiceState:
                     raise ApiError(
                         HTTPStatus.CONFLICT,
                         f"A patch named {record.id!r} already exists in the dataset")
-                if record.kind == "fiber" and \
-                        (fibers_dir / f"{record.id}.json").exists():
-                    raise ApiError(
-                        HTTPStatus.CONFLICT,
-                        f"A fiber named {record.id!r} already exists in the dataset")
+                # A tracked fiber commonly originates at this exact dataset
+                # path. Explicit commit adopts/updates it atomically and makes
+                # auto-commit sticky for later revisions.
 
             committed = []
             for record in records:
@@ -2050,7 +2259,8 @@ class ServiceState:
                 if record.kind == "patch":
                     _copy_publish(source, patches_dir / record.id, keep_source)
                 elif record.kind == "fiber":
-                    _copy_publish(source, fibers_dir / f"{record.id}.json", keep_source)
+                    _copy_publish(source, fibers_dir / f"{record.id}.json",
+                                  keep_source=True)
                 else:
                     target = dataset_root / PCL_ROLE_FILES[record.role]
                     with source.open("r", encoding="utf-8") as stream:
@@ -2098,6 +2308,11 @@ class ServiceState:
             if record is None:
                 raise ApiError(HTTPStatus.NOT_FOUND,
                                f"No ephemeral {kind or 'input'} named {input_id!r} exists")
+            if record.incorporation == "queued":
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    "This input is queued for the next optimizer step and "
+                    "can no longer be removed")
             if record.incorporated:
                 raise ApiError(HTTPStatus.CONFLICT,
                                "This input already joined the resident fit; removing it "

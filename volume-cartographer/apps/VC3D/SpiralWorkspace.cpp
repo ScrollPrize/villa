@@ -49,6 +49,7 @@
 #include <QtConcurrent/QtConcurrent>
 
 #include <array>
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <limits>
@@ -208,8 +209,8 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                     } else {
                         QDir(patch.path).removeRecursively();
                         _brush->finalizationFailed(inputId);
+                        _commitAfterBrushUploads = false;
                         if (_pendingExitAction) {
-                            _commitAfterBrushUploads = false;
                             _pendingExitAction = {};
                             QMessageBox::warning(this, tr("Brush upload failed"), error);
                         }
@@ -231,13 +232,39 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 } else {
                     QFile::remove(path);
                     _brush->finalizationFailed(inputId);
+                    _commitAfterBrushUploads = false;
                     if (_pendingExitAction) {
-                        _commitAfterBrushUploads = false;
                         _pendingExitAction = {};
                         QMessageBox::warning(this, tr("Control-point upload failed"), error);
                     }
                 }
                 maybeCommitForPendingExit();
+            });
+    connect(_service, &SpiralServiceManager::fiberRevisionUploadFinished, this,
+            [this](const QString& inputId, const QString& revision,
+                   const QString& error) {
+                for (auto it = _trackedFibers.begin(); it != _trackedFibers.end(); ++it) {
+                    if (it->inputId != inputId) continue;
+                    it->uploadInFlight = false;
+                    if (!it->snapshotPath.isEmpty()) QFile::remove(it->snapshotPath);
+                    it->snapshotPath.clear();
+                    if (!error.isEmpty()) {
+                        statusBar()->showMessage(
+                            tr("Fiber %1 revision upload failed: %2")
+                                .arg(inputId, error), 15000);
+                        if (!it->added) _trackedFibers.erase(it);
+                        return;
+                    }
+                    it->revision = revision;
+                    it->added = true;
+                    _residentFiberRevisions[inputId] = revision;
+                    const uint64_t fiberId = it.key();
+                    if (it->latestGeneration > it->sentGeneration)
+                        QTimer::singleShot(0, this, [this, fiberId]() {
+                            uploadNewestFiberRevision(fiberId);
+                        });
+                    return;
+                }
             });
     connect(_service, &SpiralServiceManager::commitInputsFinished, this,
             [this](const QStringList& committed, const QString& error) {
@@ -266,8 +293,15 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
             });
     auto* finalizeBrushShortcut = new QShortcut(QKeySequence(Qt::SHIFT | Qt::Key_E), this);
     finalizeBrushShortcut->setContext(Qt::WidgetWithChildrenShortcut);
-    connect(finalizeBrushShortcut, &QShortcut::activated,
-            this, &SpiralWorkspace::finalizeBrushPaint);
+    connect(finalizeBrushShortcut, &QShortcut::activated, this, [this]() {
+        if (!_service || !_service->hasActiveSession()) {
+            statusBar()->showMessage(tr("Load a Spiral fit before readying drawn inputs"), 10000);
+            return;
+        }
+        _brush->markDraftsReady();
+        statusBar()->showMessage(
+            tr("Drawing draft is ready; use Add to current fit to submit it"), 5000);
+    });
     connect(_brush.get(), &SpiralBrushController::brushDiameterChanged,
             this, [this](int diameter) {
                 statusBar()->showMessage(tr("Spiral brush diameter: %1 px").arg(diameter), 2500);
@@ -278,6 +312,12 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
             });
 
     _panel = new SpiralPanel(_service, this);
+    connect(_panel, &SpiralPanel::addDraftsRequested,
+            this, &SpiralWorkspace::submitReadyDrafts);
+    connect(_brush.get(), &SpiralBrushController::paintStateChanged,
+            this, [this]() {
+                _panel->setLocalDraftsReady(_brush->hasReadyDrafts());
+            });
     _panel->setSessionExitGuard([this](std::function<void()> continuation) {
         requestSessionExit(std::move(continuation));
     });
@@ -630,8 +670,22 @@ void SpiralWorkspace::updatePendingPatchIds(const QJsonObject& status)
 {
     QSet<QString> pendingPatches;
     QSet<QString> uncommittedDrawnPointCollections;
+    _residentFiberRevisions.clear();
     for (const QJsonValue& value : status.value(QStringLiteral("ephemeral_inputs")).toArray()) {
         const QJsonObject input = value.toObject();
+        if (input.value(QStringLiteral("kind")).toString() == QStringLiteral("fiber")) {
+            const QString id = input.value(QStringLiteral("id")).toString();
+            const QString revision = input.value(QStringLiteral("revision")).toString();
+            if (!id.isEmpty() && !revision.isEmpty())
+                _residentFiberRevisions[id] = revision;
+            for (auto tracked = _trackedFibers.begin();
+                 tracked != _trackedFibers.end(); ++tracked) {
+                if (tracked->inputId == id) {
+                    tracked->revision = revision;
+                    tracked->added = !revision.isEmpty();
+                }
+            }
+        }
         if (input.value(QStringLiteral("kind")).toString() == QStringLiteral("patch")
             && !input.value(QStringLiteral("committed")).toBool()) {
             pendingPatches.insert(input.value(QStringLiteral("id")).toString());
@@ -733,12 +787,64 @@ void SpiralWorkspace::addPatchToCurrentFit(
     _service->uploadPatch(tifxyzDirectory, inputId);
 }
 
-void SpiralWorkspace::addFiberToCurrentFit(const QString& fiberJsonPath)
+void SpiralWorkspace::addFiberToCurrentFit(
+    uint64_t fiberId, const QString& fiberJsonPath)
 {
     if (!_service) return;
-    const QString inputId = QFileInfo(fiberJsonPath).completeBaseName();
+    const QString inputId = QString::number(fiberId);
+    TrackedFiber& tracked = _trackedFibers[fiberId];
+    tracked.inputId = inputId;
+    tracked.path = fiberJsonPath;
+    tracked.revision = _residentFiberRevisions.value(inputId);
+    tracked.added = !tracked.revision.isEmpty();
+    tracked.uploadInFlight = true;
     statusBar()->showMessage(tr("Uploading fiber %1 to the Spiral session…").arg(inputId));
-    _service->uploadJsonInput(QStringLiteral("fiber"), fiberJsonPath, inputId);
+    _service->uploadJsonInput(QStringLiteral("fiber"), fiberJsonPath, inputId,
+                              {}, tracked.revision);
+}
+
+void SpiralWorkspace::noteTrackedFiberSaved(
+    uint64_t fiberId, uint64_t generation, const QString& fiberJsonPath)
+{
+    auto found = _trackedFibers.find(fiberId);
+    if (found == _trackedFibers.end()) {
+        const QString inputId = QString::number(fiberId);
+        const QString revision = _residentFiberRevisions.value(inputId);
+        if (revision.isEmpty()) return;
+        found = _trackedFibers.insert(
+            fiberId, TrackedFiber{inputId, fiberJsonPath, revision, {},
+                                  generation, 0, true, false});
+    }
+    found->path = fiberJsonPath;
+    found->latestGeneration = std::max(found->latestGeneration, generation);
+    uploadNewestFiberRevision(fiberId);
+}
+
+void SpiralWorkspace::uploadNewestFiberRevision(uint64_t fiberId)
+{
+    auto found = _trackedFibers.find(fiberId);
+    if (found == _trackedFibers.end() || !found->added
+        || found->uploadInFlight
+        || found->latestGeneration <= found->sentGeneration)
+        return;
+    const QString root = QDir(provisionalBrushRoot()).filePath(
+        QStringLiteral("fiber-revisions"));
+    if (!QDir().mkpath(root)) return;
+    const QString snapshot = QDir(root).filePath(
+        QStringLiteral("%1_g%2.json").arg(found->inputId)
+            .arg(found->latestGeneration));
+    QFile::remove(snapshot);
+    if (!QFile::copy(found->path, snapshot)) {
+        statusBar()->showMessage(
+            tr("Could not snapshot fiber %1 for Spiral").arg(found->inputId),
+            10000);
+        return;
+    }
+    found->snapshotPath = snapshot;
+    found->sentGeneration = found->latestGeneration;
+    found->uploadInFlight = true;
+    _service->uploadJsonInput(QStringLiteral("fiber"), snapshot,
+                              found->inputId, {}, found->revision);
 }
 
 QString SpiralWorkspace::provisionalBrushRoot() const
@@ -828,9 +934,20 @@ void SpiralWorkspace::finalizeBrushPaint()
     }
 }
 
+void SpiralWorkspace::submitReadyDrafts(bool commitAfterAdd)
+{
+    _commitAfterBrushUploads = commitAfterAdd;
+    if (!_brush->hasReadyDrafts()) {
+        maybeCommitForPendingExit();
+        return;
+    }
+    finalizeBrushPaint();
+}
+
 bool SpiralWorkspace::hasPendingBrushWork() const
 {
     return (_brush && (_brush->hasUnfinalizedPaint() || _brush->hasUnfinalizedPolylines()))
+        || (_brush && _brush->hasReadyDrafts())
         || !_pendingBrushPatches.isEmpty() || !_unverifiedBrushIds.isEmpty()
         || !_pendingPointCollectionPaths.isEmpty()
         || !_uncommittedPointCollectionIds.isEmpty();
@@ -882,7 +999,8 @@ void SpiralWorkspace::requestSessionExit(std::function<void()> continuation)
         _pendingExitAction = std::move(continuation);
         _commitAfterBrushUploads = true;
         if (_brush->hasUnfinalizedPaint() || _brush->hasUnfinalizedPolylines())
-            finalizeBrushPaint();
+            _brush->markDraftsReady();
+        if (_brush->hasReadyDrafts()) finalizeBrushPaint();
         else maybeCommitForPendingExit();
     } else if (box.clickedButton() == exit) {
         discardBrushWork();
@@ -892,9 +1010,10 @@ void SpiralWorkspace::requestSessionExit(std::function<void()> continuation)
 
 void SpiralWorkspace::maybeCommitForPendingExit()
 {
-    if (!_commitAfterBrushUploads || !_pendingExitAction || !_pendingBrushPatches.isEmpty()
+    if (!_commitAfterBrushUploads || !_pendingBrushPatches.isEmpty()
         || !_pendingPointCollectionPaths.isEmpty()) return;
-    if (_brush->hasUnfinalizedPaint() || _brush->hasUnfinalizedPolylines()) {
+    if (_brush->hasUnfinalizedPaint() || _brush->hasUnfinalizedPolylines()
+        || _brush->hasReadyDrafts()) {
         // A too-small gesture was intentionally left editable. Do not silently
         // discard it during an exit commit.
         _commitAfterBrushUploads = false;
@@ -905,9 +1024,13 @@ void SpiralWorkspace::maybeCommitForPendingExit()
     }
     _commitAfterBrushUploads = false;
     if (_unverifiedBrushIds.isEmpty() && _uncommittedPointCollectionIds.isEmpty()) {
-        auto continuation = std::move(_pendingExitAction);
-        _pendingExitAction = {};
-        continuation();
+        if (_pendingExitAction) {
+            auto continuation = std::move(_pendingExitAction);
+            _pendingExitAction = {};
+            continuation();
+        } else {
+            _service->commitInputs();
+        }
         return;
     }
     _service->commitInputs();

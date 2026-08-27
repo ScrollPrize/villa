@@ -47,6 +47,8 @@ public:
     void resetSession();
     bool hasUnfinalizedPaint() const;
     bool hasUnfinalizedPolylines() const;
+    bool hasReadyDrafts() const;
+    void markDraftsReady();
     int brushDiameter() const { return _diameterPx; }
 
     std::vector<PreparedPatch> preparePatches(QStringList& warnings);
@@ -66,7 +68,7 @@ protected:
     void collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder) override;
 
 private:
-    enum class GestureState { Painted, Finalizing, Finalized };
+    enum class GestureState { Painted, Ready, Finalizing, Finalized };
     struct Gesture {
         QString id;
         QColor color;

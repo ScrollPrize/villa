@@ -39,7 +39,7 @@ public:
 
     // The one service API version this build speaks; the handshake refuses
     // anything else. Reported to the user so a mismatch is self-explanatory.
-    static constexpr int kApiVersion = 30;
+    static constexpr int kApiVersion = 32;
 
     explicit SpiralServiceManager(QObject* parent = nullptr);
     ~SpiralServiceManager() override;
@@ -101,7 +101,8 @@ public:
     void commitInputs();
     void uploadPatch(const QString& directory, const QString& inputId);
     void uploadJsonInput(const QString& kind, const QString& filePath,
-                         const QString& inputId, const QString& role = {});
+                         const QString& inputId, const QString& role = {},
+                         const QString& baseRevision = {});
     // Remove an added input that has not joined the resident fit yet.
     void removeEphemeralInput(const QString& kind, const QString& inputId);
     // Fetch a file intentionally omitted from the initial preview transfer.
@@ -146,6 +147,9 @@ signals:
                                const QStringList& reasons, const QString& stage,
                                const QString& message);
     void inputUploadFinished(const QString& inputId, const QString& error);
+    void fiberRevisionUploadFinished(const QString& inputId,
+                                     const QString& revision,
+                                     const QString& error);
     void commitInputsFinished(const QStringList& committedIds, const QString& error);
     void logMessage(const QString& message);
     void errorOccurred(const QString& message);
@@ -202,7 +206,8 @@ private:
     QString commandId();
     QString endpointFingerprint() const;
     void continueUpload(const QString& uploadId, const QString& inputId,
-                        const QString& baseDir, QStringList pendingFiles);
+                        const QString& kind, const QString& baseDir,
+                        QStringList pendingFiles);
     void sendRebuildRequest(QJsonObject request);
     void sendInitializeRequest(QJsonObject request);
     void prepareSessionRequest(QJsonObject request, bool initialize);

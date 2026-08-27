@@ -40,6 +40,7 @@ public:
     }
     void setLossMapOptions(const QStringList& names);
     void setLossMapLegend(const QString& text);
+    void setLocalDraftsReady(bool ready);
     void setSessionExitGuard(
         std::function<void(std::function<void()>)> guard) { _sessionExitGuard = std::move(guard); }
 
@@ -55,6 +56,7 @@ signals:
     void surfaceIntersectionStrideChanged(int stride);
     void surfaceOverlapChanged(bool shown);
     void pythonOutputRequested();
+    void addDraftsRequested(bool commitAfterAdd);
 
 private:
     QLineEdit* addPathRow(QFormLayout* form, const QString& key, const QString& label,
@@ -183,6 +185,7 @@ private:
     // Ephemeral inputs
     QListWidget* _ephemeralList = nullptr;
     QPushButton* _commitInputs = nullptr;
+    QPushButton* _addInputs = nullptr;
     QPushButton* _removeInput = nullptr;
     QLabel* _commitHint = nullptr;
     QJsonArray _lastEphemeral;
@@ -207,6 +210,7 @@ private:
     bool _connected = false;
     bool _previewTransferActive = false;
     bool _checkpointDownloadActive = false;
+    bool _localDraftsReady = false;
     QString _previewTransferText;
     // Last reported session lifecycle state; "Error" is the recovery case.
     QString _sessionState;
