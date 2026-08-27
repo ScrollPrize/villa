@@ -465,8 +465,12 @@ inline cv::Vec3f interpolatedGeneratedLinePoint(const std::vector<cv::Vec3f>& li
 // position is ambiguous on the new line. The position's 3D point on the old
 // polyline is located on the new polyline instead (nearest vertex, refined by
 // projecting onto that vertex's adjacent segments), so the returned position
-// names the same fiber spot. Falls back to the clamped input position when
-// either polyline is unusable.
+// names the same fiber spot. Among near-ties in distance the vertex closest
+// to the old position in INDEX wins: a spiral fiber's adjacent wraps pass
+// within a few voxels of each other, and where the edit moved the local
+// geometry by a comparable amount, plain nearest-point could jump the anchor
+// onto the other wrap. Falls back to the clamped input position when either
+// polyline is unusable.
 inline double remappedGeneratedLinePosition(const std::vector<cv::Vec3f>& oldLinePoints,
                                             const std::vector<cv::Vec3f>& newLinePoints,
                                             double oldPosition)
@@ -475,9 +479,10 @@ inline double remappedGeneratedLinePosition(const std::vector<cv::Vec3f>& oldLin
         return 0.0;
     }
     const double maxNewPosition = static_cast<double>(newLinePoints.size() - 1);
-    const double fallback = std::isfinite(oldPosition)
-        ? std::clamp(oldPosition, 0.0, maxNewPosition)
-        : 0.0;
+    if (!std::isfinite(oldPosition)) {
+        return 0.0;
+    }
+    const double fallback = std::clamp(oldPosition, 0.0, maxNewPosition);
     const cv::Vec3f anchor = interpolatedGeneratedLinePoint(oldLinePoints, oldPosition);
     if (!std::isfinite(anchor[0]) || !std::isfinite(anchor[1]) || !std::isfinite(anchor[2])) {
         return fallback;
@@ -498,6 +503,36 @@ inline double remappedGeneratedLinePosition(const std::vector<cv::Vec3f>& oldLin
     }
     if (!nearestIndex) {
         return fallback;
+    }
+    // Continuity tiebreak (see above): among vertices within twice the
+    // nearest distance, prefer the one whose index is closest to the old
+    // position. Outside edited regions the true match is at distance ~0, so
+    // the band is empty of impostors and this is a no-op.
+    {
+        constexpr double kTieDistanceSqFactor = 4.0;  // (2x distance)^2
+        const double tieThresholdSq =
+            nearestDistanceSq * kTieDistanceSqFactor + 1.0e-12;
+        double chosenIndexDelta = std::abs(
+            static_cast<double>(*nearestIndex) - oldPosition);
+        for (size_t i = 0; i < newLinePoints.size(); ++i) {
+            const cv::Vec3f& point = newLinePoints[i];
+            if (!std::isfinite(point[0]) || !std::isfinite(point[1]) ||
+                !std::isfinite(point[2])) {
+                continue;
+            }
+            const cv::Vec3f delta = point - anchor;
+            const double distanceSq = static_cast<double>(delta.dot(delta));
+            if (distanceSq > tieThresholdSq) {
+                continue;
+            }
+            const double indexDelta =
+                std::abs(static_cast<double>(i) - oldPosition);
+            if (indexDelta < chosenIndexDelta) {
+                chosenIndexDelta = indexDelta;
+                nearestIndex = i;
+                nearestDistanceSq = distanceSq;
+            }
+        }
     }
     double bestPosition = static_cast<double>(*nearestIndex);
     double bestDistanceSq = nearestDistanceSq;

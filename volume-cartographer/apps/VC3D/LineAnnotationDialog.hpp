@@ -459,7 +459,10 @@ private:
     bool _optimizationStatusOptimized = false;
     // The overlay only blocks the mouse, so keyboard-driven edits have to test
     // this themselves before they queue any deferred state.
-    bool _optimizationBusy = false;
+    // True only while the blocking overlay is up (busy && blockInput):
+    // passive-badge solves keep editing live, and key handlers must match
+    // what a mouse click can reach.
+    bool _optimizationInputBlocked = false;
     QWidget* _tagRowWidget = nullptr;
     QHBoxLayout* _tagRowLayout = nullptr;
     QProgressBar* _sideStripIntersectionProgress = nullptr;

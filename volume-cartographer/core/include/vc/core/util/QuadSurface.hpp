@@ -328,7 +328,10 @@ public:
     // arc-length parameterization shifts with every re-optimization) stay
     // addressable by camera coordinates that survive the surface swap. Call
     // only on a surface no viewer is rendering yet — the shift is not
-    // synchronized against concurrent readers.
+    // synchronized against concurrent readers. Session-local by design: the
+    // shift is not persisted by save() and a lazy surface's cache
+    // invalidation recomputes _center, so use it only on in-memory derived
+    // surfaces, never on disk-backed ones.
     void shiftSurfaceOrigin(const cv::Vec2d& delta);
     [[nodiscard]] SurfaceSample sampleAtSurface(const cv::Vec2d& surface) const;
 

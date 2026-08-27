@@ -1166,7 +1166,7 @@ void LineAnnotationDialog::setGeneratedSpanAlignmentMetrics(
 
 void LineAnnotationDialog::setOptimizationBusy(bool busy, bool blockInput)
 {
-    _optimizationBusy = busy;
+    _optimizationInputBlocked = busy && blockInput;
     if (_fiberOptimizationCombo) {
         _fiberOptimizationCombo->setEnabled(!busy);
     }
@@ -4639,10 +4639,11 @@ bool LineAnnotationDialog::toggleCurrentCutFollowFromKeyboard()
 
 bool LineAnnotationDialog::placeControlPointAtCurrentLinePosition()
 {
-    // A click cannot reach a busy dialog because the optimization overlay
-    // covers the panes, but the keys still arrive; the controller would reject
-    // the request anyway, so refuse it here.
-    if (!_hasGeneratedViews || !_currentCutViewer || _optimizationBusy ||
+    // During a blocking (overlay) solve a click cannot reach the panes, but
+    // the keys still arrive, so refuse them to match. A passive-badge solve
+    // deliberately keeps editing live: the key must place exactly like a
+    // click would, so plain busy does not refuse.
+    if (!_hasGeneratedViews || !_currentCutViewer || _optimizationInputBlocked ||
         !controlPointPlacementAllowedAt(_currentLinePosition)) {
         return false;
     }

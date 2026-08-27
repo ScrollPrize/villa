@@ -835,6 +835,31 @@ TEST_CASE("line annotation remapped line position follows the same fiber spot")
               doctest::Approx(0.0));
     }
 
+    SUBCASE("near-ties prefer the same wrap over a closer neighboring wrap")
+    {
+        // A fiber that runs out along y=0 and comes back along y=0.5, like
+        // adjacent wraps of a spiral. The new line moves the outbound wrap
+        // to y=0.35 and the return wrap to y=-0.3: the return wrap is now
+        // geometrically CLOSER to the old anchor (5, 0, 0), but the remap
+        // must stay on the outbound wrap (index continuity).
+        std::vector<cv::Vec3f> oldWrapped;
+        for (int i = 0; i <= 10; ++i) {
+            oldWrapped.push_back({static_cast<float>(i), 0.0f, 0.0f});
+        }
+        for (int i = 0; i <= 10; ++i) {
+            oldWrapped.push_back({static_cast<float>(10 - i), 0.5f, 0.0f});
+        }
+        std::vector<cv::Vec3f> newWrapped;
+        for (int i = 0; i <= 10; ++i) {
+            newWrapped.push_back({static_cast<float>(i), 0.35f, 0.0f});
+        }
+        for (int i = 0; i <= 10; ++i) {
+            newWrapped.push_back({static_cast<float>(10 - i), -0.3f, 0.0f});
+        }
+        CHECK(remappedGeneratedLinePosition(oldWrapped, newWrapped, 5.0) ==
+              doctest::Approx(5.0));
+    }
+
     SUBCASE("non-finite vertices on the new line are skipped")
     {
         std::vector<cv::Vec3f> newLine = oldLine;

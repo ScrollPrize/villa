@@ -1790,7 +1790,8 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
     bool forceFullOptimization,
     int activeStart,
     int activeEnd,
-    const vc::lasagna::NormalSampler& sampler);
+    const vc::lasagna::NormalSampler& sampler,
+    const std::atomic<bool>* cancelFlag = nullptr);
 
 LineAnnotationController::OptimizationTaskResult optimizeLineFromManifest(
     fs::path manifestPath,
@@ -1802,7 +1803,8 @@ LineAnnotationController::OptimizationTaskResult optimizeLineFromManifest(
     int initialCenterlineLengthVx,
     bool forceFullOptimization,
     int activeStart,
-    int activeEnd)
+    int activeEnd,
+    const std::atomic<bool>* cancelFlag = nullptr)
 {
     vc::lasagna::LasagnaDataset dataset =
         vc::lasagna::LasagnaDataset::open(
@@ -1817,7 +1819,8 @@ LineAnnotationController::OptimizationTaskResult optimizeLineFromManifest(
                                    forceFullOptimization,
                                    activeStart,
                                    activeEnd,
-                                   sampler);
+                                   sampler,
+                                   cancelFlag);
 }
 
 LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
@@ -1830,7 +1833,8 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
     bool forceFullOptimization,
     int activeStart,
     int activeEnd,
-    const vc::lasagna::NormalSampler& sampler)
+    const vc::lasagna::NormalSampler& sampler,
+    const std::atomic<bool>* cancelFlag)
 {
     LineAnnotationController::OptimizationTaskResult task;
     task.manifestPath = std::move(manifestPath);
@@ -1862,6 +1866,7 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
         config.maxIterations = 1000;
         config.differentiableNormalSampling = true;
         config.printSolverProgress = false;
+        config.cancelFlag = cancelFlag;
         (void)sampler.prefetchNormalSamples({task.seedPoint}, false);
         config.initialTangent = initialTangentForMode(
             directionMode,
@@ -3386,6 +3391,9 @@ bool LineAnnotationController::exportFibersToPath(const fs::path& exportPath,
                                                   QString* errorMessage,
                                                   int* exportedCount)
 {
+    // The export reads _fibers, which a debounced autosave may not have
+    // caught up to yet: flush so the file reflects the latest landing.
+    flushAllPendingSessionAutoSaves();
     if (exportedCount) {
         *exportedCount = 0;
     }
@@ -3670,6 +3678,9 @@ bool LineAnnotationController::createAtlasFromFiberHeadless(uint64_t fiberId,
 
 fs::path LineAnnotationController::createAtlasFromFiberCore(uint64_t fiberId)
 {
+    // The atlas is built from _fibers, which a debounced autosave may not
+    // have caught up to yet: flush so it reflects the latest landing.
+    flushAllPendingSessionAutoSaves();
     auto vpkg = _state ? _state->vpkg() : nullptr;
     if (!vpkg) {
         throw std::runtime_error("No volume package is loaded");
@@ -5412,6 +5423,21 @@ void LineAnnotationController::saveOpenFibersCore()
             continue;
         }
         auto& session = *pane.session;
+        if (session.taskState == LineAnnotationSession::TaskState::Running &&
+            !session.optimizedLine.points.empty() &&
+            !session.controlPoints.empty()) {
+            // Edits stay live during passive solves, so a Running session
+            // can hold geometry newer than its last save; the pre-async rule
+            // of skipping it would drop those edits on quit. Refuse the
+            // in-flight solve's publication and ask it to stop — the
+            // synchronous finalize below supersedes it — then save like any
+            // other session.
+            session.solveQueue.noteSessionMutated();
+            if (session.runningSolveCancel) {
+                session.runningSolveCancel->store(true);
+            }
+            session.taskState = LineAnnotationSession::TaskState::Succeeded;
+        }
         if (session.taskState != LineAnnotationSession::TaskState::Succeeded ||
             session.optimizedLine.points.empty() ||
             session.controlPoints.empty()) {
@@ -7008,6 +7034,18 @@ void LineAnnotationController::onVolumePackageChanged(std::shared_ptr<VolumePkg>
             // than left visible but disconnected from any session.
             pane.dialog->setCloseAfterFinalizationAllowed(true);
             pane.dialog->close();
+        }
+        if (pane.session) {
+            // The orphaned solve's result has no session to land in; ask it
+            // to stop now so it frees its solve-pool slot for the new
+            // package instead of running to completion unobserved, and shut
+            // the queue so nothing re-dispatches. Without the cancel the
+            // destructor's teardown loop could not reach it either — the
+            // pane record is dropped from _panes below.
+            if (pane.session->runningSolveCancel) {
+                pane.session->runningSolveCancel->store(true);
+            }
+            pane.session->solveQueue.shutdown();
         }
         if (pane.session && pane.session->watcher) {
             auto* watcher = pane.session->watcher.data();
@@ -9025,6 +9063,13 @@ void LineAnnotationController::handleGeneratedControlPointDelete(const std::stri
     // serving the pre-delete control points until the follow-up solve lands
     // (or indefinitely in no-reoptimize mode).
     session.solveQueue.noteSessionMutated();
+    if (session.solveQueue.hasPending()) {
+        // A queued (still-debouncing) request is stamped in the pre-delete
+        // control numbering, and deletion has no old-to-new index map to
+        // remap it through: escalate to a whole-line pass rather than solve
+        // the wrong spans under the new numbering.
+        session.solveQueue.addPending({}, true);
+    }
     const BranchMetadataSyncResult branchSync =
         syncLinkedBranchMetadataAfterFiberModification(
             session,
@@ -9636,6 +9681,7 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
         std::all_of(session.controlPoints.begin(),
                     session.controlPoints.end(),
                     solverIndexTrusted);
+    bool membershipViolated = false;
     for (auto& control : session.controlPoints) {
         double bestDistance = std::numeric_limits<double>::infinity();
         int bestIndex = -1;
@@ -9649,6 +9695,14 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
                     bestDistance = distance;
                     bestIndex = static_cast<int>(i);
                 }
+            }
+            // The nearest vertex must actually BE the control (the loader's
+            // exact-membership tolerance): a solved line whose vertices only
+            // pass near a control would otherwise be marked optimized and
+            // then rejected by the save guard, wedging the session in a
+            // state that can never save. Reject the result instead.
+            if (bestIndex >= 0 && bestDistance > 1.0e-8) {
+                membershipViolated = true;
             }
         }
         if (bestIndex >= 0) {
@@ -9673,9 +9727,14 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
     // controls. Every consumer of control indices (span metadata, split/merge,
     // the loader's ordered-subset contract) assumes strict ordering, so a
     // violation must fail the task instead of being applied silently.
-    for (size_t index = 1; index < session.controlPoints.size(); ++index) {
+    for (size_t index = 1; !membershipViolated && index < session.controlPoints.size(); ++index) {
         if (session.controlPoints[index].optimizedIndex <=
             session.controlPoints[index - 1].optimizedIndex) {
+            membershipViolated = true;
+        }
+    }
+    {
+        if (membershipViolated) {
             session.controlPoints = branchRemapControls;
             session.branches = branchRemapBranches;
             session.optimizedLine = std::move(previousLine);
@@ -9688,9 +9747,9 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
             session.focusedLinePosition = previousFocusedLinePosition;
             session.taskState = LineAnnotationSession::TaskState::Failed;
             session.error =
-                "optimized line remapped control points out of order";
+                "optimized line no longer passes exactly through the control points in order";
             showError(tr("Line optimization failed: control points no longer "
-                         "resolve in line order."),
+                         "resolve exactly on the line in order."),
                       session.suppressErrorDialogs);
             return false;
         }
@@ -9920,12 +9979,11 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
     session.runningSolveEpoch = solveEpoch;
     session.runningSolveFullLine = true;
     session.runningSolveDirtySegments.clear();
-    // Seed solves carry no cancellation flag: there is no line yet, so no
-    // edit can supersede them (handleGeneratedControlPoint requires a
-    // non-empty line), and optimizeLineWithSampler has no flag plumbing.
-    // Leaving the slot empty keeps the teardown loop honest about what it
-    // can actually cancel.
-    session.runningSolveCancel.reset();
+    // No edit can supersede a seed solve (handleGeneratedControlPoint
+    // requires a non-empty line), but teardown and package switches still
+    // need a handle to stop it: without one the destructor's waitForDone
+    // blocks for the whole solve.
+    session.runningSolveCancel = std::make_shared<std::atomic<bool>>(false);
     session.optimizationStateBeforeTask = session.optimizationState;
     session.taskState = LineAnnotationSession::TaskState::Running;
     session.error.clear();
@@ -9993,6 +10051,7 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
                : vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX_DEFAULT);
     auto dataset = session.dataset;
     auto normalSampler = session.normalSampler;
+    auto cancelFlag = session.runningSolveCancel;
     watcher->setFuture(QtConcurrent::run(&_lineSolvePool,
                                           [factory,
                                            manifestPath,
@@ -10006,7 +10065,8 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
                                            activeEnd,
                                            workingToBaseScale,
                                            dataset,
-                                           normalSampler]() mutable {
+                                           normalSampler,
+                                           cancelFlag]() mutable {
         if (factory) {
             return factory(manifestPath,
                            std::move(controlPoints),
@@ -10029,7 +10089,8 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
                                            forceFullOptimization,
                                            activeStart,
                                            activeEnd,
-                                           *normalSampler);
+                                           *normalSampler,
+                                           cancelFlag.get());
         }
         return optimizeLineFromManifest(manifestPath,
                                         workingToBaseScale,
@@ -10040,7 +10101,8 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
                                         initialCenterlineLengthVx,
                                         forceFullOptimization,
                                         activeStart,
-                                        activeEnd);
+                                        activeEnd,
+                                        cancelFlag.get());
     }));
 }
 
@@ -10144,6 +10206,14 @@ void LineAnnotationController::dispatchPendingSolve(const std::string& surfaceNa
         // Another path started a solve meanwhile (its epilogue will dispatch
         // what is pending), or the pending request was consumed by a
         // synchronous finalize.
+        return;
+    }
+    if (pane->dialog &&
+        pane->dialog->reoptimizationMode() !=
+            LineAnnotationDialog::ReoptimizationMode::AutoReoptimize) {
+        // The mode changed inside the debounce window: keep the request
+        // queued for a later explicit or auto pass instead of launching a
+        // solve the mode says must not run.
         return;
     }
     auto pending = session.solveQueue.takePending();
@@ -10374,7 +10444,17 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
         session.nativeSeedTracePending = false;
         session.taskState = LineAnnotationSession::TaskState::Idle;
         auto pending = session.solveQueue.finishSolve();
-        if (pending.requested) {
+        const bool autoReoptimize = !pane->dialog ||
+            pane->dialog->reoptimizationMode() ==
+                LineAnnotationDialog::ReoptimizationMode::AutoReoptimize;
+        if (pending.requested && !autoReoptimize) {
+            // The user chose manual reoptimization: the superseding edit
+            // deliberately recorded no solve request, so the coalesced spans
+            // stay queued for a later explicit or auto pass instead of
+            // launching a solve the mode says must not run.
+            session.solveQueue.addPending(pending.dirtySegments,
+                                          pending.fullLine);
+        } else if (pending.requested) {
             const std::vector<size_t> pendingSpansForRetry =
                 pending.dirtySegments;
             startFiberModeOptimization(
@@ -11728,6 +11808,14 @@ void LineAnnotationController::cleanupSurfaceName(const std::string& surfaceName
                     watcher,
                     &QObject::deleteLater);
             pane.session->watcher = nullptr;
+            // The orphaned solve's result has no pane to land in: ask it to
+            // stop so it frees its pool slot, and shut the queue so nothing
+            // re-dispatches. Once the pane record is erased below, the
+            // destructor's teardown loop can no longer reach this session.
+            if (pane.session->runningSolveCancel) {
+                pane.session->runningSolveCancel->store(true);
+            }
+            pane.session->solveQueue.shutdown();
         }
         if (pane.surfaceName == surfaceName && pane.session) {
             generatedSurfaceNames = pane.session->generatedSurfaceNames;
@@ -12853,8 +12941,21 @@ void LineAnnotationController::dispatchSideStripIntersectionQuery(
     auto stripSurface = _state
         ? std::dynamic_pointer_cast<QuadSurface>(_state->surface(surfaceName))
         : nullptr;
+    // An intentional clear must also invalidate: a query still running (or
+    // queued) would otherwise pass the latest-token check when it finishes
+    // and repaint the very markers the clear removed.
+    const auto invalidateInFlightQueries = [this]() {
+        _latestSideStripIntersectionToken = ++_nextSideStripIntersectionToken;
+        if (_latestSideStripIntersectionTokenAtomic) {
+            _latestSideStripIntersectionTokenAtomic->store(
+                _latestSideStripIntersectionToken, std::memory_order_relaxed);
+        }
+        _pendingSideStripIntersectionRequest.reset();
+    };
+
     const auto* stripPointsPtr = stripSurface ? stripSurface->rawPointsPtr() : nullptr;
     if (!stripPointsPtr || stripPointsPtr->rows < 2 || stripPointsPtr->cols < 2) {
+        invalidateInFlightQueries();
         pane->dialog->setGeneratedSideStripIntersectionResult(0);
         pane->dialog->setGeneratedFiberIntersectionMarkers({});
         return;
@@ -12931,6 +13032,7 @@ void LineAnnotationController::dispatchSideStripIntersectionQuery(
                                                request.branchLinks);
 
     if (request.fibers.empty() && request.branchLinks.empty()) {
+        invalidateInFlightQueries();
         pane->dialog->setGeneratedSideStripIntersectionResult(0);
         pane->dialog->setGeneratedFiberIntersectionMarkers({});
         return;
@@ -13000,19 +13102,36 @@ void LineAnnotationController::dispatchSideStripIntersectionQuery(
                     latestToken->load(std::memory_order_relaxed) != previewToken) {
                     return;
                 }
-                vc::atlas::FiberSpatialIndex previewIndex;
-                auto previewMarkers = sideStripMarkersFromIntersections(
-                    previewIndex.sideStripIntersections(previewOptions));
-                if (!self) {
+                std::vector<SideStripMarker> previewMarkers;
+                try {
+                    vc::atlas::FiberSpatialIndex previewIndex;
+                    previewMarkers = sideStripMarkersFromIntersections(
+                        previewIndex.sideStripIntersections(previewOptions));
+                } catch (const std::exception& ex) {
+                    // The preview is a best-effort overlay ahead of the full
+                    // query; an exception escaping QRunnable::run would
+                    // terminate the process.
+                    Logger()->warn(
+                        "Line annotation branch-link preview failed: {}",
+                        ex.what());
                     return;
                 }
+                // Queued on the application object, not the controller: the
+                // GUI thread may destroy the controller between a QPointer
+                // check here and invokeMethod consuming the raw receiver.
+                // The lambda re-checks `self` on the GUI thread, where the
+                // QPointer is authoritative.
                 QMetaObject::invokeMethod(
-                    self.data(),
+                    QCoreApplication::instance(),
                     [self, previewToken, previewSurfaceName,
                      previewMarkers = std::move(previewMarkers),
                      branches = std::move(branches)]() mutable {
                         if (!self ||
-                            self->_latestSideStripIntersectionToken != previewToken) {
+                            self->_latestSideStripIntersectionToken != previewToken ||
+                            self->_completedSideStripIntersectionToken == previewToken) {
+                            // Superseded, or the full query (same token)
+                            // already delivered its complete marker set --
+                            // the branch-only preview must not overwrite it.
                             return;
                         }
                         auto* previewPane = self->paneForSurface(previewSurfaceName);
@@ -13400,6 +13519,7 @@ void LineAnnotationController::finishSideStripIntersectionQuery(
     _runningSideStripIntersectionSurfaceName.clear();
     _runningSideStripFingerprint.clear();
     const bool hasPendingRequest = _pendingSideStripIntersectionRequest.has_value();
+    _completedSideStripIntersectionToken = result.token;
     if (result.token == _latestSideStripIntersectionToken) {
         if (auto* pane = paneForSurface(result.surfaceName); pane && pane->dialog) {
             pane->dialog->setGeneratedSideStripIntersectionBusy(hasPendingRequest);
@@ -15045,9 +15165,16 @@ void LineAnnotationController::validateFiberSaveSnapshots(
     // before its geometry was finalized by a solve; writing it would produce
     // a fiber that fails to load. Refuse the save instead.
     for (const auto& snapshot : snapshots) {
-        if (snapshot.fiber.controlPoints.empty() ||
-            snapshot.fiber.linePoints.empty()) {
+        if (snapshot.fiber.controlPoints.empty()) {
             continue;
+        }
+        if (snapshot.fiber.linePoints.empty()) {
+            // Control points with no line at all cannot satisfy the subset
+            // contract either; the loader would reject the file.
+            throw std::runtime_error(
+                fiberErrorName(snapshot.fiber.fileName) +
+                ": control points present but line_points is empty; the "
+                "fiber was not finalized before saving");
         }
         if (!vc3d::line_annotation::orderedControlPointLineIndices(
                 vc3d::line_annotation::storedControlPointPositions(

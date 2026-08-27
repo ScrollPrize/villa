@@ -2741,6 +2741,11 @@ private:
     const double normalMsBeforeSolve = prefetchTiming.chunkPrefetchMs + prefetchTiming.materializeMs;
     const auto solveStart = Clock::now();
     ceres::Solve(options, &problem, &summary);
+    // The iteration callback's SOLVER_ABORT only stops Ceres; without this
+    // check a cancelled solve would keep going through result assembly and
+    // its caller's normal resampling before anything noticed, and a direct
+    // caller could mistake the aborted partial state for a real solution.
+    throwIfCancelled(config);
     const auto solveEnd = Clock::now();
     const double normalMsAfterSolve = prefetchTiming.chunkPrefetchMs + prefetchTiming.materializeMs;
     const double normalCallbackMs = std::max(0.0, normalMsAfterSolve - normalMsBeforeSolve);

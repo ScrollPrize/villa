@@ -1082,6 +1082,11 @@ private:
     mutable std::shared_ptr<FiberSaveBatchTracker> _activeFiberSaveBatch;
     uint64_t _nextSideStripIntersectionToken = 0;
     uint64_t _latestSideStripIntersectionToken = 0;
+    // Token of the most recent full query that delivered its markers; the
+    // async branch-link preview shares its request's token and must not
+    // overwrite the complete result set with its branch-only subset when the
+    // full query wins the race.
+    uint64_t _completedSideStripIntersectionToken = 0;
     std::shared_ptr<std::atomic<uint64_t>> _latestSideStripIntersectionTokenAtomic =
         std::make_shared<std::atomic<uint64_t>>(0);
     uint64_t _runningSideStripIntersectionToken = 0;

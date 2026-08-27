@@ -468,6 +468,13 @@ int replaceOpenTailsWithNative(
                 leftException);
             ++output.lasagnaFallbackExtrapolations;
         }
+        // Re-check between the two traces: each can be a long prediction
+        // walk, and a solve superseded during the left one should not still
+        // pay for the right one.
+        if (request.cancelFlag &&
+            request.cancelFlag->load(std::memory_order_relaxed)) {
+            throw vc::lasagna::LineOptimizationCancelled();
+        }
         std::optional<vc::fiber_tracer::FiberTraceOneWayResult> right;
         std::string rightException;
         try {
