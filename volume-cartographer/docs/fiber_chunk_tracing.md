@@ -692,7 +692,10 @@ orientation projection, `<base>_bp_sum_product_mixed_mixed_p0.obj` through
 `<base>_bp_sum_product_mixed_consistency.csv` with all three probabilities.
 It also writes the direct argmax partition as `<base>_bp_v.obj`,
 `<base>_bp_mixed.obj`, `<base>_bp_h.obj`, and `<base>_bp_tie.obj`. Like binary
-sum-product, it rejects population-balance controls.
+sum-product, it rejects population-balance controls. These four OBJ files use
+MeshLab-compatible per-vertex RGB: V is bright cyan, Mixed is magenta, H is
+orange, and exact ties are lime. MeshLab reads the colors directly from the
+OBJ, so there are no companion MTL files.
 
 ## Quality groups
 

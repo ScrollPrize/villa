@@ -1,7 +1,4 @@
-# Task: Explicit Mixed-state fiber belief propagation
+# Task: Color direct BP state OBJ layers
 
-Test whether adding an explicit `Mixed` state to the existing sum-product
-fiber BP improves identification of direction-defect fibers. Preserve the
-binary min-sum and sum-product modes, use the same no-split perpendicular
-factor graph and central straight H seed, expose normalized V/Mixed/H
-marginals, and compare the new mode on the centered-384 full-Mixed cohort.
+Give the direct H, V, Mixed, and tie BP result OBJ files distinct bright colors
+that MeshLab reads automatically. Preserve all existing uncolored OBJ outputs.
