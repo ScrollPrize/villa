@@ -6875,6 +6875,12 @@ LineAnnotationController::fiberSnapshotsFromStorageWithPaths() const
         return snapshot;
     };
     std::map<fs::path, FiberSnapshotWithPath> byPath;
+    // Reparse only files whose (size, mtime) token changed since the last
+    // scan; everything else is served from _storageSnapshotCache. Rebuilding
+    // the cache map each pass sweeps entries for files that vanished.
+    std::map<fs::path, StorageSnapshotCacheEntry> freshCache;
+    size_t parsedFiles = 0;
+    const auto scanStart = Clock::now();
     const fs::path dir = fibersDir();
     std::error_code ec;
     if (!dir.empty() && fs::exists(dir, ec)) {
@@ -6885,16 +6891,36 @@ LineAnnotationController::fiberSnapshotsFromStorageWithPaths() const
             if (!entry.is_regular_file() || entry.path().extension() != ".json") {
                 continue;
             }
+            std::error_code statEc;
+            const auto mtime = entry.last_write_time(statEc);
+            const auto size = statEc ? 0 : entry.file_size(statEc);
+            if (!statEc) {
+                if (auto cached = _storageSnapshotCache.find(entry.path());
+                    cached != _storageSnapshotCache.end() &&
+                    cached->second.mtime == mtime &&
+                    cached->second.size == size) {
+                    byPath[cached->second.snapshot.fiberPath] =
+                        cached->second.snapshot;
+                    freshCache.insert(*cached);
+                    continue;
+                }
+            }
             try {
                 if (auto fiber = loadFiberFile(entry.path())) {
+                    ++parsedFiles;
                     const fs::path path = relativeFiberPath(*fiber);
-                    byPath[path] = FiberSnapshotWithPath{
+                    FiberSnapshotWithPath snapshot{
                         path,
                         snapshotForFiber(*fiber),
                         fiber->id,
                         fiber->hvClassification,
                         fiber->manualHvTag,
                         fiber->tags};
+                    if (!statEc) {
+                        freshCache[entry.path()] =
+                            StorageSnapshotCacheEntry{mtime, size, snapshot};
+                    }
+                    byPath[path] = std::move(snapshot);
                 }
             } catch (const std::exception& ex) {
                 Logger()->warn("Skipping invalid VC3D fiber file {} during atlas search: {}",
@@ -6902,6 +6928,16 @@ LineAnnotationController::fiberSnapshotsFromStorageWithPaths() const
                                ex.what());
             }
         }
+    }
+    _storageSnapshotCache = std::move(freshCache);
+    const double scanMs = elapsedMs(scanStart, Clock::now());
+    if (scanMs >= 5.0) {
+        Logger()->info(
+            "Line annotation GUI stage: event=storage_snapshots ms={:.3f} "
+            "files={} parsed={}",
+            scanMs,
+            byPath.size(),
+            parsedFiles);
     }
 
     for (const auto& fiber : _fibers) {

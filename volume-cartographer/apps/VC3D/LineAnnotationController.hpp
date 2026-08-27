@@ -13,6 +13,7 @@
 #include <deque>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -1097,6 +1098,20 @@ private:
         _sideStripStoredSnapshotCache;
     mutable std::unordered_map<uint64_t, SideStripSnapshotCacheEntry>
         _sideStripSessionSnapshotCache;
+    // Per-file cache behind fiberSnapshotsFromStorageWithPaths(): parsing a
+    // fiber JSON is the expensive step, so a file is reparsed only when its
+    // (size, mtime) token changes - the same metadata-token idiom as
+    // umbilicusFingerprint(), with the same caveat about a same-size rewrite
+    // inside one timestamp tick. CWindow refreshes the atlas search docks on
+    // every fiberSaved, which used to re-parse every fiber file in the
+    // package (seconds at ~666 fibers) ON THE GUI THREAD per save.
+    struct StorageSnapshotCacheEntry {
+        std::filesystem::file_time_type mtime{};
+        std::uintmax_t size = 0;
+        FiberSnapshotWithPath snapshot;
+    };
+    mutable std::map<std::filesystem::path, StorageSnapshotCacheEntry>
+        _storageSnapshotCache;
     bool _sideStripIntersectionRunning = false;
     std::optional<SideStripIntersectionRequest> _pendingSideStripIntersectionRequest;
     // Surfaces with a debounced side-strip dispatch scheduled.
