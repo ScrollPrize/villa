@@ -5896,6 +5896,22 @@ LineAnnotationController::controlSpansForFiber(const StoredFiber& fiber)
     return spans;
 }
 
+const std::vector<LineAnnotationController::ControlSpanRecord>&
+LineAnnotationController::cachedControlSpansForFiber(const StoredFiber& fiber) const
+{
+    auto cached = _controlSpanCache.find(fiber.id);
+    if (cached == _controlSpanCache.end() ||
+        cached->second.generation != fiber.generation ||
+        cached->second.packageGeneration != _packageGeneration) {
+        ControlSpanCacheEntry entry;
+        entry.generation = fiber.generation;
+        entry.packageGeneration = _packageGeneration;
+        entry.spans = controlSpansForFiber(fiber);
+        cached = _controlSpanCache.insert_or_assign(fiber.id, std::move(entry)).first;
+    }
+    return cached->second.spans;
+}
+
 LineAnnotationController::FiberSummary::AlignmentMetrics
 LineAnnotationController::cachedAlignmentForFiber(uint64_t fiberId) const
 {
@@ -6202,7 +6218,7 @@ void LineAnnotationController::publishPendingFiberAlignmentMetrics(const StoredF
 {
     CachedFiberAlignmentMetrics metrics;
     metrics.fiber.pending = true;
-    metrics.spans.resize(controlSpansForFiber(fiber).size());
+    metrics.spans.resize(cachedControlSpansForFiber(fiber).size());
     for (auto& spanMetric : metrics.spans) {
         spanMetric.pending = true;
     }
@@ -6219,7 +6235,7 @@ void LineAnnotationController::publishUnavailableFiberAlignmentMetrics(uint64_t 
                                     return fiber.id == fiberId;
                                 });
     if (fiberIt != _fibers.end()) {
-        spanMetrics.resize(controlSpansForFiber(*fiberIt).size());
+        spanMetrics.resize(cachedControlSpansForFiber(*fiberIt).size());
     }
     emit fiberAlignmentMetricsUpdated(fiberId, FiberSummary::AlignmentMetrics{}, spanMetrics);
     updateGeneratedViewMetricsForFiber(fiberId);
@@ -6277,7 +6293,7 @@ std::vector<LineAnnotationController::FiberSummary> LineAnnotationController::fi
     summaries.reserve(_fibers.size());
     for (const auto& fiber : _fibers) {
         std::vector<FiberSummary::SpanSummary> spanSummaries;
-        const std::vector<ControlSpanRecord> spans = controlSpansForFiber(fiber);
+        const std::vector<ControlSpanRecord>& spans = cachedControlSpansForFiber(fiber);
         spanSummaries.reserve(spans.size());
         for (const auto& span : spans) {
             FiberSummary::SpanSummary summary;
@@ -12344,6 +12360,18 @@ void LineAnnotationController::emitFiberSummaries()
     // of its callers return without emitting summaries -- so a holder comparing
     // fiberDataGeneration() sees every change, not only the ones reaching here.
     ++_fiberDataGeneration;
+    // Sweep span-cache entries whose fibers vanished; live entries are
+    // revalidated per fiber by (generation, packageGeneration).
+    {
+        std::unordered_set<uint64_t> liveIds;
+        liveIds.reserve(_fibers.size());
+        for (const auto& fiber : _fibers) {
+            liveIds.insert(fiber.id);
+        }
+        std::erase_if(_controlSpanCache, [&liveIds](const auto& item) {
+            return liveIds.find(item.first) == liveIds.end();
+        });
+    }
     const auto summariesStart = Clock::now();
     auto summaries = fiberSummaries();
     const double buildMs = elapsedMs(summariesStart, Clock::now());

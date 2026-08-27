@@ -7698,6 +7698,13 @@ void CWindow::CreateWidgets(void)
         auto updateFiberList =
             [this, toFiberWidgetAlignment, syncShowFiberChecks](
                 const std::vector<LineAnnotationController::FiberSummary>& fibers) {
+            using PanelClock = std::chrono::steady_clock;
+            const auto panelStart = PanelClock::now();
+            auto panelMs = [](PanelClock::time_point from) {
+                return std::chrono::duration<double, std::milli>(
+                           PanelClock::now() - from)
+                    .count();
+            };
             std::vector<CFiberWidget::FiberEntry> entries;
             entries.reserve(fibers.size());
             for (const auto& fiber : fibers) {
@@ -7755,6 +7762,8 @@ void CWindow::CreateWidgets(void)
                     traceState,
                 });
             }
+            const double entriesMs = panelMs(panelStart);
+            const auto widgetsStart = PanelClock::now();
             if (_fiberWidget) {
                 _fiberWidget->setFibers(entries);
                 _fiberWidget->setKnownTags(_lineAnnotationController->knownFiberTags());
@@ -7763,6 +7772,8 @@ void CWindow::CreateWidgets(void)
                 _fiberSliceWidget->setFibers(entries);
                 _fiberSliceWidget->setKnownTags(_lineAnnotationController->knownFiberTags());
             }
+            const double widgetsMs = panelMs(widgetsStart);
+            const auto chainsStart = PanelClock::now();
 
             const auto linkInfos = _lineAnnotationController->fiberLinkOverlayInfos();
             std::unordered_map<uint64_t, const LineAnnotationController::FiberLinkOverlayInfo*>
@@ -7810,7 +7821,20 @@ void CWindow::CreateWidgets(void)
             if (!fibersAvailable) {
                 syncShowFiberChecks(false);
             }
+            const double chainsMs = panelMs(chainsStart);
+            const auto atlasStart = PanelClock::now();
             updateAtlasFiberDocks();
+            if (panelMs(panelStart) >= 5.0) {
+                Logger()->info(
+                    "Line annotation GUI stage: event=fiber_panel "
+                    "entries_ms={:.3f} widgets_ms={:.3f} chains_ms={:.3f} "
+                    "atlas_ms={:.3f} fibers={}",
+                    entriesMs,
+                    widgetsMs,
+                    chainsMs,
+                    panelMs(atlasStart),
+                    fibers.size());
+            }
         };
         auto updateFiberMetricRows =
             [this, toFiberWidgetAlignment](

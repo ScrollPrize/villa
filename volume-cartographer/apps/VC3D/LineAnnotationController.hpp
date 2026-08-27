@@ -933,6 +933,13 @@ private:
                                                           uint64_t& nextSequence) const;
     [[nodiscard]] static std::vector<ControlSpanRecord> controlSpansForFiber(
         const StoredFiber& fiber);
+    // Generation-keyed cache in front of controlSpansForFiber for GUI-thread
+    // callers: the scan is O(controls x linePoints) per fiber, and
+    // fiberSummaries() used to pay it for every loaded fiber on every
+    // emission (~90 ms at 666 fibers). Workers keep calling the static
+    // function directly.
+    [[nodiscard]] const std::vector<ControlSpanRecord>& cachedControlSpansForFiber(
+        const StoredFiber& fiber) const;
     [[nodiscard]] FiberSummary::AlignmentMetrics cachedAlignmentForFiber(
         uint64_t fiberId) const;
     [[nodiscard]] FiberSummary::AlignmentMetrics cachedAlignmentForSpan(
@@ -1112,6 +1119,14 @@ private:
     };
     mutable std::map<std::filesystem::path, StorageSnapshotCacheEntry>
         _storageSnapshotCache;
+    // See cachedControlSpansForFiber: keyed by fiber id, valid while the
+    // fiber's save generation and the package generation match.
+    struct ControlSpanCacheEntry {
+        uint64_t generation = 0;
+        uint64_t packageGeneration = 0;
+        std::vector<ControlSpanRecord> spans;
+    };
+    mutable std::unordered_map<uint64_t, ControlSpanCacheEntry> _controlSpanCache;
     bool _sideStripIntersectionRunning = false;
     std::optional<SideStripIntersectionRequest> _pendingSideStripIntersectionRequest;
     // Surfaces with a debounced side-strip dispatch scheduled.
