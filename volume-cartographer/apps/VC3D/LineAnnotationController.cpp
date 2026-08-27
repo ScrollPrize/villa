@@ -176,6 +176,10 @@ struct LineAnnotationController::LineAnnotationSession {
     bool solveDispatchScheduled = false;
     // A debounced session autosave is scheduled (see scheduleSessionAutoSave).
     bool autoSaveScheduled = false;
+    // Bumped on every optimizedLine replacement; part of the side-strip
+    // query fingerprint so a landed solve (or rollback) that happens to
+    // reuse the previous vector's allocation is still seen as a change.
+    uint64_t lineRevision = 0;
     bool deferShowUntilGenerated = false;
     uint64_t fiberId = 0;
     std::string fiberUsername;
@@ -2819,6 +2823,7 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
 
     try {
         session->optimizedLine = lineModelFromPoints(it->linePoints, session->normalSampler.get());
+        ++session->lineRevision;
         session->fiberMetricsMatchStoredFiber = true;
     } catch (const std::exception& ex) {
         showError(tr("Could not reopen fiber %1: %2")
@@ -7248,6 +7253,7 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
                                             session.branches);
     const std::vector<FiberBranchRef> branchRemapBranches = session.branches;
     session.optimizedLine = std::move(preparedLine);
+    ++session.lineRevision;
     const auto& changed = session.controlPoints[prepared.replacementIndex];
     session.focusedLinePosition = changed.linePosition;
     session.focusedControlPoint = changed.volumePoint;
@@ -9454,6 +9460,7 @@ void LineAnnotationController::handleGeneratedSegmentInterpolationGoal(
         session.controlPointsBeforeModeChange.reset();
         if (session.optimizedLineBeforeModeChange) {
             session.optimizedLine = std::move(*session.optimizedLineBeforeModeChange);
+            ++session.lineRevision;
             session.optimizedLineBeforeModeChange.reset();
         }
         if (session.branchesBeforeModeChange) {
@@ -9516,6 +9523,7 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
     session.selectedManifestPath = task.manifestPath;
     session.optimizationReport = task.result.report;
     session.optimizedLine = std::move(task.result.line);
+    ++session.lineRevision;
     const std::vector<vc3d::line_annotation::LineControlPoint> branchRemapControls = session.controlPoints;
     const std::vector<FiberBranchRef> branchRemapBranches = session.branches;
     session.controlPoints = std::move(task.controlPoints);
@@ -9565,6 +9573,7 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
             session.controlPoints = branchRemapControls;
             session.branches = branchRemapBranches;
             session.optimizedLine = std::move(previousLine);
+            ++session.lineRevision;
             session.seedPoint = previousSeedPoint;
             session.selectedManifestPath = previousManifestPath;
             session.lineWasOptimized = previousLineWasOptimized;
@@ -10053,6 +10062,7 @@ void LineAnnotationController::dispatchPendingSolve(const std::string& surfaceNa
         session.controlPointCollapseRollback.reset();
         session.controlPoints = std::move(rollback.controlPoints);
         session.optimizedLine = std::move(rollback.optimizedLine);
+        ++session.lineRevision;
         session.optimizationReport = std::move(rollback.optimizationReport);
         session.branches = std::move(rollback.branches);
         session.selectedManifestPath = std::move(rollback.selectedManifestPath);
@@ -10285,6 +10295,7 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
             session.controlPointCollapseRollback.reset();
             session.controlPoints = std::move(rollback.controlPoints);
             session.optimizedLine = std::move(rollback.optimizedLine);
+        ++session.lineRevision;
             session.optimizationReport = std::move(rollback.optimizationReport);
             session.branches = std::move(rollback.branches);
             session.selectedManifestPath = std::move(rollback.selectedManifestPath);
@@ -10302,6 +10313,7 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
         }
         if (session.optimizedLineBeforeModeChange) {
             session.optimizedLine = std::move(*session.optimizedLineBeforeModeChange);
+            ++session.lineRevision;
             session.optimizedLineBeforeModeChange.reset();
         }
         if (session.branchesBeforeModeChange) {
@@ -12602,11 +12614,24 @@ QString LineAnnotationController::sideStripQueryFingerprint(
             continue;
         }
         const auto& session = *pane.session;
+        uint64_t branchDigest = 0x4252414e43484653ULL;
+        for (const auto& branch : session.branches) {
+            combineSideStripHash(branchDigest,
+                                 static_cast<uint64_t>(branch.controlPointIndex));
+            combineSideStripHash(branchDigest, branch.branchFiberId);
+            combineSideStripHash(branchDigest,
+                                 static_cast<uint64_t>(branch.branchControlPointIndex));
+            combineSideStripHash(branchDigest, branch.pending ? 1u : 0u);
+            combineSideStripPointHash(branchDigest, cv::Vec3f(branch.controlPointPosition));
+            combineSideStripPointHash(branchDigest, cv::Vec3f(branch.branchControlPointPosition));
+            combineSideStripPointHash(branchDigest, cv::Vec3f(branch.branchControlPointDirection));
+        }
         out << '|' << session.fiberId << ':'
             << session.solveQueue.epoch() << ':'
+            << session.lineRevision << ':'
             << session.optimizedLine.points.size() << ':'
             << reinterpret_cast<std::uintptr_t>(session.optimizedLine.points.data())
-            << ':' << session.branches.size();
+            << ':' << branchDigest;
     }
     return QString::fromStdString(out.str());
 }
@@ -14091,6 +14116,7 @@ LineAnnotationController::makeIntersectionLineSession(
         ? normalizedOrZero(sourceSliceNormal)
         : cv::Vec3d{0.0, 0.0, 1.0};
     session->optimizedLine = syntheticLineModelFromPoints(fiber.linePoints);
+    ++session->lineRevision;
     session->taskState = LineAnnotationSession::TaskState::Succeeded;
     session->optimizationState = SessionOptimizationState::Optimized;
     session->suppressGeneratedViews = true;
@@ -14378,6 +14404,7 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
         // Equality is judged on the serializer's own output, so every
         // persisted field participates by construction; only the generation
         // counter, which the snapshot bumps unconditionally, is excluded.
+        const auto probeStart = Clock::now();
         {
             const StoredFiber candidate =
                 makeStoredFiberSessionSnapshot(session).fiber;
@@ -14432,6 +14459,7 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
                     candidate.fileName, differing);
             }
         }
+        const double probeMs = elapsedMs(probeStart, Clock::now());
         const BranchMetadataSyncResult branchSync =
             syncLinkedBranchMetadataAfterFiberModification(session);
         StoredFiber fiber = makeStoredFiberSessionSnapshot(session).fiber;
@@ -14528,8 +14556,9 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
         refreshBranchLineViews(savedFiberId);
         Logger()->info(
             "Line annotation GUI stage: event=session_save total_ms={:.3f} "
-            "line_points={}",
+            "probe_ms={:.3f} line_points={}",
             elapsedMs(saveStart, Clock::now()),
+            probeMs,
             session.optimizedLine.points.size());
     } catch (const std::exception& ex) {
         // Counted like an asynchronous write failure: callers that gate
