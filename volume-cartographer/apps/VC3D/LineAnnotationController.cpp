@@ -11410,6 +11410,29 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
         return false;
     }
 
+    std::vector<cv::Vec3f> linePoints;
+    linePoints.reserve(session.optimizedLine.points.size());
+    for (const auto& point : session.optimizedLine.points) {
+        linePoints.push_back({static_cast<float>(point.position[0]),
+                              static_cast<float>(point.position[1]),
+                              static_cast<float>(point.position[2])});
+    }
+
+    // Anchor the new strips' parameterization on what the live strip cameras
+    // are viewing BEFORE any registration: the strip viewers keep their raw
+    // camera coordinates when they adopt the replacements, so shifting the
+    // new surfaces (instead of correcting the cameras afterwards) is the only
+    // ordering where no frame — including the adoption-triggered render — is
+    // ever rendered with the drifted arc-length mapping.
+    if (auto* anchorPane = paneForSurface(session.surfaceName);
+        anchorPane && anchorPane->dialog) {
+        anchorPane->dialog->anchorGeneratedStripSurfacesForUpdate(
+            views.lineSurface.get(),
+            views.lineSideSlice.get(),
+            views.stripPositionMap,
+            linePoints);
+    }
+
     // Everything the session currently shows, retained so a failed install can
     // put it back. The registered surfaces are replaced under the same names
     // before the dialog has accepted their replacements — live viewers render
@@ -11444,14 +11467,6 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     _state->setSurface(session.generatedLineSideSliceName, views.lineSideSlice);
     session.generatedSurfaceNames.push_back(session.generatedLineSurfaceName);
     session.generatedSurfaceNames.push_back(session.generatedLineSideSliceName);
-
-    std::vector<cv::Vec3f> linePoints;
-    linePoints.reserve(session.optimizedLine.points.size());
-    for (const auto& point : session.optimizedLine.points) {
-        linePoints.push_back({static_cast<float>(point.position[0]),
-                              static_cast<float>(point.position[1]),
-                              static_cast<float>(point.position[2])});
-    }
 
     const cv::Vec3f seedPoint{static_cast<float>(session.seedPoint[0]),
                               static_cast<float>(session.seedPoint[1]),

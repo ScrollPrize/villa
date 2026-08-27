@@ -118,6 +118,18 @@ public:
     // this dialog copying it a second time.
     bool setGeneratedLineViews(GeneratedViews views,
                                const CChunkedVolumeViewer::CameraState& camera);
+    // Shift freshly rebuilt strip surfaces so the fiber spot under the live
+    // strip cameras keeps its surface coordinate across the update. The
+    // controller calls this BEFORE re-registering the surfaces: the strip
+    // viewers keep their raw camera coordinates when they adopt replacements,
+    // so anchoring the new parameterization instead of moving the cameras
+    // keeps every frame — old, new, and the held overlays in between —
+    // pixel-stable through the swap. No-op without live strip views.
+    void anchorGeneratedStripSurfacesForUpdate(
+        QuadSurface* newLineSurface,
+        QuadSurface* newLineSideSlice,
+        const vc::lasagna::LineStripPositionMap& newPositionMap,
+        const std::vector<cv::Vec3f>& newLinePoints) const;
     GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
         const std::string& surfaceName,
         CChunkedVolumeViewer* viewer,

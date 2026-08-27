@@ -1683,6 +1683,74 @@ void LineAnnotationDialog::setGeneratedOverlay(const std::string& surfaceName,
     viewer->connectOverlaysUpdated(this, apply);
 }
 
+void LineAnnotationDialog::anchorGeneratedStripSurfacesForUpdate(
+    QuadSurface* newLineSurface,
+    QuadSurface* newLineSideSlice,
+    const vc::lasagna::LineStripPositionMap& newPositionMap,
+    const std::vector<cv::Vec3f>& newLinePoints) const
+{
+    if (!_hasGeneratedViews || _stripViewers.size() != 2 || newLinePoints.empty()) {
+        return;
+    }
+    const std::array<QuadSurface*, 2> oldQuads{
+        _generatedViews.lineSurface.get(),
+        _generatedViews.lineSideSlice.get()};
+    const std::array<QuadSurface*, 2> newQuads{newLineSurface, newLineSideSlice};
+    for (size_t i = 0; i < oldQuads.size(); ++i) {
+        auto* stripViewer = _stripViewers[i].data();
+        QuadSurface* newQuad = newQuads[i];
+        if (!stripViewer || !newQuad) {
+            continue;
+        }
+        // Which fiber spot is under this strip camera's center right now, on
+        // the still-registered old surface?
+        const auto camera = stripViewer->cameraState();
+        const double oldPosition = stripCameraLinePosition(
+            camera, oldQuads[i], _generatedViews.stripPositionMap);
+        if (!std::isfinite(oldPosition)) {
+            continue;
+        }
+        // The same fiber spot's position on the new line, and its surface X
+        // under the new strip's (un-shifted) parameterization.
+        const double newPosition =
+            vc3d::line_annotation::remappedGeneratedLinePosition(
+                _generatedViews.linePoints, newLinePoints, oldPosition);
+        const auto* points = newQuad->rawPointsPtr();
+        if (!points || points->empty()) {
+            continue;
+        }
+        const double gridColumn = newPositionMap.valid()
+            ? newPositionMap.originalPositionToStripGridColumn(newPosition)
+            : newPosition;
+        if (!std::isfinite(gridColumn)) {
+            continue;
+        }
+        const double clampedColumn = std::clamp(
+            gridColumn, 0.0, static_cast<double>(points->cols - 1));
+        const double newSurfaceX = newQuad->gridToSurface(
+            {clampedColumn, static_cast<double>(points->rows / 2)})[0];
+        if (!std::isfinite(newSurfaceX)) {
+            continue;
+        }
+        const double delta = newSurfaceX - static_cast<double>(camera.surfacePtrX);
+        if (delta == 0.0) {
+            return;
+        }
+        // One shared shift for both strips: their cameras are X-linked, so a
+        // per-strip delta would tear the link apart. Both strips are built
+        // from the same line at the same along-spacing, so the first usable
+        // strip's delta is the right one for both. Y is left alone -- the
+        // cross-strip parameterization is stable and vertical pan is the
+        // user's.
+        for (QuadSurface* quad : newQuads) {
+            if (quad) {
+                quad->shiftSurfaceOrigin({delta, 0.0});
+            }
+        }
+        return;
+    }
+}
+
 bool LineAnnotationDialog::setGeneratedLineViews(
     GeneratedViews views,
     const CChunkedVolumeViewer::CameraState& camera)
@@ -1718,28 +1786,6 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         _heldGeneratedViews = _generatedViews;
         _heldControlIndex = _generatedControlIndex;
         _heldLinePosition = _currentLinePosition;
-
-        // Content anchors for the strip cameras: the strips are arc-length
-        // parameterized, so the re-optimized surfaces map surface X to fiber
-        // spots slightly differently, and a camera keeping its raw surface
-        // coordinates across the swap -- which is what surface re-registration
-        // does for these panes -- drifts along the fiber. Record which line
-        // position sat at each strip camera's center on the OLD surface, to
-        // restore (remapped onto the new line) after the swap succeeds.
-        std::array<double, 2> stripCameraAnchors{
-            std::numeric_limits<double>::quiet_NaN(),
-            std::numeric_limits<double>::quiet_NaN()};
-        const std::array<QuadSurface*, 2> heldStripQuads{
-            _heldGeneratedViews.lineSurface.get(),
-            _heldGeneratedViews.lineSideSlice.get()};
-        for (size_t i = 0; i < stripCameraAnchors.size(); ++i) {
-            if (auto* stripViewer = _stripViewers[i].data()) {
-                stripCameraAnchors[i] = stripCameraLinePosition(
-                    stripViewer->cameraState(),
-                    heldStripQuads[i],
-                    _heldGeneratedViews.stripPositionMap);
-            }
-        }
 
         const double previousLinePosition = _currentLinePosition;
         const float previousDisplayTangentSign = _displayTangentSign;
@@ -1789,34 +1835,6 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         _currentCutOverlaySwapPending = true;
         _sideCutOverlaySwapPending = true;
         _stripOverlaySwapPending.assign(_stripViewers.size(), true);
-        // Re-anchor each strip camera on the fiber spot it was viewing (the
-        // anchors recorded above, remapped onto the new line). Only X -- along
-        // the line -- is corrected; Y and zoom stay exactly where the user put
-        // them. Applied after the swap-pending flags so a synchronous
-        // overlaysUpdated echo still draws the held overlays, and before the
-        // renders below so the first post-update frame is already anchored.
-        for (size_t i = 0; i < stripCameraAnchors.size(); ++i) {
-            auto* stripViewer = _stripViewers[i].data();
-            if (!stripViewer || !std::isfinite(stripCameraAnchors[i])) {
-                continue;
-            }
-            const double anchoredPosition =
-                vc3d::line_annotation::remappedGeneratedLinePosition(
-                    _heldGeneratedViews.linePoints,
-                    _generatedViews.linePoints,
-                    stripCameraAnchors[i]);
-            const auto center = generatedStripSurfaceCenter(
-                stripViewer, anchoredPosition, &_generatedViews.stripPositionMap);
-            if (!center) {
-                continue;
-            }
-            auto stripCamera = stripViewer->cameraState();
-            if (stripCamera.surfacePtrX == (*center)[0]) {
-                continue;
-            }
-            stripCamera.surfacePtrX = (*center)[0];
-            stripViewer->applyCameraState(stripCamera, false);
-        }
         _currentCutNormalOffsetVx = 0.0;
         _sideCutNormalOffsetVx = 0.0;
         _currentCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
