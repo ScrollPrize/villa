@@ -900,6 +900,32 @@ The consistency CSV records both `winding_relative_map` and `winding_output`.
 Every published winding group is additionally partitioned by orientation state
 as `<base>_w_<number>_h.obj`, `_v.obj`, `_err.obj`, and `_tie.obj`.
 
+### Napari winding layers
+
+The state-partitioned winding OBJs can be inspected directly without loading a
+volume:
+
+```bash
+PYTHONPATH="$SRC/vesuvius/src" python -m vesuvius.scripts.view_fiber_windings "$VES/data/workdir3/fiber-crop-1024/fibers"
+```
+
+The positional argument is the output base passed to `direction-ablation`; a
+trailing `.obj` is also accepted. The viewer requires every discovered winding
+to have the complete `_h`, `_v`, `_err`, and `_tie` quartet, including empty
+files. Aggregate `_w_N.obj` files and CSV diagnostics are ignored.
+
+Each nonempty state file becomes one independently colored 3D path layer. `H`,
+`V`, and `Broken` show that category across all winding labels; Broken includes
+both `_err` and exact `_tie` layers. `All` and `None` set all winding-layer
+visibility at once. The arrow controls cycle through windings with nonempty H
+or V geometry and show the selected winding's H and V layers together. The
+first such winding is the initial view. `--width` changes the displayed path
+width.
+
+The shown winding number is the nonnegative publication offset, not an absolute
+physical winding. Likewise, physical H/V identity and absolute winding are not
+comparable across separately gauged components.
+
 ## Quality groups
 
 Visualization stably sorts traces by ascending cost density and then stored

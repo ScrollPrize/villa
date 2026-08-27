@@ -14,6 +14,7 @@ from itertools import pairwise
 from pathlib import Path
 
 import numpy as np
+from vesuvius.scripts.ordered_polyline_obj import read_ordered_polyline_obj
 
 
 @dataclass(frozen=True)
@@ -1960,67 +1961,88 @@ def read_line_obj(
     obj_path = Path(path).expanduser()
     expected_header = _LINE_OBJ_HEADERS[kind]
     paths_have_quality = kind == "paths"
+    parsed = read_ordered_polyline_obj(
+        obj_path,
+        container_records=("g",),
+        allow_singletons=False,
+        require_segment_lines=paths_have_quality,
+    )
+    expected_comment = expected_header.removeprefix("# ")
+    header_comments = [
+        comment
+        for comment in parsed.preamble_comments
+        if comment.text == expected_comment
+    ]
+    if len(header_comments) != 1:
+        raise ValueError(f"{obj_path} is not a supported {kind} OBJ")
+
     paths_zyx: list[np.ndarray] = []
     trace_loss_total: list[float] = []
     loss_per_prediction_voxel: list[float] = []
     relative_quality: list[float] = []
-    total_groups = 0
-    vertex_count = 0
-    group_name: str | None = None
-    group_vertices: dict[int, tuple[float, float, float]] = {}
-    group_lines: list[list[int]] = []
-    group_metrics: dict[str, float] = {}
-    header_seen = False
+    total_groups = len(parsed.groups)
     report_metadata: dict[str, str] = {}
     group_records: list[tuple[np.ndarray, bool, str, float, float, float]] = []
-    group_names: set[str] = set()
 
     def fail(line_number: int, message: str) -> ValueError:
         return ValueError(f"{obj_path}:{line_number}: {message}")
 
-    def finish_group(line_number: int) -> None:
-        nonlocal total_groups
-        if group_name is None:
-            return
-        total_groups += 1
-        if not group_lines:
-            raise fail(line_number, f"group {group_name!r} has no line record")
+    report_keys = {
+        "trace_quality_population",
+        "trace_loss_density_unit",
+        "trace_quality_formula",
+        "trace_quality_count",
+        "trace_loss_density_min",
+        "trace_loss_density_max",
+    }
+    metric_keys = {
+        "trace_loss_total",
+        "trace_loss_per_prediction_voxel",
+        "trace_quality_relative",
+    }
+    if paths_have_quality:
+        for comment in parsed.preamble_comments:
+            if comment.text == expected_comment:
+                continue
+            fields = comment.text.split()
+            if not fields:
+                continue
+            key = fields[0]
+            if key not in report_keys or len(fields) != 2:
+                raise fail(comment.line_number, f"unsupported path OBJ comment {key!r}")
+            if key in report_metadata:
+                raise fail(comment.line_number, f"duplicate report metadata {key!r}")
+            report_metadata[key] = fields[1]
 
-        ordered_indices: list[int] = []
-        for indices in group_lines:
-            if not ordered_indices:
-                ordered_indices.extend(indices)
-            elif ordered_indices[-1] == indices[0]:
-                ordered_indices.extend(indices[1:])
-            else:
-                raise fail(
-                    line_number,
-                    f"group {group_name!r} line records do not form one ordered path",
-                )
-        try:
-            xyz = np.asarray(
-                [group_vertices[index] for index in ordered_indices],
-                dtype=np.float64,
-            )
-        except KeyError as exc:
-            raise fail(
-                line_number,
-                f"group {group_name!r} references vertex {exc.args[0]} outside the group",
-            ) from exc
-        if xyz.shape[0] < 2:
-            raise fail(line_number, f"group {group_name!r} has fewer than two points")
-        path_zyx = xyz[:, ::-1].copy()
+    for group in parsed.groups:
+        path_zyx = group.points_xyz[:, ::-1].copy()
         intersects = _path_intersects_crop(path_zyx, crop_xyzwhd)
         if paths_have_quality:
-            required_metrics = {
-                "trace_loss_total",
-                "trace_loss_per_prediction_voxel",
-                "trace_quality_relative",
-            }
-            if set(group_metrics) != required_metrics:
+            group_metrics: dict[str, float] = {}
+            for comment in group.comments:
+                fields = comment.text.split()
+                key = fields[0] if fields else ""
+                if key not in metric_keys or len(fields) != 2:
+                    raise fail(
+                        comment.line_number,
+                        f"unsupported path OBJ comment {key!r}",
+                    )
+                if key in group_metrics:
+                    raise fail(
+                        comment.line_number,
+                        f"duplicate group metadata {key!r}",
+                    )
+                try:
+                    group_metrics[key] = float(fields[1])
+                except ValueError as exc:
+                    raise fail(
+                        comment.line_number,
+                        f"group metadata {key!r} must be numeric",
+                    ) from exc
+            if set(group_metrics) != metric_keys:
                 raise fail(
-                    line_number,
-                    f"group {group_name!r} has incomplete trace-quality metadata",
+                    group.line_number,
+                    f"group {group.name!r} has incomplete trace-quality metadata",
                 )
             total = group_metrics["trace_loss_total"]
             density = group_metrics["trace_loss_per_prediction_voxel"]
@@ -2034,133 +2056,14 @@ def read_line_obj(
                 or not 0.0 <= quality <= 1.0
             ):
                 raise fail(
-                    line_number,
-                    f"group {group_name!r} trace-quality values are invalid",
+                    group.line_number,
+                    f"group {group.name!r} trace-quality values are invalid",
                 )
             group_records.append(
-                (
-                    path_zyx,
-                    intersects,
-                    group_name,
-                    total,
-                    density,
-                    quality,
-                )
+                (path_zyx, intersects, group.name, total, density, quality)
             )
         elif intersects:
             paths_zyx.append(path_zyx)
-
-    try:
-        with obj_path.open() as stream:
-            for line_number, raw_line in enumerate(stream, start=1):
-                line = raw_line.strip()
-                if not line:
-                    continue
-                if line.startswith("#"):
-                    if line == expected_header:
-                        if header_seen:
-                            raise fail(line_number, "duplicate OBJ header")
-                        header_seen = True
-                        continue
-                    if not paths_have_quality:
-                        continue
-                    fields = line[1:].strip().split()
-                    if not fields:
-                        continue
-                    key = fields[0]
-                    report_keys = {
-                        "trace_quality_population",
-                        "trace_loss_density_unit",
-                        "trace_quality_formula",
-                        "trace_quality_count",
-                        "trace_loss_density_min",
-                        "trace_loss_density_max",
-                    }
-                    metric_keys = {
-                        "trace_loss_total",
-                        "trace_loss_per_prediction_voxel",
-                        "trace_quality_relative",
-                    }
-                    if key in report_keys:
-                        if group_name is not None or len(fields) != 2:
-                            raise fail(line_number, f"invalid report metadata {key!r}")
-                        if key in report_metadata:
-                            raise fail(
-                                line_number, f"duplicate report metadata {key!r}"
-                            )
-                        report_metadata[key] = fields[1]
-                    elif key in metric_keys:
-                        if group_name is None or len(fields) != 2:
-                            raise fail(line_number, f"invalid group metadata {key!r}")
-                        if key in group_metrics:
-                            raise fail(line_number, f"duplicate group metadata {key!r}")
-                        try:
-                            group_metrics[key] = float(fields[1])
-                        except ValueError as exc:
-                            raise fail(
-                                line_number, f"group metadata {key!r} must be numeric"
-                            ) from exc
-                    else:
-                        raise fail(line_number, f"unsupported path OBJ comment {key!r}")
-                    continue
-
-                fields = line.split()
-                record = fields[0]
-                if record == "g":
-                    if len(fields) != 2:
-                        raise fail(
-                            line_number, "group record must contain exactly one name"
-                        )
-                    finish_group(line_number)
-                    group_name = fields[1]
-                    if group_name in group_names:
-                        raise fail(line_number, f"duplicate group {group_name!r}")
-                    group_names.add(group_name)
-                    group_vertices = {}
-                    group_lines = []
-                    group_metrics = {}
-                elif record == "v":
-                    if group_name is None:
-                        raise fail(line_number, "vertex appears before the first group")
-                    if len(fields) != 4:
-                        raise fail(line_number, "vertex record must contain X Y Z")
-                    try:
-                        xyz = tuple(float(value) for value in fields[1:])
-                    except ValueError as exc:
-                        raise fail(
-                            line_number, "vertex coordinates must be numeric"
-                        ) from exc
-                    if not np.isfinite(xyz).all():
-                        raise fail(line_number, "vertex coordinates must be finite")
-                    vertex_count += 1
-                    group_vertices[vertex_count] = xyz
-                elif record == "l":
-                    if group_name is None:
-                        raise fail(line_number, "line appears before the first group")
-                    if len(fields) < 3 or (paths_have_quality and len(fields) != 3):
-                        raise fail(
-                            line_number,
-                            "path line record must reference exactly two vertices"
-                            if paths_have_quality
-                            else "line record must reference at least two vertices",
-                        )
-                    try:
-                        indices = [int(value) for value in fields[1:]]
-                    except ValueError as exc:
-                        raise fail(
-                            line_number, "line indices must be integers"
-                        ) from exc
-                    if any(index <= 0 for index in indices):
-                        raise fail(line_number, "line indices must be positive")
-                    group_lines.append(indices)
-                else:
-                    raise fail(line_number, f"unsupported OBJ record {record!r}")
-            finish_group(line_number + 1 if "line_number" in locals() else 1)
-    except OSError as exc:
-        raise ValueError(f"cannot read line OBJ {obj_path}: {exc}") from exc
-
-    if not header_seen:
-        raise ValueError(f"{obj_path} is not a supported {kind} OBJ")
     if paths_have_quality:
         required_report = {
             "trace_quality_population",

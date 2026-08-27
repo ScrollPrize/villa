@@ -5317,3 +5317,28 @@
   labeled `eta_basis=initialization`. Both estimates subtract elapsed work in
   the active unit, are empirical rather than conservative, and are recomputed
   after each matching completion.
+
+## Winding fiber Napari visualization
+
+- The winding viewer consumes only the current published quartet
+  `<base>_w_N_{h,v,err,tie}.obj` for each discovered nonnegative display label
+  `N`. Aggregate `<base>_w_N.obj`, CSV reports, and unrelated siblings are not
+  state layers. At least one complete quartet is required; every member is
+  mandatory even when its OBJ is validly empty. Winding labels need not be
+  contiguous.
+- OBJ input follows the shared strict ordered-polyline contract. Container
+  names are unique, indices are global and one-based but must reference only
+  vertices owned by the current container, and every nonempty container owns
+  exactly one ordered nonbranching path. Orphan/cross-container vertices,
+  branching, cycles, disconnected chains, unsupported records, and singleton
+  winding fibers are errors. The existing fiber-presence reader uses the same
+  parser while retaining its own header, metadata, and crop validation.
+- Every nonempty state artifact becomes an independent 3D Napari path layer.
+  Its bright opaque color is a deterministic function only of `(N,state)`.
+  Viewer category `Broken` contains both Mixed/error argmax (`err`) and exact
+  argmax ties (`tie`). H, V, Broken, All, and None presets act across every
+  winding. Previous/next winding navigation cycles only through windings with
+  nonempty H or V geometry and shows that winding's H and V layers together.
+- Published `N` is the solver's nonnegative display-offset integer label.
+  Absolute winding and physical H/V identity are not comparable across
+  independently gauged components; visualization must not imply otherwise.

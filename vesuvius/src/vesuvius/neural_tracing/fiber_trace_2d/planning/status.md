@@ -1,21 +1,11 @@
-# Status: Interleaved-lattice winding inference
+# Status: Napari winding-fiber viewer
 
 - [x] Record the user task in `task.md`.
-- [x] Write the detailed implementation, spec, docs, and validation plan.
+- [x] Write the implementation, spec, docs, and validation plan.
 - [x] Complete independent plan review against task and existing specs.
-- [x] Update the specification with the reviewed model.
-- [x] Implement joint interleaved-lattice BP and global calibration.
-- [x] Integrate joint marginals and diagnostics into crop output.
+- [x] Update the specification.
+- [x] Implement strict artifact loading and layer discovery.
+- [x] Implement Napari layers and grouped visibility/navigation controls.
 - [x] Add focused regression tests.
-- [x] Run Release tests and the 384-base crop validation.
+- [x] Run focused validation and an existing-artifact smoke test.
 - [x] Update docs, changelog, task log, and final status.
-- [x] Plan typed interleaved-winding progress reporting.
-- [x] Complete independent review of the progress design.
-- [x] Implement core progress events and throttled CLI output.
-- [x] Add callback regression coverage and rerun focused tests.
-- [x] Update docs and record progress-validation results.
-- [x] Plan initial stored-trace quality filtering.
-- [x] Complete independent review of the quality-filter design.
-- [x] Implement shared ranking and `--quality-fraction` filtering.
-- [x] Add regressions and rerun focused tests.
-- [x] Update specifications, docs, log, and changelog.

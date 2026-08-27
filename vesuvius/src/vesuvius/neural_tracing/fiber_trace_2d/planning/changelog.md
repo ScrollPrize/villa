@@ -1,3 +1,10 @@
+# 2026-08-27: winding fiber Napari viewer
+
+- Added a strict per-winding H/V/Broken OBJ viewer with stable bright layer
+  colors, cross-winding category presets, and cyclic H+V winding navigation.
+- Extracted shared global-indexed ordered-polyline OBJ parsing and retained the
+  existing presence viewer's specialized quality and crop validation.
+
 # 2026-08-27: signed crop winding belief propagation
 
 - Added live nested progress for interleaved winding initialization,
