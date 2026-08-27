@@ -1,5 +1,9 @@
 #include "LineAnnotationDialog.hpp"
 
+#include "vc/core/util/Logging.hpp"
+
+#include <chrono>
+
 #include "FiberNameDisplay.hpp"
 #include "FiberSliceGeometry.hpp"
 #include "Keybinds.hpp"
@@ -1042,6 +1046,27 @@ void LineAnnotationDialog::setGeneratedBranchOverlayData(
     rebuildGeneratedOverlays(requestSideStripIntersections);
 }
 
+
+namespace {
+// Threshold-gated GUI-stage probe: overlay rebuilds run many times per
+// second, so only the ones long enough to be felt are logged.
+struct GuiStageProbe {
+    const char* event;
+    std::chrono::steady_clock::time_point start =
+        std::chrono::steady_clock::now();
+    ~GuiStageProbe()
+    {
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - start)
+                              .count();
+        if (ms >= 5.0) {
+            Logger()->info(
+                "Line annotation GUI stage: event={} ms={:.3f}", event, ms);
+        }
+    }
+};
+}  // namespace
+
 void LineAnnotationDialog::setGeneratedFiberIntersectionMarkers(
     std::vector<GeneratedOverlay::FiberIntersectionMarker> markers)
 {
@@ -1633,6 +1658,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     GeneratedViews views,
     const CChunkedVolumeViewer::CameraState& camera)
 {
+    GuiStageProbe probe{"set_generated_views"};
     if (!_viewerManager || !_layout || views.linePoints.empty() ||
         views.lineUpVectors.size() != views.linePoints.size() ||
         !views.lineSurface || !views.lineSideSlice ||
@@ -3508,6 +3534,7 @@ void LineAnnotationDialog::rebuildGeneratedStaticStripOverlays()
     if (_closing || !_hasGeneratedViews) {
         return;
     }
+    GuiStageProbe probe{"overlay_static_rebuild"};
 
     for (size_t i = 0; i < _stripViewers.size(); ++i) {
         auto* viewer = _stripViewers[i].data();
@@ -3549,6 +3576,7 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     if (_closing || !_hasGeneratedViews) {
         return;
     }
+    GuiStageProbe probe{"overlay_dynamic_update"};
 
     // The schematic overview bar tracks the same inputs (control points +
     // current position) as the dynamic overlays; refresh it on the same cadence.

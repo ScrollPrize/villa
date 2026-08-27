@@ -60,6 +60,8 @@
 #include <QMetaObject>
 #include <QMessageBox>
 #include <QScopedValueRollback>
+#include <QScopeGuard>
+#include <QElapsedTimer>
 #include <QMdiArea>
 #include <QMdiSubWindow>
 #include <QPoint>
@@ -1967,6 +1969,26 @@ LineAnnotationController::LineAnnotationController(CState* state,
     })
 {
     _lineSolvePool.setMaxThreadCount(2);
+    // GUI-stall watchdog: whenever the event loop is blocked long enough to
+    // delay this 100 ms heartbeat past 250 ms, log the stall. Purely
+    // diagnostic - it names any freeze no per-stage probe covers.
+    {
+        auto* stallTimer = new QTimer(this);
+        stallTimer->setInterval(100);
+        stallTimer->setTimerType(Qt::CoarseTimer);
+        auto lastTick = std::make_shared<QElapsedTimer>();
+        lastTick->start();
+        connect(stallTimer, &QTimer::timeout, this, [lastTick]() {
+            const qint64 elapsed = lastTick->elapsed();
+            if (elapsed > 250) {
+                Logger()->info(
+                    "Line annotation GUI stage: event=gui_stall stall_ms={}",
+                    elapsed - 100);
+            }
+            lastTick->restart();
+        });
+        stallTimer->start();
+    }
     if (_state) {
         connect(_state,
                 &CState::surfaceChanged,
@@ -10316,9 +10338,17 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
         return;
     }
 
+    const auto finishStart = Clock::now();
     OptimizationTaskResult task = watcher->result();
     session.watcher = nullptr;
     session.runningSolveCancel.reset();
+    const auto logFinish = qScopeGuard([&finishStart]() {
+        const double ms = elapsedMs(finishStart, Clock::now());
+        if (ms >= 5.0) {
+            Logger()->info(
+                "Line annotation GUI stage: event=apply_total ms={:.3f}", ms);
+        }
+    });
 
     if (!session.solveQueue.mayPublish(session.runningSolveEpoch)) {
         // The session was mutated (or began shutdown) while this solve ran:
@@ -13219,6 +13249,10 @@ LineAnnotationController::runSideStripIntersectionQuery(
 void LineAnnotationController::startSideStripIntersectionQuery(
     SideStripIntersectionRequest request)
 {
+    Logger()->info(
+        "Line annotation GUI stage: event=side_strip_launch fibers={} branch_links={}",
+        request.fibers.size(),
+        request.branchLinks.size());
     _sideStripIntersectionRunning = true;
     _runningSideStripIntersectionToken = request.token;
     _runningSideStripIntersectionKey = request.cacheKey;
@@ -13341,6 +13375,16 @@ void LineAnnotationController::applyPartialSideStripIntersectionMarkers(
     const std::string& surfaceName,
     std::vector<SideStripMarker> markers)
 {
+    const auto partialStart = Clock::now();
+    const auto logPartial = qScopeGuard([&partialStart]() {
+        const double ms = elapsedMs(partialStart, Clock::now());
+        if (ms >= 5.0) {
+            Logger()->info(
+                "Line annotation GUI stage: event=side_strip_partial_apply ms={:.3f}",
+                ms);
+        }
+    });
+
     if (token != _latestSideStripIntersectionToken) {
         return;
     }
