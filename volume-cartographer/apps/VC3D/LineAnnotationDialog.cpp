@@ -60,6 +60,7 @@
 #include <QWidget>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <iterator>
 #include <limits>
@@ -182,6 +183,35 @@ std::optional<cv::Vec2f> generatedStripSurfaceCenter(CChunkedVolumeViewer* viewe
         {gridColumn, static_cast<double>(points->rows / 2)});
     return cv::Vec2f{static_cast<float>(surfacePoint[0]),
                      static_cast<float>(surfacePoint[1])};
+}
+
+// Inverse of generatedStripSurfaceCenter for a camera: maps a strip camera's
+// surface coordinates back to the fractional line position under the view
+// center, through the given strip quad and position map (which must describe
+// the SAME line generation the camera coordinates were panned on). NaN when
+// unavailable.
+double stripCameraLinePosition(const CChunkedVolumeViewer::CameraState& camera,
+                               QuadSurface* quad,
+                               const vc::lasagna::LineStripPositionMap& positionMap)
+{
+    constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+    if (!quad || !std::isfinite(camera.surfacePtrX) || !std::isfinite(camera.surfacePtrY)) {
+        return kNaN;
+    }
+    const auto* points = quad->rawPointsPtr();
+    if (!points || points->empty()) {
+        return kNaN;
+    }
+    const cv::Vec2d gridPoint = quad->surfaceToGrid(
+        {static_cast<double>(camera.surfacePtrX), static_cast<double>(camera.surfacePtrY)});
+    if (!std::isfinite(gridPoint[0])) {
+        return kNaN;
+    }
+    const double gridColumn = std::clamp(gridPoint[0], 0.0,
+                                         static_cast<double>(points->cols - 1));
+    return positionMap.valid()
+        ? positionMap.stripGridColumnToOriginalPosition(gridColumn)
+        : gridColumn;
 }
 
 std::optional<float> generatedStripScaleForLinePositionRange(
@@ -1393,7 +1423,6 @@ bool LineAnnotationDialog::setGeneratedRows(
     _currentCutOverlaySwapPending = false;
     _sideCutOverlaySwapPending = false;
     _stripOverlaySwapPending.clear();
-    _pendingPlacementFocus.reset();
     clearFastGeneratedOverlayItemRefs();
     _currentCutViewer = nullptr;
     _sideCutViewer = nullptr;
@@ -1690,10 +1719,30 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         _heldControlIndex = _generatedControlIndex;
         _heldLinePosition = _currentLinePosition;
 
+        // Content anchors for the strip cameras: the strips are arc-length
+        // parameterized, so the re-optimized surfaces map surface X to fiber
+        // spots slightly differently, and a camera keeping its raw surface
+        // coordinates across the swap -- which is what surface re-registration
+        // does for these panes -- drifts along the fiber. Record which line
+        // position sat at each strip camera's center on the OLD surface, to
+        // restore (remapped onto the new line) after the swap succeeds.
+        std::array<double, 2> stripCameraAnchors{
+            std::numeric_limits<double>::quiet_NaN(),
+            std::numeric_limits<double>::quiet_NaN()};
+        const std::array<QuadSurface*, 2> heldStripQuads{
+            _heldGeneratedViews.lineSurface.get(),
+            _heldGeneratedViews.lineSideSlice.get()};
+        for (size_t i = 0; i < stripCameraAnchors.size(); ++i) {
+            if (auto* stripViewer = _stripViewers[i].data()) {
+                stripCameraAnchors[i] = stripCameraLinePosition(
+                    stripViewer->cameraState(),
+                    heldStripQuads[i],
+                    _heldGeneratedViews.stripPositionMap);
+            }
+        }
+
         const double previousLinePosition = _currentLinePosition;
         const float previousDisplayTangentSign = _displayTangentSign;
-        const std::optional<cv::Vec3f> previousPendingPlacementFocus =
-            _pendingPlacementFocus;
         _generatedViews = std::move(views);
         _displayTangentSign = vc3d::line_annotation::generatedDisplayTangentSign(
             _generatedViews.linePoints,
@@ -1703,22 +1752,16 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                 _generatedViews.controlPoints);
         const double maxLinePosition =
             static_cast<double>(_generatedViews.linePoints.size() - 1);
-        // After a control-point placement, land the current position on the
-        // control point that resulted from the click (positions renumber when
-        // the line is re-optimized, so the old numeric position is ambiguous).
-        double targetLinePosition = previousLinePosition;
-        if (_pendingPlacementFocus) {
-            if (const auto nearest =
-                    vc3d::line_annotation::nearestGeneratedControlPointIndex(
-                        _generatedViews.controlPoints, *_pendingPlacementFocus)) {
-                const double controlPosition =
-                    _generatedViews.controlPoints[*nearest].linePosition;
-                if (std::isfinite(controlPosition)) {
-                    targetLinePosition = controlPosition;
-                }
-            }
-            _pendingPlacementFocus.reset();
-        }
+        // Land the current position on the same fiber spot: positions renumber
+        // when the line is re-optimized, so the old numeric position is
+        // remapped through its 3D point instead of reused. Deliberately never
+        // recentered on a just-placed control point -- an update must not move
+        // the view (the cameras belong to the user, who may be mid-pan).
+        const double targetLinePosition =
+            vc3d::line_annotation::remappedGeneratedLinePosition(
+                _heldGeneratedViews.linePoints,
+                _generatedViews.linePoints,
+                previousLinePosition);
         _currentLinePosition =
             std::clamp(targetLinePosition, 0.0, maxLinePosition);
         // The one step of the in-place update that can fail, validated before
@@ -1735,7 +1778,6 @@ bool LineAnnotationDialog::setGeneratedLineViews(
             _generatedControlIndex = _heldControlIndex;
             _currentLinePosition = previousLinePosition;
             _displayTangentSign = previousDisplayTangentSign;
-            _pendingPlacementFocus = previousPendingPlacementFocus;
             return false;
         }
         // The re-optimized views renumber line positions, so an in-flight
@@ -1747,6 +1789,34 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         _currentCutOverlaySwapPending = true;
         _sideCutOverlaySwapPending = true;
         _stripOverlaySwapPending.assign(_stripViewers.size(), true);
+        // Re-anchor each strip camera on the fiber spot it was viewing (the
+        // anchors recorded above, remapped onto the new line). Only X -- along
+        // the line -- is corrected; Y and zoom stay exactly where the user put
+        // them. Applied after the swap-pending flags so a synchronous
+        // overlaysUpdated echo still draws the held overlays, and before the
+        // renders below so the first post-update frame is already anchored.
+        for (size_t i = 0; i < stripCameraAnchors.size(); ++i) {
+            auto* stripViewer = _stripViewers[i].data();
+            if (!stripViewer || !std::isfinite(stripCameraAnchors[i])) {
+                continue;
+            }
+            const double anchoredPosition =
+                vc3d::line_annotation::remappedGeneratedLinePosition(
+                    _heldGeneratedViews.linePoints,
+                    _generatedViews.linePoints,
+                    stripCameraAnchors[i]);
+            const auto center = generatedStripSurfaceCenter(
+                stripViewer, anchoredPosition, &_generatedViews.stripPositionMap);
+            if (!center) {
+                continue;
+            }
+            auto stripCamera = stripViewer->cameraState();
+            if (stripCamera.surfacePtrX == (*center)[0]) {
+                continue;
+            }
+            stripCamera.surfacePtrX = (*center)[0];
+            stripViewer->applyCameraState(stripCamera, false);
+        }
         _currentCutNormalOffsetVx = 0.0;
         _sideCutNormalOffsetVx = 0.0;
         _currentCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
@@ -1908,7 +1978,6 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     _currentCutOverlaySwapPending = false;
     _sideCutOverlaySwapPending = false;
     _stripOverlaySwapPending.clear();
-    _pendingPlacementFocus.reset();
     clearFastGeneratedOverlayItemRefs();
     _currentCutViewer = nullptr;
     _sideCutViewer = nullptr;
@@ -2019,7 +2088,6 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                         return;
                     }
                     setCurrentCutFollowsStripMouse(true);
-                    _pendingPlacementFocus = volumePoint;
                     emit generatedControlPointRequested(_generatedViews.currentCutName,
                                                         volumePoint,
                                                         _currentLinePosition);
@@ -2079,7 +2147,6 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                         return;
                     }
                     setCurrentCutFollowsStripMouse(true);
-                    _pendingPlacementFocus = volumePoint;
                     emit generatedControlPointRequested(_generatedViews.sideCutName,
                                                         volumePoint,
                                                         _currentLinePosition);
@@ -2197,7 +2264,6 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                             if (!controlPointPlacementAllowedAt(position)) {
                                 return;
                             }
-                            _pendingPlacementFocus = volumePoint;
                             emit generatedControlPointRequested(surfaceName, volumePoint, position);
                         }
                     }
@@ -4582,8 +4648,7 @@ bool LineAnnotationDialog::placeControlPointAtCurrentLinePosition()
 {
     // A click cannot reach a busy dialog because the optimization overlay
     // covers the panes, but the keys still arrive; the controller would reject
-    // the request and leave _pendingPlacementFocus behind for the running
-    // optimization to land on.
+    // the request anyway, so refuse it here.
     if (!_hasGeneratedViews || !_currentCutViewer || _optimizationBusy ||
         !controlPointPlacementAllowedAt(_currentLinePosition)) {
         return false;
@@ -4598,7 +4663,6 @@ bool LineAnnotationDialog::placeControlPointAtCurrentLinePosition()
     // paused -- so, like the shift-click snap, it has to stop the pan itself:
     // the placement renumbers the line positions the pan is steering by.
     cancelArrowPan();
-    _pendingPlacementFocus = volumePoint;
     emit generatedControlPointRequested(_generatedViews.currentCutName,
                                         volumePoint,
                                         _currentLinePosition);

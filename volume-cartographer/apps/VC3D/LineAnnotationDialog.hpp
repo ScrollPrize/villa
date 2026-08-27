@@ -496,10 +496,6 @@ private:
     bool _currentCutOverlaySwapPending = false;
     bool _sideCutOverlaySwapPending = false;
     std::vector<bool> _stripOverlaySwapPending;
-    // Volume point of the most recent control-point placement click; the next
-    // in-place update moves the current line position onto the control point
-    // nearest to it, so the marker lands on the new point with the new image.
-    std::optional<cv::Vec3f> _pendingPlacementFocus;
     std::vector<QPointer<CChunkedVolumeViewer>> _stripViewers;
     // Schematic fixed-height bar above the cut views: a straight line with the
     // control points (LineAnnotationOverviewBar, file-local in the .cpp).

@@ -779,6 +779,73 @@ TEST_CASE("line annotation control point navigation ignores invalid positions")
     CHECK(*closest == doctest::Approx(30.0));
 }
 
+TEST_CASE("line annotation remapped line position follows the same fiber spot")
+{
+    using vc3d::line_annotation::remappedGeneratedLinePosition;
+
+    // Straight line, one unit per index.
+    std::vector<cv::Vec3f> oldLine;
+    for (int i = 0; i <= 10; ++i) {
+        oldLine.push_back({static_cast<float>(i), 0.0f, 0.0f});
+    }
+
+    SUBCASE("identical lines return the same fractional position")
+    {
+        CHECK(remappedGeneratedLinePosition(oldLine, oldLine, 4.25) ==
+              doctest::Approx(4.25));
+    }
+
+    SUBCASE("insertion before the anchor shifts the returned index")
+    {
+        // New line resamples the same geometry at half spacing: the 3D spot
+        // x=4.25 now lives at index 8.5.
+        std::vector<cv::Vec3f> newLine;
+        for (int i = 0; i <= 20; ++i) {
+            newLine.push_back({static_cast<float>(i) * 0.5f, 0.0f, 0.0f});
+        }
+        CHECK(remappedGeneratedLinePosition(oldLine, newLine, 4.25) ==
+              doctest::Approx(8.5));
+    }
+
+    SUBCASE("anchor off the new line projects onto the nearest segment")
+    {
+        // New line offset in Y: nearest point to (4.25, 0, 0) is still at
+        // parameter 4.25 along it.
+        std::vector<cv::Vec3f> newLine;
+        for (int i = 0; i <= 10; ++i) {
+            newLine.push_back({static_cast<float>(i), 1.0f, 0.0f});
+        }
+        CHECK(remappedGeneratedLinePosition(oldLine, newLine, 4.25) ==
+              doctest::Approx(4.25));
+    }
+
+    SUBCASE("degenerate inputs fall back to the clamped input position")
+    {
+        const std::vector<cv::Vec3f> empty;
+        CHECK(remappedGeneratedLinePosition(oldLine, empty, 4.0) ==
+              doctest::Approx(0.0));
+        // Empty old line: the anchor is NaN, so the input position is reused.
+        CHECK(remappedGeneratedLinePosition(empty, oldLine, 4.25) ==
+              doctest::Approx(4.25));
+        // Out-of-range input clamps to the new line's extent.
+        CHECK(remappedGeneratedLinePosition(empty, oldLine, 99.0) ==
+              doctest::Approx(10.0));
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        CHECK(remappedGeneratedLinePosition(empty, oldLine, nan) ==
+              doctest::Approx(0.0));
+    }
+
+    SUBCASE("non-finite vertices on the new line are skipped")
+    {
+        std::vector<cv::Vec3f> newLine = oldLine;
+        newLine[4] = {std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f};
+        // Nearest finite vertex to x=4.25 is index 5; the segment [5,6]
+        // projects the anchor to its clamped start.
+        CHECK(remappedGeneratedLinePosition(oldLine, newLine, 4.25) ==
+              doctest::Approx(5.0));
+    }
+}
+
 TEST_CASE("line annotation fixed current slice snaps only within quarter line position")
 {
     const std::vector<double> controlPositions{12.0, 20.0, 40.0};
