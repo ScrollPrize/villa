@@ -753,6 +753,62 @@ It also writes the direct argmax partition as `<base>_bp_v.obj`,
 `<base>_bp_mixed.obj`, `<base>_bp_h.obj`, and `<base>_bp_tie.obj`. Like binary
 sum-product, it rejects population-balance controls.
 
+### Standalone Lasagna normal sign alignment
+
+`vc_lasagna_normal_align` resolves local sign ambiguity in normals sampled
+from a regular Lasagna `grad_mag`/`nx`/`ny` manifest. It uses the same shared
+binary sum-product message engine as fiber BP, but it does not run H/V
+classification and does not use the legacy `NormalGridVolume` format.
+
+```bash
+volume-cartographer/build/bin/vc_lasagna_normal_align \
+  /path/to/normals.lasagna.json \
+  --bbox X0 Y0 Z0 X1 Y1 Z1 \
+  --output normal_alignment
+```
+
+The bbox is half-open base-voxel XYZ. The default spacing is the physical
+`nx`/`ny` Lasagna level spacing. Samples are globally anchored at integer
+multiples of that spacing, so overlapping bboxes contain identical sample
+coordinates. Remote manifests additionally require `--remote-cache-dir`.
+
+After stable removal of invalid (`grad_mag <= 0`, missing, or degenerate)
+samples, the default graph connects each retained pair in a one-cell
+Chebyshev neighborhood exactly once. For signed normalized dot product `d`,
+the pair costs are:
+
+```text
+E_same      = (1-d)/2
+E_different = (1+d)/2
+```
+
+Thus the preferred relation follows the sign and its strength follows
+`abs(d)`. Exact neutral links are omitted. Each connected component fixes its
+lowest retained node to its original sign because pairwise ambiguous axes do
+not define an absolute outward/inward orientation. Posterior flip probability
+strictly above `0.5` flips a sample; ties do not. A finite nonconverged final
+iterate is reported and still visualized.
+
+The command writes `<base>_unaligned.obj` and `<base>_aligned.obj` using the
+exact same centers. Each sample has two short crossed strokes in its normal
+plane under `g normal_bases` and one longer center-to-normal stroke under
+`g normal_directions`. Glyph dimensions can be overridden in base voxels.
+The source Lasagna Zarr is never rewritten.
+
+`--threads` controls both Lasagna batch sampling and binary BP. Large BP
+graphs use deterministic OpenMP parallelism in GCC builds; Clang and MSVC use
+the project's serial OpenMP shim. The summary prints the effective worker
+count plus BP setup, node-total, message-update, solve, and total times. Node
+totals retain original factor order and message iterations remain synchronous,
+so worker count does not change inference results. `--damping 1` can converge
+faster for well-behaved graphs, but the more conservative default remains
+`0.5` because undamped loopy BP is less robust in general.
+
+The regular spatial lattice is a standalone diagnostic topology. It can join
+nearby parallel sheets and currently treats every positive `grad_mag` as
+valid. Later H/V integration should supply its own sample graph/evidence to
+`alignLasagnaNormalSamples()` while reusing the same binary BP core.
+
 ## Quality groups
 
 Visualization stably sorts traces by ascending cost density and then stored

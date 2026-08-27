@@ -5185,3 +5185,46 @@
   `<base>_bp_mixed.obj`, `<base>_bp_h.obj`, and `<base>_bp_tie.obj`; every
   represented fiber occurs in exactly one layer and exact ties are never
   silently assigned to Mixed.
+
+## BP-aligned Lasagna normal samples
+
+- Normal sign alignment consumes only regular manifest-backed Lasagna
+  `grad_mag`/`nx`/`ny` samples. It must validate the normal dataset structure,
+  open base-coordinate callers with `workingToBaseScale=1`, and must not use
+  `NormalGridVolume` or rewrite the source Lasagna Zarr.
+- Binary pairwise sum-product is one shared core implementation for fiber BP
+  and normal alignment. Extracting or extending it must preserve fiber factor
+  and message order, central-H seed semantics, disconnected unseeded
+  probability `0.5`, probabilities, log odds, iteration count, residual, and
+  convergence status.
+- For normalized ambiguous normal axes with signed dot `d` clamped to
+  `[-1,1]`, normal-alignment costs are exactly `E_same=(1-d)/2` and
+  `E_different=(1+d)/2`. Exact neutral factors are omitted. Temperature is
+  applied only by BP. Every normal-alignment connected component fixes its
+  lowest retained node to unflipped state zero; this per-component gauge rule
+  does not apply to fiber BP.
+- Standalone sampling uses finite half-open base-voxel XYZ bounds and a
+  globally anchored isotropic lattice. Axis indices run from
+  `ceil(min/spacing)` up to but excluding `ceil(max/spacing)`. Invalid samples
+  are compacted in stable Z/Y/X order while retaining lattice identity.
+- The standalone graph connects each retained pair within a positive
+  Chebyshev lattice radius once, with no distance weight; radius one is the
+  default 26-neighborhood. This topology is diagnostic and must not silently
+  become the future H/V graph because it can couple nearby parallel sheets and
+  has no `grad_mag` confidence weighting.
+- A posterior flip probability strictly greater than `0.5` flips the sampled
+  axis; ties remain unflipped. A finite message-limit iterate remains usable
+  and explicitly nonconverged. Invalid data/configuration is a hard failure.
+- Paired standalone OBJ diagnostics use the exact same retained centers and
+  sample order. Each normal emits two crossed undirected base strokes and one
+  directed normal stroke in distinct OBJ groups. The aligned normal set is a
+  reusable core result for later H/V optimization; OBJ is diagnostic output,
+  not its persistence format.
+- Binary BP parallelism is explicit and defaults to one worker for reusable
+  core callers. Parallel node totals use contiguous CSR incoming-message slots
+  in original factor order, factor updates write disjoint slots, and every
+  totals/update/swap/stop phase is synchronized. Worker count may change only
+  execution time, effective-worker and timing diagnostics; it must not change
+  factors, synchronous Jacobi semantics, convergence, probabilities, or log
+  odds. GCC uses OpenMP while the supported Clang/MSVC configurations fall
+  back to one worker through the project shim.

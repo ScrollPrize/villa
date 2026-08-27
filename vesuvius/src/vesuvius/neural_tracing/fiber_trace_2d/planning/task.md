@@ -1,10 +1,13 @@
-# Task: Give Fiberlet crop lookahead full boundary context
+# Task: Align Lasagna normals with belief propagation
 
-Crop tracing must not rank lookahead routes against a graph truncated at the
-requested output crop. Materialize a search graph expanded from the requested
-half-open crop by the configured lookahead distance on every face, while
-retaining only requested-crop anchors as seeds and clipping accepted output at
-the original requested crop.
+Use the current fiber BP message-passing scheme to resolve the sign ambiguity
+of normals sampled from a regular Lasagna `grad_mag`/`nx`/`ny` manifest.
 
-Record staged Fiberlet filtering as the next, separate speed/quality
-experiment; do not enable filtering in this task.
+- Keep the alignment as reusable core functionality for later H/V BP work.
+- Also expose it as a standalone command over an explicit base-voxel bbox.
+- Visualize the same sampled normals before and after alignment as separate OBJ
+  files. Each normal glyph has a short crossed base and one directed stroke.
+- Do not use or modify the legacy NormalGridVolume alignment path.
+- Parallelize the standalone alignment BP so large normal lattices can approach
+  sub-second solve time on a many-core GCC/OpenMP build, without changing BP
+  factors, iteration semantics, convergence, or results.
