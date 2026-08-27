@@ -19,7 +19,6 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
-#include <limits>
 #include <map>
 #include <nlohmann/json.hpp>
 #include <random>
@@ -519,43 +518,12 @@ TEST_CASE("Polyline OBJ output uses explicit consecutive line indices")
 {
     std::mt19937_64 random(std::random_device{}());
     const auto path = std::filesystem::temp_directory_path() / ("vc_fiberlet_crop_" + std::to_string(random()) + ".obj");
-    vc::core::io::writePolylinesObj(
-        {{{"a"}, {{0, 0, 0}, {1, 0, 0}, {2, 0, 0}}},
-         {{"b"}, {{0, 1, 0}, {1, 1, 0}}},
-         {{"c"}, {{4, 4, 4}}}},
-        path);
+    vc::core::io::writePolylinesObj({{{"a"}, {{0, 0, 0}, {1, 0, 0}, {2, 0, 0}}}, {{"b"}, {{0, 1, 0}, {1, 1, 0}}}}, path);
     std::ifstream input(path);
     std::ostringstream text;
     text << input.rdbuf();
     CHECK(text.str().find("l 1 2\nl 2 3\n") != std::string::npos);
     CHECK(text.str().find("l 4 5\n") != std::string::npos);
-    CHECK(text.str().find("p 6\n") != std::string::npos);
-    std::istringstream records(text.str());
-    std::string record;
-    std::size_t vertexCount = 0;
-    while (std::getline(records, record)) {
-        if (!record.starts_with("v "))
-            continue;
-        std::istringstream fields(record);
-        std::string field;
-        std::size_t fieldCount = 0;
-        while (fields >> field)
-            ++fieldCount;
-        CHECK(fieldCount == 4);
-        ++vertexCount;
-    }
-    CHECK(vertexCount == 6);
-    CHECK_THROWS_AS(
-        vc::core::io::writePolylinesObj(
-            {}, path, "invalid", {-0.01, 0.5, 1.0}),
-        std::invalid_argument);
-    CHECK_THROWS_AS(
-        vc::core::io::writePolylinesObj(
-            {},
-            path,
-            "invalid",
-            {0.0, std::numeric_limits<double>::quiet_NaN(), 1.0}),
-        std::invalid_argument);
     std::filesystem::remove(path);
 }
 
@@ -2293,31 +2261,6 @@ TEST_CASE("Fiber value bands use fixed boundaries and short OBJ names")
     CHECK(read(statePaths.mixed).find("fiber_000001") != std::string::npos);
     CHECK(read(statePaths.horizontal).find("fiber_000002") != std::string::npos);
     CHECK(read(statePaths.tie).find("fiber_000003") != std::string::npos);
-    const auto checkColor = [&](const std::filesystem::path& path,
-                                const std::array<double, 3>& expected) {
-        std::ifstream input(path);
-        std::string record;
-        std::size_t vertexCount = 0;
-        while (std::getline(input, record)) {
-            if (!record.starts_with("v "))
-                continue;
-            std::istringstream fields(record);
-            std::vector<std::string> values;
-            std::string value;
-            while (fields >> value)
-                values.push_back(value);
-            REQUIRE(values.size() == 7);
-            CHECK(std::stod(values[4]) == doctest::Approx(expected[0]));
-            CHECK(std::stod(values[5]) == doctest::Approx(expected[1]));
-            CHECK(std::stod(values[6]) == doctest::Approx(expected[2]));
-            ++vertexCount;
-        }
-        CHECK(vertexCount > 0);
-    };
-    checkColor(statePaths.vertical, {0.05, 0.80, 1.00});
-    checkColor(statePaths.mixed, {1.00, 0.10, 0.75});
-    checkColor(statePaths.horizontal, {1.00, 0.35, 0.05});
-    checkColor(statePaths.tie, {0.60, 1.00, 0.10});
 }
 
 TEST_CASE("Trace labeling LP enforces triangle-consistent differences")

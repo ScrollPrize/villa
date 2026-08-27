@@ -5107,9 +5107,4 @@
   It additionally owns the mutually exclusive argmax layers `<base>_bp_v.obj`,
   `<base>_bp_mixed.obj`, `<base>_bp_h.obj`, and `<base>_bp_tie.obj`; every
   represented fiber occurs in exactly one layer and exact ties are never
-  silently assigned to Mixed. These four files append normalized RGB to every
-  OBJ vertex so MeshLab loads their colors directly: V is cyan
-  `(0.05,0.80,1.00)`, Mixed is magenta `(1.00,0.10,0.75)`, H is orange
-  `(1.00,0.35,0.05)`, and tie is lime `(0.60,1.00,0.10)`. No MTL sidecars are
-  required. Other shared polyline OBJ outputs remain uncolored unless their
-  caller explicitly requests a validated normalized color.
+  silently assigned to Mixed.
