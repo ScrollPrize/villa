@@ -2770,6 +2770,11 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
                                                          std::optional<int> linePointIndex,
                                                          std::optional<std::pair<int, int>> spanControlIndices)
 {
+    // The new session is built from _fibers; a debounced autosave for THIS
+    // fiber's still-open session may not have landed there yet, and the
+    // replacement session would then carry (and later re-save) the pre-solve
+    // geometry over the newer state.
+    flushAllPendingSessionAutoSaves();
     auto it = std::find_if(_fibers.begin(), _fibers.end(), [fiberId](const StoredFiber& fiber) {
         return fiber.id == fiberId;
     });
@@ -2994,6 +2999,9 @@ void LineAnnotationController::deleteFibers(std::vector<uint64_t> fiberIds)
     if (fiberIds.empty()) {
         return;
     }
+    // Drain queued save jobs first: a save still in flight for one of these
+    // fibers would recreate the file right after the remove below.
+    waitForFiberSaves();
 
     std::vector<std::pair<uint64_t, std::string>> deletedFibers;
     deletedFibers.reserve(fiberIds.size());
@@ -3131,6 +3139,10 @@ void LineAnnotationController::renameFiberFile(uint64_t fiberId)
         renamed.sequence = parsedIdentity->sequence;
     }
     try {
+        // Drain queued save jobs first: one still in flight for this fiber
+        // would recreate the old path right after the remove below, leaving
+        // duplicate files.
+        waitForFiberSaves();
         saveFiberNow(renamed);
         ec.clear();
         fs::remove(oldPath, ec);
@@ -3794,6 +3806,9 @@ fs::path LineAnnotationController::createAtlasFromFiberCore(uint64_t fiberId)
 
 void LineAnnotationController::addFiberToPointCollection(uint64_t fiberId)
 {
+    // The collection entry is built from _fibers, which a debounced autosave
+    // may not have caught up to yet.
+    flushAllPendingSessionAutoSaves();
     auto fiberIt = std::find_if(_fibers.begin(), _fibers.end(), [fiberId](const StoredFiber& fiber) {
         return fiber.id == fiberId;
     });
@@ -5442,6 +5457,12 @@ void LineAnnotationController::saveOpenFibersCore()
                 session.runningSolveCancel->store(true);
             }
             session.taskState = LineAnnotationSession::TaskState::Succeeded;
+            // The cancelled solve was going to change the line (mode change,
+            // native chain, edit follow-up); the session may still read
+            // Optimized from before it started, which would let the finalize
+            // below no-op and save the OLD geometry under the new settings.
+            setSessionOptimizationState(session,
+                                        SessionOptimizationState::Unoptimized);
         }
         if (session.taskState != LineAnnotationSession::TaskState::Succeeded ||
             session.optimizedLine.points.empty() ||
@@ -7192,6 +7213,18 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     for (const auto& point : session.optimizedLine.points) {
         currentLinePoints.push_back(point.position);
     }
+    {
+        // A rapid second click arrives while the previous edit's geometric
+        // splice is still waiting for its landing: its line position was
+        // measured on the previously DISPLAYED line, and the splice may have
+        // renumbered since. The 3D click point is frame-independent, so when
+        // the two disagree materially, trust the point.
+        const size_t nearestIndex = vc3d::fiber_slice::nearestLinePointIndex(
+            currentLinePoints, toVec3d(volumePoint));
+        if (std::abs(static_cast<double>(nearestIndex) - linePosition) > 2.0) {
+            linePosition = static_cast<double>(nearestIndex);
+        }
+    }
     const auto cumulativeArclengths =
         vc3d::fiber_slice::cumulativePolylineArclengths(currentLinePoints);
     std::vector<double> controlLinePositions;
@@ -7259,9 +7292,13 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
             invalidateFiberAlignmentMetrics(session.fiberId, true);
         }
         setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
-        // See the auto-reoptimize branch: an earlier edit's rollback must
-        // not be applied over this edit.
+        // See the auto-reoptimize branch: an earlier edit's or mode/goal
+        // change's rollback must not be applied over this edit.
         session.controlPointCollapseRollback.reset();
+        session.controlPointsBeforeModeChange.reset();
+        session.optimizedLineBeforeModeChange.reset();
+        session.branchesBeforeModeChange.reset();
+        session.restoreFiberOptimizationModeOnFailure = false;
         // The session no longer matches any in-flight solve: refuse its
         // publication and ask it to stop. Nothing dispatches in manual mode,
         // but an already-queued pending set is carried into the new control
@@ -7366,10 +7403,15 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     const size_t collapsedControlCount = prepared.collapsedOldIndices.size();
     const std::vector<vc3d::line_annotation::LineControlPoint> branchRemapControls =
         prepared.controlPointsBeforeLineUpdate;
-    // A rollback captured by an earlier edit restores a state this edit is
-    // about to build on top of; applying it to a later solve failure would
-    // silently discard this edit too. Each edit owns at most its own.
+    // A rollback captured by an earlier edit or mode/goal change restores a
+    // state this edit is about to build on top of; applying it to a later
+    // solve failure would silently discard this edit too. Each edit owns at
+    // most its own.
     session.controlPointCollapseRollback.reset();
+    session.controlPointsBeforeModeChange.reset();
+    session.optimizedLineBeforeModeChange.reset();
+    session.branchesBeforeModeChange.reset();
+    session.restoreFiberOptimizationModeOnFailure = false;
     if (collapsedControlCount > 1) {
         session.controlPointCollapseRollback =
             LineAnnotationSession::ControlPointCollapseRollback{
@@ -7988,7 +8030,22 @@ void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
     // The candidate fiber can be open in a dialog-less editing session with
     // unsaved changes; merging (and then deleting) the stale stored snapshot
     // would discard them. Bake such a session into _fibers first — same
-    // eligibility guards as scheduleBranchMetadataSaves.
+    // eligibility guards as scheduleBranchMetadataSaves. A candidate whose
+    // solve is still RUNNING refuses outright: its session holds edits the
+    // Succeeded gate below would skip, and the merge deletes the original
+    // files, so proceeding would persist the stale stored geometry and
+    // discard the edits.
+    for (const auto& otherPane : _panes) {
+        if (otherPane.session &&
+            otherPane.session->fiberId == candidate.fiberId &&
+            otherPane.session->taskState ==
+                LineAnnotationSession::TaskState::Running) {
+            showError(tr("The merge candidate's fiber is still optimizing; "
+                         "try again when it finishes."),
+                      suppressErrors);
+            return;
+        }
+    }
     for (const auto& otherPane : _panes) {
         if (!otherPane.session ||
             otherPane.session->fiberId != candidate.fiberId ||
@@ -9931,8 +9988,16 @@ bool LineAnnotationController::finalizeSessionOptimizationSynchronously(
             "segment_interpolation_final_full_line_opt",
             fireSuccessCallback);
         if (applied) {
-            // This synchronous whole-line solve subsumes any queued request.
+            // This synchronous whole-line solve subsumes any queued request
+            // and any armed rollback: leaving one armed would let a LATER
+            // failing solve restore state from before work this pass just
+            // finalized (the async success path clears the same fields).
             (void)session.solveQueue.takePending();
+            session.controlPointCollapseRollback.reset();
+            session.controlPointsBeforeModeChange.reset();
+            session.optimizedLineBeforeModeChange.reset();
+            session.branchesBeforeModeChange.reset();
+            session.restoreFiberOptimizationModeOnFailure = false;
         }
         return applied;
     }
@@ -9963,8 +10028,14 @@ bool LineAnnotationController::finalizeSessionOptimizationSynchronously(
                                                      "final_full_line_opt",
                                                      fireSuccessCallback);
     if (applied) {
-        // This synchronous whole-line solve subsumes any queued request.
+        // This synchronous whole-line solve subsumes any queued request and
+        // any armed rollback (see the multi-control branch above).
         (void)session.solveQueue.takePending();
+        session.controlPointCollapseRollback.reset();
+        session.controlPointsBeforeModeChange.reset();
+        session.optimizedLineBeforeModeChange.reset();
+        session.branchesBeforeModeChange.reset();
+        session.restoreFiberOptimizationModeOnFailure = false;
     }
     return applied;
 }
@@ -10296,6 +10367,11 @@ void LineAnnotationController::dispatchPendingSolve(const std::string& surfaceNa
         session.fiberMetricsMatchStoredFiber =
             rollback.fiberMetricsMatchStoredFiber;
         setSessionOptimizationState(session, rollback.optimizationState);
+        // The dispatched request may have carried EARLIER edits' coalesced
+        // spans too; the rollback restored a numbering they no longer fit,
+        // so escalate to a whole-line request instead of dropping them (the
+        // close/save finalize consumes it if no dispatch ever succeeds).
+        session.solveQueue.addPending({}, true);
     }
 }
 
@@ -10472,6 +10548,19 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
             task.ok,
             session.runningSolveEpoch,
             session.solveQueue.epoch());
+        if (session.suppressFiberSave) {
+            // saveOpenFibersCore superseded this solve, finalized the session
+            // synchronously, and saved it; nothing is left for a successor to
+            // do, and launching one would mutate a session whose saves are
+            // now suppressed (the post-save geometry could never persist).
+            session.runningSolveDirtySegments.clear();
+            session.nativeSeedTracePending = false;
+            (void)session.solveQueue.finishSolve();
+            if (pane->dialog) {
+                pane->dialog->setOptimizationBusy(false, false);
+            }
+            return;
+        }
         if (session.runningSolveFullLine) {
             session.solveQueue.addPending({}, true);
         } else {
@@ -10607,6 +10696,16 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
         }
     }
     if (pendingAfterPublish.requested &&
+        session.taskState != LineAnnotationSession::TaskState::Running &&
+        pane->dialog &&
+        pane->dialog->reoptimizationMode() !=
+            LineAnnotationDialog::ReoptimizationMode::AutoReoptimize) {
+        // The mode changed to manual while this solve ran: keep the request
+        // queued (the superseded epilogue and the debounce dispatcher apply
+        // the same gate) instead of launching a solve the mode forbids.
+        session.solveQueue.addPending(pendingAfterPublish.dirtySegments,
+                                      pendingAfterPublish.fullLine);
+    } else if (pendingAfterPublish.requested &&
         session.taskState != LineAnnotationSession::TaskState::Running) {
         // A request coalesced without a session mutation (a gated caller
         // slipped past its own gate mid-flight); honor it now.
@@ -14855,6 +14954,51 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
         }
         const uint64_t savedFiberId = fiber.id;
 
+        // Snapshots are built from LOCAL copies and validated/queued BEFORE
+        // anything is committed to _fibers: scheduleFiberSaveSnapshots throws
+        // on a contract violation, and a half-committed _fibers would make
+        // the no-op probe classify the next attempt as "unchanged", wedging
+        // the fiber unwritten forever.
+        std::vector<FiberSaveSnapshot> snapshots;
+        snapshots.push_back(makeFiberSaveSnapshot(fiber));
+        std::vector<StoredFiber> linkedFibersToCommit;
+        for (const uint64_t linkedFiberId : branchSync.affectedFiberIds) {
+            if (linkedFiberId == savedFiberId) {
+                continue;
+            }
+            bool addedOpenPaneSnapshot = false;
+            for (const auto& pane : _panes) {
+                if (!pane.session || pane.session.get() == &session ||
+                    pane.session->fiberId != linkedFiberId ||
+                    pane.session->taskState != LineAnnotationSession::TaskState::Succeeded ||
+                    pane.session->optimizedLine.points.empty() ||
+                    pane.session->controlPoints.empty()) {
+                    continue;
+                }
+                StoredFiber linkedFiber = storedFiberFromSession(*pane.session);
+                snapshots.push_back(makeFiberSaveSnapshot(linkedFiber));
+                linkedFibersToCommit.push_back(std::move(linkedFiber));
+                addedOpenPaneSnapshot = true;
+                break;
+            }
+            if (addedOpenPaneSnapshot) {
+                continue;
+            }
+            auto linkedIt = std::find_if(
+                _fibers.begin(),
+                _fibers.end(),
+                [linkedFiberId](const StoredFiber& candidate) {
+                    return candidate.id == linkedFiberId;
+                });
+            if (linkedIt != _fibers.end()) {
+                snapshots.push_back(makeFiberSaveSnapshot(*linkedIt));
+            }
+        }
+        scheduleFiberSaveSnapshots(std::move(snapshots),
+                                   !session.suppressErrorDialogs);
+
+        // Validation passed and the jobs are queued (they write from their
+        // own snapshot copies): commit the same objects to _fibers.
         auto it = std::find_if(_fibers.begin(), _fibers.end(), [&fiber](const StoredFiber& existing) {
             return !fiber.fileName.empty() && existing.fileName == fiber.fileName;
         });
@@ -14863,64 +15007,25 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
                 return existing.id == fiber.id;
             });
         }
-        StoredFiber* savedFiber = nullptr;
         if (it == _fibers.end()) {
             _fibers.push_back(std::move(fiber));
-            savedFiber = &_fibers.back();
         } else {
             *it = std::move(fiber);
-            savedFiber = &*it;
         }
-        if (savedFiber) {
-            std::vector<FiberSaveSnapshot> snapshots;
-            snapshots.push_back(makeFiberSaveSnapshot(*savedFiber));
-            for (const uint64_t linkedFiberId : branchSync.affectedFiberIds) {
-                if (linkedFiberId == savedFiberId) {
-                    continue;
-                }
-                bool addedOpenPaneSnapshot = false;
-                for (const auto& pane : _panes) {
-                    if (!pane.session || pane.session.get() == &session ||
-                        pane.session->fiberId != linkedFiberId ||
-                        pane.session->taskState != LineAnnotationSession::TaskState::Succeeded ||
-                        pane.session->optimizedLine.points.empty() ||
-                        pane.session->controlPoints.empty()) {
-                        continue;
-                    }
-                    StoredFiber linkedFiber = storedFiberFromSession(*pane.session);
-                    auto linkedIt = std::find_if(
-                        _fibers.begin(),
-                        _fibers.end(),
-                        [linkedFiberId, &linkedFiber](const StoredFiber& candidate) {
-                            return candidate.id == linkedFiberId ||
-                                   (!linkedFiber.fileName.empty() &&
-                                    candidate.fileName == linkedFiber.fileName);
-                        });
-                    if (linkedIt == _fibers.end()) {
-                        _fibers.push_back(std::move(linkedFiber));
-                        linkedIt = std::prev(_fibers.end());
-                    } else {
-                        *linkedIt = std::move(linkedFiber);
-                    }
-                    snapshots.push_back(makeFiberSaveSnapshot(*linkedIt));
-                    addedOpenPaneSnapshot = true;
-                    break;
-                }
-                if (addedOpenPaneSnapshot) {
-                    continue;
-                }
-                auto linkedIt = std::find_if(
-                    _fibers.begin(),
-                    _fibers.end(),
-                    [linkedFiberId](const StoredFiber& candidate) {
-                        return candidate.id == linkedFiberId;
-                    });
-                if (linkedIt != _fibers.end()) {
-                    snapshots.push_back(makeFiberSaveSnapshot(*linkedIt));
-                }
+        for (auto& linkedFiber : linkedFibersToCommit) {
+            auto linkedIt = std::find_if(
+                _fibers.begin(),
+                _fibers.end(),
+                [&linkedFiber](const StoredFiber& candidate) {
+                    return candidate.id == linkedFiber.id ||
+                           (!linkedFiber.fileName.empty() &&
+                            candidate.fileName == linkedFiber.fileName);
+                });
+            if (linkedIt == _fibers.end()) {
+                _fibers.push_back(std::move(linkedFiber));
+            } else {
+                *linkedIt = std::move(linkedFiber);
             }
-            scheduleFiberSaveSnapshots(std::move(snapshots),
-                                       !session.suppressErrorDialogs);
         }
         invalidateFiberAlignmentMetrics(savedFiberId, true);
         addKnownFiberTags(session.fiberTags);

@@ -922,6 +922,18 @@ std::shared_ptr<ChunkCache> ChunkCacheService::acquireSource(
                 "ChunkCache source was registered with incompatible metadata: " +
                 sourceIdentity);
         }
+        if (options.decodedEvictionPreferSelf !=
+            state->options_.decodedEvictionPreferSelf) {
+            // Eviction preference is a per-source policy captured by the
+            // FIRST acquisition's budget registration; it is deliberately not
+            // part of metadataCompatible (it describes no data), but a
+            // differing later request must not be ignored silently.
+            Logger()->warn(
+                "ChunkCache source {} already registered with "
+                "decodedEvictionPreferSelf={}; ignoring differing request",
+                sourceIdentity,
+                state->options_.decodedEvictionPreferSelf);
+        }
         ChunkCache::validateRefreshedFetchers(*state, fetchers);
         serviceLock.unlock();
         ChunkCache::refreshFetchers(state, std::move(fetchers));
