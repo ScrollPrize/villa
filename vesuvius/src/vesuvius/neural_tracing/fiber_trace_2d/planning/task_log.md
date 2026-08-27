@@ -1,36 +1,33 @@
-# Task log: Napari winding-fiber viewer
+# Task log: Joint adaptive-grid winding BP
 
 ## Decisions
 
-- The viewer consumes existing OBJ artifacts and does not alter inference or
-  regenerate visualization files.
-- Viewer category `Broken` includes both `_err.obj` (Mixed/error argmax) and
-  `_tie.obj` (exact argmax tie), preserving every ambiguous output.
-- Previous/next winding navigation is an H+V inspection preset; Broken remains
-  available through its category preset.
-- The independent review required strict complete state quartets, exclusion of
-  valid aggregate winding siblings, stable key-derived colors, navigation only
-  through nonempty H/V windings, and extraction of the existing ordered-line
-  OBJ parsing into a shared helper.
-- Published winding numbers are display-offset integer labels. The viewer does
-  not imply absolute winding or physical H/V comparability between separately
-  gauged components.
+- Aligned-normal sign resolution remains an independent preprocessing result.
+  It is not the H/V/Mixed orientation inference discussed by the joint solver.
+- H/V/Mixed, integer winding, phase, scale, and the necessary ladder-order
+  gauges belong to one joint inference model.
+- Calibration uses an explicit crop-global variable on an absolute sliding
+  grid over log inverse-scale and canonical phase. Retained cells keep their
+  physical identity; support moves only under boundary pressure rather than
+  remapping existing message indices.
+- Each constraint component has a separate binary ladder-order gauge, while
+  every component contributes to and receives the same global calibration
+  posterior.
+- The independent plan review required the complete orientation+winding factor
+  equation, finite continuity-factor wording, conservative integer support,
+  explicit message transport/window-growth rules, and brute-force tiny-tree
+  validation. These corrections are incorporated in `task_plan.md`.
+- The new `joint-grid` path becomes the default. The existing alternating
+  multi-start/calibration implementation remains explicitly selectable for
+  comparison and must not be silently used as a fallback.
 
 ## Deviations
 
-- None.
+- Implementation and validation are deferred at the user's request so an
+  intervening fix can be handled first.
 
 ## Validation
 
-- Shared-parser refactor plus winding-viewer tests:
-  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src pytest -q
-  vesuvius/tests/test_view_fiber_windings.py
-  vesuvius/tests/test_view_fiber_presence.py` -> 84 passed.
-- Existing 1024 artifact headless load: 76 quartet files, 51 nonempty layers,
-  19 published winding labels, 18 navigable H/V labels, and 1,361 paths.
-- Python compilation and CLI help import passed. Ruff and `git diff --check`
-  passed.
-- A live/headless Napari widget construction smoke test could not run because
-  this host does not have the optional `napari` package. No dependency install
-  was attempted. Parser, discovery, color, visibility, navigation, and CLI
-  import remain covered without GUI dependencies.
+- Independent plan review completed and its correctness findings were resolved
+  in the plan. No implementation validation has been run for this deferred
+  task.

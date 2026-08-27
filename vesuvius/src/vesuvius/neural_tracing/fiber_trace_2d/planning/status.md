@@ -1,11 +1,12 @@
-# Status: Napari winding-fiber viewer
+# Status: Joint adaptive-grid winding BP
 
-- [x] Record the user task in `task.md`.
-- [x] Write the implementation, spec, docs, and validation plan.
+- [x] Record the agreed solver requirements.
+- [x] Write the implementation, compatibility, docs, and validation plan.
 - [x] Complete independent plan review against task and existing specs.
-- [x] Update the specification.
-- [x] Implement strict artifact loading and layer discovery.
-- [x] Implement Napari layers and grouped visibility/navigation controls.
-- [x] Add focused regression tests.
-- [x] Run focused validation and an existing-artifact smoke test.
-- [x] Update docs, changelog, task log, and final status.
+- [x] Resolve review findings in the plan.
+- [ ] Implement the new joint solver and explicit legacy selection.
+- [ ] Add focused regression and synthetic inference tests.
+- [ ] Run crop-level comparison measurements.
+- [ ] Update specifications, user documentation, changelog, and task log.
+
+Implementation is intentionally deferred while an intervening fix is handled.

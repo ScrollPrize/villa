@@ -99,6 +99,23 @@
 - [ ] test distance-decayed lookahead costs so farther evidence changes the
       decision smoothly instead of treating every point in the horizon equally
 
+# joint winding inference
+
+- [ ] replace repeated winding BP calibration passes with a default joint
+      adaptive-grid solver while retaining the current alternating solver for
+      comparison
+    - keep aligned-normal sign resolution as independent preprocessing
+    - jointly infer H/V/Mixed, integer winding, global phase/scale, and legal
+      component ladder-order gauges
+    - use an absolute sliding grid in log gain `log(1/scale)` and canonical
+      phase; preserve retained cell identities and shift only under posterior
+      boundary pressure
+    - aggregate all components into one global calibration posterior
+    - run no H/V pre-pass, calibration multi-starts, or BP restarts in the new
+      mode
+    - default to `joint-grid`; expose the current behavior as `alternating`
+    - see `task_plan.md` for the implementation and validation contract
+
 # multidir
 - [ ] test a loss on multi-dir outputs being perpendicular
     - [ ] and the cross product being the surface normal?
