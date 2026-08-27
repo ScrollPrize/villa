@@ -1068,14 +1068,15 @@ def resolve_outer_winding_idx_and_notes(cfg, shell_active, infer_outer_winding_i
             f'= {idx} for the dense and regularisation losses')
     if idx is not None:
         min_gap = idx + 3
-        gap_windings = cfg['model_gap_expander_num_windings']
-        if gap_windings < min_gap:
-            notes.append(
-                f'WARNING: shell_outer_winding_idx {idx} requires '
-                f'model_gap_expander_num_windings >= {min_gap}, got '
-                f'model_gap_expander_num_windings {gap_windings}; '
-                'increase model_gap_expander_num_windings or lower '
-                'shell_outer_winding_idx')
+        capacity = cfg.get(
+            'model_gap_expander_capacity_windings',
+            cfg['model_gap_expander_num_windings'])
+        if capacity < min_gap:
+            raise ValueError(
+                f'shell_outer_winding_idx {idx} requires '
+                f'model_gap_expander_capacity_windings >= {min_gap}, got '
+                f'{capacity}; increase the allocated capacity or lower the '
+                'active shell_outer_winding_idx')
     return idx, notes
 
 
@@ -1112,7 +1113,9 @@ def _warn_if_inputs_exceed_flow_bounds(
     flow_field_radius,
     cfg,
 ):
-    gap_expander_num_windings = cfg['model_gap_expander_num_windings']
+    gap_expander_num_windings = cfg.get(
+        'model_gap_expander_capacity_windings',
+        cfg['model_gap_expander_num_windings'])
 
     over_radius_patches = []
     over_winding_patches = []
@@ -1153,7 +1156,8 @@ def _warn_if_inputs_exceed_flow_bounds(
         over_radius_patches, over_radius_pcls, lambda v: f'{v:.1f}',
     )
     _print_offenders(
-        'winding idx', 'winding index', f'gap_expander_num_windings ({gap_expander_num_windings})',
+        'winding idx', 'winding index',
+        f'gap_expander_capacity_windings ({gap_expander_num_windings})',
         over_winding_patches, over_winding_pcls, lambda v: f'{v}',
     )
 
