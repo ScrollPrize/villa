@@ -1471,3 +1471,6 @@
 - Added categorical V/Mixed/H sum-product inference with measurement-scaled
   defect costs, normalized state marginals, direct Mixed diagnostics, and
   separate orientation-projection and Mixed-probability OBJ bands.
+- Replaced measurement-scaled defect factors with a node-local Mixed unary and
+  conditionally neutral Mixed factor rows/columns, preventing Mixed labels from
+  propagating transitively through otherwise orientation-only constraints.

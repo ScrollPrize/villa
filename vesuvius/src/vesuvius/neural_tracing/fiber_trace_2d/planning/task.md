@@ -1,7 +1,9 @@
-# Task: Explicit Mixed-state fiber belief propagation
+# Task: Non-transitive Mixed-state fiber BP
 
-Test whether adding an explicit `Mixed` state to the existing sum-product
-fiber BP improves identification of direction-defect fibers. Preserve the
-binary min-sum and sum-product modes, use the same no-split perpendicular
-factor graph and central straight H seed, expose normalized V/Mixed/H
-marginals, and compare the new mode on the centered-384 full-Mixed cohort.
+Change explicit Mixed-state sum-product belief propagation so Mixed represents
+uncertain orientation at one fiber rather than an edge label which propagates
+to neighboring fibers. A factor touching Mixed must impose no pairwise loss;
+instead, each Mixed fiber pays one configurable unary cost. Consistent oriented
+neighbors must accumulate evidence for H or V, while conflicting evidence may
+make the local Mixed state preferable without encouraging neighboring fibers to
+be Mixed.

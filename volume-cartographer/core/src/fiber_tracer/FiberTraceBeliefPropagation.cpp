@@ -68,10 +68,9 @@ void validateConfig(const FiberTraceBeliefPropagationConfig& config)
         throw std::invalid_argument(
             "BP horizontalness temperature must be finite and positive");
     }
-    if (!finite(config.mixedCostPerConstraint) ||
-        config.mixedCostPerConstraint < 0.0) {
+    if (!finite(config.mixedUnaryCost) || config.mixedUnaryCost < 0.0) {
         throw std::invalid_argument(
-            "BP Mixed cost per constraint must be finite and nonnegative");
+            "BP Mixed unary cost must be finite and nonnegative");
     }
     if (!finite(config.messageDamping) || !(config.messageDamping > 0.0) ||
         config.messageDamping > 1.0) {
@@ -760,11 +759,7 @@ FiberTraceBeliefPropagationReport solveFiberTraceMixedSumProduct(
         for (std::size_t source = 0; source < 3; ++source) {
             for (std::size_t target = 0; target < 3; ++target) {
                 double energy = 0.0;
-                if (source == 1 || target == 1) {
-                    energy = config.mixedCostPerConstraint *
-                        static_cast<double>(factor.measurements) *
-                        static_cast<double>((source == 1) + (target == 1));
-                } else {
+                if (source != 1 && target != 1) {
                     energy = source == target
                         ? factor.sameCost
                         : factor.differentCost;
@@ -787,6 +782,12 @@ FiberTraceBeliefPropagationReport solveFiberTraceMixedSumProduct(
 
     const TernaryLogMessage zeroMessage{
         -std::log(3.0), -std::log(3.0), -std::log(3.0)};
+    const TernaryLogMessage logUnary{
+        0.0, -config.mixedUnaryCost / temperature, 0.0};
+    if (!std::isfinite(logUnary[1])) {
+        throw std::invalid_argument(
+            "Mixed-state sum-product BP temperature is too small for the Mixed unary cost");
+    }
     std::vector<TernaryLogMessage> aToB(
         graph.factors.size(), zeroMessage);
     std::vector<TernaryLogMessage> bToA(
@@ -819,7 +820,7 @@ FiberTraceBeliefPropagationReport solveFiberTraceMixedSumProduct(
 
     auto report = initializeReport(
         problem, config, FiberTraceBeliefInference::SumProductMixed);
-    report.mixedCostPerConstraint = config.mixedCostPerConstraint;
+    report.mixedUnaryCost = config.mixedUnaryCost;
     for (std::size_t iteration = 0;
          iteration < config.maximumMessageIterations;
          ++iteration) {
@@ -838,8 +839,10 @@ FiberTraceBeliefPropagationReport solveFiberTraceMixedSumProduct(
             TernaryLogMessage cavityA{};
             TernaryLogMessage cavityB{};
             for (std::size_t state = 0; state < 3; ++state) {
-                cavityA[state] = totals[factor.a][state] - bToA[index][state];
-                cavityB[state] = totals[factor.b][state] - aToB[index][state];
+                cavityA[state] = totals[factor.a][state] -
+                    bToA[index][state] + logUnary[state];
+                cavityB[state] = totals[factor.b][state] -
+                    aToB[index][state] + logUnary[state];
             }
             const auto rawAToB = rawMessage(
                 cavityA, logPotential[index], factor.a == problem.seed);
@@ -888,7 +891,10 @@ FiberTraceBeliefPropagationReport solveFiberTraceMixedSumProduct(
     double weightedHorizontalness = 0.0;
     double totalWeight = 0.0;
     for (std::size_t node = 0; node < nodeCount; ++node) {
-        TernaryLogMessage marginal = totals[node];
+        TernaryLogMessage marginal{
+            totals[node][0] + logUnary[0],
+            totals[node][1] + logUnary[1],
+            totals[node][2] + logUnary[2]};
         if (node == problem.seed) {
             marginal = {
                 -std::numeric_limits<double>::infinity(),

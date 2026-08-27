@@ -664,21 +664,31 @@ sum-product pairwise marginal.
 
 Add `--bp-inference sum-product-mixed` to test an explicit categorical
 V/Mixed/H variable. Mixed means an orientation defect, not a third physical
-direction. If a merged factor represents `K` measurements, its energies are:
+direction. Its pairwise energies are:
 
 ```text
 E(V,V) = E(H,H) = E_same
 E(V,H) = E(H,V) = E_diff
-E(Mixed,V/H) = E(V/H,Mixed) = K * mixed_cost_per_link
-E(Mixed,Mixed) = 2 * K * mixed_cost_per_link
+E(Mixed,*) = E(*,Mixed) = 0
 ```
 
-Set the cost with `--bp-mixed-cost F`; its experimental default is `0.5`.
-The hard seed remains H. Every directed message contains three normalized
-log-values, and the reported `p_v`, `p_mixed`, and `p_h` are normalized node
-marginals. An isolated unseeded fiber is uniform over the three states. An
+Every non-seed fiber assigned Mixed instead pays one node-local unary energy
+`U(Mixed)=mixed_unary_cost`, with `U(V)=U(H)=0`. Set it with
+`--bp-mixed-cost F`; its experimental default is `0.5`. The cost is paid once
+per fiber, independent of its degree and the number of raw measurements merged
+into its factors. Mixed therefore conditionally disables incident orientation
+terms: a source known to be Mixed sends a uniform factor message, rather than
+encouraging its neighbor to become Mixed. A soft source with residual V/H
+probability can still transmit that residual orientation evidence.
+
+The hard seed remains exactly H and replaces the unary at that node. Every
+directed message contains three normalized log-values. For a non-seed outgoing
+cavity, the solver adds `(0,-mixed_unary_cost/T,0)` exactly once; it adds the
+same unary exactly once to the final node marginal. The reported `p_v`,
+`p_mixed`, and `p_h` are normalized node marginals. An isolated unseeded fiber
+has probabilities proportional to `(1,exp(-mixed_unary_cost/T),1)`. An
 unseeded connected component retains exact V/H gauge symmetry, although its
-Mixed marginal can differ from one third.
+Mixed marginal generally differs from one third.
 
 The scalar `orientation_projection = p_h + 0.5*p_mixed` exists only for the
 legacy H/V band visualization and explicitly labeled heuristic consistency

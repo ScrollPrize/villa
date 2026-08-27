@@ -2715,13 +2715,14 @@ std::vector<std::array<double, 3>> bruteForceMixedBpMarginals(
         if (states[seed] != 2)
             continue;
         double energy = 0.0;
+        for (const std::size_t state : states) {
+            if (state == 1)
+                energy += mixedCost;
+        }
         for (const auto& constraint : constraints.constraints) {
             const std::size_t a = states[constraint.pieceA];
             const std::size_t b = states[constraint.pieceB];
-            if (a == 1 || b == 1) {
-                energy += mixedCost *
-                    static_cast<double>((a == 1) + (b == 1));
-            } else {
+            if (a != 1 && b != 1) {
                 energy += a == b
                     ? 1.0 - constraint.parallelScore
                     : constraint.parallelScore;
@@ -3039,16 +3040,16 @@ TEST_CASE("Mixed-state sum-product BP matches exact seeded tree marginals")
     for (const double temperature : {0.25, 1.0}) {
         auto config = bpConfig();
         config.horizontalnessTemperature = temperature;
-        config.mixedCostPerConstraint = 0.4;
+        config.mixedUnaryCost = 0.4;
         config.messageDamping = 1.0;
         const auto report = solveFiberTraceMixedSumProduct(
             lines, constraints, config);
         const auto exact = bruteForceMixedBpMarginals(
             lines.size(), report.seedTraceIndex, constraints,
-            temperature, config.mixedCostPerConstraint);
+            temperature, config.mixedUnaryCost);
         CHECK(report.inference ==
               FiberTraceBeliefInference::SumProductMixed);
-        CHECK(report.mixedCostPerConstraint == doctest::Approx(0.4));
+        CHECK(report.mixedUnaryCost == doctest::Approx(0.4));
         CHECK(report.status == "converged");
         for (std::size_t node = 0; node < lines.size(); ++node) {
             CHECK(report.verticalProbability[node] ==
@@ -3094,7 +3095,7 @@ TEST_CASE("Mixed-state sum-product BP preserves gauge and isolate symmetry")
     addBpConstraint(constraints, 0, 1, 0.0);
     addBpConstraint(constraints, 2, 3, 0.1);
     auto config = bpConfig();
-    config.mixedCostPerConstraint = 0.4;
+    config.mixedUnaryCost = 0.4;
     const auto report = solveFiberTraceMixedSumProduct(
         lines, constraints, config);
     CHECK(report.verticalProbability[report.seedTraceIndex] ==
@@ -3108,9 +3109,76 @@ TEST_CASE("Mixed-state sum-product BP preserves gauge and isolate symmetry")
               doctest::Approx(report.horizontalProbability[node])
                   .epsilon(1.0e-12));
     }
-    CHECK(report.verticalProbability[4] == doctest::Approx(1.0 / 3.0));
-    CHECK(report.mixedProbability[4] == doctest::Approx(1.0 / 3.0));
-    CHECK(report.horizontalProbability[4] == doctest::Approx(1.0 / 3.0));
+    const double mixedWeight = std::exp(
+        -config.mixedUnaryCost / config.horizontalnessTemperature);
+    const double isolateNormalization = 2.0 + mixedWeight;
+    CHECK(report.verticalProbability[4] ==
+          doctest::Approx(1.0 / isolateNormalization));
+    CHECK(report.mixedProbability[4] ==
+          doctest::Approx(mixedWeight / isolateNormalization));
+    CHECK(report.horizontalProbability[4] ==
+          doctest::Approx(1.0 / isolateNormalization));
+}
+
+TEST_CASE("Mixed-state sum-product BP charges one node unary")
+{
+    const auto lines = bpLines(2);
+    auto oneConstraint = bpConstraints(lines.size());
+    addBpConstraint(oneConstraint, 0, 1, 0.0);
+    auto threeConstraints = oneConstraint;
+    addBpConstraint(threeConstraints, 0, 1, 0.0);
+    addBpConstraint(threeConstraints, 0, 1, 0.0);
+
+    auto config = bpConfig();
+    config.horizontalnessTemperature = 0.5;
+    config.mixedUnaryCost = 0.7;
+    config.messageDamping = 1.0;
+    const auto one = solveFiberTraceMixedSumProduct(
+        lines, oneConstraint, config);
+    const auto three = solveFiberTraceMixedSumProduct(
+        lines, threeConstraints, config);
+    REQUIRE(three.seedTraceIndex == 0);
+
+    const double verticalWeight = 1.0;
+    const double mixedWeight = std::exp(
+        -config.mixedUnaryCost / config.horizontalnessTemperature);
+    const double horizontalWeight = std::exp(
+        -3.0 / config.horizontalnessTemperature);
+    const double normalization =
+        verticalWeight + mixedWeight + horizontalWeight;
+    CHECK(three.verticalProbability[1] ==
+          doctest::Approx(verticalWeight / normalization).epsilon(1.0e-12));
+    CHECK(three.mixedProbability[1] ==
+          doctest::Approx(mixedWeight / normalization).epsilon(1.0e-12));
+    CHECK(three.horizontalProbability[1] ==
+          doctest::Approx(horizontalWeight / normalization).epsilon(1.0e-12));
+    CHECK(three.verticalProbability[1] > one.verticalProbability[1]);
+    CHECK(three.verticalProbability[three.seedTraceIndex] ==
+          doctest::Approx(0.0));
+    CHECK(three.mixedProbability[three.seedTraceIndex] ==
+          doctest::Approx(0.0));
+    CHECK(three.horizontalProbability[three.seedTraceIndex] ==
+          doctest::Approx(1.0));
+}
+
+TEST_CASE("Mixed-state sum-product BP absorbs conflicting oriented evidence")
+{
+    const auto lines = bpLines(3);
+    auto constraints = bpConstraints(lines.size());
+    for (std::size_t repeat = 0; repeat < 5; ++repeat)
+        addBpConstraint(constraints, 0, 1, 0.0);
+    addBpConstraint(constraints, 0, 2, 0.0);
+    addBpConstraint(constraints, 1, 2, 0.0);
+
+    auto config = bpConfig();
+    config.horizontalnessTemperature = 0.1;
+    config.mixedUnaryCost = 0.2;
+    config.messageDamping = 0.25;
+    const auto report = solveFiberTraceMixedSumProduct(
+        lines, constraints, config);
+    CHECK(report.status == "converged");
+    CHECK(report.mixedProbability[2] > report.verticalProbability[2]);
+    CHECK(report.mixedProbability[2] > report.horizontalProbability[2]);
 }
 
 TEST_CASE("Mixed-state sum-product BP validates penalty and limits")
@@ -3120,10 +3188,10 @@ TEST_CASE("Mixed-state sum-product BP validates penalty and limits")
     addBpConstraint(constraints, 0, 1, 0.1);
     addBpConstraint(constraints, 1, 2, 0.1);
     auto config = bpConfig();
-    config.mixedCostPerConstraint = 0.0;
+    config.mixedUnaryCost = 0.0;
     const auto cheap = solveFiberTraceMixedSumProduct(
         lines, constraints, config);
-    config.mixedCostPerConstraint = 100.0;
+    config.mixedUnaryCost = 100.0;
     const auto expensive = solveFiberTraceMixedSumProduct(
         lines, constraints, config);
     CHECK(cheap.mixedProbability[1] > expensive.mixedProbability[1]);
@@ -3147,10 +3215,21 @@ TEST_CASE("Mixed-state sum-product BP validates penalty and limits")
     CHECK_FALSE(limited.messageConverged);
 
     config = bpConfig();
-    config.mixedCostPerConstraint = -0.1;
+    config.mixedUnaryCost = -0.1;
     CHECK_THROWS_WITH_AS(
         solveFiberTraceMixedSumProduct(lines, constraints, config),
-        doctest::Contains("Mixed cost"),
+        doctest::Contains("Mixed unary cost"),
+        std::invalid_argument);
+    config = bpConfig();
+    config.mixedUnaryCost = std::numeric_limits<double>::quiet_NaN();
+    CHECK_THROWS_WITH_AS(
+        solveFiberTraceMixedSumProduct(lines, constraints, config),
+        doctest::Contains("Mixed unary cost"),
+        std::invalid_argument);
+    config.mixedUnaryCost = std::numeric_limits<double>::infinity();
+    CHECK_THROWS_WITH_AS(
+        solveFiberTraceMixedSumProduct(lines, constraints, config),
+        doctest::Contains("Mixed unary cost"),
         std::invalid_argument);
     config = bpConfig();
     config.balanceMode = FiberTraceBalanceMode::Soft;

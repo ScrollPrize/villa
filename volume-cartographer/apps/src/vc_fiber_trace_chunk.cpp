@@ -144,7 +144,7 @@ void usage(const char* executable)
               << "Belief-propagation options (direction-ablation only):\n"
               << "  --bp-only                 run only final-cohort BP; skip HiGHS\n"
               << "  --bp-inference MODE       min-sum, sum-product, or sum-product-mixed [min-sum]\n"
-              << "  --bp-mixed-cost F         Mixed-state cost per incident link [0.5]\n"
+              << "  --bp-mixed-cost F         Mixed-state unary cost per fiber [0.5]\n"
               << "  --bp-balance MODE         soft, tight, or both [disabled]\n"
               << "  --bp-target F             arc-weighted H fraction [0.5]\n"
               << "  --bp-soft-strength F      quadratic balance strength [1]\n"
@@ -341,10 +341,12 @@ Options parse(int argc, char** argv)
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
         } else if (argument == "--bp-mixed-cost") {
-            options.bp.mixedCostPerConstraint =
+            options.bp.mixedUnaryCost =
                 number(index, argc, argv, "--bp-mixed-cost");
-            if (options.bp.mixedCostPerConstraint < 0.0)
-                fail("--bp-mixed-cost must be nonnegative");
+            if (!std::isfinite(options.bp.mixedUnaryCost) ||
+                options.bp.mixedUnaryCost < 0.0) {
+                fail("--bp-mixed-cost must be finite and nonnegative");
+            }
             options.hasBpMixedCostOption = true;
             options.hasBpTuningOption = true;
             options.hasAblationOnlyOption = true;
@@ -1192,7 +1194,7 @@ void writeAndPrintBpReport(
         csvOutput << "bp_inference,bp_temperature,";
     }
     if (mixedState)
-        csvOutput << "bp_mixed_cost,p_v,p_mixed,p_h,";
+        csvOutput << "bp_mixed_unary_cost,p_v,p_mixed,p_h,";
     csvOutput
         << "bp_status,vertical_threshold,"
            "horizontal_threshold,"
@@ -1219,7 +1221,7 @@ void writeAndPrintBpReport(
                       << ',';
         }
         if (mixedState) {
-            csvOutput << report.mixedCostPerConstraint << ','
+            csvOutput << report.mixedUnaryCost << ','
                       << report.verticalProbability[trace] << ','
                       << report.mixedProbability[trace] << ','
                       << report.horizontalProbability[trace] << ',';
@@ -1250,12 +1252,12 @@ void writeAndPrintBpReport(
     if (mixedState) {
         std::cout
             << "fiber direction Mixed-state sum-product BP\n"
-            << "inference  temperature  mixed_cost  status  fibers  factors  measurements"
+            << "inference  temperature  mixed_unary_cost  status  fibers  factors  measurements"
                "  components  isolated  seed  seed_ref  message_iterations"
                "  message_residual  achieved_orientation  min_orientation"
                "  mean_orientation  max_orientation  seconds\n"
             << inferenceName << "  " << report.inferenceTemperature << "  "
-            << report.mixedCostPerConstraint << "  "
+            << report.mixedUnaryCost << "  "
             << report.status << "  " << lines.size() << "  " << report.factors
             << "  " << report.mergedMeasurements << "  "
             << report.connectedComponents << "  " << report.isolatedTraces

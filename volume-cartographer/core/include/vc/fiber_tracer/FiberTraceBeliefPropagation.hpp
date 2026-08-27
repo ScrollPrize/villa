@@ -28,7 +28,7 @@ struct FiberTraceBeliefPropagationConfig {
     double targetHorizontalFraction = 0.5;
     double softBalanceStrength = 1.0;
     double horizontalnessTemperature = 0.25;
-    double mixedCostPerConstraint = 0.5;
+    double mixedUnaryCost = 0.5;
     double messageDamping = 0.5;
     double messageResidualTolerance = 1.0e-8;
     double balanceTolerance = 1.0e-3;
@@ -62,7 +62,7 @@ struct FiberTraceBeliefPropagationReport {
     bool balanceConverged = false;
     FiberTraceBeliefInference inference = FiberTraceBeliefInference::MinSum;
     double inferenceTemperature = 0.0;
-    double mixedCostPerConstraint = 0.0;
+    double mixedUnaryCost = 0.0;
     std::string status;
 };
 

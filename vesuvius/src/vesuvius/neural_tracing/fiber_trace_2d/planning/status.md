@@ -1,11 +1,10 @@
-# Status: Explicit Mixed-state fiber belief propagation
+# Status: Non-transitive Mixed-state fiber BP
 
-- [x] Capture the explicit Mixed-state experiment.
+- [x] Capture the formulation correction.
 - [x] Write implementation, specification, documentation, and test plan.
 - [x] Complete independent plan review.
-- [x] Implement ternary sum-product inference.
-- [x] Add CLI diagnostics and distinct artifacts.
+- [x] Implement neutral Mixed pairwise terms and node unary cost.
+- [x] Update CLI/report terminology and documentation.
 - [x] Add focused regression tests.
-- [x] Update specifications, docs, changelog, and task log.
 - [x] Build and run focused validation.
-- [x] Run centered-384 comparison and Mixed-cost sweep.
+- [x] Update task log, changelog, and status.
