@@ -7120,9 +7120,7 @@ void LineAnnotationController::onVolumePackageChanged(std::shared_ptr<VolumePkg>
     // into the new one.
     invalidateSideStripQueries();
     _pendingSideStripIntersectionRequests.clear();
-    _lastSideStripIntersectionKey = 0;
-    _lastSideStripIntersectionSurfaceName.clear();
-    _lastSideStripIntersectionMarkers.clear();
+    _sideStripReuseCache.clear();
     // Session-cache entries are keyed by runtime fiber ids, which are
     // assigned per package: an entry surviving the switch could collide with
     // a different fiber in the new package.
@@ -12143,11 +12141,10 @@ void LineAnnotationController::cleanupSurfaceName(const std::string& surfaceName
                       return matchesClosingSurface(item.first);
                   });
     refreshLatestSideStripIntersectionToken();
-    if (matchesClosingSurface(_lastSideStripIntersectionSurfaceName)) {
-        _lastSideStripIntersectionKey = 0;
-        _lastSideStripIntersectionSurfaceName.clear();
-        _lastSideStripIntersectionMarkers.clear();
-    }
+    std::erase_if(_sideStripReuseCache,
+                  [&matchesClosingSurface](const auto& item) {
+                      return matchesClosingSurface(item.first);
+                  });
 
     if (sessionToSave) {
         saveSessionAsFiber(*sessionToSave);
@@ -13315,23 +13312,29 @@ void LineAnnotationController::dispatchSideStripIntersectionQuery(
         pane->dialog->setGeneratedSideStripIntersectionProgress(tr("already queued"), 0, 0);
         return;
     }
-    if (_lastSideStripIntersectionKey != 0 &&
-        _lastSideStripIntersectionSurfaceName == surfaceName &&
-        !_lastSideStripFingerprint.isEmpty() &&
-        fingerprint == _lastSideStripFingerprint) {
+    if (const auto reuseIt = _sideStripReuseCache.find(surfaceName);
+        reuseIt != _sideStripReuseCache.end() &&
+        reuseIt->second.cacheKey != 0 &&
+        !reuseIt->second.fingerprint.isEmpty() &&
+        fingerprint == reuseIt->second.fingerprint) {
         // The cache satisfies this surface's LATEST intent: a queued older
         // request would otherwise still run, publish obsolete work, and only
         // then be caught up (visible A -> B -> pending -> A oscillation).
         _pendingSideStripIntersectionRequests.erase(surfaceName);
         refreshLatestSideStripIntersectionToken();
-        pane->dialog->setGeneratedSideStripIntersectionBusy(
-            _sideStripIntersectionRunning &&
-            _runningSideStripIntersectionSurfaceName == surfaceName);
+        const bool runningHere = _sideStripIntersectionRunning &&
+            _runningSideStripIntersectionSurfaceName == surfaceName;
+        pane->dialog->setGeneratedSideStripIntersectionBusy(runningHere);
         pane->dialog->setGeneratedFiberIntersectionMarkers(
-            markLinkCandidateFiberIntersections(_lastSideStripIntersectionMarkers,
+            markLinkCandidateFiberIntersections(reuseIt->second.markers,
                                                 pane->session->branches));
-        pane->dialog->setGeneratedSideStripIntersectionResult(
-            _lastSideStripIntersectionMarkers.size());
+        if (!runningHere) {
+            // While this surface's own query is still in flight, the busy
+            // indicator tells the truth; a completed-count would show 100%
+            // mid-run and progress cannot go backwards.
+            pane->dialog->setGeneratedSideStripIntersectionResult(
+                reuseIt->second.markers.size());
+        }
         return;
     }
 
@@ -13397,20 +13400,21 @@ void LineAnnotationController::dispatchSideStripIntersectionQuery(
         return;
     }
 
-    if (!_sideStripIntersectionRunning &&
-        _lastSideStripIntersectionKey != 0 &&
-        request.cacheKey == _lastSideStripIntersectionKey &&
-        request.surfaceName == _lastSideStripIntersectionSurfaceName) {
+    if (const auto reuseIt = _sideStripReuseCache.find(request.surfaceName);
+        !_sideStripIntersectionRunning &&
+        reuseIt != _sideStripReuseCache.end() &&
+        reuseIt->second.cacheKey != 0 &&
+        request.cacheKey == reuseIt->second.cacheKey) {
         // Defensive only: pending entries exist only while a query runs, so
         // this idle gate cannot normally have one to retire.
         _pendingSideStripIntersectionRequests.erase(request.surfaceName);
         refreshLatestSideStripIntersectionToken();
         pane->dialog->setGeneratedSideStripIntersectionBusy(false);
         pane->dialog->setGeneratedFiberIntersectionMarkers(
-            markLinkCandidateFiberIntersections(_lastSideStripIntersectionMarkers,
+            markLinkCandidateFiberIntersections(reuseIt->second.markers,
                                                 pane->session->branches));
         pane->dialog->setGeneratedSideStripIntersectionResult(
-            _lastSideStripIntersectionMarkers.size());
+            reuseIt->second.markers.size());
         return;
     }
 
@@ -13825,10 +13829,10 @@ void LineAnnotationController::finishSideStripIntersectionQuery(
             pane->dialog->setGeneratedSideStripIntersectionBusy(samePanePending);
             if (result.ok) {
                 const size_t markerCount = result.markers.size();
-                _lastSideStripIntersectionKey = result.cacheKey;
-                _lastSideStripIntersectionSurfaceName = result.surfaceName;
-                _lastSideStripIntersectionMarkers = result.markers;
-                _lastSideStripFingerprint = result.fingerprint;
+                _sideStripReuseCache.insert_or_assign(
+                    result.surfaceName,
+                    SideStripReuseEntry{result.cacheKey, result.markers,
+                                        result.fingerprint});
                 pane->dialog->setGeneratedFiberIntersectionMarkers(
                     markLinkCandidateFiberIntersections(
                         std::move(result.markers),
@@ -13838,9 +13842,21 @@ void LineAnnotationController::finishSideStripIntersectionQuery(
                     pane->dialog->setGeneratedSideStripIntersectionResult(markerCount);
                 }
             } else {
-                // Deliberately keep whatever markers are displayed (possibly
-                // a cache-served set): a failed refresh must not blank a
-                // valid display; the error state still shows.
+                // A failed refresh must not blank a valid display — but the
+                // failed run may have painted PARTIAL markers (branch links
+                // publish before the fiber sweep): restore the last known
+                // good set for this surface when the reuse cache has one,
+                // else keep what is shown. The error state still shows.
+                if (const auto reuseIt =
+                        _sideStripReuseCache.find(result.surfaceName);
+                    reuseIt != _sideStripReuseCache.end() &&
+                    reuseIt->second.cacheKey != 0) {
+                    pane->dialog->setGeneratedFiberIntersectionMarkers(
+                        markLinkCandidateFiberIntersections(
+                            reuseIt->second.markers,
+                            pane->session ? pane->session->branches
+                                          : std::vector<FiberBranchRef>{}));
+                }
                 if (!samePanePending) {
                     pane->dialog->setGeneratedSideStripIntersectionError();
                 }

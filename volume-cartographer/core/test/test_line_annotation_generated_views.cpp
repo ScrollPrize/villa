@@ -1231,6 +1231,53 @@ TEST_CASE("interpolated splice re-indexes the old range's normals without sampli
             empty, {{0, 0, 0}}, 0, 1));
     }
 
+    SUBCASE("a shrinking map keeps the range's only valid normal")
+    {
+        // Old range [2,7) has exactly one valid normal (index 4); the
+        // replacement shrinks it to two points whose proportional picks
+        // (old 2 and old 6) are both invalid — the nearest usable sample
+        // must be used instead of losing the anchor.
+        auto sparse = previous;
+        for (int i = 0; i < 8; ++i) {
+            const bool valid = i == 4;
+            sparse.points[static_cast<size_t>(i)].sampledNormal.valid = valid;
+            sparse.points[static_cast<size_t>(i)].valid = valid;
+        }
+        std::vector<cv::Vec3d> points;
+        points.push_back({0, 0, 0});
+        points.push_back({1, 0, 0});
+        points.push_back({3.0, 0.3, 0});
+        points.push_back({5.5, 0.3, 0});
+        points.push_back({7, 0, 0});
+        const auto model =
+            spliceLineModelWithInterpolatedNormals(sparse, points, 2, 2);
+        REQUIRE(model.points.size() == 5);
+        CHECK(model.points[2].valid);
+        CHECK(model.points[2].sampledNormal.normal[1] == doctest::Approx(0.4));
+        CHECK(model.displayFrameAnchorIndex >= 0);
+    }
+
+    SUBCASE("a single-point replacement still finds a usable sample")
+    {
+        auto sparse = previous;
+        for (int i = 0; i < 8; ++i) {
+            const bool valid = i == 3;  // only old index 3 in range [1,5)
+            sparse.points[static_cast<size_t>(i)].sampledNormal.valid = valid;
+            sparse.points[static_cast<size_t>(i)].valid = valid;
+        }
+        std::vector<cv::Vec3d> points;
+        points.push_back({0, 0, 0});
+        points.push_back({3.0, 0.3, 0});  // one point replaces old [1,5)
+        points.push_back({5, 0, 0});
+        points.push_back({6, 0, 0});
+        points.push_back({7, 0, 0});
+        const auto model =
+            spliceLineModelWithInterpolatedNormals(sparse, points, 1, 1);
+        REQUIRE(model.points.size() == 5);
+        CHECK(model.points[1].valid);
+        CHECK(model.points[1].sampledNormal.normal[1] == doctest::Approx(0.3));
+    }
+
     SUBCASE("the interpolated model builds line view surfaces")
     {
         std::vector<cv::Vec3d> points;

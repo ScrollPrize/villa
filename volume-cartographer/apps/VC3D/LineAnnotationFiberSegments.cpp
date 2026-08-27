@@ -1613,6 +1613,33 @@ vc::lasagna::LineModel spliceLineModelWithInterpolatedNormals(
                           static_cast<double>(localNew) *
                           static_cast<double>(oldCount - 1) / denominator));
                 localOld = std::clamp(localOld, 0, oldCount - 1);
+                // A shrinking map can skip interior samples; if the
+                // proportional pick is unusable, take the nearest USABLE
+                // sample within the old range instead of carrying an invalid
+                // normal past a valid one (a degenerate line could otherwise
+                // lose its only anchor and reject the click).
+                if (!usable(previous.points[static_cast<size_t>(
+                                                replacedStart + localOld)]
+                                .sampledNormal)) {
+                    for (int offset = 1; offset < oldCount; ++offset) {
+                        const int below = localOld - offset;
+                        const int above = localOld + offset;
+                        if (below >= 0 &&
+                            usable(previous.points[static_cast<size_t>(
+                                                       replacedStart + below)]
+                                       .sampledNormal)) {
+                            localOld = below;
+                            break;
+                        }
+                        if (above < oldCount &&
+                            usable(previous.points[static_cast<size_t>(
+                                                       replacedStart + above)]
+                                       .sampledNormal)) {
+                            localOld = above;
+                            break;
+                        }
+                    }
+                }
                 model.points.push_back(carriedPoint(
                     position,
                     previous.points[static_cast<size_t>(replacedStart +
@@ -1627,13 +1654,20 @@ vc::lasagna::LineModel spliceLineModelWithInterpolatedNormals(
                 cv::Vec3d normal{0, 0, 0};
                 bool valid = false;
                 if (leftBoundary >= 0 && rightBoundary >= 0) {
-                    const double leftNewIndex = leftBoundary;
-                    const double rightNewIndex = rightBoundary + delta;
-                    const double span =
-                        std::max(1.0, rightNewIndex - leftNewIndex);
-                    const double t = std::clamp(
-                        (static_cast<double>(i) - leftNewIndex) / span, 0.0,
-                        1.0);
+                    // Geometric weights, not index weights: inserted points
+                    // can be spaced arbitrarily between the boundaries.
+                    const cv::Vec3d leftPosition =
+                        previous.points[static_cast<size_t>(leftBoundary)]
+                            .position;
+                    const cv::Vec3d rightPosition =
+                        previous.points[static_cast<size_t>(rightBoundary)]
+                            .position;
+                    const double toLeft = cv::norm(position - leftPosition);
+                    const double toRight = cv::norm(position - rightPosition);
+                    const double total = toLeft + toRight;
+                    const double t =
+                        total > 1.0e-12 ? std::clamp(toLeft / total, 0.0, 1.0)
+                                        : 0.5;
                     normal = (1.0 - t) * leftNormal + t * rightNormal;
                     if (cv::norm(normal) <= 1.0e-6) {
                         normal = t < 0.5 ? leftNormal : rightNormal;
@@ -1685,7 +1719,12 @@ vc::lasagna::LineModel spliceLineModelWithInterpolatedNormals(
             if (!model.points[i].valid || (tier == 0) == blended[i]) {
                 continue;
             }
-            if (blended[i]) {
+            // Every candidate — re-indexed carries included — must not be
+            // parallel to the LOCAL tangent: positions moved, so a normal
+            // that was fine on the old geometry can be tangent-parallel on
+            // the new one, and the display frame builder throws on such an
+            // anchor.
+            {
                 const cv::Vec3d tangent = localTangent(i);
                 const cv::Vec3d normal = model.points[i].sampledNormal.normal;
                 const cv::Vec3d perpendicular =
@@ -1882,8 +1921,10 @@ MergedSupersededSolve mergeSupersededSolveResult(
         }
     }
 
-    // displayFrameAnchorIndex: nearest valid-normal vertex to the center,
-    // the same rule the splice path uses.
+    // displayFrameAnchorIndex: nearest valid-normal vertex to the center
+    // whose normal is not parallel to the local tangent (the display frame
+    // builder throws on a parallel anchor; merged geometry mixes normals of
+    // different provenance, so the check cannot be skipped here either).
     int bestAnchor = -1;
     double bestAnchorDistance = std::numeric_limits<double>::infinity();
     const double center =
@@ -1891,6 +1932,23 @@ MergedSupersededSolve mergeSupersededSolveResult(
     for (size_t k = 0; k < out.line.points.size(); ++k) {
         if (!out.line.points[k].valid) {
             continue;
+        }
+        {
+            const size_t lower = k > 0 ? k - 1 : k;
+            const size_t upper =
+                k + 1 < out.line.points.size() ? k + 1 : k;
+            cv::Vec3d tangent = out.line.points[upper].position -
+                                out.line.points[lower].position;
+            const double length = cv::norm(tangent);
+            if (length > 1.0e-9) {
+                tangent /= length;
+                const cv::Vec3d normal = out.line.points[k].sampledNormal.normal;
+                const cv::Vec3d perpendicular =
+                    normal - normal.dot(tangent) * tangent;
+                if (cv::norm(perpendicular) <= 1.0e-3) {
+                    continue;
+                }
+            }
         }
         const double distance = std::abs(static_cast<double>(k) - center);
         if (distance < bestAnchorDistance) {

@@ -1095,10 +1095,15 @@ private:
     uint64_t _runningSideStripIntersectionToken = 0;
     uint64_t _runningSideStripIntersectionKey = 0;
     std::string _runningSideStripIntersectionSurfaceName;
-    uint64_t _lastSideStripIntersectionKey = 0;
-    std::string _lastSideStripIntersectionSurfaceName;
-    std::vector<SideStripMarker> _lastSideStripIntersectionMarkers;
-    QString _lastSideStripFingerprint;
+    // PER-SURFACE reuse cache of the last published result (a single global
+    // slot made two panes' unconditional catch-ups evict each other's entry
+    // and re-run their queries in a self-sustaining ping-pong).
+    struct SideStripReuseEntry {
+        uint64_t cacheKey = 0;
+        std::vector<SideStripMarker> markers;
+        QString fingerprint;
+    };
+    std::map<std::string, SideStripReuseEntry> _sideStripReuseCache;
     QString _runningSideStripFingerprint;
     // Per-fiber snapshot caches behind fiberSnapshotsForSideStripQuery():
     // stored fibers keyed by generation, open sessions keyed by
