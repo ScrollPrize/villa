@@ -1,6 +1,7 @@
 #include "SpiralServiceManager.hpp"
 
 #include "SpiralArtifactCache.hpp"
+#include "SpiralFiberRevisionUpload.hpp"
 #include "SpiralSessionSync.hpp"
 #include "SpiralSshTunnel.hpp"
 #include "VCSettings.hpp"
@@ -1076,16 +1077,25 @@ void SpiralServiceManager::uploadJsonInput(const QString& kind, const QString& f
             ? QJsonValue(QJsonValue::Null) : QJsonValue(baseRevision);
     }
     const QString baseDir = QFileInfo(filePath).absolutePath();
-    post(QStringLiteral("/session/inputs"), begin, Timeout::Command,
-         [this, baseDir, inputId, name, kind](const QJsonObject& response) {
-             continueUpload(response.value(QStringLiteral("upload_id")).toString(),
-                            inputId, kind, baseDir, {name});
-         },
-         [this, inputId, kind](const QString& error) {
-             emit inputUploadFinished(inputId, error);
-             if (kind == QStringLiteral("fiber"))
-                 emit fiberRevisionUploadFinished(inputId, {}, error);
-         });
+    postWithRetry(
+        QStringLiteral("/session/inputs"), begin, Timeout::Command, 0,
+        [this, baseDir, inputId, name, kind](const QJsonObject& response) {
+            continueUpload(response.value(QStringLiteral("upload_id")).toString(),
+                           inputId, kind, baseDir, {name});
+        },
+        {},
+        [this, inputId, kind](const QString& error, const QJsonObject& body) {
+            emit inputUploadFinished(inputId, error);
+            if (kind == QStringLiteral("fiber")) {
+                // A fiber begin request is a CAS operation. Preserve the
+                // service's authoritative base so the workspace can retry the
+                // generation that remains unsent.
+                emit fiberRevisionUploadFinished(
+                    inputId,
+                    vc3d::spiralFiberConflictRevision(body),
+                    error);
+            }
+        });
 }
 
 void SpiralServiceManager::continueUpload(const QString& uploadId, const QString& inputId,

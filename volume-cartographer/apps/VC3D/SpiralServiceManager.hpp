@@ -147,6 +147,8 @@ signals:
                                const QStringList& reasons, const QString& stage,
                                const QString& message);
     void inputUploadFinished(const QString& inputId, const QString& error);
+    // On a CAS conflict, revision is the service's current revision and error
+    // is non-empty so tracked-fiber clients can update their base and retry.
     void fiberRevisionUploadFinished(const QString& inputId,
                                      const QString& revision,
                                      const QString& error);

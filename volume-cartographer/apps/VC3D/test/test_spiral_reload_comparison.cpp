@@ -1,4 +1,5 @@
 #include "SpiralReloadComparison.hpp"
+#include "SpiralFiberRevisionUpload.hpp"
 #include "SpiralSessionSync.hpp"
 
 #include <QJsonObject>
@@ -9,6 +10,23 @@ class SpiralReloadComparisonTest final : public QObject
     Q_OBJECT
 
 private slots:
+    void FiberCasConflictPreservesCurrentRevisionForRetry()
+    {
+        const QJsonObject conflict{
+            {"error", "fiber revision conflict"},
+            {"current_revision", "revision-2"},
+        };
+        const QString current =
+            vc3d::spiralFiberConflictRevision(conflict);
+
+        QCOMPARE(current, QStringLiteral("revision-2"));
+        QVERIFY(vc3d::spiralFiberUploadNeedsCasRetry(
+            current, conflict["error"].toString()));
+        QVERIFY(!vc3d::spiralFiberUploadNeedsCasRetry(
+            {}, conflict["error"].toString()));
+        QVERIFY(!vc3d::spiralFiberUploadNeedsCasRetry(current, {}));
+    }
+
     void CheckpointLoadInitializesWithoutProfileOverrides()
     {
         const QJsonObject request{

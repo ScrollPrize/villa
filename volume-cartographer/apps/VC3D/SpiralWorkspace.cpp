@@ -6,6 +6,7 @@
 #include "Keybinds.hpp"
 #include "SpiralPanel.hpp"
 #include "SpiralBrushController.hpp"
+#include "SpiralFiberRevisionUpload.hpp"
 #include "SpiralServiceManager.hpp"
 #include "SpiralMinimap.hpp"
 #include "SurfaceOverlayColors.hpp"
@@ -251,6 +252,37 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                     if (!it->snapshotPath.isEmpty()) QFile::remove(it->snapshotPath);
                     it->snapshotPath.clear();
                     if (!error.isEmpty()) {
+                        if (vc3d::spiralFiberUploadNeedsCasRetry(
+                                revision, error)) {
+                            // A CAS conflict reports the service's current
+                            // revision. The attempted generation is still
+                            // unsent, so advance its base and submit it again.
+                            it->revision = revision;
+                            it->added = true;
+                            _residentFiberRevisions[inputId] = revision;
+                            const uint64_t fiberId = it.key();
+                            statusBar()->showMessage(
+                                tr("Fiber %1 changed remotely; retrying the latest revision")
+                                    .arg(inputId),
+                                15000);
+                            if (uploadedGeneration == 0) {
+                                QTimer::singleShot(0, this, [this, fiberId]() {
+                                    auto tracked = _trackedFibers.find(fiberId);
+                                    if (tracked == _trackedFibers.end()
+                                        || tracked->uploadInFlight)
+                                        return;
+                                    tracked->uploadInFlight = true;
+                                    _service->uploadJsonInput(
+                                        QStringLiteral("fiber"), tracked->path,
+                                        tracked->inputId, {}, tracked->revision);
+                                });
+                            } else {
+                                QTimer::singleShot(0, this, [this, fiberId]() {
+                                    uploadNewestFiberRevision(fiberId);
+                                });
+                            }
+                            return;
+                        }
                         statusBar()->showMessage(
                             tr("Fiber %1 revision upload failed: %2")
                                 .arg(inputId, error), 15000);

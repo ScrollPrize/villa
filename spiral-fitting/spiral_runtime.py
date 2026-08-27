@@ -105,6 +105,11 @@ COMMAND_ACK_TIMEOUT_S = 30.0
 # close) before the parent calls the worker wedged.
 COMMAND_ACK_GRACE_S = 5.0
 
+# Live incorporation rebuilds resident catalogs, indices, fiber views, and GPU
+# influence masks.  Its acknowledgement is the result of that whole operation,
+# not the quick queue-admission acknowledgement covered above.
+LIVE_INCORPORATION_TIMEOUT_S = 1200.0
+
 # How long one requested preview export may take. The window covers the whole
 # operation, not just the render: the host service Lasagna-flattens and hashes
 # the generation synchronously from the status callback, inside the session's
@@ -1631,7 +1636,7 @@ class InteractiveFitSession:
     def incorporate_live(self, records, influence_config=None, *,
                          target_iteration=None, reservation_epoch=None,
                          mark_incorporated=None,
-                         timeout=COMMAND_ACK_TIMEOUT_S):
+                         timeout=LIVE_INCORPORATION_TIMEOUT_S):
         """Phase two: apply a reserved batch immediately before its step."""
         if target_iteration is None:
             with self._condition:
@@ -1961,7 +1966,8 @@ def _distributed_session_worker(context, gpu_id, rendezvous, paths, run,
                         arguments.get("influence_config", {}),
                         target_iteration=arguments["target_iteration"],
                         reservation_epoch=arguments["reservation_epoch"],
-                        timeout=arguments.get("timeout", COMMAND_ACK_TIMEOUT_S))
+                        timeout=arguments.get(
+                            "timeout", LIVE_INCORPORATION_TIMEOUT_S))
                 elif name == "prevalidate_incorporation":
                     result = session.prevalidate_live_incorporation(
                         arguments.get("records", []),
@@ -2533,11 +2539,11 @@ class DistributedInteractiveFitSession:
             "influence_config": dict(influence_config or {}),
             "target_iteration": target_iteration,
             "reservation_epoch": reservation_epoch,
-            "timeout": COMMAND_ACK_TIMEOUT_S,
+            "timeout": LIVE_INCORPORATION_TIMEOUT_S,
         }
         results = self._call(
             "incorporate", arguments, collective=False, return_all=True,
-            timeout=COMMAND_ACK_TIMEOUT_S + COMMAND_ACK_GRACE_S)
+            timeout=LIVE_INCORPORATION_TIMEOUT_S + COMMAND_ACK_GRACE_S)
         canonical = results[min(results)]
         applied_outcomes = canonical.get("outcomes", [])
         applied_by_identity = {
@@ -2560,7 +2566,7 @@ class DistributedInteractiveFitSession:
                 mark_incorporated(records, no_future_step=True)
             else:
                 mark_incorporated(records, outcomes=canonical_outcomes)
-        return canonical
+        return {**canonical, "outcomes": canonical_outcomes}
 
     def stop(self):
         state = self.status()["state"]

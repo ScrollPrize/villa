@@ -528,6 +528,56 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(received, [(records, {"outcomes": outcomes})])
         self.assertNotIn("run-1", session._incorporation_callbacks)
 
+    def test_distributed_live_incorporation_returns_mixed_outcomes(self):
+        session = self._proxy()
+        session._status.update({
+            "state": SessionState.Running,
+            "current_iteration": 12,
+        })
+        valid = {"id": "fiber-a", "kind": "fiber", "revision": "r1"}
+        invalid = {"id": "patch-b", "kind": "patch"}
+        accepted = {**valid, "state": "incorporated"}
+        rejected = {**invalid, "state": "error", "error": "invalid"}
+        incorporation_calls = []
+
+        def fake_call(name, arguments=None, **kwargs):
+            if name == "reserve_incorporation":
+                return {
+                    rank: {"reserved": True}
+                    for rank in range(len(session._processes))
+                }
+            if name == "prevalidate_incorporation":
+                return {
+                    rank: {"no_future_step": False,
+                           "outcomes": [accepted, rejected]}
+                    for rank in range(len(session._processes))
+                }
+            if name == "incorporate":
+                incorporation_calls.append((arguments, kwargs))
+                return {
+                    rank: {"no_future_step": False,
+                           "incorporated": 1,
+                           "outcomes": [accepted]}
+                    for rank in range(len(session._processes))
+                }
+            self.fail(f"unexpected distributed call: {name}")
+
+        session._call = fake_call
+
+        result = session.incorporate_live([valid, invalid])
+
+        self.assertEqual(result["outcomes"], [accepted, rejected])
+        self.assertEqual(result["incorporated"], 1)
+        self.assertEqual(len(incorporation_calls), 1)
+        arguments, call_options = incorporation_calls[0]
+        self.assertEqual(arguments["records"], [valid])
+        self.assertEqual(arguments["timeout"],
+                         spiral_runtime.LIVE_INCORPORATION_TIMEOUT_S)
+        self.assertEqual(
+            call_options["timeout"],
+            spiral_runtime.LIVE_INCORPORATION_TIMEOUT_S
+            + spiral_runtime.COMMAND_ACK_GRACE_S)
+
     def test_rank_zero_worker_emits_per_record_incorporation_outcomes(self):
         records = [{"id": "fiber-a", "kind": "fiber", "revision": "r1"}]
         outcomes = [{**records[0], "state": "rejected", "error": "invalid"}]
@@ -1040,6 +1090,23 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(session._commands, [])
         self.assertIsNone(session._live_reservation_iteration)
         self.assertEqual(session._state, SessionState.Running)
+
+    def test_live_incorporation_defaults_to_the_operation_timeout(self):
+        session = self._idle_session(completed=10)
+        session._state = SessionState.Running
+        session._target = 12
+        session._live_reservation_iteration = 10
+        session._live_reservation_epoch = 7
+        observed = []
+        session._queue_command = lambda command, timeout: observed.append(timeout)
+
+        session.incorporate_live(
+            [{"id": "fiber-a", "kind": "fiber"}],
+            target_iteration=10,
+            reservation_epoch=7)
+
+        self.assertEqual(observed,
+                         [spiral_runtime.LIVE_INCORPORATION_TIMEOUT_S])
 
     def test_timed_out_active_live_incorporation_fail_stops_session(self):
         session = self._idle_session(completed=10)
