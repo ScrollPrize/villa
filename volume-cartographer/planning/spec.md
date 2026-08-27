@@ -6,6 +6,12 @@
   not change as a side effect of diagnostics or scheduling work.
 - Remote fetching must remain asynchronous; UI and render threads must not wait
   on network or persistent-cache I/O.
+- S3 sources use available credentials first. When S3 explicitly rejects those
+  credentials, the same object is retried anonymously so public data remains
+  usable with stale ambient credentials. A successful or not-found anonymous
+  response makes anonymous access sticky for that source; unrelated client,
+  server, and transport failures do not trigger or retain fallback. The access
+  mode must not alter source identity, cache paths, or serialized locations.
 - Queue diagnostics must come from the existing chunk-cache request state, not
   from a parallel accounting system at viewer call sites.
 - A shared cache must report each unresolved chunk once regardless of how many

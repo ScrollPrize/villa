@@ -1,15 +1,14 @@
-# VC3D render attribution and lookup repair status
+# Public S3 Lasagna authentication fallback status
 
-- [x] Capture the attribution-first task and deferred speed requirements.
-- [x] Confirm current cross-run worker-ID attribution behavior.
-- [x] Confirm render-job request lifetime and existing local chunk caching.
-- [x] Record attribution alternatives and a provisional recommendation.
-- [x] Replace rank/tie matching with same-run scheduler evidence.
-- [x] Collect initial repeated artifacts and identify worker/scope mismatch.
-- [x] Validate passive canonical pairing over three full parallel matrices.
-- [x] Implement and test deterministic paired attribution in native C++.
-- [x] Re-evaluate residual variation with three fresh current-binary pairs.
-- [x] Validate the repaired attribution against the existing enabled CI gate.
-- [ ] Profile and implement lookup optimization against the accepted gate.
-- [x] Update specifications, documentation, and changelog.
-- [x] Complete native unit, compatibility, matrix, reference, and repeatability validation.
+- [x] Capture the observed public-data failure and required behavior.
+- [x] Inspect manifest, remote-file-cache, and Lasagna Zarr authentication paths.
+- [x] Draft the implementation and validation plan.
+- [x] Complete independent plan review.
+- [x] Implement shared authentication classification.
+- [x] Implement remote manifest anonymous fallback.
+- [x] Implement sticky Lasagna Zarr anonymous fallback.
+- [x] Add regression tests.
+- [x] Update specification, documentation, changelog, and task log.
+- [x] Build and run focused tests.
+- [x] Validate against the real PHerc0139 manifest.
+- [x] Run final diff and whitespace checks.

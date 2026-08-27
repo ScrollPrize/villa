@@ -1,4 +1,5 @@
 #include "vc/core/util/RemoteFileCache.hpp"
+#include "vc/core/util/S3AuthFallback.hpp"
 
 #include "utils/http_fetch.hpp"
 
@@ -211,6 +212,8 @@ std::string fetchFailureMessage(const std::string& sourceLocation, const vc::Res
     std::string message = "failed to fetch remote file source=" + redactedRemoteLocation(sourceLocation) +
                           " request_url=" + redactedRemoteLocation(endpoint.httpsUrl);
     message += response.status_code > 0 ? " HTTP " + std::to_string(response.status_code) : " no_http_response";
+    if (!response.error_message.empty())
+        message += " transport_error=\"" + escapedDiagnosticString(response.error_message) + "\"";
     if (!response.content_type.empty())
         message += " content_type=\"" + escapedDiagnosticString(response.content_type) + "\"";
     if (response.content_length > 0)
@@ -243,15 +246,39 @@ void defaultFetch(const std::string& sourceLocation,
     const auto endpoint = vc::resolveRemoteUrl(sourceLocation);
     auto details = makeRemoteClientDetails(
         endpoint, explicitAuth, discoverAwsCredentials);
-    utils::HttpClient client(std::move(details.config));
-    const auto response = client.get(endpoint.httpsUrl);
-    if (!response.ok())
-        throw std::runtime_error(fetchFailureMessage(sourceLocation, endpoint, details, response));
+    auto anonymousDetails = makeRemoteClientDetails(
+        endpoint, vc::HttpAuth{}, false);
+    utils::HttpClient authenticatedClient(std::move(details.config));
+    utils::HttpClient anonymousClient(std::move(anonymousDetails.config));
+    vc::S3AuthFallback fallback(details.isS3, details.credentialsLoaded);
+    auto result = fallback.request([&](bool anonymous) {
+        return anonymous
+            ? anonymousClient.get(endpoint.httpsUrl)
+            : authenticatedClient.get(endpoint.httpsUrl);
+    });
+    if (!result.response.ok()) {
+        std::string message = fetchFailureMessage(
+            sourceLocation, endpoint,
+            result.usedAnonymous ? anonymousDetails : details,
+            result.response);
+        if (result.authenticatedFailure) {
+            message += " authenticated_attempt_http=" +
+                std::to_string(result.authenticatedFailure->status_code);
+            const auto code = xmlTagValue(
+                result.authenticatedFailure->body_string(), "Code");
+            if (!code.empty()) {
+                message += " authenticated_s3_Code=\"" +
+                    escapedDiagnosticString(code) + "\"";
+            }
+            message += " anonymous_fallback=failed";
+        }
+        throw std::runtime_error(std::move(message));
+    }
     std::ofstream output(temporaryPath, std::ios::binary | std::ios::trunc);
     if (!output)
         throw std::runtime_error("cannot create remote cache temporary file");
-    if (!response.body.empty()) {
-        output.write(reinterpret_cast<const char*>(response.body.data()), static_cast<std::streamsize>(response.body.size()));
+    if (!result.response.body.empty()) {
+        output.write(reinterpret_cast<const char*>(result.response.body.data()), static_cast<std::streamsize>(result.response.body.size()));
     }
     output.close();
     if (!output)

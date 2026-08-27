@@ -14,7 +14,11 @@ optional persistent-budget read pin.
 Built-in fetching supports HTTP, HTTPS, S3, and region-qualified S3 locations.
 `RemoteFileCacheOptions::fetcher` can provide another fetch-to-temporary-file
 transport. Explicit `HttpAuth` is passed to the built-in transport; otherwise
-the existing AWS credential loader is used where required.
+the existing AWS credential loader is used where required. An S3 request with
+credentials is attempted normally. If S3 rejects those credentials, the GET is
+retried anonymously so public objects remain readable when ambient temporary
+credentials are stale. Unrelated HTTP and transport failures are not retried as
+authentication failures.
 
 `CacheFirst` reuses a valid entry. `Refresh` fetches and atomically replaces
 it. `invalidateRemoteFileCacheEntry()` removes one known destination. There is
@@ -66,6 +70,12 @@ Lasagna manifests use this path for the manifest and its sidecar; relative
 Zarr groups share the readable parent cache directory. Existing local
 manifests with an explicit adjacent `lasagna-remote.json` remain supported and
 its `artifact_url` remains authoritative.
+
+Lasagna's exact-byte remote Zarr store applies the same signed-to-anonymous
+fallback to descriptor and chunk requests. A successful or not-found anonymous
+response selects anonymous access for subsequent requests from that store.
+Concurrent readers share one transition probe; private stores retain signed
+access when anonymous access is rejected.
 
 There is no lookup or migration for the earlier development-only cache
 layout. Reopening a remote source populates the readable layout from a cold

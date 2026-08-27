@@ -4,14 +4,19 @@
 #include <doctest/doctest.h>
 
 #include "vc/core/util/HttpFetch.hpp"
+#include "vc/core/util/S3AuthFallback.hpp"
 
 #include <utils/http_fetch.hpp>
 
 #include <cstdlib>
+#include <atomic>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -21,7 +26,173 @@ bool requireNetwork()
     return env && env[0] && env[0] != '0';
 }
 
+utils::HttpResponse response(long status, std::string_view body = {})
+{
+    utils::HttpResponse out;
+    out.status_code = status;
+    out.body.reserve(body.size());
+    for (const char value : body)
+        out.body.push_back(static_cast<std::byte>(value));
+    return out;
+}
+
 } // namespace
+
+TEST_CASE("S3 authentication failures are classified narrowly")
+{
+    CHECK(vc::isAwsAuthenticationFailure(400, "<Code>InvalidToken</Code>"));
+    CHECK(vc::isAwsAuthenticationFailure(403, {}));
+    CHECK(vc::isAwsAuthenticationFailure(
+        400, "<Code>SignatureDoesNotMatch</Code>"));
+    CHECK_FALSE(vc::isAwsAuthenticationFailure(400, "BadRequest"));
+    CHECK_FALSE(vc::isAwsAuthenticationFailure(404, "NoSuchKey"));
+    CHECK_FALSE(vc::isAwsAuthenticationFailure(500, "InternalError"));
+}
+
+TEST_CASE("S3 fallback becomes sticky after anonymous success")
+{
+    vc::S3AuthFallback fallback(true, true);
+    std::vector<bool> attempts;
+    auto request = [&](bool anonymous) {
+        attempts.push_back(anonymous);
+        return anonymous
+            ? response(200, "public")
+            : response(400, "<Code>InvalidToken</Code>");
+    };
+
+    const auto first = fallback.request(request);
+    const auto second = fallback.request(request);
+
+    REQUIRE(first.response.ok());
+    REQUIRE(first.authenticatedFailure.has_value());
+    CHECK(first.usedAnonymous);
+    CHECK(second.response.ok());
+    CHECK(second.usedAnonymous);
+    CHECK(fallback.usesAnonymous());
+    CHECK(attempts == std::vector<bool>{false, true, true});
+}
+
+TEST_CASE("S3 fallback preserves private authenticated mode")
+{
+    vc::S3AuthFallback validPrivate(true, true);
+    int validSigned = 0;
+    int validAnonymous = 0;
+    const auto valid = validPrivate.request([&](bool anonymous) {
+        anonymous ? ++validAnonymous : ++validSigned;
+        return response(200, "private");
+    });
+    CHECK(valid.response.ok());
+    CHECK(validSigned == 1);
+    CHECK(validAnonymous == 0);
+
+    vc::S3AuthFallback rejectedPrivate(true, true);
+    std::vector<bool> attempts;
+    auto rejectedRequest = [&](bool anonymous) {
+        attempts.push_back(anonymous);
+        return anonymous
+            ? response(403, "<Code>AccessDenied</Code>")
+            : response(400, "<Code>InvalidToken</Code>");
+    };
+    const auto first = rejectedPrivate.request(rejectedRequest);
+    const auto second = rejectedPrivate.request(rejectedRequest);
+
+    CHECK(first.response.status_code == 403);
+    REQUIRE(first.authenticatedFailure.has_value());
+    CHECK(first.authenticatedFailure->status_code == 400);
+    CHECK_FALSE(rejectedPrivate.usesAnonymous());
+    CHECK(second.response.status_code == 400);
+    CHECK(attempts == std::vector<bool>{false, true, false});
+}
+
+TEST_CASE("anonymous not-found establishes public S3 access")
+{
+    vc::S3AuthFallback fallback(true, true);
+    std::vector<bool> attempts;
+    const auto missing = fallback.request([&](bool anonymous) {
+        attempts.push_back(anonymous);
+        return anonymous
+            ? response(404, "NoSuchKey")
+            : response(400, "<Code>InvalidToken</Code>");
+    });
+    const auto present = fallback.request([&](bool anonymous) {
+        attempts.push_back(anonymous);
+        return response(anonymous ? 200 : 400);
+    });
+
+    CHECK(missing.response.not_found());
+    CHECK(present.response.ok());
+    CHECK(fallback.usesAnonymous());
+    CHECK(attempts == std::vector<bool>{false, true, true});
+}
+
+TEST_CASE("S3 fallback ignores unrelated failures and non-S3 requests")
+{
+    for (const long status : {400L, 404L, 500L}) {
+        vc::S3AuthFallback fallback(true, true);
+        int attempts = 0;
+        const auto result = fallback.request([&](bool anonymous) {
+            ++attempts;
+            CHECK_FALSE(anonymous);
+            return response(status, status == 400 ? "BadRequest" : "failure");
+        });
+        CHECK(result.response.status_code == status);
+        CHECK(attempts == 1);
+    }
+
+    vc::S3AuthFallback nonS3(false, true);
+    int attempts = 0;
+    const auto result = nonS3.request([&](bool anonymous) {
+        ++attempts;
+        CHECK_FALSE(anonymous);
+        return response(400, "<Code>InvalidToken</Code>");
+    });
+    CHECK(result.response.status_code == 400);
+    CHECK(attempts == 1);
+}
+
+TEST_CASE("concurrent S3 requests share the anonymous transition")
+{
+    vc::S3AuthFallback fallback(true, true);
+    std::atomic<int> signedAttempts{0};
+    std::atomic<int> anonymousAttempts{0};
+    std::promise<void> probeStarted;
+    std::promise<void> releaseProbe;
+    auto release = releaseProbe.get_future().share();
+
+    auto request = [&](bool anonymous) {
+        if (!anonymous) {
+            ++signedAttempts;
+            return response(400, "<Code>InvalidToken</Code>");
+        }
+        if (anonymousAttempts.fetch_add(1) == 0) {
+            probeStarted.set_value();
+            release.wait();
+        }
+        return response(200, "public");
+    };
+
+    std::vector<std::thread> threads;
+    std::atomic<int> successfulRequests{0};
+    threads.emplace_back([&] {
+        if (fallback.request(request).response.ok())
+            ++successfulRequests;
+    });
+    probeStarted.get_future().wait();
+    for (int i = 0; i < 7; ++i) {
+        threads.emplace_back([&] {
+            if (fallback.request(request).response.ok())
+                ++successfulRequests;
+        });
+    }
+    releaseProbe.set_value();
+    for (auto& thread : threads)
+        thread.join();
+
+    CHECK(signedAttempts == 1);
+    CHECK(anonymousAttempts == 8);
+    CHECK(successfulRequests == 8);
+    CHECK(fallback.usesAnonymous());
+}
 
 TEST_CASE("httpGetString: 404 returns empty string")
 {

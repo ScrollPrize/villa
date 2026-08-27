@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-08-27
+
+- Added signed-to-anonymous S3 fallback for public remote Lasagna manifests and Zarr objects when ambient AWS credentials are rejected.
+
 ## 2026-08-17
 
 - Anchored multi-control collapse through the ordinary local span update before

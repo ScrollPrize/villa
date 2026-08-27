@@ -1,6 +1,7 @@
 #include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/types/VcDataset.hpp"
 #include "vc/core/util/CacheCompression.hpp"
+#include "vc/core/util/S3AuthFallback.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 
 #include <utils/http_fetch.hpp>
@@ -63,25 +64,6 @@ bool isOptionalMetadataProbe(std::string_view key)
            hasSuffix(key, "/.zattrs") || hasSuffix(key, "/zarr.json");
 }
 
-bool hasExplicitAwsCredentialError(std::string_view detail)
-{
-    constexpr std::array<std::string_view, 10> markers{
-        "ExpiredToken",
-        "InvalidAccessKeyId",
-        "InvalidClientTokenId",
-        "InvalidSignatureException",
-        "InvalidToken",
-        "RequestExpired",
-        "RequestTimeTooSkewed",
-        "SignatureDoesNotMatch",
-        "TokenRefreshRequired",
-        "UnrecognizedClientException",
-    };
-    return std::any_of(markers.begin(), markers.end(), [&](const auto marker) {
-        return detail.find(marker) != std::string_view::npos;
-    });
-}
-
 std::string responseErrorDetail(const utils::HttpResponse& response)
 {
     if (!response.error_message.empty())
@@ -103,14 +85,9 @@ bool isZarrMetadataKey(std::string_view key)
 bool isRemoteAuthError(const std::exception& error)
 {
     const std::string message = error.what();
-    return message.find("AWS credentials") != std::string::npos ||
+    return vc::hasExplicitAwsCredentialError(message) ||
+           message.find("AWS credentials") != std::string::npos ||
            message.find("Access denied") != std::string::npos ||
-           message.find("ExpiredToken") != std::string::npos ||
-           message.find("InvalidToken") != std::string::npos ||
-           message.find("TokenRefreshRequired") != std::string::npos ||
-           message.find("InvalidAccessKeyId") != std::string::npos ||
-           message.find("SignatureDoesNotMatch") != std::string::npos ||
-           message.find("HTTP 400") != std::string::npos ||
            message.find("HTTP 401") != std::string::npos ||
            message.find("HTTP 403") != std::string::npos;
 }
@@ -829,7 +806,7 @@ bool isOptionalRemoteMetadataMiss(
     std::string_view responseBody)
 {
     return status == 403 && isOptionalMetadataProbe(key) &&
-           !hasExplicitAwsCredentialError(responseBody);
+           !vc::hasExplicitAwsCredentialError(responseBody);
 }
 
 std::vector<std::pair<int, std::string>> remoteLevelKeysFromZattrs(
