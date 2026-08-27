@@ -63,6 +63,7 @@ private:
     // When set, the output grid is sized to the source sampling density so the
     // flattened tifxyz keeps the input's scale instead of metric mode's 1.0.
     cv::Vec2f src_scale = cv::Vec2f(0.f, 0.f);  // <=0 = unset
+    int last_valid_count = -1;  // rasterized grid points from the last createQuadSurface()
 
 public:
     void setUVMetric(bool v) { uv_is_metric = v; }
@@ -70,6 +71,10 @@ public:
     void setUVDownsample(float f) { uv_downsample = std::max(1.0f, f); }
     void setGridCapPixels(uint64_t cap) { grid_cap_pixels = cap; }
     void setSrcScale(const cv::Vec2f& s) { src_scale = s; }
+    int validCount() const { return last_valid_count; }
+    cv::Vec2f uvRange() const { return uv_max - uv_min; }
+    int gridWidth() const { return grid_size[0]; }
+    int gridHeight() const { return grid_size[1]; }
     void setSrcApproval(const cv::Mat& m) { src_approval = m; }
     bool hasApproval() const { return !src_approval.empty() && !grid_uv.empty(); }
     const cv::Mat_<cv::Vec3b>& outApproval() const { return out_approval; }
@@ -312,6 +317,7 @@ public:
         
         std::cout << "Valid grid points: " << valid_count << " / " << (grid_size[0] * grid_size[1]) 
                   << " (" << (100.0f * valid_count / (grid_size[0] * grid_size[1])) << "%)" << std::endl;
+        last_valid_count = valid_count;
         
         // Scale is currently in OBJ units. Convert to micrometers now.
         if (valid_count == 0) {
@@ -539,7 +545,7 @@ int main(int argc, char *argv[])
         std::cout << std::endl;
         std::cout << "Note: Scale factors are automatically calculated from the mesh grid structure." << std::endl;
         std::cout << "Examples:" << std::endl;
-        std::cout << "  " << argv[0] << " mesh.obj outdir                       (legacy behavior)" << std::endl;
+        std::cout << "  " << argv[0] << " mesh.obj outdir                       (UV-metric mode, default)" << std::endl;
         std::cout << "  " << argv[0] << " mesh.obj outdir 800 1.0 --uv-metric  (UV is metric, OBJ units == UV units)" << std::endl;
         std::cout << "  " << argv[0] << " mesh.obj outdir --uv-metric --uv-to-obj=0.001" << std::endl;
         return EXIT_SUCCESS;
@@ -706,6 +712,19 @@ int main(int argc, char *argv[])
     QuadSurface* surf = converter.createQuadSurface(mesh_units);
     if (!surf) {
         std::cerr << "Failed to create quad surface" << std::endl;
+        return EXIT_FAILURE;
+    }
+    if (converter.validCount() == 0) {
+        const cv::Vec2f range = converter.uvRange();
+        std::cerr << "Error: 0 grid points rasterized; not writing an all-sentinel tifxyz." << std::endl;
+        if (range[0] <= 1.5f && range[1] <= 1.5f) {
+            std::cerr << "UV range is " << range[0] << " x " << range[1]
+                      << " (normalized UVs?), which yields only a " << converter.gridWidth()
+                      << " x " << converter.gridHeight() << " grid. "
+                      << "Pass a stretch_factor (pixels per UV unit, e.g. 800) or "
+                      << "--uv-to-obj=<OBJ units per UV unit>." << std::endl;
+        }
+        delete surf;
         return EXIT_FAILURE;
     }
     surf->meta = std::move(sourceMeta);
