@@ -877,6 +877,17 @@ private:
         LineAnnotationSession& session);
     [[nodiscard]] StoredFiber storedFiberFromSession(LineAnnotationSession& session);
     void saveSessionAsFiber(LineAnnotationSession& session);
+    // Debounced autosave after a solve landing: consecutive landings coalesce
+    // into one saveSessionAsFiber (with its no-op probe, fiber summary
+    // rebuild, and linked-fiber sync) instead of paying it per landing. The
+    // flush never runs the synchronous finalize solve: a session mutated
+    // since the landing skips the save and relies on the next landing or the
+    // close paths (which finalize+save directly and supersede the pending
+    // flush). Cross-fiber operations and package switches flush explicitly
+    // so nothing reads a fiber whose newest geometry is still session-only.
+    void scheduleSessionAutoSave(LineAnnotationSession& session);
+    void flushSessionAutoSave(const std::string& surfaceName);
+    void flushAllPendingSessionAutoSaves();
     [[nodiscard]] nlohmann::json fiberToJson(const StoredFiber& fiber, double scale = 1.0) const;
     void saveFiberNow(const StoredFiber& fiber) const;
     void scheduleFiberSave(const StoredFiber& fiber);

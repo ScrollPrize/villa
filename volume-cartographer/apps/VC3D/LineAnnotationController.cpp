@@ -174,6 +174,8 @@ struct LineAnnotationController::LineAnnotationSession {
     bool runningSolveFullLine = false;
     // A debounced dispatch of the queue's pending solve is scheduled.
     bool solveDispatchScheduled = false;
+    // A debounced session autosave is scheduled (see scheduleSessionAutoSave).
+    bool autoSaveScheduled = false;
     bool deferShowUntilGenerated = false;
     uint64_t fiberId = 0;
     std::string fiberUsername;
@@ -1995,6 +1997,7 @@ LineAnnotationController::LineAnnotationController(CState* state,
 
 LineAnnotationController::~LineAnnotationController()
 {
+    flushAllPendingSessionAutoSaves();
     waitForFiberSaves();
     // Bounded teardown of in-flight line solves: request cooperative
     // cancellation on every session, then drain the private pool. The Ceres
@@ -2293,6 +2296,8 @@ bool LineAnnotationController::prepareForPackageSwitch()
     // serialization failures bump the count during the finalize walk itself,
     // not only during the flush at the end.
     const uint64_t saveFailuresBefore = _fiberSaveFailureCount;
+    // Debounced autosaves must land in this package's files, not the next's.
+    flushAllPendingSessionAutoSaves();
     // Refused outright while any optimization runs, whichever pane owns it:
     // switching mid-run would either discard the result or apply it to the
     // wrong package, and a refusal the user can retry beats both. Checked
@@ -7327,6 +7332,9 @@ void LineAnnotationController::handleGeneratedControlPointBranch(const std::stri
                   parentSession.suppressErrorDialogs);
         return;
     }
+    // Cross-fiber operation: make sure no participating fiber's newest
+    // geometry is still session-only behind a debounced autosave.
+    flushAllPendingSessionAutoSaves();
     if (controlPointIndex >= parentSession.controlPoints.size()) {
         return;
     }
@@ -7584,6 +7592,9 @@ void LineAnnotationController::handleGeneratedControlPointLinkWithCandidate(
         showError(tr("Line optimization is already running."));
         return;
     }
+    // Cross-fiber operation: make sure no participating fiber's newest
+    // geometry is still session-only behind a debounced autosave.
+    flushAllPendingSessionAutoSaves();
     if (controlPointIndex >= session.controlPoints.size()) {
         return;
     }
@@ -7794,6 +7805,9 @@ void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
         showError(tr("Line optimization is already running."));
         return;
     }
+    // Cross-fiber operation: make sure no participating fiber's newest
+    // geometry is still session-only behind a debounced autosave.
+    flushAllPendingSessionAutoSaves();
     if (controlPointIndex >= session.controlPoints.size()) {
         return;
     }
@@ -8248,6 +8262,9 @@ void LineAnnotationController::handleGeneratedControlPointSplitFromCandidate(
         showError(tr("Line optimization is already running."));
         return;
     }
+    // Cross-fiber operation: make sure no participating fiber's newest
+    // geometry is still session-only behind a debounced autosave.
+    flushAllPendingSessionAutoSaves();
     if (controlPointIndex >= session.controlPoints.size()) {
         return;
     }
@@ -8612,6 +8629,9 @@ void LineAnnotationController::handleGeneratedControlPointUnlink(
         showError(tr("Line optimization is already running."));
         return;
     }
+    // Cross-fiber operation: make sure no participating fiber's newest
+    // geometry is still session-only behind a debounced autosave.
+    flushAllPendingSessionAutoSaves();
     if (controlPointIndex >= session.controlPoints.size() || branchFiberId == 0) {
         return;
     }
@@ -8689,6 +8709,9 @@ void LineAnnotationController::handleGeneratedControlPointSetLinkPending(
         showError(tr("Line optimization is already running."));
         return;
     }
+    // Cross-fiber operation: make sure no participating fiber's newest
+    // geometry is still session-only behind a debounced autosave.
+    flushAllPendingSessionAutoSaves();
     if (controlPointIndex >= session.controlPoints.size() || branchFiberId == 0) {
         return;
     }
@@ -9629,7 +9652,10 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
         session.taskState == LineAnnotationSession::TaskState::Succeeded &&
         !session.optimizedLine.points.empty() &&
         !session.controlPoints.empty()) {
-        saveSessionAsFiber(session);
+        // Debounced: consecutive landings coalesce into one save (with its
+        // no-op probe, all-fiber summary rebuild, and linked-fiber sync)
+        // instead of paying that tail on the GUI thread per landing.
+        scheduleSessionAutoSave(session);
     }
     auto callback = fireSuccessCallback ? session.optimizationSucceededCallback : nullptr;
     if (callback) {
@@ -14259,9 +14285,62 @@ LineAnnotationController::storedFiberFromSession(LineAnnotationSession& session)
     return makeStoredFiberSessionSnapshot(session).fiber;
 }
 
+void LineAnnotationController::scheduleSessionAutoSave(LineAnnotationSession& session)
+{
+    if (session.autoSaveScheduled) {
+        return;
+    }
+    session.autoSaveScheduled = true;
+    const std::string surfaceName = session.surfaceName;
+    QTimer::singleShot(kSessionAutoSaveDebounceMs, this, [this, surfaceName]() {
+        flushSessionAutoSave(surfaceName);
+    });
+}
+
+void LineAnnotationController::flushSessionAutoSave(const std::string& surfaceName)
+{
+    auto* pane = paneForSurface(surfaceName);
+    if (!pane || !pane->session) {
+        return;
+    }
+    auto& session = *pane->session;
+    if (!session.autoSaveScheduled) {
+        return;
+    }
+    session.autoSaveScheduled = false;
+    if (session.suppressFiberSave ||
+        session.taskState == LineAnnotationSession::TaskState::Running ||
+        session.optimizationState != SessionOptimizationState::Optimized ||
+        session.optimizedLine.points.empty() ||
+        session.controlPoints.empty()) {
+        // A mutation or a new solve intervened since the landing that
+        // scheduled this flush. Never let the autosave run the synchronous
+        // finalize solve; the next landing reschedules, and the close paths
+        // finalize+save regardless.
+        return;
+    }
+    saveSessionAsFiber(session);
+}
+
+void LineAnnotationController::flushAllPendingSessionAutoSaves()
+{
+    std::vector<std::string> surfaces;
+    surfaces.reserve(_panes.size());
+    for (const auto& pane : _panes) {
+        if (pane.session && pane.session->autoSaveScheduled) {
+            surfaces.push_back(pane.session->surfaceName);
+        }
+    }
+    for (const auto& surfaceName : surfaces) {
+        flushSessionAutoSave(surfaceName);
+    }
+}
+
 void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session)
 {
     const auto saveStart = Clock::now();
+    // Any direct save supersedes a pending debounced autosave.
+    session.autoSaveScheduled = false;
     try {
         if (!finalizeSessionOptimizationSynchronously(session, false)) {
             return;
