@@ -2612,7 +2612,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             this,
             [this](uint64_t fiberId, uint64_t) {
                 _fiberIntersectionCache.pruneFiber(fiberId);
-                updateAtlasSearchDocks();
+                scheduleAtlasSearchDockRefresh();
             });
     connect(_lineAnnotationController.get(),
             &LineAnnotationController::fibersDeleted,
@@ -2621,7 +2621,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                 for (uint64_t fiberId : fiberIds) {
                     _fiberIntersectionCache.pruneFiber(fiberId);
                 }
-                updateAtlasSearchDocks();
+                scheduleAtlasSearchDockRefresh();
             });
     _fiberMapWorkspace = new FiberMapWorkspace(_lineAnnotationController.get(), this);
     _fiberMapWorkspace->setProperty("workspaceId", QStringLiteral("fiber-map"));
@@ -5116,6 +5116,18 @@ void CWindow::updateAtlasFiberDocks()
 
     tree->collapseAll();
     updateOptimizeEnabled();
+}
+
+void CWindow::scheduleAtlasSearchDockRefresh()
+{
+    if (_atlasSearchDockRefreshQueued) {
+        return;
+    }
+    _atlasSearchDockRefreshQueued = true;
+    QTimer::singleShot(50, this, [this]() {
+        _atlasSearchDockRefreshQueued = false;
+        updateAtlasSearchDocks();
+    });
 }
 
 void CWindow::updateAtlasSearchDocks()

@@ -1,5 +1,7 @@
 #include "CChunkedVolumeViewer.hpp"
 
+#include <atomic>
+
 #include "CState.hpp"
 #include "elements/DownloadQueueDebugOverlay.hpp"
 #include "elements/DownloadQueueStats.hpp"
@@ -928,8 +930,19 @@ void CChunkedVolumeViewer::rebuildChunkArray()
 
     QPointer<CChunkedVolumeViewer> guard(this);
     std::weak_ptr<Volume> volumeWeak = _volume;
-    _chunkCbId = _chunkArray->addChunkReadyListener([guard, volumeWeak]() {
-        QMetaObject::invokeMethod(qApp, [guard, volumeWeak]() {
+    // Coalesce: chunks resolve in bursts (a landing re-fetches a strip's
+    // whole tile set), and one queued submitRender per chunk made the GUI
+    // thread grind through dozens of back-to-back render kicks - each paying
+    // the synchronous prelude (focus marker projection etc.) - before it
+    // could service input. One kick per burst repaints just as correctly.
+    auto renderKickQueued = std::make_shared<std::atomic<bool>>(false);
+    _chunkCbId = _chunkArray->addChunkReadyListener(
+        [guard, volumeWeak, renderKickQueued]() {
+        if (renderKickQueued->exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+        QMetaObject::invokeMethod(qApp, [guard, volumeWeak, renderKickQueued]() {
+            renderKickQueued->store(false, std::memory_order_release);
             if (!guard)
                 return;
             auto volume = volumeWeak.lock();
