@@ -9470,6 +9470,7 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
     const cv::Vec3d previousSeedPoint = session.seedPoint;
     const fs::path previousManifestPath = session.selectedManifestPath;
     const bool previousLineWasOptimized = session.lineWasOptimized;
+    const double previousFocusedLinePosition = session.focusedLinePosition;
     vc::lasagna::LineModel previousLine = session.optimizedLine;
     session.taskState = LineAnnotationSession::TaskState::Succeeded;
     session.lineWasOptimized = true;
@@ -9529,6 +9530,9 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
             session.seedPoint = previousSeedPoint;
             session.selectedManifestPath = previousManifestPath;
             session.lineWasOptimized = previousLineWasOptimized;
+            // The remap loop above may have moved the focus onto the line
+            // being rejected; restore it with the rest of the session.
+            session.focusedLinePosition = previousFocusedLinePosition;
             session.taskState = LineAnnotationSession::TaskState::Failed;
             session.error =
                 "optimized line remapped control points out of order";
@@ -9758,7 +9762,12 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
     }
     session.runningSolveEpoch = solveEpoch;
     session.runningSolveFullLine = true;
-    session.runningSolveCancel = std::make_shared<std::atomic<bool>>(false);
+    // Seed solves carry no cancellation flag: there is no line yet, so no
+    // edit can supersede them (handleGeneratedControlPoint requires a
+    // non-empty line), and optimizeLineWithSampler has no flag plumbing.
+    // Leaving the slot empty keeps the teardown loop honest about what it
+    // can actually cancel.
+    session.runningSolveCancel.reset();
     session.optimizationStateBeforeTask = session.optimizationState;
     session.taskState = LineAnnotationSession::TaskState::Running;
     session.error.clear();
@@ -9776,8 +9785,12 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
     auto* watcher = new QFutureWatcher<OptimizationTaskResult>(this);
     session.watcher = watcher;
     const std::string surfaceName = session.surfaceName;
-    if (auto* pane = paneForSurface(surfaceName); pane && pane->dialog) {
-        pane->dialog->setOptimizationBusy(true);
+    std::weak_ptr<LineAnnotationSession> weakSession;
+    if (auto* pane = paneForSurface(surfaceName)) {
+        weakSession = pane->session;
+        if (pane->dialog) {
+            pane->dialog->setOptimizationBusy(true);
+        }
     }
     const bool localOptimization = !forceFullOptimization &&
         activeStart >= 0 &&
@@ -9788,8 +9801,18 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
     connect(watcher,
             &QFutureWatcher<OptimizationTaskResult>::finished,
             this,
-            [this, surfaceName, watcher]() {
-                finishOptimization(surfaceName);
+            [this, surfaceName, watcher, weakSession]() {
+                if (paneForSurface(surfaceName)) {
+                    finishOptimization(surfaceName);
+                } else if (auto survivor = weakSession.lock()) {
+                    // See startFiberModeOptimization: a session that
+                    // outlives its pane must not strand its queue Running.
+                    (void)watcher->result();
+                    survivor->watcher = nullptr;
+                    survivor->runningSolveCancel.reset();
+                    survivor->taskState = LineAnnotationSession::TaskState::Idle;
+                    (void)survivor->solveQueue.finishSolve();
+                }
                 watcher->deleteLater();
             });
 
@@ -10061,11 +10084,27 @@ void LineAnnotationController::startFiberModeOptimization(
         // can keep being placed while this solve runs; edits coalesce.
         pane->dialog->setOptimizationBusy(true, false);
     }
+    std::weak_ptr<LineAnnotationSession> weakSession;
+    if (pane) {
+        weakSession = pane->session;
+    }
     connect(watcher,
             &QFutureWatcher<OptimizationTaskResult>::finished,
             this,
-            [this, surfaceName, watcher]() {
-                finishOptimization(surfaceName);
+            [this, surfaceName, watcher, weakSession]() {
+                if (paneForSurface(surfaceName)) {
+                    finishOptimization(surfaceName);
+                } else if (auto survivor = weakSession.lock()) {
+                    // The pane closed mid-solve but the session outlives it
+                    // (the intersection inspection holds its sessions). The
+                    // result has nowhere to land: discard it and return the
+                    // queue to Idle so the surviving session can solve again.
+                    (void)watcher->result();
+                    survivor->watcher = nullptr;
+                    survivor->runningSolveCancel.reset();
+                    survivor->taskState = LineAnnotationSession::TaskState::Idle;
+                    (void)survivor->solveQueue.finishSolve();
+                }
                 watcher->deleteLater();
             });
 
