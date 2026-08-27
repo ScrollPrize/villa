@@ -1644,13 +1644,16 @@ std::string sanitizedProjectFiberDirName(const fs::path& projectPath,
 
 void writeLineDebugJson(const std::string& eventName,
                         const std::vector<vc3d::line_annotation::LineControlPoint>& controls,
-                        const nlohmann::json& linePoints,
+                        const vc::lasagna::LineModel& line,
                         const vc::lasagna::LineOptimizationReport* report = nullptr)
 {
+    // Gate before any serialization: with the debug dir unset (the default),
+    // this must cost nothing - the callers sit on the interactive edit path.
     const char* debugDir = std::getenv("VC3D_LINE_DEBUG_DIR");
     if (!debugDir || *debugDir == '\0') {
         return;
     }
+    const nlohmann::json linePoints = linePointsToJson(line);
 
     static std::atomic<int> sequence{0};
     const int id = sequence.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -7150,7 +7153,7 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
                                      : "control_add_no_reopt");
         writeLineDebugJson(noReoptEventName,
                            session.controlPoints,
-                           linePointsToJson(session.optimizedLine));
+                           session.optimizedLine);
         const BranchMetadataSyncResult branchSync =
             syncLinkedBranchMetadataAfterFiberModification(
                 session, nullptr, &previousBranches);
@@ -7202,6 +7205,7 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
                   session.suppressErrorDialogs);
         return;
     }
+    const double prepareMs = elapsedMs(updateStart, Clock::now());
 
     const bool editedExistingControl = !prepared.collapsedOldIndices.empty();
     const size_t collapsedControlCount = prepared.collapsedOldIndices.size();
@@ -7256,6 +7260,7 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
 
     // Immediate feedback: the new control point appears in the overlays now;
     // the strip geometry itself follows when the asynchronous solve lands.
+    const auto overlayStart = Clock::now();
     if (pane->dialog) {
         pane->dialog->setGeneratedBranchOverlayData(
             controlMarkersForSession(session),
@@ -7266,19 +7271,22 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
         pane->dialog->setGeneratedPredSnapPoints(
             generatedPredSnapMarkers(session.controlPoints, session.predSnapSet));
     }
+    const double overlayMs = elapsedMs(overlayStart, Clock::now());
 
     const std::string updateEventName = collapsedControlCount > 1
         ? "control_collapse_span_update"
         : (editedExistingControl ? "control_edit_span_update"
                                  : "control_add_span_update");
     const double updateMs = elapsedMs(updateStart, Clock::now());
-    Logger()->info("Line annotation Lasagna stage timing: event={} prepare=geometric overall_ms={:.3f} points={}",
+    Logger()->info("Line annotation GUI stage: event={} prepare=geometric prepare_ms={:.3f} overlay_ms={:.3f} overall_ms={:.3f} points={}",
                    updateEventName,
+                   prepareMs,
+                   overlayMs,
                    updateMs,
                    session.optimizedLine.points.size());
     writeLineDebugJson(updateEventName,
                        session.controlPoints,
-                       linePointsToJson(session.optimizedLine));
+                       session.optimizedLine);
     // The session no longer matches any in-flight solve: refuse its
     // publication, ask it to stop, carry any queued dirty spans into the new
     // control numbering, add this edit's spans, and dispatch one coalesced
@@ -8956,7 +8964,7 @@ void LineAnnotationController::handleGeneratedControlPointDelete(const std::stri
 
     writeLineDebugJson("control_delete",
                        session.controlPoints,
-                       linePointsToJson(session.optimizedLine));
+                       session.optimizedLine);
     const bool autoReoptimize =
         !pane->dialog ||
         pane->dialog->reoptimizationMode() ==
@@ -9551,10 +9559,18 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
         : eventName + "_result";
     writeLineDebugJson(resultEvent,
                        session.controlPoints,
-                       linePointsToJson(session.optimizedLine),
+                       session.optimizedLine,
                        &session.optimizationReport);
     if (updateGeneratedViews && !session.suppressGeneratedViews) {
-        if (!materializeGeneratedViews(session)) {
+        const auto materializeStart = Clock::now();
+        const bool materialized = materializeGeneratedViews(session);
+        Logger()->info(
+            "Line annotation GUI stage: event=materialize_views ok={} "
+            "materialize_ms={:.3f} points={}",
+            materialized,
+            elapsedMs(materializeStart, Clock::now()),
+            session.optimizedLine.points.size());
+        if (!materialized) {
             session.taskState = LineAnnotationSession::TaskState::Failed;
             return false;
         }
@@ -12104,7 +12120,17 @@ void LineAnnotationController::emitFiberSummaries()
     // of its callers return without emitting summaries -- so a holder comparing
     // fiberDataGeneration() sees every change, not only the ones reaching here.
     ++_fiberDataGeneration;
-    emit fibersChanged(fiberSummaries());
+    const auto summariesStart = Clock::now();
+    auto summaries = fiberSummaries();
+    const double buildMs = elapsedMs(summariesStart, Clock::now());
+    const size_t fiberCount = summaries.size();
+    emit fibersChanged(std::move(summaries));
+    Logger()->info(
+        "Line annotation GUI stage: event=fiber_summaries build_ms={:.3f} "
+        "emit_ms={:.3f} fibers={}",
+        buildMs,
+        elapsedMs(summariesStart, Clock::now()) - buildMs,
+        fiberCount);
 }
 
 uint64_t LineAnnotationController::fiberIdForFileName(const std::string& fileName) const
@@ -14119,6 +14145,7 @@ LineAnnotationController::storedFiberFromSession(LineAnnotationSession& session)
 
 void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session)
 {
+    const auto saveStart = Clock::now();
     try {
         if (!finalizeSessionOptimizationSynchronously(session, false)) {
             return;
@@ -14304,6 +14331,11 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
         }
         emitFiberSummaries();
         refreshBranchLineViews(savedFiberId);
+        Logger()->info(
+            "Line annotation GUI stage: event=session_save total_ms={:.3f} "
+            "line_points={}",
+            elapsedMs(saveStart, Clock::now()),
+            session.optimizedLine.points.size());
     } catch (const std::exception& ex) {
         // Counted like an asynchronous write failure: callers that gate
         // destructive follow-ups on _fiberSaveFailureCount around a
