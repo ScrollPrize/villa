@@ -3,6 +3,7 @@
 
 #include "vc/core/io/PolylineObj.hpp"
 #include "vc/core/util/AtomicFile.hpp"
+#include "vc/core/util/TexturedMesh.hpp"
 #include "vc/fiber_tracer/FiberletCropTrace.hpp"
 #include "vc/fiber_tracer/FiberletCropTraceArtifact.hpp"
 #include "vc/fiber_tracer/FiberletDataset.hpp"
@@ -19,7 +20,6 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
-#include <limits>
 #include <map>
 #include <nlohmann/json.hpp>
 #include <random>
@@ -530,6 +530,8 @@ TEST_CASE("Polyline OBJ output uses explicit consecutive line indices")
     CHECK(text.str().find("l 1 2\nl 2 3\n") != std::string::npos);
     CHECK(text.str().find("l 4 5\n") != std::string::npos);
     CHECK(text.str().find("p 6\n") != std::string::npos);
+    CHECK(text.str().find("mtllib ") == std::string::npos);
+    CHECK(text.str().find("usemtl ") == std::string::npos);
     std::istringstream records(text.str());
     std::string record;
     std::size_t vertexCount = 0;
@@ -545,18 +547,29 @@ TEST_CASE("Polyline OBJ output uses explicit consecutive line indices")
         ++vertexCount;
     }
     CHECK(vertexCount == 6);
+    auto materialPath = path;
+    materialPath.replace_extension(".mtl");
+    CHECK_FALSE(std::filesystem::exists(materialPath));
+    vc::core::io::ObjMaterial invalidMaterial;
+    invalidMaterial.diffuse[0] = -0.01;
     CHECK_THROWS_AS(
-        vc::core::io::writePolylinesObj(
-            {}, path, "invalid", {-0.01, 0.5, 1.0}),
-        std::invalid_argument);
-    CHECK_THROWS_AS(
-        vc::core::io::writePolylinesObj(
-            {},
-            path,
-            "invalid",
-            {0.0, std::numeric_limits<double>::quiet_NaN(), 1.0}),
+        vc::core::io::writePolylinesObjWithMaterial(
+            {}, path, "invalid", invalidMaterial),
         std::invalid_argument);
     std::filesystem::remove(path);
+}
+
+TEST_CASE("Shared OBJ material serializer preserves textured material output")
+{
+    CHECK(
+        vc::core::util::textureMaterialMtl("surface", "surface.png") ==
+        "newmtl surface\n"
+        "Ka 1 1 1\n"
+        "Kd 1 1 1\n"
+        "Ks 0 0 0\n"
+        "d 1\n"
+        "illum 1\n"
+        "map_Kd surface.png\n");
 }
 
 TEST_CASE("Crop trace directions fit non-orthogonal local step modes")
@@ -2293,12 +2306,14 @@ TEST_CASE("Fiber value bands use fixed boundaries and short OBJ names")
     CHECK(read(statePaths.mixed).find("fiber_000001") != std::string::npos);
     CHECK(read(statePaths.horizontal).find("fiber_000002") != std::string::npos);
     CHECK(read(statePaths.tie).find("fiber_000003") != std::string::npos);
-    const auto checkColor = [&](const std::filesystem::path& path,
-                                const std::array<double, 3>& expected) {
+    const auto checkMaterial = [&](const std::filesystem::path& path,
+                                   const std::array<double, 3>& expected) {
         std::ifstream input(path);
         std::string record;
         std::size_t vertexCount = 0;
+        std::string obj;
         while (std::getline(input, record)) {
+            obj += record + '\n';
             if (!record.starts_with("v "))
                 continue;
             std::istringstream fields(record);
@@ -2306,18 +2321,60 @@ TEST_CASE("Fiber value bands use fixed boundaries and short OBJ names")
             std::string value;
             while (fields >> value)
                 values.push_back(value);
-            REQUIRE(values.size() == 7);
-            CHECK(std::stod(values[4]) == doctest::Approx(expected[0]));
-            CHECK(std::stod(values[5]) == doctest::Approx(expected[1]));
-            CHECK(std::stod(values[6]) == doctest::Approx(expected[2]));
+            REQUIRE(values.size() == 4);
             ++vertexCount;
         }
         CHECK(vertexCount > 0);
+        auto materialPath = path;
+        materialPath.replace_extension(".mtl");
+        const std::string materialName = path.stem().string() + "_lines";
+        CHECK(obj.find("mtllib " + materialPath.filename().string() + "\n") !=
+              std::string::npos);
+        const auto usePosition = obj.find("usemtl " + materialName + "\n");
+        REQUIRE(usePosition != std::string::npos);
+        const auto linePosition = obj.find("\nl ");
+        REQUIRE(linePosition != std::string::npos);
+        CHECK(usePosition < linePosition);
+        const std::string mtl = read(materialPath);
+        CHECK(mtl.find("newmtl " + materialName + "\n") != std::string::npos);
+        const auto colorRecord = [&](const char* prefix) {
+            std::ostringstream expectedRecord;
+            expectedRecord << prefix << ' ' << expected[0] << ' '
+                           << expected[1] << ' ' << expected[2] << '\n';
+            CHECK(mtl.find(expectedRecord.str()) != std::string::npos);
+        };
+        colorRecord("Ka");
+        colorRecord("Kd");
+        CHECK(mtl.find("Ks 0 0 0\n") != std::string::npos);
+        CHECK(mtl.find("d 1\n") != std::string::npos);
+        CHECK(mtl.find("illum 1\n") != std::string::npos);
     };
-    checkColor(statePaths.vertical, {0.05, 0.80, 1.00});
-    checkColor(statePaths.mixed, {1.00, 0.10, 0.75});
-    checkColor(statePaths.horizontal, {1.00, 0.35, 0.05});
-    checkColor(statePaths.tie, {0.60, 1.00, 0.10});
+    checkMaterial(statePaths.vertical, {0.00, 1.00, 1.00});
+    checkMaterial(statePaths.mixed, {1.00, 0.00, 1.00});
+    checkMaterial(statePaths.horizontal, {1.00, 0.45, 0.00});
+    checkMaterial(statePaths.tie, {0.55, 1.00, 0.00});
+
+    const auto emptyPaths = writeFiberletCropTernaryStateObjs(
+        {}, {}, directory.path / "empty_bp");
+    for (const auto& path : std::array{
+             emptyPaths.vertical,
+             emptyPaths.mixed,
+             emptyPaths.horizontal,
+             emptyPaths.tie}) {
+        const std::string obj = read(path);
+        auto materialPath = path;
+        materialPath.replace_extension(".mtl");
+        CHECK(std::filesystem::exists(materialPath));
+        CHECK(obj.find("mtllib " + materialPath.filename().string() + "\n") !=
+              std::string::npos);
+        CHECK(obj.find("usemtl ") != std::string::npos);
+        CHECK(obj.find("\nl ") == std::string::npos);
+        CHECK(obj.find("\np ") == std::string::npos);
+    }
+    CHECK_THROWS_AS(
+        vc::core::io::writePolylinesObjWithMaterial(
+            {}, directory.path / "bad name.obj", "invalid", {}),
+        std::invalid_argument);
 }
 
 TEST_CASE("Trace labeling LP enforces triangle-consistent differences")

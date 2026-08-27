@@ -8,6 +8,8 @@
 
 #include <opencv2/core/types.hpp>
 
+#include "vc/core/io/ObjMaterial.hpp"
+
 namespace vc::core::util
 {
 

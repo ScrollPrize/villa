@@ -7,6 +7,8 @@
 
 #include <opencv2/core/types.hpp>
 
+#include "vc/core/io/ObjMaterial.hpp"
+
 namespace vc::core::io
 {
 
@@ -15,10 +17,9 @@ struct NamedPolyline {
     std::vector<cv::Vec3d> points;
 };
 
-struct ObjVertexColor {
-    double red;
-    double green;
-    double blue;
+struct MaterialPolylineObjPaths {
+    std::filesystem::path obj;
+    std::filesystem::path material;
 };
 
 [[nodiscard]] std::string objElementName(std::string name);
@@ -26,10 +27,10 @@ struct ObjVertexColor {
 void writePolylinesObj(
     const std::vector<NamedPolyline>& lines, const std::filesystem::path& outputPath, std::string_view comment = "VC3D polylines");
 
-void writePolylinesObj(
+[[nodiscard]] MaterialPolylineObjPaths writePolylinesObjWithMaterial(
     const std::vector<NamedPolyline>& lines,
     const std::filesystem::path& outputPath,
     std::string_view comment,
-    ObjVertexColor color);
+    const ObjMaterial& material);
 
 }  // namespace vc::core::io
