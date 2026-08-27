@@ -1,10 +1,18 @@
-# Status: Split-piece fiber BP
+# Status: BP-aligned Lasagna normals
 
-- [x] Capture the split-piece BP requirement.
-- [x] Write implementation, spec, docs, and test plan.
+- [x] Capture corrected Lasagna-normal scope.
+- [x] Inspect current H/V BP, Lasagna sampler, and CLI boundaries.
+- [x] Write implementation/spec/docs/test plan.
 - [x] Complete independent plan review.
-- [x] Add shared piece geometry and piece-node graph handling.
-- [x] Update CLI reporting and diagnostics for pieces.
-- [x] Add focused regression tests.
+- [x] Extract and test shared binary BP.
+- [x] Implement reusable Lasagna normal alignment.
+- [x] Add standalone command and paired OBJ visualization.
 - [x] Update specs, docs, changelog, and task log.
 - [x] Build and run focused validation.
+- [x] Plan deterministic parallel BP follow-up.
+- [x] Complete independent parallelization-plan review.
+- [x] Implement deterministic incident indexing and parallel message passes.
+- [x] Wire standalone worker count and BP timing.
+- [x] Add serial/parallel parity tests.
+- [x] Benchmark Release serial versus parallel BP.
+- [x] Update docs, changelog, task log, and final validation.

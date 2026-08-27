@@ -1,3 +1,12 @@
+# 2026-08-27: BP-aligned Lasagna normal samples
+
+- Extracted the binary pairwise sum-product engine shared by fiber BP and
+  normal sign alignment without changing existing fiber BP behavior.
+- Added reusable Lasagna normal alignment plus a standalone globally anchored
+  bbox command with paired crossed-base/directed-stroke OBJ diagnostics.
+- Parallelized large binary BP solves with deterministic ordered CSR message
+  storage and added split-phase BP timing/effective-worker diagnostics.
+
 # 2026-08-27: split-piece fiber BP
 
 - Made finite `--piece-length` constraint pieces the BP nodes, retained

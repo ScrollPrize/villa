@@ -197,6 +197,7 @@ add_library(vc_atlas
 target_link_libraries(vc_atlas PUBLIC vc_core vc_lasagna PRIVATE Ceres::ceres)
 
 add_library(vc_fiber_tracer
+    src/fiber_tracer/BinaryBeliefPropagation.cpp
     src/fiber_tracer/FiberAnchors.cpp
     src/fiber_tracer/FiberAnchorObjectives.cpp
     src/fiber_tracer/FiberAnchorFinalEvaluation.cpp
@@ -221,6 +222,7 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberletCropVisualization.cpp
     src/fiber_tracer/FiberletOnDemand.cpp
     src/fiber_tracer/FiberletStorage.cpp
+    src/fiber_tracer/LasagnaNormalAlignment.cpp
 )
 target_link_libraries(vc_fiber_tracer PUBLIC vc_core vc_lasagna PRIVATE highs::highs)
 if(VC_TESTING)

@@ -1,5 +1,6 @@
 #include "vc/fiber_tracer/FiberTraceBeliefPropagation.hpp"
 
+#include "vc/fiber_tracer/BinaryBeliefPropagation.hpp"
 #include "vc/fiber_tracer/FiberTraceSeed.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
 
@@ -402,12 +403,6 @@ double horizontalness(double advantage, double temperature)
     return exponential / (1.0 + exponential);
 }
 
-double logAddExp(double a, double b)
-{
-    const double maximum = std::max(a, b);
-    return maximum + std::log1p(std::exp(std::min(a, b) - maximum));
-}
-
 using TernaryLogMessage = std::array<double, 3>;
 
 double logSumExp(const TernaryLogMessage& values)
@@ -426,20 +421,6 @@ void normalizeLogMessage(TernaryLogMessage& values)
     const double normalization = logSumExp(values);
     for (double& value : values)
         value -= normalization;
-}
-
-double updateSumProductMessage(
-    double cavityLogOdds,
-    double logSamePotential,
-    double logDifferentPotential)
-{
-    const double targetH = logAddExp(
-        logDifferentPotential,
-        cavityLogOdds + logSamePotential);
-    const double targetV = logAddExp(
-        logSamePotential,
-        cavityLogOdds + logDifferentPotential);
-    return targetH - targetV;
 }
 
 FieldSolution solveField(
@@ -767,94 +748,34 @@ FiberTraceBeliefPropagationReport solveFiberTraceSumProduct(
     }
     const auto problem = prepareProblem(traces, constraints, config);
     const auto& graph = problem.graph;
-    const std::size_t nodeCount = graph.adjacency.size();
-    const double temperature = config.horizontalnessTemperature;
-
-    std::vector<double> logSame(graph.factors.size());
-    std::vector<double> logDifferent(graph.factors.size());
-    for (std::size_t index = 0; index < graph.factors.size(); ++index) {
-        const double minimumCost = std::min(
-            graph.factors[index].sameCost,
-            graph.factors[index].differentCost);
-        logSame[index] =
-            -(graph.factors[index].sameCost - minimumCost) / temperature;
-        logDifferent[index] =
-            -(graph.factors[index].differentCost - minimumCost) / temperature;
-        if (!std::isfinite(logSame[index]) ||
-            !std::isfinite(logDifferent[index])) {
-            throw std::invalid_argument(
-                "Sum-product BP temperature is too small for factor costs");
-        }
-    }
-
-    std::vector<double> aToB(graph.factors.size(), 0.0);
-    std::vector<double> bToA(graph.factors.size(), 0.0);
-    std::vector<double> nextAToB(graph.factors.size(), 0.0);
-    std::vector<double> nextBToA(graph.factors.size(), 0.0);
-    std::vector<double> totalLogOdds(nodeCount, 0.0);
-
     auto report = initializeReport(
         problem, config, FiberTraceBeliefInference::SumProduct);
-    for (std::size_t iteration = 0;
-         iteration < config.maximumMessageIterations;
-         ++iteration) {
-        std::fill(totalLogOdds.begin(), totalLogOdds.end(), 0.0);
-        for (std::size_t index = 0; index < graph.factors.size(); ++index) {
-            totalLogOdds[graph.factors[index].a] += bToA[index];
-            totalLogOdds[graph.factors[index].b] += aToB[index];
-        }
-
-        double residual = 0.0;
-        for (std::size_t index = 0; index < graph.factors.size(); ++index) {
-            const auto& factor = graph.factors[index];
-            const double rawAToB = factor.a == problem.seed
-                ? logSame[index] - logDifferent[index]
-                : updateSumProductMessage(
-                      totalLogOdds[factor.a] - bToA[index],
-                      logSame[index],
-                      logDifferent[index]);
-            const double rawBToA = factor.b == problem.seed
-                ? logSame[index] - logDifferent[index]
-                : updateSumProductMessage(
-                      totalLogOdds[factor.b] - aToB[index],
-                      logSame[index],
-                      logDifferent[index]);
-            nextAToB[index] = aToB[index] + config.messageDamping *
-                (rawAToB - aToB[index]);
-            nextBToA[index] = bToA[index] + config.messageDamping *
-                (rawBToA - bToA[index]);
-            residual = std::max({
-                residual,
-                std::abs(nextAToB[index] - aToB[index]),
-                std::abs(nextBToA[index] - bToA[index]),
-            });
-        }
-        aToB.swap(nextAToB);
-        bToA.swap(nextBToA);
-        report.messageIterations = iteration + 1;
-        report.messageResidual = residual;
-        if (residual <= config.messageResidualTolerance) {
-            report.messageConverged = true;
-            break;
-        }
+    std::vector<BinaryPairwiseFactor> factors;
+    factors.reserve(graph.factors.size());
+    for (const auto& factor : graph.factors) {
+        factors.push_back({
+            factor.a, factor.b, factor.sameCost, factor.differentCost});
     }
-
-    std::fill(totalLogOdds.begin(), totalLogOdds.end(), 0.0);
-    for (std::size_t index = 0; index < graph.factors.size(); ++index) {
-        totalLogOdds[graph.factors[index].a] += bToA[index];
-        totalLogOdds[graph.factors[index].b] += aToB[index];
-    }
-    report.horizontalness.resize(nodeCount);
-    report.logOdds.resize(nodeCount);
+    std::vector<BinaryBeliefState> fixed(
+        graph.adjacency.size(), BinaryBeliefState::Free);
+    fixed[problem.seed] = BinaryBeliefState::One;
+    BinaryBeliefPropagationConfig binaryConfig;
+    binaryConfig.temperature = config.horizontalnessTemperature;
+    binaryConfig.messageDamping = config.messageDamping;
+    binaryConfig.messageResidualTolerance =
+        config.messageResidualTolerance;
+    binaryConfig.maximumMessageIterations =
+        config.maximumMessageIterations;
+    const auto binary = solveBinaryPairwiseSumProduct(
+        graph.adjacency.size(), factors, fixed, binaryConfig);
+    report.messageIterations = binary.messageIterations;
+    report.messageResidual = binary.messageResidual;
+    report.messageConverged = binary.messageConverged;
+    report.horizontalness = binary.probabilityOne;
+    report.logOdds = binary.logOdds;
     double weightedHorizontal = 0.0;
     double totalWeight = 0.0;
-    for (std::size_t node = 0; node < nodeCount; ++node) {
-        report.logOdds[node] = node == problem.seed
-            ? std::numeric_limits<double>::infinity()
-            : totalLogOdds[node];
-        report.horizontalness[node] = node == problem.seed
-            ? 1.0
-            : horizontalness(totalLogOdds[node], 1.0);
+    for (std::size_t node = 0; node < graph.adjacency.size(); ++node) {
         weightedHorizontal += problem.normalizedArcWeights[node] *
             report.horizontalness[node];
         totalWeight += problem.normalizedArcWeights[node];
