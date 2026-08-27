@@ -491,6 +491,13 @@ private:
     QGraphicsScene* _scene = nullptr;
     ViewerStatsBar* _statsBar = nullptr;
     ViewerStatsBar* _statsBarRight = nullptr;
+    // Shared cache/scheduler statistics are refreshed at most every 250 ms:
+    // updateStatusLabel runs per mouse move and ChunkCache::stats() takes the
+    // cache-state and scheduler mutexes that every fetch/decode worker hammers
+    // while a solve streams chunks - polling them at input rate stalls the GUI
+    // thread and the workers alike.
+    QElapsedTimer _sharedCacheStatsThrottle;
+    QStringList _cachedSharedCacheItems;
     CameraGizmoWidget* _cameraGizmo = nullptr;
     // No per-viewer timers. ViewerManager's global clock only services
     // intersection/status maintenance; render requests submit immediately.

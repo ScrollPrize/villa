@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <future>
@@ -892,12 +893,25 @@ std::shared_ptr<const LasagnaCachedChunk> LasagnaChannelChunkCache::load(
     }
 
     if (!ownsRequest) {
+        // Bounded wait: a hung remote read must never park this caller
+        // forever (the GUI thread can land here when it samples a chunk a
+        // worker is already fetching). Past the budget, read the chunk
+        // independently - a duplicate fetch, but correct data and a bounded
+        // stall - instead of inheriting the stuck loader's fate.
+        constexpr auto kInFlightWaitBudget = std::chrono::seconds(10);
         std::unique_lock<std::mutex> lock(request->mutex);
-        request->finished.wait(lock, [&]() { return request->done; });
-        if (request->error) {
-            std::rethrow_exception(request->error);
+        const bool finished = request->finished.wait_for(
+            lock, kInFlightWaitBudget, [&]() { return request->done; });
+        if (finished) {
+            if (request->error) {
+                std::rethrow_exception(request->error);
+            }
+            return request->bytes;
         }
-        return request->bytes;
+        lock.unlock();
+        auto bytes = readSourceChunk(binding, array, key);
+        store(key, bytes);
+        return bytes;
     }
 
     std::shared_ptr<const LasagnaCachedChunk> bytes;
