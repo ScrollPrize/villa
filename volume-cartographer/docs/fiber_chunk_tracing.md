@@ -523,6 +523,38 @@ errors, piece and represented-fiber error rates, and one row for each erroneous
 piece with its original fiber ID and arc interval. An all-mixed input remains a
 successful empty diagnostic and still writes every expected output family.
 
+To measure how uncertain fibers affect the labeling graph, run the cumulative
+mixed-fiber ablation:
+
+```bash
+volume-cartographer/build/bin/vc_fiber_trace_chunk direction-ablation \
+  crop_traces.zarr \
+  --normal-manifest normals.lasagna.json \
+  --output crop_direction_ablation \
+  --direction-dominance 0.9
+```
+
+Mixed fibers are admitted five at a time by default from highest to lowest
+directional support fraction; use `--ablation-step N` to change the stride, and
+use `--ablation-limit N` to stop at a fixed ranked prefix while tuning solver
+costs. Without a limit the complete mixed cohort is admitted, and the final
+remainder is always included. Confidence ranking controls membership
+only; every Mixed
+fiber remains a defect reference and is expected to optimize to Broken rather
+than H or V. Every retained checkpoint remains in original stored-fiber order.
+Constraint extraction, optional pruning, the discrete H/V-only MILP, and its
+LP relaxation are recomputed at every checkpoint. LP activity and H/V are
+thresholded at 0.5. Each checkpoint prints both solve times, solver status,
+gap, objective, graph size, raw labels, and separate H/V-fiber and mixed-defect
+errors for MILP and thresholded LP. Component gauge alignment is chosen exclusively from
+trusted active pieces, preventing uncertain additions from changing the frame
+used to judge the original split.
+
+The initial direction OBJ family is written once beneath
+`crop_direction_ablation_initial`. Only the final admitted checkpoint
+writes constraint and H/V/broken OBJ layers; intermediate checkpoints are
+statistics-only.
+
 ## Quality groups
 
 Visualization stably sorts traces by ascending cost density and then stored

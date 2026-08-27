@@ -1,32 +1,57 @@
-# Task Log: Direction-label MILP diagnostic
+# Task Log: Mixed-fiber direction-label ablation
 
-- The direction reference is per stored trace, while the existing solver labels
-  extracted pieces. Every retained piece will inherit its source trace's
-  direction reference; reports will include piece and unique-trace errors.
-- Disconnected MILP components have independent H/V gauge symmetry. Directly
-  comparing canonical H/V to global direction 1/2 would count arbitrary flips,
-  so comparison will minimize disagreement independently per active component.
-- Mixed traces must be removed before extraction rather than merely ignored in
-  the comparison, so they cannot influence neighbors, scores, degree penalties,
-  broken decisions, or the optimized graph.
-- Independent review fixed the CLI matrix and report denominators. The new mode
-  will force ordinary discrete H/V-only labeling, reject explicit `--hv-only`
-  and incompatible solver ablations, but allow MIP-gap and no-winding-cutoff.
-  It will translate every filtered-local piece index back to the original trace
-  in user-facing errors and emit valid empty outputs for an all-mixed input.
-- Implemented the reusable comparison beside the HiGHS labeling API. It builds
-  components from the exact retained active-piece graph, resolves each binary
-  gauge deterministically, and reports orientation and Broken errors in stable
-  piece order.
-- Added `direction-diagnostic`, which writes the unfiltered `_initial` direction
-  artifact family, removes mixed traces before extraction, reuses canonical
-  constraint/pruning/OBJ/MILP paths, and prints the filtered-to-original trace
-  mapping for every error.
-- Built `vc_fiber_trace_chunk` and `test_fiberlet_crop_trace` with `-j32`; all 41
-  focused test cases passed.
-- Centered-384 validation at dominance 0.90 classified 179 source fibers as 50
-  direction 1, 45 direction 2, and 84 mixed. The retained 95 fibers produced 95
-  pieces and 755 constraints. The discrete H/V-only MILP was optimal with no
-  Broken pieces. Its one active component required a gauge flip and then
-  matched all initial labels: zero orientation errors and zero erroneous source
-  fibers.
+- Mixed fibers are defects. Confidence controls only their deterministic
+  admission order; their expected optimized state is Broken and they must
+  never receive a tentative H/V reference. Retain the originally
+  above-threshold direction groups as a separate trusted cohort.
+- Gauge alignment must not optimize against the newly admitted uncertain
+  labels, because that could hide degradation of the original diagnostic.
+  Components are therefore aligned from trusted active pieces only; an
+  unanchored component keeps the identity mapping.
+- Checkpoints are cumulative but computationally independent. Canonical
+  extraction and solve are rerun after every admission checkpoint so topology,
+  degree-dependent Broken cost, and pruning can genuinely change.
+- Independent review identified that confidence ranking must select membership
+  only. Every checkpoint will retain source traces in original stored order;
+  otherwise the ablation would also perturb piece IDs, spatial tie breaks,
+  component canonicalization, and final all-admitted equivalence.
+- Review also fixed the comparison API and accounting: pass complete reference
+  states plus a trusted mask, align exact post-pruning active components
+  from trusted pieces only, report explicit trusted/admitted/combined unions,
+  and expose solver status/gap at every checkpoint. Intermediate execution must
+  remain artifact-free; only initial and final families are written.
+- Built the command and focused tests with `-j32`; all 43 test cases pass.
+- The unpruned centered-384 run uses all links surviving the canonical
+  exclusive 1.5-winding cutoff. Checkpoints 0 through 57 completed optimally
+  with zero trusted errors, zero admitted errors, and zero Broken pieces.
+  Checkpoint 57 contains 152 represented fibers, 154 pieces, and 2,010 retained
+  constraints at latest admitted confidence 0.628699. Checkpoint 58 is still
+  solving and demonstrates a major branch-and-bound runtime discontinuity.
+- The first ablation run incorrectly treated mixed fibers as tentative H/V
+  references. It was stopped at checkpoint 67 on user correction. All results
+  after checkpoint zero are invalid and must not be used; checkpoint zero is
+  unaffected. The implementation is being corrected so admitted mixed pieces
+  are successful only when the MILP labels them Broken.
+- Per-fiber checkpoints were unnecessarily expensive and obscured the trend.
+  The corrected command defaults to five admitted mixed fibers per checkpoint,
+  always includes the final remainder, and also solves/thresholds the matching
+  LP relaxation for separate H/V-versus-defect comparison.
+- Added `--ablation-limit` so every broken-cost trial uses the identical ranked
+  Mixed prefix. On the centered 384 crop, costs from 0.25 through 0.5 detected
+  no Mixed defects. Cost 0.1 detected 2/10 but incorrectly broke 9/95 trusted
+  fibers. The narrow selected value 0.2035 keeps all 95 trusted fibers active
+  and correct while detecting 1/10 and 1/15 admitted Mixed defects; 0.205 loses
+  the 15-fiber detection. MILP and thresholded LP labels matched throughout
+  this sweep.
+- Completed the full 84-Mixed-fiber centered-384 ablation at broken cost
+  0.2035. The final MILP labels 35/84 Mixed source fibers Broken and has 1/95
+  trusted-fiber error; thresholded LP labels 12/84 Mixed fibers Broken and has
+  8/95 trusted-fiber errors. Final piece labels are MILP H=74, V=72, Broken=44
+  versus thresholded LP H=109, V=65, Broken=16. The 18 MILP checkpoints took
+  22,152.536 seconds in total (6h09m), dominated by 7,245.168 seconds at 80
+  admitted and 12,285.571 seconds at 84 admitted. All LP checkpoints together
+  took 97.286 seconds. This demonstrates both the LP quality failure and the
+  impractical branch-and-bound growth of the current full MILP ablation.
+- Final verification rebuilt `vc_fiber_trace_chunk` and
+  `test_fiberlet_crop_trace` with `-j32`; all 44 focused test cases pass and
+  `git diff --check` is clean.

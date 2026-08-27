@@ -701,10 +701,43 @@ FiberTraceLabelingReport solveFiberTraceLabels(
     return report;
 }
 
+FiberTraceLabelingReport thresholdFiberTraceLabeling(
+    const FiberTraceLabelingReport& continuous,
+    double activeThreshold,
+    double verticalThreshold)
+{
+    if (!continuous.continuousPieceValues ||
+        continuous.activeValues.size() != continuous.verticalValues.size()) {
+        throw std::invalid_argument(
+            "Fiber trace thresholding requires continuous active and H/V values");
+    }
+    if (!std::isfinite(activeThreshold) || activeThreshold < 0.0 ||
+        activeThreshold > 1.0 || !std::isfinite(verticalThreshold) ||
+        verticalThreshold < 0.0 || verticalThreshold > 1.0) {
+        throw std::invalid_argument(
+            "Fiber trace thresholds must be finite in [0,1]");
+    }
+    FiberTraceLabelingReport result = continuous;
+    result.continuousPieceValues = false;
+    result.labels.resize(continuous.activeValues.size());
+    result.labelCounts = {};
+    for (std::size_t piece = 0; piece < result.labels.size(); ++piece) {
+        const auto label = continuous.activeValues[piece] < activeThreshold
+            ? FiberTracePieceLabel::Broken
+            : (continuous.verticalValues[piece] < verticalThreshold
+                  ? FiberTracePieceLabel::HEven
+                  : FiberTracePieceLabel::VEven);
+        result.labels[piece] = label;
+        ++result.labelCounts[labelIndex(label)];
+    }
+    return result;
+}
+
 FiberDirectionLabelComparisonReport compareFiberDirectionLabels(
     const FiberTraceConstraintReport& constraints,
     std::span<const FiberDirectionGroup> traceDirections,
-    const FiberTraceLabelingReport& labeling)
+    const FiberTraceLabelingReport& labeling,
+    std::span<const std::uint8_t> trustedTraceMask)
 {
     const std::size_t pieceCount = constraints.pieces.size();
     if (labeling.continuousPieceValues || labeling.labels.size() != pieceCount) {
@@ -715,15 +748,33 @@ FiberDirectionLabelComparisonReport compareFiberDirectionLabels(
         throw std::invalid_argument(
             "Fiber direction comparison trace count does not match constraints");
     }
-    for (const auto direction : traceDirections) {
-        if (direction == FiberDirectionGroup::Mixed) {
+    if (!trustedTraceMask.empty() &&
+        trustedTraceMask.size() != traceDirections.size()) {
+        throw std::invalid_argument(
+            "Fiber direction comparison trusted mask does not match traces");
+    }
+    const auto isTrusted = [&](std::size_t trace) {
+        return trustedTraceMask.empty() || trustedTraceMask[trace] != 0;
+    };
+    for (std::size_t trace = 0; trace < traceDirections.size(); ++trace) {
+        const auto direction = traceDirections[trace];
+        if (trustedTraceMask.empty() &&
+            direction == FiberDirectionGroup::Mixed) {
             throw std::invalid_argument(
                 "Fiber direction comparison does not accept mixed traces");
+        }
+        if (!trustedTraceMask.empty() &&
+            ((isTrusted(trace) && direction == FiberDirectionGroup::Mixed) ||
+             (!isTrusted(trace) && direction != FiberDirectionGroup::Mixed))) {
+            throw std::invalid_argument(
+                "Fiber direction comparison mask does not match direction/defect references");
         }
     }
 
     FiberDirectionLabelComparisonReport result;
     std::vector<unsigned char> represented(traceDirections.size(), 0);
+    std::vector<unsigned char> trustedRepresented(traceDirections.size(), 0);
+    std::vector<unsigned char> admittedRepresented(traceDirections.size(), 0);
     std::vector<unsigned char> active(pieceCount, 0);
     std::vector<std::vector<std::size_t>> adjacency(pieceCount);
     for (std::size_t piece = 0; piece < pieceCount; ++piece) {
@@ -737,6 +788,10 @@ FiberDirectionLabelComparisonReport compareFiberDirectionLabels(
                 "Fiber direction comparison piece references an invalid trace");
         }
         represented[descriptor.traceIndex] = 1;
+        if (isTrusted(descriptor.traceIndex))
+            trustedRepresented[descriptor.traceIndex] = 1;
+        else
+            admittedRepresented[descriptor.traceIndex] = 1;
         active[piece] = isBroken(labeling.labels[piece]) ? 0 : 1;
         if (active[piece]) {
             if (isVertical(labeling.labels[piece]))
@@ -749,6 +804,12 @@ FiberDirectionLabelComparisonReport compareFiberDirectionLabels(
     }
     result.representedTraces = static_cast<std::size_t>(std::count(
         represented.begin(), represented.end(), static_cast<unsigned char>(1)));
+    result.trusted.representedTraces = static_cast<std::size_t>(std::count(
+        trustedRepresented.begin(), trustedRepresented.end(),
+        static_cast<unsigned char>(1)));
+    result.admitted.representedTraces = static_cast<std::size_t>(std::count(
+        admittedRepresented.begin(), admittedRepresented.end(),
+        static_cast<unsigned char>(1)));
 
     for (const auto& constraint : constraints.constraints) {
         if (constraint.pieceA >= pieceCount ||
@@ -798,6 +859,8 @@ FiberDirectionLabelComparisonReport compareFiberDirectionLabels(
         std::size_t identityErrors = 0;
         std::size_t flippedErrors = 0;
         for (const std::size_t piece : componentPieces[componentIndex]) {
+            if (!isTrusted(constraints.pieces[piece].traceIndex))
+                continue;
             const auto initial =
                 traceDirections[constraints.pieces[piece].traceIndex];
             const bool rawVertical = isVertical(labeling.labels[piece]);
@@ -813,13 +876,16 @@ FiberDirectionLabelComparisonReport compareFiberDirectionLabels(
     }
 
     std::vector<unsigned char> erroneousTrace(traceDirections.size(), 0);
+    std::vector<unsigned char> trustedErroneousTrace(
+        traceDirections.size(), 0);
+    std::vector<unsigned char> admittedErroneousTrace(
+        traceDirections.size(), 0);
     for (std::size_t piece = 0; piece < pieceCount; ++piece) {
         const auto& descriptor = constraints.pieces[piece];
         const auto initial = traceDirections[descriptor.traceIndex];
-        const std::size_t rowIndex =
-            initial == FiberDirectionGroup::Direction1 ? 0 : 1;
-        auto& row = result.confusion[rowIndex];
-        ++row.pieces;
+        auto& cohort = isTrusted(descriptor.traceIndex)
+            ? result.trusted
+            : result.admitted;
 
         FiberDirectionLabelError error;
         error.pieceIndex = piece;
@@ -829,11 +895,43 @@ FiberDirectionLabelComparisonReport compareFiberDirectionLabels(
         error.endArcBaseVoxels = descriptor.endArcBaseVoxels;
         error.initialDirection = initial;
         error.rawLabel = labeling.labels[piece];
+        error.trustedReference = isTrusted(descriptor.traceIndex);
+        if (initial == FiberDirectionGroup::Mixed) {
+            ++result.expectedDefectPieces;
+            ++cohort.expectedDefectPieces;
+            if (!active[piece]) {
+                ++result.defectBrokenPieces;
+                ++cohort.defectBrokenPieces;
+                continue;
+            }
+            ++result.defectActiveErrors;
+            ++cohort.defectActiveErrors;
+            erroneousTrace[descriptor.traceIndex] = 1;
+            admittedErroneousTrace[descriptor.traceIndex] = 1;
+            error.componentIndex = component[piece];
+            error.componentFlipped = flipped[component[piece]] != 0;
+            error.kind = FiberDirectionLabelErrorKind::DefectActive;
+            result.errors.push_back(error);
+            continue;
+        }
+        const std::size_t rowIndex =
+            initial == FiberDirectionGroup::Direction1 ? 0 : 1;
+        auto& row = result.confusion[rowIndex];
+        auto& cohortRow = cohort.confusion[rowIndex];
+        ++row.pieces;
+        ++cohortRow.pieces;
+
         if (!active[piece]) {
             ++row.broken;
             ++row.errors;
+            ++cohortRow.broken;
+            ++cohortRow.errors;
             ++result.brokenErrors;
+            ++cohort.brokenErrors;
             erroneousTrace[descriptor.traceIndex] = 1;
+            (error.trustedReference
+                    ? trustedErroneousTrace
+                    : admittedErroneousTrace)[descriptor.traceIndex] = 1;
             error.kind = FiberDirectionLabelErrorKind::Broken;
             result.errors.push_back(error);
             continue;
@@ -850,16 +948,31 @@ FiberDirectionLabelComparisonReport compareFiberDirectionLabels(
             ++row.alignedDirection2;
         else
             ++row.alignedDirection1;
+        if (alignedVertical)
+            ++cohortRow.alignedDirection2;
+        else
+            ++cohortRow.alignedDirection1;
         if (error.alignedDirection != initial) {
             ++row.errors;
+            ++cohortRow.errors;
             ++result.orientationErrors;
+            ++cohort.orientationErrors;
             erroneousTrace[descriptor.traceIndex] = 1;
+            (error.trustedReference
+                    ? trustedErroneousTrace
+                    : admittedErroneousTrace)[descriptor.traceIndex] = 1;
             error.kind = FiberDirectionLabelErrorKind::Orientation;
             result.errors.push_back(error);
         }
     }
     result.errorTraces = static_cast<std::size_t>(std::count(
         erroneousTrace.begin(), erroneousTrace.end(),
+        static_cast<unsigned char>(1)));
+    result.trusted.errorTraces = static_cast<std::size_t>(std::count(
+        trustedErroneousTrace.begin(), trustedErroneousTrace.end(),
+        static_cast<unsigned char>(1)));
+    result.admitted.errorTraces = static_cast<std::size_t>(std::count(
+        admittedErroneousTrace.begin(), admittedErroneousTrace.end(),
         static_cast<unsigned char>(1)));
     return result;
 }

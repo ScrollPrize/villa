@@ -4647,9 +4647,10 @@
   dominance fraction; an exact support tie prefers direction 1. Otherwise it
   is mixed. Hard fit assignments remain only for the existing deterministic
   axis ordering and do not classify lines. The default is 0.75.
-  `--direction-dominance F` is accepted only by `trace`, `visualize`, and
-  `direction-diagnostic`, must be finite in `(0.5,1]`, and is inclusive at
-  `F`; constraint and consensus modes reject it. A line without a nonzero step
+  `--direction-dominance F` is accepted only by `trace`, `visualize`,
+  `direction-diagnostic`, and `direction-ablation`, must be finite in
+  `(0.5,1]`, and is inclusive at `F`; constraint and consensus modes reject it.
+  A line without a nonzero step
   is mixed. Only accepted lines
   contribute, and analysis uses a fixed serial reduction order. The selected
   fraction is reported with the classification.
@@ -4705,6 +4706,41 @@
   denominator is every retained source trace represented by at least one
   piece. An all-mixed input succeeds and writes valid empty constraint and
   label families in addition to the complete initial direction family.
+- `vc_fiber_trace_chunk direction-ablation TRACE.zarr --normal-manifest
+  MANIFEST` classifies once, preserves above-threshold direction-1/direction-2
+  traces as a trusted cohort, and ranks Mixed traces by descending
+  `max(direction_support)/valid_arc_length` followed by original trace index.
+  Confidence controls admission order only. Every Mixed trace is a Defect
+  reference and is expected to optimize to Broken; it never receives a
+  tentative H/V reference. Zero-valid-length traces rank last.
+- Ablation checkpoint zero contains only trusted traces. Each later checkpoint
+  cumulatively admits `--ablation-step N` ranked Mixed traces, default 5; the
+  optional `--ablation-limit N` restricts admission to the first N ranked
+  Mixed traces for repeatable parameter sweeps, while omission admits all; the
+  final remainder is always included. Ranking selects membership only:
+  the retained input vector is reconstructed in original stored-trace order at
+  every checkpoint. Pieces, constraints, configured pruning, and the ordinary
+  discrete H/V-only-plus-broken MILP are recomputed independently without a
+  solution warm start. Solver status and gap remain explicit.
+- Every checkpoint also solves the matching H/V-only LP relaxation. Continuous
+  activity and H/V values are independently thresholded at 0.5; inactive maps
+  to Broken and active maps to H or V. MILP and thresholded-LP errors and solve
+  times are reported separately, and their final label OBJ basenames remain
+  distinct.
+- Ablation gauge selection uses only trusted active pieces in each exact
+  post-pruning active constraint component. A strict reduction in trusted
+  disagreement is required to flip; a tie or component without a trusted
+  active piece keeps direction 1 mapped to H. That one gauge evaluates trusted,
+  admitted, and combined cohorts. A trusted H/V mismatch is an orientation
+  error, a trusted Broken piece is a broken error, and an active admitted
+  Defect piece is a defect-active error; Broken is correct for a Defect.
+  Each cohort reports piece errors and their union per represented source trace
+  with its own denominators. Raw H/V/Broken totals remain global.
+- Ablation writes the complete `<base>_initial` direction family once and the
+  existing constraint and label OBJ families only for the final selected
+  checkpoint. Intermediate checkpoints emit statistics only. The default base
+  is sibling `<trace-stem>_direction_ablation`. With no Mixed traces,
+  checkpoint zero is final; all-Mixed checkpoint zero is a valid empty solve.
 - Every distance and arc value is in base voxels. Defaults are a 32-vx common
   sample pitch, 512-vx target piece length, 128-vx overlap, 128-vx neighbor
   radius, 32-vx centered tangent window, and 8-vx winding integration step.

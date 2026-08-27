@@ -36,6 +36,7 @@ enum class Mode {
     Constraints,
     Consensus,
     DirectionDiagnostic,
+    DirectionAblation,
 };
 
 struct Options {
@@ -55,6 +56,8 @@ struct Options {
     vc::fiber_tracer::FiberTraceConstraintConfig constraints;
     vc::fiber_tracer::FiberTraceLabelingConfig labeling;
     std::optional<std::size_t> maximumConstraintsPerFiber;
+    std::size_t ablationStep = 5;
+    std::optional<std::size_t> ablationLimit;
     bool hasBounds = false;
     bool hasTraceOnlyOption = false;
     bool hasConstraintOnlyOption = false;
@@ -62,6 +65,7 @@ struct Options {
     bool hasSharedRuntimeOption = false;
     bool hasDirectionVisualizationOption = false;
     bool hasHvOnlyOption = false;
+    bool hasAblationOnlyOption = false;
 };
 
 [[noreturn]] void fail(const std::string& message)
@@ -89,6 +93,10 @@ void usage(const char* executable)
               << "  " << executable
               << " direction-diagnostic <traces.zarr> --normal-manifest PATH"
                  " [--output BASENAME] [--direction-dominance F] [options]\n\n"
+              << "  " << executable
+              << " direction-ablation <traces.zarr> --normal-manifest PATH"
+                 " [--output BASENAME] [--direction-dominance F]"
+                 " [--ablation-step N] [--ablation-limit N] [options]\n\n"
               << "Trace options:\n"
               << "  --obj PATH                 line OBJ; defaults beside trace Zarr\n"
               << "  --volume PATH              concrete uint8 CT Zarr group\n"
@@ -103,6 +111,8 @@ void usage(const char* executable)
               << "  --max-fibers N             accepted line limit; zero is unlimited [0]\n"
               << "  --texture-max N            maximum bbox texture dimension [4096]\n\n"
               << "  --direction-dominance F   direction support/arc fraction in (0.5,1] [0.75]\n\n"
+              << "  --ablation-step N         mixed fibers admitted per checkpoint [5]\n\n"
+              << "  --ablation-limit N        stop after admitting N mixed fibers [all]\n\n"
               << "Constraint options (all distances are base voxels):\n"
               << "  --output PATH              OBJ basename; defaults beside trace dataset\n"
               << "  --sample-step N            common trace resampling step [32]\n"
@@ -174,8 +184,10 @@ Options parse(int argc, char** argv)
         options.mode = Mode::Consensus;
     else if (mode == "direction-diagnostic")
         options.mode = Mode::DirectionDiagnostic;
+    else if (mode == "direction-ablation")
+        options.mode = Mode::DirectionAblation;
     else
-        fail("mode must be 'trace', 'visualize', 'constraints', 'consensus', or 'direction-diagnostic'");
+        fail("mode must be 'trace', 'visualize', 'constraints', 'consensus', 'direction-diagnostic', or 'direction-ablation'");
     options.input = argv[2];
 
     for (int index = 3; index < argc; ++index) {
@@ -237,6 +249,18 @@ Options parse(int argc, char** argv)
                 fail("--direction-dominance must be in (0.5, 1]");
             }
             options.hasDirectionVisualizationOption = true;
+        } else if (argument == "--ablation-step") {
+            options.ablationStep = count(
+                index, argc, argv, "--ablation-step");
+            if (options.ablationStep == 0)
+                fail("--ablation-step must be positive");
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--ablation-limit") {
+            options.ablationLimit = count(
+                index, argc, argv, "--ablation-limit");
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
         } else if (argument == "--sample-step") {
             options.constraints.resampleSpacingBaseVoxels = number(index, argc, argv, "--sample-step");
             options.hasConstraintOnlyOption = true;
@@ -340,24 +364,31 @@ Options parse(int argc, char** argv)
     }
     if (options.mode == Mode::Constraints ||
         options.mode == Mode::Consensus ||
-        options.mode == Mode::DirectionDiagnostic) {
+        options.mode == Mode::DirectionDiagnostic ||
+        options.mode == Mode::DirectionAblation) {
         if (options.hasTraceOnlyOption)
             fail("constraint processing does not accept trace-only options");
         if (options.hasDirectionVisualizationOption &&
-            options.mode != Mode::DirectionDiagnostic) {
+            options.mode != Mode::DirectionDiagnostic &&
+            options.mode != Mode::DirectionAblation) {
             fail("constraint processing does not accept visualization options");
+        }
+        if (options.hasAblationOnlyOption &&
+            options.mode != Mode::DirectionAblation) {
+            fail("ablation controls require direction-ablation");
         }
         if (options.mode == Mode::Consensus && options.hasSolverOnlyOption)
             fail("consensus does not accept HiGHS labeling options");
-        if (options.mode == Mode::DirectionDiagnostic) {
+        if (options.mode == Mode::DirectionDiagnostic ||
+            options.mode == Mode::DirectionAblation) {
             if (options.hasHvOnlyOption)
-                fail("direction-diagnostic implies H/V-only labeling; omit --hv-only");
+                fail("direction diagnostics imply H/V-only labeling; omit --hv-only");
             if (options.labeling.relaxIntegrality ||
                 options.labeling.lpParallel ||
                 options.labeling.lpSolver != "choose" ||
                 options.labeling.exactPerpendicularMilp ||
                 options.labeling.excludeParallelSeparateWinding) {
-                fail("direction-diagnostic requires the ordinary discrete H/V-only MILP");
+                fail("direction diagnostics require the ordinary discrete H/V-only MILP");
             }
             options.labeling.hvOnly = true;
         }
@@ -386,6 +417,8 @@ Options parse(int argc, char** argv)
                              ? "_consensus"
                              : options.mode == Mode::DirectionDiagnostic
                                  ? "_direction_diagnostic"
+                                 : options.mode == Mode::DirectionAblation
+                                     ? "_direction_ablation"
                                  : "_constraints"));
         }
         options.constraints.parallelThreads = static_cast<std::size_t>(options.threads);
@@ -592,7 +625,7 @@ void printDirectionDiagnosticReport(
     const std::size_t pieces = comparison.rawH + comparison.rawV +
         comparison.rawBroken;
     const std::size_t errors = comparison.orientationErrors +
-        comparison.brokenErrors;
+        comparison.brokenErrors + comparison.defectActiveErrors;
     const double pieceErrorRate = pieces == 0
         ? 0.0
         : static_cast<double>(errors) / static_cast<double>(pieces);
@@ -630,9 +663,10 @@ void printDirectionDiagnosticReport(
                   << rate << '\n';
     }
     std::cout << "fiber direction MILP errors\n"
-              << "orientation_errors  broken_errors  total_errors  piece_error_rate  error_fibers  represented_fibers  fiber_error_rate\n"
+              << "orientation_errors  broken_errors  defect_active_errors  total_errors  piece_error_rate  error_fibers  represented_fibers  fiber_error_rate\n"
               << comparison.orientationErrors << "  "
-              << comparison.brokenErrors << "  " << errors << "  "
+              << comparison.brokenErrors << "  "
+              << comparison.defectActiveErrors << "  " << errors << "  "
               << std::fixed << std::setprecision(4) << pieceErrorRate << "  "
               << comparison.errorTraces << "  "
               << comparison.representedTraces << "  " << traceErrorRate << '\n'
@@ -654,6 +688,11 @@ void printDirectionDiagnosticReport(
         if (error.kind ==
             vc::fiber_tracer::FiberDirectionLabelErrorKind::Broken) {
             std::cout << "-  -  -  broken\n";
+        } else if (error.kind ==
+                   vc::fiber_tracer::FiberDirectionLabelErrorKind::DefectActive) {
+            std::cout << error.componentIndex << "  "
+                      << (error.componentFlipped ? "yes" : "no")
+                      << "  active  defect_active\n";
         } else {
             std::cout << error.componentIndex << "  "
                       << (error.componentFlipped ? "yes" : "no") << "  "
@@ -910,7 +949,8 @@ int main(int argc, char** argv)
         const auto options = parse(argc, argv);
         if (options.mode == Mode::Constraints ||
             options.mode == Mode::Consensus ||
-            options.mode == Mode::DirectionDiagnostic) {
+            options.mode == Mode::DirectionDiagnostic ||
+            options.mode == Mode::DirectionAblation) {
             const auto started = std::chrono::steady_clock::now();
             const auto cpuStarted = std::clock();
             const auto artifact =
@@ -938,7 +978,8 @@ int main(int argc, char** argv)
                 diagnosticClassification;
             const std::vector<vc::fiber_tracer::FiberletCropTraceLine>*
                 constraintLines = &artifact.lines;
-            if (options.mode == Mode::DirectionDiagnostic) {
+            if (options.mode == Mode::DirectionDiagnostic ||
+                options.mode == Mode::DirectionAblation) {
                 diagnosticClassification =
                     vc::fiber_tracer::classifyFiberletCropDirections(
                         artifact.lines, options.directionDominance);
@@ -951,6 +992,240 @@ int main(int argc, char** argv)
                 vc::fiber_tracer::writeFiberletCropDirectionObjs(
                     artifact.lines, *diagnosticClassification, initialOutput);
                 printDirectionReport(*diagnosticClassification, initialOutput);
+            }
+            if (options.mode == Mode::DirectionAblation) {
+                const auto candidates =
+                    vc::fiber_tracer::rankMixedFiberDirections(
+                        *diagnosticClassification);
+                const std::size_t admittedTarget = std::min(
+                    candidates.size(),
+                    options.ablationLimit.value_or(candidates.size()));
+                std::vector<unsigned char> admitted(
+                    artifact.lines.size(), 0);
+                std::vector<std::size_t> admittedCounts{0};
+                for (std::size_t count = options.ablationStep;
+                     count < admittedTarget;) {
+                    admittedCounts.push_back(count);
+                    if (count > admittedTarget - options.ablationStep)
+                        break;
+                    count += options.ablationStep;
+                }
+                if (admittedCounts.back() != admittedTarget)
+                    admittedCounts.push_back(admittedTarget);
+                std::cout
+                    << "fiber direction mixed ablation checkpoints="
+                    << admittedCounts.size()
+                    << " trusted_fibers="
+                    << diagnosticClassification->groupCounts[0] +
+                        diagnosticClassification->groupCounts[1]
+                    << " mixed_fibers=" << candidates.size()
+                    << " admitted_target=" << admittedTarget << '\n';
+                std::size_t admittedSoFar = 0;
+                for (std::size_t checkpoint = 0;
+                     checkpoint < admittedCounts.size();
+                     ++checkpoint) {
+                    const std::size_t admittedCount = admittedCounts[checkpoint];
+                    while (admittedSoFar < admittedCount) {
+                        admitted[candidates[admittedSoFar].lineIndex] = 1;
+                        ++admittedSoFar;
+                    }
+                    diagnosticLines.clear();
+                    diagnosticDirections.clear();
+                    std::vector<std::uint8_t> trustedMask;
+                    diagnosticLines.reserve(artifact.lines.size());
+                    diagnosticDirections.reserve(artifact.lines.size());
+                    trustedMask.reserve(artifact.lines.size());
+                    for (std::size_t trace = 0;
+                         trace < artifact.lines.size();
+                         ++trace) {
+                        const bool trusted =
+                            diagnosticClassification->lines[trace].group !=
+                            vc::fiber_tracer::FiberDirectionGroup::Mixed;
+                        if (!trusted && admitted[trace] == 0)
+                            continue;
+                        diagnosticLines.push_back(artifact.lines[trace]);
+                        diagnosticDirections.push_back(
+                            diagnosticClassification->lines[trace].group);
+                        trustedMask.push_back(trusted ? 1 : 0);
+                    }
+
+                    auto checkpointReport =
+                        vc::fiber_tracer::extractFiberTraceConstraints(
+                            diagnosticLines,
+                            options.constraints,
+                            [&normals](const cv::Vec3d& a,
+                                       const cv::Vec3d& b,
+                                       double step) {
+                                return normals.normalAlignedWindingDistance(
+                                    a, b, step);
+                            },
+                            [&normals](
+                                const std::vector<std::pair<
+                                    cv::Vec3d, cv::Vec3d>>& connectors,
+                                double step,
+                                int threads) {
+                                return normals.normalAlignedWindingDistancesBatch(
+                                    connectors, step, threads);
+                            });
+                    const auto extractedConstraints =
+                        checkpointReport.constraints;
+                    std::optional<
+                        vc::fiber_tracer::FiberTraceConstraintPruningReport>
+                        checkpointPruning;
+                    if (options.maximumConstraintsPerFiber) {
+                        auto pruning =
+                            vc::fiber_tracer::pruneFiberTraceConstraintsByStrength(
+                                checkpointReport,
+                                options.constraints.maximumDistanceBaseVoxels,
+                                *options.maximumConstraintsPerFiber);
+                        checkpointReport.constraints =
+                            std::move(pruning.constraints);
+                        checkpointPruning = std::move(pruning.report);
+                    }
+                    const auto checkpointLabeling =
+                        vc::fiber_tracer::solveFiberTraceLabels(
+                            checkpointReport, options.labeling);
+                    auto lpConfig = options.labeling;
+                    lpConfig.relaxIntegrality = true;
+                    const auto checkpointLp =
+                        vc::fiber_tracer::solveFiberTraceLabels(
+                            checkpointReport, lpConfig);
+                    const auto checkpointLpThresholded =
+                        vc::fiber_tracer::thresholdFiberTraceLabeling(
+                            checkpointLp);
+                    const auto comparison =
+                        vc::fiber_tracer::compareFiberDirectionLabels(
+                            checkpointReport,
+                            diagnosticDirections,
+                            checkpointLabeling,
+                            trustedMask);
+                    const auto lpComparison =
+                        vc::fiber_tracer::compareFiberDirectionLabels(
+                            checkpointReport,
+                            diagnosticDirections,
+                            checkpointLpThresholded,
+                            trustedMask);
+                    const auto cohortPieces = [](const auto& cohort) {
+                        return cohort.confusion[0].pieces +
+                            cohort.confusion[1].pieces +
+                            cohort.expectedDefectPieces;
+                    };
+                    const auto cohortErrors = [](const auto& cohort) {
+                        return cohort.orientationErrors + cohort.brokenErrors +
+                            cohort.defectActiveErrors;
+                    };
+                    std::cout << "fiber direction ablation checkpoint="
+                              << checkpoint
+                              << " admitted=" << admittedCount;
+                    if (admittedCount == 0) {
+                        std::cout << " latest_confidence=-";
+                    } else {
+                        const auto& latest = candidates[admittedCount - 1];
+                        std::cout << " latest_confidence=" << std::fixed
+                                  << std::setprecision(6) << latest.confidence
+                                  << " latest_original_trace="
+                                  << latest.lineIndex;
+                    }
+                    std::cout << " fibers=" << diagnosticLines.size()
+                              << " pieces=" << checkpointReport.pieces.size()
+                              << " constraints="
+                              << checkpointReport.constraints.size()
+                              << " milp_status="
+                              << checkpointLabeling.modelStatus
+                              << " milp_gap=" << std::setprecision(6)
+                              << checkpointLabeling.mipGap
+                              << " milp_solve_seconds="
+                              << checkpointLabeling.solveSeconds
+                              << " milp_objective="
+                              << checkpointLabeling.objective
+                              << " lp_status=" << checkpointLp.modelStatus
+                              << " lp_solve_seconds="
+                              << checkpointLp.solveSeconds
+                              << " lp_objective=" << checkpointLp.objective
+                              << '\n';
+                    const auto printErrors = [&](
+                                                 const char* solver,
+                                                 const auto& current) {
+                        const std::size_t allPieces = current.rawH +
+                            current.rawV + current.rawBroken;
+                        const std::size_t allErrors =
+                            current.orientationErrors + current.brokenErrors +
+                            current.defectActiveErrors;
+                        std::cout
+                            << "fiber direction ablation errors checkpoint="
+                            << checkpoint << " solver=" << solver
+                            << " raw_h=" << current.rawH
+                            << " raw_v=" << current.rawV
+                            << " raw_broken=" << current.rawBroken
+                            << " hv_orientation_errors="
+                            << current.trusted.orientationErrors
+                            << " hv_broken_errors="
+                            << current.trusted.brokenErrors
+                            << " hv_error_pieces="
+                            << cohortErrors(current.trusted) << '/'
+                            << cohortPieces(current.trusted)
+                            << " hv_error_fibers="
+                            << current.trusted.errorTraces << '/'
+                            << current.trusted.representedTraces
+                            << " mixed_active_errors="
+                            << current.admitted.defectActiveErrors
+                            << " mixed_broken_correct="
+                            << current.admitted.defectBrokenPieces << '/'
+                            << current.admitted.expectedDefectPieces
+                            << " mixed_error_pieces="
+                            << cohortErrors(current.admitted) << '/'
+                            << cohortPieces(current.admitted)
+                            << " mixed_error_fibers="
+                            << current.admitted.errorTraces << '/'
+                            << current.admitted.representedTraces
+                            << " all_pieces=" << allErrors << '/'
+                            << allPieces << " all_fibers="
+                            << current.errorTraces << '/'
+                            << current.representedTraces
+                            << " components=" << current.activeComponents
+                            << '\n';
+                    };
+                    printErrors("milp", comparison);
+                    printErrors("lp_threshold_0.5", lpComparison);
+                    std::cout << std::defaultfloat;
+
+                    if (checkpoint + 1 == admittedCounts.size()) {
+                        const auto objReport =
+                            vc::fiber_tracer::writeFiberTraceConstraintObjs(
+                                checkpointReport, options.output);
+                        const auto labelObjReport =
+                            vc::fiber_tracer::writeFiberTraceLabelObjs(
+                                checkpointReport,
+                                checkpointLabeling,
+                                options.output);
+                        const auto lpOutput = options.output.parent_path() /
+                            (options.output.stem().string() +
+                             "_lp_thresholded");
+                        const auto lpLabelObjReport =
+                            vc::fiber_tracer::writeFiberTraceLabelObjs(
+                                checkpointReport,
+                                checkpointLpThresholded,
+                                lpOutput);
+                        printConstraintObjReport(objReport);
+                        printLabelingReport(
+                            checkpointLabeling,
+                            options.labeling,
+                            labelObjReport);
+                        std::cout
+                            << "fiber direction ablation lp_thresholded_output="
+                            << lpLabelObjReport.paths.hEven.parent_path() /
+                                lpOutput.stem()
+                            << '\n';
+                        if (checkpointPruning)
+                            printConstraintPruningReport(*checkpointPruning);
+                        std::cout
+                            << "fiber direction ablation final_extracted_constraints="
+                            << extractedConstraints.size() << '\n';
+                    }
+                }
+                return 0;
+            }
+            if (options.mode == Mode::DirectionDiagnostic) {
                 diagnosticLines.reserve(artifact.lines.size());
                 diagnosticOriginalTraceIndices.reserve(artifact.lines.size());
                 diagnosticDirections.reserve(artifact.lines.size());

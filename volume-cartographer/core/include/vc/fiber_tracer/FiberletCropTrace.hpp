@@ -85,6 +85,14 @@ struct FiberDirectionClassification {
     double analyzedLengthBaseVoxels = 0.0;
 };
 
+struct FiberDirectionAblationCandidate {
+    std::size_t lineIndex = 0;
+    double confidence = 0.0;
+};
+
+[[nodiscard]] std::vector<FiberDirectionAblationCandidate>
+rankMixedFiberDirections(const FiberDirectionClassification& classification);
+
 struct FiberDirectionObjPaths {
     std::filesystem::path all;
     std::filesystem::path direction1;

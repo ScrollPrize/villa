@@ -688,6 +688,35 @@ TEST_CASE("Crop trace non-orthogonal direction supports are independent")
     CHECK(classified.lines[4].group == FiberDirectionGroup::Mixed);
 }
 
+TEST_CASE("Mixed fiber ablation ranking is stable and support based")
+{
+    FiberDirectionClassification classification;
+    classification.lines.resize(5);
+    classification.lines[0].group = FiberDirectionGroup::Direction1;
+    classification.lines[0].direction1SupportBaseVoxels = 10.0;
+    classification.lines[0].totalLengthBaseVoxels = 10.0;
+    classification.lines[1].direction1SupportBaseVoxels = 8.0;
+    classification.lines[1].direction2SupportBaseVoxels = 2.0;
+    classification.lines[1].totalLengthBaseVoxels = 10.0;
+    classification.lines[2].direction1SupportBaseVoxels = 1.0;
+    classification.lines[2].direction2SupportBaseVoxels = 8.0;
+    classification.lines[2].totalLengthBaseVoxels = 10.0;
+    classification.lines[3].direction1SupportBaseVoxels = 4.0;
+    classification.lines[3].direction2SupportBaseVoxels = 4.0;
+    classification.lines[3].totalLengthBaseVoxels = 5.0;
+    classification.groupCounts = {1, 0, 4};
+
+    const auto ranked = rankMixedFiberDirections(classification);
+    REQUIRE(ranked.size() == 4);
+    CHECK(ranked[0].lineIndex == 1);
+    CHECK(ranked[1].lineIndex == 2);
+    CHECK(ranked[2].lineIndex == 3);
+    CHECK(ranked[3].lineIndex == 4);
+    CHECK(ranked[0].confidence == doctest::Approx(0.8));
+    CHECK(ranked[2].confidence == doctest::Approx(0.8));
+    CHECK(ranked[3].confidence == doctest::Approx(0.0));
+}
+
 TEST_CASE("Crop trace direction support handles collapsed fitted axes")
 {
     FiberletCropTraceLine forward;
@@ -1862,6 +1891,11 @@ TEST_CASE("Direction label comparison aligns components and reports errors")
     CHECK(comparison.errorTraces == 2);
     CHECK(comparison.orientationErrors == 1);
     CHECK(comparison.brokenErrors == 1);
+    CHECK(comparison.trusted.representedTraces == 4);
+    CHECK(comparison.trusted.errorTraces == 2);
+    CHECK(comparison.trusted.orientationErrors == 1);
+    CHECK(comparison.trusted.brokenErrors == 1);
+    CHECK(comparison.admitted.representedTraces == 0);
     CHECK(comparison.confusion[0].pieces == 4);
     CHECK(comparison.confusion[0].alignedDirection1 == 3);
     CHECK(comparison.confusion[0].alignedDirection2 == 0);
@@ -1919,6 +1953,78 @@ TEST_CASE("Direction label comparison validates discrete retained directions")
     CHECK_THROWS_WITH_AS(
         compareFiberDirectionLabels(constraints, std::span<const FiberDirectionGroup>{}, labeling),
         doctest::Contains("trace count"),
+        std::invalid_argument);
+}
+
+TEST_CASE("Direction label comparison uses trusted references for gauge")
+{
+    FiberTraceConstraintReport constraints;
+    constraints.inputTraces = 3;
+    constraints.pieces.resize(3);
+    for (std::size_t piece = 0; piece < constraints.pieces.size(); ++piece)
+        constraints.pieces[piece].traceIndex = piece;
+    FiberTraceConstraint connected;
+    connected.pieceA = 0;
+    connected.pieceB = 1;
+    constraints.constraints.push_back(connected);
+
+    const std::array directions{
+        FiberDirectionGroup::Direction1,
+        FiberDirectionGroup::Mixed,
+        FiberDirectionGroup::Mixed,
+    };
+    const std::array<std::uint8_t, 3> trusted{1, 0, 0};
+    FiberTraceLabelingReport labeling;
+    labeling.labels = {
+        FiberTracePieceLabel::HEven,
+        FiberTracePieceLabel::VEven,
+        FiberTracePieceLabel::Broken,
+    };
+
+    const auto comparison = compareFiberDirectionLabels(
+        constraints, directions, labeling, trusted);
+    CHECK(comparison.activeComponents == 1);
+    CHECK(comparison.flippedComponents == 0);
+    CHECK(comparison.trusted.representedTraces == 1);
+    CHECK(comparison.trusted.errorTraces == 0);
+    CHECK(comparison.trusted.orientationErrors == 0);
+    CHECK(comparison.admitted.representedTraces == 2);
+    CHECK(comparison.admitted.errorTraces == 1);
+    CHECK(comparison.admitted.orientationErrors == 0);
+    CHECK(comparison.admitted.expectedDefectPieces == 2);
+    CHECK(comparison.admitted.defectBrokenPieces == 1);
+    CHECK(comparison.admitted.defectActiveErrors == 1);
+    CHECK(comparison.errorTraces == 1);
+    REQUIRE(comparison.errors.size() == 1);
+    CHECK_FALSE(comparison.errors[0].trustedReference);
+    CHECK(comparison.errors[0].kind ==
+          FiberDirectionLabelErrorKind::DefectActive);
+
+    const std::array<std::uint8_t, 2> wrongMask{1, 0};
+    CHECK_THROWS_WITH_AS(
+        compareFiberDirectionLabels(
+            constraints, directions, labeling, wrongMask),
+        doctest::Contains("trusted mask"),
+        std::invalid_argument);
+}
+
+TEST_CASE("Continuous H/V labeling thresholds to discrete defects")
+{
+    FiberTraceLabelingReport continuous;
+    continuous.continuousPieceValues = true;
+    continuous.activeValues = {0.49, 0.5, 1.0};
+    continuous.verticalValues = {0.0, 0.49, 0.5};
+    const auto discrete = thresholdFiberTraceLabeling(continuous);
+    CHECK_FALSE(discrete.continuousPieceValues);
+    REQUIRE(discrete.labels.size() == 3);
+    CHECK(discrete.labels[0] == FiberTracePieceLabel::Broken);
+    CHECK(discrete.labels[1] == FiberTracePieceLabel::HEven);
+    CHECK(discrete.labels[2] == FiberTracePieceLabel::VEven);
+    CHECK(discrete.labelCounts ==
+          std::array<std::size_t, 5>{1, 0, 1, 0, 1});
+    CHECK_THROWS_WITH_AS(
+        thresholdFiberTraceLabeling(continuous, 1.1),
+        doctest::Contains("thresholds"),
         std::invalid_argument);
 }
 

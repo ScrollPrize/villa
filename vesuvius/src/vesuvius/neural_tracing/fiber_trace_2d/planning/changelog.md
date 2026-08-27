@@ -1437,3 +1437,9 @@
   direction groups before canonical constraint extraction and discrete
   H/V-only MILP solving, then reports component-gauge-aligned orientation and
   broken-label errors against the initial direction assignment.
+- Added `direction-ablation`, which cumulatively admits Mixed fibers by gradual
+  direction confidence, independently rebuilds and solves coarse checkpoints,
+  and reports H/V versus mixed-defect errors for both the discrete MILP and its
+  thresholded LP relaxation under a trusted-only component gauge.
+- Added a ranked-prefix admission limit for fast, repeatable broken-cost
+  ablation sweeps.

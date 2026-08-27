@@ -82,6 +82,7 @@ struct FiberTraceRelaxationObjReport {
 enum class FiberDirectionLabelErrorKind : unsigned char {
     Orientation,
     Broken,
+    DefectActive,
 };
 
 struct FiberDirectionLabelError {
@@ -95,6 +96,7 @@ struct FiberDirectionLabelError {
     FiberDirectionGroup alignedDirection = FiberDirectionGroup::Mixed;
     std::size_t componentIndex = 0;
     bool componentFlipped = false;
+    bool trustedReference = true;
     FiberDirectionLabelErrorKind kind =
         FiberDirectionLabelErrorKind::Orientation;
 };
@@ -105,6 +107,17 @@ struct FiberDirectionLabelConfusionRow {
     std::size_t alignedDirection2 = 0;
     std::size_t broken = 0;
     std::size_t errors = 0;
+};
+
+struct FiberDirectionLabelCohortReport {
+    std::array<FiberDirectionLabelConfusionRow, 2> confusion{};
+    std::size_t representedTraces = 0;
+    std::size_t errorTraces = 0;
+    std::size_t orientationErrors = 0;
+    std::size_t brokenErrors = 0;
+    std::size_t expectedDefectPieces = 0;
+    std::size_t defectBrokenPieces = 0;
+    std::size_t defectActiveErrors = 0;
 };
 
 struct FiberDirectionLabelComparisonReport {
@@ -118,6 +131,11 @@ struct FiberDirectionLabelComparisonReport {
     std::size_t errorTraces = 0;
     std::size_t orientationErrors = 0;
     std::size_t brokenErrors = 0;
+    std::size_t expectedDefectPieces = 0;
+    std::size_t defectBrokenPieces = 0;
+    std::size_t defectActiveErrors = 0;
+    FiberDirectionLabelCohortReport trusted;
+    FiberDirectionLabelCohortReport admitted;
     std::vector<FiberDirectionLabelError> errors;
 };
 
@@ -125,10 +143,16 @@ struct FiberDirectionLabelComparisonReport {
     const FiberTraceConstraintReport& constraints,
     const FiberTraceLabelingConfig& config = {});
 
+[[nodiscard]] FiberTraceLabelingReport thresholdFiberTraceLabeling(
+    const FiberTraceLabelingReport& continuous,
+    double activeThreshold = 0.5,
+    double verticalThreshold = 0.5);
+
 [[nodiscard]] FiberDirectionLabelComparisonReport compareFiberDirectionLabels(
     const FiberTraceConstraintReport& constraints,
     std::span<const FiberDirectionGroup> traceDirections,
-    const FiberTraceLabelingReport& labeling);
+    const FiberTraceLabelingReport& labeling,
+    std::span<const std::uint8_t> trustedTraceMask = {});
 
 [[nodiscard]] FiberTraceLabelObjPaths fiberTraceLabelObjPaths(
     const std::filesystem::path& outputBase);

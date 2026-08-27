@@ -1040,6 +1040,45 @@ FiberDirectionClassification classifyFiberletCropDirections(
     return result;
 }
 
+std::vector<FiberDirectionAblationCandidate> rankMixedFiberDirections(
+    const FiberDirectionClassification& classification)
+{
+    std::vector<FiberDirectionAblationCandidate> result;
+    result.reserve(classification.groupCounts[groupIndex(
+        FiberDirectionGroup::Mixed)]);
+    for (std::size_t lineIndex = 0;
+         lineIndex < classification.lines.size();
+         ++lineIndex) {
+        const auto& line = classification.lines[lineIndex];
+        if (line.group != FiberDirectionGroup::Mixed)
+            continue;
+        if (!std::isfinite(line.direction1SupportBaseVoxels) ||
+            !std::isfinite(line.direction2SupportBaseVoxels) ||
+            !std::isfinite(line.totalLengthBaseVoxels) ||
+            line.direction1SupportBaseVoxels < 0.0 ||
+            line.direction2SupportBaseVoxels < 0.0 ||
+            line.totalLengthBaseVoxels < 0.0) {
+            throw std::invalid_argument(
+                "Fiber direction ablation requires finite non-negative support");
+        }
+        const double confidence = line.totalLengthBaseVoxels > kEpsilon
+            ? std::max(
+                  line.direction1SupportBaseVoxels,
+                  line.direction2SupportBaseVoxels) /
+                line.totalLengthBaseVoxels
+            : 0.0;
+        result.push_back({lineIndex, confidence});
+    }
+    std::sort(
+        result.begin(), result.end(),
+        [](const auto& a, const auto& b) {
+            if (a.confidence != b.confidence)
+                return a.confidence > b.confidence;
+            return a.lineIndex < b.lineIndex;
+        });
+    return result;
+}
+
 FiberDirectionObjPaths fiberDirectionObjPaths(
     const std::filesystem::path& allOutputPath)
 {
