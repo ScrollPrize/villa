@@ -36,6 +36,7 @@ constexpr std::size_t kDirectionSeedCount = 8;
 constexpr int kDirectionFitIterations = 32;
 constexpr double kDirectionFitTolerance = 1.0e-12;
 constexpr double kDirectionAxisSeparationEpsilon = 1.0e-8;
+constexpr double kProbabilityRoundoffTolerance = 1.0e-12;
 
 double length(const cv::Vec3d& value)
 {
@@ -1361,11 +1362,18 @@ FiberValueBands classifyFiberValues(std::span<const double> values)
     FiberValueBands result;
     std::array<double, 10> sums{};
     for (std::size_t index = 0; index < values.size(); ++index) {
-        const double value = values[index];
-        if (!std::isfinite(value) || value < 0.0 || value > 1.0) {
-            throw std::invalid_argument(
-                "Fiber value bands require finite values in [0, 1]");
+        const double input = values[index];
+        if (!std::isfinite(input) ||
+            input < -kProbabilityRoundoffTolerance ||
+            input > 1.0 + kProbabilityRoundoffTolerance) {
+            std::ostringstream message;
+            message << std::setprecision(17)
+                    << "Fiber value band input " << index
+                    << " must be finite and in [0, 1] up to roundoff; value="
+                    << input;
+            throw std::invalid_argument(message.str());
         }
+        const double value = std::clamp(input, 0.0, 1.0);
         const std::size_t band = std::min<std::size_t>(
             9, static_cast<std::size_t>(std::floor(value * 10.0)));
         auto& current = result.bands[band];

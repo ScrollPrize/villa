@@ -5,11 +5,49 @@
 #include <cstddef>
 #include <functional>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
 namespace vc::fiber_tracer
 {
+
+enum class FiberTraceWindingSolver : unsigned char {
+    JointGrid,
+    Alternating,
+};
+
+[[nodiscard]] const char* fiberTraceWindingSolverName(
+    FiberTraceWindingSolver solver) noexcept;
+
+enum class FiberTraceWindingOrientationMode : unsigned char {
+    Joint,
+    FixedPrepass,
+};
+
+[[nodiscard]] const char* fiberTraceWindingOrientationModeName(
+    FiberTraceWindingOrientationMode mode) noexcept;
+
+enum class FiberTraceFixedOrientation : unsigned char {
+    Horizontal,
+    Mixed,
+    Vertical,
+};
+
+[[nodiscard]] const char* fiberTraceFixedOrientationName(
+    FiberTraceFixedOrientation orientation) noexcept;
+
+[[nodiscard]] std::vector<FiberTraceFixedOrientation>
+fixedFiberTraceOrientations(
+    const FiberTraceBeliefPropagationReport& orientationBeliefs);
+
+enum class FiberTraceWindingCalibrationMode : unsigned char {
+    Adaptive,
+    Fixed,
+};
+
+[[nodiscard]] const char* fiberTraceWindingCalibrationModeName(
+    FiberTraceWindingCalibrationMode mode) noexcept;
 
 struct FiberTraceWindingBeliefPropagationConfig {
     double temperature = 0.25;
@@ -27,6 +65,56 @@ struct FiberTraceInterleavedWindingConfig : FiberTraceWindingBeliefPropagationCo
     double calibrationTolerance = 1.0e-4;
     std::size_t maximumCalibrationIterations = 8;
 };
+
+struct FiberTraceJointGridWindingConfig : FiberTraceWindingBeliefPropagationConfig {
+    double mixedUnaryCost = 0.5;
+    double orientationTemperature = 0.25;
+    std::optional<double> fixedPhaseMagnitude;
+    std::optional<double> fixedMeasurementScale;
+    double logGainStep = 0.09531017980432486;
+    double calibrationBoundaryProbabilityThreshold = 0.25;
+    double calibrationDiscardProbabilityThreshold = 0.001;
+    double calibrationPosteriorTolerance = 1.0e-6;
+    std::size_t initialGainCells = 5;
+    std::size_t phaseCells = 6;
+    std::size_t maximumGainCells = 17;
+    std::size_t maximumGridShifts = 32;
+    std::size_t stableIterations = 3;
+};
+
+enum class FiberTraceJointGridProgressPhase {
+    Preparing,
+    MessagePassing,
+    SupportChanged,
+    Complete,
+};
+
+struct FiberTraceJointGridProgress {
+    FiberTraceJointGridProgressPhase phase =
+        FiberTraceJointGridProgressPhase::Preparing;
+    FiberTraceWindingCalibrationMode calibrationMode =
+        FiberTraceWindingCalibrationMode::Adaptive;
+    std::size_t messageIteration = 0;
+    std::size_t maximumMessageIterations = 0;
+    std::size_t candidateStates = 0;
+    std::size_t gainCells = 0;
+    std::size_t phaseCells = 0;
+    std::size_t gridShifts = 0;
+    double messageResidual = 0.0;
+    double calibrationPosteriorResidual = 0.0;
+    double phaseMap = 0.0;
+    double phaseMean = 0.0;
+    double scaleMap = 1.0;
+    double scaleMean = 1.0;
+    double lowerGainBoundaryProbability = 0.0;
+    double upperGainBoundaryProbability = 0.0;
+    double minimumGain = 1.0;
+    double maximumGain = 1.0;
+    double elapsedSeconds = 0.0;
+};
+
+using FiberTraceJointGridProgressCallback =
+    std::function<void(const FiberTraceJointGridProgress&)>;
 
 enum class FiberTraceInterleavedWindingProgressPhase {
     Preparing,
@@ -106,9 +194,25 @@ struct FiberTraceInterleavedWindingReport : FiberTraceWindingBeliefPropagationRe
     std::vector<double> classBProbability;
     std::vector<double> posteriorMeanLatentCoordinate;
     std::vector<int> componentPhaseSign;
+    std::vector<double> componentPositivePhaseSignProbability;
+    std::vector<FiberTraceFixedOrientation> fixedOrientationByPiece;
+    FiberTraceWindingSolver solver = FiberTraceWindingSolver::Alternating;
+    FiberTraceWindingOrientationMode orientationMode =
+        FiberTraceWindingOrientationMode::Joint;
+    FiberTraceWindingCalibrationMode calibrationMode =
+        FiberTraceWindingCalibrationMode::Adaptive;
     double phaseMagnitude = 0.0;
     double measurementScale = 1.0;
+    double calibrationPhaseMean = 0.0;
+    double calibrationScaleMean = 1.0;
+    double calibrationEntropy = 0.0;
+    double lowerGainBoundaryProbability = 0.0;
+    double upperGainBoundaryProbability = 0.0;
+    double minimumCalibrationGain = 1.0;
+    double maximumCalibrationGain = 1.0;
     double decodedEnergy = 0.0;
+    std::size_t calibrationGridCells = 0;
+    std::size_t calibrationGridShifts = 0;
     std::size_t calibrationIterations = 0;
     std::size_t selectedInitialization = 0;
     std::size_t rankDeficientUpdates = 0;
@@ -127,6 +231,15 @@ solveFiberTraceInterleavedWindingBeliefPropagation(
     const FiberTraceBeliefTopology& topology,
     const FiberTraceBeliefPropagationReport& orientationBeliefs,
     const FiberTraceInterleavedWindingConfig& config = {},
-    const FiberTraceInterleavedWindingProgressCallback& progress = {});
+    const FiberTraceInterleavedWindingProgressCallback& progress = {},
+    std::span<const FiberTraceFixedOrientation> fixedOrientations = {});
+
+[[nodiscard]] FiberTraceInterleavedWindingReport
+solveFiberTraceJointGridWindingBeliefPropagation(
+    const FiberTraceConstraintReport& constraints,
+    const FiberTraceBeliefTopology& topology,
+    const FiberTraceJointGridWindingConfig& config = {},
+    const FiberTraceJointGridProgressCallback& progress = {},
+    std::span<const FiberTraceFixedOrientation> fixedOrientations = {});
 
 }  // namespace vc::fiber_tracer

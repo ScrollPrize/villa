@@ -834,14 +834,46 @@ component. Otherwise the H/V constraint remains valid but contributes no
 perpendicular winding evidence. A connected winding graph that would combine
 signed evidence from independently gauged normal components is rejected.
 
-For `sum-product-mixed`, the established V/Mixed/H solver runs first and its
-normalized piece marginals become soft priors for winding inference. Winding
-then refines the joint state `(class,k)` without charging the orientation
-factors or Mixed unary a second time. Every split piece remains a distinct
-variable. Same-trace continuity contributes its existing parallel-score-1,
-zero-difference factor, so other evidence can override it at the corresponding
-cost. The orientation stage uses `--bp-temperature`; the winding stage reports
-and uses its separate default temperature `0.25`.
+For `sum-product-mixed`, `--winding-solver joint-grid` is the default. It runs
+one inference over `(H|Mixed|V,k)`, the global calibration grid, and one local
+ladder-order sign per connected component. It does not run the earlier
+orientation BP first and does not repair labels afterward. The alternative
+`--winding-solver alternating` retains the established orientation pre-pass,
+multi-start calibration, and numerical behavior for direct comparison.
+
+Either solver can instead freeze orientation before winding:
+
+```bash
+volume-cartographer/build/bin/vc_fiber_trace_chunk direction-ablation crop_traces.zarr --normal-manifest normals.lasagna.json --output crop_bp_fixed_orientation --bp-only --bp-inference sum-product-mixed --winding-fixed-orientation
+volume-cartographer/build/bin/vc_fiber_trace_chunk direction-ablation crop_traces.zarr --normal-manifest normals.lasagna.json --output crop_bp_fixed_orientation_alternating --bp-only --bp-inference sum-product-mixed --winding-solver alternating --winding-fixed-orientation
+```
+
+`--winding-fixed-orientation` runs the ordinary H/V/Mixed sum-product BP first.
+Each piece's unique MAP class is then fixed; an exact class tie becomes Mixed.
+The winding solver stores only integer winding candidates for pieces, not three
+impossible orientation variants, so the winding phase is also substantially
+smaller. The chosen backend still controls phase/scale calibration, component
+sign, integer-support expansion, and winding factor evaluation. A fixed Mixed
+piece retains the existing normalized four-substitution winding potential, but
+the substitutions are evaluated inside the factor and are not solver states.
+The consistency CSV preserves the soft pre-pass `p_v`, `p_mixed`, and `p_h`
+columns and adds `winding_orientation_mode` plus
+`winding_fixed_orientation` so the hard class used by winding is explicit.
+
+```bash
+volume-cartographer/build/bin/vc_fiber_trace_chunk direction-ablation crop_traces.zarr --normal-manifest normals.lasagna.json --output crop_bp --bp-only --bp-inference sum-product-mixed
+volume-cartographer/build/bin/vc_fiber_trace_chunk direction-ablation crop_traces.zarr --normal-manifest normals.lasagna.json --output crop_bp_alternating --bp-only --bp-inference sum-product-mixed --winding-solver alternating
+```
+
+In joint-grid mode, a non-Mixed pair factor charges orientation and winding
+evidence once. Orientation and the Mixed unary retain `--bp-temperature`;
+winding retains its established temperature `0.25`. A Mixed endpoint removes
+the visible orientation preference and uses the normalized four-substitution
+winding potential. Consequently, Mixed-cost tuning from the alternating model
+is not expected to produce identical posteriors in the joint model. Every split
+piece remains a distinct variable. Same-trace continuity contributes its
+existing parallel-score-1, zero-difference factor, so other evidence can
+override it at the corresponding cost.
 
 The two oriented classes occupy interleaved integer lattices. Local class A is
 at `k`; local class B is at `k + sign*phase`, where `k` is integer, phase is in
@@ -851,7 +883,15 @@ components are not observable. A Mixed endpoint marginalizes the four latent
 A/B endpoint substitutions with a normalized average, retaining winding
 connectivity without transmitting a visible orientation preference.
 
-For latent difference `delta`, a measurement contributes:
+For latent difference `delta`, a joint-grid measurement contributes:
+
+```text
+parallel * abs(delta)
+    + perpendicular * abs(gain * delta - signed_target)
+```
+
+where `gain=1/measurement_scale`. In alternating mode the equivalent stored
+parameterization is:
 
 ```text
 parallel * abs(delta)
@@ -867,33 +907,63 @@ not increase. Rank-deficient evidence retains the previous parameters.
 Deterministic phase/scale starts are ranked by the complete decoded assignment
 score.
 
-The command prints live progress while this nested solve runs. It first marks
-the orientation BP stage, then reports the interleaved initialization out of
-four, calibration round, adaptive-support round, current message iteration,
-accumulated message iterations, candidate-state count, residual, phase/scale,
-and elapsed time. Repeated message updates are limited to roughly one line per
-second; calibration, initialization completion, and final completion are
-always printed. There is intentionally no percentage: message convergence can
-stop early, candidate support can expand and restart BP, and iteration cost
-changes with state count. After the first calibration, `eta_est` extrapolates
-mean calibration duration across the maximum remaining slots and reports
-`eta_basis=calibration_max`. After the first complete initialization, it
-switches to mean initialization duration and reports
-`eta_basis=initialization`. Both are empirical estimates, not upper bounds.
-Library callers can pass the optional progress callback to receive every event
-synchronously; callback exceptions propagate to the caller.
+Joint-grid progress reports one coherent warm-started lifecycle: message
+iteration/residual, calibration-posterior residual, candidate-state count,
+gain/phase grid size, shifts, MAP and posterior-mean phase/scale, gain-boundary
+mass, absolute gain bounds, and elapsed time. Support-change and terminal events
+are always printed; ordinary messages are throttled to roughly once per second.
+There is no initialization or calibration-pass counter because calibration
+cells are simultaneous states of one model. Alternating mode retains the older
+orientation, initialization, calibration, and empirical ETA progress stream.
+Library callbacks are synchronous and observational in both modes.
 
-A continuous weighted least-squares solve initializes integer support and fixes
-the crop-central variable of every connected component to zero. Integer
-sum-product BP expands support and cold-restarts whenever MAP or posterior mass
-reaches a boundary; the only limit is an explicit total-state resource guard.
+A continuous weighted least-squares solve only centers conservative integer
+support. Joint-grid fixes the crop-central state of every connected component
+to `(A,0)`, shares one crop-global calibration posterior across components, and
+retains messages when settled boundary pressure expands integer support or
+moves the absolute log-gain window. Resource and shift guards fail explicitly;
+there is no automatic fallback to alternating.
+
+The joint calibration controls are:
+
+```text
+--winding-gain-cells N
+--winding-phase-cells N
+--winding-log-gain-step F
+--winding-boundary F
+--winding-max-gain-cells N
+--winding-max-shifts N
+```
+
+Defaults are 5 gain cells, 6 phase cells, `log(1.1)` log-gain spacing, 0.25
+boundary pressure, 17 maximum gain cells, and 32 one-cell shifts. Phase always
+spans the canonical `[0,0.5]` interval.
+
+Calibration can instead be disabled and hardcoded:
+
+```text
+--winding-fixed-phase 0.5 --winding-fixed-scale 1.0
+```
+
+Both flags are required together. Phase must be finite and in `[0,0.5]`; scale
+must be finite and positive. Fixed flags cannot be combined with explicitly
+supplied adaptive-grid controls or `--winding-solver alternating`. Fixed mode
+uses the same joint H/V/Mixed, integer-winding, and component-sign model, but
+the supplied values are scalar factor parameters: there is no latent
+calibration variable, calibration message, posterior, or gain-window update.
+Adaptive integer support remains active. Progress, console summaries, and the
+consistency CSV identify calibration as `fixed`; the exact supplied scale is
+retained for reporting rather than reconstructed from reciprocal gain.
 
 The ordinary BP consistency CSV includes continuous winding, integer MAP,
 posterior mean, MAP probability, entropy, candidate bounds, component, and
 incident signed/skipped counts. `<base>_winding_factors.csv` records
 canonicalized factors, raw signed targets, and selected scale-calibrated latent
 targets. The consistency CSV additionally records posterior latent coordinate,
-phase, scale, and component phase sign. The solver's arbitrary zero-centered
+phase, scale, component phase sign, solver and calibration modes, calibration
+posterior means,
+and the component-sign posterior when available. The solver's arbitrary
+zero-centered
 relative MAP labels are shifted by the global minimum for publication, so the
 OBJ groups are consecutively numbered `<base>_w_0.obj`, `_w_1.obj`, and so on.
 The consistency CSV records both `winding_relative_map` and `winding_output`.

@@ -1,3 +1,19 @@
+# 2026-08-27: winding BP modes
+
+- Added a shared fixed-prepass orientation mode for both winding solvers which
+  freezes the initial H/V/Mixed MAP and removes orientation from subsequent
+  piece-state and message dimensions.
+- Added a calibration-free joint winding mode selected by an explicit fixed
+  phase and scale, removing calibration states/messages while retaining joint
+  H/V/Mixed, integer-support, and component-sign inference.
+- Added strict CLI validation and fixed/adaptive provenance in progress,
+  reports, console summaries, and consistency CSV output.
+- Made probability-band visualization clamp only roundoff-sized endpoint
+  excursions while reporting the exact index/value for genuinely invalid data.
+- Normalized the joint-grid solver's accumulated H/Mixed/V class marginals and
+  centralized the CLI's checked orientation projection so all downstream
+  diagnostics receive a finite value in `[0,1]`.
+
 # 2026-08-27: winding fiber Napari viewer
 
 - Added a strict per-winding H/V/Broken OBJ viewer with stable bright layer
@@ -1546,3 +1562,17 @@
   calibration in raw Lasagna-integral units.
 - Added joint class/winding CSV diagnostics and consecutive per-winding OBJ
   layers while retaining independent winding inference for other BP modes.
+
+## 2026-08-27 - Joint adaptive-grid winding BP
+
+- Added a default single-pass `joint-grid` solver over H/Mixed/V, integer
+  winding, crop-global phase/scale calibration, and component-local ladder
+  signs without an orientation pre-pass or post-fit.
+- Added an absolute sliding log-gain grid with warm message retention, settled
+  posterior support changes, explicit resource/shift guards, joint progress,
+  and calibration provenance in the existing CSV/report path.
+- Retained the previous multi-start implementation as explicit
+  `--winding-solver alternating` comparison mode with unchanged defaults.
+- Added exact tiny-factor marginal validation, shared-calibration disconnected
+  component coverage, configuration failures, and a measured 384-crop
+  comparison.

@@ -5,6 +5,7 @@
 #include "vc/fiber_tracer/FiberTraceWindingBeliefPropagation.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <vector>
 
 namespace
@@ -85,6 +86,27 @@ FiberTraceBeliefPropagationReport orientationBeliefs(
         result.verticalProbability.push_back(probability[2]);
     }
     return result;
+}
+
+TEST_CASE("Fixed winding orientations use MAP and convert ties to Mixed")
+{
+    const auto fixed = fixedFiberTraceOrientations(orientationBeliefs({
+        {0.8, 0.1, 0.1},
+        {0.1, 0.8, 0.1},
+        {0.1, 0.2, 0.7},
+        {0.5, 0.0, 0.5},
+        {0.3, 0.3, 0.3},
+    }));
+    CHECK(fixed == std::vector<FiberTraceFixedOrientation>{
+        FiberTraceFixedOrientation::Horizontal,
+        FiberTraceFixedOrientation::Mixed,
+        FiberTraceFixedOrientation::Vertical,
+        FiberTraceFixedOrientation::Mixed,
+        FiberTraceFixedOrientation::Mixed,
+    });
+    CHECK_THROWS_AS(
+        fixedFiberTraceOrientations(orientationBeliefs({})),
+        std::invalid_argument);
 }
 
 TEST_CASE("Two-stage winding BP recovers signed chains and canonical reversal")
@@ -285,6 +307,467 @@ TEST_CASE("Interleaved winding calibrates complementary fractional crossings")
     CHECK(withoutProgress.classBProbability == solved.classBProbability);
     CHECK(withoutProgress.phaseMagnitude == solved.phaseMagnitude);
     CHECK(withoutProgress.measurementScale == solved.measurementScale);
+}
+
+TEST_CASE("Alternating fixed-prepass winding has no orientation state dimension")
+{
+    const auto source = lines(2);
+    auto report = pieces(source.size());
+    addMeasured(report, 0, 1, 0.0, 0.4);
+    FiberTraceInterleavedWindingConfig joint;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(joint) = config();
+    joint.maximumCalibrationIterations = 2;
+    const std::vector fixed{
+        FiberTraceFixedOrientation::Vertical,
+        FiberTraceFixedOrientation::Mixed,
+    };
+    const auto solved = solveFiberTraceInterleavedWindingBeliefPropagation(
+        report,
+        topology(source, report),
+        orientationBeliefs({
+            {0.9, 0.05, 0.05},
+            {0.9, 0.05, 0.05},
+        }),
+        joint,
+        {},
+        fixed);
+
+    CHECK(solved.orientationMode ==
+        FiberTraceWindingOrientationMode::FixedPrepass);
+    CHECK(solved.fixedOrientationByPiece == fixed);
+    CHECK(solved.classBProbability[0] == doctest::Approx(1.0));
+    CHECK(solved.mixedProbability[1] == doctest::Approx(1.0));
+    CHECK(solved.classAProbability[0] == doctest::Approx(0.0));
+    CHECK(solved.classAProbability[1] == doctest::Approx(0.0));
+    std::size_t integerStates = 0;
+    for (std::size_t piece = 0; piece < source.size(); ++piece) {
+        integerStates += static_cast<std::size_t>(
+            solved.candidateMaximum[piece] -
+            solved.candidateMinimum[piece] + 1);
+    }
+    CHECK(solved.totalCandidateStates == integerStates);
+    CHECK_THROWS_WITH_AS(
+        solveFiberTraceInterleavedWindingBeliefPropagation(
+            report,
+            topology(source, report),
+            orientationBeliefs({
+                {0.9, 0.05, 0.05},
+                {0.9, 0.05, 0.05},
+            }),
+            joint,
+            {},
+            std::vector{FiberTraceFixedOrientation::Horizontal}),
+        doctest::Contains("do not match"),
+        std::invalid_argument);
+}
+
+TEST_CASE("Joint-grid winding jointly resolves orientation and calibration")
+{
+    const auto source = lines(3);
+    auto report = pieces(source.size());
+    addMeasured(report, 0, 1, 0.0, 0.32);
+    addMeasured(report, 1, 2, 0.0, 0.48);
+
+    FiberTraceJointGridWindingConfig joint;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(joint) = config();
+    joint.temperature = 0.05;
+    joint.mixedUnaryCost = 1.0;
+    joint.initialGainCells = 5;
+    joint.phaseCells = 6;
+    joint.maximumGainCells = 11;
+    joint.maximumGridShifts = 8;
+    joint.stableIterations = 2;
+    joint.calibrationBoundaryProbabilityThreshold = 0.25;
+    joint.calibrationDiscardProbabilityThreshold = 0.01;
+    std::vector<FiberTraceJointGridProgress> progress;
+    const auto solved = solveFiberTraceJointGridWindingBeliefPropagation(
+        report,
+        topology(source, report),
+        joint,
+        [&](const FiberTraceJointGridProgress& event) {
+            progress.push_back(event);
+        });
+
+    CHECK(solved.solver == FiberTraceWindingSolver::JointGrid);
+    CHECK(solved.status == "converged");
+    CHECK(solved.mapWinding == std::vector<int>{0, 0, 1});
+    CHECK(solved.classAProbability[0] > 0.99);
+    CHECK(solved.classBProbability[1] > 0.9);
+    CHECK(solved.classAProbability[2] > 0.9);
+    CHECK(solved.phaseMagnitude == doctest::Approx(0.4).epsilon(0.15));
+    CHECK(solved.measurementScale == doctest::Approx(1.25).epsilon(0.15));
+    CHECK(solved.calibrationGridCells >
+        joint.initialGainCells * joint.phaseCells);
+    REQUIRE_FALSE(progress.empty());
+    CHECK(progress.front().phase == FiberTraceJointGridProgressPhase::Preparing);
+    CHECK(progress.back().phase == FiberTraceJointGridProgressPhase::Complete);
+}
+
+TEST_CASE("Joint-grid fixed-prepass winding has no orientation state dimension")
+{
+    const auto source = lines(2);
+    auto report = pieces(source.size());
+    addMeasured(report, 0, 1, 0.0, 0.4);
+    FiberTraceJointGridWindingConfig joint;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(joint) = config();
+    joint.fixedPhaseMagnitude = 0.5;
+    joint.fixedMeasurementScale = 1.0;
+    joint.stableIterations = 1;
+    const std::vector fixed{
+        FiberTraceFixedOrientation::Vertical,
+        FiberTraceFixedOrientation::Mixed,
+    };
+    const auto solved = solveFiberTraceJointGridWindingBeliefPropagation(
+        report,
+        topology(source, report),
+        joint,
+        {},
+        fixed);
+
+    CHECK(solved.orientationMode ==
+        FiberTraceWindingOrientationMode::FixedPrepass);
+    CHECK(solved.fixedOrientationByPiece == fixed);
+    CHECK(solved.classBProbability[0] == doctest::Approx(1.0));
+    CHECK(solved.mixedProbability[1] == doctest::Approx(1.0));
+    CHECK(solved.classAProbability[0] == doctest::Approx(0.0));
+    CHECK(solved.classAProbability[1] == doctest::Approx(0.0));
+    std::size_t integerStates = 0;
+    for (std::size_t piece = 0; piece < source.size(); ++piece) {
+        integerStates += static_cast<std::size_t>(
+            solved.candidateMaximum[piece] -
+            solved.candidateMinimum[piece] + 1);
+    }
+    const std::size_t expectedStateAccounting =
+        2 * solved.connectedComponents + 2 * integerStates + 2;
+    CHECK(solved.totalCandidateStates == expectedStateAccounting);
+
+    const auto jointOrientation =
+        solveFiberTraceJointGridWindingBeliefPropagation(
+            report, topology(source, report), joint);
+    CHECK(jointOrientation.orientationMode ==
+        FiberTraceWindingOrientationMode::Joint);
+    CHECK(jointOrientation.fixedOrientationByPiece.empty());
+    CHECK(jointOrientation.totalCandidateStates > solved.totalCandidateStates);
+}
+
+TEST_CASE("Joint-grid winding matches exact single-factor marginals")
+{
+    const auto source = lines(2);
+    auto report = pieces(source.size());
+    addMeasured(report, 0, 1, 0.25, 0.30);
+
+    FiberTraceJointGridWindingConfig joint;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(joint) = config();
+    joint.temperature = 0.2;
+    joint.orientationTemperature = 0.35;
+    joint.mixedUnaryCost = 0.7;
+    joint.logGainStep = std::log(1.25);
+    joint.initialGainCells = 3;
+    joint.phaseCells = 3;
+    joint.maximumGainCells = 3;
+    joint.boundaryProbabilityThreshold = 0.99;
+    joint.calibrationBoundaryProbabilityThreshold = 0.99;
+    joint.calibrationDiscardProbabilityThreshold = 0.0;
+    joint.stableIterations = 2;
+    const auto solved = solveFiberTraceJointGridWindingBeliefPropagation(
+        report, topology(source, report), joint);
+
+    std::array<double, 3> classWeight{};
+    std::vector<double> windingWeight(static_cast<std::size_t>(
+        solved.candidateMaximum[1] - solved.candidateMinimum[1] + 1));
+    std::array<double, 2> signWeight{};
+    double totalWeight = 0.0;
+    double phaseWeight = 0.0;
+    double scaleWeight = 0.0;
+    const auto windingEnergy = [](double delta, double gain) {
+        return 0.25 * std::abs(delta) +
+            0.75 * std::abs(gain * delta - 0.30);
+    };
+    for (int gainIndex = -1; gainIndex <= 1; ++gainIndex) {
+        const double gain = std::exp(
+            static_cast<double>(gainIndex) * joint.logGainStep);
+        for (std::size_t phaseIndex = 0;
+             phaseIndex < joint.phaseCells;
+             ++phaseIndex) {
+            const double phase = 0.5 * static_cast<double>(phaseIndex) /
+                static_cast<double>(joint.phaseCells - 1);
+            for (std::size_t signIndex = 0; signIndex < 2; ++signIndex) {
+                const double sign = signIndex == 0 ? 1.0 : -1.0;
+                for (int winding = solved.candidateMinimum[1];
+                     winding <= solved.candidateMaximum[1];
+                     ++winding) {
+                    for (std::size_t orientation = 0;
+                         orientation < 3;
+                         ++orientation) {
+                        double weight = 0.0;
+                        if (orientation == 1) {
+                            for (const double classA : {0.0, 1.0}) {
+                                for (const double classB : {0.0, 1.0}) {
+                                    const double delta =
+                                        static_cast<double>(winding) +
+                                        sign * phase * (classB - classA);
+                                    weight += std::exp(
+                                        -windingEnergy(delta, gain) /
+                                        joint.temperature);
+                                }
+                            }
+                            weight *= 0.25 * std::exp(
+                                -joint.mixedUnaryCost /
+                                joint.orientationTemperature);
+                        } else {
+                            const bool classB = orientation == 2;
+                            const double delta = static_cast<double>(winding) +
+                                (classB ? sign * phase : 0.0);
+                            const double orientationEnergy =
+                                classB ? 0.25 : 0.75;
+                            weight = std::exp(
+                                -orientationEnergy /
+                                    joint.orientationTemperature -
+                                windingEnergy(delta, gain) /
+                                    joint.temperature);
+                        }
+                        totalWeight += weight;
+                        classWeight[orientation] += weight;
+                        windingWeight[static_cast<std::size_t>(
+                            winding - solved.candidateMinimum[1])] += weight;
+                        signWeight[signIndex] += weight;
+                        phaseWeight += weight * phase;
+                        scaleWeight += weight / gain;
+                    }
+                }
+            }
+        }
+    }
+    REQUIRE(totalWeight > 0.0);
+    CHECK(solved.classAProbability[1] ==
+        doctest::Approx(classWeight[0] / totalWeight).epsilon(1.0e-8));
+    CHECK(solved.mixedProbability[1] ==
+        doctest::Approx(classWeight[1] / totalWeight).epsilon(1.0e-8));
+    CHECK(solved.classBProbability[1] ==
+        doctest::Approx(classWeight[2] / totalWeight).epsilon(1.0e-8));
+    for (std::size_t piece = 0; piece < solved.classAProbability.size(); ++piece) {
+        CHECK(solved.classAProbability[piece] >= 0.0);
+        CHECK(solved.classAProbability[piece] <= 1.0);
+        CHECK(solved.mixedProbability[piece] >= 0.0);
+        CHECK(solved.mixedProbability[piece] <= 1.0);
+        CHECK(solved.classBProbability[piece] >= 0.0);
+        CHECK(solved.classBProbability[piece] <= 1.0);
+        CHECK(solved.classAProbability[piece] +
+              solved.mixedProbability[piece] +
+              solved.classBProbability[piece] == doctest::Approx(1.0));
+    }
+    double exactMeanWinding = 0.0;
+    for (std::size_t index = 0; index < windingWeight.size(); ++index) {
+        exactMeanWinding += windingWeight[index] / totalWeight *
+            static_cast<double>(solved.candidateMinimum[1] +
+                                static_cast<int>(index));
+    }
+    CHECK(solved.posteriorMeanWinding[1] ==
+        doctest::Approx(exactMeanWinding).epsilon(1.0e-8));
+    CHECK(solved.componentPositivePhaseSignProbability[0] ==
+        doctest::Approx(signWeight[0] / totalWeight).epsilon(1.0e-8));
+    CHECK(solved.calibrationPhaseMean ==
+        doctest::Approx(phaseWeight / totalWeight).epsilon(1.0e-8));
+    CHECK(solved.calibrationScaleMean ==
+        doctest::Approx(scaleWeight / totalWeight).epsilon(1.0e-8));
+}
+
+TEST_CASE("Fixed-calibration winding matches exact expanded-support marginals")
+{
+    const auto source = lines(2);
+    auto report = pieces(source.size());
+    addMeasured(report, 0, 1, 0.0, 0.0);
+    addMeasured(report, 0, 1, 0.0, 0.0);
+    addMeasured(report, 0, 1, 0.0, 10.0);
+
+    FiberTraceJointGridWindingConfig joint;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(joint) = config();
+    joint.temperature = 0.2;
+    joint.orientationTemperature = 0.35;
+    joint.mixedUnaryCost = 0.7;
+    joint.fixedPhaseMagnitude = 0.37;
+    joint.fixedMeasurementScale = 1.25;
+    joint.boundaryProbabilityThreshold = 0.01;
+    joint.stableIterations = 2;
+    std::vector<FiberTraceJointGridProgress> progress;
+    const auto solved = solveFiberTraceJointGridWindingBeliefPropagation(
+        report,
+        topology(source, report),
+        joint,
+        [&](const FiberTraceJointGridProgress& event) {
+            progress.push_back(event);
+        });
+
+    CHECK(solved.calibrationMode == FiberTraceWindingCalibrationMode::Fixed);
+    CHECK(solved.phaseMagnitude == 0.37);
+    CHECK(solved.calibrationPhaseMean == 0.37);
+    CHECK(solved.measurementScale == 1.25);
+    CHECK(solved.calibrationScaleMean == 1.25);
+    CHECK(solved.calibrationGridCells == 1);
+    CHECK(solved.calibrationGridShifts == 0);
+    CHECK(solved.calibrationEntropy == 0.0);
+    CHECK(solved.lowerGainBoundaryProbability == 0.0);
+    CHECK(solved.upperGainBoundaryProbability == 0.0);
+    CHECK(solved.expansionRounds > 1);
+    REQUIRE_FALSE(progress.empty());
+    for (const auto& event : progress) {
+        CHECK(event.calibrationMode ==
+            FiberTraceWindingCalibrationMode::Fixed);
+        CHECK(event.gainCells == 1);
+        CHECK(event.phaseCells == 1);
+        CHECK(event.gridShifts == 0);
+        CHECK(event.calibrationPosteriorResidual == 0.0);
+        CHECK(event.phaseMap == 0.37);
+        CHECK(event.phaseMean == 0.37);
+        CHECK(event.scaleMap == 1.25);
+        CHECK(event.scaleMean == 1.25);
+    }
+
+    std::array<double, 3> classWeight{};
+    std::vector<double> windingWeight(static_cast<std::size_t>(
+        solved.candidateMaximum[1] - solved.candidateMinimum[1] + 1));
+    std::array<double, 2> signWeight{};
+    double totalWeight = 0.0;
+    constexpr double gain = 0.8;
+    const auto windingEnergy = [](double delta) {
+        return 2.0 * std::abs(gain * delta) +
+            std::abs(gain * delta - 10.0);
+    };
+    for (std::size_t signIndex = 0; signIndex < 2; ++signIndex) {
+        const double sign = signIndex == 0 ? 1.0 : -1.0;
+        for (int winding = solved.candidateMinimum[1];
+             winding <= solved.candidateMaximum[1];
+             ++winding) {
+            for (std::size_t orientation = 0; orientation < 3; ++orientation) {
+                double weight = 0.0;
+                if (orientation == 1) {
+                    for (const double classA : {0.0, 1.0}) {
+                        for (const double classB : {0.0, 1.0}) {
+                            const double delta = static_cast<double>(winding) +
+                                sign * 0.37 * (classB - classA);
+                            weight += std::exp(
+                                -windingEnergy(delta) / joint.temperature);
+                        }
+                    }
+                    weight *= 0.25 * std::exp(
+                        -joint.mixedUnaryCost / joint.orientationTemperature);
+                } else {
+                    const bool classB = orientation == 2;
+                    const double delta = static_cast<double>(winding) +
+                        (classB ? sign * 0.37 : 0.0);
+                    const double orientationEnergy = classB ? 0.0 : 3.0;
+                    weight = std::exp(
+                        -orientationEnergy / joint.orientationTemperature -
+                        windingEnergy(delta) / joint.temperature);
+                }
+                totalWeight += weight;
+                classWeight[orientation] += weight;
+                windingWeight[static_cast<std::size_t>(
+                    winding - solved.candidateMinimum[1])] += weight;
+                signWeight[signIndex] += weight;
+            }
+        }
+    }
+    REQUIRE(totalWeight > 0.0);
+    CHECK(solved.classAProbability[1] ==
+        doctest::Approx(classWeight[0] / totalWeight).epsilon(1.0e-8));
+    CHECK(solved.mixedProbability[1] ==
+        doctest::Approx(classWeight[1] / totalWeight).epsilon(1.0e-8));
+    CHECK(solved.classBProbability[1] ==
+        doctest::Approx(classWeight[2] / totalWeight).epsilon(1.0e-8));
+    double exactMeanWinding = 0.0;
+    for (std::size_t index = 0; index < windingWeight.size(); ++index) {
+        exactMeanWinding += windingWeight[index] / totalWeight *
+            static_cast<double>(
+                solved.candidateMinimum[1] + static_cast<int>(index));
+    }
+    CHECK(solved.posteriorMeanWinding[1] ==
+        doctest::Approx(exactMeanWinding).epsilon(1.0e-8));
+    CHECK(solved.componentPositivePhaseSignProbability[0] ==
+        doctest::Approx(signWeight[0] / totalWeight).epsilon(1.0e-8));
+}
+
+TEST_CASE("Joint-grid winding shares calibration across disconnected components")
+{
+    const auto source = lines(6);
+    auto report = pieces(source.size());
+    addMeasured(report, 0, 1, 0.0, 0.32);
+    addMeasured(report, 1, 2, 0.0, 0.48);
+    addMeasured(report, 3, 4, 0.0, 0.32);
+    addMeasured(report, 4, 5, 0.0, 0.48);
+
+    FiberTraceJointGridWindingConfig joint;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(joint) = config();
+    joint.temperature = 0.05;
+    joint.mixedUnaryCost = 1.0;
+    joint.maximumGainCells = 11;
+    joint.stableIterations = 2;
+    const auto solved = solveFiberTraceJointGridWindingBeliefPropagation(
+        report, topology(source, report), joint);
+
+    CHECK(solved.connectedComponents == 2);
+    CHECK(solved.mapWinding == std::vector<int>{0, 0, 1, 0, 0, 1});
+    CHECK(solved.measurementScale == doctest::Approx(1.25).epsilon(0.15));
+    REQUIRE(solved.componentPhaseSign.size() == 2);
+    REQUIRE(solved.componentPositivePhaseSignProbability.size() == 2);
+    for (const double probability :
+         solved.componentPositivePhaseSignProbability) {
+        CHECK(probability >= 0.0);
+        CHECK(probability <= 1.0);
+    }
+}
+
+TEST_CASE("Joint-grid winding validates adaptive calibration controls")
+{
+    const auto source = lines(2);
+    auto report = pieces(source.size());
+    addMeasured(report, 0, 1, 0.0, 1.0);
+    auto joint = FiberTraceJointGridWindingConfig{};
+    joint.initialGainCells = 4;
+    CHECK_THROWS_AS(
+        solveFiberTraceJointGridWindingBeliefPropagation(
+            report, topology(source, report), joint),
+        std::invalid_argument);
+    joint.initialGainCells = 5;
+    joint.phaseCells = 1;
+    CHECK_THROWS_AS(
+        solveFiberTraceJointGridWindingBeliefPropagation(
+            report, topology(source, report), joint),
+        std::invalid_argument);
+}
+
+TEST_CASE("Joint-grid winding validates fixed calibration controls")
+{
+    const auto source = lines(2);
+    auto report = pieces(source.size());
+    addMeasured(report, 0, 1, 0.0, 1.0);
+    const auto prepared = topology(source, report);
+
+    FiberTraceJointGridWindingConfig joint;
+    joint.fixedPhaseMagnitude = 0.5;
+    CHECK_THROWS_AS(
+        solveFiberTraceJointGridWindingBeliefPropagation(
+            report, prepared, joint),
+        std::invalid_argument);
+    joint.fixedMeasurementScale = 1.0;
+    joint.fixedPhaseMagnitude = 0.5001;
+    CHECK_THROWS_AS(
+        solveFiberTraceJointGridWindingBeliefPropagation(
+            report, prepared, joint),
+        std::invalid_argument);
+    joint.fixedPhaseMagnitude = 0.5;
+    joint.fixedMeasurementScale = 0.0;
+    CHECK_THROWS_AS(
+        solveFiberTraceJointGridWindingBeliefPropagation(
+            report, prepared, joint),
+        std::invalid_argument);
+    joint.fixedMeasurementScale = 1.0;
+    joint.phaseCells = 0;
+    joint.initialGainCells = 0;
+    joint.maximumGainCells = 0;
+    joint.logGainStep = -1.0;
+    CHECK_NOTHROW(solveFiberTraceJointGridWindingBeliefPropagation(
+        report, prepared, joint));
 }
 
 TEST_CASE("Interleaved winding retains calibration when signed evidence is absent")

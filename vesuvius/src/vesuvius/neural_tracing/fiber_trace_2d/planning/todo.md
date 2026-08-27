@@ -101,7 +101,7 @@
 
 # joint winding inference
 
-- [ ] replace repeated winding BP calibration passes with a default joint
+- [x] replace repeated winding BP calibration passes with a default joint
       adaptive-grid solver while retaining the current alternating solver for
       comparison
     - keep aligned-normal sign resolution as independent preprocessing

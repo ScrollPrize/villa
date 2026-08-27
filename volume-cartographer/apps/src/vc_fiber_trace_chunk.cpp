@@ -82,6 +82,10 @@ struct Options {
         vc::fiber_tracer::FiberTraceBeliefInference::MinSum;
     bool bpOnly = false;
     vc::fiber_tracer::FiberTraceBeliefPropagationConfig bp;
+    vc::fiber_tracer::FiberTraceWindingSolver windingSolver =
+        vc::fiber_tracer::FiberTraceWindingSolver::JointGrid;
+    bool windingFixedOrientation = false;
+    vc::fiber_tracer::FiberTraceJointGridWindingConfig jointGrid;
     bool hasBounds = false;
     bool hasTraceOnlyOption = false;
     bool hasConstraintOnlyOption = false;
@@ -95,11 +99,52 @@ struct Options {
     bool hasBpInferenceOption = false;
     bool hasBpBalanceTuningOption = false;
     bool hasBpMixedCostOption = false;
+    bool hasWindingSolverOption = false;
+    bool hasWindingOrientationOption = false;
+    bool hasJointGridOption = false;
+    bool hasAdaptiveGridOption = false;
+    bool hasFixedCalibrationOption = false;
 };
 
 [[noreturn]] void fail(const std::string& message)
 {
     throw std::invalid_argument(message);
+}
+
+double orientationProjection(
+    double horizontal,
+    double mixed,
+    double vertical,
+    std::size_t piece)
+{
+    constexpr double tolerance = 1.0e-12;
+    const std::array probabilities{horizontal, mixed, vertical};
+    const double total = horizontal + mixed + vertical;
+    if (std::any_of(
+            probabilities.begin(), probabilities.end(),
+            [](double probability) {
+                return !std::isfinite(probability) ||
+                    probability < -tolerance ||
+                    probability > 1.0 + tolerance;
+            }) ||
+        !std::isfinite(total) || std::abs(total - 1.0) > tolerance) {
+        std::ostringstream message;
+        message << std::setprecision(17)
+                << "Winding BP produced an invalid orientation marginal at piece "
+                << piece << ": H=" << horizontal << " Mixed=" << mixed
+                << " V=" << vertical << " total=" << total;
+        throw std::runtime_error(message.str());
+    }
+    const double value = horizontal + 0.5 * mixed;
+    if (!std::isfinite(value) || value < -tolerance ||
+        value > 1.0 + tolerance) {
+        std::ostringstream message;
+        message << std::setprecision(17)
+                << "Winding BP produced an invalid orientation projection at piece "
+                << piece << ": value=" << value;
+        throw std::runtime_error(message.str());
+    }
+    return std::clamp(value, 0.0, 1.0);
 }
 
 void usage(const char* executable)
@@ -162,7 +207,17 @@ void usage(const char* executable)
               << "  --bp-balance-iterations N field update limit [64]\n"
               << "  --bp-damping F            message damping in (0,1] [0.5]\n"
               << "  --bp-residual F           message residual tolerance [1e-8]\n"
-              << "  --bp-balance-tolerance F  target/field tolerance [1e-3]\n\n"
+              << "  --bp-balance-tolerance F  target/field tolerance [1e-3]\n"
+              << "  --winding-solver MODE     joint-grid or alternating [joint-grid]\n"
+              << "  --winding-fixed-orientation  solve H/V/Mixed first, then only winding\n"
+              << "  --winding-fixed-phase F   disable calibration at phase F in [0,0.5]\n"
+              << "  --winding-fixed-scale F   disable calibration at positive scale F\n"
+              << "  --winding-gain-cells N    initial joint gain cells [5]\n"
+              << "  --winding-phase-cells N   joint canonical phase cells [6]\n"
+              << "  --winding-log-gain-step F joint log-gain lattice spacing [log(1.1)]\n"
+              << "  --winding-boundary F      calibration boundary pressure [0.25]\n"
+              << "  --winding-max-gain-cells N joint gain support guard [17]\n"
+              << "  --winding-max-shifts N    joint sliding-window shift guard [32]\n\n"
               << "Constraint options (all distances are base voxels):\n"
               << "  --output PATH              OBJ basename; defaults beside trace dataset\n"
               << "  --sample-step N            common trace resampling step [32]\n"
@@ -450,6 +505,82 @@ Options parse(int argc, char** argv)
             options.hasBpBalanceTuningOption = true;
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-solver") {
+            const std::string solver = value(
+                index, argc, argv, "--winding-solver");
+            if (solver == "joint-grid") {
+                options.windingSolver = vc::fiber_tracer::
+                    FiberTraceWindingSolver::JointGrid;
+            } else if (solver == "alternating") {
+                options.windingSolver = vc::fiber_tracer::
+                    FiberTraceWindingSolver::Alternating;
+            } else {
+                fail("--winding-solver must be joint-grid or alternating");
+            }
+            options.hasWindingSolverOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-fixed-orientation") {
+            options.windingFixedOrientation = true;
+            options.hasWindingOrientationOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-gain-cells") {
+            options.jointGrid.initialGainCells = count(
+                index, argc, argv, "--winding-gain-cells");
+            options.hasJointGridOption = true;
+            options.hasAdaptiveGridOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-phase-cells") {
+            options.jointGrid.phaseCells = count(
+                index, argc, argv, "--winding-phase-cells");
+            options.hasJointGridOption = true;
+            options.hasAdaptiveGridOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-log-gain-step") {
+            options.jointGrid.logGainStep = number(
+                index, argc, argv, "--winding-log-gain-step");
+            options.hasJointGridOption = true;
+            options.hasAdaptiveGridOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-boundary") {
+            options.jointGrid.calibrationBoundaryProbabilityThreshold = number(
+                index, argc, argv, "--winding-boundary");
+            options.hasJointGridOption = true;
+            options.hasAdaptiveGridOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-max-gain-cells") {
+            options.jointGrid.maximumGainCells = count(
+                index, argc, argv, "--winding-max-gain-cells");
+            options.hasJointGridOption = true;
+            options.hasAdaptiveGridOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-max-shifts") {
+            options.jointGrid.maximumGridShifts = count(
+                index, argc, argv, "--winding-max-shifts");
+            options.hasJointGridOption = true;
+            options.hasAdaptiveGridOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-fixed-phase") {
+            options.jointGrid.fixedPhaseMagnitude = number(
+                index, argc, argv, "--winding-fixed-phase");
+            options.hasJointGridOption = true;
+            options.hasFixedCalibrationOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--winding-fixed-scale") {
+            options.jointGrid.fixedMeasurementScale = number(
+                index, argc, argv, "--winding-fixed-scale");
+            options.hasJointGridOption = true;
+            options.hasFixedCalibrationOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
         } else if (argument == "--sample-step") {
             options.constraints.resampleSpacingBaseVoxels = number(index, argc, argv, "--sample-step");
             options.hasConstraintOnlyOption = true;
@@ -635,6 +766,49 @@ Options parse(int argc, char** argv)
             options.bpInference != vc::fiber_tracer::
                 FiberTraceBeliefInference::SumProductMixed) {
             fail("--bp-mixed-cost requires --bp-inference sum-product-mixed");
+        }
+        if ((options.hasWindingSolverOption || options.hasJointGridOption ||
+             options.hasWindingOrientationOption) &&
+            (!options.bpOnly ||
+             options.bpInference != vc::fiber_tracer::
+                 FiberTraceBeliefInference::SumProductMixed)) {
+            fail("winding solver controls require --bp-only --bp-inference sum-product-mixed");
+        }
+        if (options.hasJointGridOption &&
+            options.windingSolver != vc::fiber_tracer::
+                FiberTraceWindingSolver::JointGrid) {
+            fail("joint-grid controls require --winding-solver joint-grid");
+        }
+        const bool hasFixedPhase =
+            options.jointGrid.fixedPhaseMagnitude.has_value();
+        const bool hasFixedScale =
+            options.jointGrid.fixedMeasurementScale.has_value();
+        if (hasFixedPhase != hasFixedScale) {
+            fail("--winding-fixed-phase and --winding-fixed-scale must be supplied together");
+        }
+        if (options.hasFixedCalibrationOption && options.hasAdaptiveGridOption) {
+            fail("fixed winding calibration cannot be combined with adaptive-grid controls");
+        }
+        if (hasFixedPhase &&
+            (!std::isfinite(*options.jointGrid.fixedPhaseMagnitude) ||
+             *options.jointGrid.fixedPhaseMagnitude < 0.0 ||
+             *options.jointGrid.fixedPhaseMagnitude > 0.5)) {
+            fail("--winding-fixed-phase must be finite and in [0,0.5]");
+        }
+        if (hasFixedScale &&
+            (!std::isfinite(*options.jointGrid.fixedMeasurementScale) ||
+             !(*options.jointGrid.fixedMeasurementScale > 0.0))) {
+            fail("--winding-fixed-scale must be positive and finite");
+        }
+        if (options.jointGrid.initialGainCells == 0 ||
+            options.jointGrid.initialGainCells % 2 == 0 ||
+            options.jointGrid.phaseCells < 2 ||
+            !(options.jointGrid.logGainStep > 0.0) ||
+            !(options.jointGrid.calibrationBoundaryProbabilityThreshold > 0.0) ||
+            options.jointGrid.calibrationBoundaryProbabilityThreshold >= 1.0 ||
+            options.jointGrid.maximumGainCells <
+                options.jointGrid.initialGainCells) {
+            fail("joint-grid winding controls are invalid");
         }
         if ((options.bpBalance == BpBalanceSelection::Tight ||
              options.bpBalance == BpBalanceSelection::Both) &&
@@ -1176,8 +1350,31 @@ void writeAndPrintBpReport(
 
     std::vector<vc::fiber_tracer::FiberTernaryState> predictions(
         lines.size(), vc::fiber_tracer::FiberTernaryState::Tie);
+    const bool fixedPrepass = interleaved &&
+        interleaved->orientationMode == vc::fiber_tracer::
+            FiberTraceWindingOrientationMode::FixedPrepass;
+    if (fixedPrepass &&
+        interleaved->fixedOrientationByPiece.size() != lines.size()) {
+        throw std::logic_error(
+            "Fixed-prepass winding report does not match represented pieces");
+    }
     for (std::size_t piece = 0; piece < lines.size(); ++piece) {
-        if (mixedState) {
+        if (fixedPrepass) {
+            switch (interleaved->fixedOrientationByPiece[piece]) {
+            case vc::fiber_tracer::FiberTraceFixedOrientation::Horizontal:
+                predictions[piece] =
+                    vc::fiber_tracer::FiberTernaryState::Horizontal;
+                break;
+            case vc::fiber_tracer::FiberTraceFixedOrientation::Mixed:
+                predictions[piece] =
+                    vc::fiber_tracer::FiberTernaryState::Mixed;
+                break;
+            case vc::fiber_tracer::FiberTraceFixedOrientation::Vertical:
+                predictions[piece] =
+                    vc::fiber_tracer::FiberTernaryState::Vertical;
+                break;
+            }
+        } else if (mixedState) {
             const std::array probabilities{
                 report.verticalProbability[piece],
                 report.mixedProbability[piece],
@@ -1365,7 +1562,11 @@ void writeAndPrintBpReport(
            "neighbor_support_balance,neighbor_certainty";
     if (interleaved) {
         csvOutput << ",winding_latent_mean,winding_phase,winding_scale,"
-                     "winding_component_phase_sign";
+                     "winding_component_phase_sign,winding_solver,"
+                     "winding_orientation_mode,winding_fixed_orientation,"
+                     "winding_calibration_mode,"
+                     "winding_phase_mean,winding_scale_mean,"
+                     "winding_component_positive_sign_probability";
     }
     csvOutput << '\n' << std::setprecision(17);
     const auto csvOptional = [&csvOutput](const std::optional<double>& value) {
@@ -1423,11 +1624,37 @@ void writeAndPrintBpReport(
         csvOutput << ',';
         csvOptional(current.neighborCertainty);
         if (interleaved) {
+            const std::size_t component = winding.componentByPiece[piece];
             csvOutput << ',' << interleaved->posteriorMeanLatentCoordinate[piece]
                       << ',' << interleaved->phaseMagnitude
                       << ',' << interleaved->measurementScale
                       << ',' << interleaved->componentPhaseSign.at(
-                             winding.componentByPiece[piece]);
+                             component)
+                      << ',' << vc::fiber_tracer::fiberTraceWindingSolverName(
+                             interleaved->solver)
+                      << ',' << vc::fiber_tracer::
+                             fiberTraceWindingOrientationModeName(
+                                 interleaved->orientationMode)
+                      << ',';
+            if (interleaved->orientationMode == vc::fiber_tracer::
+                    FiberTraceWindingOrientationMode::FixedPrepass) {
+                csvOutput << vc::fiber_tracer::fiberTraceFixedOrientationName(
+                    interleaved->fixedOrientationByPiece.at(piece));
+            } else {
+                csvOutput << "NA";
+            }
+            csvOutput << ',' << vc::fiber_tracer::
+                             fiberTraceWindingCalibrationModeName(
+                                 interleaved->calibrationMode)
+                      << ',' << interleaved->calibrationPhaseMean
+                      << ',' << interleaved->calibrationScaleMean << ',';
+            if (component < interleaved->
+                    componentPositivePhaseSignProbability.size()) {
+                csvOutput << interleaved->
+                    componentPositivePhaseSignProbability[component];
+            } else {
+                csvOutput << "NA";
+            }
         }
         csvOutput << '\n';
     }
@@ -1437,7 +1664,7 @@ void writeAndPrintBpReport(
         winding.mapProbability.begin(), winding.mapProbability.end(), 0.0) /
         static_cast<double>(winding.mapProbability.size());
     std::cout << std::fixed << std::setprecision(6)
-              << "fiber winding two-stage BP\n"
+              << "fiber winding BP\n"
               << "status  pieces  variables  factors  components"
                  "  continuous_rms  continuous_s  temperature  expansion_rounds"
                  "  message_iterations  message_residual  workers  candidate_states"
@@ -1460,17 +1687,54 @@ void writeAndPrintBpReport(
               << "winding_factor_csv=" << factorCsv
               << " winding_obj_layers=" << windingPaths.size() << '\n';
     if (interleaved) {
-        std::cout
-            << "fiber interleaved winding calibration\n"
-            << "phase  scale  calibration_iterations  calibration_converged"
-               "  initialization  rank_deficient_updates  decoded_energy\n"
-            << interleaved->phaseMagnitude << "  "
-            << interleaved->measurementScale << "  "
-            << interleaved->calibrationIterations << "  "
-            << (interleaved->calibrationConverged ? "true" : "false") << "  "
-            << interleaved->selectedInitialization << "  "
-            << interleaved->rankDeficientUpdates << "  "
-            << interleaved->decodedEnergy << '\n';
+        std::cout << "fiber winding calibration\n";
+        if (interleaved->solver == vc::fiber_tracer::
+                FiberTraceWindingSolver::JointGrid) {
+            std::cout
+                << "solver  orientation_mode  calibration_mode  phase_map  phase_mean  scale_map  scale_mean"
+                   "  grid_cells  grid_shifts  entropy  lower_boundary"
+                   "  upper_boundary  min_gain  max_gain  converged"
+                   "  decoded_energy\n"
+                << vc::fiber_tracer::fiberTraceWindingSolverName(
+                       interleaved->solver)
+                << "  " << vc::fiber_tracer::
+                       fiberTraceWindingOrientationModeName(
+                           interleaved->orientationMode)
+                << "  " << vc::fiber_tracer::
+                       fiberTraceWindingCalibrationModeName(
+                           interleaved->calibrationMode)
+                << "  " << interleaved->phaseMagnitude
+                << "  " << interleaved->calibrationPhaseMean
+                << "  " << interleaved->measurementScale
+                << "  " << interleaved->calibrationScaleMean
+                << "  " << interleaved->calibrationGridCells
+                << "  " << interleaved->calibrationGridShifts
+                << "  " << interleaved->calibrationEntropy
+                << "  " << interleaved->lowerGainBoundaryProbability
+                << "  " << interleaved->upperGainBoundaryProbability
+                << "  " << interleaved->minimumCalibrationGain
+                << "  " << interleaved->maximumCalibrationGain
+                << "  "
+                << (interleaved->calibrationConverged ? "true" : "false")
+                << "  " << interleaved->decodedEnergy << '\n';
+        } else {
+            std::cout
+                << "solver  orientation_mode  phase  scale  calibration_iterations"
+                   "  calibration_converged  initialization"
+                   "  rank_deficient_updates  decoded_energy\n"
+                << vc::fiber_tracer::fiberTraceWindingSolverName(
+                       interleaved->solver)
+                << "  " << vc::fiber_tracer::
+                       fiberTraceWindingOrientationModeName(
+                           interleaved->orientationMode)
+                << "  " << interleaved->phaseMagnitude << "  "
+                << interleaved->measurementScale << "  "
+                << interleaved->calibrationIterations << "  "
+                << (interleaved->calibrationConverged ? "true" : "false")
+                << "  " << interleaved->selectedInitialization << "  "
+                << interleaved->rankDeficientUpdates << "  "
+                << interleaved->decodedEnergy << '\n';
+        }
     }
     std::cout << std::fixed << std::setprecision(6);
     if (mixedState) {
@@ -1946,6 +2210,62 @@ makeInterleavedWindingProgressPrinter()
     };
 }
 
+vc::fiber_tracer::FiberTraceJointGridProgressCallback
+makeJointGridWindingProgressPrinter()
+{
+    using Phase = vc::fiber_tracer::FiberTraceJointGridProgressPhase;
+    return [lastPrinted = std::chrono::steady_clock::time_point{},
+            lastPhase = Phase::Complete](
+               const vc::fiber_tracer::FiberTraceJointGridProgress& p) mutable {
+        const auto now = std::chrono::steady_clock::now();
+        const bool transition = p.phase != lastPhase;
+        const bool intervalElapsed = lastPrinted.time_since_epoch().count() == 0 ||
+            now - lastPrinted >= std::chrono::seconds(1);
+        if (!transition && !intervalElapsed && p.phase == Phase::MessagePassing)
+            return;
+        std::ostringstream line;
+        line << "fiber winding joint-grid calibration="
+             << vc::fiber_tracer::fiberTraceWindingCalibrationModeName(
+                    p.calibrationMode);
+        switch (p.phase) {
+        case Phase::Preparing:
+            line << " status=preparing";
+            break;
+        case Phase::MessagePassing:
+            line << " message=" << p.messageIteration << '/'
+                 << p.maximumMessageIterations;
+            break;
+        case Phase::SupportChanged:
+            line << " status=support_changed"
+                 << " message=" << p.messageIteration << '/'
+                 << p.maximumMessageIterations;
+            break;
+        case Phase::Complete:
+            line << " status=complete"
+                 << " messages=" << p.messageIteration;
+            break;
+        }
+        line << " states=" << p.candidateStates
+             << " grid=" << p.gainCells << 'x' << p.phaseCells
+             << " shifts=" << p.gridShifts
+             << std::scientific << std::setprecision(3)
+             << " residual=" << p.messageResidual
+             << " calibration_residual=" << p.calibrationPosteriorResidual
+             << std::fixed << std::setprecision(4)
+             << " phase_map=" << p.phaseMap
+             << " phase_mean=" << p.phaseMean
+             << " scale_map=" << p.scaleMap
+             << " scale_mean=" << p.scaleMean
+             << " boundary=" << p.lowerGainBoundaryProbability << ','
+             << p.upperGainBoundaryProbability
+             << " gain=" << p.minimumGain << ':' << p.maximumGain
+             << std::setprecision(1) << " elapsed=" << p.elapsedSeconds << 's';
+        std::cout << line.str() << '\n' << std::flush;
+        lastPrinted = now;
+        lastPhase = p.phase;
+    };
+}
+
 std::vector<std::size_t> applyQualityFilter(
     std::vector<vc::fiber_tracer::FiberletCropTraceLine>& lines,
     const std::optional<double>& fraction)
@@ -2248,45 +2568,14 @@ int main(int argc, char** argv)
                             config.cropMaximumBaseXYZ = artifact.maximumBaseXYZ;
                             vc::fiber_tracer::
                                 FiberTraceBeliefPropagationReport report;
-                            const auto orientationStarted =
-                                std::chrono::steady_clock::now();
-                            std::cout << "fiber orientation BP status=started\n"
-                                      << std::flush;
-                            switch (options.bpInference) {
-                            case vc::fiber_tracer::
-                                FiberTraceBeliefInference::MinSum:
-                                report = vc::fiber_tracer::
-                                    solveFiberTraceBeliefPropagation(
-                                        diagnosticLines,
-                                        bpConstraints,
-                                        config);
-                                break;
-                            case vc::fiber_tracer::
-                                FiberTraceBeliefInference::SumProduct:
-                                report = vc::fiber_tracer::
-                                    solveFiberTraceSumProduct(
-                                        diagnosticLines, bpConstraints, config);
-                                break;
-                            case vc::fiber_tracer::
-                                FiberTraceBeliefInference::SumProductMixed:
-                                report = vc::fiber_tracer::
-                                    solveFiberTraceMixedSumProduct(
-                                        diagnosticLines, bpConstraints, config);
-                                break;
-                            }
-                            std::cout
-                                << "fiber orientation BP status=complete elapsed="
-                                << std::chrono::duration<double>(
-                                       std::chrono::steady_clock::now() -
-                                       orientationStarted)
-                                       .count()
-                                << "s\n"
-                                << std::flush;
                             vc::fiber_tracer::
                                 FiberTraceWindingBeliefPropagationConfig
                                     windingConfig;
                             windingConfig.temperature =
-                                options.bp.horizontalnessTemperature;
+                                options.bpInference == vc::fiber_tracer::
+                                    FiberTraceBeliefInference::SumProductMixed
+                                ? 0.25
+                                : options.bp.horizontalnessTemperature;
                             windingConfig.messageDamping = options.bp.messageDamping;
                             windingConfig.messageResidualTolerance =
                                 options.bp.messageResidualTolerance;
@@ -2300,8 +2589,143 @@ int main(int argc, char** argv)
                             std::optional<vc::fiber_tracer::
                                 FiberTraceInterleavedWindingReport>
                                     interleavedWinding;
-                            if (options.bpInference == vc::fiber_tracer::
-                                FiberTraceBeliefInference::SumProductMixed) {
+                            const bool jointGrid =
+                                options.bpInference == vc::fiber_tracer::
+                                    FiberTraceBeliefInference::SumProductMixed &&
+                                options.windingSolver == vc::fiber_tracer::
+                                    FiberTraceWindingSolver::JointGrid;
+                            std::vector<vc::fiber_tracer::
+                                FiberTraceFixedOrientation> fixedOrientations;
+                            const auto solveOrientation = [&] {
+                                const auto orientationStarted =
+                                    std::chrono::steady_clock::now();
+                                std::cout
+                                    << "fiber orientation BP status=started\n"
+                                    << std::flush;
+                                switch (options.bpInference) {
+                                case vc::fiber_tracer::
+                                    FiberTraceBeliefInference::MinSum:
+                                    report = vc::fiber_tracer::
+                                        solveFiberTraceBeliefPropagation(
+                                            diagnosticLines,
+                                            bpConstraints,
+                                            config);
+                                    break;
+                                case vc::fiber_tracer::
+                                    FiberTraceBeliefInference::SumProduct:
+                                    report = vc::fiber_tracer::
+                                        solveFiberTraceSumProduct(
+                                            diagnosticLines,
+                                            bpConstraints,
+                                            config);
+                                    break;
+                                case vc::fiber_tracer::
+                                    FiberTraceBeliefInference::SumProductMixed:
+                                    report = vc::fiber_tracer::
+                                        solveFiberTraceMixedSumProduct(
+                                            diagnosticLines,
+                                            bpConstraints,
+                                            config);
+                                    break;
+                                }
+                                std::cout
+                                    << "fiber orientation BP status=complete elapsed="
+                                    << std::chrono::duration<double>(
+                                           std::chrono::steady_clock::now() -
+                                           orientationStarted)
+                                           .count()
+                                    << "s\n"
+                                    << std::flush;
+                            };
+                            if (!jointGrid || options.windingFixedOrientation)
+                                solveOrientation();
+                            if (options.windingFixedOrientation) {
+                                fixedOrientations = vc::fiber_tracer::
+                                    fixedFiberTraceOrientations(report);
+                            }
+                            if (jointGrid) {
+                                auto joint = options.jointGrid;
+                                static_cast<vc::fiber_tracer::
+                                    FiberTraceWindingBeliefPropagationConfig&>(joint) =
+                                        windingConfig;
+                                joint.mixedUnaryCost = options.bp.mixedUnaryCost;
+                                joint.orientationTemperature =
+                                    options.bp.horizontalnessTemperature;
+                                interleavedWinding = vc::fiber_tracer::
+                                    solveFiberTraceJointGridWindingBeliefPropagation(
+                                        bpConstraints,
+                                        bpTopology,
+                                        joint,
+                                        makeJointGridWindingProgressPrinter(),
+                                        fixedOrientations);
+                                if (!options.windingFixedOrientation) {
+                                    report.horizontalProbability =
+                                        interleavedWinding->classAProbability;
+                                    report.mixedProbability =
+                                        interleavedWinding->mixedProbability;
+                                    report.verticalProbability =
+                                        interleavedWinding->classBProbability;
+                                    report.normalizedArcWeights =
+                                        bpTopology.normalizedArcWeights;
+                                    report.seedPieceIndex =
+                                        bpTopology.centralSeedPiece;
+                                    report.factors = interleavedWinding->factors;
+                                    report.mergedMeasurements =
+                                        bpConstraints.constraints.size();
+                                    report.connectedComponents =
+                                        interleavedWinding->connectedComponents;
+                                    report.targetHorizontalFraction =
+                                        config.targetHorizontalFraction;
+                                    report.inference = vc::fiber_tracer::
+                                        FiberTraceBeliefInference::SumProductMixed;
+                                    report.inferenceTemperature =
+                                        joint.orientationTemperature;
+                                    report.mixedUnaryCost = joint.mixedUnaryCost;
+                                    report.messageIterations =
+                                        interleavedWinding->messageIterations;
+                                    report.messageResidual =
+                                        interleavedWinding->messageResidual;
+                                    report.messageConverged =
+                                        interleavedWinding->messageConverged;
+                                    report.solveSeconds =
+                                        interleavedWinding->continuousSolveSeconds +
+                                        interleavedWinding->discreteSolveSeconds;
+                                    report.status = interleavedWinding->status;
+                                    report.horizontalness.resize(
+                                        interleavedWinding->classAProbability.size());
+                                    std::vector<std::size_t> degree(
+                                        report.horizontalness.size(), 0);
+                                    for (std::size_t piece = 0;
+                                         piece < report.horizontalness.size();
+                                         ++piece) {
+                                        report.horizontalness[piece] =
+                                            orientationProjection(
+                                                report.horizontalProbability[piece],
+                                                report.mixedProbability[piece],
+                                                report.verticalProbability[piece],
+                                                piece);
+                                    }
+                                    for (const auto& factor :
+                                         interleavedWinding->factorDiagnostics) {
+                                        ++degree.at(factor.pieceA);
+                                        ++degree.at(factor.pieceB);
+                                        if (std::abs(
+                                                factor.parallelScore -
+                                                factor.perpendicularScore) <=
+                                            1.0e-12) {
+                                            ++report.neutralFactors;
+                                        }
+                                    }
+                                    report.neutralMeasurements =
+                                        report.neutralFactors;
+                                    report.isolatedPieces =
+                                        static_cast<std::size_t>(std::count(
+                                            degree.begin(), degree.end(), 0));
+                                }
+                            }
+                            if (!jointGrid &&
+                                options.bpInference == vc::fiber_tracer::
+                                    FiberTraceBeliefInference::SumProductMixed) {
                                 vc::fiber_tracer::
                                     FiberTraceInterleavedWindingConfig joint;
                                 static_cast<vc::fiber_tracer::
@@ -2314,60 +2738,75 @@ int main(int argc, char** argv)
                                         bpTopology,
                                         report,
                                         joint,
-                                        makeInterleavedWindingProgressPrinter());
-                                report.horizontalProbability =
-                                    interleavedWinding->classAProbability;
-                                report.mixedProbability =
-                                    interleavedWinding->mixedProbability;
-                                report.verticalProbability =
-                                    interleavedWinding->classBProbability;
-                                report.horizontalness.resize(
-                                    interleavedWinding->classAProbability.size());
-                                for (std::size_t piece = 0;
-                                     piece < report.horizontalness.size();
-                                     ++piece) {
-                                    report.horizontalness[piece] =
-                                        report.horizontalProbability[piece] +
-                                        0.5 * report.mixedProbability[piece];
-                                    if (!std::isfinite(report.horizontalness[piece]) ||
-                                        report.horizontalness[piece] < 0.0 ||
-                                        report.horizontalness[piece] > 1.0) {
-                                        throw std::runtime_error(
-                                            "Interleaved winding produced invalid orientation probability at piece " +
-                                            std::to_string(piece) + ": " +
-                                            std::to_string(report.horizontalness[piece]));
+                                        makeInterleavedWindingProgressPrinter(),
+                                        fixedOrientations);
+                                if (!options.windingFixedOrientation) {
+                                    report.horizontalProbability =
+                                        interleavedWinding->classAProbability;
+                                    report.mixedProbability =
+                                        interleavedWinding->mixedProbability;
+                                    report.verticalProbability =
+                                        interleavedWinding->classBProbability;
+                                    report.horizontalness.resize(
+                                        interleavedWinding->classAProbability.size());
+                                    for (std::size_t piece = 0;
+                                         piece < report.horizontalness.size();
+                                         ++piece) {
+                                        report.horizontalness[piece] =
+                                            orientationProjection(
+                                                report.horizontalProbability[piece],
+                                                report.mixedProbability[piece],
+                                                report.verticalProbability[piece],
+                                                piece);
                                     }
-                                }
-                                report.messageIterations =
-                                    interleavedWinding->messageIterations;
-                                report.messageResidual =
-                                    interleavedWinding->messageResidual;
-                                report.messageConverged =
-                                    interleavedWinding->messageConverged;
-                                report.solveSeconds =
-                                    interleavedWinding->discreteSolveSeconds;
-                                report.status = interleavedWinding->status;
-                                const double arcWeight = std::accumulate(
-                                    report.normalizedArcWeights.begin(),
-                                    report.normalizedArcWeights.end(),
-                                    0.0);
-                                report.achievedHorizontalFraction = arcWeight > 0.0
-                                    ? std::inner_product(
-                                        report.horizontalness.begin(),
-                                        report.horizontalness.end(),
+                                    report.messageIterations =
+                                        interleavedWinding->messageIterations;
+                                    report.messageResidual =
+                                        interleavedWinding->messageResidual;
+                                    report.messageConverged =
+                                        interleavedWinding->messageConverged;
+                                    report.solveSeconds =
+                                        interleavedWinding->discreteSolveSeconds;
+                                    report.status = interleavedWinding->status;
+                                    const double arcWeight = std::accumulate(
                                         report.normalizedArcWeights.begin(),
-                                        0.0) / arcWeight
-                                    : std::accumulate(
+                                        report.normalizedArcWeights.end(),
+                                        0.0);
+                                    report.achievedHorizontalFraction =
+                                        arcWeight > 0.0
+                                        ? std::inner_product(
+                                              report.horizontalness.begin(),
+                                              report.horizontalness.end(),
+                                              report.normalizedArcWeights.begin(),
+                                              0.0) /
+                                            arcWeight
+                                        : std::accumulate(
                                         report.horizontalness.begin(),
                                         report.horizontalness.end(),
-                                        0.0) /
-                                        static_cast<double>(
+                                        0.0) / static_cast<double>(
                                             report.horizontalness.size());
-                            } else {
+                                }
+                            } else if (!jointGrid) {
                                 independentWinding = vc::fiber_tracer::
                                     solveFiberTraceWindingBeliefPropagation(
                                         bpConstraints, bpTopology, windingConfig);
                             }
+                            const double arcWeight = std::accumulate(
+                                report.normalizedArcWeights.begin(),
+                                report.normalizedArcWeights.end(),
+                                0.0);
+                            report.achievedHorizontalFraction = arcWeight > 0.0
+                                ? std::inner_product(
+                                      report.horizontalness.begin(),
+                                      report.horizontalness.end(),
+                                      report.normalizedArcWeights.begin(),
+                                      0.0) / arcWeight
+                                : std::accumulate(
+                                      report.horizontalness.begin(),
+                                      report.horizontalness.end(),
+                                      0.0) /
+                                      static_cast<double>(
+                                          report.horizontalness.size());
                             const auto& winding = interleavedWinding
                                 ? static_cast<const vc::fiber_tracer::
                                       FiberTraceWindingBeliefPropagationReport&>(

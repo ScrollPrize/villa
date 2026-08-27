@@ -5263,8 +5263,68 @@
   `[0,0.5]`, and deterministic component sign `sign_c` accounts for otherwise
   incomparable class swaps. Absolute `k` values across components are not
   physically comparable.
-- The established Mixed-state orientation BP runs first. Its normalized
-  A/Mixed/B posterior is the joint winding solver's soft node prior. The
+- `sum-product-mixed` exposes `joint-grid` and `alternating` winding solvers.
+  `joint-grid` is the default. `alternating` is the established comparison
+  implementation described below and retains its orientation pre-pass,
+  multi-start calibration, numerical defaults, and output conventions.
+- Both winding solvers optionally support fixed-prepass orientation. The
+  ordinary Mixed-state BP runs once, and each piece's unique H/Mixed/V MAP is
+  retained as its fixed class; an exact MAP tie becomes Mixed. The subsequent
+  solver has no orientation variable or three-way piece-state dimension: each
+  piece state is only an integer winding candidate decoded with the stored
+  fixed class. Component gauges fix winding zero without changing that class.
+  Mixed retains its normalized four-substitution winding factor semantics, but
+  those substitutions are factor evaluation and never latent piece states.
+  Calibration, component sign, integer support, and winding potentials retain
+  the selected solver's existing behavior. Reports preserve the soft pre-pass
+  marginals and separately record `fixed-prepass` plus the selected class per
+  piece. Joint orientation inference remains the default when the option is
+  absent.
+- `joint-grid` has no H/V/Mixed pre-pass. Each piece state is
+  `(A|Mixed|B,k)`, with the crop-central piece of each connected constraint
+  component fixed to `(A,0)`. Each component has a binary ladder-order sign,
+  while one explicit calibration variable over `(log gain, phase)` is shared
+  by every component. Aligned-normal sign resolution remains separate and is
+  never inferred by this variable.
+- A joint non-Mixed factor charges orientation and winding evidence once.
+  Same classes cost the perpendicular score, different classes cost the
+  parallel score, and every measurement additionally contributes
+  `parallel*abs(delta)` plus
+  `perpendicular*abs(gain*delta-signed_target)` when its signed target exists.
+  Orientation and the Mixed unary retain `--bp-temperature`; winding retains
+  its established temperature `0.25`. A Mixed endpoint omits visible
+  orientation energy and uses the normalized four-A/B-substitution winding
+  potential, so it does not transmit a visible class preference.
+- Joint gain uses an absolute lattice in `log(gain)` centered initially on
+  gain 1; phase uses a fixed absolute lattice spanning `[0,0.5]`. Support
+  changes are considered only after both message and calibration posteriors
+  settle. One-sided boundary pressure shifts the gain window by one physical
+  cell only when the leaving boundary is negligible. Otherwise the window
+  grows within the explicit resource guard. Retained physical cells preserve
+  their messages and newly exposed cells receive neutral incoming messages.
+  Integer support similarly expands from settled orientation-marginalized
+  boundary pressure without restarting BP.
+- Joint convergence requires message residual convergence, calibration
+  posterior stability, resolved support pressure, and consecutive stable
+  iterations. Reports include solver mode, calibration MAP and posterior
+  means, entropy, absolute gain bounds, boundary masses, grid shifts,
+  component-sign posterior/MAP, state count, and convergence. No label-changing
+  post-fit or automatic fallback to `alternating` is permitted.
+- Joint-grid may instead use fixed calibration when both a phase in `[0,0.5]`
+  and a finite positive measurement scale are supplied. Fixed calibration is
+  a distinct reported mode, not a one-cell latent calibration posterior: pair
+  factors consume scalar phase and reciprocal gain directly, no calibration
+  messages or marginals exist, gain support cannot move, and calibration does
+  not enter resource accounting or convergence. Piece, component-sign, and
+  adaptive integer-support inference remain unchanged. Integer support changes
+  are gated only by settled piece/sign messages. Fixed mode reports the exact
+  supplied phase and scale as both MAP and mean, one reporting cell, zero
+  calibration entropy/residual/boundary mass/shifts/iterations, and calibration
+  convergence equal to message convergence. Supplying only one fixed value or
+  combining fixed values with explicit adaptive-grid controls is invalid.
+- In `alternating`, the established Mixed-state orientation BP runs first. Its
+  normalized A/Mixed/B posterior is the alternating winding stage's soft node
+  prior. The
   winding stage must not repeat the same/different factor or the Mixed unary.
 - For latent coordinate difference `delta`, every measurement contributes
   `p*abs(delta)` and, when signed target `d` is available,

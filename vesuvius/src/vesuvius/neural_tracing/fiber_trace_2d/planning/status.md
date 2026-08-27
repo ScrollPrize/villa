@@ -1,12 +1,12 @@
-# Status: Joint adaptive-grid winding BP
+# Status: Fixed pre-pass orientation for winding BP
 
-- [x] Record the agreed solver requirements.
-- [x] Write the implementation, compatibility, docs, and validation plan.
-- [x] Complete independent plan review against task and existing specs.
-- [x] Resolve review findings in the plan.
-- [ ] Implement the new joint solver and explicit legacy selection.
-- [ ] Add focused regression and synthetic inference tests.
-- [ ] Run crop-level comparison measurements.
-- [ ] Update specifications, user documentation, changelog, and task log.
-
-Implementation is intentionally deferred while an intervening fix is handled.
+- [x] Capture the requested behavior in `task.md`.
+- [x] Inspect both winding solver paths and write `task_plan.md`.
+- [x] Complete independent plan review and incorporate findings.
+- [x] Update the solver API and hard-orientation state handling.
+- [x] Add CLI option, validation, execution flow, and provenance.
+- [x] Add focused regression tests for both solver variants.
+- [x] Update specs, user documentation, changelog, and task log.
+- [x] Build Release targets with 32 jobs and run validation.
+- [x] Run end-to-end crop checks for both solver variants.
+- [x] Run `git diff --check` and report results.

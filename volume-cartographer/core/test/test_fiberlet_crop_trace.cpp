@@ -2346,7 +2346,14 @@ TEST_CASE("Trace post-filter rejects split or missing represented fibers")
 
 TEST_CASE("Fiber value bands use fixed boundaries and short OBJ names")
 {
-    const std::vector<double> values{0.0, 0.099, 0.1, 0.5, 0.9, 1.0};
+    const std::vector<double> values{
+        std::nextafter(0.0, -1.0),
+        0.099,
+        0.1,
+        0.5,
+        0.9,
+        std::nextafter(1.0, 2.0),
+    };
     const auto bands = classifyFiberValues(values);
     CHECK(bands.bands[0].lineIndices ==
           std::vector<std::size_t>{0, 1});
@@ -2356,6 +2363,22 @@ TEST_CASE("Fiber value bands use fixed boundaries and short OBJ names")
           std::vector<std::size_t>{3});
     CHECK(bands.bands[9].lineIndices ==
           std::vector<std::size_t>{4, 5});
+    CHECK(bands.bands[0].minimumValue == 0.0);
+    CHECK(bands.bands[9].maximumValue == 1.0);
+
+    CHECK_THROWS_WITH_AS(
+        classifyFiberValues(std::vector<double>{0.0, -1.0e-6}),
+        doctest::Contains("input 1"),
+        std::invalid_argument);
+    CHECK_THROWS_WITH_AS(
+        classifyFiberValues(std::vector<double>{1.0 + 1.0e-6}),
+        doctest::Contains("value="),
+        std::invalid_argument);
+    CHECK_THROWS_WITH_AS(
+        classifyFiberValues(std::vector<double>{
+            std::numeric_limits<double>::quiet_NaN()}),
+        doctest::Contains("value=nan"),
+        std::invalid_argument);
 
     std::vector<FiberletCropTraceLine> lines(values.size());
     for (std::size_t index = 0; index < lines.size(); ++index) {
