@@ -10,7 +10,6 @@ set(srcs
     ${CMAKE_SOURCE_DIR}/core/src/VCCollection.cpp
     ${vccollection_moc}
     VCAppMain.cpp
-    GuiStallSampler.cpp
     CState.cpp
     CState.hpp
     Keybinds.cpp

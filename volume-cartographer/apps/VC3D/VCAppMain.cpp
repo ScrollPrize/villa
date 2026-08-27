@@ -5,8 +5,6 @@
 #include <mimalloc.h>
 #endif
 
-#include "GuiStallSampler.hpp"
-
 #include <qapplication.h>
 #include <QAbstractSpinBox>
 #include <QCommandLineParser>
@@ -315,9 +313,6 @@ auto main(int argc, char* argv[]) -> int
     }
 
     QApplication app(argc, argv);
-    // Diagnostic: samples the GUI thread's backtrace whenever the event loop
-    // stalls, so freezes name their blocking frame in stderr.
-    vc3d::diag::installGuiStallSampler();
     // Wide surface-aligned Spiral overlays can legitimately exceed Qt's
     // 128-MiB default image-I/O allocation limit. Set the Qt runtime value
     // after QApplication construction because Qt may cache the environment

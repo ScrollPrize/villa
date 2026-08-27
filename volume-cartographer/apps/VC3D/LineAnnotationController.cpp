@@ -60,8 +60,6 @@
 #include <QMetaObject>
 #include <QMessageBox>
 #include <QScopedValueRollback>
-#include <QScopeGuard>
-#include <QElapsedTimer>
 #include <QMdiArea>
 #include <QMdiSubWindow>
 #include <QPoint>
@@ -1969,26 +1967,6 @@ LineAnnotationController::LineAnnotationController(CState* state,
     })
 {
     _lineSolvePool.setMaxThreadCount(2);
-    // GUI-stall watchdog: whenever the event loop is blocked long enough to
-    // delay this 100 ms heartbeat past 250 ms, log the stall. Purely
-    // diagnostic - it names any freeze no per-stage probe covers.
-    {
-        auto* stallTimer = new QTimer(this);
-        stallTimer->setInterval(100);
-        stallTimer->setTimerType(Qt::CoarseTimer);
-        auto lastTick = std::make_shared<QElapsedTimer>();
-        lastTick->start();
-        connect(stallTimer, &QTimer::timeout, this, [lastTick]() {
-            const qint64 elapsed = lastTick->elapsed();
-            if (elapsed > 250) {
-                Logger()->info(
-                    "Line annotation GUI stage: event=gui_stall stall_ms={}",
-                    elapsed - 100);
-            }
-            lastTick->restart();
-        });
-        stallTimer->start();
-    }
     if (_state) {
         connect(_state,
                 &CState::surfaceChanged,
@@ -6895,8 +6873,6 @@ LineAnnotationController::fiberSnapshotsFromStorageWithPaths() const
     // scan; everything else is served from _storageSnapshotCache. Rebuilding
     // the cache map each pass sweeps entries for files that vanished.
     std::map<fs::path, StorageSnapshotCacheEntry> freshCache;
-    size_t parsedFiles = 0;
-    const auto scanStart = Clock::now();
     const fs::path dir = fibersDir();
     std::error_code ec;
     if (!dir.empty() && fs::exists(dir, ec)) {
@@ -6923,7 +6899,6 @@ LineAnnotationController::fiberSnapshotsFromStorageWithPaths() const
             }
             try {
                 if (auto fiber = loadFiberFile(entry.path())) {
-                    ++parsedFiles;
                     const fs::path path = relativeFiberPath(*fiber);
                     FiberSnapshotWithPath snapshot{
                         path,
@@ -6946,15 +6921,6 @@ LineAnnotationController::fiberSnapshotsFromStorageWithPaths() const
         }
     }
     _storageSnapshotCache = std::move(freshCache);
-    const double scanMs = elapsedMs(scanStart, Clock::now());
-    if (scanMs >= 5.0) {
-        Logger()->info(
-            "Line annotation GUI stage: event=storage_snapshots ms={:.3f} "
-            "files={} parsed={}",
-            scanMs,
-            byPath.size(),
-            parsedFiles);
-    }
 
     for (const auto& fiber : _fibers) {
         const fs::path path = relativeFiberPath(fiber);
@@ -7322,8 +7288,6 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
                   session.suppressErrorDialogs);
         return;
     }
-    const double prepareMs = elapsedMs(updateStart, Clock::now());
-
     const bool editedExistingControl = !prepared.collapsedOldIndices.empty();
     const size_t collapsedControlCount = prepared.collapsedOldIndices.size();
     const std::vector<vc3d::line_annotation::LineControlPoint> branchRemapControls =
@@ -7378,7 +7342,6 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
 
     // Immediate feedback: the new control point appears in the overlays now;
     // the strip geometry itself follows when the asynchronous solve lands.
-    const auto overlayStart = Clock::now();
     if (pane->dialog) {
         pane->dialog->setGeneratedBranchOverlayData(
             controlMarkersForSession(session),
@@ -7389,17 +7352,14 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
         pane->dialog->setGeneratedPredSnapPoints(
             generatedPredSnapMarkers(session.controlPoints, session.predSnapSet));
     }
-    const double overlayMs = elapsedMs(overlayStart, Clock::now());
 
     const std::string updateEventName = collapsedControlCount > 1
         ? "control_collapse_span_update"
         : (editedExistingControl ? "control_edit_span_update"
                                  : "control_add_span_update");
     const double updateMs = elapsedMs(updateStart, Clock::now());
-    Logger()->info("Line annotation GUI stage: event={} prepare=geometric prepare_ms={:.3f} overlay_ms={:.3f} overall_ms={:.3f} points={}",
+    Logger()->info("Line annotation Lasagna stage timing: event={} overall_ms={:.3f} points={}",
                    updateEventName,
-                   prepareMs,
-                   overlayMs,
                    updateMs,
                    session.optimizedLine.points.size());
     writeLineDebugJson(updateEventName,
@@ -9747,14 +9707,7 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
                        session.optimizedLine,
                        &session.optimizationReport);
     if (updateGeneratedViews && !session.suppressGeneratedViews) {
-        const auto materializeStart = Clock::now();
         const bool materialized = materializeGeneratedViews(session);
-        Logger()->info(
-            "Line annotation GUI stage: event=materialize_views ok={} "
-            "materialize_ms={:.3f} points={}",
-            materialized,
-            elapsedMs(materializeStart, Clock::now()),
-            session.optimizedLine.points.size());
         if (!materialized) {
             session.taskState = LineAnnotationSession::TaskState::Failed;
             return false;
@@ -10390,17 +10343,9 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
         return;
     }
 
-    const auto finishStart = Clock::now();
     OptimizationTaskResult task = watcher->result();
     session.watcher = nullptr;
     session.runningSolveCancel.reset();
-    const auto logFinish = qScopeGuard([&finishStart]() {
-        const double ms = elapsedMs(finishStart, Clock::now());
-        if (ms >= 5.0) {
-            Logger()->info(
-                "Line annotation GUI stage: event=apply_total ms={:.3f}", ms);
-        }
-    });
 
     if (!session.solveQueue.mayPublish(session.runningSolveEpoch)) {
         // The session was mutated (or began shutdown) while this solve ran:
@@ -12387,17 +12332,7 @@ void LineAnnotationController::emitFiberSummaries()
             return liveIds.find(item.first) == liveIds.end();
         });
     }
-    const auto summariesStart = Clock::now();
-    auto summaries = fiberSummaries();
-    const double buildMs = elapsedMs(summariesStart, Clock::now());
-    const size_t fiberCount = summaries.size();
-    emit fibersChanged(std::move(summaries));
-    Logger()->info(
-        "Line annotation GUI stage: event=fiber_summaries build_ms={:.3f} "
-        "emit_ms={:.3f} fibers={}",
-        buildMs,
-        elapsedMs(summariesStart, Clock::now()) - buildMs,
-        fiberCount);
+    emit fibersChanged(fiberSummaries());
 }
 
 uint64_t LineAnnotationController::fiberIdForFileName(const std::string& fileName) const
@@ -12960,7 +12895,6 @@ void LineAnnotationController::dispatchSideStripIntersectionQuery(
         return;
     }
 
-    const auto requestBuildStart = Clock::now();
     SideStripIntersectionRequest request;
     request.fingerprint = fingerprint;
     request.suppressErrorDialogs =
@@ -12995,11 +12929,6 @@ void LineAnnotationController::dispatchSideStripIntersectionQuery(
                                                request.fibers,
                                                request.excludedFiberIds,
                                                request.branchLinks);
-    Logger()->info(
-        "Line annotation GUI stage: event=side_strip_request "
-        "snapshot_hash_ms={:.3f} fibers={}",
-        elapsedMs(requestBuildStart, Clock::now()),
-        request.fibers.size());
 
     if (request.fibers.empty() && request.branchLinks.empty()) {
         pane->dialog->setGeneratedSideStripIntersectionResult(0);
@@ -13328,10 +13257,6 @@ LineAnnotationController::runSideStripIntersectionQuery(
 void LineAnnotationController::startSideStripIntersectionQuery(
     SideStripIntersectionRequest request)
 {
-    Logger()->info(
-        "Line annotation GUI stage: event=side_strip_launch fibers={} branch_links={}",
-        request.fibers.size(),
-        request.branchLinks.size());
     _sideStripIntersectionRunning = true;
     _runningSideStripIntersectionToken = request.token;
     _runningSideStripIntersectionKey = request.cacheKey;
@@ -13454,16 +13379,6 @@ void LineAnnotationController::applyPartialSideStripIntersectionMarkers(
     const std::string& surfaceName,
     std::vector<SideStripMarker> markers)
 {
-    const auto partialStart = Clock::now();
-    const auto logPartial = qScopeGuard([&partialStart]() {
-        const double ms = elapsedMs(partialStart, Clock::now());
-        if (ms >= 5.0) {
-            Logger()->info(
-                "Line annotation GUI stage: event=side_strip_partial_apply ms={:.3f}",
-                ms);
-        }
-    });
-
     if (token != _latestSideStripIntersectionToken) {
         return;
     }
@@ -14652,7 +14567,6 @@ void LineAnnotationController::flushAllPendingSessionAutoSaves()
 
 void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session)
 {
-    const auto saveStart = Clock::now();
     // Any direct save supersedes a pending debounced autosave.
     session.autoSaveScheduled = false;
     try {
@@ -14692,7 +14606,6 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
         // Equality is judged on the serializer's own output, so every
         // persisted field participates by construction; only the generation
         // counter, which the snapshot bumps unconditionally, is excluded.
-        const auto probeStart = Clock::now();
         {
             const StoredFiber candidate =
                 makeStoredFiberSessionSnapshot(session).fiber;
@@ -14747,7 +14660,6 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
                     candidate.fileName, differing);
             }
         }
-        const double probeMs = elapsedMs(probeStart, Clock::now());
         const BranchMetadataSyncResult branchSync =
             syncLinkedBranchMetadataAfterFiberModification(session);
         StoredFiber fiber = makeStoredFiberSessionSnapshot(session).fiber;
@@ -14842,12 +14754,6 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
         }
         emitFiberSummaries();
         refreshBranchLineViews(savedFiberId);
-        Logger()->info(
-            "Line annotation GUI stage: event=session_save total_ms={:.3f} "
-            "probe_ms={:.3f} line_points={}",
-            elapsedMs(saveStart, Clock::now()),
-            probeMs,
-            session.optimizedLine.points.size());
     } catch (const std::exception& ex) {
         // Counted like an asynchronous write failure: callers that gate
         // destructive follow-ups on _fiberSaveFailureCount around a
