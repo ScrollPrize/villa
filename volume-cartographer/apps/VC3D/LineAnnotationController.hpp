@@ -600,6 +600,10 @@ private:
     // Invalidate every side-strip query stamped so far (see the token-domain
     // comment at the member declarations).
     void invalidateSideStripQueries();
+    // Recompute the latest scheduling intent after erasing pending work: a
+    // stale latest token defeats the running-query dedupe and re-queues
+    // identical work.
+    void refreshLatestSideStripIntersectionToken();
     // Cheap staleness proxy over everything the side-strip query reads (strip
     // surface identity, fiber data generation, each pane session's line
     // identity/epoch and branch count), computable without the all-fiber deep
