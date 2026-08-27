@@ -658,9 +658,27 @@ void combineSideStripPointHash(uint64_t& seed, const cv::Vec3f& point)
     combineSideStripHash(seed, hashSideStripDouble(point[2]));
 }
 
+// Hash of one fiber's query-relevant geometry, memoized alongside its
+// snapshot so an unchanged fiber is never re-hashed point by point.
+uint64_t sideStripFiberGeometryHash(const vc::atlas::FiberPolyline& fiber)
+{
+    uint64_t seed = 0x4649424552484153ULL;
+    combineSideStripHash(seed, fiber.id);
+    combineSideStripHash(seed, fiber.generation);
+    combineSideStripHash(seed, static_cast<uint64_t>(fiber.points.size()));
+    for (const auto& point : fiber.points) {
+        combineSideStripPointHash(seed, point.position);
+    }
+    combineSideStripHash(seed, static_cast<uint64_t>(fiber.controlPoints.size()));
+    for (const auto& point : fiber.controlPoints) {
+        combineSideStripPointHash(seed, point);
+    }
+    return seed;
+}
+
 uint64_t sideStripRequestCacheKey(
     const cv::Mat_<cv::Vec3f>& stripPoints,
-    const std::vector<vc::atlas::FiberPolyline>& fibers,
+    const std::vector<LineAnnotationController::SideStripFiberSnapshot>& fibers,
     const std::vector<uint64_t>& excludedFiberIds,
     const std::vector<vc::atlas::FiberSideStripLineQuery>& branchLinks)
 {
@@ -685,16 +703,7 @@ uint64_t sideStripRequestCacheKey(
     }
     combineSideStripHash(seed, static_cast<uint64_t>(fibers.size()));
     for (const auto& fiber : fibers) {
-        combineSideStripHash(seed, fiber.id);
-        combineSideStripHash(seed, fiber.generation);
-        combineSideStripHash(seed, static_cast<uint64_t>(fiber.points.size()));
-        for (const auto& point : fiber.points) {
-            combineSideStripPointHash(seed, point.position);
-        }
-        combineSideStripHash(seed, static_cast<uint64_t>(fiber.controlPoints.size()));
-        for (const auto& point : fiber.controlPoints) {
-            combineSideStripPointHash(seed, point);
-        }
+        combineSideStripHash(seed, fiber.geometryHash);
     }
     return seed;
 }
@@ -12583,73 +12592,117 @@ void LineAnnotationController::refreshBranchLineViews(uint64_t changedFiberId)
     }
 }
 
-std::vector<vc::atlas::FiberPolyline>
+std::vector<LineAnnotationController::SideStripFiberSnapshot>
 LineAnnotationController::fiberSnapshotsForSideStripQuery() const
 {
-    std::map<uint64_t, vc::atlas::FiberPolyline> byId;
+    // Per-fiber memoization: a snapshot (and its geometry hash) is rebuilt
+    // only when the fiber's geometry actually changed - the stored copy by
+    // its save generation, an open session by its line revision and edit
+    // epoch. Unchanged fibers cost two integer compares per query instead of
+    // a full polyline deep copy plus per-point hashing.
+    std::map<uint64_t, SideStripFiberSnapshot> byId;
 
-    auto makePolyline = [](uint64_t id,
-                           uint64_t generation,
-                           const std::vector<cv::Vec3d>& linePoints,
-                           const std::vector<cv::Vec3d>& controlPoints) {
-        vc::atlas::FiberPolyline polyline;
-        polyline.id = id;
-        polyline.generation = std::max<uint64_t>(uint64_t{1}, generation);
-        polyline.controlPoints = controlPoints;
-        polyline.points.reserve(linePoints.size());
+    const auto makePolyline = [](uint64_t id,
+                                 uint64_t generation,
+                                 const std::vector<cv::Vec3d>& linePoints,
+                                 std::vector<cv::Vec3d> controlPoints) {
+        auto polyline = std::make_shared<vc::atlas::FiberPolyline>();
+        polyline->id = id;
+        polyline->generation = std::max<uint64_t>(uint64_t{1}, generation);
+        polyline->controlPoints = std::move(controlPoints);
+        polyline->points.reserve(linePoints.size());
         for (const auto& point : linePoints) {
-            polyline.points.push_back(vc::atlas::FiberPoint{point, std::nullopt});
+            polyline->points.push_back(vc::atlas::FiberPoint{point, std::nullopt});
         }
-        return polyline;
+        SideStripFiberSnapshot snapshot;
+        snapshot.geometryHash = sideStripFiberGeometryHash(*polyline);
+        snapshot.polyline = std::move(polyline);
+        return snapshot;
     };
 
+    std::unordered_set<uint64_t> liveStoredIds;
     for (const auto& fiber : _fibers) {
         if (fiber.id == 0 || fiber.linePoints.size() < 2) {
             continue;
         }
-        byId[fiber.id] = makePolyline(fiber.id,
-                                      fiber.generation,
-                                      fiber.linePoints,
-                                      vc3d::line_annotation::storedControlPointPositions(
-                                          fiber.controlPoints));
+        liveStoredIds.insert(fiber.id);
+        auto cached = _sideStripStoredSnapshotCache.find(fiber.id);
+        if (cached == _sideStripStoredSnapshotCache.end() ||
+            cached->second.validityA != fiber.generation) {
+            SideStripSnapshotCacheEntry entry;
+            entry.validityA = fiber.generation;
+            entry.snapshot = makePolyline(
+                fiber.id,
+                fiber.generation,
+                fiber.linePoints,
+                vc3d::line_annotation::storedControlPointPositions(
+                    fiber.controlPoints));
+            cached = _sideStripStoredSnapshotCache
+                         .insert_or_assign(fiber.id, std::move(entry))
+                         .first;
+        }
+        byId[fiber.id] = cached->second.snapshot;
     }
 
+    std::unordered_set<uint64_t> liveSessionIds;
     for (const auto& pane : _panes) {
         const auto& session = pane.session;
         if (!session || session->fiberId == 0 || session->optimizedLine.points.size() < 2) {
             continue;
         }
-        uint64_t generation = 1;
-        if (auto it = std::find_if(_fibers.begin(),
-                                   _fibers.end(),
-                                   [id = session->fiberId](const StoredFiber& fiber) {
-                                       return fiber.id == id;
-                                   });
-            it != _fibers.end()) {
-            generation = std::max<uint64_t>(uint64_t{1}, it->generation + 1);
-        }
+        liveSessionIds.insert(session->fiberId);
+        auto cached = _sideStripSessionSnapshotCache.find(session->fiberId);
+        if (cached == _sideStripSessionSnapshotCache.end() ||
+            cached->second.validityA != session->lineRevision ||
+            cached->second.validityB != session->solveQueue.epoch()) {
+            uint64_t generation = 1;
+            if (auto it = std::find_if(_fibers.begin(),
+                                       _fibers.end(),
+                                       [id = session->fiberId](const StoredFiber& fiber) {
+                                           return fiber.id == id;
+                                       });
+                it != _fibers.end()) {
+                generation = std::max<uint64_t>(uint64_t{1}, it->generation + 1);
+            }
 
-        std::vector<cv::Vec3d> linePoints;
-        linePoints.reserve(session->optimizedLine.points.size());
-        for (const auto& point : session->optimizedLine.points) {
-            linePoints.push_back(point.position);
+            std::vector<cv::Vec3d> linePoints;
+            linePoints.reserve(session->optimizedLine.points.size());
+            for (const auto& point : session->optimizedLine.points) {
+                linePoints.push_back(point.position);
+            }
+            std::vector<cv::Vec3d> controlPoints;
+            controlPoints.reserve(session->controlPoints.size());
+            for (const auto& control : session->controlPoints) {
+                controlPoints.push_back(control.volumePoint);
+            }
+            SideStripSnapshotCacheEntry entry;
+            entry.validityA = session->lineRevision;
+            entry.validityB = session->solveQueue.epoch();
+            entry.snapshot = makePolyline(session->fiberId,
+                                          generation,
+                                          linePoints,
+                                          std::move(controlPoints));
+            cached = _sideStripSessionSnapshotCache
+                         .insert_or_assign(session->fiberId, std::move(entry))
+                         .first;
         }
-        std::vector<cv::Vec3d> controlPoints;
-        controlPoints.reserve(session->controlPoints.size());
-        for (const auto& control : session->controlPoints) {
-            controlPoints.push_back(control.volumePoint);
-        }
-        byId[session->fiberId] = makePolyline(session->fiberId,
-                                             generation,
-                                             linePoints,
-                                             controlPoints);
+        byId[session->fiberId] = cached->second.snapshot;
     }
 
-    std::vector<vc::atlas::FiberPolyline> snapshots;
+    // Sweep entries whose fibers/sessions vanished so the caches cannot grow
+    // unbounded across loads.
+    std::erase_if(_sideStripStoredSnapshotCache, [&](const auto& item) {
+        return liveStoredIds.find(item.first) == liveStoredIds.end();
+    });
+    std::erase_if(_sideStripSessionSnapshotCache, [&](const auto& item) {
+        return liveSessionIds.find(item.first) == liveSessionIds.end();
+    });
+
+    std::vector<SideStripFiberSnapshot> snapshots;
     snapshots.reserve(byId.size());
-    for (auto& [id, polyline] : byId) {
+    for (auto& [id, snapshot] : byId) {
         (void)id;
-        snapshots.push_back(std::move(polyline));
+        snapshots.push_back(std::move(snapshot));
     }
     return snapshots;
 }
@@ -12925,11 +12978,12 @@ LineAnnotationController::runSideStripIntersectionQuery(
                                                       request.excludedFiberIds.end());
         size_t segmentBudget = 0;
         for (const auto& fiber : request.fibers) {
-            if (excludedFiberIds.find(fiber.id) != excludedFiberIds.end() ||
-                fiber.points.size() < 2) {
+            if (!fiber.polyline ||
+                excludedFiberIds.find(fiber.polyline->id) != excludedFiberIds.end() ||
+                fiber.polyline->points.size() < 2) {
                 continue;
             }
-            segmentBudget += fiber.points.size() - 1;
+            segmentBudget += fiber.polyline->points.size() - 1;
         }
         const size_t branchBudget = request.branchLinks.size() * stripTriangleBudget;
         const size_t triangleIndexBudget = segmentBudget > 0 ? stripTriangleBudget : 0;
@@ -13092,7 +13146,9 @@ LineAnnotationController::runSideStripIntersectionQuery(
             options.workerThreads = workerThreadBudget;
             options.queryFibers.reserve(request.fibers.size());
             for (const auto& fiber : request.fibers) {
-                options.queryFibers.push_back(&fiber);
+                if (fiber.polyline) {
+                    options.queryFibers.push_back(fiber.polyline.get());
+                }
             }
             publishAggregateProgress("fiber geometry", triangleIndexOffset);
 

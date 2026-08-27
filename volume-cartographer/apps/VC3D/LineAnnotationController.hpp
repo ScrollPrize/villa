@@ -70,6 +70,17 @@ public:
         std::string eventName;
     };
 
+    // One fiber's polyline as the side-strip intersection query consumes
+    // it: an immutable shared snapshot plus a memoized hash of its points
+    // and control points. Snapshots are cached per fiber and rebuilt only
+    // when the fiber's geometry actually changed (stored generation, or the
+    // owning session's line revision/edit epoch), so a query no longer
+    // deep-copies and re-hashes every loaded fiber per placement.
+    struct SideStripFiberSnapshot {
+        std::shared_ptr<const vc::atlas::FiberPolyline> polyline;
+        uint64_t geometryHash = 0;
+    };
+
     struct FiberSummary {
         struct AlignmentMetrics {
             bool available = false;
@@ -524,7 +535,7 @@ private:
         uint64_t sourceFiberId = 0;
         std::vector<uint64_t> excludedFiberIds;
         cv::Mat_<cv::Vec3f> stripPoints;
-        std::vector<vc::atlas::FiberPolyline> fibers;
+        std::vector<SideStripFiberSnapshot> fibers;
         std::vector<vc::atlas::FiberSideStripLineQuery> branchLinks;
     };
 
@@ -805,7 +816,7 @@ private:
     [[nodiscard]] std::vector<std::vector<cv::Vec3f>> generatedBranchLinePointsForSession(
         const LineAnnotationSession& session) const;
     void refreshBranchLineViews(uint64_t changedFiberId = 0);
-    [[nodiscard]] std::vector<vc::atlas::FiberPolyline> fiberSnapshotsForSideStripQuery() const;
+    [[nodiscard]] std::vector<SideStripFiberSnapshot> fiberSnapshotsForSideStripQuery() const;
     void startSideStripIntersectionQuery(SideStripIntersectionRequest request);
     void updateSideStripIntersectionProgress(uint64_t token,
                                              const std::string& surfaceName,
@@ -1073,6 +1084,19 @@ private:
     std::vector<SideStripMarker> _lastSideStripIntersectionMarkers;
     QString _lastSideStripFingerprint;
     QString _runningSideStripFingerprint;
+    // Per-fiber snapshot caches behind fiberSnapshotsForSideStripQuery():
+    // stored fibers keyed by generation, open sessions keyed by
+    // (lineRevision, solve-queue epoch). Entries for fibers that vanished
+    // are swept on each rebuild.
+    struct SideStripSnapshotCacheEntry {
+        uint64_t validityA = 0;
+        uint64_t validityB = 0;
+        SideStripFiberSnapshot snapshot;
+    };
+    mutable std::unordered_map<uint64_t, SideStripSnapshotCacheEntry>
+        _sideStripStoredSnapshotCache;
+    mutable std::unordered_map<uint64_t, SideStripSnapshotCacheEntry>
+        _sideStripSessionSnapshotCache;
     bool _sideStripIntersectionRunning = false;
     std::optional<SideStripIntersectionRequest> _pendingSideStripIntersectionRequest;
     // Surfaces with a debounced side-strip dispatch scheduled.
