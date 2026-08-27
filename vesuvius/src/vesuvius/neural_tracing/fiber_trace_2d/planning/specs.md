@@ -5053,3 +5053,29 @@
   and Mixed, excluding undefined values. Tie-aware AUROC compares Mixed against
   both trusted groups, with the printed direction defining whether higher or
   lower values predict Mixed.
+- `--bp-inference sum-product` is valid only with `--bp-only` and selects
+  binary sum-product on exactly the same merged factor graph and central
+  straight hard-H seed. Omission retains min-sum. For factor costs
+  `E_same,E_diff` and positive temperature `T`, the log potentials are
+  `-E_same/T,-E_diff/T`; subtracting a common per-factor offset is allowed
+  because it must not alter any message ratio.
+- A directed sum-product message is
+  `ell_i->j=log m_i->j(H_j)-log m_i->j(V_j)`. Given cavity log odds `r`, its
+  raw update is
+  `logsumexp(-E_diff/T,r-E_same/T)-logsumexp(-E_same/T,r-E_diff/T)`.
+  The hard-H seed emits `(E_diff-E_same)/T`. All messages start at zero and
+  update synchronously as `old+damping*(raw-old)`, including seed messages;
+  convergence uses the maximum post-damping change.
+- Sum-product horizontalness is the normalized node marginal
+  `P(H)=sigmoid(sum incoming log messages)`, with the seed exactly one.
+  Unseeded components retain H/V gauge symmetry and therefore report `0.5`.
+  Marginals are exact on trees and approximate loopy-BP/Bethe marginals on
+  cyclic components after convergence. `message_limit` publishes the last
+  finite iterate with an explicitly nonconverged status.
+- Sum-product rejects all population-balance modes and balance-only target,
+  strength, iteration, and tolerance controls. Temperature scales factor
+  energies in sum-product; it remains only a post-hoc min-marginal display
+  scale in min-sum. Sum-product owns `<base>_bp_sum_product_p0.obj` through
+  `_p9.obj` and `<base>_bp_sum_product_consistency.csv`, which records its
+  inference name, temperature, and status. The existing soft same-label value
+  remains an endpoint-independence proxy rather than a pairwise marginal.

@@ -1,8 +1,8 @@
-# Task: Per-fiber BP constraint-consistency diagnostics
+# Task: Binary sum-product fiber belief propagation
 
-Evaluate whether disagreement with the retained perpendicular constraint graph
-can identify geometrically Mixed fibers. For every fiber, report hard resolved
-mismatches, unresolved links, strength-weighted mismatch, soft probabilistic
-mismatch, and conflicting H/V neighbor support from the BP horizontalness
-values. Run the diagnostics on the existing centered-384 full-Mixed cohort
-without rerunning the MILP or LP solvers.
+Add an experimental sum-product alternative to the existing binary min-sum
+fiber BP. Keep the same final no-split perpendicular factor graph and central
+straight H seed, but report normalized approximate `P(H)` marginals rather
+than a sigmoid of min-marginal cost gaps. Run it through the BP-only path and
+compare its constraint-consistency and Mixed-vs-trusted discrimination with
+the committed min-sum result.

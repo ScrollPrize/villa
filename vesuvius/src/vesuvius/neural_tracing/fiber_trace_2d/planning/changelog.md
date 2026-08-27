@@ -1456,3 +1456,12 @@
 - Added per-fiber hard, unresolved, strength-weighted, soft same-label, neighbor
   support-balance, and neighbor-certainty diagnostics with CSV output, grouped
   quantiles, and Mixed-vs-trusted AUROC.
+
+## 2026-08-27 - Binary sum-product BP experiment
+
+- Added deterministic log-space sum-product inference over the existing merged
+  perpendicular fiber factor graph, producing normalized approximate `P(H)`
+  marginals without changing the min-sum path.
+- Added exact-tree, damping, sign, gauge-symmetry, low-temperature,
+  nonconvergence, and deterministic-loop validation plus separate OBJ and CSV
+  artifacts with inference and temperature provenance.

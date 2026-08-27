@@ -42,6 +42,12 @@ struct FieldSolution {
     bool converged = false;
 };
 
+struct PreparedProblem {
+    Graph graph;
+    std::vector<double> normalizedArcWeights;
+    std::size_t seed = 0;
+};
+
 void validateConfig(const FiberTraceBeliefPropagationConfig& config)
 {
     const auto finite = [](double value) { return std::isfinite(value); };
@@ -180,6 +186,60 @@ Graph buildGraph(
     return graph;
 }
 
+PreparedProblem prepareProblem(
+    const std::vector<FiberletCropTraceLine>& traces,
+    const FiberTraceConstraintReport& constraints,
+    const FiberTraceBeliefPropagationConfig& config)
+{
+    if (traces.empty())
+        throw std::invalid_argument("BP requires at least one represented fiber");
+    const auto geometry = measureFiberTraceSeedGeometry(
+        traces, config.cropMinimumBaseXYZ, config.cropMaximumBaseXYZ);
+    const auto seed = selectCentralStraightFiberTrace(geometry);
+    if (!seed) {
+        throw std::invalid_argument(
+            "BP has no primary seed longer than half the nominal crop size");
+    }
+    for (const auto& trace : geometry.traces) {
+        if (!trace.valid) {
+            throw std::invalid_argument(
+                "BP requires finite nondegenerate represented fibers");
+        }
+    }
+
+    PreparedProblem problem;
+    problem.seed = *seed;
+    problem.graph = buildGraph(traces.size(), constraints);
+    problem.normalizedArcWeights.reserve(traces.size());
+    double totalArc = 0.0;
+    for (const auto& trace : geometry.traces)
+        totalArc += trace.arcLengthBaseVoxels;
+    const double meanArc = totalArc / static_cast<double>(traces.size());
+    for (const auto& trace : geometry.traces) {
+        problem.normalizedArcWeights.push_back(
+            trace.arcLengthBaseVoxels / meanArc);
+    }
+    return problem;
+}
+
+FiberTraceBeliefPropagationReport initializeReport(
+    const PreparedProblem& problem,
+    const FiberTraceBeliefPropagationConfig& config,
+    FiberTraceBeliefInference inference)
+{
+    FiberTraceBeliefPropagationReport report;
+    report.normalizedArcWeights = problem.normalizedArcWeights;
+    report.seedTraceIndex = problem.seed;
+    report.factors = problem.graph.factors.size();
+    report.mergedMeasurements = problem.graph.measurements;
+    report.connectedComponents = problem.graph.components;
+    report.isolatedTraces = problem.graph.isolated;
+    report.targetHorizontalFraction = config.targetHorizontalFraction;
+    report.inference = inference;
+    report.inferenceTemperature = config.horizontalnessTemperature;
+    return report;
+}
+
 double updateMessage(
     double cavityGap,
     double sameCost,
@@ -201,6 +261,26 @@ double horizontalness(double advantage, double temperature)
     }
     const double exponential = std::exp(scaled);
     return exponential / (1.0 + exponential);
+}
+
+double logAddExp(double a, double b)
+{
+    const double maximum = std::max(a, b);
+    return maximum + std::log1p(std::exp(std::min(a, b) - maximum));
+}
+
+double updateSumProductMessage(
+    double cavityLogOdds,
+    double logSamePotential,
+    double logDifferentPotential)
+{
+    const double targetH = logAddExp(
+        logDifferentPotential,
+        cavityLogOdds + logSamePotential);
+    const double targetV = logAddExp(
+        logSamePotential,
+        cavityLogOdds + logDifferentPotential);
+    return targetH - targetV;
 }
 
 FieldSolution solveField(
@@ -338,6 +418,18 @@ const char* fiberTraceBalanceModeName(FiberTraceBalanceMode mode) noexcept
     return "invalid";
 }
 
+const char* fiberTraceBeliefInferenceName(
+    FiberTraceBeliefInference inference) noexcept
+{
+    switch (inference) {
+    case FiberTraceBeliefInference::MinSum:
+        return "min_sum";
+    case FiberTraceBeliefInference::SumProduct:
+        return "sum_product";
+    }
+    return "invalid";
+}
+
 FiberTraceBeliefPropagationReport solveFiberTraceBeliefPropagation(
     const std::vector<FiberletCropTraceLine>& traces,
     const FiberTraceConstraintReport& constraints,
@@ -345,44 +437,15 @@ FiberTraceBeliefPropagationReport solveFiberTraceBeliefPropagation(
 {
     const auto started = std::chrono::steady_clock::now();
     validateConfig(config);
-    if (traces.empty())
-        throw std::invalid_argument("BP requires at least one represented fiber");
-
-    const auto geometry = measureFiberTraceSeedGeometry(
-        traces, config.cropMinimumBaseXYZ, config.cropMaximumBaseXYZ);
-    const auto seed = selectCentralStraightFiberTrace(geometry);
-    if (!seed) {
-        throw std::invalid_argument(
-            "BP has no primary seed longer than half the nominal crop size");
-    }
-    for (const auto& trace : geometry.traces) {
-        if (!trace.valid) {
-            throw std::invalid_argument(
-                "BP requires finite nondegenerate represented fibers");
-        }
-    }
-    const Graph graph = buildGraph(traces.size(), constraints);
-
-    std::vector<double> weights;
-    weights.reserve(traces.size());
-    double totalArc = 0.0;
-    for (const auto& trace : geometry.traces)
-        totalArc += trace.arcLengthBaseVoxels;
-    const double meanArc = totalArc / static_cast<double>(traces.size());
-    for (const auto& trace : geometry.traces)
-        weights.push_back(trace.arcLengthBaseVoxels / meanArc);
-
-    FiberTraceBeliefPropagationReport report;
-    report.normalizedArcWeights = weights;
-    report.seedTraceIndex = *seed;
-    report.factors = graph.factors.size();
-    report.mergedMeasurements = graph.measurements;
-    report.connectedComponents = graph.components;
-    report.isolatedTraces = graph.isolated;
-    report.targetHorizontalFraction = config.targetHorizontalFraction;
+    const auto problem = prepareProblem(traces, constraints, config);
+    const auto& graph = problem.graph;
+    const auto& weights = problem.normalizedArcWeights;
+    const std::size_t seed = problem.seed;
+    auto report = initializeReport(
+        problem, config, FiberTraceBeliefInference::MinSum);
 
     if (config.balanceMode == FiberTraceBalanceMode::None) {
-        auto solution = solveField(graph, weights, *seed, 0.0, config);
+        auto solution = solveField(graph, weights, seed, 0.0, config);
         assignFieldSolution(report, std::move(solution), 0.0);
         report.balanceConverged = true;
         report.status = report.messageConverged
@@ -397,7 +460,7 @@ FiberTraceBeliefPropagationReport solveFiberTraceBeliefPropagation(
         for (std::size_t outer = 0;
              outer < config.maximumBalanceIterations;
              ++outer) {
-            auto current = solveField(graph, weights, *seed, field, config);
+            auto current = solveField(graph, weights, seed, field, config);
             report.messageIterations += current.iterations;
             report.balanceIterations = outer + 1;
             const double desired = config.softBalanceStrength *
@@ -426,8 +489,8 @@ FiberTraceBeliefPropagationReport solveFiberTraceBeliefPropagation(
             graph, weights, config.horizontalnessTemperature);
         double lowField = -bound;
         double highField = bound;
-        auto low = solveField(graph, weights, *seed, lowField, config);
-        auto high = solveField(graph, weights, *seed, highField, config);
+        auto low = solveField(graph, weights, seed, lowField, config);
+        auto high = solveField(graph, weights, seed, highField, config);
         report.messageIterations = low.iterations + high.iterations;
         report.balanceIterations = 2;
         const auto error = [&](const FieldSolution& solution) {
@@ -449,7 +512,7 @@ FiberTraceBeliefPropagationReport solveFiberTraceBeliefPropagation(
                  ++outer) {
                 const double middleField = 0.5 * (lowField + highField);
                 auto middle = solveField(
-                    graph, weights, *seed, middleField, config);
+                    graph, weights, seed, middleField, config);
                 report.messageIterations += middle.iterations;
                 report.balanceIterations = outer + 1;
                 if (!middle.converged)
@@ -489,7 +552,7 @@ FiberTraceBeliefPropagationReport solveFiberTraceBeliefPropagation(
                     high.horizontalness[trace],
                     highWeight);
                 mixture.horizontalness[trace] = value;
-                if (trace == *seed) {
+                if (trace == seed) {
                     mixture.advantage[trace] =
                         std::numeric_limits<double>::infinity();
                 } else if (value <= 0.0) {
@@ -525,6 +588,120 @@ FiberTraceBeliefPropagationReport solveFiberTraceBeliefPropagation(
                     : balanceConverged ? "converged" : "balance_limit";
     }
 
+    report.solveSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    return report;
+}
+
+FiberTraceBeliefPropagationReport solveFiberTraceSumProduct(
+    const std::vector<FiberletCropTraceLine>& traces,
+    const FiberTraceConstraintReport& constraints,
+    const FiberTraceBeliefPropagationConfig& config)
+{
+    const auto started = std::chrono::steady_clock::now();
+    validateConfig(config);
+    if (config.balanceMode != FiberTraceBalanceMode::None) {
+        throw std::invalid_argument(
+            "Sum-product BP does not support population balance modes");
+    }
+    const auto problem = prepareProblem(traces, constraints, config);
+    const auto& graph = problem.graph;
+    const std::size_t nodeCount = graph.adjacency.size();
+    const double temperature = config.horizontalnessTemperature;
+
+    std::vector<double> logSame(graph.factors.size());
+    std::vector<double> logDifferent(graph.factors.size());
+    for (std::size_t index = 0; index < graph.factors.size(); ++index) {
+        const double minimumCost = std::min(
+            graph.factors[index].sameCost,
+            graph.factors[index].differentCost);
+        logSame[index] =
+            -(graph.factors[index].sameCost - minimumCost) / temperature;
+        logDifferent[index] =
+            -(graph.factors[index].differentCost - minimumCost) / temperature;
+        if (!std::isfinite(logSame[index]) ||
+            !std::isfinite(logDifferent[index])) {
+            throw std::invalid_argument(
+                "Sum-product BP temperature is too small for factor costs");
+        }
+    }
+
+    std::vector<double> aToB(graph.factors.size(), 0.0);
+    std::vector<double> bToA(graph.factors.size(), 0.0);
+    std::vector<double> nextAToB(graph.factors.size(), 0.0);
+    std::vector<double> nextBToA(graph.factors.size(), 0.0);
+    std::vector<double> totalLogOdds(nodeCount, 0.0);
+
+    auto report = initializeReport(
+        problem, config, FiberTraceBeliefInference::SumProduct);
+    for (std::size_t iteration = 0;
+         iteration < config.maximumMessageIterations;
+         ++iteration) {
+        std::fill(totalLogOdds.begin(), totalLogOdds.end(), 0.0);
+        for (std::size_t index = 0; index < graph.factors.size(); ++index) {
+            totalLogOdds[graph.factors[index].a] += bToA[index];
+            totalLogOdds[graph.factors[index].b] += aToB[index];
+        }
+
+        double residual = 0.0;
+        for (std::size_t index = 0; index < graph.factors.size(); ++index) {
+            const auto& factor = graph.factors[index];
+            const double rawAToB = factor.a == problem.seed
+                ? logSame[index] - logDifferent[index]
+                : updateSumProductMessage(
+                      totalLogOdds[factor.a] - bToA[index],
+                      logSame[index],
+                      logDifferent[index]);
+            const double rawBToA = factor.b == problem.seed
+                ? logSame[index] - logDifferent[index]
+                : updateSumProductMessage(
+                      totalLogOdds[factor.b] - aToB[index],
+                      logSame[index],
+                      logDifferent[index]);
+            nextAToB[index] = aToB[index] + config.messageDamping *
+                (rawAToB - aToB[index]);
+            nextBToA[index] = bToA[index] + config.messageDamping *
+                (rawBToA - bToA[index]);
+            residual = std::max({
+                residual,
+                std::abs(nextAToB[index] - aToB[index]),
+                std::abs(nextBToA[index] - bToA[index]),
+            });
+        }
+        aToB.swap(nextAToB);
+        bToA.swap(nextBToA);
+        report.messageIterations = iteration + 1;
+        report.messageResidual = residual;
+        if (residual <= config.messageResidualTolerance) {
+            report.messageConverged = true;
+            break;
+        }
+    }
+
+    std::fill(totalLogOdds.begin(), totalLogOdds.end(), 0.0);
+    for (std::size_t index = 0; index < graph.factors.size(); ++index) {
+        totalLogOdds[graph.factors[index].a] += bToA[index];
+        totalLogOdds[graph.factors[index].b] += aToB[index];
+    }
+    report.horizontalness.resize(nodeCount);
+    report.logOdds.resize(nodeCount);
+    double weightedHorizontal = 0.0;
+    double totalWeight = 0.0;
+    for (std::size_t node = 0; node < nodeCount; ++node) {
+        report.logOdds[node] = node == problem.seed
+            ? std::numeric_limits<double>::infinity()
+            : totalLogOdds[node];
+        report.horizontalness[node] = node == problem.seed
+            ? 1.0
+            : horizontalness(totalLogOdds[node], 1.0);
+        weightedHorizontal += problem.normalizedArcWeights[node] *
+            report.horizontalness[node];
+        totalWeight += problem.normalizedArcWeights[node];
+    }
+    report.achievedHorizontalFraction = weightedHorizontal / totalWeight;
+    report.status = report.messageConverged
+        ? "converged"
+        : "message_limit";
     report.solveSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - started).count();
     return report;

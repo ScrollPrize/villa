@@ -634,6 +634,34 @@ can be high when neighbors themselves are uncertain, so
 equal-per-fiber min/mean/median/p90/max values by initial reference group and
 tie-aware AUROC values for Mixed versus trusted fibers.
 
+Add `--bp-inference sum-product` to run binary sum-product BP over the same
+merged perpendicular factor graph and the same hard-H central straight seed:
+
+```bash
+volume-cartographer/build/bin/vc_fiber_trace_chunk direction-ablation crop_traces.zarr --normal-manifest normals.lasagna.json --output crop_bp --direction-dominance 0.9 --piece-length 1000000000 --perpendicular-only --bp-only --bp-inference sum-product
+```
+
+For same-label and different-label factor costs `E_same` and `E_diff`, this
+mode uses potentials `exp(-E_same/T)` and `exp(-E_diff/T)`, where `T` is
+`--bp-temperature`. Messages are normalized H-vs-V log ratios and the reported
+horizontalness is `P(H)`, obtained directly from the node log odds. These are
+exact marginals on trees and loopy-BP approximations after convergence on
+cyclic graphs. A `message_limit` status exposes the final finite iterate but
+does not claim convergence.
+
+Temperature has different semantics in the two modes. Sum-product applies it
+to factor energies during inference; min-sum applies it only when mapping a
+min-marginal advantage to a display value. Sum-product accepts the shared
+message-iteration, damping, and residual controls but rejects `--bp-balance`
+and the min-sum-only target, balance-strength, balance-iteration, and balance-
+tolerance controls.
+
+Sum-product writes `<base>_bp_sum_product_p0.obj` through `_p9.obj` and
+`<base>_bp_sum_product_consistency.csv`, separately from min-sum artifacts.
+The CSV records its inference name, temperature, and convergence status. The
+soft same-label diagnostic remains an endpoint-independence proxy; it is not a
+sum-product pairwise marginal.
+
 ## Quality groups
 
 Visualization stably sorts traces by ascending cost density and then stored

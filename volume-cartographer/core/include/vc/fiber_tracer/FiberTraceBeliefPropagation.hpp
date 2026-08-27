@@ -17,6 +17,11 @@ enum class FiberTraceBalanceMode : unsigned char {
     Tight,
 };
 
+enum class FiberTraceBeliefInference : unsigned char {
+    MinSum,
+    SumProduct,
+};
+
 struct FiberTraceBeliefPropagationConfig {
     FiberTraceBalanceMode balanceMode = FiberTraceBalanceMode::None;
     double targetHorizontalFraction = 0.5;
@@ -34,6 +39,7 @@ struct FiberTraceBeliefPropagationConfig {
 struct FiberTraceBeliefPropagationReport {
     std::vector<double> horizontalness;
     std::vector<double> minMarginalAdvantage;
+    std::vector<double> logOdds;
     std::vector<double> normalizedArcWeights;
     std::size_t seedTraceIndex = 0;
     std::size_t factors = 0;
@@ -49,6 +55,8 @@ struct FiberTraceBeliefPropagationReport {
     double solveSeconds = 0.0;
     bool messageConverged = false;
     bool balanceConverged = false;
+    FiberTraceBeliefInference inference = FiberTraceBeliefInference::MinSum;
+    double inferenceTemperature = 0.0;
     std::string status;
 };
 
@@ -78,8 +86,17 @@ struct FiberTraceConstraintConsistencyReport {
 [[nodiscard]] const char* fiberTraceBalanceModeName(
     FiberTraceBalanceMode mode) noexcept;
 
+[[nodiscard]] const char* fiberTraceBeliefInferenceName(
+    FiberTraceBeliefInference inference) noexcept;
+
 [[nodiscard]] FiberTraceBeliefPropagationReport
 solveFiberTraceBeliefPropagation(
+    const std::vector<FiberletCropTraceLine>& traces,
+    const FiberTraceConstraintReport& constraints,
+    const FiberTraceBeliefPropagationConfig& config);
+
+[[nodiscard]] FiberTraceBeliefPropagationReport
+solveFiberTraceSumProduct(
     const std::vector<FiberletCropTraceLine>& traces,
     const FiberTraceConstraintReport& constraints,
     const FiberTraceBeliefPropagationConfig& config);

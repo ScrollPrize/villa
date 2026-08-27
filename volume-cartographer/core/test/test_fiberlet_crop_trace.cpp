@@ -2636,6 +2636,37 @@ std::vector<double> bruteForceBpAdvantages(
     return advantages;
 }
 
+std::vector<double> bruteForceBpMarginals(
+    std::size_t count,
+    std::size_t seed,
+    const FiberTraceConstraintReport& constraints,
+    double temperature)
+{
+    std::vector<double> horizontalWeight(count, 0.0);
+    double partition = 0.0;
+    for (std::size_t bits = 0; bits < (std::size_t{1} << count); ++bits) {
+        if (((bits >> seed) & 1U) == 0)
+            continue;
+        double energy = 0.0;
+        for (const auto& constraint : constraints.constraints) {
+            const bool a = ((bits >> constraint.pieceA) & 1U) != 0;
+            const bool b = ((bits >> constraint.pieceB) & 1U) != 0;
+            energy += a == b
+                ? 1.0 - constraint.parallelScore
+                : constraint.parallelScore;
+        }
+        const double weight = std::exp(-energy / temperature);
+        partition += weight;
+        for (std::size_t node = 0; node < count; ++node) {
+            if (((bits >> node) & 1U) != 0)
+                horizontalWeight[node] += weight;
+        }
+    }
+    for (double& value : horizontalWeight)
+        value /= partition;
+    return horizontalWeight;
+}
+
 }  // namespace
 
 TEST_CASE("Binary min-sum BP matches exact seeded perpendicular tree")
@@ -2774,6 +2805,154 @@ TEST_CASE("Binary min-sum BP rejects split and non-perpendicular inputs")
         solveFiberTraceBeliefPropagation(lines, constraints, bpConfig()),
         doctest::Contains("continuity"),
         std::invalid_argument);
+}
+
+TEST_CASE("Binary sum-product BP matches exact seeded tree marginals")
+{
+    const auto lines = bpLines(4);
+    auto constraints = bpConstraints(lines.size());
+    addBpConstraint(constraints, 0, 1, 0.1);
+    addBpConstraint(constraints, 1, 2, 0.2);
+    addBpConstraint(constraints, 1, 3, 0.35);
+    addBpConstraint(constraints, 0, 1, 0.25);
+
+    for (const double temperature : {0.25, 1.0}) {
+        auto config = bpConfig();
+        config.horizontalnessTemperature = temperature;
+        config.messageDamping = 1.0;
+        const auto report = solveFiberTraceSumProduct(
+            lines, constraints, config);
+        const auto exact = bruteForceBpMarginals(
+            lines.size(), report.seedTraceIndex, constraints, temperature);
+        CHECK(report.inference == FiberTraceBeliefInference::SumProduct);
+        CHECK(report.inferenceTemperature == doctest::Approx(temperature));
+        CHECK(report.status == "converged");
+        CHECK(report.horizontalness[report.seedTraceIndex] ==
+              doctest::Approx(1.0));
+        REQUIRE(report.logOdds.size() == lines.size());
+        for (std::size_t node = 0; node < lines.size(); ++node) {
+            CHECK(report.horizontalness[node] ==
+                  doctest::Approx(exact[node]).epsilon(1.0e-10));
+        }
+
+        auto reorderedConstraints = constraints;
+        std::reverse(
+            reorderedConstraints.constraints.begin(),
+            reorderedConstraints.constraints.end());
+        const auto reordered = solveFiberTraceSumProduct(
+            lines, reorderedConstraints, config);
+        CHECK(reordered.horizontalness == report.horizontalness);
+        CHECK(reordered.logOdds == report.logOdds);
+
+        config.messageDamping = 0.25;
+        const auto damped = solveFiberTraceSumProduct(
+            lines, constraints, config);
+        CHECK(damped.status == "converged");
+        for (std::size_t node = 0; node < lines.size(); ++node) {
+            CHECK(damped.horizontalness[node] ==
+                  doctest::Approx(exact[node]).epsilon(1.0e-10));
+        }
+    }
+}
+
+TEST_CASE("Binary sum-product BP uses the expected perpendicular sign")
+{
+    const auto lines = bpLines(2);
+    auto constraints = bpConstraints(lines.size());
+    addBpConstraint(constraints, 0, 1, 0.1);
+    auto config = bpConfig();
+    config.horizontalnessTemperature = 0.4;
+    const auto report = solveFiberTraceSumProduct(
+        lines, constraints, config);
+    const double expected = 1.0 / (1.0 + std::exp(2.0));
+    CHECK(report.seedTraceIndex == 0);
+    CHECK(report.horizontalness[0] == doctest::Approx(1.0));
+    CHECK(report.horizontalness[1] ==
+          doctest::Approx(expected).epsilon(1.0e-10));
+    CHECK(report.logOdds[1] == doctest::Approx(-2.0).epsilon(1.0e-10));
+}
+
+TEST_CASE("Binary sum-product BP preserves unsupported gauge uncertainty")
+{
+    const auto lines = bpLines(4);
+    auto constraints = bpConstraints(lines.size());
+    addBpConstraint(constraints, 0, 1, 0.0);
+    addBpConstraint(constraints, 2, 3, 0.0);
+    const auto report = solveFiberTraceSumProduct(
+        lines, constraints, bpConfig());
+    CHECK(report.seedTraceIndex == 0);
+    CHECK(report.horizontalness[0] == doctest::Approx(1.0));
+    CHECK(report.horizontalness[2] == doctest::Approx(0.5));
+    CHECK(report.horizontalness[3] == doctest::Approx(0.5));
+}
+
+TEST_CASE("Binary sum-product BP remains stable at low temperature")
+{
+    const auto lines = bpLines(3);
+    auto constraints = bpConstraints(lines.size());
+    addBpConstraint(constraints, 0, 1, 0.1);
+    addBpConstraint(constraints, 0, 1, 0.1);
+    addBpConstraint(constraints, 1, 2, 0.1);
+    auto config = bpConfig();
+    config.horizontalnessTemperature = 1.0e-6;
+    const auto report = solveFiberTraceSumProduct(
+        lines, constraints, config);
+    CHECK(report.messageConverged);
+    for (const double value : report.horizontalness)
+        CHECK(std::isfinite(value));
+    for (std::size_t node = 0; node < report.logOdds.size(); ++node) {
+        if (node != report.seedTraceIndex)
+            CHECK(std::isfinite(report.logOdds[node]));
+    }
+
+    config.balanceMode = FiberTraceBalanceMode::Soft;
+    CHECK_THROWS_WITH_AS(
+        solveFiberTraceSumProduct(lines, constraints, config),
+        doctest::Contains("does not support"),
+        std::invalid_argument);
+    config.balanceMode = FiberTraceBalanceMode::None;
+    config.horizontalnessTemperature = 0.0;
+    CHECK_THROWS_WITH_AS(
+        solveFiberTraceSumProduct(lines, constraints, config),
+        doctest::Contains("temperature"),
+        std::invalid_argument);
+}
+
+TEST_CASE("Binary sum-product BP reports last-iterate message limits")
+{
+    const auto lines = bpLines(3);
+    auto constraints = bpConstraints(lines.size());
+    addBpConstraint(constraints, 0, 1, 0.1);
+    addBpConstraint(constraints, 1, 2, 0.1);
+    auto config = bpConfig();
+    config.maximumMessageIterations = 1;
+    config.messageResidualTolerance = 0.0;
+    const auto limited = solveFiberTraceSumProduct(
+        lines, constraints, config);
+    CHECK(limited.status == "message_limit");
+    CHECK_FALSE(limited.messageConverged);
+    CHECK(limited.messageIterations == 1);
+    for (const double value : limited.horizontalness)
+        CHECK(std::isfinite(value));
+
+    const auto seedOnly = solveFiberTraceSumProduct(
+        bpLines(1), bpConstraints(1), bpConfig());
+    CHECK(seedOnly.status == "converged");
+    CHECK(seedOnly.factors == 0);
+    CHECK(seedOnly.horizontalness == std::vector<double>{1.0});
+
+    auto loopConstraints = bpConstraints(lines.size());
+    addBpConstraint(loopConstraints, 0, 1, 0.1);
+    addBpConstraint(loopConstraints, 1, 2, 0.2);
+    addBpConstraint(loopConstraints, 2, 0, 0.3);
+    config = bpConfig();
+    const auto first = solveFiberTraceSumProduct(
+        lines, loopConstraints, config);
+    const auto second = solveFiberTraceSumProduct(
+        lines, loopConstraints, config);
+    CHECK(first.horizontalness == second.horizontalness);
+    for (const double value : first.horizontalness)
+        CHECK(std::isfinite(value));
 }
 
 TEST_CASE("BP consistency separates resolved mismatches and uncertainty")

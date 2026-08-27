@@ -71,6 +71,8 @@ struct Options {
     std::size_t postIterations = 0;
     double postInfluence = 1.0;
     BpBalanceSelection bpBalance = BpBalanceSelection::None;
+    vc::fiber_tracer::FiberTraceBeliefInference bpInference =
+        vc::fiber_tracer::FiberTraceBeliefInference::MinSum;
     bool bpOnly = false;
     vc::fiber_tracer::FiberTraceBeliefPropagationConfig bp;
     bool hasBounds = false;
@@ -83,6 +85,8 @@ struct Options {
     bool hasAblationOnlyOption = false;
     bool hasPostInfluenceOption = false;
     bool hasBpTuningOption = false;
+    bool hasBpInferenceOption = false;
+    bool hasBpBalanceTuningOption = false;
 };
 
 [[noreturn]] void fail(const std::string& message)
@@ -138,6 +142,7 @@ void usage(const char* executable)
               << "  --post-influence F        neighbor confidence support width in (0,1] [1]\n\n"
               << "Belief-propagation options (direction-ablation only):\n"
               << "  --bp-only                 run only final-cohort BP; skip HiGHS\n"
+              << "  --bp-inference MODE       min-sum or sum-product [min-sum]\n"
               << "  --bp-balance MODE         soft, tight, or both [disabled]\n"
               << "  --bp-target F             arc-weighted H fraction [0.5]\n"
               << "  --bp-soft-strength F      quadratic balance strength [1]\n"
@@ -315,6 +320,21 @@ Options parse(int argc, char** argv)
             options.bpOnly = true;
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
+        } else if (argument == "--bp-inference") {
+            const std::string inference = value(
+                index, argc, argv, "--bp-inference");
+            if (inference == "min-sum") {
+                options.bpInference = vc::fiber_tracer::
+                    FiberTraceBeliefInference::MinSum;
+            } else if (inference == "sum-product") {
+                options.bpInference = vc::fiber_tracer::
+                    FiberTraceBeliefInference::SumProduct;
+            } else {
+                fail("--bp-inference must be min-sum or sum-product");
+            }
+            options.hasBpInferenceOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
         } else if (argument == "--bp-balance") {
             const std::string mode = value(index, argc, argv, "--bp-balance");
             if (mode == "soft")
@@ -335,6 +355,7 @@ Options parse(int argc, char** argv)
                 fail("--bp-target must be in [0, 1]");
             }
             options.hasBpTuningOption = true;
+            options.hasBpBalanceTuningOption = true;
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
         } else if (argument == "--bp-soft-strength") {
@@ -343,6 +364,7 @@ Options parse(int argc, char** argv)
             if (options.bp.softBalanceStrength < 0.0)
                 fail("--bp-soft-strength must be nonnegative");
             options.hasBpTuningOption = true;
+            options.hasBpBalanceTuningOption = true;
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
         } else if (argument == "--bp-temperature") {
@@ -367,6 +389,7 @@ Options parse(int argc, char** argv)
             if (options.bp.maximumBalanceIterations == 0)
                 fail("--bp-balance-iterations must be positive");
             options.hasBpTuningOption = true;
+            options.hasBpBalanceTuningOption = true;
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
         } else if (argument == "--bp-damping") {
@@ -392,6 +415,7 @@ Options parse(int argc, char** argv)
             if (options.bp.balanceTolerance < 0.0)
                 fail("--bp-balance-tolerance must be nonnegative");
             options.hasBpTuningOption = true;
+            options.hasBpBalanceTuningOption = true;
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
         } else if (argument == "--sample-step") {
@@ -560,6 +584,18 @@ Options parse(int argc, char** argv)
             options.bpBalance == BpBalanceSelection::None &&
             !options.bpOnly) {
             fail("BP tuning controls require --bp-balance");
+        }
+        if (options.hasBpInferenceOption && !options.bpOnly)
+            fail("--bp-inference requires --bp-only");
+        if (options.bpInference ==
+                vc::fiber_tracer::FiberTraceBeliefInference::SumProduct &&
+            options.bpBalance != BpBalanceSelection::None) {
+            fail("sum-product BP does not support --bp-balance");
+        }
+        if (options.bpInference ==
+                vc::fiber_tracer::FiberTraceBeliefInference::SumProduct &&
+            options.hasBpBalanceTuningOption) {
+            fail("sum-product BP does not accept balance tuning controls");
         }
         if ((options.bpOnly ||
              options.bpBalance != BpBalanceSelection::None) &&
@@ -1077,8 +1113,14 @@ void writeAndPrintBpReport(
     }
     const std::string modeName =
         vc::fiber_tracer::fiberTraceBalanceModeName(mode);
+    const std::string inferenceName =
+        vc::fiber_tracer::fiberTraceBeliefInferenceName(report.inference);
+    const std::string artifactName = report.inference ==
+            vc::fiber_tracer::FiberTraceBeliefInference::SumProduct
+        ? inferenceName
+        : modeName;
     const auto outputBase = output.parent_path() /
-        (output.stem().string() + "_bp_" + modeName);
+        (output.stem().string() + "_bp_" + artifactName);
     const auto bands =
         vc::fiber_tracer::classifyFiberValues(report.horizontalness);
     const auto paths = vc::fiber_tracer::writeFiberletCropValueBandObjs(
@@ -1104,13 +1146,18 @@ void writeAndPrintBpReport(
         vc::fiber_tracer::analyzeFiberTraceConstraintConsistency(
             constraints, report.horizontalness);
     const auto csv = output.parent_path() /
-        (output.stem().string() + "_bp_" + modeName +
+        (output.stem().string() + "_bp_" + artifactName +
          "_consistency.csv");
     std::ofstream csvOutput(csv);
     if (!csvOutput)
         throw std::runtime_error("failed to open BP consistency CSV: " + csv.string());
+    csvOutput << "trace,original_trace,reference,";
+    if (report.inference ==
+        vc::fiber_tracer::FiberTraceBeliefInference::SumProduct) {
+        csvOutput << "bp_inference,bp_temperature,";
+    }
     csvOutput
-        << "trace,original_trace,reference,bp_status,vertical_threshold,"
+        << "bp_status,vertical_threshold,"
            "horizontal_threshold,horizontalness,degree,incident_measurements,"
            "total_strength,"
            "resolved_degree,resolved_strength,unresolved_degree,"
@@ -1127,8 +1174,13 @@ void writeAndPrintBpReport(
     for (std::size_t trace = 0; trace < consistency.traces.size(); ++trace) {
         const auto& current = consistency.traces[trace];
         csvOutput << trace << ',' << originalTraceIndices[trace] << ','
-                  << directionName(directions[trace]) << ',' << report.status
-                  << ',' << consistency.verticalThreshold << ','
+                  << directionName(directions[trace]) << ',';
+        if (report.inference ==
+            vc::fiber_tracer::FiberTraceBeliefInference::SumProduct) {
+            csvOutput << inferenceName << ',' << report.inferenceTemperature
+                      << ',';
+        }
+        csvOutput << report.status << ',' << consistency.verticalThreshold << ','
                   << consistency.horizontalThreshold << ','
                   << report.horizontalness[trace] << ',' << current.degree
                   << ',' << current.incidentMeasurements << ','
@@ -1150,26 +1202,43 @@ void writeAndPrintBpReport(
     }
     if (!csvOutput)
         throw std::runtime_error("failed to write BP consistency CSV: " + csv.string());
-    std::cout << std::fixed << std::setprecision(6)
-              << "fiber direction min-sum BP\n"
-              << "mode  status  fibers  factors  measurements  components"
-                 "  isolated  seed  seed_ref  message_iterations"
-                 "  balance_iterations  message_residual  field  target_h"
-                 "  achieved_h  min_h  mean_h  max_h  seconds\n"
-              << modeName << "  " << report.status << "  "
-              << lines.size() << "  " << report.factors << "  "
-              << report.mergedMeasurements << "  "
-              << report.connectedComponents << "  "
-              << report.isolatedTraces << "  " << report.seedTraceIndex
-              << "  " << directionName(directions[report.seedTraceIndex])
-              << "  " << report.messageIterations << "  "
-              << report.balanceIterations << "  "
-              << report.messageResidual << "  " << report.balanceField
-              << "  " << report.targetHorizontalFraction << "  "
-              << report.achievedHorizontalFraction << "  " << *minimum
-              << "  " << mean << "  " << *maximum << "  "
-              << report.solveSeconds << '\n'
-              << "band  count  dir1_ref  dir2_ref  mixed_ref  min  mean  max"
+    std::cout << std::fixed << std::setprecision(6);
+    if (report.inference ==
+        vc::fiber_tracer::FiberTraceBeliefInference::SumProduct) {
+        std::cout
+            << "fiber direction sum-product BP\n"
+            << "inference  temperature  status  fibers  factors  measurements"
+               "  components  isolated  seed  seed_ref  message_iterations"
+               "  message_residual  achieved_h  min_h  mean_h  max_h  seconds\n"
+            << inferenceName << "  " << report.inferenceTemperature << "  "
+            << report.status << "  " << lines.size() << "  " << report.factors
+            << "  " << report.mergedMeasurements << "  "
+            << report.connectedComponents << "  " << report.isolatedTraces
+            << "  " << report.seedTraceIndex << "  "
+            << directionName(directions[report.seedTraceIndex]) << "  "
+            << report.messageIterations << "  " << report.messageResidual
+            << "  " << report.achievedHorizontalFraction << "  " << *minimum
+            << "  " << mean << "  " << *maximum << "  "
+            << report.solveSeconds << '\n';
+    } else {
+        std::cout
+            << "fiber direction min-sum BP\n"
+            << "mode  status  fibers  factors  measurements  components"
+               "  isolated  seed  seed_ref  message_iterations"
+               "  balance_iterations  message_residual  field  target_h"
+               "  achieved_h  min_h  mean_h  max_h  seconds\n"
+            << modeName << "  " << report.status << "  " << lines.size()
+            << "  " << report.factors << "  " << report.mergedMeasurements
+            << "  " << report.connectedComponents << "  "
+            << report.isolatedTraces << "  " << report.seedTraceIndex << "  "
+            << directionName(directions[report.seedTraceIndex]) << "  "
+            << report.messageIterations << "  " << report.balanceIterations
+            << "  " << report.messageResidual << "  " << report.balanceField
+            << "  " << report.targetHorizontalFraction << "  "
+            << report.achievedHorizontalFraction << "  " << *minimum << "  "
+            << mean << "  " << *maximum << "  " << report.solveSeconds << '\n';
+    }
+    std::cout << "band  count  dir1_ref  dir2_ref  mixed_ref  min  mean  max"
                  "  path\n";
     for (std::size_t band = 0; band < bands.bands.size(); ++band) {
         const auto& current = bands.bands[band];
@@ -1530,9 +1599,16 @@ int main(int argc, char** argv)
                             config.balanceMode = mode;
                             config.cropMinimumBaseXYZ = artifact.minimumBaseXYZ;
                             config.cropMaximumBaseXYZ = artifact.maximumBaseXYZ;
-                            const auto report = vc::fiber_tracer::
-                                solveFiberTraceBeliefPropagation(
-                                    diagnosticLines, bpConstraints, config);
+                            const auto report = options.bpInference ==
+                                    vc::fiber_tracer::
+                                        FiberTraceBeliefInference::SumProduct
+                                ? vc::fiber_tracer::solveFiberTraceSumProduct(
+                                      diagnosticLines, bpConstraints, config)
+                                : vc::fiber_tracer::
+                                      solveFiberTraceBeliefPropagation(
+                                          diagnosticLines,
+                                          bpConstraints,
+                                          config);
                             writeAndPrintBpReport(
                                 report,
                                 mode,
