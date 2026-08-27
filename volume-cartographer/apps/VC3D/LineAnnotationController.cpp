@@ -1989,6 +1989,9 @@ LineAnnotationController::LineAnnotationController(CState* state,
     })
 {
     _lineSolvePool.setMaxThreadCount(2);
+    // Background work must not compete with interactive rendering at normal
+    // OS priority (review guidance: run it low, publish late results).
+    _lineSolvePool.setThreadPriority(QThread::LowPriority);
     if (_state) {
         connect(_state,
                 &CState::surfaceChanged,
@@ -2701,9 +2704,12 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
                     session, SessionOptimizationState::Unoptimized);
                 if (session.taskState == LineAnnotationSession::TaskState::Running) {
                     // The running solve computes tails with the OLD distance:
-                    // mark the config change (the merge then keeps current
-                    // tails) and queue a whole-line pass instead of silently
-                    // dropping the new setting. Dispatch stays mode-gated.
+                    // refuse its wholesale publication (the epoch routes its
+                    // landing through the merge, where the config flag keeps
+                    // the current tails) and queue a whole-line pass instead
+                    // of silently dropping the new setting. Dispatch stays
+                    // mode-gated.
+                    session.solveQueue.noteSessionMutated();
                     session.runningSolveConfigChanged = true;
                     session.solveQueue.addPending({}, true);
                     return;
@@ -7113,7 +7119,7 @@ void LineAnnotationController::onVolumePackageChanged(std::shared_ptr<VolumePkg>
     // A side-strip intersection computed for the old package must not deliver
     // into the new one.
     invalidateSideStripQueries();
-    _pendingSideStripIntersectionRequest.reset();
+    _pendingSideStripIntersectionRequests.clear();
     _lastSideStripIntersectionKey = 0;
     _lastSideStripIntersectionSurfaceName.clear();
     _lastSideStripIntersectionMarkers.clear();
@@ -7387,6 +7393,14 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
                 &branchRemapControls,
                 &branchRemapBranches);
         scheduleBranchMetadataSaves(branchSync.affectedFiberIds, session.fiberId);
+    } else if (!autoReoptimize) {
+        // Auto mode defers the multi-collapse's reciprocal cleanup to the
+        // solve landing; in manual mode no landing follows, so run the sync
+        // now (the pre-unification manual path always did).
+        const BranchMetadataSyncResult branchSync =
+            syncLinkedBranchMetadataAfterFiberModification(
+                session, nullptr, &previousBranches);
+        scheduleBranchMetadataSaves(branchSync.affectedFiberIds, session.fiberId);
     }
 
     // Immediate feedback: the new control point appears in the overlays now;
@@ -7477,6 +7491,14 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     session.solveQueue.addPending(prepared.dirtySegmentIndices, false);
     if (autoReoptimize) {
         scheduleSolveDispatch(session);
+    } else if (!session.suppressGeneratedViews &&
+               session.taskState != LineAnnotationSession::TaskState::Running) {
+        // Manual mode has no landing to publish the spliced line into the
+        // strip surfaces; rebuild the views now or every later click and
+        // intersection query works against a display whose geometry no
+        // longer matches the session. (While a superseded solve is still
+        // running, its landing refreshes the views instead.)
+        (void)materializeGeneratedViews(session);
     }
 }
 
@@ -10559,10 +10581,12 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
         // the provisional splice on screen), the edits' spans keep their
         // provisional geometry, and the pending solve then covers them.
         bool mergePublished = false;
-        vc3d::line_annotation::MergedSupersededSolve merged;
-        if (task.ok && session.runningSolveControlMap &&
+        const bool mergeAttempted = task.ok &&
+            session.runningSolveControlMap.has_value() &&
             !session.optimizedLine.points.empty() &&
-            !session.controlPoints.empty()) {
+            !session.controlPoints.empty();
+        vc3d::line_annotation::MergedSupersededSolve merged;
+        if (mergeAttempted) {
             merged = vc3d::line_annotation::mergeSupersededSolveResult(
                 session.optimizedLine,
                 session.controlPoints,
@@ -10574,20 +10598,41 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
         }
         if (merged.mergeable && !merged.adoptedSpans.empty()) {
             // Transactional install, mirroring the publish path: the merge
-            // keeps the current controls' identity and 3D positions, so
-            // branch metadata needs no remap or peer sync; only a failed
-            // generated-view rebuild rolls the geometry back.
+            // keeps the current controls' identity and 3D positions, so no
+            // control-index remap is needed; only a failed generated-view
+            // rebuild rolls the geometry back.
             std::vector<vc3d::line_annotation::LineControlPoint>
                 previousControls = session.controlPoints;
             vc::lasagna::LineModel previousLine = session.optimizedLine;
             session.controlPoints = std::move(merged.controls);
             session.optimizedLine = std::move(merged.line);
             ++session.lineRevision;
-            if (materializeGeneratedViews(session)) {
+            if (session.suppressGeneratedViews ||
+                materializeGeneratedViews(session)) {
                 mergePublished = true;
                 session.taskState = LineAnnotationSession::TaskState::Succeeded;
                 setSessionOptimizationState(
                     session, SessionOptimizationState::Incremental);
+                // Adopted spans change line tangents, and branch directions
+                // derive from them: run the same linked-metadata sync a
+                // normal publication runs.
+                const BranchMetadataSyncResult branchSync =
+                    syncLinkedBranchMetadataAfterFiberModification(session);
+                scheduleBranchMetadataSaves(branchSync.affectedFiberIds,
+                                            session.fiberId);
+                // The merge renumbered line positions; keep the focus on the
+                // same control (the normal landing remaps focus the same
+                // way).
+                if (session.focusedControlPoint) {
+                    for (const auto& control : session.controlPoints) {
+                        const cv::Vec3d delta =
+                            control.volumePoint - *session.focusedControlPoint;
+                        if (delta.dot(delta) <= 1.0e-12) {
+                            session.focusedLinePosition = control.linePosition;
+                            break;
+                        }
+                    }
+                }
                 Logger()->info(
                     "Line annotation superseded solve merged: adopted={} "
                     "rejected={} edited={}",
@@ -10598,7 +10643,21 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
                 session.controlPoints = std::move(previousControls);
                 session.optimizedLine = std::move(previousLine);
                 ++session.lineRevision;
+                // The failed materialize tore the panes down; rebuild them
+                // from the restored provisional model, best-effort (the
+                // ordinary landing failure path does the same).
+                (void)materializeGeneratedViews(session);
             }
+        } else if (mergeAttempted && !session.suppressGeneratedViews &&
+                   !session.optimizedLine.points.empty() &&
+                   !session.controlPoints.empty()) {
+            // Nothing was adoptable (e.g. a single-span fiber whose only
+            // span is edit-protected): the session's provisional geometry is
+            // still NEWER than the displayed views, so refresh them anyway —
+            // under a continuous edit storm every landing must make visible
+            // progress (render-job model), even when the solve itself
+            // contributed nothing.
+            (void)materializeGeneratedViews(session);
         }
         session.runningSolveControlMap.reset();
         session.runningSolveEditedSpans.clear();
@@ -10684,6 +10743,7 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
                                                !chainNativeSeedTrace);
     if (!ok) {
         setSessionOptimizationState(session, session.optimizationStateBeforeTask);
+        bool rollbackRestoredModel = false;
         if (session.controlPointCollapseRollback) {
             auto rollback = std::move(*session.controlPointCollapseRollback);
             session.controlPointCollapseRollback.reset();
@@ -10700,6 +10760,7 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
             session.fiberMetricsMatchStoredFiber =
                 rollback.fiberMetricsMatchStoredFiber;
             setSessionOptimizationState(session, rollback.optimizationState);
+            rollbackRestoredModel = true;
         }
         if (session.controlPointsBeforeModeChange) {
             session.controlPoints = std::move(*session.controlPointsBeforeModeChange);
@@ -10709,6 +10770,7 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
             session.optimizedLine = std::move(*session.optimizedLineBeforeModeChange);
             ++session.lineRevision;
             session.optimizedLineBeforeModeChange.reset();
+            rollbackRestoredModel = true;
         }
         if (session.branchesBeforeModeChange) {
             session.branches = std::move(*session.branchesBeforeModeChange);
@@ -10723,14 +10785,16 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
                     session.fiberOptimizationMode);
             }
         }
-        if (taskProducedResult && !session.suppressGeneratedViews &&
+        if ((taskProducedResult || rollbackRestoredModel) &&
+            !session.suppressGeneratedViews &&
             !session.optimizedLine.points.empty() &&
             !session.controlPoints.empty()) {
-            // The optimizer succeeded, so the failure came from
-            // materializeGeneratedViews after it had torn down the previous
-            // surfaces and cleaned up its half-built replacements — the
-            // panes are empty. Rebuild them from the restored model,
-            // best-effort: this geometry materialized before.
+            // Two reasons to rebuild: the optimizer succeeded but
+            // materializeGeneratedViews failed after tearing the panes down
+            // (they are empty), or a rollback just replaced the session
+            // model while the panes still display what an earlier landing —
+            // possibly a merged superseded publish — materialized. Either
+            // way the views must track the restored model, best-effort.
             materializeGeneratedViews(session);
         }
     } else {
@@ -12045,10 +12109,10 @@ void LineAnnotationController::cleanupSurfaceName(const std::string& surfaceName
     if (matchesClosingSurface(_runningSideStripIntersectionSurfaceName)) {
         invalidateSideStripQueries();
     }
-    if (_pendingSideStripIntersectionRequest &&
-        matchesClosingSurface(_pendingSideStripIntersectionRequest->surfaceName)) {
-        _pendingSideStripIntersectionRequest.reset();
-    }
+    std::erase_if(_pendingSideStripIntersectionRequests,
+                  [&matchesClosingSurface](const auto& item) {
+                      return matchesClosingSurface(item.first);
+                  });
     if (matchesClosingSurface(_lastSideStripIntersectionSurfaceName)) {
         _lastSideStripIntersectionKey = 0;
         _lastSideStripIntersectionSurfaceName.clear();
@@ -13154,9 +13218,16 @@ void LineAnnotationController::dispatchSideStripIntersectionQuery(
     // An intentional clear must also invalidate: a query still running (or
     // queued) would otherwise pass the latest-token check when it finishes
     // and repaint the very markers the clear removed.
-    const auto invalidateInFlightQueries = [this]() {
-        invalidateSideStripQueries();
-        _pendingSideStripIntersectionRequest.reset();
+    const auto invalidateInFlightQueries = [this, &surfaceName]() {
+        // Scoped to THIS surface: bump the watermark only when the running
+        // query would deliver into the pane being cleared — an unrelated
+        // pane's active query keeps running (its pending peers get
+        // re-stamped above the watermark when they start).
+        if (_sideStripIntersectionRunning &&
+            _runningSideStripIntersectionSurfaceName == surfaceName) {
+            invalidateSideStripQueries();
+        }
+        _pendingSideStripIntersectionRequests.erase(surfaceName);
     };
 
     const auto* stripPointsPtr = stripSurface ? stripSurface->rawPointsPtr() : nullptr;
@@ -13187,14 +13258,11 @@ void LineAnnotationController::dispatchSideStripIntersectionQuery(
         pane->dialog->setGeneratedSideStripIntersectionProgress(tr("already running"), 0, 0);
         return;
     }
-    if (_pendingSideStripIntersectionRequest &&
-        _pendingSideStripIntersectionRequest->token ==
-            _latestSideStripIntersectionToken &&
-        _pendingSideStripIntersectionRequest->token >
-            _sideStripInvalidationWatermark &&
-        _pendingSideStripIntersectionRequest->surfaceName == surfaceName &&
-        !_pendingSideStripIntersectionRequest->fingerprint.isEmpty() &&
-        fingerprint == _pendingSideStripIntersectionRequest->fingerprint) {
+    if (const auto pendingIt =
+            _pendingSideStripIntersectionRequests.find(surfaceName);
+        pendingIt != _pendingSideStripIntersectionRequests.end() &&
+        !pendingIt->second.fingerprint.isEmpty() &&
+        fingerprint == pendingIt->second.fingerprint) {
         pane->dialog->setGeneratedSideStripIntersectionBusy(true);
         pane->dialog->setGeneratedSideStripIntersectionProgress(tr("already queued"), 0, 0);
         return;
@@ -13264,14 +13332,11 @@ void LineAnnotationController::dispatchSideStripIntersectionQuery(
         return;
     }
 
-    if (_sideStripIntersectionRunning &&
-        _pendingSideStripIntersectionRequest &&
-        _pendingSideStripIntersectionRequest->token ==
-            _latestSideStripIntersectionToken &&
-        _pendingSideStripIntersectionRequest->token >
-            _sideStripInvalidationWatermark &&
-        _pendingSideStripIntersectionRequest->cacheKey == request.cacheKey &&
-        _pendingSideStripIntersectionRequest->surfaceName == request.surfaceName) {
+    if (const auto pendingIt =
+            _pendingSideStripIntersectionRequests.find(request.surfaceName);
+        _sideStripIntersectionRunning &&
+        pendingIt != _pendingSideStripIntersectionRequests.end() &&
+        pendingIt->second.cacheKey == request.cacheKey) {
         pane->dialog->setGeneratedSideStripIntersectionBusy(true);
         pane->dialog->setGeneratedSideStripIntersectionProgress(tr("already queued"), 0, 0);
         return;
@@ -13297,7 +13362,9 @@ void LineAnnotationController::dispatchSideStripIntersectionQuery(
     pane->dialog->setGeneratedFiberIntersectionMarkers({});
 
     if (_sideStripIntersectionRunning) {
-        _pendingSideStripIntersectionRequest = std::move(request);
+        const std::string pendingSurface = request.surfaceName;
+        _pendingSideStripIntersectionRequests.insert_or_assign(
+            pendingSurface, std::move(request));
         return;
     }
     startSideStripIntersectionQuery(std::move(request));
@@ -13690,8 +13757,7 @@ void LineAnnotationController::finishSideStripIntersectionQuery(
     // pending request targets the SAME surface; a pending query for another
     // pane sets its own busy state when it starts below.
     const bool samePanePending =
-        _pendingSideStripIntersectionRequest &&
-        _pendingSideStripIntersectionRequest->surfaceName == result.surfaceName;
+        _pendingSideStripIntersectionRequests.count(result.surfaceName) > 0;
     if (!invalidated) {
         _lastPublishedSideStripToken = result.token;
         if (auto* pane = paneForSurface(result.surfaceName); pane && pane->dialog) {
@@ -13726,10 +13792,18 @@ void LineAnnotationController::finishSideStripIntersectionQuery(
         }
     }
 
-    if (_pendingSideStripIntersectionRequest) {
-        SideStripIntersectionRequest pending =
-            std::move(*_pendingSideStripIntersectionRequest);
-        _pendingSideStripIntersectionRequest.reset();
+    if (!_pendingSideStripIntersectionRequests.empty()) {
+        // FIFO across surfaces: start the oldest queued request so a busy
+        // pane's steady refreshes cannot starve another pane's single query.
+        auto oldest = _pendingSideStripIntersectionRequests.begin();
+        for (auto it = _pendingSideStripIntersectionRequests.begin();
+             it != _pendingSideStripIntersectionRequests.end(); ++it) {
+            if (it->second.token < oldest->second.token) {
+                oldest = it;
+            }
+        }
+        SideStripIntersectionRequest pending = std::move(oldest->second);
+        _pendingSideStripIntersectionRequests.erase(oldest);
         // Re-stamp: the pending request may predate an invalidation aimed at
         // a DIFFERENT pane (the watermark is global); a fresh token keeps a
         // legitimately surviving request valid. Same-surface pending was
@@ -13737,12 +13811,14 @@ void LineAnnotationController::finishSideStripIntersectionQuery(
         pending.token = ++_nextSideStripIntersectionToken;
         _latestSideStripIntersectionToken = pending.token;
         startSideStripIntersectionQuery(std::move(pending));
-    } else if (!result.surfaceName.empty()) {
+    } else if (!invalidated && result.ok && !result.surfaceName.empty()) {
         // The render scheduler's post-adoption catch-up: the displayed state
         // may still lag the latest inputs (A -> B -> A orderings dedupe the
         // third request against the active first). Re-run the standard
         // debounced query; its fingerprint and reuse-cache gates make it a
-        // no-op whenever the published result already matches.
+        // no-op whenever the published result already matches. Failed or
+        // invalidated results deliberately do NOT catch up: a persistent
+        // failure would otherwise re-run (and re-show its error) forever.
         handleGeneratedSideStripIntersectionQuery(result.surfaceName);
     }
 }

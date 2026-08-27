@@ -1564,8 +1564,20 @@ MergedSupersededSolve mergeSupersededSolveResult(
                                 currentControls[currentControl].volumePoint;
         return delta.dot(delta) <= kMaxDistanceSq;
     };
+    // Normalized locally rather than required of the caller: sortedness is
+    // an easy contract to break silently, and an out-of-range entry names no
+    // real span.
+    std::vector<size_t> sortedEditedSpans;
+    sortedEditedSpans.reserve(editedSpans.size());
+    for (const size_t span : editedSpans) {
+        if (span < currentSpanCount) {
+            sortedEditedSpans.push_back(span);
+        }
+    }
+    std::sort(sortedEditedSpans.begin(), sortedEditedSpans.end());
     const auto spanEdited = [&](size_t span) {
-        return std::binary_search(editedSpans.begin(), editedSpans.end(), span);
+        return std::binary_search(sortedEditedSpans.begin(),
+                                  sortedEditedSpans.end(), span);
     };
 
     std::vector<bool> adopt(currentSpanCount, false);
@@ -1578,11 +1590,17 @@ MergedSupersededSolve mergeSupersededSolveResult(
     // The extrapolated tails belong to no span: adopt them only when the
     // outer control is unchanged and no solver-input configuration (the
     // extrapolation distance) changed while the solve ran.
-    const bool adoptHead =
-        !configChanged && controlMap.front() == 0 && endpointsMatch(0, 0);
+    // An edit in the outer span also invalidates its tail: the native
+    // extrapolation is seeded from the first interior vertex, so splitting
+    // or reshaping the outer span changes a real input of the solved tail
+    // even when the outer control itself is unchanged.
+    const bool adoptHead = !configChanged && controlMap.front() == 0 &&
+        endpointsMatch(0, 0) &&
+        (currentSpanCount == 0 || !spanEdited(0));
     const bool adoptTail = !configChanged &&
         controlMap.back() == currentControls.size() - 1 &&
-        endpointsMatch(solvedControls.size() - 1, currentControls.size() - 1);
+        endpointsMatch(solvedControls.size() - 1, currentControls.size() - 1) &&
+        (currentSpanCount == 0 || !spanEdited(currentSpanCount - 1));
 
     // Left-to-right assembly from half-open pieces: every control vertex is
     // the first point of the piece to its right (the last control's vertex

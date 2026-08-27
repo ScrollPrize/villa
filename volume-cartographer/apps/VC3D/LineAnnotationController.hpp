@@ -1145,7 +1145,13 @@ private:
     };
     mutable std::unordered_map<uint64_t, ControlSpanCacheEntry> _controlSpanCache;
     bool _sideStripIntersectionRunning = false;
-    std::optional<SideStripIntersectionRequest> _pendingSideStripIntersectionRequest;
+    // One latest pending request PER SURFACE (a single global slot let a
+    // busy pane's refresh silently overwrite — and permanently starve — an
+    // unrelated pane's queued query). One query still runs at a time; the
+    // finish epilogue starts the queued request with the smallest token
+    // (FIFO across surfaces) after re-stamping it.
+    std::map<std::string, SideStripIntersectionRequest>
+        _pendingSideStripIntersectionRequests;
     // Surfaces with a debounced side-strip dispatch scheduled.
     std::unordered_set<std::string> _pendingSideStripQuerySurfaces;
     std::optional<std::filesystem::path> _currentAtlasDir;

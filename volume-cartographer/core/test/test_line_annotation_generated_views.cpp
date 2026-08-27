@@ -1137,6 +1137,62 @@ TEST_CASE("superseded solve merge adopts unedited spans and keeps edited ones")
     }
 }
 
+TEST_CASE("superseded solve merge protects tails when the adjacent outer span was edited")
+{
+    using vc3d::line_annotation::mergeSupersededSolveResult;
+    // Solve-start controls A,B,C; the edit inserted X into the FIRST span
+    // (A-B). The native head extrapolation is seeded from the first interior
+    // vertex, so even though control A itself is unchanged, the solved head
+    // tail is stale and must not be adopted.
+    const cv::Vec3d A{1, 0, 0}, B{4, 0, 0}, C{7, 0, 0};
+    const cv::Vec3d X{2.5, 0, 0};
+    const auto solvedLine = makeMergeTestLine(
+        {{0, 9, 0}, A, {2, 1, 0}, {3, 1, 0}, B, {5, 1, 0}, C, {8, 9, 0}});
+    const auto currentLine = makeMergeTestLine(
+        {{0, -9, 0}, A, {1.7, 2, 0}, X, {3.2, 2, 0}, B, {5, 4, 0}, C, {8, -9, 0}});
+    const std::vector<vc3d::line_annotation::LineControlPoint> solvedControls{
+        makeMergeTestControl(A, 100.0), makeMergeTestControl(B, 101.0),
+        makeMergeTestControl(C, 102.0)};
+    const std::vector<vc3d::line_annotation::LineControlPoint> currentControls{
+        makeMergeTestControl(A, 0.0), makeMergeTestControl(X, 1.0),
+        makeMergeTestControl(B, 2.0), makeMergeTestControl(C, 3.0)};
+    const std::vector<size_t> controlMap{0, 2, 3};
+    const std::vector<size_t> editedSpans{0, 1};
+
+    const auto merged = mergeSupersededSolveResult(
+        currentLine, currentControls, solvedLine, solvedControls,
+        controlMap, editedSpans, false);
+
+    REQUIRE(merged.mergeable);
+    // Span B-C (current span 2) is adoptable, but both tails must stay
+    // current: the head because its adjacent span was edited, the tail
+    // because span 2 adoption does not change tail ownership rules — here
+    // the last span (2) is NOT edited, so the tail may adopt.
+    CHECK(merged.adoptedSpans == std::vector<size_t>{2});
+    CHECK(merged.line.points.front().position[1] == doctest::Approx(-9.0));
+    CHECK(merged.line.points.back().position[1] == doctest::Approx(9.0));
+
+    SUBCASE("an edit in the last span protects the solved tail too")
+    {
+        const auto guarded = mergeSupersededSolveResult(
+            currentLine, currentControls, solvedLine, solvedControls,
+            controlMap, {0, 1, 2}, false);
+        REQUIRE(guarded.mergeable);
+        CHECK(guarded.adoptedSpans.empty());
+        CHECK(guarded.line.points.back().position[1] == doctest::Approx(-9.0));
+    }
+
+    SUBCASE("unsorted edited spans are normalized internally")
+    {
+        const auto unsorted = mergeSupersededSolveResult(
+            currentLine, currentControls, solvedLine, solvedControls,
+            controlMap, {1, 0}, false);
+        REQUIRE(unsorted.mergeable);
+        CHECK(unsorted.adoptedSpans == std::vector<size_t>{2});
+        CHECK(unsorted.line.points.front().position[1] == doctest::Approx(-9.0));
+    }
+}
+
 TEST_CASE("superseded solve merge handles collapses and malformed inputs")
 {
     using vc3d::line_annotation::mergeSupersededSolveResult;
