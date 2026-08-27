@@ -3,6 +3,7 @@
 #include "vc/fiber_tracer/FiberletCropTrace.hpp"
 #include "vc/fiber_tracer/FiberletCropTraceArtifact.hpp"
 #include "vc/fiber_tracer/FiberletCropVisualization.hpp"
+#include "vc/fiber_tracer/FiberTraceBeliefPropagation.hpp"
 #include "vc/fiber_tracer/FiberTraceConstraints.hpp"
 #include "vc/fiber_tracer/FiberTraceConsensus.hpp"
 #include "vc/fiber_tracer/FiberTraceLabeling.hpp"
@@ -16,10 +17,12 @@
 #include <ctime>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -37,6 +40,13 @@ enum class Mode {
     Consensus,
     DirectionDiagnostic,
     DirectionAblation,
+};
+
+enum class BpBalanceSelection {
+    None,
+    Soft,
+    Tight,
+    Both,
 };
 
 struct Options {
@@ -60,6 +70,9 @@ struct Options {
     std::optional<std::size_t> ablationLimit;
     std::size_t postIterations = 0;
     double postInfluence = 1.0;
+    BpBalanceSelection bpBalance = BpBalanceSelection::None;
+    bool bpOnly = false;
+    vc::fiber_tracer::FiberTraceBeliefPropagationConfig bp;
     bool hasBounds = false;
     bool hasTraceOnlyOption = false;
     bool hasConstraintOnlyOption = false;
@@ -69,6 +82,7 @@ struct Options {
     bool hasHvOnlyOption = false;
     bool hasAblationOnlyOption = false;
     bool hasPostInfluenceOption = false;
+    bool hasBpTuningOption = false;
 };
 
 [[noreturn]] void fail(const std::string& message)
@@ -102,7 +116,8 @@ void usage(const char* executable)
                  " [--output BASENAME] [--direction-dominance F]"
                  " [--ablation-step N] [--ablation-limit N]"
                  " [--perpendicular-only] [--post-iterations N]"
-                 " [--post-influence F] [options]\n\n"
+                 " [--post-influence F] [--bp-only]"
+                 " [--bp-balance MODE] [options]\n\n"
               << "Trace options:\n"
               << "  --obj PATH                 line OBJ; defaults beside trace Zarr\n"
               << "  --volume PATH              concrete uint8 CT Zarr group\n"
@@ -121,6 +136,17 @@ void usage(const char* executable)
               << "  --ablation-limit N        stop after admitting N mixed fibers [all]\n\n"
               << "  --post-iterations N       perpendicular H/V consensus iterations [0]\n"
               << "  --post-influence F        neighbor confidence support width in (0,1] [1]\n\n"
+              << "Belief-propagation options (direction-ablation only):\n"
+              << "  --bp-only                 run only final-cohort BP; skip HiGHS\n"
+              << "  --bp-balance MODE         soft, tight, or both [disabled]\n"
+              << "  --bp-target F             arc-weighted H fraction [0.5]\n"
+              << "  --bp-soft-strength F      quadratic balance strength [1]\n"
+              << "  --bp-temperature F        min-marginal decoding temperature [0.25]\n"
+              << "  --bp-message-iterations N message update limit [500]\n"
+              << "  --bp-balance-iterations N field update limit [64]\n"
+              << "  --bp-damping F            message damping in (0,1] [0.5]\n"
+              << "  --bp-residual F           message residual tolerance [1e-8]\n"
+              << "  --bp-balance-tolerance F  target/field tolerance [1e-3]\n\n"
               << "Constraint options (all distances are base voxels):\n"
               << "  --output PATH              OBJ basename; defaults beside trace dataset\n"
               << "  --sample-step N            common trace resampling step [32]\n"
@@ -285,6 +311,89 @@ Options parse(int argc, char** argv)
             options.hasPostInfluenceOption = true;
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
+        } else if (argument == "--bp-only") {
+            options.bpOnly = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--bp-balance") {
+            const std::string mode = value(index, argc, argv, "--bp-balance");
+            if (mode == "soft")
+                options.bpBalance = BpBalanceSelection::Soft;
+            else if (mode == "tight")
+                options.bpBalance = BpBalanceSelection::Tight;
+            else if (mode == "both")
+                options.bpBalance = BpBalanceSelection::Both;
+            else
+                fail("--bp-balance must be soft, tight, or both");
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--bp-target") {
+            options.bp.targetHorizontalFraction =
+                number(index, argc, argv, "--bp-target");
+            if (options.bp.targetHorizontalFraction < 0.0 ||
+                options.bp.targetHorizontalFraction > 1.0) {
+                fail("--bp-target must be in [0, 1]");
+            }
+            options.hasBpTuningOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--bp-soft-strength") {
+            options.bp.softBalanceStrength =
+                number(index, argc, argv, "--bp-soft-strength");
+            if (options.bp.softBalanceStrength < 0.0)
+                fail("--bp-soft-strength must be nonnegative");
+            options.hasBpTuningOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--bp-temperature") {
+            options.bp.horizontalnessTemperature =
+                number(index, argc, argv, "--bp-temperature");
+            if (!(options.bp.horizontalnessTemperature > 0.0))
+                fail("--bp-temperature must be positive");
+            options.hasBpTuningOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--bp-message-iterations") {
+            options.bp.maximumMessageIterations =
+                count(index, argc, argv, "--bp-message-iterations");
+            if (options.bp.maximumMessageIterations == 0)
+                fail("--bp-message-iterations must be positive");
+            options.hasBpTuningOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--bp-balance-iterations") {
+            options.bp.maximumBalanceIterations =
+                count(index, argc, argv, "--bp-balance-iterations");
+            if (options.bp.maximumBalanceIterations == 0)
+                fail("--bp-balance-iterations must be positive");
+            options.hasBpTuningOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--bp-damping") {
+            options.bp.messageDamping = number(index, argc, argv, "--bp-damping");
+            if (!(options.bp.messageDamping > 0.0) ||
+                options.bp.messageDamping > 1.0) {
+                fail("--bp-damping must be in (0, 1]");
+            }
+            options.hasBpTuningOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--bp-residual") {
+            options.bp.messageResidualTolerance =
+                number(index, argc, argv, "--bp-residual");
+            if (options.bp.messageResidualTolerance < 0.0)
+                fail("--bp-residual must be nonnegative");
+            options.hasBpTuningOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--bp-balance-tolerance") {
+            options.bp.balanceTolerance =
+                number(index, argc, argv, "--bp-balance-tolerance");
+            if (options.bp.balanceTolerance < 0.0)
+                fail("--bp-balance-tolerance must be nonnegative");
+            options.hasBpTuningOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
         } else if (argument == "--sample-step") {
             options.constraints.resampleSpacingBaseVoxels = number(index, argc, argv, "--sample-step");
             options.hasConstraintOnlyOption = true;
@@ -446,6 +555,21 @@ Options parse(int argc, char** argv)
         }
         if (options.hasPostInfluenceOption && options.postIterations == 0) {
             fail("--post-influence requires positive --post-iterations");
+        }
+        if (options.hasBpTuningOption &&
+            options.bpBalance == BpBalanceSelection::None &&
+            !options.bpOnly) {
+            fail("BP tuning controls require --bp-balance");
+        }
+        if ((options.bpOnly ||
+             options.bpBalance != BpBalanceSelection::None) &&
+            !options.labeling.perpendicularOnly) {
+            fail("BP requires --perpendicular-only");
+        }
+        if ((options.bpBalance == BpBalanceSelection::Tight ||
+             options.bpBalance == BpBalanceSelection::Both) &&
+            options.bp.maximumBalanceIterations < 2) {
+            fail("tight BP requires at least two balance iterations");
         }
         if (options.output.empty()) {
             const std::string stem = options.input.has_extension()
@@ -936,6 +1060,253 @@ void printConsensusReport(
     std::cout << std::defaultfloat;
 }
 
+void writeAndPrintBpReport(
+    const vc::fiber_tracer::FiberTraceBeliefPropagationReport& report,
+    vc::fiber_tracer::FiberTraceBalanceMode mode,
+    const std::vector<vc::fiber_tracer::FiberletCropTraceLine>& lines,
+    const vc::fiber_tracer::FiberTraceConstraintReport& constraints,
+    std::span<const std::size_t> originalTraceIndices,
+    std::span<const vc::fiber_tracer::FiberDirectionGroup> directions,
+    const std::filesystem::path& output)
+{
+    if (report.horizontalness.size() != lines.size() ||
+        directions.size() != lines.size() ||
+        originalTraceIndices.size() != lines.size() ||
+        report.seedTraceIndex >= lines.size()) {
+        throw std::logic_error("BP report does not match represented fibers");
+    }
+    const std::string modeName =
+        vc::fiber_tracer::fiberTraceBalanceModeName(mode);
+    const auto outputBase = output.parent_path() /
+        (output.stem().string() + "_bp_" + modeName);
+    const auto bands =
+        vc::fiber_tracer::classifyFiberValues(report.horizontalness);
+    const auto paths = vc::fiber_tracer::writeFiberletCropValueBandObjs(
+        lines, bands, outputBase);
+    const auto [minimum, maximum] = std::minmax_element(
+        report.horizontalness.begin(), report.horizontalness.end());
+    const double mean = std::accumulate(
+        report.horizontalness.begin(), report.horizontalness.end(), 0.0) /
+        static_cast<double>(report.horizontalness.size());
+    const auto directionName = [](vc::fiber_tracer::FiberDirectionGroup group) {
+        using Group = vc::fiber_tracer::FiberDirectionGroup;
+        switch (group) {
+        case Group::Direction1:
+            return "dir1";
+        case Group::Direction2:
+            return "dir2";
+        case Group::Mixed:
+            return "mixed";
+        }
+        return "invalid";
+    };
+    const auto consistency =
+        vc::fiber_tracer::analyzeFiberTraceConstraintConsistency(
+            constraints, report.horizontalness);
+    const auto csv = output.parent_path() /
+        (output.stem().string() + "_bp_" + modeName +
+         "_consistency.csv");
+    std::ofstream csvOutput(csv);
+    if (!csvOutput)
+        throw std::runtime_error("failed to open BP consistency CSV: " + csv.string());
+    csvOutput
+        << "trace,original_trace,reference,bp_status,vertical_threshold,"
+           "horizontal_threshold,horizontalness,degree,incident_measurements,"
+           "total_strength,"
+           "resolved_degree,resolved_strength,unresolved_degree,"
+           "unresolved_strength,hard_mismatches,hard_mismatch_rate,"
+           "weighted_hard_mismatch_rate,soft_same_label_proxy,"
+           "neighbor_support_balance,neighbor_certainty\n"
+        << std::setprecision(17);
+    const auto csvOptional = [&csvOutput](const std::optional<double>& value) {
+        if (value)
+            csvOutput << *value;
+        else
+            csvOutput << "NA";
+    };
+    for (std::size_t trace = 0; trace < consistency.traces.size(); ++trace) {
+        const auto& current = consistency.traces[trace];
+        csvOutput << trace << ',' << originalTraceIndices[trace] << ','
+                  << directionName(directions[trace]) << ',' << report.status
+                  << ',' << consistency.verticalThreshold << ','
+                  << consistency.horizontalThreshold << ','
+                  << report.horizontalness[trace] << ',' << current.degree
+                  << ',' << current.incidentMeasurements << ','
+                  << current.totalStrength << ','
+                  << current.resolvedDegree << ',' << current.resolvedStrength
+                  << ',' << current.unresolvedDegree << ','
+                  << current.unresolvedStrength << ','
+                  << current.hardMismatches << ',';
+        csvOptional(current.hardMismatchRate);
+        csvOutput << ',';
+        csvOptional(current.weightedHardMismatchRate);
+        csvOutput << ',';
+        csvOptional(current.softSameLabelProxy);
+        csvOutput << ',';
+        csvOptional(current.neighborSupportBalance);
+        csvOutput << ',';
+        csvOptional(current.neighborCertainty);
+        csvOutput << '\n';
+    }
+    if (!csvOutput)
+        throw std::runtime_error("failed to write BP consistency CSV: " + csv.string());
+    std::cout << std::fixed << std::setprecision(6)
+              << "fiber direction min-sum BP\n"
+              << "mode  status  fibers  factors  measurements  components"
+                 "  isolated  seed  seed_ref  message_iterations"
+                 "  balance_iterations  message_residual  field  target_h"
+                 "  achieved_h  min_h  mean_h  max_h  seconds\n"
+              << modeName << "  " << report.status << "  "
+              << lines.size() << "  " << report.factors << "  "
+              << report.mergedMeasurements << "  "
+              << report.connectedComponents << "  "
+              << report.isolatedTraces << "  " << report.seedTraceIndex
+              << "  " << directionName(directions[report.seedTraceIndex])
+              << "  " << report.messageIterations << "  "
+              << report.balanceIterations << "  "
+              << report.messageResidual << "  " << report.balanceField
+              << "  " << report.targetHorizontalFraction << "  "
+              << report.achievedHorizontalFraction << "  " << *minimum
+              << "  " << mean << "  " << *maximum << "  "
+              << report.solveSeconds << '\n'
+              << "band  count  dir1_ref  dir2_ref  mixed_ref  min  mean  max"
+                 "  path\n";
+    for (std::size_t band = 0; band < bands.bands.size(); ++band) {
+        const auto& current = bands.bands[band];
+        std::array<std::size_t, 3> references{};
+        for (const std::size_t trace : current.lineIndices) {
+            ++references[static_cast<std::size_t>(directions[trace])];
+        }
+        std::cout << 'p' << band << "  " << current.lineIndices.size()
+                  << "  " << references[0] << "  " << references[1]
+                  << "  " << references[2] << "  " << current.minimumValue
+                  << "  " << current.meanValue << "  "
+                  << current.maximumValue << "  " << paths.bands[band]
+                  << '\n';
+    }
+    const auto printConsistencyMetric = [&] (
+                                            const char* reference,
+                                            const char* metric,
+                                            std::vector<double> values) {
+        if (values.empty()) {
+            std::cout << reference << "  " << metric
+                      << "  0  NA  NA  NA  NA  NA\n";
+            return;
+        }
+        const double valueMean = std::accumulate(
+            values.begin(), values.end(), 0.0) /
+            static_cast<double>(values.size());
+        std::cout << reference << "  " << metric << "  " << values.size()
+                  << "  " << quantile(values, 0.0)
+                  << "  " << valueMean
+                  << "  " << quantile(values, 0.5)
+                  << "  " << quantile(values, 0.9)
+                  << "  " << quantile(values, 1.0) << '\n';
+    };
+    std::cout << "fiber direction BP constraint consistency\n"
+              << "reference  metric  valid_fibers  min  mean  median  p90  max\n";
+    constexpr std::array<const char*, 9> names{
+        "degree",
+        "measurements",
+        "strength",
+        "unresolved_rate",
+        "hard_mismatch_rate",
+        "weighted_hard_mismatch_rate",
+        "soft_same_label_proxy",
+        "neighbor_support_balance",
+        "neighbor_certainty",
+    };
+    const auto metricValue = [](
+                                 const vc::fiber_tracer::
+                                     FiberTraceConstraintConsistency& current,
+                                 std::size_t metric) -> std::optional<double> {
+        switch (metric) {
+        case 0:
+            return static_cast<double>(current.degree);
+        case 1:
+            return static_cast<double>(current.incidentMeasurements);
+        case 2:
+            return current.totalStrength;
+        case 3:
+            if (current.degree == 0)
+                return std::nullopt;
+            return static_cast<double>(current.unresolvedDegree) /
+                static_cast<double>(current.degree);
+        case 4:
+            return current.hardMismatchRate;
+        case 5:
+            return current.weightedHardMismatchRate;
+        case 6:
+            return current.softSameLabelProxy;
+        case 7:
+            return current.neighborSupportBalance;
+        case 8:
+            return current.neighborCertainty;
+        default:
+            return std::nullopt;
+        }
+    };
+    for (std::size_t group = 0; group < 3; ++group) {
+        std::array<std::vector<double>, names.size()> metrics;
+        for (std::size_t trace = 0; trace < consistency.traces.size(); ++trace) {
+            if (static_cast<std::size_t>(directions[trace]) != group)
+                continue;
+            const auto& current = consistency.traces[trace];
+            for (std::size_t metric = 0; metric < metrics.size(); ++metric) {
+                if (const auto value = metricValue(current, metric))
+                    metrics[metric].push_back(*value);
+            }
+        }
+        const auto reference = directionName(
+            static_cast<vc::fiber_tracer::FiberDirectionGroup>(group));
+        for (std::size_t metric = 0; metric < metrics.size(); ++metric)
+            printConsistencyMetric(reference, names[metric], std::move(metrics[metric]));
+    }
+    std::cout << "fiber direction BP Mixed discrimination\n"
+              << "metric  direction  mixed  trusted  auroc\n";
+    for (std::size_t metric = 0; metric < names.size(); ++metric) {
+        std::vector<double> mixed;
+        std::vector<double> trusted;
+        for (std::size_t trace = 0; trace < consistency.traces.size(); ++trace) {
+            const auto value = metricValue(consistency.traces[trace], metric);
+            if (!value)
+                continue;
+            if (directions[trace] ==
+                vc::fiber_tracer::FiberDirectionGroup::Mixed) {
+                mixed.push_back(*value);
+            } else {
+                trusted.push_back(*value);
+            }
+        }
+        const bool lowerPredictsMixed = metric == 8;
+        double favorable = 0.0;
+        for (const double positive : mixed) {
+            for (const double negative : trusted) {
+                const double orientedPositive = lowerPredictsMixed
+                    ? -positive
+                    : positive;
+                const double orientedNegative = lowerPredictsMixed
+                    ? -negative
+                    : negative;
+                favorable += orientedPositive > orientedNegative
+                    ? 1.0
+                    : orientedPositive == orientedNegative ? 0.5 : 0.0;
+            }
+        }
+        std::cout << names[metric] << "  "
+                  << (lowerPredictsMixed ? "lower" : "higher") << "  "
+                  << mixed.size() << "  " << trusted.size() << "  ";
+        if (mixed.empty() || trusted.empty())
+            std::cout << "NA\n";
+        else
+            std::cout << favorable /
+                    static_cast<double>(mixed.size() * trusted.size())
+                      << '\n';
+    }
+    std::cout << "fiber direction BP constraint consistency csv=" << csv << '\n';
+    std::cout << std::defaultfloat;
+}
+
 struct VisualizationReport {
     vc::fiber_tracer::FiberDirectionClassification directions;
     vc::fiber_tracer::FiberQualityHistogram quality;
@@ -1045,16 +1416,21 @@ int main(int argc, char** argv)
                     options.ablationLimit.value_or(candidates.size()));
                 std::vector<unsigned char> admitted(
                     artifact.lines.size(), 0);
-                std::vector<std::size_t> admittedCounts{0};
-                for (std::size_t count = options.ablationStep;
-                     count < admittedTarget;) {
-                    admittedCounts.push_back(count);
-                    if (count > admittedTarget - options.ablationStep)
-                        break;
-                    count += options.ablationStep;
-                }
-                if (admittedCounts.back() != admittedTarget)
+                std::vector<std::size_t> admittedCounts;
+                if (options.bpOnly) {
                     admittedCounts.push_back(admittedTarget);
+                } else {
+                    admittedCounts.push_back(0);
+                    for (std::size_t count = options.ablationStep;
+                         count < admittedTarget;) {
+                        admittedCounts.push_back(count);
+                        if (count > admittedTarget - options.ablationStep)
+                            break;
+                        count += options.ablationStep;
+                    }
+                    if (admittedCounts.back() != admittedTarget)
+                        admittedCounts.push_back(admittedTarget);
+                }
                 std::cout
                     << "fiber direction mixed ablation checkpoints="
                     << admittedCounts.size()
@@ -1073,9 +1449,11 @@ int main(int argc, char** argv)
                         ++admittedSoFar;
                     }
                     diagnosticLines.clear();
+                    diagnosticOriginalTraceIndices.clear();
                     diagnosticDirections.clear();
                     std::vector<std::uint8_t> trustedMask;
                     diagnosticLines.reserve(artifact.lines.size());
+                    diagnosticOriginalTraceIndices.reserve(artifact.lines.size());
                     diagnosticDirections.reserve(artifact.lines.size());
                     trustedMask.reserve(artifact.lines.size());
                     for (std::size_t trace = 0;
@@ -1087,6 +1465,7 @@ int main(int argc, char** argv)
                         if (!trusted && admitted[trace] == 0)
                             continue;
                         diagnosticLines.push_back(artifact.lines[trace]);
+                        diagnosticOriginalTraceIndices.push_back(trace);
                         diagnosticDirections.push_back(
                             diagnosticClassification->lines[trace].group);
                         trustedMask.push_back(trusted ? 1 : 0);
@@ -1124,6 +1503,62 @@ int main(int argc, char** argv)
                         checkpointReport.constraints =
                             std::move(pruning.constraints);
                         checkpointPruning = std::move(pruning.report);
+                    }
+                    if (options.bpOnly) {
+                        auto bpConstraints = checkpointReport;
+                        const auto selection = vc::fiber_tracer::
+                            selectFiberTraceLabelConstraints(
+                                checkpointReport, options.labeling);
+                        bpConstraints.constraints.clear();
+                        bpConstraints.constraints.reserve(
+                            selection.retainedIndices.size());
+                        for (const std::size_t index : selection.retainedIndices) {
+                            bpConstraints.constraints.push_back(
+                                checkpointReport.constraints.at(index));
+                        }
+                        std::cout
+                            << "fiber direction BP-only cohort"
+                            << " admitted=" << admittedCount
+                            << " fibers=" << diagnosticLines.size()
+                            << " pieces=" << bpConstraints.pieces.size()
+                            << " perpendicular_constraints="
+                            << bpConstraints.constraints.size() << '\n';
+                        const auto runBp = [&] (
+                                               vc::fiber_tracer::
+                                                   FiberTraceBalanceMode mode) {
+                            auto config = options.bp;
+                            config.balanceMode = mode;
+                            config.cropMinimumBaseXYZ = artifact.minimumBaseXYZ;
+                            config.cropMaximumBaseXYZ = artifact.maximumBaseXYZ;
+                            const auto report = vc::fiber_tracer::
+                                solveFiberTraceBeliefPropagation(
+                                    diagnosticLines, bpConstraints, config);
+                            writeAndPrintBpReport(
+                                report,
+                                mode,
+                                diagnosticLines,
+                                bpConstraints,
+                                diagnosticOriginalTraceIndices,
+                                diagnosticDirections,
+                                options.output);
+                        };
+                        if (options.bpBalance == BpBalanceSelection::None) {
+                            runBp(vc::fiber_tracer::FiberTraceBalanceMode::None);
+                        } else {
+                            if (options.bpBalance == BpBalanceSelection::Soft ||
+                                options.bpBalance == BpBalanceSelection::Both) {
+                                runBp(vc::fiber_tracer::
+                                          FiberTraceBalanceMode::Soft);
+                            }
+                            if (options.bpBalance == BpBalanceSelection::Tight ||
+                                options.bpBalance == BpBalanceSelection::Both) {
+                                runBp(vc::fiber_tracer::
+                                          FiberTraceBalanceMode::Tight);
+                            }
+                        }
+                        if (checkpointPruning)
+                            printConstraintPruningReport(*checkpointPruning);
+                        continue;
                     }
                     const auto checkpointLabeling =
                         vc::fiber_tracer::solveFiberTraceLabels(
@@ -1262,6 +1697,41 @@ int main(int argc, char** argv)
                                 checkpointReport,
                                 checkpointLpThresholded,
                                 lpOutput);
+                        if (options.bpBalance != BpBalanceSelection::None) {
+                            const auto runBp = [&](
+                                                   vc::fiber_tracer::
+                                                       FiberTraceBalanceMode mode) {
+                                auto config = options.bp;
+                                config.balanceMode = mode;
+                                config.cropMinimumBaseXYZ =
+                                    artifact.minimumBaseXYZ;
+                                config.cropMaximumBaseXYZ =
+                                    artifact.maximumBaseXYZ;
+                                const auto report = vc::fiber_tracer::
+                                    solveFiberTraceBeliefPropagation(
+                                        diagnosticLines,
+                                        comparisonReport,
+                                        config);
+                                writeAndPrintBpReport(
+                                    report,
+                                    mode,
+                                    diagnosticLines,
+                                    comparisonReport,
+                                    diagnosticOriginalTraceIndices,
+                                    diagnosticDirections,
+                                    options.output);
+                            };
+                            if (options.bpBalance == BpBalanceSelection::Soft ||
+                                options.bpBalance == BpBalanceSelection::Both) {
+                                runBp(vc::fiber_tracer::
+                                          FiberTraceBalanceMode::Soft);
+                            }
+                            if (options.bpBalance == BpBalanceSelection::Tight ||
+                                options.bpBalance == BpBalanceSelection::Both) {
+                                runBp(vc::fiber_tracer::
+                                          FiberTraceBalanceMode::Tight);
+                            }
+                        }
                         if (options.postIterations > 0) {
                             const auto values = vc::fiber_tracer::
                                 postFilterPerpendicularFiberTraceLabels(

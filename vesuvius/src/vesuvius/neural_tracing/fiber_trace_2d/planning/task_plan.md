@@ -1,76 +1,78 @@
-# Plan: Post-solve perpendicular consensus
+# Plan: Per-fiber BP constraint-consistency diagnostics
 
 ## Contract
 
-- Add opt-in direction-ablation controls `--post-iterations N` and
-  `--post-influence I`. Zero iterations remains the default and writes no post
-  artifacts. Influence must be finite in `(0,1]` and defaults to `1` when post
-  filtering is requested.
-- Require the final selected checkpoint to have exactly one MILP piece for
-  every represented input fiber, with trace indices forming a complete unique
-  `[0,N)` set. Initialize H=`1`, V=`0`, and Broken=`0.5`. Split, missing, or
-  duplicate source-fiber pieces fail explicitly; non-admitted source fibers are
-  absent from the checkpoint and never enter post-filter output.
-- Build unique source-fiber adjacency from the exact retained solver links.
-  This post-filter is accepted only with `--perpendicular-only`; hard
-  same-source links are ignored. Every neighbor therefore contributes
-  `1-neighbor_value`, reflecting perpendicular H/V opposition.
-- For influence `I`, define neighbor confidence
-  `clamp((abs(v-0.5)-0.5*(1-I))/(0.5*I), 0, 1)`. Thus `I=1` rises linearly from
-  zero at `0.5` to one at the extrema, while `I=0.5` is zero through
-  `[0.25,0.75]` and rises linearly over the remaining quarter intervals.
-- Every iteration is a synchronous Jacobi update. A fiber becomes the weighted
-  mean of transformed neighbor values. A fiber with no positive total weight
-  keeps its previous value. Stable trace-index and neighbor ordering make the
-  result independent of thread scheduling.
-- Divide whole source fibers into ten fixed H-value bands and write
-  `<base>_p0.obj` through `<base>_p9.obj`: `p0=[0,0.1)`, ..., `p8=[0.8,0.9)`,
-  and `p9=[0.9,1]`. Exact internal boundaries belong to the higher band, and
-  equal values remain together. Every file is written even when empty. Print
-  count and min/mean/max value for every group. Also stratify the existing
-  gauge-aligned comparison by band, reporting H, V, and Mixed populations and
-  errors without defining a new post-filter error threshold.
-- Post-filtering does not modify the MILP labels, error statistics, existing
-  label/constraint/initial OBJ outputs, solver objective, or selected broken
-  cost. It is a diagnostic transformation only.
+- Analyze exactly the unique pair factors used by binary BP after duplicate
+  measurements are merged. A factor's evidence strength is the absolute
+  difference between its same-label and different-label costs; one
+  perpendicular measurement with parallel score `p` therefore has strength
+  `1 - 2p`.
+- Classify horizontalness values at fixed diagnostic thresholds: V at or below
+  `0.25`, H at or above `0.75`, and unresolved between them. For every fiber,
+  report unique-factor degree, total factor strength, resolved and unresolved
+  degree/strength, hard same-label mismatches, resolved hard mismatch rate, and
+  resolved strength-weighted mismatch rate.
+- Also report smooth diagnostics over all incident factors:
+  - soft same-label independence proxy
+    `h_i*h_j + (1-h_i)*(1-h_j)`, strength weighted; this is not a calibrated
+    BP edge probability;
+  - neighbor support balance
+    `2*min(H_support,V_support)/(H_support+V_support)`, where
+    `H_support=sum(w*(1-h_j))` and `V_support=sum(w*h_j)`.
+- Report strength-weighted neighbor certainty alongside support balance because
+  unresolved neighbors can otherwise look maximally balanced.
+- Every undefined denominator is represented as `NA`, not zero, and excluded
+  from summaries. Include valid counts and a tie-aware AUROC for Mixed versus
+  trusted fibers for every metric, with prediction direction stated.
+- Persist one CSV row per represented fiber, including cohort-local and
+  original trace IDs, BP status, thresholds, horizontalness, initial geometric
+  direction group, unique degree, and incident measurement count. Print
+  count/min/mean/median/p90/max
+  summaries separately for trusted dir1, trusted dir2, and Mixed fibers.
+- Extract the labeling constraint selector into a shared core helper used by
+  both HiGHS and BP-only. Add a BP-only direction-ablation execution path. It builds only the requested
+  final cohort, extracts/prunes the same constraints, runs BP and diagnostics,
+  and does not call either HiGHS solve. The ordinary ablation path remains
+  unchanged.
+- This task uses unbalanced/natural BP for the diagnostic experiment. The
+  previously drafted population-balance implementation remains experimental;
+  adapting it from a fixed target to the user's clarified minimum-population
+  prior is explicitly outside this focused diagnostic run.
 
 ## Implementation
 
-1. Add a reusable core post-filter helper operating on no-split constraint
-   pieces, retained constraint indices, and MILP labels, returning one value
-   per represented trace.
-2. Add reusable fixed-band classification and a writer for the ten whole-fiber
-   OBJ layers with short stable suffixes.
-3. Parse and validate the CLI controls, run the helper only for the final
-   selected direction-ablation checkpoint, and print its fixed-band summary.
-4. Extend the stable runner with explicit post-filter arguments and rerun the
-   selected no-split, perpendicular-only, 40-mixed, cost-0.2435 experiment.
+1. Extract and regression-test shared constraint selection, then expose the
+   merged BP factor graph's per-fiber consistency calculation as a
+   reusable core function and include the report in BP output ownership.
+2. Add deterministic CSV serialization and compact grouped console summaries.
+3. Add `--bp-only` to direction-ablation, make its default BP mode natural
+   (no population field), and bypass MILP/LP construction and output.
+4. Run the centered-384 full-Mixed cohort and compare diagnostic distributions
+   for dir1, dir2, and Mixed references.
 
 ## Spec Update
 
-Document no-split/represented-fiber scope, initialization, perpendicular
-inversion, confidence weighting, synchronous iteration, no-evidence behavior,
-and value-band output ownership in `planning/specs.md`.
+Add the consistency metric definitions, thresholds, merged-factor ownership,
+and BP-only diagnostic execution contract to `specs.md`.
 
 ## Docs Updates
 
-Document the CLI controls, formula, and `_p0` through `_p9` output layers in
+Document `--bp-only`, the per-fiber CSV fields, and the grouped summaries in
 `volume-cartographer/docs/fiber_chunk_tracing.md`.
 
 ## Testing
 
-- Unit-test initialization, rejection of split/missing/duplicate fibers,
-  unique-neighbor deduplication, perpendicular inversion, both influence
-  examples, synchronous multi-iteration behavior, no-weight retention, exact
-  value-band boundaries/ties, and ten output names including empty groups.
+- Unit-test inclusive thresholds, hard resolved mismatch, unresolved accounting,
+  strength partitions, weighted mismatch, soft proxy, support balance and
+  certainty, heterogeneous duplicate-factor merging, order/gauge invariance,
+  invalid evidence, and isolated fibers on a small deterministic graph.
+- Test CSV ordering/header and validation of horizontalness/report sizes.
 - Build `vc_fiber_trace_chunk` and `test_fiberlet_crop_trace` with `-j32`, run
-  the focused suite, and run `git diff --check`.
-- Rerun the stable centered-384 experiment with three post iterations and
-  influence 1.0; confirm the MILP statistics remain identical, exactly 135
-  fibers are partitioned, and all ten short-named OBJ layers are written.
-- Repeat with 100 iterations to measure long-run consensus behavior and report
-  the complete per-band H, V, and Mixed error table for both iteration counts.
+  the focused test binary, and run `git diff --check`.
+- Run the centered-384 full-Mixed BP-only command and record exact cohort,
+  timing, and grouped quantiles.
 
 ## Changelog
 
-Record the opt-in post-solve perpendicular consensus diagnostic.
+Record per-fiber BP consistency diagnostics and the HiGHS-free BP-only
+direction-ablation path.

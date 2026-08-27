@@ -600,6 +600,40 @@ trusted-direction mismatches; Mixed errors are admitted diagnostic defects
 that the labeling left active. The table only stratifies the existing
 comparison and does not introduce a post-filter error threshold.
 
+### BP-only constraint-consistency diagnostic
+
+Use `--bp-only --perpendicular-only` with `direction-ablation` to build only
+the final admitted cohort, extract and optionally prune its constraints, and
+run natural binary min-sum BP without constructing either HiGHS model:
+
+```bash
+volume-cartographer/build/bin/vc_fiber_trace_chunk direction-ablation crop_traces.zarr --normal-manifest normals.lasagna.json --output crop_bp --direction-dominance 0.9 --piece-length 1000000000 --perpendicular-only --bp-only
+```
+
+The input must produce exactly one constraint piece per represented fiber.
+`--ablation-limit N` selects a ranked prefix; omission admits every Mixed
+fiber. Natural BP fixes the established central straight seed to H and emits
+`<base>_bp_none_p0.obj` through `_p9.obj`. A nonconverged status remains in the
+report and in every CSV row; it is not silently treated as converged.
+
+`<base>_bp_none_consistency.csv` maps cohort-local and original stored trace
+indices to the initial `dir1`, `dir2`, or `mixed` diagnostic reference. It uses
+V values at or below `0.25`, H values at or above `0.75`, and treats values
+between them as unresolved. Duplicate measurements between the same two
+fibers form one factor: degree counts that factor once, `incident_measurements`
+retains its measurement count, and strength is the absolute difference of its
+summed same-label and different-label costs.
+
+Hard mismatch rates include only links whose endpoints are both resolved.
+Undefined ratios are serialized as `NA` and excluded from group summaries.
+`soft_same_label_proxy` is the strength-weighted independence proxy
+`h_i*h_j + (1-h_i)*(1-h_j)`; it is not a calibrated BP edge probability.
+`neighbor_support_balance` measures how evenly neighbors support H and V and
+can be high when neighbors themselves are uncertain, so
+`neighbor_certainty` is reported alongside it. Console summaries give
+equal-per-fiber min/mean/median/p90/max values by initial reference group and
+tie-aware AUROC values for Mixed versus trusted fibers.
+
 ## Quality groups
 
 Visualization stably sorts traces by ascending cost density and then stored

@@ -64,6 +64,12 @@ struct FiberTraceLabelingReport {
     std::string modelStatus;
 };
 
+struct FiberTraceConstraintSelection {
+    std::vector<std::size_t> retainedIndices;
+    std::size_t excludedParallelSeparateWinding = 0;
+    std::size_t excludedNonPerpendicular = 0;
+};
+
 struct FiberTraceLabelObjPaths {
     std::filesystem::path hEven;
     std::filesystem::path hOdd;
@@ -148,6 +154,10 @@ struct FiberDirectionLabelComparisonReport {
 };
 
 [[nodiscard]] FiberTraceLabelingReport solveFiberTraceLabels(
+    const FiberTraceConstraintReport& constraints,
+    const FiberTraceLabelingConfig& config = {});
+
+[[nodiscard]] FiberTraceConstraintSelection selectFiberTraceLabelConstraints(
     const FiberTraceConstraintReport& constraints,
     const FiberTraceLabelingConfig& config = {});
 

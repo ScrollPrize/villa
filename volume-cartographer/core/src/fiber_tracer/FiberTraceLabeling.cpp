@@ -262,6 +262,32 @@ std::string outputStem(const std::filesystem::path& outputBase)
 
 }  // namespace
 
+FiberTraceConstraintSelection selectFiberTraceLabelConstraints(
+    const FiberTraceConstraintReport& constraints,
+    const FiberTraceLabelingConfig& config)
+{
+    FiberTraceConstraintSelection selection;
+    selection.retainedIndices.reserve(constraints.constraints.size());
+    for (std::size_t index = 0; index < constraints.constraints.size(); ++index) {
+        const auto& constraint = constraints.constraints[index];
+        const bool excludeNonPerpendicular = config.perpendicularOnly &&
+            !constraint.hardContinuity &&
+            constraint.perpendicularScore <= 0.5;
+        const bool excludeParallelSeparate =
+            config.excludeParallelSeparateWinding &&
+            !constraint.hardContinuity && constraint.parallelScore > 0.5 &&
+            constraint.windingDistance >= 0.5;
+        if (excludeNonPerpendicular) {
+            ++selection.excludedNonPerpendicular;
+        } else if (excludeParallelSeparate) {
+            ++selection.excludedParallelSeparateWinding;
+        } else {
+            selection.retainedIndices.push_back(index);
+        }
+    }
+    return selection;
+}
+
 FiberTraceLabelingReport solveFiberTraceLabels(
     const FiberTraceConstraintReport& constraints,
     const FiberTraceLabelingConfig& config)
@@ -328,41 +354,20 @@ FiberTraceLabelingReport solveFiberTraceLabels(
         }
     }
 
+    const auto selection = selectFiberTraceLabelConstraints(constraints, config);
+    report.retainedConstraintIndices = selection.retainedIndices;
+    report.excludedNonPerpendicular = selection.excludedNonPerpendicular;
+    report.excludedParallelSeparateWinding =
+        selection.excludedParallelSeparateWinding;
     std::vector<FiberTraceConstraint> filteredConstraints;
     std::span<const FiberTraceConstraint> labelingConstraints =
         constraints.constraints;
-    report.retainedConstraintIndices.reserve(constraints.constraints.size());
-    if (config.excludeParallelSeparateWinding || config.perpendicularOnly) {
-        filteredConstraints.reserve(constraints.constraints.size());
-        for (std::size_t index = 0;
-             index < constraints.constraints.size();
-             ++index) {
-            const auto& constraint = constraints.constraints[index];
-            const bool excludeNonPerpendicular = config.perpendicularOnly &&
-                !constraint.hardContinuity &&
-                constraint.perpendicularScore <= 0.5;
-            const bool excludeParallelSeparate =
-                config.excludeParallelSeparateWinding &&
-                !constraint.hardContinuity &&
-                constraint.parallelScore > 0.5 &&
-                constraint.windingDistance >= 0.5;
-            if (excludeNonPerpendicular) {
-                ++report.excludedNonPerpendicular;
-            } else if (excludeParallelSeparate) {
-                ++report.excludedParallelSeparateWinding;
-            } else {
-                filteredConstraints.push_back(constraint);
-                report.retainedConstraintIndices.push_back(index);
-            }
-        }
+    if (report.retainedConstraintIndices.size() !=
+        constraints.constraints.size()) {
+        filteredConstraints.reserve(report.retainedConstraintIndices.size());
+        for (const std::size_t index : report.retainedConstraintIndices)
+            filteredConstraints.push_back(constraints.constraints[index]);
         labelingConstraints = filteredConstraints;
-    } else {
-        report.retainedConstraintIndices.resize(
-            constraints.constraints.size());
-        std::iota(
-            report.retainedConstraintIndices.begin(),
-            report.retainedConstraintIndices.end(),
-            std::size_t{0});
     }
     const std::size_t edgeCount = labelingConstraints.size();
     report.retainedConstraints = edgeCount;

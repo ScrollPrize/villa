@@ -1,53 +1,35 @@
-# Task Log: Post-solve perpendicular consensus
+# Task Log: Per-fiber BP constraint-consistency diagnostics
 
-## Decisions
+## 2026-08-27
 
-- Perpendicular graph links invert neighbor H values before averaging.
-- Confidence uses the exact influence-dependent central dead-band formula in
-  the task plan.
-- Iterations are synchronous and preserve the prior value when no neighbor has
-  positive confidence.
-- Post-filter input/output is exactly the represented final checkpoint and
-  requires one piece per fiber; non-admitted fibers are excluded.
-- Fixed 0.1-value OBJ bands contain complete source fibers, not extracted
-  pieces. Exact ties stay together and internal boundaries use the higher bin.
-
-## Plan Review
-
-- Removed invented split/absent-fiber averaging semantics; the diagnostic now
-  enforces the requested no-split checkpoint population.
-- Replaced ambiguous rank percentiles with explicit fixed value bands so equal
-  values are never split arbitrarily.
-
-## Deviations
-
-- None.
-
-## Validation
-
-- Built `vc_fiber_trace_chunk` and `test_fiberlet_crop_trace` from the local
-  Release build with `-j32`.
-- `volume-cartographer/build/bin/test_fiberlet_crop_trace` passed all 49 cases.
-- Stable run:
-  `/tmp/vc_direction_ablation_runner.sh 0.2435 40 perpendicular 3 1.0`.
-- The run retained the same 135 fibers/pieces and 855 constraints. MILP stayed
-  at objective 103.912955, 2/95 trusted errors, 30/40 mixed active errors, and
-  32/135 total errors. Post-filtering did not modify solver output.
-- Three influence-1 iterations partitioned exactly 135 represented fibers:
-  `p0=65`, `p1=2`, `p2=0`, `p3=0`, `p4=0`, `p5=2`, `p6=0`, `p7=0`, `p8=1`,
-  and `p9=65`. Values ranged `[0,0.041099]` in p0 and `[0.933945,1]` in p9.
-- All ten `$VES/data/workdir3/384/384_pN.obj` files were overwritten, including
-  valid comment-only files for empty bands. The stable current log contains
-  the per-band population, error, and min/mean/max table.
-- The per-band error report preserves the existing gauge-aligned comparison.
-  Across both runs it reconciles to 50 H references, 45 V references, and 40
-  Mixed references, with 0 H errors, 2 V errors, and 30 Mixed errors.
-- At three iterations, errors by band were `p0=(H0,V0,M14)`,
-  `p5=(H0,V1,M0)`, and `p9=(H0,V1,M16)`; all other bands had zero errors.
-- A second stable run used
-  `/tmp/vc_direction_ablation_runner.sh 0.2435 40 perpendicular 100 1.0`.
-  Errors moved to `p2=(H0,V0,M4)`, `p3=(H0,V0,M10)`,
-  `p5=(H0,V1,M0)`, `p6=(H0,V0,M8)`, and `p7=(H0,V1,M8)`.
-  The 100 synchronous iterations moved the two main populations inward to
-  `[0.282380,0.385884]` and `[0.616010,0.719646]`; they did not change the
-  underlying 32/135 MILP error count.
+- Replaced the previous BP implementation notes with this focused diagnostic
+  task as required by the subproject workflow.
+- Defined hard mismatch only over resolved endpoints and retained unresolved
+  degree/strength separately so ambiguous BP outputs are not mislabeled as
+  definite violations.
+- Chose the exact merged BP factors for all metrics, preventing duplicate
+  measurements from changing graph degree while preserving their summed
+  evidence in strength-weighted values.
+- The centered-384 experiment will use natural BP and a BP-only CLI path. The
+  fixed-target balance draft does not implement the later clarified minimum
+  H/V population prior and is not used for this experiment.
+- Independent review identified divergence risk from duplicating the labeling
+  filter, undefined-rate bias, overstated probability semantics, and the lack
+  of a direct separation statistic. The implementation now shares the selector,
+  emits `NA` for undefined values, names the independence proxy explicitly,
+  reports neighbor certainty with support balance, and calculates tie-aware
+  Mixed-vs-trusted AUROC.
+- Centered-384 full-Mixed BP-only run: 179 fibers (50 Direction1, 45 Direction2,
+  84 Mixed), 1324 unique factors, 5 components, 4 isolates. Natural BP
+  converged in 42 message iterations and 0.000522 s; the complete command took
+  0.08 s wall, 0.58 s user, 0.06 s system, and 66,444 KiB peak RSS.
+- The strongest tested separation was the soft same-label proxy (AUROC
+  0.646835), followed by hard mismatch rate (0.633989), strength-weighted hard
+  mismatch (0.623754), and neighbor support balance (0.605135). These are weak
+  to moderate signals rather than reliable standalone Mixed detectors.
+- Validation commands:
+  - `cmake --build volume-cartographer/build --target vc_fiber_trace_chunk test_fiberlet_crop_trace -j32`
+  - `volume-cartographer/build/bin/test_fiberlet_crop_trace` (56 cases passed)
+  - `git diff --check`
+- The BP-only experiment used
+  `volume-cartographer/build/bin/vc_fiber_trace_chunk direction-ablation /home/hendrik/vesuvius/crop_traces_central_384.zarr --normal-manifest /home/hendrik/business/aiconsulting/vesuviuschallenge/data/lasagna3d_inf/las008_s1_full/las_008.lasagna.json --output /home/hendrik/business/aiconsulting/vesuviuschallenge/data/workdir3/384/384 --direction-dominance 0.9 --piece-length 1000000000 --perpendicular-only --bp-only`.

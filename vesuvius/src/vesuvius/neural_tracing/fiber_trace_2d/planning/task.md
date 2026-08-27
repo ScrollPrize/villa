@@ -1,8 +1,8 @@
-# Task: Post-solve perpendicular consensus
+# Task: Per-fiber BP constraint-consistency diagnostics
 
-After the no-split, perpendicular-only direction-ablation MILP, initialize one
-continuous H value per fiber from its discrete result (H=1, V=0, Broken=0.5),
-then synchronously update values from confidence-weighted perpendicular
-neighbors for a configurable number of iterations. Write exactly those
-represented no-split fibers as ten short-named 0.1-value-band OBJ layers
-alongside the main output.
+Evaluate whether disagreement with the retained perpendicular constraint graph
+can identify geometrically Mixed fibers. For every fiber, report hard resolved
+mismatches, unresolved links, strength-weighted mismatch, soft probabilistic
+mismatch, and conflicting H/V neighbor support from the BP horizontalness
+values. Run the diagnostics on the existing centered-384 full-Mixed cohort
+without rerunning the MILP or LP solvers.

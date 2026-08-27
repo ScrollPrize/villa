@@ -6,6 +6,7 @@
 #include "vc/fiber_tracer/FiberletCropTrace.hpp"
 #include "vc/fiber_tracer/FiberletCropTraceArtifact.hpp"
 #include "vc/fiber_tracer/FiberletDataset.hpp"
+#include "vc/fiber_tracer/FiberTraceBeliefPropagation.hpp"
 #include "vc/fiber_tracer/FiberTraceConstraints.hpp"
 #include "vc/fiber_tracer/FiberTraceConsensus.hpp"
 #include "vc/fiber_tracer/FiberTraceLabeling.hpp"
@@ -2552,6 +2553,345 @@ TEST_CASE("Trace consensus primary seed uses crop length and center")
             traces, FiberTraceConstraintReport{}, config),
         doctest::Contains("longer than half"),
         std::invalid_argument);
+}
+
+namespace
+{
+
+std::vector<FiberletCropTraceLine> bpLines(std::size_t count)
+{
+    std::vector<FiberletCropTraceLine> lines(count);
+    for (std::size_t index = 0; index < count; ++index) {
+        lines[index].pointsBaseXYZ = {
+            {-3.0, static_cast<double>(index), 0.0},
+            {3.0, static_cast<double>(index), 0.0},
+        };
+    }
+    return lines;
+}
+
+FiberTraceConstraintReport bpConstraints(std::size_t count)
+{
+    FiberTraceConstraintReport report;
+    report.pieces.resize(count);
+    for (std::size_t index = 0; index < count; ++index)
+        report.pieces[index].traceIndex = index;
+    return report;
+}
+
+void addBpConstraint(
+    FiberTraceConstraintReport& report,
+    std::size_t a,
+    std::size_t b,
+    double parallel)
+{
+    FiberTraceConstraint constraint;
+    constraint.pieceA = a;
+    constraint.pieceB = b;
+    constraint.parallelScore = parallel;
+    constraint.perpendicularScore = 1.0 - parallel;
+    report.constraints.push_back(constraint);
+}
+
+FiberTraceBeliefPropagationConfig bpConfig()
+{
+    FiberTraceBeliefPropagationConfig config;
+    config.cropMinimumBaseXYZ = {-5.0, -5.0, -5.0};
+    config.cropMaximumBaseXYZ = {5.0, 5.0, 5.0};
+    config.horizontalnessTemperature = 0.1;
+    config.messageDamping = 0.5;
+    config.messageResidualTolerance = 1.0e-12;
+    config.maximumMessageIterations = 1000;
+    return config;
+}
+
+std::vector<double> bruteForceBpAdvantages(
+    std::size_t count,
+    std::size_t seed,
+    const FiberTraceConstraintReport& constraints)
+{
+    std::vector<double> minimumV(count, std::numeric_limits<double>::infinity());
+    std::vector<double> minimumH(count, std::numeric_limits<double>::infinity());
+    for (std::size_t bits = 0; bits < (std::size_t{1} << count); ++bits) {
+        if (((bits >> seed) & 1U) == 0)
+            continue;
+        double energy = 0.0;
+        for (const auto& constraint : constraints.constraints) {
+            const bool a = ((bits >> constraint.pieceA) & 1U) != 0;
+            const bool b = ((bits >> constraint.pieceB) & 1U) != 0;
+            energy += a == b
+                ? 1.0 - constraint.parallelScore
+                : constraint.parallelScore;
+        }
+        for (std::size_t node = 0; node < count; ++node) {
+            auto& minimum = ((bits >> node) & 1U) != 0
+                ? minimumH[node]
+                : minimumV[node];
+            minimum = std::min(minimum, energy);
+        }
+    }
+    std::vector<double> advantages(count);
+    for (std::size_t node = 0; node < count; ++node)
+        advantages[node] = minimumV[node] - minimumH[node];
+    return advantages;
+}
+
+}  // namespace
+
+TEST_CASE("Binary min-sum BP matches exact seeded perpendicular tree")
+{
+    const auto lines = bpLines(3);
+    auto constraints = bpConstraints(lines.size());
+    addBpConstraint(constraints, 0, 1, 0.0);
+    addBpConstraint(constraints, 1, 2, 0.0);
+    addBpConstraint(constraints, 0, 1, 0.0);
+
+    const auto report = solveFiberTraceBeliefPropagation(
+        lines, constraints, bpConfig());
+    const auto exact = bruteForceBpAdvantages(
+        lines.size(), report.seedTraceIndex, constraints);
+    CHECK(report.status == "converged");
+    CHECK(report.seedTraceIndex == 0);
+    CHECK(report.factors == 2);
+    CHECK(report.mergedMeasurements == 3);
+    CHECK(report.connectedComponents == 1);
+    REQUIRE(report.horizontalness.size() == lines.size());
+    CHECK(report.horizontalness[0] == doctest::Approx(1.0));
+    for (std::size_t node = 1; node < lines.size(); ++node) {
+        CHECK(report.minMarginalAdvantage[node] ==
+              doctest::Approx(exact[node]).epsilon(1.0e-9));
+    }
+    CHECK(report.horizontalness[1] < 1.0e-8);
+    CHECK(report.horizontalness[2] > 0.9999);
+
+    std::reverse(
+        constraints.constraints.begin(), constraints.constraints.end());
+    const auto reordered = solveFiberTraceBeliefPropagation(
+        lines, constraints, bpConfig());
+    CHECK(reordered.horizontalness == report.horizontalness);
+    CHECK(reordered.minMarginalAdvantage == report.minMarginalAdvantage);
+}
+
+TEST_CASE("Binary min-sum BP leaves unsupported component gauges uncertain")
+{
+    const auto lines = bpLines(4);
+    auto constraints = bpConstraints(lines.size());
+    addBpConstraint(constraints, 0, 1, 0.0);
+    addBpConstraint(constraints, 2, 3, 0.0);
+    const auto report = solveFiberTraceBeliefPropagation(
+        lines, constraints, bpConfig());
+    CHECK(report.seedTraceIndex == 0);
+    CHECK(report.connectedComponents == 2);
+    CHECK(report.horizontalness[0] == doctest::Approx(1.0));
+    CHECK(report.horizontalness[1] < 1.0e-4);
+    CHECK(report.horizontalness[2] == doctest::Approx(0.5));
+    CHECK(report.horizontalness[3] == doctest::Approx(0.5));
+}
+
+TEST_CASE("Binary min-sum BP reports frustration as horizontalness uncertainty")
+{
+    const auto lines = bpLines(3);
+    auto constraints = bpConstraints(lines.size());
+    addBpConstraint(constraints, 0, 1, 0.0);
+    addBpConstraint(constraints, 1, 2, 0.0);
+    addBpConstraint(constraints, 2, 0, 0.0);
+    auto config = bpConfig();
+    config.messageDamping = 0.25;
+    const auto report = solveFiberTraceBeliefPropagation(
+        lines, constraints, config);
+    const auto exact = bruteForceBpAdvantages(
+        lines.size(), report.seedTraceIndex, constraints);
+    CHECK(exact[1] == doctest::Approx(0.0));
+    CHECK(exact[2] == doctest::Approx(0.0));
+    CHECK(report.horizontalness[1] == doctest::Approx(0.5).epsilon(1.0e-6));
+    CHECK(report.horizontalness[2] == doctest::Approx(0.5).epsilon(1.0e-6));
+}
+
+TEST_CASE("Binary min-sum BP balance modes move weighted H fraction")
+{
+    const auto lines = bpLines(3);
+    auto constraints = bpConstraints(lines.size());
+    addBpConstraint(constraints, 0, 1, 0.0);
+    addBpConstraint(constraints, 1, 2, 0.0);
+
+    auto config = bpConfig();
+    config.horizontalnessTemperature = 0.5;
+    const auto unbalanced = solveFiberTraceBeliefPropagation(
+        lines, constraints, config);
+    REQUIRE(unbalanced.achievedHorizontalFraction > 0.55);
+
+    config.balanceMode = FiberTraceBalanceMode::Soft;
+    config.softBalanceStrength = 2.0;
+    config.balanceTolerance = 1.0e-8;
+    config.maximumBalanceIterations = 256;
+    const auto soft = solveFiberTraceBeliefPropagation(
+        lines, constraints, config);
+    CHECK(std::abs(soft.achievedHorizontalFraction - 0.5) <
+          std::abs(unbalanced.achievedHorizontalFraction - 0.5));
+    CHECK(soft.balanceConverged);
+
+    config.softBalanceStrength = 0.0;
+    const auto zeroSoft = solveFiberTraceBeliefPropagation(
+        lines, constraints, config);
+    CHECK(zeroSoft.horizontalness == unbalanced.horizontalness);
+
+    config.balanceMode = FiberTraceBalanceMode::Tight;
+    config.balanceTolerance = 1.0e-5;
+    config.maximumBalanceIterations = 64;
+    const auto tight = solveFiberTraceBeliefPropagation(
+        lines, constraints, config);
+    CHECK(tight.status == "converged");
+    CHECK(tight.achievedHorizontalFraction ==
+          doctest::Approx(0.5).epsilon(1.0e-5));
+
+    config.targetHorizontalFraction = 0.0;
+    const auto infeasible = solveFiberTraceBeliefPropagation(
+        lines, constraints, config);
+    CHECK(infeasible.status == "infeasible");
+    CHECK_FALSE(infeasible.balanceConverged);
+}
+
+TEST_CASE("Binary min-sum BP rejects split and non-perpendicular inputs")
+{
+    const auto lines = bpLines(2);
+    auto constraints = bpConstraints(lines.size());
+    constraints.pieces.push_back(constraints.pieces.front());
+    CHECK_THROWS_WITH_AS(
+        solveFiberTraceBeliefPropagation(lines, constraints, bpConfig()),
+        doctest::Contains("exactly one"),
+        std::invalid_argument);
+
+    constraints = bpConstraints(lines.size());
+    addBpConstraint(constraints, 0, 1, 0.75);
+    CHECK_THROWS_WITH_AS(
+        solveFiberTraceBeliefPropagation(lines, constraints, bpConfig()),
+        doctest::Contains("perpendicular"),
+        std::invalid_argument);
+    constraints.constraints.front().parallelScore = 0.0;
+    constraints.constraints.front().perpendicularScore = 1.0;
+    constraints.constraints.front().hardContinuity = true;
+    CHECK_THROWS_WITH_AS(
+        solveFiberTraceBeliefPropagation(lines, constraints, bpConfig()),
+        doctest::Contains("continuity"),
+        std::invalid_argument);
+}
+
+TEST_CASE("BP consistency separates resolved mismatches and uncertainty")
+{
+    auto constraints = bpConstraints(5);
+    addBpConstraint(constraints, 0, 1, 0.0);
+    addBpConstraint(constraints, 0, 2, 0.25);
+    addBpConstraint(constraints, 0, 2, 0.25);
+    addBpConstraint(constraints, 0, 3, 0.0);
+
+    const std::vector<double> horizontalness{1.0, 0.0, 1.0, 0.5, 0.5};
+    const auto report = analyzeFiberTraceConstraintConsistency(
+        constraints, horizontalness);
+    REQUIRE(report.traces.size() == horizontalness.size());
+    CHECK(report.verticalThreshold == doctest::Approx(0.25));
+    CHECK(report.horizontalThreshold == doctest::Approx(0.75));
+
+    const auto& center = report.traces[0];
+    CHECK(center.degree == 3);
+    CHECK(center.totalStrength == doctest::Approx(3.0));
+    CHECK(center.resolvedDegree == 2);
+    CHECK(center.resolvedStrength == doctest::Approx(2.0));
+    CHECK(center.unresolvedDegree == 1);
+    CHECK(center.unresolvedStrength == doctest::Approx(1.0));
+    CHECK(center.hardMismatches == 1);
+    REQUIRE(center.hardMismatchRate);
+    REQUIRE(center.weightedHardMismatchRate);
+    REQUIRE(center.softSameLabelProxy);
+    REQUIRE(center.neighborSupportBalance);
+    REQUIRE(center.neighborCertainty);
+    CHECK(*center.hardMismatchRate == doctest::Approx(0.5));
+    CHECK(*center.weightedHardMismatchRate == doctest::Approx(0.5));
+    CHECK(*center.softSameLabelProxy == doctest::Approx(0.5));
+    CHECK(*center.neighborSupportBalance == doctest::Approx(1.0));
+    CHECK(*center.neighborCertainty == doctest::Approx(2.0 / 3.0));
+    CHECK(center.incidentMeasurements == 4);
+
+    CHECK(report.traces[1].hardMismatches == 0);
+    CHECK(*report.traces[1].softSameLabelProxy == doctest::Approx(0.0));
+    CHECK(*report.traces[2].hardMismatchRate == doctest::Approx(1.0));
+    CHECK(report.traces[3].unresolvedDegree == 1);
+    CHECK(*report.traces[3].softSameLabelProxy == doctest::Approx(0.5));
+    CHECK(report.traces[4].degree == 0);
+    CHECK(report.traces[4].totalStrength == doctest::Approx(0.0));
+    CHECK_FALSE(report.traces[4].hardMismatchRate);
+    CHECK_FALSE(report.traces[4].weightedHardMismatchRate);
+    CHECK_FALSE(report.traces[4].softSameLabelProxy);
+    CHECK_FALSE(report.traces[4].neighborSupportBalance);
+    CHECK_FALSE(report.traces[4].neighborCertainty);
+
+    CHECK_THROWS_WITH_AS(
+        analyzeFiberTraceConstraintConsistency(
+            constraints, horizontalness, 0.75, 0.25),
+        doctest::Contains("thresholds"),
+        std::invalid_argument);
+
+    auto reversed = constraints;
+    std::reverse(reversed.constraints.begin(), reversed.constraints.end());
+    const auto reordered = analyzeFiberTraceConstraintConsistency(
+        reversed, horizontalness);
+    const std::vector<double> flipped{0.0, 1.0, 0.0, 0.5, 0.5};
+    const auto gaugeFlipped = analyzeFiberTraceConstraintConsistency(
+        constraints, flipped);
+    for (std::size_t trace = 0; trace < report.traces.size(); ++trace) {
+        const auto& expected = report.traces[trace];
+        for (const auto* actual : {
+                 &reordered.traces[trace], &gaugeFlipped.traces[trace]}) {
+            CHECK(actual->degree == expected.degree);
+            CHECK(actual->incidentMeasurements == expected.incidentMeasurements);
+            CHECK(actual->hardMismatches == expected.hardMismatches);
+            CHECK(actual->hardMismatchRate == expected.hardMismatchRate);
+            CHECK(actual->weightedHardMismatchRate ==
+                  expected.weightedHardMismatchRate);
+            CHECK(actual->softSameLabelProxy == expected.softSameLabelProxy);
+            CHECK(actual->neighborSupportBalance ==
+                  expected.neighborSupportBalance);
+            CHECK(actual->neighborCertainty == expected.neighborCertainty);
+        }
+        CHECK(expected.degree ==
+              expected.resolvedDegree + expected.unresolvedDegree);
+        CHECK(expected.totalStrength == doctest::Approx(
+                  expected.resolvedStrength + expected.unresolvedStrength));
+    }
+
+    const std::vector<double> inclusiveThresholds{0.75, 0.25, 1.0, 0.5, 0.5};
+    const auto inclusive = analyzeFiberTraceConstraintConsistency(
+        constraints, inclusiveThresholds);
+    CHECK(inclusive.traces[0].resolvedDegree == 2);
+
+    auto invalid = constraints;
+    invalid.constraints.front().perpendicularScore = 0.75;
+    CHECK_THROWS_WITH_AS(
+        analyzeFiberTraceConstraintConsistency(invalid, horizontalness),
+        doctest::Contains("complementary"),
+        std::invalid_argument);
+}
+
+TEST_CASE("Label constraint selection is shared and preserves hard links")
+{
+    FiberTraceConstraintReport constraints;
+    constraints.pieces.resize(4);
+    addBpConstraint(constraints, 0, 1, 0.0);
+    addBpConstraint(constraints, 1, 2, 0.75);
+    FiberTraceConstraint hard;
+    hard.pieceA = 2;
+    hard.pieceB = 3;
+    hard.parallelScore = 1.0;
+    hard.perpendicularScore = 0.0;
+    hard.hardContinuity = true;
+    constraints.constraints.push_back(hard);
+
+    FiberTraceLabelingConfig config;
+    config.perpendicularOnly = true;
+    const auto selection = selectFiberTraceLabelConstraints(constraints, config);
+    CHECK(selection.retainedIndices == std::vector<std::size_t>{0, 2});
+    CHECK(selection.excludedNonPerpendicular == 1);
+    CHECK(selection.excludedParallelSeparateWinding == 0);
+
 }
 
 TEST_CASE("Trace consensus writes requested assignment milestones")

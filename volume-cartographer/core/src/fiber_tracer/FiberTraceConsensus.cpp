@@ -1,7 +1,7 @@
 #include "vc/fiber_tracer/FiberTraceConsensus.hpp"
 
 #include "vc/core/io/PolylineObj.hpp"
-#include "vc/fiber_tracer/PolylineGeometry.hpp"
+#include "vc/fiber_tracer/FiberTraceSeed.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -16,8 +16,6 @@ namespace vc::fiber_tracer
 namespace
 {
 
-constexpr double kLengthEpsilon = 1.0e-9;
-
 std::size_t labelIndex(FiberTraceConsensusLabel label)
 {
     return static_cast<std::size_t>(label);
@@ -26,46 +24,6 @@ std::size_t labelIndex(FiberTraceConsensusLabel label)
 bool isActive(FiberTraceConsensusLabel label)
 {
     return label == FiberTraceConsensusLabel::H || label == FiberTraceConsensusLabel::V;
-}
-
-struct TraceGeometry {
-    double straightness = 0.0;
-    double arcLength = 0.0;
-    double centerDistance = 0.0;
-    bool valid = false;
-};
-
-bool finitePoint(const cv::Vec3d& point)
-{
-    return std::isfinite(point[0]) && std::isfinite(point[1]) &&
-        std::isfinite(point[2]);
-}
-
-TraceGeometry traceGeometry(
-    const FiberletCropTraceLine& trace, const cv::Vec3d& cropCenter)
-{
-    TraceGeometry result;
-    if (trace.pointsBaseXYZ.size() < 2)
-        return result;
-    for (std::size_t index = 1; index < trace.pointsBaseXYZ.size(); ++index) {
-        const double length = cv::norm(trace.pointsBaseXYZ[index] - trace.pointsBaseXYZ[index - 1]);
-        if (!std::isfinite(length))
-            throw std::invalid_argument("Consensus trace contains non-finite geometry");
-        result.arcLength += length;
-    }
-    if (!(result.arcLength > kLengthEpsilon))
-        return result;
-    const double chord = cv::norm(trace.pointsBaseXYZ.back() - trace.pointsBaseXYZ.front());
-    if (!std::isfinite(chord))
-        throw std::invalid_argument("Consensus trace contains non-finite geometry");
-    result.straightness = chord / result.arcLength;
-    const auto arcGeometry = makePolylineArcGeometry(trace.pointsBaseXYZ);
-    result.centerDistance = distanceToPolylineArc(
-        arcGeometry, cropCenter, 0.0, arcGeometry.length());
-    if (!std::isfinite(result.centerDistance))
-        throw std::invalid_argument("Consensus trace has invalid crop-center distance");
-    result.valid = true;
-    return result;
 }
 
 struct Evidence {
@@ -137,30 +95,17 @@ FiberTraceConsensusReport growFiberTraceConsensus(
     if (!std::isfinite(config.brokenCostPerConstraint) || config.brokenCostPerConstraint < 0.0) {
         throw std::invalid_argument("Consensus broken cost per constraint must be finite and nonnegative");
     }
-    if (!finitePoint(config.cropMinimumBaseXYZ) ||
-        !finitePoint(config.cropMaximumBaseXYZ)) {
-        throw std::invalid_argument("Consensus crop bounds must be finite");
-    }
-    const cv::Vec3d cropExtent =
-        config.cropMaximumBaseXYZ - config.cropMinimumBaseXYZ;
-    if (!(cropExtent[0] > 0.0) || !(cropExtent[1] > 0.0) ||
-        !(cropExtent[2] > 0.0)) {
-        throw std::invalid_argument("Consensus crop bounds must have positive extent");
-    }
-    const cv::Vec3d cropCenter =
-        0.5 * (config.cropMinimumBaseXYZ + config.cropMaximumBaseXYZ);
-    const double nominalCropSide =
-        std::min({cropExtent[0], cropExtent[1], cropExtent[2]});
-    const double primaryMinimumArcLength = 0.5 * nominalCropSide;
+    const auto geometryReport = measureFiberTraceSeedGeometry(
+        traces,
+        config.cropMinimumBaseXYZ,
+        config.cropMaximumBaseXYZ);
+    const auto& geometry = geometryReport.traces;
 
     FiberTraceConsensusReport report;
     report.labels.assign(traces.size(), FiberTraceConsensusLabel::Unassigned);
-    std::vector<TraceGeometry> geometry;
-    geometry.reserve(traces.size());
     std::size_t remaining = 0;
     for (std::size_t trace = 0; trace < traces.size(); ++trace) {
-        geometry.push_back(traceGeometry(traces[trace], cropCenter));
-        if (geometry.back().valid) {
+        if (geometry[trace].valid) {
             ++remaining;
         } else {
             report.labels[trace] = FiberTraceConsensusLabel::Broken;
@@ -201,26 +146,15 @@ FiberTraceConsensusReport growFiberTraceConsensus(
     }
 
     const auto seed = [&](bool requirePrimaryLength) -> std::size_t {
-        std::size_t best = traces.size();
+        std::vector<unsigned char> eligible(traces.size(), 0);
         for (std::size_t trace = 0; trace < traces.size(); ++trace) {
             if (report.labels[trace] != FiberTraceConsensusLabel::Unassigned)
                 continue;
-            if (requirePrimaryLength &&
-                !(geometry[trace].arcLength > primaryMinimumArcLength)) {
-                continue;
-            }
-            if (best == traces.size() ||
-                geometry[trace].straightness > geometry[best].straightness ||
-                (geometry[trace].straightness == geometry[best].straightness &&
-                 (geometry[trace].centerDistance < geometry[best].centerDistance ||
-                  (geometry[trace].centerDistance == geometry[best].centerDistance &&
-                   (geometry[trace].arcLength > geometry[best].arcLength ||
-                    (geometry[trace].arcLength == geometry[best].arcLength &&
-                     trace < best)))))) {
-                best = trace;
-            }
+            eligible[trace] = 1;
         }
-        return best;
+        return selectCentralStraightFiberTrace(
+                   geometryReport, eligible, requirePrimaryLength)
+            .value_or(traces.size());
     };
 
     struct Candidate {
@@ -288,8 +222,9 @@ FiberTraceConsensusReport growFiberTraceConsensus(
             step.label = FiberTraceConsensusLabel::H;
             step.seedStraightness = geometry[step.traceIndex].straightness;
             step.seedCenterDistanceBaseVoxels =
-                geometry[step.traceIndex].centerDistance;
-            step.seedArcLengthBaseVoxels = geometry[step.traceIndex].arcLength;
+                geometry[step.traceIndex].centerDistanceBaseVoxels;
+            step.seedArcLengthBaseVoxels =
+                geometry[step.traceIndex].arcLengthBaseVoxels;
         } else {
             step.traceIndex = best->trace;
             step.componentIndex = best->componentIndex;

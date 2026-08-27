@@ -1448,3 +1448,11 @@
   evidence and reporting excluded measured links.
 - Added an opt-in no-split post-solve perpendicular consensus diagnostic with
   confidence-weighted synchronous updates and short fixed-value OBJ layers.
+
+## 2026-08-27 - Binary BP consistency diagnostics
+
+- Added a HiGHS-free final-cohort BP-only direction-ablation path using the
+  shared perpendicular constraint selector.
+- Added per-fiber hard, unresolved, strength-weighted, soft same-label, neighbor
+  support-balance, and neighbor-certainty diagnostics with CSV output, grouped
+  quantiles, and Mixed-vs-trusted AUROC.
