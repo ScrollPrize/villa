@@ -4,6 +4,26 @@ Code and helpers to fit a canonical Archimedean spiral to deformed scrolls.
 `spiral_service.py` hosts one persistent interactive fit session over HTTP for
 the VC3D Spiral workspace; `fit_spiral.py` is the underlying fitter.
 
+## A note on the default fit window
+
+If you don't set `z_begin`/`z_end`, `fit_spiral.py` defaults to the entire
+written region of the scroll (`config.py`'s `z_begin = 4000`, `z_end =
+17000` — the range inherited from the PHercParis4 production dataset, not
+something derived from the scroll you're fitting). This is not what the
+tutorial's first-run example uses, and for good reason: under a reduced
+config (patches disabled, `dense_spacing_mode: grad_mag`, zeroed
+shell-loss weights — a tutorial-style setup), a
+full-range PHerc0826 run reached real optimization, accelerated past
+0.9 it/s, and then died silently around 300 iterations with no traceback
+and an ETA that had climbed past 8 hours — not the GPU out-of-memory error
+a "~60 GB, will OOM" figure might lead you to expect (actual GPU memory
+use stayed under 8 GiB of a 32 GiB card throughout). Whatever kills the
+process at this scale is not confirmed (a host-RAM kill during the
+~8.4M-track preparation for the full window is the leading candidate). Set
+`z_begin`/`z_end` to a smaller window (the tutorial's own ~1,000-slice
+recommendation is a reasonable first run) regardless of your GPU's VRAM
+headroom.
+
 ## Sweep runner output
 
 `runners/run_sweep.py` prefixes each active fit's live `PROGRESS` and
