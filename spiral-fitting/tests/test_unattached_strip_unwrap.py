@@ -12,6 +12,7 @@ regardless of how many windings it spans."""
 import numpy as np
 import torch
 
+import losses
 from config import Config
 from losses import (
     build_pcl_sampling_strata,
@@ -27,6 +28,20 @@ class IdentityTransform:
         return zyxs
 
     def inv(self, spiral_zyxs):
+        return spiral_zyxs
+
+
+class CountingIdentityTransform(IdentityTransform):
+    def __init__(self):
+        self.forward_counts = []
+        self.inverse_counts = []
+
+    def __call__(self, zyxs):
+        self.forward_counts.append(len(zyxs))
+        return zyxs
+
+    def inv(self, spiral_zyxs):
+        self.inverse_counts.append(len(spiral_zyxs))
         return spiral_zyxs
 
 
@@ -68,7 +83,9 @@ def _strips(zyxs_list):
     ]
 
 
-def _run_losses(zyxs_list, cfg, num_steps=25, compute_dt=True, seed=0):
+def _run_losses(
+        zyxs_list, cfg, num_steps=25, compute_dt=True, seed=0,
+        num_points_per_pcl=None, transform=None):
     np.random.seed(seed)
     torch.manual_seed(seed)
     strips = _strips(zyxs_list)
@@ -88,17 +105,61 @@ def _run_losses(zyxs_list, cfg, num_steps=25, compute_dt=True, seed=0):
     components = [[i] for i in range(len(zyxs_list))]
     edges = [[] for _ in zyxs_list]
     dr = torch.tensor(DR)
+    transform = transform or IdentityTransform()
+    if num_points_per_pcl is None:
+        num_points_per_pcl = cfg[
+            'sample_count_unattached_pcl_points_per_step']
     radius_losses, dt_losses = [], []
     for _ in range(num_steps):
         radius_loss, dt_loss = get_unattached_pcl_strip_losses(
-            IdentityTransform(), dr, strips, components, edges, strata,
+            transform, dr, strips, components, edges, strata,
             lambda _strips, _device: flat,
-            len(zyxs_list), cfg['sample_count_unattached_pcl_points_per_step'],
+            len(zyxs_list), num_points_per_pcl,
             compute_dt=compute_dt, crossing_map=crossing_map, cfg=cfg,
         )
         radius_losses.append(float(radius_loss))
         dt_losses.append(float(dt_loss))
     return np.array(radius_losses), np.array(dt_losses)
+
+
+def test_short_unequal_strips_transform_each_available_point_once():
+    cfg = _make_cfg()
+    base = _perfect_spiral_fiber(1.0)
+    transform = CountingIdentityTransform()
+    radius_losses, dt_losses = _run_losses(
+        [base[:3], base[:5]], cfg, num_steps=1,
+        num_points_per_pcl=1024, transform=transform)
+
+    assert transform.forward_counts == [8]
+    assert transform.inverse_counts == [8]
+    assert radius_losses.max() < 1e-3
+    assert dt_losses.max() < 1e-3
+
+
+def test_mixed_short_and_long_strips_use_independent_caps(monkeypatch):
+    cfg = _make_cfg()
+    short = _perfect_spiral_fiber(1.0)[:3]
+    long = _perfect_spiral_fiber(10.0)
+    assert len(long) > 1024
+    transform = CountingIdentityTransform()
+    captured_counts = []
+    real_helper = losses.strip_dt_target_in_sample_frame
+
+    def capture_mask(*args, **kwargs):
+        captured_counts.append(kwargs['sample_mask'].sum(dim=-1).tolist())
+        return real_helper(*args, **kwargs)
+
+    monkeypatch.setattr(
+        losses, 'strip_dt_target_in_sample_frame', capture_mask)
+    radius_losses, dt_losses = _run_losses(
+        [short, long], cfg, num_steps=1,
+        num_points_per_pcl=1024, transform=transform)
+
+    assert sorted(captured_counts[0]) == [3, 1024]
+    assert transform.forward_counts == [1027]
+    assert transform.inverse_counts == [1027]
+    assert radius_losses.max() < 1e-3
+    assert dt_losses.max() < 1e-3
 
 
 def test_multiwrap_perfect_fiber_has_zero_radius_and_dt_loss():

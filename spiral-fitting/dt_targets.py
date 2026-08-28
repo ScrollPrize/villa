@@ -145,7 +145,7 @@ def select_whole_object_target(values, dr_per_winding, floating_threshold):
 
 def strip_dt_target_in_sample_frame(
     sample_radii, sample_local_idx, sample_theta, sample_adjustments,
-    dr_per_winding, cache, cache_idx,
+    dr_per_winding, cache, cache_idx, sample_mask=None,
 ):
     """Per-strip DT target winding, for the strip-shaped losses (unattached pcls, tracks).
 
@@ -155,8 +155,21 @@ def strip_dt_target_in_sample_frame(
     (snap_dt_target). Otherwise the cached whole-strip target is transferred into
     each sample's unwrap frame (snap_strip_dt_target), with the snapped median as
     per-strip fallback where the cache holds no usable entry. sample_local_idx and
-    cache_idx may be numpy arrays or tensors."""
-    median_target = snap_dt_target(sample_radii.median(dim=-1, keepdim=True).values, dr_per_winding)
+    cache_idx may be numpy arrays or tensors. ``sample_mask`` excludes padded
+    points from both the median fallback and cache-anchor selection; existing
+    dense callers can omit it."""
+    if sample_mask is None:
+        sample_mask = torch.ones_like(sample_radii, dtype=torch.bool)
+    else:
+        sample_mask = torch.as_tensor(
+            sample_mask, dtype=torch.bool, device=sample_radii.device)
+    counts = sample_mask.sum(dim=-1).clamp(min=1)
+    sortable = torch.where(
+        sample_mask, sample_radii, torch.full_like(sample_radii, torch.inf))
+    sorted_radii = sortable.sort(dim=-1).values
+    median_idx = torch.div(counts - 1, 2, rounding_mode='floor')
+    sample_median = torch.gather(sorted_radii, -1, median_idx[..., None])
+    median_target = snap_dt_target(sample_median, dr_per_winding)
     if cache is None:
         return median_target
     device = sample_theta.device
@@ -164,6 +177,7 @@ def strip_dt_target_in_sample_frame(
     cache_idx = torch.as_tensor(cache_idx, dtype=torch.int64, device=device)
     target, valid = snap_strip_dt_target(
         sample_local_idx, sample_theta, sample_adjustments, dr_per_winding, cache, cache_idx,
+        sample_mask=sample_mask,
     )
     return torch.where(valid[:, None], target, median_target)
 
@@ -277,7 +291,7 @@ def _stage_strip_dt_cache(cache, cache_idx, device, value_dtype):
 
 def snap_strip_dt_target(
     sample_local_idx, sample_theta, sample_adjustments,
-    dr_per_winding, cache, cache_idx,
+    dr_per_winding, cache, cache_idx, sample_mask=None,
 ):
     """Express cached strip targets in sampled-subset unwrap frames.
 
@@ -303,9 +317,14 @@ def snap_strip_dt_target(
         cache, cache_idx, sample_theta.device, sample_theta.dtype)
     cache_idx = torch.as_tensor(
         cache_idx, dtype=torch.int64, device=sample_theta.device)
+    if sample_mask is None:
+        sample_mask = torch.ones_like(sample_local_idx, dtype=torch.bool)
+    else:
+        sample_mask = torch.as_tensor(
+            sample_mask, dtype=torch.bool, device=sample_local_idx.device)
     if cache_idx.dim() == 1:
         cache_idx = cache_idx[:, None].expand_as(sample_local_idx)
-    point_valid = cache['valid'][cache_idx]  # (K, P)
+    point_valid = cache['valid'][cache_idx] & sample_mask  # (K, P)
     valid = point_valid.any(dim=-1)
     keys = cache['keys']
     if keys.numel() == 0:

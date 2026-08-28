@@ -9,6 +9,7 @@ import torch
 from dt_targets import (
     compute_patch_dt_target_cache,
     patch_dt_target_in_sample_frame,
+    strip_dt_target_in_sample_frame,
 )
 from fit_spiral import FitContext
 from losses import _patch_radius_and_dt_losses
@@ -118,6 +119,24 @@ class ThetaCrossingLossTests(unittest.TestCase):
         }
         target = patch_dt_target_in_sample_frame(
             torch.tensor([[30.0, -20.0, -20.0]]), sample_ijs, zeros, zeros,
+            dr, cache, torch.tensor([0]), sample_mask=sample_mask)
+        torch.testing.assert_close(target, torch.tensor([[30.0]]))
+
+    def test_strip_dt_median_and_cache_anchor_ignore_padded_points(self):
+        dr = torch.tensor(10.0)
+        sample_mask = torch.tensor([[True, False, False]])
+        zeros = torch.zeros((1, 3))
+        cache = {
+            'keys': torch.tensor([0, 10]),
+            'key_scale': 100,
+            'theta': torch.zeros(2),
+            'adjustment': torch.tensor([0.0, 5.0]),
+            'target_relative': torch.tensor([3.0]),
+            'valid': torch.tensor([True]),
+        }
+        target = strip_dt_target_in_sample_frame(
+            torch.tensor([[30.0, -20.0, -20.0]]),
+            torch.tensor([[4, 10, 10]]), zeros, zeros,
             dr, cache, torch.tensor([0]), sample_mask=sample_mask)
         torch.testing.assert_close(target, torch.tensor([[30.0]]))
 
