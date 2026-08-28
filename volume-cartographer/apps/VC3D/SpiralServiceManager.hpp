@@ -39,7 +39,7 @@ public:
 
     // The one service API version this build speaks; the handshake refuses
     // anything else. Reported to the user so a mismatch is self-explanatory.
-    static constexpr int kApiVersion = 34;
+    static constexpr int kApiVersion = 35;
 
     explicit SpiralServiceManager(QObject* parent = nullptr);
     ~SpiralServiceManager() override;
@@ -140,6 +140,10 @@ signals:
     // service as a second artifact once the surface was on its way.
     void previewDiagnosticsAvailable(const QString& manifestPath,
                                      qint64 generation);
+    // Immutable display-only PCL snapshot resolved by the service. The
+    // descriptor carries the source coordinate domain.
+    void sameWindingArtifactAvailable(const QString& manifestPath,
+                                      const QJsonObject& artifactRef);
     void previewTransferProgress(const QString& phase, const QString& fileName,
                                  int filesComplete, int totalFiles,
                                  qint64 bytesReceived, qint64 totalBytes);
@@ -268,6 +272,8 @@ private:
     QString _fetchingPreviewArtifact;
     QString _installedDiagnosticsArtifact;
     QString _fetchingDiagnosticsArtifact;
+    QString _installedSameWindingArtifact;
+    QString _fetchingSameWindingArtifact;
     bool _previewDiagnosticsWanted = false;
     QString _fetchingCheckpointArtifact;
     qint64 _previewSequence = 0;

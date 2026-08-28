@@ -285,6 +285,38 @@ private slots:
         QCOMPARE(viewer.scene().items().size(), 0);
     }
 
+    void fiberOverlayUsesTheSameViewerScaleForDrawingAndHitTesting()
+    {
+        FakeViewer viewer;
+        viewer.graphicsView()->resize(800, 600);
+        viewer.setSurfaceSceneTransform(10.0, QPointF{1.0, 2.0});
+        viewer.setCurrentSurface(std::make_shared<PlaneSurface>(
+            cv::Vec3f(0.0f, 0.0f, 0.0f), cv::Vec3f(0.0f, 0.0f, 1.0f)));
+
+        FiberOverlayController controller;
+        controller.attachViewer(&viewer);
+        controller.setViewerBaseToViewerFactor(&viewer, 0.25);
+        controller.setChains({
+            FiberOverlayController::Chain{7, {{0, 0, 0}, {4, 0, 0}, {8, 0, 0}}},
+        });
+        controller.setVisible(true);
+
+        QCOMPARE(controller.viewerBaseToViewerFactor(&viewer), 0.25);
+        QVERIFY(std::abs(viewer.scene().itemsBoundingRect().center().x() - 11.0) < 0.75);
+        const auto hit = controller.hitTestControlPoint(
+            &viewer, QPointF{11.0, 2.0}, 1.0);
+        QVERIFY(hit.has_value());
+        QCOMPARE(hit->fiberId, uint64_t{7});
+        QCOMPARE(hit->controlPointIndex, 1);
+
+        controller.setViewerBaseToViewerFactor(&viewer, 0.5);
+        QVERIFY(std::abs(viewer.scene().itemsBoundingRect().center().x() - 21.0) < 0.75);
+        const auto movedHit = controller.hitTestControlPoint(
+            &viewer, QPointF{21.0, 2.0}, 1.0);
+        QVERIFY(movedHit.has_value());
+        QCOMPARE(movedHit->controlPointIndex, 1);
+    }
+
     void surfacePrimitivesUseViewerSurfaceTransform()
     {
         FakeViewer viewer;

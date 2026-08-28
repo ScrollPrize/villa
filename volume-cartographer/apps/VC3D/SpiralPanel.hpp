@@ -41,6 +41,7 @@ public:
     void setLossMapOptions(const QStringList& names);
     void setLossMapLegend(const QString& text);
     void setLocalDraftsReady(bool ready);
+    void setSameWindingPclsAvailable(bool available, const QString& reason = {});
     void setSessionExitGuard(
         std::function<void(std::function<void()>)> guard) { _sessionExitGuard = std::move(guard); }
 
@@ -55,6 +56,7 @@ signals:
     void surfaceIntersectionsChanged(bool shown);
     void surfaceIntersectionStrideChanged(int stride);
     void surfaceOverlapChanged(bool shown);
+    void sameWindingPclsChanged(bool shown);
     void pythonOutputRequested();
     void addDraftsRequested(bool commitAfterAdd);
 
@@ -104,6 +106,7 @@ private:
     QSpinBox* _minimumDisplayedWinding = nullptr;
     QSpinBox* _maximumDisplayedWinding = nullptr;
     QCheckBox* _showSurfaceIntersections = nullptr;
+    QCheckBox* _showSameWindingPcls = nullptr;
     QComboBox* _lossMap = nullptr;
     QCheckBox* _lossMapDiagnostics = nullptr;
     QSlider* _lossMapOpacity = nullptr;

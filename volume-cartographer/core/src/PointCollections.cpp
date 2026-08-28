@@ -157,8 +157,14 @@ void from_json(const Json& j, PointCollections::Collection& c) {
         }
     }
 
-    from_json(j.at("metadata"), c.metadata);
-    c.color = vec3f_from_json(j.at("color"));
+    if (j.contains("metadata") && j.at("metadata").is_object())
+        from_json(j.at("metadata"), c.metadata);
+    else
+        c.metadata = {};
+    if (j.contains("color") && j.at("color").is_array())
+        c.color = vec3f_from_json(j.at("color"));
+    else
+        c.color = cv::Vec3f{0.2f, 0.8f, 1.0f};
 
     if (j.contains("anchor2d") && !j.at("anchor2d").is_null()) {
         c.anchor2d = vec2f_from_json(j.at("anchor2d"));

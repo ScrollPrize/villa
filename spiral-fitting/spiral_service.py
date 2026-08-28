@@ -63,7 +63,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from fit_session import (API_VERSION, FIT_INPUT_CATALOG, SESSION_BUSY_STATES,
                          SCROLL_SPEC_FILENAME, SCROLL_SPEC_OWNED_RUN_KEYS,
-                         ScrollSpecError, SessionState,
+                         PclRole, ScrollSpecError, SessionState,
                          SpiralInputPaths, default_user_cache_dir,
                          input_source_enabled, pcl_input_enabled,
                          phase_bundle_enabled, winding_inference_enabled,
@@ -596,6 +596,7 @@ class ServiceState:
         # One record for the whole of preview publication (see
         # LasagnaPublisher's PreviewPublication), guarded by self.lock.
         self._preview = PreviewPublication()
+        self.same_winding_artifact = None
         # A preview export runs off the HTTP thread (it costs minutes); this
         # is what makes the verb single-flight and what /session/status
         # reports so a client reconnecting mid-export can see one is running.
@@ -690,6 +691,7 @@ class ServiceState:
             # never opens an overlay never waits for one.
             response["preview_diagnostics_artifact"] = (
                 self._preview.diagnostics_artifact)
+            response["same_winding_artifact"] = self.same_winding_artifact
             response["preview_publish"] = (
                 dict(self._preview.progress)
                 if self._preview.progress else None)
@@ -1144,6 +1146,9 @@ class ServiceState:
             args=(session_id, previous, previous_ephemeral, paths, run,
                   preview, scroll),
             name="spiral-session-build", daemon=True).start()
+        threading.Thread(
+            target=self._refresh_same_winding_artifact,
+            name="spiral-same-winding-publish", daemon=True).start()
 
     def _build(self, session_id, previous, previous_ephemeral, paths, run,
                preview, scroll):
@@ -1204,9 +1209,79 @@ class ServiceState:
         self.ephemeral_records.clear()
         self.uploads_manager.reset()
         stale_raw = self._preview.reset_session_scope()
+        self.same_winding_artifact = None
         for manifest in stale_raw:
             shutil.rmtree(
                 Path(manifest).parent, ignore_errors=True)
+
+    def _publish_same_winding_artifact(self, source_path=None):
+        """Snapshot the active same-winding PCL without exposing host paths."""
+        with self.lock:
+            session_id = self.session_id
+            paths = self.session_paths
+            generation = self.session_revision
+            resolution = self.dataset_resolution
+        if not session_id or paths is None:
+            return None
+        source = Path(source_path) if source_path else None
+        if source is None:
+            for pcl in paths.pcls:
+                if pcl.role == PclRole.SAME_WINDING and pcl.path:
+                    source = Path(pcl.path)
+                    break
+        if source is None:
+            candidate = Path(paths.dataset_root) / PCL_ROLE_FILES[PclRole.SAME_WINDING.value]
+            if candidate.is_file():
+                source = candidate
+        if source is None or not source.is_file():
+            with self.lock:
+                self.same_winding_artifact = None
+            return None
+        base_shape = None
+        if resolution is not None and resolution.scroll_spec is not None:
+            base_shape = resolution.scroll_spec.get("base_shape_zyx")
+        if base_shape is None:
+            with self.lock:
+                self.same_winding_artifact = None
+            return None
+        root = (Path(paths.output_directory) / ".spiral-artifacts" /
+                f"same-winding-{generation}-{secrets.token_hex(6)}")
+        root.mkdir(parents=True, exist_ok=False)
+        try:
+            pcl_name = "same_windings.json"
+            shutil.copy2(source, root / pcl_name)
+            descriptor = {
+                "schema_version": 1,
+                "kind": "spiral-same-winding-pcl",
+                "base_shape_zyx": list(base_shape),
+                "pcl_file": pcl_name,
+            }
+            (root / "manifest.json").write_text(
+                json.dumps(descriptor, indent=2) + "\n", encoding="utf-8")
+            ref = self.artifacts.register_directory(
+                "spiral-same-winding-pcl", session_id, generation, root,
+                "manifest.json", delete_root_on_prune=True)
+            ref["base_shape_zyx"] = list(base_shape)
+            with self.lock:
+                if self.session_id != session_id:
+                    shutil.rmtree(root, ignore_errors=True)
+                    return None
+                self.same_winding_artifact = ref
+                self.status_generation += 1
+            self.artifacts.prune("spiral-same-winding-pcl", session_id, 1)
+            return ref
+        except BaseException:
+            shutil.rmtree(root, ignore_errors=True)
+            raise
+
+    def _refresh_same_winding_artifact(self, source_path=None):
+        try:
+            self._publish_same_winding_artifact(source_path)
+        except Exception as exc:
+            self.events.append(
+                "log", f"Same-winding overlay could not be published: "
+                f"{type(exc).__name__}: {exc}", severity="warning",
+                source="service", operation="publishing_same_winding")
 
     def _status_changed(self, status):
         # Runs on the fitter thread. It may only claim immutable raw work;
@@ -2556,6 +2631,17 @@ class ServiceState:
                     for record in fiber_records.values():
                         self._cleanup_fiber_revision_files(record)
             commit_lock.release()
+        same_winding_target = next((
+            str(Path(self.session_paths.dataset_root) /
+                PCL_ROLE_FILES[PclRole.SAME_WINDING.value])
+            for snapshot in snapshots
+            if snapshot.kind == "pcl"
+            and snapshot.role == PclRole.SAME_WINDING.value
+        ), None)
+        if same_winding_target is not None:
+            self._refresh_same_winding_artifact(same_winding_target)
+            response = {**response,
+                        "same_winding_artifact": self.same_winding_artifact}
         return response
 
     def remove_input(self, kind, input_id):

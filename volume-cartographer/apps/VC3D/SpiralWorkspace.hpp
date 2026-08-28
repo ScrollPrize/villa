@@ -1,5 +1,7 @@
 #pragma once
 
+#include "LineAnnotationController.hpp"
+
 #include <QMainWindow>
 #include <QFutureWatcher>
 #include <QHash>
@@ -10,6 +12,8 @@
 #include <QStringList>
 #include <opencv2/core/mat.hpp>
 #include <opencv2/core/types.hpp>
+#include <atomic>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -35,7 +39,10 @@ class Volume;
 class SpiralOverlayController;
 class SpiralMinimap;
 class SpiralBrushController;
+class SpiralLineDraftOverlay;
 class SegmentationOverlayController;
+class PointsOverlayController;
+class VCCollection;
 class VolumeViewerBase;
 
 class SpiralWorkspace : public QMainWindow
@@ -60,9 +67,17 @@ public:
                                const QString& fiberJsonPath);
     void requestSessionExit(std::function<void()> continuation);
     bool hasPendingBrushWork() const;
+    void setLineAnnotationController(LineAnnotationController* controller);
+    [[nodiscard]] bool isFlattenedViewer(const VolumeViewerBase* viewer) const;
+    [[nodiscard]] QString lineAnnotationDraftUnavailableReason() const;
+    [[nodiscard]] std::optional<double> fiberBaseToPreviewFactor() const {
+        return _fiberBaseToPreviewFactor;
+    }
+    void startLineAnnotationDraft();
 
 signals:
     void spiralSessionActiveChanged(bool active);
+    void fiberBaseToPreviewFactorChanged(double factor, bool valid);
 
 protected:
     void keyPressEvent(QKeyEvent* event) override;
@@ -80,6 +95,7 @@ private:
         QString surfaceId;
         std::vector<PreviewComponent> components;
         cv::Mat_<int32_t> windingIds;
+        std::optional<std::array<std::size_t, 3>> baseShapeZYX;
         QString error;
         struct LossMap {
             QString name;
@@ -130,6 +146,9 @@ private:
     // what is already displayed - it never reloads the surface.
     void installPreviewDiagnostics(const QString& manifestPath,
                                    qint64 generation);
+    void installSameWindingArtifact(const QString& manifestPath,
+                                    const QJsonObject& artifactRef);
+    void refreshSameWindingOverlay();
     void applyPreviewWindingRange(bool preserveFocus);
     void loadRunDiff();
     void updateRunDiffOverlay();
@@ -149,6 +168,17 @@ private:
                                      const std::shared_ptr<QuadSurface>& surface,
                                      const std::optional<QColor>& color = std::nullopt);
     void finalizeBrushPaint();
+    void finalizeLineAnnotationDraft();
+    void cancelLineAnnotationDraft();
+    void undoLineAnnotationDraftPoint();
+    void appendLineAnnotationDraftPoint(const QPointF& scenePoint,
+                                        Qt::KeyboardModifiers modifiers);
+    [[nodiscard]] std::optional<LineAnnotationController::ResolvedFiberOptimizationInputs>
+        resolveLineAnnotationInputs(QString* errorMessage) const;
+    [[nodiscard]] QStringList fallbackFiberManifests() const;
+    [[nodiscard]] std::optional<std::array<std::size_t, 3>>
+        resolveFiberBaseShape(QString* errorMessage) const;
+    void updatePreviewCoordinateScale();
     void submitReadyDrafts(bool commitAfterAdd);
     void maybeCommitForPendingExit();
     QString provisionalBrushRoot() const;
@@ -167,6 +197,10 @@ private:
     std::unique_ptr<AxisAlignedSliceController> _slices;
     std::unique_ptr<SpiralOverlayController> _overlay;
     std::unique_ptr<SpiralBrushController> _brush;
+    std::unique_ptr<SpiralLineDraftOverlay> _lineDraftOverlay;
+    std::unique_ptr<VCCollection> _sameWindingCollection;
+    std::unique_ptr<PointsOverlayController> _sameWindingOverlay;
+    LineAnnotationController* _lineAnnotationController = nullptr;
     std::unique_ptr<SegmentationOverlayController> _surfaceOverlapOverlay;
     SpiralServiceManager* _service = nullptr;
     SpiralPanel* _panel = nullptr;
@@ -177,6 +211,15 @@ private:
     SpiralMinimap* _windingMinimap = nullptr;
     qint64 _requestedPreviewGeneration = -1;
     QJsonObject _sessionPaths;
+    QJsonObject _sessionRunConfig;
+    QString _externalFiberSource;
+    struct LineAnnotationDraft {
+        std::shared_ptr<QuadSurface> surface;
+        std::vector<QPointF> surfacePoints;
+        std::shared_ptr<std::atomic_bool> saveAllowed;
+        bool optimizing = false;
+    };
+    std::optional<LineAnnotationDraft> _lineAnnotationDraft;
     QHash<QString, QStringList> _surfaceCategoryIds;
     QHash<QString, QString> _surfaceSourceIds;
     QHash<QString, bool> _surfaceCategoryVisible;
@@ -188,6 +231,13 @@ private:
     quint64 _inputSurfaceGeneration = 0;
     std::shared_ptr<QuadSurface> _previewSource;
     QString _previewSourceId;
+    std::optional<std::array<std::size_t, 3>> _previewBaseShapeZYX;
+    std::optional<std::array<std::size_t, 3>> _sameWindingBaseShapeZYX;
+    QString _sameWindingManifestPath;
+    std::optional<std::array<std::size_t, 3>> _fiberBaseShapeZYX;
+    std::optional<double> _previewToFiberBaseScale;
+    std::optional<double> _fiberBaseToPreviewFactor;
+    QString _previewCoordinateError;
     std::vector<PreviewComponent> _previewComponents;
     cv::Mat_<int32_t> _previewWindingIds;
     QString _previewRunDiffImagePath;
@@ -210,6 +260,7 @@ private:
     bool _pendingPatchesOnly = false;
     bool _runDiffVisible = false;
     bool _windingTransitionsVisible = true;
+    bool _sameWindingPclsVisible = false;
     // True while the focus is the automatic volume-center default (no user
     // interaction and no preview yet); the first preview may then retarget it.
     bool _focusIsAutoDefault = false;

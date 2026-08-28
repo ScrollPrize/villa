@@ -162,6 +162,7 @@ struct LineAnnotationController::LineAnnotationSession {
     std::string fiberStartedAt;
     uint64_t fiberSequence = 0;
     std::string fiberFileName;
+    fs::path fiberSourceRoot;
     std::string fiberManualHvTag;
     std::vector<std::string> fiberTags;
     vc3d::line_annotation::FiberOptimizationMode fiberOptimizationMode =
@@ -898,8 +899,11 @@ bool branchReferencesFiber(const LineAnnotationController::FiberBranchRef& branc
                            uint64_t fiberId,
                            const std::string& fileName)
 {
-    if (fiberId != 0 && branch.branchFiberId == fiberId) {
-        return true;
+    // Runtime ids are unique across every registered source. Once both sides
+    // have one, do not let an equal filename in another source create a false
+    // match. Filename matching remains the legacy/on-load fallback.
+    if (fiberId != 0 && branch.branchFiberId != 0) {
+        return branch.branchFiberId == fiberId;
     }
     return !fileName.empty() && branch.branchFileName == fileName;
 }
@@ -2716,6 +2720,7 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
     session->fiberStartedAt = it->startedAt;
     session->fiberSequence = it->sequence;
     session->fiberFileName = it->fileName;
+    session->fiberSourceRoot = it->sourceRoot;
     session->fiberManualHvTag = it->manualHvTag;
     session->fiberTags = it->tags;
     session->fiberOptimizationMode = it->optimizationMode;
@@ -3015,7 +3020,7 @@ void LineAnnotationController::renameFiberFile(uint64_t fiberId)
         return;
     }
 
-    const fs::path dir = fibersDir();
+    const fs::path dir = it->sourceRoot.empty() ? fibersDir() : it->sourceRoot;
     if (dir.empty()) {
         showError(tr("No volume package is loaded."));
         return;
@@ -11357,44 +11362,57 @@ void LineAnnotationController::loadFibersForCurrentPackage()
     // The review verdict tag must be offerable even in a package where no
     // fiber carries it yet, so seed it instead of only discovering it.
     addKnownFiberTags({std::string{vc3d::line_annotation::kReviewedTag}});
-    if (!_state || !_state->vpkg()) {
+    if ((!_state || !_state->vpkg()) && _externalFiberSources.empty()) {
         emitFiberSummaries();
         return;
     }
 
     const fs::path dir = fibersDir();
     std::error_code ec;
-    if (!fs::exists(dir, ec)) {
-        emitFiberSummaries();
-        return;
-    }
-
-    std::vector<fs::path> fiberFiles;
-    for (const auto& entry : fs::directory_iterator(dir, ec)) {
+    fs::path primarySource;
+    if (!dir.empty()) {
+        primarySource = fs::weakly_canonical(dir, ec);
         if (ec) {
-            break;
+            ec.clear();
+            primarySource = fs::absolute(dir).lexically_normal();
         }
-        if (!entry.is_regular_file() || entry.path().extension() != ".json") {
-            continue;
-        }
-        fiberFiles.push_back(entry.path());
     }
-    std::sort(fiberFiles.begin(), fiberFiles.end());
+    std::vector<std::pair<fs::path, fs::path>> fiberFiles;
+    std::vector<fs::path> sources;
+    if (!primarySource.empty()) sources.push_back(primarySource);
+    for (const auto& source : _externalFiberSources) {
+        if (std::find(sources.begin(), sources.end(), source) == sources.end())
+            sources.push_back(source);
+    }
+    for (const auto& source : sources) {
+        ec.clear();
+        if (!fs::exists(source, ec) || !fs::is_directory(source, ec)) continue;
+        for (const auto& entry : fs::directory_iterator(source, ec)) {
+            if (ec) break;
+            if (!entry.is_regular_file() || entry.path().extension() != ".json") continue;
+            fiberFiles.emplace_back(source, entry.path());
+        }
+    }
+    std::sort(fiberFiles.begin(), fiberFiles.end(), [](const auto& a, const auto& b) {
+        return a.second < b.second;
+    });
 
     auto sortLoadedFibers = [](std::vector<StoredFiber>& fibers) {
         std::sort(fibers.begin(),
                   fibers.end(),
                   [](const StoredFiber& a, const StoredFiber& b) {
-                      return a.fileName < b.fileName;
+                      return std::tie(a.sourceRoot, a.fileName) <
+                             std::tie(b.sourceRoot, b.fileName);
                   });
     };
 
     auto loadStrictFibers = [&]() {
         std::vector<StoredFiber> strictFibers;
         std::vector<std::string> strictErrors;
-        for (const auto& path : fiberFiles) {
+        for (const auto& [source, path] : fiberFiles) {
             try {
                 if (auto fiber = loadFiberFile(path)) {
+                    fiber->sourceRoot = source;
                     strictFibers.push_back(std::move(*fiber));
                 }
             } catch (const std::exception& ex) {
@@ -11413,7 +11431,7 @@ void LineAnnotationController::loadFibersForCurrentPackage()
     std::vector<std::string> fatalLoadErrors;
     std::vector<std::string> branchLoadErrors;
     std::unordered_set<std::string> fibersWithRemovedBranchEntries;
-    for (const auto& path : fiberFiles) {
+    for (const auto& [source, path] : fiberFiles) {
         try {
             std::ifstream in(path);
             if (!in) {
@@ -11422,8 +11440,10 @@ void LineAnnotationController::loadFibersForCurrentPackage()
             const nlohmann::json root = nlohmann::json::parse(in);
             std::vector<std::string> branchErrors;
             if (auto fiber = loadFiberJson(root, path, &branchErrors)) {
+                fiber->sourceRoot = source;
                 if (!branchErrors.empty()) {
-                    fibersWithRemovedBranchEntries.insert(fiber->fileName);
+                    fibersWithRemovedBranchEntries.insert(
+                        (fiber->sourceRoot / fiber->fileName).lexically_normal().string());
                     branchLoadErrors.insert(branchLoadErrors.end(),
                                             branchErrors.begin(),
                                             branchErrors.end());
@@ -11443,12 +11463,13 @@ void LineAnnotationController::loadFibersForCurrentPackage()
         for (auto& fiber : loadedFibers) {
             fiber.id = runtimeId++;
             if (!fiber.fileName.empty()) {
-                fiberIdByFileName[fiber.fileName] = fiber.id;
+                fiberIdByFileName[(fiber.sourceRoot / fiber.fileName).string()] = fiber.id;
             }
         }
         for (auto& fiber : loadedFibers) {
             for (auto& branch : fiber.branches) {
-                if (auto it = fiberIdByFileName.find(branch.branchFileName);
+                if (auto it = fiberIdByFileName.find(
+                        (fiber.sourceRoot / branch.branchFileName).string());
                     it != fiberIdByFileName.end()) {
                     branch.branchFiberId = it->second;
                 }
@@ -11533,7 +11554,7 @@ void LineAnnotationController::loadFibersForCurrentPackage()
 
     for (auto& fiber : loadedFibers) {
         addKnownFiberTags(fiber.tags);
-        if (fiber.needsSave) {
+        if (fiber.needsSave && fiber.sourceRoot == primarySource) {
             try {
                 fiber.needsSave = false;
                 saveFiberNow(fiber);
@@ -11884,6 +11905,10 @@ fs::path LineAnnotationController::fiberPath(uint64_t fiberId) const
 
 fs::path LineAnnotationController::fiberPath(const StoredFiber& fiber) const
 {
+    if (!fiber.sourceRoot.empty()) {
+        if (!fiber.fileName.empty()) return fiber.sourceRoot / fiber.fileName;
+        return fiber.sourceRoot / (std::to_string(fiber.id) + ".json");
+    }
     if (!fiber.fileName.empty()) {
         return fibersDir() / fiber.fileName;
     }
@@ -11892,6 +11917,330 @@ fs::path LineAnnotationController::fiberPath(const StoredFiber& fiber) const
             fiber.username, fiber.startedAt, fiber.sequence);
     }
     return fibersDir() / (std::to_string(fiber.id) + ".json");
+}
+
+bool LineAnnotationController::registerExternalFiberSource(
+    const fs::path& source, QString* errorMessage)
+{
+    try {
+        if (source.empty()) throw std::runtime_error("Fiber source path is empty");
+        std::error_code ec;
+        fs::path canonical = fs::weakly_canonical(source, ec);
+        if (ec) canonical = fs::absolute(source).lexically_normal();
+        if (!fs::exists(canonical, ec)) {
+            if (!fs::create_directories(canonical, ec) || ec) {
+                throw std::runtime_error("Could not create fiber source " +
+                                         canonical.string());
+            }
+        }
+        if (!fs::is_directory(canonical, ec)) {
+            throw std::runtime_error("Fiber source is not a directory: " +
+                                     canonical.string());
+        }
+        if (std::find(_externalFiberSources.begin(), _externalFiberSources.end(),
+                      canonical) == _externalFiberSources.end()) {
+            _externalFiberSources.push_back(std::move(canonical));
+            loadFibersForCurrentPackage();
+        }
+        return true;
+    } catch (const std::exception& ex) {
+        if (errorMessage) *errorMessage = QString::fromUtf8(ex.what());
+        return false;
+    }
+}
+
+void LineAnnotationController::unregisterExternalFiberSource(const fs::path& source)
+{
+    if (source.empty()) return;
+    std::error_code ec;
+    fs::path canonical = fs::weakly_canonical(source, ec);
+    if (ec) canonical = fs::absolute(source).lexically_normal();
+    const auto oldSize = _externalFiberSources.size();
+    std::erase(_externalFiberSources, canonical);
+    if (_externalFiberSources.size() != oldSize) loadFibersForCurrentPackage();
+}
+
+std::optional<LineAnnotationController::ResolvedFiberOptimizationInputs>
+LineAnnotationController::resolveFiberOptimizationInputs(
+    const std::string& fallbackNormalLocation,
+    const std::string& fallbackFiberLocation,
+    QString* errorMessage) const
+{
+    if (!_state || !_state->vpkg()) {
+        if (errorMessage) *errorMessage = tr("No volume package is loaded.");
+        return std::nullopt;
+    }
+    auto vpkg = _state->vpkg();
+    vc::lasagna::LasagnaDatasetOpenOptions options;
+    options.remoteCacheRoot = vpkg->remoteCacheRootOrEmpty();
+    const auto resolveLocation = [vpkg](const std::string& location) {
+        return vc::project::isLocationRemote(location)
+            ? location
+            : vc::project::resolveLocalPath(
+                  location, vpkg->path().parent_path()).string();
+    };
+
+    ResolvedFiberOptimizationInputs result;
+    QStringList failures;
+    const std::vector<std::string> normalCandidates = {
+        vpkg->selectedLasagnaDataset(), fallbackNormalLocation};
+    for (const auto& candidate : normalCandidates) {
+        if (candidate.empty() || result.normalDataset) continue;
+        try {
+            auto dataset = std::make_shared<vc::lasagna::LasagnaDataset>(
+                vc::lasagna::LasagnaDataset::openLocation(
+                    resolveLocation(candidate), options));
+            auto sampler =
+                std::make_shared<vc::lasagna::LasagnaNormalSampler>(*dataset);
+            result.normalManifestLocation = candidate;
+            result.normalDataset = std::move(dataset);
+            result.baseNormalSampler = std::move(sampler);
+        } catch (const std::exception& ex) {
+            failures.push_back(tr("Normal dataset %1: %2")
+                                   .arg(QString::fromStdString(candidate),
+                                        QString::fromUtf8(ex.what())));
+        }
+    }
+    const std::vector<std::string> fiberCandidates = {
+        vpkg->selectedFiberInferenceDataset(), fallbackFiberLocation};
+    for (const auto& candidate : fiberCandidates) {
+        if (candidate.empty() || result.fiberDataset) continue;
+        try {
+            auto opened = vc::lasagna::LasagnaDataset::openLocation(
+                resolveLocation(candidate), options);
+            const auto scales =
+                vc::fiber_tracer::resolveFiberPredictionTraceScales(opened.manifest());
+            auto manifest = opened.manifest();
+            manifest.workingToBaseScale = scales.traceToBaseScale;
+            auto dataset = std::make_shared<vc::lasagna::LasagnaDataset>(
+                std::move(manifest));
+            auto predictions =
+                std::make_shared<vc::fiber_tracer::FiberPredictionField>(*dataset);
+            result.fiberManifestLocation = candidate;
+            result.traceToBaseScale = scales.traceToBaseScale;
+            result.fiberDataset = std::move(dataset);
+            result.predictions = std::move(predictions);
+        } catch (const std::exception& ex) {
+            failures.push_back(tr("Fiber-inference dataset %1: %2")
+                                   .arg(QString::fromStdString(candidate),
+                                        QString::fromUtf8(ex.what())));
+        }
+    }
+    if (!result.normalDataset || !result.fiberDataset) {
+        if (errorMessage) {
+            QString missing;
+            if (!result.normalDataset) missing += tr("No usable Lasagna normal dataset. ");
+            if (!result.fiberDataset) missing += tr("No usable fiber-inference dataset. ");
+            *errorMessage = missing + failures.join(QStringLiteral("; "));
+        }
+        return std::nullopt;
+    }
+    try {
+        vc::lasagna::LasagnaDatasetOpenOptions traceOptions = options;
+        traceOptions.workingToBaseScale = result.traceToBaseScale;
+        auto traceDataset = std::make_shared<vc::lasagna::LasagnaDataset>(
+            vc::lasagna::LasagnaDataset::openLocation(
+                resolveLocation(result.normalManifestLocation), traceOptions));
+        auto traceSampler =
+            std::make_shared<vc::lasagna::LasagnaNormalSampler>(*traceDataset);
+        const auto& normalShape = result.normalDataset->manifest().baseShapeZYX;
+        const auto& fiberShape = result.fiberDataset->manifest().baseShapeZYX;
+        if (normalShape && fiberShape && *normalShape != *fiberShape) {
+            throw std::runtime_error(
+                "normal and fiber-inference manifests declare different base shapes");
+        }
+        result.traceNormalDataset = std::move(traceDataset);
+        result.traceNormalSampler = std::move(traceSampler);
+    } catch (const std::exception& ex) {
+        if (errorMessage) {
+            *errorMessage = tr("The selected normal and fiber-inference datasets are "
+                               "not coordinate-compatible: %1")
+                                .arg(QString::fromUtf8(ex.what()));
+        }
+        return std::nullopt;
+    }
+    return result;
+}
+
+void LineAnnotationController::optimizeAndSaveFiberHeadless(
+    HeadlessFiberOptimizationRequest request,
+    HeadlessFiberCompletion completion)
+{
+    auto fail = [completion](const QString& message) {
+        if (completion) completion(false, message, 0);
+    };
+    if (request.controlPointsL0.size() < 2) {
+        fail(tr("A 2D line annotation needs at least two control points."));
+        return;
+    }
+    for (size_t i = 0; i < request.controlPointsL0.size(); ++i) {
+        if (!finitePoint(request.controlPointsL0[i])) {
+            fail(tr("A line control point contains non-finite coordinates."));
+            return;
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (pointsApproximatelyEqual(request.controlPointsL0[i],
+                                         request.controlPointsL0[j])) {
+                fail(tr("A 2D line annotation needs at least two distinct points and "
+                        "cannot contain duplicate controls."));
+                return;
+            }
+        }
+    }
+    if (!request.inputs.baseNormalSampler || !request.inputs.traceNormalSampler ||
+        !request.inputs.predictions) {
+        fail(tr("Fiber optimization inputs are incomplete."));
+        return;
+    }
+    QString sourceError;
+    if (!registerExternalFiberSource(request.destinationFiberSource, &sourceError)) {
+        fail(sourceError);
+        return;
+    }
+    std::error_code ec;
+    fs::path destination = fs::weakly_canonical(
+        request.destinationFiberSource, ec);
+    if (ec) destination = fs::absolute(
+        request.destinationFiberSource).lexically_normal();
+    auto shouldSave = std::move(request.shouldSave);
+
+    struct HeadlessResult {
+        bool ok = false;
+        std::vector<vc3d::line_annotation::LineControlPoint> controls;
+        std::vector<cv::Vec3d> line;
+        QString error;
+    };
+    auto* watcher = new QFutureWatcher<HeadlessResult>(this);
+    connect(watcher, &QFutureWatcher<HeadlessResult>::finished, this,
+            [this, watcher, destination, completion,
+             shouldSave = std::move(shouldSave)]() mutable {
+                HeadlessResult result = watcher->result();
+                watcher->deleteLater();
+                if (!result.ok) {
+                    if (completion) completion(false, result.error, 0);
+                    return;
+                }
+                if (shouldSave && !shouldSave()) {
+                    if (completion) {
+                        completion(false,
+                                   tr("The Spiral preview or session changed before "
+                                      "the annotation could be saved."),
+                                   0);
+                    }
+                    return;
+                }
+                try {
+                    StoredFiber fiber;
+                    fiber.id = nextFiberId();
+                    fiber.username = currentFiberUsername();
+                    fiber.startedAt = currentFiberDateTimeString();
+                    fiber.sequence = nextFiberSequenceForUsername(fiber.username);
+                    do {
+                        fiber.fileName = vc3d::line_annotation::fiberFileName(
+                            fiber.username, fiber.startedAt, fiber.sequence++);
+                    } while (fs::exists(destination / fiber.fileName));
+                    --fiber.sequence;
+                    fiber.sourceRoot = destination;
+                    fiber.generation = 1;
+                    fiber.optimizationMode =
+                        vc3d::line_annotation::FiberOptimizationMode::NativeFiberTrace3d;
+                    fiber.linePoints = std::move(result.line);
+                    fiber.controlPoints.reserve(result.controls.size());
+                    for (auto& control : result.controls) {
+                        vc3d::line_annotation::StoredControlPoint stored{
+                            control.volumePoint};
+                        stored.segmentToNext = std::move(control.segmentToNext);
+                        fiber.controlPoints.push_back(std::move(stored));
+                    }
+                    fiber.hvClassification = vc3d::line_annotation::classifyFiberHv(
+                        vc3d::line_annotation::storedControlPointPositions(
+                            fiber.controlPoints));
+                    const uint64_t id = fiber.id;
+                    saveFiberNow(fiber);
+                    _fibers.push_back(std::move(fiber));
+                    emitFiberSummaries();
+                    emit fiberSaved(id, 1);
+                    refreshBranchLineViews(id);
+                    if (completion) completion(true, {}, id);
+                } catch (const std::exception& ex) {
+                    if (completion) {
+                        completion(false,
+                                   tr("Could not save Spiral line annotation: %1")
+                                       .arg(QString::fromUtf8(ex.what())),
+                                   0);
+                    }
+                }
+            });
+    watcher->setFuture(QtConcurrent::run(
+        [request = std::move(request)]() mutable {
+            HeadlessResult output;
+            try {
+                vc::lasagna::LineOptimizationConfig config;
+                const auto discretization = initialLineDiscretization(400);
+                config.segmentsPerSide = discretization.segmentsPerSide;
+                config.segmentLength = discretization.segmentLength;
+                config.straightnessWeight = 0.1;
+                config.tangentStraightnessWeight = 5.0;
+                config.samplesPerSegment = 1;
+                config.maxIterations = 1000;
+                config.differentiableNormalSampling = true;
+                config.printSolverProgress = false;
+
+                std::vector<vc3d::line_annotation::LineControlPoint> controls;
+                controls.reserve(request.controlPointsL0.size());
+                for (size_t i = 0; i < request.controlPointsL0.size(); ++i) {
+                    controls.emplace_back(static_cast<double>(i),
+                                          request.controlPointsL0[i], i == 0, -1);
+                }
+                vc::lasagna::LineOptimizer initializer(
+                    *request.inputs.baseNormalSampler);
+                auto initialized = initializer.optimizeFromControlPoints(
+                    vc3d::line_annotation::optimizerControlPoints(controls), config);
+                std::vector<cv::Vec3d> initialLine;
+                initialLine.reserve(initialized.line.points.size());
+                for (const auto& point : initialized.line.points)
+                    initialLine.push_back(point.position);
+                size_t previous = 0;
+                for (size_t i = 0; i < controls.size(); ++i) {
+                    const size_t index = vc3d::fiber_slice::nearestLinePointIndex(
+                        initialLine, controls[i].volumePoint);
+                    if (i > 0 && index <= previous) {
+                        throw std::runtime_error(
+                            "Lasagna initialization did not preserve control-point order");
+                    }
+                    previous = index;
+                    controls[i].linePosition = static_cast<double>(index);
+                    controls[i].optimizedIndex = static_cast<int>(index);
+                }
+
+                vc3d::line_annotation::FiberModeOptimizationRequest fiberRequest;
+                fiberRequest.controlPoints = std::move(controls);
+                fiberRequest.linePointsBase = std::move(initialLine);
+                fiberRequest.predictions = request.inputs.predictions.get();
+                fiberRequest.baseNormalSampler = request.inputs.baseNormalSampler.get();
+                fiberRequest.traceNormalSampler = request.inputs.traceNormalSampler.get();
+                fiberRequest.lasagnaConfig = config;
+                fiberRequest.normalManifestLocation =
+                    request.inputs.normalManifestLocation;
+                fiberRequest.fiberManifestLocation =
+                    request.inputs.fiberManifestLocation;
+                fiberRequest.traceToBaseScale = request.inputs.traceToBaseScale;
+                fiberRequest.globalMode =
+                    vc3d::line_annotation::FiberOptimizationMode::NativeFiberTrace3d;
+                fiberRequest.retainOpenTails = false;
+                fiberRequest.extrapolationDistanceBaseVoxels = 0.0;
+                auto optimized = vc3d::line_annotation::
+                    optimizeFiberWithNativeFallback(std::move(fiberRequest));
+                output.controls = std::move(optimized.controlPoints);
+                output.line.reserve(optimized.optimization.line.points.size());
+                for (const auto& point : optimized.optimization.line.points)
+                    output.line.push_back(point.position);
+                output.ok = true;
+            } catch (const std::exception& ex) {
+                output.error = QString::fromUtf8(ex.what());
+            }
+            return output;
+        }));
 }
 
 fs::path LineAnnotationController::currentVolpkgRoot() const
@@ -13517,6 +13866,7 @@ LineAnnotationController::makeIntersectionLineSession(
     session->fiberStartedAt = fiber.startedAt;
     session->fiberSequence = fiber.sequence;
     session->fiberFileName = fiber.fileName;
+    session->fiberSourceRoot = fiber.sourceRoot;
     session->fiberManualHvTag = fiber.manualHvTag;
     session->fiberTags = fiber.tags;
     session->fiberOptimizationMode = fiber.optimizationMode;
@@ -13634,17 +13984,18 @@ LineAnnotationController::makeStoredFiberSessionSnapshot(LineAnnotationSession& 
     fiber.startedAt = session.fiberStartedAt;
     fiber.sequence = session.fiberSequence;
     fiber.fileName = session.fiberFileName;
-    auto existingIt = std::find_if(_fibers.begin(),
-                                   _fibers.end(),
-                                   [&fiber](const StoredFiber& existing) {
-                                       return !fiber.fileName.empty() &&
-                                              existing.fileName == fiber.fileName;
-                                   });
-    if (existingIt == _fibers.end() && session.fiberId != 0) {
-        existingIt = std::find_if(_fibers.begin(),
-                                  _fibers.end(),
-                                  [&session](const StoredFiber& existing) {
-                                      return existing.id == session.fiberId;
+    fiber.sourceRoot = session.fiberSourceRoot;
+    auto existingIt = session.fiberId == 0 ? _fibers.end() :
+        std::find_if(_fibers.begin(), _fibers.end(),
+                     [&session](const StoredFiber& existing) {
+                         return existing.id == session.fiberId;
+                     });
+    if (existingIt == _fibers.end()) {
+        existingIt = std::find_if(_fibers.begin(), _fibers.end(),
+                                  [&fiber](const StoredFiber& existing) {
+                                      return !fiber.fileName.empty() &&
+                                             existing.fileName == fiber.fileName &&
+                                             existing.sourceRoot == fiber.sourceRoot;
                                   });
     }
     fiber.id = existingIt == _fibers.end()
@@ -13838,11 +14189,12 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
         const uint64_t savedFiberId = fiber.id;
 
         auto it = std::find_if(_fibers.begin(), _fibers.end(), [&fiber](const StoredFiber& existing) {
-            return !fiber.fileName.empty() && existing.fileName == fiber.fileName;
+            return existing.id == fiber.id;
         });
         if (it == _fibers.end()) {
             it = std::find_if(_fibers.begin(), _fibers.end(), [&fiber](const StoredFiber& existing) {
-                return existing.id == fiber.id;
+                return !fiber.fileName.empty() && existing.fileName == fiber.fileName &&
+                       existing.sourceRoot == fiber.sourceRoot;
             });
         }
         StoredFiber* savedFiber = nullptr;
@@ -14045,7 +14397,7 @@ nlohmann::json LineAnnotationController::fiberSaveSnapshotToJson(
 
 void LineAnnotationController::saveFiberNow(const StoredFiber& fiber) const
 {
-    const fs::path dir = fibersDir();
+    const fs::path dir = fiber.sourceRoot.empty() ? fibersDir() : fiber.sourceRoot;
     if (dir.empty()) {
         throw std::runtime_error("No volume package is loaded");
     }
@@ -14720,12 +15072,16 @@ std::vector<LineAnnotationController::BranchLinkValidationIssue>
 LineAnnotationController::collectLoadedFiberBranchIssues(
     const std::vector<StoredFiber>& fibers) const
 {
+    const auto sourceFileKey = [](const StoredFiber& fiber,
+                                  const std::string& fileName) {
+        return (fiber.sourceRoot / fileName).lexically_normal().string();
+    };
     std::vector<BranchLinkValidationIssue> issues;
     std::unordered_map<std::string, size_t> indexByFileName;
     indexByFileName.reserve(fibers.size());
     for (size_t i = 0; i < fibers.size(); ++i) {
         if (!fibers[i].fileName.empty()) {
-            indexByFileName[fibers[i].fileName] = i;
+            indexByFileName[sourceFileKey(fibers[i], fibers[i].fileName)] = i;
         }
     }
 
@@ -14767,7 +15123,8 @@ LineAnnotationController::collectLoadedFiberBranchIssues(
                 addIssue("missing branch_file");
                 continue;
             }
-            const auto targetIndex = indexByFileName.find(branch.branchFileName);
+            const auto targetIndex = indexByFileName.find(
+                sourceFileKey(fiber, branch.branchFileName));
             if (targetIndex == indexByFileName.end()) {
                 addIssue("missing linked fiber");
                 continue;
@@ -14853,7 +15210,8 @@ bool LineAnnotationController::repairLoadedFiberBranchLinks(
                 fiber.branches.erase(fiber.branches.begin() +
                                      static_cast<std::ptrdiff_t>(*it));
                 fiber.needsSave = true;
-                changedFiles.insert(fiber.fileName);
+                changedFiles.insert(
+                    (fiber.sourceRoot / fiber.fileName).lexically_normal().string());
                 changed = true;
             }
         }
@@ -14872,7 +15230,9 @@ bool LineAnnotationController::repairLoadedFiberBranchLinks(
     }
 
     for (auto& fiber : fibers) {
-        if (changedFiles.find(fiber.fileName) == changedFiles.end() && !fiber.needsSave) {
+        const std::string sourceFile =
+            (fiber.sourceRoot / fiber.fileName).lexically_normal().string();
+        if (changedFiles.find(sourceFile) == changedFiles.end() && !fiber.needsSave) {
             continue;
         }
         try {
@@ -14903,7 +15263,8 @@ bool LineAnnotationController::validateLoadedFiberLinks(std::vector<StoredFiber>
                 continue;
             }
             const auto& fiber = fibers[issue.fiberIndex];
-            invalidFiles.insert(fiber.fileName);
+            invalidFiles.insert(
+                (fiber.sourceRoot / fiber.fileName).lexically_normal().string());
             errors.push_back(fiberErrorName(fiber.fileName) + ": " + issue.reason);
         }
         if (invalidFiles.empty()) {
@@ -14913,24 +15274,32 @@ bool LineAnnotationController::validateLoadedFiberLinks(std::vector<StoredFiber>
         fibers.erase(std::remove_if(fibers.begin(),
                                     fibers.end(),
                                     [&invalidFiles](const StoredFiber& fiber) {
-                                        return invalidFiles.find(fiber.fileName) !=
+                                        const std::string sourceFile =
+                                            (fiber.sourceRoot / fiber.fileName)
+                                                .lexically_normal().string();
+                                        return invalidFiles.find(sourceFile) !=
                                                invalidFiles.end();
                                     }),
                      fibers.end());
     }
 
+    const auto sourceFileKey = [](const StoredFiber& fiber,
+                                  const std::string& fileName) {
+        return (fiber.sourceRoot / fileName).lexically_normal().string();
+    };
     std::unordered_map<std::string, uint64_t> fiberIdByFileName;
     fiberIdByFileName.reserve(fibers.size());
     uint64_t runtimeId = 1;
     for (auto& fiber : fibers) {
         fiber.id = runtimeId++;
         if (!fiber.fileName.empty()) {
-            fiberIdByFileName[fiber.fileName] = fiber.id;
+            fiberIdByFileName[sourceFileKey(fiber, fiber.fileName)] = fiber.id;
         }
     }
     for (auto& fiber : fibers) {
         for (auto& branch : fiber.branches) {
-            if (auto it = fiberIdByFileName.find(branch.branchFileName);
+            if (auto it = fiberIdByFileName.find(
+                    sourceFileKey(fiber, branch.branchFileName));
                 it != fiberIdByFileName.end()) {
                 branch.branchFiberId = it->second;
             }

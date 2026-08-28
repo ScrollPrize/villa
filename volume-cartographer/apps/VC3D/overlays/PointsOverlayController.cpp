@@ -70,11 +70,31 @@ std::vector<ColPoint> orderedCollectionPoints(const VCCollection::Collection& co
 
 } // namespace
 
-PointsOverlayController::PointsOverlayController(VCCollection* collection, QObject* parent)
-    : ViewerOverlayControllerBase(kOverlayGroupPoints, parent)
+PointsOverlayController::PointsOverlayController(VCCollection* collection, QObject* parent,
+                                                 bool displayOnly)
+    : ViewerOverlayControllerBase(displayOnly
+                                      ? "display_only_point_collection_overlay"
+                                      : kOverlayGroupPoints,
+                                  parent)
     , _collection(collection)
+    , _displayOnly(displayOnly)
 {
     connectCollectionSignals();
+}
+
+void PointsOverlayController::setCoordinateScale(double scale)
+{
+    if (!std::isfinite(scale) || scale <= 0.0) return;
+    if (std::abs(_coordinateScale - scale) < 1.0e-12) return;
+    _coordinateScale = scale;
+    refreshAll();
+}
+
+void PointsOverlayController::setVisible(bool visible)
+{
+    if (_visible == visible) return;
+    _visible = visible;
+    refreshAll();
 }
 
 PointsOverlayController::~PointsOverlayController()
@@ -105,7 +125,7 @@ void PointsOverlayController::setViewTolerance(double tolerance)
 
 bool PointsOverlayController::isOverlayEnabledFor(VolumeViewerBase* viewer) const
 {
-    return _collection && viewer;
+    return _visible && _collection && viewer;
 }
 
 void PointsOverlayController::collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder)
@@ -114,7 +134,7 @@ void PointsOverlayController::collectPrimitives(VolumeViewerBase* viewer, Overla
         return;
     }
 
-    if (viewer->pointCollection() != _collection) {
+    if (!_displayOnly && viewer->pointCollection() != _collection) {
         return;
     }
 
@@ -123,9 +143,10 @@ void PointsOverlayController::collectPrimitives(VolumeViewerBase* viewer, Overla
         return;
     }
 
-    const uint64_t highlightId = viewer->highlightedPointId();
-    const uint64_t selectedId = viewer->selectedPointId();
-    const bool drawSameWrapPolylines = viewer->isSameWrapAnnotationModeEnabled();
+    const uint64_t highlightId = _displayOnly ? 0 : viewer->highlightedPointId();
+    const uint64_t selectedId = _displayOnly ? 0 : viewer->selectedPointId();
+    const bool drawSameWrapPolylines = !_displayOnly
+        && viewer->isSameWrapAnnotationModeEnabled();
 
     for (const auto& [collectionId, collection] : collections) {
         const cv::Vec3f collectionColor = collection.color;
@@ -147,7 +168,7 @@ void PointsOverlayController::collectPrimitives(VolumeViewerBase* viewer, Overla
 
         for (const ColPoint& colPoint : orderedCollectionPoints(collection)) {
             Entry entry;
-            entry.world = colPoint.p;
+            entry.world = colPoint.p * static_cast<float>(_coordinateScale);
             entry.pointId = colPoint.id;
             entry.isHighlighted = colPoint.id == highlightId;
             entry.isSelected = colPoint.id == selectedId;

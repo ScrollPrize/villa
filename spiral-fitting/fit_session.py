@@ -107,8 +107,9 @@ from config import Config
 # Version 34 gives every Run an independent DT-loss schedule. The required
 # dt_loss_schedule object controls how much of the final Run window is DT
 # eligible and is transient rather than part of advanced configuration or a
-# checkpoint.
-API_VERSION = 34
+# checkpoint. Version 35 publishes coordinate-domain metadata and an
+# authenticated immutable same-winding point-cloud artifact.
+API_VERSION = 35
 
 
 class SessionState(str, Enum):
@@ -601,6 +602,9 @@ class ScrollSpec:
     name: str
     voxel_size_um: float
     spiral_outward_sense: str
+    # Shape of the volume coordinate domain used by Spiral surfaces. This is
+    # independent of physical voxel size and may be absent in legacy specs.
+    base_shape_zyx: tuple[int, int, int] | None = None
     umbilicus_coordinate_scale: float = 1.0
     normal_zarr_group: str = "4"
     surf_sdt_zarr_group: str = "1"
@@ -648,6 +652,16 @@ def parse_scroll_spec(document: Any, dataset_root: str | os.PathLike[str],
         raise ScrollSpecError(f"{source}: voxel_size_um must be a number") from None
     if not voxel_size_um > 0:
         raise ScrollSpecError(f"{source}: voxel_size_um must be positive")
+    base_shape_raw = document.get("base_shape_zyx")
+    base_shape_zyx = None
+    if base_shape_raw is not None:
+        if (not isinstance(base_shape_raw, (list, tuple))
+                or len(base_shape_raw) != 3
+                or any(type(value) is not int or value <= 0
+                       for value in base_shape_raw)):
+            raise ScrollSpecError(
+                f"{source}: base_shape_zyx must be a ZYX list of three positive integers")
+        base_shape_zyx = tuple(base_shape_raw)
     sense = str(document["spiral_outward_sense"]).upper()
     if sense not in ("CW", "ACW"):
         raise ScrollSpecError(f"{source}: spiral_outward_sense must be CW or ACW")
@@ -687,6 +701,7 @@ def parse_scroll_spec(document: Any, dataset_root: str | os.PathLike[str],
         name=name,
         voxel_size_um=voxel_size_um,
         spiral_outward_sense=sense,
+        base_shape_zyx=base_shape_zyx,
         umbilicus_coordinate_scale=coordinate_scale,
         normal_zarr_group=str(document.get("normal_zarr_group", "4")),
         surf_sdt_zarr_group=str(document.get("surf_sdt_zarr_group", "1")),

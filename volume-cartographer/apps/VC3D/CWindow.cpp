@@ -2578,7 +2578,12 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                             ? qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject())
                             : nullptr)
                         configureChunkedViewerConnections(chunked);
-                    if (_fiberOverlay && viewer) _fiberOverlay->attachViewer(viewer);
+                    if (_fiberOverlay && viewer) {
+                        _fiberOverlay->attachViewer(viewer);
+                        _fiberOverlay->setViewerBaseToViewerFactor(
+                            viewer, _spiralWorkspace->fiberBaseToPreviewFactor()
+                                        .value_or(1.0));
+                    }
                 });
         for (auto* viewer : _spiralWorkspace->viewerManager()->baseViewers()) {
             if (auto* chunked = viewer
@@ -2592,11 +2597,25 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             if (_surfacePanel) _surfacePanel->setSpiralFitAvailable(active);
             if (_fiberWidget) _fiberWidget->setSpiralFitAvailable(active);
         });
+        connect(_spiralWorkspace,
+                &SpiralWorkspace::fiberBaseToPreviewFactorChanged,
+                this, [this](double factor, bool valid) {
+                    if (!_fiberOverlay || !_spiralWorkspace ||
+                        !_spiralWorkspace->viewerManager()) return;
+                    const double applied = valid ? factor : 1.0;
+                    _spiralWorkspace->viewerManager()->forEachBaseViewer(
+                        [this, applied](VolumeViewerBase* viewer) {
+                            _fiberOverlay->setViewerBaseToViewerFactor(viewer, applied);
+                        });
+                });
     }
     _lineAnnotationController = std::make_unique<LineAnnotationController>(_state,
                                                                            _viewerManager.get(),
                                                                            this,
                                                                            this);
+    if (_spiralWorkspace)
+        _spiralWorkspace->setLineAnnotationController(
+            _lineAnnotationController.get());
     _lineAnnotationController->setVolumeSelectorFactory(
         [this](QWidget* parent) { return createAnnotationVolumeSelector(parent); });
     connect(_lineAnnotationController.get(),
@@ -2731,8 +2750,38 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _fiberOverlay->bindToViewerManager(_viewerManager.get());
     if (_spiralWorkspace && _spiralWorkspace->viewerManager()) {
         _spiralWorkspace->viewerManager()->forEachBaseViewer(
-            [this](VolumeViewerBase* viewer) { _fiberOverlay->attachViewer(viewer); });
+            [this](VolumeViewerBase* viewer) {
+                _fiberOverlay->attachViewer(viewer);
+                _fiberOverlay->setViewerBaseToViewerFactor(
+                    viewer, _spiralWorkspace->fiberBaseToPreviewFactor()
+                                .value_or(1.0));
+            });
     }
+    const auto updateMainFiberViewerScales = [this]() {
+        double factor = 1.0;
+        if (_state && _state->vpkg()) {
+            if (const auto identity = vc3d::opendata::coordinateIdentityForVolume(
+                    *_state->vpkg(), _state->currentVolumeId())) {
+                factor = 1.0 / static_cast<double>(
+                    identity->sourceCoordinateScaleFactor);
+            }
+        }
+        if (_fiberOverlay && _viewerManager) {
+            _viewerManager->forEachBaseViewer([this, factor](VolumeViewerBase* viewer) {
+                _fiberOverlay->setViewerBaseToViewerFactor(viewer, factor);
+            });
+        }
+    };
+    updateMainFiberViewerScales();
+    connect(_state, &CState::volumeChanged, this,
+            [updateMainFiberViewerScales](const std::shared_ptr<Volume>&,
+                                          const std::string&) {
+                updateMainFiberViewerScales();
+            });
+    connect(_viewerManager.get(), &ViewerManager::baseViewerCreated, this,
+            [this, updateMainFiberViewerScales](VolumeViewerBase*) {
+                updateMainFiberViewerScales();
+            });
 
     _rawPointsOverlay = std::make_unique<RawPointsOverlayController>(_state, this);
     _viewerManager->setRawPointsOverlay(_rawPointsOverlay.get());
@@ -3574,6 +3623,24 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                                         });
                                 menu.addSeparator();
                             }
+                        }
+
+                        if (_spiralWorkspace &&
+                            _spiralWorkspace->isFlattenedViewer(viewer)) {
+                            QAction* spiralLineAction =
+                                menu.addAction(tr("2D line annotation"));
+                            spiralLineAction->setObjectName(
+                                QStringLiteral("spiral2dLineAnnotationAction"));
+                            const QString reason = _spiralWorkspace
+                                                       ->lineAnnotationDraftUnavailableReason();
+                            spiralLineAction->setEnabled(reason.isEmpty());
+                            spiralLineAction->setToolTip(reason);
+                            connect(spiralLineAction, &QAction::triggered, this,
+                                    [this]() {
+                                        if (_spiralWorkspace)
+                                            _spiralWorkspace->startLineAnnotationDraft();
+                                    });
+                            menu.addSeparator();
                         }
 
                         QAction* newLineAnnotationAction = menu.addAction(tr("New line annotation"));

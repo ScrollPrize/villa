@@ -475,6 +475,17 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             this, &SpiralPanel::surfaceIntersectionsChanged);
     displayDialogLayout->addWidget(_showSurfaceIntersections);
 
+    _showSameWindingPcls = new QCheckBox(
+        tr("Show same-winding PCLs"), _displayDialog);
+    _showSameWindingPcls->setObjectName(
+        QStringLiteral("spiralShowSameWindingPcls"));
+    _showSameWindingPcls->setEnabled(false);
+    _showSameWindingPcls->setToolTip(
+        tr("No compatible same-winding artifact is available"));
+    connect(_showSameWindingPcls, &QCheckBox::toggled,
+            this, &SpiralPanel::sameWindingPclsChanged);
+    displayDialogLayout->addWidget(_showSameWindingPcls);
+
     auto* intersectionStrideRow = new QWidget(_displayDialog);
     auto* intersectionStrideLayout = new QHBoxLayout(intersectionStrideRow);
     intersectionStrideLayout->setContentsMargins(0, 0, 0, 0);
@@ -1637,6 +1648,19 @@ void SpiralPanel::setLocalDraftsReady(bool ready)
     if (_commitInputs)
         _commitInputs->setEnabled(_connected && _hasSession
                                   && (ready || _uncommittedCount > 0));
+}
+
+void SpiralPanel::setSameWindingPclsAvailable(bool available,
+                                               const QString& reason)
+{
+    if (!_showSameWindingPcls) return;
+    _showSameWindingPcls->setEnabled(available);
+    if (!available) _showSameWindingPcls->setChecked(false);
+    _showSameWindingPcls->setToolTip(
+        available ? tr("Show the service's immutable same-winding point cloud")
+                  : reason.isEmpty()
+                        ? tr("No compatible same-winding artifact is available")
+                        : reason);
 }
 
 void SpiralPanel::applyResolution(const QJsonObject& resolution, bool force)

@@ -74,7 +74,7 @@ class ScrollSpecTests(unittest.TestCase):
                 future_extension={"enabled": True})
             spec = load_scroll_spec(temporary)
             self.assertEqual(spec.name, "s1")
-            self.assertNotIn("base_shape_zyx", spec.manifest())
+            self.assertEqual(spec.base_shape_zyx, (18946, 8174, 8174))
             self.assertNotIn("future_extension", spec.manifest())
 
     def test_unknown_path_override_keys_are_rejected(self):
@@ -97,11 +97,22 @@ class ScrollSpecTests(unittest.TestCase):
             spec = load_scroll_spec(temporary)
             self.assertEqual(spec.name, "s1")
             self.assertEqual(spec.spiral_outward_sense, "CW")
+            self.assertIsNone(spec.base_shape_zyx)
             self.assertEqual(spec.umbilicus_coordinate_scale, 1.0)
             self.assertEqual(spec.normal_zarr_group, "4")
             self.assertEqual(spec.surf_sdt_zarr_group, "1")
             self.assertEqual(spec.lasagna_scale, 4)
             self.assertEqual(spec.path_overrides, ())
+
+    def test_base_shape_is_validated_and_preserved(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            write_scroll_spec(temporary, base_shape_zyx=[100, 200, 300])
+            spec = load_scroll_spec(temporary)
+            self.assertEqual(spec.base_shape_zyx, (100, 200, 300))
+            for invalid in ([100, 200], [100, 0, 300], [100, 2.5, 300]):
+                write_scroll_spec(temporary, base_shape_zyx=invalid)
+                with self.assertRaisesRegex(ScrollSpecError, "base_shape_zyx"):
+                    load_scroll_spec(temporary)
 
     def test_relative_path_overrides_resolve_against_dataset_root(self):
         with tempfile.TemporaryDirectory() as temporary:

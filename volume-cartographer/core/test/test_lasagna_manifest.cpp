@@ -38,6 +38,26 @@ private:
 
 } // namespace
 
+TEST_CASE("Lasagna shape pairing identifies a dyadic coordinate scale")
+{
+    using vc::lasagna::dyadicCoordinateScaleBetweenShapes;
+    const std::array<std::size_t, 3> l0{75784, 32694, 32694};
+    const std::array<std::size_t, 3> l2{18946, 8174, 8174};
+    CHECK(dyadicCoordinateScaleBetweenShapes(l2, l0, 5) ==
+          doctest::Approx(4.0));
+    CHECK(dyadicCoordinateScaleBetweenShapes(l0, l2, 5) ==
+          doctest::Approx(0.25));
+
+    // Both common odd-extent pyramid conventions are accepted.
+    CHECK(dyadicCoordinateScaleBetweenShapes(
+              std::array<std::size_t, 3>{13, 25, 38},
+              std::array<std::size_t, 3>{100, 200, 300}, 5) ==
+          doctest::Approx(8.0));
+    CHECK_THROWS(dyadicCoordinateScaleBetweenShapes(
+        std::array<std::size_t, 3>{18946, 8175, 8174}, l0, 5));
+    CHECK_THROWS(dyadicCoordinateScaleBetweenShapes(l2, l2, -1));
+}
+
 TEST_CASE("LasagnaDatasetManifest parses channel groups from canonical Lasagna JSON")
 {
     const auto dir = makeTmpDir("groups");

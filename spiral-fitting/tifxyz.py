@@ -454,6 +454,7 @@ def save_combined_tifxyz(
     first_winding=10,
 	cleanup_erosion_cells=None,
 	sampling_dr_per_winding=None,
+	base_shape_zyx=None,
 ):
     """Atomically write consecutive winding grids as one QuadSurface.
 
@@ -468,6 +469,14 @@ def save_combined_tifxyz(
 
     if not winding_zyxs:
         raise ValueError("No winding grids were supplied")
+    if base_shape_zyx is not None:
+        if (not isinstance(base_shape_zyx, (list, tuple))
+                or len(base_shape_zyx) != 3
+                or any(type(value) is not int or value <= 0
+                       for value in base_shape_zyx)):
+            raise ValueError(
+                "base_shape_zyx must be a ZYX list of three positive integers")
+        base_shape_zyx = [int(value) for value in base_shape_zyx]
     by_id = {int(key): np.asarray(value, dtype=np.float32) for key, value in winding_zyxs.items()}
     last_winding = max(by_id)
     if last_winding < int(first_winding):
@@ -555,6 +564,7 @@ def save_combined_tifxyz(
             "bbox": bbox,
             "area_vx2": area_vx2,
             "area_cm2": area_vx2 * voxel_size_um ** 2 / 1.e8,
+            "voxel_size_um": float(voxel_size_um),
             "format": "tifxyz",
             "type": "seg",
             "uuid": uuid,
@@ -564,6 +574,8 @@ def save_combined_tifxyz(
             "output_first_winding": ids[0],
             "output_last_winding": ids[-1],
         }
+        if base_shape_zyx is not None:
+            metadata["base_shape_zyx"] = base_shape_zyx
         if cleanup_metadata is not None:
             metadata["lasagna_input_cleanup"] = cleanup_metadata
         meta_path = os.path.join(surface_dir, "meta.json")
@@ -581,8 +593,11 @@ def save_combined_tifxyz(
             "last_winding": ids[-1],
             "winding_column_ranges": components,
             "winding_ids": ids,
+            "voxel_size_um": float(voxel_size_um),
             "manifest_path": os.path.join(destination, "manifest.json"),
         }
+        if base_shape_zyx is not None:
+            published["base_shape_zyx"] = base_shape_zyx
         if sampling_dr_per_winding is not None:
             value = float(sampling_dr_per_winding)
             if not np.isfinite(value) or value <= 0.0:

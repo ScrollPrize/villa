@@ -247,6 +247,8 @@ void SpiralServiceManager::connectToService(const SpiralServiceProfile& profile)
     _fetchingPreviewArtifact.clear();
     _installedDiagnosticsArtifact.clear();
     _fetchingDiagnosticsArtifact.clear();
+    _installedSameWindingArtifact.clear();
+    _fetchingSameWindingArtifact.clear();
     _lastPreviewLocalPath.clear();
     _lastDiagnosticsLocalPath.clear();
     _synchronizedSessionId.clear();
@@ -1511,6 +1513,30 @@ void SpiralServiceManager::syncArtifacts(const QJsonObject& status)
                 _artifactCache->pruneSession(
                     sessionId, kPreviewCacheKept,
                     {_lastPreviewLocalPath, _lastDiagnosticsLocalPath});
+            });
+    }
+
+    const QJsonObject sameWindingRef =
+        status.value(QStringLiteral("same_winding_artifact")).toObject();
+    const QString sameWindingId = sameWindingRef.value(QStringLiteral("id")).toString();
+    if (!sameWindingId.isEmpty()
+        && sameWindingId != _installedSameWindingArtifact
+        && sameWindingId != _fetchingSameWindingArtifact) {
+        _fetchingSameWindingArtifact = sameWindingId;
+        const quint64 generation = _connectionGeneration;
+        _artifactCache->fetchArtifact(
+            sessionId, sameWindingId,
+            [this, sameWindingId, sameWindingRef, generation](
+                const QString& entryPath, const QString& error, bool gone) {
+                if (generation != _connectionGeneration) return;
+                if (_fetchingSameWindingArtifact == sameWindingId)
+                    _fetchingSameWindingArtifact.clear();
+                if (entryPath.isEmpty()) {
+                    if (!gone) emit errorOccurred(error);
+                    return;
+                }
+                _installedSameWindingArtifact = sameWindingId;
+                emit sameWindingArtifactAvailable(entryPath, sameWindingRef);
             });
     }
 }

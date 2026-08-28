@@ -311,6 +311,35 @@ TEST_CASE("old point JSON defaults links and fiber direction")
     CHECK(loaded.getAllCollections().begin()->second.windings_linked.empty());
 }
 
+TEST_CASE("minimal display-only PCL JSON defaults collection presentation")
+{
+    const fs::path tmp = fs::temp_directory_path() /
+        ("pc_minimal_pcl_" + std::to_string(::getpid()) + ".json");
+    std::ofstream out(tmp);
+    out << R"({
+        "vc_pointcollections_json_version": "1",
+        "collections": {
+            "1": {
+                "name": "same_winding",
+                "points": {"2": {"p": [1, 2, 3]}}
+            }
+        }
+    })";
+    out.close();
+
+    PointCollections loaded;
+    REQUIRE(loaded.loadFromJSON(tmp.string()));
+    fs::remove(tmp);
+
+    const auto& collection = loaded.getAllCollections().begin()->second;
+    CHECK(collection.metadata.absolute_winding_number);
+    CHECK(collection.color == cv::Vec3f{0.2f, 0.8f, 1.0f});
+    const auto points = loaded.getPoints("same_winding");
+    REQUIRE(points.size() == 1);
+    CHECK(points.front().creation_time == 0);
+    CHECK(std::isnan(points.front().winding_annotation));
+}
+
 TEST_CASE("loadFromJSON rejects bad input and returns false")
 {
     const fs::path tmp = fs::temp_directory_path() /

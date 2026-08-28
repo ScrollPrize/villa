@@ -53,6 +53,7 @@ def _live_context():
         lasagna_scale=4,
         normal_zarr_group="4",
         spiral_outward_sense="CW",
+        base_shape_zyx=(100, 200, 300),
         paths=SimpleNamespace(dataset_root="/data/scroll1"),
         phase_mode=True,
         winding_model_mode=False,
@@ -183,6 +184,16 @@ class CheckpointPreflightTests(unittest.TestCase):
                 verdict = _inspect(_checkpoint(**override))
                 self.assertFalse(verdict.accepted)
                 self.assertIn(expected, verdict.message())
+
+        self.assertTrue(_inspect(_checkpoint()).accepted)
+        self.assertTrue(_inspect(
+            _checkpoint(base_shape_zyx=[100, 200, 300])).accepted)
+        verdict = _inspect(_checkpoint(base_shape_zyx=[100, 201, 300]))
+        self.assertFalse(verdict.accepted)
+        self.assertIn("base_shape_zyx", verdict.message())
+        verdict = _inspect(_checkpoint(base_shape_zyx=[100, 0, 300]))
+        self.assertFalse(verdict.accepted)
+        self.assertIn("positive integers", verdict.message())
 
     def test_sdt_identity_invariant_applies_when_an_sdt_loss_is_enabled(self):
         stale = _checkpoint(surf_sdt_fingerprint={"sha256": "def"})

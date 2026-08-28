@@ -220,30 +220,22 @@ std::vector<std::string> entryTags(const OpenDataLasagnaInfo& info)
 int dyadicLevelForShapes(const std::array<std::size_t, 3>& baseShape,
                          const std::array<int, 3>& workingShape)
 {
-    std::vector<int> matches;
-    for (int level = 0; level <= 5; ++level) {
-        const std::size_t scale = std::size_t{1} << level;
-        bool compatible = true;
-        for (std::size_t axis = 0; axis < 3; ++axis) {
-            if (workingShape[axis] <= 0) {
-                compatible = false;
-                break;
-            }
-            const std::size_t actual = static_cast<std::size_t>(workingShape[axis]);
-            const std::size_t ceilShape = (baseShape[axis] + scale - 1) / scale;
-            const std::size_t floorShape = std::max<std::size_t>(1, baseShape[axis] / scale);
-            if (actual != ceilShape && actual != floorShape) {
-                compatible = false;
-                break;
-            }
-        }
-        if (compatible) matches.push_back(level);
-    }
-    if (matches.size() != 1)
+    if (std::any_of(workingShape.begin(), workingShape.end(),
+                    [](int extent) { return extent <= 0; }))
         throw std::runtime_error(
-            "Active volume shape does not identify exactly one supported Lasagna "
+            "Active volume shape must contain positive extents");
+    const std::array<std::size_t, 3> working{
+        static_cast<std::size_t>(workingShape[0]),
+        static_cast<std::size_t>(workingShape[1]),
+        static_cast<std::size_t>(workingShape[2])};
+    const double scale = vc::lasagna::dyadicCoordinateScaleBetweenShapes(
+        working, baseShape, 5);
+    const int level = static_cast<int>(std::llround(std::log2(scale)));
+    if (level < 0 || level > 5)
+        throw std::runtime_error(
+            "Active volume shape does not identify a supported Lasagna "
             "coordinate scale (L0-L5)");
-    return matches.front();
+    return level;
 }
 
 std::optional<ResolvedOpenDataLasagna> resolveForTags(

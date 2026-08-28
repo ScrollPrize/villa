@@ -46,6 +46,8 @@ class SurfacePanelController;
 class ViewerManager;
 class VolumePkg;
 class QWidget;
+namespace vc::lasagna { class LasagnaDataset; class LasagnaNormalSampler; }
+namespace vc::fiber_tracer { class FiberPredictionField; }
 
 class LineAnnotationController : public QObject
 {
@@ -245,6 +247,27 @@ public:
                                              int,
                                              int)>;
 
+    struct ResolvedFiberOptimizationInputs {
+        std::shared_ptr<vc::lasagna::LasagnaDataset> normalDataset;
+        std::shared_ptr<vc::lasagna::LasagnaNormalSampler> baseNormalSampler;
+        std::shared_ptr<vc::lasagna::LasagnaDataset> traceNormalDataset;
+        std::shared_ptr<vc::lasagna::LasagnaNormalSampler> traceNormalSampler;
+        std::shared_ptr<vc::lasagna::LasagnaDataset> fiberDataset;
+        std::shared_ptr<vc::fiber_tracer::FiberPredictionField> predictions;
+        std::string normalManifestLocation;
+        std::string fiberManifestLocation;
+        double traceToBaseScale = 1.0;
+    };
+
+    struct HeadlessFiberOptimizationRequest {
+        std::vector<cv::Vec3d> controlPointsL0;
+        ResolvedFiberOptimizationInputs inputs;
+        std::filesystem::path destinationFiberSource;
+        std::function<bool()> shouldSave;
+    };
+    using HeadlessFiberCompletion =
+        std::function<void(bool, const QString&, uint64_t)>;
+
     LineAnnotationController(CState* state,
                              ViewerManager* viewerManager,
                              QWidget* parentWidget,
@@ -383,6 +406,17 @@ public:
     // running Spiral fit.
     [[nodiscard]] std::filesystem::path fiberFilePath(uint64_t fiberId) const;
 
+    bool registerExternalFiberSource(const std::filesystem::path& source,
+                                     QString* errorMessage = nullptr);
+    void unregisterExternalFiberSource(const std::filesystem::path& source);
+    [[nodiscard]] std::optional<ResolvedFiberOptimizationInputs>
+        resolveFiberOptimizationInputs(
+            const std::string& fallbackNormalLocation,
+            const std::string& fallbackFiberLocation,
+            QString* errorMessage = nullptr) const;
+    void optimizeAndSaveFiberHeadless(HeadlessFiberOptimizationRequest request,
+                                      HeadlessFiberCompletion completion);
+
     // Bumped whenever the project's umbilicus attachment changes. Cheap to
     // read, so holders of geometry placed relative to the umbilicus can compare
     // it lazily instead of being signalled.
@@ -451,6 +485,7 @@ private:
         std::string startedAt;
         uint64_t sequence = 0;
         std::string fileName;
+        std::filesystem::path sourceRoot;
         uint64_t generation = 1;
         std::vector<vc3d::line_annotation::StoredControlPoint> controlPoints;
         std::vector<cv::Vec3d> linePoints;
@@ -945,6 +980,7 @@ private:
     int _nextPaneId = 1;
     std::vector<PaneRecord> _panes;
     std::vector<StoredFiber> _fibers;
+    std::vector<std::filesystem::path> _externalFiberSources;
     std::vector<std::string> _knownFiberTags;
     std::unordered_map<uint64_t, CachedFiberAlignmentMetrics> _fiberAlignmentMetrics;
     std::unordered_set<uint64_t> _pendingFiberAlignmentMetrics;

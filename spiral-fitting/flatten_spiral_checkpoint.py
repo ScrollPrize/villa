@@ -250,6 +250,7 @@ def _export_source_surface(
         first_winding=first,
         cleanup_erosion_cells=3,
         sampling_dr_per_winding=float(dr_per_winding.detach().cpu()),
+        base_shape_zyx=checkpoint.get("base_shape_zyx"),
     )
     del transform, model, dr_per_winding, winding_grids
     gc.collect()

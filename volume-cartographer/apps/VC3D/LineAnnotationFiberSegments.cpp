@@ -574,7 +574,8 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
         request.controlPoints.front().optimizedIndex = controlIndex;
         request.controlPoints.front().linePosition =
             static_cast<double>(controlIndex);
-        if (request.globalMode == FiberOptimizationMode::NativeFiberTrace3d) {
+        if (request.globalMode == FiberOptimizationMode::NativeFiberTrace3d &&
+            request.retainOpenTails) {
             replaceOpenTailsWithNative(
                 request, coordinates, controlIndex, controlIndex, output);
         }
@@ -790,9 +791,11 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
     const auto stitch = [&]() {
         std::pair<std::vector<cv::Vec3d>, std::vector<int>> value;
         auto& [points, indices] = value;
-        points.insert(points.end(), request.linePointsBase.begin(),
-                      request.linePointsBase.begin() +
-                          static_cast<std::ptrdiff_t>(originalControlIndices.front()));
+        if (request.retainOpenTails) {
+            points.insert(points.end(), request.linePointsBase.begin(),
+                          request.linePointsBase.begin() +
+                              static_cast<std::ptrdiff_t>(originalControlIndices.front()));
+        }
         indices.reserve(request.controlPoints.size());
         for (size_t spanIndex = 0; spanIndex < spans.size(); ++spanIndex) {
             const auto& span = spans[spanIndex];
@@ -806,10 +809,12 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
             }
             indices.push_back(static_cast<int>(points.size()) - 1);
         }
-        points.insert(points.end(),
-                      request.linePointsBase.begin() +
-                          static_cast<std::ptrdiff_t>(originalControlIndices.back() + 1),
-                      request.linePointsBase.end());
+        if (request.retainOpenTails) {
+            points.insert(points.end(),
+                          request.linePointsBase.begin() +
+                              static_cast<std::ptrdiff_t>(originalControlIndices.back() + 1),
+                          request.linePointsBase.end());
+        }
         return value;
     };
 
@@ -906,9 +911,52 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
     const int firstControl = reinitialized.fixedPointIndices.front();
     const int lastControl = reinitialized.fixedPointIndices.back();
     output.optimization = std::move(reinitialized.optimization);
-    if (request.globalMode == FiberOptimizationMode::NativeFiberTrace3d) {
+    if (request.globalMode == FiberOptimizationMode::NativeFiberTrace3d &&
+        request.retainOpenTails) {
         replaceOpenTailsWithNative(
             request, coordinates, firstControl, lastControl, output);
+    }
+    if (!request.retainOpenTails) {
+        auto& line = output.optimization.line;
+        if (firstControl < 0 || lastControl < firstControl ||
+            static_cast<size_t>(lastControl) >= line.points.size()) {
+            throw std::runtime_error(
+                "bounded fiber optimization returned an invalid control span");
+        }
+        const size_t originalPointCount = line.points.size();
+        line.points.erase(line.points.begin() + lastControl + 1,
+                          line.points.end());
+        line.points.erase(line.points.begin(),
+                          line.points.begin() + firstControl);
+        if (line.segmentSamples.size() + 1 == originalPointCount) {
+            line.segmentSamples.erase(line.segmentSamples.begin() + lastControl,
+                                      line.segmentSamples.end());
+            line.segmentSamples.erase(line.segmentSamples.begin(),
+                                      line.segmentSamples.begin() + firstControl);
+        } else {
+            line.segmentSamples.clear();
+        }
+        if (line.displayFrameAnchorIndex >= 0) {
+            line.displayFrameAnchorIndex = std::clamp(
+                line.displayFrameAnchorIndex - firstControl,
+                0,
+                static_cast<int>(line.points.size()) - 1);
+        }
+        for (size_t index = 0; index < request.controlPoints.size(); ++index) {
+            const int boundedIndex = reinitialized.fixedPointIndices[index] - firstControl;
+            request.controlPoints[index].optimizedIndex = boundedIndex;
+            request.controlPoints[index].linePosition =
+                static_cast<double>(boundedIndex);
+        }
+        if (line.points.empty()) {
+            throw std::runtime_error("bounded fiber optimization returned an empty line");
+        }
+        line.points.front().position = request.controlPoints.front().volumePoint;
+        line.points.front().sampledNormal =
+            request.baseNormalSampler->sampleNormal(line.points.front().position);
+        line.points.back().position = request.controlPoints.back().volumePoint;
+        line.points.back().sampledNormal =
+            request.baseNormalSampler->sampleNormal(line.points.back().position);
     }
     appendFiberModeReport(output);
     output.controlPoints = std::move(request.controlPoints);
