@@ -33,6 +33,7 @@ _STATE_HUE_OFFSETS = {
 }
 _REFERENCE_HEADER = "VC3D tagged reference fibers"
 _REFERENCE_COLOR = (1.0, 0.88, 0.12, 1.0)
+_DEFAULT_ANIMATION_INTERVAL_SECONDS = 0.5
 
 
 @dataclass(frozen=True, order=True)
@@ -65,6 +66,13 @@ class ReferenceGeometry:
 
     path: Path
     paths_zyx: tuple[np.ndarray, ...]
+
+
+@dataclass
+class _EmptyWindingLayer:
+    """Logical visibility slot for winding geometry absent from Napari."""
+
+    visible: bool = False
 
 
 def normalize_winding_output_base(path: str | Path) -> Path:
@@ -310,13 +318,22 @@ def rotate_winding_layer_visibility(
     return rotated
 
 
+def animation_interval_milliseconds(seconds: float) -> int:
+    """Convert a positive finite animation interval to Qt milliseconds."""
+    if not np.isfinite(seconds) or seconds <= 0:
+        raise ValueError("animation interval must be finite and positive")
+    return max(1, round(seconds * 1000.0))
+
+
 def add_winding_controls(
     viewer,
     layers: Mapping[WindingLayerKey, object],
     initial_windings: Sequence[int] | None = None,
 ) -> None:
     """Add grouped category and winding navigation controls to a viewer."""
+    from qtpy.QtCore import QTimer
     from qtpy.QtWidgets import (
+        QDoubleSpinBox,
         QHBoxLayout,
         QLabel,
         QPushButton,
@@ -336,6 +353,7 @@ def add_winding_controls(
     layout = QVBoxLayout(widget)
     category_row = QHBoxLayout()
     navigation_row = QHBoxLayout()
+    animation_row = QHBoxLayout()
     winding_label = QLabel()
 
     def update_label() -> None:
@@ -387,8 +405,44 @@ def add_winding_controls(
     navigation_row.addWidget(previous_button)
     navigation_row.addWidget(winding_label, stretch=1)
     navigation_row.addWidget(next_button)
+
+    animation_button = QPushButton("Animate")
+    animation_button.setCheckable(True)
+    animation_button.setToolTip("Advance the visible winding mask automatically")
+    animation_button.setEnabled(bool(windings))
+    animation_interval = QDoubleSpinBox()
+    animation_interval.setRange(0.05, 60.0)
+    animation_interval.setDecimals(2)
+    animation_interval.setSingleStep(0.05)
+    animation_interval.setSuffix(" s")
+    animation_interval.setValue(_DEFAULT_ANIMATION_INTERVAL_SECONDS)
+    animation_interval.setToolTip("Time between winding-mask steps")
+    animation_timer = QTimer(widget)
+    animation_timer.setInterval(
+        animation_interval_milliseconds(animation_interval.value())
+    )
+    animation_timer.timeout.connect(lambda: move(1))
+
+    def set_animation_running(enabled: bool) -> None:
+        animation_button.setText("Stop" if enabled else "Animate")
+        if enabled:
+            animation_timer.start()
+        else:
+            animation_timer.stop()
+
+    animation_button.toggled.connect(set_animation_running)
+    animation_interval.valueChanged.connect(
+        lambda seconds: animation_timer.setInterval(
+            animation_interval_milliseconds(seconds)
+        )
+    )
+    animation_row.addWidget(animation_button)
+    animation_row.addWidget(QLabel("Interval"))
+    animation_row.addWidget(animation_interval)
+    animation_row.addStretch(1)
     layout.addLayout(category_row)
     layout.addLayout(navigation_row)
+    layout.addLayout(animation_row)
     for layer in layers.values():
         visible_event = getattr(getattr(layer, "events", None), "visible", None)
         if visible_event is not None:
@@ -417,18 +471,16 @@ def add_winding_layers(
         geometry_by_key[key] = item.paths_zyx
     for key in complete_winding_layer_keys(tuple(geometry_by_key)):
         paths = geometry_by_key.get(key, ())
+        if not paths:
+            layers[key] = _EmptyWindingLayer()
+            continue
         color = np.asarray(winding_layer_color(key), dtype=np.float32)
-        edge_color: np.ndarray | tuple[float, float, float, float]
-        if paths:
-            edge_color = np.broadcast_to(color, (len(paths), 4)).copy()
-        else:
-            edge_color = tuple(float(channel) for channel in color)
         layers[key] = viewer.add_shapes(
             list(paths),
             ndim=3,
             shape_type="path",
             name=winding_layer_name(key),
-            edge_color=edge_color,
+            edge_color=np.broadcast_to(color, (len(paths), 4)).copy(),
             edge_width=edge_width,
             face_color="transparent",
             visible=False,

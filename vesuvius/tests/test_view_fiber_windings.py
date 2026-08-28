@@ -11,6 +11,7 @@ from vesuvius.scripts.view_fiber_windings import (
     WindingLayerKey,
     add_reference_layer,
     add_winding_layers,
+    animation_interval_milliseconds,
     build_parser,
     complete_winding_layer_keys,
     discover_reference_artifact,
@@ -293,7 +294,7 @@ def test_add_winding_layers_passes_identical_hv_per_shape_colors(tmp_path):
         WindingLayerKey(2, state) for state in ("h", "v", "err", "tie")
     )
     assert fiber_count == 3
-    assert len(viewer.calls) == 4
+    assert len(viewer.calls) == 2
     data, kwargs = viewer.calls[1]
     assert len(data) == 2
     assert kwargs["edge_color"].shape == (2, 4)
@@ -302,8 +303,8 @@ def test_add_winding_layers_passes_identical_hv_per_shape_colors(tmp_path):
     np.testing.assert_array_equal(
         viewer.calls[0][1]["edge_color"][0], kwargs["edge_color"][0]
     )
-    assert viewer.calls[2][0] == []
-    assert len(viewer.calls[2][1]["edge_color"]) == 4
+    assert not layers[WindingLayerKey(2, "err")].visible
+    assert not layers[WindingLayerKey(2, "tie")].visible
 
 
 def test_add_winding_layers_materializes_missing_states_and_windings(tmp_path):
@@ -334,9 +335,9 @@ def test_add_winding_layers_materializes_missing_states_and_windings(tmp_path):
         for state in ("h", "v", "err", "tie")
     )
     assert fiber_count == 1
-    assert len(viewer.calls) == 12
+    assert len(viewer.calls) == 1
     assert viewer.calls[0][0]
-    assert all(call[0] == [] for call in viewer.calls[1:])
+    assert all(not layer.visible for layer in layers.values())
 
 
 def test_materialized_grid_rotates_missing_empty_and_absent_slots(tmp_path):
@@ -558,6 +559,15 @@ def test_navigation_uses_only_nonempty_h_or_v_geometry(tmp_path):
     )
     keys = nonempty_layer_keys(loaded)
     assert navigable_windings(tuple(keys)) == (1, 3)
+
+
+def test_animation_interval_uses_seconds_and_rejects_invalid_values():
+    assert animation_interval_milliseconds(0.5) == 500
+    assert animation_interval_milliseconds(0.125) == 125
+    assert animation_interval_milliseconds(0.0001) == 1
+    for invalid in (0.0, -1.0, float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="finite and positive"):
+            animation_interval_milliseconds(invalid)
 
 
 def test_module_import_is_gui_independent_and_cli_accepts_obj_base():
