@@ -1,11 +1,11 @@
-# Status: separate prepass and winding Defect controls
+# Status: circular winding visibility-mask controls
 
-- [x] Capture the requested behavior in `task.md`.
-- [x] Write the implementation, testing, spec, docs, and changelog plan.
-- [x] Complete independent plan review against task/spec/plan.
-- [x] Implement independent cost controls.
-- [x] Export the exact fixed prepass OBJ partition.
-- [x] Add focused regression coverage.
-- [x] Update specification, documentation, changelog, and task log.
-- [x] Build and run focused tests.
-- [x] Run final diff validation.
+- [x] Capture corrected task semantics.
+- [x] Identify the incorrect per-visible-layer implementation.
+- [x] Verify existing helper-level H/V RGBA equality.
+- [x] Write implementation and validation plan.
+- [x] Complete independent plan review and define direction, full managed
+  winding domain, sparse-state behavior, and complete-mask label semantics.
+- [x] Implement circular full-mask shifting, labeled buttons, and shared palette.
+- [x] Update tests, specification, and documentation.
+- [x] Run focused validation and final diff check.

@@ -146,6 +146,18 @@ struct FiberTraceConstraintObjReport {
     const FiberTraceWindingDistance& windingDistance,
     const FiberTraceWindingDistanceBatch& windingDistanceBatch = {});
 
+struct FiberTraceOrderedCrossSourceConstraint {
+    std::size_t constraintIndex = 0;
+    std::size_t ownerSource = 0;
+    std::size_t targetSource = 0;
+    bool perpendicularDominant = false;
+};
+
+[[nodiscard]] std::vector<FiberTraceOrderedCrossSourceConstraint>
+orderMeasuredCrossSourceFiberTraceConstraints(
+    const FiberTraceConstraintReport& report,
+    const std::vector<std::size_t>& sourceIdsByTrace);
+
 [[nodiscard]] std::vector<FiberletCropTraceLine>
 makeFiberTraceConstraintPieceLines(
     const std::vector<FiberletCropTraceLine>& sourceLines,

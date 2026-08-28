@@ -5253,32 +5253,46 @@
   `winding(B)-winding(A)`. Canonical endpoint reversal negates this target.
   Missing or cross-component normal evidence removes only the perpendicular
   winding term, not the H/V factor.
-- H/V-aware interleaved winding BP converts every admitted nonzero raw signed
-  observation to a signed half-integer interval center before continuous or
-  discrete inference: `(0,1] -> 0.5`, `(1,2] -> 1.5`, and so on. Exact signed
-  zero and hard continuity stay zero. The raw exclusive cutoff runs before
-  conversion and is not re-applied to the effective value. The independent
+- H/V-aware interleaved winding BP converts every admitted nonnegative raw
+  `windingDistance` to the nearest integer distance for its parallel component:
+  `[0,0.5) -> 0`, `[0.5,1.5) -> 1`, and so on. Its loss is
+  `parallel_weight*abs(abs(latent_delta)-integer_distance)`, independent of
+  measurement gain/scale and aligned-normal sign. It separately converts each
+  available raw signed observation to a signed half-integer interval center
+  for its perpendicular component: `(0,1] -> 0.5`, `(1,2] -> 1.5`, and so on.
+  Exact signed zero and hard continuity stay zero. The raw exclusive cutoff
+  runs before conversion and is not re-applied to either effective value. The independent
   integer-only winding diagnostic remains raw because it has no H/V half
   ladder. Alternating and joint-grid inference consume the same converted
   target. Fixed phase `0.5` and scale `1.0` define the exact-step experiment;
   adaptive calibration remains an explicit comparison mode.
 - H/V diagnostic and winding-BP CLI paths default to the exclusive raw winding
   cutoff `4.0`; the shared extraction config and legacy parity-labeling path
-  retain their `<1.5` default. After half-integer conversion, multiply the
-  complete soft winding contribution by
-  `2^-floor(abs(effective_target))`: target magnitudes `0.5`, `1.5`, `2.5`, and
-  `3.5` therefore use `1`, `0.5`, `0.25`, and `0.125`. This multiplier applies
-  to both parallel same-winding and perpendicular signed-offset winding terms,
+  retain their `<1.5` default. Independently multiply each component by
+  `2^-floor(abs(effective_target))`: parallel distances `0`, `1`, `2`, and `3`
+  and perpendicular targets `0.5`, `1.5`, `2.5`, and `3.5` each use
+  `1`, `0.5`, `0.25`, and `0.125`, respectively. This applies
+  to both parallel integer-distance and perpendicular signed-offset winding terms,
   including continuous initialization and calibration. It must not change the
   independent H/V orientation factor, continuity, the integer-only raw winding
   diagnostic, or hard signed-order admissibility. The formula continues safely
   for larger bins admitted by explicit cutoff overrides.
+- `--parallel-winding-cutoff N` is a finite positive exclusive cutoff on the
+  quantized integer parallel distance in H/V-aware winding solves. `0.5` keeps
+  only same-winding distance zero. Filtering zeros only parallel winding
+  weight; it retains the factor's perpendicular winding evidence, H/V
+  orientation score, extracted/stored constraint, and reference diagnostic.
+  Filtered orientation-only factors do not join winding gauge components.
+  The default is no additional parallel cutoff.
 - In `sum-product-mixed`, orientation and winding are one joint state per split
   piece. Every piece remains a distinct variable. Same-trace continuity is its
   parallel-score-1, zero-distance factor, not equality or variable collapse.
   Other BP modes retain the independent integer-winding diagnostic.
-- Each connected component has a local class A/B gauge and integer gauge. Its
-  crop-central piece is fixed to `(A,0)`. A has latent coordinate `k`; B has
+- Each factor/message component has one local class A/B gauge, while each
+  disconnected subgraph with effective winding evidence has its own integer
+  offset gauge. The crop-central class gauge is fixed to `(A,0)`. Additional
+  integer gauges fix `k=0` while retaining A/B choice, so filtering a winding
+  component never removes the same factor's orientation evidence. A has latent coordinate `k`; B has
   `k+sign_c*phase`, where `k` is integer, shared phase magnitude is in
   `[0,0.5]`, and deterministic component sign `sign_c` accounts for otherwise
   incomparable class swaps. Absolute `k` values across components are not
@@ -5327,7 +5341,7 @@
 - A joint non-Mixed factor charges orientation and winding evidence once.
   Same classes cost the perpendicular score, different classes cost the
   parallel score, and every measurement additionally contributes
-  `parallel*abs(delta)` plus
+  `parallel*abs(abs(delta)-integer_distance)` plus
   `perpendicular*abs(gain*delta-signed_target)` when its signed target exists.
   Orientation and the Mixed unary retain `--bp-temperature`; winding retains
   its established temperature `0.25`. A Defect endpoint makes the complete
@@ -5444,6 +5458,62 @@
 
 ## Winding fiber Napari visualization
 
+- `vc_fiber_trace_chunk direction-ablation` optionally accepts the paired
+  `--reference-fiber-dir DIR --reference-fiber-tag TAG` diagnostic options.
+  It scans regular `.json` files immediately inside `DIR` in lexicographic
+  path order, selects an exact case-sensitive tag match, and strictly parses
+  each selected document with the shared VC3D fiber parser. Missing `tags`
+  skip a document; present tags must be an array of strings. Malformed JSON,
+  malformed selected fibers, selected fibers with fewer than two dense line
+  points, or zero matches are errors. The reference data never changes
+  splitting, constraints, BP, or published winding labels.
+- A successful tagged selection writes `<base>_reference.obj` with the exact
+  preamble `VC3D tagged reference fibers` and one uniquely named ordered
+  polyline per retained in-crop run. The authoritative bounds are the input
+  trace artifact's finite, positive-extent, half-open base-XYZ crop; they are
+  not derived from its storage grid. Point membership is `minimum <= p <
+  maximum`. A computed entry/exit intersection may equal a maximum face only
+  as the closure endpoint of a retained segment. Maximum-face-only and
+  point/tangential contacts are discarded. Exit/re-entry produces separate
+  source-ordered runs with stable source and run ordinals. Matching fibers
+  with no nondegenerate crop intersection are an error. The CLI owns this
+  sibling: a successful
+  `direction-ablation` run without reference options removes an older sibling,
+  and any unsuccessful selection, validation, or clipping does not leave a
+  stale artifact.
+- When tagged reference fibers are loaded, the CLI must reuse those exact
+  cropped runs and invoke the canonical `extractFiberTraceConstraints` path
+  exactly once, outside any ablation checkpoint loop. It must use the active
+  resampling, piece length/overlap, distance, tangent-window, winding-step,
+  winding-cutoff, thread, and batched normal-aligned Lasagna sampling settings.
+  Downstream pruning, constraints-per-fiber limits, perpendicular-only
+  selection, and labeling filters must not alter this raw diagnostic set.
+  Generated hard continuity links and measured links whose runs came from the
+  same selected source fiber must be excluded. Lexicographic selected-source
+  path order assigns virtual winding `W_i = 0.5*i` before crop retention; an
+  empty source retains its slot and all its runs share that value. Each
+  remaining measured link is presentation-oriented from `min(i,j)` to
+  `max(i,j)` without signing its nonnegative measured winding and is emitted
+  exactly once under the lower source. Extractor order is preserved within
+  each output group.
+- Reference constraint output has one source section in source order, with the
+  source name and virtual winding only in its header. Each section prints a
+  perpendicular table followed by a parallel table; an exact orientation-score
+  tie belongs to perpendicular. Both tables have exactly `target_winding`,
+  `raw_step`, `canonical_step`, `gt_step`, and `raw_minus_gt` columns, or
+  `(none)` when empty.
+  `canonical_step` uses the signed half-integer winding-solver rule in
+  perpendicular tables and nearest nonnegative integer distance in parallel
+  tables, while `raw_minus_gt` is the raw
+  winding distance minus `0.5*(target_source-owner_source)`. Run, piece,
+  distance, score, and extractor-index metadata are not printed. After all
+  source tables, print one `reference constraint canonical summary` with
+  `correct`, `false`, and `total`. Increment it while emitting each displayed
+  measured piece-pair row; do not deduplicate repeated rows for the same source
+  pair. A row is correct exactly when its table-specific canonical step equals
+  its virtual GT step. Empty diagnostics print `0 0 0`, and always satisfy
+  `correct + false = total = displayed row count`. This output is diagnostic
+  only and must not change main constraints, BP, or published labels.
 - The winding viewer consumes only the current published quartet
   `<base>_w_N_{h,v,err,tie}.obj` for each discovered nonnegative display label
   `N`. Aggregate `<base>_w_N.obj`, CSV reports, and unrelated siblings are not
@@ -5458,11 +5528,24 @@
   winding fibers are errors. The existing fiber-presence reader uses the same
   parser while retaining its own header, metadata, and crop validation.
 - Every nonempty state artifact becomes an independent 3D Napari path layer.
-  Its bright opaque color is a deterministic function only of `(N,state)`.
+  H and V at one winding `N` have exactly the same bright opaque color derived
+  from `N`; error and tie remain distinct from H/V and each other.
   Viewer category `Broken` contains both Mixed/error argmax (`err`) and exact
   argmax ties (`tie`). H, V, Broken, All, and None presets act across every
-  winding. Previous/next winding navigation cycles only through windings with
-  nonempty H or V geometry and shows that winding's H and V layers together.
+  winding. Full-size Previous/Next buttons snapshot and circularly rotate the
+  complete managed H/V/error/tie visibility mask over sorted represented
+  winding labels. Next moves source slot `i` to `(i+1) mod N`; Previous moves it
+  to `(i-1) mod N`, preserving state. Hidden bits move exactly like visible
+  bits, so arbitrary sparse selections and empty windings rotate without being
+  replaced by a preset. Missing destination-state layers discard their incoming
+  bit, and one represented winding is a no-op. The independent reference layer
+  and unmanaged Napari layers remain unchanged. The displayed winding label
+  summarizes all currently visible managed winding labels and follows presets,
+  rotations, and manual layer-visibility changes.
+- When `<base>_reference.obj` is present, the viewer validates its dedicated
+  header and ordered-polylines contract, converts base XYZ to Napari ZYX, and
+  adds one visible bright `Reference fibers` layer. Winding category and
+  previous/next controls do not change this independent comparison layer.
 - Published `N` is the solver's nonnegative display-offset integer label.
   Absolute winding and physical H/V identity are not comparable across
   independently gauged components; visualization must not imply otherwise.

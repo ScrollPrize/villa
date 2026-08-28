@@ -8,8 +8,10 @@
 #include "vc/fiber_tracer/FiberTraceWindingBeliefPropagation.hpp"
 #include "vc/fiber_tracer/FiberTraceConstraints.hpp"
 #include "vc/fiber_tracer/FiberTraceConsensus.hpp"
+#include "vc/fiber_tracer/FiberJson.hpp"
 #include "vc/fiber_tracer/FiberTraceLabeling.hpp"
 #include "vc/fiber_tracer/LasagnaNormalAlignment.hpp"
+#include "vc/fiber_tracer/PolylineGeometry.hpp"
 #include "vc/lasagna/ChannelSampler.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
@@ -73,6 +75,8 @@ struct Options {
     vc::fiber_tracer::FiberTraceLabelingConfig labeling;
     std::optional<std::size_t> maximumConstraintsPerFiber;
     std::optional<double> qualityFraction;
+    std::filesystem::path referenceFiberDirectory;
+    std::string referenceFiberTag;
     std::size_t ablationStep = 5;
     std::optional<std::size_t> ablationLimit;
     std::size_t postIterations = 0;
@@ -86,6 +90,7 @@ struct Options {
         vc::fiber_tracer::FiberTraceWindingSolver::JointGrid;
     bool windingFixedOrientation = false;
     double windingDefectCost = 0.5;
+    std::optional<double> parallelWindingCutoff;
     vc::fiber_tracer::FiberTraceJointGridWindingConfig jointGrid;
     bool hasBounds = false;
     bool hasTraceOnlyOption = false;
@@ -100,9 +105,12 @@ struct Options {
     bool hasBpInferenceOption = false;
     bool hasBpBalanceTuningOption = false;
     bool hasBpMixedCostOption = false;
+    bool hasReferenceFiberDirectoryOption = false;
+    bool hasReferenceFiberTagOption = false;
     bool hasWindingSolverOption = false;
     bool hasWindingOrientationOption = false;
     bool hasWindingDefectCostOption = false;
+    bool hasParallelWindingCutoffOption = false;
     bool hasJointGridOption = false;
     bool hasAdaptiveGridOption = false;
     bool hasFixedCalibrationOption = false;
@@ -179,7 +187,9 @@ void usage(const char* executable)
                  " [--post-influence F] [--bp-only]"
                  " [--bp-balance MODE] [options]\n\n"
               << "Stored trace input options:\n"
-              << "  --quality-fraction F      retain the best F fraction by cost density\n\n"
+              << "  --quality-fraction F      retain the best F fraction by cost density\n"
+              << "  --reference-fiber-dir DIR tagged VC3D reference fiber JSON directory\n"
+              << "  --reference-fiber-tag TAG exact tag selected from that directory\n\n"
               << "Trace options:\n"
               << "  --obj PATH                 line OBJ; defaults beside trace Zarr\n"
               << "  --volume PATH              concrete uint8 CT Zarr group\n"
@@ -214,6 +224,8 @@ void usage(const char* executable)
               << "  --winding-solver MODE     joint-grid or alternating [joint-grid]\n"
               << "  --winding-fixed-orientation  solve H/V/Mixed first, then only winding\n"
               << "  --winding-defect-cost F   winding-stage Defect unary per piece [0.5]\n"
+              << "  --parallel-winding-cutoff F\n"
+              << "                              exclusive parallel integer-distance cutoff [off]\n"
               << "  --winding-fixed-phase F   disable calibration at phase F in [0,0.5]\n"
               << "  --winding-fixed-scale F   disable calibration at positive scale F\n"
               << "  --winding-gain-cells N    initial joint gain cells [5]\n"
@@ -311,6 +323,18 @@ Options parse(int argc, char** argv)
                 *options.qualityFraction > 1.0) {
                 fail("--quality-fraction must be in (0, 1]");
             }
+        } else if (argument == "--reference-fiber-dir") {
+            options.referenceFiberDirectory = value(
+                index, argc, argv, "--reference-fiber-dir");
+            options.hasReferenceFiberDirectoryOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
+        } else if (argument == "--reference-fiber-tag") {
+            options.referenceFiberTag = value(
+                index, argc, argv, "--reference-fiber-tag");
+            options.hasReferenceFiberTagOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
         } else if (argument == "--obj") {
             options.obj = value(index, argc, argv, "--obj");
             options.hasTraceOnlyOption = true;
@@ -539,6 +563,16 @@ Options parse(int argc, char** argv)
             options.hasWindingDefectCostOption = true;
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
+        } else if (argument == "--parallel-winding-cutoff") {
+            options.parallelWindingCutoff = number(
+                index, argc, argv, "--parallel-winding-cutoff");
+            if (!std::isfinite(*options.parallelWindingCutoff) ||
+                !(*options.parallelWindingCutoff > 0.0)) {
+                fail("--parallel-winding-cutoff must be finite and positive");
+            }
+            options.hasParallelWindingCutoffOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
         } else if (argument == "--winding-gain-cells") {
             options.jointGrid.initialGainCells = count(
                 index, argc, argv, "--winding-gain-cells");
@@ -719,6 +753,14 @@ Options parse(int argc, char** argv)
             options.mode != Mode::DirectionAblation) {
             fail("ablation controls require direction-ablation");
         }
+        if (options.hasReferenceFiberDirectoryOption !=
+            options.hasReferenceFiberTagOption) {
+            fail("--reference-fiber-dir and --reference-fiber-tag must be used together");
+        }
+        if (options.hasReferenceFiberTagOption &&
+            options.referenceFiberTag.empty()) {
+            fail("--reference-fiber-tag must not be empty");
+        }
         if (options.mode == Mode::Consensus && options.hasSolverOnlyOption)
             fail("consensus does not accept HiGHS labeling options");
         if (options.mode == Mode::DirectionDiagnostic ||
@@ -787,7 +829,8 @@ Options parse(int argc, char** argv)
         }
         if ((options.hasWindingSolverOption || options.hasJointGridOption ||
              options.hasWindingOrientationOption ||
-             options.hasWindingDefectCostOption) &&
+             options.hasWindingDefectCostOption ||
+             options.hasParallelWindingCutoffOption) &&
             (!options.bpOnly ||
              options.bpInference != vc::fiber_tracer::
                  FiberTraceBeliefInference::SumProductMixed)) {
@@ -1524,11 +1567,14 @@ void writeAndPrintBpReport(
             "failed to open winding factor CSV: " + factorCsv.string());
     factorOutput
         << "constraint,piece_a,piece_b,node_a,node_b,parallel,perpendicular,"
-           "winding_weight_multiplier,effective_parallel_winding_weight,"
+           "parallel_winding_weight_multiplier,"
+           "perpendicular_winding_weight_multiplier,"
+           "effective_parallel_winding_weight,"
            "effective_perpendicular_winding_weight,"
            "original_signed_delta,canonical_raw_signed_delta,"
-           "effective_signed_delta,calibrated_signed_delta,"
-           "normal_component,self_edge\n"
+           "effective_parallel_winding_distance,parallel_winding_retained,"
+           "effective_perpendicular_signed_delta,"
+           "calibrated_perpendicular_signed_delta,normal_component,self_edge\n"
         << std::setprecision(17);
     const auto writeOptionalDouble = [](std::ostream& stream,
                                         const std::optional<double>& value) {
@@ -1549,19 +1595,24 @@ void writeAndPrintBpReport(
                      << factor.pieceB << ',' << factor.canonicalNodeA << ','
                      << factor.canonicalNodeB << ',' << factor.parallelScore
                      << ',' << factor.perpendicularScore << ','
-                     << factor.windingWeightMultiplier << ','
+                     << factor.parallelWindingWeightMultiplier << ','
+                     << factor.perpendicularWindingWeightMultiplier << ','
                      << factor.effectiveParallelWindingWeight << ','
                      << factor.effectivePerpendicularWindingWeight << ',';
         writeOptionalDouble(factorOutput, factor.originalSignedDelta);
         factorOutput << ',';
         writeOptionalDouble(factorOutput, factor.canonicalSignedDelta);
+        factorOutput << ',' << factor.effectiveParallelWindingDistance << ','
+                     << (factor.parallelWindingRetained ? 1 : 0) << ',';
+        writeOptionalDouble(
+            factorOutput, factor.effectivePerpendicularSignedDelta);
         factorOutput << ',';
-        writeOptionalDouble(factorOutput, factor.effectiveSignedDelta);
-        factorOutput << ',';
-        if (factor.effectiveSignedDelta && interleaved)
-            factorOutput << *factor.effectiveSignedDelta * interleaved->measurementScale;
+        if (factor.effectivePerpendicularSignedDelta && interleaved)
+            factorOutput << *factor.effectivePerpendicularSignedDelta *
+                interleaved->measurementScale;
         else
-            writeOptionalDouble(factorOutput, factor.effectiveSignedDelta);
+            writeOptionalDouble(
+                factorOutput, factor.effectivePerpendicularSignedDelta);
         factorOutput << ',';
         writeOptionalSize(factorOutput, factor.normalComponent);
         factorOutput << ',' << (factor.selfEdge ? 1 : 0) << '\n';
@@ -2421,6 +2472,191 @@ std::vector<std::size_t> applyQualityFilter(
     return originalTraceIndices;
 }
 
+std::filesystem::path referenceFiberObjPath(
+    const std::filesystem::path& output)
+{
+    return output.parent_path() /
+        (output.stem().string() + "_reference.obj");
+}
+
+void removeReferenceFiberArtifact(const std::filesystem::path& path)
+{
+    std::error_code error;
+    const bool exists = std::filesystem::exists(path, error);
+    if (error) {
+        throw std::runtime_error(
+            "failed to inspect reference fiber artifact: " + error.message());
+    }
+    if (!exists)
+        return;
+    if (!std::filesystem::is_regular_file(path, error) || error) {
+        throw std::runtime_error(
+            "reference fiber artifact path is not a regular file: " +
+            path.string());
+    }
+    if (!std::filesystem::remove(path, error) || error) {
+        throw std::runtime_error(
+            "failed to remove stale reference fiber artifact: " +
+            path.string());
+    }
+}
+
+struct ReferenceFiberDiagnostics {
+    std::vector<vc::fiber_tracer::FiberletCropTraceLine> lines;
+    std::vector<std::size_t> sourceIds;
+    std::vector<std::string> sourceNames;
+    std::size_t sourceFibers = 0;
+};
+
+std::optional<ReferenceFiberDiagnostics> updateReferenceFiberArtifact(
+    const Options& options,
+    const cv::Vec3d& minimumBaseXYZ,
+    const cv::Vec3d& maximumBaseXYZ)
+{
+    const auto outputPath = referenceFiberObjPath(options.output);
+    removeReferenceFiberArtifact(outputPath);
+    if (!options.hasReferenceFiberDirectoryOption)
+        return std::nullopt;
+
+    const auto selection = vc::fiber_tracer::loadTaggedVc3dFiberJsonDirectory(
+        options.referenceFiberDirectory, options.referenceFiberTag);
+    if (selection.fibers.empty()) {
+        throw std::runtime_error(
+            "no VC3D fibers matched reference tag '" +
+            options.referenceFiberTag + "' in " +
+            options.referenceFiberDirectory.string());
+    }
+
+    std::vector<vc::core::io::NamedPolyline> objLines;
+    ReferenceFiberDiagnostics diagnostics;
+    diagnostics.sourceFibers = selection.fibers.size();
+    diagnostics.sourceNames.reserve(selection.fibers.size());
+    std::size_t retainedPoints = 0;
+    for (std::size_t index = 0; index < selection.fibers.size(); ++index) {
+        const auto& selected = selection.fibers[index];
+        diagnostics.sourceNames.push_back(selected.path.stem().string());
+        auto runs = vc::fiber_tracer::clipPolylineToHalfOpenBox(
+            selected.fiber.linePoints, minimumBaseXYZ, maximumBaseXYZ);
+        for (std::size_t run = 0; run < runs.size(); ++run) {
+            const std::string name =
+                "reference_" + std::to_string(index) + "_run_" +
+                std::to_string(run) + "_" + selected.path.stem().string();
+            retainedPoints += runs[run].size();
+            objLines.push_back({name, runs[run]});
+            vc::fiber_tracer::FiberletCropTraceLine diagnostic;
+            diagnostic.seedBaseXYZ = runs[run].front();
+            diagnostic.pointsBaseXYZ = std::move(runs[run]);
+            diagnostics.lines.push_back(std::move(diagnostic));
+            diagnostics.sourceIds.push_back(index);
+        }
+    }
+    if (objLines.empty()) {
+        throw std::runtime_error(
+            "tagged VC3D reference fibers do not intersect the trace crop");
+    }
+    vc::core::io::writePolylinesObj(
+        objLines, outputPath, "VC3D tagged reference fibers");
+    std::cout << "fiber reference export"
+              << " scanned_json=" << selection.scannedJsonFiles
+              << " selected=" << selection.fibers.size()
+              << " retained_runs=" << objLines.size()
+              << " retained_points=" << retainedPoints
+              << " tag=" << std::quoted(options.referenceFiberTag)
+              << " directory=" << std::quoted(
+                     options.referenceFiberDirectory.string())
+              << " output=" << std::quoted(outputPath.string()) << '\n';
+    return diagnostics;
+}
+
+void printReferenceFiberConstraints(
+    const ReferenceFiberDiagnostics& reference,
+    const vc::fiber_tracer::FiberTraceConstraintReport& report)
+{
+    const auto ordered =
+        vc::fiber_tracer::orderMeasuredCrossSourceFiberTraceConstraints(
+            report, reference.sourceIds);
+    if (reference.sourceNames.size() != reference.sourceFibers) {
+        throw std::invalid_argument(
+            "Reference fiber names do not match selected sources");
+    }
+
+    using Ordered = vc::fiber_tracer::FiberTraceOrderedCrossSourceConstraint;
+    std::vector<std::vector<const Ordered*>> perpendicular(
+        reference.sourceFibers);
+    std::vector<std::vector<const Ordered*>> parallel(reference.sourceFibers);
+    for (const auto& link : ordered) {
+        if (link.targetSource >= reference.sourceFibers) {
+            throw std::invalid_argument(
+                "Reference constraint source is out of range");
+        }
+        auto& group = link.perpendicularDominant ? perpendicular : parallel;
+        group[link.ownerSource].push_back(&link);
+    }
+
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    vc::fiber_tracer::FiberTraceCanonicalConstraintCounts counts;
+    const auto printTable = [&output, &report, &counts](
+                                std::string_view title,
+                                const std::vector<const Ordered*>& links,
+                                bool perpendicularTable) {
+        output << title << '\n'
+               << std::left
+               << std::setw(16) << "target_winding"
+               << std::setw(14) << "raw_step"
+               << std::setw(17) << "canonical_step"
+               << std::setw(12) << "gt_step"
+               << "raw_minus_gt" << '\n';
+        if (links.empty()) {
+            output << "(none)\n";
+            return;
+        }
+        for (const Ordered* link : links) {
+            const double targetWinding =
+                0.5 * static_cast<double>(link->targetSource);
+            const double expected = 0.5 * static_cast<double>(
+                link->targetSource - link->ownerSource);
+            const double raw =
+                report.constraints.at(link->constraintIndex).windingDistance;
+            const double canonical = perpendicularTable
+                ? vc::fiber_tracer::quantizedHalfWindingTarget(raw)
+                : vc::fiber_tracer::quantizedIntegerWindingTarget(raw);
+            counts.add(canonical, expected);
+            output << std::fixed
+                   << std::setprecision(1)
+                   << std::setw(16) << targetWinding
+                   << std::setprecision(3)
+                   << std::setw(14) << raw
+                   << std::setprecision(1)
+                   << std::setw(17) << canonical
+                   << std::setw(12) << expected
+                   << std::setprecision(3)
+                   << raw - expected << '\n';
+        }
+    };
+
+    for (std::size_t source = 0; source < reference.sourceFibers; ++source) {
+        output << '\n'
+               << "reference fiber " << std::quoted(
+                      reference.sourceNames[source])
+               << " winding=" << std::fixed << std::setprecision(1)
+               << 0.5 * static_cast<double>(source) << '\n';
+        printTable(
+            "perpendicular constraints", perpendicular[source], true);
+        printTable("parallel constraints", parallel[source], false);
+    }
+    output << '\n'
+           << "reference constraint canonical summary\n"
+           << std::left
+           << std::setw(12) << "correct"
+           << std::setw(12) << "false"
+           << "total\n"
+           << std::setw(12) << counts.correct
+           << std::setw(12) << counts.falseCount
+           << counts.total << '\n';
+    std::cout << output.str();
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -2528,6 +2764,35 @@ int main(int argc, char** argv)
                     ? std::filesystem::path{"."}
                     : options.output.parent_path();
                 std::filesystem::create_directories(outputDirectory);
+                std::optional<ReferenceFiberDiagnostics> referenceDiagnostics;
+                if (options.mode == Mode::DirectionAblation) {
+                    referenceDiagnostics = updateReferenceFiberArtifact(
+                        options,
+                        artifact.minimumBaseXYZ,
+                        artifact.maximumBaseXYZ);
+                }
+                if (referenceDiagnostics) {
+                    const auto referenceConstraints =
+                        vc::fiber_tracer::extractFiberTraceConstraints(
+                            referenceDiagnostics->lines,
+                            options.constraints,
+                            [&normals](const cv::Vec3d& a,
+                                       const cv::Vec3d& b,
+                                       double step) {
+                                return normals.normalAlignedWindingDistance(
+                                    a, b, step);
+                            },
+                            [&normals](
+                                const std::vector<std::pair<
+                                    cv::Vec3d, cv::Vec3d>>& connectors,
+                                double step,
+                                int threads) {
+                                return normals.normalAlignedWindingDistancesBatch(
+                                    connectors, step, threads);
+                            });
+                    printReferenceFiberConstraints(
+                        *referenceDiagnostics, referenceConstraints);
+                }
                 const std::filesystem::path initialOutput = outputDirectory /
                     (options.output.stem().string() + "_initial.obj");
                 vc::fiber_tracer::writeFiberletCropDirectionObjs(
@@ -2703,6 +2968,8 @@ int main(int argc, char** argv)
                                 options.bp.maximumMessageIterations;
                             windingConfig.parallelWorkers =
                                 static_cast<std::size_t>(options.threads);
+                            windingConfig.parallelWindingDistanceCutoff =
+                                options.parallelWindingCutoff;
                             std::optional<vc::fiber_tracer::
                                 FiberTraceWindingBeliefPropagationReport>
                                     independentWinding;
@@ -3139,6 +3406,8 @@ int main(int argc, char** argv)
                                 options.bp.maximumMessageIterations;
                             windingConfig.parallelWorkers =
                                 static_cast<std::size_t>(options.threads);
+                            windingConfig.parallelWindingDistanceCutoff =
+                                options.parallelWindingCutoff;
                             const auto winding = vc::fiber_tracer::
                                 solveFiberTraceWindingBeliefPropagation(
                                     comparisonReport,

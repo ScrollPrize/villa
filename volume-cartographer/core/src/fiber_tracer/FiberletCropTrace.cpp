@@ -4,6 +4,7 @@
 #include "vc/core/util/AtomicFile.hpp"
 #include "vc/fiber_tracer/FiberAxisTensor.hpp"
 #include "vc/fiber_tracer/FiberReplayMetric.hpp"
+#include "vc/fiber_tracer/PolylineGeometry.hpp"
 #include "utils/thread_pool.hpp"
 
 #include <algorithm>
@@ -118,20 +119,6 @@ std::string fiberName(const FiberletCropTraceLine& line, std::size_t index)
     return name.str();
 }
 
-bool inside(
-    const cv::Vec3d& point,
-    const cv::Vec3d& minimumBaseXYZ,
-    const cv::Vec3d& maximumBaseXYZ)
-{
-    for (int axis = 0; axis < 3; ++axis) {
-        if (!(point[axis] >= minimumBaseXYZ[axis] &&
-              point[axis] < maximumBaseXYZ[axis])) {
-            return false;
-        }
-    }
-    return true;
-}
-
 struct ClippedRoute {
     double retainedFraction = 1.0;
     bool exited = false;
@@ -144,7 +131,7 @@ ClippedRoute clipAtFirstExit(
     std::vector<cv::Vec3d>* appendedPoints = nullptr)
 {
     if (route.size() < 2 ||
-        !inside(route.front(), minimumBaseXYZ, maximumBaseXYZ)) {
+        !pointInHalfOpenBox(route.front(), minimumBaseXYZ, maximumBaseXYZ)) {
         throw std::invalid_argument("Fiberlet crop route must start inside the crop");
     }
     ClippedRoute result;
@@ -162,23 +149,19 @@ ClippedRoute clipAtFirstExit(
         const double segmentLength = length(delta);
         if (!(segmentLength > kEpsilon))
             continue;
-        if (inside(finish, minimumBaseXYZ, maximumBaseXYZ)) {
+        if (pointInHalfOpenBox(finish, minimumBaseXYZ, maximumBaseXYZ)) {
             if (appendedPoints)
                 appendedPoints->push_back(finish);
             retainedLength += segmentLength;
             continue;
         }
-        double t = 1.0;
-        for (int axis = 0; axis < 3; ++axis) {
-            if (finish[axis] < minimumBaseXYZ[axis]) {
-                t = std::min(t, (minimumBaseXYZ[axis] - start[axis]) / delta[axis]);
-            } else if (finish[axis] >= maximumBaseXYZ[axis]) {
-                t = std::min(t, (maximumBaseXYZ[axis] - start[axis]) / delta[axis]);
-            }
-        }
-        t = std::clamp(t, 0.0, 1.0);
+        const auto clipped = clipLineSegmentToHalfOpenBox(
+            start, finish, minimumBaseXYZ, maximumBaseXYZ);
+        if (!clipped)
+            throw std::logic_error("Fiberlet crop exit segment missed crop");
+        const double t = clipped->endFraction;
         if (appendedPoints)
-            appendedPoints->push_back(start + delta * t);
+            appendedPoints->push_back(clipped->finish);
         retainedLength += segmentLength * t;
         result.exited = true;
         break;

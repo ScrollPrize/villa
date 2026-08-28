@@ -28,11 +28,11 @@ _STATE_NAMES = {
     "tie": "Tie",
 }
 _STATE_HUE_OFFSETS = {
-    "h": 0.0,
-    "v": 0.19,
     "err": 0.38,
     "tie": 0.57,
 }
+_REFERENCE_HEADER = "VC3D tagged reference fibers"
+_REFERENCE_COLOR = (1.0, 0.88, 0.12, 1.0)
 
 
 @dataclass(frozen=True, order=True)
@@ -56,6 +56,14 @@ class WindingGeometry:
     """One winding-state artifact converted to Napari ZYX paths."""
 
     artifact: WindingArtifact
+    paths_zyx: tuple[np.ndarray, ...]
+
+
+@dataclass(frozen=True)
+class ReferenceGeometry:
+    """Optional tagged VC3D reference fibers converted to Napari ZYX paths."""
+
+    path: Path
     paths_zyx: tuple[np.ndarray, ...]
 
 
@@ -148,14 +156,53 @@ def load_winding_geometry(path: str | Path) -> tuple[WindingGeometry, ...]:
     return tuple(read_winding_artifact(item) for item in discover_winding_artifacts(path))
 
 
+def discover_reference_artifact(path: str | Path) -> Path | None:
+    """Return the optional CLI-owned tagged-reference sibling artifact."""
+    base = normalize_winding_output_base(path)
+    candidate = base.parent / f"{base.name}_reference.obj"
+    return candidate if candidate.is_file() else None
+
+
+def read_reference_artifact(path: str | Path) -> ReferenceGeometry:
+    """Read and validate the tagged VC3D reference-fiber OBJ artifact."""
+    artifact = Path(path)
+    parsed = read_ordered_polyline_obj(
+        artifact,
+        container_records=("o",),
+        allow_singletons=False,
+        require_segment_lines=True,
+    )
+    comments = tuple(comment.text for comment in parsed.preamble_comments)
+    if comments != (_REFERENCE_HEADER,):
+        raise ValueError(
+            f"{artifact}: expected exactly the tagged reference-fiber header"
+        )
+    paths: list[np.ndarray] = []
+    for group in parsed.groups:
+        if group.comments:
+            raise ValueError(
+                f"{artifact}:{group.comments[0].line_number}: "
+                "reference fiber objects may not contain metadata comments"
+            )
+        paths.append(group.points_xyz[:, ::-1].astype(np.float32, copy=True))
+    if not paths:
+        raise ValueError(f"{artifact}: reference fiber artifact is empty")
+    return ReferenceGeometry(path=artifact, paths_zyx=tuple(paths))
+
+
+def load_reference_geometry(path: str | Path) -> ReferenceGeometry | None:
+    """Load the optional tagged-reference sibling for one winding output base."""
+    artifact = discover_reference_artifact(path)
+    return None if artifact is None else read_reference_artifact(artifact)
+
+
 def winding_layer_color(key: WindingLayerKey) -> tuple[float, float, float, float]:
-    """Return a stable bright color derived only from winding and state."""
-    if key.winding < 0 or key.state not in _STATE_HUE_OFFSETS:
+    """Return a stable bright color, sharing one color for H/V per winding."""
+    if key.winding < 0 or key.state not in _STATE_ORDER:
         raise ValueError("invalid winding layer key")
     golden_ratio_conjugate = 0.6180339887498949
-    hue = (
-        key.winding * golden_ratio_conjugate + _STATE_HUE_OFFSETS[key.state]
-    ) % 1.0
+    state_offset = 0.0 if key.state in {"h", "v"} else _STATE_HUE_OFFSETS[key.state]
+    hue = (key.winding * golden_ratio_conjugate + state_offset) % 1.0
     red, green, blue = colorsys.hsv_to_rgb(hue, 0.72, 1.0)
     return red, green, blue, 1.0
 
@@ -216,20 +263,38 @@ def visible_winding_layers(
     return frozenset(key for key in available if key.state in states)
 
 
-def advance_winding(
-    windings: Sequence[int], current: int | None, delta: int
-) -> int:
-    """Move cyclically through a nonempty ordered winding collection."""
-    ordered = tuple(windings)
-    if not ordered:
-        raise ValueError("cannot navigate an empty winding collection")
-    if len(set(ordered)) != len(ordered) or tuple(sorted(ordered)) != ordered:
-        raise ValueError("navigable windings must be unique and sorted")
+def rotate_visible_winding_mask(
+    keys: Sequence[WindingLayerKey],
+    visible: Sequence[WindingLayerKey],
+    delta: int,
+) -> frozenset[WindingLayerKey]:
+    """Circularly rotate the complete managed visibility mask by winding."""
     if delta == 0:
-        raise ValueError("winding navigation delta must be nonzero")
-    if current not in ordered:
-        return ordered[0] if delta > 0 else ordered[-1]
-    return ordered[(ordered.index(current) + delta) % len(ordered)]
+        raise ValueError("winding visibility rotation must be nonzero")
+    available = frozenset(keys)
+    selected = frozenset(visible) & available
+    windings = tuple(sorted({key.winding for key in available}))
+    if len(windings) <= 1:
+        return selected
+    winding_index = {winding: index for index, winding in enumerate(windings)}
+    rotated: set[WindingLayerKey] = set()
+    for source in selected:
+        destination_index = (winding_index[source.winding] + delta) % len(windings)
+        destination = WindingLayerKey(windings[destination_index], source.state)
+        if destination in available:
+            rotated.add(destination)
+    return frozenset(rotated)
+
+
+def rotate_winding_layer_visibility(
+    layers: Mapping[WindingLayerKey, object], delta: int
+) -> frozenset[WindingLayerKey]:
+    """Rotate a snapshot of every managed layer's live visibility bit."""
+    visible = tuple(key for key, layer in layers.items() if layer.visible)
+    rotated = rotate_visible_winding_mask(tuple(layers), visible, delta)
+    for key, layer in layers.items():
+        layer.visible = key in rotated
+    return rotated
 
 
 def add_winding_controls(
@@ -241,14 +306,13 @@ def add_winding_controls(
         QHBoxLayout,
         QLabel,
         QPushButton,
-        QToolButton,
         QVBoxLayout,
         QWidget,
     )
 
     keys = tuple(layers)
-    windings = navigable_windings(keys)
-    current_winding = windings[0] if windings else None
+    windings = tuple(sorted({key.winding for key in keys}))
+    initial_windings = navigable_windings(keys)
 
     widget = QWidget()
     layout = QVBoxLayout(widget)
@@ -256,19 +320,27 @@ def add_winding_controls(
     navigation_row = QHBoxLayout()
     winding_label = QLabel()
 
+    def update_label() -> None:
+        visible_windings = sorted(
+            {
+                key.winding
+                for key, layer in layers.items()
+                if layer.visible
+            }
+        )
+        if not visible_windings:
+            winding_label.setText("No visible winding")
+            return
+        prefix = "Winding" if len(visible_windings) == 1 else "Windings"
+        winding_label.setText(
+            f"{prefix} {', '.join(str(value) for value in visible_windings)}"
+        )
+
     def apply(preset: str, winding: int | None = None) -> None:
         selected = visible_winding_layers(keys, preset, winding=winding)
         for key, layer in layers.items():
             layer.visible = key in selected
-
-    def update_label() -> None:
-        if current_winding is None:
-            winding_label.setText("No H/V winding")
-            return
-        winding_label.setText(
-            f"Winding {current_winding} "
-            f"({windings.index(current_winding) + 1}/{len(windings)})"
-        )
+        update_label()
 
     for label, preset in (
         ("H", "h"),
@@ -281,19 +353,15 @@ def add_winding_controls(
         button.clicked.connect(lambda _checked=False, value=preset: apply(value))
         category_row.addWidget(button)
 
-    previous_button = QToolButton()
-    previous_button.setText("<")
-    previous_button.setToolTip("Previous winding")
-    next_button = QToolButton()
-    next_button.setText(">")
-    next_button.setToolTip("Next winding")
+    previous_button = QPushButton("Previous")
+    previous_button.setToolTip("Rotate visibility to the previous winding")
+    next_button = QPushButton("Next")
+    next_button.setToolTip("Rotate visibility to the next winding")
     previous_button.setEnabled(bool(windings))
     next_button.setEnabled(bool(windings))
 
     def move(delta: int) -> None:
-        nonlocal current_winding
-        current_winding = advance_winding(windings, current_winding, delta)
-        apply("winding", current_winding)
+        rotate_winding_layer_visibility(layers, delta)
         update_label()
 
     previous_button.clicked.connect(lambda _checked=False: move(-1))
@@ -303,11 +371,15 @@ def add_winding_controls(
     navigation_row.addWidget(next_button)
     layout.addLayout(category_row)
     layout.addLayout(navigation_row)
+    for layer in layers.values():
+        visible_event = getattr(getattr(layer, "events", None), "visible", None)
+        if visible_event is not None:
+            visible_event.connect(lambda _event=None: update_label())
     update_label()
-    if current_winding is None:
+    if not initial_windings:
         apply("all")
     else:
-        apply("winding", current_winding)
+        apply("winding", initial_windings[0])
     viewer.window.add_dock_widget(widget, area="right", name="Winding visibility")
 
 
@@ -319,22 +391,56 @@ def add_winding_layers(
     """Add nonempty winding artifacts using explicit per-path colors."""
     layers: dict[WindingLayerKey, object] = {}
     fiber_count = 0
+    hv_palette = {
+        item.artifact.key.winding: np.asarray(
+            winding_layer_color(WindingLayerKey(item.artifact.key.winding, "h")),
+            dtype=np.float32,
+        )
+        for item in geometry
+        if item.artifact.key.state in {"h", "v"}
+    }
     for item in geometry:
         if not item.paths_zyx:
             continue
         key = item.artifact.key
+        color = (
+            hv_palette[key.winding]
+            if key.state in {"h", "v"}
+            else np.asarray(winding_layer_color(key), dtype=np.float32)
+        )
+        colors = np.broadcast_to(color, (len(item.paths_zyx), 4)).copy()
         layers[key] = viewer.add_shapes(
             list(item.paths_zyx),
             ndim=3,
             shape_type="path",
             name=winding_layer_name(key),
-            edge_color=winding_layer_colors(key, len(item.paths_zyx)),
+            edge_color=colors,
             edge_width=edge_width,
             face_color="transparent",
             visible=False,
         )
         fiber_count += len(item.paths_zyx)
     return layers, fiber_count
+
+
+def add_reference_layer(viewer, geometry: ReferenceGeometry | None, edge_width: float):
+    """Add the optional independent tagged-reference comparison layer."""
+    if geometry is None:
+        return None
+    colors = np.broadcast_to(
+        np.asarray(_REFERENCE_COLOR, dtype=np.float32),
+        (len(geometry.paths_zyx), 4),
+    ).copy()
+    return viewer.add_shapes(
+        list(geometry.paths_zyx),
+        ndim=3,
+        shape_type="path",
+        name="Reference fibers",
+        edge_color=colors,
+        edge_width=edge_width,
+        face_color="transparent",
+        visible=True,
+    )
 
 
 def launch_viewer(path: str | Path, edge_width: float = 2.0) -> None:
@@ -350,15 +456,18 @@ def launch_viewer(path: str | Path, edge_width: float = 2.0) -> None:
 
     base = normalize_winding_output_base(path)
     geometry = load_winding_geometry(base)
+    reference = load_reference_geometry(base)
     viewer = napari.Viewer(ndisplay=3, title=f"Fiber windings: {base.name}")
     layers, fiber_count = add_winding_layers(viewer, geometry, edge_width)
     if not layers:
         raise ValueError(f"all winding state OBJ artifacts are empty for base {base}")
+    add_reference_layer(viewer, reference, edge_width)
     add_winding_controls(viewer, layers)
     viewer.reset_view()
     print(
         f"fiber winding viewer windings={len({key.winding for key in layers})} "
-        f"layers={len(layers)} fibers={fiber_count}"
+        f"layers={len(layers)} fibers={fiber_count} "
+        f"reference_fibers={0 if reference is None else len(reference.paths_zyx)}"
     )
     napari.run()
 

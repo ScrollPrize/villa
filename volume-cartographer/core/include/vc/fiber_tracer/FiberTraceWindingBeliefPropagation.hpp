@@ -12,6 +12,17 @@
 namespace vc::fiber_tracer
 {
 
+[[nodiscard]] double quantizedHalfWindingTarget(double value);
+[[nodiscard]] double quantizedIntegerWindingTarget(double value);
+
+struct FiberTraceCanonicalConstraintCounts {
+    std::size_t correct = 0;
+    std::size_t falseCount = 0;
+    std::size_t total = 0;
+
+    void add(double canonicalStep, double groundTruthStep) noexcept;
+};
+
 enum class FiberTraceWindingSolver : unsigned char {
     JointGrid,
     Alternating,
@@ -57,6 +68,7 @@ struct FiberTraceWindingBeliefPropagationConfig {
     std::size_t maximumMessageIterations = 500;
     std::size_t maximumTotalCandidateStates = 4'000'000;
     std::size_t parallelWorkers = 1;
+    std::optional<double> parallelWindingDistanceCutoff;
 };
 
 struct FiberTraceInterleavedWindingConfig : FiberTraceWindingBeliefPropagationConfig {
@@ -155,13 +167,16 @@ struct FiberTraceWindingFactorDiagnostic {
     std::size_t canonicalNodeB = 0;
     double parallelScore = 0.0;
     double perpendicularScore = 0.0;
-    double windingWeightMultiplier = 1.0;
+    double parallelWindingWeightMultiplier = 1.0;
+    double perpendicularWindingWeightMultiplier = 1.0;
     double effectiveParallelWindingWeight = 0.0;
     double effectivePerpendicularWindingWeight = 0.0;
     std::optional<double> originalSignedDelta;
     std::optional<double> canonicalSignedDelta;
-    std::optional<double> effectiveSignedDelta;
+    double effectiveParallelWindingDistance = 0.0;
+    std::optional<double> effectivePerpendicularSignedDelta;
     std::optional<std::size_t> normalComponent;
+    bool parallelWindingRetained = false;
     bool selfEdge = false;
 };
 

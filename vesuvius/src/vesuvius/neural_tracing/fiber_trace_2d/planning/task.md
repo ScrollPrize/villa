@@ -1,9 +1,7 @@
-# Task: separate prepass and winding Defect controls
+# Task: circular winding visibility-mask controls
 
-Split the orientation-prepass Mixed unary cost from the later winding-stage
-Defect unary cost. `--bp-mixed-cost` must configure only the initial H/V/Mixed
-BP, while a separate `--winding-defect-cost` configures Defect during winding.
-
-When fixed-orientation winding is used, save the exact H/V/Defect assignment
-passed from the orientation prepass into the winding solver as separate OBJ
-layers, in addition to the existing final winding-state OBJ layers.
+Previous/next must circularly shift the complete managed layer visibility mask
+by one winding. Visible and hidden bits for H, V, error, and tie all move
+together, so when every winding except one is visible the empty winding moves.
+Use full-size labeled buttons rather than tiny arrow tool buttons. H and V at
+one winding must receive the exact same color in actual Napari layer creation.

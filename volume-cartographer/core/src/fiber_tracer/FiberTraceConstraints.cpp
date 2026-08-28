@@ -617,6 +617,47 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
     return report;
 }
 
+std::vector<FiberTraceOrderedCrossSourceConstraint>
+orderMeasuredCrossSourceFiberTraceConstraints(
+    const FiberTraceConstraintReport& report,
+    const std::vector<std::size_t>& sourceIdsByTrace)
+{
+    if (sourceIdsByTrace.size() != report.inputTraces) {
+        throw std::invalid_argument(
+            "Fiber trace constraint source IDs do not match input traces");
+    }
+    std::vector<FiberTraceOrderedCrossSourceConstraint> ordered;
+    ordered.reserve(report.constraints.size());
+    for (std::size_t index = 0; index < report.constraints.size(); ++index) {
+        const auto& constraint = report.constraints[index];
+        if (constraint.hardContinuity)
+            continue;
+        if (constraint.pieceA >= report.pieces.size() ||
+            constraint.pieceB >= report.pieces.size()) {
+            throw std::invalid_argument(
+                "Fiber trace constraint references an invalid piece");
+        }
+        const std::size_t traceA = report.pieces[constraint.pieceA].traceIndex;
+        const std::size_t traceB = report.pieces[constraint.pieceB].traceIndex;
+        if (traceA >= sourceIdsByTrace.size() ||
+            traceB >= sourceIdsByTrace.size()) {
+            throw std::invalid_argument(
+                "Fiber trace constraint piece references an invalid trace");
+        }
+        const std::size_t sourceA = sourceIdsByTrace[traceA];
+        const std::size_t sourceB = sourceIdsByTrace[traceB];
+        if (sourceA != sourceB) {
+            ordered.push_back({
+                index,
+                std::min(sourceA, sourceB),
+                std::max(sourceA, sourceB),
+                constraint.perpendicularScore >= constraint.parallelScore,
+            });
+        }
+    }
+    return ordered;
+}
+
 void orientFiberTraceConstraintWindings(
     FiberTraceConstraintReport& report,
     const LasagnaNormalAlignmentField& alignedNormals)

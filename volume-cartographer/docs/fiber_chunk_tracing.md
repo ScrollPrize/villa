@@ -835,10 +835,21 @@ component. Otherwise the H/V constraint remains valid but contributes no
 perpendicular winding evidence. A connected winding graph that would combine
 signed evidence from independently gauged normal components is rejected.
 
-The H/V-aware winding BP solvers do not use that raw signed magnitude
-directly. After the raw exclusive winding cutoff has admitted a constraint,
-they map every nonzero magnitude to its half-integer interval center while
-preserving sign:
+The H/V-aware winding BP solvers split each measured factor into two winding
+components. The parallel component uses the unsigned measured
+`winding_distance`, rounded to the nearest nonnegative integer:
+
+```text
+[0,0.5) -> 0
+[0.5,1.5) -> 1
+[1.5,2.5) -> 2
+```
+
+Its loss is `parallel_weight * abs(abs(latent_delta) - integer_distance)`, so
+the same-winding zero bin needs no signed normal observation. Gain/scale never
+calibrates this exact integer ladder. The perpendicular component uses the
+aligned signed observation and maps every nonzero magnitude to its
+half-integer interval center while preserving sign:
 
 ```text
 (0,1] -> 0.5
@@ -847,21 +858,34 @@ preserving sign:
 (3,4) -> 3.5 with the default exclusive cutoff
 ```
 
-Exact signed zero and hard same-trace continuity remain zero. The cutoff is
-not re-applied to the quantized value. Alternating and joint-grid H/V winding
-solvers, including their continuous initialization, share this conversion.
+Exact signed zero and hard same-trace continuity remain zero. The extraction
+cutoff is not re-applied to either quantized value. Alternating and joint-grid
+H/V winding solvers, including continuous initialization and decoded energy,
+share these conversions.
 The independent integer-only winding diagnostic remains raw because it has no
 half-offset H/V lattice.
 
-The complete soft winding contribution of an H/V-aware measured factor is
-multiplied by `2^-floor(abs(effective_target))`. The `0.5`, `1.5`, `2.5`, and
-`3.5` target bins therefore have multipliers `1`, `0.5`, `0.25`, and `0.125`.
-This scales both the parallel same-winding residual and the perpendicular
-signed-offset residual. It does not scale the separate H/V relation energy,
+Each component is independently multiplied by
+`2^-floor(abs(effective_target))`. Parallel integer distances `0`, `1`, `2`,
+and `3` therefore use multipliers `1`, `0.5`, `0.25`, and `0.125`, while
+perpendicular half-integer targets `0.5`, `1.5`, `2.5`, and `3.5` use the same
+sequence starting at `1`. It does not scale the separate H/V relation energy,
 hard same-trace continuity, or the strict sign requirement on a nonzero signed
 perpendicular observation. The formula continues for larger bins admitted by
-an explicit cutoff override. Factor CSV output records the multiplier plus the
-effective parallel and perpendicular winding weights.
+an explicit extraction-cutoff override. Factor CSV output records both targets,
+both multipliers, and both effective winding weights.
+
+`--parallel-winding-cutoff N` applies an additional exclusive filter only to
+the H/V-aware solve's integer parallel component. For example, `0.5` retains
+only same-winding distance `0`. A filtered parallel component still contributes
+its ordinary H/V orientation score, and the perpendicular component of the
+same measured factor remains active. Extraction, reference diagnostics, and
+stored constraints are unchanged. The default is no additional filter.
+Factor/message connectivity remains intact after filtering. Each message
+component retains one H/V class gauge, while disconnected effective-winding
+subgraphs receive separate integer-zero gauges. An extra integer gauge does
+not fix H or V, so orientation-only evidence continues to propagate across a
+filtered winding component.
 
 Fixed phase `0.5` and scale `1.0` provide the exact half-step experiment.
 Adaptive calibration remains available for comparison and can move latent
@@ -1066,17 +1090,66 @@ trailing `.obj` is also accepted. The viewer requires every discovered winding
 to have the complete `_h`, `_v`, `_err`, and `_tie` quartet, including empty
 files. Aggregate `_w_N.obj` files and CSV diagnostics are ignored.
 
-Each nonempty state file becomes one independently colored 3D path layer. `H`,
+Each nonempty state file becomes one 3D path layer. H and V layers at the same
+winding share one bright winding-specific color; Broken and Tie remain visually
+distinct. `H`,
 `V`, and `Broken` show that category across all winding labels; Broken includes
 both `_err` and exact `_tie` layers. `All` and `None` set all winding-layer
-visibility at once. The arrow controls cycle through windings with nonempty H
-or V geometry and show the selected winding's H and V layers together. The
-first such winding is the initial view. `--width` changes the displayed path
-width.
+visibility at once. Full-size Previous and Next buttons circularly rotate the
+entire managed H/V/Broken/Tie visibility mask by one represented winding while
+preserving state. Visible and hidden bits both move, so any arbitrary pattern,
+including an empty winding among otherwise visible windings, wraps intact.
+The reference and unrelated layers are untouched. The label lists all currently
+visible managed windings and follows manual layer-panel visibility changes. The
+first nonempty H/V winding is the initial view. `--width` changes the displayed
+path width.
 
 The shown winding number is the nonnegative publication offset, not an absolute
 physical winding. Likewise, physical H/V identity and absolute winding are not
 comparable across separately gauged components.
+
+For comparison against an existing VC3D annotation stack, add both reference
+options to the `direction-ablation` command:
+
+```bash
+--reference-fiber-dir /path/to/vc3d-fibers --reference-fiber-tag hendrik_crop1
+```
+
+The tag match is exact and case-sensitive. The command scans only regular JSON
+files directly in that directory, validates selected files with the normal
+VC3D fiber parser, and clips their dense base-XYZ lines to the stored trace
+artifact's crop before writing `<base>_reference.obj`. A fiber that leaves and
+re-enters the half-open crop becomes multiple ordered OBJ paths; boundary
+crossings are retained, while geometry merely lying on the exclusive maximum
+face is not. The reference fibers are diagnostic only and do not affect BP.
+The same cropped runs are also passed once through the normal constraint
+extractor. Selected source-fiber filename order defines diagnostic virtual
+winding values `0.0, 0.5, 1.0, ...`; all crop runs from a source inherit its
+value, and a selected source without crop geometry still occupies its slot.
+Generated within-run continuity links and links between separate crop runs of
+the same source fiber are excluded. Every remaining link is presented exactly
+once under its lower-winding source and only points to a higher winding.
+
+For each source the command prints a perpendicular table followed by a parallel
+table. Dominant score determines the table, with exact ties assigned to
+perpendicular. Rows contain only raw nonnegative normal-aligned winding step,
+the target fiber's virtual winding, the solver's canonical half-integer step
+for perpendicular links or nearest-integer step for parallel links,
+the virtual ground-truth step, and `raw - GT`, where GT is the difference
+between the two virtual windings. These raw diagnostics use the active
+constraint extraction geometry
+and distance settings, but not downstream constraint pruning,
+perpendicular-only selection, or labeling filters.
+After the last source table, `reference constraint canonical summary` reports
+`correct`, `false`, and `total`. Every displayed measured row contributes once,
+including repeated piece-pair measurements between the same source fibers. A
+row is correct when its parallel integer or perpendicular half-integer
+canonical step equals the virtual GT step; otherwise it is false. Consequently
+`correct + false` always equals both `total` and the number of displayed rows.
+The Napari command above automatically loads this sibling as the independent
+`Reference fibers` layer when present. A later successful
+`direction-ablation` run without the reference options removes an older
+reference sibling owned by that output base.
 
 ## Quality groups
 

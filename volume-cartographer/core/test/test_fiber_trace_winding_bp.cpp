@@ -162,8 +162,10 @@ TEST_CASE("Interleaved winding uses signed half-integer observation bins")
     };
     REQUIRE(solved.factorDiagnostics.size() == expected.size());
     for (std::size_t index = 0; index < expected.size(); ++index) {
-        REQUIRE(solved.factorDiagnostics[index].effectiveSignedDelta);
-        CHECK(*solved.factorDiagnostics[index].effectiveSignedDelta ==
+        REQUIRE(solved.factorDiagnostics[index]
+            .effectivePerpendicularSignedDelta);
+        CHECK(*solved.factorDiagnostics[index]
+                   .effectivePerpendicularSignedDelta ==
             expected[index]);
     }
     CHECK(solved.factorDiagnostics[5].originalSignedDelta == -1.01);
@@ -178,8 +180,55 @@ TEST_CASE("Interleaved winding uses signed half-integer observation bins")
     const auto raw = solveFiberTraceWindingBeliefPropagation(
         report, topology(source, report), config());
     REQUIRE(raw.factorDiagnostics.size() == expected.size());
-    for (const auto& diagnostic : raw.factorDiagnostics)
-        CHECK(diagnostic.effectiveSignedDelta == diagnostic.canonicalSignedDelta);
+    for (const auto& diagnostic : raw.factorDiagnostics) {
+        CHECK(diagnostic.effectiveParallelWindingDistance == 0.0);
+        CHECK(diagnostic.effectivePerpendicularSignedDelta ==
+            diagnostic.canonicalSignedDelta);
+    }
+}
+
+TEST_CASE("Half-integer winding quantization preserves boundary behavior")
+{
+    CHECK(quantizedHalfWindingTarget(0.0) == 0.0);
+    CHECK(quantizedHalfWindingTarget(std::numeric_limits<double>::denorm_min()) ==
+        0.5);
+    CHECK(quantizedHalfWindingTarget(1.0) == 0.5);
+    CHECK(quantizedHalfWindingTarget(
+              std::nextafter(1.0, std::numeric_limits<double>::infinity())) ==
+        1.5);
+    CHECK(quantizedHalfWindingTarget(2.0) == 1.5);
+    CHECK(quantizedHalfWindingTarget(-2.0) == -1.5);
+}
+
+TEST_CASE("Integer winding quantization uses nearest integer boundaries")
+{
+    CHECK(quantizedIntegerWindingTarget(0.0) == 0.0);
+    CHECK(quantizedIntegerWindingTarget(
+              std::nextafter(0.5, 0.0)) == 0.0);
+    CHECK(quantizedIntegerWindingTarget(0.5) == 1.0);
+    CHECK(quantizedIntegerWindingTarget(
+              std::nextafter(1.5, 0.0)) == 1.0);
+    CHECK(quantizedIntegerWindingTarget(1.5) == 2.0);
+    CHECK(quantizedIntegerWindingTarget(-1.5) == -2.0);
+}
+
+TEST_CASE("Canonical constraint counts include every emitted row")
+{
+    FiberTraceCanonicalConstraintCounts counts;
+    CHECK(counts.correct == 0);
+    CHECK(counts.falseCount == 0);
+    CHECK(counts.total == 0);
+
+    counts.add(quantizedHalfWindingTarget(0.51), 0.5);
+    counts.add(quantizedHalfWindingTarget(1.51), 0.5);
+    counts.add(quantizedIntegerWindingTarget(0.49), 0.0);
+    counts.add(quantizedIntegerWindingTarget(0.51), 0.0);
+    counts.add(quantizedIntegerWindingTarget(0.49), 0.0);
+
+    CHECK(counts.correct == 3);
+    CHECK(counts.falseCount == 2);
+    CHECK(counts.total == 5);
+    CHECK(counts.correct + counts.falseCount == counts.total);
 }
 
 TEST_CASE("H/V-aware winding evidence decays by half-integer distance bin")
@@ -200,27 +249,145 @@ TEST_CASE("H/V-aware winding evidence decays by half-integer distance bin")
     const auto solved = solveFiberTraceJointGridWindingBeliefPropagation(
         report, topology(source, report), joint);
 
-    const std::array multipliers{1.0, 0.5, 0.25, 0.125};
-    REQUIRE(solved.factorDiagnostics.size() == multipliers.size());
-    for (std::size_t index = 0; index < multipliers.size(); ++index) {
+    const std::array parallelMultipliers{0.5, 0.25, 0.125, 0.0625};
+    const std::array perpendicularMultipliers{1.0, 0.5, 0.25, 0.125};
+    REQUIRE(solved.factorDiagnostics.size() == parallelMultipliers.size());
+    for (std::size_t index = 0; index < parallelMultipliers.size(); ++index) {
         const auto& diagnostic = solved.factorDiagnostics[index];
         CHECK(diagnostic.parallelScore == 0.25);
         CHECK(diagnostic.perpendicularScore == 0.75);
-        CHECK(diagnostic.windingWeightMultiplier == multipliers[index]);
+        CHECK(diagnostic.parallelWindingWeightMultiplier ==
+            parallelMultipliers[index]);
+        CHECK(diagnostic.perpendicularWindingWeightMultiplier ==
+            perpendicularMultipliers[index]);
         CHECK(diagnostic.effectiveParallelWindingWeight ==
-            doctest::Approx(0.25 * multipliers[index]));
+            doctest::Approx(0.25 * parallelMultipliers[index]));
         CHECK(diagnostic.effectivePerpendicularWindingWeight ==
-            doctest::Approx(0.75 * multipliers[index]));
+            doctest::Approx(0.75 * perpendicularMultipliers[index]));
     }
 
     const auto raw = solveFiberTraceWindingBeliefPropagation(
         report, topology(source, report), config());
-    REQUIRE(raw.factorDiagnostics.size() == multipliers.size());
+    REQUIRE(raw.factorDiagnostics.size() == parallelMultipliers.size());
     for (const auto& diagnostic : raw.factorDiagnostics) {
-        CHECK(diagnostic.windingWeightMultiplier == 1.0);
+        CHECK(diagnostic.parallelWindingWeightMultiplier == 1.0);
+        CHECK(diagnostic.perpendicularWindingWeightMultiplier == 1.0);
         CHECK(diagnostic.effectiveParallelWindingWeight == 0.25);
         CHECK(diagnostic.effectivePerpendicularWindingWeight == 0.75);
     }
+}
+
+TEST_CASE("H/V-aware winding uses unsigned parallel targets and cutoff")
+{
+    const auto source = lines(6);
+    auto report = pieces(source.size());
+    FiberTraceConstraint same;
+    same.pieceA = 0;
+    same.pieceB = 1;
+    same.parallelScore = 1.0;
+    same.perpendicularScore = 0.0;
+    same.windingDistance = 0.2;
+    report.constraints.push_back(same);
+    FiberTraceConstraint separate = same;
+    separate.pieceA = 2;
+    separate.pieceB = 3;
+    separate.windingDistance = 0.6;
+    report.constraints.push_back(separate);
+    addMeasured(report, 4, 5, 0.25, 0.6);
+
+    FiberTraceJointGridWindingConfig unfiltered;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(unfiltered) =
+        config();
+    unfiltered.fixedPhaseMagnitude = 0.5;
+    unfiltered.fixedMeasurementScale = 1.0;
+    unfiltered.mixedUnaryCost = 5.0;
+    unfiltered.stableIterations = 1;
+    const auto all = solveFiberTraceJointGridWindingBeliefPropagation(
+        report, topology(source, report), unfiltered);
+    REQUIRE(all.factorDiagnostics.size() == 3);
+    CHECK(all.factorDiagnostics[0].effectiveParallelWindingDistance == 0.0);
+    CHECK(all.factorDiagnostics[1].effectiveParallelWindingDistance == 1.0);
+    CHECK(all.factorDiagnostics[1].parallelWindingRetained);
+    CHECK(all.factorDiagnostics[1].effectiveParallelWindingWeight == 0.5);
+    CHECK_FALSE(
+        all.factorDiagnostics[1].effectivePerpendicularSignedDelta.has_value());
+    CHECK(all.factorDiagnostics[2].effectiveParallelWindingDistance == 1.0);
+    CHECK(all.factorDiagnostics[2].effectivePerpendicularSignedDelta == 0.5);
+
+    auto filtered = unfiltered;
+    filtered.parallelWindingDistanceCutoff = 0.5;
+    const auto sameOnly = solveFiberTraceJointGridWindingBeliefPropagation(
+        report, topology(source, report), filtered);
+    REQUIRE(sameOnly.factorDiagnostics.size() == 3);
+    CHECK(sameOnly.factorDiagnostics[0].parallelWindingRetained);
+    CHECK(sameOnly.factorDiagnostics[0].effectiveParallelWindingWeight == 1.0);
+    CHECK_FALSE(sameOnly.factorDiagnostics[1].parallelWindingRetained);
+    CHECK(sameOnly.factorDiagnostics[1].effectiveParallelWindingWeight == 0.0);
+    CHECK(sameOnly.factorDiagnostics[1].effectivePerpendicularWindingWeight ==
+        0.0);
+    CHECK_FALSE(sameOnly.factorDiagnostics[2].parallelWindingRetained);
+    CHECK(sameOnly.factorDiagnostics[2].effectiveParallelWindingWeight == 0.0);
+    CHECK(sameOnly.factorDiagnostics[2].effectivePerpendicularWindingWeight ==
+        doctest::Approx(0.75));
+    CHECK(sameOnly.connectedComponents == 3);
+
+    FiberTraceInterleavedWindingConfig alternating;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(alternating) =
+        config();
+    alternating.parallelWindingDistanceCutoff = 0.5;
+    alternating.mixedUnaryCost = 5.0;
+    alternating.maximumCalibrationIterations = 2;
+    const std::vector fixed(
+        source.size(), FiberTraceFixedOrientation::Horizontal);
+    const auto alternatingResult =
+        solveFiberTraceInterleavedWindingBeliefPropagation(
+            report,
+            topology(source, report),
+            orientationBeliefs({
+                {0.99, 0.005, 0.005},
+                {0.99, 0.005, 0.005},
+                {0.99, 0.005, 0.005},
+                {0.99, 0.005, 0.005},
+                {0.99, 0.005, 0.005},
+                {0.99, 0.005, 0.005},
+            }),
+            alternating,
+            {},
+            fixed);
+    REQUIRE(alternatingResult.factorDiagnostics.size() == 3);
+    CHECK(alternatingResult.factorDiagnostics[0].parallelWindingRetained);
+    CHECK_FALSE(
+        alternatingResult.factorDiagnostics[1].parallelWindingRetained);
+    CHECK(alternatingResult.factorDiagnostics[2]
+              .effectivePerpendicularWindingWeight == doctest::Approx(0.75));
+    CHECK(alternatingResult.connectedComponents == 3);
+
+    auto orientationOnlyReport = pieces(2);
+    FiberTraceConstraint orientationOnly;
+    orientationOnly.pieceA = 0;
+    orientationOnly.pieceB = 1;
+    orientationOnly.parallelScore = 0.0;
+    orientationOnly.perpendicularScore = 1.0;
+    orientationOnly.windingDistance = 0.6;
+    orientationOnlyReport.constraints.push_back(orientationOnly);
+    const auto orientationOnlyResult =
+        solveFiberTraceJointGridWindingBeliefPropagation(
+            orientationOnlyReport,
+            topology(lines(2), orientationOnlyReport),
+            filtered);
+    CHECK(orientationOnlyResult.connectedComponents == 1);
+    CHECK(orientationOnlyResult.classAProbability[0] > 0.99);
+    CHECK(orientationOnlyResult.classBProbability[1] > 0.95);
+    CHECK(orientationOnlyResult.windingValid ==
+        std::vector<unsigned char>{1, 1});
+    CHECK(orientationOnlyResult.mapWinding == std::vector<int>{0, 0});
+
+    auto invalid = unfiltered;
+    invalid.parallelWindingDistanceCutoff = 0.0;
+    CHECK_THROWS_AS(
+        solveFiberTraceJointGridWindingBeliefPropagation(
+            report, topology(source, report), invalid),
+        std::invalid_argument);
 }
 
 TEST_CASE("Winding BP fixes an independent crop-central gauge per component")
@@ -267,7 +434,10 @@ TEST_CASE("Winding BP keeps same-trace pieces as linked variables")
     CHECK(solved.mapWinding == std::vector<int>{0, 0, 1});
     CHECK(solved.factors == 2);
     CHECK_FALSE(solved.factorDiagnostics.front().selfEdge);
-    CHECK(solved.factorDiagnostics.front().effectiveSignedDelta == 0.0);
+    CHECK(solved.factorDiagnostics.front().effectiveParallelWindingDistance ==
+        0.0);
+    CHECK(solved.factorDiagnostics.front().effectivePerpendicularSignedDelta ==
+        0.0);
 }
 
 TEST_CASE("Winding BP rejects incomparable aligned-normal gauges")
@@ -346,9 +516,9 @@ TEST_CASE("Interleaved winding calibrates complementary fractional crossings")
     CHECK(solved.measurementScale <= joint.maximumMeasurementScale);
     REQUIRE(solved.factorDiagnostics.size() == 2);
     CHECK(solved.factorDiagnostics[0].canonicalSignedDelta == 0.32);
-    CHECK(solved.factorDiagnostics[0].effectiveSignedDelta == 0.5);
+    CHECK(solved.factorDiagnostics[0].effectivePerpendicularSignedDelta == 0.5);
     CHECK(solved.factorDiagnostics[1].canonicalSignedDelta == 0.48);
-    CHECK(solved.factorDiagnostics[1].effectiveSignedDelta == 0.5);
+    CHECK(solved.factorDiagnostics[1].effectivePerpendicularSignedDelta == 0.5);
 
     REQUIRE_FALSE(progress.empty());
     CHECK(progress.front().phase ==
@@ -556,8 +726,8 @@ TEST_CASE("Joint-grid winding resolves fixed half-step targets")
     CHECK(solved.measurementScale == 1.0);
     CHECK(solved.calibrationGridCells == 1);
     REQUIRE(solved.factorDiagnostics.size() == 2);
-    CHECK(solved.factorDiagnostics[0].effectiveSignedDelta == 0.5);
-    CHECK(solved.factorDiagnostics[1].effectiveSignedDelta == 0.5);
+    CHECK(solved.factorDiagnostics[0].effectivePerpendicularSignedDelta == 0.5);
+    CHECK(solved.factorDiagnostics[1].effectivePerpendicularSignedDelta == 0.5);
     REQUIRE_FALSE(progress.empty());
     CHECK(progress.front().phase == FiberTraceJointGridProgressPhase::Preparing);
     CHECK(progress.back().phase == FiberTraceJointGridProgressPhase::Complete);

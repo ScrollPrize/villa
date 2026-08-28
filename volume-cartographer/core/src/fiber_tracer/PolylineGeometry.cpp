@@ -23,6 +23,18 @@ bool finitePoint(const cv::Vec3d& point)
         std::isfinite(point[2]);
 }
 
+void validateBox(const cv::Vec3d& minimum, const cv::Vec3d& maximum)
+{
+    if (!finitePoint(minimum) || !finitePoint(maximum))
+        throw std::invalid_argument("polyline clipping box must be finite");
+    for (int axis = 0; axis < 3; ++axis) {
+        if (!(maximum[axis] > minimum[axis])) {
+            throw std::invalid_argument(
+                "polyline clipping box must have positive extent");
+        }
+    }
+}
+
 size_t segmentAtArc(const PolylineArcGeometry& geometry, double arc)
 {
     const auto upper = std::upper_bound(
@@ -93,6 +105,98 @@ void visitClippedPolylineArcSegments(
 }
 
 } // namespace
+
+bool pointInHalfOpenBox(
+    const cv::Vec3d& point,
+    const cv::Vec3d& minimum,
+    const cv::Vec3d& maximum)
+{
+    validateBox(minimum, maximum);
+    if (!finitePoint(point))
+        throw std::invalid_argument("polyline clipping point must be finite");
+    for (int axis = 0; axis < 3; ++axis) {
+        if (!(point[axis] >= minimum[axis] && point[axis] < maximum[axis]))
+            return false;
+    }
+    return true;
+}
+
+std::optional<BoxClippedLineSegment> clipLineSegmentToHalfOpenBox(
+    const cv::Vec3d& start,
+    const cv::Vec3d& finish,
+    const cv::Vec3d& minimum,
+    const cv::Vec3d& maximum)
+{
+    validateBox(minimum, maximum);
+    if (!finitePoint(start) || !finitePoint(finish)) {
+        throw std::invalid_argument(
+            "polyline clipping segment endpoints must be finite");
+    }
+    const cv::Vec3d delta = finish - start;
+    double begin = 0.0;
+    double end = 1.0;
+    for (int axis = 0; axis < 3; ++axis) {
+        if (std::abs(delta[axis]) <= kEpsilon) {
+            if (!(start[axis] >= minimum[axis] &&
+                  start[axis] < maximum[axis])) {
+                return std::nullopt;
+            }
+            continue;
+        }
+        double near = (minimum[axis] - start[axis]) / delta[axis];
+        double far = (maximum[axis] - start[axis]) / delta[axis];
+        if (near > far)
+            std::swap(near, far);
+        begin = std::max(begin, near);
+        end = std::min(end, far);
+        if (!(end > begin + kEpsilon))
+            return std::nullopt;
+    }
+    return BoxClippedLineSegment{
+        start + delta * begin,
+        start + delta * end,
+        begin,
+        end,
+    };
+}
+
+std::vector<std::vector<cv::Vec3d>> clipPolylineToHalfOpenBox(
+    const std::vector<cv::Vec3d>& points,
+    const cv::Vec3d& minimum,
+    const cv::Vec3d& maximum)
+{
+    validateBox(minimum, maximum);
+    for (const auto& point : points) {
+        if (!finitePoint(point))
+            throw std::invalid_argument("polyline clipping input must be finite");
+    }
+    std::vector<std::vector<cv::Vec3d>> runs;
+    std::vector<cv::Vec3d> current;
+    const auto finishCurrent = [&] {
+        if (current.size() >= 2)
+            runs.push_back(std::move(current));
+        current.clear();
+    };
+    for (std::size_t index = 1; index < points.size(); ++index) {
+        const auto clipped = clipLineSegmentToHalfOpenBox(
+            points[index - 1], points[index], minimum, maximum);
+        if (!clipped) {
+            finishCurrent();
+            continue;
+        }
+        if (current.empty() ||
+            vectorLength(current.back() - clipped->start) > kEpsilon) {
+            finishCurrent();
+            current.push_back(clipped->start);
+        }
+        if (vectorLength(current.back() - clipped->finish) > kEpsilon)
+            current.push_back(clipped->finish);
+        if (!pointInHalfOpenBox(points[index], minimum, maximum))
+            finishCurrent();
+    }
+    finishCurrent();
+    return runs;
+}
 
 double segmentAabbDistanceSquared(
     const cv::Vec3d& start,

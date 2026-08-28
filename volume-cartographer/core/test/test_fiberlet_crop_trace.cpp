@@ -1393,6 +1393,94 @@ TEST_CASE("Trace constraints distinguish parallel and perpendicular neighbors de
     }
 }
 
+TEST_CASE("Reference constraint selection keeps measured cross-source links")
+{
+    FiberletCropTraceLine firstRun;
+    firstRun.pointsBaseXYZ = {{0, 0, 0}, {256, 0, 0}};
+    FiberletCropTraceLine secondRunSameSource;
+    secondRunSameSource.pointsBaseXYZ = {{0, 8, 0}, {256, 8, 0}};
+    FiberletCropTraceLine differentSource;
+    differentSource.pointsBaseXYZ = {{0, 16, 0}, {256, 16, 0}};
+    FiberletCropTraceLine multiPiece;
+    multiPiece.pointsBaseXYZ = {{0, 1000, 0}, {1000, 1000, 0}};
+
+    FiberTraceConstraintConfig config;
+    config.maximumDistanceBaseVoxels = 20.0;
+    config.parallelThreads = 4;
+    std::size_t batchCalls = 0;
+    std::size_t batchedConnectors = 0;
+    const auto report = extractFiberTraceConstraints(
+        {firstRun, secondRunSameSource, differentSource, multiPiece},
+        config,
+        {},
+        [&](const std::vector<std::pair<cv::Vec3d, cv::Vec3d>>& connectors,
+            double,
+            int) {
+            ++batchCalls;
+            batchedConnectors += connectors.size();
+            std::vector<double> windings;
+            windings.reserve(connectors.size());
+            for (const auto& [a, b] : connectors)
+                windings.push_back(cv::norm(a - b) * 0.01);
+            return windings;
+        });
+
+    CHECK(batchCalls == 1);
+    CHECK(batchedConnectors == 3);
+    CHECK(report.inputTraces == 4);
+    CHECK(report.hardConstraints == 2);
+    REQUIRE(report.constraints.size() == 5);
+
+    const std::vector<std::size_t> sourceIds{0, 0, 1, 2};
+    const auto ordered = orderMeasuredCrossSourceFiberTraceConstraints(
+        report, sourceIds);
+    REQUIRE(ordered.size() == 2);
+    CHECK(ordered[0].constraintIndex < ordered[1].constraintIndex);
+    for (const auto& link : ordered) {
+        const auto& constraint = report.constraints[link.constraintIndex];
+        CHECK_FALSE(constraint.hardContinuity);
+        const std::size_t traceA = report.pieces[constraint.pieceA].traceIndex;
+        const std::size_t traceB = report.pieces[constraint.pieceB].traceIndex;
+        CHECK(sourceIds[traceA] != sourceIds[traceB]);
+        CHECK(link.ownerSource < link.targetSource);
+        CHECK(link.ownerSource == std::min(sourceIds[traceA], sourceIds[traceB]));
+        CHECK(link.targetSource == std::max(sourceIds[traceA], sourceIds[traceB]));
+        CHECK_FALSE(link.perpendicularDominant);
+        CHECK(constraint.parallelScore == doctest::Approx(1.0));
+        CHECK(constraint.perpendicularScore == doctest::Approx(0.0));
+        CHECK(constraint.windingDistance > 0.0);
+    }
+
+    CHECK(orderMeasuredCrossSourceFiberTraceConstraints(
+              report, {0, 0, 0, 0})
+              .empty());
+    const auto gapped = orderMeasuredCrossSourceFiberTraceConstraints(
+        report, {0, 0, 2, 4});
+    REQUIRE(gapped.size() == 2);
+    for (const auto& link : gapped) {
+        CHECK(link.ownerSource == 0);
+        CHECK(link.targetSource == 2);
+        CHECK(0.5 * static_cast<double>(
+                        link.targetSource - link.ownerSource) == 1.0);
+    }
+    CHECK_THROWS_WITH_AS(
+        orderMeasuredCrossSourceFiberTraceConstraints(report, {0, 1}),
+        doctest::Contains("source IDs do not match input traces"),
+        std::invalid_argument);
+
+    auto reversedTie = report;
+    auto& constraint = reversedTie.constraints[ordered.front().constraintIndex];
+    std::swap(constraint.pieceA, constraint.pieceB);
+    constraint.parallelScore = 0.5;
+    constraint.perpendicularScore = 0.5;
+    const auto reordered = orderMeasuredCrossSourceFiberTraceConstraints(
+        reversedTie, sourceIds);
+    REQUIRE(reordered.size() == ordered.size());
+    CHECK(reordered.front().ownerSource == ordered.front().ownerSource);
+    CHECK(reordered.front().targetSource == ordered.front().targetSource);
+    CHECK(reordered.front().perpendicularDominant);
+}
+
 TEST_CASE("Trace constraint R-tree cube hits still require Euclidean radius")
 {
     FiberletCropTraceLine first;

@@ -5,16 +5,22 @@ import pytest
 import vesuvius.scripts.view_fiber_windings as viewer_module
 from vesuvius.scripts.ordered_polyline_obj import read_ordered_polyline_obj
 from vesuvius.scripts.view_fiber_windings import (
+    ReferenceGeometry,
     WindingArtifact,
     WindingGeometry,
     WindingLayerKey,
+    add_reference_layer,
     add_winding_layers,
-    advance_winding,
     build_parser,
+    discover_reference_artifact,
     discover_winding_artifacts,
+    load_reference_geometry,
     navigable_windings,
     nonempty_layer_keys,
+    read_reference_artifact,
     read_winding_artifact,
+    rotate_visible_winding_mask,
+    rotate_winding_layer_visibility,
     visible_winding_layers,
     winding_layer_color,
     winding_layer_colors,
@@ -42,6 +48,12 @@ def _write_state(
 def _write_quartet(base: Path, winding: int, *, h_body: str = "") -> None:
     for state in HEADERS:
         _write_state(base, winding, state, h_body if state == "h" else "")
+
+
+def _write_reference(base: Path, body: str) -> Path:
+    path = base.parent / f"{base.name}_reference.obj"
+    path.write_text(f"# VC3D tagged reference fibers\n{body}")
+    return path
 
 
 def test_shared_obj_reader_reconstructs_global_indexed_objects_and_singleton(tmp_path):
@@ -175,20 +187,70 @@ def test_winding_reader_rejects_wrong_header_and_singleton(tmp_path):
         read_winding_artifact(WindingArtifact(WindingLayerKey(0, "h"), point))
 
 
-def test_winding_colors_are_stable_distinct_bright_and_opaque():
+def test_reference_artifact_is_optional_and_converts_xyz_to_zyx(tmp_path):
+    base = tmp_path / "fibers"
+    assert discover_reference_artifact(base) is None
+    assert load_reference_geometry(base) is None
+
+    path = _write_reference(
+        base,
+        "o reference_0_a\n"
+        "v 1 2 3\n"
+        "v 4 5 6\n"
+        "l 1 2\n",
+    )
+    assert discover_reference_artifact(base) == path
+    loaded = read_reference_artifact(path)
+    assert loaded.path == path
+    assert loaded.paths_zyx[0].dtype == np.float32
+    np.testing.assert_array_equal(loaded.paths_zyx[0], [[3, 2, 1], [6, 5, 4]])
+    reloaded = load_reference_geometry(base)
+    assert reloaded is not None
+    assert reloaded.path == loaded.path
+    np.testing.assert_array_equal(reloaded.paths_zyx[0], loaded.paths_zyx[0])
+
+
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [
+        ("# wrong\n", "tagged reference-fiber header"),
+        ("# VC3D tagged reference fibers\n", "artifact is empty"),
+        (
+            "# VC3D tagged reference fibers\n"
+            + "o one\nv 0 0 0\nv 1 0 0\nl 1 2\n"
+            + "o one\nv 2 0 0\nv 3 0 0\nl 3 4\n",
+            "duplicate container",
+        ),
+    ],
+)
+def test_reference_artifact_rejects_malformed_present_output(
+    tmp_path, content, message
+):
+    path = tmp_path / "fibers_reference.obj"
+    path.write_text(content)
+    with pytest.raises(ValueError, match=message):
+        read_reference_artifact(path)
+
+
+def test_winding_colors_are_stable_shared_for_hv_bright_and_opaque():
     keys = [
         WindingLayerKey(winding, state)
         for winding in range(20)
         for state in ("h", "v", "err", "tie")
     ]
     colors = [winding_layer_color(key) for key in keys]
-    assert len(set(colors)) == len(colors)
     for color in colors:
         assert color[3] == 1.0
         assert max(color[:3]) == 1.0
         assert min(color[:3]) >= 0.27
     assert winding_layer_color(WindingLayerKey(7, "h")) == winding_layer_color(
+        WindingLayerKey(7, "v")
+    )
+    assert winding_layer_color(WindingLayerKey(7, "err")) != winding_layer_color(
         WindingLayerKey(7, "h")
+    )
+    assert winding_layer_color(WindingLayerKey(7, "tie")) != winding_layer_color(
+        WindingLayerKey(7, "err")
     )
 
 
@@ -201,7 +263,7 @@ def test_winding_layer_colors_are_explicit_per_shape_rgba_arrays():
     np.testing.assert_allclose(colors[0], winding_layer_color(key))
 
 
-def test_add_winding_layers_passes_napari_per_shape_color_array(tmp_path):
+def test_add_winding_layers_passes_identical_hv_per_shape_colors(tmp_path):
     class FakeViewer:
         def __init__(self):
             self.calls = []
@@ -218,19 +280,57 @@ def test_add_winding_layers_passes_napari_per_shape_color_array(tmp_path):
     geometry = (
         WindingGeometry(WindingArtifact(key, tmp_path / "v.obj"), paths),
         WindingGeometry(
-            WindingArtifact(WindingLayerKey(2, "h"), tmp_path / "h.obj"), ()
+            WindingArtifact(WindingLayerKey(2, "h"), tmp_path / "h.obj"),
+            (np.full((2, 3), 2.0, dtype=np.float32),),
         ),
     )
     viewer = FakeViewer()
     layers, fiber_count = add_winding_layers(viewer, geometry, 3.0)
-    assert tuple(layers) == (key,)
-    assert fiber_count == 2
-    assert len(viewer.calls) == 1
+    assert tuple(layers) == (key, WindingLayerKey(2, "h"))
+    assert fiber_count == 3
+    assert len(viewer.calls) == 2
     data, kwargs = viewer.calls[0]
     assert len(data) == 2
     assert kwargs["edge_color"].shape == (2, 4)
     assert kwargs["edge_color"].dtype == np.float32
     assert kwargs["edge_width"] == 3.0
+    np.testing.assert_array_equal(
+        viewer.calls[0][1]["edge_color"][0],
+        viewer.calls[1][1]["edge_color"][0],
+    )
+
+
+def test_reference_layer_is_independent_bright_and_visible(tmp_path):
+    class FakeLayer:
+        visible = True
+
+    class FakeViewer:
+        def __init__(self):
+            self.calls = []
+
+        def add_shapes(self, data, **kwargs):
+            self.calls.append((data, kwargs))
+            return FakeLayer()
+
+    geometry = ReferenceGeometry(
+        tmp_path / "fibers_reference.obj",
+        (np.zeros((2, 3), dtype=np.float32),),
+    )
+    viewer = FakeViewer()
+    reference_layer = add_reference_layer(viewer, geometry, 4.0)
+    assert reference_layer.visible
+    assert len(viewer.calls) == 1
+    _, kwargs = viewer.calls[0]
+    assert kwargs["name"] == "Reference fibers"
+    assert kwargs["visible"] is True
+    assert kwargs["edge_width"] == 4.0
+    assert kwargs["edge_color"].shape == (1, 4)
+    assert np.max(kwargs["edge_color"][0, :3]) == 1.0
+
+    keys = (WindingLayerKey(0, "h"), WindingLayerKey(0, "v"))
+    assert visible_winding_layers(keys, "none") == set()
+    assert reference_layer.visible
+    assert add_reference_layer(viewer, None, 4.0) is None
 
 
 def test_visibility_presets_and_winding_navigation_group_ties_as_broken():
@@ -258,9 +358,107 @@ def test_visibility_presets_and_winding_navigation_group_ties_as_broken():
     }
     assert visible_winding_layers(keys, "all") == set(keys)
     assert visible_winding_layers(keys, "none") == set()
-    assert advance_winding((2, 10), 2, 1) == 10
-    assert advance_winding((2, 10), 10, 1) == 2
-    assert advance_winding((2, 10), 2, -1) == 10
+
+
+def test_winding_visibility_rotation_preserves_arbitrary_mask_and_state():
+    keys = tuple(
+        WindingLayerKey(winding, state)
+        for winding in range(2, 7)
+        for state in ("h", "v", "err", "tie")
+    )
+    visible = {
+        WindingLayerKey(3, "h"),
+        WindingLayerKey(5, "v"),
+        WindingLayerKey(5, "h"),
+        WindingLayerKey(6, "h"),
+        WindingLayerKey(4, "err"),
+    }
+    assert rotate_visible_winding_mask(keys, visible, -1) == {
+        WindingLayerKey(2, "h"),
+        WindingLayerKey(4, "v"),
+        WindingLayerKey(4, "h"),
+        WindingLayerKey(5, "h"),
+        WindingLayerKey(3, "err"),
+    }
+
+
+def test_winding_visibility_rotation_wraps_and_handles_sparse_states():
+    keys = (
+        WindingLayerKey(0, "h"),
+        WindingLayerKey(1, "v"),
+        WindingLayerKey(2, "h"),
+        WindingLayerKey(4, "h"),
+        WindingLayerKey(2, "err"),
+        WindingLayerKey(2, "tie"),
+    )
+    assert rotate_visible_winding_mask(
+        keys,
+        (WindingLayerKey(0, "h"), WindingLayerKey(1, "v")),
+        -1,
+    ) == {WindingLayerKey(4, "h")}
+    assert rotate_visible_winding_mask(
+        keys,
+        (
+            WindingLayerKey(2, "h"),
+            WindingLayerKey(2, "err"),
+        ),
+        1,
+    ) == {WindingLayerKey(4, "h")}
+    assert rotate_visible_winding_mask(
+        keys, (WindingLayerKey(4, "h"),), 1
+    ) == {WindingLayerKey(0, "h")}
+    one_winding = (
+        WindingLayerKey(7, "h"),
+        WindingLayerKey(7, "err"),
+    )
+    assert rotate_visible_winding_mask(
+        one_winding, (WindingLayerKey(7, "err"),), 1
+    ) == {WindingLayerKey(7, "err")}
+
+
+def test_winding_visibility_rotation_moves_an_empty_winding_with_wrap():
+    keys = tuple(
+        WindingLayerKey(winding, state)
+        for winding in (0, 1, 2, 3)
+        for state in ("h", "v", "err", "tie")
+    )
+    visible = {key for key in keys if key.winding != 1}
+    rotated = rotate_visible_winding_mask(keys, visible, 1)
+    assert {key for key in keys if key not in rotated} == {
+        key for key in keys if key.winding == 2
+    }
+    restored = rotate_visible_winding_mask(keys, rotated, -1)
+    assert restored == visible
+
+
+def test_layer_visibility_rotation_reads_live_complete_mask_only():
+    class FakeLayer:
+        def __init__(self, visible: bool):
+            self.visible = visible
+
+    layers = {
+        WindingLayerKey(2, "h"): FakeLayer(False),
+        WindingLayerKey(3, "h"): FakeLayer(True),
+        WindingLayerKey(4, "h"): FakeLayer(False),
+        WindingLayerKey(4, "v"): FakeLayer(True),
+        WindingLayerKey(5, "v"): FakeLayer(False),
+        WindingLayerKey(2, "err"): FakeLayer(False),
+        WindingLayerKey(3, "err"): FakeLayer(True),
+        WindingLayerKey(3, "tie"): FakeLayer(False),
+    }
+    unmanaged = FakeLayer(True)
+    rotated = rotate_winding_layer_visibility(layers, -1)
+    assert rotated == {
+        WindingLayerKey(2, "h"),
+        WindingLayerKey(2, "err"),
+    }
+    assert layers[WindingLayerKey(2, "h")].visible
+    assert not layers[WindingLayerKey(3, "h")].visible
+    assert not layers[WindingLayerKey(4, "v")].visible
+    assert layers[WindingLayerKey(2, "err")].visible
+    assert not layers[WindingLayerKey(3, "err")].visible
+    assert not layers[WindingLayerKey(3, "tie")].visible
+    assert unmanaged.visible
 
 
 def test_navigation_uses_only_nonempty_h_or_v_geometry(tmp_path):

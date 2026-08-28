@@ -1655,3 +1655,84 @@ TEST_CASE("replay bounds repeated invalid resets and covers the logical interval
     CHECK(result.failures[2].referenceArcBase == doctest::Approx(8.0));
     CHECK(result.completedReferenceArcBase == doctest::Approx(12.0));
 }
+
+TEST_CASE("half-open box clipping retains crossing closure endpoints")
+{
+    const cv::Vec3d minimum{0.0, 0.0, 0.0};
+    const cv::Vec3d maximum{10.0, 10.0, 10.0};
+    CHECK(vc::fiber_tracer::pointInHalfOpenBox(minimum, minimum, maximum));
+    CHECK_FALSE(vc::fiber_tracer::pointInHalfOpenBox(
+        maximum, minimum, maximum));
+
+    const auto crossing = vc::fiber_tracer::clipLineSegmentToHalfOpenBox(
+        {-5.0, 5.0, 5.0}, {15.0, 5.0, 5.0}, minimum, maximum);
+    REQUIRE(crossing.has_value());
+    CHECK(crossing->start == cv::Vec3d{0.0, 5.0, 5.0});
+    CHECK(crossing->finish == cv::Vec3d{10.0, 5.0, 5.0});
+    CHECK(crossing->beginFraction == doctest::Approx(0.25));
+    CHECK(crossing->endFraction == doctest::Approx(0.75));
+
+    const auto multiAxis = vc::fiber_tracer::clipLineSegmentToHalfOpenBox(
+        {5.0, 5.0, 5.0}, {15.0, 25.0, 5.0}, minimum, maximum);
+    REQUIRE(multiAxis.has_value());
+    CHECK(multiAxis->finish[0] == doctest::Approx(7.5));
+    CHECK(multiAxis->finish[1] == doctest::Approx(10.0));
+    CHECK(multiAxis->endFraction == doctest::Approx(0.25));
+
+    CHECK_FALSE(vc::fiber_tracer::clipLineSegmentToHalfOpenBox(
+        {10.0, 1.0, 1.0}, {10.0, 9.0, 1.0}, minimum, maximum));
+    CHECK_FALSE(vc::fiber_tracer::clipLineSegmentToHalfOpenBox(
+        {11.0, 5.0, 5.0}, {10.0, 5.0, 5.0}, minimum, maximum));
+}
+
+TEST_CASE("polyline box clipping preserves ordered exit and re-entry runs")
+{
+    const cv::Vec3d minimum{0.0, 0.0, 0.0};
+    const cv::Vec3d maximum{10.0, 10.0, 10.0};
+    const std::vector<cv::Vec3d> points{
+        {-2.0, 5.0, 5.0},
+        {2.0, 5.0, 5.0},
+        {2.0, 5.0, 5.0},
+        {12.0, 5.0, 5.0},
+        {12.0, 5.0, 5.0},
+        {8.0, 5.0, 5.0},
+        {-2.0, 5.0, 5.0},
+    };
+    const auto runs = vc::fiber_tracer::clipPolylineToHalfOpenBox(
+        points, minimum, maximum);
+    REQUIRE(runs.size() == 2);
+    REQUIRE(runs[0].size() == 3);
+    CHECK(runs[0][0] == cv::Vec3d{0.0, 5.0, 5.0});
+    CHECK(runs[0][1] == cv::Vec3d{2.0, 5.0, 5.0});
+    CHECK(runs[0][2] == cv::Vec3d{10.0, 5.0, 5.0});
+    REQUIRE(runs[1].size() == 3);
+    CHECK(runs[1][0] == cv::Vec3d{10.0, 5.0, 5.0});
+    CHECK(runs[1][1] == cv::Vec3d{8.0, 5.0, 5.0});
+    CHECK(runs[1][2][0] == doctest::Approx(0.0));
+    CHECK(runs[1][2][1] == doctest::Approx(5.0));
+    CHECK(runs[1][2][2] == doctest::Approx(5.0));
+
+    const auto maximumTouch = vc::fiber_tracer::clipPolylineToHalfOpenBox(
+        {{2.0, 5.0, 5.0}, {10.0, 5.0, 5.0}, {3.0, 5.0, 5.0}},
+        minimum,
+        maximum);
+    REQUIRE(maximumTouch.size() == 2);
+    CHECK(maximumTouch[0].front() == cv::Vec3d{2.0, 5.0, 5.0});
+    CHECK(maximumTouch[0].back() == cv::Vec3d{10.0, 5.0, 5.0});
+    CHECK(maximumTouch[1].front() == cv::Vec3d{10.0, 5.0, 5.0});
+    CHECK(maximumTouch[1].back() == cv::Vec3d{3.0, 5.0, 5.0});
+
+    const auto minimumTouch = vc::fiber_tracer::clipPolylineToHalfOpenBox(
+        {{2.0, 5.0, 5.0}, {0.0, 5.0, 5.0}, {3.0, 5.0, 5.0}},
+        minimum,
+        maximum);
+    REQUIRE(minimumTouch.size() == 1);
+    REQUIRE(minimumTouch[0].size() == 3);
+    CHECK(minimumTouch[0][1] == cv::Vec3d{0.0, 5.0, 5.0});
+
+    CHECK(vc::fiber_tracer::clipPolylineToHalfOpenBox(
+              {{10.0, 1.0, 1.0}, {10.0, 9.0, 1.0}},
+              minimum,
+              maximum)
+              .empty());
+}

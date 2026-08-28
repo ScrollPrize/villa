@@ -50,6 +50,31 @@ struct ForwardPolylineArcInterval {
     double endArc = 0.0;
 };
 
+struct BoxClippedLineSegment {
+    cv::Vec3d start{0.0, 0.0, 0.0};
+    cv::Vec3d finish{0.0, 0.0, 0.0};
+    double beginFraction = 0.0;
+    double endFraction = 1.0;
+};
+
+[[nodiscard]] bool pointInHalfOpenBox(
+    const cv::Vec3d& point,
+    const cv::Vec3d& minimum,
+    const cv::Vec3d& maximum);
+
+[[nodiscard]] std::optional<BoxClippedLineSegment>
+clipLineSegmentToHalfOpenBox(
+    const cv::Vec3d& start,
+    const cv::Vec3d& finish,
+    const cv::Vec3d& minimum,
+    const cv::Vec3d& maximum);
+
+[[nodiscard]] std::vector<std::vector<cv::Vec3d>>
+clipPolylineToHalfOpenBox(
+    const std::vector<cv::Vec3d>& points,
+    const cv::Vec3d& minimum,
+    const cv::Vec3d& maximum);
+
 [[nodiscard]] double segmentAabbDistanceSquared(
     const cv::Vec3d& start,
     const cv::Vec3d& end,

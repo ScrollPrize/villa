@@ -168,3 +168,17 @@
 - Added two-stage interleaved-lattice crop winding BP with aligned signed
   Lasagna evidence, soft V/Mixed/H priors, bounded phase/scale calibration,
   and per-winding OBJ/CSV diagnostics.
+
+## 2026-08-28
+
+- Added exact-tag selection of VC3D fiber JSON stacks to crop winding
+  diagnostics, crop-bounded ordered-run export to a dedicated reference OBJ
+  sibling, and automatic independent reference-layer loading in the Napari
+  winding viewer.
+- Added canonical constraint extraction diagnostics for cropped tagged
+  reference fibers, presented once as compact per-source
+  perpendicular/parallel tables against filename-ordered virtual half-winding
+  ground truth while excluding hard and same-source links.
+- Corrected H/V-aware winding factors to use unsigned integer parallel
+  distances and signed half-integer perpendicular targets, and added an
+  optional solve-only cutoff for distant parallel winding evidence.
