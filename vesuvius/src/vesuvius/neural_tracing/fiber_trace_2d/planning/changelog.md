@@ -1629,3 +1629,20 @@
   unary and exposed both costs with unambiguous diagnostics.
 - Added fixed-prepass H/V/Defect OBJ layers alongside the existing final
   winding classification.
+
+## 2026-08-28 - BP constraint-class cohort diagnostics
+
+- Added central/non-central admitted winding evidence tables split into
+  continuity, perpendicular-value, perpendicular-sign, parallel-same, and
+  parallel-other terms.
+- Reported endpoint incidence and finite coefficient density by final state,
+  with hard signed-order incidence kept separate from the finite
+  perpendicular-value coefficient, before each reference benchmark.
+
+## 2026-08-28 - Split-piece Defect boundary cost
+
+- Added `--piece-break-cost` to both Defect-capable winding BP solvers to
+  penalize active/Defect transitions between consecutive pieces of one trace.
+- Kept the default at zero and recorded the selected value in console and CSV
+  diagnostics. A 512-voxel-piece sweep showed that strong costs reduce local
+  breaks but can disable complete runs, so no nonzero default was selected.

@@ -1,7 +1,7 @@
-# Task: report central versus non-central BP states
+# Task: penalize split-piece Defect boundaries
 
-Keep the retained constraint-scaled Mixed/Defect costs and add a compact
-central versus non-central final-state table immediately before the deferred
-reference-to-BP benchmark output. The table must report pieces, H/V active
-pieces, Defect pieces, and Defect percentage so cost tuning can be evaluated
-directly from each run.
+Add a configurable `piece_break_cost` to winding BP. Charge it exactly once
+when consecutive pieces from the same original trace have different activity
+states: one is active H/V and the other is Defect. Do not charge active-active
+or Defect-Defect pairs. Run the established 512-piece benchmark and compare
+the positional Defect collapse against the zero-cost baseline.

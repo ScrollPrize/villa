@@ -159,6 +159,136 @@ TEST_CASE("Final winding state summary separates a stable selected cohort")
         std::invalid_argument);
 }
 
+TEST_CASE("Constraint evidence summary separates cohorts classes and final states")
+{
+    auto report = pieces(3);
+    FiberTraceConstraint continuity;
+    continuity.pieceA = 0;
+    continuity.pieceB = 1;
+    continuity.parallelScore = 1.0;
+    continuity.perpendicularScore = 0.0;
+    continuity.hardContinuity = true;
+    report.constraints.push_back(continuity);
+    addMeasured(report, 0, 2, 0.25, 0.5);
+    addMeasured(report, 1, 2, 0.4, 1.5);
+    addMeasured(report, 0, 1, 1.0, 0.0);
+
+    const auto diagnostic = [](
+        std::size_t constraint,
+        std::size_t a,
+        std::size_t b) {
+        FiberTraceWindingFactorDiagnostic result;
+        result.constraintIndex = constraint;
+        result.pieceA = a;
+        result.pieceB = b;
+        return result;
+    };
+    std::vector<FiberTraceWindingFactorDiagnostic> diagnostics;
+    auto hard = diagnostic(0, 0, 1);
+    hard.parallelScore = 1.0;
+    hard.parallelWindingRetained = true;
+    hard.effectiveParallelWindingWeight = 1.0;
+    diagnostics.push_back(hard);
+
+    auto both = diagnostic(1, 0, 2);
+    both.parallelScore = 0.25;
+    both.perpendicularScore = 0.75;
+    both.parallelWindingRetained = true;
+    both.effectiveParallelWindingWeight = 0.25;
+    both.effectivePerpendicularWindingWeight = 0.75;
+    both.effectivePerpendicularSignedDelta = 0.5;
+    diagnostics.push_back(both);
+
+    auto other = diagnostic(2, 1, 2);
+    other.parallelScore = 0.4;
+    other.perpendicularScore = 0.6;
+    other.parallelWindingRetained = true;
+    other.effectiveParallelWindingWeight = 0.4;
+    other.effectivePerpendicularWindingWeight = 0.2;
+    other.effectiveParallelWindingDistance = 2.0;
+    other.effectivePerpendicularSignedDelta = 1.5;
+    diagnostics.push_back(other);
+
+    auto suppressed = diagnostic(3, 0, 1);
+    suppressed.parallelScore = 1.0;
+    suppressed.parallelWindingRetained = false;
+    diagnostics.push_back(suppressed);
+
+    const std::vector orientations{
+        FiberTraceFixedOrientation::Horizontal,
+        FiberTraceFixedOrientation::Vertical,
+        FiberTraceFixedOrientation::Mixed,
+    };
+    const std::vector<unsigned char> valid{1, 1, 1};
+    const std::vector<unsigned char> selected{1, 0, 1};
+    const auto summary = summarizeFiberTraceConstraintEvidence(
+        report, diagnostics, orientations, valid, selected);
+    using Class = FiberTraceConstraintEvidenceClass;
+    const auto& selectedContinuity =
+        summary.selected.classes[static_cast<std::size_t>(Class::Continuity)];
+    CHECK(selectedContinuity.incidences == 1);
+    CHECK(selectedContinuity.activeIncidences == 1);
+    CHECK(selectedContinuity.effectiveWeight == doctest::Approx(1.0));
+    const auto& otherContinuity =
+        summary.other.classes[static_cast<std::size_t>(Class::Continuity)];
+    CHECK(otherContinuity.incidences == 1);
+    CHECK(otherContinuity.activeIncidences == 1);
+
+    const auto& selectedPerpendicular =
+        summary.selected.classes[static_cast<std::size_t>(Class::Perpendicular)];
+    CHECK(selectedPerpendicular.incidences == 3);
+    CHECK(selectedPerpendicular.activeIncidences == 1);
+    CHECK(selectedPerpendicular.defectIncidences == 2);
+    CHECK(selectedPerpendicular.effectiveWeight == doctest::Approx(1.7));
+    CHECK(selectedPerpendicular.activeEffectiveWeight == doctest::Approx(0.75));
+    CHECK(selectedPerpendicular.defectEffectiveWeight == doctest::Approx(0.95));
+    CHECK(selectedPerpendicular.hardSignIncidences == 3);
+    CHECK(selectedPerpendicular.activeHardSignIncidences == 1);
+    CHECK(selectedPerpendicular.defectHardSignIncidences == 2);
+    const auto& otherPerpendicular =
+        summary.other.classes[static_cast<std::size_t>(Class::Perpendicular)];
+    CHECK(otherPerpendicular.incidences == 1);
+    CHECK(otherPerpendicular.effectiveWeight == doctest::Approx(0.2));
+    CHECK(otherPerpendicular.hardSignIncidences == 1);
+
+    const auto& selectedSame = summary.selected.classes[
+        static_cast<std::size_t>(Class::ParallelSameWinding)];
+    CHECK(selectedSame.incidences == 2);
+    CHECK(selectedSame.effectiveWeight == doctest::Approx(0.5));
+    CHECK(selectedSame.activeEffectiveWeight == doctest::Approx(0.25));
+    CHECK(selectedSame.defectEffectiveWeight == doctest::Approx(0.25));
+    const auto& selectedOther = summary.selected.classes[
+        static_cast<std::size_t>(Class::ParallelOtherWinding)];
+    CHECK(selectedOther.incidences == 1);
+    CHECK(selectedOther.defectIncidences == 1);
+    CHECK(selectedOther.effectiveWeight == doctest::Approx(0.4));
+    const auto& otherOther = summary.other.classes[
+        static_cast<std::size_t>(Class::ParallelOtherWinding)];
+    CHECK(otherOther.incidences == 1);
+    CHECK(otherOther.activeIncidences == 1);
+    CHECK(otherOther.effectiveWeight == doctest::Approx(0.4));
+
+    CHECK(summary.selected.states.pieces == 2);
+    CHECK(summary.selected.states.active() == 1);
+    CHECK(summary.selected.states.defect == 1);
+    CHECK(summary.other.states.pieces == 1);
+    CHECK(summary.other.states.active() == 1);
+    CHECK(summary.selected.total.incidences == 4);
+    CHECK(summary.other.total.incidences == 2);
+    CHECK(summary.total.total.incidences ==
+          summary.selected.total.incidences + summary.other.total.incidences);
+    CHECK(summary.total.total.effectiveWeight == doctest::Approx(
+          summary.selected.total.effectiveWeight +
+          summary.other.total.effectiveWeight));
+
+    auto mismatched = diagnostics;
+    mismatched.front().pieceB = 2;
+    CHECK_THROWS_AS(
+        summarizeFiberTraceConstraintEvidence(
+            report, mismatched, orientations, valid, selected),
+        std::invalid_argument);
+}
+
 TEST_CASE("Largest winding component uses effective factors and deterministic ties")
 {
     const auto source = lines(5);
@@ -1535,6 +1665,141 @@ TEST_CASE("Interleaved winding retains calibration when signed evidence is absen
     CHECK(solved.classAProbability[1] > 0.8);
     CHECK(solved.measurementScale == doctest::Approx(1.0));
     CHECK(solved.rankDeficientUpdates > 0);
+}
+
+TEST_CASE("Joint-grid piece break cost applies once to continuity boundaries")
+{
+    const auto source = lines(1);
+    FiberTraceConstraintReport report;
+    report.inputTraces = 1;
+    report.pieces = {
+        {0, 0, 0.0, 3.0},
+        {0, 1, 3.0, 6.0},
+    };
+    FiberTraceConstraint continuity;
+    continuity.pieceA = 0;
+    continuity.pieceB = 1;
+    continuity.arcABaseVoxels = 3.0;
+    continuity.arcBBaseVoxels = 3.0;
+    continuity.pointABaseXYZ = {0.0, 0.0, 0.0};
+    continuity.pointBBaseXYZ = continuity.pointABaseXYZ;
+    continuity.parallelScore = 1.0;
+    continuity.hardContinuity = true;
+    continuity.signedWindingDelta = 0.0;
+    report.constraints.push_back(continuity);
+
+    FiberTraceJointGridWindingConfig config;
+    config.fixedPhaseMagnitude = 0.5;
+    config.fixedMeasurementScale = 1.0;
+    config.mixedUnaryCost = 0.0;
+    config.pieceBreakCost = 0.0;
+    config.messageDamping = 1.0;
+    config.maximumMessageIterations = 1000;
+    const auto baseline = solveFiberTraceJointGridWindingBeliefPropagation(
+        report, topology(source, report), config);
+    REQUIRE(baseline.windingValid.size() == 2);
+
+    config.pieceBreakCost = 3.0;
+    const auto penalized = solveFiberTraceJointGridWindingBeliefPropagation(
+        report, topology(source, report), config);
+    CHECK(penalized.pieceBreakCost == doctest::Approx(3.0));
+    CHECK(penalized.mixedProbability[1] < baseline.mixedProbability[1]);
+}
+
+TEST_CASE("Alternating piece break cost uses orientation temperature")
+{
+    const auto source = lines(1);
+    FiberTraceConstraintReport report;
+    report.inputTraces = 1;
+    report.pieces = {
+        {0, 0, 0.0, 3.0},
+        {0, 1, 3.0, 6.0},
+    };
+    FiberTraceConstraint continuity;
+    continuity.pieceA = 0;
+    continuity.pieceB = 1;
+    continuity.arcABaseVoxels = 3.0;
+    continuity.arcBBaseVoxels = 3.0;
+    continuity.pointABaseXYZ = {0.0, 0.0, 0.0};
+    continuity.pointBBaseXYZ = continuity.pointABaseXYZ;
+    continuity.parallelScore = 1.0;
+    continuity.hardContinuity = true;
+    continuity.signedWindingDelta = 0.0;
+    report.constraints.push_back(continuity);
+
+    FiberTraceInterleavedWindingConfig config;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(config) =
+        ::config();
+    config.mixedUnaryCost = 0.0;
+    config.orientationTemperature = 0.5;
+    const auto beliefs = orientationBeliefs({
+        {0.999, 0.0005, 0.0005},
+        {0.0005, 0.999, 0.0005},
+    });
+    config.pieceBreakCost = 0.0;
+    const auto baseline = solveFiberTraceInterleavedWindingBeliefPropagation(
+        report,
+        topology(source, report),
+        beliefs,
+        config);
+    REQUIRE(baseline.windingValid.size() == 2);
+    REQUIRE(baseline.windingValid[0] != baseline.windingValid[1]);
+
+    config.pieceBreakCost = 20.0;
+    const auto penalized = solveFiberTraceInterleavedWindingBeliefPropagation(
+        report,
+        topology(source, report),
+        beliefs,
+        config);
+    CHECK(penalized.pieceBreakCost == doctest::Approx(20.0));
+    CHECK(penalized.windingValid[0] == penalized.windingValid[1]);
+
+    config.orientationTemperature = 1.0;
+    config.pieceBreakCost = 40.0;
+    const auto sameNormalizedPenalty =
+        solveFiberTraceInterleavedWindingBeliefPropagation(
+            report,
+            topology(source, report),
+            beliefs,
+            config);
+    CHECK(sameNormalizedPenalty.windingValid == penalized.windingValid);
+    CHECK(sameNormalizedPenalty.classAProbability ==
+        penalized.classAProbability);
+    CHECK(sameNormalizedPenalty.mixedProbability ==
+        penalized.mixedProbability);
+    CHECK(sameNormalizedPenalty.classBProbability ==
+        penalized.classBProbability);
+}
+
+TEST_CASE("Defect-capable winding solvers validate piece break cost")
+{
+    const auto source = lines(2);
+    auto report = pieces(2);
+    addMeasured(report, 0, 1, 0.0, 0.5);
+    const auto prepared = topology(source, report);
+
+    FiberTraceJointGridWindingConfig joint;
+    joint.pieceBreakCost = -1.0;
+    CHECK_THROWS_AS(
+        solveFiberTraceJointGridWindingBeliefPropagation(
+            report, prepared, joint),
+        std::invalid_argument);
+
+    FiberTraceInterleavedWindingConfig alternating;
+    static_cast<FiberTraceWindingBeliefPropagationConfig&>(alternating) =
+        config();
+    alternating.pieceBreakCost =
+        std::numeric_limits<double>::quiet_NaN();
+    CHECK_THROWS_AS(
+        solveFiberTraceInterleavedWindingBeliefPropagation(
+            report,
+            prepared,
+            orientationBeliefs({
+                {0.9, 0.05, 0.05},
+                {0.05, 0.05, 0.9},
+            }),
+            alternating),
+        std::invalid_argument);
 }
 
 TEST_CASE("Interleaved winding rejects malformed orientation beliefs")

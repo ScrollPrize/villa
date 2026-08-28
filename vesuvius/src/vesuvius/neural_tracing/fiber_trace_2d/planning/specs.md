@@ -5329,6 +5329,14 @@
   Defect state. Constraints incident to a pre-pass Defect are removed before
   continuous initialization, component/gauge construction, and discrete BP.
   A late Defect assignment makes every incident pair factor neutral.
+- The finite nonnegative `--piece-break-cost` defaults to `0`. On an existing
+  same-trace hard-continuity edge, charge it exactly once when exactly one
+  endpoint is active and the other is Defect. Do not charge active/active,
+  Defect/Defect, or measured cross-trace pairs. Multiple measurements merged
+  into the prepared edge must not multiply the cost. Divide the term by the
+  orientation temperature, like the Defect unary. Apply the same truth table
+  in alternating and joint-grid inference and decoded-energy accounting.
+  Preserve the selected value in the winding summary and consistency CSV.
 - A newly available late-Defect state has log unary
   `-winding_defect_cost * incident_measurements / orientation_temperature`.
   In fixed-prepass mode, incidence counts only retained measurements with an
@@ -5586,6 +5594,28 @@
   pieces and Defect percentage, using `NA` for an empty cohort. Central plus
   non-central must exactly equal the total row. Without reference input, emit
   the same table with the deferred BP diagnostics.
+- Immediately after that state table, print admitted winding evidence for the
+  same central, non-central, and total cohorts. Use the winding solver's
+  authoritative factor diagnostics after fixed-orientation exclusion,
+  quantization, distance-cutoff suppression, and coefficient downweighting.
+  Report a unique admitted-measurement row followed by continuity,
+  perpendicular-value, perpendicular-sign, parallel-same, and parallel-other
+  term rows. The perpendicular-value row reports the finite absolute-distance
+  coefficient. The perpendicular-sign row reports the separate hard ordering
+  restriction and has no finite coefficient.
+  A measured constraint contributes both perpendicular and parallel terms when
+  both finite coefficients are positive, matching the solver rather than a
+  dominant-class approximation. Each endpoint is one incidence: an internal
+  constraint contributes twice to one cohort and a cross-cohort constraint
+  once to each. The measurement row counts a constraint once even when both
+  hypothesis terms are present and therefore matches the degree basis of the
+  Defect unary. Report incidence and coefficient totals, incidence and
+  coefficient per final active and Defect piece. For the sign row, report hard
+  signed-order incidence and incidence per final active and Defect piece.
+  Active and Defect numerators are endpoint-stratified before division. A
+  Defect endpoint neutralizes its realized pair energy, so its reported
+  coefficient is admitted evidence that selecting Defect evades, not realized
+  final energy. The table is descriptive association, not proof of causality.
 - Buffer the reference/reference tables and every reference-to-BP benchmark
   generated across checkpoints and balance modes. Emit them in execution order
   after all ordinary `direction-ablation` summaries and immediately before the

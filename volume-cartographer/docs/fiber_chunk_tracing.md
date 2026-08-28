@@ -925,6 +925,14 @@ same/different orientation factor. A Defect assignment makes every incident
 pair factor neutral, disabling orientation, winding, calibration, and component
 sign evidence. Constraints attached to a pre-pass Defect are also removed from
 the continuous initializer and component graph.
+Use `--piece-break-cost F` to additionally discourage a late Defect boundary
+between consecutive pieces of the same source trace. The nonnegative cost is
+charged once when exactly one side of the existing hard-continuity edge is
+active, and is divided by `--bp-temperature` in the BP log potential. It is not
+charged for active/active or Defect/Defect pairs and never applies to measured
+cross-trace constraints. The default is `0`, preserving prior behavior. Large
+values can replace local Defect gaps with entire disabled runs, so tune this
+separately from the degree-scaled Defect unary.
 The consistency CSV preserves the soft pre-pass `p_v`, `p_mixed`, and `p_h`
 columns and records `winding_prepass_class`, `winding_final_class`, and final
 H/Defect/V probabilities. It writes `winding_valid=0` and `NA` for numeric
@@ -954,7 +962,8 @@ Without fixed orientation, joint-grid uses `--winding-defect-cost` as its only
 Defect unary. Non-fixed alternating uses the orientation BP posterior as its
 orientation prior and does not charge that unary again. The winding summary and
 `winding_defect_cost_per_constraint` CSV column reports the configured winding value
-separately from `bp_mixed_cost_per_constraint`.
+separately from `bp_mixed_cost_per_constraint`. It also reports the configured
+piece-boundary value and stores it as `winding_piece_break_cost`.
 
 The two oriented classes occupy interleaved integer lattices. Local class A is
 at `k`; local class B is at `k + sign*phase`, where `k` is integer, phase is in
@@ -1195,6 +1204,22 @@ post-projection winding result. Mixed and winding-invalid pieces count as
 Defect, and an empty cohort prints `NA` percentage. The table is also emitted for
 BP runs without reference fibers.
 
+`BP admitted winding evidence by source-piece cohort` follows the state table.
+It reports the winding terms that survived preparation for the final solve:
+hard continuity, perpendicular, parallel-same, and parallel-other. A measured
+link can appear in both perpendicular and parallel rows because both weighted
+hypotheses are present in the BP factor. The `measurement` row counts each
+admitted link once and thus matches the degree basis used by the Defect unary.
+`inc` counts endpoint incidences. `act_i/p` and `def_i/p` first separate those
+incidences by final state and then normalize by the corresponding piece count;
+`act_c/p` and `def_c/p` do the same for finite coefficient.
+`hard` counts endpoint incidences with a nonzero signed perpendicular target;
+`def_hard_%` is the percentage of those incidences landing on final Defect
+pieces. The finite coefficient on a Defect endpoint is evidence admitted into
+the prepared problem that Defect can neutralize, not realized final pair
+energy. These statistics identify associations for tuning; they do not alone
+establish which constraint caused a Defect decision.
+
 The filename-ordered reference stack is calibrated separately against every
 independently gauged BP winding subgraph. Each offset is selected by exhaustive
 closed-interval event search to maximize matches within an inclusive `0.5`
@@ -1241,3 +1266,10 @@ empty; their OBJ files are still valid and present. The sibling
 `crop_fibers_quality_histogram.csv` and console table report each bin's count
 and min/mean/max total cost and cost density. Blank numeric CSV fields denote
 an empty bin.
+
+The BP cohort diagnostic separates perpendicular winding evidence into
+`perp_value` and `perp_sign`. `perp_value` is the finite winding-distance
+coefficient. `perp_sign` is the independent hard ordering incidence and has
+`NA` coefficient columns. This distinction matters because a piece can have a
+small finite value residual while no integer winding satisfies all incident
+hard signs.

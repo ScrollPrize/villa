@@ -114,6 +114,7 @@ struct FiberTraceWindingComponentSelection {
 
 struct FiberTraceInterleavedWindingConfig : FiberTraceWindingBeliefPropagationConfig {
     double mixedUnaryCost = 1.0;
+    double pieceBreakCost = 0.0;
     double orientationTemperature = 0.25;
     double minimumMeasurementScale = 0.5;
     double maximumMeasurementScale = 2.0;
@@ -123,6 +124,7 @@ struct FiberTraceInterleavedWindingConfig : FiberTraceWindingBeliefPropagationCo
 
 struct FiberTraceJointGridWindingConfig : FiberTraceWindingBeliefPropagationConfig {
     double mixedUnaryCost = 1.0;
+    double pieceBreakCost = 0.0;
     double orientationTemperature = 0.25;
     std::optional<double> fixedPhaseMagnitude;
     std::optional<double> fixedMeasurementScale;
@@ -221,6 +223,52 @@ struct FiberTraceWindingFactorDiagnostic {
     bool selfEdge = false;
 };
 
+enum class FiberTraceConstraintEvidenceClass : unsigned char {
+    Continuity,
+    Perpendicular,
+    ParallelSameWinding,
+    ParallelOtherWinding,
+    Count,
+};
+
+[[nodiscard]] const char* fiberTraceConstraintEvidenceClassName(
+    FiberTraceConstraintEvidenceClass evidenceClass) noexcept;
+
+struct FiberTraceConstraintEvidenceCounts {
+    std::size_t incidences = 0;
+    std::size_t activeIncidences = 0;
+    std::size_t defectIncidences = 0;
+    std::size_t hardSignIncidences = 0;
+    std::size_t activeHardSignIncidences = 0;
+    std::size_t defectHardSignIncidences = 0;
+    double effectiveWeight = 0.0;
+    double activeEffectiveWeight = 0.0;
+    double defectEffectiveWeight = 0.0;
+};
+
+struct FiberTraceConstraintEvidenceCohort {
+    FiberTraceFinalStateCounts states;
+    std::array<
+        FiberTraceConstraintEvidenceCounts,
+        static_cast<std::size_t>(FiberTraceConstraintEvidenceClass::Count)>
+        classes;
+    FiberTraceConstraintEvidenceCounts total;
+};
+
+struct FiberTraceConstraintEvidenceSummary {
+    FiberTraceConstraintEvidenceCohort selected;
+    FiberTraceConstraintEvidenceCohort other;
+    FiberTraceConstraintEvidenceCohort total;
+};
+
+[[nodiscard]] FiberTraceConstraintEvidenceSummary
+summarizeFiberTraceConstraintEvidence(
+    const FiberTraceConstraintReport& constraints,
+    std::span<const FiberTraceWindingFactorDiagnostic> diagnostics,
+    std::span<const FiberTraceFixedOrientation> orientations,
+    std::span<const unsigned char> windingValid,
+    std::span<const unsigned char> selectedCohort);
+
 struct FiberTraceWindingBeliefPropagationReport {
     std::vector<unsigned char> windingValid;
     std::vector<double> continuousWinding;
@@ -270,6 +318,7 @@ struct FiberTraceInterleavedWindingReport : FiberTraceWindingBeliefPropagationRe
     double phaseMagnitude = 0.0;
     double measurementScale = 1.0;
     double defectUnaryCost = 1.0;
+    double pieceBreakCost = 0.0;
     double calibrationPhaseMean = 0.0;
     double calibrationScaleMean = 1.0;
     double calibrationEntropy = 0.0;

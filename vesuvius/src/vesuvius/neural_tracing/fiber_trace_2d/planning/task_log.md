@@ -1,29 +1,37 @@
-# Task log: report central versus non-central BP states
+# Task log: penalize split-piece Defect boundaries
 
-- The previous comparison was derived from the final consistency output using
-  `source_piece == 1` as the central cohort and every other source-piece index
-  as non-central.
-- Reference diagnostics are intentionally deferred until the end of the CLI
-  run; the new summary must be deferred with the benchmark to appear directly
-  before it.
-- Independent review found final `pieceIndex == 1` is unstable because component
-  subsetting renumbers and may split traces. Preserve the pre-filter cohort bit
-  explicitly. This intentionally matches the earlier ad-hoc comparison; it is
-  named as source-piece 1 in documentation rather than claimed to be a general
-  geometric-center definition.
-- Final-state counting must use the post-projection winding result. Invalid
-  winding counts as Defect even if an orientation enum remains H or V.
-- Added a shared final-state cohort aggregator with exact total invariants and
-  focused coverage for selected/other cohorts, Mixed states, invalid winding,
-  an empty selected cohort, and malformed inputs.
-- Each BP execution now captures its original source-piece-1 mask before main
-  component filtering and remaps the mask using retained old piece indices.
-  With references, its table is concatenated directly before that execution's
-  benchmark; without references it is emitted in deferred BP diagnostics.
-- Release build used `-j 32`. The 1024 default-cost run emitted:
-  central 451 pieces, 24 H, 20 V, 44 active, 407 Defect (0.902); non-central
-  909 pieces, 321 H, 267 V, 588 active, 321 Defect (0.353); total 1,360 pieces,
-  345 H, 287 V, 632 active, 728 Defect (0.535). The following reference
-  benchmark remained 1,082 right and 126 wrong (89.570%).
-- The final display renders the three Defect rates explicitly as `90.24%`,
-  `35.31%`, and `53.53%` rather than decimal fractions.
+## Findings
+
+- Same-trace split boundaries already have one hard-continuity measurement,
+  but any factor with a Defect endpoint is currently neutral. Consequently the
+  existing continuity coefficient does not penalize active-to-Defect borders.
+- The penalty must be attached to the prepared edge rather than its individual
+  measurements so it is charged once per adjacent-piece boundary.
+- Both alternating and joint-grid winding solvers share the prepared edge but
+  use separate pair-potential implementations; both require the same term.
+- Independent review clarified that the activity regularizer must use
+  `orientationTemperature`, must live only on the two Defect-capable configs,
+  and must be printed/stored for reproducibility. The prepared-edge continuity
+  flag must be authoritative and OR-merged rather than inferred from numeric
+  scores.
+
+## Deviations
+
+- None.
+
+## Validation
+
+- Built `vc_fiber_trace_chunk` and `test_fiber_trace_winding_bp` from the
+  existing optimized build tree. All 38 winding-BP test cases pass.
+- Ran the exact 500-fiber, 512-base-voxel-piece reference benchmark with
+  piece-break costs `0`, `1`, `8`, and `32`. The default-zero run reproduced
+  728 Defect pieces, 407/451 central Defects, 520 active/Defect continuity
+  boundaries, and 89.570% reference accuracy.
+- Cost `1` produced 718 Defects, 401/451 central Defects, 510 boundaries, and
+  89.517% accuracy. Cost `8` produced 730 Defects, 389/451 central Defects,
+  463 boundaries, and 89.548% accuracy. Cost `32` produced 834 Defects,
+  367/451 central Defects, 268 boundaries, and 88.940% accuracy.
+- The sweep confirms that the regularizer reduces split-piece transitions but
+  does not by itself solve the central gap: stronger values increasingly turn
+  whole non-central runs into Defect. The feature therefore remains opt-in
+  with a zero default.

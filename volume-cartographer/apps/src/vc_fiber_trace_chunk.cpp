@@ -90,6 +90,7 @@ struct Options {
         vc::fiber_tracer::FiberTraceWindingSolver::JointGrid;
     bool windingFixedOrientation = false;
     double windingDefectCost = 1.0;
+    double pieceBreakCost = 0.0;
     std::optional<double> parallelWindingCutoff;
     vc::fiber_tracer::FiberTraceJointGridWindingConfig jointGrid;
     bool hasBounds = false;
@@ -110,6 +111,7 @@ struct Options {
     bool hasWindingSolverOption = false;
     bool hasWindingOrientationOption = false;
     bool hasWindingDefectCostOption = false;
+    bool hasPieceBreakCostOption = false;
     bool hasParallelWindingCutoffOption = false;
     bool hasJointGridOption = false;
     bool hasAdaptiveGridOption = false;
@@ -224,6 +226,7 @@ void usage(const char* executable)
               << "  --winding-solver MODE     joint-grid or alternating [joint-grid]\n"
               << "  --winding-fixed-orientation  solve H/V/Mixed first, then only winding\n"
               << "  --winding-defect-cost F   winding-stage Defect cost per constraint [1]\n"
+              << "  --piece-break-cost F      same-trace active/Defect boundary cost [0]\n"
               << "  --parallel-winding-cutoff F\n"
               << "                              exclusive parallel integer-distance cutoff [off]\n"
               << "  --winding-fixed-phase F   disable calibration at phase F in [0,0.5]\n"
@@ -563,6 +566,16 @@ Options parse(int argc, char** argv)
             options.hasWindingDefectCostOption = true;
             options.hasAblationOnlyOption = true;
             options.hasConstraintOnlyOption = true;
+        } else if (argument == "--piece-break-cost") {
+            options.pieceBreakCost = number(
+                index, argc, argv, "--piece-break-cost");
+            if (!std::isfinite(options.pieceBreakCost) ||
+                options.pieceBreakCost < 0.0) {
+                fail("--piece-break-cost must be finite and nonnegative");
+            }
+            options.hasPieceBreakCostOption = true;
+            options.hasAblationOnlyOption = true;
+            options.hasConstraintOnlyOption = true;
         } else if (argument == "--parallel-winding-cutoff") {
             options.parallelWindingCutoff = number(
                 index, argc, argv, "--parallel-winding-cutoff");
@@ -830,6 +843,7 @@ Options parse(int argc, char** argv)
         if ((options.hasWindingSolverOption || options.hasJointGridOption ||
              options.hasWindingOrientationOption ||
              options.hasWindingDefectCostOption ||
+             options.hasPieceBreakCostOption ||
              options.hasParallelWindingCutoffOption) &&
             (!options.bpOnly ||
              options.bpInference != vc::fiber_tracer::
@@ -1705,6 +1719,7 @@ void writeAndPrintBpReport(
     if (interleaved) {
         csvOutput << ",winding_latent_mean,winding_phase,winding_scale,"
                      "winding_defect_cost_per_constraint,"
+                     "winding_piece_break_cost,"
                      "winding_component_phase_sign,winding_solver,"
                      "winding_orientation_mode,winding_prepass_class,"
                      "winding_final_class,winding_final_p_h,"
@@ -1787,6 +1802,7 @@ void writeAndPrintBpReport(
             csvOutput << ',' << interleaved->phaseMagnitude
                       << ',' << interleaved->measurementScale
                       << ',' << interleaved->defectUnaryCost
+                      << ',' << interleaved->pieceBreakCost
                       << ',' << interleaved->componentPhaseSign.at(
                              component)
                       << ',' << vc::fiber_tracer::fiberTraceWindingSolverName(
@@ -1862,7 +1878,7 @@ void writeAndPrintBpReport(
         if (interleaved->solver == vc::fiber_tracer::
                 FiberTraceWindingSolver::JointGrid) {
             std::cout
-                << "solver  orientation_mode  calibration_mode  defect_cost_per_constraint  phase_map  phase_mean  scale_map  scale_mean"
+                << "solver  orientation_mode  calibration_mode  defect_cost_per_constraint  piece_break_cost  phase_map  phase_mean  scale_map  scale_mean"
                    "  grid_cells  grid_shifts  entropy  lower_boundary"
                    "  upper_boundary  min_gain  max_gain  converged"
                    "  decoded_energy  hard_sign_projected_defects\n"
@@ -1875,6 +1891,7 @@ void writeAndPrintBpReport(
                        fiberTraceWindingCalibrationModeName(
                            interleaved->calibrationMode)
                 << "  " << interleaved->defectUnaryCost
+                << "  " << interleaved->pieceBreakCost
                 << "  " << interleaved->phaseMagnitude
                 << "  " << interleaved->calibrationPhaseMean
                 << "  " << interleaved->measurementScale
@@ -1892,7 +1909,7 @@ void writeAndPrintBpReport(
                 << "  " << interleaved->hardSignProjectedDefects << '\n';
         } else {
             std::cout
-                << "solver  orientation_mode  defect_cost_per_constraint  phase  scale  calibration_iterations"
+                << "solver  orientation_mode  defect_cost_per_constraint  piece_break_cost  phase  scale  calibration_iterations"
                    "  calibration_converged  initialization"
                    "  rank_deficient_updates  decoded_energy"
                    "  hard_sign_projected_defects\n"
@@ -1902,6 +1919,7 @@ void writeAndPrintBpReport(
                        fiberTraceWindingOrientationModeName(
                            interleaved->orientationMode)
                 << "  " << interleaved->defectUnaryCost
+                << "  " << interleaved->pieceBreakCost
                 << "  " << interleaved->phaseMagnitude << "  "
                 << interleaved->measurementScale << "  "
                 << interleaved->calibrationIterations << "  "
@@ -2899,6 +2917,120 @@ std::string formatBpFinalStateCohorts(
     return output.str();
 }
 
+std::string formatBpConstraintEvidenceCohorts(
+    std::span<const unsigned char> sourcePieceOne,
+    const vc::fiber_tracer::FiberTraceConstraintReport& constraints,
+    const vc::fiber_tracer::FiberTraceInterleavedWindingReport& winding)
+{
+    const auto summary = vc::fiber_tracer::summarizeFiberTraceConstraintEvidence(
+        constraints,
+        winding.factorDiagnostics,
+        winding.mapOrientationByPiece,
+        winding.windingValid,
+        sourcePieceOne);
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << "BP admitted winding evidence by source-piece cohort\n"
+           << std::left
+           << std::setw(13) << "cohort"
+           << std::setw(16) << "class"
+           << std::right
+           << std::setw(9) << "inc"
+           << std::setw(10) << "act_i/p"
+           << std::setw(10) << "def_i/p"
+           << std::setw(11) << "coeff"
+           << std::setw(11) << "act_c/p"
+           << std::setw(11) << "def_c/p" << '\n';
+    const auto ratio = [](
+        double numerator,
+        std::size_t denominator) -> std::optional<double> {
+        if (denominator == 0)
+            return std::nullopt;
+        return numerator / static_cast<double>(denominator);
+    };
+    const auto row = [&] (
+        std::string_view cohortName,
+        std::string_view className,
+        const vc::fiber_tracer::FiberTraceConstraintEvidenceCounts& counts,
+        const vc::fiber_tracer::FiberTraceFinalStateCounts& states,
+        bool hardSignOnly = false) {
+        const auto field = [&output](
+            std::optional<double> value,
+            int width,
+            int precision = 2) {
+            if (!value)
+                output << std::setw(width) << "NA";
+            else
+                output << std::setw(width) << std::fixed
+                       << std::setprecision(precision) << *value;
+        };
+        const std::size_t incidences = hardSignOnly
+            ? counts.hardSignIncidences
+            : counts.incidences;
+        const std::size_t activeIncidences = hardSignOnly
+            ? counts.activeHardSignIncidences
+            : counts.activeIncidences;
+        const std::size_t defectIncidences = hardSignOnly
+            ? counts.defectHardSignIncidences
+            : counts.defectIncidences;
+        output << std::left << std::setw(13) << cohortName
+               << std::setw(16) << className
+               << std::right << std::setw(9) << incidences;
+        field(
+            ratio(
+                static_cast<double>(activeIncidences),
+                states.active()),
+            10);
+        field(
+            ratio(
+                static_cast<double>(defectIncidences),
+                states.defect),
+            10);
+        if (hardSignOnly) {
+            output << std::setw(11) << "NA"
+                   << std::setw(11) << "NA"
+                   << std::setw(11) << "NA";
+        } else {
+            output << std::setw(11) << std::fixed << std::setprecision(2)
+                   << counts.effectiveWeight;
+            field(ratio(counts.activeEffectiveWeight, states.active()), 11);
+            field(ratio(counts.defectEffectiveWeight, states.defect), 11);
+        }
+        output << '\n';
+    };
+    constexpr std::array evidenceClasses{
+        vc::fiber_tracer::FiberTraceConstraintEvidenceClass::Continuity,
+        vc::fiber_tracer::FiberTraceConstraintEvidenceClass::Perpendicular,
+        vc::fiber_tracer::FiberTraceConstraintEvidenceClass::ParallelSameWinding,
+        vc::fiber_tracer::FiberTraceConstraintEvidenceClass::ParallelOtherWinding,
+    };
+    const auto cohort = [&] (
+        std::string_view name,
+        const vc::fiber_tracer::FiberTraceConstraintEvidenceCohort& counts) {
+        row(name, "measurement", counts.total, counts.states);
+        for (const auto evidenceClass : evidenceClasses) {
+            const auto& evidence =
+                counts.classes[static_cast<std::size_t>(evidenceClass)];
+            if (evidenceClass ==
+                vc::fiber_tracer::FiberTraceConstraintEvidenceClass::Perpendicular) {
+                row(name, "perp_value", evidence, counts.states);
+                row(name, "perp_sign", evidence, counts.states, true);
+                continue;
+            }
+            row(
+                name,
+                vc::fiber_tracer::fiberTraceConstraintEvidenceClassName(
+                    evidenceClass),
+                evidence,
+                counts.states);
+        }
+    };
+    cohort("central", summary.selected);
+    cohort("non-central", summary.other);
+    cohort("total", summary.total);
+    return output.str();
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -3360,6 +3492,7 @@ int main(int argc, char** argv)
                                     FiberTraceWindingBeliefPropagationConfig&>(joint) =
                                         windingConfig;
                                 joint.mixedUnaryCost = options.windingDefectCost;
+                                joint.pieceBreakCost = options.pieceBreakCost;
                                 joint.orientationTemperature =
                                     options.bp.horizontalnessTemperature;
                                 interleavedWinding = vc::fiber_tracer::
@@ -3443,6 +3576,7 @@ int main(int argc, char** argv)
                                     FiberTraceWindingBeliefPropagationConfig&>(joint) =
                                         windingConfig;
                                 joint.mixedUnaryCost = options.windingDefectCost;
+                                joint.pieceBreakCost = options.pieceBreakCost;
                                 joint.orientationTemperature =
                                     options.bp.horizontalnessTemperature;
                                 joint.temperature = 0.25;
@@ -3531,11 +3665,19 @@ int main(int argc, char** argv)
                                     formatBpFinalStateCohorts(
                                         bpSourcePieceOne,
                                         *interleavedWinding) +
+                                    formatBpConstraintEvidenceCohorts(
+                                        bpSourcePieceOne,
+                                        bpConstraints,
+                                        *interleavedWinding) +
                                     formatReferenceBpWindingBenchmark(*referenceDiagnostics, *referenceBpConstraints, *interleavedWinding, mode));
                             } else if (interleavedWinding) {
                                 deferredBpStateDiagnostics.push_back(
                                     formatBpFinalStateCohorts(
                                         bpSourcePieceOne,
+                                        *interleavedWinding) +
+                                    formatBpConstraintEvidenceCohorts(
+                                        bpSourcePieceOne,
+                                        bpConstraints,
                                         *interleavedWinding));
                             }
                             writeAndPrintBpReport(

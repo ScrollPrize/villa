@@ -1,10 +1,11 @@
-# Status: report central versus non-central BP states
+# Status: penalize split-piece Defect boundaries
 
-- [x] Capture the requested output and retained cost behavior.
-- [x] Inspect the final-state and deferred benchmark output paths.
+- [x] Capture the requested task.
+- [x] Inspect continuity-edge and Defect factor semantics.
 - [x] Write the implementation and validation plan.
 - [x] Complete independent plan review.
-- [x] Implement and test the summary helper and output placement.
+- [x] Implement configuration, pair potential, and CLI option.
+- [x] Add focused regression coverage.
 - [x] Update specs, docs, changelog, and task log.
 - [x] Build and run focused validation.
-- [x] Rerun the 1024 diagnostic and report the emitted table.
+- [x] Run and compare split benchmark sweeps.
