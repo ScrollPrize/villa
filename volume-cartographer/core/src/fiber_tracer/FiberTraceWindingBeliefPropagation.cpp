@@ -50,6 +50,7 @@ struct PreparedWinding {
     std::vector<Edge> edges;
     std::vector<std::vector<std::size_t>> adjacency;
     std::vector<std::size_t> componentByNode;
+    std::vector<std::size_t> integerGaugeByNode;
     std::vector<std::size_t> gaugeNodeByComponent;
     std::vector<std::size_t> gaugePieceByComponent;
     std::vector<std::size_t> integerGaugeNodes;
@@ -292,12 +293,14 @@ PreparedWinding prepareWinding(
     // an effective winding term. Additional gauges fix only integer zero; they
     // must not pin H/V and thereby sever orientation-only factors.
     std::fill(visited.begin(), visited.end(), 0);
+    result.integerGaugeByNode.assign(result.piecesByNode.size(), 0);
     std::vector<unsigned char> classGauge(result.piecesByNode.size(), 0);
     for (const std::size_t node : result.gaugeNodeByComponent)
         classGauge[node] = 1;
     for (std::size_t start = 0; start < result.piecesByNode.size(); ++start) {
         if (visited[start] != 0)
             continue;
+        const std::size_t integerGauge = result.integerGaugeNodes.size();
         std::vector<std::size_t> nodes;
         std::queue<std::size_t> pending;
         pending.push(start);
@@ -306,6 +309,7 @@ PreparedWinding prepareWinding(
             const std::size_t node = pending.front();
             pending.pop();
             nodes.push_back(node);
+            result.integerGaugeByNode[node] = integerGauge;
             for (const std::size_t edgeIndex : windingAdjacency[node]) {
                 const auto& edge = result.edges[edgeIndex];
                 const std::size_t neighbor = edge.a == node ? edge.b : edge.a;
@@ -841,6 +845,19 @@ double classOffset(JointClass orientation, int sign, double phase)
     return orientation == JointClass::B
         ? static_cast<double>(sign) * phase
         : 0.0;
+}
+
+FiberTraceFixedOrientation publicOrientation(JointClass orientation)
+{
+    switch (orientation) {
+        case JointClass::A:
+            return FiberTraceFixedOrientation::Horizontal;
+        case JointClass::Mixed:
+            return FiberTraceFixedOrientation::Mixed;
+        case JointClass::B:
+            return FiberTraceFixedOrientation::Vertical;
+    }
+    throw std::logic_error("Invalid decoded winding orientation");
 }
 
 bool requiresHardWindingSign(const Measurement& measurement)
@@ -2730,10 +2747,13 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
     report.candidateMinimum.resize(pieceCount);
     report.candidateMaximum.resize(pieceCount);
     report.componentByPiece.resize(pieceCount);
+    report.integerGaugeByPiece.resize(pieceCount);
     report.classAProbability.resize(pieceCount);
     report.mixedProbability.resize(pieceCount);
     report.classBProbability.resize(pieceCount);
     report.posteriorMeanLatentCoordinate.resize(pieceCount);
+    report.mapLatentCoordinate.resize(pieceCount);
+    report.mapOrientationByPiece.resize(pieceCount);
     report.incidentSignedConstraints.assign(pieceCount, 0);
     report.incidentSkippedConstraints.assign(pieceCount, 0);
     for (const auto& diagnostic : report.factorDiagnostics) {
@@ -2825,6 +2845,7 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
         report.candidateMinimum[piece] = round.lower[node];
         report.candidateMaximum[piece] = round.upper[node];
         report.componentByPiece[piece] = component;
+        report.integerGaugeByPiece[piece] = prepared.integerGaugeByNode[node];
         const double classTotal = classA + mixed + classB;
         if (!std::isfinite(classTotal) || !(classTotal > 0.0)) {
             throw std::runtime_error(
@@ -2852,11 +2873,17 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
         });
     for (std::size_t piece = 0; piece < pieceCount; ++piece) {
         const std::size_t node = prepared.pieceToNode[piece];
-        const bool active = decoded[node].orientation != JointClass::Mixed;
+        const auto& state = decoded[node];
+        const bool active = state.orientation != JointClass::Mixed;
         report.windingValid[piece] = active ? 1 : 0;
         report.continuousWinding[piece] =
             active ? continuousNodes[node] : 0.0;
-        report.mapWinding[piece] = active ? decoded[node].winding : 0;
+        report.mapWinding[piece] = active ? state.winding : 0;
+        report.mapOrientationByPiece[piece] = publicOrientation(state.orientation);
+        report.mapLatentCoordinate[piece] =
+            active ? static_cast<double>(state.winding) +
+                         classOffset(state.orientation, report.componentPhaseSign.at(prepared.componentByNode[node]), selectedCalibration.phase)
+                   : std::numeric_limits<double>::quiet_NaN();
         if (!active)
             report.mapProbability[piece] = report.mixedProbability[piece];
     }
@@ -2923,6 +2950,58 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
 
 }  // namespace
 
+FiberTraceWindingComponentSelection selectLargestFiberTraceWindingComponent(
+    const FiberTraceConstraintReport& constraints,
+    const FiberTraceBeliefTopology& topology,
+    const FiberTraceWindingBeliefPropagationConfig& config,
+    std::span<const FiberTraceFixedOrientation> fixedOrientations,
+    bool quantizeComponentTargets,
+    std::optional<std::size_t> preferredPiece)
+{
+    validateConfig(config);
+    if (preferredPiece && *preferredPiece >= constraints.pieces.size()) {
+        throw std::invalid_argument("Preferred winding component piece is out of range");
+    }
+    const auto fixedClasses = fixedJointClasses(fixedOrientations, constraints.pieces.size());
+    const auto prepared = prepareWinding(constraints, topology, config, fixedClasses, quantizeComponentTargets);
+
+    FiberTraceWindingComponentSelection result;
+    result.components = prepared.integerGaugeNodes.size();
+    if (constraints.pieces.empty())
+        return result;
+    if (result.components == 0) {
+        throw std::logic_error("Nonempty winding graph has no integer gauge component");
+    }
+
+    std::vector<std::size_t> counts(result.components, 0);
+    std::vector<std::size_t> minimumPiece(result.components, constraints.pieces.size());
+    std::vector<unsigned char> preferred(result.components, 0);
+    for (std::size_t piece = 0; piece < constraints.pieces.size(); ++piece) {
+        const std::size_t node = prepared.pieceToNode[piece];
+        const std::size_t component = prepared.integerGaugeByNode[node];
+        ++counts.at(component);
+        minimumPiece[component] = std::min(minimumPiece[component], piece);
+        if (preferredPiece && piece == *preferredPiece)
+            preferred[component] = 1;
+    }
+    std::size_t selected = 0;
+    for (std::size_t component = 1; component < result.components; ++component) {
+        if (counts[component] > counts[selected] || (counts[component] == counts[selected] && preferred[component] > preferred[selected]) ||
+            (counts[component] == counts[selected] && preferred[component] == preferred[selected] && minimumPiece[component] < minimumPiece[selected])) {
+            selected = component;
+        }
+    }
+    result.retainedPieceIndices.reserve(counts[selected]);
+    for (std::size_t piece = 0; piece < constraints.pieces.size(); ++piece) {
+        const std::size_t node = prepared.pieceToNode[piece];
+        if (prepared.integerGaugeByNode[node] == selected)
+            result.retainedPieceIndices.push_back(piece);
+    }
+    result.retainedPieces = result.retainedPieceIndices.size();
+    result.removedPieces = constraints.pieces.size() - result.retainedPieces;
+    return result;
+}
+
 double quantizedHalfWindingTarget(double value)
 {
     if (value == 0.0)
@@ -2950,6 +3029,153 @@ void FiberTraceCanonicalConstraintCounts::add(
         ++correct;
     else
         ++falseCount;
+}
+
+FiberTraceReferenceWindingBenchmark calibrateFiberTraceReferenceWindings(std::span<const FiberTraceReferenceWindingObservation> observations, double tolerance)
+{
+    if (!std::isfinite(tolerance) || tolerance < 0.0) {
+        throw std::invalid_argument("Reference winding benchmark tolerance must be finite and nonnegative");
+    }
+
+    std::map<std::size_t, std::vector<std::size_t>> observationsByGauge;
+    for (std::size_t index = 0; index < observations.size(); ++index) {
+        const auto& observation = observations[index];
+        if (!std::isfinite(observation.virtualReferenceWinding) ||
+            observation.inferredReferenceWindingCount > observation.inferredReferenceWindings.size()) {
+            throw std::invalid_argument("Reference winding benchmark observation is invalid");
+        }
+        for (std::size_t candidate = 0; candidate < observation.inferredReferenceWindingCount; ++candidate) {
+            if (!std::isfinite(observation.inferredReferenceWindings[candidate])) {
+                throw std::invalid_argument("Reference winding benchmark candidate is invalid");
+            }
+        }
+        const auto classIndex = static_cast<std::size_t>(observation.constraintClass);
+        if (classIndex >= 3) {
+            throw std::invalid_argument("Reference winding benchmark class is invalid");
+        }
+        if (observation.inferredReferenceWindingCount == 0)
+            continue;
+        observationsByGauge[observation.integerGauge].push_back(index);
+    }
+
+    FiberTraceReferenceWindingBenchmark result;
+    result.tolerance = tolerance;
+    std::map<std::size_t, double> offsetByGauge;
+    const auto isRight = [&](const FiberTraceReferenceWindingObservation& o, double offset) {
+        const double expected = o.virtualReferenceWinding + offset;
+        for (std::size_t candidate = 0; candidate < o.inferredReferenceWindingCount; ++candidate) {
+            if (std::abs(o.inferredReferenceWindings[candidate] - expected) <= tolerance + kEpsilon) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const auto betterOffset = [](std::size_t right, double offset, std::size_t bestRight, double bestOffset) {
+        if (right != bestRight)
+            return right > bestRight;
+        if (std::abs(offset) != std::abs(bestOffset))
+            return std::abs(offset) < std::abs(bestOffset);
+        return offset < bestOffset;
+    };
+
+    struct OffsetEvents {
+        std::size_t starts = 0;
+        std::size_t ends = 0;
+    };
+    for (const auto& [gauge, indices] : observationsByGauge) {
+        std::map<double, OffsetEvents> events;
+        for (const std::size_t index : indices) {
+            const auto& observation = observations[index];
+            std::array<std::pair<double, double>, 2> intervals{};
+            std::size_t intervalCount = 0;
+            for (std::size_t candidate = 0; candidate < observation.inferredReferenceWindingCount; ++candidate) {
+                const double center = observation.inferredReferenceWindings[candidate] - observation.virtualReferenceWinding;
+                intervals[intervalCount++] = {center - tolerance, center + tolerance};
+            }
+            if (intervalCount == 2 && intervals[1].first < intervals[0].first) {
+                std::swap(intervals[0], intervals[1]);
+            }
+            if (intervalCount == 2 && intervals[1].first <= intervals[0].second + kEpsilon) {
+                intervals[0].second = std::max(intervals[0].second, intervals[1].second);
+                intervalCount = 1;
+            }
+            for (std::size_t interval = 0; interval < intervalCount; ++interval) {
+                ++events[intervals[interval].first].starts;
+                ++events[intervals[interval].second].ends;
+            }
+        }
+
+        double bestOffset = 0.0;
+        std::size_t bestRight = 0;
+        for (const std::size_t index : indices)
+            bestRight += isRight(observations[index], bestOffset) ? 1 : 0;
+        std::size_t active = 0;
+        for (const auto& [offset, event] : events) {
+            active += event.starts;
+            if (betterOffset(active, offset, bestRight, bestOffset)) {
+                bestRight = active;
+                bestOffset = offset;
+            }
+            active -= event.ends;
+        }
+        result.gauges.push_back({gauge, bestOffset, indices.size(), bestRight});
+        offsetByGauge.emplace(gauge, bestOffset);
+    }
+
+    for (const auto& observation : observations) {
+        if (observation.inferredReferenceWindingCount == 0)
+            continue;
+        auto& counts = result.classes[static_cast<std::size_t>(observation.constraintClass)];
+        ++counts.total;
+        ++result.sum.total;
+        const bool right = isRight(observation, offsetByGauge.at(observation.integerGauge));
+        if (right) {
+            ++counts.right;
+            ++result.sum.right;
+        } else {
+            ++counts.wrong;
+            ++result.sum.wrong;
+        }
+    }
+    return result;
+}
+
+FiberTraceReferenceWindingObservation makeFiberTraceReferenceWindingObservation(
+    const FiberTraceConstraint& constraint, bool referenceIsEndpointA, double virtualReferenceWinding, std::size_t bpPiece, const FiberTraceInterleavedWindingReport& winding)
+{
+    if (!std::isfinite(virtualReferenceWinding) || bpPiece >= winding.windingValid.size() ||
+        winding.mapLatentCoordinate.size() != winding.windingValid.size() || winding.mapOrientationByPiece.size() != winding.windingValid.size() ||
+        winding.integerGaugeByPiece.size() != winding.windingValid.size() || !std::isfinite(winding.measurementScale) ||
+        !(winding.measurementScale > 0.0)) {
+        throw std::invalid_argument("Reference winding observation inputs are invalid");
+    }
+
+    FiberTraceReferenceWindingObservation observation;
+    observation.integerGauge = winding.integerGaugeByPiece[bpPiece];
+    observation.virtualReferenceWinding = virtualReferenceWinding;
+    const bool active = winding.windingValid[bpPiece] != 0 && winding.mapOrientationByPiece[bpPiece] != FiberTraceFixedOrientation::Mixed &&
+                        std::isfinite(winding.mapLatentCoordinate[bpPiece]);
+    const bool perpendicular = constraint.perpendicularScore >= constraint.parallelScore;
+    if (perpendicular) {
+        observation.constraintClass = FiberTraceReferenceConstraintClass::Perpendicular;
+        if (active && constraint.signedWindingDelta) {
+            const double target = quantizedHalfWindingTarget(*constraint.signedWindingDelta);
+            const double direction = referenceIsEndpointA ? -1.0 : 1.0;
+            observation.inferredReferenceWindings[0] = winding.mapLatentCoordinate[bpPiece] + direction * winding.measurementScale * target;
+            observation.inferredReferenceWindingCount = 1;
+        }
+        return observation;
+    }
+
+    const double target = std::abs(quantizedIntegerWindingTarget(constraint.windingDistance));
+    observation.constraintClass =
+        target == 0.0 ? FiberTraceReferenceConstraintClass::ParallelSameWinding : FiberTraceReferenceConstraintClass::ParallelOtherWinding;
+    if (active) {
+        observation.inferredReferenceWindings[0] = winding.mapLatentCoordinate[bpPiece] - target;
+        observation.inferredReferenceWindings[1] = winding.mapLatentCoordinate[bpPiece] + target;
+        observation.inferredReferenceWindingCount = target == 0.0 ? 1 : 2;
+    }
+    return observation;
 }
 
 const char* fiberTraceWindingSolverName(FiberTraceWindingSolver solver) noexcept
@@ -3195,6 +3421,7 @@ FiberTraceWindingBeliefPropagationReport solveFiberTraceWindingBeliefPropagation
     report.candidateMinimum.resize(pieceCount);
     report.candidateMaximum.resize(pieceCount);
     report.componentByPiece.resize(pieceCount);
+    report.integerGaugeByPiece.resize(pieceCount);
     report.incidentSignedConstraints.assign(pieceCount, 0);
     report.incidentSkippedConstraints.assign(pieceCount, 0);
     for (const auto& diagnostic : report.factorDiagnostics) {
@@ -3229,6 +3456,7 @@ FiberTraceWindingBeliefPropagationReport solveFiberTraceWindingBeliefPropagation
         report.candidateMinimum[piece] = lower[node];
         report.candidateMaximum[piece] = upper[node];
         report.componentByPiece[piece] = prepared.componentByNode[node];
+        report.integerGaugeByPiece[piece] = prepared.integerGaugeByNode[node];
     }
     return report;
 }
@@ -3510,10 +3738,13 @@ solveFiberTraceInterleavedWindingBeliefPropagation(
     report.candidateMinimum.resize(pieceCount);
     report.candidateMaximum.resize(pieceCount);
     report.componentByPiece.resize(pieceCount);
+    report.integerGaugeByPiece.resize(pieceCount);
     report.classAProbability.resize(pieceCount);
     report.mixedProbability.resize(pieceCount);
     report.classBProbability.resize(pieceCount);
     report.posteriorMeanLatentCoordinate.resize(pieceCount);
+    report.mapLatentCoordinate.resize(pieceCount);
+    report.mapOrientationByPiece.resize(pieceCount);
     report.incidentSignedConstraints.assign(pieceCount, 0);
     report.incidentSkippedConstraints.assign(pieceCount, 0);
     for (const auto& diagnostic : report.factorDiagnostics) {
@@ -3597,6 +3828,7 @@ solveFiberTraceInterleavedWindingBeliefPropagation(
         report.candidateMinimum[piece] = best->round.lower[node];
         report.candidateMaximum[piece] = best->round.upper[node];
         report.componentByPiece[piece] = prepared.componentByNode[node];
+        report.integerGaugeByPiece[piece] = prepared.integerGaugeByNode[node];
         const double classTotal = classA + mixed + classB;
         if (!std::isfinite(classTotal) || !(classTotal > 0.0))
             throw std::runtime_error("Interleaved winding class marginal is invalid");
@@ -3619,11 +3851,17 @@ solveFiberTraceInterleavedWindingBeliefPropagation(
         });
     for (std::size_t piece = 0; piece < pieceCount; ++piece) {
         const std::size_t node = prepared.pieceToNode[piece];
-        const bool active = decoded[node].orientation != JointClass::Mixed;
+        const auto& state = decoded[node];
+        const bool active = state.orientation != JointClass::Mixed;
         report.windingValid[piece] = active ? 1 : 0;
         report.continuousWinding[piece] =
             active ? continuousNodes[node] : 0.0;
-        report.mapWinding[piece] = active ? decoded[node].winding : 0;
+        report.mapWinding[piece] = active ? state.winding : 0;
+        report.mapOrientationByPiece[piece] = publicOrientation(state.orientation);
+        report.mapLatentCoordinate[piece] =
+            active ? static_cast<double>(state.winding) +
+                         classOffset(state.orientation, best->parameters.componentSign.at(prepared.componentByNode[node]), best->parameters.phase)
+                   : std::numeric_limits<double>::quiet_NaN();
         if (!active)
             report.mapProbability[piece] = report.mixedProbability[piece];
     }

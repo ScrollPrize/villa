@@ -5297,6 +5297,18 @@
   `[0,0.5]`, and deterministic component sign `sign_c` accounts for otherwise
   incomparable class swaps. Absolute `k` values across components are not
   physically comparable.
+- Before a BP-only cohort enters its final winding solve, retain only the
+  largest component of the exact effective-winding graph. Component formation
+  must reuse the solver's hard-continuity, merged-measurement, signed-target,
+  quantized multiplier, parallel-cutoff, and fixed-Mixed rules. For fixed
+  orientation, run the orientation prepass, remove every smaller winding
+  component, remap source traces/pieces/constraints, rebuild topology, and
+  repeat monotonically until one component remains; reuse the stable final
+  prepass. A removed interior piece splits the retained pieces of that source
+  trace into separate contiguous represented runs; an arc gap must not be
+  relabeled as hard continuity. Equal-size components prefer the crop-central piece, then the lowest
+  original piece index. Reference fibers never affect this selection. Print
+  one cumulative before/after trace, piece, and constraint summary per solve.
 - `sum-product-mixed` exposes `joint-grid` and `alternating` winding solvers.
   `joint-grid` is the default. `alternating` is the established comparison
   implementation described below and retains its orientation pre-pass,
@@ -5434,6 +5446,12 @@
   `w_N` layers group integer `k` after a nonnegative display offset. The CSV
   retains relative `k` and component identity. Finite iteration-limit results
   remain usable but must be labeled nonconverged.
+- Winding reports also expose the authoritative post-projection MAP
+  H/V/Defect class, finite MAP latent coordinate for active pieces, and the
+  independently gauged effective-winding subgraph ID for every piece. A
+  hard-sign-projected Defect has no latent coordinate. Consumers must use these
+  fields rather than reconstructing MAP state from node marginals or the
+  broader H/V factor-component ID.
 - Winding factor diagnostics preserve raw original-order and raw
   canonical-order signed observations, separately expose the effective
   half-integer canonical target, its winding-weight multiplier, and its
@@ -5514,6 +5532,43 @@
   its virtual GT step. Empty diagnostics print `0 0 0`, and always satisfy
   `correct + false = total = displayed row count`. This output is diagnostic
   only and must not change main constraints, BP, or published labels.
+- For each represented `sum-product-mixed` BP cohort, tagged references enable
+  a second diagnostic extraction between canonical reference pieces and the
+  exact BP piece lines. Reference runs reuse the pieces already produced by the
+  reference/reference extractor; the cross extractor preserves each supplied
+  line as one piece and filters distinct-trace candidates to reference/BP pairs
+  before scoring. It runs against the final retained component for each
+  balance/solver execution. Reference/reference,
+  BP/BP, and hard-continuity links are absent. Accepted repeated piece-pair
+  measurements are not deduplicated by source fiber.
+- Cross constraints are evaluated only after BP and never enter its graph.
+  Exact parallel/perpendicular score ties are perpendicular. For signed
+  perpendicular target `d`, measurement scale `s`, and BP MAP latent `z`, a
+  reference at endpoint A of `A -> B` is inferred as `z-s*d`; at endpoint B it
+  is `z+s*d`. The target uses the canonical signed half-integer rule. A
+  parallel constraint with canonical nonnegative integer distance `n` infers
+  both `z-n` and `z+n`; `n=0` is `parallel_same`, otherwise it is
+  `parallel_other`. A Defect/invalid BP endpoint or unsigned perpendicular
+  observation has no inferred candidate. Constraints whose BP endpoint is
+  final Defect/Mixed or otherwise winding-invalid are excluded from both
+  calibration and all benchmark totals. An unsigned perpendicular observation
+  from an otherwise active endpoint remains a non-candidate and is likewise
+  excluded.
+- Reference source `i` retains virtual winding `0.5*i`. Calibration is
+  independent for every effective-winding gauge ID. For each gauge, brute-force
+  the finite closed-interval event offsets induced by every candidate's
+  `inferred-virtual +/- 0.5`, also considering zero. Select the offset with the
+  greatest number of inclusive-tolerance matches; ties prefer smaller absolute
+  offset and then smaller signed offset. Gauges with no active candidates are
+  absent.
+  Print balance mode, solver/status, per-gauge offset/right/total rows, then
+  aggregate `right`, `wrong`, `total`, and `right_percent` rows for
+  `perpendicular`, `parallel_same`, `parallel_other`, and `sum`. Empty classes
+  print `NA` percent, and right plus wrong always equals total.
+- Buffer the reference/reference tables and every reference-to-BP benchmark
+  generated across checkpoints and balance modes. Emit them in execution order
+  after all ordinary `direction-ablation` summaries and immediately before the
+  command returns.
 - The winding viewer consumes only the current published quartet
   `<base>_w_N_{h,v,err,tie}.obj` for each discovered nonnegative display label
   `N`. Aggregate `<base>_w_N.obj`, CSV reports, and unrelated siblings are not

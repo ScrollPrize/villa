@@ -1481,6 +1481,54 @@ TEST_CASE("Reference constraint selection keeps measured cross-source links")
     CHECK(reordered.front().perpendicularDominant);
 }
 
+TEST_CASE("Cross constraint extraction preserves input pieces and filters pairs")
+{
+    std::vector<FiberletCropTraceLine> lines(4);
+    for (std::size_t index = 0; index < lines.size(); ++index) {
+        const double y = 4.0 * static_cast<double>(index);
+        lines[index].pointsBaseXYZ = {{0.0, y, 0.0}, {128.0, y, 0.0}};
+    }
+
+    FiberTraceConstraintConfig splitConfig;
+    splitConfig.targetPieceLengthBaseVoxels = 64.0;
+    splitConfig.pieceOverlapBaseVoxels = 16.0;
+    splitConfig.maximumDistanceBaseVoxels = 20.0;
+    splitConfig.parallelThreads = 2;
+    const auto split = extractFiberTraceConstraints(lines, splitConfig, [](const cv::Vec3d&, const cv::Vec3d&, double) { return 0.0; });
+    CHECK(split.pieces.size() > lines.size());
+    CHECK(split.hardConstraints > 0);
+
+    auto crossConfig = splitConfig;
+    crossConfig.preserveInputLinesAsPieces = true;
+    std::size_t batchCalls = 0;
+    std::size_t connectors = 0;
+    const auto cross = extractFiberTraceConstraints(
+        lines,
+        crossConfig,
+        {},
+        [&](const std::vector<std::pair<cv::Vec3d, cv::Vec3d>>& current, double, int) {
+            ++batchCalls;
+            connectors += current.size();
+            return std::vector<double>(current.size(), 0.0);
+        },
+        [](std::size_t a, std::size_t b) { return (a < 2) != (b < 2); });
+    CHECK(cross.pieces.size() == lines.size());
+    CHECK(cross.hardConstraints == 0);
+    CHECK(cross.measuredCandidates == 4);
+    CHECK(cross.constraints.size() == 4);
+    CHECK(batchCalls == 1);
+    CHECK(connectors == 4);
+    for (std::size_t piece = 0; piece < cross.pieces.size(); ++piece) {
+        CHECK(cross.pieces[piece].traceIndex == piece);
+        CHECK(cross.pieces[piece].pieceIndex == 0);
+    }
+    for (const auto& constraint : cross.constraints) {
+        const std::size_t traceA = cross.pieces[constraint.pieceA].traceIndex;
+        const std::size_t traceB = cross.pieces[constraint.pieceB].traceIndex;
+        CHECK((traceA < 2) != (traceB < 2));
+    }
+}
+
 TEST_CASE("Trace constraint R-tree cube hits still require Euclidean radius")
 {
     FiberletCropTraceLine first;
@@ -1731,6 +1779,93 @@ TEST_CASE("Trace constraint strength pruning counts piece links per source fiber
     CHECK(one.constraints.front().pieceA == 0);
     CHECK(one.constraints.front().pieceB == 2);
     CHECK(one.report.after.maximumDegree == 1);
+}
+
+TEST_CASE("Trace constraint subsets remap pieces traces and counters")
+{
+    FiberTraceConstraintReport input;
+    input.inputTraces = 3;
+    input.skippedDegenerateTraces = 4;
+    input.prepareSeconds = 1.25;
+    for (const auto [trace, pieceIndex] : {std::pair{0UL, 0UL}, std::pair{0UL, 1UL}, std::pair{1UL, 0UL}, std::pair{2UL, 0UL}}) {
+        FiberTraceConstraintPiece piece;
+        piece.traceIndex = trace;
+        piece.pieceIndex = pieceIndex;
+        input.pieces.push_back(std::move(piece));
+    }
+    const auto link = [](std::size_t a, std::size_t b, bool hard, bool signedWinding) {
+        FiberTraceConstraint constraint;
+        constraint.pieceA = a;
+        constraint.pieceB = b;
+        constraint.parallelScore = hard ? 1.0 : 0.25;
+        constraint.perpendicularScore = 1.0 - constraint.parallelScore;
+        constraint.hardContinuity = hard;
+        if (signedWinding)
+            constraint.signedWindingDelta = 0.5;
+        return constraint;
+    };
+    input.constraints = {
+        link(0, 1, true, true),
+        link(1, 2, false, true),
+        link(2, 3, false, false),
+    };
+    input.hardConstraints = 1;
+    input.signedWindingConstraints = 2;
+    input.skippedSignedWindingConstraints = 1;
+
+    const std::array<std::size_t, 2> retained{1, 2};
+    const auto subset = subsetFiberTraceConstraintReport(input, retained);
+    CHECK(subset.retainedPieceIndices == std::vector<std::size_t>{1, 2});
+    CHECK(subset.retainedTraceIndices == std::vector<std::size_t>{0, 1});
+    CHECK(subset.report.inputTraces == 2);
+    CHECK(subset.report.pieces.size() == 2);
+    CHECK(subset.report.pieces[0].traceIndex == 0);
+    CHECK(subset.report.pieces[0].pieceIndex == 0);
+    CHECK(subset.report.pieces[1].traceIndex == 1);
+    CHECK(subset.report.pieces[1].pieceIndex == 0);
+    REQUIRE(subset.report.constraints.size() == 1);
+    CHECK(subset.report.constraints[0].pieceA == 0);
+    CHECK(subset.report.constraints[0].pieceB == 1);
+    CHECK(subset.report.hardConstraints == 0);
+    CHECK(subset.report.signedWindingConstraints == 1);
+    CHECK(subset.report.skippedSignedWindingConstraints == 0);
+    CHECK(subset.report.skippedDegenerateTraces == 4);
+    CHECK(subset.report.prepareSeconds == 1.25);
+    const std::array<std::size_t, 2> reversed{2, 1};
+    CHECK_THROWS_AS(subsetFiberTraceConstraintReport(input, reversed), std::invalid_argument);
+}
+
+TEST_CASE("Trace constraint subsets split retained piece runs across removed gaps")
+{
+    FiberTraceConstraintReport input;
+    input.inputTraces = 1;
+    for (std::size_t pieceIndex = 0; pieceIndex < 3; ++pieceIndex) {
+        FiberTraceConstraintPiece piece;
+        piece.traceIndex = 0;
+        piece.pieceIndex = pieceIndex;
+        piece.beginArcBaseVoxels = 384.0 * static_cast<double>(pieceIndex);
+        piece.endArcBaseVoxels = piece.beginArcBaseVoxels + 512.0;
+        input.pieces.push_back(std::move(piece));
+    }
+    FiberTraceConstraint continuity;
+    continuity.pieceA = 0;
+    continuity.pieceB = 1;
+    continuity.hardContinuity = true;
+    input.constraints.push_back(continuity);
+    continuity.pieceA = 1;
+    continuity.pieceB = 2;
+    input.constraints.push_back(continuity);
+
+    const std::array<std::size_t, 2> retained{0, 2};
+    const auto subset = subsetFiberTraceConstraintReport(input, retained);
+    CHECK(subset.retainedTraceIndices == std::vector<std::size_t>{0, 0});
+    CHECK(subset.report.inputTraces == 2);
+    REQUIRE(subset.report.pieces.size() == 2);
+    CHECK(subset.report.pieces[0].traceIndex == 0);
+    CHECK(subset.report.pieces[0].pieceIndex == 0);
+    CHECK(subset.report.pieces[1].traceIndex == 1);
+    CHECK(subset.report.pieces[1].pieceIndex == 0);
+    CHECK(subset.report.constraints.empty());
 }
 
 TEST_CASE("Trace constraint recovery overflow is not an infeasibility proof")

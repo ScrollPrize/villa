@@ -1,41 +1,68 @@
-# Plan: circular winding visibility-mask controls
+# Plan: retain the main BP constraint component
 
-## Implementation
+## Semantics
 
-1. Snapshot every managed winding layer's live `.visible` bit before a shift.
-2. Circularly rotate that complete state-by-winding mask by one position over
-   the sorted unique winding labels across every managed nonempty H, V, error,
-   and tie layer, including Broken/Tie-only windings. `Next` moves source slot
-   `i` to `(i+1) mod count`; `Previous` moves it to `(i-1) mod count`. State is
-   unchanged. A missing source-state layer contributes `false`; a bit whose
-   destination-state layer is absent is discarded. One winding is an exact
-   no-op. Apply all bits from the snapshot so hidden space moves as well as
-   visible space.
-3. Include H, V, error, and tie layers in the roll. Keep the independent
-   reference and unmanaged Napari layers untouched.
-4. Replace arrow `QToolButton`s with full-size labeled `QPushButton`s. Keep the
-   live visibility summary of all states/windings synchronized after controls
-   and manual changes.
-5. Build one shared palette entry per winding and use that exact entry for both
-   H and V layer color arrays. Keep error and tie colors distinct.
+1. Expose a shared selector that reuses the winding solver's exact prepared
+   factor graph, including hard continuity, merged pair measurements, signed
+   perpendicular availability, quantized target multipliers, parallel cutoff,
+   and fixed-Mixed exclusions. Find its effective-winding components and retain
+   only the largest. Isolated pieces are one-piece components. Select
+   deterministically by piece count, then prefer the component containing the
+   crop-central piece, then the lowest original piece index.
+2. Add a shared constraint-report subset transform. Remap retained source
+   traces, pieces, per-trace piece indices, and constraint endpoints
+   consistently. Preserve source arc provenance and extraction
+   timing/candidate counters while recomputing subset constraint counters.
+   Return old trace and piece indices so CLI-owned lines, original IDs,
+   directions, and masks are subset explicitly rather than inferred from
+   geometry.
+3. Prepare the unfiltered topology to obtain its existing crop-central piece.
+   When fixed orientations are requested, solve the orientation prepass, use
+   its exact fixed classes for winding-component selection, subset, and repeat
+   monotonically until the represented cohort is one effective-winding
+   component. Reuse the final orientation prepass rather than solving it again.
+   Without fixed orientations, select once using the empty fixed-class set.
+   Rebuild topology after every subset and only then run final winding BP,
+   reference/BP cross extraction, and output. Reference fibers must not
+   participate in component selection. Print one compact cumulative filter
+   summary per solver run.
+4. Convert reference/reference and reference-to-BP diagnostic printers into
+   formatters. Accumulate their complete strings during the run and emit them,
+   in deterministic execution order, immediately before the
+   `direction-ablation` command returns. Leave progress and ordinary solver
+   reports streaming as they do now.
+5. Treat a reference/BP observation with no valid final active H/V winding
+   candidate as outside the benchmark population. Such constraints contribute
+   neither offset-calibration intervals nor right/wrong/total counts. Keep the
+   raw cross extraction unchanged so this is explicitly a post-solve benchmark
+   population rule.
 
 ## Testing
 
-Test exact Next/Previous direction, complete mask roll in both directions,
-wraparound, all-but-one-visible
-empty-space movement, per-state bit preservation, sparse state layers, live
-layer reads, one-winding no-op, and untouched unmanaged/reference layers. Verify actual fake
-Napari H/V layer calls receive equal arrays. Run focused viewer tests and Ruff.
+- Unit-test largest effective-winding component retention, isolated pieces,
+  fixed-Mixed exclusions, parallel-cutoff and missing-sign splits, merged
+  pair-factor connectivity, deterministic equal-component selection,
+  constraint/source remapping, provenance, and counter recomputation.
+- Unit-test that final Mixed/Defect and invalid-winding endpoints are excluded
+  from calibration and every class total.
+- Add a CLI-level formatter/output-order test where practical; otherwise keep
+  formatters independently testable and validate a real reference-fiber run.
+- Build `vc_fiber_trace_chunk`, `test_fiberlet_crop_trace`, and
+  `test_fiber_trace_winding_bp`; run the focused tests and `git diff --check`.
 
 ## Spec update
 
-Replace the prior per-visible-H/V navigation contract with circular complete
-managed-mask rotation and retain exact shared H/V color semantics.
+Document exact effective-winding-component filtering, fixed-orientation
+prepass iteration, deterministic selection, reference independence, remapping
+requirements, and end-of-command placement of both reference diagnostic
+sections.
 
 ## Docs updates
 
-Document full-mask wraparound, labeled buttons, and shared H/V colors.
+Update the chunk tracing documentation with the main-component filter summary
+and the deferred reference diagnostic output order.
 
 ## Changelog
 
-No separate changelog entry; this corrects the current viewer interaction.
+Add one entry covering BP main-component retention and deferred reference
+diagnostics.

@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <functional>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -28,6 +29,7 @@ struct FiberTraceConstraintConfig {
     double windingIntegrationStepBaseVoxels = 8.0;
     double maximumWindingDistance = 1.5;
     bool enforceMaximumWindingDistance = true;
+    bool preserveInputLinesAsPieces = false;
     std::size_t parallelThreads = 0;
 };
 
@@ -115,6 +117,12 @@ struct FiberTraceConstraintPruningResult {
     FiberTraceConstraintPruningReport report;
 };
 
+struct FiberTraceConstraintSubsetResult {
+    FiberTraceConstraintReport report;
+    std::vector<std::size_t> retainedPieceIndices;
+    std::vector<std::size_t> retainedTraceIndices;
+};
+
 using FiberTraceWindingDistance = std::function<double(
     const cv::Vec3d& aBaseXYZ,
     const cv::Vec3d& bBaseXYZ,
@@ -124,6 +132,8 @@ using FiberTraceWindingDistanceBatch = std::function<std::vector<double>(
     const std::vector<std::pair<cv::Vec3d, cv::Vec3d>>& connectorsBaseXYZ,
     double stepBaseVoxels,
     int parallelThreads)>;
+
+using FiberTraceConstraintTracePairFilter = std::function<bool(std::size_t traceA, std::size_t traceB)>;
 
 struct FiberTraceConstraintObjPaths {
     std::filesystem::path perpendicularSameWinding;
@@ -144,7 +154,8 @@ struct FiberTraceConstraintObjReport {
     const std::vector<FiberletCropTraceLine>& lines,
     const FiberTraceConstraintConfig& config,
     const FiberTraceWindingDistance& windingDistance,
-    const FiberTraceWindingDistanceBatch& windingDistanceBatch = {});
+    const FiberTraceWindingDistanceBatch& windingDistanceBatch = {},
+    const FiberTraceConstraintTracePairFilter& tracePairFilter = {});
 
 struct FiberTraceOrderedCrossSourceConstraint {
     std::size_t constraintIndex = 0;
@@ -162,6 +173,9 @@ orderMeasuredCrossSourceFiberTraceConstraints(
 makeFiberTraceConstraintPieceLines(
     const std::vector<FiberletCropTraceLine>& sourceLines,
     const FiberTraceConstraintReport& constraints);
+
+[[nodiscard]] FiberTraceConstraintSubsetResult subsetFiberTraceConstraintReport(
+    const FiberTraceConstraintReport& constraints, std::span<const std::size_t> retainedPieceIndices);
 
 [[nodiscard]] FiberTraceConstraintPruningResult
 pruneFiberTraceConstraintsByStrength(

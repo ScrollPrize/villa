@@ -182,3 +182,9 @@
 - Corrected H/V-aware winding factors to use unsigned integer parallel
   distances and signed half-integer perpendicular targets, and added an
   optional solve-only cutoff for distant parallel winding evidence.
+- Added a diagnostic reference-to-BP winding benchmark with authoritative MAP
+  latent coordinates, independently calibrated winding gauges, and separate
+  perpendicular/parallel same/parallel other correctness rates.
+- BP-only winding now retains and remaps only its largest exact effective
+  winding component. Reference tables print at command end, and the benchmark
+  excludes final Defect/Mixed or invalid-winding endpoints.

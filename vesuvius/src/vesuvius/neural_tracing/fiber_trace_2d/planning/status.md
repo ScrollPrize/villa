@@ -1,11 +1,11 @@
-# Status: circular winding visibility-mask controls
+# Status: retain the main BP constraint component
 
-- [x] Capture corrected task semantics.
-- [x] Identify the incorrect per-visible-layer implementation.
-- [x] Verify existing helper-level H/V RGBA equality.
-- [x] Write implementation and validation plan.
-- [x] Complete independent plan review and define direction, full managed
-  winding domain, sparse-state behavior, and complete-mask label semantics.
-- [x] Implement circular full-mask shifting, labeled buttons, and shared palette.
-- [x] Update tests, specification, and documentation.
-- [x] Run focused validation and final diff check.
+- [x] Capture the requested task.
+- [x] Inspect BP connectivity, reference diagnostics, and CLI control flow.
+- [x] Write the implementation/test/docs plan.
+- [x] Complete independent plan review.
+- [x] Add shared largest-component filtering and tests.
+- [x] Apply filtering to the BP-only cohort.
+- [x] Defer reference tables and benchmark until command completion.
+- [x] Update specs, docs, changelog, and task log.
+- [x] Build and run focused validation.

@@ -356,7 +356,8 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
     const std::vector<FiberletCropTraceLine>& lines,
     const FiberTraceConstraintConfig& config,
     const FiberTraceWindingDistance& windingDistance,
-    const FiberTraceWindingDistanceBatch& windingDistanceBatch)
+    const FiberTraceWindingDistanceBatch& windingDistanceBatch,
+    const FiberTraceConstraintTracePairFilter& tracePairFilter)
 {
     validateConfig(config);
     FiberTraceConstraintReport report;
@@ -373,7 +374,8 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
             ++report.skippedDegenerateTraces;
             continue;
         }
-        const auto intervals = pieceIntervals(
+        const auto intervals = config.preserveInputLinesAsPieces ? std::vector<std::pair<double, double>>{{0.0, geometries[traceIndex]->length()}}
+                                                                 : pieceIntervals(
             geometries[traceIndex]->length(), config);
         piecesByTrace[traceIndex].reserve(intervals.size());
         for (std::size_t pieceIndex = 0; pieceIndex < intervals.size(); ++pieceIndex) {
@@ -459,6 +461,9 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
             const auto& pieceB = report.pieces[sampleB.piece];
             if (pieceA.traceIndex == pieceB.traceIndex)
                 continue;
+            if (tracePairFilter && !tracePairFilter(pieceA.traceIndex, pieceB.traceIndex)) {
+                continue;
+            }
             const cv::Vec3d pointB = pieceB.samplePointsBaseXYZ[sampleB.sample];
             const cv::Vec3d delta = pointA - pointB;
             const double distanceSquared = delta.dot(delta);
@@ -742,6 +747,92 @@ std::vector<FiberletCropTraceLine> makeFiberTraceConstraintPieceLines(
             piece.beginArcBaseVoxels,
             piece.endArcBaseVoxels);
         result.push_back(std::move(line));
+    }
+    return result;
+}
+
+FiberTraceConstraintSubsetResult subsetFiberTraceConstraintReport(const FiberTraceConstraintReport& constraints, std::span<const std::size_t> retainedPieceIndices)
+{
+    const std::size_t missing = std::numeric_limits<std::size_t>::max();
+    FiberTraceConstraintSubsetResult result;
+    result.retainedPieceIndices.assign(retainedPieceIndices.begin(), retainedPieceIndices.end());
+
+    std::vector<std::size_t> oldPieceToNew(constraints.pieces.size(), missing);
+    std::vector<std::vector<std::size_t>> retainedPiecesByTrace(constraints.inputTraces);
+    std::size_t previous = 0;
+    bool first = true;
+    for (std::size_t newPiece = 0; newPiece < retainedPieceIndices.size(); ++newPiece) {
+        const std::size_t oldPiece = retainedPieceIndices[newPiece];
+        if (oldPiece >= constraints.pieces.size() || (!first && oldPiece <= previous)) {
+            throw std::invalid_argument("Constraint subset piece indices must be sorted and unique");
+        }
+        first = false;
+        previous = oldPiece;
+        const std::size_t oldTrace = constraints.pieces[oldPiece].traceIndex;
+        if (oldTrace >= constraints.inputTraces) {
+            throw std::invalid_argument("Constraint subset piece references an invalid trace");
+        }
+        oldPieceToNew[oldPiece] = newPiece;
+        retainedPiecesByTrace[oldTrace].push_back(oldPiece);
+    }
+
+    std::vector<std::size_t> newTraceByOldPiece(constraints.pieces.size(), missing);
+    std::vector<std::size_t> newPieceIndexByOldPiece(constraints.pieces.size(), missing);
+    for (std::size_t oldTrace = 0; oldTrace < constraints.inputTraces; ++oldTrace) {
+        auto& pieces = retainedPiecesByTrace[oldTrace];
+        std::sort(pieces.begin(), pieces.end(), [&](std::size_t a, std::size_t b) {
+            return constraints.pieces[a].pieceIndex < constraints.pieces[b].pieceIndex;
+        });
+        std::size_t previousPieceIndex = missing;
+        std::size_t localPieceIndex = 0;
+        std::size_t newTrace = missing;
+        for (const std::size_t oldPiece : pieces) {
+            const std::size_t oldPieceIndex = constraints.pieces[oldPiece].pieceIndex;
+            if (previousPieceIndex == missing || oldPieceIndex != previousPieceIndex + 1) {
+                newTrace = result.retainedTraceIndices.size();
+                result.retainedTraceIndices.push_back(oldTrace);
+                localPieceIndex = 0;
+            }
+            newTraceByOldPiece[oldPiece] = newTrace;
+            newPieceIndexByOldPiece[oldPiece] = localPieceIndex++;
+            previousPieceIndex = oldPieceIndex;
+        }
+    }
+
+    result.report = constraints;
+    result.report.inputTraces = result.retainedTraceIndices.size();
+    result.report.pieces.clear();
+    result.report.constraints.clear();
+    result.report.hardConstraints = 0;
+    result.report.signedWindingConstraints = 0;
+    result.report.skippedSignedWindingConstraints = 0;
+    result.report.pieces.reserve(retainedPieceIndices.size());
+    for (const std::size_t oldPiece : retainedPieceIndices) {
+        auto piece = constraints.pieces[oldPiece];
+        piece.traceIndex = newTraceByOldPiece.at(oldPiece);
+        piece.pieceIndex = newPieceIndexByOldPiece.at(oldPiece);
+        result.report.pieces.push_back(std::move(piece));
+    }
+
+    result.report.constraints.reserve(constraints.constraints.size());
+    for (const auto& original : constraints.constraints) {
+        if (original.pieceA >= constraints.pieces.size() || original.pieceB >= constraints.pieces.size() || original.pieceA == original.pieceB) {
+            throw std::invalid_argument("Constraint subset link references an invalid piece pair");
+        }
+        const std::size_t newA = oldPieceToNew[original.pieceA];
+        const std::size_t newB = oldPieceToNew[original.pieceB];
+        if (newA == missing || newB == missing)
+            continue;
+        auto constraint = original;
+        constraint.pieceA = newA;
+        constraint.pieceB = newB;
+        result.report.hardConstraints += constraint.hardContinuity ? 1 : 0;
+        if (constraint.signedWindingDelta) {
+            ++result.report.signedWindingConstraints;
+        } else if (!constraint.hardContinuity && constraint.perpendicularScore > 0.0) {
+            ++result.report.skippedSignedWindingConstraints;
+        }
+        result.report.constraints.push_back(std::move(constraint));
     }
     return result;
 }

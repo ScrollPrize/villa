@@ -110,6 +110,54 @@ TEST_CASE("Fixed winding orientations use MAP and convert ties to Mixed")
         std::invalid_argument);
 }
 
+TEST_CASE("Largest winding component uses effective factors and deterministic ties")
+{
+    const auto source = lines(5);
+    auto report = pieces(source.size());
+    addMeasured(report, 0, 1, 0.0, 0.5);
+    addMeasured(report, 1, 2, 0.0, 0.5);
+    addMeasured(report, 3, 4, 0.0, 0.5);
+    const auto prepared = topology(source, report);
+
+    const auto largest = selectLargestFiberTraceWindingComponent(report, prepared, config());
+    CHECK(largest.components == 2);
+    CHECK(largest.retainedPieceIndices == std::vector<std::size_t>{0, 1, 2});
+    CHECK(largest.retainedPieces == 3);
+    CHECK(largest.removedPieces == 2);
+
+    auto tieReport = pieces(4);
+    addMeasured(tieReport, 0, 1, 0.0, 0.5);
+    addMeasured(tieReport, 2, 3, 0.0, 0.5);
+    const auto tieTopology = topology(lines(4), tieReport);
+    CHECK(selectLargestFiberTraceWindingComponent(tieReport, tieTopology, config()).retainedPieceIndices == std::vector<std::size_t>{0, 1});
+    CHECK(selectLargestFiberTraceWindingComponent(tieReport, tieTopology, config(), {}, true, 3).retainedPieceIndices == std::vector<std::size_t>{2, 3});
+
+    const std::vector<FiberTraceFixedOrientation> fixed{
+        FiberTraceFixedOrientation::Horizontal,
+        FiberTraceFixedOrientation::Mixed,
+        FiberTraceFixedOrientation::Vertical,
+        FiberTraceFixedOrientation::Horizontal,
+        FiberTraceFixedOrientation::Vertical,
+    };
+    const auto withoutMixed = selectLargestFiberTraceWindingComponent(report, prepared, config(), fixed);
+    CHECK(withoutMixed.components == 4);
+    CHECK(withoutMixed.retainedPieceIndices == std::vector<std::size_t>{3, 4});
+}
+
+TEST_CASE("Largest winding component honors cutoff and signed evidence")
+{
+    const auto source = lines(4);
+    auto report = pieces(source.size());
+    addMeasured(report, 0, 1, 1.0, 2.0);
+    report.constraints.back().signedWindingDelta.reset();
+    addMeasured(report, 2, 3, 0.0, 0.5);
+    auto cutoff = config();
+    cutoff.parallelWindingDistanceCutoff = 0.5;
+    const auto selected = selectLargestFiberTraceWindingComponent(report, topology(source, report), cutoff, {}, true, 3);
+    CHECK(selected.components == 3);
+    CHECK(selected.retainedPieceIndices == std::vector<std::size_t>{2, 3});
+}
+
 TEST_CASE("Two-stage winding BP recovers signed chains and canonical reversal")
 {
     const auto source = lines(3);
@@ -229,6 +277,117 @@ TEST_CASE("Canonical constraint counts include every emitted row")
     CHECK(counts.falseCount == 2);
     CHECK(counts.total == 5);
     CHECK(counts.correct + counts.falseCount == counts.total);
+}
+
+TEST_CASE("Reference winding benchmark calibrates each integer gauge")
+{
+    using Class = FiberTraceReferenceConstraintClass;
+    std::vector<FiberTraceReferenceWindingObservation> observations{
+        {Class::Perpendicular, 0, 0.0, {2.0, 0.0}, 1},
+        {Class::ParallelSameWinding, 0, 0.5, {2.5, 0.0}, 1},
+        {Class::ParallelOtherWinding, 0, 1.0, {3.0, 5.0}, 2},
+        {Class::Perpendicular, 0, 1.5, {10.0, 0.0}, 1},
+        {Class::Perpendicular, 1, 0.0, {-3.25, 0.0}, 1},
+        {Class::ParallelOtherWinding, 1, 0.5, {0.0, 0.0}, 0},
+    };
+    const auto benchmark = calibrateFiberTraceReferenceWindings(observations);
+    REQUIRE(benchmark.gauges.size() == 2);
+    CHECK(benchmark.gauges[0].integerGauge == 0);
+    CHECK(benchmark.gauges[0].offset == doctest::Approx(1.5));
+    CHECK(benchmark.gauges[0].right == 3);
+    CHECK(benchmark.gauges[0].observations == 4);
+    CHECK(benchmark.gauges[1].integerGauge == 1);
+    CHECK(benchmark.gauges[1].offset == doctest::Approx(-2.75));
+    CHECK(benchmark.gauges[1].right == 1);
+    CHECK(benchmark.gauges[1].observations == 1);
+    CHECK(benchmark.classes[0].right == 2);
+    CHECK(benchmark.classes[0].wrong == 1);
+    CHECK(benchmark.classes[0].total == 3);
+    CHECK(benchmark.classes[1].right == 1);
+    CHECK(benchmark.classes[1].wrong == 0);
+    CHECK(benchmark.classes[2].right == 1);
+    CHECK(benchmark.classes[2].wrong == 0);
+    CHECK(benchmark.sum.right == 4);
+    CHECK(benchmark.sum.wrong == 1);
+    CHECK(benchmark.sum.total == observations.size() - 1);
+}
+
+TEST_CASE("Reference winding calibration includes boundaries and stable ties")
+{
+    using Class = FiberTraceReferenceConstraintClass;
+    const std::vector<FiberTraceReferenceWindingObservation> boundary{
+        {Class::Perpendicular, 4, 0.0, {0.5, 0.0}, 1},
+    };
+    const auto atBoundary = calibrateFiberTraceReferenceWindings(boundary);
+    REQUIRE(atBoundary.gauges.size() == 1);
+    CHECK(atBoundary.gauges[0].offset == 0.0);
+    CHECK(atBoundary.sum.right == 1);
+
+    const std::vector<FiberTraceReferenceWindingObservation> tied{
+        {Class::ParallelOtherWinding, 7, 0.0, {-2.0, 2.0}, 2},
+    };
+    const auto stable = calibrateFiberTraceReferenceWindings(tied, 0.0);
+    REQUIRE(stable.gauges.size() == 1);
+    CHECK(stable.gauges[0].offset == -2.0);
+    CHECK(stable.sum.right == 1);
+
+    const std::vector<FiberTraceReferenceWindingObservation> invalid{
+        {Class::Perpendicular, 9, 0.0, {0.0, 0.0}, 0},
+    };
+    const auto allInvalid = calibrateFiberTraceReferenceWindings(invalid);
+    CHECK(allInvalid.gauges.empty());
+    CHECK(allInvalid.sum.right == 0);
+    CHECK(allInvalid.sum.wrong == 0);
+    CHECK(allInvalid.sum.total == 0);
+    CHECK(calibrateFiberTraceReferenceWindings(std::span<const FiberTraceReferenceWindingObservation>{}).gauges.empty());
+}
+
+TEST_CASE("Reference observations use authoritative latent endpoint algebra")
+{
+    FiberTraceInterleavedWindingReport winding;
+    winding.windingValid = {1, 1, 0};
+    winding.mapLatentCoordinate = {4.25, -2.0, std::numeric_limits<double>::quiet_NaN()};
+    winding.mapOrientationByPiece = {
+        FiberTraceFixedOrientation::Horizontal,
+        FiberTraceFixedOrientation::Vertical,
+        FiberTraceFixedOrientation::Mixed,
+    };
+    winding.integerGaugeByPiece = {3, 4, 5};
+    winding.measurementScale = 2.0;
+
+    FiberTraceConstraint perpendicular;
+    perpendicular.parallelScore = 0.5;
+    perpendicular.perpendicularScore = 0.5;
+    perpendicular.signedWindingDelta = 0.75;
+    const auto referenceA = makeFiberTraceReferenceWindingObservation(perpendicular, true, 1.0, 0, winding);
+    CHECK(referenceA.constraintClass == FiberTraceReferenceConstraintClass::Perpendicular);
+    CHECK(referenceA.integerGauge == 3);
+    CHECK(referenceA.inferredReferenceWindingCount == 1);
+    CHECK(referenceA.inferredReferenceWindings[0] == 3.25);
+
+    const auto referenceB = makeFiberTraceReferenceWindingObservation(perpendicular, false, 1.0, 0, winding);
+    CHECK(referenceB.inferredReferenceWindings[0] == 5.25);
+
+    FiberTraceConstraint parallel = perpendicular;
+    parallel.parallelScore = 0.75;
+    parallel.perpendicularScore = 0.25;
+    parallel.windingDistance = 1.6;
+    const auto other = makeFiberTraceReferenceWindingObservation(parallel, true, 0.5, 0, winding);
+    CHECK(other.constraintClass == FiberTraceReferenceConstraintClass::ParallelOtherWinding);
+    CHECK(other.inferredReferenceWindingCount == 2);
+    CHECK(other.inferredReferenceWindings[0] == 2.25);
+    CHECK(other.inferredReferenceWindings[1] == 6.25);
+
+    parallel.windingDistance = 0.49;
+    const auto same = makeFiberTraceReferenceWindingObservation(parallel, true, 0.5, 1, winding);
+    CHECK(same.constraintClass == FiberTraceReferenceConstraintClass::ParallelSameWinding);
+    CHECK(same.integerGauge == 4);
+    CHECK(same.inferredReferenceWindingCount == 1);
+    CHECK(same.inferredReferenceWindings[0] == -2.0);
+
+    const auto defect = makeFiberTraceReferenceWindingObservation(perpendicular, true, 1.0, 2, winding);
+    CHECK(defect.integerGauge == 5);
+    CHECK(defect.inferredReferenceWindingCount == 0);
 }
 
 TEST_CASE("H/V-aware winding evidence decays by half-integer distance bin")
@@ -381,6 +540,10 @@ TEST_CASE("H/V-aware winding uses unsigned parallel targets and cutoff")
     CHECK(orientationOnlyResult.windingValid ==
         std::vector<unsigned char>{1, 1});
     CHECK(orientationOnlyResult.mapWinding == std::vector<int>{0, 0});
+    CHECK(orientationOnlyResult.integerGaugeByPiece == std::vector<std::size_t>{0, 1});
+    CHECK(orientationOnlyResult.mapOrientationByPiece == std::vector{FiberTraceFixedOrientation::Horizontal, FiberTraceFixedOrientation::Vertical});
+    CHECK(orientationOnlyResult.mapLatentCoordinate[0] == 0.0);
+    CHECK(orientationOnlyResult.mapLatentCoordinate[1] == doctest::Approx(0.5 * static_cast<double>(orientationOnlyResult.componentPhaseSign.at(0))));
 
     auto invalid = unfiltered;
     invalid.parallelWindingDistanceCutoff = 0.0;
@@ -719,6 +882,8 @@ TEST_CASE("Joint-grid winding resolves fixed half-step targets")
     CHECK(solved.mapWinding == std::vector<int>{0, 1, 0});
     CHECK(solved.windingValid == std::vector<unsigned char>{1, 1, 0});
     CHECK(solved.hardSignProjectedDefects == 1);
+    CHECK(solved.mapOrientationByPiece[2] == FiberTraceFixedOrientation::Mixed);
+    CHECK(std::isnan(solved.mapLatentCoordinate[2]));
     CHECK(solved.classAProbability[0] > 0.99);
     CHECK(solved.classBProbability[1] > 0.9);
     CHECK(solved.classAProbability[2] > 0.9);

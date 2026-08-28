@@ -2,6 +2,8 @@
 
 #include "vc/fiber_tracer/FiberTraceBeliefPropagation.hpp"
 
+#include <array>
+
 #include <cstddef>
 #include <functional>
 #include <optional>
@@ -70,6 +72,21 @@ struct FiberTraceWindingBeliefPropagationConfig {
     std::size_t parallelWorkers = 1;
     std::optional<double> parallelWindingDistanceCutoff;
 };
+
+struct FiberTraceWindingComponentSelection {
+    std::vector<std::size_t> retainedPieceIndices;
+    std::size_t components = 0;
+    std::size_t retainedPieces = 0;
+    std::size_t removedPieces = 0;
+};
+
+[[nodiscard]] FiberTraceWindingComponentSelection selectLargestFiberTraceWindingComponent(
+    const FiberTraceConstraintReport& constraints,
+    const FiberTraceBeliefTopology& topology,
+    const FiberTraceWindingBeliefPropagationConfig& config,
+    std::span<const FiberTraceFixedOrientation> fixedOrientations = {},
+    bool quantizeComponentTargets = true,
+    std::optional<std::size_t> preferredPiece = std::nullopt);
 
 struct FiberTraceInterleavedWindingConfig : FiberTraceWindingBeliefPropagationConfig {
     double mixedUnaryCost = 0.5;
@@ -190,6 +207,7 @@ struct FiberTraceWindingBeliefPropagationReport {
     std::vector<int> candidateMinimum;
     std::vector<int> candidateMaximum;
     std::vector<std::size_t> componentByPiece;
+    std::vector<std::size_t> integerGaugeByPiece;
     std::vector<std::size_t> gaugePieces;
     std::vector<std::size_t> incidentSignedConstraints;
     std::vector<std::size_t> incidentSkippedConstraints;
@@ -215,6 +233,8 @@ struct FiberTraceInterleavedWindingReport : FiberTraceWindingBeliefPropagationRe
     std::vector<double> mixedProbability;
     std::vector<double> classBProbability;
     std::vector<double> posteriorMeanLatentCoordinate;
+    std::vector<double> mapLatentCoordinate;
+    std::vector<FiberTraceFixedOrientation> mapOrientationByPiece;
     std::vector<int> componentPhaseSign;
     std::vector<double> componentPositivePhaseSignProbability;
     std::vector<FiberTraceFixedOrientation> fixedOrientationByPiece;
@@ -242,6 +262,46 @@ struct FiberTraceInterleavedWindingReport : FiberTraceWindingBeliefPropagationRe
     std::size_t rankDeficientUpdates = 0;
     bool calibrationConverged = false;
 };
+
+enum class FiberTraceReferenceConstraintClass : unsigned char {
+    Perpendicular,
+    ParallelSameWinding,
+    ParallelOtherWinding,
+};
+
+struct FiberTraceReferenceWindingObservation {
+    FiberTraceReferenceConstraintClass constraintClass = FiberTraceReferenceConstraintClass::Perpendicular;
+    std::size_t integerGauge = 0;
+    double virtualReferenceWinding = 0.0;
+    std::array<double, 2> inferredReferenceWindings{0.0, 0.0};
+    std::size_t inferredReferenceWindingCount = 0;
+};
+
+struct FiberTraceReferenceBenchmarkCounts {
+    std::size_t right = 0;
+    std::size_t wrong = 0;
+    std::size_t total = 0;
+};
+
+struct FiberTraceReferenceGaugeCalibration {
+    std::size_t integerGauge = 0;
+    double offset = 0.0;
+    std::size_t observations = 0;
+    std::size_t right = 0;
+};
+
+struct FiberTraceReferenceWindingBenchmark {
+    double tolerance = 0.5;
+    std::vector<FiberTraceReferenceGaugeCalibration> gauges;
+    std::array<FiberTraceReferenceBenchmarkCounts, 3> classes;
+    FiberTraceReferenceBenchmarkCounts sum;
+};
+
+[[nodiscard]] FiberTraceReferenceWindingObservation makeFiberTraceReferenceWindingObservation(
+    const FiberTraceConstraint& constraint, bool referenceIsEndpointA, double virtualReferenceWinding, std::size_t bpPiece, const FiberTraceInterleavedWindingReport& winding);
+
+[[nodiscard]] FiberTraceReferenceWindingBenchmark calibrateFiberTraceReferenceWindings(
+    std::span<const FiberTraceReferenceWindingObservation> observations, double tolerance = 0.5);
 
 [[nodiscard]] FiberTraceWindingBeliefPropagationReport
 solveFiberTraceWindingBeliefPropagation(

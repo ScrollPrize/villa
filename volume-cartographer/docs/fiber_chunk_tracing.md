@@ -1151,6 +1151,56 @@ The Napari command above automatically loads this sibling as the independent
 `direction-ablation` run without the reference options removes an older
 reference sibling owned by that output base.
 
+For `--bp-only --bp-inference sum-product-mixed`, the same reference data also
+benchmarks the solved BP winding result. Reference runs reuse their canonical
+constraint pieces, while the represented BP lines remain exactly one input
+piece each. A filtered cross extraction measures only reference-to-BP pairs
+after that solver run has retained its main winding component; reference
+geometry never enters the solve.
+
+Before the final BP-only winding solve, the command retains only the largest
+component of the exact effective-winding graph. Fixed-orientation runs repeat
+their orientation prepass and component filtering until one component remains,
+then reuse that stable prepass. Source traces, split pieces, constraints, and
+output provenance are remapped together. If filtering removes pieces between
+two retained runs of one source trace, each contiguous retained run becomes a
+separate represented trace; the removed arc gap is never treated as hard
+continuity. The `fiber BP main winding component`
+line reports cumulative trace, piece, and constraint counts before and after
+filtering. Equal sizes prefer the crop-central piece and then the lowest piece
+index.
+
+The benchmark uses each BP piece's authoritative post-projection MAP latent
+coordinate. Perpendicular constraints infer the reference coordinate from the
+signed canonical half-step and solved measurement scale. Parallel constraints
+use the scale-independent canonical integer distance and test both signs;
+distance zero and nonzero are reported separately. Constraints ending at a
+final Defect/Mixed or otherwise winding-invalid BP piece are excluded from both
+offset calibration and right/wrong totals. Unsigned perpendicular observations
+also have no candidate and are excluded.
+
+The filename-ordered reference stack is calibrated separately against every
+independently gauged BP winding subgraph. Each offset is selected by exhaustive
+closed-interval event search to maximize matches within an inclusive `0.5`
+winding tolerance. Offset ties prefer the value closest to zero, then the lower
+signed value. Output first lists each gauge's offset and matched/total count,
+then reports:
+
+```text
+class  right  wrong  total  right_percent
+perpendicular  ...
+parallel_same  ...
+parallel_other  ...
+sum  ...
+```
+
+Exact orientation-score ties are perpendicular. Every accepted measured cross
+piece pair contributes once, including repeated constraints involving the same
+source fibers, provided its final BP endpoint has a valid active winding
+candidate. A zero-total class reports `NA` rather than a percentage. The full
+reference/reference section and every reference-to-BP table are buffered and
+printed after all ordinary command output.
+
 ## Quality groups
 
 Visualization stably sorts traces by ascending cost density and then stored

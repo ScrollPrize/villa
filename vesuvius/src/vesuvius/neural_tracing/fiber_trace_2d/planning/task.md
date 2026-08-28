@@ -1,7 +1,11 @@
-# Task: circular winding visibility-mask controls
+# Task: retain the main BP constraint component
 
-Previous/next must circularly shift the complete managed layer visibility mask
-by one winding. Visible and hidden bits for H, V, error, and tie all move
-together, so when every winding except one is visible the empty winding moves.
-Use full-size labeled buttons rather than tiny arrow tool buttons. H and V at
-one winding must receive the exact same color in actual Napari layer creation.
+For `vc_fiber_trace_chunk direction-ablation` BP runs:
+
+- remove disconnected BP constraint subgraphs before solving and retain only
+  the largest main component;
+- keep component selection independent of optional reference fibers;
+- move the reference/reference constraint tables and the reference-to-BP
+  winding benchmark to the end of CLI output.
+- exclude final Mixed/Defect or otherwise winding-invalid BP pieces from both
+  reference offset calibration and benchmark totals.

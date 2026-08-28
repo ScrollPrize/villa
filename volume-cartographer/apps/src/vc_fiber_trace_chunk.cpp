@@ -958,7 +958,8 @@ void printConstraintReport(
                       : "off") << "  "
               << config.parallelThreads << '\n'
               << "fiber trace constraint counts\n"
-              << "traces  degenerate  pieces  samples  spatial_hits  candidates  measured  hard  tangent_rejected  winding_invalid  winding_cutoff  manifest_matches_trace\n"
+              << "traces  degenerate  pieces  samples  spatial_hits  candidates  measured  hard  tangent_rejected  winding_invalid  "
+                 "winding_cutoff  manifest_matches_trace\n"
               << report.inputTraces << "  " << report.skippedDegenerateTraces << "  "
               << report.pieces.size() << "  " << report.resampledPoints << "  "
               << report.spatialHits << "  " << report.measuredCandidates << "  "
@@ -976,7 +977,8 @@ void printConstraintReport(
                   << quantile(winding, fraction) << '\n';
     }
     std::cout << "fiber trace constraint timing\n"
-              << "prepare_seconds  search_seconds  orientation_seconds  winding_seconds  score_seconds  total_wall_seconds  total_cpu_seconds\n"
+              << "prepare_seconds  search_seconds  orientation_seconds  winding_seconds  score_seconds  total_wall_seconds  "
+                 "total_cpu_seconds\n"
               << report.prepareSeconds << "  " << report.searchSeconds << "  "
               << report.orientationScoreSeconds << "  "
               << report.windingScoreSeconds << "  "
@@ -1000,7 +1002,8 @@ void printConstraintPruningReport(
                   << std::setw(12) << stats.connectedComponents << '\n';
     };
     std::cout << "fiber trace constraint strength pruning\n"
-              << "limit  input_total  retained_total  hard  zero_rejected  discarded  recovery_candidates  expected_bridges  recovery_bridges  cap_bridges  overflow_bridges  fibers_over_limit\n"
+              << "limit  input_total  retained_total  hard  zero_rejected  discarded  recovery_candidates  expected_bridges  "
+                 "recovery_bridges  cap_bridges  overflow_bridges  fibers_over_limit\n"
               << report.maximumConstraintsPerTrace << "  "
               << report.inputTotalConstraints << "  "
               << report.retainedTotalConstraints << "  "
@@ -1036,7 +1039,9 @@ void printLabelingReport(
     };
     std::cout << std::setprecision(8)
               << "fiber trace labeling optimization\n"
-              << "status  hv_only  perpendicular_only  objective  orientation_cost  winding_cost  broken_cost  broken_cost_per_link  retained_links  excluded_non_perpendicular  excluded_parallel_separate_winding  requested_mip_gap  variables  integer_variables  rows  mip_nodes  mip_gap  solve_seconds\n"
+              << "status  hv_only  perpendicular_only  objective  orientation_cost  winding_cost  broken_cost  broken_cost_per_link  "
+                 "retained_links  excluded_non_perpendicular  excluded_parallel_separate_winding  requested_mip_gap  variables  "
+                 "integer_variables  rows  mip_nodes  mip_gap  solve_seconds\n"
               << report.modelStatus << "  " << (report.hvOnly ? "true" : "false")
               << "  " << (config.perpendicularOnly ? "true" : "false")
               << "  " << report.objective << "  "
@@ -1136,7 +1141,8 @@ void printDirectionDiagnosticReport(
                   << rate << '\n';
     }
     std::cout << "fiber direction MILP errors\n"
-              << "orientation_errors  broken_errors  defect_active_errors  total_errors  piece_error_rate  error_fibers  represented_fibers  fiber_error_rate\n"
+              << "orientation_errors  broken_errors  defect_active_errors  total_errors  piece_error_rate  error_fibers  "
+                 "represented_fibers  fiber_error_rate\n"
               << comparison.orientationErrors << "  "
               << comparison.brokenErrors << "  "
               << comparison.defectActiveErrors << "  " << errors << "  "
@@ -1144,7 +1150,8 @@ void printDirectionDiagnosticReport(
               << comparison.errorTraces << "  "
               << comparison.representedTraces << "  " << traceErrorRate << '\n'
               << "fiber direction MILP error details\n"
-              << "piece  filtered_trace  original_trace  trace_piece  begin_arc  end_arc  initial  raw_label  component  flipped  aligned  kind\n";
+              << "piece  filtered_trace  original_trace  trace_piece  begin_arc  end_arc  initial  raw_label  component  flipped  aligned  "
+                 "kind\n";
     for (const auto& error : comparison.errors) {
         if (error.filteredTraceIndex >= originalTraceIndices.size()) {
             throw std::logic_error(
@@ -1184,7 +1191,10 @@ void printRelaxedLabelingReport(
 {
     std::cout << std::setprecision(8)
               << "fiber trace labeling continuous values\n"
-              << "status  mode  hv_only  perpendicular_only  requested_solver  requested_parallel  threads  objective  orientation_cost  winding_cost  broken_cost  broken_cost_per_link  retained_links  excluded_non_perpendicular  excluded_parallel_separate_winding  variables  integer_variables  perpendicular_branch_variables  rows  gauge_roots  triangles  triangle_rows  mip_nodes  mip_gap  solve_seconds  csv\n"
+              << "status  mode  hv_only  perpendicular_only  requested_solver  requested_parallel  threads  objective  orientation_cost  "
+                 "winding_cost  broken_cost  broken_cost_per_link  retained_links  excluded_non_perpendicular  "
+                 "excluded_parallel_separate_winding  variables  integer_variables  perpendicular_branch_variables  rows  gauge_roots  "
+                 "triangles  triangle_rows  mip_nodes  mip_gap  solve_seconds  csv\n"
               << report.modelStatus << "  "
               << (report.exactPerpendicularMilp
                       ? "exact_perpendicular_milp"
@@ -1397,12 +1407,15 @@ void writeAndPrintBpReport(
         winding.candidateMinimum.size() != lines.size() ||
         winding.candidateMaximum.size() != lines.size() ||
         winding.componentByPiece.size() != lines.size() ||
+        winding.integerGaugeByPiece.size() != lines.size() ||
         winding.incidentSignedConstraints.size() != lines.size() ||
         winding.incidentSkippedConstraints.size() != lines.size() ||
         (interleaved &&
          (interleaved->classAProbability.size() != lines.size() ||
           interleaved->mixedProbability.size() != lines.size() ||
-          interleaved->classBProbability.size() != lines.size())) ||
+          interleaved->classBProbability.size() != lines.size() ||
+          interleaved->mapLatentCoordinate.size() != lines.size() ||
+          interleaved->mapOrientationByPiece.size() != lines.size())) ||
         (mixedState &&
          (report.verticalProbability.size() != lines.size() ||
           report.mixedProbability.size() != lines.size() ||
@@ -2505,6 +2518,8 @@ struct ReferenceFiberDiagnostics {
     std::vector<vc::fiber_tracer::FiberletCropTraceLine> lines;
     std::vector<std::size_t> sourceIds;
     std::vector<std::string> sourceNames;
+    std::vector<vc::fiber_tracer::FiberletCropTraceLine> pieceLines;
+    std::vector<std::size_t> sourceIdsByPiece;
     std::size_t sourceFibers = 0;
 };
 
@@ -2568,7 +2583,7 @@ std::optional<ReferenceFiberDiagnostics> updateReferenceFiberArtifact(
     return diagnostics;
 }
 
-void printReferenceFiberConstraints(
+std::string formatReferenceFiberConstraints(
     const ReferenceFiberDiagnostics& reference,
     const vc::fiber_tracer::FiberTraceConstraintReport& report)
 {
@@ -2654,7 +2669,154 @@ void printReferenceFiberConstraints(
            << std::setw(12) << counts.correct
            << std::setw(12) << counts.falseCount
            << counts.total << '\n';
-    std::cout << output.str();
+    return output.str();
+}
+
+void prepareReferenceFiberPieces(
+    ReferenceFiberDiagnostics& reference,
+    const vc::fiber_tracer::FiberTraceConstraintReport& report)
+{
+    if (report.inputTraces != reference.lines.size() ||
+        reference.sourceIds.size() != reference.lines.size()) {
+        throw std::invalid_argument(
+            "Reference constraint report does not match cropped runs");
+    }
+    reference.pieceLines = vc::fiber_tracer::makeFiberTraceConstraintPieceLines(reference.lines, report);
+    reference.sourceIdsByPiece.clear();
+    reference.sourceIdsByPiece.reserve(report.pieces.size());
+    for (const auto& piece : report.pieces) {
+        if (piece.traceIndex >= reference.sourceIds.size()) {
+            throw std::invalid_argument("Reference constraint piece source is out of range");
+        }
+        reference.sourceIdsByPiece.push_back(reference.sourceIds[piece.traceIndex]);
+    }
+}
+
+struct ReferenceBpCrossConstraints {
+    vc::fiber_tracer::FiberTraceConstraintReport report;
+    std::size_t referencePieces = 0;
+};
+
+ReferenceBpCrossConstraints extractReferenceBpCrossConstraints(
+    const ReferenceFiberDiagnostics& reference,
+    const std::vector<vc::fiber_tracer::FiberletCropTraceLine>& bpPieceLines,
+    const Options& options,
+    const vc::lasagna::LasagnaNormalSampler& normals,
+    const vc::fiber_tracer::LasagnaNormalAlignmentField& alignedNormals)
+{
+    if (reference.pieceLines.size() != reference.sourceIdsByPiece.size()) {
+        throw std::invalid_argument("Reference diagnostic pieces do not match their source IDs");
+    }
+    std::vector<vc::fiber_tracer::FiberletCropTraceLine> combined;
+    combined.reserve(reference.pieceLines.size() + bpPieceLines.size());
+    combined.insert(combined.end(), reference.pieceLines.begin(), reference.pieceLines.end());
+    combined.insert(combined.end(), bpPieceLines.begin(), bpPieceLines.end());
+
+    auto config = options.constraints;
+    config.preserveInputLinesAsPieces = true;
+    const std::size_t referencePieces = reference.pieceLines.size();
+    auto report = vc::fiber_tracer::extractFiberTraceConstraints(
+        combined,
+        config,
+        [&normals](const cv::Vec3d& a, const cv::Vec3d& b, double step) {
+            return normals.normalAlignedWindingDistance(a, b, step);
+        },
+        [&normals](
+            const std::vector<std::pair<cv::Vec3d, cv::Vec3d>>& connectors,
+            double step,
+            int threads) {
+            return normals.normalAlignedWindingDistancesBatch(
+                connectors, step, threads);
+        },
+        [referencePieces](std::size_t a, std::size_t b) {
+            return (a < referencePieces) != (b < referencePieces);
+        });
+    if (report.pieces.size() != combined.size()) {
+        throw std::logic_error("Reference/BP cross extraction did not preserve input pieces");
+    }
+    vc::fiber_tracer::orientFiberTraceConstraintWindings(report, alignedNormals);
+    return {std::move(report), referencePieces};
+}
+
+std::string formatReferenceBpWindingBenchmark(
+    const ReferenceFiberDiagnostics& reference,
+    const ReferenceBpCrossConstraints& cross,
+    const vc::fiber_tracer::FiberTraceInterleavedWindingReport& winding,
+    vc::fiber_tracer::FiberTraceBalanceMode balanceMode)
+{
+    if (cross.report.inputTraces < cross.referencePieces) {
+        throw std::invalid_argument("Reference/BP cross report has fewer traces than references");
+    }
+    const std::size_t bpPieces = cross.report.inputTraces - cross.referencePieces;
+    if (reference.sourceIdsByPiece.size() != cross.referencePieces ||
+        winding.windingValid.size() != bpPieces ||
+        winding.mapLatentCoordinate.size() != bpPieces ||
+        winding.mapOrientationByPiece.size() != bpPieces ||
+        winding.integerGaugeByPiece.size() != bpPieces) {
+        throw std::invalid_argument("Reference/BP benchmark inputs do not match represented pieces");
+    }
+
+    std::vector<vc::fiber_tracer::FiberTraceReferenceWindingObservation> observations;
+    observations.reserve(cross.report.constraints.size());
+    for (const auto& constraint : cross.report.constraints) {
+        if (constraint.hardContinuity)
+            continue;
+        if (constraint.pieceA >= cross.report.pieces.size() || constraint.pieceB >= cross.report.pieces.size()) {
+            throw std::invalid_argument("Reference/BP constraint references an invalid piece");
+        }
+        const std::size_t traceA = cross.report.pieces[constraint.pieceA].traceIndex;
+        const std::size_t traceB = cross.report.pieces[constraint.pieceB].traceIndex;
+        const bool referenceIsA = traceA < cross.referencePieces;
+        const bool referenceIsB = traceB < cross.referencePieces;
+        if (referenceIsA == referenceIsB) {
+            throw std::logic_error("Reference/BP cross report contains a non-cross constraint");
+        }
+        const std::size_t referencePiece = referenceIsA ? traceA : traceB;
+        const std::size_t bpPiece = (referenceIsA ? traceB : traceA) - cross.referencePieces;
+        observations.push_back(vc::fiber_tracer::
+                makeFiberTraceReferenceWindingObservation(
+                    constraint,
+                    referenceIsA,
+                    0.5 * static_cast<double>(
+                        reference.sourceIdsByPiece[referencePiece]),
+                    bpPiece,
+                    winding));
+    }
+
+    const auto benchmark = vc::fiber_tracer::calibrateFiberTraceReferenceWindings(observations);
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << "reference-to-BP winding benchmark"
+           << " balance=" << vc::fiber_tracer::fiberTraceBalanceModeName(balanceMode)
+           << " solver="
+           << vc::fiber_tracer::fiberTraceWindingSolverName(winding.solver)
+           << " status=" << winding.status
+           << " tolerance=" << std::fixed << std::setprecision(3) << benchmark.tolerance << '\n'
+           << "gauge calibration\n"
+           << std::left << std::setw(12) << "gauge" << std::setw(14) << "offset" << std::setw(12) << "right"
+           << "total\n";
+    for (const auto& gauge : benchmark.gauges) {
+        output << std::setw(12) << gauge.integerGauge
+               << std::setw(14) << gauge.offset
+               << std::setw(12) << gauge.right
+               << gauge.observations << '\n';
+    }
+    output << "constraint accuracy\n"
+           << std::setw(20) << "class" << std::setw(12) << "right" << std::setw(12) << "wrong" << std::setw(12) << "total"
+           << "right_percent\n";
+    constexpr std::array<const char*, 4> names{"perpendicular", "parallel_same", "parallel_other", "sum"};
+    for (std::size_t index = 0; index < names.size(); ++index) {
+        const auto& counts = index < benchmark.classes.size() ? benchmark.classes[index] : benchmark.sum;
+        output << std::setw(20) << names[index]
+               << std::setw(12) << counts.right
+               << std::setw(12) << counts.wrong
+               << std::setw(12) << counts.total;
+        if (counts.total == 0)
+            output << "NA\n";
+        else
+            output << 100.0 * static_cast<double>(counts.right) / static_cast<double>(counts.total) << "%\n";
+    }
+    return output.str();
 }
 
 }  // namespace
@@ -2753,6 +2915,8 @@ int main(int argc, char** argv)
                 diagnosticDirections;
             std::optional<vc::fiber_tracer::FiberDirectionClassification>
                 diagnosticClassification;
+            std::optional<ReferenceFiberDiagnostics> referenceDiagnostics;
+            std::vector<std::string> deferredReferenceDiagnostics;
             const std::vector<vc::fiber_tracer::FiberletCropTraceLine>*
                 constraintLines = &artifact.lines;
             if (options.mode == Mode::DirectionDiagnostic ||
@@ -2764,7 +2928,6 @@ int main(int argc, char** argv)
                     ? std::filesystem::path{"."}
                     : options.output.parent_path();
                 std::filesystem::create_directories(outputDirectory);
-                std::optional<ReferenceFiberDiagnostics> referenceDiagnostics;
                 if (options.mode == Mode::DirectionAblation) {
                     referenceDiagnostics = updateReferenceFiberArtifact(
                         options,
@@ -2790,7 +2953,10 @@ int main(int argc, char** argv)
                                 return normals.normalAlignedWindingDistancesBatch(
                                     connectors, step, threads);
                             });
-                    printReferenceFiberConstraints(
+                    deferredReferenceDiagnostics.push_back(
+                        formatReferenceFiberConstraints(
+                            *referenceDiagnostics, referenceConstraints));
+                    prepareReferenceFiberPieces(
                         *referenceDiagnostics, referenceConstraints);
                 }
                 const std::filesystem::path initialOutput = outputDirectory /
@@ -2902,48 +3068,24 @@ int main(int argc, char** argv)
                         checkpointPruning = std::move(pruning.report);
                     }
                     if (options.bpOnly) {
-                        auto bpConstraints = checkpointReport;
+                        auto selectedBpConstraints = checkpointReport;
                         const auto selection = vc::fiber_tracer::
                             selectFiberTraceLabelConstraints(
                                 checkpointReport, options.labeling);
-                        bpConstraints.constraints.clear();
-                        bpConstraints.constraints.reserve(
+                        selectedBpConstraints.constraints.clear();
+                        selectedBpConstraints.constraints.reserve(
                             selection.retainedIndices.size());
                         for (const std::size_t index : selection.retainedIndices) {
-                            bpConstraints.constraints.push_back(
+                            selectedBpConstraints.constraints.push_back(
                                 checkpointReport.constraints.at(index));
                         }
                         std::cout
                             << "fiber direction BP-only cohort"
                             << " admitted=" << admittedCount
                             << " fibers=" << diagnosticLines.size()
-                            << " pieces=" << bpConstraints.pieces.size()
+                            << " pieces=" << selectedBpConstraints.pieces.size()
                             << " selected_constraints="
-                            << bpConstraints.constraints.size() << '\n';
-                        const auto bpPieceLines = vc::fiber_tracer::
-                            makeFiberTraceConstraintPieceLines(
-                                diagnosticLines, bpConstraints);
-                        const auto bpTopology = vc::fiber_tracer::
-                            prepareFiberTraceBeliefTopology(
-                                diagnosticLines,
-                                bpConstraints,
-                                artifact.minimumBaseXYZ,
-                                artifact.maximumBaseXYZ);
-                        std::vector<std::size_t> bpOriginalTraceIndices;
-                        std::vector<vc::fiber_tracer::FiberDirectionGroup>
-                            bpDirections;
-                        bpOriginalTraceIndices.reserve(bpConstraints.pieces.size());
-                        bpDirections.reserve(bpConstraints.pieces.size());
-                        for (const auto& piece : bpConstraints.pieces) {
-                            if (piece.traceIndex >= diagnosticLines.size()) {
-                                throw std::logic_error(
-                                    "BP piece references an invalid cohort source fiber");
-                            }
-                            bpOriginalTraceIndices.push_back(
-                                diagnosticOriginalTraceIndices[piece.traceIndex]);
-                            bpDirections.push_back(
-                                diagnosticDirections[piece.traceIndex]);
-                        }
+                            << selectedBpConstraints.constraints.size() << '\n';
                         const auto runBp = [&] (
                                                vc::fiber_tracer::
                                                    FiberTraceBalanceMode mode) {
@@ -2970,6 +3112,10 @@ int main(int argc, char** argv)
                                 static_cast<std::size_t>(options.threads);
                             windingConfig.parallelWindingDistanceCutoff =
                                 options.parallelWindingCutoff;
+                            auto bpConstraints = selectedBpConstraints;
+                            auto bpSourceLines = diagnosticLines;
+                            auto bpSourceOriginalTraceIndices = diagnosticOriginalTraceIndices;
+                            auto bpSourceDirections = diagnosticDirections;
                             std::optional<vc::fiber_tracer::
                                 FiberTraceWindingBeliefPropagationReport>
                                     independentWinding;
@@ -2981,6 +3127,8 @@ int main(int argc, char** argv)
                                     FiberTraceBeliefInference::SumProductMixed &&
                                 options.windingSolver == vc::fiber_tracer::
                                     FiberTraceWindingSolver::JointGrid;
+                            auto bpTopology = vc::fiber_tracer::
+                                prepareFiberTraceBeliefTopology(bpSourceLines, bpConstraints, artifact.minimumBaseXYZ, artifact.maximumBaseXYZ);
                             std::vector<vc::fiber_tracer::
                                 FiberTraceFixedOrientation> fixedOrientations;
                             const auto solveOrientation = [&] {
@@ -2993,24 +3141,21 @@ int main(int argc, char** argv)
                                 case vc::fiber_tracer::
                                     FiberTraceBeliefInference::MinSum:
                                     report = vc::fiber_tracer::
-                                        solveFiberTraceBeliefPropagation(
-                                            diagnosticLines,
+                                        solveFiberTraceBeliefPropagation(bpSourceLines,
                                             bpConstraints,
                                             config);
                                     break;
                                 case vc::fiber_tracer::
                                     FiberTraceBeliefInference::SumProduct:
                                     report = vc::fiber_tracer::
-                                        solveFiberTraceSumProduct(
-                                            diagnosticLines,
+                                        solveFiberTraceSumProduct(bpSourceLines,
                                             bpConstraints,
                                             config);
                                     break;
                                 case vc::fiber_tracer::
                                     FiberTraceBeliefInference::SumProductMixed:
                                     report = vc::fiber_tracer::
-                                        solveFiberTraceMixedSumProduct(
-                                            diagnosticLines,
+                                        solveFiberTraceMixedSumProduct(bpSourceLines,
                                             bpConstraints,
                                             config);
                                     break;
@@ -3024,11 +3169,94 @@ int main(int argc, char** argv)
                                     << "s\n"
                                     << std::flush;
                             };
-                            if (!jointGrid || options.windingFixedOrientation)
+                            const std::size_t inputPieces =
+                                bpConstraints.pieces.size();
+                            const std::size_t inputTraces = bpConstraints.inputTraces;
+                            const std::size_t inputConstraints =
+                                bpConstraints.constraints.size();
+                            std::size_t componentRounds = 0;
+                            while (true) {
+                                if (bpConstraints.pieces.empty()) {
+                                    throw std::runtime_error("BP main winding component is empty");
+                                }
+                                fixedOrientations.clear();
+                                if (options.windingFixedOrientation) {
+                                    solveOrientation();
+                                    fixedOrientations = vc::fiber_tracer::
+                                        fixedFiberTraceOrientations(report);
+                                }
+                                const auto component = vc::fiber_tracer::
+                                    selectLargestFiberTraceWindingComponent(
+                                        bpConstraints,
+                                        bpTopology,
+                                        windingConfig,
+                                        fixedOrientations,
+                                        options.bpInference == vc::fiber_tracer::
+                                            FiberTraceBeliefInference::SumProductMixed,
+                                        bpTopology.centralSeedPiece);
+                                if (component.components <= 1)
+                                    break;
+                                const auto subset = vc::fiber_tracer::
+                                    subsetFiberTraceConstraintReport(
+                                        bpConstraints,
+                                        component.retainedPieceIndices);
+                                std::vector<vc::fiber_tracer::FiberletCropTraceLine> nextLines;
+                                std::vector<std::size_t> nextOriginalIndices;
+                                std::vector<vc::fiber_tracer::FiberDirectionGroup> nextDirections;
+                                nextLines.reserve(subset.retainedTraceIndices.size());
+                                nextOriginalIndices.reserve(subset.retainedTraceIndices.size());
+                                nextDirections.reserve(subset.retainedTraceIndices.size());
+                                for (const std::size_t oldTrace : subset.retainedTraceIndices) {
+                                    nextLines.push_back(bpSourceLines.at(oldTrace));
+                                    nextOriginalIndices.push_back(bpSourceOriginalTraceIndices.at(oldTrace));
+                                    nextDirections.push_back(bpSourceDirections.at(oldTrace));
+                                }
+                                bpConstraints = subset.report;
+                                bpSourceLines = std::move(nextLines);
+                                bpSourceOriginalTraceIndices = std::move(nextOriginalIndices);
+                                bpSourceDirections = std::move(nextDirections);
+                                bpTopology = vc::fiber_tracer::
+                                    prepareFiberTraceBeliefTopology(
+                                        bpSourceLines,
+                                        bpConstraints,
+                                        artifact.minimumBaseXYZ,
+                                        artifact.maximumBaseXYZ);
+                                ++componentRounds;
+                                if (componentRounds > inputPieces) {
+                                    throw std::logic_error("BP component filtering did not converge");
+                                }
+                            }
+                            if (!options.windingFixedOrientation && !jointGrid)
                                 solveOrientation();
-                            if (options.windingFixedOrientation) {
-                                fixedOrientations = vc::fiber_tracer::
-                                    fixedFiberTraceOrientations(report);
+                            std::cout
+                                << "fiber BP main winding component"
+                                << " rounds=" << componentRounds
+                                << " traces=" << inputTraces << "->"
+                                << bpConstraints.inputTraces
+                                << " pieces=" << inputPieces << "->"
+                                << bpConstraints.pieces.size()
+                                << " constraints=" << inputConstraints << "->"
+                                << bpConstraints.constraints.size() << '\n';
+
+                            const auto bpPieceLines = vc::fiber_tracer::makeFiberTraceConstraintPieceLines(bpSourceLines, bpConstraints);
+                            std::vector<std::size_t> bpOriginalTraceIndices;
+                            std::vector<vc::fiber_tracer::FiberDirectionGroup> bpDirections;
+                            bpOriginalTraceIndices.reserve(bpConstraints.pieces.size());
+                            bpDirections.reserve(bpConstraints.pieces.size());
+                            for (const auto& piece : bpConstraints.pieces) {
+                                if (piece.traceIndex >= bpSourceLines.size()) {
+                                    throw std::logic_error("BP piece references an invalid filtered source fiber");
+                                }
+                                bpOriginalTraceIndices.push_back(bpSourceOriginalTraceIndices.at(piece.traceIndex));
+                                bpDirections.push_back(bpSourceDirections.at(piece.traceIndex));
+                            }
+                            std::optional<ReferenceBpCrossConstraints> referenceBpConstraints;
+                            if (referenceDiagnostics && options.bpInference == vc::fiber_tracer::FiberTraceBeliefInference::SumProductMixed) {
+                                if (!alignedNormalField) {
+                                    throw std::logic_error("Reference/BP benchmark requires aligned normals");
+                                }
+                                referenceBpConstraints =
+                                    extractReferenceBpCrossConstraints(*referenceDiagnostics, bpPieceLines, options, normals, *alignedNormalField);
                             }
                             if (jointGrid) {
                                 auto joint = options.jointGrid;
@@ -3202,6 +3430,10 @@ int main(int argc, char** argv)
                                       FiberTraceWindingBeliefPropagationReport&>(
                                       *interleavedWinding)
                                 : *independentWinding;
+                            if (referenceBpConstraints && interleavedWinding) {
+                                deferredReferenceDiagnostics.push_back(
+                                    formatReferenceBpWindingBenchmark(*referenceDiagnostics, *referenceBpConstraints, *interleavedWinding, mode));
+                            }
                             writeAndPrintBpReport(
                                 report,
                                 winding,
@@ -3547,6 +3779,14 @@ int main(int argc, char** argv)
                         std::cout
                             << "fiber direction ablation final_extracted_constraints="
                             << extractedConstraints.size() << '\n';
+                    }
+                }
+                if (!deferredReferenceDiagnostics.empty()) {
+                    std::cout << "\nreference diagnostics\n";
+                    for (const auto& diagnostic : deferredReferenceDiagnostics) {
+                        std::cout << diagnostic;
+                        if (diagnostic.empty() || diagnostic.back() != '\n')
+                            std::cout << '\n';
                     }
                 }
                 return 0;
