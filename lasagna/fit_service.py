@@ -1936,6 +1936,9 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
                     valid = st.get("flatten_source_valid")
                     if hasattr(valid, "detach"):
                         valid = valid.detach().cpu().numpy()
+                    cell_valid = st.get("flatten_source_cell_valid")
+                    if hasattr(cell_valid, "detach"):
+                        cell_valid = cell_valid.detach().cpu().numpy()
                     write_sidecars(
                         str(uv_export.get("directory") or ""), value,
                         fingerprint=str(
@@ -1943,6 +1946,7 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
                         source_step=float(uv_export["source_step"]),
                         output_step=float(uv_export["output_step"]),
                         valid=valid,
+                        cell_valid=cell_valid,
                         winding_column_ranges=uv_export.get(
                             "winding_column_ranges"),
                         winding_ids=uv_export.get("winding_ids"),

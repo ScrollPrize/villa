@@ -1469,7 +1469,7 @@ def _run_flatten_mode(
 		if not isinstance(warm_spec, dict):
 			raise ValueError("flatten_initial_uv must be an object")
 		from flatten_uv import load_sidecars, validate_uv
-		uv_np, stored_valid_np, uv_metadata = load_sidecars(
+		uv_np, stored_valid_np, stored_cell_valid_np, uv_metadata = load_sidecars(
 			str(warm_spec.get("metadata_path") or ""),
 			expected_source_step=source_step,
 			expected_output_step=flatten_output_step,
@@ -1492,7 +1492,9 @@ def _run_flatten_mode(
 		)
 		valid = valid & torch.from_numpy(stored_valid_np).to(
 			device=valid.device, dtype=torch.bool)
-		uv_np = validate_uv(uv_np, xyz.shape[:2], valid=stored_valid_np)
+		uv_np = validate_uv(
+			uv_np, xyz.shape[:2], valid=stored_valid_np,
+			cell_valid=stored_cell_valid_np)
 		initial_uv = torch.from_numpy(uv_np)
 		initialization_mode = "warm"
 	mdl = model.Model3D.from_flatten_tifxyz_crop(
@@ -1513,6 +1515,10 @@ def _run_flatten_mode(
 		flatten_initial_uv=initial_uv,
 		flatten_source_column_map=flatten_source_column_map,
 	)
+	if warm_spec is not None:
+		stored_cell_valid = torch.from_numpy(stored_cell_valid_np).to(
+			device=mdl.flatten_source_cell_valid.device, dtype=torch.bool)
+		mdl.flatten_source_cell_valid &= stored_cell_valid
 	data = _dummy_flatten_data()
 
 	print("data: flatten-only (no volume input)")

@@ -31,13 +31,14 @@ class FlattenUvSidecarTests(unittest.TestCase):
 				valid=np.ones(uv.shape[:2], dtype=np.bool_),
 				winding_column_ranges=[[0, 3], [3, 7]],
 				winding_ids=[10, 11])
-			loaded, loaded_valid, info = flatten_uv.load_sidecars(
+			loaded, loaded_valid, loaded_cells, info = flatten_uv.load_sidecars(
 				metadata,
 				expected_source_step=20.0,
 				expected_output_step=20.0,
 				expected_winding_ids=[10, 11])
 			np.testing.assert_array_equal(loaded, uv)
 			self.assertTrue(loaded_valid.all())
+			self.assertTrue(loaded_cells.all())
 			self.assertTrue(info["covers_complete_source_grid"])
 			with self.assertRaisesRegex(flatten_uv.FlattenUvError, "output_step"):
 				flatten_uv.load_sidecars(
@@ -110,6 +111,27 @@ class FlattenUvSidecarTests(unittest.TestCase):
 			with self.assertRaisesRegex(flatten_uv.FlattenUvError, "metadata"):
 				flatten_uv.load_sidecars(path)
 
+	def test_schema_v3_sidecars_remain_readable(self):
+		uv = self._uv()
+		fingerprint = flatten_uv.canonical_grid_fingerprint(
+			uv.shape[:2], source_step=20.0)
+		with tempfile.TemporaryDirectory() as temporary:
+			metadata_path = flatten_uv.write_sidecars(
+				temporary, uv, fingerprint=fingerprint,
+				source_step=20.0, output_step=20.0,
+				valid=np.ones(uv.shape[:2], dtype=np.bool_))
+			metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+			metadata["schema_version"] = flatten_uv.LEGACY_SCHEMA_VERSION
+			metadata.pop("cell_valid_file")
+			metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+			loaded, loaded_valid, loaded_cells, _ = (
+				flatten_uv.load_sidecars(metadata_path))
+
+		np.testing.assert_array_equal(loaded, uv)
+		self.assertTrue(loaded_valid.all())
+		self.assertTrue(loaded_cells.all())
+
 	def test_extrapolated_invalid_cells_may_cross_but_supported_cells_may_not(self):
 		uv = self._uv(3, 4)
 		valid = np.ones((3, 4), dtype=np.bool_)
@@ -129,6 +151,42 @@ class FlattenUvSidecarTests(unittest.TestCase):
 		], dtype=np.float32)
 		with self.assertRaisesRegex(flatten_uv.FlattenUvError, "folded"):
 			flatten_uv.validate_uv(uv, (2, 2))
+
+	def test_sidecars_exclude_only_folded_cells(self):
+		uv = np.array([
+			[[0.0, 0.0], [0.0, 1.0], [0.0, 2.0]],
+			[[1.0, 0.0], [1.0, 1.0], [-1.0, 2.0]],
+		], dtype=np.float32)
+		fingerprint = flatten_uv.canonical_grid_fingerprint(
+			uv.shape[:2], source_step=20.0)
+		with tempfile.TemporaryDirectory() as temporary:
+			metadata_path = flatten_uv.write_sidecars(
+				temporary, uv, fingerprint=fingerprint,
+				source_step=20.0, output_step=20.0,
+				valid=np.ones(uv.shape[:2], dtype=np.bool_))
+			loaded, loaded_valid, loaded_cells, metadata = (
+				flatten_uv.load_sidecars(metadata_path))
+
+		np.testing.assert_array_equal(loaded, uv)
+		self.assertTrue(loaded_valid.all())
+		np.testing.assert_array_equal(
+			loaded_cells, np.array([[True, False]], dtype=np.bool_))
+		self.assertEqual(
+			metadata["topology_validation"]["source_supported_cell_count"], 2)
+		self.assertEqual(
+			metadata["topology_validation"]["excluded_folded_cell_count"], 1)
+		self.assertEqual(
+			metadata["topology_validation"]["cell_count"], 1)
+
+	def test_explicit_cell_mask_allows_a_folded_unsupported_cell(self):
+		uv = np.array([
+			[[0.0, 0.0], [0.0, 1.0], [0.0, 2.0]],
+			[[1.0, 0.0], [1.0, 1.0], [-1.0, 2.0]],
+		], dtype=np.float32)
+		validated = flatten_uv.validate_uv(
+			uv, uv.shape[:2],
+			cell_valid=np.array([[True, False]], dtype=np.bool_))
+		np.testing.assert_array_equal(validated, uv)
 
 	def test_model_reconstructs_exact_source_uv_pyramid_and_anchor(self):
 		h, w = 5, 7

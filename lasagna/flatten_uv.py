@@ -12,11 +12,13 @@ import numpy as np
 import tifffile
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+LEGACY_SCHEMA_VERSION = 3
 KIND = "lasagna_source_grid_flatten_uv"
 ROW_FILENAME = "flatten-uv-row.tif"
 COL_FILENAME = "flatten-uv-col.tif"
 VALID_FILENAME = "flatten-uv-valid.tif"
+CELL_VALID_FILENAME = "flatten-uv-cell-valid.tif"
 METADATA_FILENAME = "flatten-uv.json"
 
 
@@ -92,9 +94,7 @@ def _normalize_layout(
 	return normalized, ids
 
 
-def _topology_stats(
-	uv: np.ndarray, valid: np.ndarray | None = None,
-) -> tuple[int, float, int]:
+def _cell_determinants(uv: np.ndarray) -> np.ndarray:
 	m00 = uv[:-1, :-1]
 	m10 = uv[1:, :-1]
 	m01 = uv[:-1, 1:]
@@ -105,17 +105,45 @@ def _topology_stats(
 	b1 = m01 - m10
 	det0 = a0[..., 0] * b0[..., 1] - a0[..., 1] * b0[..., 0]
 	det1 = a1[..., 0] * b1[..., 1] - a1[..., 1] * b1[..., 0]
-	det = np.minimum(det0, det1)
+	return np.minimum(det0, det1)
+
+
+def _supported_cells(
+	uv: np.ndarray,
+	valid: np.ndarray | None = None,
+	cell_valid: np.ndarray | None = None,
+) -> np.ndarray:
+	shape = uv.shape[:2]
 	if valid is not None:
 		valid = np.asarray(valid, dtype=np.bool_)
-		if valid.shape != uv.shape[:2]:
+		if valid.shape != shape:
 			raise FlattenUvError(
 				f"flatten UV validity shape {valid.shape} does not match "
-				f"source {uv.shape[:2]}")
-		cell_valid = (
+				f"source {shape}")
+		supported = (
 			valid[:-1, :-1] & valid[1:, :-1]
 			& valid[:-1, 1:] & valid[1:, 1:])
-		det = det[cell_valid]
+	else:
+		supported = np.ones(
+			(max(0, shape[0] - 1), max(0, shape[1] - 1)),
+			dtype=np.bool_)
+	if cell_valid is not None:
+		cell_valid = np.asarray(cell_valid, dtype=np.bool_)
+		if cell_valid.shape != supported.shape:
+			raise FlattenUvError(
+				f"flatten UV cell validity shape {cell_valid.shape} does not "
+				f"match source cells {supported.shape}")
+		supported &= cell_valid
+	return supported
+
+
+def _topology_stats(
+	uv: np.ndarray,
+	valid: np.ndarray | None = None,
+	cell_valid: np.ndarray | None = None,
+) -> tuple[int, float, int]:
+	det = _cell_determinants(uv)
+	det = det[_supported_cells(uv, valid, cell_valid)]
 	if det.size == 0:
 		raise FlattenUvError("flatten UV has no source-supported cells")
 	if not np.isfinite(det).all():
@@ -128,6 +156,7 @@ def validate_uv(
 	expected_shape: Sequence[int],
 	*,
 	valid: np.ndarray | None = None,
+	cell_valid: np.ndarray | None = None,
 ) -> np.ndarray:
 	uv = np.asarray(uv, dtype=np.float32)
 	expected = (int(expected_shape[0]), int(expected_shape[1]), 2)
@@ -139,7 +168,7 @@ def validate_uv(
 	# Invalid vertices are deliberately extrapolated so the sidecars cover the
 	# complete canonical grid. Their cells are not part of the source surface
 	# and may cross; topology is enforced on source-supported quads.
-	folds, minimum, _cell_count = _topology_stats(uv, valid)
+	folds, minimum, _cell_count = _topology_stats(uv, valid, cell_valid)
 	if folds:
 		raise FlattenUvError(
 			f"flatten UV has {folds} folded or degenerate source cells "
@@ -211,6 +240,7 @@ def write_sidecars(
 	source_step: float,
 	output_step: float,
 	valid: np.ndarray,
+	cell_valid: np.ndarray | None = None,
 	winding_column_ranges=None,
 	winding_ids=None,
 	sampling_dr_per_winding: float = 1.0,
@@ -220,8 +250,27 @@ def write_sidecars(
 	valid = np.asarray(valid, dtype=np.bool_)
 	if valid.shape != uv.shape[:2]:
 		raise FlattenUvError("flatten UV validity mask shape does not match UV")
-	uv = validate_uv(uv, uv.shape[:2], valid=valid)
-	_folds, minimum_det, topology_cell_count = _topology_stats(uv, valid)
+	uv = np.asarray(uv, dtype=np.float32)
+	expected = (int(valid.shape[0]), int(valid.shape[1]), 2)
+	if uv.shape != expected:
+		raise FlattenUvError(
+			f"flatten UV shape {uv.shape} does not match source {expected}")
+	if not np.isfinite(uv).all():
+		raise FlattenUvError("flatten UV contains non-finite values")
+	source_cells = _supported_cells(uv, valid, cell_valid)
+	determinants = _cell_determinants(uv)
+	source_determinants = determinants[source_cells]
+	if source_determinants.size == 0:
+		raise FlattenUvError("flatten UV has no source-supported cells")
+	if not np.isfinite(source_determinants).all():
+		raise FlattenUvError("flatten UV topology is not finite")
+	folded_cells = source_cells & (determinants <= 0.0)
+	excluded_folded_cell_count = int(np.count_nonzero(folded_cells))
+	cell_valid = np.ascontiguousarray(source_cells & ~folded_cells)
+	uv = validate_uv(
+		uv, uv.shape[:2], valid=valid, cell_valid=cell_valid)
+	_folds, minimum_det, topology_cell_count = _topology_stats(
+		uv, valid, cell_valid)
 	uv = _extrapolate_invalid_uv(uv, valid)
 	if not fingerprint:
 		raise FlattenUvError("canonical-grid fingerprint is empty")
@@ -234,6 +283,8 @@ def write_sidecars(
 	tifffile.imwrite(root / ROW_FILENAME, uv[..., 0], compression=None)
 	tifffile.imwrite(root / COL_FILENAME, uv[..., 1], compression=None)
 	tifffile.imwrite(root / VALID_FILENAME, valid.astype(np.uint8), compression=None)
+	tifffile.imwrite(
+		root / CELL_VALID_FILENAME, cell_valid.astype(np.uint8), compression=None)
 	metadata = {
 		"schema_version": SCHEMA_VERSION,
 		"kind": KIND,
@@ -247,14 +298,18 @@ def write_sidecars(
 		"row_file": ROW_FILENAME,
 		"column_file": COL_FILENAME,
 		"valid_file": VALID_FILENAME,
+		"cell_valid_file": CELL_VALID_FILENAME,
 		"dtype": "float32",
 		"covers_complete_source_grid": True,
 		"invalid_vertex_extrapolation": "column-linear-v1",
 		"topology_validation": {
-			"scope": "source-supported-quads",
+			"scope": "retained-source-supported-quads",
 			"cell_count": topology_cell_count,
 			"minimum_determinant": minimum_det,
 			"folded_cell_count": 0,
+			"source_supported_cell_count": int(source_determinants.size),
+			"excluded_folded_cell_count": excluded_folded_cell_count,
+			"minimum_source_determinant": float(source_determinants.min()),
 		},
 	}
 	path = root / METADATA_FILENAME
@@ -268,7 +323,7 @@ def load_sidecars(
 	expected_source_step: float | None = None,
 	expected_output_step: float | None = None,
 	expected_winding_ids=None,
-) -> tuple[np.ndarray, np.ndarray, dict]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
 	path = Path(metadata_path)
 	try:
 		metadata = json.loads(path.read_text(encoding="utf-8"))
@@ -276,7 +331,9 @@ def load_sidecars(
 		raise FlattenUvError(f"cannot read flatten UV metadata: {exc}") from exc
 	if not isinstance(metadata, Mapping):
 		raise FlattenUvError("flatten UV metadata must be an object")
-	if metadata.get("schema_version") != SCHEMA_VERSION or metadata.get("kind") != KIND:
+	schema_version = metadata.get("schema_version")
+	if (schema_version not in (LEGACY_SCHEMA_VERSION, SCHEMA_VERSION)
+			or metadata.get("kind") != KIND):
 		raise FlattenUvError("unsupported flatten UV metadata schema")
 	shape = metadata.get("source_shape")
 	if (not isinstance(shape, list) or len(shape) != 2
@@ -305,10 +362,17 @@ def load_sidecars(
 			or metadata.get("column_file") != COL_FILENAME
 			or metadata.get("valid_file") != VALID_FILENAME):
 		raise FlattenUvError("flatten UV metadata has unexpected sidecar filenames")
+	if (schema_version == SCHEMA_VERSION
+			and metadata.get("cell_valid_file") != CELL_VALID_FILENAME):
+		raise FlattenUvError(
+			"flatten UV metadata has an unexpected cell-valid filename")
 	try:
 		row = tifffile.imread(path.parent / str(metadata["row_file"]))
 		col = tifffile.imread(path.parent / str(metadata["column_file"]))
 		valid = tifffile.imread(path.parent / str(metadata["valid_file"]))
+		cell_valid = (
+			tifffile.imread(path.parent / str(metadata["cell_valid_file"]))
+			if schema_version == SCHEMA_VERSION else None)
 	except (KeyError, OSError, ValueError) as exc:
 		raise FlattenUvError(f"cannot read flatten UV TIFF sidecars: {exc}") from exc
 	if row.shape != col.shape:
@@ -325,6 +389,18 @@ def load_sidecars(
 	if not np.isin(valid, (0, 1)).all():
 		raise FlattenUvError("flatten UV validity TIFF is not binary")
 	valid = valid.astype(np.bool_)
+	expected_cell_shape = (source_shape[0] - 1, source_shape[1] - 1)
+	if schema_version == SCHEMA_VERSION:
+		if (tuple(cell_valid.shape) != expected_cell_shape
+				or cell_valid.dtype != np.uint8):
+			raise FlattenUvError("flatten UV cell-validity TIFF is invalid")
+		if not np.isin(cell_valid, (0, 1)).all():
+			raise FlattenUvError(
+				"flatten UV cell-validity TIFF is not binary")
+		cell_valid = cell_valid.astype(np.bool_)
+	else:
+		cell_valid = _supported_cells(
+			np.empty((*source_shape, 2), dtype=np.float32), valid)
 	for name in ("source_step", "output_step"):
 		try:
 			value = float(metadata[name])
@@ -345,5 +421,8 @@ def load_sidecars(
 	if metadata.get("canonical_grid_fingerprint") != stored_fingerprint:
 		raise FlattenUvError("flatten UV stored grid fingerprint is corrupt")
 	uv = np.stack((row, col), axis=-1)
-	uv = validate_uv(uv, source_shape, valid=valid)
-	return np.ascontiguousarray(uv), valid, dict(metadata)
+	uv = validate_uv(
+		uv, source_shape, valid=valid, cell_valid=cell_valid)
+	return (
+		np.ascontiguousarray(uv), valid,
+		np.ascontiguousarray(cell_valid), dict(metadata))

@@ -125,9 +125,10 @@ its original canonical source grid. A warm start does not interpolate that UV
 field onto the new Spiral grid: doing so changes the fixed-diagonal
 triangulation and can introduce folds before optimization begins. Instead:
 
-1. The previous UV field and source-valid mask are loaded from schema-v3
-   `flatten-uv-row.tif`, `flatten-uv-col.tif`, `flatten-uv-valid.tif`, and
-   `flatten-uv.json` sidecars.
+1. The previous UV field, source-valid mask, and retained-cell mask are loaded
+   from schema-v4 `flatten-uv-row.tif`, `flatten-uv-col.tif`,
+   `flatten-uv-valid.tif`, `flatten-uv-cell-valid.tif`, and `flatten-uv.json`
+   sidecars. Schema-v3 sidecars remain readable.
 2. The current Spiral XYZ field is sampled onto the previous winding grid.
 3. Optimization starts from the previous UV field exactly, with a zero
    correction pyramid over the ordinary flatten objective.
@@ -208,7 +209,9 @@ Additional synthetic smoke:
   `fit2tifxyz` compatibility and save the optimized source-grid field
   separately as `flatten_forward_uv`. Spiral exports that field as the
   versioned `flatten-uv-row.tif`, `flatten-uv-col.tif`,
-  `flatten-uv-valid.tif`, and `flatten-uv.json` host-only warm-start sidecars;
+  `flatten-uv-valid.tif`, `flatten-uv-cell-valid.tif`, and `flatten-uv.json`
+  host-only warm-start sidecars. Folded or degenerate source quads are excluded
+  from the cell mask instead of failing the preview publication;
   the model checkpoint itself is not retained or transferred.
 
 ## Historical Note

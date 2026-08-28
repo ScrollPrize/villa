@@ -963,7 +963,9 @@ class LasagnaPublisher:
                         (publish_root / ".flatten-map.npy").unlink(missing_ok=True)
                         for filename in (
                                 "flatten-uv-row.tif", "flatten-uv-col.tif",
-                                "flatten-uv-valid.tif", FLATTEN_UV_METADATA_NAME):
+                                "flatten-uv-valid.tif",
+                                "flatten-uv-cell-valid.tif",
+                                FLATTEN_UV_METADATA_NAME):
                             (raw_root / filename).unlink(missing_ok=True)
 
                     attempt_config = copy.deepcopy(attempt_config)
