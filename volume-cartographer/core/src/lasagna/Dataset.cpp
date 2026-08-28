@@ -340,11 +340,11 @@ public:
                 std::string message =
                     "Remote Lasagna Zarr fetch failed HTTP " +
                     std::to_string(response.status_code) + ": " + key;
-                if (requestResult.authenticatedFailure) {
-                    message += " after authenticated request failed HTTP " +
+                if (requestResult.anonymousFailure) {
+                    message += " after anonymous request failed HTTP " +
                         std::to_string(
-                            requestResult.authenticatedFailure->status_code) +
-                        " and anonymous fallback failed";
+                            requestResult.anonymousFailure->status_code) +
+                        " and authenticated fallback failed";
                 }
                 throw std::runtime_error(std::move(message));
             }

@@ -2,7 +2,7 @@
 
 ## 2026-08-27
 
-- Added signed-to-anonymous S3 fallback for public remote Lasagna manifests and Zarr objects when ambient AWS credentials are rejected.
+- Added anonymous-first S3 access for public remote Lasagna manifests and Zarr objects, with authenticated fallback for private data.
 
 ## 2026-08-17
 

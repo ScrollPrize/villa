@@ -3,7 +3,6 @@
 #include <utils/http_fetch.hpp>
 
 #include <condition_variable>
-#include <cstdint>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -16,6 +15,8 @@ namespace vc
 
 [[nodiscard]] bool isAwsAuthenticationFailure(long status, std::string_view detail);
 
+// Selects anonymous S3 access on the first successful request and retains
+// authenticated access only after anonymous access is denied.
 class S3AuthFallback final
 {
 public:
@@ -23,7 +24,7 @@ public:
 
     struct Result {
         utils::HttpResponse response;
-        std::optional<utils::HttpResponse> authenticatedFailure;
+        std::optional<utils::HttpResponse> anonymousFailure;
         bool usedAnonymous = false;
     };
 
@@ -35,16 +36,15 @@ public:
 private:
     enum class Mode {
         Disabled,
-        Authenticated,
-        ProbingAnonymous,
+        Undecided,
+        Probing,
         Anonymous,
-        AuthenticatedOnly,
+        Authenticated,
     };
 
     mutable std::mutex mutex_;
     mutable std::condition_variable probeFinished_;
     mutable Mode mode_;
-    mutable std::uint64_t probeGeneration_ = 0;
 };
 
 }  // namespace vc

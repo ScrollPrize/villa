@@ -431,6 +431,7 @@ TEST_CASE("public S3 Lasagna ignores rejected ambient-style credentials")
     options.remoteCacheRoot = dir;
     options.remoteAuth.access_key = "AKIAIOSFODNN7EXAMPLE";
     options.remoteAuth.secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+    options.remoteAuth.session_token = "malformed-session-token";
     options.remoteAuth.region = "us-east-1";
 
     const std::string location =

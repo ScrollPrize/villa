@@ -8,8 +8,7 @@ namespace vc
 
 bool hasExplicitAwsCredentialError(std::string_view detail)
 {
-    constexpr std::array<std::string_view, 11> markers{
-        "AccessDenied",
+    constexpr std::array<std::string_view, 10> markers{
         "ExpiredToken",
         "InvalidAccessKeyId",
         "InvalidClientTokenId",
@@ -26,67 +25,70 @@ bool hasExplicitAwsCredentialError(std::string_view detail)
 
 bool isAwsAuthenticationFailure(long status, std::string_view detail)
 {
-    return status == 401 || status == 403 || hasExplicitAwsCredentialError(detail);
+    if (status >= 200 && status < 300)
+        return false;
+    return status == 401 || status == 403 ||
+           detail.find("AccessDenied") != std::string_view::npos ||
+           hasExplicitAwsCredentialError(detail);
 }
 
-S3AuthFallback::S3AuthFallback(bool isS3, bool credentialsLoaded) : mode_(isS3 && credentialsLoaded ? Mode::Authenticated : Mode::Disabled)
+S3AuthFallback::S3AuthFallback(bool isS3, bool credentialsLoaded)
+    : mode_(isS3 && credentialsLoaded ? Mode::Undecided : Mode::Disabled)
 {
 }
 
 S3AuthFallback::Result S3AuthFallback::request(const Attempt& attempt) const
 {
     Mode mode;
-    std::uint64_t probeGeneration;
     {
         std::unique_lock lock(mutex_);
-        probeFinished_.wait(lock, [&] { return mode_ != Mode::ProbingAnonymous; });
+        probeFinished_.wait(lock, [&] { return mode_ != Mode::Probing; });
         mode = mode_;
-        probeGeneration = probeGeneration_;
+        if (mode == Mode::Undecided)
+            mode_ = Mode::Probing;
     }
 
-    if (mode == Mode::Anonymous)
-        return {attempt(true), std::nullopt, true};
+    if (mode == Mode::Disabled || mode == Mode::Authenticated)
+        return {attempt(false), std::nullopt, false};
 
-    auto authenticated = attempt(false);
-    if (mode != Mode::Authenticated || !isAwsAuthenticationFailure(authenticated.status_code, authenticated.body_string())) {
-        return {std::move(authenticated), std::nullopt, false};
-    }
+    if (mode == Mode::Anonymous) {
+        auto anonymous = attempt(true);
+        if (anonymous.status_code != 401 && anonymous.status_code != 403)
+            return {std::move(anonymous), std::nullopt, true};
 
-    {
-        std::unique_lock lock(mutex_);
-        if (mode_ == Mode::ProbingAnonymous) {
-            probeFinished_.wait(lock, [&] { return mode_ != Mode::ProbingAnonymous; });
+        auto authenticated = attempt(false);
+        if (authenticated.ok() || authenticated.not_found()) {
+            std::lock_guard lock(mutex_);
+            if (mode_ == Mode::Anonymous)
+                mode_ = Mode::Authenticated;
         }
-        if (mode_ == Mode::Anonymous) {
-            lock.unlock();
-            return {attempt(true), std::move(authenticated), true};
-        }
-        if (mode_ != Mode::Authenticated || probeGeneration_ != probeGeneration) {
-            return {std::move(authenticated), std::nullopt, false};
-        }
-        mode_ = Mode::ProbingAnonymous;
+        return {std::move(authenticated), std::move(anonymous), false};
     }
 
     try {
         auto anonymous = attempt(true);
+        if (anonymous.status_code == 401 || anonymous.status_code == 403) {
+            auto authenticated = attempt(false);
+            {
+                std::lock_guard lock(mutex_);
+                mode_ = authenticated.ok() || authenticated.not_found()
+                    ? Mode::Authenticated
+                    : Mode::Undecided;
+            }
+            probeFinished_.notify_all();
+            return {std::move(authenticated), std::move(anonymous), false};
+        }
+
         {
             std::lock_guard lock(mutex_);
-            if (anonymous.ok() || anonymous.not_found()) {
-                mode_ = Mode::Anonymous;
-            } else if (isAwsAuthenticationFailure(anonymous.status_code, anonymous.body_string())) {
-                mode_ = Mode::AuthenticatedOnly;
-            } else {
-                mode_ = Mode::Authenticated;
-            }
-            ++probeGeneration_;
+            mode_ = anonymous.ok() ? Mode::Anonymous : Mode::Undecided;
         }
         probeFinished_.notify_all();
-        return {std::move(anonymous), std::move(authenticated), true};
+        return {std::move(anonymous), std::nullopt, true};
     } catch (...) {
         {
             std::lock_guard lock(mutex_);
-            mode_ = Mode::Authenticated;
-            ++probeGeneration_;
+            mode_ = Mode::Undecided;
         }
         probeFinished_.notify_all();
         throw;

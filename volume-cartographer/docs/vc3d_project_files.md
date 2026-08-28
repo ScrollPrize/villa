@@ -36,11 +36,11 @@ descriptors, prepares the manifest's volumes, then commits the manifest entry,
 derived volumes, and selected role in one project write. Failure restores the
 prior in-memory and on-disk project state. Remote descriptors and chunks use
 the project's remote cache root and authentication; chunks stay demand-loaded.
-For recognized S3 locations, rejected credentials trigger an anonymous retry.
-This allows public manifests and their Zarr groups to open even when ambient AWS
-temporary credentials are stale, while private data continues using signed
-requests. The chosen access mode is runtime-only and does not change persisted
-manifest or volume locations.
+Recognized S3 locations are opened anonymously first and use credentials only
+when anonymous access is denied. This allows public manifests and their Zarr
+groups to open even when ambient AWS temporary credentials are stale, while
+private data continues using signed requests. The chosen access mode is
+runtime-only and does not change persisted manifest or volume locations.
 
 Both remote-origin forms remain valid:
 

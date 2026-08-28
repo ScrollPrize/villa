@@ -1,29 +1,27 @@
-# Public S3 Lasagna authentication fallback plan
+# Public S3 Lasagna anonymous-first access plan
 
 ## Implementation
 
-1. Extract the existing AWS credential-error recognition into one reusable
-   core helper. Preserve explicit AWS token/signature error markers; treat 401
-   and 403 responses as authentication rejection, but do not treat a bare 400
-   or unrelated transport/server failure as authentication rejection.
-2. Update the built-in `RemoteFileCache` transport to retry an S3 GET
-   anonymously only when a credentialed request receives a recognized
-   authentication failure. Preserve a useful failure if both attempts fail.
-3. Update Lasagna's exact-byte remote Zarr store with the same policy for GET
-   and HEAD requests. Coordinate concurrent authentication failures so one
-   anonymous probe determines the transition while followers wait. Retain
-   anonymous mode only after a 2xx or 404 response; 401/403, 5xx, and transport
-   failures do not establish anonymous access. Keep both HTTP clients alive
-   rather than replacing a client during concurrent requests.
-4. Reuse the shared classification in the ordinary remote Zarr fallback so the
-   three paths cannot drift on credential-error markers.
+1. Attempt recognized S3 sources anonymously before using any available
+   credentials. A successful anonymous response establishes sticky anonymous
+   access for the owning remote store.
+2. When anonymous access returns 401/403, retry with credentials and retain
+   authenticated mode after a successful or not-found authenticated response.
+   Permit a later anonymous denial to upgrade a mixed-access store.
+3. Coordinate the initial Lasagna store probe so concurrent readers observe one
+   selected mode, while retaining stable anonymous and authenticated clients.
+4. Reverse the ordinary remote Zarr whole-open order so it also selects
+   anonymous access before trying credentials.
+5. Keep AWS error-body recognition diagnostic-only for successful responses;
+   content containing strings such as `AccessDenied` must never change access
+   mode.
 
 ## Testing and validation
 
-- Add deterministic unit coverage for recognized and unrelated responses and
-  exact signed/anonymous request counts. Cover successful sticky fallback,
-  concurrent probe coalescing, a valid signed private request, failed anonymous
-  access to private data, unrelated 400/404/5xx responses, and non-S3 control.
+- Add deterministic unit coverage for exact authenticated/anonymous request
+  counts, successful response bodies containing AWS error words, empty-body
+  HEAD success, concurrent probe coalescing, private fallback, mixed-access
+  upgrade, unrelated failures, and non-S3 control.
 - Cover URL classification for `s3://`, region-qualified S3, virtual-hosted S3
   HTTPS, and non-S3 HTTPS inputs.
 - Run the relevant remote URL, HTTP fetch, remote file cache, Lasagna manifest,
@@ -36,15 +34,14 @@
 
 ## Specification updates
 
-Add a remote-authentication requirement to `planning/spec.md`: recognized S3
-endpoints with rejected credentials must retry anonymously without changing
-source identity, while private data must retain authenticated behavior.
+Require recognized S3 endpoints to prefer anonymous access without changing
+source identity, while private data retains authenticated behavior.
 
 ## Documentation updates
 
 Update `docs/remote_file_cache.md` and the remote Lasagna attachment section of
-`docs/vc3d_project_files.md` to describe signed-first anonymous fallback and
-sticky anonymous mode for public Lasagna objects.
+`docs/vc3d_project_files.md` to describe anonymous-first selection and sticky
+access mode.
 
 ## Changelog update
 
@@ -53,8 +50,7 @@ planning changelog.
 
 ## Independent review
 
-Reviewed on 2026-08-27. The review required canonical error classification,
-an explicit definition of authoritative anonymous responses, synchronized
-fallback transition without client replacement, private-bucket diagnostics,
-and mandatory exact request-count tests. The plan above incorporates those
-requirements.
+The 2026-08-27 follow-up review found that signed-first handling scanned
+successful payloads for error markers and could not classify an empty-body S3
+HEAD 400. Anonymous-first selection removes both ambiguities while preserving
+private and mixed-access behavior.

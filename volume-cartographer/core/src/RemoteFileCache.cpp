@@ -261,16 +261,16 @@ void defaultFetch(const std::string& sourceLocation,
             sourceLocation, endpoint,
             result.usedAnonymous ? anonymousDetails : details,
             result.response);
-        if (result.authenticatedFailure) {
-            message += " authenticated_attempt_http=" +
-                std::to_string(result.authenticatedFailure->status_code);
+        if (result.anonymousFailure) {
+            message += " anonymous_attempt_http=" +
+                std::to_string(result.anonymousFailure->status_code);
             const auto code = xmlTagValue(
-                result.authenticatedFailure->body_string(), "Code");
+                result.anonymousFailure->body_string(), "Code");
             if (!code.empty()) {
-                message += " authenticated_s3_Code=\"" +
+                message += " anonymous_s3_Code=\"" +
                     escapedDiagnosticString(code) + "\"";
             }
-            message += " anonymous_fallback=failed";
+            message += " authenticated_fallback=failed";
         }
         throw std::runtime_error(std::move(message));
     }
