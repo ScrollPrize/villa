@@ -1,4 +1,5 @@
 #include "vc/core/util/HttpFetch.hpp"
+#include "vc/core/util/S3AuthFallback.hpp"
 
 #include <utils/http_fetch.hpp>
 
@@ -23,18 +24,6 @@ utils::HttpClient makeTextClient(const HttpAuth& auth)
     cfg.connect_timeout = std::chrono::seconds{5};
     cfg.max_retries = 2;
     return utils::HttpClient(std::move(cfg));
-}
-
-bool isAuthError(long status, const std::string& body)
-{
-    if (status == 401 || status == 403)
-        return true;
-    return body.find("ExpiredToken") != std::string::npos ||
-           body.find("AccessDenied") != std::string::npos ||
-           body.find("InvalidAccessKeyId") != std::string::npos ||
-           body.find("SignatureDoesNotMatch") != std::string::npos ||
-           body.find("TokenRefreshRequired") != std::string::npos ||
-           body.find("InvalidToken") != std::string::npos;
 }
 
 std::string authErrorMessage(long status, const std::string& body)
@@ -104,7 +93,7 @@ std::string httpGetString(const std::string& url, const HttpAuth& auth)
 
     if (resp.status_code >= 400) {
         const auto body = std::string(resp.body_string());
-        if (isAuthError(resp.status_code, body))
+        if (isAwsAuthenticationFailure(resp.status_code, body))
             throw std::runtime_error(authErrorMessage(resp.status_code, body));
         if (resp.status_code >= 500) {
             throw std::runtime_error(
@@ -124,7 +113,7 @@ std::vector<std::byte> httpGetBytes(const std::string& url, const HttpAuth& auth
 
     if (resp.status_code >= 400) {
         const auto body = std::string(resp.body_string());
-        if (isAuthError(resp.status_code, body))
+        if (isAwsAuthenticationFailure(resp.status_code, body))
             throw std::runtime_error(authErrorMessage(resp.status_code, body));
         if (resp.status_code >= 500) {
             throw std::runtime_error(
