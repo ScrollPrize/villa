@@ -1181,8 +1181,10 @@ TEST_CASE("ChunkCache invalidation stop events survive a throwing listener")
 {
     // Invalidation-path listener isolation: a throwing listener must not
     // starve other listeners of their stop events or escape invalidate().
-    // Deterministic in either listener order: pre-fix, thrower-first skips
-    // the counter, counter-first lets the throw escape invalidate().
+    // Listener iteration order is unordered, so pre-fix this failed only in
+    // the thrower-first order (the per-key catch already stopped the escape);
+    // post-fix it passes deterministically in both orders and guards the
+    // per-listener contract going forward.
     std::mt19937_64 rng(std::random_device{}());
     const auto dir = fs::temp_directory_path() /
                      ("vc_chunk_activity_throwing_" + std::to_string(rng()));
