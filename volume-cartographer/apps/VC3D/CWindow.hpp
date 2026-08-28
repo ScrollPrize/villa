@@ -220,6 +220,11 @@ private:
     void refreshAtlasOverviewDocks();
     void updateAtlasFiberDocks();
     void updateAtlasSearchDocks();
+    // Coalesced entry point: fiberSaved fires once per saved fiber and a
+    // single edit saves the session plus its linked peers, so refreshes fold
+    // into one dock rebuild per burst instead of one per signal.
+    void scheduleAtlasSearchDockRefresh();
+    bool _atlasSearchDockRefreshQueued = false;
     void remapCurrentAtlas();
     // Starts atlas remapping without dialogs. The interactive caller can add
     // its completion UI through onFinished.

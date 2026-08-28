@@ -393,7 +393,11 @@ void reportExtrapolationFallback(
     request.extrapolationFallbackCallback(diagnostic);
 }
 
-void replaceOpenTailsWithNative(
+// Returns the index shift the tail replacement applied to every point in
+// [firstControl, lastControl]: newIndex = oldIndex + shift. Callers must
+// shift their control-point indices by it so the indices keep naming the
+// controls' exact line vertices.
+int replaceOpenTailsWithNative(
     const FiberModeOptimizationRequest& request,
     const vc::fiber_tracer::FiberTraceCoordinateAdapter& coordinates,
     int firstControl,
@@ -423,6 +427,10 @@ void replaceOpenTailsWithNative(
             lastControl == 0) {
             throw std::runtime_error(
                 "Lasagna fallback did not provide both endpoint directions");
+        }
+        if (request.cancelFlag &&
+            request.cancelFlag->load(std::memory_order_relaxed)) {
+            throw vc::lasagna::LineOptimizationCancelled();
         }
         const double extrapolationTrace = coordinates.baseDistanceToTrace(
             request.extrapolationDistanceBaseVoxels);
@@ -459,6 +467,13 @@ void replaceOpenTailsWithNative(
                 left,
                 leftException);
             ++output.lasagnaFallbackExtrapolations;
+        }
+        // Re-check between the two traces: each can be a long prediction
+        // walk, and a solve superseded during the left one should not still
+        // pay for the right one.
+        if (request.cancelFlag &&
+            request.cancelFlag->load(std::memory_order_relaxed)) {
+            throw vc::lasagna::LineOptimizationCancelled();
         }
         std::optional<vc::fiber_tracer::FiberTraceOneWayResult> right;
         std::string rightException;
@@ -508,6 +523,7 @@ void replaceOpenTailsWithNative(
         linePoint.sampledNormal = request.baseNormalSampler->sampleNormal(point);
         output.optimization.line.points.push_back(std::move(linePoint));
     }
+    return static_cast<int>(leftTail.size()) - 1 - firstControl;
 }
 
 }  // namespace
@@ -532,6 +548,16 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
         throw std::invalid_argument(
             "extrapolation distance must be finite and non-negative");
     }
+
+    if (request.cancelFlag) {
+        request.lasagnaConfig.cancelFlag = request.cancelFlag;
+    }
+    const auto throwIfCancelled = [&request] {
+        if (request.cancelFlag &&
+            request.cancelFlag->load(std::memory_order_relaxed)) {
+            throw vc::lasagna::LineOptimizationCancelled();
+        }
+    };
 
     std::stable_sort(request.controlPoints.begin(), request.controlPoints.end(),
                      [](const LineControlPoint& lhs, const LineControlPoint& rhs) {
@@ -575,8 +601,11 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
         request.controlPoints.front().linePosition =
             static_cast<double>(controlIndex);
         if (request.globalMode == FiberOptimizationMode::NativeFiberTrace3d) {
-            replaceOpenTailsWithNative(
+            const int shift = replaceOpenTailsWithNative(
                 request, coordinates, controlIndex, controlIndex, output);
+            request.controlPoints.front().optimizedIndex += shift;
+            request.controlPoints.front().linePosition +=
+                static_cast<double>(shift);
         }
         appendFiberModeReport(output);
         output.controlPoints = std::move(request.controlPoints);
@@ -634,6 +663,7 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
     }
     std::vector<bool> fixedSpan(spans.size(), false);
     for (size_t spanIndex = 0; spanIndex < spans.size(); ++spanIndex) {
+        throwIfCancelled();
         auto& owner = request.controlPoints[spanIndex];
         const size_t first = originalControlIndices[spanIndex];
         const size_t last = originalControlIndices[spanIndex + 1];
@@ -817,6 +847,7 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
     vc::lasagna::LineReinitializationOptimizationResult reinitialized;
     std::vector<int> controlIndices;
     while (true) {
+        throwIfCancelled();
         generateSplineRuns();
         auto [stitched, indices] = stitch();
         controlIndices = std::move(indices);
@@ -858,6 +889,10 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
             std::move(hardDirections));
         if (!reinitialized.failed)
             break;
+        // A cancelled solve reports failure through the candidate machinery;
+        // demoting a span for it would misattribute the cancellation as a
+        // structural Lasagna failure. Surface the cancellation instead.
+        throwIfCancelled();
         const int failed = reinitialized.failedSegmentIndex;
         if (failed < 0 || static_cast<size_t>(failed) >= modes.size() ||
             modes[static_cast<size_t>(failed)] != SegmentInterpolationMode::Lasagna) {
@@ -906,9 +941,23 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
     const int firstControl = reinitialized.fixedPointIndices.front();
     const int lastControl = reinitialized.fixedPointIndices.back();
     output.optimization = std::move(reinitialized.optimization);
+    // Make the control indices authoritative for the solved line: the
+    // stitch-time indices are stale once reinit regrew the tails. The reinit
+    // reports each control's exact final line index; a native tail
+    // replacement then shifts every retained point by a fixed offset.
+    for (size_t index = 0; index < request.controlPoints.size(); ++index) {
+        request.controlPoints[index].optimizedIndex =
+            reinitialized.fixedPointIndices[index];
+        request.controlPoints[index].linePosition =
+            static_cast<double>(reinitialized.fixedPointIndices[index]);
+    }
     if (request.globalMode == FiberOptimizationMode::NativeFiberTrace3d) {
-        replaceOpenTailsWithNative(
+        const int shift = replaceOpenTailsWithNative(
             request, coordinates, firstControl, lastControl, output);
+        for (auto& control : request.controlPoints) {
+            control.optimizedIndex += shift;
+            control.linePosition += static_cast<double>(shift);
+        }
     }
     appendFiberModeReport(output);
     output.controlPoints = std::move(request.controlPoints);
@@ -1266,14 +1315,19 @@ ControlPointCollapseResult collapseControlPointsAtClick(
     return result;
 }
 
-PreparedControlPointEdit prepareAutomaticControlPointEdit(
+namespace
+{
+
+// Shared collapse/merge/dirty bookkeeping of the two control-point prepares;
+// only the line-update step differs (solving vs geometric).
+template <typename UpdateLine>
+PreparedControlPointEdit prepareControlPointEditWith(
     const std::vector<cv::Vec3d>& linePoints,
     const std::vector<LineControlPoint>& controls,
     std::vector<size_t> collapsedIndices,
     double clickedLinePosition,
     const cv::Vec3d& clickedPoint,
-    const vc::lasagna::NormalSampler& sampler,
-    const vc::lasagna::LineOptimizationConfig& config)
+    const UpdateLine& updateLine)
 {
     if (linePoints.size() < 2) {
         throw std::invalid_argument(
@@ -1298,17 +1352,17 @@ PreparedControlPointEdit prepareAutomaticControlPointEdit(
         return prepared;
     }
 
-    auto update = vc::lasagna::updateExistingLineControlPoint(
+    vc::lasagna::LineControlPointUpdateResult update = updateLine(
         prepared.linePoints,
         optimizerControlPoints(prepared.controlPointsBeforeLineUpdate),
-        prepared.replacementIndex,
-        sampler,
-        config);
+        prepared.replacementIndex);
     prepared.linePoints = std::move(update.linePoints);
     prepared.controlPoints = mergeOptimizerControlPoints(
         std::move(update.controlPoints), prepared.controlPointsBeforeLineUpdate);
     prepared.replacementIndex = static_cast<size_t>(update.changedControlIndex);
     prepared.lineReconstructed = true;
+    prepared.replacedStart = update.replacedStart;
+    prepared.replacedCount = update.replacedCount;
     if (update.changedControlIndex > 0) {
         prepared.dirtySegmentIndices.push_back(
             static_cast<size_t>(update.changedControlIndex - 1));
@@ -1320,6 +1374,53 @@ PreparedControlPointEdit prepareAutomaticControlPointEdit(
             static_cast<size_t>(update.changedControlIndex));
     }
     return prepared;
+}
+
+}  // namespace
+
+PreparedControlPointEdit prepareAutomaticControlPointEdit(
+    const std::vector<cv::Vec3d>& linePoints,
+    const std::vector<LineControlPoint>& controls,
+    std::vector<size_t> collapsedIndices,
+    double clickedLinePosition,
+    const cv::Vec3d& clickedPoint,
+    const vc::lasagna::NormalSampler& sampler,
+    const vc::lasagna::LineOptimizationConfig& config)
+{
+    return prepareControlPointEditWith(
+        linePoints,
+        controls,
+        std::move(collapsedIndices),
+        clickedLinePosition,
+        clickedPoint,
+        [&sampler, &config](const std::vector<cv::Vec3d>& line,
+                            std::vector<vc::lasagna::LineControlPoint> optimizerControls,
+                            size_t changedIndex) {
+            return vc::lasagna::updateExistingLineControlPoint(
+                line, std::move(optimizerControls), changedIndex, sampler, config);
+        });
+}
+
+PreparedControlPointEdit prepareGeometricControlPointEdit(
+    const std::vector<cv::Vec3d>& linePoints,
+    const std::vector<LineControlPoint>& controls,
+    std::vector<size_t> collapsedIndices,
+    double clickedLinePosition,
+    const cv::Vec3d& clickedPoint,
+    double segmentLength)
+{
+    return prepareControlPointEditWith(
+        linePoints,
+        controls,
+        std::move(collapsedIndices),
+        clickedLinePosition,
+        clickedPoint,
+        [segmentLength](const std::vector<cv::Vec3d>& line,
+                        std::vector<vc::lasagna::LineControlPoint> optimizerControls,
+                        size_t changedIndex) {
+            return vc::lasagna::updateExistingLineControlPoint(
+                line, std::move(optimizerControls), changedIndex, segmentLength);
+        });
 }
 
 cv::Vec3d lineTangentAtPosition(
@@ -1363,13 +1464,10 @@ void invalidateSegmentsAdjacentToControl(std::vector<LineControlPoint>& controls
     (void)found;
 }
 
-namespace
-{
-
 // The loader's exact-membership scan (kControlPointMatchEpsilon in
 // core/src/Atlas.cpp): controls must be an ordered subset of the dense
 // line, so geometry sliced at these indices reloads cleanly.
-std::optional<std::vector<size_t>> orderedControlLineIndices(
+std::optional<std::vector<size_t>> orderedControlPointLineIndices(
     const std::vector<cv::Vec3d>& controlPoints,
     const std::vector<cv::Vec3d>& linePoints)
 {
@@ -1396,7 +1494,538 @@ std::optional<std::vector<size_t>> orderedControlLineIndices(
     return lineIndices;
 }
 
-}  // namespace
+vc::lasagna::LineModel spliceLineModelWithInterpolatedNormals(
+    const vc::lasagna::LineModel& previous,
+    const std::vector<cv::Vec3d>& points,
+    int replacedStart,
+    int replacedCount)
+{
+    if (points.empty()) {
+        throw std::runtime_error("Fiber has no line points");
+    }
+    if (previous.points.empty()) {
+        throw std::runtime_error(
+            "Cannot derive provisional normals from an empty line");
+    }
+    const auto usable = [](const vc::lasagna::NormalSample& sample) {
+        return sample.valid && std::isfinite(sample.normal[0]) &&
+               std::isfinite(sample.normal[1]) &&
+               std::isfinite(sample.normal[2]) &&
+               cv::norm(sample.normal) > 1.0e-9;
+    };
+    const auto carriedPoint = [&](const cv::Vec3d& position,
+                                  const vc::lasagna::LinePoint& source) {
+        vc::lasagna::LinePoint point;
+        point.position = position;
+        point.sampledNormal = source.sampledNormal;
+        point.sampledNormal.valid = usable(source.sampledNormal);
+        point.valid = point.sampledNormal.valid;
+        return point;
+    };
+
+    const int newSize = static_cast<int>(points.size());
+    const int oldSize = static_cast<int>(previous.points.size());
+    const int delta = newSize - oldSize;
+    const int suffixStart = replacedStart + replacedCount;
+    const bool spliceable = replacedStart >= 0 && replacedCount >= 0 &&
+                            suffixStart <= newSize && replacedStart <= oldSize &&
+                            suffixStart - delta >= replacedStart &&
+                            suffixStart - delta <= oldSize;
+
+    vc::lasagna::LineModel model;
+    model.points.reserve(points.size());
+    // Blended (insertion-interpolated) points are second-tier anchor
+    // candidates; everything else carries an authoritative sample.
+    std::vector<bool> blended(points.size(), false);
+
+    if (!spliceable) {
+        // Safety net only (the geometric prepare always provides the range):
+        // 3D-nearest transfer keeps normals geometrically faithful where a
+        // proportional index map would smear a localized unknown-range edit
+        // across the whole line.
+        for (int i = 0; i < newSize; ++i) {
+            size_t nearest = 0;
+            double nearestDistanceSq = std::numeric_limits<double>::max();
+            for (size_t j = 0; j < previous.points.size(); ++j) {
+                const cv::Vec3d d = previous.points[j].position -
+                                    points[static_cast<size_t>(i)];
+                const double distanceSq = d.dot(d);
+                if (distanceSq < nearestDistanceSq) {
+                    nearestDistanceSq = distanceSq;
+                    nearest = j;
+                }
+            }
+            model.points.push_back(carriedPoint(points[static_cast<size_t>(i)],
+                                                previous.points[nearest]));
+        }
+    } else {
+        const int oldCount = replacedCount - delta;
+        // Boundary normals for pure insertions: nearest usable sample before
+        // the replaced range and at/after the suffix start, hemisphere-
+        // aligned (flip the second when the dot product is negative -- the
+        // ribbon display-interpolation convention in LineViewBuilder).
+        int leftBoundary = -1;
+        for (int j = std::min(replacedStart, oldSize) - 1; j >= 0; --j) {
+            if (usable(previous.points[static_cast<size_t>(j)].sampledNormal)) {
+                leftBoundary = j;
+                break;
+            }
+        }
+        int rightBoundary = -1;
+        for (int j = suffixStart - delta; j < oldSize; ++j) {
+            if (j >= 0 &&
+                usable(previous.points[static_cast<size_t>(j)].sampledNormal)) {
+                rightBoundary = j;
+                break;
+            }
+        }
+        cv::Vec3d leftNormal{0, 0, 0}, rightNormal{0, 0, 0};
+        if (leftBoundary >= 0) {
+            leftNormal = previous.points[static_cast<size_t>(leftBoundary)]
+                             .sampledNormal.normal;
+        }
+        if (rightBoundary >= 0) {
+            rightNormal = previous.points[static_cast<size_t>(rightBoundary)]
+                              .sampledNormal.normal;
+            if (leftBoundary >= 0 && leftNormal.dot(rightNormal) < 0.0) {
+                rightNormal = -rightNormal;
+            }
+        }
+
+        for (int i = 0; i < newSize; ++i) {
+            const cv::Vec3d& position = points[static_cast<size_t>(i)];
+            if (i < replacedStart) {
+                model.points.push_back(carriedPoint(
+                    position, previous.points[static_cast<size_t>(i)]));
+            } else if (i >= suffixStart) {
+                model.points.push_back(carriedPoint(
+                    position,
+                    previous.points[static_cast<size_t>(i - delta)]));
+            } else if (oldCount > 0) {
+                // Proportional re-indexing of the OLD replaced range: real
+                // samples from the same geometry region, merely re-indexed.
+                // Endpoints map exactly (localNew 0 -> old 0, last -> last).
+                const int localNew = i - replacedStart;
+                const int denominator = std::max(1, replacedCount - 1);
+                int localOld = oldCount == 1
+                    ? 0
+                    : static_cast<int>(std::llround(
+                          static_cast<double>(localNew) *
+                          static_cast<double>(oldCount - 1) / denominator));
+                localOld = std::clamp(localOld, 0, oldCount - 1);
+                // A shrinking map can skip interior samples; if the
+                // proportional pick is unusable, take the nearest USABLE
+                // sample within the old range instead of carrying an invalid
+                // normal past a valid one (a degenerate line could otherwise
+                // lose its only anchor and reject the click). Equal-offset
+                // ties deterministically prefer the LOWER old index.
+                if (!usable(previous.points[static_cast<size_t>(
+                                                replacedStart + localOld)]
+                                .sampledNormal)) {
+                    for (int offset = 1; offset < oldCount; ++offset) {
+                        const int below = localOld - offset;
+                        const int above = localOld + offset;
+                        if (below >= 0 &&
+                            usable(previous.points[static_cast<size_t>(
+                                                       replacedStart + below)]
+                                       .sampledNormal)) {
+                            localOld = below;
+                            break;
+                        }
+                        if (above < oldCount &&
+                            usable(previous.points[static_cast<size_t>(
+                                                       replacedStart + above)]
+                                       .sampledNormal)) {
+                            localOld = above;
+                            break;
+                        }
+                    }
+                }
+                model.points.push_back(carriedPoint(
+                    position,
+                    previous.points[static_cast<size_t>(replacedStart +
+                                                        localOld)]));
+            } else {
+                // Pure insertion: blend the hemisphere-aligned boundary
+                // normals by position between the boundaries (in NEW
+                // coordinates the left boundary keeps its index, the right
+                // boundary shifts by delta).
+                vc::lasagna::LinePoint point;
+                point.position = position;
+                cv::Vec3d normal{0, 0, 0};
+                bool valid = false;
+                if (leftBoundary >= 0 && rightBoundary >= 0) {
+                    // Geometric weights, not index weights: inserted points
+                    // can be spaced arbitrarily. Signed projection onto the
+                    // boundary segment, clamped — a point beyond an endpoint
+                    // saturates to that endpoint's normal (a distance ratio
+                    // would drift back toward the midpoint instead).
+                    const cv::Vec3d leftPosition =
+                        previous.points[static_cast<size_t>(leftBoundary)]
+                            .position;
+                    const cv::Vec3d rightPosition =
+                        previous.points[static_cast<size_t>(rightBoundary)]
+                            .position;
+                    const cv::Vec3d segment = rightPosition - leftPosition;
+                    const double segmentLengthSq = segment.dot(segment);
+                    const double t = segmentLengthSq > 1.0e-24
+                        ? std::clamp((position - leftPosition).dot(segment) /
+                                         segmentLengthSq,
+                                     0.0, 1.0)
+                        : 0.5;
+                    normal = (1.0 - t) * leftNormal + t * rightNormal;
+                    if (cv::norm(normal) <= 1.0e-6) {
+                        normal = t < 0.5 ? leftNormal : rightNormal;
+                    }
+                    valid = true;
+                } else if (leftBoundary >= 0) {
+                    normal = leftNormal;
+                    valid = true;
+                } else if (rightBoundary >= 0) {
+                    normal = rightNormal;
+                    valid = true;
+                }
+                if (valid) {
+                    const double length = cv::norm(normal);
+                    if (length > 1.0e-9) {
+                        normal /= length;
+                    } else {
+                        valid = false;
+                    }
+                }
+                point.sampledNormal.normal = normal;
+                point.sampledNormal.valid = valid;
+                point.valid = valid;
+                blended[static_cast<size_t>(i)] = valid;
+                model.points.push_back(point);
+            }
+        }
+    }
+
+    // Display anchor, two tiers: carried/re-indexed authoritative normals
+    // first; a blended normal is eligible only when it is not parallel to the
+    // local tangent (the display frame's own requirement -- a parallel anchor
+    // makes buildLineViewSurfaces throw).
+    const auto localTangent = [&](size_t index) {
+        // Central difference first; a fold-back (p[i-1] == p[i+1]) makes it
+        // degenerate even though the line has a perfectly good direction, so
+        // fall back to the one-sided differences before giving up.
+        const size_t lower = index > 0 ? index - 1 : index;
+        const size_t upper =
+            index + 1 < model.points.size() ? index + 1 : index;
+        const std::array<cv::Vec3d, 3> candidates{
+            model.points[upper].position - model.points[lower].position,
+            model.points[upper].position - model.points[index].position,
+            model.points[index].position - model.points[lower].position};
+        for (const auto& candidate : candidates) {
+            const double length = cv::norm(candidate);
+            if (length > 1.0e-9) {
+                return cv::Vec3d(candidate / length);
+            }
+        }
+        return cv::Vec3d(0, 0, 0);
+    };
+    int bestAnchor = -1;
+    double bestAnchorDistance = std::numeric_limits<double>::infinity();
+    const double center = static_cast<double>(model.points.size() - 1) * 0.5;
+    for (int tier = 0; tier < 2 && bestAnchor < 0; ++tier) {
+        for (size_t i = 0; i < model.points.size(); ++i) {
+            if (!model.points[i].valid || (tier == 0) == blended[i]) {
+                continue;
+            }
+            // Every candidate — re-indexed carries included — must not be
+            // parallel to the LOCAL tangent: positions moved, so a normal
+            // that was fine on the old geometry can be tangent-parallel on
+            // the new one, and the display frame builder throws on such an
+            // anchor. The normal is normalized first (a non-unit normal
+            // would pass on magnitude alone), the tangent handles fold-backs
+            // (see localTangent), a degenerate tangent rejects the
+            // candidate, and 1e-6 leaves a wide margin over the builder's
+            // own epsilon without falsely rejecting displayable anchors.
+            {
+                const cv::Vec3d tangent = localTangent(i);
+                if (cv::norm(tangent) <= 1.0e-9) {
+                    continue;
+                }
+                cv::Vec3d normal = model.points[i].sampledNormal.normal;
+                const double normalLength = cv::norm(normal);
+                if (normalLength <= 1.0e-9) {
+                    continue;
+                }
+                normal /= normalLength;
+                const cv::Vec3d perpendicular =
+                    normal - normal.dot(tangent) * tangent;
+                if (cv::norm(perpendicular) <= 1.0e-6) {
+                    continue;
+                }
+            }
+            const double distance =
+                std::abs(static_cast<double>(i) - center);
+            if (distance < bestAnchorDistance) {
+                bestAnchorDistance = distance;
+                bestAnchor = static_cast<int>(i);
+            }
+        }
+    }
+    if (bestAnchor < 0) {
+        throw std::runtime_error(
+            "Fiber line points have no valid sampled normals");
+    }
+    model.displayFrameAnchorIndex = bestAnchor;
+    return model;
+}
+
+MergedSupersededSolve mergeSupersededSolveResult(
+    const vc::lasagna::LineModel& currentLine,
+    const std::vector<LineControlPoint>& currentControls,
+    const vc::lasagna::LineModel& solvedLine,
+    const std::vector<LineControlPoint>& solvedControls,
+    const std::vector<size_t>& controlMap,
+    const std::vector<size_t>& editedSpans,
+    bool configChanged)
+{
+    MergedSupersededSolve out;
+    if (currentControls.empty() || solvedControls.empty() ||
+        controlMap.size() != solvedControls.size()) {
+        return out;
+    }
+    // The map must land inside the current controls and be monotone
+    // non-decreasing (edits only insert or collapse; they never reorder).
+    for (size_t j = 0; j < controlMap.size(); ++j) {
+        if (controlMap[j] >= currentControls.size() ||
+            (j > 0 && controlMap[j] < controlMap[j - 1])) {
+            return out;
+        }
+    }
+    const auto positionsOf = [](const std::vector<LineControlPoint>& controls) {
+        std::vector<cv::Vec3d> positions;
+        positions.reserve(controls.size());
+        for (const auto& control : controls) {
+            positions.push_back(control.volumePoint);
+        }
+        return positions;
+    };
+    const auto linePositionsOf = [](const vc::lasagna::LineModel& line) {
+        std::vector<cv::Vec3d> positions;
+        positions.reserve(line.points.size());
+        for (const auto& point : line.points) {
+            positions.push_back(point.position);
+        }
+        return positions;
+    };
+    // Both inputs must already satisfy the exact-ordered-subset contract; a
+    // session mutated by a path that does not maintain it (legacy states)
+    // simply is not mergeable.
+    const std::vector<cv::Vec3d> currentPoints = linePositionsOf(currentLine);
+    const std::vector<cv::Vec3d> solvedPoints = linePositionsOf(solvedLine);
+    const auto currentIndices =
+        orderedControlPointLineIndices(positionsOf(currentControls), currentPoints);
+    const auto solvedIndices =
+        orderedControlPointLineIndices(positionsOf(solvedControls), solvedPoints);
+    if (!currentIndices || !solvedIndices) {
+        return out;
+    }
+    const std::vector<size_t>& cIdx = *currentIndices;
+    const std::vector<size_t>& sIdx = *solvedIndices;
+
+    const size_t currentSpanCount = currentControls.size() - 1;
+    // Unique (by monotonicity) solved span for each current span, where one
+    // exists: solved span j covers current span controlMap[j] only when no
+    // control was inserted into or collapsed out of it.
+    std::vector<int> solvedSpanForCurrentSpan(currentSpanCount, -1);
+    for (size_t j = 0; j + 1 < controlMap.size(); ++j) {
+        if (controlMap[j] + 1 == controlMap[j + 1]) {
+            solvedSpanForCurrentSpan[controlMap[j]] = static_cast<int>(j);
+        }
+    }
+    constexpr double kMatchEpsilon = 1.0e-8;
+    constexpr double kMaxDistanceSq = kMatchEpsilon * kMatchEpsilon;
+    const auto endpointsMatch = [&](size_t solvedControl, size_t currentControl) {
+        const cv::Vec3d delta = solvedControls[solvedControl].volumePoint -
+                                currentControls[currentControl].volumePoint;
+        return delta.dot(delta) <= kMaxDistanceSq;
+    };
+    // Normalized locally rather than required of the caller: sortedness is
+    // an easy contract to break silently, and an out-of-range entry names no
+    // real span.
+    std::vector<size_t> sortedEditedSpans;
+    sortedEditedSpans.reserve(editedSpans.size());
+    for (const size_t span : editedSpans) {
+        if (span < currentSpanCount) {
+            sortedEditedSpans.push_back(span);
+        }
+    }
+    std::sort(sortedEditedSpans.begin(), sortedEditedSpans.end());
+    const auto spanEdited = [&](size_t span) {
+        return std::binary_search(sortedEditedSpans.begin(),
+                                  sortedEditedSpans.end(), span);
+    };
+
+    std::vector<bool> adopt(currentSpanCount, false);
+    for (size_t i = 0; i < currentSpanCount; ++i) {
+        const int j = solvedSpanForCurrentSpan[i];
+        adopt[i] = j >= 0 && !spanEdited(i) &&
+                   endpointsMatch(static_cast<size_t>(j), i) &&
+                   endpointsMatch(static_cast<size_t>(j) + 1, i + 1);
+    }
+    // The extrapolated tails belong to no span: adopt them only when the
+    // outer control is unchanged and no solver-input configuration (the
+    // extrapolation distance) changed while the solve ran.
+    // An edit in the outer span also invalidates its tail: the native
+    // extrapolation is seeded from the first interior vertex, so splitting
+    // or reshaping the outer span changes a real input of the solved tail
+    // even when the outer control itself is unchanged.
+    const bool adoptHead = !configChanged && controlMap.front() == 0 &&
+        endpointsMatch(0, 0) &&
+        (currentSpanCount == 0 || !spanEdited(0));
+    const bool adoptTail = !configChanged &&
+        controlMap.back() == currentControls.size() - 1 &&
+        endpointsMatch(solvedControls.size() - 1, currentControls.size() - 1) &&
+        (currentSpanCount == 0 || !spanEdited(currentSpanCount - 1));
+
+    // Left-to-right assembly from half-open pieces: every control vertex is
+    // the first point of the piece to its right (the last control's vertex
+    // opens the tail piece), so shared vertices are emitted exactly once and
+    // each control's merged index is the size of the output at its piece
+    // boundary. LinePoints are copied whole — normals travel with their
+    // geometry, from whichever line the piece came from.
+    out.line.points.clear();
+    const auto appendPiece = [&out](const vc::lasagna::LineModel& source,
+                                    size_t begin,
+                                    size_t end) {
+        for (size_t k = begin; k < end && k < source.points.size(); ++k) {
+            out.line.points.push_back(source.points[k]);
+        }
+    };
+    std::vector<size_t> mergedControlIndices(currentControls.size(), 0);
+    if (adoptHead) {
+        appendPiece(solvedLine, 0, sIdx.front());
+    } else {
+        appendPiece(currentLine, 0, cIdx.front());
+    }
+    for (size_t i = 0; i < currentSpanCount; ++i) {
+        mergedControlIndices[i] = out.line.points.size();
+        if (adopt[i]) {
+            const auto j = static_cast<size_t>(solvedSpanForCurrentSpan[i]);
+            appendPiece(solvedLine, sIdx[j], sIdx[j + 1]);
+        } else {
+            appendPiece(currentLine, cIdx[i], cIdx[i + 1]);
+        }
+    }
+    mergedControlIndices.back() = out.line.points.size();
+    if (adoptTail) {
+        appendPiece(solvedLine, sIdx.back(), solvedLine.points.size());
+    } else {
+        appendPiece(currentLine, cIdx.back(), currentLine.points.size());
+    }
+
+    out.controls = currentControls;
+    for (size_t i = 0; i < currentSpanCount; ++i) {
+        if (adopt[i]) {
+            const auto j = static_cast<size_t>(solvedSpanForCurrentSpan[i]);
+            out.controls[i].segmentToNext = solvedControls[j].segmentToNext;
+        }
+    }
+    for (size_t k = 0; k < out.controls.size(); ++k) {
+        out.controls[k].optimizedIndex =
+            static_cast<int>(mergedControlIndices[k]);
+        out.controls[k].linePosition =
+            static_cast<double>(mergedControlIndices[k]);
+    }
+
+    // Output contract check, mirroring the publication guard: the merged
+    // controls must be an exact ordered subset of the merged line at exactly
+    // the indices computed above, strictly increasing.
+    const auto verify = orderedControlPointLineIndices(positionsOf(out.controls),
+                                                       linePositionsOf(out.line));
+    if (!verify || *verify != mergedControlIndices) {
+        return out;
+    }
+    for (size_t k = 1; k < mergedControlIndices.size(); ++k) {
+        if (mergedControlIndices[k] <= mergedControlIndices[k - 1]) {
+            return out;
+        }
+    }
+
+    // displayFrameAnchorIndex: nearest valid-normal vertex to the center
+    // whose normal is not parallel to the local tangent (the display frame
+    // builder throws on a parallel anchor; merged geometry mixes normals of
+    // different provenance, so the check cannot be skipped here either).
+    int bestAnchor = -1;
+    double bestAnchorDistance = std::numeric_limits<double>::infinity();
+    const double center =
+        static_cast<double>(out.line.points.size() - 1) * 0.5;
+    for (size_t k = 0; k < out.line.points.size(); ++k) {
+        if (!out.line.points[k].valid) {
+            continue;
+        }
+        if (!out.line.points[k].sampledNormal.valid) {
+            continue;
+        }
+        {
+            // Same anchor eligibility as the interpolated splice: fold-back
+            // tolerant tangent, normalized normal, degenerate tangent
+            // rejects, 1e-6 margin over the builder's epsilon.
+            const size_t lower = k > 0 ? k - 1 : k;
+            const size_t upper =
+                k + 1 < out.line.points.size() ? k + 1 : k;
+            const std::array<cv::Vec3d, 3> candidates{
+                out.line.points[upper].position -
+                    out.line.points[lower].position,
+                out.line.points[upper].position - out.line.points[k].position,
+                out.line.points[k].position -
+                    out.line.points[lower].position};
+            cv::Vec3d tangent{0, 0, 0};
+            for (const auto& candidate : candidates) {
+                const double length = cv::norm(candidate);
+                if (length > 1.0e-9) {
+                    tangent = candidate / length;
+                    break;
+                }
+            }
+            if (cv::norm(tangent) <= 1.0e-9) {
+                continue;
+            }
+            cv::Vec3d normal = out.line.points[k].sampledNormal.normal;
+            const double normalLength = cv::norm(normal);
+            if (normalLength <= 1.0e-9 || !std::isfinite(normalLength)) {
+                continue;
+            }
+            normal /= normalLength;
+            const cv::Vec3d perpendicular =
+                normal - normal.dot(tangent) * tangent;
+            if (cv::norm(perpendicular) <= 1.0e-6) {
+                continue;
+            }
+        }
+        const double distance = std::abs(static_cast<double>(k) - center);
+        if (distance < bestAnchorDistance) {
+            bestAnchorDistance = distance;
+            bestAnchor = static_cast<int>(k);
+        }
+    }
+    if (bestAnchor < 0) {
+        return out;
+    }
+    out.line.displayFrameAnchorIndex = bestAnchor;
+
+    for (size_t j = 0; j + 1 < controlMap.size(); ++j) {
+        const bool adjacent = controlMap[j] + 1 == controlMap[j + 1];
+        if (adjacent && adopt[controlMap[j]]) {
+            out.adoptedSpans.push_back(controlMap[j]);
+        } else if (adjacent) {
+            out.rejectedSolvedSpans.push_back(controlMap[j]);
+        } else if (controlMap[j] != controlMap[j + 1]) {
+            // The solved span straddles inserted controls: its coverage maps
+            // onto several current spans; re-solving those exactly is what
+            // the edits' own pending spans request, so nothing extra is
+            // needed. A collapsed span (equal map entries) has no current
+            // counterpart at all — its geometry was replaced by the edit.
+        }
+    }
+    out.mergeable = true;
+    return out;
+}
 
 std::optional<FiberSplitPlan> computeFiberSplitPlan(
     const std::vector<cv::Vec3d>& controlPoints,
@@ -1408,7 +2037,7 @@ std::optional<FiberSplitPlan> computeFiberSplitPlan(
         splitAfterControlIndex + 3 > controlPoints.size()) {
         return std::nullopt;
     }
-    const auto scannedIndices = orderedControlLineIndices(controlPoints, linePoints);
+    const auto scannedIndices = orderedControlPointLineIndices(controlPoints, linePoints);
     if (!scannedIndices) {
         return std::nullopt;
     }
@@ -1467,9 +2096,9 @@ std::optional<FiberMergeGeometry> computeFiberMergeGeometry(
         return std::nullopt;
     }
     const auto aIndices =
-        orderedControlLineIndices(storedControlPointPositions(aControls), aLine);
+        orderedControlPointLineIndices(storedControlPointPositions(aControls), aLine);
     const auto bIndices =
-        orderedControlLineIndices(storedControlPointPositions(bControls), bLine);
+        orderedControlPointLineIndices(storedControlPointPositions(bControls), bLine);
     if (!aIndices || !bIndices) {
         return std::nullopt;
     }

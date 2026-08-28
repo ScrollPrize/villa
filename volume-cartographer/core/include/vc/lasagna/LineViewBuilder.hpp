@@ -30,6 +30,11 @@ struct LineViewConfig {
     // frame mesh normals AND the display up vectors agree with these on a
     // cosine-weighted majority. Empty/mismatched/all-invalid -> legacy signs.
     std::vector<cv::Vec3f> orientedPointNormals;
+    // Build one PlaneSurface per line point into lineZSlices. VC3D's line
+    // annotation only consumes lineUpVectors, so it opts out - a 2000-point
+    // fiber otherwise allocates 2000 shared_ptr planes per view rebuild for
+    // nothing. Defaults on for the existing consumers/tests.
+    bool buildLineZSlices = true;
 };
 
 // Maps the original LineModel point-index coordinate to the ribbon grid and
