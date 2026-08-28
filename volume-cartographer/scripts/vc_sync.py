@@ -2490,11 +2490,14 @@ class SftpSyncManager(S3SyncManager):
         env['RCLONE_SFTP_USER'] = self._creds['user']
         env['RCLONE_SFTP_PORT'] = str(self._creds['port'])
         env['RCLONE_SFTP_PASS'] = self._sftp_pass_obscured
-        # "none" (the default) matches rclone's no-validation default but
-        # silences the per-invocation host-key NOTICE; a real path enables
-        # host-key pinning.
-        env['RCLONE_SFTP_KNOWN_HOSTS_FILE'] = os.path.expanduser(
-            self._creds['known_hosts_file'])
+        # Only set when a real path is configured (host-key pinning).
+        # The "none" default must leave the variable UNSET: older rclone
+        # treats any value as a literal path and fails to open "none";
+        # unset simply means rclone's own default of no validation (newer
+        # rclone then prints a one-line NOTICE per invocation — harmless).
+        known_hosts = self._creds['known_hosts_file']
+        if known_hosts.lower() != 'none':
+            env['RCLONE_SFTP_KNOWN_HOSTS_FILE'] = os.path.expanduser(known_hosts)
         return env
 
     def _run_rclone_capture(self, args, timeout=None):

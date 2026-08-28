@@ -1197,7 +1197,15 @@ class TestSftpManagerState:
         assert env['RCLONE_SFTP_USER'] == 'user1'
         assert env['RCLONE_SFTP_PORT'] == '2022'
         assert env['RCLONE_SFTP_PASS'] == 'obscured:secret'
-        assert env['RCLONE_SFTP_KNOWN_HOSTS_FILE'] == 'none'
+        # The "none" default must leave the variable UNSET: older rclone
+        # treats any value as a literal path and fails to open "none"
+        assert 'RCLONE_SFTP_KNOWN_HOSTS_FILE' not in env
+
+    def test_known_hosts_path_reaches_rclone_env(self, sftp_manager):
+        sftp_manager._creds['known_hosts_file'] = '~/.ssh/known_hosts'
+        env = sftp_manager._rclone_env()
+        assert env['RCLONE_SFTP_KNOWN_HOSTS_FILE'] == os.path.expanduser(
+            '~/.ssh/known_hosts')
 
     def test_display_url(self, sftp_manager):
         assert sftp_manager._get_s3_url('a/b.json') == (
