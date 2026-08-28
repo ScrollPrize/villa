@@ -72,7 +72,6 @@ public:
     void setGridCapPixels(uint64_t cap) { grid_cap_pixels = cap; }
     void setSrcScale(const cv::Vec2f& s) { src_scale = s; }
     int validCount() const { return last_valid_count; }
-    cv::Vec2f uvRange() const { return uv_max - uv_min; }
     int gridWidth() const { return grid_size[0]; }
     int gridHeight() const { return grid_size[1]; }
     void setSrcApproval(const cv::Mat& m) { src_approval = m; }
@@ -721,17 +720,9 @@ int main(int argc, char *argv[])
     const bool degenerate_grid =
         converter.gridWidth() <= 2 && converter.gridHeight() <= 2;
     if (converter.validCount() == 0 || degenerate_grid) {
-        const cv::Vec2f range = converter.uvRange();
         std::cerr << "Error: " << (degenerate_grid ? "degenerate 2 x 2 output grid"
                                                    : "0 grid points rasterized")
                   << "; not writing a sentinel-filled tifxyz." << std::endl;
-        if (range[0] <= 1.5f && range[1] <= 1.5f) {
-            std::cerr << "UV range is " << range[0] << " x " << range[1]
-                      << " (normalized UVs?), which yields only a " << converter.gridWidth()
-                      << " x " << converter.gridHeight() << " grid. "
-                      << "Pass a stretch_factor (pixels per UV unit, e.g. 800) or "
-                      << "--uv-to-obj=<OBJ units per UV unit>." << std::endl;
-        }
         delete surf;
         return EXIT_FAILURE;
     }
