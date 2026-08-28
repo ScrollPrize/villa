@@ -1206,7 +1206,8 @@ def _scaled_approval_tifxyz_path(
 	return str(dst)
 
 
-def _save_flatten_model(path: str, *, mdl: model.Model3D, data: fit_data.FitData3D, fit_config: dict) -> None:
+def _flatten_checkpoint_state(*, mdl: model.Model3D, fit_config: dict) -> dict:
+	"""Build the flatten checkpoint state dict (runs the full UV inversion)."""
 	st = dict(mdl.state_dict())
 	for k in [k for k in st if k.startswith("mesh_ms.")]:
 		del st[k]
@@ -1233,6 +1234,12 @@ def _save_flatten_model(path: str, *, mdl: model.Model3D, data: fit_data.FitData
 		params["lasagna_base_shape_zyx"] = list(fit_config["lasagna_base_shape_zyx"])
 	st["_model_params_"] = params
 	st["_fit_config_"] = fit_config
+	return st
+
+
+def _save_flatten_model(path: str, *, mdl: model.Model3D, data: fit_data.FitData3D, fit_config: dict,
+						state: dict | None = None) -> None:
+	st = state if state is not None else _flatten_checkpoint_state(mdl=mdl, fit_config=fit_config)
 	torch.save(st, path)
 
 
@@ -1245,19 +1252,29 @@ def _export_flatten_result(
 	voxel_size_um: float | None,
 	fit_config: dict,
 	model_source: Path | None,
+	state: dict | None = None,
 ) -> None:
 	import numpy as np
 	import fit2tifxyz
 
 	out_dir.mkdir(parents=True, exist_ok=True)
-	with torch.no_grad():
-		_map_yx, xyz, point_mask, _quad_mask = mdl._flatten_sample_current(
-			inversion_output_device=torch.device("cpu"))
-	xyz_np = xyz[0].detach().cpu().numpy().astype(np.float32, copy=False)
-	mask_np = point_mask.detach().cpu().numpy().astype(bool, copy=False)
-	x = np.where(mask_np, xyz_np[..., 0], -1.0).astype(np.float32, copy=False)
-	y = np.where(mask_np, xyz_np[..., 1], -1.0).astype(np.float32, copy=False)
-	z = np.where(mask_np, xyz_np[..., 2], -1.0).astype(np.float32, copy=False)
+	if state is not None:
+		# The checkpoint state already carries the inverted output-grid mesh
+		# with the -1 sentinel applied at invalid points; reusing it skips a
+		# second, identical full-grid inversion.
+		mesh_np = state["mesh_flat"].detach().cpu().numpy().astype(np.float32, copy=False)
+		x = mesh_np[0, 0]
+		y = mesh_np[1, 0]
+		z = mesh_np[2, 0]
+	else:
+		with torch.no_grad():
+			_map_yx, xyz, point_mask, _quad_mask = mdl._flatten_sample_current(
+				inversion_output_device=torch.device("cpu"))
+		xyz_np = xyz[0].detach().cpu().numpy().astype(np.float32, copy=False)
+		mask_np = point_mask.detach().cpu().numpy().astype(bool, copy=False)
+		x = np.where(mask_np, xyz_np[..., 0], -1.0).astype(np.float32, copy=False)
+		y = np.where(mask_np, xyz_np[..., 1], -1.0).astype(np.float32, copy=False)
+		z = np.where(mask_np, xyz_np[..., 2], -1.0).astype(np.float32, copy=False)
 	output_step = (
 		float(mdl.params.flatten_output_step)
 		if mdl.params.flatten_output_step is not None
@@ -1413,6 +1430,7 @@ def _run_flatten_mode(
 	progress_enabled: bool,
 	out_dir: str | None,
 	lifecycle_fn=None,
+	state_sink: dict | None = None,
 ) -> int:
 	ext_surfaces_cfg = cfg.get("external_surfaces", None)
 	if not isinstance(ext_surfaces_cfg, list) or len(ext_surfaces_cfg) != 1:
@@ -1607,14 +1625,22 @@ def _run_flatten_mode(
 		print(f"[fit] peak GPU memory: {peak_gb:.2f} GiB", flush=True)
 
 	model_out: str | None = model_cfg.model_output
+	flatten_state: dict | None = None
+	if model_out is not None or out_dir is not None or state_sink is not None:
+		# The state (and its full-grid UV inversion) is computed once and
+		# shared by every consumer below; the results are identical to
+		# recomputing it per consumer.
+		flatten_state = _flatten_checkpoint_state(mdl=mdl, fit_config=fit_config)
 	if model_out is not None:
-		_save_flatten_model(str(model_out), mdl=mdl, data=data, fit_config=fit_config)
+		_save_flatten_model(str(model_out), mdl=mdl, data=data,
+							fit_config=fit_config, state=flatten_state)
 		print(f"[fit] saved model to {model_out}")
 	if out_dir is not None:
 		out = Path(out_dir)
 		out.mkdir(parents=True, exist_ok=True)
 		final_path = out / "model_final.pt"
-		_save_flatten_model(str(final_path), mdl=mdl, data=data, fit_config=fit_config)
+		_save_flatten_model(str(final_path), mdl=mdl, data=data,
+							fit_config=fit_config, state=flatten_state)
 		model_source = Path(model_out) if model_out is not None else final_path
 		_export_flatten_result(
 			mdl=mdl,
@@ -1624,11 +1650,25 @@ def _run_flatten_mode(
 			voxel_size_um=(None if cfg.get("voxel_size_um") is None else float(cfg.get("voxel_size_um"))),
 			fit_config=fit_config,
 			model_source=model_source,
+			state=flatten_state,
 		)
+	if state_sink is not None and flatten_state is not None:
+		# Hand the checkpoint to the caller in host memory so it does not have
+		# to torch.load the file it just asked us to write (or ask for the
+		# file at all).  GPU tensors are copied off-device so retaining the
+		# state does not pin the model's VRAM.
+		state_sink["flatten_state"] = {
+			key: value.detach().cpu() if torch.is_tensor(value) else value
+			for key, value in flatten_state.items()
+		}
 	return 0
 
 
-def main(argv: list[str] | None = None, *, lifecycle_fn=None) -> int:
+def main(argv: list[str] | None = None, *, lifecycle_fn=None,
+		 state_sink: dict | None = None) -> int:
+	# state_sink: optional dict that receives the flatten checkpoint state as
+	# {"flatten_state": ...} (CPU tensors) so an in-process caller can consume
+	# it without re-reading the checkpoint file. Flatten mode only.
 	if argv is None:
 		argv = sys.argv[1:]
 
@@ -1678,6 +1718,7 @@ def main(argv: list[str] | None = None, *, lifecycle_fn=None) -> int:
 			progress_enabled=progress_enabled,
 			out_dir=_out_dir,
 			lifecycle_fn=lifecycle_fn,
+			state_sink=state_sink,
 		)
 
 	data_cfg = cli_data.from_args(args)

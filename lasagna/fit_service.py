@@ -1812,6 +1812,18 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
         if not model_output:
             model_output = str(Path(tmp_dir) / "model_reopt.pt")
 
+        # A flatten client that consumes only the exported tifxyz and the
+        # flatten-map sidecar can skip the checkpoint file entirely: the
+        # exports below run from the in-memory state instead.
+        omit_model_output = bool(body.get("omit_model_output", False))
+        if omit_model_output:
+            if model_init_requested != "flatten":
+                raise ValueError("omit_model_output requires args.model-init=flatten")
+            if not body.get("omit_model", False):
+                raise ValueError("omit_model_output requires omit_model")
+            if body.get("embed_job_metadata", True):
+                raise ValueError("omit_model_output requires embed_job_metadata=false")
+
         # Build argv for fit.py from the config dict.
         cfg = dict(config)
         if request_volume_shape_zyx is not None:
@@ -1849,7 +1861,8 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
             args_section.setdefault("sparse-prefetch-backend", _sparse_prefetch_backend)
         if model_init == "model" and model_input:
             args_section["model-input"] = str(model_input)
-        args_section["model-output"] = str(model_output)
+        if not omit_model_output:
+            args_section["model-output"] = str(model_output)
         # Only set fit.py out-dir if explicitly requested. pred_dt_flow_gate
         # debug slices use their own debug_out_dir so enabling them does not
         # make fit.py export model_final/tifxyz into the service cwd.
@@ -1915,7 +1928,12 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
                         stage, 0, 0, 0.0, stage_name=stage_name)
                     _check_cancel()
 
-                fit_mod.main([cfg_path], lifecycle_fn=_fit_lifecycle)
+                # Flatten runs hand their checkpoint state back in host
+                # memory; the exports below then never re-read the multi-GB
+                # checkpoint file they just asked fit.py to write.
+                fit_state_sink: dict = {}
+                fit_mod.main([cfg_path], lifecycle_fn=_fit_lifecycle,
+                             state_sink=fit_state_sink)
                 uv_export = body.get("export_flatten_uv")
                 if uv_export is not None:
                     if not isinstance(uv_export, dict):
@@ -1925,8 +1943,11 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
                         stage_name="Exporting source-grid flatten UV sidecars")
                     import torch
                     from flatten_uv import write_sidecars
-                    st = torch.load(
-                        str(model_output), map_location="cpu", weights_only=False)
+                    st = fit_state_sink.get("flatten_state")
+                    if st is None:
+                        st = torch.load(
+                            str(model_output), map_location="cpu",
+                            weights_only=False)
                     if not isinstance(st, dict) or "flatten_forward_uv" not in st:
                         raise ValueError(
                             "flatten result contains no source-grid forward UV field")
@@ -1960,7 +1981,9 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
                         "saving", 0, 0, 0.0,
                         stage_name="Embedding Lasagna job metadata")
                     import torch
-                    st = torch.load(str(model_output), map_location="cpu", weights_only=False)
+                    st = fit_state_sink.get("flatten_state")
+                    if st is None:
+                        st = torch.load(str(model_output), map_location="cpu", weights_only=False)
                     if isinstance(st, dict):
                         st["_job_spec_"] = job_spec
                         object_refs = body.get("_object_refs_")
@@ -2008,7 +2031,9 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
                     str(int(request_volume_shape_zyx[2])),
                 ])
             _check_cancel()
-            fit2tifxyz.main(export_argv, cancel_fn=_check_cancel)
+            fit2tifxyz.main(export_argv, cancel_fn=_check_cancel,
+                            state=fit_state_sink.get("flatten_state"))
+            fit_state_sink.clear()
             job.set_running(
                 "finalizing", 0, 0, 0.0,
                 stage_name="Finalizing Lasagna preview export")

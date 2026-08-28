@@ -3179,6 +3179,8 @@ class Model3D(nn.Module):
 		if tuple(source_cell_valid.shape) != (max(0, int(uv_yx.shape[0]) - 1), max(0, int(uv_yx.shape[1]) - 1)):
 			raise ValueError("forward flatten source_cell_valid shape does not match UV map")
 
+		from concurrent.futures import ThreadPoolExecutor
+
 		import numpy as np
 
 		device = uv_yx.device
@@ -3300,6 +3302,15 @@ class Model3D(nn.Module):
 		tri0_t_cell = q01 - q00
 		tri1_u_cell = q11 - q10
 		tri1_v_cell = q01 - q10
+		# One packed per-cell table so each chunk gathers and uploads its
+		# candidates in a single pass instead of six; the staged values are
+		# the same float64 bits either way.
+		cell_table = np.concatenate([
+			q00, tri0_s_cell, tri0_t_cell,
+			q10, tri1_u_cell, tri1_v_cell,
+		], axis=1)
+		del q00, q10, q01, q11
+		del tri0_s_cell, tri0_t_cell, tri1_u_cell, tri1_v_cell
 		if not use_tree:
 			centers_c = torch.as_tensor(centers, dtype=torch.float64, device=device)
 
@@ -3309,135 +3320,167 @@ class Model3D(nn.Module):
 
 		total = int(out_h) * int(out_w)
 		chunk = max(1, int(chunk_points))
-		for start in range(0, total, chunk):
+		starts = list(range(0, total, chunk))
+
+		def _chunk_points(start: int) -> tuple[np.ndarray, np.ndarray]:
 			stop = min(total, start + chunk)
 			flat_idx = np.arange(start, stop, dtype=np.int64)
 			oy = flat_idx // int(out_w)
 			ox = flat_idx - oy * int(out_w)
 			points = np.stack([lo[0] + oy.astype(np.float64), lo[1] + ox.astype(np.float64)], axis=-1)
-			if use_tree:
-				_dist, cand = tree.query(points, k=k, workers=-1)
-				cand = np.asarray(cand, dtype=np.int64)
-				if cand.ndim == 1:
-					cand = cand[:, None]
-			else:
-				pts_bf = torch.as_tensor(points, dtype=torch.float64, device=device)
-				d2 = ((pts_bf[:, None, :] - centers_c[None, :, :]) ** 2).sum(dim=-1)
-				cand = torch.topk(
-					d2, min(k, int(centers_c.shape[0])), dim=1, largest=False,
-				).indices.detach().cpu().numpy()
+			return flat_idx, points
 
-			def _candidate_tensor(values: np.ndarray) -> torch.Tensor:
-				return torch.as_tensor(
-					np.ascontiguousarray(values[cand]),
-					dtype=torch.float64,
-					device=device,
+		def _stage_chunk(start: int):
+			"""CPU stage of one chunk: output points, k-NN cells, staged rows.
+
+			This runs one chunk ahead on a worker thread so the KDTree query
+			and the host-side candidate gather overlap the previous chunk's
+			device solve. Every chunk is computed exactly as before and chunks
+			write disjoint output rows, so pipelining changes no results.
+			"""
+			flat_idx, points = _chunk_points(start)
+			_dist, cand = tree.query(points, k=k, workers=-1)
+			cand = np.asarray(cand, dtype=np.int64)
+			if cand.ndim == 1:
+				cand = cand[:, None]
+			return flat_idx, points, cand, cell_table[cand]
+
+		prefetcher = None
+		pending = None
+		if use_tree and len(starts) > 1:
+			prefetcher = ThreadPoolExecutor(
+				max_workers=1, thread_name_prefix="flatten-invert-prefetch")
+			pending = prefetcher.submit(_stage_chunk, starts[0])
+		try:
+			for index, start in enumerate(starts):
+				if pending is not None:
+					flat_idx, points, cand, staged = pending.result()
+					pending = (
+						prefetcher.submit(_stage_chunk, starts[index + 1])
+						if index + 1 < len(starts) else None)
+				elif use_tree:
+					flat_idx, points, cand, staged = _stage_chunk(start)
+				else:
+					flat_idx, points = _chunk_points(start)
+					pts_bf = torch.as_tensor(points, dtype=torch.float64, device=device)
+					d2 = ((pts_bf[:, None, :] - centers_c[None, :, :]) ** 2).sum(dim=-1)
+					cand = torch.topk(
+						d2, min(k, int(centers_c.shape[0])), dim=1, largest=False,
+					).indices.detach().cpu().numpy()
+					staged = cell_table[cand]
+
+				pts_t = torch.as_tensor(points, dtype=torch.float64, device=device)
+				cand_table = torch.as_tensor(
+					staged, dtype=torch.float64, device=device)
+				del staged
+				q00_c = cand_table[..., 0:2]
+				e0s = cand_table[..., 2:4]
+				e0t = cand_table[..., 4:6]
+
+				# Triangle 0: q00 + s*(q10-q00) + t*(q01-q00).
+				rhs0 = pts_t[:, None, :] - q00_c
+				del q00_c
+				det0_c = e0s[..., 0] * e0t[..., 1] - e0s[..., 1] * e0t[..., 0]
+				s0 = (rhs0[..., 0] * e0t[..., 1] - e0t[..., 0] * rhs0[..., 1]) / det0_c
+				t0 = (e0s[..., 0] * rhs0[..., 1] - rhs0[..., 0] * e0s[..., 1]) / det0_c
+				resid0 = s0[..., None] * e0s + t0[..., None] * e0t - rhs0
+				res20 = (resid0 * resid0).sum(dim=-1)
+				inside0 = (
+					torch.isfinite(res20)
+					& (s0 >= -1.0e-4)
+					& (t0 >= -1.0e-4)
+					& (s0 + t0 <= 1.0 + 1.0e-4)
+					& (res20 <= 1.0e-5)
 				)
+				inf = torch.full_like(res20, float("inf"))
+				score0 = torch.where(inside0, res20, inf)
+				del rhs0, e0s, e0t, det0_c, resid0, res20, inside0
 
-			pts_t = torch.as_tensor(points, dtype=torch.float64, device=device)
-			q00_c = _candidate_tensor(q00)
-			e0s = _candidate_tensor(tri0_s_cell)
-			e0t = _candidate_tensor(tri0_t_cell)
-
-			# Triangle 0: q00 + s*(q10-q00) + t*(q01-q00).
-			rhs0 = pts_t[:, None, :] - q00_c
-			del q00_c
-			det0_c = e0s[..., 0] * e0t[..., 1] - e0s[..., 1] * e0t[..., 0]
-			s0 = (rhs0[..., 0] * e0t[..., 1] - e0t[..., 0] * rhs0[..., 1]) / det0_c
-			t0 = (e0s[..., 0] * rhs0[..., 1] - rhs0[..., 0] * e0s[..., 1]) / det0_c
-			resid0 = s0[..., None] * e0s + t0[..., None] * e0t - rhs0
-			res20 = (resid0 * resid0).sum(dim=-1)
-			inside0 = (
-				torch.isfinite(res20)
-				& (s0 >= -1.0e-4)
-				& (t0 >= -1.0e-4)
-				& (s0 + t0 <= 1.0 + 1.0e-4)
-				& (res20 <= 1.0e-5)
-			)
-			inf = torch.full_like(res20, float("inf"))
-			score0 = torch.where(inside0, res20, inf)
-			del rhs0, e0s, e0t, det0_c, resid0, res20, inside0
-
-			# Triangle 1: q10 + u*(q11-q10) + v*(q01-q10).
-			q10_c = _candidate_tensor(q10)
-			e1u = _candidate_tensor(tri1_u_cell)
-			e1v = _candidate_tensor(tri1_v_cell)
-			rhs1 = pts_t[:, None, :] - q10_c
-			del q10_c
-			det1_c = e1u[..., 0] * e1v[..., 1] - e1u[..., 1] * e1v[..., 0]
-			u1 = (rhs1[..., 0] * e1v[..., 1] - e1v[..., 0] * rhs1[..., 1]) / det1_c
-			v1 = (e1u[..., 0] * rhs1[..., 1] - rhs1[..., 0] * e1u[..., 1]) / det1_c
-			resid1 = u1[..., None] * e1u + v1[..., None] * e1v - rhs1
-			res21 = (resid1 * resid1).sum(dim=-1)
-			inside1 = (
-				torch.isfinite(res21)
-				& (u1 >= -1.0e-4)
-				& (v1 >= -1.0e-4)
-				& (u1 + v1 <= 1.0 + 1.0e-4)
-				& (res21 <= 1.0e-5)
-			)
-			score1 = torch.where(inside1, res21, inf)
-			del rhs1, e1u, e1v, det1_c, resid1, res21, inside1, inf
-			use_tri1 = score1 < score0
-			score = torch.minimum(score0, score1)
-			# Deterministic argmin matching numpy: lowest candidate position among
-			# minimal scores (torch.min's tie-break is unspecified on CUDA).
-			best_score = score.min(dim=1, keepdim=True).values
-			positions = torch.arange(score.shape[1], device=device)
-			tie_pos = torch.where(score == best_score, positions, score.shape[1])
-			best_pos = tie_pos.min(dim=1).values
-			best_score = best_score.squeeze(1)
-			good = torch.isfinite(best_score)
-			if not bool(good.any()):
-				continue
-			ar = torch.arange(cand.shape[0], device=device)
-			best_tri1 = use_tri1[ar, best_pos][good]
-			best_s0 = s0[ar, best_pos][good]
-			best_t0 = t0[ar, best_pos][good]
-			best_u1 = u1[ar, best_pos][good]
-			best_v1 = v1[ar, best_pos][good]
-			best_pos_np = best_pos.detach().cpu().numpy()
-			good_np = good.detach().cpu().numpy()
-			best_cell = cand[np.arange(cand.shape[0]), best_pos_np][good_np]
-			del score0, score1, score, best_score, tie_pos, best_pos, good
-			del s0, t0, u1, v1, use_tri1
-
-			# Clamp tiny shared-edge tolerances, then renormalize barycentric
-			# weights so source coordinates and sampled xyz use the same point.
-			zero = torch.zeros_like(best_s0)
-			w00 = torch.where(best_tri1, zero, 1.0 - best_s0 - best_t0)
-			w10 = torch.where(best_tri1, 1.0 - best_u1 - best_v1, best_s0)
-			w01 = torch.where(best_tri1, best_v1, best_t0)
-			w11 = torch.where(best_tri1, best_u1, zero)
-			weights = torch.stack((w00, w10, w01, w11), dim=-1).clamp_min(0.0)
-			weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1.0e-12)
-			def _selected_tensor(values: np.ndarray) -> torch.Tensor:
-				return torch.as_tensor(
-					np.ascontiguousarray(values[best_cell]),
-					dtype=torch.float64,
-					device=device,
+				# Triangle 1: q10 + u*(q11-q10) + v*(q01-q10).
+				q10_c = cand_table[..., 6:8]
+				e1u = cand_table[..., 8:10]
+				e1v = cand_table[..., 10:12]
+				rhs1 = pts_t[:, None, :] - q10_c
+				del q10_c
+				det1_c = e1u[..., 0] * e1v[..., 1] - e1u[..., 1] * e1v[..., 0]
+				u1 = (rhs1[..., 0] * e1v[..., 1] - e1v[..., 0] * rhs1[..., 1]) / det1_c
+				v1 = (e1u[..., 0] * rhs1[..., 1] - rhs1[..., 0] * e1u[..., 1]) / det1_c
+				resid1 = u1[..., None] * e1u + v1[..., None] * e1v - rhs1
+				res21 = (resid1 * resid1).sum(dim=-1)
+				inside1 = (
+					torch.isfinite(res21)
+					& (u1 >= -1.0e-4)
+					& (v1 >= -1.0e-4)
+					& (u1 + v1 <= 1.0 + 1.0e-4)
+					& (res21 <= 1.0e-5)
 				)
+				score1 = torch.where(inside1, res21, inf)
+				del rhs1, e1u, e1v, det1_c, resid1, res21, inside1, inf, cand_table
+				use_tri1 = score1 < score0
+				score = torch.minimum(score0, score1)
+				# Deterministic argmin matching numpy: lowest candidate position among
+				# minimal scores (torch.min's tie-break is unspecified on CUDA).
+				best_score = score.min(dim=1, keepdim=True).values
+				positions = torch.arange(score.shape[1], device=device)
+				tie_pos = torch.where(score == best_score, positions, score.shape[1])
+				best_pos = tie_pos.min(dim=1).values
+				best_score = best_score.squeeze(1)
+				good = torch.isfinite(best_score)
+				if not bool(good.any()):
+					continue
+				ar = torch.arange(cand.shape[0], device=device)
+				best_tri1 = use_tri1[ar, best_pos][good]
+				best_s0 = s0[ar, best_pos][good]
+				best_t0 = t0[ar, best_pos][good]
+				best_u1 = u1[ar, best_pos][good]
+				best_v1 = v1[ar, best_pos][good]
+				best_pos_np = best_pos.detach().cpu().numpy()
+				good_np = good.detach().cpu().numpy()
+				best_cell = cand[np.arange(cand.shape[0]), best_pos_np][good_np]
+				del score0, score1, score, best_score, tie_pos, best_pos, good
+				del s0, t0, u1, v1, use_tri1
 
-			best_rows = _selected_tensor(rows_float)
-			best_cols = _selected_tensor(cols_float)
-			x00_c = _selected_tensor(x00)
-			x10_c = _selected_tensor(x10)
-			x01_c = _selected_tensor(x01)
-			x11_c = _selected_tensor(x11)
-			flat_out = torch.as_tensor(
-				flat_idx[good_np], dtype=torch.long, device=result_device)
-			src_r = best_rows + weights[:, 1] + weights[:, 3]
-			src_c = best_cols + weights[:, 2] + weights[:, 3]
-			sampled = (
-				weights[:, 0, None] * x00_c
-				+ weights[:, 1, None] * x10_c
-				+ weights[:, 2, None] * x01_c
-				+ weights[:, 3, None] * x11_c
-			)
-			out_map_t[flat_out, 0] = src_r.to(device=result_device, dtype=torch.float32)
-			out_map_t[flat_out, 1] = src_c.to(device=result_device, dtype=torch.float32)
-			out_xyz_t[flat_out] = sampled.to(device=result_device, dtype=torch.float32)
-			out_mask_t[flat_out] = True
+				# Clamp tiny shared-edge tolerances, then renormalize barycentric
+				# weights so source coordinates and sampled xyz use the same point.
+				zero = torch.zeros_like(best_s0)
+				w00 = torch.where(best_tri1, zero, 1.0 - best_s0 - best_t0)
+				w10 = torch.where(best_tri1, 1.0 - best_u1 - best_v1, best_s0)
+				w01 = torch.where(best_tri1, best_v1, best_t0)
+				w11 = torch.where(best_tri1, best_u1, zero)
+				weights = torch.stack((w00, w10, w01, w11), dim=-1).clamp_min(0.0)
+				weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1.0e-12)
+				def _selected_tensor(values: np.ndarray) -> torch.Tensor:
+					return torch.as_tensor(
+						np.ascontiguousarray(values[best_cell]),
+						dtype=torch.float64,
+						device=device,
+					)
+
+				best_rows = _selected_tensor(rows_float)
+				best_cols = _selected_tensor(cols_float)
+				x00_c = _selected_tensor(x00)
+				x10_c = _selected_tensor(x10)
+				x01_c = _selected_tensor(x01)
+				x11_c = _selected_tensor(x11)
+				flat_out = torch.as_tensor(
+					flat_idx[good_np], dtype=torch.long, device=result_device)
+				src_r = best_rows + weights[:, 1] + weights[:, 3]
+				src_c = best_cols + weights[:, 2] + weights[:, 3]
+				sampled = (
+					weights[:, 0, None] * x00_c
+					+ weights[:, 1, None] * x10_c
+					+ weights[:, 2, None] * x01_c
+					+ weights[:, 3, None] * x11_c
+				)
+				out_map_t[flat_out, 0] = src_r.to(device=result_device, dtype=torch.float32)
+				out_map_t[flat_out, 1] = src_c.to(device=result_device, dtype=torch.float32)
+				out_xyz_t[flat_out] = sampled.to(device=result_device, dtype=torch.float32)
+				out_mask_t[flat_out] = True
+		finally:
+			if prefetcher is not None:
+				if pending is not None:
+					pending.cancel()
+				prefetcher.shutdown(wait=True)
 
 		# out_xyz_t is zero-initialized and written only at filled pixels, so it is
 		# already zero everywhere out_mask is False.

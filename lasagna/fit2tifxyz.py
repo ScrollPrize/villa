@@ -1096,7 +1096,9 @@ def _export_flatten_checkpoint(
 	return 0
 
 
-def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
+def main(argv: list[str] | None = None, *, cancel_fn=None, state: dict | None = None) -> int:
+	# state: an already-loaded checkpoint state dict; when given, --input is
+	# never read (it may not even exist) and the export runs from memory.
 	def _check_cancel() -> None:
 		if cancel_fn is not None:
 			cancel_fn()
@@ -1125,7 +1127,7 @@ def main(argv: list[str] | None = None, *, cancel_fn=None) -> int:
 
 	dev = torch.device(cfg.device)
 	_check_cancel()
-	st = torch.load(cfg.input, map_location=dev, weights_only=False)
+	st = state if state is not None else torch.load(cfg.input, map_location=dev, weights_only=False)
 	_check_cancel()
 	if not isinstance(st, dict):
 		raise ValueError("expected a state_dict checkpoint")
