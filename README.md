@@ -72,6 +72,9 @@ A single-header C library for accessing CT scans of ancient scrolls.
 A GUI tool to inspect and label ink on virtually unwrapped segments of ancient scrolls.  
 Originally developed by [Julian Schilliger](https://github.com/schillij95).
 
+### [discord_chatbot](deprecated/discord_chatbot/)
+A Retrieval-Augmented Generation chatbot for answering questions from Discord chat history.
+
 [licence-badge]: https://img.shields.io/github/license/ScrollPrize/villa?color=blue
 [licence-url]: https://github.com/ScrollPrize/villa/blob/main/LICENSE
 [stars-badge]: https://img.shields.io/github/stars/ScrollPrize/villa?style=social
