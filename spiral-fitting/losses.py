@@ -8,7 +8,11 @@ import torch.nn.functional as F
 
 import geom_utils
 import prefetch
-from dt_targets import patch_dt_target_in_sample_frame, strip_dt_target_in_sample_frame
+from dt_targets import (
+    endpoint_strip_dt_target_in_sample_frame,
+    patch_dt_target_in_sample_frame,
+    strip_dt_target_in_sample_frame,
+)
 from loss_maps import diagnostics_enabled, record_loss_samples
 from sample_spiral import (
     canonical_winding_samples,
@@ -21,6 +25,15 @@ from spiral_helpers import _huber_abs
 def _masked_mean(values, mask):
     mask_f = mask.to(values.dtype)
     return (values * mask_f).sum() / mask_f.sum().clamp(min=1.)
+
+
+def _masked_median(values, mask):
+    """Lower median along the last dimension, excluding padded values."""
+    counts = mask.sum(dim=-1).clamp(min=1)
+    sortable = torch.where(mask, values, torch.full_like(values, torch.inf))
+    sorted_values = sortable.sort(dim=-1).values
+    median_idx = torch.div(counts - 1, 2, rounding_mode='floor')
+    return torch.gather(sorted_values, -1, median_idx[..., None]).squeeze(-1)
 
 
 _pinned_to_device = geom_utils.pinned_to_device
@@ -420,15 +433,24 @@ def _sample_patch_batch(key, patches, sampling_probabilities, num_to_sample,
 
 
 def _unwrap_sampled_tracks(
-    crossing_map, dr_per_winding, theta, shifted_radii, packed_walks,
+    crossing_map, dr_per_winding, theta, shifted_radii, packed_walks, *,
+    return_walk_start_adjustment=False,
 ):
-    crossing_adjustments = crossing_map.adjustments(
+    result = crossing_map.adjustments(
         packed_walks,
         theta.reshape(-1, theta.shape[-1]),
         dr_per_winding,
+        return_walk_start_adjustment=return_walk_start_adjustment,
     )
+    if return_walk_start_adjustment:
+        crossing_adjustments, walk_start_adjustment = result
+    else:
+        crossing_adjustments = result
     crossing_adjustments = crossing_adjustments.reshape(theta.shape)
-    return shifted_radii + crossing_adjustments, crossing_adjustments
+    unwrapped = shifted_radii + crossing_adjustments
+    if return_walk_start_adjustment:
+        return unwrapped, crossing_adjustments, walk_start_adjustment
+    return unwrapped, crossing_adjustments
 
 
 def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches,
@@ -1293,8 +1315,8 @@ def get_unattached_pcl_strip_losses(
     # subtracting per-point winding-annotation offsets; (2) each point should snap to
     # its target winding, with the target taken from the snapped strip median (or,
     # when dt_target_cache is given, the cached whole-strip quantile target from
-    # dt_targets.py, transferred into this sample's unwrap frame through the cached
-    # point nearest a sampled point by within-strip index).
+    # dt_targets.py, transferred through the walk-origin endpoint carried beside
+    # (but excluded from) the random loss samples).
     #
     # Graph awareness (cross-fiber links): sampling_strata indexes *components* --
     # groups of strips joined by same-winding links (component_strip_lists gives
@@ -1306,16 +1328,16 @@ def get_unattached_pcl_strip_losses(
     # registered step and cached crossings continue through it. The constant-shifted-radius target (1) along the
     # walk then pulls points on either side of every traversed junction onto one
     # shared winding; over steps, random walks cover all of a component's
-    # junctions. Rows mix strips, so the DT snap (2) passes per-point strip
-    # indices to the cache lookup. A singleton component reduces exactly to the
-    # legacy per-strip row.
+    # junctions. Rows can mix strips, but every walk begins at one endpoint of
+    # one member strip, which supplies a canonical DT frame anchor. A singleton
+    # component reduces exactly to the legacy per-strip row.
     device = dr_per_winding.device
     zero = torch.zeros([], device=device)
     if not pcl_strips:
         return zero, zero
 
     num_to_sample = min(num_pcls_per_step, sampling_strata['effective_size'])
-    if num_to_sample <= 0:
+    if num_to_sample <= 0 or num_points_per_pcl <= 0:
         return zero, zero
     chosen_comps = _choose_pcl_indices(sampling_strata, num_to_sample, cfg)
 
@@ -1326,11 +1348,14 @@ def get_unattached_pcl_strip_losses(
     branch_probability = cfg['loss_fiber_link_branch_probability']
     num_rows = len(chosen_comps)
     starts_cpu = flat['starts_cpu'].numpy()
-    sampled_strip_indices = np.empty([num_rows, num_points_per_pcl], dtype=np.int64)
-    sampled_local_indices = np.empty([num_rows, num_points_per_pcl], dtype=np.int64)
-    sampled_flat_indices = np.empty([num_rows, num_points_per_pcl], dtype=np.int64)
+    sampled_flat_rows = []
+    pick_rows = []
+    node_paths = []
     walks = []
-    for k, comp_idx in enumerate(chosen_comps):
+    anchor_flat_indices = []
+    anchor_strip_indices = []
+    anchor_at_end = []
+    for comp_idx in chosen_comps:
         members = component_strip_lists[comp_idx]
         edges = component_edges[comp_idx]
         if len(members) == 1 or not edges:
@@ -1350,35 +1375,95 @@ def get_unattached_pcl_strip_losses(
             else np.arange(pos_from, pos_to - 1, -1, dtype=np.int64)
             for strip_idx, pos_from, pos_to in segments])
         walk_len = len(walk_locals)
-        picks = np.sort(np.random.choice(
-            walk_len, num_points_per_pcl, replace=num_points_per_pcl > walk_len))
-        sampled_strip_indices[k] = walk_strips[picks]
-        sampled_local_indices[k] = walk_locals[picks]
-        sampled_flat_indices[k] = starts_cpu[sampled_strip_indices[k]] + sampled_local_indices[k]
+        if compute_dt:
+            origin_strip = int(walk_strips[0])
+            origin_local = int(walk_locals[0])
+            origin_last = len(pcl_strips[origin_strip]['zyxs']) - 1
+            if origin_local not in (0, origin_last):
+                raise RuntimeError(
+                    'PCL component walk must begin at a strip endpoint')
+            anchor_strip_indices.append(origin_strip)
+            anchor_at_end.append(origin_local == origin_last)
+            anchor_flat_indices.append(
+                starts_cpu[origin_strip] + origin_local)
+        if walk_len <= num_points_per_pcl:
+            picks = np.arange(walk_len, dtype=np.int64)
+        else:
+            picks = np.sort(np.random.choice(
+                walk_len, num_points_per_pcl, replace=False))
+        sampled_strip_row = walk_strips[picks]
+        sampled_local_row = walk_locals[picks]
+        sampled_flat_rows.append(
+            starts_cpu[sampled_strip_row] + sampled_local_row)
+        pick_rows.append(picks)
         node_path = np.concatenate([
             pcl_strips[strip_idx]['_theta_node_ids'][np.arange(
                 pos_from, pos_to + (1 if pos_from <= pos_to else -1),
                 1 if pos_from <= pos_to else -1)]
             for strip_idx, pos_from, pos_to in segments
         ])
+        node_paths.append(node_path)
+
+    sample_counts = np.asarray(
+        [len(row) for row in sampled_flat_rows], dtype=np.int64)
+    padded_count = int(sample_counts.max())
+    valid_gather_indices = np.empty(
+        [num_rows, padded_count], dtype=np.int64)
+    sample_mask_np = (
+        np.arange(padded_count)[None, :] < sample_counts[:, None])
+    valid_offset = 0
+    for k, (picks, node_path) in enumerate(zip(pick_rows, node_paths)):
+        count = len(picks)
+        padded_picks = np.empty(padded_count, dtype=np.int64)
+        padded_picks[:count] = picks
+        padded_picks[count:] = picks[0]
+        valid_gather_indices[k] = valid_offset + np.minimum(
+            np.arange(padded_count), count - 1)
+        valid_offset += count
         walks.append(SampledWalk(
             node_ids=node_path,
-            pick_positions=picks,
+            pick_positions=padded_picks,
             connect_fractional_picks=False,
         ))
 
     sampled_flat_indices_t = _pinned_to_device(
-        torch.from_numpy(sampled_flat_indices), device)
-    zyxs_t = flat['zyxs'][sampled_flat_indices_t]
-    winding_t = flat['windings'][sampled_flat_indices_t]
+        torch.from_numpy(np.concatenate(sampled_flat_rows)), device)
+    valid_gather_indices_t = _pinned_to_device(
+        torch.from_numpy(valid_gather_indices), device)
+    sample_mask = _pinned_to_device(
+        torch.from_numpy(sample_mask_np), device)
+    valid_zyxs = flat['zyxs'][sampled_flat_indices_t]
+    valid_windings = flat['windings'][sampled_flat_indices_t]
+    zyxs_t = valid_zyxs[valid_gather_indices_t]
+    winding_t = valid_windings[valid_gather_indices_t]
 
     packed_walks = _pack_walks(walks, crossing_map)
 
-    spiral_zyxs = slice_to_spiral_transform(zyxs_t.reshape(-1, 3)).reshape(*zyxs_t.shape)
+    if compute_dt:
+        anchor_flat_indices_t = _pinned_to_device(
+            torch.as_tensor(anchor_flat_indices, dtype=torch.int64), device)
+        anchor_zyxs = flat['zyxs'][anchor_flat_indices_t]
+        transformed = slice_to_spiral_transform(torch.cat([
+            anchor_zyxs, valid_zyxs], dim=0))
+        anchor_spiral_zyxs = transformed[:num_rows]
+        valid_spiral_zyxs = transformed[num_rows:]
+        anchor_theta, _, _ = get_theta_and_radii(
+            anchor_spiral_zyxs[..., 1:], dr_per_winding)
+    else:
+        valid_spiral_zyxs = slice_to_spiral_transform(valid_zyxs)
+        anchor_theta = None
+    spiral_zyxs = valid_spiral_zyxs[valid_gather_indices_t]
     theta, _, shifted_radii = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
-    shifted_radii, crossing_adjustments = _unwrap_sampled_tracks(
-        crossing_map, dr_per_winding, theta, shifted_radii, packed_walks,
-    )
+    if compute_dt:
+        (shifted_radii, crossing_adjustments,
+         anchor_sample_adjustment) = _unwrap_sampled_tracks(
+            crossing_map, dr_per_winding, theta, shifted_radii, packed_walks,
+            return_walk_start_adjustment=True,
+        )
+    else:
+        shifted_radii, crossing_adjustments = _unwrap_sampled_tracks(
+            crossing_map, dr_per_winding, theta, shifted_radii, packed_walks,
+        )
 
     # Normalise so a pcl with mixed annotations still reads as a single 'strip'.
     normalised_radii = shifted_radii - winding_t * dr_per_winding
@@ -1386,10 +1471,13 @@ def get_unattached_pcl_strip_losses(
     radius_hinge_margin = dr_per_winding.detach() * cfg['patch_radius_loss_margin']
     dt_hinge_margin = dr_per_winding.detach() * cfg['patch_dt_loss_margin']
 
-    mean_radii = normalised_radii.mean(dim=-1, keepdim=True)
+    radius_counts = sample_mask.sum(dim=-1, keepdim=True).clamp(min=1)
+    mean_radii = (
+        (normalised_radii * sample_mask).sum(dim=-1, keepdim=True)
+        / radius_counts)
     radius_deviations = (normalised_radii - mean_radii).abs()
     radius_point_residuals = F.relu(radius_deviations - radius_hinge_margin)
-    radius_loss = radius_point_residuals.mean()
+    radius_loss = _masked_mean(radius_point_residuals, sample_mask)
     if diagnostics_enabled():
         radius_target_shifted = mean_radii + winding_t * dr_per_winding
         radius_target_radii = radius_from_unwrapped_shifted(
@@ -1404,20 +1492,20 @@ def get_unattached_pcl_strip_losses(
         record_loss_samples(
             'unattached_pcl_radius', spiral_zyxs,
             radius_point_residuals,
+            sample_mask,
             display_spiral_zyx=radius_target_spiral_zyxs,
         )
 
     if not compute_dt:
         return radius_loss, zero
 
-    # Per-point strip indices: a walk row can span several strips, each with its
-    # own cache entry; the snap anchors the row on its best valid (point, cache)
-    # pair and takes that strip's cached target (the component is same-winding, so
-    # any member's target names the same winding).
-    target_normalised = strip_dt_target_in_sample_frame(
-        normalised_radii, sampled_local_indices, theta, crossing_adjustments,
-        dr_per_winding, dt_target_cache, sampled_strip_indices,
-    )
+    # The carried endpoint establishes the frame for a cached target but is
+    # excluded from every loss aggregation. Without a cache the same helper
+    # returns the legacy sampled-median target.
+    target_normalised = endpoint_strip_dt_target_in_sample_frame(
+        normalised_radii, dr_per_winding, dt_target_cache,
+        anchor_strip_indices, anchor_theta, anchor_sample_adjustment,
+        anchor_at_end, sample_mask=sample_mask)
     target_shifted = target_normalised + winding_t * dr_per_winding
     target_radii = radius_from_unwrapped_shifted(
         theta, target_shifted, crossing_adjustments, dr_per_winding,
@@ -1427,21 +1515,34 @@ def get_unattached_pcl_strip_losses(
         torch.sin(theta) * target_radii,
         torch.cos(theta) * target_radii,
     ], dim=-1).detach()
-    target_scroll_zyxs = slice_to_spiral_transform.inv(target_spiral_zyxs.reshape(-1, 3)).reshape(*target_spiral_zyxs.shape)
+    target_scroll_valid = slice_to_spiral_transform.inv(
+        target_spiral_zyxs[sample_mask])
 
     within_p = cfg['patch_dt_within_patch_norm_p']
     across_p = cfg['patch_dt_norm_p']
-    point_distances = torch.linalg.norm(zyxs_t - target_scroll_zyxs, dim=-1)
-    point_distances = F.relu(point_distances - dt_hinge_margin) + 1.e-5
-    track_losses = (point_distances ** within_p).mean(dim=-1) ** (1 / within_p)
+    valid_point_distances = torch.linalg.norm(
+        valid_zyxs - target_scroll_valid, dim=-1)
+    valid_point_distances = (
+        F.relu(valid_point_distances - dt_hinge_margin) + 1.e-5)
+    point_distances = torch.zeros_like(theta).masked_scatter(
+        sample_mask, valid_point_distances)
+    track_losses = (
+        ((point_distances ** within_p) * sample_mask).sum(dim=-1)
+        / radius_counts.squeeze(-1)
+    ) ** (1 / within_p)
     # Progressive DT: only strips whose snapped (raw, spiral-space) winding is within the current
     # cutoff contribute. Use shifted_radii (the strip's actual spiral position), not normalised_radii.
-    strip_snapped_winding = torch.round(shifted_radii.median(dim=-1).values / dr_per_winding) * dr_per_winding
+    strip_snapped_winding = (
+        torch.round(_masked_median(shifted_radii, sample_mask) / dr_per_winding)
+        * dr_per_winding)
     active_mask = _progressive_dt_active_mask(strip_snapped_winding, dr_per_winding, dt_max_winding)
     dt_loss = _aggregate_dt_track_losses(track_losses, across_p, active_mask)
+    diagnostic_mask = sample_mask
+    if active_mask is not None:
+        diagnostic_mask = diagnostic_mask & active_mask[..., None]
     record_loss_samples(
         'unattached_pcl_dt', spiral_zyxs, point_distances,
-        active_mask[..., None] if active_mask is not None else None,
+        diagnostic_mask,
         display_spiral_zyx=target_spiral_zyxs,
     )
 
