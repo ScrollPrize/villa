@@ -12,9 +12,10 @@ This script does that join by locating each representation under the roots you
 give it. Holding scrolls or segments out turns the same recipe into a
 generalisation probe: nothing on the held-out scroll is ever sampled, so its
 whole supervision mask stays honest held-out ground truth. Per-scroll batch
-quotas are renormalised over the survivors, because ``FixedScrollPriorSampler``
-rejects a batch whose quotas do not sum to ``batch_size``, and rejects quota keys
-that do not exactly match the scrolls the patches came from.
+quotas are renormalised over the survivors, because
+``FixedScrollPriorStratifiedBatchSampler`` rejects a batch whose quotas do not sum
+to ``batch_size``, rejects a non-positive quota, and rejects quota keys that do not
+exactly match the scrolls the patches came from.
 """
 
 from __future__ import annotations
@@ -78,6 +79,12 @@ def renormalise(quotas: dict, keep: set, batch_size: int) -> dict:
     live = {scroll: value for scroll, value in quotas.items() if scroll in keep}
     if not live:
         sys.exit("error: every scroll was excluded")
+    if batch_size < len(live):
+        # Every survivor is floored to one slot below, because the sampler rejects a
+        # zero quota outright, so a smaller batch than the scroll count has no answer.
+        sys.exit(f"error: batch_size {batch_size} cannot cover {len(live)} scrolls; "
+                 "FixedScrollPriorStratifiedBatchSampler needs at least one slot per "
+                 "scroll")
     total = sum(live.values())
     exact = {scroll: batch_size * value / total for scroll, value in live.items()}
     out = {scroll: max(1, int(value)) for scroll, value in exact.items()}
@@ -174,6 +181,10 @@ def main() -> int:
     batch_size = args.batch_size or int(recipe["batch_size"])
     seed = args.seed if args.seed is not None else int(recipe["seed"])
     surviving = {entry["sampling_scroll"] for entry in groups.values()}
+    if not surviving:
+        # Only reachable under --allow-missing: without it the locate failure above exits.
+        sys.exit(f"error: none of the {len(kept)} representations could be located under "
+                 f"{args.labels_root} and {args.volumes_root}")
     quotas = renormalise(contract["target_batch_counts"], surviving, batch_size)
     held_out = sorted({rep["segment"] for rep in dropped})
 
