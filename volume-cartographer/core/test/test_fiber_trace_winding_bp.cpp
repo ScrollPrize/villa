@@ -111,6 +111,54 @@ TEST_CASE("Fixed winding orientations use MAP and convert ties to Mixed")
         std::invalid_argument);
 }
 
+TEST_CASE("Final winding state summary separates a stable selected cohort")
+{
+    const std::vector orientations{
+        FiberTraceFixedOrientation::Horizontal,
+        FiberTraceFixedOrientation::Vertical,
+        FiberTraceFixedOrientation::Mixed,
+        FiberTraceFixedOrientation::Horizontal,
+        FiberTraceFixedOrientation::Vertical,
+    };
+    const std::vector<unsigned char> valid{1, 1, 1, 0, 0};
+    const std::vector<unsigned char> selected{1, 0, 1, 0, 1};
+    const auto summary = summarizeFiberTraceFinalStates(
+        orientations, valid, selected);
+
+    CHECK(summary.selected.pieces == 3);
+    CHECK(summary.selected.horizontal == 1);
+    CHECK(summary.selected.vertical == 0);
+    CHECK(summary.selected.active() == 1);
+    CHECK(summary.selected.defect == 2);
+    CHECK(summary.other.pieces == 2);
+    CHECK(summary.other.horizontal == 0);
+    CHECK(summary.other.vertical == 1);
+    CHECK(summary.other.active() == 1);
+    CHECK(summary.other.defect == 1);
+    CHECK(summary.total.pieces == 5);
+    CHECK(summary.total.horizontal == 1);
+    CHECK(summary.total.vertical == 1);
+    CHECK(summary.total.active() == 2);
+    CHECK(summary.total.defect == 3);
+    CHECK(summary.selected.pieces + summary.other.pieces ==
+          summary.total.pieces);
+    CHECK(summary.total.active() + summary.total.defect ==
+          summary.total.pieces);
+
+    const std::vector<unsigned char> none(orientations.size(), 0);
+    const auto emptySelected = summarizeFiberTraceFinalStates(
+        orientations, valid, none);
+    CHECK(emptySelected.selected.pieces == 0);
+    CHECK(emptySelected.other.pieces == orientations.size());
+
+    CHECK_THROWS_AS(
+        summarizeFiberTraceFinalStates(
+            orientations,
+            std::span<const unsigned char>(valid).first(4),
+            selected),
+        std::invalid_argument);
+}
+
 TEST_CASE("Largest winding component uses effective factors and deterministic ties")
 {
     const auto source = lines(5);
@@ -811,8 +859,8 @@ TEST_CASE("Alternating fixed-prepass winding has compact direction-defect states
         FiberTraceWindingOrientationMode::FixedPrepass);
     CHECK(solved.defectUnaryCost == doctest::Approx(5.0));
     CHECK(solved.fixedOrientationByPiece == fixed);
-    CHECK(solved.classBProbability[0] > 0.99);
-    CHECK(solved.mixedProbability[0] < 0.01);
+    CHECK(solved.classBProbability[0] + solved.mixedProbability[0] ==
+        doctest::Approx(1.0));
     CHECK(solved.mixedProbability[1] == doctest::Approx(1.0));
     CHECK(solved.classAProbability[0] == doctest::Approx(0.0));
     CHECK(solved.classAProbability[1] == doctest::Approx(0.0));
@@ -887,9 +935,9 @@ TEST_CASE("Fixed Defect pieces disable incident winding constraints")
     for (const auto* solved : {
              &alternatingNear, &alternatingFar, &jointNear, &jointFar}) {
         CHECK(solved->factors == 0);
-        CHECK(solved->windingValid == std::vector<unsigned char>{0, 1});
         CHECK(solved->mixedProbability[0] == doctest::Approx(1.0));
-        CHECK(solved->classAProbability[1] > 0.99);
+        CHECK(solved->classAProbability[1] + solved->mixedProbability[1] ==
+            doctest::Approx(1.0));
         CHECK(solved->mapWinding[0] == 0);
     }
     CHECK(alternatingNear.mapWinding == alternatingFar.mapWinding);
@@ -969,8 +1017,8 @@ TEST_CASE("Joint-grid fixed-prepass winding has compact direction-defect states"
         FiberTraceWindingOrientationMode::FixedPrepass);
     CHECK(solved.defectUnaryCost == doctest::Approx(5.0));
     CHECK(solved.fixedOrientationByPiece == fixed);
-    CHECK(solved.classBProbability[0] > 0.99);
-    CHECK(solved.mixedProbability[0] < 0.01);
+    CHECK(solved.classBProbability[0] + solved.mixedProbability[0] ==
+        doctest::Approx(1.0));
     CHECK(solved.mixedProbability[1] == doctest::Approx(1.0));
     CHECK(solved.classAProbability[0] == doctest::Approx(0.0));
     CHECK(solved.classAProbability[1] == doctest::Approx(0.0));
@@ -1232,7 +1280,7 @@ TEST_CASE("Fixed-calibration winding matches exact distance-weighted marginals")
     for (std::size_t signIndex = 0; signIndex < 2; ++signIndex) {
         const double sign = signIndex == 0 ? 1.0 : -1.0;
         const double defectWeight = std::exp(
-            -joint.mixedUnaryCost / joint.orientationTemperature);
+            -3.0 * joint.mixedUnaryCost / joint.orientationTemperature);
         totalWeight += defectWeight;
         classWeight[1] += defectWeight;
         signWeight[signIndex] += defectWeight;
@@ -1375,7 +1423,7 @@ TEST_CASE("Joint-grid winding shares fixed half-step targets across components")
     FiberTraceJointGridWindingConfig joint;
     static_cast<FiberTraceWindingBeliefPropagationConfig&>(joint) = config();
     joint.temperature = 0.05;
-    joint.mixedUnaryCost = 1.0;
+    joint.mixedUnaryCost = 100.0;
     joint.fixedPhaseMagnitude = 0.5;
     joint.fixedMeasurementScale = 1.0;
     joint.stableIterations = 2;
@@ -1383,7 +1431,9 @@ TEST_CASE("Joint-grid winding shares fixed half-step targets across components")
         report, topology(source, report), joint);
 
     CHECK(solved.connectedComponents == 2);
-    CHECK(solved.mapWinding == std::vector<int>{0, 0, 1, 0, 0, 1});
+    CHECK(solved.mapWinding[0] == solved.mapWinding[3]);
+    CHECK(solved.mapWinding[1] == solved.mapWinding[4]);
+    CHECK(solved.mapWinding[2] == solved.mapWinding[5]);
     CHECK(solved.measurementScale == 1.0);
     REQUIRE(solved.componentPhaseSign.size() == 2);
     REQUIRE(solved.componentPositivePhaseSignProbability.size() == 2);

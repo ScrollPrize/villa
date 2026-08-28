@@ -32,6 +32,7 @@ struct Factor {
 struct Graph {
     std::vector<Factor> factors;
     std::vector<std::vector<std::size_t>> adjacency;
+    std::vector<std::size_t> incidentMeasurements;
     std::size_t measurements = 0;
     std::size_t neutralFactors = 0;
     std::size_t neutralMeasurements = 0;
@@ -136,6 +137,7 @@ Graph buildGraph(
 
     Graph graph;
     graph.adjacency.resize(pieceCount);
+    graph.incidentMeasurements.assign(pieceCount, 0);
     graph.factors.reserve(merged.size());
     for (const auto& [key, factor] : merged) {
         (void)key;
@@ -153,6 +155,8 @@ Graph buildGraph(
         graph.factors.push_back(normalized);
         graph.adjacency[normalized.a].push_back(index);
         graph.adjacency[normalized.b].push_back(index);
+        graph.incidentMeasurements[normalized.a] += normalized.measurements;
+        graph.incidentMeasurements[normalized.b] += normalized.measurements;
         graph.measurements += normalized.measurements;
     }
 
@@ -882,11 +886,18 @@ FiberTraceBeliefPropagationReport solveFiberTraceMixedSumProduct(
 
     const TernaryLogMessage zeroMessage{
         -std::log(3.0), -std::log(3.0), -std::log(3.0)};
-    const TernaryLogMessage logUnary{
-        0.0, -config.mixedUnaryCost / temperature, 0.0};
-    if (!std::isfinite(logUnary[1])) {
-        throw std::invalid_argument(
-            "Mixed-state sum-product BP temperature is too small for the Mixed unary cost");
+    std::vector<TernaryLogMessage> logUnary(nodeCount);
+    for (std::size_t node = 0; node < nodeCount; ++node) {
+        logUnary[node] = {
+            0.0,
+            -config.mixedUnaryCost *
+                static_cast<double>(graph.incidentMeasurements[node]) /
+                temperature,
+            0.0};
+        if (!std::isfinite(logUnary[node][1])) {
+            throw std::invalid_argument(
+                "Mixed-state sum-product BP temperature is too small for the scaled Mixed cost");
+        }
     }
     std::vector<TernaryLogMessage> aToB(
         graph.factors.size(), zeroMessage);
@@ -940,9 +951,9 @@ FiberTraceBeliefPropagationReport solveFiberTraceMixedSumProduct(
             TernaryLogMessage cavityB{};
             for (std::size_t state = 0; state < 3; ++state) {
                 cavityA[state] = totals[factor.a][state] -
-                    bToA[index][state] + logUnary[state];
+                    bToA[index][state] + logUnary[factor.a][state];
                 cavityB[state] = totals[factor.b][state] -
-                    aToB[index][state] + logUnary[state];
+                    aToB[index][state] + logUnary[factor.b][state];
             }
             const auto rawAToB = rawMessage(
                 cavityA, logPotential[index], factor.a == problem.seed);
@@ -992,9 +1003,9 @@ FiberTraceBeliefPropagationReport solveFiberTraceMixedSumProduct(
     double totalWeight = 0.0;
     for (std::size_t node = 0; node < nodeCount; ++node) {
         TernaryLogMessage marginal{
-            totals[node][0] + logUnary[0],
-            totals[node][1] + logUnary[1],
-            totals[node][2] + logUnary[2]};
+            totals[node][0] + logUnary[node][0],
+            totals[node][1] + logUnary[node][1],
+            totals[node][2] + logUnary[node][2]};
         if (node == problem.seed) {
             marginal = {
                 -std::numeric_limits<double>::infinity(),
@@ -1003,9 +1014,22 @@ FiberTraceBeliefPropagationReport solveFiberTraceMixedSumProduct(
         } else {
             normalizeLogMessage(marginal);
         }
-        report.verticalProbability[node] = std::exp(marginal[0]);
-        report.mixedProbability[node] = std::exp(marginal[1]);
-        report.horizontalProbability[node] = std::exp(marginal[2]);
+        std::array probabilities{
+            std::exp(marginal[0]),
+            std::exp(marginal[1]),
+            std::exp(marginal[2]),
+        };
+        const double probabilityTotal = std::accumulate(
+            probabilities.begin(), probabilities.end(), 0.0);
+        if (!std::isfinite(probabilityTotal) || !(probabilityTotal > 0.0)) {
+            throw std::runtime_error(
+                "Mixed-state sum-product BP produced invalid probabilities");
+        }
+        for (double& probability : probabilities)
+            probability /= probabilityTotal;
+        report.verticalProbability[node] = probabilities[0];
+        report.mixedProbability[node] = probabilities[1];
+        report.horizontalProbability[node] = probabilities[2];
         report.horizontalness[node] = report.horizontalProbability[node] +
             0.5 * report.mixedProbability[node];
         weightedHorizontalness += problem.normalizedArcWeights[node] *

@@ -49,6 +49,8 @@ struct PreparedWinding {
     std::vector<std::vector<std::size_t>> piecesByNode;
     std::vector<Edge> edges;
     std::vector<std::vector<std::size_t>> adjacency;
+    std::vector<std::size_t> incidentMeasurements;
+    std::vector<std::size_t> incidentWindingMeasurements;
     std::vector<std::size_t> componentByNode;
     std::vector<std::size_t> integerGaugeByNode;
     std::vector<std::size_t> gaugeNodeByComponent;
@@ -218,6 +220,8 @@ PreparedWinding prepareWinding(
         addConstraint(index, false);
 
     result.adjacency.resize(result.piecesByNode.size());
+    result.incidentMeasurements.assign(result.piecesByNode.size(), 0);
+    result.incidentWindingMeasurements.assign(result.piecesByNode.size(), 0);
     std::vector<std::vector<std::size_t>> windingAdjacency(
         result.piecesByNode.size());
     for (std::size_t edge = 0; edge < result.edges.size(); ++edge) {
@@ -229,6 +233,16 @@ PreparedWinding prepareWinding(
             windingPositive = windingPositive ||
                 parallelWindingWeight(measurement) > 0.0 ||
                 perpendicularWindingWeight(measurement) > 0.0;
+            if (measurement.parallel > 0.0 ||
+                measurement.perpendicular > 0.0) {
+                ++result.incidentMeasurements[result.edges[edge].a];
+                ++result.incidentMeasurements[result.edges[edge].b];
+            }
+            if (parallelWindingWeight(measurement) > 0.0 ||
+                perpendicularWindingWeight(measurement) > 0.0) {
+                ++result.incidentWindingMeasurements[result.edges[edge].a];
+                ++result.incidentWindingMeasurements[result.edges[edge].b];
+            }
         }
         if (factorPositive) {
             result.adjacency[result.edges[edge].a].push_back(edge);
@@ -1034,7 +1048,9 @@ JointAdaptiveRound solveJointAdaptive(
                     }
                 }
             } else if (fixedOrientations[node] != JointClass::Mixed) {
-                logUnary[node][0] = -config.mixedUnaryCost /
+                logUnary[node][0] = -config.mixedUnaryCost *
+                    static_cast<double>(
+                        problem.incidentWindingMeasurements[node]) /
                     config.orientationTemperature;
             }
             if (gauge[node] == 2 && fixedOrientations.empty()) {
@@ -1526,7 +1542,9 @@ double decodedJointEnergy(
             energy -= std::log(std::max(prior, kEpsilon));
         } else if (decoded[node].orientation == JointClass::Mixed &&
                    fixedOrientations[node] != JointClass::Mixed) {
-            energy += config.mixedUnaryCost / config.orientationTemperature;
+            energy += config.mixedUnaryCost * static_cast<double>(
+                problem.incidentWindingMeasurements[node]) /
+                config.orientationTemperature;
         }
     }
     for (std::size_t edge = 0; edge < problem.edges.size(); ++edge) {
@@ -1926,6 +1944,9 @@ GridLogTotals buildGridTotals(
     GridLogTotals totals;
     totals.pieceAccumulators.resize(problem.piecesByNode.size());
     totals.pieceValues.resize(problem.piecesByNode.size());
+    const auto& incident = round.fixedOrientations.empty()
+        ? problem.incidentMeasurements
+        : problem.incidentWindingMeasurements;
     for (std::size_t node = 0; node < problem.piecesByNode.size(); ++node) {
         const std::size_t stateCount = gridPieceStateCount(
             node,
@@ -1947,7 +1968,9 @@ GridLogTotals buildGridTotals(
                 (round.fixedOrientations.empty() ||
                  round.fixedOrientations[node] != JointClass::Mixed);
             addLogFactor(totals.pieceAccumulators[node][state], chargeDefect
-                ? -config.mixedUnaryCost / config.orientationTemperature
+                ? -config.mixedUnaryCost *
+                    static_cast<double>(incident[node]) /
+                    config.orientationTemperature
                 : 0.0);
         }
     }
@@ -2914,7 +2937,11 @@ FiberTraceInterleavedWindingReport makeJointGridReport(
         if (decoded[node].orientation == JointClass::Mixed &&
             (round.fixedOrientations.empty() ||
              round.fixedOrientations[node] != JointClass::Mixed)) {
-            report.decodedEnergy += config.mixedUnaryCost;
+            const auto& incident = round.fixedOrientations.empty()
+                ? prepared.incidentMeasurements
+                : prepared.incidentWindingMeasurements;
+            report.decodedEnergy += config.mixedUnaryCost *
+                static_cast<double>(incident[node]);
         }
     }
     for (const auto& edge : prepared.edges) {
@@ -3217,6 +3244,39 @@ const char* fiberTraceWindingOrientationModeName(
         return "fixed-prepass";
     }
     return "invalid";
+}
+
+FiberTraceFinalStateCohortSummary summarizeFiberTraceFinalStates(
+    std::span<const FiberTraceFixedOrientation> orientations,
+    std::span<const unsigned char> windingValid,
+    std::span<const unsigned char> selectedCohort)
+{
+    if (windingValid.size() != orientations.size() ||
+        selectedCohort.size() != orientations.size()) {
+        throw std::invalid_argument(
+            "Final fiber state summary inputs must have equal sizes");
+    }
+
+    FiberTraceFinalStateCohortSummary result;
+    const auto add = [](FiberTraceFinalStateCounts& counts,
+                         FiberTraceFixedOrientation orientation,
+                         bool valid) {
+        ++counts.pieces;
+        if (valid && orientation == FiberTraceFixedOrientation::Horizontal)
+            ++counts.horizontal;
+        else if (valid && orientation == FiberTraceFixedOrientation::Vertical)
+            ++counts.vertical;
+        else
+            ++counts.defect;
+    };
+    for (std::size_t piece = 0; piece < orientations.size(); ++piece) {
+        auto& cohort = selectedCohort[piece] != 0
+            ? result.selected
+            : result.other;
+        add(cohort, orientations[piece], windingValid[piece] != 0);
+        add(result.total, orientations[piece], windingValid[piece] != 0);
+    }
+    return result;
 }
 
 const char* fiberTraceFixedOrientationName(

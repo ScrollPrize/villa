@@ -47,6 +47,30 @@ enum class FiberTraceFixedOrientation : unsigned char {
     Vertical,
 };
 
+struct FiberTraceFinalStateCounts {
+    std::size_t pieces = 0;
+    std::size_t horizontal = 0;
+    std::size_t vertical = 0;
+    std::size_t defect = 0;
+
+    [[nodiscard]] std::size_t active() const noexcept
+    {
+        return horizontal + vertical;
+    }
+};
+
+struct FiberTraceFinalStateCohortSummary {
+    FiberTraceFinalStateCounts selected;
+    FiberTraceFinalStateCounts other;
+    FiberTraceFinalStateCounts total;
+};
+
+[[nodiscard]] FiberTraceFinalStateCohortSummary
+summarizeFiberTraceFinalStates(
+    std::span<const FiberTraceFixedOrientation> orientations,
+    std::span<const unsigned char> windingValid,
+    std::span<const unsigned char> selectedCohort);
+
 [[nodiscard]] const char* fiberTraceFixedOrientationName(
     FiberTraceFixedOrientation orientation) noexcept;
 
@@ -89,7 +113,7 @@ struct FiberTraceWindingComponentSelection {
     std::optional<std::size_t> preferredPiece = std::nullopt);
 
 struct FiberTraceInterleavedWindingConfig : FiberTraceWindingBeliefPropagationConfig {
-    double mixedUnaryCost = 0.5;
+    double mixedUnaryCost = 1.0;
     double orientationTemperature = 0.25;
     double minimumMeasurementScale = 0.5;
     double maximumMeasurementScale = 2.0;
@@ -98,7 +122,7 @@ struct FiberTraceInterleavedWindingConfig : FiberTraceWindingBeliefPropagationCo
 };
 
 struct FiberTraceJointGridWindingConfig : FiberTraceWindingBeliefPropagationConfig {
-    double mixedUnaryCost = 0.5;
+    double mixedUnaryCost = 1.0;
     double orientationTemperature = 0.25;
     std::optional<double> fixedPhaseMagnitude;
     std::optional<double> fixedMeasurementScale;
@@ -245,7 +269,7 @@ struct FiberTraceInterleavedWindingReport : FiberTraceWindingBeliefPropagationRe
         FiberTraceWindingCalibrationMode::Adaptive;
     double phaseMagnitude = 0.0;
     double measurementScale = 1.0;
-    double defectUnaryCost = 0.5;
+    double defectUnaryCost = 1.0;
     double calibrationPhaseMean = 0.0;
     double calibrationScaleMean = 1.0;
     double calibrationEntropy = 0.0;

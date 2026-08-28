@@ -642,8 +642,9 @@ source fiber retain their canonical parallel-score-1 continuity link as finite
 strong same-label evidence; it is not an equality constraint. The established
 central-straight rule still selects a source fiber, then the exact clipped piece
 of that source closest to the crop center is fixed to H. Optional balance uses
-piece arc lengths, including overlap, and Mixed unary cost is charged once per
-piece.
+piece arc lengths, including overlap. The Mixed coefficient is multiplied by
+each piece's retained incident measurement count and applied once as a
+node-local unary.
 
 `--ablation-limit N` selects a ranked prefix; omission admits every Mixed
 fiber. Natural BP fixes the established central straight seed to H and emits
@@ -733,20 +734,20 @@ spuriously favor Mixed merely because the unnormalized oriented costs shared a
 positive constant offset.
 
 Every non-seed piece assigned Mixed instead pays one node-local unary energy
-`U(Mixed)=mixed_unary_cost`, with `U(V)=U(H)=0`. Set it with
-`--bp-mixed-cost F`; its experimental default is `0.5`. The cost is paid once
-per piece, independent of its degree and the number of raw measurements merged
-into its factors. Mixed therefore conditionally disables incident orientation
+`U(Mixed)=mixed_cost_per_constraint * incident_measurements`, with
+`U(V)=U(H)=0`. Set the coefficient with `--bp-mixed-cost F`; its default is
+`1`. Incidence sums raw measurements in retained non-neutral merged factors;
+omitted neutral measurements count zero. Mixed therefore conditionally disables incident orientation
 terms: a source known to be Mixed sends a uniform factor message, rather than
 encouraging its neighbor to become Mixed. A soft piece with residual V/H
 probability can still transmit that residual orientation evidence.
 
 The hard seed remains exactly H and replaces the unary at that node. Every
 directed message contains three normalized log-values. For a non-seed outgoing
-cavity, the solver adds `(0,-mixed_unary_cost/T,0)` exactly once; it adds the
-same unary exactly once to the final node marginal. The reported `p_v`,
+cavity, the solver adds the node's scaled unary exactly once; it adds the same
+unary exactly once to the final node marginal. The reported `p_v`,
 `p_mixed`, and `p_h` are normalized node marginals. An isolated unseeded fiber
-has probabilities proportional to `(1,exp(-mixed_unary_cost/T),1)`. An
+has uniform probabilities because its incident count is zero. An
 unseeded connected component retains exact V/H gauge symmetry, although its
 Mixed marginal generally differs from one third.
 
@@ -906,8 +907,8 @@ volume-cartographer/build/bin/vc_fiber_trace_chunk direction-ablation crop_trace
 ```
 
 `--winding-fixed-orientation` runs the ordinary H/V/Mixed sum-product BP first.
-Set its Mixed unary with `--bp-mixed-cost`. Set the later winding-stage Defect
-unary independently with `--winding-defect-cost`; both default to `0.5` and
+Set its Mixed coefficient with `--bp-mixed-cost`. Set the later winding-stage
+Defect coefficient independently with `--winding-defect-cost`; both default to `1` and
 neither inherits an explicitly changed value from the other.
 Each piece's unique MAP direction is then fixed; an exact class tie becomes
 Defect. During winding, a fixed H piece can be H or Defect and a fixed V piece
@@ -917,7 +918,8 @@ state per integer winding plus one Defect state; Defect is not duplicated over
 the winding support. The chosen backend still controls phase/scale calibration,
 component sign, integer-support expansion, and winding factor evaluation.
 
-A late Defect pays `--winding-defect-cost` at `--bp-temperature` and is
+A late Defect pays `--winding-defect-cost` times its retained incident winding
+measurement count at `--bp-temperature` and is
 selected only from winding evidence; fixed mode does not repeat the H/V
 same/different orientation factor. A Defect assignment makes every incident
 pair factor neutral, disabling orientation, winding, calibration, and component
@@ -951,8 +953,8 @@ override it at the corresponding cost.
 Without fixed orientation, joint-grid uses `--winding-defect-cost` as its only
 Defect unary. Non-fixed alternating uses the orientation BP posterior as its
 orientation prior and does not charge that unary again. The winding summary and
-`winding_defect_unary_cost` CSV column report the configured winding value
-separately from `bp_mixed_unary_cost`.
+`winding_defect_cost_per_constraint` CSV column reports the configured winding value
+separately from `bp_mixed_cost_per_constraint`.
 
 The two oriented classes occupy interleaved integer lattices. Local class A is
 at `k`; local class B is at `k + sign*phase`, where `k` is integer, phase is in
@@ -1181,6 +1183,17 @@ distance zero and nonzero are reported separately. Constraints ending at a
 final Defect/Mixed or otherwise winding-invalid BP piece are excluded from both
 offset calibration and right/wrong totals. Unsigned perpendicular observations
 also have no candidate and are excluded.
+
+Immediately before each reference benchmark, `BP final states by source-piece
+cohort` reports H, V, active H/V, Defect, and Defect percentage for the original
+`source_piece == 1` cohort, all other pieces, and their total. The cohort bit is
+captured before main-component filtering and carried through remapping, so
+filtering cannot move pieces between rows. This is the stable cohort used by
+the existing central-piece tuning diagnostic; it is not a general geometric
+center definition for arbitrary piece counts. States come from the final
+post-projection winding result. Mixed and winding-invalid pieces count as
+Defect, and an empty cohort prints `NA` percentage. The table is also emitted for
+BP runs without reference fibers.
 
 The filename-ordered reference stack is calibrated separately against every
 independently gauged BP winding subgraph. Each offset is selected by exhaustive

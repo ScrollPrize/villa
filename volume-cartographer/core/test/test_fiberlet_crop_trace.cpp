@@ -3153,6 +3153,7 @@ std::vector<std::array<double, 3>> bruteForceMixedBpMarginals(
     struct PairCost {
         double same = 0.0;
         double different = 0.0;
+        std::size_t measurements = 0;
     };
     std::map<std::pair<std::size_t, std::size_t>, PairCost> merged;
     for (const auto& constraint : constraints.constraints) {
@@ -3161,12 +3162,20 @@ std::vector<std::array<double, 3>> bruteForceMixedBpMarginals(
         auto& cost = merged[{key.first, key.second}];
         cost.same += 1.0 - constraint.parallelScore;
         cost.different += constraint.parallelScore;
+        ++cost.measurements;
     }
     for (auto& [key, cost] : merged) {
         (void)key;
         const double common = std::min(cost.same, cost.different);
         cost.same -= common;
         cost.different -= common;
+    }
+    std::vector<std::size_t> incidentMeasurements(count, 0);
+    for (const auto& [key, cost] : merged) {
+        if (cost.same == cost.different)
+            continue;
+        incidentMeasurements[key.first] += cost.measurements;
+        incidentMeasurements[key.second] += cost.measurements;
     }
     std::vector<std::array<double, 3>> stateWeights(count);
     double partition = 0.0;
@@ -3183,9 +3192,11 @@ std::vector<std::array<double, 3>> bruteForceMixedBpMarginals(
         if (states[seed] != 2)
             continue;
         double energy = 0.0;
-        for (const std::size_t state : states) {
-            if (state == 1)
-                energy += mixedCost;
+        for (std::size_t node = 0; node < states.size(); ++node) {
+            if (states[node] == 1) {
+                energy += mixedCost * static_cast<double>(
+                    incidentMeasurements[node]);
+            }
         }
         for (const auto& [key, cost] : merged) {
             const std::size_t a = states[key.first];
@@ -3592,8 +3603,7 @@ TEST_CASE("BP drops exactly neutral merged orientation factors")
         CHECK(report->isolatedPieces == 3);
     }
 
-    const double mixedWeight = std::exp(
-        -config.mixedUnaryCost / config.horizontalnessTemperature);
+    constexpr double mixedWeight = 1.0;
     const double normalization = 2.0 + mixedWeight;
     CHECK(mixed.verticalProbability[1] ==
           doctest::Approx(1.0 / normalization));
@@ -3775,8 +3785,7 @@ TEST_CASE("Mixed-state sum-product BP preserves gauge and isolate symmetry")
               doctest::Approx(report.horizontalProbability[node])
                   .epsilon(1.0e-12));
     }
-    const double mixedWeight = std::exp(
-        -config.mixedUnaryCost / config.horizontalnessTemperature);
+    constexpr double mixedWeight = 1.0;
     const double isolateNormalization = 2.0 + mixedWeight;
     CHECK(report.verticalProbability[4] ==
           doctest::Approx(1.0 / isolateNormalization));
@@ -3786,7 +3795,7 @@ TEST_CASE("Mixed-state sum-product BP preserves gauge and isolate symmetry")
           doctest::Approx(1.0 / isolateNormalization));
 }
 
-TEST_CASE("Mixed-state sum-product BP charges one unary per piece")
+TEST_CASE("Mixed-state sum-product BP scales its node unary by retained measurements")
 {
     const auto lines = bpLines(2);
     auto oneConstraint = bpConstraints(lines.size());
@@ -3807,7 +3816,7 @@ TEST_CASE("Mixed-state sum-product BP charges one unary per piece")
 
     const double verticalWeight = 1.0;
     const double mixedWeight = std::exp(
-        -config.mixedUnaryCost / config.horizontalnessTemperature);
+        -3.0 * config.mixedUnaryCost / config.horizontalnessTemperature);
     const double horizontalWeight = std::exp(
         -3.0 / config.horizontalnessTemperature);
     const double normalization =

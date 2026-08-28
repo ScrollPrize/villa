@@ -5158,10 +5158,12 @@
   zero. Normalization ensures at least one oriented relation also has zero
   energy, so a common raw factor offset cannot favor Mixed. Each non-seed node
   instead has unary energies `U(V)=U(H)=0` and
-  `U(Mixed)=bp_mixed_cost`. Every piece is one node, so the unary is charged
-  exactly once per piece,
-  independent of degree or merged measurement count. `--bp-mixed-cost` must
-  be finite and nonnegative and is invalid outside this inference mode.
+  `U(Mixed)=bp_mixed_cost * incident_measurements`. Incidence sums the raw
+  measurement count of each retained non-neutral merged factor at that node;
+  measurements in omitted neutral factors count zero. The scaled unary is
+  still applied once at the node, so Mixed cannot propagate transitively.
+  `--bp-mixed-cost` defaults to `1`, must be finite and nonnegative, and is
+  invalid outside this inference mode.
 - Ternary directed messages contain V/Mixed/H log values. Raw and post-damping
   messages subtract their log-sum-exp gauge, and convergence uses the maximum
   normalized post-damping change. The 3x3 update is
@@ -5328,8 +5330,10 @@
   continuous initialization, component/gauge construction, and discrete BP.
   A late Defect assignment makes every incident pair factor neutral.
 - A newly available late-Defect state has log unary
-  `-winding_defect_cost/orientation_temperature`. The finite nonnegative
-  `--winding-defect-cost` defaults independently to `0.5`; changing it must not
+  `-winding_defect_cost * incident_measurements / orientation_temperature`.
+  In fixed-prepass mode, incidence counts only retained measurements with an
+  active winding term or hard-sign restriction after filtering. The finite
+  nonnegative `--winding-defect-cost` defaults independently to `1`; changing it must not
   change the prepass unary. Fixed-prepass winding factors
   do not repeat the H/V same/different orientation energy; they use only
   winding evidence, so the completed orientation pre-pass is not counted
@@ -5573,6 +5577,15 @@
   reuse the single global gauge calibration, aggregate all runs and pieces of
   one source, include explicit zero-observation sources, and sum exactly to the
   aggregate `sum` row.
+- Before each reference-to-BP benchmark, print a final-state cohort table for
+  the BP execution. Capture the central cohort before component filtering as
+  pieces whose original local `pieceIndex` is one; carry that bit through all
+  subset remapping. The other row contains every remaining retained piece.
+  Count post-projection winding-valid H and V separately and as active; final
+  Mixed/Defect and any winding-invalid piece count as Defect. Include total
+  pieces and Defect percentage, using `NA` for an empty cohort. Central plus
+  non-central must exactly equal the total row. Without reference input, emit
+  the same table with the deferred BP diagnostics.
 - Buffer the reference/reference tables and every reference-to-BP benchmark
   generated across checkpoints and balance modes. Emit them in execution order
   after all ordinary `direction-ablation` summaries and immediately before the

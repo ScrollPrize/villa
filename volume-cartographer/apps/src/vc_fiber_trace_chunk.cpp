@@ -89,7 +89,7 @@ struct Options {
     vc::fiber_tracer::FiberTraceWindingSolver windingSolver =
         vc::fiber_tracer::FiberTraceWindingSolver::JointGrid;
     bool windingFixedOrientation = false;
-    double windingDefectCost = 0.5;
+    double windingDefectCost = 1.0;
     std::optional<double> parallelWindingCutoff;
     vc::fiber_tracer::FiberTraceJointGridWindingConfig jointGrid;
     bool hasBounds = false;
@@ -211,7 +211,7 @@ void usage(const char* executable)
               << "Belief-propagation options (direction-ablation only):\n"
               << "  --bp-only                 run only final-cohort BP; skip HiGHS\n"
               << "  --bp-inference MODE       min-sum, sum-product, or sum-product-mixed [min-sum]\n"
-              << "  --bp-mixed-cost F         orientation-prepass Mixed unary per piece [0.5]\n"
+              << "  --bp-mixed-cost F         orientation-prepass Mixed cost per constraint [1]\n"
               << "  --bp-balance MODE         soft, tight, or both [disabled]\n"
               << "  --bp-target F             arc-weighted H fraction [0.5]\n"
               << "  --bp-soft-strength F      quadratic balance strength [1]\n"
@@ -223,7 +223,7 @@ void usage(const char* executable)
               << "  --bp-balance-tolerance F  target/field tolerance [1e-3]\n"
               << "  --winding-solver MODE     joint-grid or alternating [joint-grid]\n"
               << "  --winding-fixed-orientation  solve H/V/Mixed first, then only winding\n"
-              << "  --winding-defect-cost F   winding-stage Defect unary per piece [0.5]\n"
+              << "  --winding-defect-cost F   winding-stage Defect cost per constraint [1]\n"
               << "  --parallel-winding-cutoff F\n"
               << "                              exclusive parallel integer-distance cutoff [off]\n"
               << "  --winding-fixed-phase F   disable calibration at phase F in [0,0.5]\n"
@@ -1686,7 +1686,7 @@ void writeAndPrintBpReport(
         csvOutput << "bp_inference,bp_temperature,";
     }
     if (mixedState)
-        csvOutput << "bp_mixed_unary_cost,p_v,p_mixed,p_h,";
+        csvOutput << "bp_mixed_cost_per_constraint,p_v,p_mixed,p_h,";
     csvOutput
         << "bp_status,vertical_threshold,"
            "horizontal_threshold,"
@@ -1704,7 +1704,7 @@ void writeAndPrintBpReport(
            "neighbor_support_balance,neighbor_certainty";
     if (interleaved) {
         csvOutput << ",winding_latent_mean,winding_phase,winding_scale,"
-                     "winding_defect_unary_cost,"
+                     "winding_defect_cost_per_constraint,"
                      "winding_component_phase_sign,winding_solver,"
                      "winding_orientation_mode,winding_prepass_class,"
                      "winding_final_class,winding_final_p_h,"
@@ -1862,7 +1862,7 @@ void writeAndPrintBpReport(
         if (interleaved->solver == vc::fiber_tracer::
                 FiberTraceWindingSolver::JointGrid) {
             std::cout
-                << "solver  orientation_mode  calibration_mode  defect_unary_cost  phase_map  phase_mean  scale_map  scale_mean"
+                << "solver  orientation_mode  calibration_mode  defect_cost_per_constraint  phase_map  phase_mean  scale_map  scale_mean"
                    "  grid_cells  grid_shifts  entropy  lower_boundary"
                    "  upper_boundary  min_gain  max_gain  converged"
                    "  decoded_energy  hard_sign_projected_defects\n"
@@ -1892,7 +1892,7 @@ void writeAndPrintBpReport(
                 << "  " << interleaved->hardSignProjectedDefects << '\n';
         } else {
             std::cout
-                << "solver  orientation_mode  defect_unary_cost  phase  scale  calibration_iterations"
+                << "solver  orientation_mode  defect_cost_per_constraint  phase  scale  calibration_iterations"
                    "  calibration_converged  initialization"
                    "  rank_deficient_updates  decoded_energy"
                    "  hard_sign_projected_defects\n"
@@ -1916,7 +1916,7 @@ void writeAndPrintBpReport(
     if (mixedState) {
         std::cout
             << "fiber direction Mixed-state sum-product BP\n"
-            << "inference  temperature  mixed_unary_cost  status  pieces  factors  measurements"
+            << "inference  temperature  mixed_cost_per_constraint  status  pieces  factors  measurements"
                "  neutral_factors  neutral_measurements"
                "  components  isolated_pieces  seed_piece  seed_original_trace"
                "  seed_source_piece  seed_ref  message_iterations"
@@ -2855,6 +2855,50 @@ std::string formatReferenceBpWindingBenchmark(
     return output.str();
 }
 
+std::string formatBpFinalStateCohorts(
+    std::span<const unsigned char> sourcePieceOne,
+    const vc::fiber_tracer::FiberTraceInterleavedWindingReport& winding)
+{
+    const auto summary = vc::fiber_tracer::summarizeFiberTraceFinalStates(
+        winding.mapOrientationByPiece,
+        winding.windingValid,
+        sourcePieceOne);
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << "BP final states by source-piece cohort\n"
+           << std::left
+           << std::setw(22) << "cohort"
+           << std::right
+           << std::setw(9) << "pieces"
+           << std::setw(9) << "h"
+           << std::setw(9) << "v"
+           << std::setw(9) << "active"
+           << std::setw(9) << "defect"
+           << std::setw(11) << "defect_%" << '\n';
+    const auto row = [&output](
+                         std::string_view name,
+                         const vc::fiber_tracer::FiberTraceFinalStateCounts& counts) {
+        output << std::left << std::setw(22) << name
+               << std::right << std::setw(9) << counts.pieces
+               << std::setw(9) << counts.horizontal
+               << std::setw(9) << counts.vertical
+               << std::setw(9) << counts.active()
+               << std::setw(9) << counts.defect;
+        if (counts.pieces == 0)
+            output << std::setw(11) << "NA";
+        else
+            output << std::setw(10) << std::fixed << std::setprecision(2)
+                   << 100.0 * static_cast<double>(counts.defect) /
+                          static_cast<double>(counts.pieces)
+                   << '%';
+        output << '\n';
+    };
+    row("central(source_piece=1)", summary.selected);
+    row("non-central", summary.other);
+    row("total", summary.total);
+    return output.str();
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -2953,6 +2997,7 @@ int main(int argc, char** argv)
                 diagnosticClassification;
             std::optional<ReferenceFiberDiagnostics> referenceDiagnostics;
             std::vector<std::string> deferredReferenceDiagnostics;
+            std::vector<std::string> deferredBpStateDiagnostics;
             const std::vector<vc::fiber_tracer::FiberletCropTraceLine>*
                 constraintLines = &artifact.lines;
             if (options.mode == Mode::DirectionDiagnostic ||
@@ -3152,6 +3197,12 @@ int main(int argc, char** argv)
                             auto bpSourceLines = diagnosticLines;
                             auto bpSourceOriginalTraceIndices = diagnosticOriginalTraceIndices;
                             auto bpSourceDirections = diagnosticDirections;
+                            std::vector<unsigned char> bpSourcePieceOne;
+                            bpSourcePieceOne.reserve(bpConstraints.pieces.size());
+                            for (const auto& piece : bpConstraints.pieces) {
+                                bpSourcePieceOne.push_back(
+                                    piece.pieceIndex == 1 ? 1 : 0);
+                            }
                             std::optional<vc::fiber_tracer::
                                 FiberTraceWindingBeliefPropagationReport>
                                     independentWinding;
@@ -3239,9 +3290,17 @@ int main(int argc, char** argv)
                                 std::vector<vc::fiber_tracer::FiberletCropTraceLine> nextLines;
                                 std::vector<std::size_t> nextOriginalIndices;
                                 std::vector<vc::fiber_tracer::FiberDirectionGroup> nextDirections;
+                                std::vector<unsigned char> nextSourcePieceOne;
                                 nextLines.reserve(subset.retainedTraceIndices.size());
                                 nextOriginalIndices.reserve(subset.retainedTraceIndices.size());
                                 nextDirections.reserve(subset.retainedTraceIndices.size());
+                                nextSourcePieceOne.reserve(
+                                    subset.retainedPieceIndices.size());
+                                for (const std::size_t oldPiece :
+                                     subset.retainedPieceIndices) {
+                                    nextSourcePieceOne.push_back(
+                                        bpSourcePieceOne.at(oldPiece));
+                                }
                                 for (const std::size_t oldTrace : subset.retainedTraceIndices) {
                                     nextLines.push_back(bpSourceLines.at(oldTrace));
                                     nextOriginalIndices.push_back(bpSourceOriginalTraceIndices.at(oldTrace));
@@ -3251,6 +3310,7 @@ int main(int argc, char** argv)
                                 bpSourceLines = std::move(nextLines);
                                 bpSourceOriginalTraceIndices = std::move(nextOriginalIndices);
                                 bpSourceDirections = std::move(nextDirections);
+                                bpSourcePieceOne = std::move(nextSourcePieceOne);
                                 bpTopology = vc::fiber_tracer::
                                     prepareFiberTraceBeliefTopology(
                                         bpSourceLines,
@@ -3468,7 +3528,15 @@ int main(int argc, char** argv)
                                 : *independentWinding;
                             if (referenceBpConstraints && interleavedWinding) {
                                 deferredReferenceDiagnostics.push_back(
+                                    formatBpFinalStateCohorts(
+                                        bpSourcePieceOne,
+                                        *interleavedWinding) +
                                     formatReferenceBpWindingBenchmark(*referenceDiagnostics, *referenceBpConstraints, *interleavedWinding, mode));
+                            } else if (interleavedWinding) {
+                                deferredBpStateDiagnostics.push_back(
+                                    formatBpFinalStateCohorts(
+                                        bpSourcePieceOne,
+                                        *interleavedWinding));
                             }
                             writeAndPrintBpReport(
                                 report,
@@ -3815,6 +3883,14 @@ int main(int argc, char** argv)
                         std::cout
                             << "fiber direction ablation final_extracted_constraints="
                             << extractedConstraints.size() << '\n';
+                    }
+                }
+                if (!deferredBpStateDiagnostics.empty()) {
+                    std::cout << "\nBP final diagnostics\n";
+                    for (const auto& diagnostic : deferredBpStateDiagnostics) {
+                        std::cout << diagnostic;
+                        if (diagnostic.empty() || diagnostic.back() != '\n')
+                            std::cout << '\n';
                     }
                 }
                 if (!deferredReferenceDiagnostics.empty()) {

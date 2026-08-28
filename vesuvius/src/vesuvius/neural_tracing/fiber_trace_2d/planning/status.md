@@ -1,11 +1,10 @@
-# Status: preserve the complete winding visibility mask
+# Status: report central versus non-central BP states
 
-- [x] Capture the requested behavior.
-- [x] Inspect winding artifact discovery, layer creation, and mask rotation.
-- [x] Write the implementation/test/docs plan.
+- [x] Capture the requested output and retained cost behavior.
+- [x] Inspect the final-state and deferred benchmark output paths.
+- [x] Write the implementation and validation plan.
 - [x] Complete independent plan review.
-- [x] Implement sparse discovery and complete logical layers.
-- [x] Add regression tests.
-- [x] Add per-reference-fiber benchmark error rows and tests.
+- [x] Implement and test the summary helper and output placement.
 - [x] Update specs, docs, changelog, and task log.
-- [x] Run focused validation.
+- [x] Build and run focused validation.
+- [x] Rerun the 1024 diagnostic and report the emitted table.

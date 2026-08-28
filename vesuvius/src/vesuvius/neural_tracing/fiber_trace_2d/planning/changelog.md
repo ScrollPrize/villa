@@ -1,3 +1,11 @@
+# 2026-08-28: constraint-scaled BP Defect costs
+
+- Restored per-constraint Mixed/Defect cost coefficients in orientation and
+  winding BP while retaining one non-transitive node-local unary, and changed
+  both default coefficients to `1`.
+- Added a stable source-piece-1 versus remaining-pieces final-state table before
+  each reference benchmark for direct Defect-cost tuning.
+
 # 2026-08-28: extended distance-weighted winding evidence
 
 - Raised H/V diagnostic and winding-BP raw winding admission to the exclusive
