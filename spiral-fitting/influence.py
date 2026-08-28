@@ -379,8 +379,7 @@ class InteractiveInfluenceState:
         # Refresh anchor targets to the current state and union the new
         # region's weight at each anchor.
         anchor_spiral = _apply_transform_chunked(slice_to_spiral_transform, self.anchor_scroll)
-        if self.anchor_target is None:
-            self.anchor_target = anchor_spiral.to(torch.float32)
+        self.anchor_target = anchor_spiral.to(torch.float32)
         anchor_zst = spiral_zst(anchor_spiral, dr_per_winding).to(torch.float32)
         self.anchor_w = influence_weight(
             anchor_zst, authoritative, self.limits, self.sigma)

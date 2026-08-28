@@ -474,6 +474,17 @@ class ActivateAndAnchorTests(unittest.TestCase):
             cfg=INFLUENCE_CONFIG, z_begin=0, z_end=192,
             anchor_geometry_zyx=anchor_geometry)
         old_footprint = state.contributions[('fiber', 'fiber-7')]['zst'].clone()
+        old_anchor_target = state.anchor_target.clone()
+
+        # Simulate accepted optimizer movement before a revision moves the
+        # authoritative footprint. Anchors excluded by the revised region must
+        # hold this revision-boundary geometry, not the pre-run geometry.
+        with torch.no_grad():
+            for flow in model.flow_field.flows:
+                flow.normal_(std=1e-3)
+        revision_boundary_target = model.get_slice_to_spiral_transform()(
+            state.anchor_scroll).to(torch.float32)
+        self.assertFalse(torch.equal(revision_boundary_target, old_anchor_target))
 
         revised = self._make_collection()
         for point in revised['points'].values():
@@ -494,6 +505,7 @@ class ActivateAndAnchorTests(unittest.TestCase):
         self.assertEqual(contribution['revision'], 'r2')
         self.assertGreater(float(contribution['zst'][:, 0].mean()),
                            float(old_footprint[:, 0].mean()) + 40.)
+        torch.testing.assert_close(state.anchor_target, revision_boundary_target)
 
 
 class SubsampleTests(unittest.TestCase):
