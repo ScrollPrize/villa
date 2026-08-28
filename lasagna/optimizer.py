@@ -4415,6 +4415,12 @@ def optimize(
 			_OptTimingWindow(interval=opt_timing_interval, sync_cuda=opt_timing_sync)
 			if opt_timing_enabled else None
 		)
+		if max_steps > 0:
+			# The first iteration immediately recomputes both values. Keeping the
+			# no-grad initial FitResult alive retains its full integrated UV grid.
+			loss = None
+			res = None
+			del loss0, res0
 
 		for step in range(max_steps):
 			_t_iter = time.perf_counter()

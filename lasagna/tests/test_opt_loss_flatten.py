@@ -154,6 +154,24 @@ class FlattenLossTest(unittest.TestCase):
 		self.assertAlmostEqual(float(map_yx[mask, 1].min()), 0.0, places=5)
 		self.assertAlmostEqual(float(map_yx[mask, 1].max()), 2.0, places=5)
 
+	def test_forward_inversion_honors_explicit_output_device(self) -> None:
+		xyz = _flat_grid(3, 3)
+		uv = xyz[..., :2].flip(-1)
+		map_yx, sampled, mask = fit_model.Model3D._flatten_invert_forward_uv_map(
+			xyz,
+			torch.ones(2, 2, dtype=torch.bool),
+			uv,
+			output_margin=0.0,
+			min_shape=(3, 3),
+			chunk_points=2,
+			output_device=torch.device("cpu"),
+		)
+
+		self.assertEqual(map_yx.device.type, "cpu")
+		self.assertEqual(sampled.device.type, "cpu")
+		self.assertEqual(mask.device.type, "cpu")
+		self.assertTrue(bool(mask.all()))
+
 	def test_forward_inversion_uses_fixed_diagonal_triangles_for_concave_cell(self) -> None:
 		# Both VC triangles have positive signed area, but this concave quad has
 		# a negative bilinear corner Jacobian. Forward export must preserve the
@@ -426,6 +444,22 @@ class FlattenLossTest(unittest.TestCase):
 		self.assertAlmostEqual(float(map_yx[0, 0, 1]), 0.0, places=6)
 		self.assertAlmostEqual(float(map_yx[-1, -1, 0]), 10.0, places=6)
 		self.assertAlmostEqual(float(map_yx[-1, -1, 1]), 20.0, places=6)
+
+	def test_flatten_model_omits_generic_full_grid_state(self) -> None:
+		mdl = _make_flatten_model(
+			_flat_grid(11, 21), mesh_step=1, flatten_direction="forward")
+
+		self.assertEqual(len(mdl.mesh_ms), 0)
+		self.assertEqual(mdl.conn_offsets.numel(), 0)
+		self.assertEqual(mdl.cyl_shell_w_offsets.numel(), 0)
+		self.assertEqual(mdl.amp.numel(), 0)
+		self.assertEqual(mdl.bias.numel(), 0)
+		res = mdl(
+			fit._dummy_flatten_data(),
+			needs=fit_model.ModelForwardNeeds(flatten=True),
+		)
+		self.assertEqual(res.amp_lr.numel(), 0)
+		self.assertEqual(res.bias_lr.numel(), 0)
 
 	def test_initial_forward_inversion_can_be_skipped(self) -> None:
 		mdl = _make_flatten_model(_flat_grid(5, 7), mesh_step=1, flatten_direction="forward")
@@ -1326,6 +1360,11 @@ class FlattenLossTest(unittest.TestCase):
 				data=fit._dummy_flatten_data(),
 				fit_config={"args": {"model-init": "flatten"}},
 			)
+			state = torch.load(
+				model_path, map_location="cpu", weights_only=False)
+			for key in ("conn_offsets", "cyl_shell_w_offsets", "amp", "bias"):
+				self.assertNotIn(key, state)
+			self.assertFalse(any(key.startswith("mesh_ms.") for key in state))
 
 			fit2tifxyz.main([
 				"--input", str(model_path),

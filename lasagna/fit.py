@@ -1210,6 +1210,8 @@ def _save_flatten_model(path: str, *, mdl: model.Model3D, data: fit_data.FitData
 	st = dict(mdl.state_dict())
 	for k in [k for k in st if k.startswith("mesh_ms.")]:
 		del st[k]
+	for k in ("conn_offsets", "cyl_shell_w_offsets", "amp", "bias"):
+		st.pop(k, None)
 	with torch.no_grad():
 		# The ordinary flatten_map_flat below is the inverse correspondence on
 		# the exported output grid.  A warm start needs the other direction:
@@ -1218,7 +1220,8 @@ def _save_flatten_model(path: str, *, mdl: model.Model3D, data: fit_data.FitData
 		# sidecars and never retains or transfers this checkpoint.
 		if mdl.flatten_direction == "forward":
 			st["flatten_forward_uv"] = mdl.flatten_map().detach().cpu()
-		map_yx, xyz, point_mask, _quad_mask = mdl._flatten_sample_current()
+		map_yx, xyz, point_mask, _quad_mask = mdl._flatten_sample_current(
+			inversion_output_device=torch.device("cpu"))
 		sentinel = torch.full_like(xyz, -1.0)
 		xyz = torch.where(point_mask.unsqueeze(0).unsqueeze(-1), xyz, sentinel)
 		st["mesh_flat"] = xyz.permute(3, 0, 1, 2).detach().cpu()
@@ -1248,7 +1251,8 @@ def _export_flatten_result(
 
 	out_dir.mkdir(parents=True, exist_ok=True)
 	with torch.no_grad():
-		_map_yx, xyz, point_mask, _quad_mask = mdl._flatten_sample_current()
+		_map_yx, xyz, point_mask, _quad_mask = mdl._flatten_sample_current(
+			inversion_output_device=torch.device("cpu"))
 	xyz_np = xyz[0].detach().cpu().numpy().astype(np.float32, copy=False)
 	mask_np = point_mask.detach().cpu().numpy().astype(bool, copy=False)
 	x = np.where(mask_np, xyz_np[..., 0], -1.0).astype(np.float32, copy=False)
@@ -1546,6 +1550,11 @@ def _run_flatten_mode(
 			f"{int(filter_stats.get('cell_valid_before', 0.0))}",
 			flush=True,
 		)
+	# Model3D owns sanitized device copies from here on. The loader/projector
+	# tensors otherwise remain referenced by this frame for the whole solve.
+	del xyz, valid, flatten_source_column_map
+	if warm_spec is not None:
+		del stored_cell_valid
 
 	def _snapshot(*, stage: str, step: int, loss: float, data, res=None) -> None:
 		if out_dir is None:
@@ -1575,6 +1584,9 @@ def _run_flatten_mode(
 			f"quad_valid={int(quad_mask.sum())}/{quad_mask.numel()}",
 			flush=True,
 		)
+	# These are inspection-only views/results. In particular map_yx owns a full
+	# integrated UV grid that is recomputed by the first optimizer evaluation.
+	del map_yx, xyz0, point_mask, quad_mask
 
 	optimizer.optimize(
 		model=mdl,
