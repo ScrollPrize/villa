@@ -93,7 +93,7 @@ from tracks import (
     prepare_main_phase_tracks,
     validate_track_sampling_config,
 )
-from track_graph import TrackGraph
+from tracks.track_graph import TrackGraph
 from umbilicus import thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx
 from sample_spiral import (
     get_spiral_points,

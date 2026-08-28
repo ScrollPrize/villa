@@ -113,7 +113,7 @@ from sample_spiral import (
 # within-patch strip follows a fringe-avoiding path through valid quads only
 # (never slicing through invalid regions, where theta would jump and the unwrap
 # would miscount whole windings).
-import connect_overlapping_patches as cop
+import tracks.connect_overlapping_patches as cop
 
 
 def resolve_umbilicus_path(patches_dir, explicit_path=None):
@@ -1392,7 +1392,7 @@ def main(checkpoint, patches_dir, umbilicus, fibers_flag, patch_id, pcl_paths, z
         # patch + connections) with the max-winding readout. Imported lazily so a
         # normal (no-plot) run never pulls in matplotlib.
         print('\nrendering full winding graph')
-        import plot_winding_graph as pwg
+        import spiral_graph.plot_winding_graph as pwg
         pwg.render(output, output=plot_output, full_graph=True)
 
 

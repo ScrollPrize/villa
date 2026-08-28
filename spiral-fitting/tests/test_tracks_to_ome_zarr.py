@@ -9,7 +9,7 @@ import numpy as np
 import zarr
 from click.testing import CliRunner
 
-from tracks_to_ome_zarr import (
+from tracks.tracks_to_ome_zarr import (
     ALL_LABEL_BITS,
     LocalLabeler,
     RoundRobinLabeler,

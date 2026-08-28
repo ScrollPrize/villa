@@ -176,10 +176,21 @@ def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_
         squared_distances = (
             (line_xyz[None, :, :] - control_xyz[:, None, :]) ** 2).sum(axis=-1)
         control_line_indices = squared_distances.argmin(axis=1)
-        span_begin = int(control_line_indices.min())
-        span_end = int(control_line_indices.max())
+        first = int(control_line_indices[0])
+        last = int(control_line_indices[-1])
+        span_begin = min(first, last)
+        span_end = max(first, last)
+        reverse = first > last
         points_xyz = line_xyz[span_begin:span_end + 1]
-        control_line_indices = control_line_indices - span_begin
+        if reverse:
+            points_xyz = points_xyz[::-1]
+        inside = ((control_line_indices >= span_begin)
+                  & (control_line_indices <= span_end))
+        directed_indices = (first - control_line_indices if reverse
+                            else control_line_indices - first)
+        # An interior control point outside the endpoint span must not expand
+        # the supervised polyline or resolve a cross-fiber link to a tail.
+        control_line_indices = np.where(inside, directed_indices, -1)
     else:
         # No usable dense polyline (legacy or degenerate fiber): fall back to
         # the control points themselves.
@@ -195,7 +206,9 @@ def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_
     for br in (data.get('branches') or []):
         control_index = int(br.get('control_point_index', -1))
         if 0 <= control_index < num_control_points:
-            link_endpoint_indices.add(int(control_line_indices[control_index]))
+            line_index = int(control_line_indices[control_index])
+            if line_index >= 0:
+                link_endpoint_indices.add(line_index)
     # Keep the surviving points' pre-decimation (trimmed line) indices so
     # cross-fiber links resolve exactly after decimation.
     points_xyz, kept_orig_indices = _decimate_ordered_points_min_spacing(
@@ -319,6 +332,8 @@ def _point_id_for_orig_index(pcl, orig_index):
         if orig_index >= len(control_line):
             return None
         orig_index = int(control_line[orig_index])
+        if orig_index < 0:
+            return None
     kept = pcl.get('kept_orig_indices')
     if kept is None or len(kept) == 0:
         return None

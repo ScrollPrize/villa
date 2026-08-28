@@ -7,7 +7,7 @@ import unittest
 import numpy as np
 import torch
 
-from build_track_crossings import build_cache
+from tracks.build_track_crossings import build_cache
 from tracks import (
     PackedTrackCollection,
     _build_crossing_partner_csr,

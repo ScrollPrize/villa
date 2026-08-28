@@ -59,6 +59,27 @@ class FiberPointCollectionTests(unittest.TestCase):
             points = [point["p"] for point in collection["points"].values()]
             np.testing.assert_array_equal(points, [[1, 2, 3], [5, 6, 7]])
 
+    def test_first_to_last_span_preserves_reverse_direction(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self._write_fiber(temporary, {
+                "control_points": [[12, 0, 0], [100, 0, 0], [4, 0, 0]],
+                "line_points": [
+                    [0, 0, 0],
+                    [4, 0, 0],
+                    [8, 0, 0],
+                    [12, 0, 0],
+                    [100, 0, 0],  # interior control outside endpoint span
+                ],
+            })
+
+            collection = load_fiber_point_collection(
+                path, collection_id=7, min_point_spacing=0)
+
+            points = [point["p"] for point in collection["points"].values()]
+            np.testing.assert_array_equal(points, [[3, 0, 0], [2, 0, 0], [1, 0, 0]])
+            np.testing.assert_array_equal(
+                collection["control_line_indices"], [0, -1, 2])
+
     def test_skips_fibers_without_control_points(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = self._write_fiber(temporary, {

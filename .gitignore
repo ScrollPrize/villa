@@ -60,9 +60,11 @@ volume-cartographer/AGENTS.md
 /.ccache/
 /lasagna/snap_surf_objs
 /spiral-fitting/bench
+/spiral-fitting/benchmark_runs
 /volume-cartographer/scripts/cache
 /volume-cartographer/docs/plans
 /spiral-fitting/scratch
 /spiral-fitting/out
 /vesuvius/experiments
 /vesuvius/src/vesuvius/neural_tracing/winding_models/runs
+/spiral-fitting/artifacts

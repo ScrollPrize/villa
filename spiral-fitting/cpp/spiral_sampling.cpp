@@ -20,6 +20,8 @@
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/vector.h>
 
+#include <spiral_graph/compact_patch_topology.hpp>
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -129,53 +131,15 @@ uint64_t splitmix64(uint64_t value)
     return value ^ (value >> 31);
 }
 
-using IndexStorage = std::variant<std::vector<uint32_t>, std::vector<uint64_t>>;
+using IndexStorage = spiral::topology::IndexStorage;
 
-size_t index_size(const IndexStorage& values)
-{
-    return std::visit([](const auto& held) { return held.size(); }, values);
-}
+size_t index_size(const IndexStorage& values) { return spiral::topology::index_size(values); }
 
-uint64_t index_at(const IndexStorage& values, size_t position)
-{
-    return std::visit(
-        [position](const auto& held) { return static_cast<uint64_t>(held[position]); },
-        values);
-}
+uint64_t index_at(const IndexStorage& values, size_t position) { return spiral::topology::index_at(values, position); }
 
-size_t index_bytes(const IndexStorage& values)
-{
-    return std::visit(
-        [](const auto& held) { return held.size() * sizeof(typename std::decay_t<decltype(held)>::value_type); },
-        values);
-}
+size_t index_bytes(const IndexStorage& values) { return spiral::topology::index_bytes(values); }
 
-IndexStorage compact_indices(std::vector<uint64_t>&& values, uint64_t maximum)
-{
-    if (maximum <= std::numeric_limits<uint32_t>::max()) {
-        std::vector<uint32_t> compact;
-        compact.reserve(values.size());
-        for (uint64_t value : values)
-            compact.push_back(static_cast<uint32_t>(value));
-        return compact;
-    }
-    return std::move(values);
-}
-
-struct PatchData {
-    uint64_t height = 0;
-    uint64_t width = 0;
-    uint64_t row_lo = 0;
-    uint64_t column_lo = 0;
-    uint64_t rectangle_width = 0;
-    bool rectangular = false;
-    IndexStorage valid_cells;
-    // Solid rectangles use an implicit boustrophedon chain. Ragged patches
-    // retain only compact DFS ordinals/parents/subtree ends, never edges.
-    IndexStorage preorder_ordinals;
-    IndexStorage parent_positions;
-    IndexStorage subtree_ends;
-};
+using PatchData = spiral::topology::CompactPatchTopology;
 
 template <typename Rng>
 int uniform_int(Rng& rng, int upper_exclusive)
@@ -618,141 +582,12 @@ private:
     // caller can fail after the parallel region.
     static bool build_patch(const BoolMatrix& mask, PatchData& patch)
     {
-        patch.height = mask.shape(0);
-        patch.width = mask.shape(1);
-        std::vector<uint64_t> cells;
-        uint64_t row_hi = 0;
-        uint64_t column_hi = 0;
-        patch.row_lo = patch.height;
-        patch.column_lo = patch.width;
-        for (uint64_t row = 0; row < patch.height; ++row) {
-            for (uint64_t column = 0; column < patch.width; ++column) {
-                if (!mask(row, column))
-                    continue;
-                cells.push_back(row * patch.width + column);
-                patch.row_lo = std::min(patch.row_lo, row);
-                patch.column_lo = std::min(patch.column_lo, column);
-                row_hi = std::max(row_hi, row + 1);
-                column_hi = std::max(column_hi, column + 1);
-            }
-        }
-        if (cells.empty())
-            return false;
-        patch.rectangle_width = column_hi - patch.column_lo;
-        patch.rectangular = cells.size()
-            == (row_hi - patch.row_lo) * patch.rectangle_width;
-        const uint64_t maximum = cells.back();
-        patch.valid_cells = compact_indices(std::move(cells), maximum);
-        if (!patch.rectangular)
-            build_ragged_tree(patch);
-        return true;
-    }
-
-    static void build_ragged_tree(PatchData& patch)
-    {
-        const size_t count = index_size(patch.valid_cells);
-        // Transient dense linear -> ordinal map: the DFS resolves eight
-        // neighbours per cell, so O(1) lookups beat per-neighbour binary
-        // searches. Freed on return; falls back to searches for the
-        // (unrealistic) case of a grid too large for uint32 ordinals.
-        constexpr uint32_t no_ordinal = std::numeric_limits<uint32_t>::max();
-        const uint64_t area = patch.height * patch.width;
-        std::vector<uint32_t> dense_ordinals;
-        if (area < no_ordinal && count < no_ordinal) {
-            dense_ordinals.assign(static_cast<size_t>(area), no_ordinal);
-            for (size_t ordinal = 0; ordinal < count; ++ordinal)
-                dense_ordinals[index_at(patch.valid_cells, ordinal)] =
-                    static_cast<uint32_t>(ordinal);
-        }
-        auto resolve = [&patch, &dense_ordinals](uint64_t linear) -> uint64_t {
-            if (dense_ordinals.empty())
-                return valid_ordinal(patch, linear);
-            const uint32_t ordinal = dense_ordinals[
-                static_cast<size_t>(linear)];
-            return ordinal == no_ordinal ? missing_index : ordinal;
-        };
-        struct Frame {
-            uint64_t ordinal;
-            uint64_t preorder_position;
-            std::array<uint64_t, 8> neighbors {};
-            uint8_t neighbor_count = 0;
-            uint8_t next = 0;
-        };
-        auto make_frame = [&patch, &resolve](
-                              uint64_t ordinal, uint64_t preorder_position) {
-            Frame frame;
-            frame.ordinal = ordinal;
-            frame.preorder_position = preorder_position;
-            const uint64_t linear = index_at(patch.valid_cells, ordinal);
-            const int64_t row = static_cast<int64_t>(linear / patch.width);
-            const int64_t column = static_cast<int64_t>(linear % patch.width);
-            // Match scipy's directed=False traversal of the legacy forward
-            // CSR graph: visit sorted outgoing entries first, followed by the
-            // sorted entries from its transpose.
-            constexpr int offsets[8][2] = {
-                {0, 1}, {1, -1}, {1, 0}, {1, 1},
-                {-1, -1}, {-1, 0}, {-1, 1}, {0, -1},
-            };
-            for (const auto& offset : offsets) {
-                const int64_t next_row = row + offset[0];
-                const int64_t next_column = column + offset[1];
-                if (next_row < 0 || next_column < 0
-                    || static_cast<uint64_t>(next_row) >= patch.height
-                    || static_cast<uint64_t>(next_column) >= patch.width)
-                    continue;
-                const uint64_t next_linear = static_cast<uint64_t>(next_row)
-                    * patch.width + static_cast<uint64_t>(next_column);
-                const uint64_t next_ordinal = resolve(next_linear);
-                if (next_ordinal != missing_index)
-                    frame.neighbors[frame.neighbor_count++] = next_ordinal;
-            }
-            return frame;
-        };
-
-        std::vector<uint8_t> visited(count, 0);
-        std::vector<uint64_t> preorder;
-        std::vector<uint64_t> parents;
-        std::vector<Frame> stack;
-        preorder.reserve(count);
-        parents.reserve(count);
-        stack.reserve(std::min<size_t>(count, 1'000'000));
-        for (uint64_t seed = 0; seed < count; ++seed) {
-            if (visited[seed])
-                continue;
-            visited[seed] = 1;
-            const uint64_t root_position = preorder.size();
-            preorder.push_back(seed);
-            parents.push_back(missing_index);
-            stack.push_back(make_frame(seed, root_position));
-            while (!stack.empty()) {
-                Frame& frame = stack.back();
-                if (frame.next >= frame.neighbor_count) {
-                    stack.pop_back();
-                    continue;
-                }
-                const uint64_t child = frame.neighbors[frame.next++];
-                if (visited[child])
-                    continue;
-                visited[child] = 1;
-                const uint64_t parent_position = frame.preorder_position;
-                const uint64_t child_position = preorder.size();
-                preorder.push_back(child);
-                parents.push_back(parent_position);
-                stack.push_back(make_frame(child, child_position));
-            }
-        }
-        std::vector<uint64_t> subtree_sizes(count, 1);
-        for (size_t child = count; child-- > 0;) {
-            if (parents[child] != missing_index)
-                subtree_sizes[parents[child]] += subtree_sizes[child];
-        }
-        std::vector<uint64_t> subtree_ends(count);
-        for (size_t position = 0; position < count; ++position)
-            subtree_ends[position] = position + subtree_sizes[position] - 1;
-        const uint64_t maximum = count - 1;
-        patch.preorder_ordinals = compact_indices(std::move(preorder), maximum);
-        patch.parent_positions = compact_indices(std::move(parents), maximum);
-        patch.subtree_ends = compact_indices(std::move(subtree_ends), maximum);
+        return spiral::topology::build_compact_patch_topology(
+            mask.shape(0), mask.shape(1),
+            [&mask](uint64_t row, uint64_t column) {
+                return mask(row, column);
+            },
+            patch);
     }
 
     size_t locate_node(uint64_t ordinal) const

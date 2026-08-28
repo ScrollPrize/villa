@@ -4,6 +4,15 @@ Code and helpers to fit a canonical Archimedean spiral to deformed scrolls.
 `spiral_service.py` hosts one persistent interactive fit session over HTTP for
 the VC3D Spiral workspace; `fit_spiral.py` is the underlying fitter.
 
+## Native winding graph
+
+The graph-construction and holonomy-detection replacement for
+`spiral_graph/plot_winding_graph.py` is the C++/nanobind `spiral_graph` package.
+It intentionally contains no HTML, SVG, or drawing path. See
+[`spiral_graph/README.md`](spiral_graph/README.md) for supported point
+collections, fibers, packed tracks/crossings, checkpoint use, caching, and
+benchmarks.
+
 ## Sweep runner output
 
 `runners/run_sweep.py` prefixes each active fit's live `PROGRESS` and
@@ -75,11 +84,45 @@ uv sync            # creates .venv from pyproject.toml
 
 This also builds Spiral's native helpers as `vc_spiral.spiral_sampling`,
 `vc_spiral.track_crossings`, `vc_spiral.track_store`, and
-`vc_spiral.surface_index`. OpenMP is used when the toolchain provides it; the
-same modules build with serial kernels when it does not.
+`vc_spiral.surface_index`, plus the direct-overlap merger described below.
+OpenMP is used when the toolchain provides it; the same modules build with
+serial kernels when it does not.
 
 or with conda/pip, install `torch` for your CUDA version and then
 `pip install -e .` from `spiral-fitting/`.
+
+### Native direct-overlap patch merger
+
+`merge_overlapping_patches` creates one self-contained TIFXYZ output for every
+non-empty eroded input patch. Each output contains only the seed and patches
+whose overlap was directly validated; patches are reusable across outputs and
+transitive graph neighbors are never pulled in. The destination must be new or
+empty.
+
+```sh
+build/bin/merge_overlapping_patches PATCH_DIR OUTPUT_DIR \
+    --tolerance 2 --dense-spacing 1 --erode-cells 1 \
+    --output-step 20 --threads 0
+```
+
+Outputs are finalized largest-first. A later seed is suppressed when at least
+90% of its sampled surface is represented by an earlier cleaned output; adjust
+this with `--containment-threshold` (use `1` for strict full containment).
+Newly constructed rasters are then reindexed and compared once more before
+promotion, removing rotated or reflected duplicates created during the merge
+itself rather than requiring another external merge round.
+
+The equivalent Python entry point is
+`vc_spiral.patch_merger.merge_patch_directory`. Its writable `MergeOptions`
+fields include the CLI thresholds, and it returns a `MergeReport` with pair
+counts and per-stage timings. Every run writes the same information to root
+`report.json`; every seed directory records members, poses, the seed-frame
+origin, and merge settings in `meta.json`.
+
+For a non-CI timing run, pass `--benchmark` or use
+`python benchmarks/benchmark_patch_merger.py PATCH_DIR OUTPUT_DIR`. The driver
+warns when a representative 80,000-patch run exceeds the five-minute target
+and prints discovery, indexing, fitting, rasterization, and filesystem timings.
 
 ### Resident sparse field pools
 
